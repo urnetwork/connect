@@ -31,6 +31,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -296,6 +297,89 @@ func TestAnswerDuringTheSilenceInferenceKeepsTheFlowOnItsExit(t *testing.T) {
 		}
 		if got := a.dialFailureCount(); got != 0 {
 			t.Errorf("exit a carries %d strikes for an attempt it answered, want 0", got)
+		}
+	})
+}
+
+// Exit a's first answer for the flow, its SYN-ACK, arrives as the silence
+// inference unbinds the flow from a: the hook runs the inference inside the
+// window a lock-free receive path leaves between its client check and its
+// mark. A first answer is decided under the flow lock, where the inference
+// unbinds, so it never takes that window: whatever reaches the app leaves the
+// flow established on a, and the app's first bytes follow it there. Read
+// lock-free, the answer reached the app for an unbound flow, and the bytes
+// re-raced onto exit b, which never saw a SYN.
+func answerRacingTheSilenceInference(t *testing.T, harness *reraceHarness, path *IpPath) {
+	t.Helper()
+	a := harness.channel("a")
+	harness.syn(path)
+	if harness.boundTo(path) != a {
+		t.Fatal("setup: the first SYN did not bind the flow to exit a")
+	}
+	a.beforeFirstAnswerMarkForTest = func(update *multiClientChannelUpdate) {
+		harness.multiClient.clientDialFailure(a, update.ipPath, false)
+	}
+	harness.inject("a", reraceSynAck(path))
+	a.beforeFirstAnswerMarkForTest = nil
+	if _, ok := harness.synAck(path); !ok {
+		t.Fatal("exit a's SYN-ACK did not reach the app")
+	}
+	update := harness.update(path)
+	if update.client.Load() != a || !update.receivedInbound.Load() {
+		t.Error("the app received exit a's SYN-ACK for a flow that is not established on exit a")
+	}
+	if got := harness.metrics().FlowsReraced; got != 0 {
+		t.Errorf("FlowsReraced = %d, want 0 for a flow its exit answered", got)
+	}
+
+	harness.send(reraceSegment(path, 0, []byte("hello")))
+	carried := false
+	for _, packet := range harness.exit("a").received(path) {
+		if string(packet.payload) == "hello" {
+			carried = true
+		}
+	}
+	if !carried {
+		t.Error("the app's first bytes did not reach exit a")
+	}
+	if got := len(harness.exit("b").received(path)); got != 0 {
+		t.Errorf("exit b received %d packets of a connection it never saw a SYN for, want none", got)
+	}
+}
+
+// The per-packet receive path (no batch receive callback).
+func TestFirstAnswerRacingTheSilenceInferenceStaysOnItsExit(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 1},
+		}, nil)
+		answerRacingTheSilenceInference(t, harness, unboundFlowTcpPath(50310))
+	})
+}
+
+// The batch receive path, which a batch receive callback turns on. The
+// callback records each packet as the app receives it.
+func TestFirstAnswerRacingTheSilenceInferenceStaysOnItsExitInABatch(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 1},
+		}, nil)
+		var batches atomic.Int32
+		harness.multiClient.SetReceivePacketsCallback(func(source TransferPath, provideMode protocol.ProvideMode, _ *IpPath, packets [][]byte) {
+			batches.Add(1)
+			for _, packet := range packets {
+				if parsed, err := ParseIpPath(packet); err == nil {
+					harness.receive(source, provideMode, parsed, packet)
+				}
+			}
+		})
+		answerRacingTheSilenceInference(t, harness, unboundFlowTcpPath(50320))
+		if batches.Load() == 0 {
+			t.Error("setup: no packet reached the app through the batch receive callback")
 		}
 	})
 }

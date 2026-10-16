@@ -8415,10 +8415,11 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		// tail below needs a separately owned path for queued race packets.
 		reversed := ipPath.ReverseValue()
 
-		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient {
-			// committed-flow fast path: batch. the first-inbound mark still
-			// runs per packet -- it gates the dial-failure re-race and resets
-			// the dial-strike window, exactly as on the per-packet path.
+		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient && update.receivedInbound.Load() {
+			// established-flow fast path: batch. A flow's first answer takes
+			// the resolve path below, which decides it under the flow lock, as
+			// on the per-packet path. The mark still runs per packet for a
+			// SYN-ACK of the established flow, exactly as on that path.
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				sourceClient.addConnectSuccess(update.ipPath.Version)
 				self.clearDestinationServiceFailure(sourceClient, update.ipPath)
@@ -8545,13 +8546,16 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
-		// steady-state fast path: the flow is already committed to this client,
-		// so deliver without taking any lock (client is atomic). this is the
-		// common download path and no longer contends the parent stateLock.
-		if update.client.Load() == sourceClient {
-			// first inbound packet for this flow marks it established, which
-			// gates the dial-failure re-race (a stale signal must not unbind a
-			// flow already carrying data).
+		// steady-state fast path: the flow is already committed to this client
+		// and established, so deliver without taking any lock (client is
+		// atomic). this is the common download path and no longer contends the
+		// parent stateLock. A flow's first answer takes the locked path below:
+		// read lock-free, its client could be unbound by the dial-failure
+		// inference before the mark, and the answer would reach the app for a
+		// flow that is no longer on the exit that sent it.
+		if update.client.Load() == sourceClient && update.receivedInbound.Load() {
+			// a SYN-ACK of the established flow still records its admission
+			// under the flow lock (markReceivedInbound)
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
@@ -8567,14 +8571,18 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			return
 		}
 
-		// race / not-yet-committed paths are guarded by the per-flow stateLock
+		// first-answer, race and not-yet-committed paths are guarded by the
+		// per-flow stateLock
 		update.stateLock.Lock()
 		defer update.stateLock.Unlock()
 
 		client := update.client.Load()
 
 		if client == sourceClient {
-			// committed between the lock-free check and acquiring the lock
+			// the flow's first answer, or committed between the lock-free
+			// check and acquiring the lock. The inference unbinds under this
+			// lock too, so the answer is marked and delivered only while the
+			// flow is still on its exit.
 			if update.markReceivedInboundWithLock(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
@@ -14291,6 +14299,12 @@ type multiClientChannel struct {
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
 	// Holds a registered producer before its typed completion is prepared.
 	beforeGroupCompletionForTest func()
+	// Nil outside focused tests. Runs in markReceivedInbound for a packet
+	// from this channel that passed the established-flow early return, before
+	// the flow lock is taken: the window a lock-free receive path leaves
+	// between its client check and its mark. Only a flow's first answers and
+	// SYN packets reach it.
+	beforeFirstAnswerMarkForTest func(*multiClientChannelUpdate)
 	// Nil outside focused tests. Replaces only concrete Client admission after
 	// the real packet/group callback is built, since Client is not an interface.
 	sendTransferForTest func(AckFunction) (bool, error)
