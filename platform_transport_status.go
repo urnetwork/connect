@@ -34,10 +34,7 @@ func PlatformTransportAutoEligibility(
 	}
 
 	_, h1Configured := preferences[TransportModeH1]
-	h1ByteCount := settings.H1BudgetByteCount
-	if h1ByteCount <= 0 {
-		h1ByteCount = MemoryScaledByteCount(kib(512), kib(256))
-	}
+	h1ByteCount := settings.H1MemoryReservationByteCount()
 	h3ByteCount := settings.H3BudgetByteCount
 	if h3ByteCount <= 0 {
 		h3ByteCount = defaultH3BudgetByteCount()
@@ -52,16 +49,23 @@ func PlatformTransportAutoEligibility(
 		targetMode:      TransportModeAuto,
 		modePreferences: preferences,
 	}
-	h3GroupByteCount := h3ByteCount + transport.h3NestedMemoryByteCount()
+	remainingByteCount := budget.TotalByteCount
 	if h1Configured {
 		// run waits for H1 admission before it starts the H3 mode group, so an
 		// H1 claim that cannot fit prevents every Auto runner from starting.
 		if !h1Eligible {
 			return eligible
 		}
-		h3GroupByteCount += h1ByteCount
+		remainingByteCount -= h1ByteCount
 	}
-	if budget.TotalByteCount < h3GroupByteCount {
+	// Subtract each admitted component instead of summing: a saturated h1
+	// claim plus a positive h3 graph must not wrap or fit a max-sized root.
+	if h3ByteCount < 0 || remainingByteCount < h3ByteCount {
+		return eligible
+	}
+	remainingByteCount -= h3ByteCount
+	nestedByteCount := transport.h3NestedMemoryByteCount()
+	if nestedByteCount < 0 || remainingByteCount < nestedByteCount {
 		return eligible
 	}
 	for mode := range preferences {

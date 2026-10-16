@@ -4382,3 +4382,130 @@ does not explain the slowdown. Sampled packet/Transfer budgets were not full
 and no forced GC was recorded; increasing memory is not justified by this run.
 Next: trace native read/batch-send admission, then rerun the complete iOS32 /
 Android64 device matrix. See the [measurement checkpoint](../tests/PERFVAR-MEASUREMENTS.md#2026-10-15--synced-runner-checkpoint-incomplete-physical-qualification).
+
+### 2026-10-16: deterministic H1 retained-root admission mismatch
+
+`TestPlatformH1GraphRetainedReceiveFitsAdmission` exercised real in-memory
+H1 and H1+ constructors at explicit 32 and 64 MiB targets. A held receiver
+retained 33 distinct message roots: 540,672 bytes for H1 and 541,068 for H1+,
+against active claims of 262,144 and 524,288 bytes respectively. All four
+cases completed cancellation and pool/claim reconciliation before reporting
+`H1_GRAPH_RETAINED_BYTES_EXCEED_CLAIM`. The source-bound diagnostic is retained
+as `merged-h1-graph-diagnostic.1Ki7Tb/go.json`; these are independent receive
+allocations, not duplicate charges for sender/Transfer shares.
+
+The correction keeps the 32-message channels and 16-KiB message maximum.
+Separate send, receive, control, and enabled acknowledgement byte lanes are
+prepaid in the graph claim. Writer ownership lasts until its share is returned;
+the private Client receive receipt lasts through decode and final Pack handoff.
+An unadmitted Pack follows the exact physical lane's cancellation, while work
+already accepted by Pack remains owned by the logical receive sequence.
+`H1BudgetByteCount` remains the base connection/scratch row, including when
+used for an outer raw tcp/tls carrier; application H1 claims use
+`H1MemoryReservationByteCount()`.
+
+The isolated Connect witness has no acknowledgement companion: its new claims
+are 656,512 / 918,656 bytes. Actual mobile SDK construction adds its 10 / 21
+acknowledgement slots, producing 697,592 / 1,004,924-byte claims. The normal
+6 / 12 direct-H1 public graphs, three provider control graphs and one replacement
+fit the unchanged 8 / 16 MiB carrier roots. Outer extender claims remain additive.
+Byte pressure does not reduce channel
+counts, borrow sibling control allowance, or silently discard a reliable frame.
+Zero/one-count custom lanes still admit one maximum-sized frame.
+
+Reproduce the independent root oracle with the canonical Go confirmation
+runner's normal and race selections for
+`^TestPlatformH1GraphRetainedReceiveFitsAdmission$`; adjacent controls are
+`^TestPlatformH1Retained` and `^TestH1ReceiveCarrier`, plus the SDK constructor
+test `^TestDeviceLocalH1RetainedGraphProfileComposition$`. This source change
+and its new controls await executor qualification. Selector microbenchmarks
+measure host overhead separately; no device performance gain is claimed.
+The witness is not a measured process-cap breach, a continuous memory peak,
+or an attribution of the observed phone stall. The 32/64 MiB memory gates,
+full physical matrix and native iOS footprint requirements remain unchanged.
+
+The first corrected focused diagnostic passed all 13 H1/receive-lifecycle
+tests and all 13 carrier-budget overflow tests. An immutable overlay restoring
+only the old budget implementation failed the exact semantic assertion
+`class h1 bypassed limit 8 with a wrapped live sum`; it compiled and cleaned up
+without a panic. Evidence is retained in
+`h1-retained-focused-final.FogUDP/{h1-lifecycle.gSlRv0,overflow.0m1tvC,overflow-old-control.z2o3z9}`.
+These are single fresh-process diagnostics, not canonical three-process
+normal/race confirmations or device qualification. Two earlier attempts are
+preserved separately: an unpooled-16-KiB test assumption and a commented-out
+helper reference in its repair. Neither failed attempt is counted as a pass.
+
+A 100-ms selector allocation screen used 1,200-byte packets, both profiles,
+and one/two/three routes (48 result rows). Ready reads and writes added no
+allocations relative to the unaccounted control; the synthetic eight-slot
+priority case remained zero-allocation. Full-route, already-cancelled writes
+showed extra allocation from retained-byte admission:
+
+| Routes | Control B/op, allocs/op | Accounted B/op, allocs/op |
+| --- | --- | --- |
+| 1 | 16, 1 | 128, 2 |
+| 2 | 144, 5 | 368, 7 |
+| 3 | 1,008, 13 | 1,976, 21 |
+
+Both targets produced the same allocation counts. This cancellation case is
+not a throughput test. The single short host screen is not a statistical
+speed comparison or a baseline update. Its measured allocation increase
+motivates examining eager credit-notification creation and the three-route
+reflective selector before retaining a performance optimization. Raw results:
+`h1-retained-focused-final.FogUDP/selector-bench.mpasgW/go.json`.
+
+Follow-up candidate A reserves bytes or subscribes under one lock; it creates a
+notification only after byte refusal and preserves an existing waiter's channel
+on success. The same 48-case screen reduced accounted cancelled-write allocation
+to 16 B / 1 allocation (one route), 144 B / 5 allocations (two), and 1,640 B /
+18 allocations (three), identically at 32/64 MiB. Other 42 rows had unchanged
+allocation counts. Retain A for this measured allocation reduction; the separate
+three-route reflective-selector cost is not fixed here. Single short host timings
+still do not establish an end-to-end speed improvement.
+
+The widened focused normal selection passed 61 top-level tests (120 including
+existing subtests). Restoring only the old eager-subscription block through an
+immutable overlay produced exactly six
+`H1_FUNDED_SELECTOR_ALLOCATED_BYTE_NOTIFY` failures after all three route-count
+cases joined; the other-waiter preservation test passed. Evidence:
+`h1-candidate-a-diagnostic.fZbQNm/{h1-normal.fElknp,selector-bench.UIkXCv,old-prepare-execution.hhWi7B}`.
+The pre-Go Bash-3 `mapfile` setup error is preserved separately and uncounted.
+Final resource sampling passed after the last command; the observer itself was
+interrupted during post-sample sleep (exit 1), not a clean supervisor exit.
+Canonical normal/race confirmation will use a graceful stop-request owner.
+Full parent and physical 32/64 qualification remain pending.
+
+### 2026-10-16: focused accounting and lifetime confirmation
+
+All eight focused confirmation groups now passed three fresh processes each:
+
+| Scope | Normal | Race |
+| --- | --- | --- |
+| Connect H1 retained roots, carrier lifetime and transport budgets | 3/3 | 3/3 |
+| Actual SDK H1 graph composition | 3/3 | 3/3 |
+| SDK memory and adjacent H3-window policy | 3/3 | 3/3 |
+| Extender mobile-memory composition and H1 lifetimes | 3/3 | 3/3 |
+
+The extender compile-only check also passed. The preceding race failure was a
+test observation without the lane lock, not a reported production-to-production
+race. The repaired fixture copies live counters under that lock, verifies its
+virtual-time admission/deadline boundaries, and joins rollback before returning
+the pooled root. Production helper `ae927399` is unchanged; repaired test
+`0e59e5b4` passed the fresh normal/race confirmations. A subsequent command-path
+setup failure occurred before any test and remains retained separately; its
+corrected invocation used a fresh output directory.
+
+Evidence is under
+`postmerge-full-current-01/h1-canonical-repaired-confirm.jHRYxX` in the retained
+chronology. All eight runner summaries report `confirmed=true` and
+`consecutive_passes=3`. The 11-repository before/after source inventories matched
+(`eb77f14260b1e9fd23bfef8076e23bf9fb35c88aa2e2dfc9ae35f60ad3ad8e59`).
+The resource observer accepted 26 samples and joined with exit 0; its final
+sample ended at 14:16:01 UTC, after the final Go command at 14:15:24 UTC.
+
+These are focused correctness/lifetime results, not an end-to-end performance
+comparison or physical memory qualification. The full affected parents and
+ALL/MAIN/PERF campaign remain pending. In particular, the 32 MiB iOS profile on
+Android and the normal 64 MiB Android profile still require the complete device
+workload; neither native iOS footprint nor a new throughput baseline follows
+from these passes.

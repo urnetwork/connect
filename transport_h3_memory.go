@@ -64,7 +64,7 @@ func (self *PlatformTransport) h3NestedMemoryByteCount() ByteCount {
 	if self.clientStrategy != nil && self.settings.H3PacketConnFactory == nil {
 		if extender := self.clientStrategy.H3ExtenderConfig(); extender != nil {
 			if extender.Profile.ConnectMode == ExtenderConnectModeTcpTls {
-				byteCount += self.h1BudgetByteCount()
+				byteCount += self.h1BaseBudgetByteCount()
 			} else {
 				policy := newExtenderQuicMemoryPolicy(self.dialContext(context.Background()), self.clientStrategy.ConnectSettings())
 				if extender.Profile.ConnectMode == ExtenderConnectModeDns {
@@ -105,6 +105,7 @@ func platformH3FixedMemoryByteCount() ByteCount {
 // retain their existing window policy, and unbudgeted defaults are unchanged.
 func applyPlatformH3MemoryPolicy(settings *PlatformTransportSettings, target ByteCount) {
 	settings.h3RetainedByteAccounting = 0 < target && target <= mib(32)
+	settings.h1RetainedByteAccounting = settings.h3RetainedByteAccounting
 	if !settings.h3RetainedByteAccounting {
 		return
 	}
@@ -122,6 +123,7 @@ func ApplyMobilePlatformTransportMemoryPolicy(settings *PlatformTransportSetting
 		return
 	}
 	settings.h3RetainedByteAccounting = true
+	settings.h1RetainedByteAccounting = true
 	settings.H3SocketReadBufferByteCount = min(settings.H3SocketReadBufferByteCount, platformH3SocketByteCount)
 	settings.H3SocketWriteBufferByteCount = min(settings.H3SocketWriteBufferByteCount, platformH3SocketByteCount)
 	fixed := platformH3FixedMemoryByteCount()

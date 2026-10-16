@@ -1329,6 +1329,9 @@ const sendPackH1EstablishedMaxMessageByteCount = 3 * DefaultMtu
 const rawSendPackPoolCapacity = 8
 
 type ReceivePack struct {
+	// Only pre-admission waits observe the exact retired physical lane. Once
+	// Pack takes ownership, closing that lane never revokes accepted work.
+	carrierDone <-chan struct{}
 	// Client-relative monotonic ingress; zero means no timing provenance.
 	receivedAtNanos    int64
 	Source             TransferPath
@@ -4418,7 +4421,12 @@ func (self *Client) run() {
 		}, self.cancel)
 	}()
 
+	var h1ReceiveCredit platformH1ReceiveCredit
+	defer h1ReceiveCredit.release()
 	for {
+		// The preceding root was returned or handed to Pack. One value receipt
+		// spans all continue/error paths, with one defer for abnormal run exit.
+		h1ReceiveCredit.release()
 		select {
 		case <-self.ctx.Done():
 			return
@@ -4438,6 +4446,7 @@ func (self *Client) run() {
 				)
 				transportType = disposition.transportType
 				carrierReliability = disposition.reliability
+				h1ReceiveCredit = disposition.h1Credit
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
@@ -4830,6 +4839,7 @@ func (self *Client) run() {
 						receivePack = &ReceivePack{}
 					}
 					*receivePack = ReceivePack{
+						carrierDone:         h1ReceiveCredit.done,
 						receivedAtNanos:     receivedAtNanos,
 						Source:              source,
 						SequenceId:          sequenceId,
@@ -13969,6 +13979,11 @@ func (self *ReceiveBuffer) removeReceiveSequenceWithLock(
 }
 
 func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
+	select {
+	case <-receivePack.carrierDone:
+		return false, errors.New("receive carrier closed")
+	default:
+	}
 	logicalLane := uint32(0)
 	if receivePack.Pack != nil {
 		logicalLane = receivePack.Pack.LogicalLane
@@ -14006,6 +14021,15 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 			}
 			self.mutex.Lock()
 
+			// Physical cancellation is not a logical generation update. Check
+			// again under the head lock before creating or superseding work.
+			select {
+			case <-receivePack.carrierDone:
+				self.mutex.Unlock()
+				receivePack.messagePoolReturn()
+				return nil
+			default:
+			}
 			if self.closed {
 				self.mutex.Unlock()
 				receivePack.messagePoolReturn()
@@ -14041,7 +14065,12 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					receivePack.messagePoolReturn()
 					return nil
 				}
-				receiveSequence.WaitForExit()
+				select {
+				case <-receiveSequence.exit:
+				case <-receivePack.carrierDone:
+					receivePack.messagePoolReturn()
+					return nil
+				}
 				self.mutex.Lock()
 				self.removeReceiveSequenceWithLock(
 					receiveSequenceId,
@@ -14101,7 +14130,12 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				// Sequence shutdown must finish before replacement for this
 				// source. Wait outside the buffer-wide map lock so other peers
 				// can keep finding and creating their sequences.
-				headReceiveSequence.WaitForExit()
+				select {
+				case <-headReceiveSequence.exit:
+				case <-receivePack.carrierDone:
+					receivePack.messagePoolReturn()
+					return nil
+				}
 				self.mutex.Lock()
 				self.removeReceiveSequenceWithLock(
 					headReceiveSequenceId,
@@ -14157,6 +14191,8 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	var err error
 	for i := 0; i < 2; i += 1 {
 		select {
+		case <-receivePack.carrierDone:
+			return false, errors.New("receive carrier closed")
 		case <-self.ctx.Done():
 			return false, errors.New("Done.")
 		default:
@@ -14747,11 +14783,16 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 }
 
 // success, error
+// Concurrent callers serialize on packMutex. The canonical Client has one
+// receive pump, so its physical-lane cancellation can end the admission wait
+// without depending on a separate caller that holds this logical queue lock.
 func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
 	self.packMutex.Lock()
 	defer self.packMutex.Unlock()
 
 	select {
+	case <-receivePack.carrierDone:
+		return false, errors.New("receive carrier closed")
 	case <-self.ctx.Done():
 		return false, errors.New("Done.")
 	default:
@@ -14893,6 +14934,9 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 			break
 		}
 		select {
+		case <-receivePack.carrierDone:
+			stopTimer()
+			return false, errors.New("receive carrier closed")
 		case <-self.ctx.Done():
 			stopTimer()
 			return false, errors.New("Done.")
@@ -14903,6 +14947,10 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 		}
 	}
 	select {
+	case <-receivePack.carrierDone:
+		stopTimer()
+		release()
+		return false, errors.New("receive carrier closed")
 	case <-self.ctx.Done():
 		stopTimer()
 		release()

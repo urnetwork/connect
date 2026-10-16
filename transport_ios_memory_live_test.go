@@ -237,6 +237,7 @@ func testIosMemoryLiveH3(t *testing.T, mode TransportMode) {
 			}
 			matched := bytes.Equal(response, expected)
 			MessagePoolReturn(response)
+			disposition.h1Credit.release()
 			if !matched {
 				t.Fatalf("%s exchange=%d changed payload", mode, i)
 			}

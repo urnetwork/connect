@@ -31,7 +31,7 @@ func TestIosMemoryCarrierAdmissionRefusalAndFailure(t *testing.T) {
 					budget := settings.PlatformTransportBudget
 					ctx, cancel := context.WithCancel(context.Background())
 					defer cancel()
-					want := settings.H1BudgetByteCount
+					want := settings.H1MemoryReservationByteCount()
 					if mode != TransportModeH1 {
 						want = settings.H3BudgetByteCount
 						if mode != TransportModeH3 {
@@ -130,7 +130,7 @@ func TestIosMemoryCarrierAdmissionRefusalAndFailure(t *testing.T) {
 						}
 						retained := want
 						if mode == TransportModeH1 {
-							retained = settings.H1BudgetByteCount
+							retained = settings.H1MemoryReservationByteCount()
 						} else if nested := transport.h3NestedBudget; nested != nil {
 							stats := nested.Stats()
 							if stats.TotalByteCount != want-settings.H3BudgetByteCount || stats.UsedByteCount != 0 ||

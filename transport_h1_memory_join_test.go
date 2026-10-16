@@ -28,9 +28,10 @@ func TestPlatformH1MemoryReservationSurvivesNativeCloseJoin(t *testing.T) {
 			root := NewPlatformTransportBudgetForMemoryTarget(mib(32))
 			budget := newDefaultPlatformTransportBudgetWithParent(target, root)
 			settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
-			claimBytes := settings.H1BudgetByteCount
+			settings.TransportBufferSize = 1
+			claimBytes := settings.H1MemoryReservationByteCount()
 			capacity := target / 4
-			if claimBytes != kib(256) || budget.Stats().TotalByteCount != capacity || root.Stats().TotalByteCount != mib(8) ||
+			if settings.H1BudgetByteCount != kib(256) || claimBytes <= settings.H1BudgetByteCount || budget.Stats().TotalByteCount != capacity || root.Stats().TotalByteCount != mib(8) ||
 				MemoryBudget() != mib(32) || debug.SetMemoryLimit(-1) != 32*1024*1024 {
 				t.Fatal("H1 join regression did not select its exact historical/current profile")
 			}
@@ -46,7 +47,8 @@ func TestPlatformH1MemoryReservationSurvivesNativeCloseJoin(t *testing.T) {
 			defer release()
 			fixture := newH1LivenessFixture(t, func(fixtureSettings *PlatformTransportSettings) {
 				fixtureSettings.PlatformTransportBudget = budget
-				fixtureSettings.H1BudgetByteCount = claimBytes
+				fixtureSettings.H1BudgetByteCount = settings.H1BudgetByteCount
+				ApplyMobilePlatformTransportMemoryPolicy(fixtureSettings, target)
 				fixtureSettings.afterRoutesRemovedForTest = func() {
 					close(closeEntered)
 					<-releaseClose

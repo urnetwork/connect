@@ -49,14 +49,14 @@ func TestH1AckPriorityLaneDoesNotStarveControlEchoes(t *testing.T) {
 		// writer on the stalled uplink
 		firstPayload := bytes.Repeat([]byte{0x01}, 64)
 		blockedPayload := bytes.Repeat([]byte{0x02}, 64)
-		fixture.send <- MessagePoolCopy(firstPayload)
+		fixture.sendMessage(t, MessagePoolCopy(firstPayload))
 		synctest.Wait()
 		select {
 		case <-fixture.peerReadBlocked:
 		default:
 			t.Fatal("the peer did not stop reading after the first payload")
 		}
-		fixture.send <- MessagePoolCopy(blockedPayload)
+		fixture.sendMessage(t, MessagePoolCopy(blockedPayload))
 		synctest.Wait()
 		if fixture.client.writesInProgress.Load() != 1 {
 			t.Fatal("the writer did not block on the stalled uplink")
@@ -67,7 +67,11 @@ func TestH1AckPriorityLaneDoesNotStarveControlEchoes(t *testing.T) {
 		ackMessages := make([][]byte, cap(ackLane))
 		for index := range ackMessages {
 			ackMessages[index] = bytes.Repeat([]byte{0x40 + byte(index)}, 24)
-			ackLane <- MessagePoolCopy(ackMessages[index])
+			message := MessagePoolCopy(ackMessages[index])
+			if accepted, _ := fixture.writer.(*MultiRouteSelector).tryWriteH1AckPriorityWithCarrierPreference(message, TransportTypeH1); !accepted {
+				MessagePoolReturn(message)
+				t.Fatal("the ready acknowledgement lane refused selector admission")
+			}
 		}
 		latencyProbe := bytes.Repeat([]byte{0x7f}, 16)
 		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, latencyProbe); err != nil {

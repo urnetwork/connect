@@ -95,7 +95,7 @@ func TestH1PhysicalProgressWireReadWriteAndHeartbeat(t *testing.T) {
 		}
 		wire := h1PlusOwnedTestMessage(0x71, 64)
 		wantHash := crc64.Checksum(wire, transferProgressChecksumTable())
-		fixture.send <- wire
+		fixture.sendMessage(t, wire)
 		synctest.Wait()
 		written := takeProgressTraceEvents(events)
 		begin, end := h1TraceStage(written, "h1_write_begin"), h1TraceStage(written, "h1_write_end")
@@ -141,7 +141,7 @@ func TestH1PhysicalProgressTerminalIOEvidence(t *testing.T) {
 				takeProgressTraceEvents(events)
 				if writeFailure {
 					fixture.client.failWrite.Store(true)
-					fixture.send <- h1PlusOwnedTestMessage(0x31, 64)
+					fixture.sendMessage(t, h1PlusOwnedTestMessage(0x31, 64))
 				} else {
 					time.Sleep(3 * time.Second)
 				}
@@ -185,9 +185,8 @@ func TestH1PhysicalProgressWebSocketFallback(t *testing.T) {
 	if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
 		t.Fatal("WebSocket fallback did not become ready")
 	}
-	var route Route
 	select {
-	case route = <-ready:
+	case <-ready:
 	case <-time.After(time.Second):
 		t.Fatal("missing ready route")
 	}
@@ -197,7 +196,12 @@ func TestH1PhysicalProgressWebSocketFallback(t *testing.T) {
 	}
 	wire := h1PlusOwnedTestMessage(0x69, 64)
 	wantHash := crc64.Checksum(wire, transferProgressChecksumTable())
-	route <- wire
+	writer := transport.routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+	defer transport.routeManager.CloseMultiRouteWriter(writer)
+	if accepted, err := writer.WriteDetailed(ctx, wire, 0); !accepted || err != nil {
+		MessagePoolReturn(wire)
+		t.Fatalf("fallback selector admission: accepted=%t err=%v", accepted, err)
+	}
 	if !waitForCondition(time.Second, func() bool { return platform.dataMessages.Load() == 1 }) {
 		t.Fatal("WebSocket payload was not read")
 	}

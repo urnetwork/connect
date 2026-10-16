@@ -7,17 +7,26 @@ import (
 
 // The custom carrier drains the same ACK/ordinary lanes and limits as H1 WS,
 // then encodes their ready payloads once through Framer's shared scratch API.
-func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, onSent func()) (open bool, err error) {
+func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
 	var owned [platformWebSocketWriteBatchMaxMessages][]byte
+	var priorityOwned [platformWebSocketWriteBatchMaxMessages]bool
 	owned[0] = first
+	priorityOwned[0] = firstPriority
 	count, byteCount, priorityCount := 1, len(first), 0
 	if firstPriority {
 		priorityCount = 1
 	}
 	open = true
 	defer func() {
-		for _, message := range owned[:count] {
-			MessagePoolReturn(message)
+		for i, message := range owned[:count] {
+			var lane *platformH1RetainedLane
+			if len(retained) != 0 && retained[0] != nil {
+				lane = &retained[0].send
+				if priorityOwned[i] {
+					lane = &retained[0].priority
+				}
+			}
+			returnH1RetainedMessage(message, lane)
 		}
 	}()
 	for platformWebSocketWriteBatchCanDrain(count, byteCount) {
@@ -35,6 +44,7 @@ func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, sen
 			break
 		}
 		owned[count] = message
+		priorityOwned[count] = priority
 		count++
 		byteCount += len(message)
 		if priority {

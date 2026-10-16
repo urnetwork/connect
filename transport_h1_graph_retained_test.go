@@ -39,7 +39,7 @@ func TestPlatformH1GraphRetainedReceiveFitsAdmission(t *testing.T) {
 					settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
 					ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 					if settings.TransportBufferSize != 32 || settings.H1MaxMessageByteCount != 16*1024 ||
-						settings.H1BudgetByteCount != target/128 {
+						settings.H1BudgetByteCount <= 0 {
 						t.Fatalf("unexpected constructor profile: target=%d queue=%d maximum=%d claim=%d",
 							target, settings.TransportBufferSize, settings.H1MaxMessageByteCount, settings.H1BudgetByteCount)
 					}
@@ -173,52 +173,52 @@ func TestPlatformH1GraphRetainedReceiveFitsAdmission(t *testing.T) {
 					if receive == nil || cap(receive) != settings.TransportBufferSize {
 						t.Fatal("constructor did not publish its unmodified bounded receive route")
 					}
-					messageCount := cap(receive) + 1
-					fillReceive := func(size int) {
-						writeDone := make(chan error, 1)
-						inFlightWrite = writeDone
-						go func() {
-							message := make([]byte, size)
-							for i := range messageCount {
+					fillReceive := func(size int) int {
+						before := settings.ReceiveStats.Snapshot().H1.QueueBackpressureMessageCount
+						for i := range cap(receive) + 1 {
+							writeDone := make(chan error, 1)
+							inFlightWrite = writeDone
+							go func() {
+								message := make([]byte, size)
 								binary.LittleEndian.PutUint32(message, uint32(i))
-								if err := peer.WriteMessage(websocket.BinaryMessage, message); err != nil {
-									writeDone <- err
-									return
+								writeDone <- peer.WriteMessage(websocket.BinaryMessage, message)
+							}()
+							synctest.Wait()
+							select {
+							case err := <-writeDone:
+								inFlightWrite = nil
+								if err != nil {
+									t.Fatalf("real peer write: %v", err)
 								}
+							default:
+								t.Fatal("reader stopped before retaining its one complete message")
 							}
-							writeDone <- nil
-						}()
-						synctest.Wait()
-						select {
-						case err := <-writeDone:
-							inFlightWrite = nil
-							if err != nil {
-								t.Fatalf("real peer write: %v", err)
+							if settings.ReceiveStats.Snapshot().H1.QueueBackpressureMessageCount != before {
+								return i + 1
 							}
-						default:
-							t.Fatal("bounded route and single reader hold did not accept the complete burst")
 						}
-						if len(receive) != cap(receive) {
-							t.Fatal("receive route was not full at the completed-write barrier")
-						}
+						t.Fatal("neither byte nor count admission bounded the actual reader")
+						return 0
 					}
-					fillReceive(int(settings.H1MaxMessageByteCount))
+					messageCount := fillReceive(int(settings.H1MaxMessageByteCount))
 					stats := settings.ReceiveStats.Snapshot().H1
 					if stats.QueueBackpressureMessageCount != 1 || stats.QueueBackpressureByteCount != uint64(settings.H1MaxMessageByteCount) ||
 						stats.QueueDropMessageCount != 0 {
 						t.Fatalf("full reliable reader ownership was not established: %+v", stats)
 					}
 					result := observation{target: target, plus: plus, claim: budget.Stats().UsedByteCount}
-					if result.claim != settings.H1BudgetByteCount || root.Stats().UsedByteCount != result.claim {
+					if result.claim != settings.H1MemoryReservationByteCount() || root.Stats().UsedByteCount != result.claim {
 						t.Fatal("receive roots were not retained under the exact active graph claim")
 					}
-					heldMessages = append(heldMessages, <-receive)
-					synctest.Wait()
-					if len(receive) != cap(receive) {
-						t.Fatal("already-read reliable message did not enter the freed slot")
-					}
-					for range cap(receive) {
-						heldMessages = append(heldMessages, <-receive)
+					reader := routes.OpenMultiRouteReader(DestinationId(NewId()))
+					defer routes.CloseMultiRouteReader(reader)
+					for range messageCount {
+						message, err := reader.Read(ctx, 0)
+						if err != nil || message == nil {
+							t.Fatalf("held receive ownership did not transfer: %v", err)
+						}
+						heldMessages = append(heldMessages, message)
+						synctest.Wait()
 					}
 					rootAddresses := map[*byte]bool{}
 					for i, message := range heldMessages {
