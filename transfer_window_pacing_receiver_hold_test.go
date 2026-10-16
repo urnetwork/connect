@@ -62,8 +62,14 @@ func (self *receiverHoldTestLane) write(t *testing.T, count int) {
 // minimumHold; the reply reports the receiver's actual wait and arrives half
 // a path after it is written, so the adjusted round trip is always the path.
 func (self *receiverHoldTestLane) ack(number int, selective bool, minimumHold time.Duration) {
+	self.ackAfterQueue(number, selective, minimumHold, 0)
+}
+
+// The same reply for an item that also waited queue in a carrier queue on its
+// way to the receiver, so the adjusted round trip is the path plus that queue.
+func (self *receiverHoldTestLane) ackAfterQueue(number int, selective bool, minimumHold, queue time.Duration) {
 	head := self.items[number-1]
-	arrived := time.Unix(0, head.pacingSentAtNanos).Add(receiverHoldTestPath / 2)
+	arrived := time.Unix(0, head.pacingSentAtNanos).Add(receiverHoldTestPath/2 + queue)
 	if wait := time.Until(arrived.Add(minimumHold + receiverHoldTestPath/2)); 0 < wait {
 		time.Sleep(wait)
 	}
@@ -202,13 +208,16 @@ func TestWindowPacingReceiverHoldEndsWithAPromptHead(t *testing.T) {
 }
 
 // A selective reply is prompt even while in-order delivery waits behind a
-// hole, so a prompt one cannot end an in-order hold: only cumulative heads
-// decide whether the receiver is draining the lane.
+// hole. It can neither start nor end the receiver hold of its lane.
 func TestWindowPacingSelectiveReplyLeavesReceiverHold(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		service, stalled, _ := newReceiverHoldTestLanes(t)
 		stalled.write(t, 32)
-		stalled.ack(2, false, time.Second)
+		stalled.ack(3, true, time.Second)
+		if !service.backlogged(receiverHoldTestRate) {
+			t.Fatal("a selective reply's wait started a receiver hold")
+		}
+		stalled.ack(2, false, 0)
 		if service.backlogged(receiverHoldTestRate) {
 			t.Fatal("the held window was read as carrier flight")
 		}
@@ -220,31 +229,29 @@ func TestWindowPacingSelectiveReplyLeavesReceiverHold(t *testing.T) {
 	})
 }
 
-// Items after a lost one are selectively acknowledged and wait at the
-// receiver until the retry fills the hole, so the head that repairs it
-// carries their long wait. That is carrier loss, not a stalled receiver: the
-// lane's flight stays carrier flight and its retries congestion evidence.
-func TestWindowPacingHoleRepairIsNotReceiverHold(t *testing.T) {
+// A queued path keeps a receiver-held lane's window and retries as carrier
+// evidence. A hole repaired after loss at a full relay also waits at its
+// receiver, and the queue that came before that loss must still slow every
+// lane.
+func TestWindowPacingQueuedPathKeepsReceiverHeldEvidence(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		service, lossy, _ := newReceiverHoldTestLanes(t)
-		lossy.write(t, 32)
-		// item 2 is lost; the receiver holds 3 and 4 behind it
-		lossy.ack(3, true, time.Second)
-		lossy.ack(4, true, time.Second)
-		if !service.backlogged(receiverHoldTestRate) {
-			t.Fatal("a selective reply's wait started a receiver hold")
+		service, held, sibling := newReceiverHoldTestLanes(t)
+		held.write(t, 32)
+		held.ack(2, false, time.Second)
+		if service.backlogged(receiverHoldTestRate) {
+			t.Fatal("the held window was read as carrier flight on an unqueued path")
 		}
-		// the retried item 2 arrives and the receiver releases 2 through 4
-		lossy.ack(4, false, time.Second)
+		sibling.write(t, 1)
+		sibling.ackAfterQueue(2, false, time.Millisecond, 20*time.Millisecond)
 		if !service.backlogged(receiverHoldTestRate) {
-			t.Fatal("a hole's repair was read as a receiver hold, hiding the lane's carrier flight")
+			t.Fatal("a queued path dropped a held lane's window from its carrier flight")
 		}
 		service.holdPacing(2 * receiverHoldTestRate)
-		if err := lossy.sequence.windowPacer.waitForServiceWrite(context.Background(), receiverHoldTestMessageBytes, true); err != nil {
+		if err := held.sequence.windowPacer.waitForServiceWrite(context.Background(), receiverHoldTestMessageBytes, true); err != nil {
 			t.Fatal(err)
 		}
-		if discovery, held := service.pacingHold(); discovery || held != 0 {
-			t.Fatalf("a lossy lane's retry lost its congestion evidence: discovery=%t held=%d", discovery, held)
+		if _, pace := service.pacingHold(); pace != 0 {
+			t.Fatalf("a held lane's retry on a queued path lost its congestion evidence: held=%d", pace)
 		}
 	})
 }

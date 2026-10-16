@@ -4,7 +4,7 @@
 // keyed by the lane-zero base), which owns their aggregate serialization clock,
 // opening probe and carrier flight. A lane whose receiver holds its delivered
 // bytes must not have that window read as queueing on the shared carrier
-// (windowPacingService.outstandingWithLock), or every sibling lane is paced
+// (windowPacingService.carrierFlightWithLock), or every sibling lane is paced
 // down to the rate the stalled lane is served.
 package connect
 

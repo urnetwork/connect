@@ -34,10 +34,7 @@ type windowBurstPacer struct {
 	serviceReserved ByteCount
 	// The receiver held this lane's last cumulative head longer than the
 	// service residence, so its unacknowledged bytes wait there.
-	receiverHeld bool
-	// The receiver acknowledged this lane out of order since its last
-	// cumulative head, so the next head may be repairing a hole.
-	receiverReordered     bool
+	receiverHeld          bool
 	serviceClosed         bool
 	afterWaitForTest      func()
 	afterAdmissionForTest func()
@@ -384,11 +381,15 @@ func (self *windowBurstPacer) waitForServiceReservation(ctx context.Context, byt
 		}
 		now := time.Now()
 		self.service.stateLock.Lock()
+		congestion := resend
 		if !resend {
 			self.serviceSent += ByteCount(byteCount)
 			self.serviceReserved = ByteCount(byteCount)
+		} else if self.receiverHeld {
+			// An unqueued path pins a held lane's retry on its receiver.
+			congestion = !self.service.unqueuedWithLock(self.service.roundTripEvidenceWithLock(now))
 		}
-		self.service.reserveWithLock(now, byteCount, self.rate, self.estimateRate, self.probeRate, self.probeLimit, resend, resend && !self.receiverHeld, &self.waiter)
+		self.service.reserveWithLock(now, byteCount, self.rate, self.estimateRate, self.probeRate, self.probeLimit, resend, congestion, &self.waiter)
 		self.service.stateLock.Unlock()
 		*reservation = windowPacingReservation{started: true, active: true, byteCount: byteCount, resend: resend}
 	}
@@ -571,8 +572,8 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 //
 // The lanes share one carrier, so they share its clock, probe, delivery and
 // flight. A lane whose receiver stops draining keeps its place on the clock,
-// but neither its held window nor its retries are evidence about the carrier
-// its siblings are paced by.
+// but while the path shows no queue, neither its held window nor its retries
+// are evidence about the carrier its siblings are paced by.
 type windowPacingService struct {
 	stateLock                sync.Mutex
 	references               int
@@ -1112,11 +1113,12 @@ func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, est
 }
 
 // A pacer charges its own service counters inside the same critical section.
-// Its retry is congestion evidence unless its receiver holds the lane.
+// Its retry is congestion evidence unless its receiver holds the lane on an
+// unqueued path.
 func (self *windowPacingService) reserveWithLock(now time.Time, byteCount int, rate, estimateRate, probeRate, probeLimit ByteCount, resend, congestion bool, waiter *windowPacingWaiter) time.Time {
 	// A recovery write is congestion evidence; it ends discovery and
-	// releases the held pace. A receiver-held lane's retry is explained by
-	// its receiver's wait, not by loss on the carrier its siblings share.
+	// releases the held pace. A receiver-held lane's retry on an unqueued
+	// path is explained by its receiver's wait, not by the shared carrier.
 	if congestion {
 		if self.queueObservedAt.IsZero() {
 			self.queueObservedAt = now
@@ -2353,30 +2355,45 @@ func (self *windowPacingService) backloggedWithLock(rate, flightRate ByteCount, 
 		return false
 	}
 	bound := self.flightBoundAtWithLock(flightRate, timing.residence)
+	unqueued := self.unqueuedWithLock(timing)
+	// A lower delivery estimate can shrink its own flight allowance after a
+	// permission-limited or compressed turn. Historical bytes do not let that
+	// lower bound revoke an admitted faster pace without queue residence.
+	if (float64(max(self.total, self.drainedSent)) < bound || rate < self.heldPacingRate) && unqueued {
+		return false
+	}
+	return self.carrierFlightWithLock(unqueued) > bound
+}
+
+// The latest round trip is within the backlog margin of the path minimum.
+// Receiver-timed samples already exclude compression; legacy ones include it.
+func (self *windowPacingService) unqueuedWithLock(timing windowReceiverRoundTripEstimate) bool {
 	compression := self.compression
 	if timing.count > 0 {
 		compression = 0
 	}
-	// A lower delivery estimate can shrink its own flight allowance after a
-	// permission-limited or compressed turn. Historical bytes do not let that
-	// lower bound revoke an admitted faster pace without queue residence.
-	if (float64(max(self.total, self.drainedSent)) < bound || rate < self.heldPacingRate) &&
-		timing.latest <= timing.minimum+compression+2*time.Millisecond {
-		return false
-	}
-	return self.outstandingWithLock() > bound
+	return timing.latest <= timing.minimum+compression+2*time.Millisecond
 }
 
 // Reserved bytes are still local. Cumulative delivery of every sibling tail
 // supplies a lower bound on ACKed wire bytes before send-loop application;
 // later application catches up to that bound without crediting it twice.
-//
-// A receiver-held lane's written, unacknowledged bytes wait at its receiver,
-// not on the shared carrier, so they leave the ACK-applied term. Lanes share
-// one service residence, the smallest receiver wait among them, so the flight
-// bound cannot cover one lane whose receiver stopped draining. The drained
-// checkpoint still bounds every lane's flight written since that proof.
 func (self *windowPacingService) outstandingWithLock() float64 {
+	return float64(max(0, self.sent-max(self.total, self.drainedSent)-self.reservedByteCount))
+}
+
+// On an unqueued path, a receiver-held lane's written, unacknowledged bytes
+// wait at its receiver, not on the shared carrier, so they leave the
+// ACK-applied term. Lanes share one service residence, the smallest receiver
+// wait among them, so the flight bound cannot cover one lane whose receiver
+// stopped draining. The drained checkpoint still bounds every lane's flight
+// written since that proof. A queued path keeps every lane's flight: a hole
+// repaired after carrier loss also waits at the receiver, and that queue
+// must still slow every lane.
+func (self *windowPacingService) carrierFlightWithLock(unqueued bool) float64 {
+	if !unqueued || len(self.receiverHeldLanes) == 0 {
+		return self.outstandingWithLock()
+	}
 	applied := self.sent - self.total - self.reservedByteCount
 	for _, lane := range self.receiverHeldLanes {
 		applied -= max(0, lane.serviceSent-lane.serviceAcked-lane.serviceReserved)
@@ -2389,18 +2406,12 @@ func (self *windowPacingService) outstandingWithLock() float64 {
 // is the path minimum plus the smallest receiver wait; a longer wait leaves
 // more of the lane's flight at its receiver than on the path. Without a path
 // measurement there is no residence to compare, so the hold stays as it was.
-//
-// A head after selective replies may be releasing a suffix held behind a
-// lost item. That wait is carrier loss, so it cannot hold the lane: the
-// lane's flight stays carrier flight and its retries congestion evidence.
 func (self *windowPacingService) observeReceiverHoldWithLock(lane *windowBurstPacer, receiverDelay time.Duration, at time.Time) {
-	reordered := lane.receiverReordered
-	lane.receiverReordered = false
 	residence := self.roundTripEvidenceWithLock(at).residence
 	if residence <= 0 {
 		return
 	}
-	held := !reordered && receiverDelay > residence
+	held := receiverDelay > residence
 	if held == lane.receiverHeld {
 		return
 	}
