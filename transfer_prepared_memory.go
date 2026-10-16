@@ -21,6 +21,10 @@ type preparedSendMemory struct {
 	required    ByteCount
 	flightMoved bool
 	closed      bool
+	// Recyclable credits have one immutable total envelope. Each physical
+	// chunk temporarily owns part of it, then returns that exact permission.
+	recyclable bool
+	inFlight   ByteCount
 }
 
 func (self *preparedSendMemory) availableLocked() ByteCount {
@@ -33,8 +37,8 @@ func (self *preparedSendMemory) require(bytes ByteCount) {
 	}
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
-	if !self.closed && !self.flightMoved {
-		self.required = max(self.required, self.retained+bytes)
+	if !self.closed && (!self.flightMoved || self.recyclable) {
+		self.required = max(self.required, addReceiveQueueByteCount(self.retained, bytes))
 	}
 	root.admissionLock.Unlock()
 }
@@ -45,6 +49,11 @@ func (self *preparedSendMemory) growRequired() bool {
 	}
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
+	if self.recyclable {
+		fits := !self.closed && self.required <= self.bytes
+		root.admissionLock.Unlock()
+		return fits
+	}
 	if self.closed || self.flightMoved {
 		open := !self.closed
 		root.admissionLock.Unlock()
@@ -74,7 +83,7 @@ func (self *preparedSendMemory) split(bytes, retained ByteCount) (*preparedSendM
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
 	defer root.admissionLock.Unlock()
-	if retained < 0 || bytes < retained || bytes > self.availableLocked() {
+	if self.recyclable || retained < 0 || bytes < retained || bytes > self.availableLocked() {
 		return nil, false
 	}
 	self.bytes -= bytes
@@ -87,6 +96,10 @@ func (self *preparedSendMemory) releaseUnused() {
 	}
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
+	if self.recyclable {
+		root.admissionLock.Unlock()
+		return
+	}
 	bytes := self.availableLocked()
 	self.bytes -= bytes
 	root.admissionLock.Unlock()
@@ -101,7 +114,7 @@ func (self *preparedSendMemory) trim(bytes ByteCount) bool {
 	}
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
-	if self.closed || bytes < self.retained || self.bytes < bytes {
+	if self.closed || self.recyclable || bytes < self.retained || self.bytes < bytes {
 		root.admissionLock.Unlock()
 		return false
 	}
@@ -121,7 +134,7 @@ func (self *preparedSendMemory) releaseUnusedAfterTransfer() {
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
 	bytes := ByteCount(0)
-	if self.flightMoved {
+	if self.flightMoved && !self.recyclable {
 		bytes = self.availableLocked()
 		self.bytes -= bytes
 	}
@@ -152,7 +165,12 @@ func (self *preparedSendMemory) release() {
 	root := self.budget.admissionRoot()
 	root.admissionLock.Lock()
 	bytes := self.bytes
-	self.bytes = 0
+	if self.recyclable && self.inFlight != 0 {
+		// The live flight can still refer to the original compact root and
+		// callback capsule. Cancel closes admission but not those owners.
+		bytes -= self.retained
+	}
+	self.bytes -= bytes
 	self.closed = true
 	root.admissionLock.Unlock()
 	if bytes > 0 {
@@ -230,6 +248,22 @@ func (self *sendItem) reservePreparedMemory(budget *TransferMemoryBudget, bytes 
 	root := budget.admissionRoot()
 	root.admissionLock.Lock()
 	defer root.admissionLock.Unlock()
+	for _, credit := range credits[:count] {
+		if !credit.recyclable {
+			continue
+		}
+		// Recovery uses one logical-group record per physical chunk. Mixing
+		// owners would require an additional retained allocation per item.
+		if count != 1 || self.acks.count != 1 || credit.closed || bytes <= 0 || bytes > credit.availableLocked() {
+			return false
+		}
+		credit.bytes -= bytes
+		credit.inFlight += bytes
+		credit.flightMoved = true
+		self.memoryBudget = budget
+		self.queueByteCount = bytes
+		return true
+	}
 	available := ByteCount(0)
 	for _, credit := range credits[:count] {
 		available = addReceiveQueueByteCount(available, credit.availableLocked())

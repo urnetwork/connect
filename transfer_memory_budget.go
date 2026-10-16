@@ -22,6 +22,9 @@ import (
 // every admitted byte through its ancestors, with one admission/resize lock
 // for the whole tree. Child ceilings may overlap (idle shares can be lent),
 // but their live owners can never collectively overdraw the root.
+// A protected child-role shrink defers only already-promised ingress permission
+// until old owners drain. Its reported total is the new target, not a revocation
+// of those existing promises; the root remains a strict physical admission cap.
 //
 // All methods are safe for concurrent use. Parent relationships are immutable.
 type TransferMemoryBudget struct {
@@ -62,12 +65,16 @@ type TransferMemoryBudget struct {
 	// One owner may protect its existing ingress windows from all sibling
 	// borrowers. The immutable pair is installed before publishing the tree.
 	ingressProtection atomic.Pointer[transferMemoryBudgetProtection]
+	// A child-role shrink cannot revoke ingress permission already promised
+	// to retained owners. This ceiling only drains; ordinary admission ignores it.
+	ingressDrainByteCount atomic.Int64
 }
 
 // A fixed pair of disjoint ingress windows, not additional byte capacity.
 // Unused permission remains available only to these descendants.
 type transferMemoryBudgetProtection struct {
-	budgets [2]*TransferMemoryBudget
+	budgets    [2]*TransferMemoryBudget
+	permission [2]atomic.Int64
 }
 
 // One member of an atomic role-driven resize within an immutable budget tree.
@@ -175,14 +182,15 @@ func (self *TransferMemoryBudget) TotalByteCount() ByteCount {
 
 // SetTotalByteCount retunes the budget capacity live (e.g. reallocating the
 // provider share to the client pair while providing is off). Shrinking does
-// not evict reserved bytes; the pool admits nothing new above the new total
-// until enough releases drain it.
+// not evict reserved bytes. Ordinary growth uses the new target immediately;
+// pre-existing protected child permission drains without raising the root.
 func (self *TransferMemoryBudget) SetTotalByteCount(totalByteCount ByteCount) {
 	self.SetTotalByteCounts(TransferMemoryBudgetTotal{Budget: self, TotalByteCount: totalByteCount})
 }
 
-// Resizes related ceilings at one admission boundary. Existing owners are not
-// evicted on shrink; new admission waits until the new permissions fit again.
+// Resizes related ceilings at one admission boundary. Child-role shrink keeps
+// already-promised ingress permission until old owners drain. Requested ingress
+// growth waits for actual target headroom; it never increases the root ceiling.
 func (self *TransferMemoryBudget) SetTotalByteCounts(totals ...TransferMemoryBudgetTotal) {
 	root := self.admissionRoot()
 	root.admissionLock.Lock()
@@ -192,9 +200,20 @@ func (self *TransferMemoryBudget) SetTotalByteCounts(totals ...TransferMemoryBud
 			panic("TransferMemoryBudget.SetTotalByteCounts: unrelated budget")
 		}
 	}
+	if protection := root.ingressProtection.Load(); protection != nil {
+		for _, protected := range protection.budgets {
+			for budget := protected.parent; budget != nil && budget != root; budget = budget.parent {
+				// Preserve obligations, not an old role's otherwise idle ceiling.
+				budget.ingressDrainByteCount.Store(addReceiveQueueByteCount(
+					budget.usedByteCount.Load(), budget.protectedUnusedByteCount(nil, nil, 0),
+				))
+			}
+		}
+	}
 	for _, total := range totals {
 		total.Budget.totalByteCount.Store(total.TotalByteCount)
 	}
+	root.refreshIngressPermissionWithLock()
 	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
 }
@@ -212,7 +231,9 @@ func (self *TransferMemoryBudget) ProtectIngressBudgets(pack, reorder *TransferM
 		root.ingressProtection.Load() != nil {
 		panic("TransferMemoryBudget.ProtectIngressBudgets: invalid ingress pair")
 	}
-	root.ingressProtection.Store(&transferMemoryBudgetProtection{budgets: [2]*TransferMemoryBudget{pack, reorder}})
+	protection := &transferMemoryBudgetProtection{budgets: [2]*TransferMemoryBudget{pack, reorder}}
+	root.ingressProtection.Store(protection)
+	root.refreshIngressPermissionWithLock()
 }
 
 // Reports immutable ancestry without taking an additional hierarchy lock.
@@ -233,7 +254,7 @@ func (self *TransferMemoryBudget) protectedUnusedByteCount(from, to *TransferMem
 		return 0
 	}
 	unused := ByteCount(0)
-	for _, protected := range protection.budgets {
+	for index, protected := range protection.budgets {
 		if !transferBudgetContains(protected, self) {
 			continue
 		}
@@ -244,9 +265,43 @@ func (self *TransferMemoryBudget) protectedUnusedByteCount(from, to *TransferMem
 		if transferBudgetContains(to, protected) {
 			used += bytes
 		}
-		unused = addReceiveQueueByteCount(unused, max(0, protected.totalByteCount.Load()-used))
+		unused = addReceiveQueueByteCount(unused, max(0, protection.permission[index].Load()-used))
 	}
 	return unused
+}
+
+// Admits deferred ingress growth only from unused target capacity. Existing
+// obligations may drain across a child shrink, but cannot fund new promises.
+// The root admission lock is held; the fixed pair requires no scratch owners.
+func (self *TransferMemoryBudget) refreshIngressPermissionWithLock() {
+	root := self.admissionRoot()
+	protection := root.ingressProtection.Load()
+	if protection == nil {
+		return
+	}
+	for index, protected := range protection.budgets {
+		permission := min(protection.permission[index].Load(), max(0, protected.totalByteCount.Load()))
+		protection.permission[index].Store(permission)
+	}
+	for index, protected := range protection.budgets {
+		target := max(0, protected.totalByteCount.Load())
+		// Already-live ingress bytes need no additional ancestor permission.
+		permission := max(protection.permission[index].Load(), min(target, protected.usedByteCount.Load()))
+		protection.permission[index].Store(permission)
+		growth := target - permission
+		for budget := protected.parent; budget != nil; budget = budget.parent {
+			growth = min(growth, transferBudgetAvailableByteCount(
+				budget.totalByteCount.Load(), budget.usedByteCount.Load(), 0, budget.protectedUnusedByteCount(nil, nil, 0),
+			))
+		}
+		protection.permission[index].Store(permission + growth)
+	}
+	for _, protected := range protection.budgets {
+		for budget := protected.parent; budget != nil && budget != root; budget = budget.parent {
+			obligation := addReceiveQueueByteCount(budget.usedByteCount.Load(), budget.protectedUnusedByteCount(nil, nil, 0))
+			budget.ingressDrainByteCount.Store(min(budget.ingressDrainByteCount.Load(), obligation))
+		}
+	}
 }
 
 // addFloor and removeFloor track the guaranteed floors of attached queues, so
@@ -270,23 +325,67 @@ func (self *TransferMemoryBudget) removeFloor(byteCount ByteCount) {
 // the path. Admission still consults Available; the ceiling does not.
 func (self *TransferMemoryBudget) LendableByteCount(ownFloorByteCount ByteCount) ByteCount {
 	otherFloors := max(0, ByteCount(self.floorByteCount.Load())-max(0, ownFloorByteCount))
-	return max(0, self.totalByteCount.Load()-otherFloors)
+	return transferBudgetAvailableByteCount(self.totalByteCount.Load(), 0, 0, otherFloors)
 }
 
-// Available is the unreserved remainder of the budget
+// Reports admissible bytes, including protected permission and draining child
+// roles. The snapshot is advisory; TryReserve linearizes the same calculation.
 func (self *TransferMemoryBudget) Available() ByteCount {
+	return self.availableWithGrants(nil)
+}
+
+// Subtracts nonnegative claims without turning a nonpositive resized ceiling
+// or an already-overdrawn legacy owner into positive permission by overflow.
+func transferBudgetAvailableByteCount(limit, used, granted, unused ByteCount) ByteCount {
+	if limit <= 0 || used < 0 || granted < 0 || unused < 0 || limit <= used {
+		return 0
+	}
+	remaining := limit - used
+	if remaining <= granted {
+		return 0
+	}
+	remaining -= granted
+	if remaining <= unused {
+		return 0
+	}
+	return remaining - unused
+}
+
+// Includes provisional intrusive-waiter grants without charging live ownership.
+// Grants and protected leaves share every ancestor in the same calculation.
+func (self *TransferMemoryBudget) availableWithGrants(granted map[*TransferMemoryBudget]ByteCount) ByteCount {
 	available := ByteCount(^uint64(0) >> 1)
-	protection := self.admissionRoot().ingressProtection.Load()
+	root := self.admissionRoot()
+	protection := root.ingressProtection.Load()
+	var ownProtected *TransferMemoryBudget
+	if protection != nil {
+		for index, protected := range protection.budgets {
+			if transferBudgetContains(self, protected) {
+				ownProtected = protected
+				available = transferBudgetAvailableByteCount(protection.permission[index].Load(), protected.usedByteCount.Load(), granted[protected], 0)
+				break
+			}
+		}
+	}
 	for budget := self; budget != nil; budget = budget.parent {
 		unused := ByteCount(0)
 		if protection != nil {
-			for _, protected := range protection.budgets {
-				if transferBudgetContains(protected, budget) && !transferBudgetContains(self, protected) {
-					unused = addReceiveQueueByteCount(unused, max(0, protected.totalByteCount.Load()-protected.usedByteCount.Load()))
+			for index, protected := range protection.budgets {
+				if transferBudgetContains(protected, budget) && protected != ownProtected {
+					unused = addReceiveQueueByteCount(unused, transferBudgetAvailableByteCount(
+						protection.permission[index].Load(), protected.usedByteCount.Load(), granted[protected], 0,
+					))
 				}
 			}
 		}
-		available = min(available, max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-unused))
+		limit := budget.totalByteCount.Load()
+		if limit < 0 {
+			return 0
+		}
+		if ownProtected != nil && budget != root && budget != ownProtected {
+			limit = max(limit, budget.ingressDrainByteCount.Load())
+		}
+		available = min(available, transferBudgetAvailableByteCount(limit, budget.usedByteCount.Load(), granted[budget], unused))
 	}
 	return available
 }
@@ -325,15 +424,14 @@ func (self *TransferMemoryBudget) TryReserve(byteCount ByteCount) bool {
 }
 
 func (self *TransferMemoryBudget) tryReserveWithLock(byteCount ByteCount) bool {
-	if byteCount < 0 {
+	if byteCount < 0 || byteCount > self.availableWithGrants(nil) {
 		return false
 	}
-	for budget := self; budget != nil; budget = budget.parent {
-		total := budget.totalByteCount.Load()
-		used := budget.usedByteCount.Load()
-		unused := budget.protectedUnusedByteCount(nil, self, byteCount)
-		if total < byteCount || total-byteCount < used || total-byteCount-used < unused {
-			return false
+	if byteCount == 0 {
+		for budget := self; budget != nil; budget = budget.parent {
+			if budget.totalByteCount.Load() < budget.usedByteCount.Load() {
+				return false
+			}
 		}
 	}
 	for budget := self; budget != nil; budget = budget.parent {
@@ -355,6 +453,7 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 			DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
 		}
 	}
+	root.refreshIngressPermissionWithLock()
 	root.admissionLock.Unlock()
 	self.notifyCapacityChanged()
 }
@@ -388,7 +487,26 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 		before := addReceiveQueueByteCount(budget.usedByteCount.Load(), budget.protectedUnusedByteCount(nil, nil, 0))
 		after := addReceiveQueueByteCount(budget.usedByteCount.Load(), growth)
 		after = addReceiveQueueByteCount(after, budget.protectedUnusedByteCount(self, target, byteCount))
-		if (growth > 0 || after > before) && budget.totalByteCount.Load() < after {
+		limit := budget.totalByteCount.Load()
+		if limit < 0 && (growth > 0 || after > before) {
+			root.admissionLock.Unlock()
+			return false
+		}
+		if protection := root.ingressProtection.Load(); protection != nil {
+			for index, protected := range protection.budgets {
+				if !transferBudgetContains(target, protected) {
+					continue
+				}
+				if budget == protected && growth > 0 && protection.permission[index].Load()-budget.usedByteCount.Load() < growth {
+					root.admissionLock.Unlock()
+					return false
+				}
+				if budget != root && budget != protected {
+					limit = max(limit, budget.ingressDrainByteCount.Load())
+				}
+			}
+		}
+		if (growth > 0 || after > before) && limit < after {
 			root.admissionLock.Unlock()
 			return false
 		}
@@ -405,6 +523,7 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 			budget.reservedByteCount.Add(byteCount)
 		}
 	}
+	root.refreshIngressPermissionWithLock()
 	root.admissionLock.Unlock()
 	if self != target && byteCount != 0 {
 		self.notifyCapacityChanged()
@@ -513,28 +632,21 @@ func (self *TransferMemoryBudget) notifyEligibleCapacityWaiters() {
 	if self.capacityWaiterCount.Load() == 0 {
 		return
 	}
-	availableByteCount := self.Available()
-	if availableByteCount <= 0 {
-		return
-	}
-
 	self.capacityWaitStateLock.Lock()
 	defer self.capacityWaitStateLock.Unlock()
+	self.admissionLock.Lock()
+	defer self.admissionLock.Unlock()
 	// Only the uncommon intrusive-waiter path needs this scratch map. Track
 	// grants per ancestor as well as at the root so a broad root does not wake
 	// every setup behind a single newly freed child receive window.
 	granted := make(map[*TransferMemoryBudget]ByteCount)
 	for waiter := self.capacityWaitHead; waiter != nil; {
 		nextWaiter := waiter.nextCapacityWaiter
-		eligible := waiter.requiredByteCount <= availableByteCount
-		for budget := waiter.budget; eligible && budget != nil; budget = budget.parent {
-			eligible = waiter.requiredByteCount <= max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-granted[budget])
-		}
+		eligible := waiter.requiredByteCount <= waiter.budget.availableWithGrants(granted)
 		if eligible {
 			self.removeCapacityWaiterWithLock(waiter)
 			select {
 			case waiter.notify <- struct{}{}:
-				availableByteCount -= waiter.requiredByteCount
 				for budget := waiter.budget; budget != nil; budget = budget.parent {
 					granted[budget] += waiter.requiredByteCount
 				}

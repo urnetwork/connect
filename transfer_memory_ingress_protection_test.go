@@ -1,7 +1,10 @@
 // Protected ingress permissions survive full roots, sibling borrowing and role changes.
 package connect
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // Returns one synthetic owner with independent provider and client descendants.
 func ingressProtectionTestBudgets() (root, client, send, pack, reorder, provider *TransferMemoryBudget) {
@@ -69,7 +72,7 @@ func TestTransferMemoryIngressProtectionCreditMove(t *testing.T) {
 	}
 }
 
-// Shrinking preserves old owners but atomically changes both ingress permissions.
+// Shrinking preserves already-promised ingress so an ACK can release old owners.
 func TestTransferMemoryIngressProtectionRoleResize(t *testing.T) {
 	root, client, send, pack, reorder, _ := ingressProtectionTestBudgets()
 	if !send.TryReserve(500) {
@@ -80,13 +83,14 @@ func TestTransferMemoryIngressProtectionRoleResize(t *testing.T) {
 		TransferMemoryBudgetTotal{Budget: pack, TotalByteCount: 100},
 		TransferMemoryBudgetTotal{Budget: reorder, TotalByteCount: 100},
 	)
-	if send.UsedByteCount() != 500 || send.TryReserve(1) || pack.TryReserve(1) {
-		t.Fatal("role shrink evicted an owner or admitted over its protected ceiling")
+	if send.UsedByteCount() != 500 || send.TryReserve(1) || pack.Available() != 100 || reorder.Available() != 100 {
+		t.Fatal("role shrink evicted an owner, admitted ordinary growth, or revoked promised ingress")
 	}
+	if !pack.TryReserve(100) || !reorder.TryReserve(100) || client.UsedByteCount() != 700 || root.UsedByteCount() > root.TotalByteCount() {
+		t.Fatal("incoming ACK could not consume existing permission before releasing old send ownership")
+	}
+	// The ACK, not a synthetic pre-ACK release, now permits the old owner to drain.
 	send.Release(100)
-	if !pack.TryReserve(100) || !reorder.TryReserve(100) || client.UsedByteCount() != 600 {
-		t.Fatal("drained old role did not reopen protected admission")
-	}
 	root.SetTotalByteCounts(
 		TransferMemoryBudgetTotal{Budget: client, TotalByteCount: 800},
 		TransferMemoryBudgetTotal{Budget: pack, TotalByteCount: 200},
@@ -102,6 +106,65 @@ func TestTransferMemoryIngressProtectionRoleResize(t *testing.T) {
 	}
 }
 
+// Requested protection growth waits for actual capacity without obstructing
+// the smaller ingress permission already promised at a full root.
+func TestTransferMemoryIngressProtectionDeferredGrowth(t *testing.T) {
+	root, client, send, pack, reorder, provider := ingressProtectionTestBudgets()
+	if !send.TryReserve(500) || !provider.TryReserve(200) {
+		t.Fatal("original ordinary owners did not fit")
+	}
+	root.SetTotalByteCounts(
+		TransferMemoryBudgetTotal{Budget: client, TotalByteCount: 1000},
+		TransferMemoryBudgetTotal{Budget: pack, TotalByteCount: 400},
+	)
+	if pack.TotalByteCount() != 400 || pack.Available() != 200 || reorder.Available() != 100 || send.TryReserve(1) || provider.TryReserve(1) {
+		t.Fatal("requested growth invented permission or blocked the existing ingress windows")
+	}
+	if !pack.TryReserve(200) || !reorder.TryReserve(100) || pack.TryReserve(1) || root.UsedByteCount() != 1000 {
+		t.Fatal("old protected capacity did not remain usable at the unchanged root")
+	}
+	provider.Release(100)
+	if pack.Available() != 100 || send.TryReserve(1) || !pack.TryReserve(100) || root.UsedByteCount() != 1000 {
+		t.Fatal("release did not admit deferred protection before an ordinary sibling could steal it")
+	}
+	provider.Release(100)
+	if pack.Available() != 100 || !pack.TryReserve(100) || root.UsedByteCount() != 1000 {
+		t.Fatal("deferred protection did not complete after its actual capacity drained")
+	}
+	pack.Release(400)
+	reorder.Release(100)
+	send.Release(500)
+	if root.UsedByteCount() != 0 || root.reservedByteCount.Load() != root.releasedByteCount.Load() {
+		t.Fatal("deferred permission growth changed actual ownership accounting")
+	}
+}
+
+// A Pack-to-reorder handoff consumes one existing claim even while its parent
+// drains above a reduced role target; protected-to-ordinary escape still refuses.
+func TestTransferMemoryIngressProtectionMoveWhileDraining(t *testing.T) {
+	root, client, send, pack, reorder, provider := ingressProtectionTestBudgets()
+	if !send.TryReserve(500) || !provider.TryReserve(200) || !pack.TryReserve(100) {
+		t.Fatal("original owners did not fit")
+	}
+	root.SetTotalByteCounts(
+		TransferMemoryBudgetTotal{Budget: client, TotalByteCount: 600},
+		TransferMemoryBudgetTotal{Budget: pack, TotalByteCount: 100},
+	)
+	if !pack.tryMoveReservation(reorder, 100) || pack.UsedByteCount() != 0 || reorder.UsedByteCount() != 100 || root.UsedByteCount() != 800 {
+		t.Fatal("reorder handoff required a duplicate reservation while the role drained")
+	}
+	if reorder.tryMoveReservation(send, 100) || !pack.TryReserve(100) || send.TryReserve(1) || client.UsedByteCount() != 700 {
+		t.Fatal("draining handoff escaped protection or revoked the next Pack's permission")
+	}
+	pack.Release(100)
+	reorder.Release(100)
+	send.Release(500)
+	provider.Release(200)
+	if root.UsedByteCount() != 0 || root.reservedByteCount.Load() != root.releasedByteCount.Load() {
+		t.Fatal("draining handoff leaked ancestor ownership")
+	}
+}
+
 // A protected owner's state never constrains an independently constructed device.
 func TestTransferMemoryIngressProtectionOwnerIsolation(t *testing.T) {
 	_, _, send, _, _, _ := ingressProtectionTestBudgets()
@@ -111,4 +174,31 @@ func TestTransferMemoryIngressProtectionOwnerIsolation(t *testing.T) {
 	}
 	send.Release(500)
 	other.Release(800)
+}
+
+// Invalid or exhausted target ceilings cannot wrap advisory subtraction into
+// positive capacity, with or without an admitted protected partition.
+func TestTransferMemoryIngressProtectionNonpositiveResize(t *testing.T) {
+	for _, protected := range []bool{false, true} {
+		for _, total := range []ByteCount{0, -1, math.MinInt64} {
+			root := NewTransferMemoryBudget(1000)
+			ordinary := NewTransferMemoryBudgetWithParent(800, root)
+			if protected {
+				pack := NewTransferMemoryBudgetWithParent(200, root)
+				reorder := NewTransferMemoryBudgetWithParent(100, root)
+				root.ProtectIngressBudgets(pack, reorder)
+			}
+			if !ordinary.TryReserve(1) {
+				t.Fatal("initial owner did not fit")
+			}
+			root.SetTotalByteCount(total)
+			if root.Available() != 0 || ordinary.Available() != 0 || ordinary.TryReserve(1) || ordinary.TryReserve(0) {
+				t.Errorf("protected=%t total=%d: nonpositive root invented capacity", protected, total)
+			}
+			ordinary.Release(1)
+			if root.UsedByteCount() != 0 || root.reservedByteCount.Load() != root.releasedByteCount.Load() {
+				t.Fatal("invalid target changed retained owner accounting")
+			}
+		}
+	}
 }

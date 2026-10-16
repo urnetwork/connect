@@ -72,6 +72,11 @@ func (self *sendItem) reserveFrameRewrite(frameByteCount ByteCount, frameCount i
 	if byteCount <= self.queueByteCount {
 		return true
 	}
+	if self.recyclablePreparedMemory() != nil {
+		// Its accepted immutable envelope includes all permitted rewrites;
+		// growing here would steal progress capacity from another old owner.
+		return false
+	}
 	if !self.memoryBudget.TryReserve(byteCount - self.queueByteCount) {
 		return false
 	}

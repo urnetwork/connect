@@ -9341,12 +9341,16 @@ sendSequenceLoop:
 				frameCount := len(sendPack.frameList())
 				messageByteCount := sendPack.serializedMessageByteCount()
 				maxFrames, maxMessageByteCount := self.readyDrainChunkLimits(flightPolicy)
+				preparedMemory := sendPack.ackRecord().preparedMemory()
 
 				// H3's explicit flow reserve needs same-flow coalescing. Carriers
 				// without that reserve retain ingress-order coalescing. H1 drains
 				// only Packs that are already ready; it never waits to fill a batch,
 				// so a sparse request or TCP ACK keeps its original latency.
+				// Recyclable credit belongs to one physical acknowledgement owner.
+				// Ordinary callbacks may still share the unchanged bulk-write path.
 				for !bypassedRecoveryAdmission &&
+					(preparedMemory == nil || !preparedMemory.recyclable) &&
 					sendPackCount < len(sendPacks) &&
 					frameCount < maxFrames {
 					var nextSendPack *SendPack
@@ -9381,7 +9385,12 @@ sendSequenceLoop:
 							self.sendContractAcked &&
 							0 < len(self.sendItems) &&
 							self.sendContract.canUpdate(nextMessageByteCount))
-					compatible := sendPack.Ack == nextSendPack.Ack &&
+					nextPreparedMemory := nextSendPack.ackRecord().preparedMemory()
+					// A logical group must reach its disposition/cursor path even
+					// when all its frames fit in this ordinary physical Pack.
+					compatible := !nextSendPack.logicalGroup &&
+						(nextPreparedMemory == nil || !nextPreparedMemory.recyclable) &&
+						sendPack.Ack == nextSendPack.Ack &&
 						sendPack.ForceUnwrapped == nextSendPack.ForceUnwrapped &&
 						frameCount+nextFrameCount <= maxFrames &&
 						nextMessageByteCount <= maxMessageByteCount &&
@@ -12495,8 +12504,16 @@ func (self *SendSequence) ackItem(item *sendItem) {
 			}
 		}
 	}
-	item.acks.invoke(nil)
-	self.returnSendItem(item)
+	if item.recyclablePreparedMemory() != nil {
+		// Replay eligibility must not precede return of the encoded wire and
+		// its prepaid serializer permission. The one record survives pooling.
+		acks := item.acks
+		self.returnSendItem(item)
+		acks.invoke(nil)
+	} else {
+		item.acks.invoke(nil)
+		self.returnSendItem(item)
+	}
 }
 
 func (self *SendSequence) releaseRetainedSendItems(err error) {
@@ -13450,6 +13467,7 @@ func clearSendItemPool() {
 
 func (self *sendItem) messagePoolReturn() {
 	MessagePoolReturn(self.transferFrameBytes)
+	self.transferFrameBytes = nil
 	self.releaseMemory()
 	*self = sendItem{}
 	select {
