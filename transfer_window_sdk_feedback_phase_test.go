@@ -15,7 +15,7 @@ func TestWindowPathSdkDuplexRecoversAfterInitialFeedbackBarrier(t *testing.T) {
 	checkWindowSdkCell(t, windowPathCell{
 		SenderProfile: &profiles[1], ReceiverProfile: &profiles[10],
 		ProfileFixtureSha256: digest, Bidirectional: true,
-		RoundTrip: 300 * time.Microsecond, Flows: 8, RoundRobinOffer: true,
+		RoundTrip: 300 * time.Microsecond, Flows: 8,
 		Payload: 1280, Rate: 125000000,
 		InitialLogicalAckRelease: 50*time.Millisecond + 100*time.Microsecond,
 	})

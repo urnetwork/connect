@@ -32,7 +32,7 @@ func checkWindowStaticLongRecovery(t *testing.T, roundTrip time.Duration, lanes 
 	readings := measureWindowPathArms(t, 8*residence, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 		cell := windowPathCell{
 			Arm: arm, RoundTrip: roundTrip, Compression: 10 * time.Millisecond,
-			Flows: lanes, Lanes: lanes, RoundRobinOffer: true,
+			Flows: lanes, Lanes: lanes,
 			Payload: 1280, Budget: mib(48), Rate: physicalRate,
 			Warmup: 64 * residence,
 		}

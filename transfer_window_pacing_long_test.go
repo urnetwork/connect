@@ -14,7 +14,7 @@ func TestWindowPathServiceLongCompressedFeedback(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	readings := measureWindowPathArms(t, time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 		return windowPathCell{Arm: arm, RoundTrip: 400 * time.Millisecond,
-			Compression: 50 * time.Millisecond, Flows: 8, RoundRobinOffer: true, Payload: 1280,
+			Compression: 50 * time.Millisecond, Flows: 8, Payload: 1280,
 			Budget: mib(48), Rate: 12500000, Drop: arm == "delivery", Warmup: 2335544320 * time.Nanosecond}
 	})
 	ceiling, candidate := readings[0], readings[1]
@@ -36,9 +36,9 @@ func TestWindowPathServiceAcrossRepeatedDrains(t *testing.T) {
 	delays := []time.Duration{0, time.Millisecond, 3 * time.Millisecond}
 	for _, payload := range []int{16 * 1024, 64 * 1024} {
 		t.Run(fmt.Sprintf("payload=%d", payload), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			reference := windowPathCell{Arm: "ceiling", RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
-				Flows: 1, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: 125000000,
+				Flows: 1, Payload: payload, Budget: mib(48), Rate: 125000000,
 				Warmup: 2301500 * time.Microsecond, PacingWakeDelay: delays[len(delays)-1]}
 			arms, trials := []string{"ceiling"}, map[string]windowPathCell{"ceiling": reference}
 			for _, delay := range delays {

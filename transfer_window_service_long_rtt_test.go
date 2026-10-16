@@ -34,7 +34,7 @@ func TestWindowPathServiceRoundTripGrowthBeyondOldRing(t *testing.T) {
 // and TestWindowPathDispatchQualityPhaseProbe share these exact cells.
 func windowLongRingGrowthCell(arm string, offset time.Duration) windowPathCell {
 	cell := windowPathCell{Arm: arm, RoundTrip: 1200 * time.Millisecond,
-		Compression: 10 * time.Millisecond, Flows: 8, Lanes: 8, RoundRobinOffer: true,
+		Compression: 10 * time.Millisecond, Flows: 8, Lanes: 8,
 		Payload: 1280, Budget: mib(48), Rate: 12500000, Warmup: 12 * time.Second}
 	if arm == "delivery" {
 		cell.QualityChanged = true
