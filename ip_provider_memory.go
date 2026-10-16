@@ -276,6 +276,11 @@ func (self *RemoteUserNatProvider) receiveIngressFrame(source TransferPath, fram
 // Dedicated TCP return producers must still make progress when replay owners
 // fill the NAT child. This is a partition of the fixed claim, not extra root
 // capacity. A blocked producer borrows its already-charged NAT packet roots.
+//
+// Every TCP flow's producer shares these two slots, and a blocked producer
+// waits in arrival order: a finished operation's slot is reserved for the
+// oldest waiter before the finishing producer, back for its next socket read,
+// can take it again.
 func (self *RemoteUserNatProvider) startReturnMemoryOperation(packets [][]byte, recovery receiveRecoveryMode) (natMemoryReservation, bool) {
 	if self.tcpReturnMemory == nil || !recovery.waitsForProviderReturnAdmission() {
 		return self.startMemoryOperation(providerPacketOperationBytes(packets))
@@ -290,18 +295,16 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperation(packets [][]byte, 
 	if bytes > kib(8) || !self.memoryOperations.start() {
 		return natMemoryReservation{}, false
 	}
-	for {
-		changed := self.tcpReturnMemory.CapacityNotify()
-		if memory, ok := reserveNatMemory(self.tcpReturnMemory, kib(32)); ok {
-			return memory, true
-		}
+	if reserved, waiter := self.tcpReturnMemory.tryReserveOrQueue(kib(32)); !reserved {
 		select {
 		case <-self.ctx.Done():
+			waiter.abandon()
 			self.memoryOperations.finish()
 			return natMemoryReservation{}, false
-		case <-changed:
+		case <-waiter.ready:
 		}
 	}
+	return natMemoryReservation{budget: self.tcpReturnMemory, bytes: kib(32)}, true
 }
 
 func providerPacketOperationBytes(packets [][]byte) ByteCount {
