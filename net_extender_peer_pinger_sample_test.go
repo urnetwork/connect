@@ -165,6 +165,9 @@ func TestExtenderPeerPingerSampleFollowsTheDirectory(t *testing.T) {
 	waitForPeerPingerStatus(t, pinger, "a full sample", func(status ExtenderPeerPingerStatus) bool {
 		return status.SampledPeerCount == 16
 	})
+	// a pass publishes its status before it schedules the sample; one more
+	// clock read is a later pass, which begins only once that schedule is done
+	fixture.clock.waitForReads(t, 1)
 	dueTimes := func() map[string]time.Time {
 		pinger.stateLock.Lock()
 		defer pinger.stateLock.Unlock()
@@ -177,6 +180,9 @@ func TestExtenderPeerPingerSampleFollowsTheDirectory(t *testing.T) {
 		return keyHexDueTimes
 	}
 	firstDueTimes := dueTimes()
+	if len(firstDueTimes) != 16 {
+		t.Fatalf("the schedule holds %d sampled members, want 16", len(firstDueTimes))
+	}
 	fixture.clock.waitForReads(t, 3)
 	if keptDueTimes := dueTimes(); !maps.Equal(firstDueTimes, keptDueTimes) {
 		t.Fatal("a pass without a refresh moved the sample or its schedule")

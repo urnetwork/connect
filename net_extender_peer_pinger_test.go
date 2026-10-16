@@ -470,7 +470,14 @@ func TestExtenderPeerPingerSpreadBoundsTheFirstPing(t *testing.T) {
 	waitForPeerPingerStatus(t, pinger, "twelve peers", func(status ExtenderPeerPingerStatus) bool {
 		return status.PeerCount == 12
 	})
+	// the status precedes its pass's schedule; a later pass's read follows it
+	fixture.clock.waitForReads(t, 1)
 	pinger.stateLock.Lock()
+	if len(pinger.peers) != 12 {
+		peerCount := len(pinger.peers)
+		pinger.stateLock.Unlock()
+		t.Fatalf("the schedule holds %d peers, want 12", peerCount)
+	}
 	for keyHex, peer := range pinger.peers {
 		if peer.dueTime.Before(startTime) || startTime.Add(time.Hour).Before(peer.dueTime) {
 			pinger.stateLock.Unlock()
