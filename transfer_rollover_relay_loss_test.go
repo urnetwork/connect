@@ -367,9 +367,10 @@ func exerciseRolloverRelayLoss(t *testing.T, loss rolloverRelayLoss, messageCoun
 
 // The connect half of the M2 churn stall (server
 // TestProxyContractChurnLoadFreePayerCap): at the first contract rollover the
-// platform retired the sender's resident and silently dropped what it held. Whatever that loss contains, the sequence
-// must deliver everything exactly once, without an acknowledgement failure,
-// and within a few retransmit backoffs rather than an ack lifetime.
+// platform retired the sender's resident and silently dropped what it held.
+// Whatever that loss contains, the sequence must deliver everything exactly
+// once, without an acknowledgement failure, and within a few retransmit
+// backoffs rather than an ack lifetime.
 func TestContractRolloverRecoversAfterRelayGenerationLoss(t *testing.T) {
 	// far below the 60 s ack lifetime, and above the cold 2 s retransmit
 	// floor plus its backoff, which a burst sender with no samples pays
