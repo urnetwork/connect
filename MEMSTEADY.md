@@ -4509,3 +4509,54 @@ ALL/MAIN/PERF campaign remain pending. In particular, the 32 MiB iOS profile on
 Android and the normal 64 MiB Android profile still require the complete device
 workload; neither native iOS footprint nor a new throughput baseline follows
 from these passes.
+
+### 2026-10-17: partial Pixel iOS32 physical collection — not qualified
+
+The fresh canonical PERF attempt `attempt-02-dm6pile763dc` collected only the
+Pixel `3B161FDJG001KT` control/Wi-Fi DIRECT and H1 observations before failing
+closed. Source heads were Connect `620d2821660f8e7795f6c5d61ea74ac219a3ceed`,
+Server `ec3dbdec6205fb3f946514837854f18b101794fb` and SDK
+`c72729efe1bb6dff5e1aa557a035fda3a116b304`. The profile was
+`ios-memory-audit-v2`: 32-MiB DeviceLocal target and 32-MiB Go soft limit on
+Android. This is not a native iOS footprint measurement.
+
+| Observation | Measured result | Qualification |
+| --- | --- | --- |
+| DIRECT fast.com | Three completed displays: 510, 550, 460 Mbit/s | Valid control observation; not a tunnel result |
+| H1 fast.com | Timeout, valid 40-Mbit/s display, timeout; the two 90-second timeouts displayed invalid 30 and 7.2 Mbit/s | Invalid H1 observation; do not average failed displays into a speed |
+| H1 active Go-runtime peak | 28,676,128 B (27.35 MiB) | Below 32 MiB in this limited sampled interval only |
+| H1 quiet maximum / p50 / p95 | 26,775,584 / 25,501,728 / 26,161,184 B (25.54 / 24.32 / 24.95 MiB) | Recovery observations, not a complete profile pass |
+| H1 final quiet sample | 24,875,040 B (23.72 MiB), zero outstanding packet-pool owners | No retained pool-owner leak shown at this boundary |
+| Overall reported runtime peak, including auxiliary observations | 30,003,232 B (28.61 MiB) | Do not substitute this for the active-only peak or native footprint |
+
+Five H1 Wikipedia navigations completed. Cold document TTFB/load were
+2,934.7/3,243.4 ms; medians were 209.9/560.4 ms. DIRECT medians were
+47.5/222.2 ms. These are one control bracket, not a paired candidate comparison.
+The single valid H1 Fast result took 64.205 seconds and reported
+131,220,598 completed page-target encoded bytes, yielding 16.35 Mbit/s over
+that observed window. Its displayed 40 Mbit/s is a different estimator.
+Completed page-target bytes exclude worker-owned and partly canceled transfers;
+the small byte count in the third failed probe is not total tunnel traffic.
+
+The H1 collector retained 713 eligible samples and a 331.222-second quiet
+window. Tunnel counters advanced to roughly 396.56 MB ingress, proving traffic
+progress but not locating either Fast stall. Quiet-window counter edges occur
+after Chrome cleanup and cannot identify the failed active interval. The next
+bounded diagnostic must retain browser completion state and packet/trace
+measurements bracketed around the actual Fast attempt.
+
+The physical phase explicitly reports `collection_only=true`, only 2/560
+observations, `physical=false`, `lowbar=false`, `memsteady=false`, and cleanup
+true. Its required Fast child and coverage gates failed. No Galaxy, cellular,
+P2P, candidate arm or Android64 result was qualified; no baseline is updated.
+The independent correctness phase also failed before product assertions on a
+cached Docker image-reference spelling mismatch. Its verified repair and a new
+full physical replay are separate requirements, not reasons to relabel this
+attempt successful. Always-cleanup and runner/observer joins completed.
+
+Evidence: retained chronology
+`go1272-qualification.NmFy9i/continuous-offer-h1/canonical-integrated-parents-v1/postmerge-full-current-01/physical-full-current.Xq5xVg/attempt-02/`,
+especially `perf/phase-physical.json` and its linked raw workload/telemetry
+artifacts. Fresh full Android-surrogate iOS32 and normal Android64 MEMSTEADY /
+PERFVAR qualification remains required; Android cannot prove the signed iOS
+extension's kernel lifetime footprint stays below 50 MiB.
