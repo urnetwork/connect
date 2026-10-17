@@ -3,6 +3,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -72,7 +73,10 @@ func TestFifoRepairRequiresExactPhysicalProvenance(t *testing.T) {
 		{name: "original after creation", prepare: func(f fifoRepairFixture, _, _ *sequenceTag, _ *bool) {
 			f.items[1].pacingSentAtNanos = f.now.Add(time.Hour).UnixNano()
 		}},
-		{name: "unconfirmed original", prepare: func(f fifoRepairFixture, _, _ *sequenceTag, _ *bool) { f.items[1].rttState = sendItemRttWritePending }},
+		{name: "unconfirmed original", prepare: func(f fifoRepairFixture, _, _ *sequenceTag, _ *bool) {
+			// An initial pending write has not acquired successful H1 evidence.
+			f.items[1].rttState, f.items[1].rttH1 = sendItemRttWritePending, false
+		}},
 		{name: "original not H1", prepare: func(f fifoRepairFixture, _, _ *sequenceTag, _ *bool) { f.items[1].rttH1 = false }},
 		{name: "no monotonic epoch", prepare: func(f fifoRepairFixture, _, _ *sequenceTag, _ *bool) {
 			f.sequence.client.feedbackTimeBase = time.Time{}
@@ -299,6 +303,83 @@ func TestFifoRepairSelectedPhysicalCopyInvalidatesProof(t *testing.T) {
 				if string(pack.MessageId) != string(item.messageId.Bytes()) || s.resendWriteCount.Load() != 1 || item.carrierChanged {
 					t.Fatal("selected copy did not use the unchanged physical FIFO")
 				}
+			}
+		}()
+	}
+}
+
+// A completed earlier copy invalidates RTT sampling, not FIFO ordering. An
+// initial refusal followed by a successful retry still lacks initial-H1 proof.
+func TestFifoRepairPriorPhysicalCopiesPreserveInitialProof(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, test := range []struct {
+		name         string
+		initialFails bool
+		kind         sendRecoveryKind
+	}{
+		{name: "earlier ordinary copy", kind: sendRecoveryNone},
+		{name: "earlier selected eviction copy with unchanged ordinary count", kind: sendRecoveryEviction},
+		{name: "failed initial then successful ordinary copy", initialFails: true, kind: sendRecoveryNone},
+		{name: "failed initial then successful selected eviction copy", initialFails: true, kind: sendRecoveryEviction},
+	} {
+		t.Log(test.name)
+		func() {
+			s, item, _, _ := newRecoveryAccountingFixture(t)
+			s.client.feedbackTimeBase = time.Now().Add(-time.Second)
+			floor := s.client.feedbackArrivalNanos(time.Now())
+			route := make(Route, 1)
+			writer := &fifoRepairCopyWriter{route: route, fail: test.initialFails,
+				windowPacingPolicyWriter: windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{generation: 2, h1Only: true}}}
+			s.contractMultiRouteWriter = writer
+			consume := func() {
+				t.Helper()
+				if len(route) != 1 {
+					t.Fatal("successful physical copy was not written")
+				}
+				wire := <-route
+				pack := decodeSendPackLifecycleWirePack(t, wire)
+				MessagePoolReturn(wire)
+				if string(pack.MessageId) != string(item.messageId.Bytes()) {
+					t.Fatal("physical copy changed identity")
+				}
+			}
+			disposition, err := s.writeMaybeWrappedBytes(item.transferFrameBytes, TransferPath{}, true, item, false, false)
+			if test.initialFails {
+				if !errors.Is(err, errTransferRouteWriteTimeout) || len(route) != 0 || item.rttH1 {
+					t.Fatal("initial physical refusal acquired H1 evidence")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				s.observeCarrierWrite(item, disposition)
+				consume()
+				if !item.rttH1 || item.rttState != sendItemRttWriteConfirmed {
+					t.Fatal("initial physical H1 write was not confirmed")
+				}
+			}
+			first := item.pacingSentAtNanos
+			writer.fail = false
+			if err := s.writeSelectedRecovery(item, sendRecoverySelection{kind: test.kind}); err != nil {
+				t.Fatal(err)
+			}
+			consume()
+			wantSends := 2
+			if test.kind == sendRecoveryEviction {
+				wantSends = 1
+			}
+			if item.rttState != sendItemRttUnavailable || item.rttH1 == test.initialFails ||
+				item.pacingSentAtNanos != first || item.sendCount != wantSends || s.resendWriteCount.Load() != 1 {
+				t.Fatal("earlier copy did not preserve the initial physical evidence independently of RTT ambiguity")
+			}
+			prefix := &sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: 0},
+				expectsAck: true, carrierRoute: route, reliableCarrierObserved: true}
+			s.sendItems = append([]*sendItem{prefix}, s.sendItems...)
+			s.sendBufferSettings.DeliverySizedWindowScale = 2
+			s.fifoRepair = fifoRepairState{generation: 2, generationStartNanos: floor}
+			s.prepareFifoRepair(prefix, sequenceTag{set: true, sendTime: 100}, sequenceTag{set: true, sendTime: 200}, false)
+			if s.fifoRepair.pending.set == test.initialFails {
+				t.Fatalf("physical initial failure=%t yielded pending proof=%t", test.initialFails, s.fifoRepair.pending.set)
 			}
 		}()
 	}
