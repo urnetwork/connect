@@ -974,6 +974,22 @@ type windowServiceSample struct {
 	receiverLastAtNanos  int64
 	receiverBytes        ByteCount
 	supply               windowServiceSupply
+	// The first raw checkpoint is excluded from a within-sample numerator.
+	// Keep the selected bytes' evidence separately instead of subtracting
+	// extrema or completeness from the whole sample after aggregation.
+	afterFirst windowServiceCoverage
+}
+
+// A value summary owns only its included bytes and clocks. Samples retain one
+// suffix summary, so tied or reordered first checkpoints need no event list.
+type windowServiceCoverage struct {
+	firstAtNanos         int64
+	lastAtNanos          int64
+	bytes                ByteCount
+	receiverFirstAtNanos int64
+	receiverLastAtNanos  int64
+	receiverBytes        ByteCount
+	supply               windowServiceSupply
 }
 
 // Offer coverage is separate from raw delivery ownership. Missing production
@@ -997,16 +1013,60 @@ type windowServiceSupply struct {
 	headComplete       bool
 }
 
-// Merge bounded provenance before changing either summary's raw endpoints.
-// Receiver clocks reuse the existing sample fields, including feedback summaries.
+// Copy full provenance without the suffix, queue flags or bucket placement.
+func (self windowServiceSample) coverage() windowServiceCoverage {
+	return windowServiceCoverage{
+		firstAtNanos: self.firstAtNanos, lastAtNanos: self.lastAtNanos, bytes: self.bytes,
+		receiverFirstAtNanos: self.receiverFirstAtNanos, receiverLastAtNanos: self.receiverLastAtNanos,
+		receiverBytes: self.receiverBytes, supply: self.supply,
+	}
+}
+
+// The excluded checkpoint still anchors elapsed time and the first arrival
+// gap. It never lends its physical offer to the selected byte numerator.
+func (self windowServiceSample) coverageAfterFirst() windowServiceCoverage {
+	selected := self.afterFirst
+	if selected.bytes > 0 {
+		selected.supply.maximumGap = max(selected.supply.maximumGap, time.Duration(selected.firstAtNanos-self.firstAtNanos))
+		if self.receiverBytes == self.bytes && selected.receiverBytes == selected.bytes {
+			selected.supply.receiverMaximumGap = max(selected.supply.receiverMaximumGap, time.Duration(selected.receiverFirstAtNanos-self.receiverFirstAtNanos))
+		}
+	}
+	return selected
+}
+
+// Merge the suffix before callers update the sample's raw endpoints or bytes.
+// An earlier first checkpoint selects all old bytes; an equal one selects only
+// both suffixes; a later incoming checkpoint selects all its bytes.
 func (self *windowServiceSample) mergeSupply(other windowServiceSample) {
 	if other.bytes <= 0 {
 		return
 	}
 	if self.bytes <= 0 {
-		self.supply = other.supply
-		self.receiverFirstAtNanos, self.receiverLastAtNanos = other.receiverFirstAtNanos, other.receiverLastAtNanos
-		self.receiverBytes = other.receiverBytes
+		self.afterFirst = other.afterFirst
+	} else if other.firstAtNanos < self.firstAtNanos {
+		selected := other.afterFirst
+		selected.merge(self.coverage())
+		self.afterFirst = selected
+	} else if other.firstAtNanos == self.firstAtNanos {
+		self.afterFirst.merge(other.afterFirst)
+	} else {
+		self.afterFirst.merge(other.coverage())
+	}
+	all := self.coverage()
+	all.merge(other.coverage())
+	self.supply = all.supply
+	self.receiverFirstAtNanos, self.receiverLastAtNanos = all.receiverFirstAtNanos, all.receiverLastAtNanos
+	self.receiverBytes = all.receiverBytes
+}
+
+// Merge bounded provenance before advancing either summary's raw endpoints.
+func (self *windowServiceCoverage) merge(other windowServiceCoverage) {
+	if other.bytes <= 0 {
+		return
+	}
+	if self.bytes <= 0 {
+		*self = other
 		return
 	}
 	self.supply.recorded = self.supply.recorded || other.supply.recorded
@@ -1048,13 +1108,21 @@ func (self *windowServiceSample) mergeSupply(other windowServiceSample) {
 		self.receiverLastAtNanos = max(self.receiverLastAtNanos, other.receiverLastAtNanos)
 	}
 	self.receiverBytes += other.receiverBytes
+	self.firstAtNanos = min(self.firstAtNanos, other.firstAtNanos)
+	self.lastAtNanos = max(self.lastAtNanos, other.lastAtNanos)
+	self.bytes += other.bytes
 }
 
-// Continuous samples retain the existing rule. A discontinuous interval needs
-// all credited offers before its left endpoint in the selected clock, or an
+// Continuous confirmed samples retain the existing rule. Discontinuous intervals
+// need all credited offers before their left endpoint in the selected clock, or an
 // exact selected tail whose own queue covers the entire interval, not one gap.
 // That queue uses its own captured baseline, separately from whole-credit supply.
 func (self windowServiceSupply) covers(receiverStart int64, span int64, interval time.Duration, receiverTimed bool) bool {
+	// Close replies cannot replace missing confirmed physical supply.
+	// Legacy and unknown-baseline cold samples retain their fallback.
+	if self.recorded && !self.complete && self.minimumPath > 0 {
+		return false
+	}
 	gap := self.maximumGap
 	if receiverTimed {
 		gap = self.receiverMaximumGap
@@ -1458,7 +1526,7 @@ func (self *windowPacingService) observeAckSampleWithLock(credit windowServiceAc
 	bytes, receiverTiming := credit.bytes, credit.receiverTiming
 	self.serviceEpochByteBase -= bytes
 	timing := self.roundTripEvidenceWithLock(at)
-	ackSample := windowServiceSample{firstAtNanos: at.UnixNano(), lastAtNanos: at.UnixNano(), bytes: bytes,
+	ackSample := windowServiceSample{firstAtNanos: at.UnixNano(), firstBytes: bytes, lastAtNanos: at.UnixNano(), bytes: bytes,
 		supply: windowServiceSupply{recorded: credit.offerRecorded,
 			complete: credit.offerRecorded && credit.offerComplete && credit.firstSentAtNanos > 0 &&
 				credit.lastSentAtNanos >= credit.firstSentAtNanos && timing.minimum > 0,
@@ -1635,6 +1703,11 @@ func (self *windowPacingService) completeFeedbackCycleWithLock() {
 	completeDrain := self.drained && self.total >= self.drainedSent ||
 		!self.feedbackDrainAt.IsZero() && self.feedbackDrainPending == 0 && cycle.lastAtNanos <= self.feedbackDrainAt.UnixNano()
 	if completeDrain {
+		// The new boundary owns no bytes, so every real credit is selected.
+		// Repeated completion must not merge that synthetic checkpoint back.
+		if cycle.firstBytes > 0 {
+			cycle.afterFirst = cycle.coverage()
+		}
 		cycle.supply.maximumGap = max(cycle.supply.maximumGap, time.Duration(cycle.firstAtNanos-self.feedbackCycleBefore.UnixNano()))
 		cycle.receiverBytes = 0
 		cycle.firstAtNanos, cycle.firstBytes = self.feedbackCycleBefore.UnixNano(), 0
@@ -1944,7 +2017,8 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				} else if newer.supply.rawClock {
 					receiverStart = newer.firstAtNanos
 				}
-				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, newer.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0)
+				selected := newer.coverageAfterFirst()
+				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, selected.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0)
 			} else {
 				invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
 			}
@@ -1992,9 +2066,13 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				receiverSpan = newer.receiverLastAtNanos - samples[j].receiverFirstAtNanos
 				firstQueued = samples[j].firstQueued
 				candidateBytes += samples[j].bytes - samples[j].firstBytes
-				combined := coverage
-				combined.mergeSupply(*samples[j])
+				combined := coverage.coverage()
+				combined.merge(samples[j].coverageAfterFirst())
 				candidateSupply = combined.supply
+				candidateSupply.maximumGap = max(candidateSupply.maximumGap, time.Duration(combined.firstAtNanos-samples[j].firstAtNanos))
+				if receiverTimed && combined.receiverBytes == combined.bytes {
+					candidateSupply.receiverMaximumGap = max(candidateSupply.receiverMaximumGap, time.Duration(combined.receiverFirstAtNanos-samples[j].receiverFirstAtNanos))
+				}
 				headStart = 0
 				offerStart = 0
 				if samples[j].supply.headComplete {
@@ -2115,7 +2193,8 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				if cycle.supply.rawClock {
 					receiverStart = cycle.firstAtNanos
 				}
-				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, cycle.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0) {
+				selected := cycle.coverageAfterFirst()
+				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, selected.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0) {
 					completedFallback = true
 					break
 				}
