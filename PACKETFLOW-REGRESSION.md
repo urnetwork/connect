@@ -279,3 +279,130 @@ Sol executed the separate eight-root OLD-source adjacency overlay once normally 
 The other two failures are fixture failures, **not additional demonstrated production defects**: `MixedHistoryPreservesIndependentTail` failed setup because route bytes did not match the recorded physical owner; `SiblingOnlyPreservesAttempt` failed setup because its third original did not park before physical dispatch. The race run was held rather than repeated. Astra is investigating a separately versioned fixture correction; the released original overlay and its failed result remain unchanged. No production pacing fix is qualified.
 
 Raw result: `go1272-qualification.NmFy9i/continuous-offer-h1/canonical-integrated-parents-v1/postmerge-full-current-01/pacing-adjacency-old.omith3/normal.go.json`, relative to `/Volumes/data/urnetwork-h1-chronology.Y0OYTR/`; SHA256 `a70a3ae13add6881185a3ed20821209691b9deb6ecdeb8dae21e83f29b8f5f96`. The test owner and its independent resource observer joined before this documentation update.
+
+## Follow-on validation — 2026-10-17: deterministic mechanisms, not incident attribution
+
+This later checkpoint supplements the preceding report and preserves its failed
+fixture attempts. Numeric pacing and receive-admission production candidates
+remain private; neither is adopted or device-qualified. Deterministic
+counterfactuals establish the tested mechanism, not deployment, onset, the
+reported iOS website pauses or the historical loaded-probe 0/64 cause.
+
+With V5's corrected fixture-publication barriers, the P1 OLD normal and race
+selections each reached exactly three semantic failures and seven passing
+controls. The numeric candidate passed all 13 focused cases normally and under
+race. The combined affected pacing prefix then passed three fresh normal and
+three fresh race processes, each with 456 top-level passes and no failures or
+skips. These are not the full Connect package or ALL/MAIN/PERF. The 13-case
+selection includes isolated metadata/predicate controls as well as real-client
+histories; it is not 13 independent constructor-backed production reproductions.
+
+The numeric predicate releases only the current, unambiguous, confirmed H1
+measurement drain when the selected same-sequence repair R covers its retained
+physical tail T before original O: `R <= T < O`, in the current drain
+generation. Paid serialization, reservation/FIFO debt and ordinary repair
+dispatch remain owned. Candidate source SHA-256 is
+`634177fdd5c6959f3aac7ca76219e70c8bf527b22448b69689c2d3bd179d94be`.
+The earlier broad pending-repair abort is not this candidate. Initial pacing
+still precedes creation of the physical writer timer; these tests do not
+establish a universal 15-second initial-wait bound.
+
+P3 now has a scoped actual receive/dispatch counterfactual:
+`TestReceiveReceiptAdmissionRefusalKeepsExactRetry` fails the intended
+pressure invariant on OLD production and passes on the reference, normally and
+under race. The refused complete, ACK-required Pack must retain exact retry
+custody; it need not already have emitted a cumulative ACK. Advancing the head
+and then merely removing cancellation is unsafe because an unretained duplicate
+below that head can be cumulatively acknowledged without delivery. This result
+does not convert complete retriable messages into unreplayed raw-stream
+fragments or justify blocking a shared receive callback.
+
+Keep the P3 fixture failures separate from that production root:
+
+- The first attempt decoded every gateway message as an ACK and failed before
+  the pressure oracle. The real provider emits a typed diagnostic Pack. V3
+  validates offered ACK identities and that diagnostic separately, without
+  disabling the publisher or inventing its peer ACK. Four five-root
+  OLD/reference normal/race control processes passed; the ACK-only fixture
+  counterfactual failed on the real 165-byte diagnostic.
+- Reference V3 all-25 normal passed 23 and failed two witness checks on
+  10,239/12,288-byte ordinary protobuf storage. Pool classes end at 8,192 bytes;
+  `MessagePoolReturn(false)` for unpooled storage is not itself a leak.
+  V4 preserves payloads and pooled-owner checks, and adds explicit unpooled
+  reference-closure, boundary and full-owner-join controls, without forced GC.
+- V4 all-30 normal passed, but race passed 27 and failed three fixture dial
+  tripwires, with no data-race warning. The hook waited for ancestor cancellation
+  while the TCP worker uses a descendant context; the ancestor can close first.
+  The tripwire is not evidence of an actual network socket being opened.
+  A separately sealed V5 waits for the worker's own cancellation and adds a
+  deterministic propagation-barrier control. At that earlier checkpoint V5
+  had not executed and V4 was not full P3 race qualification.
+
+Later V5 execution independently reproduced the fixture defect: the exact V4
+fixture with the new control failed only
+`TestReceiveReceiptFixtureWaitsForOwnTcpCancellation`, at the assertion
+`fixture released TCP worker before its own cancellation`. That is a fixture
+counterfactual, not another production defect. The corrected root passed
+normally and under race, then all 31 reference cases passed once normally and
+once under race, zero failures/skips and no data-race warning. All five process
+handles and the observer joined. This closes this focused fixture/control
+selection; broader delivery/ACK parents, healthy-burst costs and device
+qualification remain separate. No production bytes were integrated by this run.
+
+The loaded H1 evidence is a different, unqualified experiment: one OLD/numeric
+Record25/run1 pair on an active Go1.27.2 host. Both delivered the same 65,536
+useful bytes. OLD had invalid calibration; its efficiency 1.099415 is
+tunnel/direct, whereas the gate requires at most `1/1.10`. Numeric was valid
+for that diagnostic but had only 6/59 successful loaded tunnel probes versus
+OLD 40/49. Its successful-probe p95 was 6.412 seconds against a 6.416-second
+deadline and excludes 53 failed attempts. Direct loaded successes were 47/54
+and 42/45 respectively. One pair with an invalid OLD arm cannot establish a
+causal or statistical source regression, improvement or baseline.
+
+All eight windows were labelled dead by a fixed 5-Mbit/s threshold on a
+0.256-Mbit/s shaped link; that classification is not independent stall proof.
+Direct duration ends at body receipt, while tunnel duration includes the reverse
+completion byte and server join. The 8.278-to-10.063-second reported tunnel
+difference is not an isolated body-throughput measurement. Existing observations
+also do not establish that the numeric dependent-drain action ran. The sealed
+RCA proposes separately reviewed, bounded actual-action/probe/completion-phase
+attribution; it neither reports that execution nor authorizes extra replays.
+The numeric candidate is not performance-qualified for integration.
+
+Evidence locators below are relative to
+`/Volumes/data/urnetwork-h1-chronology.Y0OYTR/`. Raw run prefix is
+`go1272-qualification.NmFy9i/continuous-offer-h1/canonical-integrated-parents-v1/postmerge-full-current-01/`:
+
+- P1: `pacing-v5-run.mnO1dU` and `pacing-v5-full-confirm.BCgpJ9`.
+  Sealed fixture manifest:
+  `packetflow-regression-review/astra-review.AmbGZsAp/late-transfer/adjacency-v5.FkkBqNGJ/manifest.md`,
+  SHA-256 `bfc19b2a490821e991528829d74d6b39733829f62e3ca0da6335c6f26604d4fc`.
+- P3: `p3-v3-run.FXRozK`, `p3-v4-run.VID8EP` and later
+  `p3-v5-run.6XGiOd`.
+  V3 manifest SHA-256
+  `3baef75bdb54927cdd2ce3b6cc3e9b351d310fa7fbafa10a1744915399bf6d34`
+  in `remote-review-7days.M8OvPy/p3-gateway-fixture-v3.ERXs3jNv`;
+  V4 handoff SHA-256
+  `ee78e5defe0b26cfc434c568e7782035e1b0b54182b2971b517dba18253df512`
+  in `remote-review-7days.M8OvPy/p3-witness-fixture-v4.5q2vlZxQ`.
+  V5 fixture handoff, sealed before execution:
+  `remote-review-7days.M8OvPy/p3-cancel-fixture-v5.IeaIsmVW/handoff.json`,
+  SHA-256 `4f6efa56c96dbb054e8e95dbe1d1c9c2a1a602e2c149f7a0451df2f7371ede76`.
+  V5 raw `fixture-v4-control-normal.go.json` SHA-256
+  `b6220d35012b88145c897b5225bb6f19e753e56e79be38e15a4ddce1316e8f52`;
+  `all31-v5-normal.go.json`
+  `78d5c278321cc423eab31a4e10b365501040049c7f2b3b39e64921aada44ac85`;
+  `all31-v5-race.go.json`
+  `f0df93d9eac9b8ace670604815cd6cf38bc7408fdd7f29df2a4d013550056d3f`.
+- H1: `h1-go1272-replay-run.zqnfyd/old.go.json`,
+  SHA-256 `c35dce18333126295243e71a41a13673d4c737175589dcd16ce51056eeac7517`;
+  `numeric.go.json` in the same directory,
+  SHA-256 `6ef189eb2561a764df3a427dd542e72bbde54c5400834b465e148b98aeecfba0`.
+  Sealed RCA:
+  `packetflow-regression-review/astra-review.AmbGZsAp/h1-pair-rca.a6XeeCK7/RCA.md`,
+  SHA-256 `207f7060f8e2ac0ac94a88d83fb0101c3b60d1f2c2581e8c4bca98e2b7aa9568`.
+
+The counted test and observer owners for these reported runs joined. That
+cleanup fact does not promote a candidate, identify the phone incident or
+qualify the still-pending full parents, allocation/throughput gates and physical
+32/64-MiB workloads.

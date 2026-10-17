@@ -4560,3 +4560,69 @@ especially `perf/phase-physical.json` and its linked raw workload/telemetry
 artifacts. Fresh full Android-surrogate iOS32 and normal Android64 MEMSTEADY /
 PERFVAR qualification remains required; Android cannot prove the signed iOS
 extension's kernel lifetime footprint stays below 50 MiB.
+
+### 2026-10-17: pacing/receive diagnostics do not qualify mobile memory
+
+The private OLD/numeric H1 Record25/run1 pair measured the aggregate simulator
+host process, not either mobile profile. Its 42 samples per arm reported
+heap-plus-stack p95/max of 70,508,544/70,574,080 B for OLD and
+69,664,768/69,877,760 B for numeric. Both exceeded the historical diagnostic
+24-MiB ceiling in every sample. These are neither Android process/profile
+measurements nor native iOS extension `phys_footprint`; they cannot qualify or
+disqualify the explicit 32/64-MiB mobile policies. The small difference between
+two active-host samples is not attribution to the numeric metadata.
+
+Ten counterbalanced fresh microbenchmark processes produced 140 rows, all
+reporting 0 B/op and 0 allocs/op. That is a per-operation microkernel result,
+not a zero retained-memory-cost claim. Numeric tail metadata increases a
+retained map value by eight bytes on the measured 64-bit layout, from 32 to
+40 bytes; map backing, size classes and owner high-water still matter.
+Descriptive median original-tail and retry/fresh-tail costs increased by
+2.05 ns and 7.9 ns respectively. No statistical speed claim or blanket absence
+of performance regression follows.
+
+The P3 reference has a separate, source-known healthy 32-item burst cost:
+preparation can change one flush/two slice-clone calls into 32 flushes/64
+calls, with possible extra queue pumping. A nil-observer actual-owner
+allocation/wall-time benchmark is an adoption gate, not a measured result
+here. Its fixture correction must retain equivalent ACK, callback, final-owner
+and cancellation boundaries in both arms; virtual-time elapsed or overlapping
+goroutine allocation samples would not establish that cost.
+
+The P3 cleanup failures also do not establish retained heap leakage:
+10,239/12,288-byte ordinary buffers are outside the pool's largest 8,192-byte
+class. V4 checks actual unpooled frame/reference removal after full ownership
+joins while preserving the pooled last-owner oracle. Its normal 30-case pass
+does not erase the three race-process fixture cancellation failures. Later V5
+reproduced the exact V4 cancellation-order defect with the new control, then
+passed that root and all 31 reference cases in both normal and race builds.
+These are one normal/race execution of each corrected selection, not a measured
+allocation/throughput comparison or a full-package qualification. No forced-GC
+or claim of collected memory substitutes for reference/owner closure.
+
+Evidence, relative to `/Volumes/data/urnetwork-h1-chronology.Y0OYTR/`:
+raw prefix
+`go1272-qualification.NmFy9i/continuous-offer-h1/canonical-integrated-parents-v1/postmerge-full-current-01/`,
+children `pacing-numeric-bench-run.byqQ3o`,
+`h1-go1272-replay-run.zqnfyd`, `p3-v3-run.FXRozK`,
+`p3-v4-run.VID8EP` and later `p3-v5-run.6XGiOd`. The H1 interpretation is sealed in
+`packetflow-regression-review/astra-review.AmbGZsAp/h1-pair-rca.a6XeeCK7/RCA.md`,
+SHA-256 `207f7060f8e2ac0ac94a88d83fb0101c3b60d1f2c2581e8c4bca98e2b7aa9568`;
+its `SHA256SUMS` is
+`f4546a55cb98c122d0aec227bcf5d7cc675fd0bffbca9516c45cb7f196d46f69`.
+The adjacent packet-flow follow-on entry records exact counterfactual and
+fixture seals.
+
+The preceding partial physical attempt remains failed, collection-only
+evidence, not a 32-MiB pass. Fresh full unchanged-source A/A qualification is
+still required for both configured phones and both 32-MiB iOS-surrogate and
+64-MiB Android profiles. The recorded installed-version audit requires the
+supported Pixel maintenance path: four preparatory arm/profile builds, the
+explicitly approved helper reinstall, joined supported control release, then
+four fresh canonical builds. This is eight builds, not reuse of build-only
+attestation as canonical install authority. Retained APKs/receipts do not
+replace a fresh source freeze; retained artifacts/caches plus the next build
+working set remain charged to capacity. Neither mobile profile, even if later
+qualified on Android, proves the signed native iOS extension's total lifetime
+footprint remains below 50 MiB. Numeric H1 and P3 production remain private;
+no memory baseline or budget is changed here.
