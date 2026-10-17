@@ -2730,6 +2730,7 @@ func (self *SendSequence) resetLaneAcks(generation uint64) {
 		self.laneAcks[index] = laneAckSlot{}
 	}
 	self.laneAckGeneration = generation
+	self.resetFifoRepairGeneration(generation)
 }
 
 // observeLaneAck records that this item's route has acknowledged up to at
@@ -3127,7 +3128,7 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 		// This same FIFO already passed the item. A lower cumulative ACK
 		// cannot make an endpoint drop into queued bytes, even when fewer
 		// than three later selective ACKs leave recovery with this timer.
-		if self.laneAcknowledgedPast(item) {
+		if self.laneAcknowledgedPast(item) || self.fifoRepairPassed(item) {
 			return false
 		}
 	}
@@ -6704,6 +6705,8 @@ type SendSequence struct {
 	// At most one due retry may be selected while the current write owns
 	// the physical waiter. This record owns no bytes or service reservation.
 	pendingRecovery *sendRecoverySelection
+	// Exact physical FIFO evidence belongs to the sequence, not every item.
+	fifoRepair fifoRepairState
 	// THROUGHPUTFIX §38.12's first stage. The loop publishes an immutable
 	// snapshot of what an immediate no-acknowledgement write needs — the
 	// writer handle and the contract it may charge — and a caller reads the
@@ -11181,6 +11184,7 @@ func (self *SendSequence) setHead(
 		}
 	}
 
+	originalTag := sequenceTagFromProtocol(pack.Tag)
 	pack.Head = true
 	pack.Tag = self.rttWindow.OpenTag()
 	// A non-head promoted after cumulative progress references the contract the
@@ -11227,6 +11231,7 @@ func (self *SendSequence) setHead(
 		return nil, false, err
 	}
 
+	self.prepareFifoRepair(item, originalTag, sequenceTagFromProtocol(pack.Tag), forceFullContract)
 	return transferFrameBytesWithHead, pack.ContractFrame != nil, nil
 }
 
@@ -11317,6 +11322,7 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	defer self.observeFifoRepairWrite(item, disposition)
 	// A written item awaits an answer; silence runs until any acknowledgement.
 	if self.retainedSilenceStart.IsZero() {
 		self.retainedSilenceStart = time.Now()
@@ -12603,6 +12609,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		item.sendTime = time.Now()
 		item.resendTime = item.sendTime.Add(self.sendBufferSettings.SelectiveAckTimeout)
 		item.selectiveAcked = true
+		self.forgetFifoRepairItem(item)
 		self.addResendItem(item)
 		if laneHeadAcked && !item.carrierChanged && 1 < item.sendCount {
 			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
@@ -12617,6 +12624,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	// SendSequence while this cumulative-ack loop is still advancing. Snapshot
 	// the boundary before returning anything; never read `item` afterward.
 	ackSequenceNumber := item.sequenceNumber
+	fifoRepair := self.acknowledgedFifoRepair(item, tag)
 	if self.log.V(1).Enabled() {
 		self.log.Infof("[s]ack %d %s->%s...%s s(%s)\n", ackSequenceNumber, self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 	}
@@ -12706,6 +12714,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 	}
 	self.sendItems = self.sendItems[i:]
+	self.applyFifoRepair(fifoRepair, self.lastCumulativeAckTime)
 	if len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber > ackSequenceNumber+1 {
 		// An expired interior control becomes a skippable prefix only after
 		// every older live owner has actually been acknowledged.
