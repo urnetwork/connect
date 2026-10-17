@@ -19,6 +19,7 @@ type fifoRepairPrefixCase struct {
 	futureDeferral bool
 	laterCopy      bool
 	selectiveCopy  bool
+	earlierCopy    bool
 }
 
 type fifoRepairPrefixDecision struct {
@@ -76,6 +77,18 @@ func TestWindowPacingSuccessfulSelectiveEvictionCopyKeepsQueueResidence(t *testi
 	runFifoRepairPrefixCausality(t, fifoRepairPrefixCase{laterCopy: true, selectiveCopy: true})
 }
 
+func TestWindowPacingPriorSuccessfulCopyCannotRenewQueueResidence(t *testing.T) {
+	runFifoRepairPrefixCausality(t, fifoRepairPrefixCase{earlierCopy: true})
+}
+
+func TestWindowPacingPriorSuccessfulCopyRevokesExistingQueueResidence(t *testing.T) {
+	runFifoRepairPrefixCausality(t, fifoRepairPrefixCase{earlierCopy: true, futureDeferral: true})
+}
+
+func TestWindowPacingPriorCopyNewGenerationKeepsQueueResidence(t *testing.T) {
+	runFifoRepairPrefixCausality(t, fifoRepairPrefixCase{earlierCopy: true, newGeneration: true})
+}
+
 func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
@@ -90,7 +103,10 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 		ackReached, ackResume := make(chan struct{}), make(chan struct{})
 		decisionReached := make(chan struct{})
 		copyReached, copyResume := make(chan struct{}), make(chan struct{})
+		priorReached, priorResume := make(chan struct{}), make(chan struct{})
 		var dueOnce, failedOnce, copyOnce sync.Once
+		var priorOnce sync.Once
+		var priorCopyCompletedNanos, prefixSelectionNanos int64
 		var futureOnce sync.Once
 		var phase atomic.Int32
 		var client *Client
@@ -147,8 +163,23 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 					break
 				}
 			}
-			if item == nil || item.timeoutDeferCount == 0 {
+			if item == nil {
 				return
+			}
+			if c.earlierCopy && number == 3 && item.sendCount == 1 {
+				priorOnce.Do(func() {
+					close(priorReached)
+					select {
+					case <-priorResume:
+					case <-ctx.Done():
+					}
+				})
+			}
+			if item.timeoutDeferCount == 0 {
+				return
+			}
+			if c.earlierCopy && number == 1 {
+				prefixSelectionNanos = client.feedbackArrivalNanos(time.Now())
 			}
 			if c.futureDeferral {
 				return
@@ -195,7 +226,8 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 				return
 			}
 			sequence := client.sendBuffer.lookupSendSequence(id, nil)
-			if c.futureDeferral && phase.Load() == 0 && sequence.resendWriteCount.Load() == 1 {
+			if c.futureDeferral && phase.Load() == 0 && len(sequence.sendItems) > 0 &&
+				sequence.sendItems[0].sequenceNumber == 1 && sequence.sendItems[0].promotedHead && sequence.resendWriteCount.Load() > 0 {
 				futureOnce.Do(func() {
 					close(dueReached)
 					select {
@@ -277,8 +309,32 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 		originalPhysical := head.pacingSentAtNanos
 		generation := sequence.transferFlightPolicy().generation
 		time.Sleep(100 * time.Millisecond)
-		acknowledgeSendPackLifecycleWirePack(t, client, destination, packs[0])
-		close(initialResume)
+		if c.earlierCopy {
+			// Consume three actual copies before allowing the same worker to
+			// promote #1. No retry deadline or recovery decision is injected.
+			close(initialResume)
+			<-priorReached
+			for number := range 3 {
+				copy := readPack()
+				if copy.SequenceNumber != uint64(number) || string(copy.MessageId) != string(packs[number].MessageId) ||
+					copy.Tag == nil || copy.Tag.SendTime != packs[number].Tag.SendTime {
+					t.Fatal("prior physical copies changed the original FIFO identities or tags")
+				}
+			}
+			priorCopyCompletedNanos = client.feedbackArrivalNanos(time.Now())
+			if sequence.resendWriteCount.Load() != 3 || head.sendCount != 2 || len(route) != 0 ||
+				head.rttState != sendItemRttUnavailable || !head.rttH1 || !head.reliableCarrierObserved ||
+				head.carrierChanged || head.unreliableCarrierObserved || head.hybridReliableCarrierObserved ||
+				head.pacingSentAtNanos != originalPhysical || sequence.fifoRepair.generationStartNanos > originalPhysical ||
+				originalPhysical <= 0 || priorCopyCompletedNanos <= originalPhysical {
+				t.Fatal("prior copy lacks successful initial H1, current epoch, or completed physical ordering")
+			}
+			acknowledgeSendPackLifecycleWirePack(t, client, destination, packs[0])
+			close(priorResume)
+		} else {
+			acknowledgeSendPackLifecycleWirePack(t, client, destination, packs[0])
+			close(initialResume)
+		}
 		if c.selectiveCopy {
 			<-copyReached
 			// Public receipt plus eviction feedback schedules an explicit
@@ -309,6 +365,23 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 			}
 			for len(route) > 0 {
 				MessagePoolReturn(<-route)
+			}
+		} else if c.earlierCopy {
+			found := false
+			for len(route) > 0 {
+				copy := readPack()
+				if copy.SequenceNumber == 1 {
+					if found {
+						t.Fatal("more than one promoted prefix before its ACK")
+					}
+					prefix, found = copy, true
+				} else if copy.SequenceNumber != 3 {
+					t.Fatalf("unexpected later physical copy: %d", copy.SequenceNumber)
+				}
+			}
+			if !found || head.sendCount != 2 || head.rttState != sendItemRttUnavailable || !head.rttH1 ||
+				priorCopyCompletedNanos >= prefixSelectionNanos || prefixSelectionNanos == 0 {
+				t.Fatal("prior successful successor copy did not precede the new prefix envelope")
 			}
 		} else if !c.originalOnly {
 			prefix = readPack()
@@ -370,7 +443,7 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 		close(dueResume)
 		<-ackReached
 		wantSends, wantHighest := 1, uint64(1)
-		if c.laterCopy {
+		if c.laterCopy || c.earlierCopy {
 			wantSends = 2
 		}
 		if c.selectiveCopy {

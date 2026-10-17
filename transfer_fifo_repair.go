@@ -85,8 +85,9 @@ func (self *SendSequence) prepareFifoRepair(item *sendItem, original, promoted s
 	confirmed := func() bool {
 		self.resendQueue.stateLock.Lock()
 		defer self.resendQueue.stateLock.Unlock()
+		// Earlier copies make RTT sampling ambiguous, but precede this
+		// owner-created fence. Every later successful copy invalidates it.
 		return self.resendQueue.messageIdItems[next.messageId] == next && next.rttH1 &&
-			(next.rttState == sendItemRttWriteConfirmed || next.rttState == sendItemRttObserved) &&
 			self.fifoRepair.generationStartNanos <= next.pacingSentAtNanos && next.pacingSentAtNanos < createdNanos
 	}()
 	if !confirmed {
