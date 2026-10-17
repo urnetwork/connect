@@ -23,6 +23,9 @@ import (
 // The finite relay queue counts only bytes/messages awaiting serialization;
 // already propagating messages are separately bounded by the flight limit.
 type windowPathLink struct {
+	// The opt-in settlement fixture observes only bytes already rejected by
+	// this owner. The callback borrows the wire until MessagePoolReturn below.
+	afterDropForTest func(time.Time, []byte)
 	rate             ByteCount
 	rateAfter        ByteCount
 	rateChangeAfter  time.Duration
@@ -142,6 +145,9 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 			queuedCount = len(queue) - serviced
 			if self.dropOnFull && (queuedCount >= self.queueCount || queuedBytes+ByteCount(len(frame)) > self.queueBytes) {
 				self.dropped.Add(1)
+				if self.afterDropForTest != nil {
+					self.afterDropForTest(now, frame)
+				}
 				MessagePoolReturn(frame)
 				continue
 			}
@@ -499,6 +505,8 @@ func TestWindowReferenceCompletionObserverPhaseOwnership(t *testing.T) {
 type windowPathCell struct {
 	// Opt-in test observation; nil adds no per-Packet callback or token work.
 	referenceCompletions *windowReferenceCompletions
+	Settlement           *windowPathSettlementPolicy `json:",omitempty"`
+	MeasurementGrid      bool                        `json:",omitempty"`
 
 	// Optional explicit opening for a controlled comparison. It does not
 	// change byte permissions, the serializer, or measurement duration.
@@ -544,7 +552,11 @@ type windowPathReading struct {
 	Mbps                  float64
 	MinFlowMbps           float64
 	IntervalMbps          []float64
-	DirectionMbps         []float64 `json:",omitempty"`
+	IntervalBytes         []int64
+	IntervalDurations     []time.Duration
+	Settlement            *windowPathSettlementReading `json:",omitempty"`
+	CapacityDebt          *windowPathDebtReading       `json:",omitempty"`
+	DirectionMbps         []float64                    `json:",omitempty"`
 	RelayDrops            int64
 	MeasurementRelayDrops int64
 	NatRefused            int64
@@ -734,6 +746,15 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	for _, observer := range observe {
 		observer(cell, sender, receiver)
 	}
+	var settlement *windowPathSettlement
+	if cell.Settlement != nil {
+		var err error
+		settlement, err = newWindowPathSettlement(ctx, cell, fixtureStart, senderSettings.SendBufferSettings.AckTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settlement.install(sender, receiver)
+	}
 	var workers sync.WaitGroup
 	if cell.ReceiveWindowAfter > 0 {
 		workers.Go(func() {
@@ -745,6 +766,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		})
 	}
 	dataLink := windowPathLink{rate: cell.Rate, rateAfter: cell.RateAfter, rateChangeAfter: cell.RateChangeAfter, delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8), dropOnFull: cell.Drop}
+	if settlement != nil {
+		dataLink.afterDropForTest = settlement.dropped
+	}
 	ackLink := windowPathLink{delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8)}
 	for _, link := range []*windowPathLink{&dataLink, &ackLink} {
 		link.delayAfter = cell.RoundTripAfter / 2
@@ -954,7 +978,53 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			}
 		})
 	}
-	time.Sleep(warmup)
+	if cell.MeasurementGrid {
+		windowPathAwaitGrid(t, fixtureStart.Add(warmup))
+	} else {
+		time.Sleep(warmup)
+	}
+	sampledAt := time.Now()
+	sampledCounts := make([]int64, len(counts))
+	sampleCounts := func() int64 {
+		var total int64
+		for i := range counts {
+			sampledCounts[i] = counts[i].Load()
+			total += sampledCounts[i]
+		}
+		return total
+	}
+	sampledTotal := sampleCounts()
+	var debt *windowPathCapacityDebt
+	if settlement != nil {
+		var err error
+		debt, err = newWindowPathCapacityDebt(cell.Settlement.ReferenceBytes, cell.Settlement.ReferenceDuration,
+			cell.Settlement.CapBytes, fixtureStart.Add(warmup), sampledTotal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			ready, err := windowPathMeasurementReady(settlement, sampledAt)
+			if err != nil {
+				t.Fatalf("settlement: %v state=%+v debt=%+v", err, settlement.snapshot(), debt.snapshot())
+			}
+			if ready {
+				break
+			}
+			next, deadline := sampledAt.Add(time.Second), settlement.snapshot().Deadline
+			final := !next.Before(deadline)
+			if final {
+				next = deadline
+			}
+			windowPathAwaitGrid(t, next)
+			sampledAt, sampledTotal = time.Now(), sampleCounts()
+			if err := debt.observe(sampledAt, sampledTotal, final); err != nil {
+				t.Fatalf("settlement transient: %v state=%+v debt=%+v", err, settlement.snapshot(), debt.snapshot())
+			}
+			if final {
+				t.Fatalf("settlement deadline reached: state=%+v debt=%+v", settlement.snapshot(), debt.snapshot())
+			}
+		}
+	}
 	dropsBefore := dataLink.dropped.Load()
 	if cell.Upload {
 		dropsBefore = ackLink.dropped.Load()
@@ -964,27 +1034,67 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	before := make([]int64, len(counts))
 	for i := range counts {
-		before[i] = counts[i].Load()
+		if cell.MeasurementGrid {
+			before[i] = sampledCounts[i]
+		} else {
+			before[i] = counts[i].Load()
+		}
 	}
 	start := time.Now()
+	if cell.MeasurementGrid {
+		start = sampledAt
+	}
 	previousTime := start
 	previousBytes := int64(0)
 	var intervalMbps []float64
+	var intervalBytes []int64
+	var intervalDurations []time.Duration
 	for remaining := duration; remaining > 0; remaining = time.Until(start.Add(duration)) {
-		time.Sleep(min(time.Second, remaining))
+		if cell.MeasurementGrid {
+			windowPathAwaitGrid(t, previousTime.Add(min(time.Second, remaining)))
+		} else {
+			time.Sleep(min(time.Second, remaining))
+		}
 		now := time.Now()
 		delivered := int64(0)
+		if cell.MeasurementGrid {
+			sampledAt, sampledTotal = now, sampleCounts()
+		}
 		for i := range counts {
-			delivered += counts[i].Load() - before[i]
+			if cell.MeasurementGrid {
+				delivered += sampledCounts[i] - before[i]
+			} else {
+				delivered += counts[i].Load() - before[i]
+			}
 		}
 		intervalMbps = append(intervalMbps, float64(delivered-previousBytes)*8/now.Sub(previousTime).Seconds()/1e6)
+		intervalBytes = append(intervalBytes, delivered-previousBytes)
+		intervalDurations = append(intervalDurations, now.Sub(previousTime))
+		if settlement != nil {
+			if err := debt.observe(now, sampledTotal, !now.Before(start.Add(duration))); err != nil {
+				t.Errorf("measurement capacity debt: %v ledger=%+v", err, debt.snapshot())
+			}
+			if _, err := settlement.admit(now); err != nil {
+				t.Errorf("measurement settlement changed: %v", err)
+			}
+		}
 		previousTime, previousBytes = now, delivered
 	}
 	elapsed := time.Since(start)
+	if cell.MeasurementGrid {
+		elapsed = sampledAt.Sub(start)
+	}
 	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20, IntervalMbps: intervalMbps,
-		DirectionMbps: make([]float64, directions)}
+		IntervalBytes: intervalBytes, IntervalDurations: intervalDurations, DirectionMbps: make([]float64, directions)}
+	if settlement != nil {
+		state, capacity := settlement.snapshot(), debt.snapshot()
+		reading.Settlement, reading.CapacityDebt = &state, &capacity
+	}
 	for i := range counts {
 		delivered := counts[i].Load() - before[i]
+		if cell.MeasurementGrid {
+			delivered = sampledCounts[i] - before[i]
+		}
 		reading.Bytes += delivered
 		reading.MinFlowMbps = min(reading.MinFlowMbps, float64(delivered)*8/elapsed.Seconds()/1e6)
 		reading.DirectionMbps[i/cell.Flows] += float64(delivered) * 8 / elapsed.Seconds() / 1e6
