@@ -334,7 +334,7 @@ func TestPlatformTransportControlRefusalTerminatesGenerationWithoutWait(t *testi
 	})
 }
 
-// During a speed test the reader echoes every frame through the H1 control
+// During a speed test the reader echoes each probe through the H1 control
 // queue, so a full queue is an uplink slower than the downlink, not a dead
 // writer. The reader keeps its one already-read echo, unchanged, until the
 // writer makes room, and then hands that same echo on.

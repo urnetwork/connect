@@ -16,10 +16,19 @@ import (
 // No public ReceiveFunction contract is changed. A provider takes explicit
 // claims during its inline dispatch and completes them after final admission.
 // The ledger itself starts no workers and never waits for downstream I/O.
+//
+// Legacy accounting admits each head's receipt before batching its delivery;
+// a full ledger leaves the head in the bounded receive hold. Exact retained
+// accounting instead reserves the live item and downstream credit before any
+// head advance, refusing a fresh Pack without ACK when that admission fails.
+// Both modes retain an already-held SACK owner until downstream admission.
 type receiveDeliveryQueue struct {
-	mutex        sync.Mutex
-	sequence     *ReceiveSequence
-	items        []*receiveDeliveryReceipt
+	mutex    sync.Mutex
+	sequence *ReceiveSequence
+	items    []*receiveDeliveryReceipt
+	// Receipts admitted with their heads, in delivery order, whose batch
+	// callback has not yet run. The flush takes each with its own item.
+	admitted     []*receiveDeliveryReceipt
 	maxCount     int
 	maxBytes     ByteCount
 	bytes        ByteCount
@@ -66,25 +75,63 @@ func newReceiveDeliveryQueue(sequence *ReceiveSequence, maxCount int, maxBytes B
 
 // Includes the retained packet owner and bounded receipt/claim metadata.
 func receiveDeliveryByteCount(item *receiveItem) ByteCount {
-	// Charge the receipt, its ledger pointer and worst-case one claim per
-	// application frame as well as the pre-existing retained item envelope.
-	metadata := ByteCount(unsafe.Sizeof(receiveDeliveryReceipt{})) + 8 +
+	// The receipt can be in both the ordered ledger and the admitted batch.
+	metadata := ByteCount(unsafe.Sizeof(receiveDeliveryReceipt{})) + 16 +
 		ByteCount(max(1, len(item.frames)))*ByteCount(unsafe.Sizeof(receiveDeliveryClaim{})+unsafe.Sizeof(receiveDeliveryOperation{})+8)
 	return addReceiveQueueByteCount(max(1, item.QueueByteCount()), (metadata+63)/64*64)
 }
 
-// The receive worker is the sole appender. After flushing its previous batch,
-// this reserves actual shared memory; other workers can only free space or
-// close the ledger before append. It is not an Available-only promise.
+// Appends a directly dispatched item, using the same limits as preflight.
+func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	return q.appendLocked(item, required, false)
+}
+
+// Admits the receipt of a head before the head is delivered. A refusal
+// leaves nothing to undo: the caller keeps the head in the receive hold, and
+// a drain of this ledger wakes the sequence to try again. An empty ledger
+// takes any one owner its memory budget admits, as the hold does, so no
+// head can wait for a drain that can never come.
+func (q *receiveDeliveryQueue) admit(item *receiveItem) bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	r, ok := q.appendLocked(item, false, true)
+	if ok {
+		q.admitted = append(q.admitted, r)
+	}
+	return ok
+}
+
+// The receipt admitted with item's head. A head dispatched without that
+// admission (a direct dispatch, or reliable ingress enabled while its batch
+// was pending) is appended now and can still be refused.
+func (q *receiveDeliveryQueue) receipt(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if 0 < len(q.admitted) && q.admitted[0].item == item {
+		r := q.admitted[0]
+		q.admitted[0] = nil
+		q.admitted = q.admitted[1:]
+		r.required = required
+		return r, true
+	}
+	return q.appendLocked(item, required, false)
+}
+
+// Exact accounting flushes the previous batch before this actual reservation;
+// only the receive worker can append. Legacy accounting has already charged
+// the pending batch's receipts and needs no forced flush here.
 func (q *receiveDeliveryQueue) prepare(item *receiveItem) bool {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
-	_, _, _, accepted := q.prepareWithLock(item)
+	admitOne := q.sequence.receiveQueue != nil && !q.sequence.receiveQueue.lifetimeBudget
+	_, _, _, accepted := q.prepareWithLock(item, admitOne)
 	return accepted
 }
 
 // Shares the exact limits and reservation with the eventual ledger append.
-func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem) (ByteCount, bool, bool, bool) {
+func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem, admitOne bool) (ByteCount, bool, bool, bool) {
 	if q.sequence.receiveQueue != nil {
 		q.sequence.prepareReceiveDeliveryCredit(item)
 	}
@@ -101,7 +148,7 @@ func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem) (ByteCount, bo
 	// existing one-oversize-owner progress rule, only with an empty ledger.
 	synchronousOversize := len(q.items) == 0 && !receiveDeliveryHasTcp(item.frames)
 	regular := len(q.items)-q.controlCount < q.maxCount &&
-		(bytes <= q.maxBytes-(q.bytes-q.controlBytes) || synchronousOversize)
+		(bytes <= q.maxBytes-(q.bytes-q.controlBytes) || synchronousOversize || admitOne && len(q.items) == 0)
 	if regular && q.sequence.receiveQueue != nil && q.sequence.receiveQueue.lifetimeBudget && item.memoryBudget == nil {
 		regular = item.reserveMemory(q.sequence.receiveQueue.budget, item.QueueByteCount())
 	}
@@ -121,10 +168,9 @@ func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem) (ByteCount, bo
 	return bytes, control, controlReserve, true
 }
 
-func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-	bytes, control, controlReserve, accepted := q.prepareWithLock(item)
+// Creates one receipt only after all count, byte and retained-owner checks.
+func (q *receiveDeliveryQueue) appendLocked(item *receiveItem, required bool, admitOne bool) (*receiveDeliveryReceipt, bool) {
+	bytes, control, controlReserve, accepted := q.prepareWithLock(item, admitOne)
 	if !accepted {
 		return nil, false
 	}
@@ -144,6 +190,33 @@ func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiv
 		q.traceReceiptLocked(r, "delivery_receipt_admitted", true)
 	}
 	return r, true
+}
+
+// Undoes only a not-yet-dispatched admission. The worker still owns item's
+// roots and returns them on contract rejection or an aborted batch. Removing
+// the receipt first prevents a later cancel/flush from observing pooled data.
+func (q *receiveDeliveryQueue) discardAdmission(item *receiveItem) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	for index, r := range q.admitted {
+		if r.item != item {
+			continue
+		}
+		copy(q.admitted[index:], q.admitted[index+1:])
+		q.admitted[len(q.admitted)-1] = nil
+		q.admitted = q.admitted[:len(q.admitted)-1]
+		for receiptIndex, receipt := range q.items {
+			if receipt == r {
+				copy(q.items[receiptIndex:], q.items[receiptIndex+1:])
+				q.items[len(q.items)-1] = nil
+				q.items = q.items[:len(q.items)-1]
+				break
+			}
+		}
+		q.removeChargeLocked(r)
+		r.item = nil
+		return
+	}
 }
 
 func receiveDeliveryIsSmallControl(item *receiveItem) bool {
@@ -172,11 +245,13 @@ func (q *receiveDeliveryQueue) removeChargeLocked(r *receiveDeliveryReceipt) {
 	q.notify()
 }
 
+// After the callback returns, only an owner that still holds a claim can
+// claim again: a deferred decode hands its frame to the NAT owner it creates.
 func (r *receiveDeliveryReceipt) hold() *receiveDeliveryClaim {
 	q := r.queue
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
-	if q.closed || r.sealed {
+	if q.closed || r.sealed && r.pending == 0 {
 		return nil
 	}
 	r.claimed = true

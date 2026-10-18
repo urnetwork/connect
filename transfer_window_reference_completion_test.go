@@ -47,7 +47,7 @@ func runWindowSettledReferenceCompletions(t *testing.T, payload int) {
 		}
 		if cell.CalibrationWindow != kib(256) || reading.Window.Window != kib(256) || cell.Budget != mib(48) ||
 			cell.RoundTrip != 100*time.Millisecond || cell.Compression != 10*time.Millisecond ||
-			cell.Flows != 8 || !cell.RoundRobinOffer || cell.Lanes != 0 || cell.Rate != 125000 || cell.Drop ||
+			cell.Flows != 8 || cell.Lanes != 0 || cell.Rate != 125000 || cell.Drop ||
 			cell.Warmup != 74054432*time.Microsecond || reading.Seconds != measurement.Seconds() {
 			t.Fatal("reference changed the declared calibration, workload or interval")
 		}

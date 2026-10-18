@@ -263,7 +263,14 @@ func batchResultLegacyGrouping(packets [][]byte) (groups []*ipPacketGroup, rejec
 	return
 }
 
+// Counted in a process of its own (allocationsInFreshProcess). The foreign
+// step does nothing except in the child TestAllocationCountNeedsAProcessOfItsOwn
+// starts to reproduce the flake that made the count need one.
 func TestMultiClientBatchResultsLegacyGroupingAllocations(t *testing.T) {
+	if allocationsInFreshProcess(t) {
+		return
+	}
+	foreign := allocationCountForeignStep(t)
 	packets := make([][]byte, 64)
 	for i := range packets {
 		path := *udpTestPath(4)
@@ -278,7 +285,10 @@ func TestMultiClientBatchResultsLegacyGroupingAllocations(t *testing.T) {
 			}
 		})
 	}
-	before := measure(batchResultLegacyGrouping)
+	before := measure(func(packets [][]byte) ([]*ipPacketGroup, [][]byte) {
+		foreign()
+		return batchResultLegacyGrouping(packets)
+	})
 	after := measure(func(packets [][]byte) ([]*ipPacketGroup, [][]byte) {
 		return groupIpPacketsBounded(packets, 64, 96*1024)
 	})

@@ -1478,6 +1478,133 @@ func TestDialFailureReraceOffForwardsSignalAndKeepsExit(t *testing.T) {
 	}
 }
 
+// RR-5. With the knob off the signal is the same failure whether it lands
+// before the race of one commits the flow -- a provider that fails the dial
+// at once can answer before the send returns -- or after: the app gets one
+// icmp error at once, rebuilt over the SYN's sequence, the exit its strike,
+// and the flow stays on its exit. Dropped as stale, the early signal left the
+// app nothing at all: the commit bound the flow to the exit that failed it,
+// and collapse prevention keeps the app's same-sequence retransmits from that
+// exit, so no second signal could follow. The send hook lands the signal
+// before the send returns; a silent exit given the signal after the send is
+// the order in which the commit comes first.
+func TestDialFailureReraceOffSignalBeforeTheCommitForwards(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	for _, version := range []int{4, 6} {
+		for _, beforeCommit := range []bool{true, false} {
+			label := fmt.Sprintf("ipv%d, signal before the commit %t", version, beforeCommit)
+			synctest.Test(t, func(t *testing.T) {
+				harness := newReraceHarness(t, []reraceExitSpec{
+					{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+					{name: "b", tier: 1},
+				}, func(settings *MultiClientSettings) {
+					settings.DialFailureRerace = false
+				})
+				a := harness.channel("a")
+				path := reraceFlow(version, 0, 47100)
+				if beforeCommit {
+					a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, path)
+				}
+				harness.syn(path)
+				a.sendGroupForTest = nil
+				if !beforeCommit {
+					harness.inject("a", reraceProviderSignal(t, path))
+				}
+				if got := harness.metrics().DialFailuresIntercepted; got != 1 {
+					t.Fatalf("%s: setup: DialFailuresIntercepted = %d, want the signal", label, got)
+				}
+
+				if harness.boundTo(path) != a {
+					t.Errorf("%s: the flow left A with the knob off", label)
+				}
+				errorsDelivered := harness.errorsDelivered(path)
+				if len(errorsDelivered) != 1 {
+					t.Fatalf("%s: the app received %d icmp errors for the failed dial, want 1", label, len(errorsDelivered))
+				}
+				if sent := harness.sentSyns(path); !errorsDelivered[0].at.Equal(sent[0]) {
+					t.Errorf("%s: the icmp error reached the app %s after the SYN, want at once", label, errorsDelivered[0].at.Sub(sent[0]))
+				}
+				if embedded, ok := ipParseIcmpUnreachable(errorsDelivered[0].packet); !ok || embedded.SequenceNumber != path.SequenceNumber {
+					t.Errorf("%s: the icmp error embeds %+v, want the SYN's sequence %d", label, embedded, path.SequenceNumber)
+				}
+				want := reraceProviderFlowPath(path)
+				want.SequenceNumber = path.SequenceNumber
+				if wantPacket, _ := ipOosUnreachable(want); !bytes.Equal(errorsDelivered[0].packet, wantPacket) {
+					t.Errorf("%s: the icmp error is %x, want %x", label, errorsDelivered[0].packet, wantPacket)
+				}
+				if got := len(harness.delivered(path)); got != 1 {
+					t.Errorf("%s: the app received %d packets, want only the icmp error", label, got)
+				}
+				if got := a.dialFailureCount(); got != 1 {
+					t.Errorf("%s: A carries %d strikes, want the signal's 1", label, got)
+				}
+				if got := harness.metrics().FlowsReraced; got != 0 {
+					t.Errorf("%s: FlowsReraced = %d, want 0 with the knob off", label, got)
+				}
+				if got := len(harness.exit("b").received(path)); got != 0 {
+					t.Errorf("%s: B received %d packets of the flow, want 0", label, got)
+				}
+			})
+		}
+	}
+}
+
+// RR-5. The icmp error the knob forwards embeds the SYN of the connect attempt
+// the signal fails, which the send path records before that SYN leaves. A new
+// attempt on a flow already bound to its exit -- the app's SYN with a new
+// sequence on the same 5-tuple -- can fail at once, before its send commits
+// the new sequence: the error must embed the new SYN's sequence, not the
+// last committed one, which the app's stack no longer accepts.
+func TestDialFailureReraceOffForwardsTheNewAttemptsSequence(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	for _, version := range []int{4, 6} {
+		synctest.Test(t, func(t *testing.T) {
+			harness := newReraceHarness(t, []reraceExitSpec{
+				{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+				{name: "b", tier: 1},
+			}, func(settings *MultiClientSettings) {
+				settings.DialFailureRerace = false
+			})
+			a := harness.channel("a")
+			path := reraceFlow(version, 0, 47110)
+			harness.syn(path)
+			if harness.boundTo(path) != a {
+				t.Fatalf("ipv%d: setup: the first SYN did not bind the flow to A", version)
+			}
+
+			// the app connects again on the same 5-tuple, and A fails the new
+			// SYN before its send returns
+			next := *path
+			next.SequenceNumber = path.SequenceNumber + 100000
+			a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, &next)
+			harness.syn(&next)
+			a.sendGroupForTest = nil
+			if got := harness.metrics().DialFailuresIntercepted; got != 1 {
+				t.Fatalf("ipv%d: setup: DialFailuresIntercepted = %d, want the signal", version, got)
+			}
+
+			errorsDelivered := harness.errorsDelivered(path)
+			if len(errorsDelivered) != 1 {
+				t.Fatalf("ipv%d: the app received %d icmp errors, want 1 for the new SYN", version, len(errorsDelivered))
+			}
+			if embedded, ok := ipParseIcmpUnreachable(errorsDelivered[0].packet); !ok || embedded.SequenceNumber != next.SequenceNumber {
+				t.Errorf("ipv%d: the icmp error embeds %+v, want the new SYN's sequence %d, not the first SYN's %d", version, embedded, next.SequenceNumber, path.SequenceNumber)
+			}
+			want := reraceProviderFlowPath(path)
+			want.SequenceNumber = next.SequenceNumber
+			if wantPacket, _ := ipOosUnreachable(want); !bytes.Equal(errorsDelivered[0].packet, wantPacket) {
+				t.Errorf("ipv%d: the icmp error is %x, want %x", version, errorsDelivered[0].packet, wantPacket)
+			}
+			if harness.boundTo(path) != a {
+				t.Errorf("ipv%d: the flow left A with the knob off", version)
+			}
+			if got := a.dialFailureCount(); got != 1 {
+				t.Errorf("ipv%d: A carries %d strikes, want the new attempt's 1", version, got)
+			}
+		})
+	}
+}
+
 // --- RR-6: strikes ---
 
 // RR-6. Strikes recorded from real signals through the channel: failures

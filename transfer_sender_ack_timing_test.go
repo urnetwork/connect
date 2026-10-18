@@ -3,6 +3,7 @@ package connect
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -13,6 +14,13 @@ import (
 // A real worker waits locally before the physical write, then stays behind
 // its post-write barrier while another worker coalesces the reply. Raw RTT
 // must include neither local wait and must remain separate from ACK delay.
+//
+// The initial-write hook is client-wide, and the client's key publication
+// writes on its own control sequence. The hook therefore counts only the
+// measured sequence's writes, and the publication is released at a fixed
+// point after the measurements: released when the test's context ended, it
+// raced that cancellation reaching the client, and under load it wrote while
+// the hook still ran.
 func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -20,10 +28,17 @@ func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 		destination := NewId()
 		startWorker, localWait, releaseLocal := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		written, releaseWorker := make(chan struct{}), make(chan struct{})
+		publishKey, controlWritten := make(chan struct{}), make(chan struct{})
+		var initialWrites, controlWrites atomic.Int32
 		settings := DefaultClientSettings()
 		settings.Log = NewNoopLogger()
 		settings.EncryptionSettings.Mode = EncryptionModeOff
-		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+		settings.beforeClientKeyPublishForTest = func() {
+			select {
+			case <-publishKey:
+			case <-ctx.Done():
+			}
+		}
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.beforeRunSendSequenceForTest = func(sendSequenceId) {
@@ -32,7 +47,16 @@ func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 			case <-ctx.Done():
 			}
 		}
-		settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(sendSequenceId, uint64) {
+		settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(id sendSequenceId, _ uint64) {
+			if id.Destination == ControlId {
+				if controlWrites.Add(1) == 1 {
+					close(controlWritten)
+				}
+				return
+			}
+			if id.Destination != destination || initialWrites.Add(1) != 1 {
+				return
+			}
 			close(written)
 			select {
 			case <-releaseWorker:
@@ -91,6 +115,13 @@ func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 		estimate = sequence.rttWindow.Estimate()
 		if estimate.SampleCount != 1 || estimate.Mean != 12*time.Millisecond {
 			t.Fatalf("worker reapplied or retimed physical RTT: %+v", estimate)
+		}
+		// The publication's own initial write reaches the same hook, which
+		// must leave the measured sequence's barrier alone.
+		close(publishKey)
+		<-controlWritten
+		if got := initialWrites.Load(); got != 1 {
+			t.Fatalf("the measured sequence made %d initial writes, want 1", got)
 		}
 	})
 }

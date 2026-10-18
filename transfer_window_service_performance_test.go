@@ -53,7 +53,7 @@ func TestWindowPathPacingStartupTrace(t *testing.T) {
 	}
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		cell := windowPathCell{Arm: "delivery", RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}
+		cell := windowPathCell{Arm: "delivery", RoundTrip: 400 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 1, Payload: 1280, Budget: mib(48), Rate: 125000000, Drop: true}
 		switch os.Getenv("CONNECT_WINDOW_PACING_TRACE_CASE") {
 		case "rtt-growth":
 			cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter = 300*time.Microsecond, 100*time.Millisecond, 4*time.Second
@@ -161,7 +161,7 @@ func TestWindowPathServicePerformanceMatrix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, cell := range windowServicePerformanceCells() {
 		t.Run(fmt.Sprintf("rate=%d/rtt=%s/flows=%d/compression=%s", cell.Rate, cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			readings := measureWindowPathArms(t, max(time.Second, 2*cell.RoundTrip+4*cell.Compression), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				trial := cell
 				trial.Arm, trial.Drop = arm, arm == "delivery"
@@ -184,9 +184,9 @@ func TestWindowPathServiceCapacityChanges(t *testing.T) {
 	for _, rates := range [][2]ByteCount{{1250000, 12500000}, {12500000, 1250000}} {
 		for _, compression := range []time.Duration{0, 10 * time.Millisecond, 50 * time.Millisecond} {
 			t.Run(fmt.Sprintf("rate=%d-to-%d/compression=%s", rates[0], rates[1], compression), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				readings := measureWindowPathArms(t, time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
-					cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rates[1], Warmup: 8 * time.Second}
+					cell := windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: compression, Flows: 8, Payload: 1280, Budget: mib(48), Rate: rates[1], Warmup: 8 * time.Second}
 					if arm == "delivery" {
 						cell.Rate, cell.RateAfter, cell.RateChangeAfter, cell.Drop = rates[0], rates[1], 4*time.Second, true
 					}
@@ -212,12 +212,12 @@ func TestWindowPathServiceLargeMessages(t *testing.T) {
 			for _, flows := range []int{1, 8} {
 				for _, payload := range []int{16 * 1024, 64 * 1024} {
 					t.Run(fmt.Sprintf("rate=%d/rtt=%s/flows=%d/payload=%d", rate, rtt, flows, payload), func(t *testing.T) {
-						windowPathParallel(t)
+						t.Parallel()
 						warmup := max(300*time.Millisecond+5*rtt, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*rtt)
 						measurement := max(2*time.Second, time.Duration(64*int64(payload)*int64(time.Second)/int64(rate)))
 						readings := measureWindowPathArms(t, measurement, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 							return windowPathCell{Arm: arm, RoundTrip: rtt, Compression: 10 * time.Millisecond,
-								Flows: flows, RoundRobinOffer: true, Payload: payload, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
+								Flows: flows, Payload: payload, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
 						})
 						ceiling, fixed := readings[0], readings[1]
 						if ceiling.Mbps < .9*float64(rate)*8/1e6 || fixed.Mbps < .9*ceiling.Mbps || fixed.MinFlowMbps == 0 || fixed.MeasurementRelayDrops != 0 {
@@ -237,13 +237,13 @@ func TestWindowPathServicesShareFiniteRelay(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, rate := range []ByteCount{125000, 12500000, 125000000} {
 		t.Run(fmt.Sprintf("rate=%d", rate), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			readings := measureWindowPathArms(t, 2*time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				warmup := max(2*time.Second, time.Duration(2*4*int64(mib(2))*int64(time.Second)/int64(rate))+500*time.Millisecond)
 				// Two BDPs per sequence calibrate shared service without
 				// putting minutes of slow-link traffic into the control.
 				calibration := max(kib(256), ByteCount(float64(rate)*.110*2/4))
-				return windowPathCell{Arm: arm, CalibrationWindow: calibration, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8, RoundRobinOffer: true, Lanes: 4, Payload: 1280, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
+				return windowPathCell{Arm: arm, CalibrationWindow: calibration, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: 8, Lanes: 4, Payload: 1280, Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup}
 			})
 			ceiling, fixed := readings[0], readings[1]
 			t.Logf("shared service=%d ceiling=%.3f fixed=%.3f min-flow=%.3f model Mb/s drops=%d queue=%d/%d", rate, ceiling.Mbps, fixed.Mbps, fixed.MinFlowMbps, fixed.RelayDrops, fixed.MaxRelayQueued, fixed.MaxRelayQueuedBytes)
@@ -265,7 +265,7 @@ func TestWindowPathServiceRoundTripChanges(t *testing.T) {
 			{100 * time.Millisecond, 300 * time.Microsecond},
 		} {
 			t.Run(fmt.Sprintf("rate=%d/rtt=%s-to-%s", rate, roundTrips[0], roundTrips[1]), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				readings := measureWindowPathArms(t, time.Second, []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 					return windowServiceRoundTripChangeCell(arm, rate, roundTrips)
 				})
@@ -284,7 +284,7 @@ func TestWindowPathServiceRoundTripChanges(t *testing.T) {
 // after four settled seconds and has four more before the common interval.
 func windowServiceRoundTripChangeCell(arm string, rate ByteCount, roundTrips [2]time.Duration) windowPathCell {
 	cell := windowPathCell{Arm: arm, RoundTrip: roundTrips[1], Compression: 10 * time.Millisecond,
-		Flows: 8, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
+		Flows: 8, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: 8 * time.Second}
 	if arm == "delivery" {
 		cell.RoundTrip, cell.RoundTripAfter, cell.RoundTripChangeAfter, cell.Drop = roundTrips[0], roundTrips[1], 4*time.Second, true
 		cell.QualityChanged = true

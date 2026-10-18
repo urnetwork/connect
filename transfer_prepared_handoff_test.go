@@ -24,7 +24,7 @@ func TestPreparedHandoffCoalescedCancellationKeepsLiveCreditRetryable(t *testing
 		reserved := false
 		err := item.acks.commitPreparedHandoffs(func() error {
 			reserved = true
-			if !item.reservePreparedMemory(budget, kib(12)) {
+			if !item.reservePreparedMemory(budget, kib(12), nil) {
 				t.Fatal("full-parent credit handoff failed")
 			}
 			return nil

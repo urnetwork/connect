@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/urnetwork/connect/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // The platform's probe chunk size.
-const h1SpeedTestProbeByteCount = 1024
+const h1SpeedTestProbeByteCount = TransportSpeedTestProbeByteCount
 
 // The H1+ liveness owner with the production echo queue depth. Its peer stops
 // reading after its first complete message, the start echo.
@@ -30,7 +32,7 @@ func newH1SpeedTestFixture(t *testing.T) (*h1LivenessFixture, int) {
 
 // Probe chunks that differ from each other, so the order of their echoes is
 // visible. Each is filled with its index, so the count must stay below 256.
-func h1SpeedTestProbeMessages(t *testing.T, probeCount int) [][]byte {
+func h1SpeedTestProbeMessages(t *testing.T, probeCount int, testId uint32) [][]byte {
 	t.Helper()
 	if 256 <= probeCount {
 		t.Fatalf("%d probes cannot each have their own fill byte", probeCount)
@@ -38,6 +40,7 @@ func h1SpeedTestProbeMessages(t *testing.T, probeCount int) [][]byte {
 	probeMessages := make([][]byte, probeCount)
 	for index := range probeMessages {
 		probeMessages[index] = bytes.Repeat([]byte{byte(index)}, h1SpeedTestProbeByteCount)
+		SetTransportSpeedTestProbeHeader(probeMessages[index], testId)
 	}
 	return probeMessages
 }
@@ -110,7 +113,7 @@ func TestH1SpeedTestEchoBackpressureKeepsGenerationAndFrames(t *testing.T) {
 		stopMessage := []byte{TransportControlSpeedStop, 0, 0, 0, 7}
 		// more probes than the blocked writer, its queue and the reader hold
 		probeCount := 2*queueSize + 16
-		probeMessages := h1SpeedTestProbeMessages(t, probeCount)
+		probeMessages := h1SpeedTestProbeMessages(t, probeCount, 7)
 		probesWritten := startH1SpeedTestOnStalledUplink(t, fixture, startMessage, probeMessages)
 		// the uplink stays stalled for less than the writer's deadline
 		time.Sleep(fixture.transport.settings.WriteTimeout / 2)
@@ -184,7 +187,7 @@ func TestH1SpeedTestEchoStalledWriterEndsGenerationAtWriteDeadline(t *testing.T)
 			t,
 			fixture,
 			[]byte{TransportControlSpeedStart, 0, 0, 0, 9},
-			h1SpeedTestProbeMessages(t, probeCount),
+			h1SpeedTestProbeMessages(t, probeCount, 9),
 		)
 		if !fixture.transport.IsConnected() {
 			t.Fatal("a full speed-test echo queue closed the generation before the writer's deadline")
@@ -211,5 +214,60 @@ func TestH1SpeedTestEchoStalledWriterEndsGenerationAtWriteDeadline(t *testing.T)
 		if refusalCount := fixture.transport.ReceiveStats().H1ControlRefusalCount; refusalCount != 0 {
 			t.Fatalf("the stalled speed test refused %d echoes", refusalCount)
 		}
+	})
+}
+
+// The platform interleaves real Transfer frames with speed probes. Echoing a
+// received frame reflects its remote source back into this client's resident,
+// which correctly drops it as a forged source instead of delivering the data.
+func TestH1SpeedTestDeliversInterleavedTransferFrames(t *testing.T) {
+	resetH1UpgradeTestState(t)
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newH1LivenessFixture(t)
+		reader := fixture.routes.OpenMultiRouteReader(DestinationId(NewId()))
+		defer fixture.routes.CloseMultiRouteReader(reader)
+		start := []byte{TransportControlSpeedStart, 0, 0, 0, 7}
+		stop := []byte{TransportControlSpeedStop, 0, 0, 0, 7}
+		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, start); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		var frame []byte
+		for payloadSize := 0; len(frame) < h1SpeedTestProbeByteCount; payloadSize++ {
+			var err error
+			frame, err = proto.Marshal(&protocol.TransferFrame{
+				TransferPath: NewTransferPath(NewId(), NewId(), Id{}).ToProtobuf(),
+				Pack:         &protocol.Pack{MessageId: NewId().Bytes(), SequenceId: NewId().Bytes(), Frames: []*protocol.Frame{{MessageType: protocol.MessageType_TestSimpleMessage, MessageBytes: make([]byte, payloadSize)}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(frame) != h1SpeedTestProbeByteCount {
+			t.Fatal("fixture has no probe-sized Transfer frame")
+		}
+		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		received, err := reader.Read(context.Background(), 0)
+		if err != nil || !bytes.Equal(received, frame) {
+			t.Errorf("speed test did not deliver interleaved Transfer: received=%d err=%v", len(received), err)
+		}
+		MessagePoolReturn(received)
+		probe := bytes.Repeat([]byte{0xa5}, h1SpeedTestProbeByteCount)
+		copy(probe, []byte{0, 0, 0, 0, 7})
+		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, probe); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, stop); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if got := fixture.payloadMessagesSnapshot(); firstMessageMismatch(got, [][]byte{start, probe, stop}) != -1 {
+			t.Errorf("speed test reflected user traffic or lost probes: got %d echoes, want start/probe/stop", len(got))
+		}
+		fixture.assertConnected(t)
 	})
 }

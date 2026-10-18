@@ -284,6 +284,8 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperation(packets [][]byte, 
 // protects source-map access before the slot wait, and one exact source lease
 // remains the callback's until its defer, independent of any child return item.
 // A nonblocking callback keeps its original immediate scratch admission.
+// The two prepaid slots grant in arrival order before a returning producer
+// can reserve again. Cancellation abandons that exact queued or granted slot.
 // Borrows packets. Success gives the caller the memory operation and optional
 // source lease; release the source before finishing the memory operation.
 func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
@@ -320,27 +322,45 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperationForSource(
 	if flowCtx != nil {
 		flowDone = flowCtx.Done()
 	}
-	for {
-		// Done may already be closed when capacity is also open. Observe the
-		// exact owners before every reserve, not only in the blocking select.
-		if self.ctx.Err() != nil ||
+	ownersCanceled := func() bool {
+		return self.ctx.Err() != nil ||
 			sourceLifecycle != nil && sourceLifecycle.ctx.Err() != nil ||
-			flowCtx != nil && flowCtx.Err() != nil {
-			self.releaseSourceLifecycle(sourceId, sourceLifecycle)
-			self.memoryOperations.finish()
-			return natMemoryReservation{}, nil, false
-		}
-		changed := self.tcpReturnMemory.CapacityNotify()
-		if memory, ok := reserveNatMemory(self.tcpReturnMemory, kib(32)); ok {
-			return memory, sourceLifecycle, true
-		}
+			flowCtx != nil && flowCtx.Err() != nil
+	}
+	if ownersCanceled() {
+		self.releaseSourceLifecycle(sourceId, sourceLifecycle)
+		self.memoryOperations.finish()
+		return natMemoryReservation{}, nil, false
+	}
+	if reserved, waiter := self.tcpReturnMemory.tryReserveOrQueue(kib(32)); !reserved {
 		select {
 		case <-self.ctx.Done():
 		case <-sourceDone:
 		case <-flowDone:
-		case <-changed:
+		case <-waiter.ready:
+			if self.afterReturnMemoryGrantForTest != nil {
+				self.afterReturnMemoryGrantForTest()
+			}
+		}
+		// A closed ready channel owns real bytes, even if cancellation won
+		// the select. Abandon returns a grant or removes the queued waiter.
+		if ownersCanceled() {
+			waiter.abandon()
+			self.releaseSourceLifecycle(sourceId, sourceLifecycle)
+			self.memoryOperations.finish()
+			return natMemoryReservation{}, nil, false
 		}
 	}
+	memory := natMemoryReservation{budget: self.tcpReturnMemory, bytes: kib(32)}
+	// An immediate grant also races cancellation; do not pass a retired
+	// source/flow into the callback just because its workspace was free.
+	if ownersCanceled() {
+		memory.release()
+		self.releaseSourceLifecycle(sourceId, sourceLifecycle)
+		self.memoryOperations.finish()
+		return natMemoryReservation{}, nil, false
+	}
+	return memory, sourceLifecycle, true
 }
 
 func providerPacketOperationBytes(packets [][]byte) ByteCount {

@@ -58,7 +58,7 @@ func TestWindowPathDeterministicMatrixCoverage(t *testing.T) {
 	seen := map[[4]int]bool{}
 	for _, cell := range windowDeterministicPerformanceCells(windowDeterministicRoundTrips(), false) {
 		row := [4]int{int(cell.RoundTrip), cell.Flows, int(cell.Compression)}
-		if seen[row] || cell.Payload != 1280 || cell.Budget != mib(48) || cell.Rate != 125000000 || cell.RoundRobinOffer {
+		if seen[row] || cell.Payload != 1280 || cell.Budget != mib(48) || cell.Rate != 125000000 {
 			t.Fatalf("duplicate or changed deterministic workload: %+v", cell)
 		}
 		seen[row] = true
@@ -102,7 +102,7 @@ func TestWindowPathSdkMatrixCoverage(t *testing.T) {
 		physical := [4]int{sender, receiver, int(cell.RoundTrip), cell.Flows}
 		if !senderKnown || !receiverKnown || (sender != 1 && receiver != 1) || physicalRows[physical] ||
 			cell.ProfileFixtureSha256 != digest || cell.Payload != 1280 || cell.Rate != 125000000 ||
-			!cell.RoundRobinOffer || cell.Bidirectional || cell.Upload ||
+			cell.Bidirectional || cell.Upload ||
 			cell.SenderProfile.AckCompressionNs != 10*time.Millisecond || cell.ReceiverProfile.AckCompressionNs != 10*time.Millisecond {
 			t.Fatalf("duplicate or changed SDK workload: %+v", cell)
 		}
@@ -152,7 +152,7 @@ func TestWindowPathServiceMatrixCoverage(t *testing.T) {
 	for _, cell := range windowServicePerformanceCells() {
 		row := [4]int{int(cell.Rate), int(cell.RoundTrip), cell.Flows, int(cell.Compression)}
 		warmup := max(300*time.Millisecond+5*cell.RoundTrip, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(cell.Rate))+5*cell.RoundTrip)
-		if seen[row] || cell.Payload != 1280 || cell.Budget != mib(48) || !cell.RoundRobinOffer || cell.Warmup != warmup {
+		if seen[row] || cell.Payload != 1280 || cell.Budget != mib(48) || cell.Warmup != warmup {
 			t.Fatalf("duplicate or changed service workload: %+v", cell)
 		}
 		seen[row] = true

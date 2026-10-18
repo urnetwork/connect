@@ -3297,6 +3297,11 @@ type UdpSequence struct {
 	retirementDone                 chan struct{}
 	kernelReceiveDropCount         *atomic.Uint64
 
+	// This flow's place in line for prepared return credit while its read
+	// waits. Only the flow's one reader takes or parks it, inside a
+	// retirement operation; retirement gives it up after the last one.
+	returnReadCredit atomic.Pointer[transferMemoryReserveWaiter]
+
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
 	// Lazily allocated only when the bounded send queue actually blocks.
@@ -3401,6 +3406,7 @@ func (self *UdpSequence) startRetirementOperation() bool {
 func (self *UdpSequence) finishRetirementOperation() {
 	if self != nil && self.retirementOperations != nil {
 		self.retirementOperations.finish()
+		self.releaseReturnReadCreditIfRetired()
 		self.releaseMemoryIfRetired()
 	}
 }
@@ -3867,6 +3873,7 @@ func (self *UdpSequence) Cancel() {
 func (self *UdpSequence) Close() {
 	self.closeOnce.Do(func() {
 		self.retirementOperations.close()
+		self.releaseReturnReadCreditIfRetired()
 		self.cancel()
 		if self.sharedSocketLifecycle {
 			if self.socketReadPoller != nil {
@@ -7731,6 +7738,9 @@ type RemoteUserNatProvider struct {
 	afterContractStatusAdmissionForTest func()
 	beforeSourceAdmissionForTest        func(Id)
 	afterSourceAdmissionForTest         func(Id)
+	// Nil in production. A test may pause a queued producer after its FIFO
+	// grant, with its source and memory gates still held; set before use.
+	afterReturnMemoryGrantForTest       func()
 	beforeLocalUserNatAdmissionForTest  func(Id, [][]byte)
 	beforeSourceRetirementWaitForTest   func(Id)
 	afterReceiveSourceRetirementForTest func(Id)

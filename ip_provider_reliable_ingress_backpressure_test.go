@@ -77,9 +77,15 @@ type reliableTcpIngressFixture struct {
 
 func newReliableTcpIngressFixture(t *testing.T, version int, budget *TransferMemoryBudget, configure ...func(*ClientSettings)) *reliableTcpIngressFixture {
 	t.Helper()
+	return newReliableTcpIngressFixtureWithPath(t, icmpTcpTestPath(version), budget, configure...)
+}
+
+// The same fixture for one exact TCP flow.
+func newReliableTcpIngressFixtureWithPath(t *testing.T, path *IpPath, budget *TransferMemoryBudget, configure ...func(*ClientSettings)) *reliableTcpIngressFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &reliableTcpIngressFixture{t: t, ctx: ctx, cancel: cancel,
-		source: SourceId(NewId()), path: icmpTcpTestPath(version), processed: make(chan struct{}, 32)}
+		source: SourceId(NewId()), path: path, processed: make(chan struct{}, 32)}
 	clientSettings := DefaultClientSettings()
 	clientSettings.Log = NewNoopLogger()
 	clientSettings.EncryptionSettings.Mode = EncryptionModeOff

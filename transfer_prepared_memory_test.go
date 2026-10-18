@@ -82,7 +82,7 @@ func TestPreparedSendMemoryCoalescedMoveAndAbortReleaseExactlyOnce(t *testing.T)
 	item := &sendItem{}
 	item.acks.add(sendAckRecord{target: &preparedSendMemoryTestOwner{credit: first}})
 	item.acks.add(sendAckRecord{target: &preparedSendMemoryTestOwner{credit: second}})
-	if !item.reservePreparedMemory(budget, kib(12)) || root.UsedByteCount() != kib(16) {
+	if !item.reservePreparedMemory(budget, kib(12), nil) || root.UsedByteCount() != kib(16) {
 		t.Fatal("coalesced full-parent transfer refused or reborrowed")
 	}
 	first.release()
@@ -108,14 +108,14 @@ func TestPreparedSendMemoryDuplicateAndFailedGrowthKeepOwnership(t *testing.T) {
 	item := &sendItem{}
 	item.acks.add(sendAckRecord{target: owner})
 	item.acks.add(sendAckRecord{target: owner})
-	if item.reservePreparedMemory(budget, kib(12)) {
+	if item.reservePreparedMemory(budget, kib(12), nil) {
 		t.Fatal("duplicate records invented prepared capacity")
 	}
 	pack := &SendPack{ackTarget: owner, Frame: &protocol.Frame{}}
 	if pack.preparedMemoryBytes(budget) != kib(8) || budget.UsedByteCount() != kib(8) {
 		t.Fatal("failed growth consumed prepared credit")
 	}
-	if !item.reservePreparedMemory(budget, kib(8)) {
+	if !item.reservePreparedMemory(budget, kib(8), nil) {
 		t.Fatal("unchanged original credit became unusable")
 	}
 	item.releaseMemory()
@@ -134,10 +134,10 @@ func TestPreparedSendMemoryDetachedMetadataStaysChargedThroughAck(t *testing.T) 
 	owner := &preparedSendMemoryTestOwner{credit: credit}
 	item := &sendItem{}
 	item.acks.add(sendAckRecord{target: owner})
-	if item.reservePreparedMemory(budget, kib(16)) {
+	if item.reservePreparedMemory(budget, kib(16), nil) {
 		t.Fatal("serialized flight consumed the detached capsule's fixed memory")
 	}
-	if !item.reservePreparedMemory(budget, kib(12)) {
+	if !item.reservePreparedMemory(budget, kib(12), nil) {
 		t.Fatal("legal flight could not reuse prepared credit")
 	}
 	credit.releaseUnused()

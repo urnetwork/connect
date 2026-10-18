@@ -24,7 +24,12 @@ const extenderQuicSendMemoryByteCount ByteCount = 256 * 1024
 
 const (
 	quicSendFlightFrameLimit = 96
-	quicSendFlightWriteLimit = 64
+	// Writers block with a root free for every admitted root. Retransmission
+	// splits a lost root once whenever its packet carries more ACK or control
+	// bytes than the original did (sentFrameLocked), and the table fails
+	// closed when the roots reach quicSendFlightFrameLimit. Even a whole lost
+	// window retransmitted entirely as splits stays below that.
+	quicSendFlightWriteLimit = (quicSendFlightFrameLimit - 1) / 2
 	quicSendFlightPackets    = 256
 	quicSendFlightChunk      = 4096
 	quicSendFlightStreams    = 8
@@ -517,8 +522,9 @@ func (self *quicSendFlight) sentFrameLocked(packet int64, frame *qlog.StreamFram
 			continue
 		}
 		// Retransmissions are an entire frame or its prefix. A prefix split
-		// allocates a second pooled root. PTO moves an entire old packet,
-		// even though v0.61 does not emit PacketLost for that move.
+		// allocates a second pooled root, which admission left free. PTO
+		// moves an entire old packet, even though v0.61 does not emit
+		// PacketLost for that move.
 		if old.abandoned || start != old.start || old.end < end {
 			self.failLocked()
 			return
