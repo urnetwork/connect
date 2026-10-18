@@ -16213,12 +16213,28 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		}
 	}
 
+	// Resolve a retained duplicate before preflight. Its original owner, not
+	// the refused copy, is the one that would advance after a head reset; a
+	// duplicate must not spend predecessor credit promised to another Pack.
+	var held *receiveItem
+	if sequenceNumber >= self.nextSequenceNumber &&
+		(self.receiveQueue.lifetimeBudget || sequenceNumber == self.nextSequenceNumber || item.head) {
+		held = self.receiveQueue.GetByMessageId(messageId)
+		if held == nil {
+			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
+		}
+	}
+	admissionItem := item
+	if held != nil {
+		admissionItem = held
+	}
+
 	// Exact retained owners reserve before advancing; legacy heads reserve
 	// receipts in holdHead and may use the bounded hold on pressure. Neither
 	// mode may reset its head past a refused receipt.
 	if (self.receiveQueue.lifetimeBudget && sequenceNumber == self.nextSequenceNumber ||
 		item.head && self.nextSequenceNumber < sequenceNumber) &&
-		!self.prepareReceiveDelivery(item) {
+		!self.prepareReceiveDelivery(admissionItem) {
 		self.client.receiveQueueDropCount.Add(1)
 		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
 		return false, nil
@@ -16242,23 +16258,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	// repeat its selective ACK. An arriving ordered/head item still takes the
 	// direct-delivery path below and can drain a completely full hold, unless
 	// the head itself is held for delivery capacity: then it is a duplicate.
-	if self.receiveQueue.lifetimeBudget && sequenceNumber > self.nextSequenceNumber ||
-		sequenceNumber == self.nextSequenceNumber && self.receiveQueue.GetBySequenceNumber(sequenceNumber) != nil {
-		held := self.receiveQueue.GetByMessageId(messageId)
-		if held == nil {
-			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
+	if held != nil {
+		self.peerAudit.Update(func(a *PeerAudit) { a.resend(held.messageByteCount) })
+		if held.committed && held.ack {
+			self.sendAck(held.sequenceNumber, held.messageId, true,
+				held.tag, held.unwrapped, held.transportType)
 		}
-		if held != nil {
-			self.peerAudit.Update(func(a *PeerAudit) { a.resend(held.messageByteCount) })
-			if held.committed && held.ack {
-				self.sendAck(held.sequenceNumber, held.messageId, true,
-					held.tag, held.unwrapped, held.transportType)
-			}
-			// Head-reset preflight may have reserved this incoming copy. The
-			// original keeps its lease; the refused copy keeps no new credit.
-			item.releaseMemory()
-			return false, nil
-		}
+		item.releaseMemory()
+		return false, nil
 	}
 
 	if removedItem := self.receiveQueue.RemoveBySequenceNumber(sequenceNumber); removedItem != nil {

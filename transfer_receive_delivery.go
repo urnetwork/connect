@@ -150,7 +150,10 @@ func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem, admitOne bool)
 	regular := len(q.items)-q.controlCount < q.maxCount &&
 		(bytes <= q.maxBytes-(q.bytes-q.controlBytes) || synchronousOversize || admitOne && len(q.items) == 0)
 	if regular && q.sequence.receiveQueue != nil && q.sequence.receiveQueue.lifetimeBudget && item.memoryBudget == nil {
-		regular = item.reserveMemory(q.sequence.receiveQueue.budget, item.QueueByteCount())
+		// A selectively held successor already reserved its missing heads.
+		// Move that exact credit into the arriving owner before requesting
+		// fresh bytes, just as admission into the out-of-order hold does.
+		regular = q.sequence.reserveHeldItem(item, q.sequence.holdPromised(item.sequenceNumber))
 	}
 	controlReserve := !regular
 	if controlReserve && (!control || q.controlCount >= receiveDeliveryControlMaxCount || bytes > receiveDeliveryControlMaxBytes-q.controlBytes) {

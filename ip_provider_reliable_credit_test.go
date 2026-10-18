@@ -49,6 +49,10 @@ func TestProviderReliableTcpPrepaidSharedRootHandoff(t *testing.T) {
 						t.Fatal("selective lease did not prepay its exact downstream ownership")
 					}
 					originalCharge, prepaid := held.queueByteCount, held.deliveryPrepaid
+					promised := sequence.holdPromise.reservedByteCount
+					if promised != originalCharge || receiveBudget.UsedByteCount() != originalCharge+promised {
+						t.Fatal("one missing predecessor did not own exactly one additional held-size promise")
+					}
 					rootBytes := MessagePoolRootByteCount(held.frames[0].MessageBytes)
 					t.Logf("retained=%dB downstream-prepaid=%dB original-root=%dB", originalCharge, prepaid, rootBytes)
 					witness := MessagePoolShareReadOnly(held.frames[0].MessageBytes)
@@ -79,8 +83,15 @@ func TestProviderReliableTcpPrepaidSharedRootHandoff(t *testing.T) {
 						receiveBudget.UsedByteCount() != held.queueByteCount {
 						t.Fatal("handoff either failed or removed still-live receive-root credit")
 					}
-					if root.UsedByteCount() != root.TotalByteCount() || root.reservedByteCount.Load() != rootReserved || root.releasedByteCount.Load() != rootReleased {
-						t.Fatal("same-root handoff released/re-reserved shared ownership")
+					// The predecessor consumed/retired its separately reserved
+					// promise. Only that exact charge may leave the common root;
+					// moving the payload's prepaid credit adds no root events.
+					if sequence.holdPromise.reservedByteCount != 0 ||
+						root.UsedByteCount() != root.TotalByteCount()-promised ||
+						root.reservedByteCount.Load() != rootReserved ||
+						root.releasedByteCount.Load() != rootReleased+int64(promised) {
+						t.Fatalf("same-root handoff changed more than predecessor retirement: promise=%d used=%d total=%d reserveDelta=%d releaseDelta=%d",
+							promised, root.UsedByteCount(), root.TotalByteCount(), root.reservedByteCount.Load()-rootReserved, root.releasedByteCount.Load()-rootReleased)
 					}
 					(<-f.tcp.sendItems).release()
 					synctest.Wait()
