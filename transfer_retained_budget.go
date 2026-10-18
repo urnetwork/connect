@@ -23,6 +23,27 @@ func (self *transferItem) reserveMemory(budget *TransferMemoryBudget, byteCount 
 	return true
 }
 
+// reserveMemoryWithCredit takes up to *creditByteCount of byteCount from a
+// reservation the caller already holds in budget, and reserves only the rest.
+// The credit moves to this item without touching the budget, so no other owner
+// can take the bytes between the promise and the arrival it was made for.
+func (self *transferItem) reserveMemoryWithCredit(budget *TransferMemoryBudget, byteCount ByteCount, creditByteCount *ByteCount) bool {
+	if budget == nil {
+		return true
+	}
+	if self.memoryBudget != nil {
+		panic("transfer owner already has a memory reservation")
+	}
+	credit := min(max(0, *creditByteCount), byteCount)
+	if remainder := byteCount - credit; 0 < remainder && !budget.TryReserve(remainder) {
+		return false
+	}
+	*creditByteCount -= credit
+	self.memoryBudget = budget
+	self.queueByteCount = byteCount
+	return true
+}
+
 func (self *transferItem) releaseMemory() {
 	if budget := self.memoryBudget; budget != nil {
 		self.memoryBudget = nil
@@ -79,9 +100,16 @@ func (self *sendItem) reserveFrameRewrite(frameByteCount ByteCount, frameCount i
 	return true
 }
 
-func (self *ReceiveSequence) reserveHeldItem(item *receiveItem) bool {
-	return !self.receiveQueue.lifetimeBudget ||
-		item.reserveMemory(self.receiveQueue.budget, item.QueueByteCount())
+// A promised predecessor draws first on the reservation its committed
+// successor made for it (see transfer_receive_hold_promise.go).
+func (self *ReceiveSequence) reserveHeldItem(item *receiveItem, promised bool) bool {
+	if !self.receiveQueue.lifetimeBudget {
+		return true
+	}
+	if promised {
+		return item.reserveMemoryWithCredit(self.receiveQueue.budget, item.QueueByteCount(), &self.holdPromise.reservedByteCount)
+	}
+	return item.reserveMemory(self.receiveQueue.budget, item.QueueByteCount())
 }
 
 // Covers both protocol encodings, bounded per-frame field overhead, and a
@@ -123,5 +151,5 @@ func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
 	if credit := pack.ackRecord().preparedMemory(); credit != nil {
 		credit.require(required)
 	}
-	return required <= self.resendQueue.budget.Available()+pack.preparedMemoryBytes(self.resendQueue.budget)
+	return required <= self.resendQueue.budget.Available()+self.resendMemoryGrant+pack.preparedMemoryBytes(self.resendQueue.budget)
 }

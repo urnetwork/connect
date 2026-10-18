@@ -23,7 +23,7 @@ func TestWindowPacingShortCompressedServiceKeepsMeasuredCapacity(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				reading := measureWindowPathCell(t, windowPathCell{
 					Arm: arm, RoundTrip: rtt, Compression: compression,
-					Flows: flows, RoundRobinOffer: true, Payload: 1280,
+					Flows: flows, Payload: 1280,
 					Budget: mib(48), Rate: rate, Drop: arm == "delivery", Warmup: warmup,
 				}, max(time.Second, 2*rtt+4*compression))
 				logWindowServiceReading(t, reading)

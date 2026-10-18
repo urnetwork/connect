@@ -27,6 +27,18 @@ func (self *TcpSequence) returnMemoryBudget() *TransferMemoryBudget {
 // retainReturnChunk borrows payload and keeps an owned copy. Only the socket
 // reader calls it; waiting here propagates pressure into this flow's origin.
 // ACK callbacks merely release capacity and signal the dedicated replay worker.
+//
+// Every TCP flow of the NAT retains from one shared budget, and a reader that
+// finds it full waits in the budget's arrival order: bytes an acknowledgement
+// frees are reserved for the oldest waiting reader before any woken reader
+// runs. Waking every reader to race for them let the runtime pick: with no
+// idle processor the reader that waited first retained, read on and waited
+// again ahead of the readers it beat, so one flow kept every freed byte. A
+// reader held by its own per-flow limit takes no place in line until its
+// acknowledgements lift it. A queued reader keeps the metadata plan it queued
+// with: only this reader appends chunks, so the array it planned to grow
+// stays valid, and its per-flow limit stays met, while acknowledgements drain
+// the flow.
 func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin bool) bool {
 	// Account for the pool root and geometric slice growth of chunk metadata.
 	// Reserve before copying: a blocked flow borrows its existing socket read
@@ -58,29 +70,48 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 	if fin {
 		end++
 	}
+	var waiter *transferMemoryReserveWaiter
+	defer func() {
+		if waiter != nil {
+			waiter.abandon()
+		}
+	}()
+	metadataCharge := ByteCount(0)
+	metadataCapacity := 0
 	for {
 		if self.ctx.Err() != nil {
 			return false
-		}
-		var budgetChanged <-chan struct{}
-		if budget != nil {
-			budgetChanged = budget.CapacityNotify()
 		}
 		self.mutex.Lock()
 		if int32(self.receiveSeqAck-end) >= 0 {
 			self.mutex.Unlock()
 			return true
 		}
-		metadataCharge := ByteCount(0)
-		metadataCapacity := cap(self.returnChunks)
-		if self.tcpBufferSettings.MemoryBudget != nil && len(self.returnChunks) == cap(self.returnChunks) && self.returnHead != len(self.returnChunks) {
-			metadataCapacity = max(4, 2*cap(self.returnChunks))
-			metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
-		} else if self.tcpBufferSettings.MemoryBudget != nil && cap(self.returnChunks) == 0 {
-			metadataCapacity = 4
-			metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+		reserved := false
+		if waiter == nil {
+			metadataCharge = 0
+			metadataCapacity = cap(self.returnChunks)
+			if self.tcpBufferSettings.MemoryBudget != nil && len(self.returnChunks) == cap(self.returnChunks) && self.returnHead != len(self.returnChunks) {
+				metadataCapacity = max(4, 2*cap(self.returnChunks))
+				metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+			} else if self.tcpBufferSettings.MemoryBudget != nil && cap(self.returnChunks) == 0 {
+				metadataCapacity = 4
+				metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+			}
+			if self.returnByteCount+charge <= limit {
+				reserved = budget == nil
+				if budget != nil {
+					reserved, waiter = budget.tryReserveOrQueue(charge + metadataCharge)
+				}
+			}
+		} else {
+			select {
+			case <-waiter.ready:
+				reserved, waiter = true, nil
+			default:
+			}
 		}
-		if self.returnByteCount+charge <= limit && (budget == nil || budget.TryReserve(charge+metadataCharge)) {
+		if reserved {
 			var owned []byte
 			if len(payload) != 0 {
 				owned = MessagePoolCopy(payload)
@@ -106,10 +137,14 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 			return true
 		}
 		self.mutex.Unlock()
+		var granted <-chan struct{}
+		if waiter != nil {
+			granted = waiter.ready
+		}
 		select {
 		case <-self.ctx.Done():
 			return false
-		case <-budgetChanged:
+		case <-granted:
 		case <-self.returnCapacity:
 		}
 	}

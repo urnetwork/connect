@@ -64,6 +64,37 @@ func receiveDeliveryHasTcp(frames []*protocol.Frame) bool {
 	return false
 }
 
+// Reports whether the ready head must stay in the receive hold because the
+// delivery ledger cannot take its receipt yet. A false result has admitted
+// the receipt, so the head can be delivered. A full ledger is backpressure,
+// not a failure: the held head keeps the cumulative ACK, and with it the
+// sender's byte window, where it is until a drain wakes the sequence.
+func (self *ReceiveSequence) holdHead(item *receiveItem) bool {
+	if !item.ack {
+		return false
+	}
+	if self.deliveryQueue == nil {
+		if !self.client.reliableProviderIngress.Load() || !receiveDeliveryHasTcp(item.frames) {
+			return false
+		}
+		// The buffered heads need no receipts. Deliver them first, so every
+		// head the ledger ever owns was admitted before its delivery.
+		self.flushDeliver()
+		self.deliveryQueue = newReceiveDeliveryQueue(self,
+			self.receiveBufferSettings.SequenceBufferSize, self.receiveBufferSettings.ReceiveQueueMaxByteCount)
+	}
+	return !self.deliveryQueue.admit(item)
+}
+
+// The ledger's drain edge, or nil (never ready) before a ledger exists. A
+// sequence holding its head must wake for it even after the ledger empties.
+func (self *ReceiveSequence) deliveryWake() <-chan struct{} {
+	if self.deliveryQueue == nil {
+		return nil
+	}
+	return self.deliveryQueue.wake
+}
+
 func (self *ReceiveSequence) needsDeliveryReceipts(items []*receiveItem, frames []*protocol.Frame) bool {
 	if self.deliveryQueue != nil {
 		return true
@@ -108,9 +139,10 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 			continue
 		}
 		required := self.client.reliableProviderIngress.Load() && receiveDeliveryHasTcp(appFrames)
-		receipt, accepted := q.append(item, required)
+		receipt, accepted := q.receipt(item, required)
 		if !accepted {
-			// No ownership promise was made. Close before any later cumulative
+			// Only a head delivered without admission reaches this. No
+			// ownership promise was made; close before any later cumulative
 			// head can step over this rejected item.
 			item.messagePoolReturn()
 			q.cancel()

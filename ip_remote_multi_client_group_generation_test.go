@@ -176,7 +176,7 @@ func testTcpGroupRecoveryResetSynCancellation(t *testing.T, producerPaused bool)
 		first, releaseFirst := make(chan struct{}), make(chan struct{})
 		producerEntered, releaseProducer := make(chan struct{}), make(chan struct{})
 		terminal := make(chan struct{}, 1)
-		var firstOnce, producerOnce sync.Once
+		var firstOnce, producerOnce, firstWriteOnce sync.Once
 		unparkFirst := func() { firstOnce.Do(func() { close(releaseFirst) }) }
 		unparkProducer := func() { producerOnce.Do(func() { close(releaseProducer) }) }
 		var offers, receives, appliedAcks atomic.Int64
@@ -198,10 +198,14 @@ func testTcpGroupRecoveryResetSynCancellation(t *testing.T, producerPaused bool)
 					<-releaseProducer
 				}
 			}
+			// Client-wide: another sequence's first item, such as the key
+			// publication released at teardown, must not close it again.
 			settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(_ sendSequenceId, sequence uint64) {
 				if sequence == 0 {
-					close(first)
-					<-releaseFirst
+					firstWriteOnce.Do(func() {
+						close(first)
+						<-releaseFirst
+					})
 				}
 			}
 			settings.SendBufferSettings.afterAckSendItemForTest = func(_ sendSequenceId, sequence uint64) {

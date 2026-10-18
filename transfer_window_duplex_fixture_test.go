@@ -17,7 +17,7 @@ func TestWindowPerformanceDuplexBoundsBothDirections(t *testing.T) {
 				reading := measureWindowPathCell(t, windowPathCell{
 					Arm: "ceiling", Bidirectional: true, Upload: upload,
 					RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
-					Flows: flows, Lanes: flows, RoundRobinOffer: true, Payload: 1280,
+					Flows: flows, Lanes: flows, Payload: 1280,
 					Rate: 12500000, Budget: kib(512), SendWindow: kib(64), ReceiveWindow: kib(64),
 					Warmup: time.Second,
 				}, time.Second)
@@ -48,7 +48,7 @@ func TestWindowPerformanceDuplexBoundsRateChanges(t *testing.T) {
 				reading := measureWindowPathCell(t, windowPathCell{
 					Arm: "ceiling", Bidirectional: true, Upload: upload, Drop: true,
 					RoundTrip: 300 * time.Microsecond, Compression: 10 * time.Millisecond,
-					Flows: 8, Lanes: 8, RoundRobinOffer: true, Payload: 1280,
+					Flows: 8, Lanes: 8, Payload: 1280,
 					Rate: rate, RateAfter: rateAfter, RateChangeAfter: 500 * time.Millisecond,
 					Budget: kib(512), SendWindow: kib(64), ReceiveWindow: kib(64), Warmup: 2 * time.Second,
 				}, time.Second)

@@ -62,6 +62,14 @@ func providerUdpReadCredit(sequence *UdpSequence, readBytes int, legacy bool) By
 	return ByteCount(fragments) * providerDatagramPacketCredit(packetBytes, legacy)
 }
 
+// Every return read of this provider is paid from this budget.
+func (sender *providerDatagramSender) readCreditBudget() *TransferMemoryBudget {
+	if budget := sender.provider.client.settings.SendBufferSettings.ResendQueueBudget; budget != nil {
+		return budget
+	}
+	return sender.provider.memoryBudget()
+}
+
 func (sender *providerDatagramSender) prepareUdp(sequence *UdpSequence, readBytes int, released func()) (udpReturnReadConsumer, bool) {
 	provider := sender.provider
 	if provider.ctx.Err() != nil || !provider.memoryOperations.start() {
@@ -73,11 +81,8 @@ func (sender *providerDatagramSender) prepareUdp(sequence *UdpSequence, readByte
 		provider.memoryOperations.finish()
 		return nil, false
 	}
-	budget := provider.client.settings.SendBufferSettings.ResendQueueBudget
-	if budget == nil {
-		budget = provider.memoryBudget()
-	}
-	credit, admitted := prepareSendMemory(budget, providerUdpReadCredit(sequence, readBytes, provider.settings.ProtocolVersion < 2))
+	credit, admitted := sequence.takeReturnReadCredit(sender.readCreditBudget(),
+		providerUdpReadCredit(sequence, readBytes, provider.settings.ProtocolVersion < 2))
 	if !admitted {
 		provider.releaseSourceLifecycle(source.SourceId, lifecycle)
 		provider.memoryOperations.finish()

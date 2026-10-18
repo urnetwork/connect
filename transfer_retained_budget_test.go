@@ -64,7 +64,7 @@ func TestRetainedReceiveFanoutHasNoEmptyFlowOrFloorOverdraft(t *testing.T) {
 			item := &receiveItem{transferItem: transferItem{
 				messageId: NewId(), sequenceNumber: 1, messageByteCount: 1, queueByteCount: charge,
 			}}
-			if seq.reserveHeldItem(item) {
+			if seq.reserveHeldItem(item, false) {
 				seq.receiveQueue.Add(item)
 				items[i] = item
 				admitted.Add(1)
@@ -303,6 +303,8 @@ func TestRetainedSendFullBudgetStillPermitsNoAckControl(t *testing.T) {
 }
 
 func TestRetainedColdReliableBacklogDoesNotHideNoAck(t *testing.T) {
+	// The process-wide pool worker must start outside the fixture's bubble.
+	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		budget := NewTransferMemoryBudget(kib(64))

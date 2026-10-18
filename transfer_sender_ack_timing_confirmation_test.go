@@ -3,6 +3,7 @@ package connect
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -43,8 +44,13 @@ func senderReceiverTimingConfirmationTest(t *testing.T, failWrite, cancelWrite b
 	settings.EncryptionSettings.Mode = EncryptionModeOff
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 	settings.SendBufferSettings.WriteTimeout = 0
+	// Both hooks are client-wide, and the key publication released when the
+	// context ends writes on its own control sequence. Each hook holds only the
+	// measured sequence's first write. A wire observation names no destination,
+	// but the measured write's is the first: the publication waits until after.
+	var observations, initialWrites atomic.Int32
 	settings.SendBufferSettings.TransferWireMessageObserver = func(observation TransferWireMessageObservation) {
-		if observation.Resend {
+		if observation.Resend || observations.Add(1) != 1 {
 			return
 		}
 		observed <- decodeSendPackLifecycleWirePack(t, observation.TransferFrameBytes)
@@ -53,7 +59,10 @@ func senderReceiverTimingConfirmationTest(t *testing.T, failWrite, cancelWrite b
 		case <-ctx.Done():
 		}
 	}
-	settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(sendSequenceId, uint64) {
+	settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(id sendSequenceId, _ uint64) {
+		if id.Destination != destination || initialWrites.Add(1) != 1 {
+			return
+		}
 		close(written)
 		select {
 		case <-releaseWorker:
@@ -113,5 +122,8 @@ func senderReceiverTimingConfirmationTest(t *testing.T, failWrite, cancelWrite b
 	got := sequence.rttWindow.Estimate()
 	if got.SampleCount != want || want == 1 && got.Mean != 12*time.Millisecond {
 		t.Fatalf("byte application resurrected rejected timing or duplicated confirmed timing: %+v wantCount%d", got, want)
+	}
+	if writes := initialWrites.Load(); writes != 1 {
+		t.Fatalf("the measured sequence made %d initial writes, want 1", writes)
 	}
 }

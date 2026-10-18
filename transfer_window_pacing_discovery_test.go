@@ -131,7 +131,7 @@ func TestWindowPathDiscoveryFillsRetainedWindow(t *testing.T) {
 			reading := measureWindowPathCell(t, windowPathCell{
 				SenderProfile: sender, ReceiverProfile: receiver, ProfileFixtureSha256: digest,
 				Arm: "delivery", Drop: true, RoundTrip: roundTrip, Flows: 1,
-				RoundRobinOffer: true, Payload: 1280, Rate: 125000000, Warmup: 8 * residence,
+				Payload: 1280, Rate: 125000000, Warmup: 8 * residence,
 			}, residence)
 			logWindowServiceReading(t, reading)
 			t.Logf("discovery rtt=%s Mb/s=%.6f pace=%d window=%d discovering=%t drops=%d queued-bytes=%d resends=%d",
@@ -182,7 +182,7 @@ func TestWindowPathDiscoveryStopsAtCapacity(t *testing.T) {
 		reading := measureWindowPathCell(t, windowPathCell{
 			SenderProfile: sender, ReceiverProfile: receiver, ProfileFixtureSha256: digest,
 			Arm: "delivery", Drop: true, RoundTrip: roundTrip, Flows: 1,
-			RoundRobinOffer: true, Payload: 1280, Rate: 4000000, Warmup: 20 * residence,
+			Payload: 1280, Rate: 4000000, Warmup: 20 * residence,
 		}, 2*residence)
 		logWindowServiceReading(t, reading)
 		t.Logf("capacity rtt=%s Mb/s=%.6f pace=%d window=%d discovering=%t drops=%d/%d queued-bytes=%d resends=%d",

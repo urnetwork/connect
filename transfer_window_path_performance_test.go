@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,9 @@ import (
 // The finite relay queue counts only bytes/messages awaiting serialization;
 // already propagating messages are separately bounded by the flight limit.
 type windowPathLink struct {
+	// The opt-in settlement fixture observes only bytes already rejected by
+	// this owner. The callback borrows the wire until MessagePoolReturn below.
+	afterDropForTest func(time.Time, []byte)
 	rate             ByteCount
 	rateAfter        ByteCount
 	rateChangeAfter  time.Duration
@@ -141,6 +145,9 @@ func (self *windowPathLink) run(ctx context.Context, from, to Route) {
 			queuedCount = len(queue) - serviced
 			if self.dropOnFull && (queuedCount >= self.queueCount || queuedBytes+ByteCount(len(frame)) > self.queueBytes) {
 				self.dropped.Add(1)
+				if self.afterDropForTest != nil {
+					self.afterDropForTest(now, frame)
+				}
 				MessagePoolReturn(frame)
 				continue
 			}
@@ -274,7 +281,7 @@ func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
 			continue
 		}
 		t.Run(fmt.Sprintf("rtt=%s/flows=%d/compression=%s", cell.RoundTrip, cell.Flows, cell.Compression), func(t *testing.T) {
-			windowPathParallel(t)
+			t.Parallel()
 			readings := measureWindowPathArms(t, max(100*time.Millisecond, 2*cell.RoundTrip), []string{"ceiling", "delivery"}, func(arm string) windowPathCell {
 				trial := cell
 				trial.Arm = arm
@@ -291,6 +298,31 @@ func checkWindowDeterministicPerformanceCells(t *testing.T, boundaries bool) {
 	}
 }
 
+// Parallel arms that fill the machine leave each bubble about one processor,
+// and on one processor the runtime wakes goroutines in the same order every
+// time. While each flow had its own producer on a shared sequence, the same
+// producer won every admission slot and its siblings delivered nothing. One
+// producer per sequence offers its flows in turn, so every flow of an
+// eight-flow deterministic cell keeps its share on one processor.
+func TestWindowPathFlowsKeepShareOnOneProcessor(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for _, cell := range windowDeterministicPerformanceCells([]time.Duration{300 * time.Microsecond}, true) {
+		if cell.Flows != 8 || cell.Compression != 0 {
+			continue
+		}
+		cell.Arm = "ceiling"
+		synctest.Test(t, func(t *testing.T) {
+			reading := measureWindowPathCell(t, cell, 100*time.Millisecond)
+			share := reading.Mbps / float64(cell.Flows)
+			t.Logf("one processor: goodput=%.1f min-flow=%.1f share=%.1f model Mb/s", reading.Mbps, reading.MinFlowMbps, share)
+			if reading.Mbps < 500 || reading.MinFlowMbps < .9*share {
+				t.Fatalf("a flow lost its share on one processor: goodput=%.1f min-flow=%.1f share=%.1f model Mb/s", reading.Mbps, reading.MinFlowMbps, share)
+			}
+		})
+	}
+}
+
 // A large configured opening creates pressure at the finite forwarding queue.
 // Both arms use that same opening and startup allowance; only pacing differs.
 // Carrier reliability cannot recover a Pack discarded after its first hop.
@@ -300,7 +332,7 @@ func TestWindowPathBoundsBurstsAtFiniteRelay(t *testing.T) {
 		for _, arm := range []string{"unpaced", "delivery"} {
 			// Each arm owns its gates, so the four bubbles are independent.
 			t.Run(fmt.Sprintf("flows=%d/%s", flows, arm), func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				synctest.Test(t, func(t *testing.T) {
 					reading := measureWindowPathCell(t, windowPathCell{Arm: arm, RoundTrip: 100 * time.Millisecond, Compression: 10 * time.Millisecond, Flows: flows, Payload: 1280, Budget: mib(48), BootstrapWindow: mib(48), Rate: 125000000, Drop: true}, time.Second)
 					if reading.Window.Initial != mib(48) {
@@ -473,6 +505,8 @@ func TestWindowReferenceCompletionObserverPhaseOwnership(t *testing.T) {
 type windowPathCell struct {
 	// Opt-in test observation; nil adds no per-Packet callback or token work.
 	referenceCompletions *windowReferenceCompletions
+	Settlement           *windowPathSettlementPolicy `json:",omitempty"`
+	MeasurementGrid      bool                        `json:",omitempty"`
 
 	// Optional explicit opening for a controlled comparison. It does not
 	// change byte permissions, the serializer, or measurement duration.
@@ -498,7 +532,6 @@ type windowPathCell struct {
 	QualityChanged           bool
 	Compression              time.Duration
 	Flows                    int
-	RoundRobinOffer          bool
 	Lanes                    int
 	Payload                  int
 	Budget                   ByteCount
@@ -519,7 +552,11 @@ type windowPathReading struct {
 	Mbps                  float64
 	MinFlowMbps           float64
 	IntervalMbps          []float64
-	DirectionMbps         []float64 `json:",omitempty"`
+	IntervalBytes         []int64
+	IntervalDurations     []time.Duration
+	Settlement            *windowPathSettlementReading `json:",omitempty"`
+	CapacityDebt          *windowPathDebtReading       `json:",omitempty"`
+	DirectionMbps         []float64                    `json:",omitempty"`
 	RelayDrops            int64
 	MeasurementRelayDrops int64
 	NatRefused            int64
@@ -709,6 +746,15 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	for _, observer := range observe {
 		observer(cell, sender, receiver)
 	}
+	var settlement *windowPathSettlement
+	if cell.Settlement != nil {
+		var err error
+		settlement, err = newWindowPathSettlement(ctx, cell, fixtureStart, senderSettings.SendBufferSettings.AckTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settlement.install(sender, receiver)
+	}
 	var workers sync.WaitGroup
 	if cell.ReceiveWindowAfter > 0 {
 		workers.Go(func() {
@@ -720,6 +766,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		})
 	}
 	dataLink := windowPathLink{rate: cell.Rate, rateAfter: cell.RateAfter, rateChangeAfter: cell.RateChangeAfter, delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8), dropOnFull: cell.Drop}
+	if settlement != nil {
+		dataLink.afterDropForTest = settlement.dropped
+	}
 	ackLink := windowPathLink{delay: cell.RoundTrip / 2, queueCount: 4096, queueBytes: mib(8)}
 	for _, link := range []*windowPathLink{&dataLink, &ackLink} {
 		link.delayAfter = cell.RoundTripAfter / 2
@@ -782,10 +831,13 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 					}
 				}
 			})
-			producers := cell.Flows
-			if cell.RoundRobinOffer {
-				producers = max(1, min(lanes, cell.Flows))
-			}
+			// Each logical sequence has one producer, which offers that
+			// sequence's flows round-robin. Producers that share a sequence
+			// race for each admission slot that frees, and the runtime's wake
+			// order would set every flow's share: on one processor, which a
+			// bubble has whenever parallel arms fill the machine, one producer
+			// wins every slot and its siblings deliver nothing.
+			producers := max(1, min(lanes, cell.Flows))
 			for producer := range producers {
 				workers.Go(func() {
 					flow := producer
@@ -805,11 +857,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 							}
 							return
 						}
-						if cell.RoundRobinOffer {
-							flow += producers
-							if flow >= cell.Flows {
-								flow = producer
-							}
+						flow += producers
+						if flow >= cell.Flows {
+							flow = producer
 						}
 					}
 				})
@@ -928,7 +978,53 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			}
 		})
 	}
-	time.Sleep(warmup)
+	if cell.MeasurementGrid {
+		windowPathAwaitGrid(t, fixtureStart.Add(warmup))
+	} else {
+		time.Sleep(warmup)
+	}
+	sampledAt := time.Now()
+	sampledCounts := make([]int64, len(counts))
+	sampleCounts := func() int64 {
+		var total int64
+		for i := range counts {
+			sampledCounts[i] = counts[i].Load()
+			total += sampledCounts[i]
+		}
+		return total
+	}
+	sampledTotal := sampleCounts()
+	var debt *windowPathCapacityDebt
+	if settlement != nil {
+		var err error
+		debt, err = newWindowPathCapacityDebt(cell.Settlement.ReferenceBytes, cell.Settlement.ReferenceDuration,
+			cell.Settlement.CapBytes, fixtureStart.Add(warmup), sampledTotal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			ready, err := windowPathMeasurementReady(settlement, sampledAt)
+			if err != nil {
+				t.Fatalf("settlement: %v state=%+v debt=%+v", err, settlement.snapshot(), debt.snapshot())
+			}
+			if ready {
+				break
+			}
+			next, deadline := sampledAt.Add(time.Second), settlement.snapshot().Deadline
+			final := !next.Before(deadline)
+			if final {
+				next = deadline
+			}
+			windowPathAwaitGrid(t, next)
+			sampledAt, sampledTotal = time.Now(), sampleCounts()
+			if err := debt.observe(sampledAt, sampledTotal, final); err != nil {
+				t.Fatalf("settlement transient: %v state=%+v debt=%+v", err, settlement.snapshot(), debt.snapshot())
+			}
+			if final {
+				t.Fatalf("settlement deadline reached: state=%+v debt=%+v", settlement.snapshot(), debt.snapshot())
+			}
+		}
+	}
 	dropsBefore := dataLink.dropped.Load()
 	if cell.Upload {
 		dropsBefore = ackLink.dropped.Load()
@@ -938,27 +1034,67 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	}
 	before := make([]int64, len(counts))
 	for i := range counts {
-		before[i] = counts[i].Load()
+		if cell.MeasurementGrid {
+			before[i] = sampledCounts[i]
+		} else {
+			before[i] = counts[i].Load()
+		}
 	}
 	start := time.Now()
+	if cell.MeasurementGrid {
+		start = sampledAt
+	}
 	previousTime := start
 	previousBytes := int64(0)
 	var intervalMbps []float64
+	var intervalBytes []int64
+	var intervalDurations []time.Duration
 	for remaining := duration; remaining > 0; remaining = time.Until(start.Add(duration)) {
-		time.Sleep(min(time.Second, remaining))
+		if cell.MeasurementGrid {
+			windowPathAwaitGrid(t, previousTime.Add(min(time.Second, remaining)))
+		} else {
+			time.Sleep(min(time.Second, remaining))
+		}
 		now := time.Now()
 		delivered := int64(0)
+		if cell.MeasurementGrid {
+			sampledAt, sampledTotal = now, sampleCounts()
+		}
 		for i := range counts {
-			delivered += counts[i].Load() - before[i]
+			if cell.MeasurementGrid {
+				delivered += sampledCounts[i] - before[i]
+			} else {
+				delivered += counts[i].Load() - before[i]
+			}
 		}
 		intervalMbps = append(intervalMbps, float64(delivered-previousBytes)*8/now.Sub(previousTime).Seconds()/1e6)
+		intervalBytes = append(intervalBytes, delivered-previousBytes)
+		intervalDurations = append(intervalDurations, now.Sub(previousTime))
+		if settlement != nil {
+			if err := debt.observe(now, sampledTotal, !now.Before(start.Add(duration))); err != nil {
+				t.Errorf("measurement capacity debt: %v ledger=%+v", err, debt.snapshot())
+			}
+			if _, err := settlement.admit(now); err != nil {
+				t.Errorf("measurement settlement changed: %v", err)
+			}
+		}
 		previousTime, previousBytes = now, delivered
 	}
 	elapsed := time.Since(start)
+	if cell.MeasurementGrid {
+		elapsed = sampledAt.Sub(start)
+	}
 	reading := windowPathReading{Cell: cell, WarmupSeconds: warmup.Seconds(), Seconds: elapsed.Seconds(), MinFlowMbps: 1e20, IntervalMbps: intervalMbps,
-		DirectionMbps: make([]float64, directions)}
+		IntervalBytes: intervalBytes, IntervalDurations: intervalDurations, DirectionMbps: make([]float64, directions)}
+	if settlement != nil {
+		state, capacity := settlement.snapshot(), debt.snapshot()
+		reading.Settlement, reading.CapacityDebt = &state, &capacity
+	}
 	for i := range counts {
 		delivered := counts[i].Load() - before[i]
+		if cell.MeasurementGrid {
+			delivered = sampledCounts[i] - before[i]
+		}
 		reading.Bytes += delivered
 		reading.MinFlowMbps = min(reading.MinFlowMbps, float64(delivered)*8/elapsed.Seconds()/1e6)
 		reading.DirectionMbps[i/cell.Flows] += float64(delivered) * 8 / elapsed.Seconds() / 1e6
@@ -999,20 +1135,9 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 	return reading
 }
 
-// Under -race, window cells and arms run as parallel subtests. That runtime
-// randomizes the order of woken goroutines, so producers competing for one
-// admission keep their share even when each arm has a single P. Without it a
-// run queue that orders them the same way every time starved one of eight
-// flows for a whole interval, so ordinary builds measure one arm at a time.
-func windowPathParallel(t *testing.T) {
-	if raceEnabled {
-		t.Parallel()
-	}
-}
-
 // Arms of one comparison share no state: each owns its bubble, clients,
 // budgets, FIFO links and producers, so its virtual-time reading does not
-// depend on another arm's progress. They may run as parallel subtests and the
+// depend on another arm's progress. They run as parallel subtests and the
 // caller compares readings only after the group joins; a failed arm stops it.
 // The process-wide pool assertion stays with the sequential top-level test.
 func measureWindowPathArms(t *testing.T, duration time.Duration, arms []string, trial func(arm string) windowPathCell) []windowPathReading {
@@ -1021,7 +1146,7 @@ func measureWindowPathArms(t *testing.T, duration time.Duration, arms []string, 
 	if !t.Run("arms", func(t *testing.T) {
 		for i, arm := range arms {
 			t.Run(arm, func(t *testing.T) {
-				windowPathParallel(t)
+				t.Parallel()
 				readings[i] = measureWindowPathTrial(t, trial(arm), duration)
 			})
 		}
@@ -1096,7 +1221,7 @@ func TestWindowPathTrialKeySeparatesInputs(t *testing.T) {
 	profiles, digest := windowSdkProfiles(t)
 	copies, _ := windowSdkProfiles(t)
 	cell := windowPathCell{SenderProfile: &profiles[1], ReceiverProfile: &profiles[6], ProfileFixtureSha256: digest,
-		Arm: "delivery", RoundTrip: 400 * time.Millisecond, Flows: 1, RoundRobinOffer: true, Payload: 1280, Rate: 125000000}
+		Arm: "delivery", RoundTrip: 400 * time.Millisecond, Flows: 1, Payload: 1280, Rate: 125000000}
 	key, shared := windowPathTrialKey(cell, time.Second)
 	same := cell
 	same.SenderProfile, same.ReceiverProfile = &copies[1], &copies[6]

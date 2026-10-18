@@ -56,7 +56,7 @@ func windowSdkProfileCells(profiles []windowPathEndpointProfile, digest string) 
 					}
 					cells = append(cells, windowPathCell{SenderProfile: sender, ReceiverProfile: receiver,
 						ProfileFixtureSha256: digest, RoundTrip: roundTrip, Flows: flows,
-						RoundRobinOffer: true, Payload: 1280, Rate: 125000000})
+						Payload: 1280, Rate: 125000000})
 				}
 			}
 		}
@@ -78,7 +78,7 @@ func windowServicePerformanceCells() []windowPathCell {
 					}
 					warmup := max(300*time.Millisecond+5*roundTrip, time.Duration(2*int64(mib(2))*int64(time.Second)/int64(rate))+5*roundTrip)
 					cells = append(cells, windowPathCell{RoundTrip: roundTrip, Compression: compression,
-						Flows: flows, RoundRobinOffer: true, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: warmup})
+						Flows: flows, Payload: 1280, Budget: mib(48), Rate: rate, Warmup: warmup})
 				}
 			}
 		}
