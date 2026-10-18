@@ -4581,11 +4581,11 @@ Descriptive median original-tail and retry/fresh-tail costs increased by
 2.05 ns and 7.9 ns respectively. No statistical speed claim or blanket absence
 of performance regression follows.
 
-The P3 reference has a separate, source-known healthy 32-item burst cost:
-preparation can change one flush/two slice-clone calls into 32 flushes/64
-calls, with possible extra queue pumping. A nil-observer actual-owner
-allocation/wall-time benchmark is an adoption gate, not a measured result
-here. Its fixture correction must retain equivalent ACK, callback, final-owner
+At this earlier checkpoint the P3 reference had a separate, source-known
+healthy 32-item burst cost: preparation can change one flush/two slice-clone
+calls into 32 flushes/64 calls, with possible extra queue pumping. The
+nil-observer actual-owner allocation/wall-time benchmark was still an open
+adoption gate; the later P3 entry below records its completed comparison. Its fixture correction must retain equivalent ACK, callback, final-owner
 and cancellation boundaries in both arms; virtual-time elapsed or overlapping
 goroutine allocation samples would not establish that cost.
 
@@ -4624,5 +4624,146 @@ attestation as canonical install authority. Retained APKs/receipts do not
 replace a fresh source freeze; retained artifacts/caches plus the next build
 working set remain charged to capacity. Neither mobile profile, even if later
 qualified on Android, proves the signed native iOS extension's total lifetime
-footprint remains below 50 MiB. Numeric H1 and P3 production remain private;
-no memory baseline or budget is changed here.
+footprint remains below 50 MiB. At that checkpoint numeric H1 and P3 production
+remained private; no memory baseline or budget was changed.
+
+### 2026-10-18: P3 local cost gate cleared, mobile qualification pending
+
+Later build checkpoint: the canonical full 32-repository build completed all
+four profile/arm APK/AAR pairs on the source identity below. The build receipt
+reports `build_attested=true`, no failures and joined process owners; all input
+guards matched. All four native writers used four workers and profile rate zero.
+Conservative sampled build storage, including outside-cache growth and Git
+administration, reached approximately 24.35 GiB within the 64-GiB build allowance;
+this is host build storage, not app memory or a proven instantaneous peak.
+Receipt SHA-256: `57ceaa5e8d10a7886eeef6aefa9247db29e262ac1843205b90d0427ab6e8a017`;
+resource summary: `2c3673debf914379148d52d0c408a8977a46f2dd8c05791b84edc5b3aae9eecc`.
+These builds are explicitly not install- or device-qualified. Fresh 32-MiB
+iOS-surrogate and 64-MiB Android traffic, quiet and teardown measurements remain
+pending. The prepared full runner was held before execution for the requested
+Git checkpoint; any subsequent source sync requires refreshed source-bound evidence.
+
+The current-source OLD receipt-pressure root failed semantically and the
+reference passed. On the frozen pre-integration source, all 31 focused cases
+passed in three fresh normal and three fresh race processes, and all 197
+existing affected delivery/ACK parents passed normally and under race.
+Healthy and queued-cancel benchmark-owner controls passed in both modes for
+each arm. The exact three production and five fixture/benchmark postimages are
+now integrated. The first integrated full-root attempt exposed a portable
+fixture error: a new unconstrained test called a helper defined only under
+`!js`, so actual js/wasm test compilation failed. That run later stopped for
+a separate capacity breach; both failures remain retained. Moving the same
+helper body into common `ip_packet_pool_fixture_test.go` corrected the boundary
+without production changes or matrix/skip changes. The existing six-platform
+test, including js/wasm root-test compilation, passed in three fresh processes.
+
+The post-helper-move 32-repository identity is
+`76fcf6ad45627ab26ed65d9a3019b40282113e5134f3377492a0c08321184493`.
+Only Connect content changed; prior private-overlay results retain their
+original `66a10a38...` identity and are not integrated full-parent results.
+A fresh full-root normal process then passed in 1459.088 seconds: 5890
+top-level runs, 5855 passes, 35 top-level skips plus two DNS subtest skips,
+zero failures. Fresh root race then passed in 6237.322 seconds: 5890
+top-level runs, 5854 passes, 36 top-level skips plus two DNS subtest skips,
+zero failures and zero reassembled data-race warnings. Both owners joined
+with child/after-guard exits zero, unchanged guarded inputs and empty stderr.
+The extra race skip, `TestIpMuxSafeReceiveNoAlloc`, reports unstable allocation
+counts under race and passed normally. All 37/38 normal/race skip reasons
+remain in the ledgers; opt-in, host/mobile-conditional and pending
+implementation cases are coverage gaps, not verified invariants.
+
+Four joined A-B-B-A processes measured 16 fresh 32-Pack lifecycles each through
+real receive/dispatch, final TCP admission, cumulative wire ACK and full owner
+cleanup, with the progress observer disabled. Reference-versus-OLD means were
+lifecycle time +3.03%, allocated bytes -21.10%, allocations +2.04% (+89 per
+burst), delivery time -0.44% and joined time -0.22%. The observed 12–15%
+within-arm timing spread exceeds the mean time difference. This clears the
+local cost-review gate for the correctness fix, not statistical equivalence
+or an end-to-end speed claim. B/op is allocated bytes across the full fresh
+lifecycle, not retained heap, runtime peak or native process footprint.
+
+The known extra flush/clone opportunities remain a source-level explanation
+of possible cost, not measured call counts or a 32-fold slowdown. Two processes
+per arm do not establish tail latency; retained observer scans could overlap.
+Earlier fixture/control-capacity failures and the separate post-A1 metadata
+failure remain preserved, with no benchmark measurement retry. At this
+checkpoint the integrated default root normal/race gate is passed, not the
+canonical recursive/full-runner gate. Complete 32-MiB iOS-surrogate / 64-MiB
+Android MEMSTEADY/PERFVAR qualification also remains pending. No baseline,
+budget or threshold is changed. Historical H1 0/64 and partial physical
+attempts remain unqualified; native iOS lifetime footprint remains separate.
+
+The exact four rows, source transitions, portable compilation and full-root
+normal/race receipts (including all skip reasons) are in
+`PACKETFLOW-REGRESSION.md`'s P3 integration entry. Under the retained raw prefix
+above, `p3-current-custody-admission.5JVBwT/timing/abba-result.json` has SHA-256
+`a0a6b1eff64b4d016530dddc2b32f2733b8f4495c3503cdcf5e97d0a6c6d1f74`.
+
+### 2026-10-17: pressure refusal must preserve healthy owners
+
+A deterministic real-origin test confirmed that a full resident forwarding
+shard returned and counted its refused complete message but then canceled the whole
+resident. Both an original-data refusal and genuine reverse-ACK refusal
+reproduced this defect at the default 256-slot shard capacity. The integrated
+one-hunk correction keeps the existing queue limits, nonblocking offer and
+extra-share return; it no longer uses unrelated-flow teardown as pressure
+handling. Seven retry/loss/close/ownership roots passed three fresh normal and
+three race processes. Full on-disk parents remain pending; receipts and limits
+are recorded in Tests `PERFVAR-MEASUREMENTS.md` and `PACKETFLOW-REGRESSION.md`.
+
+Pool/ledger reconciliation is not a runtime-memory qualification. Keeping
+healthy flows alive can retain useful state that the broken teardown discarded;
+no extra queue or payload allowance was added, but steady and burst memory
+still need measurement under the complete 32-MiB iOS-surrogate and 64-MiB
+Android workloads. A previous partial H1 quiet gate peaked at 28.57 MiB and
+passed its local gate, but its cell subsequently failed and cannot qualify
+either full profile. No memory/performance baseline is promoted by this fix.
+
+### 2026-10-17: ownership-fixture validation before physical replay
+
+Partial native writes may complete zero whole frames while still making valid
+positive progress. The corrected oracle/adjacent 27-root group passed three
+fresh normal and three race processes. A separate teardown watcher incorrectly
+classified a child transport's expected close before root cancellation as a
+live failure; its first-close snapshot correction and 13-root group also
+passed three fresh normal and three race processes. The deterministic control
+reproduced the old behavior, and the reviewed test-only changes are integrated.
+See `PACKETFLOW-REGRESSION.md` and Tests `PERFVAR-MEASUREMENTS.md` for receipts.
+
+These results verify ownership and fixture behavior, not memory use. Queue
+sizes, deadlines and the 32-MiB iOS-surrogate / 64-MiB Android policies remain
+unchanged. Both profiles still require fresh complete Android-device
+MEMSTEADY/PERFVAR collection; native iOS total footprint below 50 MiB remains a
+separate, unverified requirement. No memory or throughput baseline is promoted.
+
+### 2026-10-17: physical H1 diagnostic and recovery findings
+
+The completed, single-attempt Pixel Wi-Fi/H1 diagnostic displayed **33 Mbps**
+on Fast after 88.761 seconds. Its page-target byte accounting was incomplete;
+the derived `0.01 Mbps` field is not aggregate Fast throughput. A separate,
+intrusive three-stack diagnostic hit the unchanged 90-second Fast deadline;
+its provisional 13-Mbps display is invalid as a completed speed measurement.
+
+That intrusive run observed a Go-runtime peak of **26,996,768 bytes
+(25.75 MiB)** and zero observed breaches of 33,554,432 bytes. Its 61 retained
+runtime events are not independent samples, and its memory summary is
+explicitly diagnostic/ineligible. Neither this result nor the completed
+33-Mbps attempt qualifies full MEMSTEADY/PERFVAR coverage. The complete
+32-MiB iOS-surrogate and 64-MiB Android profiles remain outstanding; no native
+iOS under-50-MiB total-footprint claim follows from Android.
+
+Two active snapshots locate TUN producer waits at Transfer Pack admission,
+with the dependent sequence worker in service pacing and H1 writers waiting
+for input. They do not capture the exact maximum-duration send call or prove
+a pacing defect. Do not increase queue/rate limits or impose an accepted-group
+lifetime on this evidence alone. Bounded, diagnostic-only pacing/admission
+state is being prepared to distinguish legitimate debt from a stalled owner.
+
+Separately, a deterministic actual Multi/Transfer/provider test reproduced a
+TCP retry suppression bug after bounded provider reorder refusal. Its repair
+is not yet qualified and is not established as the phone pause's cause.
+Cleanup now explicitly stops the joined test probe and proves process absence;
+that harness repair passed focused and adjacent checks, including 483 backend
+race roots. It changes neither memory budgets nor packet queue capacities.
+See the [measurement ledger](../tests/PERFVAR-MEASUREMENTS.md) and
+`PACKETFLOW-REGRESSION.md`; all failed attempts remain retained.

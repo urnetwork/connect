@@ -7,6 +7,8 @@ package connect
 type tcpCollapseAdmission struct {
 	update *multiClientChannelUpdate
 	epoch  uint64
+	// A scalar lease for one real inner-TCP ACK frontier, not Transfer ACK.
+	recovery uint64
 }
 
 // One numeric receipt per in-flight group offering a new SYN generation. It
@@ -14,10 +16,11 @@ type tcpCollapseAdmission struct {
 // asynchronous completion token. The native send's unconditional completion
 // unlinks and clears it, including on refusal or panic. No packet is retained.
 type tcpSynAdmission struct {
-	next           *tcpSynAdmission
-	update         *multiClientChannelUpdate
-	responseClient *multiClientChannel
-	sequence       uint32
+	next            *tcpSynAdmission
+	update          *multiClientChannelUpdate
+	responseClient  *multiClientChannel
+	responseControl tcpControlObservation
+	sequence        uint32
 }
 
 func (admission *tcpSynAdmission) clear() {
@@ -44,6 +47,12 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 		update.sequenceParent = parents[0]
 	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
+	if len(parents) != 0 && parents[0].settings.TcpCollapsePrevention &&
+		!group.reserveTcpRecoveryWithLock(update, parents[0], &admission) {
+		parents[0].tcpCollapseDropCount.Add(uint64(len(group.packets)))
+		update.stateLock.Unlock()
+		return false
+	}
 	// Only an actually different generation needs pre-commit response proof.
 	// Generation identity survives coverage revocation and provider rebinding.
 	seen, sequence := update.synGenerationSeen, update.synGenerationNumber
@@ -85,14 +94,14 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 	return true
 }
 
-// Established non-SYN ingress keeps its lock-free fast path. First response
-// and SYN-ACK observations serialize with admission commit so an old response
-// cannot establish a newly accepted generation after the reset.
+// Controls without SYN/ACK keep their established lock-free fast path. Inner
+// ACK authority and first/SYN responses serialize with admission and reset.
 func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientChannel, control tcpControlObservation) bool {
-	if !control.syn && update.receivedInbound.Load() {
+	established := update.receivedInbound.Load()
+	if !control.syn && !control.ack && established {
 		return false
 	}
-	if client != nil && client.beforeFirstAnswerMarkForTest != nil {
+	if (!established || control.syn) && client != nil && client.beforeFirstAnswerMarkForTest != nil {
 		client.beforeFirstAnswerMarkForTest(update)
 	}
 	update.stateLock.Lock()
@@ -111,6 +120,7 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 			// payload-bearing SYN. uint32 addition preserves wraparound.
 			if control.ackSequenceNumber == admission.sequence+1 {
 				admission.responseClient = client
+				admission.responseControl = control
 			}
 		}
 	}
@@ -120,6 +130,7 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 		}
 		update.synGenerationAwaiting = false
 	}
+	update.observeTcpRecoveryAckWithLock(client, control)
 	return update.receivedInbound.CompareAndSwap(false, true)
 }
 
@@ -139,6 +150,7 @@ func (admission tcpCollapseAdmission) complete(err error) {
 	update.sequenceCovered = false
 	update.sequenceAckPositionSeen = false
 	update.sequenceSynSeen = false
+	admission.revokeTcpRecoveryWithLock(err)
 }
 
 // sequenceCoversWithLock proves the entire requested interval, never only its

@@ -15,10 +15,10 @@ func (peer Peer) deliveryReceipt() *receiveDeliveryReceipt {
 
 // Reliable-provider retained accounting prepays the future packet owner as a
 // distinct amount, in addition to all still-live receive roots and metadata.
-// Admission occurs before out-of-order selective feedback can lease it.
+// Classify TCP before provider publication; admission precedes any SACK lease.
 func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) {
 	if item.deliveryPrepared || !item.ack || self.receiveQueue == nil ||
-		!self.receiveQueue.lifetimeBudget || !self.client.reliableProviderIngress.Load() ||
+		!self.receiveQueue.lifetimeBudget ||
 		!receiveDeliveryHasTcp(item.frames) {
 		return
 	}
@@ -79,6 +79,32 @@ func (self *ReceiveSequence) needsDeliveryReceipts(items []*receiveItem, frames 
 	return false
 }
 
+// Runs only on the receive worker, before head advancement or hold removal.
+// Failed admission keeps a fresh complete Pack retriable without an ACK;
+// a held item stays in its existing bounded owner, including its SACK lease.
+func (self *ReceiveSequence) prepareReceiveDelivery(item *receiveItem) bool {
+	if !item.ack || self.deliveryQueue == nil && !receiveDeliveryHasTcp(item.frames) {
+		return true
+	}
+	self.flushDeliver()
+	if self.deliveryQueue == nil {
+		self.deliveryQueue = newReceiveDeliveryQueue(self,
+			self.receiveBufferSettings.SequenceBufferSize, self.receiveBufferSettings.ReceiveQueueMaxByteCount)
+	}
+	return self.deliveryQueue.prepare(item)
+}
+
+// A TCP owner must fit before it can acquire a selective lease. Ordinary
+// callbacks retain their one-oversize-owner rule once earlier receipts drain.
+func (self *ReceiveSequence) receiveDeliveryFits(item *receiveItem) bool {
+	if !item.ack || !receiveDeliveryHasTcp(item.frames) {
+		return true
+	}
+	bytes := receiveDeliveryByteCount(item)
+	return bytes <= max(1, self.receiveBufferSettings.ReceiveQueueMaxByteCount) ||
+		receiveDeliveryIsSmallControl(item) && bytes <= receiveDeliveryControlMaxBytes
+}
+
 func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames []*protocol.Frame, peer Peer) {
 	if self.deliveryQueue == nil {
 		self.deliveryQueue = newReceiveDeliveryQueue(self,
@@ -98,6 +124,15 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 		}
 		appFrames := frames[offset : offset+count]
 		offset += count
+		q.mutex.Lock()
+		closed := q.closed
+		q.mutex.Unlock()
+		if closed {
+			// A prior fatal rejection in this batch revokes later dispatch,
+			// including unacknowledged items, without losing their roots.
+			item.messagePoolReturn()
+			continue
+		}
 		if !item.ack {
 			func() {
 				defer item.messagePoolReturn()
@@ -107,7 +142,8 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 			}()
 			continue
 		}
-		required := self.client.reliableProviderIngress.Load() && receiveDeliveryHasTcp(appFrames)
+		tcp := receiveDeliveryHasTcp(appFrames)
+		required := self.client.reliableProviderIngress.Load() && tcp
 		receipt, accepted := q.append(item, required)
 		if !accepted {
 			// No ownership promise was made. Close before any later cumulative
@@ -120,7 +156,10 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 		func() {
 			defer receipt.seal()
 			itemPeer := peer
-			if required {
+			// A provider callback can be published before its required-owner
+			// flag. Immutable TCP classification supplies its optional claim
+			// now; a real claim still delays ACK until secured.
+			if tcp {
 				itemPeer.delivery = receipt
 			}
 			if len(appFrames) != 0 {
@@ -161,7 +200,24 @@ func (self *ReceiveSequence) sendDeliveredDuplicateAck(number uint64, id Id, tag
 func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePack, bool, bool) {
 	q := self.deliveryQueue
 	wakes := q.pump()
-	if !q.pending() {
+	var blocked *receiveItem
+	if self.receiveQueue != nil {
+		blocked = self.receiveQueue.PeekFirst()
+		if blocked != nil && blocked.sequenceNumber != self.nextSequenceNumber {
+			blocked = nil
+		}
+	}
+	if blocked != nil {
+		// Subscribe before the exact reservation attempt, even with no
+		// pending receipt. Another sequence may own the shared bytes.
+		if budget := self.receiveQueue.budget; budget != nil {
+			wakes = append(wakes, budget.CapacityNotify())
+		}
+		if self.prepareReceiveDelivery(blocked) {
+			return nil, true, false
+		}
+	}
+	if blocked == nil && !q.pending() {
 		return nil, true, false
 	}
 	cases := make([]reflect.SelectCase, 0, 4+len(wakes))

@@ -15552,6 +15552,7 @@ func (self *ReceiveSequence) Run() {
 		}
 		var timeout time.Duration
 		var expiredGap *receiveItem
+		deliveryBlocked := false
 
 		if queueSize, _ := self.receiveQueue.QueueSize(); 0 == queueSize {
 			gapHandoff.active = false
@@ -15595,6 +15596,13 @@ func (self *ReceiveSequence) Run() {
 					break
 				}
 				// item.sequenceNumber <= self.nextSequenceNumber
+				if item.sequenceNumber == self.nextSequenceNumber && !self.prepareReceiveDelivery(item) {
+					// Retain an existing SACK owner. This is local admission
+					// pressure, not a missing predecessor or a new gap timeout.
+					deliveryBlocked = true
+					timeout = self.receiveBufferSettings.IdleTimeout
+					break
+				}
 
 				self.receiveQueue.RemoveByMessageId(item.messageId)
 
@@ -15736,7 +15744,7 @@ func (self *ReceiveSequence) Run() {
 
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(timeout)
-		if self.deliveryQueue != nil && self.deliveryQueue.pending() {
+		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending()) {
 			pack, ok, timedOut := self.waitDelivery(idleTimer.C)
 			if timedOut || self.ctx.Err() != nil {
 				return
@@ -15907,6 +15915,15 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		}
 	}
 
+	// Reserve receipt memory/capacity before either ordinary advancement or a
+	// sender-directed head reset. A refused complete Pack remains retriable.
+	if (sequenceNumber == self.nextSequenceNumber || item.head && self.nextSequenceNumber < sequenceNumber) &&
+		!self.prepareReceiveDelivery(item) {
+		self.client.receiveQueueDropCount.Add(1)
+		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
+		return false, nil
+	}
+
 	// this case happens when the receiver is reformed or loses state.
 	// the sequence id guarantees the sender is the same for the sequence
 	// past head items are retransmits. Future head items depend on previous ack,
@@ -15960,18 +15977,19 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			if self.log.V(2).Enabled() {
 				self.log.Infof("[r]seq+ %d->%d %s<-%s s(%s)\n", self.nextSequenceNumber, self.nextSequenceNumber+1, self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 			}
-			self.nextSequenceNumber = self.nextSequenceNumber + 1
-
 			if err := self.registerContracts(item); err != nil {
 				self.log.Errorf("[r]%s<-%s s(%s) ack could not register contracts = %s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, err)
+				item.releaseMemory()
 				return false, err
 			}
 			if self.updateContract(item) {
+				self.nextSequenceNumber = self.nextSequenceNumber + 1
 				self.receiveHead(item)
 				return true, nil
 			} else {
 				// no valid contract. it should have been attached to the head
 				self.log.Errorf("[r]drop queue head no contract %s<-%s s(%s): head=%t, contract=%t, rcontract=%t\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, item.head, item.contractFrame != nil, self.receiveContract != nil)
+				item.releaseMemory()
 				return false, errors.New("No contract")
 			}
 		} else {
@@ -15991,6 +16009,11 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			return false, nil
 		}
 	} else {
+		if !self.receiveDeliveryFits(item) {
+			self.client.receiveQueueDropCount.Add(1)
+			self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
+			return false, nil
+		}
 		// store only up to a max size in the receive queue.
 		// an empty queue always admits at least one item (see CanAdd).
 		canQueue := func(item *receiveItem) bool {

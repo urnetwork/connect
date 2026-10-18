@@ -603,6 +603,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 		update.sequenceCovered = false
 		update.sequenceAckPositionSeen = false
 		update.sequenceSynSeen = false
+		update.sequenceRecovery.clear()
 		update.sequenceClient = self.completionClient
 	}
 	for index := range self.packets {
@@ -629,6 +630,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 				if proof.update == update && proof.sequence == path.SequenceNumber && proof.responseClient == self.completionClient {
 					update.receivedInbound.Store(true)
 					update.synGenerationAwaiting = false
+					update.observeTcpRecoveryAckWithLock(self.completionClient, proof.responseControl)
 				}
 			}
 		}
@@ -744,6 +746,7 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 			panic("materialized group without retained range ownership")
 		}
 		self.completionFlags.Or(groupCompletionDisposed)
+		self.collapseAdmission.releaseTcpRecoveryWithLock()
 		self.unlinkCollapseWithLock()
 		return
 	}
@@ -758,6 +761,9 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 			*disposed |= bit
 		}
 		owner.remaining--
+	}
+	if !materialized {
+		self.releaseDisposedTcpRecoveryWithLock()
 	}
 	self.publishCollapseWithLock()
 	if owner.remaining == 0 && self.completionClient == update.client.Load() {
@@ -779,6 +785,8 @@ func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
 		update := self.collapseAdmission.update
 		update.stateLock.Lock()
 		self.publishCollapseWithLock()
+		self.collapseAdmission.releaseTcpRecoveryWithLock()
+		self.collapseAdmission.revokeTcpRecoveryWithLock(err)
 		if self.collapseOwner == nil || !self.awaitingCollapsePromotionWithLock() {
 			self.unlinkCollapseWithLock()
 		}
@@ -897,6 +905,7 @@ func (self *multiClientChannelUpdate) commitCollapseClaimsWithLock(client *multi
 	}
 	if self.sequenceClient != client {
 		self.sequenceCovered, self.sequenceAckPositionSeen, self.sequenceSynSeen = false, false, false
+		self.sequenceRecovery.clear()
 	}
 	self.sequenceClient, self.sequenceSourceId, self.sequenceControlOrder = client, state.sourceId, state.order
 	self.sequenceMetricSynSeen, self.sequenceMetricSynNumber = state.synSeen, state.synNumber

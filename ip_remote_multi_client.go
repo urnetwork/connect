@@ -1511,14 +1511,16 @@ type receivePacket struct {
 }
 
 type tcpControlObservation struct {
-	sequenceNumber    uint32
-	ackSequenceNumber uint32
-	payloadByteCount  uint32
-	ack               bool
-	fin               bool
-	rst               bool
-	valid             bool
-	syn               bool
+	sequenceNumber     uint32
+	ackSequenceNumber  uint32
+	payloadByteCount   uint32
+	windowSize         uint16
+	ack                bool
+	fin                bool
+	rst                bool
+	valid              bool
+	syn                bool
+	windowScaleEnabled bool
 }
 
 type pendingIngressTcpControl struct {
@@ -1531,14 +1533,16 @@ func tcpControlFromIpPath(ipPath *IpPath) tcpControlObservation {
 		return tcpControlObservation{}
 	}
 	return tcpControlObservation{
-		sequenceNumber:    ipPath.SequenceNumber,
-		ackSequenceNumber: ipPath.AckSequenceNumber,
-		payloadByteCount:  uint32(max(0, ipPath.TcpPayloadByteCount)),
-		ack:               ipPath.Ack,
-		fin:               ipPath.Fin,
-		rst:               ipPath.Rst,
-		valid:             true,
-		syn:               ipPath.Syn,
+		sequenceNumber:     ipPath.SequenceNumber,
+		ackSequenceNumber:  ipPath.AckSequenceNumber,
+		payloadByteCount:   uint32(max(0, ipPath.TcpPayloadByteCount)),
+		windowSize:         ipPath.TcpWindowSize,
+		ack:                ipPath.Ack,
+		fin:                ipPath.Fin,
+		rst:                ipPath.Rst,
+		valid:              true,
+		syn:                ipPath.Syn,
+		windowScaleEnabled: ipPath.TcpWindowScaleEnabled,
 	}
 }
 
@@ -7036,9 +7040,9 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 			currentClient.ipPacketTransferAckRequired(ipPath)
 		if self.settings.TcpCollapsePrevention && transferAckRequired {
 			// limit sender tcp collapse
-			// As soon as a packet is sent to a client, Transfer either commits it
-			// end to end or the client is dropped. Inner retransmits do not need to
-			// be sent again while that exact Transfer item is still recovering.
+			// Transfer owns recovery through provider queue admission, not the
+			// provider's later bounded TCP reorder decision. A real inner ACK
+			// permits one covered retry spanning its now-in-order frontier.
 			// By default elapsed time cannot revoke that ownership: an admitted
 			// new SYN generation, flow clear, or ownership invalidation can. The
 			// optional positive hold below preserves the timed-escape policy.
@@ -7144,6 +7148,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
 	defer func() {
+		if !success {
+			sendPacketGroup.collapseAdmission.releaseTcpRecovery()
+		}
 		if observations := sendPacketGroup.admissionObservations; observations != nil {
 			if completeObservations {
 				observations.complete(success)
@@ -8451,10 +8458,10 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		reversed := ipPath.ReverseValue()
 
 		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient && update.receivedInbound.Load() {
-			// established-flow fast path: batch. A flow's first answer takes
-			// the resolve path below, which decides it under the flow lock, as
-			// on the per-packet path. The mark still runs per packet for a
-			// SYN-ACK of the established flow, exactly as on that path.
+			// Established flows batch application delivery, but every ack-bearing
+			// packet records recovery authority under the flow lock first. The
+			// first-answer resolve path below commits provider ownership under
+			// that same lock.
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				sourceClient.addConnectSuccess(update.ipPath.Version)
 				self.clearDestinationServiceFailure(sourceClient, update.ipPath)
@@ -8583,16 +8590,13 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
-		// steady-state fast path: the flow is already committed to this client
-		// and established, so deliver without taking any lock (client is
-		// atomic). this is the common download path and no longer contends the
-		// parent stateLock. A flow's first answer takes the locked path below:
-		// read lock-free, its client could be unbound by the dial-failure
-		// inference before the mark, and the answer would reach the app for a
-		// flow that is no longer on the exit that sent it.
+		// Established-flow lookup avoids the parent stateLock; ack-bearing
+		// packets still take the flow lock before application delivery.
+		// A first answer takes the locked path below so concurrent unbinding
+		// cannot deliver it for a flow no longer on the answering provider.
 		if update.client.Load() == sourceClient && update.receivedInbound.Load() {
-			// a SYN-ACK of the established flow still records its admission
-			// under the flow lock (markReceivedInbound)
+			// Bind recovery authority to the current provider and syn cohort
+			// before the callback can trigger another send.
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
@@ -9709,6 +9713,8 @@ type multiClientChannelUpdate struct {
 	sequenceCovered         bool
 	sequenceAckPositionSeen bool
 	sequenceSynSeen         bool
+	// One bounded, scalar inner-ACK authority; no packet or queue owner.
+	sequenceRecovery tcpCollapseRecovery
 	// A failed asynchronous admission invalidates conservative coverage. A
 	// captured epoch prevents callback-before-return from being recommitted.
 	sequenceAdmissionEpoch uint64
@@ -9943,6 +9949,13 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 	self.sequenceSynSeen = ipPath.Syn
 	self.sequenceSynNumber = ipPath.SequenceNumber
 	self.sequenceAdmissionStateSeen = false
+	if ipPath.Syn {
+		self.sequenceRecovery.windowScale = ipPath.TcpWindowScale
+		self.sequenceRecovery.windowScaleOffered = ipPath.TcpWindowScaleEnabled
+	}
+	if ipPath.Rst {
+		self.sequenceRecovery.clear()
+	}
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
@@ -9954,6 +9967,7 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 // A real new source cohort clears both close directions. Candidate promotion
 // can force this transition even when an intervening unwritten SYN reused an ISN.
 func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32) {
+	self.sequenceRecovery.clear()
 	self.egressFinSequence, self.ingressFinSequence = 0, 0
 	self.egressAckSequence, self.ingressAckSequence = 0, 0
 	self.egressFinSeen, self.ingressFinSeen = false, false
@@ -10006,6 +10020,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		self.sequenceCovered = false
 		self.sequenceAckPositionSeen = false
 		self.sequenceSynSeen = false
+		self.sequenceRecovery.clear()
 		self.sequenceClient = client
 	}
 	for packetIndex := range sendPacketGroup.packets {
@@ -10018,6 +10033,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 				if proof.update == self && proof.sequence == sendPacket.ipPath.SequenceNumber && proof.responseClient == client {
 					self.receivedInbound.Store(true)
 					self.synGenerationAwaiting = false
+					self.observeTcpRecoveryAckWithLock(client, proof.responseControl)
 				}
 			}
 		}
@@ -10053,6 +10069,7 @@ func (self *multiClientChannelUpdate) updateMaterializedSequenceWithLock(sendPac
 	if len(payloadByteCounts) != 0 {
 		payloadByteCount = payloadByteCounts[0]
 	}
+	sendPacket.collapseAdmission.materializeTcpRecoveryWithLock(sendPacket, payloadByteCount)
 	update := self.sequencePacketCount == 0
 
 	nextAckSequenceNumber := ipPath.AckSequenceNumber
@@ -10152,6 +10169,7 @@ func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpContr
 	} else {
 		if control.ack {
 			updateLatestTcpSequence(&self.egressAckSeen, &self.egressAckSequence, control.ackSequenceNumber)
+			self.observeTcpRecoveryEgressWithLock(control)
 		}
 		if control.fin {
 			finSequence := control.sequenceNumber + control.payloadByteCount + 1
@@ -10190,7 +10208,10 @@ func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *par
 func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.releaseSequenceHoldWithLock(maxHold)
+}
 
+func (self *multiClientChannelUpdate) releaseSequenceHoldWithLock(maxHold time.Duration) bool {
 	// A raw admitted group can also suppress a duplicate. The explicit hold
 	// keeps its admission clock without claiming it was already serialized.
 	if self.sequenceTime.IsZero() {
@@ -10410,9 +10431,12 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *parsedPacket, client *multiClientChannel) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.canUpdateSequenceForClientWithLock(sendPacket, client, true)
+}
 
+func (self *multiClientChannelUpdate) canUpdateSequenceForClientWithLock(sendPacket *parsedPacket, client *multiClientChannel, recovery bool) bool {
 	path := sendPacket.ipPath
-	if self.sequenceSourceOrder == 1<<48-1 {
+	if self.sequenceSourceOrder == 1<<48-1 || self.sequenceRecovery.serial == ^uint64(0) {
 		return true
 	}
 	if path.Syn && self.pendingSequenceCoversWithLock(sendPacket, client) {
@@ -10468,7 +10492,7 @@ func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *par
 		return true
 	}
 
-	return !self.sequenceCoversWithLock(sendPacket)
+	return !self.sequenceCoversWithLock(sendPacket) || recovery && self.canRecoverTcpWithLock(sendPacket, client)
 }
 
 // commitRaceClientWithLock makes client the race winner and transfers every

@@ -64,26 +64,44 @@ func newReceiveDeliveryQueue(sequence *ReceiveSequence, maxCount int, maxBytes B
 	return &receiveDeliveryQueue{sequence: sequence, maxCount: max(1, maxCount), maxBytes: max(1, maxBytes), wake: make(chan struct{}, 1)}
 }
 
-func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-	if q.sequence.receiveQueue != nil {
-		q.sequence.prepareReceiveDeliveryCredit(item)
-	}
+// Includes the retained packet owner and bounded receipt/claim metadata.
+func receiveDeliveryByteCount(item *receiveItem) ByteCount {
 	// Charge the receipt, its ledger pointer and worst-case one claim per
 	// application frame as well as the pre-existing retained item envelope.
 	metadata := ByteCount(unsafe.Sizeof(receiveDeliveryReceipt{})) + 8 +
 		ByteCount(max(1, len(item.frames)))*ByteCount(unsafe.Sizeof(receiveDeliveryClaim{})+unsafe.Sizeof(receiveDeliveryOperation{})+8)
-	bytes := addReceiveQueueByteCount(max(1, item.QueueByteCount()), (metadata+63)/64*64)
+	return addReceiveQueueByteCount(max(1, item.QueueByteCount()), (metadata+63)/64*64)
+}
+
+// The receive worker is the sole appender. After flushing its previous batch,
+// this reserves actual shared memory; other workers can only free space or
+// close the ledger before append. It is not an Available-only promise.
+func (q *receiveDeliveryQueue) prepare(item *receiveItem) bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	_, _, _, accepted := q.prepareWithLock(item)
+	return accepted
+}
+
+// Shares the exact limits and reservation with the eventual ledger append.
+func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem) (ByteCount, bool, bool, bool) {
+	if q.sequence.receiveQueue != nil {
+		q.sequence.prepareReceiveDeliveryCredit(item)
+	}
+	bytes := receiveDeliveryByteCount(item)
 	control := receiveDeliveryIsSmallControl(item)
 	if q.closed {
-		return nil, false
+		return 0, false, false, false
 	}
 	// The small control partition is additional headroom at saturation, not
 	// a cap of two ordinary ACKs per decoded batch. Healthy controls use the
 	// same bounded regular ledger as data; only actual count/byte/admission
 	// pressure selects the independently prepaid control fallback.
-	regular := len(q.items)-q.controlCount < q.maxCount && bytes <= q.maxBytes-(q.bytes-q.controlBytes)
+	// An ordinary callback cannot retain a provider claim. Preserve its
+	// existing one-oversize-owner progress rule, only with an empty ledger.
+	synchronousOversize := len(q.items) == 0 && !receiveDeliveryHasTcp(item.frames)
+	regular := len(q.items)-q.controlCount < q.maxCount &&
+		(bytes <= q.maxBytes-(q.bytes-q.controlBytes) || synchronousOversize)
 	if regular && q.sequence.receiveQueue != nil && q.sequence.receiveQueue.lifetimeBudget && item.memoryBudget == nil {
 		regular = item.reserveMemory(q.sequence.receiveQueue.budget, item.QueueByteCount())
 	}
@@ -98,6 +116,16 @@ func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiv
 			}
 			q.traceReceiptStateLocked(&receiveDeliveryReceipt{ack: sequenceAck{messageId: item.messageId, sequenceNumber: item.sequenceNumber}, messageBytes: item.messageByteCount}, "delivery_receipt_refused", false, reason)
 		}
+		return 0, false, false, false
+	}
+	return bytes, control, controlReserve, true
+}
+
+func (q *receiveDeliveryQueue) append(item *receiveItem, required bool) (*receiveDeliveryReceipt, bool) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	bytes, control, controlReserve, accepted := q.prepareWithLock(item)
+	if !accepted {
 		return nil, false
 	}
 	r := &receiveDeliveryReceipt{queue: q, item: item, bytes: bytes, messageBytes: item.messageByteCount,
@@ -140,6 +168,8 @@ func (q *receiveDeliveryQueue) removeChargeLocked(r *receiveDeliveryReceipt) {
 		q.controlCount--
 		q.controlBytes -= r.bytes
 	}
+	// Bare claim completion and seal may free capacity outside q.pump.
+	q.notify()
 }
 
 func (r *receiveDeliveryReceipt) hold() *receiveDeliveryClaim {

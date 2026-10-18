@@ -1,5 +1,15 @@
 # Packet-flow regression review
 
+Current update: the resident and exchange pre-enqueue refusal corrections are
+integrated after deterministic counterfactuals and private normal/race proofs.
+The P3 receipt/ACK-custody correction is also integrated after scoped current-source
+correctness and local cost review. The portable fixture correction and default
+Connect root normal/race passes are qualified; canonical recursive/full-runner
+and device qualification remain pending.
+The composed on-disk confirmation stopped at a native-write fixture boundary
+error; it is not qualified. See the dated updates at the end. The initial
+status and source findings below describe the earlier frozen review.
+
 Status: sealed four-week review and scoped current-pressure audit, prepared privately for source-safe integration. All 2,274 inventoried commits have a per-SHA disposition; the finite production-relevance review has no pending assigned diff. Review depth varies explicitly below: generated equivalence, actual activation boundaries, ancestry merges and test/docs classification are not represented as manual audits of every line. Sol's deterministic OLD-source pacing executions reproduced three semantic failures with two controls passing in normal and race builds. That is the strongest current evidence, not a device incident or performance-fix result. No production change, qualified fix or remote deployment attribution is established here.
 
 The current source contains several mechanisms capable of turning local pressure or delayed recovery into wider connection pauses. The strongest initial candidates are a selected H1 repair trapped behind its own pacing drain; complete-message queue overflow retiring unrelated server work; and receive-sequence cancellation after a bounded receipt or decode admission fails. There is also a distinct, intentional DNS policy change that can expose tunnel resolver latency. These mechanisms are separate from the previously reported H1 loaded-probe 0/64 outcome. None has yet been shown to cause the reported iOS website pauses.
@@ -80,7 +90,7 @@ Deterministic discriminator: hold one destination worker at a lease-lookup barri
 
 ### P3 — pressure cancels a receive sequence after advancement
 
-**High; source-confirmed teardown, retry-safe remedy still requires implementation proof.** `transfer_receive_delivery.go:86` can refuse a delivery receipt on count, retained-byte or shared-budget capacity. `transfer_receive_delivery_dispatch.go:111` cancels both the delivery queue and receive sequence. The next sequence number has already advanced (`transfer.go:15963`). Simply removing cancellation could cause a retransmission to be treated as an old duplicate and acknowledged without delivery. Admission, sequence advancement, receipt custody and selective/cumulative ACK state must be treated as one transition.
+**High; receipt-admission correction integrated after scoped correctness and local cost review; full qualification remains pending.** In the frozen pre-fix source, `transfer_receive_delivery.go:86` can refuse a delivery receipt on count, retained-byte or shared-budget capacity. `transfer_receive_delivery_dispatch.go:111` cancels both the delivery queue and receive sequence. The next sequence number has already advanced (`transfer.go:15963`). Simply removing cancellation could cause a retransmission to be treated as an old duplicate and acknowledged without delivery. Admission, sequence advancement, receipt custody and selective/cumulative ACK state must be treated as one transition.
 
 A second site is `ip_provider_reliable_ingress.go:54`: transient decode workspace exhaustion, including its busy fixed 32 KiB fallback, reaches a deferred `claim.complete(false)` and cancellation in `transfer_receive_delivery.go:181`. Its unit is a complete **ACK-backed** Transfer Pack, not necessarily a Pack whose cumulative delivery ACK has escaped, and not a raw fragment. The blast radius is every flow mapped to that source/session/logical receive lane, not the entire Client. Side candidates `0fd6b1ba` and `1c6b36a9` address these respective boundaries; no runtime result is claimed.
 
@@ -283,8 +293,8 @@ Raw result: `go1272-qualification.NmFy9i/continuous-offer-h1/canonical-integrate
 ## Follow-on validation — 2026-10-17: deterministic mechanisms, not incident attribution
 
 This later checkpoint supplements the preceding report and preserves its failed
-fixture attempts. Numeric pacing and receive-admission production candidates
-remain private; neither is adopted or device-qualified. Deterministic
+fixture attempts. At this checkpoint numeric pacing and receive-admission production
+candidates remained private; neither was adopted or device-qualified. Deterministic
 counterfactuals establish the tested mechanism, not deployment, onset, the
 reported iOS website pauses or the historical loaded-probe 0/64 cause.
 
@@ -406,3 +416,310 @@ The counted test and observer owners for these reported runs joined. That
 cleanup fact does not promote a candidate, identify the phone incident or
 qualify the still-pending full parents, allocation/throughput gates and physical
 32/64-MiB workloads.
+
+## 2026-10-17 update: proven resident refusal defect
+
+Subsequent validation deterministically reproduced P2 on current source. With
+the real default 4,096-message ingress split into 16 shards, refusing either a
+complete original or a genuine reverse ACK canceled the shared resident.
+Both counterfactual roots failed at that exact transition, without setup or
+timeout failures. The originating sender still owned retry; carrier delivery
+had not transferred endpoint ACK custody to this forwarding callback.
+
+The minimal production correction is now integrated in Server: preserve the
+zero-wait refusal, extra-share return and counters, but do not cancel the
+resident for ordinary queue saturation. Both newer fatal-consumer handlers
+remain byte-for-byte intact. Seven real-origin roots passed in three fresh
+normal and three fresh race processes, covering natural original retry,
+genuine lost-ACK recovery/deduplication, NoAck loss, unrelated application
+progress, and explicit-close ownership races. Test and observer owners joined
+before integration. On-disk parent/AST checks remain required after formatting;
+this is not a qualified performance or deployed-device result.
+
+Evidence: the chronology prefix above,
+`aa-postp2p-mixed-admission.20261017/r4-old-minimal-result.20261017/`,
+`r4-fixed-seven-normal-result.20261017/`, and
+`r4-fixed-seven-race-result.20261017/`. Normal/race terminal summary SHA-256:
+`35c4412fbc6a820310d6b88a309d7ea9cc557fa512fc474826f8387ede649d24` and
+`02bfe38a419ae8976dcb5ea222044407b4bc2163af863d049233536840079991`.
+
+Adjacent review confirms the same incorrect framing rationale at two internal
+exchange writer boundaries: ResidentTransport and ResidentForward retire their
+ExchangeConnection when a complete message times out before socket-queue
+enqueue. This attempted message has not reached socket framing. ACK-required
+originals retain retry, reverse ACK loss uses duplicate feedback, and NoAck
+uses counted loss. Actual socket/partial-write, authentication and lifecycle
+failures remain distinct terminal conditions. A separate candidate exists,
+but real-boundary regressions are not yet implemented or qualified; it is not
+included in the integrated resident correction.
+
+CODESTYLE's receive guidance has since been corrected to distinguish complete
+retriable messages from unreplayed raw fragments; its earlier frozen wording
+above is historical. Neither this fix nor the fixture-policy repairs establish
+the cause of the iOS website pauses or qualify the historical H1 loaded-probe
+failure. Fresh device 32/64-MiB and full-runner evidence remains outstanding.
+
+## 2026-10-17 update: exchange correction and native-write oracle
+
+The adjacent exchange correction is now integrated: a complete message refused
+before socket-queue admission keeps the live ExchangeConnection generation.
+Transport and forward paths count refused messages/bytes; Done, socket errors,
+authentication failures and explicit lifecycle shutdown remain terminal. No
+queue, batch, pacing, deadline or memory-budget increase is part of this fix.
+
+The pre-fix counterfactual produced six real-boundary semantic failures with
+five controls passing. The corrected twelve-root suite passed three fresh
+normal and three fresh race processes privately. These tests exercise actual
+Client/Resident construction and framing over controlled connections, not
+radio, TLS or kernel throughput. Both refusal directions, original retry,
+reverse ACK recovery, NoAck loss, unrelated delivery and teardown are covered.
+The private normal/race summary hashes are respectively
+`2cc18c45080a96e783bafce989af143ec88f9c8da1c033d6cab16cb381453e59`
+and `60ec21044b9137c8361535aa421a2c9025fc4d6b2a863ff5cada4466c5b3df42`.
+
+Adjacent review found a separate accounting error: after a partially written
+middle frame, remaining bytes could incorrectly credit a smaller later frame.
+The correction stops prefix accounting at the first incomplete frame while
+still returning every input owner. A deterministic 23/41/7-byte fixture
+reproduced the old two-frame credit instead of one; the correction passed
+three fresh normal and three fresh race processes privately. Test cleanup also
+now joins actual socket owners and reconciles never-offered sibling shares.
+The cleanup test uses a controlled missing-registration negative, not an
+assertion that the historical production code had that artificial mutation.
+
+Native writev validation exposed two distinct fixture assumptions. First, a
+single 256-KiB batch could complete despite requested small socket buffers;
+waiting for connection termination did not prove a partial write. A finite
+pressure fixture retains production-sized batches and the one-second write
+deadline, queues at most 512 messages, and verifies predecessor bytes drained
+by the peer. Its first diagnostic produced genuine 12,288-byte terminal
+partial writes in both transport and forward paths; exact completed-prefix,
+fallback-write, queue, vector-retention and pooled-ownership checks passed.
+
+Second, the composed actual-source 26-root confirmation passed processes one
+and two but failed process three. The forward terminal batch wrote 4,096
+bytes before its real timeout, with a live parent and joined owners. That is
+a valid header plus partial first payload, not a complete 8,196-byte frame.
+Accounting correctly reported 65 complete frames / 524,553 wire bytes across
+the singleton and two earlier complete batches. Only the fixture's extra
+requirement of a complete frame inside the failed batch was violated. The
+same invalid assumption exists in the shared transport fixture. Astra is
+preparing a deterministic oracle regression; no retry or race/core continuation
+was used to conceal the failure.
+
+The failed actual-source confirmation summary has SHA-256
+`5851f948a13366753d7337ee22130d7fd3d352222087874d2f9f9a0f2597e2fd`;
+its third raw process has SHA-256
+`c752df23cc88111cce3b0cdc2c8c66bd58a6ab0a09b05fe54d2227453608994a`.
+All test/observer owners joined. These results qualify neither the composed
+fix, the historical H1 0/64 loaded-probe outcome, nor the reported iOS pauses.
+Fresh on-disk confirmations, full runner and physical 32-MiB iOS-surrogate /
+64-MiB Android measurements remain required. No performance baseline is promoted.
+
+The subsequent test-only correction is integrated but not yet executed: both
+native fixtures use one shared oracle accepting strictly positive, incomplete
+native progress with a timeout and live parent. Its completed-frame count is
+the floor of written bytes divided by framed size, including zero for a
+partial first frame. `TestExchangeWritevPartialTimeoutOracle` pins nineteen
+valid/invalid boundaries, including the observed 4,096-byte outcome. Pressure,
+deadlines, production code and ownership checks are unchanged. The fresh
+confirmation count starts at zero; the failed epoch remains retained.
+
+### 2026-10-17: partial-write and shutdown-fixture confirmations
+
+The corrected partial-write oracle and adjacent ownership tests subsequently
+passed three fresh normal and three fresh race processes, each selecting
+exactly 27 roots, with no failures or skips. Their terminal summary SHA-256s
+are `09d4e153b1d06b91389be7b2efa65f37612190e91b5627eaf6aec5accccabbd4`
+and `f155a6d011e98cb23443fbc16de3d3561e2d7d7b122f187294822a16df5accb5`.
+These are correctness results, not throughput or device-memory measurements.
+
+A separate composed race run exposed a shutdown-fixture race: cleanup canceled
+the exact child transport before publishing root cancellation, while the close
+watcher treated a live root as evidence of an unexpected connection failure.
+The test-only correction captures phase, owner cancellation, endpoint and
+preceding refusal count at the first actual socket close. Expected teardown
+is accepted only from that snapshot; late processing cannot erase an earlier
+live failure. Adjacent admission/worker checks contain only canceled-child
+Done during explicit teardown, not dropped work or other errors.
+
+The deterministic control reproduced exactly 16 expected assertion mismatches.
+The corrected 13-root group passed three fresh normal and three fresh race
+processes, with no failures, skips or race warnings. Summary SHA-256s are
+`bb3510fe102df03d2a6fb1add05d43ed1faf33e4ef078b57bcb25955c05a9779`
+and `9167b9a893cab2f81ace023e241b9062fae1d6b8725ac33c0294a840d90d7e72`.
+All test and resource-monitor processes joined. One earlier attempt stopped
+before Go execution because the local launcher had exited; its failure is
+retained separately, and the exact fixture was recovered preserving its data.
+
+The qualified fixture postimages and one new deterministic root are now
+integrated; canonical simulator coverage grows from 42 to 43 required Server
+roots without changing repetitions, deadlines or worker policy. Shared-source
+integration requires a fresh source identity and full runner replay. It does
+not establish a fix for historical H1 0/64 probes or the reported iOS pauses.
+Both physical memory profiles and performance qualification remain pending.
+
+### 2026-10-17: physical wait localization and confirmed TCP composition bug
+
+The single completed Pixel Wi-Fi/H1 Fast diagnostic displayed 33 Mbps after
+88.761 seconds. Page-target accounting's derived 0.01 Mbps is not aggregate
+throughput. The next diagnostic, with three intrusive stack captures, timed
+out at the unchanged Fast deadline; its provisional 13 Mbps is not a valid
+completed rate. Neither attempt promotes a baseline.
+
+In two active captures the same TUN producer waits in
+`SendSequence.acquirePackAdmission`; its exact sequence worker waits in
+`windowBurstPacer.waitForServiceReservation`. All seven captured H1 writers
+are at their input select, not socket writes. This localizes sampled upstream
+admission/pacing pressure, not its cause. Different current Pack objects rule
+out claiming one continuously stuck Pack. The run's 5.043-second maximum send
+occurred between captures two and three; the maximum primary TUN read was
+before workload launch. Do not conflate either maximum with the sampled stacks.
+
+The matched client's 3,385 out-of-order hold refusals are attempts, not unique
+lost packets. All 321 additional Pack-handoff waits succeeded. Fourteen ACK
+queue waits totalled 8.354 ms (maximum 1.599 ms), with no reported errors.
+Refused items retain a peer retry owner and do not advance local ACK state.
+The independent receiver audit found no new custody defect or justified
+capacity change; local resend counters describe the opposite direction.
+
+A separate deterministic native composition test **did reproduce a bug**:
+public Multi sends traverse real Transfer and provider TCP admission; the
+provider retains two future segments, refuses a third at its bounded reorder
+limit after Transfer acceptance, then drains an earlier gap fill. Its cumulative
+TCP ACK reaches 1005, but Multi still suppresses the covered byte at 1005:
+collapse drops increase 0 to 1 with durable coverage `[1001,1006)`. The test
+uses synthetic data/identities and synchronous assertions, not a timeout as
+the failure oracle. Existing lower-level retries bypassed Multi and missed
+this composition. First-run evidence SHA-256:
+`797ce1521f56385753d66147040dd05bd867aa5d4735c2967863a6f73ae57c0f`.
+
+The proposed repair uses current-generation cumulative-ACK recovery authority,
+not a timer expiry or no-ACK policy change. It remains private/unqualified;
+independent review is checking source/peer sequence validation, stale
+generations, token ownership, failed sends, group paths and wraparound.
+This local bug is not yet attributed to the phone's pacing waits or historical
+0/64 loaded probes. Additional flow-retirement cancellation testing is also
+being prepared; its source-supported hypothesis is not a confirmed failure.
+
+The stale Android test-probe cleanup bug was independently reproduced and its
+five-file repair integrated. Three fresh normal and three race private runs
+passed five roots each; the shared affected group passed 123 roots and the
+entire backend race package passed 483 roots, all joined. Tested source identity
+was `b250bc8a977ba463e315be2a7826b50f5b8182b4b5eed01588008990b6d898db`;
+this subsequent evidence-only documentation append requires a new identity.
+Full three-lane and real-device 32/64-MiB qualification remains required.
+
+### 2026-10-18: P3 receipt/ACK custody integrated with default root coverage
+
+On source identity `66a10a386bf4c466497b937e31f31bb3eb482c58567478d28bd253af5f0373c4`,
+the exact OLD root again failed the receipt-pressure invariant and the reference
+passed. The unchanged V5 fixture selection then passed all 31 roots in three
+fresh normal and three fresh race processes. All 197 affected delivery/ACK
+parent roots passed once normally and once under race. Both healthy-burst and
+queued-cancellation owner controls passed normally and under race for each arm.
+These qualified processes joined with unchanged inputs and clean guards; the
+earlier fixture failures and separate control-phase capacity failure are retained.
+
+The exact tested three production files and five fixture/benchmark files are
+now integrated, with all eight postimages verified. Admission/reservation
+precedes receive-head advancement or held-owner removal; refused complete
+Packs remain retriable without an unowned ACK promise. Shared callbacks stay
+zero-wait, and existing selective owners, secured cumulative prefixes, generic
+oversize compatibility and cancellation/pool reconciliation remain covered.
+This does not establish a fix for the separate decode-workspace boundary above.
+The initial integrated 32-repository identity was
+`c7cfdedb7dae6731a89f404ef3abbb8e551732b3e2ada20d490094a08dd4751c`.
+The earlier private-overlay receipts retain their original source identity
+rather than becoming on-disk parent results.
+
+The first integrated full-root normal attempt failed the real js/wasm
+test-compilation boundary: the unconstrained P3 fixture called
+`poolBalanceUdp4Packet`, whose definition was in a `!js` test file. That
+attempt later stopped for a separate capacity breach; it is not a passing
+parent run, and neither failure is erased by subsequent qualification.
+The helper's function body was moved unchanged into the unconstrained
+`ip_packet_pool_fixture_test.go`. No production code, test skip or platform
+matrix was changed. The existing `TestPlatformBuildVariantsCompile` then
+passed in three fresh processes, exercising all six platform variants and
+the actual js/wasm root-test compilation. The five P3 fixtures were also
+audited for similar platform-excluded helper dependencies.
+
+After this test-only move, the current code qualification uses identity
+`76fcf6ad45627ab26ed65d9a3019b40282113e5134f3377492a0c08321184493`;
+only Connect content changed in each transition. The fresh unfiltered Connect
+root normal process passed in 1459.088 seconds: 5890 top-level runs, 5855
+passes, 35 top-level skips and two DNS subtest skips, with no failures.
+The fresh race process passed in 6237.322 seconds: 5890 top-level runs, 5854
+passes, 36 top-level skips and two DNS subtest skips, with no failures or
+reassembled data-race warnings. Both execution owners joined with exit zero,
+child/after-guard exits zero, unchanged guarded inputs and empty stderr.
+The extra race skip is `TestIpMuxSafeReceiveNoAlloc`: allocation counts are
+unstable under race; the same test passed normally. The normal/race ledgers
+retain all 37/38 exact skip reasons. Opt-in measurements, host/mobile conditions
+and pending-implementation placeholders are coverage gaps, not verified
+invariants. These are default root-package results, not canonical recursive
+coverage. The previously failing platform test also passed within full normal.
+
+The completed A-B-B-A comparison used two fresh processes per arm, 16 operations
+per process, and 32 real complete Packs per operation. A is OLD; B is the
+reference. Each operation constructs Client/provider/NAT owners, queues the
+burst behind the receive-worker barrier, observes actual final admission and
+the last cumulative wire ACK, then cancels and joins all owners with exact
+pool/budget reconciliation. The progress observer is nil; held pre-Run TCP
+workers open no live sockets.
+
+| Arm | Lifecycle ns/op | B/op | allocs/op | Delivery ns/burst | Joined ns/burst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1 | 461,227 | 682,153 | 4,370 | 338,031 | 393,893 |
+| B1 | 415,260 | 546,399 | 4,477 | 303,151 | 346,763 |
+| B2 | 480,883 | 535,270 | 4,446 | 347,487 | 393,503 |
+| A2 | 408,591 | 688,806 | 4,375 | 315,479 | 348,039 |
+
+Reference-versus-OLD means were lifecycle time +3.03%, allocated bytes -21.10%,
+allocations +2.04% (+89 per burst), delivery time -0.44% and joined time -0.22%.
+The time difference is smaller than the observed 12–15% within-arm spread.
+Lifecycle metrics include setup and cleanup; the two wall timers begin at
+burst release. These are descriptive host measurements, not statistical
+equivalence, throughput, tail-latency or steady retained-memory results.
+SDK/counting owners were quiescent, but the retained observer/fixture remained;
+observer scans could overlap. A post-A1 metadata failure is preserved separately
+and no benchmark measurement was retried.
+
+The local cost gate is cleared: this observed tradeoff supports the exact
+custody correction without an unqualified batching redesign. The source-known
+1-to-32 flush / 2-to-64 clone opportunities are not a measured 32-fold slowdown.
+The integrated default root normal/race gate is now passed. Canonical recursive
+coverage, full ALL/MAIN/PERF and complete 32-MiB iOS-surrogate / 64-MiB Android
+device qualification remain pending. No baseline is promoted, native iOS
+footprint is not qualified, and
+neither the historical H1 0/64 result nor the reported website pauses is explained
+or repaired by these measurements.
+
+Evidence uses the retained raw prefix defined above; let
+`S = p3-current-custody-admission.5JVBwT` and
+`P = p3-shared-full-parent-prep`. Exact summaries link their raw rows:
+
+- `S/initial-result.json`: `c0389980e93cd86c4df59ad4638d2fd4016c4dc3e79f8ce4eebe685d05966ee6`.
+- `S/remaining-six-result.json`: `96088458d089400202e526e4c8b5b8282701615249c4098c0c6c63286eb66210`.
+- `S/qualified-owner-controls-result.json`: `15250a51653fb810b18c8714ebc0137d78d64fc6832f7b2886345de03a751fb2`.
+- `S/timing/abba-result.json`: `a0a6b1eff64b4d016530dddc2b32f2733b8f4495c3503cdcf5e97d0a6c6d1f74`.
+- `p3-integrated-source-admission.nXKeP9/source-identity.json`:
+  SHA-256 is the full `c7cfdedb...` identity above.
+
+- `p3-integrated-source-admission.ZBXTY5/source-identity.json`:
+  SHA-256 is the full `76fcf6ad...` identity above.
+- `P/normal/failed-summary.json`:
+  `7cf3b7e6d03e144a64ace8384526e76b65cf1b42ac1ac3fea6594b865ec63faa`.
+- `P/platform-three-process-result.json`:
+  `23b96a1b8b66e7090906a5209c632a9871690c0bcf4176b22239078e0110ce1b`.
+- `P/portable-normal/result.json`:
+  `4b890436dedfc13a57f9c32bd7b19cb47db6653db905794ae6c8e8221eb3964c`.
+- `P/portable-normal/full-root-ledger.json`:
+  `71ef4e2695d4bc5c322a4b152b026f58e8514239cb34d0cfd051df3d2c1c36d4`.
+- `P/portable-race/result.json`:
+  `4029aa1e74814b13e875993395f8f297eaeddda16217342e7931b1db1616d9ce`.
+- `P/portable-race/full-root-ledger.json`:
+  `57db167722494ed49dea7315f1a2ca9e06ad18ce905c051ceb772e9b56e0adf7`.
+- `P/full-parent-normal-race-result.json`:
+  `7f0e6603917092e2a1601129ae7f6510be79a20104eb9a898fdd57370e6dad99`.

@@ -5165,12 +5165,13 @@ func newTcpSequenceWithTransferKey(
 			// prime the cached ip path before the sequence goroutines start
 			// (see IpPath)
 			ipPath: &IpPath{
-				Version:         ipVersion,
-				Protocol:        IpProtocolTcp,
-				SourceIp:        sourceIp,
-				SourcePort:      int(sourcePort),
-				DestinationIp:   destinationIp,
-				DestinationPort: int(destinationPort),
+				Version:          ipVersion,
+				Protocol:         IpProtocolTcp,
+				SourceIp:         sourceIp,
+				SourcePort:       int(sourcePort),
+				DestinationIp:    destinationIp,
+				DestinationPort:  int(destinationPort),
+				tcpReturnContext: cancelCtx,
 			},
 			// The SYN advertises the protocol's literal 16-bit ceiling. The first
 			// post-handshake ACK can immediately advertise this larger scaled
@@ -7330,6 +7331,10 @@ type providerReturnItem struct {
 	// sourceLifecycle keeps the exact source behind the terminal verdict gate
 	// until this queued or in-flight return reaches final disposition.
 	sourceLifecycle *providerSourceLifecycle
+	// The immutable originating generation and its temporary admission link.
+	// Neither is selected by a tuple lookup after the return callback begins.
+	flowContext          context.Context
+	sendAdmissionContext context.Context
 }
 
 // One sender-worker result exposes the exact completed accounting edge to
@@ -7490,9 +7495,12 @@ func (self *providerReturnItem) returnPackets() {
 	self.packets = self.packets[:0]
 }
 
-// Returns the exact source cancellation boundary when this item was admitted;
-// direct unit fixtures without a lifecycle retain the provider fallback.
+// Dedicated TCP callbacks link their originating generation to the exact
+// source cancellation boundary. Unlinked fixtures keep the provider fallback.
 func (self *providerReturnItem) sendContext(fallback context.Context) context.Context {
+	if self.sendAdmissionContext != nil {
+		return self.sendAdmissionContext
+	}
 	if self.sourceLifecycle != nil {
 		return self.sourceLifecycle.ctx
 	}
@@ -8527,8 +8535,24 @@ func providerReturnSendShard(
 // the read lock lets shutdown stop and join every registered decision without
 // holding a state lock across a synchronous send.
 func (self *RemoteUserNatProvider) enqueueReturnItem(item *providerReturnItem) bool {
+	return self.enqueueReturnItemForSource(item, nil)
+}
+
+// A prepaid callback pins its exact source before waiting for workspace. Its
+// outer lease keeps that generation mapped; this item retains it directly
+// through the same gate, without selecting a newer source by identity.
+// Borrows the callback's lease; the item owns only its successful added retain.
+func (self *RemoteUserNatProvider) enqueueReturnItemForSource(
+	item *providerReturnItem,
+	sourceLifecycle *providerSourceLifecycle,
+) bool {
 	self.beginReturnSendObservation(item)
-	sourceLifecycle := self.acquireSourceLifecycle(item.source.SourceId)
+	if sourceLifecycle == nil {
+		sourceLifecycle = self.acquireSourceLifecycle(item.source.SourceId)
+	} else if sourceLifecycle.sourceId != item.source.SourceId ||
+		!sourceLifecycle.admissions.start() {
+		sourceLifecycle = nil
+	}
 	if sourceLifecycle == nil {
 		self.congestionDrops.addReturnQueue(item.packetCount(), item.packetByteCount)
 		self.releaseReturnItem(item)
@@ -8625,6 +8649,15 @@ func (self *RemoteUserNatProvider) runReturnSender(queue <-chan *providerReturnI
 // Sends one provider-owned return from either a dedicated TCP socket callback
 // or the selected nonblocking worker.
 func (self *RemoteUserNatProvider) sendReturnItem(item *providerReturnItem) {
+	if item.flowContext != nil && item.recoveryMode.waitsForProviderReturnAdmission() {
+		returnContext := newProviderReturnContextLink(item.sendContext(self.ctx), item.flowContext)
+		item.sendAdmissionContext = returnContext.ctx
+		defer func() {
+			// Stop or join cancellation before this pooled item is released.
+			returnContext.close()
+			item.sendAdmissionContext = nil
+		}()
+	}
 	if self.returnSendStarted != nil {
 		self.returnSendStarted()
 	}
@@ -8934,9 +8967,12 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 	sendCtx := item.sendContext(self.ctx)
 	for {
 		// A parent's Done closes before cancellation reaches its children.
-		// Observe the provider directly so a still-live source cannot hand
-		// ownership to Transfer after the provider has already closed.
-		if self.ctx.Err() != nil || sendCtx.Err() != nil {
+		// Observe every owner directly so a still-live child cannot hand
+		// ownership to Transfer after one of its parents has already closed.
+		if self.ctx.Err() != nil || sendCtx.Err() != nil ||
+			item.sourceLifecycle != nil && item.sourceLifecycle.ctx.Err() != nil ||
+			item.recoveryMode.waitsForProviderReturnAdmission() &&
+				item.flowContext != nil && item.flowContext.Err() != nil {
 			return false
 		}
 		if self.abandonSilentSource(item) {
@@ -9318,6 +9354,7 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 	canonicalIpPath *IpPath,
 	reassembled []byte,
 	fragments [][]byte,
+	sourceLifecycle *providerSourceLifecycle,
 ) bool {
 	if len(fragments) == 0 || canonicalIpPath == nil {
 		return false
@@ -9360,11 +9397,14 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = canonicalIpPath.Protocol
+	if recoveryMode.waitsForProviderReturnAdmission() {
+		item.flowContext = canonicalIpPath.tcpReturnContext
+	}
 	item.schedulingKey = ipSendSchedulingKey(canonicalIpPath)
 	item.batch = true
 	item.packets = append(item.packets, fragments...)
 	item.packetByteCount = byteCount
-	self.enqueueReturnItem(item)
+	self.enqueueReturnItemForSource(item, sourceLifecycle)
 	return true
 }
 
@@ -9381,11 +9421,18 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		self.receiveTransferWithRecovery(source, transferKey, provideMode, recoveryMode, ipPath, packets[0])
 		return
 	}
-	memory, admitted := self.startReturnMemoryOperation(packets, recoveryMode)
+	var flowCtx context.Context
+	if ipPath != nil {
+		flowCtx = ipPath.tcpReturnContext
+	}
+	memory, sourceLifecycle, admitted := self.startReturnMemoryOperationForSource(
+		packets, recoveryMode, source.SourceId, flowCtx,
+	)
 	if !admitted {
 		return
 	}
 	defer self.finishMemoryOperation(&memory)
+	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	if len(packets) == 0 {
 		return
 	}
@@ -9430,6 +9477,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 				ipPath,
 				result.packet,
 				result.fragments,
+				sourceLifecycle,
 			) {
 				result.fragments = nil
 			}
@@ -9473,13 +9521,16 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	if recoveryMode.waitsForProviderReturnAdmission() {
+		item.flowContext = ipPath.tcpReturnContext
+	}
 	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.batch = true
 	for _, packet := range packets {
 		item.packets = append(item.packets, MessagePoolShareReadOnly(packet))
 		item.packetByteCount += ByteCount(len(packet))
 	}
-	self.enqueueReturnItem(item)
+	self.enqueueReturnItemForSource(item, sourceLifecycle)
 }
 
 // Borrows the packet: it is valid for this call, a share is kept where the
@@ -9583,11 +9634,18 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	if pendingTerminalReset != nil && recoveryMode != receiveRecoveryModeRegenerableControl {
 		return
 	}
-	memory, admitted := self.startReturnMemoryOperation([][]byte{packet}, recoveryMode)
+	var flowCtx context.Context
+	if ipPath != nil {
+		flowCtx = ipPath.tcpReturnContext
+	}
+	memory, sourceLifecycle, admitted := self.startReturnMemoryOperationForSource(
+		[][]byte{packet}, recoveryMode, source.SourceId, flowCtx,
+	)
 	if !admitted {
 		return
 	}
 	defer self.finishMemoryOperation(&memory)
+	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	source = source.LocalMask()
 	// self.client.log.Infof("[trace]provider return packet for %s\n", source.SourceId)
 
@@ -9613,6 +9671,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 			ipPath,
 			result.packet,
 			result.fragments,
+			sourceLifecycle,
 		) {
 			result.fragments = nil
 		}
@@ -9670,6 +9729,9 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	item.provideMode = returnProvideMode
 	item.recoveryMode = recoveryMode
 	item.ipProtocol = ipPath.Protocol
+	if recoveryMode.waitsForProviderReturnAdmission() {
+		item.flowContext = ipPath.tcpReturnContext
+	}
 	item.schedulingKey = ipSendSchedulingKey(ipPath)
 	item.packet = MessagePoolShareReadOnly(packet)
 	item.packetByteCount = ByteCount(len(packet))
@@ -9677,7 +9739,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	pendingAfterRelease = nil
 	item.terminalReset = pendingTerminalReset
 	pendingTerminalReset = nil
-	self.enqueueReturnItem(item)
+	self.enqueueReturnItemForSource(item, sourceLifecycle)
 }
 
 // `connect.ReceiveFunction`
@@ -10713,6 +10775,9 @@ type IpPath struct {
 	// zero-window close/reopen from a duplicate ACK; the negotiated scale is
 	// irrelevant for that change detector.
 	TcpWindowSize uint16
+	// SYN negotiation metadata is scalar and does not retain option bytes.
+	TcpWindowScale        uint8
+	TcpWindowScaleEnabled bool
 	// TcpPayloadByteCount makes the FIN edge unambiguous: a FIN can legally
 	// share a segment with application bytes, and its acknowledged sequence is
 	// therefore seq + payload + 1 rather than merely seq + 1.
@@ -10723,6 +10788,9 @@ type IpPath struct {
 	Ack                 bool
 
 	ServerName string
+	// Only a TCP constructor's immutable canonical callback path carries this
+	// generation. Parsed, partial, and reversed packet identities carry none.
+	tcpReturnContext context.Context
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
@@ -10814,20 +10882,22 @@ func parseIpPathWithPayloadBorrowed(ipPacket []byte, ipPath *IpPath) ([]byte, er
 		}
 
 		*ipPath = IpPath{
-			Version:             int(ipVersion),
-			Protocol:            IpProtocolTcp,
-			SourceIp:            sourceIp,
-			SourcePort:          int(tcp.sourcePort),
-			DestinationIp:       destinationIp,
-			DestinationPort:     int(tcp.destinationPort),
-			SequenceNumber:      tcp.seq,
-			AckSequenceNumber:   tcp.ackNumber,
-			TcpWindowSize:       tcp.windowSize,
-			TcpPayloadByteCount: len(tcp.payload),
-			Syn:                 tcp.syn,
-			Fin:                 tcp.fin,
-			Rst:                 tcp.rst,
-			Ack:                 tcp.ack,
+			Version:               int(ipVersion),
+			Protocol:              IpProtocolTcp,
+			SourceIp:              sourceIp,
+			SourcePort:            int(tcp.sourcePort),
+			DestinationIp:         destinationIp,
+			DestinationPort:       int(tcp.destinationPort),
+			SequenceNumber:        tcp.seq,
+			AckSequenceNumber:     tcp.ackNumber,
+			TcpWindowSize:         tcp.windowSize,
+			TcpWindowScale:        uint8(tcp.windowScale),
+			TcpWindowScaleEnabled: tcp.enableWindowScale,
+			TcpPayloadByteCount:   len(tcp.payload),
+			Syn:                   tcp.syn,
+			Fin:                   tcp.fin,
+			Rst:                   tcp.rst,
+			Ack:                   tcp.ack,
 		}
 		return tcp.payload, nil
 	default:
@@ -11059,7 +11129,8 @@ func (self *IpPath) Destination() *IpPath {
 
 // ReverseValue returns the flow tuple in the opposite direction without
 // allocating. Sequence/flag state is intentionally omitted, matching Reverse:
-// synthetic packets built from a reversed path are out of sequence.
+// synthetic packets built from a reversed path are out of sequence. Callback
+// lifetime authority is likewise not inherited by an identity-only reversal.
 func (self *IpPath) ReverseValue() IpPath {
 	return IpPath{
 		Protocol:        self.Protocol,
