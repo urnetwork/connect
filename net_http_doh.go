@@ -263,6 +263,15 @@ type DohSettings struct {
 	// server that was fastest then — instead of uniform-random. Live results take over as
 	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
 	ServerStatsSeed map[string]float64
+	// RegionalRemoteDoh puts the regional bootstrap DoH presets of the network
+	// country (`RegionalControlDohUrls` of `NetworkCountryCode`) ahead of the
+	// remote DoH servers, read at each query so a country the host reports
+	// later applies from the next lookup. Only the control-name settings
+	// (`ControlDohSettings`) turn it on: in a country that blocks the default
+	// servers (cn) the space's own names still resolve, and the regional
+	// servers see only those names, as any bootstrap DoH server does. Other
+	// countries and an unknown country query the remote servers as listed.
+	RegionalRemoteDoh bool
 	// DohServerResolvedCallback, when set, is called after a doh server name
 	// (the hostname of a remote doh url) resolves, with the resolved
 	// addresses. the upgrade mux records these into its ip→hostname reverse
@@ -1390,7 +1399,18 @@ func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {
 // remoteDohUrls/localDohUrls return the configured wire-format DoH server URLs for the ip version.
 func remoteDohUrls(settings *DohSettings, ipVersion int) []string {
 	rs := settings.DnsResolverSettings
-	return dohUrlsFor(rs.RemoteDohUrlsIpv4, rs.RemoteDohUrlsIpv6, ipVersion)
+	remoteDohUrlsIpv4 := rs.RemoteDohUrlsIpv4
+	remoteDohUrlsIpv6 := rs.RemoteDohUrlsIpv6
+	if settings.RegionalRemoteDoh {
+		regionalDohUrlsIpv4, regionalDohUrlsIpv6 := RegionalControlDohUrls(NetworkCountryCode())
+		if 0 < len(regionalDohUrlsIpv4) {
+			remoteDohUrlsIpv4 = controlDohUrlsFirst(regionalDohUrlsIpv4, remoteDohUrlsIpv4)
+		}
+		if 0 < len(regionalDohUrlsIpv6) {
+			remoteDohUrlsIpv6 = controlDohUrlsFirst(regionalDohUrlsIpv6, remoteDohUrlsIpv6)
+		}
+	}
+	return dohUrlsFor(remoteDohUrlsIpv4, remoteDohUrlsIpv6, ipVersion)
 }
 
 func localDohUrls(settings *DohSettings, ipVersion int) []string {
