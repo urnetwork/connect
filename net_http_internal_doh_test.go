@@ -319,7 +319,7 @@ func TestInternalDohUdpFollowsRuntimeFamilyPolicy(t *testing.T) {
 		RemoteDohUrlsIpv4: []string{dohServer.URL},
 	}
 	resolver := &internalDohResolver{
-		cache: NewDohCache(internalDohSettings(dohSettings)),
+		cache: NewDohCache(internalDohSettings(dohSettings, nil)),
 	}
 	defer resolver.Close()
 	defer SetControlIpFamilyPolicy(IpFamilyAuto)

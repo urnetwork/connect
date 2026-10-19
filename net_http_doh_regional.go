@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -121,4 +122,65 @@ func RegionalDnsServerIpv6s(countryCode string) []string {
 		}
 	}
 	return ips
+}
+
+// Ingress dns is the resolution of the names the client dials to reach the
+// platform itself (api, connect, extender: the control and bootstrap names,
+// `ControlDohSettings` and the strategy's internal DoH resolver). Egress dns is
+// the resolution of user traffic through the tunnel (`DefaultDohSettings` of
+// the mux), which never reads the ingress country.
+//
+// The ingress country is the country the user declared they connect from
+// (`DohSettings.IngressCountryCode`), lower case, or "" when undisclosed. It
+// lives only in the ingress (control-name) settings, is local only and is never
+// sent anywhere.
+
+// The ingress country in its stored form: lower case and trimmed.
+func NormalizeIngressCountryCode(countryCode string) string {
+	return strings.ToLower(strings.TrimSpace(countryCode))
+}
+
+// The ingress dns strategy of an ingress country: the DoH presets queried ahead
+// of the default DoH servers (none: the defaults only), and the plain resolvers
+// of the last-resort bootstrap fallback (none: the local plain resolvers).
+type IngressDnsStrategy struct {
+	CountryCode  string
+	DohUrlsIpv4  []string
+	DohUrlsIpv6  []string
+	PlainDnsIpv4 []string
+	PlainDnsIpv6 []string
+}
+
+// The ingress dns strategy of a country from the per-country recommendations
+// (`RegionalControlDohUrls`, `RegionalDnsServerIps`). Undisclosed ("") and a
+// country without recommendations take the defaults.
+func IngressDnsStrategyForCountry(countryCode string) *IngressDnsStrategy {
+	countryCode = NormalizeIngressCountryCode(countryCode)
+	dohUrlsIpv4, dohUrlsIpv6 := RegionalControlDohUrls(countryCode)
+	return &IngressDnsStrategy{
+		CountryCode:  countryCode,
+		DohUrlsIpv4:  dohUrlsIpv4,
+		DohUrlsIpv6:  dohUrlsIpv6,
+		PlainDnsIpv4: RegionalDnsServerIps(countryCode),
+		PlainDnsIpv6: RegionalDnsServerIpv6s(countryCode),
+	}
+}
+
+// The ingress countries a user can pick: those with a per-country
+// recommendation (DoH presets or plain resolvers), sorted. Any other country
+// behaves as undisclosed, so it is not offered.
+func IngressCountryCodes() []string {
+	seen := map[string]bool{}
+	for _, server := range regionalControlDohServers {
+		seen[server.CountryCode] = true
+	}
+	for _, server := range regionalDnsServers {
+		seen[server.CountryCode] = true
+	}
+	countryCodes := make([]string, 0, len(seen))
+	for countryCode := range seen {
+		countryCodes = append(countryCodes, countryCode)
+	}
+	slices.Sort(countryCodes)
+	return countryCodes
 }

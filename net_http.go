@@ -863,7 +863,7 @@ func (self *ClientStrategy) SetInternalDohSettings(dohSettings *DohSettings) {
 		if self.internalDohResolver == nil {
 			return nil
 		}
-		return self.internalDohResolver.replaceCache(NewDohCache(internalDohSettings(dohSettings)))
+		return self.internalDohResolver.replaceCache(NewDohCache(internalDohSettings(dohSettings, self.internalDohResolver.domains)))
 	}()
 	// closed outside the lock: closing joins the requests in flight on it
 	if replacedCache != nil {
