@@ -138,10 +138,21 @@ func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 // like any score, so after the first minutes the servers that actually answer
 // lead.
 //
+// In an ingress country with regional presets (cn) those are queried as well, ahead of
+// the lists (`DohSettings.RegionalRemoteDoh`), whether or not any are named.
+//
 // The urls are used as given: `ParseControlDohUrl` is the rule a caller reads
 // them by.
 func ControlDohSettings(dohUrlsIpv4 []string, dohUrlsIpv6 []string) *DohSettings {
+	return IngressDohSettings("", dohUrlsIpv4, dohUrlsIpv6)
+}
+
+// `ControlDohSettings` with an ingress country (`DohSettings.IngressCountryCode`).
+func IngressDohSettings(ingressCountryCode string, dohUrlsIpv4 []string, dohUrlsIpv6 []string) *DohSettings {
 	settings := DefaultDohSettings()
+	settings.IngressCountryCode = NormalizeIngressCountryCode(ingressCountryCode)
+	// the regional presets of the ingress country, ahead of every list
+	settings.RegionalRemoteDoh = true
 	if len(dohUrlsIpv4) == 0 && len(dohUrlsIpv6) == 0 {
 		return settings
 	}

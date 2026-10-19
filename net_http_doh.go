@@ -263,6 +263,30 @@ type DohSettings struct {
 	// server that was fastest then — instead of uniform-random. Live results take over as
 	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
 	ServerStatsSeed map[string]float64
+	// RegionalRemoteDoh puts the regional bootstrap DoH presets of the
+	// ingress country (`RegionalControlDohUrls` of `IngressCountryCode`)
+	// ahead of the remote DoH servers. Only the control-name
+	// settings (`ControlDohSettings`) turn it on: in a country that blocks the
+	// default servers (cn) the space's own names still resolve, and the
+	// regional servers see only those names, as any bootstrap DoH server
+	// does. Undisclosed, or a country without presets, queries the remote
+	// servers as listed.
+	RegionalRemoteDoh bool
+	// IngressCountryCode is the country the user declared they connect from
+	// (see net_http_doh_regional.go), "" when undisclosed. It picks the
+	// regional presets of `RegionalRemoteDoh` and the plain resolvers of
+	// the bootstrap fallback. Only the ingress (control-name) settings carry
+	// it; the egress (tunnel) settings never do.
+	IngressCountryCode string
+	// BootstrapPlainDnsDomains are the bootstrap names (the network space's
+	// own control names, matched as the name or a subdomain) that may fall
+	// back to unencrypted dns, and only after every encrypted resolver failed
+	// to answer. A DoH answer, a DoH NXDOMAIN included, is final. The fallback
+	// asks the plain resolvers of the ingress country when it has them
+	// (`RegionalDnsServerIps`), else the local (host) plain resolvers. No
+	// other name ever takes it. Only the control-name resolver
+	// (`internalDohSettings`) sets these.
+	BootstrapPlainDnsDomains []string
 	// DohServerResolvedCallback, when set, is called after a doh server name
 	// (the hostname of a remote doh url) resolves, with the resolved
 	// addresses. the upgrade mux records these into its ip→hostname reverse
@@ -406,8 +430,11 @@ type DohCache struct {
 	localClient    *dohClient
 	remoteResolver *net.Resolver
 	localResolver  *net.Resolver
-	settings       *DohSettings
-	log            Logger
+	// bootstrapLookupIP is the plain dns lookup of the bootstrap fallback
+	// (`DohSettings.BootstrapPlainDnsDomains`)
+	bootstrapLookupIP func(ctx context.Context, network string, host string) ([]net.IP, error)
+	settings          *DohSettings
+	log               Logger
 
 	// the hostname-form remote doh server names (lowercase). these can not
 	// resolve through remote doh (circular), so they resolve over remote
@@ -683,6 +710,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
+		bootstrapLookupIP:     newBootstrapPlainDnsLookup(settings, lifecycle, netDialer),
 		settings:              settings,
 		log:                   loggerOrDefault(settings.Log),
 		dohServerNames:        dohServerNames,
@@ -1223,6 +1251,28 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}
 	}
 
+	if len(addrExpirations) == 0 && !cacheMiss && lookupFamilyEnabled && ctx.Err() == nil &&
+		bootstrapPlainDnsName(self.settings, q.Domain) &&
+		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		// every encrypted resolver failed: the bootstrap plain dns fallback.
+		// Its answer is used but a miss is not taken as authoritative, so the
+		// next lookup asks DoH again.
+		resolvedIps, err := self.bootstrapLookupIP(ctx, lookupNetwork, q.Domain)
+		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
+		if err == nil {
+			for _, ip := range resolvedIps {
+				if addr, ok := netIPAddr(ip); ok {
+					addrExpirations[addr] = now.Add(min(self.settings.LocalExpiration, bootstrapPlainDnsExpiration))
+				}
+			}
+			if 0 < len(addrExpirations) {
+				self.log.Infof("[doh]bootstrap plain dns fallback (%s)\n", q.Domain)
+			}
+		} else if log := self.log.V(2); log.Enabled() {
+			log.Infof("[doh]bootstrap plain dns (%s) err = %s\n", q.Domain, err)
+		}
+	}
+
 	if dohServerName && 0 < len(addrExpirations) && self.settings.DohServerResolvedCallback != nil {
 		// surface the server addresses (e.g. into the mux reverse index, so
 		// the ignore matcher covers them alongside the server name)
@@ -1390,7 +1440,19 @@ func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {
 // remoteDohUrls/localDohUrls return the configured wire-format DoH server URLs for the ip version.
 func remoteDohUrls(settings *DohSettings, ipVersion int) []string {
 	rs := settings.DnsResolverSettings
-	return dohUrlsFor(rs.RemoteDohUrlsIpv4, rs.RemoteDohUrlsIpv6, ipVersion)
+	remoteDohUrlsIpv4 := rs.RemoteDohUrlsIpv4
+	remoteDohUrlsIpv6 := rs.RemoteDohUrlsIpv6
+	if settings.RegionalRemoteDoh {
+		ingressDnsStrategy := IngressDnsStrategyForCountry(settings.IngressCountryCode)
+		regionalDohUrlsIpv4, regionalDohUrlsIpv6 := ingressDnsStrategy.DohUrlsIpv4, ingressDnsStrategy.DohUrlsIpv6
+		if 0 < len(regionalDohUrlsIpv4) {
+			remoteDohUrlsIpv4 = controlDohUrlsFirst(regionalDohUrlsIpv4, remoteDohUrlsIpv4)
+		}
+		if 0 < len(regionalDohUrlsIpv6) {
+			remoteDohUrlsIpv6 = controlDohUrlsFirst(regionalDohUrlsIpv6, remoteDohUrlsIpv6)
+		}
+	}
+	return dohUrlsFor(remoteDohUrlsIpv4, remoteDohUrlsIpv6, ipVersion)
 }
 
 func localDohUrls(settings *DohSettings, ipVersion int) []string {
