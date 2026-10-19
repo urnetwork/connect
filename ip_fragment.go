@@ -2,6 +2,7 @@ package connect
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"slices"
@@ -518,15 +519,73 @@ func writeIpv4HeaderChecksum(header []byte) {
 	binary.BigEndian.PutUint16(header[10:12], checksumFinish(checksumAdd(0, header)))
 }
 
-var ipv4FragmentIdentification atomic.Uint32
+// fragmentIdGenerator hands out fragment identifications that are unique
+// across a full counter cycle but unpredictable to a receiver (RFC 7739).
+// A counter keeps in-flight groups distinct, and a Feistel permutation keyed
+// by a random secret hides the counter, so ids neither reveal how many
+// fragmented packets the process has sent nor correlate flows.
+// The cost is one atomic add and four keyed mixes per group.
+type fragmentIdGenerator struct {
+	key      [4]uint64
+	halfBits uint
+	counter  atomic.Uint32
+}
 
-func nextIpv4FragmentIdentification() uint16 {
+func newFragmentIdGenerator(key [4]uint64, halfBits uint, counterStart uint32) *fragmentIdGenerator {
+	generator := &fragmentIdGenerator{
+		key:      key,
+		halfBits: halfBits,
+	}
+	generator.counter.Store(counterStart)
+	return generator
+}
+
+func newRandomFragmentIdGenerator(halfBits uint) *fragmentIdGenerator {
+	var b [36]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	var key [4]uint64
+	for i := range key {
+		key[i] = binary.BigEndian.Uint64(b[8*i : 8*i+8])
+	}
+	return newFragmentIdGenerator(key, halfBits, binary.BigEndian.Uint32(b[32:36]))
+}
+
+func fragmentIdMix(x uint64) uint64 {
+	// splitmix64 finalizer
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
+// permute is a bijection on [0, 2^(2*halfBits))
+func (self *fragmentIdGenerator) permute(value uint32) uint32 {
+	mask := uint32(1)<<self.halfBits - 1
+	left := (value >> self.halfBits) & mask
+	right := value & mask
+	for _, roundKey := range self.key {
+		left, right = right, left^(uint32(fragmentIdMix(roundKey^uint64(right)))&mask)
+	}
+	return left<<self.halfBits | right
+}
+
+// next returns a nonzero id
+func (self *fragmentIdGenerator) next() uint32 {
 	for {
-		identification := uint16(ipv4FragmentIdentification.Add(1))
-		if identification != 0 {
+		if identification := self.permute(self.counter.Add(1)); identification != 0 {
 			return identification
 		}
 	}
+}
+
+var ipv4FragmentIdGenerator = newRandomFragmentIdGenerator(8)
+
+func nextIpv4FragmentIdentification() uint16 {
+	return uint16(ipv4FragmentIdGenerator.next())
 }
 
 // fragmentIpv4Packet converts one complete IPv4 packet into RFC 791
