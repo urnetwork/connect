@@ -48,6 +48,12 @@ type tcpProviderRetirementPacket struct {
 // Creates all producers through production constructors. No socket factory
 // opens a host socket, and no route or Transfer acknowledgement is synthesized.
 func newTcpProviderRetirementFixture(t *testing.T) *tcpProviderRetirementFixture {
+	return newTcpProviderRetirementFixtureWithSetup(t, nil, nil)
+}
+
+// Optional socket/read barriers and per-sequence hooks are installed before
+// any flow starts; existing retirement callers retain the same fixture.
+func newTcpProviderRetirementFixtureWithSetup(t *testing.T, wrapSocket func(net.Conn) net.Conn, setupSequence func(*TcpSequence)) *tcpProviderRetirementFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture := &tcpProviderRetirementFixture{
@@ -71,6 +77,9 @@ func newTcpProviderRetirementFixture(t *testing.T) *tcpProviderRetirementFixture
 		sequenceSocket, upstream := net.Pipe()
 		fixture.sequenceSockets = append(fixture.sequenceSockets, sequenceSocket)
 		fixture.upstreams = append(fixture.upstreams, upstream)
+		if wrapSocket != nil {
+			sequenceSocket = wrapSocket(sequenceSocket)
+		}
 		sockets <- sequenceSocket
 	}
 	natSettings := DefaultLocalUserNatSettingsWithBufferSize(8)
@@ -94,6 +103,9 @@ func newTcpProviderRetirementFixture(t *testing.T) *tcpProviderRetirementFixture
 			}
 			sequence.afterPureAckWorkerStopForTest = func() { close(fixture.oldAckWorkerDone) }
 			sequence.beforeChildWorkersWaitForTest = func() { close(fixture.oldChildJoinStarted) }
+		}
+		if setupSequence != nil {
+			setupSequence(sequence)
 		}
 		fixture.created <- sequence
 	}

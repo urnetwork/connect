@@ -5879,7 +5879,9 @@ func (self *TcpSequence) Run() {
 			// close without cancel so that the receive pipeline drains all
 			// queued packets before the sequence cancels.
 			// the receive pipeline cancels after the drain.
-			if !fin {
+			// Do not synthesize a new reset for an already canceled flow.
+			// Existing queued owners keep their drain and cancellation handling.
+			if !fin && self.ctx.Err() == nil {
 				var packet []byte
 				var err error
 				func() {
