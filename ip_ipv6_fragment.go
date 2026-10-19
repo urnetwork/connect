@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
-	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -397,15 +396,10 @@ func (self *ipv6FragmentReassembler) close() {
 	}
 }
 
-var ipv6FragmentIdentification atomic.Uint32
+var ipv6FragmentIdGenerator = newRandomFragmentIdGenerator(16)
 
 func nextIpv6FragmentIdentification() uint32 {
-	for {
-		identification := ipv6FragmentIdentification.Add(1)
-		if identification != 0 {
-			return identification
-		}
-	}
+	return ipv6FragmentIdGenerator.next()
 }
 
 // fragmentIpv6Packet converts one complete IPv6 packet with no extension
