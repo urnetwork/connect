@@ -192,6 +192,10 @@ func NetworkQualityChanged() {
 // its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
 // call on every update — listeners only tear down state bound to a possibly-dead path.
 func NetworkChanged() {
+	// A hard path switch can also add or remove a usable address family, so
+	// the next control-family probe must read the host rather than a table
+	// cached for the path that just went away.
+	controlFamilyProbeCacheInvalidate()
 	// A hard path switch also invalidates quality measurements. Keep this one
 	// canonical call so DeviceLocal does not need to emit both notifications.
 	NetworkQualityChanged()

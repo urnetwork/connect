@@ -434,8 +434,69 @@ func hostControlFamilyInterfaces() ([]controlFamilyInterface, error) {
 var controlFamilyProbeSource = struct {
 	mu         sync.Mutex
 	interfaces func() ([]controlFamilyInterface, error)
+	// bumped by every seam change so a cached table from another seam is never
+	// read as evidence for this one
+	generation uint64
 }{
 	interfaces: hostControlFamilyInterfaces,
+}
+
+// controlFamilyProbeCacheTTL bounds how long the host interface table is
+// reused. Enumerating it is a syscall walk -- on Windows each
+// net.Interface.Addrs is a GetAdaptersAddresses cgo call, and the probe is
+// consulted twice for every HTTP dial expansion and for every extender
+// candidate sample. In a process that runs hundreds of provider spaces that
+// walk dominated the profile (connect#211). The table only changes on a path
+// change, which NetworkChanged invalidates explicitly, so the TTL is a stale
+// guard rather than the primary invalidation.
+const controlFamilyProbeCacheTTL = 5 * time.Second
+
+var controlFamilyProbeCache = struct {
+	mu         sync.Mutex
+	valid      bool
+	generation uint64
+	at         time.Time
+	interfaces []controlFamilyInterface
+	err        error
+}{}
+
+// controlFamilyProbeInterfaces returns the host interface table, reusing one
+// enumeration per TTL. The mutex also serializes concurrent probes, so a burst
+// of transports and spaces cannot each start its own GetAdaptersAddresses walk.
+func controlFamilyProbeInterfaces() ([]controlFamilyInterface, error) {
+	controlFamilyProbeSource.mu.Lock()
+	generation := controlFamilyProbeSource.generation
+	enumerate := controlFamilyProbeSource.interfaces
+	controlFamilyProbeSource.mu.Unlock()
+
+	controlFamilyProbeCache.mu.Lock()
+	defer controlFamilyProbeCache.mu.Unlock()
+	if controlFamilyProbeCache.valid &&
+		controlFamilyProbeCache.generation == generation &&
+		time.Since(controlFamilyProbeCache.at) < controlFamilyProbeCacheTTL {
+		return controlFamilyProbeCache.interfaces, controlFamilyProbeCache.err
+	}
+	interfaces, err := enumerate()
+	// Store under the generation read before the walk. A NetworkChanged or a
+	// seam swap that lands during the walk bumps the generation, so this
+	// result is not reused for the state it did not observe.
+	controlFamilyProbeCache.valid = true
+	controlFamilyProbeCache.generation = generation
+	controlFamilyProbeCache.at = time.Now()
+	controlFamilyProbeCache.interfaces = interfaces
+	controlFamilyProbeCache.err = err
+	return interfaces, err
+}
+
+// controlFamilyProbeCacheInvalidate drops the cached table. A network change
+// is exactly the event that can add or remove a usable family, so the next
+// probe must read the host again.
+func controlFamilyProbeCacheInvalidate() {
+	controlFamilyProbeCache.mu.Lock()
+	defer controlFamilyProbeCache.mu.Unlock()
+	controlFamilyProbeCache.valid = false
+	controlFamilyProbeCache.interfaces = nil
+	controlFamilyProbeCache.err = nil
 }
 
 // controlFamilyTunnelInterfacePrefixes are the interface names a tunnel takes
@@ -492,11 +553,7 @@ var controlFamilyReservedPrefixes = []*net.IPNet{
 // demotion costs a user a slow path; a wrongly permitted one costs them the
 // whole control plane.
 func probeFamilySupport(family int) bool {
-	controlFamilyProbeSource.mu.Lock()
-	enumerate := controlFamilyProbeSource.interfaces
-	controlFamilyProbeSource.mu.Unlock()
-
-	ifaces, err := enumerate()
+	ifaces, err := controlFamilyProbeInterfaces()
 	if err != nil {
 		return false
 	}
@@ -735,13 +792,17 @@ func swapControlFamilyInterfaces(
 	interfaces func() ([]controlFamilyInterface, error),
 ) func() {
 	controlFamilyProbeSource.mu.Lock()
-	defer controlFamilyProbeSource.mu.Unlock()
 	prev := controlFamilyProbeSource.interfaces
 	controlFamilyProbeSource.interfaces = interfaces
+	controlFamilyProbeSource.generation += 1
+	controlFamilyProbeSource.mu.Unlock()
+	controlFamilyProbeCacheInvalidate()
 	return func() {
 		controlFamilyProbeSource.mu.Lock()
-		defer controlFamilyProbeSource.mu.Unlock()
 		controlFamilyProbeSource.interfaces = prev
+		controlFamilyProbeSource.generation += 1
+		controlFamilyProbeSource.mu.Unlock()
+		controlFamilyProbeCacheInvalidate()
 	}
 }
 

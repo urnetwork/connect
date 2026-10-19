@@ -337,6 +337,70 @@ func TestProbeFamilySupportFailsClosedOnEnumerationError(t *testing.T) {
 	}
 }
 
+// The probe is consulted twice for every HTTP dial expansion and once per
+// extender candidate sample. Enumerating the host interface table each time is
+// a syscall walk (GetAdaptersAddresses per interface on Windows), which made a
+// fleet of provider spaces burn whole cores while idle (connect#211). One
+// enumeration must serve a burst of probes.
+func TestProbeFamilySupportCachesTheInterfaceTable(t *testing.T) {
+	enumerations := 0
+	restore := swapControlFamilyInterfaces(func() ([]controlFamilyInterface, error) {
+		enumerations++
+		return []controlFamilyInterface{
+			{
+				name:  "en0",
+				flags: net.FlagUp,
+				addrs: []net.Addr{ipNet("198.18.7.20/24"), ipNet("3fff:db8::1/64")},
+			},
+		}, nil
+	})
+	defer restore()
+	controlFamilyProbeCacheInvalidate()
+
+	for i := 0; i < 10; i += 1 {
+		if !probeFamilySupport(4) || !probeFamilySupport(6) || !FamilySupported(4) {
+			t.Fatal("the cached table did not report both families")
+		}
+	}
+	if enumerations != 1 {
+		t.Fatalf("interface table enumerated %d times, expected one cached read", enumerations)
+	}
+}
+
+// A path change is the event that can add or remove a usable family, so the
+// next probe must not answer from the table of the path that went away.
+func TestProbeFamilySupportCacheInvalidatesOnNetworkChange(t *testing.T) {
+	var ifaces []controlFamilyInterface
+	restore := swapControlFamilyInterfaces(func() ([]controlFamilyInterface, error) {
+		return ifaces, nil
+	})
+	defer restore()
+	controlFamilyProbeCacheInvalidate()
+
+	iface := controlFamilyInterface{
+		name:  "en0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("198.18.7.20/24")},
+	}
+	ifaces = []controlFamilyInterface{iface}
+	if !FamilySupported(4) {
+		t.Fatal("a host with a usable ipv4 address reported none")
+	}
+
+	ifaces = []controlFamilyInterface{{
+		name:  "en0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("3fff:db8::1/64")},
+	}}
+	NetworkChanged()
+	if FamilySupported(4) {
+		t.Fatal("the probe reused the interface table of the previous path")
+	}
+	if !FamilySupported(6) {
+		t.Fatal("the probe did not read the interface table of the new path")
+	}
+}
+
 // FamilySupported is the exported probe the extender activation reads (G3).
 // It answers from the same interface table the probe does -- loopback alone is
 // not connectivity -- and refuses anything that is not an ip version.
@@ -849,4 +913,34 @@ func TestALiveDemotionIsRevalidatedAgainstTheOtherFamily(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The cost the cache removes, measured on the host that profiles it: one
+// enumeration per probe against one per TTL. On a provider fleet the probe is
+// reached twice per HTTP dial expansion for every space, so this is multiplied
+// by the spaces and the dial rate (connect#211).
+func benchmarkProbeFamilySupport(b *testing.B, cached bool) {
+	b.Helper()
+	previous := controlFamilyProbeSource.interfaces
+	controlFamilyProbeSource.interfaces = hostControlFamilyInterfaces
+	controlFamilyProbeCacheInvalidate()
+	b.Cleanup(func() {
+		controlFamilyProbeSource.interfaces = previous
+		controlFamilyProbeCacheInvalidate()
+	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i += 1 {
+		if !cached {
+			controlFamilyProbeCacheInvalidate()
+		}
+		probeFamilySupport(4)
+	}
+}
+
+func BenchmarkProbeFamilySupportCached(b *testing.B) {
+	benchmarkProbeFamilySupport(b, true)
+}
+
+func BenchmarkProbeFamilySupportUncached(b *testing.B) {
+	benchmarkProbeFamilySupport(b, false)
 }
