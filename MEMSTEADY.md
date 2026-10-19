@@ -4767,3 +4767,60 @@ that harness repair passed focused and adjacent checks, including 483 backend
 race roots. It changes neither memory budgets nor packet queue capacities.
 See the [measurement ledger](../tests/PERFVAR-MEASUREMENTS.md) and
 `PACKETFLOW-REGRESSION.md`; all failed attempts remain retained.
+
+### 2026-10-19: caller-buffer retention behind closed TCP endpoints
+
+The unchanged host `TestDeviceLocalLoadStability` exceeded its existing
+6-MiB warm-heap growth band in the full SDK race process. An isolated normal
+diagnostic did not reproduce it; a matching-race diagnostic did: warm
+iterations 2–6 grew by 8,243,416 B (7.86 MiB), while dangling endpoints grew
+from 7 to 65, all in `FIN_WAIT_2`, with none in `TIME_WAIT`.
+
+The retained chain was
+`Endpoint.limRdr.R -> bytes.Reader -> caller backing array`.
+Although the write path copied payload bytes into owned packet buffers, its
+reusable `io.LimitedReader` kept the exhausted reader and the caller's entire
+128-KiB allocation reachable while the endpoint remained alive. The 58 extra
+warm-region endpoints correspond to 7,602,176 B (7.25 MiB) of such arrays:
+a quantitative fit, not a complete allocation attribution.
+
+The narrow gVisor correction clears only `io.LimitedReader.R` on return from
+`Buffer.WriteFromReaderAndLimitedReader`, preserving limiter reuse, its
+remaining count, copied bytes and original errors. TCP close/FIN/reset
+semantics, orphan timers, GC policy, pool/queue capacities, device budgets,
+test workloads, deadlines and memory bands are unchanged.
+
+After a fixture-only list-API correction, old production failed five
+retained-reference roots while the uncached-reader control passed. With the
+correction, all six roots passed in three fresh normal and three fresh race
+processes. They cover chunked limiter reuse, partial copies/errors, zero-read
+cleanup, the uncached path, and actual `Endpoint.Write` through copied-packet
+verification, acknowledged-data release and synchronous `FIN_WAIT_2`.
+Joined teardown removes the dangling endpoint without shortening its timer.
+The unchanged SDK load root also passed three fresh normal and three fresh
+race processes, with zero skips and completed ownership/source guards.
+
+One matched post-fix race diagnostic passed the unchanged band: warm heap
+spread fell to 567,664 B (0.54 MiB), while iteration-6 `FIN_WAIT_2` endpoints
+remained at 61 rather than 65. Pool capacity stayed 2,091,520 B; warm-region
+retained pool bytes were 417,280–453,632 B after versus 370,944–414,464 B before.
+Both attempts ended with zero dangling endpoints and zero outstanding packet
+ownership. This source-consistent differential strongly supports releasing
+the stale reader reference, not changing TCP lifetime or shrinking pools.
+It does not reconstruct every allocation in the original full-process
+failure or assign its remaining post-teardown heap.
+
+These are host live-heap measurements at the test's existing collection and
+settling boundaries, not physical-device all-phase Go-runtime peaks,
+300-second quiet-window qualification, throughput or native footprint.
+Both affected gVisor packages passed their full normal and race runs; full SDK
+and three-lane campaign qualification remain pending.
+Complete 32-MiB iOS-surrogate and 64-MiB Android MEMSTEADY/PERFVAR coverage is
+still required; Android/host results cannot prove native iOS lifetime
+`phys_footprint <50 MiB`. No physical/performance baseline is promoted, and
+all failed attempts remain retained.
+
+A separate short-EOF zero-progress issue in the copy helper has an untested
+private candidate, excluded from this repair. Current transport callers
+request no more than their payloader's declared remaining length; no ordinary
+production trigger or connection to this heap incident is established.
