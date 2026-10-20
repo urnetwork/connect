@@ -220,6 +220,8 @@ func newHeldHeadContractProof(t *testing.T, receiver *Client, original *protocol
 // A full shared budget still admits proof repair: it consumes the incoming
 // proof synchronously, rather than retaining a second wire/decoded owner.
 func TestReceiveHeldHeadContractProofPreservesOwner(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	for _, exact := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			assertMessagePoolOwnership(t)
@@ -298,6 +300,8 @@ func receiveHeldHeadContractControl(t *testing.T, sequence *ReceiveSequence, pac
 // Signed-but-expired/wrong-path proofs have no more authority than a bad
 // signature. Identity collisions must not upgrade a different retained Pack.
 func TestReceiveHeldHeadContractRejectsUntrustedPromotion(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	for _, kind := range []string{"signature", "expired", "source", "destination", "message", "sequence", "ahead"} {
 		synctest.Test(t, func(t *testing.T) {
 			assertMessagePoolOwnership(t)
@@ -379,6 +383,8 @@ func TestReceiveHeldHeadContractRejectsUntrustedPromotion(t *testing.T) {
 // Missing compact authority is a proof request, never an acknowledgement of
 // the held payload. The same sender-generated full head completes recovery.
 func TestReceiveHeldHeadContractUnknownCompactKeepsCustody(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		budget := NewTransferMemoryBudget(kib(64))
@@ -421,6 +427,8 @@ func TestReceiveHeldHeadContractUnknownCompactKeepsCustody(t *testing.T) {
 // Proof repair cannot bypass an already-closed downstream admission ledger.
 // Refusal leaves both the retained payload and uninstalled proof unchanged.
 func TestReceiveHeldHeadContractRefusedAdmissionKeepsState(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		budget := NewTransferMemoryBudget(kib(64))
@@ -445,6 +453,8 @@ func TestReceiveHeldHeadContractRefusedAdmissionKeepsState(t *testing.T) {
 // The held wire may carry a complete old proof. A verified incoming proof
 // must not be undone by replaying that old metadata during the ordered drain.
 func TestReceiveHeldHeadContractOldProofDoesNotReplay(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	for _, legacy := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			assertMessagePoolOwnership(t)
@@ -500,6 +510,8 @@ func TestReceiveHeldHeadContractOldProofDoesNotReplay(t *testing.T) {
 // Match the established direct compact-head rule: resolve its explicit id
 // through the verified map, without replacing a different current contract.
 func TestReceiveHeldHeadContractKnownCompactUsesExactAuthority(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		budget := NewTransferMemoryBudget(kib(64))
@@ -541,6 +553,8 @@ func TestReceiveHeldHeadContractKnownCompactUsesExactAuthority(t *testing.T) {
 // No-contract peers still promote a metadata-free held owner. A successful
 // nil-proof registration is not a promise that receiveContract is non-nil.
 func TestReceiveHeldHeadContractNoContractPromotion(t *testing.T) {
+	// The pool statistics worker belongs to the process, outside virtual time.
+	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
 		fixture := newWindowRoundFixture(t, nil, nil)

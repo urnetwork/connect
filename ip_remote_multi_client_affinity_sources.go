@@ -1,5 +1,5 @@
-// An admitted TCP group keeps its exact authenticated source unsafe for tuple
-// replacement until cumulative completion or proven pre-materialization refusal.
+// An admitted TCP group retains exact source custody through public return and
+// terminal completion. Prior participation does not exclude a new race candidate.
 package connect
 
 import "time"
@@ -33,7 +33,6 @@ type multiClientAffinitySource struct {
 	pending   uint32
 	ambiguous bool
 	seen      bool
-	forbidden bool
 }
 
 // Inline storage covers the steady one-provider path. Spill exists only when
@@ -79,7 +78,7 @@ func (self *multiClientAffinitySources) enrollWithLock(key multiClientAffinitySo
 	for index := 0; index <= len(self.spill); index++ {
 		entry := self.entryWithLock(index)
 		if entry.key == key {
-			if entry.forbidden || entry.pending == ^uint32(0) {
+			if entry.pending == ^uint32(0) {
 				return 0
 			}
 			if entry.pending == 0 {
@@ -165,63 +164,6 @@ func (self *multiClientChannelUpdate) affinitySourceFenced(client *multiClientCh
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.affinitySources.closed && self.affinitySources.fencedWithLock(key)
-}
-
-// Even a cumulatively completed outbound control can have an old return packet
-// in flight. A renewed tuple excludes every previous admission identity until
-// a separate provider/return-generation fence is proven. Only scalar keys copy;
-// the predecessor, its mutable ledger and its pending packet graph do not.
-func (self *multiClientAffinitySources) inheritForRenewalWithLock(previous *multiClientAffinitySources) {
-	self.renewal = true
-	for index := 0; index <= len(previous.spill); index++ {
-		entry := previous.entryWithLock(index)
-		if entry.key == (multiClientAffinitySourceKey{}) || !entry.seen && entry.pending == 0 && !entry.forbidden {
-			continue
-		}
-		registration := self.enrollWithLock(entry.key)
-		if registration == 0 {
-			panic("bounded affinity lineage exceeded its source capacity")
-		}
-		next := self.entryWithLock(int(registration&0xff) - 1)
-		next.pending, next.seen, next.forbidden = 0, true, true
-		next.ambiguous = entry.ambiguous || entry.pending != 0
-	}
-}
-
-// The renewal bit is immutable after publication. Ordinary established flows
-// keep their existing receive path; only renewed tuples consult the scalar set.
-func (self *multiClientChannelUpdate) allowsAffinitySource(client *multiClientChannel) bool {
-	if !self.affinitySources.renewal {
-		return true
-	}
-	key, valid := client.affinitySourceKey()
-	if !valid {
-		return false
-	}
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	for index := 0; index <= len(self.affinitySources.spill); index++ {
-		entry := self.affinitySources.entryWithLock(index)
-		if entry.key == key {
-			return !entry.forbidden
-		}
-	}
-	return true
-}
-
-// Candidate lists are snapshots owned by their caller. Filtering preserves
-// order and never changes a shared window slice or health/lifetime policy.
-func (self *multiClientChannelUpdate) filterAffinityRenewalSources(clients []*multiClientChannel) []*multiClientChannel {
-	if !self.affinitySources.renewal {
-		return clients
-	}
-	filtered := make([]*multiClientChannel, 0, len(clients))
-	for _, client := range clients {
-		if self.allowsAffinitySource(client) {
-			filtered = append(filtered, client)
-		}
-	}
-	return filtered
 }
 
 // Borrows one generated control. Its read-only share uses the same tracked

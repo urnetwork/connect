@@ -27,9 +27,13 @@ func dialFailureTestParent(t *testing.T, rerace bool, egressIpPath *IpPath) (
 
 	settings := DefaultMultiClientSettings()
 	settings.DialFailureRerace = rerace
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
 
 	captured := &[]*receivePacket{}
 	parent = &RemoteUserNatMultiClient{
+		ctx:                ctx,
+		cancel:             cancel,
 		settings:           settings,
 		ip4PathUpdates:     map[Ip4Path]*multiClientChannelUpdate{},
 		ip6PathUpdates:     map[Ip6Path]*multiClientChannelUpdate{},
@@ -45,8 +49,9 @@ func dialFailureTestParent(t *testing.T, rerace bool, egressIpPath *IpPath) (
 		})
 	})
 
-	sourceClient = &multiClientChannel{settings: settings}
-	update = &multiClientChannelUpdate{ipPath: egressIpPath}
+	sourceClient = &multiClientChannel{ctx: ctx, settings: settings}
+	update = newMultiClientChannelUpdate(ctx, egressIpPath)
+	t.Cleanup(update.Close)
 	update.client.Store(sourceClient)
 
 	switch egressIpPath.Version {
@@ -188,6 +193,9 @@ func TestDialFailureReraceOffForwards(t *testing.T) {
 
 		parent.clientDialFailureSignal(client, &signalPath)
 
+		if len(parent.affinityDeliveries) != 0 || update.affinityDelivery.Load() != 0 {
+			t.Errorf("%s: forwarding retained an application delivery lease", label)
+		}
 		if update.client.Load() != client {
 			t.Errorf("%s: rerace off must not unbind the flow", label)
 		}

@@ -64,7 +64,7 @@ func (self *RemoteUserNatMultiClient) affinityUpdateWithLock(path *IpPath) *mult
 	}
 }
 
-// Called before any fresh-source offer. Map retirement and later send lookups
+// Called before any renewal offer. Map retirement and later send lookups
 // honor this exact reservation until every candidate's public offer returns.
 // The caller must finish it on every path; no receive callback waits for it.
 func (self *RemoteUserNatMultiClient) reserveAffinityTransition(
@@ -84,7 +84,9 @@ func (self *RemoteUserNatMultiClient) reserveAffinityTransition(
 	previous.stateLock.Lock()
 	previous.affinitySources.closed = true
 	next := newMultiClientChannelUpdate(self.ctx, path)
-	next.affinitySources.inheritForRenewalWithLock(&previous.affinitySources)
+	// Renewal starts an ordinary race, including previous healthy candidates.
+	// Keep first-answer SYN authority without inheriting historical source bans.
+	next.affinitySources.renewal = true
 	previous.stateLock.Unlock()
 	next.pinned, next.pinAppId = pin.pinned(), pin.appId
 	transition := &multiClientAffinityTransition{

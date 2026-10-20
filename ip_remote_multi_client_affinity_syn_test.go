@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// The first public SYN selects an actual source; a later race also sees one
-// distinct authenticated source. No sendClientPath or Transfer-send seam remains.
+// The first candidate enumeration offers one source; later enumerations offer
+// both. Individual roots override this policy when a fixed topology is needed.
 type affinitySynQueueFixture struct {
 	first  *groupDispositionQueueFixture
 	second *groupDispositionQueueFixture
@@ -88,12 +88,22 @@ func (self *affinitySynQueueFixture) receive(t *testing.T, client *multiClientCh
 		TransportTypeUnknown, path, packet)
 }
 
+// Custody-focused roots explicitly choose their available candidate set. The
+// ordinary-race roots separately prove that a previous healthy client may win.
+func (self *affinitySynQueueFixture) raceOnly(clients ...*multiClientChannel) {
+	self.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
+		self.races++
+		return clients
+	}
+}
+
 func testAffinityRenewalPublicBoundary(t *testing.T, version int, age time.Duration, cap time.Duration, sameIsn bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		f := newAffinitySynQueueFixture(t, version, nil)
 		old := f.initial(t)
+		f.raceOnly(f.first.selected)
 		settings := ReliabilitySettingsFrom(f.parent.settings)
 		settings.AffinityMaxTime = cap
 		f.parent.SetReliabilitySettings(settings)
@@ -107,11 +117,10 @@ func testAffinityRenewalPublicBoundary(t *testing.T, version int, age time.Durat
 		renew := cap <= 0 || age >= cap
 		current := f.parent.receiveUpdate(f.path)
 		if renew {
-			if accepted != 1 || current == old || !old.IsDone() || current.client.Load() != f.second.selected || f.races != 2 {
-				t.Fatalf("v%d age=%v cap=%v sameISN=%v did not admit the distinct-source renewal", version, age, cap, sameIsn)
+			if accepted != 1 || current == old || !old.IsDone() || current.client.Load() != f.first.selected || f.races != 2 {
+				t.Fatalf("v%d age=%v cap=%v sameISN=%v did not admit an ordinary new race", version, age, cap, sameIsn)
 			}
-			f.second.unpark()
-			f.second.acknowledgeAll(template)
+			f.first.acknowledgeAll(template)
 		} else {
 			if current != old || old.IsDone() || current.client.Load() != f.first.selected || f.races != 1 {
 				t.Fatal("young healthy binding did not retain its actual provider")
@@ -186,6 +195,9 @@ func TestAffinityRenewalPublicUnhealthySynRaces(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			f := newAffinitySynQueueFixture(t, 4, nil)
 			old := f.initial(t)
+			// The ordinary healthy offer contains only the second provider;
+			// no historical-source exclusion is used to enforce this premise.
+			f.raceOnly(f.second.selected)
 			client := f.first.selected
 			client.stateLock.Lock()
 			switch state {
@@ -206,7 +218,7 @@ func TestAffinityRenewalPublicUnhealthySynRaces(t *testing.T) {
 			}
 			template := reraceTcpPacket(f.path, tcpFlagSyn, 1000, 0, nil)
 			if f.first.offer(template) != 1 {
-				t.Fatalf("%s bound SYN did not reach the distinct-source race", state)
+				t.Fatalf("%s bound SYN did not reach the healthy offered race", state)
 			}
 			current := f.parent.receiveUpdate(f.path)
 			if current == old || current.client.Load() != f.second.selected || !old.IsDone() {
@@ -225,6 +237,7 @@ func TestAffinityRenewalPublicRefusalKeepsOldOwnerAndRetries(t *testing.T) {
 			settings.SendBufferSettings.SequenceBufferSize = 0
 		})
 		old := f.initial(t)
+		f.raceOnly(f.second.selected)
 		time.Sleep(time.Minute)
 		template := reraceTcpPacket(f.path, tcpFlagSyn, 2000, 0, nil)
 		packet := MessagePoolCopy(template)
@@ -269,6 +282,7 @@ func TestAffinityRenewalPublicDequeueCommitsBeforeProducerReturn(t *testing.T) {
 		})
 		t.Cleanup(resume)
 		old := f.initial(t)
+		f.raceOnly(f.second.selected)
 		time.Sleep(time.Minute)
 		template := reraceTcpPacket(f.path, tcpFlagSyn, 2000, 0, nil)
 		result := make(chan int, 1)
@@ -314,6 +328,7 @@ func TestAffinityRenewalPublicFastOpenAndOldSourceIngress(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newAffinitySynQueueFixture(t, 6, nil)
 		old := f.initial(t)
+		f.raceOnly(f.second.selected)
 		time.Sleep(time.Minute)
 		template := reraceTcpPacket(f.path, tcpFlagSyn, 0xfffffffe, 0, []byte{1, 2, 3})
 		if f.first.offer(template) != 1 {
@@ -327,11 +342,11 @@ func TestAffinityRenewalPublicFastOpenAndOldSourceIngress(t *testing.T) {
 		for _, ack := range []uint32{0xfffffffe, 3} {
 			f.receive(t, f.second.selected, tcpFlagSyn|tcpFlagAck, 9000, ack)
 		}
-		// The old source is forbidden even if its stale control happens to
-		// carry the new generation's sequence/ack numbers exactly.
+		// The first provider is not a candidate of this particular race.
+		// Correct sequence numbers do not confer candidate ownership.
 		f.receive(t, f.first.selected, tcpFlagRst|tcpFlagAck, 9001, 2)
 		if delivered != 0 || current.receivedInbound.Load() || current.IsDone() {
-			t.Fatal("out-of-range or prior-source ingress established/closed the renewed generation")
+			t.Fatal("out-of-range or noncandidate ingress established/closed the renewed generation")
 		}
 		f.receive(t, f.second.selected, tcpFlagSyn|tcpFlagAck, 9000, 2)
 		if delivered != 1 || !current.receivedInbound.Load() || current == old || !old.IsDone() {
@@ -339,7 +354,7 @@ func TestAffinityRenewalPublicFastOpenAndOldSourceIngress(t *testing.T) {
 		}
 		f.receive(t, f.first.selected, tcpFlagRst|tcpFlagAck, 9001, 2)
 		if delivered != 1 || current.IsDone() {
-			t.Fatal("late old-generation reset crossed the established fresh-source boundary")
+			t.Fatal("nonselected provider reset crossed the established winner boundary")
 		}
 	})
 }
@@ -349,6 +364,7 @@ func TestAffinityRenewalPublicActiveCallbackRefusesThenRetries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newAffinitySynQueueFixture(t, 4, nil)
 		old := f.initial(t)
+		f.raceOnly(f.second.selected)
 		f.receive(t, f.first.selected, tcpFlagSyn|tcpFlagAck, 9000, 1001)
 		time.Sleep(time.Minute)
 		entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -401,7 +417,7 @@ func TestAffinityRenewalPublicActiveCallbackRefusesThenRetries(t *testing.T) {
 		f.second.unpark()
 		f.second.acknowledgeAll(template)
 		if current := f.parent.receiveUpdate(f.path); current == old || current.client.Load() != f.second.selected || !old.IsDone() {
-			t.Fatal("retry failed to publish its one fresh-source generation")
+			t.Fatal("retry failed to publish its one admitted generation")
 		}
 	})
 }
@@ -411,10 +427,11 @@ func TestAffinityRenewalPublicRefusedFastOpenRetryCannotExpandIngress(t *testing
 	synctest.Test(t, func(t *testing.T) {
 		f := newAffinitySynQueueFixture(t, 6, nil)
 		f.initial(t)
+		f.raceOnly(f.second.selected)
 		time.Sleep(time.Minute)
 		template := reraceTcpPacket(f.path, tcpFlagSyn, 2000, 0, []byte{1})
 		if f.first.offer(template) != 1 {
-			t.Fatal("initial fresh-source TFO was not admitted")
+			t.Fatal("initial renewed TFO was not admitted")
 		}
 		f.second.unpark()
 		f.second.acknowledgeAll(template)

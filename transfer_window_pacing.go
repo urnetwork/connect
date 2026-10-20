@@ -1010,6 +1010,7 @@ type windowServiceSupply struct {
 	headFirstAtNanos   int64
 	headLastMinAtNanos int64
 	headMaximumAtNanos int64
+	headMaximumGap     time.Duration
 	recorded           bool
 	complete           bool
 	rawClock           bool
@@ -1083,6 +1084,20 @@ func (self *windowServiceCoverage) merge(other windowServiceCoverage) {
 	self.supply.minimumPath = max(self.supply.minimumPath, other.supply.minimumPath)
 	self.supply.rawClock = self.supply.rawClock && other.supply.rawClock
 	self.supply.headComplete = self.supply.headComplete && other.supply.headComplete
+	// Preserve gaps between exact heads in their own clock. An expanded
+	// head denominator can contain many continuous checkpoints; its whole
+	// extent is not one gap. Overlapping arrival summaries cannot reconstruct
+	// interior order, so retain their full head extent conservatively.
+	headGap := int64(0)
+	if self.lastAtNanos < other.firstAtNanos {
+		headGap = max(int64(0), other.supply.headFirstAtNanos-self.supply.headLastMinAtNanos)
+	} else if other.lastAtNanos < self.firstAtNanos {
+		headGap = max(int64(0), self.supply.headFirstAtNanos-other.supply.headLastMinAtNanos)
+	} else {
+		headGap = max(self.supply.headMaximumAtNanos, other.supply.headMaximumAtNanos) -
+			min(self.supply.headFirstAtNanos, other.supply.headFirstAtNanos)
+	}
+	self.supply.headMaximumGap = max(self.supply.headMaximumGap, other.supply.headMaximumGap, time.Duration(headGap))
 	self.supply.headMaximumAtNanos = max(self.supply.headMaximumAtNanos, other.supply.headMaximumAtNanos)
 	gap := max(int64(0), other.firstAtNanos-self.lastAtNanos, self.firstAtNanos-other.lastAtNanos)
 	self.supply.maximumGap = max(self.supply.maximumGap, other.supply.maximumGap, time.Duration(gap))
@@ -1190,12 +1205,13 @@ func (self windowServiceSupply) qualifiedSpan(span, receiverStart, headStart int
 		if self.headMaximumAtNanos <= headStart {
 			return 0
 		}
-		// Raw ACK continuity cannot cover extra receiver-head time. When
-		// byte retiming is incomplete, only the full head range bounds that
-		// unknown gap; independent preoffering or own-tail queue still qualifies.
+		// Raw ACK continuity cannot cover extra receiver-head time. Use the
+		// actual head-clock gaps, including the excluded left checkpoint,
+		// rather than treating a continuous train's entire extent as idle.
 		headSpan := self.headMaximumAtNanos - headStart
 		if !receiverTimed && headSpan > span {
-			self.maximumGap = max(self.maximumGap, time.Duration(headSpan))
+			self.maximumGap = max(self.maximumGap, self.headMaximumGap,
+				time.Duration(self.headFirstAtNanos-headStart))
 		}
 		span = max(span, self.headMaximumAtNanos-headStart)
 		receiverStart = headStart
@@ -1668,6 +1684,8 @@ func (self *windowPacingService) observeAckSampleWithLock(credit windowServiceAc
 		self.feedbackCycleHeadAtNanos = min(self.feedbackCycleHeadAtNanos, ackSample.supply.headLastMinAtNanos)
 		for _, cycle := range []*windowServiceSample{&self.feedbackCycle, &self.feedbackComplete} {
 			if cycle.firstAtNanos == at.UnixNano() && cycle.firstBytes == 0 {
+				cycle.supply.headMaximumGap = max(cycle.supply.headMaximumGap,
+					time.Duration(cycle.supply.headFirstAtNanos-self.feedbackCycleHeadAtNanos))
 				cycle.supply.headFirstAtNanos = self.feedbackCycleHeadAtNanos
 				cycle.supply.headComplete = cycle.supply.headComplete && self.feedbackCycleHeadAtNanos > 0
 			}
@@ -1739,6 +1757,8 @@ func (self *windowPacingService) completeFeedbackCycleWithLock() {
 		cycle.supply.maximumGap = max(cycle.supply.maximumGap, time.Duration(cycle.firstAtNanos-self.feedbackCycleBefore.UnixNano()))
 		cycle.receiverBytes = 0
 		cycle.firstAtNanos, cycle.firstBytes = self.feedbackCycleBefore.UnixNano(), 0
+		cycle.supply.headMaximumGap = max(cycle.supply.headMaximumGap,
+			time.Duration(cycle.supply.headFirstAtNanos-self.feedbackCycleHeadAtNanos))
 		cycle.supply.headFirstAtNanos = self.feedbackCycleHeadAtNanos
 		cycle.supply.headComplete = cycle.supply.headComplete && self.feedbackCycleHeadAtNanos > 0
 	}

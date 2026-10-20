@@ -15,6 +15,7 @@ type multiClientAffinityDeliveryOwner struct {
 
 // A stack-owned lease is released even when the application callback panics.
 // The key owns address values, never slices of borrowed packet storage.
+// A nil parent denotes no ownership; non-TCP delivery needs no lease.
 type multiClientAffinityDeliveryLease struct {
 	parent *RemoteUserNatMultiClient
 	update *multiClientChannelUpdate

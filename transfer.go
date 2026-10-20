@@ -10838,15 +10838,15 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		self.sendBufferSettings.beforeGroupRetainForTest()
 	}
 	admissionErr := item.acks.commitPreparedHandoffs(func() error {
+		if err := self.ctx.Err(); err != nil {
+			return err
+		}
 		if !ack || !self.resendQueue.lifetimeBudget {
 			return nil
 		}
 		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(sendFrames), len(sendFrames))
 		if aheadContract != nil {
 			frameByteCount = addReceiveQueueByteCount(frameByteCount, ByteCount(proto.Size(aheadContract.contract)))
-		}
-		if err := self.ctx.Err(); err != nil {
-			return err
 		}
 		if !item.reservePreparedMemory(self.resendQueue.budget,
 			addReceiveQueueByteCount(groupMemoryBytes,
