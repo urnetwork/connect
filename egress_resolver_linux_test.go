@@ -204,3 +204,19 @@ func TestFreshSystemResolverAddressKeepsSelectionWhenConfigIsUnavailable(t *test
 		t.Fatalf("resolver address = %q, want unchanged %q", got, selected)
 	}
 }
+
+// A host network change drops the discovered server list: it is keyed by
+// interface index, which a switch between networks on one interface keeps.
+func TestNetworkChangedForgetsEgressDnsServers(t *testing.T) {
+	egressDnsServerCache.Store(&egressDnsServerList{
+		servers: []string{"192.0.2.53"},
+		expires: time.Now().Add(time.Minute),
+	})
+	t.Cleanup(func() {
+		egressDnsServerCache.Store(nil)
+	})
+	NetworkChanged()
+	if egressDnsServerCache.Load() != nil {
+		t.Fatal("a network change kept the previous network's resolvers")
+	}
+}

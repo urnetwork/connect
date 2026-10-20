@@ -309,7 +309,7 @@ func (self *PlatformTransport) clientLimitHold() (ClientLimitStatus, chan struct
 // cancelling handleCtx alone cannot wake. Returns when the connection ends.
 func (self *PlatformTransport) runConnectionWatch(
 	handleCtx context.Context,
-	kick chan struct{},
+	kick <-chan struct{},
 	closeConnection func(reason string),
 ) {
 	for {

@@ -564,11 +564,22 @@ func (self *PlatformTransport) authIntent() int32 {
 // pinned transport uses only its own backoff and never touches the strategy's
 // pacing state, even though it owns its strategy: the intent is that a family
 // that never connects paces nobody but itself.
-func (self *PlatformTransport) nextDialTime(hadConnection bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
+//
+// afterKick is a re-dial a network change asked for. A kick re-dials every
+// transport on the strategy at once -- one per window exit, plus the
+// provider's -- so the fast path's cap would push the exits past the fourth
+// onto the staircase behind each other for seconds. That burst is bounded by
+// the transports themselves, so it takes the fast path's jitter on its own,
+// larger cap (KickReconnectLimit).
+func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
 	releaseReconnect = func() {}
 	cancelConnect = func() {}
 	if self.pinned() {
 		return time.Now().Add(self.pinnedBackoff.delay()), releaseReconnect, cancelConnect
+	}
+	if afterKick {
+		connectTime, releaseReconnect = self.clientStrategy.NextKickReconnectTime()
+		return connectTime, releaseReconnect, cancelConnect
 	}
 	if hadConnection {
 		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()

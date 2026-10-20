@@ -20,3 +20,6 @@ import "net"
 func egressResolver() *net.Resolver {
 	return nil
 }
+
+// forgetEgressDnsServers has no discovered server list to drop here.
+func forgetEgressDnsServers() {}

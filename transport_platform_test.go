@@ -910,11 +910,10 @@ func TestKickSkipsDialFailureBackoff(t *testing.T) {
 
 		platform.rejecting.Store(false)
 		connectedCount := connections.Value().connected
-		// kick periodically rather than once: a kick that lands while the failing
-		// dial is still in flight is deliberately dropped (the backoff select arms
-		// a fresh notify channel), and re-kicking is exactly what a host emitting
-		// repeated path updates does. every wait here is still far below the 60s
-		// backoff the kick must beat.
+		// kick periodically rather than once, as a host emitting repeated path
+		// updates does: each kick either breaks the backoff or cancels the
+		// re-dial in flight and starts another (TestKickCancelsInFlightDial).
+		// every wait here is still far below the 60s backoff the kick must beat.
 		kicked := false
 		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
 			transport.Kick()

@@ -264,3 +264,19 @@ func TestEgressAdapterDnsServersWalksTheRealTable(t *testing.T) {
 		}
 	}
 }
+
+// A host network change drops the discovered server list: it is keyed by
+// interface index, which a switch between networks on one adapter keeps.
+func TestNetworkChangedForgetsEgressDnsServers(t *testing.T) {
+	egressDnsServerCache.Store(&egressDnsServerList{
+		servers: []string{"192.0.2.53"},
+		expires: time.Now().Add(time.Minute),
+	})
+	t.Cleanup(func() {
+		egressDnsServerCache.Store(nil)
+	})
+	NetworkChanged()
+	if egressDnsServerCache.Load() != nil {
+		t.Fatal("a network change kept the previous network's resolvers")
+	}
+}

@@ -63,13 +63,13 @@ func TestNextConnectTimeReconnectFastPath(t *testing.T) {
 
 	// up to the cap, reconnects are fast and independent of the staircase
 	releases := []func(){}
-	for i := range reconnectFastPathLimit {
+	for i := range settings.ReconnectFastPathLimit {
 		connectTime, release := strategy.NextReconnectTime()
 		releases = append(releases, release)
 		if !connectTime.Before(serialLast) {
 			t.Errorf("fast path call %d landed on the staircase: %s >= %s", i, connectTime, serialLast)
 		}
-		if jitter := connectTime.Sub(start); reconnectFastPathMaxDelay+100*time.Millisecond <= jitter {
+		if jitter := connectTime.Sub(start); settings.ReconnectFastPathMaxDelay+100*time.Millisecond <= jitter {
 			t.Errorf("fast path call %d jitter too large: %s", i, jitter)
 		}
 	}
@@ -95,12 +95,12 @@ func TestNextConnectTimeReconnectFastPath(t *testing.T) {
 	againRelease()
 
 	// release is idempotent: double-releasing must not free a slot twice.
-	// after this loop exactly reconnectFastPathLimit slots are free again.
+	// after this loop exactly ReconnectFastPathLimit slots are free again.
 	releases[0]()
 	for _, release := range releases[1:] {
 		release()
 	}
-	for range reconnectFastPathLimit {
+	for range settings.ReconnectFastPathLimit {
 		_, release := strategy.NextReconnectTime()
 		defer release()
 	}
@@ -213,5 +213,37 @@ func TestClientStrategyTlsSessionResumptionCache(t *testing.T) {
 	transportSettings := DefaultPlatformTransportSettings()
 	if transportSettings.QuicTlsConfig.ClientSessionCache == nil {
 		t.Error("QuicTlsConfig has no session cache: h3 re-dials cannot resume (or 0-RTT)")
+	}
+}
+
+// The fast path's cap and jitter are settings: with a cap of one, a second
+// concurrent reconnect takes the staircase instead of a slot, and with no
+// jitter the fast path and a kick re-dial both dial at once.
+func TestReconnectFastPathHonorsItsSettings(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.ReconnectFastPathLimit = 1
+	settings.ReconnectFastPathMaxDelay = 0
+	strategy := NewClientStrategy(ctx, settings)
+
+	start := time.Now()
+	first, releaseFirst := strategy.NextReconnectTime()
+	defer releaseFirst()
+	_, releaseSecond := strategy.NextReconnectTime()
+	defer releaseSecond()
+	func() {
+		strategy.mutex.Lock()
+		defer strategy.mutex.Unlock()
+		AssertEqual(t, strategy.reconnectFastPathCount, 1)
+	}()
+	if lead := first.Sub(start); 50*time.Millisecond < lead {
+		t.Fatalf("fast path with no jitter dialed %s late", lead)
+	}
+	kick, releaseKick := strategy.NextKickReconnectTime()
+	defer releaseKick()
+	if lead := kick.Sub(start); 50*time.Millisecond < lead {
+		t.Fatalf("kick re-dial with no jitter dialed %s late", lead)
 	}
 }

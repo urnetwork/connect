@@ -195,6 +195,10 @@ func NetworkChanged() {
 	// A hard path switch also invalidates quality measurements. Keep this one
 	// canonical call so DeviceLocal does not need to emit both notifications.
 	NetworkQualityChanged()
+	// before the kicks: their re-dials start a fresh backend failure streak,
+	// and resolve through the new network's servers
+	noteBackendNetworkChanged()
+	forgetEgressDnsServers()
 	for _, listener := range networkChangeListeners.Get() {
 		HandleError(listener)
 	}
