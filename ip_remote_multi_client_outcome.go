@@ -387,6 +387,56 @@ func (self *multiClientWindow) windowRetryReset() {
 	self.errorStreak.Store(0)
 }
 
+// networkChangeNotify is the channel that ends a retry wait when the host's
+// network path changes. Fetch it before the platform call whose failure is
+// waited out, so a change that lands during the call still ends the wait. nil
+// (a bare fixture without the monitor) never fires.
+func (self *multiClientWindow) networkChangeNotify() <-chan struct{} {
+	if self.networkChangeMonitor == nil {
+		return nil
+	}
+	return self.networkChangeMonitor.NotifyChannel()
+}
+
+// waitWindowRetry waits out windowRetryDelay for a failure of `class` and
+// returns false when ctx ends first. A network change (networkChanged, from
+// networkChangeNotify) ends the wait early unless the failure was a rate
+// limit: a rate limit is the platform's answer, not the path's, so it is
+// always waited out.
+func (self *multiClientWindow) waitWindowRetry(
+	ctx context.Context,
+	class windowFailureClass,
+	networkChanged <-chan struct{},
+) bool {
+	if class == windowFailureRateLimit {
+		networkChanged = nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-networkChanged:
+		return true
+	case <-time.After(self.windowRetryDelay(class)):
+		return true
+	}
+}
+
+// notifyNetworkChanged starts the window's error backoff over and ends every
+// wait on it (waitWindowRetry): failures recorded while the path was
+// changing, or gone, say nothing about the platform over the new one, and
+// without this the first round on a working path can wait out a backoff of up
+// to WindowErrorBackoffMax grown during the outage. The rate-limit streak is
+// the platform's own and is kept. The resize loop is woken too, so a window
+// short of exits re-evaluates on the new path now. Mirrors the transport
+// layer's noteBackendNetworkChanged.
+func (self *multiClientWindow) notifyNetworkChanged() {
+	self.errorStreak.Store(0)
+	if self.networkChangeMonitor != nil {
+		self.networkChangeMonitor.NotifyAll()
+	}
+	self.resizeMonitor.NotifyAll()
+}
+
 // stallReason derives the current diagnosis.
 //
 // The cheap platform-unreachable detector runs first: installed clients whose

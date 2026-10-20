@@ -668,6 +668,9 @@ type windowPacingService struct {
 	heldPacingRate          ByteCount
 	qualityChangedAt        time.Time
 	qualityLastNotification time.Time
+	// the newest network path generation the service accepted (see
+	// networkQualityChangedOnPath)
+	qualityPathGeneration   uint64
 	qualityRoundTripPending bool
 	qualityServiceMeasured  bool
 	// Lanes whose receiver is holding their delivered bytes. Their flight is

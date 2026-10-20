@@ -4,7 +4,6 @@ package connect
 import (
 	"context"
 	"errors"
-	"time"
 )
 
 // Context-aware generators without destination persistence can also keep
@@ -31,6 +30,7 @@ func (self *multiClientWindow) fixedClientArgs(ctx context.Context, destination 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		networkChanged := self.networkChangeNotify()
 		callCtx := ctx
 		cancelCall := func() {}
 		if self.settings.WindowGeneratorTimeout > 0 {
@@ -90,10 +90,8 @@ func (self *multiClientWindow) fixedClientArgs(ctx context.Context, destination 
 		}
 		self.log.Infof("[multi]create client args error = %s\n", err)
 		class := self.recordEvaluationFailure(windowFailurePlatform, err)
-		select {
-		case <-ctx.Done():
+		if !self.waitWindowRetry(ctx, class, networkChanged) {
 			return nil, ctx.Err()
-		case <-time.After(self.windowRetryDelay(class)):
 		}
 	}
 }

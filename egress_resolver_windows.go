@@ -94,6 +94,15 @@ type egressDnsServerList struct {
 
 var egressDnsServerCache atomic.Pointer[egressDnsServerList]
 
+// forgetEgressDnsServers drops the discovered server list on a host network
+// change. The cache is keyed by interface index, which a switch between
+// networks on one adapter (another SSID, a hotspot) leaves unchanged, so it
+// would keep querying the previous network's resolvers for up to
+// egressDnsServerExpiration.
+func forgetEgressDnsServers() {
+	egressDnsServerCache.Store(nil)
+}
+
 // egressDnsServers returns the resolver IPs control queries should use while
 // the given egress interfaces are forced: the egress adapter's own configured
 // resolvers — the same servers the OS resolver would have used before the

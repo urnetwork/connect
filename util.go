@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	// "fmt"
@@ -160,6 +161,14 @@ var networkChangeListeners = NewCallbackList[func()]()
 // only enqueue their work: the host may call this from an OS listener thread.
 var networkQualityChangeListeners = NewCallbackList[func()]()
 
+// networkPathGeneration counts hard network changes (NetworkChanged). A quality
+// remeasurement coalesces notifications inside windowQualityRemeasureInterval,
+// which is right for a stream of signal hints on one path; a notification from
+// a newer path generation starts a new measurement regardless, because the path
+// the previous one measured is gone. The process has one host network, so the
+// count is process-wide; each coalescing owner records the newest it accepted.
+var networkPathGeneration atomic.Uint64
+
 // AddNetworkChangeListener registers a callback invoked by NetworkChanged. It returns an
 // unregister closure; an owner must unregister when it closes.
 func AddNetworkChangeListener(listener func()) func() {
@@ -194,7 +203,14 @@ func NetworkQualityChanged() {
 func NetworkChanged() {
 	// A hard path switch also invalidates quality measurements. Keep this one
 	// canonical call so DeviceLocal does not need to emit both notifications.
+	// The new path generation lets it through the quiet interval a quality
+	// hint just started (see networkPathGeneration).
+	networkPathGeneration.Add(1)
 	NetworkQualityChanged()
+	// before the kicks: their re-dials start a fresh backend failure streak,
+	// and resolve through the new network's servers
+	noteBackendNetworkChanged()
+	forgetEgressDnsServers()
 	for _, listener := range networkChangeListeners.Get() {
 		HandleError(listener)
 	}

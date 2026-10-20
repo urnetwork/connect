@@ -291,6 +291,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout:      20 * time.Second,
 		IpFamilyStarvedRetryTimeout: defaultIpFamilyStarvedRetryTimeout,
+		// long enough to cover an outage of a few minutes, counted from the
+		// loss, and short enough that a provider the window has not seen for
+		// longer is found again through discovery like any other
+		RecentExitMemoryTimeout: 5 * time.Minute,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -863,6 +867,13 @@ type MultiClientSettings struct {
 	// the platform for a family again after a family-filtered discovery
 	// returned nothing (IPV6.md B2). 0 uses the default of one minute.
 	IpFamilyStarvedRetryTimeout time.Duration
+	// RecentExitMemoryTimeout is how long, from the loss, a window remembers an
+	// exit it lost to an outage of ours, so the rounds that re-form the window
+	// ask the platform for that provider by client id ahead of discovery
+	// (ip_remote_multi_client_recent_exits.go). An older entry is never used.
+	// Non-positive disables the memory: lost exits are replaced by discovery
+	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
+	RecentExitMemoryTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -2678,6 +2689,7 @@ func NewRemoteUserNatMultiClient(
 		settings,
 		multiClient.reliabilitySettings,
 		multiClient.uplinkGate,
+		multiClient.uplinkLastIngress,
 		multiClient.reliabilityMetricsRef,
 		multiClient.clientFlowCount,
 		multiClient.providerQualified,
@@ -2702,6 +2714,7 @@ func NewRemoteUserNatMultiClient(
 			settings,
 			multiClient.reliabilitySettings,
 			multiClient.uplinkGate,
+			multiClient.uplinkLastIngress,
 			multiClient.reliabilityMetricsRef,
 			multiClient.clientFlowCount,
 			multiClient.providerQualified,
@@ -7875,6 +7888,18 @@ func (self *RemoteUserNatMultiClient) stampUplinkIngress() {
 	self.uplinkLastIngressNanos.Store(nowNanos)
 }
 
+// uplinkLastIngress reads the ingress stamp: when a provider-originated packet
+// last arrived anywhere in the tunnel, at most uplinkStampCoarseness older than
+// the truth. Zero when nothing has arrived yet. A lock-free read, safe from any
+// goroutine; the windows read it through uplinkLastIngressFunc.
+func (self *RemoteUserNatMultiClient) uplinkLastIngress() time.Time {
+	lastNanos := self.uplinkLastIngressNanos.Load()
+	if lastNanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, lastNanos)
+}
+
 // sendingChannelCount reports how many channels across all windows currently
 // hold outstanding sends. The gate carries zero exculpatory information when
 // only one channel is talking -- tunnel-wide silence is then indistinguishable
@@ -8186,6 +8211,13 @@ func (self *RemoteUserNatMultiClient) NotifyNetworkChanged() {
 	// exactly how a capture tells them apart
 	loggerOrDefault(self.log).Infof("%s\n", relEvent("network_change", "rebased", true, "kick", true))
 	NetworkChanged()
+	// a window short of exits -- some lost in the outage, or a tunnel that
+	// started with no network -- re-evaluates on the new path now instead of
+	// at its next WindowResizeTimeout pass, and asks the platform again now
+	// instead of at the end of a backoff grown on the old path
+	for _, window := range self.windows {
+		window.notifyNetworkChanged()
+	}
 }
 
 // reliabilityMetricsRef hands the shared counters to the window channels via
@@ -11006,6 +11038,12 @@ type multiClientWindow struct {
 	// callback convention as reliabilitySettingsFunc; nil (bare fixtures)
 	// reads as gate off.
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time)
+	// uplinkLastIngressFunc reads when the tunnel last received a packet from
+	// any provider (zero when never); see RemoteUserNatMultiClient.uplinkLastIngress.
+	// The recent-exit memory reads it with the gate to tell a verdict collected
+	// in the dark from one against the provider (classifyRecentExit). nil
+	// (bare fixtures) remembers no verdict.
+	uplinkLastIngressFunc func() time.Time
 	// reliabilityMetricsFunc hands the parent's shared counters to the
 	// channels. nil (bare fixtures) loses the counts, never the traffic --
 	// every counter method tolerates a nil receiver.
@@ -11089,6 +11127,10 @@ type multiClientWindow struct {
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+	// networkChangeMonitor ends a platform-error retry wait when the host's
+	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
+	// never wakes a wait.
+	networkChangeMonitor *Monitor
 
 	// --- window honesty (see ip_remote_multi_client_outcome.go) ---
 
@@ -11150,6 +11192,12 @@ type multiClientWindow struct {
 	// The exit a sticky window lost to transport loss, for the next discovery
 	// round to ask for first. Its own lock inside.
 	stickyRedial stickyRedial
+
+	// --- recent exits (see ip_remote_multi_client_recent_exits.go) ---
+
+	// The exits any other window lost to an outage of ours, for the rounds
+	// that re-form it to ask for first. Its own lock inside.
+	recentExits recentExitMemory
 }
 
 func newMultiClientWindow(
@@ -11167,6 +11215,7 @@ func newMultiClientWindow(
 	settings *MultiClientSettings,
 	reliabilitySettingsFunc func() *ReliabilitySettings,
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
+	uplinkLastIngressFunc func() time.Time,
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
 	providerQualifiedFunc func(MultiHopId) bool,
@@ -11191,6 +11240,7 @@ func newMultiClientWindow(
 		settings:                     settings,
 		reliabilitySettingsFunc:      reliabilitySettingsFunc,
 		uplinkGateFunc:               uplinkGateFunc,
+		uplinkLastIngressFunc:        uplinkLastIngressFunc,
 		reliabilityMetricsFunc:       reliabilityMetricsFunc,
 		flowCountFunc:                flowCountFunc,
 		providerQualifiedFunc:        providerQualifiedFunc,
@@ -11205,6 +11255,7 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
@@ -11637,18 +11688,24 @@ func (self *multiClientWindow) peerIdentityChanged() {
 
 // the performance profile will take effect at the next `resize` iteration
 func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	forgottenCount := func() int {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
-		return
-	}
-	self.performanceProfile = performanceProfile
-	// a lost exit is only wanted back under the profile it was lost in
-	self.stickyRedial.Forget()
-	if self.resizeMonitor != nil {
-		self.resizeMonitor.NotifyAll()
-	}
+		if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
+			return 0
+		}
+		self.performanceProfile = performanceProfile
+		// a lost exit is only wanted back under the profile it was lost in
+		self.stickyRedial.Forget()
+		forgottenCount := self.recentExits.Forget()
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
+		return forgottenCount
+	}()
+	// logged with no lock held
+	self.logRecentExitsForgotten(forgottenCount, "profile_change")
 }
 
 // generatorCallResult carries one generator call's result across the deadline
@@ -11764,6 +11821,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
+		// before the platform call, so a change during it ends the retry wait
+		networkChanged := self.networkChangeNotify()
 
 		// exclude healthy destinations that are already in the window
 		windowDestinations := func() map[MultiHopId]bool {
@@ -11800,10 +11859,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
 			class := self.recordEvaluationFailure(windowFailurePlatform, err)
-			select {
-			case <-self.ctx.Done():
+			if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 				return
-			case <-time.After(self.windowRetryDelay(class)):
 			}
 			continue
 		}
@@ -11870,6 +11927,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					if timeout <= 0 {
 						return
 					}
+					networkChanged := self.networkChangeNotify()
 
 					// a destination-aware generator can reuse a persisted
 					// identity for this destination (PROXYDRAIN1.md §3.5).
@@ -11907,10 +11965,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
 						class := self.recordEvaluationFailure(windowFailurePlatform, err)
-						select {
-						case <-self.ctx.Done():
+						if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 							return
-						case <-time.After(self.windowRetryDelay(class)):
 						}
 						continue
 					}
@@ -11923,6 +11979,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						MultiClientGeneratorClientArgs: *clientArgs,
 						FixedDestination:               fixedDestination,
 						stickyRedial:                   enumerated.stickyRedial,
+						recentExit:                     enumerated.recentExit,
 					}
 					select {
 					case <-self.ctx.Done():
@@ -12066,7 +12123,16 @@ func (self *multiClientWindow) resize() {
 				// a verdict against the provider: ask for the same provider
 				// first (see stickyRedial)
 				self.rememberStickyRedial(client, err, stickyExit)
+				// every other window remembers an exit lost to an outage of
+				// ours for the rounds that re-form it (see recentExitMemory).
+				// Classified before the removal, while the uplink gate still
+				// counts this exit's outstanding sends; held after it, so a
+				// round in flight never finds the exit still in the window.
+				lostExit, lostExitMaxCount, rememberLostExit := self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
 				removeClient(client)
+				if rememberLostExit {
+					self.rememberRecentExit(client, lostExit, lostExitMaxCount)
+				}
 			}
 		}
 
@@ -12881,6 +12947,7 @@ func (self *multiClientWindow) expand(
 				// what the re-emitted event must carry
 				self.clientExtenderIps(existingClient),
 			)
+			self.noteRecentExitDropped(args, "declined")
 			return false
 		}
 		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
@@ -12895,6 +12962,7 @@ func (self *multiClientWindow) expand(
 			// its generator args at this point; do not return them separately.
 			client.Cancel()
 			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+			self.noteRecentExitDropped(args, "declined")
 			return false
 		}
 
@@ -12936,6 +13004,7 @@ func (self *multiClientWindow) expand(
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		self.noteRecentExitAdmitted(args)
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true
 			self.noteFixedDestinationAdmitted(args.Destination)
@@ -12972,6 +13041,7 @@ func (self *multiClientWindow) expand(
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
 		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.IpFamily)
+		self.noteRecentExitDropped(candidate.args, "not_admitted")
 	}
 
 	// admitPending admits from the evaluated pool while budget remains. Every
@@ -13243,6 +13313,7 @@ requestCandidates:
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
+				self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 			} else if client.dataOnlyProviderProbe {
 				// Registered construction is sufficient to select this explicit
 				// provider. The application's DNS/URL exchange owns qualification;
@@ -13312,6 +13383,7 @@ requestCandidates:
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
 					}
+					self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 					return true
 				}
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
@@ -13898,6 +13970,7 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 func (self *multiClientWindow) shuffle() {
 	// a shuffle asks for new exits, so a lost exit is not dialed again
 	self.stickyRedial.Forget()
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "shuffle")
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
@@ -13908,6 +13981,15 @@ func (self *multiClientWindow) shuffle() {
 // tail) client id. Cancellation wakes the resize loop, which reaps the client
 // (emitting ProviderStateRemoved) and refills the window.
 func (self *multiClientWindow) removeProvider(egressClientId Id) bool {
+	// the user removed this provider, so a loss of it is not asked for again
+	if self.recentExits.ForgetProvider(egressClientId) {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"recent_exit",
+			"provider", egressClientId,
+			"action", "drop",
+			"reason", "removed",
+		))
+	}
 	removed := false
 	for _, client := range self.unorderedClients() {
 		if client.Destination().Tail() == egressClientId {
@@ -14229,6 +14311,8 @@ func (self *multiClientWindow) Close() {
 	for _, client := range removedClients {
 		client.Close()
 	}
+	// a closed window re-forms nothing; a new destination builds new windows
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "close")
 	// DELIBERATELY NOT self.removeClients(removedClients) -- but the reason is
 	// worth stating, because the bare commented-out call above invited exactly
 	// the wrong fix.
@@ -14292,6 +14376,11 @@ type multiClientChannelArgs struct {
 	// candidate cannot take the slot and change the egress ip the re-dial
 	// exists to keep.
 	stickyRedial bool
+
+	// Marks an exit the window lost to an outage of ours, asked for again by
+	// name (enumerateRecentExits). It is evaluated and admitted like any other
+	// candidate; the mark only names its outcome in the log.
+	recentExit bool
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry
