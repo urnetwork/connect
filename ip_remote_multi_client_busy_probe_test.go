@@ -137,12 +137,63 @@ func TestBusyProbeConvictsOnTimeout(t *testing.T) {
 	})
 }
 
-// The probe write failing is weak evidence on its own: the send path being
-// wedged full of the same unacked data the probe is investigating is what a
-// congested exit looks like too, and a live one drains enough between polls for
-// the next probe to queue. Two consecutive failures inside one stale episode
-// convict; one does not.
-func TestBusyProbeConvictsOnTwoUnsendable(t *testing.T) {
+// Repeated known local refusals cannot turn admission pressure into a remote
+// verdict. They neither invent an ACK nor clear the original pending episode.
+func TestBusyProbeLocalAdmissionRefusalsDoNotConvict(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
+		sends := atomic.Int32{}
+		client := busyProbeTestChannel(t, func(_ time.Duration, _ func(error)) (bool, error) {
+			sends.Add(1)
+			return false, nil
+		})
+		metrics := newReliabilityMetrics()
+		client.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
+		stallPast(client, stallTimeout)
+		client.stateLock.Lock()
+		pendingAt := client.pendingSendTime
+		client.stateLock.Unlock()
+		sibling := receivingSibling()
+		sibling.ctx = context.Background()
+		window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
+		log := &busyExpiryTestLog{Logger: NewNoopLogger()}
+		window.log = log
+		for attempt := range 4 {
+			if window.convictSendStalls(stallTimeout) || client.IsDone() || sibling.IsDone() {
+				t.Fatalf("local refusal attempt %d retired a channel", attempt)
+			}
+			client.stateLock.Lock()
+			endErr, clock, ack := client.endErr, client.pendingSendTime, client.busyProbeAckTime
+			pending, pendingBytes, acked := client.packetStats.sendNackCount, client.packetStats.sendNackByteCount, client.packetStats.sendAckCount
+			failures, outstanding := client.busyProbeSendFailures, client.busyProbeOutstanding
+			client.stateLock.Unlock()
+			if endErr != nil || !clock.Equal(pendingAt) || !ack.IsZero() || pending != 1 || pendingBytes != 1440 || acked != 0 || failures != 0 || outstanding {
+				t.Fatalf("local refusal attempt %d changed peer evidence", attempt)
+			}
+		}
+		if sends.Load() != 4 || metrics.busyProbesSent.Load() != 0 || metrics.busyProbesAcquitted.Load() != 0 {
+			t.Fatal("local refusals manufactured probe send or answer metrics")
+		}
+		if got := log.snapshot(); strings.Count(got, "outcome=held") != 1 || !strings.Contains(got, "locally refused before admission") || strings.Contains(got, "outcome=acquitted") || strings.Contains(got, "outcome=convicted") {
+			t.Fatalf("local-refusal narration was not one held record: %s", got)
+		}
+		client.addSendAck(1440)
+		if client.sendStalled(stallTimeout) {
+			t.Fatal("real ACK did not finish the original pending episode")
+		}
+		client.addSend(1440, udpTestPath(4))
+		time.Sleep(30 * time.Millisecond)
+		sibling.addReceiveAck(77)
+		if window.convictSendStalls(stallTimeout) || strings.Count(log.snapshot(), "outcome=held") != 2 {
+			t.Fatal("new real pending episode did not get one new held record")
+		}
+		client.addSendAck(1440)
+	})
+}
+
+// Nonnil send errors retain their existing two-error compatibility policy.
+// This is deliberately distinct from a known local false/nil refusal.
+func TestBusyProbeNonnilSendErrorsRetainCompatibility(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
@@ -152,8 +203,8 @@ func TestBusyProbeConvictsOnTwoUnsendable(t *testing.T) {
 			// (fixture note: the window below carries a receiving sibling, so
 			// the sibling-corroboration gate is open and the unsendable-count
 			// logic is what decides)
-			// backpressure: reported unsuccessful, never queued, no ack possible
-			return false, nil
+			// Unknown nonnil errors are not silently reclassified as local refusal.
+			return false, errors.New("synthetic send failure")
 		})
 		stallPast(client, stallTimeout)
 
@@ -183,20 +234,22 @@ func TestBusyProbeConvictsOnTwoUnsendable(t *testing.T) {
 	})
 }
 
-// "Consecutive" is scoped to one stale episode. A transient queue-full result
-// that survived a healthy interval would make the next episode convict on its
-// first unsendable probe -- an exit removed for one bad moment minutes ago.
+// A nonnil compatibility-error run belongs to one stale episode. Real ACK
+// progress clears it; a later episode cannot inherit an old failure.
 func TestBusyProbeUnsendableRunResetsBetweenEpisodes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
 		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-			return false, nil
+			return false, errors.New("synthetic send failure")
 		})
 		stallPast(client, stallTimeout)
 
 		window := busyProbeTestWindow(40*time.Millisecond, client)
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		client.stateLock.Lock()
+		AssertEqual(t, client.busyProbeSendFailures, 1)
+		client.stateLock.Unlock()
 
 		// the exit delivers: the episode is over
 		client.addSendAck(1440)

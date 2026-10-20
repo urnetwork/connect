@@ -33,6 +33,20 @@ Source-only successor test recipes must not be counted as executed coverage.
 Raw receipts and corrected default-log analysis are retained under
 `/Volumes/data/urnetwork-h1-chronology.Y0OYTR/full-campaign-current.Fxlt45/`.
 
+### Local correctness follow-up: probe admission refusal
+
+The real Transfer regression also reproduced two synchronous local admission
+refusals retiring a channel with written data pending. The correction now holds
+an exact `false, nil` refusal without adding an error strike, inventing an ACK,
+or refreshing the pending clock; owner cancellation does not judge peer health.
+Unknown nonnil-error and admitted-probe timeout policies remain separate.
+The same 48 roots passed normal3/race3 privately and again directly against the
+integrated files, with zero failures/skips/race reports. This does not explain
+the fresh Fast stalls (no such convictions were observed), qualify performance,
+or complete the outstanding 32/64-MiB memory checks. Receipts are retained in
+`local-admission48-postcheckpoint.20261020` and
+`local-admission48-shared-confirm.20261020` under the artifact root above.
+
 This is the working research document for converting bounded mobile memory
 headroom into lower page TTFB and higher transfer speed while keeping the current
 iOS v2 profile's Go runtime at or below a hard 32 MiB cap in every phase. Its subject is the allocation
