@@ -11451,6 +11451,24 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 	for i, client := range stalled {
 		verdict := verdicts[i]
 		if !verdict.convict {
+			if client.ctx != nil && client.ctx.Err() != nil {
+				// Closing a channel is not a successful peer-health observation.
+				continue
+			}
+			if verdict.localUnwritten {
+				// A local expiry carries no peer-health evidence. Report it once
+				// in this stale episode without refreshing its pending clock.
+				if client.markStallHoldOnce() {
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"busy_probe",
+						"exit", client.ClientId(),
+						"outcome", "held",
+						"detail", verdict.detail,
+						"bar", stallTimeout,
+					))
+				}
+				continue
+			}
 			// acquitted by the probe, or deferred to the next pass (a single
 			// unsendable probe). Nothing is written here: the acquittal already
 			// refreshed the stall bar through addBusyProbeAck, and there is no
@@ -15829,6 +15847,9 @@ func busyProbeWriteTimeout(budget time.Duration, cpingWriteTimeout time.Duration
 type busyProbeVerdict struct {
 	// convict: the send-stall verdict stands this pass.
 	convict bool
+	// localUnwritten distinguishes local queue expiry from a peer answer and
+	// bounds its held diagnostic with the existing stale-episode latch.
+	localUnwritten bool
 	// detail extends the conviction reason so a field capture can tell WHICH
 	// probe outcome convicted. "" convicts with today's exact reason string,
 	// which is what a channel with no probe plumbing gets.
@@ -16089,6 +16110,18 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
 		case err := <-probeDone:
 			if err != nil {
+				if self.ctx != nil && self.ctx.Err() != nil {
+					return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+				}
+				if packetTransferExpiredUnwritten(err) {
+					// This ping never reached serialization. Local queue pressure
+					// is not a failed remote answer and cannot retire other flows.
+					// Keep their pending clock and accounting: no ACK was observed.
+					return busyProbeVerdict{
+						localUnwritten: true,
+						detail:         "liveness probe locally expired before write",
+					}
+				}
 				// the send sequence gave up on the ping itself. that is a
 				// failed question, not an answer, so it convicts -- but it is
 				// named distinctly from a plain timeout so a capture can tell
