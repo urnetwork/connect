@@ -11,6 +11,13 @@ const windowQualityRemeasureInterval = 5 * time.Second
 // An exact peer affects its logical services only; a local network event
 // affects every live service. Snapshot under the map lock, reset outside it.
 func (self *SendBuffer) networkQualityChanged(peerId Id, at time.Time) {
+	self.networkQualityChangedOnPath(peerId, at, 0)
+}
+
+// networkQualityChangedOnPath is networkQualityChanged from network path
+// generation `pathGeneration` (networkPathGeneration): a generation newer than
+// a sequence last accepted bypasses its quiet interval. Zero never does.
+func (self *SendBuffer) networkQualityChangedOnPath(peerId Id, at time.Time, pathGeneration uint64) {
 	if self == nil {
 		return
 	}
@@ -25,26 +32,38 @@ func (self *SendBuffer) networkQualityChanged(peerId Id, at time.Time) {
 	}
 	self.mutex.Unlock()
 	for _, sequence := range sequences {
-		sequence.networkQualityChanged(at)
+		sequence.networkQualityChangedOnPath(at, pathGeneration)
 	}
 }
 
 // One per-sequence lock prevents an estimate computed before reset from
 // committing afterwards. Sampling has independent generation checks below.
 func (self *SendSequence) networkQualityChanged(at time.Time) {
+	self.networkQualityChangedOnPath(at, 0)
+}
+
+// networkQualityChangedOnPath is networkQualityChanged from network path
+// generation `pathGeneration`. A generation newer than the last this sequence
+// (or its shared service) accepted starts a new measurement inside the quiet
+// interval: the path the running one measures is gone.
+func (self *SendSequence) networkQualityChangedOnPath(at time.Time, pathGeneration uint64) {
 	at = time.Unix(0, self.client.feedbackArrivalNanos(at))
 	self.windowQualityLock.Lock()
 	defer self.windowQualityLock.Unlock()
+	newPath := self.windowQualityPathGeneration < pathGeneration
+	if newPath {
+		self.windowQualityPathGeneration = pathGeneration
+	}
 	if service := self.windowPacer.service; service != nil {
 		// The shared service owns coalescing. A sibling born mid-generation
 		// inherits its original boundary, never a renewed shrink interval.
-		generationAt := service.networkQualityChanged(at)
+		generationAt := service.networkQualityChangedOnPath(at, pathGeneration)
 		self.windowQualityLastNotification = at
 		if generationAt.UnixNano() <= self.windowQualityAfterNanos {
 			return
 		}
 		at = generationAt
-	} else if !self.windowQualityLastNotification.IsZero() &&
+	} else if !newPath && !self.windowQualityLastNotification.IsZero() &&
 		at.Sub(self.windowQualityLastNotification) <= windowQualityRemeasureInterval {
 		if at.After(self.windowQualityLastNotification) {
 			self.windowQualityLastNotification = at
@@ -67,9 +86,21 @@ func (self *SendSequence) networkQualityChanged(at time.Time) {
 // Quality reset keeps the last valid rate as a provisional zero hold. Its
 // replacement requires an independently qualified pair of new-path ACKs.
 func (self *windowPacingService) networkQualityChanged(at time.Time) time.Time {
+	return self.networkQualityChangedOnPath(at, 0)
+}
+
+// networkQualityChangedOnPath is networkQualityChanged from network path
+// generation `pathGeneration`. The first sibling to bring a newer generation
+// starts the new measurement; the siblings after it, with the same generation,
+// coalesce into it as usual.
+func (self *windowPacingService) networkQualityChangedOnPath(at time.Time, pathGeneration uint64) time.Time {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if !self.qualityLastNotification.IsZero() && at.Sub(self.qualityLastNotification) <= windowQualityRemeasureInterval {
+	newPath := self.qualityPathGeneration < pathGeneration
+	if newPath {
+		self.qualityPathGeneration = pathGeneration
+	}
+	if !newPath && !self.qualityLastNotification.IsZero() && at.Sub(self.qualityLastNotification) <= windowQualityRemeasureInterval {
 		if at.After(self.qualityLastNotification) {
 			self.qualityLastNotification = at
 		}

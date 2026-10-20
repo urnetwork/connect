@@ -42,6 +42,9 @@ type networkQualityPendingPeer struct {
 type networkQualityPendingLocal struct {
 	at         time.Time
 	generation uint64
+	// the network path generation the notification came from; a newer one
+	// than a send sequence last accepted bypasses its quiet interval
+	pathGeneration uint64
 }
 
 // One client-owned worker keeps OS listener and shared receive callbacks
@@ -53,6 +56,7 @@ type clientNetworkQualityState struct {
 
 	stateLock                    sync.Mutex
 	lastLocalNotification        time.Time
+	lastLocalPathGeneration      uint64
 	localGeneration              uint64
 	pendingLocal                 networkQualityPendingLocal
 	pendingRemotePeerIdAts       map[Id]time.Time
@@ -97,12 +101,16 @@ func (self *Client) NetworkQualityChanged() {
 	if self == nil || self.networkQuality == nil {
 		return
 	}
-	self.networkQuality.dispatchLocal(time.Now())
+	self.networkQuality.dispatchLocal(time.Now(), networkPathGeneration.Load())
 }
 
-func (self *clientNetworkQualityState) dispatchLocal(at time.Time) {
+// dispatchLocal coalesces notifications inside the quiet interval, except one
+// from a newer network path generation (a hard change): that starts a new
+// generation at once.
+func (self *clientNetworkQualityState) dispatchLocal(at time.Time, pathGeneration uint64) {
 	self.stateLock.Lock()
 	if !self.lastLocalNotification.IsZero() &&
+		pathGeneration <= self.lastLocalPathGeneration &&
 		at.Sub(self.lastLocalNotification) <= windowQualityRemeasureInterval {
 		if at.After(self.lastLocalNotification) {
 			self.lastLocalNotification = at
@@ -111,10 +119,12 @@ func (self *clientNetworkQualityState) dispatchLocal(at time.Time) {
 		return
 	}
 	self.lastLocalNotification = at
+	self.lastLocalPathGeneration = max(self.lastLocalPathGeneration, pathGeneration)
 	self.localGeneration += 1
 	self.pendingLocal = networkQualityPendingLocal{
-		at:         at,
-		generation: self.localGeneration,
+		at:             at,
+		generation:     self.localGeneration,
+		pathGeneration: self.lastLocalPathGeneration,
 	}
 	self.stateLock.Unlock()
 	self.worker.Dispatch()
@@ -247,7 +257,7 @@ func (self *clientNetworkQualityState) applyPending() {
 		beforeApplyForTest()
 	}
 	if local.generation != 0 {
-		self.client.sendBuffer.networkQualityChanged(Id{}, local.at)
+		self.client.sendBuffer.networkQualityChangedOnPath(Id{}, local.at, local.pathGeneration)
 		self.queuePeerNotifications(local.generation)
 		if afterLocalApplyForTest != nil {
 			afterLocalApplyForTest(local.generation)

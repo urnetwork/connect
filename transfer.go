@@ -6848,7 +6848,10 @@ type SendSequence struct {
 	// its own leaf-lock timestamp barrier instead of waiting on this lock.
 	windowQualityLock             sync.RWMutex
 	windowQualityLastNotification time.Time
-	beforeWindowRetentionForTest  func()
+	// the newest network path generation this sequence accepted (see
+	// networkQualityChangedOnPath); guarded by windowQualityLock
+	windowQualityPathGeneration  uint64
+	beforeWindowRetentionForTest func()
 	// Protected by deliveredBytesMutex with the generation's checkpoints.
 	windowQualityAfterNanos int64
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)

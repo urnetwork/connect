@@ -75,15 +75,15 @@ func TestClientNetworkQualityCallbackIsNonblockingAndQuietCoalesced(t *testing.T
 	at := time.Unix(1700000000, 0)
 	returned := make(chan struct{})
 	go func() {
-		state.dispatchLocal(at)
+		state.dispatchLocal(at, 0)
 		close(returned)
 	}()
 	awaitNetworkQualityTestValue(t, entered)
 	awaitNetworkQualityTestValue(t, returned)
 
-	state.dispatchLocal(at.Add(time.Second))
-	state.dispatchLocal(at.Add(4 * time.Second))
-	state.dispatchLocal(at.Add(10 * time.Second))
+	state.dispatchLocal(at.Add(time.Second), 0)
+	state.dispatchLocal(at.Add(4*time.Second), 0)
+	state.dispatchLocal(at.Add(10*time.Second), 0)
 	close(release)
 	if generation := awaitNetworkQualityTestValue(t, applied); generation != 1 {
 		t.Fatalf("first generation = %d", generation)
@@ -156,7 +156,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 	}
 
 	callbackAt := time.Unix(1700000000, 0)
-	state.dispatchLocal(callbackAt)
+	state.dispatchLocal(callbackAt, 0)
 	awaitNetworkQualityTestValue(t, applyEntered)
 
 	const statisticsReaderCount = 32
@@ -185,7 +185,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 		callbacks.Add(1)
 		go func() {
 			defer callbacks.Done()
-			state.dispatchLocal(callbackAt.Add(time.Duration(index+1) * time.Nanosecond))
+			state.dispatchLocal(callbackAt.Add(time.Duration(index+1)*time.Nanosecond), 0)
 		}()
 	}
 	callbacks.Wait()
@@ -212,7 +212,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 	}
 
 	quietAt := stormLastNotification.Add(windowQualityRemeasureInterval + time.Nanosecond)
-	state.dispatchLocal(quietAt)
+	state.dispatchLocal(quietAt, 0)
 	if generation := awaitNetworkQualityTestValue(t, appliedGenerations); generation != 2 {
 		t.Fatalf("post-quiet callback applied generation %d, want 2", generation)
 	}
