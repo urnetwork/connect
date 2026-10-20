@@ -5,6 +5,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -82,25 +83,130 @@ func TestAffinityRenewalWrittenErrorCannotBecomeSourceFence(t *testing.T) {
 	})
 }
 
-func TestAffinityRenewalUnwrittenQueueCancellationSettlesSource(t *testing.T) {
+// Distinct real barriers separate pre-retention cancellation from a serialized
+// error. An empty route alone establishes neither outcome.
+func testAffinityRenewalCanceledRetention(t *testing.T, budgeted bool) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		f := newGroupDispositionQueueFixture(t, nil, nil)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		resume := func() { releaseOnce.Do(func() { close(release) }) }
+		var admittedGroup atomic.Pointer[parsedPacketGroup]
+		var wireObservations, writeReturns atomic.Int32
+		var terminalFailed atomic.Bool
+		var budget *TransferMemoryBudget
+		if budgeted {
+			budget = NewTransferMemoryBudget(kib(64))
+		}
+		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			observe := settings.SendBufferSettings.SendPackLifecycleObserver
+			settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+				observe(event)
+				if event.Phase == SendPackLifecyclePhaseTerminal {
+					terminalFailed.Store(event.Err != nil)
+				}
+			}
+			settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+				admittedGroup.Store(target.(*parsedPacketGroup))
+			}
+			if budgeted {
+				settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+					close(entered)
+					<-release
+				}
+			} else {
+				// Serialization and disposition have completed before this
+				// existing seam; the physical writer has not yet checked ctx.
+				settings.SendBufferSettings.afterTransferWriteDeadlineForTest = func(time.Time) {
+					close(entered)
+					<-release
+				}
+			}
+			settings.SendBufferSettings.TransferWireMessageObserver = func(TransferWireMessageObservation) {
+				wireObservations.Add(1)
+			}
+			settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(sendSequenceId, uint64) {
+				writeReturns.Add(1)
+			}
+		})
+		t.Cleanup(resume)
 		if f.offer(groupDispositionControlPacket(100, 0, 64, tcpFlagSyn)) != 1 {
 			t.Fatal("initial public SYN was not admitted")
 		}
 		f.requireParked()
+		group := admittedGroup.Load()
+		if group == nil || group.collapseAdmission.update != f.update {
+			t.Fatal("fixture did not capture the actual admitted group")
+		}
 		affinitySourcesTestCloseEnrollment(f.update)
 		if f.update.affinitySourceFenced(f.selected) {
 			t.Fatal("pending raw source custody was declared unwritten terminal")
 		}
-		if err := f.closeClient(context.Background()); err != nil {
-			t.Fatal(err)
+		f.unpark()
+		synctest.Wait()
+		select {
+		case <-entered:
+		default:
+			t.Fatal("actual admitted group did not reach its cancellation barrier")
 		}
-		if !f.update.affinitySourceFenced(f.selected) || f.terminal.Load() != 1 || len(f.route) != 0 {
-			t.Fatal("joined pre-materialization cancellation failed to settle only its unwritten owner")
+		f.update.stateLock.Lock()
+		source := group.collapseSource
+		materializedAtBarrier := group.affinitySourceState&affinitySourceMaterialized != 0
+		dequeued := group.completionFlags.Load()&groupCompletionDequeued != 0
+		ownsRange := group.collapseOwner != nil
+		var materializedBits uint64
+		if ownsRange {
+			materializedBits = group.collapseOwner.materialized
+		}
+		f.update.stateLock.Unlock()
+		wantMaterialized := !budgeted
+		wantBits := uint64(0)
+		if wantMaterialized {
+			wantBits = 1
+		}
+		if source == nil || !dequeued || materializedAtBarrier != wantMaterialized || ownsRange != wantMaterialized ||
+			materializedBits != wantBits || len(f.route) != 0 || wireObservations.Load() != 0 || writeReturns.Load() != 0 {
+			t.Fatalf("cancellation barrier lost its exact custody: budgeted=%t materialized=%t range=%t bits=%d",
+				budgeted, materializedAtBarrier, ownsRange, materializedBits)
+		}
+		// Cancel only this exact source, not its shared Client or fixture.
+		source.Cancel()
+		resume()
+		synctest.Wait()
+		select {
+		case <-source.done:
+		default:
+			t.Fatal("canceled source did not join its real callback and raw owners")
+		}
+		f.update.stateLock.Lock()
+		entry := f.update.affinitySources.first
+		materialized := group.affinitySourceState&affinitySourceMaterialized != 0
+		settled := group.affinitySourceState&(affinitySourceReturned|affinitySourceTerminal|affinitySourceSettled) ==
+			affinitySourceReturned|affinitySourceTerminal|affinitySourceSettled
+		f.update.stateLock.Unlock()
+		if f.client.IsDone() || f.terminal.Load() != 1 || !terminalFailed.Load() || len(f.route) != 0 ||
+			entry.pending != 0 || !settled || materialized == budgeted || entry.ambiguous == budgeted ||
+			f.update.affinitySourceFenced(f.selected) != budgeted {
+			t.Fatalf("source cancellation lost its exact retention outcome: budgeted=%t materialized=%t ambiguous=%t settled=%t pending=%d terminal=%d",
+				budgeted, materialized, entry.ambiguous, settled, entry.pending, f.terminal.Load())
+		}
+		if budgeted {
+			if wireObservations.Load() != 0 || writeReturns.Load() != 0 || budget.UsedByteCount() != 0 {
+				t.Fatal("canceled retained-memory admission serialized or kept a budget owner")
+			}
+		} else if wireObservations.Load() != 1 || writeReturns.Load() != 1 {
+			t.Fatal("materialized-error control did not exercise the real canceled writer")
 		}
 	})
+}
+
+func TestAffinityRenewalUnwrittenQueueCancellationSettlesSource(t *testing.T) {
+	testAffinityRenewalCanceledRetention(t, true)
+}
+
+func TestAffinityRenewalCanceledMaterializationKeepsSourceTaint(t *testing.T) {
+	testAffinityRenewalCanceledRetention(t, false)
 }
 
 func TestAffinityRenewalCumulativeCallbackBeforePublicReturnKeepsOfferLease(t *testing.T) {

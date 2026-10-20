@@ -4824,3 +4824,39 @@ A separate short-EOF zero-progress issue in the copy helper has an untested
 private candidate, excluded from this repair. Current transport callers
 request no more than their payloader's declared remaining length; no ordinary
 production trigger or connection to this heap incident is established.
+
+### 2026-10-20: receiver-head continuity metadata and bounded host replay
+
+The exact two-file upstream H1 correction
+`e65dc397816ffd0cdefc3eef0f94f4d0159b6f57`, authored by Bitprecipice, was
+tested as an overlay on Connect `1311aa6b`, not as the complete merged
+`58786550` tree or the larger private paid-response composition. It keeps
+the full receiver-head denominator while tracking actual gaps between heads.
+The deterministic OLD continuous-train root failed; the genuine-hole control
+passed. The seven-root candidate set passed three fresh normal and three
+fresh race processes.
+
+`TestWindowServiceRecoverySuffixMemoryBound` measured coverage 168 B,
+sample 360 B and service 25,688 B in all six processes, below the unchanged
+192/512/32,768-B caps. The new scalar adds 8 B per supply and 16 B per sample;
+the 67 embedded samples account for 1,072 B of fixed service growth.
+The existing owner census charges the service through `unsafe.Sizeof`.
+The scalar-only metadata and zero-allocation suffix-merge checks passed;
+they do not measure transport-path allocations, retained heap, runtime
+peaks or native footprint.
+
+The unchanged eight-offset parent passed three fresh normal processes.
+Across 72 one-second bins, the minimum was 95.76448 Mbps and all measurement
+relay drops were zero. Nonmeasurement relay drops reached 373 and end capacity
+debt reached 14,481,920 B; all debt records completed and settlement error
+fields were empty. The fixture's 48-MiB budget/debt cap remained unchanged.
+It is not a waiver of the 32-MiB iOS-surrogate / 64-MiB Android memory gates.
+
+Exact source scope, raw receipt hashes, nonmeasurement loss/debt rows and
+limitations are in the 2026-10-20 continuous-receiver-head entry in
+`PACKETFLOW-REGRESSION.md`. This finite host result does not qualify parent
+race, full PERF/MAIN/ALL, physical Fast, either complete device-memory profile
+or native iOS lifetime `phys_footprint <50 MiB`. It does not causally resolve
+the separate historical loaded-probe 0/64 result. Private grace/full-turn
+research is deferred with its evidence retained, not incorporated or
+qualified by this result.

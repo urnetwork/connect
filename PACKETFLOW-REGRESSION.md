@@ -723,3 +723,94 @@ Evidence uses the retained raw prefix defined above; let
   `57db167722494ed49dea7315f1a2ca9e06ad18ce905c051ceb772e9b56e0adf7`.
 - `P/full-parent-normal-race-result.json`:
   `7f0e6603917092e2a1601129ae7f6510be79a20104eb9a898fdd57370e6dad99`.
+
+### 2026-10-20: continuous receiver heads retain their full service interval
+
+Bitprecipice's upstream correction
+`e65dc397816ffd0cdefc3eef0f94f4d0159b6f57` fixes a specific qualification
+error: when raw ACK arrivals were compressed, the old `qualifiedSpan` guard
+treated the entire expanded receiver-head interval as one idle gap. A train
+of continuous exact heads could therefore lose decrease authority despite
+covering that interval. The correction retains the maximum gap between exact
+heads, including the excluded-left boundary, while keeping the full
+raw/head denominator. Overlapping or tied summaries remain conservative;
+selected bytes, completeness, genuine holes and independent preoffer/own-tail
+qualification are not relaxed.
+
+The local comparison used Connect
+`1311aa6bf336073a00d63ef6ab81403888c43660`, with only the exact upstream
+pacing file and its new test file overlaid. These are byte-identical to the
+two files in `e65dc397`; this is not a replay of the full merged
+`58786550e717248cc557c0a12ee69e4c7be99e7a` tree. Fresh canonical recursive
+Git/host guards included the authorized Android navigation changes and
+`RUN-ALL.md` routing edit and passed around every process. The private diagnostic recorder,
+endpoint-receipt, coalesced-tail and paid-response variants were not mapped.
+
+With only the new tests over OLD production, the first process ran two roots:
+`TestWindowMixedHeadContinuousTrainCoversExpandedSpan` failed exactly with
+`got 0s, want 30ms`, while `TestWindowMixedHeadTrainKeepsInternalHole`
+passed. The positive uses exact heads at 10/20/30 ms behind compressed
+101/102/103-ms ACK arrivals, without an independent full-span tail or
+preoffering escape. The negative keeps a real 40-ms internal head gap.
+With the upstream correction, the two roots, four unchanged real-coalescer
+mixed-head gap/retry/preoffer controls and the existing suffix memory root
+all passed in three fresh normal and three fresh race processes: 42 root
+passes, no failures or skips. Measured coverage/sample/service sizes were
+168/360/25,688 B in all six processes. The unchanged scalar-only metadata,
+192/512/32,768-B caps and zero-allocation suffix-merge assertion passed;
+these are not whole-path allocation or physical-memory measurements.
+
+The unchanged shared `TestWindowPathDispatchQualityPhaseProbe` then passed
+three fresh normal processes: all eight offsets (0, 250 us, 500 us, 1 ms,
+2.5 ms, 5 ms, 7.5 ms and 10 ms), 24 candidate cells and 72 one-second
+measurement bins. The workload still uses eight lanes, the 1.2-second
+post-change path, the original 48-MiB fixture budget/debt cap, and three
+measured seconds per cell. Its per-bin 90%-of-reference, zero measurement
+relay-drop and no-post-admission-settlement-transition assertions were
+unchanged. The minimum bin was 95.76448 Mbps; the minimum same-index
+bin/reference ratio was 99.9786% (95.76448/95.78496), not a comparison to a
+rounded aggregate. All measurement relay drops and NAT refusals were zero;
+all debt records completed and all settlement error fields were empty.
+
+Nonmeasurement loss and remaining debt were not erased: attempt 1 at 5 ms
+had 96 relay drops and 14,476,800 B end debt; attempt 2 at 0 ms had 144 and
+14,481,920 B; attempt 3 at 5 ms had 373 and 14,440,960 B. The other 21 cells
+had zero relay drops and end debt. These values remained within the unchanged
+fixture controls. The 48-MiB fixture cap is not an application memory gate
+and does not replace either the 32-MiB iOS-surrogate or 64-MiB Android policy.
+The final execution owner joined at 2026-10-20T16:37:37Z with exit zero.
+
+Operational scope: recorded deadlines and storage limits were admission
+limits. Retained receipts establish actual completion, source checks and
+observed usage within those limits, not automatic prospective deadline or
+byte-cap enforcement. The runner's `--grace` bounds cleanup after stop/parent
+exit; it is not a work timer starting at launch or a storage watcher.
+
+This establishes the deterministic guard repair and this finite parent
+result, not a matched causal explanation of the historical single-lane
+64-KiB loaded-probe 0/64 result. No matched OLD-parent performance comparison,
+parent race, full ALL/MAIN/PERF run, physical Fast result or device-memory
+qualification is supplied here. The earlier private 16-map paid-response
+composition and the unrun KFYAdu full-turn diagnostic are deferred: they
+were unnecessary for this two-map result, not qualified by it and not deleted.
+Their failed attempts and backing packets remain evidence. The upstream
+guard correction precedes those workaround paths; no additional grace,
+drain threshold, cooldown, timer, queue size or memory budget was needed in
+this replay.
+
+Retained evidence prefix:
+`/Volumes/data/urnetwork-h1-chronology.Y0OYTR/full-campaign-current.Fxlt45/affinity-checkpoint-focus.20261020/h1-origin-head-prep/`.
+The receipts link the exact raw processes and source guards:
+
+- `OUTCOME.json`: SHA-256
+  `846159f5fd1891d7c770670ace4afc78bc3c93139f81cbc21e682d5353f93e8b`.
+- `PARENT8.OUTCOME.json`: SHA-256
+  `aeacb1fe5e897d44c3d311cd92f30d82d857af2b5ba9a874e9c1144f0bbdbe59`.
+- `PARENT8.METRICS.json`: SHA-256
+  `3e2b552f30bd6d2159de951a4f60c031c2fe6473c894875c97ab547795c9afbb`.
+
+The metrics and raw logs are authoritative for bin order: the parent receipt's
+prose says all three 7.5-ms rows are identical, but attempt 2 is
+95.76448/95.78496/95.76448 Mbps; attempts 1 and 3 are
+95.76448/95.76448/95.78496. All three pass with zero drops and end debt.
+The sealed receipt is preserved rather than silently rewritten.

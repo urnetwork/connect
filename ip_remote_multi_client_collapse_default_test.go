@@ -11,6 +11,47 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The queue seam decides ownership, but SYN reuse still requires an explicitly
+// healthy provider with a live constructor-owned carrier for both IP families.
+func defaultCollapseTestProvider(
+	t *testing.T,
+	parent *RemoteUserNatMultiClient,
+	admit func(*parsedPacketGroup, time.Duration, bool) (bool, error),
+) *multiClientChannel {
+	t.Helper()
+	ctx, cancel := context.WithCancel(parent.ctx)
+	settings := closeWaitClientSettings()
+	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	settings.EncryptionSettings.beforeEncryptedKeyPublishForTest = func() { <-ctx.Done() }
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	destination := NewId()
+	route := make(Route, 1)
+	client.RouteManager().UpdateTransport(NewSendClientTransport(DestinationId(destination)), []Route{route})
+	t.Cleanup(func() {
+		cancel()
+		if err := client.CloseAndWait(context.Background()); err != nil {
+			t.Errorf("join default collapse provider: %v", err)
+		}
+		for len(route) > 0 {
+			MessagePoolReturn(<-route)
+		}
+	})
+	selected := &multiClientChannel{
+		ctx: ctx, client: client, settings: parent.settings, healthy: true,
+		args: &multiClientChannelArgs{
+			Destination: RequireMultiHopId(destination),
+			DestinationStats: DestinationStats{
+				IpFamily: IpFamilyDualstack,
+			},
+		},
+		sendGroupForTest: admit,
+	}
+	if !selected.hasActiveTransport() || !selected.supportsIpVersion(4) || !selected.supportsIpVersion(6) {
+		t.Fatal("default collapse provider lacks its real dual-stack carrier premise")
+	}
+	return selected
+}
+
 // Use the public constructor and its immutable reliability projection. Only
 // the selected provider's final queue decision is controlled; parsing, flow
 // lookup, collapse, commit, and flow retirement use their production paths.
@@ -30,9 +71,7 @@ func defaultCollapseTestParent(
 		}
 	})
 	update, _, _ := parent.sendUpdate(path, flowPin{})
-	client := &multiClientChannel{
-		ctx: ctx, settings: parent.settings, sendGroupForTest: admit,
-	}
+	client := defaultCollapseTestProvider(t, parent, admit)
 	update.client.Store(client)
 	parent.bindClientFlow(update, client)
 	return parent, update
@@ -196,7 +235,7 @@ func TestTcpCollapseDefaultAdmissionAndResetBoundaries(t *testing.T) {
 						t.Fatal("new generation did not retain its own SYN/data gate")
 					}
 					// Provider replacement cannot inherit another queue's ownership.
-					replacement := &multiClientChannel{ctx: parent.ctx, settings: parent.settings, sendGroupForTest: queue}
+					replacement := defaultCollapseTestProvider(t, parent, queue)
 					update.client.Store(replacement)
 					parent.bindClientFlow(update, replacement)
 					if !send(51, tcpFlagAck, []byte{1}) || send(51, tcpFlagAck, []byte{1}) {
@@ -223,7 +262,7 @@ func TestTcpCollapseDefaultAdmissionAndResetBoundaries(t *testing.T) {
 					if !update.IsDone() || fresh == update || fresh.sequencePacketCount != 0 {
 						t.Fatal("cleared flow retained its prior collapse generation")
 					}
-					fresh.client.Store(&multiClientChannel{ctx: parent.ctx, settings: parent.settings, sendGroupForTest: queue})
+					fresh.client.Store(defaultCollapseTestProvider(t, parent, queue))
 					if !send(51, tcpFlagAck, []byte{1}) || send(51, tcpFlagAck, []byte{1}) {
 						t.Fatal("fresh flow did not acquire independent collapse ownership")
 					}
@@ -272,8 +311,7 @@ func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
 							parent.SetReliabilitySettings(&reliability)
 						}
 						original := update.client.Load()
-						replacement := &multiClientChannel{ctx: parent.ctx, settings: parent.settings,
-							sendGroupForTest: queue(&newCalls, &admitReplacement)}
+						replacement := defaultCollapseTestProvider(t, parent, queue(&newCalls, &admitReplacement))
 						parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
 							return []*multiClientChannel{replacement}
 						}
@@ -386,15 +424,15 @@ func TestTcpCollapseNewGenerationResponseOwnership(t *testing.T) {
 							parent.settings.TcpCollapsePrevention = false
 						}
 						original := update.client.Load()
-						replacement := &multiClientChannel{ctx: parent.ctx, settings: parent.settings,
-							sendGroupForTest: func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
+						replacement := defaultCollapseTestProvider(t, parent,
+							func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
 								newCalls++
 								if !ack || !group.ipPath.Syn || group.ipPath.SequenceNumber != newISN {
 									t.Fatal("replacement did not acquire the exact new-generation SYN")
 								}
 								MessagePoolReturn(group.packets[0].packet)
 								return true, nil
-							}}
+							})
 						parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
 							return []*multiClientChannel{replacement}
 						}
@@ -620,62 +658,90 @@ func TestTcpCollapseCoverageInvalidationPreservesGeneration(t *testing.T) {
 func TestTcpCollapseOrderedMultiSynGroupGeneration(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, mode := range []string{"batch", "mux"} {
-		for _, scenario := range []string{"first-response-only", "final-then-stale", "refused"} {
-			t.Run(mode+"/"+scenario, func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) {
-					path, calls := icmpTcpTestPath(4), 0
-					var parent *RemoteUserNatMultiClient
-					var update *multiClientChannelUpdate
-					parent, update = defaultCollapseTestParent(t, path,
-						func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
-							calls++
-							if !ack {
-								t.Fatal("multi-SYN group lost Transfer ACK ownership")
+		for _, scenario := range []struct {
+			name           string
+			refuseFirst    bool
+			refuseLast     bool
+			answerLast     bool
+			wantCount      int
+			wantGeneration uint32
+			wantAnswered   bool
+		}{
+			{name: "first-response-only", wantCount: 2, wantGeneration: 60},
+			{name: "final-then-stale", answerLast: true, wantCount: 2, wantGeneration: 60, wantAnswered: true},
+			{name: "refused", refuseFirst: true, refuseLast: true, wantGeneration: 100, wantAnswered: true},
+			{name: "second-refused", refuseLast: true, wantCount: 1, wantGeneration: 50, wantAnswered: true},
+		} {
+			synctest.Test(t, func(t *testing.T) {
+				path, calls := icmpTcpTestPath(4), 0
+				var parent *RemoteUserNatMultiClient
+				var update *multiClientChannelUpdate
+				parent, update = defaultCollapseTestParent(t, path,
+					func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
+						calls++
+						// The public API splits differing SYN generations:
+						// each segment keeps its own all-or-none admission.
+						sequences := [...]uint32{100, 50, 60}
+						if !ack || calls > len(sequences) || len(group.packets) != 1 ||
+							group.packets[0].ipPath.SequenceNumber != sequences[calls-1] {
+							// Return the borrowed group normally so batch
+							// refusal cleanup can release its caller owner.
+							t.Errorf("%s/%s lost ordered singleton SYN admission: call=%d packets=%d ack=%t",
+								mode, scenario.name, calls, len(group.packets), ack)
+							return false, nil
+						}
+						if calls == 2 {
+							if scenario.refuseFirst {
+								return false, nil
 							}
-							if calls == 2 {
-								if len(group.packets) != 2 || group.packets[0].ipPath.SequenceNumber != 50 || group.packets[1].ipPath.SequenceNumber != 60 {
-									t.Fatal("public batching did not preserve the ordered two-SYN group")
-								}
-								if scenario == "refused" {
-									return false, nil
-								}
-								if scenario == "final-then-stale" {
-									defaultCollapseDeliverSynAck(t, parent, update, update.client.Load(), 61)
-								}
-								defaultCollapseDeliverSynAck(t, parent, update, update.client.Load(), 51)
+							defaultCollapseDeliverSynAck(t, parent, update, update.client.Load(), 51)
+						} else if calls == 3 {
+							previous := uint32(50)
+							if scenario.refuseFirst {
+								previous = 100
 							}
-							for _, packet := range group.packets {
-								MessagePoolReturn(packet.packet)
+							if update.synGenerationNumber != previous || !update.receivedInbound.Load() {
+								t.Errorf("%s/%s lost the preceding admitted generation/proof: generation=%d answered=%t",
+									mode, scenario.name, update.synGenerationNumber, update.receivedInbound.Load())
+								return false, nil
 							}
-							return true, nil
-						})
-					if !collapseOwnershipPublicSend(t, parent, mode, path, 100, tcpFlagSyn, nil) {
-						t.Fatal("original SYN refused")
-					}
-					defaultCollapseReceiveSynAck(t, parent, update)
-					packets := [][]byte{
-						MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagSyn, 50, nil)),
-						MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagSyn, 60, nil)),
-					}
-					witnesses := groupTestPacketWitnesses(t, packets)
-					var accepted int
-					if mode == "batch" {
-						accepted = parent.SendPacketBatch(SourceId(NewId()), protocol.ProvideMode_Network, packets, 0)
-					} else {
-						mux := &IpMux{upstream: parent.SendPacket, upstreamGroupSend: parent.sendPacketGroup}
-						accepted = mux.SendPacketBatch(SourceId(NewId()), protocol.ProvideMode_Network, packets, 0)
-					}
-					requireGroupTestWitnessesReleased(t, packets, witnesses)
-					wantCount, wantGeneration, wantAnswered := 2, uint32(60), scenario == "final-then-stale"
-					if scenario == "refused" {
-						wantCount, wantGeneration, wantAnswered = 0, 100, true
-					}
-					if accepted != wantCount || calls != 2 || update.synAdmissions != nil ||
-						update.synGenerationNumber != wantGeneration || update.receivedInbound.Load() != wantAnswered {
-						t.Fatalf("ordered group committed wrong generation/proof: accepted=%d calls=%d generation=%d answered=%t",
-							accepted, calls, update.synGenerationNumber, update.receivedInbound.Load())
-					}
-				})
+							if scenario.refuseLast {
+								return false, nil
+							}
+							if scenario.answerLast {
+								defaultCollapseDeliverSynAck(t, parent, update, update.client.Load(), 61)
+							}
+							// An earlier generation's answer must not stand
+							// in for the final generation's own response.
+							defaultCollapseDeliverSynAck(t, parent, update, update.client.Load(), 51)
+						}
+						for _, packet := range group.packets {
+							MessagePoolReturn(packet.packet)
+						}
+						return true, nil
+					})
+				if !collapseOwnershipPublicSend(t, parent, mode, path, 100, tcpFlagSyn, nil) {
+					t.Fatalf("%s/%s original SYN refused", mode, scenario.name)
+				}
+				defaultCollapseReceiveSynAck(t, parent, update)
+				packets := [][]byte{
+					MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagSyn, 50, nil)),
+					MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagSyn, 60, nil)),
+				}
+				witnesses := groupTestPacketWitnesses(t, packets)
+				defer requireGroupTestWitnessesReleased(t, packets, witnesses)
+				var accepted int
+				if mode == "batch" {
+					accepted = parent.SendPacketBatch(SourceId(NewId()), protocol.ProvideMode_Network, packets, 0)
+				} else {
+					mux := &IpMux{upstream: parent.SendPacket, upstreamGroupSend: parent.sendPacketGroup}
+					accepted = mux.SendPacketBatch(SourceId(NewId()), protocol.ProvideMode_Network, packets, 0)
+				}
+				if accepted != scenario.wantCount || calls != 3 || update.synAdmissions != nil ||
+					update.synGenerationNumber != scenario.wantGeneration || update.receivedInbound.Load() != scenario.wantAnswered {
+					t.Fatalf("%s/%s ordered segments committed wrong generation/proof: accepted=%d calls=%d generation=%d answered=%t",
+						mode, scenario.name, accepted, calls, update.synGenerationNumber, update.receivedInbound.Load())
+				}
 			})
 		}
 	}

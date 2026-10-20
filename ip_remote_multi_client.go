@@ -7698,7 +7698,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// Re-arm only the windows selected by this flow on each read.
 			qualityOfferChanged, speedOfferChanged = nil, nil
 			if self.groupRaceCandidatesForTest != nil {
-				return update.filterAffinityRenewalSources(self.groupRaceCandidatesForTest(sendPacketGroup))
+				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
@@ -7748,9 +7748,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					// current build's default), orderedClients is exactly what
 					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
-						if allowed := update.filterAffinityRenewalSources(orderedClients); len(allowed) != 0 {
-							return allowed
-						}
+						return orderedClients
 					}
 				}
 			}
@@ -7779,12 +7777,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 
 			orderedClients := coalesceOrderedClients()
 			if len(orderedClients) == 0 {
-				if update.affinitySources.renewal {
-					// No unused authenticated source fits this window. Preserve
-					// the incumbent and the caller's retry owner; do not steal an
-					// established sibling or exceed the hard client capacity.
-					return
-				}
 				// IPV6.md B6: once the windows hold exits and none can carry
 				// v6, a v6 flow is answered with no-route and dropped, so the
 				// application fails fast (and falls back to v4) instead of
@@ -8540,7 +8532,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			if !admitted {
 				continue
 			}
-			batchLeases = append(batchLeases, lease)
+			if lease.parent != nil {
+				batchLeases = append(batchLeases, lease)
+			}
 			// Established flows batch application delivery, but every ack-bearing
 			// packet records recovery authority under the flow lock first. The
 			// first-answer resolve path below commits provider ownership under
@@ -8673,7 +8667,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
-		if !update.allowsAffinitySource(sourceClient) || !update.acceptsAffinityIngress(sourceClient, tcpControl) {
+		if !update.acceptsAffinityIngress(sourceClient, tcpControl) {
 			return
 		}
 		// Established-flow lookup avoids the parent stateLock; ack-bearing
