@@ -2194,18 +2194,29 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				break
 			}
 			span := newer.lastAtNanos - samples[j].lastAtNanos
+			receiverTimed := coverage.receiverBytes == coverage.bytes && samples[j].receiverBytes == samples[j].bytes
+			if receiverTimed {
+				span = newer.receiverLastAtNanos - samples[j].receiverLastAtNanos
+			}
 			if span >= minSpan {
 				candidateSupply := coverage.supply
 				candidateSupply.maximumGap = max(candidateSupply.maximumGap, time.Duration(coverage.firstAtNanos-samples[j].lastAtNanos))
 				receiverStart := int64(0)
-				if candidateSupply.rawClock && samples[j].supply.rawClock {
+				if receiverTimed {
+					// Price the whole feedback turn in its complete receiver
+					// clock. Raw/head uncertainty must not discard this proof
+					// and leave a shorter ACK peak in control of a queued path.
+					receiverStart = samples[j].receiverLastAtNanos
+					candidateSupply.receiverMaximumGap = max(candidateSupply.receiverMaximumGap,
+						time.Duration(coverage.receiverFirstAtNanos-receiverStart))
+				} else if candidateSupply.rawClock && samples[j].supply.rawClock {
 					receiverStart = samples[j].lastAtNanos
 				}
 				headStart := int64(0)
 				if samples[j].supply.headComplete {
 					headStart = samples[j].supply.headLastMinAtNanos
 				}
-				span = candidateSupply.qualifiedSpan(span, receiverStart, headStart, interval, false)
+				span = candidateSupply.qualifiedSpan(span, receiverStart, headStart, interval, receiverTimed)
 				if span <= 0 {
 					break
 				}
