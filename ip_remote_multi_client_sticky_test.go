@@ -310,13 +310,20 @@ func TestStickyExitTransportLossRedialsTheSameProvider(t *testing.T) {
 }
 
 // A verdict against the provider, or a window that is not sticky, discovers
-// as before: the lost provider is never asked for by name.
+// as before: the sticky re-dial never asks for the lost provider by name. A
+// window that is not sticky asks once through its recent-exit memory instead
+// (ip_remote_multi_client_recent_exits_test.go), so its cases run with that
+// memory off, which is the behavior from before it.
 func TestStickyExitVerdictAndUnstickyLossDiscoverAsBefore(t *testing.T) {
+	recentExitsOff := func(settings *MultiClientSettings) {
+		settings.RecentExitMemoryTimeout = 0
+	}
 	cases := []struct {
 		name               string
 		windowType         WindowType
 		performanceProfile *PerformanceProfile
 		err                error
+		configure          []func(settings *MultiClientSettings)
 	}{
 		{
 			name:               "Fixed IP exit lost to a blackhole verdict",
@@ -329,12 +336,14 @@ func TestStickyExitVerdictAndUnstickyLossDiscoverAsBefore(t *testing.T) {
 			windowType:         WindowTypeSpeed,
 			performanceProfile: unfixedTestProfile(WindowTypeSpeed),
 			err:                errTransportDownTimeout,
+			configure:          []func(settings *MultiClientSettings){recentExitsOff},
 		},
 		{
 			name:               "auto speed exit lost to transport loss",
 			windowType:         WindowTypeSpeed,
 			performanceProfile: nil,
 			err:                errTransportDownTimeout,
+			configure:          []func(settings *MultiClientSettings){recentExitsOff},
 		},
 	}
 	for _, c := range cases {
@@ -342,7 +351,7 @@ func TestStickyExitVerdictAndUnstickyLossDiscoverAsBefore(t *testing.T) {
 			discoveredDestinations: map[MultiHopId]DestinationStats{},
 			onlineClientIds:        map[Id]bool{},
 		}
-		window := stickyTestWindow(t, generator, c.windowType, c.performanceProfile)
+		window := stickyTestWindow(t, generator, c.windowType, c.performanceProfile, c.configure...)
 		client := stickyTestLostChannel(c.err)
 		installStickyTestChannel(window, client)
 

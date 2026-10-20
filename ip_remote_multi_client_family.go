@@ -37,6 +37,9 @@ type enumeratedDestination struct {
 	// Marks a sticky window's lost exit, asked for by name ahead of discovery
 	// (see enumerateStickyRedial)
 	stickyRedial bool
+	// Marks an exit the window lost to an outage of ours, asked for by name
+	// alongside discovery (see enumerateRecentExits)
+	recentExit bool
 }
 
 // --- exit category ---
@@ -441,19 +444,42 @@ func (self *multiClientWindow) selectFamilySwapVictim(
 
 // --- discovery order ---
 
-// enumerateDestinations is one discovery round in push order. With a
-// family-aware generator the round is: the v6-capable request first while a
-// v6 shortfall is open and not starved (sized to the shortfall), then the
-// main v4-capable fill, which the platform draws dualstack-first. Duplicates
-// across the two are dropped. probeOnly is the resize pass's probe
-// (requestIpv6Probe): the v6-capable request alone, nothing when no shortfall
-// is open. A generator without the capability is called exactly as before
-// and its destinations read as legacy. Every call carries the generator
-// deadline, so a hung platform surfaces as an error on the caller's ordinary
-// retry cadence. Ahead of all of it, a sticky window's lost exit is asked
-// for by name, and a round that finds it is that one destination alone (see
-// enumerateStickyRedial).
+// enumerateDestinations is one discovery round in push order. Ahead of
+// discovery, a sticky window's lost exit is asked for by name, and a round that
+// finds it is that one destination alone (see enumerateStickyRedial). Any
+// other window's recently lost exits are asked for by name alongside
+// discovery and lead the push order, discovery filling the rest (see
+// enumerateRecentExits). probeOnly is the resize pass's probe
+// (requestIpv6Probe): discovery's v6-capable request alone, with neither.
 func (self *multiClientWindow) enumerateDestinations(excludeDestinations []MultiHopId, probeOnly bool) ([]enumeratedDestination, error) {
+	rankMode := self.windowType.RankMode()
+	discover := func(excludeDestinations []MultiHopId) ([]enumeratedDestination, error) {
+		return self.discoverDestinations(excludeDestinations, probeOnly, rankMode)
+	}
+	if probeOnly {
+		return discover(excludeDestinations)
+	}
+
+	redial, ok, err := self.enumerateStickyRedial(excludeDestinations, rankMode)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return []enumeratedDestination{redial}, nil
+	}
+	return self.enumerateRecentExits(excludeDestinations, rankMode, discover)
+}
+
+// discoverDestinations is one discovery request set in push order. With a
+// family-aware generator it is: the v6-capable request first while a v6
+// shortfall is open and not starved (sized to the shortfall), then the main
+// v4-capable fill, which the platform draws dualstack-first. Duplicates across
+// the two are dropped. probeOnly asks the v6-capable request alone, and
+// nothing when no shortfall is open. A generator without the capability is
+// called exactly as before and its destinations read as legacy. Every call
+// carries the generator deadline, so a hung platform surfaces as an error on
+// the caller's ordinary retry cadence.
+func (self *multiClientWindow) discoverDestinations(excludeDestinations []MultiHopId, probeOnly bool, rankMode string) ([]enumeratedDestination, error) {
 	call := func(f func() (map[MultiHopId]DestinationStats, error)) (map[MultiHopId]DestinationStats, error) {
 		return windowGeneratorCall(
 			self.ctx,
@@ -474,17 +500,6 @@ func (self *multiClientWindow) enumerateDestinations(excludeDestinations []Multi
 				destination: destination,
 				stats:       stats,
 			})
-		}
-	}
-	rankMode := self.windowType.RankMode()
-
-	if !probeOnly {
-		redial, ok, err := self.enumerateStickyRedial(excludeDestinations, rankMode)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return append(ordered, redial), nil
 		}
 	}
 

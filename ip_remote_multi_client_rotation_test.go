@@ -582,12 +582,14 @@ func TestLifetimeDrainDue(t *testing.T) {
 
 // A live window -- resize, the enumerator and the watchdogs -- of one type and
 // profile against a generator, with the fast passes of
-// TestWindowResizeTargetHeldWhileDegraded.
+// TestWindowResizeTargetHeldWhileDegraded. Each configure runs on the settings
+// before the window starts.
 func stickyTestWindow(
 	t *testing.T,
 	generator MultiClientGenerator,
 	windowType WindowType,
 	performanceProfile *PerformanceProfile,
+	configure ...func(settings *MultiClientSettings),
 ) *multiClientWindow {
 	t.Helper()
 	resetBackendDegraded()
@@ -596,6 +598,9 @@ func stickyTestWindow(
 	settings := DefaultMultiClientSettings()
 	settings.WindowResizeTimeout = 20 * time.Millisecond
 	settings.WindowExpandTimeout = 20 * time.Millisecond
+	for _, configureSettings := range configure {
+		configureSettings(settings)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -613,6 +618,7 @@ func stickyTestWindow(
 		performanceProfile,
 		settings,
 		func() *ReliabilitySettings { return ReliabilitySettingsFrom(settings) },
+		nil,
 		nil,
 		nil,
 		nil,
