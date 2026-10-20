@@ -24,7 +24,7 @@ func lateNameClient(ctx context.Context, lookup ServerNameLookup, bridge bool) *
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:      true,
-			FreshFlowAffinity:        true,
+			AffinityMaxTime:          time.Minute,
 			ServerNameAffinityBridge: bridge,
 			SequenceIdleTimeout:      10 * time.Minute,
 			TcpSequenceIdleTimeout:   10 * time.Minute,
@@ -50,13 +50,13 @@ func TestLateServerNameEstablishedFlowKeepsItsExit(t *testing.T) {
 	lookup := newTestingLearningServerNameLookup()
 	mc := lateNameClient(ctx, lookup, true)
 
-	clientA := &multiClientChannel{ctx: ctx}
+	clientA := &multiClientChannel{ctx: ctx, healthy: true}
 
 	// flow 1 is created before any name is known, and commits to clientA the
 	// way the race would have
 	flow1 := lateNamePath(40000)
 	update1, _, _ := mc.sendUpdate(flow1, flowPin{})
-	update1.client.Store(clientA)
+	update1.selectAffinityClient(clientA)
 	flow1Key := flow1.ToIp4Path()
 
 	// the mux learns the name from the tls ClientHello, an rtt later
@@ -89,7 +89,7 @@ func TestAffinityBridgeDoesNotJoinTheDestinationGroup(t *testing.T) {
 
 	flow1 := lateNamePath(40000)
 	update1, _, _ := mc.sendUpdate(flow1, flowPin{})
-	update1.client.Store(&multiClientChannel{ctx: ctx})
+	update1.selectAffinityClient(&multiClientChannel{ctx: ctx, healthy: true})
 
 	destinationKey := (&IpPath{
 		Version:         4,
@@ -114,7 +114,7 @@ func TestAffinityBridgeDisabled(t *testing.T) {
 	mc := lateNameClient(ctx, lookup, false)
 
 	update1, _, _ := mc.sendUpdate(lateNamePath(40000), flowPin{})
-	update1.client.Store(&multiClientChannel{ctx: ctx})
+	update1.selectAffinityClient(&multiClientChannel{ctx: ctx, healthy: true})
 
 	lookup.learn("93.184.216.34", "foo.com")
 	_, _, current2 := mc.sendUpdate(lateNamePath(40001), flowPin{})
@@ -134,7 +134,7 @@ func TestAffinityBridgeSkipsDoneDonors(t *testing.T) {
 	doneCancel()
 
 	update1, _, _ := mc.sendUpdate(lateNamePath(40000), flowPin{})
-	update1.client.Store(&multiClientChannel{ctx: doneCtx})
+	update1.selectAffinityClient(&multiClientChannel{ctx: doneCtx, healthy: true})
 
 	lookup.learn("93.184.216.34", "foo.com")
 	_, _, current2 := mc.sendUpdate(lateNamePath(40001), flowPin{})

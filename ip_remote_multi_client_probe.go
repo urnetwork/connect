@@ -535,7 +535,7 @@ func (self *RemoteUserNatMultiClient) registerProbeFlow(
 		update := newMultiClientChannelUpdate(self.probeCtx(), ipPath)
 		update.probe = probe
 		update.activityTime = time.Now()
-		update.client.Store(client)
+		update.selectAffinityClient(client)
 
 		switch version {
 		case 4:

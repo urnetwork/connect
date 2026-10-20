@@ -61,13 +61,14 @@ type tcpCollapseGroup struct {
 
 // Replaces the escaping callback and once without a prequeue allocation or
 // reservation. Test seams keep their legacy whole-group admission contract.
-func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup, ack bool, raceOrder uint64) {
+func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup, ack bool, raceOrder uint64) bool {
 	// The same caller-owned descriptor can retry a refused offer. A refusal
 	// never acquired source ownership, so no previous target remains live.
 	group.completionFlags.Store(group.completionFlags.Load() & groupCompletionSynOffer)
 	group.collapseOwner, group.collapseNext = nil, nil
 	group.collapseSource, group.admissionTime = nil, time.Time{}
 	group.completionClient = self
+	group.affinitySourceRegistration, group.affinitySourceState = 0, 0
 	if ack {
 		group.completionFlags.Or(groupCompletionAck)
 	}
@@ -76,6 +77,18 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		group.completionFlags.Or(groupCompletionTracked)
 		update := group.collapseAdmission.update
 		update.stateLock.Lock()
+		if !update.isProbe() {
+			key, valid := self.affinitySourceKey()
+			if !valid {
+				update.stateLock.Unlock()
+				return false
+			}
+			group.affinitySourceRegistration = update.affinitySources.enrollWithLock(key)
+			if group.affinitySourceRegistration == 0 {
+				update.stateLock.Unlock()
+				return false
+			}
+		}
 		if raceOrder != 0 {
 			group.completionFlags.Or(groupCompletionCandidate | raceOrder<<16)
 			group.validateCollapseCandidateWithLock()
@@ -84,6 +97,7 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		}
 		update.stateLock.Unlock()
 	}
+	return true
 }
 
 // Refusal drops only its close barrier, never generation or coverage. A true
@@ -344,6 +358,7 @@ func (self *multiClientChannelUpdate) abandonCollapseClaimsWithLock() {
 // Successful channel handoff and source dequeue may race. Either proves
 // admission; exactly one records performance/hold time, before serialization.
 func (self *parsedPacketGroup) sendGroupAdmitted(source *SendSequence) {
+	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
 		return
 	}
@@ -356,6 +371,14 @@ func (self *parsedPacketGroup) sendGroupAdmitted(source *SendSequence) {
 
 // Admission accounting is independent of coverage and source control order.
 func (self *parsedPacketGroup) admitCollapseWithLock(source *SendSequence, sourceOrdered bool) {
+	self.affinitySourceState |= affinitySourceAdmitted
+	if self.affinitySourceRegistration != 0 {
+		entry := self.collapseAdmission.update.affinitySources.entryWithLock(int(self.affinitySourceRegistration&0xff) - 1)
+		if entry == nil || entry.epoch != self.affinitySourceRegistration>>8 {
+			panic("affinity source admission lost its exact enrollment")
+		}
+		entry.seen = true
+	}
 	if self.completionFlags.Load()&groupCompletionAdmitted != 0 {
 		return
 	}
@@ -404,6 +427,7 @@ func (self *parsedPacketGroup) observeCollapseAdmissionWithLock(sourceOrdered bo
 // The sole source consumer supplies FIFO, including an unbuffered handoff.
 // An offer's eventual public return cannot change this order.
 func (self *parsedPacketGroup) sendGroupDequeued(source *SendSequence) {
+	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
 		return
 	}
@@ -462,6 +486,7 @@ type tcpCandidateControlState struct {
 	synIndex       int
 	rstOrder       uint64
 	synNumber      uint32
+	synEnd         uint32
 	sequenceNumber uint32
 	ackNumber      uint32
 	window         uint16
@@ -487,7 +512,7 @@ func (self *parsedPacketGroup) observeCandidateControlWithLock() {
 		return
 	}
 	if state.order == 0 {
-		state.synSeen, state.synNumber = update.synGenerationSeen, update.synGenerationNumber
+		state.synSeen, state.synNumber, state.synEnd = update.synGenerationSeen, update.synGenerationNumber, update.synGenerationEnd
 		state.finSeen, state.finSequence = update.egressFinSeen, update.egressFinSequence
 		state.ackSeen, state.ackSequence = update.egressAckSeen, update.egressAckSequence
 		state.performance = update.ackPerformance
@@ -508,12 +533,19 @@ func (self *parsedPacketGroup) observeCandidateControlWithLock() {
 			// cross-candidate lineage. This sticky bit cannot wrap.
 			state.ambiguousSyn = state.ambiguousSyn || state.synOrder != 0
 			state.synSeen, state.synNumber, state.synOrder = true, path.SequenceNumber, state.order
+			state.synEnd = tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount)
 			state.synIndex = index
 			state.closed, state.controlSeen = false, true
 			state.finSeen, state.ackSeen = false, false
 			state.finSequence, state.ackSequence = 0, 0
 			state.performance.reset()
 			changed = true
+		}
+		if path.Syn && state.synSeen && state.synNumber == path.SequenceNumber {
+			end := tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount)
+			if end-(state.synNumber+1) < 1<<31 && int32(end-state.synEnd) > 0 {
+				state.synEnd = end
+			}
 		}
 		state.sequenceNumber, state.ackNumber, state.window = path.SequenceNumber, path.AckSequenceNumber, path.TcpWindowSize
 		state.performance.observe(self.admissionTime, path.Ack, path.AckSequenceNumber)
@@ -615,7 +647,8 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 			if forceSyn && update.synGenerationSeen && update.synGenerationNumber == path.SequenceNumber {
 				// The candidate source proved a new cohort even when an
 				// intervening unwritten SYN vanished before winner replay.
-				update.resetSynGenerationWithLock(path.SequenceNumber)
+				update.resetSynGenerationWithLock(path.SequenceNumber,
+					tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount))
 			}
 			update.resetSequenceWithLock(packet)
 			update.sequenceTime = admittedAt
@@ -636,6 +669,11 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 		}
 		if path.Syn {
 			update.sequenceMetricSynSeen, update.sequenceMetricSynNumber = true, path.SequenceNumber
+			end := tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount)
+			if update.synGenerationSeen && update.synGenerationNumber == path.SequenceNumber &&
+				end-(update.synGenerationNumber+1) < 1<<31 && int32(end-update.synGenerationEnd) > 0 {
+				update.synGenerationEnd = end
+			}
 		}
 		// Source order reconciles a producer observation delayed after its
 		// enqueue. ACK progress is monotonic, so an existing sample is not
@@ -740,6 +778,9 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 	defer update.releaseCollapseClaims()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
+	if materialized {
+		self.affinitySourceState |= affinitySourceMaterialized
+	}
 	owner := self.collapseOwner
 	if owner == nil {
 		if materialized {
@@ -784,6 +825,11 @@ func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
 	if self.completionFlags.Load()&groupCompletionTracked != 0 {
 		update := self.collapseAdmission.update
 		update.stateLock.Lock()
+		self.affinitySourceState |= affinitySourceTerminal
+		if err != nil {
+			self.affinitySourceState |= affinitySourceFailed
+		}
+		self.settleAffinitySourceWithLock()
 		self.publishCollapseWithLock()
 		self.collapseAdmission.releaseTcpRecoveryWithLock()
 		self.collapseAdmission.revokeTcpRecoveryWithLock(err)
@@ -801,6 +847,13 @@ func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
 // owns refused packet buffers, and no callback or source reads their contents.
 func (self *parsedPacketGroup) finishGroupOffer() {
 	self.completionFlags.Or(groupCompletionReturned)
+	if self.completionFlags.Load()&groupCompletionTracked != 0 {
+		update := self.collapseAdmission.update
+		update.stateLock.Lock()
+		self.affinitySourceState |= affinitySourceReturned
+		self.settleAffinitySourceWithLock()
+		update.stateLock.Unlock()
+	}
 	self.releaseCollapseMemory()
 }
 
@@ -933,7 +986,7 @@ func (self *multiClientChannelUpdate) resetCandidateControlWithLock(client *mult
 	order := state.rstOrder
 	if syn {
 		path.SequenceNumber, order = state.synNumber, state.synOrder
-		self.resetSynGenerationWithLock(state.synNumber)
+		self.resetSynGenerationWithLock(state.synNumber, state.synEnd)
 	}
 	self.resetSequenceWithLock(&parsedPacket{ipPath: &path})
 	self.sequenceTime = admittedAt

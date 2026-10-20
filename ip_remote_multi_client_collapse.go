@@ -21,6 +21,7 @@ type tcpSynAdmission struct {
 	responseClient  *multiClientChannel
 	responseControl tcpControlObservation
 	sequence        uint32
+	sequenceEnd     uint32
 }
 
 func (admission *tcpSynAdmission) clear() {
@@ -59,16 +60,19 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 	hasPriorState := seen || update.sequencePacketCount != 0
 	newGeneration := false
 	hasSyn := false
+	sequenceEnd := sequence + 1
 	for i := range group.packets {
 		path := group.packets[i].ipPath
 		if path.Syn {
 			hasSyn = true
 			newGeneration = newGeneration || hasPriorState && (!seen || sequence != path.SequenceNumber)
 			seen, sequence, hasPriorState = true, path.SequenceNumber, true
+			sequenceEnd = tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount)
 		}
 	}
 	if hasSyn && len(parents) != 0 {
 		if update.IsDone() {
+			admission.releaseTcpRecoveryWithLock()
 			update.stateLock.Unlock()
 			return false
 		}
@@ -83,7 +87,7 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 			group.admissionObservations = &sendPackAdmissionObservations{}
 		}
 		observation := &group.admissionObservations.synAdmission
-		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence}
+		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence, sequenceEnd: sequenceEnd}
 		update.synAdmissions = observation
 	}
 	update.stateLock.Unlock()
@@ -116,16 +120,14 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 	}
 	if control.syn && control.ack {
 		for admission := update.synAdmissions; admission != nil; admission = admission.next {
-			// The provider acknowledges the SYN at ISN+1, including a
-			// payload-bearing SYN. uint32 addition preserves wraparound.
-			if control.ackSequenceNumber == admission.sequence+1 {
+			if tcpSynAckInRange(admission.sequence, admission.sequenceEnd, control.ackSequenceNumber) {
 				admission.responseClient = client
 				admission.responseControl = control
 			}
 		}
 	}
 	if update.synGenerationAwaiting {
-		if !control.syn || !control.ack || control.ackSequenceNumber != update.synGenerationNumber+1 {
+		if !control.syn || !control.ack || !tcpSynAckInRange(update.synGenerationNumber, update.synGenerationEnd, control.ackSequenceNumber) {
 			return false
 		}
 		update.synGenerationAwaiting = false

@@ -33,7 +33,7 @@ func bindH1MediaFlow(
 	now time.Time,
 ) *multiClientChannelUpdate {
 	update := newMultiClientChannelUpdate(parent.ctx, path)
-	update.client.Store(client)
+	update.selectAffinityClient(client)
 	update.receivedInbound.Store(true)
 	update.activityTime = now
 	pathKey := path.ToIp4Path()
@@ -66,18 +66,15 @@ func TestH1DashBlackholeQuarantineResetsAndRebinds(t *testing.T) {
 
 	settings := DefaultMultiClientSettings()
 	settings.QuicRebindOnExitLoss = true
-	// Keep the legacy DNS inheritance path enabled in this test so the CNN
-	// quarantine remediation remains covered even though production now races
-	// ordinary fresh flows by default.
-	settings.FreshFlowAffinity = true
+	settings.AffinityMaxTime = time.Minute
 	parent := flowReaperTestParent(ctx, settings)
 	parent.reliabilityMetrics = newReliabilityMetrics()
 	parent.removalReceiveQueue = make(chan receivePacket, 8)
 	parent.dnsExitHints = map[string]dnsExitHint{}
 	parent.dnsAddressExitHints = map[netip.Addr]dnsExitHint{}
 
-	failed := &multiClientChannel{ctx: ctx, settings: settings}
-	healthy := &multiClientChannel{ctx: ctx, settings: settings}
+	failed := &multiClientChannel{ctx: ctx, settings: settings, healthy: true}
+	healthy := &multiClientChannel{ctx: ctx, settings: settings, healthy: true}
 	parent.rebindCandidatesFunc = func(client *multiClientChannel) []*multiClientChannel {
 		if client != failed {
 			t.Fatalf("candidate gather for %p, want failed exit %p", client, failed)
@@ -342,7 +339,7 @@ func TestFreshHandshakeNeverFollowsQuarantinedAffinityDonor(t *testing.T) {
 	pathKey := path.ToIp4Path()
 	donorUpdate := newMultiClientChannelUpdate(context.Background(), path)
 	defer donorUpdate.Close()
-	donorUpdate.client.Store(donor)
+	donorUpdate.selectAffinityClient(donor)
 	parent.ip4PathUpdates[pathKey] = donorUpdate
 
 	fresh := newMultiClientChannelUpdate(context.Background(), cnnDashPath(44101, "198.51.100.31"))

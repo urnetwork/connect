@@ -26,6 +26,67 @@ type pendingReceiverRtt struct {
 	compressionMicros uint32
 }
 
+// One pending reservation can coexist with its previous confirmed tail. Only
+// that tail publishes ready demand; history never retains a physical route.
+// The resend lock protects both records and the acquired carrier generation.
+type windowPacingReadyWrite struct {
+	pendingId           Id
+	pendingAtNanos      int64
+	pendingGeneration   uint64
+	confirmedId         Id
+	confirmedAtNanos    int64
+	confirmedGeneration uint64
+	route               Route
+	lane                Id
+}
+
+// Route retirement and owner teardown must release the one live channel too.
+func (self *SendSequence) resetPacingReadyWrite() {
+	if self.resendQueue == nil {
+		return
+	}
+	self.resendQueue.stateLock.Lock()
+	defer self.resendQueue.stateLock.Unlock()
+	self.pacingReadyWrite = windowPacingReadyWrite{}
+}
+
+func (self *SendSequence) clearPacingReadyPending(messageId Id) {
+	if self.resendQueue == nil {
+		return
+	}
+	self.resendQueue.stateLock.Lock()
+	defer self.resendQueue.stateLock.Unlock()
+	if self.pacingReadyWrite.pendingId == messageId {
+		self.pacingReadyWrite.pendingId, self.pacingReadyWrite.pendingAtNanos = Id{}, 0
+		self.pacingReadyWrite.pendingGeneration = 0
+	}
+}
+
+// Called before RTT confirmation. Earlier synchronous ACK credit remains
+// incomplete, and cannot be upgraded by this later successful carrier return.
+func (self *SendSequence) finishPacingReadyWrite(item *sendItem, disposition transferWriteDisposition, writeErr error, generation uint64) {
+	if item == nil || self.resendQueue == nil {
+		return
+	}
+	self.resendQueue.stateLock.Lock()
+	defer self.resendQueue.stateLock.Unlock()
+	ready := &self.pacingReadyWrite
+	if writeErr != nil || disposition.transportType != TransportTypeH1 || !disposition.reliable ||
+		disposition.unreliable || disposition.route == nil || item.rttState != sendItemRttWritePending ||
+		item.sendCount != 1 || item.pacingByteCount <= 0 || ready.pendingId != item.messageId ||
+		ready.pendingAtNanos <= 0 || item.pacingSentAtNanos < ready.pendingAtNanos ||
+		generation == 0 || ready.pendingGeneration != generation {
+		*ready = windowPacingReadyWrite{}
+		return
+	}
+	if ready.route != disposition.route || ready.confirmedGeneration != generation {
+		ready.route, ready.lane = disposition.route, NewId()
+	}
+	ready.confirmedId, ready.confirmedAtNanos = item.messageId, ready.pendingAtNanos
+	ready.confirmedGeneration = generation
+	ready.pendingId, ready.pendingAtNanos, ready.pendingGeneration = Id{}, 0, 0
+}
+
 // Preserve the established local-nanosecond API while deriving elapsed time
 // from the client's monotonic clock, rather than subtracting two wall clocks.
 func (self *Client) feedbackArrivalNanos(at time.Time) int64 {
@@ -64,6 +125,7 @@ func (self *SendSequence) invalidateReceiverRttWrite(item *sendItem) {
 	}
 	self.resendQueue.stateLock.Lock()
 	defer self.resendQueue.stateLock.Unlock()
+	self.pacingReadyWrite = windowPacingReadyWrite{}
 	if item.rttState != sendItemRttObserved {
 		item.rttState = sendItemRttUnavailable
 	}

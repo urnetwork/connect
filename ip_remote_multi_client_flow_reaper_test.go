@@ -17,8 +17,8 @@ func TestFlowReaperUDPPreviousPeerGenerationKeepsOriginalPort(t *testing.T) {
 	defer cancel()
 	settings := DefaultMultiClientSettings()
 	settings.DestinationAffinity = false
-	if settings.SequenceIdleTimeout != 120*time.Second || !settings.UdpTeardownSignal {
-		t.Fatal("this control must exercise the actual two-minute UDP teardown defaults")
+	if settings.SequenceIdleTimeout != 5*time.Minute || !settings.UdpTeardownSignal {
+		t.Fatal("this control must exercise the actual five-minute UDP teardown defaults")
 	}
 	parent := flowReaperTestParent(ctx, settings)
 	parent.reliabilityMetrics = newReliabilityMetrics()

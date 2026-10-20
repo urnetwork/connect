@@ -11,10 +11,7 @@ import (
 
 func bindFlowTestParent() *RemoteUserNatMultiClient {
 	settings := DefaultMultiClientSettings()
-	// This helper exercises the legacy donor mechanics themselves. Production
-	// defaults ordinary fresh flows to the race; tests for that default use an
-	// unmodified settings value explicitly below.
-	settings.FreshFlowAffinity = true
+	settings.AffinityMaxTime = time.Minute
 	return &RemoteUserNatMultiClient{
 		settings:      settings,
 		clientUpdates: map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
@@ -24,7 +21,7 @@ func bindFlowTestParent() *RemoteUserNatMultiClient {
 // bindFlowTestChannel carries a live ctx: bindClientFlow asks IsDone(), which
 // reads it, and a bare struct would panic where production never can.
 func bindFlowTestChannel(parent *RemoteUserNatMultiClient) *multiClientChannel {
-	return &multiClientChannel{ctx: context.Background(), settings: parent.settings}
+	return &multiClientChannel{ctx: context.Background(), settings: parent.settings, healthy: true}
 }
 
 // A flow that wins its exit from an async race is committed without the send
@@ -40,7 +37,7 @@ func TestBindClientFlowRecordsRaceAssignedFlow(t *testing.T) {
 
 	// the race stores the winner directly, as clientReceivePacket and
 	// scheduleCompleteRace both do
-	update.client.Store(client)
+	update.selectAffinityClient(client)
 
 	if 0 != len(parent.clientUpdates[client]) {
 		t.Fatal("baseline: the flow should not be recorded before binding")
@@ -65,11 +62,11 @@ func TestBindClientFlowMovesFlowOffThePreviousExit(t *testing.T) {
 	newClient := bindFlowTestChannel(parent)
 	update := &multiClientChannelUpdate{}
 
-	update.client.Store(oldClient)
+	update.selectAffinityClient(oldClient)
 	parent.bindClientFlow(update, oldClient)
 
 	// re-raced onto another exit
-	update.client.Store(newClient)
+	update.selectAffinityClient(newClient)
 	parent.bindClientFlow(update, newClient)
 
 	if _, ok := parent.clientUpdates[oldClient]; ok {
@@ -90,7 +87,7 @@ func TestBindClientFlowIgnoresStaleWinner(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 
 	// the flow has already moved on by the time the bind runs
-	update.client.Store(actualClient)
+	update.selectAffinityClient(actualClient)
 	parent.bindClientFlow(update, raceWinner)
 
 	if 0 != len(parent.clientUpdates[raceWinner]) {
@@ -122,7 +119,7 @@ func TestBindClientFlowDeclinesDoneClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &multiClientChannel{ctx: ctx, settings: parent.settings}
 	update := &multiClientChannelUpdate{}
-	update.client.Store(client)
+	update.selectAffinityClient(client)
 
 	cancel() // the exit is removed while the race is completing
 	parent.bindClientFlow(update, client)
@@ -177,7 +174,7 @@ func TestBindClientFlowMakesRacedFlowsVisibleToTheCap(t *testing.T) {
 
 	for range 3 {
 		update := &multiClientChannelUpdate{}
-		update.client.Store(client)
+		update.selectAffinityClient(client)
 		parent.bindClientFlow(update, client)
 	}
 
@@ -213,8 +210,9 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 			DestinationIp:   net.IPv4(203, 0, 113, 7),
 			DestinationPort: 443,
 		}
-		flowUpdate := &multiClientChannelUpdate{}
-		flowUpdate.client.Store(donor)
+		flowUpdate := newMultiClientChannelUpdate(context.Background(), flowPath)
+		defer flowUpdate.Close()
+		flowUpdate.selectAffinityClient(donor)
 		parent.bindClientFlow(flowUpdate, donor)
 		ip4 := flowPath.ToIp4Path()
 		parent.ip4PathUpdates[ip4] = flowUpdate
@@ -226,7 +224,8 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 		parent.stateLock.Unlock()
 		t.Fatal("fixture: the donor is not at cap")
 	}
-	newFlow := &multiClientChannelUpdate{}
+	newFlow := newMultiClientChannelUpdate(context.Background(), nil)
+	defer newFlow.Close()
 	parent.inheritAffinityClient4WithLock(newFlow, donorPaths)
 	parent.stateLock.Unlock()
 	if newFlow.client.Load() != donor {
@@ -235,7 +234,8 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 
 	// the pre-change veto is the A/B point
 	parent.settings.AffinityStickyPastCap = false
-	vetoed := &multiClientChannelUpdate{}
+	vetoed := newMultiClientChannelUpdate(context.Background(), nil)
+	defer vetoed.Close()
 	parent.stateLock.Lock()
 	parent.inheritAffinityClient4WithLock(vetoed, donorPaths)
 	parent.stateLock.Unlock()
@@ -244,18 +244,16 @@ func TestAffinityInheritanceIsStickyPastTheFlowCap(t *testing.T) {
 	}
 }
 
-// Ordinary fresh flows must reach the provider race by default. A live page
-// connection is useful performance evidence, but it must not be a hard route
-// assignment for a later media connection. Explicit pins are the opt-in to
-// stable one-egress behavior.
-func TestFreshFlowAffinityDefaultsToRaceAndExplicitPinStillInherits(t *testing.T) {
+// Disabling ordinary inheritance leaves the donor and explicit pins intact.
+func TestAffinityMaxTimeDisablesOrdinaryButKeepsPins(t *testing.T) {
 	settings := DefaultMultiClientSettings()
-	if settings.FreshFlowAffinity {
-		t.Fatal("FreshFlowAffinity must default off")
+	if settings.AffinityMaxTime != time.Minute {
+		t.Fatal("affinity age must default to one minute")
 	}
-	if ReliabilitySettingsFrom(settings).FreshFlowAffinity {
-		t.Fatal("default reliability projection unexpectedly enabled fresh-flow affinity")
+	if ReliabilitySettingsFrom(settings).AffinityMaxTime != time.Minute {
+		t.Fatal("default reliability projection lost the affinity age")
 	}
+	settings.AffinityMaxTime = 0
 
 	parent := bindFlowTestParent()
 	parent.settings = settings
@@ -264,7 +262,7 @@ func TestFreshFlowAffinityDefaultsToRaceAndExplicitPinStillInherits(t *testing.T
 	donorPath := affinityPerformanceTestPath(43990)
 	donorUpdate := newMultiClientChannelUpdate(context.Background(), donorPath)
 	defer donorUpdate.Close()
-	donorUpdate.client.Store(donor)
+	donorUpdate.selectAffinityClient(donor)
 	donorKey := donorPath.ToIp4Path()
 	parent.ip4PathUpdates[donorKey] = donorUpdate
 	donorPaths := map[Ip4Path]time.Time{donorKey: time.Now()}
@@ -291,9 +289,9 @@ func TestFreshFlowAffinityDefaultsToRaceAndExplicitPinStillInherits(t *testing.T
 		t.Fatal("explicit pin did not opt back into stable-exit inheritance")
 	}
 
-	settings.FreshFlowAffinity = true
-	if !ReliabilitySettingsFrom(settings).FreshFlowAffinity {
-		t.Fatal("set FreshFlowAffinity was dropped by the reliability projection")
+	settings.AffinityMaxTime = 59 * time.Second
+	if ReliabilitySettingsFrom(settings).AffinityMaxTime != 59*time.Second {
+		t.Fatal("affinity age override was dropped by the reliability projection")
 	}
 }
 
@@ -324,7 +322,7 @@ func TestDestinationExitsJoinsFlowsToCurrentExits(t *testing.T) {
 		}
 		// a real update (live ctx), as production registers them
 		update := newMultiClientChannelUpdate(context.Background(), flowPath)
-		update.client.Store(client)
+		update.selectAffinityClient(client)
 		parent.ip4PathUpdates[flowPath.ToIp4Path()] = update
 	}
 
@@ -448,8 +446,9 @@ func TestQuarantinedDonorLosesItsSite(t *testing.T) {
 		DestinationIp:   net.IPv4(203, 0, 113, 9),
 		DestinationPort: 443,
 	}
-	flowUpdate := &multiClientChannelUpdate{}
-	flowUpdate.client.Store(donor)
+	flowUpdate := newMultiClientChannelUpdate(context.Background(), flowPath)
+	defer flowUpdate.Close()
+	flowUpdate.selectAffinityClient(donor)
 	ip4 := flowPath.ToIp4Path()
 	parent.ip4PathUpdates[ip4] = flowUpdate
 	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
@@ -515,8 +514,9 @@ func TestPinnedFlowCannotFollowBench(t *testing.T) {
 		DestinationIp:   net.IPv4(203, 0, 113, 40),
 		DestinationPort: 443,
 	}
-	flowUpdate := &multiClientChannelUpdate{}
-	flowUpdate.client.Store(donor)
+	flowUpdate := newMultiClientChannelUpdate(context.Background(), flowPath)
+	defer flowUpdate.Close()
+	flowUpdate.selectAffinityClient(donor)
 	ip4 := flowPath.ToIp4Path()
 	parent.ip4PathUpdates[ip4] = flowUpdate
 	donorPaths := map[Ip4Path]time.Time{ip4: time.Now()}
@@ -796,7 +796,7 @@ func TestMigrateClientFlowsMovesQuicResetsTcp(t *testing.T) {
 			DestinationPort: destPort,
 		}
 		update := newMultiClientChannelUpdate(context.Background(), flowPath)
-		update.client.Store(draining)
+		update.selectAffinityClient(draining)
 		if established {
 			update.receivedInbound.Store(true)
 		}

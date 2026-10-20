@@ -1,0 +1,46 @@
+H1 checkpoint handoff — 2026-10-20
+
+This checkpoint is not fully qualified.
+
+Included: verified contract authority for duplicate held heads; preservation of
+overdue selective-recovery deadlines; earliest sequence-number priority for
+equal resend deadlines; exact same-carrier sparse-original pacing evidence;
+mixed raw/head denominator coverage; deterministic regressions and controls.
+
+Qualification retained:
+- Combined 52: one screen, then three separate normal and three separate race
+  confirmations passed, including all five unchanged rollover/relay-loss rows.
+- Full Connect normal: TestWindowPathDispatchQualityPhaseProbe failed at 2.5ms,
+  5ms and1ms. The user-requested checkpoint interrupted the remaining run.
+  Owner joined 143; all seven source-after comparisons and 4,282 candidate hashes
+  matched. This is not a full normal pass. Full race remains outstanding.
+- No compiler or test was run as part of shared-source integration. The only
+  formatting successor indents two transfer.go comparator comment lines.
+- After integration and sanctioned SDK/resource generation, compile-only checks
+  passed for Connect ./..., SDK ./... and tests/runner/perf. Each used Go 1.27.2,
+  -count=1 and -run '^$'; no behavioral tests were selected. This establishes
+  source compilation, not full-suite, performance or device-memory qualification.
+
+Unresolved failure:
+The 2.5ms row accumulated 53,004,800 bytes of positive one-second payload deficit
+against the unchanged 50,331,648-byte allowance at virtual 48s. This is cumulative
+liveness debt, not allocated memory. Natural relay loss/recovery kept resetting
+settlement; all eight lanes still had unresolved loss at the captured boundary.
+The other two rows exceeded the same cap. Preserve the 48 MiB allowance, fixed
+origin/grid, residence gates, ACK lifetime and original throughput thresholds.
+
+Next causal experiment:
+After synchronization, re-pin the actual checkpoint. Compare the unchanged
+2.5ms cell on the frozen control and combined candidate; if separately admitted,
+isolate only the seven-line mixed-head coverage guard in a causal comparison.
+Its full-head-span rule may alter valid congestion evidence, but the failure
+does not capture the selected interval/flight proof. No attribution or fix is
+established; do not weaken assertions, assume flakiness or silently roll back.
+
+Retained receipts (local campaign full-campaign-current.Fxlt45):
+h1-combined52-prep.8UDtHN/COMBINED52.OUTCOME.json
+  sha256 efcb5b7c1c27d558d862dbfae9a6f8cfb6e50455a1c6ca98982c4d5dfc1ddf82
+h1-fullconnect-setup.3nj5hK/full-normal/runtime/result.stdout.jsonl
+  stable failure lines 46239–46260, 46321–46343, 46375–46395.
+Keep sealed source packets and failed receipts immutable. Any further runtime
+requires fresh bounded ownership/admission; this note grants none.

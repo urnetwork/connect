@@ -14,6 +14,8 @@ type dnsExitHint struct {
 	client       *multiClientChannel
 	affinityName string
 	createTime   time.Time
+	// Answer refreshes retain provider and original creation age, not its flow.
+	selection *multiClientAffinitySelection
 }
 
 // bindDnsResultToExit joins a successful DoH answer to the provider channel
@@ -28,11 +30,8 @@ func (self *RemoteUserNatMultiClient) bindDnsResultToExit(
 	if dohPath == nil || domain == "" {
 		return false
 	}
-	if !self.reliabilitySettings().FreshFlowAffinity {
-		// Ordinary flows no longer consume hard DNS-exit hints. Avoid retaining
-		// provider channel graphs (up to two 4096-entry maps for an hour) for a
-		// disabled policy; a runtime A/B enable begins learning from subsequent
-		// DNS answers.
+	if self.reliabilitySettings().AffinityMaxTime <= 0 {
+		// Disabled ordinary affinity retains no unused DNS provider graphs.
 		return false
 	}
 	affinityName := affinityNameForServerName(domain)
@@ -41,19 +40,29 @@ func (self *RemoteUserNatMultiClient) bindDnsResultToExit(
 	}
 
 	var client *multiClientChannel
+	var selection *multiClientAffinitySelection
 	now := time.Now()
 	self.stateLock.Lock()
+	// A runtime disable may have won after the lock-free entry gate.
+	maxTime := self.reliabilitySettings().AffinityMaxTime
+	if maxTime <= 0 {
+		self.stateLock.Unlock()
+		return false
+	}
 	switch dohPath.Version {
 	case 4:
 		if update := self.ip4PathUpdates[dohPath.ToIp4Path()]; update != nil && !update.IsDone() {
-			client = update.client.Load()
+			selection = update.client.loadSelection()
 		}
 	case 6:
 		if update := self.ip6PathUpdates[dohPath.ToIp6Path()]; update != nil && !update.IsDone() {
-			client = update.client.Load()
+			selection = update.client.loadSelection()
 		}
 	}
-	if client == nil || client.IsDone() || client.affinityDonorEligible(false, 0) != donorEligible {
+	if selection != nil {
+		client = selection.client
+	}
+	if !selection.eligible(client, now, maxTime) || client.IsDone() || client.affinityDonorEligible(false, 0) != donorEligible {
 		self.stateLock.Unlock()
 		return false
 	}
@@ -79,7 +88,7 @@ func (self *RemoteUserNatMultiClient) bindDnsResultToExit(
 			delete(self.dnsExitHints, oldestName)
 		}
 	}
-	hint := dnsExitHint{client: client, affinityName: affinityName, createTime: now}
+	hint := dnsExitHint{client: client, affinityName: affinityName, createTime: now, selection: selection}
 	self.dnsExitHints[affinityName] = hint
 	for _, addr := range addrs {
 		addr = addr.Unmap()
@@ -145,16 +154,16 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 	if update == nil || update.client.Load() != nil || ipPath == nil {
 		return false
 	}
-	if !update.pinned && !self.reliabilitySettings().FreshFlowAffinity {
-		// A DNS answer says which exit resolved a name, not which exit will
-		// serve it best. Ordinary fresh flows therefore keep the hint only as
-		// measurement context and proceed to the provider race.
+	if !update.pinned && self.reliabilitySettings().AffinityMaxTime <= 0 {
 		return false
 	}
 	now := time.Now()
 	eligible := func(hint dnsExitHint) bool {
 		client := hint.client
 		if dnsExitHintTtl <= now.Sub(hint.createTime) || client == nil || client.IsDone() {
+			return false
+		}
+		if !update.pinned && !hint.selection.eligible(client, now, self.reliabilitySettings().AffinityMaxTime) {
 			return false
 		}
 		// a hint learned from one family's answer must not place a flow of
@@ -197,8 +206,7 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 					break
 				}
 			}
-			if nameMatches && eligible(hint) {
-				update.client.Store(hint.client)
+			if nameMatches && eligible(hint) && self.adoptAffinityClientWithLock(update, hint.client, hint.selection) {
 				return true
 			}
 			if dnsExitHintTtl <= now.Sub(hint.createTime) || hint.client == nil || hint.client.IsDone() {
@@ -222,8 +230,9 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 		if !eligible(hint) {
 			continue
 		}
-		update.client.Store(client)
-		return true
+		if self.adoptAffinityClientWithLock(update, client, hint.selection) {
+			return true
+		}
 	}
 	return false
 }

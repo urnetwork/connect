@@ -206,9 +206,9 @@ func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideM
 	return upstream(source, provideMode, packet, timeout)
 }
 
-// Consumes a packet burst after grouping it by exact directional flow. Each
-// group is classified once at the routing boundary while content-aware
-// observers still inspect its packets in order.
+// Consumes a packet burst grouped by exact directional flow and TCP SYN
+// generation. Each generation is classified/admitted as a whole; a later SYN
+// cannot move its old-generation prefix to a replacement NAT identity.
 func (self *IpMux) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -216,6 +216,7 @@ func (self *IpMux) SendPacketBatch(
 	timeout time.Duration,
 ) int {
 	groups, rejectedPackets := groupIpPackets(packets)
+	groups = splitAffinitySynGroups(groups, nil)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
 	}

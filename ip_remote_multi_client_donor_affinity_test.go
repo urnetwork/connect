@@ -45,7 +45,7 @@ func donorAffinityPath(sourcePort int) *IpPath {
 // tests control when (whether) the record is reaped.
 func registerDonorFlow(mc *RemoteUserNatMultiClient, ipPath *IpPath, exit *multiClientChannel) *multiClientChannelUpdate {
 	update := newMultiClientChannelUpdate(mc.ctx, ipPath)
-	update.client.Store(exit)
+	update.selectAffinityClient(exit)
 	ip4Path := ipPath.ToIp4Path()
 	mc.stateLock.Lock()
 	defer mc.stateLock.Unlock()
@@ -73,7 +73,7 @@ func donorAffinityClient(ctx context.Context) *RemoteUserNatMultiClient {
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:    true,
-			FreshFlowAffinity:      true,
+			AffinityMaxTime:        time.Minute,
 			SequenceIdleTimeout:    10 * time.Minute,
 			TcpSequenceIdleTimeout: 10 * time.Minute,
 		},
@@ -96,7 +96,7 @@ func TestDonorAffinityRetiredFlowDonatesItsExit(t *testing.T) {
 	defer cancel()
 
 	mc := donorAffinityClient(ctx)
-	exit := &multiClientChannel{ctx: ctx}
+	exit := &multiClientChannel{ctx: ctx, healthy: true}
 
 	// flow 1 commits to the exit, then retires (the connection closed). The
 	// registration is built directly so the flow reaper does not race the
@@ -119,16 +119,15 @@ func TestDonorAffinityRetiredFlowDonatesItsExit(t *testing.T) {
 	}
 }
 
-// The production policy keeps the same measurement key but does not build or
-// consume the reverse donor index for an ordinary fresh flow. This drives the
-// complete sendUpdate path, not only the donor helper.
-func TestDonorAffinityDefaultFreshFlowReachesRace(t *testing.T) {
+// Disabled affinity keeps measurement keys without ordinary donor indexes.
+// This drives complete sendUpdate routing, not only its donor helper.
+func TestDonorAffinityDisabledFreshFlowReachesRace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	mc := donorAffinityClient(ctx)
-	mc.settings.FreshFlowAffinity = false
-	exit := &multiClientChannel{ctx: ctx}
+	mc.settings.AffinityMaxTime = 0
+	exit := &multiClientChannel{ctx: ctx, healthy: true}
 	flow1 := donorAffinityPath(40011)
 	update1 := registerDonorFlow(mc, flow1, exit)
 	defer update1.Close()
@@ -144,7 +143,7 @@ func TestDonorAffinityDefaultFreshFlowReachesRace(t *testing.T) {
 
 	for key := range update2.affinityIp4Paths {
 		if _, retained := mc.affinityIp4Paths[key][update2.ipPath.ToIp4Path()]; retained {
-			t.Fatal("default-off hard affinity retained a reverse donor-index entry")
+			t.Fatal("disabled affinity retained a reverse donor-index entry")
 		}
 	}
 
@@ -158,12 +157,12 @@ func TestDonorAffinityDefaultFreshFlowReachesRace(t *testing.T) {
 	}
 }
 
-func TestFreshFlowAffinityRuntimeToggleRebuildsOnlyNeededDonorIndexes(t *testing.T) {
+func TestAffinityMaxTimeRuntimeToggleRebuildsOnlyNeededDonorIndexes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	mc := donorAffinityClient(ctx)
-	exit := &multiClientChannel{ctx: ctx}
+	exit := &multiClientChannel{ctx: ctx, healthy: true}
 	ordinary := registerDonorFlow(mc, donorAffinityPath(40021), exit)
 	defer ordinary.Close()
 	pinned := registerDonorFlow(mc, donorAffinityPath(40022), exit)
@@ -171,7 +170,7 @@ func TestFreshFlowAffinityRuntimeToggleRebuildsOnlyNeededDonorIndexes(t *testing
 	pinned.pinned = true
 
 	override := ReliabilitySettingsFrom(mc.settings)
-	override.FreshFlowAffinity = false
+	override.AffinityMaxTime = 0
 	mc.SetReliabilitySettings(override)
 	foundOrdinary := false
 	foundPinned := false
@@ -191,7 +190,7 @@ func TestFreshFlowAffinityRuntimeToggleRebuildsOnlyNeededDonorIndexes(t *testing
 		t.Fatal("disabled ordinary affinity discarded an explicit pin index")
 	}
 
-	// Clearing the override restores the constructed legacy A/B setting and
+	// Clearing the override restores the constructed positive age cap and
 	// immediately rebuilds current ordinary donors.
 	mc.SetReliabilitySettings(nil)
 	foundOrdinary = false
@@ -214,7 +213,7 @@ func TestDonorAffinityDeadExitIsNotInherited(t *testing.T) {
 
 	mc := donorAffinityClient(ctx)
 	exitCtx, cancelExit := context.WithCancel(context.Background())
-	exit := &multiClientChannel{ctx: exitCtx}
+	exit := &multiClientChannel{ctx: exitCtx, healthy: true}
 
 	flow1 := donorAffinityPath(40001)
 	update1 := registerDonorFlow(mc, flow1, exit)
@@ -238,7 +237,7 @@ func TestDonorAffinityWarnedExitIsNotInherited(t *testing.T) {
 	defer cancel()
 
 	mc := donorAffinityClient(ctx)
-	exit := &multiClientChannel{ctx: ctx}
+	exit := &multiClientChannel{ctx: ctx, healthy: true}
 	func() {
 		exit.stateLock.Lock()
 		defer exit.stateLock.Unlock()

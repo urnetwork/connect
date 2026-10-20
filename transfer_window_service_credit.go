@@ -17,6 +17,9 @@ type windowServiceAckTiming struct {
 // A missing timestamp stays explicit and cannot establish a flight boundary.
 type windowServiceAckCredit struct {
 	bytes                  ByteCount
+	singleMessageId        Id
+	readyAtNanos           int64
+	readyLane              Id
 	firstSentAtNanos       int64
 	lastSentAtNanos        int64
 	maximumOfferGap        time.Duration
@@ -35,10 +38,14 @@ func (self *windowServiceAckCredit) add(other windowServiceAckCredit) {
 		return
 	}
 	if self.bytes == 0 {
+		self.singleMessageId = other.singleMessageId
+		self.readyAtNanos, self.readyLane = other.readyAtNanos, other.readyLane
 		self.receiverTimingEligible = other.receiverTimingEligible
 		self.offerComplete = other.offerComplete
 		self.maximumOfferGap = other.maximumOfferGap
 	} else {
+		self.singleMessageId = Id{}
+		self.readyAtNanos, self.readyLane = 0, Id{}
 		self.receiverTimingEligible = self.receiverTimingEligible && other.receiverTimingEligible
 		self.offerComplete = self.offerComplete && other.offerComplete
 		// Overlapping summaries may fill an old gap, but never erase it.
@@ -56,13 +63,23 @@ func (self *windowServiceAckCredit) add(other windowServiceAckCredit) {
 	self.bytes += other.bytes
 }
 
+// A cumulative or superseded head cannot borrow a later tail's reservation.
+func (self *SendSequence) certifyPacingReadyCreditWithLock(credit *windowServiceAckCredit) {
+	ready := self.pacingReadyWrite
+	if credit.offerComplete && credit.singleMessageId != (Id{}) &&
+		credit.singleMessageId == ready.confirmedId && ready.confirmedAtNanos > 0 &&
+		ready.confirmedAtNanos <= credit.firstSentAtNanos && ready.route != nil {
+		credit.readyAtNanos, credit.readyLane = ready.confirmedAtNanos, ready.lane
+	}
+}
+
 // The item's resend queue lock must be held. A retry does not restore credit.
 func (self *windowServiceAckCredit) addItemWithLock(item *sendItem) {
 	if item == nil || item.serviceCreditObserved || item.pacingByteCount <= 0 {
 		return
 	}
 	item.serviceCreditObserved = true
-	self.add(windowServiceAckCredit{bytes: item.pacingByteCount, firstSentAtNanos: item.pacingSentAtNanos,
+	self.add(windowServiceAckCredit{bytes: item.pacingByteCount, singleMessageId: item.messageId, firstSentAtNanos: item.pacingSentAtNanos,
 		lastSentAtNanos: item.pacingSentAtNanos, offerRecorded: true,
 		offerComplete: item.pacingSentAtNanos > 0 && item.sendCount == 1 && item.rttH1 &&
 			(item.rttState == sendItemRttWriteConfirmed || item.rttState == sendItemRttObserved),
@@ -79,6 +96,7 @@ func (self *SendSequence) takePacingServiceCredit(item *sendItem) windowServiceA
 	self.resendQueue.stateLock.Lock()
 	defer self.resendQueue.stateLock.Unlock()
 	credit.addItemWithLock(item)
+	self.certifyPacingReadyCreditWithLock(&credit)
 	return credit
 }
 
@@ -102,6 +120,7 @@ func (self *SendSequence) publishAckServiceCreditWithTiming(messageId Id, select
 	func() {
 		self.resendQueue.stateLock.Lock()
 		defer self.resendQueue.stateLock.Unlock()
+		defer self.certifyPacingReadyCreditWithLock(&credit)
 		queue := self.resendQueue
 		item := queue.messageIdItems[messageId]
 		if item == nil {
@@ -185,6 +204,9 @@ func (self *SendSequence) observePacingServiceCredit(credit windowServiceAckCred
 	}
 	if credit.receiverHeldPrefix {
 		service.receiverHeldPrefixAtNanos = max(service.receiverHeldPrefixAtNanos, at.UnixNano())
+	}
+	if !service.qualityChangedAt.IsZero() && credit.readyAtNanos <= service.qualityChangedAt.UnixNano() {
+		credit.readyAtNanos, credit.readyLane = 0, Id{}
 	}
 	service.observeAggregateDeliveryWithLock(credit, at)
 	service.observeAckWithLock(credit, at)

@@ -153,6 +153,11 @@ func TestWindowServiceRecoverySuffixMemoryBound(t *testing.T) {
 	}
 	var scalar func(reflect.Type) bool
 	scalar = func(kind reflect.Type) bool {
+		// This exact fixed identity carries no route, pointer, or payload.
+		// All byte-size caps above remain unchanged.
+		if kind == reflect.TypeOf(Id{}) {
+			return kind.Kind() == reflect.Array && kind.Len() == 16 && kind.Elem().Kind() == reflect.Uint8
+		}
 		if kind.Kind() == reflect.Struct {
 			for i := 0; i < kind.NumField(); i++ {
 				if !scalar(kind.Field(i).Type) {

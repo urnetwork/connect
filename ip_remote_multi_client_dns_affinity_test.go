@@ -10,9 +10,7 @@ import (
 
 func dnsAffinityTestParent() *RemoteUserNatMultiClient {
 	settings := DefaultMultiClientSettings()
-	// These fixtures test the legacy DNS-donor mechanism. Production leaves
-	// hard fresh-flow inheritance off unless an explicit pin requests it.
-	settings.FreshFlowAffinity = true
+	settings.AffinityMaxTime = time.Minute
 	settings.Log = NewNoopLogger()
 	return &RemoteUserNatMultiClient{
 		settings:                   settings,
@@ -31,7 +29,8 @@ func bindDnsAffinityTestFlow(
 	path *IpPath,
 ) *multiClientChannelUpdate {
 	update := newMultiClientChannelUpdate(context.Background(), path)
-	update.client.Store(client)
+	client.healthy = true
+	update.selectAffinityClient(client)
 	if path.Version == 4 {
 		parent.ip4PathUpdates[path.ToIp4Path()] = update
 	} else {
@@ -40,9 +39,9 @@ func bindDnsAffinityTestFlow(
 	return update
 }
 
-func TestDnsExitHintDoesNotHardBindOrdinaryFreshFlowByDefault(t *testing.T) {
+func TestDnsExitHintDoesNotBindWhenAffinityDisabled(t *testing.T) {
 	parent := dnsAffinityTestParent()
-	parent.settings.FreshFlowAffinity = false
+	parent.settings.AffinityMaxTime = 0
 	exit := &multiClientChannel{ctx: context.Background(), settings: parent.settings}
 	address := netip.MustParseAddr("203.0.113.24")
 	affinityName := affinityNameForServerName("video.example.test")
@@ -57,7 +56,7 @@ func TestDnsExitHintDoesNotHardBindOrdinaryFreshFlowByDefault(t *testing.T) {
 	}
 
 	// Inject one legacy hint to prove the read path independently honors the
-	// default-off policy (including state restored by an older build).
+	// disabled policy (including state restored by an older build).
 	parent.dnsAddressExitHints[address] = dnsExitHint{
 		client: exit, affinityName: affinityName, createTime: time.Now(),
 	}
@@ -81,7 +80,7 @@ func TestDnsExitHintDoesNotHardBindOrdinaryFreshFlowByDefault(t *testing.T) {
 	}
 }
 
-func TestDisablingFreshFlowAffinityReleasesDnsChannelHints(t *testing.T) {
+func TestDisablingAffinityMaxTimeReleasesDnsChannelHints(t *testing.T) {
 	parent := dnsAffinityTestParent()
 	exit := &multiClientChannel{ctx: context.Background(), settings: parent.settings}
 	parent.dnsExitHints["example.test"] = dnsExitHint{
@@ -92,7 +91,7 @@ func TestDisablingFreshFlowAffinityReleasesDnsChannelHints(t *testing.T) {
 	}
 
 	override := ReliabilitySettingsFrom(parent.settings)
-	override.FreshFlowAffinity = false
+	override.AffinityMaxTime = 0
 	parent.SetReliabilitySettings(override)
 	if len(parent.dnsExitHints) != 0 || len(parent.dnsAddressExitHints) != 0 {
 		t.Fatal("disabling hard fresh affinity retained DNS provider references")

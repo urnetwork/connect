@@ -41,7 +41,7 @@ func scoredDonorClient(ctx context.Context, scored bool) *RemoteUserNatMultiClie
 		ctx: ctx,
 		settings: &MultiClientSettings{
 			DestinationAffinity:    true,
-			FreshFlowAffinity:      true,
+			AffinityMaxTime:        time.Minute,
 			SequenceIdleTimeout:    10 * time.Minute,
 			TcpSequenceIdleTimeout: 10 * time.Minute,
 			ScoredAffinityDonor:    scored,
@@ -62,8 +62,9 @@ func scoredDonorClient(ctx context.Context, scored bool) *RemoteUserNatMultiClie
 // make a scoring test silently vacuous.
 func scoredDonorExit(ctx context.Context) (*multiClientChannel, string) {
 	exit := &multiClientChannel{
-		ctx:  ctx,
-		args: &multiClientChannelArgs{Destination: RequireMultiHopId(NewId())},
+		ctx:     ctx,
+		args:    &multiClientChannelArgs{Destination: RequireMultiHopId(NewId())},
+		healthy: true,
 	}
 	providerId, ok := providerIdentity(exit)
 	if !ok {
@@ -91,7 +92,7 @@ func twoDonorGroup(mc *RemoteUserNatMultiClient, older, newer *multiClientChanne
 // suite's own fixture.
 func registerScoredDonorFlow(mc *RemoteUserNatMultiClient, ipPath *IpPath, exit *multiClientChannel) *multiClientChannelUpdate {
 	update := newMultiClientChannelUpdate(mc.ctx, ipPath)
-	update.client.Store(exit)
+	update.selectAffinityClient(exit)
 	ip4Path := ipPath.ToIp4Path()
 	mc.stateLock.Lock()
 	defer mc.stateLock.Unlock()

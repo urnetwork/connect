@@ -19,7 +19,7 @@ type evaluationContractOob struct {
 	ready    bool
 	grant    *contractErrorOob
 	requests atomic.Int64
-	// closed at the first contract request
+	// optional notification, closed at the first contract request
 	requested     chan struct{}
 	requestedOnce sync.Once
 }
@@ -29,7 +29,9 @@ func (self *evaluationContractOob) SendControl(frames []*protocol.Frame, callbac
 	for _, frame := range frames {
 		if frame.MessageType == protocol.MessageType_TransferCreateContract {
 			self.requests.Add(1)
-			self.requestedOnce.Do(func() { close(self.requested) })
+			if self.requested != nil {
+				self.requestedOnce.Do(func() { close(self.requested) })
+			}
 		}
 	}
 	if self.ready {

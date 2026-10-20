@@ -55,6 +55,7 @@ func affinityPerformanceTestPath(sourcePort int) *IpPath {
 
 func affinityPerformanceTestClient(stats DestinationStats) *multiClientChannel {
 	client := reputationTestClient(stats)
+	client.healthy = true
 	client.args.Destination = RequireMultiHopId(NewId())
 	return client
 }
@@ -128,7 +129,7 @@ func attachLiveAffinityPerformanceTestSample(
 	update.openTime = time.Now().Add(-activeDuration)
 	update.activityTime = time.Now()
 	update.receivedInbound.Store(true)
-	update.client.Store(client)
+	update.selectAffinityClient(client)
 	update.affinityIp4Paths[(&IpPath{ServerName: "bloomberg.com"}).ToIp4Path()] = true
 	update.ackPerformance.observe(update.openTime, true, 1_000_000)
 	if 0 < ackedBytes {
@@ -458,7 +459,7 @@ func TestPerformanceAwareAffinityNeverMovesEstablishedFlow(t *testing.T) {
 	parent := reputationTestParent("www.bloomberg.com")
 	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
 	established := recordAffinityPerformanceTestSample(t, parent, low, 44330, 25_000, time.Second)
-	established.client.Store(low)
+	established.selectAffinityClient(low)
 
 	if parent.affinityPerformanceAllowsDonor(low, affinityPerformanceTestPath(44331)) {
 		t.Fatal("positive control: low donor unexpectedly remained affinity-eligible")
@@ -487,7 +488,7 @@ func TestPerformanceAwareAffinityChecksLiveDonorBeforeInheriting(t *testing.T) {
 	defer donorUpdate.Close()
 	donorUpdate.openTime = time.Now().Add(-time.Second)
 	donorUpdate.receivedInbound.Store(true)
-	donorUpdate.client.Store(donor)
+	donorUpdate.selectAffinityClient(donor)
 	donorUpdate.ackPerformance.observe(donorUpdate.openTime, true, 1_000_000)
 	donorUpdate.ackPerformance.observe(donorUpdate.openTime.Add(time.Millisecond), true, 1_025_000)
 	parent.ip4PathUpdates[donorPath.ToIp4Path()] = donorUpdate
@@ -524,7 +525,7 @@ func TestPerformanceAwareAffinityExplicitPinStillWins(t *testing.T) {
 	donorPath := affinityPerformanceTestPath(44341)
 	donorUpdate := newMultiClientChannelUpdate(context.Background(), donorPath)
 	defer donorUpdate.Close()
-	donorUpdate.client.Store(donor)
+	donorUpdate.selectAffinityClient(donor)
 	parent.ip4PathUpdates[donorPath.ToIp4Path()] = donorUpdate
 
 	fresh := newMultiClientChannelUpdate(context.Background(), affinityPerformanceTestPath(44342))
@@ -575,8 +576,8 @@ func TestAffinityPerformanceTableIsBoundedAndExpires(t *testing.T) {
 
 func TestPerformanceAwareAffinityDefaultAndOverrideProjection(t *testing.T) {
 	settings := DefaultMultiClientSettings()
-	if settings.FreshFlowAffinity {
-		t.Fatal("ordinary fresh-flow affinity must be disabled in production defaults")
+	if settings.AffinityMaxTime != time.Minute {
+		t.Fatal("ordinary affinity must default to a one-minute age bound")
 	}
 	if !settings.PerformanceAwareAffinity {
 		t.Fatal("performance-aware affinity must be enabled in the production defaults")
@@ -587,9 +588,9 @@ func TestPerformanceAwareAffinityDefaultAndOverrideProjection(t *testing.T) {
 	if ReliabilitySettingsFrom(nil).PerformanceAwareAffinity {
 		t.Fatal("a zero-value runtime override must disable performance-aware affinity")
 	}
-	settings.FreshFlowAffinity = true
-	if !ReliabilitySettingsFrom(settings).FreshFlowAffinity {
-		t.Fatal("runtime projection dropped the legacy fresh-affinity A/B override")
+	settings.AffinityMaxTime = 0
+	if ReliabilitySettingsFrom(settings).AffinityMaxTime != 0 {
+		t.Fatal("runtime projection lost disabled ordinary affinity")
 	}
 }
 

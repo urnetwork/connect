@@ -2726,6 +2726,7 @@ type laneAckSlot struct {
 // carrier, and a retired carrier's recovery is
 // scheduleRetiredReliableCarrierRecovery's business.
 func (self *SendSequence) resetLaneAcks(generation uint64) {
+	self.resetPacingReadyWrite()
 	for index := range self.laneAcks {
 		self.laneAcks[index] = laneAckSlot{}
 	}
@@ -6804,6 +6805,7 @@ type SendSequence struct {
 	rttWindow *RttWindow
 	// At most one physical write per send worker; protected by resendQueue.stateLock.
 	pendingReceiverRtt pendingReceiverRtt
+	pacingReadyWrite   windowPacingReadyWrite
 	// The queue lock owns cumulative service publication independently of delivery.
 	serviceAckHeadNumber uint64
 	serviceAckHeadSet    bool
@@ -8191,7 +8193,13 @@ func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bo
 			threshold <= provingAckCount {
 			item.selectiveGapRecovered = true
 			self.selectiveGapRecoveryActive = true
-			reschedule(item, currentTime, sendRecoverySelectiveGap)
+			// New proof can accelerate recovery, but cannot postpone an
+			// already-due hole behind younger ordinary retry deadlines.
+			resendTime := currentTime
+			if item.resendTime.Before(resendTime) {
+				resendTime = item.resendTime
+			}
+			reschedule(item, resendTime, sendRecoverySelectiveGap)
 			gapRecoveryCount += 1
 			unreliableGapRecovery = unreliableGapRecovery || item.unreliableFlightTracked
 			if item.unreliableFlightTracked {
@@ -8879,6 +8887,7 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 
 func (self *SendSequence) Run() {
 	defer self.windowPacer.close()
+	defer self.resetPacingReadyWrite()
 	var ackWorkerDone chan struct{}
 	ackWorkerStarted := false
 	defer func() {
@@ -12879,6 +12888,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	defer self.windowPacer.releaseServiceReservation(&reservation, &writeStart, false)
 	if item != nil {
 		writeStart.sequenceId, writeStart.messageId, writeStart.number = self.sequenceId, item.messageId, item.sequenceNumber
+		defer self.clearPacingReadyPending(writeStart.messageId)
 	}
 	paceWrite := func(byteCount int) error {
 		if routePolicyEnabled {
@@ -12918,6 +12928,11 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 				if !alreadyCounted {
 					self.resendQueue.stateLock.Lock()
 					item.pacingByteCount = ByteCount(byteCount)
+					if routePolicyEnabled {
+						self.pacingReadyWrite.pendingId = item.messageId
+						self.pacingReadyWrite.pendingAtNanos = self.client.feedbackArrivalNanos(now)
+						self.pacingReadyWrite.pendingGeneration = policy.generation
+					}
 					self.resendQueue.stateLock.Unlock()
 				}
 				if reservation.started {
@@ -12945,6 +12960,11 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		return nil
 	}
 	finishPacedWrite := func(disposition transferWriteDisposition, err error) {
+		generation := uint64(0)
+		if routePolicyEnabled {
+			generation = policy.generation
+		}
+		self.finishPacingReadyWrite(item, disposition, err, generation)
 		self.finishReceiverRttWrite(item, disposition, err)
 		if paced {
 			self.windowPacer.service.finishWrite(self.sequenceId, item.messageId, err == nil && disposition.transportType == TransportTypeH1)
@@ -13746,6 +13766,12 @@ func newResendQueue(budget *TransferMemoryBudget, minByteCount ByteCount) *resen
 		if a.resendTime.Before(b.resendTime) {
 			return -1
 		} else if b.resendTime.Before(a.resendTime) {
+			return 1
+			// This queue belongs to one sequence. Equal deadlines must recover
+			// its earliest hole before spending service on later retained data.
+		} else if a.sequenceNumber < b.sequenceNumber {
+			return -1
+		} else if b.sequenceNumber < a.sequenceNumber {
 			return 1
 		} else {
 			return 0
@@ -16224,6 +16250,13 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
 		}
 	}
+	// A sequence-number collision is not proof for the committed message.
+	// Successor announcements also cannot become ordinary head authority.
+	if held != nil && item.head && (held.messageId != item.messageId ||
+		held.sequenceNumber != item.sequenceNumber || held.contractAhead != item.contractAhead) {
+		item.releaseMemory()
+		return false, nil
+	}
 	admissionItem := item
 	if held != nil {
 		admissionItem = held
@@ -16238,6 +16271,36 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		self.client.receiveQueueDropCount.Add(1)
 		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
 		return false, nil
+	}
+
+	if held != nil && item.head {
+		// The retry's proof must survive as verified authority, not as a
+		// borrowed frame attached to the original retained owner. Verify
+		// before any prefix reset or repeated selective acknowledgement.
+		if err := self.registerContracts(item); err != nil {
+			item.releaseMemory()
+			return false, err
+		}
+		var headContract *sequenceContract
+		if item.contractFrame != nil && !item.contractAhead {
+			headContract = self.receiveContract
+		} else if !item.contractAhead && item.contractFrame == nil && item.contractId != nil {
+			headContract = self.openReceiveContracts[*item.contractId]
+			if headContract.expired() {
+				item.releaseMemory()
+				return false, errContractExpired
+			}
+		}
+		if headContract != nil {
+			held.contractId = &headContract.contractId
+			// The decoded owner keeps its original proof root until return.
+			// A legacy item owns that root directly. Neither may replay an
+			// older proof when this retained payload reaches the drain.
+			if held.decodedOwner == nil {
+				returnDecodedFrameMessageBytes(held.contractFrame)
+			}
+			held.contractFrame = nil
+		}
 	}
 
 	// this case happens when the receiver is reformed or loses state.
