@@ -987,32 +987,17 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	b.WriteString("\npackage connect\n\n")
 
 	writeStringConst := func(name string, data []byte) {
-		if len(data) == 0 {
-			fmt.Fprintf(&b, "const %s = \"\"\n\n", name)
-			return
-		}
-		fmt.Fprintf(&b, "const %s = \"\" +\n", name)
-		const perLine = 64
+		// A single literal keeps source type-checking linear in the table size.
+		// With thousands of concatenations, go/types recursively rechecks each
+		// growing intermediate string's length.
+		fmt.Fprintf(&b, "const %s = \"", name)
 		const hexd = "0123456789abcdef"
-		for off := 0; off < len(data); off += perLine {
-			end := off + perLine
-			if end > len(data) {
-				end = len(data)
-			}
-			b.WriteByte('\t')
-			b.WriteByte('"')
-			for _, by := range data[off:end] {
-				b.WriteString("\\x")
-				b.WriteByte(hexd[by>>4])
-				b.WriteByte(hexd[by&0xf])
-			}
-			b.WriteByte('"')
-			if end < len(data) {
-				b.WriteString(" +")
-			}
-			b.WriteByte('\n')
+		for _, by := range data {
+			b.WriteString("\\x")
+			b.WriteByte(hexd[by>>4])
+			b.WriteByte(hexd[by&0xf])
 		}
-		b.WriteByte('\n')
+		b.WriteString("\"\n\n")
 	}
 
 	writeStringConst("blockerPepper", []byte(pepper))

@@ -850,6 +850,20 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results [
 	}
 	b.WriteString("\npackage connect\n\n")
 
+	writeStringConst := func(name string, data []byte) {
+		// A single literal keeps source type-checking linear in the table size.
+		// With thousands of concatenations, go/types recursively rechecks each
+		// growing intermediate string's length.
+		fmt.Fprintf(&b, "const %s = \"", name)
+		const hexd = "0123456789abcdef"
+		for _, by := range data {
+			b.WriteString("\\x")
+			b.WriteByte(hexd[by>>4])
+			b.WriteByte(hexd[by&0xf])
+		}
+		b.WriteString("\"\n")
+	}
+
 	fmt.Fprintf(&b, "const cfaaBlockedPrefixCount = %d\n\n", len(ranges))
 
 	data := make([]byte, 0, len(ranges)*8)
@@ -859,27 +873,7 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results [
 			byte(r.hi>>24), byte(r.hi>>16), byte(r.hi>>8), byte(r.hi))
 	}
 
-	b.WriteString("const cfaaBlockedPrefixData = \"\" +\n")
-	const perLine = 64 // bytes per source line = 8 records
-	const hexd = "0123456789abcdef"
-	for off := 0; off < len(data); off += perLine {
-		end := off + perLine
-		if end > len(data) {
-			end = len(data)
-		}
-		b.WriteByte('\t')
-		b.WriteByte('"')
-		for _, by := range data[off:end] {
-			b.WriteString("\\x")
-			b.WriteByte(hexd[by>>4])
-			b.WriteByte(hexd[by&0xf])
-		}
-		b.WriteByte('"')
-		if end < len(data) {
-			b.WriteString(" +")
-		}
-		b.WriteByte('\n')
-	}
+	writeStringConst("cfaaBlockedPrefixData", data)
 
 	fmt.Fprintf(&b, "\nconst cfaaBlockedPrefix6Count = %d\n\n", len(ranges6))
 	data6 := make([]byte, 0, len(ranges6)*32)
@@ -889,29 +883,7 @@ func emit(ranges []iprange, ranges6 []ip6range, spamhausCredit string, results [
 		data6 = append(data6, lo[:]...)
 		data6 = append(data6, hi[:]...)
 	}
-	if 0 == len(data6) {
-		b.WriteString("const cfaaBlockedPrefix6Data = \"\"\n")
-	} else {
-		b.WriteString("const cfaaBlockedPrefix6Data = \"\" +\n")
-		for off := 0; off < len(data6); off += perLine {
-			end := off + perLine
-			if end > len(data6) {
-				end = len(data6)
-			}
-			b.WriteByte('\t')
-			b.WriteByte('"')
-			for _, by := range data6[off:end] {
-				b.WriteString("\\x")
-				b.WriteByte(hexd[by>>4])
-				b.WriteByte(hexd[by&0xf])
-			}
-			b.WriteByte('"')
-			if end < len(data6) {
-				b.WriteString(" +")
-			}
-			b.WriteByte('\n')
-		}
-	}
+	writeStringConst("cfaaBlockedPrefix6Data", data6)
 
 	return []byte(b.String())
 }
