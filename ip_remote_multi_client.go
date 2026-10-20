@@ -8186,6 +8186,13 @@ func (self *RemoteUserNatMultiClient) NotifyNetworkChanged() {
 	// exactly how a capture tells them apart
 	loggerOrDefault(self.log).Infof("%s\n", relEvent("network_change", "rebased", true, "kick", true))
 	NetworkChanged()
+	// a window short of exits -- some lost in the outage, or a tunnel that
+	// started with no network -- re-evaluates on the new path now instead of
+	// at its next WindowResizeTimeout pass, and asks the platform again now
+	// instead of at the end of a backoff grown on the old path
+	for _, window := range self.windows {
+		window.notifyNetworkChanged()
+	}
 }
 
 // reliabilityMetricsRef hands the shared counters to the window channels via
@@ -11089,6 +11096,10 @@ type multiClientWindow struct {
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+	// networkChangeMonitor ends a platform-error retry wait when the host's
+	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
+	// never wakes a wait.
+	networkChangeMonitor *Monitor
 
 	// --- window honesty (see ip_remote_multi_client_outcome.go) ---
 
@@ -11205,6 +11216,7 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
@@ -11764,6 +11776,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
+		// before the platform call, so a change during it ends the retry wait
+		networkChanged := self.networkChangeNotify()
 
 		// exclude healthy destinations that are already in the window
 		windowDestinations := func() map[MultiHopId]bool {
@@ -11800,10 +11814,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
 			class := self.recordEvaluationFailure(windowFailurePlatform, err)
-			select {
-			case <-self.ctx.Done():
+			if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 				return
-			case <-time.After(self.windowRetryDelay(class)):
 			}
 			continue
 		}
@@ -11870,6 +11882,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					if timeout <= 0 {
 						return
 					}
+					networkChanged := self.networkChangeNotify()
 
 					// a destination-aware generator can reuse a persisted
 					// identity for this destination (PROXYDRAIN1.md §3.5).
@@ -11907,10 +11920,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
 						class := self.recordEvaluationFailure(windowFailurePlatform, err)
-						select {
-						case <-self.ctx.Done():
+						if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 							return
-						case <-time.After(self.windowRetryDelay(class)):
 						}
 						continue
 					}
