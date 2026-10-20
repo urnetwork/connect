@@ -131,6 +131,14 @@ The provider TCP sequence's pure-acknowledgement worker is also per flow. It may
 - **Queued work keeps its owner's lifetime.** Until explicit ownership transfer, preserve the operation's deadline and cancellation across capacity waits. Retiring that owner must withdraw waiting work while shared parents remain live. A later write timeout does not bound earlier admission.
 - **Capacity changes need total-cost accounting.** Include descriptor arrays, retained roots, child budgets and native resources. Increase queue depth only with a draining consumer and measured performance benefit, keeping latency, fairness and total memory within declared bounds.
 
+## Tunables live in settings
+
+- **No global or hard-coded tunables.** Every timing value is a field of the owning component's settings struct: timeouts, intervals, debounces, holdoffs, grace periods, TTLs, backoff bases and caps, jitter bounds. So is every other value that tunes behavior: retry counts, concurrency caps, and size limits that are policy rather than protocol. The value is set by the settings' `Default...Settings()` constructor and read from the settings instance where it is used. Do not add package-level `const`/`var` tunables, and do not write inline duration or count literals into logic.
+- **Why.** A number buried in a constant cannot be tuned per owner or platform (mobile, desktop, provider, server). A test cannot override it without waiting out real time. And it drifts out of sight of whoever tunes the system next. One field, one default, one doc comment keeps every tunable discoverable and overridable.
+- **One default, one place.** The defaults constructor is the only source of a default value. Platform policies and owners adjust the settings they pass down (the `applyMobile...` pattern) rather than keeping a second copy of the number. Document each field with its unit, the reason for its default, and what a zero or negative value means (for example "non-positive disables").
+- **Exceptions are facts, not tunables.** Protocol and format values stay named constants: wire sizes, field lengths, protocol versions, enum values. So do mathematical constants and values whose change would break compatibility. Tests may use literals to configure settings.
+- **Migrate when you touch it.** When a change touches code that reads a legacy constant tunable, move that tunable into settings in the same change, as with process-global budgets below.
+
 ## Concurrency and goroutine safety
 
 - By default, package-level functions are assumed safe for concurrent use, and a type's methods are assumed NOT safe unless the type documents otherwise.
