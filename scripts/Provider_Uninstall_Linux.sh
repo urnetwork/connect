@@ -1,7 +1,7 @@
 #!/bin/sh
 
 me="$0"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 if [ "$me" = "sh" ] || [ "$me" = "bash" ] || [ "$me" = "zsh" ]; then
     me="urnetwork-uninstaller"
@@ -18,6 +18,7 @@ show_help() {
     echo "  -v, --version           Show the version of this script"
     echo "  -d, --dest=[PATH]       Installation destination"
     echo "  -B, --no-modify-bashrc  Do not modify ~/.bashrc"
+    echo "  --purge                 Also delete ~/.urnetwork (this device's miner identity)"
     echo ""
     echo "Refer to the online documentation for more help."
 }
@@ -35,6 +36,7 @@ require_arg() {
 
 install_path="$HOME/.local/share/urnetwork-provider"
 no_modify_bashrc=0
+purge=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -54,8 +56,19 @@ while [ $# -gt 0 ]; do
 	    shift 2
 	    ;;
 
-	-B|--no-modify-bashrc)
+	-B|--no-modify-bashrc|--no_modify_bashrc)
 	    no_modify_bashrc=1
+	    shift
+	    ;;
+
+	--dest=*)
+	    install_path="${1#*=}"
+	    require_arg --dest "$install_path"
+	    shift
+	    ;;
+
+	--purge)
+	    purge=1
 	    shift
 	    ;;
 	
@@ -85,30 +98,43 @@ if [ ! -d "$install_path" ]; then
     exit 1
 fi
 
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+if command -v systemctl > /dev/null; then
+    for unit in urnetwork.service urnetwork-update.timer urnetwork-update.service; do
+	if [ -f "$unit_dir/$unit" ]; then
+	    echo "$me: Removing systemd unit - $unit"
+	    systemctl --user disable --now "$unit" > /dev/null 2>&1
+	    rm -f "$unit_dir/$unit"
+	fi
+    done
+
+    systemctl --user daemon-reload > /dev/null 2>&1
+fi
+
 echo "$me: Removing '$install_path'"
 rm -r "$install_path"
 
-echo "$me: Removing '~/.urnetwork'"
-rm -rf "$HOME/.urnetwork"
-
-if command -v systemctl > /dev/null; then
-    service_path="$HOME/.config/systemd/user/urnetwork.service"
-
-    if [ -f "$service_path" ]; then
-	echo "$me: Removing systemd service - urnetwork.service"
-	systemctl --user disable --now urnetwork.service
-	rm -f "$service_path"
-    fi
+if [ "$purge" -eq 1 ]; then
+    echo "$me: Removing '$HOME/.urnetwork'"
+    rm -rf "$HOME/.urnetwork"
+elif [ -d "$HOME/.urnetwork" ]; then
+    echo "$me: Kept your miner identity in '$HOME/.urnetwork' (add --purge to delete it)"
 fi
 
 if [ "$no_modify_bashrc" -eq 0 ]; then
     if ! command -v awk > /dev/null; then
 	echo "$me: warning: awk not found, cannot modify ~/.bashrc" >&2
     else
-	echo "$me: Removing PATH exports from ~/.bashrc"
-	cp "$HOME/.bashrc" "$HOME/.bashrc.backup.old"
-	awk '/# == urnetwork-provider start/ { pr=1 } pr == 0 { print } /# == urnetwork-provider end/ { pr=0 }' "$HOME/.bashrc" > "$HOME/.bashrc.new"
-	mv "$HOME/.bashrc.new" "$HOME/.bashrc"
+	for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+	    if [ -f "$rc" ] && grep -q '# == urnetwork-provider start' "$rc"; then
+		echo "$me: Removing PATH exports from $rc"
+		cp "$rc" "$rc.backup.old"
+		awk '/# == urnetwork-provider start/ { pr=1 } pr == 0 { print } /# == urnetwork-provider end/ { pr=0 }' "$rc" > "$rc.new" &&
+		    cat "$rc.new" > "$rc"
+		rm -f "$rc.new"
+	    fi
+	done
     fi
 fi
 
