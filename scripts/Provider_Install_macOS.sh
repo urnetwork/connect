@@ -7,6 +7,11 @@
 # The same file is installed as urnet-tools. It runs the provider as a
 # launchd LaunchAgent and keeps it up to date with a second LaunchAgent.
 # Supports Apple silicon (arm64) and Intel (amd64) Macs.
+#
+# Piped through sh, it gets the urnet-tools copy to install from
+# URNETWORK_TOOLS_URL (default: this file on urnetwork/connect main). To
+# install from a branch or a fork, set it to that branch's raw URL, or
+# download this file and run it with sh.
 
 me="$0"
 script_rundir="$(pwd)"
@@ -386,6 +391,12 @@ release_lock ()
 
 cleanup ()
 {
+    # an update that failed after stopping the provider starts it again
+    if [ "${restart_on_exit:-0}" -eq 1 ]; then
+        restart_on_exit=0
+        load_job "$provider_label" "$(provider_plist)" > /dev/null 2>&1 &&
+            warn "the update failed; the provider was started again on the version it had"
+    fi
     release_lock
     # a first install that failed before installing anything leaves nothing
     if [ "${created_install_path:-0}" -eq 1 ] && [ ! -e "$install_path/bin/urnetwork" ]; then
@@ -451,7 +462,6 @@ write_provider_plist ()
     <string>$provider_label</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
         <string>$wpp_tools</string>
         <string>service-run</string>
     </array>
@@ -509,7 +519,6 @@ write_update_plist ()
     <string>$update_label</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
         <string>$wup_tools</string>
         <string>update</string>
         <string>--scheduled</string>
@@ -537,61 +546,87 @@ $wup_when        <key>Hour</key>
 EOF
 }
 
+# job_domain LABEL: the domain the job is loaded in, if any. An install over
+# SSH loads into user/<uid>, and a later screen login can add a gui/<uid>
+# copy, so every check looks at both.
+job_domain ()
+{
+    jd_uid="$(id -u)"
+    for jd_domain in "gui/$jd_uid" "user/$jd_uid"; do
+        if launchctl print "$jd_domain/$1" > /dev/null 2>&1; then
+            echo "$jd_domain"
+            return 0
+        fi
+    done
+    return 1
+}
+
 job_loaded ()
 {
-    launchctl print "$(launchd_domain)/$1" > /dev/null 2>&1
+    job_domain "$1" > /dev/null
+}
+
+job_print ()
+{
+    jp_domain="$(job_domain "$1")" || return 1
+    launchctl print "$jp_domain/$1" 2>/dev/null
 }
 
 job_running ()
 {
-    launchctl print "$(launchd_domain)/$1" 2>/dev/null | grep -q 'state = running'
+    job_print "$1" | grep -q '^[[:space:]]*state = running'
 }
 
 job_pid ()
 {
-    launchctl print "$(launchd_domain)/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p' | head -n 1
+    job_print "$1" | sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p' | head -n 1
 }
 
 job_last_exit ()
 {
-    launchctl print "$(launchd_domain)/$1" 2>/dev/null | sed -n 's/^[[:space:]]*last exit code = \(.*\)$/\1/p' | head -n 1
+    job_print "$1" | sed -n 's/^[[:space:]]*last exit code = \(.*\)$/\1/p' | head -n 1
 }
 
 # load_job LABEL PLIST
 load_job ()
 {
+    unload_job "$1"
     lj_domain="$(launchd_domain)"
-    if job_loaded "$1"; then
-        run_quiet launchctl bootout "$lj_domain/$1"
-        wait_unloaded "$1"
-    fi
     # a job disabled earlier (launchctl disable, or switched off under
     # System Settings > General > Login Items) refuses to bootstrap
     run_quiet launchctl enable "$lj_domain/$1"
-    if ! run launchctl bootstrap "$lj_domain" "$2"; then
-        warn "launchctl could not load $1 from $2"
-        warn "if macOS shows URnetwork as switched off under System Settings > General > Login Items, switch it on and run \`urnet-tools start'"
-        return 1
+    # right after a bootout launchd sometimes still answers 5 (I/O error)
+    if ! run launchctl bootstrap "$lj_domain" "$2" 2>/dev/null; then
+        sleep 1
+        # from SSH, a gui/<uid> domain can refuse a bootstrap (error 125);
+        # the background domain still takes it
+        if [ "$lj_domain" != "user/$(id -u)" ] && run launchctl bootstrap "user/$(id -u)" "$2" 2>/dev/null; then
+            return 0
+        fi
+        if ! run launchctl bootstrap "$lj_domain" "$2"; then
+            warn "launchctl could not load $1 from $2"
+            warn "if URnetwork (urnet-tools) is switched off under System Settings > General > Login Items, switch it on and run \`urnet-tools start'"
+            return 1
+        fi
     fi
 }
 
 unload_job ()
 {
-    if job_loaded "$1"; then
-        run_quiet launchctl bootout "$(launchd_domain)/$1"
-        wait_unloaded "$1"
-    fi
-    return 0
-}
-
-wait_unloaded ()
-{
-    [ "$dry_run" -eq 1 ] && return 0
-    wu_n=0
-    while job_loaded "$1" && [ "$wu_n" -lt 20 ]; do
-        sleep 0.5 2>/dev/null || sleep 1
-        wu_n=$((wu_n + 1))
+    while ul_domain="$(job_domain "$1")"; do
+        run_quiet launchctl bootout "$ul_domain/$1"
+        [ "$dry_run" -eq 1 ] && return 0
+        ul_n=0
+        while launchctl print "$ul_domain/$1" > /dev/null 2>&1 && [ "$ul_n" -lt 20 ]; do
+            sleep 0.5 2>/dev/null || sleep 1
+            ul_n=$((ul_n + 1))
+        done
+        if launchctl print "$ul_domain/$1" > /dev/null 2>&1; then
+            warn "launchctl could not stop $1"
+            return 1
+        fi
     done
+    return 0
 }
 
 # ---------------------------------------------------------------- PATH
@@ -600,22 +635,36 @@ path_block_start="# == urnetwork-provider start"
 path_block_end="# == urnetwork-provider end"
 
 # rc files that get the PATH lines: zsh is the macOS default shell, and
-# Terminal starts bash as a login shell, which reads ~/.bash_profile
+# Terminal starts bash as a login shell, which reads only the first of
+# ~/.bash_profile, ~/.bash_login and ~/.profile
 path_rc_files ()
 {
     echo "$HOME/.zshrc"
+    for prf_rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+        if [ -f "$prf_rc" ]; then
+            case "${SHELL:-}" in
+                */bash) echo "$prf_rc" ;;
+                *) [ "$prf_rc" = "$HOME/.bash_profile" ] && echo "$prf_rc" ;;
+            esac
+            return 0
+        fi
+    done
     case "${SHELL:-}" in
         */bash) echo "$HOME/.bash_profile" ;;
-        *) [ -f "$HOME/.bash_profile" ] && echo "$HOME/.bash_profile" ;;
     esac
+    return 0
 }
 
 add_to_path ()
 {
     path_rc_files | while IFS= read -r apt_rc; do
         if [ -f "$apt_rc" ] && grep -q "^$path_block_start\$" "$apt_rc"; then
-            say "$(basename "$apt_rc") already adds URnetwork to PATH"
-            continue
+            if grep -qF "export URNETWORK_PROVIDER_INSTALL=\"$install_path\"" "$apt_rc"; then
+                say "Your $(basename "$apt_rc") already adds URnetwork to PATH"
+                continue
+            fi
+            # an earlier install elsewhere: replace its lines
+            remove_path_block "$apt_rc"
         fi
         say "Adding $install_path/bin to PATH in ~/$(basename "$apt_rc")"
         if [ "$dry_run" -eq 1 ]; then
@@ -632,19 +681,26 @@ EOF
     done
 }
 
+# remove_path_block RC: drop our lines, keeping a backup
+remove_path_block ()
+{
+    rpb_rc="$1"
+    say "Removing the URnetwork PATH lines from ~/$(basename "$rpb_rc") (backup: ~/$(basename "$rpb_rc").urnetwork-backup)"
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+    cp "$rpb_rc" "$rpb_rc.urnetwork-backup"
+    awk -v s="$path_block_start" -v e="$path_block_end" '$0 == s { skip=1 } skip == 0 { print } $0 == e { skip=0 }' \
+        "$rpb_rc.urnetwork-backup" > "$rpb_rc.tmp.$$" && cat "$rpb_rc.tmp.$$" > "$rpb_rc"
+    rm -f "$rpb_rc.tmp.$$"
+}
+
 remove_from_path ()
 {
-    for rfp_rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile"; do
+    for rfp_rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.bashrc" "$HOME/.profile"; do
         [ -f "$rfp_rc" ] || continue
         grep -q "^$path_block_start\$" "$rfp_rc" || continue
-        say "Removing the PATH lines from ~/$(basename "$rfp_rc") (backup: ~/$(basename "$rfp_rc").urnetwork-backup)"
-        if [ "$dry_run" -eq 1 ]; then
-            continue
-        fi
-        cp "$rfp_rc" "$rfp_rc.urnetwork-backup"
-        awk -v s="$path_block_start" -v e="$path_block_end" '$0 == s { skip=1 } skip == 0 { print } $0 == e { skip=0 }' \
-            "$rfp_rc.urnetwork-backup" > "$rfp_rc.tmp.$$" && cat "$rfp_rc.tmp.$$" > "$rfp_rc"
-        rm -f "$rfp_rc.tmp.$$"
+        remove_path_block "$rfp_rc"
     done
 }
 
@@ -696,19 +752,16 @@ get_tools_script ()
     return 1
 }
 
-install_tools ()
+# stage_tools: writes bin/urnet-tools.new, ready to rename into place
+stage_tools ()
 {
-    if [ "$dry_run" -eq 1 ]; then
-        printf '[dry-run] install urnet-tools to %s\n' "$install_path/bin/urnet-tools"
-        return 0
-    fi
-    it_src="$workdir/urnet-tools.src"
+    st_src="$workdir/urnet-tools.src"
     {
-        head -n 1 "$it_src"
+        head -n 1 "$st_src"
         echo "URNETWORK_TOOLS_MODE=1"
-        tail -n +2 "$it_src" | grep -v '^URNETWORK_TOOLS_MODE=1$'
-    } | write_file "$install_path/bin/urnet-tools" || die "could not install urnet-tools"
-    run chmod 755 "$install_path/bin/urnet-tools"
+        tail -n +2 "$st_src" | grep -v '^URNETWORK_TOOLS_MODE=1$'
+    } > "$install_path/bin/urnet-tools.new" &&
+        chmod 755 "$install_path/bin/urnet-tools.new"
 }
 
 verify_sha256 ()
@@ -776,6 +829,7 @@ do_install ()
                 shift
                 ;;
             --no-start)
+                [ "$operation" = "install" ] || die "option '$1' is only for the installer"
                 start_after=0
                 shift
                 ;;
@@ -841,7 +895,15 @@ do_install ()
     fi
 
     say "Looking up release $tag"
-    release="$(fetch "$api_url")" || die "could not fetch release information from $api_url (check your internet connection)"
+    # a check at login can run before the network is up
+    fr_n=0
+    while ! release="$(fetch "$api_url")"; do
+        fr_n=$((fr_n + 1))
+        if [ "$scheduled" -eq 0 ] || [ "$fr_n" -ge 5 ]; then
+            die "could not fetch release information from $api_url (check your internet connection)"
+        fi
+        sleep 60
+    done
     version="$(printf '%s' "$release" | json_field tag_name)"
     [ -n "$version" ] || die "the release information has no tag_name"
     published="$(printf '%s' "$release" | json_field published_at)"
@@ -904,29 +966,33 @@ do_install ()
         set_setting auto_update 0
     fi
 
+    # stage everything first; the provider is only stopped for the renames
+    if [ "$dry_run" -eq 0 ]; then
+        if ! { cp "$new_bin" "$install_path/bin/urnetwork.new" &&
+            chmod 755 "$install_path/bin/urnetwork.new"; }; then
+            rm -f "$install_path/bin/urnetwork.new"
+            die "could not copy the provider binary to $install_path/bin"
+        fi
+        stage_tools || die "could not write urnet-tools to $install_path/bin"
+    fi
+    write_provider_plist || die "could not write the provider launch agent"
+    write_update_plist || die "could not write the update launch agent"
+
     was_running=0
     if job_running "$provider_label"; then
         was_running=1
+        restart_on_exit=1
         say "Stopping the provider for the update; it starts again when the update is done"
     fi
-    unload_job "$provider_label"
+    unload_job "$provider_label" || die "could not stop the provider; nothing was changed"
 
-    if [ "$dry_run" -eq 0 ]; then
-        if ! { cp "$new_bin" "$install_path/bin/urnetwork.new" &&
-            chmod 755 "$install_path/bin/urnetwork.new" &&
-            mv -f "$install_path/bin/urnetwork.new" "$install_path/bin/urnetwork"; }; then
-            die "could not install the provider binary"
-        fi
-    fi
-    install_tools
+    run mv -f "$install_path/bin/urnetwork.new" "$install_path/bin/urnetwork" || die "could not install the provider binary"
+    run mv -f "$install_path/bin/urnet-tools.new" "$install_path/bin/urnet-tools" || die "could not install urnet-tools"
     if [ "$dry_run" -eq 0 ]; then
         echo "$version" > "$install_path/.version"
         echo "$published" > "$install_path/.date"
     fi
     set_setting last_check "$(now_epoch)"
-
-    write_provider_plist || die "could not write the provider launch agent"
-    write_update_plist || die "could not write the update launch agent"
 
     if [ "$(get_setting auto_update 1)" = "1" ]; then
         # the scheduled update runs as this job; reloading it would stop the
@@ -948,6 +1014,7 @@ do_install ()
     release_lock
 
     if [ "$was_running" -eq 1 ]; then
+        restart_on_exit=0
         start_provider quiet || warn "the provider did not start again; run \`urnet-tools start'"
     fi
     say "Installed $version to $install_path"
@@ -986,8 +1053,18 @@ print_next_steps ()
     printf '  Stop:             %surnet-tools stop%s\n' "$bold" "$reset"
     printf '  All commands:     %surnet-tools --help%s\n' "$bold" "$reset"
     printf '\n'
-    printf 'It starts by itself when you log in, and checks for updates every day.\n'
-    printf 'macOS may show a "Background Items Added" notice for it; that is expected.\n'
+    if [ "$(get_setting auto_start 1)" = "1" ]; then
+        printf 'It starts by itself when you log in.\n'
+    fi
+    if [ "$(get_setting auto_update 1)" = "1" ]; then
+        printf 'It checks for updates %s at %s.\n' "$(get_setting update_interval daily)" "$(update_time_text)"
+    else
+        printf 'Automatic updates are off; update with %surnet-tools update%s.\n' "$bold" "$reset"
+    fi
+    if [ "$(launchd_domain)" = "user/$(id -u)" ]; then
+        printf '%sNo one is logged in at the screen, so after a restart the provider only starts once someone logs in.%s\n' "$bold" "$reset"
+    fi
+    printf 'macOS may show a "Background Items Added" notice for urnet-tools; that is expected.\n'
     printf '%sMore help: https://ur.xyz/docs/miner%s\n' "$bold" "$reset"
 }
 
@@ -1068,7 +1145,11 @@ do_status ()
         ds_running=1
         printf 'Provider:           %srunning%s (pid %s)\n' "$bold" "$reset" "$(job_pid "$provider_label")"
     elif job_loaded "$provider_label"; then
-        printf 'Provider:           %snot running%s (last exit code %s; launchd retries every minute)\n' "$bold" "$reset" "$(job_last_exit "$provider_label")"
+        if has_identity; then
+            printf 'Provider:           %snot running%s (last exit code %s; launchd retries every minute, see %surnet-tools logs%s)\n' "$bold" "$reset" "$(job_last_exit "$provider_label")" "$bold" "$reset"
+        else
+            printf 'Provider:           %snot running%s (not signed in)\n' "$bold" "$reset"
+        fi
     else
         printf 'Provider:           %sstopped%s (start it with %surnet-tools start%s)\n' "$bold" "$reset" "$bold" "$reset"
     fi
@@ -1248,7 +1329,8 @@ do_uninstall ()
             *) die "unknown option '$1' for uninstall" ;;
         esac
     done
-    [ -d "$install_path" ] || die "nothing to uninstall: $install_path does not exist"
+    [ -f "$install_path/bin/urnetwork" ] || [ -f "$install_path/settings" ] ||
+        die "nothing to uninstall: no URnetwork install in $install_path"
 
     if [ "$du_identity" -eq 1 ] && [ -d "$state_dir" ]; then
         if [ "$assume_yes" -eq 0 ]; then
@@ -1267,8 +1349,17 @@ do_uninstall ()
     run rm -f "$(provider_plist_in_agents)" "$(update_plist)"
     release_lock
     say "Removing $install_path"
-    run rm -rf "$install_path" || die "could not remove $install_path"
-    run rm -rf "$log_dir"
+    # only what the installer put there, never the folder as a whole: the
+    # path may be one the user chose with -i
+    run rm -f "$install_path/bin/urnetwork" "$install_path/bin/urnet-tools" \
+        "$install_path/bin/urnetwork.new" "$install_path/bin/urnet-tools.new" \
+        "$install_path/settings" "$install_path/.version" "$install_path/.date" \
+        "$(provider_plist_parked)"
+    run rm -rf "$install_path/.lock"
+    run rmdir "$install_path/launchd" "$install_path/bin" "$install_path" 2>/dev/null
+    [ -d "$install_path" ] && [ "$dry_run" -eq 0 ] && say "Left $install_path in place because it has other files in it"
+    run rm -f "$log_dir/provider.log" "$log_dir/provider.log.1" "$log_dir/update.log" "$log_dir/update.log.1"
+    run rmdir "$log_dir" 2>/dev/null
     if [ "$du_path" -eq 1 ]; then
         remove_from_path
     fi
@@ -1286,12 +1377,13 @@ do_uninstall ()
 # restarting a provider that cannot sign in
 do_service_run ()
 {
-    if [ -f "$log_dir/provider.log" ] && [ "$(wc -c < "$log_dir/provider.log")" -gt "$log_max_bytes" ]; then
-        mv -f "$log_dir/provider.log" "$log_dir/provider.log.1"
-    fi
-    if [ -f "$log_dir/update.log" ] && [ "$(wc -c < "$log_dir/update.log")" -gt "$log_max_bytes" ]; then
-        mv -f "$log_dir/update.log" "$log_dir/update.log.1"
-    fi
+    # launchd opened the logs before this runs, so copy and truncate them in
+    # place rather than renaming them
+    for dsr_log in "$log_dir/provider.log" "$log_dir/update.log"; do
+        if [ -f "$dsr_log" ] && [ "$(wc -c < "$dsr_log")" -gt "$log_max_bytes" ]; then
+            cp -f "$dsr_log" "$dsr_log.1" && : > "$dsr_log"
+        fi
+    done
     if ! has_identity; then
         echo "$(date): not signed in; run \`urnetwork auth', then \`urnet-tools start'"
         exit 0
@@ -1301,6 +1393,25 @@ do_service_run ()
 
 # ---------------------------------------------------------------- main
 
+# refuse paths that would put the install on top of the user's own files, or
+# that cannot be quoted safely in plists and shell startup files
+check_install_path ()
+{
+    case "$install_path" in
+        ""|/|"$HOME"|/usr|/usr/local|/opt|/opt/homebrew|/Applications|/Library|/System|"$HOME/Library"|"$HOME/.local"|"$HOME/.local/share"|"$state_dir")
+            die "refusing to install into $install_path; pick a folder of its own, such as ~/.local/share/urnetwork-provider"
+            ;;
+    esac
+    case "$install_path" in
+        *'"'*|*'$'*|*'`'*|*\\*)
+            die 'the install path must not contain quotes, dollar signs, backticks or backslashes'
+            ;;
+    esac
+    if [ "$(printf '%s' "$install_path" | wc -l | tr -d ' ')" != "0" ]; then
+        die "the install path must not contain a line break"
+    fi
+}
+
 args_rest=""
 add_arg ()
 {
@@ -1308,88 +1419,100 @@ add_arg ()
     args_rest="$args_rest '$(printf '%s' "$1" | sed "s/'/'\\\\''/g")'"
 }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -v|--version)
-            [ -z "$operation" ] && operation=version
-            shift
-            ;;
-        -t|--tag|-n|--lines|--interval)
-            # options with a value, so the value is not taken for a command
-            add_arg "$1"
-            if [ $# -gt 1 ]; then add_arg "$2"; shift; fi
-            shift
-            ;;
-        -i|--install)
-            [ -n "$2" ] || die "option '$1' needs a path"
-            install_path="$2"
-            shift 2
-            ;;
-        --install=*)
-            install_path="${1#--install=}"
-            shift
-            ;;
-        --dry-run)
-            dry_run=1
-            shift
-            ;;
-        -y|--yes)
-            assume_yes=1
-            shift
-            ;;
-        --)
-            shift
-            while [ $# -gt 0 ]; do add_arg "$1"; shift; done
-            ;;
-        -*)
-            add_arg "$1"
-            shift
-            ;;
-        *)
-            if [ -z "$operation" ] && [ "$URNETWORK_TOOLS_MODE" = "1" ]; then
-                operation="$1"
-            else
+# everything runs from here, on the last line, so a download cut off half
+# way runs nothing
+main ()
+{
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                [ -z "$operation" ] && operation=version
+                shift
+                ;;
+            -t|--tag|-n|--lines|--interval)
+                # options with a value, so the value is not taken for a command
                 add_arg "$1"
-            fi
-            shift
-            ;;
-    esac
-done
-eval "set -- $args_rest"
+                if [ $# -gt 1 ]; then add_arg "$2"; shift; fi
+                shift
+                ;;
+            -i|--install)
+                [ -n "$2" ] || die "option '$1' needs a path"
+                install_path="$2"
+                shift 2
+                ;;
+            --install=*)
+                install_path="${1#--install=}"
+                shift
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            -y|--yes)
+                assume_yes=1
+                shift
+                ;;
+            --)
+                shift
+                while [ $# -gt 0 ]; do add_arg "$1"; shift; done
+                ;;
+            -*)
+                add_arg "$1"
+                shift
+                ;;
+            *)
+                if [ -z "$operation" ] && [ "$URNETWORK_TOOLS_MODE" = "1" ]; then
+                    operation="$1"
+                else
+                    add_arg "$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    eval "set -- $args_rest"
 
-if [ "$URNETWORK_TOOLS_MODE" != "1" ]; then
-    if [ "$operation" = version ]; then
-        show_help
-        exit 0
+    if [ "$URNETWORK_TOOLS_MODE" != "1" ]; then
+        if [ "$operation" = version ]; then
+            die "this is the installer; once installed, \`urnet-tools version' shows the version"
+        fi
+        operation=install
     fi
-    operation=install
-fi
 
-if [ -z "$operation" ]; then
-    show_help >&2
-    exit 1
-fi
+    if [ -z "$operation" ]; then
+        show_help >&2
+        exit 1
+    fi
 
-case "$install_path" in
-    /*) ;;
-    *) install_path="$script_rundir/$install_path" ;;
-esac
+    case "$install_path" in
+        /*) ;;
+        *) install_path="$script_rundir/$install_path" ;;
+    esac
+    install_path="${install_path%/}"
+    check_install_path
 
-case "$operation" in
-    install|update|reinstall) do_install "$@" ;;
-    uninstall) do_uninstall "$@" ;;
-    start) do_start "$@" ;;
-    stop) do_stop "$@" ;;
-    restart) do_restart "$@" ;;
-    status) do_status "$@" ;;
-    logs|log) do_logs "$@" ;;
-    version) do_version ;;
-    auto-update) do_auto_update "$@" ;;
-    auto-start) do_auto_start "$@" ;;
-    service-run) do_service_run ;;
-    *) die "unknown command '$operation' (try \`$me --help')" ;;
-esac
+    if [ "$(id -u)" -eq 0 ] && [ "$URNETWORK_ALLOW_ROOT" != "1" ]; then
+        die "run this without sudo; it installs URnetwork for your own user"
+    fi
+
+    case "$operation" in
+        install|update|reinstall) do_install "$@" ;;
+        uninstall) do_uninstall "$@" ;;
+        start) do_start "$@" ;;
+        stop) do_stop "$@" ;;
+        restart) do_restart "$@" ;;
+        status) do_status "$@" ;;
+        logs|log) do_logs "$@" ;;
+        version) do_version ;;
+        auto-update) do_auto_update "$@" ;;
+        auto-start) do_auto_start "$@" ;;
+        service-run) do_service_run ;;
+        *) die "unknown command '$operation' (try \`$me --help')" ;;
+    esac
+}
+
+main "$@"

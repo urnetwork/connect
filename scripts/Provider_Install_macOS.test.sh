@@ -27,6 +27,7 @@ setup ()
     export MOCK_ARCH=arm64
     export MOCK_TRANSLATED=0
     export MOCK_GUI=1
+    export MOCK_UID=501
     export SHELL=/bin/zsh
     unset URNETWORK_PROVIDER_INSTALL URNETWORK_TOOLS_MODE
     export URNETWORK_API_BASE="https://api.test/repos/urnetwork/build"
@@ -35,6 +36,11 @@ setup ()
     cat > "$run_dir/bin/uname" <<'EOF'
 #!/bin/sh
 case "$1" in -s) echo "${MOCK_UNAME:-Darwin}" ;; -m) echo "$MOCK_ARCH" ;; *) echo Darwin ;; esac
+EOF
+    cat > "$run_dir/bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = -u ] && [ -n "$MOCK_UID" ]; then echo "$MOCK_UID"; exit 0; fi
+exec /usr/bin/id "$@"
 EOF
     cat > "$run_dir/bin/sw_vers" <<'EOF'
 #!/bin/sh
@@ -62,20 +68,34 @@ d="$MOCK_DIR/launchd"
 case "$1" in
     print)
         case "$2" in
-            gui/*/*|user/*/*) l="${2##*/}"; [ -f "$d/$l" ] || exit 113; printf '%s = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n}\n' "$l" ;;
+            gui/*/*|user/*/*)
+                l="${2##*/}"
+                [ -f "$d/$l" ] || exit 113
+                [ "$(cat "$d/$l.domain")" = "${2%/*}" ] || exit 113
+                if [ -f "$d/$l.exited" ]; then
+                    printf '%s = {\n\tstate = not running\n\tlast exit code = 1\n}\n' "$l"
+                else
+                    printf '%s = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n}\n' "$l"
+                fi
+                ;;
             gui/*) [ "$MOCK_GUI" = 1 ] || exit 113 ;;
             user/*) ;;
         esac
         ;;
     bootstrap)
-        python3 -I -c 'import plistlib,sys; p=plistlib.load(open(sys.argv[1],"rb")); open(sys.argv[2],"w").write(p["Label"]+"\n"+"\n".join(p["ProgramArguments"]))' "$3" "$d/.last" || exit 5
+        if command -v python3 > /dev/null; then
+            python3 -I -c 'import plistlib,sys; p=plistlib.load(open(sys.argv[1],"rb")); open(sys.argv[2],"w").write(p["Label"]+"\n"+"\n".join(p["ProgramArguments"]))' "$3" "$d/.last" || exit 5
+        else
+            plutil -lint "$3" > /dev/null || exit 5
+            sed -n 's:.*<string>\(.*\)</string>.*:\1:p' "$3" | sed -n '1,4p' | sed 's/&amp;/\&/g' > "$d/.last"
+        fi
         l="$(head -n 1 "$d/.last")"
         [ -f "$d/$l.disabled" ] && exit 5
         [ -f "$d/$l" ] && exit 5
         mv "$d/.last" "$d/$l"
         echo "$2" > "$d/$l.domain"
         ;;
-    bootout) l="${2##*/}"; [ -f "$d/$l" ] || exit 3; rm -f "$d/$l" ;;
+    bootout) l="${2##*/}"; [ -f "$d/$l" ] || exit 3; [ "$(cat "$d/$l.domain")" = "${2%/*}" ] || exit 3; rm -f "$d/$l" "$d/$l.exited" ;;
     enable) rm -f "$d/${2##*/}.disabled" ;;
     disable) touch "$d/${2##*/}.disabled" ;;
 esac
@@ -160,7 +180,7 @@ run_tests ()
     [ -f "$HOME/Library/LaunchAgents/com.urnetwork.provider.plist" ] || fail "provider plist missing"
     grep -q "urnetwork-provider start" "$HOME/.zshrc" 2>/dev/null || fail "PATH not added to a new ~/.zshrc"
     [ -f "$HOME/.bash_profile" ] && fail "bash_profile created for a zsh user"
-    [ "$(stat -c %a "$HOME/.urnetwork" 2>/dev/null)" = 700 ] || fail "state dir not private"
+    [ -n "$(find "$HOME/.urnetwork" -maxdepth 0 -perm 700)" ] || fail "state dir not private"
     grep -q "codesign --force --sign -" "$run_dir/calls" || fail "unsigned binary was not ad-hoc signed"
     grep -q "xattr -d com.apple.quarantine" "$run_dir/calls" || fail "quarantine not cleared"
     grep -q "urnetwork auth" "$run_dir/out" || fail "next steps do not mention sign-in"
@@ -170,7 +190,7 @@ run_tests ()
     grep -q "<string>$HOME/.local/share/urnetwork-provider/bin/urnet-tools</string>" "$HOME/Library/LaunchAgents/com.urnetwork.provider.plist" &&
         fail "the & in HOME was not escaped in the plist"
     grep -q "home dir &amp; co" "$HOME/Library/LaunchAgents/com.urnetwork.provider.plist" || fail "plist path not escaped"
-    sed -n 2,5p "$run_dir/launchd/com.urnetwork.provider.update" | tr '\n' ' ' | grep -q "/bin/sh $(install_dir)/bin/urnet-tools update --scheduled" ||
+    sed -n 2,4p "$run_dir/launchd/com.urnetwork.provider.update" | tr '\n' ' ' | grep -q "^$(install_dir)/bin/urnet-tools update --scheduled" ||
         fail "update agent arguments: $(cat "$run_dir/launchd/com.urnetwork.provider.update")"
 
     # --- running the installer again keeps settings and PATH lines single
@@ -292,6 +312,30 @@ run_tests ()
     grep -q "not signed in" "$run_dir/out" || fail "service-run without identity message"
     mv "$run_dir/jwt" "$HOME/.urnetwork/jwt"
 
+    # --- a provider that keeps exiting is reported, with the right hint
+    touch "$run_dir/launchd/com.urnetwork.provider.exited"
+    tools status > "$run_dir/out" 2>&1
+    grep -q "retries every minute" "$run_dir/out" || fail "status for an exiting provider: $(cat "$run_dir/out")"
+    tools restart > /dev/null 2>&1
+
+    # --- a big log is rotated in place, so launchd keeps writing to provider.log
+    dd if=/dev/zero of="$HOME/Library/Logs/urnetwork/provider.log" bs=1048576 count=11 2> /dev/null
+    tools service-run > /dev/null 2>&1
+    [ -f "$HOME/Library/Logs/urnetwork/provider.log.1" ] || fail "log not rotated"
+    [ "$(wc -c < "$HOME/Library/Logs/urnetwork/provider.log")" -lt 1000 ] || fail "rotated log not truncated"
+
+    # --- an update that fails after stopping the provider starts it again
+    make_release v7
+    mkdir -p "$(install_dir)/bin/urnetwork.new/x"
+    tools update > "$run_dir/out" 2>&1 && fail "update over a blocked path succeeded"
+    loaded com.urnetwork.provider || fail "failed update left the provider stopped: $(cat "$run_dir/out")"
+    rm -rf "$(install_dir)/bin/urnetwork.new"
+    tools update > /dev/null 2>&1 || fail "update after clearing the block"
+    grep -q "fake provider v7" "$(install_dir)/bin/urnetwork" || fail "v7 not installed"
+
+    tools update --no-start > /dev/null 2>&1 && fail "update --no-start accepted"
+    $sh_cmd "$script" -v > /dev/null 2>&1 && fail "installer -v accepted"
+
     # --- dry run changes nothing
     find "$HOME" -exec ls -ld {} + 2>/dev/null | sort > "$run_dir/before"
     cp -r "$run_dir/launchd" "$run_dir/launchd.before"
@@ -334,6 +378,31 @@ run_tests ()
     (cd "$run_dir" && $sh_cmd -s -- -y < "$script") > "$run_dir/out" 2>&1 && fail "piped install without a published script went ahead"
     [ -e "$(install_dir)" ] && fail "failed piped install left files behind"
 
+    # --- unsafe install paths and root are refused; a shared folder keeps other files
+    $sh_cmd "$script" -y -B -i "$HOME" > "$run_dir/out" 2>&1 && fail "install into HOME accepted"
+    [ -d "$HOME/bin" ] && fail "install into HOME created files"
+    $sh_cmd "$script" -y -B -i "$run_dir/we\$ird" > /dev/null 2>&1 && fail "install path with a dollar sign accepted"
+    MOCK_UID=0 $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "root install accepted"
+    grep -q "without sudo" "$run_dir/out" || fail "root refusal message"
+    mkdir -p "$run_dir/shared"
+    echo keep > "$run_dir/shared/mine.txt"
+    $sh_cmd "$script" -y -i "$run_dir/shared" > /dev/null 2>&1 || fail "install into a shared folder"
+    grep -q "URNETWORK_PROVIDER_INSTALL=\"$run_dir/shared\"" "$HOME/.zshrc" || fail "PATH block not moved to the new install path"
+    [ "$(grep -c "urnetwork-provider start" "$HOME/.zshrc")" = 1 ] || fail "PATH block duplicated on path change"
+    URNETWORK_PROVIDER_INSTALL="$run_dir/shared" $sh_cmd "$run_dir/shared/bin/urnet-tools" uninstall -y > /dev/null 2>&1 || fail "uninstall shared"
+    [ -f "$run_dir/shared/mine.txt" ] || fail "uninstall deleted a file it did not install"
+    [ -e "$run_dir/shared/bin" ] && fail "uninstall left its bin folder"
+
+    # --- bash with only ~/.profile: no new ~/.bash_profile that would hide it
+    rm -f "$HOME/.zshrc" "$HOME/.bash_profile"
+    echo "# my profile" > "$HOME/.profile"
+    SHELL=/bin/bash $sh_cmd "$script" -y > /dev/null 2>&1 || fail "install for a .profile user"
+    [ -f "$HOME/.bash_profile" ] && fail "created ~/.bash_profile over an existing ~/.profile"
+    grep -q "urnetwork-provider start" "$HOME/.profile" || fail "PATH not added to ~/.profile"
+    tools uninstall -y > /dev/null 2>&1
+    grep -q "urnetwork-provider" "$HOME/.profile" && fail "PATH left in ~/.profile"
+    rm -f "$HOME/.profile"
+
     # --- -B, bash users, Intel, Rosetta, SSH sessions, other systems
     SHELL=/bin/bash $sh_cmd "$script" -y -B > /dev/null 2>&1 || fail "install -B"
     grep -q "urnetwork-provider" "$HOME/.bash_profile" 2>/dev/null && fail "-B modified ~/.bash_profile"
@@ -343,14 +412,16 @@ run_tests ()
     grep -q "urnetwork-provider start" "$HOME/.bash_profile" || fail "bash user got no ~/.bash_profile PATH"
     tools uninstall -y > /dev/null 2>&1
     MOCK_ARCH=x86_64 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "Intel install"
-    grep -q "fake provider v6 amd64" "$(install_dir)/bin/urnetwork" || fail "Intel got the wrong binary"
+    grep -q "fake provider v7 amd64" "$(install_dir)/bin/urnetwork" || fail "Intel got the wrong binary"
     tools uninstall -y > /dev/null 2>&1
     MOCK_ARCH=x86_64 MOCK_TRANSLATED=1 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "Rosetta install"
-    grep -q "fake provider v6 arm64" "$(install_dir)/bin/urnetwork" || fail "Rosetta shell got the Intel binary"
+    grep -q "fake provider v7 arm64" "$(install_dir)/bin/urnetwork" || fail "Rosetta shell got the Intel binary"
     tools uninstall -y > /dev/null 2>&1
     MOCK_GUI=0 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "SSH install"
     grep -q "^user/" "$run_dir/launchd/com.urnetwork.provider.update.domain" || fail "SSH install did not use the user domain"
-    MOCK_GUI=0 tools uninstall -y > /dev/null 2>&1
+    # a screen login later: the job stays in user/, and every command still finds it
+    tools uninstall -y > /dev/null 2>&1 || fail "uninstall after SSH install"
+    loaded com.urnetwork.provider.update && fail "uninstall missed the job in the user domain"
     MOCK_ARCH=ppc $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "ppc accepted"
     MOCK_UNAME=Linux $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "Linux accepted"
     grep -q "Provider_Install_Linux.sh" "$run_dir/out" || fail "Linux refusal does not point to the Linux installer"
