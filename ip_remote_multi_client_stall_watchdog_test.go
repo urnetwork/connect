@@ -1,12 +1,86 @@
+// Watchdog policy, terminal ownership and exact source bindings keep the
+// asynchronous stall pass from silently bypassing the channel's safety gates.
 package connect
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Go build overlays do not redirect runtime source reads. Private runs must
+// bind both the compiled afterimage and its hash; ordinary runs use live source.
+func readBusyProbeSource(path string, expectedHash string) (string, error) {
+	if (path == "") != (expectedHash == "") {
+		return "", errors.New("private busy-probe source binding requires both path and sha256")
+	}
+	if path == "" {
+		path = "ip_remote_multi_client.go"
+	}
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	actualHash := fmt.Sprintf("%x", sha256.Sum256(source))
+	if expectedHash != "" && actualHash != expectedHash {
+		return "", fmt.Errorf("busy-probe source binding mismatch: got %s want %s", actualHash, expectedHash)
+	}
+	return strings.ReplaceAll(string(source), "\r\n", "\n"), nil
+}
+
+// The default remains live source; an explicit binding reads and verifies the
+// requested bytes before preserving the existing line-ending normalization.
+func TestBusyProbeSourceBindingUsesExactAfterimage(t *testing.T) {
+	wantLive, err := readSource("ip_remote_multi_client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLive, err := readBusyProbeSource("", "")
+	if err != nil || gotLive != wantLive {
+		t.Fatalf("default source changed: err=%v", err)
+	}
+	path := filepath.Join(t.TempDir(), "source.go")
+	raw := []byte("package connect\r\n// synthetic private afterimage\r\n")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(raw))
+	got, err := readBusyProbeSource(path, hash)
+	if err != nil || got != strings.ReplaceAll(string(raw), "\r\n", "\n") {
+		t.Fatalf("exact private source lost: err=%v source=%q", err, got)
+	}
+}
+
+// Partial or mismatched bindings must fail rather than falling back to an
+// unrelated shared file that happens to satisfy a source anchor.
+func TestBusyProbeSourceBindingRejectsPartialOrWrongPins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.go")
+	raw := []byte("package connect\n// synthetic private afterimage\n")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(raw))
+	for _, row := range []struct {
+		name string
+		path string
+		hash string
+	}{
+		{name: "path only", path: path},
+		{name: "hash only", hash: hash},
+		{name: "wrong hash", path: path, hash: strings.Repeat("0", 64)},
+		{name: "missing file", path: path + ".absent", hash: hash},
+	} {
+		if source, err := readBusyProbeSource(row.path, row.hash); err == nil || source != "" {
+			t.Fatalf("%s accepted invalid source binding: err=%v", row.name, err)
+		}
+	}
+}
 
 // the whole point of the watchdog is that a stall is noticed on roughly its own
 // timescale. Detecting at 3s is worth nothing if it is consulted every 15s,
@@ -204,7 +278,7 @@ func TestWatchSendStallsAndCpingReasonsAreNotVerdicts(t *testing.T) {
 // cancels the channel itself and the loop routes through it -- a helper that
 // is correct but uncalled is the failure mode this suite pins against.
 func TestWatchSendStallsSourceAnchors(t *testing.T) {
-	source, err := readSource("ip_remote_multi_client.go")
+	source, err := readBusyProbeSource(os.Getenv("CONNECT_TEST_BUSY_PROBE_SOURCE"), os.Getenv("CONNECT_TEST_BUSY_PROBE_SOURCE_SHA256"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,8 +286,11 @@ func TestWatchSendStallsSourceAnchors(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find convictSendStalls")
 	}
-	if !strings.Contains(body, "client.addError(") {
-		t.Error("convictSendStalls does not addError: the removal would log as a bare Done.")
+	if !strings.Contains(body, "client.addErrorWithLock(") ||
+		!strings.Contains(body, "client.stateLock.Lock()") ||
+		!strings.Contains(body, "defer client.stateLock.Unlock()") ||
+		!strings.Contains(body, "client.pendingSendGeneration != verdict.pendingGeneration") {
+		t.Error("convictSendStalls does not atomically validate the pending episode and record its terminal error")
 	}
 	if !strings.Contains(body, "client.Cancel()") {
 		t.Error("convictSendStalls does not cancel directly: removal latency is back on the resize sweep")
@@ -223,6 +300,10 @@ func TestWatchSendStallsSourceAnchors(t *testing.T) {
 	}
 	if strings.Contains(body, `"Blackhole `) {
 		t.Error("the stall reason must never carry the budgeted verdict prefix")
+	}
+	errorBody, ok := functionBody(source, "func (self *multiClientChannel) addErrorWithLock(")
+	if !ok || !strings.Contains(errorBody, "self.endErr = err") || !strings.Contains(errorBody, "eventBucket.errs = append(eventBucket.errs, err)") {
+		t.Error("the shared locked error implementation lost terminal or event accounting")
 	}
 
 	body, ok = functionBody(source, "func (self *multiClientWindow) watchSendStalls(")
@@ -256,7 +337,7 @@ func TestWatchSendStallsSourceAnchors(t *testing.T) {
 // would have removed a production exit for one lost ack. This pins the
 // restored semantics: an unanswered ping ends the ping loop and nothing else.
 func TestCpingTimeoutSourceAnchors(t *testing.T) {
-	source, err := readSource("ip_remote_multi_client.go")
+	source, err := readBusyProbeSource(os.Getenv("CONNECT_TEST_BUSY_PROBE_SOURCE"), os.Getenv("CONNECT_TEST_BUSY_PROBE_SOURCE_SHA256"))
 	if err != nil {
 		t.Fatal(err)
 	}

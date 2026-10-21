@@ -27,6 +27,7 @@ func busyProbeTestChannel(t *testing.T, send func(timeout time.Duration, ackCall
 	t.Cleanup(cancel)
 
 	client := stallTestChannel()
+	client.settings.BusyProbeSendErrorThreshold = DefaultMultiClientSettings().BusyProbeSendErrorThreshold
 	client.ctx, client.cancel = context.WithCancel(ctx)
 	client.busyProbeSendFunc = send
 	return client
@@ -104,12 +105,9 @@ func TestBusyProbeAcquitsOnAck(t *testing.T) {
 	})
 }
 
-// The conviction. An exit that does not answer inside the budget is judged
-// exactly as it was before the probe existed -- errored with the "send stalled"
-// reason and cancelled -- with the reason extended so a field capture can see
-// the probe was asked and did not answer. The "Blackhole " prefix must stay
-// off it: this is hard evidence and the storm breaker must not budget it.
-func TestBusyProbeConvictsOnTimeout(t *testing.T) {
+// Supersedes the former timeout-conviction policy: admission alone cannot prove
+// that the question crossed local carrier backpressure. No ACK is fabricated.
+func TestBusyProbeHoldsOnUnansweredBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
@@ -121,19 +119,18 @@ func TestBusyProbeConvictsOnTimeout(t *testing.T) {
 
 		window := busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
 
-		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-		AssertEqual(t, client.IsDone(), true)
+		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, client.IsDone(), false)
 
 		client.stateLock.Lock()
 		endErr := client.endErr
+		ack, pending := client.busyProbeAckTime, client.packetStats.sendNackCount
+		owner, outstanding := client.busyProbe, client.busyProbeOutstanding
 		client.stateLock.Unlock()
 
-		AssertEqual(t, endErr != nil, true)
-		AssertEqual(t, strings.HasPrefix(endErr.Error(), "send stalled"), true)
-		if !strings.Contains(endErr.Error(), "liveness probe timed out after") {
-			t.Errorf("the reason does not name the probe outcome: %q", endErr.Error())
+		if endErr != nil || !ack.IsZero() || pending != 1 || owner == nil || outstanding {
+			t.Fatal("unanswered probe changed health/accounting or retained a tier penalty")
 		}
-		AssertEqual(t, blackholeVerdictErr(endErr), false)
 	})
 }
 
@@ -431,17 +428,17 @@ func TestBusyProbeSchedulerPauseRefreshesBudget(t *testing.T) {
 	})
 }
 
-// With the detector off, the same paused probe returns a conviction at its
+// With the detector off, the same paused probe returns unknown at its
 // first expiry. Window admission is tested separately: a sibling stamped once
 // at construction may correctly age out while this waiter is descheduled.
-func TestBusyProbeSchedulerPauseOffConvictsAtTheBudget(t *testing.T) {
+func TestBusyProbeSchedulerPauseOffHoldsAtTheBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		budget := 50 * time.Millisecond
 		client, verdicts, ackCallback := busyProbeTestPausedProbe(t, budget, 0)
 		select {
 		case verdict := <-verdicts:
-			if !verdict.convict || verdict.detail != "liveness probe timed out after 50ms" {
-				t.Fatalf("disabled pause detector did not convict at the first expiry: %+v", verdict)
+			if verdict.convict || !verdict.unanswered || verdict.detail != "liveness probe unanswered after 50ms; callback retained" {
+				t.Fatalf("disabled pause detector did not hold at the first expiry: %+v", verdict)
 			}
 		default:
 			t.Fatal("disabled pause detector incorrectly refreshed the expired budget")
@@ -466,7 +463,11 @@ func TestBusyProbeHoldsWhenSiblingProofExpiresDuringProbe(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 		budget := 50 * time.Millisecond
-		client := busyProbeTestChannel(t, func(_ time.Duration, _ func(error)) (bool, error) {
+		client := busyProbeTestChannel(t, func(_ time.Duration, callback func(error)) (bool, error) {
+			go func() {
+				time.Sleep(budget - time.Nanosecond)
+				callback(errors.New("synthetic terminal probe failure"))
+			}()
 			return true, nil
 		})
 		stallPast(client, stallTimeout)
@@ -478,7 +479,7 @@ func TestBusyProbeHoldsWhenSiblingProofExpiresDuringProbe(t *testing.T) {
 
 		// Construction-to-dispatch delay plus the probe budget now exceeds
 		// the sibling proof's stallTimeout+budget lifetime by one nanosecond.
-		time.Sleep(stallTimeout + time.Nanosecond)
+		time.Sleep(stallTimeout + 2*time.Nanosecond)
 		AssertEqual(t, sibling.hasRecentReceive(stallTimeout+budget), true)
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
 		AssertEqual(t, sibling.hasRecentReceive(stallTimeout+budget), false)

@@ -72,6 +72,10 @@ func TestEveryPoolBufferEntryPointDeclaresItsOwnership(t *testing.T) {
 		{"Client.SendWithTimeoutDetailed", takesOnSuccess},
 		{name: "Client.sendWithTimeoutAdmissionDetailed", rule: takesOnSuccess},
 		{name: "ipPacketGroupBatch.offer", rule: takes},
+		{name: "RemoteUserNatMultiClient.SendNativePacketBatch", rule: takes},
+		{name: "RemoteUserNatMultiClient.SendNativePacketBatchWithResults", rule: takes},
+		{name: "UpgradeMux.SendNativePacketBatch", rule: takes},
+		{name: "RemoteUserNatMultiClient.sendNativePacketGroup", rule: takesOnSuccess},
 		{name: "RemoteUserNatMultiClient.sendPreparedPacketGroup", rule: takesOnSuccess},
 		{name: "RemoteUserNatMultiClient.sendParsedPacketGroupAttempt", rule: takesOnSuccess},
 	}

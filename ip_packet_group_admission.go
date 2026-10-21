@@ -7,12 +7,13 @@ import "time"
 // Policy preparation belongs to one synchronous input group, never a flow
 // cache. A refused group remains caller-owned while this bounded scope waits.
 type ipPacketGroupAdmission struct {
-	prepared   bool
-	probing    bool
-	stop       bool
-	local      bool
-	parsed     *parsedPacketGroup
-	firstOffer time.Time
+	nativeIngress bool
+	prepared      bool
+	probing       bool
+	stop          bool
+	local         bool
+	parsed        *parsedPacketGroup
+	firstOffer    time.Time
 }
 
 // The pending slice is bounded by the caller's existing group count. SMTP and

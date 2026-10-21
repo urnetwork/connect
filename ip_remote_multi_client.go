@@ -400,7 +400,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// false is the convict-immediately A/B comparison point
 		BusyProbe: true,
 		// 0 derives max(1s, SendStallTimeout/2) = 1.5s at the bar above
-		BusyProbeBudget: 0,
+		BusyProbeBudget:             0,
+		BusyProbeSendErrorThreshold: 2,
 		// 2s of excess timer delay is far outside any scheduling jitter a
 		// running process sees and far inside the shortest doze window, so the
 		// detector fires on real suspends and on nothing else
@@ -1004,8 +1005,8 @@ type MultiClientSettings struct {
 	// A positive control-ping ACK proves reachability when flow ACKs are stale.
 	// The ping can share local admission and serialization with stalled data;
 	// local refusal is not remote evidence. Successful admission alone also
-	// does not establish first-route-write; the existing admitted timeout
-	// policy remains separate from that positive proof.
+	// does not establish a physical write. An unanswered bounded evaluation
+	// holds; carrier read and terminal Transfer failures keep their authority.
 	//
 	// The interposition is confined to the send-stall path. The no-send-ack
 	// verdict, the transport-down hold, and the cping loop keep their exact
@@ -1014,12 +1015,14 @@ type MultiClientSettings struct {
 	// false (the zero value) is today's behavior: the bar trips, the exit is
 	// convicted, nothing is asked.
 	BusyProbe bool
-	// BusyProbeBudget is how long a busy probe waits for its ack before the
-	// stall verdict stands. 0 derives max(1s, SendStallTimeout/2) -- 1.5s at
-	// the shipped 3s bar -- which keeps total detection inside ~4.5s while
-	// leaving a congested-but-alive exit several rtts to answer. Only consulted
-	// when BusyProbe is on.
+	// Bounds one busy-probe evaluation, not remote silence. Non-positive derives
+	// max(1s, SendStallTimeout/2), or 1.5s at the default stall bar. An unanswered
+	// admitted probe retains its single owner without keeping the suspect demerit.
 	BusyProbeBudget time.Duration
+	// Consecutive nonnil admission errors required by the compatibility policy.
+	// Default 2 preserves that policy; non-positive disables this conviction.
+	// Known false/nil local refusals never contribute.
+	BusyProbeSendErrorThreshold int
 
 	// SchedulerPauseTolerance is how much later than armed a timer may fire
 	// before the host is judged to have been suspended (doze, the app freezer,
@@ -6297,6 +6300,18 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	packet []byte,
 	timeout time.Duration,
 ) bool {
+	return self.sendPacketWithPolicy(source, provideMode, packet, timeout, false)
+}
+
+// Takes on success; native input changes only remote admission, after local
+// policy classification. Fragment, SMTP and local ownership remain unchanged.
+func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packet []byte,
+	timeout time.Duration,
+	nativeIngress bool,
+) bool {
 	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
@@ -6305,12 +6320,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			packet,
 		)
 		if result.packet != nil {
-			if self.sendReassembledUdpFragments(
+			if self.sendReassembledUdpFragmentsWithPolicy(
 				source,
 				provideMode,
 				result.packet,
 				result.fragments,
 				timeout,
+				nativeIngress,
 			) {
 				result.fragments = nil
 			}
@@ -6433,7 +6449,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		pin.appId = self.flowOwnerAppId(ipPath, *lookupPtr)
 	}
 
-	parsedPacket := &parsedPacket{
+	parsed := &parsedPacket{
 		packet:  packet,
 		ipPath:  ipPath,
 		payload: payload,
@@ -6444,9 +6460,18 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			byteCount,
 		),
 	}
-	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
+	success := false
+	if nativeIngress {
+		success = self.sendNativeParsedPacketGroup(source, provideMode, &parsedPacketGroup{
+			packets: []parsedPacket{*parsed}, ipPath: parsed.ipPath,
+			pin: parsed.pin, byteCount: ByteCount(len(packet)),
+			transportAttribution: parsed.transportAttribution,
+		})
+	} else {
+		success = self.sendPacket(source, provideMode, parsed, timeout)
+	}
 	if success {
-		parsedPacket.transportAttribution.admit()
+		parsed.transportAttribution.admit()
 	}
 	return success
 }
@@ -6462,6 +6487,19 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 	reassembled []byte,
 	fragments [][]byte,
 	timeout time.Duration,
+) bool {
+	return self.sendReassembledUdpFragmentsWithPolicy(source, provideMode, reassembled, fragments, timeout, false)
+}
+
+// Fragment custody is unchanged; the reassembled policy decision chooses the
+// local timeout or a single ready remote offer for the exact original fragments.
+func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	reassembled []byte,
+	fragments [][]byte,
+	timeout time.Duration,
+	nativeIngress bool,
 ) bool {
 	if len(fragments) == 0 {
 		return false
@@ -6558,7 +6596,13 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 			byteCount,
 		),
 	}
-	if !self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout) {
+	success := false
+	if nativeIngress {
+		success = self.sendNativeParsedPacketGroup(source, provideMode, parsedGroup)
+	} else {
+		success = self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout)
+	}
+	if !success {
 		return false
 	}
 	parsedGroup.transportAttribution.admit()
@@ -6605,6 +6649,19 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 	timeout time.Duration,
 	accepted []bool,
 ) int {
+	return self.sendPacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, false)
+}
+
+// Takes all originals. Native policy is per invocation, not cached on a flow,
+// so ordinary blocking callers retain their original timeout and ordering.
+func (self *RemoteUserNatMultiClient) sendPacketBatchWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+	nativeIngress bool,
+) int {
 	containsFragments := false
 	for _, packet := range packets {
 		if isIpFragmentPacket(packet) {
@@ -6613,7 +6670,7 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 		}
 	}
 	if !containsFragments {
-		return self.sendCompletePacketBatch(source, provideMode, packets, timeout, accepted)
+		return self.sendCompletePacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, nativeIngress)
 	}
 
 	// Preserve wire order around a fragmented datagram. Ordinary contiguous
@@ -6628,12 +6685,13 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 			if accepted != nil {
 				completeAccepted = accepted[completeStart:end]
 			}
-			acceptedCount += self.sendCompletePacketBatch(
+			acceptedCount += self.sendCompletePacketBatchWithPolicy(
 				source,
 				provideMode,
 				packets[completeStart:end],
 				timeout,
 				completeAccepted,
+				nativeIngress,
 			)
 		}
 	}
@@ -6642,7 +6700,7 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 			continue
 		}
 		flushComplete(i)
-		if self.SendPacket(source, provideMode, packet, timeout) {
+		if self.sendPacketWithPolicy(source, provideMode, packet, timeout, nativeIngress) {
 			acceptedCount++
 			if accepted != nil {
 				accepted[i] = true
@@ -6660,6 +6718,19 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	packets [][]byte,
 	timeout time.Duration,
 	accepted []bool,
+) int {
+	return self.sendCompletePacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, false)
+}
+
+// Native input has no pending remote continuation; each exact-flow group is
+// offered once, while the existing local protocol timeout stays authoritative.
+func (self *RemoteUserNatMultiClient) sendCompletePacketBatchWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+	nativeIngress bool,
 ) int {
 	// The legacy hot path retains neither this map nor per-group indexes;
 	// even ipPacketGroup's allocation size is unchanged by diagnostics.
@@ -6681,8 +6752,11 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	sentPacketCount := 0
 	batch := ipPacketGroupBatch{
 		timeout:   timeout,
-		readyPass: 1 < len(groups) && timeout != 0,
+		readyPass: !nativeIngress && 1 < len(groups) && timeout != 0,
 		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
+			if nativeIngress {
+				return self.sendNativePacketGroup(source, provideMode, group, sendTimeout)
+			}
 			return self.sendPacketGroup(source, provideMode, group, sendTimeout)
 		},
 		complete: func(group *ipPacketGroup, success bool) {
@@ -6706,7 +6780,7 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 			// Preserve that per-packet result instead of applying the ordinary
 			// all-or-nothing flow-group transaction.
 			for packetIndex, packet := range group.packets {
-				if self.SendPacket(source, provideMode, packet, timeout) {
+				if self.sendPacketWithPolicy(source, provideMode, packet, timeout, nativeIngress) {
 					sentPacketCount += 1
 					if accepted != nil {
 						accepted[packetIndexes[group][packetIndex]] = true
@@ -7219,6 +7293,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	completeObservations bool,
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
+	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress
+	if nativeIngress {
+		// This is a ready offer, not a shorter delivery or recovery deadline.
+		timeout = 0
+	}
 	defer func() {
 		if !success {
 			sendPacketGroup.collapseAdmission.releaseTcpRecovery()
@@ -7317,7 +7396,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// sequence state is guarded by the per-flow `stateLock`
 				update.commitSequenceGroupForClient(sendPacketGroup, client)
 			} else if err != nil {
-				if batchAdmission != nil && batchAdmission.probing &&
+				if (nativeIngress || batchAdmission != nil && batchAdmission.probing) &&
 					errors.Is(err, ErrEncryptionRequiredNotEstablished) {
 					// A readiness visit cannot turn the caller's still-live
 					// encryption wait into a provider reset.
@@ -11453,8 +11532,8 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 				// Closing a channel is not a successful peer-health observation.
 				continue
 			}
-			if verdict.localUnwritten {
-				// Local refusal or expiry carries no peer-health evidence. Report it once
+			if verdict.localUnwritten || verdict.unanswered {
+				// Refusal, expiry or an unresolved callback carries no peer-health evidence. Report it once
 				// in this stale episode without refreshing its pending clock.
 				if client.markStallHoldOnce() {
 					loggerOrDefault(self.log).Infof("%s\n", relEvent(
@@ -11568,7 +11647,20 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 		if verdict.detail != "" {
 			reason = fmt.Sprintf("%s, %s", reason, verdict.detail)
 		}
-		client.addError(fmt.Errorf("send stalled: %s", reason))
+		committed := func() bool {
+			client.stateLock.Lock()
+			defer client.stateLock.Unlock()
+			// Other probes may have kept the window waiting after this result.
+			// Commit the error only to the pending episode that was actually judged.
+			if verdict.pendingEpisode && (client.pendingSendGeneration != verdict.pendingGeneration || (client.ctx != nil && client.ctx.Err() != nil)) {
+				return false
+			}
+			client.addErrorWithLock(fmt.Errorf("send stalled: %s", reason))
+			return true
+		}()
+		if !committed {
+			continue
+		}
 		client.Cancel()
 		loggerOrDefault(self.log).Infof("%s\n", relEvent(
 			"busy_probe",
@@ -14635,7 +14727,7 @@ type multiClientChannel struct {
 	// never be called with this channel's stateLock (or any leaf lock) held.
 	receivingSiblingsFunc func(exclude *multiClientChannel) int
 	// busyProbeSendFunc, when non-nil, overrides how the busy-flow liveness
-	// probe puts its control ping on the wire. Test seam only: the real path
+	// probe offers its control ping for admission. Test seam only: the real path
 	// needs a live Client under the channel and a provider to answer, and what
 	// needs testing is the probe's DECISION (acquit, defer, convict) against
 	// each outcome. Production leaves it nil, which routes through the same
@@ -14803,8 +14895,10 @@ type multiClientChannel struct {
 	// route write, resend, or busy-probe ACK is not packet delivery.
 	// Guarded by stateLock.
 	pendingSendTime time.Time
+	// Orders pending-episode changes even when their clock readings tie.
+	pendingSendGeneration uint64
 
-	// the busy-flow liveness probe's state (see busyLivenessProbe). All three
+	// the busy-flow liveness probe's state (see busyLivenessProbe). All fields
 	// are guarded by stateLock.
 	//
 	// busyProbeAckTime is the last time a probe was answered: proof the exit is
@@ -14818,18 +14912,15 @@ type multiClientChannel struct {
 	// further: the exit gets another full SendStallTimeout to either deliver or
 	// be asked again, and the record of what actually happened stays honest.
 	//
-	// busyProbeOutstanding is set while a probe is in flight and unanswered,
-	// which is the effectiveTier suspect demerit's whole input. Cleared on the
-	// ack and on the conviction.
-	//
-	// busyProbeSendFailures counts probes that could not even be queued within
-	// ONE stale episode -- the send path being wedged full of the same unacked
-	// data the probe is investigating is itself weak evidence, so it takes two
-	// in a row to convict. Reset whenever the channel reads not-stalled, which
-	// is what ends an episode.
+	// busyProbeOutstanding is only the bounded evaluator's suspect demerit.
+	// busyProbe owns at most one admitted callback, including after that wait
+	// ends. A completed result remains for the next window verdict or shutdown.
+	// busyProbeSendFailures retains the separate nonnil-error compatibility
+	// policy within one stale episode; local admission refusals do not count.
 	busyProbeAckTime      time.Time
 	busyProbeOutstanding  bool
 	busyProbeSendFailures int
+	busyProbe             *busyProbeAttempt
 	// stallHoldCounted latches the sibling-corroboration hold to one counter
 	// increment and one log line per stall episode. Cleared on every
 	// sendStalled reset path and on the probe ack, the same places the
@@ -15083,6 +15174,7 @@ func newMultiClientChannel(
 		case <-cancelCtx.Done():
 		case <-client.Done():
 		}
+		clientChannel.clearBusyProbe()
 		// Essential cleanup first, observer-facing events after. A stats
 		// observer can remain parked (an app suspended mid-callback), and
 		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
@@ -15325,9 +15417,8 @@ func (self *multiClientChannel) effectiveTier() int {
 	// that means anything. One step is enough to steer a new flow to a clean
 	// peer of the same tier for the ~1.5s the probe runs, without exiling the
 	// channel behind the next full tier for a suspicion that acquits more often
-	// than it convicts. Self-clearing by construction: the flag is cleared on
-	// the probe ack and on the conviction (which removes the channel anyway), so
-	// nothing here can outlive the probe.
+	// than it convicts. The bounded evaluator clears this flag even when the
+	// unanswered callback retains custody; custody alone is not a tier penalty.
 	if self.busyProbeOutstanding {
 		tier += 1
 	}
@@ -15744,6 +15835,7 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 		// "no probe, no conviction while the transport is down" needs no
 		// separate guard downstream.
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 		self.busyProbeSendFailures = 0
 		self.stallHoldCounted = false
 		return false
@@ -15803,12 +15895,6 @@ func (self *multiClientChannel) markDrainMigrateOnce() bool {
 	return true
 }
 
-// Preserve the compatibility threshold for nonnil send errors inside one stale
-// episode. Exact false/nil local refusals do not contribute: repeated occupied
-// local capacity is not evidence of remote failure. Nonnil errors are not
-// automatically wire evidence either; their existing policy stays separate.
-const busyProbeUnsendableConvictions = 2
-
 // errBusyProbeUnavailable marks a channel with no probe plumbing under it (a
 // bare fixture, a channel whose client is gone). Distinct from a send failure
 // on purpose: absence of the mechanism must fall back to the pre-probe verdict,
@@ -15846,10 +15932,33 @@ type busyProbeVerdict struct {
 	// localUnwritten distinguishes local refusal or queue expiry from a peer
 	// answer and bounds its diagnostic with the existing stale-episode latch.
 	localUnwritten bool
+	// An admitted callback is still unresolved; no physical-write claim follows
+	// from admission or the expiration of this evaluator's local timer.
+	unanswered bool
+	// A destructive window result must still refer to this pending data episode
+	// when it is committed after the other concurrent probe evaluations finish.
+	pendingEpisode    bool
+	pendingGeneration uint64
 	// detail extends the conviction reason so a field capture can tell WHICH
 	// probe outcome convicted. "" convicts with today's exact reason string,
 	// which is what a channel with no probe plumbing gets.
 	detail string
+}
+
+// One callback owner, guarded by its channel's stateLock. The buffered result
+// never blocks a Transfer callback. waiting excludes concurrent evaluators;
+// completed rejects duplicates. The generation binds errors to one data episode.
+type busyProbeAttempt struct {
+	done              chan busyProbeCompletion
+	pendingGeneration uint64
+	waiting           bool
+	completed         bool
+}
+
+// The callback's actual observation time survives a later window evaluation.
+type busyProbeCompletion struct {
+	err error
+	at  time.Time
 }
 
 // addBusyProbeAck records positive liveness: the exit answered a control ping
@@ -15866,7 +15975,14 @@ type busyProbeVerdict struct {
 func (self *multiClientChannel) addBusyProbeAck() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.busyProbeAckTime = time.Now()
+	self.addBusyProbeAckAtWithLock(time.Now())
+}
+
+// Records only an actual callback's timestamp, never the later consumption time.
+func (self *multiClientChannel) addBusyProbeAckAtWithLock(at time.Time) {
+	if self.busyProbeAckTime.Before(at) {
+		self.busyProbeAckTime = at
+	}
 	self.busyProbeOutstanding = false
 	self.busyProbeSendFailures = 0
 	self.stallHoldCounted = false
@@ -15884,6 +16000,15 @@ func (self *multiClientChannel) busyProbeOutstandingNow() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.busyProbeOutstanding
+}
+
+// Shutdown drops callback custody without judging the peer or waiting on I/O.
+// The existing channel teardown worker also calls this on parent cancellation.
+func (self *multiClientChannel) clearBusyProbe() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.busyProbe = nil
+	self.busyProbeOutstanding = false
 }
 
 // probeReceiveAge reports how many whole seconds since return traffic last
@@ -16022,79 +16147,132 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - ack inside the budget: the exit is alive despite the stalled flow acks.
 //     Record the liveness (addBusyProbeAck, which refreshes the stall bar
 //     without forging a send ack) and do not convict.
-//   - budget expires: retain the existing admitted-probe timeout policy, with
-//     the reason naming the probe. This timer starts at admission, not a first
-//     route-write receipt; it is not proof of on-wire silence. One fresh
-//     budget is granted first if the wait itself was suspended (see
-//     schedulerPauseDetected) -- a probe armed before a doze must not convict on
-//     wake, when neither the exit's answer nor this waiter had a cpu. A host
-//     sleep counts too (schedulerPauseElapsed).
+//   - budget expires: hold without refreshing any progress clock. Admission
+//     and route-channel acceptance can both precede a physical write. Retain
+//     this exact callback owner, so later passes cannot accumulate pings.
+//     The existing one-time scheduler-pause refresh still bounds evaluation.
 //   - exact false/nil admission refusal or unwritten queue expiry: hold without
 //     refreshing the stall clock or inventing a peer answer. Repetition does not
 //     turn local admission pressure into remote evidence.
-//   - nonnil send errors: retain the existing two-error compatibility policy.
+//   - nonnil send errors: retain the owner-configured compatibility policy.
 //     These errors are not all remote evidence; this narrow refusal correction
 //     does not broaden their classification.
 //   - no probe plumbing at all: convict exactly as before the probe existed.
 //
 // Locking: takes only this channel's stateLock, in short sections, never across
 // the send or the wait.
-func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProbeVerdict {
+func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) (verdict busyProbeVerdict) {
 	if budget <= 0 {
 		return busyProbeVerdict{convict: true}
 	}
 
-	probeDone := make(chan error, 1)
-	cpingWriteTimeout := time.Duration(0)
-	if self.settings != nil {
-		cpingWriteTimeout = self.settings.CPingWriteTimeout
-	}
-	writeTimeout := busyProbeWriteTimeout(budget, cpingWriteTimeout)
-	success, err := self.sendBusyProbe(writeTimeout, func(err error) {
-		// buffered by one and non-blocking: the waiter below may already have
-		// given up, and the transport's ack callback must never block on us
-		select {
-		case probeDone <- err:
-		default:
-		}
-	})
 	if self.ctx != nil && self.ctx.Err() != nil {
 		return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
 	}
-	if errors.Is(err, errBusyProbeUnavailable) {
-		return busyProbeVerdict{convict: true}
-	}
-	if !success && err == nil {
-		// The caller's bounded local admission refused this ping before taking
-		// ownership. No question reached the peer, regardless of prior refusals.
-		return busyProbeVerdict{
-			localUnwritten: true,
-			detail:         "liveness probe locally refused before admission",
-		}
-	}
-	if err != nil || !success {
-		// Preserve the separate nonnil-error compatibility policy.
-		if failures := self.addBusyProbeSendFailure(); busyProbeUnsendableConvictions <= failures {
-			return busyProbeVerdict{
-				convict: true,
-				detail: fmt.Sprintf(
-					"liveness probe unsendable %dx",
-					busyProbeUnsendableConvictions,
-				),
+	probe, admitted := func() (*busyProbeAttempt, bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.busyProbe != nil {
+			if self.busyProbe.waiting || !self.busyProbe.completed {
+				return nil, false
 			}
-		} else {
+			probe := self.busyProbe
+			probe.waiting = true
+			return probe, true
+		}
+		probe := &busyProbeAttempt{
+			done:              make(chan busyProbeCompletion, 1),
+			pendingGeneration: self.pendingSendGeneration,
+			waiting:           true,
+		}
+		self.busyProbe = probe
+		return probe, false
+	}()
+	if probe == nil {
+		return busyProbeVerdict{unanswered: true, detail: "liveness probe retained: callback pending"}
+	}
+	consumed := false
+	defer func() {
+		if verdict.convict {
+			verdict.pendingEpisode = true
+			verdict.pendingGeneration = probe.pendingGeneration
+		}
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.busyProbe != probe {
+			return
+		}
+		probe.waiting = false
+		self.busyProbeOutstanding = false
+		if !admitted || consumed || (self.ctx != nil && self.ctx.Err() != nil) {
+			self.busyProbe = nil
+		}
+	}()
+	if !admitted {
+		cpingWriteTimeout := time.Duration(0)
+		if self.settings != nil {
+			cpingWriteTimeout = self.settings.CPingWriteTimeout
+		}
+		writeTimeout := busyProbeWriteTimeout(budget, cpingWriteTimeout)
+		success, err := self.sendBusyProbe(writeTimeout, func(err error) {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.busyProbe != probe || probe.completed {
+				return
+			}
+			if self.ctx != nil && self.ctx.Err() != nil {
+				self.busyProbe = nil
+				self.busyProbeOutstanding = false
+				return
+			}
+			probe.completed = true
+			probe.done <- busyProbeCompletion{err: err, at: time.Now()}
+		})
+		if self.ctx != nil && self.ctx.Err() != nil {
+			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+		}
+		if errors.Is(err, errBusyProbeUnavailable) {
+			return busyProbeVerdict{convict: true}
+		}
+		if !success && err == nil {
+			// The caller's bounded local admission refused this ping before taking
+			// ownership. No question reached the peer, regardless of prior refusals.
 			return busyProbeVerdict{
-				detail: fmt.Sprintf("liveness probe unsendable %dx, deferred", failures),
+				localUnwritten: true,
+				detail:         "liveness probe locally refused before admission",
 			}
 		}
-	}
+		if err != nil || !success {
+			// Preserve the separate nonnil-error compatibility policy.
+			threshold := 0
+			if self.settings != nil {
+				threshold = self.settings.BusyProbeSendErrorThreshold
+			}
+			if failures := self.addBusyProbeSendFailure(); 0 < threshold && threshold <= failures {
+				return busyProbeVerdict{
+					convict: true,
+					detail: fmt.Sprintf(
+						"liveness probe unsendable %dx",
+						threshold,
+					),
+				}
+			} else {
+				return busyProbeVerdict{
+					detail: fmt.Sprintf("liveness probe unsendable %dx, deferred", failures),
+				}
+			}
+		}
 
-	self.setBusyProbeOutstanding(true)
-	// every return below either acks (addBusyProbeAck clears it) or convicts;
-	// the disarm covers both plus the ctx-done escape, so the suspect demerit
-	// can never outlive the probe that armed it
-	defer self.setBusyProbeOutstanding(false)
-	self.metrics().busyProbeSent()
+		admitted = true
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.busyProbe == probe {
+				self.busyProbeOutstanding = true
+			}
+		}()
+		self.metrics().busyProbeSent()
+	}
 
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
 	now := time.Now
@@ -16118,7 +16296,23 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 		case <-done:
 			// the channel is going away for its own reasons; no verdict to add
 			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
-		case err := <-probeDone:
+		case completion := <-probe.done:
+			consumed = true
+			current := func() bool {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if self.busyProbe != probe || self.pendingSendGeneration != probe.pendingGeneration || (self.ctx != nil && self.ctx.Err() != nil) {
+					return false
+				}
+				if completion.err == nil {
+					self.addBusyProbeAckAtWithLock(completion.at)
+				}
+				return true
+			}()
+			if !current {
+				return busyProbeVerdict{unanswered: true, detail: "liveness probe completed for an earlier pending episode"}
+			}
+			err := completion.err
 			if err != nil {
 				if self.ctx != nil && self.ctx.Err() != nil {
 					return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
@@ -16141,7 +16335,6 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 					detail:  fmt.Sprintf("liveness probe failed: %s", err),
 				}
 			}
-			self.addBusyProbeAck()
 			self.metrics().busyProbeAcquitted()
 			return busyProbeVerdict{detail: "liveness probe answered"}
 		case <-timer.C:
@@ -16149,10 +16342,8 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				// the host was suspended while this probe was in flight: the
 				// exit's answer and this waiter were both off the cpu, so the
 				// expiry says nothing about the exit. Grant the SAME probe one
-				// fresh budget. Once only -- a second expiry past a full budget
-				// of real running time is a real timeout, and an unbounded
-				// refresh would let a flapping scheduler suspend the verdict
-				// forever.
+				// fresh evaluation budget, once only. Its expiry still cannot
+				// turn local admission into physical-write evidence.
 				budgetRefreshed = true
 				waitStart = now()
 				timer.Reset(budget)
@@ -16166,8 +16357,8 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				continue
 			}
 			return busyProbeVerdict{
-				convict: true,
-				detail:  fmt.Sprintf("liveness probe timed out after %s", budget),
+				unanswered: true,
+				detail:     fmt.Sprintf("liveness probe unanswered after %s; callback retained", budget),
 			}
 		}
 	}
@@ -18228,6 +18419,7 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	if self.packetStats.sendNackCount == 0 {
 		// first outstanding send, so start the stall clock. see sendStalled
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += packetByteCount
@@ -18261,6 +18453,7 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	packetCount := len(sendPacketGroup.packets)
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += packetCount
 	self.packetStats.sendNackByteCount += sendPacketGroup.byteCount
@@ -18330,6 +18523,7 @@ func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
 	self.packetStats.sendNackByteCount -= packetByteCount
 	if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	if n := len(self.eventBuckets); 0 < n {
@@ -18351,6 +18545,7 @@ func (self *multiClientChannel) addSendAbandonedGroup(sendPacketGroup *parsedPac
 	self.packetStats.sendNackByteCount -= sendPacketGroup.byteCount
 	if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 	if eventBucketCount := len(self.eventBuckets); 0 < eventBucketCount {
 		eventBucket := self.eventBuckets[eventBucketCount-1]
@@ -18368,6 +18563,7 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += ackByteCount
@@ -18398,8 +18594,10 @@ func (self *multiClientChannel) addSendCompletion(ackByteCount ByteCount, peerAc
 	if peerAck {
 		self.lastSendAckTime = time.Now()
 		self.pendingSendTime = self.lastSendAckTime
+		self.pendingSendGeneration++
 	} else if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	eventBucket := self.eventBucket()
@@ -18427,8 +18625,10 @@ func (self *multiClientChannel) addSendGroupCompletion(sendPacketGroup *parsedPa
 	if peerAck {
 		self.lastSendAckTime = time.Now()
 		self.pendingSendTime = self.lastSendAckTime
+		self.pendingSendGeneration++
 	} else if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	eventBucket := self.eventBucket()
@@ -18591,7 +18791,11 @@ func (self *multiClientChannel) addSourceToEventBucketWithLock(eventBucket *mult
 func (self *multiClientChannel) addError(err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.addErrorWithLock(err)
+}
 
+// Commits the existing error and event accounting under the channel lock.
+func (self *multiClientChannel) addErrorWithLock(err error) {
 	if self.endErr == nil {
 		self.endErr = err
 	}
@@ -19115,6 +19319,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 func (self *multiClientChannel) Cancel() {
 	self.addError(errors.New("Done."))
+	self.clearBusyProbe()
 	self.ingressIpv4Fragments.close()
 	// nil-guard each teardown hook: bare fixture channels (built literally by
 	// tests, per the ClientId/Tier convention above) have none of them, and
@@ -19137,6 +19342,7 @@ func (self *multiClientChannel) Cancel() {
 
 func (self *multiClientChannel) Close() {
 	self.addError(errors.New("Done."))
+	self.clearBusyProbe()
 	self.ingressIpv4Fragments.close()
 	self.cancel()
 	// the local client teardown (which can wait on a slow Pion close) is
