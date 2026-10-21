@@ -141,7 +141,7 @@ make_release ()
 # fake provider $mr_tag $mr_arch
 case "\$1" in
     --help) [ "${2:-}" = broken ] && exit 137; exit 0 ;;
-    auth) mkdir -p "\$HOME/.urnetwork"; echo token > "\$HOME/.urnetwork/jwt" ;;
+    auth) mkdir -p "\$HOME/.urnetwork"; echo "token \${2:-}" > "\$HOME/.urnetwork/jwt" ;;
     provide) echo "providing $mr_tag $mr_arch" ;;
 esac
 EOF
@@ -185,6 +185,8 @@ run_tests ()
     grep -q "xattr -d com.apple.quarantine" "$run_dir/calls" || fail "quarantine not cleared"
     grep -q "urnetwork auth" "$run_dir/out" || fail "next steps do not mention sign-in"
     [ -d "$HOME/linux" ] && fail "extracted other platforms"
+    [ "$(setting update_interval)" = 6h ] || fail "default interval is not 6h"
+    [ "$(grep -c "<key>Hour</key>" "$HOME/Library/LaunchAgents/com.urnetwork.provider.update.plist")" = 4 ] || fail "6h schedule does not have 4 times"
     hour="$(setting update_hour)"
     [ -n "$hour" ] || fail "no update hour"
     grep -q "<string>$HOME/.local/share/urnetwork-provider/bin/urnet-tools</string>" "$HOME/Library/LaunchAgents/com.urnetwork.provider.plist" &&
@@ -263,7 +265,9 @@ run_tests ()
     tools update --scheduled > "$run_dir/out" 2>&1
     grep -q "off" "$run_dir/out" || fail "scheduled update with auto-update off did something"
     tools auto-update --interval=monthly > /dev/null 2>&1 || fail "auto-update --interval=monthly"
-    loaded com.urnetwork.provider.update || fail "--interval did not turn updates on"
+    loaded com.urnetwork.provider.update && fail "--interval alone turned updates on"
+    tools auto-update on > /dev/null 2>&1 || fail "auto-update on"
+    loaded com.urnetwork.provider.update || fail "auto-update on did not load the job"
     grep -q "<key>Day</key>" "$HOME/Library/LaunchAgents/com.urnetwork.provider.update.plist" || fail "monthly schedule missing"
     tools auto-update sometimes > /dev/null 2>&1 && fail "invalid auto-update value accepted"
 
@@ -365,13 +369,35 @@ run_tests ()
     tools uninstall --remove-identity -y > /dev/null 2>&1 || fail "uninstall --remove-identity -y"
     [ -d "$HOME/.urnetwork" ] && fail "--remove-identity kept the identity"
 
+    # --- --auth-code signs in and starts mining without a prompt
+    $sh_cmd "$script" -y --auth-code=abc123 > "$run_dir/out" 2>&1 || fail "install --auth-code: $(cat "$run_dir/out")"
+    grep -q "abc123" "$HOME/.urnetwork/jwt" 2>/dev/null || fail "--auth-code was not passed to auth"
+    loaded com.urnetwork.provider || fail "--auth-code install did not start the provider"
+    tools reinstall --auth-code x > /dev/null 2>&1 && fail "reinstall --auth-code accepted"
+    tools uninstall -y > /dev/null 2>&1
+
+    # --- a per-platform tarball wins over the all-platform one
+    make_release v8
+    mkdir -p "$run_dir/pp"
+    printf '#!/bin/sh\n# per-platform v8\n' > "$run_dir/pp/provider"
+    chmod 755 "$run_dir/pp/provider"
+    tar -czf "$run_dir/fixtures/urnetwork-provider-v8-darwin-arm64.tar.gz" -C "$run_dir/pp" provider
+    pp_sum="$(shasum -a 256 "$run_dir/fixtures/urnetwork-provider-v8-darwin-arm64.tar.gz" | cut -d' ' -f1)"
+    sed "s|\"assets\": \[|\"assets\": [{\"name\": \"urnetwork-provider-v8-linux-arm64.tar.gz\", \"browser_download_url\": \"https://dl.test/nope\"}, {\"name\": \"urnetwork-provider-v8-darwin-arm64.tar.gz\", \"browser_download_url\": \"https://dl.test/urnetwork-provider-v8-darwin-arm64.tar.gz\", \"digest\": \"sha256:$pp_sum\"},|" \
+        "$run_dir/fixtures/tag-v8.json" > "$run_dir/fixtures/latest.json"
+    $sh_cmd "$script" -y > "$run_dir/out" 2>&1 || fail "per-platform install: $(cat "$run_dir/out")"
+    grep -q "per-platform v8" "$(install_dir)/bin/urnetwork" || fail "per-platform tarball not preferred"
+    MOCK_ARCH=x86_64 tools reinstall > /dev/null 2>&1 || fail "Intel reinstall with only an arm64 per-platform file"
+    grep -q "fake provider v8 amd64" "$(install_dir)/bin/urnetwork" || fail "Intel did not fall back to the all-platform tarball"
+    tools uninstall -y > /dev/null 2>&1
+    cp "$run_dir/fixtures/tag-v8.json" "$run_dir/fixtures/latest.json"
+
     # --- curl | sh: $0 is the shell, so urnet-tools comes from the published URL
     cp "$script" "$run_dir/fixtures/tools.sh"
     (cd "$run_dir" && $sh_cmd -s -- -y < "$script") > "$run_dir/out" 2>&1 || fail "piped install: $(cat "$run_dir/out")"
     cmp -s "$(install_dir)/bin/urnet-tools" "$script" && fail "piped install copied the script without the mode line"
     grep -q "^provider_label=" "$(install_dir)/bin/urnet-tools" || fail "piped install has no urnet-tools"
-    tools status > /dev/null 2>&1
-    [ $? -eq 3 ] || fail "status after piped install"
+    tools status 2>&1 | grep -q "Installed version:  v8" || fail "status after piped install"
     tools uninstall -y > /dev/null 2>&1
     rm -f "$run_dir/fixtures/tools.sh"
     rm -f "$HOME/.zshrc"
@@ -412,10 +438,10 @@ run_tests ()
     grep -q "urnetwork-provider start" "$HOME/.bash_profile" || fail "bash user got no ~/.bash_profile PATH"
     tools uninstall -y > /dev/null 2>&1
     MOCK_ARCH=x86_64 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "Intel install"
-    grep -q "fake provider v7 amd64" "$(install_dir)/bin/urnetwork" || fail "Intel got the wrong binary"
+    grep -q "fake provider v8 amd64" "$(install_dir)/bin/urnetwork" || fail "Intel got the wrong binary"
     tools uninstall -y > /dev/null 2>&1
     MOCK_ARCH=x86_64 MOCK_TRANSLATED=1 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "Rosetta install"
-    grep -q "fake provider v7 arm64" "$(install_dir)/bin/urnetwork" || fail "Rosetta shell got the Intel binary"
+    grep -q "fake provider v8 arm64" "$(install_dir)/bin/urnetwork" || fail "Rosetta shell got the Intel binary"
     tools uninstall -y > /dev/null 2>&1
     MOCK_GUI=0 $sh_cmd "$script" -y > /dev/null 2>&1 || fail "SSH install"
     grep -q "^user/" "$run_dir/launchd/com.urnetwork.provider.update.domain" || fail "SSH install did not use the user domain"

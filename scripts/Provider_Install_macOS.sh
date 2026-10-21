@@ -27,7 +27,8 @@ fi
 provider_label="com.urnetwork.provider"
 update_label="com.urnetwork.provider.update"
 api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
-tools_url="${URNETWORK_TOOLS_URL:-https://raw.githubusercontent.com/urnetwork/connect/main/scripts/Provider_Install_macOS.sh}"
+default_tools_url="https://raw.githubusercontent.com/urnetwork/connect/main/scripts/Provider_Install_macOS.sh"
+tools_url="${URNETWORK_TOOLS_URL:-$default_tools_url}"
 state_dir="$HOME/.urnetwork"
 agents_dir="$HOME/Library/LaunchAgents"
 log_dir="$HOME/Library/Logs/urnetwork"
@@ -69,8 +70,9 @@ Usage:
   $me update                Install the latest release if it is newer
   $me reinstall [-t TAG]    Install the current (or the given) release again
   $me auto-update [on | off] [--interval INTERVAL]
-                            Show or change automatic updates.
-                            INTERVAL is daily, weekly or monthly (default: daily)
+                            Show or change automatic updates. INTERVAL is
+                            6h, daily, weekly or monthly (default: 6h).
+                            --interval alone keeps updates on or off as they are
   $me auto-start [on | off] Show or change starting the provider when you log in
   $me uninstall [--remove-identity] [-B] [-y]
                             Remove URnetwork. Your identity in ~/.urnetwork is kept
@@ -80,8 +82,9 @@ Usage:
 Options:
   -t, --tag TAG             Release tag to install, such as v2026.10.20 (default: latest)
   -B, --no-modify-path      Do not add or remove the PATH lines in your shell startup files
-      --remove-identity     uninstall: also delete ~/.urnetwork (your provider identity)
-  -y, --yes                 Do not ask questions
+      --remove-identity     uninstall: also delete ~/.urnetwork (your provider identity);
+                            asks you to type "delete" unless -y is given
+  -y, --yes                 Do not ask questions (answers yes)
       --dry-run             Print what would change without changing anything
   -i, --install PATH        Installation path (default: ~/.local/share/urnetwork-provider)
   -h, --help                Show this help
@@ -94,18 +97,20 @@ EOF
     else
         cat <<EOF
 Usage:
-  $me [-t TAG] [-B] [-y] [--no-auto-update] [--no-start] [--dry-run] [-i PATH]
+  $me [-t TAG] [--auth-code CODE] [-B] [-y] [--no-auto-update] [--no-start] [--dry-run] [-i PATH]
 
 Installs the URnetwork provider for the current macOS user, runs it in the
-background with launchd, and turns on automatic daily updates.
+background with launchd, and checks for updates every 6 hours.
 
 Options:
   -t, --tag TAG             Release tag to install (default: latest)
   -B, --no-modify-path      Do not add the install folder to PATH in ~/.zshrc or ~/.bash_profile
+      --auth-code CODE      Sign in with this auth code from https://ur.io
+                            (or set URNETWORK_AUTH_CODE)
   -y, --yes                 Do not ask questions (no sign-in prompt)
       --no-auto-update      Install without automatic updates (turn on later with
                             \`urnet-tools auto-update on')
-      --no-start            Do not start the provider after installing
+      --no-start            Do not sign in or start the provider after installing
       --dry-run             Print what would change without changing anything
   -i, --install PATH        Installation path (default: ~/.local/share/urnetwork-provider)
   -h, --help                Show this help
@@ -331,28 +336,41 @@ json_field ()
     fi
 }
 
-# release_asset < JSON: prints "URL DIGEST" of the provider tarball (DIGEST may be empty)
+# release_asset ARCH < JSON: prints "URL DIGEST" of the provider tarball
+# (DIGEST may be empty). A per-platform urnetwork-provider-<ver>-darwin-ARCH
+# file wins over the all-platform urnetwork-provider-<ver> one.
 release_asset ()
 {
     ra_json="$(tr -d '\000-\037')"
     if command -v jq > /dev/null 2>&1; then
-        printf '%s' "$ra_json" | jq -r '[.assets[]? | select(.name | startswith("urnetwork-provider-")) | select(.name | endswith(".tar.gz"))][0] // empty | "\(.browser_download_url) \(.digest // "")"'
+        printf '%s' "$ra_json" | jq -r --arg a "$1" '
+            [.assets[]? | select(.name | startswith("urnetwork-provider-")) | select(.name | endswith(".tar.gz"))] as $all
+            | ([$all[] | select(.name | endswith("-darwin-" + $a + ".tar.gz"))]
+               + [$all[] | select(.name | test("-(linux|darwin|windows)-[a-z0-9]+[.]tar[.]gz$") | not)])[0] // empty
+            | "\(.browser_download_url) \(.digest // "")"'
     elif command -v plutil > /dev/null 2>&1; then
-        ra_i=0
-        while ra_name="$(printf '%s' "$ra_json" | plutil -extract "assets.$ra_i.name" raw -o - - 2>/dev/null)"; do
-            case "$ra_name" in
-                urnetwork-provider-*.tar.gz)
-                    ra_url="$(printf '%s' "$ra_json" | plutil -extract "assets.$ra_i.browser_download_url" raw -o - - 2>/dev/null)"
-                    ra_digest="$(printf '%s' "$ra_json" | plutil -extract "assets.$ra_i.digest" raw -o - - 2>/dev/null)"
-                    echo "$ra_url $ra_digest"
-                    return 0
-                    ;;
-            esac
-            ra_i=$((ra_i + 1))
+        for ra_pass in platform all; do
+            ra_i=0
+            while ra_name="$(printf '%s' "$ra_json" | plutil -extract "assets.$ra_i.name" raw -o - - 2>/dev/null)"; do
+                ra_i=$((ra_i + 1))
+                case "$ra_pass:$ra_name" in
+                    "platform:urnetwork-provider-"*"-darwin-$1.tar.gz") ;;
+                    all:urnetwork-provider-*-linux-*.tar.gz|all:urnetwork-provider-*-darwin-*.tar.gz|all:urnetwork-provider-*-windows-*.tar.gz) continue ;;
+                    all:urnetwork-provider-*.tar.gz) ;;
+                    *) continue ;;
+                esac
+                ra_url="$(printf '%s' "$ra_json" | plutil -extract "assets.$((ra_i - 1)).browser_download_url" raw -o - - 2>/dev/null)"
+                ra_digest="$(printf '%s' "$ra_json" | plutil -extract "assets.$((ra_i - 1)).digest" raw -o - - 2>/dev/null)"
+                echo "$ra_url $ra_digest"
+                return 0
+            done
         done
     else
-        printf '%s' "$ra_json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*urnetwork-provider-[^"]*\.tar\.gz"' |
-            head -n 1 | sed 's/.*"\(http[^"]*\)"$/\1 /'
+        ra_urls="$(printf '%s' "$ra_json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*urnetwork-provider-[^"]*\.tar\.gz"' |
+            sed 's/.*"\(http[^"]*\)"$/\1/')"
+        ra_url="$(printf '%s\n' "$ra_urls" | grep -- "-darwin-$1\.tar\.gz\$" | head -n 1)"
+        [ -n "$ra_url" ] || ra_url="$(printf '%s\n' "$ra_urls" | grep -v -E -- '-(linux|darwin|windows)-[a-z0-9]+\.tar\.gz$' | head -n 1)"
+        [ -n "$ra_url" ] && echo "$ra_url "
     fi
 }
 
@@ -494,19 +512,46 @@ write_update_plist ()
     wup_log="$(xml_escape "$log_dir/update.log")"
     wup_hour="$(get_setting update_hour 3)"
     wup_minute="$(get_setting update_minute 0)"
-    case "$(get_setting update_interval daily)" in
+    wup_when=""
+    case "$(get_setting update_interval 6h)" in
         weekly)
-            wup_when="        <key>Weekday</key>
-        <integer>$(get_setting update_weekday 0)</integer>
-"
+            wup_when="        <dict>
+            <key>Weekday</key>
+            <integer>$(get_setting update_weekday 0)</integer>
+            <key>Hour</key>
+            <integer>$wup_hour</integer>
+            <key>Minute</key>
+            <integer>$wup_minute</integer>
+        </dict>"
             ;;
         monthly)
-            wup_when="        <key>Day</key>
-        <integer>$(get_setting update_day 1)</integer>
-"
+            wup_when="        <dict>
+            <key>Day</key>
+            <integer>$(get_setting update_day 1)</integer>
+            <key>Hour</key>
+            <integer>$wup_hour</integer>
+            <key>Minute</key>
+            <integer>$wup_minute</integer>
+        </dict>"
+            ;;
+        daily)
+            wup_when="        <dict>
+            <key>Hour</key>
+            <integer>$wup_hour</integer>
+            <key>Minute</key>
+            <integer>$wup_minute</integer>
+        </dict>"
             ;;
         *)
-            wup_when=""
+            for wup_h in $(update_hours); do
+                wup_when="$wup_when${wup_when:+
+}        <dict>
+            <key>Hour</key>
+            <integer>$wup_h</integer>
+            <key>Minute</key>
+            <integer>$wup_minute</integer>
+        </dict>"
+            done
             ;;
     esac
     run mkdir -p "$agents_dir" || return 1
@@ -531,12 +576,9 @@ write_update_plist ()
     <key>RunAtLoad</key>
     <true/>
     <key>StartCalendarInterval</key>
-    <dict>
-$wup_when        <key>Hour</key>
-        <integer>$wup_hour</integer>
-        <key>Minute</key>
-        <integer>$wup_minute</integer>
-    </dict>
+    <array>
+$wup_when
+    </array>
     <key>StandardOutPath</key>
     <string>$wup_log</string>
     <key>StandardErrorPath</key>
@@ -735,6 +777,9 @@ get_tools_script ()
         cat "$0" > "$gts_out"
         return 0
     fi
+    if [ -z "$URNETWORK_TOOLS_URL" ]; then
+        tools_url="$(get_setting tools_url "$default_tools_url")"
+    fi
     if [ "$URNETWORK_TOOLS_NO_SELF_UPDATE" != "1" ]; then
         if fetch "$tools_url" > "$gts_out.new" 2>/dev/null &&
             head -n 1 "$gts_out.new" | grep -q '^#!/bin/sh' &&
@@ -805,6 +850,7 @@ do_install ()
     modify_path=1
     auto_update_on_install=1
     start_after=1
+    auth_code="${URNETWORK_AUTH_CODE:-}"
     scheduled=0
     force=0
 
@@ -828,6 +874,15 @@ do_install ()
                 auto_update_on_install=0
                 shift
                 ;;
+            --auth-code)
+                [ -n "$2" ] || die "option '$1' needs an auth code from https://ur.io"
+                auth_code="$2"
+                shift 2
+                ;;
+            --auth-code=*)
+                auth_code="${1#--auth-code=}"
+                shift
+                ;;
             --no-start)
                 [ "$operation" = "install" ] || die "option '$1' is only for the installer"
                 start_after=0
@@ -844,6 +899,9 @@ do_install ()
         esac
     done
 
+    if [ -n "$auth_code" ] && [ "$operation" != "install" ]; then
+        die "--auth-code is only for the installer; run \`urnetwork auth CODE'"
+    fi
     if [ "$operation" = "update" ] && [ "$tag" != "latest" ]; then
         die "update always installs the latest release; use \`urnet-tools reinstall -t $tag'"
     fi
@@ -872,10 +930,11 @@ do_install ()
         fi
         # the job also runs at every login so a Mac that was off at the
         # scheduled time catches up; skip if the last check is recent
-        case "$(get_setting update_interval daily)" in
+        case "$(get_setting update_interval 6h)" in
             weekly) iu_gap=$((6 * 86400)) ;;
             monthly) iu_gap=$((27 * 86400)) ;;
-            *) iu_gap=$((20 * 3600)) ;;
+            daily) iu_gap=$((20 * 3600)) ;;
+            *) iu_gap=$((5 * 3600)) ;;
         esac
         iu_last="$(get_setting last_check 0)"
         case "$iu_last" in ''|*[!0-9]*) iu_last=0 ;; esac
@@ -915,7 +974,7 @@ do_install ()
         exit 0
     fi
 
-    asset="$(printf '%s' "$release" | release_asset)"
+    asset="$(printf '%s' "$release" | release_asset "$arch")"
     dl_url="${asset%% *}"
     dl_digest="${asset#* }"
     [ "$dl_digest" = "$asset" ] && dl_digest=""
@@ -935,13 +994,15 @@ do_install ()
             curl -fsSL --retry 3 --retry-delay 2 -o "$workdir/provider.tar.gz" "$dl_url" || die "download failed: $dl_url"
         fi
         verify_sha256 "$workdir/provider.tar.gz" "$dl_digest"
-        # extract only this Mac's binary, not all twelve platforms
-        (cd "$workdir" && tar -xzf provider.tar.gz "darwin/$arch/provider" 2>/dev/null) ||
-            (cd "$workdir" && tar -xzf provider.tar.gz 2>/dev/null) ||
+        # extract only this Mac's binary, not all twelve platforms; a
+        # per-platform tarball may hold just `provider'
+        mkdir "$workdir/x" || die "could not create a temporary folder"
+        (cd "$workdir/x" && tar -xzf ../provider.tar.gz "darwin/$arch/provider" 2>/dev/null) ||
+            (cd "$workdir/x" && tar -xzf ../provider.tar.gz 2>/dev/null) ||
             die "could not unpack the download"
-        new_bin="$workdir/darwin/$arch/provider"
-        [ -f "$new_bin" ] || new_bin="$workdir/./darwin/$arch/provider"
-        [ -f "$new_bin" ] || die "darwin/$arch/provider is missing from the release tarball"
+        new_bin="$(find "$workdir/x" -type f -name provider -path "*darwin/$arch/*" | head -n 1)"
+        [ -n "$new_bin" ] || new_bin="$(find "$workdir/x" -type f -name provider | grep -v -E '/(linux|windows|darwin)/' | head -n 1)"
+        [ -n "$new_bin" ] || die "darwin/$arch/provider is missing from the release tarball"
         prepare_binary "$new_bin"
         # before anything changes, so a failure leaves the install as it was
         get_tools_script "$workdir/urnet-tools.src" || die "could not get the urnet-tools script (from $0 or $tools_url)"
@@ -957,13 +1018,17 @@ do_install ()
     if [ "$first_install" -eq 1 ]; then
         set_setting auto_start 1
         set_setting auto_update "$auto_update_on_install"
-        set_setting update_interval daily
+        set_setting update_interval 6h
         set_setting update_hour "$(random_below 24)"
         set_setting update_minute "$(random_below 60)"
         set_setting update_weekday "$(random_below 7)"
         set_setting update_day "$(( $(random_below 28) + 1 ))"
     elif [ "$auto_update_on_install" -eq 0 ]; then
         set_setting auto_update 0
+    fi
+    # urnet-tools update keeps using the URL it was installed with
+    if [ -n "$URNETWORK_TOOLS_URL" ]; then
+        set_setting tools_url "$URNETWORK_TOOLS_URL"
     fi
 
     # stage everything first; the provider is only stopped for the renames
@@ -1023,13 +1088,17 @@ do_install ()
     fi
 
     if [ "$from_installer" -eq 1 ]; then
-        if ! has_identity && [ "$start_after" -eq 1 ] && has_tty && [ "$dry_run" -eq 0 ]; then
+        if ! has_identity && [ "$start_after" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
+            if [ -z "$auth_code" ] && has_tty; then
                 printf '\n'
-                say "Sign in now to start mining. Get an auth code at https://ur.io (or press Ctrl-C to do this later)."
-                if ask_yes_no "Sign in now?" y; then
-                    "$install_path/bin/urnetwork" auth < /dev/tty || warn "sign-in did not finish; run \`urnetwork auth' later"
-                fi
+                printf 'Sign in to start mining. Paste an auth code from https://ur.io\n(or press Enter to skip and sign in later): ' > /dev/tty
+                read -r auth_code < /dev/tty || auth_code=""
             fi
+            if [ -n "$auth_code" ]; then
+                "$install_path/bin/urnetwork" auth "$auth_code" < /dev/null ||
+                    warn "sign-in failed; get a new auth code at https://ur.io and run \`urnetwork auth CODE'"
+            fi
+        fi
             if [ "$start_after" -eq 1 ] && has_identity; then
                 start_provider quiet || true
             fi
@@ -1057,7 +1126,7 @@ print_next_steps ()
         printf 'It starts by itself when you log in.\n'
     fi
     if [ "$(get_setting auto_update 1)" = "1" ]; then
-        printf 'It checks for updates %s at %s.\n' "$(get_setting update_interval daily)" "$(update_time_text)"
+        printf 'It checks for updates %s, at %s.\n' "$(interval_text)" "$(update_time_text)"
     else
         printf 'Automatic updates are off; update with %surnet-tools update%s.\n' "$bold" "$reset"
     fi
@@ -1165,7 +1234,7 @@ do_status ()
     fi
     if [ "$(get_setting auto_update 1)" = "1" ]; then
         if job_loaded "$update_label"; then
-            printf 'Automatic updates:  on, %s at %s (local time)\n' "$(get_setting update_interval daily)" "$(update_time_text)"
+            printf 'Automatic updates:  on, %s at %s (local time)\n' "$(interval_text)" "$(update_time_text)"
         else
             printf 'Automatic updates:  on, but not loaded (run %surnet-tools auto-update on%s)\n' "$bold" "$reset"
         fi
@@ -1180,10 +1249,33 @@ do_status ()
     [ "$ds_running" -eq 1 ] || exit 3
 }
 
+interval_text ()
+{
+    case "$(get_setting update_interval 6h)" in
+        6h) echo "every 6 hours" ;;
+        *) get_setting update_interval 6h ;;
+    esac
+}
+
+# the four hours of the 6h schedule, from the per-install random hour
+update_hours ()
+{
+    uh_h="$(get_setting update_hour 3)"
+    for uh_k in 0 1 2 3; do
+        echo $(( (uh_h + uh_k * 6) % 24 ))
+    done | sort -n | tr '\n' ' '
+}
+
 update_time_text ()
 {
     utt="$(printf '%02d:%02d' "$(get_setting update_hour 3)" "$(get_setting update_minute 0)")"
-    case "$(get_setting update_interval daily)" in
+    case "$(get_setting update_interval 6h)" in
+        6h)
+            utt=""
+            for utt_h in $(update_hours); do
+                utt="$utt${utt:+, }$(printf '%02d:%02d' "$utt_h" "$(get_setting update_minute 0)")"
+            done
+            ;;
         weekly)
             case "$(get_setting update_weekday 0)" in
                 0|7) utt="Sundays $utt" ;; 1) utt="Mondays $utt" ;; 2) utt="Tuesdays $utt" ;;
@@ -1244,7 +1336,7 @@ do_auto_update ()
     while [ $# -gt 0 ]; do
         case "$1" in
             --interval)
-                [ -n "$2" ] || die "option '$1' needs a value: daily, weekly or monthly"
+                [ -n "$2" ] || die "option '$1' needs a value: 6h, daily, weekly or monthly"
                 dau_interval="$2"
                 shift 2
                 ;;
@@ -1258,21 +1350,28 @@ do_auto_update ()
         esac
     done
     case "$dau_interval" in
-        ""|daily|weekly|monthly) ;;
-        *) die "invalid interval '$dau_interval': use daily, weekly or monthly" ;;
+        ""|6h|daily|weekly|monthly) ;;
+        *) die "invalid interval '$dau_interval': use 6h, daily, weekly or monthly" ;;
     esac
     require_install
 
     if [ -z "$dau_mode" ] && [ -z "$dau_interval" ]; then
         if [ "$(get_setting auto_update 1)" = "1" ]; then
-            say "Automatic updates are on: $(get_setting update_interval daily) at $(update_time_text)"
+            say "Automatic updates are on: $(interval_text) at $(update_time_text)"
         else
             say "Automatic updates are off"
         fi
         return 0
     fi
-    # --interval alone changes the interval and keeps updates on
-    [ -n "$dau_mode" ] || dau_mode=on
+    # --interval alone changes the interval and keeps updates on or off
+    if [ -z "$dau_mode" ]; then
+        set_setting update_interval "$dau_interval"
+        if [ "$(get_setting auto_update 1)" != "1" ]; then
+            say "Saved: $(interval_text). Automatic updates stay off; \`urnet-tools auto-update on' turns them on"
+            return 0
+        fi
+        dau_mode=on
+    fi
 
     case "$dau_mode" in
         on)
@@ -1280,7 +1379,7 @@ do_auto_update ()
             set_setting auto_update 1
             write_update_plist || die "could not write $(update_plist)"
             load_job "$update_label" "$(update_plist)" || die "could not turn on automatic updates"
-            say "Automatic updates are on: $(get_setting update_interval daily) at $(update_time_text)"
+            say "Automatic updates are on: $(interval_text) at $(update_time_text)"
             ;;
         off)
             set_setting auto_update 0
@@ -1337,8 +1436,9 @@ do_uninstall ()
             if ! tty_ok; then
                 die "--remove-identity deletes $state_dir for good; add -y to confirm without a terminal"
             fi
-            ask_yes_no "Delete $state_dir? This is your provider identity and cannot be undone." n ||
-                die "kept everything; nothing was removed"
+            printf 'This deletes %s, your provider identity, for good.\nType delete to confirm: ' "$state_dir" > /dev/tty
+            read -r du_answer < /dev/tty || du_answer=""
+            [ "$du_answer" = delete ] || die "kept everything; nothing was removed"
         fi
     fi
 
