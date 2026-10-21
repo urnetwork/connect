@@ -990,13 +990,11 @@ type MultiClientSettings struct {
 	// our sendStalled bar and the verdict stays convictSendStalls, the probe
 	// only decides whether that verdict is deserved.
 	//
-	// What it buys: a stalled exit and a merely CONGESTED exit are the same
-	// observation -- bytes committed, no acks -- and today both are convicted
-	// at the 3s bar. An exit whose upstream is saturated (or whose send window
-	// is full of the very data the stall is about) answers a control ping in a
-	// couple of rtts, because the ping rides the transport rather than the
-	// blocked flow. Asking is cheap and the answer is decisive, so the fast
-	// 3-4s rescue is kept without paying for it in false removals.
+	// A positive control-ping ACK proves reachability when flow ACKs are stale.
+	// The ping can share local admission and serialization with stalled data;
+	// local refusal is not remote evidence. Successful admission alone also
+	// does not establish first-route-write; the existing admitted timeout
+	// policy remains separate from that positive proof.
 	//
 	// The interposition is confined to the send-stall path. The no-send-ack
 	// verdict, the transport-down hold, and the cping loop keep their exact
@@ -11406,6 +11404,24 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 	for i, client := range stalled {
 		verdict := verdicts[i]
 		if !verdict.convict {
+			if client.ctx != nil && client.ctx.Err() != nil {
+				// Closing a channel is not a successful peer-health observation.
+				continue
+			}
+			if verdict.localUnwritten {
+				// Local refusal or expiry carries no peer-health evidence. Report it once
+				// in this stale episode without refreshing its pending clock.
+				if client.markStallHoldOnce() {
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"busy_probe",
+						"exit", client.ClientId(),
+						"outcome", "held",
+						"detail", verdict.detail,
+						"bar", stallTimeout,
+					))
+				}
+				continue
+			}
 			// acquitted by the probe, or deferred to the next pass (a single
 			// unsendable probe). Nothing is written here: the acquittal already
 			// refreshed the stall bar through addBusyProbeAck, and there is no
@@ -15704,12 +15720,10 @@ func (self *multiClientChannel) markDrainMigrateOnce() bool {
 	return true
 }
 
-// busyProbeUnsendableConvictions is how many consecutive probes must fail to
-// even reach the wire, inside one stale episode, before the stall verdict
-// stands on that evidence alone. One is not enough: the send path being wedged
-// full of the same unacked data the probe is investigating is what a congested
-// exit looks like too, and a live one drains enough between polls for the next
-// probe to queue.
+// Preserve the compatibility threshold for nonnil send errors inside one stale
+// episode. Exact false/nil local refusals do not contribute: repeated occupied
+// local capacity is not evidence of remote failure. Nonnil errors are not
+// automatically wire evidence either; their existing policy stays separate.
 const busyProbeUnsendableConvictions = 2
 
 // errBusyProbeUnavailable marks a channel with no probe plumbing under it (a
@@ -15746,6 +15760,9 @@ func busyProbeWriteTimeout(budget time.Duration, cpingWriteTimeout time.Duration
 type busyProbeVerdict struct {
 	// convict: the send-stall verdict stands this pass.
 	convict bool
+	// localUnwritten distinguishes local refusal or queue expiry from a peer
+	// answer and bounds its diagnostic with the existing stale-episode latch.
+	localUnwritten bool
 	// detail extends the conviction reason so a field capture can tell WHICH
 	// probe outcome convicted. "" convicts with today's exact reason string,
 	// which is what a channel with no probe plumbing gets.
@@ -15869,8 +15886,8 @@ func (self *multiClientChannel) hasRecentBusyProbeAck(window time.Duration) bool
 	return !self.busyProbeAckTime.IsZero() && time.Since(self.busyProbeAckTime) < window
 }
 
-// addBusyProbeSendFailure counts one probe that could not be queued and reports
-// whether the run inside this stale episode is now long enough to convict on.
+// Count a nonnil send error under the existing compatibility policy. Exact
+// local false/nil refusal and cancellation never contribute to this run.
 func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -15878,10 +15895,9 @@ func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	return self.busyProbeSendFailures
 }
 
-// sendBusyProbe puts the probe's control ping on the wire through the same
-// plumbing the idle cping loop uses. The seam (busyProbeSendFunc) exists only
-// so the probe's decisions can be driven from a test; production is always the
-// SendDetailedMessage path below.
+// Offer the control ping through the idle cping plumbing. Success reports
+// admission, not first-route-write; the callback separately reports completion.
+// The test seam drives decisions; production uses SendDetailedMessage below.
 func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback func(error)) (bool, error) {
 	if self.busyProbeSendFunc != nil {
 		return self.busyProbeSendFunc(timeout, ackCallback)
@@ -15902,9 +15918,8 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 // borrowed. What it buys: "bytes committed, nothing acknowledged" is the same
 // observation for an exit that died and for an exit whose upstream is saturated
 // or whose send window is full of the very data the stall is about. The control
-// ping rides the transport rather than the blocked flow, so a live exit answers
-// it in a couple of rtts. Asking costs one packet; the answer separates the two
-// cases the passive signal cannot.
+// ping can share local admission and serialization with the stalled flow. A
+// positive answer is useful evidence; a locally refused question is not.
 //
 // WHERE THIS MAY INTERPOSE, and nowhere else:
 //   - the sendStalled path only. The no-send-ack blackhole verdict has its own
@@ -15924,14 +15939,19 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - ack inside the budget: the exit is alive despite the stalled flow acks.
 //     Record the liveness (addBusyProbeAck, which refreshes the stall bar
 //     without forging a send ack) and do not convict.
-//   - budget expires: convict, with the reason naming the probe. One fresh
+//   - budget expires: retain the existing admitted-probe timeout policy, with
+//     the reason naming the probe. This timer starts at admission, not a first
+//     route-write receipt; it is not proof of on-wire silence. One fresh
 //     budget is granted first if the wait itself was suspended (see
 //     schedulerPauseDetected) -- a probe armed before a doze must not convict on
 //     wake, when neither the exit's answer nor this waiter had a cpu. A host
 //     sleep counts too (schedulerPauseElapsed).
-//   - the probe cannot be queued twice in one stale episode: convict. Once is
-//     not evidence (a congested exit drains between polls); twice, while the
-//     same data sits unacked, is.
+//   - exact false/nil admission refusal or unwritten queue expiry: hold without
+//     refreshing the stall clock or inventing a peer answer. Repetition does not
+//     turn local admission pressure into remote evidence.
+//   - nonnil send errors: retain the existing two-error compatibility policy.
+//     These errors are not all remote evidence; this narrow refusal correction
+//     does not broaden their classification.
 //   - no probe plumbing at all: convict exactly as before the probe existed.
 //
 // Locking: takes only this channel's stateLock, in short sections, never across
@@ -15955,11 +15975,22 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 		default:
 		}
 	})
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+	}
 	if errors.Is(err, errBusyProbeUnavailable) {
 		return busyProbeVerdict{convict: true}
 	}
+	if !success && err == nil {
+		// The caller's bounded local admission refused this ping before taking
+		// ownership. No question reached the peer, regardless of prior refusals.
+		return busyProbeVerdict{
+			localUnwritten: true,
+			detail:         "liveness probe locally refused before admission",
+		}
+	}
 	if err != nil || !success {
-		// could not even be queued. see busyProbeUnsendableConvictions
+		// Preserve the separate nonnil-error compatibility policy.
 		if failures := self.addBusyProbeSendFailure(); busyProbeUnsendableConvictions <= failures {
 			return busyProbeVerdict{
 				convict: true,
@@ -16006,6 +16037,18 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
 		case err := <-probeDone:
 			if err != nil {
+				if self.ctx != nil && self.ctx.Err() != nil {
+					return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+				}
+				if packetTransferExpiredUnwritten(err) {
+					// This ping never reached serialization. Local queue pressure
+					// is not a failed remote answer and cannot retire other flows.
+					// Keep their pending clock and accounting: no ACK was observed.
+					return busyProbeVerdict{
+						localUnwritten: true,
+						detail:         "liveness probe locally expired before write",
+					}
+				}
 				// the send sequence gave up on the ping itself. that is a
 				// failed question, not an answer, so it convicts -- but it is
 				// named distinctly from a plain timeout so a capture can tell
