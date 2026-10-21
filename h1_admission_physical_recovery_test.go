@@ -54,6 +54,7 @@ func TestH1AdmissionRecoveryPhysicalDeadline(t *testing.T) {
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		if settings.SendBufferSettings.MinResendInterval != 2*time.Second ||
 			settings.SendBufferSettings.AckTimeout != time.Minute {

@@ -41,6 +41,7 @@ func testWindowPacingServiceAckArrival(t *testing.T, selective, cancelBeforeAppl
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(id sendSequenceId, number uint64) {
 			if id.Destination != destination || number != 2 {

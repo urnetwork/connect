@@ -123,6 +123,7 @@ func TestWindowPacingDrainedProbeOutlivesStaleLaneTimer(t *testing.T) {
 		initialWrite := make(chan struct{})
 		releaseInitial := make(chan struct{})
 		settings := DefaultClientSettings()
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.Log = NewNoopLogger()
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }

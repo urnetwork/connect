@@ -38,6 +38,7 @@ func newWindowSparsePaidFixture(t *testing.T) *windowSparsePaidFixture {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	sequence.ctx, sequence.cancel, sequence.log = ctx, cancel, NewNoopLogger()
 	sequence.sendBufferSettings = DefaultSendBufferSettings()
+	sequence.sendBufferSettings.ApplicationPacing = true
 	sequence.flightController = newSendFlightController(sequence.sendBufferSettings)
 	sequence.deliveredBytes = make([]deliveredBytesSample, deliveredBytesRingSize)
 	sequence.client.ctx, sequence.client.clientId, sequence.client.log = ctx, NewId(), sequence.log

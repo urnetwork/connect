@@ -37,6 +37,7 @@ func TestWindowPathSettlementObserverTracksRealOwner(t *testing.T) {
 			s.EncryptionSettings.Mode = EncryptionModeOff
 			s.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+			s.SendBufferSettings.ApplicationPacing = true
 			s.SendBufferSettings.ApplyWindowSizing()
 			s.SendBufferSettings.LogicalDataLaneCount = 8
 			return s

@@ -32,23 +32,23 @@ func runWindowPendingPrefixTail(t *testing.T, selective bool) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		type observation struct {
-			at time.Time
-			ids [3]Id
-			sent, physical, due, lifetime [3]time.Time
+			at                                              time.Time
+			ids                                             [3]Id
+			sent, physical, due, lifetime                   [3]time.Time
 			present, written, tracked, reliable, unreliable [3]bool
-			frameBytes, frameCapacity [3]int
-			pacingBytes [3]ByteCount
-			kinds [3]sendRecoveryKind
-			pendingA, pendingB, pendingCumulative bool
-			h1Only, reliableOnly, h1ReliableWriteOnly bool
-			selected bool
-			selectedId Id
-			reservations int
-			reserved, probe, sentBytes ByteCount
-			next, currentDeadline time.Time
-			currentOwnsFifo bool
-			retained int
-			retries uint64
+			frameBytes, frameCapacity                       [3]int
+			pacingBytes                                     [3]ByteCount
+			kinds                                           [3]sendRecoveryKind
+			pendingA, pendingB, pendingCumulative           bool
+			h1Only, reliableOnly, h1ReliableWriteOnly       bool
+			selected                                        bool
+			selectedId                                      Id
+			reservations                                    int
+			reserved, probe, sentBytes                      ByteCount
+			next, currentDeadline                           time.Time
+			currentOwnsFifo                                 bool
+			retained                                        int
+			retries                                         uint64
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		destination := NewId()
@@ -116,6 +116,7 @@ func runWindowPendingPrefixTail(t *testing.T, selective bool) {
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(id sendSequenceId, number uint64) {
 			if id.Destination != destination || number >= 3 {

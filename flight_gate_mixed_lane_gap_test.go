@@ -221,6 +221,8 @@ type mixedLaneOptions struct {
 	// Historical queue-depth controls need a constant send window and no H1
 	// service pacing, independently of the process's shipping default.
 	constantSendWindow bool
+	// Explicitly exercise the optional Transfer pacer on reliable-only paths.
+	applicationPacing bool
 	// resendBudget overrides ResendQueueMaxByteCount; zero keeps the default.
 	resendBudget ByteCount
 	// deferredItemIsLateForTheScoreboard turns on FLIGHTGATEFIX §23.2's
@@ -324,6 +326,7 @@ func newMixedLaneHarnessWithOptions(
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
 		settings := DefaultClientSettings()
+		settings.SendBufferSettings.ApplicationPacing = options.applicationPacing
 		if options.constantSendWindow {
 			settings.SendBufferSettings.WindowSizing = WindowSizingConstant
 			settings.SendBufferSettings.ApplyWindowSizing()
@@ -882,7 +885,7 @@ func TestSingleReliableLaneQueueInflatedRttDoesNotStorm(t *testing.T) {
 	})
 }
 
-// The default pacer bounds a slow reliable lane even with the older timeout
+// The optional pacer bounds a slow reliable lane even with the older timeout
 // defer disabled. The queued-window control above separately tests that defer.
 func TestWindowPacingPreventsReliableLaneQueueStorm(t *testing.T) {
 	assertMessagePoolOwnership(t)
@@ -892,10 +895,11 @@ func TestWindowPacingPreventsReliableLaneQueueStorm(t *testing.T) {
 			slowSerialization:  12 * time.Millisecond,
 			directLaneDisabled: true,
 			deferTimeoutResend: false,
+			applicationPacing:  true,
 		})
 		// Keep the harness's fixed delivery bound inside virtual time.
 		stats := harness.run(struct{ testing.TB }{TB: t}, 300)
-		t.Logf("paced default: initial=%d retries=%d deferred=%d", stats.InitialWriteCount, stats.TimeoutResendWriteCount, stats.TimeoutResendDeferCount)
+		t.Logf("explicit pacing: initial=%d retries=%d deferred=%d", stats.InitialWriteCount, stats.TimeoutResendWriteCount, stats.TimeoutResendDeferCount)
 		if stats.InitialWriteCount == 0 || stats.TimeoutResendWriteCount != 0 || stats.TimeoutResendDeferCount != 0 {
 			t.Fatalf("paced reliable delivery needed timeout recovery or hidden deferral: %+v", stats)
 		}

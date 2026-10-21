@@ -997,6 +997,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 	}
 	settings.WindowSizing = DefaultWindowSizing()
 	settings.ApplyWindowSizing()
+	settings.ApplicationPacing = false
 	return settings
 }
 
@@ -5193,6 +5194,12 @@ func (self *Client) Flush() {
 }
 
 type SendBufferSettings struct {
+	// Extra Transfer-level pacing is disabled for every transport by default.
+	// False preserves delivery windows, byte budgets and ACKs without adding
+	// rate/drain waits over the transport's own flow control. True is reserved
+	// for explicit controller experiments, never inferred from transport type.
+	ApplicationPacing bool
+
 	// Isolates path-RTT-only sizing in deterministic performance controls.
 	ackCompressionResidenceOverrideForTest *time.Duration
 	windowRoundTripOverrideForTest         *time.Duration
@@ -12912,7 +12919,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// existing precedence for previously observed lifetime outcomes.
 			return nil
 		}
-		for item != nil && item.expectsAck && self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
+		for item != nil && item.expectsAck && self.sendBufferSettings.ApplicationPacing && self.sendBufferSettings.DeliverySizedWindowScale > 0 &&
 			!self.sendBufferSettings.disableWindowPacingForTest {
 			h1Only := policy.h1Only
 			if routePolicyEnabled {

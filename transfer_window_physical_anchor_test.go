@@ -24,6 +24,7 @@ func TestWindowPacingOrdinaryRecoveryStartsAtPhysicalWrite(t *testing.T) {
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.MinResendInterval = 300 * time.Millisecond
 		settings.SendBufferSettings.RttMinResendInterval = 300 * time.Millisecond

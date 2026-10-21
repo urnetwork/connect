@@ -633,6 +633,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		}
 		s.SendBufferSettings.ApplyWindowSizing()
+		s.SendBufferSettings.ApplicationPacing = cell.Arm == "delivery" || cell.Arm == "path-rtt-only"
 		s.SendBufferSettings.disableWindowPacingForTest = cell.Arm == "unpaced"
 		if cell.KnownPathRoundTrip {
 			s.SendBufferSettings.windowRoundTripOverrideForTest = &cell.RoundTrip

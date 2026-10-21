@@ -26,6 +26,7 @@ func TestWindowPacingRoundTripExcludesLocalWriteWait(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		settings := DefaultSendBufferSettings()
+		settings.ApplicationPacing = true
 		settings.DeliverySizedWindowScale = 2
 		service := &windowPacingService{}
 		writer := &windowPacingClockWriter{windowPacingPolicyWriter: windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}}

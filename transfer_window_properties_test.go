@@ -8,13 +8,15 @@ import (
 
 // Builds a sequence whose estimator can be driven by injected values rather
 // than by racing a real transfer. Deterministic by construction: no timers, no
-// goroutines, no dependence on how fast the machine is.
+// goroutines, no dependence on how fast the machine is. Controller tests opt in
+// to pacing before applying their individual settings overrides.
 func newEstimatorFixture(
 	t *testing.T,
 	configure func(*SendBufferSettings),
 ) *SendSequence {
 	t.Helper()
 	settings := DefaultSendBufferSettings()
+	settings.ApplicationPacing = true
 	if configure != nil {
 		configure(settings)
 	}

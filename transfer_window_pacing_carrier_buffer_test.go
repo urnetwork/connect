@@ -84,6 +84,7 @@ func runWindowCarrierBufferWorker(t *testing.T, stall bool, priorRate, physicalR
 			s.EncryptionSettings.Mode = EncryptionModeOff
 			s.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+			s.SendBufferSettings.ApplicationPacing = true
 			s.SendBufferSettings.ApplyWindowSizing()
 			s.SendBufferSettings.ResendQueueBudget = NewTransferMemoryBudget(mib(8))
 			s.ReceiveBufferSettings.ReceiveQueueBudget = NewTransferMemoryBudget(mib(8))

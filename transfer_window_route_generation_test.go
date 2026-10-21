@@ -49,6 +49,7 @@ func runWindowRouteGenerationFixture(t *testing.T, configure func(*testing.T, *w
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.providerEvaluation = &providerEvaluationAttempt{
 			owner: &fixture.providerState, destinationId: destination, observeLocalWrite: true,

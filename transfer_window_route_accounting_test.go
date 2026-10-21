@@ -16,6 +16,7 @@ import (
 func newWindowRouteAccountingFixture(t *testing.T, capacity int) (*SendSequence, *sendItem, *MultiRouteSelector, Route, *int, *providerEvaluationState) {
 	t.Helper()
 	sequence, item, _, observations := newRecoveryAccountingFixture(t)
+	sequence.sendBufferSettings.ApplicationPacing = true
 	sequence.sendBufferSettings.DeliverySizedWindowScale = 2
 	selector := NewMultiRouteSelector(sequence.ctx, "route-accounting", nil, DestinationId(sequence.destination), true)
 	route := make(Route, capacity)

@@ -40,6 +40,7 @@ func TestSenderReceiverTimingArrivesBeforeBlockedWorker(t *testing.T) {
 			}
 		}
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.beforeRunSendSequenceForTest = func(sendSequenceId) {
 			select {

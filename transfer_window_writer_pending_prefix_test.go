@@ -35,27 +35,27 @@ func runWindowWriterPendingPrefixTail(t *testing.T, selective bool) {
 	}
 	synctest.Test(t, func(t *testing.T) {
 		type observation struct {
-			at time.Time
-			ids [3]Id
-			sent, physical, due, lifetime [3]time.Time
+			at                                                            time.Time
+			ids                                                           [3]Id
+			sent, physical, due, lifetime                                 [3]time.Time
 			present, written, tracked, reliable, unreliable, writePending [3]bool
-			frameBytes, frameCapacity [3]int
-			pacingBytes [3]ByteCount
-			kinds [3]sendRecoveryKind
-			pendingA, pendingB, pendingCumulative bool
-			h1Only, reliableOnly, h1ReliableWriteOnly bool
-			selected bool
-			selectedId Id
-			reservations int
-			reserved, probe, sentBytes ByteCount
-			next, currentDeadline time.Time
-			currentOwnsFifo bool
-			retained int
-			retries uint64
+			frameBytes, frameCapacity                                     [3]int
+			pacingBytes                                                   [3]ByteCount
+			kinds                                                         [3]sendRecoveryKind
+			pendingA, pendingB, pendingCumulative                         bool
+			h1Only, reliableOnly, h1ReliableWriteOnly                     bool
+			selected                                                      bool
+			selectedId                                                    Id
+			reservations                                                  int
+			reserved, probe, sentBytes                                    ByteCount
+			next, currentDeadline                                         time.Time
+			currentOwnsFifo                                               bool
+			retained                                                      int
+			retries                                                       uint64
 		}
 		type writerObservation struct {
 			state observation
-			wire []byte
+			wire  []byte
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		destination := NewId()
@@ -125,6 +125,7 @@ func runWindowWriterPendingPrefixTail(t *testing.T, selective bool) {
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.TransferWireMessageObserver = func(wire TransferWireMessageObservation) {
 			if wire.Resend || wire.SequenceNumber != 2 {

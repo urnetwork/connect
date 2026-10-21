@@ -27,6 +27,7 @@ func testWindowPacingPairedProbeRecoveryFixture(t *testing.T, configure func(*Se
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.AckTimeout = time.Minute
 		if configure != nil {

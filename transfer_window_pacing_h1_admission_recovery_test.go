@@ -54,6 +54,7 @@ func testWindowPacingH1AdmissionOwnerProgress(t *testing.T, changeRoute bool) {
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
 			if id.Destination == destination {
