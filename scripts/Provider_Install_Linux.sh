@@ -21,7 +21,10 @@ fi
 default_script_url="https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts/Provider_Install_Linux.sh"
 # where `urnet-tools update` fetches newer copies of itself; baked into the
 # installed urnet-tools so a fork or mirror keeps updating from where it came
-script_url="${URNETWORK_TOOLS_SCRIPT_URL:-$default_script_url}"
+script_url="${URNETWORK_TOOLS_URL:-${URNETWORK_TOOLS_SCRIPT_URL:-$default_script_url}}"
+# raise with every change to this script: `update' never installs a urnet-tools
+# with a lower number, so a revert or an old mirror can't downgrade installs
+tools_version=2
 api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
 default_interval="6h"
 state_dir="$HOME/.urnetwork"
@@ -37,7 +40,9 @@ show_help ()
         echo "  $me [options] logs"
         echo "  $me [options] update"
         echo "  $me [options] reinstall [--tag TAG] [--no-modify-bashrc]"
-        echo "  $me [options] uninstall [--purge [--yes]] [--no-modify-bashrc]"
+        echo "  $me [options] restart"
+        echo "  $me [options] version"
+        echo "  $me [options] uninstall [--remove-identity [--yes]] [--no-modify-bashrc]"
         echo "  $me [options] auto-update [on | off] [--interval INTERVAL]"
         echo "  $me [options] auto-start [on | off]"
         echo "  $me [-h] [-v]"
@@ -59,12 +64,15 @@ show_help ()
         echo "Operational modes:"
         echo "  start                   Start the URnetwork provider service"
         echo "  stop                    Stop the URnetwork provider service"
-        echo "  status                  Show whether the provider runs, is signed in, and updates"
+        echo "  restart                 Restart the URnetwork provider service"
+        echo "  status                  Show whether the provider runs, is signed in, and updates."
+        echo "                          Exits 0 when it runs, 3 when it doesn't"
+        echo "  version                 Show the installed and the latest version"
         echo "  logs                    Follow the provider service log (Ctrl-C to leave)"
         echo "  update                  Upgrade URnetwork and urnet-tools, if updates are available"
         echo "  reinstall               Reinstall URnetwork"
         echo "  uninstall               Uninstall URnetwork. Your miner identity in ~/.urnetwork"
-        echo "                          is kept unless you add --purge"
+        echo "                          is kept unless you add --remove-identity"
         echo "  auto-update             Turn automatic updates on or off.  With no argument,"
         echo "                          prints the current state and interval."
         echo "  auto-start              Turn starting the provider at boot/login on or off"
@@ -74,12 +82,13 @@ show_help ()
         echo "  -B, --no-modify-bashrc  Do not modify ~/.bashrc"
         echo ""
         echo "Options for uninstall:"
-        echo "  --purge                 Also delete ~/.urnetwork (this device's miner identity)"
+        echo "  --remove-identity       Also delete ~/.urnetwork (this device's miner identity)"
         echo "  -y, --yes               Don't ask before deleting it"
         echo "  -B, --no-modify-bashrc  Do not modify ~/.bashrc"
         echo ""
         echo "Options for auto-update:"
         echo "  --interval INTERVAL     How often to check: 6h, daily, weekly or monthly."
+        echo "                          Alone, changes the interval and keeps updates on or off."
         echo "                          Keeps the current interval if left out ($default_interval on a new install)."
     else
         echo ""
@@ -396,9 +405,9 @@ while [ $# -gt 0 ]; do
             note_opt --interval
             ;;
 
-        --purge)
+        --remove-identity|--purge)
             purge=1
-            note_opt --purge
+            note_opt --remove-identity
             ;;
 
         -y|--yes)
@@ -456,6 +465,13 @@ done
 case "$install_path" in
     /*) ;;
     *) install_path="$script_rundir/$install_path" ;;
+esac
+
+case "$install_path" in
+    *[\"\\\$\`]*)
+        pr_err "The install path can't contain \", \\, \$ or \`: %s" "$install_path"
+        exit 1
+        ;;
 esac
 
 if [ "$want_version" -eq 1 ]; then
@@ -603,6 +619,12 @@ interval_oncalendar ()
     esac
 }
 
+# systemd expands %-specifiers inside unit values
+unit_path ()
+{
+    printf '%s' "$1" | sed 's/%/%%/g'
+}
+
 # $1: interval
 write_systemd_units ()
 {
@@ -619,7 +641,7 @@ Description=URnetwork Provider
 Documentation=https://ur.xyz/docs/miner
 
 [Service]
-ExecStart="$install_path/bin/urnetwork" provide
+ExecStart="$(unit_path "$install_path")/bin/urnetwork" provide
 Restart=on-failure
 RestartSec=30
 
@@ -635,7 +657,7 @@ Description=URnetwork Update
 
 [Service]
 Type=oneshot
-ExecStart="$install_path/bin/urnet-tools" update
+ExecStart="$(unit_path "$install_path")/bin/urnet-tools" update
 EOF
 
     pr_info "Installing urnetwork-update.timer in %s" "$systemd_update_timer"
@@ -666,6 +688,33 @@ EOF
 workdir=""
 service_stopped=0
 
+# one install/update at a time (the timer, a person, or the miner's own
+# `provider update' can all start one)
+take_lock ()
+{
+    if ! command -v flock > /dev/null; then
+        return 0
+    fi
+
+    lock_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/urnetwork-install-$(id -u).lock"
+    exec 9> "$lock_file" || return 0
+
+    if ! flock -n 9; then
+        pr_err "Another URnetwork install or update is running; try again in a few minutes"
+        exit 1
+    fi
+}
+
+# whether version $1 sorts after $2 (needs `sort -V'; without it, never)
+version_newer ()
+{
+    if [ "$1" = "$2" ] || ! printf '1\n2\n' | sort -V > /dev/null 2>&1; then
+        return 1
+    fi
+
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sed 's/^v//' | sort -V | tail -n1)" = "$(echo "$1" | sed 's/^v//')" ]
+}
+
 cleanup ()
 {
     if [ -n "$workdir" ] && [ -d "$workdir" ]; then
@@ -678,64 +727,95 @@ cleanup ()
     fi
 }
 
-# prints the script text to install as urnet-tools
-fetch_tools_script ()
+# $1: script file; prints its tools_version, 0 if it has none (older scripts)
+script_tools_version ()
 {
-    fetched=""
+    v="$(sed -n 's/^tools_version=\([0-9][0-9]*\)$/\1/p' "$1" | head -n1)"
+    echo "${v:-0}"
+}
 
-    # an update takes the newest urnet-tools, so installer fixes reach
-    # existing installs; the curl | sh install has no file of its own either
-    if [ "$operation" != "install" ] || [ ! -f "$0" ]; then
-        if fetched="$(network_fetch "$script_url" 2>/dev/null)" &&
-            [ "$(printf '%s\n' "$fetched" | head -n1)" = "#!/bin/sh" ] &&
-            printf '%s\n' "$fetched" | grep -q "^# urnet-tools -- URnetwork manager script" &&
-            printf '%s\n' "$fetched" | sh -n 2>/dev/null; then
-            printf '%s\n' "$fetched"
-            return 0
-        fi
-    fi
+# $1: script file; whether it looks like a whole urnet-tools
+valid_tools_script ()
+{
+    [ "$(head -n1 "$1")" = "#!/bin/sh" ] &&
+        grep -q "^# urnet-tools -- URnetwork manager script" "$1" &&
+        sh -n "$1" 2>/dev/null
+}
+
+# Picks the urnet-tools to install into $workdir/tools.sh before anything is
+# changed. An update takes the newest one from $script_url, so installer fixes
+# reach existing installs; `curl | sh' has no file of its own and must fetch too.
+prepare_tools_script ()
+{
+    tools_file="$workdir/tools.sh"
+    fetched_file="$workdir/tools.fetched"
+    self_file=""
 
     if [ -f "$0" ] && grep -q "^# urnet-tools -- URnetwork manager script" "$0" 2>/dev/null; then
-        if [ "$operation" != "install" ]; then
-            pr_err "warning: Could not fetch the newest urnet-tools from %s; keeping this one" "$script_url"
-        fi
-
-        cat "$0"
-        return 0
+        self_file="$0"
     fi
 
-    return 1
+    if [ "$operation" != "install" ] || [ -z "$self_file" ]; then
+        if network_fetch "$script_url" > "$fetched_file" 2>/dev/null && valid_tools_script "$fetched_file"; then
+            if [ "$(script_tools_version "$fetched_file")" -ge "$tools_version" ]; then
+                cp "$fetched_file" "$tools_file"
+                return 0
+            fi
+
+            fetch_problem="is older than this one"
+        else
+            fetch_problem="could not be downloaded"
+        fi
+
+        if [ -z "$self_file" ]; then
+            pr_err "Could not get urnet-tools: the one at %s %s" "$script_url" "$fetch_problem"
+            pr_err "Installing from a fork or branch? Pass the same URL to sh:"
+            pr_err "  curl -fsSL <url> | URNETWORK_TOOLS_URL=<url> sh"
+            pr_err "Nothing was changed"
+            exit 1
+        fi
+
+        if [ "$operation" != "install" ]; then
+            pr_err "warning: Keeping this urnet-tools; the one at %s %s" "$script_url" "$fetch_problem"
+        fi
+    fi
+
+    cp "$self_file" "$tools_file"
 }
 
 install_tools_script ()
 {
-    if ! script="$(fetch_tools_script)"; then
-        pr_err "Could not get the urnet-tools script from %s" "$script_url"
+    if ! tools_tmp="$(mktemp "$install_path/bin/.urnet-tools.XXXXXX")"; then
+        pr_err "Failed to install urnet-tools"
         exit 1
     fi
 
-    tools_tmp="$install_path/bin/.urnet-tools.new"
-
     {
-        printf '%s\n' "$script" | head -n1
+        head -n1 "$tools_file"
         echo "URNETWORK_TOOLS_MODE=1"
         echo "URNETWORK_INSTALL_PATH=$(sh_quote "$install_path")"
-        echo "URNETWORK_TOOLS_SCRIPT_URL=$(sh_quote "$script_url")"
-        printf '%s\n' "$script" | awk 'NR > 1 && !(NR <= 6 && /^URNETWORK_(TOOLS_MODE|INSTALL_PATH|TOOLS_SCRIPT_URL)=/)'
-    } > "$tools_tmp" || { pr_err "Failed to install urnet-tools"; exit 1; }
+        echo "URNETWORK_TOOLS_URL=$(sh_quote "$script_url")"
+        awk 'NR > 1 && !(NR <= 6 && /^URNETWORK_(TOOLS_MODE|INSTALL_PATH|TOOLS_URL|TOOLS_SCRIPT_URL)=/)' "$tools_file"
+    } > "$tools_tmp" || { rm -f "$tools_tmp"; pr_err "Failed to install urnet-tools"; exit 1; }
 
-    chmod 755 "$tools_tmp" || { pr_err "Failed to install urnet-tools"; exit 1; }
+    chmod 755 "$tools_tmp" || { rm -f "$tools_tmp"; pr_err "Failed to install urnet-tools"; exit 1; }
 
     # a new file, not an overwrite: the running urnet-tools keeps reading the old one
-    mv -f "$tools_tmp" "$install_path/bin/urnet-tools" || { pr_err "Failed to install urnet-tools"; exit 1; }
+    mv -f "$tools_tmp" "$install_path/bin/urnet-tools" || { rm -f "$tools_tmp"; pr_err "Failed to install urnet-tools"; exit 1; }
 }
 
 # $1: rc file; adds the PATH block once
 add_path_block ()
 {
     if [ -f "$1" ] && grep -q '^[[:space:]]*# == urnetwork-provider start' "$1"; then
-        pr_info "%s is up-to-date" "$1"
-        return 0
+        if grep -qxF "export URNETWORK_PROVIDER_INSTALL=$(sh_quote "$install_path")" "$1" ||
+            grep -qxF "export URNETWORK_PROVIDER_INSTALL=\"$install_path\"" "$1"; then
+            pr_info "%s is up-to-date" "$1"
+            return 0
+        fi
+
+        # it points at another install path
+        remove_path_block "$1"
     fi
 
     pr_info "Adding '%s' to PATH in %s" "$install_path/bin" "$1"
@@ -846,12 +926,17 @@ sign_in ()
     return 1
 }
 
-# starts and enables the provider service if it is signed in
+# starts and enables the provider service; $1 = force starts it even when
+# ~/.urnetwork/jwt is missing (other sign-in kinds)
 start_provider ()
 {
     if ! signed_in; then
-        pr_err "Not signed in yet. Run \`urnetwork auth' first (get a code at https://ur.io)"
-        return 1
+        if [ "$1" != "force" ]; then
+            pr_err "Not signed in yet. Run \`urnetwork auth' first (get a code at https://ur.io)"
+            return 1
+        fi
+
+        pr_err "warning: %s has no sign-in; if the provider stops, run \`urnetwork auth' (code at https://ur.io)" "$state_dir"
     fi
 
     if ! systemctl --user enable urnetwork.service > /dev/null 2>&1; then
@@ -959,13 +1044,21 @@ do_install ()
 
     require_json_tool
 
-    if ! workdir="$(mktemp -d)"; then
+    # on disk next to the install: the all-platform download is ~240 MB and
+    # /tmp is often a small tmpfs
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+    if ! { mkdir -p "$cache_dir" && workdir="$(mktemp -d "$cache_dir/urnetwork-install.XXXXXX")"; } &&
+        ! workdir="$(mktemp -d)"; then
         pr_err "Failed to create working directory"
         exit 1
     fi
 
     trap cleanup EXIT
     trap 'exit 1' INT TERM HUP
+
+    take_lock
+    prepare_tools_script
 
     if [ "$tag" = "latest" ]; then
         api_url="$api_base/releases/latest"
@@ -993,13 +1086,20 @@ do_install ()
     if [ "$operation" = "update" ]; then
         current="$(installed_version)"
 
-        if [ "$current" = "$version_to_install" ]; then
-            pr_info "Installed version %s is up-to-date" "$current"
-            # still pick up urnet-tools fixes, and repair a stopped update timer
+        if [ "$current" = "$version_to_install" ] || version_newer "$current" "$version_to_install"; then
+            if [ "$current" = "$version_to_install" ]; then
+                pr_info "Installed version %s is up-to-date" "$current"
+            else
+                pr_info "Installed version %s is newer than the latest release %s; keeping it" "$current" "$version_to_install"
+            fi
+
+            # still pick up urnet-tools fixes
             install_tools_script
 
-            if [ "$has_systemd" -eq 1 ]; then
-                setup_systemd "$default_interval" > /dev/null
+            # an install made by the old script left its timer stopped after an update
+            if [ "$has_systemd" -eq 1 ] && unit_enabled urnetwork-update.timer &&
+                ! unit_active urnetwork-update.timer; then
+                systemctl --user start urnetwork-update.timer
             fi
 
             exit 0
@@ -1102,6 +1202,10 @@ EOF
         else
             pr_info "Checksum OK (sha256 %s)" "$actual_sha256"
         fi
+    elif [ "$operation" = "update" ]; then
+        pr_err "The release lists no checksum for %s; not updating without one" "$dl_name"
+        pr_err "Run \`urnet-tools reinstall --tag %s' to install it anyway" "$version_to_install"
+        exit 1
     else
         pr_err "warning: The release lists no checksum for %s; installing without a checksum check" "$dl_name"
     fi
@@ -1129,6 +1233,16 @@ EOF
         exit 1
     fi
 
+    # 126/127: the kernel can't run it (wrong architecture, noexec, missing loader)
+    chmod 755 "$bin_program"
+    "$bin_program" --version > /dev/null 2>&1 < /dev/null
+    run_status=$?
+
+    if [ "$run_status" -eq 126 ] || [ "$run_status" -eq 127 ]; then
+        pr_err "The downloaded provider program can't run on this machine; nothing was installed"
+        exit 1
+    fi
+
     if [ -d "$install_path/bin" ] && [ "$operation" = "install" ]; then
         pr_info "Found an existing installation in %s, updating it" "$install_path"
     fi
@@ -1145,9 +1259,11 @@ EOF
     fi
 
     # replace, never overwrite: a provider running in a terminal keeps its old file
-    if ! { cp "$bin_program" "$install_path/bin/.urnetwork.new" &&
-        chmod 755 "$install_path/bin/.urnetwork.new" &&
-        mv -f "$install_path/bin/.urnetwork.new" "$install_path/bin/urnetwork"; }; then
+    if ! { bin_tmp="$(mktemp "$install_path/bin/.urnetwork.XXXXXX")" &&
+        cp "$bin_program" "$bin_tmp" &&
+        chmod 755 "$bin_tmp" &&
+        mv -f "$bin_tmp" "$install_path/bin/urnetwork"; }; then
+        rm -f "$bin_tmp"
         pr_err "Failed to install provider binary"
         exit 1
     fi
@@ -1206,7 +1322,11 @@ install_summary ()
     printf "\n"
 
     if [ "$running" -eq 1 ]; then
-        printf "%sThe provider is running%s in the background and starts again after a reboot.\n" "$bold" "$plain"
+        if [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" = "yes" ]; then
+            printf "%sThe provider is running%s in the background and starts again after a reboot.\n" "$bold" "$plain"
+        else
+            printf "%sThe provider is running%s in the background until you log out (see the lingering warning above).\n" "$bold" "$plain"
+        fi
         printf "Automatic updates: %s (urnet-tools auto-update)\n\n" "$(unit_enabled urnetwork-update.timer && echo "on, $(interval_label "$(current_interval)")" || echo off)"
     fi
 
@@ -1269,8 +1389,23 @@ confirm_purge ()
 
 do_uninstall ()
 {
-    allow_opts --no-modify-bashrc --purge --yes
+    allow_opts --no-modify-bashrc --remove-identity --yes
     no_more_args
+
+    # `rm -r' below: only ever on something that looks like an install
+    if [ -d "$install_path" ]; then
+        case "$install_path" in
+            /|"$HOME"|"$HOME/"|"$state_dir"|"$state_dir/")
+                pr_err "Refusing to remove '%s'" "$install_path"
+                exit 1
+                ;;
+        esac
+
+        if [ ! -f "$install_path/.version" ] && [ ! -f "$install_path/bin/urnetwork" ]; then
+            pr_err "'%s' doesn't look like a URnetwork installation; not removing it" "$install_path"
+            exit 1
+        fi
+    fi
 
     # ask before removing anything, so a "no" leaves everything as it was
     delete_state=0
@@ -1289,9 +1424,20 @@ do_uninstall ()
     if [ -f "$systemd_service" ] || [ -f "$systemd_update_timer" ] || [ -f "$systemd_update_service" ]; then
         found=1
 
+        if [ "$no_user_manager" -eq 1 ]; then
+            pr_err "There is no systemd user session for %s, so the miner can't be stopped from here" "$(id -un)"
+            pr_err "Log in as %s directly (SSH or console) and run this again. Nothing was removed" "$(id -un)"
+            exit 1
+        fi
+
         if [ "$has_systemd" -eq 1 ]; then
             pr_info "Stopping and removing the systemd units"
-            systemctl --user disable --now urnetwork.service urnetwork-update.timer > /dev/null 2>&1
+
+            if ! systemctl --user disable --now urnetwork.service urnetwork-update.timer > /dev/null; then
+                pr_err "Could not stop urnetwork.service; nothing else was removed"
+                exit 1
+            fi
+
             systemctl --user stop urnetwork-update.service > /dev/null 2>&1
         fi
 
@@ -1352,12 +1498,25 @@ change_auto_update_prefs ()
 
     require_systemd
 
-    if [ -z "$mode" ]; then
-        if [ -n "$interval" ]; then
-            pr_err "Use \`%s auto-update on --interval %s' to change the interval" "$me" "$interval"
+    if [ -z "$mode" ] && [ -n "$interval" ]; then
+        if [ ! -f "$systemd_service" ]; then
+            pr_err "URnetwork's systemd units are missing; run \`%s reinstall' first" "$me"
             exit 1
         fi
 
+        write_systemd_units "$interval" > /dev/null
+
+        if unit_enabled urnetwork-update.timer; then
+            systemctl --user restart urnetwork-update.timer
+            pr_info "Automatic updates: on, %s" "$(interval_label "$interval")"
+        else
+            pr_info "Interval set to %s; automatic updates stay off (\`%s auto-update on' turns them on)" "$(interval_label "$interval")" "$me"
+        fi
+
+        exit 0
+    fi
+
+    if [ -z "$mode" ]; then
         state="$(systemctl --user is-enabled urnetwork-update.timer 2>/dev/null)"
         pr_info "Auto update state: %s" "${state:-not installed}"
 
@@ -1444,7 +1603,7 @@ do_start ()
         return 0
     fi
 
-    start_provider || exit 1
+    start_provider force || exit 1
     pr_info "The provider is running. Check on it with: urnet-tools status"
 }
 
@@ -1477,7 +1636,7 @@ show_status ()
 
     if [ "$has_systemd" -ne 1 ]; then
         echo "Service:       none (no systemd user session)"
-        exit 0
+        exit 3
     fi
 
     echo "Running:       $(systemctl --user is-active urnetwork.service 2>/dev/null)"
@@ -1495,7 +1654,12 @@ show_status ()
 
     echo ""
     systemctl --user status urnetwork.service --no-pager -n 5 2>/dev/null
-    return 0
+
+    if unit_active urnetwork.service; then
+        return 0
+    fi
+
+    return 3
 }
 
 show_logs ()
@@ -1539,6 +1703,22 @@ case "$operation" in
 
     status)
         show_status
+        exit $?
+        ;;
+
+    restart)
+        allow_opts
+        no_more_args
+        require_systemd
+        systemctl --user stop urnetwork.service
+        do_start
+        exit 0
+        ;;
+
+    version)
+        allow_opts
+        no_more_args
+        show_version
         exit 0
         ;;
 

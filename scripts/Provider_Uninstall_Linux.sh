@@ -18,7 +18,7 @@ show_help() {
     echo "  -v, --version           Show the version of this script"
     echo "  -d, --dest=[PATH]       Installation destination"
     echo "  -B, --no-modify-bashrc  Do not modify ~/.bashrc"
-    echo "  --purge                 Also delete ~/.urnetwork (this device's miner identity)"
+    echo "  --remove-identity       Also delete ~/.urnetwork (this device's miner identity)"
     echo ""
     echo "Refer to the online documentation for more help."
 }
@@ -67,7 +67,7 @@ while [ $# -gt 0 ]; do
 	    shift
 	    ;;
 
-	--purge)
+	--remove-identity|--purge)
 	    purge=1
 	    shift
 	    ;;
@@ -93,33 +93,73 @@ if [ $# -gt 0 ]; then
     exit 1
 fi
 
-if [ ! -d "$install_path" ]; then
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+found=0
+
+if [ -d "$install_path" ]; then
+    case "$install_path" in
+	/|"$HOME"|"$HOME/"|"$HOME/.urnetwork"|"$HOME/.urnetwork/")
+	    echo "$me: Refusing to remove '$install_path'" >&2
+	    exit 1
+	    ;;
+    esac
+
+    if [ ! -f "$install_path/.version" ] && [ ! -f "$install_path/bin/urnetwork" ]; then
+	echo "$me: '$install_path' doesn't look like a URnetwork installation; not removing it" >&2
+	exit 1
+    fi
+fi
+
+# `su - user' and `sudo -iu user' shells often lack XDG_RUNTIME_DIR
+if [ -z "$XDG_RUNTIME_DIR" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+fi
+
+if [ -f "$unit_dir/urnetwork.service" ] || [ -f "$unit_dir/urnetwork-update.timer" ] || [ -f "$unit_dir/urnetwork-update.service" ]; then
+    found=1
+
+    if command -v systemctl > /dev/null; then
+	if ! systemctl --user show-environment > /dev/null 2>&1; then
+	    echo "$me: There is no systemd user session for $(id -un), so the miner can't be stopped from here" >&2
+	    echo "$me: Log in as $(id -un) directly (SSH or console) and run this again. Nothing was removed" >&2
+	    exit 1
+	fi
+
+	echo "$me: Stopping and removing the systemd units"
+
+	if ! systemctl --user disable --now urnetwork.service urnetwork-update.timer > /dev/null; then
+	    echo "$me: Could not stop urnetwork.service; nothing else was removed" >&2
+	    exit 1
+	fi
+
+	systemctl --user stop urnetwork-update.service > /dev/null 2>&1
+    fi
+
+    rm -f "$unit_dir/urnetwork.service" "$unit_dir/urnetwork-update.timer" "$unit_dir/urnetwork-update.service"
+
+    if command -v systemctl > /dev/null; then
+	systemctl --user daemon-reload > /dev/null 2>&1
+	systemctl --user reset-failed urnetwork.service urnetwork-update.service > /dev/null 2>&1
+    fi
+fi
+
+if [ -d "$install_path" ]; then
+    found=1
+    echo "$me: Removing '$install_path'"
+    rm -r "$install_path"
+fi
+
+if [ "$found" -eq 0 ]; then
     echo "$me: Path '$install_path' does not exist - are you sure you have had Urnetwork installed?" >&2
     exit 1
 fi
-
-unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-
-if command -v systemctl > /dev/null; then
-    for unit in urnetwork.service urnetwork-update.timer urnetwork-update.service; do
-	if [ -f "$unit_dir/$unit" ]; then
-	    echo "$me: Removing systemd unit - $unit"
-	    systemctl --user disable --now "$unit" > /dev/null 2>&1
-	    rm -f "$unit_dir/$unit"
-	fi
-    done
-
-    systemctl --user daemon-reload > /dev/null 2>&1
-fi
-
-echo "$me: Removing '$install_path'"
-rm -r "$install_path"
 
 if [ "$purge" -eq 1 ]; then
     echo "$me: Removing '$HOME/.urnetwork'"
     rm -rf "$HOME/.urnetwork"
 elif [ -d "$HOME/.urnetwork" ]; then
-    echo "$me: Kept your miner identity in '$HOME/.urnetwork' (add --purge to delete it)"
+    echo "$me: Kept your miner identity in '$HOME/.urnetwork' (add --remove-identity to delete it)"
 fi
 
 if [ "$no_modify_bashrc" -eq 0 ]; then
