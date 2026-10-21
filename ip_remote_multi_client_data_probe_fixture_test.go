@@ -122,8 +122,8 @@ func newDataOnlyProviderProbeFixture(t *testing.T, configureProvider func(*Clien
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
 		failures:                     &windowFailureRecorder{},
-		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
-		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
+		pingFailThrottle:             newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
+		budgetFailThrottle:           newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
 		beforeExpandPingResultForTest: func() {
 			pingResultEnteredOnce.Do(func() {
 				close(pingResultEntered)

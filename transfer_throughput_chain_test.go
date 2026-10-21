@@ -142,12 +142,12 @@ func TestTheChainAtTheDesignPoint(t *testing.T) {
 	ceilingWindow := envSeconds(t, "CONNECT_THROUGHPUT_CEILING_SECONDS", defaultThroughputCeilingSeconds)
 
 	// One ceiling per payload is only sound if the quantities that set the
-	// ceiling do not move with the budget. They are plain constants today —
-	// `defaultTransferBufferSize`, and the sequence buffers' `kib(256)` — but
-	// the whole subject of this program is constants that were quietly
-	// memory-scaled, so this is checked rather than assumed. If it ever fails,
-	// the ceiling has to be measured per budget and this cell is wrong until it
-	// is.
+	// ceiling do not move with the budget. They are fixed defaults today — a
+	// default client's transfer queue depth and the sequence buffers'
+	// `kib(256)` — but the whole subject of this program is constants that
+	// were quietly memory-scaled, so this is checked rather than assumed. If
+	// it ever fails, the ceiling has to be measured per budget and this cell
+	// is wrong until it is.
 	assertTheCeilingDoesNotMoveWithTheBudget(t)
 
 	arms := chainArms(t)

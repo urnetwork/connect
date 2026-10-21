@@ -8,14 +8,21 @@ import (
 	"time"
 )
 
+// networkQualityChanged is the service's notification with no network path
+// generation and the default quiet interval.
+func (self *windowPacingService) networkQualityChanged(at time.Time) time.Time {
+	return self.networkQualityChangedOnPath(at, 0, DefaultSendBufferSettings().WindowQualityRemeasureInterval)
+}
+
 // Only fresh measured admission may lower capacity during the fixed interval.
 func TestWindowQualityShrinkNeedsFreshEvidenceAndExpires(t *testing.T) {
 	at := time.Unix(1700000000, 0)
+	quietInterval := DefaultSendBufferSettings().WindowQualityRemeasureInterval
 	state := sendWindowSizeState{}
 	if state.estimate(1000, 8000, true, true) != 8000 {
 		t.Fatal("fixture failed to grow")
 	}
-	state.remeasure(at)
+	state.remeasure(at, quietInterval)
 	for _, read := range []struct{ qualified, retain, fresh bool }{
 		{false, true, true}, {true, false, true}, {true, true, false},
 	} {
@@ -26,10 +33,10 @@ func TestWindowQualityShrinkNeedsFreshEvidenceAndExpires(t *testing.T) {
 	if got := state.estimateAt(1000, 2000, true, true, at.Add(time.Second), true); got != 2000 {
 		t.Fatalf("fresh remeasurement did not shrink: %d", got)
 	}
-	if got := state.estimateAt(1000, 500, true, true, at.Add(windowQualityRemeasureInterval), true); got != 2000 {
+	if got := state.estimateAt(1000, 500, true, true, at.Add(quietInterval), true); got != 2000 {
 		t.Fatalf("expired remeasurement still shrank: %d", got)
 	}
-	if got := state.estimateAt(1000, 9000, true, true, at.Add(2*windowQualityRemeasureInterval), true); got != 9000 {
+	if got := state.estimateAt(1000, 9000, true, true, at.Add(2*quietInterval), true); got != 9000 {
 		t.Fatalf("later growth was disabled: %d", got)
 	}
 }
@@ -41,12 +48,12 @@ func TestWindowQualityNoisyEventsNeedQuietBeforeNewGeneration(t *testing.T) {
 	for i := range 20 {
 		sequence.networkQualityChanged(at.Add(time.Duration(i+1) * time.Second))
 	}
-	if sequence.windowQualityAfterNanos != at.UnixNano() || sequence.windowSize.remeasureUntil != at.Add(windowQualityRemeasureInterval) {
+	if sequence.windowQualityAfterNanos != at.UnixNano() || sequence.windowSize.remeasureUntil != at.Add(sequence.sendBufferSettings.WindowQualityRemeasureInterval) {
 		t.Fatal("noisy events renewed the measurement generation")
 	}
 	next := at.Add(26 * time.Second)
 	sequence.networkQualityChanged(next)
-	if sequence.windowQualityAfterNanos != next.UnixNano() || sequence.windowSize.remeasureUntil != next.Add(windowQualityRemeasureInterval) {
+	if sequence.windowQualityAfterNanos != next.UnixNano() || sequence.windowSize.remeasureUntil != next.Add(sequence.sendBufferSettings.WindowQualityRemeasureInterval) {
 		t.Fatal("a new event after a quiet interval was lost")
 	}
 }
@@ -221,7 +228,7 @@ func TestWindowQualityLearnedWindowShrinksOnlyDuringFreshRemeasurement(t *testin
 	if !after.Sized || after.Window != 16384 || after.Window >= before.Window || after.PacingByteRate >= before.PacingByteRate {
 		t.Fatalf("fresh lower path failed to resize and repace: before=%+v after=%+v", before, after)
 	}
-	at = sample(change.Add(windowQualityRemeasureInterval), 2048)
+	at = sample(change.Add(sequence.sendBufferSettings.WindowQualityRemeasureInterval), 2048)
 	steady := sequence.sendWindowEstimate(at)
 	if steady.Window != after.Window || steady.PacingByteRate >= after.PacingByteRate {
 		t.Fatalf("expired shrink interval froze pacing or shrank bytes: before=%+v after=%+v", after, steady)
@@ -348,7 +355,7 @@ func TestWindowQualityNewSiblingCannotRenewSharedRemeasurement(t *testing.T) {
 	service.observeReceiverRoundTrip(0, time.Millisecond, time.Millisecond, 0, at.Add(2*time.Millisecond))
 	second := &SendSequence{windowPacer: windowBurstPacer{service: service}}
 	second.networkQualityChanged(at.Add(4 * time.Second))
-	if second.windowQualityAfterNanos != at.UnixNano() || second.windowSize.remeasureUntil != at.Add(windowQualityRemeasureInterval) || service.qualityRoundTripPending {
+	if second.windowQualityAfterNanos != at.UnixNano() || second.windowSize.remeasureUntil != at.Add(DefaultSendBufferSettings().WindowQualityRemeasureInterval) || service.qualityRoundTripPending {
 		t.Fatal("new sibling relabeled or reopened the existing generation")
 	}
 	for i := 5; i <= 20; i++ {
@@ -385,4 +392,16 @@ func TestWindowQualitySiblingResetRejectsInProgressOldEstimate(t *testing.T) {
 			t.Fatalf("old sibling estimate committed after shared reset: %+v", estimate)
 		}
 	})
+}
+
+// A non-positive quiet interval coalesces nothing and opens no shrink window.
+func TestWindowQualityNonPositiveQuietIntervalStartsEveryMeasurement(t *testing.T) {
+	sequence, at := newRetainedWindowFixture(t)
+	sequence.sendBufferSettings.WindowQualityRemeasureInterval = 0
+	sequence.networkQualityChanged(at)
+	next := at.Add(time.Second)
+	sequence.networkQualityChanged(next)
+	if sequence.windowQualityAfterNanos != next.UnixNano() || !sequence.windowSize.remeasureUntil.Equal(next) {
+		t.Fatal("a non-positive quiet interval coalesced a later notification")
+	}
 }

@@ -21,13 +21,6 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// defaultIpFamilyStarvedRetryTimeout is how long the enumerator waits before
-// asking for a family again after the platform returned nothing for it. Long
-// enough that a region with no v6-capable provider is not polled on every
-// resize pass, short enough that a provider coming online is picked up
-// within a minute.
-const defaultIpFamilyStarvedRetryTimeout = 60 * time.Second
-
 // enumeratedDestination is one discovery result in the order the enumerator
 // hands candidates to expand: v6-capable results first while a v6 shortfall
 // is open, so the expand pass evaluates them before the main fill.
@@ -240,7 +233,7 @@ func (self *multiClientWindow) ipv6Starved(now time.Time) bool {
 func (self *multiClientWindow) noteIpv6Starved(now time.Time) {
 	timeout := self.settings.IpFamilyStarvedRetryTimeout
 	if timeout <= 0 {
-		timeout = defaultIpFamilyStarvedRetryTimeout
+		timeout = DefaultMultiClientSettings().IpFamilyStarvedRetryTimeout
 	}
 	released := 0
 	func() {

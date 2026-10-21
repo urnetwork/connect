@@ -22,11 +22,12 @@ func (self *sendWindowSizeState) estimate(initial, candidate ByteCount, qualifie
 	return self.estimateAt(initial, candidate, qualified, retain, time.Time{}, false)
 }
 
-// Notification itself grants no bytes and teaches no smaller window.
-func (self *sendWindowSizeState) remeasure(at time.Time) {
+// Notification itself grants no bytes and teaches no smaller window. Fresh
+// evidence may shrink the window for `interval` after `at`.
+func (self *sendWindowSizeState) remeasure(at time.Time, interval time.Duration) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.remeasureUntil = at.Add(windowQualityRemeasureInterval)
+	self.remeasureUntil = at.Add(interval)
 }
 
 // Statistics cannot commit a shrink; both rate and RTT must belong to this

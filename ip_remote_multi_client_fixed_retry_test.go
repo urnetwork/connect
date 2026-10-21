@@ -90,7 +90,7 @@ func runUnreachableFixedWindow(t *testing.T, generator *unreachableFixedGenerato
 	window.generator = generator
 	window.clientChannelArgs = make(chan *multiClientChannelArgs)
 	window.contractStatusCallbacks = NewCallbackList[*contractStatusCallbackWorker]()
-	window.budgetFailThrottle = newLogThrottle(evaluationFailureLogInterval)
+	window.budgetFailThrottle = newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval)
 	window.backendDegradedForTest = func() bool { return false }
 	generator.cancel = cancel
 	if refuse {

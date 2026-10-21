@@ -60,7 +60,7 @@ func newEvaluationChannelCreationTestState(
 		settings:           settings,
 		monitor:            NewRemoteUserNatMultiClientMonitorWithDefaults(),
 		failures:           &windowFailureRecorder{},
-		createFailThrottle: newLogThrottle(evaluationFailureLogInterval),
+		createFailThrottle: newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
 	}
 	args := &multiClientChannelArgs{
 		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},

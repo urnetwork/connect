@@ -371,7 +371,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		heldStats := transport.DatagramStats()
 		if heldStats.HybridStreamQueueCurrentMessageCount != 1 ||
 			heldStats.HybridStreamQueueCurrentByteCount == 0 ||
-			H3HybridStreamQueueByteCount < heldStats.HybridStreamQueueCurrentByteCount ||
+			uint64(DefaultH3DatagramSettings().HybridStreamQueueByteCount()) < heldStats.HybridStreamQueueCurrentByteCount ||
 			heldStats.HybridStreamQueueMaximumByteCount != heldStats.HybridStreamQueueCurrentByteCount {
 			t.Fatalf("held hybrid stream queue stats=%+v", heldStats)
 		}
@@ -421,7 +421,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 			stats.HybridStreamQueueCurrentMessageCount != 0 ||
 			stats.HybridStreamQueueCurrentByteCount != 0 ||
 			stats.HybridStreamQueueMaximumMessageCount != 1 ||
-			H3HybridStreamQueueByteCount < stats.HybridStreamQueueMaximumByteCount ||
+			uint64(DefaultH3DatagramSettings().HybridStreamQueueByteCount()) < stats.HybridStreamQueueMaximumByteCount ||
 			stats.HybridStreamQueueOversizeCount != 0 {
 			t.Fatalf("client hybrid stats=%+v", stats)
 		}
