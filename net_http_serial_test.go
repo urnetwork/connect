@@ -770,7 +770,7 @@ func TestEvalResultCloseStillClosesHttpResponse(t *testing.T) {
 func TestMaterializedHttpResultClosesSuccessfulResponse(t *testing.T) {
 	body := &serialTestCloseRecorder{}
 	response := &http.Response{Body: body}
-	result := newEvalResultFromHttpResponse(response, nil, DefaultMaxHttpResponseBodyBytes)
+	result := newEvalResultFromHttpResponse(response, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 
 	result.Selected()
 	if result.err != nil {
@@ -802,7 +802,7 @@ func TestRejectedHttpResultClosesNonContextReadError(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := &http.Response{Body: body, Request: request}
-	result := newEvalResultFromHttpResponse(response, nil, DefaultMaxHttpResponseBodyBytes)
+	result := newEvalResultFromHttpResponse(response, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 
 	result.Selected()
 	if !errors.Is(result.err, readErr) {
@@ -925,7 +925,7 @@ func TestSerialEvalColdHelloReturnsWithoutCanceledResponseClose(t *testing.T) {
 					StatusCode: http.StatusOK,
 					Body:       helloBody,
 					Request:    request,
-				}, nil, DefaultMaxHttpResponseBodyBytes)
+				}, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 			},
 		)
 	}()
@@ -987,7 +987,7 @@ func TestMaterializedHttpResultReturnsWithoutCanceledResponseClose(t *testing.T)
 		StatusCode: http.StatusOK,
 		Body:       body,
 		Request:    request,
-	}, nil, DefaultMaxHttpResponseBodyBytes)
+	}, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 	result.Selected()
 	if result.err != nil {
 		t.Fatal(result.err)
@@ -1095,7 +1095,7 @@ func TestSerialEvalCanceledPreferredBodyFallsBackWithoutClose(t *testing.T) {
 						StatusCode: http.StatusOK,
 						Body:       healthyBody,
 						Request:    request,
-					}, nil, DefaultMaxHttpResponseBodyBytes)
+					}, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 				}
 
 				responseCtx, responseCancel := context.WithCancel(evalCtx)
@@ -1120,7 +1120,7 @@ func TestSerialEvalCanceledPreferredBodyFallsBackWithoutClose(t *testing.T) {
 					Request: request,
 				}
 				responseCh <- cancelableResponse{response: response, cancel: responseCancel}
-				return newEvalResultFromHttpResponse(response, nil, DefaultMaxHttpResponseBodyBytes)
+				return newEvalResultFromHttpResponse(response, nil, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 			},
 			func(context.Context, *clientDialer) *evalResult {
 				return &evalResult{err: errors.New("unexpected hello fallback")}

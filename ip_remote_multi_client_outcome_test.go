@@ -233,9 +233,9 @@ func outcomeTestWindow(ctx context.Context, log *recordingLogger) *multiClientWi
 		generatorMonitor:      NewMonitor(),
 		resizeMonitor:         NewMonitor(),
 		failures:              &windowFailureRecorder{},
-		createFailThrottle:    newLogThrottle(evaluationFailureLogInterval),
-		pingFailThrottle:      newLogThrottle(evaluationFailureLogInterval),
-		enumerateZeroThrottle: newLogThrottle(evaluationFailureLogInterval),
+		createFailThrottle:    newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
+		pingFailThrottle:      newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
+		enumerateZeroThrottle: newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
 	}
 	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
 	return window

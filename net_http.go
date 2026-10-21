@@ -34,11 +34,6 @@ import (
 type HttpPostRawFunction func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error)
 type HttpGetRawFunction func(ctx context.Context, requestUrl string, byJwt string) ([]byte, error)
 
-// DefaultMaxHttpResponseBodyBytes bounds API responses that are materialized
-// in memory. API calls return JSON/control data rather than streamed payloads;
-// larger payloads must use an explicitly streaming transport.
-const DefaultMaxHttpResponseBodyBytes int64 = 2 * 1024 * 1024
-
 var ErrHttpResponseBodyTooLarge = errors.New("http response body exceeds memory limit")
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
@@ -61,8 +56,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		DohSettings: DefaultDohSettings(),
 		DnsTlds:     [][]byte{[]byte(DefaultExtenderDnsTld)},
 
-		HelloRetryTimeout:        5 * time.Second,
-		MaxHttpResponseBodyBytes: DefaultMaxHttpResponseBodyBytes,
+		HelloRetryTimeout: 5 * time.Second,
+		// API calls return JSON/control data rather than streamed payloads;
+		// larger payloads must use an explicitly streaming transport
+		MaxHttpResponseBodyBytes: 2 * 1024 * 1024,
 
 		GetRetryCount:               1,
 		GetRetryStatusCodes:         []int{http.StatusBadGateway, http.StatusServiceUnavailable},
@@ -205,8 +202,9 @@ type ClientStrategySettings struct {
 	HelloRetryTimeout time.Duration
 
 	// MaxHttpResponseBodyBytes is the largest response body the strategy will
-	// materialize. Values <= 0 use DefaultMaxHttpResponseBodyBytes so a partial
-	// settings struct cannot accidentally restore an unbounded io.ReadAll.
+	// materialize in memory. Values <= 0 use the default
+	// (DefaultClientStrategySettings) so a partial settings struct cannot
+	// accidentally restore an unbounded io.ReadAll.
 	MaxHttpResponseBodyBytes int64
 
 	// Embedded low-memory transports set explicit connection-resident buffer
@@ -1202,7 +1200,7 @@ func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, erro
 		return nil, fmt.Errorf("http response has no body")
 	}
 	if maxBytes <= 0 {
-		maxBytes = DefaultMaxHttpResponseBodyBytes
+		maxBytes = DefaultClientStrategySettings().MaxHttpResponseBodyBytes
 	}
 	if maxBytes < response.ContentLength {
 		return nil, fmt.Errorf(
@@ -3468,7 +3466,7 @@ func httpPostStreamRaw(
 	}
 
 	defer releaseHttpResponseBody(ctx, res)
-	bodyBytes, err := readHttpResponseBody(res, DefaultMaxHttpResponseBodyBytes)
+	bodyBytes, err := readHttpResponseBody(res, DefaultClientStrategySettings().MaxHttpResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}

@@ -281,7 +281,8 @@ func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []
 }
 
 func DefaultContractManagerSettings() *ContractManagerSettings {
-	return DefaultContractManagerSettingsWithBufferSize(defaultTransferBufferSize)
+	// a default client's transfer queue depth (DefaultClientSettings)
+	return DefaultContractManagerSettingsWithBufferSize(32)
 }
 
 func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManagerSettings {

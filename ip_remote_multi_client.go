@@ -180,7 +180,9 @@ type MultiClientGeneratorWithClientId interface {
 
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
-		SequenceBufferSize:  defaultTransferBufferSize,
+		// the queue depth of a default client's transfer buffers
+		// (DefaultClientSettings)
+		SequenceBufferSize:  32,
 		SequenceIdleTimeout: 5 * time.Minute,
 		// tcp connections are routinely idle between requests and users still
 		// consider them open; traditional vpns hold nat state for 5-30 minutes
@@ -235,8 +237,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
 		CPingRestTimeout: 10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:              30 * time.Second,
-		BlackholeTimeout:        defaultPlatformTransportReadTimeout,
+		AckTimeout: 30 * time.Second,
+		// the platform transport's default ReadTimeout
+		// (DefaultPlatformTransportSettings), which the API generator uses per
+		// client instead
+		BlackholeTimeout:        30 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
 		MaxFlowsPerExit:         16,
 		// Eligible affinity keeps its exit as it grows; expiration makes later
@@ -289,12 +294,17 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		FixedDestinationRetryMax: 5 * time.Minute,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
-		WindowGeneratorTimeout:      20 * time.Second,
-		IpFamilyStarvedRetryTimeout: defaultIpFamilyStarvedRetryTimeout,
+		WindowGeneratorTimeout: 20 * time.Second,
+		// long enough that a region with no v6-capable provider is not polled
+		// on every resize pass, short enough that a provider coming online is
+		// picked up within a minute
+		IpFamilyStarvedRetryTimeout: 60 * time.Second,
 		// long enough to cover an outage of a few minutes, counted from the
 		// loss, and short enough that a provider the window has not seen for
 		// longer is found again through discovery like any other
 		RecentExitMemoryTimeout: 5 * time.Minute,
+		// the egress-dial lines' cadence (controlDialLogInterval)
+		EvaluationFailureLogInterval: 5 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -866,7 +876,8 @@ type MultiClientSettings struct {
 	WindowGeneratorTimeout time.Duration
 	// IpFamilyStarvedRetryTimeout is how long a window waits before asking
 	// the platform for a family again after a family-filtered discovery
-	// returned nothing (IPV6.md B2). 0 uses the default of one minute.
+	// returned nothing (IPV6.md B2). Non-positive uses the default
+	// (DefaultMultiClientSettings).
 	IpFamilyStarvedRetryTimeout time.Duration
 	// RecentExitMemoryTimeout is how long, from the loss, a window remembers an
 	// exit it lost to an outage of ours, so the rounds that re-form the window
@@ -875,6 +886,12 @@ type MultiClientSettings struct {
 	// Non-positive disables the memory: lost exits are replaced by discovery
 	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
 	RecentExitMemoryTimeout time.Duration
+	// EvaluationFailureLogInterval is the per-line-shape emission floor for a
+	// window's unconditional evaluation-failure lines: client create, ping,
+	// budget and empty-enumerate failures. A hung window retries
+	// continuously, and one line per shape per interval keeps the signal
+	// without the flood. Non-positive logs every line.
+	EvaluationFailureLogInterval time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -11334,10 +11351,10 @@ func newMultiClientWindow(
 		resizeMonitor:                NewMonitor(),
 		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
-		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
-		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
-		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
-		enumerateZeroThrottle:        newLogThrottle(evaluationFailureLogInterval),
+		createFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
+		pingFailThrottle:             newLogThrottle(settings.EvaluationFailureLogInterval),
+		budgetFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
+		enumerateZeroThrottle:        newLogThrottle(settings.EvaluationFailureLogInterval),
 	}
 	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
 
@@ -15766,7 +15783,7 @@ func (self *multiClientChannel) noSendAckTimeout() time.Duration {
 	if self.settings != nil {
 		return self.settings.BlackholeTimeout
 	}
-	return defaultPlatformTransportReadTimeout
+	return DefaultMultiClientSettings().BlackholeTimeout
 }
 
 // setStalled makes the channel swallow packets without acknowledging or

@@ -65,7 +65,9 @@ func TestPlatformH3MobileComposedLedger(t *testing.T) {
 			// Route ownership (both directions), dispatcher/read/pending holds,
 			// hybrid retained queue, and batch scratch fit the separate row.
 			root := retainedMessageCapacity(8192)
-			app := ByteCount(2*platformH3MemoryQueueCount+5)*root + H3HybridStreamQueueByteCount + platformH3WriteBatchMaxByteCount
+			app := ByteCount(2*platformH3MemoryQueueCount+5)*root +
+				ByteCount(settings.H3DatagramSettings.HybridStreamQueueByteCount()) +
+				ByteCount(settings.H3StreamWriteBatchMaxByteCount)
 			if platformH3ApplicationQueueBytes < app {
 				t.Fatalf("application ownership=%d escaped row=%d", app, platformH3ApplicationQueueBytes)
 			}

@@ -302,15 +302,19 @@ func receiveSignalsFromClient(
 	receiver SignalReceiver,
 ) (*clientSignalDispatcher, func()) {
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
-	bufferSize := defaultTransferBufferSize
+	var bufferSize int
 	if client.settings != nil && client.settings.ReceiveBufferSettings != nil {
 		bufferSize = client.settings.ReceiveBufferSettings.SequenceBufferSize
+	} else {
+		bufferSize = DefaultReceiveBufferSettings().SequenceBufferSize
 	}
 	bufferSize = max(1, bufferSize)
-	workerCount := 4
+	var workerCount int
 	if client.settings != nil && client.settings.WebRtcSettings != nil &&
 		0 < client.settings.WebRtcSettings.SignalReceiveWorkerCount {
 		workerCount = client.settings.WebRtcSettings.SignalReceiveWorkerCount
+	} else {
+		workerCount = DefaultWebRtcSettings().SignalReceiveWorkerCount
 	}
 	workerCount = min(bufferSize, max(1, workerCount))
 	dispatcher := &clientSignalDispatcher{
@@ -992,7 +996,7 @@ type WebRtcSettings struct {
 	// SignalReceiveWorkerCount hashes each peer/stream onto one ordered
 	// worker. Separate peers negotiate concurrently, while each stream's SDP
 	// and ICE ordering and the bounded receive callback backpressure remain
-	// intact.
+	// intact. Non-positive uses the default (DefaultWebRtcSettings).
 	SignalReceiveWorkerCount int
 	EnableSctpSnap           bool
 	EnableSctpZeroChecksum   bool

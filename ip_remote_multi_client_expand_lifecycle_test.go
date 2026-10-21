@@ -236,8 +236,8 @@ func newMultiClientExpandLifecycleFixture(t *testing.T) *multiClientExpandLifecy
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
 		failures:                     &windowFailureRecorder{},
-		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
-		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
+		pingFailThrottle:             newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
+		budgetFailThrottle:           newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval),
 		beforeExpandPingResultForTest: func() {
 			pingResultEnteredOnce.Do(func() {
 				close(pingResultEntered)

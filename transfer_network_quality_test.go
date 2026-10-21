@@ -12,10 +12,13 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func newNetworkQualityTestClient(t *testing.T) *Client {
+func newNetworkQualityTestClient(t *testing.T, configure ...func(*ClientSettings)) *Client {
 	t.Helper()
 	settings := DefaultClientSettings()
 	settings.EncryptionSettings.Mode = EncryptionModeOff
+	for _, configure := range configure {
+		configure(settings)
+	}
 	client := NewClient(context.Background(), NewId(), NewNoContractClientOob(), settings)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -211,7 +214,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 		}
 	}
 
-	quietAt := stormLastNotification.Add(windowQualityRemeasureInterval + time.Nanosecond)
+	quietAt := stormLastNotification.Add(state.quietInterval + time.Nanosecond)
 	state.dispatchLocal(quietAt, 0)
 	if generation := awaitNetworkQualityTestValue(t, appliedGenerations); generation != 2 {
 		t.Fatalf("post-quiet callback applied generation %d, want 2", generation)
@@ -348,6 +351,23 @@ func TestClientNetworkQualityRefusedNotificationRemainsPending(t *testing.T) {
 	client.networkQuality.stateLock.Unlock()
 	if !retained {
 		t.Fatal("refused zero-wait notification lost its reliable pending state")
+	}
+}
+
+// A non-positive quiet interval starts a local generation on every later hint.
+func TestClientNetworkQualityNonPositiveQuietIntervalCoalescesNothing(t *testing.T) {
+	client := newNetworkQualityTestClient(t, func(settings *ClientSettings) {
+		settings.SendBufferSettings.WindowQualityRemeasureInterval = 0
+	})
+	state := client.networkQuality
+	at := time.Unix(1700000000, 0)
+	state.dispatchLocal(at, 0)
+	state.dispatchLocal(at.Add(time.Second), 0)
+	state.stateLock.Lock()
+	generation := state.localGeneration
+	state.stateLock.Unlock()
+	if generation != 2 {
+		t.Fatalf("a non-positive quiet interval coalesced a hint: generation %d, want 2", generation)
 	}
 }
 

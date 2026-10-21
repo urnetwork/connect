@@ -119,12 +119,6 @@ func classifyWindowFailure(err error, fallback windowFailureClass) windowFailure
 	return fallback
 }
 
-// evaluationFailureLogInterval is the per-line-shape emission floor for the
-// unconditional evaluation-failure lines, matching the egress-dial evidence
-// cadence: a hung window retries continuously, and one line per shape per
-// interval keeps the signal without the flood.
-const evaluationFailureLogInterval = 5 * time.Second
-
 // suppressedSuffix renders the "(N suppressed)" tail the throttled lines
 // share with the existing "[t]auth error" and "[egress]dial" lines.
 func suppressedSuffix(suppressed int64) string {

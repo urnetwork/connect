@@ -59,10 +59,6 @@ Each transport should apply the forwarding ACL:
 // To avoid racing the nack message with the ack contract,
 // nacks are sent as ack until the contract is acked
 
-// use 0 for deadlock testing
-const defaultTransferBufferSize = 32
-const defaultReceiveSequenceBufferSize = 256
-
 var DebugTransferCopyOnWrite = false
 
 // errTransferRouteWriteTimeout identifies a bounded route write that found no
@@ -634,7 +630,9 @@ type ReceiveFunction = func(source TransferPath, frames []*protocol.Frame, peer 
 type ForwardFunction = func(path TransferPath, transferFrameBytes []byte)
 
 func DefaultClientSettings() *ClientSettings {
-	settings := DefaultClientSettingsWithBufferSize(defaultTransferBufferSize)
+	// the depth of the transfer queues a client passes down to its buffers;
+	// DefaultClientSettingsWithBufferSize(0) is the deadlock-testing setup
+	settings := DefaultClientSettingsWithBufferSize(32)
 	// Unreliable carriers can grow one destination flight to 256 complete
 	// messages. Give their zero-wait receive handoff matching count headroom,
 	// while ReceiveSequence's independent byte budget bounds retained payload.
@@ -659,6 +657,10 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		EncryptionSettings:      DefaultEncryptionSettings(),
 		ProtocolVersion:         DefaultProtocolVersion,
 		DefaultTransferOpts:     DefaultTransferOpts(),
+
+		// short next to the quiet interval, so peers hear of a change
+		// promptly, without spinning on a full queue
+		NetworkQualityNotificationRetryInterval: 100 * time.Millisecond,
 	}
 	// A per-peer session is ref-held by both a send and a receive sequence, so
 	// it must outlive the longer of the two — otherwise the next burst (after a
@@ -852,7 +854,8 @@ func (self *SendBufferSettings) WindowSizingActive() bool {
 }
 
 func DefaultSendBufferSettings() *SendBufferSettings {
-	return DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize)
+	// a default client's transfer queue depth (DefaultClientSettings)
+	return DefaultSendBufferSettingsWithBufferSize(32)
 }
 
 func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings {
@@ -957,6 +960,9 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// derived from WindowSizing below; a cell may still set them directly
 		DeliverySizedWindowScale:            0,
 		DeliverySizedWindowCeilingByteCount: 0,
+		// several long feedback turns, and short enough that noisy listener
+		// updates cannot keep remeasurement open forever
+		WindowQualityRemeasureInterval: 5 * time.Second,
 		// zero preserves the behavior of every tree before THROUGHPUTFIX §27;
 		// the lane campaign sets it
 		LaneFloorByteCount: 0,
@@ -1035,7 +1041,9 @@ func (self *ReceiveBufferSettings) ApplyWindowSizing() {
 }
 
 func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
-	return DefaultReceiveBufferSettingsWithBufferSize(defaultReceiveSequenceBufferSize)
+	// count headroom for the 256 complete messages one unreliable carrier
+	// flight can reach (SendBufferSettings.UnreliableMaximumFlightMessageCount)
+	return DefaultReceiveBufferSettingsWithBufferSize(256)
 }
 
 func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSettings {
@@ -1096,7 +1104,8 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 }
 
 func DefaultForwardBufferSettings() *ForwardBufferSettings {
-	return DefaultForwardBufferSettingsWithBufferSize(defaultTransferBufferSize)
+	// a default client's transfer queue depth (DefaultClientSettings)
+	return DefaultForwardBufferSettingsWithBufferSize(32)
 }
 
 func DefaultForwardBufferSettingsWithBufferSize(bufferSize int) *ForwardBufferSettings {
@@ -1582,6 +1591,12 @@ type ClientSettings struct {
 	BufferTimeout     time.Duration
 	// if 0, the client will not send control pings
 	ControlPingTimeout time.Duration
+	// NetworkQualityNotificationRetryInterval is how long the client waits
+	// before it tries again to send the network quality notifications that
+	// its peers' send queues had no room for. The notifications are hints, so
+	// a short pause that lets a full queue drain is enough. Non-positive does
+	// not retry: they wait for the next quality change.
+	NetworkQualityNotificationRetryInterval time.Duration
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -5322,6 +5337,16 @@ type SendBufferSettings struct {
 	// adapts both ways. Peer, memory and configured-byte permissions still
 	// clamp effective admission. Zero keeps the configured constant.
 	DeliverySizedWindowScale int
+	// WindowQualityRemeasureInterval is how long the remeasurement that a
+	// network quality notification starts stays open. Later notifications
+	// inside it coalesce into it, unless they come from a newer network path
+	// generation, and only fresh evidence inside it may shrink the learned
+	// window. The client's own quality generations use the same quiet
+	// interval. Several long feedback turns fit in the default, while noisy
+	// listener updates cannot keep remeasurement open forever. Non-positive
+	// starts a new measurement on every later notification and lets no
+	// evidence shrink the window.
+	WindowQualityRemeasureInterval time.Duration
 	// CarrierChangeVoidsSelectiveAck lets the retired-carrier recovery move
 	// selectively acknowledged items too (THROUGHPUTFIX §37.17 guard two).
 	CarrierChangeVoidsSelectiveAck bool

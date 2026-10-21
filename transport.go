@@ -121,9 +121,7 @@ func platformWebSocketWriteBatchNextReady(
 }
 
 const (
-	platformH3WriteBatchMaxMessageCount = 16
-	platformH3WriteBatchMaxByteCount    = 64 * 1024
-	DefaultDnsPumpHost                  = "whodis.bringyour.com"
+	DefaultDnsPumpHost = "whodis.bringyour.com"
 )
 
 func transportTypeFromMode(mode TransportMode) TransportType {
@@ -600,6 +598,15 @@ type PlatformTransportSettings struct {
 	H3MaxStreamReceiveWindowByteCount         ByteCount
 	H3InitialConnectionReceiveWindowByteCount ByteCount
 	H3MaxConnectionReceiveWindowByteCount     ByteCount
+	// H3StreamWriteBatchMaxMessageCount and H3StreamWriteBatchMaxByteCount
+	// bound one write on the H3 reliable stream: the writer drains up to this
+	// many ready messages, framed, into one buffer of the byte bound, which it
+	// allocates once the stream carries data. The mobile memory ledger charges
+	// that buffer inside its application row (platformH3ApplicationQueueBytes),
+	// so a larger bound needs a larger row. Non-positive writes one message at
+	// a time.
+	H3StreamWriteBatchMaxMessageCount int
+	H3StreamWriteBatchMaxByteCount    int
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
 	// aggregate budget cannot hold every caller. Foreground client windows use
 	// the zero value; background/provider transports use the background value.
@@ -742,10 +749,6 @@ type PlatformTransportSettings struct {
 	h1RetainedByteAccounting bool
 }
 
-// Shared with MultiClient's fallback no-send-ACK liveness bound. Retry/RTO and
-// logical Transfer ACK lifetimes are independent settings, not this interval.
-const defaultPlatformTransportReadTimeout = 30 * time.Second
-
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	tlsConfig, err := DefaultTlsConfig()
 	if err != nil {
@@ -761,7 +764,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ReconnectTimeout:          5 * time.Second,
 		PingTimeout:               5 * time.Second,
 		WriteTimeout:              10 * time.Second,
-		ReadTimeout:               defaultPlatformTransportReadTimeout,
+		ReadTimeout:               30 * time.Second, // also MultiClientSettings.BlackholeTimeout's default
 		TransportBufferSize:       32,
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
@@ -799,6 +802,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		QuicVersionPolicy:                         QuicVersionPolicyPreferV2,
 		H3DatagramSettings:                        DefaultH3DatagramSettings(),
 		H3QuicPacketStats:                         &H3QuicPacketStats{},
+
+		// enough ready messages per stream write to amortize it, in a buffer
+		// that fits the mobile ledger's application row with the route queues
+		H3StreamWriteBatchMaxMessageCount: 16,
+		H3StreamWriteBatchMaxByteCount:    64 * 1024,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -3745,13 +3753,13 @@ func (self *PlatformTransport) runH3(
 			streamInput := (<-chan []byte)(send)
 			if connStream.useH3Datagrams {
 				streamQueueMessageCount := min(
-					H3HybridStreamQueueMessageCount,
+					self.h3DatagramSettings.HybridStreamQueueMessageCount,
 					max(1, self.h3TransportBufferSize()),
 				)
 				streamSend = make(chan []byte, streamQueueMessageCount)
 				streamSendBudget = NewH3HybridStreamSendBudget(
 					streamQueueMessageCount,
-					H3HybridStreamQueueByteCount,
+					self.h3DatagramSettings.HybridStreamQueueByteCount(),
 					self.h3DatagramStats,
 				)
 				streamInput = streamSend
@@ -3765,12 +3773,17 @@ func (self *PlatformTransport) runH3(
 
 			// Allocated only if this generation actually selects the reliable data
 			// lane. A small-message-only hybrid keeps the former DATAGRAM memory
-			// profile instead of pinning the 64 KiB stream batch eagerly.
+			// profile instead of pinning the stream batch eagerly. One writer
+			// calls this at a time, so both buffers are reused across batches.
 			var writeBatchStorage []byte
+			var messageStorage [][]byte
+			writeBatchMaxByteCount := max(0, self.settings.H3StreamWriteBatchMaxByteCount)
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
-				var messageStorage [platformH3WriteBatchMaxMessageCount][]byte
+				if messageStorage == nil {
+					messageStorage = make([][]byte, max(1, self.settings.H3StreamWriteBatchMaxMessageCount))
+				}
 				messages := messageStorage[:1]
 				messages[0] = firstMessage
 				batchByteCount := len(firstMessage) + 4
@@ -3787,7 +3800,7 @@ func (self *PlatformTransport) runH3(
 							break drainReady
 						}
 						framedByteCount := len(message) + 4
-						if platformH3WriteBatchMaxByteCount < batchByteCount+framedByteCount {
+						if writeBatchMaxByteCount < batchByteCount+framedByteCount {
 							pendingMessage = message
 							break drainReady
 						}
@@ -3805,7 +3818,7 @@ func (self *PlatformTransport) runH3(
 					self.settings.beforeH3StreamWriteForTest()
 				}
 				if writeBatchStorage == nil {
-					writeBatchStorage = make([]byte, platformH3WriteBatchMaxByteCount)
+					writeBatchStorage = make([]byte, writeBatchMaxByteCount)
 				}
 				err = framer.WriteBatchWithStorage(
 					streamWriter,
@@ -3826,6 +3839,8 @@ func (self *PlatformTransport) runH3(
 				for _, message := range messages {
 					releaseStreamMessage(message)
 				}
+				// the next batch reuses the storage; hold no returned message
+				clear(messages)
 				return
 			}
 			sendDatagramMessage := func(message []byte) (useStream bool, sendErr error) {

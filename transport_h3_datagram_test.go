@@ -123,18 +123,19 @@ func TestH3HybridStreamSendBudgetRejectsOversizedBackingAllocation(t *testing.T)
 }
 
 func TestH3HybridStreamDefaultBudgetFitsEveryPacketPoolSlot(t *testing.T) {
-	if H3HybridStreamQueueByteCount !=
-		64*1024+H3HybridStreamQueueMessageCount*MessagePoolMetaByteCount {
-		t.Fatalf("default hybrid stream byte limit=%d", H3HybridStreamQueueByteCount)
+	settings := DefaultH3DatagramSettings()
+	messageCount, byteCount := settings.HybridStreamQueueMessageCount, settings.HybridStreamQueueByteCount()
+	if byteCount != 64*1024+messageCount*MessagePoolMetaByteCount {
+		t.Fatalf("default hybrid stream byte limit=%d", byteCount)
 	}
 	stats := &H3DatagramStats{}
 	budget := NewH3HybridStreamSendBudget(
-		H3HybridStreamQueueMessageCount,
-		H3HybridStreamQueueByteCount,
+		messageCount,
+		byteCount,
 		stats,
 	)
-	messages := make([][]byte, 0, H3HybridStreamQueueMessageCount)
-	for range H3HybridStreamQueueMessageCount {
+	messages := make([][]byte, 0, messageCount)
+	for range messageCount {
 		message := MessagePoolGet(packetPoolSize)
 		if !budget.Acquire(t.Context(), H3HybridStreamRetainedByteCount(message)) {
 			MessagePoolReturn(message)
@@ -147,8 +148,8 @@ func TestH3HybridStreamDefaultBudgetFitsEveryPacketPoolSlot(t *testing.T) {
 		messages = append(messages, message)
 	}
 	snapshot := stats.Snapshot()
-	if snapshot.HybridStreamQueueMaximumMessageCount != H3HybridStreamQueueMessageCount ||
-		snapshot.HybridStreamQueueMaximumByteCount != H3HybridStreamQueueByteCount {
+	if snapshot.HybridStreamQueueMaximumMessageCount != uint64(messageCount) ||
+		snapshot.HybridStreamQueueMaximumByteCount != uint64(byteCount) {
 		t.Fatalf("default full queue stats=%+v", snapshot)
 	}
 	for _, message := range messages {
