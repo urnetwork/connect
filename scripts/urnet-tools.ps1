@@ -112,6 +112,7 @@ for ($Index = 0; $Index -lt $Words.Count; $Index++) {
     }
     switch -regex ($Word) {
         '^(on|off|status)$' { $Value = $Word; break }
+        '^(6h|every-6h|day|daily|every-day|week|weekly|every-week|month|monthly|every-month)$' { $Interval = $Word; break }
         '^--(remove-identity|purge)$' { $RemoveIdentity = $true; break }
         '^--yes$' { $Yes = $true; break }
         '^--(tag|interval)=(.+)$' {
@@ -276,7 +277,11 @@ function Get-ProviderProcess {
             } | ForEach-Object { [int]$_.ProcessId })
         }
         catch {
-            return @()
+            # Without WMI the arguments can't be seen; count every urnetwork.exe
+            # from this folder rather than none, so nothing starts twice.
+            return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
+                $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)
+            } | ForEach-Object { $_.Id })
         }
     }
     return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
@@ -353,14 +358,24 @@ function Stop-Provider {
 }
 
 function Stop-Updater {
+    $CimWorks = $true
+    try {
+        $null = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
+    }
+    catch {
+        $CimWorks = $false
+    }
     foreach ($Process in Get-UpdaterProcess) {
         Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    # If the process list wasn't available, the PID file still names it.
+    # Without WMI, the PID file names the updater. The process must have
+    # started before the file was written, or the id now belongs to another
+    # PowerShell.
     $UpdaterPID = 0
-    if ([int]::TryParse((Read-TextFile $UpdaterPIDPath), [ref]$UpdaterPID)) {
+    if (-not $CimWorks -and [int]::TryParse((Read-TextFile $UpdaterPIDPath), [ref]$UpdaterPID)) {
         $Process = Get-Process -Id $UpdaterPID -ErrorAction SilentlyContinue
-        if ($Process -and ($Process.ProcessName -eq "powershell" -or $Process.ProcessName -eq "pwsh")) {
+        $Written = (Get-Item -LiteralPath $UpdaterPIDPath).LastWriteTime
+        if ($Process -and ($Process.ProcessName -eq "powershell" -or $Process.ProcessName -eq "pwsh") -and $Process.StartTime -le $Written) {
             Stop-Process -Id $UpdaterPID -Force -ErrorAction SilentlyContinue
         }
     }

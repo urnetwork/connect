@@ -85,6 +85,7 @@ if (-not $Once) {
 while ($true) {
     # Turned off, or uninstalled, since this updater started.
     if ((Test-Path -LiteralPath $AutoUpdateOffFile) -or -not (Test-Path -LiteralPath $ToolsPath)) {
+        Remove-Item -LiteralPath $PIDFile -Force -ErrorAction SilentlyContinue
         break
     }
 

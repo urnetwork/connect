@@ -148,12 +148,33 @@ function Invoke-Uninstall {
     }
     Start-Sleep -Seconds 1
 
+    # Only the installers' own files are deleted; the folder goes when it's empty.
     if ($Found -and (Test-Path -LiteralPath $Folder)) {
-        Write-Host "Removing installation folder: $Folder"
-        Remove-Item -LiteralPath $Folder -Recurse -Force
-        $Parent = Split-Path -Parent $Folder
-        if ((Split-Path -Leaf $Parent) -eq "urnetwork" -and -not (Get-ChildItem -LiteralPath $Parent -Force -ErrorAction SilentlyContinue)) {
-            Remove-Item -LiteralPath $Parent -Force -ErrorAction SilentlyContinue
+        Write-Host "Removing URnetwork from $Folder"
+        $Files = @("urnetwork.exe", "urnet-tools.ps1", "urnet-tools.cmd", "urnetwork-updater.ps1", "version", "date",
+            "scripts-url", "auto-update-off", "auto-update-interval", "last-update-check", "updater.log",
+            "urnetwork-updater.pid", "provider.log", "provider.log.1", "provider.log.err")
+        foreach ($File in $Files) {
+            Remove-Item -LiteralPath (Join-Path $Folder -ChildPath $File) -Force -ErrorAction SilentlyContinue
+        }
+        Get-ChildItem -LiteralPath $Folder -Filter "urnetwork.exe.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        foreach ($OldArch in @("amd64", "arm64")) {
+            Remove-Item -LiteralPath (Join-Path $Folder -ChildPath "windows\$OldArch\urnetwork.exe") -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $Folder -ChildPath "windows\$OldArch") -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath (Join-Path $Folder -ChildPath "windows") -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "urnetwork.exe")) {
+            throw "Couldn't remove $Folder\urnetwork.exe. Close any window running URnetwork and try again."
+        }
+        if (-not (Get-ChildItem -LiteralPath $Folder -Force -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $Folder -Force -ErrorAction SilentlyContinue
+            $Parent = Split-Path -Parent $Folder
+            if ((Split-Path -Leaf $Parent) -eq "urnetwork" -and -not (Get-ChildItem -LiteralPath $Parent -Force -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $Parent -Force -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            Write-Host "Left $Folder in place: it has other files in it"
         }
     }
 

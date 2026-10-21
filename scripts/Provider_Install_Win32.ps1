@@ -308,7 +308,11 @@ function Get-ProviderProcess {
             } | ForEach-Object { [int]$_.ProcessId })
         }
         catch {
-            return @()
+            # Without WMI the arguments can't be seen; count every urnetwork.exe
+            # from this folder rather than none, so nothing starts twice.
+            return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
+                $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)
+            } | ForEach-Object { $_.Id })
         }
     }
     return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
@@ -583,11 +587,15 @@ function Invoke-Install {
         $null = New-Item -Path $Folder -ItemType Directory -Force
 
         $InstalledBinaryPath = Join-Path $Folder -ChildPath "urnetwork$BinarySuffix"
+        # Only installs by the older scripts lack urnet-tools.cmd.
         $UpgradingOldInstall = (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "version")) -and
-            -not (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "auto-update-off")) -and
-            -not (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "auto-update-interval"))
+            -not (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "urnet-tools.cmd"))
         $InstalledToolsPath = Join-Path $Folder -ChildPath "urnet-tools.ps1"
         $InstalledUpdaterPath = Join-Path $Folder -ChildPath "urnetwork-updater.ps1"
+
+        # The scripts first: if one can't be fetched, nothing else changed.
+        Install-ScriptFile -Name "urnet-tools.ps1" -LocalPath $ToolsScriptPath -BaseUrl $BaseUrl -Target $InstalledToolsPath
+        Install-ScriptFile -Name "urnetwork-updater.ps1" -LocalPath $UpdaterScriptPath -BaseUrl $BaseUrl -Target $InstalledUpdaterPath
 
         # Leftovers of earlier updates; one still in use stays until next time.
         Get-ChildItem -LiteralPath $Folder -Filter "urnetwork$BinarySuffix.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -615,9 +623,6 @@ function Invoke-Install {
             }
             throw "Couldn't put the new urnetwork$BinarySuffix in place ($($_.Exception.Message)). The installed version is unchanged. If antivirus is scanning it, try again in a minute."
         }
-
-        Install-ScriptFile -Name "urnet-tools.ps1" -LocalPath $ToolsScriptPath -BaseUrl $BaseUrl -Target $InstalledToolsPath
-        Install-ScriptFile -Name "urnetwork-updater.ps1" -LocalPath $UpdaterScriptPath -BaseUrl $BaseUrl -Target $InstalledUpdaterPath
 
         if ($OnWindows) {
             # Lets "urnet-tools" work from cmd.exe, and from PowerShell when its
