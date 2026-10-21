@@ -157,6 +157,9 @@ tags:
       - client public keys (`/key`) and client log upload (`/log`)
       - Stripe checkout and the customer portal (`/stripe`), and data packs
         bought without signing in (`/pay/data`)
+      - crypto invoices (`/pay/crypto`, `/pay/data/crypto-intent`): Pro and
+        data packs paid in USDC on Solana, Zcash or Monero, with the enabled
+        coins, each invoice's status and a new quote for an unpaid one
       - inline agent payments over the x402 header protocol (`/x402`): an
         agent asks for a sku, is answered `402` with the payment terms, and
         retries the same request with a signed payment in `X-PAYMENT`
@@ -5591,6 +5594,219 @@ paths:
                 $ref: "#/components/schemas/PayDataSolanaStatusResult"
         "429":
           description: Too many requests from this address this minute. Plain text body.
+
+  /pay/crypto/assets:
+    get:
+      tags: [Other]
+      summary: Crypto Payment Assets
+      description: |
+        The coins the server takes payment in now, and what each sells:
+        `usdc_solana` (USDC on Solana), `zec` (Zcash, to shielded addresses
+        only) and `xmr` (Monero). Only enabled assets are listed, so an asset
+        that is switched off disappears from the list; a client never offers
+        an asset or an item the list does not name. The order means nothing:
+        clients show the methods as Card, USDC, Zcash, Monero. No asset sells
+        `monthly`, which is card only.
+
+        The same list rides on /subscription/balance as `crypto_assets`, which
+        the apps read. This route is for pages without a sign-in, such as the
+        ur.io buy-data page. Unauthenticated, per-ip rate limited.
+      operationId: cryptoPaymentAssets
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentAssetsResult"
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/crypto/intent:
+    post:
+      tags: [Other]
+      summary: Crypto Payment Intent
+      description: |
+        Start an invoice for Pro or a data pack, paid in an enabled asset
+        (`usdc_solana`, `zec` or `xmr`), for the signed-in network (delivery
+        `account`). Give exactly one of `plan` and `item_id`. The price is the
+        card price at the caller's regional tier, from `storefront_country`
+        when the app knows it; it is quoted by the server and never taken from
+        the client.
+
+        Each invoice has its own receive address (`address`) and an exact
+        `amount` in the coin, good until `expires_at`. Zcash and Monero are
+        quoted from at least two rate sources. Show `uri` as a QR code and
+        open it in a wallet. A client never builds a payment uri of its own,
+        and refuses to show one that does not pay `address`. `memo` is set for
+        `usdc_solana` only: the reference, for a transfer sent by hand.
+
+        `status_token` is a bearer secret for this one invoice, for
+        /pay/crypto/status and /pay/crypto/requote. Keep it in memory, in
+        device storage, in a POST body or in a url fragment, never in a query
+        string or a log.
+
+        An open invoice of this network for the same asset and item (unpaid,
+        unexpired, nothing in review) is returned again instead of a new one:
+        the same address and the same quote, with a new `status_token` (every
+        token handed out stays valid).
+
+        A refusal returns `error` with a 200 and a stable `error.code`
+        (PurchaseError): `invalid_request` (an unknown asset, or not exactly
+        one of `plan` and `item_id`), `asset_unavailable` (the asset is off,
+        or cannot be quoted right now), `plan_unavailable` (a plan the asset
+        does not sell, `monthly` included), `item_unavailable`,
+        `guest_sign_in_required` (plans only), `offer_unavailable`
+        (`yearly_onboarding` without a redeemable welcome offer),
+        `rate_limited` (too many invoices from this network this minute) or
+        `start_failed`.
+      operationId: cryptoPaymentIntent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCryptoPaymentIntentArgs"
+      responses:
+        "200":
+          description: The invoice, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentIntentResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /pay/data/crypto-intent:
+    post:
+      tags: [Other]
+      summary: Pay Data Crypto Intent
+      description: |
+        Start an invoice for a data pack without signing in (the ur.io
+        buy-data page), paid in an enabled asset. Data packs only: a `plan` is
+        refused with `invalid_request`.
+
+        With `network_name`, the data goes to that network (delivery
+        `network`), matched like /pay/data/network-lookup; no such network is
+        refused with `error.code` `network_not_found`. An open invoice for the
+        same network, asset and item is returned as it is.
+
+        Without `network_name`, the payment buys a balance code (delivery
+        `code`). /pay/crypto/status shows the code as `balance_code` once the
+        invoice is paid, and it is emailed too when `email` is given. An
+        `email` that does not look like one is refused with `invalid_email`.
+        Each request is a new invoice.
+
+        Otherwise the rules and the result are those of /pay/crypto/intent.
+        Unauthenticated, per-ip rate limited (`rate_limited`).
+      operationId: payDataCryptoIntent
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDataCryptoPaymentIntentArgs"
+      responses:
+        "200":
+          description: The invoice, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentIntentResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+
+  /pay/crypto/status:
+    post:
+      tags: [Other]
+      summary: Crypto Payment Status
+      description: |
+        The state of an invoice started with /pay/crypto/intent or
+        /pay/data/crypto-intent, read with its `status_token`, for a client to
+        poll while the invoice is on screen. `status`, first match wins:
+
+        - `unknown`: no such invoice, or the token does not match. Nothing
+          else is filled in.
+        - `paid`: credited. `balance_code` is set for delivery `code`.
+        - `review`: a payment needs an operator. `review_reason` is
+          `underpaid` (short at expiry), `late_underpaid` (arrived after
+          expiry, worth less than the price at the rate of when it was first
+          seen), `orphaned` (a credited payment left the chain and its
+          entitlement was ended; reported although the invoice was credited)
+          or `voided` (a payment to an invoice an operator closed), and
+          `error.code` is `underpaid` for the first two. A credited invoice
+          that later receives a second payment stays `paid`.
+        - `confirming`: at least 99.5% of `amount` arrived (or, after expiry,
+          a late payment worth the price at the rate of when it was first
+          seen), with fewer than `confirmations_required` confirmations.
+        - `seen`: something arrived, but less than that; `remaining` is how
+          much more to send to the same address.
+        - `expired`: past `expires_at` with nothing received. `error.code` is
+          `quote_expired`, and /pay/crypto/requote gives a new quote.
+        - `pending`: nothing received yet.
+
+        `received` counts payments in the mempool and on chain;
+        `confirmations` is the lowest among the payments that make up the
+        amount (0 in the mempool). `usdc_solana` only reports `pending`,
+        `paid` or `expired`. A late payment that covers the price at the rate
+        of when it was first seen is still credited. Amounts are exact decimal
+        strings in the coin, each beside its atomic twin in piconero, zatoshi
+        or millionths of a USDC. Unauthenticated, per-ip rate limited.
+      operationId: cryptoPaymentStatus
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CryptoPaymentStatusArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentStatusResult"
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/crypto/requote:
+    post:
+      tags: [Other]
+      summary: Crypto Payment Requote
+      description: |
+        A new quote for an invoice that nothing has been paid to (`pending` or
+        `expired`), read with its `status_token`. For `zec` and `xmr` it is a
+        new rate, amount and expiry for the same address; the old quote is
+        kept in the invoice's history. A `usdc_solana` amount is already in
+        dollars, so its quote only gets a later `expires_at`. The result is
+        the invoice, as /pay/crypto/intent returns it.
+
+        Refused with `invalid_request` once something was received, or for an
+        unknown invoice or token, and with `asset_unavailable` when the asset
+        cannot be quoted right now. Unauthenticated, per-ip rate limited
+        (`rate_limited`).
+      operationId: cryptoPaymentRequote
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CryptoPaymentStatusArgs"
+      responses:
+        "200":
+          description: The invoice with its new quote, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentIntentResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
 
   /stripe/create-checkout-session:
     post:
@@ -11785,6 +12001,20 @@ components:
             surface's experiment_id/variant on `offer.screen.shown`.
           additionalProperties:
             $ref: "#/components/schemas/ExperimentAssignment"
+        crypto_assets:
+          type: array
+          description: |
+            The coins the network can pay in now and what each sells, as
+            /pay/crypto/assets lists them. Absent when none is enabled, and
+            from older servers, so an older client never shows a crypto method
+            and a newer one shows none then.
+          items:
+            $ref: "#/components/schemas/CryptoPaymentAsset"
+        crypto_term:
+          description: |
+            The network's latest one-time crypto credit (USDC, Zcash or Monero)
+            whose grace has not ended; absent when there is none.
+          $ref: "#/components/schemas/CryptoTerm"
 
     Subscription:
       type: object
@@ -11970,6 +12200,8 @@ components:
         - play
         - stripe
         - solana
+        - zcash
+        - monero
 
     EventPlatform:
       type: string
@@ -12015,7 +12247,9 @@ components:
       description: |
         Why a checkout or payment intent was refused (/stripe/create-checkout-session,
         /stripe/payment-intent, /subscription/stripe/payment-sheet,
-        /solana/payment-intent, /pay/data/checkout and /pay/data/solana-intent).
+        /solana/payment-intent, /pay/data/checkout, /pay/data/solana-intent,
+        /pay/crypto/intent, /pay/data/crypto-intent and /pay/crypto/requote),
+        or why a crypto invoice's status needs attention (/pay/crypto/status).
         Every refusal carries `message`, worded as before the codes, and a
         stable `code` beside it.
       required:
@@ -12049,6 +12283,13 @@ components:
             minute.
             `start_failed`: the payment could not be started (Stripe or the
             database failed); a retry may work.
+            `asset_unavailable`: the coin is switched off, or cannot be quoted
+            right now (rates missing, stale or too far apart, the node or the
+            scanner behind, no free receive address, too many open invoices).
+            The UI says it is temporarily unavailable.
+            `quote_expired`: the quote's time ran out with nothing received;
+            /pay/crypto/requote gives a new one.
+            `underpaid`: the invoice ended short, and an operator reviews it.
             Absent from older servers; clients fall back to `message` for an
             absent or unknown code.
           type: string
@@ -12073,8 +12314,9 @@ components:
             cancel it there (`manage_url`).
             `managed_by_google_play`: Google Play bills this subscription;
             cancel it there (`manage_url`).
-            `does_not_renew`: a USDC payment covers one period and never
-            renews, so there is nothing to cancel.
+            `does_not_renew`: a one-time crypto payment (USDC, Zcash or
+            Monero) covers one period and never renews, so there is nothing
+            to cancel.
             `not_cancelable`: a store the server cannot act on.
             `no_subscription`: no Stripe subscription is billing this network.
             `no_customer`: this network has no Stripe customer, so there is no
@@ -16851,6 +17093,327 @@ components:
         expires_at:
           type: string
           format: date-time
+
+    CryptoAsset:
+      type: string
+      description: |
+        A coin a crypto invoice is paid in: `usdc_solana` (USDC on Solana),
+        `zec` (Zcash, shielded) or `xmr` (Monero).
+      enum:
+        - usdc_solana
+        - zec
+        - xmr
+
+    CryptoPaymentStatus:
+      type: string
+      description: A crypto invoice's state; /pay/crypto/status says when each applies.
+      enum:
+        - pending
+        - seen
+        - confirming
+        - paid
+        - expired
+        - review
+        - unknown
+
+    CryptoPaymentAsset:
+      type: object
+      description: An asset the server takes payment in now, and what it sells.
+      required:
+        - asset
+        - confirmations_required
+        - quote_ttl_seconds
+      properties:
+        asset:
+          $ref: "#/components/schemas/CryptoAsset"
+        plans:
+          type: array
+          description: the plans the asset sells (`yearly`, `yearly_onboarding`); never `monthly`
+          items:
+            type: string
+        items:
+          type: array
+          description: the data packs the asset sells (`data_1tib`, `data_10tib`)
+          items:
+            type: string
+        confirmations_required:
+          type: integer
+          description: the confirmations a payment needs before it is credited
+        quote_ttl_seconds:
+          type: integer
+          description: how long a quote holds, in seconds
+
+    CryptoPaymentAssetsResult:
+      type: object
+      required:
+        - assets
+      properties:
+        assets:
+          type: array
+          description: the enabled assets; empty when no coin is enabled
+          items:
+            $ref: "#/components/schemas/CryptoPaymentAsset"
+
+    CryptoTerm:
+      type: object
+      description: |
+        A one-time crypto credit's paid term. It never renews, so a client
+        shows the renewal notice while `term_end_time <= now < grace_end_time`,
+        and never before.
+      required:
+        - market
+        - term_end_time
+        - grace_end_time
+      properties:
+        market:
+          type: string
+          description: the subscription market of the credit
+          enum:
+            - solana
+            - monero
+            - zcash
+        term_end_time:
+          type: string
+          format: date-time
+          description: when the paid term ends and the grace begins
+        grace_end_time:
+          type: string
+          format: date-time
+          description: when the grace ends, and Pro with it
+
+    CreateCryptoPaymentIntentArgs:
+      type: object
+      required:
+        - asset
+      properties:
+        asset:
+          $ref: "#/components/schemas/CryptoAsset"
+        plan:
+          type: string
+          description: |
+            The plan, when buying Pro: `yearly`, or `yearly_onboarding` for the
+            welcome offer. Give exactly one of `plan` and `item_id`. `monthly`
+            is card only and is refused (`plan_unavailable`).
+          enum:
+            - yearly
+            - yearly_onboarding
+        item_id:
+          type: string
+          description: The data pack, when buying data.
+          enum:
+            - data_1tib
+            - data_10tib
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the app knows it; the server resolves the regional tier otherwise
+
+    CreateDataCryptoPaymentIntentArgs:
+      type: object
+      required:
+        - asset
+        - item_id
+      properties:
+        asset:
+          $ref: "#/components/schemas/CryptoAsset"
+        item_id:
+          type: string
+          enum:
+            - data_1tib
+            - data_10tib
+        network_name:
+          type: string
+          description: the network that receives the data; empty buys a balance code
+        email:
+          type: string
+          description: where to email the balance code too (delivery `code` only); optional
+
+    CryptoPaymentStatusArgs:
+      type: object
+      required:
+        - intent_id
+        - status_token
+      properties:
+        intent_id:
+          type: string
+          format: uuid
+        status_token:
+          type: string
+          description: the invoice's bearer secret, from its intent
+
+    CryptoPaymentStatusResult:
+      type: object
+      description: |
+        An invoice's state. For `unknown` nothing else is filled in: the
+        strings are empty, the numbers 0 and the times null.
+      required:
+        - status
+      properties:
+        intent_id:
+          type: string
+        asset:
+          type: string
+          description: "`usdc_solana`, `zec` or `xmr` (CryptoAsset)"
+        plan:
+          type: string
+          description: the plan the invoice buys; empty for a data pack
+        item_id:
+          type: string
+          description: the data pack the invoice buys; empty for a plan
+        delivery:
+          type: string
+          description: |
+            Where the paid invoice goes: `account` (the signed-in network),
+            `network` (a network named on the buy-data page) or `code` (a
+            balance code, shown once paid and emailed when an address was
+            given).
+        network_name:
+          type: string
+          description: the network that receives the data, for delivery `network`
+        status:
+          $ref: "#/components/schemas/CryptoPaymentStatus"
+        review_reason:
+          type: string
+          description: |
+            Why the invoice is in `review`: `underpaid`, `late_underpaid`,
+            `orphaned` or `voided` (/pay/crypto/status says when each
+            applies). Empty otherwise.
+        amount:
+          type: string
+          description: the quoted amount, an exact decimal in the coin
+        amount_atomic:
+          type: string
+          description: the quoted amount in atomic units, a decimal integer
+        received:
+          type: string
+          description: what has arrived so far, mempool included
+        received_atomic:
+          type: string
+        remaining:
+          type: string
+          description: how much more to send; "0" once the amount is covered
+        remaining_atomic:
+          type: string
+        confirmations:
+          type: integer
+          description: the lowest confirmation count among the payments that make up the amount
+        confirmations_required:
+          type: integer
+        expires_at:
+          description: when the quote ends; null for `unknown`
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        credited_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        balance_code:
+          type: string
+          description: the balance code a paid invoice bought, for delivery `code`
+        error:
+          description: |
+            `quote_expired` while `expired`, and `underpaid` while in `review`
+            for a short payment; absent otherwise.
+          oneOf:
+            - $ref: "#/components/schemas/PurchaseError"
+            - type: "null"
+
+    CryptoPaymentIntentResult:
+      type: object
+      description: |
+        An invoice, or a refusal in `error`. In a refusal every other field
+        is empty: the strings empty, the numbers 0, the times null, and
+        `status` left out.
+      required: []
+      properties:
+        intent_id:
+          type: string
+        status_token:
+          type: string
+          description: |
+            The bearer secret for this invoice's status and requote. Keep it in
+            memory, in device storage, in a POST body or in a url fragment,
+            never in a query string or a log. An open invoice returned again
+            comes with a new token; every token handed out stays valid.
+        asset:
+          type: string
+          description: "`usdc_solana`, `zec` or `xmr` (CryptoAsset)"
+        plan:
+          type: string
+          description: the plan the invoice buys; empty for a data pack
+        item_id:
+          type: string
+          description: the data pack the invoice buys; empty for a plan
+        delivery:
+          type: string
+          description: |
+            Where the paid invoice goes: `account` (the signed-in network),
+            `network` (a network named on the buy-data page) or `code` (a
+            balance code, shown once paid and emailed when an address was
+            given).
+        network_name:
+          type: string
+          description: the resolved network name, as stored, for delivery `network`
+        tier:
+          type: string
+          description: the regional price tier of a plan's price; empty for a data pack
+        offer_applied:
+          type: boolean
+          description: the welcome offer's price was applied
+        price_usd:
+          type: number
+          description: the price in USD, the same as the card price
+        regular_price_usd:
+          type: number
+          description: the regular price (the full-year price for `yearly_onboarding`)
+        rate_usd:
+          type: number
+          description: the coin's USD rate the amount was quoted at (1 for USDC)
+        address:
+          type: string
+          description: the invoice's own receive address
+        amount:
+          type: string
+          description: |
+            The exact amount to send, a decimal string in the coin. Zcash and
+            Monero amounts are rounded up to 6 decimals; a USDC amount carries
+            its unique 6-decimal suffix, so show and pay every decimal.
+        amount_atomic:
+          type: string
+          description: the same amount in atomic units (piconero, zatoshi or millionths of a USDC), a decimal integer string
+        memo:
+          type: string
+          description: the reference, for a USDC transfer sent by hand; set for `usdc_solana` only
+        uri:
+          type: string
+          description: |
+            The payment uri the server built (`monero:`, `zcash:` per ZIP 321, or
+            `solana:` per Solana Pay), to show as a QR code and open in a
+            wallet. A client never builds its own, and refuses one that does
+            not pay `address`.
+        quoted_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        expires_at:
+          description: when the quote ends
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        confirmations_required:
+          type: integer
+        status:
+          description: the invoice's state now, as /pay/crypto/status returns it
+          $ref: "#/components/schemas/CryptoPaymentStatusResult"
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/PurchaseError"
+            - type: "null"
+
     StripeCreateCheckoutSessionArgs:
       type: object
       required:
@@ -16929,7 +17492,7 @@ components:
             properties:
               store:
                 type: string
-                description: stripe | apple | google | solana | manual | x402 | "" (unknown)
+                description: stripe | apple | google | solana | monero | zcash | manual | x402 | "" (unknown)
               plan:
                 type: string
                 description: The wire plan value ("supporter"); shown as Pro.
@@ -16956,7 +17519,7 @@ components:
                 description: The store's own subscriptions page (Apple, Google), else empty.
               transaction_id:
                 type: string
-                description: The store handle for support; invoice id, original transaction id, purchase token or payment reference.
+                description: The store handle for support; invoice id, original transaction id, purchase token, payment reference or crypto invoice id.
         has_stripe_customer:
           type: boolean
           description: A Stripe customer exists for the network; gate for /stripe/customer-portal.
