@@ -53,7 +53,7 @@ func TestHardChangeStartsASequenceMeasurementInsideTheQuietInterval(t *testing.T
 	}
 	hard := at.Add(2 * time.Second)
 	sequence.networkQualityChangedOnPath(hard, 1)
-	if sequence.windowQualityAfterNanos != hard.UnixNano() || sequence.windowSize.remeasureUntil != hard.Add(windowQualityRemeasureInterval) {
+	if sequence.windowQualityAfterNanos != hard.UnixNano() || sequence.windowSize.remeasureUntil != hard.Add(sequence.sendBufferSettings.WindowQualityRemeasureInterval) {
 		t.Fatal("a hard change inside the quiet interval did not start a new measurement")
 	}
 	sequence.networkQualityChangedOnPath(hard.Add(time.Second), 1)

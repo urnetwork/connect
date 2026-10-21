@@ -38,37 +38,10 @@ const (
 	// overhead are reserved from the initial packet.
 	H3InitialDatagramByteCount = H3InitialPacketByteCount - 40
 
-	// This optimistic target allows DPLPMTUD to grow a validated path to the
-	// previous Ethernet-sized ceiling. quic-go synchronously reports the
-	// smaller initial or migrated-path ceiling through DatagramTooLargeError;
-	// the hybrid sender records that live limit before choosing the lane.
-	defaultH3DatagramTargetByteCount = 1360
-
 	// Wire bytes preceding each fragment payload.
-	H3DatagramHeaderByteCount               = 28
-	defaultH3HybridDatagramMessageByteCount = defaultH3DatagramTargetByteCount -
-		H3DatagramHeaderByteCount
-	// A complete routed message either fits one QUIC DATAGRAM or uses the
-	// reliable stream. Splitting one Transfer message across multiple lossy
-	// DATAGRAMs multiplies its loss probability and made full-MTU TCP 19% slower
-	// in the corrected one-bar full-TUN benchmark.
-	defaultH3DatagramMaxFragments  = 1
-	defaultH3DatagramMaxMessages   = 32
-	defaultH3DatagramReplayIds     = 256
-	defaultH3DatagramMessageBytes  = 8 * 1024
-	defaultH3DatagramPeerBytes     = 64 * 1024
-	defaultH3DatagramProcessBytes  = 8 * 1024 * 1024
-	defaultH3DatagramReassemblyTtl = 5 * time.Second
+	H3DatagramHeaderByteCount = 28
 
-	// The hybrid dispatcher must not turn lane separation into another large
-	// per-connection buffer. The byte limit counts the actual retained slice
-	// capacity (including message-pool metadata), and reservations stay live
-	// until the stream writer returns the message. Reserve metadata for every
-	// count slot so 32 packet-pool buffers fit the intended 64 KiB payload-
-	// capacity budget; one maximum uint16-framed message also fits.
-	H3HybridStreamQueueMessageCount = 32
-	H3HybridStreamQueueByteCount    = 64*1024 +
-		H3HybridStreamQueueMessageCount*MessagePoolMetaByteCount
+	defaultH3DatagramReplayIds = 256
 )
 
 var (
@@ -115,6 +88,21 @@ type H3DatagramSettings struct {
 	// require more than one envelope fragment. Larger frames use the reliable
 	// stream.
 	HybridDatagramMessageByteCount int
+	// HybridStreamQueueMessageCount and HybridStreamQueuePayloadByteCount
+	// bound the queue that hands a hybrid connection's reliable-lane messages
+	// to its stream writer, so lane separation cannot become another large
+	// per-connection buffer. Reservations stay live until the stream writer
+	// returns the message. Both must be positive.
+	HybridStreamQueueMessageCount     int
+	HybridStreamQueuePayloadByteCount int
+}
+
+// HybridStreamQueueByteCount is the hybrid stream queue's retained-byte limit.
+// It counts the actual retained slice capacity, so it reserves message-pool
+// metadata for every message slot on top of the payload bytes.
+func (self *H3DatagramSettings) HybridStreamQueueByteCount() int {
+	return self.HybridStreamQueuePayloadByteCount +
+		self.HybridStreamQueueMessageCount*MessagePoolMetaByteCount
 }
 
 // Returns bounded limits for a hybrid carrier and a path that may grow from
@@ -123,15 +111,28 @@ type H3DatagramSettings struct {
 // budget is shared by all connections owned by one PlatformTransport or
 // ConnectHandler.
 func DefaultH3DatagramSettings() *H3DatagramSettings {
+	// This optimistic target allows DPLPMTUD to grow a validated path to the
+	// previous Ethernet-sized ceiling. quic-go synchronously reports the
+	// smaller initial or migrated-path ceiling through DatagramTooLargeError;
+	// the hybrid sender records that live limit before choosing the lane.
+	targetDatagramByteCount := 1360
 	return &H3DatagramSettings{
-		TargetDatagramByteCount:        defaultH3DatagramTargetByteCount,
-		MaxFragmentCount:               defaultH3DatagramMaxFragments,
-		MaxMessageByteCount:            defaultH3DatagramMessageBytes,
-		MaxReassemblyMessageCount:      defaultH3DatagramMaxMessages,
-		MaxReassemblyByteCount:         defaultH3DatagramPeerBytes,
-		ProcessReassemblyByteCount:     defaultH3DatagramProcessBytes,
-		ReassemblyTimeout:              defaultH3DatagramReassemblyTtl,
-		HybridDatagramMessageByteCount: defaultH3HybridDatagramMessageByteCount,
+		TargetDatagramByteCount: targetDatagramByteCount,
+		// A complete routed message either fits one QUIC DATAGRAM or uses the
+		// reliable stream. Splitting one Transfer message across multiple lossy
+		// DATAGRAMs multiplies its loss probability and made full-MTU TCP 19%
+		// slower in the corrected one-bar full-TUN benchmark.
+		MaxFragmentCount:               1,
+		MaxMessageByteCount:            8 * 1024,
+		MaxReassemblyMessageCount:      32,
+		MaxReassemblyByteCount:         64 * 1024,
+		ProcessReassemblyByteCount:     8 * 1024 * 1024,
+		ReassemblyTimeout:              5 * time.Second,
+		HybridDatagramMessageByteCount: targetDatagramByteCount - H3DatagramHeaderByteCount,
+		// 32 packet-pool buffers fit the intended 64 KiB payload-capacity
+		// budget; one maximum uint16-framed message also fits
+		HybridStreamQueueMessageCount:     32,
+		HybridStreamQueuePayloadByteCount: 64 * 1024,
 	}
 }
 

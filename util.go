@@ -162,8 +162,8 @@ var networkChangeListeners = NewCallbackList[func()]()
 var networkQualityChangeListeners = NewCallbackList[func()]()
 
 // networkPathGeneration counts hard network changes (NetworkChanged). A quality
-// remeasurement coalesces notifications inside windowQualityRemeasureInterval,
-// which is right for a stream of signal hints on one path; a notification from
+// remeasurement coalesces notifications inside its quiet interval
+// (SendBufferSettings.WindowQualityRemeasureInterval), which is right for a stream of signal hints on one path; a notification from
 // a newer path generation starts a new measurement regardless, because the path
 // the previous one measured is gone. The process has one host network, so the
 // count is process-wide; each coalescing owner records the newest it accepted.

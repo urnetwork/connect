@@ -190,7 +190,7 @@ func runPlatformH3BatchBenchmarkIpVersion(
 	benchmark.ResetTimer()
 	writeCount := 0
 	var writeErr error
-	writeBatchStorage := make([]byte, platformH3WriteBatchMaxByteCount)
+	writeBatchStorage := make([]byte, DefaultPlatformTransportSettings().H3StreamWriteBatchMaxByteCount)
 	for range benchmark.N {
 		for firstMessageIndex := 0; firstMessageIndex < len(messages); firstMessageIndex += maximumMessageCount {
 			lastMessageIndex := min(

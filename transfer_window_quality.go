@@ -4,10 +4,6 @@ package connect
 
 import "time"
 
-// Several long feedback turns fit while noisy listener updates cannot keep
-// remeasurement open forever. Another generation needs a quiet interval first.
-const windowQualityRemeasureInterval = 5 * time.Second
-
 // An exact peer affects its logical services only; a local network event
 // affects every live service. Snapshot under the map lock, reset outside it.
 func (self *SendBuffer) networkQualityChanged(peerId Id, at time.Time) {
@@ -48,6 +44,7 @@ func (self *SendSequence) networkQualityChanged(at time.Time) {
 // interval: the path the running one measures is gone.
 func (self *SendSequence) networkQualityChangedOnPath(at time.Time, pathGeneration uint64) {
 	at = time.Unix(0, self.client.feedbackArrivalNanos(at))
+	quietInterval := self.windowQualityQuietInterval()
 	self.windowQualityLock.Lock()
 	defer self.windowQualityLock.Unlock()
 	newPath := self.windowQualityPathGeneration < pathGeneration
@@ -57,14 +54,14 @@ func (self *SendSequence) networkQualityChangedOnPath(at time.Time, pathGenerati
 	if service := self.windowPacer.service; service != nil {
 		// The shared service owns coalescing. A sibling born mid-generation
 		// inherits its original boundary, never a renewed shrink interval.
-		generationAt := service.networkQualityChangedOnPath(at, pathGeneration)
+		generationAt := service.networkQualityChangedOnPath(at, pathGeneration, quietInterval)
 		self.windowQualityLastNotification = at
 		if generationAt.UnixNano() <= self.windowQualityAfterNanos {
 			return
 		}
 		at = generationAt
 	} else if !newPath && !self.windowQualityLastNotification.IsZero() &&
-		at.Sub(self.windowQualityLastNotification) <= windowQualityRemeasureInterval {
+		at.Sub(self.windowQualityLastNotification) <= quietInterval {
 		if at.After(self.windowQualityLastNotification) {
 			self.windowQualityLastNotification = at
 		}
@@ -80,27 +77,34 @@ func (self *SendSequence) networkQualityChangedOnPath(at time.Time, pathGenerati
 	self.deliveredByteTotal, self.deliveredServiceByteTotal = 0, 0
 	clear(self.deliveredBytes)
 	self.deliveredBytesMutex.Unlock()
-	self.windowSize.remeasure(at)
+	self.windowSize.remeasure(at, quietInterval)
+}
+
+// windowQualityQuietInterval is the sequence's WindowQualityRemeasureInterval.
+// A standalone sequence history without settings takes the default.
+func (self *SendSequence) windowQualityQuietInterval() time.Duration {
+	if self.sendBufferSettings != nil {
+		return self.sendBufferSettings.WindowQualityRemeasureInterval
+	}
+	return DefaultSendBufferSettings().WindowQualityRemeasureInterval
 }
 
 // Quality reset keeps the last valid rate as a provisional zero hold. Its
 // replacement requires an independently qualified pair of new-path ACKs.
-func (self *windowPacingService) networkQualityChanged(at time.Time) time.Time {
-	return self.networkQualityChangedOnPath(at, 0)
-}
-
-// networkQualityChangedOnPath is networkQualityChanged from network path
-// generation `pathGeneration`. The first sibling to bring a newer generation
-// starts the new measurement; the siblings after it, with the same generation,
-// coalesce into it as usual.
-func (self *windowPacingService) networkQualityChangedOnPath(at time.Time, pathGeneration uint64) time.Time {
+//
+// A notification within `quietInterval` (the calling sequence's
+// WindowQualityRemeasureInterval) of the last one coalesces, unless it comes
+// from a newer network path generation `pathGeneration`. The first sibling to
+// bring a newer generation starts the new measurement; the siblings after it,
+// with the same generation, coalesce into it as usual.
+func (self *windowPacingService) networkQualityChangedOnPath(at time.Time, pathGeneration uint64, quietInterval time.Duration) time.Time {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	newPath := self.qualityPathGeneration < pathGeneration
 	if newPath {
 		self.qualityPathGeneration = pathGeneration
 	}
-	if !newPath && !self.qualityLastNotification.IsZero() && at.Sub(self.qualityLastNotification) <= windowQualityRemeasureInterval {
+	if !newPath && !self.qualityLastNotification.IsZero() && at.Sub(self.qualityLastNotification) <= quietInterval {
 		if at.After(self.qualityLastNotification) {
 			self.qualityLastNotification = at
 		}

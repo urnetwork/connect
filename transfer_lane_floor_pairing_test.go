@@ -42,7 +42,7 @@ func TestALaneCountWithoutALaneFloorIsNotAConfigurationWeShip(t *testing.T) {
 		{"DefaultSendBufferSettings", DefaultSendBufferSettings()},
 		{
 			"DefaultSendBufferSettingsWithBufferSize",
-			DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize),
+			DefaultSendBufferSettings(),
 		},
 		{
 			"DefaultClientSettings.SendBufferSettings",
@@ -50,7 +50,7 @@ func TestALaneCountWithoutALaneFloorIsNotAConfigurationWeShip(t *testing.T) {
 		},
 		{
 			"DefaultClientSettingsWithBufferSize.SendBufferSettings",
-			DefaultClientSettingsWithBufferSize(defaultTransferBufferSize).SendBufferSettings,
+			DefaultClientSettings().SendBufferSettings,
 		},
 		{
 			"DefaultClientSettingsNoNetworkEvents.SendBufferSettings",

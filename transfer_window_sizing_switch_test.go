@@ -568,7 +568,7 @@ func TestTheTransferShareIsADrawOnTheBudget(t *testing.T) {
 	if share := transferBudgetShareByteCount(); share != 0 {
 		t.Errorf("an unbudgeted process computed a share of %d; it has no budget to draw on", share)
 	}
-	settings := DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize)
+	settings := DefaultSendBufferSettings()
 	settings.WindowSizing = WindowSizingFromDelivery
 	settings.ApplyWindowSizing()
 	if settings.ResendQueueBudget != nil {
@@ -588,7 +588,7 @@ func TestTheTransferShareIsADrawOnTheBudget(t *testing.T) {
 	// the hold moves with the window, or it is the binder the moment windows
 	// can grow: 2.5 MiB is 90 Mb/s at a 200 ms round trip
 	SetMemoryBudget(mib(256))
-	receive := DefaultReceiveBufferSettingsWithBufferSize(defaultTransferBufferSize)
+	receive := DefaultReceiveBufferSettingsWithBufferSize(32)
 	receive.WindowSizing = WindowSizingFromDelivery
 	receive.ApplyWindowSizing()
 	if receive.ReceiveQueueMaxByteCount != transferBudgetShareByteCount() {

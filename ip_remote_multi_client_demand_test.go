@@ -27,8 +27,8 @@ func newDemandExpansionFixture(t *testing.T, fixed bool, windowType WindowType) 
 	fixture := newMultiClientExpandLifecycleFixture(t)
 	window := fixture.window
 	window.windowType = windowType
-	window.createFailThrottle = newLogThrottle(evaluationFailureLogInterval)
-	window.enumerateZeroThrottle = newLogThrottle(evaluationFailureLogInterval)
+	window.createFailThrottle = newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval)
+	window.enumerateZeroThrottle = newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval)
 	generator := window.generator.(*multiClientExpandLifecycleGenerator).TestMultiClientGenerator
 	// The older fixture preloads one inert synthetic args object. Here the
 	// actual producer owns every requested credential instead.

@@ -227,7 +227,7 @@ func shareTableRows() []shareTableRow {
 			loopRoundTrip:  shareTableTransferLoopRtt,
 			framed:         true,
 			resolve: atProcessBudget(func() ByteCount {
-				settings := DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize)
+				settings := DefaultSendBufferSettings()
 				settings.WindowSizing = WindowSizingFromDelivery
 				settings.ApplyWindowSizing()
 				if settings.ResendQueueBudget == nil {
@@ -246,7 +246,7 @@ func shareTableRows() []shareTableRow {
 			loopRoundTrip:  shareTableTransferLoopRtt,
 			framed:         true,
 			resolve: atProcessBudget(func() ByteCount {
-				settings := DefaultReceiveBufferSettingsWithBufferSize(defaultTransferBufferSize)
+				settings := DefaultReceiveBufferSettingsWithBufferSize(32)
 				settings.WindowSizing = WindowSizingFromDelivery
 				settings.ApplyWindowSizing()
 				if settings.ReceiveQueueBudget == nil {
