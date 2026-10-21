@@ -259,6 +259,8 @@ callee. The caller must not return it and must not use it afterwards.
 
 - `TcpSequence.receivePacket`, `TcpSequence.receiveBatch`
 - `ipPacketGroupBatch.offer`
+- `RemoteUserNatMultiClient.SendNativePacketBatch`, `SendNativePacketBatchWithResults`
+- `UpgradeMux.SendNativePacketBatch`
 
 **Takes on success** — a true return transfers ownership; a false return
 leaves it with the caller, who must return it.
@@ -267,6 +269,7 @@ leaves it with the caller, who must return it.
 - `Client.SendWithTimeout`, `SendWithTimeoutDetailed`
 - `Client.sendWithTimeoutAdmissionDetailed` (internal admission diagnostics)
 - `RemoteUserNatMultiClient.sendPreparedPacketGroup`, `sendParsedPacketGroupAttempt`
+- `RemoteUserNatMultiClient.sendNativePacketGroup`
 
 A batch entry's true return reads as a transfer and means delivered; the
 per-buffer ownership is the heading it sits under, not what the boolean

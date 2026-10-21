@@ -163,9 +163,9 @@ func TestBusyProbeRefreshesItsBudgetAfterAHostSleep(t *testing.T) {
 	})
 }
 
-// With no sleep the same probe convicts at its first expiry: the host clock
+// With no sleep the same probe holds at its first expiry: the host clock
 // adds nothing to a wait the host was awake for.
-func TestBusyProbeConvictsAtTheBudgetWithNoSleep(t *testing.T) {
+func TestBusyProbeHoldsAtTheBudgetWithNoSleep(t *testing.T) {
 	hostClock := newTestHostClock(t)
 	synctest.Test(t, func(t *testing.T) {
 		budget := 50 * time.Millisecond
@@ -176,8 +176,8 @@ func TestBusyProbeConvictsAtTheBudgetWithNoSleep(t *testing.T) {
 		synctest.Wait()
 		select {
 		case verdict := <-verdicts:
-			if !verdict.convict || verdict.detail != "liveness probe timed out after 50ms" {
-				t.Fatalf("the awake probe did not convict at its budget: %+v", verdict)
+			if verdict.convict || !verdict.unanswered || verdict.detail != "liveness probe unanswered after 50ms; callback retained" {
+				t.Fatalf("the awake probe did not hold at its budget: %+v", verdict)
 			}
 		default:
 			t.Fatal("the awake probe refreshed its budget")

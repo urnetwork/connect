@@ -1,5 +1,5 @@
 // Exercises local pre-wire probe expiry through real Transfer ownership and
-// distinguishes it from a physically written probe that receives no answer.
+// distinguishes exact local expiry from route admission without peer delivery.
 package connect
 
 import (
@@ -248,9 +248,9 @@ func TestBusyProbeRealQueuedExpiryPreservesWrittenFlow(t *testing.T) {
 	})
 }
 
-// A probe that really leaves on the route and remains unanswered retains the
-// existing finite remote timeout and window-retirement decision.
-func TestBusyProbeRealWrittenSilenceStillConvicts(t *testing.T) {
+// Supersedes the old route-only "written silence" control. A nil first-route
+// receipt means channel acceptance, not physical socket completion or peer ACK.
+func TestBusyProbeRouteAdmissionDoesNotProveWireSilence(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newBusyExpiryFixture(t, false)
@@ -276,14 +276,14 @@ func TestBusyProbeRealWrittenSilenceStillConvicts(t *testing.T) {
 		}
 		time.Sleep(501 * time.Millisecond)
 		synctest.Wait()
-		if !<-fixture.verdict || fixture.channel.ctx.Err() == nil || fixture.client.ctx.Err() == nil {
-			t.Fatal("a genuinely written unanswered probe no longer retires its stalled channel")
+		if <-fixture.verdict || fixture.channel.ctx.Err() != nil || fixture.client.ctx.Err() != nil {
+			t.Fatal("route-channel admission was mistaken for physical peer silence")
 		}
 		fixture.channel.stateLock.Lock()
 		endErr := fixture.channel.endErr
 		fixture.channel.stateLock.Unlock()
-		if endErr == nil || !strings.Contains(endErr.Error(), "liveness probe timed out after") || errors.Is(endErr, errSendPackExpiredUnwritten) {
-			t.Fatalf("wrong remote failure evidence: %v", endErr)
+		if endErr != nil || fixture.channel.busyProbeOutstandingNow() {
+			t.Fatalf("unknown route-only observation retained an error or tier penalty: %v", endErr)
 		}
 		if fixture.sibling.ctx.Err() != nil {
 			t.Fatal("remote conviction canceled the independently receiving sibling")

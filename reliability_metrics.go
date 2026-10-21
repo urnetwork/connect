@@ -177,11 +177,10 @@ type reliabilityMetrics struct {
 	providersQualified  atomic.Uint64
 
 	// the busy-flow liveness probe (see busyLivenessProbe). busyProbesSent
-	// counts probes that reached the wire against a stalled exit;
-	// busyProbesAcquitted counts the ones answered inside the budget -- exits
-	// that would have been removed before this port existed and were not. The
-	// gap is convictions, which the ordinary exit-loss counters already record,
-	// so nothing here double-counts a removal.
+	// counts successful local admissions, not physical wire delivery;
+	// busyProbesAcquitted counts actual answers consumed for the same pending
+	// episode. An answer may arrive after bounded evaluation. Their difference
+	// includes unresolved and discarded results, not just convictions.
 	//
 	// schedulerPausesDetected counts host suspends the detector caught. It is
 	// the only evidence a doze happened at all: from inside the process the
@@ -678,8 +677,8 @@ type ReliabilityMetricsSnapshot struct {
 	ProvidersQualified uint64
 
 	// BusyProbesSent and BusyProbesAcquitted are the busy-flow liveness probes
-	// fired at stalled exits and the ones answered inside the budget -- the
-	// removals the probe prevented. SchedulerPausesDetected counts host
+	// admitted against stalled exits and actual answers consumed for the same
+	// pending episode; their difference is not a removal count. SchedulerPausesDetected counts host
 	// suspends (doze, freezer, thermal) the pause detector caught.
 	BusyProbesSent          uint64
 	BusyProbesAcquitted     uint64

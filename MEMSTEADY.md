@@ -4971,3 +4971,188 @@ or native iOS lifetime `phys_footprint <50 MiB`. It does not causally resolve
 the separate historical loaded-probe 0/64 result. Private grace/full-turn
 research is deferred with its evidence retained, not incorporated or
 qualified by this result.
+
+### 2026-10-21: busy-probe custody and harness confirmation
+
+Two deterministic pre-fix witnesses reproduced premature channel retirement:
+an admitted probe remained unwritten when its local evaluation timer expired;
+an already completed error verdict canceled a new pending-send episode after
+real ACK progress. Each witness retained an unchanged-failure control that passed.
+
+The integrated correction treats unanswered bounded evaluation as unknown, not
+remote failure. One exact callback owner survives the wait, preventing repeated
+probe admission. Late results retain their actual callback timestamp; a pending
+generation check and terminal error commitment share the channel lock. Physical
+read/no-send-ACK and terminal Transfer failure authorities remain independent.
+
+Private and direct shared-source qualification each passed three fresh normal
+and three fresh race processes: 85 top-level tests plus 22 subtests per process,
+zero failures/skips. Retained evaluation measured zero allocations; owner and
+completion values measured 24 B and 40 B, with channel size 1,008 B. These are
+bounded structural measurements, not whole-process memory or throughput results.
+The first private attempt's one-allocation failure and source-overlay inspection
+failure remain recorded; neither was retried unchanged or omitted.
+
+A separate test-only Android fixture correction pins synthetic GOFLAGS rather
+than inheriting unrelated compiler flags. Real native provenance still rejects
+unsupported flags. Private and integrated 58-test sets passed three fresh
+processes each; the full 27-file helper parent then passed 594/594 tests with
+the previously failing ambient flags. All owners joined and input guards matched.
+
+Evidence is retained under `full-campaign-current.Fxlt45/` in
+`busy-stale-verdict-OLD.zqOyaA`, `busy-custody-v2-resumed.WdTeoP`,
+`busy-custody85.qjmUkO`, `busy-custody85-direct.7E4t7n`,
+`native-fixture-direct.5tSqTZ`, and `helper-parent594.aFlpO4`.
+This documentation append follows completed guards. It does not qualify Fast.com,
+the historical 0/64 loaded-probe result, full ALL/MAIN/PERF, complete Android
+32-MiB iOS-profile / 64-MiB Android-profile memory, or native iOS total footprint.
+
+### 2026-10-21: rapid-navigation admission hypothesis (source audit only)
+
+Reported symptom: several same-site pages load quickly, then later links pause
+for 5–10 seconds. No captured user-session evidence yet attributes this to a
+memory limit. Keep the 32-MiB iOS / 64-MiB Android targets unchanged while testing.
+
+Apple `PacketTunnelProvider.readToDevice` calls SDK `sendPacketBatch`
+synchronously before rearming the next native packet read. SDK `SendTimeout`
+defaults to five seconds. Same-batch ready offers let unrelated already-read
+groups advance, but cannot admit a later batch that the native reader has not
+read. `TestNativeBatchNextReadRemainsBehindPriorCall` deterministically
+characterizes that boundary with retained TCP credit. The existing split-group
+scheduler test also permits two consecutive five-second budgets for one flow;
+that exact split must not be assumed on the ordinary UpgradeMux path, which
+directly forwards groups rather than nesting another whole-batch scheduler.
+The native codec may emit multiple frames synchronously, each starting a new
+SDK call. These are plausible blocking mechanisms, not incident attribution.
+
+`MaxFlowsPerExit=16` is a placement preference, not a hard connection-admission
+limit. Increasing it or adding buffers is therefore not a demonstrated remedy.
+More queued bytes can postpone pressure while increasing latency and retention.
+Before changing capacity, measure native read/admission/physical-write/first-byte
+boundaries, actual root occupancy, refusals and retransmissions using a fixed
+healthy H1 provider. Compare a tiny request in the current batch against the
+next native read while holding real retained credit; include request-only
+cancellation versus actual FIN/RST and require complete ownership reconciliation.
+
+Potential experiments are targeted zero-wait *pre-Transfer* remote admission or
+a fixed-byte/count-bounded fair native intake adapter. Neither is implemented or
+recommended from this audit alone. Do not globally set send timeout to zero,
+drop accepted reliable owners, fabricate ACKs, or add an unbounded async queue.
+Installed-app source parity must also be checked before attributing a symptom
+to fixes present only in this workspace. This append follows completed run guards.
+
+### 2026-10-21: native-input admission isolation, first causal proof
+
+The pre-Transfer native-input wait is now pinned by
+`TestNativeIngressNextReadPrecedesUnrelatedCreditRelease`. It holds actual
+Transfer resend credit for one destination, then models sequential native reads:
+the first batch targets that blocked destination; the next targets an
+independently ready route. The old implementation fails with
+`NATIVE_INGRESS_NEXT_READ_HELD_BY_UNRELATED_CREDIT`, while the ordinary blocking
+API control passes. This is a causal admission/read-loop defect, not proof that
+memory capacity caused the reported physical browsing session.
+
+A private candidate gives native remote groups one ready-only admission offer,
+without adding a queue, worker or timer. Local protocol owners and explicit
+generic Go senders retain their existing timeout. An unavailable encryption
+session remains a temporary refusal rather than a connection reset. Refusal
+occurs before Transfer ownership; it must not commit TCP-collapse suppression,
+invent an ACK or discard an already accepted reliable original.
+
+Both causal/control roots passed in three fresh normal and three fresh race
+processes, covering direct and mux routes, independent wire progress before
+credit release, unchanged retained-owner accounting, and successful retry after
+credit release. All owners joined and input guards matched. Existing SDK smoke
+also passed 13/13 after correcting a candidate compile error; that earlier
+build failure remains preserved. Evidence:
+`/Volumes/data/urnetwork-native-ingress-connect-proof.QAU94k/` and
+`/Volumes/data/urnetwork-native-ingress-sdk-smoke-v2.Y2wD90/`.
+
+The actual SDK packed-call and native-fd regressions subsequently reproduced
+both expected old-code blocking failures. The candidate passed both roots in
+three fresh normal and three fresh race processes, with exact pooled-root
+count/byte balance after joins. The initial packed fixture incorrectly placed
+gVisor's custom, non-durable waits inside `synctest` and timed out at 120 seconds;
+that result is preserved and is not causal evidence. Its test-only successor
+uses a bounded two-second watchdog against the unchanged five-second send
+budget, with the actual remote/mux/local-DNS owners retained.
+Closed SDK proof:
+`/Volumes/data/urnetwork-native-ingress-sdk-proof-v2.ny28zy/OUTCOME.json`, SHA-256
+`5bbee0e7e37c777cf4903e67955489da170777a857d3a1b15b02fb7402a06582`.
+
+The first ordinary PERFVAR old/new comparison completed 100 rapid pages across
+four synthetic sites, each totaling 50–300 KiB of HTML, JS, CSS and images.
+Both versions passed: 99 proved overlap transitions, 100 actually canceled
+assets, 17,879,040 planned body bytes, 13,495,296 completed body bytes and
+102,400 canceled-prefix bytes. Prior assets were held while the next HTML
+started; work stayed bounded to two pages/eight asset handlers. The normal
+fixture bridge remains unchanged unless this workload opts into native input.
+
+| Per-page timing | Old | Candidate |
+| --- | ---: | ---: |
+| HTML TTFB p50 | 7.091 ms | 7.235 ms |
+| HTML TTFB p95 | 14.297 ms | 13.668 ms |
+| HTML TTFB maximum | 29.723 ms | 32.986 ms |
+| Asset completion p50 | 13.845 ms | 13.187 ms |
+| Asset completion p95 | 26.583 ms | 25.569 ms |
+| Five-second navigation stalls | 0 | 0 |
+
+This clean-network pair did not reproduce the reported browsing pause and does
+not establish a statistically significant speed change. The separate causal
+old-code failures remain the evidence for the admission/read-loop defect.
+Sampled host-process heap peaks were 116,141,000/116,503,168 bytes, including
+the fixture/provider/HTTP workload: these are not mobile 32/64-MiB measurements
+or absolute peak bounds. No capacity increase or deployed-app fix is claimed.
+Both owners, fixture cleanup and source/input checks passed. Closed outcome:
+`/Volumes/data/urnetwork-native-browsing100.PREP.Tf7V4t/OUTCOME.json`, SHA-256
+`d315bacd60f7b61c9b1b727b1c6655bff147fb2e565527adcec2691986e5b4cf`.
+# Native admission follow-up: adjacent checks and fixture failures (2026-10-21)
+
+The private native-admission candidate passed eight roots in three fresh normal
+and three fresh race processes (48/48, no skips). Allocation census measured
+one extra allocation per native batch at both one and 64 packets; bytes were
+not measured. Evidence: `/Volumes/data/urnetwork-native-ingress-adjacent.uTqbVV/OUTCOME.json`.
+The run exceeded its nested build/cache work allowance; its outcome preserves
+that resource failure separately from test correctness.
+
+The first ordinary PERFVAR unavailable-route control is **not qualified**:
+OLD hit the expected next-read marker but also a synctest cleanup panic; NEW
+failed its return-identity assertion and had the same panic. Both owners joined
+and input guards matched. Evidence:
+`/Volumes/data/urnetwork-native-browsing-boundary.HCoJ8W/OUTCOME.json`.
+Fixture repairs must precede integration; these are not additional passing
+production tests. A separate audit found that the 100-page canceled-asset branch
+could mask a joined prefix-validation error with context cancellation. Existing
+clean OLD/NEW passes remain recorded, but do not prove that negative invariant.
+
+The native candidate and regression sources were integrated into Connect, SDK,
+and ordinary Server PERFVAR on 2026-10-21. Fifteen afterimages matched
+`/tmp/urnetwork-native-ingress.jmLXFw/INTEGRATION.v2.MANIFEST.json`;
+existing dirty busy-probe changes were preserved. The successor fixtures warm
+the process-owned pool before synctest, distinguish forward callback identity
+from the parsed return tuple, and independently reject canceled corrupt bodies.
+These test-only corrections still require execution. Integration is not a
+full-run, physical-device, memory-budget, deployment, or speed qualification.
+
+Direct post-integration verification then passed the repaired PERFVAR boundary
+and canceled-prefix roots (2/2). Nine Connect roots, including the ownership
+heading audit against actual source files, passed in three fresh normal and
+three fresh race processes (54/54). All owners joined and input guards matched.
+Receipt: `/Volumes/data/urnetwork-native-ingress-integrated-confirm.2PNKHU/DIRECT.CLOSED.json`.
+The repaired PERFVAR OLD arm is still not run; no new OLD-fails/NEW-passes claim
+is attached to these direct results. Earlier separate Connect/SDK causal proofs
+remain the evidence for the admission defect.
+
+The repaired ordinary PERFVAR boundary now has its own clean causal proof:
+exact reconstructed OLD Connect and SDK preimages produced only
+`NATIVE_PERFVAR_NEXT_READ_WAITED_FOR_REMOTE`; integrated NEW passed. The same
+two NEW PERFVAR roots passed in three fresh normal processes. The earlier OLD
+compile failure (missing the SDK preimage in its overlay) remains retained with
+zero test credit. All final owners joined and guards matched. Final receipt:
+`/Volumes/data/urnetwork-native-ingress-integrated-confirm.2PNKHU/OUTCOME.FINAL.json`
+(SHA-256 `8d2576001a0d1ddaf0a4d5e4080bc802d8ac4f7fd05c8534abef51c34bb3eb27`).
+This qualifies the local admission-isolation fix, not physical pause attribution
+or a speed/memory improvement. Ready cold SYNs can still enter the existing
+race; unavailable cold flows now rely on source retransmission rather than
+blocking unrelated native reads. No additional queue or mobile budget change
+was introduced. The 100-page successor and complete runner still need replay.
