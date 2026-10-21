@@ -128,12 +128,17 @@ if [ -f "$unit_dir/urnetwork.service" ] || [ -f "$unit_dir/urnetwork-update.time
 
 	echo "$me: Stopping and removing the systemd units"
 
-	if ! systemctl --user disable --now urnetwork.service urnetwork-update.timer > /dev/null; then
+	# one by one: disabling a unit whose file is gone fails
+	for unit in urnetwork.service urnetwork-update.timer; do
+	    systemctl --user disable --now "$unit" > /dev/null 2>&1
+	done
+
+	systemctl --user stop urnetwork-update.service > /dev/null 2>&1
+
+	if systemctl --user is-active --quiet urnetwork.service; then
 	    echo "$me: Could not stop urnetwork.service; nothing else was removed" >&2
 	    exit 1
 	fi
-
-	systemctl --user stop urnetwork-update.service > /dev/null 2>&1
     fi
 
     rm -f "$unit_dir/urnetwork.service" "$unit_dir/urnetwork-update.timer" "$unit_dir/urnetwork-update.service"

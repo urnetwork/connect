@@ -696,8 +696,14 @@ take_lock ()
         return 0
     fi
 
-    lock_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/urnetwork-install-$(id -u).lock"
-    exec 9> "$lock_file" || return 0
+    lock_file="${XDG_RUNTIME_DIR:-$cache_dir}/urnetwork-install.lock"
+
+    # a failed redirect on `exec' ends dash, so try it in a subshell first
+    if ! (: >> "$lock_file") 2>/dev/null; then
+        return 0
+    fi
+
+    exec 9>> "$lock_file"
 
     if ! flock -n 9; then
         pr_err "Another URnetwork install or update is running; try again in a few minutes"
@@ -1433,12 +1439,17 @@ do_uninstall ()
         if [ "$has_systemd" -eq 1 ]; then
             pr_info "Stopping and removing the systemd units"
 
-            if ! systemctl --user disable --now urnetwork.service urnetwork-update.timer > /dev/null; then
+            # one by one: disabling a unit whose file is gone fails
+            for unit in urnetwork.service urnetwork-update.timer; do
+                systemctl --user disable --now "$unit" > /dev/null 2>&1
+            done
+
+            systemctl --user stop urnetwork-update.service > /dev/null 2>&1
+
+            if unit_active urnetwork.service; then
                 pr_err "Could not stop urnetwork.service; nothing else was removed"
                 exit 1
             fi
-
-            systemctl --user stop urnetwork-update.service > /dev/null 2>&1
         fi
 
         rm -f "$systemd_service" "$systemd_update_service" "$systemd_update_timer"
