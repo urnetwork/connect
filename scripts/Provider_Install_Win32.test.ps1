@@ -138,7 +138,7 @@ function Invoke-EndToEnd {
 #include <stdlib.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "provide") == 0) { for (;;) sleep(60); }
+    if (argc > 1 && (strcmp(argv[1], "provide") == 0 || strcmp(argv[1], "update") == 0)) { for (;;) sleep(60); }
     if (argc > 1 && strcmp(argv[1], "auth") == 0) {
         char path[4096]; snprintf(path, sizeof path, "%s/jwt", getenv("URNETWORK_STATE_DIR"));
         FILE *f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f); return 0;
@@ -226,12 +226,18 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
 
         # An update replaces the running provider and restarts it.
         New-Release "v2026.10.21-1"
+        # Stands in for the miner's "provider update" handing off to urnet-tools:
+        # the update must not kill it.
+        $Caller = Start-Process -FilePath (Join-Path $Install "urnetwork") -ArgumentList "update" -PassThru
         $Before = @(Get-Process -Name urnetwork -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Install/*" }).Id
         $Out = & $Pwsh -NoProfile -File $Tools update 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) { Fail "update failed: $Out" }
         Check "updated version" (Get-Content (Join-Path $Install "version")) "v2026.10.21-1"
         Check "updated binary" (& (Join-Path $Install "urnetwork") --version) "v2026.10.21-1"
         if (-not (Test-Path (Join-Path $Install "provider.log"))) { Fail "no provider.log" }
+        if ($Caller.HasExited) { Fail "the update killed the urnetwork process that isn't a provider" }
+        Stop-Process -Id $Caller.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
         $After = @(Get-Process -Name urnetwork -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Install/*" }).Id
         if ($After.Count -ne 1 -or ($Before -contains $After[0])) { Fail "provider wasn't restarted on the new version (before $Before, after $After)" }
         $Out = & $Pwsh -NoProfile -File $Tools update 2>&1 | Out-String
@@ -256,7 +262,11 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
         if ($LASTEXITCODE -ne 0 -or $Out -notmatch "Already signed in") { Fail "install over a kept identity: $Out" }
         $Out = & $Pwsh -NoProfile -File $Tools uninstall -RemoveIdentity 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0 -or $Out -notmatch "Nothing was removed" -or -not (Test-Path (Join-Path $Install "urnetwork"))) { Fail "uninstall -RemoveIdentity without -Yes and no terminal: $Out" }
-        $Out = & $Pwsh -NoProfile -File $Tools uninstall -RemoveData -Yes 2>&1 | Out-String
+        $Out = & $Pwsh -NoProfile -File $Tools uninstall --remove-identity 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -or $Out -notmatch "Nothing was removed") { Fail "uninstall --remove-identity without --yes: $Out" }
+        $Out = & $Pwsh -NoProfile -File $Tools uninstall --bogus 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -or $Out -notmatch "Unknown option") { Fail "unknown option: $Out" }
+        $Out = & $Pwsh -NoProfile -File $Tools uninstall --remove-identity --yes 2>&1 | Out-String
         if (Test-Path $State) { Fail "uninstall -RemoveData kept ${State}: $Out" }
 
         # Under "irm | iex" a failure must not end the caller's session.

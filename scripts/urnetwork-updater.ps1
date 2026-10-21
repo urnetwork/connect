@@ -32,7 +32,14 @@ $ToolsPath = Join-Path $InstalledPath -ChildPath "urnet-tools.ps1"
 $PIDFile = Join-Path $InstalledPath -ChildPath "urnetwork-updater.pid"
 $LastCheckFile = Join-Path $InstalledPath -ChildPath "last-update-check"
 $LogFile = Join-Path $InstalledPath -ChildPath "updater.log"
-$PowerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$AutoUpdateOffFile = Join-Path $InstalledPath -ChildPath "auto-update-off"
+$PowerShellPath = Join-Path $PSHOME -ChildPath "powershell.exe"
+if ($PSVersionTable.PSEdition -eq "Core") {
+    $PowerShellPath = Join-Path $PSHOME -ChildPath "pwsh"
+    if ($IsWindows) {
+        $PowerShellPath = "$PowerShellPath.exe"
+    }
+}
 
 # One updater per user, however often it is started.
 $Mutex = New-Object System.Threading.Mutex($false, "Local\urnetwork-updater")
@@ -76,6 +83,11 @@ if (-not $Once) {
 }
 
 while ($true) {
+    # Turned off, or uninstalled, since this updater started.
+    if ((Test-Path -LiteralPath $AutoUpdateOffFile) -or -not (Test-Path -LiteralPath $ToolsPath)) {
+        break
+    }
+
     $Now = (Get-Date).ToUniversalTime()
     if (($Now - (Get-LastCheck)) -ge $Interval) {
         Limit-Log

@@ -101,7 +101,20 @@ function Invoke-Uninstall {
         $StartupFolders += [Environment]::GetFolderPath("CommonStartup")
     }
 
-    $Found = Test-Path -LiteralPath $Folder
+    # Only ever delete a folder that holds an URnetwork install, and never one
+    # that holds the identity.
+    $Markers = @("urnetwork.exe", "urnet-tools.ps1", "windows\amd64\urnetwork.exe", "windows\arm64\urnetwork.exe")
+    $Found = $false
+    if (Test-Path -LiteralPath $Folder) {
+        $Found = @($Markers | Where-Object { Test-Path -LiteralPath (Join-Path $Folder -ChildPath $_) }).Count -gt 0
+        if (-not $Found) {
+            throw "$Folder doesn't look like an URnetwork install (no urnetwork.exe or urnet-tools.ps1), so nothing was removed"
+        }
+        $FullState = [IO.Path]::GetFullPath($StateDir).TrimEnd('\') + "\"
+        if ($FullState.StartsWith($Folder + "\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Folder contains your identity folder $StateDir, so nothing was removed"
+        }
+    }
     foreach ($StartupFolder in $StartupFolders) {
         foreach ($Name in @("urnetwork.lnk", "urnetwork-update.lnk")) {
             $Shortcut = Join-Path $StartupFolder -ChildPath $Name
@@ -135,7 +148,7 @@ function Invoke-Uninstall {
     }
     Start-Sleep -Seconds 1
 
-    if (Test-Path -LiteralPath $Folder) {
+    if ($Found -and (Test-Path -LiteralPath $Folder)) {
         Write-Host "Removing installation folder: $Folder"
         Remove-Item -LiteralPath $Folder -Recurse -Force
         $Parent = Split-Path -Parent $Folder

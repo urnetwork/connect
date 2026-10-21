@@ -293,17 +293,40 @@ function Set-UserPathRaw {
     }
 }
 
-# Get-ProviderProcess finds providers started from this install folder.
+# Get-ProviderProcess returns the ids of providers running "provide" from this
+# install folder. Other runs of the same exe ("auth", or the miner's own
+# "provider update" that may have started this install) are left alone.
 function Get-ProviderProcess {
     param([String]$Folder)
     $Prefix = $Folder.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $Provide = '(^|\s)"?provide"?(\s|$)'
+    if (Test-IsWindows) {
+        try {
+            return @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'urnetwork.exe'" -ErrorAction Stop | Where-Object {
+                $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase) -and
+                ($_.CommandLine -replace '^("[^"]*"|\S+)', '') -match $Provide
+            } | ForEach-Object { [int]$_.ProcessId })
+        }
+        catch {
+            return @()
+        }
+    }
     return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)
-    })
+        $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase) -and
+        ($_.CommandLine -replace '^\S+', '') -match $Provide
+    } | ForEach-Object { $_.Id })
 }
 
+# Get-PowerShellPath is the PowerShell to run child scripts with: this one's
+# edition, never the host (powershell_ise.exe under "irm | iex" in the ISE).
 function Get-PowerShellPath {
-    return [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        if (Test-IsWindows) {
+            return Join-Path $PSHOME -ChildPath "pwsh.exe"
+        }
+        return Join-Path $PSHOME -ChildPath "pwsh"
+    }
+    return Join-Path $PSHOME -ChildPath "powershell.exe"
 }
 
 # Invoke-Tools runs the installed urnet-tools.ps1 in a child PowerShell, so the
@@ -471,12 +494,17 @@ function Invoke-Install {
     }
     $ExpectedSha256 = Get-AssetSha256 $Asset
 
-    $WorkDir = Join-Path ([IO.Path]::GetTempPath()) -ChildPath "urnetwork-install"
+    $WorkDir = Join-Path ([IO.Path]::GetTempPath()) -ChildPath "urnetwork-install-$PID"
     $null = New-Item -Path $WorkDir -ItemType Directory -Force
     $ArchivePath = Join-Path $WorkDir -ChildPath $Asset.name
     $ExtractPath = Join-Path $WorkDir -ChildPath "extracted"
 
     try {
+        # -NoRestartDownload reuses the archive an earlier run kept with -NoCleanup.
+        $Earlier = Get-ChildItem -Path (Join-Path ([IO.Path]::GetTempPath()) -ChildPath "urnetwork-install-*\$($Asset.name)") -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($NoRestartDownload -and $Earlier -and -not (Test-Path -LiteralPath $ArchivePath)) {
+            Copy-Item -LiteralPath $Earlier.FullName -Destination $ArchivePath
+        }
         $Reuse = $NoRestartDownload -and (Test-Path -LiteralPath $ArchivePath) -and $ExpectedSha256 -and (Test-FileSha256 $ArchivePath $ExpectedSha256)
         if ($Reuse) {
             Write-Host "Reusing the earlier download $ArchivePath"
@@ -555,6 +583,9 @@ function Invoke-Install {
         $null = New-Item -Path $Folder -ItemType Directory -Force
 
         $InstalledBinaryPath = Join-Path $Folder -ChildPath "urnetwork$BinarySuffix"
+        $UpgradingOldInstall = (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "version")) -and
+            -not (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "auto-update-off")) -and
+            -not (Test-Path -LiteralPath (Join-Path $Folder -ChildPath "auto-update-interval"))
         $InstalledToolsPath = Join-Path $Folder -ChildPath "urnet-tools.ps1"
         $InstalledUpdaterPath = Join-Path $Folder -ChildPath "urnetwork-updater.ps1"
 
@@ -565,6 +596,7 @@ function Invoke-Install {
         # it. So the running provider is moved aside, the new one put in place,
         # and only then is the running one restarted.
         $Running = Get-ProviderProcess $Folder
+        $Aside = ""
         if (Test-Path -LiteralPath $InstalledBinaryPath) {
             $Aside = "$InstalledBinaryPath.old"
             if (Test-Path -LiteralPath $Aside) {
@@ -574,7 +606,15 @@ function Invoke-Install {
         }
 
         Write-Host "Installing urnetwork$BinarySuffix ($ReleaseVersion)"
-        Move-Item -LiteralPath $BinaryPath -Destination $InstalledBinaryPath
+        try {
+            Move-Item -LiteralPath $BinaryPath -Destination $InstalledBinaryPath
+        }
+        catch {
+            if ($Aside) {
+                Move-Item -LiteralPath $Aside -Destination $InstalledBinaryPath -ErrorAction SilentlyContinue
+            }
+            throw "Couldn't put the new urnetwork$BinarySuffix in place ($($_.Exception.Message)). The installed version is unchanged. If antivirus is scanning it, try again in a minute."
+        }
 
         Install-ScriptFile -Name "urnet-tools.ps1" -LocalPath $ToolsScriptPath -BaseUrl $BaseUrl -Target $InstalledToolsPath
         Install-ScriptFile -Name "urnetwork-updater.ps1" -LocalPath $UpdaterScriptPath -BaseUrl $BaseUrl -Target $InstalledUpdaterPath
@@ -582,7 +622,9 @@ function Invoke-Install {
         if ($OnWindows) {
             # Lets "urnet-tools" work from cmd.exe, and from PowerShell when its
             # execution policy blocks scripts.
-            $Shim = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0urnet-tools.ps1`" %*`r`n"
+            # One line, so cmd doesn't look for a next line after "uninstall"
+            # deleted this file.
+            $Shim = "@powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0urnet-tools.ps1`" %* & exit /b`r`n"
             [IO.File]::WriteAllText((Join-Path $Folder -ChildPath "urnet-tools.cmd"), $Shim, (New-Object Text.UTF8Encoding($false)))
         }
 
@@ -602,15 +644,14 @@ function Invoke-Install {
 
         if ($Running.Count -gt 0) {
             Write-Host "Restarting the running provider on the new version"
-            $Running | Stop-Process -Force -ErrorAction SilentlyContinue
+            $Running | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
             Start-Sleep -Seconds 1
             $null = Invoke-Tools $InstalledToolsPath @("start")
         }
     }
     finally {
         if (-not $NoCleanup) {
-            Remove-Item -LiteralPath $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -676,6 +717,24 @@ function Invoke-Install {
         Write-Host "Automatic updates and start at sign-in are Windows only; skipping them here"
     }
     else {
+        $UpdateShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) -ChildPath "urnetwork-update.lnk"
+        if ($UpgradingOldInstall) {
+            # An older urnet-tools kept these settings only in the shortcut:
+            # no shortcut means updates were turned off, and the shortcut's
+            # -Frequency is the chosen interval.
+            if (-not (Test-Path -LiteralPath $UpdateShortcut)) {
+                Set-Content -LiteralPath (Join-Path $Folder -ChildPath "auto-update-off") -Value "Off in an earlier install"
+            }
+            else {
+                try {
+                    $OldArguments = (New-Object -ComObject WScript.Shell).CreateShortcut($UpdateShortcut).Arguments
+                    if ($OldArguments -match "-Frequency every-(week|month)") {
+                        Set-Content -LiteralPath (Join-Path $Folder -ChildPath "auto-update-interval") -Value $Matches[1]
+                    }
+                }
+                catch {}
+            }
+        }
         $AutoUpdateOff = Test-Path -LiteralPath (Join-Path $Folder -ChildPath "auto-update-off")
         if ($NoAutoUpdate) {
             $null = Invoke-Tools $InstalledToolsPath @("auto-update", "off")
@@ -684,7 +743,12 @@ function Invoke-Install {
             $Settings += "Automatic updates: off (you turned them off; 'urnet-tools auto-update on' turns them on)"
         }
         elseif ($Version -ne "latest") {
-            $Settings += "Automatic updates: not turned on, since you chose version $Version"
+            if (Test-Path -LiteralPath $UpdateShortcut) {
+                $Settings += "Automatic updates are on, so this moves to the newest release at the next check. To stay on ${ReleaseVersion}, run: urnet-tools auto-update off"
+            }
+            else {
+                $Settings += "Automatic updates: not turned on, since you chose version $Version"
+            }
         }
         elseif (-not (Invoke-Tools $InstalledToolsPath @("auto-update", "on"))) {
             $Settings += "Automatic updates: couldn't be turned on, see the message above"
@@ -714,7 +778,8 @@ function Invoke-Install {
         if ($AutoStart) {
             # Also rewrites a shortcut an older installer made.
             if (Invoke-Tools $InstalledToolsPath @("auto-start", "on")) {
-                if ($SignedIn -and -not $NoStart -and (Get-ProviderProcess $Folder).Count -eq 0) {
+                # Updates (non-interactive) don't start a provider the person stopped.
+                if ($SignedIn -and -not $NoStart -and ($AddToStartup -or -not $NonInteractive) -and (Get-ProviderProcess $Folder).Count -eq 0) {
                     $null = Invoke-Tools $InstalledToolsPath @("start")
                 }
             }
@@ -725,8 +790,17 @@ function Invoke-Install {
     # policy blocks; the .cmd next to it always works.
     $Tools = "urnet-tools"
     if ($OnWindows) {
-        $Policy = "$(Get-ExecutionPolicy)"
-        if ($Policy -eq "Restricted" -or $Policy -eq "AllSigned" -or $Policy -eq "Undefined") {
+        # The policy a new window gets, so not this process's own (often
+        # Bypass from the command line). Unset everywhere means Restricted.
+        $Policy = "Restricted"
+        foreach ($Scope in @("MachinePolicy", "UserPolicy", "CurrentUser", "LocalMachine")) {
+            $ScopePolicy = "$(Get-ExecutionPolicy -Scope $Scope)"
+            if ($ScopePolicy -ne "Undefined") {
+                $Policy = $ScopePolicy
+                break
+            }
+        }
+        if ($Policy -eq "Restricted" -or $Policy -eq "AllSigned") {
             $Tools = "urnet-tools.cmd"
         }
     }

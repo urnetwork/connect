@@ -85,7 +85,6 @@ param(
     [ValidateSet("uninstall", "update", "start", "stop", "restart", "status", "logs", "version", "reinstall", "help", "auto-update", "auto-start", "auto-update-enable", "auto-update-disable", "auto-update-freq", "auto-start-enable", "auto-start-disable")]
     [String]$Command,
     [Parameter(Position = 1)]
-    [ValidateSet("", "on", "off", "status")]
     [String]$Value = "",
     [String]$Interval = "",
     [Alias("t", "Tag")]
@@ -94,10 +93,46 @@ param(
     [Switch]$RemoveIdentity = $false,
     [Switch]$Yes = $false,
     [Switch]$Help = $false,
-    [String]$InstalledPath = ""
+    [String]$InstalledPath = "",
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [String[]]$Rest = @()
 );
 
 $ErrorActionPreference = "Stop"
+
+# Linux-style options work too (--remove-identity, --yes, --tag X,
+# --interval=X), so the same instructions fit every platform.
+$Words = @(@($Value) + @($Rest) | Where-Object { $_ -ne "" -and $null -ne $_ })
+$Value = ""
+for ($Index = 0; $Index -lt $Words.Count; $Index++) {
+    $Word = $Words[$Index]
+    $Next = ""
+    if ($Index + 1 -lt $Words.Count) {
+        $Next = $Words[$Index + 1]
+    }
+    switch -regex ($Word) {
+        '^(on|off|status)$' { $Value = $Word; break }
+        '^--(remove-identity|purge)$' { $RemoveIdentity = $true; break }
+        '^--yes$' { $Yes = $true; break }
+        '^--(tag|interval)=(.+)$' {
+            if ($Matches[1] -eq "tag") { $Version = $Matches[2] } else { $Interval = $Matches[2] }
+            break
+        }
+        '^--(tag|interval)$' {
+            if (-not $Next) {
+                Write-Host "$Word needs a value"
+                exit 1
+            }
+            if ($Word -eq "--tag") { $Version = $Next } else { $Interval = $Next }
+            $Index++
+            break
+        }
+        default {
+            Write-Host "Unknown option '$Word'. See: urnet-tools help"
+            exit 1
+        }
+    }
+}
 
 if ($Help -or $Command -eq "help") {
     Get-Help $PSCommandPath -Detailed
@@ -161,8 +196,16 @@ if ($OnWindows) {
     $AutoUpdateShortcut = Join-Path $StartupPath -ChildPath "urnetwork-update.lnk"
 }
 
+# Get-PowerShellPath is the PowerShell to run child scripts with: this one's
+# edition, never the host program.
 function Get-PowerShellPath {
-    return [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        if ($OnWindows) {
+            return Join-Path $PSHOME -ChildPath "pwsh.exe"
+        }
+        return Join-Path $PSHOME -ChildPath "pwsh"
+    }
+    return Join-Path $PSHOME -ChildPath "powershell.exe"
 }
 
 function Read-TextFile {
@@ -219,12 +262,27 @@ function Get-LatestTag {
     return "$($ReleaseInfo.tag_name)"
 }
 
-# Get-ProviderProcess finds providers started from this install folder.
+# Get-ProviderProcess returns the ids of providers running "provide" from this
+# install folder. Other runs of the same exe ("auth", or the miner's own
+# "provider update", which may be what called urnet-tools) are left alone.
 function Get-ProviderProcess {
     $Prefix = $InstalledPath + [IO.Path]::DirectorySeparatorChar
+    $Provide = '(^|\s)"?provide"?(\s|$)'
+    if ($OnWindows) {
+        try {
+            return @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'urnetwork.exe'" -ErrorAction Stop | Where-Object {
+                $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase) -and
+                ($_.CommandLine -replace '^("[^"]*"|\S+)', '') -match $Provide
+            } | ForEach-Object { [int]$_.ProcessId })
+        }
+        catch {
+            return @()
+        }
+    }
     return @(Get-Process -Name "urnetwork" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)
-    })
+        $_.Path -and $_.Path.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase) -and
+        ($_.CommandLine -replace '^\S+', '') -match $Provide
+    } | ForEach-Object { $_.Id })
 }
 
 function Get-UpdaterProcess {
@@ -290,13 +348,21 @@ function Stop-Provider {
         Write-Host "URnetwork isn't running"
         return
     }
-    $Running | Stop-Process -Force -ErrorAction SilentlyContinue
+    $Running | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
     Write-Host "Stopped URnetwork"
 }
 
 function Stop-Updater {
     foreach ($Process in Get-UpdaterProcess) {
         Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    # If the process list wasn't available, the PID file still names it.
+    $UpdaterPID = 0
+    if ([int]::TryParse((Read-TextFile $UpdaterPIDPath), [ref]$UpdaterPID)) {
+        $Process = Get-Process -Id $UpdaterPID -ErrorAction SilentlyContinue
+        if ($Process -and ($Process.ProcessName -eq "powershell" -or $Process.ProcessName -eq "pwsh")) {
+            Stop-Process -Id $UpdaterPID -Force -ErrorAction SilentlyContinue
+        }
     }
     Remove-Item -LiteralPath $UpdaterPIDPath -Force -ErrorAction SilentlyContinue
 }
@@ -479,7 +545,7 @@ function Invoke-Uninstall {
     $Running = Get-ProviderProcess
     if ($Running.Count -gt 0) {
         Write-Host "Stopping URnetwork"
-        $Running | Stop-Process -Force -ErrorAction SilentlyContinue
+        $Running | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 1
     }
 
@@ -538,6 +604,14 @@ function Invoke-Installer {
     }
     catch {
         throw "Couldn't download the installer ($($_.Exception.Message))"
+    }
+
+    # Run nothing that isn't a complete installer script.
+    $Errors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($TempScriptPath, [ref]$null, [ref]$Errors)
+    if ($Errors.Count -gt 0 -or (Get-Content -LiteralPath $TempScriptPath -Raw) -notmatch "Provider_Install_Win32") {
+        Remove-Item -LiteralPath $TempScriptPath -Force -ErrorAction SilentlyContinue
+        throw "The installer downloaded from $BaseUrl isn't a valid script; nothing was changed"
     }
 
     try {
@@ -675,7 +749,7 @@ function Invoke-Main {
         "status" {
             $Running = Get-ProviderProcess
             if ($Running.Count -gt 0) {
-                Write-Host "Status: running (process $(($Running | ForEach-Object { $_.Id }) -join ', '))"
+                Write-Host "Status: running (process $($Running -join ', '))"
             }
             else {
                 Write-Host "Status: stopped"
