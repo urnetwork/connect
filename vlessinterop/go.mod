@@ -1,6 +1,6 @@
 module github.com/urnetwork/connect/vlessinterop
 
-go 1.26.3
+go 1.27.3
 
 require (
 	github.com/urnetwork/connect v0.0.0
