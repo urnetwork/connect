@@ -110,71 +110,70 @@ func TestPlatformTransportH3DatagramLanesRefuseWithoutWaiting(t *testing.T) {
 // queued behind the same new traffic. Keep the channel bounded, but make its
 // full edge ordinary TCP backpressure rather than application-level loss.
 func TestPlatformTransportH1ReceiveQueueBackpressuresWithoutDropping(t *testing.T) {
-	stats := &PlatformTransportReceiveStats{}
-	transport := &PlatformTransport{receiveStats: stats}
-	receive := make(chan []byte, 1)
-	queued := MessagePoolGet(1)
-	receive <- queued
+	// Initialize the process-wide pool and its collector outside the bubble.
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		stats := &PlatformTransportReceiveStats{}
+		transport := &PlatformTransport{receiveStats: stats}
+		receive := make(chan []byte, 1)
+		queued := MessagePoolGet(1)
+		receive <- queued
 
-	type offerResult struct {
-		open      bool
-		delivered bool
-	}
-	result := make(chan offerResult, 1)
-	started := make(chan struct{})
-	pending := MessagePoolGet(137)
-	if pooled, _ := MessagePoolCheck(pending); !pooled {
-		t.Fatal("pending H1 message is not pool-owned before offer")
-	}
-	go func() {
-		close(started)
-		open, delivered := transport.offerReceive(
-			make(chan struct{}),
-			TransportModeH1,
-			CarrierReliabilityReliable,
-			receive,
-			pending,
-		)
-		result <- offerResult{open: open, delivered: delivered}
-	}()
-	<-started
-	deadline := time.Now().Add(time.Second)
-	for stats.Snapshot().H1.QueueBackpressureMessageCount == 0 &&
-		time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	snapshot := stats.Snapshot()
-	if snapshot.H1.QueueBackpressureMessageCount != 1 ||
-		snapshot.H1.QueueBackpressureByteCount != 137 ||
-		snapshot.H1.QueueDropMessageCount != 0 {
-		t.Fatalf("full H1 route stats = %+v", snapshot.H1)
-	}
-	select {
-	case premature := <-result:
-		t.Fatalf("full H1 route returned instead of applying backpressure: %+v", premature)
-	default:
-	}
+		type offerResult struct {
+			open      bool
+			delivered bool
+		}
+		result := make(chan offerResult, 1)
+		pending := MessagePoolGet(137)
+		if pooled, _ := MessagePoolCheck(pending); !pooled {
+			t.Fatal("pending H1 message is not pool-owned before offer")
+		}
+		go func() {
+			open, delivered := transport.offerReceive(
+				make(chan struct{}),
+				TransportModeH1,
+				CarrierReliabilityReliable,
+				receive,
+				pending,
+			)
+			result <- offerResult{open: open, delivered: delivered}
+		}()
+		// Counters are separate atomics. Observe only once the producer has
+		// completed both updates and is blocked on the full bounded route.
+		synctest.Wait()
+		snapshot := stats.Snapshot()
+		if snapshot.H1.QueueBackpressureMessageCount != 1 ||
+			snapshot.H1.QueueBackpressureByteCount != 137 ||
+			snapshot.H1.QueueDropMessageCount != 0 {
+			t.Fatalf("full H1 route stats = %+v", snapshot.H1)
+		}
+		select {
+		case premature := <-result:
+			t.Fatalf("full H1 route returned instead of applying backpressure: %+v", premature)
+		default:
+		}
 
-	MessagePoolReturn(<-receive)
-	select {
-	case got := <-result:
-		if !got.open || !got.delivered {
-			t.Fatalf("H1 route result = %+v, want open delivered", got)
+		MessagePoolReturn(<-receive)
+		select {
+		case got := <-result:
+			if !got.open || !got.delivered {
+				t.Fatalf("H1 route result = %+v, want open delivered", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("H1 route did not resume after bounded channel space opened")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("H1 route did not resume after bounded channel space opened")
-	}
-	if got := <-receive; &got[0] != &pending[0] {
-		t.Fatal("H1 route changed message ownership while backpressured")
-	} else {
-		if pooled, _ := MessagePoolCheck(got); !pooled {
-			t.Fatal("H1 route returned pool ownership before delivery")
+		if got := <-receive; &got[0] != &pending[0] {
+			t.Fatal("H1 route changed message ownership while backpressured")
+		} else {
+			if pooled, _ := MessagePoolCheck(got); !pooled {
+				t.Fatal("H1 route returned pool ownership before delivery")
+			}
+			MessagePoolReturn(got)
+			if pooled, _ := MessagePoolCheck(got); pooled {
+				t.Fatal("receiver did not return delivered H1 pool ownership")
+			}
 		}
-		MessagePoolReturn(got)
-		if pooled, _ := MessagePoolCheck(got); pooled {
-			t.Fatal("receiver did not return delivered H1 pool ownership")
-		}
-	}
+	})
 }
 
 func TestPlatformTransportH1ReceiveBackpressureCancellationReturns(t *testing.T) {
