@@ -5579,3 +5579,35 @@ The minimal fix is integrated, but expanded race/full correctness and another
 canonical 100-page replay remain pending for that source. These ownership
 measurements are not peak runtime/footprint qualification of either mobile
 profile, nor proof that this defect caused the reported real-device session.
+
+### 2026-10-22 — scoped hosted H1 mobile-profile measurements
+
+Two single-cell WiFi diagnostics used the allowlisted Android device, provider
+mode off, hosted H1, five Wikipedia loads, three Fast.com measurements, and a
+330-second quiet window. These are separate provider-paired runs, not an A/B
+performance comparison or the full physical PERFVAR matrix.
+
+| Profile | Peak Go runtime | Quiet maximum | Fast.com Mbps | Verdict |
+| --- | ---: | ---: | --- | --- |
+| iOS 32 MiB surrogate | 28.54 MiB | 24.41 MiB | 13 / 41 / 10 | Memory passes; median 13 misses 40 Mbps goal |
+| Android 64 MiB | 39.03 MiB | 31.36 MiB | 40 / 84 / 13 | Memory passes; median 40 meets goal |
+
+Both final memory summaries report zero cap breaches. Android teardown peaked
+at 30.12 MiB; its quiet window lasted 332.882 seconds. Its Wikipedia median
+TTFB/load was 126.8/486.1 ms. Source identities, native-input proofs, cleanup,
+and process joins passed. Do not infer a benefit from the larger budget from
+these unpaired samples. Android does not qualify iOS extension `phys_footprint`
+below 50 MiB, and these cells do not qualify the entire dual-profile matrix.
+
+Receipts: `/Volumes/data/urnetwork-scoped-h1-workerdiag-v3.PREP.p0hkU5rH/replay-executor/RECEIPT.json`
+and `/Volumes/data/urnetwork-scoped-h1-workerdiag-v4.PREP.FHYINzAU/replay-executor/RECEIPT.json`.
+
+The separate natural SDK32-admission 100-page host test also passed: 158.69 s,
+100 navigations, zero slow navigations, and all 400 asset operations joined.
+It retained overlapping unfinished assets, the inclusive five-second gate,
+source10/provider0 constructor settings, and unchanged budgets; no packet hole
+or budget redistribution was injected. This is admission-policy evidence,
+not host/mobile peak-memory qualification. Two matched traced 8.75 MiB
+downloads passed, but the earlier independent 30-second partial-body failure
+remains unexplained. Neither extra memory nor a browsing-stall fix is proven
+by these passes. Combined-fix/full-suite requalification remains outstanding.

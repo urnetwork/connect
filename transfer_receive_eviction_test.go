@@ -498,9 +498,7 @@ func TestEvictionNoticeOnReleasedCarrierWakesParkedSource(t *testing.T) {
 			}
 			now, passes := time.Now(), ownerPasses.Load()
 			pending := func() []uint64 {
-				sequence.pendingEvictedMutex.Lock()
-				defer sequence.pendingEvictedMutex.Unlock()
-				return append([]uint64(nil), sequence.pendingEvictedSequence...)
+				return pendingEvictionStateForTest(sequence).numbers
 			}
 			item, first := sequence.resendQueue.GetBySequenceNumber(newestNumber), sequence.resendQueue.PeekFirst()
 			if item == nil || !item.selectiveAcked || first == nil || !first.resendTime.After(now) ||
@@ -579,12 +577,14 @@ func TestEvictionMetadataWakeUsesThePassedOwnerWindow(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		window, other := newSequenceAckWindow(), newSequenceAckWindow()
 		sequence := &SendSequence{resendQueue: newResendQueue(nil, 0)}
+		// The ACK carrier is unknown, but its withdrawal names a real owner.
+		sequence.resendQueue.Add(&sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: 7}, expectsAck: true})
 		if !legacy {
 			sequence.ackWindow = other
 		}
 		for _, evictions := range []*ackEvictionNotice{nil, {}} {
 			sequence.coalesceReceivedAck(window, receiveAckMessage{messageId: NewId(), evictions: evictions})
-			if window.Pending() || len(window.ackNotify) != 0 || len(sequence.pendingEvictedSequence) != 0 {
+			if window.Pending() || len(window.ackNotify) != 0 || len(pendingEvictionStateForTest(sequence).numbers) != 0 {
 				t.Fatal("empty metadata fabricated acknowledgement progress or a wake")
 			}
 		}
@@ -592,7 +592,7 @@ func TestEvictionMetadataWakeUsesThePassedOwnerWindow(t *testing.T) {
 			messageId: NewId(), evictions: &ackEvictionNotice{sequenceNumbers: []uint64{7}},
 		})
 		if len(window.ackNotify) != 1 || len(other.ackNotify) != 0 || window.Pending() ||
-			len(sequence.pendingEvictedSequence) != 1 || sequence.pendingEvictedSequence[0] != 7 {
+			len(pendingEvictionStateForTest(sequence).numbers) != 1 || pendingEvictionStateForTest(sequence).numbers[0] != 7 {
 			t.Fatalf("legacy=%t: unretained-carrier metadata did not wake only the actual ACK owner", legacy)
 		}
 	}
@@ -604,6 +604,9 @@ func TestEvictionMetadataWakeCoalescesWithoutDeliveryCredit(t *testing.T) {
 	window := newSequenceAckWindow()
 	sequence := &SendSequence{resendQueue: newResendQueue(nil, 0)}
 	for _, number := range []uint64{3, 5} {
+		sequence.resendQueue.Add(&sendItem{transferItem: transferItem{messageId: NewId(), sequenceNumber: number}, expectsAck: true})
+	}
+	for _, number := range []uint64{3, 5} {
 		sequence.coalesceReceivedAck(window, receiveAckMessage{
 			messageId: NewId(), evictions: &ackEvictionNotice{sequenceNumbers: []uint64{number}},
 		})
@@ -611,9 +614,10 @@ func TestEvictionMetadataWakeCoalescesWithoutDeliveryCredit(t *testing.T) {
 	if len(window.ackNotify) != 1 || window.Pending() {
 		t.Fatal("metadata burst did not coalesce its wake independently of delivery credit")
 	}
-	pending := sequence.takePendingEvictions()
+	pending := pendingEvictionStateForTest(sequence).numbers
+	sequence.applyPendingEvictions(sequence.takePendingEvictions())
 	if len(pending) != 2 || pending[0] != 3 || pending[1] != 5 ||
-		len(sequence.takePendingEvictions()) != 0 {
+		sequence.takePendingEvictions() != (pendingEvictionBatch{}) {
 		t.Fatal("metadata wake lost state feedback or retained it after owner extraction")
 	}
 }

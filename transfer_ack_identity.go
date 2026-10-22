@@ -1,13 +1,14 @@
 package connect
 
 // One send worker may temporarily remove one retained item while rewriting
-// its frame or recovery order. Keep only its immutable ACK identity under the
-// queue lock: a concurrent ACK must not confuse this interval with retirement.
+// its frame or recovery order. Preserve its immutable ACK identity and move
+// its withdrawal bits under the queue lock; neither custody may disappear.
 // There is no extra map, payload reference or allocation per retained message.
 type sendAckIdentity struct {
-	messageId      Id
-	sequenceNumber uint64
-	active         bool
+	messageId             Id
+	sequenceNumber        uint64
+	active                bool
+	pendingEvictionPhases uint8
 }
 
 func (self *SendSequence) detachResendItem(messageId Id) *sendItem {
@@ -23,7 +24,9 @@ func (self *SendSequence) detachResendItem(messageId Id) *sendItem {
 	}
 	self.detachedAck = sendAckIdentity{
 		messageId: item.messageId, sequenceNumber: item.sequenceNumber, active: true,
+		pendingEvictionPhases: item.pendingEvictionPhases,
 	}
+	item.pendingEvictionPhases = 0
 	return queue.remove(item)
 }
 

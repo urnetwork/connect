@@ -12906,9 +12906,17 @@ func (self *multiClientWindow) resize() {
 				self.log.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 			}
 		} else {
+			publishedTargetSize := len(clients) + len(warnedClients) + addedCount
+			if !fixedDestination {
+				// Deferring discovery delays acquisition, not the active goal.
+				// Readiness and provider ownership remain the actual counts.
+				if _, deferred := self.discoveryExpandDeferral(time.Now()); deferred {
+					publishedTargetSize = max(publishedTargetSize, targetWindowSize+len(warnedClients))
+				}
+			}
 			self.monitor.addWindowExpandEvent(
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
-				len(clients)+len(warnedClients)+addedCount,
+				publishedTargetSize,
 				self.ipv6Available(),
 				inactive,
 			)

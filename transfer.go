@@ -5502,9 +5502,11 @@ type SendBufferSettings struct {
 	// disposition and before the Ack worker advances to another item.
 	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
 	afterAckCoalescedForTest              func(sendSequenceId, uint64)
+	afterEvictionMetadataForTest          func(sendSequenceId)
 	beforeAckWorkerReceiveForTest         func(sendSequenceId)
 	beforeAckWorkerCoalesceForTest        func(sendSequenceId)
 	afterApplyAckSnapshotForTest          func(sendSequenceId)
+	afterTakePendingEvictionsForTest      func(sendSequenceId)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
@@ -5800,9 +5802,11 @@ type SendBuffer struct {
 	afterRunSendSequenceForTest           func(sendSequenceId)
 	afterInitialWriteQueuedForTest        func(sendSequenceId, uint64)
 	afterAckCoalescedForTest              func(sendSequenceId, uint64)
+	afterEvictionMetadataForTest          func(sendSequenceId)
 	beforeAckWorkerReceiveForTest         func(sendSequenceId)
 	beforeAckWorkerCoalesceForTest        func(sendSequenceId)
 	afterApplyAckSnapshotForTest          func(sendSequenceId)
+	afterTakePendingEvictionsForTest      func(sendSequenceId)
 	afterAckSendItemForTest               func(sendSequenceId, uint64)
 	beforeDueResendForTest                func(sendSequenceId, uint64)
 	afterCreateSendGroupCompletionForTest func(sendSequenceId, int)
@@ -5837,9 +5841,11 @@ func NewSendBuffer(ctx context.Context,
 		afterRunSendSequenceForTest:           sendBufferSettings.afterRunSendSequenceForTest,
 		afterInitialWriteQueuedForTest:        sendBufferSettings.afterInitialWriteQueuedForTest,
 		afterAckCoalescedForTest:              sendBufferSettings.afterAckCoalescedForTest,
+		afterEvictionMetadataForTest:          sendBufferSettings.afterEvictionMetadataForTest,
 		beforeAckWorkerReceiveForTest:         sendBufferSettings.beforeAckWorkerReceiveForTest,
 		beforeAckWorkerCoalesceForTest:        sendBufferSettings.beforeAckWorkerCoalesceForTest,
 		afterApplyAckSnapshotForTest:          sendBufferSettings.afterApplyAckSnapshotForTest,
+		afterTakePendingEvictionsForTest:      sendBufferSettings.afterTakePendingEvictionsForTest,
 		afterAckSendItemForTest:               sendBufferSettings.afterAckSendItemForTest,
 		beforeDueResendForTest:                sendBufferSettings.beforeDueResendForTest,
 		afterCreateSendGroupCompletionForTest: sendBufferSettings.afterCreateSendGroupCompletionForTest,
@@ -6906,12 +6912,11 @@ type SendSequence struct {
 	// goroutine, so it is atomic and it retires: a peer that stops advertising
 	// stops being announced to.
 	contractAheadSupported atomic.Bool
-	// Sequence numbers the receiver says it evicted, handed over from the ack
-	// worker for the sequence goroutine to act on. The item state an eviction
-	// changes belongs to the sequence goroutine, so the notice crosses here
-	// under a leaf lock rather than being applied where it arrives.
-	pendingEvictedMutex    sync.Mutex
-	pendingEvictedSequence []uint64
+	// Fixed two-phase cuts; exact-owner markers live in sendItem/detachedAck.
+	// Guarded by resendQueue.stateLock; only Run consumes a cut.
+	pendingEvictionSecondPhase bool
+	pendingEvictionPhases      uint8
+	pendingEvictionInFlight    uint8
 	// laneAcks is the highest acknowledged sequence number per carrier route,
 	// a fixed array scanned linearly since a snapshot has a handful of
 	// routes, reset on a route generation change. It is what lets the
@@ -7902,17 +7907,10 @@ func (self *SendSequence) coalesceReceivedAck(
 			SequenceId: self.sequenceId, MessageId: ack.messageId, Selective: ack.selective,
 		}, nil)
 	}
-	// Before the pending check: an eviction notice rides whatever
-	// acknowledgement is next, which may be one whose own message this sender
-	// has already released.
-	if self.observeEvictions(ack) {
-		// State feedback can ride an already-retired ACK carrier. Wake the
-		// owner without inventing delivery credit for that old message.
-		ackWindow.Wake()
-	}
 	self.observeContractAheadCapability(ack)
 	sequenceNumber, ok := self.retainedAckSequenceNumber(ack.messageId)
 	if !ok {
+		self.publishEvictionFeedback(ackWindow, ack)
 		if ackLineageTraceEnabled && progressObserver != nil {
 			progress.Outcome = "message_not_retained"
 			endTransferProgress(progressObserver, progress, "ack_coalesce_end", false, nil)
@@ -7945,6 +7943,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		sequenceAck.contractMissing = true
 		sequenceAck.missingContractId = ack.missingContractId
 		ackWindow.UpdateContractMissing(sequenceAck)
+		self.publishEvictionFeedback(ackWindow, ack)
 		if ackLineageTraceEnabled && progressObserver != nil {
 			progress.Outcome = "contract_request"
 			endTransferProgress(progressObserver, progress, "ack_coalesce_end", true, nil)
@@ -7962,6 +7961,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		self.publishAckServiceCreditWithTiming(ack.messageId, ack.selective, at, receiverTiming)
 	}
 	ackWindow.Update(sequenceAck)
+	self.publishEvictionFeedback(ackWindow, ack)
 	if ackLineageTraceEnabled && progressObserver != nil {
 		progress.Outcome = "cumulative"
 		if ack.selective {
@@ -8945,6 +8945,7 @@ func (self *SendSequence) Run() {
 		self.ackMutex.Lock()
 		self.ackMutex.Unlock()
 		self.pendingRecovery = nil
+		self.clearPendingEvictions()
 
 		// what callers wrote on the fast path is charged before the contracts
 		// report their final counts, and nothing may be written against a
@@ -9172,6 +9173,11 @@ sendSequenceLoop:
 			}
 		}
 
+		// Capture receiver withdrawals before their causally preceding ACKs.
+		evictionBatch := self.takePendingEvictions()
+		if self.sendBuffer != nil && self.sendBuffer.afterTakePendingEvictionsForTest != nil {
+			self.sendBuffer.afterTakePendingEvictionsForTest(self.id())
+		}
 		// apply the acks
 		ackSnapshot := ackWindow.Snapshot(true)
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
@@ -9220,7 +9226,7 @@ sendSequenceLoop:
 			return
 		}
 		// before the recovery scans, so an evicted item is due on this pass
-		self.resendEvicted(self.takePendingEvictions())
+		self.applyPendingEvictions(evictionBatch)
 		if flightPolicyChanged {
 			self.scheduleRetiredReliableCarrierRecovery(sendTime)
 		}
@@ -9807,6 +9813,12 @@ sendSequenceLoop:
 		}
 		if deadline, ok := self.retainedSilenceDeadline(); ok {
 			timeout = min(timeout, time.Until(deadline))
+		}
+		// Snapshot may drain a withdrawal's wake after the earlier cut.
+		// Re-enter the ordinary capture-before-snapshot boundary, not a
+		// second eviction apply against the already-consumed ACK snapshot.
+		if self.pendingEvictionsRunnable() {
+			continue sendSequenceLoop
 		}
 		idleTimer.Reset(timeout)
 		select {
@@ -11727,68 +11739,6 @@ func (self *SendSequence) ackCompressionResidence() time.Duration {
 	return defaultAckCompressTimeout
 }
 
-// Resends the items the receiver says it removed from its hold after
-// acknowledging them (THROUGHPUTFIX §37.16).
-//
-// A selective acknowledgement does not release the item. It marks it, pushes
-// its resend time out by SelectiveAckTimeout and returns it to the resend
-// queue, and every resend path skips a marked item: the paced resend, the gap
-// recovery and the carrier-change resend that fires on route death. Only the
-// timeout resend clears the mark, a minute later, by which time the sequence's
-// own ack timeout is due from the same refreshed send time. So an eviction the
-// sender is not told about is a silent withdrawal, and what the failover cell
-// measured past the hold threshold is not extra retransmission but a stalled
-// transfer.
-//
-// Clearing the mark and making the item due now is the whole of the fix. It
-// takes the unbounded path rather than the gap recovery's burst of four per
-// scan, because an eviction generation is as large as what was in flight on a
-// dead route.
-// Hands an eviction notice to the sequence goroutine.
-func (self *SendSequence) observeEvictions(ack receiveAckMessage) bool {
-	if ack.evictions == nil || len(ack.evictions.sequenceNumbers) == 0 {
-		return false
-	}
-	self.pendingEvictedMutex.Lock()
-	defer self.pendingEvictedMutex.Unlock()
-	self.pendingEvictedSequence = append(
-		self.pendingEvictedSequence, ack.evictions.sequenceNumbers...)
-	return true
-}
-
-func (self *SendSequence) takePendingEvictions() []uint64 {
-	self.pendingEvictedMutex.Lock()
-	defer self.pendingEvictedMutex.Unlock()
-	if len(self.pendingEvictedSequence) == 0 {
-		return nil
-	}
-	evicted := self.pendingEvictedSequence
-	self.pendingEvictedSequence = nil
-	return evicted
-}
-
-func (self *SendSequence) resendEvicted(evictedSequenceNumbers []uint64) {
-	if len(evictedSequenceNumbers) == 0 {
-		return
-	}
-	now := time.Now()
-	for _, sequenceNumber := range evictedSequenceNumbers {
-		item := self.resendQueue.GetBySequenceNumber(sequenceNumber)
-		if item == nil || !item.selectiveAcked {
-			// already released, already resent, or never ours
-			continue
-		}
-		removed := self.detachResendItem(item.messageId)
-		if removed != item {
-			panic(errors.New("Missing evicted item"))
-		}
-		item.selectiveAcked = false
-		item.resendTime = now
-		item.recoveryKind = sendRecoveryEviction
-		self.addResendItem(item)
-	}
-}
-
 // The latest hold the receiver advertised, and whether it has advertised one.
 // A peer that never has is legacy, and the window rule holds at the shipping
 // receive hold against it rather than growing to a size it could not take.
@@ -12813,6 +12763,9 @@ func (self *SendSequence) ackItem(item *sendItem) {
 func (self *SendSequence) releaseRetainedSendItems(err error) {
 	self.resendQueue.stateLock.Lock()
 	self.detachedAck = sendAckIdentity{}
+	self.pendingEvictionSecondPhase = false
+	self.pendingEvictionPhases = 0
+	self.pendingEvictionInFlight = 0
 	self.resendQueue.stateLock.Unlock()
 	// A retry can exit while its item is temporarily outside the heap. The
 	// acknowledgement identity list is the authoritative lifetime owner set.
@@ -12872,7 +12825,9 @@ func (self *SendSequence) addResendItem(item *sendItem) {
 	}
 	self.resendQueue.stateLock.Lock()
 	self.resendQueue.add(item)
-	if self.detachedAck.active && self.detachedAck.messageId == item.messageId {
+	if self.detachedAck.active && self.detachedAck.messageId == item.messageId &&
+		self.detachedAck.sequenceNumber == item.sequenceNumber {
+		item.pendingEvictionPhases |= self.detachedAck.pendingEvictionPhases
 		self.detachedAck = sendAckIdentity{}
 	}
 	self.resendQueue.stateLock.Unlock()
@@ -13698,7 +13653,9 @@ type sendItem struct {
 	// below it dropped. Such an item is excluded from lane attribution and
 	// keeps merged's timer (FLIGHTGATEFIX §32.6).
 	carrierChanged bool
-	schedulingKey  sendSchedulingKey
+	// Two captured/current receiver-withdrawal bits, under queue.stateLock.
+	pendingEvictionPhases uint8
+	schedulingKey         sendSchedulingKey
 	// carrierRoute is the route of the newest successful write, any carrier;
 	// acknowledgement progress is reported per route from it (M6 watchdog).
 	carrierRoute Route
