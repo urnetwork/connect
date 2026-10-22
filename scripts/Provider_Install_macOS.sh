@@ -770,7 +770,28 @@ has_identity ()
 # which leaves .provider.jwt in the state folder
 is_registered ()
 {
-    [ -s "$state_dir/.provider.jwt" ]
+    for ir_jwt in "$state_dir/.provider.jwt" "$state_dir"/.provider-*.jwt; do
+        [ -s "$ir_jwt" ] && return 0
+    done
+    return 1
+}
+
+# job_exited LABEL: loaded, not running, and launchd has an exit code for it
+job_exited ()
+{
+    ! job_running "$1" && case "$(job_last_exit "$1")" in [0-9]*|-[0-9]*) true ;; *) false ;; esac
+}
+
+# start_failed: say why the provider stopped right after starting
+start_failed ()
+{
+    warn "$1; the last lines of the log:"
+    tail -n 15 "$log_dir/provider.log" >&2 2>/dev/null
+    if tail -n 30 "$log_dir/provider.log" 2>/dev/null | grep -q startup_recovery_required; then
+        warn "the miner refused this sign-in. Sign in again with a new code from https://ur.io (\`urnetwork auth -f'), then \`urnet-tools start'"
+    else
+        warn "see \`urnet-tools logs' for more"
+    fi
 }
 
 # provide_args: what launchd runs. The released miner registers a new device
@@ -1181,7 +1202,7 @@ start_provider ()
     load_job "$provider_label" "$sp_plist" || return 1
     [ "$dry_run" -eq 1 ] && return 0
     sp_n=0
-    while ! job_running "$provider_label" && [ "$sp_n" -lt 10 ]; do
+    while ! job_running "$provider_label" && ! job_exited "$provider_label" && [ "$sp_n" -lt 10 ]; do
         sleep 1
         sp_n=$((sp_n + 1))
     done
@@ -1195,17 +1216,25 @@ start_provider ()
             sp_n=$((sp_n + 1))
         done
         if ! is_registered && ! job_running "$provider_label"; then
-            warn "registration did not finish; the last lines of the log:"
-            tail -n 15 "$log_dir/provider.log" >&2 2>/dev/null
-            warn "check your sign-in (\`urnetwork auth' with a new code from https://ur.io), then \`urnet-tools start'"
+            start_failed "registration did not finish"
             return 1
         fi
+        if ! is_registered; then
+            say "Registration is still going; \`urnet-tools status' shows when it is done"
+        fi
+    else
+        # a refused sign-in also exits 0 within seconds
+        sp_n=0
+        while job_running "$provider_label" && [ "$sp_n" -lt 5 ]; do
+            sleep 1
+            sp_n=$((sp_n + 1))
+        done
     fi
     if job_running "$provider_label"; then
         say "The provider is running (pid $(job_pid "$provider_label")). Log: $log_dir/provider.log"
         return 0
     fi
-    warn "the provider was loaded but is not running; see \`urnet-tools logs'"
+    start_failed "the provider stopped right after starting"
     return 1
 }
 
@@ -1253,6 +1282,8 @@ do_status ()
     elif job_loaded "$provider_label"; then
         if has_identity && ! is_registered; then
             printf 'Provider:           %snot running%s (device registration did not finish; see %surnet-tools logs%s, then %surnet-tools start%s)\n' "$bold" "$reset" "$bold" "$reset" "$bold" "$reset"
+        elif has_identity && [ "$(job_last_exit "$provider_label")" = 0 ]; then
+            printf 'Provider:           %sstopped%s (it exited; see %surnet-tools logs%s, then %surnet-tools start%s)\n' "$bold" "$reset" "$bold" "$reset" "$bold" "$reset"
         elif has_identity; then
             printf 'Provider:           %snot running%s (last exit code %s; launchd retries every minute, see %surnet-tools logs%s)\n' "$bold" "$reset" "$(job_last_exit "$provider_label")" "$bold" "$reset"
         else

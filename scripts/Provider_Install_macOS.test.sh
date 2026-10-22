@@ -73,7 +73,7 @@ case "$1" in
                 [ -f "$d/$l" ] || exit 113
                 [ "$(cat "$d/$l.domain")" = "${2%/*}" ] || exit 113
                 if [ -f "$d/$l.exited" ]; then
-                    printf '%s = {\n\tstate = not running\n\tlast exit code = 1\n}\n' "$l"
+                    printf '%s = {\n\tstate = not running\n\tlast exit code = %s\n}\n' "$l" "$(cat "$d/$l.exited" 2>/dev/null | grep . || echo 1)"
                 else
                     printf '%s = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n}\n' "$l"
                 fi
@@ -96,10 +96,10 @@ case "$1" in
         echo "$2" > "$d/$l.domain"
         # the provider's first start registers the device, or fails to
         if [ "$l" = com.urnetwork.provider ] && [ -s "$HOME/.urnetwork/jwt" ]; then
-            if [ "${MOCK_REG_FAIL:-0}" = 1 ]; then
-                touch "$d/$l.exited"
+            if [ "${MOCK_REG_FAIL:-0}" = 1 ] || [ "${MOCK_SIGNIN_REFUSED:-0}" = 1 ]; then
+                echo 0 > "$d/$l.exited"
                 echo "startup_recovery_required" >> "$HOME/Library/Logs/urnetwork/provider.log"
-            else
+            elif [ ! -s "$HOME/.urnetwork/.provider.jwt" ]; then
                 echo registered > "$HOME/.urnetwork/.provider.jwt"
             fi
         fi
@@ -222,9 +222,17 @@ run_tests ()
     MOCK_REG_FAIL=1 tools start > "$run_dir/out" 2>&1 && fail "start with a failed registration succeeded"
     grep -q "registration did not finish" "$run_dir/out" || fail "failed registration not reported: $(cat "$run_dir/out")"
     grep -q "startup_recovery_required" "$run_dir/out" || fail "failed registration did not show the log"
+    tools status 2>&1 | grep -q "registration did not finish" || fail "status after a failed registration"
     tools stop > /dev/null 2>&1
     tools start > "$run_dir/out" 2>&1 || fail "start failed: $(cat "$run_dir/out")"
     [ -s "$HOME/.urnetwork/.provider.jwt" ] || fail "start did not register the device"
+    # a registered device whose sign-in the miner refuses (e.g. another account)
+    tools stop > /dev/null 2>&1
+    MOCK_SIGNIN_REFUSED=1 tools start > "$run_dir/out" 2>&1 && fail "start with a refused sign-in succeeded"
+    grep -q "urnetwork auth -f" "$run_dir/out" || fail "refused sign-in gave no hint: $(cat "$run_dir/out")"
+    tools status 2>&1 | grep -q "it exited" || fail "status after an exit 0 promises a retry"
+    tools stop > /dev/null 2>&1
+    tools start > /dev/null 2>&1 || fail "start after a refused sign-in"
     loaded com.urnetwork.provider || fail "provider not loaded by start"
     tools start > "$run_dir/out" 2>&1 || fail "start when running must succeed"
     tools status > "$run_dir/out" 2>&1 || fail "status of a running provider exit $?"
@@ -341,6 +349,19 @@ run_tests ()
     tools status 2>&1 | grep -q "Registered device:  yes" || fail "status does not show registration"
     rm -f "$HOME/.urnetwork/.provider.jwt"
     tools status 2>&1 | grep -q "Registered device:  not yet" || fail "status does not show missing registration"
+    tools service-run > /dev/null 2>&1
+    # a proxy slot's .provider-<hash>.jwt also means registered
+    mv "$HOME/.urnetwork/.provider.jwt" "$HOME/.urnetwork/.provider-abc.jwt"
+    tools service-run > "$run_dir/out" 2>&1
+    grep -q -- "--allow-client-registration" "$run_dir/out" && fail "proxy-slot device got --allow-client-registration"
+    mv "$HOME/.urnetwork/.provider-abc.jwt" "$HOME/.urnetwork/.provider.jwt"
+    # a miner whose help lacks the flag gets plain provide
+    cp "$(install_dir)/bin/urnetwork" "$run_dir/urnetwork.saved"
+    sed 's/ \[--allow-client-registration\]//' "$run_dir/urnetwork.saved" > "$(install_dir)/bin/urnetwork"
+    rm -f "$HOME/.urnetwork/.provider.jwt"
+    tools service-run > "$run_dir/out" 2>&1
+    grep -q -- "--allow-client-registration" "$run_dir/out" && fail "flag passed to a miner that lacks it"
+    cp "$run_dir/urnetwork.saved" "$(install_dir)/bin/urnetwork"
     tools service-run > /dev/null 2>&1
     mv "$HOME/.urnetwork/jwt" "$run_dir/jwt"
     tools service-run > "$run_dir/out" 2>&1 || fail "service-run without identity must exit 0 (no restart loop)"
