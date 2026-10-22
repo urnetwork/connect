@@ -103,7 +103,7 @@ func TestResidentMoveDrainMigratesByName(t *testing.T) {
 	if move.MoveId != nil || 0 < len(move.TargetIps) || !move.CloseTime.IsZero() {
 		t.Fatalf("drain decoded move fields: %+v", move)
 	}
-	if move.moving() {
+	if move.Moving() {
 		t.Fatal("a drain is a move")
 	}
 	plan := PlanResidentMove(
@@ -137,7 +137,7 @@ func TestResidentMoveKeepsOneGlobalTargetPerFamily(t *testing.T) {
 	if !slices.Equal(move.TargetIps, want) {
 		t.Fatalf("targets = %v, want %v", move.TargetIps, want)
 	}
-	if !move.moving() || !move.advisory() {
+	if !move.Moving() || !move.Advisory() {
 		t.Fatal("an advisory move with an id is not a move")
 	}
 	if move.PreferDuration != 6*time.Hour {
@@ -157,11 +157,11 @@ func TestResidentMoveWithoutAValidIdMigratesByName(t *testing.T) {
 		testMoveTargetIpv4,
 	)
 	message.MoveId = []byte{1, 2, 3}
-	if move := NewResidentMove(message); move.MoveId != nil || move.moving() {
+	if move := NewResidentMove(message); move.MoveId != nil || move.Moving() {
 		t.Fatalf("malformed id decoded as a move: %+v", move)
 	}
 	message = testResidentMigrate(protocol.ResidentMoveKind(9), NewId(), testMoveTargetIpv4)
-	if move := NewResidentMove(message); move.moving() {
+	if move := NewResidentMove(message); move.Moving() {
 		t.Fatal("an unknown kind is a move")
 	}
 }

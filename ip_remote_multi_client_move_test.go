@@ -676,7 +676,7 @@ func TestMultiClientChannelPassesTheWholeMoveToAMover(t *testing.T) {
 	}
 	channel.clientReceive(SourceId(ControlId), []*protocol.Frame{frame}, Peer{})
 	move := receiveTestMoveValue(t, mover.moves, "the control move did not reach the mover")
-	if !move.advisory() || !slices.Equal(move.TargetIps, []netip.Addr{testMoveTargetIpv4}) || move.PreferDuration != 6*time.Hour {
+	if !move.Advisory() || !slices.Equal(move.TargetIps, []netip.Addr{testMoveTargetIpv4}) || move.PreferDuration != 6*time.Hour {
 		t.Fatalf("mover received %+v", move)
 	}
 	select {

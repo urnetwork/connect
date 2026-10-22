@@ -145,7 +145,7 @@ func NewResidentMove(message *protocol.ResidentMigrate) *ResidentMove {
 // Whether the frame is a move that names targets: an advisory or compulsory
 // move with an id. Everything else, including a kind this build does not know,
 // migrates by name.
-func (self *ResidentMove) moving() bool {
+func (self *ResidentMove) Moving() bool {
 	if self == nil || self.MoveId == nil {
 		return false
 	}
@@ -158,8 +158,9 @@ func (self *ResidentMove) moving() bool {
 	}
 }
 
-func (self *ResidentMove) advisory() bool {
-	return self.moving() && self.Kind == protocol.ResidentMoveKind_ResidentMoveKindAdvisory
+// Whether the frame is an advisory move, which the client may decline.
+func (self *ResidentMove) Advisory() bool {
+	return self.Moving() && self.Kind == protocol.ResidentMoveKind_ResidentMoveKindAdvisory
 }
 
 // What a transport of `ipFamily` may dial: the target of its family for a
@@ -677,14 +678,14 @@ func PlanResidentMove(
 	now time.Time,
 ) *ResidentMovePlan {
 	plan := &ResidentMovePlan{Move: move}
-	if move == nil || settings == nil || !settings.EnableMove || !move.moving() {
+	if move == nil || settings == nil || !settings.EnableMove || !move.Moving() {
 		plan.SameName = true
 		return plan
 	}
 	if tracker == nil {
 		tracker = NewResidentMoveTracker()
 	}
-	advisory := move.advisory()
+	advisory := move.Advisory()
 	eligibleTargetIps := func(ipFamily int) ([]netip.Addr, bool) {
 		targetIps := move.targetIpsForFamily(ipFamily)
 		if !advisory || len(targetIps) == 0 {

@@ -1520,7 +1520,7 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 		self.transportLock.Unlock()
 		return
 	}
-	moving := move.moving() && state.settings != nil && state.settings.EnableMove
+	moving := move.Moving() && state.settings != nil && state.settings.EnableMove
 	var residentMoveTracker *ResidentMoveTracker
 	if moving {
 		residentMoveTracker = state.residentMoveTrackerWithLock()
@@ -1532,7 +1532,7 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 	}
 	if state.initializing || state.migrating {
 		self.transportLock.Unlock()
-		if moving && move.advisory() {
+		if moving && move.Advisory() {
 			declineReport = NewResidentMoveDeclined(
 				*move.MoveId,
 				protocol.ResidentMoveReason_ResidentMoveReasonMoveInProgress,
@@ -1575,7 +1575,7 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 			return true
 		}()
 		if !admitted {
-			if move.advisory() {
+			if move.Advisory() {
 				declineReport = NewResidentMoveDeclined(
 					*move.MoveId,
 					protocol.ResidentMoveReason_ResidentMoveReasonMoveInProgress,
