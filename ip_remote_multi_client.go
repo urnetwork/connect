@@ -292,6 +292,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// half as often per failure down to once per 2.5-5 minutes
 		FixedDestinationRetryMin: 15 * time.Second,
 		FixedDestinationRetryMax: 5 * time.Minute,
+		// a discovery window whose expansion admits nothing expands again
+		// after 5-10s, then half as often per such pass down to once per 1-2
+		// minutes
+		DiscoveryExpandRetryMin: 10 * time.Second,
+		DiscoveryExpandRetryMax: 2 * time.Minute,
+		// a network change ends a deferral within a second
+		DiscoveryExpandDeferralPollTimeout: time.Second,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout: 20 * time.Second,
@@ -863,6 +870,18 @@ type MultiClientSettings struct {
 	// ip_remote_multi_client_fixed_retry.go. Nonpositive Min disables pacing.
 	FixedDestinationRetryMin time.Duration
 	FixedDestinationRetryMax time.Duration
+	// DiscoveryExpandRetryMin / Max pace the expansion of a discovery window
+	// after consecutive passes that admitted no candidate, doubling from Min
+	// to Max with jitter; an admission or a network change ends the pacing.
+	// See ip_remote_multi_client_discovery_retry.go. Nonpositive Min disables
+	// pacing.
+	DiscoveryExpandRetryMin time.Duration
+	DiscoveryExpandRetryMax time.Duration
+	// DiscoveryExpandDeferralPollTimeout is how often a deferred discovery
+	// window's enumerator rechecks its deferral, so that a network change,
+	// which ends the deferral without a signal of its own, is noticed within
+	// this interval. Nonpositive rechecks only when the deferral ends.
+	DiscoveryExpandDeferralPollTimeout time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -11218,6 +11237,10 @@ type multiClientWindow struct {
 	// Re-dial pacing of a fixed window's failed destinations. Guarded by
 	// stateLock. See ip_remote_multi_client_fixed_retry.go.
 	fixedRetries map[MultiHopId]*fixedDestinationRetry
+	// Expansion pacing of a discovery window after passes that admitted
+	// nothing. Guarded by stateLock. See
+	// ip_remote_multi_client_discovery_retry.go.
+	discoveryRetry discoveryExpandRetry
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -11949,6 +11972,14 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// before the platform call, so a change during it ends the retry wait
 		networkChanged := self.networkChangeNotify()
 
+		// A discovery window waiting out its expansion backoff lists and
+		// mints nothing: an identity minted now would expire unused before
+		// the next expansion and be replaced, a registration and a retirement
+		// per window every WindowExpandArgsTimeout.
+		if !self.waitDiscoveryExpandDeferral() {
+			return
+		}
+
 		// exclude healthy destinations that are already in the window
 		windowDestinations := func() map[MultiHopId]bool {
 			self.stateLock.Lock()
@@ -12106,14 +12137,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
 					}
-					select {
-					case <-self.ctx.Done():
-						self.generator.RemoveClientArgs(clientArgs)
-						return
-					case self.clientChannelArgs <- args:
-					case <-time.After(timeout):
-						// destination expired
-						self.log.Infof("[multi]create client args expired\n")
+					if !self.offerClientArgs(args, time.Now().Add(timeout)) {
+						select {
+						case <-self.ctx.Done():
+						default:
+							// destination expired
+							self.log.Infof("[multi]create client args expired\n")
+						}
 						self.generator.RemoveClientArgs(clientArgs)
 						return
 					}
@@ -12808,13 +12838,19 @@ func (self *multiClientWindow) resize() {
 
 		addedCount := 0
 		// A fixed window whose every missing destination is waiting out its
-		// re-dial backoff mints nothing this pass. Health, rotation and
+		// re-dial backoff mints nothing this pass, and neither does a
+		// discovery window whose last expansions admitted nothing (see
+		// ip_remote_multi_client_discovery_retry.go). Health, rotation and
 		// collapse above keep their cadence; the wait below ends with the
 		// first deferral.
 		var redialTime time.Time
 		redialDeferred := false
-		if fixedDestination && len(clients) < targetWindowSize {
-			redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
+		if len(clients) < targetWindowSize {
+			if fixedDestination {
+				redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
+			} else {
+				redialTime, redialDeferred = self.discoveryExpandDeferral(time.Now())
+			}
 		}
 		if len(clients) < targetWindowSize && !redialDeferred {
 			// expand
@@ -12839,6 +12875,13 @@ func (self *multiClientWindow) resize() {
 				neededCount,
 				ipv6Shortfall,
 			)
+			if !fixedDestination {
+				if 0 < addedCount {
+					self.noteDiscoveryExpandAdmitted()
+				} else {
+					self.noteDiscoveryExpandUnproductive(time.Now())
+				}
+			}
 			if self.log.V(1).Enabled() {
 				self.log.Infof(
 					"[multi]window expand +%d needed=%d %d->%d (+%d)\n",
