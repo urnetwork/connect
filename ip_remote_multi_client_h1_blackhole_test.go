@@ -92,11 +92,12 @@ func TestH1DashBlackholeQuarantineResetsAndRebinds(t *testing.T) {
 	segment := bindH1MediaFlow(parent, failed, cnnDashPath(44002, "198.51.100.21"), affinityKey, now)
 
 	manifestAddress := netip.MustParseAddr("198.51.100.20")
-	parent.dnsExitHints[affinityName] = dnsExitHint{client: failed, affinityName: affinityName, createTime: now}
-	parent.dnsAddressExitHints[manifestAddress] = dnsExitHint{client: failed, affinityName: affinityName, createTime: now}
+	stampDonorReceived(failed)
+	if !parent.bindDnsResultToExit(manifest.ipPath, affinityName, []netip.Addr{manifestAddress}) {
+		t.Fatal("failed-provider setup did not publish its actual DNS selection")
+	}
 	parent.appPinClients = map[string]*multiClientChannel{"cnn-app": failed}
 
-	stampDonorReceived(failed)
 	failed.setQuarantined(blackholeNoReceiveAck)
 	rebound, _, remaining := parent.migrateClientFlows(failed, "bench")
 	if rebound != 0 {
@@ -150,19 +151,41 @@ func TestH1DashBlackholeQuarantineResetsAndRebinds(t *testing.T) {
 		t.Fatalf("affinity invalidations = %d, want site+name+address+app", metrics.QuarantineAffinityInvalidations)
 	}
 
-	// A fresh resolver result arrives over the healthy provider. The browser's
-	// retry must inherit that provider, never the quarantined donor retained by
-	// the old flow generation.
+	// A healthy-looking legacy hint cannot place a new flow without the
+	// original selection receipt, even after all failed-exit state is gone.
 	retryAddress := netip.MustParseAddr("198.51.100.22")
 	parent.dnsExitHints[affinityName] = dnsExitHint{client: healthy, affinityName: affinityName, createTime: time.Now()}
 	parent.dnsAddressExitHints[retryAddress] = dnsExitHint{client: healthy, affinityName: affinityName, createTime: time.Now()}
 	retryPath := cnnDashPath(44003, retryAddress.String())
+	legacyRetry := newMultiClientChannelUpdate(ctx, retryPath)
+	defer legacyRetry.Close()
+	parent.stateLock.Lock()
+	legacyBound := parent.inheritDnsExitHintWithLock(legacyRetry, retryPath, []*IpPath{{ServerName: affinityName}})
+	parent.stateLock.Unlock()
+	if legacyBound || legacyRetry.client.Load() != nil {
+		t.Fatal("healthy-looking DNS hint without selection provenance bound a new flow")
+	}
+
+	// Publish the real healthy resolver flow before creating the browser retry.
+	// Both DNS indexes and the new flow must retain that exact selection.
+	resolverPath := cnnDashPath(44004, "192.0.2.53")
+	resolverAffinityKey := (&IpPath{ServerName: "resolver.health.example"}).ToIp4Path()
+	resolver := bindH1MediaFlow(parent, healthy, resolverPath, resolverAffinityKey, time.Now())
+	defer resolver.Close()
+	stampDonorReceived(healthy)
+	if !parent.bindDnsResultToExit(resolverPath, affinityName, []netip.Addr{retryAddress}) {
+		t.Fatal("healthy resolver did not publish its actual DNS selection")
+	}
+	selection := resolver.client.loadSelection()
+	if selection == nil || parent.dnsExitHints[affinityName].selection != selection || parent.dnsAddressExitHints[retryAddress].selection != selection {
+		t.Fatal("DNS publication did not retain the exact healthy resolver provenance")
+	}
 	retry := newMultiClientChannelUpdate(ctx, retryPath)
 	defer retry.Close()
 	parent.stateLock.Lock()
 	bound := parent.inheritDnsExitHintWithLock(retry, retryPath, []*IpPath{{ServerName: affinityName}})
 	parent.stateLock.Unlock()
-	if !bound || retry.client.Load() != healthy {
+	if !bound || retry.client.Load() != healthy || retry.client.loadSelection() != selection {
 		t.Fatal("CNN retry did not bind to the healthy resolver exit")
 	}
 }

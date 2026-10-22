@@ -49,6 +49,8 @@ type multiH1ResidenceFixture struct {
 	firstAck               atomic.Bool
 	predecessors, requests atomic.Uint64
 	pings                  atomic.Uint64
+	probesStarted          atomic.Uint64
+	probesTerminal         atomic.Uint64
 	requestAt              atomic.Int64
 	requestFailureAt       atomic.Int64
 }
@@ -70,6 +72,13 @@ func newMultiH1ResidenceFixture(t *testing.T, certificate tls.Certificate, lifet
 	}
 	f.settingsA, f.settingsB = settings(lifetime), settings(time.Minute)
 	f.settingsA.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+		if event.MessageType == protocol.MessageType_IpIpPing {
+			if event.Phase == SendPackLifecyclePhaseStarted {
+				f.probesStarted.Add(1)
+			} else if event.Phase == SendPackLifecyclePhaseTerminal {
+				f.probesTerminal.Add(1)
+			}
+		}
 		if event.Phase == SendPackLifecyclePhaseTerminal && event.MessageType == protocol.MessageType_IpIpPacketToProvider && event.Err != nil {
 			f.requestFailureAt.CompareAndSwap(0, time.Now().UnixNano())
 		}
@@ -234,6 +243,9 @@ func (f *multiH1ResidenceFixture) close(t *testing.T) {
 			t.Errorf("join real H1 health client: %v", err)
 		}
 	}
+	if f.probesStarted.Load() != f.probesTerminal.Load() {
+		t.Errorf("retired H1 health probe still owns a callback: started=%d terminal=%d", f.probesStarted.Load(), f.probesTerminal.Load())
+	}
 	for _, c := range f.carriers {
 		for _, route := range c.routes {
 			for len(route) > 0 {
@@ -342,8 +354,9 @@ func TestMultiClientH1ResidenceCumulativeAckOracle(t *testing.T) {
 // Pin the exact captured predecessor progress, rather than treating it as an
 // end-to-end receipt for the still-held request. The 34.369973417s classifier
 // eligibility is not an execution timestamp: the real 1.25s poll owns that.
-// BusyProbe remains enabled and sends real IpPing Packs. Its fixed-single-exit
-// sibling gate, not a synthetic probe ACK, holds the early 3s watchdog verdict.
+// BusyProbe remains enabled and admits one real IpPing Pack. Its unresolved
+// callback holds the early watchdog before the single-exit sibling gate; local
+// H1 serialization is not a remote verdict or a synthetic probe ACK.
 func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 	certificate := h1TLSResidenceCertificate(t)
 	const predecessorAt = 4369973417 * time.Nanosecond
@@ -453,11 +466,24 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					t.Fatalf("predecessor ACK did not restart only outstanding-send liveness: stats=%+v err=%v", stats, err)
 				}
 				advance(replacementAt - time.Nanosecond)
+				heldProbe, heldCallback := func() (*busyProbeAttempt, bool) {
+					channel.stateLock.Lock()
+					defer channel.stateLock.Unlock()
+					probe := channel.busyProbe
+					return probe, probe != nil && !probe.completed && !probe.waiting && !channel.busyProbeOutstanding
+				}()
 				if channel.IsDone() || !channel.hasActiveTransport() || channel.hasActiveUnreliableSendTransport() ||
-					!channel.busyProbeAckTime.IsZero() || len(f.log.linesWith("no receiving sibling: uplink unproven")) == 0 {
-					t.Fatal("early watchdog was not held by the actual single-exit sibling gate")
+					!channel.busyProbeAckTime.IsZero() || !heldCallback || f.probesStarted.Load() != 1 ||
+					f.probesTerminal.Load() != 0 || f.pings.Load() != 0 || len(f.log.linesWith("callback retained")) == 0 {
+					t.Fatalf("early watchdog lost actual unresolved probe custody: held=%t started=%d terminal=%d peer_pings=%d logs=%q", heldCallback, f.probesStarted.Load(), f.probesTerminal.Load(), f.pings.Load(), f.log.lines())
 				}
 				advance(replacementAt)
+				channel.stateLock.Lock()
+				sameProbe := channel.busyProbe == heldProbe
+				channel.stateLock.Unlock()
+				if !sameProbe || f.probesStarted.Load() != 1 {
+					t.Fatal("repeated watchdog evaluation replaced the one unresolved probe owner")
+				}
 				if tc.replace {
 					// Experimental routing action only: one new framed TLS stream,
 					// same clients/provider/Transfer sequence. This is not the

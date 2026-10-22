@@ -489,9 +489,11 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout:         300 * time.Second,
-		ReturnQueueBudget:   NewTransferMemoryBudget(returnBudget),
-		ReturnResendTimeout: time.Second,
+		ReadTimeout:             300 * time.Second,
+		ReturnQueueBudget:       NewTransferMemoryBudget(returnBudget),
+		ReturnResendTimeout:     time.Second,
+		ReturnPersistTimeout:    time.Second,
+		ReturnPersistMaxTimeout: 30 * time.Second,
 		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
 		// write pipeline re-arms it on partial progress). A closed window on
 		// the tunnel side legitimately parks the whole pipeline — the device's
@@ -4065,6 +4067,12 @@ type TcpBufferSettings struct {
 	ReturnQueueBudget       *TransferMemoryBudget
 	ReturnQueueMaxByteCount ByteCount
 	ReturnResendTimeout     time.Duration
+	// A socket reader with unsent bytes probes an ACKed zero window after
+	// this interval. Non-positive disables persist; no idle flow is probed.
+	ReturnPersistTimeout time.Duration
+	// Exponential persist backoff cap. A value at or below the initial
+	// interval keeps that interval fixed. Independent of data retry timing.
+	ReturnPersistMaxTimeout time.Duration
 
 	// nil resolves to the local user nat `Log`
 	Log Logger
@@ -5022,6 +5030,7 @@ type TcpSequence struct {
 	returnRecoveryEnd    uint32
 	returnRecoveryActive bool
 	returnRecoveryReady  bool
+	returnPersistPending bool
 	returnWake           chan struct{}
 	returnCapacity       chan struct{}
 
@@ -5983,6 +5992,11 @@ func (self *TcpSequence) Run() {
 							if self.log.V(2).Enabled() {
 								self.log.Infof("[f%d]tcp receive window wait\n", forwardIter)
 							}
+							if self.receiveWindowSize == 0 && self.receiveSeqAck == self.receiveSeq &&
+								self.returnHead == len(self.returnChunks) && !self.returnPersistPending {
+								self.returnPersistPending = true
+								self.signalReturnRecoveryWithLock()
+							}
 							receiveAckCond.Wait()
 						}
 					}()
@@ -6773,6 +6787,9 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 			self.receiveSeqAck = receiveSeqAck
 			self.receiveWindowSize = receiveWindowSize
 			receiveAckUpdated = true
+		}
+		if receiveWindowSize > 0 {
+			self.returnPersistPending = false
 		}
 	}
 

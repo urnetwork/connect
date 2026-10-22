@@ -171,12 +171,27 @@ func (self *groupDispositionQueueFixture) offer(templates ...[]byte) int {
 
 // Uses the public timeout unchanged, including indefinite caller backpressure.
 func (self *groupDispositionQueueFixture) offerTimeout(timeout time.Duration, templates ...[]byte) int {
+	return self.offerTimeoutWithResults(timeout, nil, templates...)
+}
+
+// Keeps the public per-input receipt independent from later source writes.
+func (self *groupDispositionQueueFixture) offerWithResults(templates ...[]byte) (int, []bool) {
+	accepted := make([]bool, len(templates))
+	count := self.offerTimeoutWithResults(0, accepted, templates...)
+	return count, accepted
+}
+
+// Both public batch entries consume every original, including refusals.
+func (self *groupDispositionQueueFixture) offerTimeoutWithResults(timeout time.Duration, accepted []bool, templates ...[]byte) int {
 	packets := make([][]byte, len(templates))
 	for index, template := range templates {
 		packets[index] = MessagePoolCopy(template)
 		self.witnesses = append(self.witnesses, MessagePoolShareReadOnly(packets[index]))
 	}
-	return self.parent.SendPacketBatch(self.source, protocol.ProvideMode_Network, packets, timeout)
+	if accepted == nil {
+		return self.parent.SendPacketBatch(self.source, protocol.ProvideMode_Network, packets, timeout)
+	}
+	return self.parent.SendPacketBatchWithResults(self.source, protocol.ProvideMode_Network, packets, timeout, accepted)
 }
 
 // Quiescence proves the barrier was reached, rather than waiting for a timer
@@ -968,8 +983,8 @@ func TestTcpGroupRecoverySecondReservationLossKeepsAckedPrefix(t *testing.T) {
 	})
 }
 
-// An identical SYN inside a progressing group is not a generation reset.
-// Its retained data prefix must survive before and after the source ACK.
+// A separately split identical SYN is redundant, not a generation reset.
+// Its accepted data prefix must survive before and after the source ACK.
 func TestTcpGroupRecoveryDataBeforeSameSynKeepsRetainedPrefix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -984,13 +999,45 @@ func TestTcpGroupRecoveryDataBeforeSameSynKeepsRetainedPrefix(t *testing.T) {
 		epoch := f.update.sequenceAdmissionEpoch
 		f.update.receivedInbound.Store(true)
 		data := groupRecoveryPacket(501, 500, 64, tcpFlagAck, make([]byte, 99))
-		if f.offer(data, syn) != 2 {
-			t.Fatal("new data with same-SYN control refused")
+		beforeDrops := f.parent.TcpCollapseDropCount()
+		if count, accepted := f.offerWithResults(data, syn); count != 1 || !accepted[0] || accepted[1] {
+			t.Fatal("split same-SYN receipt lost data admission or admitted the redundant SYN")
 		}
-		f.acknowledgeAll(data, syn)
+		f.acknowledgeAll(data)
 		if f.update.sequenceAdmissionEpoch != epoch || !f.update.receivedInbound.Load() ||
+			f.parent.TcpCollapseDropCount() != beforeDrops+1 || f.started.Load() != 2 || f.terminal.Load() != 2 ||
 			f.offer(data) != 0 || f.offer(syn) != 0 {
 			t.Fatal("identical SYN reset its cohort or erased the retained data prefix")
+		}
+	})
+}
+
+// A repeated SYN with progressing suffix data shares that suffix's group.
+// Every accepted member still reaches the wire in exact original order.
+func TestTcpGroupRecoverySplitSameSynWithProgressKeepsAcceptedMembers(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newGroupDispositionQueueFixture(t, nil, nil)
+		syn := groupDispositionControlPacket(500, 500, 64, tcpFlagSyn)
+		if f.offer(syn) != 1 {
+			t.Fatal("opening SYN refused")
+		}
+		f.requireParked()
+		f.unpark()
+		f.acknowledgeAll(syn)
+		epoch := f.update.sequenceAdmissionEpoch
+		f.update.receivedInbound.Store(true)
+		prefix := groupRecoveryPacket(501, 500, 64, tcpFlagAck, []byte{1, 2, 3})
+		suffix := groupRecoveryPacket(504, 500, 64, tcpFlagAck, []byte{4, 5, 6})
+		if count, accepted := f.offerWithResults(prefix, syn, suffix); count != 3 ||
+			!accepted[0] || !accepted[1] || !accepted[2] {
+			t.Fatal("progressing split group lost an indexed original's admission")
+		}
+		f.acknowledgeAll(prefix, syn, suffix)
+		if f.update.sequenceAdmissionEpoch != epoch || !f.update.receivedInbound.Load() ||
+			f.started.Load() != 3 || f.terminal.Load() != 3 ||
+			f.offer(prefix) != 0 || f.offer(syn) != 0 || f.offer(suffix) != 0 || len(f.route) != 0 {
+			t.Fatal("same-SYN split lost its cohort, retained prefix, or exact source completion")
 		}
 	})
 }

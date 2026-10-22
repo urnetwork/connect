@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,35 @@ func unboundFlowTcpPath(sourcePort int) *IpPath {
 	path := reraceFlow(4, 0, sourcePort)
 	path.SourceIp = net.IPv4(192, 0, 2, 2).To4()
 	return path
+}
+
+// Silence inference judges one retained healthy owner. Prove that premise
+// with an unrelated real connection; every tested-flow answer stays unchanged.
+// Build the answer policy before publishing any provider callback.
+func newUnboundInferenceHarness(t *testing.T, path *IpPath, specs []reraceExitSpec) *reraceHarness {
+	t.Helper()
+	healthPath := reraceFlow(4, 1, 49111)
+	if len(specs) == 0 || specs[0].name != "a" || reraceSameFlow(path, healthPath) {
+		t.Fatal("unbound inference needs incumbent A and a distinct healthy sibling flow")
+	}
+	specs = slices.Clone(specs)
+	answer := specs[0].answer
+	specs[0].answer = func(candidate *IpPath) reraceAnswer {
+		if reraceSameFlow(candidate, healthPath) {
+			return reraceAccept
+		}
+		if answer != nil {
+			return answer(candidate)
+		}
+		return reraceAccept
+	}
+	harness := newReraceHarness(t, specs, nil)
+	// This helper verifies actual closed buckets, positive send/receive bytes
+	// and both the returned WindowStats and channel's live healthy state.
+	if actual := reraceHealthySibling(t, harness, 4); !reraceSameFlow(actual, healthPath) {
+		t.Fatal("healthy sibling no longer matches the isolated answer policy")
+	}
+	return harness
 }
 
 // Opens a flow on exit a, the only exit of the best tier, which answers
@@ -93,10 +123,10 @@ func unboundBySilenceInference(t *testing.T, harness *reraceHarness, path *IpPat
 func TestSilenceInferenceUnboundFlowAdoptsItsExitsLateSynAck(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
 		path := unboundFlowTcpPath(50100)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
 		unboundBySilenceInference(t, harness, path)
 
 		harness.inject("a", reraceSynAck(path))
@@ -130,10 +160,10 @@ func TestSilenceInferenceUnboundFlowAdoptsItsExitsLateSynAck(t *testing.T) {
 func TestSilenceInferenceUnboundFlowAdoptsItsExitsLateData(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
 		path := unboundFlowTcpPath(50200)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
 		unboundBySilenceInference(t, harness, path)
 
 		segment := reraceTcpPacket(path.Reverse(), tcpFlagAck|tcpFlagPsh, reraceServerIsn+1, path.SequenceNumber+1, []byte("220 server flight"))
@@ -155,10 +185,10 @@ func TestSilenceInferenceUnboundFlowAdoptsItsExitsLateData(t *testing.T) {
 func TestUnboundFlowDropsInboundOfAnotherConnectAttempt(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
 		path := unboundFlowTcpPath(50250)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
 		unboundBySilenceInference(t, harness, path)
 
 		// before the attempt's ISN, and half the sequence space away from it
@@ -185,10 +215,10 @@ func TestUnboundFlowDropsInboundOfAnotherConnectAttempt(t *testing.T) {
 func TestUnboundFlowIsNotAdoptedByAnAckPastWhatItsAttemptSent(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
 		path := unboundFlowTcpPath(50260)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
 		unboundBySilenceInference(t, harness, path)
 
 		for _, ack := range []uint32{path.SequenceNumber + 2, path.SequenceNumber + 1 + 300*1024*1024} {
@@ -218,11 +248,11 @@ func TestUnboundFlowIsNotAdoptedByAnAckPastWhatItsAttemptSent(t *testing.T) {
 func TestUnboundFlowIsAdoptedOnlyByTheExitThatCarriedItsAttempt(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		path := unboundFlowTcpPath(50270)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
 			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
 			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
-		}, nil)
-		path := unboundFlowTcpPath(50270)
+		})
 		refused := unboundBySilenceInference(t, harness, path)
 		if refused[harness.channel("b")] == 0 || 0 < len(harness.exit("b").syns(path)) {
 			t.Fatal("setup: the re-race did not offer exit b the retransmit, refused, before any SYN reached it")
@@ -257,11 +287,11 @@ func TestUnboundFlowIsAdoptedOnlyByTheExitThatCarriedItsAttempt(t *testing.T) {
 func TestAnswerDuringTheSilenceInferenceKeepsTheFlowOnItsExit(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
-		a := harness.channel("a")
 		path := unboundFlowTcpPath(50280)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
+		a := harness.channel("a")
 		start := time.Now()
 		harness.syn(path)
 		harness.sleep(reraceSynSchedule[1])
@@ -392,10 +422,10 @@ func TestFirstAnswerRacingTheSilenceInferenceStaysOnItsExitInABatch(t *testing.T
 func TestDialFailureSignalAfterTheInferenceBarsItsExitsLateAnswer(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
 		path := unboundFlowTcpPath(50290)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
 		unboundBySilenceInference(t, harness, path)
 
 		harness.inject("a", reraceProviderSignal(t, path))
@@ -460,12 +490,12 @@ func reracedOntoSilentExits(t *testing.T, harness *reraceHarness, path *IpPath) 
 func TestCarryingExitsAnswerWinsAReraceOfSilentExits(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		path := unboundFlowTcpPath(50330)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
 			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
 			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
 			{name: "c", tier: 1, answer: reraceAlways(reraceSilent)},
-		}, nil)
-		path := unboundFlowTcpPath(50330)
+		})
 		update := reracedOntoSilentExits(t, harness, path)
 
 		harness.inject("a", reraceSynAck(path))
@@ -499,12 +529,12 @@ func TestCarryingExitsAnswerWinsAReraceOfSilentExits(t *testing.T) {
 func TestSignaledExitsAnswerDoesNotWinAReraceOfSilentExits(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		path := unboundFlowTcpPath(50335)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
 			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
 			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
 			{name: "c", tier: 1, answer: reraceAlways(reraceSilent)},
-		}, nil)
-		path := unboundFlowTcpPath(50335)
+		})
 		update := reracedOntoSilentExits(t, harness, path)
 
 		harness.inject("a", reraceProviderSignal(t, path))
@@ -533,12 +563,12 @@ func TestSignaledExitsAnswerDoesNotWinAReraceOfSilentExits(t *testing.T) {
 func TestReraceRefusedByEveryCandidateEndsForTheExitsLateAnswer(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		path := unboundFlowTcpPath(50295)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
 			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
 			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
 			{name: "c", tier: 1, answer: reraceAlways(reraceSilent)},
-		}, nil)
-		path := unboundFlowTcpPath(50295)
+		})
 		refused := unboundBySilenceInference(t, harness, path)
 		if refused[harness.channel("b")] == 0 || refused[harness.channel("c")] == 0 {
 			t.Fatal("setup: the re-race was not offered to both exits b and c")
@@ -568,11 +598,11 @@ func TestReraceRefusedByEveryCandidateEndsForTheExitsLateAnswer(t *testing.T) {
 func TestFlowAdoptedDuringItsSendStaysOnItsExitsRecord(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		}, nil)
-		a := harness.channel("a")
 		path := unboundFlowTcpPath(50297)
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+			{name: "a", answer: reraceAlways(reraceSilent)},
+		})
+		a := harness.channel("a")
 		start := time.Now()
 		harness.syn(path)
 		harness.sleep(reraceSynSchedule[1])
@@ -619,12 +649,12 @@ func TestNewConnectAttemptAfterAResetIsAdoptedByItsExit(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		path := unboundFlowTcpPath(50298)
-		harness := newReraceHarness(t, []reraceExitSpec{{name: "a", answer: func(syn *IpPath) reraceAnswer {
+		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{{name: "a", answer: func(syn *IpPath) reraceAnswer {
 			if syn.SequenceNumber == path.SequenceNumber {
 				return reraceAccept
 			}
 			return reraceSilent
-		}}}, nil)
+		}}})
 		a := harness.channel("a")
 		if _, _, ok := harness.connect(path); !ok {
 			t.Fatal("setup: the first attempt did not connect")

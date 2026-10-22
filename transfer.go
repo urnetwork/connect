@@ -7905,7 +7905,11 @@ func (self *SendSequence) coalesceReceivedAck(
 	// Before the pending check: an eviction notice rides whatever
 	// acknowledgement is next, which may be one whose own message this sender
 	// has already released.
-	self.observeEvictions(ack)
+	if self.observeEvictions(ack) {
+		// State feedback can ride an already-retired ACK carrier. Wake the
+		// owner without inventing delivery credit for that old message.
+		ackWindow.Wake()
+	}
 	self.observeContractAheadCapability(ack)
 	sequenceNumber, ok := self.retainedAckSequenceNumber(ack.messageId)
 	if !ok {
@@ -11741,14 +11745,15 @@ func (self *SendSequence) ackCompressionResidence() time.Duration {
 // scan, because an eviction generation is as large as what was in flight on a
 // dead route.
 // Hands an eviction notice to the sequence goroutine.
-func (self *SendSequence) observeEvictions(ack receiveAckMessage) {
+func (self *SendSequence) observeEvictions(ack receiveAckMessage) bool {
 	if ack.evictions == nil || len(ack.evictions.sequenceNumbers) == 0 {
-		return
+		return false
 	}
 	self.pendingEvictedMutex.Lock()
 	defer self.pendingEvictedMutex.Unlock()
 	self.pendingEvictedSequence = append(
 		self.pendingEvictedSequence, ack.evictions.sequenceNumbers...)
+	return true
 }
 
 func (self *SendSequence) takePendingEvictions() []uint64 {

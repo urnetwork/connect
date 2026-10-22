@@ -468,7 +468,9 @@ func testTcpGroupRecoverySeparateRaceReset(t *testing.T, sameSyn, refuseOtherSyn
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		firstBudget, secondBudget := NewTransferMemoryBudget(kib(64)), NewTransferMemoryBudget(kib(64))
+		// A data/SYN burst is two public source groups. Fund all four
+		// candidate receipts; local retention refusal has its own 64-KiB root.
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
 		f := newGroupDispositionQueueFixture(t, firstBudget, nil)
 		other := newGroupDispositionQueueFixture(t, secondBudget, func(settings *ClientSettings) {
 			if refuseOtherSyn {
@@ -626,9 +628,9 @@ func TestTcpGroupRecoveryUnwrittenNewSynPromotionKeepsSemanticTail(t *testing.T)
 	})
 }
 
-// Equal group ordinals do not order members. A wholly unwritten group still
-// keeps its final semantic action on the existing race owner until promotion.
-func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
+// Unwritten controls keep their exact source/member order until promotion.
+// A client SYN starts a separate public group; SYN/ACK stays in its raw group.
+func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool, synFlags byte) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -641,7 +643,7 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 		f.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
 			return []*multiClientChannel{f.selected, other.selected}
 		}
-		syn := groupDispositionControlPacket(900, 800, 96, tcpFlagSyn)
+		syn := groupDispositionControlPacket(900, 800, 96, synFlags)
 		rst := groupDispositionControlPacket(901, 900, 128, tcpFlagRst|tcpFlagAck)
 		packets := [][]byte{rst, syn}
 		wantAck, wantWindow := uint32(800), uint16(96)
@@ -649,20 +651,26 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 			packets = [][]byte{syn, rst}
 			wantAck, wantWindow = 900, 128
 		}
-		if f.offer(packets...) != 2 {
+		if count, accepted := f.offerWithResults(packets...); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("mixed control group did not reach public admission")
 		}
 		f.requireParked()
 		other.requireParked()
 		f.unpark()
 		synctest.Wait()
-		if len(f.route) != 0 || f.terminal.Load() != 1 || budget.UsedByteCount() != 0 || f.update.race == nil {
+		groups := int64(1)
+		if !resetLast && synFlags&tcpFlagAck == 0 {
+			groups = 2
+		}
+		if len(f.route) != 0 || f.started.Load() != groups || f.terminal.Load() != groups ||
+			budget.UsedByteCount() != 0 || f.update.race == nil {
 			t.Fatal("unfunded mixed group retained physical ownership or lost its race")
 		}
 		state := f.update.race.clientStates[f.selected]
-		if state.collapseControl.synOrder != state.collapseControl.rstOrder ||
+		if (state.collapseControl.synOrder == state.collapseControl.rstOrder) != (groups == 1) ||
+			groups == 2 && state.collapseControl.synOrder <= state.collapseControl.rstOrder ||
 			state.collapseControl.closed != resetLast {
-			t.Fatal("equal-ordinal semantic state discarded member order")
+			t.Fatal("unwritten semantic state discarded exact source/member order")
 		}
 		f.update.stateLock.Lock()
 		f.update.commitRaceClientWithLock(f.selected)
@@ -679,12 +687,17 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 
 // A final reset remains terminal even after a new SYN in the same raw group.
 func TestTcpGroupRecoveryUnwrittenSynThenResetPromotesClosed(t *testing.T) {
-	testTcpGroupRecoveryUnwrittenMixedControls(t, true)
+	testTcpGroupRecoveryUnwrittenMixedControls(t, true, tcpFlagSyn)
 }
 
-// A final genuine new SYN supersedes the earlier reset in that raw group.
+// A final genuine new SYN supersedes the earlier reset in source order.
 func TestTcpGroupRecoveryUnwrittenResetThenSynPromotesOpen(t *testing.T) {
-	testTcpGroupRecoveryUnwrittenMixedControls(t, false)
+	testTcpGroupRecoveryUnwrittenMixedControls(t, false, tcpFlagSyn)
+}
+
+// Equal group ordinals still preserve a final SYN/ACK's member-order reopen.
+func TestTcpGroupRecoveryUnwrittenResetThenSynAckPromotesOpen(t *testing.T) {
+	testTcpGroupRecoveryUnwrittenMixedControls(t, false, tcpFlagSyn|tcpFlagAck)
 }
 
 // A candidate which refused the RST can win while its later same-SYN group
@@ -696,14 +709,22 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		var receives atomic.Int64
 		var releaseOnce sync.Once
 		unpark := func() { releaseOnce.Do(func() { close(release) }) }
-		firstBudget, secondBudget := NewTransferMemoryBudget(kib(64)), NewTransferMemoryBudget(kib(64))
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
 		f := newGroupDispositionQueueFixture(t, firstBudget, nil)
 		other := newGroupDispositionQueueFixture(t, secondBudget, func(settings *ClientSettings) {
 			settings.SendBufferSettings.SequenceBufferSize = 1
 			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
-				if receives.Add(1) == 2 {
+				if receives.Add(1) == 3 {
 					close(entered)
 					<-release
+				}
+			}
+			settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+				group := target.(*parsedPacketGroup)
+				if len(group.packets) == 1 && len(group.packets[0].payload) == 1 {
+					// Admission counts unwritten work, including dequeued data.
+					// Quiesce its actual write/release before offering split SYN.
+					synctest.Wait()
 				}
 			}
 		})
@@ -727,7 +748,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		}
 		other.unpark()
 		other.acknowledgeAll(syn)
-		if f.offer(data, syn) != 2 {
+		if count, accepted := f.offerWithResults(data, syn); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("progressing same-SYN group did not reach both candidates")
 		}
 		synctest.Wait()
@@ -735,6 +756,20 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		case <-entered:
 		default:
 			t.Fatal("winner's same-SYN group did not pause at its real receive boundary")
+		}
+		pendingSyn := false
+		for group := f.update.sequenceClaims; group != nil; group = group.collapseNext {
+			flags := group.completionFlags.Load()
+			if group.completionClient == other.selected && group.ipPath.Syn &&
+				group.collapseOrder() == 0 && group.collapseSource != nil &&
+				flags&(groupCompletionAdmitted|groupCompletionLinked) == groupCompletionAdmitted|groupCompletionLinked &&
+				flags&(groupCompletionReceived|groupCompletionDequeued|groupCompletionDone|
+					groupCompletionTerminal|groupCompletionAbandoned) == 0 {
+				pendingSyn = true
+			}
+		}
+		if !pendingSyn || other.started.Load() != 4 || other.terminal.Load() != 2 {
+			t.Fatal("winner's split SYN lacked exact admitted raw custody after data write")
 		}
 		f.unpark()
 		f.acknowledgeAll(syn, rst, data, syn)
@@ -758,8 +793,74 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 	})
 }
 
+// A raw candidate's different SYN makes a return to the committed ISN a new
+// cohort. Nil selection must not hide that pending source-owned transition.
+func TestTcpGroupRecoveryPendingRaceSynAbaIsNotSameSyn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var receives atomic.Int64
+		var releaseOnce sync.Once
+		unpark := func() { releaseOnce.Do(func() { close(release) }) }
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
+		f := newGroupDispositionQueueFixture(t, firstBudget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
+				if receives.Add(1) == 2 {
+					close(entered)
+					<-release
+				}
+			}
+		})
+		other := newGroupDispositionQueueFixture(t, secondBudget, nil)
+		t.Cleanup(unpark)
+		syn := groupDispositionControlPacket(100, 500, 64, tcpFlagSyn)
+		middle := groupDispositionControlPacket(900, 700, 64, tcpFlagSyn)
+		if count, accepted := f.offerWithResults(syn); count != 1 || !accepted[0] {
+			t.Fatal("initial SYN did not reach public admission")
+		}
+		f.requireParked()
+		f.unpark()
+		f.acknowledgeAll(syn)
+		if count, accepted := f.offerWithResults(syn); count != 0 || accepted[0] {
+			t.Fatal("same-cohort SYN retransmission bypassed retained suppression")
+		}
+		f.update.client.Store(nil)
+		f.parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+		f.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
+			return []*multiClientChannel{f.selected, other.selected}
+		}
+		if count, accepted := f.offerWithResults(middle); count != 1 || !accepted[0] {
+			t.Fatal("intervening candidate SYN did not reach public admission")
+		}
+		synctest.Wait()
+		select {
+		case <-entered:
+		default:
+			t.Fatal("intervening SYN did not reach its real pre-dequeue barrier")
+		}
+		if count, accepted := f.offerWithResults(syn); count != 1 || !accepted[0] {
+			t.Fatal("pending different-SYN cohort was hidden by nil selection")
+		}
+		unpark()
+		f.acknowledgeAll(middle, syn)
+		other.requireParked()
+		other.unpark()
+		other.acknowledgeAll(middle, syn)
+		f.update.stateLock.Lock()
+		f.update.commitRaceClientWithLock(f.selected)
+		f.update.stateLock.Unlock()
+		f.update.releaseCollapseClaims()
+		if f.update.IsDone() || f.update.synGenerationNumber != 100 || f.offer(syn) != 0 ||
+			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 ||
+			f.started.Load() != f.terminal.Load() || other.started.Load() != other.terminal.Load() {
+			t.Fatal("actual ABA winner lost its final gate or retained source ownership")
+		}
+	})
+}
+
 // A retained return to the old ISN is a real new cohort when an intervening
-// admitted SYN was wholly unwritten. Its exact member index cuts off old proof.
+// admitted SYN was wholly unwritten. The split source boundary cuts old proof.
 func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -767,10 +868,19 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		var releaseOnce sync.Once
 		unpark := func() { releaseOnce.Do(func() { close(release) }) }
 		var reservations atomic.Int64
+		var recording atomic.Bool
+		sourceEntered, sourceRelease := make(chan struct{}), make(chan struct{})
+		var sourceOnce, sourceReleaseOnce sync.Once
+		unparkSource := func() { sourceReleaseOnce.Do(func() { close(sourceRelease) }) }
 		budget := NewTransferMemoryBudget(kib(64))
 		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
+				if recording.Load() {
+					sourceOnce.Do(func() { close(sourceEntered); <-sourceRelease })
+				}
+			}
 			settings.SendBufferSettings.beforeGroupRetainForTest = func() {
-				if reservations.Add(1) == 2 {
+				if recording.Load() && reservations.Add(1) == 2 {
 					budget.SetTotalByteCount(0)
 				}
 			}
@@ -784,9 +894,16 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 			}
 		})
 		t.Cleanup(unpark)
+		t.Cleanup(unparkSource)
 		other := newGroupDispositionQueueFixture(t, nil, nil)
 		syn := groupDispositionControlPacket(100, 500, 64, tcpFlagSyn)
-		f.update.updateSequence(groupRecoveryParsed(t, syn))
+		if f.offer(syn) != 1 {
+			t.Fatal("opening SYN did not reach its real source")
+		}
+		f.requireParked()
+		f.unpark()
+		f.acknowledgeAll(syn)
+		recording.Store(true)
 		f.update.egressFinSeen, f.update.ingressFinSeen = true, true
 		f.update.egressFinSequence, f.update.ingressFinSequence = 130, 600
 		f.update.client.Store(nil)
@@ -797,12 +914,24 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		old := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 10))
 		middle := groupDispositionControlPacket(900, 700, 64, tcpFlagSyn)
 		prefix := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 20))
-		if f.offer(old) != 1 || f.offer(middle) != 1 || f.offer(prefix, syn) != 2 {
+		if f.offer(old) != 1 {
+			t.Fatal("old-cohort prefix did not reach public admission")
+		}
+		synctest.Wait()
+		select {
+		case <-sourceEntered:
+		default:
+			t.Fatal("old-cohort prefix did not reach its real pre-dequeue barrier")
+		}
+		if f.offer(middle) != 1 {
+			t.Fatal("intervening SYN did not reach public admission")
+		}
+		if count, accepted := f.offerWithResults(prefix, syn); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("candidate ABA groups did not all reach successful public admission")
 		}
 		f.requireParked()
 		other.requireParked()
-		f.unpark()
+		unparkSource()
 		synctest.Wait()
 		select {
 		case <-failed:
@@ -815,7 +944,7 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		budget.SetTotalByteCount(kib(64))
 		unpark()
 		f.acknowledgeAll(old, prefix, syn)
-		if reservations.Load() != 3 || f.terminal.Load() != 3 || f.update.race == nil {
+		if reservations.Load() != 4 || f.started.Load() != 5 || f.terminal.Load() != 5 || f.update.race == nil {
 			t.Fatal("final retained A group did not follow the actual unfunded B")
 		}
 		f.update.stateLock.Lock()

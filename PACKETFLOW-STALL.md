@@ -380,21 +380,498 @@ The tracked `server/connect/perfvar` pressure root is now
 `TestFullTunH1NativeRapidBrowsingPressure100Pages`. It preserves the frozen
 four-live-page workload, streaming older assets, 300-second deadline and shared
 2-MiB retained retry budget per endpoint, without private production overlays.
-Its focused compilation and ten small controls passed; the full pressure run
-has not yet qualified the production default-off application-pacing change.
+The pre-sync canonical candidate passed the full pressure workload: 100
+navigations, zero five-second stalls, maximum HTML first byte 2.71711175 s,
+169.473434875 s workload elapsed (175.66 s test). All 400 asset workers and
+server attempts joined; pool roots/bytes drained to zero. Exact fixture cleanup
+passed and source-before/after receipts matched. No private production overlay
+was used. Receipt:
+`/Volumes/data/urnetwork-native100-canonical.PREP.nZ1mNs2a/OUTCOME.json`.
 
-The research root records slow navigations rather than aborting at the first
-one, so a passing Go test alone is insufficient evidence of stall remediation.
-Qualification must inspect the emitted observation for all 100 successful HTML
-requests and zero navigations reaching the existing five-second send-timeout
-threshold, in addition to completion, overlap, ownership and cleanup checks.
-Keep acquisition delay separate from request-written-to-first-byte delay.
-After the unchanged research replay establishes the comparison, pin this
-latency requirement as a regression assertion; do not silently redefine success
-as merely finishing within 300 seconds.
+After that unchanged research replay, the tracked pressure root gained an
+explicit latency assertion: exactly 100 completed navigations, no row at or
+above the existing SDK send-timeout threshold (currently five seconds), and
+present pressure evidence with zero slow navigations. Eight deterministic
+variations pin the inclusive boundary, first/middle/last pages, row and aggregate
+verdicts, incomplete completion and missing evidence. The eleven-root focused
+cohort passes normal and race validation on Go 1.27.3. Keep acquisition delay
+separate from request-written-to-first-byte delay; completion inside 300 seconds
+alone is not success.
 
 The canonical diagnostic campaign is prepared under
 `/Volumes/data/urnetwork-perf-defaultoff-prep.QFE7Ee`. Its A/A configuration can
 validate the candidate and characterize variability, but cannot establish an
 old-versus-new performance improvement. Full correctness, physical memory
 qualification and the final postmortem remain pending.
+
+Checkpoint sync subsequently integrated newer transport/window/SDK changes
+(Connect `8040392a`, Server `46f24c981`, SDK `829f2a92`). The earlier successful
+snapshot is not qualification of this merged source. Its first focused retry
+stopped before fixture construction because the harness required a `toolchain`
+directive removed by the new Go 1.27.3 release policy. Preserve that pre-traffic
+refusal separately from packet-flow failures; repair source selection while
+retaining exact compiler verification before rerunning.
+
+The repaired-selector post-sync replay subsequently passed on Go 1.27.3,
+including the permanent latency assertion: 100 navigations, zero slow/stalled
+rows, maximum HTML first byte 3.094035291 s, workload 179.321613750 s (test
+185.58 s), and 95 overlap proofs. All 400 asset clients/server attempts joined;
+pool roots/bytes drained to zero. The wrapper exited zero after exact fixture
+cleanup and matching source-before/after receipts; no production overlay was
+used. Evidence:
+`/Volumes/data/urnetwork-native100-postmerge-fixed.PREP.vCUWKke0`.
+These two passing source snapshots are not three same-source confirmations or
+full-suite/memory qualification. Broader correctness and PERFVAR remain pending.
+
+The first broader correctness replay stopped in Connect with seven failing
+top-level roots (15 signatures including subcases). SDK, Windows, Proxy and
+Server did not run. The same seven roots fail on the complete pre-pacing
+upstream snapshot `b351f70e`; do not attribute them to the default-off change.
+Terminal evidence and cleanup receipts are preserved at
+`/Volumes/data/urnetwork-pacing-firstfive-terminal.MsXwLjVw`.
+
+The two health fixtures used obsolete setup/assertions: DNS hints lacked the
+immutable selection provenance now required by production, and the residence
+fixture expected a sibling-gate log although an unresolved real probe callback
+now holds the verdict earlier. Test-only repairs use actual DNS publication and
+check exact probe custody, balanced lifecycle and unchanged timing bounds. The
+15-root adjacent cohort passes three fresh processes (normal/race/normal).
+The five group-recovery fixtures are still under review. A proposed pending-SYN
+ABA production bug was disproved through the public retained/ACKed send path;
+its private production candidate is withdrawn, not included in the fix.
+
+A follow-up production call-site audit found no service-wait entry bypassing
+`ApplicationPacing`: the only production call into
+`waitForServiceReservation` is inside that explicit settings gate in
+`SendSequence.writeMaybeWrappedBytes`. The standalone pacer helpers have no
+other production callers. No production constructor in Connect, SDK,
+Server/Connect or Server/Proxy enables `ApplicationPacing`. Route-policy and
+FIFO-repair checks deliberately remain enabled independently; disabling the
+additional scheduling wait must not disable their correctness protections.
+
+The remaining winner-promotion fixture exposed a second setup distinction:
+its one-slot source bound counts admitted-but-unwritten work, not merely items
+still sitting in the channel. Holding the split data item before dequeue did
+not free admission for the separate SYN. A private state/lifecycle trace proved
+that SYN was refused at zero-timeout pack admission before the tested close
+transition. The corrected fixture must let data reach its initial write, then
+hold the genuinely admitted SYN at its own source boundary; it must not treat
+the public batch count as proof of downstream SYN custody.
+With that barrier corrected, all eight focused group roots pass in a fresh
+normal process (0.659 s), including all five original failures and three
+adjacent controls. Expanded race and same-final-source confirmation remain
+required before the next full-suite replay.
+
+The final group cohort subsequently passed all 105 roots in three fresh
+normal/race/normal processes (0.628/2.058/0.618 s), with unchanged final source
+hashes, zero skips and zero production changes. Receipt:
+`/Volumes/data/urnetwork-group-cohort-diagnosis.9EGSfKig/OUTCOME.json`.
+
+The next full correctness attempt stopped in Connect on 17 additional roots:
+six DNS-affinity/dial-health/stall-conviction cases and eleven public TCP
+ACK/reorder-recovery cases. Its first failure is
+`TestBloombergDnsHintSkipsExternallyRejectedDonor`. These new failures are under
+investigation; do not yet classify them as stale fixtures or pacing regressions.
+The source audit reported no changes and no race-log deltas. SDK, Windows,
+Proxy and Server again did not run. Terminal evidence and exact cleanup receipts:
+`/Volumes/data/urnetwork-pacing-firstfive-final-terminal.J281YiCs`.
+All 17 additional roots subsequently reproduced with the same signatures on
+the complete pre-pacing `b351f70e` snapshot. The eleven TCP roots fail while
+admitting the opening SYN, before their recovery/reorder stimulus. Their
+factories construct an unhealthy accounting channel; a healthy-only setup
+discriminator is being checked without disabling affinity or safety guards.
+The six health roots also remain under repair; reproducing them upstream does
+not by itself prove that each failed assertion is obsolete.
+The TCP discriminator then passed all eleven unchanged roots (0.597 s) with
+only `healthy=true` added to each of their two fixture factories. It did not
+disable affinity, collapse prevention, ACK handling or memory accounting.
+Negative eligibility controls and expanded normal/race confirmation are still
+required for the final test-only repair.
+
+### Additional retry-path regression exposed by realistic fixture health
+
+With real closed traffic buckets proving a healthy incumbent, the updated
+eight-root health cohort exposes one production failure: the silent-provider
+connection completes on SYN 4 at seven seconds instead of SYN 3 at three
+seconds. The other seven roots pass, with balanced pool ownership. OLD evidence:
+`/Volumes/data/urnetwork-connect-health-six.wDnTj2da/contract-eight-canonical-red-v2.log`.
+
+The suspected mechanism is separate from application pacing: the group is
+marked as reusing the incumbent before silence inference runs. A successful
+inference then unbinds that incumbent, but fresh race copies retain its
+reuse-only flag. The final source-admission check can consequently reject the
+healthy replacement because it is not the old selected exit. A narrowly scoped
+private correction is under validation; no canonical production change has
+been applied for this finding yet. Do not attribute the original user session
+or the whole 100-page stall to this additional defect without measurement.
+
+The private final-boundary trace confirms `affinitySynReuse=true` while the
+selection is nil on both three-second replacement attempts. A private patch
+clearing that flag only when `clientDialFailure` successfully unbinds the
+incumbent passes the same eight-root cohort (0.652 s), including the original
+three-second recovery assertion. Normal incumbent reuse still performs its
+final health/age validation. The explicit real-source custody regression and
+expanded race qualification are pending; this private pass is not integration
+or full-suite qualification. Logs and patch:
+`/Volumes/data/urnetwork-connect-health-six.wDnTj2da`.
+
+The explicit `TestDialFailureInferredRetryUsesFreshSourceAdmission` now pins
+the real downstream boundary. With the same final test source, OLD fails at
+three seconds with one inferred rerace and zero replacement Pack starts. The
+private fix passes all nine focused roots (0.603 s), with exactly one real
+ACK-required start, route write and terminal completion at three seconds. While
+its producer is held, the actual provider SYN-ACK remains buffered by the race;
+release commits that same flow owner and delivers the reply without an extra
+application retry. Pool ownership reconciles without leaks or violations.
+
+The three-line correction was then integrated into canonical
+`ip_remote_multi_client.go`; its SHA256 is
+`3d1a8b9d0d8b8f13551741d86ce497a2bf73894c7a729096aa7b9b0751d338b2`,
+identical to the tested private afterimage. It clears only the former
+incumbent's reuse flag after a successful guarded unbind. No read, inference,
+retry or affinity timeout changed. Expanded normal/race, full correctness,
+fresh 100-page replay and PERFVAR qualification remain pending for this new
+production snapshot.
+
+### Latest qualification: a remaining connection-establishment stall
+
+The integrated correction passed the expanded 180-root health cohort in
+normal/race/normal processes; the adjacent TCP cohort passed 181 roots in each
+mode. Complete Connect short coverage also passed (6,854 passes, 95 short-mode
+skips). These are not substitutes for the full browsing latency contract.
+
+The fresh canonical full100 replay on this snapshot **failed** that contract:
+all 100 pages completed, but page 2 first byte took 14.115321459 s. The actual
+tunnel TCP dial consumed 12.408397 s, before HTTP dispatch. There was no DNS or
+TLS in this synthetic inner request. Link drops and Transfer retransmissions
+increased during the interval; handoff waits/drops, blocked ACK writes and
+missing-contract counters did not. Aggregate counters cannot identify the
+delayed SYN/return packet, and established-data TCP counters do not account for
+handshake retransmissions. Do not attribute this new failure to RR12, a pacing
+formula, memory pressure or the original iPhone session without further proof.
+
+The unchanged workload retains 100 pages, four origins/four connections, four
+live pages, seed 4013, 2 MiB per-endpoint retry budgets, its 300 s application
+deadline and the permanent 5 s latency assertion. All 400 client/server asset
+attempts joined; pools drained to zero; source identities, all input pins and
+cleanup passed. Exact retained evidence:
+`/Volumes/data/urnetwork-native100-rr12.PREP.oYf0CDMJ/{OUTCOME,PAYLOAD}.json`.
+A private bounded first-three-page trace of the full workload is being reviewed;
+it is diagnostic instrumentation, not a performance or memory qualification.
+
+The official full correctness replay also found a separately reproduced race
+failure in `TestTheEvictionNoticeStillServesAReceiverThatEvicts`. A helper that
+keeps only the last ACK may hide an earlier notice-bearing carrier; deterministic
+ordering and actual-wire preservation remain to be proved before fixing or
+classifying that failure. The campaign stopped; the other selected suites did
+not run. Evidence and limited bootstrap measurements are recorded in
+`tests/PERFVAR-MEASUREMENTS.md`.
+
+The user additionally reports new-provider establishment difficulty on iOS from
+the previous committed build. The four-root local bootstrap screen passed all
+12 normal/race/normal observations, but uses controlled peers and does not prove
+dynamic provider addition under active traffic or the iOS 32 MiB profile.
+Discovery, registration, shared resource admission, initial real ping ACK and
+first downstream delivery need their own composed qualification. Healthy-only
+affinity adoption must not be confused with fresh-provider probe eligibility.
+
+### Follow-up evidence: carrier recovery and eviction wake (2026-10-21)
+
+The bounded first-three-page trace passed the unchanged full 100-page workload,
+but page 2 reused an existing connection. It therefore did not reproduce or
+resolve the failed fresh dial above. Its 85 prefix queue drops included 46 data
+intervals and 39 pure ACKs; the later cumulative-ACK repair bound of 486.331 ms
+applies to the 46 data intervals only. Receipt:
+`/Volumes/data/urnetwork-native100-first3-trace.9b3eWSqN/OUTCOME.json`.
+
+A separately declared composed witness kept four real old asset bodies active
+(123,904 bytes), required a genuinely new HTML connection, and preserved the
+same seed, link shape, two 2 MiB retry owners and 5 s latency gate. Its no-forced-
+loss and one-forced-segment-loss arms passed at 3.779405 s and 0.799052 s. These
+two observations are diagnostic, not a performance comparison or full100 pass.
+All 36 recorder/fault controls passed normal/race/normal; source pins, owners,
+pools and cleanup reconciled. Evidence:
+`/Volumes/data/urnetwork-native-fresh-html-gap.4PwIqrGZ/NETWORK-OUTCOME.json`.
+
+The no-forced-loss trace locates its delay after admission: the provider wrote
+the SYN-ACK promptly, but device H1 read followed 3.264061 s later. Fourteen
+naturally queue-dropped downlink data intervals formed an adjacent TCP byte gap;
+cumulative ACKs repaired that gap serially and the SYN-ACK became readable
+immediately after the thirteenth repair. Actual ACKs carried a SACK block beyond
+the gap. The encrypted outer-byte-to-inner-message mapping is unavailable;
+the timing supports carrier-level head-of-line delay rather than proving that
+exact byte mapping. It does not yet prove the original 12.4 s dial's cause, an RTO
+defect, or a memory shortage. A single early forced loss did not reproduce it;
+larger, explicitly positioned loss and sender recovery accounting need tests.
+
+A deterministic gVisor test now reproduces a matching recovery defect on
+unchanged production source. A real endpoint sends fourteen 1,000-byte segments
+plus a 258-byte suffix; one actual queued suffix SACK and the production manual-
+clock reorder timer mark all fourteen holes lost. At recovery entry, cwnd is
+10 but pipe remains 15, so only the forced first retransmission is emitted; the
+next expected repair is absent at 125 ms. The direct pipe-accounting control
+also fails (a marked-lost original is still counted), while the pre-deadline
+reordering control passes. All three ran without skips, source drift or retries.
+This proves the TCP accounting defect, not yet its responsibility for the
+original full100 failure or any candidate's performance improvement. Candidate
+checks must also cover retransmitted flight counted once, split lost remainders,
+and new loss while recovery is already active. OLD receipt:
+`/Volumes/data/urnetwork-rack-pipe-old-terminal.QJOden8v/receipt.json`.
+
+The eviction correctness investigation found two distinct defects. The fixture
+discarded all but its last published ACK, losing independent eviction feedback;
+it now preserves each physical carrier where that feedback matters. A further
+production defect queued valid eviction metadata on an already-released ACK
+carrier without waking the parked sender. A deterministic single-tail test
+reached that exact stranded state without advancing virtual time or relying on
+another ACK. The minimal wake fix passed three new and five adjacent roots in
+fresh normal/race/normal processes (24 passes, zero failures/skips). Earlier
+four-tail setup failures are retained, not counted as causal reproduction: normal
+gap recovery had already queued two legitimate writes. The wake fix grants no
+delivery credit and does not fix the separately identified unbounded pending-
+metadata list. After exact integration, the same eight roots also passed
+normal/race/normal without overlays (24 passes; package times
+0.687/2.211/0.591 s), with unchanged source closure and input pins. Full-suite
+and original full100 qualification remain pending.
+Canonical confirmation receipt:
+`/private/tmp/urnetwork-eviction-wake-canonical.cSuSpnJe/OUTCOME.json`.
+
+The low32 SDK provider witness also passed on committed production code and
+current race-enabled code: six distinct carriers, five quality plus one speed,
+real initial ping admission and production NAT delivery, with the incumbent
+flow alive during new-provider setup. This uses local NoContract/EncryptionOff
+peers and is not physical iOS, account/encryption, runtime-memory or shipping-
+binary qualification. Warned quality-owner replacement at the hard window cap
+remains a separate open scenario. Receipt:
+`/Volumes/data/urnetwork-provider-comparison-terminal.0j2ZseoW/receipt.json`.
+
+### TCP recovery candidate: focused verification and unchanged full100 comparison
+
+The private three-hunk RACK candidate refreshes pipe after loss detection,
+excludes known-lost transmissions from pipe, and preserves the lost flag when
+splitting a segment. The available Go TCP package passed 11 roots in normal,
+race, and fresh normal processes (33 passes). This is not the entire upstream
+Bazel TCP suite. Receipt:
+`/Volumes/data/urnetwork-rack-pipe-v2-terminal.bc56h1x5/receipt.json`.
+
+The unchanged full100 workload then ran four fresh processes in A/B/B/A order:
+
+| Arm | Completed / slow | Maximum navigation | Workload elapsed |
+| --- | --- | --- | --- |
+| A1 canonical | 100 / 0 | 2.710 s | 170.077 s |
+| B1 private RACK | 100 / 0 | 3.053 s | 175.837 s |
+| B2 private RACK | 100 / 0 | 3.291 s | 164.053 s |
+| A2 canonical | 100 / 0 | 2.997 s | 169.392 s |
+
+All source and input pins matched across the four arms; all workers joined,
+assets completed, pools drained, and cleanup passed. These four noisy-host
+observations establish neither a speed improvement nor regression safety.
+Both controls passed, so they do not demonstrate elimination of the historical
+14.115-second navigation failure. No baseline promotion or canonical gVisor
+integration follows from this comparison. Receipt:
+`/Volumes/data/urnetwork-native100-rack-abba.PREP.fO9itfR5/ABBA-OUTCOME.json`.
+
+Scope matters: this simulator explicitly uses gVisor TCP for the outer H1
+carrier; shipping H1 normally uses the native dialer. A simulator recovery fix
+is not proof of resolution for the reported native iOS carrier. Actual Tun TCP
+consumers require their own composed qualification.
+
+An adjacent private recovery control failed before its intended observation:
+the expected first retransmission was absent. Execution stopped immediately;
+neither subsequent arm ran. This is an unexpected fixture/setup failure, not
+evidence of the hypothesized retransmission-loss congestion-response defect.
+Receipt:
+`/Volumes/data/urnetwork-rack-safety-v3-terminal.1E7o96z7/receipt.json`.
+
+### Controlled late-gap comparison and corrected safety control
+
+The private late-gap instrumentation passed 16 roots in normal/race/fresh-normal
+(48 passes), including real Tun accept/TCP-info ownership. OLD and candidate
+then each ran a fresh no-forced-gap path and a separate 14-drop path:
+
+| Production | No forced gap, first byte | Verified 14-drop gap, first byte |
+| --- | --- | --- |
+| Canonical TCP | 4.016 s | 0.726 s |
+| Private RACK candidate | 0.830 s | 0.675 s |
+
+Both fault paths proved exactly 14 adjacent original losses before the matching
+SYN-ACK physical read, with no premise flags. All paths were fresh connections
+with four old bodies still active; source/pins and cleanup passed. The injected
+gap starts near 64 KiB, earlier than the naturally observed thin-suffix tail
+loss. It did not reproduce a five-second failure and can change burst shape;
+the single pair is not a causal or statistical improvement qualification.
+Receipt:
+`/Volumes/data/urnetwork-native-late014.PREP.7LCf4E0i/NETWORK-OUTCOME.json`.
+
+The unexpected safety-control failure above was traced to an unprimed initial
+TCP recovery guard. A separately frozen successor sends and acknowledges real
+warm-up data first, without editing sender state or congestion policy. Both
+forced-first controls then passed. Its actual retransmission-loss control
+reached the intended RED: while recovery remained active, a lost replay was
+sent again with 10 repairs, one total congestion response, unchanged cwnd 10
+and ssthresh 7, and no timeout. This establishes an adjacent response gap under
+the private RACK candidate, not the original full100 failure's cause. No CC
+fix is qualified. Receipt:
+`/Volumes/data/urnetwork-rack-safety-v31-terminal.r51MF8i7/receipt.json`.
+
+The unchanged late-gap diagnostic was extended to six fresh processes in
+OLD/FIX/FIX/OLD/OLD/FIX order. No-forced-gap first-byte times were respectively
+4.016/0.830/0.572/0.811/0.635/0.592 s; forced-gap times were
+0.726/0.675/0.947/0.813/0.921/0.833 s. All twelve requests passed five seconds,
+all six forced gaps were valid, and source/pin, ownership and cleanup checks
+passed. The original code's fast repeats are retained: the initial separation
+was not stable, and no statistical speedup or baseline promotion is claimed.
+Combined receipt:
+`/Volumes/data/urnetwork-native-late014-repeat.PREP.BKqoXbQj/SIX-PROCESS-OUTCOME.json`.
+
+Actual trace geometry nevertheless localizes one recovery mechanism. The slow
+OLD control lost 14 adjacent tail originals with a 275-byte surviving SACK
+suffix; repair scheduling stretched to 3.141 s. The first FIX control lost
+15 tail originals with a 130-byte initial suffix, but scheduled its first
+11 repairs together and all 15 by 0.324 s. The matched SYN-ACK's local-write
+to physical-read delay was 3.303 versus 0.348 s. Aggregate edge timeout deltas
+were 7 versus 0; these counters are not per-socket attribution. Natural
+packetization/flight state differed, so this is supporting mechanism evidence,
+not an identical-loss comparison or proof of the original 12.408 s full100
+dial failure. Detailed immutable trace analysis:
+`/Volumes/data/urnetwork-native-late014.PREP.7LCf4E0i/ANALYSIS-014-v1.md`.
+
+The fast OLD repeats had earlier split gaps and larger growing SACK suffixes,
+not the same isolated large tail gap. Do not discard them, or assume every
+small suffix must cause a stall independent of flight/recovery state. Also,
+blindly forcing 14 packets at the historical byte offset can consume the
+surviving suffix when packetization changes, testing a different loss case.
+
+### Integrated RACK accounting correction
+
+After independent source review, the exact three-hunk candidate was integrated
+into the local gVisor checkout, with the same seven deterministic roots in
+`pkg/tcpip/transport/tcp/rack_pipe_test.go`. Production and test hashes match
+the qualified private afterimages. The full available Go TCP package then
+passed without overlays or selectors in normal/race/fresh-normal processes:
+11 roots each, 33 passes, no skips or race reports, unchanged source closure,
+and joined cleanup. Receipt:
+`/Volumes/data/urnetwork-rack-canonical-terminal.7lzC860B/receipt.json`.
+
+This integrates only the flight-accounting/split/owner-refresh correction.
+The separate active-recovery retransmission-loss congestion-response gap is
+still private research, not fixed by these three hunks. Full100 replay,
+broader correctness, and native/device memory-performance qualification remain
+pending; neither the historical full100 dial nor the native iOS symptom is
+declared resolved by this unit result.
+
+The first integrated-code canonical100 replay then passed without an inner
+overlay: all 100 navigations, zero five-second stalls, maximum navigation
+3.324 s, workload 165.428 s. All 400 asset client/server operations joined,
+pooled roots/bytes drained to zero, and source/pin/fixture cleanup checks
+passed. One passing replay is not a statistical/full-PERF or physical mobile
+memory qualification. Receipt:
+`/Volumes/data/urnetwork-native100-integrated-v2.PREP.osCr7DkU/OUTCOME.json`.
+
+A separately frozen private congestion-response candidate now passes the
+unchanged active re-loss root: two real responses, cwnd10→4, ssthresh7→4,
+four actual second repairs, and no repeat cut on the same ACK. Its basic
+state/field-order roundtrip and footprint tests pass; on darwin/arm64, segment
+struct size stays 248 B and sender size grows 856→864 B. This is compiler
+layout, not a heap allocation or physical-device peak measurement. Available
+Go TCP tests also passed 15 roots normal/race/fresh-normal (45 passes), for
+48 total passes including the causal and two basic roots. No source drift,
+skips or race reports; all owners joined. The response candidate remains
+private/unintegrated pending adjacent tests and performance comparison.
+Receipt:
+`/Volumes/data/urnetwork-rack-reloss-v4-terminal.PonpU8wk/receipt.json`.
+
+### Private response candidate: adjacent coverage and four-arm replay
+
+Six additional deterministic roots cover real Reno/Cubic re-loss, old/new
+loss epochs, reorder timers, RTO/TLP entry, clone/wrap/pool metadata, and
+non-RACK behavior. The adjacent cohort plus all available 21 TCP roots in
+normal/race/fresh-normal processes passed 69 tests, with no skips, races or
+source drift. Receipt:
+`/Volumes/data/urnetwork-rack-adjacent-v41-terminal.A8OUKWBp/receipt.json`.
+
+The unchanged canonical100 replay then ran exactly A1/B1/B2/A2, where A is
+integrated flight accounting and B adds only the four frozen private response
+production files. All four completed 100 pages with zero >=5s navigation
+stalls. Maximum full-navigation seconds were 2.878934/2.879816/4.004223/2.875193;
+workload seconds were 164.330/162.892/169.692/180.218. All 400 assets per arm
+joined, pool roots/bytes drained to zero, all eight source snapshots matched,
+and pin/runtime/OS cleanup passed. No retries or extra arms. Receipt:
+`/Volumes/data/urnetwork-native100-v4-abba.PREP.LEacEcHy/ABBA-OUTCOME.json`
+(SHA-256 `8d8a6905ed9252a94d030564b5625929b8966f0a60d8733f66efc14246ef6e28`).
+
+These four noisy-host observations establish neither a statistical speed win
+nor elimination of the historical stall. The private response candidate is
+still NOT integrated: independent source review identified an unexecuted
+counterexample where an ACK crossing the original recovery boundary may
+cause another congestion response for newer pending loss already charged
+to an epoch. A real ACK/new-flight boundary regression test is being prepared
+before accepting or repairing that candidate. This concern is separate from
+the integrated flight-accounting correction.
+
+The boundary concern subsequently reproduced in a real endpoint/manual-clock
+test. Actual SACKs free old-flight slots, source writes send newer data beyond
+the original recovery `Last`, and the real reorder timer charges its loss.
+An ACK then completes only the original prefix at the same clock instant.
+The private candidate incorrectly changes congestion responses 2→3 and epoch
+2→3, with cwnd4→5 and an extra forced replay, despite no new loss transition.
+The causal root fails at
+`RACK_CHARGED_LOSS_COUNTED_AGAIN_AT_ORIGINAL_LAST`; the positive root for
+genuinely new loss after recovery completion passes. Exactly two roots ran,
+one expected failure and one pass, no skips, unchanged source/pins and joined
+cleanup. Receipt:
+`/Volumes/data/urnetwork-rack-last-crossing-terminal.HWNwAC6W/receipt.json`.
+This confirms a defect in the still-private response candidate, not causality
+for the original browsing session. A correction must avoid double charging
+AND use the ACK-freed slot to repair already-charged pending loss; simply
+suppressing recovery is not sufficient.
+
+The correction advances the recovery completion frontier to the current sent
+frontier when a genuinely newer loss window receives an additional congestion
+response. The unchanged boundary test then preserves response2/epoch2/cwnd4
+and performs exactly one repair in the ACK-freed slot; its new-loss positive
+control also passes. Private verification passed 71 checks (causal2, then all
+23 available TCP roots normal/race/fresh-normal). An executor-only misspelled
+environment key stopped before starting the first full Go command; this is
+retained separately, not a product test failure or a hidden retry.
+
+The exact tested production/test afterimages were integrated locally using
+byte comparisons. Canonical available TCP package verification WITHOUT an
+overlay or selector then passed 23 roots in each normal/race/fresh-normal
+process: 69 passes, no failure/skip/race, stable source/pins and joined cleanup.
+Private receipt:
+`/Volumes/data/urnetwork-rack-v5-terminal.r0mlUxVg/receipt.json`.
+This closes the reproduced recovery-boundary defect, not the original full100
+causal attribution, full-suite/PERF qualification or physical memory gates.
+
+## 2026-10-22 test-build checkpoint
+
+The zero-window persist candidate is included in this checkpoint. A reader can
+have pending bytes after all returned data is ACKed, while a refused pure
+window-reopening ACK has no data retry owner. Bounded, regenerable persist
+probes now recover that state without advancing stream or delivery custody.
+Sixteen deterministic roots passed normal, race and fresh-normal execution
+(48 passes), including the actual native Multi/Transfer admission boundary.
+This proves the mechanism, not attribution of every observed browsing stall.
+
+The pre-persist baseline completed the current realistic 100-page workload:
+100 HTML responses, 400 assets drained, zero navigations at or above five
+seconds, 173.626 seconds application time. The matched persist candidate arm
+was canceled for this requested checkpoint before workload execution. There
+is no matched performance conclusion yet. Evidence is retained privately in
+`/Volumes/data/urnetwork-v5-persist-only100-prep.IDbLbm/PAIR.CHECKPOINT.v2.json`.
+
+The full correctness run passed Connect and SDK, then failed Windows because
+its complete C++ specification/mutation census exceeded Go's implicit ten-minute
+package deadline. A replay reached a different test at the same deadline;
+the originally named test passed alone and in the replay. The explicit
+30-minute package budget preserves caller overrides, child bounds, the full
+census and fail-fast behavior; deterministic old-red/fix-green checks passed.
+Remaining correctness packages and full performance replay are still required.
+
+The hosted-H1-only dual-memory harness is included for the 32 MiB iOS profile
+on Android and the normal 64 MiB Android profile. Its scoped unit checks and
+host-tool builds passed; native APK builds and physical measurements have not
+run. Do not describe either memory profile as newly qualified or this
+checkpoint as release-ready. Rebuild and rerun against the synced revisions;
+pre-checkpoint source identities do not qualify post-merge source.

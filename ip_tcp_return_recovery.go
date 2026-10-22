@@ -211,13 +211,28 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 func (self *TcpSequence) runReturnRecovery() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	defer func() {
+		self.mutex.Lock()
+		self.returnPersistPending = false
+		self.mutex.Unlock()
+	}()
+	var persistProgress time.Time
+	var persistDelay time.Duration
+	var persistAck uint32
 	for {
 		if self.ctx.Err() != nil {
 			return
 		}
 		var packet []byte
+		var persistPacket bool
 		var timeout <-chan time.Time
 		self.mutex.Lock()
+		persistEligible := self.returnPersistPending && self.receiveWindowSize == 0 &&
+			self.receiveSeqAck == self.receiveSeq && self.returnHead == len(self.returnChunks) &&
+			self.tcpBufferSettings.ReturnPersistTimeout > 0
+		if !persistEligible || persistAck != self.receiveSeqAck {
+			persistProgress = time.Time{}
+		}
 		if self.returnHead < len(self.returnChunks) {
 			delay := self.tcpBufferSettings.ReturnResendTimeout
 			if delay <= 0 {
@@ -262,9 +277,41 @@ func (self *TcpSequence) runReturnRecovery() {
 				timer.Reset(remaining)
 				timeout = timer.C
 			}
+		} else if persistEligible {
+			if persistProgress.IsZero() {
+				persistProgress = time.Now()
+				persistDelay = self.tcpBufferSettings.ReturnPersistTimeout
+				persistAck = self.receiveSeqAck
+			}
+			remaining := time.Until(persistProgress.Add(persistDelay))
+			if remaining <= 0 {
+				// Match TCP's zero-window probe: one already-ACKed byte elicits
+				// the peer's current window without issuing any new stream byte.
+				packet = self.tcpPacket(tcpFlagAck, persistAck-1, []byte{0})
+				persistPacket = true
+			} else {
+				timer.Reset(remaining)
+				timeout = timer.C
+			}
 		}
 		self.mutex.Unlock()
 		if packet != nil {
+			if persistPacket {
+				self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
+				self.mutex.Lock()
+				if self.ctx.Err() == nil && self.returnPersistPending && self.receiveWindowSize == 0 &&
+					self.receiveSeqAck == persistAck && self.receiveSeq == persistAck && self.returnHead == len(self.returnChunks) {
+					persistProgress = time.Now()
+					maxDelay := max(self.tcpBufferSettings.ReturnPersistTimeout, self.tcpBufferSettings.ReturnPersistMaxTimeout)
+					if persistDelay < maxDelay {
+						persistDelay += min(persistDelay, maxDelay-persistDelay)
+					}
+				} else {
+					persistProgress = time.Time{}
+				}
+				self.mutex.Unlock()
+				continue
+			}
 			self.receivePacket(packet, receiveRecoveryModeTcpSocket)
 			continue
 		}

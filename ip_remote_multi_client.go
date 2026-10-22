@@ -7374,6 +7374,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// round.
 			if self.clientDialFailure(currentClient, ipPath, false) {
 				currentClient = nil
+				// Guarded inference withdrew the incumbent. Replacement admission
+				// is an ordinary race, not a reuse of that former selection.
+				sendPacketGroup.affinitySynReuse = false
 			}
 		}
 		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {

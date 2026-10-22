@@ -1,5 +1,5 @@
-// Private proposed regressions; UNCOMPILED/UNRUN. Real Multi/Transfer/provider
-// admission and TcpSequence with only in-memory routes and a net.Pipe origin.
+// Real Multi/Transfer/provider admission and TcpSequence with only in-memory
+// routes and a net.Pipe origin; public retries recover bounded reorder refusal.
 package connect
 
 import (
@@ -245,10 +245,14 @@ func testMultiTcpReorderPublicRetry(t *testing.T, reorderCount int, reorderBytes
 		update, _, _ := parent.sendUpdate(path, flowPin{})
 		selected := newPacketTransferTestChannel()
 		selected.ctx, selected.log, selected.settings, selected.client = ctx, NewNoopLogger(), parent.settings, sender
+		selected.healthy = true
 		selected.args = &multiClientChannelArgs{Destination: RequireMultiHopId(receiver.ClientId())}
 		selected.clientReceivePacketCallback = parent.clientReceivePacket
 		update.client.Store(selected)
 		parent.bindClientFlow(update, selected)
+		if parent.sendClientPathForTest != nil || !parent.reuseAffinitySyn(update, selected, path) {
+			t.Fatal("selected reorder provider lacks live healthy SYN eligibility")
+		}
 		sender.AddReceiveCallback(selected.clientReceive)
 
 		gapEntered := make(chan struct{})
