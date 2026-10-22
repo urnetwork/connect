@@ -297,8 +297,6 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// minutes
 		DiscoveryExpandRetryMin: 10 * time.Second,
 		DiscoveryExpandRetryMax: 2 * time.Minute,
-		// a network change ends a deferral within a second
-		DiscoveryExpandDeferralPollTimeout: time.Second,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout: 20 * time.Second,
@@ -872,16 +870,12 @@ type MultiClientSettings struct {
 	FixedDestinationRetryMax time.Duration
 	// DiscoveryExpandRetryMin / Max pace the expansion of a discovery window
 	// after consecutive passes that admitted no candidate, doubling from Min
-	// to Max with jitter; an admission or a network change ends the pacing.
+	// to Max with jitter; an admission, a lost exit or a network change ends
+	// the pacing.
 	// See ip_remote_multi_client_discovery_retry.go. Nonpositive Min disables
 	// pacing.
 	DiscoveryExpandRetryMin time.Duration
 	DiscoveryExpandRetryMax time.Duration
-	// DiscoveryExpandDeferralPollTimeout is how often a deferred discovery
-	// window's enumerator rechecks its deferral, so that a network change,
-	// which ends the deferral without a signal of its own, is noticed within
-	// this interval. Nonpositive rechecks only when the deferral ends.
-	DiscoveryExpandDeferralPollTimeout time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -12845,6 +12839,9 @@ func (self *multiClientWindow) resize() {
 		// first deferral.
 		var redialTime time.Time
 		redialDeferred := false
+		if !fixedDestination {
+			self.noteDiscoveryClientCount(len(clients))
+		}
 		if len(clients) < targetWindowSize {
 			if fixedDestination {
 				redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())

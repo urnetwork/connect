@@ -425,6 +425,8 @@ func (self *multiClientWindow) waitWindowRetry(
 // layer's noteBackendNetworkChanged.
 func (self *multiClientWindow) notifyNetworkChanged() {
 	self.errorStreak.Store(0)
+	// a discovery window's expansion backoff grew on the old path too
+	self.clearDiscoveryExpandRetry()
 	if self.networkChangeMonitor != nil {
 		self.networkChangeMonitor.NotifyAll()
 	}

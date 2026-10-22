@@ -73,7 +73,7 @@ func runUnreachableDiscoveryWindow(t *testing.T, generator *unreachableDiscovery
 	window.settings.EvaluationPoolMultiple = 1
 	window.clientChannelArgs = make(chan *multiClientChannelArgs)
 	window.contractStatusCallbacks = NewCallbackList[*contractStatusCallbackWorker]()
-	window.budgetFailThrottle = newLogThrottle(evaluationFailureLogInterval)
+	window.budgetFailThrottle = newLogThrottle(window.settings.EvaluationFailureLogInterval)
 	window.backendDegradedForTest = func() bool { return false }
 
 	var loops sync.WaitGroup
@@ -163,9 +163,9 @@ func TestDiscoveryExpansionAdmissionClearsDeferral(t *testing.T) {
 	}
 }
 
-// Failures on the previous network say nothing about the new one: a network
-// change ends the deferral, and the next unproductive pass starts the backoff
-// over.
+// Failures on the previous network say nothing about the new one: the window's
+// network change hook ends the deferral, and the next unproductive pass starts
+// the backoff over.
 func TestDiscoveryExpansionDeferralEndsOnNetworkChange(t *testing.T) {
 	window := discoveryRetryTestWindow(t)
 	now := time.Now()
@@ -177,7 +177,7 @@ func TestDiscoveryExpansionDeferralEndsOnNetworkChange(t *testing.T) {
 		t.Fatal("four unproductive passes did not defer the window")
 	}
 
-	NetworkChanged()
+	window.notifyNetworkChanged()
 	if _, deferred := window.discoveryExpandDeferral(now); deferred {
 		t.Fatal("a network change left the window deferred")
 	}
@@ -301,8 +301,8 @@ func TestDiscoveryEnumeratorListsNothingWhileDeferred(t *testing.T) {
 	})
 }
 
-// A network change ends the deferral without a signal of its own; the deferred
-// enumerator notices it within DiscoveryExpandDeferralPollTimeout and lists.
+// A network change ends a deferred enumerator's wait at once, so a window on a
+// new path lists and mints without waiting out a backoff grown on the old one.
 func TestDiscoveryEnumeratorResumesAfterNetworkChange(t *testing.T) {
 	// the process-wide message pool worker must not start inside the bubble
 	GetMessagePoolAggregateStats()
@@ -312,6 +312,7 @@ func TestDiscoveryEnumeratorResumesAfterNetworkChange(t *testing.T) {
 		generator := &listingCountDiscoveryGenerator{}
 		window := outcomeTestWindow(ctx, newRecordingLogger())
 		window.generator = generator
+		window.networkChangeMonitor = NewMonitor()
 		window.clientChannelArgs = make(chan *multiClientChannelArgs)
 		for range 4 {
 			window.noteDiscoveryExpandUnproductive(time.Now())
@@ -330,8 +331,7 @@ func TestDiscoveryEnumeratorResumesAfterNetworkChange(t *testing.T) {
 		if listingCount := generator.listings(); listingCount != 0 {
 			t.Fatalf("a deferred enumerator listed destinations %d times", listingCount)
 		}
-		NetworkChanged()
-		time.Sleep(window.settings.DiscoveryExpandDeferralPollTimeout)
+		window.notifyNetworkChanged()
 		synctest.Wait()
 		if listingCount := generator.listings(); listingCount != 1 {
 			t.Fatalf("after a network change the enumerator listed destinations %d times, want 1", listingCount)
@@ -339,6 +339,34 @@ func TestDiscoveryEnumeratorResumesAfterNetworkChange(t *testing.T) {
 		cancel()
 		<-done
 	})
+}
+
+// A window that has been failing to add a spare exit must not hold back the
+// replacement of an exit it loses: the drop clears the deferral. The same or a
+// larger exit count keeps it.
+func TestDiscoveryExitLossClearsDeferral(t *testing.T) {
+	window := discoveryRetryTestWindow(t)
+	now := time.Now()
+	window.noteDiscoveryClientCount(3)
+	for range 3 {
+		window.noteDiscoveryExpandUnproductive(now)
+	}
+	window.noteDiscoveryClientCount(3)
+	if _, deferred := window.discoveryExpandDeferral(now); !deferred {
+		t.Fatal("an unchanged exit count ended the deferral")
+	}
+	window.noteDiscoveryClientCount(4)
+	if _, deferred := window.discoveryExpandDeferral(now); !deferred {
+		t.Fatal("a larger exit count ended the deferral")
+	}
+	window.noteDiscoveryClientCount(3)
+	if _, deferred := window.discoveryExpandDeferral(now); deferred {
+		t.Fatal("losing an exit left the window deferred")
+	}
+	window.noteDiscoveryExpandUnproductive(now)
+	if notBefore, _ := window.discoveryExpandDeferral(now); notBefore.Sub(now) != window.settings.DiscoveryExpandRetryMin/2 {
+		t.Fatalf("after losing an exit the next deferral is %s, want the minimum's %s", notBefore.Sub(now), window.settings.DiscoveryExpandRetryMin/2)
+	}
 }
 
 // Counts destination listings; the listing is empty, so nothing is minted.

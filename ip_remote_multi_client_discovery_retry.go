@@ -14,32 +14,28 @@
 // A pass that admits nothing now defers the window's next expansion by a
 // jittered exponential backoff, from DiscoveryExpandRetryMin doubling to
 // DiscoveryExpandRetryMax. Any admission clears it, so a window that is filling
-// keeps its cadence, and a network change ends it, since failures on the old
-// path say nothing about the new one. The first pass is never deferred. The
-// enumerator lists and mints nothing while the window is deferred, and the
-// candidate it minted ahead of the next pass is held across the deferral rather
-// than expiring unused and being replaced. Only expansion is paced: resize
-// keeps its health, rotation and collapse cadence, and the window keeps serving
-// the clients it has.
+// keeps its cadence. Losing a working exit clears it, so a replacement is not
+// held back by earlier failed spares. A network change clears it, since
+// failures on the old path say nothing about the new one. The first pass is
+// never deferred. The enumerator lists and mints nothing while the window is
+// deferred, and the candidate it minted ahead of the next pass is held across
+// the deferral rather than expiring unused and being replaced. Only expansion
+// is paced: resize keeps its health, rotation and collapse cadence, and the
+// window keeps serving the clients it has.
 //
 // The state is per window and guarded by the window stateLock.
 package connect
 
 import (
-	"sync/atomic"
 	"time"
 )
 
-// Counts NetworkChanged calls. A discovery deferral recorded under an earlier
-// count has ended.
-var networkChangeCount atomic.Uint64
-
 // A discovery window's consecutive passes that admitted nothing, the earliest
-// time it may expand again, and the network it failed on.
+// time it may expand again, and its exit count at the last pass.
 type discoveryExpandRetry struct {
-	failureCount       int
-	notBefore          time.Time
-	networkChangeCount uint64
+	failureCount int
+	notBefore    time.Time
+	clientCount  int
 }
 
 // Records an expansion pass that admitted no candidate and defers the next.
@@ -61,11 +57,6 @@ func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		changeCount := networkChangeCount.Load()
-		if self.discoveryRetry.networkChangeCount != changeCount {
-			// passes that failed on the previous network do not count
-			self.discoveryRetry = discoveryExpandRetry{networkChangeCount: changeCount}
-		}
 		self.discoveryRetry.failureCount += 1
 		delay = self.retryJitter(fixedDestinationRetryDelay(self.discoveryRetry.failureCount, retryMin, retryMax))
 		self.discoveryRetry.notBefore = now.Add(delay)
@@ -83,32 +74,59 @@ func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
 // An admitted candidate shows the window is filling. Its next pass that admits
 // nothing starts the backoff over.
 func (self *multiClientWindow) noteDiscoveryExpandAdmitted() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	self.discoveryRetry = discoveryExpandRetry{}
+	self.clearDiscoveryExpandRetry()
 }
 
-// The enumerator's wait for a deferred discovery window. It rechecks every
-// DiscoveryExpandDeferralPollTimeout so a network change, which ends the
-// deferral without a signal of its own, is noticed promptly. A fixed window
-// keeps its per-destination pacing instead. False when the window closed.
+// Records the window's exit count at the start of a pass. A drop means a
+// working exit was lost, and its replacement is not held back by the passes
+// that failed to add a spare before it.
+func (self *multiClientWindow) noteDiscoveryClientCount(clientCount int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if clientCount < self.discoveryRetry.clientCount {
+		self.discoveryRetry = discoveryExpandRetry{}
+	}
+	self.discoveryRetry.clientCount = clientCount
+}
+
+// Ends any deferral and starts the backoff over.
+func (self *multiClientWindow) clearDiscoveryExpandRetry() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.discoveryRetry = discoveryExpandRetry{
+		clientCount: self.discoveryRetry.clientCount,
+	}
+}
+
+// Whether a discovery window must not expand at `now`, and if so, when it may.
+func (self *multiClientWindow) discoveryExpandDeferral(now time.Time) (time.Time, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !now.Before(self.discoveryRetry.notBefore) {
+		return time.Time{}, false
+	}
+	return self.discoveryRetry.notBefore, true
+}
+
+// The enumerator's wait for a deferred discovery window. A network change
+// (notifyNetworkChanged) ends it at once. A fixed window keeps its
+// per-destination pacing instead. False when the window closed.
 func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 	if _, fixed := self.generator.FixedDestinationSize(); fixed {
 		return true
 	}
 	for {
+		// before the check, so a change that lands after it still ends the wait
+		networkChanged := self.networkChangeNotify()
 		notBefore, deferred := self.discoveryExpandDeferral(time.Now())
 		if !deferred {
 			return true
 		}
-		timeout := time.Until(notBefore)
-		if pollTimeout := self.settings.DiscoveryExpandDeferralPollTimeout; 0 < pollTimeout {
-			timeout = min(timeout, pollTimeout)
-		}
 		select {
 		case <-self.ctx.Done():
 			return false
-		case <-time.After(timeout):
+		case <-networkChanged:
+		case <-time.After(time.Until(notBefore)):
 		}
 	}
 }
@@ -134,17 +152,4 @@ func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, exp
 			expirationTime = notBefore.Add(self.settings.WindowResizeTimeout)
 		}
 	}
-}
-
-// Whether a discovery window must not expand at `now`, and if so, when it may.
-func (self *multiClientWindow) discoveryExpandDeferral(now time.Time) (time.Time, bool) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	if self.discoveryRetry.networkChangeCount != networkChangeCount.Load() {
-		return time.Time{}, false
-	}
-	if !now.Before(self.discoveryRetry.notBefore) {
-		return time.Time{}, false
-	}
-	return self.discoveryRetry.notBefore, true
 }

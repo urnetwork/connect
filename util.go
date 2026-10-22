@@ -201,9 +201,6 @@ func NetworkQualityChanged() {
 // its OS path-update signal (NWPathMonitor / ConnectivityManager); it is cheap and safe to
 // call on every update — listeners only tear down state bound to a possibly-dead path.
 func NetworkChanged() {
-	// ends every discovery window's expansion deferral (see
-	// ip_remote_multi_client_discovery_retry.go)
-	networkChangeCount.Add(1)
 	// A hard path switch also invalidates quality measurements. Keep this one
 	// canonical call so DeviceLocal does not need to emit both notifications.
 	// The new path generation lets it through the quiet interval a quality
