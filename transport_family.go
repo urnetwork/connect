@@ -837,6 +837,9 @@ type h3DialAttempt struct {
 	quicTransport *quic.Transport
 	conn          *quic.Conn
 	egressPinned  bool
+	// an extender relays the attempt's datagrams and resolves its destination
+	// name itself
+	relayed bool
 	// API alt dials own a separate carrier claim. Ordinary platform attempts
 	// use their long-lived transport's claim instead.
 	budgetReservation      *platformTransportBudgetReservation
@@ -1713,6 +1716,21 @@ func (self *PlatformTransport) h3DialCandidatesWithResolver(
 		}
 		return udpAddrs, translated(PacketTranslationModeDnsPump, tld), nil
 	default:
+		// a move's targets stand in for the resolved addresses, on the
+		// platform's own port: a target is an edge of the platform host, never
+		// the alt host (resident_move.go)
+		if override := moveDialOverrideFromContext(ctx); override.matches(serverName) {
+			udpAddrs := override.udpAddrs(self.ipFamily, self.settings.H3Port)
+			if len(udpAddrs) == 0 {
+				return nil, nil, errResidentMoveNoFamilyTarget
+			}
+			noteMoveDialOverrideUsed(ctx)
+			if self.settings.H3PacketConnFactory != nil {
+				// an injected endpoint is one socket with its own routing
+				return udpAddrs[:1], plain, nil
+			}
+			return udpAddrs, plain, nil
+		}
 		address := net.JoinHostPort(host, strconv.Itoa(ports[0]))
 		if self.settings.resolveH3AddrsForTest != nil {
 			udpAddrs, err := self.settings.resolveH3AddrsForTest(ctx, address, self.ipFamily)
@@ -1815,11 +1833,13 @@ func (self *PlatformTransport) dialH3(
 	// An extender dial has no local address for the peer: the name is resolved
 	// at the extender. Its connection reports the peer it actually relays to,
 	// and quic has to agree with that.
+	relayed := peerAddr != nil
 	if peerAddr == nil {
 		peerAddr = udpAddr
 	}
 	attempt := &h3DialAttempt{
 		udpAddr:                udpAddr,
+		relayed:                relayed,
 		translationReservation: translationClaim,
 		packetConn: capPlatformPacketConn(
 			packetConn,

@@ -237,6 +237,13 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	if hook := self.DialNetworkHook; hook != nil {
 		hook(network, addr)
 	}
+	// a move stands its target addresses in for the platform hostname
+	// (resident_move.go). The hostname stays the TLS server name and the HTTP
+	// host, which the layers above this one decided from it.
+	moveOverride := moveDialOverrideFromContext(ctx)
+	if !moveOverride.matches(addr) {
+		moveOverride = nil
+	}
 
 	var dialContext DialContextFunction
 
@@ -255,7 +262,14 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 		}
 	}
 
-	conn, err := dialContext(ctx, network, addr)
+	var conn net.Conn
+	var err error
+	if moveOverride != nil {
+		noteMoveDialOverrideUsed(ctx)
+		conn, err = moveOverride.dialTargets(ctx, network, addr, dialContext)
+	} else {
+		conn, err = dialContext(ctx, network, addr)
+	}
 	if log := loggerOrDefault(self.Log).V(2); log.Enabled() {
 		if err == nil {
 			log.Infof("[net]dial %s %s success\n", network, addr)
