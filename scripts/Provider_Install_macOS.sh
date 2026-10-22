@@ -782,6 +782,18 @@ job_exited ()
     ! job_running "$1" && case "$(job_last_exit "$1")" in [0-9]*|-[0-9]*) true ;; *) false ;; esac
 }
 
+# heal_registration: an install from before first-start registration, or
+# one whose registration failed, has a signed-in provider job that exited
+# without registering; an update starts it again so it registers
+heal_registration ()
+{
+    if [ "$dry_run" -eq 0 ] && has_identity && ! is_registered && job_loaded "$provider_label" && ! job_running "$provider_label"; then
+        say "This Mac is signed in but was never registered; starting the provider to register it"
+        unload_job "$provider_label"
+        start_provider quiet || true
+    fi
+}
+
 # start_failed: say why the provider stopped right after starting
 start_failed ()
 {
@@ -858,6 +870,11 @@ verify_sha256 ()
     case "$vs_digest" in
         sha256:*) vs_want="${vs_digest#sha256:}" ;;
         *)
+            # nobody is watching a scheduled update, so it never installs
+            # a download it cannot check
+            if [ "$scheduled" -eq 1 ]; then
+                die "the release lists no checksum; skipping this automatic update (run \`urnet-tools update' to install it anyway)"
+            fi
             say "The release lists no checksum for this download; skipping the checksum check"
             return 0
             ;;
@@ -1013,6 +1030,7 @@ do_install ()
     if [ "$operation" = "update" ] && [ "$force" -eq 0 ] && [ "$version" = "$installed_version" ]; then
         say "Already up to date ($version)"
         [ "$dry_run" -eq 1 ] || set_setting last_check "$(now_epoch)"
+        heal_registration
         exit 0
     fi
 
@@ -1086,6 +1104,8 @@ do_install ()
     write_update_plist || die "could not write the update launch agent"
 
     was_running=0
+    was_loaded=0
+    job_loaded "$provider_label" && was_loaded=1
     if job_running "$provider_label"; then
         was_running=1
         restart_on_exit=1
@@ -1123,6 +1143,14 @@ do_install ()
     if [ "$was_running" -eq 1 ]; then
         restart_on_exit=0
         start_provider quiet || warn "the provider did not start again; run \`urnet-tools start'"
+    elif [ "$was_loaded" -eq 1 ] && [ "$from_installer" -eq 0 ]; then
+        # it was loaded but had exited: retry, which also registers a
+        # device that never registered
+        heal_was_loaded=1
+    fi
+    if [ "${heal_was_loaded:-0}" -eq 1 ] && has_identity && ! is_registered; then
+        say "This Mac is signed in but was never registered; starting the provider to register it"
+        start_provider quiet || true
     fi
     say "Installed $version to $install_path"
     if [ "$tag" != "latest" ] && [ "$(get_setting auto_update 1)" = "1" ]; then

@@ -166,10 +166,12 @@ EOF
     tar -czf "$run_dir/fixtures/urnetwork-provider-$mr_tag.tar.gz" -C "$mr_root" darwin linux
     mr_sum="$(shasum -a 256 "$run_dir/fixtures/urnetwork-provider-$mr_tag.tar.gz" | cut -d' ' -f1)"
     [ "${3:-}" = badsum ] && mr_sum="0000000000000000000000000000000000000000000000000000000000000000"
+    mr_digest=", \"digest\": \"sha256:$mr_sum\""
+    [ "${3:-}" = nodigest ] && mr_digest=""
     cat > "$run_dir/fixtures/tag-$mr_tag.json" <<EOF
 {"tag_name": "$mr_tag", "published_at": "2026-10-20T00:00:00Z",
  "assets": [{"name": "urnetwork-provider-$mr_tag.tar.gz.sig", "browser_download_url": "https://dl.test/nope"},
-            {"name": "urnetwork-provider-$mr_tag.tar.gz", "browser_download_url": "https://dl.test/urnetwork-provider-$mr_tag.tar.gz", "digest": "sha256:$mr_sum"}]}
+            {"name": "urnetwork-provider-$mr_tag.tar.gz", "browser_download_url": "https://dl.test/urnetwork-provider-$mr_tag.tar.gz"$mr_digest}]}
 EOF
     cp "$run_dir/fixtures/tag-$mr_tag.json" "$run_dir/fixtures/latest.json"
 }
@@ -285,6 +287,20 @@ run_tests ()
     grep -q "fake provider v3" "$(install_dir)/bin/urnetwork" || fail "scheduled update did not update"
     grep -q "bootout gui/[0-9]*/com.urnetwork.provider.update" "$run_dir/calls" && fail "scheduled update reloaded its own job"
     loaded com.urnetwork.provider || fail "provider not restarted by the scheduled update"
+    # an update heals a signed-in job that exited without registering
+    mv "$HOME/.urnetwork/.provider.jwt" "$run_dir/pj"
+    echo 0 > "$run_dir/launchd/com.urnetwork.provider.exited"
+    tools update > "$run_dir/out" 2>&1 || fail "up-to-date update with a stuck job"
+    grep -q "never registered" "$run_dir/out" || fail "update did not heal a stuck registration: $(cat "$run_dir/out")"
+    [ -s "$HOME/.urnetwork/.provider.jwt" ] || fail "heal did not register"
+    loaded com.urnetwork.provider || fail "heal left the provider stopped"
+    rm -f "$run_dir/pj"
+    # a scheduled update never installs a download it cannot check
+    make_release v3b "" nodigest
+    grep -v '^last_check=' "$(install_dir)/settings" > "$run_dir/s" && echo "last_check=0" >> "$run_dir/s" && cp "$run_dir/s" "$(install_dir)/settings"
+    tools update --scheduled > "$run_dir/out" 2>&1 && fail "scheduled update without a checksum went ahead"
+    grep -q "fake provider v3 " "$(install_dir)/bin/urnetwork" || fail "unchecked scheduled update replaced the binary"
+    loaded com.urnetwork.provider || fail "refused scheduled update stopped the provider"
 
     # --- auto-update off and on
     tools auto-update off > /dev/null 2>&1 || fail "auto-update off"
