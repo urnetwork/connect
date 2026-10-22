@@ -20,6 +20,94 @@ func TestAckCompressionEnforcesItsOwnResponseCountLimit(t *testing.T) {
 	}
 }
 
+func TestAckCompressionOverflowWakeCannotBlockResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		window := newSequenceAckWindow()
+		want := make(map[Id]sequenceAck)
+		for number := uint64(1); number <= 7; number++ {
+			ack := sequenceAck{messageId: NewId(), sequenceNumber: number, selective: true}
+			want[ack.messageId] = ack
+			window.Update(ack)
+		}
+		for number := uint64(8); number <= 10; number++ {
+			ack := sequenceAck{messageId: NewId(), sequenceNumber: number, contractMissing: true}
+			want[ack.messageId] = ack
+			window.UpdateContractMissing(ack)
+		}
+		wakes := 0
+		window.beforeOverflowNotifyForTest = func() {
+			wakes++
+			// The real lock-free producer fills the token after takeResponse
+			// drains it, while the response still owns ackLock.
+			window.Wake()
+		}
+		const responseLimit = 2
+		var acks []sequenceAck
+		var overflow bool
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			acks, overflow = window.takeResponse(nil, responseLimit)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Error("overflow response blocked after Wake filled its notification")
+			// The old blocking rearm is the causal failure. Release that send
+			// and join the actual worker so the failing control does not leak
+			// a goroutine or turn into a bubble deadlock.
+			<-window.Notify()
+			synctest.Wait()
+			<-done
+		}
+		window.beforeOverflowNotifyForTest = nil
+		if wakes != 1 || len(acks) != responseLimit || !overflow {
+			t.Fatalf("overflow premise: wakes=%d response=%d overflow=%t", wakes, len(acks), overflow)
+		}
+		nextSelective := uint64(1)
+		for {
+			if len(acks) == 0 || len(acks) > responseLimit {
+				t.Fatalf("response count %d exceeds bound %d", len(acks), responseLimit)
+			}
+			for _, ack := range acks {
+				expected, ok := want[ack.messageId]
+				if !ok || ack.sequenceNumber != expected.sequenceNumber ||
+					ack.selective != expected.selective || ack.contractMissing != expected.contractMissing {
+					t.Fatalf("lost, duplicated or changed overflow ACK: %+v", ack)
+				}
+				delete(want, ack.messageId)
+				if ack.selective {
+					if ack.sequenceNumber != nextSelective {
+						t.Fatalf("SACK %d, want oldest pending %d", ack.sequenceNumber, nextSelective)
+					}
+					nextSelective++
+				}
+			}
+			if overflow != window.Pending() || overflow != (len(want) != 0) {
+				t.Fatal("bounded response lost pending overflow")
+			}
+			select {
+			case <-window.Notify():
+				if !overflow {
+					t.Fatal("fully drained response retained a notification")
+				}
+			default:
+				if overflow {
+					t.Fatal("pending overflow lost its notification")
+				}
+			}
+			if !overflow {
+				break
+			}
+			acks, overflow = window.takeResponse(nil, responseLimit)
+		}
+		if nextSelective != 8 || len(want) != 0 {
+			t.Fatalf("incomplete overflow drain: next SACK=%d remaining=%d", nextSelective, len(want))
+		}
+	})
+}
+
 // The common in-order path must not allocate a snapshot map or response slice.
 func TestAckCompressionHeadDrainDoesNotAllocate(t *testing.T) {
 	window := newSequenceAckWindow()

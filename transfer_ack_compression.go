@@ -54,6 +54,9 @@ type sequenceAckWindow struct {
 	// Nil by default. Runs after Update and UpdateDeliveredPrefix leave
 	// ackLock, the edges where the draining consumer may take a response.
 	afterUpdateForTest func()
+	// Nil by default. Runs under ackLock after notification tokens are
+	// drained and immediately before an overflow response rearms its wake.
+	beforeOverflowNotifyForTest func()
 }
 
 func newSequenceAckWindow() *sequenceAckWindow {
@@ -483,7 +486,13 @@ func (self *sequenceAckWindow) takeResponse(scratch []sequenceAck, limit int) ([
 	default:
 	}
 	if len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0 {
-		self.ackNotify <- struct{}{}
+		if self.beforeOverflowNotifyForTest != nil {
+			self.beforeOverflowNotifyForTest()
+		}
+		// Wake can refill the token without ackLock, including while teardown
+		// withdraws held commitments. Coalesce with that wake instead of
+		// blocking the sole draining worker on its own notification channel.
+		self.Wake()
 	}
 	return acks, len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0
 }
