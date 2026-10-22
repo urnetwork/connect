@@ -613,6 +613,9 @@ func TestMultiClientPeerReplacementContinuesWhileMonitorObserverStalls(t *testin
 	settings.PingTimeout = 500 * time.Millisecond
 	settings.WindowResizeTimeout = 100 * time.Millisecond
 	settings.WindowExpandTimeout = 500 * time.Millisecond
+	// a pass that admits nothing is paced on the same compressed clock
+	settings.DiscoveryExpandRetryMin = 100 * time.Millisecond
+	settings.DiscoveryExpandRetryMax = 100 * time.Millisecond
 	settings.WindowEnumerateErrorTimeout = 25 * time.Millisecond
 	settings.StatsWindowMaxUnhealthyDuration = 500 * time.Millisecond
 	settings.StatsWindowWarnUnhealthyDuration = 250 * time.Millisecond

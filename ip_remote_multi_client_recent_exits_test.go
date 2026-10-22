@@ -204,6 +204,9 @@ func recentExitTestWindow(
 	settings := DefaultMultiClientSettings()
 	settings.WindowResizeTimeout = 20 * time.Millisecond
 	settings.WindowExpandTimeout = 20 * time.Millisecond
+	// a pass that admits nothing is paced on the same compressed clock
+	settings.DiscoveryExpandRetryMin = 20 * time.Millisecond
+	settings.DiscoveryExpandRetryMax = 20 * time.Millisecond
 	for _, configureSettings := range configure {
 		configureSettings(settings)
 	}
