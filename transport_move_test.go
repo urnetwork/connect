@@ -1087,3 +1087,99 @@ func TestFamilyFallbackTreatsMoveTargetsAsLiterals(t *testing.T) {
 		t.Fatalf("a move target that could not connect undid the demotion (demoted ipv%d)", family)
 	}
 }
+
+// The DNS carrier runner of a strict move's replacement builds no attempt
+// until the move concludes, and then dials as usual.
+func TestPlatformTransportStrictMoveHoldsTheDnsCarrierRunner(t *testing.T) {
+	plan := PlanResidentMove(
+		testAdvisoryMove(testMoveTargetIpv4),
+		[]ResidentMoveTransport{testDirectMoveTransport(0)},
+		DefaultPlatformTransportSettings(),
+		NewResidentMoveTracker(),
+		time.Now(),
+	)
+	attempts := make(chan struct{}, 16)
+	settings := testingPlatformTransportSettings()
+	settings.ResidentMoveDial = plan.Dial
+	settings.AuthFrameObserver = func([]byte) {
+		select {
+		case attempts <- struct{}{}:
+		default:
+		}
+	}
+	settings.H3PacketConnFactory = func(context.Context) (net.PacketConn, error) {
+		return nil, errors.New("test: the attempt is all this test needs")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		NewClientStrategyWithDefaults(ctx),
+		NewRouteManager(ctx, "move-dns-hold"),
+		"https://"+testMoveHost,
+		testingFamilyAuth(),
+		TransportModeH3Dns,
+		settings,
+	)
+	defer transport.Close()
+	select {
+	case <-attempts:
+		t.Fatal("the DNS carrier dialed during a strict move")
+	case <-time.After(200 * time.Millisecond):
+	}
+	plan.Dial.Conclude()
+	receiveTestMoveValue(t, attempts, "the DNS carrier did not dial once the move concluded")
+}
+
+// A compulsory move's replacement tries its target once per carrier. After the
+// target refuses, the next attempt resolves the name and connects; the target
+// failure is the move's, and the connection is no arrival.
+func TestPlatformTransportCompulsoryMoveDialFallsBackToTheName(t *testing.T) {
+	server := newTestMoveH1Server(t, testMoveHost)
+	seam := newTestMoveDialSeam(server.address, testMoveHostAddress())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	strategy := newTestMoveStrategy(t, ctx, server.roots, seam.dial)
+	tracker := NewResidentMoveTracker()
+	plan := PlanResidentMove(
+		testCompulsoryMove(testMoveTargetIpv4),
+		[]ResidentMoveTransport{testDirectMoveTransport(0)},
+		DefaultPlatformTransportSettings(),
+		tracker,
+		time.Now(),
+	)
+	settings := testingPlatformTransportSettings()
+	settings.ResidentMoveTracker = tracker
+	settings.ResidentMoveDial = plan.Dial
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		NewRouteManager(ctx, "move-compulsory"),
+		"wss://"+testMoveHost,
+		testingFamilyAuth(),
+		TransportModeH1,
+		settings,
+	)
+	defer transport.Close()
+	request := receiveTestMoveValue(t, server.requests, "the replacement did not fall back to the name")
+	if request.host != testMoveHost {
+		t.Fatalf("HTTP host = %q", request.host)
+	}
+	dialed := seam.dialedAddresses()
+	if len(dialed) < 2 || dialed[0] != testMoveTargetAddress(testMoveTargetIpv4) || dialed[len(dialed)-1] != testMoveHostAddress() {
+		t.Fatalf("dials = %v, want the target and then the name", dialed)
+	}
+	failure, failed := plan.Dial.Failure()
+	if !failed || failure.Reason != protocol.ResidentMoveReason_ResidentMoveReasonDialError || failure.IpFamily != 4 {
+		t.Fatalf("failure = %+v, want the target's dial error", failure)
+	}
+	if !waitForCondition(10*time.Second, transport.IsConnected) {
+		t.Fatal("the replacement did not connect by name")
+	}
+	if plan.Dial.Arrived() {
+		t.Fatal("a connection by name counted as an arrival")
+	}
+	if got := tracker.preferredTargetIps(testMoveHost, 0, time.Now()); 0 < len(got) {
+		t.Fatalf("a connection by name recorded a preference: %v", got)
+	}
+}
