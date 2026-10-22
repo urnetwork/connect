@@ -143,6 +143,7 @@ int main(int argc, char **argv) {
         char path[4096]; snprintf(path, sizeof path, "%s/.provider.jwt", getenv("URNETWORK_STATE_DIR"));
         FILE *f = fopen(path, "r");
         if (f) { fclose(f); }
+        else if (getenv("FAKE_REJECT")) { puts("network_sign_in_rejected"); fflush(stdout); for (;;) sleep(60); }
         else if (argc > 2 && strcmp(argv[2], "--allow-client-registration") == 0 && !getenv("FAKE_CANT_REGISTER")) {
             f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f);
             snprintf(path, sizeof path, "%s/.provider.key", getenv("URNETWORK_STATE_DIR"));
@@ -239,6 +240,12 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
         Remove-Item Env:FAKE_CANT_REGISTER
         if ($LASTEXITCODE -eq 0 -or $Out -notmatch "Registering this device failed") { Fail "start that can't register: $Out" }
+        # A refused sign-in stops the registering miner at once, with an auth hint.
+        $env:FAKE_REJECT = "1"
+        $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
+        Remove-Item Env:FAKE_REJECT
+        if ($LASTEXITCODE -eq 0 -or $Out -notmatch "refused" -or $Out -notmatch "urnetwork auth") { Fail "refused registration: $Out" }
+        if (@(Get-Process -Name urnetwork -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Install/*" }).Count -ne 0) { Fail "refused registration left the miner running" }
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0 -or $Out -notmatch "running in the background" -or $Out -notmatch "This device is registered") { Fail "first start: $Out" }
         if (-not (Test-Path (Join-Path $State ".provider.jwt"))) { Fail "first start didn't register the device" }

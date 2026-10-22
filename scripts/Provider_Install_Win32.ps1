@@ -676,11 +676,21 @@ function Invoke-Install {
         Write-Host "Not changing `$PATH here; add $Folder to it yourself"
     }
 
+    # The state folder the background miner will use: the saved environment,
+    # not a value set only in this window (see urnet-tools).
+    if ($OnWindows) {
+        $SavedStateDir = [Environment]::GetEnvironmentVariable("URNETWORK_STATE_DIR", [EnvironmentVariableTarget]::User)
+        if (-not $SavedStateDir) {
+            $SavedStateDir = [Environment]::GetEnvironmentVariable("URNETWORK_STATE_DIR", [EnvironmentVariableTarget]::Machine)
+        }
+        $env:URNETWORK_STATE_DIR = $SavedStateDir
+    }
     $StateDir = $env:URNETWORK_STATE_DIR
     if (-not $StateDir) {
         $StateDir = Join-Path $HOME -ChildPath ".urnetwork"
     }
     $SignedIn = Test-Path -LiteralPath (Join-Path $StateDir -ChildPath "jwt")
+    $Registered = @(Get-ChildItem -LiteralPath $StateDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ".provider*.jwt" }).Count -gt 0
 
     $Code = $AuthCode
     if (-not $Code) {
@@ -783,8 +793,11 @@ function Invoke-Install {
         if ($AutoStart) {
             # Also rewrites a shortcut an older installer made.
             if (Invoke-Tools $InstalledToolsPath @("auto-start", "on")) {
-                # Updates (non-interactive) don't start a provider the person stopped.
-                if ($SignedIn -and -not $NoStart -and ($AddToStartup -or -not $NonInteractive) -and (Get-ProviderProcess $Folder).Count -eq 0) {
+                # Updates (non-interactive) don't start a provider the person
+                # stopped, but they do finish a device that never registered,
+                # so an install stuck before registering heals on its own.
+                $StartNow = $AddToStartup -or -not $NonInteractive -or -not $Registered
+                if ($SignedIn -and -not $NoStart -and $StartNow -and (Get-ProviderProcess $Folder).Count -eq 0) {
                     $null = Invoke-Tools $InstalledToolsPath @("start")
                 }
             }
@@ -832,6 +845,7 @@ function Invoke-Install {
     Write-Host "$($Bold)More help:$($Reset)            urnetwork --help, $Tools help"
 }
 
+$WindowStateDir = $env:URNETWORK_STATE_DIR
 try {
     Invoke-Install
     $ExitCode = 0
@@ -840,6 +854,10 @@ catch {
     Write-Host ""
     Write-Host "URnetwork wasn't installed: $($_.Exception.Message)" -ForegroundColor Red
     $ExitCode = 1
+}
+finally {
+    # Under "irm | iex" this is the person's own session; leave it as it was.
+    $env:URNETWORK_STATE_DIR = $WindowStateDir
 }
 
 # Run as a file, report the result as the exit code. Run with "irm | iex",

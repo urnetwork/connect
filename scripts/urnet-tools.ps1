@@ -183,6 +183,20 @@ $UpdaterLogPath = Join-Path $InstalledPath -ChildPath "updater.log"
 $UpdaterPIDPath = Join-Path $InstalledPath -ChildPath "urnetwork-updater.pid"
 $ProviderLogPath = Join-Path $InstalledPath -ChildPath "provider.log"
 
+# The background provider starts at sign-in with the saved (user or
+# machine) environment, so that decides its state folder. A value set only in
+# this window is dropped, or a later start would use a different identity.
+if ($OnWindows) {
+    $SavedStateDir = [Environment]::GetEnvironmentVariable("URNETWORK_STATE_DIR", [EnvironmentVariableTarget]::User)
+    if (-not $SavedStateDir) {
+        $SavedStateDir = [Environment]::GetEnvironmentVariable("URNETWORK_STATE_DIR", [EnvironmentVariableTarget]::Machine)
+    }
+    if ("$env:URNETWORK_STATE_DIR" -ne "$SavedStateDir") {
+        Write-Host "Note: ignoring URNETWORK_STATE_DIR set in this window only; the background miner uses $(if ($SavedStateDir) { $SavedStateDir } else { '%USERPROFILE%\.urnetwork' })"
+        $env:URNETWORK_STATE_DIR = $SavedStateDir
+    }
+}
+
 $StateDir = $env:URNETWORK_STATE_DIR
 if (-not $StateDir) {
     $StateDir = Join-Path $HOME -ChildPath ".urnetwork"
@@ -422,8 +436,22 @@ function Start-Provider {
     Start-Sleep -Seconds 2
     if ($Registering) {
         # Registration may be refused a little later; wait for its outcome.
+        # A refused sign-in won't fix itself, so it stops the wait at once.
         for ($Wait = 0; $Wait -lt 30 -and -not (Test-Registered) -and (Get-ProviderProcess).Count -gt 0; $Wait++) {
             Start-Sleep -Seconds 1
+            $Recent = "$(Get-Content -LiteralPath $ProviderLogPath -Raw -ErrorAction SilentlyContinue)"
+            $At = $Recent.LastIndexOf($Marker)
+            if ($At -gt 0) {
+                $Recent = $Recent.Substring($At)
+            }
+            if ($Recent -match "network_sign_in_rejected|client_revoked") {
+                Get-ProviderProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+                $Hint = Get-StartFailureHint -Marker $Marker
+                if (-not $Hint) {
+                    $Hint = "The network didn't accept this device's sign-in. Sign in again with 'urnetwork auth', then 'urnet-tools start'."
+                }
+                throw "Registering this device was refused. $Hint"
+            }
         }
         if ((Test-Registered)) {
             Write-Host "This device is registered"
