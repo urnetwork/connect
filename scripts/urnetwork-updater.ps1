@@ -93,6 +93,7 @@ while ($true) {
     if (($Now - (Get-LastCheck)) -ge $Interval) {
         Limit-Log
         Add-UpdaterLog "checking for an update"
+        $env:URNETWORK_REQUIRE_CHECKSUM = "1"
         & $PowerShellPath -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ToolsPath update 2>&1 | ForEach-Object {
             Add-UpdaterLog "  $_"
         }

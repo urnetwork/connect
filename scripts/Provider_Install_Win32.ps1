@@ -525,6 +525,10 @@ function Invoke-Install {
             }
             Write-Host "Checked the SHA-256 of $($Asset.name)"
         }
+        elseif ($env:URNETWORK_REQUIRE_CHECKSUM -eq "1") {
+            # Set by the background updater: unattended, nothing is installed unchecked.
+            throw "Release $ReleaseVersion doesn't publish a SHA-256 for $($Asset.name), so the automatic update skipped it. 'urnet-tools update' installs it by hand."
+        }
         else {
             Write-Host "Warning: release $ReleaseVersion doesn't publish a SHA-256 for $($Asset.name), so the download can't be checked"
         }

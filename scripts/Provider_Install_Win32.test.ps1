@@ -138,6 +138,7 @@ function Invoke-EndToEnd {
 #include <stdlib.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
+    if (argc > 2 && strcmp(argv[2], "--help") == 0) { puts("provide [--allow-client-registration]"); return 0; }
     if (argc > 1 && strcmp(argv[1], "provide") == 0) {
         /* Like the released miner: a new device needs --allow-client-registration. */
         char path[4096]; snprintf(path, sizeof path, "%s/.provider.jwt", getenv("URNETWORK_STATE_DIR"));

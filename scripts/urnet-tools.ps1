@@ -412,6 +412,13 @@ function Start-Provider {
     $ProvideArguments = "provide"
     $Registering = -not (Test-Registered)
     if ($Registering) {
+        # Older miners don't have the flag and would refuse to start with it.
+        $ErrorActionPreference = "Continue"
+        $ProvideHelp = "$(& $BinaryPath provide --help 2>&1)"
+        $ErrorActionPreference = "Stop"
+        $Registering = $ProvideHelp -match "allow-client-registration"
+    }
+    if ($Registering) {
         Write-Host "First start on this device: registering it with the network"
         $ProvideArguments = "provide --allow-client-registration"
     }
