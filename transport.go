@@ -2544,7 +2544,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			cancelDial()
 			// a dial this transport's teardown or a network change canceled
 			// says nothing about the move target either
-			if self.ctx.Err() == nil && !kickedDuringDial && moveAttempt.dialedTargets() {
+			closing := false
+			select {
+			case <-self.ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !kickedDuringDial && moveAttempt.dialedTargets() {
 				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
 				self.noteMoveDialFailed(moveAttempt, TransportModeH1, err)
 			}
@@ -3591,7 +3597,13 @@ func (self *PlatformTransport) runH3(
 			releaseAttempt()
 			// a dial this transport's teardown or a network change canceled
 			// says nothing about the move target either
-			if ctx.Err() == nil && !attemptCanceled && !kickedDuringDial && moveAttempt.dialedTargets() {
+			closing := false
+			select {
+			case <-ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !attemptCanceled && !kickedDuringDial && moveAttempt.dialedTargets() {
 				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
 				self.noteMoveDialFailed(moveAttempt, ptMode, err)
 			}
