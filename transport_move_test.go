@@ -1034,3 +1034,56 @@ func TestMoveDialOverrideMatchesOnlyItsHost(t *testing.T) {
 		t.Fatalf("v4 dial of a v6 target = %v", err)
 	}
 }
+
+// A move's targets are fixed addresses, as a literal is: a handshake that
+// stalls at a target neither demotes its family nor retries the other one,
+// and a target that cannot connect does not undo a live demotion. Without the
+// move, the same stall demotes and retries
+// (TestFamilyFallbackRecoversFromAPostConnectTimeout).
+func TestFamilyFallbackTreatsMoveTargetsAsLiterals(t *testing.T) {
+	restore := swapControlFamilyProbe(func(int) bool { return true })
+	defer restore()
+	controlFamilyClear()
+	defer controlFamilyClear()
+	SetControlIpFamilyPolicy(IpFamilyAuto)
+	ctx := withMoveDialOverride(context.Background(), &moveDialOverride{
+		host:      "api.example",
+		targetIps: []netip.Addr{testMoveTargetIpv6},
+	})
+
+	var stateLock sync.Mutex
+	dialed := []string{}
+	stall := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		stateLock.Lock()
+		dialed = append(dialed, network)
+		stateLock.Unlock()
+		return &stubConn{remote: &net.TCPAddr{IP: net.IP(testMoveTargetIpv6.AsSlice()), Port: 443}}, nil
+	}
+	handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		return nil, &timeoutError{}
+	}
+	if _, err := dialControlTlsWithFamilyFallback(ctx, DefaultConnectSettings(), "tcp", "api.example:443", stall, handshake); err == nil {
+		t.Fatal("a stalled handshake at the target connected")
+	}
+	stateLock.Lock()
+	if !slices.Equal(dialed, []string{"tcp"}) {
+		t.Fatalf("dialed %v, want one dial with no family retry", dialed)
+	}
+	stateLock.Unlock()
+	if family := controlFamilyDemotedFamily(); family != 0 {
+		t.Fatalf("a stall at a move target demoted ipv%d", family)
+	}
+
+	if !controlFamilyDemote(6) {
+		t.Fatal("expected the demotion to take")
+	}
+	unreachable := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("connect: network is unreachable")}
+	}
+	if _, err := dialControlTlsWithFamilyFallback(ctx, DefaultConnectSettings(), "tcp", "api.example:443", unreachable, handshake); err == nil {
+		t.Fatal("an unreachable target connected")
+	}
+	if family := controlFamilyDemotedFamily(); family != 6 {
+		t.Fatalf("a move target that could not connect undid the demotion (demoted ipv%d)", family)
+	}
+}
