@@ -99,6 +99,7 @@ show_help ()
         echo "  --auth-code CODE        Sign in with this auth code (or set URNETWORK_AUTH_CODE)."
         echo "                          Without it, the installer asks when run in a terminal."
         echo "  --no-start              Install only: don't sign in or start the provider"
+        echo "  -y, --yes               Don't ask anything (sign in only with --auth-code)"
     fi
 
     echo ""
@@ -587,6 +588,67 @@ signed_in ()
     [ -s "$state_dir/jwt" ]
 }
 
+# whether this device has its own provider identity yet. The miner only
+# creates one when started with --allow-client-registration; without it,
+# a new device's `provide' reports startup_recovery_required and exits 0.
+device_registered ()
+{
+    [ -s "$state_dir/.provider.jwt" ]
+}
+
+# First start of a new device: run the miner once in the foreground with
+# --allow-client-registration until it has written .provider.jwt, then stop
+# it so the service takes over. The flag never replaces a retained identity.
+register_device ()
+{
+    if device_registered; then
+        return 0
+    fi
+
+    pr_info "Registering this device with URnetwork (first start, up to 2 minutes)"
+
+    if ! reg_log="$(mktemp "${TMPDIR:-/tmp}/urnetwork-register.XXXXXX")"; then
+        reg_log=/dev/null
+    fi
+
+    "$install_path/bin/urnetwork" provide --allow-client-registration < /dev/null > "$reg_log" 2>&1 &
+    reg_pid=$!
+    waited=0
+
+    while [ "$waited" -lt 120 ] && ! device_registered && kill -0 "$reg_pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    kill "$reg_pid" 2>/dev/null
+    waited=0
+
+    while [ "$waited" -lt 15 ] && kill -0 "$reg_pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    kill -9 "$reg_pid" 2>/dev/null
+    wait "$reg_pid" 2>/dev/null
+
+    if device_registered; then
+        [ "$reg_log" != /dev/null ] && rm -f "$reg_log"
+        pr_info "This device is registered"
+        return 0
+    fi
+
+    pr_err "Registering this device didn't finish. The miner said:"
+
+    if [ "$reg_log" != /dev/null ]; then
+        tail -n 8 "$reg_log" | sed 's/^/    /' >&2
+        rm -f "$reg_log"
+    fi
+
+    pr_err "Check your internet connection and try \`urnet-tools start' again"
+    pr_err "Or run it once yourself: urnetwork provide --allow-client-registration"
+    return 1
+}
+
 # prints the configured update interval, read back from the timer unit
 current_interval ()
 {
@@ -911,7 +973,7 @@ sign_in ()
         return 0
     fi
 
-    if [ -z "$auth_code" ] && [ "$no_start" -eq 0 ] && have_tty; then
+    if [ -z "$auth_code" ] && [ "$no_start" -eq 0 ] && [ "$assume_yes" -eq 0 ] && have_tty; then
         printf "\n"
         printf "Sign in to start mining. Get an auth code at %shttps://ur.io%s\n" "$bold" "$plain"
         printf "Auth code (or press Enter to do this later): "
@@ -943,6 +1005,8 @@ start_provider ()
         fi
 
         pr_err "warning: %s has no sign-in; if the provider stops, run \`urnetwork auth' (code at https://ur.io)" "$state_dir"
+    elif ! unit_active urnetwork.service && ! register_device; then
+        return 1
     fi
 
     if ! systemctl --user enable urnetwork.service > /dev/null 2>&1; then
@@ -998,7 +1062,7 @@ do_install ()
 {
     case "$operation" in
         install)
-            allow_opts --tag --no-modify-bashrc --interval --auth-code --no-start
+            allow_opts --tag --no-modify-bashrc --interval --auth-code --no-start --yes
             ;;
 
         update)
@@ -1363,7 +1427,12 @@ install_summary ()
             printf "Sign in:         %surnetwork auth%s              # auth code from <https://ur.io>\n" "$bold" "$plain"
         fi
 
-        printf "Start:           %surnetwork provide%s           # in the foreground; keep the terminal open\n" "$bold" "$plain"
+        if device_registered; then
+            printf "Start:           %surnetwork provide%s           # in the foreground; keep the terminal open\n" "$bold" "$plain"
+        else
+            printf "First start:     %surnetwork provide --allow-client-registration%s   # registers this device; keep the terminal open\n" "$bold" "$plain"
+            printf "After that:      %surnetwork provide%s\n" "$bold" "$plain"
+        fi
         printf "No background service or automatic updates without a systemd user session.\n"
         printf "Update later with:  %surnet-tools update%s\n" "$bold" "$plain"
     fi
@@ -1644,6 +1713,7 @@ show_status ()
 
     echo "Installed:     $(installed_version) in $install_path"
     echo "Signed in:     $(yes_no signed_in)"
+    echo "Registered:    $(yes_no device_registered)"
 
     if [ "$has_systemd" -ne 1 ]; then
         echo "Service:       none (no systemd user session)"
