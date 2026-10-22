@@ -11,6 +11,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"testing"
 )
@@ -212,6 +213,72 @@ func TestTcpRecoveryAdvancingAckRetainsPublicPendingSynBarrier(t *testing.T) {
 		t.Fatal("public delivery count or pre-Run route ownership changed")
 	}
 	f.close()
+}
+
+// Refusing a genuine new SYN on an unhealthy selection cannot consume the
+// old cohort or the retry. Restoring health admits that exact public packet.
+func TestTcpRecoveryPublicSynRefusalPreservesHealthyRetry(t *testing.T) {
+	f := newTcpAckBenchFixture(t, 0, 1)
+	selection := f.update.client.loadSelection()
+	f.update.stateLock.Lock()
+	epoch, recovery := f.update.sequenceAdmissionEpoch, f.update.sequenceRecovery
+	f.update.stateLock.Unlock()
+	beforeCalls := f.seamCalls
+	sequence := f.sourceNext + 100
+	syn := tcpAckBenchPacket(f.egressPath, sequence, 0, tcpFlagSyn, 0)
+	f.channel.stateLock.Lock()
+	f.channel.healthy = false
+	f.channel.stateLock.Unlock()
+	if f.offer(syn) {
+		t.Fatal("unhealthy selection admitted a genuine new public SYN")
+	}
+	f.update.stateLock.Lock()
+	unchanged := !f.update.IsDone() && f.update.client.loadSelection() == selection &&
+		f.update.sequenceAdmissionEpoch == epoch && f.update.sequenceRecovery == recovery &&
+		f.update.synGenerationNumber == tcpAckBenchSourceInitial && f.update.receivedInbound.Load() &&
+		f.update.sequenceClaims == nil && f.update.sequenceSynOffers == 0
+	f.update.stateLock.Unlock()
+	if !unchanged || f.seamCalls != beforeCalls {
+		t.Fatal("refused SYN changed the retained cohort or fabricated admission")
+	}
+	f.channel.stateLock.Lock()
+	f.channel.healthy = true
+	f.channel.stateLock.Unlock()
+	if !f.offer(syn) || f.update.client.loadSelection() != selection || f.seamCalls != beforeCalls+1 {
+		t.Fatal("restored healthy selection failed the exact refused public SYN retry")
+	}
+	f.update.stateLock.Lock()
+	advanced := f.update.synGenerationNumber == sequence && f.update.sequenceAdmissionEpoch > epoch
+	f.update.stateLock.Unlock()
+	if !advanced || f.offer(syn) || f.seamCalls != beforeCalls+1 {
+		t.Fatal("actual healthy admission lost its new cohort or identical-SYN gate")
+	}
+}
+
+// A healthy IPv4 provider still cannot carry a prebound IPv6 SYN. Its refusal
+// preserves the selected receipt and leaves the established IPv4 sibling live.
+func TestTcpRecoveryPublicSynRejectsUnsupportedSelectedFamily(t *testing.T) {
+	f := newTcpAckBenchFixture(t, 0, 1)
+	if !f.channel.supportsIpVersion(4) || f.channel.supportsIpVersion(6) {
+		t.Fatal("legacy fixture provider must retain its IPv4-only family contract")
+	}
+	path := &IpPath{Version: 6, Protocol: IpProtocolTcp,
+		SourceIp: net.ParseIP("2001:db8:1::131"), DestinationIp: net.ParseIP("2001:db8:2::132"),
+		SourcePort: 45072, DestinationPort: 443}
+	syn := ipOosTcpPacketSequence(path, tcpFlagSyn, 500, nil)
+	update, _, _ := f.parent.sendUpdate(path, flowPin{})
+	update.client.Store(f.channel)
+	f.parent.bindClientFlow(update, f.channel)
+	selection, beforeCalls := update.client.loadSelection(), f.seamCalls
+	if f.offer(syn) || f.seamCalls != beforeCalls || update.IsDone() ||
+		update.client.loadSelection() != selection || update.synGenerationSeen || update.sequenceClaims != nil {
+		t.Fatal("unsupported-family SYN bypassed placement or changed caller-owned state")
+	}
+	if _, accepted := f.send(true); !accepted {
+		t.Fatal("unsupported-family refusal blocked the healthy IPv4 sibling")
+	}
+	f.receive(f.sourceNext)
+	f.requireState(2)
 }
 
 // Wraparound progress still takes full validation. An out-of-window or

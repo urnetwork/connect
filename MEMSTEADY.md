@@ -5523,3 +5523,59 @@ All started workers join,pools0,and source/fixture guards pass. This keeps byte
 pacing and budgets unchanged, so removing drains alone does not fix browsing.
 The next target is rate/meter/feedback capture, not a larger queue. Receipt in
 the same directory: `NO-DRAIN-OUTCOME.v1.json`. No mobile memory qualification.
+
+### 2026-10-21 — actual default-off pacing candidate
+
+The canonical implementation, without private production overlays, completed
+the unchanged overlapping 100-page workload: 100 navigations, zero five-second
+stalls, maximum HTML first byte 2.71711175 s, workload 169.473434875 s (test
+175.66 s). All 400 asset workers/server attempts joined, no pending owners or
+body-close errors remained, and pool roots/bytes drained to zero. Exact fixture
+cleanup and matching source-before/after checks passed. Receipt:
+`/Volumes/data/urnetwork-native100-canonical.PREP.nZ1mNs2a/OUTCOME.json`.
+
+Unlike the earlier broad experimental bypass, this candidate gates only the
+extra application pacing wait. Window resizing, route-policy checks, ACKs and
+hard byte ownership budgets remain enabled; configured memory was not enlarged
+to obtain this result. It is one focused host diagnostic, not statistically
+qualified throughput or 32-MiB iOS / 64-MiB Android memory evidence.
+
+The pressure root now rejects five-second navigation stalls explicitly, with
+eight deterministic acceptance variations; its eleven-root small cohort passes
+normal/race on Go 1.27.3. Newer upstream transport/window/SDK changes were then
+merged for the test-build checkpoint, so a fresh full100/full-suite replay is
+still required. The first post-sync attempt refused the stale harness toolchain
+directive contract before traffic; do not count that as a packet-flow failure.
+
+After repairing the selector, the merged-source canonical replay also passes
+with the permanent latency gate: 100 navigations, zero five-second stalls,
+maximum HTML first byte 3.094035291 s, workload 179.321613750 s (test 185.58 s),
+95 overlap proofs. All 400 asset clients/server attempts join; pool roots/bytes
+drain to zero. Wrapper exit, exact fixture cleanup and source-before/after
+identity checks pass, with no production overlay. Evidence:
+`/Volumes/data/urnetwork-native100-postmerge-fixed.PREP.vCUWKke0`.
+The 169.47-s and 179.32-s workloads use different source snapshots, so their
+difference is not a statistical regression comparison. Full-suite and mobile
+memory qualification remain outstanding.
+
+### 2026-10-21 — avoid confusing retry-state stalls with memory pressure
+
+Broader correctness exposed another bounded-flow defect after the fixtures
+were given realistic positive provider health. Silence inference withdrew an
+incumbent at three seconds, but its group retained the incumbent's affinity
+reuse flag. Fresh replacement offers then failed the final reuse check and
+waited for the application's next SYN at seven seconds. Adding memory would
+not repair that stale placement decision.
+
+The explicit real-source regression is OLD RED with zero replacement Pack
+starts at three seconds. Clearing only that flag after a successful guarded
+unbind makes the nine-root cohort pass (0.603 s): the same third SYN reaches a
+real replacement source at three seconds with exactly one ACK-required start,
+route write and terminal completion. Held-producer response custody and pool
+reconciliation also pass. No queue, memory budget, timeout or ACK policy changed.
+Evidence: `/Volumes/data/urnetwork-connect-health-six.wDnTj2da`.
+
+The minimal fix is integrated, but expanded race/full correctness and another
+canonical 100-page replay remain pending for that source. These ownership
+measurements are not peak runtime/footprint qualification of either mobile
+profile, nor proof that this defect caused the reported real-device session.

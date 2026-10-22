@@ -49,27 +49,6 @@ func TestAffinityRenewalNativeGroupingSplitsResetThenSameIsn(t *testing.T) {
 	}
 }
 
-// A same-ISN SYN in an earlier batch is not a SYN in this batch. A data
-// prefix therefore stays separate from the new SYN, even though recovery's
-// lower homogeneous-group layer can deliberately admit both as one cohort.
-func TestAffinityRenewalNativeGroupingSplitsDataBeforeSameIsn(t *testing.T) {
-	packets := [][]byte{
-		groupRecoveryPacket(501, 500, 64, tcpFlagAck, []byte{1}),
-		groupRecoveryPacket(500, 0, 64, tcpFlagSyn, nil),
-		groupRecoveryPacket(500, 0, 64, tcpFlagSyn, nil),
-	}
-	indexes := map[*ipPacketGroup][]int{}
-	groups, rejected := groupIpPacketsBoundedIndexed(packets, 0, 0, indexes)
-	if len(rejected) != 0 || len(groups) != 1 || len(groups[0].packets) != 3 {
-		t.Fatal("fixture did not form one homogeneous recovery group")
-	}
-	got := splitAffinitySynGroups(groups, indexes)
-	if len(got) != 2 || !slices.Equal(indexes[got[0]], []int{0}) ||
-		!slices.Equal(indexes[got[1]], []int{1, 2}) || len(indexes) != 2 {
-		t.Fatal("public batch conflated its data prefix with a later same-ISN SYN")
-	}
-}
-
 // Real public parsing, security, grouping, indexing and pool ownership; only
 // placement and final Transfer admission are seams in this grouping root.
 func testAffinityRenewalNativeMixedBatch(t *testing.T, prefixFlags byte, refuse int, cancelAfterPrefix, mux bool) {

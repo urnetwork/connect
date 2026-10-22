@@ -285,19 +285,29 @@ func (self *windowRoundFixture) offer(messageCount int, payloadByteCount int) {
 	}()
 }
 
-// Delivers one Pack and captures the latest cumulative or selective Ack. A
-// head release can drain several held items and coalesce their acknowledgements.
+// Captures every owned ACK wire share in publication order. Feedback such
+// as eviction withdrawals is not implied by a later cumulative or selective ACK.
+func (self *windowRoundFixture) takeAcknowledgements() []*windowRoundFrame {
+	self.t.Helper()
+	acks := []*windowRoundFrame{self.take(self.receiverOut)}
+	for len(self.receiverOut) != 0 {
+		acks = append(acks, self.take(self.receiverOut))
+	}
+	for _, ack := range acks {
+		if ack.ack == nil {
+			self.t.Fatal("receiver published a Pack in place of its acknowledgement")
+		}
+	}
+	return acks
+}
+
+// Delivers one Pack and captures the latest cumulative or selective Ack. This
+// projection is only suitable when earlier feedback has no independent meaning.
 func (self *windowRoundFixture) receive(frame *windowRoundFrame) *windowRoundFrame {
 	self.t.Helper()
 	self.forward(frame, self.receiverIn)
-	ack := self.take(self.receiverOut)
-	for len(self.receiverOut) != 0 {
-		ack = self.take(self.receiverOut)
-	}
-	if ack.ack == nil {
-		self.t.Fatal("receiver published a Pack in place of its acknowledgement")
-	}
-	return ack
+	acks := self.takeAcknowledgements()
+	return acks[len(acks)-1]
 }
 
 // Looks up the only application sender after its initial wire write. Mutable

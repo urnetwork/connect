@@ -152,8 +152,8 @@ func newTcpAckBenchFixture(t testing.TB, payloadBytes, batchSize int, nativeDept
 	}
 	f.channel = newPacketTransferTestChannel()
 	f.channel.ctx, f.channel.settings, f.channel.log = ctx, settings, NewNoopLogger()
-	// This bare provider is the fixture's chosen healthy exit. A prebound
-	// unknown-health exit must be renewed before an unestablished SYN.
+	// The preselected provider is available; the accounting-only helper
+	// otherwise starts unhealthy and correctly fails the public SYN guard.
 	f.channel.healthy = true
 	f.channel.args = &multiClientChannelArgs{
 		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
@@ -187,8 +187,8 @@ func newTcpAckBenchFixture(t testing.TB, payloadBytes, batchSize int, nativeDept
 	f.update, _, _ = f.parent.sendUpdate(path, flowPin{})
 	f.update.client.Store(f.channel)
 	f.parent.bindClientFlow(f.update, f.channel)
-	if !f.parent.reuseAffinitySyn(f.update, f.channel, path) {
-		t.Fatal("benchmark provider lacks positive, young SYN affinity")
+	if f.parent.sendClientPathForTest != nil || !f.parent.reuseAffinitySyn(f.update, f.channel, path) {
+		t.Fatal("benchmark selected provider lacks live healthy SYN eligibility")
 	}
 	if !f.offer(syn) {
 		t.Fatal("benchmark SYN was not admitted")

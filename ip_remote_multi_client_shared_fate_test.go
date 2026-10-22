@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -79,13 +78,12 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
-		var probeCompletions atomic.Int32
 		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-			// A terminal failure reaches the quarantine verdict gate. Mere
-			// admission with no callback is non-convicting before that gate.
+			// A real terminal callback reaches the quarantine gate. Admission
+			// without any callback is held earlier and cannot test this verdict.
 			go func() {
-				probeCompletions.Add(1)
-				ackCallback(errors.New("fixture terminal probe failure"))
+				time.Sleep(40*time.Millisecond - time.Nanosecond)
+				ackCallback(errors.New("synthetic terminal probe failure"))
 			}()
 			return true, nil
 		})
@@ -96,7 +94,6 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 
 		AssertEqual(t, client.setQuarantined(blackholeNoReceiveAck), true)
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-		AssertEqual(t, probeCompletions.Load(), int32(1))
 		AssertEqual(t, client.IsDone(), false)
 		client.stateLock.Lock()
 		endErr := client.endErr
@@ -104,13 +101,12 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 		AssertEqual(t, endErr == nil, true)
 
 		// the bench lifts with the stall still real: the carried evidence
-		// convicts after a fresh probe actually terminates
+		// convicts once the probe budget of a fresh pass elapses
 		client.clearQuarantine()
 		sibling.stateLock.Lock()
 		sibling.lastReceiveAckTime = time.Now()
 		sibling.stateLock.Unlock()
 		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-		AssertEqual(t, probeCompletions.Load(), int32(2))
 		AssertEqual(t, client.IsDone(), true)
 	})
 }
@@ -122,11 +118,10 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
 		metrics := newReliabilityMetrics()
-		var probeCompletions atomic.Int32
 		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
 			go func() {
-				probeCompletions.Add(1)
-				ackCallback(errors.New("fixture terminal probe failure"))
+				time.Sleep(40*time.Millisecond - time.Nanosecond)
+				ackCallback(errors.New("synthetic terminal probe failure"))
 			}()
 			return true, nil
 		})
@@ -149,7 +144,6 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		metrics.recordSharedFate(NewId(), time.Now())
 
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
-		AssertEqual(t, probeCompletions.Load(), int32(1))
 		AssertEqual(t, client.IsDone(), false)
 		AssertEqual(t, metrics.verdictsHeldSharedFate.Load() >= 1, true)
 
@@ -167,7 +161,6 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		sibling.lastReceiveAckTime = time.Now()
 		sibling.stateLock.Unlock()
 		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-		AssertEqual(t, probeCompletions.Load(), int32(2))
 		AssertEqual(t, client.IsDone(), true)
 	})
 }
@@ -180,12 +173,11 @@ func TestStallPassCrossRecordsSharedFate(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
 		metrics := newReliabilityMetrics()
-		var probeCompletions atomic.Int32
 		newStalled := func() *multiClientChannel {
 			c := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
 				go func() {
-					probeCompletions.Add(1)
-					ackCallback(errors.New("fixture terminal probe failure"))
+					time.Sleep(40*time.Millisecond - time.Nanosecond)
+					ackCallback(errors.New("synthetic terminal probe failure"))
 				}()
 				return true, nil
 			})
@@ -213,13 +205,63 @@ func TestStallPassCrossRecordsSharedFate(t *testing.T) {
 		}
 
 		window.convictSendStalls(stallTimeout)
-		AssertEqual(t, probeCompletions.Load(), int32(2))
 		// neither co-sufferer is executed: each saw the other's evidence,
 		// recorded by the same pass that judged them
 		AssertEqual(t, clientA.IsDone(), false)
 		AssertEqual(t, clientB.IsDone(), false)
 		AssertEqual(t, 2 <= metrics.verdictsHeldSharedFate.Load(), true)
 	})
+}
+
+// Missing callback evidence holds before either verdict gate: neither an old
+// quarantine nor simultaneous silence can turn local admission into a failed
+// remote question, a shared-fate verdict count, or a fabricated data ACK.
+func TestStallUnansweredProbeCannotBorrowQuarantineOrSharedFate(t *testing.T) {
+	for _, quarantined := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			metrics := newReliabilityMetrics()
+			attempts := 0
+			client := busyProbeTestChannel(t, func(_ time.Duration, _ func(error)) (bool, error) {
+				attempts++
+				return true, nil
+			})
+			client.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
+			stallPast(client, 20*time.Millisecond)
+			client.stateLock.Lock()
+			pendingAt, pendingGeneration := client.pendingSendTime, client.pendingSendGeneration
+			client.stateLock.Unlock()
+			if quarantined && !client.setQuarantined(blackholeNoReceiveAck) {
+				t.Fatal("quarantine premise was not installed")
+			}
+			metrics.recordSharedFate(NewId(), time.Now())
+			sibling := receivingSibling()
+			sibling.ctx = context.Background()
+			window := busyProbeTestWindow(40*time.Millisecond, client, sibling)
+			window.reliabilitySettingsFunc = func() *ReliabilitySettings {
+				return &ReliabilitySettings{BusyProbe: true, BusyProbeBudget: 40 * time.Millisecond,
+					SharedFateMinExits: 2, SharedFateWindow: time.Minute}
+			}
+			if window.convictSendStalls(20 * time.Millisecond) {
+				t.Fatal("unanswered admission convicted through a later verdict gate")
+			}
+			client.stateLock.Lock()
+			owner := client.busyProbe
+			client.stateLock.Unlock()
+			if owner == nil || window.convictSendStalls(20*time.Millisecond) || attempts != 1 {
+				t.Fatal("repeated verdict evaluation lost the single pending callback owner")
+			}
+			client.stateLock.Lock()
+			unchanged := client.busyProbe == owner && !owner.waiting && !owner.completed &&
+				client.endErr == nil && client.busyProbeAckTime.IsZero() && !client.busyProbeOutstanding &&
+				client.pendingSendTime.Equal(pendingAt) && client.pendingSendGeneration == pendingGeneration &&
+				client.packetStats.sendNackCount == 1 && client.packetStats.sendNackByteCount == 1440 && client.packetStats.sendAckCount == 0
+			client.stateLock.Unlock()
+			if !unchanged || client.IsDone() || sibling.IsDone() || metrics.verdictsHeldSharedFate.Load() != 0 ||
+				metrics.busyProbesSent.Load() != 1 || metrics.busyProbesAcquitted.Load() != 0 {
+				t.Fatal("unknown callback borrowed a verdict, changed pending accounting or invented progress")
+			}
+		})
+	}
 }
 
 // --- fix 3: the shared-fate gate at the blackhole verdict site ---
