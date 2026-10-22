@@ -187,6 +187,10 @@ $StateDir = $env:URNETWORK_STATE_DIR
 if (-not $StateDir) {
     $StateDir = Join-Path $HOME -ChildPath ".urnetwork"
 }
+elseif (-not [IO.Path]::IsPathRooted($StateDir)) {
+    # The miner runs in the install folder and resolves it from there.
+    $StateDir = Join-Path $InstalledPath -ChildPath $StateDir
+}
 
 # The miner's own "provider update" looks for these two names, so keep them.
 $AutoStartShortcut = ""
@@ -308,26 +312,60 @@ function Test-SignedIn {
     return (Test-Path -LiteralPath (Join-Path $StateDir -ChildPath "jwt"))
 }
 
-# Test-Registered is true once the miner has registered this device: it then
-# keeps the device's own sign-in in .provider.jwt.
+# Test-Registered is true once the miner has registered this device: like
+# the miner, any .provider*.jwt counts (proxy setups name theirs
+# .provider-<hash>.jwt).
 function Test-Registered {
-    return (Test-Path -LiteralPath (Join-Path $StateDir -ChildPath ".provider.jwt"))
+    return @(Get-ChildItem -LiteralPath $StateDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ".provider*.jwt" }).Count -gt 0
+}
+
+function Test-StateFile {
+    param([String]$Name)
+    return (Test-Path -LiteralPath (Join-Path $StateDir -ChildPath $Name))
+}
+
+# Get-IdentityProblem names states the miner refuses to start from, which
+# no registration or restart fixes.
+function Get-IdentityProblem {
+    if (Test-StateFile ".provider.jwt.rejected") {
+        return "This device was removed from your URnetwork account, so the network won't accept it again. To mine from this PC as a new device, rename the folder $StateDir (keep it, don't delete it), sign in with 'urnetwork auth' and start again."
+    }
+    if ((Test-StateFile ".provider.jwt") -and -not (Test-StateFile ".provider.key")) {
+        return "This device's identity is from an older miner and needs a one-time recovery step before this version can use it. See https://ur.xyz/docs/miner (Troubleshooting)."
+    }
+    return ""
 }
 
 # Get-StartFailureHint explains the usual reasons a provider stops at once,
-# from the end of its log.
+# from what this start added to its log.
 function Get-StartFailureHint {
-    $Tail = ""
-    if (Test-Path -LiteralPath $ProviderLogPath) {
-        $Tail = (Get-Content -LiteralPath $ProviderLogPath -Tail 40) -join "`n"
+    param([String]$Marker)
+    $Text = ""
+    foreach ($Log in @($ProviderLogPath, "$ProviderLogPath.err")) {
+        if (Test-Path -LiteralPath $Log) {
+            $Text += "$(Get-Content -LiteralPath $Log -Raw)`n"
+        }
     }
-    if ($Tail -match "requires Unix custody support") {
-        return "This URnetwork release can't register a new device on Windows yet. Windows support is on its way; until then this PC can't mine with the official release."
+    $At = $Text.LastIndexOf($Marker)
+    if ($At -ge 0) {
+        $Text = $Text.Substring($At)
     }
-    if ($Tail -match "startup_recovery_required") {
+
+    if ($Text -match "startup_recovery_required") {
+        # The miner logs only the event, not why. A device that never got a
+        # key here means registration itself failed.
+        if (-not (Test-Registered) -and -not (Test-StateFile ".provider.key")) {
+            if ($OnWindows) {
+                return "This URnetwork release can't register a new device on Windows yet. Windows support is on its way; until then this PC can't mine with the official release."
+            }
+            return "Registering this device failed. See $ProviderLogPath."
+        }
         return "This device's miner identity in $StateDir is incomplete (files missing or changed). Restore your backup of that folder."
     }
-    if ($Tail -match "network_sign_in_rejected|sign.in.*(rejected|expired)") {
+    if ($Text -match "client_revoked") {
+        return (Get-IdentityProblem)
+    }
+    if ($Text -match "network_sign_in_rejected") {
         return "The network didn't accept this device's sign-in. Sign in again with 'urnetwork auth', then 'urnet-tools start'."
     }
     return ""
@@ -344,6 +382,10 @@ function Start-Provider {
     if (-not (Test-SignedIn)) {
         throw "You're not signed in yet. Sign in with 'urnetwork auth' (auth code from https://ur.io), then start again."
     }
+    $Problem = Get-IdentityProblem
+    if ($Problem) {
+        throw $Problem
+    }
 
     # Keep the last log beside the current one.
     if ((Test-Path -LiteralPath $ProviderLogPath) -and (Get-Item -LiteralPath $ProviderLogPath).Length -gt 10MB) {
@@ -354,10 +396,15 @@ function Start-Provider {
     # does when asked. It never replaces an identity it already has, and once
     # .provider.jwt exists later starts don't ask again.
     $ProvideArguments = "provide"
-    if (-not (Test-Registered)) {
+    $Registering = -not (Test-Registered)
+    if ($Registering) {
         Write-Host "First start on this device: registering it with the network"
         $ProvideArguments = "provide --allow-client-registration"
     }
+
+    # Marks where this start's output begins in the appended log.
+    $Marker = "=== urnet-tools start $((Get-Date).ToString('u')) ==="
+    Add-Content -LiteralPath $ProviderLogPath -Value $Marker
 
     if ($OnWindows) {
         # cmd.exe writes the provider's output to its log; the window is hidden.
@@ -373,11 +420,23 @@ function Start-Provider {
         Start-Sleep -Milliseconds 500
     }
     Start-Sleep -Seconds 2
+    if ($Registering) {
+        # Registration may be refused a little later; wait for its outcome.
+        for ($Wait = 0; $Wait -lt 30 -and -not (Test-Registered) -and (Get-ProviderProcess).Count -gt 0; $Wait++) {
+            Start-Sleep -Seconds 1
+        }
+        if ((Test-Registered)) {
+            Write-Host "This device is registered"
+        }
+        elseif ((Get-ProviderProcess).Count -gt 0) {
+            Write-Host "Still registering (the network may be slow); 'urnet-tools status' shows when it's done"
+        }
+    }
     if ((Get-ProviderProcess).Count -gt 0) {
         Write-Host "URnetwork is running in the background. Its log: $ProviderLogPath"
     }
     else {
-        $Hint = Get-StartFailureHint
+        $Hint = Get-StartFailureHint -Marker $Marker
         if (-not $Hint) {
             $Hint = "See $ProviderLogPath, or run 'urnetwork provide' in a window."
         }

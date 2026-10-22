@@ -143,7 +143,9 @@ int main(int argc, char **argv) {
         char path[4096]; snprintf(path, sizeof path, "%s/.provider.jwt", getenv("URNETWORK_STATE_DIR"));
         FILE *f = fopen(path, "r");
         if (f) { fclose(f); }
-        else if (argc > 2 && strcmp(argv[2], "--allow-client-registration") == 0) {
+        else if (argc > 2 && strcmp(argv[2], "--allow-client-registration") == 0 && !getenv("FAKE_CANT_REGISTER")) {
+            f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f);
+            snprintf(path, sizeof path, "%s/.provider.key", getenv("URNETWORK_STATE_DIR"));
             f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f);
         }
         else { puts("startup_recovery_required"); fflush(stdout); return 0; }
@@ -232,11 +234,23 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
         $Plain = Start-Process -FilePath (Join-Path $Install "urnetwork") -ArgumentList "provide" -PassThru -RedirectStandardOutput (Join-Path $Root "plain.out")
         $Plain.WaitForExit(5000) | Out-Null
         if (-not $Plain.HasExited) { Fail "fake provider should stop without registration" }
+        # A release that can't register says so, not "restore your backup".
+        $env:FAKE_CANT_REGISTER = "1"
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -or $Out -notmatch "running in the background" -or $Out -notmatch "registering") { Fail "first start: $Out" }
+        Remove-Item Env:FAKE_CANT_REGISTER
+        if ($LASTEXITCODE -eq 0 -or $Out -notmatch "Registering this device failed") { Fail "start that can't register: $Out" }
+        $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $Out -notmatch "running in the background" -or $Out -notmatch "This device is registered") { Fail "first start: $Out" }
         if (-not (Test-Path (Join-Path $State ".provider.jwt"))) { Fail "first start didn't register the device" }
         $Out = & $Pwsh -NoProfile -File $Tools restart 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0 -or $Out -match "registering") { Fail "a registered device registered again: $Out" }
+        Set-Content (Join-Path $State ".provider.jwt.rejected") "x"
+        & $Pwsh -NoProfile -File $Tools stop | Out-Null
+        $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -or $Out -notmatch "removed from your URnetwork account") { Fail "revoked device: $Out" }
+        Remove-Item -Force (Join-Path $State ".provider.jwt.rejected")
+        $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { Fail "start after revoked test: $Out" }
         $Cmd = @(Get-Process -Name urnetwork -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Install/*" }).CommandLine
         if ("$Cmd" -match "allow-client-registration") { Fail "restart still asks to register: $Cmd" }
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
