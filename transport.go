@@ -1055,6 +1055,8 @@ type PlatformTransport struct {
 	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
 	registeredCount  atomic.Int64
 	connectedMonitor *Monitor
+	// set at the first registration and never cleared
+	everRegistered atomic.Bool
 
 	// The extender address of each live H1 connection, counted so two
 	// connections through one extender (a make-before-break generation) are
@@ -1281,6 +1283,13 @@ func (self *PlatformTransport) holdAfterKick(ctx context.Context, mode Transport
 // registered on the route manager
 func (self *PlatformTransport) IsConnected() bool {
 	return 0 < self.registeredCount.Load()
+}
+
+// Whether the platform has ever registered this transport, including a
+// registration since lost. A client whose transports never registered cannot
+// have reached any provider.
+func (self *PlatformTransport) EverConnected() bool {
+	return self.everRegistered.Load()
 }
 
 // IsWaitingForBudget reports whether the reservation required by the selected
@@ -1532,6 +1541,7 @@ func (self *PlatformTransport) offerH1Control(
 
 func (self *PlatformTransport) setRegistered(registered bool) {
 	if registered {
+		self.everRegistered.Store(true)
 		self.registeredCount.Add(1)
 	} else {
 		self.registeredCount.Add(-1)

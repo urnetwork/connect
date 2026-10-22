@@ -50,6 +50,8 @@ func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 		IdentityLoadTimeout:             5 * time.Second,
 		RuntimeExcludeClientMaxCount:    defaultApiRuntimeExcludeClientMaxCount(),
 		ReuseFixedDestinationIdentities: true,
+		DiscoveryIdentityParkMaxCount:   4,
+		DiscoveryIdentityParkMaxAge:     5 * time.Minute,
 	}
 }
 
@@ -109,6 +111,19 @@ type ApiMultiClientGeneratorSettings struct {
 	// identity for its next dial instead of retiring it and minting another.
 	// Captured at construction. See ip_remote_multi_client_identity_reuse.go.
 	ReuseFixedDestinationIdentities bool
+	// DiscoveryIdentityParkMaxCount bounds the identities a discovery
+	// generator parks for its next candidates instead of retiring them. Only
+	// an identity no provider can have seen parks: args never handed to a
+	// client, or a client whose platform transports never registered. Four
+	// covers one expansion pass, which requests at most four candidates.
+	// Non-positive retires every discovery identity, as before. Captured at
+	// construction. See ip_remote_multi_client_identity_reuse.go.
+	DiscoveryIdentityParkMaxCount int
+	// DiscoveryIdentityParkMaxAge retires a parked discovery identity that no
+	// candidate took in time, so an idle window holds no stale credentials.
+	// Five minutes is far inside the platform's idle reaping. Non-positive
+	// retires every discovery identity, as before. Captured at construction.
+	DiscoveryIdentityParkMaxAge time.Duration
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
@@ -178,6 +193,21 @@ type apiWindowClientTransport struct {
 	// when setup began; a client that outlived a failed attempt served its
 	// window, and its identity rotates out instead of being parked
 	createTime time.Time
+	// a transport generation replaced by migration may have registered;
+	// current is asked at teardown (windowTransportMayHaveConnected)
+	replacedMayHaveConnected bool
+}
+
+// Whether a window transport may have registered with the platform, and so
+// carried its client to a provider. A transport that cannot say is assumed to.
+func windowTransportMayHaveConnected(transport apiWindowPlatformTransport) bool {
+	if transport == nil {
+		return false
+	}
+	if everConnected, ok := transport.(interface{ EverConnected() bool }); ok {
+		return everConnected.EverConnected()
+	}
+	return true
 }
 
 // apiTransportCreationLifecycle closes the Add-versus-Wait race around both
@@ -269,6 +299,8 @@ type ApiMultiClientGenerator struct {
 	providerDiscovery       NetworkProviderDiscovery
 	controlTelemetryProbe   bool
 	reuseFixedIdentities    bool
+	discoveryParkMaxCount   int
+	discoveryParkMaxAge     time.Duration
 	// Window carriers created without an explicit caller budget all belong to
 	// this generator. Separate generators never contend through a package root.
 	defaultPlatformTransportBudget *PlatformTransportBudget
@@ -388,6 +420,8 @@ func NewApiMultiClientGenerator(
 		providerDiscovery:              settings.ProviderDiscovery,
 		controlTelemetryProbe:          settings.ControlTelemetryProbe,
 		reuseFixedIdentities:           settings.ReuseFixedDestinationIdentities,
+		discoveryParkMaxCount:          settings.DiscoveryIdentityParkMaxCount,
+		discoveryParkMaxAge:            settings.DiscoveryIdentityParkMaxAge,
 		defaultPlatformTransportBudget: DefaultPlatformTransportBudget(),
 		platformTransportMode:          platformTransportMode,
 		platformModePreferences:        maps.Clone(settings.PlatformTransportModePreferences),
@@ -919,6 +953,11 @@ func (self *ApiMultiClientGenerator) NewClientArgsForDestinationContext(ctx cont
 			},
 		}, nil
 	}
+	// an identity no provider has seen, parked by an earlier discovery
+	// candidate, now for this destination
+	if args := self.takeParkedDiscoveryIdentity(destination); args != nil {
+		return args, nil
+	}
 
 	args, err := self.NewClientArgsContext(ctx)
 	if err != nil {
@@ -1048,6 +1087,11 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		delete(self.transports, client)
 		transport = state.current
 		reusable = !state.refused && time.Since(state.createTime) < windowIdentityReuseMaxClientAge
+		if _, fixed := self.FixedDestinationSize(); !fixed {
+			// a discovery identity moves to another provider, so it parks
+			// only when no provider can have seen it
+			reusable = reusable && !args.P2pOnly && !state.replacedMayHaveConnected && !windowTransportMayHaveConnected(transport)
+		}
 		if len(self.transports) == 0 && self.transportIdle != nil {
 			close(self.transportIdle)
 		}
@@ -1476,6 +1520,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 					swapped := false
 					self.transportLock.Lock()
 					if self.transports[client] == state && state.current == current {
+						state.replacedMayHaveConnected = state.replacedMayHaveConnected || windowTransportMayHaveConnected(current)
 						state.current = next
 						state.policyVersion = nextPolicyVersion
 						swapped = true
@@ -1513,6 +1558,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 		swapped := false
 		self.transportLock.Lock()
 		if self.transports[client] == state && state.current == current {
+			state.replacedMayHaveConnected = state.replacedMayHaveConnected || windowTransportMayHaveConnected(current)
 			state.current = next
 			state.policyVersion = nextPolicyVersion
 			swapped = true

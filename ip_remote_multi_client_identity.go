@@ -120,6 +120,10 @@ type windowIdentityState struct {
 	// their destination, at most one per destination; each also stays in
 	// live. See ip_remote_multi_client_identity_reuse.go.
 	parked map[MultiHopId]*parkedWindowIdentity
+	// torn-down identities of a discovery generator that no provider has
+	// seen, oldest first, awaiting the next candidate of any destination;
+	// each also stays in live. See ip_remote_multi_client_identity_reuse.go.
+	discoveryParked []*parkedDiscoveryIdentity
 	// set once by the owning generator's close; no identity parks after it
 	parkingClosed bool
 
