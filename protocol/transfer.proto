@@ -323,6 +323,14 @@ message Auth {
     bool provide_intent = 7;
     string client_info = 8;
     uint32 stream_lease_version = 9;
+
+    // the highest `ResidentMigrate` move version the client honors
+    // (server/connect/MOVE.md). 1: the client dials a move's target address
+    // while keeping the platform hostname, reports declines and failures, and
+    // prefers the target for reconnects. Zero (absent) is a client that only
+    // migrates by name, which the platform never sends an advisory move.
+    // This is the frame form of the H1 `X-UR-ResidentMoveVersion` header.
+    uint32 resident_move_version = 10;
 }
 
 
@@ -797,11 +805,77 @@ message EncryptedControl {
 // (CONNECTDRAIN2.md §3.3). The client establishes a replacement transport at
 // `migrate_time` while the current one keeps carrying traffic, then closes
 // the old transport once the replacement is up.
+//
+// With a kind other than drain, the message is a move (server/connect/MOVE.md):
+// the client dials one of `targets`, keeping the platform hostname for TLS and
+// HTTP, so the platform decides which edge the client uses. An older client
+// ignores the move fields and migrates by name, which is the drain behavior.
 message ResidentMigrate {
     // unix milliseconds when the client should begin the migration.
     // the server jitters this across the drain migrate window so the
     // clients do not thundering-herd the siblings
     uint64 migrate_time = 1;
+    // a ulid that identifies the move in the platform's intent, in result
+    // reports and in client dedupe. Absent for a drain migrate.
+    bytes move_id = 2;
+    ResidentMoveKind kind = 3;
+    // at most one target per ip family. The client dials the target of its
+    // transport's family on the platform port, keeping the platform hostname.
+    repeated ResidentMoveTarget targets = 4;
+    // compulsory only: unix milliseconds when the platform closes the old
+    // transport if the client has not moved.
+    uint64 close_time = 5;
+    // milliseconds the client prefers the target address for reconnects to
+    // the platform hostname, after a successful move.
+    uint64 prefer_duration = 6;
+}
+
+enum ResidentMoveKind {
+    // the legacy migrate: same hostname, no target (CONNECTDRAIN2.md)
+    ResidentMoveKindDrain = 0;
+    // guidance the client may decline
+    ResidentMoveKindAdvisory = 1;
+    // the platform closes the old transport at `close_time`
+    ResidentMoveKindCompulsory = 2;
+}
+
+message ResidentMoveTarget {
+    // 4 or 16 bytes
+    bytes ip = 1;
+}
+
+// a client's report that it declined a move, or that the replacement transport
+// failed. A move that succeeds is visible to the platform as an arrival, so it
+// sends no report. Sent to the control id, best effort.
+message ResidentMoveResult {
+    bytes move_id = 1;
+    ResidentMoveOutcome outcome = 2;
+    ResidentMoveReason reason = 3;
+    // the ip family the report applies to: 4 or 6. Zero when not family specific.
+    uint32 ip_family = 4;
+    // failures only: milliseconds from the start of the dial to the failure
+    uint64 elapsed = 5;
+}
+
+enum ResidentMoveOutcome {
+    ResidentMoveOutcomeDeclined = 0;
+    ResidentMoveOutcomeFailed = 1;
+}
+
+enum ResidentMoveReason {
+    ResidentMoveReasonOther = 0;
+    ResidentMoveReasonExtenderCarrier = 1;
+    ResidentMoveReasonDnsCarrier = 2;
+    ResidentMoveReasonNoFamilyTarget = 3;
+    ResidentMoveReasonMemoryBudget = 4;
+    ResidentMoveReasonRecentMove = 5;
+    ResidentMoveReasonTargetFailedRecently = 6;
+    ResidentMoveReasonMobileBackgroundOrMetered = 7;
+    ResidentMoveReasonMoveInProgress = 8;
+    ResidentMoveReasonConnectTimeout = 9;
+    ResidentMoveReasonDialError = 10;
+    ResidentMoveReasonTlsError = 11;
+    ResidentMoveReasonAuthError = 12;
 }
 
 // A hint; receivers refetch an authoritative snapshot before replacing state.

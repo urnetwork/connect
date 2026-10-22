@@ -85,6 +85,11 @@ enum MessageType {
     TransferSubprotocolsQueryResult = 32;
     TransferNetworkSessionsChanged = 33;
     TransferStreamAuthorization = 34;
+    // a client's report that it declined a move or that the replacement
+    // transport failed (server/connect/MOVE.md). Sent to the control id.
+    // `Frame.message_bytes` is a marshaled `ResidentMoveResult`. An older
+    // platform drops the unknown message type.
+    TransferResidentMoveResult = 35;
     // ── URmessage (beta/message). Block 1000-1099 reserved so parallel beta
     // branches do not collide. Every operation lives in a oneof inside
     // MessageServerRequest/Response/Push, NOT as its own MessageType.

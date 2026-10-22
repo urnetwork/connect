@@ -1770,3 +1770,76 @@ func TestResidentMigrateFrameRoundTrip(t *testing.T) {
 	AssertEqual(t, true, ok)
 	AssertEqual(t, migrateTime, residentMigrate.MigrateTime)
 }
+
+// A move rides the move fields of ResidentMigrate (server/connect/MOVE.md §5.1).
+func TestResidentMigrateMoveFieldsRoundTrip(t *testing.T) {
+	moveId := []byte{0x01, 0x92, 0x3c, 0x7a, 0x10, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
+	ip4 := []byte{192, 0, 2, 10}
+	ip6 := []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10}
+	frame, err := ToFrame(&protocol.ResidentMigrate{
+		MigrateTime:    1752900000000,
+		MoveId:         moveId,
+		Kind:           protocol.ResidentMoveKind_ResidentMoveKindCompulsory,
+		Targets:        []*protocol.ResidentMoveTarget{{Ip: ip4}, {Ip: ip6}},
+		CloseTime:      1752900060000,
+		PreferDuration: 6 * 60 * 60 * 1000,
+	}, DefaultProtocolVersion)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, protocol.MessageType_TransferResidentMigrate, frame.MessageType)
+
+	message, err := FromFrame(frame)
+	AssertEqual(t, err, nil)
+	residentMigrate, ok := message.(*protocol.ResidentMigrate)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, uint64(1752900000000), residentMigrate.MigrateTime)
+	AssertEqual(t, true, bytes.Equal(moveId, residentMigrate.MoveId))
+	AssertEqual(t, protocol.ResidentMoveKind_ResidentMoveKindCompulsory, residentMigrate.Kind)
+	AssertEqual(t, 2, len(residentMigrate.Targets))
+	AssertEqual(t, true, bytes.Equal(ip4, residentMigrate.Targets[0].Ip))
+	AssertEqual(t, true, bytes.Equal(ip6, residentMigrate.Targets[1].Ip))
+	AssertEqual(t, uint64(1752900060000), residentMigrate.CloseTime)
+	AssertEqual(t, uint64(6*60*60*1000), residentMigrate.PreferDuration)
+}
+
+// A drain migrate carries only `migrate_time`, so it decodes as the drain kind with no move.
+// This is also what an older platform sends.
+func TestResidentMigrateDrainDecodesAsDrainKind(t *testing.T) {
+	frame, err := ToFrame(&protocol.ResidentMigrate{
+		MigrateTime: 1752900000000,
+	}, DefaultProtocolVersion)
+	AssertEqual(t, err, nil)
+
+	message, err := FromFrame(frame)
+	AssertEqual(t, err, nil)
+	residentMigrate, ok := message.(*protocol.ResidentMigrate)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, protocol.ResidentMoveKind_ResidentMoveKindDrain, residentMigrate.Kind)
+	AssertEqual(t, 0, len(residentMigrate.MoveId))
+	AssertEqual(t, 0, len(residentMigrate.Targets))
+	AssertEqual(t, uint64(0), residentMigrate.CloseTime)
+	AssertEqual(t, uint64(0), residentMigrate.PreferDuration)
+}
+
+// A client reports a declined or failed move to the control id (server/connect/MOVE.md §5.1).
+func TestResidentMoveResultFrameRoundTrip(t *testing.T) {
+	moveId := []byte{0x01, 0x92, 0x3c, 0x7a, 0x10, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}
+	frame, err := ToFrame(&protocol.ResidentMoveResult{
+		MoveId:   moveId,
+		Outcome:  protocol.ResidentMoveOutcome_ResidentMoveOutcomeFailed,
+		Reason:   protocol.ResidentMoveReason_ResidentMoveReasonConnectTimeout,
+		IpFamily: 6,
+		Elapsed:  60000,
+	}, DefaultProtocolVersion)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, protocol.MessageType_TransferResidentMoveResult, frame.MessageType)
+
+	message, err := FromFrame(frame)
+	AssertEqual(t, err, nil)
+	result, ok := message.(*protocol.ResidentMoveResult)
+	AssertEqual(t, true, ok)
+	AssertEqual(t, true, bytes.Equal(moveId, result.MoveId))
+	AssertEqual(t, protocol.ResidentMoveOutcome_ResidentMoveOutcomeFailed, result.Outcome)
+	AssertEqual(t, protocol.ResidentMoveReason_ResidentMoveReasonConnectTimeout, result.Reason)
+	AssertEqual(t, uint32(6), result.IpFamily)
+	AssertEqual(t, uint64(60000), result.Elapsed)
+}
