@@ -330,9 +330,11 @@ func (self *multiClientWindow) recordEvaluationFailure(fallback windowFailureCla
 // (a deadline, an exhausted pool, a 503, an auth refusal) doubles the same way
 // from WindowEnumerateErrorTimeout toward WindowErrorBackoffMax on its own
 // streak. Both take uniform jitter across [delay/2, delay). The counters are
-// shared by every expander in the window and are reset by windowRetryReset on
-// any successful platform call, so a one-off failure costs one short wait and
-// a sustained dependency outage is not re-asked every second by every window.
+// shared by every expander in the window. A successful mint resets both
+// (windowRetryReset); a listing the platform answered resets only the error
+// streak (windowListingRetryReset). So a one-off failure costs one short wait,
+// a sustained dependency outage is not re-asked every second by every window,
+// and a refused mint is not re-asked after every listing.
 func (self *multiClientWindow) windowRetryDelay(class windowFailureClass) time.Duration {
 	if class != windowFailureRateLimit {
 		max := self.settings.WindowErrorBackoffMax
@@ -373,11 +375,20 @@ func (self *multiClientWindow) windowBackoff(streak *atomic.Uint64, min time.Dur
 	return self.retryJitter(delay)
 }
 
-// windowRetryReset clears both failure streaks after a platform call that did
-// NOT fail. Without this the window would stay in a long backoff after the
-// platform recovered.
+// windowRetryReset clears both failure streaks after a mint that succeeded.
+// Without this the window would stay in a long backoff after the platform
+// recovered.
 func (self *multiClientWindow) windowRetryReset() {
 	self.rateLimitStreak.Store(0)
+	self.errorStreak.Store(0)
+}
+
+// Clears the error streak after a listing the platform answered. The
+// rate-limit streak is kept: an answered listing says nothing about the mint
+// admission refusing this window, and resetting it here restarted the mint
+// backoff at every expansion round (2026-10-22: about 464 refused hosted mints
+// a second). Only a mint that succeeds ends it (windowRetryReset).
+func (self *multiClientWindow) windowListingRetryReset() {
 	self.errorStreak.Store(0)
 }
 
