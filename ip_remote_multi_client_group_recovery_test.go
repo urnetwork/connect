@@ -1,5 +1,5 @@
-// Public native admission controls hold the real source worker before Run,
-// exposing queued ownership without manufacturing materialization or timeouts.
+// Public batch and internal recovery-group controls hold the real source worker
+// before Run, exposing ownership without manufacturing writes or timeouts.
 package connect
 
 import (
@@ -177,6 +177,38 @@ func (self *groupDispositionQueueFixture) offerTimeout(timeout time.Duration, te
 		self.witnesses = append(self.witnesses, MessagePoolShareReadOnly(packets[index]))
 	}
 	return self.parent.SendPacketBatch(self.source, protocol.ProvideMode_Network, packets, timeout)
+}
+
+// Recovery cohorts are transactions at the homogeneous-group admission layer.
+// Public batches additionally split SYN generations before reaching that layer;
+// offer/offerTimeout above continue to exercise that public contract. This
+// entry preserves normal bounds, parsing, policy, Transfer ownership and ACKs,
+// while deliberately offering one recovery transaction without the splitter.
+func (self *groupDispositionQueueFixture) offerRecoveryGroup(templates ...[]byte) int {
+	self.t.Helper()
+	packets := make([][]byte, len(templates))
+	callerOwns := true
+	defer func() {
+		if callerOwns {
+			for _, packet := range packets {
+				MessagePoolReturn(packet)
+			}
+		}
+	}()
+	for index, template := range templates {
+		packets[index] = MessagePoolCopy(template)
+		self.witnesses = append(self.witnesses, MessagePoolShareReadOnly(packets[index]))
+	}
+	groups, rejected := groupIpPacketsBounded(packets,
+		self.parent.settings.PacketGroupMaxPacketCount, self.parent.settings.PacketGroupMaxByteCount)
+	if len(rejected) != 0 || len(groups) != 1 || len(groups[0].packets) != len(packets) {
+		self.t.Fatal("recovery fixture requires one complete bounded homogeneous group")
+	}
+	if !self.parent.sendPacketGroup(self.source, protocol.ProvideMode_Network, groups[0], 0) {
+		return 0
+	}
+	callerOwns = false
+	return len(packets)
 }
 
 // Quiescence proves the barrier was reached, rather than waiting for a timer
@@ -968,8 +1000,9 @@ func TestTcpGroupRecoverySecondReservationLossKeepsAckedPrefix(t *testing.T) {
 	})
 }
 
-// An identical SYN inside a progressing group is not a generation reset.
-// Its retained data prefix must survive before and after the source ACK.
+// An identical SYN inside one admitted recovery group is not a generation
+// reset. Its retained data prefix survives before and after the source ACK.
+// Public batch generation splitting is a separate upstream contract.
 func TestTcpGroupRecoveryDataBeforeSameSynKeepsRetainedPrefix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -984,7 +1017,7 @@ func TestTcpGroupRecoveryDataBeforeSameSynKeepsRetainedPrefix(t *testing.T) {
 		epoch := f.update.sequenceAdmissionEpoch
 		f.update.receivedInbound.Store(true)
 		data := groupRecoveryPacket(501, 500, 64, tcpFlagAck, make([]byte, 99))
-		if f.offer(data, syn) != 2 {
+		if f.offerRecoveryGroup(data, syn) != 2 {
 			t.Fatal("new data with same-SYN control refused")
 		}
 		f.acknowledgeAll(data, syn)

@@ -134,6 +134,45 @@ func TestBusyProbeHoldsOnUnansweredBudget(t *testing.T) {
 	})
 }
 
+// The sibling gate judges a completed negative probe, not an unanswered one.
+// A single exit must retain its original stall until another exit supplies
+// real receive evidence; neither hold manufactures an ACK or resets the clock.
+func TestBusyProbeTerminalFailureHeldWithoutReceivingSibling(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stallTimeout := 20 * time.Millisecond
+		var completions atomic.Int32
+		client := busyProbeTestChannel(t, func(_ time.Duration, callback func(error)) (bool, error) {
+			go func() {
+				completions.Add(1)
+				callback(errors.New("fixture terminal probe failure"))
+			}()
+			return true, nil
+		})
+		stallPast(client, stallTimeout)
+		client.stateLock.Lock()
+		pendingBefore := client.pendingSendTime
+		client.stateLock.Unlock()
+		log := &busyExpiryTestLog{Logger: NewNoopLogger()}
+		window := busyProbeTestWindow(40*time.Millisecond, client)
+		window.log = log
+		if window.convictSendStalls(stallTimeout) || client.IsDone() || completions.Load() != 1 {
+			t.Fatal("single-exit terminal probe bypassed the sibling gate")
+		}
+		client.stateLock.Lock()
+		pendingAfter, ack, endErr := client.pendingSendTime, client.busyProbeAckTime, client.endErr
+		client.stateLock.Unlock()
+		if !pendingAfter.Equal(pendingBefore) || !ack.IsZero() || endErr != nil ||
+			!strings.Contains(log.snapshot(), "no receiving sibling: uplink unproven") ||
+			strings.Contains(log.snapshot(), "callback retained") {
+			t.Fatal("terminal probe did not reach the sibling gate with unchanged pending evidence")
+		}
+		window = busyProbeTestWindow(40*time.Millisecond, client, receivingSibling())
+		if !window.convictSendStalls(stallTimeout) || !client.IsDone() || completions.Load() != 2 {
+			t.Fatal("fresh sibling evidence did not admit the actual terminal-probe verdict")
+		}
+	})
+}
+
 // Repeated known local refusals cannot turn admission pressure into a remote
 // verdict. They neither invent an ACK nor clear the original pending episode.
 func TestBusyProbeLocalAdmissionRefusalsDoNotConvict(t *testing.T) {

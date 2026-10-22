@@ -245,10 +245,16 @@ func testMultiTcpReorderPublicRetry(t *testing.T, reorderCount int, reorderBytes
 		update, _, _ := parent.sendUpdate(path, flowPin{})
 		selected := newPacketTransferTestChannel()
 		selected.ctx, selected.log, selected.settings, selected.client = ctx, NewNoopLogger(), parent.settings, sender
+		// The recovery experiment starts on a selected healthy provider; it
+		// does not exercise renewal of an unknown-health incumbent.
+		selected.healthy = true
 		selected.args = &multiClientChannelArgs{Destination: RequireMultiHopId(receiver.ClientId())}
 		selected.clientReceivePacketCallback = parent.clientReceivePacket
 		update.client.Store(selected)
 		parent.bindClientFlow(update, selected)
+		if !parent.reuseAffinitySyn(update, selected, path) {
+			t.Fatal("reorder provider lacks positive, young SYN affinity")
+		}
 		sender.AddReceiveCallback(selected.clientReceive)
 
 		gapEntered := make(chan struct{})

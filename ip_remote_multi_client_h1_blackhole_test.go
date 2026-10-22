@@ -154,8 +154,18 @@ func TestH1DashBlackholeQuarantineResetsAndRebinds(t *testing.T) {
 	// retry must inherit that provider, never the quarantined donor retained by
 	// the old flow generation.
 	retryAddress := netip.MustParseAddr("198.51.100.22")
-	parent.dnsExitHints[affinityName] = dnsExitHint{client: healthy, affinityName: affinityName, createTime: time.Now()}
-	parent.dnsAddressExitHints[retryAddress] = dnsExitHint{client: healthy, affinityName: affinityName, createTime: time.Now()}
+	resolverPath := cnnDashPath(44004, "1.1.1.1")
+	resolver := bindDnsAffinityTestFlow(parent, healthy, resolverPath)
+	defer resolver.Close()
+	if !parent.bindDnsResultToExit(resolverPath, "gcp.amer-free.prd.media.cnn.com", []netip.Addr{retryAddress}) {
+		t.Fatal("healthy resolver flow did not publish its DNS hint")
+	}
+	hint := parent.dnsAddressExitHints[retryAddress]
+	if hint.client != healthy || hint.selection != resolver.client.loadSelection() ||
+		parent.dnsExitHints[affinityName].selection != hint.selection ||
+		!hint.selection.eligible(healthy, time.Now(), settings.AffinityMaxTime) {
+		t.Fatal("healthy retry fixture lost the resolver selection provenance")
+	}
 	retryPath := cnnDashPath(44003, retryAddress.String())
 	retry := newMultiClientChannelUpdate(ctx, retryPath)
 	defer retry.Close()

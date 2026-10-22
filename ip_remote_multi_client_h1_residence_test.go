@@ -342,8 +342,9 @@ func TestMultiClientH1ResidenceCumulativeAckOracle(t *testing.T) {
 // Pin the exact captured predecessor progress, rather than treating it as an
 // end-to-end receipt for the still-held request. The 34.369973417s classifier
 // eligibility is not an execution timestamp: the real 1.25s poll owns that.
-// BusyProbe remains enabled and sends real IpPing Packs. Its fixed-single-exit
-// sibling gate, not a synthetic probe ACK, holds the early 3s watchdog verdict.
+// BusyProbe remains enabled and sends real IpPing Packs. Its unanswered
+// callback stays owned and non-convicting while the physical stream is held;
+// a synthetic probe ACK or terminal failure would change this experiment.
 func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 	certificate := h1TLSResidenceCertificate(t)
 	const predecessorAt = 4369973417 * time.Nanosecond
@@ -431,6 +432,9 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 						t.Fatal("writer-queued request had a physical TLS write")
 					}
 				}
+				channel.stateLock.Lock()
+				requestGeneration := channel.pendingSendGeneration
+				channel.stateLock.Unlock()
 				ackTimer := time.AfterFunc(predecessorAt, f.releaseAck)
 				defer ackTimer.Stop()
 				var healthAt atomic.Int64
@@ -453,9 +457,19 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					t.Fatalf("predecessor ACK did not restart only outstanding-send liveness: stats=%+v err=%v", stats, err)
 				}
 				advance(replacementAt - time.Nanosecond)
+				channel.stateLock.Lock()
+				probe := channel.busyProbe
+				// The predecessor's real ACK advanced the pending episode;
+				// the unanswered probe still owns its earlier callback and
+				// cannot convict or refresh this later outstanding request.
+				probePending := probe != nil && !probe.completed && probe.pendingGeneration == requestGeneration &&
+					channel.pendingSendGeneration == requestGeneration+1
+				probeAck, pendingAt, endErr := channel.busyProbeAckTime, channel.pendingSendTime, channel.endErr
+				channel.stateLock.Unlock()
 				if channel.IsDone() || !channel.hasActiveTransport() || channel.hasActiveUnreliableSendTransport() ||
-					!channel.busyProbeAckTime.IsZero() || len(f.log.linesWith("no receiving sibling: uplink unproven")) == 0 {
-					t.Fatal("early watchdog was not held by the actual single-exit sibling gate")
+					!probePending || !probeAck.IsZero() || endErr != nil || !pendingAt.Equal(start.Add(predecessorAt)) ||
+					len(f.log.linesWith("callback retained")) == 0 {
+					t.Fatal("unanswered physical probe lost callback custody or convicted/refreshed the outstanding request")
 				}
 				advance(replacementAt)
 				if tc.replace {

@@ -2833,7 +2833,7 @@ func TestDialFailureSilentProviderLeavesFlowToTheAppTimeout(t *testing.T) {
 func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		harness := newSilenceInferenceHarness(t, []reraceExitSpec{
 			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
 			{name: "b", tier: 1},
 		}, nil)
@@ -2863,7 +2863,7 @@ func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 func TestDialFailureInferenceIsNotUplinkIngress(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
+		harness := newSilenceInferenceHarness(t, []reraceExitSpec{
 			{name: "a", tier: 0, answer: func(path *IpPath) reraceAnswer {
 				if path.DestinationIp[len(path.DestinationIp)-1] == 11 {
 					return reraceSilent
@@ -2886,8 +2886,10 @@ func TestDialFailureInferenceIsNotUplinkIngress(t *testing.T) {
 		path := reraceFlow(4, 1, 45001)
 		harness.syn(path)
 		harness.sleep(time.Second)
+		requireSilenceInferenceAffinity(t, harness, path)
 		harness.syn(path)
 		harness.sleep(2 * time.Second)
+		requireSilenceInferenceAffinity(t, harness, path)
 		// the 3s retransmit trips the silence inference
 		harness.syn(path)
 		if got := harness.metrics().FlowsReraced; got != 1 {

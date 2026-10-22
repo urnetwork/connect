@@ -57,6 +57,166 @@ func reraceHealthySibling(t *testing.T, harness *reraceHarness, version int) *Ip
 	return path
 }
 
+// Silence-inference roots isolate a destination that fails on an otherwise
+// healthy exit. An unrelated successful flow supplies that positive health
+// through real provider traffic before the tested connection's clock starts.
+// The target flow's answer function, SYN schedule and inference bar are intact.
+func newSilenceInferenceHarness(t *testing.T, specs []reraceExitSpec, configure func(*MultiClientSettings)) *reraceHarness {
+	t.Helper()
+	specs = append([]reraceExitSpec(nil), specs...)
+	healthPath := reraceFlow(4, 1, 49111)
+	found := false
+	for index := range specs {
+		if specs[index].name != "a" {
+			continue
+		}
+		found = true
+		answer := specs[index].answer
+		specs[index].answer = func(path *IpPath) reraceAnswer {
+			if reraceSameFlow(path, healthPath) || answer == nil {
+				return reraceAccept
+			}
+			return answer(path)
+		}
+	}
+	if !found {
+		t.Fatal("silence-inference fixture requires its initial provider a")
+	}
+	harness := newReraceHarness(t, specs, configure)
+	reraceHealthySibling(t, harness, 4)
+	return harness
+}
+
+// Assert the prerequisite immediately before the retransmit under test: an
+// unrelated unhealthy-affinity renewal must not replace its original clock.
+func requireSilenceInferenceAffinity(t *testing.T, harness *reraceHarness, path *IpPath) {
+	t.Helper()
+	update, client := harness.update(path), harness.channel("a")
+	if update == nil || update.client.Load() != client || update.receivedInbound.Load() ||
+		!harness.multiClient.reuseAffinitySyn(update, client, path) {
+		t.Fatal("silence-inference premise lacks an unanswered flow on reusable healthy affinity")
+	}
+}
+
+// The 3s retransmit begins as a reuse of healthy A, then the silence inference
+// releases A. Its same public offer must reach real new source queues, without
+// carrying A's reuse claim into their final admission guard. A test-only send
+// callback would bypass that guard and could not expose this failure.
+func TestSilenceInferenceRetransmitAdmitsFreshCandidates(t *testing.T) {
+	for _, twoCandidates := range []bool{false, true} {
+		name := "one-answering-candidate"
+		if twoCandidates {
+			name = "two-silent-candidates"
+		}
+		t.Run(name, func(t *testing.T) {
+			GetMessagePoolAggregateStats()
+			synctest.Test(t, func(t *testing.T) {
+				specs := []reraceExitSpec{
+					{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+					{name: "b", tier: 1},
+				}
+				candidates := []string{"b"}
+				if twoCandidates {
+					specs[1].answer = reraceAlways(reraceSilent)
+					specs = append(specs, reraceExitSpec{name: "c", tier: 1, answer: reraceAlways(reraceSilent)})
+					candidates = append(candidates, "c")
+				}
+				harness := newSilenceInferenceHarness(t, specs, nil)
+				path := reraceFlow(4, 0, 49112)
+				a := harness.channel("a")
+				start := time.Now()
+				if !harness.syn(path) || harness.boundTo(path) != a {
+					t.Fatal("initial public SYN did not bind its silent destination to healthy A")
+				}
+				update := harness.update(path)
+				selection := update.client.loadSelection()
+				update.stateLock.Lock()
+				firstClient, firstClock, firstCount := update.synWaitClient, update.synWaitStart, update.synWaitSendCount
+				update.stateLock.Unlock()
+				if firstClient != a || firstClock.IsZero() || firstCount != 1 || len(harness.exit("a").syns(path)) != 1 {
+					t.Fatal("first real SYN did not start A's silence clock exactly once")
+				}
+
+				harness.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
+				requireSilenceInferenceAffinity(t, harness, path)
+				harness.syn(path)
+				update.stateLock.Lock()
+				waitClient, waitClock, waitCount := update.synWaitClient, update.synWaitStart, update.synWaitSendCount
+				update.stateLock.Unlock()
+				if harness.update(path) != update || update.client.loadSelection() != selection ||
+					waitClient != a || !waitClock.Equal(firstClock) || waitCount != 2 || harness.metrics().FlowsReraced != 0 {
+					t.Fatal("the 1s retransmit replaced the binding or reset the first SYN's silence clock")
+				}
+
+				var mutex sync.Mutex
+				admissions := map[string]int{}
+				wrongClaim := false
+				for _, candidate := range candidates {
+					client := harness.channel(candidate)
+					if client.sendGroupForTest != nil {
+						t.Fatal("fresh candidate has a test-only send callback")
+					}
+					settings := client.client.sendBuffer.sendBufferSettings
+					previous := settings.afterGroupAdmissionForTest
+					settings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+						if previous != nil {
+							previous(target)
+						}
+						group, ok := target.(*parsedPacketGroup)
+						if !ok || !reraceSameFlow(group.ipPath, path) || !group.ipPath.Syn || group.ipPath.Ack {
+							return
+						}
+						mutex.Lock()
+						defer mutex.Unlock()
+						admissions[candidate]++
+						wrongClaim = wrongClaim || group.affinitySynReuse || group.completionClient != client ||
+							group.collapseAdmission.update != update || group.ipPath.SequenceNumber != path.SequenceNumber
+					}
+					t.Cleanup(func() { settings.afterGroupAdmissionForTest = previous })
+				}
+				harness.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+				requireSilenceInferenceAffinity(t, harness, path)
+				beforeA := len(harness.exit("a").syns(path))
+				if !harness.syn(path) {
+					t.Error("the 3s inference retransmit was refused by every real candidate")
+				}
+				if harness.update(path) != update || harness.metrics().FlowsReraced != 1 ||
+					len(harness.exit("a").syns(path)) != beforeA {
+					t.Error("the inference did not release A exactly once on the original flow")
+				}
+				mutex.Lock()
+				for _, candidate := range candidates {
+					if admissions[candidate] != 1 {
+						t.Errorf("candidate %s had %d real source admissions at 3s, want one", candidate, admissions[candidate])
+					}
+				}
+				if wrongClaim {
+					t.Error("fresh source admission retained A's reuse claim or the wrong flow ownership")
+				}
+				mutex.Unlock()
+				for _, candidate := range candidates {
+					syns := harness.exit(candidate).syns(path)
+					if len(syns) != 1 || syns[0].path.SequenceNumber != path.SequenceNumber ||
+						syns[0].at.Sub(start) < reraceSynSchedule[2] || reraceSynSchedule[2]+reraceSettle < syns[0].at.Sub(start) {
+						t.Errorf("candidate %s did not physically receive the same retransmit at 3s", candidate)
+					}
+				}
+				if twoCandidates {
+					update.stateLock.Lock()
+					racing := update.client.Load() == nil && update.race != nil && len(update.race.clientStates) == 2 &&
+						update.race.clientStates[harness.channel("b")] != nil && update.race.clientStates[harness.channel("c")] != nil
+					update.stateLock.Unlock()
+					if !racing || update.receivedInbound.Load() {
+						t.Error("two unanswered candidates did not remain a real response race")
+					}
+				} else if _, ok := harness.synAck(path); !ok || harness.boundTo(path) != harness.channel("b") {
+					t.Error("the answering fresh candidate did not complete the connection on the 3s retransmit")
+				}
+			})
+		})
+	}
+}
+
 // knownFailure excludes A through the existing destination-service filter;
 // without that evidence A remains an ordinary race candidate, not an affinity
 // donor. The healthy control instead reuses its young canonical update.

@@ -491,7 +491,7 @@ func testTcpGroupRecoverySeparateRaceReset(t *testing.T, sameSyn, refuseOtherSyn
 		otherTemplates := [][]byte{syn, rst}
 		if sameSyn {
 			data := groupRecoveryPacket(901, 800, 64, tcpFlagAck, []byte{1})
-			if f.offer(data, syn) != 2 {
+			if f.offerRecoveryGroup(data, syn) != 2 {
 				t.Fatal("progressing candidate same-SYN group refused")
 			}
 			firstTemplates = append(firstTemplates, data, syn)
@@ -649,8 +649,8 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 			packets = [][]byte{syn, rst}
 			wantAck, wantWindow = 900, 128
 		}
-		if f.offer(packets...) != 2 {
-			t.Fatal("mixed control group did not reach public admission")
+		if f.offerRecoveryGroup(packets...) != 2 {
+			t.Fatal("mixed control group did not reach homogeneous-group admission")
 		}
 		f.requireParked()
 		other.requireParked()
@@ -727,7 +727,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		}
 		other.unpark()
 		other.acknowledgeAll(syn)
-		if f.offer(data, syn) != 2 {
+		if f.offerRecoveryGroup(data, syn) != 2 {
 			t.Fatal("progressing same-SYN group did not reach both candidates")
 		}
 		synctest.Wait()
@@ -797,8 +797,8 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		old := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 10))
 		middle := groupDispositionControlPacket(900, 700, 64, tcpFlagSyn)
 		prefix := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 20))
-		if f.offer(old) != 1 || f.offer(middle) != 1 || f.offer(prefix, syn) != 2 {
-			t.Fatal("candidate ABA groups did not all reach successful public admission")
+		if f.offer(old) != 1 || f.offer(middle) != 1 || f.offerRecoveryGroup(prefix, syn) != 2 {
+			t.Fatal("candidate ABA groups did not all reach successful homogeneous-group admission")
 		}
 		f.requireParked()
 		other.requireParked()

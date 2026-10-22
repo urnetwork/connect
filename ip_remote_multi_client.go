@@ -7374,6 +7374,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// round.
 			if self.clientDialFailure(currentClient, ipPath, false) {
 				currentClient = nil
+				// The inference released the binding this offer intended to
+				// reuse. Fresh candidates must not inherit its late reuse guard.
+				sendPacketGroup.affinitySynReuse = false
 			}
 		}
 		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {

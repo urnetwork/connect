@@ -142,19 +142,40 @@ func TestBloombergDnsHintSkipsExternallyRejectedDonor(t *testing.T) {
 	clean := reputationTestClient(DestinationStats{})
 	affinityName := affinityNameForServerName("www.bloomberg.com")
 	address := netip.MustParseAddr("198.51.100.41")
-	now := time.Now()
-	parent.dnsAddressExitHints[address] = dnsExitHint{
-		client: bad, affinityName: affinityName, createTime: now,
+	// Keep both donors healthy and publish hints through actual resolver flows.
+	// The address donor must lose only because of its destination reputation,
+	// not because a hand-built hint omitted selection age or positive health.
+	badResolverPath := destinationServiceTestPath(4, "1.1.1.1", 443)
+	badResolver := bindDnsAffinityTestFlow(parent, bad, badResolverPath)
+	defer badResolver.Close()
+	if !parent.bindDnsResultToExit(badResolverPath, "www.bloomberg.com", []netip.Addr{address}) {
+		t.Fatal("reputation-rejected resolver did not publish its DNS hint")
 	}
-	parent.dnsExitHints[affinityName] = dnsExitHint{
-		client: clean, affinityName: affinityName, createTime: now,
+	cleanResolverPath := destinationServiceTestPath(4, "8.8.8.8", 443)
+	cleanResolver := bindDnsAffinityTestFlow(parent, clean, cleanResolverPath)
+	defer cleanResolver.Close()
+	if !parent.bindDnsResultToExit(cleanResolverPath, "www.bloomberg.com", []netip.Addr{netip.MustParseAddr("198.51.100.42")}) {
+		t.Fatal("clean resolver did not publish its DNS hint")
+	}
+	addressHint := parent.dnsAddressExitHints[address]
+	nameHint := parent.dnsExitHints[affinityName]
+	if addressHint.client != bad || addressHint.selection != badResolver.client.loadSelection() ||
+		nameHint.client != clean || nameHint.selection != cleanResolver.client.loadSelection() ||
+		!addressHint.selection.eligible(bad, time.Now(), parent.settings.AffinityMaxTime) ||
+		!nameHint.selection.eligible(clean, time.Now(), parent.settings.AffinityMaxTime) ||
+		!bad.positiveAffinityHealth() || !clean.positiveAffinityHealth() {
+		t.Fatal("DNS reputation fixture lacks eligible healthy resolver selections")
+	}
+	affinityPaths := []*IpPath{{ServerName: affinityName}}
+	if !clientFailsAffinityPathReputation(bad, affinityPaths) || clientFailsAffinityPathReputation(clean, affinityPaths) {
+		t.Fatal("DNS reputation fixture does not distinguish rejected and clean donors")
 	}
 
 	path := destinationServiceTestPath(4, address.String(), 443)
 	update := newMultiClientChannelUpdate(context.Background(), path)
 	defer update.Close()
 	parent.stateLock.Lock()
-	bound := parent.inheritDnsExitHintWithLock(update, path, []*IpPath{{ServerName: affinityName}})
+	bound := parent.inheritDnsExitHintWithLock(update, path, affinityPaths)
 	parent.stateLock.Unlock()
 	if !bound || update.client.Load() != clean {
 		t.Fatal("fresh Bloomberg handshake followed the reputation-rejected DNS donor")

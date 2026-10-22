@@ -14,7 +14,9 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -77,8 +79,14 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
+		var probeCompletions atomic.Int32
 		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-			// queued, never answered: the conviction state
+			// A terminal failure reaches the quarantine verdict gate. Mere
+			// admission with no callback is non-convicting before that gate.
+			go func() {
+				probeCompletions.Add(1)
+				ackCallback(errors.New("fixture terminal probe failure"))
+			}()
 			return true, nil
 		})
 		stallPast(client, stallTimeout)
@@ -88,6 +96,7 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 
 		AssertEqual(t, client.setQuarantined(blackholeNoReceiveAck), true)
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, probeCompletions.Load(), int32(1))
 		AssertEqual(t, client.IsDone(), false)
 		client.stateLock.Lock()
 		endErr := client.endErr
@@ -95,12 +104,13 @@ func TestStallConvictionHeldWhileQuarantined(t *testing.T) {
 		AssertEqual(t, endErr == nil, true)
 
 		// the bench lifts with the stall still real: the carried evidence
-		// convicts once the probe budget of a fresh pass elapses
+		// convicts after a fresh probe actually terminates
 		client.clearQuarantine()
 		sibling.stateLock.Lock()
 		sibling.lastReceiveAckTime = time.Now()
 		sibling.stateLock.Unlock()
 		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, probeCompletions.Load(), int32(2))
 		AssertEqual(t, client.IsDone(), true)
 	})
 }
@@ -112,7 +122,12 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
 		metrics := newReliabilityMetrics()
+		var probeCompletions atomic.Int32
 		client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+			go func() {
+				probeCompletions.Add(1)
+				ackCallback(errors.New("fixture terminal probe failure"))
+			}()
 			return true, nil
 		})
 		client.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
@@ -134,6 +149,7 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		metrics.recordSharedFate(NewId(), time.Now())
 
 		AssertEqual(t, window.convictSendStalls(stallTimeout), false)
+		AssertEqual(t, probeCompletions.Load(), int32(1))
 		AssertEqual(t, client.IsDone(), false)
 		AssertEqual(t, metrics.verdictsHeldSharedFate.Load() >= 1, true)
 
@@ -151,6 +167,7 @@ func TestStallConvictionHeldOnSharedFate(t *testing.T) {
 		sibling.lastReceiveAckTime = time.Now()
 		sibling.stateLock.Unlock()
 		AssertEqual(t, window.convictSendStalls(stallTimeout), true)
+		AssertEqual(t, probeCompletions.Load(), int32(2))
 		AssertEqual(t, client.IsDone(), true)
 	})
 }
@@ -163,8 +180,13 @@ func TestStallPassCrossRecordsSharedFate(t *testing.T) {
 		stallTimeout := 20 * time.Millisecond
 
 		metrics := newReliabilityMetrics()
+		var probeCompletions atomic.Int32
 		newStalled := func() *multiClientChannel {
 			c := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
+				go func() {
+					probeCompletions.Add(1)
+					ackCallback(errors.New("fixture terminal probe failure"))
+				}()
 				return true, nil
 			})
 			c.reliabilityMetricsFunc = func() *reliabilityMetrics { return metrics }
@@ -191,6 +213,7 @@ func TestStallPassCrossRecordsSharedFate(t *testing.T) {
 		}
 
 		window.convictSendStalls(stallTimeout)
+		AssertEqual(t, probeCompletions.Load(), int32(2))
 		// neither co-sufferer is executed: each saw the other's evidence,
 		// recorded by the same pass that judged them
 		AssertEqual(t, clientA.IsDone(), false)
