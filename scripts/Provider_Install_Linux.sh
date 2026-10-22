@@ -27,7 +27,10 @@ script_url="${URNETWORK_TOOLS_URL:-${URNETWORK_TOOLS_SCRIPT_URL:-$default_script
 tools_version=2
 api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
 default_interval="6h"
+# the service runs without URNETWORK_STATE_DIR, so the miner this script runs
+# (sign-in, first-start registration) must use the same ~/.urnetwork
 state_dir="$HOME/.urnetwork"
+unset URNETWORK_STATE_DIR
 
 show_help ()
 {
@@ -593,12 +596,53 @@ signed_in ()
 # a new device's `provide' reports startup_recovery_required and exits 0.
 device_registered ()
 {
-    [ -s "$state_dir/.provider.jwt" ]
+    # one .provider.jwt, or a .provider-<hash>.jwt per proxy in ~/.urnetwork/proxy
+    found=0
+
+    for jwt_file in "$state_dir/.provider.jwt" "$state_dir"/.provider-*.jwt; do
+        if [ -s "$jwt_file" ]; then
+            found=1
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        return 1
+    fi
+
+    # a registration that was started but has no jwt yet
+    for record in "$state_dir"/.provider*.jwt.registration; do
+        if [ -e "$record" ] && [ ! -s "${record%.registration}" ]; then
+            return 1
+        fi
+    done
+
+    return 0
 }
 
 # First start of a new device: run the miner once in the foreground with
-# --allow-client-registration until it has written .provider.jwt, then stop
+# --allow-client-registration until it has written its provider jwt, then stop
 # it so the service takes over. The flag never replaces a retained identity.
+reg_pid=""
+
+stop_registering_miner ()
+{
+    if [ -z "$reg_pid" ]; then
+        return 0
+    fi
+
+    kill "$reg_pid" 2>/dev/null
+    waited=0
+
+    while [ "$waited" -lt 15 ] && kill -0 "$reg_pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    kill -9 "$reg_pid" 2>/dev/null
+    wait "$reg_pid" 2>/dev/null
+    reg_pid=""
+}
+
 register_device ()
 {
     if device_registered; then
@@ -611,7 +655,13 @@ register_device ()
         reg_log=/dev/null
     fi
 
-    "$install_path/bin/urnetwork" provide --allow-client-registration < /dev/null > "$reg_log" 2>&1 &
+    # never leave it running with --allow-client-registration: it would hold
+    # the registration lock and keep the service from starting
+    trap 'stop_registering_miner; [ "$reg_log" != /dev/null ] && rm -f "$reg_log"; cleanup' EXIT
+    trap 'exit 1' INT TERM HUP
+
+    # 9>&-: not the install lock
+    "$install_path/bin/urnetwork" provide --allow-client-registration < /dev/null > "$reg_log" 2>&1 9>&- &
     reg_pid=$!
     waited=0
 
@@ -620,16 +670,14 @@ register_device ()
         waited=$((waited + 1))
     done
 
-    kill "$reg_pid" 2>/dev/null
-    waited=0
+    exited_early=0
 
-    while [ "$waited" -lt 15 ] && kill -0 "$reg_pid" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-    done
+    if ! device_registered && ! kill -0 "$reg_pid" 2>/dev/null; then
+        exited_early=1
+    fi
 
-    kill -9 "$reg_pid" 2>/dev/null
-    wait "$reg_pid" 2>/dev/null
+    stop_registering_miner
+    trap cleanup EXIT
 
     if device_registered; then
         [ "$reg_log" != /dev/null ] && rm -f "$reg_log"
@@ -637,16 +685,44 @@ register_device ()
         return 0
     fi
 
-    pr_err "Registering this device didn't finish. The miner said:"
+    if [ "$exited_early" -eq 1 ]; then
+        pr_err "Registering this device failed. The miner said:"
+    else
+        pr_err "Registering this device didn't finish within 2 minutes. The miner said:"
+    fi
+
+    reg_hint=""
 
     if [ "$reg_log" != /dev/null ]; then
         tail -n 8 "$reg_log" | sed 's/^/    /' >&2
+
+        if grep -q -i -E 'network_sign_in|401|unauthori' "$reg_log"; then
+            reg_hint="sign_in"
+        fi
+
         rm -f "$reg_log"
     fi
 
-    pr_err "Check your internet connection and try \`urnet-tools start' again"
-    pr_err "Or run it once yourself: urnetwork provide --allow-client-registration"
+    if [ "$reg_hint" = "sign_in" ]; then
+        pr_err "Your sign-in was refused. Sign in again with \`urnetwork auth' (code at https://ur.io), then run \`urnet-tools start'"
+    elif [ "$exited_early" -eq 1 ]; then
+        pr_err "See https://ur.xyz/docs/miner for what this means, then run \`urnet-tools start' again"
+    else
+        pr_err "Check your internet connection and run \`urnet-tools start' again"
+    fi
+
     return 1
+}
+
+# an enabled service on a device that never registered exits at once without a
+# word (and isn't restarted), so updates finish the registration for it
+repair_unregistered_service ()
+{
+    if [ "$has_systemd" -eq 1 ] && signed_in && unit_enabled urnetwork.service &&
+        ! unit_active urnetwork.service && ! device_registered; then
+        pr_info "urnetwork.service is on but this device was never registered; registering it now"
+        start_provider || pr_err "warning: The provider isn't running; run \`urnet-tools start'"
+    fi
 }
 
 # prints the configured update interval, read back from the timer unit
@@ -1172,6 +1248,7 @@ do_install ()
                 systemctl --user start urnetwork-update.timer
             fi
 
+            repair_unregistered_service
             exit 0
         fi
 
@@ -1355,6 +1432,10 @@ EOF
         fi
     fi
 
+    if [ "$operation" != "install" ]; then
+        repair_unregistered_service
+    fi
+
     if [ "$no_modify_bashrc" -eq 0 ]; then
         add_path_block "$HOME/.bashrc"
 
@@ -1415,7 +1496,10 @@ install_summary ()
 
     if [ "$has_systemd" -eq 1 ]; then
         if [ "$running" -eq 0 ]; then
-            printf "Sign in:         %surnetwork auth%s              # auth code from <https://ur.io>\n" "$bold" "$plain"
+            if ! signed_in; then
+                printf "Sign in:         %surnetwork auth%s              # auth code from <https://ur.io>\n" "$bold" "$plain"
+            fi
+
             printf "Start:           %surnet-tools start%s           # runs in the background, also after reboot\n" "$bold" "$plain"
         fi
 
