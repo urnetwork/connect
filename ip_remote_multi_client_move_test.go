@@ -568,9 +568,17 @@ func TestApiWindowDrainAndDisabledMovesMigrateByName(t *testing.T) {
 	}
 }
 
-// When the memory budget cannot hold an H3 replacement beside the old H3
-// carrier, an advisory move is declined and the old carrier keeps running.
-func TestApiWindowAdvisoryMoveDeclinesWhenTheBudgetCannotHoldTheReplacement(t *testing.T) {
+// A move never breaks before it makes. When the memory budget cannot hold an
+// H3 replacement beside the old H3 carrier, an advisory move is declined and
+// reported, and a compulsory one keeps the old carrier, which the platform
+// closes at the close time; neither releases the old carrier.
+func TestApiWindowMoveNeverBreaksBeforeMakeWhenTheBudgetIsFull(t *testing.T) {
+	for _, advisory := range []bool{true, false} {
+		testApiWindowMoveNeverBreaksBeforeMakeWhenTheBudgetIsFull(t, advisory)
+	}
+}
+
+func testApiWindowMoveNeverBreaksBeforeMakeWhenTheBudgetIsFull(t *testing.T, advisory bool) {
 	client, _ := newApiMigrationTestClient(t)
 	strategy := NewClientStrategyWithDefaults(client.Ctx())
 	budget := NewPlatformTransportBudget(4, 1)
@@ -628,28 +636,35 @@ func TestApiWindowAdvisoryMoveDeclinesWhenTheBudgetCannotHoldTheReplacement(t *t
 	fixture.generator.platformTransportPolicyVer = 1
 	fixture.state.policyVersion = 1
 
-	move := testAdvisoryMove(testMoveTargetIpv4)
+	move := testCompulsoryMove(testMoveTargetIpv4)
+	if advisory {
+		move = testAdvisoryMove(testMoveTargetIpv4)
+	}
 	fixture.generator.MoveClientTransport(client, nil, move)
 	next := receiveTestMoveValue(t, created, "the move did not build a replacement")
 	fixture.join(t)
 	select {
 	case <-next.Done():
 	default:
-		t.Fatal("the declined replacement was not closed")
+		t.Fatalf("advisory=%t: the replacement the budget cannot hold was not closed", advisory)
 	}
 	select {
 	case <-old.Done():
-		t.Fatal("a declined move released the old H3 carrier")
+		t.Fatalf("advisory=%t: the move released the old H3 carrier", advisory)
 	default:
 	}
 	if fixture.current() != old || !old.IsConnected() {
-		t.Fatal("the old carrier does not carry the client after the decline")
+		t.Fatalf("advisory=%t: the old carrier does not carry the client", advisory)
 	}
-	requireTestMoveReports(t, fixture.reports, NewResidentMoveDeclined(
-		*move.MoveId,
-		protocol.ResidentMoveReason_ResidentMoveReasonMemoryBudget,
-		0,
-	))
+	if advisory {
+		requireTestMoveReports(t, fixture.reports, NewResidentMoveDeclined(
+			*move.MoveId,
+			protocol.ResidentMoveReason_ResidentMoveReasonMemoryBudget,
+			0,
+		))
+	} else {
+		requireTestMoveReports(t, fixture.reports)
+	}
 }
 
 // A frame from the control source reaches a mover whole -- kind, targets and

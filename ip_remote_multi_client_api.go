@@ -1763,10 +1763,10 @@ func (self *ApiMultiClientGenerator) migrateConnectTimeout() time.Duration {
 // stays, the failed targets are held and the move reports its failure. A
 // compulsory move tries its target once per carrier, then dials by name,
 // and resolves when the replacement connects at all, waiting no later than
-// the move's close time. When the memory budget cannot hold the replacement
-// beside the old carrier, an advisory move is declined, and a compulsory one
-// releases the old carrier first, as a migrate by name does: the platform
-// closes the old carrier at the close time regardless.
+// the move's close time. A move never breaks before it makes: when the memory
+// budget cannot hold the replacement beside the old carrier, an advisory move
+// is declined, and a compulsory one keeps the old carrier, which the platform
+// closes at the close time, after which its own reconnect runs.
 func (self *ApiMultiClientGenerator) moveWindowTransport(
 	client *Client,
 	state *apiWindowClientTransport,
@@ -1787,28 +1787,18 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 	moveSettings.ResidentMoveDial = dial
 	next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, &moveSettings)
 
-	brokeBeforeMake := false
 	if nextPlatform, ok := next.(*PlatformTransport); ok {
 		if currentPlatform, ok := current.(*PlatformTransport); ok &&
 			!nextPlatform.CanMakeBeforeBreakFrom(currentPlatform) {
+			closeApiWindowPlatformTransportAndWait(next)
 			if dial.Strict() {
-				closeApiWindowPlatformTransportAndWait(next)
 				self.sendResidentMoveResult(client, NewResidentMoveDeclined(
 					dial.MoveId(),
 					protocol.ResidentMoveReason_ResidentMoveReasonMemoryBudget,
 					0,
 				))
-				return
 			}
-			self.transportLock.Lock()
-			stillCurrent := self.transports[client] == state && state.current == current
-			self.transportLock.Unlock()
-			if !stillCurrent {
-				closeApiWindowPlatformTransportAndWait(next)
-				return
-			}
-			closeApiWindowPlatformTransportAndWait(current)
-			brokeBeforeMake = true
+			return
 		}
 	}
 
@@ -1841,7 +1831,7 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 		return nil
 	}
 
-	if resolution != ResidentMoveResolutionConnected && !brokeBeforeMake {
+	if resolution != ResidentMoveResolutionConnected {
 		// Keep the old transport: it is still a valid route. Disarm before
 		// closing the replacement, so the close is the definitive "migration
 		// released" signal (as the migrate by name does).
@@ -1880,13 +1870,10 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 	}
 	// Only now break the old route. For the interval between next becoming
 	// connected and this close, RouteManager can carry traffic over both.
-	if !brokeBeforeMake {
-		closeApiWindowPlatformTransportAndWait(current)
-	}
+	closeApiWindowPlatformTransportAndWait(current)
 	if !dial.Arrived() {
-		// a compulsory move that connected by name, or a replacement installed
-		// after its old carrier was released: a target that failed is still
-		// reported
+		// a compulsory move that connected by name: a target that failed is
+		// still reported
 		if report := failureReport(); report != nil {
 			self.sendResidentMoveResult(client, report)
 		}
