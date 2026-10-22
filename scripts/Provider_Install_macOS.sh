@@ -766,6 +766,27 @@ has_identity ()
     [ -s "$state_dir/jwt" ]
 }
 
+# a signed-in device becomes a provider client the first time it provides,
+# which leaves .provider.jwt in the state folder
+is_registered ()
+{
+    [ -s "$state_dir/.provider.jwt" ]
+}
+
+# provide_args: what launchd runs. The released miner registers a new device
+# only with --allow-client-registration; without it the first start prints
+# startup_recovery_required and exits 0, so launchd never retries. Pass it
+# only until the device is registered (it never replaces an identity), and
+# only to a miner that knows the flag.
+provide_args ()
+{
+    if ! is_registered && "$install_path/bin/urnetwork" --help 2>&1 | grep -q -- '--allow-client-registration'; then
+        echo "provide --allow-client-registration"
+    else
+        echo "provide"
+    fi
+}
+
 # get_tools_script: the urnet-tools source to install, newest first
 get_tools_script ()
 {
@@ -1164,6 +1185,22 @@ start_provider ()
         sleep 1
         sp_n=$((sp_n + 1))
     done
+    # a first start registers the device; wait for that to finish, since a
+    # refused registration exits 0 and launchd does not try again
+    if ! is_registered; then
+        say "Registering this Mac as a provider (first start)..."
+        sp_n=0
+        while job_running "$provider_label" && ! is_registered && [ "$sp_n" -lt 60 ]; do
+            sleep 1
+            sp_n=$((sp_n + 1))
+        done
+        if ! is_registered && ! job_running "$provider_label"; then
+            warn "registration did not finish; the last lines of the log:"
+            tail -n 15 "$log_dir/provider.log" >&2 2>/dev/null
+            warn "check your sign-in (\`urnetwork auth' with a new code from https://ur.io), then \`urnet-tools start'"
+            return 1
+        fi
+    fi
     if job_running "$provider_label"; then
         say "The provider is running (pid $(job_pid "$provider_label")). Log: $log_dir/provider.log"
         return 0
@@ -1214,7 +1251,9 @@ do_status ()
         ds_running=1
         printf 'Provider:           %srunning%s (pid %s)\n' "$bold" "$reset" "$(job_pid "$provider_label")"
     elif job_loaded "$provider_label"; then
-        if has_identity; then
+        if has_identity && ! is_registered; then
+            printf 'Provider:           %snot running%s (device registration did not finish; see %surnet-tools logs%s, then %surnet-tools start%s)\n' "$bold" "$reset" "$bold" "$reset" "$bold" "$reset"
+        elif has_identity; then
             printf 'Provider:           %snot running%s (last exit code %s; launchd retries every minute, see %surnet-tools logs%s)\n' "$bold" "$reset" "$(job_last_exit "$provider_label")" "$bold" "$reset"
         else
             printf 'Provider:           %snot running%s (not signed in)\n' "$bold" "$reset"
@@ -1224,6 +1263,11 @@ do_status ()
     fi
     if has_identity; then
         printf 'Signed in:          yes (%s)\n' "$state_dir/jwt"
+        if is_registered; then
+            printf 'Registered device:  yes\n'
+        else
+            printf 'Registered device:  not yet (the first start registers it)\n'
+        fi
     else
         printf 'Signed in:          no (run %surnetwork auth%s)\n' "$bold" "$reset"
     fi
@@ -1488,7 +1532,12 @@ do_service_run ()
         echo "$(date): not signed in; run \`urnetwork auth', then \`urnet-tools start'"
         exit 0
     fi
-    exec "$install_path/bin/urnetwork" provide
+    dsr_args="$(provide_args)"
+    if ! is_registered; then
+        echo "$(date): first start on this device: registering it as a provider ($dsr_args)"
+    fi
+    # shellcheck disable=SC2086
+    exec "$install_path/bin/urnetwork" $dsr_args
 }
 
 # ---------------------------------------------------------------- main

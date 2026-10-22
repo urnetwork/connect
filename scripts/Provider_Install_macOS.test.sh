@@ -94,6 +94,15 @@ case "$1" in
         [ -f "$d/$l" ] && exit 5
         mv "$d/.last" "$d/$l"
         echo "$2" > "$d/$l.domain"
+        # the provider's first start registers the device, or fails to
+        if [ "$l" = com.urnetwork.provider ] && [ -s "$HOME/.urnetwork/jwt" ]; then
+            if [ "${MOCK_REG_FAIL:-0}" = 1 ]; then
+                touch "$d/$l.exited"
+                echo "startup_recovery_required" >> "$HOME/Library/Logs/urnetwork/provider.log"
+            else
+                echo registered > "$HOME/.urnetwork/.provider.jwt"
+            fi
+        fi
         ;;
     bootout) l="${2##*/}"; [ -f "$d/$l" ] || exit 3; [ "$(cat "$d/$l.domain")" = "${2%/*}" ] || exit 3; rm -f "$d/$l" "$d/$l.exited" ;;
     enable) rm -f "$d/${2##*/}.disabled" ;;
@@ -140,9 +149,15 @@ make_release ()
 #!/bin/sh
 # fake provider $mr_tag $mr_arch
 case "\$1" in
-    --help) [ "${2:-}" = broken ] && exit 137; exit 0 ;;
+    --help) [ "${2:-}" = broken ] && exit 137; echo "provider provide [--allow-client-registration]"; exit 0 ;;
     auth) mkdir -p "\$HOME/.urnetwork"; echo "token \${2:-}" > "\$HOME/.urnetwork/jwt" ;;
-    provide) echo "providing $mr_tag $mr_arch" ;;
+    provide)
+        if [ "\${2:-}" = --allow-client-registration ]; then
+            echo registered > "\$HOME/.urnetwork/.provider.jwt"
+            echo "registering"
+        fi
+        echo "providing $mr_tag $mr_arch \$*"
+        ;;
 esac
 EOF
         chmod 755 "$mr_root/darwin/$mr_arch/provider"
@@ -204,7 +219,12 @@ run_tests ()
     tools start > "$run_dir/out" 2>&1 && fail "start without identity succeeded"
     grep -q "urnetwork auth" "$run_dir/out" || fail "start without identity gave no hint"
     "$(install_dir)/bin/urnetwork" auth
+    MOCK_REG_FAIL=1 tools start > "$run_dir/out" 2>&1 && fail "start with a failed registration succeeded"
+    grep -q "registration did not finish" "$run_dir/out" || fail "failed registration not reported: $(cat "$run_dir/out")"
+    grep -q "startup_recovery_required" "$run_dir/out" || fail "failed registration did not show the log"
+    tools stop > /dev/null 2>&1
     tools start > "$run_dir/out" 2>&1 || fail "start failed: $(cat "$run_dir/out")"
+    [ -s "$HOME/.urnetwork/.provider.jwt" ] || fail "start did not register the device"
     loaded com.urnetwork.provider || fail "provider not loaded by start"
     tools start > "$run_dir/out" 2>&1 || fail "start when running must succeed"
     tools status > "$run_dir/out" 2>&1 || fail "status of a running provider exit $?"
@@ -309,8 +329,19 @@ run_tests ()
     mkdir -p "$HOME/Library/Logs/urnetwork"
     echo "hello log" > "$HOME/Library/Logs/urnetwork/provider.log"
     tools logs --no-follow | grep -q "hello log" || fail "logs"
+    rm -f "$HOME/.urnetwork/.provider.jwt"
     tools service-run > "$run_dir/out" 2>&1 || fail "service-run with identity"
     grep -q "providing v6 arm64" "$run_dir/out" || fail "service-run did not exec the provider: $(cat "$run_dir/out")"
+    # the first start registers the device (released miner needs the flag);
+    # later starts do not pass it
+    grep -q -- "provide --allow-client-registration" "$run_dir/out" || fail "first start without --allow-client-registration: $(cat "$run_dir/out")"
+    [ -s "$HOME/.urnetwork/.provider.jwt" ] || fail "first start did not register"
+    tools service-run > "$run_dir/out" 2>&1 || fail "second service-run"
+    grep -q -- "--allow-client-registration" "$run_dir/out" && fail "registered device still got --allow-client-registration"
+    tools status 2>&1 | grep -q "Registered device:  yes" || fail "status does not show registration"
+    rm -f "$HOME/.urnetwork/.provider.jwt"
+    tools status 2>&1 | grep -q "Registered device:  not yet" || fail "status does not show missing registration"
+    tools service-run > /dev/null 2>&1
     mv "$HOME/.urnetwork/jwt" "$run_dir/jwt"
     tools service-run > "$run_dir/out" 2>&1 || fail "service-run without identity must exit 0 (no restart loop)"
     grep -q "not signed in" "$run_dir/out" || fail "service-run without identity message"
