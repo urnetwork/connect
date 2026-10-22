@@ -308,6 +308,31 @@ function Test-SignedIn {
     return (Test-Path -LiteralPath (Join-Path $StateDir -ChildPath "jwt"))
 }
 
+# Test-Registered is true once the miner has registered this device: it then
+# keeps the device's own sign-in in .provider.jwt.
+function Test-Registered {
+    return (Test-Path -LiteralPath (Join-Path $StateDir -ChildPath ".provider.jwt"))
+}
+
+# Get-StartFailureHint explains the usual reasons a provider stops at once,
+# from the end of its log.
+function Get-StartFailureHint {
+    $Tail = ""
+    if (Test-Path -LiteralPath $ProviderLogPath) {
+        $Tail = (Get-Content -LiteralPath $ProviderLogPath -Tail 40) -join "`n"
+    }
+    if ($Tail -match "requires Unix custody support") {
+        return "This URnetwork release can't register a new device on Windows yet. Windows support is on its way; until then this PC can't mine with the official release."
+    }
+    if ($Tail -match "startup_recovery_required") {
+        return "This device's miner identity in $StateDir is incomplete (files missing or changed). Restore your backup of that folder."
+    }
+    if ($Tail -match "network_sign_in_rejected|sign.in.*(rejected|expired)") {
+        return "The network didn't accept this device's sign-in. Sign in again with 'urnetwork auth', then 'urnet-tools start'."
+    }
+    return ""
+}
+
 function Start-Provider {
     if (-not (Test-Path -LiteralPath $BinaryPath)) {
         throw "$BinaryPath is missing. Reinstall URnetwork."
@@ -325,14 +350,23 @@ function Start-Provider {
         Move-Item -LiteralPath $ProviderLogPath -Destination "$ProviderLogPath.1" -Force
     }
 
+    # A new device is registered on its first start, which the miner only
+    # does when asked. It never replaces an identity it already has, and once
+    # .provider.jwt exists later starts don't ask again.
+    $ProvideArguments = "provide"
+    if (-not (Test-Registered)) {
+        Write-Host "First start on this device: registering it with the network"
+        $ProvideArguments = "provide --allow-client-registration"
+    }
+
     if ($OnWindows) {
         # cmd.exe writes the provider's output to its log; the window is hidden.
         # cmd strips the outer quotes of /c "..." and keeps the inner ones.
-        $Line = "/d /c `"`"$BinaryPath`" provide >> `"$ProviderLogPath`" 2>&1`""
+        $Line = "/d /c `"`"$BinaryPath`" $ProvideArguments >> `"$ProviderLogPath`" 2>&1`""
         Start-Process -FilePath $env:ComSpec -ArgumentList $Line -WorkingDirectory $InstalledPath -WindowStyle Hidden
     }
     else {
-        Start-Process -FilePath $BinaryPath -ArgumentList "provide" -WorkingDirectory $InstalledPath -RedirectStandardOutput $ProviderLogPath -RedirectStandardError "$ProviderLogPath.err"
+        Start-Process -FilePath $BinaryPath -ArgumentList $ProvideArguments -WorkingDirectory $InstalledPath -RedirectStandardOutput $ProviderLogPath -RedirectStandardError "$ProviderLogPath.err"
     }
 
     for ($Wait = 0; $Wait -lt 10 -and (Get-ProviderProcess).Count -eq 0; $Wait++) {
@@ -343,7 +377,11 @@ function Start-Provider {
         Write-Host "URnetwork is running in the background. Its log: $ProviderLogPath"
     }
     else {
-        throw "URnetwork stopped right after starting. See $ProviderLogPath, or run 'urnetwork provide' in a window."
+        $Hint = Get-StartFailureHint
+        if (-not $Hint) {
+            $Hint = "See $ProviderLogPath, or run 'urnetwork provide' in a window."
+        }
+        throw "URnetwork stopped right after starting. $Hint"
     }
 }
 
@@ -780,6 +818,12 @@ function Invoke-Main {
             }
             else {
                 Write-Host "Signed in: no, run: urnetwork auth"
+            }
+            if (Test-Registered) {
+                Write-Host "Device registered: yes"
+            }
+            elseif (Test-SignedIn) {
+                Write-Host "Device registered: not yet, 'urnet-tools start' registers it"
             }
             Show-AutoStart
             Show-AutoUpdate

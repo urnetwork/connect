@@ -138,7 +138,18 @@ function Invoke-EndToEnd {
 #include <stdlib.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
-    if (argc > 1 && (strcmp(argv[1], "provide") == 0 || strcmp(argv[1], "update") == 0)) { for (;;) sleep(60); }
+    if (argc > 1 && strcmp(argv[1], "provide") == 0) {
+        /* Like the released miner: a new device needs --allow-client-registration. */
+        char path[4096]; snprintf(path, sizeof path, "%s/.provider.jwt", getenv("URNETWORK_STATE_DIR"));
+        FILE *f = fopen(path, "r");
+        if (f) { fclose(f); }
+        else if (argc > 2 && strcmp(argv[2], "--allow-client-registration") == 0) {
+            f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f);
+        }
+        else { puts("startup_recovery_required"); fflush(stdout); return 0; }
+        for (;;) sleep(60);
+    }
+    if (argc > 1 && strcmp(argv[1], "update") == 0) { for (;;) sleep(60); }
     if (argc > 1 && strcmp(argv[1], "auth") == 0) {
         char path[4096]; snprintf(path, sizeof path, "%s/jwt", getenv("URNETWORK_STATE_DIR"));
         FILE *f = fopen(path, "w"); if (!f) return 1; fputs("x", f); fclose(f); return 0;
@@ -217,10 +228,21 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0 -or $Out -notmatch "not signed in") { Fail "start before sign-in: $Out" }
         & (Join-Path $Install "urnetwork") auth
+        # Started by hand, a new device stops: it needs registering.
+        $Plain = Start-Process -FilePath (Join-Path $Install "urnetwork") -ArgumentList "provide" -PassThru -RedirectStandardOutput (Join-Path $Root "plain.out")
+        $Plain.WaitForExit(5000) | Out-Null
+        if (-not $Plain.HasExited) { Fail "fake provider should stop without registration" }
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -or $Out -notmatch "running in the background") { Fail "start: $Out" }
+        if ($LASTEXITCODE -ne 0 -or $Out -notmatch "running in the background" -or $Out -notmatch "registering") { Fail "first start: $Out" }
+        if (-not (Test-Path (Join-Path $State ".provider.jwt"))) { Fail "first start didn't register the device" }
+        $Out = & $Pwsh -NoProfile -File $Tools restart 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $Out -match "registering") { Fail "a registered device registered again: $Out" }
+        $Cmd = @(Get-Process -Name urnetwork -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Install/*" }).CommandLine
+        if ("$Cmd" -match "allow-client-registration") { Fail "restart still asks to register: $Cmd" }
         $Out = & $Pwsh -NoProfile -File $Tools start 2>&1 | Out-String
         if ($Out -notmatch "already running") { Fail "second start: $Out" }
+        $Out = & $Pwsh -NoProfile -File $Tools status 2>&1 | Out-String
+        if ($Out -notmatch "Device registered: yes") { Fail "status registration: $Out" }
         $Out = & $Pwsh -NoProfile -File $Tools status 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0 -or $Out -notmatch "Status: running" -or $Out -notmatch "Signed in: yes") { Fail "status after start: $Out" }
 
