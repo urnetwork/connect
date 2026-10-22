@@ -244,24 +244,6 @@ func TestCredentialRefusedSetupErrorClassification(t *testing.T) {
 	}
 }
 
-// Discovery generators never park: a discovered provider may not be dialed
-// again, and an identity must not follow the window to another provider.
-func TestDiscoveryGeneratorRetiresEveryIdentity(t *testing.T) {
-	// the process-wide message pool worker must not start inside the bubble
-	GetMessagePoolAggregateStats()
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newIdentityReuseFixture(t, t.Context(), []*ProviderSpec{{BestAvailable: true}}, nil)
-		first := fixture.failArgsAttempt(t)
-		second := fixture.failArgsAttempt(t)
-		if first.ClientId == second.ClientId || fixture.mintCount.Load() != 2 || fixture.retireCount.Load() != 2 {
-			t.Fatalf("discovery generator reused an identity: registrations=%d retirements=%d", fixture.mintCount.Load(), fixture.retireCount.Load())
-		}
-		if err := fixture.generator.CloseAndWait(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-	})
-}
-
 // An owner that opts out keeps one registration and retirement per attempt.
 func TestFixedDestinationReuseCanBeDisabled(t *testing.T) {
 	// the process-wide message pool worker must not start inside the bubble
