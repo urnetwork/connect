@@ -6133,6 +6133,16 @@ type MultiClientGeneratorTransportMigrator interface {
 	MigrateClientTransport(client *Client, args *MultiClientGeneratorClientArgs, migrateTime time.Time)
 }
 
+// An optional capability of a transport migrator for server-directed moves
+// (server/connect/MOVE.md): it receives the whole `ResidentMigrate` -- kind,
+// targets, deadline and preference -- instead of the migrate time alone. A
+// migrator without it migrates every move by name at its migrate time. The
+// same rules as `MigrateClientTransport` hold: return promptly and
+// deduplicate.
+type MultiClientGeneratorTransportMover interface {
+	MoveClientTransport(client *Client, args *MultiClientGeneratorClientArgs, move *ResidentMove)
+}
+
 // MultiClientGeneratorWithExtenderIps is an optional generator capability: the
 // extender addresses carrying one window client's live platform transport
 // (K1). The generator owns the transports, so it is the only layer that can
@@ -19282,11 +19292,19 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 			if !ok {
 				continue
 			}
-			self.transportMigrator.MigrateClientTransport(
-				self.client,
-				&self.args.MultiClientGeneratorClientArgs,
-				time.UnixMilli(int64(residentMigrate.MigrateTime)),
-			)
+			if mover, ok := self.transportMigrator.(MultiClientGeneratorTransportMover); ok {
+				mover.MoveClientTransport(
+					self.client,
+					&self.args.MultiClientGeneratorClientArgs,
+					NewResidentMove(residentMigrate),
+				)
+			} else {
+				self.transportMigrator.MigrateClientTransport(
+					self.client,
+					&self.args.MultiClientGeneratorClientArgs,
+					time.UnixMilli(int64(residentMigrate.MigrateTime)),
+				)
+			}
 		case protocol.MessageType_IpIpPacketFromProvider:
 			if packet, err := ipPacketFromProviderBytes(frame); err == nil {
 				if isIpFragmentPacket(packet) {
