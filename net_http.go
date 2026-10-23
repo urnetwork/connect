@@ -170,6 +170,10 @@ type ClientStrategySettings struct {
 	// dial context. 0 is the family-agnostic strategy this has always been.
 	// The stream dials are pinned through `DialContextSettings` instead.
 	ipFamily int
+	// pinnedExtenderIp is the extender pin of `newPinnedExtenderClientStrategy`
+	// (EXTENDER.md K10): the strategy dials this address's extender dialers
+	// and nothing else. The zero address is the ordinary strategy.
+	pinnedExtenderIp netip.Addr
 
 	// AltUrl enables the two api alt dialers (L4). Only its host and explicit
 	// port are read: the alt host decides where the packets go, while the
@@ -325,6 +329,10 @@ type ClientStrategy struct {
 	// custom extenders
 	// these take precedence over other extenders
 	extenderIpSecrets map[netip.Addr]string
+	// The custom extender secret of a pinned address (K10), which a pin to the
+	// legacy private extender dials with. Set once at construction.
+	pinnedExtenderSecret string
+	pinnedExtenderCustom bool
 	// Every accepted replacement fences pending expansion, even when no
 	// published dialer was removed. Guarded by mutex with the custom map.
 	customExtenderGeneration uint64
@@ -913,6 +921,52 @@ func (self *ClientStrategy) newDirectClientStrategy(ctx context.Context) *Client
 	settings := *baseSettings
 	settings.DohSettings = self.DohSettings()
 	return NewDirectClientStrategy(ctx, &settings, 0)
+}
+
+// Builds the strategy of one window client pinned to an extender address
+// (EXTENDER.md K10) from the settings this one was built with: the extender
+// dialers of that address and nothing else -- no normal, resilient, VLESS,
+// configured or alt dialer. It draws from the same directory, so the
+// address's records, holds and in-use counts stay shared, and it takes the
+// address's custom extender secret when the address is one, so a pin to the
+// legacy private extender dials it as it is dialed today. It lives as long as
+// `ctx`.
+func (self *ClientStrategy) newPinnedExtenderClientStrategy(ctx context.Context, ip netip.Addr) *ClientStrategy {
+	baseSettings := self.baseSettings
+	if baseSettings == nil {
+		// a strategy a test built without the constructor
+		baseSettings = self.settings
+	}
+	settings := *baseSettings
+	settings.DohSettings = self.DohSettings()
+	settings.EnableNormal = false
+	settings.EnableResilient = false
+	settings.ExtenderConfigs = nil
+	settings.DisableManualExtenders = true
+	settings.VlessConfigs = nil
+	settings.DisableVless = true
+	settings.AltUrl = ""
+	// one address is known, so there is no first sample to wait for (E4)
+	settings.ExtenderInitialSampleTimeout = 0
+	settings.pinnedExtenderIp = ip.Unmap()
+
+	secret, custom := func() (string, bool) {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for customIp, secret := range self.extenderIpSecrets {
+			if customIp.Unmap() == settings.pinnedExtenderIp {
+				return secret, true
+			}
+		}
+		return "", false
+	}()
+
+	strategy := NewClientStrategy(ctx, &settings)
+	strategy.mutex.Lock()
+	strategy.pinnedExtenderSecret = secret
+	strategy.pinnedExtenderCustom = custom
+	strategy.mutex.Unlock()
+	return strategy
 }
 
 // nextConnectMaxLead caps how far the shared next-connect timestamp may run
@@ -2237,8 +2291,10 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 		defer self.mutex.Unlock()
 
 		// a manual extender is not in the directory, so its dialers are judged
-		// by the drop timeout alone
-		judge := self.settings.ExtenderDirectory != nil && len(self.extenderIpSecrets) == 0
+		// by the drop timeout alone, and neither is a pinned address: its
+		// dials wait out a hold on their own transport's schedule (K10)
+		judge := self.settings.ExtenderDirectory != nil && len(self.extenderIpSecrets) == 0 &&
+			!self.settings.pinnedExtenderIp.IsValid()
 		for dialer, _ := range self.dialers {
 			if dialer.extenderConfig == nil || dialer.persistent {
 				continue
@@ -2320,6 +2376,9 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 // that refuses their names each failure would hold its address for the hold
 // timeout. A live connection keeps running; only the dialer goes.
 func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDialer) {
+	if self.settings.pinnedExtenderIp.IsValid() {
+		return self.expandPinnedExtenderDialers()
+	}
 	if self.settings.ExpandExtenderProfileCount <= 0 {
 		return []*clientDialer{}
 	}
@@ -2390,20 +2449,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			return strings.Compare(a.String(), b.String())
 		})
 		for _, ip := range ips {
-			candidate := &ExtenderCandidate{
-				Ip:        ip,
-				IpVersion: addressIpVersion(ip),
-				Carriers:  []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns},
-				TcpPort:   ExtenderTcpPort,
-				UdpPort:   ExtenderQuicPort,
-				DnsPort:   ExtenderDnsPort,
-				DnsPorts:  []int{ExtenderDnsPort},
-				DnsTld:    DefaultExtenderDnsTld,
-				Source:    ExtenderSourceManual,
-			}
 			extenderConfigs = append(
 				extenderConfigs,
-				extenderConfigsForCandidate(candidate, extenderIpSecrets[ip], spoofDomains)...,
+				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains)...,
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
@@ -2478,16 +2526,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 				continue
 			}
 			visitedExtenderIpProfiles[ipProfile] = true
-			dialer := &clientDialer{
-				description:        fmt.Sprintf("extender %s", extenderConfig.Profile.ConnectMode),
-				createTime:         time.Now(),
-				minimumWeight:      self.settings.ExtenderMinimumWeight,
-				priority:           extenderDialerPriority(extenderConfig.Profile.ConnectMode),
-				dialTlsContext:     newExtenderDialTlsContext(&self.settings.ConnectSettings, extenderConfig, clientWebSocketNextProtos),
-				httpDialTlsContext: newExtenderDialTlsContext(&self.settings.ConnectSettings, extenderConfig, clientHttpNextProtos),
-				extenderConfig:     extenderConfig,
-				settings:           self.settings,
-			}
+			dialer := newExtenderClientDialer(self.settings, extenderConfig)
 			expandedDialers = append(expandedDialers, dialer)
 			self.dialers[dialer] = true
 		}
@@ -2497,6 +2536,122 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 	}()
 
 	return
+}
+
+// expandPinnedExtenderDialers is expandExtenderDialers for a strategy pinned to
+// one extender address (K10): one dialer per carrier of that address, whatever
+// the directory's hold says, and never a dialer for another address. The
+// address comes from the directory, or from the custom extenders with its
+// secret. An address the directory does not know, may no longer dial, or has
+// limited (A12) gets no dialer this round, and the pinned client waits. As in
+// discovery, an address that still has a dialer is not expanded again: each
+// expansion draws new outer names, so its profiles never repeat.
+func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*clientDialer) {
+	ip := self.settings.pinnedExtenderIp
+
+	// the directory is an external object; it is read with no lock held
+	spoofDomains, spoofCountryCode := directorySpoofDomains(self.settings.ExtenderDirectory)
+
+	secret := ""
+	custom := false
+	retiredDialers := []*clientDialer{}
+	expanded := func() bool {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.closed {
+			return true
+		}
+		secret, custom = self.pinnedExtenderSecret, self.pinnedExtenderCustom
+		// the outer names follow the spoof list in force, as discovery's do
+		if self.extenderSpoofCountryCode != spoofCountryCode {
+			for dialer := range self.dialers {
+				if dialer.IsExtender() && !dialer.persistent {
+					retiredDialers = append(retiredDialers, dialer)
+					delete(self.dialers, dialer)
+				}
+			}
+			self.extenderSpoofCountryCode = spoofCountryCode
+			if len(retiredDialers) != 0 {
+				self.dialerGeneration++
+			}
+		}
+		return self.hasExtenderDialerWithLock(ip)
+	}()
+	for _, dialer := range retiredDialers {
+		dialer.retire()
+	}
+	if expanded {
+		return []*clientDialer{}
+	}
+
+	var candidate *ExtenderCandidate
+	if custom {
+		candidate = customExtenderCandidate(ip)
+	} else {
+		candidate = self.settings.ExtenderDirectory.PinnedCandidate(ip)
+	}
+	if candidate == nil || !candidate.LimitedUntil.IsZero() {
+		return []*clientDialer{}
+	}
+	extenderConfigs := extenderConfigsForCandidate(candidate, secret, spoofDomains)
+
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		// another expansion may have published while the configs were built
+		if self.closed || spoofCountryCode != self.extenderSpoofCountryCode || self.hasExtenderDialerWithLock(ip) {
+			return
+		}
+		for _, extenderConfig := range extenderConfigs {
+			dialer := newExtenderClientDialer(self.settings, extenderConfig)
+			expandedDialers = append(expandedDialers, dialer)
+			self.dialers[dialer] = true
+		}
+		if len(expandedDialers) != 0 {
+			self.dialerGeneration++
+		}
+	}()
+	return expandedDialers
+}
+
+// Whether a dialer of this extender address is in the set.
+func (self *ClientStrategy) hasExtenderDialerWithLock(ip netip.Addr) bool {
+	for dialer := range self.dialers {
+		if extenderConfig := dialer.extenderConfig; extenderConfig != nil && extenderConfig.Ip.Unmap() == ip {
+			return true
+		}
+	}
+	return false
+}
+
+// The candidate of a custom extender, which no record describes: every carrier
+// on its fixed port (E2).
+func customExtenderCandidate(ip netip.Addr) *ExtenderCandidate {
+	return &ExtenderCandidate{
+		Ip:        ip,
+		IpVersion: addressIpVersion(ip),
+		Carriers:  []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns},
+		TcpPort:   ExtenderTcpPort,
+		UdpPort:   ExtenderQuicPort,
+		DnsPort:   ExtenderDnsPort,
+		DnsPorts:  []int{ExtenderDnsPort},
+		DnsTld:    DefaultExtenderDnsTld,
+		Source:    ExtenderSourceManual,
+	}
+}
+
+// One dialer for one extender config, as discovery expands it (E2).
+func newExtenderClientDialer(settings *ClientStrategySettings, extenderConfig *ExtenderConfig) *clientDialer {
+	return &clientDialer{
+		description:        fmt.Sprintf("extender %s", extenderConfig.Profile.ConnectMode),
+		createTime:         time.Now(),
+		minimumWeight:      settings.ExtenderMinimumWeight,
+		priority:           extenderDialerPriority(extenderConfig.Profile.ConnectMode),
+		dialTlsContext:     newExtenderDialTlsContext(&settings.ConnectSettings, extenderConfig, clientWebSocketNextProtos),
+		httpDialTlsContext: newExtenderDialTlsContext(&settings.ConnectSettings, extenderConfig, clientHttpNextProtos),
+		extenderConfig:     extenderConfig,
+		settings:           settings,
+	}
 }
 
 // One address paired with one carrier profile, which is what makes a dialer

@@ -25,6 +25,9 @@ type MultiClientGeneratorClientArgs struct {
 	// The identity key seed of a reused identity, so its next Client
 	// re-registers the same key. In memory only; never persisted or logged.
 	clientKeySeed []byte
+	// The destination's transport hint (EXTENDER.md K10), set for a window
+	// client of a pinned stay. In memory only.
+	transportHint *TransportHint
 }
 
 // NetworkClientCredentials is an optional in-process authority for the
@@ -52,6 +55,10 @@ func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 		ReuseFixedDestinationIdentities: true,
 		DiscoveryIdentityParkMaxCount:   4,
 		DiscoveryIdentityParkMaxAge:     5 * time.Minute,
+
+		// the platform acks a committed secret within a round trip or two; a
+		// slow api must not leave a setup hanging past an ordinary ping wait
+		ProvideRegistrationTimeout: 30 * time.Second,
 	}
 }
 
@@ -127,11 +134,16 @@ type ApiMultiClientGeneratorSettings struct {
 	// MigrateConnectTimeout bounds the temporary second platform transport.
 	// If it cannot establish a route in this interval, it is closed and the
 	// old transport remains until the server's drain fallback evicts it.
+	// Non-positive uses the default.
 	MigrateConnectTimeout time.Duration
 	// MigrateMaxScheduleDelay bounds an absolute server-provided migration
 	// time, protecting the retained request/state from clock skew or a
-	// malformed far-future value.
+	// malformed far-future value. Non-positive uses the default.
 	MigrateMaxScheduleDelay time.Duration
+	// ProvideRegistrationTimeout bounds a new window client's wait for the
+	// platform to commit its provide secret when its `ControlPingTimeout` is
+	// unset. Non-positive uses the default.
+	ProvideRegistrationTimeout time.Duration
 	// IdentityLoadTimeout bounds the optional persisted-window identity load.
 	// Continuity restoration is abandoned after this deadline so a slow remote
 	// store cannot hold both window enumerators ahead of provider discovery.
@@ -199,6 +211,10 @@ type apiWindowClientTransport struct {
 	// the client's move memory, shared by every transport generation
 	// (resident_move.go). Read through residentMoveTrackerWithLock.
 	residentMoveTracker *ResidentMoveTracker
+	// The strategy of a client pinned to an extender (K10), which every
+	// generation of its transport dials with, H1 only, whatever the window's
+	// mode policy. Nil for every other client. It closes with the client.
+	pinnedStrategy *ClientStrategy
 }
 
 // The client's move memory: the one its transport settings carry, and for a
@@ -392,6 +408,9 @@ type ApiMultiClientGenerator struct {
 		targetMode TransportMode,
 		settings *PlatformTransportSettings,
 	) apiWindowPlatformTransport
+	// Observes the strategy each window transport is built with; a pinned
+	// stay's is its own (K10).
+	platformTransportStrategyForTest func(client *Client, clientStrategy *ClientStrategy)
 }
 
 func NewApiMultiClientGeneratorWithDefaults(
@@ -541,7 +560,8 @@ func (self *ApiMultiClientGenerator) SetPlatformTransportPolicy(
 	self.transportLock.Lock()
 	clients := make([]*Client, 0, len(self.transports))
 	for client, state := range self.transports {
-		if state != nil && !state.initializing {
+		// a pinned client keeps H1 through its extender whatever the policy (K10)
+		if state != nil && !state.initializing && state.pinnedStrategy == nil {
 			clients = append(clients, client)
 		}
 	}
@@ -984,8 +1004,18 @@ func (self *ApiMultiClientGenerator) NewClientArgsForDestination(destination Mul
 }
 
 // NewClientArgsForDestinationContext implements
-// MultiClientGeneratorWithDestinationContext.
+// MultiClientGeneratorWithDestinationContext. The args of a pinned stay's
+// destination carry its transport hint (K10), whichever identity they hold.
 func (self *ApiMultiClientGenerator) NewClientArgsForDestinationContext(ctx context.Context, destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {
+	args, err := self.newClientArgsForDestinationContext(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	args.transportHint = providerSpecsTransportHint(self.specs, destination)
+	return args, nil
+}
+
+func (self *ApiMultiClientGenerator) newClientArgsForDestinationContext(ctx context.Context, destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {
 	// the destination's own last identity, parked after a failed attempt
 	if args := self.takeParkedIdentity(destination); args != nil {
 		return args, nil
@@ -1295,7 +1325,13 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 			authorizationClosed(cause)
 		}
 	}
-	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
+	// a pinned stay's client dials through its own strategy, which lives as
+	// long as the client (K10)
+	var pinnedStrategy *ClientStrategy
+	if hint := args.transportHint; hint != nil && hint.ExtenderIp.IsValid() {
+		pinnedStrategy = self.clientStrategy.newPinnedExtenderClientStrategy(client.Ctx(), hint.ExtenderIp)
+	}
+	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings, pinnedStrategy)
 	auth := *args.ClientAuth
 	self.transportLock.Lock()
 	if self.transports == nil {
@@ -1313,6 +1349,7 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		policyVersion:       policyVersion,
 		extenderIpsMonitor:  extenderIpsMonitor,
 		residentMoveTracker: residentMoveTracker,
+		pinnedStrategy:      pinnedStrategy,
 	}
 	self.transportLock.Unlock()
 	// Enable return traffic for this client and block until the platform has
@@ -1339,7 +1376,10 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	)
 	provideTimeout := clientSettings.ControlPingTimeout
 	if provideTimeout <= 0 {
-		provideTimeout = 30 * time.Second
+		provideTimeout = self.settings.ProvideRegistrationTimeout
+	}
+	if provideTimeout <= 0 {
+		provideTimeout = DefaultApiMultiClientGeneratorSettings().ProvideRegistrationTimeout
 	}
 	provideTimer := time.NewTimer(provideTimeout)
 	defer provideTimer.Stop()
@@ -1385,8 +1425,9 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		state.initializing = false
 	}
 	self.transportLock.Unlock()
+	// the window's mode policy never applies to a pinned client
 	_, _, currentPolicyVersion := self.platformTransportPolicy()
-	if policyVersion != currentPolicyVersion {
+	if policyVersion != currentPolicyVersion && pinnedStrategy == nil {
 		self.MigrateClientTransport(client, nil, time.Now())
 	}
 	return client, nil
@@ -1412,20 +1453,32 @@ func (self *ApiMultiClientGenerator) createPlatformTransport(
 	client *Client,
 	auth *ClientAuth,
 	settings *PlatformTransportSettings,
+	pinnedStrategy *ClientStrategy,
 ) (apiWindowPlatformTransport, TransportMode, uint64) {
 	targetMode, modePreferences, policyVersion := self.platformTransportPolicy()
+	clientStrategy := self.clientStrategy
+	if pinnedStrategy != nil {
+		// a pinned stay dials H1 through its extender only: the window's mode
+		// policy does not apply, since only H1 runs through an extender (K10)
+		targetMode = TransportModeH1
+		modePreferences = nil
+		clientStrategy = pinnedStrategy
+	}
 	settingsValue := *settings
 	if modePreferences != nil {
 		settingsValue.ModePreferences = maps.Clone(modePreferences)
 	}
 	effectiveSettings := &settingsValue
 	var transport apiWindowPlatformTransport
+	if self.platformTransportStrategyForTest != nil {
+		self.platformTransportStrategyForTest(client, clientStrategy)
+	}
 	if self.newPlatformTransport != nil {
 		transport = self.newPlatformTransport(client, auth, targetMode, effectiveSettings)
 	} else {
 		transport = NewPlatformTransportWithTargetMode(
 			client.Ctx(),
-			self.clientStrategy,
+			clientStrategy,
 			client.RouteManager(),
 			self.platformUrl,
 			auth,
@@ -1544,6 +1597,8 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 	current := state.current
 	settings := state.settings
 	auth := state.auth
+	// a migration keeps a pinned client on its extender (K10)
+	pinnedStrategy := state.pinnedStrategy
 	if !moving {
 		state.migrating = true
 	}
@@ -1595,7 +1650,7 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 			self.transportLock.Lock()
 			if self.transports[client] == state {
 				state.migrating = false
-				stalePolicy = state.policyVersion != currentPolicyVersion
+				stalePolicy = state.policyVersion != currentPolicyVersion && state.pinnedStrategy == nil
 			}
 			self.transportLock.Unlock()
 			if stalePolicy {
@@ -1631,11 +1686,11 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 		}
 
 		if movePlan != nil && movePlan.Dial != nil {
-			self.moveWindowTransport(client, state, current, settings, auth, movePlan.Dial, move, residentMoveTracker)
+			self.moveWindowTransport(client, state, current, settings, auth, pinnedStrategy, movePlan.Dial, move, residentMoveTracker)
 			return
 		}
 
-		next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
+		next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings, pinnedStrategy)
 		brokeBeforeMake := false
 		if nextPlatform, ok := next.(*PlatformTransport); ok {
 			if currentPlatform, ok := current.(*PlatformTransport); ok &&
@@ -1766,13 +1821,16 @@ func (self *ApiMultiClientGenerator) migrateConnectTimeout() time.Duration {
 // the move's close time. A move never breaks before it makes: when the memory
 // budget cannot hold the replacement beside the old carrier, an advisory move
 // is declined, and a compulsory one keeps the old carrier, which the platform
-// closes at the close time, after which its own reconnect runs.
+// closes at the close time, after which its own reconnect runs. A client
+// pinned to an extender (K10) builds its replacement with its own strategy,
+// as every generation of it does.
 func (self *ApiMultiClientGenerator) moveWindowTransport(
 	client *Client,
 	state *apiWindowClientTransport,
 	current apiWindowPlatformTransport,
 	settings *PlatformTransportSettings,
 	auth ClientAuth,
+	pinnedStrategy *ClientStrategy,
 	dial *ResidentMoveDial,
 	move *ResidentMove,
 	residentMoveTracker *ResidentMoveTracker,
@@ -1785,7 +1843,7 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 	moveSettings := *settings
 	moveSettings.ResidentMoveTracker = residentMoveTracker
 	moveSettings.ResidentMoveDial = dial
-	next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, &moveSettings)
+	next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, &moveSettings, pinnedStrategy)
 
 	if nextPlatform, ok := next.(*PlatformTransport); ok {
 		if currentPlatform, ok := current.(*PlatformTransport); ok &&

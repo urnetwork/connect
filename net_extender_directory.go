@@ -2646,6 +2646,30 @@ func (self *ExtenderDirectory) IsActiveKey(publicKey []byte) bool {
 	return !self.keyRecordExpiredWithLock(keyRecord, now)
 }
 
+// The dialable form of one address for a strategy pinned to it (K10): what
+// `AddressUsable` admits, except that a hold does not count, because a pinned
+// stay waits out a failed dial on its own transport's schedule. Nil when the
+// directory does not know the address or may no longer dial it.
+func (self *ExtenderDirectory) PinnedCandidate(ip netip.Addr) *ExtenderCandidate {
+	if self == nil || !ip.IsValid() {
+		return nil
+	}
+	ip = ip.Unmap()
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	address := self.ipAddresses[ip]
+	if address == nil || !self.addressDialableWithLock(address) {
+		return nil
+	}
+	if !self.addressActiveWithLock(address, now) && !self.keyRetainedExpiredWithLock(address.publicKeyHex, now) {
+		return nil
+	}
+	return self.candidateWithLock(address, now)
+}
+
 // Reports whether this address may still be dialed: it is known, not held and
 // its key is active -- or it is one of the retained expired identities, the
 // last tier of Candidates, so an established dialer to it is kept rather than
