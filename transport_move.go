@@ -15,6 +15,15 @@ package connect
 // layer from the platform url, are unchanged; and the H3 candidates are the
 // target addresses on the platform port, with the server name unchanged.
 //
+// A move redirects only the platform host's edges. A carrier an alt url
+// redirects -- plain H3, and the DNS carriers, on every space with an alt
+// deployment (EXTENDER.md L1, L4) -- keeps dialing alt: neither a move's
+// targets nor a preference apply to it. A strict move's replacement parks such
+// a carrier, like a DNS carrier or H3 through an extender, so it arrives at the
+// target over H1, and the carrier dials alt again once the move concludes. A
+// compulsory move's replacement dials alt by name. Only H1, and plain H3 on a
+// space with no alt url, can use a target.
+//
 // The outcome of a dial that used targets is reported back: an arrival (the
 // connection registered and no relay carried it) to the move's dial, which also
 // records the preference; a failure, with its typed reason and how long the
@@ -149,16 +158,20 @@ func (self *PlatformTransport) noteMoveDialArrived(attempt *platformMoveDialAtte
 	attempt.dial.noteArrived(attempt.override.host, attempt.override.targetIps, time.Now())
 }
 
-// Parks a mode runner whose carrier cannot use a target -- a DNS carrier, or
-// any H3 carrier an extender relays -- while this transport is a strict move's
-// replacement. Any connection a strict replacement makes must be an arrival at
-// the target. False means the context ended.
+// Parks a mode runner whose carrier cannot use a target -- a DNS carrier, an
+// H3 carrier an alt url redirects, or one an extender relays -- while this
+// transport is a strict move's replacement. Any connection a strict
+// replacement makes must be an arrival at the target. False means the context
+// ended.
 func (self *PlatformTransport) waitMoveCarrierAdmission(ctx context.Context, mode TransportMode) bool {
 	canUseTarget := func() bool {
 		switch mode {
 		case TransportModeH1:
 			return true
 		case TransportModeH3:
+			if self.h3AltRedirected() {
+				return false
+			}
 			return self.clientStrategy == nil || self.clientStrategy.H3ExtenderConfig() == nil
 		default:
 			return false
@@ -169,12 +182,23 @@ func (self *PlatformTransport) waitMoveCarrierAdmission(ctx context.Context, mod
 		if !held || canUseTarget() {
 			return true
 		}
+		if self.settings.moveCarrierHoldForTest != nil {
+			self.settings.moveCarrierHoldForTest(mode)
+		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-notify:
 		}
 	}
+}
+
+// Whether an alt url redirects this transport's plain H3 carrier to the alt
+// host (EXTENDER.md L4). A move redirects only the platform host's edges, so
+// such a carrier dials neither a move's target nor a preference.
+func (self *PlatformTransport) h3AltRedirected() bool {
+	altHost, _ := altUrlHostPort(self.settings.AltUrl)
+	return altHost != ""
 }
 
 // Counts a live connection a relay carries for exactly its lifetime. The

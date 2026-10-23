@@ -818,3 +818,94 @@ func TestApiWindowMoveSwapsToTheTargetEdgeMakeBeforeBreak(t *testing.T) {
 	}
 	requireTestMoveReports(t, reports)
 }
+
+// A window carried on H3 through alt moves over H1, the one carrier that can
+// reach the target. When this network refuses H1 at the target, that failure
+// is no evidence about the target -- the old transport proved H3, not H1 -- so
+// it neither fails the move nor holds the target: the move times out with a
+// connect timeout and the old transport stays. The replacement's H3 waits
+// throughout and never sends to the target.
+func TestApiWindowAltH3MoveTimesOutWhenTheTargetRefusesH1(t *testing.T) {
+	server := newTestMoveH1Server(t, testMoveHost)
+	// no route at all: H1 to the target is refused
+	seam := newTestMoveDialSeam(server.address)
+	client, _ := newApiMigrationTestClient(t)
+	strategy := newTestMoveStrategy(t, client.Ctx(), server.roots, seam.dial)
+	factory, h3DialedAddresses := newTestMoveRecordingPacketConnFactory()
+	settings := testingPlatformTransportSettings()
+	settings.AltUrl = "https://127.0.0.1:1"
+	settings.H3PacketConnFactory = factory
+	settings.ResidentMoveTracker = NewResidentMoveTracker()
+
+	old := newFakeMoveWindowTransport(true)
+	old.activeMode = TransportModeH3
+	generatorSettings := DefaultApiMultiClientGeneratorSettings()
+	generatorSettings.MigrateConnectTimeout = 3 * time.Second
+	generatorSettings.MigrateMaxScheduleDelay = 20 * time.Millisecond
+	reports := &testMoveReports{}
+	state := &apiWindowClientTransport{
+		current:             old,
+		settings:            settings,
+		auth:                ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+		policyVersion:       1,
+		extenderIpsMonitor:  NewMonitorValue[uint64](0),
+		residentMoveTracker: settings.ResidentMoveTracker,
+	}
+	created := make(chan *PlatformTransport, 1)
+	generator := &ApiMultiClientGenerator{
+		settings:                      generatorSettings,
+		clientStrategy:                strategy,
+		platformUrl:                   "wss://" + testMoveHost,
+		platformTransportMode:         TransportModeAuto,
+		platformTransportPolicyVer:    1,
+		transports:                    map[*Client]*apiWindowClientTransport{client: state},
+		sendResidentMoveResultForTest: reports.observe,
+	}
+	generator.settings.PlatformTransportCreated = func(_ *Client, transport *PlatformTransport) {
+		created <- transport
+	}
+
+	move := testAdvisoryMove(testMoveTargetIpv4)
+	generator.MoveClientTransport(client, nil, move)
+	next := receiveTestMoveValue(t, created, "the move on alt built no replacement")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := generator.CloseTransportCreationAndWait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-next.Done():
+	default:
+		t.Fatal("the timed out replacement was not closed")
+	}
+	select {
+	case <-old.closed:
+		t.Fatal("the timed out move closed the old transport")
+	default:
+	}
+	generator.transportLock.Lock()
+	current := state.current
+	generator.transportLock.Unlock()
+	if current != old {
+		t.Fatal("the timed out move displaced the old transport")
+	}
+	if !slices.Contains(seam.dialedAddresses(), testMoveTargetAddress(testMoveTargetIpv4)) {
+		t.Fatal("the replacement never tried the target over H1")
+	}
+	if settings.ResidentMoveTracker.TargetFailedWithin(testMoveTargetIpv4, time.Hour, time.Now()) {
+		t.Fatal("an H1 refusal on a client that moved off H3 held the target")
+	}
+	for _, address := range h3DialedAddresses() {
+		if address == testMoveTargetAddress(testMoveTargetIpv4) {
+			t.Fatal("the alt H3 carrier sent to the target")
+		}
+	}
+	got := reports.snapshot()
+	if len(got) != 1 ||
+		got[0].Outcome != protocol.ResidentMoveOutcome_ResidentMoveOutcomeFailed ||
+		got[0].Reason != protocol.ResidentMoveReason_ResidentMoveReasonConnectTimeout ||
+		got[0].IpFamily != 0 || got[0].Elapsed < 3000 ||
+		!slices.Equal(got[0].MoveId, move.MoveId.Bytes()) {
+		t.Fatalf("reports = %v, want one connect timeout", got)
+	}
+}

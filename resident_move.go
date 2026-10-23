@@ -26,6 +26,15 @@ package connect
 //     only its targets) and what the dials have done. The replacement's
 //     transports read it through `PlatformTransportSettings.ResidentMoveDial`.
 //
+// A move redirects only the platform host's edges. A carrier an alt url
+// redirects -- plain H3, and the DNS carriers, on every space with an alt
+// deployment (EXTENDER.md L1, L4) -- keeps dialing alt: neither a move's
+// targets nor a preference apply to it (transport_move.go). Such a transport
+// is still moved, over H1, which always dials the platform host; only a
+// failure in the carrier its old transport used counts against a target, so
+// an H1 refusal on a client that ran on H3 through alt times the move out
+// instead of holding the target.
+//
 // An advisory move is declined (D11) when no transport can use a target (an
 // extender or VLESS relay carries it, it is a DNS carrier, or no target matches
 // its family), when its target failed within `MoveTargetFailHold`, when a move

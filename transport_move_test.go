@@ -860,6 +860,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 
 	transport := &PlatformTransport{
 		clientStrategy:   direct,
+		settings:         DefaultPlatformTransportSettings(),
 		residentMoveDial: plan.Dial,
 	}
 	for _, mode := range []TransportMode{TransportModeH1, TransportModeH3} {
@@ -869,6 +870,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 	}
 	extenderTransport := &PlatformTransport{
 		clientStrategy:   extenderOnly,
+		settings:         DefaultPlatformTransportSettings(),
 		residentMoveDial: plan.Dial,
 	}
 	held := []func() bool{
@@ -904,6 +906,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 	)
 	compulsoryTransport := &PlatformTransport{
 		clientStrategy:   direct,
+		settings:         DefaultPlatformTransportSettings(),
 		residentMoveDial: compulsory.Dial,
 	}
 	if !compulsoryTransport.waitMoveCarrierAdmission(ctx, TransportModeH3Dns) {
@@ -1181,5 +1184,253 @@ func TestPlatformTransportCompulsoryMoveDialFallsBackToTheName(t *testing.T) {
 	}
 	if got := tracker.preferredTargetIps(testMoveHost, 0, time.Now()); 0 < len(got) {
 		t.Fatalf("a connection by name recorded a preference: %v", got)
+	}
+}
+
+// A packet connection for an H3 carrier that records every destination and
+// sends only to loopback, so a dial to a documentation address leaves the
+// machine as nothing.
+type testMoveRecordingPacketConn struct {
+	net.PacketConn
+	stateLock sync.Mutex
+	addresses []string
+}
+
+func (self *testMoveRecordingPacketConn) WriteTo(packet []byte, addr net.Addr) (int, error) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.addresses = append(self.addresses, addr.String())
+	}()
+	if udpAddr, ok := addr.(*net.UDPAddr); !ok || !udpAddr.IP.IsLoopback() {
+		return len(packet), nil
+	}
+	return self.PacketConn.WriteTo(packet, addr)
+}
+
+func (self *testMoveRecordingPacketConn) dialedAddresses() []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.addresses)
+}
+
+// An H3 packet connection factory over recording connections, and the
+// destinations every connection it made sent to.
+func newTestMoveRecordingPacketConnFactory() (func(context.Context) (net.PacketConn, error), func() []string) {
+	var stateLock sync.Mutex
+	packetConns := []*testMoveRecordingPacketConn{}
+	factory := func(context.Context) (net.PacketConn, error) {
+		packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		recording := &testMoveRecordingPacketConn{PacketConn: packetConn}
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		packetConns = append(packetConns, recording)
+		return recording, nil
+	}
+	dialedAddresses := func() []string {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		addresses := []string{}
+		for _, packetConn := range packetConns {
+			addresses = append(addresses, packetConn.dialedAddresses()...)
+		}
+		return addresses
+	}
+	return factory, dialedAddresses
+}
+
+// An alt url redirects the plain H3 carrier to alt (EXTENDER.md L4), and a
+// move redirects only the platform host's edges: with an alt url, neither a
+// move's targets (strict or compulsory) nor a preference stand in for the alt
+// address, and the attempt never counts as a dial of its targets. Without one,
+// the target stands in on the platform port.
+func TestPlatformTransportMoveTargetsNeverRedirectAnAltCarrier(t *testing.T) {
+	transports := []ResidentMoveTransport{testDirectMoveTransport(0)}
+	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	for _, c := range []struct {
+		name    string
+		attempt func() *platformMoveDialAttempt
+	}{
+		{name: "strict move", attempt: func() *platformMoveDialAttempt {
+			return &platformMoveDialAttempt{
+				override: &moveDialOverride{host: testMoveHost, targetIps: []netip.Addr{testMoveTargetIpv4}, strict: true},
+				dial:     strict,
+			}
+		}},
+		{name: "compulsory move", attempt: func() *platformMoveDialAttempt {
+			return &platformMoveDialAttempt{
+				override: &moveDialOverride{host: testMoveHost, targetIps: []netip.Addr{testMoveTargetIpv4}},
+				dial:     compulsory,
+			}
+		}},
+		{name: "preference", attempt: func() *platformMoveDialAttempt {
+			return &platformMoveDialAttempt{
+				override: &moveDialOverride{host: testMoveHost, targetIps: []netip.Addr{testMoveTargetIpv4}},
+			}
+		}},
+	} {
+		settings := DefaultPlatformTransportSettings()
+		settings.AltUrl = "https://" + testAltIp
+		transport := newTestAltTransport(t, settings)
+		attempt := c.attempt()
+		udpAddrs, _, err := transport.h3DialCandidates(attempt.withContext(context.Background()), TransportModeH3, testMoveHost)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := testAltCandidateHostPorts(udpAddrs); !slices.Equal(got, []string{net.JoinHostPort(testAltIp, "443")}) {
+			t.Fatalf("%s with an alt url: candidates = %v, want the alt address", c.name, got)
+		}
+		if attempt.dialedTargets() {
+			t.Fatalf("%s with an alt url: the attempt counts as a dial of its targets", c.name)
+		}
+
+		settings.AltUrl = ""
+		attempt = c.attempt()
+		udpAddrs, _, err = transport.h3DialCandidates(attempt.withContext(context.Background()), TransportModeH3, testMoveHost)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := testAltCandidateHostPorts(udpAddrs); !slices.Equal(got, []string{testMoveTargetAddress(testMoveTargetIpv4)}) {
+			t.Fatalf("%s without an alt url: candidates = %v, want the target on the platform port", c.name, got)
+		}
+		if !attempt.dialedTargets() {
+			t.Fatalf("%s without an alt url: the target dial was not counted", c.name)
+		}
+	}
+}
+
+// A strict move's replacement parks an alt-redirected H3 carrier, which
+// cannot reach a target, until the move concludes; a compulsory move's dials
+// alt by name, and without an alt url plain H3 dials the target.
+func TestPlatformTransportStrictMoveParksAnAltH3Carrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	direct := NewClientStrategyWithDefaults(ctx)
+	defer direct.Close()
+	transports := []ResidentMoveTransport{testDirectMoveTransport(0)}
+	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	altSettings := DefaultPlatformTransportSettings()
+	altSettings.AltUrl = "https://" + testAltIp
+
+	for _, c := range []struct {
+		name     string
+		settings *PlatformTransportSettings
+		dial     *ResidentMoveDial
+	}{
+		{name: "compulsory move on alt", settings: altSettings, dial: compulsory},
+		{name: "strict move without alt", settings: DefaultPlatformTransportSettings(), dial: strict},
+	} {
+		transport := &PlatformTransport{clientStrategy: direct, settings: c.settings, residentMoveDial: c.dial}
+		if !transport.waitMoveCarrierAdmission(ctx, TransportModeH3) {
+			t.Fatalf("%s: H3 was held", c.name)
+		}
+	}
+
+	transport := &PlatformTransport{clientStrategy: direct, settings: altSettings, residentMoveDial: strict}
+	if !transport.waitMoveCarrierAdmission(ctx, TransportModeH1) {
+		t.Fatal("a strict move on alt held H1, the carrier that reaches the target")
+	}
+	released := make(chan bool, 1)
+	go func() {
+		released <- transport.waitMoveCarrierAdmission(ctx, TransportModeH3)
+	}()
+	select {
+	case <-released:
+		t.Fatal("a strict move dialed the alt-redirected H3 carrier")
+	case <-time.After(50 * time.Millisecond):
+	}
+	strict.Conclude()
+	if !receiveTestMoveValue(t, released, "the conclusion did not release the alt H3 carrier") {
+		t.Fatal("the released carrier reported its context ended")
+	}
+}
+
+// A strict move's replacement on alt arrives at the target over H1 while its
+// H3 carrier waits. Once the move concludes, H3 runs again and dials alt --
+// never the target, not even through the preference the arrival left.
+func TestPlatformTransportStrictMoveArrivesOverH1WhileAltH3Waits(t *testing.T) {
+	edge := newTestMoveH1Server(t, testMoveHost)
+	alt := newTestMoveH3Server(t, testMoveHost)
+	seam := newTestMoveDialSeam(edge.address, testMoveTargetAddress(testMoveTargetIpv4))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	strategy := newTestMoveStrategy(t, ctx, edge.roots, seam.dial)
+
+	h3Attempts := make(chan struct{}, 64)
+	factory, h3DialedAddresses := newTestMoveRecordingPacketConnFactory()
+	settings := testingPlatformTransportSettings()
+	// equal tiers, so H3 does not stand down for H1 once it may dial
+	settings.ModePreferences = map[TransportMode]int{TransportModeH1: 1, TransportModeH3: 1}
+	settings.AltUrl = "https://" + alt.addr.String()
+	settings.QuicTlsConfig = &tls.Config{RootCAs: alt.roots, NextProtos: []string{testMoveH3NextProto}}
+	settings.H3PacketConnFactory = factory
+	// only H3 builds an auth frame: H1 authenticates in its headers
+	settings.AuthFrameObserver = func([]byte) {
+		select {
+		case h3Attempts <- struct{}{}:
+		default:
+		}
+	}
+	// called on the H3 runner before it waits, after any attempt it made
+	h3Parked := make(chan struct{}, 8)
+	settings.moveCarrierHoldForTest = func(mode TransportMode) {
+		if mode == TransportModeH3 {
+			select {
+			case h3Parked <- struct{}{}:
+			default:
+			}
+		}
+	}
+	tracker := NewResidentMoveTracker()
+	onAlt := testDirectMoveTransport(0)
+	onAlt.activeMode = TransportModeH3
+	plan := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), []ResidentMoveTransport{onAlt}, settings, tracker, time.Now())
+	if plan.Declined || plan.Dial == nil {
+		t.Fatalf("a transport on H3 through alt was not moved: %+v", plan)
+	}
+	settings.ResidentMoveTracker = tracker
+	settings.ResidentMoveDial = plan.Dial
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		NewRouteManager(ctx, "move-alt"),
+		"wss://"+testMoveHost,
+		testingFamilyAuth(),
+		TransportModeAuto,
+		settings,
+	)
+	defer transport.Close()
+
+	request := receiveTestMoveValue(t, edge.requests, "the replacement did not reach the target over H1")
+	if request.host != testMoveHost {
+		t.Fatalf("HTTP host = %q", request.host)
+	}
+	if !waitForCondition(10*time.Second, plan.Dial.Arrived) {
+		t.Fatal("the H1 arrival was not counted")
+	}
+	receiveTestMoveValue(t, h3Parked, "the alt H3 carrier was not parked during the strict move")
+	select {
+	case <-h3Attempts:
+		t.Fatal("the alt H3 carrier dialed during the strict move")
+	default:
+	}
+
+	plan.Dial.Conclude()
+	receiveTestMoveValue(t, h3Attempts, "the alt H3 carrier did not run once the move concluded")
+	if serverName := receiveTestMoveValue(t, alt.serverNames, "the H3 carrier did not reach alt"); serverName != testMoveHost {
+		t.Fatalf("alt server name = %q", serverName)
+	}
+	for _, address := range h3DialedAddresses() {
+		if address != alt.addr.String() {
+			t.Fatalf("H3 sent to %q, want only alt at %s", address, alt.addr)
+		}
+	}
+	if got := tracker.preferredTargetIps(testMoveHost, 0, time.Now()); !slices.Equal(got, []netip.Addr{testMoveTargetIpv4}) {
+		t.Fatalf("the H1 arrival's preference = %v", got)
 	}
 }

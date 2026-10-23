@@ -778,6 +778,10 @@ type PlatformTransportSettings struct {
 	// credential refusal hold, right before it waits, so a test can hold the
 	// exact point after which no dial with the refused credential can happen.
 	credentialRefusalHoldForTest func()
+	// Nil outside package tests. Called each time a mode runner parks while a
+	// strict move's replacement holds its carrier, right before it waits, with
+	// the runner's mode (transport_move.go).
+	moveCarrierHoldForTest func(mode TransportMode)
 	// Nil outside package tests. Called each time an inactive-drain watchdog
 	// reads the active mode, with whether that mode supersedes its carrier,
 	// before it waits. It runs on the watchdog and must not block.

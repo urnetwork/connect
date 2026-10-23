@@ -1716,10 +1716,13 @@ func (self *PlatformTransport) h3DialCandidatesWithResolver(
 		}
 		return udpAddrs, translated(PacketTranslationModeDnsPump, tld), nil
 	default:
-		// a move's targets stand in for the resolved addresses, on the
-		// platform's own port: a target is an edge of the platform host, never
-		// the alt host (resident_move.go)
-		if override := moveDialOverrideFromContext(ctx); override.matches(serverName) {
+		// a move's targets, and a target a move left preferred, stand in for
+		// the resolved addresses on the platform's own port, but only while
+		// this carrier dials the platform host. A move redirects the platform
+		// host's edges, never alt's: an alt url keeps the carrier dialing alt
+		// exactly as it would, and the attempt dials no target
+		// (resident_move.go)
+		if override := moveDialOverrideFromContext(ctx); override.matches(serverName) && !self.h3AltRedirected() {
 			udpAddrs := override.udpAddrs(self.ipFamily, self.settings.H3Port)
 			if len(udpAddrs) == 0 {
 				return nil, nil, errResidentMoveNoFamilyTarget
