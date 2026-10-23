@@ -1326,6 +1326,37 @@ carousel and the share code. The linux release container adds
 `libzxing-cpp-dev`; the windows build fetches zxing-cpp and vendors the
 Nayuki encoder.
 
+K9. Provider rows (2026-10-22). The provider details sheet, the connected
+providers with their globe, shows the same extenders as the connect grid.
+`ConnectedProviderLocation` carries `ExtenderIps` and `ExtenderColorHexes`
+from the provider's event (K1), comma separated and paired by index as on
+the grid point, through the same `extenderIpsAndColorHexes`, which lives in
+the untagged color file beside `GetExtenderColorHex` because the iOS
+extension builds the provider rows too; the web binding hands the page the
+pairs as `extenders: [{ip, colorHex}]`. A row's dot draws K2's rings at its
+own size, as many as fit at full stroke, and dashes the last one drawn when
+more extenders remain: apple's dots (40 pt on iOS, 30 pt on macOS) and
+android's 40 dp hold all three, the 20 px dots on linux and the web hold two
+(the web's grew from 10 px, which held none), and windows' 12 px dot, the
+location chooser's size, holds one. The globe's dots draw them at the dot's
+size in the globe's 600-unit space, scaled with the globe, so a globe dot
+holds one ring and a second extender dashes it. The rows and the globe drop
+the rings that do not fit on every app, even where the grid thins them to
+keep the count (android, windows; K2). The rings run in each app's grid
+order: the first extender outermost everywhere but android, whose grid and
+widget put it innermost. Under the connected time, each extender gets one
+line: a small ring in its color (K3), then its address in the client id's
+monospaced style, copied on a tap. Apple's row context menu also has "Copy
+extender address"; rows without a context menu use the same words for the
+tap (android's click label, the tooltip on windows, linux and the web). The
+address is the extender's id on the rows: every extender has one, while the
+extender's uuid reaches a client only as `MeasurementId` on the open-tier
+records of extenders that serve the measurement API. A direct or p2p
+provider shows neither rings nor lines. Apple came first and every app
+follows it, including the web app, though its hosted device never dials an
+extender (K8), so its rows stay plain until a page runs against a device
+that does.
+
 ### L. The alt service
 
 L1. What alt is. A full connect node and an api server in one process,
