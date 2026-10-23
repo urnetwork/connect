@@ -1402,7 +1402,11 @@ client closes its strategy with its transport, and a policy migration keeps
 the pin. The transport reports the extender as K1 has it, so the row shows
 the pinned extender while it carries the connection. The pin covers the
 platform transport: a P2P route to the provider (K1) never touches the
-platform, is unchanged by the pin, and shows as no extender on the row.
+platform, is unchanged by the pin, and shows as no extender on the row. A
+resident move (server/connect/MOVE.md) never retargets a pinned client:
+its carrier is an extender, so an advisory move is declined as an extender
+carrier and a compulsory one migrates it by name, and every transport a
+migration or a move builds for it dials through its own strategy.
 
 Compatibility. A pin is settable state an older device process would drop:
 it decodes `extender_ip` as nothing and stays on the exit alone. Instead of a

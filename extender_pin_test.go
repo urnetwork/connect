@@ -10,6 +10,9 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 func TestTransportHintReachesOnlyItsDestination(t *testing.T) {
@@ -197,5 +200,68 @@ func TestPinnedStayTransportDialsH1ThroughItsOwnStrategy(t *testing.T) {
 	generator.createPlatformTransport(nil, &ClientAuth{}, &PlatformTransportSettings{}, nil)
 	if builtMode != TransportModeAuto || builtStrategy != base {
 		t.Fatalf("unpinned: mode %s, shared strategy %t", builtMode, builtStrategy == base)
+	}
+}
+
+// A move never takes a pinned stay off its pin: the compulsory move of its
+// extender carrier migrates it by name, and even a move that dials a target
+// builds the replacement on the pin, as every generation of it is built.
+func TestPinnedStayKeepsItsStrategyThroughAMove(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		move         func() *ResidentMove
+		relayCarried bool
+		dialsTarget  bool
+	}{
+		{
+			name:         "compulsory move of its extender carrier",
+			move:         func() *ResidentMove { return testCompulsoryMove(testMoveTargetIpv4) },
+			relayCarried: true,
+		},
+		{
+			name:        "move that dials a target",
+			move:        func() *ResidentMove { return testAdvisoryMove(testMoveTargetIpv4) },
+			dialsTarget: true,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			base := NewClientStrategy(ctx, DefaultClientStrategySettings())
+			pinned := base.newPinnedExtenderClientStrategy(ctx, netip.MustParseAddr("203.0.113.7"))
+
+			client, _ := newApiMigrationTestClient(t)
+			old := newFakeMoveWindowTransport(true)
+			old.relayCarried = c.relayCarried
+			next := newFakeWindowPlatformTransport(false)
+			fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+				func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
+			fixture.generator.clientStrategy = base
+			fixture.state.pinnedStrategy = pinned
+			strategies := make(chan *ClientStrategy, 8)
+			fixture.generator.platformTransportStrategyForTest = func(_ *Client, clientStrategy *ClientStrategy) {
+				strategies <- clientStrategy
+			}
+
+			fixture.generator.MoveClientTransport(client, nil, c.move())
+			settings := receiveTestMoveValue(t, fixture.created, "the move did not build a replacement")
+			dial := settings.ResidentMoveDial
+			if (dial != nil) != c.dialsTarget {
+				t.Fatalf("replacement dial = %+v, want a target dial %t", dial, c.dialsTarget)
+			}
+			if strategy := receiveTestMoveValue(t, strategies, "the replacement was built without a strategy"); strategy != pinned {
+				t.Fatal("the replacement of a pinned stay dials without its pin")
+			}
+
+			if dial != nil {
+				// the target fails, which keeps the old transport
+				dial.noteFailed(0, TransportModeH1, []netip.Addr{testMoveTargetIpv4}, protocol.ResidentMoveReason_ResidentMoveReasonTlsError, 250*time.Millisecond, time.Now())
+				receiveTestMoveValue(t, next.closed, "the failed replacement was not closed")
+			} else {
+				next.connect()
+				receiveTestMoveValue(t, old.closed, "the old transport did not close after the replacement connected")
+			}
+			fixture.join(t)
+		})
 	}
 }
