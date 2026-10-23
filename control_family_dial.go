@@ -98,6 +98,10 @@ func dialControlTlsWithFamilyFallback(
 		}
 		network = narrowed
 	}
+	// a move's targets stand in for the name below this layer
+	// (resident_move.go), so the dial is to fixed addresses, as a literal is:
+	// a failure there says nothing about a family the name could resolve to
+	literal := isIPLiteralDialAddr(addr) || moveDialOverrideFromContext(ctx).matches(addr)
 	conn, err := dial(ctx, network, addr)
 	if err != nil {
 		conn, err = redialWithoutAContradictedDemotion(ctx, network, addr, dial, err)
@@ -128,7 +132,7 @@ func dialControlTlsWithFamilyFallback(
 	// its family is still evidence for the ledger the family-agnostic dials
 	// read: it is recorded (subject to the same guards) and not retried.
 	if pinnedFamily != 0 {
-		if isPathTimeout(err) && failed != 0 && ctx.Err() == nil && !isIPLiteralDialAddr(addr) {
+		if isPathTimeout(err) && failed != 0 && ctx.Err() == nil && !literal {
 			controlFamilyDemote(failed)
 		}
 		return nil, err
@@ -141,7 +145,7 @@ func dialControlTlsWithFamilyFallback(
 	// onto -- `dial tcp6 1.1.1.1:443` is "no suitable address found" -- and no
 	// name resolution whose family choice a strike could inform.
 	// controlDialNetwork leaves those dials alone for the same reason.
-	if isIPLiteralDialAddr(addr) {
+	if literal {
 		return nil, err
 	}
 	if !isPathTimeout(err) {
@@ -246,8 +250,9 @@ func redialWithoutAContradictedDemotion(
 	if network != "tcp" && network != "udp" {
 		return nil, dialErr
 	}
-	// a literal is never narrowed, so its failure is not the narrowing's fault
-	if isIPLiteralDialAddr(addr) {
+	// a literal is never narrowed, so its failure is not the narrowing's
+	// fault, and neither is the failure of a move's targets
+	if isIPLiteralDialAddr(addr) || moveDialOverrideFromContext(ctx).matches(addr) {
 		return nil, dialErr
 	}
 	if ControlIpFamilyPolicy() != IpFamilyAuto {

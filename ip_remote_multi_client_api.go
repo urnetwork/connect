@@ -196,6 +196,56 @@ type apiWindowClientTransport struct {
 	// a transport generation replaced by migration may have registered;
 	// current is asked at teardown (windowTransportMayHaveConnected)
 	replacedMayHaveConnected bool
+	// the client's move memory, shared by every transport generation
+	// (resident_move.go). Read through residentMoveTrackerWithLock.
+	residentMoveTracker *ResidentMoveTracker
+}
+
+// The client's move memory: the one its transport settings carry, and for a
+// state a fixture built without one, a memory of its own. Call with the
+// generator's transportLock.
+func (self *apiWindowClientTransport) residentMoveTrackerWithLock() *ResidentMoveTracker {
+	if self.residentMoveTracker == nil {
+		if self.settings != nil && self.settings.ResidentMoveTracker != nil {
+			self.residentMoveTracker = self.settings.ResidentMoveTracker
+		} else {
+			self.residentMoveTracker = NewResidentMoveTracker()
+		}
+	}
+	return self.residentMoveTracker
+}
+
+// The move view of a window transport. A platform transport answers for
+// itself; any other (a fixture) is a family-agnostic carrier of unknown mode,
+// relay carried when it reports an extender address.
+func windowResidentMoveTransport(transport apiWindowPlatformTransport) ResidentMoveTransport {
+	if moveTransport, ok := transport.(ResidentMoveTransport); ok {
+		return moveTransport
+	}
+	return &windowResidentMoveTransportView{transport: transport}
+}
+
+type windowResidentMoveTransportView struct {
+	transport apiWindowPlatformTransport
+}
+
+func (self *windowResidentMoveTransportView) IpFamily() int {
+	return 0
+}
+
+func (self *windowResidentMoveTransportView) IsConnected() bool {
+	return self.transport.IsConnected()
+}
+
+func (self *windowResidentMoveTransportView) ActiveMode() TransportMode {
+	return TransportModeNone
+}
+
+func (self *windowResidentMoveTransportView) RelayCarried() bool {
+	if source, ok := self.transport.(interface{ ExtenderIps() []netip.Addr }); ok {
+		return 0 < len(source.ExtenderIps())
+	}
+	return false
 }
 
 // Whether a window transport may have registered with the platform, and so
@@ -333,7 +383,10 @@ type ApiMultiClientGenerator struct {
 	retirementErr       error
 	// Injectable lifecycle barriers for deterministic ownership tests.
 	beforeRetirementWaitForTest func()
-	newPlatformTransport        func(
+	// Nil outside package tests. Observes each move report as it is sent, on
+	// the sending goroutine.
+	sendResidentMoveResultForTest func(client *Client, result *protocol.ResidentMoveResult)
+	newPlatformTransport          func(
 		client *Client,
 		auth *ClientAuth,
 		targetMode TransportMode,
@@ -1229,6 +1282,10 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	// publishes its extender addresses through the same monitor (K1)
 	extenderIpsMonitor := NewMonitorValue[uint64](0)
 	settings.ExtenderIpsMonitor = extenderIpsMonitor
+	// one move memory for every generation of this client: the moves it has
+	// seen, and the target its reconnects prefer after a move (D10)
+	residentMoveTracker := NewResidentMoveTracker()
+	settings.ResidentMoveTracker = residentMoveTracker
 	// the settings are reused by every migration generation, so a refusal on
 	// any of them marks the identity
 	authorizationClosed := settings.AuthorizationClosed
@@ -1248,13 +1305,14 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		self.transportIdle = make(chan struct{})
 	}
 	self.transports[client] = &apiWindowClientTransport{
-		createTime:         time.Now(),
-		current:            transport,
-		settings:           settings,
-		auth:               auth,
-		initializing:       true,
-		policyVersion:      policyVersion,
-		extenderIpsMonitor: extenderIpsMonitor,
+		createTime:          time.Now(),
+		current:             transport,
+		settings:            settings,
+		auth:                auth,
+		initializing:        true,
+		policyVersion:       policyVersion,
+		extenderIpsMonitor:  extenderIpsMonitor,
+		residentMoveTracker: residentMoveTracker,
 	}
 	self.transportLock.Unlock()
 	// Enable return traffic for this client and block until the platform has
@@ -1399,7 +1457,8 @@ func closeApiWindowPlatformTransportAndWait(transport apiWindowPlatformTransport
 	}
 }
 
-// MigrateClientTransport implements MultiClientGeneratorTransportMigrator.
+// MigrateClientTransport implements MultiClientGeneratorTransportMigrator: a
+// migrate by name, which is a drain and every policy change.
 // The call is deliberately non-blocking: server jitter, connect waiting, and
 // handoff happen off the receive path. A duplicate frame while one migration
 // is pending is ignored, bounding overlap to one replacement per client.
@@ -1407,6 +1466,36 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 	client *Client,
 	args *MultiClientGeneratorClientArgs,
 	migrateTime time.Time,
+) {
+	self.migrateClientTransport(client, migrateTime, nil)
+}
+
+// MoveClientTransport implements MultiClientGeneratorTransportMover
+// (server/connect/MOVE.md §5.2). A drain, a client that does not honor
+// moves, and a compulsory move no carrier can use a target for migrate by
+// name exactly as MigrateClientTransport does. Otherwise the replacement
+// dials the move's target with the platform hostname kept for TLS and HTTP,
+// make-before-break. A repeated move id is dropped. An advisory move is
+// declined by the rules of PlanResidentMove, while a move is in progress,
+// and when the memory budget cannot hold the replacement beside the old
+// carrier; each decline and each failed move sends one ResidentMoveResult.
+// Non-blocking, like MigrateClientTransport.
+func (self *ApiMultiClientGenerator) MoveClientTransport(
+	client *Client,
+	args *MultiClientGeneratorClientArgs,
+	move *ResidentMove,
+) {
+	if move == nil {
+		return
+	}
+	self.migrateClientTransport(client, move.MigrateTime, move)
+}
+
+// The one migration entry. `move` is nil for a migrate by name.
+func (self *ApiMultiClientGenerator) migrateClientTransport(
+	client *Client,
+	migrateTime time.Time,
+	move *ResidentMove,
 ) {
 	if !self.transportCreation.begin() {
 		return
@@ -1417,17 +1506,85 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			self.transportCreation.end()
 		}
 	}()
+	// a decline is reported once the locks are released. The send never
+	// waits, so the receive path that delivered the move is not held.
+	var declineReport *protocol.ResidentMoveResult
+	defer func() {
+		if declineReport != nil {
+			self.sendResidentMoveResult(client, declineReport)
+		}
+	}()
 	self.transportLock.Lock()
 	state := self.transports[client]
-	if state == nil || state.initializing || state.migrating {
+	if state == nil {
 		self.transportLock.Unlock()
 		return
 	}
-	state.migrating = true
+	moving := move.Moving() && state.settings != nil && state.settings.EnableMove
+	var residentMoveTracker *ResidentMoveTracker
+	if moving {
+		residentMoveTracker = state.residentMoveTrackerWithLock()
+		if !residentMoveTracker.AdmitMoveId(*move.MoveId, state.settings.MoveIdDedupeCount) {
+			// a repeat of a move this client already handled
+			self.transportLock.Unlock()
+			return
+		}
+	}
+	if state.initializing || state.migrating {
+		self.transportLock.Unlock()
+		if moving && move.Advisory() {
+			declineReport = NewResidentMoveDeclined(
+				*move.MoveId,
+				protocol.ResidentMoveReason_ResidentMoveReasonMoveInProgress,
+				0,
+			)
+		}
+		return
+	}
 	current := state.current
 	settings := state.settings
 	auth := state.auth
+	if !moving {
+		state.migrating = true
+	}
 	self.transportLock.Unlock()
+
+	var movePlan *ResidentMovePlan
+	if moving {
+		// the plan reads the live carrier, so it is made with no lock held;
+		// a decline leaves the state untouched
+		movePlan = PlanResidentMove(
+			move,
+			[]ResidentMoveTransport{windowResidentMoveTransport(current)},
+			settings,
+			residentMoveTracker,
+			time.Now(),
+		)
+		if movePlan.Declined {
+			declineReport = NewResidentMoveDeclined(*move.MoveId, movePlan.DeclineReason, movePlan.DeclineIpFamily)
+			return
+		}
+		admitted := func() bool {
+			self.transportLock.Lock()
+			defer self.transportLock.Unlock()
+			if self.transports[client] != state || state.current != current ||
+				state.initializing || state.migrating {
+				return false
+			}
+			state.migrating = true
+			return true
+		}()
+		if !admitted {
+			if move.Advisory() {
+				declineReport = NewResidentMoveDeclined(
+					*move.MoveId,
+					protocol.ResidentMoveReason_ResidentMoveReasonMoveInProgress,
+					0,
+				)
+			}
+			return
+		}
+	}
 
 	async = true
 	go HandleError(func() {
@@ -1448,7 +1605,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 
 		maxScheduleDelay := self.settings.MigrateMaxScheduleDelay
 		if maxScheduleDelay <= 0 {
-			maxScheduleDelay = 5 * time.Minute
+			maxScheduleDelay = DefaultApiMultiClientGeneratorSettings().MigrateMaxScheduleDelay
 		}
 		now := time.Now()
 		if latest := now.Add(maxScheduleDelay); latest.Before(migrateTime) {
@@ -1473,6 +1630,11 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			return
 		}
 
+		if movePlan != nil && movePlan.Dial != nil {
+			self.moveWindowTransport(client, state, current, settings, auth, movePlan.Dial, move, residentMoveTracker)
+			return
+		}
+
 		next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, settings)
 		brokeBeforeMake := false
 		if nextPlatform, ok := next.(*PlatformTransport); ok {
@@ -1492,10 +1654,7 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 				brokeBeforeMake = true
 			}
 		}
-		connectTimeout := self.settings.MigrateConnectTimeout
-		if connectTimeout <= 0 {
-			connectTimeout = 60 * time.Second
-		}
+		connectTimeout := self.migrateConnectTimeout()
 		connectTimer := time.NewTimer(connectTimeout)
 		defer connectTimer.Stop()
 		for !next.IsConnected() {
@@ -1577,6 +1736,148 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			closeApiWindowPlatformTransportAndWait(current)
 		}
 	})
+}
+
+// Sends one move report from the window client, best effort.
+func (self *ApiMultiClientGenerator) sendResidentMoveResult(client *Client, result *protocol.ResidentMoveResult) {
+	if self.sendResidentMoveResultForTest != nil {
+		self.sendResidentMoveResultForTest(client, result)
+	}
+	SendResidentMoveResult(client, result)
+}
+
+// The bound on a replacement transport connecting: the generator's setting,
+// else its default.
+func (self *ApiMultiClientGenerator) migrateConnectTimeout() time.Duration {
+	if connectTimeout := self.settings.MigrateConnectTimeout; 0 < connectTimeout {
+		return connectTimeout
+	}
+	return DefaultApiMultiClientGeneratorSettings().MigrateConnectTimeout
+}
+
+// Runs one move whose replacement dials targets (MOVE.md §5.2), on the
+// migration worker after the migrate time. Make-before-break: the old carrier
+// closes only after the replacement resolved. A strict (advisory) move
+// resolves when the replacement arrives at its target, fails when every moved
+// family's target failed, and otherwise times out; on failure the old carrier
+// stays, the failed targets are held and the move reports its failure. A
+// compulsory move tries its target once per carrier, then dials by name,
+// and resolves when the replacement connects at all, waiting no later than
+// the move's close time. A move never breaks before it makes: when the memory
+// budget cannot hold the replacement beside the old carrier, an advisory move
+// is declined, and a compulsory one keeps the old carrier, which the platform
+// closes at the close time, after which its own reconnect runs.
+func (self *ApiMultiClientGenerator) moveWindowTransport(
+	client *Client,
+	state *apiWindowClientTransport,
+	current apiWindowPlatformTransport,
+	settings *PlatformTransportSettings,
+	auth ClientAuth,
+	dial *ResidentMoveDial,
+	move *ResidentMove,
+	residentMoveTracker *ResidentMoveTracker,
+) {
+	// from here on, transports dial as usual: the replacement that stays
+	// keeps any preference its arrival recorded
+	defer dial.Conclude()
+	startTime := time.Now()
+
+	moveSettings := *settings
+	moveSettings.ResidentMoveTracker = residentMoveTracker
+	moveSettings.ResidentMoveDial = dial
+	next, _, nextPolicyVersion := self.createPlatformTransport(client, &auth, &moveSettings)
+
+	if nextPlatform, ok := next.(*PlatformTransport); ok {
+		if currentPlatform, ok := current.(*PlatformTransport); ok &&
+			!nextPlatform.CanMakeBeforeBreakFrom(currentPlatform) {
+			closeApiWindowPlatformTransportAndWait(next)
+			if dial.Strict() {
+				self.sendResidentMoveResult(client, NewResidentMoveDeclined(
+					dial.MoveId(),
+					protocol.ResidentMoveReason_ResidentMoveReasonMemoryBudget,
+					0,
+				))
+			}
+			return
+		}
+	}
+
+	connectTimeout := self.migrateConnectTimeout()
+	if !move.CloseTime.IsZero() {
+		// the platform closes the old carrier at the close time, so waiting
+		// past it keeps nothing
+		if untilClose := time.Until(move.CloseTime); 0 < untilClose && untilClose < connectTimeout {
+			connectTimeout = untilClose
+		}
+	}
+	resolution := dial.Wait(client.Ctx(), next, connectTimeout)
+	if resolution == ResidentMoveResolutionCanceled {
+		closeApiWindowPlatformTransportAndWait(next)
+		return
+	}
+
+	// the report of a move that did not arrive at its target. The send never
+	// waits; it goes over whichever carrier is current when it is made.
+	failureReport := func() *protocol.ResidentMoveResult {
+		if failure, ok := dial.Failure(); ok {
+			return NewResidentMoveFailed(dial.MoveId(), failure)
+		}
+		if resolution == ResidentMoveResolutionTimedOut {
+			return NewResidentMoveFailed(dial.MoveId(), ResidentMoveFailure{
+				Reason:  protocol.ResidentMoveReason_ResidentMoveReasonConnectTimeout,
+				Elapsed: time.Since(startTime),
+			})
+		}
+		return nil
+	}
+
+	if resolution != ResidentMoveResolutionConnected {
+		// Keep the old transport: it is still a valid route. Disarm before
+		// closing the replacement, so the close is the definitive "migration
+		// released" signal (as the migrate by name does).
+		func() {
+			self.transportLock.Lock()
+			defer self.transportLock.Unlock()
+			if self.transports[client] == state {
+				state.migrating = false
+			}
+		}()
+		closeApiWindowPlatformTransportAndWait(next)
+		if report := failureReport(); report != nil {
+			self.sendResidentMoveResult(client, report)
+		}
+		return
+	}
+
+	swapped := false
+	func() {
+		self.transportLock.Lock()
+		defer self.transportLock.Unlock()
+		if self.transports[client] == state && state.current == current {
+			state.replacedMayHaveConnected = state.replacedMayHaveConnected || windowTransportMayHaveConnected(current)
+			state.current = next
+			state.policyVersion = nextPolicyVersion
+			swapped = true
+		}
+	}()
+	if !swapped {
+		closeApiWindowPlatformTransportAndWait(next)
+		return
+	}
+	state.noteExtenderIpsChanged()
+	if dial.Arrived() {
+		residentMoveTracker.NoteMoved(time.Now())
+	}
+	// Only now break the old route. For the interval between next becoming
+	// connected and this close, RouteManager can carry traffic over both.
+	closeApiWindowPlatformTransportAndWait(current)
+	if !dial.Arrived() {
+		// a compulsory move that connected by name: a target that failed is
+		// still reported
+		if report := failureReport(); report != nil {
+			self.sendResidentMoveResult(client, report)
+		}
+	}
 }
 
 // Bumps the per-client change counter, which is how a transport swap reaches
