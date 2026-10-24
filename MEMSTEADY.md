@@ -5737,3 +5737,71 @@ not host/mobile peak-memory qualification. Two matched traced 8.75 MiB
 downloads passed, but the earlier independent 30-second partial-body failure
 remains unexplained. Neither extra memory nor a browsing-stall fix is proven
 by these passes. Combined-fix/full-suite requalification remains outstanding.
+
+## 2026-10-24: first passing public SDK 100-page recovery replay
+
+The combined service-affinity and canceled-resize fixes passed one uninstrumented
+PERF8 replay of `TestFullTunH1Sdk32ServiceRefusalRecovery100Pages`. The existing
+five-second navigation, 300-second workload, original CSS socket/body ownership,
+and 30-second SDK join requirements were unchanged. This is a first successful
+replay of the bundle, not an isolated donor effect or statistical qualification.
+
+| Measurement | Prior selector-only failing replay | Combined candidate |
+| --- | ---: | ---: |
+| Page 1 first byte | 5.674730208 s | 3.565715708 s |
+| Page 1 inclusive tap to first byte | 5.674792875 s | 3.565773750 s |
+| 100-page median first byte | 1.135640146 s | 0.981621958 s |
+| Candidate p95 / maximum first byte | — | 2.163823292 / 3.905678417 s |
+| Pages at or above five seconds | 1 | 0 |
+| Completed HTML / assets / overlapping navigations | 100 / 400 / 99 | 100 / 400 / 99 |
+
+The candidate retained all 12,288 bytes of the held CSS response on the original
+socket and retained its public owner across navigation. Its 7,680 native packet
+operations completed, all origin dials matched closes, the late constructor
+joined, and the successful SDK post-join ownership snapshot reported zero total,
+transfer-root, platform-transport, and pending-handoff usage. The failure-only
+stack capture was not invoked. The test process exited zero with one run/pass,
+no skips or assertions, and its process group joined. Final enclosing resource
+monitor cleanup is tracked separately.
+
+Deterministic cause: ordinary fresh IPv4/IPv6 affinity could inherit a healthy
+provider already rejected for the exact destination service. Apply the existing
+service-failure history while ranking donors and recheck it at final affinity
+adoption. Keep explicit pins, established data, UDP policy, expired/missing
+history, and the ordinary all-failed fallback unchanged. The private fix passed
+756 positive checks with two causal OLD failures. A separately reproduced resize
+cancellation defect could re-enter maintenance after its owner was canceled;
+its loop-head cancellation guard passed 189 positive checks. The merged bundle
+passed another 52 focused normal/race checks and two compile checks before the
+full replay.
+
+The aggregate fixture heap includes six in-process providers, SDK, origins and
+workload owners. Its 321,002,640-byte sampled heap peak is not an isolated iOS
+profile measurement. This run does not qualify the 32 MiB iOS surrogate or
+64 MiB Android profile, nor establish iOS total physical footprint. Message-pool
+roots and bytes drained to zero. Fresh physical builds and unchanged full112
+qualification remain necessary after final source integration.
+
+Evidence: `donor-ctx-stack-candidate.PREP.WkV6x5/PERF8-full100-original-once`,
+started 2026-10-24 05:19:21.798 UTC, closed 05:22:50.045 UTC; actual Go package
+elapsed 200.509 s. Raw SHA-256:
+`b6988b9501ee2c7d336550ef8a5df8b4740e3865faa21c17eebc1d498b72c853`.
+Finite measurement SHA-256:
+`254b0b7cdc8838553c9fa2a7ce59ade5dcf51b2a1eefefce9aff3628759ad062`.
+Source: Connect `897b2321`, Server `cf024ffef`, Tests `8fe35c2` plus reviewed
+private donor/resize/capture overlay `iayrfa82`; source25
+`e894f8c2260db9e14580882c821edecf7cfe06c0938d6f90d4ebe71f429a0a98`.
+Full correctness, fresh confirmations, statistical PERF comparison, and physical
+memory qualification remain open. Do not promote a performance baseline from
+this single replay.
+
+The subsequent adjacent selector change prefers an ordinary healthy offer in a
+permitted window over a first window containing only warned or quarantined
+providers. Its two actual-provider causal controls reproduced the old first-choice
+error with empty service-failure history; 120 patched normal/race checks passed.
+Pins, established ownership, UDP, and the all-benched availability fallback stay
+covered. This later coalescer change was not present in the first full100 result
+above; confirmation on the final integrated source remains required. The
+mandatory functional100 receipt guard separately passed 24 patched normal/race
+executions against four causal OLD failures. Explicit provider4 research remains
+manual, separate from mandatory functional recovery.

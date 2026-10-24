@@ -29,6 +29,25 @@ type destinationServiceFailure struct {
 	count uint32
 }
 
+// Ordinary fresh TCP affinity cannot bypass a current failure of this exact
+// service. The parent stateLock owns this read; pins and established flows keep
+// their existing policy, and missing or expired history supplies no veto.
+func (self *RemoteUserNatMultiClient) affinityDonorServiceFailedWithLock(update *multiClientChannelUpdate, client *multiClientChannel, now time.Time) bool {
+	if update == nil || update.pinned || update.receivedInbound.Load() {
+		return false
+	}
+	path := update.ipPath
+	if path == nil || path.Protocol != IpProtocolTcp || !path.Syn || path.Ack {
+		return false
+	}
+	key, ok := destinationServiceFailureKeyFor(path, client)
+	if !ok {
+		return false
+	}
+	failure, failed := self.destinationServiceFailures[key]
+	return failed && now.Sub(failure.time) < destinationServiceFailureTtl
+}
+
 func destinationServiceFailureKeyFor(
 	ipPath *IpPath,
 	client *multiClientChannel,

@@ -179,9 +179,9 @@ func TestSelectedWindowEmptyDoesNotSatisfyMergedReadiness(t *testing.T) {
 	}
 }
 
-// Runs the production resize loop with established synthetic channels. The
-// real flow-count seam keeps every channel owned during capacity collapse.
-func readinessRetainedWindow(t *testing.T, kind WindowType, fixed bool, warned bool) (*multiClientWindow, []*multiClientChannel, func()) {
+// Constructs established synthetic channels before any resize worker starts.
+// The flow-count seam keeps each channel owned during capacity collapse.
+func newReadinessRetainedWindow(t *testing.T, kind WindowType, fixed bool, warned bool) (*multiClientWindow, []*multiClientChannel) {
 	t.Helper()
 	settings := DefaultMultiClientSettings()
 	settings.Log = NewNoopLogger()
@@ -239,13 +239,20 @@ func readinessRetainedWindow(t *testing.T, kind WindowType, fixed bool, warned b
 		other = WindowTypeSpeed
 	}
 	window.SetPerformanceProfile(readinessProfile(other))
+	return window, clients
+}
+
+// Runs the real resize loop and joins it before closing the fixture channels.
+func readinessRetainedWindow(t *testing.T, kind WindowType, fixed bool, warned bool) (*multiClientWindow, []*multiClientChannel, func()) {
+	t.Helper()
+	window, clients := newReadinessRetainedWindow(t, kind, fixed, warned)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		window.resize()
 	}()
 	stop := func() {
-		cancel()
+		window.cancel()
 		<-done
 		window.Close()
 		synctest.Wait()
@@ -386,4 +393,66 @@ func TestLegacyWindowPublisherKeepsZeroTargetFailure(t *testing.T) {
 	if event := merged.WindowExpandEvent(); !event.MinSatisfied || event.Failed || !event.Ipv6Available {
 		t.Fatalf("legacy positive publisher lost compatibility: %+v", event)
 	}
+}
+
+// A cancelled owner plus an already-ready resize edge may enter the loop again.
+// Force that body-entry state directly, without depending on select ordering.
+func TestCanceledWindowResizeDoesNotStartMaintenancePass(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		window, clients := newReadinessRetainedWindow(t, WindowTypeQuality, false, false)
+		defer window.Close()
+		removals := 0
+		retainedCallback := window.clientRemoveCallback
+		window.clientRemoveCallback = func(client *multiClientChannel) {
+			removals++
+			retainedCallback(client)
+		}
+		window.cancel()
+		<-window.ctx.Done()
+		for _, client := range clients {
+			if !client.IsDone() {
+				t.Fatal("owner cancellation did not reach an established child")
+			}
+		}
+		window.resize()
+		if removals != 0 || len(window.unorderedClients()) != len(clients) {
+			t.Fatalf("cancelled owner started maintenance: removals=%d retained=%d want=%d",
+				removals, len(window.unorderedClients()), len(clients))
+		}
+		if providers := window.monitor.ProviderEvents(); len(providers) != len(clients) {
+			t.Fatalf("cancelled maintenance published provider removals: providers=%d want=%d", len(providers), len(clients))
+		}
+		window.Close()
+		if len(window.unorderedClients()) != 0 {
+			t.Fatal("explicit window close left owned channels")
+		}
+	})
+}
+
+// The loop-head gate must not shelter a cancelled child of a live owner.
+// Its actual removal callback ends the owner only after recording the reap.
+func TestLiveWindowResizeReapsExplicitlyCanceledChannel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		window, clients := newReadinessRetainedWindow(t, WindowTypeQuality, true, false)
+		defer window.Close()
+		defer window.cancel()
+		client := clients[0]
+		client.Cancel()
+		removals := 0
+		window.clientRemoveCallback = func(removed *multiClientChannel) {
+			if window.ctx.Err() != nil || removed != client || !removed.IsDone() {
+				t.Error("explicit child retirement lost its live owner or exact channel")
+			}
+			removals++
+			window.cancel()
+		}
+		window.resize()
+		if removals != 1 || len(window.unorderedClients()) != 0 {
+			t.Fatalf("live owner did not reap cancelled child: removals=%d retained=%d",
+				removals, len(window.unorderedClients()))
+		}
+		if len(window.monitor.ProviderEvents()) != 0 {
+			t.Fatal("explicit child retirement left its provider published")
+		}
+	})
 }

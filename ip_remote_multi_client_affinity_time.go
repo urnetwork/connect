@@ -181,6 +181,9 @@ func (self *RemoteUserNatMultiClient) adoptAffinityClientWithLock(
 			origin.IsZero() || now.Before(origin) || now.Sub(origin) >= maxTime {
 			return false
 		}
+		if self.affinityDonorServiceFailedWithLock(update, client, now) {
+			return false
+		}
 	}
 	update.inheritAffinityClient(client, selection)
 	return true

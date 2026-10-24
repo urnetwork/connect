@@ -4305,6 +4305,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		if c == nil || c.IsDone() || !c.supportsIpVersion(4) || (!sticky && self.clientAtFlowCapWithLock(c)) {
 			continue
 		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
+			continue
+		}
 		// off: the legacy short-circuit, preserved exactly -- a donor no more
 		// recent than the current best is never even asked for its verdict.
 		// On, every candidate must be evaluated to be ranked, which is the one
@@ -4392,6 +4395,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		}
 		// see the v4 twin: a downgraded donor takes no new v6 flows
 		if c == nil || c.IsDone() || !c.supportsIpVersion(6) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
 			continue
 		}
 		if !scored && !createTime.After(mostRecentCreateTime) {
@@ -7848,7 +7854,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
-			var failedFallback []*multiClientChannel
+			// Data, UDP, pinned and already-established traffic retain their
+			// original field without another health walk.
+			preferHealthyWindows := ipPath.Protocol == IpProtocolTcp && ipPath.Syn && !ipPath.Ack &&
+				!sendPacketGroup.pin.pinned() && !update.receivedInbound.Load()
+			var failedFallback, benchedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
 					var offerChanged *<-chan struct{}
@@ -7870,8 +7880,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							orderedClients = fallback
 						}
 					}
-					if failedFallback != nil {
-						orderedClients = healthyCrossWindowCandidates(orderedClients)
+					benchedField := false
+					if preferHealthyWindows {
+						if healthy := healthyCrossWindowCandidates(orderedClients); 0 < len(healthy) {
+							orderedClients = healthy
+						} else {
+							// The compaction writes nothing when no healthy client
+							// exists, preserving this field's ordinary fallback order.
+							benchedField = true
+						}
 					}
 					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
 					// External probe reputation is used only here, after affinity
@@ -7897,13 +7914,19 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
 					if 0 < len(orderedClients) {
-						// An unestablished, unpinned TCP attempt may use an
-						// untried exit in the next permitted window before
-						// retrying this service's known failures. Keep the first
-						// window's ordinary order when every window has failed.
-						if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack ||
-							sendPacketGroup.pin.pinned() || update.receivedInbound.Load() ||
-							!self.destinationServiceFailuresExhausted(orderedClients, ipPath) {
+						// Prefer ordinary healthy offers across permitted windows.
+						// Retain healthy service-failed and benched fields only
+						// when no unfailed healthy offer exists.
+						if !preferHealthyWindows || sendPacketGroup.pin.pinned() || update.receivedInbound.Load() {
+							return orderedClients
+						}
+						if benchedField {
+							if benchedFallback == nil {
+								benchedFallback = orderedClients
+							}
+							continue
+						}
+						if !self.destinationServiceFailuresExhausted(orderedClients, ipPath) {
 							return orderedClients
 						}
 						if failedFallback == nil {
@@ -7912,7 +7935,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 				}
 			}
-			return failedFallback
+			if failedFallback != nil {
+				return failedFallback
+			}
+			return benchedFallback
 		}
 
 		raceClients(coalesceOrderedClients(), 0)
@@ -12261,6 +12287,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 func (self *multiClientWindow) resize() {
 	for {
+		// Cancellation can race a ready resize edge after an expansion ends.
+		// Leave owned channels to Close instead of starting a teardown pass.
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
 		update := self.resizeMonitor.NotifyChannel()
 
 		var windowSize WindowSizeSettings
