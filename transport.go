@@ -709,6 +709,45 @@ type PlatformTransportSettings struct {
 	// (transport_client_limit.go). Nil gives the transport a hold of its own.
 	ClientLimitBackoff *ClientLimitBackoff
 
+	// Declares the move capability on every connection -- the H1 header
+	// `X-UR-ResidentMoveVersion` and `Auth.resident_move_version` -- and lets
+	// the transport dial a move's target and prefer it afterwards
+	// (server/connect/MOVE.md §5.2, D2, D10). The platform sends advisory
+	// moves only to a client that declares it. Default true; false is a client
+	// that only migrates by name, and an owner then migrates every move by
+	// name.
+	EnableMove bool
+	// How long a move target whose dial failed stays held: an advisory move
+	// to a held target is declined. One hour by default, long enough that a
+	// broken edge interface does not cost the client a failed dial per move.
+	// Non-positive holds no target.
+	MoveTargetFailHold time.Duration
+	// The client's own floor between moves: an advisory move less than this
+	// long after a completed move is declined. 30 minutes by default.
+	// Non-positive declines none for this reason.
+	MoveClientMinInterval time.Duration
+	// How many recent move ids the client remembers so that a repeated move
+	// frame is dropped. Moves come minutes to hours apart, so the default 32
+	// spans days. Non-positive remembers none, which leaves only the guard
+	// against a move already in progress.
+	MoveIdDedupeCount int
+	// When set, asked before the client accepts an advisory move; true
+	// declines it with `ResidentMoveReasonMobileBackgroundOrMetered`. The sdk
+	// sets it on mobile to decline while the app is in the background or the
+	// active network is metered (D11). Called on the receive path, so it must
+	// not block. Nil declines none.
+	MoveDecline func() bool
+	// The move memory this transport shares with the other transports of its
+	// client and every generation an owner migrates to: the move ids seen,
+	// the last move, the failed targets and the targets preferred for
+	// reconnects (resident_move.go). Nil gives the transport one of its own.
+	ResidentMoveTracker *ResidentMoveTracker
+	// When set, this transport is a move's replacement: its direct dials go to
+	// the move's targets of the dial's family until the owner concludes the
+	// move (resident_move.go). An owner sets it on the replacement's own copy
+	// of the settings only.
+	ResidentMoveDial *ResidentMoveDial
+
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
 	afterRoutesRemovedForTest func()
@@ -739,6 +778,10 @@ type PlatformTransportSettings struct {
 	// credential refusal hold, right before it waits, so a test can hold the
 	// exact point after which no dial with the refused credential can happen.
 	credentialRefusalHoldForTest func()
+	// Nil outside package tests. Called each time a mode runner parks while a
+	// strict move's replacement holds its carrier, right before it waits, with
+	// the runner's mode (transport_move.go).
+	moveCarrierHoldForTest func(mode TransportMode)
 	// Nil outside package tests. Called each time an inactive-drain watchdog
 	// reads the active mode, with whether that mode supersedes its carrier,
 	// before it waits. It runs on the watchdog and must not block.
@@ -807,6 +850,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		// that fits the mobile ledger's application row with the route queues
 		H3StreamWriteBatchMaxMessageCount: 16,
 		H3StreamWriteBatchMaxByteCount:    64 * 1024,
+
+		EnableMove:            true,
+		MoveTargetFailHold:    1 * time.Hour,
+		MoveClientMinInterval: 30 * time.Minute,
+		MoveIdDedupeCount:     32,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -1121,6 +1169,15 @@ type PlatformTransport struct {
 	// the platform definitively refused. The constructor always sets it; read
 	// it through credentialRefused. See transport_credential_refusal.go.
 	credentialRefusalHold *credentialRefusalHold
+
+	// the move memory of this transport's client, shared when the settings
+	// carry one. The constructor always sets it. See transport_move.go.
+	residentMoveTracker *ResidentMoveTracker
+	// set when this transport is a move's replacement. Immutable.
+	residentMoveDial *ResidentMoveDial
+	// the live connections that reach the platform through a relay -- an
+	// extender or a VLESS server -- which a move cannot redirect
+	relayedConnectionCount atomic.Int64
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1666,6 +1723,11 @@ func NewPlatformTransportWithTargetMode(
 	if transport.credentialRefusalHold == nil {
 		transport.credentialRefusalHold = newCredentialRefusalHold()
 	}
+	transport.residentMoveTracker = settings.ResidentMoveTracker
+	if transport.residentMoveTracker == nil {
+		transport.residentMoveTracker = NewResidentMoveTracker()
+	}
+	transport.residentMoveDial = settings.ResidentMoveDial
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
 	transport.held = NewMonitorValue(settings.StartDisabled)
@@ -2285,6 +2347,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// network change asked for (see nextDialTime).
 	hadConnection := false
 	afterKick := false
+	// a compulsory move's replacement tries its target once per carrier
+	// (transport_move.go)
+	moveTargetAttempted := false
 
 	for {
 		// stand down while a strictly better mode is active
@@ -2328,6 +2393,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
 		var dialExtenderIp netip.Addr
+		// whether a relay (an extender or a VLESS server) carried the winning
+		// dial, written and read like dialExtenderIp
+		dialRelayed := false
+		// the move targets this attempt dials in place of the platform host,
+		// nil to resolve it (transport_move.go). Set right before the dial.
+		var moveAttempt *platformMoveDialAttempt
 		connect := func(dialCtx context.Context) (H1MessageConn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
@@ -2335,6 +2406,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("X-UR-AppVersion", auth.AppVersion)
 				header.Set(ClientInfoHeader, auth.ClientInfo.Json())
 				header.Set("X-UR-StreamLeaseVersion", "1")
+				if self.settings.EnableMove {
+					header.Set(HeaderResidentMoveVersion, residentMoveVersionHeader())
+				}
 				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
@@ -2342,7 +2416,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
-				self.dialContext(dialCtx),
+				moveAttempt.withContext(self.dialContext(dialCtx)),
 				self.platformUrl,
 				header,
 				int(self.h1MaxMessageByteCount()),
@@ -2354,6 +2428,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 			if dialerInfo != nil {
 				dialExtenderIp = dialerInfo.ExtenderIp
+				dialRelayed = dialerInfo.relay
 			}
 			ws.SetReadLimit(self.h1MaxMessageByteCount())
 
@@ -2366,13 +2441,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:              auth.ByJwt,
-					AppVersion:         auth.AppVersion,
-					ClientInfo:         auth.ClientInfo.Json(),
-					StreamLeaseVersion: 1,
-					InstanceId:         auth.InstanceId.Bytes(),
-					IpFamily:           self.authIntent(),
-					ProvideIntent:      auth.ProvideIntent,
+					ByJwt:               auth.ByJwt,
+					AppVersion:          auth.AppVersion,
+					ClientInfo:          auth.ClientInfo.Json(),
+					StreamLeaseVersion:  1,
+					InstanceId:          auth.InstanceId.Bytes(),
+					IpFamily:            self.authIntent(),
+					ProvideIntent:       auth.ProvideIntent,
+					ResidentMoveVersion: self.residentMoveVersion(),
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -2454,6 +2530,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// iteration.
 		dialCtx, cancelDial := context.WithCancel(self.ctx)
 		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
+		moveAttempt = self.moveDialAttempt(moveTargetAttempted)
 		var ws H1MessageConn
 		var err error
 		if self.log.V(2).Enabled() {
@@ -2469,6 +2546,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		kickedDuringDial := self.kicked(kickGeneration)
 		if err != nil {
 			cancelDial()
+			// a dial this transport's teardown or a network change canceled
+			// says nothing about the move target either
+			closing := false
+			select {
+			case <-self.ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !kickedDuringDial && moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialFailed(moveAttempt, TransportModeH1, err)
+			}
 			// a definitive refusal of the credential holds it before the next
 			// dial; the backend answered, so it is no dial failure either
 			// (transport_credential_refusal.go)
@@ -2684,16 +2773,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// the connection rather than the dial (K1, K4). Acquire both before
 			// announcing readiness; withdraw readiness before releasing them.
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
+			releaseRelayedConnection := self.holdRelayedConnection(dialRelayed)
 			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
 			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
 			}
 			self.setRegistered(true)
+			// a move's replacement arrived at its target once its connection
+			// is published (transport_move.go)
+			if moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialArrived(moveAttempt, dialRelayed)
+			}
 
 			defer func() {
 				self.setRegistered(false)
 				releaseH1ConnectionStats()
+				releaseRelayedConnection()
 				releaseExtenderIp()
 				// Stop new priority admissions before retiring the public route.
 				// RemoveTransport then joins any writer that already acquired the
@@ -3227,6 +3324,9 @@ func (self *PlatformTransport) runH3(
 	// network change asked for (see nextDialTime).
 	hadConnection := false
 	afterKick := false
+	// a compulsory move's replacement tries its target once per carrier
+	// (transport_move.go)
+	moveTargetAttempted := false
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -3259,6 +3359,11 @@ func (self *PlatformTransport) runH3(
 		if !self.waitDialAdmission(ctx) {
 			return
 		}
+		// a strict move's replacement dials nothing that cannot reach its
+		// target (transport_move.go)
+		if !self.waitMoveCarrierAdmission(ctx, ptMode) {
+			return
+		}
 		auth := self.authSnapshot()
 		// read after the auth snapshot (transport_client_limit.go)
 		clientLimitResetGeneration := self.clientLimitResetGeneration()
@@ -3268,6 +3373,10 @@ func (self *PlatformTransport) runH3(
 		// every kick after this point belongs to this iteration (see the h1
 		// loop and kickedSince)
 		kickGeneration := self.kickGeneration.Load()
+		// the move targets this attempt dials in place of the platform host,
+		// nil to resolve it (transport_move.go). Only plain H3 can use a
+		// target. Set right before the dial.
+		var moveAttempt *platformMoveDialAttempt
 
 		type ConnStream struct {
 			conn           *quic.Conn
@@ -3285,13 +3394,14 @@ func (self *PlatformTransport) runH3(
 			// the frame form of the h1 provide intent header
 			// (transport_provide_intent.go)
 			authMessage := &protocol.Auth{
-				ByJwt:              auth.ByJwt,
-				AppVersion:         auth.AppVersion,
-				ClientInfo:         auth.ClientInfo.Json(),
-				StreamLeaseVersion: 1,
-				InstanceId:         auth.InstanceId.Bytes(),
-				IpFamily:           self.authIntent(),
-				ProvideIntent:      auth.ProvideIntent,
+				ByJwt:               auth.ByJwt,
+				AppVersion:          auth.AppVersion,
+				ClientInfo:          auth.ClientInfo.Json(),
+				StreamLeaseVersion:  1,
+				InstanceId:          auth.InstanceId.Bytes(),
+				IpFamily:            self.authIntent(),
+				ProvideIntent:       auth.ProvideIntent,
+				ResidentMoveVersion: self.residentMoveVersion(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
@@ -3322,7 +3432,10 @@ func (self *PlatformTransport) runH3(
 
 			// the candidate addresses in dial order, and how each socket is
 			// wrapped for the mode. A pending family requires a confirmed
-			// handshake race even when only one address is ready so far.
+			// handshake race even when only one address is ready so far. A
+			// move's targets stand in for the resolved addresses, while the
+			// server name stays the platform host (transport_move.go).
+			attemptCtx = moveAttempt.withContext(attemptCtx)
 			candidates, wrapPacketConn, source, err := self.h3DialCandidatesProgressive(attemptCtx, ptMode, serverName)
 			if err != nil {
 				return nil, err
@@ -3465,6 +3578,10 @@ func (self *PlatformTransport) runH3(
 		// the context until this iteration ends
 		dialCtx, cancelDial := context.WithCancel(attemptCtx)
 		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
+		moveAttempt = nil
+		if ptMode == TransportModeH3 {
+			moveAttempt = self.moveDialAttempt(moveTargetAttempted)
+		}
 		var connStream *ConnStream
 		var err error
 		if self.log.V(2).Enabled() {
@@ -3482,6 +3599,18 @@ func (self *PlatformTransport) runH3(
 			attemptCanceled := attemptCtx.Err() != nil
 			cancelDial()
 			releaseAttempt()
+			// a dial this transport's teardown or a network change canceled
+			// says nothing about the move target either
+			closing := false
+			select {
+			case <-ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !attemptCanceled && !kickedDuringDial && moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialFailed(moveAttempt, ptMode, err)
+			}
 			// the platform may close for the client limit or refuse the
 			// credential right after the handshake, before the auth exchange
 			// completes. That is no backend failure: the loop parks in
@@ -3719,10 +3848,21 @@ func (self *PlatformTransport) runH3(
 					},
 				)
 			}
+			// a connection an extender relays is published for exactly its
+			// lifetime, as the h1 loop does (transport_move.go)
+			relayed := connStream.attempt.relayed
+			releaseRelayedConnection := self.holdRelayedConnection(relayed)
 			self.setRegistered(true)
+			// a move's replacement arrived at its target once its connection
+			// is published (transport_move.go)
+			if moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialArrived(moveAttempt, relayed)
+			}
 
 			defer func() {
 				self.setRegistered(false)
+				releaseRelayedConnection()
 				self.routeManager.RemoveTransport(sendTransport)
 				if self.settings.SendRouteObserver != nil {
 					self.settings.SendRouteObserver(sendTransport, send, false)

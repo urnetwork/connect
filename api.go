@@ -334,6 +334,10 @@ type ProviderSpec struct {
 	LocationGroupId *Id  `json:"location_group_id,omitempty"`
 	ClientId        *Id  `json:"client_id,omitempty"`
 	BestAvailable   bool `json:"best_available,omitempty"`
+	// TransportHint coerces the transports of a fixed `ClientId` spec, a
+	// pinned stay (EXTENDER.md K10). Client-side only: never sent, and not part
+	// of the spec fingerprint.
+	TransportHint *TransportHint `json:"-"`
 }
 
 // LocationCoordinates is a wgs84 point. Zero is a valid coordinate — absence

@@ -1326,6 +1326,97 @@ carousel and the share code. The linux release container adds
 `libzxing-cpp-dev`; the windows build fetches zxing-cpp and vendors the
 Nayuki encoder.
 
+K9. Provider rows (2026-10-22). The provider details sheet, the connected
+providers with their globe, shows the same extenders as the connect grid.
+`ConnectedProviderLocation` carries `ExtenderIps` and `ExtenderColorHexes`
+from the provider's event (K1), comma separated and paired by index as on
+the grid point, through the same `extenderIpsAndColorHexes`, which lives in
+the untagged color file beside `GetExtenderColorHex` because the iOS
+extension builds the provider rows too; the web binding hands the page the
+pairs as `extenders: [{ip, colorHex}]`. A row's dot draws K2's rings at its
+own size, as many as fit at full stroke, and dashes the last one drawn when
+more extenders remain: apple's dots (40 pt on iOS, 30 pt on macOS) and
+android's 40 dp hold all three, the 20 px dots on linux and the web hold two
+(the web's grew from 10 px, which held none), and windows' 12 px dot, the
+location chooser's size, holds one. The globe's dots draw them at the dot's
+size in the globe's 600-unit space, scaled with the globe, so a globe dot
+holds one ring and a second extender dashes it. The rows and the globe drop
+the rings that do not fit on every app, even where the grid thins them to
+keep the count (android, windows; K2). The rings run in each app's grid
+order: the first extender outermost everywhere but android, whose grid and
+widget put it innermost. Under the connected time, each extender gets one
+line: a small ring in its color (K3), then its address in the client id's
+monospaced style, copied on a tap. Apple's row context menu also has "Copy
+extender address"; rows without a context menu use the same words for the
+tap (android's click label, the tooltip on windows, linux and the web). The
+address is the extender's id on the rows: every extender has one, while the
+extender's uuid reaches a client only as `MeasurementId` on the open-tier
+records of extenders that serve the measurement API. A direct or p2p
+provider shows neither rings nor lines. Apple came first and every app
+follows it, including the web app, though its hosted device never dials an
+extender (K8), so its rows stay plain until a page runs against a device
+that does.
+
+K10. Staying on an exit through its extender (2026-10-22). "Stay on this
+exit" on a provider row that carries an extender (K9) pins the extender as
+well as the exit: the stayed-on provider is then reached through that one
+extender address and nothing else. Decided with the user:
+- Strict. The pinned destination's transports dial H1 through that address
+  only: no direct dial, no other extender, no H3 (only H1 runs through an
+  extender, K1). When the extender is down, the exit waits and retries it on
+  its own transport's schedule. The directory's hold (E2) does not bench the
+  address for the pinned dials, though their failures still hold it for
+  every other dial. A revoked or forgotten address leaves the exit waiting
+  until the user chooses another location.
+- Saved with the location. `ConnectLocation.ExtenderIp` (json `extender_ip`)
+  sits beside the stayed-on client id, so a restart reconnects through the
+  same extender. A location without a client id carries none.
+- Named in the row's stay text: the offer reads "Keeps this provider's IP
+  address and extender until either goes offline", and staying reads
+  "Staying on this exit through extender <ip>. If either goes offline,
+  choose another location." While the pinned exit is not connected, the
+  sheet's empty state says it is waiting for the exit through that extender.
+  The offer pins the row's first extender; across a migration's two that is
+  the lower address (K1 sorts them), and the stay text names the one pinned.
+  The staying line keeps naming the pin while the provider is reached over
+  P2P, which the pin does not cover (below), rather than offering the stay
+  again. A stay made before the pin, or while the provider was direct, keeps
+  saying it stays and is not offered the pin, as a stayed-on provider never
+  offers itself.
+- As built (2026-10-22) on apple only. The other apps keep the plain stay
+  until they adopt the pin; their sdk already keeps one, so adopting it is the
+  app half alone.
+
+Plumbing. The location's client id becomes the one fixed `ProviderSpec` as
+before, and the pin rides it as `ProviderSpec.TransportHint`, a client-side
+field the find-providers2 wire never carries (`json:"-"`), so the spec
+fingerprint that scopes the window identities is unchanged by a pin. The api
+generator matches each destination against its specs and hands the hint to
+the window client's args; `NewClientContext` then builds that client's
+platform transport with H1 as the only mode, and with a client strategy of
+its own (`newPinnedExtenderClientStrategy`, the per-transport precedent being
+`NewDirectClientStrategy`): no normal, resilient, VLESS, configured or alt
+dialers, and the extender dialers of the pinned address alone, drawn from
+the shared directory through `PinnedCandidate`, which ignores the hold. The
+client closes its strategy with its transport, and a policy migration keeps
+the pin. The transport reports the extender as K1 has it, so the row shows
+the pinned extender while it carries the connection. The pin covers the
+platform transport: a P2P route to the provider (K1) never touches the
+platform, is unchanged by the pin, and shows as no extender on the row. A
+resident move (server/connect/MOVE.md) never retargets a pinned client:
+its carrier is an extender, so an advisory move is declined as an extender
+carrier and a compulsory one migrates it by name, and every transport a
+migration or a move builds for it dials through its own strategy.
+
+Compatibility. A pin is settable state an older device process would drop:
+it decodes `extender_ip` as nothing and stays on the exit alone. Instead of a
+`DeviceRpcVersion` bump, which is an exact match and would turn away every
+cached browser on the hosted path until both halves redeploy, the remote asks
+the local whether it pins (`DeviceLocalRpc.GetSupportsExtenderPin`, read
+through `rpcCallNoArgAllowMissingMethod`). A local without the method answers
+false, and the apps then offer the plain stay without the pin, as the
+provider extender role is gated (N1).
+
 ### L. The alt service
 
 L1. What alt is. A full connect node and an api server in one process,
