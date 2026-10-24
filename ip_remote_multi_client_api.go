@@ -1650,15 +1650,24 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 		}
 	}
 
+	// A failed replacement releases before its close/join. Its deferred
+	// cleanup must not release a successor admitted during that join.
+	releaseMigration := sync.OnceFunc(func() {
+		self.transportLock.Lock()
+		defer self.transportLock.Unlock()
+		if self.transports[client] == state {
+			state.migrating = false
+		}
+	})
 	async = true
 	go HandleError(func() {
 		defer self.transportCreation.end()
 		defer func() {
+			releaseMigration()
 			_, _, currentPolicyVersion := self.platformTransportPolicy()
 			stalePolicy := false
 			self.transportLock.Lock()
 			if self.transports[client] == state {
-				state.migrating = false
 				stalePolicy = state.policyVersion != currentPolicyVersion && state.pinnedStrategy == nil
 			}
 			self.transportLock.Unlock()
@@ -1695,7 +1704,7 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 		}
 
 		if movePlan != nil && movePlan.Dial != nil {
-			self.moveWindowTransport(client, state, current, settings, auth, pinnedStrategy, movePlan.Dial, move, residentMoveTracker)
+			self.moveWindowTransport(client, state, current, settings, auth, pinnedStrategy, movePlan.Dial, move, residentMoveTracker, releaseMigration)
 			return
 		}
 
@@ -1704,9 +1713,15 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 		if nextPlatform, ok := next.(*PlatformTransport); ok {
 			if currentPlatform, ok := current.(*PlatformTransport); ok &&
 				!nextPlatform.CanMakeBeforeBreakFrom(currentPlatform) {
+				if nextPlatform.h1BudgetReservation != nil || currentPlatform.h1BudgetReservation != nil {
+					// A retiring replacement may still own the bounded H1 handoff.
+					// Capacity refusal must leave the live carrier usable.
+					releaseMigration()
+					closeApiWindowPlatformTransportAndWait(next)
+					return
+				}
 				// Two full H3 claims can exceed the platform memory cap. Recheck
-				// ownership before releasing the old carrier; transitions involving
-				// H1 use the bounded handoff and retain make-before-break instead.
+				// ownership before releasing the old carrier.
 				self.transportLock.Lock()
 				stillCurrent := self.transports[client] == state && state.current == current
 				self.transportLock.Unlock()
@@ -1759,20 +1774,9 @@ func (self *ApiMultiClientGenerator) migrateClientTransport(
 				// Keep the old transport: it is still a valid route, and the
 				// server's drain excuse/reconnect path remains the backstop. Closing
 				// the failed replacement also returns any temporary handoff loan.
-				// Disarm BEFORE closing the replacement so the close is the
-				// definitive "migration released" signal: the deferred disarm
-				// runs after this return, so an observer gating on the
-				// replacement's close (or a follow-up MigrateClientTransport)
-				// would otherwise see migrating still armed in the window
-				// between the close and the return. The defer re-clears
-				// idempotently.
-				func() {
-					self.transportLock.Lock()
-					defer self.transportLock.Unlock()
-					if self.transports[client] == state {
-						state.migrating = false
-					}
-				}()
+				// Release before close so observers may admit a successor; the
+				// worker's deferred cleanup cannot release that successor.
+				releaseMigration()
 				closeApiWindowPlatformTransportAndWait(next)
 				return
 			}
@@ -1843,6 +1847,7 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 	dial *ResidentMoveDial,
 	move *ResidentMove,
 	residentMoveTracker *ResidentMoveTracker,
+	releaseMigration func(),
 ) {
 	// from here on, transports dial as usual: the replacement that stays
 	// keeps any preference its arrival recorded
@@ -1902,13 +1907,7 @@ func (self *ApiMultiClientGenerator) moveWindowTransport(
 		// Keep the old transport: it is still a valid route. Disarm before
 		// closing the replacement, so the close is the definitive "migration
 		// released" signal (as the migrate by name does).
-		func() {
-			self.transportLock.Lock()
-			defer self.transportLock.Unlock()
-			if self.transports[client] == state {
-				state.migrating = false
-			}
-		}()
+		releaseMigration()
 		closeApiWindowPlatformTransportAndWait(next)
 		if report := failureReport(); report != nil {
 			self.sendResidentMoveResult(client, report)

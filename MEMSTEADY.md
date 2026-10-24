@@ -1,5 +1,47 @@
 # Memory-budget performance research
 
+## 2026-10-24 UTC: full-window service refusal and recovery
+
+A matched, sequential host replay used the public SDK with a 32 MiB admission
+target, five quality owners, one speed owner, H1, and eight Go execution cores.
+The synthetic access link was 5 Mb/s down / 1 Mb/s up with 0.5% independent loss.
+Old quality exits refused the next destination while the existing speed exit
+could serve it. This is the separate service-recovery case; the strict
+late-provider discovery diagnostic remains unchanged.
+
+| Measurement | C7 original | Service/health selector fix |
+| --- | ---: | ---: |
+| Page 0 HTML first byte | 2.190 s | 2.209 s |
+| Page 1 HTML first byte | TCP dial timed out | 5.675 s |
+| HTML / asset attempts | 2 / 4; page 1 failed | 100 / 400 completed |
+| Overlapping navigations proved | Incomplete | 99 |
+| Median HTML first byte | Not comparable | 1.136 s |
+| Navigations at or above five seconds | Incomplete | 1 of 100 |
+
+The fix lets a fresh, unpinned TCP attempt try a healthy permitted second
+window before retrying exits with failures for that exact destination service.
+It preserves the original fallback when no better candidate exists, fixed and
+pinned routing, established flows, ownership caps, and UDP policy. The native
+root-cause test fails on C7 and passes with the fix in normal, race and fresh
+processes; 159 positive safety/affected checks and two candidate-health causal
+controls also completed as expected.
+
+Recovery is improved but **the unchanged five-second gate still fails**:
+page 1 took 5.674793 s from the controller tap. Its TCP establishment took
+5.281492 s; the remaining delay needs investigation, not a larger timeout.
+The complete original 12,288-byte CSS stream kept its socket and public owner,
+and asset body ownership drained. No statistical baseline promotion follows
+from one pair. No fast.com throughput or real-device memory qualification is
+claimed: the host process includes the providers and fixture, so its heap is
+not the iOS-profile runtime footprint.
+
+Evidence: OLD raw SHA-256
+`74f603849a5d37f5d2397b369459b055f5f92bc1fa97bf9603aeb6b27fcf7e7b`;
+FIX raw SHA-256
+`7d185a982a0ad65aaed20b794f52a955dfb363c2ec2b672b937f4c89d5824802`.
+The original OLD classifier stop (one-space versus two-space log formatting)
+is retained with a separate read-only adjudication; OLD was not rerun.
+
 ## 2026-10-23: bounded discovery during a live acquisition
 
 One instrumented SDK32 host diagnostic compared original C6 routing with the

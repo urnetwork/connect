@@ -1,3 +1,4 @@
+// Direct credential retirement is valid only before a candidate owns them.
 package connect
 
 import (
@@ -105,6 +106,48 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 		if matches != 1 {
 			violations = append(violations, fmt.Sprintf("expand has %d guarded %s cleanups, want 1", matches, site.name))
 		}
+	}
+	// A stale demand handoff has minted credentials but no channel. It must
+	// return to the same receive without falling through into construction.
+	staleDemandCleanups := 0
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		receive, ok := node.(*ast.CommClause)
+		if !ok {
+			return true
+		}
+		assignment, ok := receive.Comm.(*ast.AssignStmt)
+		if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 ||
+			formatAstExpr(t, fileSet, assignment.Lhs[0]) != "args" ||
+			formatAstExpr(t, fileSet, assignment.Lhs[1]) != "ok" ||
+			formatAstExpr(t, fileSet, assignment.Rhs[0]) != "<-self.clientChannelArgs" {
+			return true
+		}
+		for _, statement := range receive.Body {
+			guard, ok := statement.(*ast.IfStmt)
+			if !ok || guard.Pos() >= construction || guard.Else != nil || len(guard.Body.List) != 2 ||
+				formatAstExpr(t, fileSet, guard.Cond) != "!self.acceptDiscoveryDemandArgs(evaluationOwner, args)" {
+				continue
+			}
+			expression, ok := guard.Body.List[0].(*ast.ExprStmt)
+			if !ok {
+				continue
+			}
+			call, ok := expression.X.(*ast.CallExpr)
+			if !ok || formatAstExpr(t, fileSet, call.Fun) != "self.generator.RemoveClientArgs" ||
+				len(call.Args) != 1 || formatAstExpr(t, fileSet, call.Args[0]) != "&args.MultiClientGeneratorClientArgs" {
+				continue
+			}
+			retry, ok := guard.Body.List[1].(*ast.BranchStmt)
+			if !ok || retry.Tok != token.GOTO || retry.Label == nil || retry.Label.Name != "awaitCandidate" {
+				continue
+			}
+			allowed[call.Pos()] = true
+			staleDemandCleanups++
+		}
+		return true
+	})
+	if staleDemandCleanups != 1 {
+		violations = append(violations, fmt.Sprintf("expand has %d guarded stale demand cleanups, want 1", staleDemandCleanups))
 	}
 	for _, call := range removals {
 		if !allowed[call.Pos()] {

@@ -7848,6 +7848,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
+			var failedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
 					var offerChanged *<-chan struct{}
@@ -7868,6 +7869,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						} else if fallback := window.lastResortClientsForIpVersion(ipPath.Version); 0 < len(fallback) {
 							orderedClients = fallback
 						}
+					}
+					if failedFallback != nil {
+						orderedClients = healthyCrossWindowCandidates(orderedClients)
 					}
 					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
 					// External probe reputation is used only here, after affinity
@@ -7892,15 +7896,23 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						// narrows it. See scoredPlacementReorder.
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
-					// legacy selection unchanged: with the gate off (every
-					// current build's default), orderedClients is exactly what
-					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
-						return orderedClients
+						// An unestablished, unpinned TCP attempt may use an
+						// untried exit in the next permitted window before
+						// retrying this service's known failures. Keep the first
+						// window's ordinary order when every window has failed.
+						if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack ||
+							sendPacketGroup.pin.pinned() || update.receivedInbound.Load() ||
+							!self.destinationServiceFailuresExhausted(orderedClients, ipPath) {
+							return orderedClients
+						}
+						if failedFallback == nil {
+							failedFallback = orderedClients
+						}
 					}
 				}
 			}
-			return []*multiClientChannel{}
+			return failedFallback
 		}
 
 		raceClients(coalesceOrderedClients(), 0)
