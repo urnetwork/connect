@@ -1,5 +1,43 @@
 # Rapid-browsing packet-flow stall: request for independent review
 
+## 2026-10-23: integrated shutdown ownership; H1 stalls remain open
+
+The SDK now registers both current and retired UpgradeMux pump joins with its
+existing lifecycle owner. `Close` remains nonjoining; `CloseAndWait` waits for
+borrowed pump callbacks to return. This joins only the IpMux pump, not all mux
+workers. Two actual SDK old-code cases reproduced premature completion while
+an exact pooled TCP/53 SYNACK callback remained held. The four corrected roots
+passed normal, race, and fresh-process validation (12 passes). Canonical lifecycle replay passed all 15 checks (12 lifecycle roots plus
+generator, C ABI, and mobile-source checks).
+
+The internal DoH pump fix and atomic upstream replacement are now integrated.
+The old ordinary-admission pump delayed a real TCP/53 reply; replacing an
+upstream could also retain the previous batch sender. Two qualified old-code
+failures and 39 corrected normal/race/fresh checks cover both root causes and
+adjacent policies. The native pump uses ready-only remote admission; generic
+senders retain their explicit send budget. Canonical and broad replay of this
+combined integration remain pending.
+
+H1 churn still has real failures despite its retry-tolerant PASS. One complete
+HTTP-phase replay accepted all 120 legs but recorded 11 failed calls across
+131 attempts in 119.856 seconds. Nine uploads finished the HTTP-client write,
+then failed before response headers; two downloads timed out after 1,785,856
+body bytes. The latter is also 109 TLS records and does not uniquely identify
+a contract boundary. A subsequent cold snapshot joined a 15.001-second native
+write timeout to its active upload, with no observed cleanup/cancellation.
+The 317,736-byte stack was untruncated. Receive/send workers were in their
+ordinary waits; observed TUN injections completed promptly. Neither full TUN
+injection nor absent callback records prove TCP delivery or a drain defect.
+The missing predecessor/ACK disposition remains unresolved.
+
+The composed browsing fixture also needs a correction: its one-shot wait-entry
+token was historical, while a later owner/count snapshot could observe another
+retry generation. The old-code composed failure qualified, but the corrected
+arm's initial-premise failure does not qualify a product regression. Full
+100-page, performance, and device-profile qualification remain outstanding.
+
+## Earlier 2026-10-21 investigation
+
 Updated 2026-10-21. **Unresolved production fix; new causal lead:** the latest
 baseline still fails, but a private pacing-only bypass completes all 100 pages
 within the unchanged deadline (171.9 s, zero slow navigations, maximum HTML
@@ -875,3 +913,54 @@ host-tool builds passed; native APK builds and physical measurements have not
 run. Do not describe either memory profile as newly qualified or this
 checkpoint as release-ready. Rebuild and rerun against the synced revisions;
 pre-checkpoint source identities do not qualify post-merge source.
+
+## 2026-10-22: six-provider SDK/native browsing screen
+
+The private V4 screen reached the actual application workload using the public
+32 MiB SDK constructor, five quality clients and one speed client, six owned
+public providers, native TUN ingress and verified HTTPS/H1 origins. All 100
+navigations completed, with 99 overlap proofs and 400 client/server asset
+workers joined. Application time was 165.180 seconds; maximum navigation elapsed
+was 2.961238 seconds, with zero navigations crossing the unchanged five-second
+gate. All six providers carried body traffic. SDK teardown reported zero held
+ownership and balanced root credits (63,799,648 bytes reserved and released).
+
+This is a functional host screen, not a matched performance comparison or mobile
+memory qualification. Sampled receive usage was zero: it does not prove behavior
+under sustained receive-budget pressure or explain the reported browsing pause.
+The next causal test must exercise actual receive ownership/admission pressure
+while proving unrelated flows and recovery remain runnable.
+
+Two setup errors were corrected privately without changing packet policy. Public
+providers require a distinct provider account for the tested forward-contract
+relationship. Also, installed clients and Added-provider monitor events are
+independent pull views: an explicit real-admission barrier proved six clients can
+coexist with five published Added events. Readiness now waits for both exact
+six-provider views inside the original 180-second deadline; it still rejects
+foreign ownership and never accepts missing, duplicate or unhealthy providers.
+The prior failed run did not retain enough cardinality evidence to attribute its
+failure specifically to this publication ordering.
+
+V4 preserved the sole expected old-logic assertion failure and passed 48 fixture
+checks plus the actual 100-page root (49 passes). Normal, race and fresh-process
+controls passed without skips. All source-bound owners and monitors joined.
+Receipt: `/Users/builder/Library/Caches/urnetwork-runall-owned/integrated-confirm.aZVJs0tw/sdk-six-fixture-v4.WidVDqdn/RECEIPT.json`
+(SHA-256 `49f285c1b470273c45f990c4bde45d1824fa78547f6bfc575eaf556641a76827`).
+Its source identity is `40ed03251f95db628ddd6d13a770ba4a9388439547a8fb1bf9b609723e8c8c19`;
+later harness integration requires a fresh correctness/performance replay.
+## 2026-10-23: distinct stall mechanisms and validation limits
+
+These measurements use source closure `f74cd26556634fb80f66c18c4554a4b4490e739789ba2ddf851e589fd48e400b` and private candidate overlays. They do not qualify the eventual integrated source.
+
+- **Shared relay idle:** the canonical proxy could close an active one-way transfer because its opposite-direction reader was idle. The shared-idle/cancellation repair passed 102 normal/race/fresh checks. A six-process A/B, B/A, A/B host screen retained all 30 benchmark results and crossed no preregistered regression threshold. Median bulk throughput improved 10.45% upload and 14.55% download; short lifecycle latency fell about 5%. These are `net.Pipe` results. In particular, its per-deadline timer allocation costs differ from OS sockets, so neither these speed gains nor the allocation savings establish real TCP/TLS or device gains.
+- **Discovery wakeup:** clearing expansion backoff changed state without waking the enumerator already waiting inside that backoff. An actual enumerator regression reproduced the old failure; the wake-only repair passed 45 normal/race/fresh checks. Existing backoff, identity ownership and established flows remain part of its controls. The composed browsing test must leave a genuine provider ownership slot free and observe the inner wait; prequalifying all providers before browsing misses this condition.
+- **Native Go reader admission:** actual SDK socket reads called the generic five-second batch send. A remote SYN could therefore delay a later independently serviceable local DNS packet. The old actual-socket root failed with its exact marker; the native-policy candidate passed 39 normal/race/fresh checks, including the unchanged generic blocking contract and ownership controls. The actual hosted proxy reader and binding omission checks are additional required coverage, not implied by that result. Mobile packed/descriptor ingress already used native admission; this finding does not mean those entry points still wait five seconds.
+- **Proxy cancellation custody:** `Tun.ReadBatch` creates caller-owned pooled copies. Cancellation at the following activity check returned without releasing them. The actual-TUN old root leaked exactly three buffers, and the return-and-clear candidate passed 12 normal/race/fresh controls. Clearing the outer slice after a consumed batch separately removes bounded stale references.
+
+An earlier actual churn trace returned only 1,083 of a 2,048-byte write after 15.000008 seconds, immediately before its application failure. Receive charge was near its approximately 2.18 MiB leaf limit. Retained return messages lacked callback-return receipts for roughly 5.4–6.0 seconds, but bounded trace membership could not locate that time conclusively inside or before a callback. A passing root with four retried failures is not a clean performance result. The next comparison preserves every request attempt and includes retry waits in complete-request latency.
+
+The existing 100-page SDK screen establishes overlapping asset activity but not the full reported failure premise: all providers were ready before browsing, readers continuously drained bodies, and sampled receive pressure was zero. Stronger coverage needs a retained old asset, a fresh navigation, real admission/ownership pressure and explicit recovery evidence. Body closure alone is not proof of FIN/RST delivery or retained-credit release.
+
+Memory evidence is likewise scoped. One hosted Android 64 MiB cell had a 37.36 MiB Go-runtime peak, a 31.94 MiB quiet peak and no cap breaches. Its Fast results were 18/19/25 Mbps, so the performance gate failed. A prior iOS-profile cell on Android peaked at 30.08 MiB below 32 MiB, but an invalid Fast child stopped that cohort. Neither is full profile qualification. Physical iOS Network Extension footprint below 50 MiB remains unmeasured.
+
+The DoH internal TUN pump is an adjacent reachable five-second admission path; it requires its own actual-root proof. A local UDP reply that bypasses that pump is not a valid discriminator. WireGuard batch admission counts can also mislabel prefix-based diagnostics; its actual caller does not reoffer a suffix, so no duplicate-packet mechanism was established there.

@@ -60,6 +60,9 @@ func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
 		self.discoveryRetry.failureCount += 1
 		delay = self.retryJitter(fixedDestinationRetryDelay(self.discoveryRetry.failureCount, retryMin, retryMax))
 		self.discoveryRetry.notBefore = now.Add(delay)
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
 		failureCount = self.discoveryRetry.failureCount
 	}()
 	if self.log != nil {
@@ -79,37 +82,54 @@ func (self *multiClientWindow) noteDiscoveryExpandAdmitted() {
 
 // Records the window's exit count at the start of a pass. A drop means a
 // working exit was lost, and its replacement is not held back by the passes
-// that failed to add a spare before it.
+// that failed to add a spare before it. A retained warned exit lowers this
+// count too, so publish the reset even though the old client remains owned.
 func (self *multiClientWindow) noteDiscoveryClientCount(clientCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if clientCount < self.discoveryRetry.clientCount {
+		deferred := !self.discoveryRetry.notBefore.IsZero()
 		self.discoveryRetry = discoveryExpandRetry{}
+		if deferred && self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
 	}
 	self.discoveryRetry.clientCount = clientCount
 }
 
-// Ends any deferral and starts the backoff over.
+// Ends any deferral and wakes its waiting producer under the same lock.
+// Repeated clears preserve the current notification generation.
 func (self *multiClientWindow) clearDiscoveryExpandRetry() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	deferred := !self.discoveryRetry.notBefore.IsZero()
 	self.discoveryRetry = discoveryExpandRetry{
 		clientCount: self.discoveryRetry.clientCount,
+	}
+	if deferred && self.resizeMonitor != nil {
+		self.resizeMonitor.NotifyAll()
 	}
 }
 
 // Whether a discovery window must not expand at `now`, and if so, when it may.
-func (self *multiClientWindow) discoveryExpandDeferral(now time.Time) (time.Time, bool) {
+// Subscribe with the snapshot so a clear between the check and wait is visible.
+func (self *multiClientWindow) discoveryExpandDeferral(now time.Time, changed ...*<-chan struct{}) (time.Time, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if len(changed) != 0 && changed[0] != nil {
+		*changed[0] = nil
+		if self.resizeMonitor != nil {
+			*changed[0] = self.resizeMonitor.NotifyChannel()
+		}
+	}
 	if !now.Before(self.discoveryRetry.notBefore) {
 		return time.Time{}, false
 	}
 	return self.discoveryRetry.notBefore, true
 }
 
-// The enumerator's wait for a deferred discovery window. A network change
-// (notifyNetworkChanged) ends it at once. A fixed window keeps its
+// The enumerator's wait for a deferred discovery window. A clear, exit loss or
+// network change ends it at once. A fixed window keeps its
 // per-destination pacing instead. False when the window closed.
 func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 	if _, fixed := self.generator.FixedDestinationSize(); fixed {
@@ -118,7 +138,8 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 	for {
 		// before the check, so a change that lands after it still ends the wait
 		networkChanged := self.networkChangeNotify()
-		notBefore, deferred := self.discoveryExpandDeferral(time.Now())
+		var retryChanged <-chan struct{}
+		notBefore, deferred := self.discoveryExpandDeferral(time.Now(), &retryChanged)
 		if !deferred {
 			return true
 		}
@@ -126,6 +147,7 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 		case <-self.ctx.Done():
 			return false
 		case <-networkChanged:
+		case <-retryChanged:
 		case <-time.After(time.Until(notBefore)):
 		}
 	}

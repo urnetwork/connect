@@ -1,5 +1,89 @@
 # Memory-budget performance research
 
+## 2026-10-23: bounded discovery during a live acquisition
+
+One instrumented SDK32 host diagnostic compared original C6 routing with the
+bounded discovery-demand candidate. The original code exceeded the unchanged
+five-second HTML first-byte gate; the candidate completed the same workload.
+
+| Measurement | Original C6 | Candidate |
+| --- | ---: | ---: |
+| Page 0 HTML first byte | 7.199 s | 1.668 s |
+| Page 1 HTML first byte | 15.649 s | 3.644 s |
+| Maximum HTML first byte | 15.649 s | 3.644 s |
+| Named provider API visibility to discovery-wrapper entry | 12.609 s | 0.187 s |
+
+Both arms completed 100 HTML and 400 asset attempts with 99 overlap proofs.
+Each created and closed 321 asset response bodies; 79 attempts were canceled
+before a response body existed. The original 12,288-byte CSS stream retained
+its source tuple and positive public flow owner through the next HTML response,
+which came from the physically late fifth quality provider. The candidate used
+one additional discovery read and one mint within the existing acquisition and
+admitted that provider before the source's unchanged three-second SYN retry.
+No memory budget, ACK policy, source retry schedule, workload or latency gate
+was relaxed. The 38 focused and 186 affected roots passed normal, race and fresh
+runs: 672 corrected checks in total, alongside four isolated negative controls.
+
+The mechanism is bounded by the active acquisition, its existing vacant request
+slot, at most three extra reads separated by at least one second, and at most
+one demanded mint. It preserves platform retry authority, ordinary resize rest,
+current source/cohort proof, IP-family eligibility and established healthy flows.
+Silent eligibility observes the existing three-second inferred-failure age; it
+does not itself create a failure verdict, strike or negative service record.
+
+These are measurements from one instrumented matched diagnostic, not a promoted
+performance baseline or device-memory qualification. The retained trace has
+explicit omissions; reserved read and SYN records establish the narrower
+admission sequence. Original page 0 spent 5.148 s in TLS, but the cumulative
+retransmit/drop counters do not identify its delayed packets. Its 0.551 s TLS
+span in the candidate does not establish that discovery demand caused the
+improvement. The measured source clock/stamp adds 32 bytes per flow in the host
+unit layout; that is not an RSS or total footprint measurement. Fresh 32 MiB
+iOS-profile and 64 MiB Android-profile device runtime checks remain pending.
+
+Evidence: `native100-level-v2.PREP.fs9t_n7q` (original raw run and separate
+report-boundary assessment), `native100-level-fix-only.PREP.7bckqti7` (candidate),
+and `cooperative-demand06.PREP.Isujjg` (component controls). The original parser
+outcome and earlier negative evidence remain preserved.
+
+## 2026-10-23: pump ownership at shutdown
+
+The integrated SDK lifecycle now joins current and retired IpMux pumps before
+`CloseAndWait` completes. Previously a borrowed pooled TCP/53 reply could remain
+live after successful SDK completion, invalidating a teardown ownership claim.
+Two old-code reproductions and 12 corrected normal/race/fresh checks qualified
+the narrow fix; canonical lifecycle replay passed all 15 checks; physical replay remains pending.
+`Close` stays nonjoining so callbacks can request shutdown without self-joining.
+
+This is an ownership correction, not a new memory-budget qualification. The
+required physical cohorts remain the 32 MiB iOS profile on the allowlisted
+Android devices and the normal 64 MiB Android profile. No physical iPhone result
+or under-50 MiB Network Extension footprint is established. The DoH ready-only pump policy and atomic upstream replacement are now
+integrated after two qualified old-code failures and 39 corrected checks.
+Their canonical replay and complete performance/memory qualification remain pending.
+
+## 2026-10-23: individual device cells and packet-reader fixes
+
+On the allowlisted Pixel, one hosted H1 Android-profile cell stayed below its
+64 MiB runtime gate: peak **37.36 MiB**, quiet peak **31.94 MiB**, teardown
+**30.42 MiB**, with zero breach samples. All five Wikipedia and three Fast
+workloads completed, but Fast measured **18/19/25 Mbps**, below the unchanged
+40 Mbps goal. This is one memory-eligible cell, not full profile qualification.
+An earlier 32 MiB iOS-profile cell on Android peaked at **30.08 MiB**, but an
+invalid Fast child stopped that cohort. Neither result qualifies the newly
+integrated source or measures physical iOS extension footprint.
+
+Source closure for those cells was
+`f74cd26556634fb80f66c18c4554a4b4490e739789ba2ddf851e589fd48e400b`.
+The subsequent packet-flow fixes need fresh qualification. In particular,
+the proxy now returns every pooled packet when cancellation follows a TUN
+batch read, and clears consumed batch references. Its forced three-buffer
+leak reproduced before the fix; 12 normal/race/fresh controls passed afterward.
+This fixes ownership rather than increasing download or connection budgets.
+Keep the iOS-profile 32 MiB and Android-profile 64 MiB gates unchanged while
+measuring the combined fixes. No budget redistribution or baseline promotion
+is supported by these individual observations.
+
 ## 2026-10-20 checkpoint: hosted variability remains unqualified
 
 Fresh common-source Pixel hosted-US H1+ diagnostics produced one completed

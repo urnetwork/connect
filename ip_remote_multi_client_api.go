@@ -634,6 +634,15 @@ func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamily(count int, exc
 	return self.nextDestinationsContext(self.ctx, count, excludeDestinations, rankMode, ipFamily)
 }
 
+// NextDestinationsWithIpFamilyContext is the cancellation-bounded form of
+// family discovery. It uses the same request, identity and exclusion owner.
+// Wrappers that constrain discovery must override this method as well as
+// NextDestinationsWithIpFamily, retaining their count, exclusion, rank and family
+// policy while forwarding the caller's context.
+func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamilyContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily)
+}
+
 // ExcludeClientIds snapshots durable constructor exclusions followed by
 // runtime exclusions in oldest-to-newest order.
 func (self *ApiMultiClientGenerator) ExcludeClientIds() []Id {

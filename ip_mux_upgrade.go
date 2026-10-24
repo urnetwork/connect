@@ -2758,14 +2758,20 @@ func (self *UpgradeMux) bindDnsResultToExit(domain string, addrs []netip.Addr, r
 // Wires an exact-flow group path when the upstream supports it.
 func (self *UpgradeMux) SetUpstreamBatchClient(upstream *RemoteUserNatMultiClient) {
 	self.upstreamMultiClient.Store(upstream)
-	self.mux.SetUpstream(upstream.SendPacket)
-	self.mux.setUpstreamGroupSend(func(
+	self.mux.setUpstreams(upstream.SendPacket, func(
 		source TransferPath,
 		provideMode protocol.ProvideMode,
 		group *ipPacketGroup,
 		timeout time.Duration,
 	) bool {
 		return upstream.sendPacketGroup(source, provideMode, group, timeout)
+	}, func(
+		source TransferPath,
+		provideMode protocol.ProvideMode,
+		packet []byte,
+		timeout time.Duration,
+	) bool {
+		return upstream.sendPacketWithPolicy(source, provideMode, packet, timeout, true)
 	})
 }
 
@@ -2829,4 +2835,27 @@ func (self *UpgradeMux) Close() {
 		fallback.Close()
 	}
 	self.mux.Close()
+}
+
+// Joins only the internal IpMux TUN pump after the owner has called Close.
+// TCP/53 accept/connection handlers, maintenance and resolver wrapper workers
+// are outside this boundary. A callback on the pump must use Close and let an
+// independent owner wait here; waiting on its own pump would self-join.
+func (self *UpgradeMux) WaitForPump(ctx context.Context) error {
+	select {
+	case <-self.mux.pumpDone:
+		return nil
+	default:
+	}
+	select {
+	case <-self.mux.pumpDone:
+		return nil
+	case <-ctx.Done():
+		select {
+		case <-self.mux.pumpDone:
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
 }
