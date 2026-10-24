@@ -1,5 +1,28 @@
 # Memory-budget performance research
 
+## 2026-10-24 UTC: revised 100-page overlap qualification
+
+The `next-navigation-image-v2` fixture now proves an actual unfinished original
+image body at every next-HTML handoff, rather than relying on historical prefix
+tokens. Only its final 1 KiB waits; other bytes and assets stream. The native
+pressure and shared SDK paths retain the original page sizes, four-page bound,
+network shape, CSS custody, cancellation and timing contracts.
+
+Qualification passed 15 normal and 15 race roots, with two intended behavioral
+failures when restoring the old writer. One uninstrumented SDK run then passed
+100 HTML / 400 assets / 99 overlaps: median TTFB 1.101654 s, p95 2.239751 s,
+maximum 4.233728 s and no samples at least five seconds. All 99 handoffs had
+more than 1 KiB of unfinished body, median 124,672 B; this does not identify
+native queue occupancy. The checked SDK post-join usage and pending counters
+returned to zero, while global unpublished-offer quiescence remains unknown.
+
+This is one changed-workload run, not a statistical improvement or an observed
+32 MiB process-memory pass. Six providers share the host process. Real-device
+MEMSTEADY/PERFVAR must still qualify the 32 MiB iOS surrogate and 64 MiB Android
+profiles. Production budgets, routing and the five-second engineering target
+are unchanged. Measurements, preserved failure and cleanup-control details are
+in [the PERFVAR measurement record](../tests/PERFVAR-MEASUREMENTS.md).
+
 ## 2026-10-24 UTC: retired-channel cache ownership and C10 follow-up
 
 Service-failure cache keys retained retired channel pointers after flowless
