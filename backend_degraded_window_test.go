@@ -154,6 +154,7 @@ func windowResizeMaxTarget(t *testing.T, degraded bool) int {
 		nil,
 		DisableSecurityPolicy(),
 		nil,
+		nil,
 		WindowTypeQuality,
 		nil,
 		settings,

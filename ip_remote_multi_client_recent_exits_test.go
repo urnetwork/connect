@@ -223,6 +223,7 @@ func recentExitTestWindow(
 		nil,
 		DisableSecurityPolicy(),
 		func(*multiClientChannel) {},
+		nil,
 		WindowTypeSpeed,
 		performanceProfile,
 		settings,

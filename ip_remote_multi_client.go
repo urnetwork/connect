@@ -2726,6 +2726,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.clientDialFailureSignal,
 		multiClient.securityPolicy,
 		multiClient.removeClient,
+		multiClient.clearDestinationServiceFailures,
 		WindowTypeQuality,
 		effectivePerformanceProfile,
 		settings,
@@ -2751,6 +2752,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.clientDialFailureSignal,
 			multiClient.securityPolicy,
 			multiClient.removeClient,
+			multiClient.clearDestinationServiceFailures,
 			WindowTypeSpeed,
 			effectivePerformanceProfile,
 			settings,
@@ -5356,6 +5358,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				delete(self.demotionStates, key)
 			}
 		}
+		self.clearDestinationServiceFailuresWithLock(client)
 		// likewise above the early return: drop the exit from every flow's
 		// record of the exits that failed it, whatever the flow is bound to,
 		// so a long-lived flow (a udp stream may never idle) does not keep
@@ -11208,7 +11211,10 @@ type multiClientWindow struct {
 	networkPeerDestination bool
 	ingressSecurityPolicy  SecurityPolicy
 	clientRemoveCallback   func(client *multiClientChannel)
-	windowType             WindowType
+	// Cache-only retirement, after cancellation with no window/channel lock.
+	// It neither emits provider events nor migrates flows.
+	clientRetireCallback func(client *multiClientChannel)
+	windowType           WindowType
 
 	settings *MultiClientSettings
 	// reliabilitySettingsFunc reads the parent's effective reliability config,
@@ -11400,6 +11406,7 @@ func newMultiClientWindow(
 	dialFailureCallback dialFailureFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
+	clientRetireCallback func(client *multiClientChannel),
 	windowType WindowType,
 	initialPerformanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
@@ -11424,6 +11431,7 @@ func newMultiClientWindow(
 		dialFailureCallback:          dialFailureCallback,
 		ingressSecurityPolicy:        ingressSecurityPolicy,
 		clientRemoveCallback:         clientRemoveCallback,
+		clientRetireCallback:         clientRetireCallback,
 		windowType:                   windowType,
 		performanceProfile:           initialPerformanceProfile,
 		windowSizeLimit:              settings.WindowSizeLimit,
@@ -13300,6 +13308,9 @@ func (self *multiClientWindow) expand(
 			// the NEW live client (Added below), and the ui would reap it
 			// while the client is still routing.
 			replacedClient.Cancel()
+			if self.clientRetireCallback != nil {
+				self.clientRetireCallback(replacedClient)
+			}
 		}
 		self.monitor.AddProviderEventWithExtenderIps(
 			args.ClientId,
@@ -14631,6 +14642,9 @@ func (self *multiClientWindow) Close() {
 	}()
 	for _, client := range removedClients {
 		client.Close()
+		if self.clientRetireCallback != nil {
+			self.clientRetireCallback(client)
+		}
 	}
 	// a closed window re-forms nothing; a new destination builds new windows
 	self.logRecentExitsForgotten(self.recentExits.Forget(), "close")

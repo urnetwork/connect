@@ -614,6 +614,7 @@ func stickyTestWindow(
 		nil,
 		DisableSecurityPolicy(),
 		func(*multiClientChannel) {},
+		nil,
 		windowType,
 		performanceProfile,
 		settings,

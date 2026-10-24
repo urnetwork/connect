@@ -88,6 +88,11 @@ func (self *RemoteUserNatMultiClient) recordDestinationServiceFailureWithLock(
 	if !ok {
 		return
 	}
+	// A receive callback may outlive removal's prune. Both decisions
+	// serialize on the parent lock, so a done channel cannot reinsert a key.
+	if client.ctx != nil && client.IsDone() {
+		return
+	}
 	if self.destinationServiceFailures == nil {
 		self.destinationServiceFailures = map[destinationServiceFailureKey]destinationServiceFailure{}
 	}
@@ -116,6 +121,23 @@ func (self *RemoteUserNatMultiClient) recordDestinationServiceFailureWithLock(
 		}
 	}
 	self.destinationServiceFailures[key] = destinationServiceFailure{time: now, count: 1}
+}
+
+// Releases this retired channel generation's cache roots without provider
+// events or flow migration.
+func (self *RemoteUserNatMultiClient) clearDestinationServiceFailures(client *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clearDestinationServiceFailuresWithLock(client)
+}
+
+// The caller holds the parent stateLock.
+func (self *RemoteUserNatMultiClient) clearDestinationServiceFailuresWithLock(client *multiClientChannel) {
+	for key := range self.destinationServiceFailures {
+		if key.client == client {
+			delete(self.destinationServiceFailures, key)
+		}
+	}
 }
 
 func (self *RemoteUserNatMultiClient) clearDestinationServiceFailure(
