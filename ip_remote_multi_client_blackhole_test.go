@@ -168,10 +168,12 @@ func TestSynWaitExceededIsPerExit(t *testing.T) {
 	// assertions spuriously on a loaded runner
 	timeout := 250 * time.Millisecond
 
-	// first syn arms the clock, nothing trips
+	// An offer alone has no silence evidence. Accepted custody arms it.
 	if update.synWaitExceeded(exitA, tcpPath, timeout) {
-		t.Fatal("first syn tripped the clock")
+		t.Fatal("unadmitted first SYN tripped the clock")
 	}
+	update.client.Store(exitA)
+	update.startSynWait(exitA, update.client.loadSelection(), tcpPath)
 	// a retransmit inside the window does not trip
 	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("retransmit inside the window tripped the clock")
@@ -179,10 +181,12 @@ func TestSynWaitExceededIsPerExit(t *testing.T) {
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
-	// moving to a new exit must restart the wait, not inherit the old one
+	// Moving to a new exit needs its own accepted custody.
+	update.client.Store(exitB)
 	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("a fresh exit inherited the previous exit's wait")
 	}
+	update.startSynWait(exitB, update.client.loadSelection(), tcpPath)
 
 	time.Sleep(timeout + 50*time.Millisecond)
 

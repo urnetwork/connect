@@ -431,9 +431,15 @@ func TestTcpGroupRecoveryRefusedDescriptorReuseKeepsChargeUntilReturn(t *testing
 			t.Fatalf("readerless first offer accepted=%t err=%v", accepted, err)
 		}
 		f.requireParked()
-		if budget.UsedByteCount() != 0 || group.collapseOwner != nil {
-			t.Fatal("unbuffered refusal created a retained owner")
+		if budget.UsedByteCount() != 0 || group.collapseOwner != nil || group.completionSelection != nil {
+			t.Fatal("unbuffered refusal retained an owner or stale selection receipt")
 		}
+		// The same descriptor retries against a fresh selection of the same
+		// channel. Its first refused attempt owns no later receipt.
+		f.update.stateLock.Lock()
+		f.update.selectAffinityClient(f.selected)
+		retrySelection := f.update.client.loadSelection()
+		f.update.stateLock.Unlock()
 		f.unpark()
 		result := make(chan bool, 1)
 		go func() { result <- f.selected.SendGroupWithAck(group, -1, true) }()
@@ -447,15 +453,15 @@ func TestTcpGroupRecoveryRefusedDescriptorReuseKeepsChargeUntilReturn(t *testing
 		f.acknowledgeAll(template)
 		if group.collapseOwner == nil || group.completionFlags.Load()&groupCompletionTerminal == 0 ||
 			group.completionFlags.Load()&groupCompletionReturned != 0 || budget.UsedByteCount() != group.collapseOwner.budgetBytes ||
-			budget.UsedByteCount() == 0 {
-			t.Fatal("callback-before-return reused a refusal flag or released live descriptor charge")
+			budget.UsedByteCount() == 0 || group.completionSelection != retrySelection {
+			t.Fatal("callback-before-return reused a stale selection/refusal flag or released live descriptor charge")
 		}
 		unpark()
 		if !<-result {
 			t.Fatal("physically acknowledged second offer did not return success")
 		}
-		if budget.UsedByteCount() != 0 || group.collapseSource != nil {
-			t.Fatal("complete public return retained a budget or source lifetime")
+		if budget.UsedByteCount() != 0 || group.collapseSource != nil || group.completionSelection != nil {
+			t.Fatal("complete public return retained a budget, source or selection lifetime")
 		}
 	})
 }

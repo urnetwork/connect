@@ -7455,12 +7455,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return false
 			}
 			selection := update.client.loadSelection()
+			sendPacketGroup.completionSelection = selection
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
-				update.commitSequenceGroupForClient(sendPacketGroup, client)
+				update.commitSequenceGroupForClient(sendPacketGroup, client, selection)
+				if dialProbePacket(ipPath) && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+					update.startSynWait(client, selection, ipPath)
+				}
 			} else if err != nil {
 				if (nativeIngress || batchAdmission != nil && batchAdmission.probing) &&
 					errors.Is(err, ErrEncryptionRequiredNotEstablished) {
@@ -7611,6 +7615,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 
 				sendPacketGroup.prepareAdmissionObservations(client)
+				sendPacketGroup.completionSelection = nil
 				// A one-candidate formation still has an initial race/probe
 				// attempt. Keep that first group reliable; once committed,
 				// sendBoundClient applies the ordinary NoAck UDP policy.
@@ -7619,6 +7624,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
+				var committedSelection *multiClientAffinitySelection
 				connectSucceeded := false
 				func() {
 					update.stateLock.Lock()
@@ -7645,13 +7651,14 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					race.sentPacketCount += 1
 					receivePackets, abandonedClients, returnPackets, connectSucceeded =
 						update.commitRaceClientWithLock(client)
+					committedSelection = update.client.loadSelection()
 				}()
 				if !sent {
 					return
 				}
 
 				success = true
-				update.commitSequenceGroupForClient(sendPacketGroup, client)
+				update.commitSequenceGroupForClient(sendPacketGroup, client, committedSelection)
 				if connectSucceeded {
 					client.addConnectSuccess(update.ipPath.Version)
 					self.clearDestinationServiceFailure(client, update.ipPath)
@@ -7678,8 +7685,8 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// A successful no-response commitment still starts its silence
 				// clock on the first probe. A synchronous response sets
 				// receivedInbound above and makes startSynWait a no-op.
-				if dialProbePacket(ipPath) && update.client.Load() == client {
-					update.startSynWait(client)
+				if dialProbePacket(ipPath) && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+					update.startSynWait(client, committedSelection, ipPath)
 				}
 				return
 
@@ -9943,22 +9950,26 @@ type multiClientChannelUpdate struct {
 	synGenerationAwaiting bool
 	synAdmissions         *tcpSynAdmission
 
-	// synWaitStart is when synWaitClient was first asked to open this flow's
-	// upstream connection -- the first dial probe (tcp syn, or quic/dns udp:
-	// see dialProbePacket) sent while receivedInbound is still false. It backs
+	// synWaitStart is when synWaitClient first accepted custody of this flow's
+	// dial probe (tcp syn, or quic/dns udp: see dialProbePacket) while
+	// receivedInbound is still false. A refused local offer has no clock. It backs
 	// the client-side dial-failure inference: a provider that silently cannot
 	// reach the destination (or a destination that silently drops the
 	// connection) produces no failure signal at all, so the wait itself is
 	// the only evidence. Keyed to synWaitClient so a re-raced flow judges
 	// each exit on its own silence; the pointer is only ever compared, never
 	// dereferenced, so a closed channel is harmless here.
-	// Both guarded by stateLock.
-	synWaitStart  time.Time
-	synWaitClient *multiClientChannel
-	// synWaitSendCount counts probes sent to synWaitClient since the clock
-	// started. Past dialProbeMaxSends the flow is a one-way stream rather
-	// than a handshake and the inference leaves it alone. Guarded by
-	// stateLock alongside the clock it qualifies.
+	// The exact selection receipt and TCP SYN number prevent an old provider
+	// attempt or generation from lending silence to a later local offer.
+	// All guarded by stateLock.
+	synWaitStart     time.Time
+	synWaitClient    *multiClientChannel
+	synWaitSelection *multiClientAffinitySelection
+	synWaitSynNumber uint32
+	// synWaitSendCount counts probe observations after accepted custody armed
+	// the clock. Past dialProbeMaxSends the existing UDP ambiguity budget
+	// treats the flow as a one-way stream. It is not a delivery counter.
+	// Guarded by stateLock alongside the clock it qualifies.
 	synWaitSendCount int
 
 	// dialFailedClients are the exits that have failed this flow's current
@@ -10180,46 +10191,65 @@ func dialProbeAwaitsResponse(ipPath *IpPath, sendCount int) bool {
 	return ipPath.Protocol == IpProtocolTcp || sendCount <= dialProbeMaxSends
 }
 
-// startSynWait records the first unanswered dial probe carried by a committed
-// client. It is used by the one-candidate path, where there is no response race
-// to perform this transition. An inbound packet racing the send wins and keeps
-// the flow established without arming stale failure state.
-func (self *multiClientChannelUpdate) startSynWait(client *multiClientChannel) {
+// startSynWait records a successful admission by a committed client. A late
+// producer return cannot arm a replacement selection, including A->B->A.
+// An inbound packet racing the admission keeps the flow established instead.
+func (self *multiClientChannelUpdate) startSynWait(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath) {
 	if client == nil || self.receivedInbound.Load() {
 		return
 	}
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.receivedInbound.Load() {
+	self.startSynWaitWithLock(client, selection, ipPath, time.Now())
+}
+
+// Must be called with stateLock, only after actual queue/source admission.
+// The first accepted receipt owns the clock until source-ordered SYN replay
+// starts a new generation. A refused offer never changes either boundary.
+func (self *multiClientChannelUpdate) startSynWaitWithLock(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath, admittedAt time.Time) {
+	if selection == nil || selection.client != client || self.client.loadSelection() != selection ||
+		self.IsDone() || self.receivedInbound.Load() || admittedAt.IsZero() || !dialProbePacket(ipPath) {
 		return
 	}
-	if self.synWaitClient != client || self.synWaitStart.IsZero() {
+	if self.synWaitSelection != selection || self.synWaitStart.IsZero() {
 		self.synWaitClient = client
-		self.synWaitStart = time.Now()
+		self.synWaitSelection = selection
+		self.synWaitSynNumber = ipPath.SequenceNumber
+		self.synWaitStart = admittedAt
 		self.synWaitSendCount = 1
 	}
 }
 
-// synWaitExceeded starts the connect-wait clock on the first dial probe (a
-// tcp syn or a udp handshake packet, see dialProbePacket) a given exit
-// carries for this flow, and reports whether it has run past timeout on later
-// probes through that same exit. The clock is keyed to the exit: a flow that
-// re-races restarts the wait, so each exit is judged on its own silence rather
-// than inheriting the previous one's -- otherwise the first probe through a
-// fresh exit would strike it immediately. When it trips, the clock restarts
-// for the same reason.
+// Source order alone may replace an earlier accepted SYN generation's clock.
+// The descriptor still has to own this exact provider selection.
+func (self *multiClientChannelUpdate) restartSynWaitWithLock(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath, admittedAt time.Time) {
+	if selection == nil || selection.client != client || self.client.loadSelection() != selection ||
+		self.IsDone() || self.receivedInbound.Load() || admittedAt.IsZero() || !dialProbePacket(ipPath) {
+		return
+	}
+	self.synWaitClient = client
+	self.synWaitSelection = selection
+	self.synWaitSynNumber = ipPath.SequenceNumber
+	self.synWaitStart = admittedAt
+	self.synWaitSendCount = 1
+}
+
+// synWaitExceeded observes an already accepted dial probe before collapse can
+// suppress its retransmission. Offered packets cannot initialize the clock:
+// local queue/readiness refusal is not evidence of upstream provider silence.
+// Each immutable selection and TCP generation earns its own accepted clock.
 func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, ipPath *IpPath, timeout time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	now := time.Now()
-	if self.synWaitClient != client || self.synWaitStart.IsZero() {
-		self.synWaitClient = client
-		self.synWaitStart = now
-		self.synWaitSendCount = 1
+	selection := self.client.loadSelection()
+	if client == nil || selection == nil || selection.client != client || self.synWaitSelection != selection ||
+		self.synWaitClient != client || self.synWaitStart.IsZero() || self.IsDone() || self.sourceReset.Load() || self.receivedInbound.Load() ||
+		ipPath.Protocol == IpProtocolTcp && self.synWaitSynNumber != ipPath.SequenceNumber {
 		return false
 	}
+	now := time.Now()
 	self.synWaitSendCount += 1
 	// Past an initial UDP window with nothing back this may be a one-way
 	// stream rather than a handshake -- see dialProbeMaxSends. A pure TCP SYN
@@ -10303,9 +10333,6 @@ func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32
 	}
 	// a new connect attempt is alive even after the last one was torn down
 	self.sourceReset.Store(false)
-	self.synWaitClient = self.client.Load()
-	self.synWaitStart = time.Now()
-	self.synWaitSendCount = 1
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
@@ -10324,7 +10351,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parse
 	self.commitSequenceGroupForClient(sendPacketGroup, self.client.Load())
 }
 
-func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel) {
+func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel, selections ...*multiClientAffinitySelection) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if sendPacketGroup.completionFlags.Load()&groupCompletionTracked != 0 {
@@ -10338,6 +10365,10 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		// A concurrent rebind must never inherit this old provider's proof.
 		return
 	}
+	selection := sendPacketGroup.completionSelection
+	if len(selections) != 0 {
+		selection = selections[0]
+	}
 	if self.sequenceClient != client {
 		self.sequenceCovered = false
 		self.sequenceAckPositionSeen = false
@@ -10350,6 +10381,9 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		if sendPacket.ipPath.Rst || sendPacket.ipPath.Syn &&
 			(!self.sequenceSynSeen || self.sequenceSynNumber != sendPacket.ipPath.SequenceNumber) {
 			self.resetSequenceWithLock(sendPacket)
+			if sendPacket.ipPath.Syn && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+				self.restartSynWaitWithLock(client, selection, sendPacket.ipPath, time.Now())
+			}
 			if observations := sendPacketGroup.admissionObservations; observations != nil && sendPacket.ipPath.Syn {
 				proof := &observations.synAdmission
 				if proof.update == self && proof.sequence == sendPacket.ipPath.SequenceNumber && proof.responseClient == client {
@@ -11017,6 +11051,7 @@ type parsedPacketGroup struct {
 	collapseAdmission          tcpCollapseAdmission
 	collapseOwner              *tcpCollapseGroup
 	completionClient           *multiClientChannel
+	completionSelection        *multiClientAffinitySelection
 	collapseNext               *parsedPacketGroup
 	collapseSource             *SendSequence
 	admissionTime              time.Time
@@ -17213,9 +17248,16 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	// demote it to NoAck or weaken an affirmative reliable commit.
 	ack = ipPacketTransferAckForRequest(sendPacketGroup.ipPath, ack)
 	if self.sendGroupForTest != nil {
-		return self.sendGroupForTest(sendPacketGroup, timeout, ack)
+		success, err := self.sendGroupForTest(sendPacketGroup, timeout, ack)
+		if success && err == nil {
+			sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
+		} else {
+			sendPacketGroup.completionSelection = nil
+		}
+		return success, err
 	}
 	if sendPacketGroup.affinityTransition.Load() != nil && self.stalled.Load() {
+		sendPacketGroup.completionSelection = nil
 		return false, nil
 	}
 	frames := make([]*protocol.Frame, len(sendPacketGroup.packets))
@@ -17231,6 +17273,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 				}
 			}
 			self.addError(err)
+			sendPacketGroup.completionSelection = nil
 			return false, err
 		}
 		frames[packetIndex] = frame
@@ -17242,6 +17285,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			// Stalling can change after the entry check. Synthetic success
 			// without a source owner cannot commit a reserved new generation.
 			self.addSendAbandonedGroup(sendPacketGroup)
+			sendPacketGroup.completionSelection = nil
 			for _, frame := range frames {
 				if !frame.Raw {
 					MessagePoolReturn(frame.MessageBytes)
@@ -17255,6 +17299,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			}
 			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
 		}
+		sendPacketGroup.completionSelection = nil
 		return true, nil
 	}
 
@@ -17266,6 +17311,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		if parent := update.sequenceParent; parent == nil ||
 			!parent.reuseAffinitySyn(update, self, sendPacketGroup.packets[0].ipPath) {
 			self.addSendAbandonedGroup(sendPacketGroup)
+			sendPacketGroup.completionSelection = nil
 			for _, frame := range frames {
 				if !frame.Raw {
 					MessagePoolReturn(frame.MessageBytes)
@@ -17334,6 +17380,9 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			}
 		}
 		return success, err
+	}
+	if self.sendTransferForTest != nil {
+		sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
 	}
 	for packetIndex, frame := range frames {
 		if !frame.Raw {

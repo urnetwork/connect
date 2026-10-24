@@ -80,20 +80,28 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		if !update.isProbe() {
 			key, valid := self.affinitySourceKey()
 			if !valid {
+				group.completionSelection = nil
 				update.stateLock.Unlock()
 				return false
 			}
 			group.affinitySourceRegistration = update.affinitySources.enrollWithLock(key)
 			if group.affinitySourceRegistration == 0 {
+				group.completionSelection = nil
 				update.stateLock.Unlock()
 				return false
 			}
 		}
 		if raceOrder != 0 {
+			group.completionSelection = nil
 			group.completionFlags.Or(groupCompletionCandidate | raceOrder<<16)
 			group.validateCollapseCandidateWithLock()
-		} else if update.client.Load() != self {
-			group.completionFlags.Or(groupCompletionAbandoned)
+		} else {
+			if group.completionSelection == nil {
+				group.completionSelection = update.client.loadSelection()
+			}
+			if selection := group.completionSelection; selection == nil || selection.client != self || update.client.loadSelection() != selection {
+				group.completionFlags.Or(groupCompletionAbandoned)
+			}
 		}
 		update.stateLock.Unlock()
 	}
@@ -360,6 +368,7 @@ func (self *multiClientChannelUpdate) abandonCollapseClaimsWithLock() {
 func (self *parsedPacketGroup) sendGroupAdmitted(source *SendSequence) {
 	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
+		self.completionFlags.Or(groupCompletionAdmitted)
 		return
 	}
 	update := self.collapseAdmission.update
@@ -406,6 +415,9 @@ func (self *parsedPacketGroup) observeCollapseAdmissionWithLock(sourceOrdered bo
 	}
 	for index := range self.packets {
 		path := self.packets[index].ipPath
+		if dialProbePacket(path) && self.completionFlags.Load()&groupCompletionAbandoned == 0 {
+			update.startSynWaitWithLock(self.completionClient, self.completionSelection, path, self.admissionTime)
+		}
 		if path.Syn && (!update.sequenceMetricSynSeen || update.sequenceMetricSynNumber != path.SequenceNumber) {
 			update.ackPerformance.reset()
 			update.sequenceMetricSynSeen, update.sequenceMetricSynNumber = true, path.SequenceNumber
@@ -429,6 +441,7 @@ func (self *parsedPacketGroup) observeCollapseAdmissionWithLock(sourceOrdered bo
 func (self *parsedPacketGroup) sendGroupDequeued(source *SendSequence) {
 	self.admitAffinityTransition()
 	if self.completionFlags.Load()&groupCompletionTracked == 0 {
+		self.completionFlags.Or(groupCompletionAdmitted)
 		return
 	}
 	update := self.collapseAdmission.update
@@ -651,6 +664,9 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 					tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount))
 			}
 			update.resetSequenceWithLock(packet)
+			if path.Syn {
+				update.restartSynWaitWithLock(self.completionClient, self.completionSelection, path, self.admissionTime)
+			}
 			update.sequenceTime = admittedAt
 			self.collapseAdmission.epoch = update.sequenceAdmissionEpoch
 			update.sequenceResetSourceId, update.sequenceResetOrder = sourceId, self.collapseOrder()
@@ -850,9 +866,17 @@ func (self *parsedPacketGroup) finishGroupOffer() {
 	if self.completionFlags.Load()&groupCompletionTracked != 0 {
 		update := self.collapseAdmission.update
 		update.stateLock.Lock()
+		if self.completionFlags.Load()&groupCompletionAdmitted == 0 {
+			// A refused descriptor has no source reader and may be retried.
+			self.completionSelection = nil
+		}
 		self.affinitySourceState |= affinitySourceReturned
 		self.settleAffinitySourceWithLock()
 		update.stateLock.Unlock()
+	} else {
+		// Untracked callbacks do not read the selection receipt. Their
+		// producer keeps its own exact local receipt through public return.
+		self.completionSelection = nil
 	}
 	self.releaseCollapseMemory()
 }
@@ -878,6 +902,7 @@ func (self *parsedPacketGroup) releaseCollapseMemory() {
 		update.stateLock.Unlock()
 		return
 	}
+	self.completionSelection = nil
 	var budget *TransferMemoryBudget
 	var bytes ByteCount
 	if owner := self.collapseOwner; owner != nil {
@@ -901,6 +926,9 @@ func (self *multiClientChannelUpdate) commitCollapseClaimsWithLock(client *multi
 	synPending, rstPending := state != nil && state.synOrder != 0, state != nil && state.closed && state.rstOrder != 0
 	for group := self.sequenceClaims; group != nil; group = group.collapseNext {
 		if group.completionClient == client {
+			if group.completionSelection == nil && group.completionFlags.Load()&(groupCompletionCandidate|groupCompletionAbandoned) == groupCompletionCandidate {
+				group.completionSelection = self.client.loadSelection()
+			}
 			group.observeCollapseAdmissionWithLock(group.collapseOrder() != 0)
 		}
 	}
@@ -989,6 +1017,9 @@ func (self *multiClientChannelUpdate) resetCandidateControlWithLock(client *mult
 		self.resetSynGenerationWithLock(state.synNumber, state.synEnd)
 	}
 	self.resetSequenceWithLock(&parsedPacket{ipPath: &path})
+	if syn {
+		self.restartSynWaitWithLock(client, self.client.loadSelection(), &path, state.admittedAt)
+	}
 	self.sequenceTime = admittedAt
 	self.sequenceSynSeen = false
 	self.sequenceClient, self.sequenceSourceId, self.sequenceControlOrder = client, state.sourceId, order
