@@ -276,6 +276,7 @@ func TestTcpCollapseDefaultAdmissionAndResetBoundaries(t *testing.T) {
 // connect. Silent SYN retries must still reach the guarded failure inference,
 // then acquire fresh ownership only if the replacement actually accepts them.
 func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
+	const synSequenceNumber uint32 = 100
 	assertMessagePoolOwnership(t)
 	for _, version := range []int{4, 6} {
 		for _, mode := range []string{"singleton", "batch", "mux"} {
@@ -288,7 +289,7 @@ func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
 						queue := func(calls *int, admit *bool) func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
 							return func(group *parsedPacketGroup, _ time.Duration, ack bool) (bool, error) {
 								*calls++
-								if !ack || len(group.packets) != 1 || !group.ipPath.Syn || group.ipPath.SequenceNumber != 100 {
+								if !ack || len(group.packets) != 1 || !group.ipPath.Syn || group.ipPath.SequenceNumber != synSequenceNumber {
 									t.Fatal("recovery changed the exact ACK-required SYN")
 								}
 								if admit != nil && !*admit {
@@ -316,7 +317,7 @@ func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
 							return []*multiClientChannel{replacement}
 						}
 						send := func() bool {
-							return collapseOwnershipPublicSend(t, parent, mode, path, 100, tcpFlagSyn, nil)
+							return collapseOwnershipPublicSend(t, parent, mode, path, synSequenceNumber, tcpFlagSyn, nil)
 						}
 						if !send() || oldCalls != 1 || newCalls != 0 {
 							t.Fatal("initial SYN did not acquire only the original owner")
@@ -329,7 +330,23 @@ func TestTcpCollapseLifetimeSynRecovery(t *testing.T) {
 						if scenario == "established" || scenario == "stale-inference" {
 							if scenario == "stale-inference" {
 								probe := *path
-								probe.Syn = true
+								// path is the tuple-lookup template. Only the public
+								// packet's admitted SYN owns this generation's clock.
+								probe.Syn, probe.SequenceNumber = true, synSequenceNumber
+								wrongProbe := probe
+								wrongProbe.SequenceNumber++
+								update.stateLock.Lock()
+								acceptedClock := update.synWaitStart
+								update.stateLock.Unlock()
+								if update.synWaitExceeded(original, &wrongProbe, inferredDialFailureTimeout) {
+									t.Fatal("different-ISN probe inherited an accepted SYN's stale inference")
+								}
+								update.stateLock.Lock()
+								clockPreserved := update.synWaitStart.Equal(acceptedClock)
+								update.stateLock.Unlock()
+								if !clockPreserved {
+									t.Fatal("different-ISN probe changed the admitted SYN's mature clock")
+								}
 								if !update.synWaitExceeded(original, &probe, inferredDialFailureTimeout) {
 									t.Fatal("setup did not produce a stale eligible inference")
 								}
