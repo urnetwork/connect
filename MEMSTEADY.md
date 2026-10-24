@@ -5877,3 +5877,57 @@ above; confirmation on the final integrated source remains required. The
 mandatory functional100 receipt guard separately passed 24 patched normal/race
 executions against four causal OLD failures. Explicit provider4 research remains
 manual, separate from mandatory functional recovery.
+
+## 2026-10-24: fresh canonical SDK 100-page functional replay
+
+The C13b canonical run of
+`TestFullTunH1Sdk32ServiceRefusalRecovery100Pages` passed once with
+100 HTML requests, 400 asset attempts and 99 next-navigation overlaps.
+It used `next-navigation-image-v2`, the public SDK/native TUN/H1/provider
+path, CPU8, the unchanged 300-second workload budget and five-second
+navigation target. There was no instrumentation overlay or workload retry.
+
+| All-page first-byte measurement | Result |
+| --- | ---: |
+| Median | 0.858013459 s |
+| p95, nearest rank | 2.065520583 s |
+| Maximum | 3.780069917 s |
+| Pages at or above five seconds | 0 / 100 |
+
+The original 12,288-byte CSS stream retained its TCP tuple and public owner
+through the next HTML handoff. All checked native packet entries and
+origin connection owners completed; the late constructor joined. The
+checked SDK post-join memory ownership fields were zero. Unpublished
+offers/global publication quiescence remain unknown. Packet-entry counters
+are not API-call counts and do not prove individual SYN acceptance.
+
+The v2 fixture verifies that an original image is unfinished at each
+next-navigation handoff, then releases its final 1 KiB before fetching
+the next HTML. This guarantees overlap, not native-queue backlog. Historical
+v1 runs retain their original weaker overlap meaning. This single pass is
+a functional recovery result, not a statistically qualified improvement,
+a Fast.com measurement, or proof of the cause of the reported device pauses.
+
+The fixture cohosts SDK, providers and origins. Its aggregate Go memory
+cannot qualify isolated 32 MiB iOS-profile or 64 MiB Android-profile usage.
+Those physical-device startup/active/quiet/teardown checks remain pending;
+actual iOS extension total physical footprint is also unqualified.
+
+Source: Connect `15bdd250f22976923e4b7f6bd7366eab859fe584`,
+SDK `3bd24c6865ff92dc61bf764465cf60775134a304`,
+Server `936c63f651444797775a7b44a76a6088b375c546`,
+Tests `4ba46b48426831831173103811152a67dae80504`; whole-source fingerprint
+`6d1a60145c675d44176cdf5969f2d1a3714025517ba7d6860fcb470f74b7f464`.
+Actual root RUN 17:03:53.881705 UTC; PASS 17:07:19.598488 UTC.
+One root RUN/PASS, zero FAIL/SKIP; root elapsed 205.72 s.
+
+Evidence owner: `h1-disjoint-controls.PREP.7tk80_6o/c13b-sdk100-once.PREP._rdr6c11`
+under the retained current112 evidence root.
+`C13B-SDK100-MEASUREMENTS.json` SHA-256:
+`aac7ff9e7342289adf2ab741253920287d5e057af543332e7cf48abdef1a9622`.
+Raw Go JSON SHA-256:
+`fa9d7608905f6e5419386db698a83fa4dc32b822b88857d70b073d8454ca7124`.
+Final all-joined custody receipt SHA-256:
+`b2e5e5c1a4864f242f439e6458913421e403a277c5a704c224548e2235da8644`.
+Full correctness and complete simulator/benchmark/device qualification
+remain open; no performance baseline is promoted.
