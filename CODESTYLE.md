@@ -82,6 +82,12 @@ actually use.
 - No AI attribution in commit messages, in any repository: no `Co-authored-by:` trailer for anyone, no "Generated with" footer or other trailer that names an AI tool, no AI tool's noreply address, and no AI session or task link. Commits that already have one stay as they are; history is not rewritten (owner decision, 2026-10-14).
 - `.githooks/commit-msg` rejects such a message. Install it once per clone, and its worktrees share it: `git config core.hooksPath .githooks`, or, in a clone that keeps git-lfs or gofmt hooks in `.git/hooks`, a copy at `.git/hooks/commit-msg`. Do not use `--no-verify` to get past it. `.githooks/commit-msg --scan <git log arguments>` lists commits that reached a branch without the check.
 
+## Database migrations and deploy order
+
+- **Migrations apply before any code deployment.** `bringyourctl db migrate` runs while the previous release still serves, and a new release's startup readiness requires the schema head. So every migration must work with the release that is running when it applies. It may add tables, columns, indexes, functions and permissive guards. It may not drop or narrow anything the running release reads or writes, and it may not bound the running release's work (a role default such as `transaction_timeout`) before that release honors the bound.
+- **Destructive changes are post-deployment cleanup migrations.** Dropping a table, column, index, trigger or guard the previous release uses, tightening a constraint, or bounding long work belongs in a later cleanup migration. Merge it only once every running job that reads or writes the database (api, connect, taskworker, alt, proxy, gossip, mcp, monitor) runs a release that no longer depends on what it removes.
+- **Prove compatibility against the running release before migrating.** Plan the running release's real query shapes (from `pg_stat_statements`) against a schema migrated to head with sequential scans disabled, and check dropped objects, new guards and session defaults against its code paths. When a pending migration is not compatible, fix the running release first, or split the migration into an additive part and a cleanup.
+
 ## Routing keys
 
 A routing key is a value that decides *which* instance of something a message belongs to: the sequence lane (`Pack.force_stream` / `Pack.companion_contract`), the session role and identity companion (`TransferFrame.session_role` / `session_companion`), the handshake generation (`EncryptedControl.epoch_id`). Adding one is never a single-site change.
