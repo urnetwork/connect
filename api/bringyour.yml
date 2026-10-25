@@ -297,6 +297,33 @@ paths:
         "503":
           description: The clock has not completed its initial block-9 backfill.
 
+  /health:
+    get:
+      tags: [Other]
+      summary: Network Health
+      description: |
+        The public health status of the network, as the ur.io status pill and
+        banner show it. `status` is `healthy`; one of `degraded`, `partial`,
+        `major` or `full`, the level an operator set while fixing a problem;
+        or `unknown` when the status cannot be read. A level other than
+        healthy carries `reason`, one line of public text, and `since` and
+        `updated`: when the network left healthy and when the level or reason
+        last changed. No other field is set.
+
+        Each API process keeps a status it read for 10 seconds. A known
+        status may be cached for 30 seconds (`Cache-Control: public,
+        max-age=30`); unknown is not cached. This is not a readiness check:
+        `/status` is.
+      operationId: networkHealth
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkHealthResult"
+
   /stats/last-90:
     get:
       tags: [Stats]
@@ -9065,6 +9092,35 @@ components:
           type: string
           format: date-time
           description: UTC start time of since_block.
+
+    NetworkHealthResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, partial, major, full, unknown]
+          description: |
+            `healthy`, a level an operator set (`degraded`, `partial`,
+            `major`, `full`, mildest first), or `unknown` when the status
+            cannot be read.
+        reason:
+          type: string
+          maxLength: 160
+          description: |
+            What is wrong, as one line of public text. Set for a level other
+            than healthy.
+        since:
+          type: string
+          format: date-time
+          description: |
+            When the network left healthy, in UTC. A change of level or reason
+            keeps it.
+        updated:
+          type: string
+          format: date-time
+          description: When the level or reason last changed, in UTC.
 
     ProvideMode:
       type: integer

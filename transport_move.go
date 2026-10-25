@@ -7,8 +7,9 @@ package connect
 // move's replacement gets its move's targets of the transport's family: a
 // strict (advisory) move on every attempt until the owner concludes the move,
 // and a compulsory move on the first attempt of each carrier. Otherwise a
-// preference an earlier move left is tried. The targets reach the dial layers
-// the transport does not own through the dial context
+// preference an earlier move left is tried, and otherwise the edge the client's
+// placement chose, with or without moves (platform_placement.go). The targets
+// reach the dial layers the transport does not own through the dial context
 // (`moveDialOverrideContextKey`), the same route the pinned family takes:
 // `ConnectSettings.DialContext` dials the target literals in place of the
 // hostname, so the TLS server name and the HTTP host, both decided above that
@@ -35,6 +36,8 @@ package connect
 
 import (
 	"context"
+	"net/netip"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -42,8 +45,10 @@ import (
 // One dial attempt that stands move targets in for the platform host.
 type platformMoveDialAttempt struct {
 	override *moveDialOverride
-	// the move whose replacement dials, nil for a preference
-	dial      *ResidentMoveDial
+	// the move whose replacement dials, nil for a preference or a placement
+	dial *ResidentMoveDial
+	// the targets are the client's placement (platform_placement.go)
+	placement bool
 	startTime time.Time
 	// set by the dial layer that applied the override
 	used          atomic.Bool
@@ -51,11 +56,13 @@ type platformMoveDialAttempt struct {
 }
 
 // The targets one dial attempt uses in place of resolving the platform host,
-// nil to resolve it as usual. `targetAttempted` is whether this carrier already
+// nil to resolve it as usual: with moves enabled, a move's targets, then a
+// move's preference; then, with or without moves, the client's placement
+// (platform_placement.go). `targetAttempted` is whether this carrier already
 // made its one attempt for a move that is not strict. Only the H1 and plain H3
 // carriers ask.
 func (self *PlatformTransport) moveDialAttempt(targetAttempted bool) *platformMoveDialAttempt {
-	if !self.settings.EnableMove {
+	if !self.settings.EnableMove && self.settings.Placement == nil {
 		return nil
 	}
 	host, err := connectHost(self.platformUrl)
@@ -63,27 +70,78 @@ func (self *PlatformTransport) moveDialAttempt(targetAttempted bool) *platformMo
 		return nil
 	}
 	now := time.Now()
-	if targetIps, strict, ok := self.residentMoveDial.targetIpsFor(self.ipFamily); ok && (strict || !targetAttempted) {
-		return &platformMoveDialAttempt{
-			override: &moveDialOverride{
-				host:      host,
-				targetIps: targetIps,
-				strict:    strict,
-			},
-			dial:      self.residentMoveDial,
-			startTime: now,
+	if self.settings.EnableMove {
+		if targetIps, strict, ok := self.residentMoveDial.targetIpsFor(self.ipFamily); ok && (strict || !targetAttempted) {
+			return &platformMoveDialAttempt{
+				override: &moveDialOverride{
+					host:      host,
+					targetIps: targetIps,
+					strict:    strict,
+				},
+				dial:      self.residentMoveDial,
+				startTime: now,
+			}
+		}
+		if targetIps := self.residentMoveTracker.preferredTargetIps(host, self.ipFamily, now); 0 < len(targetIps) {
+			return &platformMoveDialAttempt{
+				override: &moveDialOverride{
+					host:      host,
+					targetIps: targetIps,
+				},
+				startTime: now,
+			}
 		}
 	}
-	if targetIps := self.residentMoveTracker.preferredTargetIps(host, self.ipFamily, now); 0 < len(targetIps) {
+	if targetIps := self.placementTargetIps(host, now); 0 < len(targetIps) {
 		return &platformMoveDialAttempt{
 			override: &moveDialOverride{
 				host:      host,
 				targetIps: targetIps,
 			},
+			placement: true,
 			startTime: now,
 		}
 	}
 	return nil
+}
+
+// The placed addresses of this transport's family for a dial of `host`: the
+// client's kept placement, else the placement's answer less the addresses held
+// after a failed dial, which the client then keeps for every family offered
+// for `PlacementPreferDuration`. None without a placement or an address to
+// dial, which resolves the name.
+func (self *PlatformTransport) placementTargetIps(host string, now time.Time) []netip.Addr {
+	placement := self.settings.Placement
+	if placement == nil {
+		return nil
+	}
+	if targetIps := self.residentMoveTracker.placedTargetIps(host, self.ipFamily, now); 0 < len(targetIps) {
+		return targetIps
+	}
+	offeredIps := []netip.Addr{}
+	for _, targetIp := range placement.PlatformPlacementTargets(host) {
+		targetIp = targetIp.Unmap()
+		if !targetIp.IsValid() || targetIp.IsUnspecified() {
+			continue
+		}
+		if self.residentMoveTracker.TargetFailedWithin(targetIp, self.settings.PlacementFailHold, now) {
+			continue
+		}
+		offeredIps = append(offeredIps, targetIp)
+	}
+	if len(offeredIps) == 0 {
+		return nil
+	}
+	if 0 < self.settings.PlacementPreferDuration {
+		self.residentMoveTracker.placeTargets(host, offeredIps, now.Add(self.settings.PlacementPreferDuration))
+	}
+	targetIps := []netip.Addr{}
+	for _, targetIp := range offeredIps {
+		if self.ipFamily == 0 || netipAddrFamily(targetIp) == self.ipFamily {
+			targetIps = append(targetIps, targetIp)
+		}
+	}
+	return orderDialAddrs(targetIps)
 }
 
 // The dial context of the attempt: the override for the dial layers, and for a
@@ -124,8 +182,11 @@ func (self *platformMoveDialAttempt) dialedTargets() bool {
 
 // Reports a failed attempt that dialed its targets. A move's dial counts it (in
 // `mode`) and a preference is dropped, so the next attempt resolves the name. A
-// dial canceled by the transport's own teardown or a network change is no
-// failure of the target; the caller does not report it.
+// placement is dropped, its addresses held for `PlacementFailHold` and the
+// placement told, so the next attempt asks again and resolves the name when
+// every address offered is held. A dial canceled by the transport's own
+// teardown or a network change is no failure of the target; the caller does
+// not report it.
 func (self *PlatformTransport) noteMoveDialFailed(
 	attempt *platformMoveDialAttempt,
 	mode TransportMode,
@@ -135,6 +196,16 @@ func (self *PlatformTransport) noteMoveDialFailed(
 		return
 	}
 	now := time.Now()
+	if attempt.placement {
+		self.residentMoveTracker.dropPlacedTargets(attempt.override.host, attempt.override.targetIps)
+		for _, targetIp := range attempt.override.targetIps {
+			self.residentMoveTracker.NoteTargetFailed(targetIp, now)
+		}
+		if placement := self.settings.Placement; placement != nil {
+			placement.PlatformPlacementFailed(attempt.override.host, slices.Clone(attempt.override.targetIps))
+		}
+		return
+	}
 	if attempt.dial == nil {
 		self.residentMoveTracker.dropPreferredTargets(attempt.override.host, attempt.override.targetIps)
 		return

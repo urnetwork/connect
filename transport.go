@@ -747,6 +747,21 @@ type PlatformTransportSettings struct {
 	// move (resident_move.go). An owner sets it on the replacement's own copy
 	// of the settings only.
 	ResidentMoveDial *ResidentMoveDial
+	// Chooses the edge this transport dials when no move target or preference
+	// applies, for a client that runs on the platform and reads its edge load
+	// (platform_placement.go). Applies with or without `EnableMove`. Nil
+	// resolves the platform host.
+	Placement PlatformPlacement
+	// How long the client keeps the edge a placement chose, so its transports
+	// and reconnects return to the edge that holds its resident. Six hours by
+	// default, the move preference's duration. Non-positive keeps none: every
+	// dial asks the placement.
+	PlacementPreferDuration time.Duration
+	// How long a placed address whose dial failed is not dialed for a
+	// placement again. Ten minutes by default: long enough that a broken edge
+	// interface does not cost every reconnect a failed dial, short enough that
+	// a repaired one is used again. Non-positive holds none.
+	PlacementFailHold time.Duration
 
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
@@ -855,6 +870,9 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		MoveTargetFailHold:    1 * time.Hour,
 		MoveClientMinInterval: 30 * time.Minute,
 		MoveIdDedupeCount:     32,
+
+		PlacementPreferDuration: 6 * time.Hour,
+		PlacementFailHold:       10 * time.Minute,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
