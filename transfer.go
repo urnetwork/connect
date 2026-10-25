@@ -6578,6 +6578,14 @@ func (self *SendBuffer) cancelDestinationAndWait(destinationId Id) {
 	}
 }
 
+// Admission closes permanently, even while the owning Client is still live.
+// Retry owners consult this only after an enqueue error.
+func (self *SendBuffer) admissionClosed() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.closed
+}
+
 func (self *SendBuffer) Close() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -7076,18 +7084,19 @@ func newSendSequenceWithLogicalLane(
 		packAdmission:                  newSendPackAdmission(sequenceBufferSize),
 		ackWindow:                      newSequenceAckWindow(),
 		resendQueue:                    newResendQueue(resendQueueBudget, resendQueueMinByteCount),
-		sendItems:                      []*sendItem{},
-		nextSequenceNumber:             0,
-		flightController:               newSendFlightController(sendBufferSettings),
-		idleCondition:                  NewIdleCondition(),
-		rttWindow:                      rttWindow,
-		windowPacer:                    windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
-		contractSeqIndex:               0,
-		peerCapabilityRecorder:         client.peerCapabilityRecorder,
+		// Immutable before publication; legacy control leases reuse this wake.
+		retainedAdmissionWake:  make(chan struct{}, 1),
+		sendItems:              []*sendItem{},
+		nextSequenceNumber:     0,
+		flightController:       newSendFlightController(sendBufferSettings),
+		idleCondition:          NewIdleCondition(),
+		rttWindow:              rttWindow,
+		windowPacer:            windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
+		contractSeqIndex:       0,
+		peerCapabilityRecorder: client.peerCapabilityRecorder,
 	}
 	if sendBufferSettings.ResendQueueRetainedByteAccounting {
 		seq.resendQueue.setLifetimeBudget()
-		seq.retainedAdmissionWake = make(chan struct{}, 1)
 	}
 	// Never encrypt control-plane traffic. A SendSequence's data source is
 	// always this client (sourceId == client.ClientId()) and its destination
@@ -11142,6 +11151,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	}
 	ownDisposition = false
 	disposition.complete(ack)
+	disposition.retainSynRetry(self, sendFrames)
 	// Report source ownership before pool return, still synchronously and
 	// before any observer or writer. No deferred frame slice is retained.
 	ownFrames = false

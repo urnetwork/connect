@@ -59,6 +59,8 @@ type SubprotocolCodec[T any] interface {
 	// buffer and a copy, which the stats count as an overrun.
 	Size(m T) int
 	// Appends the encoding of m to b (cap(b)-len(b) >= Size(m)) and returns it.
+	// The caller owns the returned buffer on success and error; m remains
+	// borrowed. The returned bytes preserve b's existing prefix.
 	MarshalAppend(b []byte, m T) ([]byte, error)
 	// Decodes b into m. b is borrowed for the call and must not be retained.
 	Unmarshal(b []byte, m T) error
@@ -90,6 +92,7 @@ var (
 	errSubprotocolCodecType     = errors.New("subprotocol codec message type does not match")
 	errSubprotocolControl       = errors.New("the control id speaks only the top-level protocol")
 	errSubprotocolNegativeSize  = errors.New("subprotocol codec reported a negative size")
+	errSubprotocolShortEncoding = errors.New("subprotocol codec discarded the wrapper header")
 	errSubprotocolQueryNoResult = errors.New("subprotocols query got no result")
 )
 
@@ -144,22 +147,31 @@ func marshalSubprotocol[T any](codec SubprotocolCodec[T], subprotocolId Subproto
 		return nil, false, errSubprotocolNegativeSize
 	}
 	buf := MessagePoolGet(subprotocolHeaderSize(subprotocolId, n) + n)
-	b := appendSubprotocolHeader(buf[:0], subprotocolId, n)
+	// A codec may misreport Size. Its append must not reach pool metadata.
+	b := appendSubprotocolHeader(buf[:0:cap(buf)-MessagePoolMetaByteCount], subprotocolId, n)
 	headerLen := len(b)
 	b, err = codec.MarshalAppend(b, m)
-	if err != nil {
+	sameBuffer := 0 < cap(b) && &b[:1][0] == &buf[0]
+	if err != nil || len(b) < headerLen {
 		MessagePoolReturn(buf)
+		if !sameBuffer {
+			MessagePoolReturn(b)
+		}
+		if err == nil {
+			err = errSubprotocolShortEncoding
+		}
 		return nil, false, err
 	}
 	written := len(b) - headerLen
-	if written == n && cap(b) == cap(buf) {
-		return b, false, nil
+	if written == n && sameBuffer {
+		// Restore the full pooled view clipped before the codec's append.
+		return buf[:len(b)], false, nil
 	}
-	// the codec wrote a different length than it sized, or grew past the
+	// the codec wrote a different length than it sized, or replaced the
 	// buffer: re-wrap with the true length so the prefix is right
 	out = wrapSubprotocolBytes(subprotocolId, b[headerLen:])
 	MessagePoolReturn(buf)
-	if cap(b) != cap(buf) {
+	if !sameBuffer {
 		MessagePoolReturn(b)
 	}
 	return out, true, nil

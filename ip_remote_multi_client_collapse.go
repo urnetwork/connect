@@ -108,6 +108,7 @@ func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientC
 	if (!established || control.syn) && client != nil && client.beforeFirstAnswerMarkForTest != nil {
 		client.beforeFirstAnswerMarkForTest(update)
 	}
+	defer update.releaseSynRetryMemory()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	return update.markReceivedInboundWithLock(client, control)
@@ -133,6 +134,7 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 		update.synGenerationAwaiting = false
 	}
 	update.observeTcpRecoveryAckWithLock(client, control)
+	update.clearSynRetryWithLock()
 	return update.receivedInbound.CompareAndSwap(false, true)
 }
 

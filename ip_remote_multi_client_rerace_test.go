@@ -75,6 +75,8 @@ type reraceExitSpec struct {
 	tier   int
 	// answer decides each SYN (and each udp datagram); nil accepts all
 	answer func(path *IpPath) reraceAnswer
+	// Optional source settings are applied before real Client construction.
+	clientSettings func(*ClientSettings)
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -345,6 +347,9 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 		return nil, errors.New("client args were not minted for a destination")
 	}
 
+	if exit.clientSettings != nil {
+		exit.clientSettings(clientSettings)
+	}
 	client := NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings)
 	routeSend := make(chan []byte)
 	routeReceive := make(chan []byte)

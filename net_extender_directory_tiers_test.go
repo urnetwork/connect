@@ -482,15 +482,14 @@ func TestExtenderVantageKeyIsThePrefix(t *testing.T) {
 	}
 }
 
-// A gated fleet of `count` keys, hex and sorted.
+// A seeded gated fleet, hex and sorted, with its population pinned per partition.
 func testGatedKeyHexes(t *testing.T, count int) []string {
 	t.Helper()
-	keyHexes := []string{}
-	for range count {
-		keyHexes = append(keyHexes, hex.EncodeToString(newTestExtenderKey(t)))
+	partitionSizes := make([]int, ExtenderPartitionCount(count))
+	for index := range count {
+		partitionSizes[index%len(partitionSizes)]++
 	}
-	slices.Sort(keyHexes)
-	return keyHexes
+	return testGatedKeyHexesByPartition(t, partitionSizes)
 }
 
 // One policy over a memory ledger with the fake clock and the test secret.

@@ -63,7 +63,7 @@ func (self *ControlSync) startWorker(run func()) bool {
 func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protocol.Frame, ackCallback AckFunction) {
 	// 1. try to send non-blocking
 	// 2. if fails, send blocking with no timeout
-	// 3. keep retying on error until the handle context or client is closed
+	// 3. retry errors while the handle, Client and send admission remain live
 
 	safeAckCallback := func(err error) {
 		if ackCallback != nil {
@@ -206,16 +206,22 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 				return
 			}
 			if err != nil {
-				// only stop when the context or client is done
+				// A closed buffer cannot admit a later retry, even while its
+				// Client remains live. Other errors retain the normal retry policy.
+				terminal := false
 				select {
 				case <-handleCtx.Done():
-					MessagePoolReturn(frame.MessageBytes)
-					return
+					terminal = true
 				case <-self.client.Done():
-					MessagePoolReturn(frame.MessageBytes)
+					terminal = true
+				default:
+				}
+				if terminal || self.client.sendBuffer.admissionClosed() {
+					// Replacing an update already returned the previous base.
+					// This generation still owns the current frame.
+					MessagePoolReturn(updatedFrame.MessageBytes)
 					handleCancel()
 					return
-				default:
 				}
 			}
 			// else try again

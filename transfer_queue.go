@@ -102,6 +102,11 @@ type transferQueue[T transferQueueItem] struct {
 	floorRegistered   bool
 	lifetimeBudget    bool
 
+	// Optional retained controls share this queue's existing local window.
+	// Their detached ledger never holds a queue or source back-reference.
+	retainedControl       *transferQueueRetainedControl
+	retainedControlClosed bool
+
 	cmp TransferQueueCmpFunction[T]
 }
 
@@ -251,7 +256,7 @@ func (self *transferQueue[T]) CanAddWithQueueByteCountAndCredit(
 	if len(self.orderedItems) == 0 && !self.lifetimeBudget {
 		return true
 	}
-	if !transferQueueWindowAdmits(self.byteCount, byteCount, maxByteCount) {
+	if !transferQueueWindowAdmits(self.windowByteCountWithLock(), byteCount, maxByteCount) {
 		return false
 	}
 	if self.budget == nil {
@@ -291,6 +296,8 @@ func (self *transferQueue[T]) Clear() []T {
 	clear(self.messageIdItems)
 	clear(self.sequenceNumberItems)
 	self.updateByteCountWithLock(-self.byteCount, -self.queueByteCount)
+	// Outstanding control leases release independently after teardown.
+	self.retainedControlClosed = true
 	// Teardown drops the queue wholesale, so its guaranteed floor is no longer
 	// spoken for and the pool may lend those bytes to the queues that remain.
 	if self.budget != nil && self.floorRegistered {

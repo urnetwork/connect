@@ -1635,6 +1635,11 @@ type RemoteUserNatMultiClient struct {
 	// flow, which otherwise makes short-lived web traffic grow the tunnel's
 	// runtime footprint for the full (intentionally long) TCP idle timeout.
 	flowReaperWake chan struct{}
+	flowReaperDone chan struct{}
+	// Pending SYN retries use the existing parent worker and intrusive owners.
+	synRetryHead                  *tcpSynRetry
+	synRetryTail                  *tcpSynRetry
+	beforeSynRetryDispatchForTest func(*multiClientChannelUpdate)
 
 	settings *MultiClientSettings
 	log      Logger
@@ -1799,8 +1804,9 @@ type RemoteUserNatMultiClient struct {
 	priorsStore atomic.Pointer[PriorsStore]
 	// Nil test seams make whole-group candidate admission deterministic without
 	// changing production selection or adding synchronization to the send path.
-	groupRaceCandidatesForTest func(*parsedPacketGroup) []*multiClientChannel
-	sendClientPathForTest      func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	groupRaceCandidatesForTest   func(*parsedPacketGroup) []*multiClientChannel
+	sendClientPathForTest        func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	beforePacketGroupGateForTest func(*multiClientChannelUpdate, *multiClientChannel, *parsedPacketGroup)
 	// Runs after preliminary donor checks, before the final health snapshot.
 	beforeAffinityAdoptionForTest func(*multiClientChannel)
 	// backendDegradedForTest replaces the process-wide isBackendDegraded read
@@ -2673,6 +2679,7 @@ func NewRemoteUserNatMultiClient(
 		packetStatsCallbacks:       NewCallbackList[PacketStatsFunction](),
 		reliabilityMetrics:         newReliabilityMetrics(),
 		flowReaperWake:             make(chan struct{}, 1),
+		flowReaperDone:             make(chan struct{}),
 	}
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
@@ -4889,11 +4896,21 @@ func stopFlowReaperTimer(timer *time.Timer) {
 }
 
 func (self *RemoteUserNatMultiClient) runFlowReaper() {
+	defer func() {
+		self.discardSynRetries()
+		if self.flowReaperDone != nil {
+			close(self.flowReaperDone)
+		}
+	}()
 	timer := time.NewTimer(time.Hour)
 	stopFlowReaperTimer(timer)
 	defer timer.Stop()
 
 	for {
+		self.drainSynRetries()
+		if self.ctx.Err() != nil {
+			return
+		}
 		retired, nextDelay, hasNext := self.detachIdleFlows(time.Now())
 		self.finishRetiredFlows(retired)
 		if 0 < len(retired) {
@@ -5303,6 +5320,7 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 // migrate; their own re-race already covers them), and rebindable flows with
 // no live under-cap replacement -- keeps the teardown-with-signal behavior.
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
+	var synRetryReleases []*multiClientChannelUpdate
 	// Replacement candidates are gathered BEFORE the parent-locked section.
 	// The gather reads each window's ordered offer (the window's own lock)
 	// and each candidate's stats clock (the channel's lock, heavyweight
@@ -5417,9 +5435,15 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		teardownUpdates = append(teardownUpdates, unplaced...)
 
 		for _, update := range teardownUpdates {
+			update.stateLock.Lock()
 			update.discoveryAttemptStamp.Add(1)
 			update.sourceReset.Store(true)
+			update.clearSynRetryWithLock()
 			update.client.Store(nil)
+			if update.synRetryReleased.Load() != nil {
+				synRetryReleases = append(synRetryReleases, update)
+			}
+			update.stateLock.Unlock()
 
 			// the update's ipPath is egress-oriented, so the remote
 			// endpoint the user is waiting on is the destination.
@@ -5445,6 +5469,10 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			}
 		}
 	}()
+
+	for _, update := range synRetryReleases {
+		update.releaseSynRetryMemory()
+	}
 
 	// recorded outside stateLock -- the metrics take their own lock, and
 	// nesting them under the parent lock would put the recovery tracker on the
@@ -7233,6 +7261,19 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 	sendPacket *parsedPacket,
 	update *multiClientChannelUpdate,
 	currentClient *multiClientChannel,
+) bool {
+	if sendPacket.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention {
+		return true
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	return self.canSendPacketWithLock(sendPacket, update, currentClient)
+}
+
+func (self *RemoteUserNatMultiClient) canSendPacketWithLock(
+	sendPacket *parsedPacket,
+	update *multiClientChannelUpdate,
+	currentClient *multiClientChannel,
 ) (allow bool) {
 	ipPath := sendPacket.ipPath
 	switch ipPath.Protocol {
@@ -7256,12 +7297,12 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 			// optional positive hold below preserves the timed-escape policy.
 			if ipPath.Rst {
 				allow = true
-			} else if update.canUpdateSequenceForClient(sendPacket, currentClient) {
+			} else if update.canUpdateSequenceForClientWithLock(sendPacket, currentClient, true) {
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
 			} else if tcpCollapseMaxHold := self.reliabilitySettings().TcpCollapseMaxHold; 0 < tcpCollapseMaxHold &&
-				update.releaseSequenceHold(tcpCollapseMaxHold) {
+				update.releaseSequenceHoldWithLock(tcpCollapseMaxHold) {
 				// Explicit positive overrides permit an aged duplicate. This
 				// read-only offer does not consume the escape on queue refusal.
 				allow = true
@@ -7275,19 +7316,51 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 	return
 }
 
-// Applies collapse prevention once to a group. If any member can advance the
-// flow, the whole ordered group stays intact; a fully redundant group drops.
+// Compatibility callers supply an explicit owner. All members still share
+// one flow lock; production selection uses the receipt-returning gate below.
 func (self *RemoteUserNatMultiClient) canSendPacketGroup(
-	sendPacketGroup *parsedPacketGroup,
+	group *parsedPacketGroup,
 	update *multiClientChannelUpdate,
-	currentClient *multiClientChannel,
+	client *multiClientChannel,
 ) bool {
-	for packetIndex := range sendPacketGroup.packets {
-		if self.canSendPacket(&sendPacketGroup.packets[packetIndex], update, currentClient) {
+	if group.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention {
+		return len(group.packets) != 0
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	for index := range group.packets {
+		if self.canSendPacketWithLock(&group.packets[index], update, client) {
 			return true
 		}
 	}
 	return false
+}
+
+// Applies collapse prevention once to a group. If any member can advance the
+// flow, the whole ordered group stays intact; a fully redundant group drops.
+func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
+	sendPacketGroup *parsedPacketGroup,
+	update *multiClientChannelUpdate,
+) (*multiClientAffinitySelection, bool) {
+	if (sendPacketGroup.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention) && !sendPacketGroup.isSynRetry() {
+		return update.client.loadSelection(), len(sendPacketGroup.packets) != 0
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	selection := update.client.loadSelection()
+	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || update.race != nil) {
+		return selection, false
+	}
+	var currentClient *multiClientChannel
+	if selection != nil {
+		currentClient = selection.client
+	}
+	for packetIndex := range sendPacketGroup.packets {
+		if self.canSendPacketWithLock(&sendPacketGroup.packets[packetIndex], update, currentClient) {
+			return selection, true
+		}
+	}
+	return selection, false
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -7355,7 +7428,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	completeObservations bool,
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
-	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress
+	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress || sendPacketGroup.isSynRetry()
 	if nativeIngress {
 		// This is a ready offer, not a shorter delivery or recovery deadline.
 		timeout = 0
@@ -7383,10 +7456,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		defer update.releaseCollapseClaims()
 		sentUpdate = update
 		enterTime := time.Now()
-		for packetIndex := range sendPacketGroup.packets {
-			update.noteConnectAttempt(sendPacketGroup.packets[packetIndex].ipPath)
+		if !sendPacketGroup.isSynRetry() {
+			for packetIndex := range sendPacketGroup.packets {
+				path := sendPacketGroup.packets[packetIndex].ipPath
+				update.noteConnectAttempt(path)
+				if path.Protocol == IpProtocolTcp && path.Syn && !path.Ack {
+					sendPacketGroup.prepareSynRetry(source, provideMode, self, update, path)
+				}
+			}
+			self.requestDiscoveryForSourceSyn(update, ipPath)
 		}
-		self.requestDiscoveryForSourceSyn(update, ipPath)
 
 		// Client-side dial-failure inference. A connection attempt
 		// retransmitting on an exit that has answered nothing is the silent
@@ -7425,7 +7504,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				sendPacketGroup.affinitySynReuse = false
 			}
 		}
-		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
+		if self.beforePacketGroupGateForTest != nil {
+			self.beforePacketGroupGateForTest(update, currentClient, sendPacketGroup)
+		}
+		gateSelection, canSend := self.canSendPacketGroupSelection(sendPacketGroup, update)
+		if gateSelection == nil || gateSelection.client != currentClient {
+			sendPacketGroup.affinitySynReuse = false
+		}
+		currentClient = nil
+		if gateSelection != nil {
+			currentClient = gateSelection.client
+		}
+		if !canSend {
 			if batchAdmission != nil {
 				batchAdmission.stop = true
 			}
@@ -7451,14 +7541,31 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// transition. Provider selection also calls this helper when its original
 		// nil snapshot becomes stale because another sender committed the flow.
 		sendBoundClient := func(client *multiClientChannel, sendTimeout time.Duration) bool {
-			if client == nil {
+			selection := update.client.loadSelection()
+			if selection != gateSelection {
+				selection, canSend = self.canSendPacketGroupSelection(sendPacketGroup, update)
+				gateSelection = selection
+				sendPacketGroup.affinitySynReuse = false
+			}
+			if selection == nil {
 				return false
 			}
-			selection := update.client.loadSelection()
+			if !canSend {
+				if batchAdmission != nil {
+					batchAdmission.stop = true
+				}
+				self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
+				return true
+			}
+			client = selection.client
 			sendPacketGroup.completionSelection = selection
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
+			if !success && err == nil && update.client.loadSelection() != selection {
+				sendPacketGroup.affinitySynReuse = false
+				return false
+			}
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
 				update.commitSequenceGroupForClient(sendPacketGroup, client, selection)
@@ -7501,11 +7608,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 					update.discoveryAttemptStamp.Add(1)
 					update.sourceReset.Store(true)
+					update.clearSynRetryWithLock()
 					return true
 				}()
 				if !unbound {
 					return true
 				}
+				update.releaseSynRetryMemory()
 
 				self.log.Infof("[multi]reset error = %s\n", err)
 
@@ -7891,7 +8000,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						}
 					}
 					benchedField := false
-					if preferHealthyWindows {
+					if preferHealthyWindows || sendPacketGroup.isSynRetry() {
 						if healthy := healthyCrossWindowCandidates(orderedClients); 0 < len(healthy) {
 							orderedClients = healthy
 						} else {
@@ -7923,6 +8032,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						// narrows it. See scoredPlacementReorder.
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
+					if sendPacketGroup.isSynRetry() && (benchedField || self.destinationServiceFailuresExhausted(orderedClients, ipPath)) {
+						continue
+					}
 					if 0 < len(orderedClients) {
 						// Prefer ordinary healthy offers across permitted windows.
 						// Retain healthy service-failed and benched fields only
@@ -7944,6 +8056,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						}
 					}
 				}
+			}
+			if sendPacketGroup.isSynRetry() {
+				return nil
 			}
 			if failedFallback != nil {
 				return failedFallback
@@ -9158,8 +9273,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // destination-unreachable whose embed named the flow, accepted by the channel
 // only as the exact packet a provider builds for that flow
 // (providerDialFailureEgressPath). The provider could not open the upstream
-// for that flow and answered at once instead of going silent, so the source is
-// not left in syn-retransmit backoff. Only providers whose return path passes
+// for that flow and answered at once instead of going silent. An unanswered TCP
+// SYN with retained credit can retry on the existing parent worker; otherwise
+// ordinary native retries remain the fallback. Only providers whose return path passes
 // their own signal send it (IPV6.md C7), and current ones only for a dial that
 // failed at once. signaled is false for the send-path silence inference, where
 // nothing arrived: a flow retransmitting on an exit that has answered nothing.
@@ -9169,8 +9285,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // a flow still waiting on its first upstream connect, not an established one a
 // late or stale signal happens to name. When those hold and DialFailureRerace
 // is on, it unbinds the flow (the removeClient per-update idiom, minus teardown
-// and minus cancelling the update) so the application's own retransmit re-races
-// it onto another exit within ~1s. A signal can also land while the flow is
+// and minus cancelling the update). A credited unanswered TCP SYN can then
+// retry on the existing parent worker; later native traffic remains the fallback.
+// A signal can also land while the flow is
 // still racing, before a race commits it (the send has not even returned when
 // a provider fails the dial at once): with the re-race on, the exit is then
 // taken out of the race, with its strike and its service failure, so the
@@ -9262,9 +9379,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		// with the re-race on, unbind exactly like removeClient does
 		// per-update, minus teardown and minus cancelling the update: clear
 		// its client pointer (inside dialFailureStanding) and drop it from the
-		// client's flow set. The flow's own next retransmit (SYN ~1s, QUIC
-		// PTO, DNS retry) then sees a nil client in sendPacket and races a
-		// fresh exit.
+		// client's flow set. A later outbound packet sees nil and races a
+		// fresh exit. Retained unanswered TCP SYNs additionally schedule a
+		// bounded explicit-failure retry outside these owner locks.
 		standing, firstFromExit = update.dialFailureStanding(sourceClient, rerace, signaled, rerace)
 		if standing == dialFailureStale {
 			return
@@ -9313,6 +9430,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		self.requestDiscoveryForFailedAttempt(signaledUpdate, sourceClient, egressIpPath)
 	}
 
+	if rerace && signaled && firstFromExit {
+		self.enqueueSynRetry(signaledUpdate)
+	}
 	if standing == dialFailureWithdrawn {
 		// the race goes on without the exit, or, left empty, ends so the
 		// flow's next packet races afresh. one candidate of several was never
@@ -9327,8 +9447,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			self.reliabilityMetrics.flowReraced()
 		}
 		self.logSmtpProviderOutcome(egressIpPath, sourceClient, "reraced")
-		// swallowed: the icmp is never forwarded. the app's retransmit drives
-		// recovery. this is the whole point -- ~1s instead of 3-63s.
+		// The explicit error is swallowed. A credited unanswered TCP SYN can
+		// retry from its owned copy; other traffic and silence inference keep
+		// their ordinary outbound-retry path. No native RTO latency is promised.
 		return true
 	}
 
@@ -9885,6 +10006,11 @@ func (self *RemoteUserNatMultiClient) Close() {
 // terminal. Generated network clients remain owned by their generator.
 func (self *RemoteUserNatMultiClient) CloseAndWait(ctx context.Context) error {
 	self.Close()
+	if self.flowReaperDone != nil {
+		if err := waitForLifecycleDone(ctx, self.flowReaperDone, "multi-client flow reaper"); err != nil {
+			return err
+		}
+	}
 	if self.localUserNat == nil {
 		return nil
 	}
@@ -9898,7 +10024,10 @@ type multiClientChannelUpdate struct {
 	// value seals an old TCP generation during/after a tuple transition.
 	affinityDelivery atomic.Int64
 	// All admitted sources, including race losers; leaf-lock-owned scalar proof.
-	affinitySources multiClientAffinitySources
+	affinitySources  multiClientAffinitySources
+	synRetry         *tcpSynRetry
+	synRetrySerial   uint64
+	synRetryReleased atomic.Pointer[tcpSynRetry]
 	// openTime and activityTime bound one TCP generation's active lifetime for
 	// the affinity-performance learner; no timer or goroutine is retained per
 	// flow. Construction initializes it, and a same-tuple fresh SYN resets it
@@ -10302,6 +10431,7 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 		self.sequenceRecovery.windowScaleOffered = ipPath.TcpWindowScaleEnabled
 	}
 	if ipPath.Rst {
+		self.clearSynRetryWithLock()
 		self.sequenceRecovery.clear()
 	}
 
@@ -10315,6 +10445,9 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 // A real new source cohort clears both close directions. Candidate promotion
 // can force this transition even when an intervening unwritten SYN reused an ISN.
 func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32, ends ...uint32) {
+	if self.synRetry != nil && self.synRetry.sequence != sequence {
+		self.clearSynRetryWithLock()
+	}
 	self.sequenceRecovery.clear()
 	self.egressFinSequence, self.ingressFinSequence = 0, 0
 	self.egressAckSequence, self.ingressAckSequence = 0, 0
@@ -10511,6 +10644,9 @@ func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpContr
 		return false
 	}
 
+	if control.rst || control.fin {
+		self.clearSynRetryWithLock()
+	}
 	if control.rst {
 		return true
 	}
@@ -10958,6 +11094,7 @@ func (self *multiClientChannelUpdate) Close() {
 	defer self.releaseCollapseClaims()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.clearSynRetryWithLock()
 	self.clearRaceWithLock()
 	self.abandonCollapseClaimsWithLock()
 }
@@ -11060,6 +11197,7 @@ type parsedPacketGroup struct {
 	affinitySourceRegistration uint64
 	affinitySourceState        uint8
 	affinitySynReuse           bool
+	synRetry                   *tcpSynRetryRequest
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -17211,6 +17349,7 @@ func sendMultiClientGroupRaceAttempt(
 		transportAttribution:  sendPacketGroup.transportAttribution,
 		admissionObservations: sendPacketGroup.admissionObservations,
 		collapseAdmission:     sendPacketGroup.collapseAdmission,
+		synRetry:              sendPacketGroup.synRetry,
 	}
 	sharedGroup.affinityTransition.Store(sendPacketGroup.affinityTransition.Load())
 	sharedGroup.affinitySynReuse = sendPacketGroup.affinitySynReuse
@@ -17641,6 +17780,8 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
+// Owns marshaled frame bytes until admission. Raw IP PacketBytes transfer only
+// on success; refusal leaves those caller-owned input bytes untouched.
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error), opts ...any) (bool, error) {
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
@@ -17648,13 +17789,17 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
-		return self.client.SendMultiHopWithTimeoutDetailed(
+		success, err := self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
 			opts...,
 		)
+		if !frame.Raw && !success {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		return success, err
 	}
 }
 

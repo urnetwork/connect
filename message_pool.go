@@ -1340,17 +1340,25 @@ func ProtoMarshalWithTag(m proto.Message, tag uint8) ([]byte, error) {
 
 	buf, _ := MessagePoolGetDetailedWithTag(proto.Size(m), tag)
 
-	out, err := proto.MarshalOptions{}.MarshalAppend(buf[:0], m)
+	// Keep append inside the payload capacity: the final bytes belong to the
+	// pool, even when proto.Size underestimates the encoding.
+	out, err := proto.MarshalOptions{}.MarshalAppend(buf[:0:cap(buf)-MessagePoolMetaByteCount], m)
+	sameBuffer := 0 < cap(out) && &out[:1][0] == &buf[:1][0]
 	if err != nil {
 		MessagePoolReturn(buf)
+		if !sameBuffer {
+			MessagePoolReturn(out)
+		}
 		return nil, err
 	}
-	// if proto.Size underestimated, MarshalAppend may have allocated a fresh
-	// slice; the pool buffer is then orphaned and must be returned to balance
-	// the Get above. detected by a cap change (append only grows cap).
-	if cap(out) != cap(buf) {
-		MessagePoolReturn(buf)
+	if sameBuffer {
+		// Restore the full pooled view so the eventual owner can return it.
+		// This includes an empty encoding that kept the original backing array.
+		return buf[:len(out)], nil
 	}
+	// A growing or custom encoder may replace the destination, even with
+	// another buffer of the same capacity. It no longer owns our scratch root.
+	MessagePoolReturn(buf)
 	return out, nil
 }
 

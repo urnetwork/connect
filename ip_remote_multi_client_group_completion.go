@@ -77,6 +77,15 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		group.completionFlags.Or(groupCompletionTracked)
 		update := group.collapseAdmission.update
 		update.stateLock.Lock()
+		if group.isSynRetry() && !group.validSynRetryWithLock(update) {
+			update.stateLock.Unlock()
+			return false
+		}
+		if selection := group.completionSelection; selection != nil &&
+			(selection.client != self || update.client.loadSelection() != selection) {
+			update.stateLock.Unlock()
+			return false
+		}
 		if !update.isProbe() {
 			key, valid := self.affinitySourceKey()
 			if !valid {
@@ -167,6 +176,9 @@ func (self *parsedPacketGroup) sendGroupMemoryByteCount() ByteCount {
 		}
 	}
 	bytes := (ByteCount(unsafe.Sizeof(tcpCollapseGroup{}))+63)/64*64 + ByteCount(capacity)*8
+	if self.synRetry != nil {
+		bytes = addReceiveQueueByteCount(bytes, (ByteCount(unsafe.Sizeof(tcpSynRetryRequest{}))+63)/64*64)
+	}
 	if self.completionFlags.Load()&groupCompletionCandidate != 0 {
 		// Only a candidate can outlive both callback and offer. Reserve its
 		// surviving graph with the first item; terminal trimming drops all
@@ -305,6 +317,7 @@ func (self *parsedPacketGroup) unlinkCollapseWithLock() {
 // Detached terminal descriptors need no new release owner. Drain their existing
 // links outside the flow lock so budget notification never nests underneath it.
 func (self *multiClientChannelUpdate) releaseCollapseClaims() {
+	defer self.releaseSynRetryMemory()
 	if self.sequenceReleasedClaims.Load() == nil && !self.sequenceCloseReady.Load() {
 		return
 	}
@@ -314,6 +327,7 @@ func (self *multiClientChannelUpdate) releaseCollapseClaims() {
 		self.sequenceCloseReady.Swap(false) && self.cancel != nil && !self.IsDone() {
 		// Serialize retirement with a later source SYN reset. Notification is
 		// outside this lock; no callback or joining operation runs here.
+		self.clearSynRetryWithLock()
 		self.cancel()
 		parent = self.sequenceParent
 		self.clearRaceWithLock()

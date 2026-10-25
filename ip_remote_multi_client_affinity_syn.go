@@ -88,6 +88,10 @@ func (self *RemoteUserNatMultiClient) sendAffinityClientPath(
 	timeout time.Duration,
 	callback func(*multiClientChannelUpdate, *multiClientChannel, time.Duration),
 ) {
+	if group.isSynRetry() {
+		self.sendOwnedSynRetryPath(group, timeout, callback)
+		return
+	}
 	self.sendClientPath(group.ipPath, group.pin, func(update *multiClientChannelUpdate, current *multiClientChannel) {
 		if self.sendClientPathForTest != nil || len(group.packets) == 0 || group.packets[0].ipPath == nil ||
 			self.reuseAffinitySyn(update, current, group.packets[0].ipPath) {
