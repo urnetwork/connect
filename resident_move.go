@@ -225,10 +225,12 @@ type residentMoveTargetPreference struct {
 // and every generation an owner migrates to shares one, so a decline rule sees
 // the whole client and a reconnect of any transport sees the preference a move
 // left. It holds the most recent move ids, the time the last move completed,
-// the targets that failed and the stickiness preferences. The failures are
-// keyed by target address, which the platform draws from its edge inventory,
-// and pruned past the longest fail hold asked about. Memory only. Safe for
-// concurrent use.
+// the targets that failed, the stickiness preferences and the edges a
+// placement chose (platform_placement.go). Placements are kept apart from
+// preferences: a transport without moves still dials its placement, and a
+// move's preference outranks it. The failures are keyed by target address,
+// which the platform draws from its edge inventory, and pruned past the
+// longest fail hold asked about. Memory only. Safe for concurrent use.
 type ResidentMoveTracker struct {
 	stateLock sync.Mutex
 	// the most recent move ids, oldest first, for dedupe
@@ -238,12 +240,14 @@ type ResidentMoveTracker struct {
 	// the longest fail hold asked about. Zero prunes nothing.
 	targetFailHold    time.Duration
 	targetPreferences map[residentMoveTargetKey]residentMoveTargetPreference
+	targetPlacements  map[residentMoveTargetKey]residentMoveTargetPreference
 }
 
 func NewResidentMoveTracker() *ResidentMoveTracker {
 	return &ResidentMoveTracker{
 		targetFailTimes:   map[netip.Addr]time.Time{},
 		targetPreferences: map[residentMoveTargetKey]residentMoveTargetPreference{},
+		targetPlacements:  map[residentMoveTargetKey]residentMoveTargetPreference{},
 	}
 }
 
@@ -324,8 +328,65 @@ func (self *ResidentMoveTracker) pruneTargetFailuresWithLock(now time.Time) {
 func (self *ResidentMoveTracker) preferTargets(host string, targetIps []netip.Addr, endTime time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	keepTargetsWithLock(self.targetPreferences, host, targetIps, endTime)
+}
+
+// The live preferences of `host` for a transport of `ipFamily`: the one of its
+// family when pinned, and every family's when family-agnostic, ordered for the
+// race. Expired preferences are dropped.
+func (self *ResidentMoveTracker) preferredTargetIps(host string, ipFamily int, now time.Time) []netip.Addr {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return liveTargetIpsWithLock(self.targetPreferences, host, ipFamily, now)
+}
+
+// Clears the preferences of `host` that point at one of `targetIps`, after a
+// dial to them failed, so the next dial resolves the name. A preference a newer
+// move already replaced is kept.
+func (self *ResidentMoveTracker) dropPreferredTargets(host string, targetIps []netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	dropTargetsWithLock(self.targetPreferences, host, targetIps)
+}
+
+// Records that `host` dials each of `targetIps`, the edge a placement chose,
+// for dials of the target's family until `endTime` (platform_placement.go). A
+// newer placement of a family replaces the older one.
+func (self *ResidentMoveTracker) placeTargets(host string, targetIps []netip.Addr, endTime time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.targetPlacements == nil {
+		self.targetPlacements = map[residentMoveTargetKey]residentMoveTargetPreference{}
+	}
+	keepTargetsWithLock(self.targetPlacements, host, targetIps, endTime)
+}
+
+// The live placements of `host` for a transport of `ipFamily`, as
+// `preferredTargetIps` reads preferences.
+func (self *ResidentMoveTracker) placedTargetIps(host string, ipFamily int, now time.Time) []netip.Addr {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return liveTargetIpsWithLock(self.targetPlacements, host, ipFamily, now)
+}
+
+// Clears the placements of `host` that point at one of `targetIps`, after a
+// dial to them failed. A placement a newer one already replaced is kept.
+func (self *ResidentMoveTracker) dropPlacedTargets(host string, targetIps []netip.Addr) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	dropTargetsWithLock(self.targetPlacements, host, targetIps)
+}
+
+// Keeps each of `targetIps` for `host` and the target's family until
+// `endTime`, replacing what the family kept before.
+func keepTargetsWithLock(
+	targets map[residentMoveTargetKey]residentMoveTargetPreference,
+	host string,
+	targetIps []netip.Addr,
+	endTime time.Time,
+) {
 	for _, targetIp := range targetIps {
-		self.targetPreferences[residentMoveTargetKey{
+		targets[residentMoveTargetKey{
 			host:     host,
 			ipFamily: netipAddrFamily(targetIp),
 		}] = residentMoveTargetPreference{
@@ -335,41 +396,45 @@ func (self *ResidentMoveTracker) preferTargets(host string, targetIps []netip.Ad
 	}
 }
 
-// The live preferences of `host` for a transport of `ipFamily`: the one of its
-// family when pinned, and every family's when family-agnostic, ordered for the
-// race. Expired preferences are dropped.
-func (self *ResidentMoveTracker) preferredTargetIps(host string, ipFamily int, now time.Time) []netip.Addr {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// The live targets kept for `host` and a transport of `ipFamily`: the one of
+// its family when pinned, and every family's when family-agnostic, ordered for
+// the race. Expired targets are dropped.
+func liveTargetIpsWithLock(
+	targets map[residentMoveTargetKey]residentMoveTargetPreference,
+	host string,
+	ipFamily int,
+	now time.Time,
+) []netip.Addr {
 	targetIps := []netip.Addr{}
-	for _, preferenceFamily := range []int{4, 6} {
-		if ipFamily != 0 && ipFamily != preferenceFamily {
+	for _, targetFamily := range []int{4, 6} {
+		if ipFamily != 0 && ipFamily != targetFamily {
 			continue
 		}
-		key := residentMoveTargetKey{host: host, ipFamily: preferenceFamily}
-		preference, ok := self.targetPreferences[key]
+		key := residentMoveTargetKey{host: host, ipFamily: targetFamily}
+		target, ok := targets[key]
 		if !ok {
 			continue
 		}
-		if !now.Before(preference.endTime) {
-			delete(self.targetPreferences, key)
+		if !now.Before(target.endTime) {
+			delete(targets, key)
 			continue
 		}
-		targetIps = append(targetIps, preference.targetIp)
+		targetIps = append(targetIps, target.targetIp)
 	}
 	return orderDialAddrs(targetIps)
 }
 
-// Clears the preferences of `host` that point at one of `targetIps`, after a
-// dial to them failed, so the next dial resolves the name. A preference a newer
-// move already replaced is kept.
-func (self *ResidentMoveTracker) dropPreferredTargets(host string, targetIps []netip.Addr) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+// Clears the kept targets of `host` that are one of `targetIps`. A target a
+// newer one already replaced is kept.
+func dropTargetsWithLock(
+	targets map[residentMoveTargetKey]residentMoveTargetPreference,
+	host string,
+	targetIps []netip.Addr,
+) {
 	for _, targetIp := range targetIps {
 		key := residentMoveTargetKey{host: host, ipFamily: netipAddrFamily(targetIp)}
-		if preference, ok := self.targetPreferences[key]; ok && preference.targetIp == targetIp.Unmap() {
-			delete(self.targetPreferences, key)
+		if target, ok := targets[key]; ok && target.targetIp == targetIp.Unmap() {
+			delete(targets, key)
 		}
 	}
 }
