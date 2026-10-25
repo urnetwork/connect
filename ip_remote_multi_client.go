@@ -14356,6 +14356,12 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 // lastResortClientsForIpVersion is lastResortClients narrowed to the exits
 // that can carry the version -- a benched exit that cannot carry v6 is no
 // exit at all for a v6 flow. 0 is any.
+//
+// A sticky window (the user's Fixed IP) can hold two live exits at once, the
+// warned exit and its replacement. Racing both would let each new flow leave
+// on whichever answers first, so the egress ip changes between page loads.
+// Its offer keeps one exit: the most recently used, then the busiest, then
+// the lowest client id, so every call picks the same one.
 func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*multiClientChannel {
 	clients := []*multiClientChannel{}
 	for _, client := range self.unorderedClients() {
@@ -14364,7 +14370,48 @@ func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*m
 		}
 		clients = append(clients, client)
 	}
+	if 1 < len(clients) && self.stickyExit() {
+		lruTimes := map[*multiClientChannel]time.Time{}
+		weights := map[*multiClientChannel]float32{}
+		for _, client := range clients {
+			if stats, err := client.WindowStats(); err == nil {
+				lruTimes[client] = stats.lastEventTime
+				weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+			}
+		}
+		sortClientsByRecentUse(clients, lruTimes, weights)
+		clients = clients[:1]
+	}
 	return clients
+}
+
+// sortClientsByRecentUse orders clients most recently used first, then by
+// expected throughput descending, then by client id, so equal clients do not
+// reorder between calls.
+func sortClientsByRecentUse(
+	clients []*multiClientChannel,
+	lruTimes map[*multiClientChannel]time.Time,
+	weights map[*multiClientChannel]float32,
+) {
+	slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
+		lruTimeA := lruTimes[a]
+		lruTimeB := lruTimes[b]
+		// descending
+		if lruTimeA.Before(lruTimeB) {
+			return 1
+		} else if lruTimeB.Before(lruTimeA) {
+			return -1
+		}
+		weightA := weights[a]
+		weightB := weights[b]
+		// descending
+		if weightA < weightB {
+			return 1
+		} else if weightB < weightA {
+			return -1
+		}
+		return a.ClientId().Cmp(b.ClientId())
+	})
 }
 
 // OrderedClients is the window's offer to the race: its healthy clients,
@@ -14508,25 +14555,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 	}
 
 	if 0 < windowSize.FixedWindowSize && windowSize.FixedWindowSize < len(clients) {
-		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
-			lruTimeA := lruTimes[a]
-			lruTimeB := lruTimes[b]
-			// descending
-			if lruTimeA.Before(lruTimeB) {
-				return 1
-			} else if lruTimeB.Before(lruTimeA) {
-				return -1
-			}
-			weightA := weights[a]
-			weightB := weights[b]
-			// descending
-			if weightA < weightB {
-				return 1
-			} else if weightB < weightA {
-				return -1
-			}
-			return 0
-		})
+		sortClientsByRecentUse(clients, lruTimes, weights)
 		clients = clients[:windowSize.FixedWindowSize]
 	}
 
