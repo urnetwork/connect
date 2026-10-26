@@ -98,3 +98,26 @@ func TestSampleProbeTargetsForIpVersion(t *testing.T) {
 		}
 	}
 }
+
+// probeKnownUnreachableHostNames are hosts verified to answer nothing on :443.
+// A health entry is dialed at :443, so any of these can only fail and lowers
+// every provider's answered fraction by its share of the table.
+var probeKnownUnreachableHostNames = []string{
+	// connect#228: refused on :443 over v4 and v6 from 28 servers (2026-10-25)
+	"speedtest.tele2.net",
+}
+
+func TestProbeHostNamesInvariants(t *testing.T) {
+	seen := map[string]bool{}
+	for _, hostName := range probeHostNames {
+		if seen[hostName] {
+			t.Fatalf("duplicate probe host %s", hostName)
+		}
+		seen[hostName] = true
+	}
+	for _, hostName := range probeKnownUnreachableHostNames {
+		if seen[hostName] {
+			t.Fatalf("probe host %s is known unreachable on :443", hostName)
+		}
+	}
+}

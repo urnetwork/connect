@@ -68,7 +68,7 @@ var probeHostNames = []string{
 	"www.sucuri.net",
 	"cachefly.cachefly.net",
 	"proof.ovh.net",
-	"speedtest.tele2.net",
+	"www.iana.org",
 	"mirrors.kernel.org",
 	"deb.debian.org",
 	"archive.ubuntu.com",
