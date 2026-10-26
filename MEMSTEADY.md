@@ -1,5 +1,23 @@
 # Memory-budget performance research
 
+## 2026-10-26: native duplicate-ACK recovery checkpoint
+
+A local real-gVisor pilot exercised the full TUN/H1 path with GRO enabled, a verified **2 MiB** body and exactly one controlled first-segment loss after Transfer delivery. The effective constructor `ReturnResendTimeout` was **1 second in both arms**. The single normal pair measured:
+
+| Measurement | OLD | NEW |
+| --- | ---: | ---: |
+| Loss-case bulk download duration | **1,039.074125 ms** | **39.134917 ms** |
+| Receiver hole, drop to first replay | **999.169542 ms** | **8.710833 ms** |
+| Healthy bulk download duration | **34.331042 ms** | **34.031458 ms** |
+
+The OLD/NEW loss-duration ratio is **26.551** for this pair. It is not a statistical baseline, Fast.com result, page-TTFB measurement or SDK32/64 memory qualification. Both arms completed the same body hash; the healthy pair does not establish a statistically unchanged cost. All four normal/race pilot receipts are accepted: two expected OLD recovery failures, two OLD healthy passes and four NEW passes, with final source checks matching, recorded owners joined and the cache lease released. Race results qualify behavior, not speed. ACK observations and deterministic coverage are recorded in [RTOPT](RTOPT.md#2026-10-26-native-duplicate-ack-feedback-checkpoint).
+
+The production correction adds 27 lines across two files, with no added state fields, per-flow ledger, packet queue or RTO change. This source shape is not a measured memory saving. A separate ACK-plus-covered-DATA group concern remains a source-only hypothesis, without a runtime reproduction or production fix.
+
+These results used a tested overlay on **C23 before the incoming origin sync**; the merged source requires fresh qualification. The original 100-HTML/400-asset/99-overlap workload and five-second navigation limit, full six-repository correctness, 48 synthetic family invocations/60 benchmark processes, four native builds/112 physical cases, and the 32 MiB iOS-profile surrogate on Android/64 MiB Android memory profiles remain pending. Historical browsing attribution and full page-stall resolution remain unproven.
+
+Evidence: [normal-pair metrics](/private/tmp/urnetwork-gvisor-normal-pilot-metrics.PREP.bmyetujp/NORMAL-PAIR.json), SHA-256 `c545c03f6e26fe2e5f09a8d544c4fcbc7e2f67f0390b1bf244232d96f48ae879`; [closed pilot custody](/private/tmp/urnetwork-c23-gvisor-pilot-final.m9d8t3ub/FINAL-CUSTODY.json), SHA-256 `5bf3f12f2d27381b2983035df87005f14e2c65d91006bee0f2ed2f66b50314d9`.
+
 ## 2026-10-25: cold-page evidence and selection-consistent duplicate suppression
 
 Focused qualification completed with all processes and monitors joined and the native cache released. This is not final workload or memory qualification.

@@ -1,6 +1,6 @@
 # Retransmission optimization: TUN TCP and client Transfer
 
-Status: research in progress, updated 2026-10-05. No production TCP RTO, Transfer resend, ACK policy, or reconnect default has been changed by this study. The later lifetime-collapse contract correction below changes the collapse default; exact-source performance and memory qualification remain pending. The client-TCP-NoAck direction was explicitly superseded after a partial diagnostic screen; ACK-required 3s-TUN/3s-Transfer is the active candidate. Do not promote pilots or screens as baselines.
+Status: research in progress, updated 2026-10-26. This checkpoint corrects pure-TCP-ACK content collapse without changing TCP RTO, Transfer resend or Transfer ACK-required defaults. Earlier lifetime-collapse and timer investigations below retain their own source boundaries; exact-source performance and memory qualification remain pending. The client-TCP-NoAck direction remains superseded; ACK-required 3s-TUN/3s-Transfer remains a separate timer candidate. Do not promote pilots or screens as baselines.
 
 ## Scope and ownership
 
@@ -9,6 +9,18 @@ Status: research in progress, updated 2026-10-05. No production TCP RTO, Transfe
 Transfer has a separate, higher-layer timer: `DefaultSendBufferSettings().MaxResendInterval` is 8 seconds for reliable-carried Packs, while `UnreliableMaxResendInterval` already caps unreliable-carrier retries at 2 seconds. A 2-second Transfer cap is a separate candidate, **not** the same as the TUN TCP RTO cap. On a reliable H1 stream, an extra Transfer resend may duplicate a Pack already queued for TCP recovery; on a route change it may instead aid delivery. The H1 raw-residence and hybrid-reliable paths also reference the setting. Evaluate its effects on logical ACK lifetime, duplicate writes, queue/cwnd pressure, throughput, and memory in a separately frozen 8-versus-2-second A/B (and then a factorial interaction check with the TUN setting). Do not infer a Transfer default from the TUN-only screen below.
 
 Keep the lifetimes distinct: raw `DefaultSendBufferSettings().AckTimeout` is 60 seconds, whereas the affected MultiClient H1 path uses a 30-second ordinary provider-failure/ACK bar. The observed 30-second expiry is not evidence that the global Transfer default is 30 seconds; any Transfer A/B must report the effective lifetime per route so changing the resend cap is the only treatment.
+
+## 2026-10-26: native duplicate-ACK feedback checkpoint
+
+Repeated native TCP ACKs can be new loss/control feedback even when their bytes match. Transfer separately suppresses retries of the same held or delivered message by its identity. Whole pure-ACK groups now bypass the three TCP content-collapse gates; mixed groups keep their existing logic. The two-file correction adds 27 lines and no state fields, packet queue or timer. Provider fast repair still uses its existing duplicate-ACK threshold and suppresses another fast replay at an unchanged ACK frontier.
+
+The unchanged adjacent baseline passed **312 roots** across normal/race. The first NEW normal run retained **154 passes and two failures** from stale expectations that repeated pure ACKs must collapse. The two corrected tests retain FIFO/source-order and budget assertions and verify the admitted ACK's physical bytes and real Transfer ACK. The expanded NVD8 source then passed **336 roots and 272 child checks**, normal/race, with no root failures or skips and final source/owner/cache custody complete. Its production bytes are unchanged by the test corrections and DATA-coverage extension.
+
+In the closed real-gVisor pilot, normal ACK generation/provider observations were **46/0 OLD versus 48/48 NEW**; race observations were **59/0 versus 63/63**. All four pilot receipts qualified their declared causal/control outcomes. The single normal timing pair and its effective one-second provider resend timeout are recorded in [MEMSTEADY](MEMSTEADY.md#2026-10-26-native-duplicate-ack-recovery-checkpoint); race timings are not a speed score. A separate ACK-plus-covered-DATA group hypothesis remains unmeasured.
+
+Qualification used the C23 overlay before the incoming origin sync. Fresh merged-source, full workload, performance and physical-memory qualification remain required; this checkpoint does not attribute or close the browsing incident.
+
+Evidence: [preserved baseline and first NEW failures](/private/tmp/urnetwork-c23-adjacent-baseline-final.vm9lzs_y/FINAL-CUSTODY.json), SHA-256 `cacc07008838de333c92a91724f65a2a06aaae766afacf00279215fcb50d92ad`; [NEW168 final custody](/private/tmp/urnetwork-c23-pureack-new168-final.w607dxnq/FINAL-CUSTODY.json), SHA-256 `d52dbbbbeecf6c48ce1b5923723659b5c9e80ca37faa305208ade2ad9ef5eb39`. Executed [NVD8 recipe](/private/tmp/urnetwork-native-pure-ack-adjacent-fix.PREP.nvd4jnla/RECIPE.json): `392408294a8d62202aae0525aef564c84df570f4605f4362bb095fbbc64ce4c8`.
 
 ## Client Transfer resend research
 
