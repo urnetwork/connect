@@ -1385,6 +1385,58 @@ func TestLagApiPingCadence(t *testing.T) {
 	}
 }
 
+// Amendment 22: while a load runs, the pings go back to back, one in flight,
+// no closer than lagApiLoadPingInterval; the report's minute keeps only those
+// on the ticket's cadence, so it stays inside A7's bounds.
+func TestLagApiLoadPingsFast(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	fixture.setTimings(func(timings *lagApiTimings) {
+		timings.reportBefore = 500 * time.Millisecond
+		timings.reportAfter = 500 * time.Millisecond
+		timings.reportWindow = 5 * time.Second
+	})
+	ticketText := fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.DownloadMs = 1000
+		body.UploadMs = 1000
+	})
+	session := fixture.openHelloSession(ticketText)
+	// idle: 4 a second
+	if rtts := session.rttsFor(1100 * time.Millisecond); len(rtts) < 3 || 6 < len(rtts) {
+		t.Fatalf("%d idle rtts in 1.1 s", len(rtts))
+	}
+
+	load := session.runLoad(lagTestLoadOptions{uploadByteCount: testLagDurationByteCount})
+	if load.result.Type != "loadResult" {
+		t.Fatalf("result %+v", load.result.raw)
+	}
+	// the load's 2 s at the ticket's cadence would be 8 pings
+	rtts := []testLagMessage{}
+	for len(session.rtts) > 0 {
+		rtts = append(rtts, <-session.rtts)
+	}
+	if len(rtts) < 30 {
+		t.Errorf("%d rtts during the load", len(rtts))
+	}
+	for i := 1; i < len(rtts); i += 1 {
+		if gap := rtts[i].T - rtts[i-1].T; gap < int64(lagApiLoadPingInterval/time.Millisecond)-1 {
+			t.Errorf("pings %d ms apart during the load", gap)
+		}
+	}
+
+	body := fixture.nextReport(5 * time.Second)
+	if len(body.PingOffsetMs) < 10 || 600 < len(body.PingOffsetMs) {
+		t.Fatalf("%d pings in the report", len(body.PingOffsetMs))
+	}
+	for i := 1; i < len(body.PingOffsetMs); i += 1 {
+		if body.PingMicros[i] == 0 {
+			continue
+		}
+		if gap := body.PingOffsetMs[i] - body.PingOffsetMs[i-1]; gap < 250-250/8 {
+			t.Errorf("report pings %d ms apart", gap)
+		}
+	}
+}
+
 // M4: a ping with no pong within the loss timeout is lost and the next goes at
 // once; with no pong at all for the pong timeout the session ends, and its
 // report holds the lost pings (M8).
