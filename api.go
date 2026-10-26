@@ -375,6 +375,14 @@ type FindProviders2Args struct {
 	// v4-capable, which is every provider an older server knows, so an older
 	// client keeps today's behavior. See ip_family.go.
 	IpFamily IpFamilyFilter `json:"ip_family,omitempty"`
+	// PostQuantumEncryption asks only for providers whose latest provide
+	// advertised post-quantum encryption sessions
+	// (`Provide.post_quantum_encryption`); a provider that never advertised
+	// it, as every provider before the field did not, is left out. A client
+	// whose window clients require post-quantum encryption sets it. Unset, the
+	// request is the capability-blind discovery of an older client, and an
+	// older server ignores it.
+	PostQuantumEncryption bool `json:"post_quantum_encryption,omitempty"`
 }
 
 type FindProviders2Result struct {

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "google.golang.org/protobuf/proto"
@@ -376,6 +377,10 @@ type ApiMultiClientGenerator struct {
 	platformModePreferences    map[TransportMode]int
 	platformTransportPolicyVer uint64
 
+	// Every discovery request asks only for providers that advertise
+	// post-quantum encryption while set (SetPostQuantumEncryption).
+	postQuantumEncryption atomic.Bool
+
 	api *BringYourApi
 
 	// window identity persistence (PROXYDRAIN1.md §3.5); nil state behavior
@@ -716,6 +721,14 @@ func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamilyContext(ctx con
 	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily)
 }
 
+// SetPostQuantumEncryption implements
+// MultiClientGeneratorWithPostQuantumEncryption. Each later find-providers2
+// request, a window's discovery and a named redial alike, asks only for
+// providers that advertise post-quantum encryption while it is set.
+func (self *ApiMultiClientGenerator) SetPostQuantumEncryption(postQuantumEncryption bool) {
+	self.postQuantumEncryption.Store(postQuantumEncryption)
+}
+
 // ExcludeClientIds snapshots durable constructor exclusions followed by
 // runtime exclusions in oldest-to-newest order.
 func (self *ApiMultiClientGenerator) ExcludeClientIds() []Id {
@@ -841,12 +854,13 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 
 	if 0 < len(discoverySpecs) {
 		findProviders2 := &FindProviders2Args{
-			Specs:               discoverySpecs,
-			ExcludeClientIds:    excludeClientIds,
-			ExcludeDestinations: excludeDestinationsIds,
-			Count:               count,
-			RankMode:            rankMode,
-			IpFamily:            ipFamily,
+			Specs:                 discoverySpecs,
+			ExcludeClientIds:      excludeClientIds,
+			ExcludeDestinations:   excludeDestinationsIds,
+			Count:                 count,
+			RankMode:              rankMode,
+			IpFamily:              ipFamily,
+			PostQuantumEncryption: self.postQuantumEncryption.Load(),
 		}
 
 		result, err := self.findProviders2(ctx, findProviders2)
@@ -881,10 +895,11 @@ func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, ex
 		Specs: []*ProviderSpec{
 			{ClientId: &clientId},
 		},
-		ExcludeClientIds:    excludeClientIds,
-		ExcludeDestinations: excludeDestinationsIds,
-		Count:               1,
-		RankMode:            rankMode,
+		ExcludeClientIds:      excludeClientIds,
+		ExcludeDestinations:   excludeDestinationsIds,
+		Count:                 1,
+		RankMode:              rankMode,
+		PostQuantumEncryption: self.postQuantumEncryption.Load(),
 	})
 	if err != nil {
 		return nil, err
