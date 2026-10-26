@@ -336,9 +336,16 @@ func checkGroupRecoveryReturnOrder(t *testing.T, ackChange bool) {
 		}
 		f.unpark()
 		f.acknowledgeAll(first, second)
-		if f.offer(second) != 0 || !f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, first), f.selected) {
+		// Check FIFO authority before another public offer could restore the
+		// latest tuple. Pure ACK admission does not alter this coverage proof.
+		if f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, second), f.selected) ||
+			!f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, first), f.selected) {
 			t.Fatal("source FIFO did not preserve the latest control after inverted public returns")
 		}
+		if f.offer(second) != 1 {
+			t.Fatal("repeated pure ACK was collapsed after source-ordered completion")
+		}
+		f.acknowledgeAll(second)
 		if f.update.sourceRstSequence() != groupRecoveryParsed(t, second).ipPath.AckSequenceNumber || budget.UsedByteCount() != 0 {
 			t.Fatal("latest admission ACK or released memory differed after source completion")
 		}

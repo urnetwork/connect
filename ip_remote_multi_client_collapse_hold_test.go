@@ -116,27 +116,46 @@ func TestTcpCollapseHoldAllowsProgress(t *testing.T) {
 
 func TestTcpCollapseAllowsReceiveWindowCloseAndReopen(t *testing.T) {
 	client, update := collapseTestClient(time.Hour)
+	selected := &multiClientChannel{settings: client.settings}
+	canSend := func(packet *parsedPacket) bool {
+		return client.canSendPacketGroup(&parsedPacketGroup{
+			packets: []parsedPacket{*packet},
+			ipPath:  packet.ipPath,
+		}, update, selected)
+	}
 
 	open := collapseTestPacket(1000, 5000, 0, false, false)
-	if !collapseTestCanSend(client, update, open) {
+	open.ipPath.Ack = true
+	if !canSend(open) {
 		t.Fatal("initial open-window ACK was not admitted")
 	}
 	update.updateSequence(open)
+	if update.tcpWindowSize != open.ipPath.TcpWindowSize || update.sequenceAdmissionWindow != open.ipPath.TcpWindowSize {
+		t.Fatal("initial open-window ACK did not record its window")
+	}
 
 	closed := collapseTestPacket(1000, 5000, 0, false, false)
+	closed.ipPath.Ack = true
 	closed.ipPath.TcpWindowSize = 0
-	if !collapseTestCanSend(client, update, closed) {
+	if !canSend(closed) {
 		t.Fatal("zero-window update was collapsed as a duplicate ACK")
 	}
 	update.updateSequence(closed)
+	if update.tcpWindowSize != 0 || update.sequenceAdmissionWindow != 0 {
+		t.Fatal("zero-window ACK did not record its closed window")
+	}
 
 	reopened := collapseTestPacket(1000, 5000, 0, false, false)
-	if !collapseTestCanSend(client, update, reopened) {
+	reopened.ipPath.Ack = true
+	if !canSend(reopened) {
 		t.Fatal("receive-window reopen was collapsed as a duplicate ACK")
 	}
 	update.updateSequence(reopened)
-	if collapseTestCanSend(client, update, reopened) {
-		t.Fatal("identical reopened-window ACK bypassed collapse prevention")
+	if update.tcpWindowSize != reopened.ipPath.TcpWindowSize || update.sequenceAdmissionWindow != reopened.ipPath.TcpWindowSize {
+		t.Fatal("reopened-window ACK did not record its window")
+	}
+	if !canSend(reopened) {
+		t.Fatal("repeated reopened-window ACK was collapsed")
 	}
 }
 

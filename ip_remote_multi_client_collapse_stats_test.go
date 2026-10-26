@@ -128,10 +128,9 @@ func TestMultiClientTcpCollapseCountsRejectedPackets(t *testing.T) {
 				t.Errorf("%s: progressing group collapse count=%d, want %d", mode, got, wantCollapsed)
 			}
 			ack := MessagePoolCopy(ipOosTcpPacketSequence(path, tcpFlagAck, 103, nil))
-			if got := send(ack); got != 0 {
-				t.Fatalf("%s: redundant pure ack accepted=%d, want 0", mode, got)
+			if got := send(ack); got != 1 {
+				t.Fatalf("%s: repeated pure ack accepted=%d, want 1", mode, got)
 			}
-			wantCollapsed++
 			if got := parent.TcpCollapseDropCount(); got != wantCollapsed {
 				t.Errorf("%s: pure ack collapse count=%d, want %d", mode, got, wantCollapsed)
 			}

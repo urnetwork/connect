@@ -7328,6 +7328,9 @@ func (self *RemoteUserNatMultiClient) canSendPacketGroup(
 	}
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
+	if group.onlyPureTcpAcks() {
+		return true
+	}
 	for index := range group.packets {
 		if self.canSendPacketWithLock(&group.packets[index], update, client) {
 			return true
@@ -7350,6 +7353,9 @@ func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
 	selection := update.client.loadSelection()
 	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || update.race != nil) {
 		return selection, false
+	}
+	if sendPacketGroup.onlyPureTcpAcks() {
+		return selection, true
 	}
 	var currentClient *multiClientChannel
 	if selection != nil {
