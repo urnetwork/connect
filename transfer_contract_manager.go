@@ -493,6 +493,15 @@ type ContractManager struct {
 	// Protected by mutex. Consecutive contract requests refused as a rate
 	// limit. See CreateContractRateLimitBackoffMin.
 	createContractRateLimitCount int
+	// Protected by mutex. Keys whose last contract request was refused as a
+	// rate limit and not asked for since, so a send sequence that marked such a
+	// successor requested asks for it again. A key leaves when it is asked for
+	// again or its queue is flushed at its sequence's exit.
+	createContractRateLimitedKeys map[ContractKey]bool
+	// How many contract requests were refused as a rate limit. A sequence
+	// holding a successor marked requested reads it once per write, and reads
+	// the keys only when it has moved.
+	createContractRateLimitRefusals atomic.Uint64
 	// The end of the running or last rate-limit hold, nil before any. Written
 	// under mutex with the count; read without it by the checks a send
 	// sequence and a window make on every write and race
@@ -1676,7 +1685,12 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 			self.localStats.CreateContractRateLimitDropCount += 1
 			return false
 		}
-		return self.workers.start()
+		if !self.workers.start() {
+			return false
+		}
+		// asked for again: no longer a refused key
+		delete(self.createContractRateLimitedKeys, contractKey)
+		return true
 	}()
 	if !admitted {
 		return false
@@ -1757,7 +1771,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 						// every sequence in it, and the next success anywhere
 						// released them all within a second, into the same
 						// bound. Hold only this client instead.
-						hold := self.noteCreateContractRateLimited(time.Now())
+						hold := self.noteCreateContractRateLimited(contractKey, time.Now())
 						if ok, suppressed := shouldLogOobRateLimit(); ok {
 							self.client.log.Infof("[contract]oob rate limited, hold %s = %s%s\n", hold, err, suppressedSuffix(suppressed))
 						} else if v := self.client.log.V(1); v.Enabled() {
@@ -1790,9 +1804,16 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 // the longest step after the last hold ended starts the backoff over: the
 // platform has had room since, and an old streak says nothing about this one.
 // Returns the hold this refusal started, 0 when it started none.
-func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.Duration {
+func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractKey, now time.Time) time.Duration {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	// refused, whether or not the refusal steps the backoff: a sequence that
+	// marked this request made asks for it again
+	if self.createContractRateLimitedKeys == nil {
+		self.createContractRateLimitedKeys = map[ContractKey]bool{}
+	}
+	self.createContractRateLimitedKeys[contractKey] = true
+	self.createContractRateLimitRefusals.Add(1)
 	holdEnd := self.createContractRateLimitHoldEnd()
 	if now.Before(holdEnd) {
 		return 0
@@ -1822,6 +1843,19 @@ func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.D
 	self.createContractRateLimitHoldUntil.Store(&holdUntil)
 	self.localStats.CreateContractRateLimitHoldCount += 1
 	return hold
+}
+
+// How many contract requests were refused as a rate limit. Lock-free.
+func (self *ContractManager) createContractRateLimitRefusalCount() uint64 {
+	return self.createContractRateLimitRefusals.Load()
+}
+
+// Whether the last contract request for `contractKey` was refused as a rate
+// limit, and the key not asked for since.
+func (self *ContractManager) createContractRateLimitedKey(contractKey ContractKey) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.createContractRateLimitedKeys[contractKey]
 }
 
 // The end of the running or last rate-limit hold; zero before any.
@@ -2131,6 +2165,8 @@ func (self *ContractManager) Flush(resetUsedContractIds bool) []Id {
 }
 
 func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUsedContractIds bool) []Id {
+	// the key as requests carry it, before any legacy mapping
+	requestKey := contractKey
 	if self.settings.LegacyCreateContract {
 		contractKey = contractKey.Legacy()
 	}
@@ -2144,6 +2180,9 @@ func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUs
 		// generation before the drain or creates a fresh one after deletion.
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
+
+		// the flushing sequence will not ask for this key again
+		delete(self.createContractRateLimitedKeys, requestKey)
 
 		contractQueue = self.destinationContracts[contractKey]
 		if contractQueue == nil {
