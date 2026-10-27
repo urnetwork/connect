@@ -32,7 +32,7 @@ func (self *UpgradeMux) SendNativePacketBatch(source TransferPath, provideMode p
 	return self.mux.sendPacketBatchWithUpstreams(source, provideMode, packets, localTimeout,
 		func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 			return upstream.sendPacketWithPolicy(source, provideMode, packet, timeout, true)
-		}, upstream.sendNativePacketGroup, true)
+		}, nil, upstream.sendNativePacketGroupWithResults, true)
 }
 
 // Takes on success; a native offer cannot retain a retry continuation. Policy,
@@ -58,4 +58,140 @@ func (self *RemoteUserNatMultiClient) sendNativePacketGroup(source TransferPath,
 func (self *RemoteUserNatMultiClient) sendNativeParsedPacketGroup(source TransferPath, provideMode protocol.ProvideMode, group *parsedPacketGroup) bool {
 	admission := ipPacketGroupAdmission{nativeIngress: true}
 	return self.sendParsedPacketGroupAttempt(source, provideMode, group, 0, true, &admission)
+}
+
+// The receipt is metadata, never a policy limit. Unrepresentable input keeps
+// complete refusal before any original is compacted or ownership transfers.
+func nativeAckRetainedPathCount(packetCapacity int) (uint32, bool) {
+	if packetCapacity < 0 || uint64(packetCapacity) > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(packetCapacity), true
+}
+
+// Only redundant data groups can shed covered members for independent feedback.
+// Connection controls keep their existing indivisible generation/close behavior.
+func (self *parsedPacketGroup) nativeAckPartitionCandidate() bool {
+	if _, valid := nativeAckRetainedPathCount(cap(self.packets)); !valid {
+		return false
+	}
+	hasAck, hasData := false, false
+	for index := range self.packets {
+		packet := &self.packets[index]
+		path := packet.ipPath
+		if path == nil || path.Protocol != IpProtocolTcp || path.Syn || path.Fin || path.Rst {
+			return false
+		}
+		hasAck = hasAck || packet.pureTcpAck()
+		hasData = hasData || len(packet.payload) != 0
+	}
+	return hasAck && hasData
+}
+
+// Records a synchronous refusal before any queue acquired packet ownership.
+// Eligible native owners account only the members they ultimately collapse.
+func (self *RemoteUserNatMultiClient) recordCollapsedPacketGroup(group *parsedPacketGroup, admission *ipPacketGroupAdmission) {
+	if admission != nil && admission.nativeIngress && admission.partitionPureAcks && group.nativeAckPartitionCandidate() {
+		admission.collapseRejected = true
+		return
+	}
+	self.tcpCollapseDropCount.Add(uint64(len(group.packets)))
+}
+
+// Takes every packet and borrows the descriptor and admitted callback. A failed
+// complete-group collapse offer can retain its original parsed allocation,
+// compact only pure acknowledgements, and make one ordinary ready offer.
+// Original scalar metadata supplies exact caller indexes after byte handoff.
+func (self *RemoteUserNatMultiClient) sendNativePacketGroupWithResults(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	localTimeout time.Duration,
+	admitted func(int),
+) int {
+	if group == nil {
+		return 0
+	}
+	admission := ipPacketGroupAdmission{nativeIngress: true, partitionPureAcks: true}
+	previousAdmission := group.batchAdmission
+	group.batchAdmission = &admission
+	allAccepted, acksAccepted := false, false
+	memberIsAck := func(index int) bool {
+		path := &group.ipPaths[index]
+		return path.Protocol == IpProtocolTcp && path.Ack && !path.Syn && !path.Fin && !path.Rst &&
+			path.TcpPayloadByteCount == 0 && len(group.payloads[index]) == 0
+	}
+	defer func() {
+		if admission.parsed != nil && admission.parsed.admissionObservations != nil {
+			admission.parsed.admissionObservations.complete(allAccepted || acksAccepted)
+		}
+		group.batchAdmission = previousAdmission
+		if !allAccepted {
+			for index, packet := range group.packets {
+				if !acksAccepted || !memberIsAck(index) {
+					MessagePoolReturn(packet)
+				}
+			}
+		}
+	}()
+	report := func(onlyAcks bool) {
+		if admitted != nil {
+			for index := range group.packets {
+				if !onlyAcks || memberIsAck(index) {
+					admitted(index)
+				}
+			}
+		}
+	}
+	if self.sendPacketGroup(source, provideMode, group, localTimeout) {
+		allAccepted = true
+		report(false)
+		return len(group.packets)
+	}
+	if !admission.collapseRejected {
+		return 0
+	}
+
+	// Every original remains owned here after the typed refusal. Distinct path
+	// slots come from sendPacketGroup's one memberIpPaths allocation.
+	parsed := admission.parsed
+	pathCount, valid := nativeAckRetainedPathCount(cap(parsed.packets))
+	if !valid {
+		self.tcpCollapseDropCount.Add(uint64(len(group.packets)))
+		return 0
+	}
+	packetCount, byteCount := 0, ByteCount(0)
+	for index := range parsed.packets {
+		packet := parsed.packets[index]
+		if packet.pureTcpAck() {
+			parsed.packets[packetCount] = packet
+			packetCount++
+			byteCount += ByteCount(len(packet.packet))
+		} else {
+			*packet.ipPath = IpPath{}
+		}
+	}
+	clear(parsed.packets[packetCount:])
+	parsed.retainedIpPathCount = pathCount
+	// Keep parsed capacity and an explicit path receipt through race copies.
+	parsed.packets = parsed.packets[:packetCount]
+	self.tcpCollapseDropCount.Add(uint64(len(group.packets) - packetCount))
+	if packetCount == 0 {
+		return 0
+	}
+	parsed.ipPath, parsed.byteCount = parsed.packets[0].ipPath, byteCount
+	parsed.completionFlags.Or(groupCompletionCompactedMetadata)
+	if attribution := parsed.transportAttribution; attribution != nil {
+		attribution.stateLock.Lock()
+		attribution.packetCount, attribution.byteCount = int64(packetCount), byteCount
+		attribution.stateLock.Unlock()
+	}
+	admission.partitionPureAcks, admission.collapseRejected = false, false
+	if !self.sendParsedPacketGroupAttempt(source, provideMode, parsed, 0, false, &admission) {
+		return 0
+	}
+	acksAccepted = true
+	parsed.transportAttribution.admit()
+	report(true)
+	return packetCount
 }

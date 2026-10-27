@@ -6178,3 +6178,56 @@ PERFVAR/benchmark coverage, and fresh physical 32 MiB iOS-surrogate and 64 MiB
 Android profiles. Simulator-wide heap readings and zero tracked post-join credit
 are not device-runtime memory qualification. The required SN Linux image was
 confirmed present; ordinary SN readiness and resource checks remain required.
+
+## 2026-10-26 UTC: C24 original eight-case browsing qualification
+
+The original Wi-Fi/cellular profile × inner H1/H2 × normal/race matrix passed all **eight cases** on C24, with outer H1 throughout. Each case retained the strict five-second gate and completed **100 HTML responses, 400 validated-or-canceled asset requests and 99 overlap proofs**. The asset total includes intentional cancellations; it is not a count of 400 complete bodies. Each checked post-join `TotalByteCount` was zero. All recorded test groups, process owners and monitors joined, source checks matched and the cache lease was released.
+
+The largest maximum combined tap-to-first-byte interval among the cases was **3.837206208 s**; the corresponding case's maximum request TTFB was **3.837168333 s**. The separate columns and per-case cancellation counts are in [the C24 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-26-utc-c24-original-eight-case-browsing-qualification).
+
+This qualifies one original eight-case execution at Connect `2849685f`, Server `ce2b19e0`, SDK `b5ea15df`, Tests `52a3e7fe`. It is not a statistical baseline, an isolated fix-effect estimate or historical-incident attribution. Earlier C23 failures remain retained. Zero checked post-join usage does not establish an actual iOS footprint or physical 32/64 MiB qualification. Full-six correctness, 48 family invocations plus 60 benchmark processes and native/physical memory qualification remain incomplete. This original-eight result predates the mixed-ACK candidate; its later scoped results are recorded below.
+
+Evidence: [closed C24 final custody](/private/tmp/urnetwork-c24-full8-final.cm__z6n0/FINAL-CUSTODY.json), SHA-256 `b80189ccea7a1dc0ca3197a495dce1f6adf659e30ac9022c8dfee5344871c942`.
+
+## 2026-10-27 UTC: Controlled mixed-ACK H1 recovery and allocation qualification
+
+The scoped pilot is qualified. Its exact executable afterimages have now been integrated locally; integrated-source full-suite and device qualification remain pending.
+
+The corrected local full-TUN/H1 experiment used real gVisor/native ACKs, GRO enabled, a hash-checked 2 MiB body, and controlled coalescing of ACKs with already-covered DATA. Loss cases deliberately dropped exactly one segment after Transfer. Both variants retained the constructor's one-second `ReturnResendTimeout`. This workload deliberately exercises the mixed-group recovery mechanism; attribution to natural browsing stalls remains unproven. [Measured observations](/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/h1-disjoint-controls.PREP.7tk80_6o/c24-gvisor-clock-H1.PREP.gb7c703t/MATCHED-H1-OBSERVATIONS.json).
+
+| Normal-mode observation | OLD | NEW |
+| --- | ---: | ---: |
+| Healthy bulk duration | 33.448500 ms | 33.979875 ms |
+| One-loss bulk duration | 1,030.222209 ms | 38.961125 ms |
+| Receiver hole | 999.407333 ms | 7.990375 ms |
+| Matching ACKs generated / reaching provider | 51 / 0 | 45 / 45 |
+
+These are per-test bulk durations from one normal pair, with no statistical speedup claim. ACK counts are packet events over the complete loss flight, not API calls or counts of mixed-group offers. Race results establish functional behavior only: the OLD loss root produced its expected typed failure; both NEW roots passed.
+
+The [final custody receipt](/private/tmp/urnetwork-c24-clock-H1pilot-qualified-final.gi1el2d1/FINAL-CUSTODY.json) qualifies six commands and ten expected root outcomes: eight PASS plus two typed OLD failures, with no unexpected failures. Owner/controller/wrapper cleanup completed, process and group probes were clear, all 41,666 source rows matched, and cache custody was free. Qualification covers two canonical timer-origin controls and eight matched H1 outcomes on the C24 private overlay. The earlier observations file's pending-lifecycle flag is superseded by this final receipt.
+
+The [earlier failed pilot](/private/tmp/urnetwork-c24-H1pilot-failed-final.zxdfd18j/FINAL-CUSTODY.json) remains an unexpected failure in the record. Its receiver-hole oracle compared the later receiver drop against a timer that starts at provider retention. The corrected normal/race control observed retention-to-replay at exactly 1 s, with delivery/drop delayed 250 ms and a 750 ms receiver hole, without feedback. The real H1 pilot did **not** observe the internal retention timestamp; its OLD timeout explanation remains source-inferred. The correction removes the invalid receiver-hole comparison, adds no timer slack, and changes no production timer, threshold or API. [Clock correction](/private/tmp/urnetwork-gvisor-mixed-ack-clock-correction.PREP.m6c8l6b3/RECIPE.json) and [source review](/private/tmp/urnetwork-gvisor-mixed-ack-clock-correction.PREP.m6c8l6b3/FINAL-SOURCE-REVIEW.json).
+
+The independently [qualified 14 allocation/capacity outcomes](/private/tmp/urnetwork-c24-capacity-allocation-qualified-final.og3p912o/FINAL-CUSTODY.json) remain applicable: healthy equal-work offers used 980 allocations for ACK-only and 1,186 for fresh-DATA-plus-ACK in both variants. The covered case's 44→124 allocations accompanies 0→101 delivered ACKs and compares different completed work. No allocator wall-time or B/op result is claimed; neither allocation counts nor this H1 pilot establish device memory footprint.
+
+The original C24 eight browsing cases predate this candidate and do not qualify its integration. Integrated-source qualification remains pending: full six-repository correctness, 48 family invocations plus 60 benchmark processes, four fresh native builds and 112 physical cells, and 32 MiB iOS-profile / 64 MiB Android budgets. Historical 100-page attribution and actual iOS footprint remain unproven. This appendix is not a final postmortem or a claim that page stalls are fixed.
+
+Final H1 custody SHA-256: `e55baabbd27c1bf1fc99ff9b3533e5b8e364725d241bb3450aa3a01661fb351e`; observation packet: `1d657d5cac6fe0e55f1b97b20cf7fa60e6d69cdc141a2ad534c826a6dfdd0c6f`. Exact integration inventory and before/after hashes: [apply proof](/private/tmp/urnetwork-c24-adoption-applied._rn50v71/APPLY-PROOF.json), SHA-256 `a14305adfa15c353ecb8d9f3b10402e43a53d9dc8a1694dc1af6aa1ff04831af`.
+
+## 2026-10-27 UTC: C25 integrated fix, original eight browsing cases
+
+The canonical integrated mixed DATA/ACK source passed the original eight Wi-Fi/cellular × inner H1/H2 × normal/race browsing cases, with outer H1 throughout and no overlay. Every case retained the strict five-second gate, validated 100 HTML responses and 400 validated-or-canceled asset requests, and proved 99 overlaps. The largest case maxima were 4.771682 s request TTFB and 4.772368 s tap-to-first-byte, measured separately. Intentional asset cancellations are not complete response bodies. The per-case maxima and cancellation counts are in [the C25 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-27-utc-integrated-mixed-dataack-fix-original-eight-browsing-cases).
+
+Source: Connect `a0f892773fbeb48f22ef4c5f2310124a57d30b65`, Server `425b96306cc24e4ed03a89f5e33f853e1038d4d7`. The [closed C25 final custody](/private/tmp/urnetwork-c25-full8-qualified-final.0n97qksk/FINAL-CUSTODY.json), SHA-256 `a3dea0ea239cbefff55db5a687f7fc6a4fbff781156d836c15aeef3b6bf7a7a6`, accepts 8 PASS / 0 FAIL, joined owners and observers, matching source and released cache custody. No retry or source change occurred during the run.
+
+All checked post-join `ByteCountBudget` totals were zero. That is packet-budget ownership accounting, not Go heap/RSS, global quiescence or an actual iOS footprint. This qualifies the original-eight workload only: `baselineEligible=false`, with no statistical improvement or natural-session attribution claim. Full correctness, full PERF and fresh physical 32/64 MiB memory qualification remain outstanding; the broader goal is incomplete.
+
+## 2026-10-27 UTC: native qualification stopped at harness gates
+
+The first native attempt failed GLOBAL admission before command 1: two intermediate metadata directories were mode 0755, while the strict sampler requires owned private mode 0700. It ran no native builds or device calls. Its [closed failed receipt](/private/tmp/urnetwork-c25-native-admission-failed-final.6rrtzjk1/FINAL-CUSTODY.json), SHA-256 `1df8e8624e44845ea0c64fc219e91558cf0e894a0094f061f73289cff3f1d316`, preserves that failure.
+
+The revised private metadata materializer, SHA-256 `154aa84d70272e2a67ae9657b929ebde8503add27d8a2e6f50baa4c34d535026`, passed the actual umask-022 OLD typed-failure / NEW-pass control ([proof](/private/tmp/urnetwork-c25-privateparents-controls.tdm5u6l1/RESULT.json), SHA-256 `94e71358ee117df632216cfc28f084564661998d3ba89f920a47a52b01d6f7e1`). The next actual execution received fresh admission from the unchanged strict GLOBAL sampler.
+
+That `al9bofhe` execution passed all 10 setup commands, then command 11 (`native-four`) failed before the APK build because its PERF config was mode 0400 rather than the required owned private mode 0600. It completed zero native artifact builds and started none of the 112 physical cases. The [second closed failed receipt](/private/tmp/urnetwork-c25-native4-mode-failed-final.vjfdfa4m/FINAL-CUSTODY.json), SHA-256 `9486beca637a465f9901009c389f76f420cc2e32d2d3b17d1c56ef45f2a5cbed`, records joined owners and monitors, dead process/group probes, matching external source and released cache custody. Both failed owners remain preserved.
+
+These are harness preparation failures, not application regressions or memory passes. Config-mode correction and fresh preparation are in progress. The four native artifact builds, all 112 physical cells and physical 32 MiB iOS-profile / 64 MiB Android memory qualification remain pending. The original-eight browsing result does not close full correctness or full PERF, and no statistical baseline is promoted.

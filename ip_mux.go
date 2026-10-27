@@ -40,6 +40,16 @@ type ipPacketGroupSend = func(
 	timeout time.Duration,
 ) bool
 
+// Takes every original group packet and borrows admitted during the call.
+// Observed indexes refer to original members; the result counts admissions.
+type ipNativePacketGroupSend = func(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+	admitted func(int),
+) int
+
 // ipMuxOnSend lets a concrete mux claim and terminate a send-path packet. It
 // returns true if it handled the packet, or false to forward it upstream.
 type ipMuxOnSend = func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
@@ -240,7 +250,7 @@ func (self *IpMux) SendPacketBatch(
 	timeout time.Duration,
 ) int {
 	upstream, upstreamGroupSend := self.getUpstreams()
-	return self.sendPacketBatchWithUpstreams(source, provideMode, packets, timeout, upstream, upstreamGroupSend, false)
+	return self.sendPacketBatchWithUpstreams(source, provideMode, packets, timeout, upstream, upstreamGroupSend, nil, false)
 }
 
 // Takes a burst under one immutable upstream snapshot. Native callbacks keep
@@ -252,6 +262,7 @@ func (self *IpMux) sendPacketBatchWithUpstreams(
 	timeout time.Duration,
 	upstream IpMuxSend,
 	upstreamGroupSend ipPacketGroupSend,
+	nativeGroupSend ipNativePacketGroupSend,
 	nativeIngress bool,
 ) int {
 	groups, rejectedPackets := groupIpPackets(packets)
@@ -315,6 +326,10 @@ func (self *IpMux) sendPacketBatchWithUpstreams(
 					MessagePoolReturn(packet)
 				}
 			}
+			continue
+		}
+		if nativeGroupSend != nil {
+			sentPacketCount += nativeGroupSend(source, provideMode, group, timeout, nil)
 			continue
 		}
 		if upstreamGroupSend != nil {

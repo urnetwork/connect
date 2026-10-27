@@ -24,6 +24,7 @@ const (
 	groupCompletionSourceControls
 	groupCompletionSynOffer
 	groupCompletionReceived
+	groupCompletionCompactedMetadata
 )
 
 // Before dequeue, upper bits identify the exact candidate registration. The
@@ -64,7 +65,7 @@ type tcpCollapseGroup struct {
 func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup, ack bool, raceOrder uint64) bool {
 	// The same caller-owned descriptor can retry a refused offer. A refusal
 	// never acquired source ownership, so no previous target remains live.
-	group.completionFlags.Store(group.completionFlags.Load() & groupCompletionSynOffer)
+	group.completionFlags.Store(group.completionFlags.Load() & (groupCompletionSynOffer | groupCompletionCompactedMetadata))
 	group.collapseOwner, group.collapseNext = nil, nil
 	group.collapseSource, group.admissionTime = nil, time.Time{}
 	group.completionClient = self
@@ -161,8 +162,8 @@ func (self *parsedPacketGroup) awaitingCollapsePromotionWithLock() bool {
 		update.race != nil && update.race.clientStates[self.completionClient] != nil
 }
 
-// Measures only the new lazy allocation, including overflow capacity. The
-// descriptor replaces existing escaped ownership and is measured separately.
+// Joint admission pays for lazy range storage and metadata retained through
+// compaction or promotion before allocating the range owner.
 func (self *parsedPacketGroup) sendGroupMemoryByteCount() ByteCount {
 	if self.completionFlags.Load()&groupCompletionTracked == 0 || self.collapseOwner != nil {
 		return 0
@@ -179,10 +180,9 @@ func (self *parsedPacketGroup) sendGroupMemoryByteCount() ByteCount {
 	if self.synRetry != nil {
 		bytes = addReceiveQueueByteCount(bytes, (ByteCount(unsafe.Sizeof(tcpSynRetryRequest{}))+63)/64*64)
 	}
-	if self.completionFlags.Load()&groupCompletionCandidate != 0 {
-		// Only a candidate can outlive both callback and offer. Reserve its
-		// surviving graph with the first item; terminal trimming drops all
-		// packet roots and the live source before this extended phase.
+	if self.completionFlags.Load()&(groupCompletionCandidate|groupCompletionCompactedMetadata) != 0 {
+		// Compaction retains the original metadata backing even for one ack.
+		// Candidates also keep their graph through winner promotion.
 		bytes = addReceiveQueueByteCount(bytes, self.collapsePromotionByteCount())
 	}
 	return bytes
@@ -194,10 +194,11 @@ func (self *parsedPacketGroup) collapsePromotionByteCount() ByteCount {
 	round := func(bytes ByteCount) ByteCount { return (bytes + 63) / 64 * 64 }
 	bytes := round(ByteCount(unsafe.Sizeof(parsedPacketGroup{})))
 	bytes = addReceiveQueueByteCount(bytes, round(ByteCount(cap(self.packets))*ByteCount(unsafe.Sizeof(parsedPacket{}))))
+	pathCount := max(ByteCount(len(self.packets)), ByteCount(self.retainedIpPathCount))
+	bytes = addReceiveQueueByteCount(bytes, pathCount*round(ByteCount(unsafe.Sizeof(IpPath{}))))
 	for index := range self.packets {
 		packet := &self.packets[index]
 		path := packet.ipPath
-		bytes = addReceiveQueueByteCount(bytes, round(ByteCount(unsafe.Sizeof(IpPath{}))))
 		bytes = addReceiveQueueByteCount(bytes, round(ByteCount(cap(path.SourceIp)+cap(path.DestinationIp))))
 		bytes = addReceiveQueueByteCount(bytes, round(ByteCount(len(path.ServerName)+len(packet.pin.appId))))
 		if packet.transportAttribution != nil {
