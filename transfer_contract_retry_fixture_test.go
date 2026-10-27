@@ -187,7 +187,14 @@ func newContractTestClientWithOob(t *testing.T, clientId Id, oob OutOfBandContro
 // Queues one message for `destinationId` and returns where its ack lands.
 func sendContractRetryMessage(t *testing.T, client *Client, destinationId Id) chan error {
 	t.Helper()
-	frame, err := ToFrame(&protocol.SimpleMessage{Content: "contract retry"}, DefaultProtocolVersion)
+	return sendContractRetryContent(t, client, destinationId, "contract retry")
+}
+
+// sendContractRetryMessage with the message's `content`, which sets how much of
+// its contract the message uses.
+func sendContractRetryContent(t *testing.T, client *Client, destinationId Id, content string) chan error {
+	t.Helper()
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: content}, DefaultProtocolVersion)
 	if err != nil {
 		t.Fatal(err)
 	}

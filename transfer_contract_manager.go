@@ -1629,6 +1629,16 @@ func (self *ContractManager) addContractToQueue(
 // Dropped while a rate limit holds this client's requests (see
 // CreateContractRateLimitBackoffMin); the caller asks again on its own schedule.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
+	self.createContract(contractKey, contractSeqIndex, minByteCount)
+}
+
+// CreateContract, reporting whether a request for the contract is in flight
+// afterwards: this one, or an identical pending one it joined. False when
+// nothing was sent: the manager is closed, a rate-limit hold is running, the
+// queue generation is drained, or the frame could not be built. A caller
+// that marks the contract requested must not do so on false, or a request a
+// hold dropped is never made.
+func (self *ContractManager) createContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) bool {
 	// The external OOB owns transport and frame buffers; this manager owns its
 	// callback until it has consumed or closed every returned reservation. The
 	// generator joins the Client before closing OOB admission, so retaining this
@@ -1642,7 +1652,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		return self.workers.start()
 	}()
 	if !admitted {
-		return
+		return false
 	}
 
 	// Retain ownership through the asynchronous callback. A route promotion can
@@ -1655,10 +1665,10 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		seqIndex:          contractSeqIndex,
 		transferByteCount: self.contractByteCount(contractKey, contractSeqIndex, minByteCount),
 	}
-	if !contractQueue.beginCreate(request) {
+	if begun, pending := contractQueue.beginCreate(request); !begun {
 		self.closeContractQueue(contractKey, contractQueue)
 		self.workers.finish()
-		return
+		return pending
 	}
 	finish := func() {
 		defer self.workers.finish()
@@ -1685,7 +1695,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 	if err != nil {
 		finish()
 		self.client.log.Infof("[contract]could not create contract frame = %s", err)
-		return
+		return false
 	}
 
 	if self.client.log.V(1).Enabled() {
@@ -1742,6 +1752,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 			}
 		},
 	)
+	return true
 }
 
 // Records a contract request refused as a rate limit at `now` and holds this
@@ -2216,18 +2227,23 @@ type contractQueue struct {
 
 var errContractQueueDrained = errors.New("contract queue drained")
 
-// Linearizes nonblocking admission under this queue generation's lock.
-func (self *contractQueue) beginCreate(request contractCreateRequest) bool {
+// Linearizes nonblocking admission under this queue generation's lock. A
+// drained generation begins nothing. Neither does an identical request already
+// in flight, which `pending` reports: that request stands for this one.
+func (self *contractQueue) beginCreate(request contractCreateRequest) (begun bool, pending bool) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.drained || self.pendingCreates[request] {
-		return false
+	if self.drained {
+		return false, false
+	}
+	if self.pendingCreates[request] {
+		return false, true
 	}
 	if self.pendingCreates == nil {
 		self.pendingCreates = map[contractCreateRequest]bool{}
 	}
 	self.pendingCreates[request] = true
-	return true
+	return true, false
 }
 
 // Releases only this generation after its response processing has completed.

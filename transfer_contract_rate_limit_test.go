@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -227,6 +228,113 @@ func TestContractRateLimitHoldCoversEveryRequestOfTheClient(t *testing.T) {
 			t.Fatalf("open contracts = %d, want both sequences granted after the hold", stats.ContractOpenCount)
 		}
 	})
+}
+
+// A successor that comes due while the client is held is asked for by the
+// first write after the hold ends. The hold drops the request; reported as
+// made, the sequence marked its successor requested and never asked again
+// until the contract ran out.
+func TestContractRateLimitHoldDefersASuccessorUntilItEnds(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &contractRetryOob{
+			clientId: NewId(),
+			answer: func(index int) contractRetryAnswer {
+				// the second request, another key's, is the refused one
+				if index == 1 {
+					return contractRetryRateLimit
+				}
+				return contractRetryGrant
+			},
+		}
+		settings := contractRetryTestSettings()
+		settings.SendBufferSettings.PrewarmOpeningContract = true
+		settings.SendBufferSettings.backendDegradedForTest = func() bool { return false }
+		// due once 4 KiB is used, at any rate the test writes
+		settings.SendBufferSettings.ContractPrefetchMinUsedByteCount = kib(4)
+		settings.SendBufferSettings.ContractPrefetchLeadTime = time.Hour
+		// a hold of 4.375 s
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractRetryTestClient(t, oob, settings)
+
+		destinationId := NewId()
+		sendContractRetryMessage(t, client, destinationId)
+		synctest.Wait()
+		requireContractRetryOffsets(t, "opening contract", oob.requestOffsets(destinationId, start), []time.Duration{0})
+
+		otherKey := ContractKey{Destination: DestinationId(NewId())}
+		client.ContractManager().CreateContract(otherKey, 0, ByteCount(1024))
+		requireContractRetryOffsets(t, "refused request", oob.requestOffsets(otherKey.Destination.DestinationId, start), []time.Duration{0})
+
+		// 8 KiB more brings the successor due inside the hold
+		sendContractRetryContent(t, client, destinationId, strings.Repeat("x", 8*1024))
+		synctest.Wait()
+		requireContractRetryOffsets(t, "successor due inside the hold", oob.requestOffsets(destinationId, start), []time.Duration{0})
+
+		time.Sleep(5 * time.Second)
+		sendContractRetryMessage(t, client, destinationId)
+		synctest.Wait()
+		requireContractRetryOffsets(t, "successor after the hold", oob.requestOffsets(destinationId, start), []time.Duration{0, 5 * time.Second})
+	})
+}
+
+// createContract reports a request in flight when it sent one or joined an
+// identical one already pending, and none when a hold dropped it.
+func TestCreateContractReportsWhetherARequestIsInFlight(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &pendingContractOob{}
+		settings := contractRetryTestSettings()
+		client := newContractTestClientWithOob(t, NewId(), oob, settings)
+		t.Cleanup(func() { oob.failAll(contractRateLimitTestError()) })
+		manager := client.ContractManager()
+
+		key := ContractKey{Destination: DestinationId(NewId())}
+		if !manager.createContract(key, 0, ByteCount(1024)) {
+			t.Fatal("a sent request was reported not in flight")
+		}
+		if !manager.createContract(key, 0, ByteCount(1024)) {
+			t.Fatal("a request joined to an identical pending one was reported not in flight")
+		}
+		requireContractRetryOffsets(t, "coalesced requests", oob.requestOffsets(key.Destination.DestinationId, start), []time.Duration{0})
+
+		oob.failAll(contractRateLimitTestError())
+		otherKey := ContractKey{Destination: DestinationId(NewId())}
+		if manager.createContract(otherKey, 0, ByteCount(1024)) {
+			t.Fatal("a request the hold dropped was reported in flight")
+		}
+		requireContractRetryOffsets(t, "held request", oob.requestOffsets(otherKey.Destination.DestinationId, start), []time.Duration{})
+
+		time.Sleep(7 * time.Second)
+		if !manager.createContract(otherKey, 0, ByteCount(1024)) {
+			t.Fatal("a request after the hold was reported not in flight")
+		}
+		requireContractRetryOffsets(t, "request after the hold", oob.requestOffsets(otherKey.Destination.DestinationId, start), []time.Duration{7 * time.Second})
+	})
+}
+
+// A queue generation begins one request per identical request, reports an
+// identical one already pending, and begins nothing once drained.
+func TestContractQueueBeginCreate(t *testing.T) {
+	queue := newContractQueue(NewNoopLogger(), false)
+	request := contractCreateRequest{key: ContractKey{Destination: DestinationId(NewId())}, seqIndex: 1, transferByteCount: 1024}
+	if begun, pending := queue.beginCreate(request); !begun || pending {
+		t.Fatalf("first request begun=%t pending=%t, want begun", begun, pending)
+	}
+	if begun, pending := queue.beginCreate(request); begun || !pending {
+		t.Fatalf("identical request begun=%t pending=%t, want pending", begun, pending)
+	}
+	queue.finishCreate(request)
+	queue.drained = true
+	if begun, pending := queue.beginCreate(request); begun || pending {
+		t.Fatalf("drained queue begun=%t pending=%t, want neither", begun, pending)
+	}
 }
 
 // With the hold disabled a 429 is still not a backend failure: three in a row

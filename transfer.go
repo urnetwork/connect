@@ -10312,16 +10312,20 @@ func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 // requesting and keep the OOB storm going for exactly the sequences that still
 // have work to do. The contract in use is unaffected: only its successor waits
 // for the backend.
+//
+// Returns whether a request for the successor is in flight. A request the
+// client's rate-limit hold dropped is none, so the successor stays due and is
+// asked for by the first write after the hold ends; reported as made, it was
+// never asked for until the contract ran out.
 func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteCount ByteCount) bool {
 	if self.backendDegraded() {
 		return false
 	}
-	self.client.ContractManager().CreateContract(
+	return self.client.ContractManager().createContract(
 		key,
 		self.contractSeqIndex,
 		ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
 	)
-	return true
 }
 
 // Requests the current contract's successor the first time it is due (see
