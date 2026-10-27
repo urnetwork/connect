@@ -141,6 +141,12 @@ func TestContractRateLimitHoldsClientWithoutDegradingBackend(t *testing.T) {
 		if isBackendDegraded() {
 			t.Fatal("rate limits tripped the process-wide degraded-backend gate")
 		}
+		// four refusals started four holds, and the retries at 1, 3, 12 and
+		// 22 s were dropped inside them
+		stats := client.ContractManager().LocalStats()
+		if stats.CreateContractRateLimitHoldCount != 4 || stats.CreateContractRateLimitDropCount != 4 {
+			t.Fatalf("holds = %d, dropped = %d, want 4 and 4", stats.CreateContractRateLimitHoldCount, stats.CreateContractRateLimitDropCount)
+		}
 	})
 }
 
@@ -178,6 +184,9 @@ func TestContractRateLimitRefusalsTogetherHoldOneStep(t *testing.T) {
 		synctest.Wait()
 		for _, destinationId := range destinationIds {
 			requireContractRetryOffsets(t, "sequence refused with two others", oob.requestOffsets(destinationId, start), []time.Duration{0, 7 * time.Second})
+		}
+		if holds := client.ContractManager().LocalStats().CreateContractRateLimitHoldCount; holds != 1 {
+			t.Fatalf("three refusals together started %d holds, want 1", holds)
 		}
 	})
 }
@@ -476,7 +485,7 @@ func TestCreateContractRateLimitBackoff(t *testing.T) {
 func TestContractManagerRateLimitHold(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	settings.CreateContractRateLimitJitter = 0
-	manager := &ContractManager{settings: settings}
+	manager := &ContractManager{settings: settings, localStats: NewContractManagerStats()}
 	now := time.Unix(1000, 0)
 	for _, want := range []time.Duration{5 * time.Second, 10 * time.Second, 10 * time.Second} {
 		hold := manager.noteCreateContractRateLimited(now)
@@ -506,14 +515,14 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 
 	jitterSettings := DefaultContractManagerSettings()
 	jitterSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return 0 }
-	jitterManager := &ContractManager{settings: jitterSettings}
+	jitterManager := &ContractManager{settings: jitterSettings, localStats: NewContractManagerStats()}
 	if hold := jitterManager.noteCreateContractRateLimited(time.Unix(1000, 0)); hold != 3750*time.Millisecond {
 		t.Fatalf("jittered hold = %s, want the bottom of [3.75s, 6.25s)", hold)
 	}
 
 	disabledSettings := DefaultContractManagerSettings()
 	disabledSettings.CreateContractRateLimitBackoffMin = 0
-	disabledManager := &ContractManager{settings: disabledSettings}
+	disabledManager := &ContractManager{settings: disabledSettings, localStats: NewContractManagerStats()}
 	if hold := disabledManager.noteCreateContractRateLimited(time.Unix(1000, 0)); hold != 0 {
 		t.Fatalf("disabled hold = %s", hold)
 	}
@@ -530,7 +539,7 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 func TestContractManagerRateLimitStreakAgesOut(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	settings.CreateContractRateLimitJitter = 0
-	manager := &ContractManager{settings: settings}
+	manager := &ContractManager{settings: settings, localStats: NewContractManagerStats()}
 	now := time.Unix(1000, 0)
 	for range 4 {
 		now = now.Add(manager.noteCreateContractRateLimited(now))

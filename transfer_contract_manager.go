@@ -36,6 +36,17 @@ var oobErrThrottle = newLogThrottle(time.Minute)
 // shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
 func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
 
+// oobRateLimitThrottle rate-limits `[contract]oob rate limited`. During a
+// hosted owner's contract admission storm every refused client logs it, and
+// it is throttled apart from oobErrThrottle so a flood of rate limits cannot
+// hide the control failures that line reports. See logThrottle in
+// log_throttle.go.
+var oobRateLimitThrottle = newLogThrottle(time.Minute)
+
+// Reports whether a rate-limited contract request should be logged, and how
+// many were suppressed since the previous allowed log.
+func shouldLogOobRateLimit() (bool, int64) { return oobRateLimitThrottle.Allow(time.Now()) }
+
 type ContractKey struct {
 	Destination       TransferPath
 	IntermediaryIds   MultiHopId
@@ -219,6 +230,11 @@ func (self *contractStatusCallbackWorker) closeAndWait(ctx context.Context) erro
 type ContractManagerStats struct {
 	ContractOpenCount  int64
 	ContractCloseCount int64
+	// Contract requests refused as a rate limit that started a hold, and
+	// contract requests dropped while a hold ran. See
+	// ContractManagerSettings.CreateContractRateLimitBackoffMin.
+	CreateContractRateLimitHoldCount int64
+	CreateContractRateLimitDropCount int64
 	// contract id -> byte count
 	ContractOpenByteCounts map[Id]ByteCount
 	// contract id -> contract key
@@ -229,12 +245,14 @@ type ContractManagerStats struct {
 
 func NewContractManagerStats() *ContractManagerStats {
 	return &ContractManagerStats{
-		ContractOpenCount:             0,
-		ContractCloseCount:            0,
-		ContractOpenByteCounts:        map[Id]ByteCount{},
-		ContractOpenKeys:              map[Id]ContractKey{},
-		ContractCloseByteCount:        0,
-		ReceiveContractCloseByteCount: 0,
+		ContractOpenCount:                0,
+		ContractCloseCount:               0,
+		CreateContractRateLimitHoldCount: 0,
+		CreateContractRateLimitDropCount: 0,
+		ContractOpenByteCounts:           map[Id]ByteCount{},
+		ContractOpenKeys:                 map[Id]ContractKey{},
+		ContractCloseByteCount:           0,
+		ReceiveContractCloseByteCount:    0,
 	}
 }
 
@@ -1648,7 +1666,11 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 	admitted := func() bool {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
-		if self.closed || time.Now().Before(self.createContractRateLimitHoldUntil) {
+		if self.closed {
+			return false
+		}
+		if time.Now().Before(self.createContractRateLimitHoldUntil) {
+			self.localStats.CreateContractRateLimitDropCount += 1
 			return false
 		}
 		return self.workers.start()
@@ -1733,7 +1755,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 						// released them all within a second, into the same
 						// bound. Hold only this client instead.
 						hold := self.noteCreateContractRateLimited(time.Now())
-						if ok, suppressed := shouldLogOobErr(); ok {
+						if ok, suppressed := shouldLogOobRateLimit(); ok {
 							self.client.log.Infof("[contract]oob rate limited, hold %s = %s%s\n", hold, err, suppressedSuffix(suppressed))
 						} else if v := self.client.log.V(1); v.Enabled() {
 							v.Infof("[contract]oob rate limited, hold %s = %s\n", hold, err)
@@ -1794,6 +1816,7 @@ func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.D
 		return 0
 	}
 	self.createContractRateLimitHoldUntil = now.Add(hold)
+	self.localStats.CreateContractRateLimitHoldCount += 1
 	return hold
 }
 
@@ -2035,10 +2058,12 @@ func (self *ContractManager) LocalStats() *ContractManagerStats {
 	defer self.mutex.Unlock()
 
 	return &ContractManagerStats{
-		ContractOpenCount:      self.localStats.ContractOpenCount,
-		ContractCloseCount:     self.localStats.ContractCloseCount,
-		ContractOpenByteCounts: maps.Clone(self.localStats.ContractOpenByteCounts),
-		ContractOpenKeys:       maps.Clone(self.localStats.ContractOpenKeys),
+		ContractOpenCount:                self.localStats.ContractOpenCount,
+		ContractCloseCount:               self.localStats.ContractCloseCount,
+		CreateContractRateLimitHoldCount: self.localStats.CreateContractRateLimitHoldCount,
+		CreateContractRateLimitDropCount: self.localStats.CreateContractRateLimitDropCount,
+		ContractOpenByteCounts:           maps.Clone(self.localStats.ContractOpenByteCounts),
+		ContractOpenKeys:                 maps.Clone(self.localStats.ContractOpenKeys),
 		// ContractOpenDestinationIds: maps.Clone(self.localStats.ContractOpenDestinationIds),
 		ContractCloseByteCount:        self.localStats.ContractCloseByteCount,
 		ReceiveContractCloseByteCount: self.localStats.ReceiveContractCloseByteCount,
