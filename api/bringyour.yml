@@ -11690,6 +11690,15 @@ components:
             `v6-only` are the exact categories.
           type: string
           enum: ["", v4-capable, v6-capable, dualstack, v4-only, v6-only]
+        post_quantum_encryption:
+          description: |
+            Keep only providers whose latest provide with a Public or Network
+            key declared post-quantum encryption sessions, in every draw,
+            providers named by `client_id` included. A provider that never
+            declared them, as no provider did before the declaration existed,
+            is left out. A client whose connections require post-quantum
+            encryption sets it; unset keeps the capability-blind answer.
+          type: boolean
 
     LocationCoordinates:
       description: |

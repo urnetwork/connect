@@ -352,6 +352,12 @@ enum ProvideMode {
 
 message Provide {
     repeated ProvideKey keys = 1;
+    // The sender serves the per-peer post-quantum encryption sessions
+    // (`EncryptedControl`) that a client requiring post-quantum encryption
+    // opens. Provider discovery offers only such providers to that client. A
+    // provide without it, which includes every provide sent before this field
+    // existed, counts as not capable.
+    bool post_quantum_encryption = 2;
 }
 
 

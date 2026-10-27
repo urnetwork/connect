@@ -178,6 +178,19 @@ type MultiClientGeneratorWithClientId interface {
 	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 }
 
+// An optional generator capability: discover only providers that advertise
+// post-quantum encryption (`FindProviders2Args.PostQuantumEncryption`). The
+// multi client sets it from its performance profile before any window
+// discovers under the profile. Under `PostQuantumEncryption` every window
+// client runs `EncryptionModeRequired`, so a provider that cannot seal a
+// session can never carry its traffic; asking for capable providers keeps
+// such a provider from being dialed and evaluated at all. It only narrows
+// discovery: the window clients' required gate still decides every send. A
+// generator without the capability discovers as before.
+type MultiClientGeneratorWithPostQuantumEncryption interface {
+	SetPostQuantumEncryption(postQuantumEncryption bool)
+}
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		// the queue depth of a default client's transfer buffers
@@ -2707,6 +2720,8 @@ func NewRemoteUserNatMultiClient(
 		serverNameLookup:    nil,
 		blocker:             nil,
 	})
+	// before the windows below start discovering under the profile
+	multiClient.syncGeneratorPostQuantumEncryption()
 	multiClient.blockActionState.Store(&blockActionState{
 		version: 0,
 		matcher: nil,
@@ -3063,12 +3078,29 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			blocker:             prev.blocker,
 		})
 	}()
+	// before the reset windows discover again
+	self.syncGeneratorPostQuantumEncryption()
 	for _, window := range self.windows {
 		window.SetPerformanceProfile(performanceProfile)
 		// reset the window
 		window.shuffle()
 	}
 	return nil
+}
+
+// syncGeneratorPostQuantumEncryption tells a generator that can narrow its
+// discovery (`MultiClientGeneratorWithPostQuantumEncryption`) whether the
+// profile in force requires post-quantum encryption. It reads the stored
+// config rather than a caller's profile, so whichever of two concurrent
+// setters runs it last leaves the generator agreeing with the last stored
+// profile. It runs with no lock held.
+func (self *RemoteUserNatMultiClient) syncGeneratorPostQuantumEncryption() {
+	generator, ok := self.generator.(MultiClientGeneratorWithPostQuantumEncryption)
+	if !ok {
+		return
+	}
+	performanceProfile := self.config.Load().performanceProfile
+	generator.SetPostQuantumEncryption(performanceProfile != nil && performanceProfile.PostQuantumEncryption)
 }
 
 func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
