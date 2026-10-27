@@ -337,6 +337,54 @@ func TestContractQueueBeginCreate(t *testing.T) {
 	}
 }
 
+// A request the platform answered between two rate limits ends the streak, so
+// the second rate limit holds the minimum step again. The sequence asks at its
+// fixed 0, 7, 12 and 17 s retries: refused at 0, answered with an error result
+// at 7, refused at 12 for 7/8 of 5 s, and granted at 17. Had the answer not
+// ended the streak, the refusal at 12 would have held 7/8 of 10 s and pushed
+// the grant to 22 s.
+func TestContractRateLimitStreakEndsWithACompletedRequest(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &contractRetryOob{
+			clientId: NewId(),
+			answer: func(index int) contractRetryAnswer {
+				switch index {
+				case 0, 2:
+					return contractRetryRateLimit
+				case 1:
+					return contractRetryRefuse
+				default:
+					return contractRetryGrant
+				}
+			},
+		}
+		settings := contractRetryTestSettings()
+		settings.SendBufferSettings.PrewarmOpeningContract = false
+		settings.SendBufferSettings.CreateContractRetryJitter = 0
+		settings.SendBufferSettings.backendDegradedForTest = func() bool { return false }
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractRetryTestClient(t, oob, settings)
+
+		destinationId := NewId()
+		sendContractRetryMessage(t, client, destinationId)
+		time.Sleep(25 * time.Second)
+		synctest.Wait()
+		requireContractRetryOffsets(t, "refused, answered, refused, granted", oob.requestOffsets(destinationId, start), []time.Duration{
+			0,
+			7 * time.Second,
+			12 * time.Second,
+			17 * time.Second,
+		})
+		if stats := client.ContractManager().LocalStats(); stats.ContractOpenCount != 1 {
+			t.Fatalf("open contracts = %d, want the granted contract taken", stats.ContractOpenCount)
+		}
+	})
+}
+
 // With the hold disabled a 429 is still not a backend failure: three in a row
 // reach the control service and leave the gate clear. The same three plain
 // failures trip it (TestContractManagerCreateContract_OobFailureAccumulatesTowardDegraded).
