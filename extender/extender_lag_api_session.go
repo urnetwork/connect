@@ -67,6 +67,12 @@ const (
 	lagApiDefaultMaxByteCount = 2 * 1024 * 1024 * 1024
 )
 
+// While a load runs, the pings go out back to back, one in flight, as fast as
+// the path answers, so the page sees the load's latency in detail
+// (lag.dev/PLAN.md amendment 22). This floor keeps a path a few ms long from
+// sending the page hundreds of rtt messages a second.
+const lagApiLoadPingInterval = 10 * time.Millisecond
+
 // The most bytes one control message from the browser may hold.
 const lagApiMaxControlMessageByteCount = 4 * 1024
 
@@ -1158,6 +1164,22 @@ func (self *lagApiSession) run() {
 	inFlightPayload := ""
 	var inFlightSendTime time.Time
 
+	// the load's pings come faster than the ticket's interval; the minute the
+	// report carries keeps only those on the ticket's cadence, so it stays
+	// inside A7's bounds and the ring's room. A lost ping is always kept.
+	var keptPingTime time.Time
+	keepPing := func(ping lagApiPing) {
+		if !ping.lost && !keptPingTime.IsZero() && ping.sendTime.Sub(keptPingTime) < self.pingInterval-self.pingInterval/8 {
+			return
+		}
+		keptPingTime = ping.sendTime
+		self.pings.add(ping)
+	}
+	loading := func() bool {
+		load := self.load
+		return load != nil && !load.settled
+	}
+
 	// the load: the wait for the upload after the download, the upload's
 	// progress, the wait for the browser's done, and the report's minute
 	stoppedTimer := func() *time.Timer {
@@ -1381,6 +1403,11 @@ func (self *lagApiSession) run() {
 			self.load = load
 			self.publishWithLock()
 			self.stateLock.Unlock()
+			// the load's pings go back to back from now: a ping waiting out
+			// the ticket's interval goes at once
+			if pingC != nil {
+				pingTimer.Reset(0)
+			}
 		case "upload":
 			if load == nil || load.settled || load.upload != nil {
 				return true
@@ -1472,14 +1499,18 @@ func (self *lagApiSession) run() {
 			lossTimer.Stop()
 			lossC = nil
 			rtt := pong.arrivalTime.Sub(inFlightSendTime)
-			self.pings.add(lagApiPing{sendTime: inFlightSendTime, rtt: rtt})
+			keepPing(lagApiPing{sendTime: inFlightSendTime, rtt: rtt})
 			ms := math.Round(float64(rtt)/float64(time.Millisecond)*100) / 100
 			ok = self.write(&lagApiRttMessage{
 				Type: "rtt",
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),
 				Ms:   &ms,
 			})
-			nextPingTime := inFlightSendTime.Add(self.pingInterval)
+			interval := self.pingInterval
+			if loading() {
+				interval = lagApiLoadPingInterval
+			}
+			nextPingTime := inFlightSendTime.Add(interval)
 			if nextPingTime.Before(pong.arrivalTime) {
 				nextPingTime = pong.arrivalTime
 			}
@@ -1492,7 +1523,7 @@ func (self *lagApiSession) run() {
 			// finds it as one or the other
 			self.addLostPing(lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime}, timings.pongTimeout)
 			self.inFlight.Store(nil)
-			self.pings.add(lagApiPing{sendTime: inFlightSendTime, lost: true})
+			keepPing(lagApiPing{sendTime: inFlightSendTime, lost: true})
 			ok = self.write(&lagApiRttMessage{
 				Type: "rtt",
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),
