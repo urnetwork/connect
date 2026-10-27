@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -144,11 +145,12 @@ func TestContractRateLimitHoldsClientWithoutDegradingBackend(t *testing.T) {
 		if isBackendDegraded() {
 			t.Fatal("rate limits tripped the process-wide degraded-backend gate")
 		}
-		// four refusals started four holds, and the retries at 1, 3, 12 and
-		// 22 s were dropped inside them
+		// four refusals started four holds; the retries at 1 and 3 s were
+		// dropped inside the first, at 12 s inside the second and at 22 s
+		// inside the third, the key counted once per hold
 		stats := client.ContractManager().LocalStats()
-		if stats.CreateContractRateLimitHoldCount != 4 || stats.CreateContractRateLimitDropCount != 4 {
-			t.Fatalf("holds = %d, dropped = %d, want 4 and 4", stats.CreateContractRateLimitHoldCount, stats.CreateContractRateLimitDropCount)
+		if stats.CreateContractRateLimitHoldCount != 4 || stats.CreateContractRateLimitDropCount != 3 {
+			t.Fatalf("holds = %d, dropped = %d, want 4 and 3", stats.CreateContractRateLimitHoldCount, stats.CreateContractRateLimitDropCount)
 		}
 	})
 }
@@ -340,6 +342,110 @@ func TestContractRateLimitRefusedSuccessorIsAskedAgainAfterTheHold(t *testing.T)
 		sendContractRetryMessage(t, client, destinationId)
 		synctest.Wait()
 		requireContractRetryOffsets(t, "successor after the hold", oob.requestOffsets(destinationId, start), []time.Duration{0, 0, 5 * time.Second})
+	})
+}
+
+// A successor due while its client is held costs a write nothing: no queue or
+// admission lock and no dropped request, however many writes the hold sees.
+// The first write after the hold takes the locks and asks. Before, every write
+// in the hold locked the queue and the manager and counted a dropped request.
+func TestContractRateLimitHeldSuccessorChecksTakeNoLocks(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &contractRetryOob{
+			clientId: NewId(),
+			answer: func(index int) contractRetryAnswer {
+				// the second request, another key's, is the refused one
+				if index == 1 {
+					return contractRetryRateLimit
+				}
+				return contractRetryGrant
+			},
+		}
+		destinationId := NewId()
+		var lockedChecks atomic.Int64
+		settings := contractRetryTestSettings()
+		settings.SendBufferSettings.PrewarmOpeningContract = true
+		settings.SendBufferSettings.backendDegradedForTest = func() bool { return false }
+		settings.SendBufferSettings.ContractPrefetchMinUsedByteCount = kib(4)
+		settings.SendBufferSettings.ContractPrefetchLeadTime = time.Hour
+		settings.SendBufferSettings.beforeSuccessorContractRequestForTest = func(id sendSequenceId) {
+			if id.Destination == destinationId {
+				lockedChecks.Add(1)
+			}
+		}
+		// a hold of 4.375 s
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractRetryTestClient(t, oob, settings)
+
+		sendContractRetryMessage(t, client, destinationId)
+		synctest.Wait()
+		client.ContractManager().CreateContract(ContractKey{Destination: DestinationId(NewId())}, 0, ByteCount(1024))
+
+		// these bring the successor due inside the hold
+		for range 20 {
+			sendContractRetryContent(t, client, destinationId, strings.Repeat("x", 1024))
+		}
+		synctest.Wait()
+		if checks := lockedChecks.Load(); checks != 0 {
+			t.Fatalf("writes inside the hold took the successor locks %d times", checks)
+		}
+		if dropped := client.ContractManager().LocalStats().CreateContractRateLimitDropCount; dropped != 0 {
+			t.Fatalf("writes inside the hold counted %d dropped requests", dropped)
+		}
+
+		time.Sleep(5 * time.Second)
+		sendContractRetryMessage(t, client, destinationId)
+		synctest.Wait()
+		if checks := lockedChecks.Load(); checks != 1 {
+			t.Fatalf("the write after the hold took the successor locks %d times, want 1", checks)
+		}
+		requireContractRetryOffsets(t, "successor after the hold", oob.requestOffsets(destinationId, start), []time.Duration{0, 5 * time.Second})
+	})
+}
+
+// A hold counts each contract key it drops once, however often its sequence
+// asks, and the next hold counts afresh. Before, the count was one per call.
+func TestContractRateLimitDropsCountOncePerKeyPerHold(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		oob := &contractRetryOob{
+			clientId: NewId(),
+			answer:   func(int) contractRetryAnswer { return contractRetryRateLimit },
+		}
+		settings := contractRetryTestSettings()
+		// a hold of 4.375 s, then of 8.75 s
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractRetryTestClient(t, oob, settings)
+		manager := client.ContractManager()
+
+		first := ContractKey{Destination: DestinationId(NewId())}
+		second := ContractKey{Destination: DestinationId(NewId())}
+		manager.CreateContract(ContractKey{Destination: DestinationId(NewId())}, 0, ByteCount(1024))
+		for i := range 5 {
+			manager.CreateContract(first, uint64(i), ByteCount(1024))
+		}
+		for i := range 2 {
+			manager.CreateContract(second, uint64(i), ByteCount(1024))
+		}
+		if dropped := manager.LocalStats().CreateContractRateLimitDropCount; dropped != 2 {
+			t.Fatalf("one hold dropped %d keys, want 2", dropped)
+		}
+
+		time.Sleep(5 * time.Second)
+		manager.CreateContract(ContractKey{Destination: DestinationId(NewId())}, 0, ByteCount(1024))
+		for i := range 3 {
+			manager.CreateContract(first, uint64(i), ByteCount(1024))
+		}
+		stats := manager.LocalStats()
+		if stats.CreateContractRateLimitHoldCount != 2 || stats.CreateContractRateLimitDropCount != 3 {
+			t.Fatalf("holds = %d, dropped = %d, want 2 and 3", stats.CreateContractRateLimitHoldCount, stats.CreateContractRateLimitDropCount)
+		}
 	})
 }
 

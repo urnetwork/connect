@@ -5249,6 +5249,9 @@ type SendBufferSettings struct {
 	createContractRetryRandomForTest func(n int64) int64
 	// Nil reads the process-wide degraded-backend gate (isBackendDegraded).
 	backendDegradedForTest func() bool
+	// Nil test observer runs as a due successor's request takes the queue
+	// and admission locks (maybeRequestSuccessorContract).
+	beforeSuccessorContractRequestForTest func(sendSequenceId)
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
 	// MinResendInterval is the resend floor while no rtt samples exist (the
@@ -10348,11 +10351,22 @@ func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCou
 	}
 	due, checkRemainingByteCount := self.successorContractDue(contract)
 	if due {
+		manager := self.client.ContractManager()
+		// While the client's rate-limit hold runs the request would only be
+		// dropped. Leave the successor due for the first write after the
+		// hold, without the queue and admission locks on every write until
+		// then. Lock-free: a hold this read misses, admission still drops.
+		if manager.createContractRateLimitHeld(time.Now()) {
+			contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+			return
+		}
 		metadata := self.contractMetadata()
 		if self.sendContractMetadataGeneration != metadata.generation {
 			return
 		}
-		manager := self.client.ContractManager()
+		if self.sendBufferSettings.beforeSuccessorContractRequestForTest != nil {
+			self.sendBufferSettings.beforeSuccessorContractRequestForTest(self.id())
+		}
 		// read before asking: a refusal answered during the request, as a
 		// synchronous control answers it, must read as after the mark
 		refusals := manager.createContractRateLimitRefusalCount()

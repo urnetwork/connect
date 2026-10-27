@@ -230,8 +230,9 @@ func (self *contractStatusCallbackWorker) closeAndWait(ctx context.Context) erro
 type ContractManagerStats struct {
 	ContractOpenCount  int64
 	ContractCloseCount int64
-	// Contract requests refused as a rate limit that started a hold, and
-	// contract requests dropped while a hold ran. See
+	// Contract requests refused as a rate limit that started a hold, and the
+	// contract keys whose requests a hold dropped, each counted once per hold
+	// however often its sequence asked. See
 	// ContractManagerSettings.CreateContractRateLimitBackoffMin.
 	CreateContractRateLimitHoldCount int64
 	CreateContractRateLimitDropCount int64
@@ -502,6 +503,10 @@ type ContractManager struct {
 	// holding a successor marked requested reads it once per write, and reads
 	// the keys only when it has moved.
 	createContractRateLimitRefusals atomic.Uint64
+	// Protected by mutex. Keys whose requests the running hold has dropped,
+	// so CreateContractRateLimitDropCount counts each once per hold, however
+	// often its sequence asks. Reset when a hold starts.
+	createContractRateLimitDroppedKeys map[ContractKey]bool
 	// The end of the running or last rate-limit hold, nil before any. Written
 	// under mutex with the count; read without it by the checks a send
 	// sequence and a window make on every write and race
@@ -1682,7 +1687,13 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 			return false
 		}
 		if self.createContractRateLimitHeld(time.Now()) {
-			self.localStats.CreateContractRateLimitDropCount += 1
+			if !self.createContractRateLimitDroppedKeys[contractKey] {
+				if self.createContractRateLimitDroppedKeys == nil {
+					self.createContractRateLimitDroppedKeys = map[ContractKey]bool{}
+				}
+				self.createContractRateLimitDroppedKeys[contractKey] = true
+				self.localStats.CreateContractRateLimitDropCount += 1
+			}
 			return false
 		}
 		if !self.workers.start() {
@@ -1841,6 +1852,7 @@ func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractK
 	}
 	holdUntil := now.Add(hold)
 	self.createContractRateLimitHoldUntil.Store(&holdUntil)
+	self.createContractRateLimitDroppedKeys = nil
 	self.localStats.CreateContractRateLimitHoldCount += 1
 	return hold
 }
