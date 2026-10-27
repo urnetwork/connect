@@ -67,6 +67,10 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 			default:
 				t.Fatal("in-flight empty read did not reach its owned barrier")
 			}
+		} else {
+			generator.mutex.Lock()
+			generator.holdNextAvailable = true
+			generator.mutex.Unlock()
 		}
 		// Strictly after the empty snapshot, construction changes availability
 		// only. The next real source retransmit must reassert discovery demand.
@@ -77,10 +81,20 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 		if !h.syn(failedPath) {
 			t.Fatal("same-SYN retransmit was refused at source")
 		}
+		if len(h.liveChannels()) != 4 || h.boundTo(failedPath) != nil || update.receivedInbound.Load() || len(h.exit("late").syns(failedPath)) != 0 {
+			t.Fatal("late provider published before the reasserting source offer completed")
+		}
 		if holdEmpty {
 			close(generator.emptyRelease)
-			synctest.Wait()
+		} else {
+			select {
+			case <-generator.availableEntered:
+			default:
+				t.Fatal("available demand read did not reach its owned barrier")
+			}
+			close(generator.availableRelease)
 		}
+		synctest.Wait()
 		publicationBound := discoveryDemandTestEarlierTime(deadline, start.Add(reraceSynSchedule[2]))
 		publicationReady := discoveryDemandTestAwaitPublication(t, publication, publicationBound)
 		reads, empty, mints, retired := generator.counts()

@@ -12,7 +12,7 @@ import (
 func privateCrossWindowTestSoleUnavailableSpeed(t *testing.T, kind string) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, nil)

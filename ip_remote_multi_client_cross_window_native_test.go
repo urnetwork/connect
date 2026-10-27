@@ -32,7 +32,7 @@ func TestPrivateCrossWindowNativeFullStrictSixUsesOwnedSpeed(t *testing.T) {
 			specs = append(specs, privateCrossWindowExitSpec{exitSpec: reraceExitSpec{name: name, answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality})
 		}
 		specs = append(specs, privateCrossWindowExitSpec{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed})
-		harness := newPrivateCrossWindowHarness(t, specs, nil)
+		harness := newPrivateCrossWindowSourceRetryHarness(t, specs, nil)
 		if harness.multiClient.reliabilitySettings().MaxFlowsPerExit != 16 {
 			t.Fatal("native full-window control lost the SDK-like16-flow policy")
 		}

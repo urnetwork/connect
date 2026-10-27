@@ -8045,6 +8045,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
 					if sendPacketGroup.isSynRetry() && (benchedField || self.destinationServiceFailuresExhausted(orderedClients, ipPath)) {
+						// A pin keeps the first nonempty field even when its only
+						// offers have failed. Leave that fallback to a source retry.
+						if sendPacketGroup.pin.pinned() && 0 < len(orderedClients) {
+							return nil
+						}
 						continue
 					}
 					if 0 < len(orderedClients) {

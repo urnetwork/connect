@@ -11,7 +11,7 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// Counts the actual generator calls and can delay one already empty response.
+// Counts actual generator calls and can gate one empty or available response.
 // Availability changes only the provider set; no fixture notification is sent.
 type discoveryDemandTestGenerator struct {
 	*reraceGenerator
@@ -24,6 +24,9 @@ type discoveryDemandTestGenerator struct {
 	emptyEntered       chan struct{}
 	emptyRelease       chan struct{}
 	emptyOnce          sync.Once
+	holdNextAvailable  bool
+	availableEntered   chan struct{}
+	availableRelease   chan struct{}
 	configureNewClient func(*MultiClientGeneratorClientArgs, *ClientSettings)
 }
 
@@ -47,11 +50,23 @@ func (self *discoveryDemandTestGenerator) NextDestinationsWithIpFamilyContext(ct
 	if hold {
 		self.holdNextEmpty = false
 	}
+	holdAvailable := rank == "quality" && err == nil && len(result) != 0 && self.holdNextAvailable
+	if holdAvailable {
+		self.holdNextAvailable = false
+	}
 	self.mutex.Unlock()
 	if hold {
 		self.emptyOnce.Do(func() { close(self.emptyEntered) })
 		select {
 		case <-self.emptyRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if holdAvailable {
+		close(self.availableEntered)
+		select {
+		case <-self.availableRelease:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -117,7 +132,9 @@ func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configu
 	for _, spec := range specs {
 		h.addExit(spec)
 	}
-	g := &discoveryDemandTestGenerator{reraceGenerator: h.generator, retired: map[Id]int{}, emptyEntered: make(chan struct{}), emptyRelease: make(chan struct{})}
+	g := &discoveryDemandTestGenerator{reraceGenerator: h.generator, retired: map[Id]int{},
+		emptyEntered: make(chan struct{}), emptyRelease: make(chan struct{}),
+		availableEntered: make(chan struct{}), availableRelease: make(chan struct{})}
 	t.Cleanup(func() {
 		_, _, mints, retired := g.counts()
 		if mints != retired {
@@ -146,10 +163,12 @@ func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configu
 				t.Log(line)
 			}
 		}
-		select {
-		case <-g.emptyRelease:
-		default:
-			close(g.emptyRelease)
+		for _, release := range []chan struct{}{g.emptyRelease, g.availableRelease} {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
 		}
 		if err := h.multiClient.CloseAndWait(context.Background()); err != nil {
 			t.Error(err)
@@ -353,6 +372,10 @@ func testDiscoveryDemandLateVisibility(t *testing.T, holdEmpty bool) {
 			default:
 				t.Fatal("in-flight empty read did not reach its owned barrier")
 			}
+		} else {
+			generator.mutex.Lock()
+			generator.holdNextAvailable = true
+			generator.mutex.Unlock()
 		}
 		// Strictly after the empty snapshot, construction changes availability
 		// only. The next real source retransmit must reassert discovery demand.
@@ -362,10 +385,22 @@ func testDiscoveryDemandLateVisibility(t *testing.T, holdEmpty bool) {
 		if !h.syn(failedPath) {
 			t.Fatal("same-SYN retransmit was refused at source")
 		}
+		// Keep this control's publication after the reasserting offer. A
+		// separately covered order lets that same offer use the late provider.
+		if len(h.liveChannels()) != 4 || h.boundTo(failedPath) != nil || update.receivedInbound.Load() || len(h.exit("late").syns(failedPath)) != 0 {
+			t.Fatal("late provider published before the reasserting source offer completed")
+		}
 		if holdEmpty {
 			close(generator.emptyRelease)
-			synctest.Wait()
+		} else {
+			select {
+			case <-generator.availableEntered:
+			default:
+				t.Fatal("available demand read did not reach its owned barrier")
+			}
+			close(generator.availableRelease)
 		}
+		synctest.Wait()
 		publicationBound := discoveryDemandTestEarlierTime(deadline, start.Add(reraceSynSchedule[2]))
 		publicationReady := discoveryDemandTestAwaitPublication(t, publication, publicationBound)
 		reads, empty, mints, retired := generator.counts()

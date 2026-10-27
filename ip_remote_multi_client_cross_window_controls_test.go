@@ -14,7 +14,7 @@ import (
 func privateCrossWindowTestSoleQualityFailureUsesSpeed(t *testing.T, version int) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, nil)
@@ -45,7 +45,7 @@ func TestPrivateCrossWindowSoleQualityFailureUsesSpeedIp6(t *testing.T) {
 func TestPrivateCrossWindowNewFlowUsesServiceFailureMemory(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, nil)
@@ -69,7 +69,7 @@ func TestPrivateCrossWindowNewFlowUsesServiceFailureMemory(t *testing.T) {
 func TestPrivateCrossWindowAllWindowsFailedKeepsFirstFallback(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality-a", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "quality-b", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeSpeed},
@@ -134,7 +134,7 @@ func TestPrivateCrossWindowAllFailedOldestQualityOrder(t *testing.T) {
 func privateCrossWindowTestPin(t *testing.T, appPin bool) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, nil)
@@ -176,7 +176,7 @@ func TestPrivateCrossWindowSitePinKeepsQualityFallback(t *testing.T) {
 func TestPrivateCrossWindowFixedProfileKeepsQuality(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, func(settings *MultiClientSettings) {
@@ -202,7 +202,7 @@ func TestPrivateCrossWindowFixedProfileKeepsQuality(t *testing.T) {
 func TestPrivateCrossWindowFixedDestinationKeepsQuality(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
 		}, nil, true)
@@ -240,7 +240,7 @@ func privateCrossWindowTestIncompatibleSpeedKeepsQualityFallback(t *testing.T, v
 				exitSpec: reraceExitSpec{name: "speed-setup-anchor", family: IpFamilyV4Only}, windowType: WindowTypeSpeed,
 			})
 		}
-		harness := newPrivateCrossWindowHarness(t, specs, func(settings *MultiClientSettings) {
+		harness := newPrivateCrossWindowSourceRetryHarness(t, specs, func(settings *MultiClientSettings) {
 			if version == 4 {
 				windowSize := settings.WindowSizes[WindowTypeSpeed]
 				windowSize.WindowSizeMinIpv6Capable = 1
@@ -293,7 +293,7 @@ func TestPrivateCrossWindowIncompatibleSpeedKeepsQualityFallbackIp6(t *testing.T
 func TestPrivateCrossWindowQualityCrossTierPrecedesSpeed(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality-best", tier: 0, answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "quality-other", tier: 2}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed", tier: 0}, windowType: WindowTypeSpeed},
@@ -313,7 +313,7 @@ func TestPrivateCrossWindowQualityCrossTierPrecedesSpeed(t *testing.T) {
 func TestPrivateCrossWindowSpeedKeepsRankGate(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed-best", tier: 0}, windowType: WindowTypeSpeed},
 			{exitSpec: reraceExitSpec{name: "speed-other", tier: 2}, windowType: WindowTypeSpeed},
@@ -333,7 +333,7 @@ func TestPrivateCrossWindowSpeedKeepsRankGate(t *testing.T) {
 func TestPrivateCrossWindowSpeedPreservesHealthExclusions(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed-warned", tier: 0}, windowType: WindowTypeSpeed},
 			{exitSpec: reraceExitSpec{name: "speed-quarantined", tier: 0}, windowType: WindowTypeSpeed},
@@ -371,7 +371,7 @@ func TestPrivateCrossWindowSpeedPreservesHealthExclusions(t *testing.T) {
 func TestPrivateCrossWindowSpeedPreservesFlowCap(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed-full", tier: 0}, windowType: WindowTypeSpeed},
 			{exitSpec: reraceExitSpec{name: "speed-free", tier: 2}, windowType: WindowTypeSpeed},
@@ -399,7 +399,7 @@ func TestPrivateCrossWindowSpeedPreservesFlowCap(t *testing.T) {
 func TestPrivateCrossWindowSpeedPreservesReputation(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed-rejected"}, windowType: WindowTypeSpeed, reputationFailures: []string{"service.example"}},
 			{exitSpec: reraceExitSpec{name: "speed-clean"}, windowType: WindowTypeSpeed},
@@ -428,7 +428,7 @@ func privateCrossWindowTestKeepsEstablishedCssSibling(t *testing.T, version int)
 			}
 			return reraceSignal
 		}
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality-original", tier: 0, answer: answer}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "quality-other", tier: 2, answer: answer}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},

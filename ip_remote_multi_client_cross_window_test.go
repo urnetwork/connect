@@ -29,6 +29,8 @@ type privateCrossWindowGenerator struct {
 	exitReputationFailures map[*reraceExit][]string
 	unavailableExits       map[*reraceExit]bool
 	fixedDestinations      bool
+	sourceRetryEntered     <-chan *multiClientChannelUpdate
+	sourceRetryObserved    *multiClientChannelUpdate
 }
 
 // Enumerates only the requested window and family, using the same exclusions
@@ -111,6 +113,27 @@ func newPrivateCrossWindowHarness(t *testing.T, specs []privateCrossWindowExitSp
 	return newPrivateCrossWindowHarnessWithOptions(t, specs, configure, privateCrossWindowHarnessOptions{
 		fixedDestinations: len(fixedDestinations) != 0 && fixedDestinations[0],
 	})
+}
+
+// Holds the independent dispatcher for owned syns while controls prove routing
+// caused by an actual source retransmit. Production settings remain enabled.
+func newPrivateCrossWindowSourceRetryHarness(t *testing.T, specs []privateCrossWindowExitSpec, configure func(*MultiClientSettings), fixedDestinations ...bool) *reraceHarness {
+	t.Helper()
+	harness := newPrivateCrossWindowHarness(t, specs, configure, fixedDestinations...)
+	entered, release := make(chan *multiClientChannelUpdate, 1), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	harness.multiClient.beforeSynRetryDispatchForTest = func(update *multiClientChannelUpdate) {
+		select {
+		case entered <- update:
+		default:
+		}
+		select {
+		case <-release:
+		case <-harness.multiClient.ctx.Done():
+		}
+	}
+	harness.multiClient.generator.(*privateCrossWindowGenerator).sourceRetryEntered = entered
+	return harness
 }
 
 // Builds actual windows at their exact fixture caps. Publication and optional
@@ -278,6 +301,19 @@ func privateCrossWindowAssertFailed(t *testing.T, harness *reraceHarness, path *
 			t.Fatalf("%s has no completed standing service refusal", name)
 		}
 	}
+	generator := harness.multiClient.generator.(*privateCrossWindowGenerator)
+	if entered := generator.sourceRetryEntered; entered != nil && path.Protocol == IpProtocolTcp {
+		if generator.sourceRetryObserved == nil {
+			select {
+			case generator.sourceRetryObserved = <-entered:
+			default:
+				t.Fatal("explicit failure did not reach the independent owned-SYN dispatcher")
+			}
+		}
+		if generator.sourceRetryObserved != harness.update(path) {
+			t.Fatal("held owned-SYN dispatch belongs to a different flow generation")
+		}
+	}
 }
 
 // The causal regression: the same source SYN exhausts the quality window,
@@ -286,7 +322,7 @@ func privateCrossWindowAssertFailed(t *testing.T, harness *reraceHarness, path *
 func privateCrossWindowTestUntriedSpeedAfterQualityRefusal(t *testing.T, version int) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		harness := newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
+		harness := newPrivateCrossWindowSourceRetryHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality-a", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "quality-b", answer: reraceAlways(reraceSignal)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed"}, windowType: WindowTypeSpeed},
