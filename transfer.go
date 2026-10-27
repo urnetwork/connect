@@ -18366,6 +18366,16 @@ func MessageByteCount(frames []*protocol.Frame) ByteCount {
 // The request is fire-and-forget: CreateContract hands the frame to the control
 // channel with a callback and returns, so this never blocks the caller. The
 // size is left to the contract manager's own ramp -- only a floor is passed.
+//
+// Deliberately not held by the degraded-backend gate (isBackendDegraded),
+// unlike the acquisition loop and successor requests. While the gate is
+// tripped, a new sequence's prewarm is the only contract request that still
+// goes out, and its completed round trip is what clears the gate once the
+// backend is back. Held by the gate, a process with nothing else succeeding
+// waits out the gate's whole recency window (backendDegradedWindow) before any
+// new sequence gets a contract, unless a transport dial happens to succeed.
+// Bounding the prewarm during an outage needs a process-wide probe budget, not
+// the gate.
 func (self *SendSequence) prewarmOpeningContract() {
 	if !self.sendBufferSettings.PrewarmOpeningContract {
 		return
