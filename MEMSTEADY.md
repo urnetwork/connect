@@ -6179,17 +6179,17 @@ Android profiles. Simulator-wide heap readings and zero tracked post-join credit
 are not device-runtime memory qualification. The required SN Linux image was
 confirmed present; ordinary SN readiness and resource checks remain required.
 
-## 2026-10-26: C24 original eight-case browsing qualification
+## 2026-10-26 UTC: C24 original eight-case browsing qualification
 
 The original Wi-Fi/cellular profile × inner H1/H2 × normal/race matrix passed all **eight cases** on C24, with outer H1 throughout. Each case retained the strict five-second gate and completed **100 HTML responses, 400 validated-or-canceled asset requests and 99 overlap proofs**. The asset total includes intentional cancellations; it is not a count of 400 complete bodies. Each checked post-join `TotalByteCount` was zero. All recorded test groups, process owners and monitors joined, source checks matched and the cache lease was released.
 
-The largest maximum combined tap-to-first-byte interval among the cases was **3.837206208 s**; the corresponding case's maximum request TTFB was **3.837168333 s**. The separate columns and per-case cancellation counts are in [the C24 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-26-c24-original-eight-case-browsing-qualification).
+The largest maximum combined tap-to-first-byte interval among the cases was **3.837206208 s**; the corresponding case's maximum request TTFB was **3.837168333 s**. The separate columns and per-case cancellation counts are in [the C24 measurement table](../tests/PERFVAR-MEASUREMENTS.md#2026-10-26-utc-c24-original-eight-case-browsing-qualification).
 
 This qualifies one original eight-case execution at Connect `2849685f`, Server `ce2b19e0`, SDK `b5ea15df`, Tests `52a3e7fe`. It is not a statistical baseline, an isolated fix-effect estimate or historical-incident attribution. Earlier C23 failures remain retained. Zero checked post-join usage does not establish an actual iOS footprint or physical 32/64 MiB qualification. Full-six correctness, 48 family invocations plus 60 benchmark processes and native/physical memory qualification remain incomplete. This original-eight result predates the mixed-ACK candidate; its later scoped results are recorded below.
 
 Evidence: [closed C24 final custody](/private/tmp/urnetwork-c24-full8-final.cm__z6n0/FINAL-CUSTODY.json), SHA-256 `b80189ccea7a1dc0ca3197a495dce1f6adf659e30ac9022c8dfee5344871c942`.
 
-## 2026-10-26: Controlled mixed-ACK H1 recovery and allocation qualification
+## 2026-10-27 UTC: Controlled mixed-ACK H1 recovery and allocation qualification
 
 The scoped pilot is qualified. Its exact executable afterimages have now been integrated locally; integrated-source full-suite and device qualification remain pending.
 
