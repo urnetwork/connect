@@ -6,9 +6,9 @@ import (
 )
 
 // The package-level throttles (dropErrThrottle in transfer.go, oobErrThrottle
-// in transfer_contract_manager.go, authErrThrottle/writeErrThrottle in
-// transport.go) exist to bound exactly the log lines named in log_throttle.go's
-// doc comment. These tests pin the wiring: each `shouldLog*Err` wrapper must
+// and oobRateLimitThrottle in transfer_contract_manager.go,
+// authErrThrottle/writeErrThrottle in transport.go) exist to bound exactly the
+// log lines named in log_throttle.go's doc comment. These tests pin the wiring: each `shouldLog*Err` wrapper must
 // read/write the same persistent, package-level *logThrottle on every call,
 // not construct a fresh one — a fresh one would defeat throttling entirely,
 // since every call would see a zero `lastNanos` and be allowed.
@@ -38,6 +38,10 @@ func TestShouldLogDropErr_PersistsThrottleAcrossCalls(t *testing.T) {
 
 func TestShouldLogOobErr_PersistsThrottleAcrossCalls(t *testing.T) {
 	assertAtMostOneAllowed(t, "shouldLogOobErr", shouldLogOobErr)
+}
+
+func TestShouldLogOobRateLimit_PersistsThrottleAcrossCalls(t *testing.T) {
+	assertAtMostOneAllowed(t, "shouldLogOobRateLimit", shouldLogOobRateLimit)
 }
 
 func TestShouldLogAuthErr_PersistsThrottleAcrossCalls(t *testing.T) {
@@ -73,10 +77,11 @@ func TestShouldLogDropErr_SuppressedCallReportsZero(t *testing.T) {
 // (over-suppressing) interval.
 func TestPackageLogThrottles_ConfiguredForOneMinute(t *testing.T) {
 	throttles := map[string]*logThrottle{
-		"dropErrThrottle":  dropErrThrottle,
-		"oobErrThrottle":   oobErrThrottle,
-		"authErrThrottle":  authErrThrottle,
-		"writeErrThrottle": writeErrThrottle,
+		"dropErrThrottle":      dropErrThrottle,
+		"oobErrThrottle":       oobErrThrottle,
+		"oobRateLimitThrottle": oobRateLimitThrottle,
+		"authErrThrottle":      authErrThrottle,
+		"writeErrThrottle":     writeErrThrottle,
 	}
 	for name, th := range throttles {
 		if th == nil {
@@ -88,12 +93,13 @@ func TestPackageLogThrottles_ConfiguredForOneMinute(t *testing.T) {
 	}
 }
 
-// The four throttles must be four distinct instances. Sharing an instance
-// between call sites (e.g. a copy-paste that reused a variable) would let an
-// auth-error flood suppress an unrelated write-error line, silently losing
-// signal on a fault the throttle was never meant to touch.
+// The throttles must be distinct instances. Sharing an instance between call
+// sites (e.g. a copy-paste that reused a variable) would let an auth-error
+// flood suppress an unrelated write-error line, or a rate-limit flood an
+// out-of-band failure, silently losing signal on a fault the throttle was
+// never meant to touch.
 func TestPackageLogThrottles_AreDistinctInstances(t *testing.T) {
-	all := []*logThrottle{dropErrThrottle, oobErrThrottle, authErrThrottle, writeErrThrottle}
+	all := []*logThrottle{dropErrThrottle, oobErrThrottle, oobRateLimitThrottle, authErrThrottle, writeErrThrottle}
 	for i := range all {
 		for j := range all {
 			if i == j {

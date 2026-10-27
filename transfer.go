@@ -5249,6 +5249,9 @@ type SendBufferSettings struct {
 	createContractRetryRandomForTest func(n int64) int64
 	// Nil reads the process-wide degraded-backend gate (isBackendDegraded).
 	backendDegradedForTest func() bool
+	// Nil test observer runs as a due successor's request takes the queue
+	// and admission locks (maybeRequestSuccessorContract).
+	beforeSuccessorContractRequestForTest func(sendSequenceId)
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
 	// MinResendInterval is the resend floor while no rtt samples exist (the
@@ -6738,6 +6741,10 @@ type SendSequence struct {
 	// a contract becomes current. Owned by the sequence goroutine.
 	successorContractRequested bool
 	sendContractSetTime        time.Time
+	// The manager's rate-limit refusal count when the successor was marked
+	// requested (ContractManager.createContractRateLimitRefusalCount). Once
+	// it moves, the successor's own request may have been the one refused.
+	successorContractRequestedRefusals uint64
 	// Whether the current contract's successor is requested at take and at
 	// announcement rather than once it is due (`successorContractEagerForKey`).
 	successorContractEager bool
@@ -10312,16 +10319,20 @@ func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 // requesting and keep the OOB storm going for exactly the sequences that still
 // have work to do. The contract in use is unaffected: only its successor waits
 // for the backend.
+//
+// Returns whether a request for the successor is in flight. A request the
+// client's rate-limit hold dropped is none, so the successor stays due and is
+// asked for by the first write after the hold ends; reported as made, it was
+// never asked for until the contract ran out.
 func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteCount ByteCount) bool {
 	if self.backendDegraded() {
 		return false
 	}
-	self.client.ContractManager().CreateContract(
+	return self.client.ContractManager().createContract(
 		key,
 		self.contractSeqIndex,
 		ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
 	)
-	return true
 }
 
 // Requests the current contract's successor the first time it is due (see
@@ -10332,22 +10343,60 @@ func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteC
 // path, which retires it. Nothing here blocks.
 func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCount) {
 	contract := self.sendContract
-	if contract == nil || self.successorContractEager || self.successorContractRequested {
+	if contract == nil || self.successorContractEager {
+		return
+	}
+	if self.successorContractRequested && !self.successorContractRefused() {
 		return
 	}
 	due, checkRemainingByteCount := self.successorContractDue(contract)
 	if due {
+		manager := self.client.ContractManager()
+		// While the client's rate-limit hold runs the request would only be
+		// dropped. Leave the successor due for the first write after the
+		// hold, without the queue and admission locks on every write until
+		// then. Lock-free: a hold this read misses, admission still drops.
+		if manager.createContractRateLimitHeld(time.Now()) {
+			contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+			return
+		}
 		metadata := self.contractMetadata()
 		if self.sendContractMetadataGeneration != metadata.generation {
 			return
 		}
-		if self.client.ContractManager().hasQueuedContract(metadata.key) ||
+		if self.sendBufferSettings.beforeSuccessorContractRequestForTest != nil {
+			self.sendBufferSettings.beforeSuccessorContractRequestForTest(self.id())
+		}
+		// read before asking: a refusal answered during the request, as a
+		// synchronous control answers it, must read as after the mark
+		refusals := manager.createContractRateLimitRefusalCount()
+		if manager.hasQueuedContract(metadata.key) ||
 			self.requestSuccessorContract(metadata.key, messageByteCount) {
 			self.successorContractRequested = true
+			self.successorContractRequestedRefusals = refusals
 			checkRemainingByteCount = 0
 		}
 	}
 	contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+}
+
+// Whether the successor marked requested has since been refused as a rate
+// limit. Such a request never queues a contract, so the successor is due
+// again, as a request a hold dropped is. One atomic read per write until a
+// refusal comes, then one locked read of the key; either way the mark is
+// current again afterwards.
+func (self *SendSequence) successorContractRefused() bool {
+	manager := self.client.ContractManager()
+	refusals := manager.createContractRateLimitRefusalCount()
+	if refusals == self.successorContractRequestedRefusals {
+		return false
+	}
+	self.successorContractRequestedRefusals = refusals
+	if !manager.createContractRateLimitedKey(self.contractMetadata().key) {
+		return false
+	}
+	self.successorContractRequested = false
+	return true
 }
 
 // The successor is due once the contract has carried
