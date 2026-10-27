@@ -713,11 +713,11 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 	manager := &ContractManager{settings: settings, localStats: NewContractManagerStats()}
 	now := time.Unix(1000, 0)
 	for _, want := range []time.Duration{5 * time.Second, 10 * time.Second, 10 * time.Second} {
-		hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, now, now)
+		hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, now)
 		if hold != want {
 			t.Fatalf("hold = %s, want %s", hold, want)
 		}
-		if ignored := manager.noteCreateContractRateLimited(contractRateLimitTestKey, now, now.Add(time.Second)); ignored != 0 {
+		if ignored := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, now.Add(time.Second)); ignored != 0 {
 			t.Fatalf("a refusal inside the running hold started a %s hold", ignored)
 		}
 		if want := now.Add(hold); manager.createContractRateLimitHoldEnd() != want {
@@ -729,26 +729,26 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 		t.Fatalf("refusal count = %d, want 3, one per hold", manager.createContractRateLimitCount)
 	}
 	// complete a request inside one more running hold
-	holdUntil := now.Add(manager.noteCreateContractRateLimited(contractRateLimitTestKey, now, now))
+	holdUntil := now.Add(manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, now))
 	manager.noteCreateContractCompleted()
 	if manager.createContractRateLimitHoldEnd() != holdUntil {
 		t.Fatalf("a completed request cut the running hold to %s, want %s", manager.createContractRateLimitHoldEnd(), holdUntil)
 	}
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, holdUntil, holdUntil); hold != 5*time.Second {
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, holdUntil); hold != 5*time.Second {
 		t.Fatalf("hold after a completed request = %s, want the minimum", hold)
 	}
 
 	jitterSettings := DefaultContractManagerSettings()
 	jitterSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return 0 }
 	jitterManager := &ContractManager{settings: jitterSettings, localStats: NewContractManagerStats()}
-	if hold := jitterManager.noteCreateContractRateLimited(contractRateLimitTestKey, time.Unix(1000, 0), time.Unix(1000, 0)); hold != 3750*time.Millisecond {
+	if hold := jitterManager.noteCreateContractRateLimited(contractRateLimitTestKey, 0, time.Unix(1000, 0)); hold != 3750*time.Millisecond {
 		t.Fatalf("jittered hold = %s, want the bottom of [3.75s, 6.25s)", hold)
 	}
 
 	disabledSettings := DefaultContractManagerSettings()
 	disabledSettings.CreateContractRateLimitBackoffMin = 0
 	disabledManager := &ContractManager{settings: disabledSettings, localStats: NewContractManagerStats()}
-	if hold := disabledManager.noteCreateContractRateLimited(contractRateLimitTestKey, time.Unix(1000, 0), time.Unix(1000, 0)); hold != 0 {
+	if hold := disabledManager.noteCreateContractRateLimited(contractRateLimitTestKey, 0, time.Unix(1000, 0)); hold != 0 {
 		t.Fatalf("disabled hold = %s", hold)
 	}
 	if !disabledManager.createContractRateLimitHoldEnd().IsZero() {
@@ -756,23 +756,24 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 	}
 }
 
-// A refusal of a request sent before the last hold began does not step the
+// A refusal of a request admitted before the last hold began does not step the
 // backoff, even when it arrives after that hold ended: the request was in
 // flight when the hold started, and the hold already answered its round. A
-// request sent after the hold, refused, does step it. Before, the slow refusal
-// started a 10 s hold.
+// request admitted after the hold, refused, does step it. Before, the slow
+// refusal started a 10 s hold.
 func TestContractManagerRateLimitIgnoresRequestsSentBeforeTheHold(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	settings.CreateContractRateLimitJitter = 0
 	manager := &ContractManager{settings: settings, localStats: NewContractManagerStats()}
 	start := time.Unix(1000, 0)
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, start, start); hold != 5*time.Second {
+	before := manager.createContractRateLimitHoldGeneration
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, before, start); hold != 5*time.Second {
 		t.Fatalf("first hold = %s, want 5s", hold)
 	}
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, start.Add(-time.Second), start.Add(6*time.Second)); hold != 0 {
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, before, start.Add(6*time.Second)); hold != 0 {
 		t.Fatalf("a late refusal of a request sent before the hold started a %s hold", hold)
 	}
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, start.Add(6*time.Second), start.Add(7*time.Second)); hold != 10*time.Second {
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, start.Add(7*time.Second)); hold != 10*time.Second {
 		t.Fatalf("a refusal of a request sent after the hold held %s, want the next step's 10s", hold)
 	}
 }
@@ -814,6 +815,50 @@ func TestContractRateLimitLateRefusalOfAnEarlierRequestHoldsNothing(t *testing.T
 	})
 }
 
+// A request admitted after a refusal has read its clock, but before that
+// refusal takes the manager lock and starts its hold, was admitted before the
+// hold began: its refusal, arriving after the hold ended, steps nothing.
+// Before, the hold's start was the refusal's clock read, the request looked
+// sent after it, and its late refusal started a second, longer hold.
+func TestContractRateLimitRequestAdmittedAsTheHoldBeginsStepsNothing(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		oob := &pendingContractOob{}
+		settings := contractRetryTestSettings()
+		// a hold of 4.375 s
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractTestClientWithOob(t, NewId(), oob, settings)
+		t.Cleanup(func() { oob.failAll(contractRateLimitTestError()) })
+		manager := client.ContractManager()
+
+		first := ContractKey{Destination: DestinationId(NewId())}
+		between := ContractKey{Destination: DestinationId(NewId())}
+		manager.CreateContract(first, 0, ByteCount(1024))
+		manager.testingBeforeCreateContractRateLimitedLock = func() {
+			manager.testingBeforeCreateContractRateLimitedLock = nil
+			time.Sleep(time.Millisecond)
+			if !manager.createContract(between, 0, ByteCount(1024)) {
+				t.Error("the request between the refusal's clock read and its lock was not admitted")
+			}
+		}
+		oob.fail(first.Destination.DestinationId, contractRateLimitTestError())
+		if !manager.createContractRateLimitHeld(time.Now()) {
+			t.Fatal("the first refusal started no hold")
+		}
+
+		time.Sleep(6 * time.Second)
+		oob.fail(between.Destination.DestinationId, contractRateLimitTestError())
+		if manager.createContractRateLimitHeld(time.Now()) {
+			t.Error("the late refusal of a request admitted before the hold began started a hold")
+		}
+		if holds := manager.LocalStats().CreateContractRateLimitHoldCount; holds != 1 {
+			t.Fatalf("started %d holds, want 1", holds)
+		}
+	})
+}
+
 // The backoff starts over once the last hold ended more than the longest step
 // ago. Four refusals in a row climb to the 10 s step, and one exactly the
 // longest step after the last hold ended keeps climbing; one an hour later
@@ -825,14 +870,14 @@ func TestContractManagerRateLimitStreakAgesOut(t *testing.T) {
 	manager := &ContractManager{settings: settings, localStats: NewContractManagerStats()}
 	now := time.Unix(1000, 0)
 	for range 4 {
-		now = now.Add(manager.noteCreateContractRateLimited(contractRateLimitTestKey, now, now))
+		now = now.Add(manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, now))
 	}
 	edge := now.Add(settings.CreateContractRateLimitBackoffMax)
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, edge, edge); hold != 10*time.Second {
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, edge); hold != 10*time.Second {
 		t.Fatalf("hold a longest step after the last = %s, want the streak's 10s", hold)
 	}
 	quiet := manager.createContractRateLimitHoldEnd().Add(time.Hour)
-	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, quiet, quiet); hold != 5*time.Second {
+	if hold := manager.noteCreateContractRateLimited(contractRateLimitTestKey, manager.createContractRateLimitHoldGeneration, quiet); hold != 5*time.Second {
 		t.Fatalf("hold after an hour of quiet = %s, want the minimum", hold)
 	}
 	if manager.createContractRateLimitCount != 1 {

@@ -504,9 +504,12 @@ type ContractManager struct {
 	// holding a successor marked requested reads it once per write, and reads
 	// the keys only when it has moved.
 	createContractRateLimitRefusals atomic.Uint64
-	// Protected by mutex. When the running or last hold started: a refusal of
-	// a request sent before it belongs to the round that hold answered.
-	createContractRateLimitHoldStart time.Time
+	// Protected by mutex. How many holds have begun. A request records it when
+	// admitted, under the lock that starts a hold, so a refusal of a request
+	// admitted before the latest hold began is told apart in lock order. A
+	// clock read cannot do it: a refusal reads its clock before it takes the
+	// lock, so a request admitted in between looked sent after the hold began.
+	createContractRateLimitHoldGeneration uint64
 	// Protected by mutex. Keys whose requests the running hold has dropped,
 	// so CreateContractRateLimitDropCount counts each once per hold, however
 	// often its sequence asks. Reset when a hold starts.
@@ -559,6 +562,9 @@ type ContractManager struct {
 	// Tests pause the drain/detach boundary and observe a competing opener.
 	// Nil keeps production queue lifecycle unchanged.
 	testingBeforeOpenContractQueueLock func(ContractKey)
+	// Tests admit another request here, after a refusal has read its clock and
+	// before it takes the manager lock. Nil in production.
+	testingBeforeCreateContractRateLimitedLock func()
 	// Nil test barrier pauses an owned background worker after its cleanup and
 	// before joined completion.
 	beforeWorkerDoneForTest func(string)
@@ -1684,9 +1690,10 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 	// callback until it has consumed or closed every returned reservation. The
 	// generator joins the Client before closing OOB admission, so retaining this
 	// owner also retains permission for the callback's bounded shutdown close.
-	// when the request was admitted, under the same lock that starts a hold,
-	// so a refusal can tell a request sent before the hold from one after it
-	var sentTime time.Time
+	// how many holds had begun when the request was admitted, read under the
+	// lock that starts a hold, so a refusal can tell a request admitted before
+	// the latest hold from one admitted after it
+	var sentHoldGeneration uint64
 	admitted := func() bool {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
@@ -1709,7 +1716,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 		}
 		// asked for again: no longer a refused key
 		delete(self.createContractRateLimitedKeys, contractKey)
-		sentTime = now
+		sentHoldGeneration = self.createContractRateLimitHoldGeneration
 		return true
 	}()
 	if !admitted {
@@ -1791,7 +1798,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 						// every sequence in it, and the next success anywhere
 						// released them all within a second, into the same
 						// bound. Hold only this client instead.
-						hold := self.noteCreateContractRateLimited(contractKey, sentTime, time.Now())
+						hold := self.noteCreateContractRateLimited(contractKey, sentHoldGeneration, time.Now())
 						if ok, suppressed := shouldLogOobRateLimit(); ok {
 							self.client.log.Infof("[contract]oob rate limited, hold %s = %s%s\n", hold, err, suppressedSuffix(suppressed))
 						} else if v := self.client.log.V(1); v.Enabled() {
@@ -1816,18 +1823,22 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 	return true
 }
 
-// Records a contract request for `contractKey`, sent at `sentTime`, refused as
-// a rate limit at `now`, and holds this client's requests for the next step of
-// the backoff. A refusal of a request sent before the last hold began is
-// ignored, whenever it arrives: nothing is sent during a hold, so that request
-// was in flight when the hold started and belongs to the round the hold
-// already answers. Counting it would step the backoff once per request in
-// flight instead of once per refusal, and a slow refusal arriving after the
-// hold ended would start a longer one. A refusal more than the longest step
-// after the last hold ended starts the backoff over: the platform has had room
-// since, and an old streak says nothing about this one. Returns the hold this
-// refusal started, 0 when it started none.
-func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractKey, sentTime time.Time, now time.Time) time.Duration {
+// Records a contract request for `contractKey`, admitted when
+// `sentHoldGeneration` holds had begun, refused as a rate limit at `now`, and
+// holds this client's requests for the next step of the backoff. A refusal of
+// a request admitted before the latest hold began is ignored, whenever it
+// arrives: nothing is admitted during a hold, so that request was in flight
+// when the hold started and belongs to the round the hold already answers.
+// Counting it would step the backoff once per request in flight instead of
+// once per refusal, and a slow refusal arriving after the hold ended would
+// start a longer one. A refusal more than the longest step after the last
+// hold ended starts the backoff over: the platform has had room since, and an
+// old streak says nothing about this one. Returns the hold this refusal
+// started, 0 when it started none.
+func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractKey, sentHoldGeneration uint64, now time.Time) time.Duration {
+	if self.testingBeforeCreateContractRateLimitedLock != nil {
+		self.testingBeforeCreateContractRateLimitedLock()
+	}
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	// Refused, whether or not the refusal steps the backoff, so a sequence
@@ -1847,9 +1858,7 @@ func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractK
 	if now.Before(holdEnd) {
 		return 0
 	}
-	// admitted no later than the hold began, so admitted before it: a request
-	// admitted once a hold has begun is dropped instead
-	if !self.createContractRateLimitHoldStart.IsZero() && !sentTime.After(self.createContractRateLimitHoldStart) {
+	if sentHoldGeneration != self.createContractRateLimitHoldGeneration {
 		return 0
 	}
 	streakTimeout := max(
@@ -1874,7 +1883,7 @@ func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractK
 		return 0
 	}
 	holdUntil := now.Add(hold)
-	self.createContractRateLimitHoldStart = now
+	self.createContractRateLimitHoldGeneration += 1
 	self.createContractRateLimitHoldUntil.Store(&holdUntil)
 	self.createContractRateLimitDroppedKeys = nil
 	self.localStats.CreateContractRateLimitHoldCount += 1
