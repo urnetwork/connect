@@ -378,7 +378,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// the outage amplification in
 		// https://github.com/urnetwork/connect/issues/181. Two keeps the
 		// losing-first-pick cover for the moment the backend recovers; the
-		// bound lifts on the first successful backend round-trip.
+		// bound lifts on the first successful backend round-trip. The same
+		// bound applies to a race whose candidates include a client the
+		// platform is rate limiting (contractRateLimitHeldChannels), for as
+		// long as its hold runs.
 		// 0 disables the degraded bound.
 		MultiRaceDegradedClientCount: 2,
 
@@ -7430,7 +7433,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 // multiRaceClientCount is how many of the orderedCount race candidates one
 // cold-start race dials: all of them, truncated to configuredCount when that is
 // set (MultiRaceClientCount), and further to degradedCount while the backend is
-// degraded (MultiRaceDegradedClientCount). A zero count leaves its bound off.
+// degraded or a candidate's client is rate limited
+// (MultiRaceDegradedClientCount). A zero count leaves its bound off.
 func multiRaceClientCount(orderedCount int, configuredCount int, degradedCount int, degraded bool) int {
 	count := orderedCount
 	if 0 < configuredCount && configuredCount < count {
@@ -7848,7 +7852,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
 					self.settings.MultiRaceDegradedClientCount,
-					self.backendDegraded(),
+					// a race that includes a rate-limited client is bounded like
+					// one during an outage (contractRateLimitHeldChannels)
+					self.backendDegraded() || contractRateLimitHeldChannels(orderedClients, time.Now()),
 				)]
 
 				// Publish the race and every candidate before any SendGroup call.
@@ -11374,6 +11380,29 @@ func (self *multiClientWindow) backendDegraded() bool {
 	return isBackendDegraded()
 }
 
+// Whether the platform is rate limiting the contract requests of any of these
+// channels' clients (ContractManager.createContractRateLimitHeld). A window
+// reads it as a degraded backend scoped to itself: while one of its own
+// clients is held it does not grow (resize) and its races dial at most
+// MultiRaceDegradedClientCount exits. A client minted meanwhile would be
+// minted into the same refusal, and a race copy sent to a held client waits
+// for a contract it cannot get yet, then asks for one after the hold, while
+// the platform is shedding load. A hold lasts 12.5 s at most and leaves the
+// process-wide gate alone, so a sibling window, and the window itself once
+// the hold ends, grows as usual. Lock-free; a bare fixture channel has no
+// client and is never held.
+func contractRateLimitHeldChannels(channels []*multiClientChannel, now time.Time) bool {
+	for _, channel := range channels {
+		if channel == nil || channel.client == nil {
+			continue
+		}
+		if channel.client.ContractManager().createContractRateLimitHeld(now) {
+			return true
+		}
+	}
+	return false
+}
+
 // degradedWindowTarget caps a window's resize target at its current size
 // while the control API is degraded (see isBackendDegraded), so an outage
 // never grows the window. Every client the window adds during an outage is
@@ -13098,8 +13127,10 @@ func (self *multiClientWindow) resize() {
 		)
 
 		// while the control API is unreachable, hold the window at its
-		// current size. See degradedWindowTarget.
-		degraded := self.backendDegraded()
+		// current size. See degradedWindowTarget. So too while the platform
+		// is rate limiting one of the window's own clients, scoped to this
+		// window (contractRateLimitHeldChannels).
+		degraded := self.backendDegraded() || contractRateLimitHeldChannels(self.unorderedClients(), time.Now())
 		targetWindowSize = degradedWindowTarget(targetWindowSize, len(clients), degraded)
 
 		// publish the shortfall for the enumerator (it asks for v6-capable

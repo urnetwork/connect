@@ -495,8 +495,8 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 		if ignored := manager.noteCreateContractRateLimited(now.Add(time.Second)); ignored != 0 {
 			t.Fatalf("a refusal inside the running hold started a %s hold", ignored)
 		}
-		if want := now.Add(hold); manager.createContractRateLimitHoldUntil != want {
-			t.Fatalf("hold until %s, want %s", manager.createContractRateLimitHoldUntil, want)
+		if want := now.Add(hold); manager.createContractRateLimitHoldEnd() != want {
+			t.Fatalf("hold until %s, want %s", manager.createContractRateLimitHoldEnd(), want)
 		}
 		now = now.Add(hold)
 	}
@@ -506,8 +506,8 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 	// complete a request inside one more running hold
 	holdUntil := now.Add(manager.noteCreateContractRateLimited(now))
 	manager.noteCreateContractCompleted()
-	if manager.createContractRateLimitHoldUntil != holdUntil {
-		t.Fatalf("a completed request cut the running hold to %s, want %s", manager.createContractRateLimitHoldUntil, holdUntil)
+	if manager.createContractRateLimitHoldEnd() != holdUntil {
+		t.Fatalf("a completed request cut the running hold to %s, want %s", manager.createContractRateLimitHoldEnd(), holdUntil)
 	}
 	if hold := manager.noteCreateContractRateLimited(holdUntil); hold != 5*time.Second {
 		t.Fatalf("hold after a completed request = %s, want the minimum", hold)
@@ -526,8 +526,8 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 	if hold := disabledManager.noteCreateContractRateLimited(time.Unix(1000, 0)); hold != 0 {
 		t.Fatalf("disabled hold = %s", hold)
 	}
-	if !disabledManager.createContractRateLimitHoldUntil.IsZero() {
-		t.Fatalf("disabled hold set an end %s", disabledManager.createContractRateLimitHoldUntil)
+	if !disabledManager.createContractRateLimitHoldEnd().IsZero() {
+		t.Fatalf("disabled hold set an end %s", disabledManager.createContractRateLimitHoldEnd())
 	}
 }
 
@@ -548,7 +548,7 @@ func TestContractManagerRateLimitStreakAgesOut(t *testing.T) {
 	if hold := manager.noteCreateContractRateLimited(edge); hold != 10*time.Second {
 		t.Fatalf("hold a longest step after the last = %s, want the streak's 10s", hold)
 	}
-	quiet := manager.createContractRateLimitHoldUntil.Add(time.Hour)
+	quiet := manager.createContractRateLimitHoldEnd().Add(time.Hour)
 	if hold := manager.noteCreateContractRateLimited(quiet); hold != 5*time.Second {
 		t.Fatalf("hold after an hour of quiet = %s, want the minimum", hold)
 	}

@@ -491,10 +491,13 @@ type ContractManager struct {
 	workers           *lifecycleAdmission
 	closeControlSyncs map[*ControlSync]bool
 	// Protected by mutex. Consecutive contract requests refused as a rate
-	// limit, and the end of the hold they set. See
-	// CreateContractRateLimitBackoffMin.
-	createContractRateLimitCount     int
-	createContractRateLimitHoldUntil time.Time
+	// limit. See CreateContractRateLimitBackoffMin.
+	createContractRateLimitCount int
+	// The end of the running or last rate-limit hold, nil before any. Written
+	// under mutex with the count; read without it by the checks a send
+	// sequence and a window make on every write and race
+	// (createContractRateLimitHeld).
+	createContractRateLimitHoldUntil atomic.Pointer[time.Time]
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -1669,7 +1672,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 		if self.closed {
 			return false
 		}
-		if time.Now().Before(self.createContractRateLimitHoldUntil) {
+		if self.createContractRateLimitHeld(time.Now()) {
 			self.localStats.CreateContractRateLimitDropCount += 1
 			return false
 		}
@@ -1790,15 +1793,15 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.Duration {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if now.Before(self.createContractRateLimitHoldUntil) {
+	holdEnd := self.createContractRateLimitHoldEnd()
+	if now.Before(holdEnd) {
 		return 0
 	}
 	streakTimeout := max(
 		self.settings.CreateContractRateLimitBackoffMin,
 		self.settings.CreateContractRateLimitBackoffMax,
 	)
-	if !self.createContractRateLimitHoldUntil.IsZero() &&
-		streakTimeout < now.Sub(self.createContractRateLimitHoldUntil) {
+	if !holdEnd.IsZero() && streakTimeout < now.Sub(holdEnd) {
 		self.createContractRateLimitCount = 0
 	}
 	self.createContractRateLimitCount += 1
@@ -1815,9 +1818,26 @@ func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.D
 		// disabled: the sequences retry on their own schedule
 		return 0
 	}
-	self.createContractRateLimitHoldUntil = now.Add(hold)
+	holdUntil := now.Add(hold)
+	self.createContractRateLimitHoldUntil.Store(&holdUntil)
 	self.localStats.CreateContractRateLimitHoldCount += 1
 	return hold
+}
+
+// The end of the running or last rate-limit hold; zero before any.
+func (self *ContractManager) createContractRateLimitHoldEnd() time.Time {
+	if holdUntil := self.createContractRateLimitHoldUntil.Load(); holdUntil != nil {
+		return *holdUntil
+	}
+	return time.Time{}
+}
+
+// Whether a rate-limit hold is running at `now`. Lock-free, so a send
+// sequence and a window can ask on every write and race: a refusal racing this
+// read can start a hold it misses, and CreateContract's admission, under the
+// mutex, still drops what that lets through.
+func (self *ContractManager) createContractRateLimitHeld(now time.Time) bool {
+	return now.Before(self.createContractRateLimitHoldEnd())
 }
 
 // A completed request ends the rate-limit streak, so the next refusal holds
