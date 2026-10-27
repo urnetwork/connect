@@ -7848,13 +7848,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return
 
 			default:
+				// a client whose contract requests are held races last, and a
+				// race that would still send to one is bounded like one during
+				// an outage (contractRateLimitHeldRaced)
+				raceTime := time.Now()
+				orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
 					self.settings.MultiRaceDegradedClientCount,
-					// a race that includes a rate-limited client is bounded like
-					// one during an outage (contractRateLimitHeldChannels)
-					self.backendDegraded() || contractRateLimitHeldChannels(orderedClients, time.Now()),
+					self.backendDegraded() || contractRateLimitHeldRaced(orderedClients, self.settings.MultiRaceClientCount, raceTime),
 				)]
 
 				// Publish the race and every candidate before any SendGroup call.
@@ -11383,20 +11386,62 @@ func (self *multiClientWindow) backendDegraded() bool {
 // Whether the platform is rate limiting the contract requests of any of these
 // channels' clients (ContractManager.createContractRateLimitHeld). A window
 // reads it as a degraded backend scoped to itself: while one of its own
-// clients is held it does not grow (resize) and its races dial at most
-// MultiRaceDegradedClientCount exits. A client minted meanwhile would be
-// minted into the same refusal, and a race copy sent to a held client waits
-// for a contract it cannot get yet, then asks for one after the hold, while
-// the platform is shedding load. A hold lasts 12.5 s at most and leaves the
-// process-wide gate alone, so a sibling window, and the window itself once
-// the hold ends, grows as usual. Lock-free; a bare fixture channel has no
-// client and is never held.
+// clients is held it does not grow (resize), and a race that would send to a
+// held client dials at most MultiRaceDegradedClientCount exits
+// (contractRateLimitHeldRaced). A client minted meanwhile would be minted into
+// the same refusal, and a race copy sent to a held client waits for a contract
+// it cannot get yet, then asks for one after the hold, while the platform is
+// shedding load. A hold lasts 12.5 s at most and leaves the process-wide gate
+// alone, so a sibling window, and the window itself once the hold ends, grows
+// as usual. Lock-free; a bare fixture channel has no client and is never held.
 func contractRateLimitHeldChannels(channels []*multiClientChannel, now time.Time) bool {
 	for _, channel := range channels {
-		if channel == nil || channel.client == nil {
-			continue
+		if contractRateLimitHeldChannel(channel, now) {
+			return true
 		}
-		if channel.client.ContractManager().createContractRateLimitHeld(now) {
+	}
+	return false
+}
+
+func contractRateLimitHeldChannel(channel *multiClientChannel, now time.Time) bool {
+	return channel != nil && channel.client != nil && channel.client.ContractManager().createContractRateLimitHeld(now)
+}
+
+// contractRateLimitHeldLast is a race's candidates with the held ones
+// (contractRateLimitHeldChannel) after the rest, each part in its own order,
+// so a bounded race spends its slots on exits that can take a new contract.
+// It returns the candidates as they are when none is held, and a reordered
+// copy otherwise, so the caller's list keeps its order.
+func contractRateLimitHeldLast(orderedClients []*multiClientChannel, now time.Time) []*multiClientChannel {
+	if !contractRateLimitHeldChannels(orderedClients, now) {
+		return orderedClients
+	}
+	sorted := make([]*multiClientChannel, 0, len(orderedClients))
+	var held []*multiClientChannel
+	for _, client := range orderedClients {
+		if contractRateLimitHeldChannel(client, now) {
+			held = append(held, client)
+		} else {
+			sorted = append(sorted, client)
+		}
+	}
+	return append(sorted, held...)
+}
+
+// contractRateLimitHeldRaced is whether a race over orderedClients, ordered by
+// contractRateLimitHeldLast, would send to a held client at its configured
+// width, so the race is bounded to MultiRaceDegradedClientCount. A race the
+// held clients fall outside of is not cut. Neither is a field of benched
+// exits only, which is what a window offers once its ordinary offer is empty
+// (lastResortClients): that race is how the window finds the exit still
+// moving bytes, and it keeps its full width.
+func contractRateLimitHeldRaced(orderedClients []*multiClientChannel, configured int, now time.Time) bool {
+	width := multiRaceClientCount(len(orderedClients), configured, 0, false)
+	if !contractRateLimitHeldChannels(orderedClients[:width], now) {
+		return false
+	}
+	for _, client := range orderedClients {
+		if !client.isWarning() {
 			return true
 		}
 	}

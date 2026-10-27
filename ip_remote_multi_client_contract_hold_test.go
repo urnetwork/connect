@@ -1,17 +1,21 @@
 // A window reads a contract rate-limit hold on one of its own clients as a
-// degraded backend scoped to itself: it does not grow, and its races dial at
-// most MultiRaceDegradedClientCount exits, while the process-wide
-// degraded-backend gate and every sibling window are untouched. Every identity
-// and destination here is synthetic.
+// degraded backend scoped to itself: it does not grow, and a race that would
+// send to a held client dials at most MultiRaceDegradedClientCount exits, with
+// the held ones last, while the process-wide degraded-backend gate and every
+// sibling window are untouched. Every identity and destination here is
+// synthetic.
 package connect
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // A quality window whose one installed client is `client`, with the real
@@ -167,9 +171,9 @@ func TestContractRateLimitHeldChannels(t *testing.T) {
 	})
 }
 
-// The growth gate and the race bound are only worth anything where they are
-// consulted. Pin both call sites: the resize gate before expand, and the race
-// truncation over the race's own candidates.
+// The growth gate is only worth anything where it is consulted: before expand
+// in resize. The race bound is covered by behaviour
+// (TestMultiClientRaceWithAContractRateLimitedClient).
 func TestContractRateLimitHeldWindowSourceAnchors(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
@@ -186,11 +190,197 @@ func TestContractRateLimitHeldWindowSourceAnchors(t *testing.T) {
 	if expand := strings.Index(resize, "addedCount = self.expand("); expand < 0 || expand < gate {
 		t.Error("the rate-limit gate must apply before expand")
 	}
-	race, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(")
-	if !ok {
-		t.Fatal("could not find sendParsedPacketGroupAttempt")
+}
+
+// A client whose contract requests are held for about an hour: its one
+// request was refused as a rate limit, and the fixture control answers before
+// CreateContract returns.
+func contractHeldTestClient(t *testing.T) *Client {
+	t.Helper()
+	settings := contractRetryTestSettings()
+	settings.ContractManagerSettings.CreateContractRateLimitBackoffMin = time.Hour
+	settings.ContractManagerSettings.CreateContractRateLimitBackoffMax = time.Hour
+	client := newContractRetryTestClient(t, &contractRetryOob{
+		clientId: NewId(),
+		answer:   func(int) contractRetryAnswer { return contractRetryRateLimit },
+	}, settings)
+	client.ContractManager().CreateContract(ContractKey{Destination: DestinationId(NewId())}, 0, ByteCount(1024))
+	if !client.ContractManager().createContractRateLimitHeld(time.Now()) {
+		t.Fatal("the client's contract requests are not held after a refusal")
 	}
-	if !strings.Contains(race, "self.backendDegraded() || contractRateLimitHeldChannels(orderedClients, time.Now())") {
-		t.Error("a race that includes a rate-limited client is not bounded")
+	return client
+}
+
+func TestContractRateLimitHeldLast(t *testing.T) {
+	heldClient := contractHeldTestClient(t)
+	channels := make([]*multiClientChannel, 4)
+	for i := range channels {
+		channels[i] = stallTestChannel()
 	}
+	channels[0].client = heldClient
+	channels[2].client = heldClient
+	original := slices.Clone(channels)
+	now := time.Now()
+
+	sorted := contractRateLimitHeldLast(channels, now)
+	if want := []*multiClientChannel{original[1], original[3], original[0], original[2]}; !slices.Equal(sorted, want) {
+		t.Errorf("held channels not sorted last in their own order: got %v, want %v", channelIndexes(original, sorted), channelIndexes(original, want))
+	}
+	if !slices.Equal(channels, original) {
+		t.Errorf("the caller's list was reordered: %v", channelIndexes(original, channels))
+	}
+
+	unheld := []*multiClientChannel{original[1], original[3]}
+	if got := contractRateLimitHeldLast(unheld, now); &got[0] != &unheld[0] || len(got) != len(unheld) {
+		t.Error("a list without a held channel was copied")
+	}
+}
+
+func TestContractRateLimitHeldRaced(t *testing.T) {
+	heldClient := contractHeldTestClient(t)
+	channel := func(held bool, benched bool) *multiClientChannel {
+		channel := stallTestChannel()
+		if held {
+			channel.client = heldClient
+		}
+		channel.warning = benched
+		return channel
+	}
+	cases := []struct {
+		name       string
+		channels   []*multiClientChannel
+		configured int
+		want       bool
+	}{
+		{"none held", []*multiClientChannel{channel(false, false), channel(false, false), channel(false, false)}, 0, false},
+		{"held within the unbounded width", []*multiClientChannel{channel(false, false), channel(false, false), channel(true, false)}, 0, true},
+		{"held within the configured width", []*multiClientChannel{channel(false, false), channel(false, false), channel(true, false)}, 3, true},
+		{"held past the configured width", []*multiClientChannel{channel(false, false), channel(false, false), channel(true, false)}, 2, false},
+		{"benched field", []*multiClientChannel{channel(false, true), channel(false, true), channel(true, true)}, 0, false},
+		{"one exit not benched", []*multiClientChannel{channel(false, true), channel(false, false), channel(true, true)}, 0, true},
+	}
+	for _, c := range cases {
+		if got := contractRateLimitHeldRaced(c.channels, c.configured, time.Now()); got != c.want {
+			t.Errorf("%s: contractRateLimitHeldRaced = %t, want %t", c.name, got, c.want)
+		}
+	}
+}
+
+// End to end through sendPacketGroup, a cold-start SYN raced to four exits
+// with the backend healthy: a held exit is sent the packet last, the race is
+// cut to MultiRaceDegradedClientCount (2) only when a held exit would be
+// raced, and a field of benched exits, the window's last resort, is raced at
+// full width.
+func TestMultiClientRaceWithAContractRateLimitedClient(t *testing.T) {
+	t.Run("held exit races last in a cut race", func(t *testing.T) {
+		testMultiClientRaceWithHeldClient(t, 0, false, []int{1, 2})
+	})
+	t.Run("held exit past the configured width", func(t *testing.T) {
+		testMultiClientRaceWithHeldClient(t, 3, false, []int{1, 2, 3})
+	})
+	t.Run("benched last-resort field", func(t *testing.T) {
+		testMultiClientRaceWithHeldClient(t, 0, true, []int{0, 1, 2, 3})
+	})
+}
+
+// Races a cold-start SYN to four stalled exits, the first one held and each
+// benched if `benched`, with MultiRaceClientCount `configured`; requires the
+// race to register, and send to, exactly the candidates `want`.
+func testMultiClientRaceWithHeldClient(t *testing.T, configured int, benched bool, want []int) {
+	t.Helper()
+	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	parent.settings.MultiRaceSetOnNoResponseTimeout = 50 * time.Millisecond
+	parent.settings.MultiRaceClientCount = configured
+	parent.backendDegradedForTest = func() bool { return false }
+
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	packet := MessagePoolCopy(ipOosTcpPacketSequence(tcpPath, tcpFlagSyn, 1000, nil))
+	group := requireGroupTestPacketGroup(t, packet)
+	parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{
+		tcpPath.ToIp4Path(): update,
+	}
+
+	const candidateCount = 4
+	sent := make(chan *multiClientChannel, candidateCount)
+	candidates := make([]*multiClientChannel, candidateCount)
+	for i := range candidates {
+		client := groupTestStalledChannel(parent.settings.ProtocolVersion)
+		client.ctx = parent.ctx
+		client.settings = parent.settings
+		client.warning = benched
+		client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
+			sent <- client
+			for packetIndex := range group.packets {
+				MessagePoolReturn(group.packets[packetIndex].packet)
+			}
+			return true, nil
+		}
+		candidates[i] = client
+	}
+	candidates[0].client = contractHeldTestClient(t)
+	parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
+		return candidates
+	}
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- parent.sendPacketGroup(SourceId(NewId()), protocol.ProvideMode_Network, group, time.Second)
+	}()
+
+	// every racer is registered before the first SendGroup call
+	var first *multiClientChannel
+	select {
+	case first = <-sent:
+	case <-time.After(30 * time.Second):
+		t.Fatal("no race candidate was sent the packet")
+	}
+	var registered []*multiClientChannel
+	func() {
+		update.stateLock.Lock()
+		defer update.stateLock.Unlock()
+		if update.race != nil {
+			for client := range update.race.clientStates {
+				registered = append(registered, client)
+			}
+		}
+	}()
+
+	select {
+	case <-result:
+	case <-time.After(30 * time.Second):
+		t.Fatal("race did not complete")
+	}
+	sentTo := []*multiClientChannel{first}
+	for done := false; !done; {
+		select {
+		case client := <-sent:
+			sentTo = append(sentTo, client)
+		default:
+			done = true
+		}
+	}
+
+	if got := sortedChannelIndexes(candidates, registered); !slices.Equal(got, want) {
+		t.Errorf("race registered candidates %v, want %v", got, want)
+	}
+	if got := sortedChannelIndexes(candidates, sentTo); !slices.Equal(got, want) {
+		t.Errorf("packet sent to candidates %v, want %v", got, want)
+	}
+}
+
+// The index in `channels` of each of `of`, -1 for one not in it.
+func channelIndexes(channels []*multiClientChannel, of []*multiClientChannel) []int {
+	indexes := make([]int, len(of))
+	for i, channel := range of {
+		indexes[i] = slices.Index(channels, channel)
+	}
+	return indexes
+}
+
+func sortedChannelIndexes(channels []*multiClientChannel, of []*multiClientChannel) []int {
+	indexes := channelIndexes(channels, of)
+	slices.Sort(indexes)
+	return indexes
 }
