@@ -6844,9 +6844,6 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatchWithPolicy(
 		timeout:   timeout,
 		readyPass: !nativeIngress && 1 < len(groups) && timeout != 0,
 		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
-			if nativeIngress {
-				return self.sendNativePacketGroup(source, provideMode, group, sendTimeout)
-			}
 			return self.sendPacketGroup(source, provideMode, group, sendTimeout)
 		},
 		complete: func(group *ipPacketGroup, success bool) {
@@ -6879,6 +6876,15 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatchWithPolicy(
 					MessagePoolReturn(packet)
 				}
 			}
+			continue
+		}
+		if nativeIngress {
+			var admitted func(int)
+			if accepted != nil {
+				indexes := packetIndexes[group]
+				admitted = func(index int) { accepted[indexes[index]] = true }
+			}
+			sentPacketCount += self.sendNativePacketGroupWithResults(source, provideMode, group, timeout, admitted)
 			continue
 		}
 		batch.offer(group)
@@ -7525,7 +7531,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			if batchAdmission != nil {
 				batchAdmission.stop = true
 			}
-			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
+			self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
 			return
 		}
 		// Passing the gate is only an offer. Neither SYN generation nor the
@@ -7535,7 +7541,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// Generation response ownership is also required when duplicate
 		// suppression is disabled: a new SYN may receive its reply inline.
 		if ipPath.Protocol == IpProtocolTcp {
-			if !sendPacketGroup.prepareCollapseAdmission(update, self) {
+			if !sendPacketGroup.prepareCollapseAdmissionWithRefusal(update, batchAdmission, self) {
 				if batchAdmission != nil {
 					batchAdmission.stop = true
 				}
@@ -7560,7 +7566,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				if batchAdmission != nil {
 					batchAdmission.stop = true
 				}
-				self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
+				self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
 				return true
 			}
 			client = selection.client
@@ -11203,7 +11209,9 @@ type parsedPacketGroup struct {
 	affinitySourceRegistration uint64
 	affinitySourceState        uint8
 	affinitySynReuse           bool
-	synRetry                   *tcpSynRetryRequest
+	// Compacted race copies retain the original owned path allocation.
+	retainedIpPathCount uint32
+	synRetry            *tcpSynRetryRequest
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -17349,6 +17357,7 @@ func sendMultiClientGroupRaceAttempt(
 ) bool {
 	sharedGroup := &parsedPacketGroup{
 		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
+		retainedIpPathCount:   sendPacketGroup.retainedIpPathCount,
 		ipPath:                sendPacketGroup.ipPath,
 		pin:                   sendPacketGroup.pin,
 		byteCount:             sendPacketGroup.byteCount,
@@ -17359,6 +17368,7 @@ func sendMultiClientGroupRaceAttempt(
 	}
 	sharedGroup.affinityTransition.Store(sendPacketGroup.affinityTransition.Load())
 	sharedGroup.affinitySynReuse = sendPacketGroup.affinitySynReuse
+	sharedGroup.completionFlags.Or(sendPacketGroup.completionFlags.Load() & groupCompletionCompactedMetadata)
 	for packetIndex := range sendPacketGroup.packets {
 		sharedGroup.packets[packetIndex] = sendPacketGroup.packets[packetIndex]
 		sharedGroup.packets[packetIndex].packet = MessagePoolShareReadOnly(

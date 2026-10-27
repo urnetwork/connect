@@ -42,15 +42,21 @@ func (admission *tcpSynAdmission) clear() {
 	*admission = tcpSynAdmission{}
 }
 
-func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate, parents ...*RemoteUserNatMultiClient) bool {
+// Compatibility callers retain the same complete-group collapse contract.
+func (self *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate, parents ...*RemoteUserNatMultiClient) bool {
+	return self.prepareCollapseAdmissionWithRefusal(update, nil, parents...)
+}
+
+// Carries the synchronous native refusal receipt through the final lease gate.
+func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multiClientChannelUpdate, batchAdmission *ipPacketGroupAdmission, parents ...*RemoteUserNatMultiClient) bool {
 	update.stateLock.Lock()
 	if len(parents) != 0 {
 		update.sequenceParent = parents[0]
 	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
 	if len(parents) != 0 && parents[0].settings.TcpCollapsePrevention &&
-		!group.reserveTcpRecoveryWithLock(update, parents[0], &admission) {
-		parents[0].tcpCollapseDropCount.Add(uint64(len(group.packets)))
+		!self.reserveTcpRecoveryWithLock(update, parents[0], &admission) {
+		parents[0].recordCollapsedPacketGroup(self, batchAdmission)
 		update.stateLock.Unlock()
 		return false
 	}
@@ -61,8 +67,8 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 	newGeneration := false
 	hasSyn := false
 	sequenceEnd := sequence + 1
-	for i := range group.packets {
-		path := group.packets[i].ipPath
+	for i := range self.packets {
+		path := self.packets[i].ipPath
 		if path.Syn {
 			hasSyn = true
 			newGeneration = newGeneration || hasPriorState && (!seen || sequence != path.SequenceNumber)
@@ -78,22 +84,22 @@ func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChan
 		}
 		// The existing send defer releases this scalar; no descriptor is
 		// linked and no bytes are reserved before successful admission.
-		if group.completionFlags.Or(groupCompletionSynOffer)&groupCompletionSynOffer == 0 {
+		if self.completionFlags.Or(groupCompletionSynOffer)&groupCompletionSynOffer == 0 {
 			update.sequenceSynOffers++
 		}
 	}
 	if newGeneration {
-		if group.admissionObservations == nil {
-			group.admissionObservations = &sendPackAdmissionObservations{}
+		if self.admissionObservations == nil {
+			self.admissionObservations = &sendPackAdmissionObservations{}
 		}
-		observation := &group.admissionObservations.synAdmission
+		observation := &self.admissionObservations.synAdmission
 		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence, sequenceEnd: sequenceEnd}
 		update.synAdmissions = observation
 	}
 	update.stateLock.Unlock()
-	group.collapseAdmission = admission
-	for i := range group.packets {
-		group.packets[i].collapseAdmission = admission
+	self.collapseAdmission = admission
+	for i := range self.packets {
+		self.packets[i].collapseAdmission = admission
 	}
 	return true
 }

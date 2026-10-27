@@ -263,18 +263,18 @@ func TestNativePureAckCannotReleaseMixedCoveredData(t *testing.T) {
 		}
 		providerPackets := watchNativePureAckProvider(t, fixture)
 		ack := groupRecoveryPacket(fixture.initial+1+uint32(len(payload)), base, fixture.window, tcpFlagAck, nil)
-		if count, accepted := offerNativePureAckPackets(t, fixture, data, ack); count != 0 {
-			t.Fatalf("pure ACK released covered upload DATA: count=%d accepted=%v", count, accepted)
+		if count, accepted := offerNativePureAckPackets(t, fixture, data, ack); count != 1 || accepted[0] || !accepted[1] {
+			t.Fatalf("mixed native group lost isolated ACK admission: count=%d accepted=%v", count, accepted)
 		}
 		synctest.Wait()
-		if providerPackets.Load() != 0 {
-			t.Fatal("mixed covered DATA group reached the provider")
+		if providerPackets.Load() != 1 {
+			t.Fatal("mixed native group did not deliver exactly its pure ACK")
 		}
 		if !fixture.offer(ack) {
 			t.Fatal("mixed DATA refusal prevented an independent pure ACK")
 		}
 		synctest.Wait()
-		if providerPackets.Load() != 1 {
+		if providerPackets.Load() != 2 {
 			t.Fatal("independent pure ACK did not reach the provider")
 		}
 		before, drops := time.Now(), fixture.parent.TcpCollapseDropCount()
@@ -282,14 +282,14 @@ func TestNativePureAckCannotReleaseMixedCoveredData(t *testing.T) {
 			t.Fatal("admitted pure ACK erased covered upload DATA")
 		}
 		synctest.Wait()
-		if providerPackets.Load() != 1 || fixture.parent.TcpCollapseDropCount() != drops+1 {
+		if providerPackets.Load() != 2 || fixture.parent.TcpCollapseDropCount() != drops+1 {
 			t.Fatal("covered upload DATA reached the provider after pure ACK admission")
 		}
 		if !fixture.offer(ack) {
 			t.Fatal("covered DATA refusal prevented another independent pure ACK")
 		}
 		synctest.Wait()
-		if providerPackets.Load() != 2 || time.Since(before) != 0 {
+		if providerPackets.Load() != 3 || time.Since(before) != 0 {
 			t.Fatal("repeated pure ACK lost its ordinary admission after covered DATA refusal")
 		}
 	})
