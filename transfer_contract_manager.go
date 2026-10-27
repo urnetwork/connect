@@ -498,7 +498,8 @@ type ContractManager struct {
 	// rate limit and not asked for since, so a send sequence that marked such a
 	// successor requested asks for it again; only kept while a hold is
 	// configured. A key leaves when it is asked for again or its queue is
-	// flushed at its sequence's exit.
+	// flushed at its sequence's exit, and a refusal that arrives after the
+	// flush adds none.
 	createContractRateLimitedKeys map[ContractKey]bool
 	// How many contract requests were refused as a rate limit. A sequence
 	// holding a successor marked requested reads it once per write, and reads
@@ -1798,7 +1799,7 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 						// every sequence in it, and the next success anywhere
 						// released them all within a second, into the same
 						// bound. Hold only this client instead.
-						hold := self.noteCreateContractRateLimited(contractKey, sentHoldGeneration, time.Now())
+						hold := self.noteCreateContractRateLimited(contractKey, contractQueue, sentHoldGeneration, time.Now())
 						if ok, suppressed := shouldLogOobRateLimit(); ok {
 							self.client.log.Infof("[contract]oob rate limited, hold %s = %s%s\n", hold, err, suppressedSuffix(suppressed))
 						} else if v := self.client.log.V(1); v.Enabled() {
@@ -1823,19 +1824,24 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 	return true
 }
 
-// Records a contract request for `contractKey`, admitted when
-// `sentHoldGeneration` holds had begun, refused as a rate limit at `now`, and
-// holds this client's requests for the next step of the backoff. A refusal of
-// a request admitted before the latest hold began is ignored, whenever it
-// arrives: nothing is admitted during a hold, so that request was in flight
-// when the hold started and belongs to the round the hold already answers.
-// Counting it would step the backoff once per request in flight instead of
-// once per refusal, and a slow refusal arriving after the hold ended would
-// start a longer one. A refusal more than the longest step after the last
-// hold ended starts the backoff over: the platform has had room since, and an
-// old streak says nothing about this one. Returns the hold this refusal
-// started, 0 when it started none.
-func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractKey, sentHoldGeneration uint64, now time.Time) time.Duration {
+// Records a contract request for `contractKey`, made through `contractQueue`
+// and admitted when `sentHoldGeneration` holds had begun, refused as a rate
+// limit at `now`, and holds this client's requests for the next step of the
+// backoff. A refusal of a request admitted before the latest hold began is
+// ignored, whenever it arrives: nothing is admitted during a hold, so that
+// request was in flight when the hold started and belongs to the round the
+// hold already answers. Counting it would step the backoff once per request
+// in flight instead of once per refusal, and a slow refusal arriving after
+// the hold ended would start a longer one. A refusal more than the longest
+// step after the last hold ended starts the backoff over: the platform has
+// had room since, and an old streak says nothing about this one. Returns the
+// hold this refusal started, 0 when it started none.
+func (self *ContractManager) noteCreateContractRateLimited(
+	contractKey ContractKey,
+	contractQueue *contractQueue,
+	sentHoldGeneration uint64,
+	now time.Time,
+) time.Duration {
 	if self.testingBeforeCreateContractRateLimitedLock != nil {
 		self.testingBeforeCreateContractRateLimitedLock()
 	}
@@ -1846,8 +1852,11 @@ func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractK
 	// Only while a hold is configured: the hold is what paces that ask, and
 	// without one the sequence asked on every write, each answered with
 	// another 429. With none, a refused successor waits for its contract to
-	// run out, as it did before the hold.
-	if 0 < self.settings.CreateContractRateLimitBackoffMin {
+	// run out, as it did before the hold. Not once the queue is drained: its
+	// sequence has flushed it on exit and will not ask again, and nothing
+	// would clear the key. A flush drains under this lock, so it either came
+	// first or deletes the key after.
+	if 0 < self.settings.CreateContractRateLimitBackoffMin && !contractQueue.Drained() {
 		if self.createContractRateLimitedKeys == nil {
 			self.createContractRateLimitedKeys = map[ContractKey]bool{}
 		}
