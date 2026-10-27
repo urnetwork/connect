@@ -496,8 +496,9 @@ type ContractManager struct {
 	createContractRateLimitCount int
 	// Protected by mutex. Keys whose last contract request was refused as a
 	// rate limit and not asked for since, so a send sequence that marked such a
-	// successor requested asks for it again. A key leaves when it is asked for
-	// again or its queue is flushed at its sequence's exit.
+	// successor requested asks for it again; only kept while a hold is
+	// configured. A key leaves when it is asked for again or its queue is
+	// flushed at its sequence's exit.
 	createContractRateLimitedKeys map[ContractKey]bool
 	// How many contract requests were refused as a rate limit. A sequence
 	// holding a successor marked requested reads it once per write, and reads
@@ -1829,13 +1830,19 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 func (self *ContractManager) noteCreateContractRateLimited(contractKey ContractKey, sentTime time.Time, now time.Time) time.Duration {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	// refused, whether or not the refusal steps the backoff: a sequence that
-	// marked this request made asks for it again
-	if self.createContractRateLimitedKeys == nil {
-		self.createContractRateLimitedKeys = map[ContractKey]bool{}
+	// Refused, whether or not the refusal steps the backoff, so a sequence
+	// that marked this request made asks for it again once the hold allows.
+	// Only while a hold is configured: the hold is what paces that ask, and
+	// without one the sequence asked on every write, each answered with
+	// another 429. With none, a refused successor waits for its contract to
+	// run out, as it did before the hold.
+	if 0 < self.settings.CreateContractRateLimitBackoffMin {
+		if self.createContractRateLimitedKeys == nil {
+			self.createContractRateLimitedKeys = map[ContractKey]bool{}
+		}
+		self.createContractRateLimitedKeys[contractKey] = true
+		self.createContractRateLimitRefusals.Add(1)
 	}
-	self.createContractRateLimitedKeys[contractKey] = true
-	self.createContractRateLimitRefusals.Add(1)
 	holdEnd := self.createContractRateLimitHoldEnd()
 	if now.Before(holdEnd) {
 		return 0

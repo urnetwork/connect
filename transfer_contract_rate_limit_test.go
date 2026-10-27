@@ -371,6 +371,46 @@ func TestContractRateLimitRefusedSuccessorIsAskedAgainAfterTheHold(t *testing.T)
 	})
 }
 
+// With the hold disabled, a successor refused as a rate limit is not asked for
+// again on every write: nothing would pace that, so it waits for its contract
+// to run out, as before the hold. Before, every write asked again, and each ask
+// was refused.
+func TestContractRateLimitDisabledHoldDoesNotReaskARefusedSuccessor(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &contractRetryOob{
+			clientId: NewId(),
+			answer: func(index int) contractRetryAnswer {
+				// the opening contract is granted, every successor refused
+				if index == 0 {
+					return contractRetryGrant
+				}
+				return contractRetryRateLimit
+			},
+		}
+		settings := contractRetryTestSettings()
+		settings.SendBufferSettings.PrewarmOpeningContract = true
+		settings.SendBufferSettings.backendDegradedForTest = func() bool { return false }
+		settings.SendBufferSettings.ContractPrefetchMinUsedByteCount = kib(4)
+		settings.SendBufferSettings.ContractPrefetchLeadTime = time.Hour
+		settings.ContractManagerSettings.CreateContractRateLimitBackoffMin = 0
+		client := newContractRetryTestClient(t, oob, settings)
+
+		destinationId := NewId()
+		sendContractRetryMessage(t, client, destinationId)
+		synctest.Wait()
+		// these bring the successor due, and its one request is refused
+		for range 40 {
+			sendContractRetryContent(t, client, destinationId, strings.Repeat("x", 1024))
+			synctest.Wait()
+		}
+		requireContractRetryOffsets(t, "opening contract and one refused successor", oob.requestOffsets(destinationId, start), []time.Duration{0, 0})
+	})
+}
+
 // A successor due while its client is held costs a write nothing: no queue or
 // admission lock and no dropped request, however many writes the hold sees.
 // The first write after the hold takes the locks and asks. Before, every write
