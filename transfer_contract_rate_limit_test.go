@@ -10,19 +10,105 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
+
+// The 429 a hosted owner's contract admission bound answers with.
+func contractRateLimitTestError() error {
+	return &HttpStatusError{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Body:       []byte("hosted contract creation is at its concurrent bound"),
+	}
+}
+
+// Holds every contract request until the test answers it, so several are in
+// flight at once, as on a slow control path, and records when each arrived.
+// Takes the frames. Other control is answered empty at once.
+type pendingContractOob struct {
+	stateLock sync.Mutex
+	requests  []contractRetryRequest
+	callbacks []OobResultFunction
+}
+
+func (self *pendingContractOob) SendControl(frames []*protocol.Frame, callback OobResultFunction) {
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
+	pending := false
+	for _, frame := range frames {
+		message, err := FromFrame(frame)
+		if err != nil {
+			continue
+		}
+		createContract, ok := message.(*protocol.CreateContract)
+		if !ok {
+			continue
+		}
+		destinationId, err := IdFromBytes(createContract.DestinationId)
+		if err != nil {
+			continue
+		}
+		pending = true
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.requests = append(self.requests, contractRetryRequest{
+				destinationId: destinationId,
+				time:          time.Now(),
+			})
+			self.callbacks = append(self.callbacks, callback)
+		}()
+	}
+	if !pending {
+		callback(nil, nil)
+	}
+}
+
+// Fails every request in flight with `err`, in arrival order. Returns how
+// many it answered.
+func (self *pendingContractOob) failAll(err error) int {
+	callbacks := func() []OobResultFunction {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		callbacks := self.callbacks
+		self.callbacks = nil
+		return callbacks
+	}()
+	for _, callback := range callbacks {
+		callback(nil, err)
+	}
+	return len(callbacks)
+}
+
+// The times of the requests for `destinationId`, as offsets from `start`.
+func (self *pendingContractOob) requestOffsets(destinationId Id, start time.Time) []time.Duration {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	offsets := []time.Duration{}
+	for _, request := range self.requests {
+		if request.destinationId == destinationId {
+			offsets = append(offsets, request.time.Sub(start))
+		}
+	}
+	return offsets
+}
 
 // A client refused with 429s holds its own contract requests for a jittered
 // exponential hold and leaves the process-wide degraded gate alone. Drawing a
-// quarter into each range gives holds of 7/8 of 5, 10 and 20 s, so of the
-// sequence's fixed 0, 1, 3, 7, 12, 17, 22 and 27 s retries only those at 0, 7
-// and 17 s ask; the rest fall in a hold. Before, each 429 was a backend
-// failure: the third tripped the gate and the sequence stopped asking at 3 s,
-// with every other sequence in the process, until a success anywhere released
-// them all within a second.
+// quarter into each range gives holds of 7/8 of 5, then of the 10 s maximum,
+// so of the sequence's fixed 0, 1, 3, 7, 12, 17, 22 and 27 s retries only
+// those at 0, 7, 17 and 27 s ask; the rest fall in a hold. Before, each 429
+// was a backend failure: the third tripped the gate and the sequence stopped
+// asking at 3 s, with every other sequence in the process, until a success
+// anywhere released them all within a second.
 func TestContractRateLimitHoldsClientWithoutDegradingBackend(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	resetBackendDegraded()
@@ -37,9 +123,6 @@ func TestContractRateLimitHoldsClientWithoutDegradingBackend(t *testing.T) {
 		settings.SendBufferSettings.PrewarmOpeningContract = false
 		// the fixed schedule, so only the hold moves the requests
 		settings.SendBufferSettings.CreateContractRetryJitter = 0
-		settings.ContractManagerSettings.CreateContractRateLimitBackoffMin = 5 * time.Second
-		settings.ContractManagerSettings.CreateContractRateLimitBackoffMax = 30 * time.Second
-		settings.ContractManagerSettings.CreateContractRateLimitJitter = 0.5
 		// no hold ends on a retry instant
 		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
 		client := newContractRetryTestClient(t, oob, settings)
@@ -52,9 +135,48 @@ func TestContractRateLimitHoldsClientWithoutDegradingBackend(t *testing.T) {
 			0,
 			7 * time.Second,
 			17 * time.Second,
+			27 * time.Second,
 		})
 		if isBackendDegraded() {
 			t.Fatal("rate limits tripped the process-wide degraded-backend gate")
+		}
+	})
+}
+
+// Requests in flight together and refused together are one refusal: the
+// client holds one step, not one step per request. Three sequences' first
+// requests are all sent before any answer; refused together they hold 7/8 of
+// 5 s, and each sequence asks again at its 7 s retry. Before, the three
+// refusals stepped the backoff three times, the hold grew to 8.75 s, and every
+// retry waited until 12 s.
+func TestContractRateLimitRefusalsTogetherHoldOneStep(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		oob := &pendingContractOob{}
+		settings := contractRetryTestSettings()
+		settings.SendBufferSettings.PrewarmOpeningContract = false
+		settings.SendBufferSettings.CreateContractRetryJitter = 0
+		settings.ContractManagerSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return n / 4 }
+		client := newContractTestClientWithOob(t, NewId(), oob, settings)
+		// the client joins its requests at close, so answer what is left first
+		t.Cleanup(func() { oob.failAll(contractRateLimitTestError()) })
+
+		destinationIds := []Id{NewId(), NewId(), NewId()}
+		for _, destinationId := range destinationIds {
+			sendContractRetryMessage(t, client, destinationId)
+		}
+		synctest.Wait()
+		if count := oob.failAll(contractRateLimitTestError()); count != len(destinationIds) {
+			t.Fatalf("%d requests in flight, want %d", count, len(destinationIds))
+		}
+		// past the 7 s retries, inside the 12 s ones
+		time.Sleep(8 * time.Second)
+		synctest.Wait()
+		for _, destinationId := range destinationIds {
+			requireContractRetryOffsets(t, "sequence refused with two others", oob.requestOffsets(destinationId, start), []time.Duration{0, 7 * time.Second})
 		}
 	})
 }
@@ -190,41 +312,53 @@ func TestCreateContractRateLimitBackoff(t *testing.T) {
 	}
 }
 
-// Each rate limit takes the next step of the backoff and holds from `now`; a
-// completed request restarts the steps without cutting a running hold short;
-// the jitter draws from the top of the step; a disabled minimum holds nothing.
+// A refusal after the running hold has ended takes the next step of the
+// backoff from `now`; one that arrives while the hold runs answers a request
+// sent before it and is ignored, so refusals that arrive together hold one
+// step. A completed request restarts the steps without cutting a running hold
+// short; the jitter draws around the step; a disabled minimum holds nothing.
 func TestContractManagerRateLimitHold(t *testing.T) {
 	settings := DefaultContractManagerSettings()
 	settings.CreateContractRateLimitJitter = 0
 	manager := &ContractManager{settings: settings}
 	now := time.Unix(1000, 0)
-	for _, want := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 24 * time.Second, 24 * time.Second} {
-		if hold := manager.noteCreateContractRateLimited(now); hold != want {
+	for _, want := range []time.Duration{5 * time.Second, 10 * time.Second, 10 * time.Second} {
+		hold := manager.noteCreateContractRateLimited(now)
+		if hold != want {
 			t.Fatalf("hold = %s, want %s", hold, want)
 		}
+		if ignored := manager.noteCreateContractRateLimited(now.Add(time.Second)); ignored != 0 {
+			t.Fatalf("a refusal inside the running hold started a %s hold", ignored)
+		}
+		if want := now.Add(hold); manager.createContractRateLimitHoldUntil != want {
+			t.Fatalf("hold until %s, want %s", manager.createContractRateLimitHoldUntil, want)
+		}
+		now = now.Add(hold)
 	}
-	if want := now.Add(24 * time.Second); manager.createContractRateLimitHoldUntil != want {
-		t.Fatalf("hold until %s, want %s", manager.createContractRateLimitHoldUntil, want)
+	if manager.createContractRateLimitCount != 3 {
+		t.Fatalf("refusal count = %d, want 3, one per hold", manager.createContractRateLimitCount)
 	}
+	// complete a request inside one more running hold
+	holdUntil := now.Add(manager.noteCreateContractRateLimited(now))
 	manager.noteCreateContractCompleted()
-	if hold := manager.noteCreateContractRateLimited(now); hold != 5*time.Second {
-		t.Fatalf("hold after a completed request = %s, want the minimum", hold)
+	if manager.createContractRateLimitHoldUntil != holdUntil {
+		t.Fatalf("a completed request cut the running hold to %s, want %s", manager.createContractRateLimitHoldUntil, holdUntil)
 	}
-	if want := now.Add(24 * time.Second); manager.createContractRateLimitHoldUntil != want {
-		t.Fatalf("a shorter hold cut the running one to %s, want %s", manager.createContractRateLimitHoldUntil, want)
+	if hold := manager.noteCreateContractRateLimited(holdUntil); hold != 5*time.Second {
+		t.Fatalf("hold after a completed request = %s, want the minimum", hold)
 	}
 
 	jitterSettings := DefaultContractManagerSettings()
 	jitterSettings.createContractRateLimitRandomForTest = func(n int64) int64 { return 0 }
 	jitterManager := &ContractManager{settings: jitterSettings}
-	if hold := jitterManager.noteCreateContractRateLimited(now); hold != 3750*time.Millisecond {
+	if hold := jitterManager.noteCreateContractRateLimited(time.Unix(1000, 0)); hold != 3750*time.Millisecond {
 		t.Fatalf("jittered hold = %s, want the bottom of [3.75s, 6.25s)", hold)
 	}
 
 	disabledSettings := DefaultContractManagerSettings()
 	disabledSettings.CreateContractRateLimitBackoffMin = 0
 	disabledManager := &ContractManager{settings: disabledSettings}
-	if hold := disabledManager.noteCreateContractRateLimited(now); hold != 0 {
+	if hold := disabledManager.noteCreateContractRateLimited(time.Unix(1000, 0)); hold != 0 {
 		t.Fatalf("disabled hold = %s", hold)
 	}
 	if !disabledManager.createContractRateLimitHoldUntil.IsZero() {
@@ -233,8 +367,8 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 }
 
 // A rate limit holds the client from the sequences' longest retry interval,
-// with half of each step as jitter, and the longest hold drawn ends at their
-// acquisition budget.
+// with half of each step as jitter, and the longest hold drawn, 12.5 s, ends
+// before a window judges its client unhealthy for the silence.
 func TestCreateContractRateLimitDefaults(t *testing.T) {
 	sendBufferSettings := DefaultSendBufferSettings()
 	contractManagerSettings := DefaultContractManagerSettings()
@@ -245,5 +379,8 @@ func TestCreateContractRateLimitDefaults(t *testing.T) {
 		contractManagerSettings.CreateContractRateLimitJitter,
 		func(n int64) int64 { return n - 1 },
 	)
-	AssertEqual(t, longestHold+time.Nanosecond, sendBufferSettings.CreateContractTimeout)
+	AssertEqual(t, longestHold+time.Nanosecond, 12500*time.Millisecond)
+	if unhealthy := DefaultMultiClientSettings().StatsWindowMaxUnhealthyDuration; unhealthy <= longestHold {
+		t.Fatalf("the longest hold %s reaches the %s a window allows a silent client", longestHold, unhealthy)
+	}
 }

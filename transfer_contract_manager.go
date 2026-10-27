@@ -334,12 +334,12 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		ContractStatsEpoch: 1 * time.Second,
 
-		// a refused client waits 3.75-6.25s, then 7.5-12.5s, 15-25s and
-		// 18-30s, so a refused sequence asks 3 or 4 times in its 30s budget
-		// instead of about 8, and never in step with the other refused
-		// clients
+		// a refused client waits 3.75-6.25s, then 7.5-12.5s for each further
+		// refusal in a row, so a refused sequence asks about 4 times in its
+		// 30s budget instead of about 8, never in step with the other refused
+		// clients, and no hold reaches a window's 15s unhealthy bound
 		CreateContractRateLimitBackoffMin: 5 * time.Second,
-		CreateContractRateLimitBackoffMax: 24 * time.Second,
+		CreateContractRateLimitBackoffMax: 10 * time.Second,
 		CreateContractRateLimitJitter:     0.5,
 
 		ProtocolVersion: DefaultProtocolVersion,
@@ -420,16 +420,20 @@ type ContractManagerSettings struct {
 	// drawn uniformly from [d*(1-jitter/2), d*(1+jitter/2)) with jitter
 	// CreateContractRateLimitJitter, where d starts at
 	// CreateContractRateLimitBackoffMin and doubles per consecutive rate limit
-	// up to CreateContractRateLimitBackoffMax. The mean hold is d. A completed
-	// request ends the streak but not a hold already running. The hold covers
-	// the opening prewarm, successor prefetch and every sequence's retry, all
-	// of which go through CreateContract; the sequences keep waiting for
-	// contracts meanwhile. A rate limit does not feed the process-wide
-	// degraded-backend gate. The default min is the sequences' longest retry
-	// interval, and the default max puts the longest hold drawn,
-	// max*(1+jitter/2), at their CreateContractTimeout, so every hold ends
-	// within one sequence's acquisition budget. Nonpositive min disables the
-	// hold, and the rate limit is then retried on the sequences' own schedule.
+	// up to CreateContractRateLimitBackoffMax. The mean hold is d. A refusal
+	// that arrives while a hold runs does not step the backoff: nothing is sent
+	// during a hold, so it answers a request sent before the hold began, and
+	// requests refused together hold one step. A completed request ends the
+	// streak but not a hold already running. The hold covers the opening
+	// prewarm, successor prefetch and every sequence's retry, all of which go
+	// through CreateContract; the sequences keep waiting for contracts
+	// meanwhile. A rate limit does not feed the process-wide degraded-backend
+	// gate. The default min is the sequences' longest retry interval. The
+	// default max keeps the longest hold drawn, max*(1+jitter/2), under a
+	// window's StatsWindowMaxUnhealthyDuration (15 s): a window client held
+	// longer is judged unhealthy and replaced by a fresh mint, the loop the
+	// hold exists to stop. Nonpositive min disables the hold, and the rate
+	// limit is then retried on the sequences' own schedule.
 	CreateContractRateLimitBackoffMin time.Duration
 	CreateContractRateLimitBackoffMax time.Duration
 	// Nonpositive holds exactly d; above 1 is 1.
@@ -1741,11 +1745,17 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 }
 
 // Records a contract request refused as a rate limit at `now` and holds this
-// client's requests for the next step of the backoff. An existing longer hold
-// is kept. Returns the hold this refusal asked for.
+// client's requests for the next step of the backoff. A refusal that arrives
+// while a hold runs is ignored: nothing is sent during a hold, so it answers a
+// request sent before the hold began, and counting it would step the backoff
+// once per request in flight instead of once per refusal. Returns the hold
+// this refusal started, 0 when it started none.
 func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.Duration {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	if now.Before(self.createContractRateLimitHoldUntil) {
+		return 0
+	}
 	self.createContractRateLimitCount += 1
 	hold := jitterContractRetryWait(
 		createContractRateLimitBackoff(
@@ -1760,9 +1770,7 @@ func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.D
 		// disabled: the sequences retry on their own schedule
 		return 0
 	}
-	if holdUntil := now.Add(hold); self.createContractRateLimitHoldUntil.Before(holdUntil) {
-		self.createContractRateLimitHoldUntil = holdUntil
-	}
+	self.createContractRateLimitHoldUntil = now.Add(hold)
 	return hold
 }
 
