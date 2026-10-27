@@ -869,6 +869,10 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// contract-control/API load for a persistently unavailable destination.
 		CreateContractRetryInterval:    1 * time.Second,
 		CreateContractRetryMaxInterval: 5 * time.Second,
+		// a refused wave comes back spread over half of each interval around
+		// it rather than as one burst, and asks no more often: the first retry
+		// lands within 0.75-1.25s and the mean wait is the interval
+		CreateContractRetryJitter: 0.5,
 		// the COLD resend floor: applies only while no rtt samples exist
 		// (nothing acked yet) — no evidence, so retry conservatively
 		MinResendInterval: 2 * time.Second,
@@ -5230,6 +5234,21 @@ type SendBufferSettings struct {
 	// preserves the historical constant-interval behavior for callers that
 	// construct settings without the new field.
 	CreateContractRetryMaxInterval time.Duration
+	// The width of the random range each retry wait is drawn from, as a
+	// fraction of the interval: a sequence whose contract has not arrived asks
+	// again after a wait uniform in [interval*(1-jitter/2),
+	// interval*(1+jitter/2)). The range is centered on the interval, so the
+	// mean wait, and with it the request rate of a refused sequence, is the
+	// fixed schedule's, and a wait can exceed the interval by jitter/2 (6.25 s
+	// at the 5 s step for 0.5). A deploy or a platform rate limit refuses
+	// thousands of sequences in the same second, and on the fixed schedule
+	// every one of them asked again in the same second, 1, 3, 7 and 12 s
+	// later. Nonpositive keeps the fixed schedule; above 1 is 1.
+	CreateContractRetryJitter float64
+	// Nil draws the retry jitter from math/rand. Returns a value in [0, n).
+	createContractRetryRandomForTest func(n int64) int64
+	// Nil reads the process-wide degraded-backend gate (isBackendDegraded).
+	backendDegradedForTest func() bool
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
 	// MinResendInterval is the resend floor while no rtt samples exist (the
@@ -10140,7 +10159,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		// message. While the backend is unreachable there is nothing to cover:
 		// no contract can be authorized until it returns, so start at the
 		// backed-off interval instead of walking up from 1s on every sequence.
-		if isBackendDegraded() {
+		if self.backendDegraded() {
 			retryInterval = maxRetryInterval
 		}
 
@@ -10196,7 +10215,7 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			// succeed. The loop still waits out the retry interval, so the
 			// sequence resumes promptly once a successful auth or OOB
 			// round-trip clears the degraded state.
-			degraded := isBackendDegraded()
+			degraded := self.backendDegraded()
 			if !degraded {
 				self.client.ContractManager().CreateContract(
 					metadata.key,
@@ -10205,7 +10224,16 @@ func (self *SendSequence) updateContractWithAckPromotion(
 				)
 			}
 
-			wait := min(timeout, retryInterval)
+			// Sequences refused together must not ask again together: a
+			// deploy or a rate limit refuses a whole process's sequences in
+			// one second, and the fixed schedule brought them back as one
+			// burst at every step. A contract that arrives still ends the
+			// wait at once.
+			wait := min(timeout, jitterContractRetryWait(
+				retryInterval,
+				self.sendBufferSettings.CreateContractRetryJitter,
+				self.sendBufferSettings.createContractRetryRandomForTest,
+			))
 			if baseRetryInterval := self.sendBufferSettings.CreateContractRetryInterval; degraded && 0 < baseRetryInterval {
 				// nothing was requested, so this wait only has to notice the
 				// gate clearing: a sequence that began waiting in a short
@@ -10285,7 +10313,7 @@ func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 // have work to do. The contract in use is unaffected: only its successor waits
 // for the backend.
 func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteCount ByteCount) bool {
-	if isBackendDegraded() {
+	if self.backendDegraded() {
 		return false
 	}
 	self.client.ContractManager().CreateContract(
@@ -18338,6 +18366,16 @@ func MessageByteCount(frames []*protocol.Frame) ByteCount {
 // The request is fire-and-forget: CreateContract hands the frame to the control
 // channel with a callback and returns, so this never blocks the caller. The
 // size is left to the contract manager's own ramp -- only a floor is passed.
+//
+// Deliberately not held by the degraded-backend gate (isBackendDegraded),
+// unlike the acquisition loop and successor requests. While the gate is
+// tripped, a new sequence's prewarm is the only contract request that still
+// goes out, and its completed round trip is what clears the gate once the
+// backend is back. Held by the gate, a process with nothing else succeeding
+// waits out the gate's whole recency window (backendDegradedWindow) before any
+// new sequence gets a contract, unless a transport dial happens to succeed.
+// Bounding the prewarm during an outage needs a process-wide probe budget, not
+// the gate.
 func (self *SendSequence) prewarmOpeningContract() {
 	if !self.sendBufferSettings.PrewarmOpeningContract {
 		return
@@ -18356,6 +18394,15 @@ func (self *SendSequence) prewarmOpeningContract() {
 		self.contractSeqIndex,
 		ByteCount(float32(self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
 	)
+}
+
+// The process-wide degraded-backend gate (isBackendDegraded) that this
+// sequence's contract acquisition and successor requests consult.
+func (self *SendSequence) backendDegraded() bool {
+	if self.sendBufferSettings.backendDegradedForTest != nil {
+		return self.sendBufferSettings.backendDegradedForTest()
+	}
+	return isBackendDegraded()
 }
 
 // addContractWaitTime records time the send sequence spent blocked acquiring a

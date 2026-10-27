@@ -2,6 +2,7 @@ package connect
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -12,9 +13,10 @@ import (
 //
 // The degradation state is package-level, so these must not run in parallel.
 
-// Site: SendSequence.updateContract, "if !isBackendDegraded() { CreateContract(...) }"
+// Site: SendSequence.updateContract, "if !self.backendDegraded() { CreateContract(...) }"
 // (the retry-loop call), and SendSequence.requestSuccessorContract, which every
-// successor request goes through.
+// successor request goes through. SendSequence.backendDegraded reads
+// isBackendDegraded.
 func TestGate_ContractCreationSuppressedOnlyWhileDegraded(t *testing.T) {
 	resetBackendDegraded()
 	defer resetBackendDegraded()
@@ -44,7 +46,7 @@ func TestGate_ContractCreationSuppressedOnlyWhileDegraded(t *testing.T) {
 }
 
 // Site: SendSequence.updateContract,
-// "if isBackendDegraded() { retryInterval = maxRetryInterval }".
+// "if self.backendDegraded() { retryInterval = maxRetryInterval }".
 // While degraded, skip the fast first retry and start already backed off.
 func TestGate_ContractRetryStartsBackedOffWhileDegraded(t *testing.T) {
 	resetBackendDegraded()
@@ -112,4 +114,34 @@ func TestNextCreateContractRetryIntervalConvergesToMax(t *testing.T) {
 	if interval != max {
 		t.Fatalf("interval converged to %s, want %s", interval, max)
 	}
+}
+
+// Site: SendSequence.backendDegraded, which the sites above read. A sequence
+// reads the process-wide gate unless a test replaces it. The bubble stamps its
+// own failures, so a stale real-time stamp cannot read as recent inside it.
+func TestSendSequenceBackendDegradedReadsProcessGate(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+	synctest.Test(t, func(t *testing.T) {
+		sequence := &SendSequence{sendBufferSettings: DefaultSendBufferSettings()}
+		if sequence.backendDegraded() {
+			t.Fatal("a clean gate read as degraded")
+		}
+		for range backendDegradedFailThreshold {
+			noteBackendFailure()
+		}
+		if !sequence.backendDegraded() {
+			t.Fatal("the sequence did not read the tripped process-wide gate")
+		}
+		noteBackendSuccess()
+		if sequence.backendDegraded() {
+			t.Fatal("the sequence did not read the cleared process-wide gate")
+		}
+
+		replaced := &SendSequence{sendBufferSettings: DefaultSendBufferSettings()}
+		replaced.sendBufferSettings.backendDegradedForTest = func() bool { return true }
+		if !replaced.backendDegraded() {
+			t.Fatal("the test gate was not read")
+		}
+	})
 }
