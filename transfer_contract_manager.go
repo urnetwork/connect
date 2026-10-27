@@ -334,6 +334,14 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 
 		ContractStatsEpoch: 1 * time.Second,
 
+		// a refused client waits 3.75-6.25s, then 7.5-12.5s, 15-25s and
+		// 18-30s, so a refused sequence asks 3 or 4 times in its 30s budget
+		// instead of about 8, and never in step with the other refused
+		// clients
+		CreateContractRateLimitBackoffMin: 5 * time.Second,
+		CreateContractRateLimitBackoffMax: 24 * time.Second,
+		CreateContractRateLimitJitter:     0.5,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -407,6 +415,29 @@ type ContractManagerSettings struct {
 	// `AddContractStatsCallback` listeners
 	ContractStatsEpoch time.Duration
 
+	// After a contract request is refused as a rate limit (a 429, see
+	// controlRateLimited), this client sends no contract request for a hold
+	// drawn uniformly from [d*(1-jitter/2), d*(1+jitter/2)) with jitter
+	// CreateContractRateLimitJitter, where d starts at
+	// CreateContractRateLimitBackoffMin and doubles per consecutive rate limit
+	// up to CreateContractRateLimitBackoffMax. The mean hold is d. A completed
+	// request ends the streak but not a hold already running. The hold covers
+	// the opening prewarm, successor prefetch and every sequence's retry, all
+	// of which go through CreateContract; the sequences keep waiting for
+	// contracts meanwhile. A rate limit does not feed the process-wide
+	// degraded-backend gate. The default min is the sequences' longest retry
+	// interval, and the default max puts the longest hold drawn,
+	// max*(1+jitter/2), at their CreateContractTimeout, so every hold ends
+	// within one sequence's acquisition budget. Nonpositive min disables the
+	// hold, and the rate limit is then retried on the sequences' own schedule.
+	CreateContractRateLimitBackoffMin time.Duration
+	CreateContractRateLimitBackoffMax time.Duration
+	// Nonpositive holds exactly d; above 1 is 1.
+	CreateContractRateLimitJitter float64
+	// Nil draws the rate-limit hold jitter from math/rand. Returns a value in
+	// [0, n).
+	createContractRateLimitRandomForTest func(n int64) int64
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -435,6 +466,11 @@ type ContractManager struct {
 	closed            bool
 	workers           *lifecycleAdmission
 	closeControlSyncs map[*ControlSync]bool
+	// Protected by mutex. Consecutive contract requests refused as a rate
+	// limit, and the end of the hold they set. See
+	// CreateContractRateLimitBackoffMin.
+	createContractRateLimitCount     int
+	createContractRateLimitHoldUntil time.Time
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -1586,17 +1622,24 @@ func (self *ContractManager) addContractToQueue(
 
 // Coalesces an identical pending request within its exact queue generation.
 // Completion releases admission; this is not remote exactly-once semantics.
+// Dropped while a rate limit holds this client's requests (see
+// CreateContractRateLimitBackoffMin); the caller asks again on its own schedule.
 func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) {
 	// The external OOB owns transport and frame buffers; this manager owns its
 	// callback until it has consumed or closed every returned reservation. The
 	// generator joins the Client before closing OOB admission, so retaining this
 	// owner also retains permission for the callback's bounded shutdown close.
-	self.mutex.Lock()
-	if self.closed || !self.workers.start() {
-		self.mutex.Unlock()
+	admitted := func() bool {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.closed || time.Now().Before(self.createContractRateLimitHoldUntil) {
+			return false
+		}
+		return self.workers.start()
+	}()
+	if !admitted {
 		return
 	}
-	self.mutex.Unlock()
 
 	// Retain ownership through the asynchronous callback. A route promotion can
 	// force-remove and drain this exact generation while the request is in
@@ -1656,6 +1699,7 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
+				self.noteCreateContractCompleted()
 				for _, resultFrame := range resultFrames {
 					self.handleControlFrameForQueue(contractKey, contractQueue, resultFrame)
 				}
@@ -1664,6 +1708,22 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 				case <-self.client.Done():
 					// no need to log warnings when the client closes
 				default:
+					if controlRateLimited(err) {
+						// The platform answered and asked this client to slow
+						// down, which says nothing about whether it can
+						// authorize contracts. Counted as a backend failure,
+						// three refusals anywhere in a hosted process held
+						// every sequence in it, and the next success anywhere
+						// released them all within a second, into the same
+						// bound. Hold only this client instead.
+						hold := self.noteCreateContractRateLimited(time.Now())
+						if ok, suppressed := shouldLogOobErr(); ok {
+							self.client.log.Infof("[contract]oob rate limited, hold %s = %s%s\n", hold, err, suppressedSuffix(suppressed))
+						} else if v := self.client.log.V(1); v.Enabled() {
+							v.Infof("[contract]oob rate limited, hold %s = %s\n", hold, err)
+						}
+						return
+					}
 					noteBackendFailure()
 					if ok, suppressed := shouldLogOobErr(); ok {
 						if suppressed > 0 {
@@ -1678,6 +1738,42 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 			}
 		},
 	)
+}
+
+// Records a contract request refused as a rate limit at `now` and holds this
+// client's requests for the next step of the backoff. An existing longer hold
+// is kept. Returns the hold this refusal asked for.
+func (self *ContractManager) noteCreateContractRateLimited(now time.Time) time.Duration {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	self.createContractRateLimitCount += 1
+	hold := jitterContractRetryWait(
+		createContractRateLimitBackoff(
+			self.createContractRateLimitCount,
+			self.settings.CreateContractRateLimitBackoffMin,
+			self.settings.CreateContractRateLimitBackoffMax,
+		),
+		self.settings.CreateContractRateLimitJitter,
+		self.settings.createContractRateLimitRandomForTest,
+	)
+	if hold <= 0 {
+		// disabled: the sequences retry on their own schedule
+		return 0
+	}
+	if holdUntil := now.Add(hold); self.createContractRateLimitHoldUntil.Before(holdUntil) {
+		self.createContractRateLimitHoldUntil = holdUntil
+	}
+	return hold
+}
+
+// A completed request ends the rate-limit streak, so the next refusal holds
+// for the minimum again. A hold already running is kept: the request that
+// completed was admitted before the refusal, and is no evidence that the bound
+// has room now.
+func (self *ContractManager) noteCreateContractCompleted() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	self.createContractRateLimitCount = 0
 }
 
 func (self *ContractManager) contractByteCount(
