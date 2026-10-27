@@ -474,6 +474,32 @@ func TestContractManagerRateLimitHold(t *testing.T) {
 	}
 }
 
+// The backoff starts over once the last hold ended more than the longest step
+// ago. Four refusals in a row climb to the 10 s step, and one exactly the
+// longest step after the last hold ended keeps climbing; one an hour later
+// holds the minimum again. Before, the count never aged, and a refusal an hour
+// after four others held for the longest step.
+func TestContractManagerRateLimitStreakAgesOut(t *testing.T) {
+	settings := DefaultContractManagerSettings()
+	settings.CreateContractRateLimitJitter = 0
+	manager := &ContractManager{settings: settings}
+	now := time.Unix(1000, 0)
+	for range 4 {
+		now = now.Add(manager.noteCreateContractRateLimited(now))
+	}
+	edge := now.Add(settings.CreateContractRateLimitBackoffMax)
+	if hold := manager.noteCreateContractRateLimited(edge); hold != 10*time.Second {
+		t.Fatalf("hold a longest step after the last = %s, want the streak's 10s", hold)
+	}
+	quiet := manager.createContractRateLimitHoldUntil.Add(time.Hour)
+	if hold := manager.noteCreateContractRateLimited(quiet); hold != 5*time.Second {
+		t.Fatalf("hold after an hour of quiet = %s, want the minimum", hold)
+	}
+	if manager.createContractRateLimitCount != 1 {
+		t.Fatalf("refusal count after an hour of quiet = %d, want 1", manager.createContractRateLimitCount)
+	}
+}
+
 // A rate limit holds the client from the sequences' longest retry interval,
 // with half of each step as jitter, and the longest hold drawn, 12.5 s, ends
 // before a window judges its client unhealthy for the silence.
