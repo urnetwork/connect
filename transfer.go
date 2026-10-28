@@ -14843,8 +14843,8 @@ type ReceiveSequence struct {
 	// whether the exit reports a final rather than a checkpoint for the
 	// current contract
 	closeCurrentContract bool
-	// set when the exit takes the requests to report its contracts; a later
-	// request is refused, and its caller reports the close itself
+	// set once the manager owns every exit report; a later request uses that
+	// manager's pending report order to finalize the contract
 	closeRequestsTaken bool
 	// a coalesced edge that wakes Run for a new close request
 	closeNotify chan struct{}
@@ -15568,7 +15568,8 @@ func (self *ReceiveSequence) Run() {
 				self.receiveContract.unackedByteCount,
 			)
 		}
-		// reported: a later close request for these finds no holder
+		self.finishCloseRequests()
+		// The manager now owns the counts and any final requested during exit.
 		for contractId := range self.openReceiveContracts {
 			self.contractHolders.release(contractId, self)
 		}
@@ -16274,8 +16275,8 @@ func (self *ReceiveSequence) Run() {
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(timeout)
 		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending()) {
-			pack, ok, timedOut := self.waitDelivery(idleTimer.C)
-			if timedOut || self.ctx.Err() != nil {
+			pack, ok, shouldExit := self.waitDelivery(idleTimer.C)
+			if shouldExit || self.ctx.Err() != nil {
 				return
 			}
 			if pack != nil && !processPack(pack, ok) {
