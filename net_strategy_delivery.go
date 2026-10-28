@@ -66,12 +66,19 @@ func (self *strategyDeliveryMessageConn) NextReader() (int, io.Reader, error) {
 	return kind, reader, err
 }
 
-// Preserves concrete framing access for batching, stats and progress hooks.
+// Preserves concrete framing access for batching, stats and progress hooks,
+// through the delivery observer and the WebSocket delay header wrapper.
 func unobservedH1MessageConn(conn H1MessageConn) H1MessageConn {
-	if observed, ok := conn.(*strategyDeliveryMessageConn); ok {
-		return observed.H1MessageConn
+	for {
+		switch wrapped := conn.(type) {
+		case *strategyDeliveryMessageConn:
+			conn = wrapped.H1MessageConn
+		case *transportDelayWebSocketConn:
+			conn = wrapped.H1MessageConn
+		default:
+			return conn
+		}
 	}
-	return conn
 }
 
 // A message reader EOF is a frame boundary, not a connection delivery verdict.

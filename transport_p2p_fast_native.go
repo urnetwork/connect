@@ -343,13 +343,36 @@ func (self *peerConn) WriteFastPathMessage(message []byte) (int, error) {
 	return fastPath.writeMessage(message)
 }
 
+// Writes a delay header and one transfer message as one fast-path message.
+// The header is the message's first bytes inside the fragment envelope, so
+// the envelope's length counts it and its version is unchanged (DELAY.md
+// §6.1).
+func (self *peerConn) WriteFastPathMessageWithHeader(
+	header transportDelayHeader,
+	message []byte,
+) (int, error) {
+	fastPath := self.fastPath.Load()
+	if fastPath == nil || !fastPath.track.bound.Load() {
+		return 0, errP2pFastPathNotReady
+	}
+	return fastPath.writeMessageWithPrefix(header[:], message)
+}
+
 // writeMessage assigns ordered fragment counters and writes every fragment
 // synchronously before the caller releases the source message.
 func (self *webRtcFastPath) writeMessage(message []byte) (int, error) {
-	if len(message) == 0 || self.maximumMessageByteCount < len(message) {
+	return self.writeMessageWithPrefix(nil, message)
+}
+
+// Writes prefix followed by message as one fast-path message. Each fragment
+// copies its bytes from both, so the two are never joined into another
+// buffer.
+func (self *webRtcFastPath) writeMessageWithPrefix(prefix []byte, message []byte) (int, error) {
+	messageByteCount := len(prefix) + len(message)
+	if messageByteCount == 0 || self.maximumMessageByteCount < messageByteCount {
 		return 0, errP2pFastPathMessageTooLarge
 	}
-	fragmentCount := p2pFastPathFragmentCount(len(message))
+	fragmentCount := p2pFastPathFragmentCount(messageByteCount)
 	if p2pFastPathMaximumFragmentCount < fragmentCount {
 		return 0, errP2pFastPathMessageTooLarge
 	}
@@ -366,14 +389,14 @@ func (self *webRtcFastPath) writeMessage(message []byte) (int, error) {
 		offset := fragmentIndex * p2pFastPathFragmentPayloadByteCount
 		fragmentByteCount := min(
 			p2pFastPathFragmentPayloadByteCount,
-			len(message)-offset,
+			messageByteCount-offset,
 		)
 		packet := packetBuffer[:p2pFastPathFragmentHeaderByteCount+fragmentByteCount]
 		err := writeP2pFastPathFragmentHeader(
 			packet,
 			p2pFastPathFragmentHeader{
 				messageId:     messageId,
-				messageLength: len(message),
+				messageLength: messageByteCount,
 				fragmentIndex: fragmentIndex,
 				fragmentCount: fragmentCount,
 			},
@@ -381,9 +404,11 @@ func (self *webRtcFastPath) writeMessage(message []byte) (int, error) {
 		if err != nil {
 			return fragmentIndex, err
 		}
-		copy(
+		copyP2pFastPathFragment(
 			packet[p2pFastPathFragmentHeaderByteCount:],
-			message[offset:offset+fragmentByteCount],
+			prefix,
+			message,
+			offset,
 		)
 		self.nextSequenceNumber += 1
 		rtpPacket := rtp.Packet{

@@ -1854,6 +1854,9 @@ type RemoteUserNatMultiClient struct {
 	serverNamesLearnedUnsub func()
 	packetStatsCounters     *packetStatsCounters
 	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+	// every window client's transport delay stats pass through here unchanged
+	// (DELAY.md §9, D9)
+	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
 
 	// reliabilityMetrics measures what a provider failure actually costs the
 	// user -- how many flows die with an exit, and how long the destinations
@@ -2668,34 +2671,35 @@ func NewRemoteUserNatMultiClient(
 	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
-		ctx:                        cancelCtx,
-		cancel:                     cancel,
-		log:                        log,
-		generator:                  generator,
-		settings:                   settings,
-		defaultReliabilitySettings: ReliabilitySettingsFrom(settings),
-		windows:                    map[WindowType]*multiClientWindow{},
-		securityPolicyStats:        securityPolicyStats,
-		securityPolicy:             settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
-		provideMode:                provideMode,
-		ip4PathUpdates:             map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:             map[Ip6Path]*multiClientChannelUpdate{},
-		flowUpdates:                map[*multiClientChannelUpdate]bool{},
-		affinityIp4Paths:           map[Ip4Path]map[Ip4Path]time.Time{},
-		affinityIp6Paths:           map[Ip6Path]map[Ip6Path]time.Time{},
-		clientUpdates:              map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-		qualification:              map[MultiHopId]*providerQualification{},
-		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
-		localUserNat:               localUserNat,
-		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		policyLocalHints:           newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
-		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
-		blockActionIgnoreCache:     newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		packetStatsCounters:        &packetStatsCounters{},
-		packetStatsCallbacks:       NewCallbackList[PacketStatsFunction](),
-		reliabilityMetrics:         newReliabilityMetrics(),
-		flowReaperWake:             make(chan struct{}, 1),
-		flowReaperDone:             make(chan struct{}),
+		ctx:                          cancelCtx,
+		cancel:                       cancel,
+		log:                          log,
+		generator:                    generator,
+		settings:                     settings,
+		defaultReliabilitySettings:   ReliabilitySettingsFrom(settings),
+		windows:                      map[WindowType]*multiClientWindow{},
+		securityPolicyStats:          securityPolicyStats,
+		securityPolicy:               settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
+		provideMode:                  provideMode,
+		ip4PathUpdates:               map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:               map[Ip6Path]*multiClientChannelUpdate{},
+		flowUpdates:                  map[*multiClientChannelUpdate]bool{},
+		affinityIp4Paths:             map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:             map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:                map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		qualification:                map[MultiHopId]*providerQualification{},
+		destinationServiceFailures:   map[destinationServiceFailureKey]destinationServiceFailure{},
+		localUserNat:                 localUserNat,
+		blockActionCache:             newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		policyLocalHints:             newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
+		blockActionCollector:         newBlockActionCollector(settings.BlockActionAggMaxCount, log),
+		blockActionIgnoreCache:       newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		packetStatsCounters:          &packetStatsCounters{},
+		packetStatsCallbacks:         NewCallbackList[PacketStatsFunction](),
+		transportDelayStatsCallbacks: NewCallbackList[TransportDelayStatsFunction](),
+		reliabilityMetrics:           newReliabilityMetrics(),
+		flowReaperWake:               make(chan struct{}, 1),
+		flowReaperDone:               make(chan struct{}),
 	}
 	if settings.IpAssocSettings != nil {
 		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
@@ -2764,6 +2768,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.receivingChannelCount,
 		multiClient.recordProbePass,
 		multiClient.providerPolicyPreference,
+		multiClient.publishTransportDelayStats,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2790,6 +2795,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.receivingChannelCount,
 			multiClient.recordProbePass,
 			multiClient.providerPolicyPreference,
+			multiClient.publishTransportDelayStats,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -7291,6 +7297,24 @@ func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
 	return self.tcpCollapseDropCount.Load()
 }
 
+// AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
+// every window client's transports, passed through unchanged (DELAY.md §9).
+// Callbacks run on transport goroutines and must not block.
+func (self *RemoteUserNatMultiClient) AddTransportDelayStatsCallback(callback TransportDelayStatsFunction) func() {
+	callbackId := self.transportDelayStatsCallbacks.Add(callback)
+	return func() {
+		self.transportDelayStatsCallbacks.Remove(callbackId)
+	}
+}
+
+func (self *RemoteUserNatMultiClient) publishTransportDelayStats(stats *TransportDelayStats) {
+	for _, callback := range self.transportDelayStatsCallbacks.Get() {
+		HandleError(func() {
+			callback(stats)
+		})
+	}
+}
+
 // AddPacketStatsCallback registers a listener fired on the event epoch when the
 // packet stats change
 func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
@@ -11628,6 +11652,10 @@ type multiClientWindow struct {
 	// parent stateLock inside, so the same contract as flowCountFunc applies:
 	// call it with no window or channel lock held.
 	clientMigrateFunc func(client *multiClientChannel, cause string) (rebound int, replacements int, remaining int)
+	// transportDelayStats is the parent's pass-through; every client this
+	// window creates subscribes it (DELAY.md §9). Set at construction and
+	// never changed. Nil in bare fixtures.
+	transportDelayStats TransportDelayStatsFunction
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -11769,9 +11797,14 @@ func newMultiClientWindow(
 	receivingSiblingsFunc func(exclude *multiClientChannel) int,
 	qualificationRefreshFunc func(MultiHopId),
 	providerPolicyPreference *providerPolicyPreference,
+	// the parent's delay stats pass-through, set before the window's
+	// goroutines start so every client it creates subscribes it (DELAY.md
+	// §9); nil in bare fixtures
+	transportDelayStats TransportDelayStatsFunction,
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
+		transportDelayStats:          transportDelayStats,
 		cancel:                       cancel,
 		log:                          loggerOrDefault(settings.Log),
 		generator:                    generator,
@@ -13983,6 +14016,11 @@ requestCandidates:
 				self.receivingSiblingsFunc,
 				self.qualificationRefreshFunc,
 			)
+			if err == nil && self.transportDelayStats != nil {
+				// every new client adds the multi client as a subscriber; the
+				// subscription ends with the client
+				client.client.AddTransportDelayStatsCallback(self.transportDelayStats)
+			}
 			if err != nil {
 				providerFailure := self.recordChannelCreationFailure(evaluationCtx, args, err)
 				var setupErr *multiClientSetupError

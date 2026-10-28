@@ -1667,6 +1667,12 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+
+	// TransportDelay, when set, offers the per-message delay header on this
+	// client's P2P streams as the active side (DELAY.md §6.1). A passive
+	// side accepts an offer regardless, stamping and echoing only. Nil
+	// offers nothing; only non-provider window clients set it (D3).
+	TransportDelay *TransportDelaySettings
 }
 
 // MinimumMessageLenLimit returns the smallest per-transport framer
@@ -4374,6 +4380,13 @@ func (self *Client) forward(path TransferPath, transferFrameBytes []byte) {
 			c()
 		}
 	}
+}
+
+// AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
+// every transport of this client (DELAY.md §9). Callbacks run on transport
+// goroutines and must not block.
+func (self *Client) AddTransportDelayStatsCallback(callback TransportDelayStatsFunction) func() {
+	return self.routeManager.addTransportDelayStatsCallback(callback)
 }
 
 func (self *Client) AddReceiveCallback(receiveCallback ReceiveFunction) func() {

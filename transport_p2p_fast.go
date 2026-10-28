@@ -194,6 +194,16 @@ func p2pFastPathFragmentCount(messageByteCount int) int {
 		p2pFastPathFragmentPayloadByteCount
 }
 
+// Fills fragment with the bytes at offset of prefix followed by message, the
+// logical message one fast-path write carries.
+func copyP2pFastPathFragment(fragment []byte, prefix []byte, message []byte, offset int) {
+	copiedByteCount := 0
+	if offset < len(prefix) {
+		copiedByteCount = copy(fragment, prefix[offset:])
+	}
+	copy(fragment[copiedByteCount:], message[max(0, offset-len(prefix)):])
+}
+
 // writeP2pFastPathFragmentHeader serializes one fixed-size routing header.
 func writeP2pFastPathFragmentHeader(
 	packet []byte,

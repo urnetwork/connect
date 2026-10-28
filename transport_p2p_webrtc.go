@@ -2502,10 +2502,11 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[signal]%s\n", signal.SignalType)
 		}
-		if err := conn.receiveSignalFromPeerWithTransferKey(
+		if err := conn.receiveBatchSignalFromPeer(
 			signal,
 			senderGenerationId,
 			senderGenerationSet,
+			v.TransportDelayVersion,
 			transferKey,
 			true,
 		); err != nil {
@@ -2524,10 +2525,20 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 }
 
 func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
+	return self.newP2pConnActiveWithTransportDelay(ctx, path, nil)
+}
+
+// Starts an active generation that offers the delay header when
+// transportDelay offers it (DELAY.md §6.1).
+func (self *WebRtcManager) newP2pConnActiveWithTransportDelay(
+	ctx context.Context,
+	path TransferPath,
+	transportDelay *TransportDelaySettings,
+) (WebRtcConn, error) {
 	if self.newP2pConnForTest != nil {
 		return self.newP2pConnForTest(ctx, path, true)
 	}
-	conn, err := self.newP2pConn(ctx, path, true)
+	conn, err := self.newP2pConn(ctx, path, true, transportDelay.offered())
 	if err == nil && self.testingAfterPeerConnRegistered != nil {
 		self.testingAfterPeerConnRegistered(path, true)
 	}
@@ -2538,14 +2549,19 @@ func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, path TransferP
 	if self.newP2pConnForTest != nil {
 		return self.newP2pConnForTest(ctx, path, false)
 	}
-	conn, err := self.newP2pConn(ctx, path, false)
+	conn, err := self.newP2pConn(ctx, path, false, false)
 	if err == nil && self.testingAfterPeerConnRegistered != nil {
 		self.testingAfterPeerConnRegistered(path, false)
 	}
 	return conn, err
 }
 
-func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, active bool) (conn *peerConn, err error) {
+func (self *WebRtcManager) newP2pConn(
+	ctx context.Context,
+	path TransferPath,
+	active bool,
+	offerTransportDelay bool,
+) (conn *peerConn, err error) {
 	if err = ctx.Err(); err != nil {
 		return
 	}
@@ -2758,6 +2774,8 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	conn.admissionBudget = reserveBudget
 	conn.admissionByteCount = reserveByteCount
 	conn.admissionOwner = admissionOwner
+	// set before Run sends the first signal batch; only an active side offers
+	conn.transportDelayOffered = active && offerTransportDelay
 	if !self.peerConnLifecycle.start() {
 		panic("open WebRTC manager rejected peer lifecycle admission")
 	}
@@ -3075,6 +3093,14 @@ type peerConn struct {
 	signalGeneration          Id
 	remoteSignalGeneration    Id
 	remoteSignalGenerationSet bool
+	// Immutable after manager admission: an active generation of a client
+	// that offers the delay header puts its version on every outbound signal
+	// batch (DELAY.md §6.1).
+	transportDelayOffered bool
+	// The delay header version on the batch of the remote offer or answer
+	// this generation applies, stored before the description so the data
+	// channel cannot open ahead of it.
+	remoteTransportDelayVersion atomic.Uint32
 	// Inbound signaling supplies the local lane/session used by replies. Active
 	// setup has no key until the peer answers, so the presence bit is separate.
 	signalReplyTransferKey    TransferKey
@@ -3596,6 +3622,26 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 	transferKey TransferKey,
 	transferKeySet bool,
 ) error {
+	return self.receiveBatchSignalFromPeer(
+		signal,
+		senderGenerationId,
+		senderGenerationSet,
+		0,
+		transferKey,
+		transferKeySet,
+	)
+}
+
+// Applies one signal of a batch with the batch's sender generation and delay
+// header version.
+func (self *peerConn) receiveBatchSignalFromPeer(
+	signal *protocol.ExchangeSignal,
+	senderGenerationId Id,
+	senderGenerationSet bool,
+	transportDelayVersion uint32,
+	transferKey TransferKey,
+	transferKeySet bool,
+) error {
 	if signal == nil {
 		return nil
 	}
@@ -3639,6 +3685,7 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 				signal,
 				senderGenerationId,
 				senderGenerationSet,
+				transportDelayVersion,
 				transferKey,
 				transferKeySet,
 			)
@@ -3718,6 +3765,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 	signal *protocol.ExchangeSignal,
 	senderGenerationId Id,
 	senderGenerationSet bool,
+	transportDelayVersion uint32,
 	transferKey TransferKey,
 	transferKeySet bool,
 ) (
@@ -3751,6 +3799,8 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = json.Unmarshal(signal.Sdp, &offer); err != nil {
 			return
 		}
+		// the answer built below accepts the delay header this batch offers
+		self.remoteTransportDelayVersion.Store(transportDelayVersion)
 		if err = self.pc.SetRemoteDescription(offer); err != nil {
 			return
 		}
@@ -3798,6 +3848,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = json.Unmarshal(signal.Sdp, &answer); err != nil {
 			return
 		}
+		self.remoteTransportDelayVersion.Store(transportDelayVersion)
 		if err = self.pc.SetRemoteDescription(answer); err != nil {
 			return
 		}
@@ -4299,10 +4350,11 @@ func (self *peerConn) sendSignalsWithTransferKey(
 		return
 	}
 	signals := &protocol.ExchangeSignals{
-		StreamId:           self.key.StreamId.Bytes(),
-		ResetSignals:       resetSignals,
-		Signals:            signalValues,
-		SenderGenerationId: self.signalGeneration.Bytes(),
+		StreamId:              self.key.StreamId.Bytes(),
+		ResetSignals:          resetSignals,
+		Signals:               signalValues,
+		SenderGenerationId:    self.signalGeneration.Bytes(),
+		TransportDelayVersion: self.localTransportDelayVersion(),
 	}
 	// passive peers send signals in the return direction of the stream,
 	// so they ask for a companion contract (verified as
