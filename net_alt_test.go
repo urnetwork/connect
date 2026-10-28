@@ -46,6 +46,12 @@ func TestAltUrlFromPlatformUrl(t *testing.T) {
 			altUrl:      "https://alt.example.com:8443",
 		},
 		{
+			// a bare host and port, as a hand-written setting is, takes the
+			// default scheme rather than its host as the scheme
+			platformUrl: "connect.example.com:8443",
+			altUrl:      "https://alt.example.com:8443",
+		},
+		{
 			// an ip literal has no service label to replace
 			platformUrl: "https://192.0.2.10:8080",
 			altUrl:      "",
@@ -55,17 +61,12 @@ func TestAltUrlFromPlatformUrl(t *testing.T) {
 			altUrl:      "",
 		},
 		{
-			// a bare space host, a single label and a name that is not the
-			// connect service derive nothing
+			// a bare space host and a single label derive nothing
 			platformUrl: "wss://example.com",
 			altUrl:      "",
 		},
 		{
 			platformUrl: "wss://localhost:8080",
-			altUrl:      "",
-		},
-		{
-			platformUrl: "wss://api.example.com",
 			altUrl:      "",
 		},
 		{
@@ -76,6 +77,42 @@ func TestAltUrlFromPlatformUrl(t *testing.T) {
 	for _, c := range cases {
 		if altUrl := AltUrlFromPlatformUrl(c.platformUrl); altUrl != c.altUrl {
 			t.Errorf("AltUrlFromPlatformUrl(%q) = %q, expected %q", c.platformUrl, altUrl, c.altUrl)
+		}
+	}
+}
+
+// The api labels derive the alt names as the connect labels do, since alt
+// serves the api names too (L1, L3; connect#229): `api`, `api-v4` and `api-v6`
+// give `alt`, `alt-v4` and `alt-v6`, with the env prefix and an explicit port
+// kept. A label that is neither service, including one that only contains
+// `api`, derives nothing, as before.
+func TestAltUrlFromApiUrl(t *testing.T) {
+	cases := []struct {
+		apiUrl string
+		altUrl string
+	}{
+		{apiUrl: "https://api.example.com", altUrl: "https://alt.example.com"},
+		{apiUrl: "https://api-v4.example.com", altUrl: "https://alt-v4.example.com"},
+		{apiUrl: "https://api-v6.example.com", altUrl: "https://alt-v6.example.com"},
+		{apiUrl: "wss://api.example.com", altUrl: "wss://alt.example.com"},
+		// the env prefix rides the label, and the path names no part of alt
+		{apiUrl: "https://g2-api.example.com/x", altUrl: "https://g2-alt.example.com"},
+		{apiUrl: "https://g2-api-v4.example.com/x", altUrl: "https://g2-alt-v4.example.com"},
+		{apiUrl: "https://API-V6.Space.Example.:8443/x?y=1", altUrl: "https://alt-v6.space.example:8443"},
+		// other labels are not the api service
+		{apiUrl: "https://auth.example.com", altUrl: ""},
+		{apiUrl: "https://apis.example.com", altUrl: ""},
+		{apiUrl: "https://myapi.example.com", altUrl: ""},
+		{apiUrl: "https://api2-v4.example.com", altUrl: ""},
+		{apiUrl: "https://extender-v4.example.com", altUrl: ""},
+		{apiUrl: "wss://connector.example.com", altUrl: ""},
+		// an api name with no space under it, and an ip literal
+		{apiUrl: "https://api.example", altUrl: ""},
+		{apiUrl: "https://192.0.2.10", altUrl: ""},
+	}
+	for _, c := range cases {
+		if altUrl := AltUrlFromPlatformUrl(c.apiUrl); altUrl != c.altUrl {
+			t.Errorf("AltUrlFromPlatformUrl(%q) = %q, expected %q", c.apiUrl, altUrl, c.altUrl)
 		}
 	}
 }

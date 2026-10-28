@@ -560,7 +560,7 @@ func (self *ExtenderActivator) run() {
 			if err != nil {
 				// a failed check retries on the backoff floor rather than on
 				// every wake, which a directory change would otherwise be
-				self.log.Infof("[extender]activate hello err = %s\n", err)
+				self.log.Infof("[extender]activate hello err = %s\n", httpRequestErrorWithCauses(err))
 				nextAddressCheckTime = now.Add(self.settings.MinBackoff)
 			} else {
 				nextAddressCheckTime = now.Add(self.settings.AddressCheckTimeout)
@@ -896,7 +896,9 @@ func (self *ExtenderActivator) activateUrl(
 		args,
 	)
 	if err != nil {
-		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, err)
+		// the causes of every attempt, which an exhausted request's own
+		// message hides (connect#229)
+		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
 		self.recordFailure(ipVersion, now, err.Error(), false)
 		return false
 	}
