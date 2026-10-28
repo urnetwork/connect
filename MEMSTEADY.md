@@ -6252,3 +6252,22 @@ The final bracket-bound summaries report complete teardown and no runtime cap br
 The third cell was Galaxy `R5CX21FY6ND`, candidate, cellular, iOS surrogate. Authentication discovery timed out before the password screen and before traffic. A retained credential-free SDK category and the 15-second request deadline establish request expiry, but do not identify DNS, dialing, TLS, headers, or an application defect. Its missing readiness/runtime/cleanup evidence correctly prevented memory qualification and stopped collection. No timeout, cap, schema, or traffic-policy change is justified by this failure alone.
 
 [Closed failed campaign](/private/tmp/urnetwork-c26-native-firstfailure-final.417g8w90/FINAL-CUSTODY.json), SHA-256 `7cf42391a3ea4be2be93dba48be192870fb97506d97fc7128d0273f86e709bd3`: all canonical owners and monitors joined, cache released, 530 input pins matched, and the fresh C26 source-after check matched 41,764 files and two symlinks. [Authentication analysis](/private/tmp/urnetwork-c26-cell003-auth-discovery.PREP.7c5g25yq/REPORT-FINAL.json), SHA-256 `2f8501cedfc15f4402a959f537867f0a0b4352bc783836a32171485866ae191f`. The original 100-page synthetic qualification remains separate; full correctness, full PERF and complete 32/64 MiB physical qualification are still outstanding.
+
+
+### 2026-10-28 checkpoint: partial-race recovery and browsing fixture authority
+
+The candidate continues a refused partial TCP race into unused healthy candidates while preserving race-generation, ownership and admission bounds. Winner overflow now preserves buffered packets through the existing commit path. Eight deterministic roots passed in three fresh normal and three fresh race processes (48 root passes).
+
+The browsing fixture now supplies five genuinely eligible initial quality providers plus one speed provider. Serialized discovery and roster controls distinguish provider identity from array position; their fresh normal/race runs produced 112 and 62 passing root executions respectively. These fixture changes preserve the 100-page workload and five-second navigation limit.
+
+A fresh matched-fixture pair completed 100 HTML responses, 400 validated-or-canceled assets and 99 overlapping navigations in both arms. Candidate/control controller times were 3.096/3.646 seconds; median page TTFB was 0.836/0.770 seconds, p95 2.120/2.092 seconds, and maximum 4.906/3.862 seconds. The mixed results do not establish an overall performance improvement or justify baseline promotion.
+
+The independent eight-arm replay passed cellular H2 normal and cellular H1 normal, then failed cellular H1 race: page 0 reached first byte at 6.364 seconds, including 5.235 seconds after HTTP request write. A separate provider-roster assertion also failed and has deterministic fixture corrections. The remaining five arms did not run. The page-zero pause remains unresolved.
+
+Nine diagnostic controls subsequently passed, but the traced H1 replay stopped on a real data race: blockActionDecision sorts an IP-association snapshot while updateClusters reads it. The sorting code is unchanged from the checkpoint base; this is not evidence that the partial-race candidate introduced it, nor proof that it causes the page pause. The failure and incomplete workload remain recorded as failures. All test processes joined and the shared cache lease was released.
+
+Full correctness/PERF and fresh two-device 32 MiB iOS-surrogate / 64 MiB Android qualification remain outstanding. Android measurements cannot qualify the iOS extension's total physical footprint. This checkpoint includes research candidates for a test build; it is not release qualification.
+
+Evidence: /private/tmp/urnetwork-c34-v2-strict-pair-metadata.zwt6ec5y/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-v2-browsing-eight-metadata.2bhpr64m/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-page0-control-successor-metadata.boqm1uf_/FINAL-CUSTODY.json.
+
+The checkpoint also includes a cache-miss-only clone before block-action cluster sorting, preserving immutable association snapshots and zero-copy cache hits. Three deterministic ownership/cache/publication tests are included but have not yet run; OLD-red/NEW-green and race validation remain pending.

@@ -7127,7 +7127,9 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	clusterIps := []netip.Addr{addr}
 	if self.ipAssoc != nil {
 		if members := self.ipAssoc.GetClusterAddrs(addr); 0 < len(members) {
-			clusterIps = members
+			// The published snapshot is immutable. Only this cache miss owns
+			// a mutable copy to order for the decision.
+			clusterIps = slices.Clone(members)
 		}
 	}
 	slices.SortFunc(clusterIps, func(a netip.Addr, b netip.Addr) int {
@@ -7416,7 +7418,7 @@ func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	selection := update.client.loadSelection()
-	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || update.race != nil) {
+	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || !self.synRetryDispatchEligibleWithLock(update, sendPacketGroup.synRetry.raceOrder)) {
 		return selection, false
 	}
 	if sendPacketGroup.onlyPureTcpAcks() {
@@ -7773,8 +7775,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						committedClient = client
 						return
 					}
+					if sendPacketGroup.isSynRetry() {
+						if sendPacketGroup.synRetry.raceOrder == 0 {
+							if update.race != nil {
+								return
+							}
+						} else if len(self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, orderedClients)) != 1 {
+							return
+						}
+					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						update.race.clientLimit = 1
 						// the race commits on the send: a signal that beats
 						// the commit undoes it (withdrawRaceCandidateWithLock)
 						update.race.single = true
@@ -7786,6 +7798,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						race.clientStates[client] = state
 					}
 					state.pendingSendCount += 1
+					race.pendingSendCount += 1
 				}()
 				if committedClient != nil {
 					sendBoundClient(committedClient, sendTimeout)
@@ -7806,13 +7819,17 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
 				var committedSelection *multiClientAffinitySelection
+				commitOnSend := false
+				retryRequested := false
 				connectSucceeded := false
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
+					race.pendingSendCount -= 1
 					if update.race != race {
 						return
 					}
+					retryRequested = race.synRetryPending
 					state := race.clientStates[client]
 					if state == nil {
 						return
@@ -7830,15 +7847,28 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 					state.sentPacketCount += 1
 					race.sentPacketCount += 1
+					// A response-requiring singleton cannot revoke the other
+					// wide-race candidates. Send-only/ordinary data retains its
+					// existing immediate commitment and NoAck policy.
+					commitOnSend = race.single || !dialProbeAwaitsResponse(ipPath, state.sentPacketCount)
+					if !commitOnSend {
+						return
+					}
 					receivePackets, abandonedClients, returnPackets, connectSucceeded =
 						update.commitRaceClientWithLock(client)
 					committedSelection = update.client.loadSelection()
 				}()
+				if retryRequested {
+					self.enqueueSynRetryForRace(update, race.collapseOrder)
+				}
 				if !sent {
 					return
 				}
 
 				success = true
+				if !commitOnSend {
+					return
+				}
 				update.commitSequenceGroupForClient(sendPacketGroup, client, committedSelection)
 				if connectSucceeded {
 					client.addConnectSuccess(update.ipPath.Version)
@@ -7900,8 +7930,21 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						committedClient = client
 						return
 					}
+					if sendPacketGroup.isSynRetry() {
+						if sendPacketGroup.synRetry.raceOrder == 0 {
+							if update.race != nil {
+								return
+							}
+						} else {
+							raceOrderedClients = self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, raceOrderedClients)
+							if len(raceOrderedClients) == 0 {
+								return
+							}
+						}
+					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						update.race.clientLimit = len(raceOrderedClients)
 						initRace = update.race
 						initRaceEarlyComplete = initRace.completeMonitor.NotifyChannel()
 					}
@@ -7914,6 +7957,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							race.clientStates[client] = state
 						}
 						state.pendingSendCount += 1
+						race.pendingSendCount += 1
 					}
 				}()
 				if committedClient != nil {
@@ -7956,12 +8000,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 
 					var abandonedClients []*multiClientChannel
+					retryRequested := false
 					func() {
 						update.stateLock.Lock()
 						defer update.stateLock.Unlock()
+						race.pendingSendCount -= 1
 						if update.race != race {
 							return
 						}
+						retryRequested = race.synRetryPending
 						state := race.clientStates[client]
 						if state == nil {
 							return
@@ -8001,6 +8048,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						}
 					}()
 
+					if retryRequested {
+						self.enqueueSynRetryForRace(update, race.collapseOrder)
+					}
 					// Start the response deadline only after an admission call
 					// returns. Starting it at registration can expire the race
 					// while a bounded send is still waiting for queue capacity.
@@ -8108,6 +8158,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						// already health-filtered field above, never widens or
 						// narrows it. See scoredPlacementReorder.
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
+					}
+					if sendPacketGroup.isSynRetry() && sendPacketGroup.synRetry.raceOrder != 0 {
+						hadOffer := len(orderedClients) != 0
+						update.stateLock.Lock()
+						orderedClients = self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, orderedClients)
+						update.stateLock.Unlock()
+						if len(orderedClients) == 0 {
+							if hadOffer && sendPacketGroup.pin.pinned() {
+								return nil
+							}
+							continue
+						}
 					}
 					if sendPacketGroup.isSynRetry() && (benchedField || self.destinationServiceFailuresExhausted(orderedClients, ipPath)) {
 						// A pin keeps the first nonempty field even when its only
@@ -9192,23 +9254,14 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			// race buffer limits exceeded, end the race immediately
 			self.log.Infof("[multi]receive race buffer limit reached")
 
-			for abandonedClient, abandonedState := range race.clientStates {
-				if abandonedClient != sourceClient {
-					abandonedClients = append(abandonedClients, abandonedClient)
-					for _, p := range abandonedState.packets {
-						if p.Pooled {
-							p.Pooled = false
-							returnPackets = append(returnPackets, p)
-						}
-					}
-				}
-			}
-
-			update.selectAffinityClient(sourceClient)
-			update.sequenceCommittedRaceOrder = race.collapseOrder
-			update.commitCollapseClaimsWithLock(sourceClient)
-			update.clearRaceWithLock()
+			// Claim buffered owners before closing the race. The current
+			// callback packet remains borrowed and follows that buffered prefix.
+			receivePackets, abandonedClients, returnPackets, connectSucceeded =
+				update.commitRaceClientWithLock(sourceClient)
 			boundUpdate = update
+			if connectSucceeded {
+				connectPath = update.ipPath
+			}
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
@@ -9217,16 +9270,10 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				tcpControl:  tcpControl,
 				generation:  update,
 			}
-			receivePackets = append(state.packets, receivePacket)
-			for _, p := range receivePackets {
-				if update.markReceivedInboundWithLock(sourceClient, p.tcpControl) {
-					connectSucceeded = true
-					connectPath = update.ipPath
-				}
-				if p.Pooled {
-					p.Pooled = false
-					returnPackets = append(returnPackets, p)
-				}
+			receivePackets = append(receivePackets, receivePacket)
+			if update.markReceivedInboundWithLock(sourceClient, tcpControl) {
+				connectSucceeded = true
+				connectPath = update.ipPath
 			}
 		}
 	})
@@ -11187,7 +11234,12 @@ type multiClientChannelUpdateRace struct {
 	clientStates map[*multiClientChannel]*multiClientChannelRaceClientState
 	// single marks a race of one candidate, which commits as soon as its send
 	// is admitted rather than on a winner decision
-	single                 bool
+	single bool
+	// Continuation fills only the original race's vacated live slots. Pending
+	// admissions remain charged even after an explicit failure withdraws them.
+	clientLimit            int
+	pendingSendCount       int
+	synRetryPending        bool
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int

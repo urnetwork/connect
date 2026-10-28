@@ -19,6 +19,8 @@ type tcpSynRetryRequest struct {
 	pin         flowPin
 	update      *multiClientChannelUpdate
 	serial      uint64
+	// Nonzero only for a continuation of this exact unanswered wide race.
+	raceOrder uint64
 }
 
 // The flow lock guards cache/queue references. Packet and credit remain live
@@ -35,8 +37,10 @@ type tcpSynRetry struct {
 	serial      uint64
 	references  uint32
 	queued      bool
-	next        *tcpSynRetry
-	released    *tcpSynRetry
+	// Queue-local token; the dispatcher snapshots it before releasing the lock.
+	raceOrder uint64
+	next      *tcpSynRetry
+	released  *tcpSynRetry
 }
 
 func (self *parsedPacketGroup) isSynRetry() bool {
@@ -68,7 +72,8 @@ func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
 
 func (self *parsedPacketGroup) validSynRetryWithLock(update *multiClientChannelUpdate) bool {
 	return !self.isSynRetry() || self.synRetry.update == update && update.synRetry != nil &&
-		update.synRetry.serial == self.synRetry.serial && update.synRetry.validWithLock(update)
+		update.synRetry.serial == self.synRetry.serial && update.synRetry.validWithLock(update) &&
+		(self.synRetry.raceOrder == 0 || unansweredSynRetryRaceWithLock(update, self.synRetry.raceOrder))
 }
 
 // Materialization has already published source control. These actual borrowed
@@ -170,9 +175,99 @@ func (self *multiClientChannelUpdate) releaseSynRetryMemory() {
 	}
 }
 
-// Only a last live explicit failure reaches here. Repeated signals coalesce;
-// no provider, capacity or established-flow decision is inferred by this queue.
+// A continuation cannot compete with response proof already owned by the race.
+// The caller holds the flow lock; collapseOrder fences race replacement.
+func unansweredSynRetryRaceWithLock(update *multiClientChannelUpdate, order uint64) bool {
+	race := update.race
+	if order == 0 || race == nil || race.collapseOrder != order || race.single ||
+		race.packetCount != 0 || race.clientsWithPacketCount != 0 {
+		return false
+	}
+	for _, state := range race.clientStates {
+		if len(state.packets) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// A withdrawn candidate's still-running admissions retain slots until return.
+// Existing live/pending candidates and fresh proposals share the original width
+// and the current configured/degraded bound. Contract hold reads are lock-free.
+func (self *RemoteUserNatMultiClient) synRetryRaceSlotsWithLock(update *multiClientChannelUpdate, fresh []*multiClientChannel) int {
+	race := update.race
+	if race == nil || race.clientLimit <= 0 || !unansweredSynRetryRaceWithLock(update, race.collapseOrder) {
+		return 0
+	}
+	retiredPending := race.pendingSendCount
+	degraded := self.backendDegraded()
+	now := time.Now()
+	for client, state := range race.clientStates {
+		retiredPending -= state.pendingSendCount
+		degraded = degraded || contractRateLimitHeldChannel(client, now)
+	}
+	for _, client := range fresh {
+		degraded = degraded || contractRateLimitHeldChannel(client, now)
+	}
+	limit := multiRaceClientCount(race.clientLimit, self.settings.MultiRaceClientCount, self.settings.MultiRaceDegradedClientCount, degraded)
+	return max(0, limit-len(race.clientStates)-max(0, retiredPending))
+}
+
+// A normal empty-race retry keeps its old policy. A partial continuation must
+// still name its exact unanswered race and a genuinely vacated admission slot.
+func (self *RemoteUserNatMultiClient) synRetryDispatchEligibleWithLock(update *multiClientChannelUpdate, order uint64) bool {
+	if order == 0 {
+		return update.race == nil
+	}
+	return unansweredSynRetryRaceWithLock(update, order) && self.synRetryRaceSlotsWithLock(update, nil) > 0
+}
+
+// Filtering precedes the first-window return: live quality owners are not fresh
+// candidates. A continuation can visit the next permitted healthy window only
+// after exhausting untried offers in the preferred field. Call under flow lock.
+func (self *RemoteUserNatMultiClient) freshSynRetryCandidatesWithLock(group *parsedPacketGroup, update *multiClientChannelUpdate, candidates []*multiClientChannel) []*multiClientChannel {
+	if !group.isSynRetry() || group.synRetry.raceOrder == 0 {
+		return candidates
+	}
+	if !group.validSynRetryWithLock(update) || update.client.Load() != nil {
+		return nil
+	}
+	available := self.synRetryRaceSlotsWithLock(update, candidates)
+	if available == 0 {
+		return nil
+	}
+	fresh := make([]*multiClientChannel, 0, min(available, len(candidates)))
+	for _, client := range candidates {
+		if update.race.clientStates[client] != nil {
+			continue
+		}
+		failed := false
+		for _, prior := range update.dialFailedClients {
+			if prior == client {
+				failed = true
+				break
+			}
+		}
+		if failed {
+			continue
+		}
+		fresh = append(fresh, client)
+		if len(fresh) == available {
+			break
+		}
+	}
+	return fresh
+}
+
+// A first standing explicit failure earns one coalesced continuation. If an
+// admission still owns the vacated slot, its actual return retries this enqueue.
 func (self *RemoteUserNatMultiClient) enqueueSynRetry(update *multiClientChannelUpdate) {
+	self.enqueueSynRetryForRace(update, 0)
+}
+
+// A nonzero completion token may consume only its race's existing request.
+// It never grants a retry merely because an unrelated admission completed.
+func (self *RemoteUserNatMultiClient) enqueueSynRetryForRace(update *multiClientChannelUpdate, completedOrder uint64) {
 	if update == nil || self.flowReaperDone == nil {
 		return
 	}
@@ -184,7 +279,28 @@ func (self *RemoteUserNatMultiClient) enqueueSynRetry(update *multiClientChannel
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	owner := update.synRetry
-	if owner == nil || !owner.validWithLock(update) || owner.queued || update.client.Load() != nil || update.race != nil {
+	if owner == nil || !owner.validWithLock(update) || update.client.Load() != nil {
+		return
+	}
+	if completedOrder != 0 && (update.race == nil || update.race.collapseOrder != completedOrder || !update.race.synRetryPending) {
+		return
+	}
+	order := uint64(0)
+	if race := update.race; race != nil {
+		if !unansweredSynRetryRaceWithLock(update, race.collapseOrder) {
+			return
+		}
+		race.synRetryPending = true
+		if self.synRetryRaceSlotsWithLock(update, nil) == 0 {
+			return
+		}
+		order = race.collapseOrder
+		race.synRetryPending = false
+	}
+	owner.raceOrder = order
+	if owner.queued {
+		// Another standing failure may empty the race while its partial work
+		// is still queued. Retarget only work not yet captured by a dispatcher.
 		return
 	}
 	owner.references++
@@ -234,8 +350,9 @@ func (self *RemoteUserNatMultiClient) drainSynRetries() {
 			defer self.finishSynRetry(owner)
 			update := owner.update
 			update.stateLock.Lock()
+			order := owner.raceOrder
 			owner.queued = false
-			eligible := owner.validWithLock(update) && update.client.Load() == nil && update.race == nil
+			eligible := owner.validWithLock(update) && update.client.Load() == nil && self.synRetryDispatchEligibleWithLock(update, order)
 			update.stateLock.Unlock()
 			if !eligible {
 				return
@@ -243,7 +360,7 @@ func (self *RemoteUserNatMultiClient) drainSynRetries() {
 			if hook := self.beforeSynRetryDispatchForTest; hook != nil {
 				hook(update)
 			}
-			self.dispatchSynRetry(owner)
+			self.dispatchSynRetry(owner, order)
 		}()
 		if owner == last {
 			return
@@ -260,10 +377,10 @@ func (self *RemoteUserNatMultiClient) discardSynRetries() {
 	}
 }
 
-func (self *RemoteUserNatMultiClient) dispatchSynRetry(owner *tcpSynRetry) {
+func (self *RemoteUserNatMultiClient) dispatchSynRetry(owner *tcpSynRetry, order uint64) {
 	update := owner.update
 	update.stateLock.Lock()
-	if !owner.validWithLock(update) || update.client.Load() != nil || update.race != nil || self.ctx.Err() != nil {
+	if !owner.validWithLock(update) || update.client.Load() != nil || !self.synRetryDispatchEligibleWithLock(update, order) || self.ctx.Err() != nil {
 		update.stateLock.Unlock()
 		return
 	}
@@ -274,7 +391,7 @@ func (self *RemoteUserNatMultiClient) dispatchSynRetry(owner *tcpSynRetry) {
 		MessagePoolReturn(packet)
 		return
 	}
-	request := &tcpSynRetryRequest{source: owner.source, provideMode: owner.provideMode, pin: owner.pin, update: update, serial: owner.serial}
+	request := &tcpSynRetryRequest{source: owner.source, provideMode: owner.provideMode, pin: owner.pin, update: update, serial: owner.serial, raceOrder: order}
 	group := &parsedPacketGroup{
 		ipPath: path, pin: owner.pin, byteCount: ByteCount(len(packet)), synRetry: request,
 		packets: []parsedPacket{{packet: packet, ipPath: path, payload: payload, pin: owner.pin}},
