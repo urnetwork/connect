@@ -76,6 +76,20 @@ func (self ContractKey) Legacy() ContractKey {
 	}
 }
 
+// The identity of the send sequence that takes contracts from this key. The
+// route hint and the contract sizing policy are acquisition metadata, not
+// sequence identity (see sendSequenceId), so they drop out.
+func (self ContractKey) sendSequenceId() sendSequenceId {
+	return sendSequenceId{
+		Destination:         self.Destination.DestinationId,
+		CompanionContract:   self.CompanionContract,
+		ForceStream:         self.ForceStream,
+		LogicalLane:         self.LogicalLane,
+		EncryptionRole:      self.EncryptionRole,
+		EncryptionCompanion: self.EncryptionCompanion,
+	}
+}
+
 type ContractStatus struct {
 	Key     ContractKey
 	Error   *protocol.ContractError
@@ -1991,6 +2005,66 @@ func (self *ContractManager) FlushContractQueue(contractKey ContractKey, resetUs
 	return self.closeContracts(contracts)
 }
 
+// Flushes every contract queue to one destination, for a client removed
+// through the api (CloseSequences): no sequence will take these contracts, so
+// each reports a final of (0, 0).
+func (self *ContractManager) flushDestinationContractQueues(destinationId Id) []Id {
+	contractKeys := []ContractKey{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for contractKey := range self.destinationContracts {
+			if contractKey.Destination.DestinationId == destinationId {
+				contractKeys = append(contractKeys, contractKey)
+			}
+		}
+	}()
+
+	contractIds := []Id{}
+	for _, contractKey := range contractKeys {
+		contractIds = append(contractIds, self.FlushContractQueue(contractKey, true)...)
+	}
+	return contractIds
+}
+
+// Finds listed contracts on the send side, for the platform's close request
+// (CloseSequences). A contract that a send sequence has taken and not closed
+// returns in openKeys with the key it was taken from. A contract still queued
+// leaves its queue, so no sequence can take it, and returns in queuedKeys; the
+// caller reports its final. A take that has polled its queue but not yet
+// recorded the contract open is not found. The caller then reports (0, 0) for
+// that contract first, and the platform does not apply its sequence's later
+// final.
+func (self *ContractManager) takeSendContracts(contractIds []Id) (
+	openKeys map[Id]ContractKey,
+	queuedKeys map[Id]ContractKey,
+) {
+	openKeys = map[Id]ContractKey{}
+	queuedKeys = map[Id]ContractKey{}
+
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	queuedContractIds := map[Id]bool{}
+	for _, contractId := range contractIds {
+		if contractKey, ok := self.localStats.ContractOpenKeys[contractId]; ok {
+			openKeys[contractId] = contractKey
+		} else {
+			queuedContractIds[contractId] = true
+		}
+	}
+	if len(queuedContractIds) == 0 {
+		return
+	}
+	// the manager-to-queue lock order of every queue lifecycle operation
+	for contractKey, contractQueue := range self.destinationContracts {
+		for _, contractId := range contractQueue.remove(queuedContractIds) {
+			queuedKeys[contractId] = contractKey
+		}
+	}
+	return
+}
+
 func (self *ContractManager) closeContracts(contracts []*protocol.Contract) []Id {
 	contractIds := []Id{}
 	for _, contract := range contracts {
@@ -2298,6 +2372,21 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		// drop this contract. it has already been used locally
 	}
 	return nil
+}
+
+// Removes the listed contracts that are still queued and returns their ids.
+func (self *contractQueue) remove(contractIds map[Id]bool) []Id {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	removedContractIds := []Id{}
+	for contractId := range self.contracts {
+		if contractIds[contractId] {
+			delete(self.contracts, contractId)
+			removedContractIds = append(removedContractIds, contractId)
+		}
+	}
+	return removedContractIds
 }
 
 func (self *contractQueue) RemoveUsedContract(contractId Id) {

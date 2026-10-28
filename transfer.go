@@ -661,6 +661,9 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		// short next to the quiet interval, so peers hear of a change
 		// promptly, without spinning on a full queue
 		NetworkQualityNotificationRetryInterval: 100 * time.Millisecond,
+
+		// four of the platform's largest messages (1024 ids each)
+		CloseSequencesMaxPendingCount: 4 * 1024,
 	}
 	// A per-peer session is ref-held by both a send and a receive sequence, so
 	// it must outlive the longer of the two — otherwise the next burst (after a
@@ -1601,6 +1604,12 @@ type ClientSettings struct {
 	// a short pause that lets a full queue drain is enough. Non-positive does
 	// not retry: they wait for the next quality change.
 	NetworkQualityNotificationRetryInterval time.Duration
+	// CloseSequencesMaxPendingCount bounds the contract and peer ids from the
+	// platform's CloseSequences that wait for the client's close worker. Ids
+	// past it are dropped and counted, and their contracts close as they did
+	// before the message: at the platform's expiry sweep. Non-positive drops
+	// every id.
+	CloseSequencesMaxPendingCount int
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -2193,6 +2202,7 @@ type Client struct {
 	encryptionSessionManager *EncryptionSessionManager
 	signalDispatcher         *clientSignalDispatcher
 	networkQuality           *clientNetworkQualityState
+	sequenceCloser           *sequenceCloser
 
 	// ready is closed by NewClientWithTag right before it returns, once every
 	// manager, buffer, callback, and the `run` loop are wired up. See
@@ -2207,9 +2217,10 @@ type Client struct {
 	beforeLoopbackReleaseForTest func()
 
 	// contractManagerUnsub func()
-	webRtcManagerUnsub func()
-	streamManagerUnsub func()
-	peerManagerUnsub   func()
+	webRtcManagerUnsub  func()
+	streamManagerUnsub  func()
+	peerManagerUnsub    func()
+	sequenceCloserUnsub func()
 }
 
 func NewClientWithDefaults(
@@ -2337,6 +2348,8 @@ func NewClientWithTag(
 	// valid same-network endpoint from stale public provider work.
 	client.peerManagerUnsub = client.AddReceiveCallback(peerManager.Receive)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
+	client.sequenceCloser = newSequenceCloser(client)
+	client.sequenceCloserUnsub = client.AddReceiveCallback(client.sequenceCloser.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 	client.networkQuality = newClientNetworkQualityState(client)
@@ -5060,6 +5073,7 @@ func (self *Client) Ctx() context.Context {
 func (self *Client) Close() {
 	self.cancel()
 	self.networkQuality.close()
+	self.sequenceCloser.close()
 	self.webRtcManagerUnsub()
 
 	if self.streamManager != nil {
@@ -5084,13 +5098,14 @@ func (self *Client) Close() {
 	// self.contractManagerUnsub()
 	self.streamManagerUnsub()
 	self.peerManagerUnsub()
+	self.sequenceCloserUnsub()
 }
 
-// CloseAndWait closes the client and joins its reader, client-created signal
-// dispatcher, stream transports, transfer sequences, WebRTC peers, and
-// contract/encryption manager work. It returns only after those workers have
-// relinquished their message-pool ownership, or ctx expires. Close remains the
-// non-joining compatibility API.
+// CloseAndWait closes the client and joins its reader, close worker,
+// client-created signal dispatcher, stream transports, transfer sequences,
+// WebRTC peers, and contract/encryption manager work. It returns only after
+// those workers have relinquished their message-pool ownership, or ctx
+// expires. Close remains the non-joining compatibility API.
 //
 // The join covers only Client-owned work. Arbitrary transports registered in
 // RouteManager, including externally created PlatformTransport or direct
@@ -5114,6 +5129,10 @@ func (self *Client) CloseAndWait(ctx context.Context) error {
 
 	var result error
 	if err := self.networkQuality.wait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
+	// Its close reports start contract manager work, joined below.
+	if err := self.sequenceCloser.wait(ctx); err != nil {
 		result = errors.Join(result, err)
 	}
 	if self.beforeRunDoneWaitForTest != nil {
@@ -6595,6 +6614,32 @@ func (self *SendBuffer) cancelDestinationAndWait(destinationId Id) {
 	for sequence := range sequences {
 		<-sequence.done
 	}
+}
+
+// Cancels every send sequence, running or exiting, with a listed identity, and
+// returns the identities that had one. Each exit reports finals for the
+// sequence's open contracts and flushes its queued ones. Does not wait.
+func (self *SendBuffer) cancelSendSequences(sendSequenceIds map[sendSequenceId]bool) map[sendSequenceId]bool {
+	canceledSendSequenceIds := map[sendSequenceId]bool{}
+	if len(sendSequenceIds) == 0 {
+		return canceledSendSequenceIds
+	}
+	sequences := []*SendSequence{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for sequence := range self.activeSendSequences {
+			id := sequence.id()
+			if sendSequenceIds[id] {
+				sequences = append(sequences, sequence)
+				canceledSendSequenceIds[id] = true
+			}
+		}
+	}()
+	for _, sequence := range sequences {
+		sequence.Cancel()
+	}
+	return canceledSendSequenceIds
 }
 
 // Admission closes permanently, even while the owning Client is still live.
@@ -14131,6 +14176,9 @@ type ReceiveBuffer struct {
 	// activeReceiveSequences retains workers through their final Pack-channel
 	// drain, which occurs after their public head/index entries are removed.
 	activeReceiveSequences map[*ReceiveSequence]bool
+	// the live sequence holding each open receive contract, for the
+	// platform's close requests (CloseSequences). Its own lock.
+	contractHolders *receiveContractHolders
 	// Nonzero receive lanes share one fixed reorder pool when the caller did
 	// not already install a device-wide ReceiveQueueBudget.
 	logicalLaneReceiveBudget *TransferMemoryBudget
@@ -14152,6 +14200,7 @@ func NewReceiveBuffer(ctx context.Context,
 		receiveSequences:       map[receiveSequenceId]*ReceiveSequence{},
 		headReceiveSequenceIds: map[receiveSequenceHeadKey]receiveSequenceId{},
 		activeReceiveSequences: map[*ReceiveSequence]bool{},
+		contractHolders:        newReceiveContractHolders(),
 		beforeCreateReceiveSequenceForTest: receiveBufferSettings.
 			beforeCreateReceiveSequenceForTest,
 		beforeRunReceiveSequenceForTest: receiveBufferSettings.
@@ -14464,6 +14513,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				self.receiveBufferSettings,
 				logicalLaneReceiveBudget,
 			)
+			receiveSequence.contractHolders = self.contractHolders
 			self.receiveSequences[receiveSequenceId] = receiveSequence
 			self.headReceiveSequenceIds[headKey] = receiveSequenceId
 			self.activeReceiveSequences[receiveSequence] = true
@@ -14574,19 +14624,39 @@ func (self *ReceiveBuffer) ReceiveQueueSizeAndMessageTypes(source TransferPath, 
 
 // Cancels and joins every inbound Transfer sequence authenticated as one
 // source. This prevents already-queued Packs from recreating provider work
-// after the source gate has accepted a terminal verdict.
+// after the source gate has accepted a terminal verdict. Each exit
+// checkpoints its current contract, which the source may resume.
 func (self *ReceiveBuffer) cancelSourceAndWait(sourceId Id) {
-	self.mutex.Lock()
+	self.endSourceAndWait(sourceId, false)
+}
+
+// Like cancelSourceAndWait, for a source removed through the api
+// (CloseSequences). The source has finished with every contract, so each
+// exit reports a final for its current contract rather than a checkpoint.
+func (self *ReceiveBuffer) closeSourceAndWait(sourceId Id) {
+	self.endSourceAndWait(sourceId, true)
+}
+
+// Ends and joins every inbound sequence from one source. closeContracts
+// selects a final rather than a checkpoint for each current contract.
+func (self *ReceiveBuffer) endSourceAndWait(sourceId Id, closeContracts bool) {
 	sequences := map[*ReceiveSequence]bool{}
-	for id, sequence := range self.receiveSequences {
-		if id.Source.SourceId == sourceId {
-			sequences[sequence] = true
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for id, sequence := range self.receiveSequences {
+			if id.Source.SourceId == sourceId {
+				sequences[sequence] = true
+			}
 		}
-	}
-	self.mutex.Unlock()
+	}()
 
 	for sequence := range sequences {
-		sequence.Cancel()
+		if closeContracts {
+			sequence.closeContractsAndCancel()
+		} else {
+			sequence.Cancel()
+		}
 	}
 	for sequence := range sequences {
 		<-sequence.done
@@ -14712,6 +14782,23 @@ type ReceiveSequence struct {
 	receiveContract           *sequenceContract
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
+	// the owning buffer's index of open contracts by holding sequence; nil
+	// for a sequence outside a ReceiveBuffer
+	contractHolders *receiveContractHolders
+
+	// closeStateLock guards the platform's close requests (CloseSequences):
+	// the client's close worker adds them and Run takes them. A leaf lock.
+	closeStateLock sync.Mutex
+	// open contracts the other party has finished with
+	closeContractIds map[Id]bool
+	// whether the exit reports a final rather than a checkpoint for the
+	// current contract
+	closeCurrentContract bool
+	// set when the exit takes the requests to report its contracts; a later
+	// request is refused, and its caller reports the close itself
+	closeRequestsTaken bool
+	// a coalesced edge that wakes Run for a new close request
+	closeNotify chan struct{}
 
 	packMutex sync.Mutex
 	packs     chan *ReceivePack
@@ -14936,6 +15023,7 @@ func newReceiveSequenceWithLogicalLaneBudget(
 		receiveBufferSettings:           receiveBufferSettings,
 		openReceiveContracts:            map[Id]*sequenceContract{},
 		receiveContract:                 nil,
+		closeNotify:                     make(chan struct{}, 1),
 		packs:                           make(chan *ReceivePack, channelBufferSize),
 		packQueueBaseLimit:              int64(sequenceBufferSize),
 		packQueueH1Limit:                int64(h1SequenceBufferSize),
@@ -15393,7 +15481,9 @@ func (self *ReceiveSequence) Run() {
 		self.closeContractWriterAlias()
 		self.cancel()
 
-		// close previous contracts and checkpoint the current contract
+		// close previous contracts and checkpoint the current contract,
+		// or close it too when the other party has finished with it
+		closeCurrentContract := self.takeCloseRequests()
 		for _, receiveContract := range self.openReceiveContracts {
 			if self.receiveContract != receiveContract {
 				if receiveContract.unackedByteCount != 0 {
@@ -15406,7 +15496,18 @@ func (self *ReceiveSequence) Run() {
 				)
 			}
 		}
-		if self.receiveContract != nil {
+		if self.receiveContract != nil && closeCurrentContract {
+			// the platform reported that the other party has finished with
+			// this contract (CloseSequences), so no sender resumes it
+			if self.receiveContract.unackedByteCount != 0 {
+				self.log.Infof("[r]%s<-%s s(%s) close contract with unacked =  %d\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.receiveContract.unackedByteCount)
+			}
+			self.client.ContractManager().CloseContract(
+				self.receiveContract.contractId,
+				self.receiveContract.ackedByteCount,
+				self.receiveContract.unackedByteCount,
+			)
+		} else if self.receiveContract != nil {
 			// the sender may send again with this contract (set as head)
 			// checkpoint the contract but do not close it
 			if self.receiveContract.unackedByteCount != 0 {
@@ -15417,6 +15518,10 @@ func (self *ReceiveSequence) Run() {
 				self.receiveContract.ackedByteCount,
 				self.receiveContract.unackedByteCount,
 			)
+		}
+		// reported: a later close request for these finds no holder
+		for contractId := range self.openReceiveContracts {
+			self.contractHolders.release(contractId, self)
 		}
 
 		// drain the buffer, releasing any borrowed budget
@@ -15909,6 +16014,14 @@ func (self *ReceiveSequence) Run() {
 		if self.ctx.Err() != nil {
 			return
 		}
+		// a busy sequence takes close requests between Packs
+		select {
+		case <-self.closeNotify:
+			if self.applyCloseRequests() {
+				return
+			}
+		default:
+		}
 		var timeout time.Duration
 		var expiredGap *receiveItem
 		deliveryBlocked := false
@@ -16131,6 +16244,10 @@ func (self *ReceiveSequence) Run() {
 			}
 		case <-self.deliveryWake():
 			// The ledger drained after it refused a held head.
+		case <-self.closeNotify:
+			if self.applyCloseRequests() {
+				return
+			}
 		case <-idleTimer.C:
 			if 0 == self.receiveQueue.Len() {
 				// An open Pack can be waiting for this worker to receive; its idle
@@ -17152,6 +17269,7 @@ func (self *ReceiveSequence) registerContractAhead(
 		return nil
 	}
 	self.openReceiveContracts[aheadReceiveContract.contractId] = aheadReceiveContract
+	self.contractHolders.hold(aheadReceiveContract.contractId, self)
 	aheadReceiveContract.statsEntry = self.client.ContractManager().registerContractStats(
 		aheadReceiveContract.contractId,
 		true,
@@ -17206,6 +17324,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 	superseded := self.receiveContract
 
 	self.openReceiveContracts[nextReceiveContract.contractId] = nextReceiveContract
+	self.contractHolders.hold(nextReceiveContract.contractId, self)
 	self.receiveContract = nextReceiveContract
 	self.updateContractWriterAlias()
 	// the receive side does not know companion-ness (the wire contract does not
@@ -17246,6 +17365,7 @@ func (self *ReceiveSequence) trimReceiveContracts() {
 					receiveContract.unackedByteCount,
 				)
 				delete(self.openReceiveContracts, receiveContract.contractId)
+				self.contractHolders.release(receiveContract.contractId, self)
 			}
 		}
 	}
