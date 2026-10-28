@@ -381,8 +381,9 @@ type ApiMultiClientGenerator struct {
 	platformModePreferences    map[TransportMode]int
 	platformTransportPolicyVer uint64
 
-	// Every discovery request asks only for providers that advertise
-	// post-quantum encryption while set (SetPostQuantumEncryption).
+	// While set, every discovery request asks only for modern providers
+	// (`FindProviders2Args.RequireModernProvider`) and leaves
+	// `PostQuantumEncryption` unset (SetPostQuantumEncryption).
 	postQuantumEncryption atomic.Bool
 
 	api *BringYourApi
@@ -725,10 +726,12 @@ func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamilyContext(ctx con
 	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily)
 }
 
-// SetPostQuantumEncryption implements
-// MultiClientGeneratorWithPostQuantumEncryption. Each later find-providers2
-// request, a window's discovery and a named redial alike, asks only for
-// providers that advertise post-quantum encryption while it is set.
+// Implements MultiClientGeneratorWithPostQuantumEncryption. While it is set,
+// each later find-providers2 request, a window's discovery, a family top-up
+// and a named redial alike, asks only for modern providers
+// (`FindProviders2Args.RequireModernProvider`) and does not send
+// `PostQuantumEncryption`. Fixed `ClientId` specs and restored window
+// identities make no request, so it does not narrow them.
 func (self *ApiMultiClientGenerator) SetPostQuantumEncryption(postQuantumEncryption bool) {
 	self.postQuantumEncryption.Store(postQuantumEncryption)
 }
@@ -857,6 +860,8 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 	}
 
 	if 0 < len(discoverySpecs) {
+		// the modern requirement narrows only this request: the fixed and
+		// restored destinations above are returned as they are
 		findProviders2 := &FindProviders2Args{
 			Specs:                 discoverySpecs,
 			ExcludeClientIds:      excludeClientIds,
@@ -864,7 +869,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			Count:                 count,
 			RankMode:              rankMode,
 			IpFamily:              ipFamily,
-			PostQuantumEncryption: self.postQuantumEncryption.Load(),
+			RequireModernProvider: self.postQuantumEncryption.Load(),
 		}
 
 		result, err := self.findProviders2(ctx, findProviders2)
@@ -883,8 +888,10 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 
 // Implements MultiClientGeneratorWithClientId: one find-providers2 request that
 // names only clientId, so the platform's exclusions decide whether the provider
-// may be dialed again. An id this generator excludes is answered empty without
-// a request, as discovery would never return it either.
+// may be dialed again. While SetPostQuantumEncryption is set, the request also
+// requires a modern provider, so a provider that is not modern is answered
+// empty too. An id this generator excludes is answered empty without a
+// request, as discovery would never return it either.
 func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	destinations := map[MultiHopId]DestinationStats{}
 	excludeClientIds := self.ExcludeClientIds()
@@ -903,7 +910,7 @@ func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, ex
 		ExcludeDestinations:   excludeDestinationsIds,
 		Count:                 1,
 		RankMode:              rankMode,
-		PostQuantumEncryption: self.postQuantumEncryption.Load(),
+		RequireModernProvider: self.postQuantumEncryption.Load(),
 	})
 	if err != nil {
 		return nil, err

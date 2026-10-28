@@ -178,14 +178,20 @@ type MultiClientGeneratorWithClientId interface {
 	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 }
 
-// An optional generator capability: discover only providers that advertise
-// post-quantum encryption (`FindProviders2Args.PostQuantumEncryption`). The
-// multi client sets it from its performance profile before any window
-// discovers under the profile. Under `PostQuantumEncryption` every window
-// client runs `EncryptionModeRequired`, so a provider that cannot seal a
-// session can never carry its traffic; asking for capable providers keeps
-// such a provider from being dialed and evaluated at all. It only narrows
-// discovery: the window clients' required gate still decides every send. A
+// An optional generator capability: narrow discovery to modern providers
+// (`FindProviders2Args.RequireModernProvider`), those the platform's
+// capability probe measured within the last seven days negotiating end-to-end
+// post-quantum encryption with resizable transfer windows, or, holding only a
+// Network key, that declared post-quantum encryption. The multi client sets it
+// from its performance profile before any window discovers under the profile.
+// Under `PostQuantumEncryption` every window client runs
+// `EncryptionModeRequired`, so a provider that cannot seal a session can never
+// carry its traffic; asking for modern providers keeps a provider without
+// evidence that it negotiates the session from being dialed and evaluated at
+// all. It narrows only the requests the generator makes: fixed `ClientId`
+// destinations and restored window identities bypass discovery and are not
+// filtered. The window clients' required gate still decides every send, and a
+// modern provider that fails to seal costs a failed dial, never plaintext. A
 // generator without the capability discovers as before.
 type MultiClientGeneratorWithPostQuantumEncryption interface {
 	SetPostQuantumEncryption(postQuantumEncryption bool)

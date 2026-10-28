@@ -375,14 +375,23 @@ type FindProviders2Args struct {
 	// v4-capable, which is every provider an older server knows, so an older
 	// client keeps today's behavior. See ip_family.go.
 	IpFamily IpFamilyFilter `json:"ip_family,omitempty"`
-	// PostQuantumEncryption asks only for providers whose latest provide
-	// advertised post-quantum encryption sessions
-	// (`Provide.post_quantum_encryption`); a provider that never advertised
-	// it, as every provider before the field did not, is left out. A client
-	// whose window clients require post-quantum encryption sets it. Unset, the
-	// request is the capability-blind discovery of an older client, and an
-	// older server ignores it.
+	// Asks only for providers whose latest provide advertised post-quantum
+	// encryption sessions (`Provide.post_quantum_encryption`); a provider that
+	// never advertised it, as every provider before the field did not, is left
+	// out. A client whose window clients require end-to-end encryption asks
+	// with `RequireModernProvider` instead and leaves this unset. An older
+	// server ignores it.
 	PostQuantumEncryption bool `json:"post_quantum_encryption,omitempty"`
+	// Keeps only modern providers in every draw, providers named by a
+	// `ClientId` spec included. A provider is modern when the platform's
+	// capability probe measured it within the last seven days negotiating
+	// end-to-end post-quantum encryption with resizable transfer windows, or,
+	// for a provider holding only a Network key, which the probe cannot reach,
+	// when its latest provide declared post-quantum encryption. A client whose
+	// window clients require end-to-end encryption sets it. With neither this
+	// nor `PostQuantumEncryption` set, the request is the capability-blind
+	// discovery of an older client. An older server ignores it.
+	RequireModernProvider bool `json:"require_modern_provider,omitempty"`
 }
 
 type FindProviders2Result struct {

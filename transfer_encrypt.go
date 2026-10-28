@@ -3639,10 +3639,13 @@ func (self *EncryptionSessionManager) RequireEncryption() bool {
 // layer is on, the identity such a peer verifies the session against is set
 // up (the published TLS certificate, signed with the client identity key),
 // and the receiver-role TLS config offers the X25519MLKEM768 hybrid. Every
-// `Provide` the contract manager sends advertises it, and provider discovery
-// offers only advertising providers to a client that requires post-quantum
-// encryption. It is a claim for discovery, never for admission: the
-// requiring peer still verifies every session it seals with.
+// `Provide` the contract manager sends advertises it. Provider discovery
+// narrows a client that requires post-quantum encryption to modern providers,
+// and the advertisement is what makes a provider holding only a Network key
+// modern, since the capability probe cannot reach it; a request that sets
+// `post_quantum_encryption` keeps only advertising providers. It is a claim
+// for discovery, never for admission: the requiring peer still verifies every
+// session it seals with.
 func (self *EncryptionSessionManager) ServesPostQuantumEncryption() bool {
 	if self.settings == nil || self.settings.Mode == EncryptionModeOff || self.clientKeyManager == nil {
 		return false

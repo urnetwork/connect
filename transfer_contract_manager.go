@@ -1281,8 +1281,10 @@ func (self *ContractManager) IsProvidePaused() bool {
 
 // provideFrame builds the provide that registers the current provide keys, and
 // advertises whether this client serves post-quantum encryption sessions
-// (`EncryptionSessionManager.ServesPostQuantumEncryption`), which provider
-// discovery requires of the providers it offers a post-quantum client.
+// (`EncryptionSessionManager.ServesPostQuantumEncryption`). Provider discovery
+// narrows a post-quantum client to modern providers, and the declaration is
+// what makes a provider holding only a Network key modern; a request that sets
+// `post_quantum_encryption` filters on it directly.
 func (self *ContractManager) provideFrame() (*protocol.Frame, error) {
 	// read before taking the manager lock: the session manager has its own
 	postQuantumEncryption := false
