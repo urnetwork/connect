@@ -98,7 +98,21 @@ func newTestAltServerWithVersions(
 	versions []quic.Version,
 ) *testAltServer {
 	t.Helper()
-	certPem, keyPem, err := selfSign([]string{testAltApiHost}, "alt-test", 1*time.Hour, 24*time.Hour)
+	return newTestAltServerForApiHost(t, whodis, loopbackIp, testAltApiHost, versions)
+}
+
+// The same fixture serving another api name, which its certificate covers and
+// its handler answers: a family name such as `api-v4.space.example`, as alt
+// serves every api name the services config exposes (L1, L3).
+func newTestAltServerForApiHost(
+	t *testing.T,
+	whodis bool,
+	loopbackIp string,
+	apiHost string,
+	versions []quic.Version,
+) *testAltServer {
+	t.Helper()
+	certPem, keyPem, err := selfSign([]string{apiHost}, "alt-test", 1*time.Hour, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +151,7 @@ func newTestAltServerWithVersions(
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host != testAltApiHost {
+		if r.Host != apiHost {
 			w.WriteHeader(http.StatusMisdirectedRequest)
 			return
 		}

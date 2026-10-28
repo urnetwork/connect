@@ -1478,7 +1478,9 @@ included, so alt loads the existing api and connect certificates and no
 certificate is issued for the alt names. The network space derives
 `GetAltUrl`, `GetAltUrlV4` and `GetAltUrlV6` from the platform url by the
 label rule (`connect` to `alt`) with an optional `AltUrl` override, and
-alt names resolve over DoH like the other space names.
+alt names resolve over DoH like the other space names. The rule maps an
+`api` label the same way (`api`, `api-v4` and `api-v6` to `alt`, `alt-v4`
+and `alt-v6`), since alt serves the api names as well (connect#229).
 
 L4. Client strategy. The api gains an "alt h3" dialer (an http3 round
 tripper to the alt addresses with the api name as SNI and the platform's
@@ -1492,7 +1494,13 @@ setting is empty (the sdk clears it); H1 keeps the platform url. An
 explicit port on an alt url pins both udp carriers to it, which is how a
 test fixture is reached; the family group derives `alt-v4` and `alt-v6`
 only from an alt url that is itself derived from the platform url, and
-passes any other alt url through unchanged. A family-pinned direct
+passes any other alt url through unchanged. The api alt dialers pair the
+same way by the name a request presents: a family name of the alt url's
+own space (`api-v4`, `connect-v6`, with the env prefix) goes to its
+family's alt name on the alt url's port, so an extender activation posted
+to `api-v4` reaches `alt-v4`, whose addresses are v4 alone, even from the
+role's unpinned strategy (connect#229); every other name, and an alt url
+set explicitly, keeps the alt url's host. A family-pinned direct
 strategy carries its family into the udp dials so a v4 activation never
 reaches alt over v6. The 53-then-4053 order is two candidates through the
 existing staggered race. The extender carriers are unchanged, since they forward the
