@@ -395,6 +395,21 @@ message StreamReset {
     repeated StreamOpen streams = 1;
 }
 
+// The platform's request that a client close contracts and sequences now,
+// sent only from the control id (server/CLIENTCLOSE1.md). The platform sends
+// it when the other party of a contract has sent its final close, and to each
+// counterparty of a client removed through the api. For each contract the
+// client reports a final close: with the counts of the live sequence that
+// holds it, or with zero counts when no sequence holds it any more, since its
+// counts were reported before. For each peer the client closes every sequence
+// with the peer, reporting finals for their contracts.
+message CloseSequences {
+    // ulid
+    repeated bytes contract_ids = 1;
+    // ulid
+    repeated bytes peer_ids = 2;
+}
+
 
 // a network peer: a connected top-level client in the same network and its
 // identity metadata. When `disconnect_time` is set, this entry is a
