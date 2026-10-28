@@ -11699,6 +11699,20 @@ components:
             is left out. A client whose connections require post-quantum
             encryption sets it; unset keeps the capability-blind answer.
           type: boolean
+        require_modern_provider:
+          description: |
+            Keep only modern providers, in every draw, providers named by
+            `client_id` included. A provider holding a Public key is modern
+            when the platform's capability probe measured it, within the last
+            seven days, negotiating end-to-end post-quantum encryption with
+            resizable transfer windows. A provider holding only a Network key,
+            which the probe cannot reach, is modern when its latest provide
+            with a Network key declared post-quantum encryption sessions. A
+            provider holding neither key is never modern. With
+            `post_quantum_encryption` too, both filters apply. A client whose
+            connections require end-to-end encryption sets it; unset keeps
+            the capability-blind answer.
+          type: boolean
 
     LocationCoordinates:
       description: |
