@@ -348,6 +348,7 @@ func TestCloseSequencesReportsZeroFinalForUnheldContract(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
 		harness := newCloseSequencesHarness(t)
+		harness.holdControlAcknowledgements()()
 		sender := harness.newSender()
 		contractId, contractFrame := harness.newReceiveContract(sender.sourceId)
 		byteCount := harness.deliver(sender, contractFrame, closeSequencesMessageFrame("idle"))
