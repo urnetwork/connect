@@ -111,7 +111,7 @@ const (
 	// platform drops the unknown message type.
 	MessageType_TransferResidentMoveResult MessageType = 35
 	// the platform's request that a client close contracts and sequences now
-	// (server/CLIENTCLOSE1.md). Sent only from the control id.
+	// (server/CLIENTCLOSE.md). Sent only from the control id.
 	// `Frame.message_bytes` is a marshaled `CloseSequences`. An older client
 	// ignores the unknown message type.
 	MessageType_TransferCloseSequences MessageType = 36

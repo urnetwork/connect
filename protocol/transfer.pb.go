@@ -1706,7 +1706,7 @@ func (x *StreamReset) GetStreams() []*StreamOpen {
 }
 
 // The platform's request that a client close contracts and sequences now,
-// sent only from the control id (server/CLIENTCLOSE1.md). The platform sends
+// sent only from the control id (server/CLIENTCLOSE.md). The platform sends
 // it when the other party of a contract has sent its final close, and to each
 // counterparty of a client removed through the api. For each contract the
 // client reports a final close: with the counts of the live sequence that

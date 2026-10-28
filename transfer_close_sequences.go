@@ -1,4 +1,4 @@
-// The platform's CloseSequences (server CLIENTCLOSE1.md). When the other party
+// The platform's CloseSequences (server CLIENTCLOSE.md). When the other party
 // of a contract has sent its final close, or a client was removed through the
 // api, the platform asks this client to report its own final for the listed
 // contracts now, instead of leaving them to the platform's expiry sweep.
