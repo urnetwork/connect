@@ -661,6 +661,9 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		// short next to the quiet interval, so peers hear of a change
 		// promptly, without spinning on a full queue
 		NetworkQualityNotificationRetryInterval: 100 * time.Millisecond,
+
+		// four of the platform's largest messages (1024 ids each)
+		CloseSequencesMaxPendingCount: 4 * 1024,
 	}
 	// A per-peer session is ref-held by both a send and a receive sequence, so
 	// it must outlive the longer of the two — otherwise the next burst (after a
@@ -1601,6 +1604,12 @@ type ClientSettings struct {
 	// a short pause that lets a full queue drain is enough. Non-positive does
 	// not retry: they wait for the next quality change.
 	NetworkQualityNotificationRetryInterval time.Duration
+	// CloseSequencesMaxPendingCount bounds the contract and peer ids from the
+	// platform's CloseSequences that wait for the client's close worker. Ids
+	// past it are dropped and counted, and their contracts close as they did
+	// before the message: at the platform's expiry sweep. Non-positive drops
+	// every id.
+	CloseSequencesMaxPendingCount int
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -2199,6 +2208,7 @@ type Client struct {
 	encryptionSessionManager *EncryptionSessionManager
 	signalDispatcher         *clientSignalDispatcher
 	networkQuality           *clientNetworkQualityState
+	sequenceCloser           *sequenceCloser
 
 	// ready is closed by NewClientWithTag right before it returns, once every
 	// manager, buffer, callback, and the `run` loop are wired up. See
@@ -2213,9 +2223,10 @@ type Client struct {
 	beforeLoopbackReleaseForTest func()
 
 	// contractManagerUnsub func()
-	webRtcManagerUnsub func()
-	streamManagerUnsub func()
-	peerManagerUnsub   func()
+	webRtcManagerUnsub  func()
+	streamManagerUnsub  func()
+	peerManagerUnsub    func()
+	sequenceCloserUnsub func()
 }
 
 func NewClientWithDefaults(
@@ -2343,6 +2354,8 @@ func NewClientWithTag(
 	// valid same-network endpoint from stale public provider work.
 	client.peerManagerUnsub = client.AddReceiveCallback(peerManager.Receive)
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
+	client.sequenceCloser = newSequenceCloser(client)
+	client.sequenceCloserUnsub = client.AddReceiveCallback(client.sequenceCloser.Receive)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 	client.networkQuality = newClientNetworkQualityState(client)
@@ -5073,6 +5086,7 @@ func (self *Client) Ctx() context.Context {
 func (self *Client) Close() {
 	self.cancel()
 	self.networkQuality.close()
+	self.sequenceCloser.close()
 	self.webRtcManagerUnsub()
 
 	if self.streamManager != nil {
@@ -5097,13 +5111,14 @@ func (self *Client) Close() {
 	// self.contractManagerUnsub()
 	self.streamManagerUnsub()
 	self.peerManagerUnsub()
+	self.sequenceCloserUnsub()
 }
 
-// CloseAndWait closes the client and joins its reader, client-created signal
-// dispatcher, stream transports, transfer sequences, WebRTC peers, and
-// contract/encryption manager work. It returns only after those workers have
-// relinquished their message-pool ownership, or ctx expires. Close remains the
-// non-joining compatibility API.
+// CloseAndWait closes the client and joins its reader, close worker,
+// client-created signal dispatcher, stream transports, transfer sequences,
+// WebRTC peers, and contract/encryption manager work. It returns only after
+// those workers have relinquished their message-pool ownership, or ctx
+// expires. Close remains the non-joining compatibility API.
 //
 // The join covers only Client-owned work. Arbitrary transports registered in
 // RouteManager, including externally created PlatformTransport or direct
@@ -5127,6 +5142,10 @@ func (self *Client) CloseAndWait(ctx context.Context) error {
 
 	var result error
 	if err := self.networkQuality.wait(ctx); err != nil {
+		result = errors.Join(result, err)
+	}
+	// Its close reports start contract manager work, joined below.
+	if err := self.sequenceCloser.wait(ctx); err != nil {
 		result = errors.Join(result, err)
 	}
 	if self.beforeRunDoneWaitForTest != nil {
@@ -5262,6 +5281,9 @@ type SendBufferSettings struct {
 	createContractRetryRandomForTest func(n int64) int64
 	// Nil reads the process-wide degraded-backend gate (isBackendDegraded).
 	backendDegradedForTest func() bool
+	// Nil test observer runs as a due successor's request takes the queue
+	// and admission locks (maybeRequestSuccessorContract).
+	beforeSuccessorContractRequestForTest func(sendSequenceId)
 
 	// resend timeout is the initial time between successive send attempts. Does linear backoff
 	// MinResendInterval is the resend floor while no rtt samples exist (the
@@ -6610,6 +6632,32 @@ func (self *SendBuffer) cancelDestinationAndWait(destinationId Id) {
 	}
 }
 
+// Cancels every send sequence, running or exiting, with a listed identity, and
+// returns the identities that had one. Each exit reports finals for the
+// sequence's open contracts and flushes its queued ones. Does not wait.
+func (self *SendBuffer) cancelSendSequences(sendSequenceIds map[sendSequenceId]bool) map[sendSequenceId]bool {
+	canceledSendSequenceIds := map[sendSequenceId]bool{}
+	if len(sendSequenceIds) == 0 {
+		return canceledSendSequenceIds
+	}
+	sequences := []*SendSequence{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for sequence := range self.activeSendSequences {
+			id := sequence.id()
+			if sendSequenceIds[id] {
+				sequences = append(sequences, sequence)
+				canceledSendSequenceIds[id] = true
+			}
+		}
+	}()
+	for _, sequence := range sequences {
+		sequence.Cancel()
+	}
+	return canceledSendSequenceIds
+}
+
 // Admission closes permanently, even while the owning Client is still live.
 // Retry owners consult this only after an enqueue error.
 func (self *SendBuffer) admissionClosed() bool {
@@ -6751,6 +6799,10 @@ type SendSequence struct {
 	// a contract becomes current. Owned by the sequence goroutine.
 	successorContractRequested bool
 	sendContractSetTime        time.Time
+	// The manager's rate-limit refusal count when the successor was marked
+	// requested (ContractManager.createContractRateLimitRefusalCount). Once
+	// it moves, the successor's own request may have been the one refused.
+	successorContractRequestedRefusals uint64
 	// Whether the current contract's successor is requested at take and at
 	// announcement rather than once it is due (`successorContractEagerForKey`).
 	successorContractEager bool
@@ -10325,16 +10377,20 @@ func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 // requesting and keep the OOB storm going for exactly the sequences that still
 // have work to do. The contract in use is unaffected: only its successor waits
 // for the backend.
+//
+// Returns whether a request for the successor is in flight. A request the
+// client's rate-limit hold dropped is none, so the successor stays due and is
+// asked for by the first write after the hold ends; reported as made, it was
+// never asked for until the contract ran out.
 func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteCount ByteCount) bool {
 	if self.backendDegraded() {
 		return false
 	}
-	self.client.ContractManager().CreateContract(
+	return self.client.ContractManager().createContract(
 		key,
 		self.contractSeqIndex,
 		ByteCount(32+float32(messageByteCount+self.sendBufferSettings.MinMessageByteCount)/self.sendBufferSettings.ContractFillFraction),
 	)
-	return true
 }
 
 // Requests the current contract's successor the first time it is due (see
@@ -10345,22 +10401,60 @@ func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteC
 // path, which retires it. Nothing here blocks.
 func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCount) {
 	contract := self.sendContract
-	if contract == nil || self.successorContractEager || self.successorContractRequested {
+	if contract == nil || self.successorContractEager {
+		return
+	}
+	if self.successorContractRequested && !self.successorContractRefused() {
 		return
 	}
 	due, checkRemainingByteCount := self.successorContractDue(contract)
 	if due {
+		manager := self.client.ContractManager()
+		// While the client's rate-limit hold runs the request would only be
+		// dropped. Leave the successor due for the first write after the
+		// hold, without the queue and admission locks on every write until
+		// then. Lock-free: a hold this read misses, admission still drops.
+		if manager.createContractRateLimitHeld(time.Now()) {
+			contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+			return
+		}
 		metadata := self.contractMetadata()
 		if self.sendContractMetadataGeneration != metadata.generation {
 			return
 		}
-		if self.client.ContractManager().hasQueuedContract(metadata.key) ||
+		if self.sendBufferSettings.beforeSuccessorContractRequestForTest != nil {
+			self.sendBufferSettings.beforeSuccessorContractRequestForTest(self.id())
+		}
+		// read before asking: a refusal answered during the request, as a
+		// synchronous control answers it, must read as after the mark
+		refusals := manager.createContractRateLimitRefusalCount()
+		if manager.hasQueuedContract(metadata.key) ||
 			self.requestSuccessorContract(metadata.key, messageByteCount) {
 			self.successorContractRequested = true
+			self.successorContractRequestedRefusals = refusals
 			checkRemainingByteCount = 0
 		}
 	}
 	contract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
+}
+
+// Whether the successor marked requested has since been refused as a rate
+// limit. Such a request never queues a contract, so the successor is due
+// again, as a request a hold dropped is. One atomic read per write until a
+// refusal comes, then one locked read of the key; either way the mark is
+// current again afterwards.
+func (self *SendSequence) successorContractRefused() bool {
+	manager := self.client.ContractManager()
+	refusals := manager.createContractRateLimitRefusalCount()
+	if refusals == self.successorContractRequestedRefusals {
+		return false
+	}
+	self.successorContractRequestedRefusals = refusals
+	if !manager.createContractRateLimitedKey(self.contractMetadata().key) {
+		return false
+	}
+	self.successorContractRequested = false
+	return true
 }
 
 // The successor is due once the contract has carried
@@ -14144,6 +14238,9 @@ type ReceiveBuffer struct {
 	// activeReceiveSequences retains workers through their final Pack-channel
 	// drain, which occurs after their public head/index entries are removed.
 	activeReceiveSequences map[*ReceiveSequence]bool
+	// the live sequence holding each open receive contract, for the
+	// platform's close requests (CloseSequences). Its own lock.
+	contractHolders *receiveContractHolders
 	// Nonzero receive lanes share one fixed reorder pool when the caller did
 	// not already install a device-wide ReceiveQueueBudget.
 	logicalLaneReceiveBudget *TransferMemoryBudget
@@ -14165,6 +14262,7 @@ func NewReceiveBuffer(ctx context.Context,
 		receiveSequences:       map[receiveSequenceId]*ReceiveSequence{},
 		headReceiveSequenceIds: map[receiveSequenceHeadKey]receiveSequenceId{},
 		activeReceiveSequences: map[*ReceiveSequence]bool{},
+		contractHolders:        newReceiveContractHolders(),
 		beforeCreateReceiveSequenceForTest: receiveBufferSettings.
 			beforeCreateReceiveSequenceForTest,
 		beforeRunReceiveSequenceForTest: receiveBufferSettings.
@@ -14477,6 +14575,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				self.receiveBufferSettings,
 				logicalLaneReceiveBudget,
 			)
+			receiveSequence.contractHolders = self.contractHolders
 			self.receiveSequences[receiveSequenceId] = receiveSequence
 			self.headReceiveSequenceIds[headKey] = receiveSequenceId
 			self.activeReceiveSequences[receiveSequence] = true
@@ -14587,19 +14686,39 @@ func (self *ReceiveBuffer) ReceiveQueueSizeAndMessageTypes(source TransferPath, 
 
 // Cancels and joins every inbound Transfer sequence authenticated as one
 // source. This prevents already-queued Packs from recreating provider work
-// after the source gate has accepted a terminal verdict.
+// after the source gate has accepted a terminal verdict. Each exit
+// checkpoints its current contract, which the source may resume.
 func (self *ReceiveBuffer) cancelSourceAndWait(sourceId Id) {
-	self.mutex.Lock()
+	self.endSourceAndWait(sourceId, false)
+}
+
+// Like cancelSourceAndWait, for a source removed through the api
+// (CloseSequences). The source has finished with every contract, so each
+// exit reports a final for its current contract rather than a checkpoint.
+func (self *ReceiveBuffer) closeSourceAndWait(sourceId Id) {
+	self.endSourceAndWait(sourceId, true)
+}
+
+// Ends and joins every inbound sequence from one source. closeContracts
+// selects a final rather than a checkpoint for each current contract.
+func (self *ReceiveBuffer) endSourceAndWait(sourceId Id, closeContracts bool) {
 	sequences := map[*ReceiveSequence]bool{}
-	for id, sequence := range self.receiveSequences {
-		if id.Source.SourceId == sourceId {
-			sequences[sequence] = true
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for id, sequence := range self.receiveSequences {
+			if id.Source.SourceId == sourceId {
+				sequences[sequence] = true
+			}
 		}
-	}
-	self.mutex.Unlock()
+	}()
 
 	for sequence := range sequences {
-		sequence.Cancel()
+		if closeContracts {
+			sequence.closeContractsAndCancel()
+		} else {
+			sequence.Cancel()
+		}
 	}
 	for sequence := range sequences {
 		<-sequence.done
@@ -14725,6 +14844,23 @@ type ReceiveSequence struct {
 	receiveContract           *sequenceContract
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
+	// the owning buffer's index of open contracts by holding sequence; nil
+	// for a sequence outside a ReceiveBuffer
+	contractHolders *receiveContractHolders
+
+	// closeStateLock guards the platform's close requests (CloseSequences):
+	// the client's close worker adds them and Run takes them. A leaf lock.
+	closeStateLock sync.Mutex
+	// open contracts the other party has finished with
+	closeContractIds map[Id]bool
+	// whether the exit reports a final rather than a checkpoint for the
+	// current contract
+	closeCurrentContract bool
+	// set when the exit takes the requests to report its contracts; a later
+	// request is refused, and its caller reports the close itself
+	closeRequestsTaken bool
+	// a coalesced edge that wakes Run for a new close request
+	closeNotify chan struct{}
 
 	packMutex sync.Mutex
 	packs     chan *ReceivePack
@@ -14949,6 +15085,7 @@ func newReceiveSequenceWithLogicalLaneBudget(
 		receiveBufferSettings:           receiveBufferSettings,
 		openReceiveContracts:            map[Id]*sequenceContract{},
 		receiveContract:                 nil,
+		closeNotify:                     make(chan struct{}, 1),
 		packs:                           make(chan *ReceivePack, channelBufferSize),
 		packQueueBaseLimit:              int64(sequenceBufferSize),
 		packQueueH1Limit:                int64(h1SequenceBufferSize),
@@ -15406,7 +15543,9 @@ func (self *ReceiveSequence) Run() {
 		self.closeContractWriterAlias()
 		self.cancel()
 
-		// close previous contracts and checkpoint the current contract
+		// close previous contracts and checkpoint the current contract,
+		// or close it too when the other party has finished with it
+		closeCurrentContract := self.takeCloseRequests()
 		for _, receiveContract := range self.openReceiveContracts {
 			if self.receiveContract != receiveContract {
 				if receiveContract.unackedByteCount != 0 {
@@ -15419,7 +15558,18 @@ func (self *ReceiveSequence) Run() {
 				)
 			}
 		}
-		if self.receiveContract != nil {
+		if self.receiveContract != nil && closeCurrentContract {
+			// the platform reported that the other party has finished with
+			// this contract (CloseSequences), so no sender resumes it
+			if self.receiveContract.unackedByteCount != 0 {
+				self.log.Infof("[r]%s<-%s s(%s) close contract with unacked =  %d\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.receiveContract.unackedByteCount)
+			}
+			self.client.ContractManager().CloseContract(
+				self.receiveContract.contractId,
+				self.receiveContract.ackedByteCount,
+				self.receiveContract.unackedByteCount,
+			)
+		} else if self.receiveContract != nil {
 			// the sender may send again with this contract (set as head)
 			// checkpoint the contract but do not close it
 			if self.receiveContract.unackedByteCount != 0 {
@@ -15430,6 +15580,10 @@ func (self *ReceiveSequence) Run() {
 				self.receiveContract.ackedByteCount,
 				self.receiveContract.unackedByteCount,
 			)
+		}
+		// reported: a later close request for these finds no holder
+		for contractId := range self.openReceiveContracts {
+			self.contractHolders.release(contractId, self)
 		}
 
 		// drain the buffer, releasing any borrowed budget
@@ -15922,6 +16076,14 @@ func (self *ReceiveSequence) Run() {
 		if self.ctx.Err() != nil {
 			return
 		}
+		// a busy sequence takes close requests between Packs
+		select {
+		case <-self.closeNotify:
+			if self.applyCloseRequests() {
+				return
+			}
+		default:
+		}
 		var timeout time.Duration
 		var expiredGap *receiveItem
 		deliveryBlocked := false
@@ -16144,6 +16306,10 @@ func (self *ReceiveSequence) Run() {
 			}
 		case <-self.deliveryWake():
 			// The ledger drained after it refused a held head.
+		case <-self.closeNotify:
+			if self.applyCloseRequests() {
+				return
+			}
 		case <-idleTimer.C:
 			if 0 == self.receiveQueue.Len() {
 				// An open Pack can be waiting for this worker to receive; its idle
@@ -17165,6 +17331,7 @@ func (self *ReceiveSequence) registerContractAhead(
 		return nil
 	}
 	self.openReceiveContracts[aheadReceiveContract.contractId] = aheadReceiveContract
+	self.contractHolders.hold(aheadReceiveContract.contractId, self)
 	aheadReceiveContract.statsEntry = self.client.ContractManager().registerContractStats(
 		aheadReceiveContract.contractId,
 		true,
@@ -17219,6 +17386,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 	superseded := self.receiveContract
 
 	self.openReceiveContracts[nextReceiveContract.contractId] = nextReceiveContract
+	self.contractHolders.hold(nextReceiveContract.contractId, self)
 	self.receiveContract = nextReceiveContract
 	self.updateContractWriterAlias()
 	// the receive side does not know companion-ness (the wire contract does not
@@ -17259,6 +17427,7 @@ func (self *ReceiveSequence) trimReceiveContracts() {
 					receiveContract.unackedByteCount,
 				)
 				delete(self.openReceiveContracts, receiveContract.contractId)
+				self.contractHolders.release(receiveContract.contractId, self)
 			}
 		}
 	}

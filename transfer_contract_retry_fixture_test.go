@@ -155,8 +155,14 @@ func contractRetryTestSettings() *ClientSettings {
 // joins it, then returns what the route still holds.
 func newContractRetryTestClient(t *testing.T, oob *contractRetryOob, settings *ClientSettings) *Client {
 	t.Helper()
+	return newContractTestClientWithOob(t, oob.clientId, oob, settings)
+}
+
+// newContractRetryTestClient for any control service.
+func newContractTestClientWithOob(t *testing.T, clientId Id, oob OutOfBandControl, settings *ClientSettings) *Client {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	client := NewClient(ctx, oob.clientId, oob, settings)
+	client := NewClient(ctx, clientId, oob, settings)
 	route := make(chan []byte, 1024)
 	client.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{route})
 	t.Cleanup(func() {
@@ -181,7 +187,14 @@ func newContractRetryTestClient(t *testing.T, oob *contractRetryOob, settings *C
 // Queues one message for `destinationId` and returns where its ack lands.
 func sendContractRetryMessage(t *testing.T, client *Client, destinationId Id) chan error {
 	t.Helper()
-	frame, err := ToFrame(&protocol.SimpleMessage{Content: "contract retry"}, DefaultProtocolVersion)
+	return sendContractRetryContent(t, client, destinationId, "contract retry")
+}
+
+// sendContractRetryMessage with the message's `content`, which sets how much of
+// its contract the message uses.
+func sendContractRetryContent(t *testing.T, client *Client, destinationId Id, content string) chan error {
+	t.Helper()
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: content}, DefaultProtocolVersion)
 	if err != nil {
 		t.Fatal(err)
 	}

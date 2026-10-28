@@ -285,6 +285,7 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		{path: "ip.go", callback: "userNatClient.ClientReceive"},
 		{path: "ip.go", callback: "userNatProvider.ClientReceive"},
 		{path: "ip_remote_multi_client.go", callback: "clientChannel.clientReceive"},
+		{path: "transfer.go", callback: "client.sequenceCloser.Receive"},
 		{path: "transfer.go", callback: "peerManager.Receive"},
 		{path: "transfer.go", callback: "streamManager.Receive"},
 		{path: "transport_p2p_webrtc.go", callback: "dispatcher.Receive"},
@@ -305,6 +306,9 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		{path: "ip.go", receiver: "RemoteUserNatClient", method: "ClientReceive"},
 		{path: "ip.go", receiver: "RemoteUserNatProvider", method: "ClientReceive"},
 		{path: "ip_remote_multi_client.go", receiver: "multiClientChannel", method: "clientReceive"},
+		// records bounded ids under a leaf lock and wakes its worker without waiting
+		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "Receive"},
+		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "add"},
 		{path: "transfer_peer_manager.go", receiver: "PeerManager", method: "Receive"},
 		{path: "transfer_stream_manager.go", receiver: "StreamManager", method: "Receive"},
 		{path: "transport_p2p_webrtc.go", receiver: "clientSignalDispatcher", method: "Receive"},

@@ -13,8 +13,9 @@ import (
 // sustained fault. During a control-API outage every client retries auth and
 // every contract request fails, so `[t]auth error`, `[contract]oob err`,
 // `[ts]->error` and `[r]drop` are emitted continuously by every sequence at
-// once. Throttling keeps the signal (the first line, plus a running suppressed
-// count) while bounding the volume.
+// once, as is `[contract]oob rate limited` while a hosted owner refuses
+// contract creation. Throttling keeps the signal (the first line, plus a
+// running suppressed count) while bounding the volume.
 //
 // Concurrency: lock-free. When multiple goroutines race the same interval
 // boundary, exactly one wins the CompareAndSwap and emits; the rest are counted
