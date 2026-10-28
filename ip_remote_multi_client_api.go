@@ -176,6 +176,10 @@ type ApiMultiClientGeneratorSettings struct {
 	// route after promotion; nil has no production effect. The callback must not
 	// block the window setup path.
 	PlatformTransportCreated func(client *Client, transport *PlatformTransport)
+	// TransportDelay, when set, offers the delay header on every window
+	// client's platform transport and P2P streams (DELAY.md, D3). Nil offers
+	// nothing.
+	TransportDelay *TransportDelaySettings
 }
 
 type apiWindowPlatformTransport interface {
@@ -1318,8 +1322,12 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		// client's own copy
 		clientSettings.ClientKeySeed = bytes.Clone(args.clientKeySeed)
 	}
+	// window clients are the non-provider client connections that measure
+	// transport delay (DELAY.md D3)
+	clientSettings.TransportDelay = self.settings.TransportDelay
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := self.newPlatformTransportSettings()
+	settings.TransportDelay = self.settings.TransportDelay
 	// propagate so the client-level logger covers the platform transport
 	settings.Log = client.Log()
 	if args.P2pOnly {

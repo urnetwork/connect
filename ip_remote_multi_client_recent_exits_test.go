@@ -236,6 +236,7 @@ func recentExitTestWindow(
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 }
 

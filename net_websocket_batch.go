@@ -35,6 +35,10 @@ type WebSocketWriteBatchConn struct {
 	batching      bool
 	deadlineError atomic.Pointer[webSocketDeadlineError]
 
+	// observes each explicit batch as one physical write (transport_delay_h1.go).
+	// Set before the writer starts.
+	writeBatchObserver webSocketWriteBatchObserver
+
 	// Tests place batch activation and a concurrent control write at one exact
 	// boundary. Nil in production.
 	beforeBeginWriteBatchForTest func()
@@ -49,10 +53,24 @@ func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
 	}
 }
 
+// webSocketWriteBatchObserver is told when an explicit batch begins and ends.
+// Its calls run outside stateLock, so it may take its own locks and write.
+type webSocketWriteBatchObserver interface {
+	beginWriteBatch()
+	endWriteBatch(err error)
+}
+
+func (self *WebSocketWriteBatchConn) setWriteBatchObserver(observer webSocketWriteBatchObserver) {
+	self.writeBatchObserver = observer
+}
+
 // Starts one explicit ready-only batch on the connection's single writer.
 func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 	if self.beforeBeginWriteBatchForTest != nil {
 		self.beforeBeginWriteBatchForTest()
+	}
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.beginWriteBatch()
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -75,11 +93,16 @@ func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 
 // Discards bytes that have not reached the delegated connection.
 func (self *WebSocketWriteBatchConn) AbortWriteBatch() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	self.batching = false
-	self.writeBuffer = self.writeBuffer[:0]
+		self.batching = false
+		self.writeBuffer = self.writeBuffer[:0]
+	}()
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.endWriteBatch(errWebSocketWriteBatchAborted)
+	}
 }
 
 // Writes retained bytes while the state lock keeps concurrent control writes
@@ -103,6 +126,14 @@ func (self *WebSocketWriteBatchConn) flushWriteBufferWithLock() error {
 
 // Ends the active batch and writes every retained complete frame byte.
 func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
+	err := self.flushWriteBatch()
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.endWriteBatch(err)
+	}
+	return err
+}
+
+func (self *WebSocketWriteBatchConn) flushWriteBatch() error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 

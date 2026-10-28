@@ -34,6 +34,11 @@ type FramerSettings struct {
 	// splits the body into two `io.Writer.Write` calls to save a memcpy.
 	// This is a stream-transport optimization.
 	SplitMinimumLen int
+	// HeaderByteCount is a fixed per-message header carried between the
+	// length prefix and the message by the *WithHeader methods. It is part of
+	// the negotiated wire format. The frame length counts the header;
+	// MaxMessageLen bounds the message alone. 0 is the legacy wire.
+	HeaderByteCount int
 }
 
 // DefaultFramerSettings returns framer settings for a context whose maximum
@@ -60,7 +65,7 @@ type Framer struct {
 
 func NewFramer(settings *FramerSettings) *Framer {
 	return &Framer{
-		maxFrameLen: settings.MaxMessageLen + 4,
+		maxFrameLen: settings.MaxMessageLen + 4 + max(0, settings.HeaderByteCount),
 		settings:    settings,
 		log:         loggerOrDefault(settings.Log),
 	}
@@ -270,4 +275,159 @@ func writeFramerBatch(w io.Writer, messages [][]byte, batchBytes []byte) error {
 		return io.ErrShortWrite
 	}
 	return nil
+}
+
+// headerByteCount is the fixed per-message header of the *WithHeader methods.
+func (self *Framer) headerByteCount() int {
+	return max(0, self.settings.HeaderByteCount)
+}
+
+// validateHeaderMessage checks one message of a header frame. MaxMessageLen
+// bounds the message alone; the uint16 length bounds header and message.
+func (self *Framer) validateHeaderMessage(header []byte, messageLen int) error {
+	if len(header) != self.headerByteCount() {
+		return fmt.Errorf("Framer header length %d != %d", len(header), self.headerByteCount())
+	}
+	if self.settings.MaxMessageLen < messageLen {
+		self.log.Infof(
+			"[framer][reject]write messageLen=%d > MaxMessageLen=%d (maxFrameLen=%d)\n",
+			messageLen, self.settings.MaxMessageLen, self.maxFrameLen,
+		)
+		return fmt.Errorf("Max message len exceeded (%d<%d)", self.settings.MaxMessageLen, messageLen)
+	}
+	if math.MaxUint16 < len(header)+messageLen {
+		return fmt.Errorf("Max possible message len exceeded (%d<%d)", math.MaxUint16, len(header)+messageLen)
+	}
+	return nil
+}
+
+// WriteWithHeader emits one frame whose body is header followed by message:
+// [uint16 len(header)+len(message)][uint16 split][header][message]. header
+// must be exactly HeaderByteCount bytes. Large messages take Write's split
+// path, the header riding in the first stream write.
+func (self *Framer) WriteWithHeader(w io.Writer, header []byte, message []byte) error {
+	if err := self.validateHeaderMessage(header, len(message)); err != nil {
+		return err
+	}
+	headerLen := len(header)
+	messageLen := len(message)
+	bodyLen := headerLen + messageLen
+	if messageLen < max(16, self.settings.SplitMinimumLen) {
+		frame := MessagePoolGet(4 + bodyLen)
+		defer MessagePoolReturn(frame)
+		binary.BigEndian.PutUint16(frame[0:2], uint16(bodyLen))
+		binary.BigEndian.PutUint16(frame[2:4], uint16(0))
+		copy(frame[4:4+headerLen], header)
+		copy(frame[4+headerLen:], message)
+		if nw, writeErr := w.Write(frame[0 : 4+bodyLen]); writeErr != nil {
+			return writeErr
+		} else if nw < 4+bodyLen {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
+	splitIndex := messageLen / 2
+	h := MessagePoolGet(4 + headerLen + splitIndex)
+	defer MessagePoolReturn(h)
+	binary.BigEndian.PutUint16(h[0:2], uint16(bodyLen))
+	binary.BigEndian.PutUint16(h[2:4], uint16(headerLen+splitIndex))
+	copy(h[4:4+headerLen], header)
+	copy(h[4+headerLen:4+headerLen+splitIndex], message[0:splitIndex])
+	if nw, writeErr := w.Write(h[0 : 4+headerLen+splitIndex]); writeErr != nil {
+		return writeErr
+	} else if nw < 4+headerLen+splitIndex {
+		return io.ErrShortWrite
+	}
+	if nw, writeErr := w.Write(message[splitIndex:messageLen]); writeErr != nil {
+		return writeErr
+	} else if nw < messageLen-splitIndex {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// WriteBatchWithHeaderStorage emits messages in one physical write, each
+// preceded by the same header: all frames of one physical write carry the same
+// timing (DELAY.md §5.1). Storage and ownership follow WriteBatchWithStorage.
+func (self *Framer) WriteBatchWithHeaderStorage(
+	w io.Writer,
+	header []byte,
+	messages [][]byte,
+	storage []byte,
+) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	headerLen := len(header)
+	if len(messages) == 1 && len(storage) < 4+headerLen+len(messages[0]) {
+		return self.WriteWithHeader(w, header, messages[0])
+	}
+	totalByteCount := 0
+	for _, message := range messages {
+		if err := self.validateHeaderMessage(header, len(message)); err != nil {
+			return err
+		}
+		if math.MaxInt-totalByteCount < 4+headerLen+len(message) {
+			return fmt.Errorf("Framer batch byte count overflow.")
+		}
+		totalByteCount += 4 + headerLen + len(message)
+	}
+	if len(storage) < totalByteCount {
+		return fmt.Errorf(
+			"Framer batch storage too small (%d<%d)",
+			len(storage),
+			totalByteCount,
+		)
+	}
+	batchBytes := storage[:totalByteCount]
+	offset := 0
+	for _, message := range messages {
+		bodyLen := headerLen + len(message)
+		binary.BigEndian.PutUint16(batchBytes[offset:offset+2], uint16(bodyLen))
+		binary.BigEndian.PutUint16(batchBytes[offset+2:offset+4], 0)
+		copy(batchBytes[offset+4:offset+4+headerLen], header)
+		copy(batchBytes[offset+4+headerLen:offset+4+bodyLen], message)
+		offset += 4 + bodyLen
+	}
+	if writtenByteCount, err := w.Write(batchBytes); err != nil {
+		return err
+	} else if writtenByteCount < len(batchBytes) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// ReadWithHeader reads one header frame and returns its message as a pooled
+// buffer without the header. header receives the frame's header only once the
+// complete frame was read without error; the message never aliases it, so the
+// pooled buffer keeps its own capacity class.
+func (self *Framer) ReadWithHeader(r io.Reader, header []byte) ([]byte, error) {
+	headerLen := self.headerByteCount()
+	if len(header) != headerLen {
+		return nil, fmt.Errorf("Framer header length %d != %d", len(header), headerLen)
+	}
+	bodyLen, err := self.ReadHeader(r)
+	if err != nil {
+		return nil, err
+	}
+	if bodyLen < headerLen {
+		return nil, fmt.Errorf("Framer frame shorter than its header (%d<%d)", bodyLen, headerLen)
+	}
+	var stackHeader [64]byte
+	var frameHeader []byte
+	if headerLen <= len(stackHeader) {
+		frameHeader = stackHeader[:headerLen]
+	} else {
+		frameHeader = make([]byte, headerLen)
+	}
+	if _, err := io.ReadFull(r, frameHeader); err != nil {
+		return nil, err
+	}
+	message := MessagePoolGet(bodyLen - headerLen)
+	if _, err := io.ReadFull(r, message); err != nil {
+		MessagePoolReturn(message)
+		return nil, err
+	}
+	copy(header, frameHeader)
+	return message, nil
 }

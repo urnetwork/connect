@@ -108,6 +108,26 @@ func headerSize(header http.Header) int {
 // revocation, membership and admission checks. It preserves bytes prefetched by
 // net/http and clears its deadlines after a bounded 101 write.
 func AcceptFramedUpgrade(w http.ResponseWriter, r *http.Request, protocol string, timeout time.Duration) (net.Conn, error) {
+	return AcceptFramedUpgradeWithHeader(w, r, protocol, timeout, nil)
+}
+
+// AcceptFramedUpgradeWithHeader is AcceptFramedUpgrade with extra 101 response
+// headers, such as the Sec-WebSocket-Protocol that accepts the delay header
+// (TransportDelayH1AcceptHeader). A header name or value holding CR or LF is
+// refused rather than written.
+func AcceptFramedUpgradeWithHeader(w http.ResponseWriter, r *http.Request, protocol string, timeout time.Duration, header http.Header) (net.Conn, error) {
+	var extraLines strings.Builder
+	for name, values := range header {
+		for _, value := range values {
+			if strings.ContainsAny(name, "\r\n:") || strings.ContainsAny(value, "\r\n") {
+				return nil, &HTTPUpgradeError{Reason: "invalid-response-header", StatusCode: http.StatusInternalServerError}
+			}
+			extraLines.WriteString(http.CanonicalHeaderKey(name))
+			extraLines.WriteString(": ")
+			extraLines.WriteString(value)
+			extraLines.WriteString("\r\n")
+		}
+	}
 	if err := ValidateFramedUpgradeRequest(r, protocol); err != nil {
 		return nil, err
 	}
@@ -123,7 +143,7 @@ func AcceptFramedUpgrade(w http.ResponseWriter, r *http.Request, protocol string
 		timeout = h1UpgradeTimeout
 	}
 	if err = conn.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
-		_, err = fmt.Fprintf(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n", protocol)
+		_, err = fmt.Fprintf(buffered, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: %s\r\n%s\r\n", protocol, extraLines.String())
 	}
 	if err == nil {
 		err = buffered.Flush()
@@ -135,7 +155,8 @@ func AcceptFramedUpgrade(w http.ResponseWriter, r *http.Request, protocol string
 		conn.Close()
 		return nil, err
 	}
-	return &httpUpgradeConn{Conn: conn, reader: buffered.Reader}, nil
+	// the server's own selection, as the client records the one it read
+	return &httpUpgradeConn{Conn: conn, reader: buffered.Reader, subprotocol: header.Get("Sec-WebSocket-Protocol")}, nil
 }
 
 // httpUpgradeConn releases the handshake buffer as soon as its prefetched bytes
@@ -143,6 +164,8 @@ func AcceptFramedUpgrade(w http.ResponseWriter, r *http.Request, protocol string
 type httpUpgradeConn struct {
 	net.Conn
 	reader *bufio.Reader
+	// the Sec-WebSocket-Protocol the server's 101 selected, if any
+	subprotocol string
 }
 
 func (c *httpUpgradeConn) Read(p []byte) (int, error) {
@@ -364,7 +387,7 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 	}
 	limited.remaining = -1
 	success = true
-	return &httpUpgradeConn{Conn: conn, reader: buffered}, nil
+	return &httpUpgradeConn{Conn: conn, reader: buffered, subprotocol: response.Header.Get("Sec-WebSocket-Protocol")}, nil
 }
 
 // DialH1Messages tries the authenticated custom carrier once and falls back to

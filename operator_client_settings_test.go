@@ -165,6 +165,8 @@ func TestOperatorClientSettingsCopiesExactlyTheNestedSettingsItOwns(t *testing.T
 		"PeerManagerSettings":    true,
 		"Log":                    true,
 		"ClientKeySeed":          true,
+		// read-only: the transports read the offer and never write it
+		"TransportDelay": true,
 	}
 	isReference := func(kind reflect.Kind) bool {
 		switch kind {
