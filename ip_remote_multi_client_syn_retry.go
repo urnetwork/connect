@@ -27,16 +27,20 @@ type tcpSynRetryRequest struct {
 // until both the cache and queued/in-flight dispatcher have released them.
 // Queue links use the parent lock; release links use the flow lock.
 type tcpSynRetry struct {
-	update      *multiClientChannelUpdate
-	packet      []byte
-	credit      *transferRetainedControlCredit
-	source      TransferPath
-	provideMode protocol.ProvideMode
-	pin         flowPin
-	sequence    uint32
-	serial      uint64
-	references  uint32
-	queued      bool
+	update                               *multiClientChannelUpdate
+	packet                               []byte
+	credit                               *transferRetainedControlCredit
+	readiness                            *tcpSynRetryReadiness
+	readinessWidth                       int
+	readinessEpoch, readinessSourceOrder uint64
+	readinessOverflow                    bool
+	source                               TransferPath
+	provideMode                          protocol.ProvideMode
+	pin                                  flowPin
+	sequence                             uint32
+	serial                               uint64
+	references                           uint32
+	queued                               bool
 	// Queue-local token; the dispatcher snapshots it before releasing the lock.
 	raceOrder uint64
 	next      *tcpSynRetry
@@ -66,8 +70,45 @@ func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
 	return self != nil && self.update == update && update.synRetry == self &&
 		!update.IsDone() && !update.sourceReset.Load() && !update.receivedInbound.Load() &&
 		!update.affinitySources.closed && !update.pendingCollapseResetWithLock() &&
-		!update.pendingCollapseCloseWithLock() &&
+		!self.pendingConflictingControlWithLock(update) &&
 		(!update.synGenerationSeen || update.synGenerationNumber == self.sequence)
+}
+
+// A queued sibling SYN from this same retained attempt does not introduce a
+// different control generation. Every other pending SYN/RST remains a fence.
+// This applies at both candidate preparation and source materialization.
+func (self *tcpSynRetry) pendingConflictingControlWithLock(update *multiClientChannelUpdate) bool {
+	if !update.pendingCollapseCloseWithLock() {
+		return false
+	}
+	race := update.race
+	if race == nil || race.single || update.client.Load() != nil {
+		return true
+	}
+	for group := update.sequenceClaims; group != nil; group = group.collapseNext {
+		flags := group.completionFlags.Load()
+		if flags&(groupCompletionDequeued|groupCompletionAbandoned) != 0 || !group.awaitingCollapsePromotionWithLock() {
+			continue
+		}
+		for _, packet := range group.packets {
+			path := packet.ipPath
+			if !path.Syn && !path.Rst {
+				continue
+			}
+			const ownCandidate = groupCompletionAck | groupCompletionTracked | groupCompletionAdmitted | groupCompletionLinked | groupCompletionCandidate
+			request := group.synRetry
+			if flags&ownCandidate != ownCandidate || flags&(groupCompletionDisposed|groupCompletionDone) != 0 ||
+				flags>>16 != race.collapseOrder || race.clientStates[group.completionClient] == nil ||
+				len(group.packets) != 1 || path.Protocol != IpProtocolTcp || !path.Syn || path.Ack || path.Rst || path.Fin || path.SequenceNumber != self.sequence ||
+				request == nil || request.serial != self.serial || request.serial == 0 || request.update != update ||
+				request.raceOrder != 0 && request.raceOrder != race.collapseOrder ||
+				group.collapseAdmission.update != update || group.collapseAdmission.epoch != update.sequenceAdmissionEpoch ||
+				group.collapseSource == nil || group.collapseSource.ctx.Err() != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (self *parsedPacketGroup) validSynRetryWithLock(update *multiClientChannelUpdate) bool {
@@ -129,12 +170,14 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		}
 		copyPacket := MessagePoolCopy(packet)
 		update.synRetrySerial++
-		update.synRetry = &tcpSynRetry{
+		owner := &tcpSynRetry{
 			update: update, packet: copyPacket, credit: credit,
 			source: group.synRetry.source, provideMode: group.synRetry.provideMode,
 			pin: group.synRetry.pin, sequence: path.SequenceNumber,
 			serial: update.synRetrySerial, references: 1,
 		}
+		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update))
+		update.synRetry = owner
 	}
 }
 
@@ -151,6 +194,10 @@ func (self *multiClientChannelUpdate) releaseSynRetryReferenceWithLock(owner *tc
 
 func (self *multiClientChannelUpdate) clearSynRetryWithLock() {
 	if owner := self.synRetry; owner != nil {
+		if ready := owner.readiness; ready != nil {
+			ready.closed.Store(true)
+			ready.parent.notifyFlowReaper()
+		}
 		self.synRetry = nil
 		self.releaseSynRetryReferenceWithLock(owner)
 	}
@@ -168,8 +215,13 @@ func (self *multiClientChannelUpdate) releaseSynRetryMemory() {
 	for owners != nil {
 		owner := owners
 		owners, owner.released = owner.released, nil
-		packet, credit := owner.packet, owner.credit
-		owner.packet, owner.credit, owner.update, owner.next = nil, nil, nil, nil
+		packet, credit, ready := owner.packet, owner.credit, owner.readiness
+		owner.packet, owner.credit, owner.update, owner.next, owner.readiness = nil, nil, nil, nil, nil
+		if ready != nil {
+			ready.closed.Store(true)
+			ready.detach()
+			ready.release()
+		}
 		MessagePoolReturn(packet)
 		credit.Release()
 	}
@@ -297,6 +349,11 @@ func (self *RemoteUserNatMultiClient) enqueueSynRetryForRace(update *multiClient
 		order = race.collapseOrder
 		race.synRetryPending = false
 	}
+	self.queueSynRetryWithLock(owner, order)
+}
+
+// Parent and flow locks protect one identity-specific queue publication.
+func (self *RemoteUserNatMultiClient) queueSynRetryWithLock(owner *tcpSynRetry, order uint64) {
 	owner.raceOrder = order
 	if owner.queued {
 		// Another standing failure may empty the race while its partial work
@@ -379,10 +436,18 @@ func (self *RemoteUserNatMultiClient) discardSynRetries() {
 
 func (self *RemoteUserNatMultiClient) dispatchSynRetry(owner *tcpSynRetry, order uint64) {
 	update := owner.update
+	if ready := owner.readiness; ready != nil {
+		ready.detach()
+	}
 	update.stateLock.Lock()
 	if !owner.validWithLock(update) || update.client.Load() != nil || !self.synRetryDispatchEligibleWithLock(update, order) || self.ctx.Err() != nil {
 		update.stateLock.Unlock()
 		return
+	}
+	owner.readinessWidth, owner.readinessOverflow = 1, false
+	owner.readinessEpoch, owner.readinessSourceOrder = update.sequenceAdmissionEpoch, update.sequenceSourceOrder
+	if ready := owner.readiness; ready != nil {
+		ready.attemptEpoch, ready.attemptSourceOrder = owner.readinessEpoch, owner.readinessSourceOrder
 	}
 	packet := MessagePoolShareReadOnly(owner.packet)
 	update.stateLock.Unlock()
@@ -399,6 +464,9 @@ func (self *RemoteUserNatMultiClient) dispatchSynRetry(owner *tcpSynRetry, order
 	if !self.sendParsedPacketGroupAttempt(owner.source, owner.provideMode, group, 0, true, nil) {
 		MessagePoolReturn(packet)
 	}
+	// All synchronous candidate calls and refusal cleanup have returned.
+	// The dispatch reference keeps owner.readiness immutable through this arm.
+	self.armSynRetryReadiness(owner)
 }
 
 // A retry belongs to this existing canonical flow. It must not create a new

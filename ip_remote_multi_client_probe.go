@@ -861,16 +861,13 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 				found = u
 			}
 		}
-		if found == nil {
+		if found == nil || found.client.Load() != sourceClient {
 			return
 		}
 		if questions := found.probe.dnsQueries; questions != nil {
 			// The path identifies this resolver and pass; the transaction id
 			// identifies a question. Wrong/late/duplicate ids cannot complete
 			// a sibling, and another channel cannot answer for this one.
-			if found.client.Load() != sourceClient {
-				return
-			}
 			_, payload, err := ParseIpPathWithPayload(packet)
 			if err == nil && len(payload) >= 2 {
 				probe = questions[binary.BigEndian.Uint16(payload[:2])]
@@ -960,10 +957,14 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	// connection for its own timeout and the provider can release the socket
 	if sourceClient != nil && probe.target.Class == probeClassHealth {
 		if rstPacket, ok := probeCourtesyRstPacket(probe.ipPath, probe.synSequence); ok {
-			sourceClient.sendProbe(&parsedPacket{
+			// Optional cleanup cannot wait on the shared receive callback.
+			// Refusal leaves the provider's existing dial/idle timeout in charge.
+			if !sourceClient.sendProbe(&parsedPacket{
 				packet: rstPacket,
 				ipPath: probe.ipPath,
-			}, probeSendTimeout)
+			}, 0) {
+				MessagePoolReturn(rstPacket)
+			}
 		}
 	}
 

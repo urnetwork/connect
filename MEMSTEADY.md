@@ -6271,3 +6271,50 @@ Full correctness/PERF and fresh two-device 32 MiB iOS-surrogate / 64 MiB Android
 Evidence: /private/tmp/urnetwork-c34-v2-strict-pair-metadata.zwt6ec5y/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-v2-browsing-eight-metadata.2bhpr64m/FINAL-CUSTODY.json; /private/tmp/urnetwork-c34-page0-control-successor-metadata.boqm1uf_/FINAL-CUSTODY.json.
 
 The checkpoint also includes a cache-miss-only clone before block-action cluster sorting, preserving immutable association snapshots and zero-copy cache hits. Three deterministic ownership/cache/publication tests are included but have not yet run; OLD-red/NEW-green and race validation remain pending.
+
+
+## 2026-10-29 UTC: retained-SYN readiness and shared association ownership checkpoint
+
+The candidate is now installed as physical Connect source so all six correctness suites, including SN's Docker-staged source, can test the same implementation. The previous C35 source (Connect `345fdd6d`, SDK `f1e24fc3`, Server `22026e05`) remains preserved. This is a research checkpoint, not release qualification.
+
+Deterministic OLD/NEW tests identified and addressed three ownership problems:
+
+- A real reliable-window ACK could free capacity without promptly retrying a retained native SYN. Directed, owner-bound readiness now retries that cached SYN without waiting for the native retransmission timer. Readiness metadata is admitted against the actual memory root before allocation and is withdrawn on cancellation, flow/race replacement, FIN/RST and source retirement.
+- A still-queued sibling SYN from the same wide race could invalidate its own retry owner. The exception is restricted to the live matching SYN, race, admission epoch, cache serial and source; unrelated close/reset barriers remain authoritative.
+- Block-action decisions cloned association clusters per destination. Publication now creates one sorted immutable view, which internal cache entries share; public results remain owned copies. Epoch/configuration fences prevent stale in-flight decisions from repopulating a cleared or closed cache. Probe courtesy resets also use zero-wait admission and the exact registered channel owner.
+
+The combined candidate passed **68 roots in normal mode and the same 68 under race detection**, with four child tests in each process and no failed/skipped roots. The complete integration contains eight production and fifteen test/helper files. Ten additional batch-credit roots were not selected by that focused run; the full suite must still execute them. Benchmark declarations and helper compilation are not benchmark results.
+
+### Host memory experiment
+
+One fresh OLD and NEW process ran at each 32/64 MiB profile with GOGC=25 and forced GC at measurement boundaries. Each fixture published 512 cluster members and cached 256 destinations.
+
+| Profile | OLD live HeapAlloc B | NEW live HeapAlloc B | Reduction |
+| --- | ---: | ---: | ---: |
+| 32 MiB | 4,715,752 | 1,248,456 | 3,467,296 B (3.31 MiB) |
+| 64 MiB | 4,716,904 | 1,247,944 | 3,468,960 B (3.31 MiB) |
+
+Retained address backing changed from **257 allocations / 3,487,728 B** to **one / 16,368 B**, a 99.53% reduction in that fixture. Event ownership retained the shared view until flush, then released it. These are host forced-GC ownership measurements, not natural steady memory, peak-RSS measurements, mobile throughput evidence, or qualification of the 32 MiB iOS-surrogate / 64 MiB Android gates.
+
+### Unresolved 100-page latency
+
+Every completed row below validated 100 HTML responses, 400 validated-or-canceled assets and 99 overlaps, with balanced managed-byte accounting after join. The original 5 s first-byte gate was unchanged.
+
+| Cellular H1 case | Maximum first byte | Result / limitation |
+| --- | ---: | --- |
+| Original normal | 5.109 s, page 28 | FAIL; 3.585 s from WroteRequest callback to first byte |
+| Original race | 5.202 s, page 93 | FAIL; connect 3.163 s, TLS 1.743 s, callback-to-first-byte 0.295 s |
+| Page-28 diagnostic, normal | 3.182 s | PASS; selected page 28 was 1.733 s; no failing interval reproduced |
+| Rolling diagnostic, normal | 2.879 s | PASS; no slow trigger; final-page trace qualified |
+| Rolling diagnostic, race | 4.927 s, page 0 | PASS; final page reused a connection, so retained packet attribution is UNKNOWN |
+| Tagged, untraced race control | 4.802 s, page 78 | PASS; one predeclared control, not a statistical comparison |
+
+The separate original cellular H2 normal arm passed at 2.272 s maximum. Five original browsing arms remain unrun. Later diagnostic passes do not erase either H1 failure, establish an observer effect, or promote a baseline. Tracing adds locks/decoding and can change packet ordering and queue admission; a fixed loss seed does not guarantee identical packet-to-loss assignments across executions.
+
+The rolling diagnostic passed fifteen race controls. It retains the first slow/error navigation in fixed storage, fences late callbacks by navigation epoch, and treats reused/unseen tuples, overflow and incomplete coverage as UNKNOWN without changing the workload verdict. No actual failing packet interval has yet been captured.
+
+Source inspection distinguishes inner custom TCP, outer gVisor TCP and Transfer recovery. The inner peer does not advertise SACK; established gVisor's configured 8 s maximum and the separate SYN-handshake backoff are different mechanisms. These are hypotheses for the next packet-level investigation, not attribution from a matching duration or justification for changing timers.
+
+Full unfiltered correctness, corrected public-SDK OLD/NEW tests, full synthetic PERF/server benchmarks, focused repeated memory-performance comparisons, and four fresh native builds plus all 112 scoped hosted-H1 device sessions remain pending. No Android result can qualify a physical iOS extension's total footprint.
+
+Evidence: focused normal/race raw hashes `8a66466279ec6cd468236c612bb05422e2e4311d3aa371de66f27c39aceff635` / `be28c99bf940bd3da38bfc15d00ffeabf4394a351954da4c9470dfefb4bbb6e6`; host memory comparison [receipt](/private/tmp/urnetwork-c35-host-memory-comparison.gyilpemo/COMPARISON.json); original H1 failures `2784510d68c3ec304f22972d5c1edb31ed2d2d491e14e93a39faebfbbd12b800` / `0df2b2c049db338e4894f7e66cdfd7ce166a1fed881e78a0541f6efb07863a00`; finite race [analysis](/private/tmp/urnetwork-c35-finite-race-pair-analysis.PREP.tg_ejyl1/PACKET.json). The previous forced-GC/physical observations above retain their original scope and limitations.

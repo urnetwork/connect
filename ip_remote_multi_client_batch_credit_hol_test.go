@@ -43,7 +43,7 @@ type nativeBatchCreditFixture struct {
 
 // One real original fills the deliberately small protocol window. The source
 // publishes its closed gate before the barrier; no capacity flag is assigned.
-func newNativeBatchCreditFixture(t *testing.T) *nativeBatchCreditFixture {
+func newNativeBatchCreditFixture(t *testing.T, configures ...func(*ClientSettings)) *nativeBatchCreditFixture {
 	t.Helper()
 	self := &nativeBatchCreditFixture{
 		t: t, capacityRelease: make(chan struct{}),
@@ -57,6 +57,9 @@ func newNativeBatchCreditFixture(t *testing.T) *nativeBatchCreditFixture {
 		// The unbudgeted queue's documented first-item allowance lets one
 		// actual original reach retention, then closes subsequent admission.
 		settings.SendBufferSettings.ResendQueueMaxByteCount = 1
+		for _, configure := range configures {
+			configure(settings)
+		}
 		settings.SendBufferSettings.beforeResendCapacityWaitForTest = func(id sendSequenceId) {
 			if self.base == nil || id.Destination != self.base.peer {
 				return

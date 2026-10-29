@@ -218,6 +218,8 @@ type IpAssoc struct {
 	generation uint64
 
 	unregisterShed func()
+	// Immutable after construction; runs after source and scratch locks are released.
+	afterShed func()
 
 	clusters atomic.Pointer[ipAssocClusters]
 
@@ -234,12 +236,18 @@ type serverNameLookupHolder struct {
 }
 
 func NewIpAssoc(ctx context.Context, settings *IpAssocSettings) *IpAssoc {
+	return newIpAssoc(ctx, settings, nil)
+}
+
+// Installs the owning cache retirement before the association worker or pressure callback can run.
+func newIpAssoc(ctx context.Context, settings *IpAssocSettings, afterShed func()) *IpAssoc {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	ipAssoc := &IpAssoc{
 		ctx:        cancelCtx,
 		cancel:     cancel,
 		settings:   settings,
+		afterShed:  afterShed,
 		lastActive: map[netip.Addr]time.Time{},
 		baseNames:  map[netip.Addr][]string{},
 	}
@@ -476,6 +484,9 @@ func (self *IpAssoc) ShedMemory() {
 	self.scratchLock.Lock()
 	self.scratch = ipAssocScratch{}
 	self.scratchLock.Unlock()
+	if self.afterShed != nil {
+		self.afterShed()
+	}
 }
 
 func (self *IpAssoc) updateClusters() {
@@ -947,6 +958,8 @@ func clusterIpAssocScratch(
 				clusterAddrs = append(clusterAddrs, scratch.addrs[scratch.nodeMembers[m]])
 			}
 		}
+		// This new backing is canonical before any immutable reader receives it.
+		slices.SortFunc(clusterAddrs, func(a, b netip.Addr) int { return a.Compare(b) })
 		for _, addr := range clusterAddrs {
 			members[addr] = clusterAddrs
 		}
@@ -1150,10 +1163,17 @@ func (self *IpAssoc) GetCluster(path *IpPath) []*IpPath {
 	return memberPaths
 }
 
-// GetClusterAddrs returns the cluster member ips for an entity ip,
-// or nil if the entity is not in a multi-member cluster
+// Borrows immutable members and their version from one atomic publication.
+// Internal readers must not write or expose this backing to public callers.
+func (self *IpAssoc) clusterMembers(addr netip.Addr) (uint64, []netip.Addr) {
+	clusters := self.clusters.Load()
+	return clusters.version, clusters.members[addr.Unmap()]
+}
+
+// Returns caller-owned cluster member ips, or nil for an unclustered entity.
 func (self *IpAssoc) GetClusterAddrs(addr netip.Addr) []netip.Addr {
-	return self.clusters.Load().members[addr.Unmap()]
+	_, members := self.clusterMembers(addr)
+	return slices.Clone(members)
 }
 
 func (self *IpAssoc) Close() {

@@ -9,7 +9,7 @@ import (
 )
 
 // The association owner has no worker: real packet activity and the ordinary
-// clustering pass publish a deliberately unordered, shared member slice.
+// clustering pass publish a shared member slice from deliberately unordered activity.
 func testingBlockActionSnapshot(t *testing.T) (*RemoteUserNatMultiClient, *IpAssoc, []netip.Addr) {
 	t.Helper()
 	members := []netip.Addr{
@@ -33,9 +33,12 @@ func testingBlockActionSnapshot(t *testing.T) (*RemoteUserNatMultiClient, *IpAss
 		assoc.AddEgressPacket(&IpPath{Version: 4, Protocol: IpProtocolTcp, DestinationIp: member.AsSlice(), DestinationPort: 443})
 	}
 	assoc.updateClusters()
-	if got := assoc.GetClusterAddrs(members[0]); !slices.Equal(got, members) {
-		t.Fatalf("fixture did not publish the deliberate member order: got=%v want=%v", got, members)
+	ordered := slices.Clone(members)
+	slices.SortFunc(ordered, func(a, b netip.Addr) int { return a.Compare(b) })
+	if got := assoc.GetClusterAddrs(members[0]); !slices.Equal(got, ordered) {
+		t.Fatalf("fixture did not canonicalize deliberately unordered activity: got=%v want=%v", got, ordered)
 	}
+	members = ordered
 	multi := &RemoteUserNatMultiClient{
 		ipAssoc:          assoc,
 		blockActionCache: newBlockActionCache(time.Hour, 16),
@@ -43,12 +46,12 @@ func testingBlockActionSnapshot(t *testing.T) (*RemoteUserNatMultiClient, *IpAss
 	return multi, assoc, members
 }
 
-// The actual cache builder must order its own copy without writing the slice
-// concurrently read by updateClusters and other lock-free association readers.
+// The actual cache builder borrows one already ordered immutable publication
+// without writing storage concurrently read by association and cache readers.
 func TestBlockActionDecisionPreservesPublishedClusterSnapshot(t *testing.T) {
 	multi, assoc, members := testingBlockActionSnapshot(t)
 	published := assoc.clusters.Load()
-	borrowed := assoc.GetClusterAddrs(members[0])
+	_, borrowed := assoc.clusterMembers(members[0])
 	before := slices.Clone(borrowed)
 	state := &blockActionState{version: 1}
 	path := &IpPath{Version: 4, Protocol: IpProtocolTcp, DestinationIp: members[0].AsSlice(), DestinationPort: 443}
@@ -64,19 +67,19 @@ func TestBlockActionDecisionPreservesPublishedClusterSnapshot(t *testing.T) {
 	if decision == nil || decision.clusterKey != ordered[0] || !slices.Equal(decision.clusterIps, ordered) {
 		t.Fatalf("decision lost canonical cluster ordering: got=%+v want=%v", decision, ordered)
 	}
-	if &decision.clusterIps[0] == &borrowed[0] {
-		t.Fatal("decision retained mutable ownership of the borrowed snapshot")
+	if &decision.clusterIps[0] != &borrowed[0] {
+		t.Fatal("decision copied the immutable publication instead of sharing it")
 	}
 	for _, member := range members {
-		got := assoc.GetClusterAddrs(member)
+		_, got := assoc.clusterMembers(member)
 		if !slices.Equal(got, before) || &got[0] != &borrowed[0] {
 			t.Fatal("shared snapshot membership or backing identity changed")
 		}
 	}
 }
 
-// Distinct destination cache misses each own ordered state; a hot cache hit
-// reuses the decision and performs no copy or allocation.
+// Distinct destination decisions share one ordered immutable payload; a hot
+// cache hit reuses its destination decision without any copy or allocation.
 func TestBlockActionDecisionOwnsCacheMissOrderingAndReusesHits(t *testing.T) {
 	multi, assoc, members := testingBlockActionSnapshot(t)
 	state := &blockActionState{version: 1}
@@ -87,9 +90,9 @@ func TestBlockActionDecisionOwnsCacheMissOrderingAndReusesHits(t *testing.T) {
 	if first == nil || second == nil || !slices.Equal(first.clusterIps, second.clusterIps) || first.clusterKey != second.clusterKey {
 		t.Fatal("cluster siblings lost equivalent canonical decisions")
 	}
-	borrowed := assoc.GetClusterAddrs(members[0])
-	if &first.clusterIps[0] == &borrowed[0] || &second.clusterIps[0] == &borrowed[0] || &first.clusterIps[0] == &second.clusterIps[0] {
-		t.Fatal("separate cache misses share mutable ordering storage")
+	_, borrowed := assoc.clusterMembers(members[0])
+	if first == second || &first.clusterIps[0] != &borrowed[0] || &second.clusterIps[0] != &borrowed[0] {
+		t.Fatal("destination decisions did not share the immutable publication")
 	}
 	cacheChanged := false
 	allocations := testing.AllocsPerRun(100, func() {
@@ -106,7 +109,7 @@ func TestBlockActionDecisionOwnsCacheMissOrderingAndReusesHits(t *testing.T) {
 }
 
 // A cache and an event epoch can retain their ordered state across a genuine
-// cluster replacement and pressure shed, without retaining mutable snapshot use.
+// cluster replacement and pressure shed without mutating retained readers.
 func TestBlockActionDecisionRetainsOrderingAcrossPublicationAndShed(t *testing.T) {
 	multi, assoc, members := testingBlockActionSnapshot(t)
 	state := &blockActionState{version: 1}

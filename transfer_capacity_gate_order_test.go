@@ -122,8 +122,8 @@ func TestResendCapacityGateAbandonedTurnPassesToNextWaiter(t *testing.T) {
 	if !gate.pass(second) {
 		t.Fatal("the next waiter could not pass the open gate with its turn")
 	}
-	if count := gate.waiterCount.Load(); count != 0 || len(gate.waiters) != 0 || !gate.open(true) {
-		t.Fatalf("gate after every waiter left holds count %d and %d waiters, open %t", count, len(gate.waiters), gate.open(true))
+	if count := gate.waiterCount.Load(); count != 0 || gate.first != nil || gate.last != nil || !gate.open(true) {
+		t.Fatalf("gate after every waiter left holds count %d head=%p tail=%p open=%t", count, gate.first, gate.last, gate.open(true))
 	}
 }
 
