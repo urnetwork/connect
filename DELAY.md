@@ -1,7 +1,7 @@
 # DELAY: per-message transport delay, throughput and quality
 
-Status: implemented 2026-10-27 in connect, server and sdk, uncommitted; §15
-records what was built. The decisions in §2 were settled in review on
+Status: implemented 2026-10-27 in connect, server and sdk, merged to main
+2026-10-28; §15 records what was built. The decisions in §2 were settled in review on
 2026-10-27. Open items are in §14.
 
 ## 1. Purpose and scope
@@ -829,6 +829,19 @@ helper comes from connect (`replace github.com/urnetwork/connect => ../connect`)
   stripped payloads.
 - **Rollout.** Ship the server first (it accepts offers). Clients offer from
   the next release. Old clients never offer, and old servers never accept.
+- **Runtime switch.** The field `transportDelay` of the Redis move control
+  turns acceptance off on every edge, connect and alt, without a deploy:
+  `redis-cli -c HSET '{connect_move}control' transportDelay off`. Turn it back
+  on with `redis-cli -c HDEL '{connect_move}control' transportDelay`. The
+  field only narrows `EnableTransportDelay`, so absent is the code default,
+  on; a value that does not parse is off, and deleting the whole control also
+  turns acceptance back on. Each handler reads the control every 10 s, so new
+  connections follow a change within about 10 s, and none waits on Redis. A
+  connection keeps what its 101 or auth response negotiated until it
+  reconnects. A failed read keeps the last value, and a handler that has not
+  read yet uses the code default. `urnetwork_connect_transport_delay_enabled`
+  shows each process's value. P2P is negotiated between the clients (§6.1),
+  so the switch does not reach it.
 
 ## 12. Implementation map
 
@@ -937,7 +950,7 @@ helper comes from connect (`replace github.com/urnetwork/connect => ../connect`)
    user's network.
 6. **Header overhead on small frames.** Measure it (§5.4).
 7. **Windows sleep-inclusive clock.** Verify (§5.2).
-8. **Provide-mode ordinal comparison: fixed 2026-10-27, uncommitted.**
+8. **Provide-mode ordinal comparison: fixed 2026-10-27.**
    `provideModeIncludesPublic` (sdk/device_local_provider.go) used
    `ProvideModePublic <= provideMode`, which transfer.proto:337-342 forbids.
    A device in `ProvideModeStream` provides nothing publicly
@@ -958,7 +971,7 @@ helper comes from connect (`replace github.com/urnetwork/connect => ../connect`)
    2026-10-27: nothing is built for the web, because the connection that matters
    there is on our server machines (apple/DELAY.md §10).
 
-## 15. As built (2026-10-27, uncommitted)
+## 15. As built (2026-10-27)
 
 §6–§11 are implemented in connect, server and sdk, with the additions and
 deviations below.
@@ -987,7 +1000,9 @@ fraction at or below 1 when the stream and DATAGRAM lanes block at once.
   subprotocol on the server's own `httpUpgradeConn`. Without it, H1+ accept
   never switched to the header while the client did.
 - **Server.**
-  - `EnableTransportDelay` (default true) gates accept on H1 and H3.
+  - `EnableTransportDelay` (default true) gates accept on H1 and H3. Since
+    2026-10-28 the move control's `transportDelay` can turn it off at runtime
+    (§11, "Runtime switch"; server `connect/transport_delay_control.go`).
   - The peer conn gets a zero client id, because the upgrade precedes auth, and
     it publishes nothing.
   - It censors by timing `sendReceivedMessage`.
