@@ -17283,7 +17283,9 @@ components:
         claim_prompt:
           description: |
             The apps prompt the network to claim a head seat: it is
-            `measurable` and its `position` is 200 or better.
+            `measurable`, its `position` is 200 or better, and it has no
+            active claimed fleet. A network that already claimed is not
+            prompted. Apps use this flag rather than computing it.
           type: boolean
         is_me:
           description: The row is the caller's own network; false without a bearer token.
@@ -17296,7 +17298,11 @@ components:
 
     SnTopFleet:
       type: object
-      description: One fleet a network has claimed, bound on SN25 to a hotkey UID.
+      description: |
+        One fleet a network has claimed, bound on SN25 to a hotkey UID. A UID
+        that changed hands earns and ranks for its new holder, so the
+        validator's data and the incentive are shown only while the fleet's
+        hotkey still holds the UID, and are null otherwise.
       required:
         - uid
         - generation
@@ -17338,9 +17344,14 @@ components:
           description: The validator selected the fleet into the Top 200; null without a head summary.
           type: [boolean, "null"]
         incentive:
-          description: The UID's on-chain `Incentive`; null before it is first read.
+          description: |
+            The UID's share of SN25 incentive, a fraction from 0 to 1 (the
+            chain's `Incentive`, a share of 65535); null before it is first
+            read. 0.018 is 1.8%.
           type: [number, "null"]
           format: double
+          minimum: 0
+          maximum: 1
         incentive_stale:
           description: |
             `incentive` is stale: the validator's weights on chain are its
