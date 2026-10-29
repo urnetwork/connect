@@ -27,7 +27,10 @@ func negotiateH3DatagramAuthResponse(
 		request.ClientInfo != "" && request.StreamLeaseVersion == 1 &&
 		response.ClientInfo == "" && response.StreamLeaseVersion == 0 {
 		// Retain every authenticated legacy field. The strict validator still
-		// checks the offered/accepted versions and both QUIC capabilities.
+		// checks the offered/accepted versions and both QUIC capabilities. The
+		// delay header offer is negotiated apart from this echo
+		// (negotiateTransportDelayH3AuthResponse), so its omission here, like
+		// the old server's, never fails validation.
 		negotiatedRequest = &protocol.Auth{
 			ByJwt:             request.ByJwt,
 			AppVersion:        request.AppVersion,

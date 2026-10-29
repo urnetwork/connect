@@ -280,8 +280,8 @@ func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePac
 	if blocked == nil && !q.pending() {
 		return nil, true, false
 	}
-	cases := make([]reflect.SelectCase, 0, 4+len(wakes))
-	for _, channel := range []any{self.ctx.Done(), self.packs, timeout, q.wake} {
+	cases := make([]reflect.SelectCase, 0, 5+len(wakes))
+	for _, channel := range []any{self.ctx.Done(), self.packs, timeout, q.wake, self.closeNotify} {
 		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(channel)})
 	}
 	for _, wake := range wakes {
@@ -290,6 +290,9 @@ func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePac
 		}
 	}
 	chosen, value, ok := reflect.Select(cases)
+	if chosen == 4 {
+		return nil, true, self.applyCloseRequests()
+	}
 	if chosen == 1 {
 		if !ok {
 			return nil, false, true

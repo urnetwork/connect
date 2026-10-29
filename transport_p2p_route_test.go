@@ -111,6 +111,7 @@ func TestP2pReceiveConstructorPublishesExactPhysicalLanes(t *testing.T) {
 		DefaultP2pTransportSettings(),
 		nil,
 		nil,
+		nil,
 	)
 	if len(lanes) != 2 {
 		t.Fatalf("P2P receive lanes=%d want=2", len(lanes))

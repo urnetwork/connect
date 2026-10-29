@@ -197,7 +197,7 @@ func (self *sequenceCloser) closeContracts(contractIds []Id) {
 			continue
 		}
 		// nothing holds it, or it has just left its queue
-		contractManager.CloseContract(contractId, 0, 0)
+		contractManager.requestContractClose(contractId)
 	}
 }
 
@@ -316,13 +316,20 @@ func (self *ReceiveSequence) requestCloseContract(contractId Id) bool {
 // Ends the sequence with finals for all of its contracts, the current one
 // included, because the other party has finished with them. Does not wait.
 func (self *ReceiveSequence) closeContractsAndCancel() {
+	var reportedContractId *Id
 	func() {
 		self.closeStateLock.Lock()
 		defer self.closeStateLock.Unlock()
 
-		// after the exit has taken its requests, nothing reads this
 		self.closeCurrentContract = true
+		if self.closeRequestsTaken && self.receiveContract != nil {
+			contractId := self.receiveContract.contractId
+			reportedContractId = &contractId
+		}
 	}()
+	if reportedContractId != nil {
+		self.client.ContractManager().requestContractClose(*reportedContractId)
+	}
 	self.Cancel()
 }
 
@@ -368,18 +375,38 @@ func (self *ReceiveSequence) applyCloseRequests() bool {
 	return closeCurrentContract
 }
 
-// Takes the last close requests at the exit and refuses later ones. True when
-// the exit reports a final rather than a checkpoint for the current contract.
-// Every other open contract gets a final at the exit regardless.
+// Takes requests already present at exit. Later requests remain accepted until
+// every counted report has been handed to the contract manager.
 func (self *ReceiveSequence) takeCloseRequests() bool {
 	self.closeStateLock.Lock()
 	defer self.closeStateLock.Unlock()
 
-	self.closeRequestsTaken = true
 	closeCurrentContract := self.closeCurrentContract
 	if self.receiveContract != nil && self.closeContractIds[self.receiveContract.contractId] {
 		closeCurrentContract = true
 	}
 	self.closeContractIds = nil
 	return closeCurrentContract
+}
+
+// Hands requests racing report creation to the manager before releasing the
+// holder index. Its pending reports order any needed zero final after counts.
+func (self *ReceiveSequence) finishCloseRequests() {
+	var contractIdKVs map[Id]bool
+	func() {
+		self.closeStateLock.Lock()
+		defer self.closeStateLock.Unlock()
+		self.closeRequestsTaken = true
+		contractIdKVs = self.closeContractIds
+		self.closeContractIds = nil
+		if self.closeCurrentContract && self.receiveContract != nil {
+			if contractIdKVs == nil {
+				contractIdKVs = map[Id]bool{}
+			}
+			contractIdKVs[self.receiveContract.contractId] = true
+		}
+	}()
+	for contractId := range contractIdKVs {
+		self.client.ContractManager().requestContractClose(contractId)
+	}
 }

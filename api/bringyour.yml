@@ -1794,16 +1794,22 @@ paths:
         it in the directory (connect/EXTENDER.md C2).
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
-        attributed to a network and a client, and is rate limited per user
-        (6 per hour). Call it on the family api host of the family being
-        activated -- `api-v4.bringyour.com` for an IPv4 address,
-        `api-v6.bringyour.com` for an IPv6 one -- so the caller address the
-        operator probes back has exactly one family. An operator without
-        family hosts (a development operator on an ip literal, say) is
-        activated through its plain api url instead, and the family of the
-        outcome is the one the result reports. NEVER call it through an
-        extender: the address that is probed and published is the address this
-        request arrived from.
+        attributed to a network and a client. It is rate limited per address
+        family: 6 per hour per client and 60 per hour per account, for IPv4
+        and for IPv6 each. A budget is spent only when the operator is about
+        to probe, so a request refused before the probe (malformed arguments,
+        the wrong family, a spent budget) costs nothing, and a refusal by a
+        spent budget says how long until it has room again. Call it on the
+        family api host of the family being activated --
+        `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
+        an IPv6 one -- so the caller address the operator probes back has
+        exactly one family. An activation posted to one family's host that
+        arrives over the other family is refused before it is probed. An
+        operator without family hosts (a development operator on an ip
+        literal, say) is activated through its plain api url instead, and the
+        family of the outcome is the one the result reports. NEVER call it
+        through an extender: the address that is probed and published is the
+        address this request arrived from.
 
         Nothing is taken on the caller's word. Inside the request, and within
         a 10 second budget, the operator dials BACK to the caller's own
@@ -2822,18 +2828,61 @@ paths:
         comes first when it is a provider. At most 32 provider clients are
         decided per answer; `truncated` is set when the network has more.
 
+        With `client_id`, the answer is the status of that one client: a
+        provider client of the caller's network, or the caller's own
+        client. Its admission and ranking are cached per client for about 5
+        minutes, and its histogram is read fresh. Every other id gets one
+        answer, whether it is unknown, another network's client, a removed
+        or child client, or a client of the network that is not a
+        provider: no providers and `error.message` "Provider client not
+        found in this network."
+
+        With `format=compact`, the answer has the same statuses in the same
+        order without their English texts (`GetProviderStatusCompactResult`).
+        Without a query, the answer is unchanged.
+
+        A refused query answers 200 with no providers and `error.message`:
+        "Invalid client_id." for a `client_id` that is not a uuid, and
+        "Invalid format." for a `format` other than `full` or `compact`.
+
         Anti-abuse checks are reported only as the generic reason
         `not_eligible`. Which check applies is never returned.
       operationId: networkProviderStatus
       security:
         - BearerAuth: []
+      parameters:
+        - in: query
+          name: client_id
+          required: false
+          description: |
+            One client to answer for: a provider client of the caller's
+            network, or the caller's own client. Without it, the answer is
+            the network's provider clients.
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: format
+          required: false
+          description: |
+            `full`, the default, gives every status with its English texts.
+            `compact` gives the same statuses without them.
+          schema:
+            type: string
+            enum:
+              - full
+              - compact
       responses:
         "200":
-          description: OK.
+          description: |
+            OK. `GetProviderStatusResult`, or `GetProviderStatusCompactResult`
+            with `format=compact`.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GetProviderStatusResult"
+                anyOf:
+                  - $ref: "#/components/schemas/GetProviderStatusCompactResult"
+                  - $ref: "#/components/schemas/GetProviderStatusResult"
 
   /network/user:
     get:
@@ -11699,6 +11748,20 @@ components:
             is left out. A client whose connections require post-quantum
             encryption sets it; unset keeps the capability-blind answer.
           type: boolean
+        require_modern_provider:
+          description: |
+            Keep only modern providers, in every draw, providers named by
+            `client_id` included. A provider holding a Public key is modern
+            when the platform's capability probe measured it, within the last
+            seven days, negotiating end-to-end post-quantum encryption with
+            resizable transfer windows. A provider holding only a Network key,
+            which the probe cannot reach, is modern when its latest provide
+            with a Network key declared post-quantum encryption sessions. A
+            provider holding neither key is never modern. With
+            `post_quantum_encryption` too, both filters apply. A client whose
+            connections require end-to-end encryption sets it; unset keeps
+            the capability-blind answer.
+          type: boolean
 
     LocationCoordinates:
       description: |
@@ -15137,13 +15200,51 @@ components:
         - providers
       properties:
         providers:
-          description: the caller's own client first when it is a provider, then the network's other provider clients in client id order
+          description: the caller's own client first when it is a provider, then the network's other provider clients in client id order; with `client_id`, that one client; empty for a refused query
           type: array
           items:
             $ref: "#/components/schemas/ProviderStatus"
         truncated:
           description: the network has more provider clients than one answer decides
           type: boolean
+        error:
+          description: a refused query, which has no providers
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              description: |
+                "Provider client not found in this network." for every
+                `client_id` the caller does not read, "Invalid client_id." or
+                "Invalid format."
+              type: string
+
+    GetProviderStatusCompactResult:
+      description: |
+        The answer with `format=compact`: the statuses of
+        `GetProviderStatusResult`, in the same order, without their English
+        texts.
+      type: object
+      required:
+        - providers
+      properties:
+        providers:
+          description: the statuses `GetProviderStatusResult.providers` lists, in the same order
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderStatusCompact"
+        truncated:
+          description: the network has more provider clients than one answer decides
+          type: boolean
+        error:
+          description: a refused query, which has no providers; as `GetProviderStatusResult.error`
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     ProviderStatus:
       type: object
@@ -15172,8 +15273,12 @@ components:
             - reliability_warming_up
             - reliability_low
             - not_eligible
+            - egress_no_success
+            - egress_low_success
             - egress_unprobed
+            - egress_warming_up
             - egress_failing
+            - not_modern
             - speed_test_missing
             - slow
             - none
@@ -15187,7 +15292,8 @@ components:
             The numbers find-providers2 admits and orders the provider by, in
             display order. The mode-level numbers (`weight_*`, `tier_*`) are
             left out when the provider is in no pool (not_providing,
-            not_connected, location_invalid, not_eligible).
+            not_connected, location_invalid, not_eligible, egress_no_success,
+            egress_low_success).
           type: array
           items:
             $ref: "#/components/schemas/ProviderRankingNumber"
@@ -15327,6 +15433,108 @@ components:
           items:
             type: integer
             format: int64
+
+    ProviderStatusCompact:
+      description: A `ProviderStatus` without `reason_text` and the explanations.
+      type: object
+      required:
+        - client_id
+        - reason
+        - admission
+        - ranking
+        - evaluate_time
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        reason:
+          description: |
+            The first rule, in this order, that holds the provider back; `none`
+            when it passes them all. `not_eligible` covers every anti-abuse
+            check and never says which.
+          type: string
+          enum:
+            - not_providing
+            - not_connected
+            - location_invalid
+            - network_only
+            - reliability_warming_up
+            - reliability_low
+            - not_eligible
+            - egress_no_success
+            - egress_low_success
+            - egress_unprobed
+            - egress_warming_up
+            - egress_failing
+            - not_modern
+            - speed_test_missing
+            - slow
+            - none
+        admission:
+          $ref: "#/components/schemas/ProviderAdmission"
+        ranking:
+          description: the numbers of `ProviderStatus.ranking`, in the same order
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderRankingNumberCompact"
+        country:
+          $ref: "#/components/schemas/ProviderStatusCountryCompact"
+        evaluate_time:
+          description: when the admission and ranking were decided
+          type: string
+          format: date-time
+        appearances:
+          $ref: "#/components/schemas/ProviderAppearanceHistogram"
+
+    ProviderRankingNumberCompact:
+      description: |
+        A `ProviderRankingNumber` without its explanation. `value`, `minimum`
+        and `maximum` are present only when the number has one (`has_value`,
+        `has_minimum` and `has_maximum` in the full form). `count` and `total`
+        are present only for a counted number with a value (`url_checks`).
+      type: object
+      required:
+        - name
+        - passes
+      properties:
+        name:
+          description: as `ProviderRankingNumber.name`
+          type: string
+        value:
+          type: number
+          format: double
+        minimum:
+          description: the selection's floor
+          type: number
+          format: double
+        maximum:
+          description: the selection's ceiling
+          type: number
+          format: double
+        passes:
+          description: false when the number holds the provider back
+          type: boolean
+        count:
+          type: integer
+        total:
+          type: integer
+
+    ProviderStatusCountryCompact:
+      description: A `ProviderStatusCountry` without its explanation.
+      type: object
+      required:
+        - country_code
+        - country
+        - observed_country_code
+      properties:
+        country_code:
+          description: the country clients are offered the provider under
+          type: string
+        country:
+          type: string
+        observed_country_code:
+          description: the country the latest network check saw the connection exit in, empty for none
+          type: string
 
     SolanaPaymentIntentArgs:
       type: object

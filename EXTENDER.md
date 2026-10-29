@@ -585,7 +585,10 @@ family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
 `{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
-limit 6 per hour per client. The handler probes the caller ip synchronously
+limit 6 per hour per client and 60 per hour per account, each per address
+family, so one family's failures never spend the other's (2026-10-28). An
+activation posted to `api-v4` or `api-v6` that arrives on the other family
+is refused before it is probed. The handler probes the caller ip synchronously
 within 10 s: for each requested carrier, `connect.ProbeExtenderCarrier`
 dials that carrier with a random spoof name, sends a header with a
 challenge and verifies the response signature against `public_key_hex`;
@@ -601,8 +604,12 @@ geolocation of the caller. A probe failure returns `activated: false` with
 the failing carrier in `error` and stores nothing. Acceptance requires
 public tcp 443 or peer-to-peer webrtc, each of which proves the forward
 (C2a). Zero ports and an empty tld
-take the C1 defaults. The configuration check precedes the rate limit so
-an unconfigured operator never spends a caller's budget. A failed
+take the C1 defaults. The budgets are spent at the probe: every check that
+refuses without dialing the caller (the arguments, the caller and its
+family, the configuration) precedes them, so a malformed request or an
+unconfigured operator never spends a caller's budget, and the client's and
+the account's budgets are spent together or not at all. Every activation
+that dials the caller is counted, whatever its probe finds. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
 name the api host on port 443 as their destination.
@@ -1478,7 +1485,9 @@ included, so alt loads the existing api and connect certificates and no
 certificate is issued for the alt names. The network space derives
 `GetAltUrl`, `GetAltUrlV4` and `GetAltUrlV6` from the platform url by the
 label rule (`connect` to `alt`) with an optional `AltUrl` override, and
-alt names resolve over DoH like the other space names.
+alt names resolve over DoH like the other space names. The rule maps an
+`api` label the same way (`api`, `api-v4` and `api-v6` to `alt`, `alt-v4`
+and `alt-v6`), since alt serves the api names as well (connect#229).
 
 L4. Client strategy. The api gains an "alt h3" dialer (an http3 round
 tripper to the alt addresses with the api name as SNI and the platform's
@@ -1492,7 +1501,13 @@ setting is empty (the sdk clears it); H1 keeps the platform url. An
 explicit port on an alt url pins both udp carriers to it, which is how a
 test fixture is reached; the family group derives `alt-v4` and `alt-v6`
 only from an alt url that is itself derived from the platform url, and
-passes any other alt url through unchanged. A family-pinned direct
+passes any other alt url through unchanged. The api alt dialers pair the
+same way by the name a request presents: a family name of the alt url's
+own space (`api-v4`, `connect-v6`, with the env prefix) goes to its
+family's alt name on the alt url's port, so an extender activation posted
+to `api-v4` reaches `alt-v4`, whose addresses are v4 alone, even from the
+role's unpinned strategy (connect#229); every other name, and an alt url
+set explicitly, keeps the alt url's host. A family-pinned direct
 strategy carries its family into the udp dials so a v4 activation never
 reaches alt over v6. The 53-then-4053 order is two candidates through the
 existing staggered race. The extender carriers are unchanged, since they forward the

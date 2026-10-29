@@ -114,9 +114,12 @@ func newAltHttpClient(
 }
 
 // dialAltQuic opens one quic connection to the alt host for an api request
-// (L4). The returned connection is owned by the http3 transport; the socket,
-// the translation and the quic transport under it are released when it dies or
-// when the strategy closes.
+// (L4). The alt host pairs with the server name the request presents, which
+// http3 fills from the request host, so a request to a family api name goes
+// to that family's alt name (altHostPortForServerName). The returned
+// connection is owned by the http3 transport; the socket, the translation and
+// the quic transport under it are released when it dies or when the strategy
+// closes.
 func (self *ClientStrategy) dialAltQuic(
 	ctx context.Context,
 	whodis bool,
@@ -124,7 +127,11 @@ func (self *ClientStrategy) dialAltQuic(
 	quicConfig *quic.Config,
 ) (*quic.Conn, error) {
 	policy := newExtenderQuicMemoryPolicy(ctx, &self.settings.ConnectSettings)
-	candidates, source, err := self.altDialCandidatesProgressive(ctx, whodis)
+	serverName := ""
+	if tlsConfig != nil {
+		serverName = tlsConfig.ServerName
+	}
+	candidates, source, err := self.altDialCandidatesProgressive(ctx, whodis, serverName)
 	if err != nil {
 		return nil, err
 	}
@@ -184,22 +191,25 @@ func (self *ClientStrategy) dialAltQuic(
 // The addresses one alt dial may use, in dial order (L2, L4): every address of
 // the alt host that the family pin and the family policy permit, v6 first
 // interleaved, on each carrier port -- 53 before 4053 for whodis. One
-// resolution serves every port.
+// resolution serves every port. This is the alt url's own host, which a
+// request presenting no family name of its space is sent to.
 func (self *ClientStrategy) altDialCandidates(
 	ctx context.Context,
 	whodis bool,
 ) ([]*net.UDPAddr, error) {
-	return self.altDialCandidatesWithResolver(ctx, whodis, self.resolveControlUDPAddrs)
+	return self.altDialCandidatesWithResolver(ctx, whodis, "", self.resolveControlUDPAddrs)
 }
 
 // A runtime dial retains late-family candidates without holding its first
 // socket. Each family expands over the same configured carrier-port order.
+// `serverName` is the name the request presents, which picks the alt host.
 func (self *ClientStrategy) altDialCandidatesProgressive(
 	ctx context.Context,
 	whodis bool,
+	serverName string,
 ) ([]*net.UDPAddr, *udpDialCandidateSource, error) {
 	var source *udpDialCandidateSource
-	candidates, err := self.altDialCandidatesWithResolver(ctx, whodis,
+	candidates, err := self.altDialCandidatesWithResolver(ctx, whodis, serverName,
 		func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error) {
 			addrs, pending, err := self.startControlUdpCandidates(ctx, address, ipFamily)
 			source = pending
@@ -223,12 +233,17 @@ func (self *ClientStrategy) altDialCandidatesProgressive(
 }
 
 // Shared destination/pin/port policy for complete-list and progressive callers.
+// The destination is the alt host that pairs with `serverName` (L3), which
+// for a family name is that family's alt name: its addresses are of the one
+// family, so the request cannot cross to the other even from a strategy with
+// no family pin, as the extender activation's is.
 func (self *ClientStrategy) altDialCandidatesWithResolver(
 	ctx context.Context,
 	whodis bool,
+	serverName string,
 	resolve func(context.Context, string, int) ([]*net.UDPAddr, error),
 ) ([]*net.UDPAddr, error) {
-	altHost, altPort := altUrlHostPort(self.settings.AltUrl)
+	altHost, altPort := altHostPortForServerName(self.settings.AltUrl, serverName)
 	if altHost == "" {
 		return nil, fmt.Errorf("the alt url names no host")
 	}

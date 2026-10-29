@@ -1667,6 +1667,12 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+
+	// TransportDelay, when set, offers the per-message delay header on this
+	// client's P2P streams as the active side (DELAY.md §6.1). A passive
+	// side accepts an offer regardless, stamping and echoing only. Nil
+	// offers nothing; only non-provider window clients set it (D3).
+	TransportDelay *TransportDelaySettings
 }
 
 // MinimumMessageLenLimit returns the smallest per-transport framer
@@ -4374,6 +4380,13 @@ func (self *Client) forward(path TransferPath, transferFrameBytes []byte) {
 			c()
 		}
 	}
+}
+
+// AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
+// every transport of this client (DELAY.md §9). Callbacks run on transport
+// goroutines and must not block.
+func (self *Client) AddTransportDelayStatsCallback(callback TransportDelayStatsFunction) func() {
+	return self.routeManager.addTransportDelayStatsCallback(callback)
 }
 
 func (self *Client) AddReceiveCallback(receiveCallback ReceiveFunction) func() {
@@ -14873,8 +14886,8 @@ type ReceiveSequence struct {
 	// whether the exit reports a final rather than a checkpoint for the
 	// current contract
 	closeCurrentContract bool
-	// set when the exit takes the requests to report its contracts; a later
-	// request is refused, and its caller reports the close itself
+	// set once the manager owns every exit report; a later request uses that
+	// manager's pending report order to finalize the contract
 	closeRequestsTaken bool
 	// a coalesced edge that wakes Run for a new close request
 	closeNotify chan struct{}
@@ -15598,7 +15611,8 @@ func (self *ReceiveSequence) Run() {
 				self.receiveContract.unackedByteCount,
 			)
 		}
-		// reported: a later close request for these finds no holder
+		self.finishCloseRequests()
+		// The manager now owns the counts and any final requested during exit.
 		for contractId := range self.openReceiveContracts {
 			self.contractHolders.release(contractId, self)
 		}
@@ -16304,8 +16318,8 @@ func (self *ReceiveSequence) Run() {
 		checkpointId := self.idleCondition.Checkpoint()
 		idleTimer.Reset(timeout)
 		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending()) {
-			pack, ok, timedOut := self.waitDelivery(idleTimer.C)
-			if timedOut || self.ctx.Err() != nil {
+			pack, ok, shouldExit := self.waitDelivery(idleTimer.C)
+			if shouldExit || self.ctx.Err() != nil {
 				return
 			}
 			if pack != nil && !processPack(pack, ok) {

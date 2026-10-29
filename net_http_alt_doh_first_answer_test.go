@@ -117,7 +117,7 @@ func TestAltDohFirstAnswerLateFamilyRetainsWhodisPorts(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			candidates, source, err := strategy.altDialCandidatesProgressive(ctx, true)
+			candidates, source, err := strategy.altDialCandidatesProgressive(ctx, true, "")
 			done <- outcome{candidates: candidates, source: source, err: err}
 		}()
 		synctest.Wait()

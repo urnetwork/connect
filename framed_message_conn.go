@@ -42,6 +42,13 @@ type FramedMessageConn struct {
 	body      framedMessageBody
 	stats     *H1PlusStats
 	progress  *h1PhysicalProgress
+	// the Sec-WebSocket-Protocol the upgrade selected; carries the delay
+	// header offer (transport_delay_h1.go)
+	subprotocol string
+	// set when the delay header was negotiated; the compact framer only
+	delayFramer *Framer
+	delayWrite  *transportDelayWriteLane
+	delayRead   *transportDelayReadLane
 }
 
 func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1PlusStats) (*FramedMessageConn, error) {
@@ -57,7 +64,30 @@ func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1
 		c.xl = NewFramerXl(DefaultFramerXlSettings(maximum))
 	}
 	c.body.conn = c
+	if upgraded, ok := conn.(*httpUpgradeConn); ok {
+		c.subprotocol = upgraded.subprotocol
+	}
 	return c, nil
+}
+
+// Subprotocol is the Sec-WebSocket-Protocol token the upgrade selected, as on
+// a WebSocket conn.
+func (c *FramedMessageConn) Subprotocol() string { return c.subprotocol }
+
+// enableTransportDelay switches a negotiated stream to delay header frames in
+// both directions (DELAY.md §5). Every physical write is stamped, so the header
+// lives here rather than in a wrapper. Call before the reader and writer start.
+// Only the compact framer carries the header.
+func (c *FramedMessageConn) enableTransportDelay(delay *transportDelay) (*transportDelayReadLane, bool) {
+	if c.framer == nil {
+		return nil, false
+	}
+	settings := DefaultFramerSettings(c.maximum)
+	settings.HeaderByteCount = transportDelayHeaderByteCount
+	c.delayFramer = NewFramer(settings)
+	c.delayWrite = delay.newWriteLane()
+	c.delayRead = delay.newReadLane(transportDelayLaneOrdered)
+	return c.delayRead, true
 }
 
 func (c *FramedMessageConn) UnderlyingConn() net.Conn { return c.Conn }
@@ -89,20 +119,33 @@ func (c *FramedMessageConn) NextReader() (int, io.Reader, error) {
 	}
 	var length int
 	var err error
+	headerLen := 0
 	if c.xl != nil {
 		length, err = c.xl.ReadHeader(c.Conn)
+	} else if c.delayFramer != nil {
+		headerLen = transportDelayHeaderByteCount
+		length, err = c.delayFramer.ReadHeader(c.Conn)
+		if err == nil && length < headerLen {
+			err = errors.New("framed stream message shorter than its delay header")
+		}
 	} else {
 		length, err = c.framer.ReadHeader(c.Conn)
 	}
-	if err == nil && c.readLimit.Load() < int64(length) {
+	if err == nil && c.readLimit.Load() < int64(length-headerLen) {
 		err = errors.New("framed stream message limit exceeded")
+	}
+	if err == nil && 0 < headerLen {
+		var header transportDelayHeader
+		if _, err = io.ReadFull(c.Conn, header[:]); err == nil {
+			c.delayRead.receive(header[:], 4+length)
+		}
 	}
 	if err != nil {
 		c.recordReadError(err)
 		c.Conn.Close()
 		return 0, nil, err
 	}
-	c.body.remaining = length
+	c.body.remaining = length - headerLen
 	return websocket.BinaryMessage, &c.body, nil
 }
 
@@ -164,6 +207,9 @@ func (c *FramedMessageConn) ReadMessage() (int, []byte, error) {
 }
 
 func ReadH1PooledMessage(conn H1MessageConn, limit int64) (int, []byte, error) {
+	if delayed, ok := conn.(*transportDelayWebSocketConn); ok {
+		return delayed.readPooledMessage(limit)
+	}
 	if observed, ok := conn.(*strategyDeliveryMessageConn); ok {
 		kind, message, err := ReadH1PooledMessage(observed.H1MessageConn, limit)
 		observed.info.observeRead(observed.ctx, len(message), err, false)
@@ -201,10 +247,14 @@ func (c *FramedMessageConn) WriteMessages(messages [][]byte) error {
 	if c.storage == nil {
 		c.storage = make([]byte, 16*1024)
 	}
+	frameOverhead := 4
+	if c.delayWrite != nil {
+		frameOverhead += transportDelayHeaderByteCount
+	}
 	for len(messages) != 0 {
-		count, bytes := 1, len(messages[0])+4
-		for count < len(messages) && bytes <= len(c.storage)-4 && len(messages[count]) <= len(c.storage)-bytes-4 {
-			bytes += len(messages[count]) + 4
+		count, bytes := 1, len(messages[0])+frameOverhead
+		for count < len(messages) && bytes <= len(c.storage)-frameOverhead && len(messages[count]) <= len(c.storage)-bytes-frameOverhead {
+			bytes += len(messages[count]) + frameOverhead
 			count++
 		}
 		var err error
@@ -214,7 +264,12 @@ func (c *FramedMessageConn) WriteMessages(messages [][]byte) error {
 			}
 			c.progress.beginWrite()
 		}
-		if c.framer != nil {
+		if c.delayWrite != nil {
+			// one chunk is one physical write: its frames share one stamp
+			write := c.delayWrite.beginWrite()
+			err = c.delayFramer.WriteBatchWithHeaderStorage(c, write.header[:], messages[:count], c.storage)
+			c.delayWrite.endWrite(write, bytes, err)
+		} else if c.framer != nil {
 			err = c.framer.WriteBatchWithStorage(c, messages[:count], c.storage)
 		} else {
 			err = c.xl.WriteBatchWithStorage(c, messages[:count], c.storage)
@@ -230,7 +285,7 @@ func (c *FramedMessageConn) WriteMessages(messages [][]byte) error {
 		if c.stats != nil {
 			c.stats.flushes.Add(1)
 			c.stats.messages.Add(uint64(count))
-			c.stats.bytes.Add(uint64(bytes - 4*count))
+			c.stats.bytes.Add(uint64(bytes - frameOverhead*count))
 		}
 		messages = messages[count:]
 	}

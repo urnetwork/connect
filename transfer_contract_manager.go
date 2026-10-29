@@ -505,6 +505,8 @@ type ContractManager struct {
 	closed            bool
 	workers           *lifecycleAdmission
 	closeControlSyncs map[*ControlSync]bool
+	// Report ownership outlives sequence indexes until delivery is acknowledged.
+	pendingCloseReportKVs map[Id]*contractCloseReports
 	// Protected by mutex. Consecutive contract requests refused as a rate
 	// limit. See CreateContractRateLimitBackoffMin.
 	createContractRateLimitCount int
@@ -593,6 +595,8 @@ type ContractManager struct {
 	// Nil test barriers expose shutdown before retry admission and first send.
 	beforeCloseControlAdmissionForTest func(*protocol.Frame)
 	beforeCloseControlSendForTest      func(*protocol.Frame)
+	// Nil test barrier at the atomic queue-to-open ownership handoff.
+	afterPollContractForTest func()
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -747,6 +751,13 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 		if err := controlSync.closeAndWait(ctx); err != nil {
 			result = errors.Join(result, err)
 		}
+	}
+	if result == nil {
+		// External cleanup callbacks keep their own report state after handoff.
+		// No admitted sequence can add reports after the client's joined exit.
+		self.mutex.Lock()
+		self.pendingCloseReportKVs = nil
+		self.mutex.Unlock()
 	}
 	return result
 }
@@ -1270,8 +1281,10 @@ func (self *ContractManager) IsProvidePaused() bool {
 
 // provideFrame builds the provide that registers the current provide keys, and
 // advertises whether this client serves post-quantum encryption sessions
-// (`EncryptionSessionManager.ServesPostQuantumEncryption`), which provider
-// discovery requires of the providers it offers a post-quantum client.
+// (`EncryptionSessionManager.ServesPostQuantumEncryption`). Provider discovery
+// narrows a post-quantum client to modern providers, and the declaration is
+// what makes a provider holding only a Network key modern; a request that sets
+// `post_quantum_encryption` filters on it directly.
 func (self *ContractManager) provideFrame() (*protocol.Frame, error) {
 	// read before taking the manager lock: the session manager has its own
 	postQuantumEncryption := false
@@ -1534,7 +1547,28 @@ func (self *ContractManager) TakeContract(
 				self.hasOpenContractForKey(contractKey)) {
 			minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
 		}
-		contract, expired := contractQueue.Poll(minEnqueueTime)
+		var contract *protocol.Contract
+		var expired []*protocol.Contract
+		func() {
+			// Queue removal and open ownership are one manager-to-queue lock
+			// boundary, shared with the platform's close lookup.
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			contract, expired = contractQueue.Poll(minEnqueueTime)
+			if self.afterPollContractForTest != nil {
+				self.afterPollContractForTest()
+			}
+			if contract != nil {
+				storedContract := &protocol.StoredContract{}
+				if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
+					if contractId, err := IdFromBytes(storedContract.ContractId); err == nil {
+						self.localStats.ContractOpenCount += 1
+						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(storedContract.TransferByteCount)
+						self.localStats.ContractOpenKeys[contractId] = contractKey
+					}
+				}
+			}
+		}()
 		if 0 < len(expired) {
 			// stale queued contracts may already be force-closed server-side;
 			// close them rather than handing them to a sequence
@@ -1549,20 +1583,6 @@ func (self *ContractManager) TakeContract(
 		}
 
 		if contract != nil {
-			storedContract := &protocol.StoredContract{}
-			if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
-				if contractId, err := IdFromBytes(storedContract.ContractId); err == nil {
-					func() {
-						self.mutex.Lock()
-						defer self.mutex.Unlock()
-
-						self.localStats.ContractOpenCount += 1
-						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(storedContract.TransferByteCount)
-						self.localStats.ContractOpenKeys[contractId] = contractKey
-					}()
-				}
-			}
-
 			return contract
 		}
 
@@ -2024,6 +2044,23 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	unackedByteCount ByteCount,
 	checkpoint bool,
 ) {
+	self.closeContractWithPendingReport(contractId, ackedByteCount, unackedByteCount, checkpoint, self.newContractCloseReport(contractId, checkpoint))
+}
+
+// Builds and hands off a report whose accounting ownership is already published.
+func (self *ContractManager) closeContractWithPendingReport(
+	contractId Id,
+	ackedByteCount ByteCount,
+	unackedByteCount ByteCount,
+	checkpoint bool,
+	pending *contractCloseReports,
+) {
+	var completed atomic.Bool
+	complete := func(succeeded bool) {
+		if completed.CompareAndSwap(false, true) {
+			self.completeContractCloseReport(pending, succeeded)
+		}
+	}
 	// the sequence stops updating the contract at close/checkpoint,
 	// so this is final for the stats entry either way
 	self.closeContractStats(contractId)
@@ -2093,6 +2130,7 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	frame, err := ToFrame(report, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
+		complete(false)
 		return
 	}
 
@@ -2100,7 +2138,21 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// loses its lifecycle. The external OOB owner takes custody on return;
 	// server expiry remains the backstop if that attempt fails.
 	sendCleanup := func(cleanupFrame *protocol.Frame) {
+		var stateLock sync.Mutex
+		cleanupReturned, cleanupCompleted, cleanupSucceeded := false, false, false
+		finishCleanup := func() {
+			stateLock.Lock()
+			ready, succeeded := cleanupReturned && cleanupCompleted, cleanupSucceeded
+			stateLock.Unlock()
+			if ready {
+				complete(succeeded)
+			}
+		}
 		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
+			defer finishCleanup()
+			stateLock.Lock()
+			cleanupCompleted, cleanupSucceeded = true, sendErr == nil
+			stateLock.Unlock()
 			if sendErr == nil {
 				if self.client.log.V(1).Enabled() {
 					self.client.log.Infof("[contract]closed %s after client close\n", contractId)
@@ -2115,6 +2167,10 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)
 		}
+		stateLock.Lock()
+		cleanupReturned = true
+		stateLock.Unlock()
+		finishCleanup()
 	}
 	if self.ctx.Err() != nil || self.client.IsDone() {
 		sendCleanup(frame)
@@ -2147,6 +2203,8 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 		self.mutex.Unlock()
 		if closeAcknowledged.Load() {
 			MessagePoolReturn(cleanupFrame.MessageBytes)
+			// Retire counted ownership after the retry worker releases its frame.
+			complete(true)
 		} else {
 			sendCleanup(cleanupFrame)
 		}
@@ -2296,10 +2354,8 @@ func (self *ContractManager) flushDestinationContractQueues(destinationId Id) []
 // (CloseSequences). A contract that a send sequence has taken and not closed
 // returns in openKeys with the key it was taken from. A contract still queued
 // leaves its queue, so no sequence can take it, and returns in queuedKeys; the
-// caller reports its final. A take that has polled its queue but not yet
-// recorded the contract open is not found. The caller then reports (0, 0) for
-// that contract first, and the platform does not apply its sequence's later
-// final.
+// caller reports its final. Queue polling records open ownership under this
+// same manager lock, so a contract never disappears between those states.
 func (self *ContractManager) takeSendContracts(contractIds []Id) (
 	openKeys map[Id]ContractKey,
 	queuedKeys map[Id]ContractKey,

@@ -6,11 +6,14 @@ package connect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -23,6 +26,48 @@ type HttpRequestExhaustedError struct{ causes []error }
 
 func (self *HttpRequestExhaustedError) Error() string   { return "http request attempts exhausted" }
 func (self *HttpRequestExhaustedError) Unwrap() []error { return slices.Clone(self.causes) }
+
+// The error of a failed request as a log line shows it. An exhausted request's
+// own message is fixed and names no cause, so the causes its attempts retained
+// follow it, which is what shows the failing candidate in the field
+// (connect#229); a cause the retries repeated is named once, with its count.
+// The causes are the leaves the exhaustion already unwrapped -- a dial, tls,
+// quic or dns error, a deadline -- so neither the request url, which may carry
+// an env secret, nor the headers, which carry the jwt, reach the line: a url
+// error kept whole for want of a cause is reduced to its operation. Any other
+// error is its own message.
+func httpRequestErrorWithCauses(err error) string {
+	if err == nil {
+		return ""
+	}
+	var exhausted *HttpRequestExhaustedError
+	if !errors.As(err, &exhausted) || exhausted == nil {
+		return err.Error()
+	}
+	causeMessages := []string{}
+	causeMessageCounts := map[string]int{}
+	for _, cause := range exhausted.Unwrap() {
+		var causeMessage string
+		if urlError, ok := cause.(*url.Error); ok {
+			causeMessage = fmt.Sprintf("%s: %v", urlError.Op, urlError.Err)
+		} else {
+			causeMessage = cause.Error()
+		}
+		if causeMessageCounts[causeMessage] == 0 {
+			causeMessages = append(causeMessages, causeMessage)
+		}
+		causeMessageCounts[causeMessage] += 1
+	}
+	if len(causeMessages) == 0 {
+		return err.Error()
+	}
+	for i, causeMessage := range causeMessages {
+		if count := causeMessageCounts[causeMessage]; 1 < count {
+			causeMessages[i] = fmt.Sprintf("%s (x%d)", causeMessage, count)
+		}
+	}
+	return fmt.Sprintf("%s: %s", err.Error(), strings.Join(causeMessages, "; "))
+}
 
 var errHttpExhaustionAdditionalHardCauses = errors.New("http request exhausted with additional non-transient causes")
 var errHttpExhaustionCauseTraversal = errors.New("http request cause tree exceeds its finite inspection bound")

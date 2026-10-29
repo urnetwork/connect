@@ -347,7 +347,18 @@ func TestCloseSequencesClosesOpenReceiveContractAndContinues(t *testing.T) {
 func TestCloseSequencesReportsZeroFinalForUnheldContract(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
-		harness := newCloseSequencesHarness(t)
+		harness := newCloseSequencesHarness(t, func(settings *ClientSettings) {
+			// Keep the constructor worker live until its completion hook is installed.
+			settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
+		})
+		checkpointAcknowledged := make(chan struct{})
+		var checkpointOnce sync.Once
+		harness.client.ContractManager().beforeWorkerDoneForTest = func(name string) {
+			if name == "contract close sync" {
+				checkpointOnce.Do(func() { close(checkpointAcknowledged) })
+			}
+		}
+		harness.holdControlAcknowledgements()()
 		sender := harness.newSender()
 		contractId, contractFrame := harness.newReceiveContract(sender.sourceId)
 		byteCount := harness.deliver(sender, contractFrame, closeSequencesMessageFrame("idle"))
@@ -359,6 +370,9 @@ func TestCloseSequencesReportsZeroFinalForUnheldContract(t *testing.T) {
 		}
 		checkpoint := closeSequencesReport{acked: uint64(byteCount), checkpoint: true}
 		harness.requireReports(contractId, checkpoint)
+		// Frame construction precedes native delivery. Wait for its actual
+		// acknowledgement before exercising the already-delivered fallback.
+		<-checkpointAcknowledged
 
 		unknownContractId := NewId()
 		harness.closeSequences([]Id{contractId, unknownContractId}, nil)

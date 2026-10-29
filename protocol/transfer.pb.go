@@ -1302,8 +1302,17 @@ type Auth struct {
 	// migrates by name, which the platform never sends an advisory move.
 	// This is the frame form of the H1 `X-UR-ResidentMoveVersion` header.
 	ResidentMoveVersion uint32 `protobuf:"varint,10,opt,name=resident_move_version,json=residentMoveVersion,proto3" json:"resident_move_version,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// the per-message delay header version the client offers (connect
+	// DELAY.md §6). Zero offers nothing. An old server's response does not
+	// carry the separate accepted field, so the connection keeps the legacy
+	// wire, as with h3_datagram_version.
+	TransportDelayVersion uint32 `protobuf:"varint,11,opt,name=transport_delay_version,json=transportDelayVersion,proto3" json:"transport_delay_version,omitempty"`
+	// set by the server only when it accepts the offered delay header
+	// version; both directions of every lane then carry the header after the
+	// auth exchange.
+	TransportDelayAcceptedVersion uint32 `protobuf:"varint,12,opt,name=transport_delay_accepted_version,json=transportDelayAcceptedVersion,proto3" json:"transport_delay_accepted_version,omitempty"`
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *Auth) Reset() {
@@ -1402,6 +1411,20 @@ func (x *Auth) GetStreamLeaseVersion() uint32 {
 func (x *Auth) GetResidentMoveVersion() uint32 {
 	if x != nil {
 		return x.ResidentMoveVersion
+	}
+	return 0
+}
+
+func (x *Auth) GetTransportDelayVersion() uint32 {
+	if x != nil {
+		return x.TransportDelayVersion
+	}
+	return 0
+}
+
+func (x *Auth) GetTransportDelayAcceptedVersion() uint32 {
+	if x != nil {
+		return x.TransportDelayAcceptedVersion
 	}
 	return 0
 }
@@ -1971,8 +1994,14 @@ type ExchangeSignals struct {
 	// which is the compatibility path: an old extender simply does not
 	// answer.
 	ExtenderCarrier bool `protobuf:"varint,5,opt,name=extender_carrier,json=extenderCarrier,proto3" json:"extender_carrier,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The per-message delay header version this peer speaks on the stream's
+	// data lanes (connect DELAY.md §6.1). The active side offers it with its
+	// offer batch; the passive side sets it on its answer batch only when it
+	// accepts. Both lanes carry the header after "rdy" when both set it. An
+	// older peer ignores the field, which keeps the legacy wire.
+	TransportDelayVersion uint32 `protobuf:"varint,6,opt,name=transport_delay_version,json=transportDelayVersion,proto3" json:"transport_delay_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ExchangeSignals) Reset() {
@@ -2038,6 +2067,13 @@ func (x *ExchangeSignals) GetExtenderCarrier() bool {
 		return x.ExtenderCarrier
 	}
 	return false
+}
+
+func (x *ExchangeSignals) GetTransportDelayVersion() uint32 {
+	if x != nil {
+		return x.TransportDelayVersion
+	}
+	return 0
 }
 
 // signals are sent in real time to the destination of the peer pair
@@ -3578,7 +3614,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
 	"\x1a_receiver_ack_delay_micros\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
-	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x9b\x03\n" +
+	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x9c\x04\n" +
 	"\x04Auth\x12\x15\n" +
 	"\x06by_jwt\x18\x01 \x01(\tR\x05byJwt\x12\x1f\n" +
 	"\vapp_version\x18\x02 \x01(\tR\n" +
@@ -3593,7 +3629,9 @@ const file_transfer_proto_rawDesc = "" +
 	"clientInfo\x120\n" +
 	"\x14stream_lease_version\x18\t \x01(\rR\x12streamLeaseVersion\x122\n" +
 	"\x15resident_move_version\x18\n" +
-	" \x01(\rR\x13residentMoveVersion\"l\n" +
+	" \x01(\rR\x13residentMoveVersion\x126\n" +
+	"\x17transport_delay_version\x18\v \x01(\rR\x15transportDelayVersion\x12G\n" +
+	" transport_delay_accepted_version\x18\f \x01(\rR\x1dtransportDelayAcceptedVersion\"l\n" +
 	"\aProvide\x12)\n" +
 	"\x04keys\x18\x01 \x03(\v2\x15.bringyour.ProvideKeyR\x04keys\x126\n" +
 	"\x17post_quantum_encryption\x18\x02 \x01(\bR\x15postQuantumEncryption\"f\n" +
@@ -3633,13 +3671,14 @@ const file_transfer_proto_rawDesc = "" +
 	"\x10_disconnect_time\"\x13\n" +
 	"\x11NetworkPeersReset\"B\n" +
 	"\x12NetworkPeersUpdate\x12,\n" +
-	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\xe5\x01\n" +
+	"\x05peers\x18\x01 \x03(\v2\x16.bringyour.NetworkPeerR\x05peers\"\x9d\x02\n" +
 	"\x0fExchangeSignals\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\fR\bstreamId\x12#\n" +
 	"\rreset_signals\x18\x02 \x01(\bR\fresetSignals\x123\n" +
 	"\asignals\x18\x03 \x03(\v2\x19.bringyour.ExchangeSignalR\asignals\x120\n" +
 	"\x14sender_generation_id\x18\x04 \x01(\fR\x12senderGenerationId\x12)\n" +
-	"\x10extender_carrier\x18\x05 \x01(\bR\x0fextenderCarrier\"\xa3\x01\n" +
+	"\x10extender_carrier\x18\x05 \x01(\bR\x0fextenderCarrier\x126\n" +
+	"\x17transport_delay_version\x18\x06 \x01(\rR\x15transportDelayVersion\"\xa3\x01\n" +
 	"\x0eExchangeSignal\x126\n" +
 	"\vsignal_type\x18\x03 \x01(\x0e2\x15.bringyour.SignalTypeR\n" +
 	"signalType\x12\x15\n" +
