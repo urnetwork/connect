@@ -663,9 +663,10 @@ type PlatformTransportSettings struct {
 	FramerSettings *FramerSettings
 	// TransportDelay, when set, offers the per-message delay header on this
 	// transport's connections and publishes their delay stats to the route
-	// manager (DELAY.md). Nil offers nothing. Only non-provider client
-	// transports set it (D3); a connection declaring provide intent never
-	// offers.
+	// manager (DELAY.md). Each edge's answer is recorded there too, for the
+	// client's new P2P generations to follow (§6.1). Nil offers nothing. Only
+	// non-provider client transports set it (D3); a connection declaring
+	// provide intent never offers.
 	TransportDelay *TransportDelaySettings
 
 	PtDnsSlowMultiple int
@@ -2423,6 +2424,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// the move targets this attempt dials in place of the platform host,
 		// nil to resolve it (transport_move.go). Set right before the dial.
 		var moveAttempt *platformMoveDialAttempt
+		// the delay header rides header auth only, where the first message
+		// after the 101 is the switch point, and never a connection that
+		// declares provide intent (DELAY.md §6, D3)
+		offerTransportDelay := self.settings.V2H1Auth && self.settings.TransportDelay.offered() && !auth.ProvideIntent
 		connect := func(dialCtx context.Context) (H1MessageConn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
@@ -2437,10 +2442,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
 				applyProvideIntentHeader(header, auth)
-				// the delay header rides header auth only, where the first
-				// message after the 101 is the switch point, and never a
-				// connection that declares provide intent (DELAY.md §6, D3)
-				if self.settings.TransportDelay.offered() && !auth.ProvideIntent {
+				if offerTransportDelay {
 					applyTransportDelayH1Offer(header)
 				}
 			}
@@ -2669,6 +2671,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			TransportTypeH1,
 			self.routeManager.publishTransportDelayStats,
 		))
+		if offerTransportDelay {
+			// the edge's answer, which the client's new P2P generations
+			// follow (DELAY.md §6.1)
+			self.routeManager.noteTransportDelayEdgeAnswer(delayH1 != nil)
+		}
 		if delayH1 != nil {
 			ws = delayH1.conn
 			// re-apply the payload limit through the wrapper, which adds the
@@ -3594,6 +3601,11 @@ func (self *PlatformTransport) runH3(
 				)
 				if responseErr != nil {
 					return nil, responseErr
+				}
+				if authMessage.TransportDelayVersion != 0 {
+					// the edge's answer, which the client's new P2P
+					// generations follow (DELAY.md §6.1)
+					self.routeManager.noteTransportDelayEdgeAnswer(useTransportDelay)
 				}
 			}
 

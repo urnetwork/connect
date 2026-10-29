@@ -777,10 +777,11 @@ func (self *P2pTransport) run() {
 		switch self.peerType {
 		case PeerTypeDestination:
 			// the active side offers the delay header when its client does
+			// and the client's edges accept it (transport_delay_p2p.go)
 			conn, err = self.webRtcManager.newP2pConnActiveWithTransportDelay(
 				self.ctx,
 				NewTransferPath(self.client.ClientId(), self.peerId, self.streamId),
-				self.client.settings.TransportDelay,
+				self.client.transportDelayP2pOffer(),
 			)
 		case PeerTypeSource:
 			conn, err = self.webRtcManager.NewP2pConnPassive(self.ctx, NewTransferPath(self.client.ClientId(), self.peerId, self.streamId))

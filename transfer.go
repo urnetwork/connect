@@ -1669,9 +1669,10 @@ type ClientSettings struct {
 	beforeClientKeyPublishForTest func()
 
 	// TransportDelay, when set, offers the per-message delay header on this
-	// client's P2P streams as the active side (DELAY.md §6.1). A passive
-	// side accepts an offer regardless, stamping and echoing only. Nil
-	// offers nothing; only non-provider window clients set it (D3).
+	// client's P2P streams as the active side, while the client's edges
+	// accept it on its platform connections (DELAY.md §6.1). A passive side
+	// accepts an offer regardless, stamping and echoing only. Nil offers
+	// nothing; only non-provider window clients set it (D3).
 	TransportDelay *TransportDelaySettings
 }
 

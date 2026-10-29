@@ -650,7 +650,9 @@ type h3DelayRoundTripCase struct {
 // and, with DATAGRAM, one DATAGRAM message each way while both sides keep
 // stamped heartbeats flowing. Payloads must arrive unchanged on every lane. A
 // negotiated connection publishes intervals with delay samples in both
-// directions; the legacy wire publishes nothing, including at teardown.
+// directions; the legacy wire publishes nothing, including at teardown. Either
+// way the server's answer replaces the one the route manager recorded for the
+// client's P2P.
 func testPlatformTransportH3DelayRoundTrip(t *testing.T, ipVersion int, c h3DelayRoundTripCase) {
 	t.Helper()
 	testCtx, testCancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -875,7 +877,10 @@ func testPlatformTransportH3DelayRoundTrip(t *testing.T, ipVersion int, c h3Dela
 		}
 	}
 
+	negotiated := c.acceptDelay && !c.rawEcho
 	routeManager := NewRouteManager(testCtx, "h3-delay-round-trip")
+	// the opposite of this edge's answer, which must replace it (DELAY.md §6.1)
+	routeManager.noteTransportDelayEdgeAnswer(!negotiated)
 	var statsLock sync.Mutex
 	var publishedStats []TransportDelayStats
 	statsPublished := make(chan struct{}, 1)
@@ -936,6 +941,10 @@ func testPlatformTransportH3DelayRoundTrip(t *testing.T, ipVersion int, c h3Dela
 	case <-testCtx.Done():
 		t.Fatalf("v%d wait for send route: %v", ipVersion, testCtx.Err())
 	}
+	// the auth exchange precedes the route
+	if accepted := routeManager.transportDelayEdgeAccepted.Load(); accepted != negotiated {
+		t.Fatalf("v%d recorded edge acceptance=%t, expected %t", ipVersion, accepted, negotiated)
+	}
 	writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
 	defer routeManager.CloseMultiRouteWriter(writer)
 	carrierWriter := writer.(transferCarrierMultiRouteWriter)
@@ -978,7 +987,6 @@ func testPlatformTransportH3DelayRoundTrip(t *testing.T, ipVersion int, c h3Dela
 		}
 	}
 
-	negotiated := c.acceptDelay && !c.rawEcho
 	sampledStats := func() (TransportDelayStats, bool) {
 		statsLock.Lock()
 		defer statsLock.Unlock()
