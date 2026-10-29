@@ -407,6 +407,82 @@ func TestTransportDelayP2pNegotiationMatrix(t *testing.T) {
 	}
 }
 
+// newTestTransportDelayP2pGateClient holds only what the P2P offer gate reads:
+// the client's settings and the route manager its platform connections record
+// edge answers on.
+func newTestTransportDelayP2pGateClient(t *testing.T, settings *TransportDelaySettings) *Client {
+	clientSettings := closeWaitClientSettings()
+	clientSettings.TransportDelay = settings
+	return &Client{
+		routeManager: NewRouteManager(t.Context(), "transport-delay-p2p-gate"),
+		settings:     clientSettings,
+	}
+}
+
+// A new active generation offers the header only while the latest edge answer
+// on the client's platform connections accepted it (DELAY.md §6.1): not before
+// any edge answers, not after a decline, and again after the next acceptance.
+// A client whose own settings do not offer never does.
+func TestTransportDelayP2pOfferFollowsTheEdges(t *testing.T) {
+	requireOffer := func(state string, client *Client, expected *TransportDelaySettings) {
+		t.Helper()
+		if offer := client.transportDelayP2pOffer(); offer != expected {
+			t.Fatalf("%s: offer = %+v, expected %+v", state, offer, expected)
+		}
+	}
+	settings := testTransportDelayP2pSettings()
+	client := newTestTransportDelayP2pGateClient(t, settings)
+	requireOffer("before any edge answers", client, nil)
+	client.routeManager.noteTransportDelayEdgeAnswer(true)
+	requireOffer("after an edge accepted", client, settings)
+	client.routeManager.noteTransportDelayEdgeAnswer(false)
+	requireOffer("after an edge declined", client, nil)
+	client.routeManager.noteTransportDelayEdgeAnswer(true)
+	requireOffer("after the next acceptance", client, settings)
+
+	withoutSettings := newTestTransportDelayP2pGateClient(t, nil)
+	withoutSettings.routeManager.noteTransportDelayEdgeAnswer(true)
+	requireOffer("without settings", withoutSettings, nil)
+}
+
+// A generation reads the gate once, when it starts. One that negotiated while
+// the edges accepted keeps the header after they decline, and the next one
+// offers nothing and keeps the legacy wire (DELAY.md §6.1, §11).
+func TestTransportDelayP2pEdgeDeclineStopsOnlyNewGenerations(t *testing.T) {
+	settings := testTransportDelayP2pSettings()
+	client := newTestTransportDelayP2pGateClient(t, settings)
+	client.routeManager.noteTransportDelayEdgeAnswer(true)
+	accepted := newTransportDelayP2pTestPair(t, client.transportDelayP2pOffer(), false)
+	client.routeManager.noteTransportDelayEdgeAnswer(false)
+	declined := newTransportDelayP2pTestPair(t, client.transportDelayP2pOffer(), false)
+
+	accepted.toPassive.requireVersions(t, protocol.SignalType_SdpOffer, TransportDelayVersion)
+	accepted.toActive.requireVersions(t, protocol.SignalType_SdpAnswer, TransportDelayVersion)
+	declined.toPassive.requireVersions(t, protocol.SignalType_SdpOffer, 0)
+	declined.toActive.requireVersions(t, protocol.SignalType_SdpAnswer, 0)
+	for _, generation := range []struct {
+		name       string
+		pair       *transportDelayP2pTestPair
+		negotiated bool
+	}{
+		{name: "the generation the edges accepted", pair: accepted, negotiated: true},
+		{name: "the generation after the decline", pair: declined},
+	} {
+		// the delay state each end starts after "rdy", which decides its wire
+		activeDelay := newP2pTransportDelayForConn(generation.pair.active, true, settings, generation.pair.activeId, nil)
+		passiveDelay := newP2pTransportDelayForConn(generation.pair.passive, false, nil, generation.pair.passiveId, nil)
+		if (activeDelay != nil) != generation.negotiated || (passiveDelay != nil) != generation.negotiated {
+			t.Fatalf(
+				"%s: header active=%t passive=%t, expected %t",
+				generation.name,
+				activeDelay != nil,
+				passiveDelay != nil,
+				generation.negotiated,
+			)
+		}
+	}
+}
+
 // testTransportDelayP2pLaneRoundTrip drives one forced lane both ways with the
 // header and checks the payloads, the lane counters, and the active end's
 // published measurement.
@@ -1013,12 +1089,25 @@ func TestTransportDelayP2pRelayStampsEachHopOnce(t *testing.T) {
 }
 
 // The production association end to end: a client whose settings offer the
-// header negotiates it as the active side of a real offer/answer, both
-// directions deliver through the route managers, and the generation's last
-// interval is published to the offering client's subscribers when the
-// generation ends. The passive client stamps and echoes and publishes
-// nothing.
+// header and whose edges accepted it negotiates it as the active side of a
+// real offer/answer, both directions deliver through the route managers, and
+// the generation's last interval is published to the offering client's
+// subscribers when the generation ends. The passive client stamps and echoes
+// and publishes nothing.
 func TestTransportDelayP2pTransportNegotiatesAndFlushesOnGenerationEnd(t *testing.T) {
+	testTransportDelayP2pTransportGeneration(t, true)
+}
+
+// The same client before any edge answered offers nothing: both directions
+// deliver on the legacy wire, and nothing is published (DELAY.md §6.1).
+func TestTransportDelayP2pTransportOffersNothingBeforeAnEdgeAccepts(t *testing.T) {
+	testTransportDelayP2pTransportGeneration(t, false)
+}
+
+// One production association between an active client whose settings offer
+// the header and a passive client. edgeAccepted records an edge's acceptance
+// on the active client first, as its platform connections do.
+func testTransportDelayP2pTransportGeneration(t *testing.T, edgeAccepted bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
@@ -1029,6 +1118,9 @@ func TestTransportDelayP2pTransportNegotiatesAndFlushesOnGenerationEnd(t *testin
 	activeClientSettings.TransportDelay = delaySettings
 	activeClient := NewClient(ctx, NewId(), NewNoContractClientOob(), activeClientSettings)
 	passiveClient := NewClient(ctx, NewId(), NewNoContractClientOob(), closeWaitClientSettings())
+	if edgeAccepted {
+		activeClient.RouteManager().noteTransportDelayEdgeAnswer(true)
+	}
 	defer func() {
 		joinCtx, joinCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer joinCancel()
@@ -1110,8 +1202,12 @@ func TestTransportDelayP2pTransportNegotiatesAndFlushesOnGenerationEnd(t *testin
 		case <-routeInstalled:
 		}
 	}
-	toPassive.requireVersions(t, protocol.SignalType_SdpOffer, TransportDelayVersion)
-	toActive.requireVersions(t, protocol.SignalType_SdpAnswer, TransportDelayVersion)
+	expectedVersion := uint32(0)
+	if edgeAccepted {
+		expectedVersion = TransportDelayVersion
+	}
+	toPassive.requireVersions(t, protocol.SignalType_SdpOffer, expectedVersion)
+	toActive.requireVersions(t, protocol.SignalType_SdpAnswer, expectedVersion)
 
 	transfer := func(sendRoutes *RouteManager, destinationId Id, receiveRoutes *RouteManager, message []byte) {
 		t.Helper()
@@ -1148,7 +1244,16 @@ func TestTransportDelayP2pTransportNegotiatesAndFlushesOnGenerationEnd(t *testin
 	if err := passiveTransport.CloseAndWait(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if passivePublished := passiveRecorder.snapshot(); len(passivePublished) != 0 {
+		t.Fatalf("the passive client published %d intervals", len(passivePublished))
+	}
 	published := activeRecorder.snapshot()
+	if !edgeAccepted {
+		if len(published) != 0 {
+			t.Fatalf("the legacy wire published %d intervals", len(published))
+		}
+		return
+	}
 	if len(published) != 1 {
 		t.Fatalf("the generation end published %d intervals, expected 1", len(published))
 	}
@@ -1162,8 +1267,5 @@ func TestTransportDelayP2pTransportNegotiatesAndFlushesOnGenerationEnd(t *testin
 	}
 	if !interval.ReceiveQueueDelayValid || !interval.SendQueueDelayValid {
 		t.Fatalf("flushed interval has no queue samples: %+v", interval)
-	}
-	if passivePublished := passiveRecorder.snapshot(); len(passivePublished) != 0 {
-		t.Fatalf("the passive client published %d intervals", len(passivePublished))
 	}
 }

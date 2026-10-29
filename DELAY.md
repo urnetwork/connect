@@ -308,6 +308,10 @@ carries two lanes that share one transport clock and one echo.
   - The active side sets it on its offer batch. The passive side sets it on its
     answer batch only if it accepts. Each side knows the other's answer before
     the data channel opens.
+  - Since 2026-10-28 the active side offers on a new generation only while the
+    latest answer of its client's edges to a delay header offer accepted it,
+    and not before any edge has answered. The edges never see this exchange,
+    so this is how their runtime switch (§11) reaches P2P.
   - Not through the "rdy" ready header: it is an exact match
     (transport_p2p.go:146), so an old peer would time out.
   - Not through `DataChannelInit.Protocol`: it only travels active to passive.
@@ -841,7 +845,12 @@ helper comes from connect (`replace github.com/urnetwork/connect => ../connect`)
   reconnects. A failed read keeps the last value, and a handler that has not
   read yet uses the code default. `urnetwork_connect_transport_delay_enabled`
   shows each process's value. P2P is negotiated between the clients (§6.1),
-  so the switch does not reach it.
+  and the edge only forwards their signals, so P2P follows the edges through
+  the client: a new active P2P generation offers only while the latest answer
+  an edge gave one of the client's own connections accepted the header. The
+  switch reaches a client's new P2P generations once one of its edge
+  connections negotiates after the change, and a P2P generation keeps what it
+  negotiated.
 
 ## 12. Implementation map
 
@@ -1047,6 +1056,21 @@ fraction at or below 1 when the stream and DATAGRAM lanes block at once.
   - The active side enables the header only if the answer carried exactly 1.
     The passive side enables it when the offer carried 1 or more, and answers
     1.
+- **Edge gate (2026-10-28).** A new active generation offers only while the
+  client's edges accept the header (§6.1, §11).
+  - Every platform connection that offered, on H1, H1+ or any H3 carrier,
+    stores the edge's answer (its 101 or auth response) on the client's
+    `RouteManager`, which all of the client's transports share
+    (`noteTransportDelayEdgeAnswer`). The latest answer wins. A connection that
+    did not offer stores nothing.
+  - `P2pTransport.run` reads the gate through `Client.transportDelayP2pOffer`
+    once per generation. Before any answer, it offers nothing.
+  - The passive side is unchanged.
+  - Tests: `TestTransportDelayP2pOfferFollowsTheEdges`,
+    `TestTransportDelayP2pEdgeDeclineStopsOnlyNewGenerations` and
+    `TestTransportDelayP2pTransportOffersNothingBeforeAnEdgeAccepts`. The H1
+    and H3 platform transport tests check the stored answer, including an old
+    server's decline.
 - **State.** Delay state is per connection generation, created right after
   "rdy". Frames prefetched during the ready exchange are stripped but excluded
   from measurement.
