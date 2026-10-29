@@ -2820,7 +2820,9 @@ paths:
         and are cached per network for about 5 minutes. The appearance
         histograms are read fresh on every call. The caller's own client
         comes first when it is a provider. At most 32 provider clients are
-        decided per answer; `truncated` is set when the network has more.
+        decided per answer, the first 32 in client id order; `truncated` is
+        set when the network has more, and `total_clients` says how many it
+        has.
 
         With `client_id`, the answer is the status of that one client: a
         provider client of the caller's network, or the caller's own
@@ -2839,8 +2841,23 @@ paths:
         "Invalid client_id." for a `client_id` that is not a uuid, and
         "Invalid format." for a `format` other than `full` or `compact`.
 
-        Anti-abuse checks are reported only as the generic reason
-        `not_eligible`. Which check applies is never returned.
+        Every 200 answer, a refused query's included, carries an `ETag`: a
+        digest of the caller's network, the query and the exact body, so it
+        changes exactly when the body does, and two networks or two queries
+        never share one. A request whose `If-None-Match` names the current
+        `ETag` is answered `304 Not Modified` with no body. The body changes
+        when the cached admission and ranking are decided again, at most
+        every 5 minutes, when a histogram counts an appearance, and every
+        minute as the histograms' hour moves on; a repeat poll in between is
+        answered 304. There is no `since` parameter: the `ETag` already
+        answers a poll whose answer has not changed, and a delta would have
+        to carry removed clients and the moved histograms besides.
+
+        Every status gives its reason as a stable code, `reason_code`, of
+        what the provider's operator can act on. Anti-abuse checks are
+        reported only as the generic reason `not_eligible` and the code
+        `withheld`, alike for every check. Which check applies is never
+        returned.
       operationId: networkProviderStatus
       security:
         - BearerAuth: []
@@ -2866,17 +2883,47 @@ paths:
             enum:
               - full
               - compact
+        - in: header
+          name: If-None-Match
+          required: false
+          description: |
+            The `ETag` of an earlier answer to the same query. When the
+            answer is unchanged, it is `304 Not Modified` with no body.
+          schema:
+            type: string
       responses:
         "200":
           description: |
             OK. `GetProviderStatusResult`, or `GetProviderStatusCompactResult`
             with `format=compact`.
+          headers:
+            ETag:
+              description: A strong tag of the answer, in double quotes. It changes exactly when the body does.
+              schema:
+                type: string
+            Cache-Control:
+              description: "`private, no-cache`: a cache may keep the answer for the caller alone, and revalidates it with the `ETag` before every reuse."
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 anyOf:
                   - $ref: "#/components/schemas/GetProviderStatusCompactResult"
                   - $ref: "#/components/schemas/GetProviderStatusResult"
+        "304":
+          description: |
+            Not Modified: `If-None-Match` names the current `ETag`, so the
+            answer is the one the caller has. No body.
+          headers:
+            ETag:
+              description: The current tag, the one named.
+              schema:
+                type: string
+            Cache-Control:
+              description: "`private, no-cache`, as for the 200."
+              schema:
+                type: string
 
   /network/user:
     get:
@@ -15201,6 +15248,16 @@ components:
         truncated:
           description: the network has more provider clients than one answer decides
           type: boolean
+        total_clients:
+          description: |
+            How many provider clients the network has (active, top-level
+            clients with a provide key), the ones `providers` is drawn from,
+            counted up to 10000. With `truncated`, all but the first 32 in
+            client id order are left out, except the caller's own client,
+            which is listed first. Only in the network's answer: absent with
+            `client_id`, whose answer is one client and never truncated, and
+            for a refused query.
+          type: integer
         error:
           description: a refused query, which has no providers
           type: object
@@ -15231,6 +15288,9 @@ components:
         truncated:
           description: the network has more provider clients than one answer decides
           type: boolean
+        total_clients:
+          description: as `GetProviderStatusResult.total_clients`
+          type: integer
         error:
           description: a refused query, which has no providers; as `GetProviderStatusResult.error`
           type: object
@@ -15245,6 +15305,7 @@ components:
       required:
         - client_id
         - reason
+        - reason_code
         - reason_text
         - admission
         - ranking
@@ -15276,6 +15337,8 @@ components:
             - speed_test_missing
             - slow
             - none
+        reason_code:
+          $ref: "#/components/schemas/ProviderStatusReasonCode"
         reason_text:
           description: the reason in English
           type: string
@@ -15299,6 +15362,50 @@ components:
           format: date-time
         appearances:
           $ref: "#/components/schemas/ProviderAppearanceHistogram"
+
+    ProviderStatusReasonCode:
+      description: |
+        The reason as a stable code of what the provider's operator can act
+        on, with the reasons each codes. A code is coarser than the reason
+        and outlives it: a reason added later is given one of these codes.
+
+        - `not_providing`: providing is off on the device; turn it on
+          (`not_providing`).
+        - `not_connected`: the device isn't connected (`not_connected`).
+        - `location_invalid`: the device connects from more than one
+          address, or its location is unknown (`location_invalid`).
+        - `network_only`: the device provides only to the network's own
+          devices; choose Always to share with everyone (`network_only`).
+        - `warming_up`: a measurement is still accruing (reliability
+          history, network checks or a speed test), and the reason clears on
+          its own (`reliability_warming_up`, `egress_warming_up`,
+          `egress_unprobed`, `speed_test_missing`).
+        - `reliability_low`: reliability over the last hour is below the
+          floor; keep the device connected (`reliability_low`).
+        - `withheld`: an anti-abuse check holds the provider back. Every
+          check gives this one code, and which applies is never returned
+          (`not_eligible`).
+        - `egress_failing`: test sites fail to load through the connection;
+          check its internet connection and any firewall, VPN or DNS filter
+          (`egress_no_success`, `egress_low_success`, `egress_failing`).
+        - `not_modern`: the network check hasn't confirmed the modern
+          provider build, end-to-end post-quantum encryption with resizable
+          transfer windows; update the app (`not_modern`).
+        - `slow`: the connection measured slower than clients need (`slow`).
+        - `none`: nothing holds the provider back (`none`).
+      type: string
+      enum:
+        - not_providing
+        - not_connected
+        - location_invalid
+        - network_only
+        - warming_up
+        - reliability_low
+        - withheld
+        - egress_failing
+        - not_modern
+        - slow
+        - none
 
     ProviderAdmission:
       type: object
@@ -15434,6 +15541,7 @@ components:
       required:
         - client_id
         - reason
+        - reason_code
         - admission
         - ranking
         - evaluate_time
@@ -15464,6 +15572,8 @@ components:
             - speed_test_missing
             - slow
             - none
+        reason_code:
+          $ref: "#/components/schemas/ProviderStatusReasonCode"
         admission:
           $ref: "#/components/schemas/ProviderAdmission"
         ranking:
