@@ -6343,3 +6343,25 @@ correctness, synthetic PERFVAR, focused memory benchmarks, and fresh hosted-H1
 device qualification for the 32 MiB iOS surrogate and 64 MiB Android profile
 remain outstanding. A private near-stall diagnostic is prepared but unrun; its
 4.5-second capture trigger leaves the five-second workload failure gate intact.
+
+
+### 2026-10-29: C38 original eight-arm browsing replay
+
+Connect `b360c4bb`, Server `3654e3d8`, SDK `ec826241`, and Tests `e623e541` completed the original eight-arm matrix without production overlays, tracing overrides, retries, or threshold changes. Outer transport was H1. Each arm exercised 100 HTML pages, 400 validated-or-canceled assets, 99 overlapping navigations, and four live pages under the original five-second first-byte gate.
+
+| Link | Inner protocol | Mode | Maximum first byte (s) | Median (s) | p95 (s) |
+|---|---|---|---:|---:|---:|
+| cell-edge-5m-down-1m-up | h2 | normal | 3.088 | 0.677 | 1.719 |
+| cell-edge-5m-down-1m-up | http/1.1 | normal | 3.584 | 1.312 | 2.725 |
+| cell-edge-5m-down-1m-up | http/1.1 | race | 3.280 | 1.663 | 2.806 |
+| cell-edge-5m-down-1m-up | h2 | race | 3.575 | 0.782 | 1.860 |
+| wifi-good | http/1.1 | normal | 0.162 | 0.080 | 0.105 |
+| wifi-good | h2 | normal | 0.220 | 0.027 | 0.052 |
+| wifi-good | http/1.1 | race | 0.255 | 0.099 | 0.174 |
+| wifi-good | h2 | race | 0.190 | 0.046 | 0.112 |
+
+All eight arms passed: 800 HTML pages, 3,200 assets, and 792 overlap proofs, with no first-byte failure at or above five seconds. Checked post-join managed-budget totals were zero; this is ownership accounting, not RSS or an iOS physical-footprint measurement.
+
+This qualifies this current workload execution, not a statistical baseline, a complete historical-stall explanation, full correctness/PERF, or physical 32 MiB iOS-profile / 64 MiB Android qualification. `baselineEligible=false`, admission-chain coverage remains unexercised, and physical pause attribution remains unknown.
+
+Evidence: `/private/tmp/urnetwork-c38-original8-metadata.vy2_wvjd/FINAL-CUSTODY.json`, SHA-256 `b5f0a1d1e0147e09ab6ab6129a819b6bc8a897413c38d3abaef5d6100010f680`.
