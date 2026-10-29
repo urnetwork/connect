@@ -7125,13 +7125,10 @@ paths:
 
   /sn/head-summary:
     post:
-      x-status: planned
       x-internal: true
       tags: [Other]
       summary: Upload the validator's signed head summary
       description: |
-        Planned operation; the server does not currently expose this route.
-
         The validator uploads its signed head result for one native tempo
         (sn docs/spec/head-summary-v1.md; server LEADERTOP.md §6.1): every
         eligible head UID in rank order with its exact score, its fleet
