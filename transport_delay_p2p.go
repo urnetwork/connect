@@ -4,15 +4,21 @@ package connect
 // §6.1).
 //
 // Negotiation rides the signal batches of the offer/answer exchange. The
-// active side of a client whose settings offer the header puts
-// TransportDelayVersion on every ExchangeSignals batch it sends; the passive
-// side records the version on the batch of the offer it applies and, when it
-// accepts, puts its own version on every later batch, including the answer.
-// The active side records the version on the batch of the answer it applies.
-// Each side stores the remote version before applying the description, and
-// the data channel cannot open before both descriptions apply, so both sides
-// know the outcome at "rdy". The "rdy" marker itself is never stamped; every
-// later message in both directions is.
+// active side of a client that offers the header puts TransportDelayVersion
+// on every ExchangeSignals batch it sends; the passive side records the
+// version on the batch of the offer it applies and, when it accepts, puts its
+// own version on every later batch, including the answer. The active side
+// records the version on the batch of the answer it applies. Each side stores
+// the remote version before applying the description, and the data channel
+// cannot open before both descriptions apply, so both sides know the outcome
+// at "rdy". The "rdy" marker itself is never stamped; every later message in
+// both directions is.
+//
+// A client offers on a new generation only when its settings offer the header
+// and the latest edge answer to the offer of one of its platform connections
+// accepted it, so never before an edge has answered. The edges never see this
+// exchange, so this is how their runtime switch (DELAY.md §11) reaches P2P. A
+// generation decides once, when it starts, and keeps what it negotiated.
 //
 // One PeerConnection generation keeps one transportDelay (one transport clock
 // and echo) with a write and read lane per physical lane:
@@ -139,6 +145,16 @@ func newP2pTransportDelayForConn(
 		publish = nil
 	}
 	return newP2pTransportDelay(newTransportDelay(settings, clientId, TransportTypeP2p, publish))
+}
+
+// The delay settings a new active generation of this client offers: the
+// client's own while the latest answer of its edges accepted the header, else
+// nil, which offers nothing (DELAY.md §6.1).
+func (self *Client) transportDelayP2pOffer() *TransportDelaySettings {
+	if !self.routeManager.transportDelayEdgeAccepted.Load() {
+		return nil
+	}
+	return self.settings.TransportDelay
 }
 
 // Starts the delay state of the generation conn carries. The active side is

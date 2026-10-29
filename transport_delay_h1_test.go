@@ -681,20 +681,29 @@ func TestTransportDelayH1WebSocketReadLimitAndClose(t *testing.T) {
 // route manager. Its reader classifies stripped payloads: a latency test is
 // echoed, and a payload at the client's message limit still fits although the
 // header rides inside the WebSocket message. A transport without delay
-// settings, and a connection that declares provide intent, never offer.
+// settings, and a connection that declares provide intent, never offer. The
+// edge's answer to an offer, an old server's included, replaces the one the
+// route manager recorded for the client's P2P (DELAY.md §6.1); a connection
+// that does not offer leaves it.
 func TestTransportDelayH1PlatformTransport(t *testing.T) {
 	type platformCase struct {
 		name           string
 		enableH1Plus   bool
 		transportDelay *TransportDelaySettings
 		provideIntent  bool
-		negotiated     bool
+		// the server predates the header and never selects it
+		oldServer  bool
+		negotiated bool
+		// the recorded edge answer before and after the connection
+		edgeAcceptedBefore bool
+		edgeAcceptedAfter  bool
 	}
 	platformCases := []platformCase{
-		{name: "websocket", transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), negotiated: true},
-		{name: "h1plus", enableH1Plus: true, transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), negotiated: true},
-		{name: "provide-intent", transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), provideIntent: true},
-		{name: "no-settings"},
+		{name: "websocket", transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), negotiated: true, edgeAcceptedAfter: true},
+		{name: "h1plus", enableH1Plus: true, transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), negotiated: true, edgeAcceptedAfter: true},
+		{name: "old-server", transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), oldServer: true, edgeAcceptedBefore: true},
+		{name: "provide-intent", transportDelay: testTransportDelayH1Settings(50 * time.Millisecond), provideIntent: true, edgeAcceptedBefore: true, edgeAcceptedAfter: true},
+		{name: "no-settings", edgeAcceptedBefore: true, edgeAcceptedAfter: true},
 	}
 	for _, platform := range platformCases {
 		t.Run(platform.name, func(t *testing.T) {
@@ -713,7 +722,11 @@ func TestTransportDelayH1PlatformTransport(t *testing.T) {
 			}
 			connections := make(chan platformConnection, 16)
 			echoes := make(chan bool, 16)
-			server := newTestTransportDelayH1Server(t, testTransportDelayH1ServerNew, func(serverConn *testTransportDelayH1ServerConn) {
+			serverMode := testTransportDelayH1ServerNew
+			if platform.oldServer {
+				serverMode = testTransportDelayH1ServerOld
+			}
+			server := newTestTransportDelayH1Server(t, serverMode, func(serverConn *testTransportDelayH1ServerConn) {
 				select {
 				case connections <- platformConnection{offered: serverConn.offered, delayed: serverConn.delayed}:
 				default:
@@ -773,6 +786,7 @@ func TestTransportDelayH1PlatformTransport(t *testing.T) {
 			strategy := NewClientStrategy(ctx, strategySettings)
 			defer strategy.Close()
 			routeManager := NewRouteManager(ctx, "transport-delay-h1")
+			routeManager.noteTransportDelayEdgeAnswer(platform.edgeAcceptedBefore)
 			published := &testTransportDelayH1Published{}
 			defer routeManager.addTransportDelayStatsCallback(published.add)()
 			transport := NewPlatformTransportWithTargetMode(
@@ -786,12 +800,23 @@ func TestTransportDelayH1PlatformTransport(t *testing.T) {
 			)
 			defer transport.Close()
 
+			offered := platform.transportDelay != nil && !platform.provideIntent
 			connection := receivePlatformAuthWitness(t, connections, "the transport did not connect")
-			if connection.offered != platform.negotiated || connection.delayed != platform.negotiated {
-				t.Fatalf("server saw offered=%t delayed=%t, expected %t", connection.offered, connection.delayed, platform.negotiated)
+			if connection.offered != offered || connection.delayed != platform.negotiated {
+				t.Fatalf(
+					"server saw offered=%t delayed=%t, expected offered=%t delayed=%t",
+					connection.offered,
+					connection.delayed,
+					offered,
+					platform.negotiated,
+				)
 			}
 			if delayed := receivePlatformAuthWitness(t, echoes, "the latency test was not echoed"); delayed != platform.negotiated {
 				t.Fatalf("the echo arrived on a connection with delayed=%t, expected %t", delayed, platform.negotiated)
+			}
+			// the client's reader echoed, so the connection is past its 101
+			if accepted := routeManager.transportDelayEdgeAccepted.Load(); accepted != platform.edgeAcceptedAfter {
+				t.Fatalf("recorded edge acceptance=%t after the connection, expected %t", accepted, platform.edgeAcceptedAfter)
 			}
 			if platform.negotiated && !waitForCondition(5*time.Second, func() bool {
 				for _, interval := range published.snapshot() {

@@ -469,6 +469,11 @@ type RouteManager struct {
 	// every transport of the client publishes its delay stats here
 	// (DELAY.md §9); the route manager is the one object they all hold
 	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
+	// whether the latest edge answer to the delay header offer of one of the
+	// client's platform connections accepted it; false until an edge answers.
+	// New active P2P generations offer the header only while it holds
+	// (DELAY.md §6.1).
+	transportDelayEdgeAccepted atomic.Bool
 	// Verified final destinations outlive individual transfer sequences. A
 	// live endpoint StreamSequence owns the matching alias scope; verified
 	// contracts may arrive before that scope opens and remain recorded until an
@@ -548,6 +553,13 @@ func (self *RouteManager) publishTransportDelayStats(stats *TransportDelayStats)
 			callback(stats)
 		})
 	}
+}
+
+// noteTransportDelayEdgeAnswer records an edge's answer to the delay header
+// offer of one of the client's platform connections, on its 101 or its auth
+// response. The latest answer wins (DELAY.md §6.1).
+func (self *RouteManager) noteTransportDelayEdgeAnswer(accepted bool) {
+	self.transportDelayEdgeAccepted.Store(accepted)
 }
 
 func (self *RouteManager) DowngradeReceiverConnection(source TransferPath) {
