@@ -7123,6 +7123,128 @@ paths:
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
+  /sn/top:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The Protocol leaderboard
+      description: |
+        Planned operation; the server does not currently expose this route.
+
+        The Protocol leaderboard (server LEADERTOP.md): networks ranked the
+        way the SN25 validator picks its Top 200 head fleets, so a network
+        that has not claimed a UID can see whether it would make the head if
+        it claimed now. Each network is scored as one hypothetical fleet of
+        its verify-eligible providers with the validator's head formula: the
+        distinct /29 (IPv4) or /48 (IPv6) egress prefixes they provide from,
+        each shared prefix split among every network and claimed fleet on it,
+        smoothed with the validator's EMA of a quarter per tempo. Claimed
+        networks also list their fleets, with the validator's own ranking and
+        the on-chain incentive where those are known.
+
+        The board is a snapshot computed once per tempo (360 blocks, about 72
+        minutes); `stale` is set when the newest one is more than 3 tempos
+        old. `projected_cutoff`, the projected score of the 200th unit
+        (network or claimed fleet), is the line every `margin` and `label`
+        is measured against.
+
+        `rows` cover the top 400 positions only, so networks just outside
+        the 200 line can follow their progress. Pages use a keyset `cursor`
+        pinned to the snapshot of the page that returned it: pass `next` as
+        `cursor` until it is null. `snapshot` pins the first page to one
+        snapshot, and `filter` lists `unclaimed` or `claimed` networks only.
+
+        No authentication is required. With a bearer token the response also
+        carries `me`, the caller's own row wherever it ranks, and the
+        caller's row in `rows` has `is_me` set. Rows are anonymous by
+        default: no row carries a network id, and a row in `rows` has a
+        `name` only when its network turned on the "show my network name"
+        switch (/network/points-ranking-visibility), the one switch for this
+        board and the points leaderboard. An anonymous claimed row is known
+        only by its fleets' UIDs. Prefix hashes and addresses are never
+        returned, only counts.
+      operationId: snTop
+      # optional auth: anonymous callers get the board, a bearer adds `me`
+      security:
+        - {}
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          description: Page size, default 50, at most 200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: cursor
+          required: false
+          description: |
+            Continues from a previous page's `next`. Opaque, and pinned to the
+            snapshot of the page that returned it. Omit for the first page.
+          schema:
+            type: string
+        - in: query
+          name: filter
+          required: false
+          description: |
+            Which networks to list: every ranked network, the ones that have
+            not claimed a UID, or the ones that have.
+          schema:
+            type: string
+            enum: [all, unclaimed, claimed]
+            default: all
+        - in: query
+          name: snapshot
+          required: false
+          description: |
+            A snapshot `id` to read the first page from. Absent means the
+            newest snapshot.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnTopResult"
+        "400":
+          description: A query parameter is malformed.
+        "401":
+          description: A bearer token was sent and does not authenticate.
+
+  /sn/top/me:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The caller's Protocol leaderboard detail
+      description: |
+        Planned operation; the server does not currently expose this route.
+
+        The caller network's standing on the Protocol leaderboard
+        (`GET /sn/top`), from the same snapshot: its row; the score it would
+        have if it claimed alone today, with no other network or fleet on its
+        prefixes claiming; its distinct and shared prefix counts and how many
+        other networks and claimed fleets share them; why the validator
+        cannot measure it, when it cannot; and its rank and score for each
+        day of up to the last 90, for a progress chart. Counts only, never
+        prefix hashes or addresses.
+      operationId: snTopMe
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnTopMeResult"
+        "401":
+          description: Missing or invalid bearer token.
+
   /sn/pool/claim:
     get:
       tags: [Other]
@@ -16692,6 +16814,359 @@ components:
           properties:
             message:
               type: string
+
+    SnTopResult:
+      type: object
+      description: One page of the Protocol leaderboard (`GET /sn/top`).
+      required:
+        - snapshot
+        - rows
+        - me
+        - next
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/SnTopSnapshot"
+        rows:
+          description: The page's rows in position order, within the top 400 positions.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnTopRow"
+        me:
+          description: |
+            The caller's own row wherever it ranks; null when the request is
+            not signed in or the caller's network is not ranked.
+          oneOf:
+            - $ref: "#/components/schemas/SnTopRow"
+            - type: "null"
+        next:
+          description: The `cursor` of the next page; null on the last page.
+          type: [string, "null"]
+
+    SnTopSnapshot:
+      type: object
+      description: |
+        One per-tempo computation of the Protocol leaderboard. Every page and
+        `GET /sn/top/me` say which snapshot they were read from.
+      required:
+        - id
+        - tempo_index
+        - block
+        - computed_at
+        - settlement_epoch
+        - total_ranked
+        - head_seats
+        - claimed_fleets
+        - open_seats
+        - projected_cutoff
+        - claimed_cutoff
+        - binding_open
+        - binding_note
+        - measured_providers
+        - cohort_capacity
+        - validator_summary_at
+        - incentive_at
+        - precision_at_200
+        - stale
+      properties:
+        id:
+          description: Opaque; the `snapshot` query parameter of `GET /sn/top` reads from it.
+          type: string
+        tempo_index:
+          description: The SN25 tempo the snapshot folds in.
+          type: integer
+          format: int64
+        block:
+          description: The chain block the snapshot was computed at.
+          type: integer
+          format: int64
+        computed_at:
+          type: string
+          format: date-time
+        settlement_epoch:
+          description: The settlement epoch whose pinned prefix hashes the snapshot uses.
+          type: integer
+          format: int64
+        total_ranked:
+          description: Networks ranked in the snapshot.
+          type: integer
+        head_seats:
+          description: Head seats on SN25 (200).
+          type: integer
+        claimed_fleets:
+          description: Fleets bound on SN25.
+          type: integer
+        open_seats:
+          description: Head seats that claimed fleets leave open.
+          type: integer
+        projected_cutoff:
+          description: |
+            The projected score of the 200th unit (network or claimed fleet):
+            the line every `margin` and `label` is measured against.
+          type: number
+          format: double
+        claimed_cutoff:
+          description: The current floor among claimed fleets; null when no fleet has claimed.
+          type: [number, "null"]
+          format: double
+        binding_open:
+          description: |
+            Fleet binding is open on mainnet. While it is closed no fleet can
+            claim a head seat, and the apps say that claiming isn't open yet.
+          type: boolean
+        binding_note:
+          description: |
+            The state of fleet binding in English, such as "Top 200 binding
+            isn't open on mainnet yet".
+          type: string
+        measured_providers:
+          description: Providers in the validator's verify cohort, the ones it can measure.
+          type: integer
+        cohort_capacity:
+          description: How many providers the verify cohort holds.
+          type: integer
+        validator_summary_at:
+          description: When the validator's latest signed head summary arrived; null without one.
+          type: [string, "null"]
+          format: date-time
+        incentive_at:
+          description: When on-chain incentive was last read; null before the first read.
+          type: [string, "null"]
+          format: date-time
+        precision_at_200:
+          description: |
+            The measured precision of the projected top 200 against the
+            validator's selection, from 0 to 1; null until fleets bind. The
+            `likely` label switches on at 0.9.
+          type: [number, "null"]
+          format: double
+        stale:
+          description: The snapshot was computed more than 3 tempos ago.
+          type: boolean
+
+    SnTopRow:
+      type: object
+      description: |
+        One network on the Protocol leaderboard, scored as one hypothetical
+        fleet of its verify-eligible providers. No row carries a network id.
+      required:
+        - position
+        - name
+        - tag
+        - projected_score
+        - raw_last_tempo
+        - margin
+        - trend
+        - prefixes
+        - shared_prefixes
+        - presence
+        - label
+        - measurable
+        - verify_eligible
+        - claim_prompt
+        - is_me
+        - fleets
+      properties:
+        position:
+          description: The 1-based position in the snapshot's total order.
+          type: integer
+          minimum: 1
+        name:
+          description: |
+            The network name, set in `rows` only when the network turned on
+            its "show my network name" switch
+            (/network/points-ranking-visibility); "" when the row is
+            anonymous.
+          type: string
+        tag:
+          description: The network's emoji tag; "" when unset.
+          type: string
+        projected_score:
+          description: The projected head score, smoothed with the validator's EMA.
+          type: number
+          format: double
+        raw_last_tempo:
+          description: The projected raw score of the last tempo, before smoothing.
+          type: number
+          format: double
+        margin:
+          description: |
+            The `projected_score` relative to the snapshot's
+            `projected_cutoff`, as a fraction of the cutoff: positive above
+            the Top 200 line, negative below it.
+          type: number
+          format: double
+        trend:
+          description: Positions moved since the previous tempo's snapshot; positive is up.
+          type: integer
+        prefixes:
+          description: Distinct /29 (IPv4) or /48 (IPv6) egress prefixes the network's providers provide from.
+          type: integer
+        shared_prefixes:
+          description: How many of those prefixes another network or claimed fleet also provides from.
+          type: integer
+        presence:
+          description: How present the network's providers were over the last tempo, from 0 to 1.
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        label:
+          description: |
+            The recommendation. `not_measurable` when the validator cannot
+            measure the network (`measurable` is false). Otherwise `estimate`
+            until the snapshot's `precision_at_200` reaches 0.9, and after
+            that `likely` (a `margin` of +0.20 or more, and measurable in at
+            least 3 of the last 4 tempos), `borderline` (a `margin` within
+            0.20 of the line either way) or `unlikely` (a `margin` of -0.20
+            or less).
+          type: string
+          enum: [estimate, likely, borderline, unlikely, not_measurable]
+        measurable:
+          description: The validator can measure the network; its providers are in the verify cohort.
+          type: boolean
+        verify_eligible:
+          description: The network has verify-eligible providers.
+          type: boolean
+        claim_prompt:
+          description: |
+            The apps prompt the network to claim a head seat: it is
+            `measurable` and its `position` is 200 or better.
+          type: boolean
+        is_me:
+          description: The row is the caller's own network; false without a bearer token.
+          type: boolean
+        fleets:
+          description: The network's claimed fleets; empty when it has not claimed.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnTopFleet"
+
+    SnTopFleet:
+      type: object
+      description: One fleet a network has claimed, bound on SN25 to a hotkey UID.
+      required:
+        - uid
+        - generation
+        - valid_to_epoch
+        - replica_score
+        - validator_score
+        - validator_rank
+        - validator_rank_of
+        - selected
+        - incentive
+        - incentive_stale
+      properties:
+        uid:
+          description: The fleet's UID on SN25.
+          type: integer
+        generation:
+          description: The binding generation.
+          type: integer
+          format: int64
+        valid_to_epoch:
+          description: The settlement epoch the binding is valid until.
+          type: integer
+          format: int64
+        replica_score:
+          description: The board's replica of the validator's head score for the fleet, from its complete trails.
+          type: number
+          format: double
+        validator_score:
+          description: The validator's own head score for the fleet, from its signed head summary; null without one.
+          type: [number, "null"]
+          format: double
+        validator_rank:
+          description: The fleet's 1-based rank among the fleets the validator ranked; null without a head summary.
+          type: [integer, "null"]
+        validator_rank_of:
+          description: How many fleets the validator ranked; null without a head summary.
+          type: [integer, "null"]
+        selected:
+          description: The validator selected the fleet into the Top 200; null without a head summary.
+          type: [boolean, "null"]
+        incentive:
+          description: The UID's on-chain `Incentive`; null before it is first read.
+          type: [number, "null"]
+          format: double
+        incentive_stale:
+          description: |
+            `incentive` is stale: the validator's weights on chain are its
+            fallback row, or they are outside the activity cutoff.
+          type: boolean
+
+    SnTopMeResult:
+      type: object
+      description: The caller's detail on the Protocol leaderboard (`GET /sn/top/me`).
+      required:
+        - snapshot
+        - me
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/SnTopSnapshot"
+        me:
+          $ref: "#/components/schemas/SnTopMe"
+
+    SnTopMe:
+      type: object
+      description: The caller network's standing on the Protocol leaderboard, with what is behind it.
+      required:
+        - row
+        - solo_score
+        - distinct_prefixes
+        - shared_prefixes
+        - shared_with_units
+        - not_measurable_reason
+        - history
+      properties:
+        row:
+          $ref: "#/components/schemas/SnTopRow"
+        solo_score:
+          description: |
+            The score the network would have if it claimed alone today, with
+            no other network or fleet on its prefixes claiming.
+          type: number
+          format: double
+        distinct_prefixes:
+          description: Distinct /29 (IPv4) or /48 (IPv6) egress prefixes the network's providers provide from.
+          type: integer
+        shared_prefixes:
+          description: How many of those prefixes another network or claimed fleet also provides from.
+          type: integer
+        shared_with_units:
+          description: How many other networks and claimed fleets share the network's prefixes.
+          type: integer
+        not_measurable_reason:
+          description: |
+            Why the validator cannot measure the network; "" when it can.
+            `not_in_cohort`: its providers aren't in the verify cohort.
+            `shared_egress`: its providers share an egress address with
+            another network. `not_providing`: none of its devices provides.
+          type: string
+          enum: ["", not_in_cohort, shared_egress, not_providing]
+        history:
+          description: The network's projected rank and score for each day, at most 90 days.
+          type: array
+          maxItems: 90
+          items:
+            $ref: "#/components/schemas/SnTopHistoryPoint"
+
+    SnTopHistoryPoint:
+      type: object
+      description: The network's projected rank and score on one day.
+      required:
+        - day
+        - rank
+        - score
+      properties:
+        day:
+          description: The day, YYYY-MM-DD.
+          type: string
+          format: date
+        rank:
+          type: integer
+        score:
+          type: number
+          format: double
 
     SnPoolClaimResult:
       type: object
