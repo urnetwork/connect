@@ -6365,3 +6365,29 @@ All eight arms passed: 800 HTML pages, 3,200 assets, and 792 overlap proofs, wit
 This qualifies this current workload execution, not a statistical baseline, a complete historical-stall explanation, full correctness/PERF, or physical 32 MiB iOS-profile / 64 MiB Android qualification. `baselineEligible=false`, admission-chain coverage remains unexercised, and physical pause attribution remains unknown.
 
 Evidence: `/private/tmp/urnetwork-c38-original8-metadata.vy2_wvjd/FINAL-CUSTODY.json`, SHA-256 `b5f0a1d1e0147e09ab6ab6129a819b6bc8a897413c38d3abaef5d6100010f680`.
+
+
+### 2026-10-29: C40 eight-arm browsing replay and native build prerequisite
+
+Connect `a6d16288`, Server `1355bc7d`, SDK `fa7ffc7a`, and Tests `b5f82774` completed the same eight-arm synthetic browsing matrix. Outer transport remained H1; no production overlay, tracing override, retry, or threshold change was used. Each arm retained 100 HTML pages, 400 validated-or-canceled assets, 99 overlapping navigations, four live pages, and the original five-second first-byte gate.
+
+| Link | Inner protocol | Mode | Maximum first byte (s) | Median (s) | p95 (s) |
+|---|---|---|---:|---:|---:|
+| cell-edge-5m-down-1m-up | h2 | normal | 2.401 | 0.623 | 1.727 |
+| cell-edge-5m-down-1m-up | http/1.1 | normal | 2.744 | 1.424 | 2.178 |
+| cell-edge-5m-down-1m-up | http/1.1 | race | 4.855 | 1.721 | 3.413 |
+| cell-edge-5m-down-1m-up | h2 | race | 3.070 | 0.865 | 2.340 |
+| wifi-good | http/1.1 | normal | 0.215 | 0.080 | 0.111 |
+| wifi-good | h2 | normal | 0.202 | 0.028 | 0.097 |
+| wifi-good | http/1.1 | race | 0.225 | 0.100 | 0.167 |
+| wifi-good | h2 | race | 0.273 | 0.048 | 0.118 |
+
+All eight commands passed: 800 HTML pages, 3,200 assets, 792 overlap proofs, zero navigation stalls, and no race warnings. Every checked post-join managed-budget total was zero. This is managed ownership accounting, not process RSS, natural Go-runtime steady memory, or an iOS extension footprint.
+
+The cell H1 race maximum was 4.855 s. Its slowest navigation spent about 3.171 s connecting and 0.909 s in TLS; the remaining reply interval was about 0.776 s. These phase observations do not identify a retransmitted packet, establish the historical stall cause, or justify changing timers. A single replay does not establish statistical improvement over C38 or update a performance baseline. Admission-chain coverage remained unexercised; the separate retained-SYN causal control is still pending.
+
+The fresh four-APK build attempt failed before APK compilation or installation: the offline Go cache lacked dependencies for the host `warpctl` build (`GOPROXY=off`). Its eight reported missing module versions have pinned checksum pairs available to the bounded cache-acquisition repair. No APK build was attested and no device session ran. This is a build prerequisite failure, not a 32 MiB iOS-surrogate or 64 MiB Android memory result.
+
+Full unfiltered six-repository correctness, synthetic PERFVAR and server benchmarks, repeated memory comparisons, and all 112 scoped hosted-H1 device sessions remain outstanding. The iOS profile is measured on the two allowlisted Android devices; it cannot qualify physical iOS total footprint.
+
+Evidence: `/private/tmp/urnetwork-c40-root-original8-results.json`, SHA-256 `a3d027502f4e55be6985409dff3fd27edfe85bc6c9732c32d770cfef128dd6d6`; native `physical-build-only-result.json`, SHA-256 `64aad731049b59cedb2d1e48bf53d14fe870fde35e697f7041c351210c099868`, under `physical-c38-build-cache.PREP.nvwey6qp/native4-full112-c40-6taq995o/native-build/perf/scoped-h1`. Both runs completed cleanup with all owners joined, source unchanged, and cache leases released. Browsing outer-final SHA-256: `55fc04f901a63dc4f0c49ccaab80864dcb069b3da75e9067bd0ddabc59b8d81e`; failed native outer-final SHA-256: `45511c537d62ff432b2992fcc7c82239a0ea71285b280bfda1d7a80bcec7f0a3`.
