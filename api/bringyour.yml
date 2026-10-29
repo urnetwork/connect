@@ -48,12 +48,12 @@ info:
     Operations marked `x-internal: true` are not part of the public API:
     the server-to-server webhooks (payment processors, app stores and the
     email provider), the operator's provider probe control plane, the admin
-    reports, the operator's own evidence publishing, the provider work
-    intake (the signed originals the SDK and the independent work
-    authorities post), the acceptance-test routes and the extender
-    directory calls the SDK makes on its own. They stay in this document so
-    the server's route and conformance checks cover them; the public API
-    reference leaves them out.
+    reports, the operator's own evidence publishing, the validator's head
+    summary upload, the provider work intake (the signed originals the SDK
+    and the independent work authorities post), the acceptance-test routes
+    and the extender directory calls the SDK makes on its own. They stay in
+    this document so the server's route and conformance checks cover them;
+    the public API reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -7122,6 +7122,56 @@ paths:
                 $ref: "#/components/schemas/SnHeadBindingResult"
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/head-summary:
+    post:
+      x-status: planned
+      x-internal: true
+      tags: [Other]
+      summary: Upload the validator's signed head summary
+      description: |
+        Planned operation; the server does not currently expose this route.
+
+        The validator uploads its signed head result for one native tempo
+        (sn docs/spec/head-summary-v1.md; server LEADERTOP.md §6.1): every
+        eligible head UID in rank order with its exact score, its fleet
+        identities and whether it was selected, and no private inputs. The
+        Protocol leaderboard shows it as the validator's own ranking of
+        claimed fleets (`validator_score`, `validator_rank`,
+        `validator_rank_of` and `selected` in `GET /sn/top`).
+
+        The bearer is the validator's API session, the client JWT it uploads
+        attempt artifacts with. The session authorizes nothing by itself: the
+        summary's authority is the validator hotkey's sr25519 signature over
+        its canonical encoding, and the body must be exactly that encoding,
+        at most 16 MiB. One summary is kept
+        per netuid, validator hotkey and native epoch: a summary with a later
+        `native_snapshot_block` replaces it, and any other is answered 204
+        and leaves it in place.
+      operationId: snUploadHeadSummary
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHeadSummary"
+      responses:
+        "204":
+          description: Stored, or a summary at least as recent is already stored.
+        "400":
+          description: The body is malformed, not canonical, inconsistent or wrongly signed, or its `schema` is unknown.
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The signature verifies, but the operator does not accept `validator_hotkey` as a validator of `netuid`.
+        "413":
+          description: The body is over 16 MiB.
+        "429":
+          description: Rate limited; `Retry-After` may be set.
+        "5XX":
+          description: A transient operator failure; the validator retries.
 
   /sn/top:
     get:
@@ -16814,6 +16864,212 @@ components:
           properties:
             message:
               type: string
+
+    SnHeadSummary:
+      type: object
+      description: |
+        The validator's signed head result for one native tempo, version 1
+        (sn docs/spec/head-summary-v1.md). The members appear in exactly this
+        order with no insignificant whitespace, and the body must equal that
+        canonical encoding byte for byte. Integers are exact to 64 bits; a
+        consumer outside Go parses them as 64-bit integers.
+
+        `signing_hash` is `sha256:` and the hex of SHA-256 over the domain
+        "urnetwork/validator/head-summary/v1", a zero byte and the canonical
+        encoding with `signing_hash` and `signature` set to "". `signature`
+        is the validator hotkey's sr25519 signature over that digest, in the
+        Substrate signing context `substrate`.
+      additionalProperties: false
+      required:
+        - schema
+        - netuid
+        - native_epoch
+        - native_snapshot_block
+        - native_snapshot_hash
+        - evm_snapshot_block
+        - evm_snapshot_hash
+        - settlement_epoch
+        - policy_id
+        - policy_hash
+        - measurement_artifact_hash
+        - validator_hotkey
+        - validator_uid
+        - maximum_head_fleets
+        - entries
+        - selected_uids
+        - rejected_uids
+        - signed_at
+        - signature_scheme
+        - signing_hash
+        - signature
+      properties:
+        schema:
+          type: string
+          const: urnetwork-validator-head-summary-v1
+        netuid:
+          description: The subnet (25 on mainnet).
+          type: integer
+          minimum: 1
+          maximum: 65535
+        native_epoch:
+          description: |
+            The tempo index: the subnet's epoch index at
+            `native_snapshot_block`, the steering intent's `subnet_epoch`.
+          type: integer
+          minimum: 0
+        native_snapshot_block:
+          description: The finalized native block the decision was taken at.
+          type: integer
+          minimum: 1
+        native_snapshot_hash:
+          description: That block's hash.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        evm_snapshot_block:
+          description: The finalized EVM block whose coordinator binding census was read.
+          type: integer
+          minimum: 1
+        evm_snapshot_hash:
+          description: That block's hash.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        settlement_epoch:
+          description: The coordinator settlement epoch at `evm_snapshot_block`.
+          type: integer
+          minimum: 0
+        policy_id:
+          description: The signed policy's id.
+          type: integer
+          minimum: 1
+        policy_hash:
+          description: The signed policy's hash, as the coordinator pins it.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        measurement_artifact_hash:
+          description: The content address of the validator's private measurement artifact for this intent; it reveals nothing.
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        validator_hotkey:
+          description: The validator's sr25519 public key, nonzero.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        validator_uid:
+          description: The validator's UID on `netuid`.
+          type: integer
+          minimum: 0
+          maximum: 65535
+        maximum_head_fleets:
+          description: The policy's head size (200 on mainnet).
+          type: integer
+          minimum: 1
+          maximum: 65535
+        entries:
+          description: |
+            Every eligible head UID in rank order: score descending, then UID
+            ascending, with ranks 1 to n. Empty when the head is empty.
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/SnHeadSummaryEntry"
+        selected_uids:
+          description: The UIDs of the selected entries, in rank order.
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 65535
+        rejected_uids:
+          description: The UIDs of the other entries, in rank order.
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 65535
+        signed_at:
+          description: The UTC signing time, RFC 3339 with up to nine fraction digits and no trailing fraction zeros, ending in Z.
+          type: string
+          format: date-time
+        signature_scheme:
+          type: string
+          const: sr25519
+        signing_hash:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        signature:
+          description: The 64-byte sr25519 signature.
+          type: string
+          pattern: "^0x[0-9a-f]{128}$"
+
+    SnHeadSummaryEntry:
+      type: object
+      description: One eligible head UID of a head summary.
+      additionalProperties: false
+      required:
+        - rank
+        - uid
+        - hotkey
+        - score
+        - selected
+        - fleets
+      properties:
+        rank:
+          description: The 1-based position among the eligible entries.
+          type: integer
+          minimum: 1
+        uid:
+          description: The head UID.
+          type: integer
+          minimum: 0
+          maximum: 65535
+        hotkey:
+          description: The hotkey holding `uid` at `evm_snapshot_block`, nonzero.
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        score:
+          $ref: "#/components/schemas/SnHeadSummaryRational"
+        selected:
+          description: Exactly when `rank` is at most `maximum_head_fleets`.
+          type: boolean
+        fleets:
+          description: |
+            The live fleet identities that make up `score`, ordered by
+            `fleet_id` bytes and then `generation`, with no duplicates.
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/SnHeadSummaryFleet"
+
+    SnHeadSummaryFleet:
+      type: object
+      description: One fleet identity of a head UID, with the entry's `uid` and `hotkey`.
+      additionalProperties: false
+      required:
+        - fleet_id
+        - generation
+      properties:
+        fleet_id:
+          type: string
+          pattern: "^0x[0-9a-f]{64}$"
+        generation:
+          type: integer
+          minimum: 1
+
+    SnHeadSummaryRational:
+      type: object
+      description: |
+        An exact head score in its unique reduced form: the greatest common
+        divisor of the two is 1, and the denominator is at least 1.
+      additionalProperties: false
+      required:
+        - numerator
+        - denominator
+      properties:
+        numerator:
+          type: string
+          pattern: "^(0|[1-9][0-9]*)$"
+        denominator:
+          type: string
+          pattern: "^[1-9][0-9]*$"
 
     SnTopResult:
       type: object
