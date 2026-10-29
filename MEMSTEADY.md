@@ -6318,3 +6318,28 @@ Source inspection distinguishes inner custom TCP, outer gVisor TCP and Transfer 
 Full unfiltered correctness, corrected public-SDK OLD/NEW tests, full synthetic PERF/server benchmarks, focused repeated memory-performance comparisons, and four fresh native builds plus all 112 scoped hosted-H1 device sessions remain pending. No Android result can qualify a physical iOS extension's total footprint.
 
 Evidence: focused normal/race raw hashes `8a66466279ec6cd468236c612bb05422e2e4311d3aa371de66f27c39aceff635` / `be28c99bf940bd3da38bfc15d00ffeabf4394a351954da4c9470dfefb4bbb6e6`; host memory comparison [receipt](/private/tmp/urnetwork-c35-host-memory-comparison.gyilpemo/COMPARISON.json); original H1 failures `2784510d68c3ec304f22972d5c1edb31ed2d2d491e14e93a39faebfbbd12b800` / `0df2b2c049db338e4894f7e66cdfd7ce166a1fed881e78a0541f6efb07863a00`; finite race [analysis](/private/tmp/urnetwork-c35-finite-race-pair-analysis.PREP.tg_ejyl1/PACKET.json). The previous forced-GC/physical observations above retain their original scope and limitations.
+
+
+### 2026-10-29 checkpoint: bounded-read overflow repair
+
+Fixed signed-overflow handling in pooled message reads, HTTP response-body
+limits, Extender request-body limits, and transport-delay WebSocket wire caps.
+Adding one lookahead byte to MaxInt64 previously wrapped negative and could
+return an empty successful read. Adding the framing header could also wrap a
+positive WebSocket cap negative, which Gorilla interprets as unlimited. The
+repair saturates arithmetic; ordinary finite limits and ownership remain intact.
+
+The primary focused comparison reproduced two old-code failures in both normal
+and race modes; the repair passed 32 root tests in each mode. The adjacent
+comparison reproduced one Connect and one Extender failure in each mode; the
+combined repair passed 33 Connect and 7 Extender root tests in each mode
+(80 root passes, no skips or race warnings). Both runs completed with all
+processes joined, source unchanged, and the test cache released.
+
+These are correctness results, not a measured throughput or memory improvement.
+They do not establish the cause of the historical 100-page stalls. The original
+eight browsing arms and five-second first-byte gate, full six-repository
+correctness, synthetic PERFVAR, focused memory benchmarks, and fresh hosted-H1
+device qualification for the 32 MiB iOS surrogate and 64 MiB Android profile
+remain outstanding. A private near-stall diagnostic is prepared but unrun; its
+4.5-second capture trigger leaves the five-second workload failure gate intact.

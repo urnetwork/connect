@@ -156,7 +156,8 @@ type transportDelayWebSocketConn struct {
 // WebSocket message, so the wrapped conn's limit counts it too.
 func (self *transportDelayWebSocketConn) SetReadLimit(limit int64) {
 	if 0 < limit {
-		limit += transportDelayHeaderByteCount
+		// Gorilla treats a negative limit as unlimited; saturate the wire cap.
+		limit += min(int64(transportDelayHeaderByteCount), math64MaxInt-limit)
 	}
 	self.H1MessageConn.SetReadLimit(limit)
 }

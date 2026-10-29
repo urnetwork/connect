@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	mathrand "math/rand"
 	"net"
 	"net/http"
@@ -1265,7 +1266,12 @@ func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, erro
 		)
 	}
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	// Keep the lookahead bounded when the largest signed limit has no successor.
+	readLimit := maxBytes
+	if readLimit < math.MaxInt64 {
+		readLimit += 1
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, readLimit))
 	if err != nil {
 		return nil, err
 	}

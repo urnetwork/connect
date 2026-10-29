@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -318,7 +319,12 @@ func (self *extenderProxy) readRequestBody(req *http.Request) (io.Reader, error)
 	}
 	var reader io.Reader = req.Body
 	if 0 < maxByteCount {
-		reader = io.LimitReader(req.Body, maxByteCount+1)
+		// Keep the lookahead bounded at the largest signed request limit.
+		readLimit := maxByteCount
+		if readLimit < math.MaxInt64 {
+			readLimit += 1
+		}
+		reader = io.LimitReader(req.Body, readLimit)
 	}
 	bodyBytes, err := io.ReadAll(reader)
 	if err != nil {

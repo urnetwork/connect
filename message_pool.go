@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"io"
+	"math"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -1088,7 +1089,12 @@ func MessagePoolReadAllLimit(r io.Reader, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("invalid message byte limit %d", maxBytes)
 	}
 
-	message, err := MessagePoolReadAll(io.LimitReader(r, maxBytes+1))
+	// Keep the lookahead bounded when the largest signed limit has no successor.
+	readLimit := maxBytes
+	if readLimit < math.MaxInt64 {
+		readLimit += 1
+	}
+	message, err := MessagePoolReadAll(io.LimitReader(r, readLimit))
 	if err != nil {
 		return nil, err
 	}
