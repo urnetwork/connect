@@ -229,6 +229,21 @@ type DialContextSettings struct {
 	PacketConnFactory func(context.Context) (net.PacketConn, error)
 }
 
+type platformTransportDialKey struct{}
+
+// Marks the dials of a platform transport. A transport runs its own heartbeat,
+// pings against its read deadline, so its sockets leave TCP keepalive off.
+// Other dials keep it: a pooled API connection has nothing else to notice that
+// it died while idle.
+func withPlatformTransportDial(ctx context.Context) context.Context {
+	return context.WithValue(ctx, platformTransportDialKey{}, true)
+}
+
+func isPlatformTransportDial(ctx context.Context) bool {
+	marked, _ := ctx.Value(platformTransportDialKey{}).(bool)
+	return marked
+}
+
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
 	network, networkErr := controlDialNetwork(network, addr)
 	if networkErr != nil {
@@ -269,6 +284,11 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 		conn, err = moveOverride.dialTargets(ctx, network, addr, dialContext)
 	} else {
 		conn, err = dialContext(ctx, network, addr)
+	}
+	if err == nil && isPlatformTransportDial(ctx) {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(false)
+		}
 	}
 	if log := loggerOrDefault(self.Log).V(2); log.Enabled() {
 		if err == nil {
