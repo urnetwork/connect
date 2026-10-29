@@ -1794,16 +1794,22 @@ paths:
         it in the directory (connect/EXTENDER.md C2).
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
-        attributed to a network and a client, and is rate limited per user
-        (6 per hour). Call it on the family api host of the family being
-        activated -- `api-v4.bringyour.com` for an IPv4 address,
-        `api-v6.bringyour.com` for an IPv6 one -- so the caller address the
-        operator probes back has exactly one family. An operator without
-        family hosts (a development operator on an ip literal, say) is
-        activated through its plain api url instead, and the family of the
-        outcome is the one the result reports. NEVER call it through an
-        extender: the address that is probed and published is the address this
-        request arrived from.
+        attributed to a network and a client. It is rate limited per address
+        family: 6 per hour per client and 60 per hour per account, for IPv4
+        and for IPv6 each. A budget is spent only when the operator is about
+        to probe, so a request refused before the probe (malformed arguments,
+        the wrong family, a spent budget) costs nothing, and a refusal by a
+        spent budget says how long until it has room again. Call it on the
+        family api host of the family being activated --
+        `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
+        an IPv6 one -- so the caller address the operator probes back has
+        exactly one family. An activation posted to one family's host that
+        arrives over the other family is refused before it is probed. An
+        operator without family hosts (a development operator on an ip
+        literal, say) is activated through its plain api url instead, and the
+        family of the outcome is the one the result reports. NEVER call it
+        through an extender: the address that is probed and published is the
+        address this request arrived from.
 
         Nothing is taken on the caller's word. Inside the request, and within
         a 10 second budget, the operator dials BACK to the caller's own

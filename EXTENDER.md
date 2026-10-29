@@ -585,7 +585,10 @@ family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
 `{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
-limit 6 per hour per client. The handler probes the caller ip synchronously
+limit 6 per hour per client and 60 per hour per account, each per address
+family, so one family's failures never spend the other's (2026-10-28). An
+activation posted to `api-v4` or `api-v6` that arrives on the other family
+is refused before it is probed. The handler probes the caller ip synchronously
 within 10 s: for each requested carrier, `connect.ProbeExtenderCarrier`
 dials that carrier with a random spoof name, sends a header with a
 challenge and verifies the response signature against `public_key_hex`;
@@ -601,8 +604,12 @@ geolocation of the caller. A probe failure returns `activated: false` with
 the failing carrier in `error` and stores nothing. Acceptance requires
 public tcp 443 or peer-to-peer webrtc, each of which proves the forward
 (C2a). Zero ports and an empty tld
-take the C1 defaults. The configuration check precedes the rate limit so
-an unconfigured operator never spends a caller's budget. A failed
+take the C1 defaults. The budgets are spent at the probe: every check that
+refuses without dialing the caller (the arguments, the caller and its
+family, the configuration) precedes them, so a malformed request or an
+unconfigured operator never spends a caller's budget, and the client's and
+the account's budgets are spent together or not at all. Every activation
+that dials the caller is counted, whatever its probe finds. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
 name the api host on port 443 as their destination.
