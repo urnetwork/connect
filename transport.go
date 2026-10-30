@@ -560,7 +560,16 @@ type PlatformTransportSettings struct {
 	// began: 10-15s with the defaults. One half by default. Non-positive
 	// re-arms exactly WriteTimeout before every write.
 	WriteDeadlineSlackFraction float64
-	TransportGenerator         func() (sendTransport Transport, receiveTransport Transport)
+	// PingJitter spreads the pings of the many transports one host runs. Each
+	// transport draws one offset below it at construction and pings that far
+	// past the wall-clock ping boundaries, so its ping cadence is unchanged.
+	// Zero, the default, keeps every ping on the wall-clock boundary, which
+	// lets a phone's pings share radio wakeups with its other aligned timers;
+	// on a host that alignment only makes bursts. A host that runs many
+	// transports, such as the proxy, sets it to PingTimeout to spread its
+	// pings evenly. Non-positive aligns.
+	PingJitter         time.Duration
+	TransportGenerator func() (sendTransport Transport, receiveTransport Transport)
 	// SendRouteObserver borrows route identity for deterministic topology
 	// observation. It must not block or send directly: writes use the route
 	// selector so carrier admission cannot be bypassed. Nil is the default.
@@ -1231,6 +1240,9 @@ type PlatformTransport struct {
 	// the live connections that reach the platform through a relay -- an
 	// extender or a VLESS server -- which a move cannot redirect
 	relayedConnectionCount atomic.Int64
+	// how far past the wall-clock ping boundaries this transport pings, drawn
+	// from PingJitter at construction. Immutable.
+	pingOffset time.Duration
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1262,8 +1274,13 @@ func newPlatformQuicConfig(
 		MaxIdleTimeout: settings.PingTimeout * 4,
 		// QUIC owns hybrid-carrier liveness. Its keepalive loop is independent
 		// of the application writer, which can legitimately wait behind
-		// quic-go's bounded DATAGRAM queue on a constrained uplink.
-		KeepAlivePeriod:   settings.PingTimeout,
+		// quic-go's bounded DATAGRAM queue on a constrained uplink. It sends a
+		// PING once the peer has been quiet this long, at most half the idle
+		// timeout in quic-go. Twice the ping interval leaves an idle
+		// connection's liveness to the application ping, one ack-eliciting
+		// packet per ping where a QUIC PING went between each two, and still
+		// finds a dead peer within this plus the idle timeout: 30s by default.
+		KeepAlivePeriod:   settings.PingTimeout * 2,
 		Allow0RTT:         !settings.h3RetainedByteAccounting,
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
@@ -1764,6 +1781,7 @@ func NewPlatformTransportWithTargetMode(
 		kickMonitor:          NewMonitor(),
 		extenderIpCounts:     map[netip.Addr]int{},
 		extenderIpsMonitor:   settings.ExtenderIpsMonitor,
+		pingOffset:           wakeupOffset(settings.PingJitter),
 	}
 	if transport.extenderIpsMonitor == nil {
 		transport.extenderIpsMonitor = NewMonitorValue[uint64](0)
@@ -2969,7 +2987,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				pinger := newPingPacer(
 					self.settings.PingTimeout,
 					self.settings.PingTimeout,
-					0,
+					self.pingOffset,
 					time.Now(),
 					self.settings.pingTimerArmForTest,
 				)
@@ -4265,7 +4283,7 @@ func (self *PlatformTransport) runH3(
 				pinger := newPingPacer(
 					self.settings.PingTimeout,
 					self.settings.PingTimeout,
-					0,
+					self.pingOffset,
 					time.Now(),
 					self.settings.pingTimerArmForTest,
 				)

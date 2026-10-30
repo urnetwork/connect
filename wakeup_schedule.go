@@ -1,6 +1,7 @@
 package connect
 
 import (
+	mathrand "math/rand/v2"
 	"time"
 )
 
@@ -44,6 +45,15 @@ func wakeupTimeWithOffset(t time.Time, epoch time.Duration, offset time.Duration
 		return t
 	}
 	return t.Add(epoch - r)
+}
+
+// Draws one owner's offset on the wakeup schedule, uniform in [0, jitter).
+// Non-positive jitter is the wall-clock schedule, offset zero.
+func wakeupOffset(jitter time.Duration) time.Duration {
+	if jitter <= 0 {
+		return 0
+	}
+	return time.Duration(mathrand.Int64N(int64(jitter)))
 }
 
 // pingPacer paces one writer's keepalive pings from its last write. A ping is

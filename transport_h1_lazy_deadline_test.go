@@ -6,6 +6,7 @@
 package connect
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -322,5 +323,70 @@ func TestLazyDeadlineRearmsOnlyWithLessThanTimeoutLeft(t *testing.T) {
 		expect(now, true, now.Add(timeout))
 		expect(now, true, now.Add(timeout))
 		expect(now.Add(time.Second), true, now.Add(time.Second+timeout))
+	}
+}
+
+// With PingJitter a transport pings its own offset past the wall-clock ping
+// boundaries, at the same cadence. The offset is drawn below the jitter.
+func TestH1PingJitterOffsetsThePingBoundary(t *testing.T) {
+	resetH1UpgradeTestState(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newH1LivenessFixture(t, func(settings *PlatformTransportSettings) {
+			// the reader's deadline stays out of the way
+			settings.ReadTimeout = time.Minute
+			settings.PingJitter = settings.PingTimeout
+		})
+		pingTimeout := fixture.transport.settings.PingTimeout
+		offset := fixture.transport.pingOffset
+		if offset < 0 || pingTimeout <= offset {
+			t.Fatalf("ping offset %s is not below the %s jitter", offset, pingTimeout)
+		}
+		fixture.sendMessage(t, h1PlusOwnedTestMessage(0x31, 64))
+		synctest.Wait()
+		lastWrite := time.Now()
+		var wantPings []time.Time
+		wantPing := wakeupTimeWithOffset(lastWrite.Add(pingTimeout), pingTimeout, offset)
+		for range 3 {
+			wantPings = append(wantPings, wantPing)
+			time.Sleep(time.Until(wantPing) - time.Nanosecond)
+			synctest.Wait()
+			if heartbeatCount := len(fixture.heartbeatTimesSnapshot()); heartbeatCount != len(wantPings)-1 {
+				t.Fatalf("%d pings before %s, want %d", heartbeatCount, wantPing, len(wantPings)-1)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			// pings complete in no time here, so the next lands one ping
+			// interval later
+			wantPing = wakeupTimeWithOffset(wantPing.Add(pingTimeout), pingTimeout, offset)
+		}
+		heartbeatTimes := fixture.heartbeatTimesSnapshot()
+		for i := range wantPings {
+			if len(heartbeatTimes) != len(wantPings) || !heartbeatTimes[i].Equal(wantPings[i]) {
+				t.Fatalf("pings at %v, want %v", heartbeatTimes, wantPings)
+			}
+		}
+		fixture.assertConnected(t)
+	})
+}
+
+// Phones keep the wall-clock alignment: the default draws no offset.
+func TestPlatformTransportDefaultPingsOnTheWallClockBoundary(t *testing.T) {
+	settings := DefaultPlatformTransportSettings()
+	if settings.PingJitter != 0 {
+		t.Fatalf("default ping jitter=%s, want none", settings.PingJitter)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	transport := NewPlatformTransportWithTargetMode(ctx, NewClientStrategyWithDefaults(ctx), NewRouteManager(ctx, "default-ping-offset"),
+		"ws://ping-offset.example/endpoint", &ClientAuth{ByJwt: "synthetic-test-token", InstanceId: NewId()},
+		TransportModeH1, settings)
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if err := transport.CloseAndWait(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	if transport.pingOffset != 0 {
+		t.Fatalf("default transport ping offset=%s, want 0", transport.pingOffset)
 	}
 }

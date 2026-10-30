@@ -77,6 +77,28 @@ func TestWakeupTimeWithOffset(t *testing.T) {
 	}
 }
 
+// A non-positive jitter keeps the wall-clock schedule; a positive one draws
+// offsets uniformly below it, so transports land at different instants.
+func TestWakeupOffsetDrawsBelowJitter(t *testing.T) {
+	for _, jitter := range []time.Duration{0, -time.Second} {
+		if offset := wakeupOffset(jitter); offset != 0 {
+			t.Fatalf("jitter %s drew offset %s, want 0", jitter, offset)
+		}
+	}
+	jitter := 5 * time.Second
+	offsets := map[time.Duration]bool{}
+	for range 256 {
+		offset := wakeupOffset(jitter)
+		if offset < 0 || jitter <= offset {
+			t.Fatalf("jitter %s drew offset %s", jitter, offset)
+		}
+		offsets[offset] = true
+	}
+	if len(offsets) < 2 {
+		t.Fatalf("256 draws below %s gave %d distinct offsets", jitter, len(offsets))
+	}
+}
+
 // Feeds one write schedule to a writer that resets its ping timer after every
 // write, as the platform writers did, and to one that paces from its last
 // write. Both ping at the same instants; the paced one arms its timer about
