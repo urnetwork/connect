@@ -7696,6 +7696,7 @@ type RemoteUserNatProvider struct {
 	// direction convention as the contracts: ingress is traffic received from
 	// the tunnel (remote clients' egress), egress is the return into the tunnel
 	packetStatsCounters         *packetStatsCounters
+	packetStatsChange           *packetStatsChange
 	packetStatsCallbacks        *CallbackList[PacketStatsFunction]
 	congestionDrops             providerCongestionDropCounters
 	nextReturnSendObserverToken atomic.Uint64
@@ -7786,6 +7787,9 @@ type RemoteUserNatProvider struct {
 	// returnSendNowForTest replaces the clock used to evaluate a source's
 	// acknowledgement silence against ReturnSendAbandonTimeout.
 	returnSendNowForTest func() time.Time
+	// Observes each wake of the packet stats epoch worker. Set before the
+	// first stats callback starts it; nil in production.
+	packetStatsWakeForTest func()
 }
 
 func NewRemoteUserNatProviderWithDefaults(
@@ -7883,6 +7887,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		securityPolicyGeneration: SecurityPolicyGeneration(securityPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
+		packetStatsChange:        newPacketStatsChange(),
 		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
 		sourceProvideMode:        map[Id]protocol.ProvideMode{},
 		sourceDiagnostics:        map[Id]*providerSourceDiagnostics{},
@@ -8807,6 +8812,9 @@ func (self *RemoteUserNatProvider) addAdmittedPacketStatsCallbackWithLock(callba
 		self.packetStatsSubscriptions = map[int]*providerStatsSubscription{}
 	}
 	self.packetStatsSubscriptions[id] = subscription
+	// the next epoch reports the counts as they stand, if they changed since
+	// the last report (the first report always)
+	self.packetStatsChange.raise()
 	return func() {
 		self.stateLock.Lock()
 		if self.packetStatsSubscriptions[id] == subscription {
@@ -8818,19 +8826,31 @@ func (self *RemoteUserNatProvider) addAdmittedPacketStatsCallbackWithLock(callba
 	}
 }
 
-// flushes packet stats events to listeners on the event epoch
+// flushes packet stats events to listeners on the event epoch. One timer
+// serves the worker's life. An epoch with no counted packet parks the worker
+// until the next one raises `packetStatsChange`, and that packet is reported
+// an epoch after it; an unchanged epoch compares the counters in place and
+// allocates nothing.
 func (self *RemoteUserNatProvider) runPacketStats() {
 	var lastPacketStats *PacketStats
+	epochTimer := time.NewTimer(self.settings.EventEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.EventEpoch):
+		case <-epochTimer.C:
+		}
+		if self.packetStatsWakeForTest != nil {
+			self.packetStatsWakeForTest()
 		}
 
-		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
-			packetStats := self.packetStatsCounters.snapshot()
-			if !packetStatsEqual(packetStats, lastPacketStats) {
+		// take the edge before reading the counters, so a packet counted
+		// during this pass raises it for the next one
+		if self.packetStatsChange.take() {
+			if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) &&
+				!self.packetStatsCounters.unchangedSince(lastPacketStats) {
+				packetStats := self.packetStatsCounters.snapshot()
 				lastPacketStats = packetStats
 				for _, callback := range callbacks {
 					HandleError(func() {
@@ -8838,8 +8858,89 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 					})
 				}
 			}
+		} else {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.packetStatsChange.wake:
+			}
 		}
+		epochTimer.Reset(self.settings.EventEpoch)
 	}
+}
+
+// packetStatsChange is the provider's packet stats change edge. Every counted
+// packet raises it, and the stats epoch worker takes it each epoch and parks
+// while it stays down. Raising a raised edge costs one atomic load, so the
+// packet path pays nothing more while traffic moves. It is its own small
+// object so a detached send's write observer can raise it without retaining
+// the provider. Safe for concurrent use; a nil edge ignores raises.
+type packetStatsChange struct {
+	raised atomic.Bool
+	// signaled when the edge rises, so the parked worker resumes
+	wake chan struct{}
+}
+
+func newPacketStatsChange() *packetStatsChange {
+	return &packetStatsChange{wake: make(chan struct{}, 1)}
+}
+
+func (self *packetStatsChange) raise() {
+	if self == nil || self.raised.Load() || !self.raised.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Lowers the edge and reports whether it was raised. A wake from that rise is
+// spent: the pass that takes the edge reads the counters itself.
+func (self *packetStatsChange) take() bool {
+	if !self.raised.Swap(false) {
+		return false
+	}
+	select {
+	case <-self.wake:
+	default:
+	}
+	return true
+}
+
+// A write observer that moves an admitted return's remote egress to the
+// carrier that wrote it, and raises the edge for the move.
+func (self *packetStatsChange) transportWriteObserver(attribution *transportPacketAttribution) func(TransportType) {
+	return func(transportType TransportType) {
+		attribution.observe(transportType)
+		self.raise()
+	}
+}
+
+// Counts packets the provider security policy dropped from the tunnel.
+func (self *RemoteUserNatProvider) countBlockIngress(packetCount int64, byteCount int64) {
+	self.packetStatsCounters.blockIngressPacketCount.Add(packetCount)
+	self.packetStatsCounters.blockIngressByteCount.Add(byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts returns the provider security policy dropped.
+func (self *RemoteUserNatProvider) countBlockEgress(packetCount int64, byteCount int64) {
+	self.packetStatsCounters.blockEgressPacketCount.Add(packetCount)
+	self.packetStatsCounters.blockEgressByteCount.Add(byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts packets from the tunnel handed to the exit NAT.
+func (self *RemoteUserNatProvider) countRemoteIngress(transportType TransportType, packetCount int64, byteCount ByteCount) {
+	self.packetStatsCounters.recordRemoteIngress(transportType, packetCount, byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts a return Transfer admitted, under its carrier once observed.
+func (self *RemoteUserNatProvider) countReturnAdmitted(attribution *transportPacketAttribution) {
+	attribution.admit()
+	self.packetStatsChange.raise()
 }
 
 // recordSourceProvideMode remembers the provide mode to echo on a source's
@@ -9120,7 +9221,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnTransferKey,
 				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
-				observeTransportWrite(transportAttribution.observe),
+				observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 				recoveryOption,
 			)
 			return attemptSent
@@ -9151,7 +9252,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnTransferKey,
 				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
-				observeTransportWrite(transportAttribution.observe),
+				observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 				recoveryOption,
 				sendAckTargetOption{target: ackTarget},
 			)
@@ -9164,7 +9265,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		// Transfer's ACK target now owns this exceptional receipt. Never
 		// leave it on the return item that is immediately reused from a pool.
 		item.terminalReset = nil
-		transportAttribution.admit()
+		self.countReturnAdmitted(transportAttribution)
 	} else {
 		self.congestionDrops.addReturnSend(1, item.packetByteCount)
 	}
@@ -9244,7 +9345,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					returnTransferKey,
 					Ctx(item.sendContext(self.ctx)),
 					sendSchedulingKeyOption{key: item.schedulingKey},
-					observeTransportWrite(transportAttribution.observe),
+					observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 					recoveryOption,
 					sendAckTargetOption{target: ackTarget},
 				)
@@ -9252,7 +9353,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 			},
 		)
 		if sent {
-			transportAttribution.admit()
+			self.countReturnAdmitted(transportAttribution)
 		} else {
 			allSent = false
 			self.congestionDrops.addReturnSend(frameCount, ByteCount(packetBytes))
@@ -9422,8 +9523,7 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 		byteCount += ByteCount(len(fragment))
 	}
 	if r != SecurityPolicyResultAllow {
-		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
-		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.countBlockEgress(int64(len(fragments)), int64(byteCount))
 		self.recordProviderBlock(source.SourceId, false, len(fragments), byteCount)
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return false
@@ -9546,8 +9646,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		for _, packet := range packets {
 			blockedBytes += int64(len(packet))
 		}
-		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(packets)))
-		self.packetStatsCounters.blockEgressByteCount.Add(blockedBytes)
+		self.countBlockEgress(int64(len(packets)), blockedBytes)
 		self.recordProviderBlock(source.SourceId, false, len(packets), ByteCount(blockedBytes))
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
@@ -9749,8 +9848,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		}
 	}
 	if r != SecurityPolicyResultAllow {
-		self.packetStatsCounters.blockEgressPacketCount.Add(1)
-		self.packetStatsCounters.blockEgressByteCount.Add(int64(len(packet)))
+		self.countBlockEgress(1, int64(len(packet)))
 		self.recordProviderBlock(source.SourceId, false, 1, ByteCount(len(packet)))
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
@@ -9931,8 +10029,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 							for _, fragment := range result.fragments {
 								fragmentByteCount += int64(len(fragment))
 							}
-							self.packetStatsCounters.blockIngressPacketCount.Add(int64(len(result.fragments)))
-							self.packetStatsCounters.blockIngressByteCount.Add(fragmentByteCount)
+							self.countBlockIngress(int64(len(result.fragments)), fragmentByteCount)
 							self.recordProviderBlock(
 								source.SourceId,
 								true,
@@ -9962,8 +10059,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 					&ipPath,
 					payload,
 				) == smtpEgressReject {
-					self.packetStatsCounters.blockIngressPacketCount.Add(1)
-					self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+					self.countBlockIngress(1, int64(len(packetBytes)))
 					self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
 					var afterResetRelease func()
 					if diagnosticsAfterReset == nil {
@@ -10036,8 +10132,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 						}
 					default:
 						// drop or incident: blocked by the provider security policy
-						self.packetStatsCounters.blockIngressPacketCount.Add(1)
-						self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+						self.countBlockIngress(1, int64(len(packetBytes)))
 						self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
 						if r == SecurityPolicyResultIncident {
 							self.client.ReportAbuse(source)
@@ -10103,7 +10198,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 				},
 			)
 			if success {
-				self.packetStatsCounters.recordRemoteIngress(
+				self.countRemoteIngress(
 					peer.TransportType,
 					int64(len(packetGroup.packets)),
 					packetGroup.byteCount,
@@ -10123,7 +10218,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 							source, transferKey, provideMode, [][]byte{packet}, 0,
 							func() { self.releaseSourceLifecycle(source.SourceId, sourceLifecycle) },
 						) {
-							self.packetStatsCounters.recordRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))
+							self.countRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))
 							packetGroup.packets[i] = nil
 						}
 					}
