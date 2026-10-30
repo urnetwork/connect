@@ -11928,8 +11928,9 @@ type multiClientWindow struct {
 	// It neither emits provider events nor migrates flows.
 	clientRetireCallback func(client *multiClientChannel)
 	windowType           WindowType
-	// called after the window admits a client, with no lock held; nil in
-	// bare fixtures
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
 	clientAddCallback func(client *multiClientChannel)
 
 	settings *MultiClientSettings
@@ -12154,8 +12155,9 @@ func newMultiClientWindow(
 	// goroutines start so every client it creates subscribes it (DELAY.md
 	// §9); nil in bare fixtures
 	transportDelayStats TransportDelayStatsFunction,
-	// called after the window admits a client, with no lock held; nil in
-	// bare fixtures
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
 	clientAddCallback func(client *multiClientChannel),
 ) *multiClientWindow {
 	window := &multiClientWindow{
