@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,12 +18,31 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Counts the deadlines a flow installs on its in-memory socket.
+type deadlineCountingConn struct {
+	net.Conn
+	readDeadlines  atomic.Int64
+	writeDeadlines atomic.Int64
+}
+
+func (self *deadlineCountingConn) SetReadDeadline(t time.Time) error {
+	self.readDeadlines.Add(1)
+	return self.Conn.SetReadDeadline(t)
+}
+
+func (self *deadlineCountingConn) SetWriteDeadline(t time.Time) error {
+	self.writeDeadlines.Add(1)
+	return self.Conn.SetWriteDeadline(t)
+}
+
 // Runs one provider TCP flow over net.Pipe inside the caller's synctest
 // bubble and records what reaches the source.
 type tcpReapTestFlow struct {
 	t        *testing.T
 	settings *TcpBufferSettings
 	sequence *TcpSequence
+	// the flow's end of the pipe, and the upstream's
+	local    *deadlineCountingConn
 	upstream net.Conn
 	source   TransferPath
 	// the source's next sequence number, and the provider's
@@ -38,7 +58,8 @@ type tcpReapTestFlow struct {
 func newTcpReapTestFlow(t *testing.T, settings *TcpBufferSettings) *tcpReapTestFlow {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	local, upstream := net.Pipe()
+	pipe, upstream := net.Pipe()
+	local := &deadlineCountingConn{Conn: pipe}
 	settings.Log = NewNoopLogger()
 	settings.DialContextSettings = &DialContextSettings{
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
@@ -49,6 +70,7 @@ func newTcpReapTestFlow(t *testing.T, settings *TcpBufferSettings) *tcpReapTestF
 	f := &tcpReapTestFlow{
 		t:         t,
 		settings:  settings,
+		local:     local,
 		upstream:  upstream,
 		source:    SourceId(NewId()),
 		sourceSeq: initialSeq + 1,

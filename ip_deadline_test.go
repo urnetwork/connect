@@ -273,7 +273,7 @@ func (self *ipDeadlineProgressConn) SetWriteDeadline(time.Time) error {
 // The very first failed installation must prevent all upstream payload writes.
 func TestIpDeadlineProgressInitialRejectionWritesNothing(t *testing.T) {
 	conn := &ipDeadlineProgressConn{want: errors.New("synthetic initial bound rejected"), rejectAt: 1}
-	n, err := writeWithProgressDeadline(conn, net.Buffers{make([]byte, 10)}, time.Second)
+	n, err := newIoDeadline(time.Second, conn.SetWriteDeadline).writeWithProgress(conn, net.Buffers{make([]byte, 10)})
 	if !errors.Is(err, conn.want) || n != 0 || conn.writes != 0 {
 		t.Fatalf("initial bound result=%v bytes=%d writes=%d", err, n, conn.writes)
 	}
@@ -282,7 +282,7 @@ func TestIpDeadlineProgressInitialRejectionWritesNothing(t *testing.T) {
 // A failed rearm cannot erase the already accepted prefix or emit more bytes.
 func TestIpDeadlineProgressRearmPreservesExactPrefix(t *testing.T) {
 	conn := &ipDeadlineProgressConn{want: errors.New("synthetic rearm rejected"), rejectAt: 2}
-	n, err := writeWithProgressDeadline(conn, net.Buffers{make([]byte, 10)}, time.Second)
+	n, err := newIoDeadline(time.Second, conn.SetWriteDeadline).writeWithProgress(conn, net.Buffers{make([]byte, 10)})
 	if !errors.Is(err, conn.want) || n != 3 || conn.writes != 1 {
 		t.Fatalf("rearm result=%v bytes=%d writes=%d", err, n, conn.writes)
 	}
@@ -291,7 +291,7 @@ func TestIpDeadlineProgressRearmPreservesExactPrefix(t *testing.T) {
 // Nil installations retain the zero-progress, not whole-transfer, policy.
 func TestIpDeadlineProgressHealthyPartialWritesContinue(t *testing.T) {
 	conn := &ipDeadlineProgressConn{}
-	n, err := writeWithProgressDeadline(conn, net.Buffers{make([]byte, 10)}, time.Second)
+	n, err := newIoDeadline(time.Second, conn.SetWriteDeadline).writeWithProgress(conn, net.Buffers{make([]byte, 10)})
 	if err != nil || n != 10 || conn.writes != 4 || conn.sets != 4 {
 		t.Fatalf("healthy progress result=%v bytes=%d writes=%d sets=%d", err, n, conn.writes, conn.sets)
 	}
@@ -300,7 +300,7 @@ func TestIpDeadlineProgressHealthyPartialWritesContinue(t *testing.T) {
 // A true zero-progress timeout still terminates at the first write.
 func TestIpDeadlineProgressHealthyStallStillFails(t *testing.T) {
 	conn := &ipDeadlineProgressConn{stalled: true}
-	n, err := writeWithProgressDeadline(conn, net.Buffers{make([]byte, 10)}, time.Second)
+	n, err := newIoDeadline(time.Second, conn.SetWriteDeadline).writeWithProgress(conn, net.Buffers{make([]byte, 10)})
 	var timeout net.Error
 	if !errors.As(err, &timeout) || !timeout.Timeout() || n != 0 || conn.writes != 1 {
 		t.Fatalf("stalled progress result=%v bytes=%d writes=%d", err, n, conn.writes)

@@ -3315,6 +3315,9 @@ type UdpSequence struct {
 	// Lazily allocated only when the bounded send queue actually blocks.
 	// sendMutex serializes Reset/Stop.
 	sendTimer *time.Timer
+	// The shared socket's write deadline, allocated by the first shared
+	// write. sendMutex serializes its use.
+	sharedWriteDeadline *ioDeadline
 
 	idleCondition *IdleCondition
 	transferState transferState
@@ -3522,14 +3525,19 @@ func (self *UdpSequence) sendSharedSocket(sendItem *UdpSendItem) (bool, error) {
 	self.transferState.update(sendItem.source, sendItem.transferKey)
 	payload := sendItem.udp.payload
 	if len(payload) != 0 {
-		if err := self.sharedSocket.SetWriteDeadline(
-			time.Now().Add(self.udpBufferSettings.WriteTimeout),
-		); err != nil {
+		if self.sharedWriteDeadline == nil {
+			self.sharedWriteDeadline = newIoDeadline(self.udpBufferSettings.WriteTimeout, self.sharedSocket.SetWriteDeadline)
+		}
+		writeStart, err := self.sharedWriteDeadline.begin()
+		if err != nil {
 			self.sharedSocketErr = err
 			self.Close()
 			return false, err
 		}
 		n, err := self.sharedSocket.Write(payload)
+		for n == 0 && self.sharedWriteDeadline.retry(writeStart, err) {
+			n, err = self.sharedSocket.Write(payload)
+		}
 		if err != nil {
 			self.sharedSocketErr = err
 			self.Close()
@@ -3703,6 +3711,8 @@ func (self *UdpSequence) Run() {
 		defer self.cancel()
 
 		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
+		// the reader owns the socket's read deadline
+		readDeadline := newIoDeadline(self.udpBufferSettings.ReadTimeout, socket.SetReadDeadline)
 
 		for forwardIter := uint64(0); ; forwardIter += 1 {
 			select {
@@ -3711,15 +3721,29 @@ func (self *UdpSequence) Run() {
 			default:
 			}
 
-			readTimeout := time.Now().Add(self.udpBufferSettings.ReadTimeout)
-			if err := socket.SetReadDeadline(readTimeout); err != nil {
+			readStart, err := readDeadline.begin()
+			if err != nil {
 				return
 			}
-			lease, prepareErr := self.awaitReturnRead(socket, buffer)
-			if prepareErr != nil {
-				return
+			var lease *udpReturnReadLease
+			var n int
+			for {
+				// The readiness wait and the read share one bound. An expiry of
+				// a deadline installed before this read began waits again.
+				lease, err = self.awaitReturnRead(socket, buffer)
+				if err != nil {
+					if readDeadline.retry(readStart, err) {
+						continue
+					}
+					return
+				}
+				n, err = socket.Read(buffer)
+				if n == 0 && err != nil && readDeadline.retry(readStart, err) {
+					lease.abort()
+					continue
+				}
+				break
 			}
-			n, err := socket.Read(buffer)
 
 			if err != nil {
 				if self.log.V(1).Enabled() {
@@ -3795,6 +3819,8 @@ func (self *UdpSequence) Run() {
 	// concurrent reader plus one writer, so the extra stage added memory,
 	// scheduling, and a handoff without adding parallelism.
 	writeBatch := make([]*UdpSendItem, 0, self.udpBufferSettings.WriteBatchSize)
+	// the send loop owns the socket's write deadline
+	writeDeadline := newIoDeadline(self.udpBufferSettings.WriteTimeout, socket.SetWriteDeadline)
 	writeSendItems := func(first *UdpSendItem) bool {
 		writeBatch = append(writeBatch[:0], first)
 	drain:
@@ -3810,13 +3836,16 @@ func (self *UdpSequence) Run() {
 			}
 		}
 
-		writeErr := socket.SetWriteDeadline(time.Now().Add(self.udpBufferSettings.WriteTimeout))
+		writeStart, writeErr := writeDeadline.begin()
 		for _, sendItem := range writeBatch {
 			payload := sendItem.udp.payload
 			if writeErr == nil && 0 < len(payload) {
 				// Each payload is one datagram; writes cannot be coalesced, but
 				// the drained batch shares one deadline and one scheduler wake.
 				n, err := socket.Write(payload)
+				for n == 0 && writeDeadline.retry(writeStart, err) {
+					n, err = socket.Write(payload)
+				}
 				if err == nil {
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[f%d]udp forward %d\n", sendIter, n)
@@ -4954,27 +4983,89 @@ func tcpRstForOrphan(ipVersion int, tcp *parsedTcp) []byte {
 	return packet
 }
 
-// writeWithProgressDeadline writes to an upstream socket, bounding
-// ZERO-PROGRESS time rather than total time: the deadline re-arms whenever a
-// write advances, so a peer applying ordinary flow control (accepting data
-// steadily but slowly) is not failed, while a peer that accepts nothing for a
-// full timeout still is.
+// ioDeadline is one direction's deadline on a flow's socket, owned by the one
+// goroutine (or lock holder) that does that direction's I/O. It is lazy: an
+// operation installs a new deadline only when less than half the timeout
+// remains on the installed one, so a busy flow sets it, a runtime timer modify,
+// about twice per timeout rather than on every read or write. A deadline that
+// fires before a full timeout has passed since the operation began is not a
+// stall: retry installs that exact bound and the operation goes on, so a stall
+// still ends a full timeout after the operation began, as a deadline set for
+// each operation did.
+type ioDeadline struct {
+	timeout     time.Duration
+	setDeadline func(time.Time) error
+	// installed on the socket; zero before the first operation and after a
+	// failed install
+	deadline time.Time
+}
+
+func newIoDeadline(timeout time.Duration, setDeadline func(time.Time) error) *ioDeadline {
+	return &ioDeadline{
+		timeout:     timeout,
+		setDeadline: setDeadline,
+	}
+}
+
+// Begins an operation now, installing a full deadline when less than half the
+// timeout remains on the installed one. Returns the operation's start.
+func (self *ioDeadline) begin() (time.Time, error) {
+	now := time.Now()
+	if self.deadline.Sub(now) < self.timeout/2 {
+		return now, self.install(now.Add(self.timeout))
+	}
+	return now, nil
+}
+
+// Begins a fresh attempt now with a full deadline, after progress.
+func (self *ioDeadline) restart() (time.Time, error) {
+	now := time.Now()
+	return now, self.install(now.Add(self.timeout))
+}
+
+// Reports whether an operation that began at start and failed with err should
+// try again, having installed the full bound start+timeout: err is a deadline
+// expiry, and the deadline that expired was earlier than that bound. Any other
+// failure, and an expiry at the full bound, is the operation's result.
+func (self *ioDeadline) retry(start time.Time, err error) bool {
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		return false
+	}
+	bound := start.Add(self.timeout)
+	if !self.deadline.Before(bound) {
+		return false
+	}
+	return self.install(bound) == nil
+}
+
+func (self *ioDeadline) install(deadline time.Time) error {
+	if err := self.setDeadline(deadline); err != nil {
+		self.deadline = time.Time{}
+		return err
+	}
+	self.deadline = deadline
+	return nil
+}
+
+// writeWithProgress writes to an upstream socket, bounding ZERO-PROGRESS time
+// rather than total time: the deadline re-arms whenever a write advances, so a
+// peer applying ordinary flow control (accepting data steadily but slowly) is
+// not failed, while a peer that accepts nothing for a full timeout from the
+// start of the write still is.
 //
 // A single deadline for the whole batch killed alive flows under sustained
 // bulk transfer: the return path's acks stall behind saturated tunnel queues
 // long enough that the upstream socket drains slower than one batch, and the
 // partial write at the deadline tore the sequence down (observed as mid-stream
 // resets in the full-stack tcp test).
-func writeWithProgressDeadline(
-	socket net.Conn,
-	buffers net.Buffers,
-	timeout time.Duration,
-) (int64, error) {
+func (self *ioDeadline) writeWithProgress(socket net.Conn, buffers net.Buffers) (int64, error) {
 	n := int64(0)
+	start, err := self.begin()
+	if err != nil {
+		return n, err
+	}
 	for {
-		if err := socket.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-			return n, err
-		}
 		wn, err := buffers.WriteTo(socket)
 		n += wn
 		if err == nil {
@@ -4983,6 +5074,12 @@ func writeWithProgressDeadline(
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
 			// progress inside this deadline window: the peer is alive and
 			// draining, so give the remainder a fresh window
+			if start, err = self.restart(); err != nil {
+				return n, err
+			}
+			continue
+		}
+		if wn == 0 && self.retry(start, err) {
 			continue
 		}
 		return n, err
@@ -5767,6 +5864,8 @@ func (self *TcpSequence) Run() {
 
 		batch := make([]writePayload, 0, self.tcpBufferSettings.WriteBatchSize)
 		bufferStorage := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
+		// the writer owns the socket's write deadline
+		writeDeadline := newIoDeadline(self.tcpBufferSettings.WriteTimeout, socket.SetWriteDeadline)
 
 		for {
 			batch = batch[:0]
@@ -5808,11 +5907,7 @@ func (self *TcpSequence) Run() {
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
 			buffers := net.Buffers(bufferStorage)
 
-			n, err := writeWithProgressDeadline(
-				socket,
-				buffers,
-				self.tcpBufferSettings.WriteTimeout,
-			)
+			n, err := writeDeadline.writeWithProgress(socket, buffers)
 
 			if err == nil {
 				if self.log.V(2).Enabled() {
@@ -5928,6 +6023,8 @@ func (self *TcpSequence) Run() {
 		}()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
+		// the reader owns the socket's read deadline
+		readDeadline := newIoDeadline(self.tcpBufferSettings.ReadTimeout, socket.SetReadDeadline)
 
 		for forwardIter := uint64(0); ; forwardIter += 1 {
 			select {
@@ -5936,12 +6033,15 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			readTimeout := time.Now().Add(self.tcpBufferSettings.ReadTimeout)
-			if err := socket.SetReadDeadline(readTimeout); err != nil {
+			readStart, err := readDeadline.begin()
+			if err != nil {
 				return
 			}
 
 			n, err := socket.Read(buffer)
+			for n == 0 && readDeadline.retry(readStart, err) {
+				n, err = socket.Read(buffer)
+			}
 
 			if err != nil {
 				if self.log.V(1).Enabled() {
