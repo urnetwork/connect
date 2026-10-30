@@ -264,8 +264,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeReceiveTimeout: 20 * time.Second,
 		// an evaluation cadence, not a liveness deadline; see the field
 		BlackholePollInterval: 1250 * time.Millisecond,
-		// an idle channel checks its carrier an eighth as often, so a carrier
-		// lost while nothing is sent retires within 70s instead of 60s
+		// a backstop only: every input an idle channel's verdicts wait on,
+		// its carrier included, wakes the parked loop when it changes
 		BlackholeIdlePollInterval: 10 * time.Second,
 		MaxFlowsPerExit:           16,
 		// Eligible affinity keeps its exit as it grows; expiration makes later
@@ -647,11 +647,12 @@ type MultiClientSettings struct {
 	// Must be positive.
 	BlackholePollInterval time.Duration
 	// BlackholeIdlePollInterval is how often the health loop of a channel
-	// holding none of that evidence wakes to check its carrier. Every verdict
-	// needs a send, and the first send of a run, an error and the channel's
-	// end each wake the loop at once, so an idle loop polls only for a
-	// carrier lost while nothing is sent: that carrier's retirement hold
-	// (StatsWindowKeepUnhealthyDuration) starts up to this much late.
+	// holding none of that evidence wakes anyway. Every verdict needs a send,
+	// and the first send of a run, an error, a change of the channel's
+	// carrier (RouteManager.ActiveTransportNotify) and the channel's end each
+	// wake the loop at once, so a carrier lost while nothing is sent starts
+	// its retirement hold (StatsWindowKeepUnhealthyDuration) at the loss, as
+	// it did when the loop judged every poll; this poll is only a backstop.
 	// Non-positive never parks: the loop judges every BlackholePollInterval.
 	BlackholeIdlePollInterval time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
@@ -19496,13 +19497,20 @@ func (self *multiClientChannel) detectBlackhole() {
 			}
 
 			// With no evidence left to judge, the carrier is all there is to
-			// watch: park, and check it each idle poll.
+			// watch, and its change wakes the loop: park. The carrier is read
+			// with its change subscribed in one step and before the evidence
+			// check, so a loss after either still wakes the parked loop.
 			pollInterval := self.settings.BlackholePollInterval
 			parked := false
+			var carrierChanged <-chan struct{}
 			if idlePollInterval := self.settings.BlackholeIdlePollInterval; 0 < idlePollInterval && !transportDown {
-				parked = self.parkIdleBlackhole(idleWake)
+				carrierUp, changed := self.carrierNotify()
+				if carrierUp {
+					parked = self.parkIdleBlackhole(idleWake)
+				}
 				if parked {
 					pollInterval = idlePollInterval
+					carrierChanged = changed
 				}
 			}
 			pollTimer.Reset(pollInterval)
@@ -19512,6 +19520,7 @@ func (self *multiClientChannel) detectBlackhole() {
 			case <-self.client.Done():
 				return
 			case <-idleWake:
+			case <-carrierChanged:
 			case <-pollTimer.C:
 			}
 			if parked {
@@ -19521,14 +19530,25 @@ func (self *multiClientChannel) detectBlackhole() {
 	}
 }
 
+// carrierNotify reads whether this channel's carrier is up, with a channel
+// that closes at its next change, in one step. A bare fixture channel has no
+// client, which reads as up (see hasActiveTransport) and never changes.
+func (self *multiClientChannel) carrierNotify() (bool, <-chan struct{}) {
+	if self.client == nil {
+		return true, nil
+	}
+	return self.client.RouteManager().ActiveTransportNotify()
+}
+
 // parkIdleBlackhole hands the health loop's wake to the channel when the
 // channel holds no evidence a verdict could mature on, and reports whether it
-// did. The caller has found the carrier up. Every verdict needs a send: one
-// outstanding (no-send-ack), one in the stats window (no-receive-ack), or an
-// unanswered connect, whose clock outlives the window (no-receive-syn). A
-// quarantine is judged every pass, and an error ends the loop. The check and
-// the handoff share the lock under which the first send of a run and the
-// first error signal the wake, so neither can land between them unseen.
+// did. The caller has found the carrier up and watches it for the loop
+// (carrierNotify). Every verdict needs a send: one outstanding (no-send-ack),
+// one in the stats window (no-receive-ack), or an unanswered connect, whose
+// clock outlives the window (no-receive-syn). A quarantine is judged every
+// pass, and an error ends the loop. The check and the handoff share the lock
+// under which the first send of a run and the first error signal the wake, so
+// neither can land between them unseen.
 func (self *multiClientChannel) parkIdleBlackhole(wake chan struct{}) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
