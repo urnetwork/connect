@@ -561,24 +561,28 @@ paths:
         = "blocks", current streak of consecutive finalized epochs with points)
         with competition ranks (1, 2, 2, 4), and every ranked network is
         listed: the pages form one continuous list. A row carries the network
-        name only when that network turned on
+        name and the network id only when that network turned on
         /network/points-ranking-visibility (its "show my network name"
-        switch); otherwise the row is anonymous. The emoji tag (/network/emoji)
-        shows on every row that set one.
+        switch); otherwise the row is anonymous and never identifies its
+        network. The emoji tag (/network/emoji) shows on every row that set
+        one.
         Each sort has its own tie-break order, every key descending, then the
         network id ascending so the order is total: `points` = (points,
         streak, blocks), `blocks` = (blocks, streak, points), `streak` =
         (streak, blocks, points). The pages come in exactly that order, and a
-        rank is shared only by networks whose three values all tie.
+        rank is shared only by networks whose three values all tie. A row's
+        `position` is its place in that order; anonymous rows carry no id to
+        order by, so a client orders rows by `position`.
         Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
         epoch finalizes, when a payout plan commits, and hourly); a cursor
         whose snapshot was pruned returns `restart: true` and the client
         reloads from the top. No authentication is required; with a bearer
         token the response also carries `me`, the caller's own row with its
-        network name for the caller's own card, whether or not it opted in.
-        In the list itself the caller's row is anonymous like everyone
-        else's until it opts in: the caller sees what everyone sees, and the
-        apps only highlight that row.
+        network name and id for the caller's own card, whether or not it
+        opted in. In the list itself the caller's row keeps its name hidden
+        until it opts in, like everyone else's: the caller sees what everyone
+        sees. That row has `is_me` set and carries the caller's own network
+        id, so the apps can highlight it.
       operationId: statsPointsLeaderboard
       # optional auth: anonymous callers get the list, a bearer adds `me`
       security:
@@ -14987,7 +14991,7 @@ components:
     PointsLeaderboardRow:
       type: object
       required:
-        - network_id
+        - is_me
         - anonymous
         - total_points
         - blocks_with_points
@@ -14999,7 +15003,16 @@ components:
         - position
       properties:
         network_id:
+          description: |
+            The network's id, present only on a named row (the network turned
+            on points_leaderboard_public, /network/points-ranking-visibility)
+            and on the signed-in caller's own row, and absent otherwise: an
+            anonymous row never identifies its network.
           type: string
+          format: uuid
+        is_me:
+          description: The row is the signed-in caller's own network; false without a bearer token.
+          type: boolean
         network_name:
           description: Present only when the network turned on points_leaderboard_public (/network/points-ranking-visibility)
           type: string
