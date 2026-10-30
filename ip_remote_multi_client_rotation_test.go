@@ -301,8 +301,9 @@ func TestLifetimeJitterDisabledStaysDisabled(t *testing.T) {
 }
 
 // The jitter must be drawn once at construction and used wherever removeTime
-// derives from the lifetime. windowStatsWithCoalesce is the derivation site:
-// it must read the stored effectiveLifetime, and must no longer read
+// derives from the lifetime. windowStatsInto, which every window stats read
+// runs (windowStatsWithCoalesce delegates to it), is the derivation site: it
+// must read the stored effectiveLifetime, and must no longer read
 // settings.MaxClientLifetime, which would silently re-synchronize rotation.
 func TestLifetimeJitterSourceAnchor(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
@@ -318,15 +319,22 @@ func TestLifetimeJitterSourceAnchor(t *testing.T) {
 		t.Error("newMultiClientChannel does not draw the lifetime jitter, so every channel rotates on the raw lifetime")
 	}
 
-	statsBody, ok := functionBody(source, "func (self *multiClientChannel) windowStatsWithCoalesce(")
+	delegateBody, ok := functionBody(source, "func (self *multiClientChannel) windowStatsWithCoalesce(")
 	if !ok {
 		t.Fatal("could not find windowStatsWithCoalesce")
 	}
+	if !strings.Contains(delegateBody, "self.windowStatsInto(") {
+		t.Error("windowStatsWithCoalesce does not read through windowStatsInto, the derivation site")
+	}
+	statsBody, ok := functionBody(source, "func (self *multiClientChannel) windowStatsInto(")
+	if !ok {
+		t.Fatal("could not find windowStatsInto")
+	}
 	if !strings.Contains(statsBody, "self.effectiveLifetime") {
-		t.Error("windowStatsWithCoalesce does not derive removeTime from the jittered effective lifetime")
+		t.Error("windowStatsInto does not derive removeTime from the jittered effective lifetime")
 	}
 	if strings.Contains(statsBody, "MaxClientLifetime") {
-		t.Error("windowStatsWithCoalesce still reads MaxClientLifetime directly, re-synchronizing rotation")
+		t.Error("windowStatsInto still reads MaxClientLifetime directly, re-synchronizing rotation")
 	}
 }
 

@@ -259,6 +259,52 @@ func (self *packetStatsCounters) snapshot() *PacketStats {
 	return packetStats
 }
 
+// unchangedSince reports what `packetStatsEqual(self.snapshot(), last)` would,
+// without building the snapshot: an epoch with no new packets reads the
+// counters in place and allocates nothing.
+func (self *packetStatsCounters) unchangedSince(last *PacketStats) bool {
+	if last == nil {
+		return false
+	}
+	self.transportStatsLock.Lock()
+	defer self.transportStatsLock.Unlock()
+	if self.remoteEgressPacketCount.Load() != last.RemoteEgressPacketCount ||
+		ByteCount(self.remoteEgressByteCount.Load()) != last.RemoteEgressByteCount ||
+		self.remoteIngressPacketCount.Load() != last.RemoteIngressPacketCount ||
+		ByteCount(self.remoteIngressByteCount.Load()) != last.RemoteIngressByteCount ||
+		self.localEgressPacketCount.Load() != last.LocalEgressPacketCount ||
+		ByteCount(self.localEgressByteCount.Load()) != last.LocalEgressByteCount ||
+		self.localIngressPacketCount.Load() != last.LocalIngressPacketCount ||
+		ByteCount(self.localIngressByteCount.Load()) != last.LocalIngressByteCount ||
+		self.blockEgressPacketCount.Load() != last.BlockEgressPacketCount ||
+		ByteCount(self.blockEgressByteCount.Load()) != last.BlockEgressByteCount ||
+		self.blockIngressPacketCount.Load() != last.BlockIngressPacketCount ||
+		ByteCount(self.blockIngressByteCount.Load()) != last.BlockIngressByteCount {
+		return false
+	}
+	for _, transportType := range TransportTypes() {
+		// a snapshot carries every transport type, zero when never counted
+		lastStats := last.TransportStats[transportType]
+		if lastStats == nil {
+			return false
+		}
+		current := self.transportStats[transportType]
+		if current == nil {
+			current = &zeroPacketStats
+		}
+		if current.RemoteEgressPacketCount != lastStats.RemoteEgressPacketCount ||
+			current.RemoteEgressByteCount != lastStats.RemoteEgressByteCount ||
+			current.RemoteIngressPacketCount != lastStats.RemoteIngressPacketCount ||
+			current.RemoteIngressByteCount != lastStats.RemoteIngressByteCount {
+			return false
+		}
+	}
+	return true
+}
+
+// read only
+var zeroPacketStats PacketStats
+
 func normalizedTransportType(transportType TransportType) TransportType {
 	switch transportType {
 	case TransportTypeH3,

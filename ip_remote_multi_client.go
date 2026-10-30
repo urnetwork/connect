@@ -14,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -1108,6 +1109,11 @@ type MultiClientSettings struct {
 	// first verdict pass after wake cannot convict on a window whose history
 	// was accumulated before the host stopped. 0 rebases without holding.
 	SchedulerPauseRecoveryTimeout time.Duration
+	// SchedulerPauseDetector, when set, is the detector this client shares
+	// with the other clients of its host instead of running its own. A host
+	// that runs many clients (the proxy service) sets one detector on all of
+	// them. Nil runs a detector per client.
+	SchedulerPauseDetector *SchedulerPauseDetector
 
 	// SoftVerdictDemote changes what a soft classification against a loaded
 	// exit does. The core invariant it enforces: an exit carrying live flows
@@ -2854,9 +2860,17 @@ func NewRemoteUserNatMultiClient(
 	// client built with a zero tolerance never runs the goroutine -- while the
 	// runtime toggle is honored per pass inside. Not wired to `cancel` for the
 	// same reason as the prober: an exculpatory aide must never be able to tear
-	// down the tunnel it exists to protect.
+	// down the tunnel it exists to protect. A client given a shared detector
+	// subscribes to it for its life instead.
 	if 0 < settings.SchedulerPauseTolerance {
-		go HandleError(multiClient.runSchedulerPauseDetector)
+		if detector := settings.SchedulerPauseDetector; detector != nil {
+			detector.subscribe(multiClient)
+			context.AfterFunc(multiClient.ctx, func() {
+				detector.unsubscribe(multiClient)
+			})
+		} else {
+			go HandleError(multiClient.runSchedulerPauseDetector)
+		}
 	}
 
 	return multiClient
@@ -2867,16 +2881,21 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 	defer self.cancel()
 
 	var lastPacketStats *PacketStats
+	// one timer for the loop's life
+	epochTimer := time.NewTimer(self.settings.EventEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.EventEpoch):
+		case <-epochTimer.C:
 		}
 
 		self.blockActionCollector.flush()
 
-		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
+		// an epoch with no new packets compares the counters in place, and
+		// builds a snapshot only to report a change
+		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) && !self.packetStatsCounters.unchangedSince(lastPacketStats) {
 			packetStats := self.packetStatsCounters.snapshot()
 			if !packetStatsEqual(packetStats, lastPacketStats) {
 				lastPacketStats = packetStats
@@ -2887,6 +2906,7 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 				}
 			}
 		}
+		epochTimer.Reset(self.settings.EventEpoch)
 	}
 }
 
@@ -8563,17 +8583,128 @@ func schedulerPauseElapsed(start time.Time, now time.Time) time.Duration {
 // "late" this loop would misread as a suspend.
 //
 // Tied to the multi-client ctx and not to `cancel`: like the prober, a detector
-// failure must never tear down the tunnel.
+// failure must never tear down the tunnel. One timer is armed for the loop's
+// life and re-armed after each wait.
 func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector() {
+	probeTimer := time.NewTimer(schedulerPauseProbeInterval)
+	defer probeTimer.Stop()
 	for {
 		armed := time.Now()
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(schedulerPauseProbeInterval):
+		case <-probeTimer.C:
 		}
 		self.observeSchedulerPause(armed, time.Now())
+		probeTimer.Reset(schedulerPauseProbeInterval)
 	}
+}
+
+// SchedulerPauseDetector is one scheduler-pause detector that the clients of
+// a host share (`MultiClientSettings.SchedulerPauseDetector`). A pause belongs
+// to the host, not to a client: when the process is frozen or the host
+// sleeps, every client's timer comes back late together. So one timer, armed
+// exactly as a client's own detector arms it, judges for all of them: each
+// subscribed client judges the same two readings with its own tolerance and
+// opens its own hold (`observeSchedulerPause`), as its own detector would
+// have. A host running thousands of clients pays one goroutine and one wakeup
+// per probe interval instead of one each per client.
+type SchedulerPauseDetector struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stateLock sync.Mutex
+	clients   map[*RemoteUserNatMultiClient]struct{}
+}
+
+// NewSchedulerPauseDetector starts a shared detector that runs until ctx ends
+// or Close.
+func NewSchedulerPauseDetector(ctx context.Context) *SchedulerPauseDetector {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	detector := &SchedulerPauseDetector{
+		ctx:     cancelCtx,
+		cancel:  cancel,
+		clients: map[*RemoteUserNatMultiClient]struct{}{},
+	}
+	go HandleError(detector.run)
+	return detector
+}
+
+func (self *SchedulerPauseDetector) Close() {
+	self.cancel()
+}
+
+// ClientCount is the number of clients the detector judges for.
+func (self *SchedulerPauseDetector) ClientCount() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return len(self.clients)
+}
+
+func (self *SchedulerPauseDetector) subscribe(client *RemoteUserNatMultiClient) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clients[client] = struct{}{}
+}
+
+func (self *SchedulerPauseDetector) unsubscribe(client *RemoteUserNatMultiClient) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	delete(self.clients, client)
+}
+
+// The client detector's wait, made once for every subscribed client: plain
+// timer, NOT WakeupAfter, for the reason on runSchedulerPauseDetector.
+func (self *SchedulerPauseDetector) run() {
+	probeTimer := time.NewTimer(schedulerPauseProbeInterval)
+	defer probeTimer.Stop()
+	// reused by each pass, so a pass allocates nothing
+	var clients []*RemoteUserNatMultiClient
+	for {
+		armed := time.Now()
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-probeTimer.C:
+		}
+		clients = self.observeSchedulerPause(clients[:0], armed, time.Now())
+		probeTimer.Reset(schedulerPauseProbeInterval)
+	}
+}
+
+// Judges one wait for every subscribed client, from the two readings of the
+// shared timer. The clients are read into `clients`, which is cleared and
+// returned for reuse.
+func (self *SchedulerPauseDetector) observeSchedulerPause(clients []*RemoteUserNatMultiClient, armed time.Time, now time.Time) []*RemoteUserNatMultiClient {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for client := range self.clients {
+			clients = append(clients, client)
+		}
+	}()
+	for _, client := range clients {
+		observeSchedulerPauseIsolated(client, armed, now)
+	}
+	clear(clients)
+	return clients
+}
+
+// One client's judgement. A panic in it is logged and ends only this
+// judgement: the shared detector keeps judging for every client.
+func observeSchedulerPauseIsolated(client *RemoteUserNatMultiClient, armed time.Time, now time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			DefaultLogger().Warningf("Unexpected error: %s\n", ErrorJson(r, debug.Stack()))
+		}
+	}()
+	select {
+	case <-client.ctx.Done():
+		// a closing client leaves the detector; it is judged no more
+		return
+	default:
+	}
+	client.observeSchedulerPause(armed, now)
 }
 
 // Judges one wait of the pause detector, from the reading taken when it armed
@@ -11707,6 +11838,11 @@ type multiClientWindow struct {
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+	// the send-stall pass reads the clients into this list, so a pass that
+	// finds nothing stalled allocates nothing. Owned by whichever pass holds
+	// sendStallClientsBusy; a concurrent pass collects its own.
+	sendStallClients     []*multiClientChannel
+	sendStallClientsBusy atomic.Bool
 	// networkChangeMonitor ends a platform-error retry wait when the host's
 	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
 	// never wakes a wait.
@@ -11895,15 +12031,27 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 // resize is woken only to reap it and backfill the window. Soft classifications
 // (stats-unhealthy, rank, drain) remain exclusively in resize.
 func (self *multiClientWindow) watchSendStalls() {
+	// one timer for the loop's life
+	var pollTimer *time.Timer
+	defer func() {
+		if pollTimer != nil {
+			pollTimer.Stop()
+		}
+	}()
 	for {
 		stallTimeout := self.reliabilitySettings().SendStallTimeout
 
 		pollTimeout := sendStallPollTimeout(stallTimeout, self.settings.WindowResizeTimeout)
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(pollTimeout)
+		} else {
+			pollTimer.Reset(pollTimeout)
+		}
 
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(pollTimeout):
+		case <-pollTimer.C:
 		}
 
 		if stallTimeout <= 0 {
@@ -11948,8 +12096,19 @@ func (self *multiClientWindow) watchSendStalls() {
 // state; the verdicts are applied serially afterwards so the addError-before-
 // Cancel ordering above is preserved per channel.
 func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) bool {
+	var clients []*multiClientChannel
+	if self.sendStallClientsBusy.CompareAndSwap(false, true) {
+		clients = self.appendUnorderedClients(self.sendStallClients[:0])
+		defer func() {
+			clear(clients)
+			self.sendStallClients = clients[:0]
+			self.sendStallClientsBusy.Store(false)
+		}()
+	} else {
+		clients = self.unorderedClients()
+	}
 	var stalled []*multiClientChannel
-	for _, client := range self.unorderedClients() {
+	for _, client := range clients {
 		// A finite application probe owns its data deadline and outcome. Skip
 		// this active question and its conviction together, not just the ping.
 		if client.dataOnlyProviderProbe {
@@ -14732,9 +14891,23 @@ func (self *multiClientWindow) removeProvider(egressClientId Id) bool {
 }
 
 func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
+	return self.appendUnorderedClients(nil)
+}
+
+// appendUnorderedClients appends the window's clients to clients, in no
+// order, growing it at most once. A loop that passes its last list back with
+// length 0 collects without allocating.
+func (self *multiClientWindow) appendUnorderedClients(clients []*multiClientChannel) []*multiClientChannel {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return slices.Collect(maps.Values(self.clients))
+	if len(self.clients) == 0 {
+		return clients
+	}
+	clients = slices.Grow(clients, len(self.clients))
+	for _, client := range self.clients {
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 // lastResortClients is the window's offer when its ordinary offer is empty:
@@ -15448,6 +15621,7 @@ type multiClientChannel struct {
 	// destination -> source -> count
 	ip4DestinationSourceCount          map[Ip4Path]map[Ip4Path]int
 	ip6DestinationSourceCount          map[Ip6Path]map[Ip6Path]int
+	windowStatsSourceCounts            []int // reused by each window stats read
 	packetStats                        *clientWindowStats
 	endErr                             error
 	maxEffectiveByteCountPerSecond     ByteCount
@@ -15824,37 +15998,44 @@ func newMultiClientChannel(
 	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(effectiveContractStatusCallback)
 	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
 	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
-	go HandleError(func() {
-		select {
-		case <-cancelCtx.Done():
-		case <-client.Done():
+	// The cleanup runs once, when the channel or its client ends. It is
+	// registered on both contexts rather than parked in a goroutine of its
+	// own, so a live channel holds no goroutine for it.
+	cleanupStarted := atomic.Bool{}
+	cleanup := func() {
+		if !cleanupStarted.CompareAndSwap(false, true) {
+			return
 		}
-		clientChannel.clearBusyProbe()
-		// Essential cleanup first, observer-facing events after. A stats
-		// observer can remain parked (an app suspended mid-callback), and
-		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
-		// first let a parked observer block RemoveClientWithArgs, retaining
-		// the platform identity and another client/transport record on every
-		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
-		contractStatusSub()
-		peerIdentitySub()
-		// Detach the platform transport before the synchronous local teardown.
-		// The API generator retires the derived identity asynchronously after
-		// Client and OOB cleanup have joined, so a slow Pion close never blocks
-		// this path and the final contract-close controls retain valid auth.
-		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
-		client.Cancel()
-		// Fire the contract-close events for this client's still-open
-		// contracts while the stats listener is still attached, or a removed
-		// peer's contracts linger open forever in the contract-details UI.
-		// The client is already cancelled — that is what woke this cleanup —
-		// and CloseAllContractStats is the deterministic synchronous backstop
-		// that emits regardless of the stopped epoch worker.
-		client.CloseContractStats()
-		contractStatsSub()
-		// the removed client's established peers leave the aggregate set
-		peerIdentityChangeCallback()
-	}, cancel)
+		HandleError(func() {
+			clientChannel.clearBusyProbe()
+			// Essential cleanup first, observer-facing events after. A stats
+			// observer can remain parked (an app suspended mid-callback), and
+			// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
+			// first let a parked observer block RemoveClientWithArgs, retaining
+			// the platform identity and another client/transport record on every
+			// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
+			contractStatusSub()
+			peerIdentitySub()
+			// Detach the platform transport before the synchronous local teardown.
+			// The API generator retires the derived identity asynchronously after
+			// Client and OOB cleanup have joined, so a slow Pion close never blocks
+			// this path and the final contract-close controls retain valid auth.
+			generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
+			client.Cancel()
+			// Fire the contract-close events for this client's still-open
+			// contracts while the stats listener is still attached, or a removed
+			// peer's contracts linger open forever in the contract-details UI.
+			// The client is already cancelled — that is what woke this cleanup —
+			// and CloseAllContractStats is the deterministic synchronous backstop
+			// that emits regardless of the stopped epoch worker.
+			client.CloseContractStats()
+			contractStatsSub()
+			// the removed client's established peers leave the aggregate set
+			peerIdentityChangeCallback()
+		}, cancel)
+	}
+	context.AfterFunc(cancelCtx, cleanup)
+	context.AfterFunc(client.Ctx(), cleanup)
 
 	go HandleError(clientChannel.detectBlackhole, cancel)
 	if clientChannel.dataOnlyProviderProbe {
@@ -18645,8 +18826,15 @@ func (self *multiClientChannel) detectBlackhole() {
 	heldCounted := false
 	sharedFateCounted := false
 
+	// each pass reads the window stats into one value and waits on one timer,
+	// both kept for the loop's life; nothing below keeps the stats past its
+	// pass
+	windowStats := &clientWindowStats{}
+	pollTimer := time.NewTimer(blackholePollInterval)
+	pollTimer.Stop()
+	defer pollTimer.Stop()
 	for {
-		if windowStats, err := self.WindowStats(); err != nil {
+		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else {
 			now := time.Now()
@@ -18980,20 +19168,27 @@ func (self *multiClientChannel) detectBlackhole() {
 				}
 			}
 
+			pollTimer.Reset(blackholePollInterval)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-self.client.Done():
 				return
-			case <-time.After(blackholePollInterval):
+			case <-pollTimer.C:
 			}
 		}
 	}
 }
 
 func (self *multiClientChannel) ping() {
+	// one stats value and one timer for the loop's life: the ack wait and the
+	// rest between pings take turns on the timer
+	windowStats := &clientWindowStats{}
+	pingTimer := time.NewTimer(self.settings.CPingTimeout)
+	pingTimer.Stop()
+	defer pingTimer.Stop()
 	for {
-		if windowStats, err := self.WindowStats(); err != nil {
+		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else if self.settings.CPingMaxByteCountPerSecond == 0 || windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond {
 			// One callback, one buffered result. The ping loop deliberately may
@@ -19037,6 +19232,7 @@ func (self *multiClientChannel) ping() {
 				// ping has no deferred cancel: that stale defer contradicted this
 				// branch and reset a lossy H3 flow at CPingTimeout with reason
 				// "Done.".
+				pingTimer.Reset(self.settings.CPingTimeout)
 				select {
 				case <-self.ctx.Done():
 					return
@@ -19054,7 +19250,7 @@ func (self *multiClientChannel) ping() {
 						self.cancel()
 						return
 					}
-				case <-time.After(self.settings.CPingTimeout):
+				case <-pingTimer.C:
 					self.log.Infof("[multi]cping %s unanswered: ping loop ended, channel remains\n", self.args.Destination)
 					return
 				}
@@ -19075,12 +19271,13 @@ func (self *multiClientChannel) ping() {
 				restTimeout = time.Duration(float64(restTimeout) * scale)
 			}
 		}
+		resetWakeupTimer(pingTimer, restTimeout, restTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-self.clientDone():
 			return
-		case <-WakeupAfter(restTimeout, restTimeout):
+		case <-pingTimer.C:
 		}
 	}
 }
@@ -19577,6 +19774,16 @@ func (self *multiClientChannel) WindowStats() (*clientWindowStats, error) {
 }
 
 func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientWindowStats, error) {
+	stats := &clientWindowStats{}
+	err := self.windowStatsInto(coalesce, stats)
+	return stats, err
+}
+
+// windowStatsInto is windowStatsWithCoalesce writing into stats, which it
+// overwrites whole. A loop that judges one pass at a time (detectBlackhole,
+// ping) reuses one value instead of allocating one per pass; the caller must
+// not keep the value past its pass.
+func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWindowStats) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -19627,7 +19834,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	netSourceCounts := []int{}
+	netSourceCounts := self.windowStatsSourceCounts[:0]
 	for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
 		if isPublicPort(ip4Path.DestinationPort) {
 			netSourceCounts = append(netSourceCounts, len(sourceCounts))
@@ -19637,6 +19844,12 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		if isPublicPort(ip6Path.DestinationPort) {
 			netSourceCounts = append(netSourceCounts, len(sourceCounts))
 		}
+	}
+	// keep the list for the next read unless a burst grew it past a small bound
+	if cap(netSourceCounts) <= windowStatsSourceCountsRetainMax {
+		self.windowStatsSourceCounts = netSourceCounts[:0]
+	} else {
+		self.windowStatsSourceCounts = nil
 	}
 	slices.Sort(netSourceCounts)
 	maxSourceCount := 0
@@ -19676,7 +19889,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	stats := &clientWindowStats{
+	*stats = clientWindowStats{
 		log:            log,
 		sourceCount:    maxSourceCount,
 		netSourceCount: netSourceCount,
@@ -19798,8 +20011,12 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	return stats, err
+	return err
 }
+
+// windowStatsSourceCountsRetainMax bounds the per-destination list a channel
+// keeps between window stats reads.
+const windowStatsSourceCountsRetainMax = 1024
 
 // clientDone is the underlying transport client's done channel, nil-safe for
 // the bare fixture channels built literally by tests (the same convention

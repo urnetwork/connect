@@ -616,26 +616,44 @@ func proberPlan(now time.Time, candidates []proberCandidate) []int {
 // stateLock inside) and never across a probe pass (which waits on the
 // network). The pass goroutines hold no lock at all while probing, which is
 // the established F-1 rule.
+//
+// One timer is armed for the loop's life, and each scan refills the previous
+// scan's client list, live set and candidates, so a scan that schedules
+// nothing allocates nothing.
 func (self *RemoteUserNatMultiClient) runProber() {
 	sem := make(chan struct{}, proberConcurrency)
 	var stateMutex sync.Mutex
 	inFlight := map[*multiClientChannel]bool{}
 	lastAttempt := map[*multiClientChannel]time.Time{}
 
+	var scanTimer *time.Timer
+	defer func() {
+		if scanTimer != nil {
+			scanTimer.Stop()
+		}
+	}()
+	var clients []*multiClientChannel
+	live := map[*multiClientChannel]bool{}
+	var candidates []proberCandidate
 	for {
+		if scanTimer == nil {
+			scanTimer = time.NewTimer(proberScanInterval)
+		} else {
+			scanTimer.Reset(proberScanInterval)
+		}
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(proberScanInterval):
+		case <-scanTimer.C:
 		}
 
 		if !self.reliabilitySettings().ProviderProbe {
 			continue
 		}
 
-		clients := []*multiClientChannel{}
+		clients = clients[:0]
 		for _, window := range self.windows {
-			clients = append(clients, window.unorderedClients()...)
+			clients = window.appendUnorderedClients(clients)
 		}
 
 		// forget departed clients so the maps track the window, not history.
@@ -644,7 +662,6 @@ func (self *RemoteUserNatMultiClient) runProber() {
 		func() {
 			stateMutex.Lock()
 			defer stateMutex.Unlock()
-			live := map[*multiClientChannel]bool{}
 			for _, client := range clients {
 				live[client] = true
 			}
@@ -653,10 +670,15 @@ func (self *RemoteUserNatMultiClient) runProber() {
 					delete(lastAttempt, client)
 				}
 			}
+			clear(live)
 		}()
 
 		now := time.Now()
-		candidates := make([]proberCandidate, len(clients))
+		if cap(candidates) < len(clients) {
+			candidates = make([]proberCandidate, len(clients))
+		} else {
+			candidates = candidates[:len(clients)]
+		}
 		for i, client := range clients {
 			// both reads take the parent stateLock inside; no other lock is
 			// held here, per the clientFlowCount contract
@@ -677,6 +699,8 @@ func (self *RemoteUserNatMultiClient) runProber() {
 
 		picks := proberPlan(now, candidates)
 		if len(picks) == 0 {
+			// the lists keep no departed client until the next scan
+			clear(clients)
 			continue
 		}
 
@@ -742,6 +766,7 @@ func (self *RemoteUserNatMultiClient) runProber() {
 				}
 			})
 		}
+		clear(clients)
 	}
 }
 
