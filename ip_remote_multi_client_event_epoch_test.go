@@ -231,7 +231,7 @@ func TestMultiClientEventEpochParksWhileIdle(t *testing.T) {
 		localPath := &IpPath{
 			Version:         4,
 			Protocol:        IpProtocolUdp,
-			SourceIp:        net.ParseIP("10.0.0.2"),
+			SourceIp:        net.ParseIP("192.0.2.10"),
 			SourcePort:      40000,
 			DestinationIp:   net.ParseIP("198.51.100.7"),
 			DestinationPort: 53,

@@ -53,9 +53,9 @@ func sendStallParkTestPath() *IpPath {
 	return &IpPath{
 		Version:         4,
 		Protocol:        IpProtocolTcp,
-		SourceIp:        net.ParseIP("10.0.0.2"),
+		SourceIp:        net.ParseIP("192.0.2.10"),
 		SourcePort:      40000,
-		DestinationIp:   net.ParseIP("192.0.2.1"),
+		DestinationIp:   net.ParseIP("198.51.100.1"),
 		DestinationPort: 443,
 	}
 }

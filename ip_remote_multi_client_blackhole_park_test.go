@@ -62,7 +62,7 @@ func healthParkTestPath(destination byte, syn bool) *IpPath {
 	return &IpPath{
 		Version:         4,
 		Protocol:        IpProtocolTcp,
-		SourceIp:        net.ParseIP("10.0.0.2"),
+		SourceIp:        net.ParseIP("203.0.113.10"),
 		SourcePort:      40000,
 		DestinationIp:   net.IPv4(192, 0, 2, destination),
 		DestinationPort: 443,
