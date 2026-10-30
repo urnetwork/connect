@@ -17465,8 +17465,8 @@ components:
           type: integer
           format: int64
         replica_score:
-          description: The board's replica of the validator's head score for the fleet, from its complete trails.
-          type: number
+          description: The fleet's exact replica score; null until authenticated evidence and prior state are available for replay.
+          type: [number, "null"]
           format: double
         validator_score:
           description: The validator's own head score for the fleet, from its signed head summary; null without one.

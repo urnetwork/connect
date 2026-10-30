@@ -11,6 +11,13 @@ class SpecTest(unittest.TestCase):
     def setUpClass(cls):
         cls.spec = yaml.safe_load(Path(__file__).with_name("bringyour.yml").read_text())
 
+    def test_sn_top_replica_score_distinguishes_unavailable_evidence(self):
+        fleet = self.spec["components"]["schemas"]["SnTopFleet"]
+        self.assertIn("replica_score", fleet["required"])
+        self.assertEqual(
+            ["number", "null"], fleet["properties"]["replica_score"]["type"]
+        )
+
     def test_paths_and_shared_responses_stay_in_their_sections(self):
         paths = self.spec["paths"]
         for path in ("/privacy.txt", "/terms.txt", "/vdp.txt"):
