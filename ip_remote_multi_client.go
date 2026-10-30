@@ -481,6 +481,15 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
+		// joiners and settings changes wake the prober, so the bound only
+		// covers an exit whose flows ended while its proof went stale
+		ProberScanMaxInterval: time.Minute,
+		// the joiner bound of the 5s scan this replaced: the exits a window
+		// forms with at the start of a session share one sweep
+		ProberJoinDelay: 5 * time.Second,
+		// see the field comments
+		ProberAttemptMinInterval: time.Minute,
+		ProberReprobeInterval:    10 * time.Minute,
 		// a tcp handshake through a provider to a live site completes well
 		// inside this on any network worth keeping; past it the answer is not
 		// coming, and a probe that waits longer only delays a sweep
@@ -1226,6 +1235,32 @@ type MultiClientSettings struct {
 	// default on this fork, and is inert on its own: something has to call
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
+	// ProberScanMaxInterval is the longest the prober sleeps between scans of
+	// the windows. It otherwise sleeps until the next exit falls due, and a
+	// window admitting an exit or a reliability settings change wakes it (see
+	// ProberJoinDelay), so this bounds only how late it notices what nothing
+	// signals: an exit whose flows ended, which the prober re-probes once its
+	// proof is stale and it is idle. Non-positive leaves the sleep unbounded.
+	ProberScanMaxInterval time.Duration
+	// ProberJoinDelay is how long after a window admits an exit, or the
+	// reliability settings change, the prober scans. Exits admitted together
+	// share one sweep, whose result line tells a pool of bad providers from a
+	// phone that was away only when it judges them together. Non-positive
+	// scans at once.
+	ProberJoinDelay time.Duration
+	// ProberAttemptMinInterval is the per-exit floor between probe pass
+	// attempts, keyed on the attempt rather than the recorded pass: a pass
+	// that sends nothing (transport refusing, every registration colliding)
+	// records nothing in the qualification table by design, and without this
+	// floor the prober would retry such an exit at every scan. Non-positive
+	// has no floor: such an exit is retried at the next scan.
+	ProberAttemptMinInterval time.Duration
+	// ProberReprobeInterval is how often an idle exit with a stale (or no)
+	// qualification is asked again. Half of these passes advance the rotation
+	// over the table; loaded exits never wait on this, their own receive
+	// progress refreshes them for free (see touchQualificationOnReceive).
+	// Non-positive asks again as often as ProberAttemptMinInterval allows.
+	ProberReprobeInterval time.Duration
 
 	// DataOnlyProviderProbe lets an application-owned, finite probe evaluate
 	// one explicitly fixed provider with its real traffic. It is effective
@@ -1902,6 +1937,11 @@ type RemoteUserNatMultiClient struct {
 	eventEpochWake    chan struct{}
 	// Observes each wake of the event epoch worker. Nil in production.
 	eventEpochWakeForTest atomic.Pointer[func()]
+	// wakes a sleeping prober (runProber) for a joiner or a settings change
+	proberWake chan struct{}
+	// Nil outside focused tests. Runs at the start of each prober scan
+	// (runProber). Set before the loop starts.
+	proberScanForTest func()
 	// every window client's transport delay stats pass through here unchanged
 	// (DELAY.md §9, D9)
 	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
@@ -2745,6 +2785,7 @@ func NewRemoteUserNatMultiClient(
 		packetStatsCounters:          &packetStatsCounters{},
 		packetStatsCallbacks:         NewCallbackList[PacketStatsFunction](),
 		eventEpochWake:               make(chan struct{}, 1),
+		proberWake:                   make(chan struct{}, 1),
 		transportDelayStatsCallbacks: NewCallbackList[TransportDelayStatsFunction](),
 		reliabilityMetrics:           newReliabilityMetrics(),
 		flowReaperWake:               make(chan struct{}, 1),
@@ -2828,6 +2869,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.recordProbePass,
 		multiClient.providerPolicyPreference,
 		multiClient.publishTransportDelayStats,
+		multiClient.clientAdded,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2855,6 +2897,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.recordProbePass,
 			multiClient.providerPolicyPreference,
 			multiClient.publishTransportDelayStats,
+			multiClient.clientAdded,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -3663,6 +3706,8 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 	// knobs. Wake the shared reaper so a shorter override applies immediately;
 	// a longer one is harmlessly rechecked before any flow is detached.
 	self.notifyFlowReaper()
+	// the prober honors ProviderProbe and the probe knobs from its next scan
+	self.wakeProber()
 
 	log := loggerOrDefault(self.log)
 	if classifierChanged {
@@ -11847,6 +11892,9 @@ type multiClientWindow struct {
 	// It neither emits provider events nor migrates flows.
 	clientRetireCallback func(client *multiClientChannel)
 	windowType           WindowType
+	// called after the window admits a client, with no lock held; nil in
+	// bare fixtures
+	clientAddCallback func(client *multiClientChannel)
 
 	settings *MultiClientSettings
 	// reliabilitySettingsFunc reads the parent's effective reliability config,
@@ -12070,10 +12118,14 @@ func newMultiClientWindow(
 	// goroutines start so every client it creates subscribes it (DELAY.md
 	// §9); nil in bare fixtures
 	transportDelayStats TransportDelayStatsFunction,
+	// called after the window admits a client, with no lock held; nil in
+	// bare fixtures
+	clientAddCallback func(client *multiClientChannel),
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
 		transportDelayStats:          transportDelayStats,
+		clientAddCallback:            clientAddCallback,
 		cancel:                       cancel,
 		log:                          loggerOrDefault(settings.Log),
 		generator:                    generator,
@@ -14065,6 +14117,9 @@ func (self *multiClientWindow) expand(
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		if self.clientAddCallback != nil {
+			self.clientAddCallback(client)
+		}
 		self.noteRecentExitAdmitted(args)
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true

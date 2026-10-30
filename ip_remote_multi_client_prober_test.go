@@ -328,6 +328,9 @@ func TestProbeResolverDownFallsBackToLiterals(t *testing.T) {
 // their qualification ages, flow counts, and attempt history.
 func TestProberPlanTable(t *testing.T) {
 	now := time.Now()
+	settings := DefaultMultiClientSettings()
+	proberAttemptMinInterval := settings.ProberAttemptMinInterval
+	proberReprobeInterval := settings.ProberReprobeInterval
 	cases := []struct {
 		name      string
 		candidate proberCandidate
@@ -370,18 +373,18 @@ func TestProberPlanTable(t *testing.T) {
 			proberCandidate{flowCount: 5}, true},
 	}
 	for _, c := range cases {
-		picks := proberPlan(now, []proberCandidate{c.candidate})
+		picks, _ := proberPlan(now, []proberCandidate{c.candidate}, settings)
 		if got := len(picks) == 1; got != c.want {
 			t.Errorf("%s: probe=%v, want %v", c.name, got, c.want)
 		}
 	}
 
 	// indexes come back aligned to the input
-	picks := proberPlan(now, []proberCandidate{
+	picks, _ := proberPlan(now, []proberCandidate{
 		{},
 		{inFlight: true},
 		{},
-	})
+	}, settings)
 	if len(picks) != 2 || picks[0] != 0 || picks[1] != 2 {
 		t.Errorf("picks = %v, want [0 2]", picks)
 	}
