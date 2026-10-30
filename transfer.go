@@ -14158,6 +14158,8 @@ type ReceiveBufferSettings struct {
 	beforeAckWorkerStopForTest         func(receiveSequenceId)
 	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
+	// Nil observer counts each arm of the ACK worker's compression timer.
+	afterAckCompressTimerArmForTest func(receiveSequenceId)
 	// Nil observer exposes an idle check while producer admission is held.
 	afterIdleCloseForTest func(receiveSequenceId, bool)
 	// Nil by default. Exposes the fixed handoff census without changing admission.
@@ -15877,10 +15879,25 @@ func (self *ReceiveSequence) Run() {
 		}
 
 		// reusable ack-compress timer (avoids a per-iteration time.After alloc on
-		// the ack hot path). created already-fired; Reset before the blocking
-		// select arms it (go1.23+ delivers no stale fire after Reset).
+		// the ack hot path). created already-fired; a wait moves it only when its
+		// deadline differs from the one armed (go1.23+ delivers no stale fire
+		// after Reset). A wait woken without a new deadline, by the quantum
+		// signal or a drained cancellation, keeps the timer it armed: a Reset
+		// of the unfired timer would modify the runtime's heap for nothing.
 		ackCompressTimer := time.NewTimer(0)
 		defer ackCompressTimer.Stop()
+		// the deadline the timer is armed for and has not delivered; zero when none
+		ackCompressTimerDeadline := time.Time{}
+		armAckCompressTimer := func(deadline time.Time) <-chan time.Time {
+			if !deadline.Equal(ackCompressTimerDeadline) {
+				ackCompressTimer.Reset(time.Until(deadline))
+				ackCompressTimerDeadline = deadline
+				if self.receiveBufferSettings.afterAckCompressTimerArmForTest != nil {
+					self.receiveBufferSettings.afterAckCompressTimerArmForTest(self.id())
+				}
+			}
+			return ackCompressTimer.C
+		}
 		var ackScratch [ackResponseMaxCount]sequenceAck
 		lastAckWriteTime := time.Time{}
 		var lastAck sequenceAck
@@ -15993,14 +16010,15 @@ func (self *ReceiveSequence) Run() {
 
 			if !retryNotBefore.IsZero() {
 				if wait := time.Until(retryNotBefore); wait > 0 {
-					ackCompressTimer.Reset(wait)
+					retryReached := armAckCompressTimer(retryNotBefore)
 					select {
 					case <-ctxDone:
 						drainCanceledSequence()
 					case <-ackWorkerStop:
 						drainAndStop()
 						return
-					case <-ackCompressTimer.C:
+					case <-retryReached:
+						ackCompressTimerDeadline = time.Time{}
 					}
 					continue
 				}
@@ -16063,7 +16081,7 @@ func (self *ReceiveSequence) Run() {
 					if !quietDeadline.IsZero() && quietDeadline.Before(deadline) {
 						deadline = quietDeadline
 					}
-					ackCompressTimer.Reset(time.Until(deadline))
+					deadlineReached := armAckCompressTimer(deadline)
 					if self.receiveBufferSettings.beforeAckCompressWaitForTest != nil {
 						self.receiveBufferSettings.beforeAckCompressWaitForTest(self.id())
 					}
@@ -16074,7 +16092,8 @@ func (self *ReceiveSequence) Run() {
 					case <-ackWorkerStop:
 						drainAndStop()
 						return
-					case <-ackCompressTimer.C:
+					case <-deadlineReached:
+						ackCompressTimerDeadline = time.Time{}
 					case <-self.ackWindow.HeadQuietNotify():
 					case <-self.ackWindow.GapNotify():
 						break compressWait
