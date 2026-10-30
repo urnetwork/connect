@@ -1,7 +1,8 @@
-// The H3 owner re-arms its stream deadlines only when less than their timeout
-// is left, and paces its pings from its last write (server CPUOPT2.md §9). A
-// stream-only QUIC peer on the loopback echoes the authentication, then trades
-// payloads with the owner one at a time.
+// The H3 owner installs no stream deadline per batch or per read: its read
+// and write watchdogs bound each operation instead, arming their one timer
+// about once per timeout, and it paces its pings from its last write (server
+// CPUOPT2.md §9). A stream-only QUIC peer on the loopback echoes the
+// authentication, then trades payloads with the owner one at a time.
 package connect
 
 import (
@@ -17,26 +18,15 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
-// How far past its WriteTimeout a re-armed stream write deadline reaches.
-func h3WriteDeadlineSlack(settings *PlatformTransportSettings) time.Duration {
-	return time.Duration(float64(settings.WriteTimeout) * settings.WriteDeadlineSlackFraction)
-}
-
-// How far past its ReadTimeout a re-armed stream read deadline reaches.
-func h3ReadDeadlineSlack(settings *PlatformTransportSettings) time.Duration {
-	return time.Duration(float64(settings.ReadTimeout) * settings.ReadDeadlineSlackFraction)
-}
-
-// The stream deadlines and ping timer arms an H3 owner made, and the least and
-// most time its write deadline left as each stream write began.
+// The stream deadlines, watchdog arms and ping timer arms an H3 owner made,
+// and its stream writes.
 type h3LazyDeadlineCounts struct {
-	writeDeadlineCount     int
-	readDeadlineCount      int
-	writeDeadline          time.Time
-	streamWriteCount       int
-	leastWriteDeadlineLeft time.Duration
-	mostWriteDeadlineLeft  time.Duration
-	pingTimerArmCount      int
+	writeDeadlineCount int
+	readDeadlineCount  int
+	streamWriteCount   int
+	writeWatchdogArms  int
+	readWatchdogArms   int
+	pingTimerArmCount  int
 }
 
 // stateLock guards counts, which the owner's hooks update.
@@ -52,7 +42,6 @@ func (self *h3LazyDeadlineStats) observe(settings *PlatformTransportSettings) {
 		defer self.stateLock.Unlock()
 		if write {
 			self.counts.writeDeadlineCount += 1
-			self.counts.writeDeadline = deadline
 		} else {
 			self.counts.readDeadlineCount += 1
 		}
@@ -60,15 +49,15 @@ func (self *h3LazyDeadlineStats) observe(settings *PlatformTransportSettings) {
 	settings.beforeH3StreamWriteForTest = func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		counts := &self.counts
-		left := time.Until(counts.writeDeadline)
-		counts.streamWriteCount += 1
-		if counts.streamWriteCount == 1 {
-			counts.leastWriteDeadlineLeft = left
-			counts.mostWriteDeadlineLeft = left
+		self.counts.streamWriteCount += 1
+	}
+	settings.ioWatchdogArmForTest = func(write bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if write {
+			self.counts.writeWatchdogArms += 1
 		} else {
-			counts.leastWriteDeadlineLeft = min(counts.leastWriteDeadlineLeft, left)
-			counts.mostWriteDeadlineLeft = max(counts.mostWriteDeadlineLeft, left)
+			self.counts.readWatchdogArms += 1
 		}
 	}
 	settings.pingTimerArmForTest = func() {
@@ -78,11 +67,11 @@ func (self *h3LazyDeadlineStats) observe(settings *PlatformTransportSettings) {
 	}
 }
 
-// Forgets the counts so far, but not the write deadline in force.
+// Forgets the counts so far.
 func (self *h3LazyDeadlineStats) reset() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.counts = h3LazyDeadlineCounts{writeDeadline: self.counts.writeDeadline}
+	self.counts = h3LazyDeadlineCounts{}
 }
 
 // The counts since the last reset.
@@ -93,10 +82,9 @@ func (self *h3LazyDeadlineStats) snapshot() h3LazyDeadlineCounts {
 }
 
 // Every payload is its own stream batch and every inbound payload its own
-// stream read. Within one slack the owner installs each stream deadline at
-// most once and arms no ping timer, where it used to install one per batch and
-// per read and arm the ping timer per batch. Every stream write still begins
-// with at least WriteTimeout left.
+// stream read. The owner installs no stream deadline and arms each watchdog
+// at most once per timeout and no ping timer, where it used to install a
+// deadline per batch and per read and arm the ping timer per batch.
 func TestH3LazyStreamDeadlinesInstallOncePerSlack(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		certPem, keyPem, err := selfSign(
@@ -200,9 +188,6 @@ func TestH3LazyStreamDeadlinesInstallOncePerSlack(t *testing.T) {
 		settings.afterH3ReceiveEnqueueForTest = func([]byte) {
 			clientReceived <- struct{}{}
 		}
-		if h3WriteDeadlineSlack(settings) <= 0 || h3ReadDeadlineSlack(settings) <= 0 {
-			t.Fatal("the default settings re-arm stream deadlines before every operation")
-		}
 		stats.observe(settings)
 		routeManager := NewRouteManager(ctx, "h3-lazy-deadline")
 		transport := NewPlatformTransportWithTargetMode(
@@ -263,21 +248,18 @@ func TestH3LazyStreamDeadlinesInstallOncePerSlack(t *testing.T) {
 		if got.streamWriteCount != sendCount {
 			t.Fatalf("%d payloads took %d stream writes, want one each", sendCount, got.streamWriteCount)
 		}
-		// one installation per slack that elapsed, so a slow run cannot fail it
-		writeDeadlineAllowance := 1 + int(elapsed/h3WriteDeadlineSlack(settings))
-		readDeadlineAllowance := 1 + int(elapsed/h3ReadDeadlineSlack(settings))
-		if writeDeadlineAllowance < got.writeDeadlineCount || readDeadlineAllowance < got.readDeadlineCount {
-			t.Fatalf("in %s, %d stream writes and %d reads installed %d write and %d read deadlines, want at most %d and %d",
-				elapsed, sendCount, receiveCount, got.writeDeadlineCount, got.readDeadlineCount,
-				writeDeadlineAllowance, readDeadlineAllowance)
+		// only an interrupt installs a stream deadline, and nothing stalled
+		if got.writeDeadlineCount != 0 || got.readDeadlineCount != 0 {
+			t.Fatalf("in %s, %d stream writes and %d reads installed %d write and %d read deadlines, want none",
+				elapsed, sendCount, receiveCount, got.writeDeadlineCount, got.readDeadlineCount)
 		}
-		// real time passes between the lazy check and the write it admits
-		const checkToWriteAllowance = time.Second
-		if got.leastWriteDeadlineLeft < settings.WriteTimeout-checkToWriteAllowance ||
-			settings.WriteTimeout+h3WriteDeadlineSlack(settings) < got.mostWriteDeadlineLeft {
-			t.Fatalf("stream writes began with %s to %s left, want %s to %s",
-				got.leastWriteDeadlineLeft, got.mostWriteDeadlineLeft,
-				settings.WriteTimeout, settings.WriteTimeout+h3WriteDeadlineSlack(settings))
+		// one arm per timeout that elapsed, so a slow run cannot fail it
+		writeArmAllowance := 1 + int(elapsed/settings.WriteTimeout)
+		readArmAllowance := 1 + int(elapsed/settings.ReadTimeout)
+		if writeArmAllowance < got.writeWatchdogArms || readArmAllowance < got.readWatchdogArms {
+			t.Fatalf("in %s, %d stream writes and %d reads armed the write watchdog %d and the read watchdog %d times, want at most %d and %d",
+				elapsed, sendCount, receiveCount, got.writeWatchdogArms, got.readWatchdogArms,
+				writeArmAllowance, readArmAllowance)
 		}
 		if pingTimerArmAllowance := int(elapsed / settings.PingTimeout); pingTimerArmAllowance < got.pingTimerArmCount {
 			t.Fatalf("in %s, %d stream writes armed the ping timer %d times, want at most %d", elapsed, sendCount, got.pingTimerArmCount, pingTimerArmAllowance)
