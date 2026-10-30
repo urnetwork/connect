@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -118,7 +119,10 @@ func TestP2pLegacyWriteTimeoutStartsAtPhysicalWrite(t *testing.T) {
 
 // Giving each write its own budget must not turn an actually stuck SCTP write
 // into an unbounded wait. The earlier successful write consumes twelve seconds
-// of queue age; the next physical call still fails after exactly fifteen more.
+// of queue age; the next physical call still fails no earlier than
+// WriteTimeout after it starts. The deadline is re-armed lazily: that call
+// found less than WriteTimeout left, so it re-armed at WriteTimeout plus the
+// slack, and fails exactly then, within 1.5 WriteTimeout at the default.
 func TestP2pLegacyPhysicalWriteTimeoutStillBoundsBlockedCarrier(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -153,20 +157,102 @@ func TestP2pLegacyPhysicalWriteTimeoutStillBoundsBlockedCarrier(t *testing.T) {
 		}
 		synctest.Wait()
 		blockedAt := time.Now()
+		slack := time.Duration(float64(settings.WriteTimeout) * settings.WriteDeadlineSlackFraction)
+		if slack <= 0 || settings.WriteTimeout/2 < slack {
+			t.Fatalf("write deadline slack %s, expected (0, WriteTimeout/2]", slack)
+		}
 		time.Sleep(settings.WriteTimeout - time.Nanosecond)
 		synctest.Wait()
 		if ctx.Err() != nil {
 			t.Fatalf("queued age shortened the physical write budget: %v after %s", ctx.Err(), time.Since(blockedAt))
+		}
+		time.Sleep(slack)
+		synctest.Wait()
+		if ctx.Err() != nil {
+			t.Fatalf("the re-armed physical write lost its slack: %v after %s", ctx.Err(), time.Since(blockedAt))
 		}
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		select {
 		case <-transport.(P2pRouteLifecycle).Done():
 		default:
-			t.Fatal("blocked physical carrier outlived its unchanged WriteTimeout")
+			t.Fatal("blocked physical carrier outlived its WriteTimeout and slack")
 		}
 		if len(writes) != 2 || !writes[0].Success || writes[1].Success ||
-			writes[1].ElapsedNanos != int64(settings.WriteTimeout) || writes[1].ErrorKind != "io_timeout" {
+			writes[1].ElapsedNanos != int64(settings.WriteTimeout+slack) || writes[1].ErrorKind != "io_timeout" {
+			t.Fatalf("physical timeout disposition=%+v", writes)
+		}
+		if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
+			t.Fatalf("timeout did not return every queued root and owner: %+v", stats)
+		}
+	})
+}
+
+// The other side of the lazy deadline: a write that finds at least
+// WriteTimeout left keeps the installed deadline, so it fails later than
+// WriteTimeout after it starts but before WriteTimeout and the slack. Writes
+// start at 0 s (the first, armed at 15 s), 1 s (re-armed to 23.5 s) and 5 s
+// (18.5 s left, kept), and the last one is never read.
+func TestP2pLegacyKeptWriteDeadlineStillBoundsBlockedCarrier(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		left, right := net.Pipe()
+		defer left.Close()
+		defer right.Close()
+		budget := NewTransferMemoryBudget(kib(512))
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		var writes []TransferProgressEvent
+		settings.ProgressObserver = func(event TransferProgressEvent) {
+			if event.Stage == "p2p_write_end" {
+				writes = append(writes, event)
+			}
+		}
+		transport, route := NewP2pSendTransport(ctx, cancel, &p2pLegacyQueueBudgetTestConn{Conn: left, budget: budget}, NewId(), settings)
+		defer func() {
+			left.Close()
+			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+		start := time.Now()
+		for index := range 3 {
+			route <- legacyQueueTestPacket(uint32(index), 1200)
+		}
+		synctest.Wait()
+		for _, readAt := range []time.Duration{time.Second, 5 * time.Second} {
+			time.Sleep(time.Until(start.Add(readAt)))
+			if _, err := io.ReadFull(right, make([]byte, 1200)); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+		}
+		blockedAt := time.Now()
+		keptDeadline := start.Add(time.Second + settings.WriteTimeout + time.Duration(float64(settings.WriteTimeout)*settings.WriteDeadlineSlackFraction))
+		if keptDeadline.Sub(blockedAt) < settings.WriteTimeout {
+			t.Fatalf("the fixture's kept deadline %s is less than WriteTimeout after the write", keptDeadline.Sub(blockedAt))
+		}
+		time.Sleep(settings.WriteTimeout - time.Nanosecond)
+		synctest.Wait()
+		if ctx.Err() != nil {
+			t.Fatalf("a kept deadline failed the write before WriteTimeout: %v after %s", ctx.Err(), time.Since(blockedAt))
+		}
+		time.Sleep(time.Until(keptDeadline.Add(-time.Nanosecond)))
+		synctest.Wait()
+		if ctx.Err() != nil {
+			t.Fatalf("the write failed before its kept deadline: %v after %s", ctx.Err(), time.Since(blockedAt))
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		select {
+		case <-transport.(P2pRouteLifecycle).Done():
+		default:
+			t.Fatal("blocked physical carrier outlived its kept deadline")
+		}
+		if len(writes) != 3 || !writes[0].Success || !writes[1].Success || writes[2].Success ||
+			writes[2].ElapsedNanos != int64(keptDeadline.Sub(blockedAt)) || writes[2].ErrorKind != "io_timeout" {
 			t.Fatalf("physical timeout disposition=%+v", writes)
 		}
 		if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
@@ -252,6 +338,81 @@ func TestP2pLegacyQueuedWriteCannotExtendTransferAckLifetime(t *testing.T) {
 		if got.err == nil || got.at != started.Add(30*time.Second) || ctx.Err() != nil ||
 			sequence.resendQueue.Len() != 0 || len(sequence.ackLifetimes.items) != 0 {
 			t.Fatalf("ACK lifetime changed: terminal=%+v elapsed=%s carrier=%v resend=%d lifetimes=%d", got, got.at.Sub(started), ctx.Err(), sequence.resendQueue.Len(), len(sequence.ackLifetimes.items))
+		}
+	})
+}
+
+// Counts the write deadlines the legacy writer installs on its connection.
+type p2pWriteDeadlineCountingConn struct {
+	stateLock          sync.Mutex
+	writeCount         int
+	writeDeadlineCount int
+	written            chan struct{}
+}
+
+func (self *p2pWriteDeadlineCountingConn) Write(message []byte) (int, error) {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.writeCount += 1
+	}()
+	self.written <- struct{}{}
+	return len(message), nil
+}
+
+func (self *p2pWriteDeadlineCountingConn) SetWriteDeadline(time.Time) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.writeDeadlineCount += 1
+	return nil
+}
+
+func (self *p2pWriteDeadlineCountingConn) counts() (int, int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.writeCount, self.writeDeadlineCount
+}
+
+func (self *p2pWriteDeadlineCountingConn) Read([]byte) (int, error)        { return 0, io.EOF }
+func (self *p2pWriteDeadlineCountingConn) Close() error                    { return nil }
+func (self *p2pWriteDeadlineCountingConn) LocalAddr() net.Addr             { return &net.IPAddr{} }
+func (self *p2pWriteDeadlineCountingConn) RemoteAddr() net.Addr            { return &net.IPAddr{} }
+func (self *p2pWriteDeadlineCountingConn) SetDeadline(time.Time) error     { return nil }
+func (self *p2pWriteDeadlineCountingConn) SetReadDeadline(time.Time) error { return nil }
+
+// 64 messages a millisecond apart install the physical write deadline at most
+// twice: the first write arms WriteTimeout alone and the second re-arms it with
+// the slack, which 64 ms of messages never use up. Before, every message
+// installed one.
+func TestP2pLegacyWriteDeadlineInstalledPerBurstNotPerMessage(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		conn := &p2pWriteDeadlineCountingConn{written: make(chan struct{})}
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		transport, route := NewP2pSendTransport(ctx, cancel, conn, NewId(), settings)
+		defer func() {
+			cancel()
+			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		const messageCount = 64
+		for index := range messageCount {
+			time.Sleep(time.Millisecond)
+			route <- legacyQueueTestPacket(uint32(index), 1200)
+			<-conn.written
+		}
+		synctest.Wait()
+		writeCount, writeDeadlineCount := conn.counts()
+		if writeCount != messageCount {
+			t.Fatalf("%d messages written, expected %d", writeCount, messageCount)
+		}
+		if 2 < writeDeadlineCount {
+			t.Fatalf("%d write deadlines installed for %d messages, expected at most 2", writeDeadlineCount, messageCount)
 		}
 	})
 }

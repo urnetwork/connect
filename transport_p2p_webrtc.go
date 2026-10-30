@@ -869,10 +869,14 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		MaxPeerConnectionCount: MemoryScaledCount(32, 8),
 		DisconnectedTimeout:    30 * time.Second,
 		FailedTimeout:          30 * time.Second,
-		// Pion's two-second default halves idle STUN/radio wakeups versus the
-		// former one-second override without changing the 30-second
-		// disconnect/failure thresholds.
-		KeepAliveTimeout: 2 * time.Second,
+		// While connected, the ICE agent of every peer connection wakes and
+		// sends a consent check once per keepalive. Pion's two-second default
+		// suits its own five-second disconnect timeout. Against the 30-second
+		// thresholds here, five seconds (RFC 7675's consent cadence) still
+		// fits six checks in each window and refreshes the selected pair's NAT
+		// bindings far inside common UDP mapping timeouts, with 2.5 times
+		// fewer idle STUN and radio wakeups.
+		KeepAliveTimeout: 5 * time.Second,
 		// Host candidates are available immediately. Bound the lifetime of
 		// dead STUN socket/gather goroutines instead of accepting Pion's
 		// five-second default for every URL and address family.
@@ -3127,6 +3131,15 @@ type peerConn struct {
 
 	readDeadline  time.Time
 	writeDeadline time.Time
+	// The deadlines Read and Write last installed on conn, so an unchanged
+	// deadline is not installed again for every message: on the SCTP stream
+	// each install takes the stream lock, and a write deadline also re-arms
+	// the stream's deadline timer. A new conn has none, so installing one
+	// resets both. Guarded by stateLock. Writes are serialized by the route's
+	// one writer and reads by its one reader; another concurrent caller at
+	// worst installs an unchanged deadline again.
+	connReadDeadline  time.Time
+	connWriteDeadline time.Time
 }
 
 const (
@@ -4439,6 +4452,8 @@ func (self *peerConn) installOpenDataChannel(conn datachannel.ReadWriteCloserDea
 		defer self.stateLock.Unlock()
 		if (self.ctx == nil || self.ctx.Err() == nil) && self.conn == nil {
 			self.conn = conn
+			self.connReadDeadline = time.Time{}
+			self.connWriteDeadline = time.Time{}
 			accepted = true
 			self.connMonitor.NotifyAll()
 		}
@@ -4451,28 +4466,30 @@ func (self *peerConn) installOpenDataChannel(conn datachannel.ReadWriteCloserDea
 	return accepted
 }
 
+// The open data channel, waiting until it opens or the deadline passes. A
+// deadline that has already passed fails at once, as a stream deadline does.
+// Once the connection is up the channel is open for every message, so the
+// deadline's timer is created only when the first look misses.
 func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWriteCloserDeadliner, error) {
 	conn := func() (datachannel.ReadWriteCloserDeadliner, chan struct{}) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		return self.conn, self.connMonitor.NotifyChannel()
 	}
-	var deadlineTimer *time.Timer
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return nil, os.ErrDeadlineExceeded
+	}
+	c, update := conn()
+	if c != nil {
+		return c, nil
+	}
 	var deadlineC <-chan time.Time
 	if !deadline.IsZero() {
-		timeout := time.Until(deadline)
-		if timeout <= 0 {
-			return nil, os.ErrDeadlineExceeded
-		}
-		deadlineTimer = time.NewTimer(timeout)
-		deadlineC = deadlineTimer.C
+		deadlineTimer := time.NewTimer(time.Until(deadline))
 		defer deadlineTimer.Stop()
+		deadlineC = deadlineTimer.C
 	}
 	for {
-		c, update := conn()
-		if c != nil {
-			return c, nil
-		}
 		select {
 		case <-self.ctx.Done():
 			return nil, os.ErrClosed
@@ -4480,22 +4497,37 @@ func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWrite
 		case <-deadlineC:
 			return nil, os.ErrDeadlineExceeded
 		}
+		c, update = conn()
+		if c != nil {
+			return c, nil
+		}
 	}
 }
 
 func (self *peerConn) Read(b []byte) (n int, err error) {
 	var deadline time.Time
+	var connDeadline time.Time
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		deadline = self.readDeadline
+		connDeadline = self.connReadDeadline
 	}()
 	var c datachannel.ReadWriteCloserDeadliner
 	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	c.SetReadDeadline(deadline)
+	// the steady-state reader clears its deadline once, so this is nearly
+	// always unchanged
+	if !deadline.Equal(connDeadline) {
+		c.SetReadDeadline(deadline)
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.connReadDeadline = deadline
+		}()
+	}
 	n, err = c.Read(b)
 	return
 }
@@ -4675,17 +4707,28 @@ func (self *peerConn) runSctpProgressWatchdog() {
 
 func (self *peerConn) Write(b []byte) (n int, err error) {
 	var deadline time.Time
+	var connDeadline time.Time
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		deadline = self.writeDeadline
+		connDeadline = self.connWriteDeadline
 	}()
 	var c datachannel.ReadWriteCloserDeadliner
 	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	c.SetWriteDeadline(deadline)
+	// the legacy writer re-arms its deadline lazily, so this is unchanged for
+	// most messages
+	if !deadline.Equal(connDeadline) {
+		c.SetWriteDeadline(deadline)
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.connWriteDeadline = deadline
+		}()
+	}
 	n, err = c.Write(b)
 	if 0 < n {
 		self.outboundByteCount.Add(uint64(n))

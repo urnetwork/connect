@@ -162,6 +162,10 @@ func DefaultP2pTransportSettings() *P2pTransportSettings {
 		ConnectTimeout:        15 * time.Second,
 		ReconnectTimeout:      5 * time.Second,
 		AdmissionRetryTimeout: 30 * time.Second,
+		// half WriteTimeout: a busy carrier installs a write deadline about
+		// once per 7.5 s, and a blocked physical write fails between 15 s and
+		// 22.5 s after it starts
+		WriteDeadlineSlackFraction: 0.5,
 		// Five seconds leaves a physical quiet window after a complete probe
 		// on the supported one-second regional path. A one-second cadence lets
 		// the two endpoints' independent request/response trains interleave
@@ -246,6 +250,15 @@ type P2pTransportSettings struct {
 	ReadTimeout      time.Duration
 	ConnectTimeout   time.Duration
 	ReconnectTimeout time.Duration
+	// How far past WriteTimeout the legacy writer re-arms a physical write
+	// deadline that is still running, as a share of WriteTimeout. A busy
+	// carrier then installs its deadline about once per this share of
+	// WriteTimeout instead of before every message, each install being a
+	// timer change on the SCTP stream. A physical write still fails no
+	// earlier than WriteTimeout after it starts, and at most this share later;
+	// the SCTP no-progress watchdog separately bounds a stalled association.
+	// Non-positive re-arms before every write.
+	WriteDeadlineSlackFraction float64
 	// AdmissionRetryTimeout is only the liveness fallback for a saturated
 	// peer-connection count/memory budget. Normal retries are woken
 	// immediately by a release, avoiding the former sub-second polling storm.
@@ -1416,6 +1429,59 @@ func (self *P2pSendTransport) takePendingProbe(probeBurst int) []byte {
 	}
 }
 
+// The legacy writer's physical write deadline, re-armed lazily (CPUOPT2 §9.2
+// finding 1). Each install is a timer change on the SCTP stream, so a busy
+// carrier should not install one per message. A write keeps the installed
+// deadline while it still has the timeout left. With less left, the deadline
+// is re-armed at the timeout plus the slack, so the writes that follow keep it
+// for about one slack. A deadline that has passed, or the first one, is armed
+// at the timeout alone: there is no burst yet to spread it over, so an
+// isolated write is bounded by the timeout exactly.
+//
+// Every write therefore fails no earlier than the timeout after it starts,
+// and at most the slack later. The extender relay's relayDeadline is the same
+// rule.
+//
+// One writer at a time owns a value.
+type p2pWriteDeadline struct {
+	timeout time.Duration
+	slack   time.Duration
+	// zero until the first write, and after a write with its own deadline
+	deadline time.Time
+}
+
+// The slack is slackFraction of the timeout. A non-positive fraction re-arms
+// before every write.
+func newP2pWriteDeadline(timeout time.Duration, slackFraction float64) p2pWriteDeadline {
+	var slack time.Duration
+	if 0 < slackFraction {
+		slack = time.Duration(float64(timeout) * slackFraction)
+	}
+	return p2pWriteDeadline{
+		timeout: timeout,
+		slack:   slack,
+	}
+}
+
+// The deadline for a write that starts at now, and whether it changed and
+// must be installed before the write.
+func (self *p2pWriteDeadline) next(now time.Time) (time.Time, bool) {
+	if self.deadline.IsZero() || !now.Before(self.deadline) {
+		self.deadline = now.Add(self.timeout)
+		return self.deadline, true
+	}
+	if self.deadline.Sub(now) < self.timeout {
+		self.deadline = now.Add(self.timeout + self.slack)
+		return self.deadline, true
+	}
+	return self.deadline, false
+}
+
+// Forgets the installed deadline after a write installed its own.
+func (self *p2pWriteDeadline) clear() {
+	self.deadline = time.Time{}
+}
+
 func (self *P2pSendTransport) run() {
 	var legacyQueue *p2pLegacySendQueue
 	defer close(self.done)
@@ -1460,16 +1526,27 @@ func (self *P2pSendTransport) run() {
 	}()
 
 	var pairRecorded atomic.Bool
+	// The physical writes are serialized, by this goroutine before the legacy
+	// queue exists and then by the queue's handoff, so they share one lazily
+	// re-armed deadline.
+	legacyWriteDeadline := newP2pWriteDeadline(self.settings.WriteTimeout, self.settings.WriteDeadlineSlackFraction)
 	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
+		installDeadline := true
 		if deadline.IsZero() {
-			deadline = time.Now().Add(self.settings.WriteTimeout)
+			deadline, installDeadline = legacyWriteDeadline.next(time.Now())
+		} else {
+			// a write with its own deadline replaces the armed one, so the
+			// next write arms afresh
+			legacyWriteDeadline.clear()
 		}
 		progressObserver := self.settings.ProgressObserver
 		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
 			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
 			TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
 		}, transferFrameBytes)
-		self.conn.SetWriteDeadline(deadline)
+		if installDeadline {
+			self.conn.SetWriteDeadline(deadline)
+		}
 		var nw int
 		var err error
 		if self.delay != nil {
