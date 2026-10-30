@@ -481,12 +481,16 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
-		// joiners and settings changes wake the prober, so the bound only
-		// covers an exit whose flows ended while its proof went stale
+		// joiners and settings changes wake the prober, and the recheck
+		// covers an exit held from a due probe, so the bound is a backstop
 		ProberScanMaxInterval: time.Minute,
 		// the joiner bound of the 5s scan this replaced: the exits a window
 		// forms with at the start of a session share one sweep
 		ProberJoinDelay: 5 * time.Second,
+		// the 5s scan this replaced, kept only while an exit is held from a
+		// due probe, so an exit whose flows end is re-probed as promptly as
+		// before the sleep
+		ProberRecheckInterval: 5 * time.Second,
 		// see the field comments
 		ProberAttemptMinInterval: time.Minute,
 		ProberReprobeInterval:    10 * time.Minute,
@@ -1236,11 +1240,11 @@ type MultiClientSettings struct {
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
 	// ProberScanMaxInterval is the longest the prober sleeps between scans of
-	// the windows. It otherwise sleeps until the next exit falls due, and a
-	// window admitting an exit or a reliability settings change wakes it (see
-	// ProberJoinDelay), so this bounds only how late it notices what nothing
-	// signals: an exit whose flows ended, which the prober re-probes once its
-	// proof is stale and it is idle. Non-positive leaves the sleep unbounded.
+	// the windows. It otherwise sleeps until the next exit falls due; a window
+	// admitting an exit or a reliability settings change wakes it (see
+	// ProberJoinDelay); and an exit held from a due probe is rechecked (see
+	// ProberRecheckInterval). So this is a backstop, not a detection bound.
+	// Non-positive leaves the sleep unbounded.
 	ProberScanMaxInterval time.Duration
 	// ProberJoinDelay is how long after a window admits an exit, or the
 	// reliability settings change, the prober scans. Exits admitted together
@@ -1248,6 +1252,14 @@ type MultiClientSettings struct {
 	// phone that was away only when it judges them together. Non-positive
 	// scans at once.
 	ProberJoinDelay time.Duration
+	// How often the prober scans while an exit due for a probe is held from it
+	// by something whose end nothing signals: flows it carries (its traffic is
+	// the better evidence until they end), or its own pass still in flight
+	// past the attempt floor. Each such exit is then probed within this much
+	// of its hold ending, as the periodic scan the sleep replaced probed it,
+	// while an exit whose proof is fresh costs no scan before it falls due.
+	// Non-positive leaves the end of a hold to ProberScanMaxInterval.
+	ProberRecheckInterval time.Duration
 	// ProberAttemptMinInterval is the per-exit floor between probe pass
 	// attempts, keyed on the attempt rather than the recorded pass: a pass
 	// that sends nothing (transport refusing, every registration colliding)

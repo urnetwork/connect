@@ -544,7 +544,7 @@ type proberCandidate struct {
 }
 
 // proberPlan decides which candidates get a probe pass this scan, and when
-// the next one falls due. Pure so the decision table is testable without
+// the loop should scan again. Pure so the decision table is testable without
 // windows, clocks, or goroutines; the loop is obligated to consult it
 // (anchored by TestProberLoopConsultsPlan).
 //
@@ -561,16 +561,25 @@ type proberCandidate struct {
 //
 // Each rule but the in-flight and loaded ones is a time to wait for, so a
 // candidate falls due at the latest of its waits and is picked once that is
-// not after now. nextDue is the earliest due time after now, when the loop
-// scans again if nothing else changes: a candidate picked now falls due again
-// at its attempt floor, one in flight at most at its floor, and a loaded one
-// only when its flows end, which no time measures. Zero when nothing waits on
-// a time.
+// not after now. nextDue is when the loop scans again if nothing else
+// changes: the earliest due time after now, where a candidate picked now
+// falls due again at its attempt floor. A candidate due but held from its
+// probe by something whose end nothing signals -- its flows, or its own pass
+// still in flight past the floor -- is looked at again each
+// ProberRecheckInterval instead, so it is probed within that of the hold
+// ending, as the periodic scan this sleep replaced probed it. Held before it
+// is due, it waits for its due time like any other. Zero when nothing waits.
 func proberPlan(now time.Time, candidates []proberCandidate, settings *MultiClientSettings) (picks []int, nextDue time.Time) {
 	picks = []int{}
 	later := func(due time.Time) {
 		if now.Before(due) && (nextDue.IsZero() || due.Before(nextDue)) {
 			nextDue = due
+		}
+	}
+	// a due candidate is held: look again soon, since nothing signals the end
+	recheck := func() {
+		if 0 < settings.ProberRecheckInterval {
+			later(now.Add(settings.ProberRecheckInterval))
 		}
 	}
 	for i, candidate := range candidates {
@@ -584,20 +593,27 @@ func proberPlan(now time.Time, candidates []proberCandidate, settings *MultiClie
 			wait(candidate.lastAttemptAt.Add(settings.ProberAttemptMinInterval))
 		}
 		if candidate.inFlight {
-			later(due)
+			if now.Before(due) {
+				later(due)
+			} else {
+				recheck()
+			}
 			continue
 		}
 		if !candidate.qualifiedAt.IsZero() {
 			wait(candidate.qualifiedAt.Add(QualificationMaxAge))
 		}
+		loaded := false
 		if !candidate.lastProbeAt.IsZero() {
-			if 0 < candidate.flowCount {
-				continue
-			}
 			wait(candidate.lastProbeAt.Add(settings.ProberReprobeInterval))
+			loaded = 0 < candidate.flowCount
 		}
 		if now.Before(due) {
 			later(due)
+			continue
+		}
+		if loaded {
+			recheck()
 			continue
 		}
 		picks = append(picks, i)
@@ -619,7 +635,8 @@ func proberPlan(now time.Time, candidates []proberCandidate, settings *MultiClie
 // network). The pass goroutines hold no lock at all while probing, which is
 // the established F-1 rule.
 //
-// Between scans the loop sleeps until the plan's next due time, at most
+// Between scans the loop sleeps until the plan's next due time (which
+// rechecks an exit held from a due probe; see proberPlan), at most
 // ProberScanMaxInterval. A window admitting an exit (clientAdded) and a
 // reliability settings change wake it to scan ProberJoinDelay later, so the
 // exits a window admits together are swept together. One timer is armed for
