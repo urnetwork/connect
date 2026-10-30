@@ -54,10 +54,10 @@ func TestDetectBlackholeIdlePassesAllocateNothing(t *testing.T) {
 			defer close(done)
 			channel.detectBlackhole()
 		}()
-		time.Sleep(10 * blackholePollInterval)
+		time.Sleep(10 * channel.settings.BlackholePollInterval)
 
 		allocations := allocationsUnder(t, "(*multiClientChannel).detectBlackhole", func() {
-			time.Sleep(100 * blackholePollInterval)
+			time.Sleep(100 * channel.settings.BlackholePollInterval)
 		})
 		select {
 		case <-done:
@@ -252,15 +252,19 @@ func TestProberIdleScansAllocateNothing(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		multiClient := newIdleProberTestMultiClient(ctx, cancel, 8)
+		// scan at a short bound, so 100 scans fit inside the exits' fresh
+		// qualification and none of them is due
+		scanInterval := 5 * time.Second
+		multiClient.settings.ProberScanMaxInterval = scanInterval
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			multiClient.runProber()
 		}()
-		time.Sleep(2 * proberScanInterval)
+		time.Sleep(2 * scanInterval)
 
 		allocations := allocationsUnder(t, "(*RemoteUserNatMultiClient).runProber", func() {
-			time.Sleep(100 * proberScanInterval)
+			time.Sleep(100 * scanInterval)
 		})
 		cancel()
 		<-done

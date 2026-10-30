@@ -518,32 +518,11 @@ func (self *proberSweepTally) record(result probeResult) (proberSweepLine, bool)
 // --- the prober loop ---
 
 const (
-	// proberScanInterval is the membership watch: how often the loop rescans
-	// the windows for clients that need probing. A periodic scan rather than a
-	// membership callback on purpose -- the windows expose no add/remove hook
-	// today beyond the monitor's event stream (which is a ui feed with its own
-	// coalescing), and inventing callback plumbing for a 5s-latency requirement
-	// buys nothing but coupling. 5s is the "joiner probed within ~5s" bound.
-	proberScanInterval = 5 * time.Second
-
 	// proberConcurrency bounds in-flight probe passes. Each pass is a handful
 	// of packets but up to ~2x ProbeTimeout of waiting; 4 keeps a cold-start
-	// sweep of a full window inside a few scan intervals without ever having
-	// more than a few kilobytes of probe traffic outstanding.
+	// sweep of a full window inside a few scans without ever having more than
+	// a few kilobytes of probe traffic outstanding.
 	proberConcurrency = 4
-
-	// proberReprobeInterval is how often an idle exit with stale (or no)
-	// qualification is re-asked. Half of these passes advance the rotation
-	// over the table; loaded exits never wait on this -- their own receive
-	// progress refreshes them for free (see touchQualificationOnReceive).
-	proberReprobeInterval = 10 * time.Minute
-
-	// proberAttemptMinInterval is the per-exit floor between pass ATTEMPTS,
-	// keyed on the attempt rather than the recorded pass: a pass that sends
-	// nothing (transport refusing, every registration colliding) records
-	// nothing in the qualification table by design, and without this floor the
-	// scan would retry such an exit every 5s forever.
-	proberAttemptMinInterval = time.Minute
 )
 
 // proberCandidate is what the planner knows about one window client. A plain
@@ -564,44 +543,67 @@ type proberCandidate struct {
 	qualifiedAt time.Time
 }
 
-// proberPlan decides which candidates get a probe pass this scan. Pure so the
-// decision table is testable without windows, clocks, or goroutines; the loop
-// is obligated to consult it (anchored by TestProberLoopConsultsPlan).
+// proberPlan decides which candidates get a probe pass this scan, and when
+// the next one falls due. Pure so the decision table is testable without
+// windows, clocks, or goroutines; the loop is obligated to consult it
+// (anchored by TestProberLoopConsultsPlan).
 //
 // The rules, in order:
 //   - a pass already in flight is never doubled.
-//   - attempts are floored at proberAttemptMinInterval per exit.
+//   - attempts are floored at ProberAttemptMinInterval per exit.
 //   - fresh qualification needs nothing.
 //   - never-probed exits are probed now: this one rule is both the startup
 //     sweep (everything present at the first scan) and the joiner probe (a
 //     new exit fails it on the first scan after it appears).
 //   - otherwise only IDLE exits (flowCount 0) are re-probed, and only once
-//     their record is proberReprobeInterval old. A loaded exit's traffic is
+//     their record is ProberReprobeInterval old. A loaded exit's traffic is
 //     better evidence than any probe and refreshes its qualification for free.
-func proberPlan(now time.Time, candidates []proberCandidate) []int {
-	picks := []int{}
-	for i, candidate := range candidates {
-		if candidate.inFlight {
-			continue
-		}
-		if !candidate.lastAttemptAt.IsZero() && now.Sub(candidate.lastAttemptAt) < proberAttemptMinInterval {
-			continue
-		}
-		if !candidate.qualifiedAt.IsZero() && now.Sub(candidate.qualifiedAt) < QualificationMaxAge {
-			continue
-		}
-		if candidate.lastProbeAt.IsZero() {
-			picks = append(picks, i)
-			continue
-		}
-		if 0 < candidate.flowCount {
-			continue
-		}
-		if proberReprobeInterval <= now.Sub(candidate.lastProbeAt) {
-			picks = append(picks, i)
+//
+// Each rule but the in-flight and loaded ones is a time to wait for, so a
+// candidate falls due at the latest of its waits and is picked once that is
+// not after now. nextDue is the earliest due time after now, when the loop
+// scans again if nothing else changes: a candidate picked now falls due again
+// at its attempt floor, one in flight at most at its floor, and a loaded one
+// only when its flows end, which no time measures. Zero when nothing waits on
+// a time.
+func proberPlan(now time.Time, candidates []proberCandidate, settings *MultiClientSettings) (picks []int, nextDue time.Time) {
+	picks = []int{}
+	later := func(due time.Time) {
+		if now.Before(due) && (nextDue.IsZero() || due.Before(nextDue)) {
+			nextDue = due
 		}
 	}
-	return picks
+	for i, candidate := range candidates {
+		var due time.Time
+		wait := func(until time.Time) {
+			if due.Before(until) {
+				due = until
+			}
+		}
+		if !candidate.lastAttemptAt.IsZero() {
+			wait(candidate.lastAttemptAt.Add(settings.ProberAttemptMinInterval))
+		}
+		if candidate.inFlight {
+			later(due)
+			continue
+		}
+		if !candidate.qualifiedAt.IsZero() {
+			wait(candidate.qualifiedAt.Add(QualificationMaxAge))
+		}
+		if !candidate.lastProbeAt.IsZero() {
+			if 0 < candidate.flowCount {
+				continue
+			}
+			wait(candidate.lastProbeAt.Add(settings.ProberReprobeInterval))
+		}
+		if now.Before(due) {
+			later(due)
+			continue
+		}
+		picks = append(picks, i)
+		later(now.Add(settings.ProberAttemptMinInterval))
+	}
+	return picks, nextDue
 }
 
 // runProber is the qualification loop: the startup sweep, the joiner probes,
@@ -617,9 +619,13 @@ func proberPlan(now time.Time, candidates []proberCandidate) []int {
 // network). The pass goroutines hold no lock at all while probing, which is
 // the established F-1 rule.
 //
-// One timer is armed for the loop's life, and each scan refills the previous
-// scan's client list, live set and candidates, so a scan that schedules
-// nothing allocates nothing.
+// Between scans the loop sleeps until the plan's next due time, at most
+// ProberScanMaxInterval. A window admitting an exit (clientAdded) and a
+// reliability settings change wake it to scan ProberJoinDelay later, so the
+// exits a window admits together are swept together. One timer is armed for
+// the loop's life, and each scan refills the previous scan's client list,
+// live set and candidates, so a scan that schedules nothing allocates
+// nothing.
 func (self *RemoteUserNatMultiClient) runProber() {
 	sem := make(chan struct{}, proberConcurrency)
 	var stateMutex sync.Mutex
@@ -635,18 +641,39 @@ func (self *RemoteUserNatMultiClient) runProber() {
 	var clients []*multiClientChannel
 	live := map[*multiClientChannel]bool{}
 	var candidates []proberCandidate
+	// zero until a scan finds something to wait for
+	var nextDue time.Time
 	for {
-		if scanTimer == nil {
-			scanTimer = time.NewTimer(proberScanInterval)
-		} else {
-			scanTimer.Reset(proberScanInterval)
+		wait := self.settings.ProberScanMaxInterval
+		if !nextDue.IsZero() {
+			if untilDue := max(time.Until(nextDue), 0); wait <= 0 || untilDue < wait {
+				wait = untilDue
+			}
+		}
+		// no bound and nothing due: only a wake ends the sleep
+		var scanTimeout <-chan time.Time
+		if 0 < wait || !nextDue.IsZero() {
+			scanTimeout = resetOrCreateTimer(&scanTimer, wait)
 		}
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-scanTimer.C:
+		case <-scanTimeout:
+		case <-self.proberWake:
+			// scan a join delay after the first wake, unless a scan is due
+			// sooner, so the wakes of a burst of joiners share one sweep
+			if joinDelay := self.settings.ProberJoinDelay; 0 < joinDelay {
+				if joinDue := time.Now().Add(joinDelay); nextDue.IsZero() || joinDue.Before(nextDue) {
+					nextDue = joinDue
+				}
+				continue
+			}
+		}
+		if self.proberScanForTest != nil {
+			self.proberScanForTest()
 		}
 
+		nextDue = time.Time{}
 		if !self.reliabilitySettings().ProviderProbe {
 			continue
 		}
@@ -697,7 +724,8 @@ func (self *RemoteUserNatMultiClient) runProber() {
 			}()
 		}
 
-		picks := proberPlan(now, candidates)
+		var picks []int
+		picks, nextDue = proberPlan(now, candidates, self.settings)
 		if len(picks) == 0 {
 			// the lists keep no departed client until the next scan
 			clear(clients)
@@ -768,6 +796,21 @@ func (self *RemoteUserNatMultiClient) runProber() {
 		}
 		clear(clients)
 	}
+}
+
+// wakeProber wakes a sleeping prober to scan a join delay later. Nil-safe: a
+// bare fixture has no prober to wake.
+func (self *RemoteUserNatMultiClient) wakeProber() {
+	select {
+	case self.proberWake <- struct{}{}:
+	default:
+	}
+}
+
+// clientAdded is the windows' admission callback: a joiner is never probed,
+// so the scan the wake brings probes it.
+func (self *RemoteUserNatMultiClient) clientAdded(client *multiClientChannel) {
+	self.wakeProber()
 }
 
 // --- qualification readouts ---

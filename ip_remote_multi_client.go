@@ -142,11 +142,10 @@ type MultiClientGeneratorReadTimeout interface {
 	ClientReadTimeout(client *Client) (time.Duration, bool)
 }
 
-// Evaluation cadence and the freshness of comparative ACK evidence are not
-// liveness deadlines. Keep their original values when the no-send-ACK bound
-// follows a longer transport read interval.
+// The freshness of comparative ACK evidence is not a liveness deadline. Keep
+// its original value when the no-send-ACK bound follows a longer transport
+// read interval, as MultiClientSettings.BlackholePollInterval does.
 const (
-	blackholePollInterval         = 1250 * time.Millisecond
 	blackholeAckFreshnessInterval = 5 * time.Second
 )
 
@@ -263,7 +262,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// client instead
 		BlackholeTimeout:        30 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
-		MaxFlowsPerExit:         16,
+		// an evaluation cadence, not a liveness deadline; see the field
+		BlackholePollInterval: 1250 * time.Millisecond,
+		// an idle channel checks its carrier an eighth as often, so a carrier
+		// lost while nothing is sent retires within 70s instead of 60s
+		BlackholeIdlePollInterval: 10 * time.Second,
+		MaxFlowsPerExit:           16,
 		// Eligible affinity keeps its exit as it grows; expiration makes later
 		// fresh flows reconsider the provider without moving existing flows.
 		AffinityStickyPastCap: true,
@@ -477,6 +481,15 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
+		// joiners and settings changes wake the prober, so the bound only
+		// covers an exit whose flows ended while its proof went stale
+		ProberScanMaxInterval: time.Minute,
+		// the joiner bound of the 5s scan this replaced: the exits a window
+		// forms with at the start of a session share one sweep
+		ProberJoinDelay: 5 * time.Second,
+		// see the field comments
+		ProberAttemptMinInterval: time.Minute,
+		ProberReprobeInterval:    10 * time.Minute,
 		// a tcp handshake through a provider to a live site completes well
 		// inside this on any network worth keeping; past it the answer is not
 		// coming, and a probe that waits longer only delays a sweep
@@ -620,6 +633,22 @@ type MultiClientSettings struct {
 	// Zero disables this verdict. Neither this interval nor its persistent
 	// no-progress clock changes Transfer resend pacing or ACK lifetime.
 	BlackholeTimeout time.Duration
+	// BlackholePollInterval is how often a channel's health loop
+	// (detectBlackhole) judges the channel while it holds evidence: a send
+	// outstanding or in the stats window, an unanswered connect, a quarantine
+	// or a carrier down. A verdict acts within this much of its bound. It is
+	// an evaluation cadence, not a liveness deadline, so it keeps its value
+	// when the no-send-ACK bound follows a longer transport read interval.
+	// Must be positive.
+	BlackholePollInterval time.Duration
+	// BlackholeIdlePollInterval is how often the health loop of a channel
+	// holding none of that evidence wakes to check its carrier. Every verdict
+	// needs a send, and the first send of a run, an error and the channel's
+	// end each wake the loop at once, so an idle loop polls only for a
+	// carrier lost while nothing is sent: that carrier's retirement hold
+	// (StatsWindowKeepUnhealthyDuration) starts up to this much late.
+	// Non-positive never parks: the loop judges every BlackholePollInterval.
+	BlackholeIdlePollInterval time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
 	// the provider is acknowledging our sends, so it is demonstrably alive,
 	// but nothing has come back from the destination. That is ambiguous -- a
@@ -1206,6 +1235,32 @@ type MultiClientSettings struct {
 	// default on this fork, and is inert on its own: something has to call
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
+	// ProberScanMaxInterval is the longest the prober sleeps between scans of
+	// the windows. It otherwise sleeps until the next exit falls due, and a
+	// window admitting an exit or a reliability settings change wakes it (see
+	// ProberJoinDelay), so this bounds only how late it notices what nothing
+	// signals: an exit whose flows ended, which the prober re-probes once its
+	// proof is stale and it is idle. Non-positive leaves the sleep unbounded.
+	ProberScanMaxInterval time.Duration
+	// ProberJoinDelay is how long after a window admits an exit, or the
+	// reliability settings change, the prober scans. Exits admitted together
+	// share one sweep, whose result line tells a pool of bad providers from a
+	// phone that was away only when it judges them together. Non-positive
+	// scans at once.
+	ProberJoinDelay time.Duration
+	// ProberAttemptMinInterval is the per-exit floor between probe pass
+	// attempts, keyed on the attempt rather than the recorded pass: a pass
+	// that sends nothing (transport refusing, every registration colliding)
+	// records nothing in the qualification table by design, and without this
+	// floor the prober would retry such an exit at every scan. Non-positive
+	// has no floor: such an exit is retried at the next scan.
+	ProberAttemptMinInterval time.Duration
+	// ProberReprobeInterval is how often an idle exit with a stale (or no)
+	// qualification is asked again. Half of these passes advance the rotation
+	// over the table; loaded exits never wait on this, their own receive
+	// progress refreshes them for free (see touchQualificationOnReceive).
+	// Non-positive asks again as often as ProberAttemptMinInterval allows.
+	ProberReprobeInterval time.Duration
 
 	// DataOnlyProviderProbe lets an application-owned, finite probe evaluate
 	// one explicitly fixed provider with its real traffic. It is effective
@@ -1875,6 +1930,18 @@ type RemoteUserNatMultiClient struct {
 	serverNamesLearnedUnsub func()
 	packetStatsCounters     *packetStatsCounters
 	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+	// set by any change an epoch would report (a counted packet, a collected
+	// block action, a new packet stats listener) and taken by the epoch
+	// worker; the wake lets a parked worker resume (see runEventEpoch)
+	eventEpochChanged atomic.Bool
+	eventEpochWake    chan struct{}
+	// Observes each wake of the event epoch worker. Nil in production.
+	eventEpochWakeForTest atomic.Pointer[func()]
+	// wakes a sleeping prober (runProber) for a joiner or a settings change
+	proberWake chan struct{}
+	// Nil outside focused tests. Runs at the start of each prober scan
+	// (runProber). Set before the loop starts.
+	proberScanForTest func()
 	// every window client's transport delay stats pass through here unchanged
 	// (DELAY.md §9, D9)
 	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
@@ -2717,11 +2784,15 @@ func NewRemoteUserNatMultiClient(
 		blockActionIgnoreCache:       newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:          &packetStatsCounters{},
 		packetStatsCallbacks:         NewCallbackList[PacketStatsFunction](),
+		eventEpochWake:               make(chan struct{}, 1),
+		proberWake:                   make(chan struct{}, 1),
 		transportDelayStatsCallbacks: NewCallbackList[TransportDelayStatsFunction](),
 		reliabilityMetrics:           newReliabilityMetrics(),
 		flowReaperWake:               make(chan struct{}, 1),
 		flowReaperDone:               make(chan struct{}),
 	}
+	// every count recorded through the counters wakes a parked event epoch
+	multiClient.packetStatsCounters.changed = multiClient.eventEpochChange
 	if settings.IpAssocSettings != nil {
 		cache := multiClient.blockActionCache
 		afterShed := cache.clear
@@ -2798,6 +2869,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.recordProbePass,
 		multiClient.providerPolicyPreference,
 		multiClient.publishTransportDelayStats,
+		multiClient.clientAdded,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2825,6 +2897,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.recordProbePass,
 			multiClient.providerPolicyPreference,
 			multiClient.publishTransportDelayStats,
+			multiClient.clientAdded,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -2893,12 +2966,15 @@ func NewRemoteUserNatMultiClient(
 	return multiClient
 }
 
-// flushes block action and packet stats events to listeners on the event epoch
+// flushes block action and packet stats events to listeners an epoch after a
+// change. It arms one timer for its life. An epoch that takes no change parks
+// the worker until the next change wakes it (eventEpochChange), and the flush
+// then follows one epoch later, so every change is reported within one epoch
+// of it while an idle client costs no wakeups.
 func (self *RemoteUserNatMultiClient) runEventEpoch() {
 	defer self.cancel()
 
 	var lastPacketStats *PacketStats
-	// one timer for the loop's life
 	epochTimer := time.NewTimer(self.settings.EventEpoch)
 	defer epochTimer.Stop()
 	for {
@@ -2907,6 +2983,20 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 			return
 		case <-epochTimer.C:
 		}
+		if wake := self.eventEpochWakeForTest.Load(); wake != nil {
+			(*wake)()
+		}
+
+		// Take the flag before the flush and the compare, so a change that
+		// lands during this pass raises it for the next one. Drain the wake
+		// first: a wake the drain drops was sent by a raise that this take or
+		// an earlier one covers, and a raise the take misses sends its wake
+		// after the drain, so the park below still sees it.
+		select {
+		case <-self.eventEpochWake:
+		default:
+		}
+		changed := self.eventEpochChanged.Swap(false)
 
 		self.blockActionCollector.flush()
 
@@ -2923,7 +3013,28 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 				}
 			}
 		}
+		if !changed {
+			// nothing changed for a whole epoch
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.eventEpochWake:
+			}
+		}
 		epochTimer.Reset(self.settings.EventEpoch)
+	}
+}
+
+// eventEpochChange marks the event epoch changed and wakes a parked epoch
+// worker. Called after the change it reports. Once the flag is up it costs one
+// atomic load, so a packet pays nothing more while traffic moves.
+func (self *RemoteUserNatMultiClient) eventEpochChange() {
+	if self.eventEpochChanged.Load() || !self.eventEpochChanged.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.eventEpochWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -2936,6 +3047,7 @@ func (self *RemoteUserNatMultiClient) localReceivePacket(
 ) {
 	self.packetStatsCounters.localIngressPacketCount.Add(1)
 	self.packetStatsCounters.localIngressByteCount.Add(int64(len(packet)))
+	self.eventEpochChange()
 	if self.ipAssoc != nil && !self.blockActionIgnored(ipPath) {
 		// the local user nat delivers the flow's egress-oriented path
 		// (the remote endpoint is the destination)
@@ -3594,6 +3706,8 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 	// knobs. Wake the shared reaper so a shorter override applies immediately;
 	// a longer one is harmlessly rechecked before any flow is detached.
 	self.notifyFlowReaper()
+	// the prober honors ProviderProbe and the probe knobs from its next scan
+	self.wakeProber()
 
 	log := loggerOrDefault(self.log)
 	if classifierChanged {
@@ -6364,10 +6478,12 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 			reason = BlockActionReasonBlocker
 		}
 		self.blockActionCollector.add(decision, block, local, match, reason, byteCount)
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return false
 	}
 	if !local || self.localUserNat == nil {
@@ -6377,6 +6493,7 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 	if success {
 		self.packetStatsCounters.localEgressPacketCount.Add(1)
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 	}
 	return success
 }
@@ -6396,6 +6513,7 @@ func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
 	}
 	self.packetStatsCounters.blockEgressPacketCount.Add(1)
 	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+	self.eventEpochChange()
 	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
 	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
 }
@@ -6598,11 +6716,13 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
 		self.blockActionCollector.add(decision, block, local, match, blockActionReason(r, securityReason, blockerBlock, match), byteCount)
+		self.eventEpochChange()
 	}
 
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, packet)
 		}
@@ -6613,6 +6733,7 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 		if success {
 			self.packetStatsCounters.localEgressPacketCount.Add(1)
 			self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+			self.eventEpochChange()
 		}
 		return success
 	}
@@ -6725,11 +6846,13 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 		byteCount += fragmentByteCount
 		if decision != nil && self.blockActionCollector.hasCallbacks() {
 			self.blockActionCollector.add(decision, block, local, match, actionReason, fragmentByteCount)
+			self.eventEpochChange()
 		}
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, reassembled)
 		}
@@ -6746,6 +6869,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return true
 	}
 
@@ -7075,10 +7199,12 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 				ByteCount(len(packet)),
 			)
 		}
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, group.packets[len(group.packets)-1])
 		}
@@ -7138,6 +7264,7 @@ func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		return true
 	}
 	if parsedGroup == nil || !self.sendParsedPacketGroupAttempt(
@@ -7374,6 +7501,9 @@ func (self *RemoteUserNatMultiClient) publishTransportDelayStats(stats *Transpor
 // packet stats change
 func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
 	callbackId := self.packetStatsCallbacks.Add(packetStatsCallback)
+	// wake a parked epoch: the first listener is owed the counters as they
+	// stand
+	self.eventEpochChange()
 	return func() {
 		self.packetStatsCallbacks.Remove(callbackId)
 	}
@@ -7980,7 +8110,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var race *multiClientChannelUpdateRace
 				var committedClient *multiClientChannel
 				var initRace *multiClientChannelUpdateRace
-				var initRaceEarlyComplete <-chan struct{}
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
@@ -8004,7 +8133,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						update.initRaceWithLock()
 						update.race.clientLimit = len(raceOrderedClients)
 						initRace = update.race
-						initRaceEarlyComplete = initRace.completeMonitor.NotifyChannel()
 					}
 					race = update.race
 					now := time.Now()
@@ -8033,7 +8161,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				scheduleRace := func() {
 					if initRace != nil {
 						scheduleOnce.Do(func() {
-							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+							self.scheduleCompleteRace(update.ipPath, initRace)
 						})
 					}
 				}
@@ -8276,6 +8404,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			return
 		}
 
+		// one timer for the retries, re-armed for each wait
+		var retryTimer *time.Timer
+		defer func() {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+		}()
 		for {
 			var retryTimeout time.Duration
 			if 0 <= timeout {
@@ -8317,7 +8452,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				case <-qualityOfferChanged:
 				case <-speedOfferChanged:
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 				continue
 			}
@@ -8334,7 +8469,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				select {
 				case <-update.ctx.Done():
 					return
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 			}
 		}
@@ -9419,7 +9554,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
 				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
-					race.completeMonitor.NotifyAll()
+					race.completeEarly()
 				}
 			}
 		} else {
@@ -9774,21 +9909,23 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	return false
 }
 
-// spawns a goroutine that completes the race after a timeout. it acquires the
-// per-flow stateLock (not the parent lock) when it evaluates the race.
+// completes the race when its response window ends, or at once when enough
+// candidates answered first (completeEarly). The completion runs on the
+// window's timer, so a race waiting out its window holds a timer, not a parked
+// goroutine; the once keeps a timer an early completion re-armed from
+// completing the race twice. A race closed first is never completed. It
+// acquires the per-flow stateLock (not the parent lock) when it evaluates the
+// race.
 func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 	ipPath *IpPath,
 	race *multiClientChannelUpdateRace,
-	earlyComplete <-chan struct{},
 ) {
-	go HandleError(func() {
-		// wait for the race to finish, then choose
-
+	complete := func() {
+		// the window ended or enough candidates answered: choose
 		select {
 		case <-race.ctx.Done():
 			return
-		case <-earlyComplete:
-		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
+		default:
 		}
 
 		var abandonedClients []*multiClientChannel
@@ -9882,7 +10019,18 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		for _, p := range returnPackets {
 			MessagePoolReturn(p.Packet)
 		}
+	}
+	var completeOnce sync.Once
+	completeTimer := time.AfterFunc(self.settings.MultiRaceSetOnResponseTimeout, func() {
+		completeOnce.Do(func() {
+			HandleError(complete)
+		})
 	})
+	race.completeTimer.Store(completeTimer)
+	// an early completion asked before the timer existed
+	if race.completeRequested.Load() {
+		completeTimer.Reset(0)
+	}
 }
 
 // ExitInfo is one provider channel in the window, as reported to a developer
@@ -11416,9 +11564,13 @@ type multiClientChannelUpdateRace struct {
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int
-	completeMonitor        *Monitor
 	responseWindowElapsed  bool
 	collapseOrder          uint64
+	// completes the race when its response window ends; nil until the race's
+	// first send returns (scheduleCompleteRace)
+	completeTimer atomic.Pointer[time.Timer]
+	// an early completion asked before completeTimer existed
+	completeRequested atomic.Bool
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -11430,12 +11582,26 @@ func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpd
 		// sentPacketCount:        0,
 		// packetCount:            0,
 		// clientsWithPacketCount: 0,
-		completeMonitor: NewMonitor(),
+	}
+}
+
+// completeEarly completes the race now instead of at the end of its response
+// window: enough candidates answered. Safe under the flow lock, since it only
+// re-arms the completion timer; the request is kept for a timer not yet
+// scheduled.
+func (self *multiClientChannelUpdateRace) completeEarly() {
+	self.completeRequested.Store(true)
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Reset(0)
 	}
 }
 
 func (self *multiClientChannelUpdateRace) Close() {
 	self.cancel()
+	// a closed race is never completed: release its window's timer now
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Stop()
+	}
 	// return any still-pooled packets that no other path has claimed.
 	// the Pooled flag is the single-owner marker: paths that consume a
 	// receivePacket (race-buffer-exceeded in clientReceivePacket, the
@@ -11762,6 +11928,10 @@ type multiClientWindow struct {
 	// It neither emits provider events nor migrates flows.
 	clientRetireCallback func(client *multiClientChannel)
 	windowType           WindowType
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
+	clientAddCallback func(client *multiClientChannel)
 
 	settings *MultiClientSettings
 	// reliabilitySettingsFunc reads the parent's effective reliability config,
@@ -11879,6 +12049,12 @@ type multiClientWindow struct {
 	// sendStallClientsBusy; a concurrent pass collects its own.
 	sendStallClients     []*multiClientChannel
 	sendStallClientsBusy atomic.Bool
+	// parks the send-stall watchdog while nothing is outstanding; every
+	// client the window constructs holds it. nil (bare fixtures) never parks
+	sendStallWake *outstandingSendWake
+	// Nil outside focused tests. Runs at the start of each send-stall pass
+	// (watchSendStalls). Set before the loop starts.
+	sendStallPassForTest func()
 	// networkChangeMonitor ends a platform-error retry wait when the host's
 	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
 	// never wakes a wait.
@@ -11979,10 +12155,15 @@ func newMultiClientWindow(
 	// goroutines start so every client it creates subscribes it (DELAY.md
 	// §9); nil in bare fixtures
 	transportDelayStats TransportDelayStatsFunction,
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
+	clientAddCallback func(client *multiClientChannel),
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
 		transportDelayStats:          transportDelayStats,
+		clientAddCallback:            clientAddCallback,
 		cancel:                       cancel,
 		log:                          loggerOrDefault(settings.Log),
 		generator:                    generator,
@@ -12014,6 +12195,7 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		sendStallWake:                newOutstandingSendWake(),
 		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
@@ -12048,6 +12230,36 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 	return max(stallTimeout/3, 250*time.Millisecond)
 }
 
+// outstandingSendWake parks a window's send-stall watchdog while no client of
+// the window has a send outstanding, and wakes it at the first send of a run:
+// a stall needs an outstanding send (sendStalled). The watchdog marks itself
+// parked before its last look at the clients, and the first send of a run
+// reads the mark under the client lock that look takes, so one of the two
+// always sees the other. While the watchdog runs, that send pays one atomic
+// load.
+type outstandingSendWake struct {
+	parked atomic.Bool
+	wake   chan struct{}
+}
+
+func newOutstandingSendWake() *outstandingSendWake {
+	return &outstandingSendWake{
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// signal wakes the watchdog if it is parked. Nil-safe: a channel built
+// outside a window has none.
+func (self *outstandingSendWake) signal() {
+	if self == nil || !self.parked.Load() || !self.parked.CompareAndSwap(true, false) {
+		return
+	}
+	select {
+	case self.wake <- struct{}{}:
+	default:
+	}
+}
+
 // watchSendStalls evaluates a client once its acknowledged-send progress stops.
 //
 // The watchdog polls on a fraction of the stall timeout (resize otherwise runs
@@ -12066,6 +12278,10 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 // admissible. An admitted verdict errors and cancels the channel immediately;
 // resize is woken only to reap it and backfill the window. Soft classifications
 // (stats-unhealthy, rank, drain) remain exclusively in resize.
+//
+// With nothing outstanding in the window no stall can start, so the watchdog
+// parks until the first send of a run or a newly admitted client wakes it
+// (outstandingSendWake), and polls again from there.
 func (self *multiClientWindow) watchSendStalls() {
 	// one timer for the loop's life
 	var pollTimer *time.Timer
@@ -12074,6 +12290,8 @@ func (self *multiClientWindow) watchSendStalls() {
 			pollTimer.Stop()
 		}
 	}()
+	// reused by each look before parking, so an idle look allocates nothing
+	var parkClients []*multiClientChannel
 	for {
 		stallTimeout := self.reliabilitySettings().SendStallTimeout
 
@@ -12089,6 +12307,9 @@ func (self *multiClientWindow) watchSendStalls() {
 			return
 		case <-pollTimer.C:
 		}
+		if self.sendStallPassForTest != nil {
+			self.sendStallPassForTest()
+		}
 
 		if stallTimeout <= 0 {
 			continue
@@ -12097,6 +12318,29 @@ func (self *multiClientWindow) watchSendStalls() {
 			// wake resize for the reap and the backfill only; the verdict has
 			// already been executed above
 			self.resizeMonitor.NotifyAll()
+		}
+
+		if wake := self.sendStallWake; wake != nil {
+			wake.parked.Store(true)
+			parkClients = self.appendUnorderedClients(parkClients[:0])
+			outstanding := false
+			for _, client := range parkClients {
+				// judged as convictSendStalls judges them
+				if !client.dataOnlyProviderProbe && client.hasOutstandingSends() {
+					outstanding = true
+					break
+				}
+			}
+			clear(parkClients)
+			if outstanding {
+				wake.parked.Store(false)
+			} else {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-wake.wake:
+				}
+			}
 		}
 	}
 }
@@ -12878,6 +13122,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 }
 
 func (self *multiClientWindow) resize() {
+	// one timer for the loop's life, re-armed for each wait between passes
+	var waitTimer *time.Timer
+	defer func() {
+		if waitTimer != nil {
+			waitTimer.Stop()
+		}
+	}()
 	for {
 		// Cancellation can race a ready resize edge after an expansion ends.
 		// Leave owned channels to Close instead of starting a teardown pass.
@@ -13662,7 +13913,7 @@ func (self *multiClientWindow) resize() {
 			case <-self.ctx.Done():
 				return
 			case <-update:
-			case <-time.After(timeout):
+			case <-resetOrCreateTimer(&waitTimer, timeout):
 			}
 		}
 	}
@@ -13882,6 +14133,8 @@ func (self *multiClientWindow) expand(
 			if self.resizeMonitor != nil {
 				self.resizeMonitor.NotifyAll()
 			}
+			// the client may already have sends outstanding
+			self.sendStallWake.signal()
 		}()
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1
@@ -13909,6 +14162,9 @@ func (self *multiClientWindow) expand(
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		if self.clientAddCallback != nil {
+			self.clientAddCallback(client)
+		}
 		self.noteRecentExitAdmitted(args)
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true
@@ -14179,6 +14435,7 @@ requestCandidates:
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
+			args.sendStallWake = self.sendStallWake
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -15360,6 +15617,9 @@ type multiClientChannelArgs struct {
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. nil (directly constructed channels) signals nothing.
+	sendStallWake *outstandingSendWake
 	// The parent's, shared by every channel: armed from this channel's provider
 	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
 	// leaves the channel at its rank.
@@ -15623,6 +15883,9 @@ type multiClientChannel struct {
 	// timeout lifecycle can be tested without constructing a full Transfer
 	// route. Production uses SendDetailedMessage with the same signature.
 	pingSendForTest func(time.Duration, func(error)) (bool, error)
+	// Nil outside focused tests. Runs at the start of each health pass
+	// (detectBlackhole). Set before the loop starts.
+	blackholePassForTest func()
 	// qualificationRefreshFunc re-stamps the parent's qualification for this
 	// channel's destination (RemoteUserNatMultiClient.recordProbePass), called
 	// from the receive-ack path at most once per
@@ -15762,6 +16025,14 @@ type multiClientChannel struct {
 	pendingSendTime time.Time
 	// Orders pending-episode changes even when their clock readings tie.
 	pendingSendGeneration uint64
+	// The health loop's wake while it is parked on an idle channel
+	// (parkIdleBlackhole), nil otherwise. The first send of a run and the
+	// channel's first error signal it and clear it, so the loop judges the
+	// new evidence at once. Guarded by stateLock.
+	blackholeWake chan struct{}
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. Immutable from construction; nil outside a window.
+	sendStallWake *outstandingSendWake
 
 	// the busy-flow liveness probe's state (see busyLivenessProbe). All fields
 	// are guarded by stateLock.
@@ -16014,6 +16285,7 @@ func newMultiClientChannel(
 		providerQualifiedFunc:     providerQualifiedFunc,
 		receivingSiblingsFunc:     receivingSiblingsFunc,
 		qualificationRefreshFunc:  qualificationRefreshFunc,
+		sendStallWake:             args.sendStallWake,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -18866,10 +19138,15 @@ func (self *multiClientChannel) detectBlackhole() {
 	// both kept for the loop's life; nothing below keeps the stats past its
 	// pass
 	windowStats := &clientWindowStats{}
-	pollTimer := time.NewTimer(blackholePollInterval)
+	pollTimer := time.NewTimer(self.settings.BlackholePollInterval)
 	pollTimer.Stop()
 	defer pollTimer.Stop()
+	// handed to the channel while the loop is parked; see parkIdleBlackhole
+	idleWake := make(chan struct{}, 1)
 	for {
+		if self.blackholePassForTest != nil {
+			self.blackholePassForTest()
+		}
 		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else {
@@ -19204,16 +19481,80 @@ func (self *multiClientChannel) detectBlackhole() {
 				}
 			}
 
-			pollTimer.Reset(blackholePollInterval)
+			// With no evidence left to judge, the carrier is all there is to
+			// watch: park, and check it each idle poll.
+			pollInterval := self.settings.BlackholePollInterval
+			parked := false
+			if idlePollInterval := self.settings.BlackholeIdlePollInterval; 0 < idlePollInterval && !transportDown {
+				parked = self.parkIdleBlackhole(idleWake)
+				if parked {
+					pollInterval = idlePollInterval
+				}
+			}
+			pollTimer.Reset(pollInterval)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-self.client.Done():
 				return
+			case <-idleWake:
 			case <-pollTimer.C:
+			}
+			if parked {
+				self.unparkIdleBlackhole(idleWake)
 			}
 		}
 	}
+}
+
+// parkIdleBlackhole hands the health loop's wake to the channel when the
+// channel holds no evidence a verdict could mature on, and reports whether it
+// did. The caller has found the carrier up. Every verdict needs a send: one
+// outstanding (no-send-ack), one in the stats window (no-receive-ack), or an
+// unanswered connect, whose clock outlives the window (no-receive-syn). A
+// quarantine is judged every pass, and an error ends the loop. The check and
+// the handoff share the lock under which the first send of a run and the
+// first error signal the wake, so neither can land between them unseen.
+func (self *multiClientChannel) parkIdleBlackhole(wake chan struct{}) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.endErr != nil || self.quarantined || 0 < self.packetStats.sendNackCount ||
+		!self.packetStats.firstUnansweredSendSynTime.IsZero() {
+		return false
+	}
+	for _, eventBucket := range self.eventBuckets {
+		if 0 < eventBucket.sendNackCount || 0 < eventBucket.sendSynCount {
+			return false
+		}
+	}
+	self.blackholeWake = wake
+	return true
+}
+
+// unparkIdleBlackhole takes the wake back from the channel when the parked
+// loop resumes, and drops a signal that raced the resume, so the next park
+// starts clean.
+func (self *multiClientChannel) unparkIdleBlackhole(wake chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.blackholeWake = nil
+	select {
+	case <-wake:
+	default:
+	}
+}
+
+// Wakes a parked health loop to judge new evidence.
+// must be called with `stateLock`
+func (self *multiClientChannel) wakeBlackholeWithLock() {
+	if self.blackholeWake == nil {
+		return
+	}
+	select {
+	case self.blackholeWake <- struct{}{}:
+	default:
+	}
+	self.blackholeWake = nil
 }
 
 func (self *multiClientChannel) ping() {
@@ -19327,6 +19668,11 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 
 	eventBucket := self.eventBucket()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		// first outstanding send, so start the stall clock. see sendStalled
 		self.pendingSendTime = time.Now()
@@ -19362,6 +19708,11 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 
 	eventBucket := self.eventBucket()
 	packetCount := len(sendPacketGroup.packets)
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
 		self.pendingSendGeneration++
@@ -19472,6 +19823,11 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
 		self.pendingSendGeneration++
@@ -19556,6 +19912,8 @@ func (self *multiClientChannel) addSendSyn(synCount int) {
 
 	if 0 < synCount && self.packetStats.firstUnansweredSendSynTime.IsZero() {
 		self.packetStats.firstUnansweredSendSynTime = time.Now()
+		// an unanswered connect is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
 	}
 	self.packetStats.sendSynCount += synCount
 
@@ -19709,6 +20067,8 @@ func (self *multiClientChannel) addError(err error) {
 func (self *multiClientChannel) addErrorWithLock(err error) {
 	if self.endErr == nil {
 		self.endErr = err
+		// the health loop ends on the error
+		self.wakeBlackholeWithLock()
 	}
 
 	eventBucket := self.eventBucket()

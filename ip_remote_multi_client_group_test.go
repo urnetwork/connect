@@ -518,7 +518,7 @@ func TestMultiClientRaceRegistersCandidatesBeforeSend(t *testing.T) {
 	// Complete the retained race through its ordinary async path. The buffered
 	// packet is not merely a winner vote: it must establish the flow before a
 	// later dial-failure signal can act on it.
-	race.completeMonitor.NotifyAll()
+	race.completeEarly()
 	finish()
 	if !<-result {
 		t.Fatal("race rejected candidates after retaining the synchronous response")
