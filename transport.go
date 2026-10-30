@@ -1266,11 +1266,12 @@ func newPlatformQuicConfig(
 		// of the application writer, which can legitimately wait behind
 		// quic-go's bounded DATAGRAM queue on a constrained uplink. It sends a
 		// PING once the peer has been quiet this long, at most half the idle
-		// timeout in quic-go. Twice the ping interval leaves an idle
-		// connection's liveness to the application ping, one ack-eliciting
-		// packet per ping where a QUIC PING went between each two, and still
-		// finds a dead peer within this plus the idle timeout: 30s by default.
-		KeepAlivePeriod:   settings.PingTimeout * 2,
+		// timeout in quic-go, and the idle timeout runs from the first
+		// ack-eliciting packet after the peer's last. So a dead peer is found
+		// within this plus the idle timeout of its last packet: 25s by default.
+		// The application ping cannot stand in for it: one paced from a write
+		// just past a ping boundary goes out nearly two ping intervals later.
+		KeepAlivePeriod:   settings.PingTimeout,
 		Allow0RTT:         !settings.h3RetainedByteAccounting,
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport

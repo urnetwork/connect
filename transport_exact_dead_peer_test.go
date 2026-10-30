@@ -2,9 +2,10 @@
 // deadlines went lazy (connect caad1de6). A read ends ReadTimeout after it
 // began, so a silent peer is cut off ReadTimeout after its last frame, and a
 // stalled write fails WriteTimeout after it began, on H1+, WebSocket and H3.
-// H1 runs against the synthetic in-memory peer in virtual time, so its
-// boundaries are exact; H3 runs against a loopback QUIC peer in real time,
-// within a tolerance well under the lazy slack it rules out.
+// A dead H3 peer is found within PingTimeout plus the QUIC idle timeout of its
+// last packet. H1 runs against the synthetic in-memory peer in virtual time,
+// so its boundaries are exact; H3 runs against a loopback QUIC peer in real
+// time, within a tolerance well under the lazy slack it rules out.
 package connect
 
 import (
@@ -513,6 +514,149 @@ func TestH3StalledWriteFailsWriteTimeoutAfterItBegan(t *testing.T) {
 		t.Logf("the stalled write failed %s after it began", cutOff)
 		if cutOff < writeTimeout-h3ExactBoundTolerance/4 || writeTimeout+h3ExactBoundTolerance < cutOff {
 			t.Fatalf("the stalled write failed %s after it began, want %s", cutOff, writeTimeout)
+		}
+	})
+}
+
+// Relays UDP datagrams between one client and a server until it goes dead,
+// when it drops every datagram both ways, as a dead peer's path would. It
+// notes when it last relayed a datagram from the server.
+type h3DeadPeerRelay struct {
+	conn      *net.UDPConn
+	upstream  *net.UDPConn
+	dead      atomic.Bool
+	stateLock sync.Mutex
+	client    *net.UDPAddr
+	// when the last datagram from the server reached the client
+	lastFromServer time.Time
+}
+
+// Relays between the loopback and server.
+func newH3DeadPeerRelay(t *testing.T, ipVersion int, server *net.UDPAddr) *h3DeadPeerRelay {
+	t.Helper()
+	listenAddr, err := net.ResolveUDPAddr("udp", testLoopbackHostPort(ipVersion, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := net.DialUDP("udp", nil, server)
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	relay := &h3DeadPeerRelay{conn: conn, upstream: upstream}
+	t.Cleanup(func() {
+		conn.Close()
+		upstream.Close()
+	})
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, client, err := conn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			func() {
+				relay.stateLock.Lock()
+				defer relay.stateLock.Unlock()
+				relay.client = client
+			}()
+			if !relay.dead.Load() {
+				upstream.Write(buffer[:n])
+			}
+		}
+	}()
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, err := upstream.Read(buffer)
+			if err != nil {
+				return
+			}
+			if relay.dead.Load() {
+				continue
+			}
+			client := func() *net.UDPAddr {
+				relay.stateLock.Lock()
+				defer relay.stateLock.Unlock()
+				return relay.client
+			}()
+			if client == nil {
+				continue
+			}
+			if _, err := conn.WriteToUDP(buffer[:n], client); err == nil {
+				func() {
+					relay.stateLock.Lock()
+					defer relay.stateLock.Unlock()
+					relay.lastFromServer = time.Now()
+				}()
+			}
+		}
+	}()
+	return relay
+}
+
+// Kills the path and returns when the client last heard from the server.
+func (self *h3DeadPeerRelay) kill() time.Time {
+	self.dead.Store(true)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.lastFromServer
+}
+
+// QUIC finds a dead peer on an otherwise idle H3 connection within
+// PingTimeout plus the idle timeout of the last packet it heard: the bound a
+// keepalive every PingTimeout gave. The owner's last write lands just after a
+// ping boundary, so its next application ping is nearly two ping intervals
+// later; only the QUIC keepalive starts the idle timeout sooner.
+func TestH3DeadPeerFoundWithinPingTimeoutPlusIdleTimeout(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		const nextProto = "urnetwork-platform-dead-peer-test"
+		peer := newH3ExactPeer(t, ipVersion, nextProto, true)
+		relay := newH3DeadPeerRelay(t, ipVersion, peer.addr)
+		pingTimeout := 500 * time.Millisecond
+		var settings *PlatformTransportSettings
+		_, routeManager, lifetime := newH3ExactOwner(t, ipVersion, relay.conn.LocalAddr().(*net.UDPAddr).Port, nextProto, func(s *PlatformTransportSettings) {
+			s.PingTimeout = pingTimeout
+			settings = s
+		})
+		bound := pingTimeout + newPlatformQuicConfig(settings, 1).MaxIdleTimeout
+
+		writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
+		defer routeManager.CloseMultiRouteWriter(writer)
+		// just past a ping boundary, so the owner's next ping is the boundary
+		// after next
+		time.Sleep(time.Until(WakeupTime(time.Now(), pingTimeout).Add(30 * time.Millisecond)))
+		for len(peer.received) != 0 {
+			<-peer.received
+		}
+		message := MessagePoolGet(64)
+		if err := writer.Write(context.Background(), message, time.Second); err != nil {
+			MessagePoolReturn(message)
+			t.Fatal(err)
+		}
+		select {
+		case <-peer.received:
+		case err := <-peer.errs:
+			t.Fatal(err)
+		case <-time.After(time.Second):
+			t.Fatal("the peer did not receive the last write")
+		}
+		// the peer's acknowledgement crosses before the path dies
+		time.Sleep(100 * time.Millisecond)
+		lastHeard := relay.kill()
+
+		withdrawn := lifetime.waitWithdrawn(3 * bound)
+		if withdrawn.IsZero() {
+			t.Fatal("the dead peer was never found")
+		}
+		found := withdrawn.Sub(lastHeard)
+		t.Logf("found the dead peer %s after its last packet, bound %s", found, bound)
+		if bound+h3ExactBoundTolerance < found {
+			t.Fatalf("found the dead peer %s after its last packet, want at most %s", found, bound)
 		}
 	})
 }
