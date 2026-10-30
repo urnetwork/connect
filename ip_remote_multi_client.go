@@ -11964,6 +11964,12 @@ type multiClientWindow struct {
 	// sendStallClientsBusy; a concurrent pass collects its own.
 	sendStallClients     []*multiClientChannel
 	sendStallClientsBusy atomic.Bool
+	// parks the send-stall watchdog while nothing is outstanding; every
+	// client the window constructs holds it. nil (bare fixtures) never parks
+	sendStallWake *outstandingSendWake
+	// Nil outside focused tests. Runs at the start of each send-stall pass
+	// (watchSendStalls). Set before the loop starts.
+	sendStallPassForTest func()
 	// networkChangeMonitor ends a platform-error retry wait when the host's
 	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
 	// never wakes a wait.
@@ -12099,6 +12105,7 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		sendStallWake:                newOutstandingSendWake(),
 		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
@@ -12133,6 +12140,36 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 	return max(stallTimeout/3, 250*time.Millisecond)
 }
 
+// outstandingSendWake parks a window's send-stall watchdog while no client of
+// the window has a send outstanding, and wakes it at the first send of a run:
+// a stall needs an outstanding send (sendStalled). The watchdog marks itself
+// parked before its last look at the clients, and the first send of a run
+// reads the mark under the client lock that look takes, so one of the two
+// always sees the other. While the watchdog runs, that send pays one atomic
+// load.
+type outstandingSendWake struct {
+	parked atomic.Bool
+	wake   chan struct{}
+}
+
+func newOutstandingSendWake() *outstandingSendWake {
+	return &outstandingSendWake{
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// signal wakes the watchdog if it is parked. Nil-safe: a channel built
+// outside a window has none.
+func (self *outstandingSendWake) signal() {
+	if self == nil || !self.parked.Load() || !self.parked.CompareAndSwap(true, false) {
+		return
+	}
+	select {
+	case self.wake <- struct{}{}:
+	default:
+	}
+}
+
 // watchSendStalls evaluates a client once its acknowledged-send progress stops.
 //
 // The watchdog polls on a fraction of the stall timeout (resize otherwise runs
@@ -12151,6 +12188,10 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 // admissible. An admitted verdict errors and cancels the channel immediately;
 // resize is woken only to reap it and backfill the window. Soft classifications
 // (stats-unhealthy, rank, drain) remain exclusively in resize.
+//
+// With nothing outstanding in the window no stall can start, so the watchdog
+// parks until the first send of a run or a newly admitted client wakes it
+// (outstandingSendWake), and polls again from there.
 func (self *multiClientWindow) watchSendStalls() {
 	// one timer for the loop's life
 	var pollTimer *time.Timer
@@ -12159,6 +12200,8 @@ func (self *multiClientWindow) watchSendStalls() {
 			pollTimer.Stop()
 		}
 	}()
+	// reused by each look before parking, so an idle look allocates nothing
+	var parkClients []*multiClientChannel
 	for {
 		stallTimeout := self.reliabilitySettings().SendStallTimeout
 
@@ -12174,6 +12217,9 @@ func (self *multiClientWindow) watchSendStalls() {
 			return
 		case <-pollTimer.C:
 		}
+		if self.sendStallPassForTest != nil {
+			self.sendStallPassForTest()
+		}
 
 		if stallTimeout <= 0 {
 			continue
@@ -12182,6 +12228,29 @@ func (self *multiClientWindow) watchSendStalls() {
 			// wake resize for the reap and the backfill only; the verdict has
 			// already been executed above
 			self.resizeMonitor.NotifyAll()
+		}
+
+		if wake := self.sendStallWake; wake != nil {
+			wake.parked.Store(true)
+			parkClients = self.appendUnorderedClients(parkClients[:0])
+			outstanding := false
+			for _, client := range parkClients {
+				// judged as convictSendStalls judges them
+				if !client.dataOnlyProviderProbe && client.hasOutstandingSends() {
+					outstanding = true
+					break
+				}
+			}
+			clear(parkClients)
+			if outstanding {
+				wake.parked.Store(false)
+			} else {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-wake.wake:
+				}
+			}
 		}
 	}
 }
@@ -13967,6 +14036,8 @@ func (self *multiClientWindow) expand(
 			if self.resizeMonitor != nil {
 				self.resizeMonitor.NotifyAll()
 			}
+			// the client may already have sends outstanding
+			self.sendStallWake.signal()
 		}()
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1
@@ -14264,6 +14335,7 @@ requestCandidates:
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
+			args.sendStallWake = self.sendStallWake
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -15445,6 +15517,9 @@ type multiClientChannelArgs struct {
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. nil (directly constructed channels) signals nothing.
+	sendStallWake *outstandingSendWake
 	// The parent's, shared by every channel: armed from this channel's provider
 	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
 	// leaves the channel at its rank.
@@ -15855,6 +15930,9 @@ type multiClientChannel struct {
 	// channel's first error signal it and clear it, so the loop judges the
 	// new evidence at once. Guarded by stateLock.
 	blackholeWake chan struct{}
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. Immutable from construction; nil outside a window.
+	sendStallWake *outstandingSendWake
 
 	// the busy-flow liveness probe's state (see busyLivenessProbe). All fields
 	// are guarded by stateLock.
@@ -16107,6 +16185,7 @@ func newMultiClientChannel(
 		providerQualifiedFunc:     providerQualifiedFunc,
 		receivingSiblingsFunc:     receivingSiblingsFunc,
 		qualificationRefreshFunc:  qualificationRefreshFunc,
+		sendStallWake:             args.sendStallWake,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -19490,8 +19569,9 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	eventBucket := self.eventBucket()
 
 	if self.packetStats.sendNackCount <= 0 {
-		// the first send of a run is evidence for a parked health loop
+		// the first send of a run is evidence for the parked watchers
 		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
 	}
 	if self.packetStats.sendNackCount == 0 {
 		// first outstanding send, so start the stall clock. see sendStalled
@@ -19529,8 +19609,9 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	eventBucket := self.eventBucket()
 	packetCount := len(sendPacketGroup.packets)
 	if self.packetStats.sendNackCount <= 0 {
-		// the first send of a run is evidence for a parked health loop
+		// the first send of a run is evidence for the parked watchers
 		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
 	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
@@ -19643,8 +19724,9 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	defer self.stateLock.Unlock()
 
 	if self.packetStats.sendNackCount <= 0 {
-		// the first send of a run is evidence for a parked health loop
+		// the first send of a run is evidence for the parked watchers
 		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
 	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
