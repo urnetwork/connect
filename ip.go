@@ -488,6 +488,9 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		returnBudget = max(kib(320), transferBudgetShareByteCount())
 	}
 	tcpBufferSettings := &TcpBufferSettings{
+		// off, see ProviderKeepAliveConfig. Negative timings leave the
+		// socket's own, so turning it off is one option write per flow.
+		ProviderKeepAliveConfig: &net.KeepAliveConfig{Enable: false, Idle: -1, Interval: -1, Count: -1},
 		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:             300 * time.Second,
 		ReturnQueueBudget:       NewTransferMemoryBudget(returnBudget),
@@ -4060,9 +4063,13 @@ type TcpBufferSettings struct {
 	// Shadow observes the socket default; mirror applies the first SYN's
 	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
 	EgressTtlMode EgressTtlMode
-	// Nil preserves existing provider keepalive settings (5s by default).
-	// An explicit config, including Enable:false, applies after connect and is
-	// independent of the control-plane ConnectSettings keepalive cadence.
+	// Kernel keepalive on the upstream socket of each flow, applied after
+	// connect and independent of the control-plane ConnectSettings cadence the
+	// dial uses. The default turns it off: the flow's own ReadTimeout and
+	// IdleTimeout reap a dead upstream, while probing every idle flow every 5 s
+	// kept a phone's radio up for each flow it carried. Nil leaves the dial's
+	// setting (that 5 s cadence, or a host-supplied dialer's own); an explicit
+	// config, including Enable:false, sets its own.
 	ProviderKeepAliveConfig *net.KeepAliveConfig
 	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
 	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
@@ -5519,7 +5526,8 @@ func (self *TcpSequence) Run() {
 	var err error
 	var egressDial *providerEgressDial
 	var dialDuration time.Duration
-	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
+	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp)
+	if synthetic {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
 		if self.log.V(1).Enabled() {
@@ -5593,7 +5601,10 @@ func (self *TcpSequence) Run() {
 			self.tcpBufferSettings.DialContextSettings == nil,
 		)
 	}
-	configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	if !synthetic {
+		// the synthetic server has no socket to configure
+		configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	}
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		if self.tcpBufferSettings.afterUpstreamConnectForTest != nil {
 			self.tcpBufferSettings.afterUpstreamConnectForTest(tcpConn)
