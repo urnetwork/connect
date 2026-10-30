@@ -4,7 +4,6 @@ package connect
 
 import (
 	"sync"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,8 +61,8 @@ func (self *udpSocketKqueueBackend) wake() {
 }
 
 func (self *udpSocketKqueueBackend) wait(events []udpSocketPollEvent) (int, error) {
-	timeout := unix.NsecToTimespec((100 * time.Millisecond).Nanoseconds())
-	n, err := unix.Kevent(self.fd, nil, self.osEvents[:min(len(events), len(self.osEvents))], &timeout)
+	// no timeout: readiness or wake ends the wait
+	n, err := unix.Kevent(self.fd, nil, self.osEvents[:min(len(events), len(self.osEvents))], nil)
 	for i := range n {
 		event := self.osEvents[i]
 		if event.Filter == unix.EVFILT_USER {

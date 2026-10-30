@@ -61,7 +61,8 @@ func (self *udpSocketEpollBackend) wake() {
 }
 
 func (self *udpSocketEpollBackend) wait(events []udpSocketPollEvent) (int, error) {
-	n, err := unix.EpollWait(self.fd, self.osEvents[:min(len(events), len(self.osEvents))], 100)
+	// no timeout: readiness or wake ends the wait
+	n, err := unix.EpollWait(self.fd, self.osEvents[:min(len(events), len(self.osEvents))], -1)
 	for i := range n {
 		event := self.osEvents[i]
 		if int(event.Fd) == self.wakeFd {

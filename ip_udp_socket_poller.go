@@ -18,6 +18,11 @@ type udpSocketPollEvent struct {
 // udpSocketPollBackend is implemented with epoll on Linux/Android and kqueue
 // on Darwin/iOS. The portable fallback returns nil from
 // newUdpSocketPollBackend, leaving UdpSequence's established reader intact.
+//
+// wait blocks until a registered descriptor is ready or wake is called, with
+// no timeout, so an idle shard sleeps in the kernel. A wake is reported as an
+// event with fd -1. wake and close may run concurrently with each other and
+// with wait; a wake after close does nothing.
 type udpSocketPollBackend interface {
 	add(fd int) error
 	remove(fd int)
@@ -50,6 +55,8 @@ type udpSocketReadPollShard struct {
 	pauseCount         int
 	pauseChanged       receiveCapacitySignal
 	returnReadCapacity receiveCapacitySignal
+	// Observes each return from the readiness wait. Nil in production.
+	afterWaitForTest func()
 }
 
 type udpSocketReadPoller struct {
@@ -74,10 +81,11 @@ func newUdpSocketReadPoller(
 			return nil
 		}
 		shards = append(shards, udpSocketReadPollShard{
-			ctx:        ctx,
-			backend:    backend,
-			readBuffer: make([]byte, settings.ReadBufferByteCount),
-			byFd:       map[int]*udpSocketReadRegistration{},
+			ctx:              ctx,
+			backend:          backend,
+			readBuffer:       make([]byte, settings.ReadBufferByteCount),
+			byFd:             map[int]*udpSocketReadRegistration{},
+			afterWaitForTest: settings.afterSocketPollWaitForTest,
 		})
 	}
 	poller := &udpSocketReadPoller{shards: shards}
@@ -183,8 +191,12 @@ func (self *udpSocketReadPollShard) registration(fd int) (*udpSocketReadRegistra
 	return registration, active
 }
 
+// The readiness wait has no timeout, so cancellation reaches it through the
+// backend's wake. That wake ends the shard; it does not resume paused flows.
 func (self *udpSocketReadPollShard) run() {
 	defer self.backend.close()
+	stopCancelWake := context.AfterFunc(self.ctx, self.backend.wake)
+	defer stopCancelWake()
 	watchCtx, cancelWatch := context.WithCancel(self.ctx)
 	watchDone := make(chan struct{})
 	go func() {
@@ -200,15 +212,13 @@ func (self *udpSocketReadPollShard) run() {
 		default:
 		}
 		eventCount, err := self.backend.wait(events)
-		if err != nil {
-			if errors.Is(err, syscall.EINTR) {
-				continue
-			}
-			select {
-			case <-self.ctx.Done():
-				return
-			default:
-			}
+		if err != nil && errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if self.afterWaitForTest != nil {
+			self.afterWaitForTest()
+		}
+		if err != nil || self.ctx.Err() != nil {
 			return
 		}
 		for _, event := range events[:eventCount] {

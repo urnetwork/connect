@@ -2195,6 +2195,9 @@ type UdpBufferSettings struct {
 	// Tests inspect the configured socket before the first datagram is written.
 	// Runs on the flow's opener; nil is a production no-op.
 	afterSocketOpenForTest func(*UdpSequence, net.Conn)
+	// Tests count the readiness shards' returns from their kernel wait. Runs
+	// on each shard's goroutine; nil is a production no-op.
+	afterSocketPollWaitForTest func()
 
 	ConnectSettings
 }
