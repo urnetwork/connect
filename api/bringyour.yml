@@ -7075,10 +7075,15 @@ paths:
       summary: Sn Head
       description: |
         The caller network's standing for a head mining spot (Top 200,
-        WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
-        distinct routable egress-IP breadth from the live trail egress index,
-        `floor` the score of the last network inside `cutoff` (0 while fewer
-        networks score), `rank_estimate` 1-based (0 without a score).
+        WHITEPAPER 8.4), read from the Protocol leaderboard's newest snapshot
+        (`GET /sn/top`), so this route, the Top 200 page and the Protocol tab
+        agree: `score` is the network's `projected_score`, `floor` the
+        snapshot's `projected_cutoff` (the projected 200th score), and
+        `rank_estimate` the network's 1-based `position` (0 when it is not
+        ranked). Before the board's first snapshot they come from the live
+        estimate instead: split-adjusted distinct routable egress-IP breadth
+        from the live trail egress index, with `floor` the score of the last
+        network inside `cutoff` (0 while fewer networks score).
         `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
         "server" until validators publish consensus scores on chain; a chain
         outage degrades to the estimate, never an error.
@@ -7172,12 +7177,9 @@ paths:
 
   /sn/top:
     get:
-      x-status: planned
       tags: [Other]
       summary: The Protocol leaderboard
       description: |
-        Planned operation; the server does not currently expose this route.
-
         The Protocol leaderboard (server LEADERTOP.md): networks ranked the
         way the SN25 validator picks its Top 200 head fleets, so a network
         that has not claimed a UID can see whether it would make the head if
@@ -7200,6 +7202,8 @@ paths:
         pinned to the snapshot of the page that returned it: pass `next` as
         `cursor` until it is null. `snapshot` pins the first page to one
         snapshot, and `filter` lists `unclaimed` or `claimed` networks only.
+        Before the board's first snapshot the answer has no rows, and its
+        snapshot has an empty `id`.
 
         No authentication is required. With a bearer token the response also
         carries `me`, the caller's own row wherever it ranks, and the
@@ -7219,7 +7223,7 @@ paths:
         - in: query
           name: limit
           required: false
-          description: Page size, default 50, at most 200.
+          description: Page size, default 50, at most 200; a larger one is served as 200.
           schema:
             type: integer
             minimum: 1
@@ -7259,18 +7263,23 @@ paths:
               schema:
                 $ref: "#/components/schemas/SnTopResult"
         "400":
-          description: A query parameter is malformed.
+          description: |
+            A query parameter is malformed: a `limit` that is not a whole
+            number, an unknown `filter`, a `cursor` or `snapshot` that does
+            not parse, or a `cursor` from another `filter` or `snapshot` than
+            the ones given.
         "401":
           description: A bearer token was sent and does not authenticate.
+        "404":
+          description: "`snapshot` names no snapshot."
+        "410":
+          description: The cursor's snapshot expired; reload from the first page.
 
   /sn/top/me:
     get:
-      x-status: planned
       tags: [Other]
       summary: The caller's Protocol leaderboard detail
       description: |
-        Planned operation; the server does not currently expose this route.
-
         The caller network's standing on the Protocol leaderboard
         (`GET /sn/top`), from the same snapshot: its row; the score it would
         have if it claimed alone today, with no other network or fleet on its
@@ -7278,7 +7287,8 @@ paths:
         other networks and claimed fleets share them; why the validator
         cannot measure it, when it cannot; and its rank and score for each
         day of up to the last 90, for a progress chart. Counts only, never
-        prefix hashes or addresses.
+        prefix hashes or addresses. A network that is not ranked has a row
+        with `position` 0 and the label `not_measurable`.
       operationId: snTopMe
       security:
         - BearerAuth: []
@@ -16718,15 +16728,21 @@ components:
           description: The estimate places the network inside the cutoff.
           type: boolean
         score:
-          description: Split-adjusted distinct routable egress-IP breadth (server estimate).
+          description: |
+            The network's `projected_score` in the Protocol leaderboard's
+            newest snapshot; before the first snapshot, the live estimate of
+            split-adjusted distinct routable egress-IP breadth.
           type: number
           format: double
         floor:
-          description: Score of the last network inside the cutoff; 0 while fewer networks score.
+          description: |
+            The snapshot's `projected_cutoff`, the projected 200th score;
+            before the first snapshot, the score of the last network inside
+            the cutoff (0 while fewer networks score).
           type: number
           format: double
         rank_estimate:
-          description: 1-based estimated rank; 0 without a score.
+          description: The network's 1-based `position` on the board; 0 when it is not ranked.
           type: integer
         cutoff:
           description: Head-tier size (200).
@@ -17122,7 +17138,9 @@ components:
         - stale
       properties:
         id:
-          description: Opaque; the `snapshot` query parameter of `GET /sn/top` reads from it.
+          description: |
+            Opaque; the `snapshot` query parameter of `GET /sn/top` reads from
+            it. Empty before the board's first snapshot.
           type: string
         tempo_index:
           description: The SN25 tempo the snapshot folds in.
@@ -17220,9 +17238,11 @@ components:
         - fleets
       properties:
         position:
-          description: The 1-based position in the snapshot's total order.
+          description: |
+            The 1-based position in the snapshot's total order; 0 in
+            `GET /sn/top/me` when the network is not ranked.
           type: integer
-          minimum: 1
+          minimum: 0
         name:
           description: |
             The network name, set in `rows` only when the network turned on
@@ -17283,7 +17303,9 @@ components:
         claim_prompt:
           description: |
             The apps prompt the network to claim a head seat: it is
-            `measurable` and its `position` is 200 or better.
+            `measurable`, its `position` is 200 or better, and it has no
+            active claimed fleet. A network that already claimed is not
+            prompted. Apps use this flag rather than computing it.
           type: boolean
         is_me:
           description: The row is the caller's own network; false without a bearer token.
@@ -17296,7 +17318,11 @@ components:
 
     SnTopFleet:
       type: object
-      description: One fleet a network has claimed, bound on SN25 to a hotkey UID.
+      description: |
+        One fleet a network has claimed, bound on SN25 to a hotkey UID. A UID
+        that changed hands earns and ranks for its new holder, so the
+        validator's data and the incentive are shown only while the fleet's
+        hotkey still holds the UID, and are null otherwise.
       required:
         - uid
         - generation
@@ -17338,9 +17364,14 @@ components:
           description: The validator selected the fleet into the Top 200; null without a head summary.
           type: [boolean, "null"]
         incentive:
-          description: The UID's on-chain `Incentive`; null before it is first read.
+          description: |
+            The UID's share of SN25 incentive, a fraction from 0 to 1 (the
+            chain's `Incentive`, a share of 65535); null before it is first
+            read. 0.018 is 1.8%.
           type: [number, "null"]
           format: double
+          minimum: 0
+          maximum: 1
         incentive_stale:
           description: |
             `incentive` is stale: the validator's weights on chain are its
