@@ -7318,41 +7318,111 @@ func (self *SendSequence) ResendQueueSizeAndMessageTypes() (int, ByteCount, Id, 
 	return count, byteSize, self.sequenceId, messageTypes
 }
 
-// awaitResendCapacity holds a reliable pack outside admission until the send
-// loop reports that the resend queue could take it, or the caller's timeout
-// runs out. Returns the remaining timeout.
+// The one timer of a Pack call. Each wait of the call re-arms it only when
+// its deadline changes, so a wait that readiness edges or admission turns wake
+// again and again arms no new timer per wake. The admission waits (resend
+// capacity, the admission slot, the handoff) share one deadline, the remaining
+// timeout fixed at the first of them that blocks, so together they stay within
+// the caller's timeout. Owned by the calling goroutine.
+type sendPackWait struct {
+	timer *time.Timer
+	// the deadline the timer is armed for and has not delivered; zero when none
+	armedDeadline time.Time
+	// the admission budget: negative waits with no deadline, zero never waits
+	timeout time.Duration
+	// fixed at the first admission wait that blocks; zero before
+	deadline time.Time
+}
+
+// Fires at deadline. The call's timer is created at its first wait and
+// re-armed only for a different deadline.
+func (self *sendPackWait) until(deadline time.Time) <-chan time.Time {
+	if self.timer == nil {
+		self.timer = time.NewTimer(time.Until(deadline))
+	} else if !deadline.Equal(self.armedDeadline) {
+		self.timer.Reset(time.Until(deadline))
+	}
+	self.armedDeadline = deadline
+	return self.timer.C
+}
+
+// Records that a wait received the armed deadline, so a later wait for the
+// same deadline re-arms.
+func (self *sendPackWait) fired() {
+	self.armedDeadline = time.Time{}
+}
+
+// The admission budget left for the next wait: the timeout until a wait has
+// blocked, or when it has no deadline, then the time left to the deadline,
+// never below zero.
+func (self *sendPackWait) remaining() time.Duration {
+	if self.timeout <= 0 || self.deadline.IsZero() {
+		return self.timeout
+	}
+	return max(0, time.Until(self.deadline))
+}
+
+// Fires at the admission deadline, fixing it at the first call. For a
+// positive timeout only.
+func (self *sendPackWait) expired() <-chan time.Time {
+	if self.deadline.IsZero() {
+		self.deadline = time.Now().Add(self.timeout)
+	}
+	return self.until(self.deadline)
+}
+
+func (self *sendPackWait) stop() {
+	if self.timer != nil {
+		self.timer.Stop()
+	}
+}
+
+// One awaitResendCapacityWithin wait with a timer of its own. Returns the
+// remaining timeout.
+func (self *SendSequence) awaitResendCapacity(
+	sendPack *SendPack,
+	timeout time.Duration,
+) (bool, error, time.Duration) {
+	wait := sendPackWait{timeout: timeout}
+	defer wait.stop()
+	admitted, err := self.awaitResendCapacityWithin(sendPack, &wait)
+	return admitted, err, wait.remaining()
+}
+
+// Holds a reliable pack outside admission until the send loop reports that
+// the resend queue could take it, or the call's admission budget runs out.
 //
 // A capacity publication gives the first blocked producer its turn at once.
 // The common open case stays two atomic reads. Producers that wait pass in
 // arrival order (see resendCapacityGate), so one that has just passed cannot
 // pass again ahead of one that was already waiting.
-func (self *SendSequence) awaitResendCapacity(
+func (self *SendSequence) awaitResendCapacityWithin(
 	sendPack *SendPack,
-	timeout time.Duration,
-) (bool, error, time.Duration) {
+	wait *sendPackWait,
+) (bool, error) {
+	timeout := wait.remaining()
 	gate := &self.resendCapacityUnavailable
 	if self.preparedPackFits(sendPack) {
 		gate = &self.preparedFlightUnavailable
 	}
 	if gate.closed.Load() {
-		return false, errors.New("send capacity source closed"), timeout
+		return false, errors.New("send capacity source closed")
 	}
 	if gate.open(timeout != 0) {
-		return true, nil, timeout
+		return true, nil
 	}
 	if timeout == 0 {
 		if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok && group.isSynRetry() {
 			group.noteSynRetryCapacityRefusal(self, gate)
 		}
-		return false, nil, timeout
+		return false, nil
 	}
-	startTime := time.Now()
 	waiter := gate.queue()
 	if gate.closed.Load() {
 		if waiter != nil {
 			gate.abandon(waiter)
 		}
-		return false, errors.New("send capacity source closed"), timeout
+		return false, errors.New("send capacity source closed")
 	}
 	if waiter != nil {
 		if gate == &self.resendCapacityUnavailable {
@@ -7361,34 +7431,29 @@ func (self *SendSequence) awaitResendCapacity(
 		}
 		var timeoutChannel <-chan time.Time
 		if 0 < timeout {
-			timer := time.NewTimer(timeout)
-			defer timer.Stop()
-			timeoutChannel = timer.C
+			timeoutChannel = wait.expired()
 		}
 		for passed := false; !passed; {
 			if gate.closed.Load() {
 				gate.abandon(waiter)
-				return false, errors.New("send capacity source closed"), timeout
+				return false, errors.New("send capacity source closed")
 			}
 			select {
 			case <-sendPack.Ctx.Done():
 				gate.abandon(waiter)
-				return false, errors.New("Done."), timeout
+				return false, errors.New("Done.")
 			case <-self.ctx.Done():
 				gate.abandon(waiter)
-				return false, errors.New("Done."), timeout
+				return false, errors.New("Done.")
 			case <-timeoutChannel:
 				gate.abandon(waiter)
-				return false, nil, 0
+				return false, nil
 			case <-waiter.ready:
 				passed = gate.pass(waiter)
 			}
 		}
 	}
-	if 0 < timeout {
-		timeout = max(time.Duration(0), timeout-time.Since(startTime))
-	}
-	return true, nil, timeout
+	return true, nil
 }
 
 func (self *SendSequence) notifyRetainedAdmissionDemand() {
@@ -7405,20 +7470,32 @@ func (self *SendSequence) notifyRetainedAdmissionDemand() {
 // reliable admission gate uses capacity notifications rather than this timer.
 const resendCapacityPollInterval = 2 * time.Millisecond
 
-// Spends the same caller timeout as channel admission. The returned timeout is
-// the remaining budget for the channel handoff.
-//
-// A sender that finds no slot waits in arrival order, and the slot a release
-// frees is already this sender's when its ready channel closes. A sender that
-// gives up abandons its place, passing on any slot granted meanwhile.
+// One acquirePackAdmissionWithin wait with a timer of its own. Returns the
+// remaining timeout.
 func (self *SendSequence) acquirePackAdmission(
 	sendPack *SendPack,
 	timeout time.Duration,
 ) (bool, error, time.Duration) {
+	wait := sendPackWait{timeout: timeout}
+	defer wait.stop()
+	acquired, err := self.acquirePackAdmissionWithin(sendPack, &wait)
+	return acquired, err, wait.remaining()
+}
+
+// Spends the call's admission budget, which the channel handoff then spends
+// what remains of.
+//
+// A sender that finds no slot waits in arrival order, and the slot a release
+// frees is already this sender's when its ready channel closes. A sender that
+// gives up abandons its place, passing on any slot granted meanwhile.
+func (self *SendSequence) acquirePackAdmissionWithin(
+	sendPack *SendPack,
+	wait *sendPackWait,
+) (bool, error) {
 	if self.packAdmission == nil {
-		return true, nil, timeout
+		return true, nil
 	}
-	startTime := time.Now()
+	timeout := wait.remaining()
 	admissionKey := sendPack.schedulingKey
 	if !self.flowIsolation.Load() {
 		// A carrier without explicit flow isolation gets the complete legacy
@@ -7429,36 +7506,31 @@ func (self *SendSequence) acquirePackAdmission(
 	if waiter != nil {
 		var timeoutChannel <-chan time.Time
 		if 0 < timeout {
-			timer := time.NewTimer(timeout)
-			defer timer.Stop()
-			timeoutChannel = timer.C
+			timeoutChannel = wait.expired()
 		}
 		select {
 		case <-waiter.ready:
 			acquired, closed = waiter.granted, !waiter.granted
 		case <-sendPack.Ctx.Done():
 			self.packAdmission.abandon(waiter)
-			return false, errors.New("Done."), timeout
+			return false, errors.New("Done.")
 		case <-self.ctx.Done():
 			self.packAdmission.abandon(waiter)
-			return false, errors.New("Done."), timeout
+			return false, errors.New("Done.")
 		case <-timeoutChannel:
 			self.packAdmission.abandon(waiter)
-			return false, nil, timeout
+			return false, nil
 		}
 	}
 	if closed {
-		return false, errors.New("Done."), timeout
+		return false, errors.New("Done.")
 	}
 	if !acquired {
-		return false, nil, timeout
+		return false, nil
 	}
 	sendPack.admission = self.packAdmission
 	sendPack.admissionKey = admissionKey
-	if 0 < timeout {
-		timeout = max(time.Duration(0), timeout-time.Since(startTime))
-	}
-	return true, nil, timeout
+	return true, nil
 }
 
 // success, error
@@ -7479,6 +7551,10 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		return false, errors.New("Done.")
 	}
 	defer self.idleCondition.UpdateClose()
+
+	// every wait of this call shares one timer
+	var wait sendPackWait
+	defer wait.stop()
 
 	// A handshake/control pack can create this logical sequence before the
 	// application supplies its explicit multihop route. Promote the shared
@@ -7590,7 +7666,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			}
 			var deadlineReached <-chan time.Time
 			if !deadline.IsZero() {
-				deadlineReached = time.After(time.Until(deadline))
+				deadlineReached = wait.until(deadline)
 			}
 			select {
 			case <-sendPack.Ctx.Done():
@@ -7601,6 +7677,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 				return false, errors.New("Done.")
 			case <-changed:
 			case <-deadlineReached:
+				wait.fired()
 			}
 		}
 		if 0 < timeout {
@@ -7660,7 +7737,8 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			case <-self.session.ctx.Done():
 				return false, errors.New("Done.")
 			case <-changed:
-			case <-time.After(deadline.Sub(now)):
+			case <-wait.until(deadline):
+				wait.fired()
 			}
 		}
 		if 0 < timeout {
@@ -7717,20 +7795,20 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			return true, nil
 		}
 	}
+	wait.timeout = timeout
 	if sendPack.Ack {
 		if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok && group.isSynRetry() {
 			group.prepareSynRetryReadinessCapacity(self)
 		}
-		admitted, err, capacityTimeout := self.awaitResendCapacity(sendPack, timeout)
+		admitted, err := self.awaitResendCapacityWithin(sendPack, &wait)
 		if err != nil || !admitted {
 			if err == nil {
 				sendPack.admissionFailure = sendAdmissionResendCapacity
 			}
 			return false, err
 		}
-		timeout = capacityTimeout
 	}
-	admitted, err, timeout := self.acquirePackAdmission(sendPack, timeout)
+	admitted, err := self.acquirePackAdmissionWithin(sendPack, &wait)
 	if err != nil || !admitted {
 		if err == nil {
 			sendPack.admissionFailure = sendAdmissionPack
@@ -7758,7 +7836,8 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	default:
 	}
 
-	if timeout < 0 {
+	// the handoff spends what remains of the admission budget
+	if remaining := wait.remaining(); remaining < 0 {
 		select {
 		case <-sendPack.Ctx.Done():
 			return false, errors.New("Done.")
@@ -7769,7 +7848,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			self.groupAdmitted(groupAdmissionTarget)
 			return true, nil
 		}
-	} else if timeout == 0 {
+	} else if remaining == 0 {
 		select {
 		case <-sendPack.Ctx.Done():
 			return false, errors.New("Done.")
@@ -7793,7 +7872,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			queued = true
 			self.groupAdmitted(groupAdmissionTarget)
 			return true, nil
-		case <-time.After(timeout):
+		case <-wait.expired():
 			sendPack.admissionFailure = sendAdmissionHandoff
 			return false, nil
 		}

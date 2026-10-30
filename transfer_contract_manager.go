@@ -1610,6 +1610,14 @@ func (self *ContractManager) TakeContract(
 	defer self.closeContractQueue(contractKey, contractQueue)
 
 	enterTime := time.Now()
+	// One timer for the call's deadline, armed at its first wait. A queue
+	// notification that brings no contract leaves it armed.
+	var timeoutTimer *time.Timer
+	defer func() {
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+	}()
 	for {
 		notify := contractQueue.updateMonitor.NotifyChannel()
 		var minEnqueueTime time.Time
@@ -1672,13 +1680,16 @@ func (self *ContractManager) TakeContract(
 			if remainingTimeout <= 0 {
 				return nil
 			}
+			if timeoutTimer == nil {
+				timeoutTimer = time.NewTimer(remainingTimeout)
+			}
 			select {
 			case <-self.ctx.Done():
 				return nil
 			case <-ctx.Done():
 				return nil
 			case <-notify:
-			case <-time.After(remainingTimeout):
+			case <-timeoutTimer.C:
 				return nil
 			}
 		}
