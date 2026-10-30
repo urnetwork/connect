@@ -227,6 +227,17 @@ type packetStatsCounters struct {
 	blockIngressByteCount    atomic.Int64
 	transportStatsLock       sync.Mutex
 	transportStats           map[TransportType]*PacketStats
+	// called after each change recorded through the methods below, so the
+	// owner's epoch worker can park while nothing moves. A direct add to a
+	// counter above signals the owner at its own site. Set before the
+	// counters are shared; nil signals nothing.
+	changed func()
+}
+
+func (self *packetStatsCounters) change() {
+	if self.changed != nil {
+		self.changed()
+	}
 }
 
 func (self *packetStatsCounters) snapshot() *PacketStats {
@@ -338,6 +349,8 @@ func (self *packetStatsCounters) recordRemoteEgress(
 	packetCount int64,
 	byteCount ByteCount,
 ) {
+	// runs after the unlock below
+	defer self.change()
 	self.transportStatsLock.Lock()
 	defer self.transportStatsLock.Unlock()
 	self.remoteEgressPacketCount.Add(packetCount)
@@ -358,6 +371,8 @@ func (self *packetStatsCounters) moveRemoteEgress(
 	if from == to {
 		return
 	}
+	// runs after the unlock below
+	defer self.change()
 	self.transportStatsLock.Lock()
 	defer self.transportStatsLock.Unlock()
 	fromStats := self.transportStatsWithLock(from)
@@ -373,6 +388,8 @@ func (self *packetStatsCounters) recordRemoteIngress(
 	packetCount int64,
 	byteCount ByteCount,
 ) {
+	// runs after the unlock below
+	defer self.change()
 	self.transportStatsLock.Lock()
 	defer self.transportStatsLock.Unlock()
 	self.remoteIngressPacketCount.Add(packetCount)

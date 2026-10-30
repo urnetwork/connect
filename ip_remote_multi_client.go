@@ -1875,6 +1875,13 @@ type RemoteUserNatMultiClient struct {
 	serverNamesLearnedUnsub func()
 	packetStatsCounters     *packetStatsCounters
 	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+	// set by any change an epoch would report (a counted packet, a collected
+	// block action, a new packet stats listener) and taken by the epoch
+	// worker; the wake lets a parked worker resume (see runEventEpoch)
+	eventEpochChanged atomic.Bool
+	eventEpochWake    chan struct{}
+	// Observes each wake of the event epoch worker. Nil in production.
+	eventEpochWakeForTest atomic.Pointer[func()]
 	// every window client's transport delay stats pass through here unchanged
 	// (DELAY.md §9, D9)
 	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
@@ -2717,11 +2724,14 @@ func NewRemoteUserNatMultiClient(
 		blockActionIgnoreCache:       newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
 		packetStatsCounters:          &packetStatsCounters{},
 		packetStatsCallbacks:         NewCallbackList[PacketStatsFunction](),
+		eventEpochWake:               make(chan struct{}, 1),
 		transportDelayStatsCallbacks: NewCallbackList[TransportDelayStatsFunction](),
 		reliabilityMetrics:           newReliabilityMetrics(),
 		flowReaperWake:               make(chan struct{}, 1),
 		flowReaperDone:               make(chan struct{}),
 	}
+	// every count recorded through the counters wakes a parked event epoch
+	multiClient.packetStatsCounters.changed = multiClient.eventEpochChange
 	if settings.IpAssocSettings != nil {
 		cache := multiClient.blockActionCache
 		afterShed := cache.clear
@@ -2893,12 +2903,15 @@ func NewRemoteUserNatMultiClient(
 	return multiClient
 }
 
-// flushes block action and packet stats events to listeners on the event epoch
+// flushes block action and packet stats events to listeners an epoch after a
+// change. It arms one timer for its life. An epoch that takes no change parks
+// the worker until the next change wakes it (eventEpochChange), and the flush
+// then follows one epoch later, so every change is reported within one epoch
+// of it while an idle client costs no wakeups.
 func (self *RemoteUserNatMultiClient) runEventEpoch() {
 	defer self.cancel()
 
 	var lastPacketStats *PacketStats
-	// one timer for the loop's life
 	epochTimer := time.NewTimer(self.settings.EventEpoch)
 	defer epochTimer.Stop()
 	for {
@@ -2907,6 +2920,20 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 			return
 		case <-epochTimer.C:
 		}
+		if wake := self.eventEpochWakeForTest.Load(); wake != nil {
+			(*wake)()
+		}
+
+		// Take the flag before the flush and the compare, so a change that
+		// lands during this pass raises it for the next one. Drain the wake
+		// first: a wake the drain drops was sent by a raise that this take or
+		// an earlier one covers, and a raise the take misses sends its wake
+		// after the drain, so the park below still sees it.
+		select {
+		case <-self.eventEpochWake:
+		default:
+		}
+		changed := self.eventEpochChanged.Swap(false)
 
 		self.blockActionCollector.flush()
 
@@ -2923,7 +2950,28 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 				}
 			}
 		}
+		if !changed {
+			// nothing changed for a whole epoch
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.eventEpochWake:
+			}
+		}
 		epochTimer.Reset(self.settings.EventEpoch)
+	}
+}
+
+// eventEpochChange marks the event epoch changed and wakes a parked epoch
+// worker. Called after the change it reports. Once the flag is up it costs one
+// atomic load, so a packet pays nothing more while traffic moves.
+func (self *RemoteUserNatMultiClient) eventEpochChange() {
+	if self.eventEpochChanged.Load() || !self.eventEpochChanged.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.eventEpochWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -2936,6 +2984,7 @@ func (self *RemoteUserNatMultiClient) localReceivePacket(
 ) {
 	self.packetStatsCounters.localIngressPacketCount.Add(1)
 	self.packetStatsCounters.localIngressByteCount.Add(int64(len(packet)))
+	self.eventEpochChange()
 	if self.ipAssoc != nil && !self.blockActionIgnored(ipPath) {
 		// the local user nat delivers the flow's egress-oriented path
 		// (the remote endpoint is the destination)
@@ -6364,10 +6413,12 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 			reason = BlockActionReasonBlocker
 		}
 		self.blockActionCollector.add(decision, block, local, match, reason, byteCount)
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return false
 	}
 	if !local || self.localUserNat == nil {
@@ -6377,6 +6428,7 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 	if success {
 		self.packetStatsCounters.localEgressPacketCount.Add(1)
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 	}
 	return success
 }
@@ -6396,6 +6448,7 @@ func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
 	}
 	self.packetStatsCounters.blockEgressPacketCount.Add(1)
 	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+	self.eventEpochChange()
 	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
 	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
 }
@@ -6598,11 +6651,13 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
 		self.blockActionCollector.add(decision, block, local, match, blockActionReason(r, securityReason, blockerBlock, match), byteCount)
+		self.eventEpochChange()
 	}
 
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, packet)
 		}
@@ -6613,6 +6668,7 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 		if success {
 			self.packetStatsCounters.localEgressPacketCount.Add(1)
 			self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+			self.eventEpochChange()
 		}
 		return success
 	}
@@ -6725,11 +6781,13 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 		byteCount += fragmentByteCount
 		if decision != nil && self.blockActionCollector.hasCallbacks() {
 			self.blockActionCollector.add(decision, block, local, match, actionReason, fragmentByteCount)
+			self.eventEpochChange()
 		}
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, reassembled)
 		}
@@ -6746,6 +6804,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return true
 	}
 
@@ -7075,10 +7134,12 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 				ByteCount(len(packet)),
 			)
 		}
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, group.packets[len(group.packets)-1])
 		}
@@ -7138,6 +7199,7 @@ func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		return true
 	}
 	if parsedGroup == nil || !self.sendParsedPacketGroupAttempt(
@@ -7374,6 +7436,9 @@ func (self *RemoteUserNatMultiClient) publishTransportDelayStats(stats *Transpor
 // packet stats change
 func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
 	callbackId := self.packetStatsCallbacks.Add(packetStatsCallback)
+	// wake a parked epoch: the first listener is owed the counters as they
+	// stand
+	self.eventEpochChange()
 	return func() {
 		self.packetStatsCallbacks.Remove(callbackId)
 	}
