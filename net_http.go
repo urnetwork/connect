@@ -2744,15 +2744,15 @@ func extenderConfigsForCandidate(
 // completed first attempt, or no network client at all never waits: the gate
 // exists so a cold start does not dial without the extenders it is about to
 // learn, not to delay anything else.
+//
+// The gate starts every dial and GET, and almost every call finds no sample
+// pending. A call that does not wait creates no timer and copies nothing.
 func (self *ClientStrategy) waitForExtenderInitialSample(ctx context.Context) {
 	directory := self.settings.ExtenderDirectory
 	if directory == nil || self.settings.ExtenderInitialSampleTimeout <= 0 {
 		return
 	}
-	if 0 < len(self.CustomExtenders()) {
-		return
-	}
-	timeout := time.After(self.settings.ExtenderInitialSampleTimeout)
+	var timeout <-chan time.Time
 	for {
 		state, update := directory.InitialSampleMonitor().Get()
 		if state != ExtenderInitialSamplePending {
@@ -2760,6 +2760,14 @@ func (self *ClientStrategy) waitForExtenderInitialSample(ctx context.Context) {
 		}
 		if 0 < directory.UsableCount(0) {
 			return
+		}
+		if timeout == nil {
+			// the first wait: custom extenders never wait, and one timer
+			// bounds every pass after this
+			if 0 < len(self.CustomExtenders()) {
+				return
+			}
+			timeout = time.After(self.settings.ExtenderInitialSampleTimeout)
 		}
 		select {
 		case <-ctx.Done():
