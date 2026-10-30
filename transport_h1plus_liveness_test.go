@@ -549,6 +549,9 @@ func TestH1PlusLivenessSpeedPayloadDeadlineReturnsOwner(t *testing.T) {
 			t.Fatal("speed-mode control was not echoed before the failure")
 		}
 		fixture.client.failWriteDeadline.Store(true)
+		// a later instant, so the payload installs a deadline of its own: the
+		// batch conn does not forward one identical to the echo's again
+		time.Sleep(time.Nanosecond)
 		message := MessagePoolGet(64)
 		witness := MessagePoolShareReadOnly(message)
 		fixture.sendMessage(t, message)
