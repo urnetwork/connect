@@ -233,8 +233,8 @@ func (self *ExtenderServer) peekNLayerClientRandom(clientConn net.Conn) ([]byte,
 		m, err := clientConn.Read(prefixBytes[n:])
 		n += m
 		if err != nil {
-			// a timeout leaves the stream usable, since the relay sets its own
-			// deadlines; any other error the relay meets on its first read
+			// a timeout leaves the stream usable once the deadline is cleared
+			// below; any other error the relay meets on its first read
 			break
 		}
 	}

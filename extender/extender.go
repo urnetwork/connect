@@ -72,11 +72,6 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		ValidFrom:    180 * 24 * time.Hour,
 		ValidFor:     180 * 24 * time.Hour,
 
-		// half the timeout: a busy direction installs a deadline about once
-		// per 15 s, and a stalled peer is noticed between 30 s and 45 s after
-		// its last chunk rather than at 30 s
-		RelayDeadlineSlackFraction: 0.5,
-
 		HeaderTimeout:               10 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
 		QuicVersionPolicy:           connect.QuicVersionPolicyPreferV2,
@@ -135,16 +130,6 @@ type ExtenderSettings struct {
 	WriteTimeout time.Duration
 	ValidFrom    time.Duration
 	ValidFor     time.Duration
-
-	// How far past the relay's ReadTimeout and WriteTimeout (A9), and past
-	// ProxyIdleTimeout in the camouflage splice, a relay re-arms a deadline
-	// that is still running, as a share of that timeout. A busy direction then
-	// installs a deadline about once per this share of the timeout instead of
-	// before every chunk, each install being a timer change in the runtime
-	// poller. A read or write still fails no earlier than its timeout after it
-	// starts, and at most this share later. Non-positive re-arms before every
-	// operation.
-	RelayDeadlineSlackFraction float64
 
 	// Budget for the outer handshake and the extender request of one
 	// connection (A9). A client that opens a connection and says nothing is
@@ -439,6 +424,11 @@ type ExtenderSettings struct {
 	// certificate, so the API never serves.
 	Measurement  ExtenderLagSettings
 	LagLifecycle *ExtenderLagLifecycleSettings
+
+	// Nil outside package tests. Called each time a relay direction's
+	// watchdog arms its timer, so a test can count the timer operations its
+	// chunks cost.
+	relayWatchdogArmForTest func()
 }
 
 type ExtenderServer struct {
@@ -1896,16 +1886,21 @@ func forwardNetwork(clientAddress string) string {
 }
 
 // Copies both directions until either ends, then releases both connections.
-// Each direction re-arms its read and write deadlines lazily (relayDeadline),
-// so a stream still ends no earlier than ReadTimeout after a read starts or
-// WriteTimeout after a write starts, and at most RelayDeadlineSlackFraction of
-// that later.
+// A read that runs ReadTimeout, or a write that runs WriteTimeout, ends the
+// relay exactly then, each counted from its own start. Each direction's
+// watchdog (relayWatchdog) keeps the two bounds on one timer, so no chunk
+// installs a deadline.
 func (self *ExtenderServer) relay(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	clientConn net.Conn,
 	forwardConn net.Conn,
 ) {
+	// The relay installs no deadline, so none left by the setup may outlive
+	// it. Before, the first read and write of each direction replaced them.
+	clientConn.SetDeadline(time.Time{})
+	forwardConn.SetDeadline(time.Time{})
+
 	var relayWorkers sync.WaitGroup
 	relayWorkers.Add(2)
 	go connect.HandleError(func() {
@@ -1914,8 +1909,8 @@ func (self *ExtenderServer) relay(
 		defer cancel()
 
 		buffer := make([]byte, 4096)
-		readDeadline := newRelayDeadline(self.settings.ReadTimeout, self.settings.RelayDeadlineSlackFraction)
-		writeDeadline := newRelayDeadline(self.settings.WriteTimeout, self.settings.RelayDeadlineSlackFraction)
+		watchdog := newRelayWatchdog(self.settings.ReadTimeout, self.settings.WriteTimeout, cancel, self.settings.relayWatchdogArmForTest)
+		defer watchdog.stop()
 
 		for {
 			select {
@@ -1924,18 +1919,14 @@ func (self *ExtenderServer) relay(
 			default:
 			}
 
-			if deadline, changed := readDeadline.next(time.Now()); changed {
-				clientConn.SetReadDeadline(deadline)
-			}
+			watchdog.beginRead()
 			n, err := clientConn.Read(buffer)
 			if n > 0 {
 				// the ingress of O1, counted before the write so a client that
 				// has seen the round trip has seen the count
 				self.ingressByteCount.Add(int64(n))
 				self.ingressReadCount.Add(1)
-				if deadline, changed := writeDeadline.next(time.Now()); changed {
-					forwardConn.SetWriteDeadline(deadline)
-				}
+				watchdog.beginWrite()
 				toWrite := buffer[0:n]
 				for len(toWrite) > 0 {
 					nw, werr := forwardConn.Write(toWrite)
@@ -1959,8 +1950,8 @@ func (self *ExtenderServer) relay(
 		defer cancel()
 
 		buffer := make([]byte, 4096)
-		readDeadline := newRelayDeadline(self.settings.ReadTimeout, self.settings.RelayDeadlineSlackFraction)
-		writeDeadline := newRelayDeadline(self.settings.WriteTimeout, self.settings.RelayDeadlineSlackFraction)
+		watchdog := newRelayWatchdog(self.settings.ReadTimeout, self.settings.WriteTimeout, cancel, self.settings.relayWatchdogArmForTest)
+		defer watchdog.stop()
 
 		for {
 			select {
@@ -1969,17 +1960,13 @@ func (self *ExtenderServer) relay(
 			default:
 			}
 
-			if deadline, changed := readDeadline.next(time.Now()); changed {
-				forwardConn.SetReadDeadline(deadline)
-			}
+			watchdog.beginRead()
 			n, err := forwardConn.Read(buffer)
 			if n > 0 {
 				// the egress of O1
 				self.egressByteCount.Add(int64(n))
 				self.egressReadCount.Add(1)
-				if deadline, changed := writeDeadline.next(time.Now()); changed {
-					clientConn.SetWriteDeadline(deadline)
-				}
+				watchdog.beginWrite()
 				toWrite := buffer[0:n]
 				for len(toWrite) > 0 {
 					nw, werr := clientConn.Write(toWrite)
