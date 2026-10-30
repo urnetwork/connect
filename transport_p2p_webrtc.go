@@ -869,14 +869,12 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		MaxPeerConnectionCount: MemoryScaledCount(32, 8),
 		DisconnectedTimeout:    30 * time.Second,
 		FailedTimeout:          30 * time.Second,
-		// While connected, the ICE agent of every peer connection wakes and
-		// sends a consent check once per keepalive. Pion's two-second default
-		// suits its own five-second disconnect timeout. Against the 30-second
-		// thresholds here, five seconds (RFC 7675's consent cadence) still
-		// fits six checks in each window and refreshes the selected pair's NAT
-		// bindings far inside common UDP mapping timeouts, with 2.5 times
-		// fewer idle STUN and radio wakeups.
-		KeepAliveTimeout: 5 * time.Second,
+		// Pion's two-second default halves idle STUN/radio wakeups versus the
+		// former one-second override without changing the 30-second
+		// disconnect/failure thresholds. The agent judges those thresholds
+		// only when it wakes for a keepalive, so a longer keepalive notices a
+		// lost path later too.
+		KeepAliveTimeout: 2 * time.Second,
 		// Host candidates are available immediately. Bound the lifetime of
 		// dead STUN socket/gather goroutines instead of accepting Pion's
 		// five-second default for every URL and address family.
