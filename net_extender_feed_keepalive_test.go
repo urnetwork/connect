@@ -10,23 +10,21 @@ import (
 	"time"
 )
 
-// The feed keeps its own liveness: the extender keepalives an idle
-// subscription every 30 s and the client drops one that is silent for
-// SubscribeIdleTimeout (D4, E3), and a sample alone is bounded by the dial
-// budget. So the carrier of a feed leaves TCP keepalive off, as a platform
-// transport's does, rather than probing every idle subscription every few
-// seconds. A subscription without the idle bound keeps it, since then the
-// kernel's probes are the only thing that notices a dead extender.
-func TestExtenderFeedDialLeavesTcpKeepAliveOffUnderItsOwnLiveness(t *testing.T) {
+// The feed's tcp carrier keeps the kernel keepalive of ConnectSettings (5 s
+// idle, then one probe after 5 s), which notices a dead extender about 10 s
+// after the last packet. Nothing else of the feed is that quick: a
+// subscription waits SubscribeIdleTimeout (90 s) for the server's 30 s
+// keepalive frame, and a sample its 30 s budget. So every feed dial keeps it,
+// a subscription with or without the idle bound and a sample alone.
+func TestExtenderFeedDialKeepsTcpKeepAlive(t *testing.T) {
 	cases := []struct {
 		name                 string
 		subscribe            bool
 		subscribeIdleTimeout time.Duration
-		expectedKeepAlive    bool
 	}{
-		{name: "a subscription with the idle bound", subscribe: true, subscribeIdleTimeout: 90 * time.Second, expectedKeepAlive: false},
-		{name: "a sample alone", subscribe: false, subscribeIdleTimeout: 90 * time.Second, expectedKeepAlive: false},
-		{name: "a subscription without the idle bound", subscribe: true, subscribeIdleTimeout: 0, expectedKeepAlive: true},
+		{name: "a subscription with the idle bound", subscribe: true, subscribeIdleTimeout: 90 * time.Second},
+		{name: "a sample alone", subscribe: false, subscribeIdleTimeout: 90 * time.Second},
+		{name: "a subscription without the idle bound", subscribe: true, subscribeIdleTimeout: 0},
 	}
 	for _, c := range cases {
 		// a stand-in extender that holds the connection once the outer
@@ -55,10 +53,11 @@ func TestExtenderFeedDialLeavesTcpKeepAliveOffUnderItsOwnLiveness(t *testing.T) 
 		})
 		dialedConns := make(chan *net.TCPConn, 1)
 		connectSettings := DefaultConnectSettings()
+		netDialer := connectSettings.NetDialer()
 		connectSettings.DialContextSettings = &DialContextSettings{
 			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-				// a plain dialer turns TCP keepalive on
-				conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+				// the platform dialer, with its keepalive
+				conn, err := netDialer.DialContext(ctx, network, address)
 				if err == nil {
 					dialedConns <- conn.(*net.TCPConn)
 				}
@@ -90,8 +89,8 @@ func TestExtenderFeedDialLeavesTcpKeepAliveOffUnderItsOwnLiveness(t *testing.T) 
 		helloConn.Close()
 		listener.Close()
 		<-feedDone
-		if keepAlive != c.expectedKeepAlive {
-			t.Errorf("%s: TCP keepalive %t, expected %t", c.name, keepAlive, c.expectedKeepAlive)
+		if !keepAlive {
+			t.Errorf("%s: TCP keepalive off, expected on", c.name)
 		}
 	}
 }
