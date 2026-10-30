@@ -542,7 +542,25 @@ type PlatformTransportSettings struct {
 	PingTimeout          time.Duration
 	WriteTimeout         time.Duration
 	ReadTimeout          time.Duration
-	TransportGenerator   func() (sendTransport Transport, receiveTransport Transport)
+	// ReadDeadlineSlackFraction lets a busy connection keep its read deadline.
+	// The reader re-arms it only once less than ReadTimeout is left, and then
+	// to ReadTimeout plus this fraction of it, so a connection whose frames
+	// keep arriving re-arms once per that slack instead of once per frame; on
+	// a socket each re-arm moves the deadline timer, a timer heap modify. A
+	// silent peer is cut off between ReadTimeout and ReadTimeout plus the
+	// slack after its last frame: 30-40s with the defaults, which holds while
+	// the platform pings at most ~10s apart. One third by default.
+	// Non-positive re-arms exactly ReadTimeout before every read.
+	ReadDeadlineSlackFraction float64
+	// WriteDeadlineSlackFraction is the same for writes: the writer re-arms
+	// only once less than WriteTimeout is left, and then to WriteTimeout plus
+	// this fraction of it. A WebSocket write timeout is terminal, so every
+	// write still begins with at least WriteTimeout left, and a stalled write
+	// fails between WriteTimeout and WriteTimeout plus the slack after it
+	// began: 10-15s with the defaults. One half by default. Non-positive
+	// re-arms exactly WriteTimeout before every write.
+	WriteDeadlineSlackFraction float64
+	TransportGenerator         func() (sendTransport Transport, receiveTransport Transport)
 	// SendRouteObserver borrows route identity for deterministic topology
 	// observation. It must not block or send directly: writes use the route
 	// selector so carrier admission cannot be bypassed. Nil is the default.
@@ -783,6 +801,12 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. The observer borrows one H3 receive message
 	// after the channel accepts its ownership.
 	afterH3ReceiveEnqueueForTest func([]byte)
+	// Nil outside package tests. Called each time a carrier writer arms its
+	// ping timer, so a test can count the timer operations its writes cost.
+	pingTimerArmForTest func()
+	// Nil outside package tests. Called each time an authenticated H3
+	// connection installs a stream deadline, with its direction and value.
+	h3StreamDeadlineForTest func(write bool, deadline time.Time)
 	// Nil outside package tests. Replaces one H3 carrier runner so budget lease
 	// preemption can hold its exact teardown boundary without opening a socket.
 	runH3ModeForTest func(context.Context, TransportMode, time.Duration)
@@ -880,6 +904,10 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 
 		PlacementPreferDuration: 6 * time.Hour,
 		PlacementFailHold:       10 * time.Minute,
+
+		// a deadline re-armed lazily reaches this far past its timeout
+		ReadDeadlineSlackFraction:  1.0 / 3,
+		WriteDeadlineSlackFraction: 1.0 / 2,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -2271,6 +2299,47 @@ func (self *PlatformTransport) h3SocketWriteBufferByteCount() ByteCount {
 	return MemoryScaledByteCount(mib(1), kib(256))
 }
 
+// lazyDeadline re-arms one connection I/O deadline only when the armed one
+// leaves less than its timeout, and then to the timeout plus a slack. Every
+// operation still begins with at least the timeout left, and one that stalls
+// fails between the timeout and the timeout plus the slack after it began. A
+// busy connection re-arms about once per slack instead of once per operation;
+// on a socket each re-arm moves its deadline timer, a timer heap modify
+// (server CPUOPT2.md §9). A non-positive slack re-arms exactly the timeout
+// before every operation. One goroutine owns each value.
+type lazyDeadline struct {
+	timeout time.Duration
+	slack   time.Duration
+	// the deadline last armed, zero before the first
+	deadline time.Time
+}
+
+// The slack is slackFraction of the timeout.
+func newLazyDeadline(timeout time.Duration, slackFraction float64) lazyDeadline {
+	return lazyDeadline{
+		timeout: timeout,
+		slack:   max(0, time.Duration(float64(timeout)*slackFraction)),
+	}
+}
+
+// The deadline to install before an operation that begins at now, or false
+// when the armed one still leaves the timeout. An expired deadline, or none,
+// always re-arms.
+func (self *lazyDeadline) rearm(now time.Time) (time.Time, bool) {
+	if 0 < self.slack && now.Before(self.deadline) && self.timeout <= self.deadline.Sub(now) {
+		return time.Time{}, false
+	}
+	self.deadline = now.Add(self.timeout + self.slack)
+	return self.deadline, true
+}
+
+// Tells a test that an H3 connection installed a stream deadline.
+func (self *PlatformTransport) h3StreamDeadlineInstalledForTest(write bool, deadline time.Time) {
+	if self.settings.h3StreamDeadlineForTest != nil {
+		self.settings.h3StreamDeadlineForTest(write, deadline)
+	}
+}
+
 // runInactiveDrain bounds a carrier only after a strictly better mode has
 // superseded it. Control frames and keepalives never reset the quiet interval;
 // callers increment the counters only for routed payload. Even continuous
@@ -2893,9 +2962,36 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer handleCancel()
 
 				speedTest := false
-				pingTimer := time.NewTimer(0)
-				defer pingTimer.Stop()
-				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+				// Writes only note their time for the ping, and the write
+				// deadline is re-armed only when less than WriteTimeout is left
+				// on it. Gorilla keeps the deadline and installs it again before
+				// every frame; the batch conn forwards it only when it changes.
+				pinger := newPingPacer(
+					self.settings.PingTimeout,
+					self.settings.PingTimeout,
+					0,
+					time.Now(),
+					self.settings.pingTimerArmForTest,
+				)
+				defer pinger.stop()
+				writeDeadline := newLazyDeadline(self.settings.WriteTimeout, self.settings.WriteDeadlineSlackFraction)
+				armWriteDeadline := func() error {
+					if deadline, rearm := writeDeadline.rearm(time.Now()); rearm {
+						return ws.SetWriteDeadline(deadline)
+					}
+					return nil
+				}
+				writePing := func() error {
+					if err := armWriteDeadline(); err != nil {
+						return err
+					}
+					// note that for websocket a deadline timeout cannot be recovered
+					if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
+						return err
+					}
+					pinger.pinged(time.Now())
+					return nil
+				}
 
 				writeMessage := func(message []byte, lane *platformH1RetainedLane) error {
 					standaloneProgress := h1Progress.prepareWebSocketWrite(message)
@@ -2923,7 +3019,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					return nil
 				}
 				write := func(message []byte, lane *platformH1RetainedLane) error {
-					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+					if err := armWriteDeadline(); err != nil {
 						returnH1RetainedMessage(message, lane)
 						return err
 					}
@@ -2950,7 +3046,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					if err := write(message, controlLane); err != nil {
 						return err
 					}
-					resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+					pinger.wrote(time.Now())
 					return nil
 				}
 				writeSendMessage := func(message []byte, priority bool) error {
@@ -2981,17 +3077,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						firstLane = priorityLane
 					}
 					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
-						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
+						return writeH1FramedReadyBatchWithDeadline(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, &writeDeadline, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
 					}
 					if writeBatchConn == nil {
-						if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						if err := armWriteDeadline(); err != nil {
 							returnH1RetainedMessage(firstMessage, firstLane)
 							return true, err
 						}
 						return true, writeSendMessage(firstMessage, firstPriority)
 					}
 
-					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+					if err := armWriteDeadline(); err != nil {
 						returnH1RetainedMessage(firstMessage, firstLane)
 						return true, err
 					}
@@ -3094,7 +3190,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									return
 								}
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 							continue
 						default:
 						}
@@ -3107,15 +3203,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						select {
 						case <-handleCtx.Done():
 							return
-						case <-pingTimer.C:
-							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						case <-pinger.timer.C:
+							if pinger.fired(time.Now()) && writePing() != nil {
 								return
 							}
-							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok || writeControl(message) != nil {
 								return
@@ -3130,7 +3221,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							} else if writePayload(message, sendLane) != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						case message := <-ackPrioritySend:
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
@@ -3138,7 +3229,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							} else if writePayload(message, priorityLane) != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						}
 					} else {
 						select {
@@ -3156,22 +3247,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if err != nil || !sendOpen {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						case message := <-ackPrioritySend:
 							sendOpen, err := writeReadySendBatch(message, true)
 							if err != nil || !sendOpen {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
-						case <-pingTimer.C:
-							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+							pinger.wrote(time.Now())
+						case <-pinger.timer.C:
+							if pinger.fired(time.Now()) && writePing() != nil {
 								return
 							}
-							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
 							if !ok || writeControl(message) != nil {
 								return
@@ -3200,6 +3286,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// sample: the next message waited in the socket for a local
 				// reason (DELAY.md §4.2). Zero when there is no delay header.
 				var handoffStartTime time.Time
+				// Re-armed only when less than ReadTimeout is left on it, so a
+				// silent peer is cut off within the slack after ReadTimeout.
+				readDeadline := newLazyDeadline(self.settings.ReadTimeout, self.settings.ReadDeadlineSlackFraction)
 
 				for {
 					select {
@@ -3211,9 +3300,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					if !handoffStartTime.IsZero() {
 						delayH1.noteHandoff(time.Since(handoffStartTime))
 					}
-					if err := ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
-						h1Progress.event("h1_read_deadline_error", nil, false, err)
-						return
+					if deadline, rearm := readDeadline.rearm(time.Now()); rearm {
+						if err := ws.SetReadDeadline(deadline); err != nil {
+							h1Progress.event("h1_read_deadline_error", nil, false, err)
+							return
+						}
 					}
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
 					if delayH1 != nil {
@@ -4039,6 +4130,18 @@ func (self *PlatformTransport) runH3(
 			var writeBatchStorage []byte
 			var messageStorage [][]byte
 			writeBatchMaxByteCount := max(0, self.settings.H3StreamWriteBatchMaxByteCount)
+			// The one writer re-arms the stream write deadline, for its batches
+			// and its pings, only when less than the timeout is left on it.
+			writeDeadline := newLazyDeadline(
+				time.Duration(slowMultiple)*self.settings.WriteTimeout,
+				self.settings.WriteDeadlineSlackFraction,
+			)
+			armStreamWriteDeadline := func() {
+				if deadline, rearm := writeDeadline.rearm(time.Now()); rearm {
+					streamWriter.SetWriteDeadline(deadline)
+					self.h3StreamDeadlineInstalledForTest(true, deadline)
+				}
+			}
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
@@ -4073,9 +4176,7 @@ func (self *PlatformTransport) runH3(
 					}
 				}
 
-				streamWriter.SetWriteDeadline(
-					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
-				)
+				armStreamWriteDeadline()
 				if self.settings.beforeH3StreamWriteForTest != nil {
 					self.settings.beforeH3StreamWriteForTest()
 				}
@@ -4160,9 +4261,15 @@ func (self *PlatformTransport) runH3(
 					}()
 				}
 
-				pingTimer := time.NewTimer(0)
-				defer pingTimer.Stop()
-				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+				// writes only note their time; the timer re-arms when it fires
+				pinger := newPingPacer(
+					self.settings.PingTimeout,
+					self.settings.PingTimeout,
+					0,
+					time.Now(),
+					self.settings.pingTimerArmForTest,
+				)
+				defer pinger.stop()
 
 				var pendingMessage []byte
 				defer func() {
@@ -4182,15 +4289,18 @@ func (self *PlatformTransport) runH3(
 								return
 							}
 							message = nextMessage
-						case <-pingTimer.C:
-							streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+						case <-pinger.timer.C:
+							if !pinger.fired(time.Now()) {
+								continue
+							}
+							armStreamWriteDeadline()
 							// Reuse the reliable writer's scratch if already allocated;
 							// heartbeat-only hybrid lanes keep their lazy memory shape.
 							// A negotiated heartbeat is stamped like any stream write.
 							if err := streamFraming.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.pinged(time.Now())
 							continue
 						}
 					}
@@ -4206,11 +4316,7 @@ func (self *PlatformTransport) runH3(
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[ts]%s->stream\n", clientId)
 					}
-					resetWakeupTimer(
-						pingTimer,
-						self.settings.PingTimeout,
-						self.settings.PingTimeout,
-					)
+					pinger.wrote(time.Now())
 				}
 			}, handleCancel)
 
@@ -4372,6 +4478,12 @@ func (self *PlatformTransport) runH3(
 						close(reliableReceive)
 					}
 				}()
+				// stream-only H3 re-arms the stream read deadline only when less
+				// than the timeout is left on it
+				readDeadline := newLazyDeadline(
+					time.Duration(slowMultiple)*self.settings.ReadTimeout,
+					self.settings.ReadDeadlineSlackFraction,
+				)
 
 				for {
 					select {
@@ -4395,7 +4507,10 @@ func (self *PlatformTransport) runH3(
 							continue
 						}
 					} else {
-						stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
+						if deadline, rearm := readDeadline.rearm(time.Now()); rearm {
+							stream.SetReadDeadline(deadline)
+							self.h3StreamDeadlineInstalledForTest(false, deadline)
+						}
 						var err error
 						message, err = streamFraming.Read(stream)
 						if err != nil {

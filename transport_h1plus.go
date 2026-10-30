@@ -7,7 +7,17 @@ import (
 
 // The custom carrier drains the same ACK/ordinary lanes and limits as H1 WS,
 // then encodes their ready payloads once through Framer's shared scratch API.
+// The batch installs a write deadline of timeout for itself alone; the
+// platform writer shares one lazily re-armed deadline across all its writes
+// through writeH1FramedReadyBatchWithDeadline.
 func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
+	writeDeadline := newLazyDeadline(timeout, 0)
+	return writeH1FramedReadyBatchWithDeadline(ctx, writer, send, prioritySend, first, firstPriority, &writeDeadline, onSent, retained...)
+}
+
+// writeH1FramedReadyBatch with the connection's write deadline, which the batch
+// re-arms only when less than its timeout is left (lazyDeadline).
+func writeH1FramedReadyBatchWithDeadline(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, writeDeadline *lazyDeadline, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
 	var owned [platformWebSocketWriteBatchMaxMessages][]byte
 	var priorityOwned [platformWebSocketWriteBatchMaxMessages]bool
 	owned[0] = first
@@ -66,8 +76,10 @@ func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, sen
 			n++
 		}
 	}
-	if err = writer.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return open, err
+	if deadline, rearm := writeDeadline.rearm(time.Now()); rearm {
+		if err = writer.SetWriteDeadline(deadline); err != nil {
+			return open, err
+		}
 	}
 	if err = writer.WriteMessages(payloads[:n]); err != nil {
 		return open, err
