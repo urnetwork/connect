@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -119,10 +120,7 @@ func TestP2pLegacyWriteTimeoutStartsAtPhysicalWrite(t *testing.T) {
 
 // Giving each write its own budget must not turn an actually stuck SCTP write
 // into an unbounded wait. The earlier successful write consumes twelve seconds
-// of queue age; the next physical call still fails no earlier than
-// WriteTimeout after it starts. The deadline is re-armed lazily: that call
-// found less than WriteTimeout left, so it re-armed at WriteTimeout plus the
-// slack, and fails exactly then, within 1.5 WriteTimeout at the default.
+// of queue age; the next physical call still fails after exactly fifteen more.
 func TestP2pLegacyPhysicalWriteTimeoutStillBoundsBlockedCarrier(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -157,102 +155,20 @@ func TestP2pLegacyPhysicalWriteTimeoutStillBoundsBlockedCarrier(t *testing.T) {
 		}
 		synctest.Wait()
 		blockedAt := time.Now()
-		slack := time.Duration(float64(settings.WriteTimeout) * settings.WriteDeadlineSlackFraction)
-		if slack <= 0 || settings.WriteTimeout/2 < slack {
-			t.Fatalf("write deadline slack %s, expected (0, WriteTimeout/2]", slack)
-		}
 		time.Sleep(settings.WriteTimeout - time.Nanosecond)
 		synctest.Wait()
 		if ctx.Err() != nil {
 			t.Fatalf("queued age shortened the physical write budget: %v after %s", ctx.Err(), time.Since(blockedAt))
 		}
-		time.Sleep(slack)
-		synctest.Wait()
-		if ctx.Err() != nil {
-			t.Fatalf("the re-armed physical write lost its slack: %v after %s", ctx.Err(), time.Since(blockedAt))
-		}
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		select {
 		case <-transport.(P2pRouteLifecycle).Done():
 		default:
-			t.Fatal("blocked physical carrier outlived its WriteTimeout and slack")
+			t.Fatal("blocked physical carrier outlived its unchanged WriteTimeout")
 		}
 		if len(writes) != 2 || !writes[0].Success || writes[1].Success ||
-			writes[1].ElapsedNanos != int64(settings.WriteTimeout+slack) || writes[1].ErrorKind != "io_timeout" {
-			t.Fatalf("physical timeout disposition=%+v", writes)
-		}
-		if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
-			t.Fatalf("timeout did not return every queued root and owner: %+v", stats)
-		}
-	})
-}
-
-// The other side of the lazy deadline: a write that finds at least
-// WriteTimeout left keeps the installed deadline, so it fails later than
-// WriteTimeout after it starts but before WriteTimeout and the slack. Writes
-// start at 0 s (the first, armed at 15 s), 1 s (re-armed to 23.5 s) and 5 s
-// (18.5 s left, kept), and the last one is never read.
-func TestP2pLegacyKeptWriteDeadlineStillBoundsBlockedCarrier(t *testing.T) {
-	assertMessagePoolOwnership(t)
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		left, right := net.Pipe()
-		defer left.Close()
-		defer right.Close()
-		budget := NewTransferMemoryBudget(kib(512))
-		settings := DefaultP2pTransportSettings()
-		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
-		var writes []TransferProgressEvent
-		settings.ProgressObserver = func(event TransferProgressEvent) {
-			if event.Stage == "p2p_write_end" {
-				writes = append(writes, event)
-			}
-		}
-		transport, route := NewP2pSendTransport(ctx, cancel, &p2pLegacyQueueBudgetTestConn{Conn: left, budget: budget}, NewId(), settings)
-		defer func() {
-			left.Close()
-			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
-				t.Error(err)
-			}
-		}()
-		start := time.Now()
-		for index := range 3 {
-			route <- legacyQueueTestPacket(uint32(index), 1200)
-		}
-		synctest.Wait()
-		for _, readAt := range []time.Duration{time.Second, 5 * time.Second} {
-			time.Sleep(time.Until(start.Add(readAt)))
-			if _, err := io.ReadFull(right, make([]byte, 1200)); err != nil {
-				t.Fatal(err)
-			}
-			synctest.Wait()
-		}
-		blockedAt := time.Now()
-		keptDeadline := start.Add(time.Second + settings.WriteTimeout + time.Duration(float64(settings.WriteTimeout)*settings.WriteDeadlineSlackFraction))
-		if keptDeadline.Sub(blockedAt) < settings.WriteTimeout {
-			t.Fatalf("the fixture's kept deadline %s is less than WriteTimeout after the write", keptDeadline.Sub(blockedAt))
-		}
-		time.Sleep(settings.WriteTimeout - time.Nanosecond)
-		synctest.Wait()
-		if ctx.Err() != nil {
-			t.Fatalf("a kept deadline failed the write before WriteTimeout: %v after %s", ctx.Err(), time.Since(blockedAt))
-		}
-		time.Sleep(time.Until(keptDeadline.Add(-time.Nanosecond)))
-		synctest.Wait()
-		if ctx.Err() != nil {
-			t.Fatalf("the write failed before its kept deadline: %v after %s", ctx.Err(), time.Since(blockedAt))
-		}
-		time.Sleep(time.Nanosecond)
-		synctest.Wait()
-		select {
-		case <-transport.(P2pRouteLifecycle).Done():
-		default:
-			t.Fatal("blocked physical carrier outlived its kept deadline")
-		}
-		if len(writes) != 3 || !writes[0].Success || !writes[1].Success || writes[2].Success ||
-			writes[2].ElapsedNanos != int64(keptDeadline.Sub(blockedAt)) || writes[2].ErrorKind != "io_timeout" {
+			writes[1].ElapsedNanos != int64(settings.WriteTimeout) || writes[1].ErrorKind != "io_timeout" {
 			t.Fatalf("physical timeout disposition=%+v", writes)
 		}
 		if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
@@ -380,10 +296,9 @@ func (self *p2pWriteDeadlineCountingConn) RemoteAddr() net.Addr            { ret
 func (self *p2pWriteDeadlineCountingConn) SetDeadline(time.Time) error     { return nil }
 func (self *p2pWriteDeadlineCountingConn) SetReadDeadline(time.Time) error { return nil }
 
-// 64 messages a millisecond apart install the physical write deadline at most
-// twice: the first write arms WriteTimeout alone and the second re-arms it with
-// the slack, which 64 ms of messages never use up. Before, every message
-// installed one.
+// 64 messages a millisecond apart install the physical write deadline once:
+// the first write installs WriteTimeout and the rest keep it, since 64 ms of
+// messages never reach it. Before CPUOPT2, every message installed one.
 func TestP2pLegacyWriteDeadlineInstalledPerBurstNotPerMessage(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -411,8 +326,120 @@ func TestP2pLegacyWriteDeadlineInstalledPerBurstNotPerMessage(t *testing.T) {
 		if writeCount != messageCount {
 			t.Fatalf("%d messages written, expected %d", writeCount, messageCount)
 		}
-		if 2 < writeDeadlineCount {
-			t.Fatalf("%d write deadlines installed for %d messages, expected at most 2", writeDeadlineCount, messageCount)
+		if writeDeadlineCount != 1 {
+			t.Fatalf("%d write deadlines installed for %d messages, expected 1", writeDeadlineCount, messageCount)
+		}
+	})
+}
+
+// Records the write deadlines the legacy writer installs on a pipe.
+type p2pWriteDeadlineRecordingConn struct {
+	net.Conn
+	stateLock      sync.Mutex
+	writeDeadlines []time.Time
+}
+
+func (self *p2pWriteDeadlineRecordingConn) SetWriteDeadline(t time.Time) error {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.writeDeadlines = append(self.writeDeadlines, t)
+	}()
+	return self.Conn.SetWriteDeadline(t)
+}
+
+func (self *p2pWriteDeadlineRecordingConn) installedWriteDeadlines() []time.Time {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.writeDeadlines)
+}
+
+// A write that starts under a deadline kept from an earlier write, and blocks
+// past it, installs its own deadline when the kept one fires and is written
+// again. A carrier that takes it before its own WriteTimeout ends receives it
+// once and intact, and stays up. Writes start at 0 s (installing 15 s), 12 s
+// (keeping 15 s, then installing its own 27 s when 15 s passes) and 20 s
+// (keeping 27 s); the carrier reads them at 12 s, 20 s and 22 s.
+func TestP2pLegacyWriteOutlastingAKeptDeadlineIsWrittenAgainUnderItsOwn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		left, right := net.Pipe()
+		defer left.Close()
+		defer right.Close()
+		budget := NewTransferMemoryBudget(kib(512))
+		settings := DefaultP2pTransportSettings()
+		settings.DataPlaneMode = P2pDataPlaneModeLegacyOnly
+		var writes []TransferProgressEvent
+		settings.ProgressObserver = func(event TransferProgressEvent) {
+			if event.Stage == "p2p_write_end" {
+				writes = append(writes, event)
+			}
+		}
+		deadlineConn := &p2pWriteDeadlineRecordingConn{Conn: left}
+		transport, route := NewP2pSendTransport(ctx, cancel, &p2pLegacyQueueBudgetTestConn{Conn: deadlineConn, budget: budget}, NewId(), settings)
+		defer func() {
+			cancel()
+			left.Close()
+			if err := transport.(P2pRouteLifecycle).CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+			if stats := budget.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
+				t.Errorf("unbalanced physical/queued ownership: %+v", stats)
+			}
+		}()
+		if settings.WriteTimeout != 15*time.Second {
+			t.Fatalf("the test assumes a 15 s write timeout, got %s", settings.WriteTimeout)
+		}
+
+		start := time.Now()
+		for index := range 3 {
+			route <- legacyQueueTestPacket(uint32(index), 1200)
+		}
+		synctest.Wait()
+		for index, readAt := range []time.Duration{12 * time.Second, 20 * time.Second, 22 * time.Second} {
+			time.Sleep(time.Until(start.Add(readAt)))
+			packet := make([]byte, 1200)
+			if _, err := io.ReadFull(right, packet); err != nil {
+				t.Fatalf("packet %d at %s: %v", index, readAt, err)
+			}
+			if binary.BigEndian.Uint32(packet) != uint32(index) ||
+				!bytes.Equal(packet[4:], bytes.Repeat([]byte{byte(index)}, len(packet)-4)) {
+				t.Fatalf("packet %d lost its identity or payload", index)
+			}
+			synctest.Wait()
+		}
+		// nothing was written twice
+		if err := right.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := right.Read(make([]byte, 1200)); n != 0 || err == nil {
+			t.Fatalf("the carrier received %d more bytes after the three packets, err %v", n, err)
+		}
+
+		if ctx.Err() != nil {
+			t.Fatalf("the carrier was torn down: %v", ctx.Err())
+		}
+		expectedElapsed := []time.Duration{12 * time.Second, 8 * time.Second, 2 * time.Second}
+		if len(writes) != len(expectedElapsed) {
+			t.Fatalf("physical writes=%+v, expected %d", writes, len(expectedElapsed))
+		}
+		for index, write := range writes {
+			if !write.Success || write.ElapsedNanos != int64(expectedElapsed[index]) {
+				t.Fatalf("physical write %d=%+v, expected a success after %s", index, write, expectedElapsed[index])
+			}
+		}
+		installedWriteDeadlines := deadlineConn.installedWriteDeadlines()
+		expectedWriteDeadlines := []time.Time{start.Add(15 * time.Second), start.Add(27 * time.Second)}
+		if !slices.EqualFunc(installedWriteDeadlines, expectedWriteDeadlines, time.Time.Equal) {
+			t.Fatalf("installed write deadlines %v after the start, expected 15 s and 27 s", func() []time.Duration {
+				offsets := []time.Duration{}
+				for _, installedWriteDeadline := range installedWriteDeadlines {
+					offsets = append(offsets, installedWriteDeadline.Sub(start))
+				}
+				return offsets
+			}())
 		}
 	})
 }

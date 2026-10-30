@@ -1175,15 +1175,6 @@ func (self *ExtenderNetworkClient) runFeed(
 ) (sampled bool, resultErr error) {
 	dialCtx, dialCancel := context.WithTimeout(self.ctx, self.settings.DialTimeout)
 	defer dialCancel()
-	if !self.settings.Subscribe || 0 < self.settings.SubscribeIdleTimeout {
-		// The feed keeps its own liveness, as a platform transport does: a
-		// sample is bounded by the dial budget, and a subscription by the
-		// server's keepalive against SubscribeIdleTimeout (D4). So its carrier
-		// leaves TCP keepalive off rather than probing an idle subscription
-		// every few seconds. Without the idle bound the kernel's probes are
-		// all that notices a dead extender, so they stay.
-		dialCtx = withPlatformTransportDial(dialCtx)
-	}
 	stream, err := DialExtenderFeed(
 		dialCtx,
 		connectSettings,

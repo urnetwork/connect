@@ -464,15 +464,14 @@ func (self *extenderCamouflage) spliceDohCache() *connect.DohCache {
 // timeout. Owns and joins cancellation from before the first write, including
 // failed and partial hello writes. None of it touches the O1 relay counters (P10).
 //
-// The idle deadlines are re-armed lazily, as in the relay (relayDeadline): a
-// read or write still fails no earlier than the idle timeout after it starts.
-// Each connection's write deadline is owned by the one goroutine that writes
-// it: the site's by this one for the hello and then by its copy worker.
+// A read or a write that runs the idle timeout, counted from its own start,
+// ends the splice exactly then. Each direction's watchdog (relayWatchdog)
+// keeps both bounds on one timer, so no chunk installs a deadline; the
+// client-to-site watchdog bounds the hello first. A non-positive idle timeout
+// leaves both directions unbounded.
 func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.Conn, siteConn net.Conn, initialBytes []byte) {
 	idle := self.settings.ProxyIdleTimeout
 	maxByteCount := self.settings.ProxyMaxResponseByteCount
-	clientWriteDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
-	siteWriteDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
 
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	var relayWorkers sync.WaitGroup
@@ -487,19 +486,16 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		<-connectionsClosed
 		relayWorkers.Wait()
 	}()
-	// The peek's header budget ends at this handoff. Relay I/O installs its
-	// own idle deadlines, including leaving them unset when idle is disabled.
+	// The peek's header budget ends at this handoff. The relay installs no
+	// deadline, so none left by the setup may outlive it either.
 	clientConn.SetDeadline(time.Time{})
-	writeAll := func(dst net.Conn, dstWriteDeadline *relayDeadline, writeBytes []byte) bool {
+	siteConn.SetDeadline(time.Time{})
+	writeAll := func(dst net.Conn, watchdog *relayWatchdog, writeBytes []byte) bool {
 		for 0 < len(writeBytes) {
 			if relayCtx.Err() != nil {
 				return false
 			}
-			if 0 < idle {
-				if deadline, changed := dstWriteDeadline.next(time.Now()); changed {
-					dst.SetWriteDeadline(deadline)
-				}
-			}
+			watchdog.beginWrite()
 			n, err := dst.Write(writeBytes)
 			if err != nil || n <= 0 {
 				return false
@@ -508,27 +504,27 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		}
 		return true
 	}
-	if !writeAll(siteConn, &siteWriteDeadline, initialBytes) {
+	upWatchdog := newRelayWatchdog(idle, idle, relayCancel, self.settings.relayWatchdogArmForTest)
+	defer upWatchdog.stop()
+	if !writeAll(siteConn, upWatchdog, initialBytes) {
 		return
 	}
+	// armed after the hello, which its direction does not wait for
+	downWatchdog := newRelayWatchdog(idle, idle, relayCancel, self.settings.relayWatchdogArmForTest)
+	defer downWatchdog.stop()
 
 	var relayedByteCount atomicInt64
-	copyDirection := func(dst net.Conn, dstWriteDeadline *relayDeadline, src net.Conn) {
+	copyDirection := func(dst net.Conn, src net.Conn, watchdog *relayWatchdog) {
 		defer relayWorkers.Done()
 		defer relayCancel()
 		buffer := make([]byte, extenderCamouflageSpliceBufferByteCount)
-		srcReadDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
 		for {
 			select {
 			case <-relayCtx.Done():
 				return
 			default:
 			}
-			if 0 < idle {
-				if deadline, changed := srcReadDeadline.next(time.Now()); changed {
-					src.SetReadDeadline(deadline)
-				}
-			}
+			watchdog.beginRead()
 			n, err := src.Read(buffer)
 			if 0 < n {
 				if 0 < maxByteCount && maxByteCount < relayedByteCount.add(int64(n)) {
@@ -536,7 +532,7 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 					// splice, never counting the byte as O1 relay traffic
 					return
 				}
-				if !writeAll(dst, dstWriteDeadline, buffer[:n]) {
+				if !writeAll(dst, watchdog, buffer[:n]) {
 					return
 				}
 			}
@@ -546,8 +542,8 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		}
 	}
 	relayWorkers.Add(2)
-	go connect.HandleError(func() { copyDirection(siteConn, &siteWriteDeadline, clientConn) }, relayCancel)
-	go connect.HandleError(func() { copyDirection(clientConn, &clientWriteDeadline, siteConn) }, relayCancel)
+	go connect.HandleError(func() { copyDirection(siteConn, clientConn, upWatchdog) }, relayCancel)
+	go connect.HandleError(func() { copyDirection(clientConn, siteConn, downWatchdog) }, relayCancel)
 	<-relayCtx.Done()
 }
 
