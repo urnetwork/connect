@@ -6233,12 +6233,13 @@ func (self *TcpSequence) Run() {
 		// on the hot ack coalescing path)
 		ackCompressTimer := time.NewTimer(0)
 		defer ackCompressTimer.Stop()
-		// The compression interval follows each acknowledgement, until this
-		// time; zero when no interval is running. The timer is armed only for
+		// The compression interval follows each acknowledgement, while
+		// compressing, until compressDeadlineNanos. The timer is armed only for
 		// data that arrives inside the interval, to coalesce it, so a flow
 		// whose data comes further apart than AckCompressTimeout is
 		// acknowledged on arrival with no timer at all. The schedule is the one
 		// a wait after every acknowledgement gave.
+		compressing := false
 		compressDeadlineNanos := int64(0)
 
 		for {
@@ -6260,7 +6261,7 @@ func (self *TcpSequence) Run() {
 				return
 			}
 
-			if compressDeadlineNanos != 0 {
+			if compressing {
 				// coalesce acks up to the timeout.
 				// the send loop signals to ack sooner when the unacked byte
 				// count reaches half the window, so the source never stalls
@@ -6277,7 +6278,7 @@ func (self *TcpSequence) Run() {
 				// wakes against a wake per segment. Each firing re-reads the
 				// last-arrival timestamp the send loop stores under the mutex
 				// and either acknowledges or re-arms at the moved deadline.
-				//
+
 				// armed, and whether the burst it watches has already ended
 				burstEndStateWithoutLock := func() (bool, bool) {
 					self.mutex.Lock()
@@ -6330,7 +6331,7 @@ func (self *TcpSequence) Run() {
 					}
 					break
 				}
-				compressDeadlineNanos = 0
+				compressing = false
 			}
 
 			var packet []byte
@@ -6389,6 +6390,7 @@ func (self *TcpSequence) Run() {
 				select {
 				case <-ackSignal:
 				default:
+					compressing = true
 					compressDeadlineNanos = monotonicNanos() +
 						int64(self.tcpBufferSettings.AckCompressTimeout)
 				}
