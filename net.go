@@ -229,22 +229,6 @@ type DialContextSettings struct {
 	PacketConnFactory func(context.Context) (net.PacketConn, error)
 }
 
-type platformTransportDialKey struct{}
-
-// Marks the dials of a platform transport. The mark no longer changes TCP
-// keepalive: every platform dial keeps the ConnectSettings cadence, because a
-// transport's heartbeat notices a dead peer only at its read deadline (30 s
-// after the last frame), while keepalive notices it about 10 s after the last
-// packet.
-func withPlatformTransportDial(ctx context.Context) context.Context {
-	return context.WithValue(ctx, platformTransportDialKey{}, true)
-}
-
-func isPlatformTransportDial(ctx context.Context) bool {
-	marked, _ := ctx.Value(platformTransportDialKey{}).(bool)
-	return marked
-}
-
 func (self *ConnectSettings) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
 	network, networkErr := controlDialNetwork(network, addr)
 	if networkErr != nil {

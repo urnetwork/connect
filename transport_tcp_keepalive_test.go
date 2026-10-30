@@ -37,7 +37,7 @@ func TestPlatformTransportDialKeepsTcpKeepAlive(t *testing.T) {
 	for _, transport := range []bool{false, true} {
 		dialCtx := ctx
 		if transport {
-			dialCtx = withPlatformTransportDial(ctx)
+			dialCtx = (&PlatformTransport{}).dialContext(ctx)
 		}
 		conn, err := settings.DialContext(dialCtx, "tcp", listener.Addr().String())
 		if err != nil {
@@ -48,12 +48,6 @@ func TestPlatformTransportDialKeepsTcpKeepAlive(t *testing.T) {
 		if !enabled {
 			t.Fatalf("platform transport dial=%t: TCP keepalive is off", transport)
 		}
-	}
-}
-
-func TestPlatformTransportDialContextIsMarked(t *testing.T) {
-	if !isPlatformTransportDial((&PlatformTransport{}).dialContext(context.Background())) {
-		t.Fatal("platform transport dial context is not marked")
 	}
 }
 

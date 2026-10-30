@@ -535,12 +535,11 @@ func (self *PlatformTransport) runFamilyHoldWatcher() {
 	}
 }
 
-// dialContext tags a dial as a platform transport's (its sockets leave TCP
-// keepalive off), with the pinned family so the strategy's tls dial helper
-// narrows the network before resolution, and with the attempt observer that
-// classifies each dialer attempt's typed error (see noteDialError).
+// dialContext tags a dial with the transport's settings, with the pinned family
+// so the strategy's tls dial helper narrows the network before resolution, and
+// with the attempt observer that classifies each dialer attempt's typed error
+// (see noteDialError).
 func (self *PlatformTransport) dialContext(ctx context.Context) context.Context {
-	ctx = withPlatformTransportDial(ctx)
 	ctx = context.WithValue(ctx, extenderTransportSettingsContextKey{}, self.settings)
 	if !self.pinned() {
 		return ctx
