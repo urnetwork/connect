@@ -231,10 +231,11 @@ type DialContextSettings struct {
 
 type platformTransportDialKey struct{}
 
-// Marks the dials of a platform transport. A transport runs its own heartbeat,
-// pings against its read deadline, so its sockets leave TCP keepalive off.
-// Other dials keep it: a pooled API connection has nothing else to notice that
-// it died while idle.
+// Marks the dials of a platform transport. The mark no longer changes TCP
+// keepalive: every platform dial keeps the ConnectSettings cadence, because a
+// transport's heartbeat notices a dead peer only at its read deadline (30 s
+// after the last frame), while keepalive notices it about 10 s after the last
+// packet.
 func withPlatformTransportDial(ctx context.Context) context.Context {
 	return context.WithValue(ctx, platformTransportDialKey{}, true)
 }
@@ -284,11 +285,6 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 		conn, err = moveOverride.dialTargets(ctx, network, addr, dialContext)
 	} else {
 		conn, err = dialContext(ctx, network, addr)
-	}
-	if err == nil && isPlatformTransportDial(ctx) {
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(false)
-		}
 	}
 	if log := loggerOrDefault(self.Log).V(2); log.Enabled() {
 		if err == nil {

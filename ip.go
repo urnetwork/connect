@@ -488,9 +488,6 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		returnBudget = max(kib(320), transferBudgetShareByteCount())
 	}
 	tcpBufferSettings := &TcpBufferSettings{
-		// off, see ProviderKeepAliveConfig. Negative timings leave the
-		// socket's own, so turning it off is one option write per flow.
-		ProviderKeepAliveConfig: &net.KeepAliveConfig{Enable: false, Idle: -1, Interval: -1, Count: -1},
 		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:             300 * time.Second,
 		ReturnQueueBudget:       NewTransferMemoryBudget(returnBudget),
@@ -4117,11 +4114,12 @@ type TcpBufferSettings struct {
 	EgressTtlMode EgressTtlMode
 	// Kernel keepalive on the upstream socket of each flow, applied after
 	// connect and independent of the control-plane ConnectSettings cadence the
-	// dial uses. The default turns it off: the flow's own ReadTimeout and
-	// IdleTimeout reap a dead upstream, while probing every idle flow every 5 s
-	// kept a phone's radio up for each flow it carried. Nil leaves the dial's
-	// setting (that 5 s cadence, or a host-supplied dialer's own); an explicit
-	// config, including Enable:false, sets its own.
+	// dial uses. Nil, the default, keeps the dial's setting: a probe after 5 s
+	// idle and a reset after one unanswered probe, or a host-supplied dialer's
+	// own. A relayed flow carries arbitrary TCP with no heartbeat of ours, so
+	// keepalive is what notices an upstream that vanished while the flow was
+	// idle; without it the flow lingers until ReadTimeout or IdleTimeout
+	// (300 s). An explicit config, including Enable:false, sets its own.
 	ProviderKeepAliveConfig *net.KeepAliveConfig
 	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
 	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
