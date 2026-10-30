@@ -123,7 +123,7 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	if owned {
 		// The platform transport above pings over this carrier's one request
 		// stream, and its ping is stream data that keeps the connection inside
-		// MaxIdleTimeout, so a QUIC PING every PingTimeout would be a second
+		// MaxIdleTimeout, so the platform config's QUIC PING would be a second
 		// keepalive. A standalone feed, API or probe dial has no ping of its
 		// own and keeps the QUIC one.
 		config.KeepAlivePeriod = 0

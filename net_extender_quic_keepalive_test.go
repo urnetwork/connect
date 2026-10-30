@@ -23,8 +23,14 @@ func TestExtenderQuicCarrierKeepAliveOnlyWithoutAPlatformTransport(t *testing.T)
 	if owned.quicConfig.KeepAlivePeriod != 0 {
 		t.Errorf("a platform transport's carrier keeps a %s QUIC keepalive", owned.quicConfig.KeepAlivePeriod)
 	}
-	if unowned.quicConfig.KeepAlivePeriod != DefaultPlatformTransportSettings().PingTimeout {
-		t.Errorf("a standalone carrier's QUIC keepalive is %s, expected the ping timeout %s", unowned.quicConfig.KeepAlivePeriod, DefaultPlatformTransportSettings().PingTimeout)
+	// a standalone carrier keeps the platform QUIC config's keepalive, which
+	// must land at least twice inside the idle timeout
+	platformKeepAlive := newPlatformQuicConfig(DefaultPlatformTransportSettings(), 1).KeepAlivePeriod
+	if unowned.quicConfig.KeepAlivePeriod != platformKeepAlive {
+		t.Errorf("a standalone carrier's QUIC keepalive is %s, expected the platform config's %s", unowned.quicConfig.KeepAlivePeriod, platformKeepAlive)
+	}
+	if unowned.quicConfig.KeepAlivePeriod <= 0 || unowned.quicConfig.MaxIdleTimeout < 2*unowned.quicConfig.KeepAlivePeriod {
+		t.Errorf("a standalone carrier's QUIC keepalive %s does not land twice inside its idle timeout %s", unowned.quicConfig.KeepAlivePeriod, unowned.quicConfig.MaxIdleTimeout)
 	}
 	if owned.quicConfig.MaxIdleTimeout != unowned.quicConfig.MaxIdleTimeout || owned.quicConfig.MaxIdleTimeout <= 2*settings.PingTimeout {
 		t.Errorf("idle timeouts owned %s and standalone %s, expected the same and more than two pings apart", owned.quicConfig.MaxIdleTimeout, unowned.quicConfig.MaxIdleTimeout)
