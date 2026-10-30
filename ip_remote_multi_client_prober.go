@@ -637,12 +637,12 @@ func proberPlan(now time.Time, candidates []proberCandidate, settings *MultiClie
 //
 // Between scans the loop sleeps until the plan's next due time (which
 // rechecks an exit held from a due probe; see proberPlan), at most
-// ProberScanMaxInterval. A window admitting an exit (clientAdded) and a
-// reliability settings change wake it to scan ProberJoinDelay later, so the
-// exits a window admits together are swept together. One timer is armed for
-// the loop's life, and each scan refills the previous scan's client list,
-// live set and candidates, so a scan that schedules nothing allocates
-// nothing.
+// ProberScanMaxInterval. A window admitting an exit (clientAdded), a
+// reliability settings change and an evicted qualification record wake it to
+// scan ProberJoinDelay later, so the exits a window admits together are swept
+// together. One timer is armed for the loop's life, and each scan refills the
+// previous scan's client list, live set and candidates, so a scan that
+// schedules nothing allocates nothing.
 func (self *RemoteUserNatMultiClient) runProber() {
 	sem := make(chan struct{}, proberConcurrency)
 	var stateMutex sync.Mutex

@@ -481,8 +481,9 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
-		// joiners and settings changes wake the prober, and the recheck
-		// covers an exit held from a due probe, so the bound is a backstop
+		// joiners, settings changes and evictions wake the prober, and the
+		// recheck covers an exit held from a due probe, so the bound is a
+		// backstop
 		ProberScanMaxInterval: time.Minute,
 		// the joiner bound of the 5s scan this replaced: the exits a window
 		// forms with at the start of a session share one sweep
@@ -1241,16 +1242,17 @@ type MultiClientSettings struct {
 	ProviderProbe bool
 	// ProberScanMaxInterval is the longest the prober sleeps between scans of
 	// the windows. It otherwise sleeps until the next exit falls due; a window
-	// admitting an exit or a reliability settings change wakes it (see
-	// ProberJoinDelay); and an exit held from a due probe is rechecked (see
-	// ProberRecheckInterval). So this is a backstop, not a detection bound.
-	// Non-positive leaves the sleep unbounded.
+	// admitting an exit, a reliability settings change and a qualification
+	// record evicted from the table wake it (see ProberJoinDelay); and an exit
+	// held from a due probe is rechecked (see ProberRecheckInterval). So this
+	// is a backstop, not a detection bound. Non-positive leaves the sleep
+	// unbounded.
 	ProberScanMaxInterval time.Duration
-	// ProberJoinDelay is how long after a window admits an exit, or the
-	// reliability settings change, the prober scans. Exits admitted together
-	// share one sweep, whose result line tells a pool of bad providers from a
-	// phone that was away only when it judges them together. Non-positive
-	// scans at once.
+	// ProberJoinDelay is how long after a window admits an exit, the
+	// reliability settings change, or a qualification record is evicted, the
+	// prober scans. Exits admitted together share one sweep, whose result line
+	// tells a pool of bad providers from a phone that was away only when it
+	// judges them together. Non-positive scans at once.
 	ProberJoinDelay time.Duration
 	// How often the prober scans while an exit due for a probe is held from it
 	// by something whose end nothing signals: flows it carries (its traffic is

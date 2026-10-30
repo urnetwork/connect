@@ -1107,7 +1107,7 @@ func (self *multiClientChannel) probeDestination() MultiHopId {
 func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 	now := time.Now()
 
-	newlyQualified := func() bool {
+	newlyQualified, evicted := func() (bool, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
@@ -1116,8 +1116,8 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 		entry.qualifiedAt = now
 		entry.lastProbeAt = now
 		entry.passed += 1
-		self.evictQualificationWithLock()
-		return !was
+		evicted := self.evictQualificationWithLock()
+		return !was, evicted
 	}()
 
 	// counted on the transition only: the number that matters is how many
@@ -1125,6 +1125,9 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 	// the same one
 	if newlyQualified {
 		self.reliabilityMetrics.providerQualified()
+	}
+	if evicted {
+		self.wakeProber()
 	}
 }
 
@@ -1138,13 +1141,18 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 //
 // called without stateLock
 func (self *RemoteUserNatMultiClient) recordProbeFail(destination MultiHopId) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	evicted := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	entry := self.qualificationEntryWithLock(destination)
-	entry.lastProbeAt = time.Now()
-	entry.failed += 1
-	self.evictQualificationWithLock()
+		entry := self.qualificationEntryWithLock(destination)
+		entry.lastProbeAt = time.Now()
+		entry.failed += 1
+		return self.evictQualificationWithLock()
+	}()
+	if evicted {
+		self.wakeProber()
+	}
 }
 
 // providerQualified reports whether a provider has a probe pass inside
@@ -1180,8 +1188,14 @@ func (self *RemoteUserNatMultiClient) qualificationEntryWithLock(destination Mul
 // means "the most recently probed providers survive" is a property a test can
 // assert rather than a tendency.
 //
+// Reports whether it evicted a record. A provider a window still holds is
+// unprobed again once its record is gone, so due at once, and nothing but
+// the caller can tell a sleeping prober: the caller wakes it (wakeProber)
+// once it has released the lock.
+//
 // must be called with stateLock
-func (self *RemoteUserNatMultiClient) evictQualificationWithLock() {
+func (self *RemoteUserNatMultiClient) evictQualificationWithLock() bool {
+	evicted := false
 	for qualificationMaxEntries < len(self.qualification) {
 		var oldestKey MultiHopId
 		var oldestTime time.Time
@@ -1192,10 +1206,12 @@ func (self *RemoteUserNatMultiClient) evictQualificationWithLock() {
 			}
 		}
 		if !found {
-			return
+			return evicted
 		}
 		delete(self.qualification, oldestKey)
+		evicted = true
 	}
+	return evicted
 }
 
 // --- the send seam ---

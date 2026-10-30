@@ -372,3 +372,37 @@ func TestProberSleepsWhileALoadedExitIsFresh(t *testing.T) {
 		}
 	})
 }
+
+// A live exit whose qualification record is evicted from the full table is
+// unprobed again, so due at once, and is probed within the pre-sleep scan
+// interval rather than at the next bound: nothing else marks it due.
+func TestProberProbesAnExitWhoseRecordIsEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		multiClient, log, _ := newOneExitProberTestMultiClient(ctx, cancel)
+		// as the constructor makes it
+		multiClient.proberWake = make(chan struct{}, 1)
+		defer startProberForTest(multiClient, cancel)()
+
+		// off any scan grid, with the exit's proof fresh
+		time.Sleep(multiClient.settings.ProberScanMaxInterval + proberPreSleepScanInterval/2)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); 0 < len(lines) {
+			t.Fatalf("the prober probed an exit with a fresh proof: %v", lines)
+		}
+
+		// the providers probed since fill the table past its cap, and the
+		// exit's record is the oldest
+		for range qualificationMaxEntries {
+			multiClient.recordProbePass(RequireMultiHopId(NewId()))
+		}
+		if _, _, passIndex := multiClient.qualificationSnapshot(MultiHopId{}); passIndex != 0 {
+			t.Fatal("the exit's record was not evicted")
+		}
+		time.Sleep(proberPreSleepScanInterval)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); len(lines) != 1 {
+			t.Fatalf("an exit whose record was evicted was probed by %d sweeps within %s, want 1", len(lines), proberPreSleepScanInterval)
+		}
+	})
+}
