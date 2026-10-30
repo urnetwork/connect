@@ -8404,6 +8404,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			return
 		}
 
+		// one timer for the retries, re-armed for each wait
+		var retryTimer *time.Timer
+		defer func() {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+		}()
 		for {
 			var retryTimeout time.Duration
 			if 0 <= timeout {
@@ -8445,7 +8452,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				case <-qualityOfferChanged:
 				case <-speedOfferChanged:
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 				continue
 			}
@@ -8462,7 +8469,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				select {
 				case <-update.ctx.Done():
 					return
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 			}
 		}
@@ -13113,6 +13120,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 }
 
 func (self *multiClientWindow) resize() {
+	// one timer for the loop's life, re-armed for each wait between passes
+	var waitTimer *time.Timer
+	defer func() {
+		if waitTimer != nil {
+			waitTimer.Stop()
+		}
+	}()
 	for {
 		// Cancellation can race a ready resize edge after an expansion ends.
 		// Leave owned channels to Close instead of starting a teardown pass.
@@ -13897,7 +13911,7 @@ func (self *multiClientWindow) resize() {
 			case <-self.ctx.Done():
 				return
 			case <-update:
-			case <-time.After(timeout):
+			case <-resetOrCreateTimer(&waitTimer, timeout):
 			}
 		}
 	}

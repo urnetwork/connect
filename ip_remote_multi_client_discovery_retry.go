@@ -135,6 +135,13 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 	if _, fixed := self.generator.FixedDestinationSize(); fixed {
 		return true
 	}
+	// one timer for the wait, re-armed after each early wake
+	var waitTimer *time.Timer
+	defer func() {
+		if waitTimer != nil {
+			waitTimer.Stop()
+		}
+	}()
 	for {
 		// before the check, so a change that lands after it still ends the wait
 		networkChanged := self.networkChangeNotify()
@@ -148,7 +155,7 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 			return false
 		case <-networkChanged:
 		case <-retryChanged:
-		case <-time.After(time.Until(notBefore)):
+		case <-resetOrCreateTimer(&waitTimer, time.Until(notBefore)):
 		}
 	}
 }
@@ -160,13 +167,20 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 // no provider, so retiring it during the backoff only made the next expansion
 // mint a replacement. False when the window closed or the candidate expired.
 func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, expirationTime time.Time) bool {
+	// one timer for the offer, stopped as soon as the candidate is taken
+	var expirationTimer *time.Timer
+	defer func() {
+		if expirationTimer != nil {
+			expirationTimer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return false
 		case self.clientChannelArgs <- args:
 			return true
-		case <-time.After(time.Until(expirationTime)):
+		case <-resetOrCreateTimer(&expirationTimer, time.Until(expirationTime)):
 			notBefore, deferred := self.discoveryExpandDeferral(time.Now())
 			if !deferred {
 				return false
