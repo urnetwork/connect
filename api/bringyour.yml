@@ -2523,6 +2523,35 @@ paths:
         "429":
           description: Too many inquiries from this source address; try again later.
 
+  /friends/apply:
+    post:
+      tags: [Other]
+      summary: Apply to Friends of the Network
+      description: |
+        Apply to host a Friends of the Network research node: a Raspberry Pi
+        the URnetwork research team runs network tests on. This is the
+        endpoint behind the ur.io Friends of the Network form, and it needs no
+        authentication. Applications are not stored by the api; they are
+        forwarded to the URnetwork team. Requests are rate limited per source
+        address.
+      operationId: friendsApply
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FriendsApplyArgs"
+      responses:
+        "200":
+          description: The application was received.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FriendsApplyResult"
+        "429":
+          description: Too many applications from this source address; try again later.
+
   /log/{clientId}/upload:
     post:
       tags: [Other]
@@ -11761,6 +11790,82 @@ components:
           type: string
 
     ServicesContactSalesResult:
+      type: object
+      required: []
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+
+    FriendsGarment:
+      type: object
+      required:
+        - fit
+        - size
+      properties:
+        fit:
+          description: "`m` for men's fit, `f` for women's fit."
+          type: string
+          enum: [m, f]
+        size:
+          type: string
+          enum: [XS, S, M, L, XL, 2XL, 3XL]
+
+    FriendsApplyArgs:
+      type: object
+      required:
+        - name
+        - email
+        - country_code
+        - connection_type
+        - consent
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        country_code:
+          description: |
+            ISO 3166-1 alpha-2 country the node would be hosted in. Nodes ship
+            under US export controls, so some countries are refused.
+          type: string
+        connection_type:
+          type: string
+          enum: [wifi, ethernet, cellular, satellite, other]
+        consent:
+          description: The applicant agrees to do their best to keep the node online. Must be true.
+          type: boolean
+        credit:
+          description: Credit the applicant in the published research reports.
+          type: boolean
+        credit_name:
+          description: The name to credit, when it differs from `name`.
+          type: string
+        t_shirts:
+          description: Up to two t-shirts.
+          type: array
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/FriendsGarment"
+        hoodies:
+          description: Up to two hoodies.
+          type: array
+          maxItems: 2
+          items:
+            $ref: "#/components/schemas/FriendsGarment"
+        notes:
+          description: Optional notes, comments or questions.
+          type: string
+
+    FriendsApplyResult:
       type: object
       required: []
       properties:
