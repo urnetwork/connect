@@ -1548,7 +1548,10 @@ func raceTunDialContext(
 				lastErr = errors.New("dial returned no connection")
 			}
 			completed++
-			if completed == attemptCount {
+			// An authoritative "no such host" ends the race: every attempt
+			// resolves through this tun's DoH cache, so another attempt
+			// could only repeat it.
+			if completed == attemptCount || authoritativeDnsMiss(lastErr) {
 				return nil, lastErr
 			}
 

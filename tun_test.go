@@ -546,6 +546,44 @@ func TestTunDialRaceReturnsImmediatelyWhenEveryAttemptFails(t *testing.T) {
 	}
 }
 
+// An authoritative "no such host" ends the race at once: every attempt
+// resolves through the tun's DoH cache, so a relaunched attempt could only
+// repeat the answer. The hosted proxy answered each such CONNECT with two
+// resolutions, and retried it every second.
+func TestTunDialRaceStopsOnNoSuchHost(t *testing.T) {
+	notFound := &net.DNSError{Err: "no such host", Name: "nothing.invalid", IsNotFound: true}
+	for _, attemptErr := range []error{
+		notFound,
+		// the datagram dial's form
+		fmt.Errorf("Could not resolve nothing.invalid:53: %w", notFound),
+	} {
+		var attempts atomic.Int32
+		conn, err := raceTunDialContext(
+			context.Background(),
+			context.Background(),
+			"tcp4",
+			"nothing.invalid:443",
+			2,
+			2*time.Second,
+			30*time.Second,
+			func(ctx context.Context, network string, address string) (net.Conn, error) {
+				attempts.Add(1)
+				return nil, attemptErr
+			},
+		)
+		if conn != nil {
+			conn.Close()
+			t.Fatal("failed dial race returned a connection")
+		}
+		if err != attemptErr {
+			t.Fatalf("dial race returned %v, want %v", err, attemptErr)
+		}
+		if got := attempts.Load(); got != 1 {
+			t.Fatalf("dial race launched %d attempts after an authoritative no such host, want 1", got)
+		}
+	}
+}
+
 func TestTunDialRaceClosesSimultaneousSuccessfulLoser(t *testing.T) {
 	started := make(chan *trackedTunDialConn, 2)
 	release := make(chan struct{})
