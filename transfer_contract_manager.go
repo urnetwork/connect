@@ -572,6 +572,11 @@ type ContractManager struct {
 	// per-contract event sequence numbers, assigned under `contractStatsLock`
 	// at snapshot time (see `emitContractStats`)
 	contractStatsSequences map[Id]uint64
+	// set by any change an emit would report (a registered, moved or closed
+	// contract) and taken by the epoch worker; the wake lets a parked worker
+	// resume (see `runContractStats`)
+	contractStatsChanged atomic.Bool
+	contractStatsWake    chan struct{}
 
 	controlSyncProvide    *ControlSync
 	controlSyncProvideOob *ControlSyncOob
@@ -590,6 +595,8 @@ type ContractManager struct {
 	// Nil test barriers expose callback admission and manager join entry.
 	beforeCallbackAdmissionLockForTest func()
 	beforeCloseWaitForTest             func()
+	// Observes each wake of the contract stats epoch worker.
+	contractStatsWakeForTest func()
 	// Nil in production; exposes completed original creation before route selection.
 	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
 	// Nil test barriers expose shutdown before retry admission and first send.
@@ -642,6 +649,7 @@ func NewContractManager(
 		contractStatsEntries:            map[contractStatsKey]*contractStatsEntry{},
 		contractStatsCallbacks:          NewCallbackList[ContractStatsFunction](),
 		contractStatsSequences:          map[Id]uint64{},
+		contractStatsWake:               make(chan struct{}, 1),
 		controlSyncProvide:              NewControlSync(managerCtx, client, "provide"),
 		controlSyncProvideOob:           NewControlSyncOob(managerCtx, client, "provide-oob"),
 		workers:                         newLifecycleAdmission(),

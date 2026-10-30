@@ -777,25 +777,40 @@ func TestSchedulerPauseClosesTheUplinkStaleEpoch(t *testing.T) {
 // scheduler: WakeupAfter deliberately coalesces timers to save radio wakeups,
 // and a coalesced fire is exactly the "late" this loop would misread as a
 // suspend. It must also be gated on the constructed tolerance, so a client
-// built with the detector off never runs the goroutine.
+// built with the detector off never runs the goroutine. A detector shared by
+// the clients of a host waits the same way, and each client judges its two
+// readings.
 func TestSchedulerPauseDetectorSourceAnchors(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	body, ok := functionBody(source, "func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector(")
+	for _, function := range []string{
+		"func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector(",
+		"func (self *SchedulerPauseDetector) run(",
+	} {
+		body, ok := functionBody(source, function)
+		if !ok {
+			t.Fatalf("could not find %s", function)
+		}
+		if !strings.Contains(body, "time.NewTimer(schedulerPauseProbeInterval)") || !strings.Contains(body, "probeTimer.Reset(schedulerPauseProbeInterval)") {
+			t.Errorf("%s does not arm a plain timer, so it cannot measure the pause", function)
+		}
+		if strings.Contains(body, "WakeupAfter") {
+			t.Errorf("%s uses the coalescing wakeup scheduler: a batched wakeup would read as a suspend", function)
+		}
+		if !strings.Contains(body, "armed := time.Now()") || !strings.Contains(body, "observeSchedulerPause(") || !strings.Contains(body, "armed, time.Now())") {
+			t.Errorf("%s does not judge each wait from its two readings", function)
+		}
+	}
+
+	body, ok := functionBody(source, "func observeSchedulerPauseIsolated(")
 	if !ok {
-		t.Fatal("could not find runSchedulerPauseDetector")
+		t.Fatal("could not find observeSchedulerPauseIsolated")
 	}
-	if !strings.Contains(body, "time.After(schedulerPauseProbeInterval)") {
-		t.Error("the detector does not arm a plain timer, so it cannot measure the pause")
-	}
-	if strings.Contains(body, "WakeupAfter") {
-		t.Error("the detector uses the coalescing wakeup scheduler: a batched wakeup would read as a suspend")
-	}
-	if !strings.Contains(body, "self.observeSchedulerPause(armed, time.Now())") {
-		t.Error("the detector does not judge each wait from its two readings")
+	if !strings.Contains(body, "client.observeSchedulerPause(armed, now)") {
+		t.Error("the shared detector does not judge each client from the shared readings")
 	}
 
 	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) observeSchedulerPause(")

@@ -669,9 +669,13 @@ func relHeartbeatLine(state heartbeatState, uptime time.Duration) string {
 // the previous beat and prints nothing when they match, so a phone sitting on a
 // desk overnight contributes zero lines instead of 480.
 //
-// Plain time.After rather than WakeupAfter: a once-a-minute timer is not worth
+// A plain timer rather than WakeupAfter: a once-a-minute timer is not worth
 // aligning to the wakeup grid, and a coalesced beat would blur the one property
-// the interval has -- that consecutive lines are one interval apart.
+// the interval has -- that consecutive lines are one interval apart. One timer
+// is armed for the loop's life and re-armed for each beat.
+//
+// A client whose logger discards everything (a hosted device) skips the
+// readouts: the line they would build is never printed.
 //
 // Tied to the multi-client ctx and NOT to `cancel`, like the prober and the
 // pause detector: a logging goroutine must never be able to tear down the
@@ -685,7 +689,14 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 	if self.ctx != nil {
 		done = self.ctx.Done()
 	}
+	_, silent := loggerOrDefault(self.log).(noopLogger)
 
+	var beatTimer *time.Timer
+	defer func() {
+		if beatTimer != nil {
+			beatTimer.Stop()
+		}
+	}()
 	for {
 		// read the interval BEFORE the wait so a runtime change takes effect on
 		// the next beat, and fall back to the constructed value when the
@@ -699,10 +710,15 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 			}
 		}
 
+		if beatTimer == nil {
+			beatTimer = time.NewTimer(wait)
+		} else {
+			beatTimer.Reset(wait)
+		}
 		select {
 		case <-done:
 			return
-		case <-time.After(wait):
+		case <-beatTimer.C:
 		}
 
 		// the reward-instrumentation fold+persist tick (Task 5): reuses this
@@ -719,6 +735,9 @@ func (self *RemoteUserNatMultiClient) runHeartbeat() {
 		// re-read after the wait: the heartbeat can be switched off at runtime,
 		// and the loop stays alive so switching it back on costs no reconnect
 		if self.reliabilitySettings().HeartbeatInterval <= 0 {
+			continue
+		}
+		if silent {
 			continue
 		}
 

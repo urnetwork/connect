@@ -548,15 +548,35 @@ func outcomeWatchPollTimeout(deadline time.Duration, resizeTimeout time.Duration
 // describe and rescue the window must never be able to tear down the tunnel.
 // Only accepted candidates may defer either transition inside one finite
 // phase envelope from the epoch arm time; repeated passes cannot slide it.
+//
+// The first installed provider disarms the watchdog for the window's life
+// (`everAdded` is never cleared), so the watcher ends there instead of
+// polling a window it can no longer act on. One timer is armed for the loop's
+// life and re-armed for each poll.
 func (self *multiClientWindow) watchOutcome() {
+	var pollTimer *time.Timer
+	defer func() {
+		if pollTimer != nil {
+			pollTimer.Stop()
+		}
+	}()
 	for {
 		deadline := self.reliabilitySettings().WindowOutcomeDeadline
 		rebuildDeadline := self.reliabilitySettings().WindowOutcomeRebuildDeadline
 
+		pollTimeout := outcomeWatchPollTimeout(deadline, self.settings.WindowResizeTimeout)
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(pollTimeout)
+		} else {
+			pollTimer.Reset(pollTimeout)
+		}
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(outcomeWatchPollTimeout(deadline, self.settings.WindowResizeTimeout)):
+		case <-pollTimer.C:
+		}
+		if self.outcomeDisarmed() {
+			return
 		}
 		if deadline <= 0 {
 			continue
@@ -592,6 +612,14 @@ func (self *multiClientWindow) watchOutcome() {
 			self.failOutcome(elapsed)
 		}
 	}
+}
+
+// outcomeDisarmed reports that a provider was installed, which disarms the
+// outcome watchdog for the window's life.
+func (self *multiClientWindow) outcomeDisarmed() bool {
+	self.outcomeLock.Lock()
+	defer self.outcomeLock.Unlock()
+	return self.everAdded
 }
 
 // rebuildWindow is the one automatic rescue: the programmatic form of the
