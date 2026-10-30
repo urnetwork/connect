@@ -5582,6 +5582,8 @@ type SendBufferSettings struct {
 	beforeGroupDequeueForTest           func(*SendSequence)
 	beforeGroupRetainForTest            func()
 	afterIdleCloseForTest               func(sendSequenceId, bool)
+	// Nil observer counts each arm of the send loop's deadline timer.
+	afterDeadlineTimerArmForTest func(sendSequenceId)
 	// Nil observer marks an application Pack entering the Opportunistic
 	// establish hold's wait.
 	beforeEstablishHoldWaitForTest func(sendSequenceId)
@@ -9048,6 +9050,65 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 		self.sendContract.canUpdate(sendPack.nextSerializedMessageByteCount())
 }
 
+// A sequence loop's one lazily armed deadline. The loops wake once per Pack,
+// ACK or flight change, and most passes leave their next deadline where it was
+// or move it later, so the timer moves only when a pass needs an earlier
+// deadline or the armed one has fired. A later deadline keeps the earlier one
+// armed; its fire costs the loop one recompute pass, so no deadline is ever
+// late.
+//
+// A time.AfterFunc feeds a one-slot wake channel, so a loop's per-Pack select
+// holds no timer channel: blocking on a channel timer costs a heap insert or a
+// zombie mark on every block and unblock, the work this replaces, while the
+// func timer stays in the heap until it fires. A fire that races a Reset can
+// leave a stale wake, which is only another early fire, and no wake is lost:
+// the slot keeps it until the loop takes it. One loop goroutine owns it.
+type sequenceDeadlineTimer struct {
+	timer *time.Timer
+	wake  chan struct{}
+	// the deadline armed and not yet taken as a wake; zero when none is
+	armedDeadline time.Time
+}
+
+func newSequenceDeadlineTimer() *sequenceDeadlineTimer {
+	return &sequenceDeadlineTimer{
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// Makes the next wake come no later than deadline. Reports whether it moved
+// the timer.
+func (self *sequenceDeadlineTimer) armBy(deadline time.Time) bool {
+	if !self.armedDeadline.IsZero() && !deadline.Before(self.armedDeadline) {
+		return false
+	}
+	self.armedDeadline = deadline
+	if self.timer == nil {
+		wake := self.wake
+		self.timer = time.AfterFunc(time.Until(deadline), func() {
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		})
+	} else {
+		self.timer.Reset(time.Until(deadline))
+	}
+	return true
+}
+
+// Records that the loop took a wake. The armed deadline has passed, or the
+// wake was stale; either way the next armBy moves the timer.
+func (self *sequenceDeadlineTimer) woke() {
+	self.armedDeadline = time.Time{}
+}
+
+func (self *sequenceDeadlineTimer) stop() {
+	if self.timer != nil {
+		self.timer.Stop()
+	}
+}
+
 func (self *SendSequence) Run() {
 	defer self.windowPacer.close()
 	defer self.resetPacingReadyWrite()
@@ -9167,11 +9228,16 @@ func (self *SendSequence) Run() {
 		}()
 	}
 
-	// reusable idle/resend timer: a per-iteration time.After would allocate a
-	// timer per packet on this hot loop. created already-fired; the Reset before
-	// each blocking select arms it (go1.23+ delivers no stale fire after Reset).
-	idleTimer := time.NewTimer(0)
-	defer idleTimer.Stop()
+	// The idle, resend and acknowledgement deadlines share one lazily armed
+	// timer. This loop passes once per Pack, ACK and flight wake, and a timer
+	// re-armed on every pass costs the runtime's timer heap a modify per Pack.
+	deadlineTimer := newSequenceDeadlineTimer()
+	defer deadlineTimer.stop()
+	// The idle close counts from the last activity: the latest pass not
+	// started by a timer wake alone, or one that applied feedback. A wake that
+	// only recomputes, or an early fire, does not extend the idle period.
+	idleSince := time.Now()
+	timerWake := false
 
 	scheduler := newSendPackScheduler()
 	// FLIGHTGATEFIX §22: when the reliable admission bound first blocks, this
@@ -9345,6 +9411,10 @@ sendSequenceLoop:
 		self.maybeRequestSuccessorContract(0)
 
 		sendTime := time.Now()
+		if !timerWake || ackUpdated {
+			idleSince = sendTime
+		}
+		timerWake = false
 		if err := self.retireAckLifetimes(sendTime); err != nil {
 			return
 		}
@@ -9362,7 +9432,8 @@ sendSequenceLoop:
 		}
 		var timeout time.Duration
 
-		if self.resendQueue.Len() == 0 {
+		idle := self.resendQueue.Len() == 0
+		if idle {
 			timeout = self.sendBufferSettings.IdleTimeout
 		} else {
 			timeout = self.sendBufferSettings.AckTimeout
@@ -9925,6 +9996,12 @@ sendSequenceLoop:
 			packIngress = nil
 		}
 
+		// The queue's deadlines count from this pass; the idle deadline counts
+		// from the last activity.
+		wakeDeadline := sendTime.Add(timeout)
+		if idle {
+			wakeDeadline = idleSince.Add(timeout)
+		}
 		// A flow-isolating carrier keeps ingress armed while one flow is
 		// flight-limited. That exposes a newly active flow to the fair scheduler;
 		// a carrier with a reserve may send it immediately, while an isolation-only
@@ -9934,11 +10011,11 @@ sendSequenceLoop:
 				continue sendSequenceLoop
 			}
 			return
-		} else if !deadline.IsZero() {
-			timeout = min(timeout, time.Until(deadline))
+		} else if !deadline.IsZero() && deadline.Before(wakeDeadline) {
+			wakeDeadline = deadline
 		}
-		if deadline, ok := self.retainedSilenceDeadline(); ok {
-			timeout = min(timeout, time.Until(deadline))
+		if deadline, ok := self.retainedSilenceDeadline(); ok && deadline.Before(wakeDeadline) {
+			wakeDeadline = deadline
 		}
 		// Snapshot may drain a withdrawal's wake after the earlier cut.
 		// Re-enter the ordinary capture-before-snapshot boundary, not a
@@ -9946,7 +10023,9 @@ sendSequenceLoop:
 		if self.pendingEvictionsRunnable() {
 			continue sendSequenceLoop
 		}
-		idleTimer.Reset(timeout)
+		if deadlineTimer.armBy(wakeDeadline) && self.sendBufferSettings.afterDeadlineTimerArmForTest != nil {
+			self.sendBufferSettings.afterDeadlineTimerArmForTest(self.id())
+		}
 		select {
 		case <-self.ctx.Done():
 			if !flightWaitStart.IsZero() {
@@ -9968,22 +10047,32 @@ sendSequenceLoop:
 				self.groupDequeued(nextSendPack)
 				scheduler.Push(nextSendPack)
 			}
-		case <-idleTimer.C:
-			if self.resendQueue.Len() == 0 && scheduler.Len() == 0 {
-				// IdleCondition atomically rejects retirement while Pack is open.
-				// Waiting for packMutex here would strand Required application
-				// admission and exclude the controls needed to finish its handshake.
-				done := self.idleCondition.Close(checkpointId)
-				if self.sendBufferSettings.afterIdleCloseForTest != nil {
-					self.sendBufferSettings.afterIdleCloseForTest(self.id(), done)
-				}
-				if done {
-					self.recordSendSequenceExit("idle", nil, time.Time{}, nil)
-					if self.log.V(1).Enabled() {
-						self.log.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
+		case <-deadlineTimer.wake:
+			deadlineTimer.woke()
+			timerWake = true
+			// An early fire leaves the idle period running.
+			if now := time.Now(); self.resendQueue.Len() == 0 &&
+				!now.Before(idleSince.Add(self.sendBufferSettings.IdleTimeout)) {
+				if scheduler.Len() == 0 {
+					// IdleCondition atomically rejects retirement while Pack is open.
+					// Waiting for packMutex here would strand Required application
+					// admission and exclude the controls needed to finish its handshake.
+					done := self.idleCondition.Close(checkpointId)
+					if self.sendBufferSettings.afterIdleCloseForTest != nil {
+						self.sendBufferSettings.afterIdleCloseForTest(self.id(), done)
 					}
-					return
+					if done {
+						self.recordSendSequenceExit("idle", nil, time.Time{}, nil)
+						if self.log.V(1).Enabled() {
+							self.log.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
+						}
+						return
+					}
 				}
+				// Queued Packs or an open Pack hold the sequence. The next
+				// check is a full idle timeout away, as it was when every pass
+				// re-armed the timer.
+				idleSince = now
 			}
 		}
 		if !flightWaitStart.IsZero() {
@@ -14168,6 +14257,8 @@ type ReceiveBufferSettings struct {
 	afterAckCompressTimerArmForTest func(receiveSequenceId)
 	// Nil observer exposes an idle check while producer admission is held.
 	afterIdleCloseForTest func(receiveSequenceId, bool)
+	// Nil observer counts each arm of the receive loop's deadline timer.
+	afterDeadlineTimerArmForTest func(receiveSequenceId)
 	// Nil by default. Exposes the fixed handoff census without changing admission.
 	afterGapHandoffSnapshotForTest func(receiveSequenceId, int)
 	// Nil by default. Runs on the updating goroutine after each ACK window
@@ -16114,11 +16205,23 @@ func (self *ReceiveSequence) Run() {
 		}
 	}, self.cancel)
 
-	// reusable idle/gap timer (avoids a per-iteration time.After alloc on the
-	// receive hot path). created already-fired; Reset before the blocking select
-	// arms it (go1.23+ delivers no stale fire after Reset).
-	idleTimer := time.NewTimer(0)
-	defer idleTimer.Stop()
+	// The idle and gap deadlines share one lazily armed timer (see
+	// sequenceDeadlineTimer): this loop passes once per Pack.
+	deadlineTimer := newSequenceDeadlineTimer()
+	defer deadlineTimer.stop()
+	// The delivery wait ends the sequence when its timer fires, so it keeps an
+	// exact timer of its own, created on that path's first wait.
+	var deliveryTimer *time.Timer
+	defer func() {
+		if deliveryTimer != nil {
+			deliveryTimer.Stop()
+		}
+	}()
+	// The idle close counts from the last activity: the latest pass not
+	// started by a timer wake alone. A wake that only recomputes, or an early
+	// fire, does not extend the idle period.
+	idleSince := time.Now()
+	timerWake := false
 
 	// A timed-out hole may already have its predecessor in the local handoff
 	// queue. Reconcile only the prefix present at first expiry, never replenish
@@ -16133,6 +16236,8 @@ func (self *ReceiveSequence) Run() {
 		if self.ctx.Err() != nil {
 			return
 		}
+		active := !timerWake
+		timerWake = false
 		// a busy sequence takes close requests between Packs
 		select {
 		case <-self.closeNotify:
@@ -16142,11 +16247,15 @@ func (self *ReceiveSequence) Run() {
 		default:
 		}
 		var timeout time.Duration
+		// the earliest hole's absolute deadline; zero when none
+		var gapDeadline time.Time
 		var expiredGap *receiveItem
 		deliveryBlocked := false
 
+		idle := false
 		if queueSize, _ := self.receiveQueue.QueueSize(); 0 == queueSize {
 			gapHandoff.active = false
+			idle = true
 			timeout = self.receiveBufferSettings.IdleTimeout
 		} else {
 			timeout = self.receiveBufferSettings.GapTimeout
@@ -16165,7 +16274,8 @@ func (self *ReceiveSequence) Run() {
 					if gapHandoff.active && gapHandoff.next != self.nextSequenceNumber {
 						gapHandoff.active = false
 					}
-					itemGapTimeout := time.Until(item.receiveTime.Add(self.receiveBufferSettings.GapTimeout))
+					itemGapDeadline := item.receiveTime.Add(self.receiveBufferSettings.GapTimeout)
+					itemGapTimeout := time.Until(itemGapDeadline)
 					if itemGapTimeout <= 0 || gapHandoff.active {
 						if !gapHandoff.active {
 							gapHandoff.active = true
@@ -16181,6 +16291,7 @@ func (self *ReceiveSequence) Run() {
 						expiredGap = item
 						break
 					}
+					gapDeadline = itemGapDeadline
 					if itemGapTimeout < timeout {
 						timeout = itemGapTimeout
 					}
@@ -16342,9 +16453,12 @@ func (self *ReceiveSequence) Run() {
 		self.flushDeliver()
 
 		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(timeout)
+		now := time.Now()
+		if active {
+			idleSince = now
+		}
 		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending()) {
-			pack, ok, shouldExit := self.waitDelivery(idleTimer.C)
+			pack, ok, shouldExit := self.waitDelivery(resetOrCreateTimer(&deliveryTimer, timeout))
 			if shouldExit || self.ctx.Err() != nil {
 				return
 			}
@@ -16352,6 +16466,17 @@ func (self *ReceiveSequence) Run() {
 				return
 			}
 			continue
+		}
+		// A hole's deadline is absolute; the idle deadline counts from the
+		// last activity.
+		wakeDeadline := now.Add(timeout)
+		if idle {
+			wakeDeadline = idleSince.Add(timeout)
+		} else if !gapDeadline.IsZero() && gapDeadline.Before(wakeDeadline) {
+			wakeDeadline = gapDeadline
+		}
+		if deadlineTimer.armBy(wakeDeadline) && self.receiveBufferSettings.afterDeadlineTimerArmForTest != nil {
+			self.receiveBufferSettings.afterDeadlineTimerArmForTest(self.id())
 		}
 		select {
 		case <-self.ctx.Done():
@@ -16367,8 +16492,12 @@ func (self *ReceiveSequence) Run() {
 			if self.applyCloseRequests() {
 				return
 			}
-		case <-idleTimer.C:
-			if 0 == self.receiveQueue.Len() {
+		case <-deadlineTimer.wake:
+			deadlineTimer.woke()
+			timerWake = true
+			// An early fire leaves the idle period running.
+			if now := time.Now(); 0 == self.receiveQueue.Len() &&
+				!now.Before(idleSince.Add(self.receiveBufferSettings.IdleTimeout)) {
 				// An open Pack can be waiting for this worker to receive; its idle
 				// reservation, not its producer mutex, serializes retirement.
 				done := self.idleCondition.Close(checkpointId)
@@ -16382,6 +16511,9 @@ func (self *ReceiveSequence) Run() {
 					}
 					return
 				}
+				// An open Pack holds the sequence. The next check is a full
+				// idle timeout away, as it was when every pass re-armed the timer.
+				idleSince = now
 			}
 		}
 	}
@@ -17993,6 +18125,8 @@ type ForwardBufferSettings struct {
 	afterRunForwardSequenceForTest     func(TransferPath)
 	// Nil observer exposes an idle check while producer admission is held.
 	afterIdleCloseForTest func(TransferPath, bool)
+	// Nil observer counts each arm of the forward loop's idle timer.
+	afterDeadlineTimerArmForTest func(TransferPath)
 }
 
 type ForwardBuffer struct {
@@ -18316,11 +18450,20 @@ func (self *ForwardSequence) Run() {
 	self.multiRouteWriter = self.client.RouteManager().OpenMultiRouteWriter(self.destination)
 	defer self.client.RouteManager().CloseMultiRouteWriter(self.multiRouteWriter)
 
-	// reusable idle timer (avoids a per-iteration time.After alloc on the
-	// forward hot path). created already-fired; Reset before the blocking select
-	// arms it (go1.23+ delivers no stale fire after Reset).
-	idleTimer := time.NewTimer(0)
-	defer idleTimer.Stop()
+	// The idle timer is armed once and moved only when it fires before the
+	// idle deadline, which counts from the last Pack: this loop passes once per
+	// Pack. Packs taken without blocking are stamped together when the loop
+	// next waits.
+	idleTimer := newSequenceDeadlineTimer()
+	defer idleTimer.stop()
+	lastPackTime := time.Now()
+	packed := false
+	armIdleTimer := func(deadline time.Time) {
+		if idleTimer.armBy(deadline) && self.forwardBufferSettings.afterDeadlineTimerArmForTest != nil {
+			self.forwardBufferSettings.afterDeadlineTimerArmForTest(self.destination)
+		}
+	}
+	armIdleTimer(lastPackTime.Add(self.forwardBufferSettings.IdleTimeout))
 
 	for {
 		processPack := func(forwardPack *ForwardPack, ok bool) bool {
@@ -18374,12 +18517,16 @@ func (self *ForwardSequence) Run() {
 			if !processPack(forwardPack, ok) {
 				return
 			}
+			packed = true
 			continue
 		default:
 		}
 
+		if packed {
+			lastPackTime = time.Now()
+			packed = false
+		}
 		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.forwardBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -18387,7 +18534,15 @@ func (self *ForwardSequence) Run() {
 			if !processPack(forwardPack, ok) {
 				return
 			}
-		case <-idleTimer.C:
+			packed = true
+		case <-idleTimer.wake:
+			idleTimer.woke()
+			now := time.Now()
+			if idleDeadline := lastPackTime.Add(self.forwardBufferSettings.IdleTimeout); now.Before(idleDeadline) {
+				// armed for an earlier Pack
+				armIdleTimer(idleDeadline)
+				continue
+			}
 			// An open Pack can be waiting for this worker to receive; its idle
 			// reservation, not its producer mutex, serializes retirement.
 			done := self.idleCondition.Close(checkpointId)
@@ -18401,6 +18556,10 @@ func (self *ForwardSequence) Run() {
 				}
 				return
 			}
+			// An open Pack holds the sequence: check again a full idle
+			// timeout from now.
+			lastPackTime = now
+			armIdleTimer(lastPackTime.Add(self.forwardBufferSettings.IdleTimeout))
 		}
 	}
 }
