@@ -8110,7 +8110,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var race *multiClientChannelUpdateRace
 				var committedClient *multiClientChannel
 				var initRace *multiClientChannelUpdateRace
-				var initRaceEarlyComplete <-chan struct{}
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
@@ -8134,7 +8133,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						update.initRaceWithLock()
 						update.race.clientLimit = len(raceOrderedClients)
 						initRace = update.race
-						initRaceEarlyComplete = initRace.completeMonitor.NotifyChannel()
 					}
 					race = update.race
 					now := time.Now()
@@ -8163,7 +8161,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				scheduleRace := func() {
 					if initRace != nil {
 						scheduleOnce.Do(func() {
-							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+							self.scheduleCompleteRace(update.ipPath, initRace)
 						})
 					}
 				}
@@ -9549,7 +9547,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
 				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
-					race.completeMonitor.NotifyAll()
+					race.completeEarly()
 				}
 			}
 		} else {
@@ -9904,21 +9902,23 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	return false
 }
 
-// spawns a goroutine that completes the race after a timeout. it acquires the
-// per-flow stateLock (not the parent lock) when it evaluates the race.
+// completes the race when its response window ends, or at once when enough
+// candidates answered first (completeEarly). The completion runs on the
+// window's timer, so a race waiting out its window holds a timer, not a parked
+// goroutine; the once keeps a timer an early completion re-armed from
+// completing the race twice. A race closed first is never completed. It
+// acquires the per-flow stateLock (not the parent lock) when it evaluates the
+// race.
 func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 	ipPath *IpPath,
 	race *multiClientChannelUpdateRace,
-	earlyComplete <-chan struct{},
 ) {
-	go HandleError(func() {
-		// wait for the race to finish, then choose
-
+	complete := func() {
+		// the window ended or enough candidates answered: choose
 		select {
 		case <-race.ctx.Done():
 			return
-		case <-earlyComplete:
-		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
+		default:
 		}
 
 		var abandonedClients []*multiClientChannel
@@ -10012,7 +10012,18 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		for _, p := range returnPackets {
 			MessagePoolReturn(p.Packet)
 		}
+	}
+	var completeOnce sync.Once
+	completeTimer := time.AfterFunc(self.settings.MultiRaceSetOnResponseTimeout, func() {
+		completeOnce.Do(func() {
+			HandleError(complete)
+		})
 	})
+	race.completeTimer.Store(completeTimer)
+	// an early completion asked before the timer existed
+	if race.completeRequested.Load() {
+		completeTimer.Reset(0)
+	}
 }
 
 // ExitInfo is one provider channel in the window, as reported to a developer
@@ -11546,9 +11557,13 @@ type multiClientChannelUpdateRace struct {
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int
-	completeMonitor        *Monitor
 	responseWindowElapsed  bool
 	collapseOrder          uint64
+	// completes the race when its response window ends; nil until the race's
+	// first send returns (scheduleCompleteRace)
+	completeTimer atomic.Pointer[time.Timer]
+	// an early completion asked before completeTimer existed
+	completeRequested atomic.Bool
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -11560,12 +11575,26 @@ func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpd
 		// sentPacketCount:        0,
 		// packetCount:            0,
 		// clientsWithPacketCount: 0,
-		completeMonitor: NewMonitor(),
+	}
+}
+
+// completeEarly completes the race now instead of at the end of its response
+// window: enough candidates answered. Safe under the flow lock, since it only
+// re-arms the completion timer; the request is kept for a timer not yet
+// scheduled.
+func (self *multiClientChannelUpdateRace) completeEarly() {
+	self.completeRequested.Store(true)
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Reset(0)
 	}
 }
 
 func (self *multiClientChannelUpdateRace) Close() {
 	self.cancel()
+	// a closed race is never completed: release its window's timer now
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Stop()
+	}
 	// return any still-pooled packets that no other path has claimed.
 	// the Pooled flag is the single-owner marker: paths that consume a
 	// receivePacket (race-buffer-exceeded in clientReceivePacket, the
