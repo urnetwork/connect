@@ -142,12 +142,12 @@ type DmcaSecurityPolicySettings struct {
 	// performs the eviction. 0 disables the scan (flows then persist until MaxFlows
 	// capacity-LRU eviction).
 	FlowTtl time.Duration
-	// FlowScanInterval is how often the idle scan runs while it tracks flows,
-	// so an idle flow is reclaimed within FlowTtl plus this. With no flow
-	// tracked the scan parks until the next one is. The default is a quarter
-	// of the default FlowTtl; it does not follow a changed FlowTtl. Non-positive
-	// is a quarter of FlowTtl. It schedules reclamation and decides no verdict,
-	// so it is not part of the policy's identity (SecurityPolicyHash).
+	// How often the idle scan runs while it tracks flows, so an idle flow is
+	// reclaimed within FlowTtl plus this. With no flow tracked the scan parks
+	// until the next one is. The default is a quarter of the default FlowTtl;
+	// it does not follow a changed FlowTtl. Non-positive is a quarter of
+	// FlowTtl. It schedules reclamation and decides no verdict, so it is not
+	// part of the policy's identity (SecurityPolicyHash).
 	FlowScanInterval time.Duration `json:"-"`
 
 	// Tests count the idle scans. Runs on the scan goroutine; nil is a
@@ -539,7 +539,7 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 	return self
 }
 
-// run evicts flows whose last packet activity (sent or received) is older than
+// Evicts flows whose last packet activity (sent or received) is older than
 // FlowTtl, scanning every FlowScanInterval while it tracks flows. With none
 // tracked it parks until the next tracked flow wakes it, then scans an
 // interval later.

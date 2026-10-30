@@ -5009,15 +5009,15 @@ func tcpRstForOrphan(ipVersion int, tcp *parsedTcp) []byte {
 	return packet
 }
 
-// ioDeadline is one direction's deadline on a flow's socket, owned by the one
-// goroutine (or lock holder) that does that direction's I/O. It is lazy: an
-// operation installs a new deadline only when less than half the timeout
-// remains on the installed one, so a busy flow sets it, a runtime timer modify,
-// about twice per timeout rather than on every read or write. A deadline that
-// fires before a full timeout has passed since the operation began is not a
-// stall: retry installs that exact bound and the operation goes on, so a stall
-// still ends a full timeout after the operation began, as a deadline set for
-// each operation did.
+// One direction's deadline on a flow's socket, owned by the one goroutine (or
+// lock holder) that does that direction's I/O. It is lazy: an operation
+// installs a new deadline only when less than half the timeout remains on the
+// installed one, so a busy flow sets it, a runtime timer modify, about twice
+// per timeout rather than on every read or write. A deadline that fires before
+// a full timeout has passed since the operation began is not a stall: retry
+// installs that exact bound and the operation goes on, so a stall still ends a
+// full timeout after the operation began, as a deadline set for each operation
+// did.
 type ioDeadline struct {
 	timeout     time.Duration
 	setDeadline func(time.Time) error
@@ -5074,11 +5074,11 @@ func (self *ioDeadline) install(deadline time.Time) error {
 	return nil
 }
 
-// writeWithProgress writes to an upstream socket, bounding ZERO-PROGRESS time
-// rather than total time: the deadline re-arms whenever a write advances, so a
-// peer applying ordinary flow control (accepting data steadily but slowly) is
-// not failed, while a peer that accepts nothing for a full timeout from the
-// start of the write still is.
+// Writes to an upstream socket, bounding ZERO-PROGRESS time rather than total
+// time: the deadline re-arms whenever a write advances, so a peer applying
+// ordinary flow control (accepting data steadily but slowly) is not failed,
+// while a peer that accepts nothing for a full timeout from the start of the
+// write still is.
 //
 // A single deadline for the whole batch killed alive flows under sustained
 // bulk transfer: the return path's acks stall behind saturated tunnel queues
@@ -9040,12 +9040,12 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 	}
 }
 
-// packetStatsChange is the provider's packet stats change edge. Every counted
-// packet raises it, and the stats epoch worker takes it each epoch and parks
-// while it stays down. Raising a raised edge costs one atomic load, so the
-// packet path pays nothing more while traffic moves. It is its own small
-// object so a detached send's write observer can raise it without retaining
-// the provider. Safe for concurrent use; a nil edge ignores raises.
+// The provider's packet stats change edge. Every counted packet raises it, and
+// the stats epoch worker takes it each epoch and parks while it stays down.
+// Raising a raised edge costs one atomic load, so the packet path pays nothing
+// more while traffic moves. It is its own small object so a detached send's
+// write observer can raise it without retaining the provider. Safe for
+// concurrent use; a nil edge ignores raises.
 type packetStatsChange struct {
 	raised atomic.Bool
 	// signaled when the edge rises, so the parked worker resumes
@@ -11513,11 +11513,11 @@ type UserLimited interface {
 	Cancel()
 }
 
-// userLimited is a flow's last activity, which the flow tables' LRU eviction
-// and the shared UDP idle reap read. Its reader and writer stamp it on every
-// packet, so the stamp is one store of monotonic nanoseconds (see
-// monotonicNanos): one clock read and no lock per packet, and a wall clock
-// step cannot make a flow look idle or fresh. Safe for concurrent use.
+// A flow's last activity, which the flow tables' LRU eviction and the shared
+// UDP idle reap read. Its reader and writer stamp it on every packet, so the
+// stamp is one store of monotonic nanoseconds (see monotonicNanos): one clock
+// read and no lock per packet, and a wall clock step cannot make a flow look
+// idle or fresh. Safe for concurrent use.
 type userLimited struct {
 	lastActivityNanos atomic.Int64
 }
