@@ -104,7 +104,7 @@ func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJo
 	constructed := make(chan *Client, 1)
 	publish := make(chan struct{})
 	generator.newPlatformTransport = func(client *Client, _ *ClientAuth, _ TransportMode, _ *PlatformTransportSettings) apiWindowPlatformTransport {
-		client.ClientKeyManager().registrationSync.retryTimeout = 0
+		client.ClientKeyManager().registrationSync.settings.RetryTimeout = 0
 		constructed <- client
 		close(publish)
 		return transport

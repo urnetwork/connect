@@ -112,7 +112,7 @@ func newClientKeyRegistrationDomainHttpFixture(t *testing.T, ipVersion int, doma
 		endpoint.Close()
 		t.Fatal("actual registration manager was not constructed")
 	}
-	client.ClientKeyManager().registrationSync.retryTimeout = 0
+	client.ClientKeyManager().registrationSync.settings.RetryTimeout = 0
 	close(publish)
 	t.Cleanup(func() {
 		cancel()

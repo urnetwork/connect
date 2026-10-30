@@ -2,11 +2,37 @@ package connect
 
 import (
 	"context"
+	mathrand "math/rand"
 	"sync"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Retry pacing of a ControlSyncOob. A client's syncs read it from
+// `ClientSettings.ControlSyncOobSettings`, and each copies it at construction.
+type ControlSyncOobSettings struct {
+	// The nominal wait after a send's first failed attempt. It doubles per
+	// consecutive failure up to RetryMaxTimeout, and each wait is drawn
+	// uniformly from [d/2, d) of the nominal wait d. Each Send starts here
+	// again: a success or a newer Send ends the previous send's backoff.
+	// Non-positive retries at once.
+	RetryTimeout time.Duration
+	// Caps the nominal wait, so a refused send still retries at least this
+	// often. At or below RetryTimeout, the nominal wait stays RetryTimeout.
+	RetryMaxTimeout time.Duration
+}
+
+func DefaultControlSyncOobSettings() *ControlSyncOobSettings {
+	return &ControlSyncOobSettings{
+		// the former fixed wait, so a one-off failure retries about as soon
+		RetryTimeout: 1 * time.Second,
+		// at the cap a send waits 15 to 30 s: 1000 clients refused together
+		// retry about 45 times a second instead of 1000, and each still retries
+		// within 30 s of recovery, inside the transport's 60 s dial backoff cap
+		RetryMaxTimeout: 30 * time.Second,
+	}
+}
 
 // ControlSyncOob is like ControlSync, but delivers control messages via the
 // client out-of-band control (a synchronous request/response to the platform)
@@ -15,14 +41,17 @@ import (
 // secret is registered on the platform), not merely delivered — which is the
 // reliable "committed" signal a normal control ack does not give. It retries on
 // error until success or the context/client is closed, and only the latest
-// message per scope is retried.
+// message per scope is retried. Consecutive failures of a send back off
+// exponentially with jitter (ControlSyncOobSettings), so many clients refused
+// together neither retry once a second nor in lockstep.
 type ControlSyncOob struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client       *Client
-	scopeTag     string
-	retryTimeout time.Duration
+	client   *Client
+	scopeTag string
+	// a copy, so a test may pace one sync without touching the client's
+	settings ControlSyncOobSettings
 
 	sendLock  sync.Mutex
 	closed    bool
@@ -36,18 +65,28 @@ type ControlSyncOob struct {
 	beforeWorkerDoneForTest func()
 	beforeCloseWaitForTest  func()
 	beforeSendLockForTest   func()
+	// Nil test hooks replace time.After for a retry wait, and the uniform
+	// jitter offset in [0, half) of a retry wait.
+	retryAfterForTest  func(timeout time.Duration) <-chan time.Time
+	retryJitterForTest func(half time.Duration) time.Duration
 }
 
 func NewControlSyncOob(ctx context.Context, client *Client, scopeTag string) *ControlSyncOob {
 	cancelCtx, cancel := context.WithCancel(ctx)
 
+	// client settings built without the field pace with the defaults
+	settings := client.settings.ControlSyncOobSettings
+	if settings == nil {
+		settings = DefaultControlSyncOobSettings()
+	}
+
 	return &ControlSyncOob{
-		ctx:          cancelCtx,
-		cancel:       cancel,
-		client:       client,
-		scopeTag:     scopeTag,
-		retryTimeout: 1 * time.Second,
-		workers:      newLifecycleAdmission(),
+		ctx:      cancelCtx,
+		cancel:   cancel,
+		client:   client,
+		scopeTag: scopeTag,
+		settings: *settings,
+		workers:  newLifecycleAdmission(),
 	}
 }
 
@@ -126,6 +165,36 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 		return true
 	}
 
+	// The nominal wait before this send's next retry. Attempts of one send run
+	// one at a time, each launched from the previous attempt's callback, so
+	// only one callback touches it. A success or a newer Send ends this send,
+	// and the next send starts again from RetryTimeout.
+	nominalRetryTimeout := self.settings.RetryTimeout
+	// Draws a failed attempt's wait uniformly from [d/2, d) of the nominal wait
+	// d, then doubles d up to RetryMaxTimeout for the next failure (the shape of
+	// pinnedDialBackoff). Jitter only downward, so the cap is a real ceiling.
+	nextRetryTimeout := func() time.Duration {
+		d := nominalRetryTimeout
+		if d <= 0 {
+			return 0
+		}
+		maxTimeout := max(self.settings.RetryTimeout, self.settings.RetryMaxTimeout)
+		// compare against half the cap, since doubling d could overflow
+		if maxTimeout/2 < d {
+			nominalRetryTimeout = maxTimeout
+		} else {
+			nominalRetryTimeout = 2 * d
+		}
+		half := d / 2
+		if half <= 0 {
+			return d
+		}
+		if self.retryJitterForTest != nil {
+			return half + max(0, min(half-1, self.retryJitterForTest(half)))
+		}
+		return half + time.Duration(mathrand.Int63n(int64(half)))
+	}
+
 	var send func()
 	send = func() {
 		// stop if a newer Send for this scope superseded this one, or done
@@ -164,13 +233,18 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 				handleCancel()
 				return
 			}
+			retryTimeout := nextRetryTimeout()
 			if self.client.log.V(2).Enabled() {
-				self.client.log.Infof("[control-oob][%d]retry scope = %s err = %s\n", syncIndex, self.scopeTag, err)
+				self.client.log.Infof("[control-oob][%d]retry scope = %s in %s err = %s\n", syncIndex, self.scopeTag, retryTimeout, err)
+			}
+			retryAfter := time.After
+			if self.retryAfterForTest != nil {
+				retryAfter = self.retryAfterForTest
 			}
 			select {
 			case <-handleCtx.Done():
 			case <-self.client.Done():
-			case <-time.After(self.retryTimeout):
+			case <-retryAfter(retryTimeout):
 				if !self.startWorker(send) {
 					handleCancel()
 				}

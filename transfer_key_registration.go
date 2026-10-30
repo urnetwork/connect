@@ -55,7 +55,7 @@ func (self *ClientKeyManager) WaitForRegistration(ctx context.Context) error {
 // Serializes publication through processed completion. A seed change cannot
 // overtake a paused old publisher, and an old response cannot mark the changed
 // key ready. Transient errors use ControlSyncOob's existing bounded request,
-// one-second retry and caller-owned cancellation, not transport acknowledgments.
+// backed-off retry and caller-owned cancellation, not transport acknowledgments.
 func (self *ClientKeyManager) publishRegisteredClientKey() {
 	select {
 	case <-self.client.ReadyNotify():

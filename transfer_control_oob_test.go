@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -122,7 +123,9 @@ func TestControlSyncOobRetryUntilSuccess(t *testing.T) {
 	client := newControlSyncOobTestClient(ctx, oob)
 
 	cs := NewControlSyncOob(ctx, client, "m1")
-	cs.retryTimeout = 10 * time.Millisecond
+	// a fast fixed cadence: this test runs real retries
+	cs.settings.RetryTimeout = 10 * time.Millisecond
+	cs.settings.RetryMaxTimeout = 10 * time.Millisecond
 	defer cs.Close()
 
 	var ackLock sync.Mutex
@@ -176,7 +179,9 @@ func TestControlSyncOobImmediateSuccess(t *testing.T) {
 	client := newControlSyncOobTestClient(ctx, oob)
 
 	cs := NewControlSyncOob(ctx, client, "m1")
-	cs.retryTimeout = 10 * time.Millisecond
+	// a fast fixed cadence, should it retry
+	cs.settings.RetryTimeout = 10 * time.Millisecond
+	cs.settings.RetryMaxTimeout = 10 * time.Millisecond
 	defer cs.Close()
 
 	ackCh := make(chan error, 1)
@@ -216,7 +221,9 @@ func TestControlSyncOobLatestSupersedes(t *testing.T) {
 	client := newControlSyncOobTestClient(ctx, oob)
 
 	cs := NewControlSyncOob(ctx, client, "m1")
-	cs.retryTimeout = 10 * time.Millisecond
+	// a fast fixed cadence: this test runs real retries
+	cs.settings.RetryTimeout = 10 * time.Millisecond
+	cs.settings.RetryMaxTimeout = 10 * time.Millisecond
 	defer cs.Close()
 
 	firstAcked := make(chan struct{}, 1)
@@ -407,7 +414,9 @@ func TestControlSyncOobCloseStopsRetries(t *testing.T) {
 	client := newControlSyncOobTestClient(ctx, oob)
 
 	cs := NewControlSyncOob(ctx, client, "m1")
-	cs.retryTimeout = 10 * time.Millisecond
+	// a fast fixed cadence: this test runs real retries
+	cs.settings.RetryTimeout = 10 * time.Millisecond
+	cs.settings.RetryMaxTimeout = 10 * time.Millisecond
 
 	acked := make(chan struct{}, 1)
 	cs.Send(makeFrame(1), func(err error) {
@@ -439,5 +448,251 @@ func TestControlSyncOobCloseStopsRetries(t *testing.T) {
 	case <-acked:
 		t.Fatal("send acked despite always failing")
 	default:
+	}
+}
+
+// One retry wait a ControlSyncOob asked for. It fires only when the test sends
+// on `fire`.
+type controlSyncOobRetryWait struct {
+	timeout time.Duration
+	fire    chan time.Time
+}
+
+// Hands each retry wait of `cs` to the test in place of a timer.
+func captureControlSyncOobRetryWaits(cs *ControlSyncOob) <-chan controlSyncOobRetryWait {
+	waits := make(chan controlSyncOobRetryWait, 2)
+	cs.retryAfterForTest = func(timeout time.Duration) <-chan time.Time {
+		wait := controlSyncOobRetryWait{
+			timeout: timeout,
+			fire:    make(chan time.Time, 1),
+		}
+		waits <- wait
+		return wait.fire
+	}
+	return waits
+}
+
+// A liveness deadline does not decide the asserted ordering.
+func receiveControlSyncOobTestValue[T any](t *testing.T, values <-chan T, message string) T {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(10 * time.Second):
+		t.Fatal(message)
+		var empty T
+		return empty
+	}
+}
+
+// Fails `attempt` on its own goroutine, as the api's callback does. The
+// returned channel closes when the callback, and with it the retry wait,
+// returns.
+func failControlSyncOobAttempt(attempt delayedOobAttempt) <-chan struct{} {
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		attempt.callback(nil, errors.New("synthetic control refusal"))
+	}()
+	return returned
+}
+
+func controlSyncOobTestFrame(t *testing.T, index uint32) *protocol.Frame {
+	t.Helper()
+	frame, err := ToFrame(&protocol.SimpleMessage{MessageIndex: index}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
+}
+
+// A sync of a default client, with an oob whose every attempt the test answers
+// and retry waits the test fires.
+func newControlSyncOobBackoffTest(t *testing.T) (*ControlSyncOob, *Client, *delayedOobControl, <-chan controlSyncOobRetryWait) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	oob := &delayedOobControl{attempts: make(chan delayedOobAttempt, 1)}
+	client := newControlSyncOobTestClient(ctx, oob)
+	t.Cleanup(client.Cancel)
+	cs := NewControlSyncOob(ctx, client, "backoff")
+	t.Cleanup(cs.Close)
+	return cs, client, oob, captureControlSyncOobRetryWaits(cs)
+}
+
+// Fails the send's next attempt and returns the retry wait it asked for. With
+// `fire`, the wait fires and its callback returns, having started the next
+// attempt's launcher, before this returns.
+func failControlSyncOobAttemptAndWait(t *testing.T, oob *delayedOobControl, waits <-chan controlSyncOobRetryWait, fire bool) (controlSyncOobRetryWait, <-chan struct{}) {
+	t.Helper()
+	attempt := receiveControlSyncOobTestValue(t, oob.attempts, "oob attempt did not arrive")
+	returned := failControlSyncOobAttempt(attempt)
+	wait := receiveControlSyncOobTestValue(t, waits, "retry wait was not requested")
+	if fire {
+		wait.fire <- time.Now()
+		receiveControlSyncOobTestValue(t, returned, "fired retry wait did not return")
+	}
+	return wait, returned
+}
+
+// The middle of each jitter range, so a wait is 3/4 of its nominal wait.
+func controlSyncOobMiddleJitter(half time.Duration) time.Duration {
+	return half / 2
+}
+
+// Consecutive failures of one send back off: the nominal wait doubles from
+// RetryTimeout to RetryMaxTimeout (the defaults: 1 s to 30 s), and each wait
+// is jittered within [d/2, d) of it. Every retry used to wait a fixed 1 s, so
+// 1000 providers in one process retried about 1000 times a second, in
+// lockstep, while the platform refused them
+// (https://github.com/urnetwork/connect/issues/227).
+func TestControlSyncOobRetryBacksOffExponentiallyToCap(t *testing.T) {
+	cs, _, oob, waits := newControlSyncOobBackoffTest(t)
+	cs.retryJitterForTest = controlSyncOobMiddleJitter
+
+	cs.Send(controlSyncOobTestFrame(t, 1), nil)
+	want := []time.Duration{
+		750 * time.Millisecond,
+		1500 * time.Millisecond,
+		3 * time.Second,
+		6 * time.Second,
+		12 * time.Second,
+		22500 * time.Millisecond,
+		22500 * time.Millisecond,
+		22500 * time.Millisecond,
+	}
+	got := []time.Duration{}
+	for range want {
+		wait, _ := failControlSyncOobAttemptAndWait(t, oob, waits, true)
+		got = append(got, wait.timeout)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("retry waits = %v, want %v", got, want)
+	}
+}
+
+// Drawn from math/rand, each wait stays in [d/2, d) of its nominal wait d:
+// never over the cap, and spread below the nominal wait that clients refused
+// at the same moment would otherwise share.
+func TestControlSyncOobRetryJitterStaysWithinNominalRange(t *testing.T) {
+	cs, _, oob, waits := newControlSyncOobBackoffTest(t)
+
+	cs.Send(controlSyncOobTestFrame(t, 1), nil)
+	nominals := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	}
+	for i, nominal := range nominals {
+		wait, _ := failControlSyncOobAttemptAndWait(t, oob, waits, true)
+		if wait.timeout < nominal/2 || nominal <= wait.timeout {
+			t.Errorf("failure %d waited %s, want in [%s, %s)", i+1, wait.timeout, nominal/2, nominal)
+		}
+	}
+}
+
+// A success ends its send's backoff: the next send's first failure waits from
+// RetryTimeout again, however far the previous send had backed off.
+func TestControlSyncOobSuccessResetsRetryBackoff(t *testing.T) {
+	cs, _, oob, waits := newControlSyncOobBackoffTest(t)
+	cs.retryJitterForTest = controlSyncOobMiddleJitter
+
+	acked := make(chan error, 1)
+	cs.Send(controlSyncOobTestFrame(t, 1), func(err error) {
+		acked <- err
+	})
+	for _, want := range []time.Duration{750 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second, 6 * time.Second} {
+		if wait, _ := failControlSyncOobAttemptAndWait(t, oob, waits, true); wait.timeout != want {
+			t.Fatalf("backing off: waited %s, want %s", wait.timeout, want)
+		}
+	}
+	attempt := receiveControlSyncOobTestValue(t, oob.attempts, "oob attempt did not arrive")
+	attempt.callback(nil, nil)
+	if err := receiveControlSyncOobTestValue(t, acked, "successful send did not acknowledge"); err != nil {
+		t.Fatal(err)
+	}
+
+	cs.Send(controlSyncOobTestFrame(t, 2), nil)
+	wait, returned := failControlSyncOobAttemptAndWait(t, oob, waits, false)
+	if want := 750 * time.Millisecond; wait.timeout != want {
+		t.Fatalf("the send after a success first waited %s, want %s", wait.timeout, want)
+	}
+	cs.Close()
+	receiveControlSyncOobTestValue(t, returned, "closed sync kept waiting")
+}
+
+// A newer Send ends the older send's pending retry wait without another
+// attempt, and its own first failure waits from RetryTimeout, not from where
+// the older send had backed off to.
+func TestControlSyncOobSupersessionStopsRetryAndRestartsBackoff(t *testing.T) {
+	cs, _, oob, waits := newControlSyncOobBackoffTest(t)
+	cs.retryJitterForTest = controlSyncOobMiddleJitter
+
+	cs.Send(controlSyncOobTestFrame(t, 1), nil)
+	for _, want := range []time.Duration{750 * time.Millisecond, 1500 * time.Millisecond} {
+		if wait, _ := failControlSyncOobAttemptAndWait(t, oob, waits, true); wait.timeout != want {
+			t.Fatalf("backing off: waited %s, want %s", wait.timeout, want)
+		}
+	}
+	// the third wait stays pending until the newer send supersedes it
+	olderWait, olderReturned := failControlSyncOobAttemptAndWait(t, oob, waits, false)
+	if want := 3 * time.Second; olderWait.timeout != want {
+		t.Fatalf("backing off: waited %s, want %s", olderWait.timeout, want)
+	}
+
+	cs.Send(controlSyncOobTestFrame(t, 2), nil)
+	receiveControlSyncOobTestValue(t, olderReturned, "superseded send kept waiting")
+	// the timer would fire now; nothing waits on it
+	olderWait.fire <- time.Now()
+
+	wait, returned := failControlSyncOobAttemptAndWait(t, oob, waits, false)
+	if want := 750 * time.Millisecond; wait.timeout != want {
+		t.Fatalf("the superseding send first waited %s, want %s", wait.timeout, want)
+	}
+	// the newer send is held at its wait, so any attempt now is the older send's
+	select {
+	case <-oob.attempts:
+		t.Fatal("superseded send attempted again")
+	default:
+	}
+	cs.Close()
+	receiveControlSyncOobTestValue(t, returned, "closed sync kept waiting")
+}
+
+// Closing the sync, or its client, ends a pending retry wait at once, without
+// another attempt, however long the backed-off wait.
+func TestControlSyncOobStopEndsRetryWait(t *testing.T) {
+	stops := []struct {
+		name string
+		stop func(cs *ControlSyncOob, client *Client)
+	}{
+		{name: "sync close", stop: func(cs *ControlSyncOob, _ *Client) { cs.Close() }},
+		{name: "client cancel", stop: func(_ *ControlSyncOob, client *Client) { client.Cancel() }},
+	}
+	for _, s := range stops {
+		cs, client, oob, waits := newControlSyncOobBackoffTest(t)
+		cs.retryJitterForTest = controlSyncOobMiddleJitter
+
+		cs.Send(controlSyncOobTestFrame(t, 1), nil)
+		for range 5 {
+			failControlSyncOobAttemptAndWait(t, oob, waits, true)
+		}
+		wait, returned := failControlSyncOobAttemptAndWait(t, oob, waits, false)
+		if want := 22500 * time.Millisecond; wait.timeout != want {
+			t.Fatalf("%s: backing off: waited %s, want %s", s.name, wait.timeout, want)
+		}
+		s.stop(cs, client)
+		receiveControlSyncOobTestValue(t, returned, s.name+" did not end the retry wait")
+		// the timer would fire now; nothing waits on it
+		wait.fire <- time.Now()
+		select {
+		case <-oob.attempts:
+			t.Fatalf("%s: retried after the stop", s.name)
+		default:
+		}
 	}
 }
