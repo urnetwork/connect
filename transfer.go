@@ -652,6 +652,7 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
 		ContractManagerSettings: DefaultContractManagerSettingsWithBufferSize(bufferSize),
+		ControlSyncOobSettings:  DefaultControlSyncOobSettings(),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
 		PeerManagerSettings:     DefaultPeerManagerSettings(),
 		WebRtcSettings:          DefaultWebRtcSettings(),
@@ -1630,6 +1631,11 @@ type ClientSettings struct {
 	PeerManagerSettings     *PeerManagerSettings
 	WebRtcSettings          *WebRtcSettings
 	EncryptionSettings      *EncryptionSettings
+
+	// Retry pacing of the client's out-of-band control syncs (the provide
+	// secret and processed key registrations). Nil uses
+	// `DefaultControlSyncOobSettings()`. Each sync copies it at construction.
+	ControlSyncOobSettings *ControlSyncOobSettings
 
 	// ProviderStreamPolicy marks a top-level client whose P2P streams exist to
 	// serve/relay provider traffic. Its stream manager applies provide-mode
