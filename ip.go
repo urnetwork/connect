@@ -2201,6 +2201,9 @@ type UdpBufferSettings struct {
 	// Tests count the readiness shards' returns from their kernel wait. Runs
 	// on each shard's goroutine; nil is a production no-op.
 	afterSocketPollWaitForTest func()
+	// Tests count the arms of a flow's idle timer. Runs on the flow's send
+	// loop; nil is a production no-op.
+	afterIdleTimerArmForTest func()
 
 	ConnectSettings
 }
@@ -3865,15 +3868,27 @@ func (self *UdpSequence) Run() {
 		return writeErr == nil
 	}
 
-	// reusable idle timer: this send loop wakes per datagram, so a per-iteration
-	// time.After allocated a timer per packet (the dominant alloc in the udp
-	// egress profile). hot-path timer reuse per CODESTYLE.
-	idleTimer := time.NewTimer(0)
+	// One idle timer for the loop's life, armed once rather than per datagram:
+	// a send moves lastSendNanos, and a fire before IdleTimeout has passed since
+	// it re-arms to that point, so a close is never early. The IdleCondition
+	// checkpoint taken after the last send still decides the close, so a send
+	// racing it keeps its datagram.
+	idleTimeout := self.udpBufferSettings.IdleTimeout
+	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
+	armIdleTimer := func(timeout time.Duration) {
+		idleTimer.Reset(timeout)
+		if self.udpBufferSettings.afterIdleTimerArmForTest != nil {
+			self.udpBufferSettings.afterIdleTimerArmForTest()
+		}
+	}
+	if self.udpBufferSettings.afterIdleTimerArmForTest != nil {
+		self.udpBufferSettings.afterIdleTimerArmForTest()
+	}
+	lastSendNanos := monotonicNanos()
+	checkpointId := self.idleCondition.Checkpoint()
 
 	for {
-		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.udpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -3884,7 +3899,13 @@ func (self *UdpSequence) Run() {
 			if !writeSendItems(sendItem) {
 				return
 			}
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
 		case <-idleTimer.C:
+			if remaining := time.Duration(lastSendNanos + int64(idleTimeout) - monotonicNanos()); 0 < remaining {
+				armIdleTimer(remaining)
+				continue
+			}
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -3898,7 +3919,10 @@ func (self *UdpSequence) Run() {
 				// close the sequence
 				return
 			}
-			// else there pending updates
+			// else there pending updates: a full window from now
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
+			armIdleTimer(idleTimeout)
 		}
 	}
 }
@@ -4280,6 +4304,9 @@ type TcpBufferSettings struct {
 	// owns it for its whole life. Called on the sequence's own goroutine, so
 	// an implementation must not block. Nil is a production no-op.
 	afterUpstreamConnectForTest func(*net.TCPConn)
+	// Tests count the arms of a flow's idle timer once it is established.
+	// Runs on the flow's send loop; nil is a production no-op.
+	afterIdleTimerArmForTest func()
 
 	ConnectSettings
 }
@@ -6801,16 +6828,27 @@ func (self *TcpSequence) Run() {
 		return true
 	}
 
+	// The idle timer is armed once for the established flow rather than per
+	// segment: a send moves lastSendNanos, and a fire before IdleTimeout has
+	// passed since it re-arms to that point, so a close is never early. The
+	// IdleCondition checkpoint taken after the last send still decides the
+	// close, so a send or a pure ACK since then defers it a full window.
+	idleTimeout := self.tcpBufferSettings.IdleTimeout
+	armIdleTimer := func(timeout time.Duration) {
+		idleTimer.Reset(timeout)
+		if self.tcpBufferSettings.afterIdleTimerArmForTest != nil {
+			self.tcpBufferSettings.afterIdleTimerArmForTest()
+		}
+	}
+	armIdleTimer(idleTimeout)
+	lastSendNanos := monotonicNanos()
+	checkpointId := self.idleCondition.Checkpoint()
 send:
 	for {
-		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.tcpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
-			idleTimer.Stop()
 			return
 		case sendItem := <-self.sendItems:
-			idleTimer.Stop()
 			self.admissionCapacity.notify()
 			if !handleSendItem(sendItem) {
 				if !fin {
@@ -6832,10 +6870,16 @@ send:
 					}
 					sendIter += 1
 				default:
+					lastSendNanos = monotonicNanos()
+					checkpointId = self.idleCondition.Checkpoint()
 					continue send
 				}
 			}
 		case <-idleTimer.C:
+			if remaining := time.Duration(lastSendNanos + int64(idleTimeout) - monotonicNanos()); 0 < remaining {
+				armIdleTimer(remaining)
+				continue
+			}
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -6852,7 +6896,10 @@ send:
 				}
 				return
 			}
-			// else there pending updates
+			// else there pending updates: a full window from now
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
+			armIdleTimer(idleTimeout)
 		}
 	}
 
