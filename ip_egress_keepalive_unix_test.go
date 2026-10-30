@@ -72,6 +72,7 @@ func TestProviderEgressKeepAliveIsIndependentAndOptional(t *testing.T) {
 // A host can establish its own cadence. Nil must not replace it after connect.
 func TestProviderEgressNilKeepAlivePreservesHostDialSettings(t *testing.T) {
 	settings := DefaultLocalUserNatSettingsWithBufferSize(2)
+	settings.TcpBufferSettings.ProviderKeepAliveConfig = nil
 	want := net.KeepAliveConfig{Enable: true, Idle: 73 * time.Second, Interval: 17 * time.Second, Count: 6}
 	host := &net.Dialer{KeepAliveConfig: want}
 	settings.TcpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: host.DialContext}

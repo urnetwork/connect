@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -519,7 +520,8 @@ func (self *icmpEgressTransactor) WriteEcho(deadline time.Time, ttl int, sequenc
 func (self *icmpEgressTransactor) ReadEcho(deadline time.Time) (sequenceNumber uint16, payload []byte, err error) {
 	timeout := time.Until(deadline)
 	if timeout <= 0 {
-		return 0, nil, fmt.Errorf("Read deadline.")
+		// a timeout the flow can tell from other failures (see icmpEgress)
+		return 0, nil, os.ErrDeadlineExceeded
 	}
 	select {
 	case <-self.ctx.Done():
@@ -527,7 +529,7 @@ func (self *icmpEgressTransactor) ReadEcho(deadline time.Time) (sequenceNumber u
 	case item := <-self.replies:
 		return item.sequenceNumber, item.payload, nil
 	case <-time.After(timeout):
-		return 0, nil, fmt.Errorf("Read deadline.")
+		return 0, nil, os.ErrDeadlineExceeded
 	}
 }
 

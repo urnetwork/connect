@@ -221,7 +221,7 @@ func (owner *providerReliablePacket) enterNat() receiveDeliveryAttempt {
 	packetBytes := ByteCount(len(owner.packet))
 	select {
 	case nat.sendPackets <- queued:
-		owner.provider.packetStatsCounters.recordRemoteIngress(owner.peer.TransportType, 1, packetBytes)
+		owner.provider.countRemoteIngress(owner.peer.TransportType, 1, packetBytes)
 		return receiveDeliveryInFlight
 	default:
 		return receiveDeliveryWaiting

@@ -263,9 +263,7 @@ func testProviderUdpSharedSocketLifecyclePreservesOrderAndReaps[BufferId compara
 	}
 	buffer.mutex.Unlock()
 
-	activeSequence.userLimited.mutex.Lock()
-	activeSequence.lastActivityTime = time.Now().Add(-2 * settings.IdleTimeout)
-	activeSequence.userLimited.mutex.Unlock()
+	activeSequence.lastActivityNanos.Store(monotonicNanos() - int64(2*settings.IdleTimeout))
 	buffer.wakeSharedSocketLifecycle()
 	select {
 	case <-activeSequence.ctx.Done():

@@ -488,6 +488,9 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		returnBudget = max(kib(320), transferBudgetShareByteCount())
 	}
 	tcpBufferSettings := &TcpBufferSettings{
+		// off, see ProviderKeepAliveConfig. Negative timings leave the
+		// socket's own, so turning it off is one option write per flow.
+		ProviderKeepAliveConfig: &net.KeepAliveConfig{Enable: false, Idle: -1, Interval: -1, Count: -1},
 		// ConnectTimeout:     60 * time.Second,
 		ReadTimeout:             300 * time.Second,
 		ReturnQueueBudget:       NewTransferMemoryBudget(returnBudget),
@@ -2195,6 +2198,12 @@ type UdpBufferSettings struct {
 	// Tests inspect the configured socket before the first datagram is written.
 	// Runs on the flow's opener; nil is a production no-op.
 	afterSocketOpenForTest func(*UdpSequence, net.Conn)
+	// Tests count the readiness shards' returns from their kernel wait. Runs
+	// on each shard's goroutine; nil is a production no-op.
+	afterSocketPollWaitForTest func()
+	// Tests count the arms of a flow's idle timer. Runs on the flow's send
+	// loop; nil is a production no-op.
+	afterIdleTimerArmForTest func()
 
 	ConnectSettings
 }
@@ -3309,6 +3318,9 @@ type UdpSequence struct {
 	// Lazily allocated only when the bounded send queue actually blocks.
 	// sendMutex serializes Reset/Stop.
 	sendTimer *time.Timer
+	// The shared socket's write deadline, allocated by the first shared
+	// write. sendMutex serializes its use.
+	sharedWriteDeadline *ioDeadline
 
 	idleCondition *IdleCondition
 	transferState transferState
@@ -3364,7 +3376,7 @@ func newUdpSequenceWithTransferKey(
 	if !udpBufferSettings.SharedSocketLifecycle {
 		sendItems = make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize)
 	}
-	return &UdpSequence{
+	sequence := &UdpSequence{
 		memory:               memory,
 		ctx:                  cancelCtx,
 		cancel:               cancel,
@@ -3385,11 +3397,10 @@ func newUdpSequenceWithTransferKey(
 			sourcePort:      sourcePort,
 			destinationIp:   destinationIp,
 			destinationPort: destinationPort,
-			userLimited: userLimited{
-				lastActivityTime: time.Now(),
-			},
 		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 func (self *UdpSequence) ensureSendItems() {
@@ -3516,14 +3527,19 @@ func (self *UdpSequence) sendSharedSocket(sendItem *UdpSendItem) (bool, error) {
 	self.transferState.update(sendItem.source, sendItem.transferKey)
 	payload := sendItem.udp.payload
 	if len(payload) != 0 {
-		if err := self.sharedSocket.SetWriteDeadline(
-			time.Now().Add(self.udpBufferSettings.WriteTimeout),
-		); err != nil {
+		if self.sharedWriteDeadline == nil {
+			self.sharedWriteDeadline = newIoDeadline(self.udpBufferSettings.WriteTimeout, self.sharedSocket.SetWriteDeadline)
+		}
+		writeStart, err := self.sharedWriteDeadline.begin()
+		if err != nil {
 			self.sharedSocketErr = err
 			self.Close()
 			return false, err
 		}
 		n, err := self.sharedSocket.Write(payload)
+		for n == 0 && self.sharedWriteDeadline.retry(writeStart, err) {
+			n, err = self.sharedSocket.Write(payload)
+		}
 		if err != nil {
 			self.sharedSocketErr = err
 			self.Close()
@@ -3697,6 +3713,8 @@ func (self *UdpSequence) Run() {
 		defer self.cancel()
 
 		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
+		// the reader owns the socket's read deadline
+		readDeadline := newIoDeadline(self.udpBufferSettings.ReadTimeout, socket.SetReadDeadline)
 
 		for forwardIter := uint64(0); ; forwardIter += 1 {
 			select {
@@ -3705,15 +3723,29 @@ func (self *UdpSequence) Run() {
 			default:
 			}
 
-			readTimeout := time.Now().Add(self.udpBufferSettings.ReadTimeout)
-			if err := socket.SetReadDeadline(readTimeout); err != nil {
+			readStart, err := readDeadline.begin()
+			if err != nil {
 				return
 			}
-			lease, prepareErr := self.awaitReturnRead(socket, buffer)
-			if prepareErr != nil {
-				return
+			var lease *udpReturnReadLease
+			var n int
+			for {
+				// The readiness wait and the read share one bound. An expiry of
+				// a deadline installed before this read began waits again.
+				lease, err = self.awaitReturnRead(socket, buffer)
+				if err != nil {
+					if readDeadline.retry(readStart, err) {
+						continue
+					}
+					return
+				}
+				n, err = socket.Read(buffer)
+				if n == 0 && err != nil && readDeadline.retry(readStart, err) {
+					lease.abort()
+					continue
+				}
+				break
 			}
-			n, err := socket.Read(buffer)
 
 			if err != nil {
 				if self.log.V(1).Enabled() {
@@ -3789,6 +3821,8 @@ func (self *UdpSequence) Run() {
 	// concurrent reader plus one writer, so the extra stage added memory,
 	// scheduling, and a handoff without adding parallelism.
 	writeBatch := make([]*UdpSendItem, 0, self.udpBufferSettings.WriteBatchSize)
+	// the send loop owns the socket's write deadline
+	writeDeadline := newIoDeadline(self.udpBufferSettings.WriteTimeout, socket.SetWriteDeadline)
 	writeSendItems := func(first *UdpSendItem) bool {
 		writeBatch = append(writeBatch[:0], first)
 	drain:
@@ -3804,13 +3838,16 @@ func (self *UdpSequence) Run() {
 			}
 		}
 
-		writeErr := socket.SetWriteDeadline(time.Now().Add(self.udpBufferSettings.WriteTimeout))
+		writeStart, writeErr := writeDeadline.begin()
 		for _, sendItem := range writeBatch {
 			payload := sendItem.udp.payload
 			if writeErr == nil && 0 < len(payload) {
 				// Each payload is one datagram; writes cannot be coalesced, but
 				// the drained batch shares one deadline and one scheduler wake.
 				n, err := socket.Write(payload)
+				for n == 0 && writeDeadline.retry(writeStart, err) {
+					n, err = socket.Write(payload)
+				}
 				if err == nil {
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[f%d]udp forward %d\n", sendIter, n)
@@ -3830,15 +3867,27 @@ func (self *UdpSequence) Run() {
 		return writeErr == nil
 	}
 
-	// reusable idle timer: this send loop wakes per datagram, so a per-iteration
-	// time.After allocated a timer per packet (the dominant alloc in the udp
-	// egress profile). hot-path timer reuse per CODESTYLE.
-	idleTimer := time.NewTimer(0)
+	// One idle timer for the loop's life, armed once rather than per datagram:
+	// a send moves lastSendNanos, and a fire before IdleTimeout has passed since
+	// it re-arms to that point, so a close is never early. The IdleCondition
+	// checkpoint taken after the last send still decides the close, so a send
+	// racing it keeps its datagram.
+	idleTimeout := self.udpBufferSettings.IdleTimeout
+	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
+	armIdleTimer := func(timeout time.Duration) {
+		idleTimer.Reset(timeout)
+		if self.udpBufferSettings.afterIdleTimerArmForTest != nil {
+			self.udpBufferSettings.afterIdleTimerArmForTest()
+		}
+	}
+	if self.udpBufferSettings.afterIdleTimerArmForTest != nil {
+		self.udpBufferSettings.afterIdleTimerArmForTest()
+	}
+	lastSendNanos := monotonicNanos()
+	checkpointId := self.idleCondition.Checkpoint()
 
 	for {
-		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.udpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -3849,7 +3898,13 @@ func (self *UdpSequence) Run() {
 			if !writeSendItems(sendItem) {
 				return
 			}
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
 		case <-idleTimer.C:
+			if remaining := time.Duration(lastSendNanos + int64(idleTimeout) - monotonicNanos()); 0 < remaining {
+				armIdleTimer(remaining)
+				continue
+			}
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -3863,7 +3918,10 @@ func (self *UdpSequence) Run() {
 				// close the sequence
 				return
 			}
-			// else there pending updates
+			// else there pending updates: a full window from now
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
+			armIdleTimer(idleTimeout)
 		}
 	}
 }
@@ -4057,9 +4115,13 @@ type TcpBufferSettings struct {
 	// Shadow observes the socket default; mirror applies the first SYN's
 	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
 	EgressTtlMode EgressTtlMode
-	// Nil preserves existing provider keepalive settings (5s by default).
-	// An explicit config, including Enable:false, applies after connect and is
-	// independent of the control-plane ConnectSettings keepalive cadence.
+	// Kernel keepalive on the upstream socket of each flow, applied after
+	// connect and independent of the control-plane ConnectSettings cadence the
+	// dial uses. The default turns it off: the flow's own ReadTimeout and
+	// IdleTimeout reap a dead upstream, while probing every idle flow every 5 s
+	// kept a phone's radio up for each flow it carried. Nil leaves the dial's
+	// setting (that 5 s cadence, or a host-supplied dialer's own); an explicit
+	// config, including Enable:false, sets its own.
 	ProviderKeepAliveConfig *net.KeepAliveConfig
 	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
 	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
@@ -4241,6 +4303,9 @@ type TcpBufferSettings struct {
 	// owns it for its whole life. Called on the sequence's own goroutine, so
 	// an implementation must not block. Nil is a production no-op.
 	afterUpstreamConnectForTest func(*net.TCPConn)
+	// Tests count the arms of a flow's idle timer once it is established.
+	// Runs on the flow's send loop; nil is a production no-op.
+	afterIdleTimerArmForTest func()
 
 	ConnectSettings
 }
@@ -4944,27 +5009,89 @@ func tcpRstForOrphan(ipVersion int, tcp *parsedTcp) []byte {
 	return packet
 }
 
-// writeWithProgressDeadline writes to an upstream socket, bounding
-// ZERO-PROGRESS time rather than total time: the deadline re-arms whenever a
-// write advances, so a peer applying ordinary flow control (accepting data
-// steadily but slowly) is not failed, while a peer that accepts nothing for a
-// full timeout still is.
+// One direction's deadline on a flow's socket, owned by the one goroutine (or
+// lock holder) that does that direction's I/O. It is lazy: an operation
+// installs a new deadline only when less than half the timeout remains on the
+// installed one, so a busy flow sets it, a runtime timer modify, about twice
+// per timeout rather than on every read or write. A deadline that fires before
+// a full timeout has passed since the operation began is not a stall: retry
+// installs that exact bound and the operation goes on, so a stall still ends a
+// full timeout after the operation began, as a deadline set for each operation
+// did.
+type ioDeadline struct {
+	timeout     time.Duration
+	setDeadline func(time.Time) error
+	// installed on the socket; zero before the first operation and after a
+	// failed install
+	deadline time.Time
+}
+
+func newIoDeadline(timeout time.Duration, setDeadline func(time.Time) error) *ioDeadline {
+	return &ioDeadline{
+		timeout:     timeout,
+		setDeadline: setDeadline,
+	}
+}
+
+// Begins an operation now, installing a full deadline when less than half the
+// timeout remains on the installed one. Returns the operation's start.
+func (self *ioDeadline) begin() (time.Time, error) {
+	now := time.Now()
+	if self.deadline.Sub(now) < self.timeout/2 {
+		return now, self.install(now.Add(self.timeout))
+	}
+	return now, nil
+}
+
+// Begins a fresh attempt now with a full deadline, after progress.
+func (self *ioDeadline) restart() (time.Time, error) {
+	now := time.Now()
+	return now, self.install(now.Add(self.timeout))
+}
+
+// Reports whether an operation that began at start and failed with err should
+// try again, having installed the full bound start+timeout: err is a deadline
+// expiry, and the deadline that expired was earlier than that bound. Any other
+// failure, and an expiry at the full bound, is the operation's result.
+func (self *ioDeadline) retry(start time.Time, err error) bool {
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		return false
+	}
+	bound := start.Add(self.timeout)
+	if !self.deadline.Before(bound) {
+		return false
+	}
+	return self.install(bound) == nil
+}
+
+func (self *ioDeadline) install(deadline time.Time) error {
+	if err := self.setDeadline(deadline); err != nil {
+		self.deadline = time.Time{}
+		return err
+	}
+	self.deadline = deadline
+	return nil
+}
+
+// Writes to an upstream socket, bounding ZERO-PROGRESS time rather than total
+// time: the deadline re-arms whenever a write advances, so a peer applying
+// ordinary flow control (accepting data steadily but slowly) is not failed,
+// while a peer that accepts nothing for a full timeout from the start of the
+// write still is.
 //
 // A single deadline for the whole batch killed alive flows under sustained
 // bulk transfer: the return path's acks stall behind saturated tunnel queues
 // long enough that the upstream socket drains slower than one batch, and the
 // partial write at the deadline tore the sequence down (observed as mid-stream
 // resets in the full-stack tcp test).
-func writeWithProgressDeadline(
-	socket net.Conn,
-	buffers net.Buffers,
-	timeout time.Duration,
-) (int64, error) {
+func (self *ioDeadline) writeWithProgress(socket net.Conn, buffers net.Buffers) (int64, error) {
 	n := int64(0)
+	start, err := self.begin()
+	if err != nil {
+		return n, err
+	}
 	for {
-		if err := socket.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-			return n, err
-		}
 		wn, err := buffers.WriteTo(socket)
 		n += wn
 		if err == nil {
@@ -4973,6 +5100,12 @@ func writeWithProgressDeadline(
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() && 0 < wn {
 			// progress inside this deadline window: the peer is alive and
 			// draining, so give the remainder a fresh window
+			if start, err = self.restart(); err != nil {
+				return n, err
+			}
+			continue
+		}
+		if wn == 0 && self.retry(start, err) {
 			continue
 		}
 		return n, err
@@ -5080,6 +5213,9 @@ type TcpSequence struct {
 	// the burst-end trigger wakes on the quiescence cadence rather than per
 	// arrival (THROUGHPUTFIX §26.10). Nil is a production no-op.
 	afterAckWaitWakeForTest func()
+	// Counts the return recovery goroutine's wakes from its wait. Set before
+	// the goroutine starts; nil is a production no-op.
+	afterReturnRecoveryWakeForTest func()
 	// Tests join the pure-acknowledgement worker before inspecting ownership. Nil is a
 	// production no-op.
 	afterPureAckWorkerStopForTest func()
@@ -5155,7 +5291,7 @@ func newTcpSequenceWithTransferKey(
 	)
 	timestampOffset := mathrand.Uint32()
 
-	return &TcpSequence{
+	sequence := &TcpSequence{
 		memory:            memory,
 		ctx:               cancelCtx,
 		cancel:            cancel,
@@ -5196,11 +5332,10 @@ func newTcpSequenceWithTransferKey(
 			windowSize:        initialWindowSize,
 			windowScale:       0,
 			timestampOffset:   timestampOffset,
-			userLimited: userLimited{
-				lastActivityTime: time.Now(),
-			},
 		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (bool, error) {
@@ -5516,7 +5651,8 @@ func (self *TcpSequence) Run() {
 	var err error
 	var egressDial *providerEgressDial
 	var dialDuration time.Duration
-	if self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp) {
+	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp)
+	if synthetic {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
 		if self.log.V(1).Enabled() {
@@ -5590,7 +5726,10 @@ func (self *TcpSequence) Run() {
 			self.tcpBufferSettings.DialContextSettings == nil,
 		)
 	}
-	configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	if !synthetic {
+		// the synthetic server has no socket to configure
+		configureProviderKeepAlive(socket, self.tcpBufferSettings.ProviderKeepAliveConfig, self.egressRealism)
+	}
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		if self.tcpBufferSettings.afterUpstreamConnectForTest != nil {
 			self.tcpBufferSettings.afterUpstreamConnectForTest(tcpConn)
@@ -5750,6 +5889,8 @@ func (self *TcpSequence) Run() {
 
 		batch := make([]writePayload, 0, self.tcpBufferSettings.WriteBatchSize)
 		bufferStorage := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
+		// the writer owns the socket's write deadline
+		writeDeadline := newIoDeadline(self.tcpBufferSettings.WriteTimeout, socket.SetWriteDeadline)
 
 		for {
 			batch = batch[:0]
@@ -5791,11 +5932,7 @@ func (self *TcpSequence) Run() {
 			// `WriteTo` retries partial writes until fully written, a timeout, or an error.
 			buffers := net.Buffers(bufferStorage)
 
-			n, err := writeWithProgressDeadline(
-				socket,
-				buffers,
-				self.tcpBufferSettings.WriteTimeout,
-			)
+			n, err := writeDeadline.writeWithProgress(socket, buffers)
 
 			if err == nil {
 				if self.log.V(2).Enabled() {
@@ -5911,6 +6048,8 @@ func (self *TcpSequence) Run() {
 		}()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
+		// the reader owns the socket's read deadline
+		readDeadline := newIoDeadline(self.tcpBufferSettings.ReadTimeout, socket.SetReadDeadline)
 
 		for forwardIter := uint64(0); ; forwardIter += 1 {
 			select {
@@ -5919,12 +6058,15 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			readTimeout := time.Now().Add(self.tcpBufferSettings.ReadTimeout)
-			if err := socket.SetReadDeadline(readTimeout); err != nil {
+			readStart, err := readDeadline.begin()
+			if err != nil {
 				return
 			}
 
 			n, err := socket.Read(buffer)
+			for n == 0 && readDeadline.retry(readStart, err) {
+				n, err = socket.Read(buffer)
+			}
 
 			if err != nil {
 				if self.log.V(1).Enabled() {
@@ -6091,6 +6233,14 @@ func (self *TcpSequence) Run() {
 		// on the hot ack coalescing path)
 		ackCompressTimer := time.NewTimer(0)
 		defer ackCompressTimer.Stop()
+		// The compression interval follows each acknowledgement, while
+		// compressing, until compressDeadlineNanos. The timer is armed only for
+		// data that arrives inside the interval, to coalesce it, so a flow
+		// whose data comes further apart than AckCompressTimeout is
+		// acknowledged on arrival with no timer at all. The schedule is the one
+		// a wait after every acknowledgement gave.
+		compressing := false
+		compressDeadlineNanos := int64(0)
 
 		for {
 			select {
@@ -6099,66 +6249,19 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			var packet []byte
+			// wait for data to acknowledge
 			func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
-
-				select {
-				case <-self.ctx.Done():
-					return
-				default:
-				}
-
-				for self.sendSeq == ackedSendSeq {
+				for self.ctx.Err() == nil && self.sendSeq == ackedSendSeq {
 					ackCond.Wait()
-					select {
-					case <-self.ctx.Done():
-						return
-					default:
-					}
-				}
-
-				var err error
-				packet, err = self.PureAck()
-				if err != nil {
-					self.log.Infof("[r]ack err = %s\n", err)
-				}
-				acknowledgedByteCount := self.sendSeq - ackedSendSeq
-				ackedSendSeq = self.sendSeq
-				// nothing is outstanding from here, which is what separates a
-				// recovering peer from a quiet one, and what disarms the
-				// burst-end trigger
-				quiescentNanos = monotonicNanos()
-				lastArrivalNanos = 0
-				if recovering {
-					recoveryAckedByteCount += acknowledgedByteCount
-					// the bound on what one entry may cost, for a peer that
-					// never grows out of the phase by itself
-					if 0 < self.tcpBufferSettings.RecoveryQuickackByteBound &&
-						self.tcpBufferSettings.RecoveryQuickackByteBound <=
-							ByteCount(recoveryAckedByteCount) {
-						recovering = false
-					}
 				}
 			}()
-			if packet == nil {
+			if self.ctx.Err() != nil {
 				return
 			}
-			if self.afterPureAckBuildForTest != nil {
-				self.afterPureAckBuildForTest(packet)
-			}
 
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(packet)
-				return
-			default:
-			}
-
-			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
-
-			if 0 < self.tcpBufferSettings.AckCompressTimeout {
+			if compressing {
 				// coalesce acks up to the timeout.
 				// the send loop signals to ack sooner when the unacked byte
 				// count reaches half the window, so the source never stalls
@@ -6175,8 +6278,7 @@ func (self *TcpSequence) Run() {
 				// wakes against a wake per segment. Each firing re-reads the
 				// last-arrival timestamp the send loop stores under the mutex
 				// and either acknowledges or re-arms at the moved deadline.
-				compressDeadlineNanos := monotonicNanos() +
-					int64(self.tcpBufferSettings.AckCompressTimeout)
+
 				// armed, and whether the burst it watches has already ended
 				burstEndStateWithoutLock := func() (bool, bool) {
 					self.mutex.Lock()
@@ -6228,6 +6330,69 @@ func (self *TcpSequence) Run() {
 						return
 					}
 					break
+				}
+				compressing = false
+			}
+
+			var packet []byte
+			func() {
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+
+				select {
+				case <-self.ctx.Done():
+					return
+				default:
+				}
+
+				var err error
+				packet, err = self.PureAck()
+				if err != nil {
+					self.log.Infof("[r]ack err = %s\n", err)
+				}
+				acknowledgedByteCount := self.sendSeq - ackedSendSeq
+				ackedSendSeq = self.sendSeq
+				// nothing is outstanding from here, which is what separates a
+				// recovering peer from a quiet one, and what disarms the
+				// burst-end trigger
+				quiescentNanos = monotonicNanos()
+				lastArrivalNanos = 0
+				if recovering {
+					recoveryAckedByteCount += acknowledgedByteCount
+					// the bound on what one entry may cost, for a peer that
+					// never grows out of the phase by itself
+					if 0 < self.tcpBufferSettings.RecoveryQuickackByteBound &&
+						self.tcpBufferSettings.RecoveryQuickackByteBound <=
+							ByteCount(recoveryAckedByteCount) {
+						recovering = false
+					}
+				}
+			}()
+			if packet == nil {
+				return
+			}
+			if self.afterPureAckBuildForTest != nil {
+				self.afterPureAckBuildForTest(packet)
+			}
+
+			select {
+			case <-self.ctx.Done():
+				MessagePoolReturn(packet)
+				return
+			default:
+			}
+
+			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
+
+			if 0 < self.tcpBufferSettings.AckCompressTimeout {
+				// A signal already waiting ends this interval at once, as it
+				// would have ended a wait begun here.
+				select {
+				case <-ackSignal:
+				default:
+					compressing = true
+					compressDeadlineNanos = monotonicNanos() +
+						int64(self.tcpBufferSettings.AckCompressTimeout)
 				}
 			}
 		}
@@ -6684,16 +6849,27 @@ func (self *TcpSequence) Run() {
 		return true
 	}
 
+	// The idle timer is armed once for the established flow rather than per
+	// segment: a send moves lastSendNanos, and a fire before IdleTimeout has
+	// passed since it re-arms to that point, so a close is never early. The
+	// IdleCondition checkpoint taken after the last send still decides the
+	// close, so a send or a pure ACK since then defers it a full window.
+	idleTimeout := self.tcpBufferSettings.IdleTimeout
+	armIdleTimer := func(timeout time.Duration) {
+		idleTimer.Reset(timeout)
+		if self.tcpBufferSettings.afterIdleTimerArmForTest != nil {
+			self.tcpBufferSettings.afterIdleTimerArmForTest()
+		}
+	}
+	armIdleTimer(idleTimeout)
+	lastSendNanos := monotonicNanos()
+	checkpointId := self.idleCondition.Checkpoint()
 send:
 	for {
-		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.tcpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
-			idleTimer.Stop()
 			return
 		case sendItem := <-self.sendItems:
-			idleTimer.Stop()
 			self.admissionCapacity.notify()
 			if !handleSendItem(sendItem) {
 				if !fin {
@@ -6715,10 +6891,16 @@ send:
 					}
 					sendIter += 1
 				default:
+					lastSendNanos = monotonicNanos()
+					checkpointId = self.idleCondition.Checkpoint()
 					continue send
 				}
 			}
 		case <-idleTimer.C:
+			if remaining := time.Duration(lastSendNanos + int64(idleTimeout) - monotonicNanos()); 0 < remaining {
+				armIdleTimer(remaining)
+				continue
+			}
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -6735,7 +6917,10 @@ send:
 				}
 				return
 			}
-			// else there pending updates
+			// else there pending updates: a full window from now
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
+			armIdleTimer(idleTimeout)
 		}
 	}
 
@@ -7682,6 +7867,7 @@ type RemoteUserNatProvider struct {
 	// direction convention as the contracts: ingress is traffic received from
 	// the tunnel (remote clients' egress), egress is the return into the tunnel
 	packetStatsCounters         *packetStatsCounters
+	packetStatsChange           *packetStatsChange
 	packetStatsCallbacks        *CallbackList[PacketStatsFunction]
 	congestionDrops             providerCongestionDropCounters
 	nextReturnSendObserverToken atomic.Uint64
@@ -7772,6 +7958,9 @@ type RemoteUserNatProvider struct {
 	// returnSendNowForTest replaces the clock used to evaluate a source's
 	// acknowledgement silence against ReturnSendAbandonTimeout.
 	returnSendNowForTest func() time.Time
+	// Observes each wake of the packet stats epoch worker. Set before the
+	// first stats callback starts it; nil in production.
+	packetStatsWakeForTest func()
 }
 
 func NewRemoteUserNatProviderWithDefaults(
@@ -7869,6 +8058,7 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		securityPolicyGeneration: SecurityPolicyGeneration(securityPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
+		packetStatsChange:        newPacketStatsChange(),
 		packetStatsCallbacks:     NewCallbackList[PacketStatsFunction](),
 		sourceProvideMode:        map[Id]protocol.ProvideMode{},
 		sourceDiagnostics:        map[Id]*providerSourceDiagnostics{},
@@ -8793,6 +8983,9 @@ func (self *RemoteUserNatProvider) addAdmittedPacketStatsCallbackWithLock(callba
 		self.packetStatsSubscriptions = map[int]*providerStatsSubscription{}
 	}
 	self.packetStatsSubscriptions[id] = subscription
+	// the next epoch reports the counts as they stand, if they changed since
+	// the last report (the first report always)
+	self.packetStatsChange.raise()
 	return func() {
 		self.stateLock.Lock()
 		if self.packetStatsSubscriptions[id] == subscription {
@@ -8804,19 +8997,31 @@ func (self *RemoteUserNatProvider) addAdmittedPacketStatsCallbackWithLock(callba
 	}
 }
 
-// flushes packet stats events to listeners on the event epoch
+// flushes packet stats events to listeners on the event epoch. One timer
+// serves the worker's life. An epoch with no counted packet parks the worker
+// until the next one raises `packetStatsChange`, and that packet is reported
+// an epoch after it; an unchanged epoch compares the counters in place and
+// allocates nothing.
 func (self *RemoteUserNatProvider) runPacketStats() {
 	var lastPacketStats *PacketStats
+	epochTimer := time.NewTimer(self.settings.EventEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.EventEpoch):
+		case <-epochTimer.C:
+		}
+		if self.packetStatsWakeForTest != nil {
+			self.packetStatsWakeForTest()
 		}
 
-		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
-			packetStats := self.packetStatsCounters.snapshot()
-			if !packetStatsEqual(packetStats, lastPacketStats) {
+		// take the edge before reading the counters, so a packet counted
+		// during this pass raises it for the next one
+		if self.packetStatsChange.take() {
+			if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) &&
+				!self.packetStatsCounters.unchangedSince(lastPacketStats) {
+				packetStats := self.packetStatsCounters.snapshot()
 				lastPacketStats = packetStats
 				for _, callback := range callbacks {
 					HandleError(func() {
@@ -8824,8 +9029,89 @@ func (self *RemoteUserNatProvider) runPacketStats() {
 					})
 				}
 			}
+		} else {
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.packetStatsChange.wake:
+			}
 		}
+		epochTimer.Reset(self.settings.EventEpoch)
 	}
+}
+
+// The provider's packet stats change edge. Every counted packet raises it, and
+// the stats epoch worker takes it each epoch and parks while it stays down.
+// Raising a raised edge costs one atomic load, so the packet path pays nothing
+// more while traffic moves. It is its own small object so a detached send's
+// write observer can raise it without retaining the provider. Safe for
+// concurrent use; a nil edge ignores raises.
+type packetStatsChange struct {
+	raised atomic.Bool
+	// signaled when the edge rises, so the parked worker resumes
+	wake chan struct{}
+}
+
+func newPacketStatsChange() *packetStatsChange {
+	return &packetStatsChange{wake: make(chan struct{}, 1)}
+}
+
+func (self *packetStatsChange) raise() {
+	if self == nil || self.raised.Load() || !self.raised.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Lowers the edge and reports whether it was raised. A wake from that rise is
+// spent: the pass that takes the edge reads the counters itself.
+func (self *packetStatsChange) take() bool {
+	if !self.raised.Swap(false) {
+		return false
+	}
+	select {
+	case <-self.wake:
+	default:
+	}
+	return true
+}
+
+// A write observer that moves an admitted return's remote egress to the
+// carrier that wrote it, and raises the edge for the move.
+func (self *packetStatsChange) transportWriteObserver(attribution *transportPacketAttribution) func(TransportType) {
+	return func(transportType TransportType) {
+		attribution.observe(transportType)
+		self.raise()
+	}
+}
+
+// Counts packets the provider security policy dropped from the tunnel.
+func (self *RemoteUserNatProvider) countBlockIngress(packetCount int64, byteCount int64) {
+	self.packetStatsCounters.blockIngressPacketCount.Add(packetCount)
+	self.packetStatsCounters.blockIngressByteCount.Add(byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts returns the provider security policy dropped.
+func (self *RemoteUserNatProvider) countBlockEgress(packetCount int64, byteCount int64) {
+	self.packetStatsCounters.blockEgressPacketCount.Add(packetCount)
+	self.packetStatsCounters.blockEgressByteCount.Add(byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts packets from the tunnel handed to the exit NAT.
+func (self *RemoteUserNatProvider) countRemoteIngress(transportType TransportType, packetCount int64, byteCount ByteCount) {
+	self.packetStatsCounters.recordRemoteIngress(transportType, packetCount, byteCount)
+	self.packetStatsChange.raise()
+}
+
+// Counts a return Transfer admitted, under its carrier once observed.
+func (self *RemoteUserNatProvider) countReturnAdmitted(attribution *transportPacketAttribution) {
+	attribution.admit()
+	self.packetStatsChange.raise()
 }
 
 // recordSourceProvideMode remembers the provide mode to echo on a source's
@@ -9106,7 +9392,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnTransferKey,
 				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
-				observeTransportWrite(transportAttribution.observe),
+				observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 				recoveryOption,
 			)
 			return attemptSent
@@ -9137,7 +9423,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				returnTransferKey,
 				Ctx(item.sendContext(self.ctx)),
 				sendSchedulingKeyOption{key: item.schedulingKey},
-				observeTransportWrite(transportAttribution.observe),
+				observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 				recoveryOption,
 				sendAckTargetOption{target: ackTarget},
 			)
@@ -9150,7 +9436,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		// Transfer's ACK target now owns this exceptional receipt. Never
 		// leave it on the return item that is immediately reused from a pool.
 		item.terminalReset = nil
-		transportAttribution.admit()
+		self.countReturnAdmitted(transportAttribution)
 	} else {
 		self.congestionDrops.addReturnSend(1, item.packetByteCount)
 	}
@@ -9230,7 +9516,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					returnTransferKey,
 					Ctx(item.sendContext(self.ctx)),
 					sendSchedulingKeyOption{key: item.schedulingKey},
-					observeTransportWrite(transportAttribution.observe),
+					observeTransportWrite(self.packetStatsChange.transportWriteObserver(transportAttribution)),
 					recoveryOption,
 					sendAckTargetOption{target: ackTarget},
 				)
@@ -9238,7 +9524,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 			},
 		)
 		if sent {
-			transportAttribution.admit()
+			self.countReturnAdmitted(transportAttribution)
 		} else {
 			allSent = false
 			self.congestionDrops.addReturnSend(frameCount, ByteCount(packetBytes))
@@ -9408,8 +9694,7 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 		byteCount += ByteCount(len(fragment))
 	}
 	if r != SecurityPolicyResultAllow {
-		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
-		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.countBlockEgress(int64(len(fragments)), int64(byteCount))
 		self.recordProviderBlock(source.SourceId, false, len(fragments), byteCount)
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return false
@@ -9532,8 +9817,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		for _, packet := range packets {
 			blockedBytes += int64(len(packet))
 		}
-		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(packets)))
-		self.packetStatsCounters.blockEgressByteCount.Add(blockedBytes)
+		self.countBlockEgress(int64(len(packets)), blockedBytes)
 		self.recordProviderBlock(source.SourceId, false, len(packets), ByteCount(blockedBytes))
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
@@ -9735,8 +10019,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		}
 	}
 	if r != SecurityPolicyResultAllow {
-		self.packetStatsCounters.blockEgressPacketCount.Add(1)
-		self.packetStatsCounters.blockEgressByteCount.Add(int64(len(packet)))
+		self.countBlockEgress(1, int64(len(packet)))
 		self.recordProviderBlock(source.SourceId, false, 1, ByteCount(len(packet)))
 		self.publishProviderDiagnostics(source, transferKey, provideMode)
 		return
@@ -9917,8 +10200,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 							for _, fragment := range result.fragments {
 								fragmentByteCount += int64(len(fragment))
 							}
-							self.packetStatsCounters.blockIngressPacketCount.Add(int64(len(result.fragments)))
-							self.packetStatsCounters.blockIngressByteCount.Add(fragmentByteCount)
+							self.countBlockIngress(int64(len(result.fragments)), fragmentByteCount)
 							self.recordProviderBlock(
 								source.SourceId,
 								true,
@@ -9948,8 +10230,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 					&ipPath,
 					payload,
 				) == smtpEgressReject {
-					self.packetStatsCounters.blockIngressPacketCount.Add(1)
-					self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+					self.countBlockIngress(1, int64(len(packetBytes)))
 					self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
 					var afterResetRelease func()
 					if diagnosticsAfterReset == nil {
@@ -10022,8 +10303,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 						}
 					default:
 						// drop or incident: blocked by the provider security policy
-						self.packetStatsCounters.blockIngressPacketCount.Add(1)
-						self.packetStatsCounters.blockIngressByteCount.Add(int64(len(packetBytes)))
+						self.countBlockIngress(1, int64(len(packetBytes)))
 						self.recordProviderBlock(source.SourceId, true, 1, ByteCount(len(packetBytes)))
 						if r == SecurityPolicyResultIncident {
 							self.client.ReportAbuse(source)
@@ -10089,7 +10369,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 				},
 			)
 			if success {
-				self.packetStatsCounters.recordRemoteIngress(
+				self.countRemoteIngress(
 					peer.TransportType,
 					int64(len(packetGroup.packets)),
 					packetGroup.byteCount,
@@ -10109,7 +10389,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 							source, transferKey, provideMode, [][]byte{packet}, 0,
 							func() { self.releaseSourceLifecycle(source.SourceId, sourceLifecycle) },
 						) {
-							self.packetStatsCounters.recordRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))
+							self.countRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))
 							packetGroup.packets[i] = nil
 						}
 					}
@@ -11233,27 +11513,27 @@ type UserLimited interface {
 	Cancel()
 }
 
+// A flow's last activity, which the flow tables' LRU eviction and the shared
+// UDP idle reap read. Its reader and writer stamp it on every packet, so the
+// stamp is one store of monotonic nanoseconds (see monotonicNanos): one clock
+// read and no lock per packet, and a wall clock step cannot make a flow look
+// idle or fresh. Safe for concurrent use.
 type userLimited struct {
-	mutex            sync.Mutex
-	lastActivityTime time.Time
+	lastActivityNanos atomic.Int64
 }
 
 func newUserLimited() *userLimited {
-	return &userLimited{
-		lastActivityTime: time.Now(),
-	}
+	activity := &userLimited{}
+	activity.UpdateLastActivityTime()
+	return activity
 }
 
 func (self *userLimited) LastActivityTime() time.Time {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	return self.lastActivityTime
+	return monotonicEpoch.Add(time.Duration(self.lastActivityNanos.Load()))
 }
 
 func (self *userLimited) UpdateLastActivityTime() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	self.lastActivityTime = time.Now()
+	self.lastActivityNanos.Store(monotonicNanos())
 }
 
 const lruEvictionSampleSize = 32

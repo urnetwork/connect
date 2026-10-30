@@ -142,6 +142,17 @@ type DmcaSecurityPolicySettings struct {
 	// performs the eviction. 0 disables the scan (flows then persist until MaxFlows
 	// capacity-LRU eviction).
 	FlowTtl time.Duration
+	// How often the idle scan runs while it tracks flows, so an idle flow is
+	// reclaimed within FlowTtl plus this. With no flow tracked the scan parks
+	// until the next one is. The default is a quarter of the default FlowTtl;
+	// it does not follow a changed FlowTtl. Non-positive is a quarter of
+	// FlowTtl. It schedules reclamation and decides no verdict, so it is not
+	// part of the policy's identity (SecurityPolicyHash).
+	FlowScanInterval time.Duration `json:"-"`
+
+	// Tests count the idle scans. Runs on the scan goroutine; nil is a
+	// production no-op.
+	afterFlowScanForTest func()
 }
 
 func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
@@ -165,8 +176,9 @@ func DefaultDmcaSecurityPolicySettings() *DmcaSecurityPolicySettings {
 		// scaled by the memory budget: each tracked flow holds ~100-200
 		// bytes (state + map overhead), so the cap bounds the policy's
 		// worst case footprint per instance
-		MaxFlows: MemoryScaledCount(65536, 4096),
-		FlowTtl:  300 * time.Second,
+		MaxFlows:         MemoryScaledCount(65536, 4096),
+		FlowTtl:          300 * time.Second,
+		FlowScanInterval: 75 * time.Second,
 	}
 }
 
@@ -487,6 +499,10 @@ type dmcaDetector struct {
 	app         *appStandardDetector
 	perShardCap int
 	shards      [dmcaFlowShards]*dmcaFlowShard
+	// set while the idle scan is parked with no flow tracked; the next tracked
+	// flow wakes it
+	scanParked atomic.Bool
+	scanWake   chan struct{}
 }
 
 func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, web *webStandardDetector) *dmcaDetector {
@@ -503,6 +519,7 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 		web:         web,
 		app:         newAppStandardDetector(settings.App),
 		perShardCap: perShardCap,
+		scanWake:    make(chan struct{}, 1),
 	}
 	for i := range self.shards {
 		self.shards[i] = &dmcaFlowShard{
@@ -522,20 +539,62 @@ func newDmcaDetector(ctx context.Context, settings *DmcaSecurityPolicySettings, 
 	return self
 }
 
-// run periodically evicts flows whose last packet activity (sent or received) is older
-// than FlowTtl.
+// Evicts flows whose last packet activity (sent or received) is older than
+// FlowTtl, scanning every FlowScanInterval while it tracks flows. With none
+// tracked it parks until the next tracked flow wakes it, then scans an
+// interval later.
 func (self *dmcaDetector) run(ctx context.Context) {
-	scanInterval := self.settings.FlowTtl / 4
-	if scanInterval < 5*time.Second {
-		scanInterval = 5 * time.Second
+	scanInterval := self.settings.FlowScanInterval
+	if scanInterval <= 0 {
+		scanInterval = self.settings.FlowTtl / 4
 	}
+	scanTimer := time.NewTimer(scanInterval)
+	defer scanTimer.Stop()
 	for {
+		if !self.waitForFlows(ctx) {
+			return
+		}
+		scanTimer.Reset(scanInterval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(scanInterval):
-			self.evictIdle(time.Now())
+		case <-scanTimer.C:
 		}
+		self.evictIdle(time.Now())
+		if self.settings.afterFlowScanForTest != nil {
+			self.settings.afterFlowScanForTest()
+		}
+	}
+}
+
+// Parks the idle scan while no flow is tracked. False when ctx ends first.
+func (self *dmcaDetector) waitForFlows(ctx context.Context) bool {
+	for self.flowCount() == 0 {
+		self.scanParked.Store(true)
+		// counted again after the park is published: a flow tracked before it
+		// is seen here, and one tracked after it wakes the scan
+		if self.flowCount() == 0 {
+			select {
+			case <-ctx.Done():
+				self.scanParked.Store(false)
+				return false
+			case <-self.scanWake:
+			}
+		}
+		self.scanParked.Store(false)
+	}
+	return true
+}
+
+// Wakes a parked idle scan once a flow is tracked. One atomic load per new
+// flow, not per packet.
+func (self *dmcaDetector) flowTracked() {
+	if !self.scanParked.Load() {
+		return
+	}
+	select {
+	case self.scanWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -771,6 +830,7 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 	if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
 		// A SYN is the generation boundary. Serialize its replacement so a new
 		// connection cannot inherit a terminal verdict from tuple reuse.
+		tracked := false
 		shard.mu.Lock()
 		state = shard.flows[key]
 		if state == nil || !state.synSeen || state.synSequence != ipPath.SequenceNumber {
@@ -780,13 +840,18 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 				self.evictWithLock(shard)
 			}
 			shard.flows[key] = state
+			tracked = !replacing
 		}
 		shard.mu.Unlock()
+		if tracked {
+			self.flowTracked()
+		}
 	} else {
 		shard.mu.RLock()
 		state = shard.flows[key]
 		shard.mu.RUnlock()
 		if state == nil {
+			tracked := false
 			shard.mu.Lock()
 			state = shard.flows[key]
 			if state == nil {
@@ -794,8 +859,12 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 				state = createState()
 				self.evictWithLock(shard)
 				shard.flows[key] = state
+				tracked = true
 			}
 			shard.mu.Unlock()
+			if tracked {
+				self.flowTracked()
+			}
 		}
 	}
 	if ipPath.Protocol == IpProtocolTcp && ipPath.Fin {

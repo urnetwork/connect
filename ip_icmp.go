@@ -99,6 +99,12 @@ func parseIcmpPacket(ipVersion int, sourceIp net.IP, destinationIp net.IP, trans
 // The returned payload aliases an internal buffer and is valid only until the
 // next ReadEcho call. WriteEcho and ReadEcho may be called from one writer and
 // one reader goroutine concurrently.
+//
+// The flow passes each direction a lazily refreshed deadline (see
+// ioDeadline): the same value until less than half its timeout remains. A
+// socket backend installs a deadline only when the value changes, and a
+// passed deadline fails with an error whose Timeout() is true, so the flow can
+// tell an early expiry from a stall.
 type icmpEgress interface {
 	WriteEcho(deadline time.Time, ttl int, sequenceNumber uint16, payload []byte) error
 	ReadEcho(deadline time.Time) (sequenceNumber uint16, payload []byte, err error)
@@ -126,6 +132,12 @@ type IcmpBufferSettings struct {
 	// transactions per flow; requests over the cap drop, which ping
 	// tolerates
 	OutstandingLimit int
+
+	// Tests replace the platform echo backend. Nil is a production no-op.
+	newEgressForTest func(ctx context.Context, ipVersion int, destinationIp net.IP, settings *IcmpBufferSettings) (icmpEgress, error)
+	// Tests count the arms of a flow's idle timer. Runs on the flow's send
+	// loop; nil is a production no-op.
+	afterIdleTimerArmForTest func()
 }
 
 const defaultIcmpFlowBufferSize = 64
@@ -612,7 +624,7 @@ func newIcmpSequenceWithTransferKey(
 	destinationIp = slices.Clone(destinationIp)
 	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
-	return &IcmpSequence{
+	sequence := &IcmpSequence{
 		memory:             memory,
 		ctx:                cancelCtx,
 		cancel:             cancel,
@@ -629,10 +641,9 @@ func newIcmpSequenceWithTransferKey(
 		sourceIp:           sourceIp,
 		identifier:         identifier,
 		destinationIp:      destinationIp,
-		userLimited: userLimited{
-			lastActivityTime: time.Now(),
-		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 // the immutable ip path for this flow. the identifier stands in for the
@@ -768,7 +779,11 @@ func (self *IcmpSequence) Run() {
 	}()
 
 	self.log.V(2).Infof("[init]icmp connect\n")
-	egress, err := newIcmpEgress(self.ctx, self.ipVersion, self.destinationIp, self.icmpBufferSettings)
+	newEgress := newIcmpEgress
+	if self.icmpBufferSettings.newEgressForTest != nil {
+		newEgress = self.icmpBufferSettings.newEgressForTest
+	}
+	egress, err := newEgress(self.ctx, self.ipVersion, self.destinationIp, self.icmpBufferSettings)
 	if err != nil {
 		// fail soft: the platform cannot open an unprivileged echo socket,
 		// so the flow drops exactly as before icmp support
@@ -786,6 +801,13 @@ func (self *IcmpSequence) Run() {
 		defer childWorkers.Done()
 		defer self.cancel()
 
+		// the backend installs what this deadline passes it
+		var readAt time.Time
+		readDeadline := newIoDeadline(self.icmpBufferSettings.ReadTimeout, func(deadline time.Time) error {
+			readAt = deadline
+			return nil
+		})
+
 		for replyIter := uint64(0); ; replyIter += 1 {
 			select {
 			case <-self.ctx.Done():
@@ -793,7 +815,11 @@ func (self *IcmpSequence) Run() {
 			default:
 			}
 
-			sequenceNumber, payload, err := egress.ReadEcho(time.Now().Add(self.icmpBufferSettings.ReadTimeout))
+			readStart, _ := readDeadline.begin()
+			sequenceNumber, payload, err := egress.ReadEcho(readAt)
+			for err != nil && readDeadline.retry(readStart, err) {
+				sequenceNumber, payload, err = egress.ReadEcho(readAt)
+			}
 			if err != nil {
 				if self.log.V(1).Enabled() {
 					self.log.Infof("[r%d]icmp receive err = %s\n", replyIter, err)
@@ -814,15 +840,33 @@ func (self *IcmpSequence) Run() {
 		}
 	}, self.cancel)
 
-	// reusable idle timer: a per-iteration time.After would allocate a timer
-	// per packet and retain it for the whole idle timeout (hot-path timer
-	// reuse per CODESTYLE)
-	idleTimer := time.NewTimer(0)
+	// the backend installs what this deadline passes it
+	var writeAt time.Time
+	writeDeadline := newIoDeadline(self.icmpBufferSettings.WriteTimeout, func(deadline time.Time) error {
+		writeAt = deadline
+		return nil
+	})
+
+	// One idle timer for the loop's life, armed once rather than per request:
+	// a send moves lastSendNanos, and a fire before IdleTimeout has passed since
+	// it re-arms to that point, so a close is never early. The IdleCondition
+	// checkpoint taken after the last send still decides the close.
+	idleTimeout := self.icmpBufferSettings.IdleTimeout
+	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
+	armIdleTimer := func(timeout time.Duration) {
+		idleTimer.Reset(timeout)
+		if self.icmpBufferSettings.afterIdleTimerArmForTest != nil {
+			self.icmpBufferSettings.afterIdleTimerArmForTest()
+		}
+	}
+	if self.icmpBufferSettings.afterIdleTimerArmForTest != nil {
+		self.icmpBufferSettings.afterIdleTimerArmForTest()
+	}
+	lastSendNanos := monotonicNanos()
+	checkpointId := self.idleCondition.Checkpoint()
 
 	for sendIter := uint64(0); ; {
-		checkpointId := self.idleCondition.Checkpoint()
-		idleTimer.Reset(self.icmpBufferSettings.IdleTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -830,12 +874,21 @@ func (self *IcmpSequence) Run() {
 			if !ok {
 				return
 			}
+			writeStart, _ := writeDeadline.begin()
 			err := egress.WriteEcho(
-				time.Now().Add(self.icmpBufferSettings.WriteTimeout),
+				writeAt,
 				int(sendItem.icmp.ttl),
 				sendItem.icmp.sequenceNumber,
 				sendItem.icmp.payload,
 			)
+			for err != nil && writeDeadline.retry(writeStart, err) {
+				err = egress.WriteEcho(
+					writeAt,
+					int(sendItem.icmp.ttl),
+					sendItem.icmp.sequenceNumber,
+					sendItem.icmp.payload,
+				)
+			}
 			if err == nil {
 				self.UpdateLastActivityTime()
 				if self.log.V(2).Enabled() {
@@ -849,7 +902,13 @@ func (self *IcmpSequence) Run() {
 			if err != nil {
 				return
 			}
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
 		case <-idleTimer.C:
+			if remaining := time.Duration(lastSendNanos + int64(idleTimeout) - monotonicNanos()); 0 < remaining {
+				armIdleTimer(remaining)
+				continue
+			}
 			done := false
 			func() {
 				self.sendMutex.Lock()
@@ -863,7 +922,10 @@ func (self *IcmpSequence) Run() {
 				// close the sequence
 				return
 			}
-			// else there are pending updates
+			// else there are pending updates: a full window from now
+			lastSendNanos = monotonicNanos()
+			checkpointId = self.idleCondition.Checkpoint()
+			armIdleTimer(idleTimeout)
 		}
 	}
 }

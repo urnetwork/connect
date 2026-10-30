@@ -11,7 +11,8 @@ func TestProviderDatagramAckDetachedGraphFitsClaim(t *testing.T) {
 	// evidence and transport attribution table, not just its own struct.
 	known := unsafe.Sizeof(providerDatagramAck{}) + unsafe.Sizeof(preparedSendMemory{}) +
 		unsafe.Sizeof(sourceAckEvidence{}) + unsafe.Sizeof(transportPacketAttribution{}) +
-		unsafe.Sizeof(packetStatsCounters{}) + uintptr(len(TransportTypes()))*unsafe.Sizeof(PacketStats{})
+		unsafe.Sizeof(packetStatsCounters{}) + uintptr(len(TransportTypes()))*unsafe.Sizeof(PacketStats{}) +
+		unsafe.Sizeof(packetStatsChange{})
 	// One small map and the fixed producer/sequence wake channels. This is
 	// an explicit envelope, not a claim to measure the whole Go allocator.
 	const runtimeEnvelope = 512

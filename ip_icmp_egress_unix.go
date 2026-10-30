@@ -40,9 +40,12 @@ type icmpEgressConn struct {
 	// writer-goroutine state
 	lastTtl     int
 	writeBuffer []byte
+	// installed on the socket, so an unchanged deadline is not installed again
+	writeDeadline time.Time
 
 	// reader-goroutine state
-	readBuffer []byte
+	readBuffer   []byte
+	readDeadline time.Time
 }
 
 func newIcmpEgress(ctx context.Context, ipVersion int, destinationIp net.IP, settings *IcmpBufferSettings) (icmpEgress, error) {
@@ -127,7 +130,11 @@ func (self *icmpEgressConn) WriteEcho(deadline time.Time, ttl int, sequenceNumbe
 		binary.BigEndian.PutUint16(message[2:4], checksumFinish(checksumAdd(0, message)))
 	}
 
-	self.conn.SetWriteDeadline(deadline)
+	if !deadline.Equal(self.writeDeadline) {
+		if self.conn.SetWriteDeadline(deadline) == nil {
+			self.writeDeadline = deadline
+		}
+	}
 	_, err := self.conn.WriteTo(message, &net.UDPAddr{
 		IP: self.destinationIp,
 	})
@@ -135,8 +142,12 @@ func (self *icmpEgressConn) WriteEcho(deadline time.Time, ttl int, sequenceNumbe
 }
 
 func (self *icmpEgressConn) ReadEcho(deadline time.Time) (sequenceNumber uint16, payload []byte, err error) {
+	if !deadline.Equal(self.readDeadline) {
+		if self.conn.SetReadDeadline(deadline) == nil {
+			self.readDeadline = deadline
+		}
+	}
 	for {
-		self.conn.SetReadDeadline(deadline)
 		n, peer, readErr := self.conn.ReadFrom(self.readBuffer)
 		if readErr != nil {
 			return 0, nil, readErr

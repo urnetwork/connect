@@ -1,7 +1,7 @@
 package connect
 
 // The user-nat's upstream write deadline must bound ZERO-progress time, not
-// total batch time. See writeWithProgressDeadline.
+// total batch time. See ioDeadline.writeWithProgress.
 //
 // This is deliberately a unit test over a fake conn rather than a slow-socket
 // integration test: the discriminating window for a real socket sits between
@@ -64,10 +64,9 @@ func TestWriteProgressDeadlineSurvivesSlowPeer(t *testing.T) {
 	payload := make([]byte, 64*1024)
 	conn := &progressConn{acceptPerWrite: 4 * 1024}
 
-	n, err := writeWithProgressDeadline(
+	n, err := newIoDeadline(100*time.Millisecond, conn.SetWriteDeadline).writeWithProgress(
 		conn,
 		net.Buffers{payload},
-		100*time.Millisecond,
 	)
 	if err != nil {
 		t.Fatalf("a peer that keeps accepting data must not fail the flow: %s (wrote %d of %d)", err, n, len(payload))
@@ -89,10 +88,9 @@ func TestWriteProgressDeadlineFailsStalledPeer(t *testing.T) {
 	payload := make([]byte, 64*1024)
 	conn := &progressConn{acceptPerWrite: 4 * 1024, stalled: true}
 
-	n, err := writeWithProgressDeadline(
+	n, err := newIoDeadline(10*time.Millisecond, conn.SetWriteDeadline).writeWithProgress(
 		conn,
 		net.Buffers{payload},
-		10*time.Millisecond,
 	)
 	if err == nil {
 		t.Fatal("a peer accepting nothing for a full timeout must fail the flow")
