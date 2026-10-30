@@ -1500,20 +1500,22 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			HandleError(run, handlers...)
 		}()
 	}
+	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
+	// goroutine parked for the call: the callback starts only if the strategy
+	// is canceled first, and is then joined like a worker.
+	workerWaitGroup.Add(1)
+	stopStrategyCancel := context.AfterFunc(self.ctx, func() {
+		defer workerWaitGroup.Done()
+		handleCancel()
+	})
 	defer func() {
+		// true means the callback never started and now never will
+		if stopStrategyCancel() {
+			workerWaitGroup.Done()
+		}
 		handleCancel()
 		workerWaitGroup.Wait()
 	}()
-	// merge handleCtx with self.ctx
-	startWorker(func() {
-		defer handleCancel()
-		select {
-		case <-handleCtx.Done():
-			return
-		case <-self.ctx.Done():
-			return
-		}
-	}, handleCancel)
 
 	// E4: a cold start gives the network client a bounded moment to land its
 	// first feed sample, so the first dial can use the extenders it is about
@@ -1809,26 +1811,24 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 ) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	// The strategy-context bridge is function-owned; join it so even a fast
-	// successful serial result leaves no callback racing the caller's cleanup.
+	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
+	// goroutine parked for the call: the callback starts only if the strategy
+	// is canceled first. The bridge is function-owned; join a started callback
+	// so even a fast successful serial result leaves none racing the caller's
+	// cleanup.
 	var contextWaitGroup sync.WaitGroup
+	contextWaitGroup.Add(1)
+	stopStrategyCancel := context.AfterFunc(self.ctx, func() {
+		defer contextWaitGroup.Done()
+		handleCancel()
+	})
 	defer func() {
+		// true means the callback never started and now never will
+		if stopStrategyCancel() {
+			contextWaitGroup.Done()
+		}
 		handleCancel()
 		contextWaitGroup.Wait()
-	}()
-	// merge handleCtx with self.ctx
-	contextWaitGroup.Add(1)
-	go func() {
-		defer contextWaitGroup.Done()
-		HandleError(func() {
-			defer handleCancel()
-			select {
-			case <-handleCtx.Done():
-				return
-			case <-self.ctx.Done():
-				return
-			}
-		}, handleCancel)
 	}()
 
 	// A short hello can establish this operation without becoming lasting
