@@ -264,8 +264,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		BlackholeReceiveTimeout: 20 * time.Second,
 		// an evaluation cadence, not a liveness deadline; see the field
 		BlackholePollInterval: 1250 * time.Millisecond,
-		// an idle channel checks its carrier an eighth as often, so a carrier
-		// lost while nothing is sent retires within 70s instead of 60s
+		// a backstop only: every input an idle channel's verdicts wait on,
+		// its carrier included, wakes the parked loop when it changes
 		BlackholeIdlePollInterval: 10 * time.Second,
 		MaxFlowsPerExit:           16,
 		// Eligible affinity keeps its exit as it grows; expiration makes later
@@ -481,12 +481,17 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
-		// joiners and settings changes wake the prober, so the bound only
-		// covers an exit whose flows ended while its proof went stale
+		// joiners, settings changes and evictions wake the prober, and the
+		// recheck covers an exit held from a due probe, so the bound is a
+		// backstop
 		ProberScanMaxInterval: time.Minute,
 		// the joiner bound of the 5s scan this replaced: the exits a window
 		// forms with at the start of a session share one sweep
 		ProberJoinDelay: 5 * time.Second,
+		// the 5s scan this replaced, kept only while an exit is held from a
+		// due probe, so an exit whose flows end is re-probed as promptly as
+		// before the sleep
+		ProberRecheckInterval: 5 * time.Second,
 		// see the field comments
 		ProberAttemptMinInterval: time.Minute,
 		ProberReprobeInterval:    10 * time.Minute,
@@ -642,11 +647,12 @@ type MultiClientSettings struct {
 	// Must be positive.
 	BlackholePollInterval time.Duration
 	// BlackholeIdlePollInterval is how often the health loop of a channel
-	// holding none of that evidence wakes to check its carrier. Every verdict
-	// needs a send, and the first send of a run, an error and the channel's
-	// end each wake the loop at once, so an idle loop polls only for a
-	// carrier lost while nothing is sent: that carrier's retirement hold
-	// (StatsWindowKeepUnhealthyDuration) starts up to this much late.
+	// holding none of that evidence wakes anyway. Every verdict needs a send,
+	// and the first send of a run, an error, a change of the channel's
+	// carrier (RouteManager.ActiveTransportNotify) and the channel's end each
+	// wake the loop at once, so a carrier lost while nothing is sent starts
+	// its retirement hold (StatsWindowKeepUnhealthyDuration) at the loss, as
+	// it did when the loop judged every poll; this poll is only a backstop.
 	// Non-positive never parks: the loop judges every BlackholePollInterval.
 	BlackholeIdlePollInterval time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
@@ -1236,18 +1242,27 @@ type MultiClientSettings struct {
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
 	// ProberScanMaxInterval is the longest the prober sleeps between scans of
-	// the windows. It otherwise sleeps until the next exit falls due, and a
-	// window admitting an exit or a reliability settings change wakes it (see
-	// ProberJoinDelay), so this bounds only how late it notices what nothing
-	// signals: an exit whose flows ended, which the prober re-probes once its
-	// proof is stale and it is idle. Non-positive leaves the sleep unbounded.
+	// the windows. It otherwise sleeps until the next exit falls due; a window
+	// admitting an exit, a reliability settings change and a qualification
+	// record evicted from the table wake it (see ProberJoinDelay); and an exit
+	// held from a due probe is rechecked (see ProberRecheckInterval). So this
+	// is a backstop, not a detection bound. Non-positive leaves the sleep
+	// unbounded.
 	ProberScanMaxInterval time.Duration
-	// ProberJoinDelay is how long after a window admits an exit, or the
-	// reliability settings change, the prober scans. Exits admitted together
-	// share one sweep, whose result line tells a pool of bad providers from a
-	// phone that was away only when it judges them together. Non-positive
-	// scans at once.
+	// ProberJoinDelay is how long after a window admits an exit, the
+	// reliability settings change, or a qualification record is evicted, the
+	// prober scans. Exits admitted together share one sweep, whose result line
+	// tells a pool of bad providers from a phone that was away only when it
+	// judges them together. Non-positive scans at once.
 	ProberJoinDelay time.Duration
+	// How often the prober scans while an exit due for a probe is held from it
+	// by something whose end nothing signals: flows it carries (its traffic is
+	// the better evidence until they end), or its own pass still in flight
+	// past the attempt floor. Each such exit is then probed within this much
+	// of its hold ending, as the periodic scan the sleep replaced probed it,
+	// while an exit whose proof is fresh costs no scan before it falls due.
+	// Non-positive leaves the end of a hold to ProberScanMaxInterval.
+	ProberRecheckInterval time.Duration
 	// ProberAttemptMinInterval is the per-exit floor between probe pass
 	// attempts, keyed on the attempt rather than the recorded pass: a pass
 	// that sends nothing (transport refusing, every registration colliding)
@@ -19482,13 +19497,20 @@ func (self *multiClientChannel) detectBlackhole() {
 			}
 
 			// With no evidence left to judge, the carrier is all there is to
-			// watch: park, and check it each idle poll.
+			// watch, and its change wakes the loop: park. The carrier is read
+			// with its change subscribed in one step and before the evidence
+			// check, so a loss after either still wakes the parked loop.
 			pollInterval := self.settings.BlackholePollInterval
 			parked := false
+			var carrierChanged <-chan struct{}
 			if idlePollInterval := self.settings.BlackholeIdlePollInterval; 0 < idlePollInterval && !transportDown {
-				parked = self.parkIdleBlackhole(idleWake)
+				carrierUp, changed := self.carrierNotify()
+				if carrierUp {
+					parked = self.parkIdleBlackhole(idleWake)
+				}
 				if parked {
 					pollInterval = idlePollInterval
+					carrierChanged = changed
 				}
 			}
 			pollTimer.Reset(pollInterval)
@@ -19498,6 +19520,7 @@ func (self *multiClientChannel) detectBlackhole() {
 			case <-self.client.Done():
 				return
 			case <-idleWake:
+			case <-carrierChanged:
 			case <-pollTimer.C:
 			}
 			if parked {
@@ -19507,14 +19530,25 @@ func (self *multiClientChannel) detectBlackhole() {
 	}
 }
 
+// carrierNotify reads whether this channel's carrier is up, with a channel
+// that closes at its next change, in one step. A bare fixture channel has no
+// client, which reads as up (see hasActiveTransport) and never changes.
+func (self *multiClientChannel) carrierNotify() (bool, <-chan struct{}) {
+	if self.client == nil {
+		return true, nil
+	}
+	return self.client.RouteManager().ActiveTransportNotify()
+}
+
 // parkIdleBlackhole hands the health loop's wake to the channel when the
 // channel holds no evidence a verdict could mature on, and reports whether it
-// did. The caller has found the carrier up. Every verdict needs a send: one
-// outstanding (no-send-ack), one in the stats window (no-receive-ack), or an
-// unanswered connect, whose clock outlives the window (no-receive-syn). A
-// quarantine is judged every pass, and an error ends the loop. The check and
-// the handoff share the lock under which the first send of a run and the
-// first error signal the wake, so neither can land between them unseen.
+// did. The caller has found the carrier up and watches it for the loop
+// (carrierNotify). Every verdict needs a send: one outstanding (no-send-ack),
+// one in the stats window (no-receive-ack), or an unanswered connect, whose
+// clock outlives the window (no-receive-syn). A quarantine is judged every
+// pass, and an error ends the loop. The check and the handoff share the lock
+// under which the first send of a run and the first error signal the wake, so
+// neither can land between them unseen.
 func (self *multiClientChannel) parkIdleBlackhole(wake chan struct{}) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

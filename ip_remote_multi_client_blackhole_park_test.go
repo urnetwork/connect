@@ -155,11 +155,10 @@ func TestDetectBlackholeParkedChannelEndsOnError(t *testing.T) {
 	})
 }
 
-// A carrier lost while the loop is parked is found at the next idle poll, and
-// its retirement hold runs from there: the channel retires within
-// StatsWindowKeepUnhealthyDuration + BlackholeIdlePollInterval of the loss,
-// plus one poll. Before the loop parked, the bound was one poll tighter than
-// the hold plus a poll.
+// A carrier lost while the loop is parked wakes it, so its retirement hold
+// runs from the loss: the channel retires within one poll of
+// StatsWindowKeepUnhealthyDuration after the loss, as it did when the loop
+// judged every poll (caad1de6), and not up to an idle poll later.
 func TestDetectBlackholeParkedChannelRetiresLostCarrier(t *testing.T) {
 	// the shared pools start their workers outside the bubble
 	MessagePoolReturn(MessagePoolGet(1))
@@ -167,26 +166,84 @@ func TestDetectBlackholeParkedChannelRetiresLostCarrier(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		channel, transport, _, closeChannel := newParkingHealthTestChannel(ctx, cancel)
 		defer closeChannel()
-		pollInterval, idlePollInterval := healthPollIntervals(channel)
+		pollInterval, _ := healthPollIntervals(channel)
 		hold := channel.settings.StatsWindowKeepUnhealthyDuration
 		done, endTime := startParkingHealthLoop(channel)
-		time.Sleep(10 * pollInterval)
+		// parked, and off the poll grid
+		time.Sleep(10*pollInterval + pollInterval/2)
 		synctest.Wait()
 
 		lostTime := time.Now()
 		channel.client.RouteManager().RemoveTransport(transport)
-		time.Sleep(hold + idlePollInterval + pollInterval)
+		time.Sleep(hold + pollInterval)
 		synctest.Wait()
 		select {
 		case <-done:
 		default:
-			t.Fatalf("a carrier lost while parked was not retired within %s", hold+idlePollInterval+pollInterval)
+			t.Fatalf("a carrier lost while parked was not retired within %s", hold+pollInterval)
 		}
-		if elapsed := endTime().Sub(lostTime); elapsed < hold {
-			t.Fatalf("the channel retired %s after its carrier was lost, before the %s hold", elapsed, hold)
+		if elapsed := endTime().Sub(lostTime); elapsed < hold || hold+pollInterval < elapsed {
+			t.Fatalf("the channel retired %s after its carrier was lost, want within one poll of the %s hold", elapsed, hold)
 		}
 		if err := healthParkTestEndErr(channel); err != errTransportDownTimeout {
 			t.Fatalf("the channel ended with %v, want %v", err, errTransportDownTimeout)
+		}
+	})
+}
+
+// A carrier that drops and returns while the channel is idle is judged on
+// both edges within one poll, as before the loop parked: the drop wakes the
+// parked loop, the loop judges every poll while the carrier is down, so the
+// return rebases the verdict clocks on time, and then the loop parks again.
+func TestDetectBlackholeParkedChannelFollowsACarrierFlap(t *testing.T) {
+	// the shared pools start their workers outside the bubble
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		channel, transport, passes, closeChannel := newParkingHealthTestChannel(ctx, cancel)
+		defer closeChannel()
+		log := newRecordingLogger()
+		channel.log = log
+		pollInterval, idlePollInterval := healthPollIntervals(channel)
+		done, _ := startParkingHealthLoop(channel)
+		time.Sleep(10*pollInterval + pollInterval/2)
+		synctest.Wait()
+
+		before := passes.Load()
+		route := make(Route, 64)
+		defer func() {
+			for 0 < len(route) {
+				MessagePoolReturn(<-route)
+			}
+		}()
+		channel.client.RouteManager().RemoveTransport(transport)
+		synctest.Wait()
+		if passes.Load() == before || len(log.linesWith("transport down")) != 1 {
+			t.Fatal("a carrier lost while parked did not wake the health loop")
+		}
+
+		time.Sleep(2*pollInterval + pollInterval/2)
+		channel.client.RouteManager().UpdateTransport(transport, []Route{route})
+		time.Sleep(pollInterval)
+		synctest.Wait()
+		if len(log.linesWith("transport restored")) != 1 {
+			t.Fatalf("a carrier that returned was not judged within one poll")
+		}
+
+		// parked again
+		time.Sleep(2 * pollInterval)
+		synctest.Wait()
+		idle := 100 * pollInterval
+		before = passes.Load()
+		time.Sleep(idle)
+		synctest.Wait()
+		if n, most := passes.Load()-before, int64(idle/idlePollInterval)+1; most < n {
+			t.Fatalf("the health loop judged %d times over %s after its carrier returned, want at most %d", n, idle, most)
+		}
+		select {
+		case <-done:
+			t.Fatal("the health loop ended over a carrier flap")
+		default:
 		}
 	})
 }

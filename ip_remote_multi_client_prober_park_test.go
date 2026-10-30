@@ -164,7 +164,8 @@ func TestProberWakesForASettingsChange(t *testing.T) {
 }
 
 // The plan's next due time agrees with its picks: a candidate it passes over
-// is not picked an instant before its due time and is picked at it.
+// is not picked an instant before its due time and is picked at it, unless
+// its flows hold it, and then it is rechecked from its due time on.
 func TestProberPlanNextDue(t *testing.T) {
 	now := time.Now()
 	settings := DefaultMultiClientSettings()
@@ -189,15 +190,18 @@ func TestProberPlanNextDue(t *testing.T) {
 				lastProbeAt:   now.Add(-settings.ProberReprobeInterval + 2*settings.ProberAttemptMinInterval),
 			},
 			now.Add(2 * settings.ProberAttemptMinInterval)},
-		{"loaded and stale waits on its flows, not a time",
+		{"loaded waits for its due time",
 			proberCandidate{flowCount: 3, lastProbeAt: now.Add(-time.Minute), qualifiedAt: now.Add(-QualificationMaxAge - time.Second)},
-			time.Time{}},
+			now.Add(-time.Minute + settings.ProberReprobeInterval)},
+		{"loaded past its due time is rechecked",
+			proberCandidate{flowCount: 3, lastProbeAt: now.Add(-settings.ProberReprobeInterval - time.Second), qualifiedAt: now.Add(-QualificationMaxAge - time.Second)},
+			now.Add(settings.ProberRecheckInterval)},
 		{"in flight waits on its attempt floor",
 			proberCandidate{inFlight: true, lastAttemptAt: now.Add(-time.Second)},
 			now.Add(-time.Second + settings.ProberAttemptMinInterval)},
-		{"in flight past its floor waits on nothing",
+		{"in flight past its floor is rechecked",
 			proberCandidate{inFlight: true, lastAttemptAt: now.Add(-2 * settings.ProberAttemptMinInterval)},
-			time.Time{}},
+			now.Add(settings.ProberRecheckInterval)},
 		{"picked now falls due again at its floor",
 			proberCandidate{},
 			now.Add(settings.ProberAttemptMinInterval)},
@@ -208,8 +212,9 @@ func TestProberPlanNextDue(t *testing.T) {
 			t.Errorf("%s: due %v, want %v", c.name, due, c.due)
 			continue
 		}
-		// a candidate passed over is picked exactly at its due time
-		if due.IsZero() || c.candidate.inFlight || c.candidate == (proberCandidate{}) {
+		// a candidate passed over is picked exactly at its due time; one its
+		// flows or its pass hold is never picked
+		if due.IsZero() || c.candidate.inFlight || 0 < c.candidate.flowCount || c.candidate == (proberCandidate{}) {
 			continue
 		}
 		if picks, _ := proberPlan(due.Add(-time.Nanosecond), []proberCandidate{c.candidate}, settings); len(picks) != 0 {
@@ -224,10 +229,25 @@ func TestProberPlanNextDue(t *testing.T) {
 	_, due := proberPlan(now, []proberCandidate{
 		{lastProbeAt: now, qualifiedAt: now},
 		{lastAttemptAt: now.Add(-time.Second)},
-		{flowCount: 1, lastProbeAt: now.Add(-time.Hour)},
+		{flowCount: 1, lastProbeAt: now, qualifiedAt: now},
 	}, settings)
 	if want := now.Add(-time.Second + settings.ProberAttemptMinInterval); !due.Equal(want) {
 		t.Errorf("due %v across candidates, want the earliest %v", due, want)
+	}
+
+	// a recheck is a wait like any other
+	held := []proberCandidate{
+		{lastAttemptAt: now.Add(-time.Second)},
+		{flowCount: 1, lastProbeAt: now.Add(-time.Hour)},
+	}
+	if _, due := proberPlan(now, held, settings); !due.Equal(now.Add(settings.ProberRecheckInterval)) {
+		t.Errorf("due %v with a held candidate, want its recheck at %v", due, now.Add(settings.ProberRecheckInterval))
+	}
+	// and with the recheck off, the hold's end is left to the scan bound
+	noRecheck := *settings
+	noRecheck.ProberRecheckInterval = 0
+	if _, due := proberPlan(now, held, &noRecheck); !due.Equal(now.Add(-time.Second + settings.ProberAttemptMinInterval)) {
+		t.Errorf("due %v with the recheck off, want the attempt floor %v", due, now.Add(-time.Second+settings.ProberAttemptMinInterval))
 	}
 }
 
@@ -251,4 +271,138 @@ func TestWindowsWakeTheProberOnAdmission(t *testing.T) {
 	if n := strings.Count(constructor, "multiClient.clientAdded,"); n != 2 {
 		t.Errorf("the parent hands its admission callback to %d windows, want both", n)
 	}
+}
+
+// The bound the periodic scan the sleep replaced kept: caad1de6 scanned every
+// 5s (proberScanInterval), so whatever made an exit due was acted on within
+// that, however it came about.
+const proberPreSleepScanInterval = 5 * time.Second
+
+// The default-level line of a scan that scheduled probe passes.
+const proberSweepLinePrefix = "event=probe_sweep scheduled="
+
+// The prober over one idle exit whose proof is as fresh as the fixture's,
+// with the default-level lines recorded. A pass on the exit ends at once,
+// since the exit is already done: these tests watch the plan, not the probe.
+// The returned func moves the exit between loaded and idle, as its first flow
+// attaching and its last one ending do.
+func newOneExitProberTestMultiClient(ctx context.Context, cancel context.CancelFunc) (*RemoteUserNatMultiClient, *recordingLogger, func(bool)) {
+	multiClient := newIdleProberTestMultiClient(ctx, cancel, 1)
+	log := newRecordingLogger()
+	multiClient.log = log
+	var exit *multiClientChannel
+	for _, client := range multiClient.windows[WindowTypeQuality].clients {
+		exit = client
+	}
+	exitCtx, exitCancel := context.WithCancel(ctx)
+	exitCancel()
+	exit.ctx = exitCtx
+	setLoaded := func(loaded bool) {
+		multiClient.stateLock.Lock()
+		defer multiClient.stateLock.Unlock()
+		if loaded {
+			multiClient.clientUpdates[exit] = map[*multiClientChannelUpdate]bool{{}: true}
+		} else {
+			delete(multiClient.clientUpdates, exit)
+		}
+	}
+	return multiClient, log, setLoaded
+}
+
+// Runs the prober until the returned func cancels it and waits for it.
+func startProberForTest(multiClient *RemoteUserNatMultiClient, cancel context.CancelFunc) func() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		multiClient.runProber()
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// An exit whose re-probe falls due while it carries flows is passed over, its
+// traffic being the better evidence, and is re-probed within the pre-sleep
+// scan interval of its flows ending: nothing signals that end.
+func TestProberReprobesAnExitWithinTheScanIntervalOfItsFlowsEnding(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		multiClient, log, setLoaded := newOneExitProberTestMultiClient(ctx, cancel)
+		setLoaded(true)
+		// past both the proof's age and the re-probe interval
+		dueAt := multiClient.qualification[MultiHopId{}].qualifiedAt.Add(QualificationMaxAge)
+		defer startProberForTest(multiClient, cancel)()
+
+		// the flows end off any scan grid, well past the due time
+		time.Sleep(time.Until(dueAt) + 2*proberPreSleepScanInterval + proberPreSleepScanInterval/2)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); 0 < len(lines) {
+			t.Fatalf("the prober probed an exit carrying flows: %v", lines)
+		}
+
+		setLoaded(false)
+		time.Sleep(proberPreSleepScanInterval)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); len(lines) != 1 {
+			t.Fatalf("an exit whose flows ended past its due was probed by %d sweeps within %s, want 1", len(lines), proberPreSleepScanInterval)
+		}
+	})
+}
+
+// An exit carrying flows whose proof is still fresh costs no scan before it
+// falls due: the prober sleeps as long as it does over idle exits.
+func TestProberSleepsWhileALoadedExitIsFresh(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		multiClient, _, setLoaded := newOneExitProberTestMultiClient(ctx, cancel)
+		setLoaded(true)
+		scanCount := &atomic.Int64{}
+		multiClient.proberScanForTest = func() {
+			scanCount.Add(1)
+		}
+		maxInterval := multiClient.settings.ProberScanMaxInterval
+		defer startProberForTest(multiClient, cancel)()
+
+		idle := QualificationMaxAge / 2
+		time.Sleep(idle)
+		synctest.Wait()
+		if n, most := scanCount.Load(), int64(idle/maxInterval)+1; most < n {
+			t.Fatalf("the prober scanned %d times over %s with a fresh loaded exit, want at most %d", n, idle, most)
+		}
+	})
+}
+
+// A live exit whose qualification record is evicted from the full table is
+// unprobed again, so due at once, and is probed within the pre-sleep scan
+// interval rather than at the next bound: nothing else marks it due.
+func TestProberProbesAnExitWhoseRecordIsEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		multiClient, log, _ := newOneExitProberTestMultiClient(ctx, cancel)
+		// as the constructor makes it
+		multiClient.proberWake = make(chan struct{}, 1)
+		defer startProberForTest(multiClient, cancel)()
+
+		// off any scan grid, with the exit's proof fresh
+		time.Sleep(multiClient.settings.ProberScanMaxInterval + proberPreSleepScanInterval/2)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); 0 < len(lines) {
+			t.Fatalf("the prober probed an exit with a fresh proof: %v", lines)
+		}
+
+		// the providers probed since fill the table past its cap, and the
+		// exit's record is the oldest
+		for range qualificationMaxEntries {
+			multiClient.recordProbePass(RequireMultiHopId(NewId()))
+		}
+		if _, _, passIndex := multiClient.qualificationSnapshot(MultiHopId{}); passIndex != 0 {
+			t.Fatal("the exit's record was not evicted")
+		}
+		time.Sleep(proberPreSleepScanInterval)
+		synctest.Wait()
+		if lines := log.linesWith(proberSweepLinePrefix); len(lines) != 1 {
+			t.Fatalf("an exit whose record was evicted was probed by %d sweeps within %s, want 1", len(lines), proberPreSleepScanInterval)
+		}
+	})
 }
