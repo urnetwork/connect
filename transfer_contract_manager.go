@@ -364,6 +364,9 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		OriginContractLinger: 300 * time.Second,
 
 		ContractQueueExpireTimeout: 120 * time.Second,
+		// the age cutoff passes every 60s; with it disabled, a signed
+		// deadline is applied at most a minute late
+		ContractQueueExpireInterval: 60 * time.Second,
 
 		ContractStatsEpoch: 1 * time.Second,
 
@@ -443,6 +446,14 @@ type ContractManagerSettings struct {
 	// window (5 minutes). <= 0 disables enqueue-age expiry; signed absolute
 	// deadlines always apply.
 	ContractQueueExpireTimeout time.Duration
+	// The longest wait between passes of the expiry worker while contracts are
+	// queued; enqueue-age expiry shortens it to ContractQueueExpireTimeout/2. A
+	// queued contract closes within one pass of its age cutoff or its signed
+	// deadline, and the worker parks while nothing is queued. Non-positive
+	// leaves only the age-expiry cadence; with that disabled too, a signed
+	// deadline applies when a sequence polls the queue, and shutdown closes
+	// the rest.
+	ContractQueueExpireInterval time.Duration
 
 	// the epoch for emitting open contract usage events to
 	// `AddContractStatsCallback` listeners
@@ -550,6 +561,9 @@ type ContractManager struct {
 	// Protected by mutex. Contract-free clients need no expiry worker; once
 	// a contract is queued, the worker remains owned through its final flush.
 	contractExpiryStarted bool
+	// Raised under mutex by each queued contract; wakes a parked expiry
+	// worker (see expireQueuedContracts).
+	contractExpiryWake chan struct{}
 
 	receiveNoContractClientIds map[Id]bool
 	sendNoContractClientIds    map[Id]bool
@@ -597,6 +611,8 @@ type ContractManager struct {
 	beforeCloseWaitForTest             func()
 	// Observes each wake of the contract stats epoch worker.
 	contractStatsWakeForTest func()
+	// Observes each pass of the queued contract expiry worker.
+	contractExpiryWakeForTest func()
 	// Nil in production; exposes completed original creation before route selection.
 	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
 	// Nil test barriers expose shutdown before retry admission and first send.
@@ -641,6 +657,7 @@ func NewContractManager(
 		providePaused:                   false,
 		provideMonitor:                  NewMonitor(),
 		destinationContracts:            map[ContractKey]*contractQueue{},
+		contractExpiryWake:              make(chan struct{}, 1),
 		receiveNoContractClientIds:      receiveNoContractClientIds,
 		sendNoContractClientIds:         sendNoContractClientIds,
 		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
@@ -777,13 +794,19 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 // queue (`FlushContractQueue` force-remove) re-creates the queue entry, and if
 // that destination is never used again (provider rotation) the entry would
 // otherwise be retained forever.
+//
+// It arms one timer for its life. A pass that leaves `destinationContracts`
+// empty parks the worker until `addContractToQueue` queues a contract, and
+// passes resume an interval after that wake, so an idle manager costs no
+// wakeups and a contract queued after the park still closes within its age
+// cutoff or signed deadline plus one interval.
 func (self *ContractManager) expireQueuedContracts() {
 	timeout := self.settings.ContractQueueExpireTimeout
 	// Absolute deadlines still retire idle reservations when enqueue-age
 	// expiry is disabled. Poll independently enforces the exact deadline.
-	interval := time.Minute
-	if 0 < timeout {
-		interval = max(time.Nanosecond, min(interval, timeout/2))
+	interval := self.settings.ContractQueueExpireInterval
+	if 0 < timeout && (interval <= 0 || timeout/2 < interval) {
+		interval = max(time.Nanosecond, timeout/2)
 	}
 
 	// the contract manager is closing: close all still-queued (pending)
@@ -812,6 +835,30 @@ func (self *ContractManager) expireQueuedContracts() {
 		}
 	}
 
+	// nil, never ready, when there are no periodic passes
+	var passDue <-chan time.Time
+	var passTimer *time.Timer
+	if 0 < interval {
+		passTimer = time.NewTimer(interval)
+		defer passTimer.Stop()
+		passDue = passTimer.C
+	}
+	// Whether nothing is queued. The wake a queued contract raised is taken
+	// under the same lock, so only a contract queued after this check, which
+	// raises it again, can end the park.
+	parked := func() bool {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if len(self.destinationContracts) != 0 {
+			return false
+		}
+		select {
+		case <-self.contractExpiryWake:
+		default:
+		}
+		return true
+	}
+
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -822,7 +869,10 @@ func (self *ContractManager) expireQueuedContracts() {
 			// is the shutdown signal
 			finalFlush()
 			return
-		case <-time.After(interval):
+		case <-passDue:
+		}
+		if self.contractExpiryWakeForTest != nil {
+			self.contractExpiryWakeForTest()
 		}
 
 		var minEnqueueTime time.Time
@@ -837,6 +887,19 @@ func (self *ContractManager) expireQueuedContracts() {
 			// close outside the manager mutex: CloseContract re-takes it
 			self.closeContracts(expired)
 		}
+
+		if parked() {
+			select {
+			case <-self.ctx.Done():
+				finalFlush()
+				return
+			case <-self.client.Done():
+				finalFlush()
+				return
+			case <-self.contractExpiryWake:
+			}
+		}
+		passTimer.Reset(interval)
 	}
 }
 
@@ -1547,6 +1610,14 @@ func (self *ContractManager) TakeContract(
 	defer self.closeContractQueue(contractKey, contractQueue)
 
 	enterTime := time.Now()
+	// One timer for the call's deadline, armed at its first wait. A queue
+	// notification that brings no contract leaves it armed.
+	var timeoutTimer *time.Timer
+	defer func() {
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+	}()
 	for {
 		notify := contractQueue.updateMonitor.NotifyChannel()
 		var minEnqueueTime time.Time
@@ -1609,13 +1680,16 @@ func (self *ContractManager) TakeContract(
 			if remainingTimeout <= 0 {
 				return nil
 			}
+			if timeoutTimer == nil {
+				timeoutTimer = time.NewTimer(remainingTimeout)
+			}
 			select {
 			case <-self.ctx.Done():
 				return nil
 			case <-ctx.Done():
 				return nil
 			case <-notify:
-			case <-time.After(remainingTimeout):
+			case <-timeoutTimer.C:
 				return nil
 			}
 		}
@@ -1710,6 +1784,11 @@ func (self *ContractManager) addContractToQueue(
 		// This admission shares Close's lock, so a successfully queued result
 		// always has a joined final-flush owner, even when expiry is disabled.
 		self.contractExpiryStarted = self.startWorker("contract expiry", self.expireQueuedContracts)
+	}
+	// a parked expiry worker resumes its passes
+	select {
+	case self.contractExpiryWake <- struct{}{}:
+	default:
 	}
 	return nil
 }

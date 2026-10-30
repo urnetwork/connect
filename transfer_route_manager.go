@@ -3400,8 +3400,11 @@ func (self *MultiRouteSelector) readWithCarrier(
 ) ([]byte, transferReceiveDisposition, error) {
 	self.readMutex.Lock()
 	defer self.readMutex.Unlock()
+	// A negative timeout waits with no timer. Only a call that armed the
+	// timer stops it, so a read served without blocking touches no timer.
+	readTimerArmed := false
 	defer func() {
-		if self.readTimer != nil {
+		if readTimerArmed {
 			self.readTimer.Stop()
 		}
 	}()
@@ -3463,6 +3466,7 @@ func (self *MultiRouteSelector) readWithCarrier(
 					return nil, transferReceiveDisposition{}, nil
 				}
 				timeoutChan = resetOrCreateTimer(&self.readTimer, remainingTimeout)
+				readTimerArmed = true
 			}
 			select {
 			case <-ctx.Done():
@@ -3544,6 +3548,7 @@ func (self *MultiRouteSelector) readWithCarrier(
 			} else {
 				// add a timeout case
 				timeoutChan := resetOrCreateTimer(&self.readTimer, remainingTimeout)
+				readTimerArmed = true
 				selectCases = append(selectCases, reflect.SelectCase{
 					Dir:  reflect.SelectRecv,
 					Chan: reflect.ValueOf(timeoutChan),
