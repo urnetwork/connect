@@ -116,7 +116,11 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 			if len(payload) != 0 {
 				owned = MessagePoolCopy(payload)
 			}
-			if self.returnHead == len(self.returnChunks) {
+			// The first retained chunk starts the resend deadline. Later
+			// chunks leave it at the oldest chunk's progress, so only the
+			// first wakes the recovery goroutine to arm it.
+			first := self.returnHead == len(self.returnChunks)
+			if first {
 				self.returnChunks = self.returnChunks[:0]
 				self.returnHead = 0
 				self.returnProgressTime = time.Now()
@@ -132,7 +136,9 @@ func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin boo
 			}
 			self.returnChunks = append(self.returnChunks, tcpReturnChunk{start: start, end: end, payload: owned, charge: charge, fin: fin})
 			self.returnByteCount += charge
-			self.signalReturnRecoveryWithLock()
+			if first {
+				self.signalReturnRecoveryWithLock()
+			}
 			self.mutex.Unlock()
 			return true
 		}
@@ -158,11 +164,18 @@ func (self *TcpSequence) signalReturnRecoveryWithLock() {
 }
 
 // Called only after the ACK was validated against the emitted sequence range.
+//
+// An advancing ACK is progress, which moves the resend deadline later; the
+// recovery goroutine finds the new deadline when its armed timer fires, so an
+// ordinary ACK costs it no wake. It is woken only when the deadline moves
+// earlier: an ACK that resets a backed-off delay, one that readies the next
+// replay of a recovery, or the third duplicate.
 func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 	if self.returnHead == len(self.returnChunks) {
 		return
 	}
 	if ack != self.receiveSeqAck {
+		backedOff := 0 < self.returnAttempts
 		self.returnDuplicateAcks = 0
 		self.returnAttempts = 0
 		self.returnProgressTime = time.Now()
@@ -194,7 +207,9 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 		case self.returnCapacity <- struct{}{}:
 		default:
 		}
-		self.signalReturnRecoveryWithLock()
+		if backedOff || self.returnRecoveryReady {
+			self.signalReturnRecoveryWithLock()
+		}
 	} else if self.returnDuplicateAcks < 3 {
 		self.returnDuplicateAcks++
 		if self.returnDuplicateAcks == 3 {
@@ -320,6 +335,9 @@ func (self *TcpSequence) runReturnRecovery() {
 			return
 		case <-self.returnWake:
 		case <-timeout:
+		}
+		if self.afterReturnRecoveryWakeForTest != nil {
+			self.afterReturnRecoveryWakeForTest()
 		}
 	}
 }

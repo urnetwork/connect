@@ -5090,6 +5090,9 @@ type TcpSequence struct {
 	// the burst-end trigger wakes on the quiescence cadence rather than per
 	// arrival (THROUGHPUTFIX §26.10). Nil is a production no-op.
 	afterAckWaitWakeForTest func()
+	// Counts the return recovery goroutine's wakes from its wait. Set before
+	// the goroutine starts; nil is a production no-op.
+	afterReturnRecoveryWakeForTest func()
 	// Tests join the pure-acknowledgement worker before inspecting ownership. Nil is a
 	// production no-op.
 	afterPureAckWorkerStopForTest func()
