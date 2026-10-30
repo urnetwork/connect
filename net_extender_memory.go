@@ -120,6 +120,14 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	transport := &PlatformTransport{settings: settings}
 	config := newPlatformQuicConfig(settings, 1)
 	config.HandshakeIdleTimeout = connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout
+	if owned {
+		// The platform transport above pings over this carrier's one request
+		// stream, and its ping is stream data that keeps the connection inside
+		// MaxIdleTimeout, so a QUIC PING every PingTimeout would be a second
+		// keepalive. A standalone feed, API or probe dial has no ping of its
+		// own and keeps the QUIC one.
+		config.KeepAlivePeriod = 0
+	}
 	// the offer is the dial's, not the platform transport's that sized the
 	// windows: an extender carrier crosses the filter in the clear (A13)
 	config.Versions = connectSettings.QuicVersionPolicy.Versions()
