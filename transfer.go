@@ -642,9 +642,10 @@ func DefaultClientSettings() *ClientSettings {
 
 func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 	settings := &ClientSettings{
-		SendBufferSize:          bufferSize,
-		ForwardBufferSize:       bufferSize,
-		ReadTimeout:             30 * time.Second,
+		SendBufferSize:    bufferSize,
+		ForwardBufferSize: bufferSize,
+		// a timed-out read only loops (see ReadTimeout)
+		ReadTimeout:             time.Duration(-1),
 		BufferTimeout:           15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
 		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
@@ -1594,8 +1595,13 @@ type ClientSettings struct {
 
 	SendBufferSize    int
 	ForwardBufferSize int
-	ReadTimeout       time.Duration
-	BufferTimeout     time.Duration
+	// bounds each wait of the receive loop on the client's routes. A read
+	// that times out returns no frame and the loop reads again, so a timeout
+	// only adds a timer per inbound frame and a wake per interval; context
+	// cancellation and route changes end a wait without one. Negative, the
+	// default, waits with no timeout.
+	ReadTimeout   time.Duration
+	BufferTimeout time.Duration
 	// if 0, the client will not send control pings
 	ControlPingTimeout time.Duration
 	// NetworkQualityNotificationRetryInterval is how long the client waits
