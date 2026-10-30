@@ -10,8 +10,11 @@ import (
 // contract stats surface per-contract usage from the send and receive sequences
 // without per-packet dispatch. open contracts register an entry whose used byte
 // count the owning sequence updates with an atomic store on debit/ack. an epoch
-// worker (started on the first callback) snapshots the registry every
-// `ContractStatsEpoch` and emits events only for contracts that changed.
+// worker (started on the first callback) snapshots the registry an epoch after a
+// change and emits events only for contracts that changed. Registering, moving
+// or closing a contract raises one change flag; with nothing changed for a whole
+// epoch the worker parks until the flag rises again, so an idle client costs no
+// epoch wakeups.
 
 type ContractStatsEvent struct {
 	ContractId Id
@@ -199,6 +202,8 @@ type contractStatsEntry struct {
 	// stored by the owning sequence on debit/ack
 	usedByteCount atomic.Int64
 	closed        atomic.Bool
+	// the manager whose epoch worker reports this entry; nil for a bare entry
+	owner *ContractManager
 
 	// owned by the epoch worker
 	emittedUsedByteCount ByteCount
@@ -207,6 +212,22 @@ type contractStatsEntry struct {
 
 func (self *contractStatsEntry) updateUsedByteCount(usedByteCount ByteCount) {
 	self.usedByteCount.Store(int64(usedByteCount))
+	if self.owner != nil {
+		self.owner.contractStatsChange()
+	}
+}
+
+// contractStatsChange marks the registry changed and wakes a parked epoch
+// worker. Once the flag is up it costs one atomic load, so the debit/ack path
+// pays nothing more while a transfer moves.
+func (self *ContractManager) contractStatsChange() {
+	if self.contractStatsChanged.Load() || !self.contractStatsChanged.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.contractStatsWake <- struct{}{}:
+	default:
+	}
 }
 
 // register adds an entry for an open contract and returns it.
@@ -224,11 +245,16 @@ func (self *ContractManager) registerContractStats(
 		companion:         companion,
 		path:              path,
 		transferByteCount: transferByteCount,
+		owner:             self,
 	}
 
-	self.contractStatsLock.Lock()
-	defer self.contractStatsLock.Unlock()
-	self.contractStatsEntries[contractStatsKey{contractId: contractId, receive: receive}] = entry
+	func() {
+		self.contractStatsLock.Lock()
+		defer self.contractStatsLock.Unlock()
+		self.contractStatsEntries[contractStatsKey{contractId: contractId, receive: receive}] = entry
+	}()
+	// a new contract is reported once even before it moves
+	self.contractStatsChange()
 	return entry
 }
 
@@ -236,17 +262,24 @@ func (self *ContractManager) registerContractStats(
 // the entry emits a final closed event and is removed by the epoch worker,
 // or removed immediately when the worker never started
 func (self *ContractManager) closeContractStats(contractId Id) {
-	self.contractStatsLock.Lock()
-	defer self.contractStatsLock.Unlock()
-	for _, receive := range []bool{false, true} {
-		key := contractStatsKey{contractId: contractId, receive: receive}
-		if entry, ok := self.contractStatsEntries[key]; ok {
-			if self.contractStatsStarted {
-				entry.closed.Store(true)
-			} else {
-				delete(self.contractStatsEntries, key)
+	closed := false
+	func() {
+		self.contractStatsLock.Lock()
+		defer self.contractStatsLock.Unlock()
+		for _, receive := range []bool{false, true} {
+			key := contractStatsKey{contractId: contractId, receive: receive}
+			if entry, ok := self.contractStatsEntries[key]; ok {
+				if self.contractStatsStarted {
+					entry.closed.Store(true)
+					closed = true
+				} else {
+					delete(self.contractStatsEntries, key)
+				}
 			}
 		}
+	}()
+	if closed {
+		self.contractStatsChange()
 	}
 }
 
@@ -266,6 +299,9 @@ func (self *ContractManager) AddContractStatsCallback(contractStatsCallback Cont
 		defer self.contractStatsLock.Unlock()
 		if !self.contractStatsStarted {
 			self.contractStatsStarted = true
+			// the first epoch reports the contracts registered before the
+			// worker started
+			self.contractStatsChanged.Store(true)
 			self.startWorker("contract stats", self.runContractStats)
 		}
 	}()
@@ -275,7 +311,13 @@ func (self *ContractManager) AddContractStatsCallback(contractStatsCallback Cont
 	}
 }
 
+// runContractStats emits an epoch after each change. It arms one timer for its
+// life. An epoch with no change parks the worker until the next change wakes
+// it, and the emit then follows one epoch later, so events keep their epoch
+// pacing while an idle client costs no wakeups.
 func (self *ContractManager) runContractStats() {
+	epochTimer := time.NewTimer(self.settings.ContractStatsEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -285,9 +327,24 @@ func (self *ContractManager) runContractStats() {
 			// still attached); this only covers other exit paths.
 			self.emitContractStats()
 			return
-		case <-time.After(self.settings.ContractStatsEpoch):
+		case <-epochTimer.C:
 		}
-		self.emitContractStats()
+		if self.contractStatsWakeForTest != nil {
+			self.contractStatsWakeForTest()
+		}
+		// take the flag before reading the entries, so a change that lands
+		// during this pass raises it for the next one
+		if self.contractStatsChanged.Swap(false) {
+			self.emitContractStats()
+		} else {
+			select {
+			case <-self.ctx.Done():
+				self.emitContractStats()
+				return
+			case <-self.contractStatsWake:
+			}
+		}
+		epochTimer.Reset(self.settings.ContractStatsEpoch)
 	}
 }
 
