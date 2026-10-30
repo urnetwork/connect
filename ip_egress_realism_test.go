@@ -432,8 +432,8 @@ func providerEgressTestBaseline(settings *ConnectSettings, ttl int) {
 }
 
 // Mirror is the explicit shipping default; independently allocated settings
-// still offer shadow/native. Upstream keepalive is off by default, and the
-// control-plane cadence is unchanged.
+// still offer shadow/native. Upstream keepalive keeps the dial's cadence (nil),
+// and the control-plane cadence is unchanged.
 func TestProviderEgressDefaultsEnableMirror(t *testing.T) {
 	for _, settings := range []*LocalUserNatSettings{
 		DefaultLocalUserNatSettings(), DefaultLocalUserNatSettingsWithBufferSize(1),
@@ -442,8 +442,8 @@ func TestProviderEgressDefaultsEnableMirror(t *testing.T) {
 		if settings.TcpBufferSettings.EgressTtlMode != EgressTtlModeMirror || settings.UdpBufferSettings.EgressTtlMode != EgressTtlModeMirror {
 			t.Fatal("default provider did not enable TTL mirroring")
 		}
-		if config := settings.TcpBufferSettings.ProviderKeepAliveConfig; config == nil || config.Enable {
-			t.Fatalf("provider default leaves upstream keepalive on: %+v", config)
+		if config := settings.TcpBufferSettings.ProviderKeepAliveConfig; config != nil {
+			t.Fatalf("provider default overrides the dial's upstream keepalive: %+v", config)
 		}
 	}
 	settings := DefaultConnectSettings()
