@@ -53,9 +53,22 @@ type tcpReapTestFlow struct {
 	stateLock sync.Mutex
 	resetTime time.Time
 	synAcked  bool
+	// pure acknowledgements toward the source, in order
+	acks []tcpReapTestAck
+}
+
+type tcpReapTestAck struct {
+	at        time.Time
+	ackNumber uint32
 }
 
 func newTcpReapTestFlow(t *testing.T, settings *TcpBufferSettings) *tcpReapTestFlow {
+	t.Helper()
+	return newTcpReapTestFlowWithSetup(t, settings, nil)
+}
+
+// Applies setup to the flow before it runs.
+func newTcpReapTestFlowWithSetup(t *testing.T, settings *TcpBufferSettings, setup func(*TcpSequence)) *tcpReapTestFlow {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pipe, upstream := net.Pipe()
@@ -92,11 +105,17 @@ func newTcpReapTestFlow(t *testing.T, settings *TcpBufferSettings) *tcpReapTestF
 		if tcp.rst && f.resetTime.IsZero() {
 			f.resetTime = time.Now()
 		}
+		if tcp.ack && !tcp.syn && !tcp.rst && !tcp.fin && len(tcp.payload) == 0 {
+			f.acks = append(f.acks, tcpReapTestAck{at: time.Now(), ackNumber: tcp.ackNumber})
+		}
 	}, f.source, protocol.ProvideMode_Network, 4,
 		net.IPv4(192, 0, 2, 2).To4(), 41000, net.IPv4(198, 51, 100, 2).To4(), 443,
 		initialSeq, settings)
 	if f.sequence == nil {
 		t.Fatal("could not admit a TCP flow")
+	}
+	if setup != nil {
+		setup(f.sequence)
 	}
 	go func() {
 		defer close(f.runDone)
@@ -160,6 +179,15 @@ func (self *tcpReapTestFlow) send(sendItem *TcpSendItem) {
 		self.t.Fatalf("the flow refused a source segment: %v", err)
 	}
 	self.sourceSeq += payloadByteCount
+}
+
+// Takes the pure acknowledgements the source has received.
+func (self *tcpReapTestFlow) takeAcks() []tcpReapTestAck {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	acks := self.acks
+	self.acks = nil
+	return acks
 }
 
 func (self *tcpReapTestFlow) reset() time.Time {

@@ -6235,6 +6235,13 @@ func (self *TcpSequence) Run() {
 		// on the hot ack coalescing path)
 		ackCompressTimer := time.NewTimer(0)
 		defer ackCompressTimer.Stop()
+		// The compression interval follows each acknowledgement, until this
+		// time; zero when no interval is running. The timer is armed only for
+		// data that arrives inside the interval, to coalesce it, so a flow
+		// whose data comes further apart than AckCompressTimeout is
+		// acknowledged on arrival with no timer at all. The schedule is the one
+		// a wait after every acknowledgement gave.
+		compressDeadlineNanos := int64(0)
 
 		for {
 			select {
@@ -6243,66 +6250,19 @@ func (self *TcpSequence) Run() {
 			default:
 			}
 
-			var packet []byte
+			// wait for data to acknowledge
 			func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
-
-				select {
-				case <-self.ctx.Done():
-					return
-				default:
-				}
-
-				for self.sendSeq == ackedSendSeq {
+				for self.ctx.Err() == nil && self.sendSeq == ackedSendSeq {
 					ackCond.Wait()
-					select {
-					case <-self.ctx.Done():
-						return
-					default:
-					}
-				}
-
-				var err error
-				packet, err = self.PureAck()
-				if err != nil {
-					self.log.Infof("[r]ack err = %s\n", err)
-				}
-				acknowledgedByteCount := self.sendSeq - ackedSendSeq
-				ackedSendSeq = self.sendSeq
-				// nothing is outstanding from here, which is what separates a
-				// recovering peer from a quiet one, and what disarms the
-				// burst-end trigger
-				quiescentNanos = monotonicNanos()
-				lastArrivalNanos = 0
-				if recovering {
-					recoveryAckedByteCount += acknowledgedByteCount
-					// the bound on what one entry may cost, for a peer that
-					// never grows out of the phase by itself
-					if 0 < self.tcpBufferSettings.RecoveryQuickackByteBound &&
-						self.tcpBufferSettings.RecoveryQuickackByteBound <=
-							ByteCount(recoveryAckedByteCount) {
-						recovering = false
-					}
 				}
 			}()
-			if packet == nil {
+			if self.ctx.Err() != nil {
 				return
 			}
-			if self.afterPureAckBuildForTest != nil {
-				self.afterPureAckBuildForTest(packet)
-			}
 
-			select {
-			case <-self.ctx.Done():
-				MessagePoolReturn(packet)
-				return
-			default:
-			}
-
-			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
-
-			if 0 < self.tcpBufferSettings.AckCompressTimeout {
+			if compressDeadlineNanos != 0 {
 				// coalesce acks up to the timeout.
 				// the send loop signals to ack sooner when the unacked byte
 				// count reaches half the window, so the source never stalls
@@ -6319,8 +6279,7 @@ func (self *TcpSequence) Run() {
 				// wakes against a wake per segment. Each firing re-reads the
 				// last-arrival timestamp the send loop stores under the mutex
 				// and either acknowledges or re-arms at the moved deadline.
-				compressDeadlineNanos := monotonicNanos() +
-					int64(self.tcpBufferSettings.AckCompressTimeout)
+				//
 				// armed, and whether the burst it watches has already ended
 				burstEndStateWithoutLock := func() (bool, bool) {
 					self.mutex.Lock()
@@ -6372,6 +6331,68 @@ func (self *TcpSequence) Run() {
 						return
 					}
 					break
+				}
+				compressDeadlineNanos = 0
+			}
+
+			var packet []byte
+			func() {
+				self.mutex.Lock()
+				defer self.mutex.Unlock()
+
+				select {
+				case <-self.ctx.Done():
+					return
+				default:
+				}
+
+				var err error
+				packet, err = self.PureAck()
+				if err != nil {
+					self.log.Infof("[r]ack err = %s\n", err)
+				}
+				acknowledgedByteCount := self.sendSeq - ackedSendSeq
+				ackedSendSeq = self.sendSeq
+				// nothing is outstanding from here, which is what separates a
+				// recovering peer from a quiet one, and what disarms the
+				// burst-end trigger
+				quiescentNanos = monotonicNanos()
+				lastArrivalNanos = 0
+				if recovering {
+					recoveryAckedByteCount += acknowledgedByteCount
+					// the bound on what one entry may cost, for a peer that
+					// never grows out of the phase by itself
+					if 0 < self.tcpBufferSettings.RecoveryQuickackByteBound &&
+						self.tcpBufferSettings.RecoveryQuickackByteBound <=
+							ByteCount(recoveryAckedByteCount) {
+						recovering = false
+					}
+				}
+			}()
+			if packet == nil {
+				return
+			}
+			if self.afterPureAckBuildForTest != nil {
+				self.afterPureAckBuildForTest(packet)
+			}
+
+			select {
+			case <-self.ctx.Done():
+				MessagePoolReturn(packet)
+				return
+			default:
+			}
+
+			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
+
+			if 0 < self.tcpBufferSettings.AckCompressTimeout {
+				// A signal already waiting ends this interval at once, as it
+				// would have ended a wait begun here.
+				select {
+				case <-ackSignal:
+				default:
+					compressDeadlineNanos = monotonicNanos() +
+						int64(self.tcpBufferSettings.AckCompressTimeout)
 				}
 			}
 		}
