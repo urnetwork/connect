@@ -234,7 +234,17 @@ func (self *quicSendFlight) retireWriter(writer *quicSendFlightWriter) {
 	}
 }
 
+// Waits for credit, or for an empty flight when idle. While the flight stays
+// full every freed root wakes another pass, so one timer serves the whole
+// wait and is reset only when the writer's deadline moves.
 func (self *quicSendFlight) wait(ctx context.Context, idle bool, deadline func() time.Time) error {
+	var timer *time.Timer
+	var timerUntil time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		self.mutex.Lock()
 		err := self.err
@@ -262,20 +272,22 @@ func (self *quicSendFlight) wait(ctx context.Context, idle bool, deadline func()
 		if ready {
 			return nil
 		}
-		var timer *time.Timer
 		var timeout <-chan time.Time
 		if !until.IsZero() {
-			timer = time.NewTimer(time.Until(until))
-			timeout = timer.C
+			if timer != nil && until.Equal(timerUntil) {
+				// still armed for this deadline, even if it was cleared and
+				// set back since
+				timeout = timer.C
+			} else {
+				timeout = resetOrCreateTimer(&timer, time.Until(until))
+				timerUntil = until
+			}
 		}
 		select {
 		case <-ctx.Done():
 		case <-self.notify:
 		case <-self.failed:
 		case <-timeout:
-		}
-		if timer != nil {
-			timer.Stop()
 		}
 	}
 }
