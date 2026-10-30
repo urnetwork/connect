@@ -142,7 +142,7 @@ func TestBlackholeReadTimeoutOnlyPeerAckRestartsClock(t *testing.T) {
 }
 
 func TestBlackholeReadTimeoutDoesNotLengthenFreshnessOrPoll(t *testing.T) {
-	if blackholePollInterval != 1250*time.Millisecond || blackholeAckFreshnessInterval != 5*time.Second {
+	if DefaultMultiClientSettings().BlackholePollInterval != 1250*time.Millisecond || blackholeAckFreshnessInterval != 5*time.Second {
 		t.Fatal("read alignment changed health evaluation/freshness cadence")
 	}
 	synctest.Test(t, func(t *testing.T) {

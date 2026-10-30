@@ -142,11 +142,10 @@ type MultiClientGeneratorReadTimeout interface {
 	ClientReadTimeout(client *Client) (time.Duration, bool)
 }
 
-// Evaluation cadence and the freshness of comparative ACK evidence are not
-// liveness deadlines. Keep their original values when the no-send-ACK bound
-// follows a longer transport read interval.
+// The freshness of comparative ACK evidence is not a liveness deadline. Keep
+// its original value when the no-send-ACK bound follows a longer transport
+// read interval, as MultiClientSettings.BlackholePollInterval does.
 const (
-	blackholePollInterval         = 1250 * time.Millisecond
 	blackholeAckFreshnessInterval = 5 * time.Second
 )
 
@@ -263,7 +262,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// client instead
 		BlackholeTimeout:        30 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
-		MaxFlowsPerExit:         16,
+		// an evaluation cadence, not a liveness deadline; see the field
+		BlackholePollInterval: 1250 * time.Millisecond,
+		// an idle channel checks its carrier an eighth as often, so a carrier
+		// lost while nothing is sent retires within 70s instead of 60s
+		BlackholeIdlePollInterval: 10 * time.Second,
+		MaxFlowsPerExit:           16,
 		// Eligible affinity keeps its exit as it grows; expiration makes later
 		// fresh flows reconsider the provider without moving existing flows.
 		AffinityStickyPastCap: true,
@@ -620,6 +624,22 @@ type MultiClientSettings struct {
 	// Zero disables this verdict. Neither this interval nor its persistent
 	// no-progress clock changes Transfer resend pacing or ACK lifetime.
 	BlackholeTimeout time.Duration
+	// BlackholePollInterval is how often a channel's health loop
+	// (detectBlackhole) judges the channel while it holds evidence: a send
+	// outstanding or in the stats window, an unanswered connect, a quarantine
+	// or a carrier down. A verdict acts within this much of its bound. It is
+	// an evaluation cadence, not a liveness deadline, so it keeps its value
+	// when the no-send-ACK bound follows a longer transport read interval.
+	// Must be positive.
+	BlackholePollInterval time.Duration
+	// BlackholeIdlePollInterval is how often the health loop of a channel
+	// holding none of that evidence wakes to check its carrier. Every verdict
+	// needs a send, and the first send of a run, an error and the channel's
+	// end each wake the loop at once, so an idle loop polls only for a
+	// carrier lost while nothing is sent: that carrier's retirement hold
+	// (StatsWindowKeepUnhealthyDuration) starts up to this much late.
+	// Non-positive never parks: the loop judges every BlackholePollInterval.
+	BlackholeIdlePollInterval time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
 	// the provider is acknowledging our sends, so it is demonstrably alive,
 	// but nothing has come back from the destination. That is ambiguous -- a
@@ -15688,6 +15708,9 @@ type multiClientChannel struct {
 	// timeout lifecycle can be tested without constructing a full Transfer
 	// route. Production uses SendDetailedMessage with the same signature.
 	pingSendForTest func(time.Duration, func(error)) (bool, error)
+	// Nil outside focused tests. Runs at the start of each health pass
+	// (detectBlackhole). Set before the loop starts.
+	blackholePassForTest func()
 	// qualificationRefreshFunc re-stamps the parent's qualification for this
 	// channel's destination (RemoteUserNatMultiClient.recordProbePass), called
 	// from the receive-ack path at most once per
@@ -15827,6 +15850,11 @@ type multiClientChannel struct {
 	pendingSendTime time.Time
 	// Orders pending-episode changes even when their clock readings tie.
 	pendingSendGeneration uint64
+	// The health loop's wake while it is parked on an idle channel
+	// (parkIdleBlackhole), nil otherwise. The first send of a run and the
+	// channel's first error signal it and clear it, so the loop judges the
+	// new evidence at once. Guarded by stateLock.
+	blackholeWake chan struct{}
 
 	// the busy-flow liveness probe's state (see busyLivenessProbe). All fields
 	// are guarded by stateLock.
@@ -18931,10 +18959,15 @@ func (self *multiClientChannel) detectBlackhole() {
 	// both kept for the loop's life; nothing below keeps the stats past its
 	// pass
 	windowStats := &clientWindowStats{}
-	pollTimer := time.NewTimer(blackholePollInterval)
+	pollTimer := time.NewTimer(self.settings.BlackholePollInterval)
 	pollTimer.Stop()
 	defer pollTimer.Stop()
+	// handed to the channel while the loop is parked; see parkIdleBlackhole
+	idleWake := make(chan struct{}, 1)
 	for {
+		if self.blackholePassForTest != nil {
+			self.blackholePassForTest()
+		}
 		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else {
@@ -19269,16 +19302,80 @@ func (self *multiClientChannel) detectBlackhole() {
 				}
 			}
 
-			pollTimer.Reset(blackholePollInterval)
+			// With no evidence left to judge, the carrier is all there is to
+			// watch: park, and check it each idle poll.
+			pollInterval := self.settings.BlackholePollInterval
+			parked := false
+			if idlePollInterval := self.settings.BlackholeIdlePollInterval; 0 < idlePollInterval && !transportDown {
+				parked = self.parkIdleBlackhole(idleWake)
+				if parked {
+					pollInterval = idlePollInterval
+				}
+			}
+			pollTimer.Reset(pollInterval)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-self.client.Done():
 				return
+			case <-idleWake:
 			case <-pollTimer.C:
+			}
+			if parked {
+				self.unparkIdleBlackhole(idleWake)
 			}
 		}
 	}
+}
+
+// parkIdleBlackhole hands the health loop's wake to the channel when the
+// channel holds no evidence a verdict could mature on, and reports whether it
+// did. The caller has found the carrier up. Every verdict needs a send: one
+// outstanding (no-send-ack), one in the stats window (no-receive-ack), or an
+// unanswered connect, whose clock outlives the window (no-receive-syn). A
+// quarantine is judged every pass, and an error ends the loop. The check and
+// the handoff share the lock under which the first send of a run and the
+// first error signal the wake, so neither can land between them unseen.
+func (self *multiClientChannel) parkIdleBlackhole(wake chan struct{}) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.endErr != nil || self.quarantined || 0 < self.packetStats.sendNackCount ||
+		!self.packetStats.firstUnansweredSendSynTime.IsZero() {
+		return false
+	}
+	for _, eventBucket := range self.eventBuckets {
+		if 0 < eventBucket.sendNackCount || 0 < eventBucket.sendSynCount {
+			return false
+		}
+	}
+	self.blackholeWake = wake
+	return true
+}
+
+// unparkIdleBlackhole takes the wake back from the channel when the parked
+// loop resumes, and drops a signal that raced the resume, so the next park
+// starts clean.
+func (self *multiClientChannel) unparkIdleBlackhole(wake chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.blackholeWake = nil
+	select {
+	case <-wake:
+	default:
+	}
+}
+
+// Wakes a parked health loop to judge new evidence.
+// must be called with `stateLock`
+func (self *multiClientChannel) wakeBlackholeWithLock() {
+	if self.blackholeWake == nil {
+		return
+	}
+	select {
+	case self.blackholeWake <- struct{}{}:
+	default:
+	}
+	self.blackholeWake = nil
 }
 
 func (self *multiClientChannel) ping() {
@@ -19392,6 +19489,10 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 
 	eventBucket := self.eventBucket()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		// first outstanding send, so start the stall clock. see sendStalled
 		self.pendingSendTime = time.Now()
@@ -19427,6 +19528,10 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 
 	eventBucket := self.eventBucket()
 	packetCount := len(sendPacketGroup.packets)
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
 		self.pendingSendGeneration++
@@ -19537,6 +19642,10 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
 		self.pendingSendGeneration++
@@ -19621,6 +19730,8 @@ func (self *multiClientChannel) addSendSyn(synCount int) {
 
 	if 0 < synCount && self.packetStats.firstUnansweredSendSynTime.IsZero() {
 		self.packetStats.firstUnansweredSendSynTime = time.Now()
+		// an unanswered connect is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
 	}
 	self.packetStats.sendSynCount += synCount
 
@@ -19774,6 +19885,8 @@ func (self *multiClientChannel) addError(err error) {
 func (self *multiClientChannel) addErrorWithLock(err error) {
 	if self.endErr == nil {
 		self.endErr = err
+		// the health loop ends on the error
+		self.wakeBlackholeWithLock()
 	}
 
 	eventBucket := self.eventBucket()

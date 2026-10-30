@@ -516,8 +516,8 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					// ACK expiry and the 30s poll can be ready together. The
 					// callback's 30s verdict is exact; joining health is bounded by
 					// one unchanged poll, not by select ordering at the tie.
-					advance(30*time.Second + blackholePollInterval)
-					if !channel.IsDone() || healthAt.Load() < int64(30*time.Second) || healthAt.Load() > int64(30*time.Second+blackholePollInterval) {
+					advance(30*time.Second + channel.settings.BlackholePollInterval)
+					if !channel.IsDone() || healthAt.Load() < int64(30*time.Second) || healthAt.Load() > int64(30*time.Second+channel.settings.BlackholePollInterval) {
 						t.Fatalf("health did not join the terminal request within one poll: at=%s", time.Duration(healthAt.Load()))
 					}
 				} else if !survives {

@@ -54,10 +54,10 @@ func TestDetectBlackholeIdlePassesAllocateNothing(t *testing.T) {
 			defer close(done)
 			channel.detectBlackhole()
 		}()
-		time.Sleep(10 * blackholePollInterval)
+		time.Sleep(10 * channel.settings.BlackholePollInterval)
 
 		allocations := allocationsUnder(t, "(*multiClientChannel).detectBlackhole", func() {
-			time.Sleep(100 * blackholePollInterval)
+			time.Sleep(100 * channel.settings.BlackholePollInterval)
 		})
 		select {
 		case <-done:
