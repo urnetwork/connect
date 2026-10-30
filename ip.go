@@ -3376,7 +3376,7 @@ func newUdpSequenceWithTransferKey(
 	if !udpBufferSettings.SharedSocketLifecycle {
 		sendItems = make(chan *UdpSendItem, udpBufferSettings.SequenceBufferSize)
 	}
-	return &UdpSequence{
+	sequence := &UdpSequence{
 		memory:               memory,
 		ctx:                  cancelCtx,
 		cancel:               cancel,
@@ -3397,11 +3397,10 @@ func newUdpSequenceWithTransferKey(
 			sourcePort:      sourcePort,
 			destinationIp:   destinationIp,
 			destinationPort: destinationPort,
-			userLimited: userLimited{
-				lastActivityTime: time.Now(),
-			},
 		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 func (self *UdpSequence) ensureSendItems() {
@@ -5292,7 +5291,7 @@ func newTcpSequenceWithTransferKey(
 	)
 	timestampOffset := mathrand.Uint32()
 
-	return &TcpSequence{
+	sequence := &TcpSequence{
 		memory:            memory,
 		ctx:               cancelCtx,
 		cancel:            cancel,
@@ -5333,11 +5332,10 @@ func newTcpSequenceWithTransferKey(
 			windowSize:        initialWindowSize,
 			windowScale:       0,
 			timestampOffset:   timestampOffset,
-			userLimited: userLimited{
-				lastActivityTime: time.Now(),
-			},
 		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 func (self *TcpSequence) send(sendItem *TcpSendItem, timeout time.Duration) (bool, error) {
@@ -11513,27 +11511,27 @@ type UserLimited interface {
 	Cancel()
 }
 
+// userLimited is a flow's last activity, which the flow tables' LRU eviction
+// and the shared UDP idle reap read. Its reader and writer stamp it on every
+// packet, so the stamp is one store of monotonic nanoseconds (see
+// monotonicNanos): one clock read and no lock per packet, and a wall clock
+// step cannot make a flow look idle or fresh. Safe for concurrent use.
 type userLimited struct {
-	mutex            sync.Mutex
-	lastActivityTime time.Time
+	lastActivityNanos atomic.Int64
 }
 
 func newUserLimited() *userLimited {
-	return &userLimited{
-		lastActivityTime: time.Now(),
-	}
+	activity := &userLimited{}
+	activity.UpdateLastActivityTime()
+	return activity
 }
 
 func (self *userLimited) LastActivityTime() time.Time {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	return self.lastActivityTime
+	return monotonicEpoch.Add(time.Duration(self.lastActivityNanos.Load()))
 }
 
 func (self *userLimited) UpdateLastActivityTime() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	self.lastActivityTime = time.Now()
+	self.lastActivityNanos.Store(monotonicNanos())
 }
 
 const lruEvictionSampleSize = 32

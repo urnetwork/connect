@@ -624,7 +624,7 @@ func newIcmpSequenceWithTransferKey(
 	destinationIp = slices.Clone(destinationIp)
 	source = source.LocalMask()
 	cancelCtx, cancel := context.WithCancel(ctx)
-	return &IcmpSequence{
+	sequence := &IcmpSequence{
 		memory:             memory,
 		ctx:                cancelCtx,
 		cancel:             cancel,
@@ -641,10 +641,9 @@ func newIcmpSequenceWithTransferKey(
 		sourceIp:           sourceIp,
 		identifier:         identifier,
 		destinationIp:      destinationIp,
-		userLimited: userLimited{
-			lastActivityTime: time.Now(),
-		},
 	}
+	sequence.UpdateLastActivityTime()
+	return sequence
 }
 
 // the immutable ip path for this flow. the identifier stands in for the
