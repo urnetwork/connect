@@ -540,26 +540,17 @@ type PlatformTransportSettings struct {
 	AuthTimeout          time.Duration
 	ReconnectTimeout     time.Duration
 	PingTimeout          time.Duration
-	WriteTimeout         time.Duration
-	ReadTimeout          time.Duration
-	// ReadDeadlineSlackFraction lets a busy connection keep its read deadline.
-	// The reader re-arms it only once less than ReadTimeout is left, and then
-	// to ReadTimeout plus this fraction of it, so a connection whose frames
-	// keep arriving re-arms once per that slack instead of once per frame; on
-	// a socket each re-arm moves the deadline timer, a timer heap modify. A
-	// silent peer is cut off between ReadTimeout and ReadTimeout plus the
-	// slack after its last frame: 30-40s with the defaults, which holds while
-	// the platform pings at most ~10s apart. One third by default.
-	// Non-positive re-arms exactly ReadTimeout before every read.
-	ReadDeadlineSlackFraction float64
-	// WriteDeadlineSlackFraction is the same for writes: the writer re-arms
-	// only once less than WriteTimeout is left, and then to WriteTimeout plus
-	// this fraction of it. A WebSocket write timeout is terminal, so every
-	// write still begins with at least WriteTimeout left, and a stalled write
-	// fails between WriteTimeout and WriteTimeout plus the slack after it
-	// began: 10-15s with the defaults. One half by default. Non-positive
-	// re-arms exactly WriteTimeout before every write.
-	WriteDeadlineSlackFraction float64
+	// WriteTimeout bounds each carrier write, a ready batch or a ping, from
+	// the instant it begins: one still in progress this long after it began
+	// fails as a timeout, which ends the connection. The connection's write
+	// watchdog (ioWatchdog) enforces it without a deadline per write. The H3
+	// DNS modes multiply it by their slow multiple.
+	WriteTimeout time.Duration
+	// ReadTimeout bounds each carrier read the same way, so a peer silent
+	// this long after its last frame is cut off exactly then. A reader that
+	// waits on local receive capacity is not reading. Hybrid H3 leaves its
+	// reliable stream to the QUIC idle timeout.
+	ReadTimeout time.Duration
 	// PingJitter spreads the pings of the many transports one host runs. Each
 	// transport draws one offset below it at construction and pings that far
 	// past the wall-clock ping boundaries, so its ping cadence is unchanged.
@@ -813,6 +804,9 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Called each time a carrier writer arms its
 	// ping timer, so a test can count the timer operations its writes cost.
 	pingTimerArmForTest func()
+	// Nil outside package tests. Called each time a connection's read or write
+	// watchdog arms its timer, with its direction.
+	ioWatchdogArmForTest func(write bool)
 	// Nil outside package tests. Called each time an authenticated H3
 	// connection installs a stream deadline, with its direction and value.
 	h3StreamDeadlineForTest func(write bool, deadline time.Time)
@@ -913,10 +907,6 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 
 		PlacementPreferDuration: 6 * time.Hour,
 		PlacementFailHold:       10 * time.Minute,
-
-		// a deadline re-armed lazily reaches this far past its timeout
-		ReadDeadlineSlackFraction:  1.0 / 3,
-		WriteDeadlineSlackFraction: 1.0 / 2,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -1276,11 +1266,12 @@ func newPlatformQuicConfig(
 		// of the application writer, which can legitimately wait behind
 		// quic-go's bounded DATAGRAM queue on a constrained uplink. It sends a
 		// PING once the peer has been quiet this long, at most half the idle
-		// timeout in quic-go. Twice the ping interval leaves an idle
-		// connection's liveness to the application ping, one ack-eliciting
-		// packet per ping where a QUIC PING went between each two, and still
-		// finds a dead peer within this plus the idle timeout: 30s by default.
-		KeepAlivePeriod:   settings.PingTimeout * 2,
+		// timeout in quic-go, and the idle timeout runs from the first
+		// ack-eliciting packet after the peer's last. So a dead peer is found
+		// within this plus the idle timeout of its last packet: 25s by default.
+		// The application ping cannot stand in for it: one paced from a write
+		// just past a ping boundary goes out nearly two ping intervals later.
+		KeepAlivePeriod:   settings.PingTimeout,
 		Allow0RTT:         !settings.h3RetainedByteAccounting,
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
@@ -2317,38 +2308,124 @@ func (self *PlatformTransport) h3SocketWriteBufferByteCount() ByteCount {
 	return MemoryScaledByteCount(mib(1), kib(256))
 }
 
-// lazyDeadline re-arms one connection I/O deadline only when the armed one
-// leaves less than its timeout, and then to the timeout plus a slack. Every
-// operation still begins with at least the timeout left, and one that stalls
-// fails between the timeout and the timeout plus the slack after it began. A
-// busy connection re-arms about once per slack instead of once per operation;
-// on a socket each re-arm moves its deadline timer, a timer heap modify
-// (server CPUOPT2.md §9). A non-positive slack re-arms exactly the timeout
-// before every operation. One goroutine owns each value.
-type lazyDeadline struct {
+// An instant long past. Installed as an I/O deadline, it ends a blocked
+// operation, and every later one, as a timeout.
+var ioWatchdogExpiredDeadline = time.Unix(1, 0)
+
+// Bounds each read, or each write, of one connection to a timeout from the
+// instant the operation began. That is the bound a deadline installed
+// before every operation set, with no deadline per operation: on a socket each
+// installation moves its deadline timer, a timer heap modify, and on a QUIC
+// stream any deadline costs a timer per blocking call (server CPUOPT2.md §9).
+//
+// An operation stores its start as it begins and clears it as it ends, its
+// whole cost. One timer fires when the operation in progress would expire. On
+// a fire, an operation that has run the timeout or longer is interrupted, one
+// that has run less re-arms the timer for the rest, and with none in progress
+// the watchdog goes idle until the next operation arms it. A busy connection
+// fires and arms about once per timeout; an idle one does neither.
+//
+// The interrupt installs a deadline in the past on the connection the
+// operation uses, so the operation ends through its ordinary timeout path, and
+// nothing may install a later deadline after it. An operation that ends between
+// the check and the interrupt leaves its successor to fail at once: it ran the
+// timeout, so the connection ends as a deadline would have ended it. An
+// interrupted watchdog never fires again.
+//
+// begin and end belong to the goroutine that runs the operations, which stops
+// the watchdog as it exits. The timer callback runs on its own goroutine.
+type ioWatchdog struct {
 	timeout time.Duration
-	slack   time.Duration
-	// the deadline last armed, zero before the first
-	deadline time.Time
+	// ends the operation in progress, on the timer's goroutine
+	interrupt func()
+	// start readings count from this monotonic instant
+	epoch time.Time
+	// when the operation in progress began, in nanoseconds past epoch plus
+	// one; zero while none is
+	startNanos atomic.Int64
+	// set while the timer is armed or its callback runs. Whoever sets it owns
+	// the timer until the callback clears it.
+	armed   atomic.Bool
+	stopped atomic.Bool
+	timer   *time.Timer
+	// nil outside package tests
+	armForTest func()
 }
 
-// The slack is slackFraction of the timeout.
-func newLazyDeadline(timeout time.Duration, slackFraction float64) lazyDeadline {
-	return lazyDeadline{
-		timeout: timeout,
-		slack:   max(0, time.Duration(float64(timeout)*slackFraction)),
+// Creates an idle watchdog whose interrupt ends the operation in progress.
+func newIoWatchdog(timeout time.Duration, interrupt func(), armForTest func()) *ioWatchdog {
+	watchdog := &ioWatchdog{
+		timeout:    timeout,
+		interrupt:  interrupt,
+		epoch:      time.Now(),
+		armForTest: armForTest,
+	}
+	// created stopped; the first operation arms it
+	watchdog.timer = time.AfterFunc(time.Duration(math.MaxInt64), watchdog.fire)
+	watchdog.timer.Stop()
+	return watchdog
+}
+
+// Notes an operation that begins at now, and arms the timer when idle.
+func (self *ioWatchdog) begin(now time.Time) {
+	self.startNanos.Store(int64(now.Sub(self.epoch)) + 1)
+	if !self.armed.Load() && self.armed.CompareAndSwap(false, true) {
+		self.arm(self.timeout)
 	}
 }
 
-// The deadline to install before an operation that begins at now, or false
-// when the armed one still leaves the timeout. An expired deadline, or none,
-// always re-arms.
-func (self *lazyDeadline) rearm(now time.Time) (time.Time, bool) {
-	if 0 < self.slack && now.Before(self.deadline) && self.timeout <= self.deadline.Sub(now) {
-		return time.Time{}, false
+// Notes that the operation in progress ended.
+func (self *ioWatchdog) end() {
+	self.startNanos.Store(0)
+}
+
+// Arms the timer to fire after d. Only the owner of armed calls it.
+func (self *ioWatchdog) arm(d time.Duration) {
+	self.timer.Reset(d)
+	if self.armForTest != nil {
+		self.armForTest()
 	}
-	self.deadline = now.Add(self.timeout + self.slack)
-	return self.deadline, true
+}
+
+// The timer callback.
+func (self *ioWatchdog) fire() {
+	for !self.stopped.Load() {
+		startNanos := self.startNanos.Load()
+		if startNanos == 0 {
+			self.armed.Store(false)
+			// an operation that began before the store saw the timer armed
+			// and left arming it here
+			if self.startNanos.Load() == 0 || !self.armed.CompareAndSwap(false, true) {
+				return
+			}
+			continue
+		}
+		elapsed := time.Since(self.epoch) - time.Duration(startNanos-1)
+		if elapsed < self.timeout {
+			self.arm(self.timeout - elapsed)
+			return
+		}
+		self.interrupt()
+		return
+	}
+}
+
+// Stops the timer for good as the operations' goroutine exits. A callback
+// already running may still interrupt, which the closing connection ignores.
+func (self *ioWatchdog) stop() {
+	self.stopped.Store(true)
+	self.timer.Stop()
+}
+
+// The hook that counts a watchdog's timer arms in one direction, nil outside
+// package tests.
+func (self *PlatformTransport) ioWatchdogArmHookForTest(write bool) func() {
+	if self.settings.ioWatchdogArmForTest == nil {
+		return nil
+	}
+	return func() {
+		self.settings.ioWatchdogArmForTest(write)
+	}
 }
 
 // Tells a test that an H3 connection installed a stream deadline.
@@ -2605,6 +2682,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					default:
 						return nil, fmt.Errorf("Auth response error.")
 					}
+				}
+				// the connection's watchdogs bound its reads and writes from
+				// here, with no deadline per operation to replace these
+				if err := ws.SetReadDeadline(time.Time{}); err != nil {
+					return nil, err
+				}
+				if err := ws.SetWriteDeadline(time.Time{}); err != nil {
+					return nil, err
 				}
 			}
 
@@ -2980,10 +3065,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer handleCancel()
 
 				speedTest := false
-				// Writes only note their time for the ping, and the write
-				// deadline is re-armed only when less than WriteTimeout is left
-				// on it. Gorilla keeps the deadline and installs it again before
-				// every frame; the batch conn forwards it only when it changes.
+				// Writes only note their time for the ping, and their start and
+				// end for the write watchdog, which bounds each to WriteTimeout
+				// from its start. The socket write deadline stays unset until
+				// the watchdog installs one in the past under a stalled write.
+				// Gorilla installs its stored deadline, zero, before every frame;
+				// the batch conn forwards it only when it changes, and never over
+				// an expired one.
 				pinger := newPingPacer(
 					self.settings.PingTimeout,
 					self.settings.PingTimeout,
@@ -2992,19 +3080,20 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					self.settings.pingTimerArmForTest,
 				)
 				defer pinger.stop()
-				writeDeadline := newLazyDeadline(self.settings.WriteTimeout, self.settings.WriteDeadlineSlackFraction)
-				armWriteDeadline := func() error {
-					if deadline, rearm := writeDeadline.rearm(time.Now()); rearm {
-						return ws.SetWriteDeadline(deadline)
+				writeWatchdog := newIoWatchdog(self.settings.WriteTimeout, func() {
+					// on the conn gorilla writes to: gorilla's own deadline is
+					// the writer's alone. A rejected bound closes the socket.
+					if err := ws.UnderlyingConn().SetWriteDeadline(ioWatchdogExpiredDeadline); err != nil {
+						ws.Close()
 					}
-					return nil
-				}
+				}, self.ioWatchdogArmHookForTest(true))
+				defer writeWatchdog.stop()
 				writePing := func() error {
-					if err := armWriteDeadline(); err != nil {
-						return err
-					}
+					writeWatchdog.begin(time.Now())
 					// note that for websocket a deadline timeout cannot be recovered
-					if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
+					err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0))
+					writeWatchdog.end()
+					if err != nil {
 						return err
 					}
 					pinger.pinged(time.Now())
@@ -3037,11 +3126,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					return nil
 				}
 				write := func(message []byte, lane *platformH1RetainedLane) error {
-					if err := armWriteDeadline(); err != nil {
-						returnH1RetainedMessage(message, lane)
-						return err
-					}
-					return writeMessage(message, lane)
+					writeWatchdog.begin(time.Now())
+					err := writeMessage(message, lane)
+					writeWatchdog.end()
+					return err
 				}
 				writePayload := func(message []byte, lane *platformH1RetainedLane) error {
 					if err := write(message, lane); err != nil {
@@ -3090,25 +3178,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstMessage []byte,
 					firstPriority bool,
 				) (sendOpen bool, err error) {
-					firstLane := sendLane
-					if firstPriority {
-						firstLane = priorityLane
-					}
 					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
-						return writeH1FramedReadyBatchWithDeadline(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, &writeDeadline, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
+						return writeH1FramedReadyBatchWatched(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, 0, writeWatchdog, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
 					}
+					// one write from here to the flush, as one deadline bounded
+					// the whole batch
+					writeWatchdog.begin(time.Now())
+					defer writeWatchdog.end()
 					if writeBatchConn == nil {
-						if err := armWriteDeadline(); err != nil {
-							returnH1RetainedMessage(firstMessage, firstLane)
-							return true, err
-						}
 						return true, writeSendMessage(firstMessage, firstPriority)
 					}
 
-					if err := armWriteDeadline(); err != nil {
-						returnH1RetainedMessage(firstMessage, firstLane)
-						return true, err
-					}
 					writeBatchConn.BeginWriteBatch()
 					h1Progress.beginWebSocketBatch()
 					defer h1Progress.finishWebSocketBatch()
@@ -3304,9 +3384,19 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// sample: the next message waited in the socket for a local
 				// reason (DELAY.md §4.2). Zero when there is no delay header.
 				var handoffStartTime time.Time
-				// Re-armed only when less than ReadTimeout is left on it, so a
-				// silent peer is cut off within the slack after ReadTimeout.
-				readDeadline := newLazyDeadline(self.settings.ReadTimeout, self.settings.ReadDeadlineSlackFraction)
+				// Bounds each read to ReadTimeout from its start, so a silent
+				// peer is cut off exactly ReadTimeout after its last frame. A
+				// handoff waiting on receive capacity is not a read. The socket
+				// read deadline stays unset until the watchdog installs one in
+				// the past under the read; gorilla times that read out for good.
+				readWatchdog := newIoWatchdog(self.settings.ReadTimeout, func() {
+					if err := ws.SetReadDeadline(ioWatchdogExpiredDeadline); err != nil {
+						// a rejected bound closes the socket instead
+						h1Progress.event("h1_read_deadline_error", nil, false, err)
+						ws.Close()
+					}
+				}, self.ioWatchdogArmHookForTest(false))
+				defer readWatchdog.stop()
 
 				for {
 					select {
@@ -3318,13 +3408,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					if !handoffStartTime.IsZero() {
 						delayH1.noteHandoff(time.Since(handoffStartTime))
 					}
-					if deadline, rearm := readDeadline.rearm(time.Now()); rearm {
-						if err := ws.SetReadDeadline(deadline); err != nil {
-							h1Progress.event("h1_read_deadline_error", nil, false, err)
-							return
-						}
-					}
+					readWatchdog.begin(time.Now())
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
+					readWatchdog.end()
 					if delayH1 != nil {
 						handoffStartTime = time.Now()
 					}
@@ -3717,6 +3803,11 @@ func (self *PlatformTransport) runH3(
 					self.routeManager.noteTransportDelayEdgeAnswer(useTransportDelay)
 				}
 			}
+			// the connection's watchdogs bound its stream reads and writes
+			// from here. A stream deadline would cost quic-go a timer per
+			// blocking call.
+			streamWriter.SetWriteDeadline(time.Time{})
+			stream.SetReadDeadline(time.Time{})
 
 			success = true
 			return &ConnStream{
@@ -4148,18 +4239,12 @@ func (self *PlatformTransport) runH3(
 			var writeBatchStorage []byte
 			var messageStorage [][]byte
 			writeBatchMaxByteCount := max(0, self.settings.H3StreamWriteBatchMaxByteCount)
-			// The one writer re-arms the stream write deadline, for its batches
-			// and its pings, only when less than the timeout is left on it.
-			writeDeadline := newLazyDeadline(
-				time.Duration(slowMultiple)*self.settings.WriteTimeout,
-				self.settings.WriteDeadlineSlackFraction,
-			)
-			armStreamWriteDeadline := func() {
-				if deadline, rearm := writeDeadline.rearm(time.Now()); rearm {
-					streamWriter.SetWriteDeadline(deadline)
-					self.h3StreamDeadlineInstalledForTest(true, deadline)
-				}
-			}
+			// Bounds the one writer's stream writes, its batches and its pings,
+			// each from its start. The writer stops it.
+			writeWatchdog := newIoWatchdog(time.Duration(slowMultiple)*self.settings.WriteTimeout, func() {
+				streamWriter.SetWriteDeadline(ioWatchdogExpiredDeadline)
+				self.h3StreamDeadlineInstalledForTest(true, ioWatchdogExpiredDeadline)
+			}, self.ioWatchdogArmHookForTest(true))
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
@@ -4194,7 +4279,7 @@ func (self *PlatformTransport) runH3(
 					}
 				}
 
-				armStreamWriteDeadline()
+				writeWatchdog.begin(time.Now())
 				if self.settings.beforeH3StreamWriteForTest != nil {
 					self.settings.beforeH3StreamWriteForTest()
 				}
@@ -4206,6 +4291,7 @@ func (self *PlatformTransport) runH3(
 					messages,
 					writeBatchStorage,
 				)
+				writeWatchdog.end()
 				if err == nil {
 					writeCounter.Add(uint64(len(messages)))
 					for _, message := range messages {
@@ -4278,6 +4364,7 @@ func (self *PlatformTransport) runH3(
 						}
 					}()
 				}
+				defer writeWatchdog.stop()
 
 				// writes only note their time; the timer re-arms when it fires
 				pinger := newPingPacer(
@@ -4308,14 +4395,17 @@ func (self *PlatformTransport) runH3(
 							}
 							message = nextMessage
 						case <-pinger.timer.C:
-							if !pinger.fired(time.Now()) {
+							now := time.Now()
+							if !pinger.fired(now) {
 								continue
 							}
-							armStreamWriteDeadline()
+							writeWatchdog.begin(now)
 							// Reuse the reliable writer's scratch if already allocated;
 							// heartbeat-only hybrid lanes keep their lazy memory shape.
 							// A negotiated heartbeat is stamped like any stream write.
-							if err := streamFraming.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
+							err := streamFraming.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage)
+							writeWatchdog.end()
+							if err != nil {
 								return
 							}
 							pinger.pinged(time.Now())
@@ -4496,12 +4586,16 @@ func (self *PlatformTransport) runH3(
 						close(reliableReceive)
 					}
 				}()
-				// stream-only H3 re-arms the stream read deadline only when less
-				// than the timeout is left on it
-				readDeadline := newLazyDeadline(
-					time.Duration(slowMultiple)*self.settings.ReadTimeout,
-					self.settings.ReadDeadlineSlackFraction,
-				)
+				// stream-only H3 bounds each stream read from its start; the
+				// hybrid reader above leaves its stream to the QUIC idle timeout
+				var readWatchdog *ioWatchdog
+				if !connStream.useH3Datagrams {
+					readWatchdog = newIoWatchdog(time.Duration(slowMultiple)*self.settings.ReadTimeout, func() {
+						stream.SetReadDeadline(ioWatchdogExpiredDeadline)
+						self.h3StreamDeadlineInstalledForTest(false, ioWatchdogExpiredDeadline)
+					}, self.ioWatchdogArmHookForTest(false))
+					defer readWatchdog.stop()
+				}
 
 				for {
 					select {
@@ -4525,12 +4619,10 @@ func (self *PlatformTransport) runH3(
 							continue
 						}
 					} else {
-						if deadline, rearm := readDeadline.rearm(time.Now()); rearm {
-							stream.SetReadDeadline(deadline)
-							self.h3StreamDeadlineInstalledForTest(false, deadline)
-						}
+						readWatchdog.begin(time.Now())
 						var err error
 						message, err = streamFraming.Read(stream)
+						readWatchdog.end()
 						if err != nil {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 							return

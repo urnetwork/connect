@@ -375,11 +375,6 @@ func newH1LivenessFixtureWithRoutes(t *testing.T, pausePeer bool, writeTimeout t
 		settings.WriteTimeout = writeTimeout
 	}
 	settings.ReconnectTimeout = time.Hour
-	// Exact deadlines, re-armed before every operation, so that a boundary
-	// test here reads the timeout itself. The lazy re-arm's tests restore the
-	// production slack (withLazyH1Deadlines).
-	settings.ReadDeadlineSlackFraction = 0
-	settings.WriteDeadlineSlackFraction = 0
 	settings.TransportBufferSize = 1
 	settings.H1PlusStats = fixture.stats
 	settings.H1ConnectionStats = fixture.connectionStats
@@ -591,145 +586,96 @@ func TestH1PlusLivenessReceiveBackpressureIsNotDeadPeer(t *testing.T) {
 	})
 }
 
-// The old owner ignored the error and began another unbounded read. This
-// forces rejection after a successful upgrade, at the actual read-loop edge.
+// The read watchdog's bound is the reader's only deadline installation. A
+// rejected one still ends the read at exactly ReadTimeout: the batch conn
+// closes the socket instead, and no socket read begins after the rejection.
 func TestH1PlusLivenessReadDeadlineFailureIsTerminal(t *testing.T) {
 	resetH1UpgradeTestState(t)
 	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		fixture.client.failReadDeadline.Store(true)
-		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, nil); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		if !fixture.client.readRejected.Load() {
-			t.Fatal("fixture did not reach the rejected read deadline")
-		}
-		fixture.assertWithdrawn(t)
-		if fixture.client.readsAfterRejection.Load() != 0 {
-			t.Error("reader began socket I/O after rejecting its deadline")
-		}
-	})
+	for _, h1Plus := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newH1LivenessFixture(t, withH1Plus(h1Plus))
+			fixture.client.failReadDeadline.Store(true)
+			readTimeout := fixture.transport.settings.ReadTimeout
+			if cutOff := h1WithdrawnAfter(fixture, time.Now(), readTimeout); cutOff != readTimeout {
+				t.Fatalf("h1+=%t: the silent peer was cut off %s after its last frame, want exactly %s", h1Plus, cutOff, readTimeout)
+			}
+			fixture.assertWithdrawn(t)
+			if !fixture.client.readRejected.Load() {
+				t.Fatalf("h1+=%t: the read watchdog did not install its bound", h1Plus)
+			}
+			if fixture.client.readsAfterRejection.Load() != 0 {
+				t.Errorf("h1+=%t: the reader began socket I/O after its bound was rejected", h1Plus)
+			}
+		})
+	}
 }
 
-// The old heartbeat writer ignored the deadline error and could block forever.
+// The write watchdog's bound is the writer's only deadline installation. For
+// the named kind of write, stalled on the paused peer, a rejected one still
+// ends the write at exactly WriteTimeout after it began: the batch conn closes
+// the socket instead, no socket write begins after the rejection, and the
+// owner returns the write's payload.
+func testH1StalledWriteRejectedBoundIsTerminal(t *testing.T, kindName string) {
+	t.Helper()
+	resetH1UpgradeTestState(t)
+	MessagePoolReturn(MessagePoolGet(1))
+	var kind h1StalledWriteKind
+	for _, k := range h1StalledWriteKinds() {
+		if k.name == kindName {
+			kind = k
+		}
+	}
+	if kind.stall == nil {
+		t.Fatalf("no stalled write kind %q", kindName)
+	}
+	for _, h1Plus := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			fixture := newH1LivenessFixtureWithBackpressure(t, true, 0, withH1Plus(h1Plus), kind.configure)
+			stallStart, witness := kind.stall(t, fixture)
+			fixture.client.failWriteDeadline.Store(true)
+			writeTimeout := fixture.transport.settings.WriteTimeout
+			if cutOff := h1WithdrawnAfter(fixture, stallStart, writeTimeout); cutOff != writeTimeout {
+				t.Fatalf("h1+=%t: the stalled %s ended %s after it began, want exactly %s", h1Plus, kind.name, cutOff, writeTimeout)
+			}
+			fixture.assertWithdrawn(t)
+			if !fixture.client.writeRejected.Load() {
+				t.Fatalf("h1+=%t: the write watchdog did not install its bound under the %s", h1Plus, kind.name)
+			}
+			if fixture.client.writesAfterRejection.Load() != 0 {
+				t.Errorf("h1+=%t: a socket write began after the %s's bound was rejected", h1Plus, kind.name)
+			}
+			if witness != nil && !MessagePoolReturn(witness) {
+				t.Errorf("h1+=%t: the rejected bound retained the %s's payload", h1Plus, kind.name)
+			}
+		})
+	}
+}
+
+// The heartbeat writer must not block forever behind a rejected bound.
 func TestH1PlusLivenessWriteDeadlineFailureIsTerminal(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		fixture.client.failWriteDeadline.Store(true)
-		time.Sleep(time.Second)
-		synctest.Wait()
-		if !fixture.client.writeRejected.Load() {
-			t.Fatal("fixture did not reach the rejected write deadline")
-		}
-		fixture.assertWithdrawn(t)
-		if fixture.client.writesAfterRejection.Load() != 0 {
-			t.Error("writer began socket I/O after rejecting its deadline")
-		}
-	})
+	testH1StalledWriteRejectedBoundIsTerminal(t, "ping")
 }
 
-// Control echoes share the serialized writer and must obey the same deadline.
+// Control echoes share the serialized writer and its bound.
 func TestH1PlusLivenessControlDeadlineFailureIsTerminal(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		fixture.client.failWriteDeadline.Store(true)
-		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, make([]byte, 16)); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		if !fixture.client.writeRejected.Load() {
-			t.Fatal("control echo did not reach the rejected deadline")
-		}
-		fixture.assertWithdrawn(t)
-		if fixture.client.writesAfterRejection.Load() != 0 {
-			t.Error("control echo performed I/O after rejecting its deadline")
-		}
-	})
+	testH1StalledWriteRejectedBoundIsTerminal(t, "control echo")
 }
 
 // Speed mode has a distinct heartbeat select branch; the same failure policy
 // must hold there without changing the speed-control wire format.
 func TestH1PlusLivenessSpeedHeartbeatDeadlineFailureIsTerminal(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, []byte{TransportControlSpeedStart, 0, 0, 0, 0}); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		if fixture.payloads.Load() != 1 {
-			t.Fatal("speed-mode control was not echoed before the failure")
-		}
-		fixture.client.failWriteDeadline.Store(true)
-		time.Sleep(time.Second)
-		synctest.Wait()
-		if !fixture.client.writeRejected.Load() {
-			t.Fatal("speed heartbeat did not reach the rejected deadline")
-		}
-		fixture.assertWithdrawn(t)
-		if fixture.client.writesAfterRejection.Load() != 0 {
-			t.Error("speed heartbeat performed I/O after rejecting its deadline")
-		}
-	})
+	testH1StalledWriteRejectedBoundIsTerminal(t, "speed test ping")
 }
 
-// The non-batching speed-mode sender owns its pooled payload even on the new
-// deadline-error exit. The witness is released only after the owner returned.
+// The non-batching speed-mode sender owns its pooled payload on this exit too.
+// The witness is released only after the owner returned.
 func TestH1PlusLivenessSpeedPayloadDeadlineReturnsOwner(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, []byte{TransportControlSpeedStart, 0, 0, 0, 0}); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
-		if fixture.payloads.Load() != 1 {
-			t.Fatal("speed-mode control was not echoed before the failure")
-		}
-		fixture.client.failWriteDeadline.Store(true)
-		// a later instant, so the payload installs a deadline of its own: the
-		// batch conn does not forward one identical to the echo's again
-		time.Sleep(time.Nanosecond)
-		message := MessagePoolGet(64)
-		witness := MessagePoolShareReadOnly(message)
-		fixture.sendMessage(t, message)
-		synctest.Wait()
-		fixture.assertWithdrawn(t)
-		if !MessagePoolReturn(witness) {
-			t.Error("deadline rejection retained the speed payload owner")
-		}
-		if !fixture.client.writeRejected.Load() || fixture.client.writesAfterRejection.Load() != 0 {
-			t.Error("speed payload bypassed the rejected deadline")
-		}
-	})
+	testH1StalledWriteRejectedBoundIsTerminal(t, "speed test payload")
 }
 
-// Ordinary Framed ready batching already checks deadline errors. Preserve
-// that healthy negative control and all pooled ownership when fixing pings.
+// Ready batches, framed and WebSocket, fail closed the same way, and return
+// every pooled payload.
 func TestH1PlusLivenessReadyBatchDeadlineAlreadyFailsClosed(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	synctest.Test(t, func(t *testing.T) {
-		fixture := newH1LivenessFixture(t)
-		fixture.client.failWriteDeadline.Store(true)
-		message := MessagePoolGet(64)
-		witness := MessagePoolShareReadOnly(message)
-		fixture.sendMessage(t, message)
-		synctest.Wait()
-		fixture.assertWithdrawn(t)
-		if !MessagePoolReturn(witness) {
-			t.Error("ready batch retained its payload owner")
-		}
-		if !fixture.client.writeRejected.Load() || fixture.client.writesAfterRejection.Load() != 0 {
-			t.Error("ready batch bypassed the rejected deadline")
-		}
-	})
+	testH1StalledWriteRejectedBoundIsTerminal(t, "ready batch payload")
 }

@@ -206,6 +206,8 @@ func TestWebSocketDeadlineActualControlRejectsInnerError(t *testing.T) {
 }
 
 // Previously retained bytes cannot escape through a later flush after rejection.
+// The second frame installs a new deadline: one the socket already holds, as
+// gorilla's repeated zero, is not installed again and cannot be rejected.
 func TestWebSocketDeadlineBufferedFramesAreRetired(t *testing.T) {
 	ws, adapter, raw := newWebSocketDeadlineFixture(t)
 	adapter.BeginWriteBatch()
@@ -216,6 +218,9 @@ func TestWebSocketDeadlineBufferedFramesAreRetired(t *testing.T) {
 		t.Fatal("fixture did not retain a complete ready frame")
 	}
 	raw.writeErr = errors.New("synthetic second-frame deadline rejected")
+	if err := ws.SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	err := ws.WriteMessage(websocket.BinaryMessage, []byte("second complete frame"))
 	flushErr := adapter.FlushWriteBatch()
 	if !errors.Is(err, raw.writeErr) || !errors.Is(flushErr, raw.writeErr) || raw.writeCount != 0 || len(adapter.writeBuffer) != 0 {

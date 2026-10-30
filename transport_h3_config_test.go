@@ -41,11 +41,11 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 	if !config.EnableDatagrams {
 		t.Fatal("H3 DATAGRAM capability is not advertised by default")
 	}
-	if config.KeepAlivePeriod != 2*settings.PingTimeout {
+	if config.KeepAlivePeriod != settings.PingTimeout {
 		t.Fatalf(
 			"H3 keepalive period=%s want=%s",
 			config.KeepAlivePeriod,
-			2*settings.PingTimeout,
+			settings.PingTimeout,
 		)
 	}
 	if config.Tracer == nil {
@@ -64,19 +64,19 @@ func TestPlatformQuicConfigEnablesPathMtuDiscovery(t *testing.T) {
 // QUIC sends a keepalive PING once the peer has been quiet for its keepalive
 // period, which quic-go caps at half the idle timeout, and closes the
 // connection one idle timeout after the first ack-eliciting packet the peer
-// leaves unanswered. At twice PingTimeout the app's own ping carries an idle
-// connection's liveness, one ack-eliciting packet per ping interval instead of
-// a QUIC PING between every two app pings, and a dead peer is still detected
-// within the keepalive period plus the idle timeout: 30s with the defaults.
-func TestPlatformQuicConfigKeepAliveIsTwicePingTimeout(t *testing.T) {
+// leaves unanswered. At PingTimeout a dead peer is found within PingTimeout
+// plus the idle timeout of its last packet, 25s with the defaults; the
+// application ping cannot keep that bound by itself
+// (TestH3DeadPeerFoundWithinPingTimeoutPlusIdleTimeout).
+func TestPlatformQuicConfigKeepAliveIsPingTimeout(t *testing.T) {
 	defaultPingTimeout := DefaultPlatformTransportSettings().PingTimeout
 	for _, pingTimeout := range []time.Duration{defaultPingTimeout, 250 * time.Millisecond, 30 * time.Second} {
 		settings := DefaultPlatformTransportSettings()
 		settings.PingTimeout = pingTimeout
 		config := newPlatformQuicConfig(settings, 1)
-		if config.KeepAlivePeriod != 2*pingTimeout || config.MaxIdleTimeout != 4*pingTimeout {
+		if config.KeepAlivePeriod != pingTimeout || config.MaxIdleTimeout != 4*pingTimeout {
 			t.Fatalf("ping timeout %s: QUIC keepalive=%s idle timeout=%s, want %s and %s",
-				pingTimeout, config.KeepAlivePeriod, config.MaxIdleTimeout, 2*pingTimeout, 4*pingTimeout)
+				pingTimeout, config.KeepAlivePeriod, config.MaxIdleTimeout, pingTimeout, 4*pingTimeout)
 		}
 		if config.MaxIdleTimeout/2 < config.KeepAlivePeriod {
 			t.Fatalf("ping timeout %s: quic-go caps the %s keepalive at half the %s idle timeout",
@@ -84,8 +84,8 @@ func TestPlatformQuicConfigKeepAliveIsTwicePingTimeout(t *testing.T) {
 		}
 	}
 	config := newPlatformQuicConfig(DefaultPlatformTransportSettings(), 1)
-	if detection := config.KeepAlivePeriod + config.MaxIdleTimeout; 30*time.Second < detection {
-		t.Fatalf("default dead-peer detection can take %s, want at most 30s", detection)
+	if detection := config.KeepAlivePeriod + config.MaxIdleTimeout; 25*time.Second < detection {
+		t.Fatalf("default dead-peer detection can take %s, want at most 25s", detection)
 	}
 }
 
