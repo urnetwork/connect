@@ -28,12 +28,25 @@ type webSocketDeadlineError struct {
 // write. A control frame that arrives inside a ready-only batch joins that
 // byte-stream batch in arrival order. Read, deadlines, and Close retain
 // net.Conn's concurrent contract and can interrupt a blocked delegated write.
+//
+// Gorilla installs its stored write deadline again before every frame, even
+// mid-batch, and on a TCP socket each installation moves the socket's deadline
+// timer, a timer heap modify (server CPUOPT2.md §9). So a write deadline equal
+// to the last one forwarded is not forwarded again. SetDeadline and a zero
+// deadline are always forwarded, and every forwarded write deadline, a
+// WriteControl's included, replaces the remembered one.
 type WebSocketWriteBatchConn struct {
 	conn          net.Conn
 	stateLock     sync.Mutex
 	writeBuffer   []byte
 	batching      bool
 	deadlineError atomic.Pointer[webSocketDeadlineError]
+	// writeDeadlineLock serializes write deadline installations so that
+	// writeDeadline, the last one forwarded, is the one the socket holds; zero
+	// when none is known. It is not stateLock, which a blocked delegated write
+	// holds and which a deadline must be able to interrupt.
+	writeDeadlineLock sync.Mutex
+	writeDeadline     time.Time
 
 	// observes each explicit batch as one physical write (transport_delay_h1.go).
 	// Set before the writer starts.
@@ -212,11 +225,24 @@ func (self *WebSocketWriteBatchConn) observeDeadlineError(err error) error {
 }
 
 // Sets both deadlines, preserving any earlier terminal installation failure.
+// Always forwarded; the write deadline it sets is the one later write
+// deadlines compare with.
 func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
 	}
-	return self.observeDeadlineError(self.conn.SetDeadline(deadline))
+	err := func() error {
+		self.writeDeadlineLock.Lock()
+		defer self.writeDeadlineLock.Unlock()
+		err := self.conn.SetDeadline(deadline)
+		if err == nil {
+			self.writeDeadline = deadline
+		} else {
+			self.writeDeadline = time.Time{}
+		}
+		return err
+	}()
+	return self.observeDeadlineError(err)
 }
 
 // A rejected read bound closes this owned full-duplex connection.
@@ -228,9 +254,25 @@ func (self *WebSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
 }
 
 // Gorilla ignores this result; the terminal latch also prevents its next Write.
+// A deadline equal to the last one forwarded is already the socket's and is
+// not forwarded again; a zero deadline always is.
 func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
 	}
-	return self.observeDeadlineError(self.conn.SetWriteDeadline(deadline))
+	err := func() error {
+		self.writeDeadlineLock.Lock()
+		defer self.writeDeadlineLock.Unlock()
+		if !deadline.IsZero() && deadline.Equal(self.writeDeadline) {
+			return nil
+		}
+		err := self.conn.SetWriteDeadline(deadline)
+		if err == nil {
+			self.writeDeadline = deadline
+		} else {
+			self.writeDeadline = time.Time{}
+		}
+		return err
+	}()
+	return self.observeDeadlineError(err)
 }
