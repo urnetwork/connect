@@ -1,8 +1,5 @@
-// The H3 owner installs no stream deadline per batch or per read: its read
-// and write watchdogs bound each operation instead, arming their one timer
-// about once per timeout, and it paces its pings from its last write (server
-// CPUOPT2.md §9). A stream-only QUIC peer on the loopback echoes the
-// authentication, then trades payloads with the owner one at a time.
+// H3 keeps native stream deadlines while pacing pings without a timer reset
+// after every batch. A real QUIC peer exchanges one payload at a time.
 package connect
 
 import (
@@ -18,14 +15,11 @@ import (
 	quic "github.com/quic-go/quic-go"
 )
 
-// The stream deadlines, watchdog arms and ping timer arms an H3 owner made,
-// and its stream writes.
+// Counts the stream deadlines, stream writes and ping timer arms.
 type h3LazyDeadlineCounts struct {
 	writeDeadlineCount int
 	readDeadlineCount  int
 	streamWriteCount   int
-	writeWatchdogArms  int
-	readWatchdogArms   int
 	pingTimerArmCount  int
 }
 
@@ -51,15 +45,6 @@ func (self *h3LazyDeadlineStats) observe(settings *PlatformTransportSettings) {
 		defer self.stateLock.Unlock()
 		self.counts.streamWriteCount += 1
 	}
-	settings.ioWatchdogArmForTest = func(write bool) {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		if write {
-			self.counts.writeWatchdogArms += 1
-		} else {
-			self.counts.readWatchdogArms += 1
-		}
-	}
 	settings.pingTimerArmForTest = func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -81,11 +66,9 @@ func (self *h3LazyDeadlineStats) snapshot() h3LazyDeadlineCounts {
 	return self.counts
 }
 
-// Every payload is its own stream batch and every inbound payload its own
-// stream read. The owner installs no stream deadline and arms each watchdog
-// at most once per timeout and no ping timer, where it used to install a
-// deadline per batch and per read and arm the ping timer per batch.
-func TestH3LazyStreamDeadlinesInstallOncePerSlack(t *testing.T) {
+// Every stream operation retains its own deadline; only ping timer resets
+// are coalesced while payloads are busy.
+func TestH3NativeDeadlinesKeepPingTimerPacing(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		certPem, keyPem, err := selfSign(
 			[]string{testLoopbackIp(ipVersion)},
@@ -248,18 +231,8 @@ func TestH3LazyStreamDeadlinesInstallOncePerSlack(t *testing.T) {
 		if got.streamWriteCount != sendCount {
 			t.Fatalf("%d payloads took %d stream writes, want one each", sendCount, got.streamWriteCount)
 		}
-		// only an interrupt installs a stream deadline, and nothing stalled
-		if got.writeDeadlineCount != 0 || got.readDeadlineCount != 0 {
-			t.Fatalf("in %s, %d stream writes and %d reads installed %d write and %d read deadlines, want none",
-				elapsed, sendCount, receiveCount, got.writeDeadlineCount, got.readDeadlineCount)
-		}
-		// one arm per timeout that elapsed, so a slow run cannot fail it
-		writeArmAllowance := 1 + int(elapsed/settings.WriteTimeout)
-		readArmAllowance := 1 + int(elapsed/settings.ReadTimeout)
-		if writeArmAllowance < got.writeWatchdogArms || readArmAllowance < got.readWatchdogArms {
-			t.Fatalf("in %s, %d stream writes and %d reads armed the write watchdog %d and the read watchdog %d times, want at most %d and %d",
-				elapsed, sendCount, receiveCount, got.writeWatchdogArms, got.readWatchdogArms,
-				writeArmAllowance, readArmAllowance)
+		if got.writeDeadlineCount < sendCount || got.readDeadlineCount < receiveCount {
+			t.Fatalf("native deadline bounds missing: writes=%d/%d reads=%d/%d", got.writeDeadlineCount, sendCount, got.readDeadlineCount, receiveCount)
 		}
 		if pingTimerArmAllowance := int(elapsed / settings.PingTimeout); pingTimerArmAllowance < got.pingTimerArmCount {
 			t.Fatalf("in %s, %d stream writes armed the ping timer %d times, want at most %d", elapsed, sendCount, got.pingTimerArmCount, pingTimerArmAllowance)

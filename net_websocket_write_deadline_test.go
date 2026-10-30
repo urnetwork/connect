@@ -2,8 +2,8 @@
 // On a TCP socket each installation takes the poller's locks and, when the
 // deadline moves, is a timer heap modify, so the batch conn forwards a write
 // deadline only when it changes, zero included (server CPUOPT2.md §9). An
-// expired write deadline is terminal and never lifted. These pin that
-// reduction and every installation that must still reach the socket.
+// expired write deadline may be replaced before the next operation. These
+// pin that reduction and every installation that must still reach the socket.
 package connect
 
 import (
@@ -151,8 +151,7 @@ func TestWebSocketWriteBatchWriteDeadlineFollowsConcurrentSetters(t *testing.T) 
 	}
 }
 
-// With no write deadline set, as on the platform transport whose watchdog
-// bounds its writes, gorilla installs zero before every frame. Once the socket
+// With no write deadline set, gorilla installs zero before every frame. Once the socket
 // holds zero, none of those reaches it again, across single frames, a split
 // message and a ready batch.
 func TestWebSocketWriteBatchForwardsRepeatedZeroWriteDeadlineOnce(t *testing.T) {
@@ -185,42 +184,5 @@ func TestWebSocketWriteBatchForwardsRepeatedZeroWriteDeadlineOnce(t *testing.T) 
 	installs := raw.deadlineInstallsSnapshot()
 	if len(installs) != 1 || installs[0].setter != "write" || !installs[0].deadline.IsZero() {
 		t.Fatalf("a repeated zero write deadline reached the socket %d times, want once: %+v", len(installs), installs)
-	}
-}
-
-// The write watchdog interrupts a stalled write with an expired write deadline,
-// and may land between two of gorilla's frames, each of which installs
-// gorilla's own deadline, zero, first. That must not lift the expiry, nor may
-// a later write deadline, a WriteControl's or SetDeadline's; SetDeadline still
-// sets the read deadline.
-func TestWebSocketWriteBatchKeepsAnExpiredWriteDeadline(t *testing.T) {
-	ws, adapter, raw := newWebSocketDeadlineFixture(t)
-	adapter.BeginWriteBatch()
-	if err := ws.WriteMessage(websocket.BinaryMessage, []byte("first frame")); err != nil {
-		t.Fatal(err)
-	}
-	// the interrupt, between two frames of the batch
-	expired := time.Unix(1, 0)
-	if err := adapter.SetWriteDeadline(expired); err != nil {
-		t.Fatal(err)
-	}
-	raw.resetDeadlineInstalls()
-	ws.WriteMessage(websocket.BinaryMessage, []byte("second frame"))
-	adapter.FlushWriteBatch()
-	if held := raw.writeDeadlineSnapshot(); !held.Equal(expired) {
-		t.Fatalf("the next frame lifted the expired write deadline to %s", held)
-	}
-	ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Minute))
-	adapter.SetWriteDeadline(time.Now().Add(time.Minute))
-	readDeadline := time.Now().Add(2 * time.Minute)
-	if err := adapter.SetDeadline(readDeadline); err != nil {
-		t.Fatal(err)
-	}
-	if held := raw.writeDeadlineSnapshot(); !held.Equal(expired) {
-		t.Fatalf("a later deadline lifted the expired write deadline to %s", held)
-	}
-	installs := raw.deadlineInstallsSnapshot()
-	if len(installs) != 1 || installs[0].setter != "read" || !installs[0].deadline.Equal(readDeadline) {
-		t.Fatalf("installations over the expired write deadline=%+v, want only SetDeadline's read deadline", installs)
 	}
 }

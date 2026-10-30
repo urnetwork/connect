@@ -7,16 +7,8 @@ import (
 
 // The custom carrier drains the same ACK/ordinary lanes and limits as H1 WS,
 // then encodes their ready payloads once through Framer's shared scratch API.
-// The batch installs a write deadline of timeout for itself alone.
+// One native write deadline bounds the whole batch.
 func writeH1FramedReadyBatch(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
-	return writeH1FramedReadyBatchWatched(ctx, writer, send, prioritySend, first, firstPriority, timeout, nil, onSent, retained...)
-}
-
-// writeH1FramedReadyBatch, with the platform writer's write watchdog in place
-// of the deadline when it is not nil. The watchdog bounds the batch's write to
-// its timeout from where the deadline would have been installed, and the
-// socket write deadline stays as it is.
-func writeH1FramedReadyBatchWatched(ctx context.Context, writer *FramedMessageConn, send, prioritySend <-chan []byte, first []byte, firstPriority bool, timeout time.Duration, writeWatchdog *ioWatchdog, onSent func(), retained ...*platformH1RetainedBudget) (open bool, err error) {
 	var owned [platformWebSocketWriteBatchMaxMessages][]byte
 	var priorityOwned [platformWebSocketWriteBatchMaxMessages]bool
 	owned[0] = first
@@ -75,14 +67,10 @@ func writeH1FramedReadyBatchWatched(ctx context.Context, writer *FramedMessageCo
 			n++
 		}
 	}
-	if writeWatchdog != nil {
-		writeWatchdog.begin(time.Now())
-		err = writer.WriteMessages(payloads[:n])
-		writeWatchdog.end()
-	} else if err = writer.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
-		err = writer.WriteMessages(payloads[:n])
+	if err = writer.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return open, err
 	}
-	if err != nil {
+	if err = writer.WriteMessages(payloads[:n]); err != nil {
 		return open, err
 	}
 	if onSent != nil {

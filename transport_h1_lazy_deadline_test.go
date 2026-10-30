@@ -1,9 +1,5 @@
-// The H1 owner installs no socket deadline per frame: its read and write
-// watchdogs bound each operation instead, arming their one timer about once
-// per timeout, and it paces its pings from its last write (server CPUOPT2.md
-// §9). Real H1+ and WebSocket owners run against the synthetic in-memory
-// peer, and virtual time places every boundary exactly. The socket counts
-// each deadline installation that reaches it.
+// Ping pacing preserves the old wire schedule while avoiding a timer reset
+// after every write. Native deadlines remain responsible for I/O bounds.
 package connect
 
 import (
@@ -12,106 +8,12 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
-
-// Counts the timer arms of each connection watchdog direction.
-type h1WatchdogArms struct {
-	read  atomic.Int64
-	write atomic.Int64
-}
-
-// Installs the counting hook.
-func (self *h1WatchdogArms) observe(settings *PlatformTransportSettings) {
-	settings.ioWatchdogArmForTest = func(write bool) {
-		if write {
-			self.write.Add(1)
-		} else {
-			self.read.Add(1)
-		}
-	}
-}
 
 // Selects the H1+ or the WebSocket carrier.
 func withH1Plus(h1Plus bool) func(*PlatformTransportSettings) {
 	return func(settings *PlatformTransportSettings) {
 		settings.EnableH1Plus = h1Plus
-	}
-}
-
-// A busy writer installs no write deadline per write or, on WebSocket, per
-// frame: at most one reaches the socket. The write watchdog bounds the writes
-// instead and arms its timer once for the whole burst, which ends inside one
-// WriteTimeout.
-func TestH1LazyWriteDeadlineInstallsOncePerSlack(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	for _, h1Plus := range []bool{true, false} {
-		synctest.Test(t, func(t *testing.T) {
-			arms := &h1WatchdogArms{}
-			fixture := newH1LivenessFixture(t, withH1Plus(h1Plus), arms.observe)
-			fixture.client.resetDeadlineStats()
-			arms.write.Store(0)
-			// fifty payloads 10ms apart, all inside one WriteTimeout
-			const payloadCount = 50
-			for range payloadCount {
-				fixture.sendMessage(t, h1PlusOwnedTestMessage(0x31, 64))
-				synctest.Wait()
-				time.Sleep(10 * time.Millisecond)
-			}
-			fixture.assertConnected(t)
-			stats := fixture.client.deadlineStatsSnapshot()
-			if fixture.payloads.Load() != payloadCount || stats.writeCount < payloadCount {
-				t.Fatalf("h1+=%t: the peer read %d of %d payloads in %d socket writes", h1Plus, fixture.payloads.Load(), payloadCount, stats.writeCount)
-			}
-			if 1 < stats.writeDeadlineCount {
-				t.Fatalf("h1+=%t: %d payloads installed the write deadline %d times, want at most once", h1Plus, payloadCount, stats.writeDeadlineCount)
-			}
-			if stats.writesWithoutAnyDeadline != stats.writeCount {
-				t.Fatalf("h1+=%t: %d of %d socket writes began under a write deadline, want none", h1Plus, stats.writeCount-stats.writesWithoutAnyDeadline, stats.writeCount)
-			}
-			if writeArms := arms.write.Load(); writeArms != 1 {
-				t.Fatalf("h1+=%t: %d payloads armed the write watchdog %d times, want once", h1Plus, payloadCount, writeArms)
-			}
-		})
-	}
-}
-
-// A reader that keeps receiving frames, server pings included, installs no
-// read deadline: the read watchdog bounds each read instead, and arms its timer
-// at most once per ReadTimeout.
-func TestH1LazyReadDeadlineInstallsOncePerSlack(t *testing.T) {
-	resetH1UpgradeTestState(t)
-	MessagePoolReturn(MessagePoolGet(1))
-	for _, h1Plus := range []bool{true, false} {
-		synctest.Test(t, func(t *testing.T) {
-			arms := &h1WatchdogArms{}
-			fixture := newH1LivenessFixture(t, withH1Plus(h1Plus), arms.observe)
-			fixture.client.resetDeadlineStats()
-			arms.read.Store(0)
-			readTimeout := fixture.transport.settings.ReadTimeout
-			start := time.Now()
-			// heartbeats 10ms apart over three ReadTimeouts
-			heartbeatCount := 0
-			for time.Since(start) < 3*readTimeout {
-				if err := fixture.peer.WriteMessage(websocket.BinaryMessage, nil); err != nil {
-					t.Fatal(err)
-				}
-				heartbeatCount += 1
-				synctest.Wait()
-				time.Sleep(10 * time.Millisecond)
-			}
-			fixture.assertConnected(t)
-			if readDeadlineCount := fixture.client.deadlineStatsSnapshot().readDeadlineCount; 1 < readDeadlineCount {
-				t.Fatalf("h1+=%t: %d inbound frames installed the read deadline %d times, want at most once", h1Plus, heartbeatCount, readDeadlineCount)
-			}
-			// a fire with a read in progress re-arms for the rest of it
-			readArmAllowance := 1 + int64(time.Since(start)/readTimeout)
-			if readArms := arms.read.Load(); readArmAllowance < readArms {
-				t.Fatalf("h1+=%t: %d inbound frames over three read timeouts armed the read watchdog %d times, want at most %d", h1Plus, heartbeatCount, readArms, readArmAllowance)
-			}
-		})
 	}
 }
 

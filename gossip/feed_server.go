@@ -47,14 +47,16 @@ type FeedServerSettings struct {
 	// sample; only the subscription is refused, so it takes its bootstrap and
 	// reconnects elsewhere.
 	MaxSubscriberCount int
-	// An idle subscription is kept alive at this period (D4). A client treats
-	// three missed keepalives as a dead stream (E3).
+	// Maximum silence after a successfully written subscription frame (D4).
+	// Filtered directory records do not renew it. A client treats three missed
+	// keepalives as a dead stream (E3). Non-positive disables these frames.
 	KeepaliveTimeout time.Duration
 	// Budget of the client's opening request, which bounds a connection that
 	// opens the service and then says nothing.
 	RequestTimeout time.Duration
-	// Budget of one frame write, so a client that stops reading releases its
-	// subscriber slot.
+	// Budget of one blocked frame write. A write that fits the socket buffer
+	// can succeed after the peer disappears, so accepted TCP sockets retain
+	// kernel keepalive independently. Non-positive leaves writes unbounded.
 	WriteTimeout time.Duration
 }
 
@@ -185,44 +187,69 @@ func (self *FeedServer) Serve(conn net.Conn) {
 		return
 	}
 
+	// Only a completed outgoing frame renews the heartbeat. A filtered
+	// directory event is no evidence that this subscriber received anything.
+	var keepaliveDue time.Time
+	if 0 < self.settings.KeepaliveTimeout {
+		keepaliveDue = time.Now().Add(self.settings.KeepaliveTimeout)
+	}
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-clientGone:
 			return
-		case message, ok := <-messages:
-			if !ok {
-				// the directory closed the subscription because this client
-				// fell a whole buffer behind (D4)
-				if self.log.V(1).Enabled() {
-					self.log.Infof("[gossip]feed subscriber fell behind\n")
-				}
-				return
+		default:
+		}
+		var frame *protocol.ExtenderFeedFrame
+		wait := time.Until(keepaliveDue)
+		if !keepaliveDue.IsZero() && wait <= 0 {
+			// Check before selecting more records: a perpetually ready
+			// directory cannot starve a heartbeat that is already due.
+			frame = &protocol.ExtenderFeedFrame{
+				Frame: &protocol.ExtenderFeedFrame_Keepalive{Keepalive: true},
 			}
-			frame := &protocol.ExtenderFeedFrame{}
-			switch {
-			case message.GetRecord() != nil:
-				if !self.streamsRecord(message.GetRecord(), vantage) {
-					// outside the client's partition: as unseen on the
-					// stream as in the sample (Q2)
+		} else {
+			var keepaliveTimeout <-chan time.Time
+			if !keepaliveDue.IsZero() {
+				keepaliveTimeout = time.After(wait)
+			}
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-clientGone:
+				return
+			case message, ok := <-messages:
+				if !ok {
+					// The directory refuses a subscriber that falls a whole
+					// buffer behind (D4).
+					if self.log.V(1).Enabled() {
+						self.log.Infof("[gossip]feed subscriber fell behind\n")
+					}
+					return
+				}
+				frame = &protocol.ExtenderFeedFrame{}
+				switch {
+				case message.GetRecord() != nil:
+					if !self.streamsRecord(message.GetRecord(), vantage) {
+						// The record is outside the client's partition (Q2).
+						continue
+					}
+					frame.Frame = &protocol.ExtenderFeedFrame_Record{Record: message.GetRecord()}
+				case message.GetRevocation() != nil:
+					frame.Frame = &protocol.ExtenderFeedFrame_Revocation{Revocation: message.GetRevocation()}
+				default:
 					continue
 				}
-				frame.Frame = &protocol.ExtenderFeedFrame_Record{Record: message.GetRecord()}
-			case message.GetRevocation() != nil:
-				frame.Frame = &protocol.ExtenderFeedFrame_Revocation{Revocation: message.GetRevocation()}
-			default:
+			case <-keepaliveTimeout:
 				continue
 			}
-			if err := self.write(conn, frame); err != nil {
-				return
-			}
-		case <-time.After(self.settings.KeepaliveTimeout):
-			if err := self.write(conn, &protocol.ExtenderFeedFrame{
-				Frame: &protocol.ExtenderFeedFrame_Keepalive{Keepalive: true},
-			}); err != nil {
-				return
-			}
+		}
+		if err := self.write(conn, frame); err != nil {
+			return
+		}
+		if 0 < self.settings.KeepaliveTimeout {
+			keepaliveDue = time.Now().Add(self.settings.KeepaliveTimeout)
 		}
 	}
 }

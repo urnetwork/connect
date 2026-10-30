@@ -295,6 +295,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// engaged well before the shortest receive verdict (20s) can mature
 		// on evidence collected during the silence
 		UplinkStalenessGate:                       5 * time.Second,
+		UplinkStalenessMaxHold:                    60 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
@@ -453,7 +454,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// one full uplink-gate window (5s) of grace after wake: long enough for
 		// the transports to re-register and the first return packets to land,
 		// short enough that a genuinely dead exit is still convicted promptly
-		SchedulerPauseRecoveryTimeout: 5 * time.Second,
+		SchedulerPauseRecoveryTimeout:  5 * time.Second,
+		SchedulerPauseDetectorSettings: DefaultSchedulerPauseDetectorSettings(),
 		// Keep exact accepted ownership for the flow lifetime. Elapsed time
 		// alone must not multiply an inner TCP retry into another Transfer Pack.
 		// A positive runtime override retains the optional timed-escape policy.
@@ -716,9 +718,14 @@ type MultiClientSettings struct {
 	// Ack delivery. A reliable carrier, or a fresh uplink, keeps that verdict on
 	// its own fast signal. The gate only applies while at least two channels are
 	// actively talking (see sendingChannelCount), and stops applying after
-	// uplinkStalenessMaxHold of continuous staleness so a genuinely dead
+	// UplinkStalenessMaxHold of continuous staleness so a genuinely dead
 	// window can still be recycled. 0 disables the gate entirely.
 	UplinkStalenessGate time.Duration
+	// Maximum continuous uplink-staleness hold. The 60-second default lets
+	// network changes recover before ordinary verdicts recycle a dead window.
+	// Non-positive permits immediate verdicts while preserving freshness
+	// rebasing. The independent scheduler-pause recovery hold still applies.
+	UplinkStalenessMaxHold time.Duration
 	// MaxFlowsPerExit bounds how many live flows may be pinned to one exit.
 	//
 	// Providers are split-tcp, so removing an exit destroys every flow on it.
@@ -1144,6 +1151,10 @@ type MultiClientSettings struct {
 	// first verdict pass after wake cannot convict on a window whose history
 	// was accumulated before the host stopped. 0 rebases without holding.
 	SchedulerPauseRecoveryTimeout time.Duration
+	// Timing for this client's private detector. Nil uses the default settings.
+	// A supplied shared detector owns its settings instead. Copied at creation;
+	// per-client tolerance and recovery hold remain runtime reliability settings.
+	SchedulerPauseDetectorSettings *SchedulerPauseDetectorSettings
 	// SchedulerPauseDetector, when set, is the detector this client shares
 	// with the other clients of its host instead of running its own. A host
 	// that runs many clients (the proxy service) sets one detector on all of
@@ -2968,14 +2979,14 @@ func NewRemoteUserNatMultiClient(
 	// down the tunnel it exists to protect. A client given a shared detector
 	// subscribes to it for its life instead.
 	if 0 < settings.SchedulerPauseTolerance {
-		if detector := settings.SchedulerPauseDetector; detector != nil {
-			detector.subscribe(multiClient)
-			context.AfterFunc(multiClient.ctx, func() {
-				detector.unsubscribe(multiClient)
-			})
-		} else {
-			go HandleError(multiClient.runSchedulerPauseDetector)
+		detector := settings.SchedulerPauseDetector
+		if detector == nil {
+			detector = NewSchedulerPauseDetectorWithSettings(multiClient.ctx, settings.SchedulerPauseDetectorSettings)
 		}
+		detector.subscribe(multiClient)
+		context.AfterFunc(multiClient.ctx, func() {
+			detector.unsubscribe(multiClient)
+		})
 	}
 
 	return multiClient
@@ -3439,6 +3450,7 @@ type ReliabilitySettings struct {
 	GroupFollowWindow          time.Duration
 	DialFailureRerace          bool
 	UplinkStalenessGate        time.Duration
+	UplinkStalenessMaxHold     time.Duration
 	SoftVerdictDemote          bool
 	RemovalBudgetCount         int
 	RemovalBudgetWindow        time.Duration
@@ -3526,6 +3538,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		GroupFollowWindow:          settings.GroupFollowWindow,
 		DialFailureRerace:          settings.DialFailureRerace,
 		UplinkStalenessGate:        settings.UplinkStalenessGate,
+		UplinkStalenessMaxHold:     settings.UplinkStalenessMaxHold,
 		SoftVerdictDemote:          settings.SoftVerdictDemote,
 		RemovalBudgetCount:         settings.RemovalBudgetCount,
 		RemovalBudgetWindow:        settings.RemovalBudgetWindow,
@@ -8520,14 +8533,6 @@ const (
 	// unsynchronized read-then-write race is benign: losing a store leaves a
 	// stamp at most this much older than the truth.
 	uplinkStampCoarseness = 100 * time.Millisecond
-
-	// uplinkStalenessMaxHold caps how long continuous staleness may hold
-	// verdicts. The gate cannot tell a long network outage from a window
-	// whose every provider is dead -- both are tunnel-wide silence -- so past
-	// this bound it stops applying and the ordinary verdicts recycle the
-	// window. The epoch stays open: the clocks still rebase when receiving
-	// actually resumes, so the recycled channels' replacements start clean.
-	uplinkStalenessMaxHold = 60 * time.Second
 )
 
 // stampUplinkIngress records proof that the local uplink delivers. Called
@@ -8649,7 +8654,9 @@ func (self *RemoteUserNatMultiClient) receivingChannelCount(exclude *multiClient
 // from. Safe on a bare client; called from every channel's detectBlackhole
 // cadence with no locks held.
 func (self *RemoteUserNatMultiClient) uplinkGate(now time.Time) (stale bool, freshSince time.Time) {
-	gate := self.reliabilitySettings().UplinkStalenessGate
+	reliabilitySettings := self.reliabilitySettings()
+	gate := reliabilitySettings.UplinkStalenessGate
+	maxHold := reliabilitySettings.UplinkStalenessMaxHold
 
 	timeStale := false
 	if 0 < gate {
@@ -8672,60 +8679,60 @@ func (self *RemoteUserNatMultiClient) uplinkGate(now time.Time) (stale bool, fre
 	// (false, uplinkFreshSince), and uplinkFreshSince is zero on a client that
 	// has never been gated or rebased -- the disabled-gate behavior unchanged.
 
-	self.uplinkStateLock.Lock()
-	defer self.uplinkStateLock.Unlock()
+	logState := ""
+	stale, freshSince = func() (bool, time.Time) {
+		self.uplinkStateLock.Lock()
+		defer self.uplinkStateLock.Unlock()
 
-	// the scheduler-pause recovery hold rides out on the same two values the
-	// migration case uses (see notifySchedulerPause): a suspend and a network
-	// migration are the same problem for the verdict layer -- evidence
-	// collected while nothing could arrive -- so they share one hold path
-	// instead of the channels learning about a second one.
-	pauseHold := !self.schedulerPauseHoldUntil.IsZero() && now.Before(self.schedulerPauseHoldUntil)
-
-	if timeStale {
-		if self.uplinkStaleSince.IsZero() {
-			self.uplinkStaleSince = now
-			self.uplinkCapLogged = false
-			// transitions only -- the passes in between are silent
-			loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", "stale"))
-		}
-		if uplinkStalenessMaxHold <= now.Sub(self.uplinkStaleSince) {
-			// past the cap the gate stops applying so a genuinely dead window
-			// can be recycled. the epoch deliberately stays open: freshSince
-			// must not advance to here, or the recycle the cap exists to
-			// allow would be rebased away.
-			if !self.uplinkCapLogged {
-				self.uplinkCapLogged = true
-				loggerOrDefault(self.log).Infof("%s\n", relEvent(
-					"uplink",
-					"state", "cap",
-					"hold", uplinkStalenessMaxHold,
-				))
+		// Pause recovery and uplink migration share the same verdict hold.
+		pauseHold := !self.schedulerPauseHoldUntil.IsZero() && now.Before(self.schedulerPauseHoldUntil)
+		if timeStale {
+			if self.uplinkStaleSince.IsZero() {
+				self.uplinkStaleSince = now
+				self.uplinkCapLogged = false
+				logState = "stale"
 			}
-			// the cap releases the ingress-staleness hold only. an open
-			// scheduler-pause window is a different, bounded piece of evidence
-			// and keeps holding on its own timer.
-			return pauseHold, self.uplinkFreshSince
+			if maxHold <= now.Sub(self.uplinkStaleSince) {
+				// The epoch remains open at the cap: rebasing here would defer
+				// the recycle this cap permits. Pause recovery remains separate.
+				if !self.uplinkCapLogged {
+					self.uplinkCapLogged = true
+					logState = "cap"
+				}
+				return pauseHold, self.uplinkFreshSince
+			}
+			return true, self.uplinkFreshSince
 		}
-		return true, self.uplinkFreshSince
-	}
 
-	if !self.uplinkStaleSince.IsZero() {
-		// the stale epoch just ended. the receive-verdict clocks rebase from
-		// here, so verdicts held across the epoch restart instead of all
-		// firing at once on unfreeze.
-		self.uplinkStaleSince = time.Time{}
-		self.uplinkFreshSince = now
-		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", "fresh"))
+		if !self.uplinkStaleSince.IsZero() {
+			// Rebase held receive verdicts when ingress actually resumes.
+			self.uplinkStaleSince = time.Time{}
+			self.uplinkFreshSince = now
+			logState = "fresh"
+		}
+		return pauseHold, self.uplinkFreshSince
+	}()
+	// A slow sink must not retain the lock the shared pause detector needs.
+	if logState == "cap" {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", logState, "hold", maxHold))
+	} else if logState != "" {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", logState))
 	}
-	return pauseHold, self.uplinkFreshSince
+	return stale, freshSince
 }
 
-// schedulerPauseProbeInterval is how long the pause detector arms for on each
-// iteration. Short enough that a suspend is noticed on the first wakeup after
-// resume (the hold has to be in place before the channels' 1.25s verdict passes
-// run), long enough that the goroutine costs one wakeup per second.
-const schedulerPauseProbeInterval = 1 * time.Second
+// Detector-owned timing, shared by every client registered with that detector.
+type SchedulerPauseDetectorSettings struct {
+	// Time between probes. The one-second default notices resume before the
+	// ordinary verdict passes without adding more than one wakeup per second.
+	// Non-positive disables probes. A shared detector copies this at creation.
+	ProbeInterval time.Duration
+}
+
+// The private and shared detectors use the same probe cadence.
+func DefaultSchedulerPauseDetectorSettings() *SchedulerPauseDetectorSettings {
+	return &SchedulerPauseDetectorSettings{ProbeInterval: time.Second}
+}
 
 // schedulerPauseDetected is the whole detection rule: a timer armed for
 // `expected` that took `elapsed` to come back was not merely late, it was not
@@ -8754,69 +8761,62 @@ func schedulerPauseElapsed(start time.Time, now time.Time) time.Duration {
 	return now.Sub(start) + max(0, hostSlept(now, start))
 }
 
-// runSchedulerPauseDetector watches for the host stopping underneath us.
-//
-// The instrument is deliberately the crudest one available: arm a timer, see
-// how long it actually took (schedulerPauseElapsed). Everything else this
-// process could measure went away with the cpu -- no packets arrived, no acks
-// landed, no verdict pass ran -- so the only observable left is that wall-clock
-// time passed while we were not running. That is exactly what doze, the app
-// freezer, thermal throttling and a closed lid look like from in here.
-//
-// Plain time.After, NOT WakeupAfter: the wakeup scheduler intentionally
-// coalesces timers to save radio wakeups, and a coalesced fire is precisely the
-// "late" this loop would misread as a suspend.
-//
-// Tied to the multi-client ctx and not to `cancel`: like the prober, a detector
-// failure must never tear down the tunnel. One timer is armed for the loop's
-// life and re-armed after each wait.
-func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector() {
-	probeTimer := time.NewTimer(schedulerPauseProbeInterval)
-	defer probeTimer.Stop()
-	for {
-		armed := time.Now()
-		select {
-		case <-self.ctx.Done():
-			return
-		case <-probeTimer.C:
-		}
-		self.observeSchedulerPause(armed, time.Now())
-		probeTimer.Reset(schedulerPauseProbeInterval)
-	}
-}
-
-// SchedulerPauseDetector is one scheduler-pause detector that the clients of
-// a host share (`MultiClientSettings.SchedulerPauseDetector`). A pause belongs
-// to the host, not to a client: when the process is frozen or the host
-// sleeps, every client's timer comes back late together. So one timer, armed
-// exactly as a client's own detector arms it, judges for all of them: each
-// subscribed client judges the same two readings with its own tolerance and
-// opens its own hold (`observeSchedulerPause`), as its own detector would
-// have. A host running thousands of clients pays one goroutine and one wakeup
-// per probe interval instead of one each per client.
+// One pause timer serves a private client or all clients of a host. Every
+// client judges the same readings with its own tolerance and recovery hold.
+// Holds are applied before logs are queued, and logging never runs on the
+// timer goroutine. One separate worker owns at most one pending log per live
+// registration, coalescing repeated pauses while an external sink is slow.
+// Safe for concurrent subscription, unsubscription and Close.
 type SchedulerPauseDetector struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	settings SchedulerPauseDetectorSettings
+	done     chan struct{}
+	logs     *schedulerPauseLogs
 
 	stateLock sync.Mutex
-	clients   map[*RemoteUserNatMultiClient]struct{}
+	clients   map[*RemoteUserNatMultiClient]*schedulerPauseLogSlot
 }
 
-// NewSchedulerPauseDetector starts a shared detector that runs until ctx ends
-// or Close.
+// Starts a detector with the default timing until ctx ends or Close is called.
 func NewSchedulerPauseDetector(ctx context.Context) *SchedulerPauseDetector {
+	return NewSchedulerPauseDetectorWithSettings(ctx, DefaultSchedulerPauseDetectorSettings())
+}
+
+// Copies the settings and starts the timer and logging workers. Nil settings
+// use the defaults. The logger worker never retains a client or detector.
+func NewSchedulerPauseDetectorWithSettings(ctx context.Context, settings *SchedulerPauseDetectorSettings) *SchedulerPauseDetector {
+	if settings == nil {
+		settings = DefaultSchedulerPauseDetectorSettings()
+	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	detector := &SchedulerPauseDetector{
-		ctx:     cancelCtx,
-		cancel:  cancel,
-		clients: map[*RemoteUserNatMultiClient]struct{}{},
+		ctx:      cancelCtx,
+		cancel:   cancel,
+		settings: *settings,
+		done:     make(chan struct{}),
+		logs:     newSchedulerPauseLogs(cancelCtx),
+		clients:  map[*RemoteUserNatMultiClient]*schedulerPauseLogSlot{},
 	}
 	go HandleError(detector.run)
 	return detector
 }
 
+// Cancels probes and releases registrations and pending logs immediately.
+// Logger calls have no cancellation contract: one already-entered log call
+// may finish later. Close does not join that external call; its worker exits
+// as soon as it returns, retaining only that scalar snapshot and logger.
 func (self *SchedulerPauseDetector) Close() {
 	self.cancel()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, slot := range self.clients {
+			self.logs.unsubscribe(slot)
+		}
+		clear(self.clients)
+	}()
+	self.logs.close()
 }
 
 // ClientCount is the number of clients the detector judges for.
@@ -8829,22 +8829,38 @@ func (self *SchedulerPauseDetector) ClientCount() int {
 func (self *SchedulerPauseDetector) subscribe(client *RemoteUserNatMultiClient) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.clients[client] = struct{}{}
+	if self.ctx.Err() != nil || (client.ctx != nil && client.ctx.Err() != nil) {
+		return
+	}
+	if _, ok := self.clients[client]; !ok {
+		self.clients[client] = &schedulerPauseLogSlot{log: loggerOrDefault(client.log), active: true}
+	}
 }
 
 func (self *SchedulerPauseDetector) unsubscribe(client *RemoteUserNatMultiClient) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if slot := self.clients[client]; slot != nil {
+		self.logs.unsubscribe(slot)
+	}
 	delete(self.clients, client)
 }
 
-// The client detector's wait, made once for every subscribed client: plain
-// timer, NOT WakeupAfter, for the reason on runSchedulerPauseDetector.
+// Arms a plain timer for the detector's life. WakeupAfter deliberately batches
+// wakeups, which would turn ordinary coalescing into false pause evidence.
+// Cancellation stops the timer independently of external logging.
 func (self *SchedulerPauseDetector) run() {
-	probeTimer := time.NewTimer(schedulerPauseProbeInterval)
+	defer close(self.done)
+	defer self.Close()
+	probeInterval := self.settings.ProbeInterval
+	if probeInterval <= 0 {
+		<-self.ctx.Done()
+		return
+	}
+	probeTimer := time.NewTimer(probeInterval)
 	defer probeTimer.Stop()
 	// reused by each pass, so a pass allocates nothing
-	var clients []*RemoteUserNatMultiClient
+	var observations []schedulerPauseObservation
 	for {
 		armed := time.Now()
 		select {
@@ -8852,56 +8868,70 @@ func (self *SchedulerPauseDetector) run() {
 			return
 		case <-probeTimer.C:
 		}
-		clients = self.observeSchedulerPause(clients[:0], armed, time.Now())
-		probeTimer.Reset(schedulerPauseProbeInterval)
+		observations = self.observeSchedulerPause(observations[:0], armed, time.Now())
+		probeTimer.Reset(probeInterval)
 	}
+}
+
+// Only a detector pass holds clients. Logging receives scalar values and a
+// registration slot with no backlink to a client or detector.
+type schedulerPauseObservation struct {
+	client *RemoteUserNatMultiClient
+	slot   *schedulerPauseLogSlot
+	event  schedulerPauseLogEvent
 }
 
 // Judges one wait for every subscribed client, from the two readings of the
-// shared timer. The clients are read into `clients`, which is cleared and
-// returned for reuse.
-func (self *SchedulerPauseDetector) observeSchedulerPause(clients []*RemoteUserNatMultiClient, armed time.Time, now time.Time) []*RemoteUserNatMultiClient {
+// shared timer. All holds precede log publication. The pass buffer is cleared
+// before reuse so neither cancellation nor an idle timer retains old clients.
+func (self *SchedulerPauseDetector) observeSchedulerPause(observations []schedulerPauseObservation, armed time.Time, now time.Time) []schedulerPauseObservation {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		for client := range self.clients {
-			clients = append(clients, client)
+		for client, slot := range self.clients {
+			observations = append(observations, schedulerPauseObservation{client: client, slot: slot})
 		}
 	}()
-	for _, client := range clients {
-		observeSchedulerPauseIsolated(client, armed, now)
+	publish := false
+	for i := range observations {
+		observations[i].event = observeSchedulerPauseIsolated(observations[i].client, armed, now, self.settings.ProbeInterval)
+		publish = publish || 0 < observations[i].event.pauseCount || observations[i].event.warning != ""
 	}
-	clear(clients)
-	return clients
+	if publish {
+		self.logs.publish(observations)
+	}
+	clear(observations)
+	return observations
 }
 
-// One client's judgement. A panic in it is logged and ends only this
-// judgement: the shared detector keeps judging for every client.
-func observeSchedulerPauseIsolated(client *RemoteUserNatMultiClient, armed time.Time, now time.Time) {
+// One client's judgement. Even panic reporting is deferred to the log worker
+// so a logger cannot stop another client's hold publication.
+func observeSchedulerPauseIsolated(client *RemoteUserNatMultiClient, armed time.Time, now time.Time, probeInterval time.Duration) (event schedulerPauseLogEvent) {
 	defer func() {
 		if r := recover(); r != nil {
-			DefaultLogger().Warningf("Unexpected error: %s\n", ErrorJson(r, debug.Stack()))
+			// The panic value may reference a client or run arbitrary formatting
+			// code. Preserve its type and stack as an immutable scalar instead.
+			event.warning = fmt.Sprintf("Unexpected scheduler pause error (%T):\n%s", r, debug.Stack())
 		}
 	}()
-	select {
-	case <-client.ctx.Done():
+	if client.ctx != nil && client.ctx.Err() != nil {
 		// a closing client leaves the detector; it is judged no more
 		return
-	default:
 	}
-	client.observeSchedulerPause(armed, now)
+	return client.observeSchedulerPause(armed, now, probeInterval)
 }
 
 // Judges one wait of the pause detector, from the reading taken when it armed
 // and the one taken when it fired.
-func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time) {
+func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time, probeInterval time.Duration) schedulerPauseLogEvent {
 	// read the tolerance AFTER the wait so the runtime toggle takes effect
 	// without a reconnect, the same discipline the other loops here use
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
 	elapsed := schedulerPauseElapsed(armed, now)
-	if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
-		self.notifySchedulerPause(elapsed)
+	if schedulerPauseDetected(elapsed, probeInterval, tolerance) {
+		return self.notifySchedulerPause(elapsed)
 	}
+	return schedulerPauseLogEvent{}
 }
 
 // notifySchedulerPause records that the host was suspended and just resumed.
@@ -8920,7 +8950,7 @@ func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now
 //
 // Lock discipline: only uplinkStateLock (a leaf) is taken, with nothing else
 // held. Safe on a bare client.
-func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration) {
+func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration) schedulerPauseLogEvent {
 	recoveryTimeout := self.reliabilitySettings().SchedulerPauseRecoveryTimeout
 	now := time.Now()
 	func() {
@@ -8934,13 +8964,188 @@ func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration
 		}
 	}()
 	self.reliabilityMetrics.schedulerPauseDetected()
-	// one line per detected pause -- a suspend is a rare, decisive event and
-	// the reconstruction of any wake-up incident starts here
-	loggerOrDefault(self.log).Infof("%s\n", relEvent(
-		"scheduler_pause",
-		"elapsed", elapsed.Round(time.Millisecond),
-		"hold", recoveryTimeout,
-	))
+	return schedulerPauseLogEvent{elapsed: elapsed, hold: recoveryTimeout, pauseCount: 1}
+}
+
+// Scalar evidence copied from a completed hold update. Repeated pauses retain
+// their count and latest timing when their logger cannot keep up.
+type schedulerPauseLogEvent struct {
+	elapsed    time.Duration
+	hold       time.Duration
+	pauseCount uint64
+	warning    string
+}
+
+// One pending record per live registration. No field points back to the
+// client or detector. All fields are guarded by schedulerPauseLogs.stateLock.
+type schedulerPauseLogSlot struct {
+	log      Logger
+	active   bool
+	pending  bool
+	previous *schedulerPauseLogSlot
+	next     *schedulerPauseLogSlot
+	event    schedulerPauseLogEvent
+}
+
+// One worker and at most one pending slot per subscription. Unsubscribe
+// removes a slot in constant time; Close releases all pending logger refs.
+// The worker takes one scalar snapshot at a time, never a batch of owners.
+type schedulerPauseLogs struct {
+	ctx       context.Context
+	notify    chan struct{}
+	done      chan struct{}
+	stateLock sync.Mutex
+	closed    bool
+	head      *schedulerPauseLogSlot
+	tail      *schedulerPauseLogSlot
+}
+
+// The worker is separate from the detector so an in-flight external logger
+// cannot retain the detector's clients after cancellation.
+func newSchedulerPauseLogs(ctx context.Context) *schedulerPauseLogs {
+	logs := &schedulerPauseLogs{
+		ctx:    ctx,
+		notify: make(chan struct{}, 1),
+		done:   make(chan struct{}),
+	}
+	go logs.run()
+	return logs
+}
+
+// Coalesces behind a slow sink without dropping a client's first pending
+// resume record. The timer never calls external logger methods here.
+func (self *schedulerPauseLogs) publish(observations []schedulerPauseObservation) {
+	notify := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.closed || self.ctx.Err() != nil {
+			return
+		}
+		for _, observation := range observations {
+			slot, event := observation.slot, observation.event
+			if !slot.active || (event.pauseCount == 0 && event.warning == "") {
+				continue
+			}
+			if 0 < event.pauseCount {
+				slot.event.elapsed = event.elapsed
+				slot.event.hold = event.hold
+				slot.event.pauseCount += event.pauseCount
+			}
+			if event.warning != "" {
+				slot.event.warning = event.warning
+			}
+			if !slot.pending {
+				slot.pending = true
+				slot.previous = self.tail
+				if self.tail != nil {
+					self.tail.next = slot
+				} else {
+					self.head = slot
+				}
+				self.tail = slot
+			}
+			notify = true
+		}
+	}()
+	if notify {
+		select {
+		case self.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Removes one queued record; called with the log queue lock held.
+func (self *schedulerPauseLogs) removeWithLock(slot *schedulerPauseLogSlot) {
+	if !slot.pending {
+		return
+	}
+	if slot.previous != nil {
+		slot.previous.next = slot.next
+	} else {
+		self.head = slot.next
+	}
+	if slot.next != nil {
+		slot.next.previous = slot.previous
+	} else {
+		self.tail = slot.previous
+	}
+	slot.pending = false
+	slot.previous = nil
+	slot.next = nil
+}
+
+// Retiring a client withdraws its pending logs even if another sink is held.
+func (self *schedulerPauseLogs) unsubscribe(slot *schedulerPauseLogSlot) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.removeWithLock(slot)
+	slot.active = false
+	slot.log = nil
+	slot.event = schedulerPauseLogEvent{}
+}
+
+// Stops admission and releases queued snapshots without joining an external
+// sink. Only the worker's already-entered scalar snapshot may outlive this.
+func (self *schedulerPauseLogs) close() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.closed = true
+	for self.head != nil {
+		slot := self.head
+		self.removeWithLock(slot)
+		slot.active = false
+		slot.log = nil
+		slot.event = schedulerPauseLogEvent{}
+	}
+}
+
+// Taking a record transfers only its logger and scalar evidence to the one
+// worker. No slot/client collection survives a blocked logger call.
+func (self *schedulerPauseLogs) take() (Logger, schedulerPauseLogEvent, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed || self.ctx.Err() != nil || self.head == nil {
+		return nil, schedulerPauseLogEvent{}, false
+	}
+	slot := self.head
+	self.removeWithLock(slot)
+	log, event := slot.log, slot.event
+	slot.event = schedulerPauseLogEvent{}
+	return log, event, true
+}
+
+// Logging is independent of timer progress and holds. A sink panic cannot
+// stop subsequent records; a sink that never returns retains this one worker,
+// because Logger has no cancellation contract.
+func (self *schedulerPauseLogs) run() {
+	defer close(self.done)
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.notify:
+		}
+		for {
+			log, event, ok := self.take()
+			if !ok {
+				break
+			}
+			HandleError(func() {
+				if event.warning != "" {
+					log.Warningf("%s\n", event.warning)
+				}
+				if 0 < event.pauseCount {
+					line := relEvent("scheduler_pause", "elapsed", event.elapsed.Round(time.Millisecond), "hold", event.hold)
+					if 1 < event.pauseCount {
+						line += fmt.Sprintf(" coalesced=%d", event.pauseCount-1)
+					}
+					log.Infof("%s\n", line)
+				}
+			})
+		}
+	}
 }
 
 // NotifyNetworkChanged is the parent seam for the host's network path change

@@ -520,7 +520,7 @@ func TestRecentExitRemembersVerdictsOnlyInTheDark(t *testing.T) {
 			parent: func(now time.Time) *RemoteUserNatMultiClient {
 				mc := uplinkGateTestParent(2)
 				mc.uplinkLastIngressNanos.Store(now.Add(-100 * time.Second).UnixNano())
-				mc.uplinkStaleSince = now.Add(-uplinkStalenessMaxHold - time.Second)
+				mc.uplinkStaleSince = now.Add(-mc.settings.UplinkStalenessMaxHold - time.Second)
 				return mc
 			},
 			err:   noSendAck,

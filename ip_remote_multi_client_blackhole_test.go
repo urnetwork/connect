@@ -585,7 +585,7 @@ func TestBlackholeUplinkGateStaleEpochAndCap(t *testing.T) {
 
 	// past the hard cap the gate stops applying -- a window whose every
 	// provider is dead is also tunnel-wide silence, and it must still recycle
-	capped := now.Add(uplinkStalenessMaxHold + time.Second)
+	capped := now.Add(mc.settings.UplinkStalenessMaxHold + time.Second)
 	stale, freshSince = mc.uplinkGate(capped)
 	if stale {
 		t.Error("the gate still held past the hard cap")

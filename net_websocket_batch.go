@@ -36,11 +36,6 @@ type webSocketDeadlineError struct {
 // included, is not forwarded again. SetDeadline is always forwarded, and every
 // forwarded write deadline, a WriteControl's included, replaces the remembered
 // one.
-//
-// An expired write deadline is terminal: no later one replaces it. A WebSocket
-// write timeout cannot be recovered anyway, and the platform transport's write
-// watchdog ends a stalled write by installing one, which gorilla's next frame
-// would otherwise lift if the watchdog lands between two frames.
 type WebSocketWriteBatchConn struct {
 	conn          net.Conn
 	stateLock     sync.Mutex
@@ -49,13 +44,11 @@ type WebSocketWriteBatchConn struct {
 	deadlineError atomic.Pointer[webSocketDeadlineError]
 	// writeDeadlineLock serializes write deadline installations so that
 	// writeDeadline, the last one forwarded, is the one the socket holds while
-	// writeDeadlineKnown. writeDeadlineExpired is set once an expired one has
-	// been installed. It is not stateLock, which a blocked delegated write
-	// holds and which a deadline must be able to interrupt.
-	writeDeadlineLock    sync.Mutex
-	writeDeadline        time.Time
-	writeDeadlineKnown   bool
-	writeDeadlineExpired bool
+	// writeDeadlineKnown. It is not stateLock, which a blocked delegated
+	// write holds and which a deadline must be able to interrupt.
+	writeDeadlineLock  sync.Mutex
+	writeDeadline      time.Time
+	writeDeadlineKnown bool
 
 	// observes each explicit batch as one physical write (transport_delay_h1.go).
 	// Set before the writer starts.
@@ -235,8 +228,7 @@ func (self *WebSocketWriteBatchConn) observeDeadlineError(err error) error {
 
 // Sets both deadlines, preserving any earlier terminal installation failure.
 // Always forwarded; the write deadline it sets is the one later write
-// deadlines compare with. Over an expired write deadline only the read
-// deadline is set.
+// deadlines compare with, including a past deadline replaced before I/O.
 func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
@@ -244,9 +236,6 @@ func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
 	err := func() error {
 		self.writeDeadlineLock.Lock()
 		defer self.writeDeadlineLock.Unlock()
-		if self.writeDeadlineExpired {
-			return self.conn.SetReadDeadline(deadline)
-		}
 		err := self.conn.SetDeadline(deadline)
 		self.rememberWriteDeadlineWithLock(deadline, err)
 		return err
@@ -264,7 +253,6 @@ func (self *WebSocketWriteBatchConn) rememberWriteDeadlineWithLock(deadline time
 	}
 	self.writeDeadline = deadline
 	self.writeDeadlineKnown = true
-	self.writeDeadlineExpired = !deadline.IsZero() && !deadline.After(time.Now())
 }
 
 // A rejected read bound closes this owned full-duplex connection.
@@ -277,7 +265,8 @@ func (self *WebSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
 
 // Gorilla ignores this result; the terminal latch also prevents its next Write.
 // A deadline equal to the last one forwarded is already the socket's and is
-// not forwarded again, and none replaces an expired one.
+// not forwarded again. A new operation may replace an expired deadline
+// when the earlier I/O succeeded; only an actual write error is terminal.
 func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
@@ -285,7 +274,7 @@ func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error 
 	err := func() error {
 		self.writeDeadlineLock.Lock()
 		defer self.writeDeadlineLock.Unlock()
-		if self.writeDeadlineExpired || self.writeDeadlineKnown && deadline.Equal(self.writeDeadline) {
+		if self.writeDeadlineKnown && deadline.Equal(self.writeDeadline) {
 			return nil
 		}
 		err := self.conn.SetWriteDeadline(deadline)

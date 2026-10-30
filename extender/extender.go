@@ -71,6 +71,12 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		WriteTimeout: 30 * time.Second,
 		ValidFrom:    180 * 24 * time.Hour,
 		ValidFor:     180 * 24 * time.Hour,
+		TcpKeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     15 * time.Second,
+			Interval: 15 * time.Second,
+			Count:    9,
+		},
 
 		HeaderTimeout:               10 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
@@ -126,10 +132,18 @@ func DefaultExtenderSettings() *ExtenderSettings {
 }
 
 type ExtenderSettings struct {
+	// Budget of one relay read or chunk write. Non-positive leaves that
+	// direction of I/O unbounded; the other budget remains independent.
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	ValidFrom    time.Duration
 	ValidFor     time.Duration
+	// Kernel keepalive for accepted TCP sockets, including feed, gossip and
+	// HTTP services. The default preserves Go's former listener cadence:
+	// 15 s idle, 15 s between unanswered probes, 9 probes. Application writes
+	// may only fill a socket buffer and do not replace this liveness backstop.
+	// Enable=false disables it. A custom Listen callback owns its socket policy.
+	TcpKeepAliveConfig net.KeepAliveConfig
 
 	// Budget for the outer handshake and the extender request of one
 	// connection (A9). A client that opens a connection and says nothing is
@@ -376,8 +390,8 @@ type ExtenderSettings struct {
 
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
-	// binds with TCP keepalive off on accepted connections (listenTcp). The
-	// extender owns and closes returned listeners.
+	// binds with TcpKeepAliveConfig on accepted connections (listenTcp).
+	// The extender owns and closes returned listeners.
 	Listen func(network string, address string) (net.Listener, error)
 	// ListenPacket, when set, binds the udp carriers. Tests use it to inject
 	// a socket without binding a privileged port. Nil retains
@@ -424,11 +438,6 @@ type ExtenderSettings struct {
 	// certificate, so the API never serves.
 	Measurement  ExtenderLagSettings
 	LagLifecycle *ExtenderLagLifecycleSettings
-
-	// Nil outside package tests. Called each time a relay direction's
-	// watchdog arms its timer, so a test can count the timer operations its
-	// chunks cost.
-	relayWatchdogArmForTest func()
 }
 
 type ExtenderServer struct {
@@ -1089,17 +1098,16 @@ func (self *ExtenderServer) ListenAndServe() error {
 	return nil
 }
 
-// Binds one tcp carrier port through the Listen seam, or else with TCP
-// keepalive off on every connection it accepts. Each of those is bounded by
-// its own deadlines -- the header budget (A9), the relay's read deadlines, the
-// splice's idle bound, the services' own keepalives -- so Go's default 15 s
-// keepalive only added kernel probes and timers to every idle relay.
+// Binds one TCP carrier port through the Listen seam or with its configured
+// kernel keepalive. This listener also accepts services whose heartbeat
+// writes can buffer successfully after the peer disappears.
 func (self *ExtenderServer) listenTcp(address string) (net.Listener, error) {
 	if self.settings.Listen != nil {
 		return self.settings.Listen("tcp", address)
 	}
 	listenConfig := net.ListenConfig{
-		KeepAlive: -1,
+		KeepAlive:       -1,
+		KeepAliveConfig: self.settings.TcpKeepAliveConfig,
 	}
 	return listenConfig.Listen(self.ctx, "tcp", address)
 }
@@ -1886,22 +1894,29 @@ func forwardNetwork(clientAddress string) string {
 }
 
 // Copies both directions until either ends, then releases both connections.
-// A read that runs ReadTimeout, or a write that runs WriteTimeout, ends the
-// relay exactly then, each counted from its own start. Each direction's
-// watchdog (relayWatchdog) keeps the two bounds on one timer, so no chunk
-// installs a deadline.
+// Each native deadline bounds the socket operation itself, preserving a
+// successful operation if its caller is descheduled before the next one.
 func (self *ExtenderServer) relay(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	clientConn net.Conn,
 	forwardConn net.Conn,
 ) {
-	// The relay installs no deadline, so none left by the setup may outlive
-	// it. Before, the first read and write of each direction replaced them.
-	clientConn.SetDeadline(time.Time{})
-	forwardConn.SetDeadline(time.Time{})
-
 	var relayWorkers sync.WaitGroup
+	defer func() {
+		cancel()
+		clientConn.Close()
+		forwardConn.Close()
+		relayWorkers.Wait()
+	}()
+	// Setup deadlines must not survive into unbounded relay operations.
+	if err := clientConn.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	if err := forwardConn.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+
 	relayWorkers.Add(2)
 	go connect.HandleError(func() {
 		defer relayWorkers.Done()
@@ -1909,8 +1924,6 @@ func (self *ExtenderServer) relay(
 		defer cancel()
 
 		buffer := make([]byte, 4096)
-		watchdog := newRelayWatchdog(self.settings.ReadTimeout, self.settings.WriteTimeout, cancel, self.settings.relayWatchdogArmForTest)
-		defer watchdog.stop()
 
 		for {
 			select {
@@ -1919,21 +1932,29 @@ func (self *ExtenderServer) relay(
 			default:
 			}
 
-			watchdog.beginRead()
+			if 0 < self.settings.ReadTimeout {
+				if err := clientConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
+					return
+				}
+			}
 			n, err := clientConn.Read(buffer)
 			if n > 0 {
 				// the ingress of O1, counted before the write so a client that
 				// has seen the round trip has seen the count
 				self.ingressByteCount.Add(int64(n))
 				self.ingressReadCount.Add(1)
-				watchdog.beginWrite()
+				if 0 < self.settings.WriteTimeout {
+					if err := forwardConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						return
+					}
+				}
 				toWrite := buffer[0:n]
 				for len(toWrite) > 0 {
 					nw, werr := forwardConn.Write(toWrite)
 					if nw > 0 {
 						toWrite = toWrite[nw:]
 					}
-					if werr != nil {
+					if werr != nil || nw <= 0 {
 						return
 					}
 				}
@@ -1950,8 +1971,6 @@ func (self *ExtenderServer) relay(
 		defer cancel()
 
 		buffer := make([]byte, 4096)
-		watchdog := newRelayWatchdog(self.settings.ReadTimeout, self.settings.WriteTimeout, cancel, self.settings.relayWatchdogArmForTest)
-		defer watchdog.stop()
 
 		for {
 			select {
@@ -1960,20 +1979,28 @@ func (self *ExtenderServer) relay(
 			default:
 			}
 
-			watchdog.beginRead()
+			if 0 < self.settings.ReadTimeout {
+				if err := forwardConn.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
+					return
+				}
+			}
 			n, err := forwardConn.Read(buffer)
 			if n > 0 {
 				// the egress of O1
 				self.egressByteCount.Add(int64(n))
 				self.egressReadCount.Add(1)
-				watchdog.beginWrite()
+				if 0 < self.settings.WriteTimeout {
+					if err := clientConn.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						return
+					}
+				}
 				toWrite := buffer[0:n]
 				for len(toWrite) > 0 {
 					nw, werr := clientConn.Write(toWrite)
 					if nw > 0 {
 						toWrite = toWrite[nw:]
 					}
-					if werr != nil {
+					if werr != nil || nw <= 0 {
 						return
 					}
 				}
@@ -1987,9 +2014,6 @@ func (self *ExtenderServer) relay(
 	select {
 	case <-ctx.Done():
 	}
-	clientConn.Close()
-	forwardConn.Close()
-	relayWorkers.Wait()
 }
 
 func guessOrganizationName(host string) string {

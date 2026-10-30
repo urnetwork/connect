@@ -11,12 +11,15 @@ import (
 
 // A multi client with the shipped pause tolerance and none of the other
 // optional watchers. A nil detector runs the client's own.
-func newPauseDetectorTestMultiClient(detector *SchedulerPauseDetector) *RemoteUserNatMultiClient {
+func newPauseDetectorTestMultiClient(detector *SchedulerPauseDetector, configure ...func(*MultiClientSettings)) *RemoteUserNatMultiClient {
 	settings := DefaultMultiClientSettings()
 	settings.HeartbeatInterval = 0
 	settings.ProviderProbe = false
 	settings.IpAssocSettings = nil
 	settings.SchedulerPauseDetector = detector
+	for _, configureSettings := range configure {
+		configureSettings(settings)
+	}
 	return NewRemoteUserNatMultiClient(
 		context.Background(),
 		&testingEmptyMultiClientGenerator{},
@@ -50,8 +53,8 @@ func TestSchedulerPauseDetectorReusesOneTimer(t *testing.T) {
 		multiClient := newPauseDetectorTestMultiClient(nil)
 		defer closePauseDetectorTestMultiClient(t, multiClient)
 
-		timers := timerAllocationsUnder(t, ").runSchedulerPauseDetector", func() {
-			time.Sleep(100 * schedulerPauseProbeInterval)
+		timers := timerAllocationsUnder(t, "(*SchedulerPauseDetector).run", func() {
+			time.Sleep(100 * DefaultSchedulerPauseDetectorSettings().ProbeInterval)
 		})
 		if 4 < timers {
 			t.Fatalf("the pause detector allocated %d timer objects over 100 probes, want one timer for its life", timers)
@@ -70,13 +73,14 @@ func TestSharedSchedulerPauseDetectorJudgesEveryClient(t *testing.T) {
 		defer cancel()
 		detector := NewSchedulerPauseDetector(ctx)
 		defer detector.Close()
+		synctest.Wait()
 
 		clients := []*RemoteUserNatMultiClient{}
-		clientTimers := timerAllocationsUnder(t, ").runSchedulerPauseDetector", func() {
+		clientTimers := timerAllocationsUnder(t, "(*SchedulerPauseDetector).run", func() {
 			for range 8 {
 				clients = append(clients, newPauseDetectorTestMultiClient(detector))
 			}
-			time.Sleep(10 * schedulerPauseProbeInterval)
+			time.Sleep(10 * detector.settings.ProbeInterval)
 		})
 		if clientTimers != 0 {
 			t.Fatalf("clients with a shared detector allocated %d detector timer objects of their own, want none", clientTimers)
@@ -84,7 +88,7 @@ func TestSharedSchedulerPauseDetectorJudgesEveryClient(t *testing.T) {
 		AssertEqual(t, 8, detector.ClientCount())
 
 		sharedTimers := timerAllocationsUnder(t, "(*SchedulerPauseDetector).run", func() {
-			time.Sleep(100 * schedulerPauseProbeInterval)
+			time.Sleep(100 * detector.settings.ProbeInterval)
 		})
 		if 2 < sharedTimers {
 			t.Fatalf("the shared detector allocated %d timer objects over 100 probes, want its one timer", sharedTimers)

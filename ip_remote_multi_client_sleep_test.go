@@ -84,7 +84,7 @@ func TestSchedulerPauseDetectorSeesAHostSleep(t *testing.T) {
 		hostClock.setBack(c.setBack)
 
 		before := time.Now()
-		mc.observeSchedulerPause(armed, hostClock.Now())
+		mc.observeSchedulerPause(armed, hostClock.Now(), DefaultSchedulerPauseDetectorSettings().ProbeInterval)
 		stale, freshSince := mc.uplinkGate(time.Now())
 		if stale != c.held {
 			t.Errorf("%s: receive verdicts held = %t, expected %t", c.name, stale, c.held)

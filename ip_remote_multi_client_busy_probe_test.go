@@ -787,14 +787,13 @@ func TestSchedulerPauseDetectorSourceAnchors(t *testing.T) {
 	}
 
 	for _, function := range []string{
-		"func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector(",
 		"func (self *SchedulerPauseDetector) run(",
 	} {
 		body, ok := functionBody(source, function)
 		if !ok {
 			t.Fatalf("could not find %s", function)
 		}
-		if !strings.Contains(body, "time.NewTimer(schedulerPauseProbeInterval)") || !strings.Contains(body, "probeTimer.Reset(schedulerPauseProbeInterval)") {
+		if !strings.Contains(body, "time.NewTimer(probeInterval)") || !strings.Contains(body, "probeTimer.Reset(probeInterval)") {
 			t.Errorf("%s does not arm a plain timer, so it cannot measure the pause", function)
 		}
 		if strings.Contains(body, "WakeupAfter") {
@@ -809,7 +808,7 @@ func TestSchedulerPauseDetectorSourceAnchors(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find observeSchedulerPauseIsolated")
 	}
-	if !strings.Contains(body, "client.observeSchedulerPause(armed, now)") {
+	if !strings.Contains(body, "client.observeSchedulerPause(armed, now, probeInterval)") {
 		t.Error("the shared detector does not judge each client from the shared readings")
 	}
 
@@ -864,8 +863,12 @@ func TestSchedulerPauseDefaults(t *testing.T) {
 	}
 	// the arming window has to be shorter than the tolerance, or ordinary
 	// jitter across a long arm would read as a suspend
-	if schedulerPauseProbeInterval >= settings.SchedulerPauseTolerance {
-		t.Errorf("the arming window (%v) is not shorter than the tolerance (%v)", schedulerPauseProbeInterval, settings.SchedulerPauseTolerance)
+	probeInterval := settings.SchedulerPauseDetectorSettings.ProbeInterval
+	if probeInterval != time.Second {
+		t.Errorf("ProbeInterval = %v, want 1s", probeInterval)
+	}
+	if probeInterval >= settings.SchedulerPauseTolerance {
+		t.Errorf("the arming window (%v) is not shorter than the tolerance (%v)", probeInterval, settings.SchedulerPauseTolerance)
 	}
 
 	reliabilitySettings := ReliabilitySettingsFrom(settings)
