@@ -391,7 +391,8 @@ type ExtenderSettings struct {
 
 	// Listen, when set, binds the outer TLS listener. Userspace integration
 	// tests use it to place the production extender on a simulated TUN. Nil
-	// retains net.Listen. The extender owns and closes returned listeners.
+	// binds with TCP keepalive off on accepted connections (listenTcp). The
+	// extender owns and closes returned listeners.
 	Listen func(network string, address string) (net.Listener, error)
 	// ListenPacket, when set, binds the udp carriers. Tests use it to inject
 	// a socket without binding a privileged port. Nil retains
@@ -941,11 +942,7 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}
 
 		log.Printf("[extender] listen tcp %d", port)
-		listen := net.Listen
-		if self.settings.Listen != nil {
-			listen = self.settings.Listen
-		}
-		listener, err := listen("tcp", fmt.Sprintf(":%d", port))
+		listener, err := self.listenTcp(fmt.Sprintf(":%d", port))
 		if err != nil {
 			// Ownership transfers for every non-nil callback result, even when
 			// the callback rejects that result with an error.
@@ -1100,6 +1097,21 @@ func (self *ExtenderServer) ListenAndServe() error {
 	}
 
 	return nil
+}
+
+// Binds one tcp carrier port through the Listen seam, or else with TCP
+// keepalive off on every connection it accepts. Each of those is bounded by
+// its own deadlines -- the header budget (A9), the relay's read deadlines, the
+// splice's idle bound, the services' own keepalives -- so Go's default 15 s
+// keepalive only added kernel probes and timers to every idle relay.
+func (self *ExtenderServer) listenTcp(address string) (net.Listener, error) {
+	if self.settings.Listen != nil {
+		return self.settings.Listen("tcp", address)
+	}
+	listenConfig := net.ListenConfig{
+		KeepAlive: -1,
+	}
+	return listenConfig.Listen(self.ctx, "tcp", address)
 }
 
 // Listening closes once every carrier bind has been attempted, and at the
