@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -283,52 +284,81 @@ func TestUnboundFlowIsAdoptedOnlyByTheExitThatCarriedItsAttempt(t *testing.T) {
 // leaves it on its exit, with no strike and no re-race. The hook commits the
 // exit's SYN-ACK at that exact point, and the exit refuses the retransmit, so
 // a flow the inference wrongly unbound stays unbound rather than racing back
-// onto the same exit.
+// onto the same exit. The SYN retry the answer drops is freed once the
+// inference returns: freeing it takes the parent lock.
 func TestAnswerDuringTheSilenceInferenceKeepsTheFlowOnItsExit(t *testing.T) {
 	GetMessagePoolAggregateStats()
-	synctest.Test(t, func(t *testing.T) {
-		path := unboundFlowTcpPath(50280)
-		harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
-			{name: "a", answer: reraceAlways(reraceSilent)},
-		})
-		a := harness.channel("a")
-		start := time.Now()
-		harness.syn(path)
-		harness.sleep(reraceSynSchedule[1])
-		harness.syn(path)
-		harness.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+	// Taking the parent lock again inside the inference parks the bubble on a
+	// mutex, which synctest never counts as durably blocked, so its clock
+	// cannot end the wait. The real clock bounds it.
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		synctest.Test(t, answerDuringTheSilenceInference)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(time.Minute):
+		stacks := make([]byte, 1024*1024)
+		stacks = stacks[:runtime.Stack(stacks, true)]
+		t.Fatalf("the silence inference did not return: a lock it holds was taken again\n%s", stacks)
+	}
+}
 
-		synAck, err := ParseIpPath(reraceSynAck(path))
-		if err != nil {
-			t.Fatal(err)
-		}
-		answered := 0
-		harness.multiClient.beforeDialFailureStandingForTest = func(update *multiClientChannelUpdate) {
-			answered += 1
-			if !update.markReceivedInbound(a, tcpControlFromIpPath(synAck)) {
-				t.Error("setup: the exit's SYN-ACK did not commit the flow's first answer")
-			}
-		}
-		a.sendGroupForTest = func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
-			return false, nil
-		}
-		harness.syn(path)
-		a.sendGroupForTest = nil
-		harness.multiClient.beforeDialFailureStandingForTest = nil
-		if answered != 1 {
-			t.Fatalf("setup: the inference ran %d times, want once", answered)
-		}
-
-		if harness.boundTo(path) != a {
-			t.Error("the inference unbound a flow whose first answer had committed")
-		}
-		if got := harness.metrics().FlowsReraced; got != 0 {
-			t.Errorf("FlowsReraced = %d, want 0 for an answered flow", got)
-		}
-		if got := a.dialFailureCount(); got != 0 {
-			t.Errorf("exit a carries %d strikes for an attempt it answered, want 0", got)
-		}
+// The bubble of TestAnswerDuringTheSilenceInferenceKeepsTheFlowOnItsExit.
+func answerDuringTheSilenceInference(t *testing.T) {
+	path := unboundFlowTcpPath(50280)
+	harness := newUnboundInferenceHarness(t, path, []reraceExitSpec{
+		{name: "a", answer: reraceAlways(reraceSilent)},
 	})
+	a := harness.channel("a")
+	start := time.Now()
+	harness.syn(path)
+	harness.sleep(reraceSynSchedule[1])
+	harness.syn(path)
+	harness.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+
+	synAck, err := ParseIpPath(reraceSynAck(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered := 0
+	harness.multiClient.beforeDialFailureStandingForTest = func(update *multiClientChannelUpdate) {
+		answered += 1
+		// the receive path's commit, under the flow lock alone, which nests
+		// under the parent lock the inference holds
+		retained, committed := func() (bool, bool) {
+			update.stateLock.Lock()
+			defer update.stateLock.Unlock()
+			retained := update.synRetry != nil
+			return retained, update.markReceivedInboundWithLock(a, tcpControlFromIpPath(synAck))
+		}()
+		if !retained || !committed {
+			t.Error("setup: the exit's SYN-ACK did not commit the first answer of a flow retaining its SYN")
+		}
+	}
+	a.sendGroupForTest = func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
+		return false, nil
+	}
+	harness.syn(path)
+	a.sendGroupForTest = nil
+	harness.multiClient.beforeDialFailureStandingForTest = nil
+	if answered != 1 {
+		t.Fatalf("setup: the inference ran %d times, want once", answered)
+	}
+
+	if harness.boundTo(path) != a {
+		t.Error("the inference unbound a flow whose first answer had committed")
+	}
+	if got := harness.metrics().FlowsReraced; got != 0 {
+		t.Errorf("FlowsReraced = %d, want 0 for an answered flow", got)
+	}
+	if got := a.dialFailureCount(); got != 0 {
+		t.Errorf("exit a carries %d strikes for an attempt it answered, want 0", got)
+	}
+	if harness.update(path).synRetryReleased.Load() != nil {
+		t.Error("the SYN retry the answer dropped was not freed once the inference returned")
+	}
 }
 
 // Exit a's first answer for the flow, its SYN-ACK, arrives as the silence
