@@ -85,6 +85,11 @@ type DestinationStats struct {
 	// find-providers2. nil for fixed client-id and restored-identity
 	// destinations, which bypass discovery.
 	Location *ProviderLocation
+	// LocationMatch is the level find-providers2 found the provider at when
+	// the requested city or region had none of its own
+	// (`FindProvidersProvider.Match`, normalized; see location_match.go).
+	// Exact for fixed and restored destinations and for older servers.
+	LocationMatch LocationMatch
 	// IpFamily is the destination provider's proven address-family
 	// category from find-providers2. Legacy (empty) for fixed and restored
 	// destinations and for older servers; legacy carries v4 only.
@@ -14310,11 +14315,12 @@ func (self *multiClientWindow) expand(
 			// Calling RemoveClientArgs here would revoke the derived JWT first
 			// and turn the channel's final contract closes into 401s.
 			client.Cancel()
-			self.monitor.AddProviderEventWithExtenderIps(
+			self.monitor.AddProviderEventWithLocationMatch(
 				args.ClientId,
 				ProviderStateAdded,
 				args.Destination.Tail(),
 				args.Location,
+				args.LocationMatch,
 				args.IpFamily,
 				// the dot belongs to the live old client, so its extenders are
 				// what the re-emitted event must carry
@@ -14334,7 +14340,7 @@ func (self *multiClientWindow) expand(
 			// ownership without disturbing an existing flow. The channel owns
 			// its generator args at this point; do not return them separately.
 			client.Cancel()
-			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+			self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 			self.noteRecentExitDropped(args, "declined")
 			return false
 		}
@@ -14371,11 +14377,12 @@ func (self *multiClientWindow) expand(
 				self.clientRetireCallback(replacedClient)
 			}
 		}
-		self.monitor.AddProviderEventWithExtenderIps(
+		self.monitor.AddProviderEventWithLocationMatch(
 			args.ClientId,
 			ProviderStateAdded,
 			args.Destination.Tail(),
 			args.Location,
+			args.LocationMatch,
 			args.IpFamily,
 			self.clientExtenderIps(client),
 		)
@@ -14421,7 +14428,7 @@ func (self *multiClientWindow) expand(
 		// cancellation cleanup returns them through RemoveClientWithArgs after
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
-		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.IpFamily)
+		self.monitor.AddProviderEventWithLocationMatch(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.LocationMatch, candidate.args.IpFamily, nil)
 		self.noteRecentExitDropped(candidate.args, "not_admitted")
 	}
 
@@ -14707,9 +14714,9 @@ requestCandidates:
 					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				}
 				if providerFailure {
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				} else if setupFailed && evaluationCtx.Err() == nil {
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
 				self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 			} else if client.dataOnlyProviderProbe {
@@ -14777,7 +14784,7 @@ requestCandidates:
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
 					}
-					self.monitor.AddProviderEvent(args.ClientId, state, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
 					}
@@ -14911,11 +14918,12 @@ requestCandidates:
 						addedP2pOnly += 1
 					}
 
-					self.monitor.AddProviderEventWithExtenderIps(
+					self.monitor.AddProviderEventWithLocationMatch(
 						args.ClientId,
 						ProviderStateInEvaluation,
 						args.Destination.Tail(),
 						args.Location,
+						args.LocationMatch,
 						args.IpFamily,
 						self.clientExtenderIps(client),
 					)
@@ -15780,7 +15788,7 @@ func (self *multiClientWindow) Close() {
 
 func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
 	for _, client := range removedClients {
-		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location, client.IpFamily())
+		self.monitor.AddProviderEventWithLocationMatch(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location, client.args.LocationMatch, client.IpFamily(), nil)
 	}
 	for _, client := range removedClients {
 		self.clientRemoveCallback(client)

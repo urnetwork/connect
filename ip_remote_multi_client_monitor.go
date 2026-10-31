@@ -38,6 +38,14 @@ type WindowExpandEvent struct {
 	// apps can tell the user v6 is not carried, the in-tunnel resolver
 	// answers AAAA empty, and v6 flows are answered with no-route.
 	Ipv6Available bool
+	// LocationMatch is whether the Added providers are in the location that
+	// was asked for, or in its region or country because it had none (see
+	// location_match.go). The monitor derives it from its provider events in
+	// the same critical section that changes them, so every change rides the
+	// provider event's dispatch. Like Ipv6Available it describes retained
+	// exits, so an inactive window does not mask it. Merged across windows
+	// from the union of their provider events. Exact from an older sender.
+	LocationMatch WindowLocationMatch
 }
 
 // provider state machine is:
@@ -90,6 +98,11 @@ type ProviderEvent struct {
 	// Location is the egress provider's location. nil when unknown. Immutable
 	// — events are shallow-cloned and the pointee is shared.
 	Location *ProviderLocation
+	// LocationMatch is the level discovery found the egress provider at:
+	// exact (empty) in the requested location, else its region or country
+	// because the requested city or region had no provider (see
+	// location_match.go). Exact from an older server or sender.
+	LocationMatch LocationMatch
 	// IpFamily is the egress provider's address-family category. Legacy
 	// (empty) reads as v4-only. This is what the apps' histogram and provider
 	// rows show.
@@ -136,8 +149,24 @@ type RemoteUserNatMultiClientMonitor struct {
 
 	windowExpandEvent      WindowExpandEvent
 	clientIdProviderEvents map[Id]*ProviderEvent
+	// the fold of clientIdProviderEvents behind windowExpandEvent.LocationMatch,
+	// kept so a merged monitor can merge it without copying the events
+	locationMatchFold locationMatchFold
 
 	monitorEventCallbacks *CallbackList[*monitorEventCallbackWorker]
+}
+
+// monitorLocationMatchFolder is what a merged monitor merges a window's
+// location match from. A monitor without it, such as a test or embedder
+// monitor, is folded from its provider events.
+type monitorLocationMatchFolder interface {
+	currentLocationMatchFold() locationMatchFold
+}
+
+func (self *RemoteUserNatMultiClientMonitor) currentLocationMatchFold() locationMatchFold {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.locationMatchFold
 }
 
 func NewRemoteUserNatMultiClientMonitorWithDefaults() *RemoteUserNatMultiClientMonitor {
@@ -427,6 +456,8 @@ func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied b
 			// other half)
 			Reason: self.windowExpandEvent.Reason,
 			Failed: self.windowExpandEvent.Failed,
+			// owned by the provider events
+			LocationMatch: self.windowExpandEvent.LocationMatch,
 		}
 
 		if self.windowExpandEvent != windowExpandEvent {
@@ -473,21 +504,44 @@ func (self *RemoteUserNatMultiClientMonitor) SetStallStatus(reason string, faile
 	return changed
 }
 
-// provider events are serialized per `clientId`
+// provider events are serialized per `clientId`. The event carries an exact
+// location match: the form for a provider discovery did not find above the
+// requested location (see `AddProviderEventWithLocationMatch`).
 func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState, egressClientId Id, location *ProviderLocation, ipFamily IpFamily) {
-	self.AddProviderEventWithExtenderIps(clientId, state, egressClientId, location, ipFamily, nil)
+	self.AddProviderEventWithLocationMatch(clientId, state, egressClientId, location, LocationMatchExact, ipFamily, nil)
 }
 
 // AddProviderEventWithExtenderIps is the same event, carrying the extenders
 // that were on this client's transports when it was raised (K1). A later
 // change rides `SetProviderExtenderIps`; every event that replaces a live
 // one must carry the current addresses, or the replacement would blank the
-// dot's rings until the next transport change.
+// dot's rings until the next transport change. The location match is exact,
+// as for `AddProviderEvent`.
 func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithExtenderIps(
 	clientId Id,
 	state ProviderState,
 	egressClientId Id,
 	location *ProviderLocation,
+	ipFamily IpFamily,
+	extenderIps []netip.Addr,
+) {
+	self.AddProviderEventWithLocationMatch(clientId, state, egressClientId, location, LocationMatchExact, ipFamily, extenderIps)
+}
+
+// AddProviderEventWithLocationMatch is the full provider event: it also
+// carries the level discovery found the provider at (location_match.go).
+// Like the extenders, every event that replaces a live one must carry the
+// provider's match, or the replacement would drop the provider from the
+// window's `WindowExpandEvent.LocationMatch`. The window-level match is
+// derived again in the same critical section as the event, and the event's
+// dispatch carries it, so a change of the window-level match always notifies
+// the listeners.
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithLocationMatch(
+	clientId Id,
+	state ProviderState,
+	egressClientId Id,
+	location *ProviderLocation,
+	locationMatch LocationMatch,
 	ipFamily IpFamily,
 	extenderIps []netip.Addr,
 ) {
@@ -504,6 +558,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithExtenderIps(
 			State:          state,
 			EgressClientId: egressClientId,
 			Location:       location,
+			LocationMatch:  locationMatch.Normalize(),
 			IpFamily:       ipFamily,
 			ExtenderIps:    slices.Clone(extenderIps),
 		}
@@ -515,6 +570,12 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithExtenderIps(
 		} else {
 			self.clientIdProviderEvents[clientId] = providerEvent
 		}
+		locationMatchFold := locationMatchFold{}
+		for _, retainedProviderEvent := range self.clientIdProviderEvents {
+			locationMatchFold.add(retainedProviderEvent)
+		}
+		self.locationMatchFold = locationMatchFold
+		self.windowExpandEvent.LocationMatch = locationMatchFold.windowLocationMatch()
 
 		windowExpandEvent = self.windowExpandEvent
 		clientIdProviderEvents[providerEvent.ClientId] = providerEvent
@@ -612,6 +673,11 @@ func (self *MergedMultiClientMonitor) Events() (*WindowExpandEvent, map[Id]*Prov
 	return self.WindowExpandEvent(), self.ProviderEvents()
 }
 
+// WindowExpandEvent merges the windows' expand events. It copies no provider
+// events, so a readiness sample stays cheap: the location match merges the
+// windows' folds (location_match.go), which is the fold of the union of their
+// Added providers, so one rule names the shown location whichever window holds
+// its providers.
 func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 	netWindowExpandEvent := WindowExpandEvent{
 		TargetSize:   0,
@@ -642,6 +708,17 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 		netWindowExpandEvent.Reason = WindowStallEvaluating
 	}
 	netWindowExpandEvent.Failed = 0 < failed && failed == trying && !netWindowExpandEvent.MinSatisfied
+	locationMatchFold := locationMatchFold{}
+	for _, monitor := range self.monitors {
+		if folder, ok := monitor.(monitorLocationMatchFolder); ok {
+			locationMatchFold.merge(folder.currentLocationMatchFold())
+		} else {
+			for _, providerEvent := range monitor.ProviderEvents() {
+				locationMatchFold.add(providerEvent)
+			}
+		}
+	}
+	netWindowExpandEvent.LocationMatch = locationMatchFold.windowLocationMatch()
 	return &netWindowExpandEvent
 }
 

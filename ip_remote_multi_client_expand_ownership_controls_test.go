@@ -47,7 +47,7 @@ func TestExpandArgsCleanupAnchorAcceptsStaleDemandBeforeOwnership(t *testing.T) 
 func TestExpandArgsCleanupAnchorRejectsMovedStaleDemandRetirement(t *testing.T) {
 	body := expandOwnershipControlBody(t)
 	stale := expandOwnershipStaleCleanup()
-	decline := "\n\t\t\tclient.Cancel()\n\t\t\tself.monitor.AddProviderEventWithExtenderIps("
+	decline := "\n\t\t\tclient.Cancel()\n\t\t\tself.monitor.AddProviderEventWithLocationMatch(\n"
 	if strings.Count(body, stale) != 1 || strings.Count(body, decline) != 1 {
 		t.Fatal("ownership mutation sites changed")
 	}

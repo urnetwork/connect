@@ -172,7 +172,7 @@ func TestExpandArgsCleanupAnchorRejectsOwnedRetirement(t *testing.T) {
 		t.Fatalf("healthy ownership control: %v", violations)
 	}
 	validCleanup := "\n\t\t\t\t\tself.generator.RemoveClientArgs(clientArgs)"
-	decline := "\n\t\t\tclient.Cancel()\n\t\t\tself.monitor.AddProviderEventWithExtenderIps("
+	decline := "\n\t\t\tclient.Cancel()\n\t\t\tself.monitor.AddProviderEventWithLocationMatch(\n"
 	if strings.Count(body, validCleanup) != 1 || strings.Count(body, decline) != 1 {
 		t.Fatal("ownership mutation sites changed")
 	}
