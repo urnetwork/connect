@@ -301,16 +301,19 @@ func windowStatsWindows(stats *WindowClientStats, state windowState) int64 {
 	return stats.windows[windowStatsWindowQuality][state].Load()
 }
 
-// The baseline loop the counters exist to size: a strict window at its hard
-// max whose drained client keeps its slot builds a candidate every pass, the
-// strict hard max declines it, and the window sits in a strict hole. Formation
-// counts as admissions below the minimum, the drain as one warning however
-// many passes see it, and closing the window retracts its state and counts
-// every installed client as closed.
+// The baseline loop the counters exist to size, which the handover's kill
+// switch restores: a strict window at its hard max whose drained client keeps
+// its slot builds a candidate every pass, the strict hard max declines it,
+// and the window sits in a strict hole. Formation counts as admissions below
+// the minimum, the drain as one warning however many passes see it, and
+// closing the window retracts its state and counts every installed client as
+// closed.
 func TestWindowClientStatsCountTheStrictDrainLoop(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		h, _, stats := newWindowStatsTestHarness(t)
+		h, _, stats := newWindowStatsTestHarness(t, func(settings *MultiClientSettings) {
+			settings.StrictWindowHandover = false
+		})
 		window := h.multiClient.windows[WindowTypeQuality]
 		if admitted := windowStatsCandidates(stats, windowExpandPassBelowMin, windowCandidateAdmitted); admitted != 5 {
 			t.Fatalf("formation admitted %d candidates below the minimum, want 5", admitted)
