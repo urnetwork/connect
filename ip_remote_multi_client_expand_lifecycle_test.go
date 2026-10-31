@@ -297,6 +297,7 @@ func (self *multiClientExpandLifecycleFixture) start() <-chan int {
 			1,
 			1,
 			0,
+			windowExpandPassPlan{},
 		)
 	}()
 	return expandDone
