@@ -392,6 +392,11 @@ type FindProviders2Args struct {
 	// nor `PostQuantumEncryption` set, the request is the capability-blind
 	// discovery of an older client. An older server ignores it.
 	RequireModernProvider bool `json:"require_modern_provider,omitempty"`
+	// Asks for the requested targets only. Unset, as before the field, a city
+	// or region target the platform holds no admitted provider for is
+	// answered from its region, then its country, and each provider found
+	// there carries its `Match`. An older server answers exactly either way.
+	Strict bool `json:"strict,omitempty"`
 }
 
 type FindProviders2Result struct {
@@ -416,6 +421,11 @@ type FindProvidersProvider struct {
 	// IpFamily is the provider's proven address-family category. Empty from
 	// an older server, which the client treats as v4-only (legacy).
 	IpFamily IpFamily `json:"ip_family,omitempty"`
+	// Match is the level the provider was found at because the requested
+	// city or region had no admitted provider: "region" or "country". Empty
+	// for a provider of the requested target itself, a provider named by
+	// client id, a `Strict` request, and from an older server.
+	Match string `json:"match,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {

@@ -2643,6 +2643,9 @@ paths:
         which are active and in good health.
         This allows random iteration by using the exclude input to mark
         visited providers.
+        A city or region the platform holds no admitted provider for is
+        answered from its region, then its country, unless `strict` is set;
+        each provider found that way carries `match`.
       operationId: networkFindProviders2
       security: []
       requestBody:
@@ -12097,6 +12100,17 @@ components:
             connections require end-to-end encryption sets it; unset keeps
             the capability-blind answer.
           type: boolean
+        strict:
+          description: |
+            Answer the requested targets only. Unset, as a client before the
+            field sends it, a `location_id` target that is a city or a region
+            the platform holds no admitted provider for is answered from its
+            region, then from its country if the region has none either, and
+            never from another country. Every other filter of the request
+            applies there, and each provider found that way carries `match`.
+            A target whose admitted providers the request's own exclusions
+            removed is not widened.
+          type: boolean
 
     LocationCoordinates:
       description: |
@@ -12216,6 +12230,16 @@ components:
               location:
                 # omitted when the provider's location is unknown
                 $ref: "#/components/schemas/ProviderLocation"
+              match:
+                description: |
+                  The level the provider was found at because the requested
+                  city or region had no admitted provider: `region` or
+                  `country`, so a client can say what it shows in place of
+                  the location it asked for. Absent for a provider of the
+                  requested target itself, for a provider named by
+                  `client_id`, and with `strict`.
+                type: string
+                enum: [region, country]
 
     WalletBalanceResult:
       type: object
