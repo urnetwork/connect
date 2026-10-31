@@ -20,7 +20,7 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// testLocation is a synthetic provider location with every id set.
+// A synthetic provider location with every id set.
 func testLocation(region string, country string) *ProviderLocation {
 	regionLocationId := NewId()
 	countryLocationId := NewId()
@@ -36,8 +36,8 @@ func testLocation(region string, country string) *ProviderLocation {
 	}
 }
 
-// locationMatchEvents records every window expand event a monitor listener
-// receives, in delivery order.
+// Records every window expand event a monitor listener receives, in delivery
+// order.
 type locationMatchEvents struct {
 	stateLock sync.Mutex
 	matches   []WindowLocationMatch
@@ -57,6 +57,46 @@ func (self *locationMatchEvents) callback(windowExpandEvent *WindowExpandEvent, 
 		self.matches = append(self.matches, windowExpandEvent.LocationMatch)
 	}()
 	self.notify <- struct{}{}
+}
+
+func (self *locationMatchEvents) count() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return len(self.matches)
+}
+
+func (self *locationMatchEvents) last() WindowLocationMatch {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.matches) == 0 {
+		return WindowLocationMatch{}
+	}
+	return self.matches[len(self.matches)-1]
+}
+
+// waits until the listener has received more than count deliveries, failing
+// after a second, and returns the deliveries after the first count
+func (self *locationMatchEvents) waitForCount(t *testing.T, count int) []WindowLocationMatch {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		matches := func() []WindowLocationMatch {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if len(self.matches) <= count {
+				return nil
+			}
+			return append([]WindowLocationMatch{}, self.matches[count:]...)
+		}()
+		if matches != nil {
+			return matches
+		}
+		select {
+		case <-self.notify:
+		case <-deadline:
+			t.Fatalf("listener never received a delivery after %d", count)
+		}
+	}
 }
 
 // waits for the listener to deliver want, failing after a second
@@ -82,27 +122,33 @@ func (self *locationMatchEvents) waitFor(t *testing.T, want WindowLocationMatch)
 	}
 }
 
-func TestLocationMatchNormalizesUnknownLevelsToExact(t *testing.T) {
+// A level a newer server introduces is kept apart from exact, as the internal
+// other level, and is not a fallback this build can name.
+func TestLocationMatchNormalizesUnknownLevelsToOther(t *testing.T) {
 	for _, c := range []struct {
-		match LocationMatch
-		want  LocationMatch
+		match    LocationMatch
+		want     LocationMatch
+		fallback bool
 	}{
-		{match: "", want: LocationMatchExact},
-		{match: "region", want: LocationMatchRegion},
-		{match: "country", want: LocationMatchCountry},
-		// a level a newer server introduces degrades to no notice
-		{match: "continent", want: LocationMatchExact},
-		{match: "Region", want: LocationMatchExact},
+		{match: "", want: LocationMatchExact, fallback: false},
+		{match: "region", want: LocationMatchRegion, fallback: true},
+		{match: "country", want: LocationMatchCountry, fallback: true},
+		{match: "continent", want: locationMatchOther, fallback: false},
+		{match: "Region", want: locationMatchOther, fallback: false},
+		{match: locationMatchOther, want: locationMatchOther, fallback: false},
 	} {
 		if got := c.match.Normalize(); got != c.want {
 			t.Errorf("%q normalized to %q, want %q", c.match, got, c.want)
+		}
+		if got := c.match.Normalize().IsFallback(); got != c.fallback {
+			t.Errorf("%q is a fallback: %t, want %t", c.match, got, c.fallback)
 		}
 	}
 }
 
 // The generator carries each provider's find-providers2 match into its
 // destination stats. A provider without one, as from a server that predates
-// the field, and a level this build does not know are exact.
+// the field, is exact; a level this build does not know is the other level.
 func TestNextDestinationsCarriesTheDiscoveredLocationMatch(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unused", http.StatusServiceUnavailable)
@@ -159,7 +205,7 @@ func TestNextDestinationsCarriesTheDiscoveredLocationMatch(t *testing.T) {
 		regionProvider:  LocationMatchRegion,
 		countryProvider: LocationMatchCountry,
 		exactProvider:   LocationMatchExact,
-		unknownProvider: LocationMatchExact,
+		unknownProvider: locationMatchOther,
 	}
 	if len(destinations) != len(want) {
 		t.Fatalf("destinations = %d, want %d", len(destinations), len(want))
@@ -261,8 +307,12 @@ func TestMonitorLocationMatchIsExactForExactProvidersAndOlderSenders(t *testing.
 	windowExpandEvent, providerEvents := monitor.Events()
 	AssertEqual(t, windowExpandEvent.LocationMatch, WindowLocationMatch{})
 	for clientId, providerEvent := range providerEvents {
-		if providerEvent.LocationMatch != LocationMatchExact {
-			t.Errorf("%s carries match %q, want exact", clientId, providerEvent.LocationMatch)
+		want := LocationMatchExact
+		if clientId == fourthClientId {
+			want = locationMatchOther
+		}
+		if providerEvent.LocationMatch != want {
+			t.Errorf("%s carries match %q, want %q", clientId, providerEvent.LocationMatch, want)
 		}
 	}
 
@@ -306,14 +356,24 @@ func TestMonitorLocationMatchChangeNotifiesListeners(t *testing.T) {
 	}
 	events.waitFor(t, region)
 
-	// updates that are not provider events keep the match on what they publish
-	monitor.AddWindowExpandEvent(true, 2, false)
-	monitor.SetStallStatus(WindowStallProvidersUnresponsive, false)
-	monitor.SetProviderIpFamily(clientId, IpFamilyDualstack)
-	if windowExpandEvent, _ := monitor.Events(); windowExpandEvent.LocationMatch != region {
-		t.Fatalf("expand, stall and family updates lost the match: %+v", windowExpandEvent.LocationMatch)
+	// updates that are not provider events keep the match, on what they
+	// publish and in the window: each is waited for as its own delivery
+	for _, update := range []func(){
+		func() { monitor.AddWindowExpandEvent(true, 2, false) },
+		func() { monitor.SetStallStatus(WindowStallProvidersUnresponsive, false) },
+		func() { monitor.SetProviderIpFamily(clientId, IpFamilyDualstack) },
+	} {
+		count := events.count()
+		update()
+		for _, delivered := range events.waitForCount(t, count) {
+			if delivered != region {
+				t.Fatalf("an update that is not a provider event delivered %+v, want %+v", delivered, region)
+			}
+		}
+		if windowExpandEvent, _ := monitor.Events(); windowExpandEvent.LocationMatch != region {
+			t.Fatalf("an update that is not a provider event lost the match: %+v", windowExpandEvent.LocationMatch)
+		}
 	}
-	events.waitFor(t, region)
 
 	monitor.AddProviderEventWithLocationMatch(clientId, ProviderStateRemoved, clientId, location, LocationMatchRegion, IpFamilyLegacy, nil)
 	events.waitFor(t, WindowLocationMatch{})
@@ -420,8 +480,8 @@ func TestMergedMonitorLocationMatchNamesAcrossWindows(t *testing.T) {
 	}
 }
 
-// locationMatchEventsMonitor is a monitor that keeps no fold, as an embedder's
-// or a test's monitor does: only its provider events.
+// A monitor that keeps no fold, as an embedder's or a test's monitor does:
+// only its provider events.
 type locationMatchEventsMonitor struct {
 	providerEvents map[Id]*ProviderEvent
 }
@@ -470,6 +530,201 @@ func TestMergedMonitorLocationMatchFoldsAMonitorWithoutAFold(t *testing.T) {
 	})
 }
 
+// A level this build does not know counts neither as exact nor as a fallback
+// it can name: beside a known fallback it does not make the window mixed, and
+// alone, or beside providers of the location itself, it leaves the window
+// exact, as an older build reads it.
+func TestMonitorLocationMatchIgnoresLevelsThisBuildDoesNotKnow(t *testing.T) {
+	add := func(monitor *RemoteUserNatMultiClientMonitor, location *ProviderLocation, match LocationMatch) {
+		clientId := NewId()
+		monitor.AddProviderEventWithLocationMatch(clientId, ProviderStateAdded, clientId, location, match, IpFamilyLegacy, nil)
+	}
+	locationMatch := func(monitor *RemoteUserNatMultiClientMonitor) WindowLocationMatch {
+		windowExpandEvent, _ := monitor.Events()
+		return windowExpandEvent.LocationMatch
+	}
+
+	location := testLocation("Region A", "Country A")
+	monitor := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	add(monitor, location, LocationMatchRegion)
+	add(monitor, testLocation("Region B", "Country A"), "metro")
+	AssertEqual(t, locationMatch(monitor), WindowLocationMatch{
+		Match:      LocationMatchRegion,
+		Name:       "Region A",
+		LocationId: *location.RegionLocationId,
+	})
+
+	unknownOnly := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	add(unknownOnly, testLocation("Region B", "Country A"), "metro")
+	add(unknownOnly, nil, "continent")
+	AssertEqual(t, locationMatch(unknownOnly), WindowLocationMatch{})
+
+	besideExact := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	add(besideExact, testLocation("Region C", "Country A"), LocationMatchExact)
+	add(besideExact, testLocation("Region B", "Country A"), "metro")
+	AssertEqual(t, locationMatch(besideExact), WindowLocationMatch{})
+
+	// the merged monitor folds the windows the same way
+	merged := NewMergedMultiClientMonitor([]MultiClientMonitor{unknownOnly, monitor})
+	AssertEqual(t, merged.WindowExpandEvent().LocationMatch, WindowLocationMatch{
+		Match:      LocationMatchRegion,
+		Name:       "Region A",
+		LocationId: *location.RegionLocationId,
+	})
+}
+
+// A publisher reads the window under its lock and dispatches after it unlocks,
+// so another publisher's newer event can reach the listener first. The
+// listener must still end on the window's current match: here an older read is
+// dispatched to it after the provider that read named has left the window.
+func TestMonitorListenerEndsOnTheCurrentMatchAfterAStaleDispatch(t *testing.T) {
+	monitor := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	events := newLocationMatchEvents()
+	unsub := monitor.AddMonitorEventCallback(events.callback)
+	defer unsub()
+
+	location := testLocation("Region A", "Country A")
+	clientId := NewId()
+	monitor.AddProviderEventWithLocationMatch(clientId, ProviderStateAdded, clientId, location, LocationMatchRegion, IpFamilyLegacy, nil)
+	events.waitFor(t, WindowLocationMatch{
+		Match:      LocationMatchRegion,
+		Name:       "Region A",
+		LocationId: *location.RegionLocationId,
+	})
+	// a publisher's read, made while the region provider is still Added
+	stale := monitor.WindowExpandEvent()
+
+	monitor.AddProviderEventWithLocationMatch(clientId, ProviderStateRemoved, clientId, location, LocationMatchRegion, IpFamilyLegacy, nil)
+	events.waitFor(t, WindowLocationMatch{})
+
+	// the publisher dispatches its older read last
+	count := events.count()
+	for _, worker := range monitor.monitorEventCallbacks.Get() {
+		worker.Dispatch(stale, nil, false)
+	}
+	for _, delivered := range events.waitForCount(t, count) {
+		if delivered != (WindowLocationMatch{}) {
+			t.Fatalf("the listener was left on a removed provider's match: %+v", delivered)
+		}
+	}
+	AssertEqual(t, events.last(), WindowLocationMatch{})
+}
+
+// The merged monitor reads the merged match in a window's callback and
+// dispatches it after, and the windows' callbacks run on separate workers. The
+// speed window's callback reads the match while the quality window still holds
+// its region provider and stalls before dispatching it; the quality window
+// then drops that provider and its callback delivers the new match. The
+// stalled callback's older match, dispatched last, must not be what the
+// listener ends on.
+func TestMergedMonitorListenerEndsOnTheCurrentMatchAfterInterleavedWindows(t *testing.T) {
+	quality := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	speed := NewRemoteUserNatMultiClientMonitorWithDefaults()
+	merged := NewMergedMultiClientMonitor([]MultiClientMonitor{quality, speed})
+
+	stallClientId := NewId()
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var stallOnce sync.Once
+	merged.beforeDispatchForTest = func(providerEvents map[Id]*ProviderEvent) {
+		if _, ok := providerEvents[stallClientId]; ok {
+			stallOnce.Do(func() {
+				close(stalled)
+				<-release
+			})
+		}
+	}
+	events := newLocationMatchEvents()
+	unsub := merged.AddMonitorEventCallback(events.callback)
+	defer unsub()
+
+	location := testLocation("Region A", "Country A")
+	regionClientId := NewId()
+	quality.AddProviderEventWithLocationMatch(regionClientId, ProviderStateAdded, regionClientId, location, LocationMatchRegion, IpFamilyLegacy, nil)
+	exactClientId := NewId()
+	speed.AddProviderEventWithLocationMatch(exactClientId, ProviderStateAdded, exactClientId, testLocation("Region C", "Country A"), LocationMatchExact, IpFamilyLegacy, nil)
+	mixedRegion := WindowLocationMatch{
+		Match:      LocationMatchRegion,
+		Mixed:      true,
+		Name:       "Region A",
+		LocationId: *location.RegionLocationId,
+	}
+	events.waitFor(t, mixedRegion)
+
+	// the speed window's callback reads mixed region, then stalls
+	speed.AddProviderEventWithLocationMatch(stallClientId, ProviderStateAdded, stallClientId, nil, LocationMatchExact, IpFamilyLegacy, nil)
+	select {
+	case <-stalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the speed window's callback never reached its dispatch")
+	}
+
+	// the quality window drops its region provider and delivers the new match
+	quality.AddProviderEventWithLocationMatch(regionClientId, ProviderStateRemoved, regionClientId, location, LocationMatchRegion, IpFamilyLegacy, nil)
+	events.waitFor(t, WindowLocationMatch{})
+
+	// the stalled callback dispatches its older read last
+	count := events.count()
+	close(release)
+	for _, delivered := range events.waitForCount(t, count) {
+		if delivered != (WindowLocationMatch{}) {
+			t.Fatalf("the listener was left on a removed provider's match: %+v", delivered)
+		}
+	}
+	AssertEqual(t, events.last(), WindowLocationMatch{})
+	AssertEqual(t, merged.WindowExpandEvent().LocationMatch, WindowLocationMatch{})
+}
+
+// Declining a replacement for a flow-carrying client re-emits the live
+// client's Added event; it carries the provider's match, so the window keeps
+// its fallback notice instead of reading exact.
+func TestExpandReplacementDeclineKeepsTheLocationMatch(t *testing.T) {
+	fixture := newMultiClientExpandLifecycleFixture(t)
+	location := testLocation("Region A", "Country A")
+	args := <-fixture.window.clientChannelArgs
+	args.Location = location
+	args.LocationMatch = LocationMatchRegion
+	fixture.window.clientChannelArgs <- args
+	oldCtx, cancelOld := context.WithCancel(fixture.window.ctx)
+	defer cancelOld()
+	oldClient := stallTestChannel()
+	oldClient.ctx = oldCtx
+	oldClient.cancel = cancelOld
+	oldClient.args = &multiClientChannelArgs{
+		MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: args.ClientId},
+		Destination:                    args.Destination,
+		DestinationStats:               DestinationStats{Location: location, LocationMatch: LocationMatchRegion},
+	}
+	fixture.window.clients[args.ClientId] = oldClient
+	fixture.window.flowCountFunc = func(client *multiClientChannel) int {
+		if client == oldClient {
+			return 1
+		}
+		return 0
+	}
+	expandDone := fixture.start()
+	fixture.wait(t, "held replacement ping", fixture.pingResultEntered)
+	fixture.releasePing()
+	if added := fixture.result(t, expandDone); added != 0 {
+		t.Fatalf("flow-carrying replacement admitted %d candidates", added)
+	}
+	fixture.wait(t, "declined channel cleanup", fixture.clientRemoved)
+
+	windowExpandEvent, providerEvents := fixture.window.monitor.Events()
+	providerEvent := providerEvents[args.ClientId]
+	if providerEvent == nil || providerEvent.State != ProviderStateAdded {
+		t.Fatalf("the decline did not re-emit the live client's Added event: %+v", providerEvent)
+	}
+	if providerEvent.LocationMatch != LocationMatchRegion {
+		t.Fatalf("the re-emitted Added event carries match %q, want region", providerEvent.LocationMatch)
+	}
+	AssertEqual(t, windowExpandEvent.LocationMatch, WindowLocationMatch{
+		Match:      LocationMatchRegion,
+		Name:       "Region A",
+		LocationId: *location.RegionLocationId,
+	})
+}
+
 // Removing a window client publishes its terminal event with the match it was
 // discovered at, like its location and family.
 func TestWindowRemovalCarriesTheLocationMatch(t *testing.T) {
@@ -513,9 +768,9 @@ func TestWindowRemovalCarriesTheLocationMatch(t *testing.T) {
 	}
 }
 
-// locationMatchProviderGenerator discovers the live acking providers of a
-// flappingProviderGenerator as providers find-providers2 found in a region,
-// as a server answers a city with no admitted provider.
+// Discovers the live acking providers of a flappingProviderGenerator as
+// providers find-providers2 found in a region, as a server answers a city with
+// no admitted provider.
 type locationMatchProviderGenerator struct {
 	*flappingProviderGenerator
 	location *ProviderLocation

@@ -85,10 +85,10 @@ type DestinationStats struct {
 	// find-providers2. nil for fixed client-id and restored-identity
 	// destinations, which bypass discovery.
 	Location *ProviderLocation
-	// LocationMatch is the level find-providers2 found the provider at when
-	// the requested city or region had none of its own
-	// (`FindProvidersProvider.Match`, normalized; see location_match.go).
-	// Exact for fixed and restored destinations and for older servers.
+	// The level find-providers2 found the provider at when the requested city
+	// or region had none of its own (`FindProvidersProvider.Match`,
+	// normalized; see location_match.go). Exact for fixed and restored
+	// destinations and for older servers.
 	LocationMatch LocationMatch
 	// IpFamily is the destination provider's proven address-family
 	// category from find-providers2. Legacy (empty) for fixed and restored

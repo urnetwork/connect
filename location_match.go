@@ -17,36 +17,54 @@ import (
 // The empty `LocationMatch` is exact: a provider of the requested target
 // itself, a provider named by client id, a fixed or restored destination, a
 // strict request, and every provider of a server that predates the marker. An
-// older server therefore never produces a fallback notice.
+// older server therefore never produces a fallback notice. A level this build
+// does not know, as a newer server could send, is kept apart as the internal
+// other level, which the window counts neither as exact nor as a fallback.
 
-// LocationMatch is the level find-providers2 found a provider at.
+// The level find-providers2 found a provider at.
 type LocationMatch string
 
 const (
-	// LocationMatchExact is the zero value: the provider is in the requested
-	// location, or no level was reported.
+	// The zero value: the provider is in the requested location, or no level
+	// was reported.
 	LocationMatchExact LocationMatch = ""
-	// LocationMatchRegion means the provider was found in the requested
-	// city's region because the city had no admitted provider.
+	// Found in the requested city's region because the city had no admitted
+	// provider.
 	LocationMatchRegion LocationMatch = "region"
-	// LocationMatchCountry means the provider was found in the requested
-	// city's or region's country because the region had none either.
+	// Found in the requested city's or region's country because the region
+	// had none either.
 	LocationMatchCountry LocationMatch = "country"
+	// Internal: every level this build does not know. A provider at it is
+	// neither in the requested location nor at a fallback this build can name.
+	locationMatchOther LocationMatch = "other"
 )
 
-// Normalize maps a level this build does not know to exact, so a level a newer
-// server introduces degrades to today's behavior (no notice) instead of to a
-// notice this client cannot name.
+// Maps every level this build does not know to the internal other level, so a
+// level a newer server introduces is neither read as exact nor named: a window
+// whose fallback providers all have it reads exact, as an older build reads
+// it, and one beside a known fallback does not make the window mixed.
 func (self LocationMatch) Normalize() LocationMatch {
 	switch self {
-	case LocationMatchRegion, LocationMatchCountry:
+	case LocationMatchExact, LocationMatchRegion, LocationMatchCountry:
 		return self
 	default:
-		return LocationMatchExact
+		return locationMatchOther
 	}
 }
 
-// breadth orders the levels outward from the requested location.
+// Reports whether the level is a fallback this build can name: region or
+// country. Exact and every level this build does not know are not.
+func (self LocationMatch) IsFallback() bool {
+	switch self {
+	case LocationMatchRegion, LocationMatchCountry:
+		return true
+	default:
+		return false
+	}
+}
+
+// Orders the fallback levels outward from the requested location. Exact and
+// the other level are 0.
 func (self LocationMatch) breadth() int {
 	switch self.Normalize() {
 	case LocationMatchRegion:
@@ -58,41 +76,45 @@ func (self LocationMatch) breadth() int {
 	}
 }
 
-// WindowLocationMatch is the window-level answer to "do the providers in use
-// match the location that was asked for?", derived from the Added providers'
-// `ProviderEvent.LocationMatch`. A provider in evaluation carries no traffic
-// and is not counted. The zero value is exact: every Added provider is in the
-// requested location, or none is Added. It is comparable, so a
+// The window-level answer to "do the providers in use match the location that
+// was asked for?", derived from the Added providers'
+// `ProviderEvent.LocationMatch`. A provider counts from the moment it is
+// Added, which is when the window starts routing flows to it, so a fallback
+// can show while the window is still short of its minimum and an app reads
+// the connection as connecting: that is where the traffic exits. A provider
+// in evaluation carries no traffic and is not counted. The zero value is
+// exact: every Added provider is in the requested location or at a level this
+// build does not know, or none is Added. It is comparable, so a
 // `WindowExpandEvent` stays comparable.
 type WindowLocationMatch struct {
-	// Match is the broadest level among the Added providers. A window routes
+	// The broadest fallback level among the Added providers. A window routes
 	// a new flow to any of its Added providers, so while one of them is
 	// outside the requested location the user's traffic can leave from there,
 	// and the notice must not be hidden behind the providers that match.
 	Match LocationMatch
-	// Mixed is true while some Added providers are in the requested location
-	// itself and others are not, so "no providers in <city>" would be untrue.
-	// It is a transition: the location's own providers came back and the
-	// fallback ones have not rotated out of the window yet. False when Match
-	// is exact.
+	// True while some Added providers are in the requested location itself
+	// and others are at a fallback, so "no providers in <city>" would be
+	// untrue. It is a transition: the location's own providers came back and
+	// the fallback ones have not rotated out of the window yet. False when
+	// Match is exact.
 	Mixed bool
-	// Name is the name of the location shown in place of the requested one:
-	// the providers' region for `LocationMatchRegion`, their country for
+	// The name of the location shown in place of the requested one: the
+	// providers' region for `LocationMatchRegion`, their country for
 	// `LocationMatchCountry`. Empty when Match is exact, and when the server
 	// sent no location for the provider.
 	Name string
-	// LocationId is the id of that region or country. Zero when Match is
-	// exact or the server did not send it.
+	// The id of that region or country. Zero when Match is exact or the server
+	// did not send it.
 	LocationId Id
 }
 
-// locationMatchFold folds Added provider events into a `WindowLocationMatch`.
-// Among the Added providers at the broadest level, the one that names its
-// location, then the longest connected, then the lowest egress client id (then
-// window client id) names the shown location, a total order, so the result
-// does not depend on map order. With one location target every provider at a
-// level shares one region or country; the order matters only when a window
-// discovers for several targets.
+// Folds Added provider events into a `WindowLocationMatch`. Among the Added
+// providers at the broadest level, the one that names its location, then the
+// longest connected, then the lowest egress client id (then window client id)
+// names the shown location, a total order, so the result does not depend on
+// map order. With one location target every provider at a level shares one
+// region or country; the order matters only when a window discovers for
+// several targets.
 //
 // The fold keeps the naming event rather than its name, so two folds merge by
 // the same order: the multi client's merged monitor folds its windows' folds
@@ -112,6 +134,8 @@ func (self *locationMatchFold) add(providerEvent *ProviderEvent) {
 	switch {
 	case match == LocationMatchExact:
 		self.exact = true
+	case !match.IsFallback():
+		// a level this build does not know: neither exact nor a fallback
 	case self.broadest.breadth() < match.breadth():
 		self.broadest = match
 		self.shown = providerEvent
@@ -123,7 +147,7 @@ func (self *locationMatchFold) add(providerEvent *ProviderEvent) {
 func (self *locationMatchFold) merge(other locationMatchFold) {
 	self.exact = self.exact || other.exact
 	switch {
-	case other.broadest == LocationMatchExact:
+	case !other.broadest.IsFallback():
 	case self.broadest.breadth() < other.broadest.breadth():
 		self.broadest = other.broadest
 		self.shown = other.shown
@@ -133,7 +157,7 @@ func (self *locationMatchFold) merge(other locationMatchFold) {
 }
 
 func (self *locationMatchFold) windowLocationMatch() WindowLocationMatch {
-	if self.broadest == LocationMatchExact {
+	if !self.broadest.IsFallback() {
 		return WindowLocationMatch{}
 	}
 	name, locationId := locationMatchName(self.shown.Location, self.broadest)
@@ -145,8 +169,8 @@ func (self *locationMatchFold) windowLocationMatch() WindowLocationMatch {
 	}
 }
 
-// locationMatchName is the name and id of the location a provider at match
-// shows: its region for region, its country for country.
+// The name and id of the location a provider at match shows: its region for
+// region, its country for country.
 func locationMatchName(location *ProviderLocation, match LocationMatch) (string, Id) {
 	if location == nil {
 		return "", Id{}
@@ -167,8 +191,8 @@ func locationMatchName(location *ProviderLocation, match LocationMatch) (string,
 	}
 }
 
-// locationMatchShownBefore reports whether a names the shown location ahead
-// of b, two Added providers at match (see locationMatchFold).
+// Reports whether a names the shown location ahead of b, two Added providers
+// at match (see locationMatchFold).
 func locationMatchShownBefore(a *ProviderEvent, b *ProviderEvent, match LocationMatch) bool {
 	aName, _ := locationMatchName(a.Location, match)
 	bName, _ := locationMatchName(b.Location, match)
