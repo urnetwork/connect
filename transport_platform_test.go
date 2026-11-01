@@ -235,6 +235,10 @@ func testingPlatformTransportSettings() *PlatformTransportSettings {
 	// enough that the election (which is immediate) always precedes it
 	settings.InactiveDrainTimeout = 500 * time.Millisecond
 	settings.ReconnectTimeout = 50 * time.Millisecond
+	// these tests count on prompt re-dials after a connection they close; the
+	// spread of a fleet's re-dials has its own tests
+	// (transport_reconnect_jitter_test.go), which opt back in
+	settings.ReconnectJitter = 0
 	// keep the client's own keepalive out of the way; it is written directly to
 	// the socket and is not counted as activity either way
 	settings.PingTimeout = 30 * time.Second

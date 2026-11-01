@@ -1056,6 +1056,11 @@ func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 // this only for the FIRST dial after a lost connection -- retries after a
 // failed reconnect go back through NextConnectTime, restoring the old pacing
 // exactly when the platform itself is what is failing.
+//
+// The fast path bounds one device's burst, not the fleet's. A platform restart
+// ends every device's connections in the same instant, so a platform
+// transport whose connection died without a network change kick adds its own
+// spread past this time (PlatformTransportSettings.ReconnectJitter).
 func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 	acquired := false
 	func() {

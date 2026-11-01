@@ -651,6 +651,16 @@ type PlatformTransportSettings struct {
 	// backoff after consecutive failed dials (see dialRetryAfter).
 	// Non-positive resolves to one minute.
 	ReconnectMaxTimeout time.Duration
+	// ReconnectJitter spreads the re-dial after a connection that ran and
+	// died without a network change kick: the dial waits a further draw
+	// uniform in [0, ReconnectJitter) past its other pacing, pinned or not
+	// (see nextDialTime). A platform restart or deploy ends every client's
+	// connection in the same instant. Without the spread the fleet re-dialed
+	// within the strategy's fast-path jitter (250 ms), and a pinned transport
+	// at once (2026-11-01). A kick re-dial keeps the fast path, since a
+	// network change is this device's own event. Non-positive re-dials on the
+	// other pacing alone.
+	ReconnectJitter time.Duration
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -835,6 +845,10 @@ type PlatformTransportSettings struct {
 	// reads the active mode, with whether that mode supersedes its carrier,
 	// before it waits. It runs on the watchdog and must not block.
 	inactiveDrainDecisionForTest func(mode TransportMode, activeMode TransportMode, superseded bool)
+	// Nil outside package tests. Replaces the uniform draw of a lost
+	// connection's re-dial spread, given ReconnectJitter. Its result is held
+	// to [0, ReconnectJitter).
+	reconnectJitterForTest func(maxJitter time.Duration) time.Duration
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -864,6 +878,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
 		ReconnectMaxTimeout:       60 * time.Second,
+		// A fleet-wide re-dial spreads over 5 s instead of 250 ms. A window
+		// whose k exits lost their connections together has its first one back
+		// after 5/(k+1) s on average, well inside the window's 20 s exit
+		// verdicts, and one lost connection re-dials within 5 s.
+		ReconnectJitter: 5 * time.Second,
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,

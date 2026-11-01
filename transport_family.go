@@ -24,8 +24,9 @@ package connect
 //
 // The GROUP owns the three transports a provider runs (A4). The standby is the
 // full-strategy, family-agnostic transport this product has always run; it
-// dials only after StandbyDelay has elapsed with neither pinned transport
-// connected, and it stands down again when one connects. That covers
+// dials only after StandbyDelay, plus a draw over [0, StandbyJitter), has
+// elapsed with neither pinned transport connected, and it stands down again
+// when one connects. That covers
 // unprovisioned family names, blocked DNS and censored networks, where the
 // provider is then tagged legacy v4 by the platform. The delay is skipped
 // when no pinned transport can connect soon: every configured pin is held
@@ -572,11 +573,21 @@ func (self *PlatformTransport) authIntent() int32 {
 // onto the staircase behind each other for seconds. That burst is bounded by
 // the transports themselves, so it takes the fast path's jitter on its own,
 // larger cap (KickReconnectLimit).
+//
+// A re-dial after a connection that ran and died without a kick waits a
+// further draw over [0, ReconnectJitter), pinned or not. Its connection may
+// have died with every other client's in a platform restart, and the fast
+// path's 250 ms jitter, or a pinned transport's zero backoff after a success,
+// re-dialed the whole fleet in the same instant.
 func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
 	releaseReconnect = func() {}
 	cancelConnect = func() {}
+	reconnectJitter := time.Duration(0)
+	if hadConnection && !afterKick {
+		reconnectJitter = self.reconnectJitter()
+	}
 	if self.pinned() {
-		return time.Now().Add(self.pinnedBackoff.delay()), releaseReconnect, cancelConnect
+		return time.Now().Add(self.pinnedBackoff.delay() + reconnectJitter), releaseReconnect, cancelConnect
 	}
 	if afterKick {
 		connectTime, releaseReconnect = self.clientStrategy.NextKickReconnectTime()
@@ -584,10 +595,21 @@ func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) 
 	}
 	if hadConnection {
 		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+		connectTime = connectTime.Add(reconnectJitter)
 	} else {
 		connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 	}
 	return connectTime, releaseReconnect, cancelConnect
+}
+
+// reconnectJitter is one draw of a lost connection's re-dial spread, uniform
+// in [0, ReconnectJitter). A transport a fixture built without settings
+// draws none.
+func (self *PlatformTransport) reconnectJitter() time.Duration {
+	if self.settings == nil {
+		return 0
+	}
+	return uniformJitter(self.settings.ReconnectJitter, self.settings.reconnectJitterForTest)
 }
 
 // noteDialFailure records a failed connect. A pinned transport's failure is
@@ -1058,11 +1080,25 @@ type FamilyPlatformTransportGroupSettings struct {
 	// (sleeping or idle by policy) or its last dial failed because its
 	// hostname does not resolve. Any other failure waits out the delay.
 	StandbyDelay time.Duration
+	// StandbyJitter spreads the release past StandbyDelay: each delay waits a
+	// further draw uniform in [0, StandbyJitter). A platform restart or outage
+	// disconnects every provider's pinned transports in the same instant, and
+	// a fixed delay then released every standby in the fleet together.
+	// Non-positive releases at StandbyDelay exactly.
+	StandbyJitter time.Duration
+
+	// Nil outside package tests. Replaces the uniform draw of the release's
+	// spread, given StandbyJitter. Its result is held to [0, StandbyJitter).
+	standbyJitterForTest func(maxJitter time.Duration) time.Duration
 }
 
 func DefaultFamilyPlatformTransportGroupSettings() *FamilyPlatformTransportGroupSettings {
 	return &FamilyPlatformTransportGroupSettings{
 		StandbyDelay: 15 * time.Second,
+		// releases spread over [15 s, 30 s) of an outage: a provider whose pins
+		// cannot connect falls back to the standby 7.5 s later on average, and
+		// a pin that cannot resolve still releases it at once
+		StandbyJitter: 15 * time.Second,
 	}
 }
 
@@ -1211,13 +1247,21 @@ func NewFamilyPlatformTransportGroup(
 		&standbySettings,
 	)
 	group.standbyActive = !hasPinned
-	group.standbyDueTime = time.Now().Add(groupSettings.StandbyDelay)
+	group.standbyDueTime = time.Now().Add(group.standbyDelay())
 
 	go HandleError(func() {
 		defer close(group.done)
 		group.run()
 	}, cancel)
 	return group
+}
+
+// standbyDelay is how long the standby waits from a moment with no pinned
+// transport connected: StandbyDelay, plus a draw uniform in [0, StandbyJitter)
+// so that providers whose pins lost the platform together do not release
+// their standbys together.
+func (self *FamilyPlatformTransportGroup) standbyDelay() time.Duration {
+	return self.settings.StandbyDelay + uniformJitter(self.settings.StandbyJitter, self.settings.standbyJitterForTest)
 }
 
 // run drives the standby from the pinned transports' connected state and fans
@@ -1248,11 +1292,11 @@ func (self *FamilyPlatformTransportGroup) run() {
 				self.standbyDueTime = time.Time{}
 			} else {
 				if self.standbyDueTime.IsZero() {
-					self.standbyDueTime = now.Add(self.settings.StandbyDelay)
+					self.standbyDueTime = now.Add(self.standbyDelay())
 				}
 				if !self.standbyActive {
 					if !now.Before(self.standbyDueTime) {
-						self.log.Infof("[t]standby transport dials: no pinned transport connected for %s\n", self.settings.StandbyDelay)
+						self.log.Infof("[t]standby transport dials: no pinned transport connected for at least %s\n", self.settings.StandbyDelay)
 						self.standbyTransport.SetEnabled(true)
 						self.standbyActive = true
 					} else if self.pinnedCannotConnectWithLock() {

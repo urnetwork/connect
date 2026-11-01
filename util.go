@@ -652,6 +652,20 @@ func weightedSelectFuncWithEntropy[T any, R weightedRandomSource](values []T, n 
 	}
 }
 
+// uniformJitter is one draw uniform in [0, maxJitter), none when maxJitter is
+// non-positive. A non-nil testDraw replaces the draw, and its result is held
+// to the same range, so a test can pick any point of the window but never
+// leave it.
+func uniformJitter(maxJitter time.Duration, testDraw func(maxJitter time.Duration) time.Duration) time.Duration {
+	if maxJitter <= 0 {
+		return 0
+	}
+	if testDraw != nil {
+		return max(0, min(maxJitter-1, testDraw(maxJitter)))
+	}
+	return time.Duration(mathrand.Int63n(int64(maxJitter)))
+}
+
 type Reconnect struct {
 	startTime  time.Time
 	minTimeout time.Duration
