@@ -278,6 +278,8 @@ func newWindowStatsTestHarness(t *testing.T, configure ...func(*MultiClientSetti
 	configureAll := append([]func(*MultiClientSettings){func(settings *MultiClientSettings) {
 		settings.WindowClientStats = stats
 		settings.MaxFlowsPerExit = DefaultMultiClientSettings().MaxFlowsPerExit
+		// the host's opt-in, as the proxy service sets it
+		settings.StrictWindowHandover = true
 	}}, configure...)
 	h, generator := newDiscoveryDemandTestHarness(t, specs, configureAll...)
 	synctest.Wait()
