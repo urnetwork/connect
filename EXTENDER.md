@@ -1119,7 +1119,11 @@ apply the bootstrap records to the directory, and record the status.
 Each family keeps its own schedule (connect#230): backoff on failure 10
 minutes doubling to 6 hours, and a success resets it and waits out that
 family's own 24 hour tick, so a family that passed is not posted again for
-the other family's refusal. A family without an address is skipped and
+the other family's refusal. A refusal that carries `retry_after_seconds`
+(C2: a spent activation budget, or an operator too busy to probe) holds
+its family exactly that long, at least 1 minute and at most 6 hours, and
+leaves the backoff as it was; an operator that predates the field gets
+the backoff. A family without an address is skipped and
 retried on its own backoff rather than the daily tick. A trigger makes
 every family due. The hourly address check is
 one hello for both families and compares the address, not the port. The

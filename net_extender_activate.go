@@ -34,13 +34,16 @@ import (
 // The loop runs on five triggers (G3): start, the 24 hour tick, the own key
 // observed revoked in the directory, a changed caller address from hello, and a
 // network change. Everything else is backoff: a refusal holds the next attempt
-// for ten minutes, doubling to six hours, and a success resets it. Each family
-// keeps its own schedule (connect#230): a family that passed waits out its own
-// tick while the other family retries, rather than being posted again with it
-// and spending its activation budget for nothing. A trigger makes every family
-// due. The tick, the address check and the backoff count the time the host
-// slept, from the first minute it is awake after a sleep of fifteen minutes or
-// more.
+// for ten minutes, doubling to six hours, and a success resets it. A refusal
+// that says when the operator has room again (`retry_after_seconds`: a spent
+// activation budget, or an operator too busy to probe) holds the family that
+// long instead, within a minute and six hours, and leaves the backoff as it
+// was. Each family keeps its own schedule (connect#230): a family that passed
+// waits out its own tick while the other family retries, rather than being
+// posted again with it and spending its activation budget for nothing. A
+// trigger makes every family due. The tick, the address check and the backoff
+// count the time the host slept, from the first minute it is awake after a
+// sleep of fifteen minutes or more.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `AddNetworkChangeListener` -- so the whole loop is
@@ -108,6 +111,11 @@ type ExtenderActivateResult struct {
 	// base64 of serialized protocol.ExtenderRecord messages of other active
 	// extenders, the directory this extender starts from (D6)
 	Bootstrap []string `json:"bootstrap,omitempty"`
+	// on a refusal that judged nothing about this extender -- a spent
+	// activation budget, or an operator too busy to probe -- the seconds until
+	// the operator has room for this family's next post (C2, connect#230). 0
+	// on every other answer, and from an operator that predates the field.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // PostExtenderActivate posts one activation to one family api url (C2). The
@@ -234,6 +242,13 @@ type ExtenderActivatorSettings struct {
 	// Backoff after a failed pass, doubling to the max (G3).
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
+	// The shortest wait a refusal's `retry_after_seconds` is taken as (C2,
+	// connect#230). A refusal that carries one holds its family exactly that
+	// long, at least this and at most MaxBackoff, and leaves the backoff as it
+	// was: the operator said when it has room, and nothing about this host. A
+	// minute keeps an operator's short answer from turning the loop into a
+	// poll. Non-positive takes the default.
+	MinRetryAfter time.Duration
 	// Budget of one activation post and of one hello.
 	RequestTimeout time.Duration
 	// A resume from a sleep of at least ResumeMinSleep pulls the address
@@ -272,6 +287,7 @@ func DefaultExtenderActivatorSettings() *ExtenderActivatorSettings {
 		AddressCheckTimeout: 1 * time.Hour,
 		MinBackoff:          10 * time.Minute,
 		MaxBackoff:          6 * time.Hour,
+		MinRetryAfter:       1 * time.Minute,
 		RequestTimeout:      60 * time.Second,
 		ResumeCheckTimeout:  defaultResumeCheckTimeout,
 		ResumeMinSleep:      defaultResumeMinSleep,
@@ -382,6 +398,9 @@ func NewExtenderActivator(
 	}
 	if copied.MaxBackoff < copied.MinBackoff {
 		copied.MaxBackoff = copied.MinBackoff
+	}
+	if copied.MinRetryAfter <= 0 {
+		copied.MinRetryAfter = DefaultExtenderActivatorSettings().MinRetryAfter
 	}
 	if copied.RequestTimeout <= 0 {
 		copied.RequestTimeout = 60 * time.Second
@@ -516,6 +535,15 @@ type extenderActivateSchedule struct {
 	backoff          time.Duration
 }
 
+// What one family's activation in a pass came to, which is what its schedule
+// is set from.
+type extenderActivateOutcome struct {
+	succeeded bool
+	// the wait the operator's refusal asked for (`retry_after_seconds`, C2),
+	// 0 when it asked for none or the attempt was no refusal
+	retryAfter time.Duration
+}
+
 // The keys of the activation schedules, one per family this activator runs, in
 // ip version order. The plain api url has one schedule, under 0, since one
 // post a cycle activates whichever family the answer names.
@@ -615,13 +643,23 @@ func (self *ExtenderActivator) run() {
 			}
 		}
 		if 0 < len(dueIpVersions) {
-			ipVersionSucceeded := self.activate(now, dueIpVersions)
+			ipVersionOutcomes := self.activate(now, dueIpVersions)
 			for _, ipVersion := range dueIpVersions {
 				schedule := ipVersionSchedules[ipVersion]
-				if ipVersionSucceeded[ipVersion] {
+				outcome := ipVersionOutcomes[ipVersion]
+				switch {
+				case outcome.succeeded:
 					schedule.backoff = self.settings.MinBackoff
 					schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
-				} else {
+				case 0 < outcome.retryAfter:
+					// the operator said when it has room again (connect#230).
+					// Its refusal judged nothing about this host, so the
+					// backoff is left as it was rather than doubled
+					schedule.nextActivateTime = now.Add(min(
+						max(outcome.retryAfter, self.settings.MinRetryAfter),
+						self.settings.MaxBackoff,
+					))
+				default:
 					schedule.nextActivateTime = now.Add(schedule.backoff)
 					schedule.backoff = min(2*schedule.backoff, self.settings.MaxBackoff)
 				}
@@ -792,7 +830,7 @@ func (self *ExtenderActivator) dnsPorts() []int {
 }
 
 // Activates the due families that have an address on this host, each with its
-// own post, and reports which of them succeeded, keyed by schedule
+// own post, and reports what each came to, keyed by schedule
 // (scheduleIpVersions). Each family's outcome sets only its own schedule
 // (connect#230): a family that passed is not posted again for the other's
 // refusal, since that post would spend the passed family's activation budget
@@ -802,7 +840,7 @@ func (self *ExtenderActivator) dnsPorts() []int {
 //
 // The pass as a whole -- every due family it attempted passed, and it
 // attempted one -- is what decides the measurement follow-up (C4).
-func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[int]bool {
+func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[int]extenderActivateOutcome {
 	carriers := []string{}
 	if self.settings.Carriers != nil {
 		carriers = self.settings.Carriers()
@@ -812,13 +850,15 @@ func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[
 	followUp := self.measurementFollowUp
 	self.measurementFollowUp = false
 
-	ipVersionSucceeded := map[int]bool{}
+	ipVersionOutcomes := map[int]extenderActivateOutcome{}
 	succeeded := false
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	if self.fallback {
-		succeeded, measurementCarried = self.activateFallback(carriers, now)
-		ipVersionSucceeded[0] = succeeded
+		var outcome extenderActivateOutcome
+		outcome, measurementCarried = self.activateFallback(carriers, now)
+		ipVersionOutcomes[0] = outcome
+		succeeded = outcome.succeeded
 	} else {
 		attempted := false
 		succeeded = true
@@ -839,8 +879,9 @@ func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[
 			if !measurementCarried {
 				measurementCsr = self.measurementCsr()
 			}
-			if self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now) {
-				ipVersionSucceeded[ipVersion] = true
+			outcome := self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
+			ipVersionOutcomes[ipVersion] = outcome
+			if outcome.succeeded {
 				measurementCarried = measurementCarried || measurementCsr != ""
 			} else {
 				succeeded = false
@@ -851,7 +892,7 @@ func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[
 	if succeeded && !followUp && !measurementCarried {
 		self.followMeasurementCsr()
 	}
-	return ipVersionSucceeded
+	return ipVersionOutcomes
 }
 
 // The measurement request a post carries (lag.dev/PLAN.md C4): what the
@@ -910,30 +951,31 @@ func (self *ExtenderActivator) ipVersionSupported(ipVersion int) bool {
 // without one is (G3). The one post carries the measurement request when one
 // is wanted and this extender's id is known, and whether it delivered one
 // comes back with the outcome (C4).
-func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (succeeded bool, measurementCarried bool) {
+func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (outcome extenderActivateOutcome, measurementCarried bool) {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
-		return false, false
+		return extenderActivateOutcome{}, false
 	}
 	if len(carriers) == 0 {
 		self.recordFailure(0, now, "no carrier is listening", false)
-		return false, false
+		return extenderActivateOutcome{}, false
 	}
 	measurementCsr := self.measurementCsr()
-	succeeded = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
-	return succeeded, succeeded && measurementCsr != ""
+	outcome = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
+	return outcome, outcome.succeeded && measurementCsr != ""
 }
 
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
 // fallback mode. `measurementCsr` is the request the post carries, empty for
-// none (C4).
+// none (C4). A refusal that names when the operator has room again
+// (`retry_after_seconds`) carries that wait in the outcome.
 func (self *ExtenderActivator) activateUrl(
 	ipVersion int,
 	apiUrl string,
 	carriers []string,
 	measurementCsr string,
 	now time.Time,
-) bool {
+) extenderActivateOutcome {
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
 		TcpPort:             self.settings.TcpPort,
@@ -964,11 +1006,11 @@ func (self *ExtenderActivator) activateUrl(
 		// message hides (connect#229)
 		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
 		self.recordFailure(ipVersion, now, err.Error(), false)
-		return false
+		return extenderActivateOutcome{}
 	}
 	if result == nil {
 		self.recordFailure(ipVersion, now, "the operator sent no activation result", false)
-		return false
+		return extenderActivateOutcome{}
 	}
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)
@@ -978,9 +1020,15 @@ func (self *ExtenderActivator) activateUrl(
 		if message == "" {
 			message = "the operator refused the activation"
 		}
-		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		retryAfter := time.Duration(0)
+		if 0 < result.RetryAfterSeconds {
+			retryAfter = time.Duration(result.RetryAfterSeconds) * time.Second
+			self.log.Infof("[extender]activate v%d refused = %s (retry after %s)\n", ipVersion, message, retryAfter)
+		} else {
+			self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		}
 		self.recordFailure(ipVersion, now, message, true)
-		return false
+		return extenderActivateOutcome{retryAfter: retryAfter}
 	}
 
 	// the operator's id of this extender, the same at every activation, which
@@ -998,13 +1046,13 @@ func (self *ExtenderActivator) activateUrl(
 		// an activation with no family cannot be attributed to one, and the
 		// mesh address of D2 has no family to be published under
 		self.recordFailure(ipVersion, now, "the operator named no address family", false)
-		return false
+		return extenderActivateOutcome{}
 	}
 	self.recordSuccess(ipVersion, now, result)
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
-	return true
+	return extenderActivateOutcome{succeeded: true}
 }
 
 // The family an activation answer belongs to: what the operator reported, else
