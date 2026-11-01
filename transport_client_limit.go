@@ -302,30 +302,61 @@ func (self *PlatformTransport) clientLimitHold() (ClientLimitStatus, chan struct
 	return self.clientLimitBackoff.Get()
 }
 
+// The reasons runConnectionWatch closes a connection with. A QUIC carrier sends
+// the reason with its close.
+const (
+	connectionCloseNetworkChange = "network change"
+	connectionCloseHeld          = "held"
+	connectionCloseClientLimit   = "client limit"
+)
+
 // runConnectionWatch closes a live connection on a network change kick, so the
-// loop re-dials over the new path at once, or when a client limit hold is in
-// force, so the connection stops with the one the platform closed. Closing the
-// carrier is what unblocks a reader or writer parked in socket I/O that
-// cancelling handleCtx alone cannot wake. Returns when the connection ends.
+// loop re-dials over the new path at once, while the owner or the pinned
+// family holds the transport, so a held transport carries nothing, or when a
+// client limit hold is in force, so the connection stops with the one the
+// platform closed. Both holds are read as levels, so a connection that a dial
+// produced after its hold began closes at once rather than on a notification
+// that already fired. Closing the carrier is what unblocks a reader or writer
+// parked in socket I/O that cancelling handleCtx alone cannot wake. Returns
+// when the connection ends.
 func (self *PlatformTransport) runConnectionWatch(
 	handleCtx context.Context,
 	kick <-chan struct{},
 	closeConnection func(reason string),
 ) {
 	for {
+		var held bool
+		var heldNotify chan struct{}
+		if self.held != nil {
+			held, heldNotify = self.held.Get()
+		}
+		if held {
+			self.log.Infof("[t]transport held: closing connection\n")
+			closeConnection(connectionCloseHeld)
+			return
+		}
 		clientLimitStatus, clientLimitNotify := self.clientLimitHold()
 		if clientLimitStatus.Exceeded {
 			self.log.Infof("[t]client limit hold: closing connection\n")
-			closeConnection("client limit")
+			closeConnection(connectionCloseClientLimit)
 			return
+		}
+		if self.settings.connectionWatchWaitForTest != nil {
+			self.settings.connectionWatchWaitForTest(self)
 		}
 		select {
 		case <-handleCtx.Done():
 			return
 		case <-kick:
+			// the kick monitor also fires when the transport becomes held,
+			// which the level read above names
+			if self.heldNow() {
+				continue
+			}
 			self.log.Infof("[t]kick: closing connection for re-dial\n")
-			closeConnection("network change")
+			closeConnection(connectionCloseNetworkChange)
 			return
+		case <-heldNotify:
 		case <-clientLimitNotify:
 		}
 	}

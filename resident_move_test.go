@@ -109,7 +109,7 @@ func TestResidentMoveDrainMigratesByName(t *testing.T) {
 	plan := PlanResidentMove(
 		move,
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		NewResidentMoveTracker(),
 		time.Now(),
 	)
@@ -293,7 +293,7 @@ func TestPlanResidentMoveAcceptsAnAdvisoryMove(t *testing.T) {
 	plan := PlanResidentMove(
 		move,
 		[]ResidentMoveTransport{ipv4, ipv6, standby},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		NewResidentMoveTracker(),
 		time.Now(),
 	)
@@ -400,7 +400,7 @@ func TestPlanResidentMoveDeclinesAdvisoryMoves(t *testing.T) {
 			reason: protocol.ResidentMoveReason_ResidentMoveReasonMobileBackgroundOrMetered,
 		},
 	} {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		tracker := NewResidentMoveTracker()
 		if c.configure != nil {
 			c.configure(settings, tracker)
@@ -416,7 +416,7 @@ func TestPlanResidentMoveDeclinesAdvisoryMoves(t *testing.T) {
 // interval accept again, and a hook that declines nothing accepts.
 func TestPlanResidentMoveAcceptsPastTheHolds(t *testing.T) {
 	now := time.Now()
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.MoveDecline = func() bool { return false }
 	tracker := NewResidentMoveTracker()
 	tracker.NoteTargetFailed(testMoveTargetIpv4, now.Add(-time.Hour))
@@ -449,7 +449,7 @@ func TestPlanResidentMoveCompulsoryFallsBackToTheSameName(t *testing.T) {
 		{name: "no family target", transport: testDirectMoveTransport(6), targetIps: []netip.Addr{testMoveTargetIpv4}, enable: true},
 		{name: "moves disabled", transport: testDirectMoveTransport(0), targetIps: []netip.Addr{testMoveTargetIpv4}, enable: false},
 	} {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.EnableMove = c.enable
 		settings.MoveDecline = func() bool { return true }
 		plan := PlanResidentMove(testCompulsoryMove(c.targetIps...), []ResidentMoveTransport{c.transport}, settings, NewResidentMoveTracker(), now)
@@ -458,7 +458,7 @@ func TestPlanResidentMoveCompulsoryFallsBackToTheSameName(t *testing.T) {
 		}
 	}
 
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.MoveDecline = func() bool { return true }
 	tracker := NewResidentMoveTracker()
 	tracker.NoteTargetFailed(testMoveTargetIpv4, now)
@@ -484,7 +484,7 @@ func TestResidentMoveDialCountsOnlyDecisiveFailures(t *testing.T) {
 	plan := PlanResidentMove(
 		testAdvisoryMove(testMoveTargetIpv4, testMoveTargetIpv6),
 		[]ResidentMoveTransport{ipv4, ipv6},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		tracker,
 		time.Now(),
 	)
@@ -539,7 +539,7 @@ func TestResidentMoveDialArrivalRecordsThePreference(t *testing.T) {
 	plan := PlanResidentMove(
 		testAdvisoryMove(testMoveTargetIpv4),
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		tracker,
 		time.Now(),
 	)
@@ -566,12 +566,12 @@ func TestResidentMoveDialArrivalRecordsThePreference(t *testing.T) {
 // a strict one waits for its arrival, else its timeout.
 func TestResidentMoveDialWaitFollowsStrictness(t *testing.T) {
 	transports := []ResidentMoveTransport{testDirectMoveTransport(0)}
-	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now())
+	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now())
 	connected := newFakeWindowPlatformTransport(true)
 	if resolution := compulsory.Dial.Wait(context.Background(), connected, time.Second); resolution != ResidentMoveResolutionConnected {
 		t.Fatalf("compulsory resolution = %d, want connected", resolution)
 	}
-	advisory := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now())
+	advisory := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now())
 	if resolution := advisory.Dial.Wait(context.Background(), connected, 20*time.Millisecond); resolution != ResidentMoveResolutionTimedOut {
 		t.Fatalf("advisory resolution = %d, want timed out without an arrival", resolution)
 	}

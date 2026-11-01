@@ -131,17 +131,25 @@ func newTestingFamilyPlatformServerOnPort(t *testing.T, ipVersion int, port int,
 	}
 	platform.port = listener.Addr().(*net.TCPAddr).Port
 	platform.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		platform.connectCount.Add(1)
+		// the upgrade answers the client, which may then count the connection
+		// as up, so the platform holds the connection under the same lock:
+		// closeConns never runs between the two and misses it
+		var ws *websocket.Conn
+		var err error
 		func() {
 			platform.stateLock.Lock()
 			defer platform.stateLock.Unlock()
+			ws, err = upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			platform.connectCount.Add(1)
 			platform.conns = append(platform.conns, ws)
 			platform.instanceIdConnectCounts[r.Header.Get("X-UR-InstanceId")] += 1
 		}()
+		if err != nil {
+			return
+		}
 		remoteFamily := 0
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 			if ip := net.ParseIP(host); ip != nil {

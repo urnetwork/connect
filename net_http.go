@@ -1056,7 +1056,28 @@ func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 // this only for the FIRST dial after a lost connection -- retries after a
 // failed reconnect go back through NextConnectTime, restoring the old pacing
 // exactly when the platform itself is what is failing.
+//
+// The fast path bounds one device's burst, not the fleet's. A platform restart
+// ends every device's connections in the same instant, so a platform
+// transport whose connection died without a network change kick waits out its
+// own spread before it asks for this time
+// (PlatformTransportSettings.ReconnectJitter).
 func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
+	// The staircase step taken past the cap is kept when the wait is
+	// cancelled: this method's release contract is "dial attempt completed",
+	// and handing back a pacing step after a dial that actually happened would
+	// defeat the pacing. Such a leak is bounded by nextConnectMaxLead. The
+	// platform transport gives the step back through nextReconnectTime.
+	next, release, _ := self.nextReconnectTime()
+	return next, release
+}
+
+// nextReconnectTime is NextReconnectTime with the staircase's cancel. A
+// caller past the fast path's cap takes a staircase step, which cancel gives
+// back when its wait ends before it dials, as NextConnectTime's release does.
+// Within the cap, cancel does nothing and release frees the slot. Both are
+// idempotent and never nil.
+func (self *ClientStrategy) nextReconnectTime() (connectTime time.Time, release func(), cancel func()) {
 	acquired := false
 	func() {
 		self.mutex.Lock()
@@ -1069,25 +1090,20 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 	if !acquired {
 		// over the cap: this burst is not small after all; serialize like any
 		// other connect. NextConnectTime takes the mutex itself, so it must be
-		// called with the lock released (done above). The staircase release is
-		// deliberately dropped: this method's release contract is "dial
-		// attempt completed", and handing back a pacing step after a dial that
-		// actually happened would defeat the pacing. A cancelled wait on this
-		// rare over-cap path therefore leaks its step, bounded by
-		// nextConnectMaxLead.
-		next, _ := self.NextConnectTime()
-		return next, func() {}
+		// called with the lock released (done above).
+		next, cancelStep := self.NextConnectTime()
+		return next, func() {}, cancelStep
 	}
 
 	var releaseOnce sync.Once
-	release := func() {
+	release = func() {
 		releaseOnce.Do(func() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 			self.reconnectFastPathCount -= 1
 		})
 	}
-	return time.Now().Add(self.reconnectFastPathJitter()), release
+	return time.Now().Add(self.reconnectFastPathJitter()), release, func() {}
 }
 
 // reconnectFastPathJitter is one draw of the fast path's independent jitter,
@@ -1116,6 +1132,13 @@ func (self *ClientStrategy) dialerWeights(webSocketOnly bool) map[*clientDialer]
 // reconnect path (NextReconnectTime). The release contract is
 // NextReconnectTime's: call it once the dial attempt completes.
 func (self *ClientStrategy) NextKickReconnectTime() (time.Time, func()) {
+	next, release, _ := self.nextKickReconnectTime()
+	return next, release
+}
+
+// nextKickReconnectTime is NextKickReconnectTime with the cancel of
+// nextReconnectTime, which a caller past the kick cap falls back to.
+func (self *ClientStrategy) nextKickReconnectTime() (connectTime time.Time, release func(), cancel func()) {
 	acquired := false
 	func() {
 		self.mutex.Lock()
@@ -1126,18 +1149,18 @@ func (self *ClientStrategy) NextKickReconnectTime() (time.Time, func()) {
 		}
 	}()
 	if !acquired {
-		return self.NextReconnectTime()
+		return self.nextReconnectTime()
 	}
 
 	var releaseOnce sync.Once
-	release := func() {
+	release = func() {
 		releaseOnce.Do(func() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 			self.kickReconnectCount -= 1
 		})
 	}
-	return time.Now().Add(self.reconnectFastPathJitter()), release
+	return time.Now().Add(self.reconnectFastPathJitter()), release, func() {}
 }
 
 // The weights of dialerWeights with every limited extender dialer left out

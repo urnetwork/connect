@@ -66,8 +66,12 @@ host logic.
 A4. Direct only, plus a legacy standby. Pinned transports use direct dialers
 only (no extender, no SOCKS). A third, family-agnostic standby transport with
 the full dialer set and no intent runs only while neither pinned transport is
-connected, after a `StandbyDelay` (default 15s) from start or from the last
-pinned disconnect, and stops when a pinned transport connects. The delay is
+connected, after a `StandbyDelay` (default 15s) from start, or after
+`StandbyDelay` plus a draw uniform in [0, `StandbyJitter`) (default 5s) from
+the last pinned disconnect, and stops when a pinned transport connects. The
+draw spreads the standbys of providers whose pins lost the platform together
+in a restart or outage, which a fixed delay released in the same second; a
+start is one device's own event and keeps the exact delay. The delay is
 skipped when no pinned transport can connect soon: every configured pin is
 held (sleeping or idle by policy) or its last dial failed because its hostname
 does not resolve (NXDOMAIN or no record of its family); any other failure
@@ -81,7 +85,11 @@ A5. Sleep instead of spin. A pinned transport sleeps while
 `probeFamilySupport(family)` reports no global address of its family and
 wakes on `AddNetworkChangeListener`. Its dial failures never call
 `noteBackendFailure`, and it uses its own jittered backoff rather than a
-shared `NextConnectTime` pacing step. Implementation check: the probe's
+shared `NextConnectTime` pacing step. Its re-dial after a connection that ran
+and died without a network change kick also waits a draw uniform in
+[0, `ReconnectJitter`), as a family-agnostic transport's does, since a
+platform restart ends every provider's connections in the same instant.
+Implementation check: the probe's
 reserved-range list must not exclude the 464XLAT CLAT range (192.0.0.0/29),
 or v4 over NAT64 hosts is never attempted.
 

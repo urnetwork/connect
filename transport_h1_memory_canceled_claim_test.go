@@ -27,7 +27,7 @@ func TestPlatformH1CanceledClaimJoinsWithoutOpeningGraph(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root := NewPlatformTransportBudgetForMemoryTarget(mib(32))
 		budget := newDefaultPlatformTransportBudgetWithParent(mib(32), root)
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 		settings.PlatformTransportBudget = budget
 		if MemoryBudget() != mib(32) || debug.SetMemoryLimit(-1) != 32*1024*1024 ||
 			budget.Stats().TotalByteCount != mib(8) || root.Stats().TotalByteCount != mib(8) ||

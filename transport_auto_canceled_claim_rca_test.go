@@ -30,7 +30,7 @@ func testPlatformAutoCanceledH1AdmissionReleasesPendingH3(t *testing.T, blockH1 
 	synctest.Test(t, func(t *testing.T) {
 		root := NewPlatformTransportBudget(mib(8), 16)
 		budget := newDefaultPlatformTransportBudgetWithParent(mib(32), root)
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 		settings.PlatformTransportBudget = budget
 		settings.PlatformTransportBudgetPriority = PlatformTransportBudgetPriorityForeground
 		settings.ModePreferences = map[TransportMode]int{

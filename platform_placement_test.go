@@ -261,7 +261,7 @@ func TestPlatformTransportPinnedPlacementUsesItsFamily(t *testing.T) {
 // keeps plain H3 on alt, and without one plain H3 dials the placed edge on the
 // platform port.
 func TestPlatformTransportPlacementNeverRedirectsAnAltCarrier(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.AltUrl = "https://" + testAltIp
 	transport := newTestAltTransport(t, settings)
 	placed := func() *platformMoveDialAttempt {

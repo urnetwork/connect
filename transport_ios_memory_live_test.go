@@ -35,7 +35,7 @@ func newIosMemoryLiveSettings(t *testing.T) *PlatformTransportSettings {
 		SetMemoryBudget(previousTarget)
 		debug.SetMemoryLimit(previousSoftLimit)
 	})
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 	ApplyMobilePlatformTransportMemoryPolicy(settings, mib(32))
 	assertIosMemoryLiveSettings(t, settings)
 	return settings

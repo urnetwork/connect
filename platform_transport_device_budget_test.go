@@ -27,7 +27,7 @@ func acquireDeviceBudgetTestH1(
 // production root cause: unrelated devices sharing the process budget fill its
 // sixteen transport slots even though the next device owns no live carrier.
 func TestSharedPlatformTransportBudgetBlocksTheSeventeenthDeviceCarrier(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(
 		deviceBudgetTestMemoryTarget,
 	)
 	budget := settings.PlatformTransportBudget
@@ -63,7 +63,7 @@ func TestPrivatePlatformTransportBudgetsAdmitEveryDeviceWindow(t *testing.T) {
 	budgets := make([]*PlatformTransportBudget, 0, deviceCount)
 	reservations := make([]*platformTransportBudgetReservation, 0, deviceCount*carrierCount)
 	for range deviceCount {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(
 			deviceBudgetTestMemoryTarget,
 		)
 		budget := settings.PlatformTransportBudget
@@ -93,7 +93,7 @@ func TestPrivatePlatformTransportBudgetsAdmitEveryDeviceWindow(t *testing.T) {
 // fallback carrier. A mismatch here would turn explicit or Auto H3 into a
 // permanent budget wait on low-memory devices.
 func TestDeviceMemoryTargetPlatformSettingsFitAutoWorkingSet(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(
 		deviceBudgetTestMemoryTarget,
 	)
 	stats := settings.PlatformTransportBudget.Stats()

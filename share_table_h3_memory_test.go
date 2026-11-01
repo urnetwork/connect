@@ -59,7 +59,7 @@ func TestTheShareTableH3RetainedPolicyBoundaries(t *testing.T) {
 		for _, process := range []ByteCount{0, mib(8), mib(32), mib(40), mib(256)} {
 			t.Run(fmt.Sprintf("target%d/process%d", row.target, process), func(t *testing.T) {
 				SetMemoryBudget(process)
-				settings := DefaultPlatformTransportSettingsWithMemoryTarget(row.target)
+				settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(row.target)
 				config := newPlatformQuicConfig(settings, 1)
 				if settings.h3RetainedByteAccounting != row.retained || settings.H3BudgetByteCount != row.reservation ||
 					ByteCount(config.MaxConnectionReceiveWindow) != row.connection || ByteCount(config.MaxStreamReceiveWindow) != row.stream {

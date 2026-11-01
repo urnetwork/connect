@@ -36,7 +36,7 @@ func TestPlatformH1GraphRetainedReceiveFitsAdmission(t *testing.T) {
 			for _, plus := range []bool{false, true} {
 				observations = append(observations, func() observation {
 					baselineCount, baselineBytes := messagePoolOutstandingSnapshot()
-					settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+					settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 					ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 					if settings.TransportBufferSize != 32 || settings.H1MaxMessageByteCount != 16*1024 ||
 						settings.H1BudgetByteCount <= 0 {

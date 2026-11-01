@@ -19,7 +19,7 @@ import (
 func TestPlatformDnsCarrierAdmissionWithPendingSibling(t *testing.T) {
 	for _, mode := range []TransportMode{TransportModeH3Dns, TransportModeH3DnsPump, TransportModeAuto} {
 		ctx, cancel := context.WithCancel(t.Context())
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.H3BudgetByteCount = mib(8)
 		settings.PlatformTransportBudget = NewPlatformTransportBudget(mib(16), 16)
 		settings.ModePreferences = map[TransportMode]int{TransportModeH3Dns: 1}
@@ -102,7 +102,7 @@ func TestPlatformH3ExtenderGraphAdmissionWithPendingSibling(t *testing.T) {
 			defer cancel()
 			root := NewPlatformTransportBudget(mib(16), 16)
 			budget := newPlatformTransportBudget(mib(16), 16, root)
-			settings := DefaultPlatformTransportSettings()
+			settings := testingDefaultPlatformTransportSettings()
 			settings.H3BudgetByteCount = mib(8)
 			settings.PlatformTransportBudget = budget
 			settings.DnsPumpHost = "pump.example"

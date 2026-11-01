@@ -334,7 +334,7 @@ func TestPlatformTransportPinnedMoveDialUsesItsFamilyTarget(t *testing.T) {
 	plan := PlanResidentMove(
 		testAdvisoryMove(testMoveTargetIpv4, testMoveTargetIpv6),
 		[]ResidentMoveTransport{testDirectMoveTransport(4), testDirectMoveTransport(6)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		tracker,
 		time.Now(),
 	)
@@ -842,7 +842,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 	plan := PlanResidentMove(
 		testAdvisoryMove(testMoveTargetIpv4),
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		NewResidentMoveTracker(),
 		time.Now(),
 	)
@@ -860,7 +860,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 
 	transport := &PlatformTransport{
 		clientStrategy:   direct,
-		settings:         DefaultPlatformTransportSettings(),
+		settings:         testingDefaultPlatformTransportSettings(),
 		residentMoveDial: plan.Dial,
 	}
 	for _, mode := range []TransportMode{TransportModeH1, TransportModeH3} {
@@ -870,7 +870,7 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 	}
 	extenderTransport := &PlatformTransport{
 		clientStrategy:   extenderOnly,
-		settings:         DefaultPlatformTransportSettings(),
+		settings:         testingDefaultPlatformTransportSettings(),
 		residentMoveDial: plan.Dial,
 	}
 	held := []func() bool{
@@ -900,13 +900,13 @@ func TestPlatformTransportStrictMoveHoldsCarriersThatCannotUseATarget(t *testing
 	compulsory := PlanResidentMove(
 		testCompulsoryMove(testMoveTargetIpv4),
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		NewResidentMoveTracker(),
 		time.Now(),
 	)
 	compulsoryTransport := &PlatformTransport{
 		clientStrategy:   direct,
-		settings:         DefaultPlatformTransportSettings(),
+		settings:         testingDefaultPlatformTransportSettings(),
 		residentMoveDial: compulsory.Dial,
 	}
 	if !compulsoryTransport.waitMoveCarrierAdmission(ctx, TransportModeH3Dns) {
@@ -1097,7 +1097,7 @@ func TestPlatformTransportStrictMoveHoldsTheDnsCarrierRunner(t *testing.T) {
 	plan := PlanResidentMove(
 		testAdvisoryMove(testMoveTargetIpv4),
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		NewResidentMoveTracker(),
 		time.Now(),
 	)
@@ -1147,7 +1147,7 @@ func TestPlatformTransportCompulsoryMoveDialFallsBackToTheName(t *testing.T) {
 	plan := PlanResidentMove(
 		testCompulsoryMove(testMoveTargetIpv4),
 		[]ResidentMoveTransport{testDirectMoveTransport(0)},
-		DefaultPlatformTransportSettings(),
+		testingDefaultPlatformTransportSettings(),
 		tracker,
 		time.Now(),
 	)
@@ -1249,8 +1249,8 @@ func newTestMoveRecordingPacketConnFactory() (func(context.Context) (net.PacketC
 // the target stands in on the platform port.
 func TestPlatformTransportMoveTargetsNeverRedirectAnAltCarrier(t *testing.T) {
 	transports := []ResidentMoveTransport{testDirectMoveTransport(0)}
-	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
-	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
 	for _, c := range []struct {
 		name    string
 		attempt func() *platformMoveDialAttempt
@@ -1273,7 +1273,7 @@ func TestPlatformTransportMoveTargetsNeverRedirectAnAltCarrier(t *testing.T) {
 			}
 		}},
 	} {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.AltUrl = "https://" + testAltIp
 		transport := newTestAltTransport(t, settings)
 		attempt := c.attempt()
@@ -1312,9 +1312,9 @@ func TestPlatformTransportStrictMoveParksAnAltH3Carrier(t *testing.T) {
 	direct := NewClientStrategyWithDefaults(ctx)
 	defer direct.Close()
 	transports := []ResidentMoveTransport{testDirectMoveTransport(0)}
-	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
-	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, DefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
-	altSettings := DefaultPlatformTransportSettings()
+	strict := PlanResidentMove(testAdvisoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	compulsory := PlanResidentMove(testCompulsoryMove(testMoveTargetIpv4), transports, testingDefaultPlatformTransportSettings(), NewResidentMoveTracker(), time.Now()).Dial
+	altSettings := testingDefaultPlatformTransportSettings()
 	altSettings.AltUrl = "https://" + testAltIp
 
 	for _, c := range []struct {
@@ -1323,7 +1323,7 @@ func TestPlatformTransportStrictMoveParksAnAltH3Carrier(t *testing.T) {
 		dial     *ResidentMoveDial
 	}{
 		{name: "compulsory move on alt", settings: altSettings, dial: compulsory},
-		{name: "strict move without alt", settings: DefaultPlatformTransportSettings(), dial: strict},
+		{name: "strict move without alt", settings: testingDefaultPlatformTransportSettings(), dial: strict},
 	} {
 		transport := &PlatformTransport{clientStrategy: direct, settings: c.settings, residentMoveDial: c.dial}
 		if !transport.waitMoveCarrierAdmission(ctx, TransportModeH3) {

@@ -62,7 +62,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	// costs; TestPlatformH3MobileComposedLedger pins that envelope separately.
 	for _, budget := range []ByteCount{mib(64), mib(256), mib(1024)} {
 		SetMemoryBudget(budget)
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		stream, connection := resolved(settings)
 		samples = append(samples, sample{
 			budget:      budget,
@@ -119,7 +119,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	// before. The reservation itself does not move, at the reference or anywhere:
 	// only the fractions inside it do.
 	SetMemoryBudget(mib(64))
-	referenceSettings := DefaultPlatformTransportSettings()
+	referenceSettings := testingDefaultPlatformTransportSettings()
 	referenceStream, referenceConnection := resolved(referenceSettings)
 	for _, expected := range []struct {
 		name  string
@@ -150,7 +150,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 		mib(64), mib(128), mib(256), mib(1024),
 	} {
 		SetMemoryBudget(budget)
-		budgetSettings := DefaultPlatformTransportSettings()
+		budgetSettings := testingDefaultPlatformTransportSettings()
 		budgetStream, budgetConnection := resolved(budgetSettings)
 		if budgetSettings.h3RetainedByteAccounting {
 			if budgetSettings.H3BudgetByteCount < budgetConnection+platformH3FixedMemoryByteCount() {
@@ -181,7 +181,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	// (§37.22) — slower the moment this lands, which is the opposite of the
 	// point.
 	SetMemoryBudget(0)
-	unbudgetedSettings := DefaultPlatformTransportSettings()
+	unbudgetedSettings := testingDefaultPlatformTransportSettings()
 	unbudgetedStream, unbudgetedConnection := resolved(unbudgetedSettings)
 	for _, expected := range []struct {
 		name string
@@ -222,7 +222,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 		{mib(1), kib(384), kib(512)},
 	} {
 		SetMemoryBudget(floor.budget)
-		floorSettings := DefaultPlatformTransportSettings()
+		floorSettings := testingDefaultPlatformTransportSettings()
 		floorStream, floorConnection := resolved(floorSettings)
 		if floorStream != floor.stream || floorConnection != floor.connection {
 			t.Errorf(
@@ -239,7 +239,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	SetMemoryBudget(0)
 	targetSamples := []sample{}
 	for _, target := range []ByteCount{mib(64), mib(256), mib(1024)} {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 		stream, connection := resolved(settings)
 		targetSamples = append(targetSamples, sample{
 			budget:      target,

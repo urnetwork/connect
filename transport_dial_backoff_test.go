@@ -154,7 +154,7 @@ func TestPlatformTransportFailBackoffSettings(t *testing.T) {
 		{-time.Second, 60 * time.Second},
 		{7 * time.Second, 7 * time.Second},
 	} {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.ReconnectMaxTimeout = c.max
 		settings.StartDisabled = true
 		transport := NewPlatformTransportWithTargetMode(
@@ -190,7 +190,8 @@ func TestDialRetryAfterSourceAnchor(t *testing.T) {
 		if !ok {
 			t.Fatalf("could not find %s", signature)
 		}
-		if !strings.Contains(body, "case <-self.dialRetryAfter(reconnect):") {
+		// the wait also ends on a kick or a hold (waitDial)
+		if !strings.Contains(body, "self.dialRetryAfter(reconnect)") {
 			t.Errorf("%s does not back off after a failed dial", signature)
 		}
 	}

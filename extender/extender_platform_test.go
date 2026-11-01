@@ -144,6 +144,9 @@ func TestPlatformTransportPublishesTheExtenderOfItsConnection(t *testing.T) {
 
 	clientStrategy := newExtenderTestStrategy(t, ctx, fixture, directory)
 	transportSettings := connect.DefaultPlatformTransportSettings()
+	// no re-dial spread after a lost connection: this test does not
+	// exercise it
+	transportSettings.ReconnectJitter = 0
 	transportSettings.ReconnectTimeout = 50 * time.Millisecond
 	transportSettings.TransportGenerator = func() (connect.Transport, connect.Transport) {
 		<-transportReady

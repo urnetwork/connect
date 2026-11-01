@@ -234,7 +234,7 @@ func TestPinnedStayKeepsItsStrategyThroughAMove(t *testing.T) {
 			old := newFakeMoveWindowTransport(true)
 			old.relayCarried = c.relayCarried
 			next := newFakeWindowPlatformTransport(false)
-			fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+			fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 				func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 			fixture.generator.clientStrategy = base
 			fixture.state.pinnedStrategy = pinned
