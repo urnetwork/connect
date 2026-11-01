@@ -68,14 +68,18 @@ func testStartXray(t *testing.T, streamConfig *internet.StreamConfig, flow strin
 				StreamSettings: streamConfig,
 			}),
 			ProxySettings: serial.ToTypedMessage(&inbound.Config{
-				Clients: []*protocol.User{{
+				Users: []*protocol.User{{
 					Account: serial.ToTypedMessage(&vless.Account{Id: testUserId, Flow: flow}),
 				}},
 				Decryption: "none",
 			}),
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{
-			ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			// freedom blocks private and loopback targets behind a vless inbound
+			// by default; the test destinations are on loopback
+			ProxySettings: serial.ToTypedMessage(&freedom.Config{
+				FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+			}),
 		}},
 	}
 	instance, err := core.New(config)
