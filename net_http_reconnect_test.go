@@ -210,7 +210,7 @@ func TestClientStrategyTlsSessionResumptionCache(t *testing.T) {
 	if connectSettings.TlsConfig.ClientSessionCache == nil {
 		t.Error("ConnectSettings.TlsConfig has no session cache")
 	}
-	transportSettings := DefaultPlatformTransportSettings()
+	transportSettings := testingDefaultPlatformTransportSettings()
 	if transportSettings.QuicTlsConfig.ClientSessionCache == nil {
 		t.Error("QuicTlsConfig has no session cache: h3 re-dials cannot resume (or 0-RTT)")
 	}

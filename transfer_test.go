@@ -837,7 +837,7 @@ func TestMinimumMessageLenLimitFitsWorstCaseHandshake(t *testing.T) {
 		)
 	}
 
-	platformSettings := DefaultPlatformTransportSettings()
+	platformSettings := testingDefaultPlatformTransportSettings()
 	if platformSettings.H1MaxMessageByteCount != limit {
 		t.Fatalf(
 			"default platform H1 receive cap %d, want shared minimum %d",

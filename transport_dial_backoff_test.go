@@ -154,7 +154,7 @@ func TestPlatformTransportFailBackoffSettings(t *testing.T) {
 		{-time.Second, 60 * time.Second},
 		{7 * time.Second, 7 * time.Second},
 	} {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.ReconnectMaxTimeout = c.max
 		settings.StartDisabled = true
 		transport := NewPlatformTransportWithTargetMode(

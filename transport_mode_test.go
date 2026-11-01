@@ -13,7 +13,7 @@ import (
 
 func TestInactiveDrainIgnoresEqualPriorityMode(t *testing.T) {
 	transport := testingPlatformTransportModes()
-	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings = testingDefaultPlatformTransportSettings()
 	transport.settings.InactiveDrainTimeout = 10 * time.Millisecond
 	transport.settings.InactiveDrainMaxTimeout = 20 * time.Millisecond
 	transport.modePreferences = normalizeTransportModePreferences(map[TransportMode]int{
@@ -46,7 +46,7 @@ func TestInactiveDrainIgnoresEqualPriorityMode(t *testing.T) {
 
 func TestInactiveDrainHasAbsoluteDeadlineDespitePayload(t *testing.T) {
 	transport := testingPlatformTransportModes()
-	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings = testingDefaultPlatformTransportSettings()
 	transport.settings.InactiveDrainTimeout = 20 * time.Millisecond
 	transport.settings.InactiveDrainMaxTimeout = 60 * time.Millisecond
 	transport.modePreferences = normalizeTransportModePreferences(nil)
@@ -413,7 +413,7 @@ func TestTransportModeTiers(t *testing.T) {
 // subset and that equal custom priorities retain the same coexistence rule.
 func TestPlatformTransportCustomModePreferences(t *testing.T) {
 	transport := testingPlatformTransportModes()
-	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings = testingDefaultPlatformTransportSettings()
 	transport.settings.ModeInitialDelay = 250 * time.Millisecond
 	transport.modePreferences = normalizeTransportModePreferences(map[TransportMode]int{
 		TransportModeH3:        10,

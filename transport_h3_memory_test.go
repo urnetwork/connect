@@ -28,7 +28,7 @@ func TestPlatformH3MobileComposedLedger(t *testing.T) {
 			old := MemoryBudget()
 			defer SetMemoryBudget(old)
 			SetMemoryBudget(c.process)
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
 			config := newPlatformQuicConfig(settings, 1)
 			if config.Allow0RTT {
 				t.Fatal("mobile retained-send policy permits untracked early data")
@@ -81,7 +81,7 @@ func TestPlatformExplicitMobilePolicyScalesBeyondHistoricalTarget(t *testing.T) 
 	for _, target := range []ByteCount{mib(32), mib(64), mib(128)} {
 		t.Run(fmt.Sprint(target), func(t *testing.T) {
 			SetMemoryBudget(target)
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 			desktopWindow := settings.H3MaxConnectionReceiveWindowByteCount
 			if target > mib(32) && settings.h3RetainedByteAccounting {
 				t.Fatal("an ordinary desktop target was reclassified as mobile")
@@ -151,7 +151,7 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 			for _, carrier := range []string{"direct", ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns} {
 				t.Run(fmt.Sprintf("%d/%s/%s", profile.target, mode, carrier), func(t *testing.T) {
 					SetMemoryBudget(profile.process)
-					settings := DefaultPlatformTransportSettingsWithMemoryTarget(profile.target)
+					settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(profile.target)
 					ApplyMobilePlatformTransportMemoryPolicy(settings, profile.target)
 					settings.AltUrl = "https://127.0.0.1:443"
 					settings.DnsPumpHost = "127.0.0.1"
@@ -236,7 +236,7 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 }
 
 func TestPlatformDnsMemoryRefusalDoesNotCreateTranslation(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	settings.AltUrl = "https://127.0.0.1:443"
 	settings.PlatformTransportBudget = NewPlatformTransportBudget(settings.H3BudgetByteCount, 1)
 	inner := settings.PlatformTransportBudget.register(platformTransportBudgetH3, settings.H3BudgetByteCount, true)
@@ -266,7 +266,7 @@ func TestPlatformDnsMemoryRefusalDoesNotCreateTranslation(t *testing.T) {
 func TestPlatformDnsTranslationAdmissionPrecedesEverySocket(t *testing.T) {
 	for _, mode := range []TransportMode{TransportModeH3Dns, TransportModeH3DnsPump} {
 		t.Run(string(mode), func(t *testing.T) {
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			settings.AltUrl = "https://127.0.0.1:443"
 			settings.DnsPumpHost = "127.0.0.1"
 			settings.PlatformTransportBudget = NewPlatformTransportBudget(settings.H3BudgetByteCount, 1)
@@ -324,7 +324,7 @@ func TestMobileAltApiCoexistsWithDeviceCarrierAndReleases(t *testing.T) {
 	SetMemoryBudget(mib(32))
 	for _, whodis := range []bool{false, true} {
 		t.Run(fmt.Sprint(whodis), func(t *testing.T) {
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			inner := settings.PlatformTransportBudget.register(platformTransportBudgetH3, settings.H3BudgetByteCount, true)
 			if !inner.TryAcquire() {
 				t.Fatal("device admission")

@@ -20,7 +20,7 @@ func newH3DohProgressTransport(ctx context.Context, cache *DohCache) *PlatformTr
 		ctx: ctx, settings: strategySettings,
 		internalDohResolver: &internalDohResolver{cache: cache, domains: []string{"first-answer.example"}},
 	}
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.PlatformTransportBudget = NewPlatformTransportBudget(8*1024*1024, 2)
 	settings.H3Port = 1443
 	return &PlatformTransport{

@@ -229,16 +229,33 @@ func (self *testingPlatformServer) down() {
 	self.closeConns()
 }
 
-func testingPlatformTransportSettings() *PlatformTransportSettings {
+// testingDefaultPlatformTransportSettings is DefaultPlatformTransportSettings
+// with no re-dial spread after a lost connection. Tests that do not exercise
+// the spread build on it, so a connection they close is re-dialed on the
+// pacing they test, not 0-5 s later at random. The spread has its own tests
+// (transport_reconnect_jitter_test.go, transport_redial_hold_test.go), which
+// set ReconnectJitter themselves.
+func testingDefaultPlatformTransportSettings() *PlatformTransportSettings {
 	settings := DefaultPlatformTransportSettings()
+	settings.ReconnectJitter = 0
+	return settings
+}
+
+// testingDefaultPlatformTransportSettingsWithMemoryTarget is
+// DefaultPlatformTransportSettingsWithMemoryTarget with no re-dial spread
+// (see testingDefaultPlatformTransportSettings).
+func testingDefaultPlatformTransportSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *PlatformTransportSettings {
+	settings := DefaultPlatformTransportSettingsWithMemoryTarget(memoryTargetByteCount)
+	settings.ReconnectJitter = 0
+	return settings
+}
+
+func testingPlatformTransportSettings() *PlatformTransportSettings {
+	settings := testingDefaultPlatformTransportSettings()
 	// short enough to exercise the inactive-drain watchdog inside a test, long
 	// enough that the election (which is immediate) always precedes it
 	settings.InactiveDrainTimeout = 500 * time.Millisecond
 	settings.ReconnectTimeout = 50 * time.Millisecond
-	// these tests count on prompt re-dials after a connection they close; the
-	// spread of a fleet's re-dials has its own tests
-	// (transport_reconnect_jitter_test.go), which opt back in
-	settings.ReconnectJitter = 0
 	// keep the client's own keepalive out of the way; it is written directly to
 	// the socket and is not counted as activity either way
 	settings.PingTimeout = 30 * time.Second

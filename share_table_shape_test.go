@@ -182,7 +182,7 @@ func TestTheShareTableShapeFollowsItsLoops(t *testing.T) {
 	// connection window is the whole of it, and the two keep the 3:4 they have
 	// always had. A change to one without the others fails here.
 	target := surface
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 	config := newPlatformQuicConfig(settings, 1)
 	reservation := settings.H3BudgetByteCount
 	stream := ByteCount(config.MaxStreamReceiveWindow)
@@ -422,7 +422,7 @@ func TestTheShareTableBinderIsTheH3StreamWindow(t *testing.T) {
 		// The composed mobile ledger supersedes the historical receive-only
 		// doubling claim. Keep an exact byte assertion rather than widening
 		// the rate tolerance to hide a changed window.
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(scenario.deviceTarget)
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(scenario.deviceTarget)
 		ledger := shareTableH3LedgerForTarget(scenario.deviceTarget)
 		if binderWindow != ledger.stream || settings.H3BudgetByteCount != ledger.reservation {
 			t.Errorf("%s: binder/claim %d/%d do not match declared retained ledger %+v",

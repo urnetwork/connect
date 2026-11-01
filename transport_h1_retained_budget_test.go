@@ -38,7 +38,7 @@ func TestPlatformH1RetainedProfileClaims(t *testing.T) {
 		{target: mib(32), priority: 10, graphs: 10, claim: 697592},
 		{target: mib(64), priority: 21, graphs: 16, claim: 1004924},
 	} {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
 		if c.target == mib(64) && (settings.h1RetainedByteAccounting || settings.H1MemoryReservationByteCount() != kib(512)) {
 			t.Fatal("explicit desktop owner inherited constrained process accounting")
 		}
@@ -76,7 +76,7 @@ func TestPlatformH1RetainedProfileClaims(t *testing.T) {
 func TestPlatformH1RetainedNarrowAndOverflowProfiles(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, count := range []int{0, 1} {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 		settings.TransportBufferSize = count
 		settings.H1AckPriorityBufferSize = 0
 		settings.H1MaxMessageByteCount = 0
@@ -96,7 +96,7 @@ func TestPlatformH1RetainedNarrowAndOverflowProfiles(t *testing.T) {
 		}
 		MessagePoolReturn(message)
 	}
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 	settings.TransportBufferSize = math.MaxInt
 	if got := settings.H1MemoryReservationByteCount(); got != ByteCount(math.MaxInt64) {
 		t.Fatalf("count overflow claim=%d", got)
@@ -126,7 +126,7 @@ func TestPlatformH1RetainedAutoAndRawBaseComposition(t *testing.T) {
 		{target: mib(32), priority: 10},
 		{target: mib(64), priority: 21},
 	} {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
 		ApplyMobilePlatformTransportMemoryPolicy(settings, c.target)
 		settings.H1AckPriorityBufferSize = c.priority
 		settings.ModePreferences = map[TransportMode]int{TransportModeH1: 1, TransportModeH3: 2}
@@ -160,7 +160,7 @@ func TestPlatformH1RetainedAutoAndRawBaseComposition(t *testing.T) {
 			t.Fatal(stats)
 		}
 	}
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 	settings.TransportBufferSize = math.MaxInt
 	settings.PlatformTransportBudget = NewPlatformTransportBudget(ByteCount(math.MaxInt64), 1)
 	if settings.H1MemoryReservationByteCount() != ByteCount(math.MaxInt64) {
@@ -180,7 +180,7 @@ func TestPlatformH1RetainedAutoAndRawBaseComposition(t *testing.T) {
 // Each independent lane can still make progress while ordinary credit is full.
 func TestPlatformH1RetainedLanesChargeRootsAndStayIndependent(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 	settings.TransportBufferSize, settings.H1AckPriorityBufferSize = 1, 1
 	owner := newPlatformH1RetainedBudget(settings)
 	message := MessagePoolGet(16 * 1024)[:1]
@@ -718,7 +718,7 @@ func TestPlatformH1RetainedReaderCancellation(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		for _, count := range []int{0, 1} {
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 			settings.TransportBufferSize = count
 			owner := newPlatformH1RetainedBudget(settings)
 			transport := &PlatformTransport{receiveStats: &PlatformTransportReceiveStats{}}

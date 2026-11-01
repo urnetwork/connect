@@ -296,7 +296,7 @@ func newH1LivenessFixtureWithRoutes(t *testing.T, pausePeer bool, writeTimeout t
 		},
 	}
 	fixture.strategy = NewClientStrategy(ctx, strategySettings)
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.Log = NewNoopLogger()
 	settings.EnableH1Plus = true
 	settings.V2H1Auth = true

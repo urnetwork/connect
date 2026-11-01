@@ -8,7 +8,7 @@ import (
 
 func TestPlatformH3GatePreemptsLowerPriorityFamily(t *testing.T) {
 	transport := testingPlatformTransportModes()
-	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings = testingDefaultPlatformTransportSettings()
 	transport.modePreferences = normalizeTransportModePreferences(nil)
 	gate := newPlatformH3Gate(transport)
 
@@ -46,7 +46,7 @@ func TestPlatformH3GatePreemptsLowerPriorityFamily(t *testing.T) {
 
 func TestPlatformH3GateAllowsOnlyOneFamily(t *testing.T) {
 	transport := testingPlatformTransportModes()
-	transport.settings = DefaultPlatformTransportSettings()
+	transport.settings = testingDefaultPlatformTransportSettings()
 	transport.modePreferences = normalizeTransportModePreferences(map[TransportMode]int{
 		TransportModeH3Dns:     2,
 		TransportModeH3DnsPump: 2,

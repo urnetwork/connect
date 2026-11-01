@@ -132,7 +132,7 @@ func benchmarkH1RetainedSelectorCases(b *testing.B, receive bool, priority bool,
 			}
 			for routeCount := 1; routeCount <= 3; routeCount++ {
 				b.Run(fmt.Sprintf("target_%dMiB/%s/routes_%d", target/(1024*1024), mode, routeCount), func(b *testing.B) {
-					settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+					settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 					ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 					if !settings.h1RetainedByteAccounting || settings.TransportBufferSize != 32 ||
 						settings.H1MaxMessageByteCount != 16*1024 || settings.H1AckPriorityBufferSize != 0 {

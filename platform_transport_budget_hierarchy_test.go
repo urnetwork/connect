@@ -67,8 +67,8 @@ func TestPlatformTransportBudgetHierarchyMobileDevicesHaveIndependentCeilings(t 
 	defer SetMemoryBudget(previousTarget)
 	SetMemoryBudget(mib(32))
 	root := DefaultPlatformTransportBudget()
-	firstSettings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
-	secondSettings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	firstSettings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	secondSettings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	first, second := firstSettings.PlatformTransportBudget, secondSettings.PlatformTransportBudget
 	if first == second || first.parent != nil || second.parent != nil || root.parent != nil {
 		t.Fatal("mobile devices or unrelated API work share an admission root")

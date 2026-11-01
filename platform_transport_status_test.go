@@ -45,7 +45,7 @@ func TestPlatformTransportAutoEligibility(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			settings := DefaultPlatformTransportSettings()
+			settings := testingDefaultPlatformTransportSettings()
 			_, translationByteCount := boundedQuicPacketTranslationSettings()
 			settings.PlatformTransportBudget = NewPlatformTransportBudget(mib(test.budget)+translationByteCount, 1)
 			settings.H1BudgetByteCount = mib(2)
@@ -59,7 +59,7 @@ func TestPlatformTransportAutoEligibility(t *testing.T) {
 }
 
 func TestPlatformTransportAutoEligibilityWithoutBudget(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.PlatformTransportBudget = nil
 	if got := PlatformTransportAutoEligibility(settings); len(got) != 4 {
 		t.Fatalf("unbudgeted Auto eligibility = %v, want every configured mode", got)
@@ -69,7 +69,7 @@ func TestPlatformTransportAutoEligibilityWithoutBudget(t *testing.T) {
 // A core-only fit must not advertise DNS eligibility when the constructor's
 // complete H3 group cannot fit. A plain-H3 policy needs no translation capacity.
 func TestPlatformTransportAutoEligibilityIncludesDnsGraph(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.H1BudgetByteCount = mib(1)
 	settings.H3BudgetByteCount = mib(8)
 	settings.PlatformTransportBudget = NewPlatformTransportBudget(mib(9), 1)

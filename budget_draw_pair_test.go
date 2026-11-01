@@ -137,7 +137,7 @@ func TestTheH3WindowsAtTheShippedDeviceTargets(t *testing.T) {
 		// same target under a small and a large process budget
 		for _, processBudget := range []ByteCount{0, mib(8), mib(32), mib(256)} {
 			SetMemoryBudget(processBudget)
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
 			if settings.H3MaxStreamReceiveWindowByteCount != c.stream ||
 				settings.H3MaxConnectionReceiveWindowByteCount != c.connection {
 				t.Errorf(

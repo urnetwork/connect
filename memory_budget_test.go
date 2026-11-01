@@ -96,7 +96,7 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	platformStats := platformBudget.Stats()
 	AssertEqual(t, platformStats.TotalByteCount, mib(8))
 	AssertEqual(t, platformStats.MaxTransportCount, 16)
-	platformSettings := DefaultPlatformTransportSettings()
+	platformSettings := testingDefaultPlatformTransportSettings()
 	if platformSettings.PlatformTransportBudget == platformBudget || platformSettings.PlatformTransportBudget.Stats().TotalByteCount != platformStats.TotalByteCount {
 		t.Fatal("platform settings did not copy the current limit into an independent budget")
 	}
@@ -158,7 +158,7 @@ func TestMemoryBudgetFloors(t *testing.T) {
 	// selected H3 carrier; its aggregate budget and reservation share a floor.
 	SetMemoryBudget(mib(8))
 	legacyPlatformBudget := DefaultPlatformTransportBudget().Stats()
-	legacyPlatformSettings := DefaultPlatformTransportSettings()
+	legacyPlatformSettings := testingDefaultPlatformTransportSettings()
 	AssertEqual(t, legacyPlatformBudget.TotalByteCount, mib(3))
 	AssertEqual(t, legacyPlatformSettings.H3BudgetByteCount, mib(3))
 	if legacyPlatformSettings.H1BudgetByteCount+legacyPlatformSettings.H3BudgetByteCount <=
