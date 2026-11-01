@@ -721,6 +721,10 @@ func TestLagCertCsrAsksOnlyWhileTheOperatorHoldsNone(t *testing.T) {
 	if count := len(reactivations); count != 0 {
 		t.Fatalf("asked for %d passes with the request held", count)
 	}
+	// asking for nothing still has the poll read soon (amendment 24)
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
+	}
 
 	// refused: the operator holds nothing, and the next activation asks again
 	api.setCertResult(&extenderMeasurementCertResult{
@@ -1035,11 +1039,13 @@ func newTestLagInstalled(t *testing.T) *testLagInstalled {
 
 // A withdrawn answer drops the installed certificate at once, so the extender
 // stops answering to its measurement name, whichever name the answer carries;
-// and the operator then holds nothing, so the next activation asks again (C9).
+// and the operator then holds nothing, so the next activation asks again, and
+// is asked for at once (C9, amendment 24).
 func TestLagCertWithdrawnDropsAtOnce(t *testing.T) {
 	otherName := connect.ExtenderMeasurementName(connect.NewId(), "")
 	for _, withdrawnNames := range [][]string{{testLagCertName}, nil, {otherName}} {
 		installed := newTestLagInstalled(t)
+		reactivations := testLagReactivations(installed.certificate)
 		installed.api.setCertResult(&extenderMeasurementCertResult{
 			State:  ExtenderMeasurementCertStateWithdrawn,
 			Names:  withdrawnNames,
@@ -1058,10 +1064,261 @@ func TestLagCertWithdrawnDropsAtOnce(t *testing.T) {
 		if wait := installed.clock.nextWait(t); wait != time.Hour {
 			t.Errorf("withdrawn %v: wait = %s, expected the check timeout", withdrawnNames, wait)
 		}
+		if count := len(reactivations); count != 1 {
+			t.Errorf("withdrawn %v: asked for %d passes, expected 1", withdrawnNames, count)
+		}
 		if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
 			t.Errorf("withdrawn %v: the next activation did not ask again", withdrawnNames)
 		}
 	}
+}
+
+// The withdrawal that amendment 23 made usual: a deactivation withdraws only
+// after the extender has been away a week, so a withdrawn answer is most often
+// read by an extender that is back. It asks for an activation pass at once,
+// which carries the request since nothing is held, rather than leaving it to
+// the 24 hour tick (C4, C9, amendment 24). A withdrawal that stands asks once,
+// however often it is read: here no post lands, the extender not reachable
+// yet, and the activation's own retries carry the request from then on.
+func TestLagCertWithdrawnAsksForAPassOnce(t *testing.T) {
+	installed := newTestLagInstalled(t)
+	reactivations := testLagReactivations(installed.certificate)
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateWithdrawn,
+		Names:     []string{testLagCertName},
+		Reason:    "the extender is not active",
+		KeySha256: installed.certificate.keySha256,
+	})
+	installed.clock.advance(time.Hour)
+	installed.api.waitPoll()
+	if wait := installed.clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("withdrawn wait = %s, expected the check timeout", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 1)
+
+	// the pass, and a retry of the activation after it, each carry the
+	// request and wake the poll, which reads withdrawn still and asks for
+	// nothing more
+	for _, pass := range []string{"the pass asked for", "a retry"} {
+		if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
+			t.Fatalf("%s carried no request", pass)
+		}
+		if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+			t.Fatalf("%s: offer wait = %s, expected the offer poll timeout", pass, wait)
+		}
+		installed.clock.advance(15 * time.Second)
+		installed.api.waitPoll()
+		if wait := installed.clock.nextWait(t); wait != time.Hour {
+			t.Fatalf("%s: withdrawn wait = %s, expected the check timeout", pass, wait)
+		}
+		testLagExpectReactivations(t, reactivations, 0)
+	}
+	// nor does the hourly check
+	installed.clock.advance(time.Hour)
+	installed.api.waitPoll()
+	installed.clock.nextWait(t)
+	testLagExpectReactivations(t, reactivations, 0)
+}
+
+// Once the operator holds this key's request or certificate again, pending or
+// issued, the withdrawal that asked has ended, and the next one asks again
+// (C9, amendment 24).
+func TestLagCertWithdrawnAsksAgainOnceHeld(t *testing.T) {
+	for _, state := range []string{ExtenderMeasurementCertStatePending, ExtenderMeasurementCertStateIssued} {
+		installed := newTestLagInstalled(t)
+		reactivations := testLagReactivations(installed.certificate)
+		withdrawn := &extenderMeasurementCertResult{
+			State:     ExtenderMeasurementCertStateWithdrawn,
+			Names:     []string{testLagCertName},
+			Reason:    "the extender is not active",
+			KeySha256: installed.certificate.keySha256,
+		}
+		installed.api.setCertResult(withdrawn)
+		installed.clock.advance(time.Hour)
+		installed.api.waitPoll()
+		installed.clock.nextWait(t)
+		testLagExpectReactivations(t, reactivations, 1)
+
+		// the pass carries the request, and the operator holds it
+		csr := installed.certificate.ActivationCsr(testLagCertExtenderId)
+		if csr == "" {
+			t.Fatalf("%s: the pass after the withdrawal carried no request", state)
+		}
+		if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+			t.Fatalf("%s: offer wait = %s, expected the offer poll timeout", state, wait)
+		}
+		held := &extenderMeasurementCertResult{
+			State:     state,
+			Names:     []string{testLagCertName},
+			KeySha256: installed.certificate.keySha256,
+		}
+		if state == ExtenderMeasurementCertStateIssued {
+			now := installed.clock.Now()
+			held.ChainPem = newTestLagCa(t).issue(t, csr, now, now.Add(90*24*time.Hour))
+		}
+		installed.api.setCertResult(held)
+		installed.clock.advance(15 * time.Second)
+		installed.api.waitPoll()
+		wait := installed.clock.nextWait(t)
+		testLagExpectReactivations(t, reactivations, 0)
+
+		// withdrawn again: a new withdrawal, which asks again
+		installed.api.setCertResult(withdrawn)
+		installed.clock.advance(wait)
+		installed.api.waitPoll()
+		installed.clock.nextWait(t)
+		testLagExpectReactivations(t, reactivations, 1)
+		if names, tlsCertificate := installed.lifecycle.Certificate(); names != nil || tlsCertificate != nil {
+			t.Fatalf("%s: a certificate is still presented for %v", state, names)
+		}
+	}
+}
+
+// An operator's move of the extender to the gated tier or a canary withdraws
+// at once (C9, A9), and its issuance refuses the request that the pass asked
+// for then carries. The refusal asks for nothing, however often it is read,
+// and the request goes out again at the next activation as after any refusal,
+// so a withdrawal the operator will not undo never loops (amendment 24).
+func TestLagCertWithdrawnThenRefusedDoesNotLoop(t *testing.T) {
+	installed := newTestLagInstalled(t)
+	reactivations := testLagReactivations(installed.certificate)
+	names := []string{testLagCertName}
+	keySha256 := installed.certificate.keySha256
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateWithdrawn,
+		Names:     names,
+		Reason:    "the extender moved to the gated tier",
+		KeySha256: keySha256,
+	})
+	installed.clock.advance(time.Hour)
+	installed.api.waitPoll()
+	installed.clock.nextWait(t)
+	testLagExpectReactivations(t, reactivations, 1)
+
+	// the pass carries the request, which the operator holds pending until
+	// its issuance refuses it
+	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
+		t.Fatal("the pass after the withdrawal carried no request")
+	}
+	if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
+	}
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStatePending,
+		Names:     names,
+		KeySha256: keySha256,
+	})
+	installed.clock.advance(15 * time.Second)
+	installed.api.waitPoll()
+	if wait := installed.clock.nextWait(t); wait != 30*time.Second {
+		t.Fatalf("pending wait = %s, expected the min backoff", wait)
+	}
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateRefused,
+		Names:     names,
+		Reason:    "an extender in the gated tier is never measured",
+		KeySha256: keySha256,
+	})
+	installed.clock.advance(30 * time.Second)
+	installed.api.waitPoll()
+	if wait := installed.clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("refused wait = %s, expected the check timeout", wait)
+	}
+
+	// read again at the hourly check, and after the next activation carries
+	// the request again, the refusal still asks for nothing
+	installed.clock.advance(time.Hour)
+	installed.api.waitPoll()
+	installed.clock.nextWait(t)
+	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
+		t.Fatal("the next activation did not ask again after the refusal")
+	}
+	if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
+	}
+	installed.clock.advance(15 * time.Second)
+	installed.api.waitPoll()
+	installed.clock.nextWait(t)
+	testLagExpectReactivations(t, reactivations, 0)
+	installed.api.expectQuiet()
+}
+
+// An extender back from a week away reads what its operator did meanwhile
+// within seconds of the pass that reactivated it, though that pass asks for
+// nothing -- the last it read, the operator held its certificate -- rather
+// than at the hourly check (C9, amendment 24). A withdrawal drops the
+// certificate and asks for a pass at once, which carries the request again;
+// a request the operator put back in its queue is read on the backoff, and
+// the certificate issued from it installed.
+func TestLagCertBackFromAwayReadsAtThePass(t *testing.T) {
+	// withdrawn while it was away
+	installed := newTestLagInstalled(t)
+	reactivations := testLagReactivations(installed.certificate)
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateWithdrawn,
+		Names:     []string{testLagCertName},
+		Reason:    "the extender is not active",
+		KeySha256: installed.certificate.keySha256,
+	})
+	version, _ := installed.certificate.ChangeMonitor().Get()
+	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("the pass asked with %q for the certificate the operator held", csr)
+	}
+	if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
+	}
+	installed.clock.advance(15 * time.Second)
+	installed.api.waitPoll()
+	waitTestLagInstall(t, installed.certificate, version)
+	if wait := installed.clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("withdrawn wait = %s, expected the check timeout", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 1)
+	if names, tlsCertificate := installed.lifecycle.Certificate(); names != nil || tlsCertificate != nil {
+		t.Fatalf("the withdrawn certificate is still presented for %v", names)
+	}
+	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
+		t.Fatal("the pass asked for after the withdrawal carried no request")
+	}
+
+	// the request the operator kept, put back in its queue as it came back
+	installed = newTestLagInstalled(t)
+	reactivations = testLagReactivations(installed.certificate)
+	_, oldCertificate := installed.lifecycle.Certificate()
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStatePending,
+		Names:     []string{testLagCertName},
+		KeySha256: installed.certificate.keySha256,
+	})
+	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("the pass asked with %q for the certificate the operator held", csr)
+	}
+	if wait := installed.clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
+	}
+	installed.clock.advance(15 * time.Second)
+	installed.api.waitPoll()
+	if wait := installed.clock.nextWait(t); wait != 30*time.Second {
+		t.Fatalf("pending wait = %s, expected the min backoff", wait)
+	}
+	now := installed.clock.Now()
+	installed.api.setCertResult(&extenderMeasurementCertResult{
+		State: ExtenderMeasurementCertStateIssued,
+		Names: []string{testLagCertName},
+		ChainPem: newTestLagCa(t).issueFor(
+			t, installed.certificate.PublicKey(), []string{testLagCertName}, now, now.Add(90*24*time.Hour)),
+		KeySha256: installed.certificate.keySha256,
+	})
+	version, _ = installed.certificate.ChangeMonitor().Get()
+	installed.clock.advance(30 * time.Second)
+	installed.api.waitPoll()
+	waitTestLagInstall(t, installed.certificate, version)
+	if _, tlsCertificate := installed.lifecycle.Certificate(); tlsCertificate == nil ||
+		bytes.Equal(tlsCertificate.Certificate[0], oldCertificate.Certificate[0]) {
+		t.Fatal("the certificate issued from the kept request was not installed")
+	}
+	installed.clock.nextWait(t)
+	testLagExpectReactivations(t, reactivations, 0)
 }
 
 // An installed, unexpired certificate is kept through a none, pending or
@@ -1155,6 +1412,50 @@ func TestLagCertOfferPollsSoon(t *testing.T) {
 	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr == "" {
 		t.Fatal("a refused request was not asked for again")
 	}
+	api.expectQuiet()
+}
+
+// A pass that asks for nothing, the operator holding the request already,
+// wakes the poll all the same, which reads what the operator holds once the
+// post has landed, and on the backoff it was on: a pass adds a read and never
+// restarts a backoff (amendment 24).
+func TestLagCertHeldPassWakesThePoll(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	certificate := newTestLagCertificate(t)
+	reactivations := testLagReactivations(certificate)
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStatePending,
+		Names:     []string{testLagCertName},
+		KeySha256: certificate.keySha256,
+	})
+	newTestLagLifecycle(t, api, clock, certificate, nil)
+	// the pending request is read on the backoff, which doubles
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != 30*time.Second {
+		t.Fatalf("pending wait = %s, expected the min backoff", wait)
+	}
+	clock.advance(30 * time.Second)
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != time.Minute {
+		t.Fatalf("pending wait = %s, expected the doubled backoff", wait)
+	}
+
+	// a pass asks for nothing, and the poll reads once its post has landed
+	// rather than at the minute
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("asked with %q for the request the operator holds", csr)
+	}
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
+	}
+	clock.advance(15 * time.Second)
+	api.waitPoll()
+	// and goes on from the backoff it was on, not from the min
+	if wait := clock.nextWait(t); wait != 2*time.Minute {
+		t.Fatalf("pending wait = %s, expected the backoff doubled again", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 0)
 	api.expectQuiet()
 }
 
@@ -1315,6 +1616,11 @@ func TestLagCertKeyMismatchAsksForAPassNow(t *testing.T) {
 	// the operator holds this key's request: one post, and nothing follows it
 	if csr := api.waitActivation(); csr != "" {
 		t.Fatalf("the first activation carried %q", csr)
+	}
+	// the pass found the request held once the answer named the id, and that
+	// still has the poll read soon (amendment 24)
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
 	}
 
 	// the request it holds is an old key's after all

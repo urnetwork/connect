@@ -99,9 +99,13 @@ type ExtenderMeasurementCert struct {
 	// no certificate is served and no request is asked for
 	disabled atomic.Bool
 
-	// wakes the lifecycle's poll when an activation carries a request, or
-	// measurement is turned back on
+	// wakes the lifecycle's poll, which reads soon on a fresh backoff, when an
+	// activation carries a request or measurement is turned back on
 	offerMonitor *connect.Monitor
+	// wakes the lifecycle's poll, which reads soon on the backoff it is on,
+	// when an activation pass asks for nothing because the operator holds this
+	// key's request or certificate already (amendment 24)
+	passMonitor *connect.Monitor
 	// the installed certificate, swapped whole so a handshake never sees half
 	// of one (M1)
 	installed atomic.Pointer[extenderMeasurementInstalled]
@@ -155,6 +159,7 @@ func NewExtenderMeasurementCert(keyFile string, zone string) (*ExtenderMeasureme
 		zone:           zone,
 		keySha256:      keySha256,
 		offerMonitor:   connect.NewMonitor(),
+		passMonitor:    connect.NewMonitor(),
 		installMonitor: connect.NewMonitorValue[uint64](0),
 	}, nil
 }
@@ -210,8 +215,9 @@ func (self *ExtenderMeasurementCert) Enabled() bool {
 // Sets what asks the activation for a pass at once (C4): the role's
 // connect.ExtenderActivator.Reactivate, once its activator exists. The
 // lifecycle asks when the operator holds a request or a certificate for
-// another key, so this key's request goes out now rather than at the next
-// tick. Nil asks for nothing.
+// another key, or has withdrawn the certificate (C9, amendment 24), so this
+// key's request goes out now rather than at the next tick. Each answer asks
+// once while it stands. Nil asks for nothing.
 func (self *ExtenderMeasurementCert) SetReactivate(reactivate func()) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -252,10 +258,13 @@ func (self *ExtenderMeasurementCert) PublicKey() *ecdsa.PublicKey {
 // never leaves the extender. "" for the zero id, which has no name; while the
 // owner has opted out; and when the operator already holds a request or a
 // certificate for that name under this key, so a routine activation asks for
-// nothing new. The request is made
-// once and kept, since the id never changes. Being asked for a request wakes
-// the lifecycle's poll, which reads what the operator made of it once the post
-// has landed.
+// nothing new. The request is made once and kept, since the id never changes.
+// Being asked wakes the lifecycle's poll, which reads once the post has
+// landed: what the operator made of the request, or, when it holds the
+// request already, what it holds now, which may have moved on since the last
+// read. A pass is when an extender back from a week away hears of that: its
+// certificate withdrawn, or a new one issued from the request the operator
+// kept (C4, C9, amendment 24).
 func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string {
 	if self.disabled.Load() {
 		// opted out: the activation says so instead (SetEnabled)
@@ -278,6 +287,9 @@ func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string
 		return false, ""
 	}()
 	if held {
+		// nothing new to ask for, but the poll reads what the operator holds
+		// once this pass has landed, rather than at the hourly check
+		self.passMonitor.NotifyAll()
 		return ""
 	}
 	if csr == "" {
@@ -598,9 +610,14 @@ type ExtenderLagLifecycleSettings struct {
 	// The certificate poll (C4, C6, A8). A pending request, and a read that
 	// failed, are polled again on a backoff from the min doubling to the max.
 	// A request an activation carries is first polled CertOfferPollTimeout
-	// after it was asked for, once the post has landed. With nothing pending
-	// the state is read again at least every CertCheckTimeout, which is how a
-	// withdrawal is seen and so bounds how long the extender goes on answering
+	// after it was asked for, once the post has landed, on a fresh backoff. So
+	// is the state after a pass that carries none because the operator holds
+	// the request or the certificate already, on the backoff the poll is on:
+	// an extender that comes back reads a withdrawal, or a new certificate
+	// issued from the request the operator kept, within seconds of the pass
+	// that reactivated it (C9, amendment 24). With nothing pending the state
+	// is read again at least every CertCheckTimeout, which is how a withdrawal
+	// is seen otherwise and so bounds how long the extender goes on answering
 	// to a withdrawn name (C9); an installed certificate is read again at two
 	// thirds of its life, when the operator renews it, and from then on at a
 	// quarter of the time it has left, but never further apart than
@@ -656,9 +673,12 @@ type extenderLagLifecycle struct {
 	reporter *extenderLagReporter
 	// nil when the server serves no feed
 	feedHandler http.Handler
-	// the last key mismatch an activation pass was asked for, so a mismatch
-	// that stands asks once. Read and written by the poll loop alone.
-	keyMismatch string
+	// the answer the last activation pass was asked for (askForPass), a key
+	// mismatch or a withdrawal, so an answer that stands asks once. Cleared
+	// once the operator holds this key's request or certificate, after which
+	// the next such answer asks again. Read and written by the poll loop
+	// alone.
+	passAskedFor string
 }
 
 // Builds the lifecycle of a server (lag.dev/PLAN.md M10), the lifecycle side's
@@ -764,18 +784,21 @@ func (self *extenderLagLifecycle) FeedHandler() http.Handler {
 }
 
 // The certificate poll (C4, C6, C9, A8). It reads the operator's state at
-// start; when an activation carries a request, once the post has landed; on a
-// backoff while a request is pending, a read fails, or an offered request has
-// not been answered for; ahead of each renewal of the installed certificate;
-// and at least every CertCheckTimeout otherwise. A newly issued chain is
-// installed at once and a withdrawn one dropped at once, each a swap the next
-// handshake sees.
+// start; after every activation pass, once the post has landed -- on a fresh
+// backoff when the pass carries a request, and on the backoff it is on when
+// the operator holds the request already (amendment 24); on a backoff while a
+// request is pending, a read fails, or an offered request has not been
+// answered for; ahead of each renewal of the installed certificate; and at
+// least every CertCheckTimeout otherwise. A newly issued chain is installed at
+// once and a withdrawn one dropped at once, each a swap the next handshake
+// sees.
 func (self *extenderLagLifecycle) run() {
 	settings := self.settings
 	backoff := settings.CertPollMinBackoff
 	nextPollTime := settings.Now()
 	for {
 		offer := self.certificate.offerMonitor.NotifyChannel()
+		pass := self.certificate.passMonitor.NotifyChannel()
 		if now := settings.Now(); !now.Before(nextPollTime) {
 			nextPollTime, backoff = self.poll(now, backoff)
 		}
@@ -794,13 +817,26 @@ func (self *extenderLagLifecycle) run() {
 				nextPollTime = offerPollTime
 			}
 			backoff = settings.CertPollMinBackoff
+		case <-pass:
+			// a pass is asking for nothing, since the operator holds the
+			// request or the certificate: read what it holds once the post has
+			// landed, which may have moved on while the extender was away
+			// (amendment 24). The backoff stays as it was: the reads this adds
+			// follow the passes -- the activation's 24 hour tick, its backoff
+			// after a failure, a network change -- never closer together than
+			// CertOfferPollTimeout, and restart no backoff.
+			if passPollTime := settings.Now().Add(settings.CertOfferPollTimeout); passPollTime.Before(nextPollTime) {
+				nextPollTime = passPollTime
+			}
 		case <-settings.After(wait):
 		}
 	}
 }
 
 // One read of the operator's state and what follows from it: when to read
-// again, and the backoff after that.
+// again, and the backoff after that. An answer that leaves nothing held for
+// this key -- another key's request or certificate, or a withdrawal -- also
+// asks for an activation pass now, once while it stands (askForPass).
 func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (time.Time, time.Duration) {
 	settings := self.settings
 	nextBackoff := min(2*backoff, settings.CertPollMaxBackoff)
@@ -830,7 +866,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 			self.askForKey("request pending", result.KeySha256)
 			return now.Add(backoff), nextBackoff
 		}
-		self.keyMismatch = ""
+		self.passAskedFor = ""
 		self.certificate.setHeld(result.Names, result.Names)
 		return now.Add(backoff), nextBackoff
 
@@ -847,7 +883,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 			}
 			return self.idlePollTime(now, backoff)
 		}
-		self.keyMismatch = ""
+		self.passAskedFor = ""
 		self.certificate.setHeld(installed.names, installed.names)
 		if self.certificate.install(installed) {
 			log.Printf(
@@ -867,13 +903,21 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		return nextPollTime, settings.CertPollMinBackoff
 
 	case ExtenderMeasurementCertStateWithdrawn:
-		// the operator withdrew the certificate (C9): the extender was
-		// deactivated, or overridden to the gated tier or a canary, and must
-		// stop answering to the name the certificate logs list. Whatever is
-		// installed goes at once, whichever name the answer carries: while the
-		// operator answers withdrawn it publishes nothing for this extender.
-		// Nothing is held, so the next activation asks again, and an extender
-		// that qualifies again is issued a new one.
+		// the operator withdrew the certificate (C9): the extender was away
+		// for a week after its deactivation (amendment 23), or overridden to
+		// the gated tier or a canary, and must stop answering to the name the
+		// certificate logs list. Whatever is installed goes at once, whichever
+		// name the answer carries: while the operator answers withdrawn it
+		// publishes nothing for this extender. Nothing is held, so the next
+		// activation asks again, and an extender that qualifies again is
+		// issued a new one. That pass is asked for now (C4, amendment 24):
+		// the extender is most often back from its week away, and its request
+		// would otherwise wait for the 24 hour tick. A withdrawal that stands
+		// asks once. A pass that fails, the extender not reachable yet,
+		// leaves the request to the activation's own retries, which carry it
+		// while nothing is held; a request the operator refuses, of an
+		// extender it moved to the gated tier or a canary, goes out again at
+		// the tick, as after any refusal.
 		if dropped := self.certificate.drop(); dropped != nil {
 			log.Printf(
 				"[extender] lag: measurement certificate for %s withdrawn by the operator = %s",
@@ -882,6 +926,7 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 			)
 		}
 		self.certificate.setHeld(nil, result.Names)
+		self.askForPass("certificate withdrawn "+result.KeySha256, "the operator withdrew the measurement certificate")
 		return self.idlePollTime(now, backoff)
 
 	case ExtenderMeasurementCertStateNone, ExtenderMeasurementCertStateRefused:
@@ -911,14 +956,24 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 // Asks for an activation pass at once because the operator holds or answered
 // for another key than this one (lag.dev/PLAN.md C4): the pass carries this
 // key's request, instead of the 24 hour tick. A mismatch that stands asks
-// once, however often it is read.
+// once, however often it is read (askForPass).
 func (self *extenderLagLifecycle) askForKey(what string, keySha256 string) {
-	keyMismatch := what + " " + keySha256
-	if keyMismatch == self.keyMismatch {
+	self.askForPass(what+" "+keySha256, "the operator has a measurement "+what+" for another key")
+}
+
+// Asks for an activation pass at once for an answer that leaves the operator
+// holding nothing for this key (C4, C9): another key's request or
+// certificate, or a withdrawal. The pass carries this key's request
+// (ActivationCsr) instead of waiting for the 24 hour tick. `asked` names the
+// answer, so one that stands asks once however often it is read, until the
+// operator holds this key's request or certificate (passAskedFor); `why` is
+// what the log says.
+func (self *extenderLagLifecycle) askForPass(asked string, why string) {
+	if asked == self.passAskedFor {
 		return
 	}
-	self.keyMismatch = keyMismatch
-	log.Printf("[extender] lag: the operator has a measurement %s for another key; asking for a pass now", what)
+	self.passAskedFor = asked
+	log.Printf("[extender] lag: %s; asking for a pass now", why)
 	self.certificate.requestReactivate()
 }
 
