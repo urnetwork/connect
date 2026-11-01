@@ -162,15 +162,20 @@ func newTestingPlatformServerWithUpgradeHold(t *testing.T, ipVersion int, held c
 				return
 			}
 		}
-		ws, err := upgrader.Upgrade(w, r, nil)
-		if err == nil {
-			platform.connectCount.Add(1)
-			func() {
-				platform.stateLock.Lock()
-				defer platform.stateLock.Unlock()
+		// the upgrade answers the client, which may then count the connection
+		// as up, so the platform holds the connection under the same lock:
+		// closeConns never runs between the two and misses it
+		var ws *websocket.Conn
+		var err error
+		func() {
+			platform.stateLock.Lock()
+			defer platform.stateLock.Unlock()
+			ws, err = upgrader.Upgrade(w, r, nil)
+			if err == nil {
+				platform.connectCount.Add(1)
 				platform.conns = append(platform.conns, ws)
-			}()
-		}
+			}
+		}()
 		if counted != nil {
 			close(counted)
 		}
