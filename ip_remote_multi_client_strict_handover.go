@@ -15,8 +15,8 @@
 // own inputs:
 //   - capacity before construction: a pass builds only as many candidates as
 //     admission would accept now (strictAdmissionCapacityWithLock), and the
-//     enumerator lists and mints only the candidates a running pass asked
-//     for, never ahead of one, and nothing while the capacity is zero;
+//     enumerator lists and mints nothing while the capacity is zero, and no
+//     more than a running pass asked for;
 //   - collapse at admission: a pass at the hard max reserves one warned
 //     client that the capacity collapse test would remove (flowless, or past
 //     the collapse deadline), and admission swaps the evaluated candidate in
@@ -107,9 +107,13 @@ func (self *multiClientWindow) windowSizeWithLock() WindowSizeSettings {
 }
 
 // Whether the enumerator may list or mint for this window now. A strict
-// discovery window lists and mints only for a running pass that still wants a
-// candidate, and only while admission has capacity for it, as the discovery
-// demand path already declines at the hard max (discoveryDemandLiveWithLock).
+// discovery window lists and mints only while admission has capacity, as the
+// discovery demand path already declines at the hard max
+// (discoveryDemandLiveWithLock), and no more than a running pass still wants.
+// Between passes it may mint the one candidate the next pass takes: a listing
+// that outlasts its pass's acquisition budget, on a slow platform or after an
+// error backoff, is minted and parked for the next pass instead of
+// discarded, so every pass does not repeat the same race.
 func (self *multiClientWindow) strictDiscoveryAdmissible() bool {
 	if !self.strictWindowHandoverEnabled() {
 		return true
@@ -120,7 +124,7 @@ func (self *multiClientWindow) strictDiscoveryAdmissible() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	pass := self.strictPass
-	return pass != nil && 0 < pass.remainingCandidates &&
+	return (pass == nil || 0 < pass.remainingCandidates) &&
 		0 < self.strictAdmissionCapacityWithLock(self.windowSizeWithLock().WindowSizeHardMax)
 }
 

@@ -14561,11 +14561,11 @@ func (self *multiClientWindow) expand(
 		if strictHandover != nil {
 			victim := strictHandover.victim
 			if victimRemoval != nil {
-				// the verdict budget is charged as resize charges it, but the
-				// victim leaves even past it: an evaluated replacement already
-				// holds its slot, and it carries no flow the breaker protects
+				// the storm breaker counts the removal as resize's would count,
+				// even past its budget: an evaluated replacement already holds
+				// the victim's slot, and it carries no flow the breaker protects
 				if blackholeVerdictErr(victimRemoval.err) {
-					self.verdictRemovalAllowed(time.Now())
+					self.noteVerdictRemoval(time.Now())
 				}
 				victimRemoval.begin()
 			}
@@ -15599,6 +15599,35 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	self.pruneVerdictRemovalTimesWithLock(now, budgetWindow)
+
+	if budgetCount <= len(self.verdictRemovalTimes) {
+		return false
+	}
+	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
+	return true
+}
+
+// Records a verdict-driven removal the budget does not decide, so the storm
+// breaker counts it with the rest: a handover's victim leaves even past the
+// budget, since its evaluated replacement already holds the slot. Takes the
+// window stateLock.
+func (self *multiClientWindow) noteVerdictRemoval(now time.Time) {
+	reliabilitySettings := self.reliabilitySettings()
+	budgetWindow := reliabilitySettings.RemovalBudgetWindow
+	if reliabilitySettings.RemovalBudgetCount <= 0 || budgetWindow <= 0 {
+		return
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.pruneVerdictRemovalTimesWithLock(now, budgetWindow)
+	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
+}
+
+// Drops the verdict removals older than the budget window.
+func (self *multiClientWindow) pruneVerdictRemovalTimesWithLock(now time.Time, budgetWindow time.Duration) {
 	horizon := now.Add(-budgetWindow)
 	// timestamps are appended in order, so pruning is a prefix scan
 	i := 0
@@ -15608,12 +15637,6 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 	if 0 < i {
 		self.verdictRemovalTimes = self.verdictRemovalTimes[i:]
 	}
-
-	if budgetCount <= len(self.verdictRemovalTimes) {
-		return false
-	}
-	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
-	return true
 }
 
 func (self *multiClientWindow) shuffle() {

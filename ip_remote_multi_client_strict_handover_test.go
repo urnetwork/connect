@@ -17,6 +17,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // The installed and selectable (live, unwarned) client counts, read under the
@@ -861,10 +863,10 @@ func TestStrictWindowRefillMintsOnlyWhatThePassTakes(t *testing.T) {
 	})
 }
 
-// A strict window's enumerator lists and mints only for a running pass that
-// still wants a candidate, and only while admission has room for one; every
-// other window's enumerator is not held.
-func TestStrictDiscoveryAdmissibleNeedsAPassThatWantsACandidate(t *testing.T) {
+// A strict window's enumerator lists and mints only while admission has room,
+// and no more than a running pass still wants; between passes it may mint the
+// candidate the next pass takes. Every other window's enumerator is not held.
+func TestStrictDiscoveryAdmissibleNeedsRoomAndThePassBudget(t *testing.T) {
 	newWindow := func(strictWindowHandover bool, fixed bool, installedCount int) (*multiClientWindow, []*multiClientChannel) {
 		window := discoveryRetryTestWindow(t)
 		window.generator = &discoveryDemandTestBudgetGenerator{fixed: fixed}
@@ -882,17 +884,20 @@ func TestStrictDiscoveryAdmissibleNeedsAPassThatWantsACandidate(t *testing.T) {
 	}
 	owner := &multiClientEvaluationOwner{}
 
+	// room: between passes, and for a pass until it has its candidates
 	window, _ := newWindow(true, false, 1)
-	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
 	pass := window.beginStrictPass(owner, 1, nil)
 	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
 	window.noteStrictPassCandidateOffered()
 	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
 	window.endStrictPass(pass)
-	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
 
-	// full: a pass wants a candidate only for a reserved slot
+	// full: nothing between passes, and a pass wants a candidate only for a
+	// reserved slot
 	window, clients := newWindow(true, false, 2)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
 	pass = window.beginStrictPass(owner, 1, nil)
 	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
 	window.endStrictPass(pass)
@@ -1164,4 +1169,173 @@ func TestStrictWindowHandoverRunsNoCollapse(t *testing.T) {
 		installedCount, _ := strictHandoverTestCounts(window)
 		AssertEqual(t, installedCount, 5)
 	})
+}
+
+// A quality listing that takes `delay` (fake time): a platform that is slow
+// but alive, inside WindowGeneratorTimeout.
+type strictSlowListingTestGenerator struct {
+	*discoveryDemandTestGenerator
+	delay atomic.Int64
+}
+
+func (self *strictSlowListingTestGenerator) NextDestinationsWithIpFamily(count int, exclude []MultiHopId, rank string, family IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	if delay := time.Duration(self.delay.Load()); 0 < delay && rank == "quality" {
+		time.Sleep(delay)
+	}
+	return self.discoveryDemandTestGenerator.NextDestinationsWithIpFamily(count, exclude, rank, family)
+}
+
+// A strict 5/5/5 quality window with the handover on, over five exits and a
+// spare, whose generator's quality listings can be slowed.
+func newStrictSlowListingTestHarness(t *testing.T) (*reraceHarness, *strictSlowListingTestGenerator, *WindowClientStats) {
+	t.Helper()
+	resetBackendDegraded()
+	t.Cleanup(resetBackendDegraded)
+	ctx, cancel := context.WithCancel(t.Context())
+	h := &reraceHarness{t: t, ctx: ctx,
+		generator: &reraceGenerator{clientExits: map[Id]*reraceExit{}, unsubs: map[Id]func(){}},
+		log:       newRecordingLogger(), source: SourceId(NewId()), synTimes: map[string][]time.Time{}}
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		h.addExit(reraceExitSpec{name: name})
+	}
+	inner := &discoveryDemandTestGenerator{reraceGenerator: h.generator, retired: map[Id]int{},
+		emptyEntered: make(chan struct{}), emptyRelease: make(chan struct{}),
+		availableEntered: make(chan struct{}), availableRelease: make(chan struct{})}
+	generator := &strictSlowListingTestGenerator{discoveryDemandTestGenerator: inner}
+	stats := NewWindowClientStats()
+	settings := DefaultMultiClientSettings()
+	settings.Log, settings.ProviderProbe, settings.HeartbeatInterval = h.log, false, 0
+	settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{WindowSizeMin: 5, WindowSizeMax: 5, WindowSizeHardMax: 5}
+	settings.StrictWindowSizeHardMax, settings.StandingReserve, settings.EvaluationPoolMultiple = true, false, 1
+	settings.WindowClientStats = stats
+	settings.StrictWindowHandover = true
+	h.multiClient = NewRemoteUserNatMultiClient(ctx, generator, h.receive, protocol.ProvideMode_Network, settings)
+	t.Cleanup(func() {
+		if t.Failed() {
+			lines := h.log.lines()
+			for _, line := range lines[max(0, len(lines)-80):] {
+				t.Log(line)
+			}
+		}
+		for _, release := range []chan struct{}{inner.emptyRelease, inner.availableRelease} {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		}
+		if err := h.multiClient.CloseAndWait(context.Background()); err != nil {
+			t.Error(err)
+		}
+		cancel()
+		for _, client := range h.generator.clientList() {
+			if err := client.CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+		for _, exit := range h.generator.exitList() {
+			if err := exit.provider.CloseAndWait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+		h.exitWorkers.Wait()
+	})
+	h.waitForExits(5)
+	h.start = time.Now()
+	synctest.Wait()
+	h.addExit(reraceExitSpec{name: "spare"})
+	return h, generator, stats
+}
+
+// A strict window refills a lost exit while every quality listing takes
+// 17 s: longer than a pass's 15 s acquisition budget (WindowExpandTimeout),
+// inside the 20 s WindowGeneratorTimeout, as on a slow platform or after an
+// error backoff. The listing returns after its pass ended, so its candidate is
+// minted and parked for the next pass; a window that mints only for a running
+// pass discards it, and every later pass repeats the race. The review's N1.
+func TestStrictWindowRefillsWhenListingsOutlastThePass(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, generator, stats := newStrictSlowListingTestHarness(t)
+		h.addExit(reraceExitSpec{name: "spare-b"})
+		h.sleep(time.Second)
+		readsBefore, _, mintsBefore, _ := generator.counts()
+		admittedBefore := windowStatsCandidateTotal(stats, windowCandidateAdmitted)
+		generator.delay.Store(int64(17 * time.Second))
+		dead := h.liveChannels()[0]
+		dead.addError(fmt.Errorf("Blackhole no-send-ack (synthetic)"))
+		dead.Cancel()
+		h.sleep(10 * time.Minute)
+
+		reads, _, mints, _ := generator.counts()
+		installedCount, selectableCount := strictHandoverTestCounts(h.multiClient.windows[WindowTypeQuality])
+		t.Logf("slow listings, 10 min after one loss: listings=%d mints=%d installed=%d selectable=%d",
+			reads-readsBefore, mints-mintsBefore, installedCount, selectableCount)
+		if selectableCount != 5 {
+			t.Fatalf("the window did not refill its lost exit: %d selectable after 10 minutes, %d listings, %d mints",
+				selectableCount, reads-readsBefore, mints-mintsBefore)
+		}
+		// the freed slot cost one mint, and nothing was minted into the
+		// refilled window
+		AssertEqual(t, mints-mintsBefore, 1)
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmitted)-admittedBefore, uint64(1))
+	})
+}
+
+// A victim that ends with a blackhole verdict before its swap is removed by
+// its verdict, and the storm breaker counts the removal in its window whether
+// or not the budget has room: the victim leaves either way, since its
+// evaluated replacement already holds the slot. The review's N2.
+func TestStrictHandoverVerdictVictimIsCountedByTheStormBreaker(t *testing.T) {
+	for _, spent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("spent=%t", spent), func(t *testing.T) {
+			GetMessagePoolAggregateStats()
+			synctest.Test(t, func(t *testing.T) {
+				h, _, stats := newWindowStatsTestHarness(t)
+				window := h.multiClient.windows[WindowTypeQuality]
+				h.sleep(time.Second)
+				drained := h.liveChannels()[0]
+				var before int
+				var fired atomic.Bool
+				func() {
+					window.stateLock.Lock()
+					defer window.stateLock.Unlock()
+					window.beforeStrictHandoverSwapForTest = func() {
+						if !fired.CompareAndSwap(false, true) {
+							return
+						}
+						func() {
+							window.stateLock.Lock()
+							defer window.stateLock.Unlock()
+							if spent {
+								now := time.Now()
+								budget := window.reliabilitySettings().RemovalBudgetCount
+								window.verdictRemovalTimes = slices.Repeat([]time.Time{now}, budget)
+							}
+							before = len(window.verdictRemovalTimes)
+						}()
+						drained.addError(fmt.Errorf("Blackhole no-send-ack (synthetic)"))
+					}
+				}()
+				ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+				h.sleep(20 * time.Second)
+
+				if !fired.Load() {
+					t.Fatal("no handover swap was attempted")
+				}
+				var after int
+				func() {
+					window.stateLock.Lock()
+					defer window.stateLock.Unlock()
+					after = len(window.verdictRemovalTimes)
+				}()
+				if strictHandoverTestInstalled(window, drained) {
+					t.Fatal("the verdict victim kept its slot")
+				}
+				AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalVerdict].Load(), uint64(1))
+				AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalHandover].Load(), uint64(0))
+				AssertEqual(t, after, before+1)
+			})
+		})
+	}
 }
