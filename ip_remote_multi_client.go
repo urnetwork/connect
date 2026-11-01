@@ -12284,10 +12284,11 @@ type multiClientWindow struct {
 	discoveryRetry         discoveryExpandRetry
 	discoveryDemand        discoveryAcquisitionDemand
 	discoveryDemandChanged *Monitor
-	// The current expansion pass's reservation of a warned client's slot in
-	// a strict window at its hard max. Guarded by stateLock. See
+	// A strict window's current expansion pass: the candidates the
+	// enumerator may still hand it, and its reservation of a warned client's
+	// slot at the hard max. Guarded by stateLock. See
 	// ip_remote_multi_client_strict_handover.go.
-	strictHandover *strictWindowHandover
+	strictPass *strictWindowPass
 	// Nil outside focused tests. Runs before a handover's swap section, with
 	// no lock held. Guarded by stateLock.
 	beforeStrictHandoverSwapForTest func()
@@ -13352,15 +13353,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
 					}
-					offered := false
-					if demandRead == nil {
-						offered = self.offerClientArgs(args, time.Now().Add(timeout))
-						if offered {
-							self.noteStrictHandoverCandidateOffered()
-						}
-					} else {
-						offered = self.offerDiscoveryDemandArgs(demandRead, args)
-					}
+					offered := self.offerPassCandidate(demandRead, args, time.Now().Add(timeout))
 					if !offered {
 						select {
 						case <-self.ctx.Done():
@@ -14353,12 +14346,13 @@ func (self *multiClientWindow) expand(
 		self.reliabilitySettings().EvaluationPoolMultiple,
 		fixedDestination,
 	)
-	// a strict window's handover lasts as long as this pass, its final
-	// admissions included: registered before the terminal cleanup, so it is
-	// released after it
-	if pass.handover != nil {
-		self.reserveStrictHandover(pass.handover, evaluationOwner, requestCount)
-		defer self.releaseStrictHandover(pass.handover)
+	// a strict window's pass: the enumerator hands it only the candidates it
+	// requests, and its handover lasts as long as the pass, its final
+	// admissions included (registered before the terminal cleanup, so it ends
+	// after it)
+	if pass.handover != nil || (!fixedDestination && self.strictWindowHandoverEnabled()) {
+		strictPass := self.beginStrictPass(evaluationOwner, requestCount, pass.handover)
+		defer self.endStrictPass(strictPass)
 	}
 
 	admitted := 0

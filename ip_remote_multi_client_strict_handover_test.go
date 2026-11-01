@@ -8,6 +8,7 @@ package connect
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"slices"
 	"sync"
@@ -426,7 +427,7 @@ func TestStrictAdmissionPrecheckEquivalence(t *testing.T) {
 	for _, strict := range []bool{false, true} {
 		for _, hardMax := range []int{0, 1, 3, 5} {
 			for installedCount := 0; installedCount <= hardMax+1; installedCount += 1 {
-				for _, reservation := range []string{"none", "live", "spent", "victim-gone"} {
+				for _, reservation := range []string{"none", "pass-only", "reserved", "victim-gone"} {
 					// a pass reserves a slot only at exactly the hard max
 					if reservation != "none" && (!strict || installedCount != hardMax || hardMax == 0) {
 						continue
@@ -444,17 +445,16 @@ func TestStrictAdmissionPrecheckEquivalence(t *testing.T) {
 					}
 					reservationStands := false
 					switch reservation {
-					case "live", "spent", "victim-gone":
+					case "pass-only":
+						// a pass without a handover adds no capacity
+						window.strictPass = &strictWindowPass{remainingCandidates: 1}
+					case "reserved", "victim-gone":
 						victim := window.clients[installedIds[0]]
-						remaining := 1
-						if reservation == "spent" {
-							remaining = 0
-						}
-						window.strictHandover = &strictWindowHandover{victim: victim, remainingCandidates: remaining}
+						window.strictPass = &strictWindowPass{handover: &strictWindowHandover{victim: victim}}
 						if reservation == "victim-gone" {
 							delete(window.clients, installedIds[0])
 						}
-						reservationStands = reservation == "live"
+						reservationStands = reservation == "reserved"
 					}
 					windowSize := WindowSizeSettings{WindowSizeHardMax: hardMax}
 					capacity := window.strictAdmissionCapacity(hardMax)
@@ -603,15 +603,22 @@ func TestEnumeratorSkipsListingWhenStrictFull(t *testing.T) {
 		}
 		reads, mints := counts()
 		AssertEqual(t, [2]int{reads, mints}, [2]int{0, 0})
-		// an expansion asks while the window is full and nothing is reserved
+		// an expansion asks while the window is full and no pass is running
 		window.generatorMonitor.NotifyAll()
 		synctest.Wait()
 		reads, mints = counts()
 		AssertEqual(t, [2]int{reads, mints}, [2]int{0, 0})
+		// a pass that reserved nothing finds the window full too
+		fullPass := window.beginStrictPass(&multiClientEvaluationOwner{}, 1, nil)
+		window.generatorMonitor.NotifyAll()
+		synctest.Wait()
+		reads, mints = counts()
+		AssertEqual(t, [2]int{reads, mints}, [2]int{0, 0})
+		window.endStrictPass(fullPass)
 
 		// a handover pass reserves the warned client's slot for one candidate
 		handover := &strictWindowHandover{victim: victim}
-		window.reserveStrictHandover(handover, &multiClientEvaluationOwner{}, 1)
+		handoverPass := window.beginStrictPass(&multiClientEvaluationOwner{}, 1, handover)
 		window.generatorMonitor.NotifyAll()
 		synctest.Wait()
 		reads, mints = counts()
@@ -623,7 +630,7 @@ func TestEnumeratorSkipsListingWhenStrictFull(t *testing.T) {
 		reads, mints = counts()
 		AssertEqual(t, [2]int{reads, mints}, [2]int{1, 1})
 
-		window.releaseStrictHandover(handover)
+		window.endStrictPass(handoverPass)
 		window.generator.RemoveClientArgs(&offered.MultiClientGeneratorClientArgs)
 		cancel()
 		<-done
@@ -708,12 +715,13 @@ func TestStrictHandoverReservationEndsWithItsPass(t *testing.T) {
 	func() {
 		fixture.window.stateLock.Lock()
 		defer fixture.window.stateLock.Unlock()
-		if fixture.window.strictHandover != handover || handover.owner == nil {
+		strictPass := fixture.window.strictPass
+		if strictPass == nil || strictPass.handover != handover || strictPass.owner == nil {
 			t.Fatal("the pass does not hold its reservation")
 		}
 		// it stands for the one candidate the pass requests; only the
 		// enumerator spends it, and this fixture offered its candidate itself
-		AssertEqual(t, handover.remainingCandidates, 1)
+		AssertEqual(t, strictPass.remainingCandidates, 1)
 	}()
 	fixture.send(t, "initial-ping timeout", expirePing)
 	if got := fixture.result(t, expandDone); got != 0 {
@@ -722,7 +730,7 @@ func TestStrictHandoverReservationEndsWithItsPass(t *testing.T) {
 	func() {
 		fixture.window.stateLock.Lock()
 		defer fixture.window.stateLock.Unlock()
-		if fixture.window.strictHandover != nil {
+		if fixture.window.strictPass != nil {
 			t.Fatal("the reservation outlived its pass")
 		}
 	}()
@@ -819,4 +827,153 @@ func TestStrictWindowHandoverIsOffByDefault(t *testing.T) {
 	AssertEqual(t, window.strictWindowHandoverEnabled(), false)
 	settings.StrictWindowHandover = true
 	AssertEqual(t, window.strictWindowHandoverEnabled(), true)
+}
+
+// A strict window refilling one freed slot mints one candidate: the
+// enumerator hands a pass only the candidates it requested, so nothing is
+// minted ahead into a window its pass is already filling, to wait out
+// WindowExpandArgsTimeout and be retired unused. The review's A2.
+func TestStrictWindowRefillMintsOnlyWhatThePassTakes(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, generator, stats := newWindowStatsTestHarness(t)
+		h.addExit(reraceExitSpec{name: "spare-b"})
+		h.addExit(reraceExitSpec{name: "spare-c"})
+		window := h.multiClient.windows[WindowTypeQuality]
+		h.sleep(time.Second)
+		_, _, mintsBefore, _ := generator.counts()
+		admittedBefore := windowStatsCandidateTotal(stats, windowCandidateAdmitted)
+
+		dead := h.liveChannels()[0]
+		dead.addError(fmt.Errorf("Blackhole no-send-ack (synthetic)"))
+		dead.Cancel()
+		h.sleep(5 * time.Minute)
+
+		_, _, mints, _ := generator.counts()
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmitted)-admittedBefore, uint64(1))
+		AssertEqual(t, mints-mintsBefore, 1)
+		installedCount, selectableCount := strictHandoverTestCounts(window)
+		AssertEqual(t, installedCount, 5)
+		AssertEqual(t, selectableCount, 5)
+	})
+}
+
+// A strict window's enumerator lists and mints only for a running pass that
+// still wants a candidate, and only while admission has room for one; every
+// other window's enumerator is not held.
+func TestStrictDiscoveryAdmissibleNeedsAPassThatWantsACandidate(t *testing.T) {
+	newWindow := func(strictWindowHandover bool, fixed bool, installedCount int) (*multiClientWindow, []*multiClientChannel) {
+		window := discoveryRetryTestWindow(t)
+		window.generator = &discoveryDemandTestBudgetGenerator{fixed: fixed}
+		window.settings.StrictWindowSizeHardMax = true
+		window.settings.StrictWindowHandover = strictWindowHandover
+		window.settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}
+		clients := []*multiClientChannel{}
+		for range installedCount {
+			id := NewId()
+			client := &multiClientChannel{args: &multiClientChannelArgs{MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: id}}}
+			window.clients[id] = client
+			clients = append(clients, client)
+		}
+		return window, clients
+	}
+	owner := &multiClientEvaluationOwner{}
+
+	window, _ := newWindow(true, false, 1)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	pass := window.beginStrictPass(owner, 1, nil)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
+	window.noteStrictPassCandidateOffered()
+	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	window.endStrictPass(pass)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+
+	// full: a pass wants a candidate only for a reserved slot
+	window, clients := newWindow(true, false, 2)
+	pass = window.beginStrictPass(owner, 1, nil)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	window.endStrictPass(pass)
+	window.beginStrictPass(owner, 1, &strictWindowHandover{victim: clients[0]})
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
+
+	// the handover off, and a fixed window, are not held
+	window, _ = newWindow(false, false, 2)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
+	window, _ = newWindow(true, true, 2)
+	AssertEqual(t, window.strictDiscoveryAdmissible(), true)
+}
+
+// A candidate from a discovery demand read fills one of the slots its pass
+// asked for, as an ordinary candidate does, so the enumerator lists and mints
+// no more for the pass than it requested.
+func TestStrictPassBudgetCountsDemandCandidates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		window := discoveryRetryTestWindow(t)
+		window.generator = &discoveryDemandTestBudgetGenerator{}
+		window.clientChannelArgs = make(chan *multiClientChannelArgs)
+		window.settings.StrictWindowSizeHardMax = true
+		window.settings.StrictWindowHandover = true
+		window.settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{WindowSizeMin: 3, WindowSizeMax: 3, WindowSizeHardMax: 3}
+		installedId := NewId()
+		window.clients[installedId] = &multiClientChannel{
+			args: &multiClientChannelArgs{MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: installedId}},
+		}
+		owner := &multiClientEvaluationOwner{}
+		pass := window.beginStrictPass(owner, 2, nil)
+		defer window.endStrictPass(pass)
+		window.beginDiscoveryAcquisition(owner, t.Context(), time.Now().Add(time.Minute), 3, 3)
+		defer window.endDiscoveryAcquisition(owner)
+		window.beginDiscoveryDemandSlot(owner)
+		update := newMultiClientChannelUpdate(t.Context(), unboundFlowTcpPath(52996))
+		defer update.Close()
+		var read *discoveryDemandRead
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			demand := &window.discoveryDemand
+			read = &discoveryDemandRead{
+				owner:    owner,
+				slot:     demand.slot,
+				ctx:      demand.slotCtx,
+				deadline: demand.deadline,
+				update:   update,
+				stamp:    update.discoveryAttemptStamp.Load(),
+				members:  maps.Clone(window.clients),
+			}
+		}()
+		if !window.discoveryDemandReadLive(read) {
+			t.Fatal("the demand read is not live")
+		}
+		remaining := func() int {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			return pass.remainingCandidates
+		}
+		// the pass's receiver; it ends with the test
+		received := make(chan *multiClientChannelArgs, 2)
+		go func() {
+			for range 2 {
+				select {
+				case args := <-window.clientChannelArgs:
+					received <- args
+				case <-t.Context().Done():
+					return
+				}
+			}
+		}()
+
+		if !window.offerPassCandidate(read, &multiClientChannelArgs{}, time.Now().Add(time.Minute)) {
+			t.Fatal("the pass did not take the demand candidate")
+		}
+		<-received
+		AssertEqual(t, remaining(), 1)
+		AssertEqual(t, window.strictDiscoveryAdmissible(), true)
+
+		if !window.offerPassCandidate(nil, &multiClientChannelArgs{}, time.Now().Add(time.Minute)) {
+			t.Fatal("the pass did not take the ordinary candidate")
+		}
+		<-received
+		AssertEqual(t, remaining(), 0)
+		AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	})
 }
