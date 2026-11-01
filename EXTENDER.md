@@ -100,7 +100,7 @@ Clarifications given during review, which the decisions below implement:
 
 A1. Three carriers, one stream contract. The extender listens on tcp 443,
 udp 443 and the dns carrier's udp 4053, and the sn miner on udp 53 as well
-(L2). Acceptance requires public tcp 443 or a peer-to-peer webrtc
+(L2). Acceptance requires public tcp (443 by default) or a peer-to-peer webrtc
 connection (C2a); the udp carriers are optional (G2). Each carrier yields
 one reliable byte stream from the client:
 
@@ -594,15 +594,17 @@ dials that carrier with a random spoof name, sends a header with a
 challenge and verifies the response signature against `public_key_hex`;
 then `connect.ProbeExtenderForward` performs a verified `GET /hello`
 through the tcp carrier to the api url. Result `{activated, ip,
-ip_version, carriers, error, expire_time, allowed_hosts, record,
-bootstrap}`: `record` is the extender's own freshly signed record,
+ip_version, carriers, refused_carriers, error, expire_time, allowed_hosts,
+record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
 random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
 set, and a record publish row is inserted. The country comes from the ip
-geolocation of the caller. A probe failure returns `activated: false` with
-the failing carrier in `error` and stores nothing. Acceptance requires
-public tcp 443 or peer-to-peer webrtc, each of which proves the forward
+geolocation of the caller. A failed required test (C2a) returns `activated: false`
+with the failing test in `error` and stores nothing. An optional carrier
+that fails its probe is left out of the stored `carriers` and listed in
+`refused_carriers` (carrier, port, error); it does not fail the activation. Acceptance requires
+public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each of which proves the forward
 (C2a). Zero ports and an empty tld
 take the C1 defaults. The budgets are spent at the probe: every check that
 refuses without dialing the caller (the arguments, the caller and its
@@ -618,7 +620,7 @@ C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
 it passes at least one required test. Every other carrier is optional.
 
 - Required, at least one of:
-  - Public tcp 443. The activation probe dials the caller's public address
+  - Public tcp, on the offered `tcp_port` (443 by default). The activation probe dials the caller's public address
     on the tcp carrier, verifies the challenge signature against
     `public_key_hex`, and proves the forward with a verified `GET /hello`
     through it (C2).
@@ -1469,7 +1471,8 @@ that carries the role (G1); only the sn miner sets
 `DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort` (default off, a
 plain boolean on gomobile and in the c abi settings json) to also try 53,
 and a 53 bind that fails leaves the carrier serving on 4053; connectctl's
-standalone extender binds 53 only under `--dns_privileged_port`. Records carry the list of dns ports that passed the activation probe (`DnsPorts`, the ascending union over the extender's active addresses, with `DnsPort` kept for old readers as the extender's configured port, 4053 by default); each listed port is probed on its own 3 s sub-budget inside the 10 s activation budget, the ports that answer are recorded per address, and a dns carrier with no answering port refuses the activation. A client tries both 53 and 4053 on every extender, whether or not its record lists 53: the ports the record lists first, ascending, then whichever of 4053 and 53 it does not list, 4053 first. So a record that lists 53 is dialed on 53 first, and an app extender's record, which lists 4053 alone, and a manual address no record names yet are dialed on 4053 first with 53 behind it. The ports are one dial, a staggered race (`connect/net_extender_dns_ports.go`): the first port at once, each next port one stagger (250 ms, the stagger of the alt race below) after the last while nothing has answered, or at once when every attempt out has failed; the first port to answer wins and every other attempt is canceled and joined; an answer that refuses or limits the request (A4, A12) ends the race, since the extender answers the same on every port; a port the client's memory budget refused goes again once an attempt that held the budget ends. One dial means one dns dialer per extender, one slot of the strategy's parallel block and expand budget, and one carrier outcome for the directory, so a 53 that never answers on an app extender neither holds the address nor delays its 4053 dial. The feed, the probe and the peer pinger dial the dns carrier the same way. An exact endpoint -- `ExtenderConfigs`, an NLayer hop, the operator's per-port activation probe -- is dialed on the one port it names. Alt is dialed on 53 first,
+standalone extender binds 53 only under `--dns_privileged_port`. Records carry the list of dns ports that passed the activation probe (`DnsPorts`, the ascending union over the extender's active addresses, with `DnsPort` kept for old readers as the extender's configured port, 4053 by default); each listed port is probed on its own 3 s sub-budget inside the 10 s activation budget, the ports that answer are recorded per address, and a dns carrier with no answering port is left out of the record and
+listed in `refused_carriers`; it does not fail the activation (C2a). A client tries both 53 and 4053 on every extender, whether or not its record lists 53: the ports the record lists first, ascending, then whichever of 4053 and 53 it does not list, 4053 first. So a record that lists 53 is dialed on 53 first, and an app extender's record, which lists 4053 alone, and a manual address no record names yet are dialed on 4053 first with 53 behind it. The ports are one dial, a staggered race (`connect/net_extender_dns_ports.go`): the first port at once, each next port one stagger (250 ms, the stagger of the alt race below) after the last while nothing has answered, or at once when every attempt out has failed; the first port to answer wins and every other attempt is canceled and joined; an answer that refuses or limits the request (A4, A12) ends the race, since the extender answers the same on every port; a port the client's memory budget refused goes again once an attempt that held the budget ends. One dial means one dns dialer per extender, one slot of the strategy's parallel block and expand budget, and one carrier outcome for the directory, so a 53 that never answers on an app extender neither holds the address nor delays its 4053 dial. The feed, the probe and the peer pinger dial the dns carrier the same way. An exact endpoint -- `ExtenderConfigs`, an NLayer hop, the operator's per-port activation probe -- is dialed on the one port it names. Alt is dialed on 53 first,
 then 4053. The extender binds the configured dns port, 4053 in the sdk and
 connectctl, plus 53 under `DnsPrivilegedPort`, and reports what it bound
 so the activator advertises exactly that.

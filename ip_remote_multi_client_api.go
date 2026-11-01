@@ -956,6 +956,7 @@ func addProviderDestinations(destinations map[MultiHopId]DestinationStats, provi
 				NetworkOnly:             provider.NetworkOnly,
 				ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
 				Location:                provider.Location,
+				LocationMatch:           LocationMatch(provider.Match).Normalize(),
 				IpFamily:                provider.IpFamily.Normalize(),
 			}
 		}
