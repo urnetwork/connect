@@ -13380,6 +13380,82 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 	}
 }
 
+// The removal of a window client that ended with an error, which the resize
+// pass and a handover whose victim ended before its swap share: THE verdict
+// line, the Fixed IP's re-dial, and the recent-exit memory, classified while
+// the client is still in the window and held only after it left.
+type windowErrorRemoval struct {
+	window     *multiClientWindow
+	client     *multiClientChannel
+	err        error
+	stickyExit bool
+	// what classifyRecentExit found, held by finish
+	lostExit         recentExit
+	lostExitMaxCount int
+	rememberLostExit bool
+}
+
+// Classifies the removal of a client that ended with err. Every other window
+// remembers an exit lost to an outage of ours for the rounds that re-form it
+// (see recentExitMemory), so this runs before the removal, while the uplink
+// gate still counts the exit's outstanding sends. Nothing is recorded yet.
+// Called with no lock held.
+func (self *multiClientWindow) classifyErrorRemoval(
+	client *multiClientChannel,
+	err error,
+	stats *clientWindowStats,
+	windowSize WindowSizeSettings,
+	stickyExit bool,
+) *windowErrorRemoval {
+	removal := &windowErrorRemoval{
+		window:     self,
+		client:     client,
+		err:        err,
+		stickyExit: stickyExit,
+	}
+	removal.lostExit, removal.lostExitMaxCount, removal.rememberLostExit =
+		self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
+	return removal
+}
+
+// Records the removal before the client leaves the window. Called with no
+// lock held.
+func (self *windowErrorRemoval) begin() {
+	window := self.window
+	// the historical format is preserved EXACTLY up to the separator -- this
+	// is THE verdict line, the one the owner greps and the one every removal
+	// postmortem starts from. The twin adds the compact reason token and the
+	// blast radius on the same line, so `grep 'event=removal'` yields the
+	// removal census without a regex over the free-text error.
+	window.log.Infof(
+		"[multi]remove error client [%s] = %s | %s\n",
+		self.client.ClientId(), self.err,
+		relEvent(
+			"removal",
+			"exit", self.client.ClientId(),
+			"reason", relRemovalReason(self.err),
+			"flows", window.flowCount(self.client),
+		),
+	)
+	// the user's Fixed IP lost its exit to transport loss, not to a verdict
+	// against the provider: ask for the same provider first (see
+	// stickyRedial)
+	window.rememberStickyRedial(self.client, self.err, self.stickyExit)
+}
+
+// The cause the removal counts under.
+func (self *windowErrorRemoval) cause() windowRemovalCause {
+	return windowRemovalCauseOf(self.err)
+}
+
+// Holds the lost exit once the client left the window, so a round in flight
+// never finds the exit still in the window.
+func (self *windowErrorRemoval) finish() {
+	if self.rememberLostExit {
+		self.window.rememberRecentExit(self.client, self.lostExit, self.lostExitMaxCount)
+	}
+}
+
 func (self *multiClientWindow) resize() {
 	// one timer for the loop's life, re-armed for each wait between passes
 	var waitTimer *time.Timer
@@ -13499,36 +13575,13 @@ func (self *multiClientWindow) resize() {
 					"detail", err,
 				))
 			} else {
-				// the historical format is preserved EXACTLY up to the
-				// separator -- this is THE verdict line, the one the owner
-				// greps and the one every removal postmortem starts from. The
-				// twin adds the compact reason token and the blast radius on
-				// the same line, so `grep 'event=removal'` yields the removal
-				// census without a regex over the free-text error.
-				self.log.Infof(
-					"[multi]remove error client [%s] = %s | %s\n",
-					client.ClientId(), err,
-					relEvent(
-						"removal",
-						"exit", client.ClientId(),
-						"reason", relRemovalReason(err),
-						"flows", self.flowCount(client),
-					),
-				)
-				// the user's Fixed IP lost its exit to transport loss, not to
-				// a verdict against the provider: ask for the same provider
-				// first (see stickyRedial)
-				self.rememberStickyRedial(client, err, stickyExit)
-				// every other window remembers an exit lost to an outage of
-				// ours for the rounds that re-form it (see recentExitMemory).
-				// Classified before the removal, while the uplink gate still
-				// counts this exit's outstanding sends; held after it, so a
-				// round in flight never finds the exit still in the window.
-				lostExit, lostExitMaxCount, rememberLostExit := self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
-				removeClient(client, windowRemovalCauseOf(err))
-				if rememberLostExit {
-					self.rememberRecentExit(client, lostExit, lostExitMaxCount)
-				}
+				// THE verdict line, the Fixed IP's re-dial and the recent-exit
+				// memory, which a handover victim that ended before its swap
+				// shares (see windowErrorRemoval)
+				removal := self.classifyErrorRemoval(client, err, stats, windowSize, stickyExit)
+				removal.begin()
+				removeClient(client, removal.cause())
+				removal.finish()
 			}
 		}
 
@@ -14450,6 +14503,13 @@ func (self *multiClientWindow) expand(
 				beforeSwap()
 			}
 		}
+		// a victim that ended with an error before its swap is removed by its
+		// error, as the resize pass removes one: classified here, while it is
+		// still in the window
+		var victimRemoval *windowErrorRemoval
+		if strictHandover != nil {
+			victimRemoval = self.classifyHandoverVictimRemoval(strictHandover.victim, windowSize)
+		}
 		var replacedClient *multiClientChannel
 		installed := false
 		if admissible || strictHandover != nil {
@@ -14500,16 +14560,30 @@ func (self *multiClientWindow) expand(
 
 		if strictHandover != nil {
 			victim := strictHandover.victim
+			if victimRemoval != nil {
+				// the verdict budget is charged as resize charges it, but the
+				// victim leaves even past it: an evaluated replacement already
+				// holds its slot, and it carries no flow the breaker protects
+				if blackholeVerdictErr(victimRemoval.err) {
+					self.verdictRemovalAllowed(time.Now())
+				}
+				victimRemoval.begin()
+			}
 			// the victim's ordinary removal, after the swap: its remaining
 			// flows move or end with it, and its channel cleanup retires it
 			victim.Close()
 			self.removeClients(victim)
-			windowClientStats.addRemoval(self.windowType, windowRemovalHandover)
-			self.log.Infof("%s\n", relEvent(
-				"handover",
-				"exit", victim.ClientId(),
-				"replacement", clientId,
-			))
+			if victimRemoval != nil {
+				windowClientStats.addRemoval(self.windowType, victimRemoval.cause())
+				victimRemoval.finish()
+			} else {
+				windowClientStats.addRemoval(self.windowType, windowRemovalHandover)
+				self.log.Infof("%s\n", relEvent(
+					"handover",
+					"exit", victim.ClientId(),
+					"replacement", clientId,
+				))
+			}
 		}
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1

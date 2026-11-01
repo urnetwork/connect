@@ -748,9 +748,9 @@ func TestBlackholeVerdictAndTeardownFormatsUnchanged(t *testing.T) {
 
 	// the twins ride on the SAME line (no second Infof), so they can never be
 	// separated by interleaving from another goroutine
-	removal, ok := functionBody(source, "func (self *multiClientWindow) resize()")
+	removal, ok := functionBody(source, "func (self *windowErrorRemoval) begin()")
 	if !ok {
-		t.Fatal("could not find resize")
+		t.Fatal("could not find the error removal's verdict line")
 	}
 	if !strings.Contains(removal, `"[multi]remove error client [%s] = %s | %s\n"`) {
 		t.Error("the removal verdict line lost its [rel] twin")

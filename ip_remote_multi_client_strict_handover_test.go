@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -975,5 +976,52 @@ func TestStrictPassBudgetCountsDemandCandidates(t *testing.T) {
 		<-received
 		AssertEqual(t, remaining(), 0)
 		AssertEqual(t, window.strictDiscoveryAdmissible(), false)
+	})
+}
+
+// A victim that ends with an error during its handover pass (here its
+// transport is lost while the candidate is evaluated) is removed by its
+// error, as the resize pass would have removed it: the transport_down
+// removal, THE verdict line, and no handover removal, while the evaluated
+// candidate still takes the slot. The review's A1.
+func TestStrictHandoverVictimEndedBeforeTheSwapIsRemovedByItsError(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, _, stats := newWindowStatsTestHarness(t)
+		window := h.multiClient.windows[WindowTypeQuality]
+		h.sleep(time.Second)
+		drained := h.liveChannels()[0]
+		var ended atomic.Bool
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			window.beforeStrictHandoverSwapForTest = func() {
+				if ended.CompareAndSwap(false, true) {
+					drained.addError(errTransportDownTimeout)
+				}
+			}
+		}()
+		ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+		h.sleep(40 * time.Second)
+
+		if !ended.Load() {
+			t.Fatal("no handover swap was attempted")
+		}
+		removalLines := 0
+		for _, line := range h.log.linesWith("event=removal") {
+			if strings.Contains(line, drained.ClientId().String()) {
+				removalLines += 1
+			}
+		}
+		AssertEqual(t, removalLines, 1)
+		AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalTransportDown].Load(), uint64(1))
+		AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalHandover].Load(), uint64(0))
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), uint64(1))
+		if strictHandoverTestInstalled(window, drained) {
+			t.Fatal("the ended victim kept its slot")
+		}
+		installedCount, selectableCount := strictHandoverTestCounts(window)
+		AssertEqual(t, installedCount, 5)
+		AssertEqual(t, selectableCount, 5)
 	})
 }

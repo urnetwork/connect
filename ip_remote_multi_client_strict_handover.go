@@ -295,6 +295,19 @@ func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOw
 	return handover
 }
 
+// The removal by its error of a handover's victim that ended with one, or nil
+// for a victim that is still live. Called with no lock held.
+func (self *multiClientWindow) classifyHandoverVictimRemoval(
+	victim *multiClientChannel,
+	windowSize WindowSizeSettings,
+) *windowErrorRemoval {
+	stats, err := victim.WindowStats()
+	if err == nil {
+		return nil
+	}
+	return self.classifyErrorRemoval(victim, err, stats, windowSize, self.stickyExit())
+}
+
 // The swap's precondition under the install lock: the reservation is still
 // installed and unspent, and its victim is still installed and still out of
 // selection, or done.
