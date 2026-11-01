@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"crypto/tls"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -585,4 +586,97 @@ func TestHoldCanceledDialIsNoDialFailure(t *testing.T) {
 	if n := consecutiveBackendFails.Load(); n != 0 {
 		t.Fatalf("a hold-canceled dial counted %d backend failures", n)
 	}
+}
+
+// Holds the transport and lifts the hold at once, the first time a
+// connection's watch waits, right after the watch read no hold. The hold's
+// edge on the kick monitor wakes the watch, and the watch then reads no hold:
+// a re-enable within microseconds of the hold, with no scheduling to win.
+type testingLiftedHold struct {
+	lifted atomic.Bool
+}
+
+func (self *testingLiftedHold) beforeWatchWait(transport *PlatformTransport) {
+	if self.lifted.CompareAndSwap(false, true) {
+		transport.SetEnabled(false)
+		transport.SetEnabled(true)
+	}
+}
+
+// A hold that lifts before the connection's watch reads it. The watch, woken
+// by the hold's edge on the kick monitor, reads no hold and closes the
+// connection as for a network change. With no kick that close is the hold's,
+// not a lost connection, and the re-dial after it draws no spread. It was
+// taken for a lost connection and drew one.
+func TestHoldLiftedBeforeTheWatchReadsItRedialsWithoutTheSpread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	strategy := NewClientStrategy(ctx, DefaultClientStrategySettings())
+	defer strategy.Close()
+	settings := testingPlatformTransportSettings()
+	settings.ReconnectJitter = 10 * time.Second
+	draws := newTestingJitterDraws(300 * time.Millisecond)
+	settings.reconnectJitterForTest = draws.draw
+	hold := &testingLiftedHold{}
+	settings.connectionWatchWaitForTest = hold.beforeWatchWait
+	connections := observeTestingTransportConnections(settings)
+	newRedialTestTransport(t, ctx, platform.url, strategy, settings)
+
+	waitTestingConnected(t, connections, 2)
+	if !hold.lifted.Load() {
+		t.Fatal("the first connection's watch never waited")
+	}
+	requireDrawWindows(t, draws, 0, settings.ReconnectJitter)
+}
+
+// The same for the H3 runner, whose watch closes the QUIC connection. With a
+// transport budget an H3 runner runs in the H3 group, which restarts it on any
+// hold's edge, so the transport here has none: its explicit H3 runner runs on
+// its own and meets the hold itself.
+func TestH3HoldLiftedBeforeTheWatchReadsItRedialsWithoutTheSpread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingClientLimitH3Platform(t)
+	settings := testingFamilyTransportSettings()
+	settings.PlatformTransportBudget = nil
+	settings.H3Port = platform.port
+	settings.QuicConnectTimeout = 2 * time.Second
+	settings.QuicHandshakeTimeout = 2 * time.Second
+	settings.QuicTlsConfig = &tls.Config{
+		InsecureSkipVerify: true, // test-only self-signed endpoint
+		NextProtos:         []string{platform.nextProto},
+	}
+	settings.FramerSettings = platform.framerSets
+	settings.ReconnectJitter = 10 * time.Second
+	draws := newTestingJitterDraws(300 * time.Millisecond)
+	settings.reconnectJitterForTest = draws.draw
+	hold := &testingLiftedHold{}
+	settings.connectionWatchWaitForTest = hold.beforeWatchWait
+	connections := observeTestingTransportConnections(settings)
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategy := NewClientStrategy(ctx, strategySettings)
+	defer strategy.Close()
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		NewRouteManager(ctx, "lifted-hold-h3"),
+		"https://"+testLoopbackHost(4),
+		&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+		TransportModeH3,
+		settings,
+	)
+	defer transport.Close()
+
+	platform.nextConnection(t)
+	platform.nextConnection(t)
+	waitTestingConnected(t, connections, 2)
+	if !hold.lifted.Load() {
+		t.Fatal("the first connection's watch never waited")
+	}
+	requireDrawWindows(t, draws, 0, settings.ReconnectJitter)
 }

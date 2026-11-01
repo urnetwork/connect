@@ -341,6 +341,9 @@ func (self *PlatformTransport) runConnectionWatch(
 			closeConnection(connectionCloseClientLimit)
 			return
 		}
+		if self.settings.connectionWatchWaitForTest != nil {
+			self.settings.connectionWatchWaitForTest(self)
+		}
 		select {
 		case <-handleCtx.Done():
 			return

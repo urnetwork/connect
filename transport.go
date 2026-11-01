@@ -857,6 +857,11 @@ type PlatformTransportSettings struct {
 	// its owner or its pinned family holds the transport, right before it
 	// waits.
 	heldParkForTest func()
+	// Nil outside package tests. Called each time a connection's watch
+	// (runConnectionWatch) has read the transport's hold and client limit and
+	// is about to wait for a change, with the transport, so a test can change
+	// the hold right after the watch read it.
+	connectionWatchWaitForTest func(transport *PlatformTransport)
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -2793,7 +2798,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			kick := self.kickedSince(kickGeneration)
 			startConnectionWorker(func() {
 				self.runConnectionWatch(handleCtx, kick, func(reason string) {
-					if reason != connectionCloseNetworkChange {
+					// The kick monitor also fires when the transport becomes
+					// held, so a network change close with no kick is a hold's
+					// that lifted before the watch read it.
+					if reason != connectionCloseNetworkChange || !self.kicked(kickGeneration) {
 						closedByHold.Store(true)
 					}
 					handleCancel()
@@ -3902,7 +3910,9 @@ func (self *PlatformTransport) runH3(
 			kick := self.kickedSince(kickGeneration)
 			startConnectionWorker(func() {
 				self.runConnectionWatch(handleCtx, kick, func(reason string) {
-					if reason != connectionCloseNetworkChange {
+					// a network change close with no kick is a hold's (see the
+					// h1 loop)
+					if reason != connectionCloseNetworkChange || !self.kicked(kickGeneration) {
 						closedByHold.Store(true)
 					}
 					handleCancel()
