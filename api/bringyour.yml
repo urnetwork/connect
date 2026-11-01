@@ -4728,6 +4728,11 @@ paths:
         Out-of-band control messages for the connect protocol.
         Blocking request-response control messages need to be handled out-of-band
         to resolve the possibility of deadlocks in the client sequence.
+
+        A pack whose every frame is a `PeerAudit` is answered
+        `{"pack": "", "error": null}` without reading the bearer token, and
+        no one stores it. Clients send none by default
+        (`ClientSettings.SendPeerAudits`).
       operationId: connectControl
       security:
         - BearerAuth: []

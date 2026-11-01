@@ -115,7 +115,7 @@ func testDynamicCandidateDemand(t *testing.T, windowType WindowType) {
 	fixture, _, _, entered := newDemandExpansionFixture(t, false, windowType)
 	done := make(chan int, 1)
 	go func() {
-		done <- fixture.window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 0, 0, 2, 2, 2, 0)
+		done <- fixture.window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 0, 0, 2, 2, 2, 0, windowExpandPassPlan{})
 	}()
 	fixture.wait(t, "first demanded setup", entered)
 	fixture.wait(t, "first ping held", fixture.pingResultEntered)
@@ -224,7 +224,7 @@ func TestFixedCandidateMintsOnlyRequestedIdentity(t *testing.T) {
 		beforeDemand := minted.Load()
 		expandDone := make(chan int, 1)
 		go func() {
-			expandDone <- window.expand(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, WindowSizeHardMax: 1}, 0, 0, 1, 1, 1, 0)
+			expandDone <- window.expand(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, WindowSizeHardMax: 1}, 0, 0, 1, 1, 1, 0, windowExpandPassPlan{})
 		}()
 		<-generator.setupEntered
 		synctest.Wait()
@@ -418,7 +418,7 @@ func TestFixedCandidateExpiredMintRetiresBeforeSetup(t *testing.T) {
 		window.clientChannelArgs = make(chan *multiClientChannelArgs, 1)
 		window.clientChannelArgs <- &multiClientChannelArgs{Destination: destination, FixedDestination: true, deferredClientArgs: true}
 		started := time.Now()
-		added := window.expand(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, WindowSizeHardMax: 1}, 0, 0, 1, 1, 1, 0)
+		added := window.expand(WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, WindowSizeHardMax: 1}, 0, 0, 1, 1, 1, 0, windowExpandPassPlan{})
 		if added != 0 || calls != 1 || retired != 1 || generator.setupCalls.Load() != 0 || time.Since(started) != 3*time.Second {
 			t.Fatalf("expired demand: added=%d mints=%d retired=%d setup=%d elapsed=%s", added, calls, retired, generator.setupCalls.Load(), time.Since(started))
 		}
@@ -451,7 +451,7 @@ func TestFixedCandidateStaleOfferKeepsMissingDestinationDemand(t *testing.T) {
 		window.clientChannelArgs <- &multiClientChannelArgs{Destination: destination, FixedDestination: true, deferredClientArgs: true}
 	}
 	window.settings.EvaluationPoolMultiple = 1
-	added := window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 1, 0, 2, 2, 1, 0)
+	added := window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 1, 0, 2, 2, 1, 0, windowExpandPassPlan{})
 	if added != 0 || calls != 1 || retired != 1 {
 		t.Fatalf("stale offer consumed demand or changed failure cleanup: added=%d calls=%d retired=%d", added, calls, retired)
 	}

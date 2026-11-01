@@ -1605,6 +1605,15 @@ type ClientSettings struct {
 	BufferTimeout time.Duration
 	// if 0, the client will not send control pings
 	ControlPingTimeout time.Duration
+	// Whether the client sends `PeerAudit` frames to the platform's
+	// out-of-band control: one per receive sequence every
+	// `ReceiveBufferSettings.MaxPeerAuditDuration`, on a verified stream
+	// change and at its exit, one per malformed inbound transfer frame, and
+	// one per `ReportAbuse`. No platform has ever read one, and it answers
+	// them empty without authenticating them (server CPUOPT3 D3). False, the
+	// default, sends none and keeps no audit; local policy verdicts and their
+	// counters are unaffected. A future consumer turns them back on here.
+	SendPeerAudits bool
 	// NetworkQualityNotificationRetryInterval is how long the client waits
 	// before it tries again to send the network quality notifications that
 	// its peers' send queues had no room for. The notifications are hints, so
@@ -18734,11 +18743,17 @@ func (self *PeerAudit) resend(byteCount ByteCount) {
 	self.ResendByteCount += byteCount
 }
 
+// Collects one peer's audit and sends it to the platform's out-of-band
+// control when it completes. Only when the client's settings send audits
+// (`ClientSettings.SendPeerAudits`); otherwise every method returns at once,
+// before reading the clock or building a frame.
 type SequencePeerAudit struct {
 	client           *Client
 	log              Logger
 	source           TransferPath
 	maxAuditDuration time.Duration
+	// from `ClientSettings.SendPeerAudits` at construction
+	send bool
 
 	peerAudit *PeerAudit
 }
@@ -18749,6 +18764,7 @@ func NewSequencePeerAudit(client *Client, source TransferPath, maxAuditDuration 
 		log:              client.log,
 		source:           source,
 		maxAuditDuration: maxAuditDuration,
+		send:             client.settings.SendPeerAudits,
 		peerAudit:        nil,
 	}
 }
@@ -18756,6 +18772,9 @@ func NewSequencePeerAudit(client *Client, source TransferPath, maxAuditDuration 
 // Moves subsequent observations onto the stream authenticated by a verified
 // contract. A route change completes the prior attribution first.
 func (self *SequencePeerAudit) SetStreamId(streamId Id) {
+	if !self.send {
+		return
+	}
 	if self.source.StreamId == streamId {
 		return
 	}
@@ -18764,6 +18783,9 @@ func (self *SequencePeerAudit) SetStreamId(streamId Id) {
 }
 
 func (self *SequencePeerAudit) Update(callback func(*PeerAudit)) {
+	if !self.send {
+		return
+	}
 	auditTime := time.Now()
 
 	if self.peerAudit != nil && self.maxAuditDuration <= auditTime.Sub(self.peerAudit.startTime) {
@@ -18779,7 +18801,7 @@ func (self *SequencePeerAudit) Update(callback func(*PeerAudit)) {
 }
 
 func (self *SequencePeerAudit) Complete() {
-	if self.peerAudit == nil {
+	if !self.send || self.peerAudit == nil {
 		return
 	}
 

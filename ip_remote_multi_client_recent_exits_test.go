@@ -899,7 +899,7 @@ func TestRecentExitHeldOnlyAfterItsExitLeftTheWindow(t *testing.T) {
 	if classify < 0 {
 		t.Fatal("resize does not classify the exits it removes for the recent-exit memory")
 	}
-	removal := strings.Index(body[classify:], "removeClient(client)")
+	removal := strings.Index(body[classify:], "removeClient(client, ")
 	remember := strings.Index(body[classify:], "self.rememberRecentExit(client, lostExit, lostExitMaxCount)")
 	if removal < 0 || remember < 0 || remember < removal {
 		t.Fatal("resize holds a lost exit before its removal: a round in between drops it as still in the window")

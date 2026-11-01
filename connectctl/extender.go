@@ -681,8 +681,9 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	}
 	run.activator = connect.NewExtenderActivator(ctx, activatorSettings)
 	if run.measurementCert != nil {
-		// the operator holding another key's request or certificate asks for a
-		// pass at once, which carries this key's request (C4)
+		// the operator holding another key's request or certificate, or
+		// withdrawing the certificate, asks for a pass at once, which carries
+		// this key's request (C4, C9)
 		run.measurementCert.SetReactivate(run.activator.Reactivate)
 	}
 	run.closers = append(run.closers, run.activator.Close)

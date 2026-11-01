@@ -439,6 +439,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		UdpTeardownSignal:        true,
 		QuicRebindOnExitLoss:     true,
 		StandingReserve:          true,
+		StrictWindowHandover:     true,
 		ClusterAffinityFallback:  true,
 		ServerNameAffinityBridge: true,
 		// well inside AckTimeout (30s), which is what otherwise bounds recovery
@@ -605,6 +606,25 @@ type MultiClientSettings struct {
 	// takes precedence over a transient ownership overshoot. Mobile low-memory
 	// profiles opt in because their process has a strict memory envelope.
 	StrictWindowSizeHardMax bool
+	// Makes a strict window (StrictWindowSizeHardMax) plan with its
+	// admission gate's inputs (see
+	// ip_remote_multi_client_strict_handover.go). A pass builds only the
+	// candidates admission would accept, so a window at its hard max builds
+	// nothing, and the enumerator lists and mints nothing for it. At the hard
+	// max, a warned client that the capacity collapse test would remove
+	// (flowless, or past the collapse deadline) hands its slot to the next
+	// evaluated candidate in one atomic swap, so lifetime rotation completes
+	// without the window ever holding more than its hard max or fewer than
+	// its minimum. Fixed destinations and non-strict windows are unaffected.
+	// false keeps building candidates the hard max refuses and keeps warned
+	// clients in their slots, as before.
+	StrictWindowHandover bool
+	// When set, the process's counters of what the windows do with their
+	// window clients (see
+	// ip_remote_multi_client_window_client_stats.go). A host that runs many
+	// devices in one process (the proxy service) sets one instance on all of
+	// them and exports it. Nil counts nothing.
+	WindowClientStats *WindowClientStats
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
@@ -12266,6 +12286,13 @@ type multiClientWindow struct {
 	discoveryRetry         discoveryExpandRetry
 	discoveryDemand        discoveryAcquisitionDemand
 	discoveryDemandChanged *Monitor
+	// The current expansion pass's reservation of a warned client's slot in
+	// a strict window at its hard max. Guarded by stateLock. See
+	// ip_remote_multi_client_strict_handover.go.
+	strictHandover *strictWindowHandover
+	// Nil outside focused tests. Runs before a handover's swap section, with
+	// no lock held. Guarded by stateLock.
+	beforeStrictHandoverSwapForTest func()
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -13146,6 +13173,16 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		var err error
 		if demandRead == nil {
 			probeOnly = self.takeIpv6ProbeRequest()
+			// a strict window at its hard max with no handover to fill lists
+			// and mints nothing until an expansion asks again; a family-swap
+			// probe still asks before the window gives anything up
+			if !probeOnly && !self.strictDiscoveryAdmissible() {
+				demandRead = self.waitDiscoveryDemand(generatorNotify, true)
+				if self.ctx.Err() != nil {
+					return
+				}
+				continue
+			}
 			destinations, err = self.enumerateDestinations(slices.Collect(maps.Keys(windowDestinations())), probeOnly)
 		} else {
 			destinations, err = self.listDiscoveryDemand(demandRead, slices.Collect(maps.Keys(windowDestinations())))
@@ -13238,6 +13275,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					continue
 				}
 
+				if demandRead == nil && !probeOnly && !self.strictDiscoveryAdmissible() {
+					return
+				}
 				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
 					return
 				}
@@ -13317,6 +13357,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					offered := false
 					if demandRead == nil {
 						offered = self.offerClientArgs(args, time.Now().Add(timeout))
+						if offered {
+							self.noteStrictHandoverCandidateOffered()
+						}
 					} else {
 						offered = self.offerDiscoveryDemandArgs(demandRead, args)
 					}
@@ -13354,6 +13397,15 @@ func (self *multiClientWindow) resize() {
 			waitTimer.Stop()
 		}
 	}()
+	// the process counters (nil counts nothing): the state this loop last
+	// published for the window, retracted when the loop ends, and the warned
+	// clients' causes as the last pass classified them
+	windowClientStats := self.windowClientStats()
+	publishedWindowState := windowStateNone
+	defer func() {
+		windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowStateNone)
+	}()
+	warningTransitions := windowWarningTransitions{}
 	for {
 		// Cancellation can race a ready resize edge after an expansion ends.
 		// Leave owned channels to Close instead of starting a teardown pass.
@@ -13389,7 +13441,7 @@ func (self *multiClientWindow) resize() {
 		weights := map[*multiClientChannel]float32{}
 		durations := map[*multiClientChannel]time.Duration{}
 
-		removeClient := func(client *multiClientChannel) {
+		removeClient := func(client *multiClientChannel, cause windowRemovalCause) {
 			client.Close()
 			removed := false
 			func() {
@@ -13409,6 +13461,7 @@ func (self *multiClientWindow) resize() {
 				}
 			}()
 			if removed {
+				windowClientStats.addRemoval(self.windowType, cause)
 				self.removeClients(client)
 			}
 		}
@@ -13481,7 +13534,7 @@ func (self *multiClientWindow) resize() {
 				// counts this exit's outstanding sends; held after it, so a
 				// round in flight never finds the exit still in the window.
 				lostExit, lostExitMaxCount, rememberLostExit := self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
-				removeClient(client)
+				removeClient(client, windowRemovalCauseOf(err))
 				if rememberLostExit {
 					self.rememberRecentExit(client, lostExit, lostExitMaxCount)
 				}
@@ -13761,7 +13814,7 @@ func (self *multiClientWindow) resize() {
 					} else {
 						previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
 						self.logWarnTransition(client, previousCause, causeChanged, stats)
-						removeClient(client)
+						removeClient(client, windowRemovalUnhealthy)
 					}
 				} else {
 					previousCause, causeChanged := client.setWarning(false, warnNone)
@@ -13771,6 +13824,8 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 
+		warningTransitions.observe(windowClientStats, self.windowType, warnedClients)
+
 		collapseLowestWeighted := func(targetWindowSize int) {
 
 			n := (len(warnedClients) + len(clients)) - targetWindowSize
@@ -13779,28 +13834,9 @@ func (self *multiClientWindow) resize() {
 				if 0 < n && 0 < len(cs) {
 					m := min(len(cs), n)
 					if 0 < m {
+						// the tail is what is shed
 						slices.SortFunc(cs, func(a *multiClientChannel, b *multiClientChannel) int {
-							// dualstack exits are kept ahead of single-family
-							// ones (IPV6.md B2); the tail is what is shed
-							if c := collapseFamilyOrder(a, b); c != 0 {
-								return c
-							}
-							// descending weight
-							aWeight := weights[a]
-							bWeight := weights[b]
-							if aWeight < bWeight {
-								return 1
-							} else if bWeight < aWeight {
-								return -1
-							}
-							aDuration := durations[a]
-							bDuration := durations[b]
-							if aDuration < bDuration {
-								return 1
-							} else if bDuration < aDuration {
-								return -1
-							}
-							return 0
+							return collapseKeepOrder(a, b, weights, durations)
 						})
 
 						for _, client := range cs[len(cs)-m : len(cs)] {
@@ -13820,7 +13856,7 @@ func (self *multiClientWindow) resize() {
 								// own idiom: the flow count read takes the
 								// parent stateLock inside.
 								if self.collapseRemovalAllowed(client, durations[client]) {
-									removeClient(client)
+									removeClient(client, windowRemovalCollapse)
 								} else {
 									// collapse deferred: the capacity collapse
 									// would have destroyed live flows
@@ -13978,7 +14014,7 @@ func (self *multiClientWindow) resize() {
 						"action", "remove_idle",
 						"family", string(victim.IpFamily()),
 					))
-					removeClient(victim)
+					removeClient(victim, windowRemovalFamilySwap)
 					clients = slices.DeleteFunc(clients, func(c *multiClientChannel) bool { return c == victim })
 				} else {
 					// admit one over target and let the capacity collapse
@@ -14044,19 +14080,54 @@ func (self *multiClientWindow) resize() {
 		// first deferral.
 		var redialTime time.Time
 		redialDeferred := false
+		// A strict discovery window builds only what admission would accept
+		// now: at its hard max, one candidate for the slot a warned client
+		// hands over, or nothing (see
+		// ip_remote_multi_client_strict_handover.go). A pass that builds
+		// nothing attempted nothing, so the expansion backoff neither advances
+		// nor resets. Fixed destinations and non-strict windows are unbounded.
+		strictCapacity := math.MaxInt
+		var strictHandover *strictWindowHandover
 		if !fixedDestination {
 			self.noteDiscoveryClientCount(len(clients))
+			if len(clients) < targetWindowSize && self.strictWindowHandoverEnabled() {
+				strictCapacity = self.strictAdmissionCapacity(windowSize.WindowSizeHardMax)
+				// exactly at the hard max; above it, the capacity collapse
+				// below sheds clients and nothing is built
+				if strictCapacity == 0 {
+					strictHandover = self.selectStrictHandoverVictim(warnedClients, weights, durations)
+					if strictHandover != nil {
+						strictCapacity = 1
+					}
+				}
+			}
 		}
-		if len(clients) < targetWindowSize {
+		if len(clients) < targetWindowSize && strictCapacity <= 0 {
+			windowClientStats.addExpandPass(self.windowType, windowExpandPassSkippedStrictFull)
+		} else if len(clients) < targetWindowSize {
 			if fixedDestination {
 				redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
 			} else {
 				redialTime, redialDeferred = self.discoveryExpandDeferral(time.Now())
 			}
 		}
-		if len(clients) < targetWindowSize && !redialDeferred {
+		if len(clients) < targetWindowSize && redialDeferred {
+			windowClientStats.addExpandPass(self.windowType, windowExpandPassDeferred)
+		}
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred {
 			// expand
-			neededCount := targetWindowSize - len(clients)
+			expandPass := windowExpandPassPlan{
+				state: windowExpandPassStateOf(
+					len(clients),
+					len(clients)+len(warnedClients),
+					windowSizeMin,
+					self.settings.StrictWindowSizeHardMax,
+					windowSize.WindowSizeHardMax,
+				),
+				handover: strictHandover,
+			}
+			windowClientStats.addExpandPass(self.windowType, expandPass.state)
+			neededCount := min(targetWindowSize-len(clients), strictCapacity)
 			plannedAdmitCount, _ := multiClientExpandPlan(
 				neededCount,
 				self.reliabilitySettings().EvaluationPoolMultiple,
@@ -14076,7 +14147,15 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin,
 				neededCount,
 				ipv6Shortfall,
+				expandPass,
 			)
+			if strictHandover != nil && strictHandover.completed.Load() {
+				// the victim left the window in the swap; the rest of this
+				// pass sees it gone
+				warnedClients = slices.DeleteFunc(warnedClients, func(client *multiClientChannel) bool {
+					return client == strictHandover.victim
+				})
+			}
 			if !fixedDestination {
 				if 0 < addedCount {
 					self.noteDiscoveryExpandAdmitted()
@@ -14122,6 +14201,20 @@ func (self *multiClientWindow) resize() {
 				inactive,
 			)
 		}
+		if windowClientStats != nil {
+			selectableCount, installedCount := self.windowStateCounts(fixedDestination)
+			windowState := windowStateOf(
+				selectableCount,
+				installedCount,
+				targetWindowSize,
+				windowSizeMin,
+				fixedDestination,
+				self.settings.StrictWindowSizeHardMax,
+				windowSize.WindowSizeHardMax,
+			)
+			windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowState)
+			publishedWindowState = windowState
+		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
 		if redialDeferred {
@@ -14151,6 +14244,15 @@ func (self *multiClientWindow) resize() {
 type expandEvaluatedCandidate struct {
 	client *multiClientChannel
 	args   *multiClientChannelArgs
+}
+
+// What resize hands one expansion pass beyond its sizes: the window state the pass was started in, which labels the pass's
+// candidates in the process counters, and a strict window's handover.
+type windowExpandPassPlan struct {
+	state windowExpandPassState
+	// the warned client whose slot a strict window at its hard max hands to
+	// the candidate this pass admits; nil for every other pass
+	handover *strictWindowHandover
 }
 
 // multiClientExpandStepMax bounds every object-producing expansion pass, not
@@ -14212,7 +14314,9 @@ func (self *multiClientWindow) expand(
 	// while positive and unfilled, an evaluated candidate that can carry v6
 	// is admitted ahead of every other, as p2p-only candidates are preferred
 	ipv6Shortfall int,
+	pass windowExpandPassPlan,
 ) (returnPingSuccess int) {
+	windowClientStats := self.windowClientStats()
 	mutex := sync.Mutex{}
 	evaluationOwner := &multiClientEvaluationOwner{}
 	defer self.releaseOutcomeEvaluation(evaluationOwner)
@@ -14251,6 +14355,13 @@ func (self *multiClientWindow) expand(
 		self.reliabilitySettings().EvaluationPoolMultiple,
 		fixedDestination,
 	)
+	// a strict window's handover lasts as long as this pass, its final
+	// admissions included: registered before the terminal cleanup, so it is
+	// released after it
+	if pass.handover != nil {
+		self.reserveStrictHandover(pass.handover, evaluationOwner, requestCount)
+		defer self.releaseStrictHandover(pass.handover)
+	}
 
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
@@ -14327,9 +14438,57 @@ func (self *multiClientWindow) expand(
 				self.clientExtenderIps(existingClient),
 			)
 			self.noteRecentExitDropped(args, "declined")
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateDeclinedReplacement)
 			return false
 		}
-		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
+		// at its hard max a strict window admits only into the slot this
+		// pass's handover reserved (see strictWindowHandover)
+		admissible := self.strictWindowAdmissionAllowed(clientId, windowSize)
+		var strictHandover *strictWindowHandover
+		if !admissible {
+			strictHandover = self.takeStrictHandover(evaluationOwner)
+		}
+		if strictHandover != nil {
+			var beforeSwap func()
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				beforeSwap = self.beforeStrictHandoverSwapForTest
+			}()
+			if beforeSwap != nil {
+				beforeSwap()
+			}
+		}
+		var replacedClient *multiClientChannel
+		installed := false
+		if admissible || strictHandover != nil {
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if strictHandover != nil {
+					// the swap: the victim leaves and the candidate takes its
+					// slot in one section, so the installed count never
+					// leaves the hard max
+					if !self.strictHandoverSwappableWithLock(strictHandover) {
+						return
+					}
+					delete(self.clients, strictHandover.victim.ClientId())
+					strictHandover.completed.Store(true)
+				}
+				// re-read under the lock: the slot is installed against whatever
+				// is there NOW, so a concurrent remove/replace between the gate
+				// above and here can never leak an uncancelled channel
+				replacedClient = self.clients[clientId]
+				self.clients[clientId] = client
+				if self.resizeMonitor != nil {
+					self.resizeMonitor.NotifyAll()
+				}
+				// the client may already have sends outstanding
+				self.sendStallWake.signal()
+				installed = true
+			}()
+		}
+		if !installed {
 			self.log.Infof("%s\n", relEvent(
 				"expand_decline",
 				"exit", clientId,
@@ -14342,26 +14501,25 @@ func (self *multiClientWindow) expand(
 			client.Cancel()
 			self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 			self.noteRecentExitDropped(args, "declined")
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateDeclinedStrictCap)
 			return false
 		}
 
 		self.log.V(1).Infof("[multi]expand new client\n")
 
-		var replacedClient *multiClientChannel
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			// re-read under the lock: the slot is installed against whatever
-			// is there NOW, so a concurrent remove/replace between the gate
-			// above and here can never leak an uncancelled channel
-			replacedClient = self.clients[clientId]
-			self.clients[clientId] = client
-			if self.resizeMonitor != nil {
-				self.resizeMonitor.NotifyAll()
-			}
-			// the client may already have sends outstanding
-			self.sendStallWake.signal()
-		}()
+		if strictHandover != nil {
+			victim := strictHandover.victim
+			// the victim's ordinary removal, after the swap: its remaining
+			// flows move or end with it, and its channel cleanup retires it
+			victim.Close()
+			self.removeClients(victim)
+			windowClientStats.addRemoval(self.windowType, windowRemovalHandover)
+			self.log.Infof("%s\n", relEvent(
+				"handover",
+				"exit", victim.ClientId(),
+				"replacement", clientId,
+			))
+		}
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1
 			self.noteIpv6CandidateAdmitted()
@@ -14393,6 +14551,11 @@ func (self *multiClientWindow) expand(
 			self.clientAddCallback(client)
 		}
 		self.noteRecentExitAdmitted(args)
+		if strictHandover == nil {
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateAdmitted)
+		} else {
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateAdmittedHandover)
+		}
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true
 			self.noteFixedDestinationAdmitted(args.Destination)
@@ -14423,13 +14586,14 @@ func (self *multiClientWindow) expand(
 	// chosen), distinct from EvaluationFailed.
 	//
 	// must be called with mutex
-	cancelCandidate := func(candidate *expandEvaluatedCandidate) {
+	cancelCandidate := func(candidate *expandEvaluatedCandidate, outcome windowCandidateOutcome) {
 		// A successfully constructed channel owns its generator args. Its
 		// cancellation cleanup returns them through RemoveClientWithArgs after
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
 		self.monitor.AddProviderEventWithLocationMatch(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.LocationMatch, candidate.args.IpFamily, nil)
 		self.noteRecentExitDropped(candidate.args, "not_admitted")
+		windowClientStats.addCandidate(self.windowType, pass.state, outcome)
 	}
 
 	// admitPending admits from the evaluated pool while budget remains. Every
@@ -14484,7 +14648,7 @@ func (self *multiClientWindow) expand(
 		expandEnded = true
 		admitPending()
 		for _, candidate := range pending {
-			cancelCandidate(candidate)
+			cancelCandidate(candidate, windowCandidateNotAdmittedSurplus)
 		}
 		pending = nil
 		// The pass deadline is an ownership boundary, not merely a return to
@@ -14719,6 +14883,11 @@ requestCandidates:
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
 				self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
+				setupOutcome := windowCandidateFailedSetup
+				if evaluationCtx.Err() != nil {
+					setupOutcome = windowCandidateCanceled
+				}
+				windowClientStats.addCandidate(self.windowType, pass.state, setupOutcome)
 			} else if client.dataOnlyProviderProbe {
 				// Registered construction is sufficient to select this explicit
 				// provider. The application's DNS/URL exchange owns qualification;
@@ -14726,7 +14895,7 @@ requestCandidates:
 				mutex.Lock()
 				candidate := &expandEvaluatedCandidate{client: client, args: args}
 				if self.ctx.Err() != nil || evaluationCtx.Err() != nil || client.IsDone() {
-					cancelCandidate(candidate)
+					cancelCandidate(candidate, windowCandidateCanceled)
 				} else {
 					added += 1
 					if client.IsP2pOnly() {
@@ -14776,6 +14945,11 @@ requestCandidates:
 					}
 
 					providerFailure = providerFailure && evaluationCtx.Err() == nil
+					// read before our own cancellation releases a contract wait
+					failureOutcome := windowCandidateFailureOutcome(
+						outcome == initialPingCanceled || evaluationCtx.Err() != nil || self.ctx.Err() != nil,
+						args.providerEvaluation.localContractUnavailable(),
+					)
 					pingCancel()
 					// The channel cleanup owns the generator args and preserves the
 					// derived identity through its final contract-close controls.
@@ -14789,6 +14963,7 @@ requestCandidates:
 						self.noteIpv6CandidateFailed()
 					}
 					self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
+					windowClientStats.addCandidate(self.windowType, pass.state, failureOutcome)
 					return true
 				}
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
@@ -14972,7 +15147,7 @@ requestCandidates:
 									// branch is reachable only when its callback crossed
 									// the terminal mutex boundary before cleanup canceled
 									// the unresolved ping.
-									cancelCandidate(candidate)
+									cancelCandidate(candidate, windowCandidateNotAdmittedSurplus)
 								} else {
 									pending = append(pending, candidate)
 									admitPending()
@@ -15759,11 +15934,13 @@ func (self *multiClientWindow) Close() {
 			}
 		}
 	}()
+	windowClientStats := self.windowClientStats()
 	for _, client := range removedClients {
 		client.Close()
 		if self.clientRetireCallback != nil {
 			self.clientRetireCallback(client)
 		}
+		windowClientStats.addRemoval(self.windowType, windowRemovalClosed)
 	}
 	// a closed window re-forms nothing; a new destination builds new windows
 	self.logRecentExitsForgotten(self.recentExits.Forget(), "close")
