@@ -190,7 +190,8 @@ func TestDialRetryAfterSourceAnchor(t *testing.T) {
 		if !ok {
 			t.Fatalf("could not find %s", signature)
 		}
-		if !strings.Contains(body, "case <-self.dialRetryAfter(reconnect):") {
+		// the wait also ends on a kick or a hold (waitDial)
+		if !strings.Contains(body, "self.dialRetryAfter(reconnect)") {
 			t.Errorf("%s does not back off after a failed dial", signature)
 		}
 	}

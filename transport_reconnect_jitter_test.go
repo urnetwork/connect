@@ -2,7 +2,7 @@ package connect
 
 import (
 	"context"
-	"strings"
+	"crypto/tls"
 	"sync"
 	"testing"
 	"time"
@@ -14,16 +14,20 @@ import (
 // drops. A connection that ran and died without a network change kick was
 // re-dialed within the strategy's 250 ms fast-path jitter, and a pinned
 // transport's at once, so the fleet re-dialed in lockstep. These tests pin the
-// spread of that re-dial over [0, ReconnectJitter).
+// spread of that re-dial over [0, ReconnectJitter). The spread's interplay
+// with the transport's holds and the strategy's pacing is in
+// transport_redial_hold_test.go.
 
-// A transport whose re-dial pacing is the spread alone: the strategy's own
-// fast-path jitter is zero, and `draw` replaces the spread's uniform draw.
+// A transport whose pacing a test reads through a recorder of its pre-dial
+// waits: the strategy's own fast-path jitter is zero, so a re-dial's waits are
+// the spread and a pinned transport's backoff alone, and `draw` replaces the
+// spread's uniform draw. Each wait ends at once.
 func newReconnectJitterTestTransport(
 	t *testing.T,
 	ipFamily int,
 	maxJitter time.Duration,
 	draw func(maxJitter time.Duration) time.Duration,
-) *PlatformTransport {
+) (*PlatformTransport, *testingPacingWaits) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -31,29 +35,49 @@ func newReconnectJitterTestTransport(
 	strategySettings.ReconnectFastPathMaxDelay = 0
 	strategy := NewClientStrategy(ctx, strategySettings)
 	t.Cleanup(strategy.Close)
+	waits := newTestingPacingWaits(strategy, false)
 	settings := DefaultPlatformTransportSettings()
 	settings.ReconnectJitter = maxJitter
 	settings.reconnectJitterForTest = draw
+	settings.pacingAfterForTest = waits.after
 	return &PlatformTransport{
+		ctx:            ctx,
 		log:            NewNoopLogger(),
 		settings:       settings,
 		clientStrategy: strategy,
 		ipFamily:       ipFamily,
 		pinnedBackoff:  newPinnedDialBackoff(time.Second, time.Minute),
 		failBackoff:    newDialFailureBackoff(time.Second, time.Minute),
-	}
+		kickMonitor:    NewMonitor(),
+	}, waits
 }
 
-// The lead of one dial's pacing over the nextDialTime call that drew it: the
-// dial time less the instant the call returned, and less the instant it
-// began. The pacing the call drew lies between the two.
-func testingDialLead(transport *PlatformTransport, hadConnection bool, afterKick bool) (minLead time.Duration, maxLead time.Duration) {
-	before := time.Now()
-	connectTime, releaseReconnect, cancelConnect := transport.nextDialTime(hadConnection, afterKick)
-	after := time.Now()
+// The pre-dial waits of one pacing, which a recorder that ends every wait at
+// once lets run to its end. The pacing's release is called, as after a dial.
+func testingDialPacingWaits(
+	t *testing.T,
+	transport *PlatformTransport,
+	waits *testingPacingWaits,
+	hadConnection bool,
+	afterKick bool,
+) []time.Duration {
+	t.Helper()
+	kickGeneration := transport.kickGeneration.Load()
+	pacing, releaseReconnect, _ := transport.waitDialPacing(transport.ctx, hadConnection, afterKick, &kickGeneration)
+	if pacing != dialWaitElapsed {
+		t.Fatalf("pacing ended with %d, want the waits to elapse", pacing)
+	}
 	releaseReconnect()
-	cancelConnect()
-	return connectTime.Sub(after), connectTime.Sub(before)
+	delays := []time.Duration{}
+	for {
+		select {
+		case wait := <-waits.waits:
+			delays = append(delays, wait.delay)
+			continue
+		default:
+		}
+		return delays
+	}
 }
 
 // A recorded sequence of spread draws. Each draw returns the next value and
@@ -98,20 +122,39 @@ func requireDrawWindows(t *testing.T, draws *testingJitterDraws, count int, maxJ
 	}
 }
 
+// The waits a re-dial with the spread `spread` must make: the spread, which is
+// no wait when it is zero, then `rest`.
+func testingSpreadWaits(spread time.Duration, rest ...time.Duration) []time.Duration {
+	waits := []time.Duration{}
+	if 0 < spread {
+		waits = append(waits, spread)
+	}
+	return append(waits, rest...)
+}
+
+func requireWaits(t *testing.T, label string, waits []time.Duration, want []time.Duration) {
+	t.Helper()
+	if len(waits) != len(want) {
+		t.Fatalf("%s: pre-dial waits %v, want %v", label, waits, want)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("%s: pre-dial waits %v, want %v", label, waits, want)
+		}
+	}
+}
+
 // The root cause: a family-agnostic transport re-dialed a lost connection on
-// the strategy's fast path alone. Its lead is now the spread's draw, across the
-// whole window.
+// the strategy's fast path alone. It now waits the spread's draw first, across
+// the whole window.
 func TestLostConnectionRedialSpreadsOverReconnectJitter(t *testing.T) {
 	const maxJitter = 8 * time.Second
 	values := []time.Duration{0, maxJitter / 4, maxJitter / 2, 3 * maxJitter / 4, maxJitter - 1}
 	draws := newTestingJitterDraws(values...)
-	transport := newReconnectJitterTestTransport(t, 0, maxJitter, draws.draw)
+	transport, waits := newReconnectJitterTestTransport(t, 0, maxJitter, draws.draw)
 
 	for _, value := range values {
-		minLead, maxLead := testingDialLead(transport, true, false)
-		if value < minLead || maxLead < value {
-			t.Fatalf("re-dial lead in [%s, %s], want the spread's draw %s", minLead, maxLead, value)
-		}
+		requireWaits(t, "re-dial", testingDialPacingWaits(t, transport, waits, true, false), testingSpreadWaits(value))
 	}
 	requireDrawWindows(t, draws, len(values), maxJitter)
 }
@@ -124,33 +167,32 @@ func TestPinnedLostConnectionRedialSpreadsOverReconnectJitter(t *testing.T) {
 	values := []time.Duration{0, maxJitter / 3, 2 * maxJitter / 3, maxJitter - 1}
 	for _, ipFamily := range []int{4, 6} {
 		draws := newTestingJitterDraws(values...)
-		transport := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
+		transport, waits := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
 		for _, value := range values {
-			minLead, maxLead := testingDialLead(transport, true, false)
-			if value < minLead || maxLead < value {
-				t.Fatalf("ipv%d re-dial lead in [%s, %s], want the spread's draw %s", ipFamily, minLead, maxLead, value)
-			}
+			requireWaits(t, "pinned re-dial", testingDialPacingWaits(t, transport, waits, true, false), testingSpreadWaits(value))
 		}
 		requireDrawWindows(t, draws, len(values), maxJitter)
 	}
 }
 
-// The spread adds to a pinned transport's backoff rather than replacing it.
+// The spread comes before a pinned transport's backoff rather than replacing
+// it.
 func TestPinnedLostConnectionRedialKeepsItsBackoff(t *testing.T) {
 	const maxJitter = 8 * time.Second
 	const spread = 3 * time.Second
 	draws := newTestingJitterDraws(spread)
-	transport := newReconnectJitterTestTransport(t, 4, maxJitter, draws.draw)
+	transport, waits := newReconnectJitterTestTransport(t, 4, maxJitter, draws.draw)
 	// one failure: a backoff in [base/2, base) of the pinned base, 1 s
 	transport.pinnedBackoff.fail()
 
-	minLead, maxLead := testingDialLead(transport, true, false)
-	if maxLead < spread+500*time.Millisecond || spread+time.Second <= minLead {
-		t.Fatalf("re-dial lead in [%s, %s], want the spread %s plus a backoff in [500ms, 1s)", minLead, maxLead, spread)
+	delays := testingDialPacingWaits(t, transport, waits, true, false)
+	if len(delays) != 2 || delays[0] != spread || delays[1] < 450*time.Millisecond || time.Second <= delays[1] {
+		t.Fatalf("pre-dial waits %v, want the spread %s, then a backoff in [500ms, 1s)", delays, spread)
 	}
 }
 
-// The cap holds: a draw outside the window is held to [0, ReconnectJitter).
+// The cap holds: a draw outside the window is held to [0, ReconnectJitter),
+// and the production draw never reaches the cap.
 func TestReconnectJitterDrawHoldsItsWindow(t *testing.T) {
 	const maxJitter = 8 * time.Second
 	for _, c := range []struct {
@@ -161,23 +203,19 @@ func TestReconnectJitterDrawHoldsItsWindow(t *testing.T) {
 		{maxJitter, maxJitter - 1},
 		{10 * maxJitter, maxJitter - 1},
 	} {
-		draws := newTestingJitterDraws(c.draw)
 		for _, ipFamily := range []int{0, 4} {
-			transport := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
-			minLead, maxLead := testingDialLead(transport, true, false)
-			if c.want < minLead || maxLead < c.want {
-				t.Fatalf("ipv%d draw %s: re-dial lead in [%s, %s], want %s", ipFamily, c.draw, minLead, maxLead, c.want)
-			}
+			transport, waits := newReconnectJitterTestTransport(t, ipFamily, maxJitter, newTestingJitterDraws(c.draw).draw)
+			requireWaits(t, "held draw", testingDialPacingWaits(t, transport, waits, true, false), testingSpreadWaits(c.want))
 		}
 	}
 
-	// the production draw never reaches the cap
 	for _, ipFamily := range []int{0, 4} {
-		transport := newReconnectJitterTestTransport(t, ipFamily, maxJitter, nil)
+		transport, waits := newReconnectJitterTestTransport(t, ipFamily, maxJitter, nil)
 		for i := 0; i < 1000; i += 1 {
-			minLead, maxLead := testingDialLead(transport, true, false)
-			if maxJitter <= minLead || maxLead < 0 {
-				t.Fatalf("ipv%d re-dial lead in [%s, %s], want a draw in [0, %s)", ipFamily, minLead, maxLead, maxJitter)
+			for _, delay := range testingDialPacingWaits(t, transport, waits, true, false) {
+				if delay < 0 || maxJitter <= delay {
+					t.Fatalf("ipv%d re-dial spread %s, want in [0, %s)", ipFamily, delay, maxJitter)
+				}
 			}
 		}
 	}
@@ -189,17 +227,46 @@ func TestKickAndColdDialsTakeNoReconnectJitter(t *testing.T) {
 	const maxJitter = 8 * time.Second
 	for _, ipFamily := range []int{0, 4, 6} {
 		draws := newTestingJitterDraws(maxJitter - 1)
-		transport := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
+		transport, waits := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
 
-		// a drawn spread would lead by maxJitter-1; none leads by about zero
-		if _, maxLead := testingDialLead(transport, true, true); maxJitter/2 <= maxLead {
-			t.Fatalf("ipv%d kick re-dial lead %s, want the fast path", ipFamily, maxLead)
-		}
+		requireWaits(t, "kick re-dial", testingDialPacingWaits(t, transport, waits, true, true), nil)
 		// the first cold dial clamps the staircase to now
-		if _, maxLead := testingDialLead(transport, false, false); maxJitter/2 <= maxLead {
-			t.Fatalf("ipv%d cold dial lead %s, want the staircase", ipFamily, maxLead)
-		}
+		requireWaits(t, "cold dial", testingDialPacingWaits(t, transport, waits, false, false), nil)
 		requireDrawWindows(t, draws, 0, maxJitter)
+	}
+}
+
+// A kick during the spread ends it, and the re-dial takes the kick's path at
+// once rather than waiting out the rest of the spread.
+func TestKickDuringRedialSpreadRedialsOnTheKickPath(t *testing.T) {
+	const maxJitter = 8 * time.Second
+	transport, waits := newReconnectJitterTestTransport(t, 0, maxJitter, newTestingJitterDraws(maxJitter-1).draw)
+	waits.hold.Store(true)
+
+	kickGeneration := transport.kickGeneration.Load()
+	type result struct {
+		pacing  dialWait
+		release func()
+	}
+	done := make(chan result, 1)
+	go func() {
+		pacing, releaseReconnect, _ := transport.waitDialPacing(transport.ctx, true, false, &kickGeneration)
+		done <- result{pacing: pacing, release: releaseReconnect}
+	}()
+	spreadWait := waits.next(t)
+	AssertEqual(t, spreadWait.delay, maxJitter-1)
+	transport.Kick()
+	select {
+	case r := <-done:
+		if r.pacing == dialWaitHeld || r.pacing == dialWaitClosed {
+			t.Fatalf("pacing ended with %d after a kick, want a dial", r.pacing)
+		}
+		r.release()
+	case <-time.After(15 * time.Second):
+		t.Fatal("a kick did not end the re-dial spread")
+	}
+	if kickGeneration != transport.kickGeneration.Load() {
+		t.Fatal("the pacing did not take the kick it ended on")
 	}
 }
 
@@ -208,10 +275,8 @@ func TestReconnectJitterNonPositiveRedialsOnPacingAlone(t *testing.T) {
 	for _, maxJitter := range []time.Duration{0, -time.Second} {
 		for _, ipFamily := range []int{0, 4} {
 			draws := newTestingJitterDraws(time.Hour)
-			transport := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
-			if _, maxLead := testingDialLead(transport, true, false); time.Minute <= maxLead {
-				t.Fatalf("ipv%d ReconnectJitter %s: re-dial lead %s, want none", ipFamily, maxJitter, maxLead)
-			}
+			transport, waits := newReconnectJitterTestTransport(t, ipFamily, maxJitter, draws.draw)
+			requireWaits(t, "re-dial", testingDialPacingWaits(t, transport, waits, true, false), nil)
 			requireDrawWindows(t, draws, 0, maxJitter)
 		}
 	}
@@ -219,28 +284,6 @@ func TestReconnectJitterNonPositiveRedialsOnPacingAlone(t *testing.T) {
 
 func TestDefaultReconnectJitter(t *testing.T) {
 	AssertEqual(t, DefaultPlatformTransportSettings().ReconnectJitter, 5*time.Second)
-}
-
-// Both mode runners take their dial pacing from nextDialTime, so the H3 modes
-// spread a lost connection's re-dial as H1 does. The H1 runner is driven end
-// to end below.
-func TestRunnersPaceDialsThroughNextDialTime(t *testing.T) {
-	source, err := readSource("transport.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, signature := range []string{
-		"func (self *PlatformTransport) runH1(",
-		"func (self *PlatformTransport) runH3(",
-	} {
-		body, ok := functionBody(source, signature)
-		if !ok {
-			t.Fatalf("could not find %s", signature)
-		}
-		if !strings.Contains(body, "self.nextDialTime(hadConnection, afterKick)") {
-			t.Errorf("%s does not pace its dials through nextDialTime", signature)
-		}
-	}
 }
 
 // The spread reaches the real H1 runner: after the platform closes a live
@@ -260,22 +303,14 @@ func TestPlatformTransportRedialAfterPlatformCloseWaitsItsReconnectJitter(t *tes
 	connections := observeTestingTransportConnections(settings)
 	transport := testingPlatformTransport(t, ctx, platform.url, settings)
 
-	if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
-		return 1 <= counts.connected
-	}); !ok {
-		t.Fatal("the transport never connected")
-	}
+	waitTestingConnected(t, connections, 1)
 	// the first dial is cold: no spread
 	requireDrawWindows(t, draws, 0, maxJitter)
 
 	// the platform restarts: it closes every live connection
 	closeTime := time.Now()
 	platform.closeConns()
-	if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
-		return 2 <= counts.connected
-	}); !ok {
-		t.Fatal("the transport never re-dialed after the platform closed its connection")
-	}
+	waitTestingConnected(t, connections, 2)
 	if elapsed := time.Since(closeTime); elapsed < spread {
 		t.Fatalf("re-dialed %s after the platform closed the connection, want at least the %s spread", elapsed, spread)
 	}
@@ -283,11 +318,7 @@ func TestPlatformTransportRedialAfterPlatformCloseWaitsItsReconnectJitter(t *tes
 
 	// a kick is this device's own event: its re-dial draws no spread
 	transport.Kick()
-	if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
-		return 3 <= counts.connected
-	}); !ok {
-		t.Fatal("the transport never re-dialed after a kick")
-	}
+	waitTestingConnected(t, connections, 3)
 	requireDrawWindows(t, draws, 1, maxJitter)
 }
 
@@ -309,20 +340,12 @@ func TestPinnedTransportRedialAfterPlatformCloseWaitsItsReconnectJitter(t *testi
 	transport := newTestingPinnedTransport(t, ctx, clientSettings, platform.dualStackURL(), 4, settings)
 
 	receiveFamilyConnection(t, platform, 15*time.Second)
-	if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
-		return 1 <= counts.connected
-	}); !ok {
-		t.Fatal("the pinned transport never connected")
-	}
+	waitTestingConnected(t, connections, 1)
 	requireDrawWindows(t, draws, 0, maxJitter)
 
 	closeTime := time.Now()
 	platform.closeConns()
-	if _, ok := waitTestingTransportConnections(connections, 15*time.Second, func(counts testingTransportConnectionCounts) bool {
-		return 2 <= counts.connected
-	}); !ok {
-		t.Fatal("the pinned transport never re-dialed after the platform closed its connection")
-	}
+	waitTestingConnected(t, connections, 2)
 	if elapsed := time.Since(closeTime); elapsed < spread {
 		t.Fatalf("re-dialed %s after the platform closed the connection, want at least the %s spread", elapsed, spread)
 	}
@@ -330,4 +353,56 @@ func TestPinnedTransportRedialAfterPlatformCloseWaitsItsReconnectJitter(t *testi
 	if transport.IpFamily() != 4 {
 		t.Fatalf("IpFamily = %d, want 4", transport.IpFamily())
 	}
+}
+
+// The same for the H3 runner: the platform ends the QUIC connection with an
+// ordinary close, and the re-dial waits out the spread it drew.
+func TestPlatformTransportH3RedialAfterPlatformCloseWaitsItsReconnectJitter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const maxJitter = 10 * time.Second
+	const spread = 700 * time.Millisecond
+	platform := newTestingClientLimitH3Platform(t)
+	settings := testingFamilyTransportSettings()
+	settings.H3Port = platform.port
+	settings.QuicConnectTimeout = 2 * time.Second
+	settings.QuicHandshakeTimeout = 2 * time.Second
+	settings.QuicTlsConfig = &tls.Config{
+		InsecureSkipVerify: true, // test-only self-signed endpoint
+		NextProtos:         []string{platform.nextProto},
+	}
+	settings.FramerSettings = platform.framerSets
+	settings.ReconnectJitter = maxJitter
+	draws := newTestingJitterDraws(spread)
+	settings.reconnectJitterForTest = draws.draw
+	connections := observeTestingTransportConnections(settings)
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategy := NewClientStrategy(ctx, strategySettings)
+	defer strategy.Close()
+	transport := NewPlatformTransportWithTargetMode(
+		ctx,
+		strategy,
+		NewRouteManager(ctx, "redial-h3"),
+		"https://"+testLoopbackHost(4),
+		&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+		TransportModeH3,
+		settings,
+	)
+	defer transport.Close()
+
+	conn := platform.nextConnection(t)
+	waitTestingConnected(t, connections, 1)
+	requireDrawWindows(t, draws, 0, maxJitter)
+
+	closeTime := time.Now()
+	conn.CloseWithError(0, "platform restart")
+	platform.nextConnection(t)
+	waitTestingConnected(t, connections, 2)
+	if elapsed := time.Since(closeTime); elapsed < spread {
+		t.Fatalf("re-dialed %s after the platform closed the connection, want at least the %s spread", elapsed, spread)
+	}
+	requireDrawWindows(t, draws, 1, maxJitter)
 }

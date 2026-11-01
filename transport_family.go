@@ -459,12 +459,25 @@ func (self *PlatformTransport) updateHold() {
 // (transport_client_limit.go), or by a hold on its refused credential
 // (transport_credential_refusal.go). False means the transport is closing.
 func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
+	admitted, _ := self.waitDialAdmissionParked(ctx)
+	return admitted
+}
+
+// waitDialAdmissionParked is waitDialAdmission that also reports whether the
+// runner parked on a hold. A dial after a park is a fresh start, not a lost
+// connection's re-dial: the hold, not the platform, ended the connection or
+// held back the dial, and holds end per device (see nextDialTime).
+func (self *PlatformTransport) waitDialAdmissionParked(ctx context.Context) (admitted bool, parked bool) {
 	for {
 		held, notify := self.held.Get()
 		if held {
+			parked = true
+			if self.settings.heldParkForTest != nil {
+				self.settings.heldParkForTest()
+			}
 			select {
 			case <-ctx.Done():
-				return false
+				return false, parked
 			case <-notify:
 			}
 			continue
@@ -472,8 +485,9 @@ func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 		clientLimitStatus, clientLimitNotify := self.clientLimitHold()
 		credentialRefused, credentialRefusalNotify := self.credentialRefused()
 		if !clientLimitStatus.Exceeded && !credentialRefused {
-			return true
+			return true, parked
 		}
+		parked = true
 		if clientLimitStatus.Exceeded && self.settings.clientLimitHoldForTest != nil {
 			self.settings.clientLimitHoldForTest()
 		}
@@ -483,12 +497,17 @@ func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 		// a change of any hold re-runs every check
 		select {
 		case <-ctx.Done():
-			return false
+			return false, parked
 		case <-notify:
 		case <-clientLimitNotify:
 		case <-credentialRefusalNotify:
 		}
 	}
+}
+
+// heldNow reports whether the owner or the pinned family holds the transport.
+func (self *PlatformTransport) heldNow() bool {
+	return self.held != nil && self.held.Value()
 }
 
 // heldNotify returns the current hold and the channel that closes when it
@@ -574,32 +593,22 @@ func (self *PlatformTransport) authIntent() int32 {
 // the transports themselves, so it takes the fast path's jitter on its own,
 // larger cap (KickReconnectLimit).
 //
-// A re-dial after a connection that ran and died without a kick waits a
-// further draw over [0, ReconnectJitter), pinned or not. Its connection may
-// have died with every other client's in a platform restart, and the fast
-// path's 250 ms jitter, or a pinned transport's zero backoff after a success,
-// re-dialed the whole fleet in the same instant.
+// The release frees a fast-path slot once the dial attempt completes. The
+// cancel gives a staircase step back when the wait ends before the dial, and
+// must not be called once the dial proceeds. A lost connection's spread is
+// not part of this pacing: waitDialPacing waits it out first.
 func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
-	releaseReconnect = func() {}
-	cancelConnect = func() {}
-	reconnectJitter := time.Duration(0)
-	if hadConnection && !afterKick {
-		reconnectJitter = self.reconnectJitter()
-	}
 	if self.pinned() {
-		return time.Now().Add(self.pinnedBackoff.delay() + reconnectJitter), releaseReconnect, cancelConnect
+		return time.Now().Add(self.pinnedBackoff.delay()), func() {}, func() {}
 	}
 	if afterKick {
-		connectTime, releaseReconnect = self.clientStrategy.NextKickReconnectTime()
-		return connectTime, releaseReconnect, cancelConnect
+		return self.clientStrategy.nextKickReconnectTime()
 	}
 	if hadConnection {
-		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
-		connectTime = connectTime.Add(reconnectJitter)
-	} else {
-		connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
+		return self.clientStrategy.nextReconnectTime()
 	}
-	return connectTime, releaseReconnect, cancelConnect
+	connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
+	return connectTime, func() {}, cancelConnect
 }
 
 // reconnectJitter is one draw of a lost connection's re-dial spread, uniform
@@ -610,6 +619,113 @@ func (self *PlatformTransport) reconnectJitter() time.Duration {
 		return 0
 	}
 	return uniformJitter(self.settings.ReconnectJitter, self.settings.reconnectJitterForTest)
+}
+
+// dialWait is how one of a mode runner's waits ended.
+type dialWait int
+
+const (
+	// the wait ran out
+	dialWaitElapsed dialWait = iota
+	// a network change kick landed after the runner's kick generation
+	dialWaitKicked
+	// the owner or the pinned family holds the transport: the runner goes
+	// back to admission, and its next dial is a fresh start
+	dialWaitHeld
+	// the runner's context ended
+	dialWaitClosed
+)
+
+// waitDial waits for `after` unless the runner's context ends, a kick lands
+// after `kickGeneration`, or the transport is or becomes held. The kick
+// monitor fires both for a kick and when the transport becomes held
+// (updateHold), so a wake without a kick is a hold. The subscription comes
+// before the reads, so a kick or a hold that lands as the wait begins is seen.
+func (self *PlatformTransport) waitDial(ctx context.Context, after <-chan time.Time, kickGeneration uint64) dialWait {
+	kick := self.kickedSince(kickGeneration)
+	if self.kicked(kickGeneration) {
+		return dialWaitKicked
+	}
+	if self.heldNow() {
+		return dialWaitHeld
+	}
+	select {
+	case <-ctx.Done():
+		return dialWaitClosed
+	case <-kick:
+		if self.kicked(kickGeneration) {
+			return dialWaitKicked
+		}
+		return dialWaitHeld
+	case <-after:
+		return dialWaitElapsed
+	}
+}
+
+// pacingAfter is the timer of a pre-dial wait.
+func (self *PlatformTransport) pacingAfter(delay time.Duration) <-chan time.Time {
+	if self.settings != nil && self.settings.pacingAfterForTest != nil {
+		return self.settings.pacingAfterForTest(delay)
+	}
+	return time.After(delay)
+}
+
+// waitDialPacing waits out the pacing before a dial. A connection that ran
+// and died without a kick may have died with every other client's in a
+// platform restart, so its re-dial first waits a draw over
+// [0, ReconnectJitter), pinned or not. Before the spread, the fast path's
+// 250 ms jitter, or a pinned transport's zero backoff after a success,
+// re-dialed the whole fleet in the same instant. The spread comes before the
+// strategy's pacing (nextDialTime), so no fast-path slot or staircase step is
+// held through it, and a staircase lead is never stacked on it.
+//
+// A kick during the spread re-dials at once on the kick's path. A kick during
+// the strategy's pacing dials at once, without the pacing the old path
+// earned, as before. A hold during either gives the pacing back and returns
+// dialWaitHeld, so the runner runs admission again instead of dialing while
+// held.
+//
+// On dialWaitElapsed or dialWaitKicked the runner dials, calls release once
+// the dial attempt completes, and calls cancel instead if it gives up before
+// dialing. On dialWaitHeld or dialWaitClosed both were already called.
+// `kickGeneration` advances past a kick the wait consumed.
+func (self *PlatformTransport) waitDialPacing(
+	ctx context.Context,
+	hadConnection bool,
+	afterKick bool,
+	kickGeneration *uint64,
+) (wait dialWait, releaseReconnect func(), cancelConnect func()) {
+	noop := func() {}
+	if hadConnection && !afterKick {
+		if reconnectJitter := self.reconnectJitter(); 0 < reconnectJitter {
+			switch spreadWait := self.waitDial(ctx, self.pacingAfter(reconnectJitter), *kickGeneration); spreadWait {
+			case dialWaitHeld, dialWaitClosed:
+				return spreadWait, noop, noop
+			case dialWaitKicked:
+				// the network changed: re-dial over the new path now
+				self.noteKick()
+				*kickGeneration = self.kickGeneration.Load()
+				afterKick = true
+			}
+		}
+	}
+	connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick)
+	if connectDelay := time.Until(connectTime); 0 < connectDelay {
+		switch pacingWait := self.waitDial(ctx, self.pacingAfter(connectDelay), *kickGeneration); pacingWait {
+		case dialWaitHeld, dialWaitClosed:
+			releaseReconnect()
+			cancelConnect()
+			return pacingWait, noop, noop
+		case dialWaitKicked:
+			// network changed while waiting to dial: any pacing computed for
+			// the old path is meaningless. Dial now over the new one, without
+			// the backoff the old path earned.
+			self.noteKick()
+			*kickGeneration = self.kickGeneration.Load()
+			return dialWaitKicked, releaseReconnect, cancelConnect
+		}
+	}
+	return dialWaitElapsed, releaseReconnect, cancelConnect
 }
 
 // noteDialFailure records a failed connect. A pinned transport's failure is
