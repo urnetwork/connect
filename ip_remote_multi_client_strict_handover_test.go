@@ -1025,3 +1025,141 @@ func TestStrictHandoverVictimEndedBeforeTheSwapIsRemovedByItsError(t *testing.T)
 		AssertEqual(t, selectableCount, 5)
 	})
 }
+
+// The window closes while a handover pass is between evaluation and the
+// swap: nothing is installed into the closed window, the candidate is
+// declined, and the pass and its reservation end with it. The review's A4.
+func TestStrictHandoverWindowClosesBeforeTheSwap(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, _, stats := newWindowStatsTestHarness(t)
+		window := h.multiClient.windows[WindowTypeQuality]
+		h.sleep(time.Second)
+		drained := h.liveChannels()[0]
+		var closed atomic.Bool
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			window.beforeStrictHandoverSwapForTest = func() {
+				if closed.CompareAndSwap(false, true) {
+					done := make(chan struct{})
+					go func() {
+						defer close(done)
+						h.multiClient.Close()
+					}()
+					<-done
+				}
+			}
+		}()
+		ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+		h.sleep(40 * time.Second)
+
+		if !closed.Load() {
+			t.Fatal("no handover swap was attempted")
+		}
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			AssertEqual(t, len(window.clients), 0)
+			if window.strictPass != nil {
+				t.Fatal("the pass and its reservation outlived the closed window")
+			}
+		}()
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), uint64(0))
+		AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalHandover].Load(), uint64(0))
+	})
+}
+
+// A victim that gains a flow after the pass chose it (here while the
+// candidate is constructed) keeps its slot: admission re-checks the flow half
+// of the collapse test and declines the candidate. The flow is recorded in
+// the parent's flow bookkeeping, which the window's flow count reads. The
+// review's A7.
+func TestStrictHandoverVictimGainsAFlowAfterSelection(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, generator, stats := newWindowStatsTestHarness(t)
+		window := h.multiClient.windows[WindowTypeQuality]
+		h.sleep(time.Second)
+		drained := h.liveChannels()[0]
+		gained := newMultiClientChannelUpdate(h.ctx, unboundFlowTcpPath(52990))
+		var gainedFlow atomic.Bool
+		setGained := func(present bool) {
+			h.multiClient.stateLock.Lock()
+			defer h.multiClient.stateLock.Unlock()
+			updates, ok := h.multiClient.clientUpdates[drained]
+			if !ok {
+				updates = map[*multiClientChannelUpdate]bool{}
+				h.multiClient.clientUpdates[drained] = updates
+			}
+			if present {
+				updates[gained] = true
+			} else {
+				delete(updates, gained)
+			}
+		}
+		func() {
+			generator.mutex.Lock()
+			defer generator.mutex.Unlock()
+			generator.configureNewClient = func(*MultiClientGeneratorClientArgs, *ClientSettings) {
+				if gainedFlow.CompareAndSwap(false, true) {
+					setGained(true)
+				}
+			}
+		}()
+		ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+		h.sleep(30 * time.Second)
+
+		if !gainedFlow.Load() {
+			t.Fatal("no candidate was built")
+		}
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), uint64(0))
+		AssertEqual(t, windowStatsCandidates(stats, windowExpandPassStrictHole, windowCandidateDeclinedStrictCap), uint64(1))
+		if !strictHandoverTestInstalled(window, drained) || drained.IsDone() {
+			t.Fatal("a victim that gained a flow after selection was swapped out")
+		}
+		setGained(false)
+		gained.Close()
+	})
+}
+
+// A handover pass runs no capacity collapse: the swap keeps the window at its
+// hard max, so a second drained client that still carries a flow, and sorts
+// at the collapse's tail, is not judged again by a collapse that would only
+// defer it. Kills the review's mutant M3 (keeping the victim in the pass's
+// warned clients), which the collapse order masks when the victim is the
+// tail.
+func TestStrictWindowHandoverRunsNoCollapse(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, _, stats := newWindowStatsTestHarness(t)
+		window := h.multiClient.windows[WindowTypeQuality]
+		path, carrying := bindStrictHandoverTestFlow(t, h, 5)
+		var flowless *multiClientChannel
+		for _, client := range h.liveChannels() {
+			if client != carrying {
+				flowless = client
+				break
+			}
+		}
+		// the flow goes idle, so both stats windows empty
+		h.sleep(31 * time.Second)
+		// the flowless client is the older, so the collapse order (descending
+		// duration) puts the carrying client at its tail
+		ageWindowClientForTest(flowless, time.Minute, 3*time.Minute)
+		ageWindowClientForTest(carrying, time.Minute, 2*time.Minute)
+		h.sleep(20 * time.Second)
+
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), uint64(1))
+		if strictHandoverTestInstalled(window, flowless) {
+			t.Fatal("the flowless drained client kept its slot")
+		}
+		if !strictHandoverTestInstalled(window, carrying) || h.boundTo(path) != carrying {
+			t.Fatal("the drained client carrying a flow lost its slot or its flow")
+		}
+		AssertEqual(t, len(h.log.linesWith("event=collapse_defer")), 0)
+		AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalCollapse].Load(), uint64(0))
+		installedCount, _ := strictHandoverTestCounts(window)
+		AssertEqual(t, installedCount, 5)
+	})
+}
