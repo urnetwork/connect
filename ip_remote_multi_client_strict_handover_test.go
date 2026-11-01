@@ -121,6 +121,8 @@ func TestStrictWindowLifetimeDrainHandsOverSlot(t *testing.T) {
 		pointsLock.Unlock()
 		AssertEqual(t, windowStatsWindows(stats, windowStateSelectableFull), int64(1))
 		AssertEqual(t, windowStatsWindows(stats, windowStateStrictHole), int64(0))
+		// one per rotation of every hosted window: verbose only
+		AssertEqual(t, len(h.log.linesWith("event=handover")), 0)
 
 		// full again: nothing more is listed, minted or built
 		readsSteady, _, _, _ := generator.counts()

@@ -14578,11 +14578,14 @@ func (self *multiClientWindow) expand(
 				victimRemoval.finish()
 			} else {
 				windowClientStats.addRemoval(self.windowType, windowRemovalHandover)
-				self.log.Infof("%s\n", relEvent(
-					"handover",
-					"exit", victim.ClientId(),
-					"replacement", clientId,
-				))
+				// verbose: a hosted window hands a slot over at every rotation
+				if self.log.V(1).Enabled() {
+					self.log.Infof("%s\n", relEvent(
+						"handover",
+						"exit", victim.ClientId(),
+						"replacement", clientId,
+					))
+				}
 			}
 		}
 		if client.IpFamily().SupportsIpv6() {
