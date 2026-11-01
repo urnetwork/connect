@@ -1816,22 +1816,29 @@ paths:
         address this request arrived from.
 
         Nothing is taken on the caller's word. Inside the request, and within
-        a 10 second budget, the operator dials BACK to the caller's own
-        address on every carrier offered and on every dns port listed, each
-        time sending a challenge and verifying the response signature against
-        `public_key_hex`; it then performs a verified `GET /hello` forward
-        through the tcp carrier to its own api. The tcp carrier is therefore
-        required, since only it can prove the forward. One dns port failing is
-        not the dns carrier failing -- only a dns carrier with no port left is
-        refused -- and the forward must arrive on the same family the probe
-        reached, or the record would promise an address that does not carry
-        the traffic.
+        one 10 second probe budget, the operator dials BACK to the caller's own
+        address, each time sending a challenge and verifying the response
+        signature against `public_key_hex`. The required test runs first and
+        alone decides acceptance (connect/EXTENDER.md C2a): the tcp carrier's
+        challenge, then a verified `GET /hello` forward through the tcp
+        carrier to the operator's own api, which must arrive on the same
+        family the probe reached, or the record would promise an address that
+        does not carry the traffic. The tcp carrier is therefore required,
+        since only it can prove the forward. Only then is each optional
+        carrier offered probed: every listed dns port under its own 3 second
+        budget, then quic with what is left. An optional carrier, or a dns
+        port, that does not answer is left out of the record and listed in
+        `refused_carriers`; it never refuses the activation.
 
         A refusal is a NORMAL 200 with `activated: false` and `error` naming
-        the carrier that failed, not an HTTP error: the caller is a provider
-        running this on a timer, and it needs to tell "this carrier did not
-        answer" from "the request was malformed". Nothing is stored on a
-        refusal.
+        the step of the required test that failed, not an HTTP error: the
+        caller is a provider running this on a timer, and it needs to tell
+        "this carrier did not answer" from "the request was malformed".
+        Nothing is stored on a refusal. Every step is timed (EXTENDER.md C2b):
+        `probe_steps` lists each step the probe ran, and a refusal says how
+        long its step ran or, when the step's budget ran out first, how much
+        it had, so an extender that answers late can tell that from one that
+        does not answer at all.
 
         On success the extender row and the family's address row are upserted
         active and a record publish row is queued for gossip. The answer
@@ -19071,11 +19078,35 @@ components:
           type: array
           items:
             type: integer
+        refused_carriers:
+          description: |
+            The optional carriers that were offered and did not answer, and
+            each dns port that did not, in the order offered (EXTENDER.md
+            C2a). They are left out of the stored address and the signed
+            record. Empty on a refusal, which probes no optional carrier.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderCarrierRefusal"
+        probe_steps:
+          description: |
+            Every probe step the activation ran, in the order run: the tcp
+            challenge, the forward through it, each dns port, then quic
+            (EXTENDER.md C2b). A refusal's last step is the one that refused
+            it. Omitted when the activation was refused before anything was
+            probed. A provider that predates the field ignores it.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderProbeStep"
         error:
           description: |
             Why the activation was refused; empty on success. A refusal is a
-            normal answer, not a request error: the caller is told which
-            carrier failed so it can fix its own binding.
+            normal answer, not a request error: the caller is told which step
+            of the required test failed -- the tcp carrier, the forward
+            through it, or the family the forward arrived on -- so it can fix
+            its own binding. A probe refusal says how long its step ran ("the
+            forward failed after 0.1 s: ...") or, when the step's budget ran
+            out before it answered, how much it had ("the forward did not
+            answer within the 0.5 s left of the 10 s probe budget: ...").
           type: string
         expire_time:
           description: |
@@ -19100,6 +19131,86 @@ components:
           type: array
           items:
             type: string
+
+    ExtenderCarrierRefusal:
+      type: object
+      description: |
+        One optional carrier, or one dns port, that was offered and did not
+        answer its probe, and was left out of an accepted activation
+        (EXTENDER.md C2a, C2b).
+      required:
+        - carrier
+        - port
+        - error
+        - elapsed_ms
+        - budget_left_ms
+      properties:
+        carrier:
+          type: string
+          enum: [quic, dns]
+        port:
+          description: The port the carrier was probed on.
+          type: integer
+        error:
+          description: |
+            Why the probe failed. A probe whose budget ran out first says how
+            much time it had: "no answer within 3 s: ..." for a dns port, or
+            "no answer within the 6.5 s left of the 10 s probe budget: ...".
+          type: string
+        elapsed_ms:
+          description: How long the probe ran, in milliseconds.
+          type: integer
+          format: int64
+        budget_left_ms:
+          description: |
+            How much of the activation's 10 s probe budget was left when the
+            probe started, in milliseconds. A dns port is also bounded by its
+            own 3 s.
+          type: integer
+          format: int64
+
+    ExtenderProbeStep:
+      type: object
+      description: |
+        One probe step of an activation, timed on the operator's clock
+        (EXTENDER.md C2b). The steps share one 10 s probe budget, so a step
+        that ran out of it is told apart from one that failed on its own,
+        and from one starved by the steps before it.
+      required:
+        - name
+        - ip_version
+        - port
+        - elapsed_ms
+        - budget_left_ms
+        - outcome
+      properties:
+        name:
+          type: string
+          enum: [tcp, forward, dns, quic]
+        ip_version:
+          description: The family the step dialed, 4 or 6.
+          type: integer
+        port:
+          description: |
+            The extender port the step dialed. The forward runs over the tcp
+            carrier and names its port.
+          type: integer
+        elapsed_ms:
+          description: How long the step ran, in milliseconds.
+          type: integer
+          format: int64
+        budget_left_ms:
+          description: |
+            How much of the 10 s probe budget was left when the step started,
+            in milliseconds. A dns port is also bounded by its own 3 s.
+          type: integer
+          format: int64
+        outcome:
+          description: |
+            `ok`; `error`, the step failed on its own before its budget ran
+            out; or `timeout`, its budget ran out before it answered.
+          type: string
+          enum: [ok, error, timeout]
 
     ExtenderHintResult:
       type: object
