@@ -1,7 +1,9 @@
 package connect
 
 import (
+	"errors"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 )
@@ -38,9 +40,13 @@ func EgressInterfaceIndex() (uint32, uint32) {
 	return egressInterfaceIndex4.Load(), egressInterfaceIndex6.Load()
 }
 
+// errEgressIpv6Unpinned reports an AF_INET6 socket whose IPv4 traffic is pinned
+// but whose IPv6 traffic could not be.
+var errEgressIpv6Unpinned = errors.New("connect: could not pin the socket's ipv6 traffic to the egress interface")
+
 // egressControl is a net.Dialer / net.ListenConfig Control callback that applies
 // the egress interface binding to a socket at creation time.
-func egressControl(_ string, _ string, c syscall.RawConn) error {
+func egressControl(_ string, address string, c syscall.RawConn) error {
 	index4, index6 := EgressInterfaceIndex()
 	if index4 == 0 && index6 == 0 {
 		return nil
@@ -52,7 +58,21 @@ func egressControl(_ string, _ string, c syscall.RawConn) error {
 	if err != nil {
 		return err
 	}
+	if errors.Is(innerErr, errEgressIpv6Unpinned) && !egressAddressIsIpv6Destination(address) {
+		return nil
+	}
 	return innerErr
+}
+
+// A dial's control sees its destination. A wildcard listener, or a socket that
+// already exists, has none, and its IPv4 traffic is pinned.
+func egressAddressIsIpv6Destination(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Is6() && !ip.Is4In6() && !ip.IsUnspecified()
 }
 
 // egressDialer installs the egress control on d, chaining any existing Control.

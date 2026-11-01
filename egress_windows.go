@@ -4,6 +4,8 @@ package connect
 
 import (
 	"fmt"
+	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -18,66 +20,80 @@ const (
 	ipv6UnicastIf = 31
 )
 
+// SO_PROTOCOL_INFOW, which x/sys/windows does not name.
+const soProtocolInfoW = 0x2005
+
+// The other family's options cannot tell: IPPROTO_IPV6 reads succeed on AF_INET.
+func socketIsIpv6(h windows.Handle) (bool, error) {
+	var info windows.WSAProtocolInfo
+	size := int32(unsafe.Sizeof(info))
+	if err := syscall.Getsockopt(
+		syscall.Handle(h),
+		windows.SOL_SOCKET,
+		soProtocolInfoW,
+		(*byte)(unsafe.Pointer(&info)),
+		&size,
+	); err != nil {
+		return false, err
+	}
+	return info.AddressFamily == windows.AF_INET6, nil
+}
+
 func htonl(x uint32) uint32 {
 	return (x&0x000000ff)<<24 | (x&0x0000ff00)<<8 | (x&0x00ff0000)>>8 | (x&0xff000000)>>24
 }
 
 // applyEgressInterface sets the forced egress interface on the socket.
 //
-// Both families are attempted, because the caller does not know which one this
-// socket is: setting the wrong family's option on a single-family socket fails
-// harmlessly, and treating that as an error would break every connection. So a
-// PER-OPTION failure is still ignored, as in wireguard-windows.
+// The caller does not know the socket's family, and setting the other family's
+// option does not reliably tell: a single-family socket refuses it, but a
+// dual-stack AF_INET6 socket, which is what a "udp" or "tcp" dial to an IPv6
+// address makes, accepts IP_UNICAST_IF and stays unpinned for IPv6. So the IPv6
+// option is tried first. It succeeds only on an AF_INET6 socket on an interface
+// with IPv6, and the IPv4 option then covers that socket's mapped traffic.
 //
-// What is NOT ignored is every attempted option failing. That means the socket
-// carries no forced interface at all, and a socket with no forced interface
-// follows the route table — which on the machine this exists for is the tunnel
-// this very process provides. Returning nil there made the R1 self-exclusion
-// fail open and silent: the deadlock it prevents would happen with nothing
-// anywhere saying why. The dominant cause is an interface index that has been
-// reclaimed since it was chosen, which is exactly the case worth reporting.
+// A family with no default route of its own is pinned to the other family's
+// interface. When that interface has no IPv6 at all the IPv6 option is refused,
+// and an AF_INET6 socket is reported as errEgressIpv6Unpinned. A socket with no
+// forced interface follows the route table, which on the machine this exists
+// for is the tunnel this very process provides: each datagram comes back as a
+// new flow and opens another socket.
 //
 // The error travels back through egressControl to net.Dialer.Control, so the
 // dial fails and shows up in the existing [net]dial log line. A failed dial
 // retries; an unpinned socket blackholes.
 func applyEgressInterface(fd uintptr, index4 uint32, index6 uint32) error {
-	h := windows.Handle(fd)
-	var attempted int
-	var lastErr error
-	if index4 != 0 {
-		attempted++
-		if err := windows.SetsockoptInt(
-			h,
-			windows.IPPROTO_IP,
-			ipUnicastIf,
-			int(htonl(index4)),
-		); err != nil {
-			lastErr = err
-		} else {
-			return nil
-		}
-	}
-	if index6 != 0 {
-		attempted++
-		if err := windows.SetsockoptInt(
-			h,
-			windows.IPPROTO_IPV6,
-			ipv6UnicastIf,
-			int(index6),
-		); err != nil {
-			lastErr = err
-		} else {
-			return nil
-		}
-	}
-	if attempted == 0 || lastErr == nil {
+	if index4 == 0 && index6 == 0 {
 		return nil
+	}
+	if index4 == 0 {
+		index4 = index6
+	}
+	if index6 == 0 {
+		index6 = index4
+	}
+	h := windows.Handle(fd)
+	err6 := windows.SetsockoptInt(h, windows.IPPROTO_IPV6, ipv6UnicastIf, int(index6))
+	err4 := windows.SetsockoptInt(h, windows.IPPROTO_IP, ipUnicastIf, int(htonl(index4)))
+	is6, err := socketIsIpv6(h)
+	if err != nil {
+		return fmt.Errorf("connect: could not read the socket family: %w", err)
+	}
+	switch {
+	case is6 && err6 == nil, !is6 && err4 == nil:
+		return nil
+	case is6 && err4 == nil:
+		return fmt.Errorf("%w (v4=%d v6=%d): %w", errEgressIpv6Unpinned, index4, index6, err6)
+	}
+	err = err4
+	if is6 {
+		err = err6
 	}
 	return fmt.Errorf(
 		"connect: could not pin the socket to the egress interface (v4=%d v6=%d): %w; "+
 			"the socket would follow the route table and loop into the tunnel",
 		index4,
 		index6,
-		lastErr,
+		err,
 	)
 }
