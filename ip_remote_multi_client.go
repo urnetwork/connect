@@ -434,7 +434,6 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		UdpTeardownSignal:        true,
 		QuicRebindOnExitLoss:     true,
 		StandingReserve:          true,
-		StrictWindowHandover:     true,
 		ClusterAffinityFallback:  true,
 		ServerNameAffinityBridge: true,
 		// well inside AckTimeout (30s), which is what otherwise bounds recovery
@@ -611,8 +610,12 @@ type MultiClientSettings struct {
 	// evaluated candidate in one atomic swap, so lifetime rotation completes
 	// without the window ever holding more than its hard max or fewer than
 	// its minimum. Fixed destinations and non-strict windows are unaffected.
-	// false keeps building candidates the hard max refuses and keeps warned
-	// clients in their slots, as before.
+	//
+	// Off by default, which keeps building candidates the hard max refuses
+	// and keeps warned clients in their slots, as before. A host opts in: the
+	// proxy service turns it on for its hosted devices, and an app release
+	// turns it on only once the owner approves it for apps (CPUOPT3 D2, owner
+	// question 5).
 	StrictWindowHandover bool
 	// When set, the process's counters of what the windows do with their
 	// window clients (see

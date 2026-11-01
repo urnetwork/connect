@@ -583,6 +583,7 @@ func TestEnumeratorSkipsListingWhenStrictFull(t *testing.T) {
 		window.ctx, window.cancel, window.generator = ctx, cancel, generator
 		window.clientChannelArgs = make(chan *multiClientChannelArgs)
 		window.settings.StrictWindowSizeHardMax = true
+		window.settings.StrictWindowHandover = true
 		window.settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{WindowSizeMin: 1, WindowSizeMax: 1, WindowSizeHardMax: 1}
 		victimId := NewId()
 		victim := &multiClientChannel{ctx: ctx, settings: window.settings, warning: true, warnCause: warnDraining,
@@ -805,4 +806,17 @@ func TestStrictWindowAboveHardMaxCollapsesWithoutBuilding(t *testing.T) {
 		AssertEqual(t, installedCount, 4)
 		AssertEqual(t, selectableCount, 4)
 	})
+}
+
+// The handover is a host's opt-in: the defaults leave it off, so a strict
+// window built from them (every app's low-memory profile, and a c abi host)
+// plans exactly as before until its host turns it on.
+func TestStrictWindowHandoverIsOffByDefault(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	AssertEqual(t, settings.StrictWindowHandover, false)
+	settings.StrictWindowSizeHardMax = true
+	window := &multiClientWindow{settings: settings}
+	AssertEqual(t, window.strictWindowHandoverEnabled(), false)
+	settings.StrictWindowHandover = true
+	AssertEqual(t, window.strictWindowHandoverEnabled(), true)
 }
