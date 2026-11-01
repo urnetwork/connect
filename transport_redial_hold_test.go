@@ -548,3 +548,41 @@ func TestOverCapRedialGivesItsStepBackWhenClosed(t *testing.T) {
 		t.Fatalf("staircase at %s after the closed wait, want the step %s given back to %s", given, time.Second, afterStep.Add(-time.Second))
 	}
 }
+
+// A hold cancels a dial in flight (cancelOnKick shares the kick monitor), and
+// that cancellation is the owner's or the family's stop, not a dial failure.
+// It was counted as one: it grew the transport's failure backoff and fed the
+// process-wide degraded-backend gate, which holds contract requests and
+// window growth for every client in the process. A provider's standby is
+// disabled this way whenever a pin connects while the standby dials.
+func TestHoldCanceledDialIsNoDialFailure(t *testing.T) {
+	resetBackendDegraded()
+	defer resetBackendDegraded()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform, held := newTestingPlatformServerHoldingUpgrades(t, 4)
+	strategy := NewClientStrategy(ctx, DefaultClientStrategySettings())
+	defer strategy.Close()
+	settings := testingPlatformTransportSettings()
+	parked := observeTestingHeldParks(settings)
+	connections := observeTestingTransportConnections(settings)
+	transport := newRedialTestTransport(t, ctx, platform.url, strategy, settings)
+
+	// the dial parks in the platform's upgrade until the test ends
+	select {
+	case <-held:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the transport never dialed")
+	}
+	transport.SetEnabled(false)
+	waitTestingHeldParkWithoutDial(t, parked, connections, 0)
+
+	if failures := testingDialFailureCount(transport.failBackoff); failures != 0 {
+		t.Fatalf("a hold-canceled dial counted %d dial failures", failures)
+	}
+	if n := consecutiveBackendFails.Load(); n != 0 {
+		t.Fatalf("a hold-canceled dial counted %d backend failures", n)
+	}
+}
