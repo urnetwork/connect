@@ -34,9 +34,13 @@ import (
 // The loop runs on five triggers (G3): start, the 24 hour tick, the own key
 // observed revoked in the directory, a changed caller address from hello, and a
 // network change. Everything else is backoff: a refusal holds the next attempt
-// for ten minutes, doubling to six hours, and a success resets it. The tick,
-// the address check and the backoff count the time the host slept, from the
-// first minute it is awake after a sleep of fifteen minutes or more.
+// for ten minutes, doubling to six hours, and a success resets it. Each family
+// keeps its own schedule (connect#230): a family that passed waits out its own
+// tick while the other family retries, rather than being posted again with it
+// and spending its activation budget for nothing. A trigger makes every family
+// due. The tick, the address check and the backoff count the time the host
+// slept, from the first minute it is awake after a sleep of fifteen minutes or
+// more.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `AddNetworkChangeListener` -- so the whole loop is
@@ -505,19 +509,48 @@ func (self *ExtenderActivator) changedWithLock() {
 	self.changeMonitor.Set(self.version)
 }
 
+// The activation schedule of one family (G3): when it is next due, and how long
+// its next failure holds it. The loop goroutine alone reads and writes it.
+type extenderActivateSchedule struct {
+	nextActivateTime time.Time
+	backoff          time.Duration
+}
+
+// The keys of the activation schedules, one per family this activator runs, in
+// ip version order. The plain api url has one schedule, under 0, since one
+// post a cycle activates whichever family the answer names.
+func (self *ExtenderActivator) scheduleIpVersions() []int {
+	if self.fallback {
+		return []int{0}
+	}
+	return self.ipVersions()
+}
+
 // The activation loop. One pass observes the directory for a revocation of this
-// key, checks the caller address when it is due, and activates when the cadence
-// or a trigger says so. Everything the pass needs is read after the subscribe
-// above it, so a trigger that lands while the pass runs is carried into the
-// next wait rather than lost.
+// key, checks the caller address when it is due, and activates the families
+// whose schedule or a trigger says so. Everything the pass needs is read after
+// the subscribe above it, so a trigger that lands while the pass runs is
+// carried into the next wait rather than lost.
 //
 // The deadlines are monotonic, and the monotonic clock stops while the host
 // sleeps, so the wait reads the host clock at every wakeup, and at least every
-// ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls both
-// deadlines forward by the time slept and starts a pass.
+// ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls every
+// deadline forward by the time slept and starts a pass.
 func (self *ExtenderActivator) run() {
-	backoff := self.settings.MinBackoff
-	var nextActivateTime time.Time
+	scheduleIpVersions := self.scheduleIpVersions()
+	ipVersionSchedules := map[int]*extenderActivateSchedule{}
+	for _, ipVersion := range scheduleIpVersions {
+		ipVersionSchedules[ipVersion] = &extenderActivateSchedule{
+			backoff: self.settings.MinBackoff,
+		}
+	}
+	// a trigger re-activates every family: the address the operator published
+	// for each may no longer be this host's
+	activateEveryFamily := func(now time.Time) {
+		for _, schedule := range ipVersionSchedules {
+			schedule.nextActivateTime = now
+		}
+	}
 	var nextAddressCheckTime time.Time
 	var clientAddress string
 
@@ -549,10 +582,10 @@ func (self *ExtenderActivator) run() {
 		}
 
 		if self.observeRevocation(now) {
-			nextActivateTime = now
+			activateEveryFamily(now)
 		}
 		if self.takeForcedActivate() {
-			nextActivateTime = now
+			activateEveryFamily(now)
 		}
 
 		if self.settings.HelloUrl != "" && !now.Before(nextAddressCheckTime) {
@@ -569,27 +602,48 @@ func (self *ExtenderActivator) run() {
 					// has; the record must be reissued for the new one
 					self.log.Infof(
 						"[extender]activate address %s -> %s\n", clientAddress, address)
-					nextActivateTime = now
+					activateEveryFamily(now)
 				}
 				clientAddress = address
 			}
 		}
 
-		if !now.Before(nextActivateTime) {
-			if self.activate(now) {
-				backoff = self.settings.MinBackoff
-				nextActivateTime = now.Add(self.settings.ActivateTimeout)
-			} else {
-				nextActivateTime = now.Add(backoff)
-				backoff = min(2*backoff, self.settings.MaxBackoff)
+		dueIpVersions := []int{}
+		for _, ipVersion := range scheduleIpVersions {
+			if !now.Before(ipVersionSchedules[ipVersion].nextActivateTime) {
+				dueIpVersions = append(dueIpVersions, ipVersion)
+			}
+		}
+		if 0 < len(dueIpVersions) {
+			ipVersionSucceeded := self.activate(now, dueIpVersions)
+			for _, ipVersion := range dueIpVersions {
+				schedule := ipVersionSchedules[ipVersion]
+				if ipVersionSucceeded[ipVersion] {
+					schedule.backoff = self.settings.MinBackoff
+					schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
+				} else {
+					schedule.nextActivateTime = now.Add(schedule.backoff)
+					schedule.backoff = min(2*schedule.backoff, self.settings.MaxBackoff)
+				}
 			}
 		}
 
-		wait := nextActivateTime.Sub(now)
-		if self.settings.HelloUrl != "" {
-			wait = min(wait, nextAddressCheckTime.Sub(now))
+		// until the first deadline of any family, or of the address check
+		var wait time.Duration
+		waitSet := false
+		waitUntil := func(deadline time.Time) {
+			if remaining := deadline.Sub(now); !waitSet || remaining < wait {
+				wait = remaining
+				waitSet = true
+			}
 		}
-		if wait <= 0 {
+		for _, schedule := range ipVersionSchedules {
+			waitUntil(schedule.nextActivateTime)
+		}
+		if self.settings.HelloUrl != "" {
+			waitUntil(nextAddressCheckTime)
+		}
+		if !waitSet || wait <= 0 {
 			// nothing above left a deadline in the past; a zero here would be
 			// a busy loop
 			wait = self.settings.MinBackoff
@@ -621,7 +675,9 @@ func (self *ExtenderActivator) run() {
 					}
 					return deadline.Add(-sleep)
 				}
-				nextActivateTime = pullForward(nextActivateTime)
+				for _, schedule := range ipVersionSchedules {
+					schedule.nextActivateTime = pullForward(schedule.nextActivateTime)
+				}
 				nextAddressCheckTime = pullForward(nextAddressCheckTime)
 				self.log.Infof("[extender]activate resumed after %s asleep\n", sleep.Round(time.Second))
 				waiting = false
@@ -735,13 +791,18 @@ func (self *ExtenderActivator) dnsPorts() []int {
 	return nil
 }
 
-// Activates every family that has an api url and an address on this host.
-// Reports whether the pass is a success, which is what resets the backoff: a
-// family that was attempted and refused holds the whole pass, since the next
-// attempt reissues every record anyway, and a pass that attempted nothing holds
-// too, so a host that gains an address is retried on the backoff rather than on
-// the 24 hour tick.
-func (self *ExtenderActivator) activate(now time.Time) bool {
+// Activates the due families that have an address on this host, each with its
+// own post, and reports which of them succeeded, keyed by schedule
+// (scheduleIpVersions). Each family's outcome sets only its own schedule
+// (connect#230): a family that passed is not posted again for the other's
+// refusal, since that post would spend the passed family's activation budget
+// to reissue a record it already holds. A family with no address on this host
+// is not attempted and reports no success, so a host that gains an address is
+// retried on that family's backoff rather than on the 24 hour tick.
+//
+// The pass as a whole -- every due family it attempted passed, and it
+// attempted one -- is what decides the measurement follow-up (C4).
+func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[int]bool {
 	carriers := []string{}
 	if self.settings.Carriers != nil {
 		carriers = self.settings.Carriers()
@@ -751,15 +812,17 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 	followUp := self.measurementFollowUp
 	self.measurementFollowUp = false
 
+	ipVersionSucceeded := map[int]bool{}
 	succeeded := false
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	if self.fallback {
 		succeeded, measurementCarried = self.activateFallback(carriers, now)
+		ipVersionSucceeded[0] = succeeded
 	} else {
 		attempted := false
 		succeeded = true
-		for _, ipVersion := range self.ipVersions() {
+		for _, ipVersion := range dueIpVersions {
 			if !self.ipVersionSupported(ipVersion) {
 				// a family with no global address on this host cannot be probed
 				// back, so it is skipped rather than refused (G3)
@@ -777,6 +840,7 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 				measurementCsr = self.measurementCsr()
 			}
 			if self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now) {
+				ipVersionSucceeded[ipVersion] = true
 				measurementCarried = measurementCarried || measurementCsr != ""
 			} else {
 				succeeded = false
@@ -787,7 +851,7 @@ func (self *ExtenderActivator) activate(now time.Time) bool {
 	if succeeded && !followUp && !measurementCarried {
 		self.followMeasurementCsr()
 	}
-	return succeeded
+	return ipVersionSucceeded
 }
 
 // The measurement request a post carries (lag.dev/PLAN.md C4): what the

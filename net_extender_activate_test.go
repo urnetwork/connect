@@ -84,8 +84,11 @@ type testActivateOperator struct {
 	stateLock     sync.Mutex
 	clientAddress string
 	// non-empty refuses every activation with this message
-	refusal    string
-	postCounts map[int]int
+	refusal string
+	// refusals of one family, which replace `refusal` for that family; an
+	// empty one lets the family activate
+	ipVersionRefusals map[int]string
+	postCounts        map[int]int
 	// how an activation that is not refused is answered
 	answer testActivateAnswer
 	// the addresses this extender has activated, by family. One record names
@@ -103,14 +106,15 @@ func newTestActivateOperator(
 ) *testActivateOperator {
 	t.Helper()
 	operator := &testActivateOperator{
-		clock:          clock,
-		rootPrivateKey: rootPrivateKey,
-		bootstrapKey:   newTestExtenderKey(t),
-		posts:          make(chan *testActivatePost, 64),
-		hellos:         make(chan struct{}, 64),
-		clientAddress:  testActivateIpv4 + ":41001",
-		postCounts:     map[int]int{},
-		activatedIps:   map[int]string{},
+		clock:             clock,
+		rootPrivateKey:    rootPrivateKey,
+		bootstrapKey:      newTestExtenderKey(t),
+		posts:             make(chan *testActivatePost, 64),
+		hellos:            make(chan struct{}, 64),
+		clientAddress:     testActivateIpv4 + ":41001",
+		ipVersionRefusals: map[int]string{},
+		postCounts:        map[int]int{},
+		activatedIps:      map[int]string{},
 	}
 	v4Server := newFamilyHttptestServer(t, 4, operator.familyHandler(4))
 	v6Server := newFamilyHttptestServer(t, 6, operator.familyHandler(6))
@@ -153,6 +157,9 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		now := self.clock.Now()
 		self.stateLock.Lock()
 		refusal := self.refusal
+		if ipVersionRefusal, ok := self.ipVersionRefusals[ipVersion]; ok {
+			refusal = ipVersionRefusal
+		}
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
 		self.stateLock.Unlock()
@@ -297,6 +304,14 @@ func (self *testActivateOperator) setRefusal(refusal string) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.refusal = refusal
+}
+
+// Refuses one family's activations with `refusal`, whatever `setRefusal` says
+// for the other; an empty refusal lets that family activate.
+func (self *testActivateOperator) setIpVersionRefusal(ipVersion int, refusal string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.ipVersionRefusals[ipVersion] = refusal
 }
 
 func (self *testActivateOperator) setAnswer(answer testActivateAnswer) {
@@ -760,6 +775,80 @@ func TestExtenderActivatorBacksOffOnRefusal(t *testing.T) {
 	if count := fixture.operator.postCount(4); count != beforeCount+1 {
 		t.Fatalf("posts after the reset = %d, expected %d", count, beforeCount+1)
 	}
+}
+
+// A family that passed is not posted again when only the other family failed
+// (connect#230). The refused family retries on its own backoff and the family
+// that passed waits out its own 24 hour tick. Before, a refusal of either
+// family held the whole pass and every retry re-posted both, so a fleet whose
+// ipv6 failed everywhere spent its ipv4 activation budget again on every
+// retry, reissuing records it already held.
+func TestExtenderActivatorRetriesOnlyTheFamilyThatFailed(t *testing.T) {
+	fixture := newTestActivatorFixture(t, nil)
+	fixture.operator.setIpVersionRefusal(6, "the tcp carrier did not answer")
+	startTime := fixture.clock.Now()
+
+	fixture.waitPass()
+	for range 2 {
+		fixture.waitPost()
+	}
+	if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+		t.Fatalf("activated v%d, expected v4", ipVersion)
+	}
+
+	// expects the next post at `postTime`, from the family named, after a
+	// pass barrier one minute short of it proves the pass before it finished
+	expectPost := func(name string, ipVersion int, postTime time.Time) {
+		t.Helper()
+		fixture.step(postTime.Sub(fixture.clock.Now()) - time.Minute)
+		fixture.clock.advance(time.Minute)
+		fixture.wake()
+		post := fixture.waitPost()
+		if post.ipVersion != ipVersion || post.postTime != postTime {
+			t.Fatalf(
+				"%s: v%d posted at %s, expected v%d at %s",
+				name, post.ipVersion, post.postTime.Sub(startTime),
+				ipVersion, postTime.Sub(startTime))
+		}
+	}
+	// the counts once the pass of the last post has finished
+	expectPostCounts := func(name string, v4Count int, v6Count int) {
+		t.Helper()
+		fixture.step(time.Minute)
+		if count := fixture.operator.postCount(4); count != v4Count {
+			t.Fatalf("%s: v4 posts = %d, expected %d", name, count, v4Count)
+		}
+		if count := fixture.operator.postCount(6); count != v6Count {
+			t.Fatalf("%s: v6 posts = %d, expected %d", name, count, v6Count)
+		}
+	}
+
+	// ipv6 retries on its own backoff, 10 then 20 minutes, alone
+	expectPost("the first v6 retry", 6, startTime.Add(10*time.Minute))
+	expectPost("the second v6 retry", 6, startTime.Add(30*time.Minute))
+	expectPostCounts("the v6 retries", 1, 3)
+	status := fixture.activator.Status()
+	if family := status.Family(4); !family.Activated || family.LastActivationTime != startTime {
+		t.Fatalf("v4 status = %+v, expected activated at the start", family)
+	}
+	if family := status.Family(6); family.Activated || !family.LastRefused {
+		t.Fatalf("v6 status = %+v, expected refused", family)
+	}
+
+	// ipv6 passes on its next retry, 40 minutes on
+	fixture.operator.setIpVersionRefusal(6, "")
+	v6ActivateTime := startTime.Add(70 * time.Minute)
+	expectPost("the v6 retry that passes", 6, v6ActivateTime)
+	if ipVersion := fixture.waitActivation(); ipVersion != 6 {
+		t.Fatalf("activated v%d, expected v6", ipVersion)
+	}
+	expectPostCounts("the v6 activation", 1, 4)
+
+	// each family re-activates on its own tick
+	expectPost("the v4 tick", 4, startTime.Add(24*time.Hour))
+	expectPostCounts("the v4 tick", 2, 4)
+	expectPost("the v6 tick", 6, v6ActivateTime.Add(24*time.Hour))
+	expectPostCounts("the v6 tick", 2, 5)
 }
 
 // A revocation of this extender's own key, observed in the directory,

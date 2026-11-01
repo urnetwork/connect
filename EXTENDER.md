@@ -1116,10 +1116,12 @@ global address (`FamilySupported`), `POST` activate to the family api
 url with the client jwt through a direct-only client strategy, since an
 activation that crossed an extender would publish the extender's address,
 apply the bootstrap records to the directory, and record the status.
-Backoff on failure 10 minutes doubling to 6 hours; a refusal of any
-attempted family holds the whole pass and the retry reissues both, and a
-pass that attempted nothing retries on the backoff rather than the daily
-tick. A family without an address is skipped. The hourly address check is
+Each family keeps its own schedule (connect#230): backoff on failure 10
+minutes doubling to 6 hours, and a success resets it and waits out that
+family's own 24 hour tick, so a family that passed is not posted again for
+the other family's refusal. A family without an address is skipped and
+retried on its own backoff rather than the daily tick. A trigger makes
+every family due. The hourly address check is
 one hello for both families and compares the address, not the port. The
 24 hour tick, the hourly check and the backoff count the time the host
 slept: a minute after waking from a sleep of 15 minutes or more, what came
