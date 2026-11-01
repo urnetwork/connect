@@ -83,6 +83,10 @@ func TestFamilyStandbyAtGroupStartIsStandbyDelayExactly(t *testing.T) {
 	AssertEqual(t, defaultSettings.StandbyDelay, 15*time.Second)
 }
 
+// How long a loss test waits for a step it expects. A step takes moments; the
+// bound is far past any scheduling delay under load.
+const testingStandbyLossWait = 60 * time.Second
+
 // A group whose v4 pin dials `v4PlatformUrl` and whose v6 pin cannot connect.
 func newStandbyLossTestGroup(
 	t *testing.T,
@@ -94,6 +98,10 @@ func newStandbyLossTestGroup(
 ) *FamilyPlatformTransportGroup {
 	t.Helper()
 	clientSettings := newTestingFamilyStrategySettings(t)
+	// a dial to a platform that is not up yet is tried again within 100 ms,
+	// not at a random point of the strategy's 15 s retry window, so a pin
+	// reaches a platform that appears mid-test at once
+	clientSettings.ReconnectTimeout = 100 * time.Millisecond
 	v6Port := reserveTestPort(t, "tcp6", "::1")
 	strategy := NewClientStrategy(ctx, clientSettings)
 	t.Cleanup(strategy.Close)
@@ -139,7 +147,7 @@ func TestFamilyStandbyAfterPinnedLossSpreadsOverStandbyJitter(t *testing.T) {
 			})
 
 			// the v4 pin connects, and the group clears the release
-			if !waitForCondition(15*time.Second, func() bool {
+			if !waitForCondition(testingStandbyLossWait, func() bool {
 				return group.Ipv4Transport().IsConnected() && testingStandbyDueTime(group).IsZero()
 			}) {
 				t.Fatalf("the v4 pin never connected: %+v", group.Status())
@@ -149,7 +157,7 @@ func TestFamilyStandbyAfterPinnedLossSpreadsOverStandbyJitter(t *testing.T) {
 			// the platform restarts: it closes the pin's connection
 			closeTime := time.Now()
 			v4Platform.closeConns()
-			if !waitForCondition(15*time.Second, func() bool {
+			if !waitForCondition(testingStandbyLossWait, func() bool {
 				return !testingStandbyDueTime(group).IsZero()
 			}) {
 				t.Fatalf("the group never set a release after the pin lost its connection: %+v", group.Status())
@@ -195,8 +203,8 @@ func TestFamilyStandbyReleaseAfterPinnedLossDialsWithoutReconnectJitter(t *testi
 
 	// no pin connects: the standby is released at the start's exact delay
 	// and connects
-	receiveFamilyConnection(t, standbyPlatform, 15*time.Second)
-	if !waitForCondition(15*time.Second, func() bool { return group.StandbyTransport().IsConnected() }) {
+	receiveFamilyConnection(t, standbyPlatform, testingStandbyLossWait)
+	if !waitForCondition(testingStandbyLossWait, func() bool { return group.StandbyTransport().IsConnected() }) {
 		t.Fatalf("the standby never connected: %+v", group.Status())
 	}
 	requireDrawWindows(t, standbyDraws, 0, standbyJitter)
@@ -204,8 +212,8 @@ func TestFamilyStandbyReleaseAfterPinnedLossDialsWithoutReconnectJitter(t *testi
 	// the v4 platform appears: the pin connects and the standby stands down,
 	// its connection closed by the hold
 	v4Platform := newTestingFamilyPlatformServerOnPort(t, 4, v4Port, false)
-	receiveFamilyConnection(t, v4Platform, 15*time.Second)
-	if !waitForCondition(15*time.Second, func() bool {
+	receiveFamilyConnection(t, v4Platform, testingStandbyLossWait)
+	if !waitForCondition(testingStandbyLossWait, func() bool {
 		status := group.Status()
 		return status.Ipv4 == PlatformTransportStateConnected && !status.StandbyActive && !group.StandbyTransport().IsConnected()
 	}) {
@@ -216,7 +224,7 @@ func TestFamilyStandbyReleaseAfterPinnedLossDialsWithoutReconnectJitter(t *testi
 	// through its own re-dial spread
 	closeTime := time.Now()
 	v4Platform.closeConns()
-	if !waitForCondition(15*time.Second, func() bool { return group.StandbyTransport().IsConnected() }) {
+	if !waitForCondition(testingStandbyLossWait, func() bool { return group.StandbyTransport().IsConnected() }) {
 		t.Fatalf("the standby never connected after the pin's loss: %+v", group.Status())
 	}
 	if elapsed := time.Since(closeTime); elapsed < standbyDelay+spread {
