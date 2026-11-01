@@ -1799,11 +1799,18 @@ paths:
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
         attributed to a network and a client. It is rate limited per address
-        family: 6 per hour per client and 60 per hour per account, for IPv4
-        and for IPv6 each. A budget is spent only when the operator is about
-        to probe, so a request refused before the probe (malformed arguments,
-        the wrong family, a spent budget) costs nothing, and a refusal by a
-        spent budget says how long until it has room again. Call it on the
+        family, for IPv4 and for IPv6 each, over a trailing hour: 6 per
+        client; 6 per caller address (its /32 or /64), over every client and
+        every account; and per account 60 plus 6 for each proven host, at
+        most 1200. A proven host is an identity key of the account that
+        passed activation on that family between 1 hour and 7 days ago,
+        counted once per address and at most 32 per /24 or /48. The operator
+        also probes only so many activations at once, and refuses one more as
+        busy. A budget is spent only when the operator is about to probe, so
+        a request refused before the probe (malformed arguments, the wrong
+        family, a spent budget, a busy operator) costs nothing, and a refusal
+        by a spent budget or a busy operator says in `retry_after_seconds`
+        how long until there is room again. Call it on the
         family api host of the family being activated --
         `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
         an IPv6 one -- so the caller address the operator probes back has
@@ -19077,6 +19084,14 @@ components:
             normal answer, not a request error: the caller is told which
             carrier failed so it can fix its own binding.
           type: string
+        retry_after_seconds:
+          description: |
+            On a refusal that judged nothing about the caller -- a spent
+            activation budget, or an operator busy probing other activations
+            -- the seconds until there is room for the caller's next post of
+            this family, rounded up. Wait that long rather than backing off.
+            Absent on every other answer.
+          type: integer
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator

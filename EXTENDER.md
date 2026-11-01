@@ -585,8 +585,18 @@ family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
 `{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
-limit 6 per hour per client and 60 per hour per account, each per address
-family, so one family's failures never spend the other's (2026-10-28). An
+limits, each per address family over a trailing hour, so one family's
+failures never spend the other's (2026-10-28), and per host (connect#230,
+2026-11-01): 6 per client; 6 per caller address, its /32 or /64, over every
+client and every account, kept under a keyed hash; and per account 60 plus 6
+for each proven host, at most 1200. A proven host is an identity key of the
+account that passed activation on that family between 1 hour and 7 days ago,
+counted once per address and at most 32 per /24 or /48, so a fleet that has
+passed activation restarts at once and a new one ramps an hour at a time.
+The api process probes at most 64 activations at once. A post over a budget
+or over the probes is refused with the wait until there is room in
+`retry_after_seconds`, which the activator waits out (G3), and spends
+nothing. An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
 is refused before it is probed. The handler probes the caller ip synchronously
 within 10 s: for each requested carrier, `connect.ProbeExtenderCarrier`
@@ -594,8 +604,8 @@ dials that carrier with a random spoof name, sends a header with a
 challenge and verifies the response signature against `public_key_hex`;
 then `connect.ProbeExtenderForward` performs a verified `GET /hello`
 through the tcp carrier to the api url. Result `{activated, ip,
-ip_version, carriers, refused_carriers, error, expire_time, allowed_hosts,
-record, bootstrap}`: `record` is the extender's own freshly signed record,
+ip_version, carriers, refused_carriers, error, retry_after_seconds,
+expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
 random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
@@ -609,8 +619,9 @@ public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each
 take the C1 defaults. The budgets are spent at the probe: every check that
 refuses without dialing the caller (the arguments, the caller and its
 family, the configuration) precedes them, so a malformed request or an
-unconfigured operator never spends a caller's budget, and the client's and
-the account's budgets are spent together or not at all. Every activation
+unconfigured operator never spends a caller's budget, and the client's, the
+address's and the account's budgets are spent together or not at all, one
+spend of a budget at a time. Every activation
 that dials the caller is counted, whatever its probe finds. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
