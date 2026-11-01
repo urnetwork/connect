@@ -544,16 +544,6 @@ type extenderActivateOutcome struct {
 	retryAfter time.Duration
 }
 
-// The keys of the activation schedules, one per family this activator runs, in
-// ip version order. The plain api url has one schedule, under 0, since one
-// post a cycle activates whichever family the answer names.
-func (self *ExtenderActivator) scheduleIpVersions() []int {
-	if self.fallback {
-		return []int{0}
-	}
-	return self.ipVersions()
-}
-
 // The activation loop. One pass observes the directory for a revocation of this
 // key, checks the caller address when it is due, and activates the families
 // whose schedule or a trigger says so. Everything the pass needs is read after
@@ -565,7 +555,13 @@ func (self *ExtenderActivator) scheduleIpVersions() []int {
 // ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls every
 // deadline forward by the time slept and starts a pass.
 func (self *ExtenderActivator) run() {
-	scheduleIpVersions := self.scheduleIpVersions()
+	// one schedule per family this activator runs, in ip version order. The
+	// plain api url has one, under 0, since one post a cycle activates
+	// whichever family the answer names
+	scheduleIpVersions := self.ipVersions()
+	if self.fallback {
+		scheduleIpVersions = []int{0}
+	}
 	ipVersionSchedules := map[int]*extenderActivateSchedule{}
 	for _, ipVersion := range scheduleIpVersions {
 		ipVersionSchedules[ipVersion] = &extenderActivateSchedule{
@@ -830,13 +826,13 @@ func (self *ExtenderActivator) dnsPorts() []int {
 }
 
 // Activates the due families that have an address on this host, each with its
-// own post, and reports what each came to, keyed by schedule
-// (scheduleIpVersions). Each family's outcome sets only its own schedule
-// (connect#230): a family that passed is not posted again for the other's
-// refusal, since that post would spend the passed family's activation budget
-// to reissue a record it already holds. A family with no address on this host
-// is not attempted and reports no success, so a host that gains an address is
-// retried on that family's backoff rather than on the 24 hour tick.
+// own post, and reports what each came to, keyed by its schedule's family: 0
+// for the plain api url's one schedule. Each family's outcome sets only its
+// own schedule (connect#230): a family that passed is not posted again for the
+// other's refusal, since that post would spend the passed family's activation
+// budget to reissue a record it already holds. A family with no address on
+// this host is not attempted and reports no success, so a host that gains an
+// address is retried on that family's backoff rather than on the 24 hour tick.
 //
 // The pass as a whole -- every due family it attempted passed, and it
 // attempted one -- is what decides the measurement follow-up (C4).
