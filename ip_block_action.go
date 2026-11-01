@@ -15,7 +15,10 @@ import (
 // decisions - both the security decision (block) and the local routing decision.
 // an override matches a destination by host, and the match extends to the
 // destination's `IpAssoc` cluster, so blocking a single host blocks the ips that
-// activity-associate with it (cdns, apis, etc).
+// activity-associate with it (cdns, apis, etc). a route to the local network is
+// the exception: it applies only to the destination it matches, because cluster
+// membership is only timing, and a bypass of a busy host would otherwise take
+// unrelated traffic out of the tunnel.
 //
 // every egress decision is surfaced as a `BlockAction`, deduplicated per
 // destination per event epoch, so listeners see all routing decisions without
@@ -630,15 +633,44 @@ func blockActionApply(r SecurityPolicyResult, localSecurityBypass bool, blockerB
 }
 
 func (self *blockActionMatcher) matchAddr(match *blockActionMatch, addr netip.Addr, serverNames []string) {
+	self.matchAddrWith(match, addr, serverNames, func(override *BlockActionOverride) bool {
+		match.merge(override)
+		return true
+	})
+}
+
+// matchClusterMember matches a cluster member other than the destination. Its
+// overrides extend to the destination except for a local route.
+func (self *blockActionMatcher) matchClusterMember(match *blockActionMatch, addr netip.Addr, serverNames []string) {
+	self.matchAddrWith(match, addr, serverNames, func(override *BlockActionOverride) bool {
+		if override.RouteOverride == nil || !override.RouteOverride.Local {
+			match.merge(override)
+			return true
+		}
+		if override.BlockOverride == nil {
+			return false
+		}
+		match.merge(&BlockActionOverride{
+			OverrideId:    override.OverrideId,
+			BlockOverride: override.BlockOverride,
+		})
+		return true
+	})
+}
+
+func (self *blockActionMatcher) matchAddrWith(
+	match *blockActionMatch,
+	addr netip.Addr,
+	serverNames []string,
+	merge func(override *BlockActionOverride) bool,
+) {
 	addrMatched := false
 	for _, override := range self.addrs[addr] {
-		match.merge(override)
-		addrMatched = true
+		addrMatched = merge(override) || addrMatched
 	}
 	for _, blockActionPrefix := range self.prefixes {
 		if blockActionPrefix.prefix.Contains(addr) {
-			match.merge(blockActionPrefix.override)
-			addrMatched = true
+			addrMatched = merge(blockActionPrefix.override) || addrMatched
 		}
 	}
 	if addrMatched {
@@ -648,13 +680,11 @@ func (self *blockActionMatcher) matchAddr(match *blockActionMatch, addr netip.Ad
 		lower := strings.ToLower(serverName)
 		hostMatched := false
 		for _, override := range self.exactHosts[lower] {
-			match.merge(override)
-			hostMatched = true
+			hostMatched = merge(override) || hostMatched
 		}
 		for _, wildcardHost := range self.wildcardHosts {
 			if strings.HasSuffix(lower, wildcardHost.dotSuffix) || lower == wildcardHost.base {
-				match.merge(wildcardHost.override)
-				hostMatched = true
+				hostMatched = merge(wildcardHost.override) || hostMatched
 			}
 		}
 		if hostMatched {

@@ -7403,8 +7403,13 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 			}
 		}
 		if match != nil {
-			// the match extends over the destination's entire cluster
-			state.matcher.matchAddr(match, member, memberServerNames)
+			// the match extends over the destination's entire cluster,
+			// except that a local route stays with the destination
+			if member == addr {
+				state.matcher.matchAddr(match, member, memberServerNames)
+			} else {
+				state.matcher.matchClusterMember(match, member, memberServerNames)
+			}
 		}
 		if blockerActive && member == addr {
 			// the blocker matches the destination itself: its ip and its own
