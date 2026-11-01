@@ -895,14 +895,23 @@ func TestRecentExitHeldOnlyAfterItsExitLeftTheWindow(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find resize")
 	}
-	classify := strings.Index(body, "self.classifyRecentExit(client, err, stats, windowSize, stickyExit)")
+	classify := strings.Index(body, "self.classifyErrorRemoval(client, err, stats, windowSize, stickyExit)")
 	if classify < 0 {
 		t.Fatal("resize does not classify the exits it removes for the recent-exit memory")
 	}
-	removal := strings.Index(body[classify:], "removeClient(client, ")
-	remember := strings.Index(body[classify:], "self.rememberRecentExit(client, lostExit, lostExitMaxCount)")
+	removal := strings.Index(body[classify:], "removeClient(client, removal.cause())")
+	remember := strings.Index(body[classify:], "removal.finish()")
 	if removal < 0 || remember < 0 || remember < removal {
 		t.Fatal("resize holds a lost exit before its removal: a round in between drops it as still in the window")
+	}
+	// the shared removal classifies first and holds the exit only in finish
+	classifier, ok := functionBody(source, "func (self *multiClientWindow) classifyErrorRemoval(")
+	if !ok || !strings.Contains(classifier, "self.classifyRecentExit(client, err, stats, windowSize, stickyExit)") {
+		t.Fatal("the error removal does not classify the exit for the recent-exit memory")
+	}
+	finish, ok := functionBody(source, "func (self *windowErrorRemoval) finish()")
+	if !ok || !strings.Contains(finish, "rememberRecentExit(") {
+		t.Fatal("the error removal does not hold the lost exit after the removal")
 	}
 }
 

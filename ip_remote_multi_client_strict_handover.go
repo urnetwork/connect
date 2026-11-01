@@ -15,7 +15,8 @@
 // own inputs:
 //   - capacity before construction: a pass builds only as many candidates as
 //     admission would accept now (strictAdmissionCapacityWithLock), and the
-//     enumerator lists and mints nothing while that is zero;
+//     enumerator lists and mints nothing while the capacity is zero, and no
+//     more than a running pass asked for;
 //   - collapse at admission: a pass at the hard max reserves one warned
 //     client that the capacity collapse test would remove (flowless, or past
 //     the collapse deadline), and admission swaps the evaluated candidate in
@@ -36,19 +37,27 @@ import (
 	"time"
 )
 
+// A strict window's current expansion pass, as the enumerator and admission
+// see it. Guarded by the window stateLock.
+type strictWindowPass struct {
+	owner *multiClientEvaluationOwner
+	// how many more candidates the enumerator may hand the pass: its request
+	// count, less each candidate handed over, so a candidate is never minted
+	// ahead for a slot the pass is already filling
+	remainingCandidates int
+	// the warned client whose slot the pass's candidate takes, when the
+	// window is at its hard max; nil otherwise
+	handover *strictWindowHandover
+}
+
 // One strict window's reservation of a warned client's slot for the
-// candidate its current expansion pass admits. Guarded by the window
-// stateLock, except completed.
+// candidate its current expansion pass admits. Unchanged once the pass
+// starts, except completed.
 type strictWindowHandover struct {
 	victim *multiClientChannel
 	// the victim's age when the pass chose it, for the collapse deadline's
 	// re-check at admission; the deadline only gets more past with time
 	victimDuration time.Duration
-	// the pass holding the reservation, set when the pass starts
-	owner *multiClientEvaluationOwner
-	// how many more candidates the enumerator may hand this pass for the
-	// slot: the pass's request count, less each candidate handed over
-	remainingCandidates int
 	// the swap happened; resize reads it after the pass returns
 	completed atomic.Bool
 }
@@ -59,9 +68,9 @@ func (self *multiClientWindow) strictWindowHandoverEnabled() bool {
 		self.settings.StrictWindowSizeHardMax && self.settings.StrictWindowHandover
 }
 
-// How many new identities admission would accept right now: the free slots below the hard max, plus the one slot a
-// live handover reservation will swap while its pass still takes candidates
-// for it. Unbounded when the window has no strict ceiling. These are the
+// How many new identities admission would accept right now: the free slots
+// below the hard max, plus the one slot a live handover reservation will
+// swap. Unbounded when the window has no strict ceiling. These are the
 // inputs of strictWindowAdmissionAllowed, read under the same lock: without a
 // reservation the capacity is positive exactly when that gate admits a new
 // identity. A same-identity replacement needs no capacity; the gate admits it
@@ -73,8 +82,8 @@ func (self *multiClientWindow) strictAdmissionCapacityWithLock(windowSizeHardMax
 		return math.MaxInt
 	}
 	capacity := windowSizeHardMax - len(self.clients)
-	if handover := self.strictHandover; handover != nil && 0 < handover.remainingCandidates &&
-		self.clients[handover.victim.ClientId()] == handover.victim {
+	if pass := self.strictPass; pass != nil && pass.handover != nil &&
+		self.clients[pass.handover.victim.ClientId()] == pass.handover.victim {
 		capacity += 1
 	}
 	return capacity
@@ -98,9 +107,13 @@ func (self *multiClientWindow) windowSizeWithLock() WindowSizeSettings {
 }
 
 // Whether the enumerator may list or mint for this window now. A strict
-// discovery window with no admission capacity and no handover candidate still
-// to take lists and mints nothing, as the discovery demand path already
-// declines at the hard max (discoveryDemandLiveWithLock).
+// discovery window lists and mints only while admission has capacity, as the
+// discovery demand path already declines at the hard max
+// (discoveryDemandLiveWithLock), and no more than a running pass still wants.
+// Between passes it may mint the one candidate the next pass takes: a listing
+// that outlasts its pass's acquisition budget, on a slow platform or after an
+// error backoff, is minted and parked for the next pass instead of
+// discarded, so every pass does not repeat the same race.
 func (self *multiClientWindow) strictDiscoveryAdmissible() bool {
 	if !self.strictWindowHandoverEnabled() {
 		return true
@@ -110,17 +123,39 @@ func (self *multiClientWindow) strictDiscoveryAdmissible() bool {
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return 0 < self.strictAdmissionCapacityWithLock(self.windowSizeWithLock().WindowSizeHardMax)
+	pass := self.strictPass
+	return (pass == nil || 0 < pass.remainingCandidates) &&
+		0 < self.strictAdmissionCapacityWithLock(self.windowSizeWithLock().WindowSizeHardMax)
 }
 
-// The enumerator handed the current pass one candidate. A candidate handed to
-// a handover pass uses up one of the candidates the reservation stands for,
-// so the enumerator does not mint ahead for a slot its pass already took.
-func (self *multiClientWindow) noteStrictHandoverCandidateOffered() {
+// Hands a minted candidate to the running pass, from a discovery demand read
+// or from the ordinary listing, and charges the pass's offer budget when the
+// pass took it: a demand candidate fills one of the slots the pass asked for,
+// as an ordinary one does.
+func (self *multiClientWindow) offerPassCandidate(
+	demandRead *discoveryDemandRead,
+	args *multiClientChannelArgs,
+	expirationTime time.Time,
+) bool {
+	var offered bool
+	if demandRead == nil {
+		offered = self.offerClientArgs(args, expirationTime)
+	} else {
+		offered = self.offerDiscoveryDemandArgs(demandRead, args)
+	}
+	if offered {
+		self.noteStrictPassCandidateOffered()
+	}
+	return offered
+}
+
+// The enumerator handed the current pass one candidate, which uses up one of
+// the candidates the pass asked for.
+func (self *multiClientWindow) noteStrictPassCandidateOffered() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if handover := self.strictHandover; handover != nil && 0 < handover.remainingCandidates {
-		handover.remainingCandidates -= 1
+	if pass := self.strictPass; pass != nil && 0 < pass.remainingCandidates {
+		pass.remainingCandidates -= 1
 	}
 }
 
@@ -213,25 +248,30 @@ func (self *multiClientWindow) selectStrictHandoverVictim(
 	return nil
 }
 
-// Installs the pass's reservation for the candidates it requests.
-func (self *multiClientWindow) reserveStrictHandover(
-	handover *strictWindowHandover,
+// Starts a strict window's pass: the candidates it requests, and its handover
+// reservation, if any.
+func (self *multiClientWindow) beginStrictPass(
 	owner *multiClientEvaluationOwner,
 	requestCount int,
-) {
+	handover *strictWindowHandover,
+) *strictWindowPass {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	handover.owner = owner
-	handover.remainingCandidates = requestCount
-	self.strictHandover = handover
+	pass := &strictWindowPass{
+		owner:               owner,
+		remainingCandidates: requestCount,
+		handover:            handover,
+	}
+	self.strictPass = pass
+	return pass
 }
 
-// Ends the pass's reservation; the pass's expand defer calls it.
-func (self *multiClientWindow) releaseStrictHandover(handover *strictWindowHandover) {
+// Ends the pass and its reservation; the pass's expand defer calls it.
+func (self *multiClientWindow) endStrictPass(pass *strictWindowPass) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.strictHandover == handover {
-		self.strictHandover = nil
+	if self.strictPass == pass {
+		self.strictPass = nil
 	}
 }
 
@@ -245,8 +285,9 @@ func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOw
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if self.strictHandover != nil && self.strictHandover.owner == owner && !self.strictHandover.completed.Load() {
-			handover = self.strictHandover
+		if pass := self.strictPass; pass != nil && pass.owner == owner &&
+			pass.handover != nil && !pass.handover.completed.Load() {
+			handover = pass.handover
 		}
 	}()
 	if handover == nil {
@@ -258,6 +299,19 @@ func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOw
 	return handover
 }
 
+// The removal by its error of a handover's victim that ended with one, or nil
+// for a victim that is still live. Called with no lock held.
+func (self *multiClientWindow) classifyHandoverVictimRemoval(
+	victim *multiClientChannel,
+	windowSize WindowSizeSettings,
+) *windowErrorRemoval {
+	stats, err := victim.WindowStats()
+	if err == nil {
+		return nil
+	}
+	return self.classifyErrorRemoval(victim, err, stats, windowSize, self.stickyExit())
+}
+
 // The swap's precondition under the install lock: the reservation is still
 // installed and unspent, and its victim is still installed and still out of
 // selection, or done.
@@ -265,7 +319,8 @@ func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOw
 // must be called with stateLock
 func (self *multiClientWindow) strictHandoverSwappableWithLock(handover *strictWindowHandover) bool {
 	victim := handover.victim
-	return self.strictHandover == handover && !handover.completed.Load() &&
+	pass := self.strictPass
+	return pass != nil && pass.handover == handover && !handover.completed.Load() &&
 		self.clients[victim.ClientId()] == victim &&
 		(victim.isWarning() || victim.IsDone())
 }
