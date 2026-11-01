@@ -24,9 +24,10 @@ package connect
 //
 // The GROUP owns the three transports a provider runs (A4). The standby is the
 // full-strategy, family-agnostic transport this product has always run; it
-// dials only after StandbyDelay, plus a draw over [0, StandbyJitter), has
-// elapsed with neither pinned transport connected, and it stands down again
-// when one connects. That covers
+// dials only after StandbyDelay has elapsed with neither pinned transport
+// connected since the group started, or StandbyDelay plus a draw over
+// [0, StandbyJitter) since the pins were lost, and it stands down again when
+// one connects. That covers
 // unprovisioned family names, blocked DNS and censored networks, where the
 // provider is then tagged legacy v4 by the platform. The delay is skipped
 // when no pinned transport can connect soon: every configured pin is held
@@ -1196,11 +1197,14 @@ type FamilyPlatformTransportGroupSettings struct {
 	// (sleeping or idle by policy) or its last dial failed because its
 	// hostname does not resolve. Any other failure waits out the delay.
 	StandbyDelay time.Duration
-	// StandbyJitter spreads the release past StandbyDelay: each delay waits a
-	// further draw uniform in [0, StandbyJitter). A platform restart or outage
-	// disconnects every provider's pinned transports in the same instant, and
-	// a fixed delay then released every standby in the fleet together.
-	// Non-positive releases at StandbyDelay exactly.
+	// StandbyJitter spreads the release after a pinned loss: the delay from
+	// the last pinned disconnect waits a further draw uniform in
+	// [0, StandbyJitter). A platform restart or outage disconnects every
+	// provider's pinned transports in the same instant, and a fixed delay then
+	// released every standby in the fleet together. A group start keeps
+	// StandbyDelay exactly: starts are one device's own events (an app start,
+	// a provide toggle, a policy migration). Non-positive releases at
+	// StandbyDelay exactly after a loss too.
 	StandbyJitter time.Duration
 
 	// Nil outside package tests. Replaces the uniform draw of the release's
@@ -1211,10 +1215,11 @@ type FamilyPlatformTransportGroupSettings struct {
 func DefaultFamilyPlatformTransportGroupSettings() *FamilyPlatformTransportGroupSettings {
 	return &FamilyPlatformTransportGroupSettings{
 		StandbyDelay: 15 * time.Second,
-		// releases spread over [15 s, 30 s) of an outage: a provider whose pins
-		// cannot connect falls back to the standby 7.5 s later on average, and
-		// a pin that cannot resolve still releases it at once
-		StandbyJitter: 15 * time.Second,
+		// after a pinned loss the standby releases in [15 s, 20 s): the fleet's
+		// releases spread over 5 s, and a provider whose pins cannot connect
+		// falls back 2.5 s later on average. A pin that cannot resolve still
+		// releases it at once.
+		StandbyJitter: 5 * time.Second,
 	}
 }
 
@@ -1363,7 +1368,8 @@ func NewFamilyPlatformTransportGroup(
 		&standbySettings,
 	)
 	group.standbyActive = !hasPinned
-	group.standbyDueTime = time.Now().Add(group.standbyDelay())
+	// a group start is this device's own event: StandbyDelay exactly
+	group.standbyDueTime = time.Now().Add(groupSettings.StandbyDelay)
 
 	go HandleError(func() {
 		defer close(group.done)
@@ -1372,11 +1378,11 @@ func NewFamilyPlatformTransportGroup(
 	return group
 }
 
-// standbyDelay is how long the standby waits from a moment with no pinned
-// transport connected: StandbyDelay, plus a draw uniform in [0, StandbyJitter)
-// so that providers whose pins lost the platform together do not release
-// their standbys together.
-func (self *FamilyPlatformTransportGroup) standbyDelay() time.Duration {
+// standbyDelayAfterLoss is how long the standby waits from the last pinned
+// disconnect: StandbyDelay, plus a draw uniform in [0, StandbyJitter) so that
+// providers whose pins lost the platform together do not release their
+// standbys together.
+func (self *FamilyPlatformTransportGroup) standbyDelayAfterLoss() time.Duration {
 	return self.settings.StandbyDelay + uniformJitter(self.settings.StandbyJitter, self.settings.standbyJitterForTest)
 }
 
@@ -1408,7 +1414,9 @@ func (self *FamilyPlatformTransportGroup) run() {
 				self.standbyDueTime = time.Time{}
 			} else {
 				if self.standbyDueTime.IsZero() {
-					self.standbyDueTime = now.Add(self.standbyDelay())
+					// the pins were connected and are lost: the loss may be
+					// every provider's at once, so the release spreads
+					self.standbyDueTime = now.Add(self.standbyDelayAfterLoss())
 				}
 				if !self.standbyActive {
 					if !now.Before(self.standbyDueTime) {
