@@ -4587,3 +4587,58 @@ The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
 cover these root causes with synthetic fixtures and explicit ordering. This
 review preserves the phased server/SDK and empty borrowed-resource limitations
 listed above; it does not change their deployment status.
+
+## Design note: authenticated seed bundle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The cold-start bootstrap of EXTENDER-UPDATE2 §2 is built in connect as a
+separate signed format beside the unsigned K7 share, which is unchanged.
+
+- Format (`protocol/extender.proto`, new messages only): `ExtenderSeedBody`
+  (format version 1, network host, sequence, issue and expiry times, serialized
+  open-tier records, serialized root-signed revocations) inside
+  `ExtenderSeedEnvelope` (body bytes, signature, key id). The envelope is
+  ed25519 over `ur-extender-seed-v1` || body; the key id is a lookup hint only.
+  The text form is `ur-seed:1:` and base64url without padding
+  (`net_extender_seed.go`).
+- Trust: an envelope verifies only under the root keys the directory already
+  holds (network-space configuration or hello), and every record inside is
+  verified again under its own root signature, network host, tier
+  (`ExtenderRecordOpen`, so no gated or canary record) and expiry. A bundle has
+  no field for keys, hosts, gossip urls or resolver settings, and a body or
+  envelope with a field a v1 reader does not know is refused rather than
+  partly read. Records must list public addresses only, outlive the bundle, and
+  be issued before it.
+- Limits: 64 KiB per envelope (checked before decoding), 8 records, 32
+  addresses, 32 revocations, 8 KiB per record, 1 KiB per revocation, a 30-day
+  maximum validity, and a 5-minute clock allowance either way (the directory's
+  `RecordExpireSkew`). A clock outside the allowance gets an explicit
+  `expired` or `not_yet_valid` refusal.
+- State (`net_extender_seed_store.go`): per normalized network host, the
+  greatest accepted sequence, its body digest and the bundle, all hosts in one
+  document saved through a byte backend (`ExtenderSeedStore`, the shape of
+  `ExtenderDirectoryStore`; `ExtenderSeedFileStore` writes temp, sync, rename).
+  Lower sequences are rollbacks, a different body at the floor a conflict, the
+  same bundle idempotent; nothing is written on a refusal; a backend that cannot
+  load fails closed; an undecodable document is no history. A floor binds only
+  while its envelope verifies under the keys in force, so a floor set by a key
+  a root update removed, or by a root a K7 settings import installed, is void
+  and dropped; a rotation the client followed keeps its floor, and an empty key
+  set judges nothing.
+- Directory: records enter only through `ApplyRecord` and revocations through
+  `ApplyRevocationSource`, both with `ExtenderSourceSeed`, revocations first. No
+  address is ever added, so the dialability rule is unchanged: a seed address
+  without a verified key is not dialable. A record applied from a seed carries
+  a per-key `seed` marker (stored as `record_source`); a lapsed seed record is
+  never one of the retained expired identities, so the expiry recovery never
+  offers a stale seed to a new cold start. A newer record from another source
+  clears the marker.
+- Bootstrap pass (`net_extender_seed_bootstrap.go`): https mirrors, each with
+  an optional dns-independent address (tls still verifies the url's host);
+  redirects only to configured hosts over https within a bound; every mirror
+  runs its own attempts with backoff under one attempt, dial and byte budget and
+  one deadline, so a stalled mirror holds up only itself; the first acceptable
+  bundle wins and the rest are canceled. Per-mirror outcomes are fixed codes
+  with no addresses. After a usable apply the owner calls
+  `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
+  once and runs a pass, so control reach and the gated release follow on the
+  seed's verified records.
