@@ -1,10 +1,12 @@
 package connect
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -467,21 +469,146 @@ func TestExtenderActivatorRetriesAPrivateFamilyAfterARevocation(t *testing.T) {
 func (self *testActivatorFixture) applyOwnRecord(ips ...string) {
 	self.t.Helper()
 	now := self.clock.Now()
-	recordBase64, err := self.operator.signRecord(
-		self.publicKey, ips, now, now.Add(14*24*time.Hour), []string{ExtenderCarrierTcp})
+	applyTestOperatorRecord(
+		self.t, self.directory, self.operator, self.publicKey, now, now.Add(14*24*time.Hour), ips...)
+}
+
+// Applies a record of `publicKey` naming `ips`, signed by the operator with the
+// given issue and expire times, to the directory, as the feed would.
+func applyTestOperatorRecord(
+	t *testing.T,
+	directory *ExtenderDirectory,
+	operator *testActivateOperator,
+	publicKey ed25519.PublicKey,
+	issueTime time.Time,
+	expireTime time.Time,
+	ips ...string,
+) {
+	t.Helper()
+	recordBase64, err := operator.signRecord(
+		publicKey, ips, issueTime, expireTime, []string{ExtenderCarrierTcp})
 	if err != nil {
-		self.t.Fatal(err)
+		t.Fatal(err)
 	}
 	recordBytes, err := base64.StdEncoding.DecodeString(recordBase64)
 	if err != nil {
-		self.t.Fatal(err)
+		t.Fatal(err)
 	}
 	record := &protocol.ExtenderRecord{}
 	if err := proto.Unmarshal(recordBytes, record); err != nil {
-		self.t.Fatal(err)
+		t.Fatal(err)
 	}
-	if _, err := self.directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
-		self.t.Fatal(err)
+	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Only the newest record of a key says what the operator publishes now. The
+// directory keeps every address the key's records have listed, and they read
+// active, but CurrentRecordNamesFamily reads the newest record alone, valid,
+// with addresses still the key's.
+func TestExtenderDirectoryCurrentRecordNamesFamily(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
+	operator := newTestActivateOperator(t, clock, rootPrivateKey)
+	newKey := func() ed25519.PublicKey {
+		seed, err := NewExtenderKeySeed()
+		if err != nil {
+			t.Fatal(err)
+		}
+		publicKey, err := ExtenderPublicKeyFromSeed(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return publicKey
+	}
+	expectNames := func(what string, publicKey ed25519.PublicKey, names4 bool, names6 bool) {
+		t.Helper()
+		if got := directory.CurrentRecordNamesFamily(publicKey, 4); got != names4 {
+			t.Fatalf("%s: names v4 = %t, expected %t", what, got, names4)
+		}
+		if got := directory.CurrentRecordNamesFamily(publicKey, 6); got != names6 {
+			t.Fatalf("%s: names v6 = %t, expected %t", what, got, names6)
+		}
+	}
+	day := 14 * 24 * time.Hour
+
+	// a newer record that drops v4
+	dropped := newKey()
+	expectNames("no record", dropped, false, false)
+	applyTestOperatorRecord(t, directory, operator, dropped, clock.Now(), clock.Now().Add(day), testActivateIpv4, testActivateIpv6)
+	expectNames("a record of both", dropped, true, true)
+	clock.advance(time.Second)
+	applyTestOperatorRecord(t, directory, operator, dropped, clock.Now(), clock.Now().Add(day), testActivateIpv6)
+	if state := testDirectoryState(t, directory, netip.MustParseAddr(testActivateIpv4)); state != ExtenderStateActive {
+		t.Fatalf("%s state = %q, expected the address the older record named kept and active", testActivateIpv4, state)
+	}
+	expectNames("a newer record of v6 alone", dropped, false, true)
+
+	// a revoked key
+	revoked := newKey()
+	applyTestOperatorRecord(t, directory, operator, revoked, clock.Now(), clock.Now().Add(day), "198.51.100.30")
+	expectNames("a record of v4", revoked, true, false)
+	clock.advance(time.Second)
+	if _, err := directory.ApplyRevocation(signTestRevocation(t, rootPrivateKey, revoked, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+	expectNames("revoked", revoked, false, false)
+
+	// an address another key claims since
+	claimed := newKey()
+	applyTestOperatorRecord(t, directory, operator, claimed, clock.Now(), clock.Now().Add(day), "198.51.100.31")
+	expectNames("a record of v4", claimed, true, false)
+	clock.advance(time.Second)
+	applyTestOperatorRecord(t, directory, operator, newKey(), clock.Now(), clock.Now().Add(day), "198.51.100.31")
+	expectNames("its address claimed by another key", claimed, false, false)
+
+	// an expired record
+	expired := newKey()
+	applyTestOperatorRecord(t, directory, operator, expired, clock.Now(), clock.Now().Add(time.Hour), "198.51.100.32")
+	expectNames("a record of v4", expired, true, false)
+	clock.advance(2 * time.Hour)
+	expectNames("expired", expired, false, false)
+}
+
+// The newest record of this extender names v6 alone: the operator stopped
+// publishing v4, which an earlier record named. The directory keeps that v4
+// address under this key and it reads active, but it is no evidence that
+// anything forwards to v4 now, so a private v4 refused at start waits for its
+// tick, as the owner decided.
+func TestExtenderActivatorCountsOnlyTheNewestOwnRecord(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.applyOwnRecord(testActivateIpv4, testActivateIpv6)
+		fixture.clock.advance(time.Second)
+		fixture.applyOwnRecord(testActivateIpv6)
+		fixture.operator.setFamilyRefusal(4, testActivateFamilyRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.IpVersionPublic = func(ipVersion int) bool { return ipVersion == 6 }
+	})
+	startTime := fixture.clock.Now()
+	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateActive {
+		t.Fatalf("%s state = %q, expected the dropped address kept and active", testActivateIpv4, state)
+	}
+	if fixture.directory.CurrentRecordNamesFamily(fixture.publicKey, 4) {
+		t.Fatal("the newest own record names v4")
+	}
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+
+	for _, at := range []time.Duration{
+		10 * time.Minute,
+		30 * time.Minute,
+		70 * time.Minute,
+		6 * time.Hour,
+		24*time.Hour - time.Minute,
+	} {
+		fixture.step(startTime.Add(at).Sub(fixture.clock.Now()))
+		fixture.expectFamilyPostCounts(fmt.Sprintf("at %s", at), 1, 1)
+	}
+	fixture.clock.advance(time.Minute)
+	tickTime := startTime.Add(24 * time.Hour)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 || post.postTime != tickTime {
+		t.Fatalf("tick post = v%d at %s, expected v4 at 24h", post.ipVersion, post.postTime.Sub(startTime))
 	}
 }
 

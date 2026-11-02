@@ -1133,8 +1133,11 @@ backoff, since a NAT that never forwards refuses every retry alike. It has
 activated once it has since start, or once the directory holds this
 extender's own current record naming an address of the family, which is the
 operator's word that it published the family after its probes passed and
-which carries a restart; a revoked or expired record does not count, and
-the schedules move once every post of the pass is answered, so the record
+which carries a restart. Only the newest record of the key counts
+(`CurrentRecordNamesFamily`): a revoked or expired one does not, nor does an
+address an older record named that the newest no longer does, though the
+directory keeps that address, nor one another key has claimed since. The
+schedules move once every post of the pass is answered, so the record
 another family's answer brings counts too. Once it has activated, something
 forwards to it, so its refusals -- the operator's budgets, a probe that
 failed, the re-post of a revocation -- are held on the backoff as any
@@ -1168,7 +1171,9 @@ activated family unposted for a day; the address a check saw outlived an
 activation that moved the family; and the look for a family without an
 address doubled to 6 hours. A second review carried "activated" across a
 restart, through the directory's own record, so a forwarded family whose
-first post of a run is refused by the operator is not held for the day.
+first post of a run is refused by the operator is not held for the day; a
+third read that record's newest body alone rather than every address the
+directory keeps for the key.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,

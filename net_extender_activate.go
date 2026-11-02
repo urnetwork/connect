@@ -983,24 +983,16 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 // Whether the directory holds this extender's own current record naming an
 // address of the family: the operator published the family after its probes
 // passed, in this run or an earlier one whose record the directory kept or the
-// feed brought back (G3). An address in the record counts whatever the local
-// dial evidence says of it, active, warning or hold; a revoked or expired
-// record, and an address no record names, do not. It reads the snapshot
-// observeRevocation reads.
+// feed brought back (G3). Only the newest record of the key counts, valid,
+// neither revoked nor expired; an address an older record named and the newest
+// no longer does is the operator no longer publishing it, though the directory
+// keeps the address. Local dial evidence does not enter, so an address in
+// warning or hold counts (ExtenderDirectory.CurrentRecordNamesFamily).
 func (self *ExtenderActivator) ownRecordNamesFamily(ipVersion int) bool {
 	if self.settings.Directory == nil || len(self.settings.PublicKey) == 0 {
 		return false
 	}
-	for _, entry := range self.settings.Directory.Snapshot().Entries {
-		if entry.IpVersion != ipVersion || !slices.Equal(entry.PublicKey, self.settings.PublicKey) {
-			continue
-		}
-		switch entry.State {
-		case ExtenderStateActive, ExtenderStateWarning, ExtenderStateHold:
-			return true
-		}
-	}
-	return false
+	return self.settings.Directory.CurrentRecordNamesFamily(self.settings.PublicKey, ipVersion)
 }
 
 // One family's turn in a pass: its post to its family api url, unless the host
