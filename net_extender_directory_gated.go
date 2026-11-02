@@ -417,6 +417,7 @@ func (self *ExtenderDirectory) ConnectCandidates(
 				candidateClass = ExtenderGatedClassOpen
 			}
 			state.candidateCounts = extenderGatedCountAdd(state.candidateCounts, candidateClass, 1)
+			self.blockEvidenceDrawnWithLock(candidate)
 		}
 	}
 	return familyCandidates
