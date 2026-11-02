@@ -2075,9 +2075,9 @@ in this order, the first match winning:
 - `active`: at least one family is activated. Green; `Active · IPv4 and
   IPv6`, or the one family; when the other family's last activation
   failed, its reason follows on the same line.
-- `error`, listen: no carrier bound, or the tcp carrier was lost and is being
-  bound again (G2), when no family reads as activated. Red; `Could not listen: `
-  and the carrier errors.
+- `error`, listen: no carrier bound, the tcp carrier was lost and is being bound
+  again, or the role failed and is being replaced (G2), when no family reads as
+  activated. Red; `Could not listen: ` and the carrier errors.
 - `error`, activation: the last activation failed or was refused and no
   family is active. Red; `Activation refused: ` and the operator's reason,
   or `Activation failed: ` and the error.
