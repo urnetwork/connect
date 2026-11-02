@@ -640,32 +640,82 @@ func TestExtenderSeedBootstrapBudgets(t *testing.T) {
 }
 
 // A response past the artifact cap is refused, by its length when it states
-// one and by what is read when it does not, and never read past the cap.
+// one and by what is read when it does not, and never read past the cap. The
+// cap is the mirror contract's (api/bringyour.yml, `/v1/seed.bin`): the raw
+// envelope at most 64 KiB, so a response one byte past it is already too
+// large, refused before anything is decoded.
 func TestExtenderSeedBootstrapOversizedResponse(t *testing.T) {
-	for _, stated := range []bool{true, false} {
-		t.Run(strconv.FormatBool(stated), func(t *testing.T) {
-			bootstrap := newTestSeedBootstrap(t)
-			oversize := strings.Repeat("A", 4*extenderSeedMaxArtifactByteCount)
-			server := newTestSeedMirrorServer(t, bootstrap.certificate, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if stated {
-					w.Header().Set("Content-Length", strconv.Itoa(len(oversize)))
+	for _, size := range []int{ExtenderSeedMaxEnvelopeByteCount + 1, 4 * extenderSeedMaxArtifactByteCount} {
+		for _, stated := range []bool{true, false} {
+			t.Run(strconv.Itoa(size)+"/"+strconv.FormatBool(stated), func(t *testing.T) {
+				bootstrap := newTestSeedBootstrap(t)
+				oversize := strings.Repeat("A", size)
+				server := newTestSeedMirrorServer(t, bootstrap.certificate, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if stated {
+						w.Header().Set("Content-Length", strconv.Itoa(len(oversize)))
+					}
+					io.WriteString(w, oversize)
+				}))
+				result, err, _ := bootstrap.run(t, t.Context(), bootstrap.settings(
+					&ExtenderSeedMirror{Url: "https://seed-a.example/seed", Address: server.Listener.Addr().String()},
+				))
+				requireExtenderSeedCode(t, err, ExtenderSeedCodeFetch)
+				if result.Mirrors[0].Outcome != ExtenderSeedMirrorOutcomeTooLarge || result.Mirrors[0].AttemptCount != 1 {
+					t.Fatalf("outcome = %s/%s after %d attempts", result.Mirrors[0].Outcome, result.Mirrors[0].Code, result.Mirrors[0].AttemptCount)
 				}
-				io.WriteString(w, oversize)
-			}))
-			result, err, _ := bootstrap.run(t, t.Context(), bootstrap.settings(
-				&ExtenderSeedMirror{Url: "https://seed-a.example/seed", Address: server.Listener.Addr().String()},
-			))
-			requireExtenderSeedCode(t, err, ExtenderSeedCodeFetch)
-			if result.Mirrors[0].Outcome != ExtenderSeedMirrorOutcomeTooLarge || result.Mirrors[0].AttemptCount != 1 {
-				t.Fatalf("outcome = %s after %d attempts", result.Mirrors[0].Outcome, result.Mirrors[0].AttemptCount)
-			}
-			if int64(extenderSeedMaxArtifactByteCount) < result.ByteCount {
-				t.Fatalf("read %d bytes, past the cap", result.ByteCount)
-			}
-			if stated && result.ByteCount != 0 {
-				t.Fatalf("read %d bytes of a response whose length is past the cap", result.ByteCount)
-			}
-		})
+				if int64(extenderSeedMaxArtifactByteCount) < result.ByteCount {
+					t.Fatalf("read %d bytes, past the cap", result.ByteCount)
+				}
+				if stated && result.ByteCount != 0 {
+					t.Fatalf("read %d bytes of a response whose length is past the cap", result.ByteCount)
+				}
+			})
+		}
+	}
+}
+
+// A reader that counts the bytes it hands out.
+type testSeedCountingReader struct {
+	reader    io.Reader
+	readCount int
+}
+
+func (self *testSeedCountingReader) Read(p []byte) (int, error) {
+	n, err := self.reader.Read(p)
+	self.readCount += n
+	return n, err
+}
+
+// The read takes at most one byte past the cap from a response body, however
+// much more the body has, and a body of exactly the cap is read whole.
+func TestExtenderSeedBootstrapReadsAtMostOneBytePastTheCap(t *testing.T) {
+	newPass := func() *extenderSeedBootstrapPass {
+		return &extenderSeedBootstrapPass{
+			budget: &extenderSeedPassBudget{
+				maxAttemptCount: 1,
+				maxDialCount:    1,
+				maxByteCount:    int64(8 * extenderSeedMaxArtifactByteCount),
+			},
+		}
+	}
+	for _, size := range []int{ExtenderSeedMaxEnvelopeByteCount + 1, ExtenderSeedMaxEnvelopeByteCount + 4096, 4 * ExtenderSeedMaxEnvelopeByteCount} {
+		body := &testSeedCountingReader{reader: strings.NewReader(strings.Repeat("A", size))}
+		pass := newPass()
+		if _, err := pass.readArtifact(body); !errors.Is(err, errExtenderSeedTooLarge) {
+			t.Fatalf("a %d byte body read as %v, expected too large", size, err)
+		}
+		if ExtenderSeedMaxEnvelopeByteCount+1 < body.readCount {
+			t.Fatalf("read %d bytes of a %d byte body, past one byte over the cap", body.readCount, size)
+		}
+		if used := pass.budget.byteCount.Load(); int64(ExtenderSeedMaxEnvelopeByteCount) < used {
+			t.Fatalf("the budget took %d bytes, past the cap", used)
+		}
+	}
+
+	body := &testSeedCountingReader{reader: strings.NewReader(strings.Repeat("A", ExtenderSeedMaxEnvelopeByteCount))}
+	artifact, err := newPass().readArtifact(body)
+	if err != nil || len(artifact) != ExtenderSeedMaxEnvelopeByteCount {
+		t.Fatalf("a body of exactly the cap read as %d bytes, %v", len(artifact), err)
 	}
 }
 

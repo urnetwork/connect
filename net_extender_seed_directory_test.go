@@ -380,6 +380,84 @@ func TestExtenderSeedImportAndStoredApply(t *testing.T) {
 	}
 }
 
+// A start applies the accepted bundle of every host the space accepts, each
+// judged on its own: a stale bundle of one host keeps its floor and is passed
+// over, and never keeps a fresh bundle of another host from applying. Only
+// when every host's bundle is refused is the refusal returned.
+func TestExtenderSeedStoredApplyPassesOverAStaleHost(t *testing.T) {
+	clock := newTestClock()
+	now := clock.Now()
+	const staleHost = "stale.example"
+	networkHosts := []string{staleHost, testExtenderNetworkHost}
+	newDirectory := func() *ExtenderDirectory {
+		settings := DefaultExtenderDirectorySettings()
+		settings.Now = clock.Now
+		settings.NetworkHosts = networkHosts
+		ctx, cancel := context.WithCancel(context.Background())
+		directory := NewExtenderDirectory(ctx, settings)
+		directory.SetRootKeys(testSeedRootKeys(testSeedRootKey))
+		t.Cleanup(func() {
+			directory.Close()
+			cancel()
+		})
+		return directory
+	}
+	acceptor := NewExtenderSeedAcceptor(NewExtenderSeedMemoryStore(), nil)
+
+	// the first host's bundle is valid for an hour, the space's for a day
+	staleRecord := testSeedEditedRecord(t, testSeedRootKey, 1, now, func(body *protocol.ExtenderRecordBody) {
+		body.NetworkHost = staleHost
+	}, "203.0.113.1")
+	staleBody, err := NewExtenderSeedBody(staleHost, 1, now.Add(-time.Minute), now.Add(time.Hour), []*protocol.ExtenderRecord{staleRecord}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleEnvelope, err := SignExtenderSeed(testSeedRootKey, staleBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := newDirectory()
+	for _, envelope := range []*protocol.ExtenderSeedEnvelope{
+		staleEnvelope,
+		testSeedEnvelope(t, testSeedRootKey, 1, now, []*protocol.ExtenderRecord{testSeedRecord(t, testSeedRootKey, 2, now, "203.0.113.2")}, nil),
+	} {
+		text, err := EncodeExtenderSeedText(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result, err := ImportExtenderSeed(directory, acceptor, []byte(text)); err != nil || result.Outcome != ExtenderSeedOutcomeAccepted {
+			t.Fatalf("import = %v, %v", result, err)
+		}
+	}
+
+	// both in force: a start applies both
+	started := newDirectory()
+	result, err := ApplyStoredExtenderSeed(started, acceptor)
+	if err != nil || result == nil || result.Bundle.NetworkHost != staleHost {
+		t.Fatalf("stored apply = %v, %v; expected the first host's bundle", result, err)
+	}
+	requireCandidateIps(t, started.Candidates(0, 64), "203.0.113.1", "203.0.113.2")
+
+	// two hours on, the first host's bundle is stale and the space's is not
+	clock.advance(2 * time.Hour)
+	later := newDirectory()
+	result, err = ApplyStoredExtenderSeed(later, acceptor)
+	if err != nil || result == nil || result.Bundle.NetworkHost != testExtenderNetworkHost || result.Apply.UsableRecordCount != 1 {
+		t.Fatalf("stored apply with one stale host = %v, %v; expected the space's bundle", result, err)
+	}
+	requireCandidateIps(t, later.Candidates(0, 64), "203.0.113.2")
+	if sequence, err := acceptor.Sequence(staleHost, later.RootKeys()); err != nil || sequence != 1 {
+		t.Fatalf("the stale host's floor = %d, %v; expected it kept", sequence, err)
+	}
+
+	// once every host's bundle is stale, the first refusal is returned
+	clock.advance(48 * time.Hour)
+	stale := newDirectory()
+	_, err = ApplyStoredExtenderSeed(stale, acceptor)
+	requireExtenderSeedCode(t, err, ExtenderSeedCodeExpired)
+	requireNothingDialable(t, stale, "203.0.113.1", "203.0.113.2")
+}
+
 // A bundle held past its validity is judged again when it is applied, so a
 // caller that kept a verified bundle cannot apply it once it is stale.
 func TestExtenderSeedApplyRejectsAStaleBundle(t *testing.T) {
