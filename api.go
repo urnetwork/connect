@@ -401,6 +401,11 @@ type FindProviders2Args struct {
 
 type FindProviders2Result struct {
 	Providers []*FindProvidersProvider `json:"providers"`
+	// The platform's override of the strict window handover
+	// (`MultiClientSettings.StrictWindowHandover`): false turns it off, true
+	// leaves it to the host's setting, and absent, as from an older server,
+	// overrides nothing. See MultiClientGeneratorWithStrictWindowHandoverOverride.
+	WindowStrictHandover *bool `json:"window_strict_handover,omitempty"`
 }
 
 type FindProvidersProvider struct {

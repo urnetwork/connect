@@ -386,6 +386,10 @@ type ApiMultiClientGenerator struct {
 	// `PostQuantumEncryption` unset (SetPostQuantumEncryption).
 	postQuantumEncryption atomic.Bool
 
+	// The platform's override of the strict window handover, as the latest
+	// discovery answer carried it (StrictWindowHandoverOverride).
+	strictWindowHandoverOverride strictWindowHandoverOverride
+
 	api *BringYourApi
 
 	// window identity persistence (PROXYDRAIN1.md §3.5); nil state behavior
@@ -934,7 +938,53 @@ func (self *ApiMultiClientGenerator) findProviders2(ctx context.Context, findPro
 	if err == nil && result == nil {
 		err = errors.New("provider discovery returned no result")
 	}
+	if err == nil {
+		// every answer sets the override, or clears it; a failed request says
+		// nothing about it
+		self.strictWindowHandoverOverride.observe(result.WindowStrictHandover)
+	}
 	return result, err
+}
+
+// Implements MultiClientGeneratorWithStrictWindowHandoverOverride.
+func (self *ApiMultiClientGenerator) StrictWindowHandoverOverride() (enabled bool, set bool) {
+	return self.strictWindowHandoverOverride.get()
+}
+
+// The platform's override of the strict window handover, as one discovery
+// answer at a time sets it: none, on or off. Safe for concurrent use.
+type strictWindowHandoverOverride struct {
+	value atomic.Int32
+}
+
+const (
+	strictWindowHandoverOverrideNone int32 = 0
+	strictWindowHandoverOverrideOn   int32 = 1
+	strictWindowHandoverOverrideOff  int32 = 2
+)
+
+// Takes one answer's override, nil for none.
+func (self *strictWindowHandoverOverride) observe(windowStrictHandover *bool) {
+	value := strictWindowHandoverOverrideNone
+	if windowStrictHandover != nil {
+		if *windowStrictHandover {
+			value = strictWindowHandoverOverrideOn
+		} else {
+			value = strictWindowHandoverOverrideOff
+		}
+	}
+	self.value.Store(value)
+}
+
+func (self *strictWindowHandoverOverride) get() (enabled bool, set bool) {
+	switch self.value.Load() {
+	case strictWindowHandoverOverrideOn:
+		return true, true
+	case strictWindowHandoverOverrideOff:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // Adds each discovered provider as a destination with its discovery stats.

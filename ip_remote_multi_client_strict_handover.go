@@ -62,10 +62,36 @@ type strictWindowHandover struct {
 	completed atomic.Bool
 }
 
-// Both parts are on: a strict window with the handover enabled.
+// An optional generator capability: the platform's override of the strict
+// window handover, as the generator's latest discovery answer carried it
+// (`FindProviders2Result.WindowStrictHandover`). It is the platform's off
+// switch: false turns every strict window's handover off, while true and no
+// override leave the host's StrictWindowHandover, so the platform can turn the
+// handover off but never on past its host. The windows read it at each
+// decision, so a discovery answer that carries it takes effect from the next
+// one. A generator without the capability overrides nothing.
+type MultiClientGeneratorWithStrictWindowHandoverOverride interface {
+	// The override as of the latest discovery answer, unset when that answer
+	// carried none.
+	StrictWindowHandoverOverride() (enabled bool, set bool)
+}
+
+// Both parts are on: a strict window with the handover enabled, which the
+// platform has not turned off.
 func (self *multiClientWindow) strictWindowHandoverEnabled() bool {
 	return self != nil && self.settings != nil &&
-		self.settings.StrictWindowSizeHardMax && self.settings.StrictWindowHandover
+		self.settings.StrictWindowSizeHardMax && self.settings.StrictWindowHandover &&
+		!self.strictWindowHandoverTurnedOff()
+}
+
+// Whether the platform's latest discovery answer turned the handover off.
+func (self *multiClientWindow) strictWindowHandoverTurnedOff() bool {
+	override, ok := self.generator.(MultiClientGeneratorWithStrictWindowHandoverOverride)
+	if !ok {
+		return false
+	}
+	enabled, set := override.StrictWindowHandoverOverride()
+	return set && !enabled
 }
 
 // How many new identities admission would accept right now: the free slots
@@ -281,6 +307,12 @@ func (self *multiClientWindow) endStrictPass(pass *strictWindowPass) {
 // against what is there under the lock, as replacementAllowed is: a victim
 // takes no new flows, so the window in which one lands is tiny.
 func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOwner) *strictWindowHandover {
+	// turned off since the pass reserved the slot: the candidate is declined
+	// as at the hard max and the victim keeps its slot, and the reservation
+	// ends with the pass
+	if !self.strictWindowHandoverEnabled() {
+		return nil
+	}
 	var handover *strictWindowHandover
 	func() {
 		self.stateLock.Lock()

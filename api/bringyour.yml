@@ -12245,6 +12245,14 @@ components:
                   `client_id`, and with `strict`.
                 type: string
                 enum: [region, country]
+        window_strict_handover:
+          description: |
+            The platform's override of the clients' strict window handover:
+            `false` turns it off, `true` leaves each client's own setting,
+            which the override can never turn on. Absent overrides nothing.
+            The api answers it over http only; in-process callers never see
+            it.
+          type: boolean
 
     WalletBalanceResult:
       type: object
