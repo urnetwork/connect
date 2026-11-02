@@ -601,11 +601,23 @@ client and every account, kept under a keyed hash; and per account 60 plus 6
 for each proven host, at most 1200. A proven host is an identity key of the
 account that passed activation on that family between 1 hour and 7 days ago,
 counted once per address and at most 32 per /24 or /48, so a fleet that has
-passed activation restarts at once and a new one ramps an hour at a time.
-The api process probes at most 64 activations at once. A post over a budget
-or over the probes is refused with the wait until there is room in
-`retry_after_seconds`, which the activator waits out (G3), and spends
-nothing. An
+passed activation restarts at once and a new one ramps an hour at a time;
+each api process reuses an account's proven host candidates for a minute
+and counts them at every read's own time. A key its network already proved
+at the caller's /32 or /64, its last pass there at most 7 days ago, spends
+a budget of its own at that address, 6 an hour, instead of the address's:
+a public extender relays posts to the api from its own address, so other
+accounts' posts through it spend the address's budget, and must not hold
+off its own re-activation. The api process probes at most 64 activations
+at once. A post over a budget, over the probes, or whose wait for a
+budget's lock ran past its 2 s bound is refused with the wait until there
+is room in `retry_after_seconds`, which the activator waits out (G3), and
+spends nothing: for the budgets, the longest wait of those with no room
+and up to a minute more, drawn so a fleet refused together does not come
+back together; for a busy api, one to three minutes. The attempts one
+spend records for its budgets are each recorded up to a second before it,
+so no create_time joins the address's hashed row to its client's and
+account's. An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
 is refused before it is probed. The handler probes the caller ip synchronously
 within one 10 s probe budget, in this order: the required test (C2a) --
@@ -696,9 +708,12 @@ left of the 10 s probe budget: ..." for quic; one that failed on its own
 keeps its probe's error. Old providers decode the answer into
 `connect.ExtenderActivateResult`, which skips the new fields. The api
 counts every activation in `urnetwork_extender_activations_total{stage,
-outcome, family}` -- stage `request`, `config`, `budget`, `tcp`, `forward`
-or `store`; outcome `refused`, `error`, `timeout`, `other_family` or
-`activated`; family `ipv4`, `ipv6` or `unknown` -- and times every step in
+outcome, family}` -- stage `request`, `config`, `busy`, `budget`, `tcp`,
+`forward` or `store`; outcome `refused`, `error`, `timeout`,
+`other_family` or `activated`, and for `busy` why (`probes`,
+`budget_lock`) and for `budget` which budget refused (`client`,
+`address`, `proven_address`, `account`; connect#230); family `ipv4`,
+`ipv6` or `unknown` -- and times every step in
 `urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
 whose buckets end at 10 s. The extenders dashboard shows both.
 

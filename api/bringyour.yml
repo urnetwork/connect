@@ -1804,13 +1804,17 @@ paths:
         every account; and per account 60 plus 6 for each proven host, at
         most 1200. A proven host is an identity key of the account that
         passed activation on that family between 1 hour and 7 days ago,
-        counted once per address and at most 32 per /24 or /48. The operator
-        also probes only so many activations at once, and refuses one more as
+        counted once per address and at most 32 per /24 or /48. A key the
+        account already proved at the caller's /32 or /64 spends 6 an hour
+        of its own there instead of the address's, so posts relayed through
+        an extender cannot hold off its own re-activation. The operator also
+        probes only so many activations at once, and refuses one more as
         busy. A budget is spent only when the operator is about to probe, so
         a request refused before the probe (malformed arguments, the wrong
         family, a spent budget, a busy operator) costs nothing, and a refusal
         by a spent budget or a busy operator says in `retry_after_seconds`
-        how long until there is room again. Call it on the
+        how long until there is room again: the longest wait of the spent
+        budgets, plus up to a minute. Call it on the
         family api host of the family being activated --
         `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
         an IPv6 one -- so the caller address the operator probes back has
