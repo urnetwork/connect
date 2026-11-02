@@ -5037,3 +5037,27 @@ extends P. It does not revise P.
   run-time rollback lever in connectctl, whose rollback is a restart without
   `--camouflage_splice`. The revalidation timer is monotonic, so a desktop that sleeps
   verifies late by the time it slept.
+
+## Design note: block reporters and what a client's errors say (EXTENDER-UPDATE2 §1.3, 2026-11-02)
+
+Two corrections to the block report note above, which this adds to.
+
+- Distinct reporters are networks. The server's threshold counted `client_id`s, so
+  one account's three devices blocked a record for a whole country. It now counts
+  distinct networks through `network_client`, joined on the client id of the report's
+  verified token, so the known limit in the note above is narrower: separate accounts
+  behind one firewall still count separately. The threshold value and the probe check
+  are unchanged. The table records no network, and this needs no migration. Reading
+  the row at count time means a report whose client has since been reaped (30 days
+  after it was deactivated) drops out, which errs toward no block.
+  `ExtenderBlockedState`'s reporter is whatever the caller passes, and the rule there
+  is unchanged.
+- A client's errors name no address. A failed dial names the address it dialed, and
+  sometimes this host's own, and the feed and probe lines of the network client also
+  named each candidate. All of it reached default-level logs, and the feed's text
+  reached `ExtenderStatus.LastError`. Those lines leave a device in feedback and
+  support, and a client holds gated records. Default-level lines of
+  `net_extender_network.go` and `net_extender_dns_progress.go` and `LastError` now go
+  through `extenderErrorText`, which takes every ip literal out by parsing it, and the
+  feed and probe lines no longer name the candidate. Lines behind a verbosity someone
+  opted into still do. Tests: `net_extender_network_log_test.go`.
