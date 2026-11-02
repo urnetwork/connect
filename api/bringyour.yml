@@ -2037,6 +2037,50 @@ paths:
         "401":
           description: Missing or invalid bearer token.
 
+  /network/extender-camouflage-report:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Report what this client's tcp camouflage came to
+      description: |
+        A report the SDK and an extender make on their own about once an hour,
+        off by default on both sides and only while the operator has it on:
+        counts of what the sender's tcp camouflage dials came to since its last
+        report, and for an extender how it classified its tcp connections, the
+        load on each borrowed site and its coverage verdict. The route only
+        increments counters and stores nothing. Needs a client JWT, which spends
+        a rate budget per client and is not recorded; the country is the
+        operator's own lookup of the caller's address, and anything a report says
+        beyond these fields is ignored.
+
+        A report's `report_id` stays the same across its retries, and a retry of a
+        report already counted answers `duplicate` and adds nothing, so a sender
+        retries a post whose answer it lost without counting anything twice. Every
+        answer is 200: `accepted` and `duplicate` end a report; `rate_limited`
+        and `unavailable` are not counted and may be posted again, the first after
+        `retry_after_seconds`; `invalid` is not counted and never will be;
+        `disabled` means the operator has the reports off, so ask again in hours. A
+        sender treats an outcome it does not know as `unavailable`, and stops
+        posting one id after two hours, since the operator holds it for three.
+      operationId: extenderCamouflageReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderCamouflageReportArgs"
+      responses:
+        "200":
+          description: What became of the report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderCamouflageReportResult"
+        "401":
+          description: Missing or invalid bearer token.
+
   /network/ping-report:
     post:
       tags: [Network]
@@ -11099,6 +11143,143 @@ components:
         error:
           description: Why the report was not recorded; absent when it was, for an unknown key, and for an extender the operator's probe does not reach now.
           type: string
+
+    ExtenderCamouflageClientCounts:
+      type: object
+      required: []
+      description: What a client's tcp camouflage dials came to since its last report, each at most 65536.
+      properties:
+        camouflage_won:
+          description: Races the camouflaged attempt won.
+          type: integer
+          format: int64
+        legacy_won:
+          description: Races the legacy attempt won, the Phase A fallback.
+          type: integer
+          format: int64
+        both_failed:
+          description: Races where both attempts failed, the Phase B loss.
+          type: integer
+          format: int64
+        refused:
+          description: Races ended by a refusal or a limit.
+          type: integer
+          format: int64
+        camouflage_unauthenticated:
+          description: Camouflaged attempts the extender terminated unauthenticated, in Phase A.
+          type: integer
+          format: int64
+        camouflage_leaf_rejected:
+          description: Camouflaged attempts that met a leaf the record key did not sign, the Phase B splice.
+          type: integer
+          format: int64
+        legacy_only_no_key:
+          description: Dials that ran the legacy attempt alone because the config carried no camouflage key.
+          type: integer
+          format: int64
+        legacy_only_fingerprint:
+          description: Dials that ran the legacy attempt alone because the fingerprint switch is not the Chrome hello.
+          type: integer
+          format: int64
+        legacy_only_no_front_name:
+          description: Dials that ran the legacy attempt alone because there was no borrowed name to front.
+          type: integer
+          format: int64
+
+    ExtenderCamouflageTargetCounts:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          description: A borrowed site's name, at most 253 bytes. The operator labels only names in its own bundled lists, and every other name as `other`.
+          type: string
+        splice_count:
+          description: Splices that began to the site since the last report, at most 2^24.
+          type: integer
+          format: int64
+        relayed_byte_count:
+          description: Bytes spliced to and from the site since the last report, at most 2^44.
+          type: integer
+          format: int64
+
+    ExtenderCamouflageExtenderCounts:
+      type: object
+      required: []
+      description: How an extender classified its tcp connections since its last report, each at most 2^26, and its coverage verdict now. Taken only from a client that activated an extender that is active.
+      properties:
+        authenticated:
+          type: integer
+          format: int64
+        spliced:
+          type: integer
+          format: int64
+        terminated:
+          type: integer
+          format: int64
+        splice_fallback_terminated:
+          description: Splice on and no borrowed target reachable, the degraded exposure.
+          type: integer
+          format: int64
+        replay_refused:
+          type: integer
+          format: int64
+        time_window_failed:
+          type: integer
+          format: int64
+        splice_dial_failed:
+          type: integer
+          format: int64
+        borrow_verify_failed:
+          type: integer
+          format: int64
+        targets:
+          description: At most 32 borrowed sites.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderCamouflageTargetCounts"
+        covered:
+          description: Whether this extender presents real-site behavior to a prober now.
+          type: boolean
+        degraded_reason:
+          description: Why it does not, when it does not. One of `camouflage_off`, `splice_off`, `splice_gate_closed`, `no_verified_target`, `splice_fallback_active` and `coverage_incomplete`; anything else reads as `other`.
+          type: string
+
+    ExtenderCamouflageReportArgs:
+      type: object
+      required:
+        - report_id
+      properties:
+        report_id:
+          description: 32 lower case hex digits, random, the same across the retries of one report.
+          type: string
+        client_version:
+          description: The sender's build, at most 64 bytes. Reduced to a calendar release label.
+          type: string
+        resource_version:
+          description: The version of the borrow list the sender reads, zero for none.
+          type: integer
+        ip_versions:
+          description: The address families the sender dials extenders of (4, 6). Empty means any.
+          type: array
+          items:
+            type: integer
+        client:
+          $ref: "#/components/schemas/ExtenderCamouflageClientCounts"
+        extender:
+          $ref: "#/components/schemas/ExtenderCamouflageExtenderCounts"
+
+    ExtenderCamouflageReportResult:
+      type: object
+      required:
+        - outcome
+      properties:
+        outcome:
+          description: "`accepted`, `duplicate`, `rate_limited`, `disabled`, `invalid` or `unavailable`. A sender treats one it does not know as `unavailable`."
+          type: string
+        retry_after_seconds:
+          description: With `rate_limited`, how long until a report can be taken.
+          type: integer
 
     TestBalanceDrainArgs:
       type: object
