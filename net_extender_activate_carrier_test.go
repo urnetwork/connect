@@ -402,3 +402,210 @@ func TestExtenderActivatorTcpCarrierReturnWithThePlainApiUrl(t *testing.T) {
 	fixture.waitPost()
 	fixture.waitActivation()
 }
+
+// Closes the activator and starts the one that replaces it on the same settings, as
+// a role being replaced does.
+func (self *testActivatorFixture) replaceActivator(configure func(settings *ExtenderActivatorSettings)) {
+	self.t.Helper()
+	self.activator.Close()
+	settings := *self.activatorSettings
+	settings.PreviousState = self.activator.State()
+	if configure != nil {
+		configure(&settings)
+	}
+	self.activator = NewExtenderActivator(self.activatorCtx, &settings)
+}
+
+// Replacing a role is not a restart of the host. A family that stands activated
+// stays activated, in its status from the start, and is posted once more within the
+// spread, since a new role needs what a post gives it. Then it is back on its tick.
+func TestExtenderActivatorReplacementKeepsARecordAndSpreadsThePost(t *testing.T) {
+	draws := make(chan time.Duration, 8)
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.step(time.Minute)
+	fixture.replaceActivator(func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			draws <- maxJitter
+			return 30 * time.Minute
+		}
+	})
+	for _, ipVersion := range []int{4, 6} {
+		status := fixture.activator.Status().Family(ipVersion)
+		if !status.Activated || !status.Ip.IsValid() {
+			t.Fatalf("v%d status = %+v, expected it carried over", ipVersion, status)
+		}
+		if maxJitter := <-draws; maxJitter != DefaultExtenderActivatorSettings().ReplacedPostJitter {
+			t.Fatalf("drew from %s", maxJitter)
+		}
+	}
+
+	fixture.step(29 * time.Minute)
+	fixture.expectFamilyPostCounts("within the draw", 1, 1)
+
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the draw", post.ipVersion)
+	}
+	fixture.waitPost()
+	fixture.step(23 * time.Hour)
+	fixture.expectFamilyPostCounts("on the tick from there", 2, 2)
+}
+
+// A family's tick stands if it comes before the draw.
+func TestExtenderActivatorReplacementPostsNoLaterThanTheTick(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.step(23*time.Hour + 30*time.Minute)
+	fixture.replaceActivator(func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			return 59 * time.Minute
+		}
+	})
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("short of the tick", 1, 1)
+	fixture.clock.advance(29 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d at the tick", post.ipVersion)
+	}
+	fixture.waitPost()
+}
+
+// A family waiting out what the operator said goes on waiting: replacing the role
+// used to post at once.
+func TestExtenderActivatorReplacementKeepsARetryAfter(t *testing.T) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setRefusal(testActivateFamilyRefusal)
+		operator.setRetryAfterSeconds(50 * 60)
+	}, nil)
+	fixture.waitFirstPass()
+	fixture.step(time.Minute)
+	fixture.replaceActivator(nil)
+
+	fixture.step(time.Minute)
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after the replacement", 1, 1)
+	if status := fixture.activator.Status().Family(4); !status.LastRefused || status.LastError != testActivateFamilyRefusal {
+		t.Fatalf("v4 status = %+v, expected the refusal carried over", status)
+	}
+
+	fixture.clock.advance(47 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the wait", post.ipVersion)
+	}
+	fixture.waitPost()
+}
+
+// So does a family on a hold that has doubled, and the next refusal doubles it again
+// rather than starting over from the floor.
+func TestExtenderActivatorReplacementKeepsAHold(t *testing.T) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setFamilyRefusal(4, testActivateFamilyRefusal)
+	}, nil)
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after start", 1, 1)
+
+	// the second refusal holds for 20 minutes, of which this replacement leaves 19
+	fixture.clock.advance(9 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the hold", post.ipVersion)
+	}
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after the second refusal", 2, 1)
+	fixture.replaceActivator(nil)
+	fixture.step(17 * time.Minute)
+	fixture.expectFamilyPostCounts("within the hold", 2, 1)
+
+	fixture.clock.advance(2 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the hold", post.ipVersion)
+	}
+	// and the hold after that is 40 minutes, not 10
+	fixture.step(time.Minute)
+	fixture.step(30 * time.Minute)
+	fixture.expectFamilyPostCounts("within the next hold", 3, 1)
+}
+
+// What the gate held back is owed by the replacement, which is usually what brought
+// the port back, spread as a return's is.
+func TestExtenderActivatorReplacementPostsWhatTheGateHeldBack(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.setCarriers(ExtenderCarrierQuic)
+	fixture.revoke()
+	fixture.waitHeldForCarrier()
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("with the listener gone", 1, 1)
+
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic)
+	fixture.replaceActivator(func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			if maxJitter != settings.CarrierReturnJitter {
+				t.Errorf("drew from %s", maxJitter)
+			}
+			return 3 * time.Minute
+		}
+	})
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("within the draw", 1, 1)
+	fixture.clock.advance(2 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the draw", post.ipVersion)
+	}
+	fixture.waitPost()
+}
+
+// A revocation the old activator already answered is not news to the new one, which
+// would post every family at once for it.
+func TestExtenderActivatorReplacementDoesNotSeeARevocationAgain(t *testing.T) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setRefusal(testActivateFamilyRefusal)
+		operator.setRetryAfterSeconds(50 * 60)
+	}, nil)
+	fixture.waitFirstPass()
+	fixture.step(time.Minute)
+	fixture.revoke()
+	// the edge posts every family at once, whatever the wait said
+	fixture.waitPost()
+	fixture.waitPost()
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after the revocation", 2, 2)
+
+	fixture.replaceActivator(nil)
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after the replacement", 2, 2)
+	if status := fixture.activator.Status().Family(4); status.RevokedTime.IsZero() {
+		t.Fatalf("v4 status = %+v, expected the revocation carried over", status)
+	}
+}
+
+// What another identity's activation held says nothing of this one: it starts as a
+// new process does.
+func TestExtenderActivatorReplacementOfAnotherIdentityStartsDue(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.step(time.Minute)
+	fixture.activator.Close()
+	state := fixture.activator.State()
+	state.publicKey = []byte("another identity")
+	settings := *fixture.activatorSettings
+	settings.PreviousState = state
+	fixture.activator = NewExtenderActivator(fixture.activatorCtx, &settings)
+	if status := fixture.activator.Status().Family(4); status.Activated {
+		t.Fatalf("v4 status = %+v, expected nothing carried over", status)
+	}
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.waitPost()
+}
+
+// An activator with nothing handed over starts every family due, as a new process
+// does, so a host that restarted is posted at once.
+func TestExtenderActivatorWithNoPreviousStateStartsDue(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.step(time.Minute)
+	fixture.activator.Close()
+	settings := *fixture.activatorSettings
+	fixture.activator = NewExtenderActivator(fixture.activatorCtx, &settings)
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.waitPost()
+}

@@ -364,6 +364,9 @@ type testActivatorFixture struct {
 	directory *ExtenderDirectory
 	operator  *testActivateOperator
 	activator *ExtenderActivator
+	// what it was built from, for one that replaces it
+	activatorSettings *ExtenderActivatorSettings
+	activatorCtx      context.Context
 
 	publicKey ed25519.PublicKey
 
@@ -479,6 +482,8 @@ func newTestActivatorFixtureWithPrepare(
 	if configure != nil {
 		configure(settings)
 	}
+	fixture.activatorSettings = settings
+	fixture.activatorCtx = ctx
 	fixture.activator = NewExtenderActivator(ctx, settings)
 	t.Cleanup(func() {
 		fixture.activator.Close()

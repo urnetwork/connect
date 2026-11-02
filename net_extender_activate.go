@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -267,6 +268,14 @@ type ExtenderActivatorSettings struct {
 	// listeners together does not post together. Zero takes the default; a negative
 	// value posts at once.
 	CarrierReturnJitter time.Duration
+	// What the activator this one replaces handed over (ExtenderActivator.State),
+	// when a role is replaced under a running process (G2). Nil starts as a new
+	// process does, with every family due.
+	PreviousState *ExtenderActivatorState
+	// The spread of the post an activator owes for a family that was handed over
+	// activated (PreviousState), each family's uniform in [0, this) and never later
+	// than its tick. Zero takes the default; a negative value posts at once.
+	ReplacedPostJitter time.Duration
 	// Nil outside package tests. Replaces the uniform draw of a post's spread, given
 	// the spread. Its result is held to [0, maxJitter).
 	postJitterForTest func(maxJitter time.Duration) time.Duration
@@ -329,6 +338,7 @@ func DefaultExtenderActivatorSettings() *ExtenderActivatorSettings {
 		MaxBackoff:          6 * time.Hour,
 		MinRetryAfter:       1 * time.Minute,
 		CarrierReturnJitter: 5 * time.Minute,
+		ReplacedPostJitter:  1 * time.Hour,
 		RequestTimeout:      60 * time.Second,
 		ResumeCheckTimeout:  defaultResumeCheckTimeout,
 		ResumeMinSleep:      defaultResumeMinSleep,
@@ -424,6 +434,105 @@ type ExtenderActivator struct {
 	// goroutine alone.
 	schedules      map[int]*extenderActivateSchedule
 	helloAddresses map[int]netip.Addr
+	// when the caller address is next checked. The loop's, and handed over
+	// (State).
+	nextAddressCheckTime time.Time
+}
+
+// What an activator hands to the one that replaces it in the same process (G2):
+// when each family is next posted and how long its next failure holds it, and what
+// the status says. Replacing a role is not a restart of the host. Its records are as
+// good as they were, and whatever the operator said still stands, so a fleet that
+// lost its listeners together must not post every family at once because its roles
+// were replaced together.
+type ExtenderActivatorState struct {
+	publicKey            []byte
+	schedules            map[int]extenderActivateSchedule
+	families             map[int]ExtenderFamilyActivationStatus
+	revokedObserved      bool
+	extenderId           Id
+	helloAddresses       map[int]netip.Addr
+	nextAddressCheckTime time.Time
+}
+
+// What the activator that replaces this one continues from
+// (ExtenderActivatorSettings.PreviousState). Call it after Close: it reads what the
+// loop owns.
+func (self *ExtenderActivator) State() *ExtenderActivatorState {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	state := &ExtenderActivatorState{
+		publicKey:            slices.Clone(self.settings.PublicKey),
+		schedules:            map[int]extenderActivateSchedule{},
+		families:             map[int]ExtenderFamilyActivationStatus{},
+		revokedObserved:      self.revokedObserved,
+		extenderId:           self.extenderId,
+		helloAddresses:       maps.Clone(self.helloAddresses),
+		nextAddressCheckTime: self.nextAddressCheckTime,
+	}
+	for key, schedule := range self.schedules {
+		state.schedules[key] = *schedule
+	}
+	for ipVersion, family := range self.families {
+		state.families[ipVersion] = *family
+	}
+	return state
+}
+
+// Continues from what the activator this one replaces handed over, unless that was
+// another identity's, which says nothing of this one. A family waiting out a hold, a
+// retry_after_seconds or a private family's day goes on waiting. A post owed now,
+// held back for its carriers or one that had come due, goes within CarrierReturnJitter, as on the
+// carrier's return. A family that stands activated keeps its record and its status
+// and is posted once more within ReplacedPostJitter, sooner if its tick says so:
+// nothing about it is urgent, but the new role has things only a post gives it (the
+// record the camouflage gate reads, the ports that bound this time).
+func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
+	if !slices.Equal(previous.publicKey, self.settings.PublicKey) {
+		return
+	}
+	for ipVersion, family := range previous.families {
+		if _, ok := self.families[ipVersion]; ok || self.fallback {
+			copied := family
+			copied.AllowedHosts = slices.Clone(family.AllowedHosts)
+			self.families[ipVersion] = &copied
+		}
+	}
+	now := self.settings.Now()
+	for key, schedule := range self.schedules {
+		previousSchedule, ok := previous.schedules[key]
+		if !ok {
+			continue
+		}
+		*schedule = previousSchedule
+		if schedule.carrierHeld || !schedule.nextActivateTime.After(now) {
+			schedule.nextActivateTime = now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
+		} else if self.scheduleActivated(key) {
+			postTime := now.Add(uniformJitter(self.settings.ReplacedPostJitter, self.settings.postJitterForTest))
+			if postTime.Before(schedule.nextActivateTime) {
+				schedule.nextActivateTime = postTime
+			}
+		}
+	}
+	self.revokedObserved = previous.revokedObserved
+	self.extenderId = previous.extenderId
+	self.helloAddresses = maps.Clone(previous.helloAddresses)
+	self.nextAddressCheckTime = previous.nextAddressCheckTime
+}
+
+// Whether the family of a schedule stands activated. The one schedule of the plain
+// api url answers for whichever family the operator named.
+func (self *ExtenderActivator) scheduleActivated(key int) bool {
+	if self.fallback {
+		for _, family := range self.families {
+			if family.Activated {
+				return true
+			}
+		}
+		return false
+	}
+	family, ok := self.families[key]
+	return ok && family.Activated
 }
 
 // When one family is next posted, and how long its next failure holds it
@@ -507,6 +616,9 @@ func NewExtenderActivator(
 	if copied.CarrierReturnJitter == 0 {
 		copied.CarrierReturnJitter = DefaultExtenderActivatorSettings().CarrierReturnJitter
 	}
+	if copied.ReplacedPostJitter == 0 {
+		copied.ReplacedPostJitter = DefaultExtenderActivatorSettings().ReplacedPostJitter
+	}
 	if copied.RequestTimeout <= 0 {
 		copied.RequestTimeout = 60 * time.Second
 	}
@@ -543,6 +655,9 @@ func NewExtenderActivator(
 	// every family is due at start
 	for _, key := range self.scheduleKeys() {
 		self.schedules[key] = &extenderActivateSchedule{backoff: settings.MinBackoff}
+	}
+	if settings.PreviousState != nil {
+		self.continueFrom(settings.PreviousState)
 	}
 
 	addNetworkChangeListener := settings.AddNetworkChangeListener
@@ -683,8 +798,6 @@ func (self *ExtenderActivator) changedWithLock() {
 // ResumeCheckTimeout, to tell a resume (hostResumeWatch). A resume pulls every
 // deadline forward by the time slept and starts a pass.
 func (self *ExtenderActivator) run() {
-	var nextAddressCheckTime time.Time
-
 	passAfter := self.settings.PassAfter
 	if passAfter == nil {
 		passAfter = time.After
@@ -726,15 +839,15 @@ func (self *ExtenderActivator) run() {
 			self.scheduleCarrierHeldFamilies(now)
 		}
 
-		if self.settings.HelloUrl != "" && !now.Before(nextAddressCheckTime) {
+		if self.settings.HelloUrl != "" && !now.Before(self.nextAddressCheckTime) {
 			address, err := self.hello()
 			if err != nil {
 				// a failed check retries on the backoff floor rather than on
 				// every wake, which a directory change would otherwise be
 				self.log.Infof("[extender]activate hello err = %s\n", httpRequestErrorWithCauses(err))
-				nextAddressCheckTime = now.Add(self.settings.MinBackoff)
+				self.nextAddressCheckTime = now.Add(self.settings.MinBackoff)
 			} else {
-				nextAddressCheckTime = now.Add(self.settings.AddressCheckTimeout)
+				self.nextAddressCheckTime = now.Add(self.settings.AddressCheckTimeout)
 				self.checkAddress(address)
 			}
 		}
@@ -745,7 +858,7 @@ func (self *ExtenderActivator) run() {
 
 		wait := self.nextActivateWait(now)
 		if self.settings.HelloUrl != "" {
-			wait = min(wait, nextAddressCheckTime.Sub(now))
+			wait = min(wait, self.nextAddressCheckTime.Sub(now))
 		}
 		if wait <= 0 {
 			// nothing above left a deadline in the past; a zero here would be
@@ -782,7 +895,7 @@ func (self *ExtenderActivator) run() {
 				for _, schedule := range self.schedules {
 					schedule.nextActivateTime = pullForward(schedule.nextActivateTime)
 				}
-				nextAddressCheckTime = pullForward(nextAddressCheckTime)
+				self.nextAddressCheckTime = pullForward(self.nextAddressCheckTime)
 				self.log.Infof("[extender]activate resumed after %s asleep\n", sleep.Round(time.Second))
 				waiting = false
 			}
