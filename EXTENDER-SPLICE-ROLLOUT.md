@@ -25,6 +25,11 @@ the capability. What this delivery ships is inert until these exist:
    `OnActivated`. The gate exists and is tested, and no production role uses it
    yet.
 
+Status update 2026-11-02: items 3 and 4 are on main, off unless a host opts in
+(Role options under Controls). Items 1 and 2 remain. Until the list exists, a
+host that passes `--camouflage` verifies nothing, posts no key and reports
+`no_verified_target`, so Phase A has no effect on any client yet.
+
 ## Controls
 
 Per-extender (connect `extender.ExtenderSettings`, set by the provider role):
@@ -38,6 +43,49 @@ Per-extender (connect `extender.ExtenderSettings`, set by the provider role):
 | `CamouflageBorrowNames` | the role-start-verified borrowed names this extender splices to. Empty ⇒ no coverage. |
 | `ExtenderCamouflageSpliceMaxCount` (256), `...MaxPerTarget` (32) | per-extender concurrent-splice caps. |
 | `ExtenderCamouflageTimeWindow` (2m), `...ReplayTagCount` (65536), `...HelloMaxByteCount` (16 KiB) | the hello time window, the replay cache size, the peek byte bound. Preserve these. |
+
+Role options (added 2026-11-02). `connectctl extender`, for operator hosts, takes
+these as flags, and each is off unless given. The role behind them is
+`extender.ExtenderCamouflageRole`.
+
+| Option | Meaning |
+| --- | --- |
+| `--camouflage` | Sets `CamouflageEnabled`, so Phase A. Verifies the borrowed names and publishes the key while one verifies. Needs a kept identity. |
+| `--camouflage_splice` | Sets `ExtenderCamouflageSplice`, so Phase B once this host's records settle. Needs `--camouflage`. |
+| `--camouflage_revalidate_interval=<duration>` | How often the names are verified again. Needs `--camouflage`. Default `extender.DefaultExtenderCamouflageRevalidationInterval`, 6 h, at least 10 m. **The value is the owner's decision** and goes in the rollout config (gate 6 below). A list whose manifest asks for less gets less. |
+| `--nlayer-hop=...&key=<hex>&camouflage_key=<hex>` | The camouflage key of a tcp hop, beside the identity key its leaf check needs. A hop that splices can be reached only with it. |
+
+- **The key.** It derives from the identity seed, so there is no second file: it
+  is as stable and as well kept as `--extender_key_file` or the `--state_dir`
+  key file, and it rotates with the identity. A host that opts in with an ephemeral
+  identity, or a key file that does not read, exits at start with a message saying
+  so, before it binds anything.
+- **What the activator posts.** The key is published only while at least one name
+  verifies (P5). A host with none serves the legacy path alone and reports
+  `no_verified_target`, which is not an error. A name that verifies after a post
+  went out with no key is posted at once. Losing every name changes the record at
+  the next activation, not before, so one bad pass that a retry repairs changes
+  nothing. With server 14b, a post with no key clears the stored key, and the record
+  then carries neither the key nor the requirement.
+- **Verification.** A name is dialed over the path the splice uses and must pass on
+  every family the host can dial, so a dual-stack host drops a name one family
+  cannot reach. A failed name is dropped at once, counted in `BorrowVerifyFailCount`,
+  and retried alone from 5 m, doubling within the interval. Each pass is a tls
+  handshake to a third party per name and family, which the fleet multiplies
+  (gate 7).
+- **The gate.** Every role sets `CamouflageSpliceGate`, whatever the posture, so
+  `SetCamouflageSplice(true)` cannot pass it either.
+- **Rollback on an operator host.** connectctl has no run-time lever:
+  `SetCamouflageSplice` is not reachable from outside the process. Remove
+  `--camouflage_splice` and restart, which also drops that host's working sessions,
+  and only then take the key out of the cohort. Not the other way round: a record
+  signed without the requirement can reach a legacy client while the host still
+  splices, until its next activation closes the gate.
+- **The sdk provider role** takes the same settings in
+  `deviceLocalExtenderSettings` (`CamouflageEnabled`, `CamouflageSplice`,
+  `CamouflageRevalidationInterval`). The provider fills none of them and the sdk
+  exports no switch, so an embedder cannot turn it on yet. That takes one exported
+  `DeviceLocalSettings` field and its generated bindings, when the owner wants it.
 
 Per-cohort (server, slice B, vault `extender.yml` `directory.capability_cohorts`):
 the set of extender public keys eligible for the `tcp-camouflage-v1` capability.
@@ -138,6 +186,19 @@ open, and no running fallback; otherwise `DegradedReason` names why
 `splice_fallback_active`). **A deployment whose `CamouflageStatus().Covered` is
 false must not be reported as providing camouflage coverage.**
 
+Added 2026-11-02: with camouflage on, `no_verified_target` takes precedence over
+the posture and the gate, since a role with no name posts no key and its gate is
+closed because of that. Under a role, `coverage_incomplete` says the splice runs
+but a name this extender's supported clients select did not verify, or a list is
+unmeasured or past its maximum age. A prober replaying that name meets a
+substitution, which is degraded (`connect.EvaluateExtenderCamouflageCoverage`).
+Roles log the verdict and the counts as one line, which is the only place an
+operator can read them until the reporting path below exists:
+
+    extender camouflage: authenticated_rollout, not covered: splice_off; 3 verified names, 0 failed verifications; 12 authenticated, 0 spliced, 40 terminated, 0 fallback terminated
+
+`not covered: splice_off` is the correct line for a healthy Phase A host.
+
 Client-side, `connect.ExtenderTcpCamouflageClientStatsSnapshot()`:
 `CamouflageWonCount`, `LegacyWonCount` (Phase A fallback), `BothFailedCount`
 (the Phase B loss a skewed/legacy client meets), `RefusedCount`,
@@ -184,8 +245,55 @@ An NLayer hop URL (`connectctl extender`) has no camouflage key parameter, so a
 hop dials its tcp carrier with the legacy hello. A Phase B extender cannot serve
 as a tcp hop until the hop URL gains one.
 
+Added 2026-11-02: the hop URL has one now, `camouflage_key=<hex>` beside `key=<hex>`
+(Role options). The dial is then the client's race, fronting a name of the front
+extender's bundled global list, so the front's build must carry the measured list.
+With no list it is the legacy hello alone and a Phase B hop splices it away.
+
 ## Splice posture semantics (added 2026-11-02)
 
 `ExtenderCamouflageSplice` is the posture until `SetCamouflageSplice` sets one.
 After that, the run-time value wins over the setting, so a rollback through
 `SetCamouflageSplice(false)` holds even if the setting still says on.
+
+## Turning on Phase A on one host (added 2026-11-02)
+
+Phase A changes nothing for a legacy client: it still reaches the host on the legacy
+hello. Do this only once all of these hold:
+
+- Server 14b is merged, its migration applied, and api and taskworker deployed, so
+  the key is stored and signed. (Without it the host still runs: the server ignores
+  the posted key, and no client learns it.)
+- The measured list and its manifest are bundled (slice E), and the `connectctl`
+  and client builds in use carry them.
+- The host's `connectctl extender` already passes `--extender_key_file` or
+  `--state_dir`. Do not change which: a new file is a new identity.
+
+Then, through xops (host changes never go ad hoc):
+
+1. Add `--camouflage` to that host's arguments. Leave out `--camouflage_splice`.
+   Leave out `--camouflage_revalidate_interval` unless the owner has set a value.
+2. Deploy the build and restart the extender on that host.
+3. Read the host's log. Expect `extender camouflage: on, splice false, ...`, then
+   `extender camouflage: authenticated_rollout, not covered: splice_off; N verified
+   names, ...` with N at least 1. If the reason is `no_verified_target`, no name
+   verified and no key was posted: check the host's egress on each family before
+   going on. Failed verifications are retried from 5 m.
+4. Confirm the record, with a read-only query that prints no key (`SET LOCAL
+   statement_timeout` first):
+   `SELECT reality_public_key IS NOT NULL FROM network_extender WHERE public_key = decode('<identity public key hex>', 'hex');`
+   The identity key is the `extender public key:` line of the log.
+5. Over the next record lifetime, as clients with the list refresh it, `authenticated`
+   in the log line rises. `terminated` keeps counting legacy clients and probers,
+   which is what Phase A is for.
+
+Rollback: remove `--camouflage` and restart. The next activation posts no key, and
+the server clears it. A client still holding a record with the key fails its
+camouflaged attempt and wins on the legacy one.
+
+Moving that host to Phase B is a separate step, under every gate above: add its
+identity public key to `directory.capability_cohorts` in vault `extender.yml`, confirm
+the probes and the list on the operator's side (Operator probes in Phase B), and add
+`--camouflage_splice`. Nothing splices until the host's records have carried the key
+and the requirement for one lifetime and the margin, about 25 h, and each restart
+restarts that wait. Until then the log says `splice_gate_closed`.
