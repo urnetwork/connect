@@ -420,6 +420,7 @@ type ExtenderActivator struct {
 	// set when the tcp carrier comes back, taken by the next pass, which then
 	// posts every family that is not activated
 	tcpCarrierReturned bool
+	carriersChanged    bool
 
 	// this extender's id as the operator's last answer reported it, zero
 	// until one has (lag.dev/PLAN.md N4), and whether the last pass forced this
@@ -550,6 +551,11 @@ type extenderActivateSchedule struct {
 	// what the carrier's return owes (TcpCarrierReturned). A family whose hold
 	// simply has not run out is owed nothing.
 	carrierHeld bool
+	// what the post that activated the family offered, nil unless its last post
+	// did. A carrier serving that is not in these is off its record
+	// (CarriersChanged).
+	postedCarriers []string
+	postedDnsPorts []int
 }
 
 // After a success: the family's next post is its tick, and its hold is back to
@@ -758,6 +764,19 @@ func (self *ExtenderActivator) TcpCarrierReturned() {
 	self.wakeMonitor.NotifyAll()
 }
 
+// Says what is serving changed (G2). A post goes out with what is serving then, so
+// one made while a carrier or a dns port was being rebuilt leaves it off the record,
+// and the record would stay that way until the tick. A family activated without one
+// that is serving now is posted within CarrierReturnJitter, and any other is left as
+// it is, so a carrier that goes and comes back with the record naming it posts
+// nothing. Safe to call from any goroutine.
+func (self *ExtenderActivator) CarriersChanged() {
+	self.stateLock.Lock()
+	self.carriersChanged = true
+	self.stateLock.Unlock()
+	self.wakeMonitor.NotifyAll()
+}
+
 // Wakes the loop, which re-activates every family (G3). A path change can move
 // this host's public address.
 func (self *ExtenderActivator) networkChanged() {
@@ -837,6 +856,9 @@ func (self *ExtenderActivator) run() {
 		}
 		if self.takeTcpCarrierReturned() {
 			self.scheduleCarrierHeldFamilies(now)
+		}
+		if self.takeCarriersChanged() {
+			self.scheduleFamiliesMissingACarrier(now)
 		}
 
 		if self.settings.HelloUrl != "" && !now.Before(self.nextAddressCheckTime) {
@@ -959,6 +981,41 @@ func (self *ExtenderActivator) takeTcpCarrierReturned() bool {
 	returned := self.tcpCarrierReturned
 	self.tcpCarrierReturned = false
 	return returned
+}
+
+func (self *ExtenderActivator) takeCarriersChanged() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	changed := self.carriersChanged
+	self.carriersChanged = false
+	return changed
+}
+
+// Makes a family due, after its own draw, whose last post activated it and offered
+// less than is serving now (CarriersChanged). A sooner post stands.
+func (self *ExtenderActivator) scheduleFamiliesMissingACarrier(now time.Time) {
+	carriers := self.carriers()
+	dnsPorts := self.dnsPorts()
+	for _, schedule := range self.schedules {
+		if schedule.postedCarriers == nil {
+			continue
+		}
+		if !extenderActivateOffersMore(carriers, schedule.postedCarriers) &&
+			!extenderActivateOffersMore(dnsPorts, schedule.postedDnsPorts) {
+			continue
+		}
+		postTime := now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
+		if postTime.Before(schedule.nextActivateTime) {
+			schedule.nextActivateTime = postTime
+		}
+	}
+}
+
+// Whether `serving` has anything `posted` does not.
+func extenderActivateOffersMore[T comparable](serving []T, posted []T) bool {
+	return slices.ContainsFunc(serving, func(value T) bool {
+		return !slices.Contains(posted, value)
+	})
 }
 
 // Makes the families whose post came due with no required carrier serving due, each
@@ -1131,6 +1188,13 @@ func (self *ExtenderActivator) byJwt() string {
 
 // The dns ports this extender is listening on, ascending (L2). Nil when the
 // caller offers none, which leaves the operator on DnsPort alone.
+func (self *ExtenderActivator) carriers() []string {
+	if self.settings.Carriers == nil {
+		return []string{}
+	}
+	return self.settings.Carriers()
+}
+
 func (self *ExtenderActivator) dnsPorts() []int {
 	if self.settings.DnsPorts == nil {
 		return nil
@@ -1182,10 +1246,8 @@ const (
 // schedules move once every post of the pass has been answered, so the record
 // another family's answer brought counts too.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
-	carriers := []string{}
-	if self.settings.Carriers != nil {
-		carriers = self.settings.Carriers()
-	}
+	carriers := self.carriers()
+	dnsPorts := self.dnsPorts()
 	// a pass forced to carry the measurement request is followed by no
 	// other, so a request that keeps missing cannot hold the loop (C4)
 	followUp := self.measurementFollowUp
@@ -1199,9 +1261,9 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	for i, key := range due {
 		var carried bool
 		if self.fallback {
-			outcomes[i], carried, retryAfters[i] = self.activateFallback(carriers, now)
+			outcomes[i], carried, retryAfters[i] = self.activateFallback(carriers, dnsPorts, now)
 		} else {
-			outcomes[i], carried, retryAfters[i] = self.activateFamily(key, carriers, measurementCarried, now)
+			outcomes[i], carried, retryAfters[i] = self.activateFamily(key, carriers, dnsPorts, measurementCarried, now)
 		}
 		measurementCarried = measurementCarried || carried
 	}
@@ -1210,11 +1272,15 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	for i, key := range due {
 		schedule := self.schedules[key]
 		schedule.carrierHeld = false
+		schedule.postedCarriers = nil
+		schedule.postedDnsPorts = nil
 		switch outcome := outcomes[i]; {
 		case outcome == extenderActivateCarrierHeld:
 			schedule.holdForCarrier(now, self.settings)
 		case outcome == extenderActivateActivated:
 			schedule.tick(now, self.settings)
+			schedule.postedCarriers = carriers
+			schedule.postedDnsPorts = dnsPorts
 			activated = append(activated, key)
 		case outcome == extenderActivateSkipped:
 			schedule.recheck(now, self.settings)
@@ -1267,6 +1333,7 @@ func (self *ExtenderActivator) ownRecordNamesFamily(ipVersion int) bool {
 func (self *ExtenderActivator) activateFamily(
 	ipVersion int,
 	carriers []string,
+	dnsPorts []int,
 	measurementCarried bool,
 	now time.Time,
 ) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
@@ -1284,7 +1351,7 @@ func (self *ExtenderActivator) activateFamily(
 	if !measurementCarried {
 		measurementCsr = self.measurementCsr()
 	}
-	outcome, retryAfter = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
+	outcome, retryAfter = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, dnsPorts, measurementCsr, now)
 	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
 }
 
@@ -1386,7 +1453,7 @@ func (self *ExtenderActivator) ipVersionPublic(ipVersion int) bool {
 // without one is (G3). The one post carries the measurement request when one
 // is wanted and this extender's id is known, and whether it delivered one
 // comes back with the outcome (C4).
-func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
+func (self *ExtenderActivator) activateFallback(carriers []string, dnsPorts []int, now time.Time) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
 		return extenderActivateSkipped, false, 0
 	}
@@ -1395,7 +1462,7 @@ func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time
 		return extenderActivateCarrierHeld, false, 0
 	}
 	measurementCsr := self.measurementCsr()
-	outcome, retryAfter = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
+	outcome, retryAfter = self.activateUrl(0, self.fallbackApiUrl(), carriers, dnsPorts, measurementCsr, now)
 	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
 }
 
@@ -1409,6 +1476,7 @@ func (self *ExtenderActivator) activateUrl(
 	ipVersion int,
 	apiUrl string,
 	carriers []string,
+	dnsPorts []int,
 	measurementCsr string,
 	now time.Time,
 ) (extenderActivateOutcome, time.Duration) {
@@ -1418,7 +1486,7 @@ func (self *ExtenderActivator) activateUrl(
 		TcpPort:             self.settings.TcpPort,
 		UdpPort:             self.settings.UdpPort,
 		DnsPort:             self.settings.DnsPort,
-		DnsPorts:            self.dnsPorts(),
+		DnsPorts:            dnsPorts,
 		DnsTld:              self.settings.DnsTld,
 		Carriers:            carriers,
 		MeasurementCsr:      measurementCsr,

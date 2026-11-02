@@ -2,6 +2,7 @@ package connect
 
 import (
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -401,6 +402,117 @@ func TestExtenderActivatorTcpCarrierReturnWithThePlainApiUrl(t *testing.T) {
 	fixture.activator.TcpCarrierReturned()
 	fixture.waitPost()
 	fixture.waitActivation()
+}
+
+// A post that went out with a carrier being rebuilt leaves it off the record, which
+// would stay that way until the tick. Its return makes the family due, after a draw.
+func TestExtenderActivatorPostsARecordMissingACarrierWhenItReturns(t *testing.T) {
+	draws := make(chan time.Duration, 8)
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierTcp, ExtenderCarrierDns}
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			draws <- maxJitter
+			return 3 * time.Minute
+		}
+	})
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+	fixture.waitActivation()
+	fixture.step(time.Minute)
+
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns)
+	fixture.activator.CarriersChanged()
+	fixture.step(time.Minute)
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("within the draw", 1, 1)
+	if len(draws) != 2 {
+		t.Fatalf("%d draws, expected each family's", len(draws))
+	}
+	if maxJitter := <-draws; maxJitter != DefaultExtenderActivatorSettings().CarrierReturnJitter {
+		t.Fatalf("drew from %s", maxJitter)
+	}
+
+	fixture.clock.advance(time.Minute)
+	for _, ipVersion := range []int{4, 6} {
+		var post *testActivatePost
+		if ipVersion == 4 {
+			post = fixture.wakeForPost()
+		} else {
+			post = fixture.waitPost()
+		}
+		if post.ipVersion != ipVersion || !slices.Contains(post.args.Carriers, ExtenderCarrierQuic) {
+			t.Fatalf("post = v%d of %v, expected v%d with the carrier", post.ipVersion, post.args.Carriers, ipVersion)
+		}
+	}
+	fixture.waitActivation()
+	fixture.waitActivation()
+
+	// and with the record naming it, the next change costs nothing
+	fixture.step(time.Minute)
+	fixture.activator.CarriersChanged()
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("with nothing missing", 2, 2)
+	if 1 < len(draws) {
+		t.Fatalf("%d draws left, expected none with nothing missing", len(draws)-1)
+	}
+}
+
+// A dns port is on the record or off it the same way (L2).
+func TestExtenderActivatorPostsARecordMissingADnsPortWhenItReturns(t *testing.T) {
+	var dnsPorts atomic.Pointer[[]int]
+	setDnsPorts := func(ports ...int) {
+		dnsPorts.Store(&ports)
+	}
+	setDnsPorts(4053)
+	fixture := newTestActivatorFixtureActivated(t, func(settings *ExtenderActivatorSettings) {
+		settings.DnsPorts = func() []int {
+			return *dnsPorts.Load()
+		}
+		settings.CarrierReturnJitter = -1
+	})
+	fixture.step(time.Minute)
+
+	setDnsPorts(4053, 53)
+	fixture.activator.CarriersChanged()
+	post := fixture.waitPost()
+	if post.ipVersion != 4 || !slices.Contains(post.args.DnsPorts, 53) {
+		t.Fatalf("post = v%d of %v, expected v4 with the port", post.ipVersion, post.args.DnsPorts)
+	}
+	fixture.waitPost()
+}
+
+// What is on the record going and coming back posts nothing: this is every flap of a
+// udp carrier that had served when the family was posted, so the operator hears of
+// none of them.
+func TestExtenderActivatorCarrierThatFlapsOnTheRecordPostsNothing(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, testActivatorNoReturnJitter)
+	for range 5 {
+		fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierDns)
+		fixture.activator.CarriersChanged()
+		fixture.step(time.Minute)
+		fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns)
+		fixture.activator.CarriersChanged()
+		fixture.step(time.Minute)
+	}
+	fixture.expectFamilyPostCounts("after the flaps", 1, 1)
+}
+
+// A family on a hold posts at its end with what is serving then, so a carrier's return
+// is no reason to cut that short.
+func TestExtenderActivatorCarrierReturnKeepsAHold(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierTcp}
+		fixture.operator.setRefusal(testActivateFamilyRefusal)
+		fixture.operator.setRetryAfterSeconds(50 * 60)
+	}, testActivatorNoReturnJitter)
+	fixture.waitFirstPass()
+	fixture.step(time.Minute)
+
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic)
+	fixture.activator.CarriersChanged()
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("within the wait", 1, 1)
 }
 
 // Closes the activator and starts the one that replaces it on the same settings, as
