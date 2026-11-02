@@ -363,9 +363,7 @@ func (self *ExtenderRootKeySet) VerifyRevocation(
 // caller is part of (B2). The comparison ignores case and a trailing dot. An
 // empty candidate matches nothing: a record must name its space.
 func ExtenderNetworkHostAllowed(networkHost string, allowedNetworkHosts ...string) bool {
-	normalize := func(host string) string {
-		return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	}
+	normalize := NormalizeExtenderNetworkHost
 	candidate := normalize(networkHost)
 	if candidate == "" {
 		return false

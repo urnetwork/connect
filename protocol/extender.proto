@@ -239,3 +239,37 @@ message ExtenderShare {
     repeated bytes Addresses = 3;
     ExtenderShareSettings Settings = 4;
 }
+
+// The signed body of a public seed bundle (EXTENDER-UPDATE2.md §2.2): a small
+// authenticated set of ordinary open-tier records for one network space, which
+// restores verified reach when the feed and the dns bootstrap cannot be
+// reached. The envelope signature authenticates only this distribution
+// metadata; every record inside still carries, and is judged by, its own root
+// signature, network host, expiry, revocation and tier. There is deliberately
+// no field for root keys, network hosts, gossip urls or resolver settings: a
+// seed never changes what a client trusts or how it resolves.
+message ExtenderSeedBody {
+    // 1; a reader refuses any other version
+    uint32 FormatVersion = 1;
+    // the space whose public seed feed this is
+    string NetworkHost = 2;
+    // increases with every bundle the space publishes, across signing keys
+    uint64 Sequence = 3;
+    uint64 IssuedAtUnixMilli = 4;
+    // never later than the expiry of any record carried
+    uint64 ExpiresAtUnixMilli = 5;
+    // serialized ExtenderRecord, each open tier with an empty CanaryChannel
+    repeated bytes Records = 6;
+    // serialized ExtenderRevocation, each root signed
+    repeated bytes Revocations = 7;
+}
+
+message ExtenderSeedEnvelope {
+    // serialized ExtenderSeedBody, signed opaquely to avoid serialization ambiguity
+    bytes Body = 1;
+    // over "ur-extender-seed-v1" || Body by a root key of the space
+    bytes Signature = 2;
+    // first 8 bytes of sha256 of the signing public key; a lookup hint only,
+    // never a trust anchor
+    bytes KeyId = 3;
+}
