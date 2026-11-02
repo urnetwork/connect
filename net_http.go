@@ -285,6 +285,15 @@ type ClientStrategySettings struct {
 	// reconnect path (NextReconnectTime). Non-positive removes the cap.
 	KickReconnectLimit int
 
+	// PlatformApiHosts are the hosts of the platform's own api, normalized
+	// (PlatformApiHostNames). The Date of a response from one of them whose tls
+	// chain verified corrects the clock a camouflaged hello seals with, on every
+	// route to the api, an extender's included, since the chain is the api's
+	// (net_extender_camouflage_clock.go). Empty reads no clock. It is meant only
+	// for hosts this strategy's owner trusts to be the platform: a host named
+	// here can move the seal time, and so at worst fail a camouflaged attempt.
+	PlatformApiHosts []string
+
 	// ExtraHeaders, when set, are applied (Set semantics, overriding same-named
 	// headers) to every request this strategy issues: http serial/parallel,
 	// the hello ping, and websocket dials. Intended for test/simulation
@@ -2057,7 +2066,9 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 			}
 			return causes.track(&evalResult{err: errClientDialerRetired})
 		}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
@@ -2131,7 +2142,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			}
 			return causes.track(&evalResult{err: errClientDialerRetired})
 		}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		authProgress.responseHeaders(response, err)
 		if self.log.V(2).Enabled() {
@@ -2162,7 +2175,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			}
 			return causes.track(&evalResult{err: errClientDialerRetired})
 		}
+		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
 			if err != nil {
