@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/urnetwork/connect"
@@ -217,18 +218,24 @@ func TestExtenderCamouflageReportRestartStartsAtZero(t *testing.T) {
 // this package.
 var _ connect.ExtenderCamouflageReportSource = (*ExtenderServer)(nil)
 
-// A real splice comes through as load on its borrowed site.
+// A real splice comes through as load on its borrowed site, read once the close has
+// joined the splice, which is when its relayed bytes are counted.
 func TestExtenderCamouflageReportCarriesARealSplice(t *testing.T) {
 	floodByteCount := 4096
 	site := newFakeBorrowSite(t, floodBorrowSiteHandler(floodByteCount))
+	siteCloseRelease := make(chan struct{})
+	releaseSiteClose := sync.OnceFunc(func() { close(siteCloseRelease) })
+	defer releaseSiteClose()
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
 		settings.IdentityKeySeed = mustSeed(t)
 		settings.ExtenderCamouflageSplice = true
 		settings.CamouflageBorrowNames = []string{testBorrowName}
-		settings.CamouflageSpliceDialContext = site.dialContext()
+		settings.CamouflageSpliceDialContext = site.dialContextHoldingClose(siteCloseRelease)
 	})
 	spliceProberReceiveByteCount(t, fixture)
+	releaseSiteClose()
+	fixture.server.CloseAndWait()
 
 	counts := fixture.server.TakeCamouflageReportCounts()
 	if counts.Spliced == 0 {
