@@ -2357,7 +2357,9 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	if directory := self.settings.ExtenderDirectory; directory != nil {
 		for _, dialer := range judgeDialers {
 			// the address was held, revoked, expired or removed (E2)
-			if !directory.AddressUsable(dialer.extenderConfig.Ip) {
+			// or, while gated records are preferred, an open record whose
+			// working connections drain (EXTENDER-UPDATE2 §1.1 rule 5)
+			if !directory.ConnectAddressUsable(dialer.extenderConfig.Ip) {
 				dropDialers = append(dropDialers, dialer)
 			}
 		}
@@ -2485,21 +2487,16 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
-		familyCandidates := [][]*ExtenderCandidate{}
-		candidates := directory.Candidates
-		if self.settings.DisableManualExtenders {
-			// never a manual address no signed record verifies
-			candidates = directory.VerifiedCandidates
-		}
-		for _, ipVersion := range []int{4, 6} {
-			if !controlFamilyProbe(ipVersion) {
-				continue
-			}
-			familyCandidates = append(
-				familyCandidates,
-				candidates(ipVersion, maxNewDialerCount, visitedExtenderIps...),
-			)
-		}
+		// the connection draw of each family the host has (E2), under the
+		// directory's gated preference (EXTENDER-UPDATE2 §1.1); with
+		// DisableManualExtenders never a manual address no signed record
+		// verifies
+		familyCandidates := directory.ConnectCandidates(
+			ExtenderDialIpVersions(),
+			maxNewDialerCount,
+			self.settings.DisableManualExtenders,
+			visitedExtenderIps,
+		)
 		// interleave the families, so a dual-stack host does not spend its
 		// whole expand budget on v4 before v6 is ever dialed
 		for i := 0; ; i += 1 {

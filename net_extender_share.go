@@ -212,9 +212,12 @@ func BuildExtenderShare(
 		return -1
 	}
 	// the snapshot is already ordered by address, so the sort inside a tier is
-	// stable and two shares of the same directory are the same payload
+	// stable and two shares of the same directory are the same payload. A share
+	// is a public path: the address of a gated or channel-restricted record
+	// never leaves in one, whatever source it arrived from, in use or not
+	// (EXTENDER.md R1, R4; EXTENDER-UPDATE2 §1.3)
 	entries := []*ExtenderDirectoryEntry{}
-	for _, entry := range directory.Snapshot().Entries {
+	for _, entry := range directory.publicSnapshotEntries() {
 		if 0 <= tier(entry) {
 			entries = append(entries, entry)
 		}
