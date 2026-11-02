@@ -96,6 +96,16 @@ type testExtenderOperator struct {
 
 	stateLock   sync.Mutex
 	issueSerial int
+	// signs the camouflage key an activation posts into its record, as an
+	// operator with phase 14b does; nil ignores it, as one without does
+	signCamouflageKey bool
+	// has the record require tcp-camouflage-v1 when it carries a key, as an
+	// operator does for an extender in its capability cohort
+	requireCamouflage bool
+	// the clock and lifetime of a record; nil and zero are the real clock and
+	// the fixture's two weeks
+	now            func() time.Time
+	recordLifetime time.Duration
 }
 
 func newTestExtenderOperator(t *testing.T) *testExtenderOperator {
@@ -167,9 +177,29 @@ func (self *testExtenderOperator) activateResult(
 
 	self.stateLock.Lock()
 	self.issueSerial += 1
-	issueTime := time.Now().Add(time.Duration(self.issueSerial) * time.Millisecond)
+	now := time.Now
+	if self.now != nil {
+		now = self.now
+	}
+	recordLifetime := 14 * 24 * time.Hour
+	if 0 < self.recordLifetime {
+		recordLifetime = self.recordLifetime
+	}
+	issueTime := now().Add(time.Duration(self.issueSerial) * time.Millisecond)
+	var realityPublicKey []byte
+	var requiredCapabilities []string
+	if self.signCamouflageKey && args.RealityPublicKeyHex != "" {
+		var keyErr error
+		if realityPublicKey, keyErr = connect.ParseExtenderRealityPublicKeyHex(args.RealityPublicKeyHex); keyErr != nil {
+			self.stateLock.Unlock()
+			return nil, keyErr
+		}
+		if self.requireCamouflage {
+			requiredCapabilities = []string{connect.ExtenderCapabilityTcpCamouflageV1}
+		}
+	}
 	self.stateLock.Unlock()
-	expireTime := issueTime.Add(14 * 24 * time.Hour)
+	expireTime := issueTime.Add(recordLifetime)
 
 	addresses := []*protocol.ExtenderAddress{}
 	for _, recordIp := range []string{testExtenderIpv4, testExtenderIpv6} {
@@ -194,6 +224,9 @@ func (self *testExtenderOperator) activateResult(
 		IssueTimeMs:  uint64(issueTime.UnixMilli()),
 		ExpireTimeMs: uint64(expireTime.UnixMilli()),
 		NetworkHost:  testExtenderNetworkHost,
+
+		RealityPublicKey:     realityPublicKey,
+		RequiredCapabilities: requiredCapabilities,
 	})
 	if err != nil {
 		return nil, err

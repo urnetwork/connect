@@ -325,10 +325,12 @@ func (ready *tcpSynRetryReadiness) detach() {
 	}
 }
 
-func (self *RemoteUserNatMultiClient) synRetryReadinessValidWithLock(ready *tcpSynRetryReadiness) (*tcpSynRetry, bool) {
+// Identity and lifecycle fences remain separate from a temporary race-slot
+// shortage, so only the current registration may return its retry request.
+func (self *RemoteUserNatMultiClient) synRetryReadinessCurrentWithLock(ready *tcpSynRetryReadiness) (*tcpSynRetry, bool) {
 	update := ready.update
 	owner := update.synRetry
-	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && update.client.Load() == nil && update.sequenceAdmissionEpoch == ready.epoch && self.synRetryDispatchEligibleWithLock(update, ready.raceOrder)
+	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && update.client.Load() == nil && update.sequenceAdmissionEpoch == ready.epoch
 	if ready.raceOrder == 0 {
 		valid = valid && update.sequenceSourceOrder == ready.sourceOrder
 	}
@@ -365,7 +367,11 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	update := ready.update
 	self.stateLock.Lock()
 	update.stateLock.Lock()
-	_, valid := self.synRetryReadinessValidWithLock(ready)
+	owner, current := self.synRetryReadinessCurrentWithLock(ready)
+	valid := current && self.synRetryDispatchEligibleWithLock(update, ready.raceOrder)
+	if current && !valid {
+		owner.preserveRaceRequestWithLock(ready.raceOrder)
+	}
 	var grantedSource *SendSequence
 	waiting := false
 	if valid {
@@ -405,7 +411,11 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	}
 	self.stateLock.Lock()
 	update.stateLock.Lock()
-	owner, valid := self.synRetryReadinessValidWithLock(ready)
+	owner, current = self.synRetryReadinessCurrentWithLock(ready)
+	valid = current && self.synRetryDispatchEligibleWithLock(update, ready.raceOrder)
+	if current && !valid {
+		owner.preserveRaceRequestWithLock(ready.raceOrder)
+	}
 	if valid && grantedSource.ctx.Err() == nil {
 		self.queueSynRetryWithLock(owner, ready.raceOrder)
 	}

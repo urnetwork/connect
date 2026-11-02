@@ -1799,11 +1799,22 @@ paths:
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
         attributed to a network and a client. It is rate limited per address
-        family: 6 per hour per client and 60 per hour per account, for IPv4
-        and for IPv6 each. A budget is spent only when the operator is about
-        to probe, so a request refused before the probe (malformed arguments,
-        the wrong family, a spent budget) costs nothing, and a refusal by a
-        spent budget says how long until it has room again. Call it on the
+        family, for IPv4 and for IPv6 each, over a trailing hour: 6 per
+        client; 6 per caller address (its /32 or /64), over every client and
+        every account; and per account 60 plus 6 for each proven host, at
+        most 1200. A proven host is an identity key of the account that
+        passed activation on that family between 1 hour and 7 days ago,
+        counted once per address and at most 32 per /24 or /48. A key the
+        account already proved at the caller's /32 or /64 spends 6 an hour
+        of its own there instead of the address's, so posts relayed through
+        an extender cannot hold off its own re-activation. The operator also
+        probes only so many activations at once, and refuses one more as
+        busy. A budget is spent only when the operator is about to probe, so
+        a request refused before the probe (malformed arguments, the wrong
+        family, a spent budget, a busy operator) costs nothing, and a refusal
+        by a spent budget or a busy operator says in `retry_after_seconds`
+        how long until there is room again: the longest wait of the spent
+        budgets, plus up to a minute. Call it on the
         family api host of the family being activated --
         `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
         an IPv6 one -- so the caller address the operator probes back has
@@ -1961,10 +1972,20 @@ paths:
         caller's address is part of the decision.
 
         `ip_versions` lists the address families the client can dial (4, 6);
-        empty means any. The answer carries base64 serialized
+        empty means any. `capabilities` lists what the client can use, such
+        as `tcp-camouflage-v1`. A record that requires a capability the client
+        did not declare is not released to it. Capabilities change which records
+        are eligible, never how many the identity is entitled to; unknown values
+        are ignored. The answer carries base64 serialized
         `protocol.ExtenderRecord` messages, the epoch, how many records the
         identity is entitled to this epoch, and `probation`. A refusal
         answers 200 with `error` and no records.
+
+        `outcome` says why the answer holds what it does, and
+        `retry_after_seconds`, when present, how long until asking again can
+        change it. A client treats an unknown outcome as `empty`, bounds the
+        retry time itself, and keeps its own deadline and rate limits. Neither
+        describes the fleet.
       operationId: extenderRelease
       security:
         - BearerAuth: []
@@ -1994,7 +2015,9 @@ paths:
         Needs a client JWT; the server records it against the country the
         caller's address places it in, once per client, and rate limits
         reports per user. An unknown extender key answers `recorded: false`
-        without an error. A refusal answers 200 with `error`.
+        without an error. So does a report against an extender the
+        operator's own probe does not reach now: that describes an outage, not
+        a block, and is not recorded. A refusal answers 200 with `error`.
       operationId: extenderBlockReport
       security:
         - BearerAuth: []
@@ -2011,6 +2034,50 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExtenderBlockReportResult"
+        "401":
+          description: Missing or invalid bearer token.
+
+  /network/extender-camouflage-report:
+    post:
+      tags: [Network]
+      x-internal: true
+      summary: Report what this client's tcp camouflage came to
+      description: |
+        A report the SDK and an extender make on their own about once an hour,
+        off by default on both sides and only while the operator has it on:
+        counts of what the sender's tcp camouflage dials came to since its last
+        report, and for an extender how it classified its tcp connections, the
+        load on each borrowed site and its coverage verdict. The route only
+        increments counters and stores nothing. Needs a client JWT, which spends
+        a rate budget per client and is not recorded; the country is the
+        operator's own lookup of the caller's address, and anything a report says
+        beyond these fields is ignored.
+
+        A report's `report_id` stays the same across its retries, and a retry of a
+        report already counted answers `duplicate` and adds nothing, so a sender
+        retries a post whose answer it lost without counting anything twice. Every
+        answer is 200: `accepted` and `duplicate` end a report; `rate_limited`
+        and `unavailable` are not counted and may be posted again, the first after
+        `retry_after_seconds`; `invalid` is not counted and never will be;
+        `disabled` means the operator has the reports off, so ask again in hours. A
+        sender treats an outcome it does not know as `unavailable`, and stops
+        posting one id after two hours, since the operator holds it for three.
+      operationId: extenderCamouflageReport
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtenderCamouflageReportArgs"
+      responses:
+        "200":
+          description: What became of the report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtenderCamouflageReportResult"
         "401":
           description: Missing or invalid bearer token.
 
@@ -2133,6 +2200,53 @@ paths:
                 $ref: "#/components/schemas/ExtenderMeasurementCertResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /v1/seed.bin:
+    get:
+      tags: [Network]
+      summary: The public extender seed bundle
+      description: |
+        The operator's public seed bundle (EXTENDER-UPDATE2.md §2): the
+        serialized `ExtenderSeedEnvelope`, raw bytes, at most 64 KiB. It is
+        the origin the seed mirrors copy, and every mirror serves the same
+        bytes at this same path for one sequence. A client reads at most
+        64 KiB + 1 bytes, refuses a larger body before decoding, and verifies
+        the envelope and every record in it under the root keys its network
+        space already authorizes (`VerifyExtenderSeed`); nothing here is
+        trusted for being served by the operator.
+
+        The bundle is public by design: a small, stable cohort of ordinary
+        open-tier records with an empty canary channel, and root-signed
+        revocations. It never carries a gated or channel-restricted record,
+        a root key, a network host setting or a resolver setting.
+
+        No auth. `404` while the operator's seed is off or nothing is
+        stored; `503` while no stored bundle verifies. The answer is
+        cacheable for five minutes, and its strong `ETag` is the quoted hex
+        sha256 of the body.
+      operationId: extenderSeed
+      security: []
+      responses:
+        "200":
+          description: The serialized seed envelope
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The bundle named by `If-None-Match` is still current
+        "404":
+          description: The seed is off, or no bundle is stored
+        "503":
+          description: No stored bundle verifies
 
   /network/extender-lag-report:
     post:
@@ -2443,7 +2557,11 @@ paths:
       tags: [Preferences]
       summary: Preferences Set
       description: |
-        Set account preferences.
+        Set account preferences. A call is recorded as the account holder's
+        own choice in settings, which the email campaigns read as consent
+        evidence: call it for a change the user makes, not to repeat the
+        sign-up form's choice, which /auth/network-create records from its
+        `product_updates`.
       operationId: preferencesSet
       security:
         - BearerAuth: []
@@ -3675,7 +3793,9 @@ paths:
         Get the current subscription status and transfer balance. This is also
         the PLAN response of the onboarding program: it carries the caller's
         regional `price_tier`, the welcome `onboarding_offer` (null when none
-        was issued) and the `experiments` assignments per surface.
+        was issued) and the `experiments` assignments per surface. For a
+        former subscriber it also carries the re-engagement program's
+        comeback offer, `winback_offer`, while one is active.
 
         Regional pricing rule (mmm/onboarding/PLAN.md): the tier is resolved,
         in order, from `storefront_country` (the store's storefront country,
@@ -5994,6 +6114,14 @@ paths:
             client uses to mount Stripe Embedded Checkout inline (the desktop
             apps load ur.io/checkout in a webview with these).
 
+        A Pro session carries the caller's regional tier price and applies a
+        redeemable offer itself: the welcome offer's coupon on the yearly
+        plan, or the caller's win-back offer (`winback_offer` on
+        /subscription/balance) on the monthly plan's first month. The
+        win-back offer is a promotion code Stripe honors only for the
+        customer it was made for, so that session is created for the
+        caller's Stripe customer.
+
         The subscription is granted by the `invoice.paid` webhook, never by the
         client; the client only polls /subscription/balance afterwards.
 
@@ -8158,16 +8286,45 @@ paths:
       tags: [Other]
       summary: Record a campaign landing click
       description: |
-        Record a campaign landing-page click. Every onboarding email link is
-        `https://ur.io/o/<step>?t=<token>`; the landing page posts the token
-        here, which writes the server-side `landing.clicked` attribution
-        event and answers with the in-app destination to route to
-        (`onboarding/connect`, `onboarding/widgets`, `onboarding/offer`,
-        `onboarding/feedback`). An app open (`/network/auth-client`) within
-        48 h of the click is attributed to it as `app.opened`.
+        Record a campaign landing-page click. Every button in the onboarding
+        and re-engagement emails links to a landing page,
+        `https://ur.io/o/<step>?t=<token>`, whose `<step>` is a
+        landing slug (LandingStep): `connect`, `widgets`, `offer` or
+        `feedback` from an onboarding email, `connect`, `update`, `keep`,
+        `learn` or `winback` from a re-engagement email. The page posts the
+        token here and routes by the link's own slug:
+
+        - `connect`, `widgets`, `offer` and `feedback` open that screen of
+          the app, passing the token as `t`: on Android the app link
+          `https://ur.io/c?onboarding=<step>` through an intent that falls
+          back to the Play listing, on iOS `urnetwork://onboarding/<step>`
+          with a link to the App Store if the app does not open, and on a
+          desktop the web app.
+        - `winback` opens the plan screen as `offer` does (the web app's
+          subscription page on a desktop), or, when the response carries
+          `open_url`, that link instead: Apple's own page for an App Store
+          win-back offer, `https://apps.apple.com/win-back/<id>`, the only
+          link the page will open from a response.
+        - `update` opens the app's store listing (the download page on a
+          desktop), and `learn` the threat model,
+          `https://ur.io/docs/threat-model`.
+        - `keep` opens nothing: the click itself is the answer to the
+          "should I keep writing?" email, and the page says so once this
+          call has recorded it.
+
+        The server records the click, as `landing.clicked` for an onboarding
+        link and `reengage.landing.clicked` for a re-engagement link (with
+        `reengage.keep` for a `keep` link), and answers with the token's
+        `step`, always a landing slug, and the in-app `destination` for it.
+        Servers before the change of 2026-11-01 answered an onboarding token
+        with its email template's name (`e4b_offer`) instead, so a client
+        routes by the slug in the link and reads `step` only for a link
+        without one. An app open (`/network/auth-client`) within 48 h of an
+        onboarding click is attributed to it as `app.opened`.
 
         No authentication: the signed token is the credential, and the
-        response carries nothing about the network. An expired token still
+        response carries nothing about the network beyond where its email's
+        button leads (`open_url`). An expired token still
         returns `step` and `destination` (with `ok: false`,
         `error: expired`) so the page can route without attributing; an
         invalid token returns `ok: false`, `error: invalid`. Budgeted per
@@ -8193,14 +8350,28 @@ paths:
                 $ref: "#/components/schemas/OnboardingClickResult"
               examples:
                 attributed:
+                  summary: An onboarding offer button
                   value:
                     ok: true
-                    step: e1_connect
-                    destination: onboarding/connect
+                    step: offer
+                    destination: onboarding/offer
+                winback:
+                  summary: A re-engagement win-back button
+                  value:
+                    ok: true
+                    step: winback
+                    destination: onboarding/offer
+                winbackAppStore:
+                  summary: A win-back button whose offer is the App Store's
+                  value:
+                    ok: true
+                    step: winback
+                    destination: onboarding/offer
+                    open_url: https://apps.apple.com/win-back/1234567890
                 expired:
                   value:
                     ok: false
-                    step: e1_connect
+                    step: connect
                     destination: onboarding/connect
                     error: expired
         "429":
@@ -8223,13 +8394,35 @@ paths:
       tags: [Other]
       summary: Resolve a feedback link token
       description: |
-        Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
-        `?why=n`) to the rating or reason the one-tap email button stood
-        for, so the in-app feedback screen opens pre-filled. The token
-        carries the step and may carry the rating/reason; `r` (1-5) and
-        `why` (a reason token) override when present. The app then submits
-        the actual feedback through `/feedback/send-feedback` and reports
-        `feedback.submitted` through `/client/events`.
+        Resolve a feedback link token to the rating or reason the one-tap
+        email button stood for, so the in-app feedback screen opens
+        pre-filled. The buttons link to the landing page
+        `https://ur.io/f/<token>?r=<rating>` (1-5) or
+        `https://ur.io/f/<token>?why=<reason>`, which calls this endpoint and
+        then opens the app's feedback screen with the answer as `r` or `why`
+        and the token as `t` (`https://ur.io/c?onboarding=feedback` on
+        Android, `urnetwork://onboarding/feedback` on iOS, the web app's
+        support page on a desktop). The token carries the step and may carry
+        the rating or reason; `r` and `why` override when present.
+
+        `why` is a reason code. The onboarding feedback email's buttons are
+        the four reasons of the apps' feedback screen: `not_needed`,
+        `not_working`, `trust` and `other` (its older links carry `1` to
+        `4`, which resolve to those four in that order). The re-engagement
+        email that asks why the reader stopped adds `stopped`, `slow` and
+        `switched` (its buttons are `stopped`, `slow`, `not_needed`,
+        `switched` and `other`); for its links `reason` is the closest of the
+        apps' four (`stopped` and `slow` → `not_working`, `switched` →
+        `other`) and `step` is `feedback`.
+
+        The tap is the answer, recorded when the link resolves so it counts
+        even if the reader never sends the in-app form: `feedback.tapped`,
+        with the rating or one of the four reasons, for an onboarding link;
+        `reengage.reason`, with the reason as tapped, for a re-engagement
+        link, whose answer also decides the network's next re-engagement
+        email (or that there is none). The app then submits the form through
+        `/feedback/send-feedback` and reports `feedback.submitted` through
+        `/client/events`.
 
         No authentication: the signed token is the credential. Budgeted per
         caller address (60 per 10 minutes) -> 429 with Retry-After.
@@ -8253,7 +8446,11 @@ paths:
         - name: why
           in: query
           required: false
-          description: Reason token from the tapped button.
+          description: |
+            The reason code of the tapped button: `not_needed`,
+            `not_working`, `trust` or `other`, and on a re-engagement link
+            also `stopped`, `slow` or `switched`. Older onboarding links
+            carry `1` to `4`.
           schema:
             type: string
       responses:
@@ -8265,16 +8462,23 @@ paths:
                 $ref: "#/components/schemas/OnboardingFeedbackTokenResult"
               examples:
                 rating:
+                  summary: A rating button (`?r=4`)
                   value:
                     ok: true
-                    step: e4_feedback
+                    step: feedback
                     rating: 4
-                    reason: ""
                 reason:
+                  summary: An onboarding reason button (`?why=not_working`)
                   value:
                     ok: true
-                    step: e4_feedback
-                    reason: did_not_work
+                    step: feedback
+                    reason: not_working
+                reengagementReason:
+                  summary: A re-engagement reason button (`?why=slow`)
+                  value:
+                    ok: true
+                    step: feedback
+                    reason: not_working
         "429":
           description: |
             Too many requests from this address. The body is PLAIN TEXT, not JSON: every non-2xx in this api is
@@ -8301,7 +8505,10 @@ paths:
         (metadata `network_id`) and the subscription at the caller's
         regional tier price: the yearly plan with the 14-day trial and, when
         the caller's welcome offer is redeemable, the 25% coupon applied
-        server-side; the monthly plan without a trial. The sheet confirms
+        server-side; the monthly plan without a trial and, when the caller
+        holds an active Stripe win-back offer (`winback_offer` on
+        /subscription/balance), its discount on the first month, applied
+        server-side (`winback_offer_applied`). The sheet confirms
         the returned intent: a SetupIntent for the yearly plan
         (`intent_type: setup`, `setup_intent_client_secret`) or the first
         invoice's PaymentIntent for the monthly plan (`intent_type: payment`,
@@ -8357,6 +8564,24 @@ paths:
                     trial_days: 14
                     trial_end_at: "2026-09-23T16:00:00Z"
                     offer_applied: true
+                    winback_offer_applied: false
+                    error: null
+                monthlyWithWinbackOffer:
+                  value:
+                    customer_id: cus_123
+                    ephemeral_key_secret: ek_test_123
+                    payment_intent_client_secret: pi_123_secret_456
+                    intent_type: payment
+                    subscription_id: sub_456
+                    publishable_key: pk_test_123
+                    tier: standard
+                    currency: USD
+                    plan: monthly
+                    amount_first_period_usd: 2.5
+                    regular_period_usd: 5
+                    trial_days: 0
+                    offer_applied: false
+                    winback_offer_applied: true
                     error: null
         "401":
           description: Missing or invalid bearer token.
@@ -8452,6 +8677,10 @@ paths:
         click); `connect_7d` = a `connect.day` (server-written on each UTC day the
         network had a connection) or a `connect.first` within 7 days; `widget_7d` = `widget.added` within 7 days; `feedback_7d` =
         `feedback.submitted` or an account feedback within 7 days;
+        `purchase_started_7d` = a `purchase.started` (the app started a
+        store, card or crypto purchase of any plan, from the offer screen or
+        the regular plan picker, so a holdout that never sees the offer
+        screen counts too) within 7 days;
         `pro_start_14d` = a `purchase.completed` or the first subscription
         renewal (trial included) within 14 days; `trial_to_paid_35d` =
         `trial.converted` within 35 days; `refund_60d` = a `refund` within
@@ -8558,6 +8787,7 @@ paths:
                         connect_7d: 19
                         widget_7d: 6
                         feedback_7d: 9
+                        purchase_started_7d: 8
                         pro_start_14d: 5
                         trial_to_paid_35d: 3
                         refund_60d: 0
@@ -8723,35 +8953,204 @@ paths:
         "403":
           description: The token is not an admin token.
 
+  /admin/reengagement/results:
+    get:
+      tags: [Other]
+      x-internal: true
+      summary: Aggregated re-engagement experiment results
+      description: |
+        The nightly aggregate the re-engagement experiments are read from
+        (mmm/reengagement/PLAN.md "MEASUREMENT"):
+        `reengagement_results_daily`, recomputed at 02:45 UTC by the
+        `ReengagementResultsRollup` task for the last
+        `reengagement.results.rollup_days` cohort days (120 by default), so
+        the 90-day window matures in place. One row per cohort day,
+        experiment, variant, stream, platform and price tier. Counts are
+        episodes, never events or networks: a network counts once per
+        episode, in the cohort day of that episode.
+
+        The cohort of a day is the episodes whose first step, a real send
+        (`reengage.email.sent`) or a virtual send (`reengage.virtual_send`,
+        the holdout's step logged at the moment it would have been mailed),
+        fell on it (UTC). An episode begins at its `reengage.episode.started`
+        (or its network's current re-engagement row, should that event be
+        missing); a send is the first step when no other send of the network
+        falls between that start and it. `experiment` and `variant` are the
+        first step's, which the step copies from the network's re-engagement
+        row (both empty when no experiment covered the episode); `stream` is
+        the episode's (lapsed, never_activated, fix, winback); `platform` the
+        step's; `tier` the price tier of the network's country, as in the
+        onboarding results. A dimension nothing recorded is `unknown`.
+
+        Column definitions. The episode's own events are the ones from its
+        first step (less a minute: Brevo's webhook times are whole seconds)
+        to the next episode's start: `exposures` = episodes;
+        `virtual_exposures` = those whose first step was virtual (the
+        holdout); `sent`, `delivered`, `landing_clicked`, `reason_answers`,
+        `keeps`, `unsubscribe`, `complaint`, `hard_bounce` = at least one
+        `reengage.email.sent`, `reengage.email.delivered`,
+        `reengage.landing.clicked`, `reengage.reason`, `reengage.keep`,
+        `reengage.email.unsubscribed`, `reengage.email.complained`,
+        `reengage.email.bounced`. The webhook records Brevo's `hard_bounce`,
+        `blocked`, `invalid_email` and `error` as `reengage.email.bounced` and
+        drops `soft_bounce`, so `hard_bounce` counts permanent failures and
+        never a soft bounce. The windows are the network's, from the first
+        step on, whatever came after (intent to treat), each open at the
+        step: `reactivation_7d`, `reactivation_30d` = a `connect.day` (one
+        server event per network per UTC day with a connection, at its first
+        connection) in (step, step + 7 days], (step, step + 30 days];
+        `retention_90d` = a `connect.day` in (step + 60 days, step + 90 days],
+        days 61 through 90; `pro_restart_30d` = a supporter subscription
+        renewal with positive net revenue starting in (step, step + 30 days].
+        A window that has not closed reports 0: `matured_days` is the cohort
+        day's age in whole days at `computed_at`, and since the first steps
+        fall anywhere in the day, a window of W days has closed for every
+        episode of the day once `matured_days` is more than W.
+
+        Volume floor: rows with fewer than `onboarding.results.min_exposures`
+        exposures (default 10) are suppressed, as in
+        /admin/onboarding/results, and no identifier of any kind is
+        returned. Ordered by the dimension tuple; keyset paged by `cursor`.
+
+        Auth: the same admin bearers as /admin/onboarding/results, compared
+        in constant time. A missing or unknown token is 401; a network JWT is
+        403. Without an admin bearer configured the endpoint is closed.
+      operationId: adminReengagementResults
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: experiment
+          in: query
+          required: false
+          description: An experiment id from the re-engagement registry (`reengagement.experiments`). Omitted or empty, every row is returned, the episodes no experiment covered (empty `experiment` and `variant`) included.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          description: First cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          description: Last cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: stream
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReengagementStream"
+        - name: platform
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventPlatform"
+        - name: tier
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PriceTierName"
+        - name: cursor
+          in: query
+          required: false
+          description: The `next_cursor` of the previous page.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Rows per page, 1-1000 (default 500).
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A page of aggregated rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReengagementResultsPage"
+              examples:
+                page:
+                  value:
+                    rows:
+                      - cohort_day: "2026-11-20"
+                        experiment: reengage_lapsed_1
+                        variant: holdout
+                        stream: lapsed
+                        platform: android
+                        tier: standard
+                        exposures: 212
+                        virtual_exposures: 212
+                        sent: 0
+                        delivered: 0
+                        landing_clicked: 0
+                        reason_answers: 0
+                        keeps: 0
+                        reactivation_7d: 9
+                        reactivation_30d: 21
+                        retention_90d: 0
+                        pro_restart_30d: 0
+                        unsubscribe: 0
+                        complaint: 0
+                        hard_bounce: 0
+                        matured_days: 41
+                        computed_at: "2026-12-31T02:45:09Z"
+                    next_cursor: null
+                    min_exposures: 10
+        "400":
+          description: A date not YYYY-MM-DD, `to` before `from`, or an invalid cursor.
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is a network token, not an admin bearer.
+
   /updates/brevo:
     post:
       tags: [Other]
       x-internal: true
       summary: Brevo transactional webhook
       description: |
-        The Brevo transactional-email webhook. Brevo is registered
-        (idempotently, by the server when `onboarding.enabled` is on) to post
-        one event per delivery step.
+        The Brevo transactional-email webhook: one request per delivery event
+        of the campaign mail. The operator registers it with `bringyourctl
+        onboarding webhook-ensure` (refused while the onboarding campaign is
+        disabled), which creates Brevo's transactional webhook for the
+        configured URL, or updates the registered one in place, so that it
+        carries a credential this endpoint accepts and every campaign event.
 
         Authentication is HTTP BASIC, not bearer and not a network token: the
-        request must carry `Authorization: Basic base64(<secret>:)` where
-        `<secret>` is one of the account's configured webhook secrets and the
-        password half is empty.
+        request must carry `Authorization: Basic base64(<user>:)` where
+        `<user>` is one of the deployment's configured webhook users and the
+        password half is empty. The registration puts the user in the
+        webhook URL's userinfo (`https://<user>:@<host>/updates/brevo`), from
+        which Brevo sends that header, or, with `--credential=header`,
+        registers the header itself. Without it, or with any other
+        credential, the request is 401 before anything is recorded, and
+        Brevo does not retry an event refused with a 4xx other than 429;
+        while no usable webhook user is configured, every request is 503.
 
         `unsubscribe` turns the account's product-updates preference off (the
-        existing behavior). For the onboarding campaign the remaining events
-        are recorded as server-written
+        existing behavior) and records the unsubscribe as how the preference
+        was last set. The events are recorded against the network of the
+        campaign send that `message-id` names: for an onboarding send as a
+        server-written
         `email.delivered|opened|clicked|bounced|complained|unsubscribed`
-        events against the network, with the campaign step taken from the
-        stored send that `message-id` names. An event whose message id is not
-        a known campaign send records nothing.
+        event with the campaign step, for a re-engagement send as
+        `reengage.email.delivered|clicked|bounced|complained|unsubscribed`
+        (opens are not recorded). An event whose message id is not a known
+        campaign send records no campaign event.
 
         The event name is matched lower-cased against this exact set:
         `delivered`; `opened`, `unique_opened`, `proxy_open`; `click`,
         `clicked`; `hard_bounce`, `blocked`, `invalid_email`, `error`;
         `spam`, `complaint`; `unsubscribed`, `unsubscribe`. Anything else
-        records no campaign event. A hard bounce or a complaint exits the
-        network from the sequence.
+        records no campaign event. A hard bounce, a complaint or an
+        unsubscribe exits the network from that program's sequence, and a
+        hard bounce or a complaint in either program also stops all campaign
+        mail to the network.
       operationId: brevoWebhook
       security:
         - BrevoWebhookAuth: []
@@ -8768,7 +9167,7 @@ paths:
                   email: person@example.com
                   message-id: "<202609091600.123@smtp-relay.mailin.fr>"
                   tags: [onboarding, e1_connect, control]
-                  link: https://ur.io/o/e1_connect?t=...
+                  link: https://ur.io/o/connect?t=...
                   ts_event: 1757495521
       responses:
         "200":
@@ -8778,7 +9177,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/BrevoWebhookResult"
         "401":
-          description: The credential is not one of the account's webhook bearers.
+          description: No `Authorization`, or one that is not a configured webhook user with an empty password.
+        "503":
+          description: No usable webhook user is configured, so the endpoint accepts nothing.
 
   # ----- oauth authorization server (server/IDP.md) -----
 
@@ -9234,8 +9635,10 @@ components:
       type: http
       scheme: basic
       description: |
-        HTTP Basic with one of the account's configured webhook secrets as
-        the username and an empty password. Not a URnetwork JWT.
+        HTTP Basic with one of the deployment's configured webhook users as
+        the username and an empty password, which Brevo sends from the
+        registered webhook URL's userinfo or from a registered custom
+        header. Not a URnetwork JWT.
     AdminBearerAuth:
       type: http
       scheme: bearer
@@ -9936,7 +10339,11 @@ components:
             preference off from the first moment: no onboarding campaign mail
             is ever sent. Honored on every create path, including sign-ups
             that complete through /auth/verify. The server records a
-            `signup.optout_changed` event with the value.
+            `signup.optout_changed` event with the value, and, as the consent
+            evidence the email campaigns read, whether the request carried the
+            field at all. Send it exactly when the form shows the line, ticked
+            or not: a request with the field is recorded as the user's answer
+            to the switch, one without it as a default the user never saw.
         result_errors:
           description: |
             Answer a refusal that has a code (`signature_mismatch`) with the
@@ -10670,6 +11077,14 @@ components:
           items:
             type: integer
             enum: [4, 6]
+        capabilities:
+          description: |
+            What the client can use. `tcp-camouflage-v1` is a client that sends
+            authenticated camouflage hellos and works with spliced extenders.
+            Eligibility only; unknown values are ignored.
+          type: array
+          items:
+            type: string
 
     ExtenderReleaseResult:
       type: object
@@ -10691,6 +11106,24 @@ components:
         error:
           description: Why the release was refused; absent on success.
           type: string
+        outcome:
+          description: |
+            Why the answer holds what it does: `ok`, records released; `empty`,
+            nothing eligible; `epoch_spent`, this epoch's records are spent and
+            none is eligible now; `probation`, the same for an identity still in
+            probation; `country_capacity`, every eligible record is at its limit
+            in the caller's country; `rate_limited`, refused by a request limit;
+            `incompatible`, the only eligible records require capabilities the
+            client did not declare; `unavailable`, the release could not be
+            answered. A client treats an unknown value as `empty`.
+          type: string
+        retry_after_seconds:
+          description: |
+            Seconds until asking again can change the answer, when known: the
+            request window for `rate_limited`, the epoch's end for
+            `epoch_spent`, and the sooner of the epoch's and the probation's end
+            for `probation`. Absent when unknown.
+          type: integer
 
     ExtenderBlockReportArgs:
       type: object
@@ -10708,8 +11141,145 @@ components:
         recorded:
           type: boolean
         error:
-          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          description: Why the report was not recorded; absent when it was, for an unknown key, and for an extender the operator's probe does not reach now.
           type: string
+
+    ExtenderCamouflageClientCounts:
+      type: object
+      required: []
+      description: What a client's tcp camouflage dials came to since its last report, each at most 65536.
+      properties:
+        camouflage_won:
+          description: Races the camouflaged attempt won.
+          type: integer
+          format: int64
+        legacy_won:
+          description: Races the legacy attempt won, the Phase A fallback.
+          type: integer
+          format: int64
+        both_failed:
+          description: Races where both attempts failed, the Phase B loss.
+          type: integer
+          format: int64
+        refused:
+          description: Races ended by a refusal or a limit.
+          type: integer
+          format: int64
+        camouflage_unauthenticated:
+          description: Camouflaged attempts the extender terminated unauthenticated, in Phase A.
+          type: integer
+          format: int64
+        camouflage_leaf_rejected:
+          description: Camouflaged attempts that met a leaf the record key did not sign, the Phase B splice.
+          type: integer
+          format: int64
+        legacy_only_no_key:
+          description: Dials that ran the legacy attempt alone because the config carried no camouflage key.
+          type: integer
+          format: int64
+        legacy_only_fingerprint:
+          description: Dials that ran the legacy attempt alone because the fingerprint switch is not the Chrome hello.
+          type: integer
+          format: int64
+        legacy_only_no_front_name:
+          description: Dials that ran the legacy attempt alone because there was no borrowed name to front.
+          type: integer
+          format: int64
+
+    ExtenderCamouflageTargetCounts:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          description: A borrowed site's name, at most 253 bytes. The operator labels only names in its own bundled lists, and every other name as `other`.
+          type: string
+        splice_count:
+          description: Splices that began to the site since the last report, at most 2^24.
+          type: integer
+          format: int64
+        relayed_byte_count:
+          description: Bytes spliced to and from the site since the last report, at most 2^44.
+          type: integer
+          format: int64
+
+    ExtenderCamouflageExtenderCounts:
+      type: object
+      required: []
+      description: How an extender classified its tcp connections since its last report, each at most 2^26, and its coverage verdict now. Taken only from a client that activated an extender that is active.
+      properties:
+        authenticated:
+          type: integer
+          format: int64
+        spliced:
+          type: integer
+          format: int64
+        terminated:
+          type: integer
+          format: int64
+        splice_fallback_terminated:
+          description: Splice on and no borrowed target reachable, the degraded exposure.
+          type: integer
+          format: int64
+        replay_refused:
+          type: integer
+          format: int64
+        time_window_failed:
+          type: integer
+          format: int64
+        splice_dial_failed:
+          type: integer
+          format: int64
+        borrow_verify_failed:
+          type: integer
+          format: int64
+        targets:
+          description: At most 32 borrowed sites.
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtenderCamouflageTargetCounts"
+        covered:
+          description: Whether this extender presents real-site behavior to a prober now.
+          type: boolean
+        degraded_reason:
+          description: Why it does not, when it does not. One of `camouflage_off`, `splice_off`, `splice_gate_closed`, `no_verified_target`, `splice_fallback_active` and `coverage_incomplete`; anything else reads as `other`.
+          type: string
+
+    ExtenderCamouflageReportArgs:
+      type: object
+      required:
+        - report_id
+      properties:
+        report_id:
+          description: 32 lower case hex digits, random, the same across the retries of one report.
+          type: string
+        client_version:
+          description: The sender's build, at most 64 bytes. Reduced to a calendar release label.
+          type: string
+        resource_version:
+          description: The version of the borrow list the sender reads, zero for none.
+          type: integer
+        ip_versions:
+          description: The address families the sender dials extenders of (4, 6). Empty means any.
+          type: array
+          items:
+            type: integer
+        client:
+          $ref: "#/components/schemas/ExtenderCamouflageClientCounts"
+        extender:
+          $ref: "#/components/schemas/ExtenderCamouflageExtenderCounts"
+
+    ExtenderCamouflageReportResult:
+      type: object
+      required:
+        - outcome
+      properties:
+        outcome:
+          description: "`accepted`, `duplicate`, `rate_limited`, `disabled`, `invalid` or `unavailable`. A sender treats one it does not know as `unavailable`."
+          type: string
+        retry_after_seconds:
+          description: With `rate_limited`, how long until a report can be taken.
+          type: integer
 
     TestBalanceDrainArgs:
       type: object
@@ -12494,6 +13064,15 @@ components:
           oneOf:
             - $ref: "#/components/schemas/OnboardingOffer"
             - type: "null"
+        winback_offer:
+          description: |
+            The caller's active win-back offer, from the re-engagement
+            program's email to former subscribers. Absent when there is none,
+            once it has expired or been redeemed, for a Stripe offer whose
+            discounted first month would fall below Stripe's minimum charge
+            at the caller's price tier (checkout would not apply it), and
+            from older servers.
+          $ref: "#/components/schemas/WinbackOffer"
         experiments:
           type: object
           description: |
@@ -12644,6 +13223,45 @@ components:
           oneOf:
             - $ref: "#/components/schemas/EventStore"
             - type: "null"
+
+    WinbackOffer:
+      type: object
+      description: |
+        A former subscriber's comeback offer: `percent_off` off the first
+        month of `plan`, redeemable on `store` only, until `expires_at`. An
+        app shows it on that store's plan screen and nowhere else: Stripe
+        applies it server-side at checkout and in the payment sheet
+        (`winback_offer_applied`), the Google Play app selects the plan's
+        offer tagged `play_offer_tag`, and the App Store app presents
+        Apple's win-back offer `apple_offer_id`.
+      required:
+        - expires_at
+        - percent_off
+        - plan
+        - store
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+        percent_off:
+          type: integer
+          description: The discount, in percent.
+        plan:
+          type: string
+          description: The plan the offer discounts (`monthly`; no win-back offer is made on the yearly plan).
+        store:
+          type: string
+          description: The one store the offer is redeemed on.
+          enum:
+            - stripe
+            - play
+            - apple
+        play_offer_tag:
+          type: string
+          description: The Google Play offer's tag. Present only when `store` is `play`.
+        apple_offer_id:
+          type: string
+          description: The App Store win-back offer's identifier. Present only when `store` is `apple`.
 
     ExperimentAssignment:
       type: object
@@ -12843,7 +13461,8 @@ components:
         keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
         at most 64 characters. Server-written names (`landing.clicked`,
         `app.opened`, `email.*`, `trial.*`, `refund`, `retention.*`,
-        `connect.day`) are refused from clients.
+        `connect.day`, `feedback.tapped`, and the re-engagement program's
+        `reengage.*`) are refused from clients.
       oneOf:
         - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
         - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
@@ -13342,6 +13961,26 @@ components:
         token:
           type: string
 
+    LandingStep:
+      type: string
+      description: |
+        A campaign landing page's slug, the `<step>` of
+        `https://ur.io/o/<step>`. The onboarding emails link `connect`,
+        `widgets`, `offer` and `feedback`; the re-engagement emails link
+        `connect`, `update` (the app's store listing), `keep` (the answer to
+        "should I keep writing?", which opens nothing), `learn` (the threat
+        model) and `winback` (the plan screen), and their reason buttons
+        resolve to `feedback`.
+      enum:
+        - connect
+        - widgets
+        - offer
+        - feedback
+        - update
+        - keep
+        - learn
+        - winback
+
     OnboardingClickResult:
       type: object
       required:
@@ -13350,16 +13989,32 @@ components:
         ok:
           type: boolean
         step:
-          type: string
-          description: the campaign step the link belongs to (e.g. e1_connect)
+          description: |
+            The landing slug the token routes to, never an email template's
+            name. Absent for an invalid token.
+          $ref: "#/components/schemas/LandingStep"
         destination:
           type: string
-          description: the in-app destination to route to
+          description: |
+            The in-app destination for `step`. `connect`, `widgets`, `offer`
+            and `feedback` route to their own; `winback` to
+            `onboarding/offer`; `update`, `keep` and `learn`, which the
+            landing page does not open in the app, to `onboarding/connect`.
           enum:
             - onboarding/connect
             - onboarding/widgets
             - onboarding/offer
             - onboarding/feedback
+        open_url:
+          type: string
+          format: uri
+          description: |
+            Where the landing page opens instead of the app, when set: on a
+            `winback` click by a network whose win-back offer is the App
+            Store's, Apple's direct link to that offer
+            (`https://apps.apple.com/win-back/<id>`), while the offer is
+            active and the link is configured. Absent otherwise, on an
+            expired or invalid token, and from older servers.
         error:
           type: string
           enum:
@@ -13374,7 +14029,10 @@ components:
         ok:
           type: boolean
         step:
-          type: string
+          description: |
+            The token's landing slug, `feedback` for every feedback link.
+            Absent for an invalid or expired token.
+          $ref: "#/components/schemas/LandingStep"
         rating:
           type: integer
           description: |
@@ -13382,6 +14040,15 @@ components:
             omits the zero value rather than sending 0).
         reason:
           type: string
+          description: |
+            The reason code to pre-select; absent when there is none. For an
+            onboarding link, the link's code (`not_needed`, `not_working`,
+            `trust` or `other`; an older link's `1` to `4` come back as
+            those codes), and a `why` outside the four is passed back as sent
+            and not recorded. For a re-engagement link, the closest of the
+            four to the reason tapped (`stopped` and `slow` → `not_working`,
+            `not_needed` → `not_needed`, `switched` and `other` → `other`),
+            absent when the link carried none of its five reasons.
         error:
           type: string
           enum:
@@ -13435,7 +14102,7 @@ components:
           type: string
         amount_first_period_usd:
           type: number
-          description: the first period's price, with the welcome offer applied when eligible
+          description: the first period's price, with the welcome offer (yearly) or the win-back offer (monthly) applied when eligible
         regular_period_usd:
           type: number
         trial_days:
@@ -13445,6 +14112,13 @@ components:
           format: date-time
         offer_applied:
           type: boolean
+          description: the welcome offer's coupon discounts the first year
+        winback_offer_applied:
+          type: boolean
+          description: |
+            The caller's win-back offer discounts the first month (the
+            monthly plan, never together with the welcome offer). Absent
+            from older servers.
         error:
           oneOf:
             - $ref: "#/components/schemas/PurchaseError"
@@ -13511,6 +14185,7 @@ components:
         - connect_7d
         - widget_7d
         - feedback_7d
+        - purchase_started_7d
         - pro_start_14d
         - trial_to_paid_35d
         - refund_60d
@@ -13559,6 +14234,12 @@ components:
           type: integer
         feedback_7d:
           type: integer
+        purchase_started_7d:
+          type: integer
+          description: |
+            Exposed networks with a `purchase.started` within 7 days: the
+            in-app offer experiments' leading metric, which a holdout that
+            never sees the offer screen can reach too.
         pro_start_14d:
           type: integer
         trial_to_paid_35d:
@@ -13591,6 +14272,120 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/OnboardingResultsRow"
+        next_cursor:
+          description: The cursor for the next page; null on the last page.
+          type: [string, "null"]
+        min_exposures:
+          type: integer
+          description: The volume floor applied to this page.
+
+    ReengagementStream:
+      type: string
+      description: A re-engagement stream (mmm/reengagement/PLAN.md "AUDIENCES AND STREAMS").
+      enum:
+        - lapsed
+        - never_activated
+        - fix
+        - winback
+
+    ReengagementResultsRow:
+      type: object
+      description: |
+        One aggregated row of the re-engagement results. Counts are
+        episodes, not networks or events; the windows are measured from each
+        episode's first step (see GET /admin/reengagement/results for every
+        column's definition).
+      required:
+        - cohort_day
+        - experiment
+        - variant
+        - stream
+        - platform
+        - tier
+        - exposures
+        - virtual_exposures
+        - sent
+        - delivered
+        - landing_clicked
+        - reason_answers
+        - keeps
+        - reactivation_7d
+        - reactivation_30d
+        - retention_90d
+        - pro_restart_30d
+        - unsubscribe
+        - complaint
+        - hard_bounce
+        - matured_days
+        - computed_at
+      properties:
+        cohort_day:
+          type: string
+          format: date
+          description: The UTC day of the episodes' first step.
+        experiment:
+          type: string
+          description: The registry experiment, or empty when none covered the episodes.
+        variant:
+          type: string
+          description: The experiment variant the episodes were served, or empty.
+        stream:
+          type: string
+          description: A ReengagementStream, or `unknown` when the episode did not record one.
+        platform:
+          type: string
+          description: An EventPlatform, or `unknown` when the episode did not record one.
+        tier:
+          type: string
+          description: A PriceTierName, or `unknown` when the network's country is unknown.
+        exposures:
+          type: integer
+        virtual_exposures:
+          type: integer
+          description: Exposures whose first step was a virtual send (the holdout).
+        sent:
+          type: integer
+        delivered:
+          type: integer
+        landing_clicked:
+          type: integer
+        reason_answers:
+          type: integer
+        keeps:
+          type: integer
+        reactivation_7d:
+          type: integer
+        reactivation_30d:
+          type: integer
+        retention_90d:
+          type: integer
+        pro_restart_30d:
+          type: integer
+        unsubscribe:
+          type: integer
+        complaint:
+          type: integer
+        hard_bounce:
+          type: integer
+          description: Permanent failures (Brevo hard_bounce, blocked, invalid_email, error); soft bounces are not recorded.
+        matured_days:
+          type: integer
+          description: The cohort day's age in whole days at `computed_at`; a window of W days has closed for every episode of the day once this is more than W.
+        computed_at:
+          type: string
+          format: date-time
+
+    ReengagementResultsPage:
+      type: object
+      required:
+        - rows
+        - next_cursor
+        - min_exposures
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReengagementResultsRow"
         next_cursor:
           description: The cursor for the next page; null on the last page.
           type: [string, "null"]
@@ -19062,6 +19857,33 @@ components:
             activation without it and with `measurement_csr` makes the
             extender eligible again.
           type: boolean
+        run_id:
+          description: |
+            The run of the extender process that posted this activation
+            (EXTENDER.md G3): 32 hex characters of 128 random bits drawn once
+            when the process starts, so every activation of one process carries
+            the same id and a restart a new one. The three run fields are
+            optional, and a well-typed one never refuses an activation: each is
+            stored on the activation's history row when it is well formed, and
+            as null otherwise.
+          type: string
+        run_start_time:
+          description: |
+            When that process started, in UTC. Stored when it is no earlier
+            than 2026-11-01 and no later than an hour past the operator's
+            clock.
+          type: string
+          format: date-time
+        previous_exit:
+          description: |
+            How the run before it ended, as the host that restarted the process
+            reported it: `oom`, `stop` when the host stopped it on purpose, the
+            signal that ended it (`sigkill`, `sigterm`, `sigint`, `sighup`,
+            `sigquit`, `sigabrt`, `sigsegv`, `sigbus`, `sigill`, `sigfpe`,
+            `sigtrap`, `sigpipe`, `sigalrm`, or `signal` for another), or
+            `exit-<code>` for an exit code from 0 to 255. Omitted when the host
+            reported none.
+          type: string
 
     ExtenderActivateResult:
       type: object
@@ -19129,6 +19951,14 @@ components:
             out before it answered, how much it had ("the forward did not
             answer within the 0.5 s left of the 10 s probe budget: ...").
           type: string
+        retry_after_seconds:
+          description: |
+            On a refusal that judged nothing about the caller -- a spent
+            activation budget, or an operator busy probing other activations
+            -- the seconds until there is room for the caller's next post of
+            this family, rounded up. Wait that long rather than backing off.
+            Absent on every other answer.
+          type: integer
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator

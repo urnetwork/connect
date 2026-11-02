@@ -562,8 +562,19 @@ type ExtenderRecordBody struct {
 	// an extender that does not serve the API or whose name is not published,
 	// and on records that predate the field.
 	MeasurementId []byte `protobuf:"bytes,17,opt,name=MeasurementId,proto3" json:"MeasurementId,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The client capabilities a release must see declared before it hands
+	// out this record (EXTENDER-UPDATE2 §3.2). A Phase B extender splices an
+	// unauthenticated hello to its borrowed site, so its record requires
+	// "tcp-camouflage-v1". The field is signed with the rest of the body, so
+	// a client that holds the record knows the requirement too, and an
+	// unknown value is one no client satisfies. The operator sets it only on
+	// records that a release alone hands out (the gated tier) and that carry
+	// a RealityPublicKey; a capability changes which records are eligible,
+	// never the disclosure budget. Empty, it requires nothing, as on every
+	// record that predates the field. A reader that predates it skips it.
+	RequiredCapabilities []string `protobuf:"bytes,18,rep,name=RequiredCapabilities,proto3" json:"RequiredCapabilities,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ExtenderRecordBody) Reset() {
@@ -711,6 +722,13 @@ func (x *ExtenderRecordBody) GetCanaryChannel() string {
 func (x *ExtenderRecordBody) GetMeasurementId() []byte {
 	if x != nil {
 		return x.MeasurementId
+	}
+	return nil
+}
+
+func (x *ExtenderRecordBody) GetRequiredCapabilities() []string {
+	if x != nil {
+		return x.RequiredCapabilities
 	}
 	return nil
 }
@@ -1516,7 +1534,7 @@ const file_extender_proto_rawDesc = "" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\xe4\x04\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\x98\x05\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
@@ -1535,7 +1553,8 @@ const file_extender_proto_rawDesc = "" +
 	"\x0eWebRtcClientId\x18\x0e \x01(\fR\x0eWebRtcClientId\x12*\n" +
 	"\x10RealityPublicKey\x18\x0f \x01(\fR\x10RealityPublicKey\x12$\n" +
 	"\rCanaryChannel\x18\x10 \x01(\tR\rCanaryChannel\x12$\n" +
-	"\rMeasurementId\x18\x11 \x01(\fR\rMeasurementId\"h\n" +
+	"\rMeasurementId\x18\x11 \x01(\fR\rMeasurementId\x122\n" +
+	"\x14RequiredCapabilities\x18\x12 \x03(\tR\x14RequiredCapabilities\"h\n" +
 	"\x0eExtenderRecord\x12\x12\n" +
 	"\x04Body\x18\x01 \x01(\fR\x04Body\x12$\n" +
 	"\rRootSignature\x18\x02 \x01(\fR\rRootSignature\x12\x1c\n" +

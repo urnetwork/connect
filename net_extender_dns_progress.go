@@ -155,7 +155,7 @@ func (self *ExtenderNetworkClient) bootstrapDnsAddresses(ctx context.Context) {
 		return
 	}
 	if err := publication.waitFirst(self.ctx); err != nil && self.ctx.Err() == nil {
-		self.log.Infof("[extender]bootstrap err = %s\n", err)
+		self.log.Infof("[extender]bootstrap err = %s\n", extenderErrorText(err))
 	}
 }
 
@@ -186,7 +186,7 @@ func (self *ExtenderNetworkClient) applyManualHostsProgressive() uint64 {
 				ready(changed)
 			})
 			if err != nil && ctx.Err() == nil {
-				self.log.Infof("[extender]manual host %s err = %s\n", host, err)
+				self.log.Infof("[extender]manual host %s err = %s\n", host, extenderErrorText(err))
 			}
 		}
 		return ctx.Err()

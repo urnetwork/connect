@@ -17,7 +17,9 @@ package connect
 //     time a client seals for that same extender — which it checks against its
 //     own clock anyway — and never the time sealed for another.
 //   - The Date of a platform api response whose tls chain verified
-//     (ObserveExtenderCamouflagePlatformTime). That offset is the fallback for
+//     (ObserveExtenderCamouflagePlatformTime), which a client strategy reads off
+//     every response of the hosts its settings name as the platform's own api
+//     (ClientStrategySettings.PlatformApiHosts). That offset is the fallback for
 //     an extender with no observation of its own.
 //
 // Nothing else moves it. A failed dial, a spliced handshake, a hello the
@@ -43,6 +45,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
@@ -232,6 +235,41 @@ func ObserveExtenderCamouflagePlatformTime(response *http.Response, sendTime tim
 	}
 	currentExtenderCamouflageClock().observePlatform(offset, receiveTime)
 	return true
+}
+
+// PlatformApiHostNames are the hosts of the given api urls, normalized and
+// distinct, for ClientStrategySettings.PlatformApiHosts. A url that names no
+// host, such as the family url of a space that has none, adds nothing.
+func PlatformApiHostNames(apiUrls ...string) []string {
+	hostNames := []string{}
+	for _, apiUrl := range apiUrls {
+		if hostName, err := ExtenderApiHostName(apiUrl); err == nil && !slices.Contains(hostNames, hostName) {
+			hostNames = append(hostNames, hostName)
+		}
+	}
+	return hostNames
+}
+
+// PlatformApiHosts are the hosts this strategy reads the camouflage clock from
+// (ClientStrategySettings.PlatformApiHosts). The result is a copy.
+func (self *ClientStrategy) PlatformApiHosts() []string {
+	return slices.Clone(self.settings.PlatformApiHosts)
+}
+
+// Reads the camouflage clock's fallback offset off one attempt of this strategy
+// (ObserveExtenderCamouflagePlatformTime), when the response came from a host
+// the settings name as the platform's own api. The host is the one the response
+// actually came from, the request after any redirect, so the api redirecting
+// elsewhere moves nothing. sendTime is the local clock before the attempt.
+func (self *ClientStrategy) observeExtenderCamouflagePlatformTime(response *http.Response, err error, sendTime time.Time) {
+	if err != nil || response == nil || response.Request == nil || response.Request.URL == nil {
+		return
+	}
+	hostName := NormalizeExtenderNetworkHost(response.Request.URL.Hostname())
+	if hostName == "" || !slices.Contains(self.settings.PlatformApiHosts, hostName) {
+		return
+	}
+	ObserveExtenderCamouflagePlatformTime(response, sendTime, extenderCamouflageLocalNow())
 }
 
 // The time a camouflaged hello to the extender with this identity key seals:

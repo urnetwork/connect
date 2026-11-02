@@ -114,12 +114,20 @@ type nativeDuplicateAckFixture struct {
 
 // Constructors keep production collapse and original recovery timers. All routes
 // are in memory and every dial is either the one owned pipe or an explicit error.
-func newNativeDuplicateAckFixture(t *testing.T, loss bool) *nativeDuplicateAckFixture {
+func newNativeDuplicateAckFixture(t *testing.T, loss bool, returnFlightPacketCount ...int) *nativeDuplicateAckFixture {
 	t.Helper()
+	return newNativeDuplicateAckFixtureWithWindow(t, loss, 4096, returnFlightPacketCount...)
+}
+
+func newNativeDuplicateAckFixtureWithWindow(t *testing.T, loss bool, window uint16, returnFlightPacketCount ...int) *nativeDuplicateAckFixture {
+	t.Helper()
+	if len(returnFlightPacketCount) > 1 {
+		t.Fatal("native recovery fixture accepts at most one explicit flight bound")
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	local, origin := net.Pipe()
 	f := &nativeDuplicateAckFixture{t: t, ctx: ctx, cancel: cancel, local: local, origin: origin,
-		forward: make(Route, 16), reverse: make(Route, 16), initial: 1000, window: 4096,
+		forward: make(Route, 16), reverse: make(Route, 16), initial: 1000, window: window,
 		consumer: nativeDuplicateAckConsumer{loss: loss, pending: make(map[uint32]string)}}
 	t.Cleanup(f.close)
 	constructed := false
@@ -162,6 +170,9 @@ func newNativeDuplicateAckFixture(t *testing.T, loss bool) *nativeDuplicateAckFi
 	natSettings.TcpBufferSettings.Mtu = 44
 	natSettings.TcpBufferSettings.ReadBufferByteCount = 16
 	natSettings.TcpBufferSettings.AckCompressTimeout = 0
+	if len(returnFlightPacketCount) == 1 {
+		natSettings.TcpBufferSettings.ReturnRecoveryMaxPacketCount = returnFlightPacketCount[0]
+	}
 	natSettings.TcpBufferSettings.beforeSequenceRunWithStateForTest = func(sequence *TcpSequence) {
 		if !f.providerSequence.CompareAndSwap(nil, sequence) {
 			t.Error("fixture constructed more than one provider TCP flow")

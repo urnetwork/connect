@@ -270,6 +270,89 @@ func TestExtenderCamouflageStatusNoVerifiedTarget(t *testing.T) {
 	}
 }
 
+// No verified name is what the status says in every posture of an enabled
+// extender, since it stands between the extender and coverage whatever the posture
+// and the gate say; only the phase differs. With a name, the posture and the gate
+// speak as they did. Off is off, name or no name.
+func TestExtenderCamouflageStatusNamesNoVerifiedTargetInEveryPosture(t *testing.T) {
+	closedGate := func() bool { return false }
+	openGate := func() bool { return true }
+	cases := []struct {
+		name           string
+		enabled        bool
+		splice         bool
+		gate           func() bool
+		borrowNames    []string
+		expectedPhase  string
+		expectedReason string
+	}{
+		{
+			name:           "phase a with no name",
+			enabled:        true,
+			expectedPhase:  ExtenderCamouflagePhaseAuthenticatedRollout,
+			expectedReason: ExtenderCamouflageDegradedNoVerifiedTarget,
+		},
+		{
+			name:           "gate closed with no name",
+			enabled:        true,
+			splice:         true,
+			gate:           closedGate,
+			expectedPhase:  ExtenderCamouflagePhaseAuthenticatedRollout,
+			expectedReason: ExtenderCamouflageDegradedNoVerifiedTarget,
+		},
+		{
+			name:           "gate open with no name",
+			enabled:        true,
+			splice:         true,
+			gate:           openGate,
+			expectedPhase:  ExtenderCamouflagePhaseSplicePilot,
+			expectedReason: ExtenderCamouflageDegradedNoVerifiedTarget,
+		},
+		{
+			name:           "phase a with a name",
+			enabled:        true,
+			borrowNames:    []string{testBorrowName},
+			expectedPhase:  ExtenderCamouflagePhaseAuthenticatedRollout,
+			expectedReason: ExtenderCamouflageDegradedSpliceOff,
+		},
+		{
+			name:           "gate closed with a name",
+			enabled:        true,
+			splice:         true,
+			gate:           closedGate,
+			borrowNames:    []string{testBorrowName},
+			expectedPhase:  ExtenderCamouflagePhaseAuthenticatedRollout,
+			expectedReason: ExtenderCamouflageDegradedGateClosed,
+		},
+		{
+			name:           "off with no name",
+			expectedPhase:  ExtenderCamouflagePhaseOff,
+			expectedReason: ExtenderCamouflageDegradedCamouflageOff,
+		},
+		{
+			name:           "off with a name",
+			borrowNames:    []string{testBorrowName},
+			expectedPhase:  ExtenderCamouflagePhaseOff,
+			expectedReason: ExtenderCamouflageDegradedCamouflageOff,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
+				settings.CamouflageEnabled = c.enabled
+				settings.IdentityKeySeed = mustSeed(t)
+				settings.ExtenderCamouflageSplice = c.splice
+				settings.CamouflageSpliceGate = c.gate
+				settings.CamouflageBorrowNames = c.borrowNames
+			})
+			status := fixture.server.CamouflageStatus()
+			if status.Covered || status.Phase != c.expectedPhase || status.DegradedReason != c.expectedReason {
+				t.Fatalf("status = %+v, expected %s with %s", status, c.expectedPhase, c.expectedReason)
+			}
+		})
+	}
+}
+
 // A splice pilot with verified targets, the gate open and no fallback reports
 // coverage (§3.3): the one honest success state.
 func TestExtenderCamouflageStatusCovered(t *testing.T) {
