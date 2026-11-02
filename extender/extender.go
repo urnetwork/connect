@@ -1713,7 +1713,8 @@ type ExtenderCamouflageStatus struct {
 	SpliceDialFailedCount int64
 	// the honest answer: does this extender currently present real-site
 	// behavior to a prober. False whenever it is not in the splice pilot, has
-	// no verified target, or has fallen back to terminate.
+	// no verified target, has fallen back to terminate, or a role found a name
+	// its supported clients select unverified.
 	Covered bool
 	// why Covered is false, for status and telemetry
 	DegradedReason string
