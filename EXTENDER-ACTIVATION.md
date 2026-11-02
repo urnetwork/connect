@@ -32,19 +32,25 @@ For peer review. Written 2026-11-01.
 **Triggers.** A pass runs:
 - at start;
 - on a 24 h tick (`ActivateTimeout`);
-- when the extender sees its own key revoked in the directory (`observeRevocation`, l.699);
+- when the extender sees its own key revoked in the directory (`observeRevocation`);
 - on a network change, and on `Reactivate`;
-- when the hourly address check (`AddressCheckTimeout`, 1 h) sees a moved address.
+- when the hourly address check (`AddressCheckTimeout`, 1 h) sees a moved address;
+- when the tcp carrier returns, for a family whose post came due while it was gone (`TcpCarrierReturned`), within 5 minutes (`CarrierReturnJitter`);
+- when a carrier returns that a family's last post left off, within the same 5 minutes, if it is still serving then (`CarriersChanged`).
 
-The defaults are in `DefaultExtenderActivatorSettings` (l.273).
+A replaced role is not a start: its activator continues from the old one's schedules and status (`ExtenderActivator.State`), so a hold stands, and a family that stands activated is posted once more within the hour (`ReplacedPostJitter`). Only a new process, or the role being turned off and on, starts every family due.
+
+**The gate.** A post that comes due with no required carrier serving, which today means tcp, is not made (`extenderActivateCarrierFailure`). The operator would refuse the list before probing anything, so this saves a round trip. The status gives the reason, the hold stays as it was, and the family is looked at again after 10 minutes (`holdForCarrier`).
+
+The defaults are in `DefaultExtenderActivatorSettings`.
 
 **A post** goes to the family's api url, for example the v4-only host, with the client jwt, through a direct-only client strategy. An activation relayed through another extender would publish that extender's address. The result's bootstrap records are applied to the local directory and the status is recorded (`applyRecords`, `recordSuccess`, `recordFailure`).
 
 **Backoff:** 10 min doubling to 6 h (`MinBackoff`, `MaxBackoff`).
 
-**The address check** is one hello to the plain dual-stack api url (`hello`, l.841). It compares the caller address the operator saw, by address and not port, with the last one.
+**The address check** is one hello to the plain dual-stack api url (`hello`). It compares the caller address the operator saw, by address and not port, with the last one.
 
-**The measurement request** for lag.dev's certificate rides the first post of a pass that can carry it (lag.dev/PLAN.md C4, `followMeasurementCsr`, l.1055).
+**The measurement request** for lag.dev's certificate rides the first post of a pass that can carry it (lag.dev/PLAN.md C4, `followMeasurementCsr`).
 
 **Sleep:** the tick, the hourly check and the backoff count time the host slept. A minute after waking from 15 minutes or more of sleep, whatever came due is due.
 
@@ -138,16 +144,16 @@ The hello goes to the plain dual-stack url, so it arrives over v4 one hour and v
 
 ### 4.1 What changed (`net_extender_activate.go`, `control_family.go`, EXTENDER.md G3)
 
-- **Schedules:** each family has its own `extenderActivateSchedule` (l.380): a 24 h tick, and a hold of 10 min doubling to 6 h (`tick` l.392, `hold` l.400).
+- **Schedules:** each family has its own `extenderActivateSchedule`: a 24 h tick, and a hold of 10 min doubling to 6 h (`tick`, `hold`).
   - A refused family holds only itself, so it never re-posts the family that works.
   - A success moves the family back to its tick, resets its hold and marks it activated in this run (`activatedInRun`).
-  - The schedules move once every post of the pass has been answered (`activate`, l.934), so a record that another family's answer brings counts for the family it names.
-  - `dueScheduleKeys` (l.746) and `nextActivateWait` (l.758) pick what's due.
-- **Triggers that post every family,** as before: start, an observed revocation, a network change and `Reactivate` (`scheduleEveryFamily`, l.738).
-- **A family with no global address** on the host (`FamilySupported`, `control_family.go` l.557) isn't posted. It's looked at again every 10 min without doubling (`recheck`, l.410), so one that gains an address is posted within 10 min however long it went without one, and its first failure after that holds 10 min.
-- **The address check** (`checkAddress` l.768, `addressChange` l.797) is still one hello to the plain url, now compared within the family it arrived on.
+  - The schedules move once every post of the pass has been answered (`activate`), so a record that another family's answer brings counts for the family it names.
+  - `dueScheduleKeys` and `nextActivateWait` pick what's due.
+- **Triggers that post every family,** as before: start, an observed revocation, a network change and `Reactivate` (`scheduleEveryFamily`).
+- **A family with no global address** on the host (`FamilySupported`, `control_family.go`) isn't posted. It's looked at again every 10 min without doubling (`recheck`), so one that gains an address is posted within 10 min however long it went without one, and its first failure after that holds 10 min.
+- **The address check** (`checkAddress`, `addressChange`) is still one hello to the plain url, now compared within the family it arrived on.
   - These count as unchanged: an address the operator published for any family, and the last address that family's hello saw, while the family's published address is still the one that hello was read against. So a dual-stack host whose hello alternates families posts nothing, and a host whose hello leaves from another of its addresses than its activation posts once, not hourly.
-  - An activation that moves a family's published address forgets that family's last hello (`activateUrl` l.1188, `recordSuccess` l.1275), so a host that returns to an address it left is posted at the next check.
+  - An activation that moves a family's published address forgets that family's last hello (`activateUrl`, `recordSuccess`), so a host that returns to an address it left is posted at the next check.
   - A family that really moved posts that family alone.
   - A family that isn't activated is left to its schedule.
 - **The measurement follow-up** goes only to the families the pass activated. So a new identity whose v4 is refused sends its request on v6 at once, and a refusal of the follow-up is held as an activated family's.
@@ -156,20 +162,20 @@ The hello goes to the plain dual-stack url, so it arrives over v4 one hour and v
 
 ### 4.2 Private addresses: one try at start, then the daily tick, while the family hasn't activated (decided)
 
-`FamilyPublic` (`control_family.go` l.586) treats a family as private when all its global addresses are RFC 1918, RFC 4193 (ULA), carrier-grade NAT (100.64/10), link-local or the 464XLAT range.
-- **What happens:** a private family is still posted at start, on its tick and on every trigger, like any family. If it's refused while it hasn't activated, it waits for its next tick instead of the backoff (l.966), since a NAT that never forwards refuses every retry alike. For a NAT'd v4 that's one refused try per start plus one a day, down from 4–9 a day.
+`FamilyPublic` (`control_family.go`) treats a family as private when all its global addresses are RFC 1918, RFC 4193 (ULA), carrier-grade NAT (100.64/10), link-local or the 464XLAT range.
+- **What happens:** a private family is still posted at start, on its tick and on every trigger, like any family. If it's refused while it hasn't activated, it waits for its next tick instead of the backoff, since a NAT that never forwards refuses every retry alike. For a NAT'd v4 that's one refused try per start plus one a day, down from 4–9 a day.
 - **What counts as activated:**
   - it activated since start (`activatedInRun`); or
-  - the directory holds this extender's own current record naming an address of the family (`ownRecordNamesFamily`, l.991, through `ExtenderDirectory.CurrentRecordNamesFamily`, `net_extender_directory.go` l.2577): the operator published that family after its probes passed.
+  - the directory holds this extender's own current record naming an address of the family (`ownRecordNamesFamily`, through `ExtenderDirectory.CurrentRecordNamesFamily`, `net_extender_directory.go`): the operator published that family after its probes passed.
     - Only the newest record of the key counts, and only while it's valid, neither revoked nor expired. An address an older record named and the newest one dropped doesn't count, though the directory keeps it; nor does an address another key has claimed since.
     - Local dial evidence doesn't enter, so an address in warning or hold counts.
 - **Across a restart:** an app's directory has a store, so it keeps the record. The miner's network space keeps no local state, so its directory starts empty and names the family only once the other family's answer in the same pass, or the feed, brings the record back. So a dual-stack miner whose v4 the operator still holds retries v4 in 10 min, while a v4-only miner whose first post of a run is refused still waits for the tick. Lifting the hold when a later directory change brings the record would close that; it isn't implemented.
 - **Once it has activated,** something forwards to it: a home router's port forward, a published container port, a cloud VM's 1:1 NAT. Its later refusals — the operator's rate budget, its configuration or store, a probe flake, the re-post after a revocation — are held on the backoff as any family's are.
 - **A refusal that names a wait** (`retry_after_seconds`: a spent activation budget, or a busy operator) takes priority over the one-day hold, whether or not the family is private, because the operator probed nothing, so the refusal says nothing about whether a NAT forwards. The family waits out the named wait instead. The owner's rule still covers refusals where the operator did probe (G3, `TestExtenderActivatorWaitsTheRetryAfterOfAPrivateFamily`).
 - **A request that fails,** rather than a refusal, uses the backoff whether or not the family has activated.
-- **An interface table that can't be read** counts as public here (`ipVersionPublic` l.1079, `familyPublicReadable` `control_family.go` l.593), so it never lengthens a hold. `FamilyPublic` itself still fails closed.
+- **An interface table that can't be read** counts as public here (`ipVersionPublic`, `familyPublicReadable` `control_family.go`), so it never lengthens a hold. `FamilyPublic` itself still fails closed.
 - **Why not skip private families entirely:** that would cut off every host whose only v4 is private but does forward 443, such as home routers and docker-bridge providers with published ports. EXTENDER.md C2a and S plan for NAT hosts, including later UPnP/PCP mapping. Main has such candidates today: `orochimura`, whose v4 serves only tcp, and `ur712`, which is v4 only.
-- **The owner agreed to this on 2026-11-01.** Skipping instead is a one-line change in `activateFamily` (l.1002): return skipped when `!ipVersionPublic`.
+- **The owner agreed to this on 2026-11-01.** Skipping instead is a one-line change in `activateFamily`: return skipped when `!ipVersionPublic`.
 
 ### 4.3 Tests
 

@@ -1,10 +1,11 @@
-//go:build unix
+//go:build linux || darwin
 
-// A real EMFILE, from the kernel, rather than one a test's listener answers: the
-// one failure of 2026-11-01 that needs nothing from outside the host but connections
-// (EXTENDER.md G2). The extender runs in a child process with its file descriptors
-// limited, because the limit is the process's, and this test connects to it until
-// its accept fails.
+// A real EMFILE, from the kernel, rather than one a test's listener answers: the one
+// way to the state of 2026-11-01 that needs nothing from outside the host but
+// connections, though no host's log says it was this (EXTENDER.md G2). The extender
+// runs in a child process with its file descriptors limited, because the limit is the
+// process's, and this test connects to it until its accept fails. The build tag leaves
+// out the systems whose rlimit fields are another type.
 
 package extender
 

@@ -111,6 +111,9 @@ type extenderOptions struct {
 	// before it is built. The test installs an in-process resolver so the dns
 	// bootstrap never leaves the machine.
 	configureNetworkClient func(settings *connect.ExtenderNetworkClientSettings)
+	// configureActivator, when set, adjusts the activation loop's settings before
+	// it is built. A test pins when a post goes through it.
+	configureActivator func(settings *connect.ExtenderActivatorSettings)
 	// onStart, when set, receives the running extender once every part is up.
 	// The test reads the live objects through it.
 	onStart func(run *extenderRun)
@@ -772,6 +775,16 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	default:
 	}
 	Out.Printf("extender carriers: %s", strings.Join(run.server.Carriers(), ","))
+	// A carrier whose first bind failed stays down (G2), and the operator accepts no
+	// activation without tcp, so this run could never post and would never end. A
+	// role waits for the port and says so; this process exits for whatever runs it to
+	// see (G4).
+	if !slices.Contains(run.server.Carriers(), connect.ExtenderCarrierTcp) {
+		return nil, fmt.Errorf(
+			"the extender tcp carrier did not bind: %w",
+			run.server.ListenErrors()[connect.ExtenderCarrierTcp],
+		)
+	}
 
 	activatorSettings := connect.DefaultExtenderActivatorSettings()
 	if run.camouflage != nil {
@@ -804,6 +817,9 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	activatorSettings.Carriers = run.server.Carriers
 	activatorSettings.Directory = run.directory
 	activatorSettings.OnActivated = run.activated
+	if options.configureActivator != nil {
+		options.configureActivator(activatorSettings)
+	}
 	if run.measurementCert != nil {
 		// the activation carries the measurement certificate request, named by
 		// the id its answers report (lag.dev/PLAN.md C4, N4)
@@ -961,6 +977,7 @@ func (self *extenderRun) run(ctx context.Context) error {
 				self.activator.TcpCarrierReturned()
 			}
 			tcpServing = serving
+			self.activator.CarriersChanged()
 		case <-change:
 		case <-pingerChange:
 		case <-measurementChange:

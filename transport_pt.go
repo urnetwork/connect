@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	// "runtime/debug"
 
@@ -50,6 +51,12 @@ const (
 	packetTranslationReadRetryMinBackoff = 5 * time.Millisecond
 	packetTranslationReadRetryMaxBackoff = 1 * time.Second
 )
+
+// WSAEMSGSIZE: what windows answers a read of a datagram longer than the buffer with,
+// where other systems cut the datagram short. It says nothing of the socket and anyone
+// can send such a datagram, so it must not end a carrier. Nothing returns this number
+// elsewhere.
+const packetTranslationReadTooLong = syscall.Errno(10040)
 
 type PacketTranslationMode string
 
@@ -663,7 +670,15 @@ func packetTranslationSocketError(err error) error {
 // client's address the socket cannot send to, or a path that is down for a
 // moment, must not end the one socket every client of the carrier shares; nor
 // should it end the quic connection of a client a returned error would close.
+//
 // Only a closed socket ends the encoder, and that error comes back.
+//
+// That holds however long the writes go on failing. A sender can bring that about: a
+// source port of 0 fails every write to it, and on a quiet port nothing else succeeds
+// in between, so any bound here is one a sender can reach. On the server's alt listener
+// losing the socket ends the whole process with no drain, and a restart could not cure
+// egress that refuses every write anyway, so a socket stuck this way stays up, and says
+// so a line a minute.
 func (self *packetTranslation) dropServerWrite(err error) error {
 	if errors.Is(err, net.ErrClosed) {
 		return err
@@ -675,9 +690,11 @@ func (self *packetTranslation) dropServerWrite(err error) error {
 }
 
 // Whether a read error of a server mode's socket is one to wait out: what
-// net/http and quic-go read as temporary, which on windows includes the
-// connection reset an unreachable client's icmp leaves on a udp socket. Any
-// other error is the socket's end, which the owner of the carrier rebuilds.
+// net/http and quic-go read as temporary. Any other error is the socket's end, which
+// the owner of the carrier rebuilds. The net package turns off the resets an
+// unreachable client's icmp would leave on a windows udp socket, so that is not one a
+// client can provoke. The one that is, a datagram too long to read, is dealt with
+// apart (packetTranslationReadTooLong).
 func packetTranslationReadRetries(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return false
@@ -869,6 +886,13 @@ func (self *packetTranslation) decodeDns() {
 			if self.dnsClient {
 				self.log.Infof("[pt]read err = %s\n", err)
 				return
+			}
+			if errors.Is(err, packetTranslationReadTooLong) {
+				// a lost datagram, with nothing to wait out
+				if allowed, suppressed := self.readRetryLog.Allow(time.Now()); allowed {
+					self.log.Errorf("[pt]dropped a datagram too long to read, %d more since the last line\n", suppressed)
+				}
+				continue
 			}
 			if !retries {
 				self.log.Errorf("[pt]read err = %s\n", err)

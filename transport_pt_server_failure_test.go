@@ -10,13 +10,14 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 // What a decode53 socket does with a failure that is not its end (EXTENDER.md G2).
 // An extender's dns carrier serves every client on one socket, so a datagram it
-// cannot write, or a read that fails for a moment, costs that datagram. On
-// 2026-11-01 one such write would end the translation, and the extender's whole
+// cannot write, or a read that fails for a moment, costs that datagram. Before
+// 2026-11-02 one such write would end the translation, and the extender's whole
 // server with it.
 
 // A socket whose next writes and reads answer scripted errors.
@@ -317,6 +318,91 @@ func TestPacketTranslationClientEndsOnAReadFailure(t *testing.T) {
 		conn.failReads(temporaryErr)
 	})
 	fixture.waitEnded(t)
+}
+
+// A socket whose every write fails stays up, however long that goes on. A sender can
+// bring it about: a source port of 0 fails every write to it, and on a quiet port
+// nothing else succeeds in between, so anything here that ended the socket is something
+// a sender can reach. On the server's alt listener losing the socket ends the whole
+// process with no drain, and a review measured that on real sockets, with a bound of 5
+// minutes, at 160 datagrams. This is a week of such failures on the fake clock, so a
+// bound of any length fails it, and it is what must keep one from coming back.
+func TestPacketTranslationServerOutlivesWritesThatAllFail(t *testing.T) {
+	// the pools start a goroutine for good at their first use, which must be outside
+	// the bubble
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		log := &dnsCarrierLogLines{}
+		fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, nil, func(settings *PacketTranslationSettings) {
+			settings.Log = log
+		})
+		const failures = 7 * 24 * 60
+		for i := range failures {
+			fixture.conn.failWrites(syscall.EINVAL)
+			if n, err := fixture.translation.WriteTo([]byte("a datagram"), fixture.peer.addr); err != nil || n != 10 {
+				t.Fatalf("write %d = %d, %v, expected a lost datagram to answer as written", i, n, err)
+			}
+			time.Sleep(time.Minute)
+		}
+		if attempts := fixture.conn.writeAttempts.Load(); attempts != failures {
+			t.Fatalf("write attempts = %d, expected %d", attempts, failures)
+		}
+		fixture.expectAlive(t, "after a week of failed writes")
+		if err := fixture.translation.EndError(); err != nil {
+			t.Fatalf("end error = %v", err)
+		}
+		// each failure is on the record, at one line a minute
+		if count := strings.Count(log.all(), "dropped a datagram"); count < failures/2 {
+			t.Fatalf("%d lines of the failures, expected them on the record", count)
+		}
+
+		if _, err := fixture.translation.WriteTo([]byte("the next one"), fixture.peer.addr); err != nil {
+			t.Fatalf("next write = %v", err)
+		}
+		fixture.conn.nextWrite(t, "the next one")
+	})
+}
+
+// A datagram too long to read is what windows reports as a read error, and anyone can
+// send one. It costs that datagram and no wait, and a line a minute however many
+// arrive. These are winsock's number, as a real socket's error wraps it, on a socket
+// that is not windows': a windows socket has not been run here.
+func TestPacketTranslationServerDropsADatagramTooLongToRead(t *testing.T) {
+	const tooLongCount = 1000
+	log := &dnsCarrierLogLines{}
+	tooLong := &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("wsarecvfrom", syscall.Errno(10040))}
+	fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, func(conn *dnsCarrierFailingConn) {
+		for range tooLongCount {
+			conn.failReads(tooLong)
+		}
+	}, func(settings *PacketTranslationSettings) {
+		settings.Log = log
+	})
+
+	var buf [1024]byte
+	header := dnsCarrierTestHeader(0x12, 1, 0)
+	_, datagram, err := encodeDnsRequest(1, header, []byte("after the long ones"), buf, fixture.tld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.peer.WriteTo(datagram, fixture.conn.addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.translation.SetReadDeadline(time.Now().Add(dnsCarrierTestWait)); err != nil {
+		t.Fatal(err)
+	}
+	var packetData [2048]byte
+	n, _, err := fixture.translation.ReadFrom(packetData[:])
+	if err != nil {
+		t.Fatalf("read after the long ones: %v", err)
+	}
+	if string(packetData[:n]) != "after the long ones" {
+		t.Fatalf("read %q", packetData[:n])
+	}
+	fixture.expectAlive(t, "after the long ones")
+	if count := strings.Count(log.all(), "too long"); count != 1 {
+		t.Fatalf("%d lines of the long ones, expected one a minute", count)
+	}
 }
 
 // A logger that keeps every line, whatever its level.

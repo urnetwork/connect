@@ -96,6 +96,8 @@ type testActivateOperator struct {
 	postCounts   map[int]int
 	// how an activation that is not refused is answered
 	answer testActivateAnswer
+	// while set, an activation is answered only once this closes, or its caller goes
+	answerHold chan struct{}
 	// the addresses this extender has activated, by family. One record names
 	// every one of them, as the operator's does from its address rows (C1, C2).
 	activatedIps map[int]string
@@ -173,6 +175,16 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		select {
 		case self.posts <- &testActivatePost{ipVersion: ipVersion, args: args, postTime: now}:
 		default:
+		}
+		self.stateLock.Lock()
+		answerHold := self.answerHold
+		self.stateLock.Unlock()
+		if answerHold != nil {
+			select {
+			case <-answerHold:
+			case <-r.Context().Done():
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -333,6 +345,12 @@ func (self *testActivateOperator) setFamilyRefusal(ipVersion int, refusal string
 
 // The `retry_after_seconds` every refusal carries from now on, 0 for none
 // (connect#230).
+func (self *testActivateOperator) setAnswerHold(answerHold chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.answerHold = answerHold
+}
+
 func (self *testActivateOperator) setRetryAfterSeconds(retryAfterSeconds int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -364,6 +382,9 @@ type testActivatorFixture struct {
 	directory *ExtenderDirectory
 	operator  *testActivateOperator
 	activator *ExtenderActivator
+	// what it was built from, for one that replaces it
+	activatorSettings *ExtenderActivatorSettings
+	activatorCtx      context.Context
 
 	publicKey ed25519.PublicKey
 
@@ -479,6 +500,8 @@ func newTestActivatorFixtureWithPrepare(
 	if configure != nil {
 		configure(settings)
 	}
+	fixture.activatorSettings = settings
+	fixture.activatorCtx = ctx
 	fixture.activator = NewExtenderActivator(ctx, settings)
 	t.Cleanup(func() {
 		fixture.activator.Close()

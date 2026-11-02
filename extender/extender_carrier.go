@@ -18,7 +18,9 @@ import (
 // A carrier that fails must not take the server down with it. One accept error
 // or one udp carrier's exit used to close every carrier for the life of the
 // process, while the provider stayed connected and the activation loop kept
-// posting for a listener that was gone (2026-11-01, network 01979e1c).
+// posting for a listener that was gone. That is probably what network 01979e1c
+// showed on 2026-11-01, tcp 443 and udp 53 refused with the process up, though no
+// host's log confirms it and which failure it was is not known.
 //
 // So each bound port is supervised on its own. An accept error that is a passing
 // condition of the host is waited out on the same listener, as net/http does.
@@ -375,6 +377,20 @@ var extenderAcceptTransientErrors = []error{
 	syscall.EHOSTUNREACH,
 	syscall.ENOPROTOOPT,
 	syscall.EOPNOTSUPP,
+	// the same conditions as winsock numbers them. On windows the names above are
+	// values of syscall's own that no socket returns, and on any other system
+	// nothing returns these
+	syscall.Errno(10004), // WSAEINTR
+	syscall.Errno(10024), // WSAEMFILE
+	syscall.Errno(10050), // WSAENETDOWN
+	syscall.Errno(10051), // WSAENETUNREACH
+	syscall.Errno(10052), // WSAENETRESET
+	syscall.Errno(10053), // WSAECONNABORTED
+	syscall.Errno(10054), // WSAECONNRESET
+	syscall.Errno(10055), // WSAENOBUFS
+	syscall.Errno(10060), // WSAETIMEDOUT
+	syscall.Errno(10064), // WSAEHOSTDOWN
+	syscall.Errno(10065), // WSAEHOSTUNREACH
 }
 
 // Whether an accept error is a passing condition of the host rather than the end
@@ -423,12 +439,8 @@ func (self *ExtenderServer) carrierPortLost(carrierPort *extenderCarrierPort, er
 	if !changed {
 		return
 	}
-	if self.settings.ListenErrorHandler != nil {
-		self.settings.ListenErrorHandler(carrierPort.carrier, err)
-	}
-	if self.settings.CarriersChangeHandler != nil {
-		self.settings.CarriersChangeHandler()
-	}
+	self.notifyListenError(carrierPort, err)
+	self.notifyCarriersChange()
 }
 
 // Records why a lost port could not be bound again, which replaces what ended it
@@ -441,9 +453,7 @@ func (self *ExtenderServer) carrierPortBindFailed(carrierPort *extenderCarrierPo
 			self.carrierListenErrs[carrierPort.carrier] = err
 		}
 	}()
-	if self.settings.ListenErrorHandler != nil {
-		self.settings.ListenErrorHandler(carrierPort.carrier, err)
-	}
+	self.notifyListenError(carrierPort, err)
 }
 
 // Puts a lost port back in what the server serves, and tells the owner.
@@ -461,7 +471,25 @@ func (self *ExtenderServer) carrierPortServing(carrierPort *extenderCarrierPort)
 		}
 		return true
 	}()
-	if changed && self.settings.CarriersChangeHandler != nil {
-		self.settings.CarriersChangeHandler()
+	if changed {
+		self.notifyCarriersChange()
+	}
+}
+
+// Tells the owner why a carrier is down. Whatever its handler does ends here: a
+// panic in it is logged by HandleError and costs the owner the news, not this port
+// its supervision, which is on this goroutine.
+func (self *ExtenderServer) notifyListenError(carrierPort *extenderCarrierPort, err error) {
+	if self.settings.ListenErrorHandler != nil {
+		connect.HandleError(func() {
+			self.settings.ListenErrorHandler(carrierPort.carrier, err)
+		})
+	}
+}
+
+// Tells the owner the carriers changed, as notifyListenError does.
+func (self *ExtenderServer) notifyCarriersChange() {
+	if self.settings.CarriersChangeHandler != nil {
+		connect.HandleError(self.settings.CarriersChangeHandler)
 	}
 }

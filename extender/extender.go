@@ -1108,10 +1108,13 @@ func (self *ExtenderServer) ListenAndServe() error {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
-		go func() {
+		// a panic in a carrier or its owner's handler ends there (extender_carrier.go),
+		// so one that gets this far is the supervision's own, which leaves that port
+		// with nothing looking after it, and is for the owner to replace
+		go connect.HandleError(func() {
 			defer self.endWorker()
 			self.superviseTcpCarrier(bound.port, bound.listener, bound.ownedListener)
-		}()
+		}, self.cancel)
 	}
 
 	for _, bound := range boundPacketConns {
@@ -1119,10 +1122,10 @@ func (self *ExtenderServer) ListenAndServe() error {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
-		go func() {
+		go connect.HandleError(func() {
 			defer self.endWorker()
 			self.superviseUdpCarrier(bound.port, bound.connectMode, bound.packetConn, bound.ownedCloser)
-		}()
+		}, self.cancel)
 	}
 
 	select {

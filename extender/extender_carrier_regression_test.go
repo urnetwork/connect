@@ -3,8 +3,9 @@
 // tcp 443 and udp 53 while their processes stayed connected and kept posting
 // activations. One accept error, one udp carrier's exit or one failed write on
 // the dns carrier closed every carrier for the life of the process, and nothing
-// restarted the server. Each test here injects one of those failures and fails on
-// the code before the fix, through the seams that code already had.
+// restarted the server, which is probably how, though no host's log confirms it.
+// Each test here injects one of those failures and fails on the code before the
+// fix, through the seams that code already had.
 
 package extender
 
