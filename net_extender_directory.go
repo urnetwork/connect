@@ -63,6 +63,13 @@ const (
 	// A record the operator released to this client's authenticated identity
 	// (Q3): the gated tier. Not a network event (K4), like a bootstrap.
 	ExtenderSourceRelease = "release"
+	// A record from an authenticated seed bundle (EXTENDER-UPDATE2.md §2,
+	// net_extender_seed.go): an open-tier record verified under the root keys
+	// like any other, applied only through ApplyRecord, never as a bare
+	// address. Not a network event (K4). An expired seed record is never one
+	// of the retained expired identities, so a stale seed cannot become a
+	// last resort of a new cold start (MaxExpiredRecordCount).
+	ExtenderSourceSeed = "seed"
 )
 
 // The address states reported by the status (F2), in precedence order: trust
