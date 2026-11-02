@@ -24,7 +24,8 @@ package fingerprint
 // grease (rfc 8701) is normalized, never matched literally: a client sends a
 // fresh grease value per connection, so a changed grease value must not fail,
 // while a grease codepoint that moved out of its slot must. for the lists
-// Chrome sends in a fixed order (ciphers, groups, key shares, versions) the
+// Chrome sends in a fixed order (ciphers, groups, key shares, signature
+// algorithms, versions) the
 // grease value is replaced by a sentinel in place, so a moved slot changes the
 // normalized sequence. for the extension list, whose order Chrome shuffles per
 // connection, the grease slots are checked structurally (grease opens the
@@ -114,8 +115,10 @@ func Diff(golden *ClientHelloFingerprint, got *ClientHelloFingerprint, opts Diff
 	if !sliceContains(got.KeyShareGroups, groupX25519Mlkem768) {
 		add("key_share_groups.X25519MLKEM768", "present", "absent")
 	}
-	if !slices.Equal(golden.SignatureAlgorithms, got.SignatureAlgorithms) {
-		add("signature_algorithms", formatUint16s(golden.SignatureAlgorithms), formatUint16s(got.SignatureAlgorithms))
+	// real Chrome opens this list with a grease value too (the Chrome 156
+	// golden), so it is normalized in place like the others
+	if want, gotValue := normalizeGrease(golden.SignatureAlgorithms), normalizeGrease(got.SignatureAlgorithms); !slices.Equal(want, gotValue) {
+		add("signature_algorithms", formatUint16s(want), formatUint16s(gotValue))
 	}
 	if want, gotValue := normalizeGrease(golden.SupportedVersions), normalizeGrease(got.SupportedVersions); !slices.Equal(want, gotValue) {
 		add("supported_versions", formatUint16s(want), formatUint16s(gotValue))

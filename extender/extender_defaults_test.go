@@ -58,6 +58,13 @@ func TestDefaultExtenderSettingsValues(t *testing.T) {
 		{name: "AdmissionRefusalsPerSubnetPerMinute", value: settings.AdmissionRefusalsPerSubnetPerMinute, expected: 8},
 		{name: "AdmissionRetryAfterMin", value: settings.AdmissionRetryAfterMin, expected: 15 * time.Second},
 		{name: "AdmissionRetryAfterMax", value: settings.AdmissionRetryAfterMax, expected: 60 * time.Second},
+
+		{name: "AcceptRetryMinBackoff", value: settings.AcceptRetryMinBackoff, expected: 5 * time.Millisecond},
+		{name: "AcceptRetryMaxBackoff", value: settings.AcceptRetryMaxBackoff, expected: 1 * time.Second},
+		{name: "AcceptDownTimeout", value: settings.AcceptDownTimeout, expected: 30 * time.Second},
+		{name: "CarrierRebuildMinBackoff", value: settings.CarrierRebuildMinBackoff, expected: 1 * time.Second},
+		{name: "CarrierRebuildMaxBackoff", value: settings.CarrierRebuildMaxBackoff, expected: 5 * time.Minute},
+		{name: "CarrierRebuildStableTimeout", value: settings.CarrierRebuildStableTimeout, expected: 5 * time.Minute},
 		{name: "AdmissionIpv4PrefixBitCount", value: settings.AdmissionIpv4PrefixBitCount, expected: 29},
 		{name: "AdmissionIpv6PrefixBitCount", value: settings.AdmissionIpv6PrefixBitCount, expected: 56},
 		{name: "AdmissionMinSubnetCount", value: settings.AdmissionMinSubnetCount, expected: 4096},

@@ -56,17 +56,26 @@ type extenderCamouflage struct {
 	// the 8-byte short id of the identity key both ends compute (P1)
 	shortId []byte
 
-	// the verified borrowed names this extender splices to (P5), lowercased
-	borrowNames []string
-
 	replay *extenderCamouflageReplaySet
 
-	// retirement and the live splice slots of the total and per-target caps
-	// (P3); resolver construction and shutdown never hold this lock
-	stateLock          sync.Mutex
-	closed             bool
+	// retirement, the verified names and the live splice slots of the total and
+	// per-target caps (P3); resolver construction and shutdown never hold this
+	// lock
+	stateLock sync.Mutex
+	closed    bool
+	// the verified borrowed names this extender splices to (P5), lowercased:
+	// those of the settings until a role replaces them (setBorrowNames)
+	borrowNames []string
+	// a role found that this extender does not cover every name its supported
+	// clients select (ExtenderCamouflageRole), which the status must not report
+	// as coverage whatever the splice can reach
+	coverageIncomplete bool
 	spliceCount        int
 	spliceTargetCounts map[string]int
+	// the cumulative per-borrowed-name splice load (EXTENDER-UPDATE2 §3.3):
+	// begins and relayed bytes, so a fleet telemetry can sum one target's load
+	// across extenders. Keyed on the lower-cased borrowed name.
+	targetLoadCounts map[string]*extenderCamouflageTargetLoad
 
 	// the lazily built DoH cache the default splice dial resolves over; every
 	// access follows dohOnce.Do, including retirement joining its constructor
@@ -83,16 +92,11 @@ func newExtenderCamouflage(server *ExtenderServer, settings *ExtenderSettings) (
 	camouflage := &extenderCamouflage{
 		server:             server,
 		settings:           settings,
+		borrowNames:        normalizedBorrowNames(settings.CamouflageBorrowNames),
 		spliceTargetCounts: map[string]int{},
+		targetLoadCounts:   map[string]*extenderCamouflageTargetLoad{},
 		replay:             newExtenderCamouflageReplaySet(settings),
 	}
-	borrowNames := []string{}
-	for _, borrowName := range settings.CamouflageBorrowNames {
-		if borrowName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(borrowName), ".")); borrowName != "" {
-			borrowNames = append(borrowNames, borrowName)
-		}
-	}
-	camouflage.borrowNames = borrowNames
 	if 0 < len(settings.IdentityKeySeed) {
 		staticPrivateKey, err := connect.ExtenderRealityStaticPrivateKey(settings.IdentityKeySeed)
 		if err != nil {
@@ -107,6 +111,47 @@ func newExtenderCamouflage(server *ExtenderServer, settings *ExtenderSettings) (
 		camouflage.shortId = connect.ExtenderKeyId(publicKey)
 	}
 	return camouflage, nil
+}
+
+// The lowercased, dot-trimmed form of the borrowed names, dropping the empty.
+func normalizedBorrowNames(names []string) []string {
+	borrowNames := []string{}
+	for _, borrowName := range names {
+		if borrowName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(borrowName), ".")); borrowName != "" {
+			borrowNames = append(borrowNames, borrowName)
+		}
+	}
+	return borrowNames
+}
+
+// Replaces the names the splice dials, for hellos classified after this
+// returns; a splice already relaying keeps its target (ExtenderCamouflageRole).
+func (self *extenderCamouflage) setBorrowNames(names []string) {
+	borrowNames := normalizedBorrowNames(names)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.borrowNames = borrowNames
+}
+
+// Records whether a role found this extender's coverage incomplete.
+func (self *extenderCamouflage) setCoverageIncomplete(coverageIncomplete bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.coverageIncomplete = coverageIncomplete
+}
+
+// Whether a role found this extender's coverage incomplete.
+func (self *extenderCamouflage) isCoverageIncomplete() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.coverageIncomplete
+}
+
+// The names the splice dials now.
+func (self *extenderCamouflage) currentBorrowNames() []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.borrowNames
 }
 
 // The published X25519 static public key, or nil without an identity key.
@@ -204,13 +249,31 @@ func (self *ExtenderServer) camouflageDemultiplex(ctx context.Context, conn net.
 		return newConnWithInitialBytes(conn, readBytes, ""), true, false
 	}
 
-	// unauthenticated: splice to the real borrowed site when splice mode is on
-	// and a target is reachable (P3), else terminate as today. splice counts the
-	// connection when it begins, since the relay then blocks until it ends
-	if self.settings.ExtenderCamouflageSplice {
-		if camouflage.splice(ctx, conn, readBytes, parsed.ServerName) {
+	// unauthenticated: splice to the real borrowed site when the runtime splice
+	// posture and the record gate allow it and a target is reachable (P3,
+	// EXTENDER-UPDATE2 §3.2, §3.3), else terminate as today. splice counts the
+	// connection when it begins, since the relay then blocks until it ends.
+	if self.camouflageSpliceEnabled() {
+		switch camouflage.splice(ctx, conn, readBytes, parsed.ServerName) {
+		case extenderCamouflageSpliced:
 			camouflage.reportOutcome(parsed, ExtenderCamouflageOutcomeSpliced)
 			return nil, false, true
+		case extenderCamouflageSpliceNoTarget:
+			// splice on but no borrowed target was reachable (none configured,
+			// or every candidate dial failed): the hello is terminated and
+			// shown the old self-signed probe response. This is the degraded
+			// fallback of §3.3, counted apart from the Phase-A terminate so a
+			// deployment in it is visible and not reported as coverage.
+			self.camouflageSpliceFallbackTerminatedCount.Add(1)
+			camouflage.reportOutcome(parsed, ExtenderCamouflageOutcomeSpliceFallbackTerminated)
+			return newConnWithInitialBytes(conn, readBytes, ""), false, false
+		default:
+			// a per-target or total cap refused this hello while other
+			// connections are being spliced (P3): a working bound, not a
+			// coverage failure, so it is the ordinary terminate.
+			self.camouflageTerminatedCount.Add(1)
+			camouflage.reportOutcome(parsed, ExtenderCamouflageOutcomeTerminated)
+			return newConnWithInitialBytes(conn, readBytes, ""), false, false
 		}
 	}
 	self.camouflageTerminatedCount.Add(1)
@@ -308,12 +371,14 @@ func (self *extenderCamouflage) preferredEphemeral(parsed *utls.PubClientHelloMs
 // candidate borrowed sites was reachable or a cap refused the splice, in which
 // case the caller terminates the connection instead. A spliced byte is never
 // added to the O1 relay counters (P10).
-func (self *extenderCamouflage) splice(ctx context.Context, clientConn net.Conn, initialBytes []byte, serverName string) bool {
+func (self *extenderCamouflage) splice(ctx context.Context, clientConn net.Conn, initialBytes []byte, serverName string) extenderCamouflageSpliceResult {
 	targets := self.spliceTargets(serverName)
 	if len(targets) == 0 {
-		return false
+		// nothing verified to splice to: the degraded no-coverage state (§3.3)
+		return extenderCamouflageSpliceNoTarget
 	}
 	network := forwardNetwork(clientConn.RemoteAddr().String())
+	dialAttempted := false
 	for _, target := range targets {
 		// the per-target and total caps are reserved before the dial, so a
 		// refusal never opens a connection to the site (P3)
@@ -327,6 +392,7 @@ func (self *extenderCamouflage) splice(ctx context.Context, clientConn net.Conn,
 			}
 			self.endSplice(target)
 			self.server.camouflageSpliceDialFailedCount.Add(1)
+			dialAttempted = true
 			// a borrowed site the extender cannot reach falls to another
 			// reachable borrowed target of the same family (P3)
 			continue
@@ -334,12 +400,31 @@ func (self *extenderCamouflage) splice(ctx context.Context, clientConn net.Conn,
 		// counted when the splice begins, since relaySplice then blocks until the
 		// connection ends; a spliced byte is never added to the O1 relay counts
 		self.server.camouflageSplicedCount.Add(1)
-		self.relaySplice(ctx, clientConn, siteConn, initialBytes)
+		self.recordTargetSpliceBegin(target)
+		relayedByteCount := self.relaySplice(ctx, clientConn, siteConn, initialBytes)
+		self.recordTargetSpliceBytes(target, relayedByteCount)
 		self.endSplice(target)
-		return true
+		return extenderCamouflageSpliced
 	}
-	return false
+	if dialAttempted {
+		// a reachable target was tried and failed: no splice target succeeded,
+		// the degraded fallback of §3.3
+		return extenderCamouflageSpliceNoTarget
+	}
+	// every candidate was refused by a cap before any dial: a working bound,
+	// since other connections hold those slots and are being spliced
+	return extenderCamouflageSpliceCapRefused
 }
+
+// What a splice attempt came to (§3.3): spliced, refused by a bound (other
+// connections are being spliced), or no reachable target (the degraded state).
+type extenderCamouflageSpliceResult int
+
+const (
+	extenderCamouflageSpliced extenderCamouflageSpliceResult = iota
+	extenderCamouflageSpliceCapRefused
+	extenderCamouflageSpliceNoTarget
+)
 
 // The borrowed sites to try, in order (P3): the sni first when it is a verified
 // borrowed name, then the other verified names, so a reachable real site is
@@ -349,11 +434,14 @@ func (self *extenderCamouflage) splice(ctx context.Context, clientConn net.Conn,
 // tell.
 func (self *extenderCamouflage) spliceTargets(serverName string) []string {
 	serverName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(serverName), "."))
-	targets := make([]string, 0, len(self.borrowNames))
-	if serverName != "" && slices.Contains(self.borrowNames, serverName) {
+	// replaced whole (setBorrowNames) and never written through, so the slice
+	// stays as it was read here
+	borrowNames := self.currentBorrowNames()
+	targets := make([]string, 0, len(borrowNames))
+	if serverName != "" && slices.Contains(borrowNames, serverName) {
 		targets = append(targets, serverName)
 	}
-	for _, borrowName := range self.borrowNames {
+	for _, borrowName := range borrowNames {
 		if borrowName != serverName {
 			targets = append(targets, borrowName)
 		}
@@ -391,6 +479,56 @@ func (self *extenderCamouflage) endSplice(target string) {
 	} else {
 		delete(self.spliceTargetCounts, target)
 	}
+}
+
+// The cumulative splice load of one borrowed name (EXTENDER-UPDATE2 §3.3).
+type extenderCamouflageTargetLoad struct {
+	spliceCount      int64
+	relayedByteCount int64
+}
+
+// Counts one splice begun to a target.
+func (self *extenderCamouflage) recordTargetSpliceBegin(target string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	load := self.targetLoadCounts[target]
+	if load == nil {
+		load = &extenderCamouflageTargetLoad{}
+		self.targetLoadCounts[target] = load
+	}
+	load.spliceCount += 1
+}
+
+// Adds the bytes a splice to a target relayed.
+func (self *extenderCamouflage) recordTargetSpliceBytes(target string, relayedByteCount int64) {
+	if relayedByteCount <= 0 {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if load := self.targetLoadCounts[target]; load != nil {
+		load.relayedByteCount += relayedByteCount
+	}
+}
+
+// A snapshot of the per-target splice load.
+func (self *extenderCamouflage) targetLoads() map[string]ExtenderCamouflageTargetLoad {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	targetLoads := make(map[string]ExtenderCamouflageTargetLoad, len(self.targetLoadCounts))
+	for target, load := range self.targetLoadCounts {
+		targetLoads[target] = ExtenderCamouflageTargetLoad{
+			SpliceCount:      load.spliceCount,
+			RelayedByteCount: load.relayedByteCount,
+		}
+	}
+	return targetLoads
+}
+
+// The number of verified borrowed names this extender can splice to (§3.3): a
+// splice pilot with none is degraded, never coverage.
+func (self *extenderCamouflage) verifiedTargetCount() int {
+	return len(self.currentBorrowNames())
 }
 
 // Opens the tcp connection to a borrowed site for the splice (P3). The injected
@@ -462,15 +600,18 @@ func (self *extenderCamouflage) spliceDohCache() *connect.DohCache {
 // bound is hit (P3): the peeked ClientHello is written to the site first, then
 // each direction is copied with the A5 per-connection byte bound and idle
 // timeout. Owns and joins cancellation from before the first write, including
-// failed and partial hello writes. None of it touches the O1 relay counters (P10).
+// failed and partial hello writes. None of it touches the O1 relay counters
+// (P10). It returns the bytes relayed each way, summed, for the per-target load
+// (§3.3); the initial hello is not counted, as it is not relay traffic.
 //
 // Native deadlines bound each socket read or write, including the hello,
 // without canceling an operation that already completed while its caller was
 // descheduled. A non-positive idle timeout leaves both directions unbounded.
-func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.Conn, siteConn net.Conn, initialBytes []byte) {
+func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.Conn, siteConn net.Conn, initialBytes []byte) int64 {
 	idle := self.settings.ProxyIdleTimeout
 	maxByteCount := self.settings.ProxyMaxResponseByteCount
 
+	var relayedByteCount atomicInt64
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	var relayWorkers sync.WaitGroup
 	connectionsClosed := make(chan struct{})
@@ -487,10 +628,10 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 	// The peek's header budget ends at this handoff, including when the
 	// splice's own idle budget is disabled.
 	if err := clientConn.SetDeadline(time.Time{}); err != nil {
-		return
+		return relayedByteCount.get()
 	}
 	if err := siteConn.SetDeadline(time.Time{}); err != nil {
-		return
+		return relayedByteCount.get()
 	}
 	writeAll := func(dst net.Conn, writeBytes []byte) bool {
 		for 0 < len(writeBytes) {
@@ -511,10 +652,9 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		return true
 	}
 	if !writeAll(siteConn, initialBytes) {
-		return
+		return relayedByteCount.get()
 	}
 
-	var relayedByteCount atomicInt64
 	copyDirection := func(dst net.Conn, src net.Conn) {
 		defer relayWorkers.Done()
 		defer relayCancel()
@@ -550,6 +690,7 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 	go connect.HandleError(func() { copyDirection(siteConn, clientConn) }, relayCancel)
 	go connect.HandleError(func() { copyDirection(clientConn, siteConn) }, relayCancel)
 	<-relayCtx.Done()
+	return relayedByteCount.get()
 }
 
 // A small atomic int64 so the splice relay sums its two directions without a
@@ -563,6 +704,12 @@ func (self *atomicInt64) add(delta int64) int64 {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.value += delta
+	return self.value
+}
+
+func (self *atomicInt64) get() int64 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	return self.value
 }
 

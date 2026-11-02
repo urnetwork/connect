@@ -122,6 +122,13 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		AdmissionIpv6PrefixBitCount:         56,
 		AdmissionMinSubnetCount:             4096,
 
+		AcceptRetryMinBackoff:       5 * time.Millisecond,
+		AcceptRetryMaxBackoff:       1 * time.Second,
+		AcceptDownTimeout:           30 * time.Second,
+		CarrierRebuildMinBackoff:    1 * time.Second,
+		CarrierRebuildMaxBackoff:    5 * time.Minute,
+		CarrierRebuildStableTimeout: 5 * time.Minute,
+
 		ExtenderCamouflageTimeWindow:         2 * time.Minute,
 		ExtenderCamouflageReplayTagCount:     65536,
 		ExtenderCamouflageHelloMaxByteCount:  16 * 1024,
@@ -362,9 +369,22 @@ type ExtenderSettings struct {
 	// one it does nothing. ExtenderCamouflageSplice is the Phase-A -> B flip
 	// (P3): off, an unauthenticated hello is terminated as today; on, it is
 	// spliced to the real borrowed site. Meaningful only while
-	// CamouflageEnabled, off by default and the legacy-safe posture.
+	// CamouflageEnabled, off by default and the legacy-safe posture. It is the
+	// posture until SetCamouflageSplice sets one at run time, which then wins
+	// over it, so a Phase B cohort rolls back to Phase A for new connections
+	// without a restart (EXTENDER-UPDATE2 §3.3).
 	CamouflageEnabled        bool
 	ExtenderCamouflageSplice bool
+	// CamouflageSpliceGate, when set, is an extra admission gate on the splice
+	// (EXTENDER-UPDATE2 §3.2): splicing runs only while it returns true, even
+	// when the posture is on. A role that splices sets this to the Open of an
+	// ExtenderCamouflageSpliceSettle fed from its activations, the safe-flip
+	// rule: its own record carries the camouflage key and requires
+	// tcp-camouflage-v1, and has for at least one record lifetime, so legacy
+	// clients' records issued without the requirement have expired. Nil applies
+	// no extra gate, which is the posture flag alone. It runs on the accept
+	// path, must not block, and is read once per unauthenticated hello.
+	CamouflageSpliceGate func() bool
 	// The tolerated clock skew each way of a sealed hello time (P1); a client
 	// outside it is not authenticated. <= 0 takes the default.
 	ExtenderCamouflageTimeWindow time.Duration
@@ -382,9 +402,11 @@ type ExtenderSettings struct {
 	ExtenderCamouflageSpliceMaxCount     int
 	ExtenderCamouflageSpliceMaxPerTarget int
 	// The borrowed names this extender has verified and will splice to (P5),
-	// the role-start-verified subset of the bundled borrow list. Empty leaves
-	// the splice with no target, so an unauthenticated hello in splice mode
-	// degrades to the A5 reverse proxy. Copied at construction.
+	// the verified subset of the bundled borrow list. Empty leaves the splice
+	// with no target, so an unauthenticated hello in splice mode degrades to
+	// the A5 reverse proxy. Copied at construction. A role leaves this empty
+	// and its ExtenderCamouflageRole feeds the running server instead, at start
+	// and every revalidation interval.
 	CamouflageBorrowNames []string
 	// CamouflageSpliceDialContext, when set, opens the tcp connection to a
 	// borrowed site for the splice (P3), its address the borrowed name and port
@@ -433,8 +455,29 @@ type ExtenderSettings struct {
 	// carrier and is reported here once, and only a failure of every carrier
 	// ends ListenAndServe with an error. The provider role logs it once and
 	// retries on the activation cadence, never as a user-visible error. It
-	// runs synchronously and must not block.
+	// also receives the failure of a carrier that was serving, and each new
+	// reason its rebuild fails for (extender_carrier.go). It runs synchronously
+	// and must not block.
 	ListenErrorHandler func(carrier string, err error)
+	// CarriersChangeHandler, when set, is called after Carriers changed once
+	// serving has started: a carrier was lost or came back (G2). It runs
+	// synchronously and must not block.
+	CarriersChangeHandler func()
+	// The wait after an accept error that is worth retrying, doubling from the
+	// min to the max, as net/http waits (extender_carrier.go). A listener that
+	// keeps failing this way for AcceptDownTimeout is reported lost until its
+	// accepts stop failing.
+	AcceptRetryMinBackoff time.Duration
+	AcceptRetryMaxBackoff time.Duration
+	AcceptDownTimeout     time.Duration
+	// The wait before rebuilding a carrier that ended under a live server,
+	// doubling from the min to the max, with jitter so a fleet that lost its
+	// carriers together does not rebuild together. It starts over once a
+	// carrier has served for CarrierRebuildStableTimeout, so one that binds and
+	// dies at once is not rebuilt in a loop (extender_carrier.go).
+	CarrierRebuildMinBackoff    time.Duration
+	CarrierRebuildMaxBackoff    time.Duration
+	CarrierRebuildStableTimeout time.Duration
 	// CertificateHandler, when set, receives the outer sni of every handshake
 	// as its certificate is selected, on every carrier. Tests use it to observe
 	// what a dial presented; an empty name is a ClientHello that carried no sni
@@ -490,23 +533,43 @@ type ExtenderServer struct {
 	camouflageTimeWindowFailedCount atomic.Int64
 	camouflageSpliceDialFailedCount atomic.Int64
 	camouflageBorrowVerifyFailCount atomic.Int64
+	// the degraded-state tell of §3.3: splice is on but no borrowed target was
+	// reachable, so the hello was terminated and shown the old self-signed
+	// probe response. Counted apart from the Phase-A terminate above, since
+	// that one is the intended posture and this one is exposure.
+	camouflageSpliceFallbackTerminatedCount atomic.Int64
+	// how much of those counts the camouflage report has taken
+	// (extender_camouflage_report.go)
+	camouflageReportLedger extenderCamouflageReportLedger
+
+	// the runtime splice posture (EXTENDER-UPDATE2 §3.3): until
+	// SetCamouflageSplice sets one, the posture is the ExtenderCamouflageSplice
+	// setting, read on each accept as it was before the runtime flip existed,
+	// so a setting made before the server serves still applies. Once set, it
+	// wins over the setting. Read on each accept so a rollback changes only
+	// new connections. The gate is the extra admission condition
+	// CamouflageSpliceGate, read beside it.
+	camouflageSpliceOverride atomic.Int32
 
 	allowedSecrets []string
 	// exact (x) or wildcard (*.x)
 	// wildcard *.x does not match exact x
 	allowedHosts []string
 	ports        map[int][]connect.ExtenderConnectMode
-	// the carriers whose bind succeeded, in wire order. Empty until
-	// ListenAndServe has bound them, because a carrier that did not bind must
-	// not be offered to a client or to an activation (G2).
+	// the carriers that are serving, in wire order. Empty until ListenAndServe
+	// has bound them and again once the server has ended, because a carrier that
+	// is not serving must not be offered to a client or to an activation (G2).
 	carriers []string
-	// the dns ports whose bind succeeded, ascending, which is the order a
-	// client dials the ports a record lists in (L2). What the activation
-	// advertises, so a port that did not bind is never probed.
+	// how many ports each carrier in carriers is serving on: it stays listed
+	// until its last one is lost (extender_carrier.go)
+	carrierPortCounts map[string]int
+	// the dns ports that are serving, ascending, which is the order a client
+	// dials the ports a record lists in (L2). What the activation advertises,
+	// so a port that is not serving is never probed.
 	dnsPorts []int
-	// the last bind failure of each carrier that has one, which is what a
-	// provider role renders beside the carrier list (G2, F3). A carrier that
-	// binds clears its entry.
+	// the last failure of each carrier that has one and is not serving, which
+	// is what a provider role renders beside the carrier list (G2, F3). A
+	// carrier that serves clears its entry.
 	carrierListenErrs map[string]error
 	forwardDialer     *net.Dialer
 
@@ -613,6 +676,7 @@ func NewExtenderServer(
 		allowedHosts:             allowedHosts,
 		ports:                    ports,
 		carriers:                 []string{},
+		carrierPortCounts:        map[string]int{},
 		dnsPorts:                 []int{},
 		carrierListenErrs:        map[string]error{},
 		forwardDialer:            forwardDialer,
@@ -891,6 +955,10 @@ func (self *ExtenderServer) startConnection(connection net.Conn) {
 // reaches the first carrier up can never be told a carrier list that is still
 // being assembled. A Close that lands while a carrier is binding ends the call
 // with no error, as a Close after the carriers are up does.
+//
+// Once serving, the call ends only with Close or the context: each carrier that
+// bound is supervised on its own, so a failure of one is logged and retried and
+// never touches the others (extender_carrier.go).
 func (self *ExtenderServer) ListenAndServe() error {
 	if !self.beginWorker() {
 		// shutdown started before serving, which is not a bind failure
@@ -926,11 +994,13 @@ func (self *ExtenderServer) ListenAndServe() error {
 
 	// one bound tcp listener, accepted only after every carrier has bound
 	type boundListener struct {
+		port          int
 		listener      net.Listener
 		ownedListener *extenderOwnedListener
 	}
 	// one bound udp endpoint and the carrier it serves
 	type boundPacketConn struct {
+		port        int
 		connectMode connect.ExtenderConnectMode
 		packetConn  net.PacketConn
 		ownedCloser *extenderOwnedCloser
@@ -955,30 +1025,18 @@ func (self *ExtenderServer) ListenAndServe() error {
 			continue
 		}
 
-		log.Printf("[extender] listen tcp %d", port)
-		listener, err := self.listenTcp(fmt.Sprintf(":%d", port))
-		if err != nil {
-			// Ownership transfers for every non-nil callback result, even when
-			// the callback rejects that result with an error.
-			if listener != nil {
-				listener.Close()
-			}
-			self.reportListenError(connect.ExtenderCarrierTcp, err)
-			bindErrs = append(bindErrs, err)
-			continue
-		}
-		if listener == nil {
-			err := fmt.Errorf("extender listener factory returned nil")
-			self.reportListenError(connect.ExtenderCarrierTcp, err)
-			bindErrs = append(bindErrs, err)
-			continue
-		}
-		ownedListener, ok := self.addListener(listener)
-		if !ok {
+		listener, ownedListener, err := self.bindTcpCarrier(port)
+		if errors.Is(err, errExtenderServerClosing) {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
+		if err != nil {
+			self.reportListenError(connect.ExtenderCarrierTcp, err)
+			bindErrs = append(bindErrs, err)
+			continue
+		}
 		boundListeners = append(boundListeners, &boundListener{
+			port:          port,
 			listener:      listener,
 			ownedListener: ownedListener,
 		})
@@ -998,32 +1056,18 @@ func (self *ExtenderServer) ListenAndServe() error {
 		}
 		carrier := connect.ExtenderCarrierForConnectMode(connectMode)
 
-		log.Printf("[extender] listen udp %d (%s)", port, connectMode)
-		listenPacket := net.ListenPacket
-		if self.settings.ListenPacket != nil {
-			listenPacket = self.settings.ListenPacket
-		}
-		packetConn, err := listenPacket("udp", fmt.Sprintf(":%d", port))
-		if err != nil {
-			if packetConn != nil {
-				packetConn.Close()
-			}
-			self.reportListenError(carrier, err)
-			bindErrs = append(bindErrs, err)
-			continue
-		}
-		if packetConn == nil {
-			err := fmt.Errorf("extender packet listener factory returned nil")
-			self.reportListenError(carrier, err)
-			bindErrs = append(bindErrs, err)
-			continue
-		}
-		ownedCloser, ok := self.addCloser(func() { packetConn.Close() })
-		if !ok {
+		packetConn, ownedCloser, err := self.bindUdpCarrier(port, connectMode)
+		if errors.Is(err, errExtenderServerClosing) {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
+		if err != nil {
+			self.reportListenError(carrier, err)
+			bindErrs = append(bindErrs, err)
+			continue
+		}
 		boundPacketConns = append(boundPacketConns, &boundPacketConn{
+			port:        port,
 			connectMode: connectMode,
 			packetConn:  packetConn,
 			ownedCloser: ownedCloser,
@@ -1060,49 +1104,24 @@ func (self *ExtenderServer) ListenAndServe() error {
 	self.markListening()
 
 	for _, bound := range boundListeners {
-		listener := bound.listener
 		if !self.beginWorker() {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
 		go func() {
 			defer self.endWorker()
-			connect.HandleError(func() {
-				defer self.Close()
-
-				for {
-					select {
-					case <-self.ctx.Done():
-						return
-					default:
-					}
-
-					conn, err := listener.Accept()
-					if err != nil {
-						log.Printf("[extender] accept error: %s", err)
-						return
-					}
-					self.startConnection(conn)
-				}
-			}, self.cancel)
+			self.superviseTcpCarrier(bound.port, bound.listener, bound.ownedListener)
 		}()
 	}
 
 	for _, bound := range boundPacketConns {
-		connectMode := bound.connectMode
-		packetConn := bound.packetConn
 		if !self.beginWorker() {
 			// shutdown started while binding, which is not a bind failure
 			return nil
 		}
 		go func() {
 			defer self.endWorker()
-			connect.HandleError(func() {
-				defer self.Close()
-				if err := self.serveQuicCarrier(connectMode, packetConn); err != nil {
-					log.Printf("[extender] udp carrier %s exited: %s", connectMode, err)
-				}
-			}, self.cancel)
+			self.superviseUdpCarrier(bound.port, bound.connectMode, bound.packetConn, bound.ownedCloser)
 		}()
 	}
 
@@ -1111,6 +1130,14 @@ func (self *ExtenderServer) ListenAndServe() error {
 	}
 
 	return nil
+}
+
+// Done closes when the server has ended: Close, the end of its context, or a
+// ListenAndServe that could not start. Nothing else ends it (ListenAndServe), so
+// an owner that did neither reads this as a server gone for good, which it
+// replaces (G2).
+func (self *ExtenderServer) Done() <-chan struct{} {
+	return self.ctx.Done()
 }
 
 // Binds one TCP carrier port through the Listen seam or with its configured
@@ -1182,6 +1209,13 @@ func (self *ExtenderServer) listenPorts() map[int][]connect.ExtenderConnectMode 
 func (self *ExtenderServer) addDnsPort(port int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.closing {
+		return
+	}
+	self.addDnsPortWithLock(port)
+}
+
+func (self *ExtenderServer) addDnsPortWithLock(port int) {
 	if slices.Contains(self.dnsPorts, port) {
 		return
 	}
@@ -1205,6 +1239,14 @@ func (self *ExtenderServer) DnsPorts() []int {
 func (self *ExtenderServer) addCarrier(carrier string) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.closing {
+		return
+	}
+	self.addCarrierWithLock(carrier)
+}
+
+func (self *ExtenderServer) addCarrierWithLock(carrier string) {
+	self.carrierPortCounts[carrier] += 1
 	if slices.Contains(self.carriers, carrier) {
 		return
 	}
@@ -1238,6 +1280,8 @@ func (self *ExtenderServer) serveQuicCarrier(
 	packetConn net.PacketConn,
 ) error {
 	carrierPacketConn := packetConn
+	// what ended the carrier below its quic transport, which sees only a close
+	endError := func() error { return nil }
 	if connectMode == connect.ExtenderConnectModeDns {
 		ptSettings := connect.DefaultPacketTranslationSettings()
 		dnsTlds := [][]byte{}
@@ -1272,6 +1316,7 @@ func (self *ExtenderServer) serveQuicCarrier(
 			self.removeCloser(ownedCloser)
 		}()
 		carrierPacketConn = translation
+		endError = translation.EndError
 	}
 
 	quicTransport := &quic.Transport{
@@ -1323,6 +1368,9 @@ func (self *ExtenderServer) serveQuicCarrier(
 	for {
 		quicConn, err := listener.Accept(self.ctx)
 		if err != nil {
+			if cause := endError(); cause != nil {
+				return fmt.Errorf("%w: %w", err, cause)
+			}
 			return err
 		}
 		if !self.beginConnection(quicConn.RemoteAddr()) {
@@ -1365,6 +1413,11 @@ func (self *ExtenderServer) Close() {
 	}
 	self.closing = true
 	self.cancel()
+	// nothing serves from here, which is what a status or an activation that
+	// reads the carriers after this must be told (G2)
+	self.carriers = []string{}
+	self.carrierPortCounts = map[string]int{}
+	self.dnsPorts = []int{}
 	listeners := make([]net.Listener, 0, len(self.listeners))
 	for ownedListener := range self.listeners {
 		listeners = append(listeners, ownedListener.listener)
@@ -1471,17 +1524,19 @@ func (self *ExtenderServer) SignProbeCosign(cosignBytes []byte) []byte {
 	return self.certificates.SignProbeCosign(cosignBytes)
 }
 
-// The carrier names this extender is listening on (A4, G2). Empty until the
-// binds have been attempted, which Listening reports.
+// The carrier names this extender is serving right now (A4, G2). Empty until the
+// binds have been attempted, which Listening reports, and once the server has
+// ended. A carrier that was lost leaves the list until it serves again.
 func (self *ExtenderServer) Carriers() []string {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return slices.Clone(self.carriers)
 }
 
-// The last bind failure of each carrier that has one (G2). A carrier that bound
-// has no entry, so an empty map with a full carrier list is a fully listening
-// extender. The failures are kept rather than only handed to
+// The last failure of each carrier that has one and is not serving (G2): the
+// bind that failed, or what ended a carrier that had been serving. A carrier
+// that serves has no entry, so an empty map with a full carrier list is a fully
+// listening extender. The failures are kept rather than only handed to
 // ListenErrorHandler because a status is read long after the bind.
 func (self *ExtenderServer) ListenErrors() map[string]error {
 	self.stateLock.Lock()
@@ -1524,11 +1579,17 @@ func (self *ExtenderServer) Stats() ExtenderStats {
 	}
 }
 
-// The three classifications the camouflage gives a peeked ClientHello (P3).
+// The classifications the camouflage gives a peeked ClientHello (P3).
+// SpliceFallbackTerminated is the degraded tell of §3.3: splice was on but no
+// borrowed target was reachable, so the hello was terminated and shown the old
+// probe response. It is kept apart from Terminated, the Phase-A intended
+// terminate, so a deployment in the degraded state is visible and never counted
+// as camouflage coverage.
 const (
-	ExtenderCamouflageOutcomeAuthenticated = "authenticated"
-	ExtenderCamouflageOutcomeSpliced       = "spliced"
-	ExtenderCamouflageOutcomeTerminated    = "terminated"
+	ExtenderCamouflageOutcomeAuthenticated            = "authenticated"
+	ExtenderCamouflageOutcomeSpliced                  = "spliced"
+	ExtenderCamouflageOutcomeTerminated               = "terminated"
+	ExtenderCamouflageOutcomeSpliceFallbackTerminated = "splice_fallback_terminated"
 )
 
 // ExtenderCamouflageOutcome is what the CamouflageHandler seam reports for one
@@ -1553,6 +1614,22 @@ type ExtenderCamouflageStats struct {
 	TimeWindowFailedCount int64
 	SpliceDialFailedCount int64
 	BorrowVerifyFailCount int64
+	// splice on, no borrowed target reachable: the degraded fallback terminate
+	// of §3.3, the one state that exposes the old probe response
+	SpliceFallbackTerminatedCount int64
+	// the per-borrowed-name splice load (§3.3): begins and relayed bytes since
+	// the server started, so a fleet telemetry can sum one target's load across
+	// extenders, which per-extender caps alone do not bound. Keyed on the
+	// lower-cased borrowed name. Empty until a splice runs.
+	TargetLoads map[string]ExtenderCamouflageTargetLoad
+}
+
+// ExtenderCamouflageTargetLoad is one borrowed site's cumulative splice load on
+// this extender (§3.3): how many splices began to it and how many bytes were
+// relayed through them, each way summed.
+type ExtenderCamouflageTargetLoad struct {
+	SpliceCount      int64
+	RelayedByteCount int64
 }
 
 // A snapshot of the camouflage counts (P7). Each counter is read independently,
@@ -1567,7 +1644,173 @@ func (self *ExtenderServer) CamouflageStats() ExtenderCamouflageStats {
 		TimeWindowFailedCount: self.camouflageTimeWindowFailedCount.Load(),
 		SpliceDialFailedCount: self.camouflageSpliceDialFailedCount.Load(),
 		BorrowVerifyFailCount: self.camouflageBorrowVerifyFailCount.Load(),
+
+		SpliceFallbackTerminatedCount: self.camouflageSpliceFallbackTerminatedCount.Load(),
+		TargetLoads:                   self.camouflageTargetLoads(),
 	}
+}
+
+// The per-borrowed-name splice load, empty when the server has no camouflage or
+// nothing has been spliced yet.
+func (self *ExtenderServer) camouflageTargetLoads() map[string]ExtenderCamouflageTargetLoad {
+	if self.camouflage == nil {
+		return map[string]ExtenderCamouflageTargetLoad{}
+	}
+	return self.camouflage.targetLoads()
+}
+
+// SetCamouflageSplice flips the runtime splice posture (EXTENDER-UPDATE2 §3.3):
+// on moves the cohort to Phase B, off rolls it back to Phase A. It takes effect
+// for connections accepted after it returns; splices already relaying keep
+// running. It does nothing structural when camouflage is off — the posture is
+// read only while CamouflageEnabled — but the value is retained. Once called,
+// the posture no longer follows the ExtenderCamouflageSplice setting.
+func (self *ExtenderServer) SetCamouflageSplice(on bool) {
+	if on {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOn)
+	} else {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOff)
+	}
+}
+
+// The values of the runtime splice posture (camouflageSpliceOverride).
+const (
+	// follow the ExtenderCamouflageSplice setting
+	extenderCamouflageSpliceFollowSetting int32 = iota
+	extenderCamouflageSpliceOverrideOn
+	extenderCamouflageSpliceOverrideOff
+)
+
+// CamouflageSplice reports the current runtime splice posture: the one
+// SetCamouflageSplice set, else the ExtenderCamouflageSplice setting.
+func (self *ExtenderServer) CamouflageSplice() bool {
+	switch self.camouflageSpliceOverride.Load() {
+	case extenderCamouflageSpliceOverrideOn:
+		return true
+	case extenderCamouflageSpliceOverrideOff:
+		return false
+	default:
+		return self.settings.ExtenderCamouflageSplice
+	}
+}
+
+// Whether the splice admits a hello now (EXTENDER-UPDATE2 §3.2, §3.3): the
+// runtime posture is on and the optional record gate, when set, allows it.
+func (self *ExtenderServer) camouflageSpliceEnabled() bool {
+	if !self.CamouflageSplice() {
+		return false
+	}
+	if gate := self.settings.CamouflageSpliceGate; gate != nil {
+		return gate()
+	}
+	return true
+}
+
+// The phases of the camouflage a deployment is in (EXTENDER-UPDATE2 §3.2, §3.3).
+const (
+	// camouflage off, or no identity key: legacy posture, no authenticated path
+	ExtenderCamouflagePhaseOff = "off"
+	// authenticated hellos recognized, unauthenticated hellos terminated
+	ExtenderCamouflagePhaseAuthenticatedRollout = "authenticated_rollout"
+	// splicing unauthenticated hellos to borrowed sites
+	ExtenderCamouflagePhaseSplicePilot = "splice_pilot"
+)
+
+// ExtenderCamouflageStatus is whether this extender actually provides camouflage
+// coverage right now (EXTENDER-UPDATE2 §3.3). Covered is true only in the splice
+// pilot with verified borrowed targets and no running degraded fallback; it is
+// deliberately conservative, so a degraded deployment is never reported as
+// successful coverage.
+type ExtenderCamouflageStatus struct {
+	// off, authenticated_rollout or splice_pilot
+	Phase string
+	// whether the server publishes a camouflage key and recognizes tags
+	Enabled bool
+	// the runtime splice posture
+	SpliceOn bool
+	// whether the record gate (CamouflageSpliceGate), if set, currently allows
+	// the splice
+	SpliceGateOpen bool
+	// borrowed names verified and available to splice to
+	VerifiedTargetCount int
+	// splice was on but a hello found no reachable target and was terminated
+	SpliceFallbackTerminatedCount int64
+	// splice-target dial failures
+	SpliceDialFailedCount int64
+	// the honest answer: does this extender currently present real-site
+	// behavior to a prober. False whenever it is not in the splice pilot, has
+	// no verified target, has fallen back to terminate, or a role found a name
+	// its supported clients select unverified.
+	Covered bool
+	// why Covered is false, for status and telemetry
+	DegradedReason string
+}
+
+// The degraded reasons of ExtenderCamouflageStatus.
+const (
+	ExtenderCamouflageDegradedNone             = ""
+	ExtenderCamouflageDegradedCamouflageOff    = "camouflage_off"
+	ExtenderCamouflageDegradedSpliceOff        = "splice_off"
+	ExtenderCamouflageDegradedGateClosed       = "splice_gate_closed"
+	ExtenderCamouflageDegradedNoVerifiedTarget = "no_verified_target"
+	ExtenderCamouflageDegradedFallbackActive   = "splice_fallback_active"
+	// the splice runs, but a role found a name this extender's supported
+	// clients select that it did not verify, or a list that is unmeasured or
+	// past its maximum age (connect.ExtenderCamouflageCoverage): a prober
+	// replaying that name is substituted, which is degraded, not coverage
+	ExtenderCamouflageDegradedCoverageIncomplete = "coverage_incomplete"
+)
+
+// CamouflageStatus reports whether this extender provides camouflage coverage
+// now (§3.3). A deployment that has fallen back to legacy termination — splice
+// on but no reachable target — is reported degraded, never as coverage. An
+// enabled extender with no verified name says so in every posture: that is what
+// stands between it and coverage whatever the posture and the gate say, and a
+// role's gate is closed because of it (it publishes no key without a name).
+func (self *ExtenderServer) CamouflageStatus() ExtenderCamouflageStatus {
+	enabled := self.camouflage != nil && self.settings.CamouflageEnabled && self.camouflage.staticPrivateKey != nil
+	spliceOn := self.CamouflageSplice()
+	gateOpen := true
+	if gate := self.settings.CamouflageSpliceGate; gate != nil {
+		gateOpen = gate()
+	}
+	status := ExtenderCamouflageStatus{
+		Enabled:                       enabled,
+		SpliceOn:                      spliceOn,
+		SpliceGateOpen:                gateOpen,
+		SpliceFallbackTerminatedCount: self.camouflageSpliceFallbackTerminatedCount.Load(),
+		SpliceDialFailedCount:         self.camouflageSpliceDialFailedCount.Load(),
+	}
+	coverageIncomplete := false
+	if self.camouflage != nil {
+		status.VerifiedTargetCount = self.camouflage.verifiedTargetCount()
+		coverageIncomplete = self.camouflage.isCoverageIncomplete()
+	}
+	switch {
+	case !enabled:
+		status.Phase = ExtenderCamouflagePhaseOff
+	case !spliceOn || !gateOpen:
+		status.Phase = ExtenderCamouflagePhaseAuthenticatedRollout
+	default:
+		status.Phase = ExtenderCamouflagePhaseSplicePilot
+	}
+	switch {
+	case !enabled:
+		status.DegradedReason = ExtenderCamouflageDegradedCamouflageOff
+	case status.VerifiedTargetCount == 0:
+		status.DegradedReason = ExtenderCamouflageDegradedNoVerifiedTarget
+	case !spliceOn:
+		status.DegradedReason = ExtenderCamouflageDegradedSpliceOff
+	case !gateOpen:
+		status.DegradedReason = ExtenderCamouflageDegradedGateClosed
+	case 0 < status.SpliceFallbackTerminatedCount:
+		status.DegradedReason = ExtenderCamouflageDegradedFallbackActive
+	case coverageIncomplete:
+		status.DegradedReason = ExtenderCamouflageDegradedCoverageIncomplete
+	default:
+		status.Covered = true
+	}
+	return status
 }
 
 // RealityPublicKey is the 32-byte X25519 static public key the record publishes

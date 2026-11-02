@@ -39,22 +39,32 @@ import (
 
 func main() {
 	synthetic := flag.Bool("synthetic", false, "regenerate the synthetic golden from uTLS (no Docker)")
+	localBrowser := flag.String("local-browser", "", "capture a locally installed Chromium browser instead of Docker; \"auto\" or a browser binary path")
 	chromeImage := flag.String("chrome-image", "chromedp/headless-shell:stable", "pinned headless Chrome Docker image")
-	chromeVersion := flag.String("chrome-version", "", "the Chrome version to stamp the golden with (e.g. 141); required outside -synthetic")
+	chromeVersion := flag.String("chrome-version", "", "the Chrome version to stamp the golden with (e.g. 141); required for Docker, optional for -local-browser (read from the browser)")
 	goldenDir := flag.String("golden-dir", "fingerprint/testdata/fingerprints", "directory to write goldens into")
 	captureQuic := flag.Bool("quic", false, "also capture the QUIC Initial (forces Chrome onto h3)")
 	timeout := flag.Duration("timeout", 60*time.Second, "how long to wait for Chrome to connect")
 	flag.Parse()
 
-	if err := run(*synthetic, *chromeImage, *chromeVersion, *goldenDir, *captureQuic, *timeout); err != nil {
+	if err := run(*synthetic, *localBrowser, *chromeImage, *chromeVersion, *goldenDir, *captureQuic, *timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "capture: %s\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(synthetic bool, chromeImage string, chromeVersion string, goldenDir string, captureQuic bool, timeout time.Duration) error {
+func run(synthetic bool, localBrowser string, chromeImage string, chromeVersion string, goldenDir string, captureQuic bool, timeout time.Duration) error {
 	if synthetic {
 		return writeSyntheticGolden(goldenDir)
+	}
+	if localBrowser != "" {
+		browserPath := localBrowser
+		if localBrowser == "auto" {
+			browserPath = ""
+		}
+		// QUIC capture from a local browser is not wired; the TLS hello is what
+		// the camouflage carrier needs (QUIC conformance is out of scope here).
+		return captureLocalBrowserTlsClientHello(browserPath, chromeVersion, goldenDir, timeout)
 	}
 	if chromeVersion == "" {
 		return fmt.Errorf("-chrome-version is required (stamp the golden with the real Chrome version)")

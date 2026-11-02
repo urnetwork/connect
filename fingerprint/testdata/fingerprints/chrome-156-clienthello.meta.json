@@ -1,0 +1,10 @@
+{
+  "chrome_version": "156",
+  "capture_date": "2026-11-02",
+  "source": "real Google Chrome, captured at the local fingerprint endpoint (no Docker)",
+  "browser_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "server_name": "endpoint.example",
+  "record_count": 1,
+  "message_bytes": 2015,
+  "synthetic": false
+}

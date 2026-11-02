@@ -169,6 +169,17 @@ message ExtenderRecordBody {
     // an extender that does not serve the API or whose name is not published,
     // and on records that predate the field.
     bytes MeasurementId = 17;
+    // The client capabilities a release must see declared before it hands
+    // out this record (EXTENDER-UPDATE2 §3.2). A Phase B extender splices an
+    // unauthenticated hello to its borrowed site, so its record requires
+    // "tcp-camouflage-v1". The field is signed with the rest of the body, so
+    // a client that holds the record knows the requirement too, and an
+    // unknown value is one no client satisfies. The operator sets it only on
+    // records that a release alone hands out (the gated tier) and that carry
+    // a RealityPublicKey; a capability changes which records are eligible,
+    // never the disclosure budget. Empty, it requires nothing, as on every
+    // record that predates the field. A reader that predates it skips it.
+    repeated string RequiredCapabilities = 18;
 }
 
 message ExtenderRecord {
@@ -238,4 +249,38 @@ message ExtenderShare {
     // 4 or 16 bytes each
     repeated bytes Addresses = 3;
     ExtenderShareSettings Settings = 4;
+}
+
+// The signed body of a public seed bundle (EXTENDER-UPDATE2.md §2.2): a small
+// authenticated set of ordinary open-tier records for one network space, which
+// restores verified reach when the feed and the dns bootstrap cannot be
+// reached. The envelope signature authenticates only this distribution
+// metadata; every record inside still carries, and is judged by, its own root
+// signature, network host, expiry, revocation and tier. There is deliberately
+// no field for root keys, network hosts, gossip urls or resolver settings: a
+// seed never changes what a client trusts or how it resolves.
+message ExtenderSeedBody {
+    // 1; a reader refuses any other version
+    uint32 FormatVersion = 1;
+    // the space whose public seed feed this is
+    string NetworkHost = 2;
+    // increases with every bundle the space publishes, across signing keys
+    uint64 Sequence = 3;
+    uint64 IssuedAtUnixMilli = 4;
+    // never later than the expiry of any record carried
+    uint64 ExpiresAtUnixMilli = 5;
+    // serialized ExtenderRecord, each open tier with an empty CanaryChannel
+    repeated bytes Records = 6;
+    // serialized ExtenderRevocation, each root signed
+    repeated bytes Revocations = 7;
+}
+
+message ExtenderSeedEnvelope {
+    // serialized ExtenderSeedBody, signed opaquely to avoid serialization ambiguity
+    bytes Body = 1;
+    // over "ur-extender-seed-v1" || Body by a root key of the space
+    bytes Signature = 2;
+    // first 8 bytes of sha256 of the signing public key; a lookup hint only,
+    // never a trust anchor
+    bytes KeyId = 3;
 }

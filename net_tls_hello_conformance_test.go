@@ -219,13 +219,90 @@ func TestNormalDialerSendsSingleRecordHello(t *testing.T) {
 // connect's dialer in the meantime (task + RULES.md coordination).
 // ---------------------------------------------------------------------------
 
-// The extender camouflage carrier hello: the same parrot assertions on the
-// carrier's uTLS hello, plus that the sealed session occupies the 32-byte
-// legacy session-id field and the rest matches Chrome. waits on the extender
-// camouflage implementation (its design merged as 0a349da5; the impl that emits
-// the authenticated REALITY hello is not yet on origin/main).
+// The extender camouflage carrier hello (EXTENDER-UPDATE2 §3.4): the same
+// parrot assertions on the carrier's uTLS hello as the normal dialers, plus
+// that the sealed authenticated tag occupies the 32-byte legacy session-id
+// field (so the first flight is indistinguishable from a browser's, which fills
+// that field with 32 random bytes) and the carrier offers {h2,http/1.1} on the
+// wire. The carrier parrots the same uTLS Chrome profile as the normal dialers,
+// so it is gated against the committed synthetic parrot golden; real-browser
+// equivalence is the separate concern of TestExtenderCamouflageCarrierHelloVs
+// RealBrowser below and the fingerprint package's real golden.
 func TestExtenderCamouflageHelloConformance(t *testing.T) {
-	t.Skip("waits on the extender camouflage carrier-hello implementation branch; Layer A wired when it is on origin/main (fingerprint/README.md)")
+	golden, err := fingerprint.LoadGolden(fingerprint.GoldenChrome133Synthetic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := connect.ExtenderCamouflageCarrierHelloForTest(t)
+	got, err := fingerprint.ParseClientHello(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the sealed tag occupies the 32-byte legacy session id, exactly where a
+	// browser puts its 32 random bytes
+	if got.LegacySessionIdLength != 32 {
+		t.Fatalf("carrier hello legacy session id = %d bytes, want 32 (the sealed tag)", got.LegacySessionIdLength)
+	}
+	// the carrier offers {h2,http/1.1} on the wire; the server negotiates
+	// http/1.1 alone on the authenticated path, and that choice is encrypted
+	opts := fingerprint.DiffOptions{
+		ExpectedServerName:        got.ServerName,
+		ExpectedAlpnProtocols:     connect.ExtenderCamouflageCarrierAlpnForTest(),
+		ExpectApplicationSettings: true,
+	}
+	if drifts := fingerprint.Diff(golden.Fingerprint, got, opts); len(drifts) != 0 {
+		t.Fatalf("camouflage carrier hello drifted from the Chrome parrot: %s", fingerprint.FormatDrift(fingerprint.GoldenChrome133Synthetic, drifts))
+	}
+}
+
+// The camouflage carrier hello is the SAME Chrome parrot the normal dialers
+// send (EXTENDER-UPDATE2 §3.4): its parrot fields match a normal websocket
+// dial's, so the camouflaged first flight is no more distinguishable from real
+// Chrome than connect's ordinary traffic is. Against the committed real Chrome
+// golden the carrier shows the same measured parrot gap the normal dialers do
+// (signature_algorithms and the extension set), not a wider one — which is the
+// honest real-browser claim: not equivalence, but no extra tell from the
+// camouflage layer.
+func TestExtenderCamouflageCarrierHelloVsRealBrowser(t *testing.T) {
+	real, err := fingerprint.LoadGolden(fingerprint.GoldenChrome156Real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier, err := fingerprint.ParseClientHello(connect.ExtenderCamouflageCarrierHelloForTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a normal websocket dial's hello, captured at the shared endpoint
+	endpoint, err := fingerprint.NewEndpoint(fingerprint.EndpointOptions{Handler: connect.TlsHelloConformanceHandlerForTest()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer endpoint.Close()
+	_, normal := captureDialerHellos(t, endpoint, connect.TlsHelloConformanceDialersForTest()[0], fingerprintEndpointSettings(t, endpoint))
+
+	opts := func(hello *fingerprint.ClientHelloFingerprint) fingerprint.DiffOptions {
+		return fingerprint.DiffOptions{
+			ExpectedServerName:        hello.ServerName,
+			ExpectedAlpnProtocols:     hello.AlpnProtocols,
+			ExpectApplicationSettings: len(hello.AlpsProtocols) != 0,
+		}
+	}
+	// the carrier's gap from real Chrome is exactly the normal dialer's gap:
+	// same drifted fields, no extra tell from the camouflage layer
+	carrierDrift := driftFieldSet(fingerprint.Diff(real.Fingerprint, carrier, opts(carrier)))
+	normalDrift := driftFieldSet(fingerprint.Diff(real.Fingerprint, normal, opts(normal)))
+	if !slices.Equal(carrierDrift, normalDrift) {
+		t.Fatalf("camouflage carrier drifts from real Chrome differently than the normal dialer: carrier %v, normal %v", carrierDrift, normalDrift)
+	}
+}
+
+func driftFieldSet(drifts []fingerprint.Drift) []string {
+	fields := []string{}
+	for _, drift := range drifts {
+		fields = append(fields, drift.Field)
+	}
+	slices.Sort(fields)
+	return slices.Compact(fields)
 }
 
 // The quic Initial comparison is WIRED, not a placeholder: feat/quicv2-extender-udp
