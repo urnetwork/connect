@@ -4786,3 +4786,51 @@ change or extend section P. It does not revise P.
   signature_algorithms with a grease value, which the diff normalizes like the
   other ordered lists. The synthetic uTLS golden stays regression coverage
   only.
+
+## Design note: release outcomes, capability eligibility and the outage rule (2026-11-02)
+
+EXTENDER-UPDATE2 §1.1, §1.3 and §3.2, server half (slice B). This adds to R3,
+R4 and P without rewriting them.
+
+- Outcomes. `ExtenderReleasePolicy.Release` sets `ExtenderReleaseResult.Outcome`
+  on every admitted answer: `ok`, `empty`, `epoch_spent`, `probation`,
+  `country_capacity` or `incompatible`. A refusal is an
+  `*ExtenderReleaseRefusal` (`rate_limited` or `unavailable`), which unwraps to
+  the existing errors and keeps their messages. A spent epoch decides an empty
+  answer before anything else, since nothing else can be released until the
+  epoch ends. `RetryAfter` is set only from the requester's own clock state:
+  the request window plus one second for a limit (the refused request counts
+  too), the epoch's end for `epoch_spent`, and the sooner of the epoch's end
+  and the probation's end for `probation`. `empty`, `country_capacity` and
+  `incompatible` carry none, since when a slot frees depends on other
+  identities. No outcome names a count, a partition or a record. The route
+  carries these as the additive `outcome` and `retry_after_seconds`.
+- Capability eligibility. `ExtenderRecordBody.RequiredCapabilities` is field
+  18 (`repeated string`). Field 18 was free on main, on every remote and local
+  branch, and in every worktree on 2026-11-02. A record lists the capabilities
+  a client must declare before a release hands it out. The policy reads them
+  through `ExtenderReleaseRequest.Compatible`. An incompatible record is skipped
+  like an ineligible one, after the family and blocked checks, and is never
+  charged. The identity's count, partition and epoch disclosures are the same
+  whatever it declares: a capability declared or dropped within an epoch never
+  refunds a disclosure or adds one past the count. The answer is
+  `incompatible` only when nothing compatible is left. The operator sets the
+  field only for an extender a release alone reaches (the gated tier, not a
+  dns canary) whose record carries a `RealityPublicKey`, and only from its
+  configured cohort (server `extender.yml`, `directory.capability_cohorts`). It
+  is therefore inert until the server signs the camouflage key (phase 14b). A
+  value no client knows is one no client satisfies.
+- Outage rule. A block now needs the operator's probe to reach the record
+  now, not merely within the probe window: a failed probe with no success
+  after it is an outage. Reports made before the last failed probe describe
+  that outage and do not count, even after the probe succeeds again.
+  `ExtenderBlockedState.ProbeFailed` records the failure. The server applies
+  the same rule to its tables: every active address's latest probe must have
+  succeeded within the window, a report sent while the extender fails its
+  probe is not recorded, and a failed probe on any family deletes the reports
+  made before it, since the tables keep only each address's latest probe. A
+  report holds the probe rows it read until it commits, so a probe failing
+  meanwhile either refuses it or deletes it after. A blocked canary still names
+  its one place (`ExtenderAttributeBlockedCanaries`) and blocks no other
+  record: blocked state stays per record, and the release keeps the epoch's
+  order among the rest.

@@ -28,6 +28,14 @@ import (
 // against an extender that is simply down is not a block, and one reporter,
 // however loud, is not enough. The state is bounded in reporters and entries.
 //
+// The probe must still reach the record now, not merely have reached it within
+// the window (EXTENDER-UPDATE2 §1.3). A failed probe with no success after it is
+// an outage, whatever was reported. A report made before the last failed probe
+// may describe that outage rather than a block, so it does not count, even after
+// the probe succeeds again. A block is never inferred from a canary's placement
+// either: the state is per record, and a blocked canary names the place that
+// leaked (ExtenderAttributeBlockedCanaries) without blocking any other record.
+//
 // ExtenderBlockedState is safe for concurrent use; the placement functions
 // are pure.
 
@@ -174,6 +182,8 @@ type ExtenderBlockedState struct {
 	entryCount int
 	// by key hex, the operator's last successful probe
 	probeSuccessTimes map[string]time.Time
+	// by key hex, the operator's last failed probe
+	probeFailureTimes map[string]time.Time
 }
 
 func NewExtenderBlockedState(settings *ExtenderBlockedStateSettings) *ExtenderBlockedState {
@@ -189,6 +199,7 @@ func NewExtenderBlockedState(settings *ExtenderBlockedStateSettings) *ExtenderBl
 		settings:          settings,
 		entries:           map[string]map[string]*extenderBlockedEntry{},
 		probeSuccessTimes: map[string]time.Time{},
+		probeFailureTimes: map[string]time.Time{},
 	}
 }
 
@@ -284,9 +295,21 @@ func (self *ExtenderBlockedState) ProbeSucceeded(keyHex string) {
 	self.probeSuccessTimes[strings.ToLower(keyHex)] = now
 }
 
+// Records that the operator's own probe failed to reach the record now. Until
+// a later success the record is down rather than blocked, and the reports made
+// before now never count toward a block.
+func (self *ExtenderBlockedState) ProbeFailed(keyHex string) {
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.probeFailureTimes[strings.ToLower(keyHex)] = now
+}
+
 // Whether the record is blocked in the country now: reporters at or above
-// the threshold within the window, and a probe success within the probe
-// window.
+// the threshold within the window, each reporting after the last failed probe,
+// and a probe success within the probe window with no failure after it.
 func (self *ExtenderBlockedState) Blocked(keyHex string, countryCode string) bool {
 	now := self.settings.Now()
 
@@ -309,7 +332,25 @@ func (self *ExtenderBlockedState) blockedWithLock(keyHex string, countryCode str
 	if !ok {
 		return false
 	}
-	return now.Sub(probeSuccessTime) < self.settings.ProbeWindow
+	if self.settings.ProbeWindow <= now.Sub(probeSuccessTime) {
+		return false
+	}
+	probeFailureTime, failed := self.probeFailureTimes[keyHex]
+	if !failed {
+		return true
+	}
+	if !probeFailureTime.Before(probeSuccessTime) {
+		// the latest probe failed: the record is down, not blocked
+		return false
+	}
+	// only reports made while the probe has been reaching the record count
+	reporterCount := 0
+	for _, reportTime := range entry.reporterTimes {
+		if probeFailureTime.Before(reportTime) {
+			reporterCount += 1
+		}
+	}
+	return self.settings.ReportThreshold <= reporterCount
 }
 
 // The records blocked in the country now, in key order.
