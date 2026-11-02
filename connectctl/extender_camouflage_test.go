@@ -344,7 +344,7 @@ func (self *testCamouflageCommand) waitUntil(name string, condition func() bool)
 // is not checked, which is what a prober that wants to see what answers does.
 func (self *testCamouflageCommand) probeLeaf() []byte {
 	self.t.Helper()
-	conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", self.tcpPort), &tls.Config{
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 60 * time.Second}, "tcp", fmt.Sprintf("127.0.0.1:%d", self.tcpPort), &tls.Config{
 		ServerName:         testCamouflageBorrowName,
 		InsecureSkipVerify: true,
 	})
@@ -494,13 +494,16 @@ func TestExtenderCommandCamouflagePhaseAPublishesTheKeyItOpensTagsUnder(t *testi
 		}
 		stream.Close()
 	}
-	feed(realityPublicKey)
-	if count := server.CamouflageStats().AuthenticatedCount; count != 1 {
-		t.Fatalf("authenticated hellos = %d, expected the keyed client's", count)
-	}
+	// the legacy attempt of the race can win on a slow machine and cancel the
+	// camouflaged one before it is read, so this asks until one is
+	command.waitUntil("an authenticated hello", func() bool {
+		feed(realityPublicKey)
+		return 0 < server.CamouflageStats().AuthenticatedCount
+	})
+	terminatedCount := server.CamouflageStats().TerminatedCount
 	feed(nil)
-	if count := server.CamouflageStats().TerminatedCount; count != 1 {
-		t.Fatalf("terminated hellos = %d, expected the legacy client's", count)
+	if count := server.CamouflageStats().TerminatedCount; count != terminatedCount+1 {
+		t.Fatalf("terminated hellos went from %d to %d, expected the legacy client's", terminatedCount, count)
 	}
 	if leaf := command.probeLeaf(); slices.Equal(leaf, site.leaf) {
 		t.Fatal("Phase A spliced a prober")
@@ -751,7 +754,9 @@ func TestExtenderCommandCamouflageSpliceWaitsForItsRecordsToSettle(t *testing.T)
 		t.Fatalf("status before the records settled = %+v", status)
 	}
 
-	// each activation renews the record, and the gate reads each one
+	// each activation renews the record, and the gate reads each one. The first
+	// record reaches the gate just after the operator answers it, so the run may
+	// start a step after this; it can never start before
 	renew := func() {
 		t.Helper()
 		version, _ := command.run.activator.ChangeMonitor().Get()
@@ -761,18 +766,18 @@ func TestExtenderCommandCamouflageSpliceWaitsForItsRecordsToSettle(t *testing.T)
 			return version < current
 		})
 	}
-	for elapsed := time.Duration(0); elapsed <= recordLifetime+margin; elapsed += 6 * time.Hour {
-		if server.CamouflageStatus().SpliceGateOpen {
-			t.Fatalf("the gate opened after %s, expected a lifetime and the margin", elapsed)
+	const step = 6 * time.Hour
+	firstRecord := clock.Now()
+	for !server.CamouflageStatus().SpliceGateOpen {
+		if recordLifetime+margin+3*step < clock.Now().Sub(firstRecord) {
+			t.Fatalf("the gate is still closed after %s: %+v", clock.Now().Sub(firstRecord), server.CamouflageStatus())
 		}
-		clock.advance(6 * time.Hour)
+		clock.advance(step)
 		renew()
-		// the outcome is published ahead of the record reaching the gate; nothing
-		// here depends on when, since the wait below reads the gate itself
 	}
-	command.waitUntil("the gate opening", func() bool {
-		return server.CamouflageStatus().SpliceGateOpen
-	})
+	if elapsed := clock.Now().Sub(firstRecord); elapsed < recordLifetime+margin {
+		t.Fatalf("the gate opened after %s, expected a lifetime and the margin", elapsed)
+	}
 	if leaf := command.probeLeaf(); !slices.Equal(leaf, site.leaf) {
 		t.Fatal("a prober was not spliced after the records settled")
 	}
