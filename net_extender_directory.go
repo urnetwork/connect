@@ -542,6 +542,9 @@ type ExtenderDirectory struct {
 	// the secret the feed sample is partitioned by (Q2): the setting, or one
 	// drawn at construction
 	partitionSecret []byte
+	// the gated-preferred connection policy (net_extender_directory_gated.go,
+	// EXTENDER-UPDATE2 §1.1); its zero value is the policy off
+	gated extenderGatedState
 }
 
 // One live subscription to the applied messages (D4). The channel is the
@@ -1301,6 +1304,7 @@ func (self *ExtenderDirectory) RecordSuccess(ip netip.Addr, connectMode Extender
 		self.log.Infof("[extender]success %s %s\n", ip, connectMode)
 	}
 	self.tierUpdateAddressWithLock(address, now)
+	self.gatedConnectedWithLock(address, now)
 	self.changedWithLock()
 }
 
@@ -1738,13 +1742,40 @@ func (self *ExtenderDirectory) candidates(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	return self.candidatesWithLock(ipVersion, count, verifiedOnly, excludeIps, now, nil)
+}
+
+// The candidates of `candidates`. `class`, when set, leads the order within
+// each tier, lowest first, and leaves out every address it gives a negative
+// class: the gated preference's order (connectCandidatesWithLock). Nil is the
+// order of `Candidates`.
+func (self *ExtenderDirectory) candidatesWithLock(
+	ipVersion int,
+	count int,
+	verifiedOnly bool,
+	excludeIps map[netip.Addr]bool,
+	now time.Time,
+	class func(address *extenderDirectoryAddress) int,
+) []*ExtenderCandidate {
+	compareClass := func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		if class == nil {
+			return 0
+		}
+		return class(a) - class(b)
+	}
 	compareUsable := func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		if c := compareClass(a, b); c != 0 {
+			return c
+		}
 		if c := compareExtenderVerified(a, b); c != 0 {
 			return c
 		}
 		return self.compareCandidateWithLock(a, b, now)
 	}
 	compareExpired := func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		if c := compareClass(a, b); c != 0 {
+			return c
+		}
 		if c := compareExpiredKeyRecords(
 			a.publicKeyHex,
 			self.keyHexRecords[a.publicKeyHex],
@@ -1772,11 +1803,16 @@ func (self *ExtenderDirectory) candidates(
 			return address.publicKeyHex == ""
 		})
 	}
+	expired := self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps)
+	if class != nil {
+		withheld := func(address *extenderDirectoryAddress) bool {
+			return class(address) < 0
+		}
+		usable = slices.DeleteFunc(usable, withheld)
+		expired = slices.DeleteFunc(expired, withheld)
+	}
 	usableAddresses, limitedUsableAddresses := splitExtenderLimitedAddresses(usable, now)
-	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(
-		self.retainedExpiredAddressesWithLock(ipVersion, now, excludeIps),
-		now,
-	)
+	expiredAddresses, limitedExpiredAddresses := splitExtenderLimitedAddresses(expired, now)
 	tiers := []struct {
 		addresses []*extenderDirectoryAddress
 		compare   func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int
@@ -2555,6 +2591,11 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	return self.snapshotWithLock(now)
+}
+
+// The snapshot of `Snapshot`, under the state lock.
+func (self *ExtenderDirectory) snapshotWithLock(now time.Time) *ExtenderDirectorySnapshot {
 	snapshot := &ExtenderDirectorySnapshot{
 		Entries: []*ExtenderDirectoryEntry{},
 	}
