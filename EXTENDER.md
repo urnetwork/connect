@@ -1324,8 +1324,9 @@ stays on its tick, and one waiting out a hold, a `retry_after_seconds` or a priv
 family's day goes on waiting, so a listener that flaps posts nothing it would not have
 posted anyway. A post that went out while another carrier or a dns port was down leaves
 it off the record, so its return (`ExtenderActivator.CarriersChanged`) makes a family
-activated without it due, after the same draw. A carrier that goes and comes back with
-the record already naming it posts nothing.
+activated without it due, after the same draw. If it has gone again when the draw comes
+up, the post could not name it, so it is not made and the family stays on its tick. A
+carrier that goes and comes back with the record already naming it posts nothing.
 
 Every post names the run of the process that sent it (2026-11-02): `run_id`,
 32 lower case hex characters of 128 random bits drawn once when the process

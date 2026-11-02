@@ -539,6 +539,101 @@ func TestExtenderActivatorCarrierThatFlapsOnTheRecordPostsNothing(t *testing.T) 
 	fixture.expectFamilyPostCounts("after the flaps", 1, 1)
 }
 
+// Runs a carrier through a return and its loss again, as one that binds and dies at
+// once does, past a draw of 3 minutes. The last step is what proves the pass that the
+// draw came up in has finished, with the carrier down.
+func (self *testActivatorFixture) carrierBindsAndDies(serving []string, down []string) {
+	self.t.Helper()
+	self.setCarriers(serving...)
+	self.activator.CarriersChanged()
+	self.step(time.Minute)
+	self.setCarriers(down...)
+	self.activator.CarriersChanged()
+	self.step(time.Minute)
+	self.step(3 * time.Minute)
+	self.step(time.Minute)
+}
+
+// Activated without the quic carrier, and with its post coming up in 3 minutes each
+// time it returns.
+func newTestActivatorFixtureWithoutQuic(t *testing.T) *testActivatorFixture {
+	t.Helper()
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierTcp, ExtenderCarrierDns}
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			return 3 * time.Minute
+		}
+	})
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+	fixture.waitActivation()
+	fixture.step(time.Minute)
+	return fixture
+}
+
+// A carrier that binds and dies at once returns over and over, and is gone again when
+// the post for it comes due. That post could not name it, so it is not made: a review
+// measured 12 posts an hour for each family, indefinitely. The family stays on the tick
+// it was on, which still goes.
+func TestExtenderActivatorCarrierThatDiesAtOncePostsOnlyOnTheTick(t *testing.T) {
+	fixture := newTestActivatorFixtureWithoutQuic(t)
+	serving := []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns}
+	down := []string{ExtenderCarrierTcp, ExtenderCarrierDns}
+	for range 12 {
+		fixture.carrierBindsAndDies(serving, down)
+	}
+	fixture.expectFamilyPostCounts("after 12 returns", 1, 1)
+
+	// short of the tick, which is a day from the first post
+	fixture.step(22 * time.Hour)
+	fixture.expectFamilyPostCounts("short of the tick", 1, 1)
+	fixture.clock.advance(1 * time.Hour)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 || slices.Contains(post.args.Carriers, ExtenderCarrierQuic) {
+		t.Fatalf("post = v%d of %v, expected v4's tick without the carrier", post.ipVersion, post.args.Carriers)
+	}
+	fixture.waitPost()
+}
+
+// The same carrier serving when the post comes due is on the record from then, so the
+// skip costs nothing but the posts that could not name it, and its later returns post
+// nothing.
+func TestExtenderActivatorCarrierThatStaysAfterDyingIsPosted(t *testing.T) {
+	fixture := newTestActivatorFixtureWithoutQuic(t)
+	serving := []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns}
+	down := []string{ExtenderCarrierTcp, ExtenderCarrierDns}
+	fixture.carrierBindsAndDies(serving, down)
+	fixture.expectFamilyPostCounts("after it died", 1, 1)
+
+	fixture.setCarriers(serving...)
+	fixture.activator.CarriersChanged()
+	fixture.step(time.Minute)
+	fixture.clock.advance(3 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 || !slices.Contains(post.args.Carriers, ExtenderCarrierQuic) {
+		t.Fatalf("post = v%d of %v, expected v4 with the carrier", post.ipVersion, post.args.Carriers)
+	}
+	fixture.waitPost()
+	fixture.waitActivation()
+	fixture.waitActivation()
+
+	fixture.step(time.Minute)
+	fixture.carrierBindsAndDies(serving, down)
+	fixture.expectFamilyPostCounts("with it on the record", 2, 2)
+}
+
+// A trigger that moved the post is not the carrier's, so the carrier being down again
+// does not cancel it: a network change is owed its post whatever else is serving.
+func TestExtenderActivatorCarrierSkipLeavesAnotherTriggersPost(t *testing.T) {
+	fixture := newTestActivatorFixtureWithoutQuic(t)
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns)
+	fixture.activator.CarriersChanged()
+	fixture.step(time.Minute)
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierDns)
+	fixture.activator.Reactivate()
+	fixture.waitPost()
+	fixture.waitPost()
+}
+
 // A family on a hold posts at its end with what is serving then, so a carrier's return
 // is no reason to cut that short.
 func TestExtenderActivatorCarrierReturnKeepsAHold(t *testing.T) {
@@ -772,6 +867,45 @@ func TestExtenderActivatorReplacementDoesNotSeeARevocationAgain(t *testing.T) {
 	if status := fixture.activator.Status().Family(4); status.RevokedTime.IsZero() {
 		t.Fatalf("v4 status = %+v, expected the revocation carried over", status)
 	}
+}
+
+// A trigger that landed just ahead of the close, which no pass acted on, is still owed:
+// a network change would otherwise wait for the post the replacement spreads over an
+// hour, and a carrier's return for the tick.
+func TestExtenderActivatorReplacementKeepsATriggerNotYetActedOn(t *testing.T) {
+	t.Run("a network change", func(t *testing.T) {
+		fixture := newTestActivatorFixtureActivated(t, func(settings *ExtenderActivatorSettings) {
+			settings.ReplacedPostJitter = 24 * 365 * time.Hour
+		})
+		fixture.step(time.Minute)
+		fixture.activator.Close()
+		fixture.activator.Reactivate()
+		settings := *fixture.activatorSettings
+		settings.PreviousState = fixture.activator.State()
+		fixture.activator = NewExtenderActivator(fixture.activatorCtx, &settings)
+		fixture.waitPost()
+		fixture.waitPost()
+	})
+	t.Run("a carrier's return", func(t *testing.T) {
+		fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+			fixture.carriers = []string{ExtenderCarrierTcp}
+		}, func(settings *ExtenderActivatorSettings) {
+			settings.CarrierReturnJitter = -1
+			settings.ReplacedPostJitter = 24 * 365 * time.Hour
+		})
+		fixture.waitFirstPass()
+		fixture.waitActivation()
+		fixture.waitActivation()
+		fixture.step(time.Minute)
+		fixture.activator.Close()
+		fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic)
+		fixture.activator.CarriersChanged()
+		settings := *fixture.activatorSettings
+		settings.PreviousState = fixture.activator.State()
+		fixture.activator = NewExtenderActivator(fixture.activatorCtx, &settings)
+		fixture.waitPost()
+		fixture.waitPost()
+	})
 }
 
 // What another identity's activation held says nothing of this one: it starts as a

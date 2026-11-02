@@ -36,7 +36,7 @@ For peer review. Written 2026-11-01.
 - on a network change, and on `Reactivate`;
 - when the hourly address check (`AddressCheckTimeout`, 1 h) sees a moved address;
 - when the tcp carrier returns, for a family whose post came due while it was gone (`TcpCarrierReturned`), within 5 minutes (`CarrierReturnJitter`);
-- when a carrier returns that a family's last post left off, within the same 5 minutes (`CarriersChanged`).
+- when a carrier returns that a family's last post left off, within the same 5 minutes, if it is still serving then (`CarriersChanged`).
 
 A replaced role is not a start: its activator continues from the old one's schedules and status (`ExtenderActivator.State`), so a hold stands, and a family that stands activated is posted once more within the hour (`ReplacedPostJitter`). Only a new process, or the role being turned off and on, starts every family due.
 

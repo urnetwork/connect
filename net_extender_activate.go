@@ -454,6 +454,8 @@ type ExtenderActivatorState struct {
 	extenderId           Id
 	helloAddresses       map[int]netip.Addr
 	nextAddressCheckTime time.Time
+	forcedActivate       bool
+	carriersChanged      bool
 }
 
 // What the activator that replaces this one continues from
@@ -470,6 +472,8 @@ func (self *ExtenderActivator) State() *ExtenderActivatorState {
 		extenderId:           self.extenderId,
 		helloAddresses:       maps.Clone(self.helloAddresses),
 		nextAddressCheckTime: self.nextAddressCheckTime,
+		forcedActivate:       self.forcedActivate,
+		carriersChanged:      self.carriersChanged,
 	}
 	for key, schedule := range self.schedules {
 		state.schedules[key] = *schedule
@@ -511,6 +515,10 @@ func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 			continue
 		}
 		*schedule = previousSchedule
+		// a post owed only for a carrier is the new role's to make as any other, since
+		// it owes a post anyway
+		schedule.carrierPostTime = time.Time{}
+		schedule.carrierTickTime = time.Time{}
 		if schedule.carrierHeld || !schedule.nextActivateTime.After(now) {
 			schedule.nextActivateTime = now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
 		} else if self.scheduleActivated(key) {
@@ -524,6 +532,9 @@ func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 	self.extenderId = previous.extenderId
 	self.helloAddresses = maps.Clone(previous.helloAddresses)
 	self.nextAddressCheckTime = previous.nextAddressCheckTime
+	// a trigger that landed just ahead of the close, which no pass has acted on
+	self.forcedActivate = previous.forcedActivate
+	self.carriersChanged = previous.carriersChanged
 }
 
 // Whether the family of a schedule stands activated. The one schedule of the plain
@@ -561,6 +572,26 @@ type extenderActivateSchedule struct {
 	// (CarriersChanged).
 	postedCarriers []string
 	postedDnsPorts []int
+	// set while the next post is owed only for a carrier off the record: when that
+	// post goes, and when the family would be posted without it
+	// (scheduleFamiliesMissingACarrier). A trigger that moves the next post leaves
+	// them behind, which is what says the post is no longer only for the carrier.
+	carrierPostTime time.Time
+	carrierTickTime time.Time
+}
+
+// Whether the next post is owed only for a carrier off the record.
+func (self *extenderActivateSchedule) owedOnlyForACarrier() bool {
+	return !self.carrierPostTime.IsZero() && self.nextActivateTime.Equal(self.carrierPostTime)
+}
+
+// Whether what is serving has anything the family's standing post did not offer.
+func (self *extenderActivateSchedule) missesACarrier(carriers []string, dnsPorts []int) bool {
+	if self.postedCarriers == nil {
+		return false
+	}
+	return extenderActivateOffersMore(carriers, self.postedCarriers) ||
+		extenderActivateOffersMore(dnsPorts, self.postedDnsPorts)
 }
 
 // After a success: the family's next post is its tick, and its hold is back to
@@ -884,6 +915,7 @@ func (self *ExtenderActivator) run() {
 			}
 		}
 
+		self.skipCarrierPostsNotOwed(now)
 		if due := self.dueScheduleKeys(now); 0 < len(due) {
 			self.activate(now, due)
 		}
@@ -926,6 +958,8 @@ func (self *ExtenderActivator) run() {
 				}
 				for _, schedule := range self.schedules {
 					schedule.nextActivateTime = pullForward(schedule.nextActivateTime)
+					schedule.carrierPostTime = pullForward(schedule.carrierPostTime)
+					schedule.carrierTickTime = pullForward(schedule.carrierTickTime)
 				}
 				self.nextAddressCheckTime = pullForward(self.nextAddressCheckTime)
 				self.log.Infof("[extender]activate resumed after %s asleep\n", sleep.Round(time.Second))
@@ -1007,16 +1041,36 @@ func (self *ExtenderActivator) scheduleFamiliesMissingACarrier(now time.Time) {
 	carriers := self.carriers()
 	dnsPorts := self.dnsPorts()
 	for _, schedule := range self.schedules {
-		if schedule.postedCarriers == nil {
-			continue
-		}
-		if !extenderActivateOffersMore(carriers, schedule.postedCarriers) &&
-			!extenderActivateOffersMore(dnsPorts, schedule.postedDnsPorts) {
+		if !schedule.missesACarrier(carriers, dnsPorts) {
 			continue
 		}
 		postTime := now.Add(uniformJitter(self.settings.CarrierReturnJitter, self.settings.postJitterForTest))
-		if postTime.Before(schedule.nextActivateTime) {
-			schedule.nextActivateTime = postTime
+		if !postTime.Before(schedule.nextActivateTime) {
+			continue
+		}
+		if !schedule.owedOnlyForACarrier() {
+			schedule.carrierTickTime = schedule.nextActivateTime
+		}
+		schedule.nextActivateTime = postTime
+		schedule.carrierPostTime = postTime
+	}
+}
+
+// Puts a family back on its tick whose post has come due, was owed only for a carrier
+// off the record, and that carrier has gone again. The post could not name it. A
+// carrier that binds and dies at once would otherwise post at each return, each post
+// as short of it as the last: a review measured 12 posts an hour for each family,
+// indefinitely, where the tick is one a day.
+func (self *ExtenderActivator) skipCarrierPostsNotOwed(now time.Time) {
+	carriers := self.carriers()
+	dnsPorts := self.dnsPorts()
+	for _, schedule := range self.schedules {
+		if schedule.owedOnlyForACarrier() &&
+			!now.Before(schedule.nextActivateTime) &&
+			!schedule.missesACarrier(carriers, dnsPorts) {
+			schedule.nextActivateTime = schedule.carrierTickTime
+			schedule.carrierPostTime = time.Time{}
+			schedule.carrierTickTime = time.Time{}
 		}
 	}
 }
@@ -1290,6 +1344,8 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		schedule.carrierHeld = false
 		schedule.postedCarriers = nil
 		schedule.postedDnsPorts = nil
+		schedule.carrierPostTime = time.Time{}
+		schedule.carrierTickTime = time.Time{}
 		switch outcome := outcomes[i]; {
 		case outcome == extenderActivateCarrierHeld:
 			schedule.holdForCarrier(now, self.settings)
