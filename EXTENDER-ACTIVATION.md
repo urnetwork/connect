@@ -17,7 +17,7 @@ For peer review. Written 2026-11-01, status updated 2026-11-02. §2.2 and §3 de
 - **What activation is:** each extender tells the operator, per address family (IPv4, IPv6), that it serves at that family's address. The operator probes the address, records it, and publishes a signed record to the directory, which clients read.
 - **What Main showed (2026-11-01):**
   - The median extender wrote 2 activation rows in 24 h; p90 was 14 and p99 53.
-  - The healthy network `01994645` wrote 74 rows for its 74 extenders.
+  - A healthy network wrote 74 rows for its 74 extenders.
   - The excess has five drivers (§3). Two are bugs in connect's activator. One is host instability. One is our probe and revocation loop. One is a deployment that shares one identity among many clients.
 - **The fix fixes the two activator bugs:**
   - Each family gets its own schedule and backoff.
@@ -69,7 +69,7 @@ The defaults are in `DefaultExtenderActivatorSettings`.
 
 **The model** is `model/network_extender_model.go` `ActivateNetworkExtender` (l.512).
 - `network_extender` is upserted by key: `ON CONFLICT (public_key) DO UPDATE SET network_id, client_id, …, country_code, active = true` (l.557).
-  - Any client holding the key can take the row over (§3, item 5).
+  - Key ownership is enforced here at activation (§3, item 5; §5 item 4).
   - `country_code` is one column both families write, so the family that posted last wins.
 - `network_extender_address` is upserted per family, and the upsert resets `consecutive_probe_failures = 0` (l.626).
 - Every activation writes a `network_extender_activation` row: ip_version, a peppered hash of the address, location ids, accuracy. It never stores the raw address.
@@ -87,7 +87,7 @@ The numbers come from `network_extender_activation`, `network_user_action_attemp
 
 ### Item 1. Restart loops (host)
 
-Saginaw `01a17c4f`, US, network `01983769`: 51 rows in 24 h, about 26 passes.
+A high-load host on one operator's network: 51 rows in 24 h, about 26 passes.
 - **Every attempt succeeded:** all 55 attempts. It has had no probe failures and no revocation since Oct 28. Its address hashes and country never changed.
 - **Every pass from 13:15 to 20:53Z followed one sequence:** both platform connections retire, then 1.5 to 11 min later a pass runs, then new connections arrive 4 s after it. Fleet-wide over the same window, 523 of 590 passes ran while the process stayed connected.
 - **One stall, captured with probes every 20 s:**
@@ -97,15 +97,15 @@ Saginaw `01a17c4f`, US, network `01983769`: 51 rows in 24 h, about 26 passes.
   - a pass ran at 21:08:15, and TLS answered at 21:08:18.
 
   A lag.dev health-check timeout at 19:59:18 fits the same pattern.
-- **It tracks provider load.** On Nov 1 Saginaw carried 8k–34k contracts an hour from up to 29k sources. It ran 15 h without restarting at 3k–9k an hour. Its 7 siblings on the network carry about 5–40 an hour together, and never restart.
-- **Others in loops:** `01a18c5e` entered the same loop after a surge to 12.8k contracts an hour. `01a1904e` (hk, since deactivated) restarted every ~3 min with almost no load.
+- **It tracks provider load.** On Nov 1 the host carried 8k–34k contracts an hour from up to 29k sources. It ran 15 h without restarting at 3k–9k an hour. Its 7 siblings on the network carry about 5–40 an hour together, and never restart.
+- **Others in loops:** a second host entered the same loop after a surge to 12.8k contracts an hour. A near-idle host (since deactivated) restarted every ~3 min with almost no load.
 - **Likely cause:** memory exhaustion followed by an OOM kill. The miner sets only a soft Go limit of 4/5 of host memory (`sn/miner/provider_memory.go`), and its systemd unit is `Restart=on-failure` with no watchdog. Unconfirmed: we have no host logs.
-- **Impact:** about 28 stalls on Nov 1, each 2–15 min with TLS timing out on both families. lag.dev tickets issued within 15 min before a restart got results 29 of 47 times, against 39 of 50 otherwise. Saginaw published 62 records in 24 h, against 4.6 per extender on the healthy network.
+- **Impact:** about 28 stalls on Nov 1, each 2–15 min with TLS timing out on both families. lag.dev tickets issued within 15 min before a restart got results 29 of 47 times, against 39 of 50 otherwise. The host published 62 records in 24 h, against 4.6 per extender on the healthy network.
 
 ### Item 2. Activator: a refused family re-posts the working one (fixed by this branch)
 
 `FamilySupported(4)` counts a private RFC 1918 address as v4, so a NAT'd host tries v4 every pass, and the operator refuses it every time.
-- **What the old rule did:** the refusal held the whole pass, so the working family was re-posted at 10, 20, 40, 80, 160 and 320 min, then every 6 h. Example: `01a17d0b` posts at 01:01:47, 07:01:47, 13:01:47 and 19:01:47 daily.
+- **What the old rule did:** the refusal held the whole pass, so the working family was re-posted at 10, 20, 40, 80, 160 and 320 min, then every 6 h. Example: a NAT'd host posts at 01:01:47, 07:01:47, 13:01:47 and 19:01:47 daily.
 - **Scale:** 19 extenders had one family always refused. They wrote 70 rows in 24 h instead of about 19, plus 62 refused attempts, each costing the operator a probe of a dead address.
 
 ### Item 3. Activator: the hourly check flips family (fixed by this branch)
@@ -114,22 +114,22 @@ The hello goes to the plain dual-stack url, so it arrives over v4 one hour and v
 - The old check saw a moved address each time and ran a full pass.
 - From 13:15 to 20:50Z, 79 passes on dual-stack hosts came right after a fully successful pass, excluding passes after a revocation. 45 of them came a whole number of hours after the previous pass, on 26 extenders: about 140 a day.
 - The existing test `TestExtenderActivatorReactivatesOnAddressChange` covered one family only.
-- Example, France `01a146e9`: low load and an unbroken connection. An hourly-check pass found v6 refused that one time, which started a 10/20/40 min chain of v4 re-posts: 11 v4 rows against 2 v6 in a day.
+- Example, a low-load dual-stack host with an unbroken connection: an hourly-check pass found v6 refused that one time, which started a 10/20/40 min chain of v4 re-posts: 11 v4 rows against 2 v6 in a day.
 
 ### Item 4. Probe revocation, then immediate re-activation
 
-- **Scale:** 183 revocations in 24 h across 65 extenders; 174 were on network `01979e1c`. 57 were re-activated within 15 min.
-- **Example:** `01a18644` was revoked 18 times in 14 h, each 33–36 min after its last activation. The activation probe passes, then six uptime probes in a row fail.
+- **Scale:** 183 revocations in 24 h across 65 extenders; 174 were on one large operator's network. 57 were re-activated within 15 min.
+- **Example:** one host was revoked 18 times in 14 h, each 33–36 min after its last activation. The activation probe passes, then six uptime probes in a row fail.
 - **Background failure rate:** each probe sweep fails 59–82 of about 430 addresses.
 - **Why it loops:** a revocation is the only way the operator tells an extender to re-activate, and the extender does so at once.
 
 ### Item 5. One identity shared by many clients
 
-- **Scale:** on network `01990418`, 63 provider clients connect from one IPv4 for extender `01a1871a`. 32 of them posted 142 v4 activations of that one key in 24 h, and 110 succeeded.
+- **Scale:** on a shared-identity network, 63 provider clients connect from one IPv4 for one extender. 32 of them posted 142 v4 activations of that one key in 24 h, and 110 succeeded.
 - **Symptom:** the row's `client_id` changes hands; it was seen changing between two reads. Across the network, 4 extenders got 162 activations a day from other clients.
-- **What allows it:**
+- **What allowed it (before the activation-time ownership check, §2.2, §5 item 4):**
   - the sn miner gives every slot the same `.provider.extender.key`;
-  - the operator lets any client re-activate a key (§2.2).
+  - the operator did not yet enforce key ownership when a client re-activated a key.
 
 ### Side effects worth knowing
 
@@ -180,7 +180,7 @@ The hello goes to the plain dual-stack url, so it arrives over v4 one hour and v
 - **A refusal that names a wait** (`retry_after_seconds`: a spent activation budget, or a busy operator) takes priority over the one-day hold, whether or not the family is private, because the operator probed nothing, so the refusal says nothing about whether a NAT forwards. The family waits out the named wait instead. The owner's rule still covers refusals where the operator did probe (G3, `TestExtenderActivatorWaitsTheRetryAfterOfAPrivateFamily`).
 - **A request that fails,** rather than a refusal, uses the backoff whether or not the family has activated.
 - **An interface table that can't be read** counts as public here (`ipVersionPublic`, `familyPublicReadable` `control_family.go`), so it never lengthens a hold. `FamilyPublic` itself still fails closed.
-- **Why not skip private families entirely:** that would cut off every host whose only v4 is private but does forward 443, such as home routers and docker-bridge providers with published ports. EXTENDER.md C2a and S plan for NAT hosts, including later UPnP/PCP mapping. Main has such candidates today: `orochimura`, whose v4 serves only tcp, and `ur712`, which is v4 only.
+- **Why not skip private families entirely:** that would cut off every host whose only v4 is private but does forward 443, such as home routers and docker-bridge providers with published ports. EXTENDER.md C2a and S plan for NAT hosts, including later UPnP/PCP mapping. Main has such candidates today: one host whose v4 serves only tcp, and another that is v4 only.
 - **The owner agreed to this on 2026-11-01.** Skipping instead is a one-line change in `activateFamily`: return skipped when `!ipVersionPublic`.
 
 ### 4.3 Tests
@@ -237,8 +237,8 @@ Main wrote 795 rows from 13:15 to 22:15Z, about 2,100 a day.
 | — hour-aligned passes from the family flip | 129 per 9 h |
 | — re-posts during the other family's hold | 112 per 9 h |
 | Hosts with one family always refused (19) | 70 a day to about 19, and refused attempts to one a day plus one per restart |
-| France `01a146e9` | about 13 a day to about 2 |
-| Restart loops, revocation loops, network `01990418` | unchanged |
+| A low-load dual-stack host | about 13 a day to about 2 |
+| Restart loops, revocation loops, shared-identity network | unchanged |
 
 ### 4.5 Rollout
 
@@ -258,7 +258,7 @@ Main wrote 795 rows from 13:15 to 22:15Z, about 2,100 a day.
 
 **Open.** The server stores each activation's run (§7), but nothing sends one until a miner release, which hasn't been cut. None of the steps below has a result yet.
 
-- Ask the operators of networks `01983769` and `01979e1c` for `journalctl`, `dmesg` (OOM) and host memory.
+- Ask the operators of the two affected networks for `journalctl`, `dmesg` (OOM) and host memory.
 - Profile the provider at about 20k sources an hour.
 - The miner's supervisor (`operators_supervisor.go`) restarts every child when the memory share changes. Rule that out as a cause. Its restarts report `stop` (§7).
 - **Record how each run ended on a systemd host.** Run ids and, under a supervisor, exit reasons are built (§7), but the installed unit runs plain `provider start` with no supervisor (`sn/miner/cli_service.go`), so most hosts report no exit. The unit could add an `ExecStopPost=` that records `URNETWORK_PREVIOUS_EXIT` from `$SERVICE_RESULT` for the next start, with `oom-kill` mapping to `oom`. Only systemd knows that result, and it's the one source of `oom`. It only reaches hosts whose unit gets rewritten: the unit is written by `provider service install`, so updating the binary leaves an installed unit as it is.
@@ -267,7 +267,7 @@ Main wrote 795 rows from 13:15 to 22:15Z, about 2,100 a day.
 
 **Diagnosis started; the options below are undecided.** Since 2026-11-02 15:55Z the uptime probe logs a `[extenderprobe]diagnostic` line for a failing address, at most once an hour. The first 11 lines were 8 `tls_no_answer` and 3 `timeout`, with no `admission_limited` or `closed_before_tls`. Those sweeps failed only 1 to 6 of about 212 addresses, because the hosts that had been failing were already revoked, and the lines say nothing about those. By about 20:40Z sweeps failed 0 to 6 of about 228 addresses, so the loop may have shrunk. Why uptime probes fail right after a passing activation probe is still unknown, and the choice below waits on more of these lines.
 
-- **Diagnose first:** find out why uptime probes fail right after a passing activation probe on about 56 hosts on `01979e1c`. Log probe errors at V(1) for those addresses for a while, and check A12 admission (8 actions per subnet per minute, `connect/extender/extender.go` l.115).
+- **Diagnose first:** find out why uptime probes fail right after a passing activation probe on about 56 hosts on the large operator's network. Log probe errors at V(1) for those addresses for a while, and check A12 admission (8 actions per subnet per minute, `connect/extender/extender.go` l.115).
 - **Then one of:**
   - **Operator side:** after a probe revocation, store the re-activation but publish its record only after the next uptime probe passes (`model/network_extender_model.go`, `taskworker/work/extender_probe_work.go`).
   - **Extender side:** re-activate after a revocation on the backoff instead of at once (`observeRevocation`).
@@ -277,7 +277,7 @@ Main wrote 795 rows from 13:15 to 22:15Z, about 2,100 a day.
 
 **Status:**
 - **Miner: merged, not released** (sn `8b9b910e`). A miner with a proxy file then runs no extender, and whether a proxy run should have one slot is undecided. That is the owner's to decide before a miner release. One slot per proxy run is recommended.
-- **Operator: live since 2026-11-02 18:59Z** (server `3e4d2a32d`). Activation no longer moves a key across networks. Moves inside a network still happen, and a takeover rule for those is undecided. A candidate is with the owner, and none is merged.
+- **Operator: live since 2026-11-02 18:59Z** (server `3e4d2a32d`). Key ownership is enforced at activation: activation no longer moves a key across networks. A takeover rule for legitimate re-registration within an operator is still being decided; a candidate is with the owner, and none is merged.
 
 The original proposal:
 - **Miner:** only the direct slot runs the extender role (`sn/miner/run.go`, `provideWithProxy`).
@@ -309,7 +309,7 @@ It makes deactivation stricter, so deactivations and revocations still need comp
 3. **Private families:** is one try at start and one a day, until the family first activates, right, or should NAT'd families be skipped outright (§4.2)? Unanswered. The owner's decision in §4.2 stands meanwhile.
 4. **Concurrency:** check the shared state between `run`, `observeRevocation`, `Reactivate` and the network-change observer, and the timer resets. Run the new tests with `-race`. Unanswered.
 5. **§5 item 3:** for the revocation loop, do you prefer the operator-side fix or the extender-side one? Unanswered, and the diagnosis in §5 item 3 comes first.
-6. **§5 item 4:** what takeover rule would you accept for a key that moves between clients? Unanswered. Activation no longer moves a key across networks, so this now concerns moves inside a network.
+6. **§5 item 4:** what takeover rule would you accept for legitimate re-registration of a key? Unanswered. Key ownership is enforced at activation, so this now concerns re-registration within an operator.
 7. **§5 item 5:** should activation keep resetting the probe-failure count? Decided and shipped: not for an address still active on the same IP (§5 item 5).
 
 ## 7. The run on each activation (merged; no extender sends one yet)
@@ -382,12 +382,12 @@ order by first_activate_time;
 
 ## 8. The Nov 1 fleet drop
 
-Network `01979e1c` fell from about 190 active extenders to 58, starting about 20:00Z on Nov 1. 147 were revoked from then on, and 131 of those kept posting. By 20:41Z on Nov 2 it was back to 71, for reasons not established.
+One large operator's network fell from about 190 active extenders to 58, starting about 20:00Z on Nov 1. 147 were revoked from then on, and 131 of those kept posting. By 20:41Z on Nov 2 it was back to 71, for reasons not established.
 
 - **Probably:** one carrier failure closed every carrier (EXTENDER.md G2). The measured state fits: the process up and still posting, connected to the platform, with TCP 443 and UDP 53 closed, while status read as listening. On the old code, a real EMFILE reproduces it. No host log confirms it, and which failure fired is unknown. The old processes' journals should show `[extender] accept error`, `[extender] udp carrier`, `[pt]write err` or `Unexpected error`, so get them before restarting a host.
-- **Not the activation budget.** Budget refusals came in waves from two other networks with no extenders: `01983c4d` (14,150 active clients, then all removed at 14:02Z on Nov 2) and `01984483` (2,430). A batch of clients started together posts together at +10, +30, +70, +150, +310 and +630 min, about 3,300 refused in a 3-minute wave. `01979e1c` sat at about 40 to 57 of its 60 an hour in those windows. A refused post leaves no row, so the refused account is the one whose rolling hour reads exactly 60. Tested in advance: `01984483` spent exactly 60 at 16:30:03-05Z on Nov 2, its midnight series' +990. The per-host budget (connect#230) is right for a proven fleet restarting, and it left `01979e1c` flat for an hour; it had climbed to 70 by 19:21Z, for reasons not established.
+- **Not the activation budget.** Budget refusals came in waves from two other networks with no extenders (about 14,150 and 2,430 active clients; the first removed all of them at 14:02Z on Nov 2). A batch of clients started together posts together at +10, +30, +70, +150, +310 and +630 min, about 3,300 refused in a 3-minute wave. The affected network sat at about 40 to 57 of its 60 an hour in those windows. A refused post leaves no row, so the refused account is the one whose rolling hour reads exactly 60. Tested in advance: the second network spent exactly 60 at 16:30:03-05Z on Nov 2, its midnight series' +990. The per-host budget (connect#230) is right for a proven fleet restarting, and it left the affected network flat for an hour; it had climbed to 70 by 19:21Z, for reasons not established.
 - **The fix:** each carrier now recovers on its own, and no activation is posted while TCP is lost. It merged in two parts: connect `6203a4e8` with sdk `826df3eb`, then the follow-ups in connect `c4c99031` with sdk `2ae5419a`. **Status (2026-11-02):** neither part has reached a provider. That takes a miner release, which hasn't been cut, and hosts already down need a restart either way. `alt` has had the first part since 18:59Z, and a server release with the follow-ups, `2026.11.2-outerwerld-1088515650`, is built and not deployed. The fix doesn't cover hosts that time out rather than refuse (10 of 47 sampled), hosts where TLS stalls after TCP connects (4 of 12 failing active addresses), or addresses that only the uptime probe finds failing (7 of those 12).
-- **A remote kill it closed on `alt`:** before connect `6203a4e8`, about 40 datagrams from a raw sender with source port 0 could end a server-mode translation's socket, and losing a listener ends the `alt` process. A failed write now costs one datagram, and a socket whose writes all fail stays up. Don't roll `alt` back past 2026.11.2-outerwerld+1088438700.
+- **A remote availability defect it closed on `alt`:** before connect `6203a4e8`, a lost listener ended the `alt` process, and older builds can lose one to unauthenticated remote input. The fix keeps the listener up. The trigger and the measured threshold are in the operator's records. **Don't roll `alt` back past 2026.11.2-outerwerld+1088438700; older builds have this known remote availability defect.**
 
 ## Appendix: reproducing the numbers (Main, read-only)
 
