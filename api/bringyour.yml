@@ -19844,6 +19844,33 @@ components:
             activation without it and with `measurement_csr` makes the
             extender eligible again.
           type: boolean
+        run_id:
+          description: |
+            The run of the extender process that posted this activation
+            (EXTENDER.md G3): 32 hex characters of 128 random bits drawn once
+            when the process starts, so every activation of one process carries
+            the same id and a restart a new one. The three run fields are
+            optional, and a well-typed one never refuses an activation: each is
+            stored on the activation's history row when it is well formed, and
+            as null otherwise.
+          type: string
+        run_start_time:
+          description: |
+            When that process started, in UTC. Stored when it is no earlier
+            than 2026-11-01 and no later than an hour past the operator's
+            clock.
+          type: string
+          format: date-time
+        previous_exit:
+          description: |
+            How the run before it ended, as the host that restarted the process
+            reported it: `oom`, `stop` when the host stopped it on purpose, the
+            signal that ended it (`sigkill`, `sigterm`, `sigint`, `sighup`,
+            `sigquit`, `sigabrt`, `sigsegv`, `sigbus`, `sigill`, `sigfpe`,
+            `sigtrap`, `sigpipe`, `sigalrm`, or `signal` for another), or
+            `exit-<code>` for an exit code from 0 to 255. Omitted when the host
+            reported none.
+          type: string
 
     ExtenderActivateResult:
       type: object
