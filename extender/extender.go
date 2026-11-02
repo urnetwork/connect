@@ -362,9 +362,22 @@ type ExtenderSettings struct {
 	// one it does nothing. ExtenderCamouflageSplice is the Phase-A -> B flip
 	// (P3): off, an unauthenticated hello is terminated as today; on, it is
 	// spliced to the real borrowed site. Meaningful only while
-	// CamouflageEnabled, off by default and the legacy-safe posture.
+	// CamouflageEnabled, off by default and the legacy-safe posture. It is the
+	// posture until SetCamouflageSplice sets one at run time, which then wins
+	// over it, so a Phase B cohort rolls back to Phase A for new connections
+	// without a restart (EXTENDER-UPDATE2 §3.3).
 	CamouflageEnabled        bool
 	ExtenderCamouflageSplice bool
+	// CamouflageSpliceGate, when set, is an extra admission gate on the splice
+	// (EXTENDER-UPDATE2 §3.2): splicing runs only while it returns true, even
+	// when the posture is on. A role that splices sets this to the Open of an
+	// ExtenderCamouflageSpliceSettle fed from its activations, the safe-flip
+	// rule: its own record carries the camouflage key and requires
+	// tcp-camouflage-v1, and has for at least one record lifetime, so legacy
+	// clients' records issued without the requirement have expired. Nil applies
+	// no extra gate, which is the posture flag alone. It runs on the accept
+	// path, must not block, and is read once per unauthenticated hello.
+	CamouflageSpliceGate func() bool
 	// The tolerated clock skew each way of a sealed hello time (P1); a client
 	// outside it is not authenticated. <= 0 takes the default.
 	ExtenderCamouflageTimeWindow time.Duration
@@ -490,6 +503,20 @@ type ExtenderServer struct {
 	camouflageTimeWindowFailedCount atomic.Int64
 	camouflageSpliceDialFailedCount atomic.Int64
 	camouflageBorrowVerifyFailCount atomic.Int64
+	// the degraded-state tell of §3.3: splice is on but no borrowed target was
+	// reachable, so the hello was terminated and shown the old self-signed
+	// probe response. Counted apart from the Phase-A terminate above, since
+	// that one is the intended posture and this one is exposure.
+	camouflageSpliceFallbackTerminatedCount atomic.Int64
+
+	// the runtime splice posture (EXTENDER-UPDATE2 §3.3): until
+	// SetCamouflageSplice sets one, the posture is the ExtenderCamouflageSplice
+	// setting, read on each accept as it was before the runtime flip existed,
+	// so a setting made before the server serves still applies. Once set, it
+	// wins over the setting. Read on each accept so a rollback changes only
+	// new connections. The gate is the extra admission condition
+	// CamouflageSpliceGate, read beside it.
+	camouflageSpliceOverride atomic.Int32
 
 	allowedSecrets []string
 	// exact (x) or wildcard (*.x)
@@ -1524,11 +1551,17 @@ func (self *ExtenderServer) Stats() ExtenderStats {
 	}
 }
 
-// The three classifications the camouflage gives a peeked ClientHello (P3).
+// The classifications the camouflage gives a peeked ClientHello (P3).
+// SpliceFallbackTerminated is the degraded tell of §3.3: splice was on but no
+// borrowed target was reachable, so the hello was terminated and shown the old
+// probe response. It is kept apart from Terminated, the Phase-A intended
+// terminate, so a deployment in the degraded state is visible and never counted
+// as camouflage coverage.
 const (
-	ExtenderCamouflageOutcomeAuthenticated = "authenticated"
-	ExtenderCamouflageOutcomeSpliced       = "spliced"
-	ExtenderCamouflageOutcomeTerminated    = "terminated"
+	ExtenderCamouflageOutcomeAuthenticated            = "authenticated"
+	ExtenderCamouflageOutcomeSpliced                  = "spliced"
+	ExtenderCamouflageOutcomeTerminated               = "terminated"
+	ExtenderCamouflageOutcomeSpliceFallbackTerminated = "splice_fallback_terminated"
 )
 
 // ExtenderCamouflageOutcome is what the CamouflageHandler seam reports for one
@@ -1553,6 +1586,22 @@ type ExtenderCamouflageStats struct {
 	TimeWindowFailedCount int64
 	SpliceDialFailedCount int64
 	BorrowVerifyFailCount int64
+	// splice on, no borrowed target reachable: the degraded fallback terminate
+	// of §3.3, the one state that exposes the old probe response
+	SpliceFallbackTerminatedCount int64
+	// the per-borrowed-name splice load (§3.3): begins and relayed bytes since
+	// the server started, so a fleet telemetry can sum one target's load across
+	// extenders, which per-extender caps alone do not bound. Keyed on the
+	// lower-cased borrowed name. Empty until a splice runs.
+	TargetLoads map[string]ExtenderCamouflageTargetLoad
+}
+
+// ExtenderCamouflageTargetLoad is one borrowed site's cumulative splice load on
+// this extender (§3.3): how many splices began to it and how many bytes were
+// relayed through them, each way summed.
+type ExtenderCamouflageTargetLoad struct {
+	SpliceCount      int64
+	RelayedByteCount int64
 }
 
 // A snapshot of the camouflage counts (P7). Each counter is read independently,
@@ -1567,7 +1616,158 @@ func (self *ExtenderServer) CamouflageStats() ExtenderCamouflageStats {
 		TimeWindowFailedCount: self.camouflageTimeWindowFailedCount.Load(),
 		SpliceDialFailedCount: self.camouflageSpliceDialFailedCount.Load(),
 		BorrowVerifyFailCount: self.camouflageBorrowVerifyFailCount.Load(),
+
+		SpliceFallbackTerminatedCount: self.camouflageSpliceFallbackTerminatedCount.Load(),
+		TargetLoads:                   self.camouflageTargetLoads(),
 	}
+}
+
+// The per-borrowed-name splice load, empty when the server has no camouflage or
+// nothing has been spliced yet.
+func (self *ExtenderServer) camouflageTargetLoads() map[string]ExtenderCamouflageTargetLoad {
+	if self.camouflage == nil {
+		return map[string]ExtenderCamouflageTargetLoad{}
+	}
+	return self.camouflage.targetLoads()
+}
+
+// SetCamouflageSplice flips the runtime splice posture (EXTENDER-UPDATE2 §3.3):
+// on moves the cohort to Phase B, off rolls it back to Phase A. It takes effect
+// for connections accepted after it returns; splices already relaying keep
+// running. It does nothing structural when camouflage is off — the posture is
+// read only while CamouflageEnabled — but the value is retained. Once called,
+// the posture no longer follows the ExtenderCamouflageSplice setting.
+func (self *ExtenderServer) SetCamouflageSplice(on bool) {
+	if on {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOn)
+	} else {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOff)
+	}
+}
+
+// The values of the runtime splice posture (camouflageSpliceOverride).
+const (
+	// follow the ExtenderCamouflageSplice setting
+	extenderCamouflageSpliceFollowSetting int32 = iota
+	extenderCamouflageSpliceOverrideOn
+	extenderCamouflageSpliceOverrideOff
+)
+
+// CamouflageSplice reports the current runtime splice posture: the one
+// SetCamouflageSplice set, else the ExtenderCamouflageSplice setting.
+func (self *ExtenderServer) CamouflageSplice() bool {
+	switch self.camouflageSpliceOverride.Load() {
+	case extenderCamouflageSpliceOverrideOn:
+		return true
+	case extenderCamouflageSpliceOverrideOff:
+		return false
+	default:
+		return self.settings.ExtenderCamouflageSplice
+	}
+}
+
+// Whether the splice admits a hello now (EXTENDER-UPDATE2 §3.2, §3.3): the
+// runtime posture is on and the optional record gate, when set, allows it.
+func (self *ExtenderServer) camouflageSpliceEnabled() bool {
+	if !self.CamouflageSplice() {
+		return false
+	}
+	if gate := self.settings.CamouflageSpliceGate; gate != nil {
+		return gate()
+	}
+	return true
+}
+
+// The phases of the camouflage a deployment is in (EXTENDER-UPDATE2 §3.2, §3.3).
+const (
+	// camouflage off, or no identity key: legacy posture, no authenticated path
+	ExtenderCamouflagePhaseOff = "off"
+	// authenticated hellos recognized, unauthenticated hellos terminated
+	ExtenderCamouflagePhaseAuthenticatedRollout = "authenticated_rollout"
+	// splicing unauthenticated hellos to borrowed sites
+	ExtenderCamouflagePhaseSplicePilot = "splice_pilot"
+)
+
+// ExtenderCamouflageStatus is whether this extender actually provides camouflage
+// coverage right now (EXTENDER-UPDATE2 §3.3). Covered is true only in the splice
+// pilot with verified borrowed targets and no running degraded fallback; it is
+// deliberately conservative, so a degraded deployment is never reported as
+// successful coverage.
+type ExtenderCamouflageStatus struct {
+	// off, authenticated_rollout or splice_pilot
+	Phase string
+	// whether the server publishes a camouflage key and recognizes tags
+	Enabled bool
+	// the runtime splice posture
+	SpliceOn bool
+	// whether the record gate (CamouflageSpliceGate), if set, currently allows
+	// the splice
+	SpliceGateOpen bool
+	// borrowed names verified and available to splice to
+	VerifiedTargetCount int
+	// splice was on but a hello found no reachable target and was terminated
+	SpliceFallbackTerminatedCount int64
+	// splice-target dial failures
+	SpliceDialFailedCount int64
+	// the honest answer: does this extender currently present real-site
+	// behavior to a prober. False whenever it is not in the splice pilot, has
+	// no verified target, or has fallen back to terminate.
+	Covered bool
+	// why Covered is false, for status and telemetry
+	DegradedReason string
+}
+
+// The degraded reasons of ExtenderCamouflageStatus.
+const (
+	ExtenderCamouflageDegradedNone             = ""
+	ExtenderCamouflageDegradedCamouflageOff    = "camouflage_off"
+	ExtenderCamouflageDegradedSpliceOff        = "splice_off"
+	ExtenderCamouflageDegradedGateClosed       = "splice_gate_closed"
+	ExtenderCamouflageDegradedNoVerifiedTarget = "no_verified_target"
+	ExtenderCamouflageDegradedFallbackActive   = "splice_fallback_active"
+)
+
+// CamouflageStatus reports whether this extender provides camouflage coverage
+// now (§3.3). A deployment that has fallen back to legacy termination — splice
+// on but no reachable target — is reported degraded, never as coverage.
+func (self *ExtenderServer) CamouflageStatus() ExtenderCamouflageStatus {
+	enabled := self.camouflage != nil && self.settings.CamouflageEnabled && self.camouflage.staticPrivateKey != nil
+	spliceOn := self.CamouflageSplice()
+	gateOpen := true
+	if gate := self.settings.CamouflageSpliceGate; gate != nil {
+		gateOpen = gate()
+	}
+	status := ExtenderCamouflageStatus{
+		Enabled:                       enabled,
+		SpliceOn:                      spliceOn,
+		SpliceGateOpen:                gateOpen,
+		SpliceFallbackTerminatedCount: self.camouflageSpliceFallbackTerminatedCount.Load(),
+		SpliceDialFailedCount:         self.camouflageSpliceDialFailedCount.Load(),
+	}
+	if self.camouflage != nil {
+		status.VerifiedTargetCount = self.camouflage.verifiedTargetCount()
+	}
+	switch {
+	case !enabled:
+		status.Phase = ExtenderCamouflagePhaseOff
+		status.DegradedReason = ExtenderCamouflageDegradedCamouflageOff
+	case !spliceOn:
+		status.Phase = ExtenderCamouflagePhaseAuthenticatedRollout
+		status.DegradedReason = ExtenderCamouflageDegradedSpliceOff
+	case !gateOpen:
+		status.Phase = ExtenderCamouflagePhaseAuthenticatedRollout
+		status.DegradedReason = ExtenderCamouflageDegradedGateClosed
+	case status.VerifiedTargetCount == 0:
+		status.Phase = ExtenderCamouflagePhaseSplicePilot
+		status.DegradedReason = ExtenderCamouflageDegradedNoVerifiedTarget
+	case 0 < status.SpliceFallbackTerminatedCount:
+		status.Phase = ExtenderCamouflagePhaseSplicePilot
+		status.DegradedReason = ExtenderCamouflageDegradedFallbackActive
+	default:
+		status.Phase = ExtenderCamouflagePhaseSplicePilot
+		status.Covered = true
+	}
+	return status
 }
 
 // RealityPublicKey is the 32-byte X25519 static public key the record publishes

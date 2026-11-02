@@ -2416,6 +2416,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 
 	// the directory is an external object; it is read with no lock held
 	spoofDomains, spoofCountryCode := directorySpoofDomains(self.settings.ExtenderDirectory)
+	borrowCountryCode := directoryBorrowCountryCode(self.settings.ExtenderDirectory)
 
 	visitedExtenderIpProfiles := map[extenderIpProfile]bool{}
 	visitedExtenderIps := []netip.Addr{}
@@ -2482,7 +2483,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 		for _, ip := range ips {
 			extenderConfigs = append(
 				extenderConfigs,
-				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains)...,
+				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains, borrowCountryCode)...,
 			)
 		}
 	} else if directory := self.settings.ExtenderDirectory; directory != nil {
@@ -2510,7 +2511,7 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 					}
 					extenderConfigs = append(
 						extenderConfigs,
-						extenderConfigsForCandidate(candidates[i], "", spoofDomains)...,
+						extenderConfigsForCandidate(candidates[i], "", spoofDomains, borrowCountryCode)...,
 					)
 				}
 			}
@@ -2619,7 +2620,12 @@ func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*cl
 	if candidate == nil || !candidate.LimitedUntil.IsZero() {
 		return []*clientDialer{}
 	}
-	extenderConfigs := extenderConfigsForCandidate(candidate, secret, spoofDomains)
+	extenderConfigs := extenderConfigsForCandidate(
+		candidate,
+		secret,
+		spoofDomains,
+		directoryBorrowCountryCode(self.settings.ExtenderDirectory),
+	)
 
 	func() {
 		self.mutex.Lock()
@@ -2706,11 +2712,15 @@ func extenderDialerPriority(connectMode ExtenderConnectMode) int {
 // 4053 and 53 it does not. The identity key of a verified record is carried
 // into the config so the outer leaf is checked against it (B3). Each config
 // fronts with one random name of `spoofDomains`, the list in force
-// (directorySpoofDomains).
+// (directorySpoofDomains). The tcp config also carries the record's camouflage
+// key and the client's borrow country (borrowCountryCode, the directory's
+// SpoofCountryCode), so its dial fronts the camouflaged attempt with the name
+// the extender covers (EXTENDER-UPDATE2 §3.1, §3.2).
 func extenderConfigsForCandidate(
 	candidate *ExtenderCandidate,
 	secret string,
 	spoofDomains []string,
+	borrowCountryCode string,
 ) []*ExtenderConfig {
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile, dnsPorts []int) {
@@ -2720,13 +2730,18 @@ func extenderConfigsForCandidate(
 		if profile.Port <= 0 {
 			return
 		}
-		extenderConfigs = append(extenderConfigs, &ExtenderConfig{
+		extenderConfig := &ExtenderConfig{
 			Profile:   profile,
 			Ip:        candidate.Ip,
 			Secret:    secret,
 			PublicKey: slices.Clone(candidate.PublicKey),
 			DnsPorts:  dnsPorts,
-		})
+		}
+		if profile.ConnectMode == ExtenderConnectModeTcpTls {
+			extenderConfig.RealityPublicKey = slices.Clone(candidate.RealityPublicKey)
+			extenderConfig.CamouflageCountryCode = borrowCountryCode
+		}
+		extenderConfigs = append(extenderConfigs, extenderConfig)
 	}
 	for _, carrier := range candidate.Carriers {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)

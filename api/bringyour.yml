@@ -1799,11 +1799,22 @@ paths:
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
         attributed to a network and a client. It is rate limited per address
-        family: 6 per hour per client and 60 per hour per account, for IPv4
-        and for IPv6 each. A budget is spent only when the operator is about
-        to probe, so a request refused before the probe (malformed arguments,
-        the wrong family, a spent budget) costs nothing, and a refusal by a
-        spent budget says how long until it has room again. Call it on the
+        family, for IPv4 and for IPv6 each, over a trailing hour: 6 per
+        client; 6 per caller address (its /32 or /64), over every client and
+        every account; and per account 60 plus 6 for each proven host, at
+        most 1200. A proven host is an identity key of the account that
+        passed activation on that family between 1 hour and 7 days ago,
+        counted once per address and at most 32 per /24 or /48. A key the
+        account already proved at the caller's /32 or /64 spends 6 an hour
+        of its own there instead of the address's, so posts relayed through
+        an extender cannot hold off its own re-activation. The operator also
+        probes only so many activations at once, and refuses one more as
+        busy. A budget is spent only when the operator is about to probe, so
+        a request refused before the probe (malformed arguments, the wrong
+        family, a spent budget, a busy operator) costs nothing, and a refusal
+        by a spent budget or a busy operator says in `retry_after_seconds`
+        how long until there is room again: the longest wait of the spent
+        budgets, plus up to a minute. Call it on the
         family api host of the family being activated --
         `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
         an IPv6 one -- so the caller address the operator probes back has
@@ -1961,10 +1972,20 @@ paths:
         caller's address is part of the decision.
 
         `ip_versions` lists the address families the client can dial (4, 6);
-        empty means any. The answer carries base64 serialized
+        empty means any. `capabilities` lists what the client can use, such
+        as `tcp-camouflage-v1`. A record that requires a capability the client
+        did not declare is not released to it. Capabilities change which records
+        are eligible, never how many the identity is entitled to; unknown values
+        are ignored. The answer carries base64 serialized
         `protocol.ExtenderRecord` messages, the epoch, how many records the
         identity is entitled to this epoch, and `probation`. A refusal
         answers 200 with `error` and no records.
+
+        `outcome` says why the answer holds what it does, and
+        `retry_after_seconds`, when present, how long until asking again can
+        change it. A client treats an unknown outcome as `empty`, bounds the
+        retry time itself, and keeps its own deadline and rate limits. Neither
+        describes the fleet.
       operationId: extenderRelease
       security:
         - BearerAuth: []
@@ -1994,7 +2015,9 @@ paths:
         Needs a client JWT; the server records it against the country the
         caller's address places it in, once per client, and rate limits
         reports per user. An unknown extender key answers `recorded: false`
-        without an error. A refusal answers 200 with `error`.
+        without an error. So does a report against an extender the
+        operator's own probe does not reach now: that describes an outage, not
+        a block, and is not recorded. A refusal answers 200 with `error`.
       operationId: extenderBlockReport
       security:
         - BearerAuth: []
@@ -2133,6 +2156,53 @@ paths:
                 $ref: "#/components/schemas/ExtenderMeasurementCertResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /v1/seed.bin:
+    get:
+      tags: [Network]
+      summary: The public extender seed bundle
+      description: |
+        The operator's public seed bundle (EXTENDER-UPDATE2.md §2): the
+        serialized `ExtenderSeedEnvelope`, raw bytes, at most 64 KiB. It is
+        the origin the seed mirrors copy, and every mirror serves the same
+        bytes at this same path for one sequence. A client reads at most
+        64 KiB + 1 bytes, refuses a larger body before decoding, and verifies
+        the envelope and every record in it under the root keys its network
+        space already authorizes (`VerifyExtenderSeed`); nothing here is
+        trusted for being served by the operator.
+
+        The bundle is public by design: a small, stable cohort of ordinary
+        open-tier records with an empty canary channel, and root-signed
+        revocations. It never carries a gated or channel-restricted record,
+        a root key, a network host setting or a resolver setting.
+
+        No auth. `404` while the operator's seed is off or nothing is
+        stored; `503` while no stored bundle verifies. The answer is
+        cacheable for five minutes, and its strong `ETag` is the quoted hex
+        sha256 of the body.
+      operationId: extenderSeed
+      security: []
+      responses:
+        "200":
+          description: The serialized seed envelope
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The bundle named by `If-None-Match` is still current
+        "404":
+          description: The seed is off, or no bundle is stored
+        "503":
+          description: No stored bundle verifies
 
   /network/extender-lag-report:
     post:
@@ -10963,6 +11033,14 @@ components:
           items:
             type: integer
             enum: [4, 6]
+        capabilities:
+          description: |
+            What the client can use. `tcp-camouflage-v1` is a client that sends
+            authenticated camouflage hellos and works with spliced extenders.
+            Eligibility only; unknown values are ignored.
+          type: array
+          items:
+            type: string
 
     ExtenderReleaseResult:
       type: object
@@ -10984,6 +11062,24 @@ components:
         error:
           description: Why the release was refused; absent on success.
           type: string
+        outcome:
+          description: |
+            Why the answer holds what it does: `ok`, records released; `empty`,
+            nothing eligible; `epoch_spent`, this epoch's records are spent and
+            none is eligible now; `probation`, the same for an identity still in
+            probation; `country_capacity`, every eligible record is at its limit
+            in the caller's country; `rate_limited`, refused by a request limit;
+            `incompatible`, the only eligible records require capabilities the
+            client did not declare; `unavailable`, the release could not be
+            answered. A client treats an unknown value as `empty`.
+          type: string
+        retry_after_seconds:
+          description: |
+            Seconds until asking again can change the answer, when known: the
+            request window for `rate_limited`, the epoch's end for
+            `epoch_spent`, and the sooner of the epoch's and the probation's end
+            for `probation`. Absent when unknown.
+          type: integer
 
     ExtenderBlockReportArgs:
       type: object
@@ -11001,7 +11097,7 @@ components:
         recorded:
           type: boolean
         error:
-          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          description: Why the report was not recorded; absent when it was, for an unknown key, and for an extender the operator's probe does not reach now.
           type: string
 
     TestBalanceDrainArgs:
@@ -19634,6 +19730,14 @@ components:
             out before it answered, how much it had ("the forward did not
             answer within the 0.5 s left of the 10 s probe budget: ...").
           type: string
+        retry_after_seconds:
+          description: |
+            On a refusal that judged nothing about the caller -- a spent
+            activation budget, or an operator busy probing other activations
+            -- the seconds until there is room for the caller's next post of
+            this family, rounded up. Wait that long rather than backing off.
+            Absent on every other answer.
+          type: integer
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator
