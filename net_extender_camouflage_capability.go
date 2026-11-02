@@ -40,8 +40,11 @@ import (
 const ExtenderCapabilityTcpCamouflageV1 = "tcp-camouflage-v1"
 
 // The capabilities this build knows. A requirement outside it is never
-// satisfied, so a record gated on a later capability is never dialed by a client
-// that cannot meet it.
+// satisfied, so the release withholds a record gated on a later capability from
+// a client that cannot meet it. The check is the release's alone: a client does
+// not re-read a record's requirement when it dials. One that has since lost the
+// capability, by a fingerprint switch to "go" say, fails that dial against a
+// splicing extender, and the gated attempt's bound falls back to open records.
 var extenderKnownCapabilities = []string{
 	ExtenderCapabilityTcpCamouflageV1,
 }

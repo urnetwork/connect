@@ -1799,11 +1799,22 @@ paths:
 
         Requires a CLIENT jwt (from `/network/auth-client`): the activation is
         attributed to a network and a client. It is rate limited per address
-        family: 6 per hour per client and 60 per hour per account, for IPv4
-        and for IPv6 each. A budget is spent only when the operator is about
-        to probe, so a request refused before the probe (malformed arguments,
-        the wrong family, a spent budget) costs nothing, and a refusal by a
-        spent budget says how long until it has room again. Call it on the
+        family, for IPv4 and for IPv6 each, over a trailing hour: 6 per
+        client; 6 per caller address (its /32 or /64), over every client and
+        every account; and per account 60 plus 6 for each proven host, at
+        most 1200. A proven host is an identity key of the account that
+        passed activation on that family between 1 hour and 7 days ago,
+        counted once per address and at most 32 per /24 or /48. A key the
+        account already proved at the caller's /32 or /64 spends 6 an hour
+        of its own there instead of the address's, so posts relayed through
+        an extender cannot hold off its own re-activation. The operator also
+        probes only so many activations at once, and refuses one more as
+        busy. A budget is spent only when the operator is about to probe, so
+        a request refused before the probe (malformed arguments, the wrong
+        family, a spent budget, a busy operator) costs nothing, and a refusal
+        by a spent budget or a busy operator says in `retry_after_seconds`
+        how long until there is room again: the longest wait of the spent
+        budgets, plus up to a minute. Call it on the
         family api host of the family being activated --
         `api-v4.bringyour.com` for an IPv4 address, `api-v6.bringyour.com` for
         an IPv6 one -- so the caller address the operator probes back has
@@ -2145,6 +2156,53 @@ paths:
                 $ref: "#/components/schemas/ExtenderMeasurementCertResult"
         "401":
           description: Missing or invalid client bearer token.
+
+  /v1/seed.bin:
+    get:
+      tags: [Network]
+      summary: The public extender seed bundle
+      description: |
+        The operator's public seed bundle (EXTENDER-UPDATE2.md §2): the
+        serialized `ExtenderSeedEnvelope`, raw bytes, at most 64 KiB. It is
+        the origin the seed mirrors copy, and every mirror serves the same
+        bytes at this same path for one sequence. A client reads at most
+        64 KiB + 1 bytes, refuses a larger body before decoding, and verifies
+        the envelope and every record in it under the root keys its network
+        space already authorizes (`VerifyExtenderSeed`); nothing here is
+        trusted for being served by the operator.
+
+        The bundle is public by design: a small, stable cohort of ordinary
+        open-tier records with an empty canary channel, and root-signed
+        revocations. It never carries a gated or channel-restricted record,
+        a root key, a network host setting or a resolver setting.
+
+        No auth. `404` while the operator's seed is off or nothing is
+        stored; `503` while no stored bundle verifies. The answer is
+        cacheable for five minutes, and its strong `ETag` is the quoted hex
+        sha256 of the body.
+      operationId: extenderSeed
+      security: []
+      responses:
+        "200":
+          description: The serialized seed envelope
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The bundle named by `If-None-Match` is still current
+        "404":
+          description: The seed is off, or no bundle is stored
+        "503":
+          description: No stored bundle verifies
 
   /network/extender-lag-report:
     post:
@@ -19181,6 +19239,14 @@ components:
             out before it answered, how much it had ("the forward did not
             answer within the 0.5 s left of the 10 s probe budget: ...").
           type: string
+        retry_after_seconds:
+          description: |
+            On a refusal that judged nothing about the caller -- a spent
+            activation budget, or an operator busy probing other activations
+            -- the seconds until there is room for the caller's next post of
+            this family, rounded up. Wait that long rather than backing off.
+            Absent on every other answer.
+          type: integer
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator
