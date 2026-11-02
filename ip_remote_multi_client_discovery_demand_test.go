@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -28,6 +29,16 @@ type discoveryDemandTestGenerator struct {
 	availableEntered   chan struct{}
 	availableRelease   chan struct{}
 	configureNewClient func(*MultiClientGeneratorClientArgs, *ClientSettings)
+	// the platform's strict window handover override each listing answers
+	// with, nil for none, which the generator takes from each answer as the
+	// api generator takes it from find-providers2
+	platformStrictWindowHandover atomic.Pointer[bool]
+	strictWindowHandoverOverride strictWindowHandoverOverride
+}
+
+// Implements MultiClientGeneratorWithStrictWindowHandoverOverride.
+func (self *discoveryDemandTestGenerator) StrictWindowHandoverOverride() (enabled bool, set bool) {
+	return self.strictWindowHandoverOverride.get()
 }
 
 func (self *discoveryDemandTestGenerator) NextDestinationsWithIpFamily(count int, exclude []MultiHopId, rank string, family IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
@@ -39,6 +50,9 @@ func (self *discoveryDemandTestGenerator) NextDestinationsWithIpFamilyContext(ct
 		return nil, err
 	}
 	result, err := self.reraceGenerator.NextDestinationsWithIpFamily(count, exclude, rank, family)
+	if err == nil {
+		self.strictWindowHandoverOverride.observe(self.platformStrictWindowHandover.Load())
+	}
 	self.mutex.Lock()
 	if rank == "quality" {
 		self.qualityReads++

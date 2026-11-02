@@ -18,7 +18,7 @@ func TestApiMultiClientGeneratorTransportSeamsCopySettings(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	generatedSettings := DefaultPlatformTransportSettings()
+	generatedSettings := testingDefaultPlatformTransportSettings()
 	generatedSettings.Log = nil
 	generatedSettings.TransportGenerator = nil
 	generatorSettings := DefaultApiMultiClientGeneratorSettings()

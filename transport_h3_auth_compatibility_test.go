@@ -257,7 +257,7 @@ func testPlatformH3AuthCompatibility(t *testing.T, ipVersion int, c h3AuthCompat
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(64))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(64))
 	settings.Log = NewNoopLogger()
 	settings.ReconnectTimeout = time.Hour
 	settings.PingTimeout = time.Minute

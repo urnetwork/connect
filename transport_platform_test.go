@@ -162,15 +162,20 @@ func newTestingPlatformServerWithUpgradeHold(t *testing.T, ipVersion int, held c
 				return
 			}
 		}
-		ws, err := upgrader.Upgrade(w, r, nil)
-		if err == nil {
-			platform.connectCount.Add(1)
-			func() {
-				platform.stateLock.Lock()
-				defer platform.stateLock.Unlock()
+		// the upgrade answers the client, which may then count the connection
+		// as up, so the platform holds the connection under the same lock:
+		// closeConns never runs between the two and misses it
+		var ws *websocket.Conn
+		var err error
+		func() {
+			platform.stateLock.Lock()
+			defer platform.stateLock.Unlock()
+			ws, err = upgrader.Upgrade(w, r, nil)
+			if err == nil {
+				platform.connectCount.Add(1)
 				platform.conns = append(platform.conns, ws)
-			}()
-		}
+			}
+		}()
 		if counted != nil {
 			close(counted)
 		}
@@ -229,8 +234,29 @@ func (self *testingPlatformServer) down() {
 	self.closeConns()
 }
 
-func testingPlatformTransportSettings() *PlatformTransportSettings {
+// testingDefaultPlatformTransportSettings is DefaultPlatformTransportSettings
+// with no re-dial spread after a lost connection. Tests that do not exercise
+// the spread build on it, so a connection they close is re-dialed on the
+// pacing they test, not 0-5 s later at random. The spread has its own tests
+// (transport_reconnect_jitter_test.go, transport_redial_hold_test.go), which
+// set ReconnectJitter themselves.
+func testingDefaultPlatformTransportSettings() *PlatformTransportSettings {
 	settings := DefaultPlatformTransportSettings()
+	settings.ReconnectJitter = 0
+	return settings
+}
+
+// testingDefaultPlatformTransportSettingsWithMemoryTarget is
+// DefaultPlatformTransportSettingsWithMemoryTarget with no re-dial spread
+// (see testingDefaultPlatformTransportSettings).
+func testingDefaultPlatformTransportSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *PlatformTransportSettings {
+	settings := DefaultPlatformTransportSettingsWithMemoryTarget(memoryTargetByteCount)
+	settings.ReconnectJitter = 0
+	return settings
+}
+
+func testingPlatformTransportSettings() *PlatformTransportSettings {
+	settings := testingDefaultPlatformTransportSettings()
 	// short enough to exercise the inactive-drain watchdog inside a test, long
 	// enough that the election (which is immediate) always precedes it
 	settings.InactiveDrainTimeout = 500 * time.Millisecond

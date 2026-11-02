@@ -56,7 +56,7 @@ func TestPlatformPacketConnClampsQuicRequestToDeviceMemoryTarget(t *testing.T) {
 	const deviceMemoryTargetByteCount = ByteCount(20 * 1024 * 1024)
 	const quicSocketBufferRequestByteCount = 7 * 1024 * 1024
 
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(
 		deviceMemoryTargetByteCount,
 	)
 	wantBufferByteCount := kib(64)

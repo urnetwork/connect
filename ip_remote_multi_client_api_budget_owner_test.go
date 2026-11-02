@@ -47,7 +47,7 @@ func TestApiMultiClientGeneratorDefaultCarrierBudgetIsInstanceOwned(t *testing.T
 
 func TestApiMultiClientGeneratorHonorsExplicitCarrierOwner(t *testing.T) {
 	owner := NewPlatformTransportBudget(mib(8), 32)
-	template := DefaultPlatformTransportSettings()
+	template := testingDefaultPlatformTransportSettings()
 	template.PlatformTransportBudget = owner
 	generator := &ApiMultiClientGenerator{
 		settings: &ApiMultiClientGeneratorSettings{

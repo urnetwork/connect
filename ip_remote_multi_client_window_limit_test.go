@@ -102,7 +102,7 @@ func TestH3WindowClaimMatchesActualCarrierReservation(t *testing.T) {
 	for _, target := range []ByteCount{32 * 1024 * 1024, 64 * 1024 * 1024} {
 		for _, mode := range []TransportMode{TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
 			for _, outer := range []ExtenderConnectMode{"", ExtenderConnectModeTcpTls, ExtenderConnectModeQuic, ExtenderConnectModeDns} {
-				settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+				settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 				ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 				settings.StartDisabled = true
 				settings.Log = NewNoopLogger()

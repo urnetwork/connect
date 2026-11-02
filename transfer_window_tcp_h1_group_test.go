@@ -29,7 +29,7 @@ func TestWindowTcpSocketBatchFitsPhysicalH1(t *testing.T) {
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 	settings.SendBufferSettings.WindowSizing = WindowSizingConstant
 	settings.SendBufferSettings.ApplyWindowSizing()
-	carrier := DefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
+	carrier := testingDefaultPlatformTransportSettingsWithMemoryTarget(24 * 1024 * 1024)
 	carrier.Log = NewNoopLogger()
 	carrier.PingTimeout = 30 * time.Second
 	if carrier.H1MaxMessageByteCount != 16*1024 {

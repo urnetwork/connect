@@ -168,7 +168,7 @@ func TestApiWindowTransportMigrationIsMakeBeforeBreakAndDeduplicated(t *testing.
 	settings := DefaultApiMultiClientGeneratorSettings()
 	settings.MigrateConnectTimeout = time.Second
 	settings.MigrateMaxScheduleDelay = 20 * time.Millisecond
-	transportSettings := DefaultPlatformTransportSettings()
+	transportSettings := testingDefaultPlatformTransportSettings()
 	state := &apiWindowClientTransport{
 		current:            old,
 		settings:           transportSettings,
@@ -251,7 +251,7 @@ func TestApiWindowTransportMigrationKeepsOldOnTimeout(t *testing.T) {
 	settings.MigrateConnectTimeout = 25 * time.Millisecond
 	state := &apiWindowClientTransport{
 		current:  old,
-		settings: DefaultPlatformTransportSettings(),
+		settings: testingDefaultPlatformTransportSettings(),
 		auth:     ClientAuth{InstanceId: NewId()},
 	}
 	generator := &ApiMultiClientGenerator{
@@ -311,7 +311,7 @@ func TestApiWindowTransportMigrationDisarmsBeforeClosingReplacement(t *testing.T
 	settings.MigrateConnectTimeout = 25 * time.Millisecond
 	state := &apiWindowClientTransport{
 		current:  old,
-		settings: DefaultPlatformTransportSettings(),
+		settings: testingDefaultPlatformTransportSettings(),
 		auth:     ClientAuth{InstanceId: NewId()},
 	}
 	generator := &ApiMultiClientGenerator{
@@ -357,7 +357,7 @@ func TestApiWindowTransportCreationCloseJoinsHeldMigrationCreator(t *testing.T) 
 	var creationCount atomic.Int32
 	state := &apiWindowClientTransport{
 		current:  old,
-		settings: DefaultPlatformTransportSettings(),
+		settings: testingDefaultPlatformTransportSettings(),
 		auth:     ClientAuth{InstanceId: NewId()},
 	}
 	generator := &ApiMultiClientGenerator{
@@ -420,7 +420,7 @@ func TestApiWindowTransportPolicyChangeIsLiveAndMakeBeforeBreak(t *testing.T) {
 	createdSettings := make(chan *PlatformTransportSettings, 1)
 	state := &apiWindowClientTransport{
 		current:       old,
-		settings:      DefaultPlatformTransportSettings(),
+		settings:      testingDefaultPlatformTransportSettings(),
 		auth:          ClientAuth{InstanceId: NewId()},
 		policyVersion: 1,
 	}
@@ -516,7 +516,7 @@ func TestApiWindowTransportPolicyTransitionMatrix(t *testing.T) {
 				created := make(chan creation, 1)
 				state := &apiWindowClientTransport{
 					current:       source,
-					settings:      DefaultPlatformTransportSettings(),
+					settings:      testingDefaultPlatformTransportSettings(),
 					auth:          ClientAuth{InstanceId: NewId()},
 					policyVersion: 1,
 				}
@@ -615,7 +615,7 @@ func TestApiWindowExplicitPolicyKeepsOldCarrierUntilH3ConnectsWhenBudgetBlocked(
 	created := make(chan struct{}, 1)
 	state := &apiWindowClientTransport{
 		current:       old,
-		settings:      DefaultPlatformTransportSettings(),
+		settings:      testingDefaultPlatformTransportSettings(),
 		auth:          ClientAuth{InstanceId: NewId()},
 		policyVersion: 1,
 	}

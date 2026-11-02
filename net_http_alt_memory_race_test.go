@@ -154,7 +154,7 @@ func TestAltMemoryRaceLiveFallbackWithOnlyOneCarrierClaim(t *testing.T) {
 				visible.Port = 443
 			}
 			settings.ConnectSettings.Resolver = newFamilyTestResolver(t, addresses...)
-			platformSettings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			platformSettings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			ctx = (&PlatformTransport{settings: platformSettings}).dialContext(ctx)

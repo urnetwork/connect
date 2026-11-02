@@ -172,7 +172,7 @@ func TestPlatformMobileResumptionWaitsForHandshakeBeforeTrackedWrites(t *testing
 			go func() { <-ctx.Done(); conn.CloseWithError(0, "") }()
 		}
 	}()
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	claim := settings.PlatformTransportBudget.register(platformTransportBudgetH3Explicit, settings.H3BudgetByteCount, true)
 	if !claim.TryAcquire() {
 		t.Fatal("mobile carrier claim")
@@ -253,7 +253,7 @@ func TestPlatformMobileLiveH3DnsPumpBidirectionalAndTeardown(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
 			port, serverErrors := newMobileMemoryQuicEcho(t, ctx, mode)
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			settings.AltUrl = fmt.Sprintf("https://127.0.0.1:%d", port)
 			settings.DnsPort, settings.H3Port = port, port
 			settings.DnsPumpHost = "127.0.0.1"

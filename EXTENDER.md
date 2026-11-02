@@ -216,7 +216,16 @@ A7. Family match. The forward dial and the reverse proxy transport use
 `tcp4` or `tcp6` by the family of the client's outer socket, so name
 resolution yields only that family. The udp carriers use the family of the
 datagram source. A destination with no address of that family fails the
-request; the client moves to another extender.
+request; the client moves to another extender. The forward dial, stream or
+datagram, is bounded by `ForwardDialTimeout`, 5 s (connect#230). The
+extender has already answered the request when it dials, so a dial that
+never connected used to hold the client's stream open, silently, for as
+long as the embedder's dialer did, which had no timeout. 5 s allows two lost
+SYNs or a slow resolver, and it is half of the operator's 10 s activation
+probe budget (C2): a forward dial that fails closes the stream while the
+probe still has budget left to see it close. The failure reaches
+`ErrorHandler` as `ExtenderErrorStageForwardDial` or
+`ExtenderErrorStageDatagramForwardDial`.
 
 A8. Reserved services. `Service` 1 (gossip) hands the taken-over stream to
 the in-process gossip listener (D2). `Service` 2 (feed) hands it to the
@@ -233,7 +242,7 @@ callback until its consumer releases the connection.
 
 A9. Limits. Relay read and write timeouts 30 s as today. Header read
 deadline 10 s, which also bounds the outer handshake and, as the HTTP
-server's read timeout, the request body. Per-source concurrent connections 64, total 4096, both
+server's read timeout, the request body. Forward dial 5 s (A7). Per-source concurrent connections 64, total 4096, both
 settings. Idle QUIC connections close after 30 s.
 
 A10. Spoof list and dial. `SpoofDomains()` in connect root returns the
@@ -599,12 +608,14 @@ or over the probes is refused with the wait until there is room in
 nothing. An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
 is refused before it is probed. The handler probes the caller ip synchronously
-within 10 s: for each requested carrier, `connect.ProbeExtenderCarrier`
-dials that carrier with a random spoof name, sends a header with a
-challenge and verifies the response signature against `public_key_hex`;
-then `connect.ProbeExtenderForward` performs a verified `GET /hello`
-through the tcp carrier to the api url. Result `{activated, ip,
-ip_version, carriers, refused_carriers, error, retry_after_seconds,
+within one 10 s probe budget, in this order: the required test (C2a) --
+`connect.ProbeExtenderCarrier` dials the tcp carrier with a random spoof
+name, sends a header with a challenge and verifies the response signature
+against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
+verified `GET /hello` through the tcp carrier to the api url -- and only
+then each offered optional carrier: each dns port under its own 3 s (L2),
+then quic with what is left. Result `{activated, ip, ip_version,
+carriers, refused_carriers, probe_steps, error, retry_after_seconds,
 expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
 random, `allowed_hosts` the operator patterns of A5. On success the row
@@ -613,7 +624,7 @@ set, and a record publish row is inserted. The country comes from the ip
 geolocation of the caller. A failed required test (C2a) returns `activated: false`
 with the failing test in `error` and stores nothing. An optional carrier
 that fails its probe is left out of the stored `carriers` and listed in
-`refused_carriers` (carrier, port, error); it does not fail the activation. Acceptance requires
+`refused_carriers` (carrier, port, error, elapsed_ms, budget_left_ms); it does not fail the activation. Acceptance requires
 public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each of which proves the forward
 (C2a). Zero ports and an empty tld
 take the C1 defaults. The budgets are spent at the probe: every check that
@@ -663,6 +674,33 @@ it passes at least one required test. Every other carrier is optional.
   failing an activation that passed a required test; the uptime task probes
   a webrtc-accepted address over webrtc and does not deactivate it for a
   missing tcp port.
+
+C2b. Probe timing (connect#230, 2026-11-01). Every probe step is timed,
+because the steps share one budget and an answer that came too late, one
+starved by the steps before it, and no answer at all were the same
+`context deadline exceeded`. `probe_steps` lists every step run, in order,
+refusals included: `name` (`tcp`, `forward`, `dns`, `quic`), `ip_version`,
+`port` (the forward names the tcp port it runs over), `elapsed_ms`,
+`budget_left_ms` (what was left of the 10 s budget when the step started)
+and `outcome` (`ok`; `error`, it failed on its own; `timeout`, its budget
+ran out before it answered). A refusal's last step is the one that refused
+it; a request refused before the probe has no list. Each
+`refused_carriers` entry carries the same two times. A refusal says how
+long its step ran: "the forward failed after 0.1 s: ..." makes no claim
+about the budget, while a step whose budget ran out says how much it had,
+"the forward did not answer within the 0.5 s left of the 10 s probe
+budget: context deadline exceeded" or "the tcp carrier did not answer
+within the 10 s probe budget: ...". A left out carrier that timed out reads
+"no answer within 3 s: ..." for a dns port and "no answer within the 6.5 s
+left of the 10 s probe budget: ..." for quic; one that failed on its own
+keeps its probe's error. Old providers decode the answer into
+`connect.ExtenderActivateResult`, which skips the new fields. The api
+counts every activation in `urnetwork_extender_activations_total{stage,
+outcome, family}` -- stage `request`, `config`, `budget`, `tcp`, `forward`
+or `store`; outcome `refused`, `error`, `timeout`, `other_family` or
+`activated`; family `ipv4`, `ipv6` or `unknown` -- and times every step in
+`urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
+whose buckets end at 10 s. The extenders dashboard shows both.
 
 C3. Uptime probes. Taskworker task every 5 minutes over every active
 address, batched, concurrency 16, a challenge probe over the required path
@@ -1095,7 +1133,10 @@ tcp 443 first, the one port an extender requires, and only then start
 device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
 L2), each udp carrier bound independently and a failed udp bind disabling
 that carrier alone; the forward dialer is
-the device's egress-aware connect dial narrowed by family; the whitelist is
+the device's egress-aware connect dial narrowed by family, and its failures
+(A7) are logged, the first of each kind at once and then at most one line a
+minute carrying the count since, so an extender whose egress cannot reach
+the operator says so (connect#230); the whitelist is
 A5 from the space hosts plus the spoof list; the space's node is rebuilt
 with the extender role, the in-process listener, the feed server and the
 listen addresses of the activated families, so it becomes a listening
@@ -3887,6 +3928,10 @@ with the database.
 | `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
 | `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
 | extender udp 4053 and udp 53 (dns carrier) | a request is one TXT question with no aa bit and an EDNS0 opt record (udp payload 1232); a response repeats the opt record only for a request that carried one (Q2); old peers unchanged in both directions (Q3) |
+| `POST /network/extender-activate` answer | `probe_steps` added; `refused_carriers` entries gain `elapsed_ms` and `budget_left_ms`; a probe refusal's `error` says how long its step ran, or how much budget it had; old providers skip the fields (C2b) |
+| api metrics | `urnetwork_extender_activations_total{stage, outcome, family}`, `urnetwork_extender_activation_step_seconds{step, outcome}` (C2b) |
+| `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
+| sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still

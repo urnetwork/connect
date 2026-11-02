@@ -41,6 +41,9 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				strategy := connect.NewClientStrategy(ctx, strategySettings)
 				defer strategy.Close()
 				settings := connect.DefaultPlatformTransportSettingsWithMemoryTarget(20 * 1024 * 1024)
+				// no re-dial spread after a lost connection: these tests do
+				// not exercise it
+				settings.ReconnectJitter = 0
 				settings.EnableH3Datagrams = false
 				settings.ModeInitialDelay = 0
 				settings.PingTimeout = 30 * time.Second

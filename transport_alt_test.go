@@ -51,7 +51,7 @@ func testAltCandidateHostPorts(udpAddrs []*net.UDPAddr) []string {
 // The plain H3 carrier dials the alt host, and without an alt url it dials the
 // platform host exactly as before.
 func TestPlatformTransportAltUrlDialsTheAltHostOverH3(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.AltUrl = "https://" + testAltIp
 	transport := newTestAltTransport(t, settings)
 
@@ -95,7 +95,7 @@ func TestPlatformTransportAltUrlDialsTheAltHostOverH3(t *testing.T) {
 // The h3dns carrier dials the alt host on 53 and then 4053, which the race
 // launches in that order with the second staggered behind the first (L2).
 func TestPlatformTransportAltH3DnsTries53Then4053(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.AltUrl = "https://" + testAltIp
 	transport := newTestAltTransport(t, settings)
 
@@ -133,7 +133,7 @@ func TestPlatformTransportAltH3DnsTries53Then4053(t *testing.T) {
 // The pump host derives from the alt url when nothing names it, and an
 // explicit pump host still wins (L3).
 func TestPlatformTransportAltH3DnsPumpHost(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.AltUrl = "https://" + testAltIp
 	settings.DnsPumpHost = ""
 	transport := newTestAltTransport(t, settings)

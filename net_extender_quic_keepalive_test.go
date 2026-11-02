@@ -25,7 +25,7 @@ import (
 // peer's last packet, whether or not a platform transport owns it, and the
 // idle timeout is the same either way.
 func TestExtenderQuicCarrierKeepsAPingTimeoutKeepAlive(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	connectSettings := DefaultConnectSettings()
 	owned := newExtenderQuicMemoryPolicy(
 		(&PlatformTransport{settings: settings}).dialContext(context.Background()),
@@ -101,7 +101,7 @@ func extenderQuicKeepAliveTestTlsConfig(t *testing.T) *tls.Config {
 // a ping timeout after the transport's last write.
 func expectExtenderQuicCarrierNoticesADeadExtenderInTime(t *testing.T, owned bool) {
 	synctest.Test(t, func(t *testing.T) {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		dialCtx := context.Background()
 		if owned {
 			dialCtx = (&PlatformTransport{settings: settings}).dialContext(dialCtx)

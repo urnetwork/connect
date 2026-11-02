@@ -68,7 +68,7 @@ func TestExtenderOuterResponseHeadersFailBoundedAndReleaseClaim(t *testing.T) {
 	}
 	for _, carrier := range []string{"tcp-large-line", "tcp-many-fields", "tcp-chunked", "quic-encoded", "quic-decoded"} {
 		t.Run(carrier, func(t *testing.T) {
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			ctx, cancel := context.WithTimeout((&PlatformTransport{settings: settings}).dialContext(t.Context()), 5*time.Second)
 			defer cancel()
 			budget, root := settings.PlatformTransportBudget, DefaultPlatformTransportBudget()

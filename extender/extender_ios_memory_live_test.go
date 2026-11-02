@@ -136,6 +136,9 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 	})
 	run := func(cancelParent bool) {
 		settings := connect.DefaultPlatformTransportSettingsWithMemoryTarget(32 * 1024 * 1024)
+		// no re-dial spread after a lost connection: these tests do not
+		// exercise it
+		settings.ReconnectJitter = 0
 		connect.ApplyMobilePlatformTransportMemoryPolicy(settings, 32*1024*1024)
 		budget := settings.PlatformTransportBudget
 		assertProfile := func() {

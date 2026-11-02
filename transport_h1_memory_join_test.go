@@ -27,7 +27,7 @@ func TestPlatformH1MemoryReservationSurvivesNativeCloseJoin(t *testing.T) {
 		for _, target := range []ByteCount{mib(20), mib(32)} {
 			root := NewPlatformTransportBudgetForMemoryTarget(mib(32))
 			budget := newDefaultPlatformTransportBudgetWithParent(target, root)
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 			settings.TransportBufferSize = 1
 			claimBytes := settings.H1MemoryReservationByteCount()
 			capacity := target / 4

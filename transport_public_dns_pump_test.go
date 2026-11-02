@@ -53,12 +53,12 @@ func lookUpDnsPumpCandidates(t *testing.T, settings *PlatformTransportSettings) 
 // synthetic pump host still reaches the resolver, so the refusal covers the
 // production default and nothing else.
 func TestPackageTestsNeverResolveOrDialPublicDnsPumpHost(t *testing.T) {
-	defaultLookupCount, defaultErr := lookUpDnsPumpCandidates(t, DefaultPlatformTransportSettings())
+	defaultLookupCount, defaultErr := lookUpDnsPumpCandidates(t, testingDefaultPlatformTransportSettings())
 	if defaultLookupCount != 0 || !strings.Contains(defaultErr.Error(), "public H3 DNS pump host") {
 		t.Fatalf("a transport on default settings looked up its pump host %d time(s), error %v; want the refusal before any lookup", defaultLookupCount, defaultErr)
 	}
 
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.DnsPumpHost = "pump.example"
 	syntheticLookupCount, syntheticErr := lookUpDnsPumpCandidates(t, settings)
 	if syntheticLookupCount == 0 || strings.Contains(syntheticErr.Error(), "public H3 DNS pump host") {

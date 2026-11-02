@@ -17,7 +17,7 @@ import (
 // H1 graph. Counting only the inner H1 reservation leaves QUIC receive windows
 // invisible, and using a fresh/default budget per dial repeats that escape.
 func TestExtenderQuicChargesH1OwnerBeforeOpeningSocket(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	budget := settings.PlatformTransportBudget
 	h1 := budget.register(platformTransportBudgetH1, settings.H1BudgetByteCount, true)
 	if !h1.Acquire(context.Background()) {
@@ -51,7 +51,7 @@ func TestExtenderQuicChargesH1OwnerBeforeOpeningSocket(t *testing.T) {
 }
 
 func TestExtenderQuicPolicyBoundsAllRetainedAreas(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	policy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 	config := policy.quicConfig
@@ -92,7 +92,7 @@ func TestExtenderQuicPolicyBoundsAllRetainedAreas(t *testing.T) {
 }
 
 func TestExtenderQuicPreservesPendingH1Claims(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	policy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 	policy.budget = NewPlatformTransportBudget(policy.byteCount+settings.H1BudgetByteCount-1, 16)
@@ -112,7 +112,7 @@ func TestExtenderQuicPreservesPendingH1Claims(t *testing.T) {
 }
 
 func TestExtenderQuicConcurrentClaimsAndCleanupAreExact(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	policy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 	policy.budget = NewPlatformTransportBudget(2*policy.byteCount, 16)
@@ -166,7 +166,7 @@ func (self *extenderMemoryPacketConn) Close() error {
 }
 
 func TestAltQuicCapsSocketAndKeepsClaimThroughFailureCleanup(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	connectSettings := DefaultConnectSettings()
 	policy := newExtenderQuicMemoryPolicy(ctx, connectSettings)
@@ -207,7 +207,7 @@ func TestUnownedMobileQuicHasIndependentCarrierBudget(t *testing.T) {
 		t.Fatalf("unowned mobile carrier did not acquire an independent budget: %v, %v", claim, err)
 	}
 	defer claim.Release()
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	ownedPolicy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 	ownedClaim, err := ownedPolicy.acquire(ctx)
@@ -235,7 +235,7 @@ func (self *extenderMemoryStreamConn) Close() error {
 }
 
 func TestExtenderTcpSharesOwnerAndReleasesAfterSocket(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	budget := settings.PlatformTransportBudget
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	h1 := budget.register(platformTransportBudgetH1, settings.H1BudgetByteCount, true)
@@ -298,7 +298,7 @@ func TestExtenderTcpUnownedMobileHasIndependentCarrierBudget(t *testing.T) {
 }
 
 func TestExtenderQuicRefusesFullH1OwnerWithoutOpeningSocket(t *testing.T) {
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(24))
 	settings.PlatformTransportBudget = NewPlatformTransportBudget(settings.H1BudgetByteCount, 1)
 	budget := settings.PlatformTransportBudget
 	h1 := budget.register(platformTransportBudgetH1, settings.H1BudgetByteCount, true)

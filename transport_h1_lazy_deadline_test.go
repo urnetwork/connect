@@ -116,7 +116,7 @@ func TestH1PingJitterOffsetsThePingBoundary(t *testing.T) {
 
 // Phones keep the wall-clock alignment: the default draws no offset.
 func TestPlatformTransportDefaultPingsOnTheWallClockBoundary(t *testing.T) {
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	if settings.PingJitter != 0 {
 		t.Fatalf("default ping jitter=%s, want none", settings.PingJitter)
 	}

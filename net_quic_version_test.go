@@ -345,7 +345,7 @@ func TestQuicDefaultsOfferVersion2First(t *testing.T) {
 	if policy := DefaultConnectSettings().QuicVersionPolicy; policy != QuicVersionPolicyPreferV2 {
 		t.Errorf("DefaultConnectSettings policy = %q", policy)
 	}
-	platformSettings := DefaultPlatformTransportSettings()
+	platformSettings := testingDefaultPlatformTransportSettings()
 	if policy := platformSettings.QuicVersionPolicy; policy != QuicVersionPolicyPreferV2 {
 		t.Errorf("DefaultPlatformTransportSettings policy = %q", policy)
 	}

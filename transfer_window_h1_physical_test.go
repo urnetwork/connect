@@ -293,7 +293,7 @@ func measureWindowPhysicalH1(t *testing.T, arm, digest string, profiles [2]windo
 		strategySettings.EnableResilient = false
 		strategySettings.TlsConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 		strategies[index] = NewClientStrategy(ctx, strategySettings)
-		carrier := DefaultPlatformTransportSettingsWithMemoryTarget(profile.DeviceTarget)
+		carrier := testingDefaultPlatformTransportSettingsWithMemoryTarget(profile.DeviceTarget)
 		carrier.Log = NewNoopLogger()
 		carrier.PingTimeout = 30 * time.Second
 		// SDK provider construction leaves this at zero. Only outbound

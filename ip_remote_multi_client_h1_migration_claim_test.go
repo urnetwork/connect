@@ -44,7 +44,7 @@ func requireApiMigrationSuccessorClaim(t *testing.T, failure string) {
 		settings.MigrateConnectTimeout = time.Second
 		state := &apiWindowClientTransport{
 			current:  old,
-			settings: DefaultPlatformTransportSettings(),
+			settings: testingDefaultPlatformTransportSettings(),
 			auth:     ClientAuth{InstanceId: NewId()},
 		}
 		reports := &testMoveReports{}

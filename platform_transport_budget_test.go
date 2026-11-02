@@ -532,7 +532,7 @@ func TestPlatformTransportBudgetPolicySwitchH1AutoH3Auto(t *testing.T) {
 
 func TestPlatformTransportAutoH3PreemptionYieldsAfterCarrierTeardown(t *testing.T) {
 	budget := NewPlatformTransportBudget(4, 1)
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.PlatformTransportBudget = budget
 	settings.H3BudgetByteCount = 4
 	settings.PlatformTransportBudgetPriority = PlatformTransportBudgetPriorityBackground
@@ -772,7 +772,7 @@ func TestPlatformTransportBudgetAutoModesFollowMemoryTarget(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			SetMemoryBudget(test.memoryTarget)
 			t.Cleanup(func() { SetMemoryBudget(0) })
-			settings := DefaultPlatformTransportSettings()
+			settings := testingDefaultPlatformTransportSettings()
 			budget := settings.PlatformTransportBudget
 			h1 := budget.register(platformTransportBudgetH1, settings.H1BudgetByteCount, true)
 			h3 := budget.register(platformTransportBudgetH3, settings.H3BudgetByteCount, false)

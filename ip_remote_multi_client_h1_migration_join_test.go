@@ -271,7 +271,7 @@ func TestApiWindowTransportMigrationJoinsDiscardedReplacement(t *testing.T) {
 			if reason == "connect-timeout" {
 				settings.MigrateConnectTimeout = 10 * time.Millisecond
 			}
-			state := &apiWindowClientTransport{current: old, settings: DefaultPlatformTransportSettings()}
+			state := &apiWindowClientTransport{current: old, settings: testingDefaultPlatformTransportSettings()}
 			generator := &ApiMultiClientGenerator{
 				settings: settings, transports: map[*Client]*apiWindowClientTransport{client: state},
 				newPlatformTransport: func(*Client, *ClientAuth, TransportMode, *PlatformTransportSettings) apiWindowPlatformTransport {

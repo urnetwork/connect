@@ -272,7 +272,7 @@ func TestHoldAfterKickParksLowerAutoModes(t *testing.T) {
 	defer cancel()
 
 	newTransport := func(targetMode TransportMode) *PlatformTransport {
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.StartDisabled = true
 		settings.ModeInitialDelay = 300 * time.Millisecond
 		transport := NewPlatformTransportWithTargetMode(
@@ -315,10 +315,9 @@ func TestHoldAfterKickParksLowerAutoModes(t *testing.T) {
 	}
 }
 
-// Every place a runner waits on a kick reads the iteration's generation, and
-// a kick in the pre-dial wait clears the backoff the old path earned: the
-// first dial on a new path often fails once while the link finishes coming
-// up, and its retry must not inherit the old network's grown backoff.
+// Every place a runner waits on a kick reads the iteration's generation. The
+// pre-dial wait is waitDialPacing, whose kick arm
+// TestKickDuringPreDialWaitClearsTheBackoff drives.
 func TestRunnerKickSourceAnchor(t *testing.T) {
 	source, err := readSource("transport.go")
 	if err != nil {
@@ -335,19 +334,59 @@ func TestRunnerKickSourceAnchor(t *testing.T) {
 		if strings.Contains(body, "self.kickMonitor.NotifyChannel()") {
 			t.Errorf("%s waits on a notify channel fetched without the iteration's kick generation", signature)
 		}
-		preDial := strings.Index(body, "network changed while waiting to dial")
-		if preDial < 0 {
-			t.Fatalf("%s: could not find the pre-dial kick arm", signature)
-		}
-		arm := body[preDial:]
-		if end := strings.Index(arm, "case <-time.After(connectDelay):"); 0 <= end {
-			arm = arm[:end]
-		}
-		if !strings.Contains(arm, "self.noteKick()") {
-			t.Errorf("%s: a kick in the pre-dial wait does not reset the dial backoff", signature)
+		if !strings.Contains(body, "&kickGeneration)") || !strings.Contains(body, "self.waitDialPacing(") {
+			t.Errorf("%s: the pre-dial wait does not read the iteration's kick generation", signature)
 		}
 		if !strings.Contains(body, "self.cancelOnKick(dialCtx, kickGeneration, cancelDial)") {
 			t.Errorf("%s: a kick does not cancel the in-flight dial", signature)
+		}
+	}
+}
+
+// A kick in the pre-dial wait clears the backoff the old path earned: the
+// first dial on a new path often fails once while the link finishes coming
+// up, and its retry must not inherit the old network's grown backoff. The
+// wait ends at once, and its kick is taken.
+func TestKickDuringPreDialWaitClearsTheBackoff(t *testing.T) {
+	for _, ipFamily := range []int{0, 4} {
+		transport, waits := newReconnectJitterTestTransport(t, ipFamily, 0, nil)
+		waits.hold.Store(true)
+		// a family-agnostic transport waits on the staircase; a pinned one
+		// waits out its own grown backoff
+		if ipFamily == 0 {
+			for i := 0; i < 4; i += 1 {
+				transport.clientStrategy.NextConnectTime()
+			}
+		}
+		for i := 0; i < 4; i += 1 {
+			transport.pinnedBackoff.fail()
+			transport.failBackoff.fail()
+		}
+
+		kickGeneration := transport.kickGeneration.Load()
+		done := make(chan dialWait, 1)
+		go func() {
+			pacing, releaseReconnect, _ := transport.waitDialPacing(transport.ctx, false, false, &kickGeneration)
+			releaseReconnect()
+			done <- pacing
+		}()
+		waits.next(t)
+		transport.Kick()
+		select {
+		case pacing := <-done:
+			AssertEqual(t, pacing, dialWaitKicked)
+		case <-time.After(15 * time.Second):
+			t.Fatalf("ipv%d: a kick did not end the pre-dial wait", ipFamily)
+		}
+		if kickGeneration != transport.kickGeneration.Load() {
+			t.Fatalf("ipv%d: the pre-dial wait did not take its kick", ipFamily)
+		}
+		backoff := transport.failBackoff
+		if transport.pinned() {
+			backoff = transport.pinnedBackoff
+		}
+		if delay := backoff.delay(); delay != 0 {
+			t.Fatalf("ipv%d: backoff %s after the kick, want it cleared", ipFamily, delay)
 		}
 	}
 }

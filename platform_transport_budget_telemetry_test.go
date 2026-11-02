@@ -120,7 +120,7 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	previousMemoryBudget := MemoryBudget()
 	SetMemoryBudget(mib(32))
 	defer SetMemoryBudget(previousMemoryBudget)
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 	root := NewPlatformTransportBudget(mib(8), 16)
 	child := newPlatformTransportBudget(mib(5), 16, root)
 	settings.PlatformTransportBudget = child

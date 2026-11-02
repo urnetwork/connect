@@ -18,7 +18,7 @@ func TestPlatformH3ExtenderPacketConnPreservesMemoryOwner(t *testing.T) {
 	for _, mode := range []TransportMode{TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
 		for _, carrier := range []ExtenderConnectMode{ExtenderConnectModeTcpTls, ExtenderConnectModeQuic, ExtenderConnectModeDns} {
 			t.Run(string(mode)+"/"+ExtenderCarrierForConnectMode(carrier), func(t *testing.T) {
-				settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+				settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 				// Defaults deliberately have independent owners. This regression
 				// needs an explicit hierarchy: filling the 5 MiB child must not
 				// permit an outer carrier to escape into the 8 MiB parent.

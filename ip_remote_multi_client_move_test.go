@@ -147,7 +147,7 @@ func TestApiWindowAdvisoryMoveIsMakeBeforeBreakAtTheTarget(t *testing.T) {
 	client, _ := newApiMigrationTestClient(t)
 	old := newFakeMoveWindowTransport(true)
 	next := newFakeWindowPlatformTransport(false)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 
 	move := testAdvisoryMove(testMoveTargetIpv4, testMoveTargetIpv6)
@@ -202,7 +202,7 @@ func TestApiWindowAdvisoryMoveFailureKeepsTheOldTransport(t *testing.T) {
 	client, _ := newApiMigrationTestClient(t)
 	old := newFakeMoveWindowTransport(true)
 	next := newFakeWindowPlatformTransport(false)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 
 	move := testAdvisoryMove(testMoveTargetIpv4)
@@ -237,7 +237,7 @@ func TestApiWindowAdvisoryMoveTimeoutReportsConnectTimeout(t *testing.T) {
 	client, _ := newApiMigrationTestClient(t)
 	old := newFakeMoveWindowTransport(true)
 	next := newFakeWindowPlatformTransport(false)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 	fixture.generator.settings.MigrateConnectTimeout = 25 * time.Millisecond
 
@@ -334,7 +334,7 @@ func TestApiWindowAdvisoryMoveDeclines(t *testing.T) {
 	} {
 		client, _ := newApiMigrationTestClient(t)
 		old := newFakeMoveWindowTransport(true)
-		fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+		fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 			func(*PlatformTransportSettings) apiWindowPlatformTransport {
 				return newFakeWindowPlatformTransport(false)
 			})
@@ -406,7 +406,7 @@ func TestApiWindowMoveDeclineReachesTheControl(t *testing.T) {
 
 	old := newFakeMoveWindowTransport(true)
 	old.relayCarried = true
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport {
 			return newFakeWindowPlatformTransport(false)
 		})
@@ -427,7 +427,7 @@ func TestApiWindowMoveDeclineReachesTheControl(t *testing.T) {
 func TestApiWindowMoveIdIsDeduplicated(t *testing.T) {
 	client, _ := newApiMigrationTestClient(t)
 	old := newFakeMoveWindowTransport(true)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport {
 			return newFakeWindowPlatformTransport(false)
 		})
@@ -461,7 +461,7 @@ func TestApiWindowCompulsoryMoveMigratesByNameWithoutAUsableTarget(t *testing.T)
 	old := newFakeMoveWindowTransport(true)
 	old.relayCarried = true
 	next := newFakeWindowPlatformTransport(false)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 	fixture.generator.MoveClientTransport(client, nil, testCompulsoryMove(testMoveTargetIpv4))
 	settings := receiveTestMoveValue(t, fixture.created, "the compulsory move did not build a replacement")
@@ -488,7 +488,7 @@ func TestApiWindowCompulsoryMoveFallsBackByNameAfterATargetFailure(t *testing.T)
 	client, _ := newApiMigrationTestClient(t)
 	old := newFakeMoveWindowTransport(true)
 	next := newFakeWindowPlatformTransport(false)
-	fixture := newTestMoveGenerator(t, client, old, DefaultPlatformTransportSettings(),
+	fixture := newTestMoveGenerator(t, client, old, testingDefaultPlatformTransportSettings(),
 		func(*PlatformTransportSettings) apiWindowPlatformTransport { return next })
 	move := testCompulsoryMove(testMoveTargetIpv4)
 	fixture.generator.MoveClientTransport(client, nil, move)
@@ -536,7 +536,7 @@ func TestApiWindowDrainAndDisabledMovesMigrateByName(t *testing.T) {
 		client, _ := newApiMigrationTestClient(t)
 		old := newFakeMoveWindowTransport(true)
 		next := newFakeWindowPlatformTransport(false)
-		settings := DefaultPlatformTransportSettings()
+		settings := testingDefaultPlatformTransportSettings()
 		settings.EnableMove = c.enableMove
 		settings.MoveDecline = func() bool { return true }
 		fixture := newTestMoveGenerator(t, client, old, settings,

@@ -26,7 +26,7 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 	SetMemoryBudget(mib(32))
 	for _, mode := range []TransportMode{TransportModeH3, TransportModeH3Dns} {
 		t.Run(string(mode), func(t *testing.T) {
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
 			settings.AltUrl = "https://127.0.0.1:443"
 			transport := newTestAltTransport(t, settings)
 			budget := settings.PlatformTransportBudget
