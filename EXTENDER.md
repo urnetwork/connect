@@ -593,7 +593,9 @@ or `api-v6` so the caller address has one family. An operator without
 family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
-`{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
+`{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`, and the
+optional `run_id`, `run_start_time` and `previous_exit` of G3, which are stored
+and never refuse an activation. Rate
 limit 6 per hour per client and 60 per hour per account, each per address
 family, so one family's failures never spend the other's (2026-10-28). An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
@@ -1215,6 +1217,29 @@ restart, through the directory's own record, so a forwarded family whose
 first post of a run is refused by the operator is not held for the day; a
 third read that record's newest body alone rather than every address the
 directory keeps for the key.
+
+Every post names the run of the process that sent it (2026-11-02): `run_id`,
+32 lower case hex characters of 128 random bits drawn once when the process
+starts, so every activation of one process carries the same id and a restart
+a new one; `run_start_time`, when the process started, in utc; and
+`previous_exit`, how the run before it ended, when the host that restarted the
+process says so in the environment variable `URNETWORK_PREVIOUS_EXIT`. Its
+words are `oom` (the host knows the run ran out of memory), `stop` (the host
+stopped it on purpose), the signal that ended it (`sigkill`, `sigterm`,
+`sigint`, `sighup`, `sigquit`, `sigabrt`, `sigsegv`, `sigbus`, `sigill`,
+`sigfpe`, `sigtrap`, `sigpipe`, `sigalrm`, or `signal` for another), and
+`exit-<code>` for an exit code from 0 to 255. The sn miner's supervisor sets it
+for a provider child it restarts; a process restarted any other way has none.
+All three are optional: an operator that predates them ignores them and an
+extender that predates them omits them. The operator stores each on the
+activation's history row when it is well formed -- 32 hex characters; a start
+no earlier than 2026-11-01 and no later than an hour past its clock; one of
+those words -- and null otherwise, and never refuses an activation for them,
+since an extender with a wrong clock must still be published. A restart is then
+a new run id among an extender's activations rather than something inferred
+from its platform connections. The process is what has a run, so every slot of
+one sn miner shares it, and separate processes on one identity key are a run
+each. The queries are in EXTENDER-ACTIVATION.md §5, item 2.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
