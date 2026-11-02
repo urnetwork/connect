@@ -4618,3 +4618,164 @@ The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
 cover these root causes with synthetic fixtures and explicit ordering. This
 review preserves the phased server/SDK and empty borrowed-resource limitations
 listed above; it does not change their deployment status.
+
+## Design note: authenticated seed bundle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The cold-start bootstrap of EXTENDER-UPDATE2 §2 is built in connect as a
+separate signed format beside the unsigned K7 share, which is unchanged.
+
+- Format (`protocol/extender.proto`, new messages only): `ExtenderSeedBody`
+  (format version 1, network host, sequence, issue and expiry times, serialized
+  open-tier records, serialized root-signed revocations) inside
+  `ExtenderSeedEnvelope` (body bytes, signature, key id). The envelope is
+  ed25519 over `ur-extender-seed-v1` || body; the key id is a lookup hint only.
+  The text form is `ur-seed:1:` and base64url without padding
+  (`net_extender_seed.go`).
+- Trust: an envelope verifies only under the root keys the directory already
+  holds (network-space configuration or hello), and every record inside is
+  verified again under its own root signature, network host, tier
+  (`ExtenderRecordOpen`, so no gated or canary record) and expiry. A bundle has
+  no field for keys, hosts, gossip urls or resolver settings, and a body or
+  envelope with a field a v1 reader does not know is refused rather than
+  partly read. Records must list public addresses only, outlive the bundle, and
+  be issued before it.
+- Limits: 64 KiB per envelope (checked before decoding), 8 records, 32
+  addresses, 32 revocations, 8 KiB per record, 1 KiB per revocation, a 30-day
+  maximum validity, and a 5-minute clock allowance either way (the directory's
+  `RecordExpireSkew`). A clock outside the allowance gets an explicit
+  `expired` or `not_yet_valid` refusal.
+- State (`net_extender_seed_store.go`): per normalized network host, the
+  greatest accepted sequence, its body digest and the bundle, all hosts in one
+  document saved through a byte backend (`ExtenderSeedStore`, the shape of
+  `ExtenderDirectoryStore`; `ExtenderSeedFileStore` writes temp, sync, rename).
+  Lower sequences are rollbacks, a different body at the floor a conflict, the
+  same bundle idempotent; nothing is written on a refusal; a backend that cannot
+  load fails closed; an undecodable document is no history. A floor binds only
+  while its envelope verifies under the keys in force, so a floor set by a key
+  a root update removed, or by a root a K7 settings import installed, is void
+  and dropped; a rotation the client followed keeps its floor, and an empty key
+  set judges nothing.
+- Directory: records enter only through `ApplyRecord` and revocations through
+  `ApplyRevocationSource`, both with `ExtenderSourceSeed`, revocations first. No
+  address is ever added, so the dialability rule is unchanged: a seed address
+  without a verified key is not dialable. A record applied from a seed carries
+  a per-key `seed` marker (stored as `record_source`); a lapsed seed record is
+  never one of the retained expired identities, so the expiry recovery never
+  offers a stale seed to a new cold start. A newer record from another source
+  clears the marker.
+- Bootstrap pass (`net_extender_seed_bootstrap.go`): https mirrors, each with
+  an optional dns-independent address (tls still verifies the url's host);
+  redirects only to configured hosts over https within a bound; every mirror
+  runs its own attempts with backoff under one attempt, dial and byte budget and
+  one deadline, so a stalled mirror holds up only itself; the first acceptable
+  bundle wins and the rest are canceled. Per-mirror outcomes are fixed codes
+  with no addresses. After a usable apply the owner calls
+  `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
+  once and runs a pass, so control reach and the gated release follow on the
+  seed's verified records.
+
+## Design note: seed bundle follow-up (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+Follow-up to the seed bundle note above, after an audit of connect main
+against EXTENDER-UPDATE2 §2.1–§2.4.
+
+- Mirror reads: a bootstrap pass reads a mirror response to at most one byte
+  past the 64 KiB envelope cap, which is the mirror contract of `/v1/seed.bin`
+  (api/bringyour.yml), and refuses a response with that byte, or a stated
+  length past the cap, as `too_large` before decoding. A mirror may still
+  serve the text form, but only of a bundle whose text fits the cap; a file or
+  paste import keeps the text form's own cap.
+- Stored apply: `ApplyStoredExtenderSeed` applies the accepted bundle of every
+  network host the directory accepts and passes over a host whose bundle no
+  longer verifies or is stale, which keeps its floor. One host's stale bundle
+  never keeps another's fresh one from applying.
+- One store per space: the void rule judges every state a seed document holds
+  under the keys of each call, so an acceptor and its store serve one network
+  space, whose hosts share its root keys. The sdk keeps one store per space.
+- K7 hostile root: `net_extender_seed_k7_test.go` takes a hostile share with its
+  settings through the importer's own path (decode,
+  `ExtenderShareRootKeyHexes`, `SetRootKeys`) and accepts a hostile bundle for
+  the real space at a huge sequence under it. Once the roots change back, by a
+  settings change or by the first hello, the hostile floor binds nothing, is
+  dropped from the document, and never comes back with the stored apply or a
+  restart; the next genuine bundle is accepted at its ordinary sequence. The
+  episode costs the genuine floor, which leaves the fresh-install bound: the
+  configured minimum sequence and the validity window.
+- Wake: `ExtenderNetworkClient.Wake()` rearms the hello and hint backoffs and
+  runs a pass at once. Hello is then read over the client strategy, which draws
+  its extenders from the same directory, so control reach follows the seed at
+  once. The pass itself still bootstraps first while the directory is below
+  `LowWaterCount` (4): with dns black-holed and a seed of fewer than four usable
+  records, the feed sample of the seed's records can wait up to `HelloTimeout`
+  (30 s).
+
+## Design note: gated-preferred selection and the release fetch (EXTENDER-UPDATE2 §1, 2026-11-02)
+
+The client half of EXTENDER-UPDATE2 §1. R3's release policy and the server
+route are unchanged by it; the release outcomes and retry times are the
+server's (contract R).
+
+- Policy (`net_extender_directory_gated.go`): `ExtenderDirectory.SetGatedPreference`,
+  off by default. When on, only the connection path changes: the client
+  strategy expands its extender dialers from `ConnectCandidates` and judges the
+  ones it holds with `ConnectAddressUsable`, while the feed, the probe pass and
+  the gossip node draw as before. The policy is judged at each draw, which the
+  strategy makes only when the dialers it holds did not deliver, so a healthy
+  direct connection is never routed through an extender and never waits for a
+  release.
+  - attempt: usable gated records exist. Only they and the manual addresses
+    the user configured are drawn, under one shared budget
+    (`AttemptTimeout`, 10 s). An open dialer the strategy already holds keeps
+    serving, so a gated record that never answers strands no working
+    connection.
+  - gated: a gated record connected, by a dial, a probe or the feed. The open
+    dialers drain: the collapse drops them for new requests and a live
+    connection through one runs on. A gated record that stopped being usable
+    since the last draw falls back before any open dialer is drained.
+  - fallback: verified open records are drawn after the gated ones, for a
+    reason from a fixed set -- `no_gated_record`, `release_<outcome>`,
+    `release_failed`, `gated_failed`, `gated_timeout`, `control_reach` -- and a
+    reachable release route that released nothing usable is a reason like any
+    other. A gated record that connects, or one newly usable (released since,
+    its hold lapsed), ends it; the hold timeout is the gated retry backoff.
+  - The policy asks for a release through `GatedRefreshMonitor` when the
+    current gated records fall below the low watermark and when it falls back
+    for a reason a release can mend; the fetch coalesces the ask.
+- Never a candidate: a revoked record, in any tier (a revoked record is never
+  lapsed, so never a retained expired identity), and a release record that is
+  not a current gated record of this space under the root keys in force or was
+  requested before a reset (`ApplyReleaseRecord`, by `ResetGeneration`).
+- Publication: the K7 share leaves out every address a gated or
+  channel-restricted record names, whatever source it arrived from and in use
+  or not. It carried them before, in-use first. The feed sample, the
+  subscribers (feed stream and mesh) and the seed publisher already refused
+  them.
+- Release fetch (sdk `extender_release.go`, `extender_release_space.go`): one
+  fetcher per space, `POST /network/extender-release` with the client token of
+  the device bound to the space (`bindExtenderRelease`; a hosted space and a
+  read-only extender store never bind). Every trigger -- the schedule, a path
+  change, the directory's ask, the seed bootstrap (`requestExtenderRelease`) --
+  shares one request and one retry budget. The normal refresh is 6 h after an
+  answer that released a record, brought earlier by a jitter of at most
+  30 min and never later than 1 h before the earliest expiry held; failures
+  back off from 1 min to 30 min; the operator's retry time is clamped to
+  [60 s, 6 h]; the client asks at most 4 times an hour and not within 60 s of
+  an answer. An unknown outcome is `empty`. A request that reaches nothing
+  tries the space's control reaches -- the cached verified open records
+  (`AllowOpenForControlReach`), then the seed bootstrap -- once per failure
+  run, and asks again at once when one made a verified open record usable.
+- Account change: a token of another network or client, a sign-out or an
+  unbind cancels the request that is out, discards its answer (answers apply
+  under the binding lock the change takes) and advances the space's account
+  monitor, which the seed bootstrap watches. When another identity binds, the
+  gated records released to the previous one are forgotten
+  (`ForgetGatedRecords`); revocations, open records, manual addresses and the
+  extender's own record stay. The schedule is stored per identity digest, so a
+  restart of the same identity does not ask again early.
+- Cohort control: `NetworkSpaceValues.ExtenderGatedPreference`, applied in
+  place, turns the policy and the fetch on together; outside the cohort the
+  client asks for nothing and spends no disclosure.
+- Status: `ExtenderStatus` gains the mode, the fallback reason, the usable gated
+  count, the last release outcome and the earliest gated expiry; the policy
+  and the fetch keep counts over fixed label sets (`ExtenderGatedStats`, the
+  fetcher's stats). No address, key, id or token is logged or counted.
