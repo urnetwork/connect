@@ -891,6 +891,53 @@ func TestExtenderCommandCamouflageRevalidatesAtItsInterval(t *testing.T) {
 	}
 }
 
+// The command waits for a verification in flight when it stops, past the cancel that
+// ends it, so nothing dials through a server that has gone.
+func TestExtenderCommandWaitsForAVerificationInFlightWhenItStops(t *testing.T) {
+	installTestCamouflageBorrowList(t, testCamouflageBorrowName)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	keyFile, _, _ := writeTestExtenderKeyFile(t)
+	command := startTestCamouflageCommand(t, newTestExtenderOperator(t), func(options *extenderOptions) {
+		options.keyFile = keyFile
+		options.camouflageEnabled = true
+		options.configureCamouflage = func(settings *extender.ExtenderCamouflageRoleSettings) {
+			testCamouflageV4Host(settings)
+			settings.FirstVerificationTimeout = time.Millisecond
+			settings.VerifyBorrowName = func(ctx context.Context, network string, borrowName string) bool {
+				once.Do(func() {
+					close(entered)
+					<-ctx.Done()
+					<-release
+				})
+				return false
+			}
+		}
+	})
+	select {
+	case <-entered:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the verification never ran")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		command.stop()
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("the command stopped with the verification in flight")
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the command did not stop once the verification ended")
+	}
+}
+
 // The command reads the operator's clock from its own api, on the family hosts as
 // well (net_extender_camouflage_clock.go).
 func TestExtenderCommandNamesItsApiHostsForTheCamouflageClock(t *testing.T) {
