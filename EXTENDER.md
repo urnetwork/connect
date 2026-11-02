@@ -1237,6 +1237,14 @@ listening while the activation went on posting. That is probably what happened: 
 EMFILE reproduces the state, but no host's log confirms it, and which failure it was
 is not known.
 
+`ErrorHandler` hears no client's address (`connect/extender/extender_error.go`). A stage
+reports its name and one class of failure: an errno, a timeout, a close, or a constant
+the site names, and nothing of the text or the chain of the error it came from, so a new
+stage or a new kind of error is scrubbed with nothing further done. Only `forward dial`,
+`datagram forward dial`, `nlayer hop dial` and `nlayer probe dial` keep the whole error,
+since each dials what the operator named (A5, A7, A11) and the client's address only
+chooses the family. Those are what an operator reads, and the role logs the first two.
+
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
 key observed revoked in the directory and a network change make every family
@@ -4105,6 +4113,7 @@ with the database.
 | `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
 | sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
 | `extender.ExtenderSettings` | `AcceptRetryMinBackoff`, `AcceptRetryMaxBackoff`, `AcceptDownTimeout`, `CarrierRebuildMinBackoff`, `CarrierRebuildMaxBackoff`, `CarrierRebuildStableTimeout` and `CarriersChangeHandler` added; `ListenErrorHandler` also receives what ended a carrier that was serving (G2) |
+| `extender.ExtenderSettings` | `ErrorHandler` hears a stage's name and a class of failure, and the whole error only of the four dial stages, of which `ExtenderErrorStageNLayerHopDial` and `ExtenderErrorStageNLayerProbeDial` are added; a site's error text no longer names an address, a host or a query name (G2) |
 | `extender.ExtenderServer` | `Carriers` and `DnsPorts` read what is serving now, and nothing once it has ended; `Done` added (G2) |
 | `ExtenderActivator` | `TcpCarrierReturned`, `CarriersChanged` and `State` added, with the settings `CarrierReturnJitter`, `PreviousState` and `ReplacedPostJitter`; no post without a required carrier (G2, G3) |
 | packet translation, server modes | a datagram that cannot be written, or on windows is too long to read, is lost, however long that goes on; a temporary read error is waited out; a closed socket or any other read error ends it; `EndError` added; no socket error it logs, keeps or returns names an address (G2) |

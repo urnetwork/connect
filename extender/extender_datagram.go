@@ -133,9 +133,7 @@ func (self *ExtenderServer) relayDatagram(
 		select {
 		case <-relayCtx.Done():
 		case <-idle.C:
-			self.reportError("datagram relay idle", fmt.Errorf(
-				"no datagram in either direction for %s", extenderDatagramIdleTimeout,
-			))
+			self.reportError("datagram relay idle", extenderFixedError("no datagram in either direction within the idle timeout"))
 		}
 		clientConn.Close()
 		forwardConn.Close()

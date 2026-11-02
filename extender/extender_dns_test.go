@@ -383,7 +383,7 @@ func TestExtenderForwarderEnforcesItsQueryRates(t *testing.T) {
 				settings.DnsMaxQueryBurstPerSource = 1
 				settings.DnsMaxQueryRatePerSource = 0.001
 			},
-			expect: "is over its query rate",
+			expect: "the source is over its query rate",
 		},
 		{
 			description: "total",
@@ -612,7 +612,7 @@ func TestExtenderForwarderAnswerErrorNamesNoAddress(t *testing.T) {
 			{
 				name:       "an address the socket cannot send to",
 				err:        opError(&net.AddrError{Err: "non-IPv4 address", Addr: addrs.client.IP.String()}),
-				expectText: "non-IPv4 address",
+				expectText: extenderErrorAddress.Error(),
 			},
 		} {
 			t.Run(addrs.name+"/"+testCase.name, func(t *testing.T) {

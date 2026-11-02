@@ -191,7 +191,7 @@ func TestExtenderForwarderLimitsAnIpv6Source(t *testing.T) {
 	if err == nil {
 		t.Fatal("an ipv6 source over its burst was admitted")
 	}
-	if !strings.Contains(err.Error(), "2001:db8::1 is over its query rate") {
+	if !strings.Contains(err.Error(), "the source is over its query rate") {
 		t.Fatalf("attributed error = %v, expected the per-source rate of the ipv6 address", err)
 	}
 	// another ipv6 source spends its own budget
@@ -242,7 +242,7 @@ func TestExtenderForwarderLimitsAnIpv6Source(t *testing.T) {
 	inFlightForwarder.handleQuery(queryBytes, &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 2053})
 	select {
 	case err := <-extenderErrors:
-		if !strings.Contains(err.Error(), "2001:db8::1 already has a query in flight") {
+		if !strings.Contains(err.Error(), "the source already has a query in flight") {
 			t.Fatalf("attributed error = %v, expected the in flight rule of the ipv6 address", err)
 		}
 	default:

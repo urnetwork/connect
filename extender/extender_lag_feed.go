@@ -81,7 +81,7 @@ func (self *extenderLagFeedHandler) ServeHTTP(w http.ResponseWriter, r *http.Req
 			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 		}
 		w.WriteHeader(http.StatusTooManyRequests)
-		self.server.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		self.server.reportError(extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
 		return
 	}
 

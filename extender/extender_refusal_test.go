@@ -158,7 +158,7 @@ func TestExtenderRefusesAnUndecodableHeader(t *testing.T) {
 			description:   "a body under the cap that is not a header",
 			bodyBytes:     bytes.Repeat([]byte{0xff}, 16),
 			contentLength: 0,
-			expect:        "cannot parse",
+			expect:        "does not parse",
 		},
 	}
 	for _, c := range cases {
