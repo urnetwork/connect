@@ -80,6 +80,12 @@ func TestExtenderAcceptErrorIsTransient(t *testing.T) {
 		testAcceptError(syscall.ENETDOWN),
 		testAcceptError(syscall.ENETUNREACH),
 		testAcceptError(syscall.EHOSTUNREACH),
+		// what winsock numbers them, which syscall's names do not match on windows
+		testAcceptError(syscall.Errno(10024)),
+		testAcceptError(syscall.Errno(10053)),
+		testAcceptError(syscall.Errno(10054)),
+		testAcceptError(syscall.Errno(10055)),
+		testAcceptError(syscall.Errno(10060)),
 		// unwrapped, and through another's wrapping, as a seam may return it
 		syscall.EMFILE,
 		fmt.Errorf("the listener: %w", syscall.ENFILE),
@@ -362,6 +368,40 @@ func TestExtenderCarrierPanicIsRebuilt(t *testing.T) {
 	fixture.waitCarrier(connect.ExtenderCarrierTcp, true)
 	fixture.expectServing("after the panic", testEveryCarrier...)
 	fixture.expectNotEnded("after the panic")
+}
+
+// An owner's handler that panics costs the owner the news and nothing else: the panic
+// used to take the process, since supervision has no recovery of its own around
+// them, and the port goes on being rebuilt.
+func TestExtenderCarrierOwnerHandlerPanicIsContained(t *testing.T) {
+	listenErrorCalls := &atomic.Int64{}
+	carriersChangeCalls := &atomic.Int64{}
+	fixture := newTestCarrierFixture(t, nil, func(_ *testCarrierFixture, settings *ExtenderSettings) {
+		testFastCarrierRebuild(settings)
+		settings.ListenErrorHandler = func(carrier string, err error) {
+			listenErrorCalls.Add(1)
+			panic("the test's panic in an owner's handler")
+		}
+		settings.CarriersChangeHandler = func() {
+			carriersChangeCalls.Add(1)
+			panic("the test's panic in an owner's handler")
+		}
+	})
+	fixture.currentListener().Listener.Close()
+
+	testEventually(t, "the rebuild", func() bool { return fixture.tcpBindCount.Load() == 2 })
+	fixture.waitCarrier(connect.ExtenderCarrierTcp, true)
+	testEventually(t, "the handlers", func() bool {
+		// the loss and the return, and the reason for the loss
+		return carriersChangeCalls.Load() == 2 && listenErrorCalls.Load() == 1
+	})
+	fixture.expectServing("after the panics", testEveryCarrier...)
+	fixture.expectNotEnded("after the panics")
+
+	// and it is still supervised
+	fixture.currentListener().Listener.Close()
+	testEventually(t, "the second rebuild", func() bool { return fixture.tcpBindCount.Load() == 3 })
+	fixture.waitCarrier(connect.ExtenderCarrierTcp, true)
 }
 
 // A udp carrier whose socket fails is bound again and answers again, and tcp never
