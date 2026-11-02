@@ -19,6 +19,8 @@ func newTestCamouflageReportServer(t *testing.T) *ExtenderServer {
 	settings := DefaultExtenderSettings()
 	settings.CamouflageEnabled = true
 	settings.IdentityKeySeed = mustSeed(t)
+	// a healthy Phase A host: a verified name, and the splice off
+	settings.CamouflageBorrowNames = []string{testBorrowName}
 	server := NewExtenderServer(context.Background(), nil, nil, nil, &net.Dialer{}, settings)
 	t.Cleanup(server.CloseAndWait)
 	return server
