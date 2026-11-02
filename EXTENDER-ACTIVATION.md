@@ -242,13 +242,15 @@ Main wrote 795 rows from 13:15 to 22:15Z, about 2,100 a day.
 - **The path:** merge to connect main, then the next build release takes the new pin. Miners installed as a service update within a day through their 6-hour update timer.
 - **Watch on Main afterwards:** the 6-hour single-family rows and the hour-aligned full passes should disappear. The queries are in the appendix.
 
-## 5. What this branch does not fix (proposals, not implemented)
+## 5. What this branch did not fix, and where each stands (2026-11-02)
 
 ### Item 1. lag.dev's offers skip unstable extenders
 
-Server branch `lagdev/offer-stability`, in progress: `GET /lag/extenders` skips an extender in a restart loop, or one whose last uptime probe failed, with thresholds from a 48 h replay. It's a lag.dev mitigation, and it doesn't stop the loops.
+**Done.** `GET /lag/extenders` and the tickets leave out an extender in a restart loop (lag.dev amendment 26) and one whose measurement API a probe can't reach (amendment 27). Both are live. The uptime probe isn't used, since it failed for extenders whose measurement API answered. This is a lag.dev mitigation and doesn't stop the loops.
 
 ### Item 2. Restart loops
+
+**Open.** The server stores each activation's run (§7), but nothing sends one until a miner release.
 
 - Ask the operators of networks `01983769` and `01979e1c` for `journalctl`, `dmesg` (OOM) and host memory.
 - Profile the provider at about 20k sources an hour.
@@ -256,6 +258,8 @@ Server branch `lagdev/offer-stability`, in progress: `GET /lag/extenders` skips 
 - **Record how each run ended on a systemd host.** Run ids and, under a supervisor, exit reasons are built (§7), but the installed unit runs plain `provider start` with no supervisor (`sn/miner/cli_service.go`), so most hosts report no exit. The unit could add an `ExecStopPost=` that records `URNETWORK_PREVIOUS_EXIT` from `$SERVICE_RESULT` for the next start, with `oom-kill` mapping to `oom`. Only systemd knows that result, and it's the one source of `oom`. It only reaches hosts whose unit gets rewritten: the unit is written by `provider service install`, so updating the binary leaves an installed unit as it is.
 
 ### Item 3. The revocation loop
+
+**Diagnosis started; the options below are undecided.** Since 2026-11-02 15:55Z the uptime probe logs a `[extenderprobe]diagnostic` line for a failing address, at most once an hour. The first 11 lines were 8 `tls_no_answer` and 3 `timeout`, with no `admission_limited` or `closed_before_tls`. Those sweeps failed only 1 to 6 of about 212 addresses, because the hosts that had been failing were already revoked, and the lines say nothing about those.
 
 - **Diagnose first:** find out why uptime probes fail right after a passing activation probe on about 56 hosts on `01979e1c`. Log probe errors at V(1) for those addresses for a while, and check A12 admission (8 actions per subnet per minute, `connect/extender/extender.go` l.115).
 - **Then one of:**
@@ -265,6 +269,11 @@ Server branch `lagdev/offer-stability`, in progress: `GET /lag/extenders` skips 
 
 ### Item 4. Shared identities
 
+**Status:**
+- **Miner: merged, not released** (sn `8b9b910e`). A miner with a proxy file then runs no extender, and whether a proxy run should have one slot is undecided.
+- **Operator: live since 2026-11-02 18:59Z** (server `3e4d2a32d`). Activation no longer moves a key across networks. Moves inside a network still happen, and a takeover rule for those is undecided.
+
+The original proposal:
 - **Miner:** only the direct slot runs the extender role (`sn/miner/run.go`, `provideWithProxy`).
 - **Operator:** refuse a key that a different client activated in the last 24 h, and add `client_id` to `network_extender_activation`.
   - It needs a migration, which blocks Main deploys until it's applied.
@@ -272,7 +281,7 @@ Server branch `lagdev/offer-stability`, in progress: `GET /lag/extenders` skips 
 
 ### Item 5. The probe-failure reset
 
-Should an activation stop resetting `consecutive_probe_failures`? Today a restart every 25 min keeps a stalling extender active indefinitely.
+**Done, in the api since 2026-11-02 18:59Z.** A re-activation of an address still active on the same IP keeps its `consecutive_probe_failures`. An address the probes deactivated, or one on another IP, starts at zero. Before this, a restart every 25 min kept a stalling extender active indefinitely.
 
 ### Item 6. Record churn (optional)
 
@@ -358,6 +367,15 @@ where extender_id = '<extender_id>'
 group by run_id
 order by first_activate_time;
 ```
+
+## 8. The Nov 1 fleet drop
+
+Network `01979e1c` fell from about 190 active extenders to 58, starting about 20:00Z on Nov 1. 147 were revoked from then on, and 131 of those kept posting.
+
+- **Probably:** one carrier failure closed every carrier (EXTENDER.md G2). The measured state fits: the process up and still posting, connected to the platform, with TCP 443 and UDP 53 closed, while status read as listening. On the old code, a real EMFILE reproduces it. No host log confirms it, and which failure fired is unknown. The old processes' journals should show `[extender] accept error`, `[extender] udp carrier`, `[pt]write err` or `Unexpected error`, so get them before restarting a host.
+- **Not the activation budget.** Budget refusals came in waves from two other networks with no extenders: `01983c4d` (14,150 active clients, then all removed at 14:02Z on Nov 2) and `01984483` (2,430). A batch of clients started together posts together at +10, +30, +70, +150, +310 and +630 min, about 3,300 refused in a 3-minute wave. `01979e1c` sat at about 40 to 57 of its 60 an hour in those windows. A refused post leaves no row, so the refused account is the one whose rolling hour reads exactly 60. Tested in advance: `01984483` spent exactly 60 at 16:30:03-05Z on Nov 2, its midnight series' +990. The per-host budget (connect#230) is right for a proven fleet restarting, and it left `01979e1c` flat for an hour; it had climbed to 70 by 19:21Z, for reasons not established.
+- **The fix:** each carrier now recovers on its own, and no activation is posted while TCP is lost (connect `c4c99031`, sdk `2ae5419a`). It reaches providers only through a miner release, and hosts already down need a restart either way. It doesn't cover hosts that time out rather than refuse (10 of 47 sampled), hosts where TLS stalls after TCP connects (4 of 12 failing active addresses), or addresses that only the uptime probe finds failing (7 of those 12).
+- **A remote kill it closed on `alt`:** before connect `6203a4e8`, about 40 datagrams from a raw sender with source port 0 could end a server-mode translation's socket, and losing a listener ends the `alt` process. A failed write now costs one datagram, and a socket whose writes all fail stays up. Don't roll `alt` back past 2026.11.2-outerwerld+1088438700.
 
 ## Appendix: reproducing the numbers (Main, read-only)
 
