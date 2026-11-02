@@ -776,16 +776,17 @@ func TestExtenderCamouflageReporterNeverRetriesPastItsAge(t *testing.T) {
 			t.Errorf("stats = %+v", stats)
 		}
 	})
-	t.Run("the age holds the wall clock of a monotonic clock that stopped", func(t *testing.T) {
+	t.Run("the age reads the wall clock", func(t *testing.T) {
+		// a reading with a monotonic part and one without compare by the wall, which is
+		// what a monotonic clock that stopped during a sleep leaves as the longer age.
+		// The stopped clock itself cannot be made in a test.
 		createTime := time.Now()
 		pending := &extenderCamouflagePendingReport{createTime: createTime}
-		// the same monotonic reading, eight hours on by the wall
 		now := createTime.Add(time.Minute)
-		wallNow := now.Round(0).Add(8 * time.Hour)
 		if age := pending.age(now); age != time.Minute {
 			t.Errorf("age = %s", age)
 		}
-		if age := pending.age(wallNow); age < 8*time.Hour {
+		if age := pending.age(now.Round(0).Add(8 * time.Hour)); age < 8*time.Hour {
 			t.Errorf("age by the wall = %s", age)
 		}
 	})
