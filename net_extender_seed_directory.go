@@ -41,6 +41,11 @@ func ApplyExtenderSeed(directory *ExtenderDirectory, bundle *ExtenderSeedBundle)
 	if bundle == nil {
 		return nil, newExtenderSeedError(ExtenderSeedCodeMalformed, nil, "the bundle is missing")
 	}
+	// a bundle verified a while ago is judged fresh again by the directory's
+	// clock, so holding a bundle never outlasts its validity
+	if err := checkExtenderSeedFreshness(bundle.IssueTime, bundle.ExpireTime, directory.settings.Now()); err != nil {
+		return nil, err
+	}
 	result := &ExtenderSeedApplyResult{}
 	for _, revocation := range bundle.Revocations {
 		changed, err := directory.ApplyRevocationSource(revocation.Revocation, ExtenderSourceSeed)
@@ -87,4 +92,97 @@ func ExtenderSeedUsableRecordCount(directory *ExtenderDirectory, bundle *Extende
 		}
 	}
 	return count
+}
+
+// What an import or a stored apply did.
+type ExtenderSeedImportResult struct {
+	Bundle *ExtenderSeedBundle
+	// ExtenderSeedOutcomeAccepted or ExtenderSeedOutcomeIdentical; empty for
+	// a stored apply, which accepts nothing
+	Outcome string
+	Apply   *ExtenderSeedApplyResult
+}
+
+// Imports one seed artifact -- a file, pasted text, or a bundle an application
+// release carries -- in either form (ParseExtenderSeedArtifact). It is judged
+// exactly as a mirror's artifact is: verified under the root keys and network
+// hosts the directory holds and fresh by the directory's clock, accepted under
+// the sequence rules, and only then applied. An import is no exception to any
+// of them, so an expired embedded bundle fails its freshness check like any
+// other. A bundle that is accepted but whose records are all expired or
+// revoked is a `no_usable_record` refusal, with the result.
+func ImportExtenderSeed(
+	directory *ExtenderDirectory,
+	acceptor *ExtenderSeedAcceptor,
+	artifact []byte,
+) (*ExtenderSeedImportResult, error) {
+	if directory == nil || acceptor == nil {
+		return nil, fmt.Errorf("extender seed import needs a directory and an acceptor")
+	}
+	envelope, err := ParseExtenderSeedArtifact(artifact)
+	if err != nil {
+		return nil, err
+	}
+	rootKeys := directory.RootKeys()
+	bundle, err := VerifyExtenderSeed(envelope, rootKeys, directory.settings.NetworkHosts, directory.settings.Now())
+	if err != nil {
+		return nil, err
+	}
+	outcome, err := acceptor.Accept(bundle, rootKeys)
+	if err != nil {
+		return nil, err
+	}
+	return applyExtenderSeedImport(directory, bundle, outcome)
+}
+
+// Applies the accepted bundle of the directory's space again, which is what a
+// start does before any mirror is asked: verified under the root keys and
+// network hosts in force and fresh by the directory's clock. The first of the
+// directory's network hosts with an accepted bundle is applied. Nil and no
+// error when none has one; the typed refusal when the bundle no longer
+// verifies or is no longer fresh, whose floor stays (ExtenderSeedAcceptor.Stored).
+func ApplyStoredExtenderSeed(
+	directory *ExtenderDirectory,
+	acceptor *ExtenderSeedAcceptor,
+) (*ExtenderSeedImportResult, error) {
+	if directory == nil || acceptor == nil {
+		return nil, fmt.Errorf("extender seed apply needs a directory and an acceptor")
+	}
+	rootKeys := directory.RootKeys()
+	networkHosts := directory.settings.NetworkHosts
+	for _, networkHost := range networkHosts {
+		bundle, err := acceptor.Stored(networkHost, rootKeys, networkHosts, directory.settings.Now())
+		if err != nil {
+			return nil, err
+		}
+		if bundle == nil {
+			continue
+		}
+		return applyExtenderSeedImport(directory, bundle, "")
+	}
+	return nil, nil
+}
+
+func applyExtenderSeedImport(
+	directory *ExtenderDirectory,
+	bundle *ExtenderSeedBundle,
+	outcome string,
+) (*ExtenderSeedImportResult, error) {
+	apply, err := ApplyExtenderSeed(directory, bundle)
+	result := &ExtenderSeedImportResult{
+		Bundle:  bundle,
+		Outcome: outcome,
+		Apply:   apply,
+	}
+	if err != nil {
+		return result, err
+	}
+	if apply.UsableRecordCount == 0 {
+		return result, newExtenderSeedError(
+			ExtenderSeedCodeNoUsableRecord,
+			nil,
+			"every record of the bundle is expired or revoked",
+		)
+	}
+	return result, nil
 }
