@@ -1083,6 +1083,58 @@ func TestExtenderActivatorWaitsTheRetryAfterOfAPrivateFamily(t *testing.T) {
 	}
 }
 
+// A wake that arrives as a pass starts is not lost. The loop read its clock and
+// then subscribed to its wakes, so a wake between the two was missed by the
+// subscribe while its pass ran on the time before it, found nothing due, and
+// went back to wait with nothing to end the wait. The clock read makes the
+// interleaving exact here: the first pass's read returns its time and then
+// advances the clock and wakes the loop, as a test's step does. On a loaded
+// host that window took
+// TestExtenderActivatorPostsAFamilyThatGainsAnAddressLate, whose first step
+// lands as the activation's own directory change starts the next pass.
+func TestExtenderActivatorKeepsAWakeThatArrivesAsAPassStarts(t *testing.T) {
+	var clockReads atomic.Int64
+	var prepared *testActivatorFixture
+	fixture := newTestActivatorFixtureWithPrepare(
+		t,
+		func(fixture *testActivatorFixture) {
+			prepared = fixture
+			// a refusal applies no record, so no directory change of the
+			// pass's own can end the wait in the wake's place
+			fixture.operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+			settings.ResumeCheckTimeout = 0
+			// nothing but a wake ends the wait
+			settings.PassAfter = func(wait time.Duration) <-chan time.Time {
+				return nil
+			}
+			settings.Now = func() time.Time {
+				now := prepared.clock.Now()
+				// the resume watch takes the first read, and the first pass
+				// the second
+				if clockReads.Add(1) == 2 {
+					prepared.clock.advance(time.Hour)
+					prepared.wake()
+				}
+				return now
+			}
+		},
+	)
+
+	// the first pass, on the time before the wake
+	fixture.waitPass()
+	fixture.waitPost()
+	// the pass the wake asked for, an hour on, with the hold of the first
+	// pass's refusal run out
+	fixture.waitPass()
+	fixture.waitPost()
+	if count := fixture.operator.postCount(4); count != 2 {
+		t.Fatalf("v4 posts = %d, expected 2", count)
+	}
+}
+
 // A revocation of this extender's own key, observed in the directory,
 // re-activates at once rather than waiting out the 24 hour tick (G3, B5).
 func TestExtenderActivatorReactivatesOnRevocation(t *testing.T) {

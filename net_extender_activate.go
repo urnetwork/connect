@@ -628,15 +628,17 @@ func (self *ExtenderActivator) run() {
 		default:
 		}
 
-		now := self.settings.Now()
+		// the clock and the directory are read below, so the subscribes belong
+		// ahead of both: a revocation applied while this pass runs, or a wake
+		// that arrives as it starts, must wake the next wait, and a wake ahead
+		// of the subscribes is one this pass's reads already see. With no
+		// directory the channel stays nil, which never fires.
 		wake := self.wakeMonitor.NotifyChannel()
-		// the directory is read below, so the subscribe belongs here: a
-		// revocation applied while this pass runs must wake the next wait.
-		// With no directory the channel stays nil, which never fires.
 		var directoryChange chan struct{}
 		if self.settings.Directory != nil {
 			_, directoryChange = self.settings.Directory.ChangeMonitor().Get()
 		}
+		now := self.settings.Now()
 
 		// a revocation and a network change leave every record of this host in
 		// doubt, so every family is due, whatever its own schedule says
