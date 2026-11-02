@@ -2443,7 +2443,11 @@ paths:
       tags: [Preferences]
       summary: Preferences Set
       description: |
-        Set account preferences.
+        Set account preferences. A call is recorded as the account holder's
+        own choice in settings, which the email campaigns read as consent
+        evidence: call it for a change the user makes, not to repeat the
+        sign-up form's choice, which /auth/network-create records from its
+        `product_updates`.
       operationId: preferencesSet
       security:
         - BearerAuth: []
@@ -8158,13 +8162,38 @@ paths:
       tags: [Other]
       summary: Record a campaign landing click
       description: |
-        Record a campaign landing-page click. Every onboarding email link is
-        `https://ur.io/o/<step>?t=<token>`; the landing page posts the token
-        here, which writes the server-side `landing.clicked` attribution
-        event and answers with the in-app destination to route to
-        (`onboarding/connect`, `onboarding/widgets`, `onboarding/offer`,
-        `onboarding/feedback`). An app open (`/network/auth-client`) within
-        48 h of the click is attributed to it as `app.opened`.
+        Record a campaign landing-page click. Every button in the onboarding
+        and re-engagement emails links to a landing page,
+        `https://ur.io/o/<step>?t=<token>`, whose `<step>` is a
+        landing slug (LandingStep): `connect`, `widgets`, `offer` or
+        `feedback` from an onboarding email, `connect`, `update`, `keep`,
+        `learn` or `winback` from a re-engagement email. The page posts the
+        token here and routes by the link's own slug:
+
+        - `connect`, `widgets`, `offer` and `feedback` open that screen of
+          the app, passing the token as `t`: on Android the app link
+          `https://ur.io/c?onboarding=<step>` through an intent that falls
+          back to the Play listing, on iOS `urnetwork://onboarding/<step>`
+          with a link to the App Store if the app does not open, and on a
+          desktop the web app.
+        - `winback` opens the plan screen as `offer` does (the web app's
+          subscription page on a desktop).
+        - `update` opens the app's store listing (the download page on a
+          desktop), and `learn` the threat model,
+          `https://ur.io/docs/threat-model`.
+        - `keep` opens nothing: the click itself is the answer to the
+          "should I keep writing?" email, and the page says so once this
+          call has recorded it.
+
+        The server records the click, as `landing.clicked` for an onboarding
+        link and `reengage.landing.clicked` for a re-engagement link (with
+        `reengage.keep` for a `keep` link), and answers with the token's
+        `step`, always a landing slug, and the in-app `destination` for it.
+        Servers before the change of 2026-11-01 answered an onboarding token
+        with its email template's name (`e4b_offer`) instead, so a client
+        routes by the slug in the link and reads `step` only for a link
+        without one. An app open (`/network/auth-client`) within 48 h of an
+        onboarding click is attributed to it as `app.opened`.
 
         No authentication: the signed token is the credential, and the
         response carries nothing about the network. An expired token still
@@ -8193,14 +8222,21 @@ paths:
                 $ref: "#/components/schemas/OnboardingClickResult"
               examples:
                 attributed:
+                  summary: An onboarding offer button
                   value:
                     ok: true
-                    step: e1_connect
-                    destination: onboarding/connect
+                    step: offer
+                    destination: onboarding/offer
+                winback:
+                  summary: A re-engagement win-back button
+                  value:
+                    ok: true
+                    step: winback
+                    destination: onboarding/offer
                 expired:
                   value:
                     ok: false
-                    step: e1_connect
+                    step: connect
                     destination: onboarding/connect
                     error: expired
         "429":
@@ -8223,13 +8259,35 @@ paths:
       tags: [Other]
       summary: Resolve a feedback link token
       description: |
-        Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
-        `?why=n`) to the rating or reason the one-tap email button stood
-        for, so the in-app feedback screen opens pre-filled. The token
-        carries the step and may carry the rating/reason; `r` (1-5) and
-        `why` (a reason token) override when present. The app then submits
-        the actual feedback through `/feedback/send-feedback` and reports
-        `feedback.submitted` through `/client/events`.
+        Resolve a feedback link token to the rating or reason the one-tap
+        email button stood for, so the in-app feedback screen opens
+        pre-filled. The buttons link to the landing page
+        `https://ur.io/f/<token>?r=<rating>` (1-5) or
+        `https://ur.io/f/<token>?why=<reason>`, which calls this endpoint and
+        then opens the app's feedback screen with the answer as `r` or `why`
+        and the token as `t` (`https://ur.io/c?onboarding=feedback` on
+        Android, `urnetwork://onboarding/feedback` on iOS, the web app's
+        support page on a desktop). The token carries the step and may carry
+        the rating or reason; `r` and `why` override when present.
+
+        `why` is a reason code. The onboarding feedback email's buttons are
+        the four reasons of the apps' feedback screen: `not_needed`,
+        `not_working`, `trust` and `other` (its older links carry `1` to
+        `4`, which resolve to those four in that order). The re-engagement
+        email that asks why the reader stopped adds `stopped`, `slow` and
+        `switched` (its buttons are `stopped`, `slow`, `not_needed`,
+        `switched` and `other`); for its links `reason` is the closest of the
+        apps' four (`stopped` and `slow` → `not_working`, `switched` →
+        `other`) and `step` is `feedback`.
+
+        The tap is the answer, recorded when the link resolves so it counts
+        even if the reader never sends the in-app form: `feedback.tapped`,
+        with the rating or one of the four reasons, for an onboarding link;
+        `reengage.reason`, with the reason as tapped, for a re-engagement
+        link, whose answer also decides the network's next re-engagement
+        email (or that there is none). The app then submits the form through
+        `/feedback/send-feedback` and reports `feedback.submitted` through
+        `/client/events`.
 
         No authentication: the signed token is the credential. Budgeted per
         caller address (60 per 10 minutes) -> 429 with Retry-After.
@@ -8253,7 +8311,11 @@ paths:
         - name: why
           in: query
           required: false
-          description: Reason token from the tapped button.
+          description: |
+            The reason code of the tapped button: `not_needed`,
+            `not_working`, `trust` or `other`, and on a re-engagement link
+            also `stopped`, `slow` or `switched`. Older onboarding links
+            carry `1` to `4`.
           schema:
             type: string
       responses:
@@ -8265,16 +8327,23 @@ paths:
                 $ref: "#/components/schemas/OnboardingFeedbackTokenResult"
               examples:
                 rating:
+                  summary: A rating button (`?r=4`)
                   value:
                     ok: true
-                    step: e4_feedback
+                    step: feedback
                     rating: 4
-                    reason: ""
                 reason:
+                  summary: An onboarding reason button (`?why=not_working`)
                   value:
                     ok: true
-                    step: e4_feedback
-                    reason: did_not_work
+                    step: feedback
+                    reason: not_working
+                reengagementReason:
+                  summary: A re-engagement reason button (`?why=slow`)
+                  value:
+                    ok: true
+                    step: feedback
+                    reason: not_working
         "429":
           description: |
             Too many requests from this address. The body is PLAIN TEXT, not JSON: every non-2xx in this api is
@@ -8894,19 +8963,24 @@ paths:
         password half is empty.
 
         `unsubscribe` turns the account's product-updates preference off (the
-        existing behavior). For the onboarding campaign the remaining events
-        are recorded as server-written
+        existing behavior) and records the unsubscribe as how the preference
+        was last set. The events are recorded against the network of the
+        campaign send that `message-id` names: for an onboarding send as a
+        server-written
         `email.delivered|opened|clicked|bounced|complained|unsubscribed`
-        events against the network, with the campaign step taken from the
-        stored send that `message-id` names. An event whose message id is not
-        a known campaign send records nothing.
+        event with the campaign step, for a re-engagement send as
+        `reengage.email.delivered|clicked|bounced|complained|unsubscribed`
+        (opens are not recorded). An event whose message id is not a known
+        campaign send records no campaign event.
 
         The event name is matched lower-cased against this exact set:
         `delivered`; `opened`, `unique_opened`, `proxy_open`; `click`,
         `clicked`; `hard_bounce`, `blocked`, `invalid_email`, `error`;
         `spam`, `complaint`; `unsubscribed`, `unsubscribe`. Anything else
-        records no campaign event. A hard bounce or a complaint exits the
-        network from the sequence.
+        records no campaign event. A hard bounce, a complaint or an
+        unsubscribe exits the network from that program's sequence, and a
+        hard bounce or a complaint in either program also stops all campaign
+        mail to the network.
       operationId: brevoWebhook
       security:
         - BrevoWebhookAuth: []
@@ -8923,7 +8997,7 @@ paths:
                   email: person@example.com
                   message-id: "<202609091600.123@smtp-relay.mailin.fr>"
                   tags: [onboarding, e1_connect, control]
-                  link: https://ur.io/o/e1_connect?t=...
+                  link: https://ur.io/o/connect?t=...
                   ts_event: 1757495521
       responses:
         "200":
@@ -10091,7 +10165,11 @@ components:
             preference off from the first moment: no onboarding campaign mail
             is ever sent. Honored on every create path, including sign-ups
             that complete through /auth/verify. The server records a
-            `signup.optout_changed` event with the value.
+            `signup.optout_changed` event with the value, and, as the consent
+            evidence the email campaigns read, whether the request carried the
+            field at all. Send it exactly when the form shows the line, ticked
+            or not: a request with the field is recorded as the user's answer
+            to the switch, one without it as a default the user never saw.
         result_errors:
           description: |
             Answer a refusal that has a code (`signature_mismatch`) with the
@@ -12998,7 +13076,8 @@ components:
         keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
         at most 64 characters. Server-written names (`landing.clicked`,
         `app.opened`, `email.*`, `trial.*`, `refund`, `retention.*`,
-        `connect.day`) are refused from clients.
+        `connect.day`, `feedback.tapped`, and the re-engagement program's
+        `reengage.*`) are refused from clients.
       oneOf:
         - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
         - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
@@ -13497,6 +13576,26 @@ components:
         token:
           type: string
 
+    LandingStep:
+      type: string
+      description: |
+        A campaign landing page's slug, the `<step>` of
+        `https://ur.io/o/<step>`. The onboarding emails link `connect`,
+        `widgets`, `offer` and `feedback`; the re-engagement emails link
+        `connect`, `update` (the app's store listing), `keep` (the answer to
+        "should I keep writing?", which opens nothing), `learn` (the threat
+        model) and `winback` (the plan screen), and their reason buttons
+        resolve to `feedback`.
+      enum:
+        - connect
+        - widgets
+        - offer
+        - feedback
+        - update
+        - keep
+        - learn
+        - winback
+
     OnboardingClickResult:
       type: object
       required:
@@ -13505,11 +13604,17 @@ components:
         ok:
           type: boolean
         step:
-          type: string
-          description: the campaign step the link belongs to (e.g. e1_connect)
+          description: |
+            The landing slug the token routes to, never an email template's
+            name. Absent for an invalid token.
+          $ref: "#/components/schemas/LandingStep"
         destination:
           type: string
-          description: the in-app destination to route to
+          description: |
+            The in-app destination for `step`. `connect`, `widgets`, `offer`
+            and `feedback` route to their own; `winback` to
+            `onboarding/offer`; `update`, `keep` and `learn`, which the
+            landing page does not open in the app, to `onboarding/connect`.
           enum:
             - onboarding/connect
             - onboarding/widgets
@@ -13529,7 +13634,10 @@ components:
         ok:
           type: boolean
         step:
-          type: string
+          description: |
+            The token's landing slug, `feedback` for every feedback link.
+            Absent for an invalid or expired token.
+          $ref: "#/components/schemas/LandingStep"
         rating:
           type: integer
           description: |
@@ -13537,6 +13645,15 @@ components:
             omits the zero value rather than sending 0).
         reason:
           type: string
+          description: |
+            The reason code to pre-select; absent when there is none. For an
+            onboarding link, the link's code (`not_needed`, `not_working`,
+            `trust` or `other`; an older link's `1` to `4` come back as
+            those codes), and a `why` outside the four is passed back as sent
+            and not recorded. For a re-engagement link, the closest of the
+            four to the reason tapped (`stopped` and `slow` → `not_working`,
+            `not_needed` → `not_needed`, `switched` and `other` → `other`),
+            absent when the link carried none of its five reasons.
         error:
           type: string
           enum:
