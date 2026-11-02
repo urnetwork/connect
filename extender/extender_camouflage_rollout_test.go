@@ -92,6 +92,47 @@ func TestExtenderCamouflageRuntimeSplicePostureFlipAndRollback(t *testing.T) {
 	}
 }
 
+// The posture is the ExtenderCamouflageSplice setting until SetCamouflageSplice
+// sets one: a setting made after the server was built and before it serves
+// applies, as it did before the runtime flip existed, and a posture set at run
+// time then wins over the setting either way (§3.3).
+func TestExtenderCamouflageSplicePostureFollowsSettingUntilSet(t *testing.T) {
+	settings := DefaultExtenderSettings()
+	settings.CamouflageEnabled = true
+	settings.IdentityKeySeed = mustSeed(t)
+	settings.ExtenderCamouflageSplice = false
+	server := NewExtenderServer(context.Background(), nil, nil, nil, &net.Dialer{}, settings)
+	defer server.CloseAndWait()
+
+	// set after the server was built, before it serves
+	server.settings.ExtenderCamouflageSplice = true
+	if !server.CamouflageSplice() || !server.camouflageSpliceEnabled() {
+		t.Fatal("a splice setting made before serving did not apply")
+	}
+	if status := server.CamouflageStatus(); !status.SpliceOn {
+		t.Fatalf("status = %+v, expected the splice on", status)
+	}
+	server.settings.ExtenderCamouflageSplice = false
+	if server.CamouflageSplice() || server.camouflageSpliceEnabled() {
+		t.Fatal("clearing the splice setting before serving did not apply")
+	}
+
+	// a posture set at run time wins over the setting
+	server.SetCamouflageSplice(true)
+	server.settings.ExtenderCamouflageSplice = false
+	if !server.CamouflageSplice() || !server.camouflageSpliceEnabled() {
+		t.Fatal("the setting overrode a posture set at run time")
+	}
+	server.SetCamouflageSplice(false)
+	server.settings.ExtenderCamouflageSplice = true
+	if server.CamouflageSplice() || server.camouflageSpliceEnabled() {
+		t.Fatal("the setting overrode a rollback set at run time")
+	}
+	if status := server.CamouflageStatus(); status.SpliceOn || status.Covered {
+		t.Fatalf("status = %+v, expected the rollback to hold", status)
+	}
+}
+
 // A working splice already relaying is not interrupted by a rollback: rollback
 // changes posture for new connections and preserves working sessions (§3.3).
 func TestExtenderCamouflageRollbackPreservesActiveSplice(t *testing.T) {

@@ -363,9 +363,9 @@ type ExtenderSettings struct {
 	// (P3): off, an unauthenticated hello is terminated as today; on, it is
 	// spliced to the real borrowed site. Meaningful only while
 	// CamouflageEnabled, off by default and the legacy-safe posture. It is the
-	// initial posture; SetCamouflageSplice flips it at run time, so a Phase B
-	// cohort rolls back to Phase A for new connections without a restart
-	// (EXTENDER-UPDATE2 §3.3).
+	// posture until SetCamouflageSplice sets one at run time, which then wins
+	// over it, so a Phase B cohort rolls back to Phase A for new connections
+	// without a restart (EXTENDER-UPDATE2 §3.3).
 	CamouflageEnabled        bool
 	ExtenderCamouflageSplice bool
 	// CamouflageSpliceGate, when set, is an extra admission gate on the splice
@@ -509,11 +509,14 @@ type ExtenderServer struct {
 	// that one is the intended posture and this one is exposure.
 	camouflageSpliceFallbackTerminatedCount atomic.Int64
 
-	// the runtime splice posture (EXTENDER-UPDATE2 §3.3), seeded from
-	// ExtenderCamouflageSplice and flipped by SetCamouflageSplice. Read on each
-	// accept so a rollback changes only new connections. The gate is the extra
-	// admission condition CamouflageSpliceGate, read beside it.
-	camouflageSpliceOn atomic.Bool
+	// the runtime splice posture (EXTENDER-UPDATE2 §3.3): until
+	// SetCamouflageSplice sets one, the posture is the ExtenderCamouflageSplice
+	// setting, read on each accept as it was before the runtime flip existed,
+	// so a setting made before the server serves still applies. Once set, it
+	// wins over the setting. Read on each accept so a rollback changes only
+	// new connections. The gate is the extra admission condition
+	// CamouflageSpliceGate, read beside it.
+	camouflageSpliceOverride atomic.Int32
 
 	allowedSecrets []string
 	// exact (x) or wildcard (*.x)
@@ -651,7 +654,6 @@ func NewExtenderServer(
 	if 0 < len(self.nlayerHops) {
 		self.nlayerConnectSettings = self.newNLayerConnectSettings()
 	}
-	self.camouflageSpliceOn.Store(settings.ExtenderCamouflageSplice)
 
 	// A certificate failure is reported when serving starts, so the
 	// constructor keeps its shape for callers that cannot handle an error.
@@ -1633,20 +1635,41 @@ func (self *ExtenderServer) camouflageTargetLoads() map[string]ExtenderCamouflag
 // on moves the cohort to Phase B, off rolls it back to Phase A. It takes effect
 // for connections accepted after it returns; splices already relaying keep
 // running. It does nothing structural when camouflage is off — the posture is
-// read only while CamouflageEnabled — but the value is retained.
+// read only while CamouflageEnabled — but the value is retained. Once called,
+// the posture no longer follows the ExtenderCamouflageSplice setting.
 func (self *ExtenderServer) SetCamouflageSplice(on bool) {
-	self.camouflageSpliceOn.Store(on)
+	if on {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOn)
+	} else {
+		self.camouflageSpliceOverride.Store(extenderCamouflageSpliceOverrideOff)
+	}
 }
 
-// CamouflageSplice reports the current runtime splice posture.
+// The values of the runtime splice posture (camouflageSpliceOverride).
+const (
+	// follow the ExtenderCamouflageSplice setting
+	extenderCamouflageSpliceFollowSetting int32 = iota
+	extenderCamouflageSpliceOverrideOn
+	extenderCamouflageSpliceOverrideOff
+)
+
+// CamouflageSplice reports the current runtime splice posture: the one
+// SetCamouflageSplice set, else the ExtenderCamouflageSplice setting.
 func (self *ExtenderServer) CamouflageSplice() bool {
-	return self.camouflageSpliceOn.Load()
+	switch self.camouflageSpliceOverride.Load() {
+	case extenderCamouflageSpliceOverrideOn:
+		return true
+	case extenderCamouflageSpliceOverrideOff:
+		return false
+	default:
+		return self.settings.ExtenderCamouflageSplice
+	}
 }
 
 // Whether the splice admits a hello now (EXTENDER-UPDATE2 §3.2, §3.3): the
 // runtime posture is on and the optional record gate, when set, allows it.
 func (self *ExtenderServer) camouflageSpliceEnabled() bool {
-	if !self.camouflageSpliceOn.Load() {
+	if !self.CamouflageSplice() {
 		return false
 	}
 	if gate := self.settings.CamouflageSpliceGate; gate != nil {
@@ -1709,7 +1732,7 @@ const (
 // on but no reachable target — is reported degraded, never as coverage.
 func (self *ExtenderServer) CamouflageStatus() ExtenderCamouflageStatus {
 	enabled := self.camouflage != nil && self.settings.CamouflageEnabled && self.camouflage.staticPrivateKey != nil
-	spliceOn := self.camouflageSpliceOn.Load()
+	spliceOn := self.CamouflageSplice()
 	gateOpen := true
 	if gate := self.settings.CamouflageSpliceGate; gate != nil {
 		gateOpen = gate()

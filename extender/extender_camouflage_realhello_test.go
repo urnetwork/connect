@@ -103,8 +103,14 @@ func TestExtenderCamouflageRealBrowserHelloSplicedPhaseB(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the real browser hello was not spliced to the borrowed site")
 	}
-	if count := fixture.server.CamouflageStats().SplicedCount; count == 0 {
-		t.Fatal("spliced count did not increment for a real browser hello")
+	// the site accepts during the splice's dial, and the splice counts itself
+	// only once that dial returns, so the count trails the accept
+	deadline := time.Now().Add(10 * time.Second)
+	for fixture.server.CamouflageStats().SplicedCount == 0 {
+		if deadline.Before(time.Now()) {
+			t.Fatal("spliced count did not increment for a real browser hello")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
