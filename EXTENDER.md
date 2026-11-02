@@ -1227,13 +1227,14 @@ provider that is serving (G1), and a desktop app has no supervisor to restart it
 connectctl, which exists only to run the extender, exits with an error instead (G4).
 
 Decided 2026-11-02 from the outage on network 01979e1c on 2026-11-01. Of about 190
-active extenders, 147 were revoked from 20:00Z with tcp 443 and udp 53 refused and
-their processes still up, and 131 of those went on posting. One accept error, one
-udp carrier's exit or one failed write on the dns carrier used to close every carrier
-for the life of the process, nothing restarted the server, and the status went on
-saying listening while the activation went on posting. That is probably what
-happened: a real EMFILE reproduces the state, but no host's log confirms it, and
-which failure it was is not known.
+active extenders, 147 were revoked from 20:00Z. 131 of those went on posting, so their
+processes were up, while 46 of 47 sampled addresses did not answer on tcp 443, and the
+10 that refused it when udp 53 was sampled refused that too. One accept error, one udp
+carrier's exit or one failed write on the dns carrier used to close every carrier for
+the life of the process, nothing restarted the server, and the status went on saying
+listening while the activation went on posting. That is probably what happened: a real
+EMFILE reproduces the state, but no host's log confirms it, and which failure it was
+is not known.
 
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
