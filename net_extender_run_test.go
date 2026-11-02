@@ -3,7 +3,12 @@ package connect
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,6 +70,86 @@ func TestNewExtenderRunDrawsANewIdEachStart(t *testing.T) {
 	}
 	if second.PreviousExit != "" {
 		t.Fatalf("previous exit = %q, expected none", second.PreviousExit)
+	}
+}
+
+// What a child process prints of its run when testExtenderRunChildEnv is set.
+const testExtenderRunChildEnv = "URNETWORK_TEST_EXTENDER_RUN_CHILD"
+const testExtenderRunChildPrefix = "extender-run-child "
+
+// A process reads the previous exit from the environment it started with, and
+// every start draws its own run: this is the process itself, run again with
+// the variable a host sets, printing what its activations would report.
+func TestExtenderProcessRunReadsTheEnvironmentOfItsStart(t *testing.T) {
+	if os.Getenv(testExtenderRunChildEnv) != "" {
+		run := ExtenderProcessRun()
+		fmt.Printf("%s%s %s %q\n", testExtenderRunChildPrefix, run.Id, run.StartTime.Format(time.RFC3339Nano), run.PreviousExit)
+		return
+	}
+
+	const unset = "\x00"
+	seenRunIds := map[string]bool{ExtenderProcessRun().Id: true}
+	for _, c := range []struct {
+		value    string
+		expected string
+	}{
+		{value: "sigkill", expected: "sigkill"},
+		{value: "exit-137", expected: "exit-137"},
+		// a host's spelling, which the filter normalizes
+		{value: " SIGKILL\n", expected: "sigkill"},
+		// not a token, so nothing rides the activation
+		{value: "kill -9", expected: ""},
+		{value: unset, expected: ""},
+	} {
+		beforeStart := time.Now()
+		command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestExtenderProcessRunReadsTheEnvironmentOfItsStart$")
+		command.Env = []string{testExtenderRunChildEnv + "=1"}
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, ExtenderPreviousExitEnv+"=") {
+				command.Env = append(command.Env, entry)
+			}
+		}
+		if c.value != unset {
+			command.Env = append(command.Env, ExtenderPreviousExitEnv+"="+c.value)
+		}
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("the child for %q failed: %v\n%s", c.value, err, output)
+		}
+
+		line := ""
+		for _, outputLine := range strings.Split(string(output), "\n") {
+			if rest, ok := strings.CutPrefix(outputLine, testExtenderRunChildPrefix); ok {
+				line = rest
+			}
+		}
+		fields := strings.SplitN(line, " ", 3)
+		if len(fields) != 3 {
+			t.Fatalf("the child for %q printed no run:\n%s", c.value, output)
+		}
+		runId, startText, quotedPreviousExit := fields[0], fields[1], fields[2]
+
+		testExtenderRunId(t, runId)
+		if seenRunIds[runId] {
+			t.Fatalf("the child for %q drew a run id another process has: %s", c.value, runId)
+		}
+		seenRunIds[runId] = true
+
+		startTime, err := time.Parse(time.RFC3339Nano, startText)
+		if err != nil {
+			t.Fatalf("the child for %q printed the start %q: %v", c.value, startText, err)
+		}
+		if startTime.Before(beforeStart) {
+			t.Fatalf("the child for %q started at %s, before it was run at %s", c.value, startTime, beforeStart)
+		}
+
+		previousExit, err := strconv.Unquote(quotedPreviousExit)
+		if err != nil {
+			t.Fatalf("the child for %q printed the previous exit %s: %v", c.value, quotedPreviousExit, err)
+		}
+		if previousExit != c.expected {
+			t.Errorf("the child for %q read the previous exit %q, expected %q", c.value, previousExit, c.expected)
+		}
 	}
 }
 
@@ -172,23 +257,6 @@ func TestExtenderActivatorPostsTheRunItIsGiven(t *testing.T) {
 	}
 	if post.args.PreviousExit != "sigkill" {
 		t.Fatalf("previous exit = %q, expected sigkill", post.args.PreviousExit)
-	}
-}
-
-// A run with no start, which only a test builds, posts no start rather than
-// the zero time.
-func TestExtenderActivatorPostsNoZeroRunStart(t *testing.T) {
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
-		settings.ApiUrlV6 = ""
-		settings.Run = &ExtenderRun{Id: "00112233445566778899aabbccddeeff"}
-	})
-	fixture.waitPass()
-	post := fixture.waitPost()
-	if post.args.RunStartTime != nil {
-		t.Fatalf("run start = %s, expected none", post.args.RunStartTime)
-	}
-	if post.args.PreviousExit != "" {
-		t.Fatalf("previous exit = %q, expected none", post.args.PreviousExit)
 	}
 }
 

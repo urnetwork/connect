@@ -594,8 +594,8 @@ family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
 `{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`, and the
-optional `run_id`, `run_start_time` and `previous_exit` of G3, which are stored
-and never refuse an activation. Rate
+optional `run_id`, `run_start_time` and `previous_exit` of G3, stored when they
+are well formed, and a well-typed one never refuses an activation. Rate
 limits, each per address family over a trailing hour, so one family's
 failures never spend the other's (2026-10-28), and per host (connect#230,
 2026-11-01): 6 per client; 6 per caller address, its /32 or /64, over every
@@ -1265,12 +1265,13 @@ All three are optional: an operator that predates them ignores them and an
 extender that predates them omits them. The operator stores each on the
 activation's history row when it is well formed -- 32 hex characters; a start
 no earlier than 2026-11-01 and no later than an hour past its clock; one of
-those words -- and null otherwise, and never refuses an activation for them,
-since an extender with a wrong clock must still be published. A restart is then
-a new run id among an extender's activations rather than something inferred
-from its platform connections. The process is what has a run, so every slot of
-one sn miner shares it, and separate processes on one identity key are a run
-each. The queries are in EXTENDER-ACTIVATION.md §5, item 2.
+those words -- and null otherwise, and never refuses an activation for a
+well-typed value, since an extender with a wrong clock must still be published.
+A restart is then a run that started recently among an extender's activations,
+rather than something inferred from its platform connections. The process is
+what has a run, so every slot of one sn miner shares it, and separate processes
+on one identity key are a run each, which count as restarts only when they
+start. The queries are in EXTENDER-ACTIVATION.md §7.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,

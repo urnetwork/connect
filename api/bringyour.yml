@@ -19151,9 +19151,9 @@ components:
             (EXTENDER.md G3): 32 hex characters of 128 random bits drawn once
             when the process starts, so every activation of one process carries
             the same id and a restart a new one. The three run fields are
-            optional and never refuse an activation: each is stored on the
-            activation's history row when it is well formed, and as null
-            otherwise.
+            optional, and a well-typed one never refuses an activation: each is
+            stored on the activation's history row when it is well formed, and
+            as null otherwise.
           type: string
         run_start_time:
           description: |

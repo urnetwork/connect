@@ -14,7 +14,7 @@ import (
 // operator stores the three on each activation's history row, so a restart is
 // a new run id among an extender's activations rather than something inferred
 // from its platform connections, and a process that restarts every half hour
-// shows as many runs a day (EXTENDER-ACTIVATION.md §5, item 2).
+// shows as many runs a day (EXTENDER-ACTIVATION.md §7).
 //
 // The run belongs to the process, not to an activator: every activator of one
 // process -- the sdk's provider role, connectctl's extender, each slot of an sn

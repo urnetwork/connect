@@ -6,7 +6,7 @@ For peer review. Written 2026-11-01.
 
 **Already decided:** the owner agreed, 2026-11-01, that a family whose only addresses are private, behind a NAT that never forwards, still gets one post at start and one a day (§4.2). After review that applies only while the family hasn't activated, in this run or, as far as the directory's own record shows, before it.
 
-**Not decided:** everything in §5, and the questions in §6.
+**Not decided:** everything in §5, and the questions in §6. §7 describes what was built after this review for §5 item 2.
 
 ## 1. Summary
 
@@ -245,68 +245,8 @@ Server branch `lagdev/offer-stability`, in progress: `GET /lag/extenders` skips 
 
 - Ask the operators of networks `01983769` and `01979e1c` for `journalctl`, `dmesg` (OOM) and host memory.
 - Profile the provider at about 20k sources an hour.
-- The miner's supervisor (`operators_supervisor.go`) restarts every child when the memory share changes. Rule that out as a cause. Its restarts report `stop`, below.
-
-**Built: the run on each activation** (branches `lagdev/activation-run-id` in connect, server and sn; EXTENDER.md G3 is the normative text). Restarts show up directly rather than inferred from connections.
-
-| Field | Format | Who supplies it | Stored as |
-|---|---|---|---|
-| `run_id` | 32 lower case hex characters, 128 random bits | connect, once per process start | `varchar(32)`, null unless 32 hex characters |
-| `run_start_time` | RFC 3339, UTC | connect, the process start | `timestamp`, null unless from 2026-11-01 to an hour past the operator's clock |
-| `previous_exit` | `oom`, `stop`, a signal such as `sigkill`, `exit-<code>` | the host, through `URNETWORK_PREVIOUS_EXIT` | `varchar(16)`, null unless one of the words |
-
-- **Never refused:** the fields are diagnostics. A malformed one is stored as null, and the activation goes on.
-- **Only stored activations carry a run.** A process whose every post is refused leaves no row, so it doesn't show here.
-- **`previous_exit` needs a supervisor.** `provider start --all-operators` restarts its children itself, so it sets the variable. A single-operator miner is restarted by systemd (`Restart=on-failure`), which passes nothing to the new process, so it reports run ids and no exit.
-- **An OOM kill reads as `sigkill`, and the Go runtime running out of memory as `exit-2`.** The supervisor sees the signal or the code and doesn't read the kernel log or the cgroup, and nothing sets `oom` yet: it is there for a host that knows. So `sigkill` is evidence for the OOM theory, not proof of it. `stop` is the supervisor's own restarts, including a stop it had to force with a kill, so a bare `sigkill` came from outside the supervisor.
-- **Shared identities (item 4):** the run belongs to the process, so the slots of one miner share it. Separate processes on one key are a run each, so five copies of a key that all activate within a day read as five runs without a restart.
-
-- **Rollout:**
-  - Either side alone is harmless: an old operator ignores the fields, and an old extender omits them.
-  - The one ordering is that the server merges before connect or with it, because its spec conformance test requires every field `api/bringyour.yml` lists to be on its args struct.
-  - The server's migration blocks deploys on Main until it's applied.
-  - connect and sn reach providers with the next build release. Rows carry a run once a deployed server meets a released connect.
-
-**The gauges** (`controller/stats_collector.go`, the extenders dashboard's "restarting extenders (24h)"). They are plain counts with no labels:
-- `urnetwork_stats_extenders_restarting_24h`: extenders with 5 or more distinct run ids in the trailing 24 h.
-- `urnetwork_stats_extenders_reporting_runs_24h`: extenders with any run id in the trailing 24 h. Read the first beside this one: both are zero until a connect release with run ids reaches the extenders.
-
-Restart count and exit reasons per extender, last 24 h. A process that was already running when the window opened is one run, so `restarts` is `runs - 1`:
-
-```sql
-with run as (
-  select extender_id, run_id, min(previous_exit) previous_exit
-  from network_extender_activation
-  where activate_time > now() at time zone 'utc' - interval '24 hours'
-    and run_id is not null
-  group by 1, 2
-), exits as (
-  select extender_id, coalesce(previous_exit, 'unreported') previous_exit, count(*) n
-  from run group by 1, 2
-)
-select r.extender_id, count(*) runs, count(*) - 1 restarts,
-       (select string_agg(e.previous_exit || ' ' || e.n, ', ' order by e.n desc, e.previous_exit)
-        from exits e where e.extender_id = r.extender_id) exits
-from run r
-group by r.extender_id
-order by runs desc;
-```
-
-`exits` counts the runs by how the run before each one ended. `unreported` is a run whose host named no exit, which includes the first run of every supervisor and every run under systemd.
-
-The runs of one extender in order, with how long each was seen and what ended the one before:
-
-```sql
-select run_id, min(run_start_time) run_start_time, min(previous_exit) previous_exit,
-       min(activate_time) first_activate_time, max(activate_time) last_activate_time,
-       count(*) activations
-from network_extender_activation
-where extender_id = '<extender_id>'
-  and activate_time > now() at time zone 'utc' - interval '24 hours'
-  and run_id is not null
-group by run_id
-order by first_activate_time;
-```
+- The miner's supervisor (`operators_supervisor.go`) restarts every child when the memory share changes. Rule that out as a cause. Its restarts report `stop` (§7).
+- **Record how each run ended on a systemd host.** Run ids and, under a supervisor, exit reasons are built (§7), but the installed unit runs plain `provider start` with no supervisor (`sn/miner/cli_service.go`), so most hosts report no exit. The unit could add an `ExecStopPost=` that records `URNETWORK_PREVIOUS_EXIT` from `$SERVICE_RESULT` for the next start, with `oom-kill` mapping to `oom`. Only systemd knows that result, and it's the one source of `oom`. It only reaches hosts whose unit gets rewritten: the unit is written by `provider service install`, so updating the binary leaves an installed unit as it is.
 
 ### Item 3. The revocation loop
 
@@ -345,6 +285,72 @@ Skip publishing a new record when an activation changes nothing and the current 
 5. **§5 item 3:** for the revocation loop, do you prefer the operator-side fix or the extender-side one?
 6. **§5 item 4:** what takeover rule would you accept for a key that moves between clients?
 7. **§5 item 5:** should activation keep resetting the probe-failure count?
+
+## 7. The run on each activation (built)
+
+Branches `lagdev/activation-run-id` in connect, server and sn; EXTENDER.md G3 is the normative text. It covers part of §5 item 2: restarts show up directly rather than inferred from connections.
+
+| Field | Format | Who supplies it | Stored as |
+|---|---|---|---|
+| `run_id` | 32 lower case hex characters, 128 random bits | connect, once per process start | `varchar(32)`, null unless 32 hex characters |
+| `run_start_time` | RFC 3339, UTC | connect, the process start | `timestamp`, null unless from 2026-11-01 to an hour past the operator's clock |
+| `previous_exit` | `oom`, `stop`, a signal such as `sigkill`, `exit-<code>` | the host, through `URNETWORK_PREVIOUS_EXIT` | `varchar(16)`, null unless one of the words |
+
+- **Never refused when well-typed:** the fields are diagnostics. A string that's malformed is stored as null, and the activation goes on. A value of another JSON type fails the request's decoding, as any field's does.
+- **Only stored activations carry a run.** A process whose every post is refused, for a busy operator, a budget or a probe, leaves no row, so it doesn't show here.
+- **Most hosts report run ids and no exit.** The installed unit (`sn/miner/cli_service.go`) runs plain `provider start`, and systemd passes nothing to the process it restarts. Only `provider start --all-operators` has a supervisor to set the variable. §5 item 2 proposes the unit recording it.
+- **Under a supervisor, `previous_exit` is evidence, not a diagnosis:**
+  - `sigkill` appears only when the supervisor survives the kill. An out-of-memory kill that takes the whole unit with it, which is what systemd's default `OOMPolicy=stop` does, restarts the supervisor, and its first child has no exit to report. So the absence of `sigkill` doesn't rule out an OOM kill, and a `sigkill` from outside the supervisor needn't be one.
+  - `exit-2` is any Go panic or fatal runtime error, out of memory among them, so it isn't memory-specific.
+  - `stop` is the supervisor's own restarts, including a stop it had to force with a kill.
+  - Nothing sets `oom` yet: it is there for a host that knows.
+- **Shared identities (§5 item 4):** the run belongs to the process, so the slots of one miner share it. Separate processes on one key are a run each, but what counts as a restart is a run that started in the window, so long-lived copies read as none. Copies that all start within a day, as a deployment's do, count for that day.
+- **Rollout:**
+  - Either side alone is harmless: an old operator ignores the fields, and an old extender omits them.
+  - The one ordering is that the server merges before connect or with it, because its spec conformance test requires every field `api/bringyour.yml` lists to be on its args struct.
+  - The server's migration blocks deploys on Main until it's applied.
+  - connect and sn reach providers with the next build release. Rows carry a run once a deployed server meets a released connect.
+
+**The gauges** (`controller/stats_collector.go`, the extenders dashboard's "restarting extenders (24h)"). They are plain counts with no labels, and a read that fails withdraws both, so an incident shows as a gap rather than a flat line:
+- `urnetwork_stats_extenders_restarting_24h`: extenders with 5 or more distinct runs started in the trailing 24 h.
+- `urnetwork_stats_extenders_reporting_runs_24h`: extenders with any run id in the trailing 24 h. Read the first beside this one: both are zero until a connect release with run ids reaches the extenders.
+
+Restarts and exit reasons per extender, last 24 h. `runs` is every run seen in the window, and `restarts` the ones that started in it, the gauge's count; a run whose start was stored as null isn't among them. `exits` counts those restarts by how the run before each one ended, and `unreported` is a restart whose host named no exit, which includes the first run of every supervisor and every run under systemd:
+
+```sql
+with run as (
+  select extender_id, run_id, min(run_start_time) run_start_time, min(previous_exit) previous_exit
+  from network_extender_activation
+  where activate_time > now() at time zone 'utc' - interval '24 hours'
+    and run_id is not null
+  group by 1, 2
+), restart as (
+  select * from run where run_start_time > now() at time zone 'utc' - interval '24 hours'
+), exits as (
+  select extender_id, coalesce(previous_exit, 'unreported') previous_exit, count(*) n
+  from restart group by 1, 2
+)
+select r.extender_id, count(*) runs, count(x.run_id) restarts,
+       (select string_agg(e.previous_exit || ' ' || e.n, ', ' order by e.n desc, e.previous_exit)
+        from exits e where e.extender_id = r.extender_id) exits
+from run r left join restart x using (extender_id, run_id)
+group by r.extender_id
+order by restarts desc, runs desc;
+```
+
+The runs of one extender in order, with how long each was seen and what ended the one before:
+
+```sql
+select run_id, min(run_start_time) run_start_time, min(previous_exit) previous_exit,
+       min(activate_time) first_activate_time, max(activate_time) last_activate_time,
+       count(*) activations
+from network_extender_activation
+where extender_id = '<extender_id>'
+  and activate_time > now() at time zone 'utc' - interval '24 hours'
+  and run_id is not null
+group by run_id
+order by first_activate_time;
+```
 
 ## Appendix: reproducing the numbers (Main, read-only)
 

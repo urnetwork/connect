@@ -1185,6 +1185,7 @@ func (self *ExtenderActivator) activateUrl(
 	measurementCsr string,
 	now time.Time,
 ) (extenderActivateOutcome, time.Duration) {
+	runStartTime := self.settings.Run.StartTime.UTC()
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
 		TcpPort:             self.settings.TcpPort,
@@ -1197,11 +1198,8 @@ func (self *ExtenderActivator) activateUrl(
 		MeasurementDisabled: self.measurementDisabled(),
 		// the same run on every post of this process (G3)
 		RunId:        self.settings.Run.Id,
+		RunStartTime: &runStartTime,
 		PreviousExit: self.settings.Run.PreviousExit,
-	}
-	if runStartTime := self.settings.Run.StartTime; !runStartTime.IsZero() {
-		runStartTime = runStartTime.UTC()
-		args.RunStartTime = &runStartTime
 	}
 	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
 	// empty key is left off the args so an operator sees no camouflage key
