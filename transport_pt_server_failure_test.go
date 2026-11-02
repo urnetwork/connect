@@ -2,7 +2,10 @@ package connect
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -90,6 +93,16 @@ func newDnsCarrierFailingFixture(
 	prepare func(conn *dnsCarrierFailingConn),
 ) *dnsCarrierFailingFixture {
 	t.Helper()
+	return newDnsCarrierFailingFixtureWithSettings(t, mode, prepare, nil)
+}
+
+func newDnsCarrierFailingFixtureWithSettings(
+	t *testing.T,
+	mode PacketTranslationMode,
+	prepare func(conn *dnsCarrierFailingConn),
+	configure func(settings *PacketTranslationSettings),
+) *dnsCarrierFailingFixture {
+	t.Helper()
 	tld := []byte("pt.example.")
 	network := newMemoryPacketNetwork()
 	conn := &dnsCarrierFailingConn{
@@ -100,7 +113,11 @@ func newDnsCarrierFailingFixture(
 	}
 	peer := network.listen(dnsCarrierTestAddr("192.0.2.10", 1053))
 	t.Cleanup(func() { peer.Close() })
-	translation, err := NewPacketTranslation(t.Context(), mode, conn, dnsCarrierTestSettings(tld))
+	settings := dnsCarrierTestSettings(tld)
+	if configure != nil {
+		configure(settings)
+	}
+	translation, err := NewPacketTranslation(t.Context(), mode, conn, settings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,4 +317,166 @@ func TestPacketTranslationClientEndsOnAReadFailure(t *testing.T) {
 		conn.failReads(temporaryErr)
 	})
 	fixture.waitEnded(t)
+}
+
+// A logger that keeps every line, whatever its level.
+type dnsCarrierLogLines struct {
+	stateLock sync.Mutex
+	lines     []string
+}
+
+func (self *dnsCarrierLogLines) add(format string, args ...any) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.lines = append(self.lines, fmt.Sprintf(format, args...))
+}
+
+func (self *dnsCarrierLogLines) all() string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return strings.Join(self.lines, "\n")
+}
+
+func (self *dnsCarrierLogLines) Info(args ...any)                    { self.add("%v", args) }
+func (self *dnsCarrierLogLines) Infof(format string, args ...any)    { self.add(format, args...) }
+func (self *dnsCarrierLogLines) Warningf(format string, args ...any) { self.add(format, args...) }
+func (self *dnsCarrierLogLines) Errorf(format string, args ...any)   { self.add(format, args...) }
+func (self *dnsCarrierLogLines) V(level int32) Verbose               { return dnsCarrierLogVerbose{self} }
+
+type dnsCarrierLogVerbose struct {
+	log *dnsCarrierLogLines
+}
+
+func (self dnsCarrierLogVerbose) Enabled() bool                    { return true }
+func (self dnsCarrierLogVerbose) Info(args ...any)                 { self.log.Info(args...) }
+func (self dnsCarrierLogVerbose) Infof(format string, args ...any) { self.log.Infof(format, args...) }
+
+// A socket's errors say which addresses they failed between, and on a server the
+// far one is a client's. It must reach no line of the log, which sdk/log_upload.go
+// uploads, no error the translation keeps and nothing it returns, in either family,
+// on any way a socket can fail. The server's alt listener and an extender's dns
+// carrier are both this translation.
+func TestPacketTranslationErrorsNameNoAddress(t *testing.T) {
+	for _, addrs := range []struct {
+		name   string
+		source *net.UDPAddr
+		client *net.UDPAddr
+	}{
+		{
+			name:   "ipv4",
+			source: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53866},
+			client: &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444},
+		},
+		{
+			name:   "ipv6",
+			source: &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 53866},
+			client: &net.UDPAddr{IP: net.ParseIP("2001:db8:1234::7"), Port: 44444},
+		},
+	} {
+		opError := func(op string, err error) error {
+			return &net.OpError{Op: op, Net: "udp", Source: addrs.source, Addr: addrs.client, Err: err}
+		}
+		sendErr := os.NewSyscallError("sendto", syscall.ENETUNREACH)
+		// what the net package builds for a family the socket cannot send to
+		addrErr := &net.AddrError{Err: "non-IPv4 address", Addr: addrs.client.IP.String()}
+		cases := []struct {
+			name       string
+			mode       PacketTranslationMode
+			writeErr   error
+			readErr    error
+			expectText string
+			ends       bool
+		}{
+			{name: "a dropped datagram", mode: PacketTranslationModeDecode53, writeErr: opError("write", sendErr), expectText: "network is unreachable"},
+			{name: "an address the socket cannot send to", mode: PacketTranslationModeDecode53, writeErr: opError("write", addrErr), expectText: "non-IPv4 address"},
+			{name: "a closed socket on write", mode: PacketTranslationModeDecode53, writeErr: opError("write", net.ErrClosed), expectText: "closed", ends: true},
+			{name: "a read that retries", mode: PacketTranslationModeDecode53, readErr: opError("read", os.NewSyscallError("recvfrom", syscall.EMFILE)), expectText: "too many open files"},
+			{name: "a read that ends it", mode: PacketTranslationModeDecode53, readErr: opError("read", os.NewSyscallError("recvfrom", syscall.EIO)), expectText: "recvfrom", ends: true},
+			{name: "a client's write", mode: PacketTranslationModeDns, writeErr: opError("write", sendErr), expectText: "network is unreachable", ends: true},
+			{name: "a client's read", mode: PacketTranslationModeDns, readErr: opError("read", os.NewSyscallError("recvfrom", syscall.EIO)), expectText: "recvfrom", ends: true},
+		}
+		for _, testCase := range cases {
+			t.Run(addrs.name+"/"+testCase.name, func(t *testing.T) {
+				log := &dnsCarrierLogLines{}
+				fixture := newDnsCarrierFailingFixtureWithSettings(t, testCase.mode, func(conn *dnsCarrierFailingConn) {
+					if testCase.readErr != nil {
+						conn.failReads(testCase.readErr)
+					}
+					if testCase.writeErr != nil {
+						conn.failWrites(testCase.writeErr)
+					}
+				}, func(settings *PacketTranslationSettings) {
+					settings.Log = log
+				})
+
+				results := []string{}
+				if testCase.writeErr != nil {
+					_, err := fixture.translation.WriteTo([]byte("a datagram"), fixture.peer.addr)
+					results = append(results, fmt.Sprint(err))
+				}
+				if testCase.ends {
+					fixture.waitEnded(t)
+				} else {
+					deadline := time.Now().Add(dnsCarrierTestWait)
+					for !strings.Contains(log.all(), testCase.expectText) {
+						if deadline.Before(time.Now()) {
+							t.Fatalf("the failure was not logged, lines = %q", log.all())
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				results = append(results, fmt.Sprint(fixture.translation.EndError()), log.all())
+
+				everything := strings.Join(results, "\n")
+				if !strings.Contains(everything, testCase.expectText) {
+					t.Fatalf("what was said = %q, expected the cause %q", everything, testCase.expectText)
+				}
+				for _, forbidden := range []string{
+					addrs.client.IP.String(),
+					addrs.source.IP.String(),
+					fmt.Sprint(addrs.client.Port),
+					fmt.Sprint(addrs.source.Port),
+				} {
+					if strings.Contains(everything, forbidden) {
+						t.Fatalf("what was said names %q: %q", forbidden, everything)
+					}
+				}
+			})
+		}
+	}
+}
+
+// The cause survives the scrubbing for whoever asks: a closed socket stays closed,
+// and the errno and the *os.SyscallError quic-go reads for a send it can recover
+// from are still there.
+func TestPacketTranslationSocketErrorKeepsTheCause(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444}
+	if err := packetTranslationSocketError(nil); err != nil {
+		t.Fatalf("nil = %v", err)
+	}
+	closed := packetTranslationSocketError(&net.OpError{Op: "write", Addr: addr, Err: net.ErrClosed})
+	if !errors.Is(closed, net.ErrClosed) {
+		t.Fatalf("closed = %v", closed)
+	}
+	sent := packetTranslationSocketError(&net.OpError{
+		Op:   "write",
+		Addr: addr,
+		Err:  os.NewSyscallError("sendto", syscall.EMSGSIZE),
+	})
+	if !errors.Is(sent, syscall.EMSGSIZE) {
+		t.Fatalf("sent = %v", sent)
+	}
+	var syscallErr *os.SyscallError
+	if !errors.As(sent, &syscallErr) {
+		t.Fatalf("sent = %T, expected the syscall error", sent)
+	}
+	// nothing to scrub is left alone
+	plain := errors.New("a failure this does not know")
+	if err := packetTranslationSocketError(plain); err != plain {
+		t.Fatalf("plain = %v", err)
+	}
+	wrapped := packetTranslationSocketError(fmt.Errorf("through a seam: %w", &net.OpError{Op: "write", Addr: addr, Err: syscall.EPERM}))
+	if !errors.Is(wrapped, syscall.EPERM) || strings.Contains(wrapped.Error(), "203.0.113.7") {
+		t.Fatalf("wrapped = %v", wrapped)
+	}
 }

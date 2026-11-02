@@ -397,7 +397,7 @@ func (self *packetTranslation) encodeDns() {
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-					_, err = self.packetConn.WriteTo(packetData, p.addr)
+					err = self.writeWire(packetData, p.addr)
 					if err != nil {
 						return err
 					}
@@ -467,7 +467,7 @@ func (self *packetTranslation) encodeDns() {
 
 						// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-						_, err = self.packetConn.WriteTo(packetData, mostRecentAddr)
+						err = self.writeWire(packetData, mostRecentAddr)
 						if err != nil {
 							select {
 							case <-self.ctx.Done():
@@ -575,7 +575,7 @@ func (self *packetTranslation) encodeDns() {
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-					_, err = self.packetConn.WriteTo(packetData, p.addr)
+					err = self.writeWire(packetData, p.addr)
 					if err != nil {
 						return self.dropServerWrite(err)
 					}
@@ -611,7 +611,7 @@ func (self *packetTranslation) encodeDns() {
 			case p := <-self.forward:
 				// fmt.Printf("PACKET WRITE TO: %v\n", string(p.data))
 
-				_, err := self.packetConn.WriteTo(p.data, p.addr)
+				err := self.writeWire(p.data, p.addr)
 				MessagePoolReturn(p.data)
 				if err != nil && self.dropServerWrite(err) != nil {
 					select {
@@ -625,6 +625,36 @@ func (self *packetTranslation) encodeDns() {
 			}
 		}
 	}
+}
+
+// One write on the wire, with an error that names no address
+// (packetTranslationSocketError).
+func (self *packetTranslation) writeWire(packetData []byte, addr net.Addr) error {
+	_, err := self.packetConn.WriteTo(packetData, addr)
+	return packetTranslationSocketError(err)
+}
+
+// A socket's error without the addresses its text carries. A *net.OpError prints
+// both ends of the operation, so a failed write reads `write udp4
+// 127.0.0.1:53866->203.0.113.7:4444: sendto: ...`, and on a server the far end is a
+// client's address. What the operator has of these is the log, the status and what
+// sdk/log_upload.go uploads, and none of them may hold a client's address, so nothing
+// here logs, keeps or returns the whole error. A *net.AddrError names its address
+// too. errors.Is still finds net.ErrClosed and the errno, and errors.As the
+// *os.SyscallError quic-go reads.
+func packetTranslationSocketError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		err = opErr.Err
+	}
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return errors.New(addrErr.Err)
+	}
+	return err
 }
 
 // What a server mode does with a datagram it could not encode or write
@@ -834,11 +864,13 @@ func (self *packetTranslation) decodeDns() {
 				return
 			default:
 			}
+			retries := packetTranslationReadRetries(err)
+			err = packetTranslationSocketError(err)
 			if self.dnsClient {
 				self.log.Infof("[pt]read err = %s\n", err)
 				return
 			}
-			if !packetTranslationReadRetries(err) {
+			if !retries {
 				self.log.Errorf("[pt]read err = %s\n", err)
 				self.endWith(err)
 				return
