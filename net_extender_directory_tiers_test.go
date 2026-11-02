@@ -954,3 +954,807 @@ func TestExtenderBlockedCanaryMapsToExactlyOnePlacement(t *testing.T) {
 		t.Error("a canary with no channel was placed")
 	}
 }
+
+// The gated-preferred connection policy (EXTENDER-UPDATE2.md §1.1, §1.3,
+// §1.4): what the connection draw hands the strategy in each mode, the
+// bounded fallback to verified open records, recovery, and what never becomes
+// a candidate or leaves on a public path. The clock is the fake one; the
+// strategy-level dial order is pinned in net_extender_directory_gated_test.go.
+
+// The budget the policy tests run with.
+const testGatedPreferenceAttemptTimeout = 10 * time.Second
+
+// A directory with the gated preference on and the fake clock.
+func newTestGatedPreferenceDirectory(t *testing.T, clock *testClock) (*ExtenderDirectory, ed25519.PrivateKey) {
+	t.Helper()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
+		settings.PartitionSecret = testPartitionSecret
+	})
+	directory.SetGatedPreference(&ExtenderGatedPreferenceSettings{
+		Enabled:        true,
+		AttemptTimeout: testGatedPreferenceAttemptTimeout,
+	})
+	return directory, rootPrivateKey
+}
+
+// Releases one gated record of `extenderKey` at `ips` as the release fetch
+// applies it, issued now.
+func applyTestGatedRelease(
+	t *testing.T,
+	directory *ExtenderDirectory,
+	rootPrivateKey ed25519.PrivateKey,
+	clock *testClock,
+	extenderKey ed25519.PublicKey,
+	ips ...string,
+) {
+	t.Helper()
+	addresses := []*protocol.ExtenderAddress{}
+	for _, ip := range ips {
+		addresses = append(addresses, testExtenderAddress(ip))
+	}
+	record, err := SignExtenderRecord(rootPrivateKey, &protocol.ExtenderRecordBody{
+		PublicKey:     extenderKey,
+		Addresses:     addresses,
+		TcpPort:       443,
+		UdpPort:       443,
+		DnsPort:       53,
+		DnsTld:        "x.example.",
+		CountryCode:   "us",
+		IssueTimeMs:   uint64(clock.Now().UnixMilli()),
+		ExpireTimeMs:  uint64(clock.Now().Add(24 * time.Hour).UnixMilli()),
+		NetworkHost:   testExtenderNetworkHost,
+		DirectoryTier: ExtenderDirectoryTierGated,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := directory.ApplyReleaseRecord(record, directory.ResetGeneration()); err != nil || !changed {
+		t.Fatalf("the released record was not applied: changed=%t err=%v", changed, err)
+	}
+}
+
+// Applies one open record at `ip` from the feed and returns its key.
+func applyTestOpenTierRecord(
+	t *testing.T,
+	directory *ExtenderDirectory,
+	rootPrivateKey ed25519.PrivateKey,
+	clock *testClock,
+	ip string,
+) ed25519.PublicKey {
+	t.Helper()
+	extenderKey := newTestExtenderKey(t)
+	record := signTestTierRecord(t, rootPrivateKey, extenderKey, clock.Now(), ExtenderDirectoryTierOpen, ip)
+	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+		t.Fatal(err)
+	}
+	return extenderKey
+}
+
+// The addresses of one connection draw of one family, in order.
+func testConnectDrawIps(directory *ExtenderDirectory, ipVersion int) []string {
+	ips := []string{}
+	for _, candidate := range directory.ConnectCandidates([]int{ipVersion}, 64, false, nil)[0] {
+		ips = append(ips, candidate.Ip.String())
+	}
+	return ips
+}
+
+// With the preference off, which is the default, the connection draw is the
+// candidate order every caller had: gated records rank as any other (§1.1 is
+// a cohort setting, not a change for everyone).
+func TestExtenderGatedPreferenceOffKeepsTheCandidateOrder(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
+	if directory.GatedPreferenceEnabled() {
+		t.Fatal("the gated preference is on by default")
+	}
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.2")
+	directory.AddManual(netip.MustParseAddr("203.0.113.5"))
+	directory.RecordSuccess(netip.MustParseAddr("198.51.100.2"), ExtenderConnectModeTcpTls)
+
+	for _, verifiedOnly := range []bool{false, true} {
+		expected := directory.Candidates(4, 64)
+		if verifiedOnly {
+			expected = directory.VerifiedCandidates(4, 64)
+		}
+		drawn := directory.ConnectCandidates([]int{4, 6}, 64, verifiedOnly, nil)
+		if len(drawn) != 2 || len(drawn[1]) != 0 {
+			t.Fatalf("verifiedOnly=%t: the draw has %d families, %v", verifiedOnly, len(drawn), drawn)
+		}
+		if len(drawn[0]) != len(expected) {
+			t.Fatalf("verifiedOnly=%t: drew %d candidates, expected %d", verifiedOnly, len(drawn[0]), len(expected))
+		}
+		for i := range expected {
+			if drawn[0][i].Ip != expected[i].Ip {
+				t.Fatalf("verifiedOnly=%t: candidate %d is %s, expected %s", verifiedOnly, i, drawn[0][i].Ip, expected[i].Ip)
+			}
+		}
+	}
+	status := directory.GatedPreference()
+	if status.Mode != ExtenderGatedModeOff || 0 < len(status.Stats.DrawCounts) {
+		t.Fatalf("the preference judged a draw while off: %+v", status)
+	}
+	for _, ip := range []string{"198.51.100.1", "198.51.100.2", "192.0.2.10"} {
+		if !directory.ConnectAddressUsable(netip.MustParseAddr(ip)) {
+			t.Fatalf("%s is not usable while the preference is off", ip)
+		}
+	}
+}
+
+// A usable gated record is drawn alone, ahead of the manual addresses the user
+// configured, and the open records are held back from new draws; an open
+// dialer the strategy already holds keeps serving until the gated record
+// connects, and then the policy is gated and the open dialers drain (§1.1
+// rules 1 and 5).
+func TestExtenderGatedPreferenceDrawsAUsableGatedRecordAlone(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.2")
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+	directory.AddManual(netip.MustParseAddr("203.0.113.5"))
+
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.10", "203.0.113.5"}) {
+		t.Fatalf("the attempt drew %v, expected the gated record and then the manual address", drawn)
+	}
+	if mode := directory.GatedPreference().Mode; mode != ExtenderGatedModeAttempt {
+		t.Fatalf("mode %s, expected an attempt", mode)
+	}
+	// an open dialer the strategy already holds is not drained by an attempt
+	// alone: no gated record has connected yet
+	if !directory.ConnectAddressUsable(netip.MustParseAddr("198.51.100.1")) {
+		t.Fatal("an open dialer drained before any gated record connected")
+	}
+	if !directory.ConnectAddressUsable(netip.MustParseAddr("192.0.2.10")) || !directory.ConnectAddressUsable(netip.MustParseAddr("203.0.113.5")) {
+		t.Fatal("the gated record or the manual address is not usable during a gated attempt")
+	}
+
+	directory.RecordSuccess(netip.MustParseAddr("192.0.2.10"), ExtenderConnectModeTcpTls)
+	clock.advance(time.Hour)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.10", "203.0.113.5"}) {
+		t.Fatalf("the gated policy drew %v", drawn)
+	}
+	status := directory.GatedPreference()
+	if status.Mode != ExtenderGatedModeGated || status.FallbackReason != "" {
+		t.Fatalf("mode %s reason %q, expected gated: its budget no longer applies once a gated record connected", status.Mode, status.FallbackReason)
+	}
+	if status.Stats.CandidateCounts[ExtenderGatedClassOpen] != 0 || status.Stats.CandidateCounts[ExtenderGatedClassGated] != 2 {
+		t.Fatalf("the draws handed out %v", status.Stats.CandidateCounts)
+	}
+	if directory.ConnectAddressUsable(netip.MustParseAddr("198.51.100.2")) {
+		t.Fatal("an open dialer is kept once gated connected")
+	}
+	// the manual address the user configured is never drained
+	if !directory.ConnectAddressUsable(netip.MustParseAddr("203.0.113.5")) {
+		t.Fatal("the manual address drained once gated connected")
+	}
+}
+
+// The gated attempt has a bounded budget: at its end, or at once when every
+// gated record has failed, verified open records are drawn after the gated
+// ones (§1.1 rule 3). Every draw in the window shares one budget.
+func TestExtenderGatedPreferenceFallsBackWithinTheAttemptBudget(t *testing.T) {
+	t.Run("budget", func(t *testing.T) {
+		clock := newTestClock()
+		directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+
+		for elapsed := time.Duration(0); elapsed < testGatedPreferenceAttemptTimeout; elapsed += time.Second {
+			if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.10"}) {
+				t.Fatalf("at %s the attempt drew %v", elapsed, drawn)
+			}
+			clock.advance(time.Second)
+		}
+		if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.10", "198.51.100.1"}) {
+			t.Fatalf("at the budget the fallback drew %v, expected gated first and then open", drawn)
+		}
+		status := directory.GatedPreference()
+		if status.Mode != ExtenderGatedModeFallback || status.FallbackReason != ExtenderGatedFallbackGatedTimeout {
+			t.Fatalf("mode %s reason %q, expected the timeout fallback", status.Mode, status.FallbackReason)
+		}
+		if status.Stats.FallbackCounts[ExtenderGatedFallbackGatedTimeout] != 1 {
+			t.Fatalf("fallback counts %v", status.Stats.FallbackCounts)
+		}
+		if !directory.ConnectAddressUsable(netip.MustParseAddr("198.51.100.1")) {
+			t.Fatal("the open record is not usable in the fallback")
+		}
+	})
+	t.Run("failed", func(t *testing.T) {
+		clock := newTestClock()
+		directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+		testConnectDrawIps(directory, 4)
+		directory.RecordFailure(netip.MustParseAddr("192.0.2.10"), ExtenderConnectModeTcpTls)
+		if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"198.51.100.1"}) {
+			t.Fatalf("after the gated record failed the draw was %v, expected the open record at once", drawn)
+		}
+		if reason := directory.GatedPreference().FallbackReason; reason != ExtenderGatedFallbackGatedFailed {
+			t.Fatalf("reason %q, expected gated_failed", reason)
+		}
+	})
+}
+
+// An empty, refused, timed-out or failed release leaves no usable gated record
+// and falls back to the verified open records at the first draw, the reason
+// naming the release's answer; an outcome the client does not know is empty,
+// and a release route that answered ok with nothing still falls back
+// (§1.1 rule 3, contract R).
+func TestExtenderGatedPreferenceFallsBackOnAnUnusableRelease(t *testing.T) {
+	cases := []struct {
+		outcome string
+		reason  string
+	}{
+		{outcome: "", reason: ExtenderGatedFallbackNoRecord},
+		{outcome: "ok", reason: ExtenderGatedFallbackNoRecord},
+		{outcome: "empty", reason: ExtenderGatedFallbackReleaseEmpty},
+		{outcome: "epoch_spent", reason: ExtenderGatedFallbackReleaseEpochSpent},
+		{outcome: "probation", reason: ExtenderGatedFallbackReleaseProbation},
+		{outcome: "country_capacity", reason: ExtenderGatedFallbackReleaseCountryCapacity},
+		{outcome: "Rate_Limited ", reason: ExtenderGatedFallbackReleaseRateLimited},
+		{outcome: "incompatible", reason: ExtenderGatedFallbackReleaseIncompatible},
+		{outcome: "unavailable", reason: ExtenderGatedFallbackReleaseUnavailable},
+		{outcome: "failed", reason: ExtenderGatedFallbackReleaseFailed},
+		{outcome: "a_newer_outcome", reason: ExtenderGatedFallbackReleaseEmpty},
+	}
+	for _, c := range cases {
+		clock := newTestClock()
+		directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+		if c.outcome != "" {
+			directory.SetGatedReleaseOutcome(c.outcome)
+		}
+		if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"198.51.100.1"}) {
+			t.Fatalf("outcome %q: the first draw was %v, expected the open record at once", c.outcome, drawn)
+		}
+		status := directory.GatedPreference()
+		if status.Mode != ExtenderGatedModeFallback || status.FallbackReason != c.reason {
+			t.Fatalf("outcome %q: mode %s reason %q, expected %q", c.outcome, status.Mode, status.FallbackReason, c.reason)
+		}
+		if !slices.Contains(ExtenderGatedFallbackReasons(), status.FallbackReason) {
+			t.Fatalf("outcome %q: reason %q is not in the fixed label set", c.outcome, status.FallbackReason)
+		}
+		if c.outcome != "" && !slices.Contains(ExtenderGatedReleaseOutcomes(), status.ReleaseOutcome) {
+			t.Fatalf("outcome %q was counted as %q, outside the fixed label set", c.outcome, status.ReleaseOutcome)
+		}
+	}
+}
+
+// A revoked gated record is never a candidate, in an attempt or a fallback,
+// and a release record that is not a current gated record of this space, or
+// that was fetched before a reset, is never applied (§1.4).
+func TestExtenderGatedPreferenceNeverDrawsARevokedOrDisallowedRecord(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	revokedKey := newTestExtenderKey(t)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, revokedKey, "192.0.2.10")
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	clock.advance(time.Minute)
+	if _, err := directory.ApplyRevocation(signTestRevocation(t, rootPrivateKey, revokedKey, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	gatedBody := func(ip string, issueTime time.Time, expireTime time.Time) *protocol.ExtenderRecordBody {
+		return &protocol.ExtenderRecordBody{
+			PublicKey:     newTestExtenderKey(t),
+			Addresses:     []*protocol.ExtenderAddress{testExtenderAddress(ip)},
+			TcpPort:       443,
+			IssueTimeMs:   uint64(issueTime.UnixMilli()),
+			ExpireTimeMs:  uint64(expireTime.UnixMilli()),
+			NetworkHost:   testExtenderNetworkHost,
+			DirectoryTier: ExtenderDirectoryTierGated,
+		}
+	}
+	sign := func(privateKey ed25519.PrivateKey, body *protocol.ExtenderRecordBody) *protocol.ExtenderRecord {
+		record, err := SignExtenderRecord(privateKey, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	otherRootSeed, err := NewExtenderKeySeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRoot, err := ExtenderPrivateKeyFromSeed(otherRootSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := clock.Now()
+	openBody := gatedBody("192.0.2.21", now, now.Add(24*time.Hour))
+	openBody.DirectoryTier = ExtenderDirectoryTierOpen
+	foreignBody := gatedBody("192.0.2.22", now, now.Add(24*time.Hour))
+	foreignBody.NetworkHost = "other.example"
+	disallowed := map[string]*protocol.ExtenderRecord{
+		"open tier":     sign(rootPrivateKey, openBody),
+		"foreign host":  sign(rootPrivateKey, foreignBody),
+		"another root":  sign(otherRoot, gatedBody("192.0.2.23", now, now.Add(24*time.Hour))),
+		"already spent": sign(rootPrivateKey, gatedBody("192.0.2.24", now.Add(-48*time.Hour), now.Add(-24*time.Hour))),
+	}
+	for name, record := range disallowed {
+		if changed, err := directory.ApplyReleaseRecord(record, directory.ResetGeneration()); err == nil || changed {
+			t.Fatalf("%s: a disallowed release record was applied", name)
+		}
+	}
+	// a release requested before a reset is dropped when it lands after it
+	staleGeneration := directory.ResetGeneration()
+	directory.Reset(directory.RootKeys())
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	if changed, err := directory.ApplyReleaseRecord(sign(rootPrivateKey, gatedBody("192.0.2.25", now, now.Add(24*time.Hour))), staleGeneration); err == nil || changed {
+		t.Fatal("a release fetched before the reset was applied after it")
+	}
+	// the revoked record went with the reset; revoke one again for the draws
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, revokedKey, "192.0.2.10")
+	clock.advance(time.Minute)
+	if _, err := directory.ApplyRevocation(signTestRevocation(t, rootPrivateKey, revokedKey, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		for _, ip := range testConnectDrawIps(directory, 4) {
+			if ip != "198.51.100.1" {
+				t.Fatalf("the draw offered %s, which is revoked or was never applied", ip)
+			}
+		}
+		clock.advance(testGatedPreferenceAttemptTimeout)
+	}
+	if reason := directory.GatedPreference().FallbackReason; reason != ExtenderGatedFallbackNoRecord {
+		t.Fatalf("reason %q, expected no usable gated record", reason)
+	}
+
+	// an expired gated record is not drawn while gated is preferred, and in the
+	// fallback it is only the last resort it always was
+	expiringKey := newTestExtenderKey(t)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, expiringKey, "192.0.2.30")
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.30"}) {
+		t.Fatalf("a newly released record started no attempt: %v", drawn)
+	}
+	clock.advance(25 * time.Hour)
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.2")
+	drawn := testConnectDrawIps(directory, 4)
+	if 0 < len(drawn) && drawn[0] == "192.0.2.30" {
+		t.Fatalf("an expired gated record leads the draw: %v", drawn)
+	}
+	if !slices.Contains(drawn, "198.51.100.2") {
+		t.Fatalf("the fallback after the gated record expired drew %v", drawn)
+	}
+}
+
+// The fallback gives way to gated again once a gated record connects, or one
+// becomes newly usable -- released since, or its hold lapsed -- and the open
+// dialers then drain (§1.1 rule 5).
+func TestExtenderGatedPreferenceRecoversAndDrainsTheOpenRecords(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	gatedIp := netip.MustParseAddr("192.0.2.10")
+	openIp := netip.MustParseAddr("198.51.100.1")
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), gatedIp.String())
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, openIp.String())
+
+	testConnectDrawIps(directory, 4)
+	directory.RecordFailure(gatedIp, ExtenderConnectModeTcpTls)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{openIp.String()}) {
+		t.Fatalf("the fallback drew %v", drawn)
+	}
+	// the fallback holds while the gated record is held
+	clock.advance(5 * time.Minute)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{openIp.String()}) {
+		t.Fatalf("the held fallback drew %v", drawn)
+	}
+	// its hold lapses: gated is tried again, with a fresh budget; the open
+	// dialers keep serving until it connects, and drain once it has
+	clock.advance(6 * time.Minute)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{gatedIp.String()}) {
+		t.Fatalf("the recovery drew %v", drawn)
+	}
+	status := directory.GatedPreference()
+	if status.Mode != ExtenderGatedModeAttempt || status.Stats.RecoveryCount != 1 {
+		t.Fatalf("mode %s recoveries %d, expected a new attempt", status.Mode, status.Stats.RecoveryCount)
+	}
+	if !directory.ConnectAddressUsable(openIp) {
+		t.Fatal("the open dialers drained before the gated record connected again")
+	}
+	directory.RecordSuccess(gatedIp, ExtenderConnectModeTcpTls)
+	if directory.ConnectAddressUsable(openIp) {
+		t.Fatal("the open dialers do not drain once the gated record connected again")
+	}
+	testConnectDrawIps(directory, 4)
+	if mode := directory.GatedPreference().Mode; mode != ExtenderGatedModeGated {
+		t.Fatalf("mode %s after the gated record connected", mode)
+	}
+
+	// a cold fallback ends when a release brings a record
+	clock = newTestClock()
+	directory, rootPrivateKey = newTestGatedPreferenceDirectory(t, clock)
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, openIp.String())
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{openIp.String()}) {
+		t.Fatalf("the cold draw was %v", drawn)
+	}
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), gatedIp.String())
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{gatedIp.String()}) {
+		t.Fatalf("the first draw after the release was %v", drawn)
+	}
+
+	// and a gated record that connects in the fallback -- a probe, a dial the
+	// fallback drew it for -- ends it at once
+	clock = newTestClock()
+	directory, rootPrivateKey = newTestGatedPreferenceDirectory(t, clock)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), gatedIp.String())
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, openIp.String())
+	testConnectDrawIps(directory, 4)
+	clock.advance(testGatedPreferenceAttemptTimeout)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{gatedIp.String(), openIp.String()}) {
+		t.Fatalf("the timeout fallback drew %v", drawn)
+	}
+	clock.advance(time.Second)
+	directory.RecordSuccess(gatedIp, ExtenderConnectModeQuic)
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{gatedIp.String()}) {
+		t.Fatalf("the draw after the gated record connected was %v", drawn)
+	}
+	if mode := directory.GatedPreference().Mode; mode != ExtenderGatedModeGated {
+		t.Fatalf("mode %s, expected gated", mode)
+	}
+}
+
+// The open dialers drain only while a gated record that connected is still
+// usable: one held or expired since the last draw -- a probe failed it, its
+// refresh is late -- falls the policy back before an open dialer that carries
+// the client is drained, with no draw in between, and an expired gated record
+// keeps the last-resort rule of AddressUsable (§1.1 rules 3 and 5).
+func TestExtenderGatedPreferenceDrainsOnlyWhileAGatedRecordIsUsable(t *testing.T) {
+	for _, lapse := range []string{"held", "expired"} {
+		clock := newTestClock()
+		directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+		gatedIp := netip.MustParseAddr("192.0.2.10")
+		openIp := netip.MustParseAddr("198.51.100.1")
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), gatedIp.String())
+		// the open record is issued later, so it is current when the gated one
+		// has expired
+		clock.advance(12 * time.Hour)
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, openIp.String())
+		testConnectDrawIps(directory, 4)
+		directory.RecordSuccess(gatedIp, ExtenderConnectModeTcpTls)
+		if directory.ConnectAddressUsable(openIp) {
+			t.Fatalf("%s: an open dialer was kept once gated connected", lapse)
+		}
+
+		reason := ""
+		switch lapse {
+		case "held":
+			directory.RecordFailure(gatedIp, ExtenderConnectModeTcpTls)
+			reason = ExtenderGatedFallbackGatedFailed
+		case "expired":
+			clock.advance(13 * time.Hour)
+			reason = ExtenderGatedFallbackNoRecord
+		}
+		if !directory.ConnectAddressUsable(openIp) {
+			t.Fatalf("%s: the open dialer drained while no gated record was usable", lapse)
+		}
+		status := directory.GatedPreference()
+		if status.Mode != ExtenderGatedModeFallback || status.FallbackReason != reason {
+			t.Fatalf("%s: mode %s reason %q, expected the fallback for %q", lapse, status.Mode, status.FallbackReason, reason)
+		}
+		if lapse == "expired" && !directory.ConnectAddressUsable(gatedIp) {
+			t.Fatal("expired: the dialer of the expired gated record lost the last-resort rule")
+		}
+		if drawn := testConnectDrawIps(directory, 4); len(drawn) == 0 || drawn[0] != openIp.String() {
+			t.Fatalf("%s: the fallback drew %v, expected the open record first", lapse, drawn)
+		}
+	}
+}
+
+// When the control route cannot be reached, the cached verified open records
+// carry it at once rather than at the end of the gated budget (§1.1 rule 4),
+// and the fallback is in force for anything a seed bootstrap adds.
+func TestExtenderGatedPreferenceControlReachAllowsTheCachedOpenRecords(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	testConnectDrawIps(directory, 4)
+	if !directory.AllowOpenForControlReach() {
+		t.Fatal("the cached open record was not let carry the control route")
+	}
+	if drawn := testConnectDrawIps(directory, 4); !slices.Equal(drawn, []string{"192.0.2.10", "198.51.100.1"}) {
+		t.Fatalf("the draw after control reach was %v", drawn)
+	}
+	if reason := directory.GatedPreference().FallbackReason; reason != ExtenderGatedFallbackControlReach {
+		t.Fatalf("reason %q", reason)
+	}
+	// already falling back, nothing is new
+	if directory.AllowOpenForControlReach() {
+		t.Fatal("a second reach claimed to add something")
+	}
+
+	// with no open record cached it adds nothing, but a record a seed brings
+	// next is dialable at once
+	clock = newTestClock()
+	directory, rootPrivateKey = newTestGatedPreferenceDirectory(t, clock)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+	testConnectDrawIps(directory, 4)
+	if directory.AllowOpenForControlReach() {
+		t.Fatal("a reach with no open record claimed to add one")
+	}
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.9")
+	if drawn := testConnectDrawIps(directory, 4); !slices.Contains(drawn, "198.51.100.9") {
+		t.Fatalf("the seeded open record was held back: %v", drawn)
+	}
+
+	// and with the preference off open records are never held back
+	clock = newTestClock()
+	directory, rootPrivateKey = newTestExtenderDirectory(t, clock, nil)
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	if directory.AllowOpenForControlReach() {
+		t.Fatal("a reach with the preference off claimed to add something")
+	}
+}
+
+// The policy asks for a release refresh when the current gated records drop
+// below the low watermark and when it falls back for a reason a release can
+// mend, once per crossing (§1.1, §1.3).
+func TestExtenderGatedPreferenceAsksForARefresh(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	notified := func(notify chan struct{}) bool {
+		select {
+		case <-notify:
+			return true
+		default:
+			return false
+		}
+	}
+
+	notify := directory.GatedRefreshMonitor().NotifyChannel()
+	testConnectDrawIps(directory, 4)
+	if !notified(notify) {
+		t.Fatal("a cold draw asked for no release")
+	}
+	notify = directory.GatedRefreshMonitor().NotifyChannel()
+	for range 4 {
+		testConnectDrawIps(directory, 4)
+	}
+	if notified(notify) {
+		t.Fatal("simultaneous draws below the watermark asked again")
+	}
+	// a released record clears the watermark; its expiry crosses it again
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, newTestExtenderKey(t), "192.0.2.10")
+	testConnectDrawIps(directory, 4)
+	notify = directory.GatedRefreshMonitor().NotifyChannel()
+	clock.advance(25 * time.Hour)
+	testConnectDrawIps(directory, 4)
+	if !notified(notify) {
+		t.Fatal("the expiry of the last gated record asked for no release")
+	}
+	if status := directory.GatedPreference(); status.Stats.RefreshWantedCount < 2 {
+		t.Fatalf("refresh asks %d", status.Stats.RefreshWantedCount)
+	}
+}
+
+// Gated and channel-restricted records never leave this client on a public
+// path, whatever source they arrived from and whether or not a connection
+// uses them now: not in a share (K7), not in a feed sample from any vantage,
+// not to a feed or mesh subscriber, and not into a seed bundle, which the
+// publisher refuses whatever else it holds (§1.3, §1.4, §2.2; R1, R4).
+func TestExtenderGatedRecordsNeverLeaveOnAPublicPath(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	messages, unsubscribe := directory.Subscribe()
+	defer unsubscribe()
+
+	releasedKey := newTestExtenderKey(t)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, releasedKey, "192.0.2.10", "2001:db8::10")
+	// a gated canary and a channel-marked record of the open tier leak in
+	restricted := map[string]ed25519.PublicKey{}
+	restrictedRecords := []*protocol.ExtenderRecord{
+		signTestTierRecord(t, rootPrivateKey, releasedKey, clock.Now(), ExtenderDirectoryTierGated, "192.0.2.10"),
+	}
+	for i, tier := range []int{ExtenderDirectoryTierGated, ExtenderDirectoryTierOpen} {
+		key := newTestExtenderKey(t)
+		ip := fmt.Sprintf("192.0.2.%d", 20+i)
+		record, err := SignExtenderRecord(rootPrivateKey, &protocol.ExtenderRecordBody{
+			PublicKey:     key,
+			Addresses:     []*protocol.ExtenderAddress{testExtenderAddress(ip)},
+			TcpPort:       443,
+			IssueTimeMs:   uint64(clock.Now().UnixMilli()),
+			ExpireTimeMs:  uint64(clock.Now().Add(24 * time.Hour).UnixMilli()),
+			NetworkHost:   testExtenderNetworkHost,
+			DirectoryTier: uint32(tier),
+			CanaryChannel: ExtenderChannelDns,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := directory.ApplyRecord(record, ExtenderSourceGossip); err != nil {
+			t.Fatal(err)
+		}
+		restricted[ip] = key
+		restrictedRecords = append(restrictedRecords, record)
+	}
+	restricted["192.0.2.10"] = releasedKey
+	restricted["2001:db8::10"] = releasedKey
+	openKey := applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+	// in use, which a share ranks first
+	for ip := range restricted {
+		directory.SetInUse(netip.MustParseAddr(ip), 1)
+	}
+
+	share := BuildExtenderShare(directory, testExtenderNetworkHost, "", "", nil, false, ExtenderShareMaxAddressCount)
+	shared := []string{}
+	for _, ip := range ExtenderShareAddresses(share) {
+		shared = append(shared, ip.String())
+	}
+	if !slices.Equal(shared, []string{"198.51.100.1"}) {
+		t.Fatalf("the share carries %v, expected the open record alone", shared)
+	}
+	for i := range 64 {
+		for _, keyHex := range sampleKeyHexes(t, directory, directory.SampleRecords(ExtenderFeedMaxSampleCount, nil, []byte(fmt.Sprintf("vantage-%d", i)))) {
+			if keyHex != hex.EncodeToString(openKey) {
+				t.Fatalf("vantage %d was sampled a restricted record", i)
+			}
+		}
+	}
+	select {
+	case message := <-messages:
+		body, err := directory.RootKeys().VerifyRecord(message.GetRecord())
+		if err != nil || !bytes.Equal(body.PublicKey, openKey) {
+			t.Fatal("a subscriber was handed a restricted record")
+		}
+	default:
+		t.Fatal("the open record was not published")
+	}
+	select {
+	case <-messages:
+		t.Fatal("a subscriber was handed more than the open record")
+	default:
+	}
+
+	openRecord := signTestTierRecord(t, rootPrivateKey, openKey, clock.Now(), ExtenderDirectoryTierOpen, "198.51.100.1")
+	seedExpireTime := clock.Now().Add(time.Hour)
+	if _, err := NewExtenderSeedBody(testExtenderNetworkHost, 1, clock.Now(), seedExpireTime, []*protocol.ExtenderRecord{openRecord}, nil); err != nil {
+		t.Fatalf("the open record does not make a seed body: %v", err)
+	}
+	for i, record := range restrictedRecords {
+		body, err := NewExtenderSeedBody(
+			testExtenderNetworkHost,
+			1,
+			clock.Now(),
+			seedExpireTime,
+			[]*protocol.ExtenderRecord{openRecord, record},
+			nil,
+		)
+		if body != nil || ExtenderSeedErrorCode(err) != ExtenderSeedCodeGatedRecord {
+			t.Fatalf("restricted record %d entered a seed body: %v", i, err)
+		}
+	}
+}
+
+// Routine endpoint replacement in each family (§1.3): a release re-signs the
+// record at a new address, the old one drains as it fails, and when the old
+// endpoint disappears before the refresh the fallback carries the client until
+// the refreshed record is tried again. Only the host's family is ever drawn.
+func TestExtenderGatedReleaseReplacesAnEndpointInEitherFamily(t *testing.T) {
+	cases := []struct {
+		ipVersion  int
+		oldIp      string
+		newIp      string
+		openIp     string
+		otherIp    string
+		otherIpNew string
+	}{
+		{ipVersion: 4, oldIp: "192.0.2.10", newIp: "192.0.2.11", openIp: "198.51.100.1", otherIp: "2001:db8::10", otherIpNew: "2001:db8::11"},
+		{ipVersion: 6, oldIp: "2001:db8::10", newIp: "2001:db8::11", openIp: "2001:db8:1::1", otherIp: "192.0.2.10", otherIpNew: "192.0.2.11"},
+	}
+	for _, c := range cases {
+		draw := func(directory *ExtenderDirectory) []string {
+			drawn := []string{}
+			for _, candidate := range directory.ConnectCandidates([]int{c.ipVersion}, 64, false, nil)[0] {
+				if candidate.IpVersion != c.ipVersion {
+					t.Fatalf("v%d: a host of one family drew %s", c.ipVersion, candidate.Ip)
+				}
+				drawn = append(drawn, candidate.Ip.String())
+			}
+			return drawn
+		}
+
+		// routine: the refresh lands before the old endpoint goes
+		clock := newTestClock()
+		directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+		gatedKey := newTestExtenderKey(t)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, gatedKey, c.oldIp, c.otherIp)
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, c.openIp)
+		if drawn := draw(directory); !slices.Equal(drawn, []string{c.oldIp}) {
+			t.Fatalf("v%d: drew %v", c.ipVersion, drawn)
+		}
+		directory.RecordSuccess(netip.MustParseAddr(c.oldIp), ExtenderConnectModeTcpTls)
+		clock.advance(6 * time.Hour)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, gatedKey, c.newIp, c.otherIpNew)
+		if drawn := draw(directory); !slices.Contains(drawn, c.newIp) || slices.Contains(drawn, c.openIp) {
+			t.Fatalf("v%d: after the replacement drew %v", c.ipVersion, drawn)
+		}
+		directory.RecordFailure(netip.MustParseAddr(c.oldIp), ExtenderConnectModeTcpTls)
+		if drawn := draw(directory); !slices.Equal(drawn, []string{c.newIp}) {
+			t.Fatalf("v%d: once the old endpoint failed drew %v", c.ipVersion, drawn)
+		}
+		if mode := directory.GatedPreference().Mode; mode != ExtenderGatedModeGated {
+			t.Fatalf("v%d: mode %s, expected the replacement to keep gated", c.ipVersion, mode)
+		}
+
+		// the old endpoint disappears before the refresh
+		clock = newTestClock()
+		directory, rootPrivateKey = newTestGatedPreferenceDirectory(t, clock)
+		gatedKey = newTestExtenderKey(t)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, gatedKey, c.oldIp, c.otherIp)
+		applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, c.openIp)
+		draw(directory)
+		directory.RecordSuccess(netip.MustParseAddr(c.oldIp), ExtenderConnectModeTcpTls)
+		draw(directory)
+		clock.advance(time.Hour)
+		directory.RecordFailure(netip.MustParseAddr(c.oldIp), ExtenderConnectModeTcpTls)
+		if drawn := draw(directory); !slices.Equal(drawn, []string{c.openIp}) {
+			t.Fatalf("v%d: with the old endpoint gone drew %v, expected the open fallback", c.ipVersion, drawn)
+		}
+		if reason := directory.GatedPreference().FallbackReason; reason != ExtenderGatedFallbackGatedFailed {
+			t.Fatalf("v%d: reason %q", c.ipVersion, reason)
+		}
+		clock.advance(time.Minute)
+		applyTestGatedRelease(t, directory, rootPrivateKey, clock, gatedKey, c.newIp, c.otherIpNew)
+		if drawn := draw(directory); !slices.Equal(drawn, []string{c.newIp}) {
+			t.Fatalf("v%d: the refreshed record drew %v", c.ipVersion, drawn)
+		}
+		directory.RecordSuccess(netip.MustParseAddr(c.newIp), ExtenderConnectModeTcpTls)
+		draw(directory)
+		if mode := directory.GatedPreference().Mode; mode != ExtenderGatedModeGated {
+			t.Fatalf("v%d: mode %s after the new endpoint connected", c.ipVersion, mode)
+		}
+	}
+}
+
+// An account change drops what the operator released to the identity before
+// it (§1.1 rule 2): every gated record and the addresses only they name, never
+// an open record, a revocation, this extender's own record, or a manual
+// address, which stays as the unverified manual entry it was.
+func TestExtenderGatedForgetDropsOnlyTheGatedRecords(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestGatedPreferenceDirectory(t, clock)
+	manualIp := netip.MustParseAddr("192.0.2.11")
+	directory.AddManual(manualIp)
+	releasedKey := newTestExtenderKey(t)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, releasedKey, "192.0.2.10", manualIp.String())
+	ownKey := newTestExtenderKey(t)
+	directory.KeepPublicKey(ownKey)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, ownKey, "192.0.2.12")
+	revokedKey := newTestExtenderKey(t)
+	applyTestGatedRelease(t, directory, rootPrivateKey, clock, revokedKey, "192.0.2.13")
+	clock.advance(time.Minute)
+	if _, err := directory.ApplyRevocation(signTestRevocation(t, rootPrivateKey, revokedKey, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+	applyTestOpenTierRecord(t, directory, rootPrivateKey, clock, "198.51.100.1")
+
+	if count := directory.ForgetGatedRecords(); count != 2 {
+		t.Fatalf("forgot %d gated records, expected the released and the revoked one", count)
+	}
+	if testDirectoryKnown(directory, netip.MustParseAddr("192.0.2.10")) || testDirectoryKnown(directory, netip.MustParseAddr("192.0.2.13")) {
+		t.Fatal("a forgotten gated record kept its address")
+	}
+	if entry := testDirectoryEntry(t, directory, manualIp); entry.Source != ExtenderSourceManual || entry.State != ExtenderStateUnverified {
+		t.Fatalf("the manual address is %s from %s, expected the unverified manual entry", entry.State, entry.Source)
+	}
+	if !testDirectoryKnown(directory, netip.MustParseAddr("192.0.2.12")) || !testDirectoryKnown(directory, netip.MustParseAddr("198.51.100.1")) {
+		t.Fatal("the extender's own record or an open record was forgotten")
+	}
+	// the revocation stays, so the record it revoked cannot come back
+	clock.advance(-2 * time.Minute)
+	replayed := signTestTierRecord(t, rootPrivateKey, revokedKey, clock.Now(), ExtenderDirectoryTierGated, "192.0.2.13")
+	clock.advance(2 * time.Minute)
+	if _, err := directory.ApplyRecord(replayed, ExtenderSourceGossip); err != nil {
+		t.Fatal(err)
+	}
+	if directory.IsActiveKey(revokedKey) {
+		t.Fatal("a replayed record brought a revoked key back after the forget")
+	}
+}
