@@ -369,9 +369,13 @@ type ExtenderActivator struct {
 	// this extender's id as the operator's last answer reported it, zero
 	// until one has (lag.dev/PLAN.md N4), and whether the last pass forced this
 	// one to carry the measurement request (C4), so that it is followed by no
-	// other. Both are read and written by the loop goroutine alone.
-	extenderId          Id
-	measurementFollowUp bool
+	// other. The family that follow-up posts is due at once while
+	// measurementFollowUpDue holds. All are read and written by the loop
+	// goroutine alone.
+	extenderId                   Id
+	measurementFollowUp          bool
+	measurementFollowUpIpVersion int
+	measurementFollowUpDue       bool
 }
 
 // The activator is running when this returns: the loop is up and its first
@@ -660,6 +664,15 @@ func (self *ExtenderActivator) run() {
 					schedule.backoff = min(2*schedule.backoff, self.settings.MaxBackoff)
 				}
 			}
+			if self.measurementFollowUpDue {
+				// the family that passed is posted once more at once, to carry
+				// the measurement request no post that passed carried (C4);
+				// the wake the follow-up sent starts that pass
+				self.measurementFollowUpDue = false
+				if schedule, ok := ipVersionSchedules[self.measurementFollowUpIpVersion]; ok {
+					schedule.nextActivateTime = now
+				}
+			}
 		}
 
 		// until the first deadline of any family, or of the address check
@@ -834,8 +847,9 @@ func (self *ExtenderActivator) dnsPorts() []int {
 // this host is not attempted and reports no success, so a host that gains an
 // address is retried on that family's backoff rather than on the 24 hour tick.
 //
-// The pass as a whole -- every due family it attempted passed, and it
-// attempted one -- is what decides the measurement follow-up (C4).
+// A pass in which a family passed and no post that passed carried the
+// measurement request is followed by one more post of that family
+// (followMeasurementCsr, C4).
 func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[int]extenderActivateOutcome {
 	carriers := []string{}
 	if self.settings.Carriers != nil {
@@ -847,27 +861,25 @@ func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[
 	self.measurementFollowUp = false
 
 	ipVersionOutcomes := map[int]extenderActivateOutcome{}
-	succeeded := false
-	// whether a post of this pass delivered the measurement request
+	// the first family whose post passed, which a measurement follow-up posts
+	passed := false
+	passedIpVersion := 0
+	// whether a post of this pass that passed delivered the measurement request
 	measurementCarried := false
 	if self.fallback {
 		var outcome extenderActivateOutcome
 		outcome, measurementCarried = self.activateFallback(carriers, now)
 		ipVersionOutcomes[0] = outcome
-		succeeded = outcome.succeeded
+		passed = outcome.succeeded
 	} else {
-		attempted := false
-		succeeded = true
 		for _, ipVersion := range dueIpVersions {
 			if !self.ipVersionSupported(ipVersion) {
 				// a family with no global address on this host cannot be probed
 				// back, so it is skipped rather than refused (G3)
 				continue
 			}
-			attempted = true
 			if len(carriers) == 0 {
 				self.recordFailure(ipVersion, now, "no carrier is listening", false)
-				succeeded = false
 				continue
 			}
 			// one request a pass, on the first post that can carry it (C4)
@@ -878,15 +890,16 @@ func (self *ExtenderActivator) activate(now time.Time, dueIpVersions []int) map[
 			outcome := self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
 			ipVersionOutcomes[ipVersion] = outcome
 			if outcome.succeeded {
+				if !passed {
+					passed = true
+					passedIpVersion = ipVersion
+				}
 				measurementCarried = measurementCarried || measurementCsr != ""
-			} else {
-				succeeded = false
 			}
 		}
-		succeeded = attempted && succeeded
 	}
-	if succeeded && !followUp && !measurementCarried {
-		self.followMeasurementCsr()
+	if passed && !followUp && !measurementCarried {
+		self.followMeasurementCsr(passedIpVersion)
 	}
 	return ipVersionOutcomes
 }
@@ -906,29 +919,31 @@ func (self *ExtenderActivator) measurementDisabled() bool {
 	return self.settings.MeasurementDisabled != nil && self.settings.MeasurementDisabled()
 }
 
-// Follows a successful pass that delivered no measurement request with one
-// more pass at once, when a request is wanted now. That is the first pass of
-// a new identity with a single post -- one family, or the plain api url --
-// which learned this extender's id from the answer to that post and so had no
-// later post to carry the request on.
+// Follows a pass in which a family passed but no post that passed delivered
+// the measurement request, when one is wanted now, with one more post of the
+// family that passed (`ipVersion`), at once. That is the first pass of a new
+// identity whose only post that passed was the one that learned this
+// extender's id from its answer, so the request had no later post to ride:
+// a single post -- one family, or the plain api url -- or two families of
+// which the other was refused, its post carrying the request and failing.
 //
 // lag.dev/PLAN.md C4 has a new identity's request ride its next activation
-// post. With one post a pass that next post is the 24 hour tick away, and a
-// process that restarts more often than that would never reach it, since the
-// id is learned again from the first answer of each run. This one extra post
-// is the smallest change that makes the next post follow the first.
-func (self *ExtenderActivator) followMeasurementCsr() {
+// post. With each family on a schedule of its own, the family that passed is
+// next posted on its 24 hour tick, and the refused family's posts carry the
+// request only to be refused again, so a process that restarts more often
+// than that would never deliver it, since the id is learned again from the
+// first answer of each run (connect#230). This one extra post of the family
+// that passed is the smallest change that makes the next post follow the
+// first; the refused family keeps its own schedule.
+func (self *ExtenderActivator) followMeasurementCsr(ipVersion int) {
 	if self.measurementCsr() == "" {
 		// nothing is wanted: measurement is off, the id is not known, or the
 		// operator already holds a request or a certificate for the name
 		return
 	}
 	self.measurementFollowUp = true
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		self.forcedActivate = true
-	}()
+	self.measurementFollowUpIpVersion = ipVersion
+	self.measurementFollowUpDue = true
 	self.wakeMonitor.NotifyAll()
 }
 
