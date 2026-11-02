@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect"
+	"github.com/urnetwork/connect/extender"
 	"github.com/urnetwork/connect/gossip"
 	"github.com/urnetwork/connect/protocol"
 )
@@ -348,6 +349,15 @@ func extenderCommandServesAndActivates(t *testing.T, loopbackIp string) {
 		},
 		packetConnFactory:      testLoopbackPacketConn,
 		configureNetworkClient: testHermeticNetworkClient,
+		// The peer probes below judge who the pinger is. The gate's rtt check
+		// compares two separate round trips of this machine, and on a busy one
+		// either can wait out the scheduler while the other does not, by more than
+		// any tolerance, so here it takes any claim. The extender's own tests cover
+		// the check (extender.TestExtenderProbeGate).
+		configureServer: func(settings *extender.ExtenderSettings) {
+			settings.ProbeRttTolerance = 24 * time.Hour
+			settings.ProbeAttestationTimeout = 60 * time.Second
+		},
 		onStart: func(run *extenderRun) {
 			runs <- run
 		},
@@ -500,7 +510,7 @@ func extenderPeerProbes(
 	if run.peerPinger == nil {
 		t.Fatal("the extender runs no peer pinger")
 	}
-	newPeer := func() *connect.ExtenderProbeAttestor {
+	newPeer := func(signHold time.Duration) *connect.ExtenderProbeAttestor {
 		seed, err := connect.NewExtenderKeySeed()
 		if err != nil {
 			t.Fatal(err)
@@ -509,13 +519,21 @@ func extenderPeerProbes(
 		if err != nil {
 			t.Fatal(err)
 		}
+		sign := connect.NewExtenderPeerProbeSigner(privateKey)
 		return connect.NewExtenderProbeExtenderAttestor(
 			privateKey.Public().(ed25519.PublicKey),
-			connect.NewExtenderPeerProbeSigner(privateKey),
+			func(data []byte) []byte {
+				time.Sleep(signHold)
+				return sign(data)
+			},
 		)
 	}
-	knownPeer := newPeer()
-	unknownPeer := newPeer()
+	// A claim is measured before it is signed, so holding the signature holds the
+	// frame past the default tolerance after the claim is fixed. A busy machine does
+	// that now and then; here every run does, and the known peer must still be
+	// co-signed.
+	knownPeer := newPeer(250 * time.Millisecond)
+	unknownPeer := newPeer(0)
 	record, err := connect.SignExtenderRecord(operator.rootPrivateKey, &protocol.ExtenderRecordBody{
 		PublicKey: knownPeer.ExtenderPublicKey,
 		Addresses: []*protocol.ExtenderAddress{
