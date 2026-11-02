@@ -2134,6 +2134,53 @@ paths:
         "401":
           description: Missing or invalid client bearer token.
 
+  /v1/seed.bin:
+    get:
+      tags: [Network]
+      summary: The public extender seed bundle
+      description: |
+        The operator's public seed bundle (EXTENDER-UPDATE2.md §2): the
+        serialized `ExtenderSeedEnvelope`, raw bytes, at most 64 KiB. It is
+        the origin the seed mirrors copy, and every mirror serves the same
+        bytes at this same path for one sequence. A client reads at most
+        64 KiB + 1 bytes, refuses a larger body before decoding, and verifies
+        the envelope and every record in it under the root keys its network
+        space already authorizes (`VerifyExtenderSeed`); nothing here is
+        trusted for being served by the operator.
+
+        The bundle is public by design: a small, stable cohort of ordinary
+        open-tier records with an empty canary channel, and root-signed
+        revocations. It never carries a gated or channel-restricted record,
+        a root key, a network host setting or a resolver setting.
+
+        No auth. `404` while the operator's seed is off or nothing is
+        stored; `503` while no stored bundle verifies. The answer is
+        cacheable for five minutes, and its strong `ETag` is the quoted hex
+        sha256 of the body.
+      operationId: extenderSeed
+      security: []
+      responses:
+        "200":
+          description: The serialized seed envelope
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The bundle named by `If-None-Match` is still current
+        "404":
+          description: The seed is off, or no bundle is stored
+        "503":
+          description: No stored bundle verifies
+
   /network/extender-lag-report:
     post:
       tags: [Network]
