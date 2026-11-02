@@ -496,6 +496,11 @@ func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 		if _, ok := self.families[ipVersion]; ok || self.fallback {
 			copied := family
 			copied.AllowedHosts = slices.Clone(family.AllowedHosts)
+			// the carrier this was about is the old role's. If the new role's is gone
+			// too, its own first look says so
+			if extenderActivateCarrierFailureMessage(copied.LastError) {
+				copied.LastError = ""
+			}
 			self.families[ipVersion] = &copied
 		}
 	}
@@ -863,6 +868,11 @@ func (self *ExtenderActivator) run() {
 
 		if self.settings.HelloUrl != "" && !now.Before(self.nextAddressCheckTime) {
 			address, err := self.hello()
+			if err != nil && self.ctx.Err() != nil {
+				// the close interrupted it, so nothing was learned, and what is handed
+				// over (State) still has it due
+				return
+			}
 			if err != nil {
 				// a failed check retries on the backoff floor rather than on
 				// every wake, which a directory change would otherwise be
@@ -1216,6 +1226,9 @@ const (
 	// no carrier the operator can accept an activation on is serving, so nothing
 	// was asked of the operator (G2, C2a)
 	extenderActivateCarrierHeld
+	// the activator closed under the post, which says nothing of the operator, so
+	// it is still owed (State)
+	extenderActivateInterrupted
 	// the operator answered `activated` false (N7)
 	extenderActivateRefused
 	extenderActivateActivated
@@ -1271,6 +1284,9 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	activated := []int{}
 	for i, key := range due {
 		schedule := self.schedules[key]
+		if outcomes[i] == extenderActivateInterrupted {
+			continue
+		}
 		schedule.carrierHeld = false
 		schedule.postedCarriers = nil
 		schedule.postedDnsPorts = nil
@@ -1343,7 +1359,7 @@ func (self *ExtenderActivator) activateFamily(
 		return extenderActivateSkipped, false, 0
 	}
 	if message := extenderActivateCarrierFailure(carriers); message != "" {
-		self.recordFailure(ipVersion, now, message, false)
+		self.recordCarrierHeld(ipVersion, now, message)
 		return extenderActivateCarrierHeld, false, 0
 	}
 	// one request a pass, on the first post that can carry it (C4)
@@ -1458,7 +1474,7 @@ func (self *ExtenderActivator) activateFallback(carriers []string, dnsPorts []in
 		return extenderActivateSkipped, false, 0
 	}
 	if message := extenderActivateCarrierFailure(carriers); message != "" {
-		self.recordFailure(0, now, message, false)
+		self.recordCarrierHeld(0, now, message)
 		return extenderActivateCarrierHeld, false, 0
 	}
 	measurementCsr := self.measurementCsr()
@@ -1515,6 +1531,9 @@ func (self *ExtenderActivator) activateUrl(
 		args,
 	)
 	if err != nil {
+		if self.ctx.Err() != nil {
+			return extenderActivateInterrupted, 0
+		}
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
 		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
@@ -1690,16 +1709,7 @@ func (self *ExtenderActivator) recordFailure(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	families := []*ExtenderFamilyActivationStatus{}
-	if ipVersion == 0 && 0 < len(self.families) {
-		// the answer named no family, and in the fallback mode every family
-		// was activated through the one url this failure came from
-		for _, family := range self.families {
-			families = append(families, family)
-		}
-	} else if family := self.familyWithLock(ipVersion); family != nil {
-		families = append(families, family)
-	}
+	families := self.failedFamiliesWithLock(ipVersion)
 	if len(families) == 0 {
 		return
 	}
@@ -1710,4 +1720,38 @@ func (self *ExtenderActivator) recordFailure(
 		family.LastRefused = refused
 	}
 	self.changedWithLock()
+}
+
+// Records a post held back for its carriers. That asked nothing of the operator, so
+// what the family last heard stands: a record that was good is good, and a tick or a
+// Reactivate that falls within a flap does not read as a family lost.
+func (self *ExtenderActivator) recordCarrierHeld(ipVersion int, now time.Time, message string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	families := self.failedFamiliesWithLock(ipVersion)
+	if len(families) == 0 {
+		return
+	}
+	for _, family := range families {
+		family.LastActivationTime = now
+		family.LastError = message
+		family.LastRefused = false
+	}
+	self.changedWithLock()
+}
+
+// The families a failure of one family's turn is about. An answer that named no
+// family, in the fallback mode, is about every family activated through the one url
+// it came from.
+func (self *ExtenderActivator) failedFamiliesWithLock(ipVersion int) []*ExtenderFamilyActivationStatus {
+	families := []*ExtenderFamilyActivationStatus{}
+	if ipVersion == 0 && 0 < len(self.families) {
+		for _, family := range self.families {
+			families = append(families, family)
+		}
+	} else if family := self.familyWithLock(ipVersion); family != nil {
+		families = append(families, family)
+	}
+	return families
 }

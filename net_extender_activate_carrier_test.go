@@ -191,11 +191,14 @@ func TestExtenderActivatorSpreadsThePostsOfAReturnedTcpCarrier(t *testing.T) {
 		}
 	}
 
-	fixture.step(time.Minute)
-	for _, ipVersion := range []int{4, 6} {
-		if post := fixture.waitPost(); post.ipVersion != ipVersion {
-			t.Fatalf("post = v%d, expected v%d", post.ipVersion, ipVersion)
-		}
+	// the pass that took the return may have read the clock a step on, so this is past
+	// the draw from either
+	fixture.clock.advance(2 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d, expected v4", post.ipVersion)
+	}
+	if post := fixture.waitPost(); post.ipVersion != 6 {
+		t.Fatalf("post = v%d, expected v6", post.ipVersion)
 	}
 }
 
@@ -427,11 +430,15 @@ func TestExtenderActivatorPostsARecordMissingACarrierWhenItReturns(t *testing.T)
 	if len(draws) != 2 {
 		t.Fatalf("%d draws, expected each family's", len(draws))
 	}
-	if maxJitter := <-draws; maxJitter != DefaultExtenderActivatorSettings().CarrierReturnJitter {
-		t.Fatalf("drew from %s", maxJitter)
+	for range 2 {
+		if maxJitter := <-draws; maxJitter != DefaultExtenderActivatorSettings().CarrierReturnJitter {
+			t.Fatalf("drew from %s", maxJitter)
+		}
 	}
 
-	fixture.clock.advance(time.Minute)
+	// the pass that took the change may have read the clock a step on, so this is past
+	// the draw from either
+	fixture.clock.advance(2 * time.Minute)
 	for _, ipVersion := range []int{4, 6} {
 		var post *testActivatePost
 		if ipVersion == 4 {
@@ -451,8 +458,8 @@ func TestExtenderActivatorPostsARecordMissingACarrierWhenItReturns(t *testing.T)
 	fixture.activator.CarriersChanged()
 	fixture.step(time.Minute)
 	fixture.expectFamilyPostCounts("with nothing missing", 2, 2)
-	if 1 < len(draws) {
-		t.Fatalf("%d draws left, expected none with nothing missing", len(draws)-1)
+	if 0 < len(draws) {
+		t.Fatalf("%d draws, expected none with nothing missing", len(draws))
 	}
 }
 
@@ -622,7 +629,10 @@ func TestExtenderActivatorReplacementKeepsAHold(t *testing.T) {
 	}
 	fixture.step(time.Minute)
 	fixture.expectFamilyPostCounts("after the second refusal", 2, 1)
-	fixture.replaceActivator(nil)
+	// v6 stands activated, and its post is not what this is about
+	fixture.replaceActivator(func(settings *ExtenderActivatorSettings) {
+		settings.ReplacedPostJitter = 24 * 365 * time.Hour
+	})
 	fixture.step(17 * time.Minute)
 	fixture.expectFamilyPostCounts("within the hold", 2, 1)
 
@@ -655,8 +665,46 @@ func TestExtenderActivatorReplacementPostsWhatTheGateHeldBack(t *testing.T) {
 			return 3 * time.Minute
 		}
 	})
+	if status := fixture.activator.Status().Family(4); status.LastError != "" {
+		t.Fatalf("v4 status = %+v, expected the old role's carrier no longer given as the reason", status)
+	}
 	fixture.step(time.Minute)
 	fixture.expectFamilyPostCounts("within the draw", 1, 1)
+	fixture.clock.advance(2 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the draw", post.ipVersion)
+	}
+	fixture.waitPost()
+}
+
+// A post the close of a replaced role interrupted says nothing of the operator: it
+// neither holds nor reads as a failure, and the next role still owes it.
+func TestExtenderActivatorReplacementStillOwesAnInterruptedPost(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, nil)
+	fixture.step(time.Minute)
+	release := make(chan struct{})
+	defer close(release)
+	fixture.operator.setAnswerHold(release)
+	fixture.activator.Reactivate()
+	fixture.waitPost()
+
+	fixture.replaceActivator(func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			if maxJitter != settings.CarrierReturnJitter {
+				t.Errorf("drew from %s", maxJitter)
+			}
+			return 3 * time.Minute
+		}
+	})
+	fixture.operator.setAnswerHold(nil)
+	for _, ipVersion := range []int{4, 6} {
+		status := fixture.activator.Status().Family(ipVersion)
+		if !status.Activated || status.LastError != "" {
+			t.Fatalf("v%d status = %+v, expected the interrupted post to say nothing", ipVersion, status)
+		}
+	}
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("within the draw", 2, 1)
 	fixture.clock.advance(2 * time.Minute)
 	if post := fixture.wakeForPost(); post.ipVersion != 4 {
 		t.Fatalf("post = v%d after the draw", post.ipVersion)
@@ -667,16 +715,18 @@ func TestExtenderActivatorReplacementPostsWhatTheGateHeldBack(t *testing.T) {
 // A revocation the old activator already answered is not news to the new one, which
 // would post every family at once for it.
 func TestExtenderActivatorReplacementDoesNotSeeARevocationAgain(t *testing.T) {
-	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
-		operator.setRefusal(testActivateFamilyRefusal)
-		operator.setRetryAfterSeconds(50 * 60)
-	}, nil)
-	fixture.waitFirstPass()
+	fixture := newTestActivatorFixtureActivated(t, nil)
 	fixture.step(time.Minute)
+	fixture.operator.setRefusal(testActivateFamilyRefusal)
+	fixture.operator.setRetryAfterSeconds(50 * 60)
 	fixture.revoke()
-	// the edge posts every family at once, whatever the wait said
+	// the edge posts every family at once
 	fixture.waitPost()
 	fixture.waitPost()
+	fixture.waitFamilies("refused", func(family *ExtenderFamilyActivationStatus) bool {
+		return family.LastRefused
+	})
+	fixture.step(time.Minute)
 	fixture.step(time.Minute)
 	fixture.expectFamilyPostCounts("after the revocation", 2, 2)
 
