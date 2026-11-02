@@ -147,26 +147,18 @@ func ExtenderGatedFallbackReasons() []string {
 // label, which no server answers with.
 const ExtenderGatedReleaseFailed = "failed"
 
-// Contract R's outcome names. The server declares them as
-// ExtenderReleaseOutcome* (net_extender_directory_release.go); they are
-// spelled here, unexported, until those are declared beside this file, and
-// then this map keys by those names.
-const (
-	extenderGatedReleaseOk    = "ok"
-	extenderGatedReleaseEmpty = "empty"
-)
-
-// The non-ok outcomes of contract R, by their wire names, and the fallback
-// each leads to when it leaves no usable gated record.
+// The non-ok outcomes of contract R (ExtenderReleaseOutcome*,
+// net_extender_directory_release.go), and the fallback each leads to when it
+// leaves no usable gated record.
 var extenderGatedReleaseFallbackReasons = map[string]string{
-	extenderGatedReleaseEmpty:  ExtenderGatedFallbackReleaseEmpty,
-	"epoch_spent":              ExtenderGatedFallbackReleaseEpochSpent,
-	"probation":                ExtenderGatedFallbackReleaseProbation,
-	"country_capacity":         ExtenderGatedFallbackReleaseCountryCapacity,
-	"rate_limited":             ExtenderGatedFallbackReleaseRateLimited,
-	"incompatible":             ExtenderGatedFallbackReleaseIncompatible,
-	"unavailable":              ExtenderGatedFallbackReleaseUnavailable,
-	ExtenderGatedReleaseFailed: ExtenderGatedFallbackReleaseFailed,
+	ExtenderReleaseOutcomeEmpty:           ExtenderGatedFallbackReleaseEmpty,
+	ExtenderReleaseOutcomeEpochSpent:      ExtenderGatedFallbackReleaseEpochSpent,
+	ExtenderReleaseOutcomeProbation:       ExtenderGatedFallbackReleaseProbation,
+	ExtenderReleaseOutcomeCountryCapacity: ExtenderGatedFallbackReleaseCountryCapacity,
+	ExtenderReleaseOutcomeRateLimited:     ExtenderGatedFallbackReleaseRateLimited,
+	ExtenderReleaseOutcomeIncompatible:    ExtenderGatedFallbackReleaseIncompatible,
+	ExtenderReleaseOutcomeUnavailable:     ExtenderGatedFallbackReleaseUnavailable,
+	ExtenderGatedReleaseFailed:            ExtenderGatedFallbackReleaseFailed,
 }
 
 // Normalizes a release outcome: `ok`, `failed` and the non-ok outcomes of
@@ -175,18 +167,18 @@ var extenderGatedReleaseFallbackReasons = map[string]string{
 // outcome it does not know.
 func NormalizeExtenderGatedReleaseOutcome(outcome string) string {
 	outcome = strings.ToLower(strings.TrimSpace(outcome))
-	if outcome == extenderGatedReleaseOk {
+	if outcome == ExtenderReleaseOutcomeOk {
 		return outcome
 	}
 	if _, ok := extenderGatedReleaseFallbackReasons[outcome]; ok {
 		return outcome
 	}
-	return extenderGatedReleaseEmpty
+	return ExtenderReleaseOutcomeEmpty
 }
 
 // Every release outcome the counts name, the complete label set.
 func ExtenderGatedReleaseOutcomes() []string {
-	outcomes := []string{extenderGatedReleaseOk}
+	outcomes := []string{ExtenderReleaseOutcomeOk}
 	for outcome := range extenderGatedReleaseFallbackReasons {
 		outcomes = append(outcomes, outcome)
 	}

@@ -73,6 +73,25 @@ func TestExtenderReleaseOutcomeWireNames(t *testing.T) {
 	}
 }
 
+// The gated client reads the answer through its normalizer, which treats a name
+// it does not know as empty (contract R). Every outcome the policy can answer
+// with must reach the client as itself, or a refusal with a retry time would
+// read as an empty release, and the client's counts must label each one.
+func TestExtenderReleaseOutcomesReachTheGatedClient(t *testing.T) {
+	labels := ExtenderGatedReleaseOutcomes()
+	for _, outcome := range testReleaseOutcomes {
+		if normalized := NormalizeExtenderGatedReleaseOutcome(outcome); normalized != outcome {
+			t.Errorf("outcome %q reaches the client as %q", outcome, normalized)
+		}
+		if !slices.Contains(labels, outcome) {
+			t.Errorf("outcome %q has no label in the client's counts %v", outcome, labels)
+		}
+	}
+	if normalized := NormalizeExtenderGatedReleaseOutcome("a-newer-outcome"); normalized != ExtenderReleaseOutcomeEmpty {
+		t.Errorf("an unknown outcome reaches the client as %q, want empty", normalized)
+	}
+}
+
 // A release with records is ok; an admitted release with nothing eligible is
 // empty, and neither carries a retry time.
 func TestExtenderReleaseOutcomeOkAndEmpty(t *testing.T) {
