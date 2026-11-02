@@ -136,6 +136,9 @@ Usage:
         [--state_dir=<dir>]
         [--no_measurement]
         [--measurement_zone=<zone>]
+        [--camouflage]
+        [--camouflage_splice]
+        [--camouflage_revalidate_interval=<duration>]
         [--camouflage_report]
     
 Options:
@@ -161,9 +164,10 @@ Options:
     --nlayer-hop=<spec>              Another extender to relay every forward to, which makes
                                      this an NLayer extender. Repeatable; forwards are balanced
                                      over the hops. The spec is
-                                     [tcp|quic|dns://]<ip>[:<port>][?key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder].
+                                     [tcp|quic|dns://]<ip>[:<port>][?key=<hex>&camouflage_key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder].
                                      A private hop's secret is read from the file secret_file names,
-                                     never given in the spec.
+                                     never given in the spec. A tcp hop that splices (Phase B) needs
+                                     key and its camouflage_key.
     --admission_subnets_per_minute=<count>
                                      Distinct source subnets the extender admits a minute (default 1000, 0 disables).
     --admission_actions_per_subnet_per_minute=<count>
@@ -177,7 +181,18 @@ Options:
                                      operator for no measurement certificate. The API needs an
                                      identity kept by --extender_key_file or --state_dir.
     --measurement_zone=<zone>        Zone of the extender's measurement name
-                                     (default extender.bringyour.com).`,
+                                     (default extender.bringyour.com).
+    --camouflage                     Turn on the tcp carrier camouflage (Phase A): recognize
+                                     authenticated hellos, verify the borrowed names, and publish
+                                     the camouflage key while one verifies. The key derives from
+                                     the identity key, which must be kept by --extender_key_file
+                                     or --state_dir. Off by default.
+    --camouflage_splice              Start in Phase B: splice an unauthenticated hello to a
+                                     verified borrowed site once this extender's records have
+                                     settled. Needs --camouflage.
+    --camouflage_revalidate_interval=<duration>
+                                     How often the borrowed names are verified again, such as 6h
+                                     (default 6h, at least 10m). Needs --camouflage.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)

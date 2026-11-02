@@ -133,6 +133,24 @@ type extenderOptions struct {
 	// poll through it.
 	configureLagLifecycle func(settings *extender.ExtenderLagLifecycleSettings)
 
+	// the tcp carrier camouflage (EXTENDER.md P, EXTENDER-UPDATE2 §3), off unless
+	// the owner asks: --camouflage. It takes an identity kept in a file, since
+	// its key derives from the identity and a client finds it in a signed record.
+	camouflageEnabled bool
+	// the initial splice posture (--camouflage_splice): off is Phase A, on is
+	// Phase B once this extender's records have settled
+	camouflageSplice bool
+	// how often the borrowed names are verified again
+	// (--camouflage_revalidate_interval); zero takes the role's default
+	camouflageRevalidationInterval time.Duration
+	// configureCamouflage, when set, adjusts the camouflage role's settings
+	// before it is built. The test installs a clock and a fake borrowed site
+	// through it.
+	configureCamouflage func(settings *extender.ExtenderCamouflageRoleSettings)
+	// configureServer, when set, sees the server's settings last, just before
+	// the server is built. The test reads what the command passes through it.
+	configureServer func(settings *extender.ExtenderSettings)
+
 	// whether this extender posts what its tcp camouflage came to to the operator
 	// (connect/EXTENDER-SPLICE-ROLLOUT.md): --camouflage_report, off by default.
 	// This is the operator hosts' cohort control, which have no network space.
@@ -246,16 +264,58 @@ func extenderOptionsFromOpts(opts docopt.Opts) (*extenderOptions, error) {
 			options.nlayerHops = append(options.nlayerHops, hop)
 		}
 	}
+	if err := options.readCamouflageOpts(opts); err != nil {
+		return nil, err
+	}
 	return options, nil
+}
+
+// Reads the camouflage flags (EXTENDER.md P7). The options of Phase B and of the
+// revalidation mean nothing without --camouflage, so a host that gives one alone
+// is refused rather than left thinking it runs what it asked for.
+func (self *extenderOptions) readCamouflageOpts(opts docopt.Opts) error {
+	if camouflage, err := opts.Bool("--camouflage"); err == nil {
+		self.camouflageEnabled = camouflage
+	}
+	if camouflageSplice, err := opts.Bool("--camouflage_splice"); err == nil {
+		self.camouflageSplice = camouflageSplice
+	}
+	if self.camouflageSplice && !self.camouflageEnabled {
+		return fmt.Errorf("--camouflage_splice needs --camouflage")
+	}
+	revalidationInterval, ok := opts["--camouflage_revalidate_interval"].(string)
+	if !ok {
+		return nil
+	}
+	if !self.camouflageEnabled {
+		return fmt.Errorf("--camouflage_revalidate_interval needs --camouflage")
+	}
+	interval, err := time.ParseDuration(strings.TrimSpace(revalidationInterval))
+	if err != nil {
+		return fmt.Errorf("--camouflage_revalidate_interval must be a duration, such as 6h")
+	}
+	if interval < extender.ExtenderCamouflageMinRevalidationInterval {
+		return fmt.Errorf(
+			"--camouflage_revalidate_interval must be at least %s, since a fleet multiplies what it costs the borrowed sites",
+			extender.ExtenderCamouflageMinRevalidationInterval,
+		)
+	}
+	self.camouflageRevalidationInterval = interval
+	return nil
 }
 
 // Reads one --nlayer-hop, an extender this one relays forwards to (A11):
 //
-//	[<carrier>://]<ip>[:<port>][?key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder]
+//	[<carrier>://]<ip>[:<port>][?key=<hex>&camouflage_key=<hex>&secret_file=<path>&sni=<name>&tld=<tld>&fragment&reorder]
 //
 // The carrier is tcp, quic or dns, and tcp when omitted; the port defaults to
 // the carrier's fixed port (A1). key pins the hop's identity leaf (B3), which
-// is how a hop is known to be the extender it claims. The secret that signs
+// is how a hop is known to be the extender it claims. camouflage_key is the
+// camouflage key of the hop's signed record (P6), for the tcp carrier and only
+// beside key, whose leaf check the camouflaged attempt needs: the dial is then
+// the client's race, an authenticated hello fronting a name of this build's
+// global borrow list and the legacy hello after it, which is what reaches a hop
+// that splices a legacy hello away (Phase B). The secret that signs
 // the header of a private hop (A4) is the trimmed content of the file
 // secret_file names, read here, once, at start: a process's arguments are
 // readable by every user of the host, so a secret is never one, and a spec
@@ -336,6 +396,7 @@ func parseExtenderHopSpec(hopSpec string) (*connect.ExtenderConfig, error) {
 	}
 	serverNameSet := false
 	secretFilePath := ""
+	var camouflageKey []byte
 	for name, parameterValues := range values {
 		if len(parameterValues) != 1 {
 			return nil, fmt.Errorf("parameter %q is given %d times", name, len(parameterValues))
@@ -348,6 +409,13 @@ func parseExtenderHopSpec(hopSpec string) (*connect.ExtenderConfig, error) {
 				return nil, fmt.Errorf("key: %w", err)
 			}
 			hop.PublicKey = publicKey
+		case "camouflage_key":
+			if connectMode != connect.ExtenderConnectModeTcpTls {
+				return nil, fmt.Errorf("camouflage_key applies to the tcp carrier only")
+			}
+			if camouflageKey, err = connect.ParseExtenderRealityPublicKeyHex(value); err != nil {
+				return nil, fmt.Errorf("camouflage_key: %w", err)
+			}
 		case "secret_file":
 			if value == "" {
 				return nil, fmt.Errorf("secret_file names no file")
@@ -386,6 +454,13 @@ func parseExtenderHopSpec(hopSpec string) (*connect.ExtenderConfig, error) {
 		default:
 			return nil, fmt.Errorf("parameter %q is not known", name)
 		}
+	}
+	if 0 < len(camouflageKey) {
+		// checked once every parameter is read, since their order is the map's
+		if len(hop.PublicKey) == 0 {
+			return nil, fmt.Errorf("camouflage_key needs key, whose leaf check the camouflaged attempt relies on")
+		}
+		hop.RealityPublicKey = camouflageKey
 	}
 	if !serverNameSet {
 		// the name a client dialer would present (A10): never the operator's,
@@ -429,6 +504,9 @@ func extenderHopDescription(hop *connect.ExtenderConfig) string {
 	if 0 < len(hop.PublicKey) {
 		description += " pinned"
 	}
+	if 0 < len(hop.RealityPublicKey) {
+		description += " camouflaged"
+	}
 	return description
 }
 
@@ -456,6 +534,8 @@ type extenderRun struct {
 	// the lag.dev measurement key and certificate (lag.dev/PLAN.md C4), nil
 	// when this extender serves no measurement API
 	measurementCert *extender.ExtenderMeasurementCert
+	// the tcp carrier camouflage (EXTENDER.md P), nil unless the owner asked
+	camouflage *extender.ExtenderCamouflageRole
 
 	serveDone chan error
 	closers   []func()
@@ -508,14 +588,27 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		}
 	}()
 
+	// before anything is created or bound, so a host that opted in and cannot
+	// keep its key is told at once
+	if options.camouflageEnabled && run.identityKeyFile() == "" {
+		return nil, fmt.Errorf(
+			"--camouflage needs a kept identity: pass --extender_key_file or --state_dir, since the camouflage key derives from the identity key and would change with it at every start",
+		)
+	}
 	keySeed, err := run.identityKeySeed()
 	if err != nil {
+		if options.camouflageEnabled {
+			return nil, fmt.Errorf("--camouflage needs a usable identity key in %s: %w", run.identityKeyFile(), err)
+		}
 		return nil, err
 	}
 	if run.publicKey, err = connect.ExtenderPublicKeyFromSeed(keySeed); err != nil {
 		return nil, err
 	}
 	Out.Printf("extender public key: %s", hex.EncodeToString(run.publicKey))
+	if run.camouflage, err = run.newCamouflageRole(keySeed); err != nil {
+		return nil, err
+	}
 	run.measurementCert = run.newMeasurementCert()
 
 	// direct only: an activation that crossed an extender would tell the
@@ -527,6 +620,13 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 			PacketConnFactory: options.packetConnFactory,
 		}
 	}
+	// the operator's own api, whose authenticated Date corrects the clock an
+	// NLayer hop's camouflaged hello seals with (EXTENDER-UPDATE2 §3.2)
+	strategySettings.PlatformApiHosts = connect.PlatformApiHostNames(
+		options.apiUrl,
+		familyServiceUrl(options.apiUrl, 4),
+		familyServiceUrl(options.apiUrl, 6),
+	)
 	run.clientStrategy = connect.NewDirectClientStrategy(ctx, strategySettings, 0)
 	run.closers = append(run.closers, run.clientStrategy.Close)
 
@@ -617,6 +717,13 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		options.admissionActionsPerSubnetPerMinute,
 		len(options.admissionUnlimitedSources),
 	)
+	// the tcp carrier camouflage, when the owner asked (EXTENDER.md P7)
+	if run.camouflage != nil {
+		run.camouflage.ConfigureServer(serverSettings)
+	}
+	if options.configureServer != nil {
+		options.configureServer(serverSettings)
+	}
 	// an operator activated extender is open: it accepts every header and
 	// forwards only to the whitelist (A4, A5)
 	run.server = extender.NewExtenderServer(
@@ -631,6 +738,11 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	go func() {
 		run.serveDone <- run.server.ListenAndServe()
 	}()
+	if run.camouflage != nil {
+		// before the server goes down, whose splice dial the passes use
+		run.closers = append(run.closers, run.camouflage.Close)
+		run.camouflage.Start(ctx, run.server)
+	}
 
 	// the activation offers the carriers that bound, so it waits for the binds
 	// to settle (G2)
@@ -651,6 +763,12 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	Out.Printf("extender carriers: %s", strings.Join(run.server.Carriers(), ","))
 
 	activatorSettings := connect.DefaultExtenderActivatorSettings()
+	if run.camouflage != nil {
+		// the first post carries the key when the names verify in good time
+		// (P5); the server opens tags under the same one (ConfigureServer)
+		run.camouflage.WaitFirstVerification(ctx)
+		activatorSettings.PublishedRealityPublicKey = run.camouflage.PublishedRealityPublicKey
+	}
 	activatorSettings.ApiUrlV4 = familyServiceUrl(options.apiUrl, 4)
 	activatorSettings.ApiUrlV6 = familyServiceUrl(options.apiUrl, 6)
 	// a url with no service label to suffix has no api-v4 or api-v6 host; the
@@ -691,6 +809,10 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		}
 	}
 	run.activator = connect.NewExtenderActivator(ctx, activatorSettings)
+	if run.camouflage != nil {
+		// a name that verifies after a post went out with no key is posted at once
+		run.camouflage.SetReactivate(run.activator.Reactivate)
+	}
 	if run.measurementCert != nil {
 		// the operator holding another key's request or certificate, or
 		// withdrawing the certificate, asks for a pass at once, which carries
@@ -761,6 +883,7 @@ func (self *extenderRun) run(ctx context.Context) error {
 	pingerLine := ""
 	admissionLine := ""
 	measurementLine := ""
+	camouflageLine := ""
 	admissionLogTimeout := extenderAdmissionLogTimeout
 	if 0 < self.options.admissionLogTimeout {
 		admissionLogTimeout = self.options.admissionLogTimeout
@@ -798,6 +921,13 @@ func (self *extenderRun) run(ctx context.Context) error {
 			if line := extenderMeasurementLine(self.measurementCert); line != measurementLine {
 				measurementLine = line
 				Out.Printf("%s", line)
+			}
+		}
+		if self.camouflage != nil {
+			line := extender.ExtenderCamouflageStatusLine(self.server.CamouflageStatus(), self.server.CamouflageStats())
+			if line != camouflageLine {
+				camouflageLine = line
+				Out.Printf("extender camouflage: %s", line)
 			}
 		}
 		select {
@@ -913,9 +1043,14 @@ func (self *extenderRun) close() {
 	self.closers = nil
 }
 
-// Publishes the mesh address of one activated family (D2, G3). Only the tcp
-// carrier carries the mesh, so a host whose tcp bind failed advertises nothing.
+// What one activated family changes (G3): the safe-flip gate reads the record,
+// whatever the carriers (EXTENDER-UPDATE2 §3.2), and the mesh address is published
+// (D2). Only the tcp carrier carries the mesh, so a host whose tcp bind failed
+// advertises nothing.
 func (self *extenderRun) activated(ipVersion int, result *connect.ExtenderActivateResult) {
+	if self.camouflage != nil {
+		self.camouflage.ObserveActivation(result, self.directory.RootKeys())
+	}
 	if !slices.Contains(self.server.Carriers(), connect.ExtenderCarrierTcp) {
 		return
 	}
@@ -942,6 +1077,32 @@ func (self *extenderRun) identityKeyFile() string {
 		keyFile = filepath.Join(self.options.stateDir, extenderKeyFileName)
 	}
 	return keyFile
+}
+
+// The camouflage of this extender (EXTENDER.md P7), or nil when the owner did not
+// ask for it. A seed it cannot derive its key from fails the start.
+func (self *extenderRun) newCamouflageRole(keySeed []byte) (*extender.ExtenderCamouflageRole, error) {
+	if !self.options.camouflageEnabled {
+		return nil, nil
+	}
+	settings := extender.DefaultExtenderCamouflageRoleSettings()
+	settings.Splice = self.options.camouflageSplice
+	if 0 < self.options.camouflageRevalidationInterval {
+		settings.RevalidationInterval = self.options.camouflageRevalidationInterval
+	}
+	if self.options.configureCamouflage != nil {
+		self.options.configureCamouflage(settings)
+	}
+	camouflage, err := extender.NewExtenderCamouflageRole(keySeed, settings)
+	if err != nil {
+		return nil, err
+	}
+	Out.Printf(
+		"extender camouflage: on, splice %t, revalidating borrowed names every %s",
+		settings.Splice,
+		settings.RevalidationInterval,
+	)
+	return camouflage, nil
 }
 
 // The measurement key and certificate (lag.dev/PLAN.md C4), or nil when this

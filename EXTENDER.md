@@ -4991,3 +4991,49 @@ sdk api.
 - Known limit. The server counts distinct `client_id`s, so three devices behind one
   firewall can block a record for their whole country until the reports age out
   (24 h). That is the operator's rule and it is unchanged here.
+
+## Design note: the camouflage roles (EXTENDER-UPDATE2 §3, 2026-11-02)
+
+The runtime of section P had no production caller. `connectctl extender` (operator
+hosts, the gated cohort) and the sdk provider role (phase 14c) now run it, off unless
+asked, through one `extender.ExtenderCamouflageRole`. The controls and the steps to
+turn it on are in `EXTENDER-SPLICE-ROLLOUT.md`. This note records what changes or
+extends P. It does not revise P.
+
+- The key has no file. P1 derives it from the identity seed and the server opens tags
+  under that derivation, so a second file could only disagree with it. It is stable
+  exactly as long as the identity is kept, so `--camouflage` refuses an ephemeral
+  identity and an unreadable key file at start, before anything binds.
+- P5's rule stands: no verified name, no published key. The names change at run time,
+  so `ExtenderActivatorSettings.PublishedRealityPublicKey` reads the key at each post.
+  A key the operator has not heard is posted at once when a first name verifies. The
+  reverse waits for the next activation, so a bad pass that a retry repairs changes no
+  record and restarts no settling.
+- Verification dials through `extenderCamouflage.spliceDial`, the path the splice
+  takes, and a name must pass on every family the host can dial. Coverage is one claim
+  across families and a client's front name is chosen without regard to family, so a
+  name one family cannot reach is not covered there. The cost is that a dual-stack
+  host needs names reachable on both, or a working route on both, to have any.
+  `VerifyExtenderBorrowDomain` runs with no cdn check: the list is curated, and which
+  organizations count as a shared cdn is the measurement's call (§3.1).
+- The revalidation interval is `DefaultExtenderCamouflageRevalidationInterval`, 6 h, a
+  placeholder for the owner's number. A list's manifest can shorten it, and
+  `ExtenderCamouflageMinRevalidationInterval`, 10 m, floors both. A failed name is
+  retried alone on a doubling schedule from 5 m, so a host that starts before its
+  network is up recovers in minutes.
+- `CamouflageStatus` puts `no_verified_target` ahead of the posture and the gate, and
+  adds `coverage_incomplete`, which only a role can raise: only it knows the lists and
+  the verification times (`connect.EvaluateExtenderCamouflageCoverage`).
+- The clock's platform source now has its production caller. A client strategy reads
+  the Date of a response whose tls chain verified and whose final host, after any
+  redirect, is one of `ClientStrategySettings.PlatformApiHosts`. The sdk spaces and
+  connectctl name their api host and its family hosts. A js build's fetch exposes no
+  tls state and seals no camouflaged hello, so it reads nothing.
+- `--nlayer-hop` gains `camouflage_key`, for the tcp carrier and only beside `key`. It
+  changes no other dial.
+- Left for later: `DeviceLocalSettings.DefaultCamouflage` and the bindings 14c names, to
+  keep the exported sdk surface as it is, so an embedder cannot turn the sdk role on
+  yet; P7's status counts on `ExtenderProvideStatus`, for the same reason; and a
+  run-time rollback lever in connectctl, whose rollback is a restart without
+  `--camouflage_splice`. The revalidation timer is monotonic, so a desktop that sleeps
+  verifies late by the time it slept.

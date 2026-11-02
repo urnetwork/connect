@@ -187,6 +187,11 @@ type ExtenderActivatorSettings struct {
 	// camouflage is on and at least one borrowed name verified; empty leaves the
 	// extender on the legacy terminate path and publishes no camouflage key.
 	RealityPublicKey []byte
+	// PublishedRealityPublicKey, when set, is read at each post and replaces
+	// RealityPublicKey: a role's verified names change while it runs, so what it
+	// publishes does too (the role's ExtenderCamouflageRole). It runs on the
+	// loop goroutine and must not block.
+	PublishedRealityPublicKey func() []byte
 
 	// The carrier ports and the encoding tld this extender serves (C1, C2).
 	// Zero ports and an empty tld take the operator's defaults.
@@ -1171,8 +1176,12 @@ func (self *ExtenderActivator) activateUrl(
 	}
 	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
 	// empty key is left off the args so an operator sees no camouflage key
-	if 0 < len(self.settings.RealityPublicKey) {
-		args.RealityPublicKeyHex = hex.EncodeToString(self.settings.RealityPublicKey)
+	realityPublicKey := self.settings.RealityPublicKey
+	if self.settings.PublishedRealityPublicKey != nil {
+		realityPublicKey = self.settings.PublishedRealityPublicKey()
+	}
+	if 0 < len(realityPublicKey) {
+		args.RealityPublicKeyHex = hex.EncodeToString(realityPublicKey)
 	}
 	ctx, cancel := context.WithTimeout(self.ctx, self.settings.RequestTimeout)
 	defer cancel()
