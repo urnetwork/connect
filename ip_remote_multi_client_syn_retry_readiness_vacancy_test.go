@@ -169,7 +169,7 @@ func testNativeSynRetryReadinessVacancyReopens(t *testing.T, secondCheck bool) {
 
 		// A new real reliable data original re-closes the source after the seed
 		// ACK. Keep its decoded ACK identity; no memory/gate flag is assigned.
-		refillSource := func() protocol.Ack {
+		refillSource := func() *protocol.Ack {
 			if credit.source.resendCapacityUnavailable.Load() || credit.base.offer(credit.tcp) != 1 {
 				t.Fatal("exact seed ACK did not permit one real source refill")
 			}
@@ -184,11 +184,11 @@ func testNativeSynRetryReadinessVacancyReopens(t *testing.T, secondCheck bool) {
 				MessagePoolReturn(wire)
 				t.Fatal("refill wire changed its actual reliable packet")
 			}
-			ack := protocol.Ack{MessageId: append([]byte(nil), pack.MessageId...), SequenceId: append([]byte(nil), pack.SequenceId...)}
+			ack := &protocol.Ack{MessageId: append([]byte(nil), pack.MessageId...), SequenceId: append([]byte(nil), pack.SequenceId...)}
 			MessagePoolReturn(wire)
 			return ack
 		}
-		var refillAck protocol.Ack
+		var refillAck *protocol.Ack
 		if secondCheck {
 			credit.releasePeerCredit()
 			select {
@@ -251,7 +251,7 @@ func testNativeSynRetryReadinessVacancyReopens(t *testing.T, secondCheck bool) {
 			t.Fatalf("RETAINED_SYN_READINESS_VACANCY_WAKE_LOST: second_check=%t dispatches=%d want=2 native_offers=1 local_refusals=1 reopened=true",
 				secondCheck, dispatchCalls.Load())
 		}
-		if !credit.base.client.sendBuffer.Ack(credit.base.peer, &refillAck, 0) {
+		if !credit.base.client.sendBuffer.Ack(credit.base.peer, refillAck, 0) {
 			t.Fatal("exact decoded refill acknowledgement was refused")
 		}
 		harness.settle()
