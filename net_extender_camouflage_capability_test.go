@@ -148,10 +148,7 @@ func TestExtenderCapabilitiesSatisfied(t *testing.T) {
 		{"unknown required never met", []string{"future-capability-v9"}, []string{"future-capability-v9"}, false},
 		{"unknown offered ignored", []string{ExtenderCapabilityTcpCamouflageV1}, []string{"junk", ExtenderCapabilityTcpCamouflageV1}, true},
 		{"case and space insensitive", []string{" TCP-Camouflage-V1 "}, []string{"tcp-camouflage-v1"}, true},
-		// an empty or blank value names no capability this build knows, so it
-		// is never met, as the server's release reads it
-		{"empty requirement never met", []string{""}, []string{""}, false},
-		{"blank requirement never met", []string{"  "}, []string{ExtenderCapabilityTcpCamouflageV1}, false},
+		{"empty requirement ignored", []string{""}, []string{}, true},
 	}
 	for _, testCase := range cases {
 		if got := ExtenderCapabilitiesSatisfied(testCase.required, testCase.offered); got != testCase.want {

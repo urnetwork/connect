@@ -131,11 +131,11 @@ func ExtenderClientCapabilities(connectSettings *ConnectSettings, countryCode st
 
 // ExtenderCapabilitiesSatisfied reports whether the offered capabilities meet
 // every required one. A required capability this build does not know is never
-// met, and that includes an empty or blank value, which names none; an offered
-// value this build does not know is ignored. Values compare trimmed and
-// case-insensitively, and only the first extenderMaxOfferedCapabilityCount
-// offered values of at most extenderMaxOfferedCapabilityByteCount bytes are
-// read. An empty required list is always met.
+// met; an offered value this build does not know is ignored. Values compare
+// trimmed and case-insensitively, and only the first
+// extenderMaxOfferedCapabilityCount offered values of at most
+// extenderMaxOfferedCapabilityByteCount bytes are read. No requirement is
+// always met.
 func ExtenderCapabilitiesSatisfied(required []string, offered []string) bool {
 	offeredCapabilities := map[string]bool{}
 	for i, capability := range offered {
@@ -149,6 +149,9 @@ func ExtenderCapabilitiesSatisfied(required []string, offered []string) bool {
 	}
 	for _, capability := range required {
 		capability = normalizeExtenderCapability(capability)
+		if capability == "" {
+			continue
+		}
 		if !slices.Contains(extenderKnownCapabilities, capability) || !offeredCapabilities[capability] {
 			return false
 		}
