@@ -492,13 +492,28 @@ var controlFamilyReservedPrefixes = []*net.IPNet{
 // demotion costs a user a slow path; a wrongly permitted one costs them the
 // whole control plane.
 func probeFamilySupport(family int) bool {
+	return probeFamilyAddress(family, nil)
+}
+
+// Reports whether an up, non-loopback, non-tunnel interface of this device
+// carries a global unicast, unreserved address of the family that `accept`
+// also accepts; nil accepts every such address. False when the interface table
+// cannot be read, like every probe that reads it.
+func probeFamilyAddress(family int, accept func(ip net.IP) bool) bool {
+	found, _ := probeFamilyAddressReadable(family, accept)
+	return found
+}
+
+// probeFamilyAddress, and whether the interface table could be read at all, for
+// the one caller that must not take an unreadable table for a no.
+func probeFamilyAddressReadable(family int, accept func(ip net.IP) bool) (found bool, readable bool) {
 	controlFamilyProbeSource.mu.Lock()
 	enumerate := controlFamilyProbeSource.interfaces
 	controlFamilyProbeSource.mu.Unlock()
 
 	ifaces, err := enumerate()
 	if err != nil {
-		return false
+		return false, false
 	}
 	for _, iface := range ifaces {
 		if iface.flags&net.FlagUp == 0 {
@@ -518,12 +533,15 @@ func probeFamilySupport(family int) bool {
 			if isControlFamilyReservedIP(ip) {
 				continue
 			}
-			if (ip.To4() != nil) == (family == 4) {
-				return true
+			if (ip.To4() != nil) != (family == 4) {
+				continue
+			}
+			if accept == nil || accept(ip) {
+				return true, true
 			}
 		}
 	}
-	return false
+	return false, true
 }
 
 // FamilySupported reports whether this device has a usable path of ip version
@@ -543,6 +561,54 @@ func FamilySupported(ipVersion int) bool {
 	default:
 		return false
 	}
+}
+
+// familyPublicExcludedPrefixes are the ranges FamilyPublic refuses beside the
+// private ranges of net.IP.IsPrivate (RFC 1918, RFC 4193): addresses a host can
+// be numbered from that nothing on the internet can dial. Link-local addresses
+// already fail IsGlobalUnicast.
+var familyPublicExcludedPrefixes = []*net.IPNet{
+	// carrier-grade NAT, RFC 6598
+	{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)},
+	// the 464XLAT CLAT range, RFC 7335: a working v4 path out through NAT64,
+	// which is why the family probe counts it, and nothing dials back on it
+	{IP: net.IPv4(192, 0, 0, 0), Mask: net.CIDRMask(29, 32)},
+}
+
+// FamilyPublic reports whether this device has a public address of ip version
+// 4 or 6: one FamilySupported counts that is also neither private (RFC 1918,
+// RFC 4193), carrier-grade NAT (RFC 6598) nor a CLAT address (RFC 7335). An
+// operator can dial a public address back, while a host whose addresses of a
+// family are all private is behind a NAT, which forwards the carrier ports to
+// it or not. Fails closed on an unreadable interface table. The extender
+// activation loop reads the same probe through familyPublicReadable, to tell a
+// refusal that a retry may change from one that is a NAT's (EXTENDER.md G3).
+func FamilyPublic(ipVersion int) bool {
+	public, _ := familyPublicReadable(ipVersion)
+	return public
+}
+
+// FamilyPublic, and whether the interface table could be read: a caller that
+// holds a family longer on a no must not take an unreadable table for one.
+func familyPublicReadable(ipVersion int) (public bool, readable bool) {
+	switch ipVersion {
+	case 4, 6:
+		return probeFamilyAddressReadable(ipVersion, isFamilyPublicIP)
+	default:
+		return false, true
+	}
+}
+
+func isFamilyPublicIP(ip net.IP) bool {
+	if ip.IsPrivate() {
+		return false
+	}
+	for _, excluded := range familyPublicExcludedPrefixes {
+		if excluded.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // controlFamilyProbe is probeFamilySupport through the ledger's test seam, so
