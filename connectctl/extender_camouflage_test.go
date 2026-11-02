@@ -843,6 +843,49 @@ func TestExtenderCommandCamouflagePostsTheKeyWhenANameVerifiesLater(t *testing.T
 	}
 }
 
+// --camouflage_revalidate_interval is how long the next pass waits, and with no flag
+// it is the role's default: the wait is the interval, less at most a tenth.
+func TestExtenderCommandCamouflageRevalidatesAtItsInterval(t *testing.T) {
+	installTestCamouflageBorrowList(t, testCamouflageBorrowName)
+	site := newTestCamouflageSite(t)
+	cases := []struct {
+		name     string
+		interval time.Duration
+		expected time.Duration
+	}{
+		{name: "the flag", interval: 12 * time.Hour, expected: 12 * time.Hour},
+		{name: "the default", expected: extender.DefaultExtenderCamouflageRevalidationInterval},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			waits := make(chan time.Duration, 16)
+			keyFile, _, _ := writeTestExtenderKeyFile(t)
+			command := startTestCamouflageCommand(t, newTestExtenderOperator(t), func(options *extenderOptions) {
+				options.keyFile = keyFile
+				options.camouflageEnabled = true
+				options.camouflageRevalidationInterval = c.interval
+				options.configureCamouflage = func(settings *extender.ExtenderCamouflageRoleSettings) {
+					testCamouflageV4Host(settings)
+					settings.SpliceDialContext = site.dialContext
+					settings.After = func(wait time.Duration) <-chan time.Time {
+						waits <- wait
+						return make(chan time.Time)
+					}
+				}
+			})
+			defer command.stop()
+			select {
+			case wait := <-waits:
+				if c.expected < wait || wait < c.expected-c.expected/10 {
+					t.Fatalf("wait = %s, expected within a tenth under %s", wait, c.expected)
+				}
+			case <-time.After(60 * time.Second):
+				t.Fatal("the role did not finish a pass")
+			}
+		})
+	}
+}
+
 // The command reads the operator's clock from its own api, on the family hosts as
 // well (net_extender_camouflage_clock.go).
 func TestExtenderCommandNamesItsApiHostsForTheCamouflageClock(t *testing.T) {

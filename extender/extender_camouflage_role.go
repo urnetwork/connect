@@ -160,8 +160,7 @@ type ExtenderCamouflageRole struct {
 	firstVerification chan struct{}
 
 	stateLock sync.Mutex
-	// nil until Start, and after that what the passes feed
-	server *ExtenderServer
+	// nil until Start
 	cancel context.CancelFunc
 	done   chan struct{}
 	// each verified name and when it last passed
@@ -257,7 +256,6 @@ func (self *ExtenderCamouflageRole) Start(ctx context.Context, server *ExtenderS
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		self.server = server
 		self.cancel = cancel
 		self.done = done
 	}()

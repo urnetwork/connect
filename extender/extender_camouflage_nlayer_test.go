@@ -5,8 +5,11 @@ package extender
 // with its camouflage key, the --nlayer-hop parameter camouflage_key.
 
 import (
+	"crypto/ed25519"
+	"crypto/tls"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect"
 )
@@ -66,6 +69,49 @@ func TestExtenderNLayerHopWithoutTheCamouflageKeyIsSplicedAway(t *testing.T) {
 	}
 	if site.reached.get() == 0 {
 		t.Fatal("the hop did not splice the legacy hello")
+	}
+}
+
+// The api's chain is what makes its Date authenticated, so the clock reads it on a
+// route through an extender as on a direct one. The extender in the middle cannot
+// move it: the chain it would have to present is the api's.
+func TestClientStrategyReadsThePlatformClockThroughAnExtender(t *testing.T) {
+	const skew = 10 * time.Minute
+	t.Cleanup(connect.Testing_SetExtenderCamouflageLocalClock(func() time.Time {
+		return time.Now().Add(-skew)
+	}))
+	fixture := newExtenderFixture(t, "127.0.0.1", nil)
+	strategy := func(tlsConfig *tls.Config) *connect.ClientStrategy {
+		settings := connect.DefaultClientStrategySettings()
+		settings.EnableNormal = false
+		settings.EnableResilient = false
+		settings.ExtenderConfigs = []*connect.ExtenderConfig{fixture.extenderConfig(connect.ExtenderCarrierTcp)}
+		settings.ConnectSettings = *fixture.connectSettings()
+		settings.TlsConfig = tlsConfig
+		settings.PlatformApiHosts = []string{"dest.example"}
+		strategy := connect.NewClientStrategy(t.Context(), settings)
+		t.Cleanup(strategy.Close)
+		return strategy
+	}
+	offset := func() time.Duration {
+		return connect.Testing_ExtenderCamouflageClockOffset(make([]byte, ed25519.PublicKeySize))
+	}
+
+	// a route the client cannot verify the api over says nothing
+	unverified := strategy(&tls.Config{InsecureSkipVerify: true})
+	if _, err := connect.HttpGetWithStrategyRaw(t.Context(), unverified, "https://dest.example/hello", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := offset(); got != 0 {
+		t.Fatalf("offset = %s after a response of no verified chain", got)
+	}
+
+	verified := strategy(&tls.Config{RootCAs: fixture.destination.rootCas})
+	if _, err := connect.HttpGetWithStrategyRaw(t.Context(), verified, "https://dest.example/hello", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := offset(); got < skew-time.Minute || skew+time.Minute < got {
+		t.Fatalf("offset = %s, expected about +%s to cancel the skew", got, skew)
 	}
 }
 

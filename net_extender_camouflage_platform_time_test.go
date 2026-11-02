@@ -109,9 +109,22 @@ func newTestPlatformStrategy(
 	hosts []string,
 ) *ClientStrategy {
 	t.Helper()
+	return newTestPlatformStrategyWithDialers(t, address, tlsConfig, hosts, true, false)
+}
+
+// The same strategy over the given dialers.
+func newTestPlatformStrategyWithDialers(
+	t *testing.T,
+	address string,
+	tlsConfig *tls.Config,
+	hosts []string,
+	normal bool,
+	resilient bool,
+) *ClientStrategy {
+	t.Helper()
 	settings := DefaultClientStrategySettings()
-	settings.EnableNormal = true
-	settings.EnableResilient = false
+	settings.EnableNormal = normal
+	settings.EnableResilient = resilient
 	settings.TlsConfig = tlsConfig
 	settings.RequestTimeout = 20 * time.Second
 	settings.ConnectSettings.DialContextSettings = &DialContextSettings{
@@ -147,52 +160,65 @@ func requireTestPlatformOffsetCancelsTheSkew(t *testing.T, when string) {
 	}
 }
 
-// A response of the platform's own api over a verified chain corrects the clock,
-// on the get path and on the post path, including the hello the post path sends
-// first, since each is how a real client hears from the api.
+// A response of the platform's own api over a verified chain corrects the clock, on
+// the get path and on the post path, on http/1.1 and h2, and over the normal and the
+// resilient dialers, each of which a real client's api call can take. So does a
+// refusal: any status of the api is the api's Date, over the same verified chain.
 func TestClientStrategyPlatformResponseCorrectsTheCamouflageClock(t *testing.T) {
 	certificate, roots := newTestPlatformCertificate(t)
-	server := newTestPlatformServer(t, certificate, true)
-	address := server.Listener.Addr().String()
-	_, port, err := net.SplitHostPort(address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	apiUrl := fmt.Sprintf("https://%s", net.JoinHostPort(testPlatformApiHost, port))
 	tlsConfig := &tls.Config{RootCAs: roots}
-	hosts := PlatformApiHostNames(apiUrl)
-
-	t.Run("get", func(t *testing.T) {
-		skewTestPlatformClock(t)
-		strategy := newTestPlatformStrategy(t, address, tlsConfig, hosts)
-		if _, err := HttpGetWithStrategyRaw(t.Context(), strategy, apiUrl+"/", ""); err != nil {
-			t.Fatal(err)
-		}
-		requireTestPlatformOffsetCancelsTheSkew(t, "after a verified get")
-	})
-	t.Run("post", func(t *testing.T) {
-		skewTestPlatformClock(t)
-		strategy := newTestPlatformStrategy(t, address, tlsConfig, hosts)
-		if _, err := HttpPostWithStrategyRaw(t.Context(), strategy, apiUrl+"/", []byte("{}"), ""); err != nil {
-			t.Fatal(err)
-		}
-		requireTestPlatformOffsetCancelsTheSkew(t, "after a verified post")
-	})
-	// any status of the api is the api's Date, over the same verified chain
-	t.Run("a refusal", func(t *testing.T) {
-		skewTestPlatformClock(t)
-		refusing := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusForbidden)
-		}))
-		refusing.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}}
-		refusing.StartTLS()
-		t.Cleanup(refusing.Close)
-		strategy := newTestPlatformStrategy(t, refusing.Listener.Addr().String(), tlsConfig, hosts)
-		if _, err := HttpGetWithStrategyRaw(t.Context(), strategy, apiUrl+"/", ""); err == nil {
-			t.Fatal("the refusal was not an error")
-		}
-		requireTestPlatformOffsetCancelsTheSkew(t, "after a verified refusal")
-	})
+	for _, c := range []struct {
+		name      string
+		http2     bool
+		resilient bool
+		status    int
+		post      bool
+	}{
+		{name: "get"},
+		{name: "post", post: true},
+		{name: "get over h2", http2: true},
+		{name: "post over h2", http2: true, post: true},
+		{name: "get over a resilient dialer", resilient: true},
+		{name: "post over a resilient dialer", resilient: true, post: true},
+		{name: "get over h2 and a resilient dialer", http2: true, resilient: true},
+		{name: "a refusal", status: http.StatusForbidden},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			skewTestPlatformClock(t)
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if c.status != 0 {
+					w.WriteHeader(c.status)
+				}
+				if r.ProtoMajor == 2 != c.http2 {
+					t.Errorf("the request came over %s", r.Proto)
+				}
+				w.Write([]byte("ok"))
+			}))
+			server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}}
+			server.EnableHTTP2 = c.http2
+			server.StartTLS()
+			t.Cleanup(server.Close)
+			address := server.Listener.Addr().String()
+			_, port, err := net.SplitHostPort(address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apiUrl := fmt.Sprintf("https://%s", net.JoinHostPort(testPlatformApiHost, port))
+			strategy := newTestPlatformStrategyWithDialers(t, address, tlsConfig, PlatformApiHostNames(apiUrl), !c.resilient, c.resilient)
+			if c.post {
+				_, err = HttpPostWithStrategyRaw(t.Context(), strategy, apiUrl+"/", []byte("{}"), "")
+			} else {
+				_, err = HttpGetWithStrategyRaw(t.Context(), strategy, apiUrl+"/", "")
+			}
+			if c.status == 0 && err != nil {
+				t.Fatal(err)
+			}
+			if c.status != 0 && err == nil {
+				t.Fatal("the refusal was not an error")
+			}
+			requireTestPlatformOffsetCancelsTheSkew(t, c.name)
+		})
+	}
 }
 
 // Nothing unauthenticated moves the clock (§3.2), and nothing from a host that is
