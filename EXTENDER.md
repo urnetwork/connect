@@ -1121,23 +1121,32 @@ records the status. A success moves the family to its tick. A failure holds
 that family alone, 10 minutes doubling to 6 hours, and a success resets its
 hold, so a family the operator keeps refusing never re-posts one that works.
 A family without a global address on the host (`FamilySupported`) is not
-posted and is looked at again on its own hold, so one that gains an address
-is posted within it. A family whose global addresses on the host are all
-private (RFC 1918, RFC 4193, carrier-grade NAT, the 464XLAT range;
-`FamilyPublic`) can be dialed back only through a port forward: it is
-posted at start, on its tick and on every trigger as any family is, but a
-refusal holds it until its next tick instead of the backoff, since a NAT
-that does not forward the carrier ports refuses every retry alike. The
+posted and is looked at again every 10 minutes, without doubling, since the
+look is local; one that gains an address is posted within 10 minutes however
+long it went without one, and its first failure after that holds 10
+minutes. A family whose global addresses on the host are all private (RFC
+1918, RFC 4193, carrier-grade NAT, the 464XLAT range; `FamilyPublic`) can
+be dialed back only through something that forwards to it: it is posted at
+start, on its tick and on every trigger as any family is, and a refusal
+before it has activated since start holds it until its next tick instead of
+the backoff, since a NAT that never forwards refuses every retry alike. Once
+it has activated, something forwards to it, so its refusals -- the
+operator's budgets, a probe that failed, the re-post of a revocation -- are
+held on the backoff as any family's are. An interface table that cannot be
+read counts as public here, so it never lengthens a hold. The
 measurement request rides the first post of a pass that can carry it
 (lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
 request that is wanted, the families it activated are posted once more at
 once, and that post is followed by no other. The address check is one
 hello, to the plain api url, compared within the family it arrived on and
 by the address, not the port: an address the operator published for any
-family is unchanged, and so is the one the last check saw on that family,
-so a dual-stack host whose hello arrives on either family, or a host whose
-hello leaves from another of its addresses than its activation, posts
-nothing; a family that is not activated is left to its schedule. An
+family is unchanged, and so is the one the last check saw on that family
+while the family's published address is still the one that check was read
+against (an activation that moves the published address forgets it), so a
+dual-stack host whose hello arrives on either family, or a host whose hello
+leaves from another of its addresses than its activation, posts nothing,
+and a host that returns to an address it left is posted at the next check;
+a family that is not activated is left to its schedule. An
 operator with no family api hosts is posted once a cycle to its plain api
 url on one schedule. The ticks, the hourly check and the holds count the
 time the host slept: a minute after waking from a sleep of 15 minutes or
@@ -1147,6 +1156,11 @@ made a v4 behind a NAT, refused at every post, re-post the working v6 on
 every step of the shared backoff (every 6 hours at the cap, 4 to 7 times a
 day where 1 was due), and one hello compared with the last read every
 dual-stack host's switch of family as a moved address and re-posted both.
+Revised the same day on review: the day's hold of a private family's
+refusal was any refusal's, so a revocation's re-post refused once left an
+activated family unposted for a day; the address a check saw outlived an
+activation that moved the family; and the look for a family without an
+address doubled to 6 hours.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,

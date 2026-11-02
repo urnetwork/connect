@@ -260,7 +260,8 @@ type ExtenderActivatorSettings struct {
 	IpVersionSupported func(ipVersion int) bool
 	// IpVersionPublic, when set, replaces the probe of whether the host has a
 	// public address of the family, one the operator can dial back without a
-	// port forward (G3). Nil uses FamilyPublic, or answers as
+	// port forward (G3). Nil reads the interface table as FamilyPublic does,
+	// except that a table that cannot be read answers yes; or it answers as
 	// IpVersionSupported does when that is set, so a seam that replaces the
 	// host's family probe replaces both answers.
 	IpVersionPublic func(ipVersion int) bool
@@ -380,6 +381,10 @@ type extenderActivateSchedule struct {
 	// the zero time is due at once, which is what start and every trigger set
 	nextActivateTime time.Time
 	backoff          time.Duration
+	// whether the family has activated since the activator started. A
+	// private family that has is reachable through whatever forwards to it,
+	// so its refusals are held as any family's are (activate).
+	activatedInRun bool
 }
 
 // After a success: the family's next post is its tick, and its hold is back to
@@ -387,13 +392,24 @@ type extenderActivateSchedule struct {
 func (self *extenderActivateSchedule) tick(now time.Time, settings *ExtenderActivatorSettings) {
 	self.nextActivateTime = now.Add(settings.ActivateTimeout)
 	self.backoff = settings.MinBackoff
+	self.activatedInRun = true
 }
 
-// After a failure, or a pass that found no address for the family: the family
-// waits out its hold, which doubles to the cap for the next one.
+// After a failure: the family waits out its hold, which doubles to the cap for
+// the next one.
 func (self *extenderActivateSchedule) hold(now time.Time, settings *ExtenderActivatorSettings) {
 	self.nextActivateTime = now.Add(self.backoff)
 	self.backoff = min(2*self.backoff, settings.MaxBackoff)
+}
+
+// After a pass that found no address for the family on the host: it is looked
+// at again after the floor, every time, since the look is local and costs
+// nothing, so a family that gains an address is posted within the floor
+// however long it went without one. Its first failure once it has one holds
+// the floor too.
+func (self *extenderActivateSchedule) recheck(now time.Time, settings *ExtenderActivatorSettings) {
+	self.nextActivateTime = now.Add(settings.MinBackoff)
+	self.backoff = settings.MinBackoff
 }
 
 // The activator is running when this returns: the loop is up and its first
@@ -771,9 +787,13 @@ func (self *ExtenderActivator) checkAddress(clientAddress string) {
 // within its own family: one the operator published for any family is
 // unchanged, and so is the one the last check saw on this family, which keeps
 // a host whose hello leaves from another of its addresses than its activation
-// from re-posting on every check. A family that is not activated is left to
-// its own schedule, which posts it when it is due. In the fallback mode the one
-// post a cycle is what can reissue the record, so the schedule is 0.
+// from re-posting on every check. That address holds only while the family's
+// published address is the one it was read against: an activation that moves
+// the published address forgets it (activateUrl), so a host that returns to
+// an address it left is posted at the next check rather than its tick. A
+// family that is not activated is left to its own schedule, which posts it
+// when it is due. In the fallback mode the one post a cycle is what can
+// reissue the record, so the schedule is 0.
 func (self *ExtenderActivator) addressChange(clientAddress string) (key int, previous netip.Addr, changed bool) {
 	address, err := netip.ParseAddr(clientAddress)
 	if err != nil {
@@ -892,17 +912,20 @@ const (
 )
 
 // Posts the families in `due`, in key order, and moves each one's schedule by
-// its own outcome (G3): a success to its tick, and a failure, or a family with
-// no address on this host, onto its own hold. So a family the operator keeps
-// refusing holds itself alone and never re-posts another, and a host that
-// gains an address for a family is posted on that family's hold rather than
-// its tick.
+// its own outcome (G3): a success to its tick, a failure onto its own hold,
+// and a family with no address on this host to a look again after the floor.
+// So a family the operator keeps refusing holds itself alone and never
+// re-posts another, and a family that gains an address is posted within the
+// floor rather than at its tick.
 //
-// A refusal of a family whose host addresses are all private holds it until
-// its next tick instead: the operator can dial such an address back only
-// through a port forward, so a refusal is a host behind a NAT, which no hold
-// will change. It is still posted at start, on its tick and on every trigger,
-// so a host whose router forwards the carrier ports keeps activating.
+// One refusal is held until the tick instead: that of a family whose host
+// addresses are all private and which has not activated since the activator
+// started. The operator can dial such an address back only through something
+// that forwards to it, and a NAT that never forwards refuses every retry
+// alike, so it gets one post at start and then one a day, as the owner decided
+// (2026-11-01). Once the family has activated something does forward to it,
+// so its refusals are the operator's budgets, its probes and its revocations,
+// which the hold retries as for any family.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	carriers := []string{}
 	if self.settings.Carriers != nil {
@@ -931,9 +954,14 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		case outcome == extenderActivateActivated:
 			schedule.tick(now, self.settings)
 			activated = append(activated, key)
-		case outcome == extenderActivateRefused && !self.fallback && !self.ipVersionPublic(key):
-			// a NAT refuses every retry alike, so the family waits for its
-			// tick; its hold stays as it was
+		case outcome == extenderActivateSkipped:
+			schedule.recheck(now, self.settings)
+		case outcome == extenderActivateRefused &&
+			!self.fallback &&
+			!schedule.activatedInRun &&
+			!self.ipVersionPublic(key):
+			// a NAT that never forwarded refuses every retry alike, so the
+			// family waits for its tick; its hold stays as it was
 			schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
 		default:
 			schedule.hold(now, self.settings)
@@ -1022,7 +1050,9 @@ func (self *ExtenderActivator) ipVersionSupported(ipVersion int) bool {
 }
 
 // Whether this host has a public address of the family, one the operator can
-// dial back without a port forward (G3).
+// dial back without a port forward (G3). An interface table that cannot be
+// read is no evidence of a NAT, so here it answers yes, which holds a refusal
+// on the backoff; FamilyPublic itself fails closed.
 func (self *ExtenderActivator) ipVersionPublic(ipVersion int) bool {
 	if self.settings.IpVersionPublic != nil {
 		return self.settings.IpVersionPublic(ipVersion)
@@ -1030,7 +1060,8 @@ func (self *ExtenderActivator) ipVersionPublic(ipVersion int) bool {
 	if self.settings.IpVersionSupported != nil {
 		return self.settings.IpVersionSupported(ipVersion)
 	}
-	return FamilyPublic(ipVersion)
+	public, readable := familyPublicReadable(ipVersion)
+	return public || !readable
 }
 
 // Posts one activation to the plain api url, which is what an operator with no
@@ -1131,7 +1162,13 @@ func (self *ExtenderActivator) activateUrl(
 		self.recordFailure(ipVersion, now, "the operator named no address family", false)
 		return extenderActivateFailed
 	}
-	self.recordSuccess(ipVersion, now, result)
+	if moved := self.recordSuccess(ipVersion, now, result); moved {
+		// the address the last check saw on this family was read against
+		// the address the operator published before, so it says nothing of
+		// the one published now: a check that sees it again must compare it
+		// with this one (addressChange)
+		delete(self.helloAddresses, ipVersion)
+	}
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
@@ -1210,21 +1247,25 @@ func (self *ExtenderActivator) familyWithLock(ipVersion int) *ExtenderFamilyActi
 	return family
 }
 
+// Records a successful activation, and reports whether it moved the family's
+// published address from another one.
 func (self *ExtenderActivator) recordSuccess(
 	ipVersion int,
 	now time.Time,
 	result *ExtenderActivateResult,
-) {
+) (moved bool) {
 	ip, _ := netip.ParseAddr(result.Ip)
+	ip = ip.Unmap()
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	family := self.familyWithLock(ipVersion)
 	if family == nil {
-		return
+		return false
 	}
+	moved = family.Ip.IsValid() && family.Ip != ip
 	family.Activated = true
-	family.Ip = ip.Unmap()
+	family.Ip = ip
 	family.LastActivationTime = now
 	family.LastError = ""
 	family.LastRefused = false
@@ -1235,6 +1276,7 @@ func (self *ExtenderActivator) recordSuccess(
 		family.ExpireTime = *result.ExpireTime
 	}
 	self.changedWithLock()
+	return moved
 }
 
 // Records a failed attempt. `refused` is true only for the operator's refusal,

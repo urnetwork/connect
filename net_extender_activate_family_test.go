@@ -19,6 +19,13 @@ import (
 // before read as a moved address and re-posted both families. Each family now
 // keeps its own tick and hold, and the hello is compared within its family.
 //
+// A review of the first version found three holes, each tested here: a private
+// family held for a day on any one refusal, even one that had activated and
+// was refused by a budget, a probe or a revocation's re-post; a hello address
+// remembered across an activation that moved the family's address; and a
+// family without an address looked at again on a hold that doubled to six
+// hours.
+//
 // These run on the fixture of net_extender_activate_test.go. The fixture's
 // address check is a minute, so every step of a minute or more begins with a
 // hello, the pass barrier: the hello of a pass proves the pass before it
@@ -241,11 +248,12 @@ func TestExtenderActivatorPostsEveryFamilyOnRevocation(t *testing.T) {
 	}
 }
 
-// A refused family whose host addresses are all private is a host behind a
-// NAT, which no backoff changes: it is posted at start and then not until its
-// tick, where a public family would have been posted eight times. The family
+// A family whose host addresses are all private, refused before it has ever
+// activated, is a NAT that does not forward, which no backoff changes: it is
+// posted at start and then not until its tick, where a public family would
+// have been posted eight times (the owner's decision, 2026-11-01). The family
 // with a public address keeps its own tick.
-func TestExtenderActivatorHoldsARefusedPrivateFamilyForTheDay(t *testing.T) {
+func TestExtenderActivatorHoldsANeverActivatedPrivateFamilyForTheDay(t *testing.T) {
 	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
 		operator.setFamilyRefusal(4, testActivateFamilyRefusal)
 	}, func(settings *ExtenderActivatorSettings) {
@@ -310,8 +318,8 @@ func TestExtenderActivatorKeepsAnAcceptedPrivateFamily(t *testing.T) {
 }
 
 // A family the host has no address for is never posted, and is looked at
-// again on its own backoff: once the host has one, it is posted at the end of
-// that hold rather than at the tick of the family that was posted.
+// again every ten minutes: once the host has one, it is posted at the next
+// look rather than at the tick of the family that was posted.
 func TestExtenderActivatorPostsAFamilyOnceTheHostHasAnAddress(t *testing.T) {
 	var v6Supported atomic.Bool
 	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
@@ -328,7 +336,7 @@ func TestExtenderActivatorPostsAFamilyOnceTheHostHasAnAddress(t *testing.T) {
 	fixture.step(5 * time.Minute)
 	fixture.expectFamilyPostCounts("with no v6 address", 1, 0)
 
-	// v6's hold, ten minutes from the pass that skipped it
+	// v6's next look, ten minutes from the pass that skipped it
 	v6Supported.Store(true)
 	fixture.step(4 * time.Minute)
 	fixture.expectFamilyPostCounts("one minute short of v6's hold", 1, 0)
@@ -339,6 +347,271 @@ func TestExtenderActivatorPostsAFamilyOnceTheHostHasAnAddress(t *testing.T) {
 	fixture.waitActivation()
 	fixture.step(time.Minute)
 	fixture.expectFamilyPostCounts("once the host has a v6 address", 1, 1)
+}
+
+// However long a family went without an address on the host, it is posted
+// within ten minutes of gaining one: the look is local and costs nothing, so it
+// is repeated every ten minutes rather than on a hold that doubles to six
+// hours.
+func TestExtenderActivatorPostsAFamilyThatGainsAnAddressLate(t *testing.T) {
+	var v6Supported atomic.Bool
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.IpVersionSupported = func(ipVersion int) bool {
+			return ipVersion == 4 || v6Supported.Load()
+		}
+	})
+	startTime := fixture.clock.Now()
+	fixture.waitPass()
+	if post := fixture.waitPost(); post.ipVersion != 4 {
+		t.Fatalf("first pass posted v%d, expected v4", post.ipVersion)
+	}
+	fixture.waitActivation()
+	for range 12 {
+		fixture.step(time.Hour)
+	}
+	// a barrier, so the look at twelve hours has finished before v6 appears
+	fixture.step(time.Minute)
+	fixture.expectFamilyPostCounts("after twelve hours without v6", 1, 0)
+
+	v6Supported.Store(true)
+	lookTime := startTime.Add(12*time.Hour + 10*time.Minute)
+	fixture.step(lookTime.Sub(fixture.clock.Now()) - time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of v6's next look", 1, 0)
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 6 || post.postTime != lookTime {
+		t.Fatalf("post = v%d at %s, expected v6 at 12h10m", post.ipVersion, post.postTime.Sub(startTime))
+	}
+	fixture.waitActivation()
+}
+
+// A private family that has activated is reachable through whatever forwards
+// to it, so a refusal after that -- the operator's budget, a probe that failed
+// -- is held as any family's is: once accepted, refused once, then accepted, it
+// is posted again ten minutes after the refusal.
+func TestExtenderActivatorRetriesAPrivateFamilyThatActivated(t *testing.T) {
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(ipVersion int) bool { return false }
+	})
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.waitActivation()
+
+	fixture.step(5 * time.Minute)
+	refusalTime := fixture.clock.Now()
+	fixture.operator.setRefusal(testActivateFamilyRefusal)
+	fixture.networkChanged()
+	if post := fixture.waitPost(); post.postTime != refusalTime {
+		t.Fatalf("forced post at %s, expected %s", post.postTime, refusalTime)
+	}
+	fixture.operator.setRefusal("")
+
+	fixture.step(9 * time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of the hold", 2, 0)
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.postTime != refusalTime.Add(10*time.Minute) {
+		t.Fatalf("post at %s after the refusal, expected 10m", post.postTime.Sub(refusalTime))
+	}
+	if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+		t.Fatalf("activated v%d, expected v4", ipVersion)
+	}
+}
+
+// The re-post of a revocation that the operator refuses once is held as any
+// family's refusal: a private v4 that had activated is posted again ten
+// minutes later, not a day later, and its record replaces the revocation.
+func TestExtenderActivatorRetriesAPrivateFamilyAfterARevocation(t *testing.T) {
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(ipVersion int) bool { return false }
+	})
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.waitActivation()
+	fixture.step(time.Hour)
+
+	fixture.operator.setRefusal(testActivateFamilyRefusal)
+	revocationTime := fixture.clock.Now()
+	revocation := signTestRevocation(
+		t, fixture.operator.rootPrivateKey, fixture.publicKey, revocationTime)
+	if _, err := fixture.directory.ApplyRevocation(revocation); err != nil {
+		t.Fatal(err)
+	}
+	if post := fixture.waitPost(); post.postTime != revocationTime {
+		t.Fatalf("post after the revocation at %s, expected the revocation", post.postTime)
+	}
+	fixture.operator.setRefusal("")
+
+	fixture.step(9 * time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of the hold", 2, 0)
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.postTime != revocationTime.Add(10*time.Minute) {
+		t.Fatalf("post at %s after the revocation, expected 10m", post.postTime.Sub(revocationTime))
+	}
+	fixture.waitActivation()
+	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateActive {
+		t.Fatalf("%s state = %q, expected active", testActivateIpv4, state)
+	}
+}
+
+// A request that fails, rather than one the operator refuses, says nothing of
+// a NAT: a private family whose post fails is held on the backoff, even before
+// it has activated.
+func TestExtenderActivatorHoldsAFailedPrivateFamilyOnTheBackoff(t *testing.T) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setAnswer(testActivateAnswerUnavailable)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(ipVersion int) bool { return false }
+	})
+	startTime := fixture.clock.Now()
+	fixture.waitPass()
+	fixture.waitPost()
+	fixture.operator.setAnswer(testActivateAnswerActivated)
+
+	fixture.step(9 * time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of the hold", 1, 0)
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.postTime != startTime.Add(10*time.Minute) {
+		t.Fatalf("post at %s, expected 10m", post.postTime.Sub(startTime))
+	}
+	fixture.waitActivation()
+}
+
+// A hello that arrives on a family that is not activated -- from the public
+// address of a NAT that refuses the family -- posts nothing: the family is left
+// to its own schedule.
+func TestExtenderActivatorIgnoresAHelloOnAFamilyNotActivated(t *testing.T) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setFamilyRefusal(4, testActivateFamilyRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.IpVersionPublic = func(ipVersion int) bool { return ipVersion == 6 }
+	})
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+
+	for i := range 4 {
+		fixture.operator.setClientAddress(fmt.Sprintf("198.51.100.%d:%d", 50+i, 43000+i))
+		fixture.step(30 * time.Minute)
+	}
+	fixture.expectFamilyPostCounts("after hellos on the refused family", 1, 1)
+}
+
+// The address the last check saw on a family is unchanged only while the
+// family's published address is the one it was read against. Here the check
+// sees v4 at X, a network change publishes Y, the checks then arrive on v6,
+// and v4's egress returns to X: the next check that sees X on v4 posts v4,
+// where the record would otherwise have named Y until the tick.
+func TestExtenderActivatorForgetsAHelloOnceTheFamilyMoves(t *testing.T) {
+	fixture := newTestActivatorFixture(t, nil)
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+	fixture.waitActivation()
+
+	const movedIpv4 = "198.51.100.8"
+	fixture.operator.setPublishedIp(4, movedIpv4)
+	fixture.clock.advance(2 * time.Minute)
+	fixture.networkChanged()
+	// the check this pass makes still sees X, the address published then
+	fixture.waitPass()
+	for _, ipVersion := range []int{4, 6} {
+		if post := fixture.waitPost(); post.ipVersion != ipVersion {
+			t.Fatalf("network change posted v%d, expected v%d", post.ipVersion, ipVersion)
+		}
+	}
+	fixture.waitActivation()
+	fixture.waitActivation()
+	if ip := fixture.activator.Status().Family(4).Ip.String(); ip != movedIpv4 {
+		t.Fatalf("v4 ip = %s, expected %s", ip, movedIpv4)
+	}
+
+	fixture.operator.setClientAddress(fmt.Sprintf("[%s]:42001", testActivateIpv6))
+	fixture.step(2 * time.Minute)
+	fixture.step(2 * time.Minute)
+	fixture.expectFamilyPostCounts("with the checks on v6", 2, 2)
+
+	fixture.operator.setPublishedIp(4, testActivateIpv4)
+	fixture.operator.setClientAddress(testActivateIpv4 + ":42002")
+	fixture.clock.advance(2 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("posted v%d for v4 back at its old address, expected v4", post.ipVersion)
+	}
+	fixture.waitActivation()
+	fixture.step(2 * time.Minute)
+	fixture.expectFamilyPostCounts("after the check saw X again", 3, 2)
+	if ip := fixture.activator.Status().Family(4).Ip.String(); ip != testActivateIpv4 {
+		t.Fatalf("v4 ip = %s, expected %s", ip, testActivateIpv4)
+	}
+}
+
+// With no family seam set, the activator reads the host's interface table:
+// FamilySupported counts a cloud vm's private v4, so v4 is posted, and the
+// public-address probe finds it private, so a refusal before it has activated
+// waits for the tick, while the public v6 keeps its own.
+func TestExtenderActivatorReadsTheHostsFamiliesByDefault(t *testing.T) {
+	restore := swapControlFamilyInterfaces(func() ([]controlFamilyInterface, error) {
+		return []controlFamilyInterface{
+			{
+				name:  "lo0",
+				flags: net.FlagUp | net.FlagLoopback,
+				addrs: []net.Addr{ipNet("127.0.0.1/8"), ipNet("::1/128")},
+			},
+			{
+				// 3fff::/20 stands in for a public v6 without naming a network
+				name:  "en0",
+				flags: net.FlagUp,
+				addrs: []net.Addr{ipNet("10.1.2.3/24"), ipNet("3fff:db8::1/64")},
+			},
+		}, nil
+	})
+	defer restore()
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.setFamilyRefusal(4, testActivateFamilyRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.IpVersionSupported = nil
+		settings.IpVersionPublic = nil
+	})
+	startTime := fixture.clock.Now()
+	fixture.waitFirstPass()
+	fixture.waitActivation()
+
+	for _, at := range []time.Duration{
+		10 * time.Minute,
+		30 * time.Minute,
+		70 * time.Minute,
+		6 * time.Hour,
+		24*time.Hour - time.Minute,
+	} {
+		fixture.step(startTime.Add(at).Sub(fixture.clock.Now()))
+		fixture.expectFamilyPostCounts(fmt.Sprintf("at %s", at), 1, 1)
+	}
+	fixture.clock.advance(time.Minute)
+	tickTime := startTime.Add(24 * time.Hour)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 || post.postTime != tickTime {
+		t.Fatalf("tick post = v%d at %s, expected v4 at 24h", post.ipVersion, post.postTime.Sub(startTime))
+	}
+	if post := fixture.waitPost(); post.ipVersion != 6 || post.postTime != tickTime {
+		t.Fatalf("tick post = v%d at %s, expected v6 at 24h", post.ipVersion, post.postTime.Sub(startTime))
+	}
+}
+
+// An interface table that cannot be read is no evidence of a NAT, so the
+// activator holds a refusal as a public family's, on the backoff, while the
+// exported probe still fails closed.
+func TestExtenderActivatorTakesAnUnreadableTableForPublic(t *testing.T) {
+	restore := swapControlFamilyInterfaces(func() ([]controlFamilyInterface, error) {
+		return nil, errors.New("operation not permitted")
+	})
+	defer restore()
+	activator := &ExtenderActivator{settings: DefaultExtenderActivatorSettings()}
+	for _, ipVersion := range []int{4, 6} {
+		if !activator.ipVersionPublic(ipVersion) {
+			t.Fatalf("v%d with an unreadable table read as private", ipVersion)
+		}
+		if FamilyPublic(ipVersion) {
+			t.Fatalf("FamilyPublic(%d) said yes with an unreadable table", ipVersion)
+		}
+	}
 }
 
 // A new identity whose v4 is refused learns its id from the v6 answer, the

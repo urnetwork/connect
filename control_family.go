@@ -500,13 +500,20 @@ func probeFamilySupport(family int) bool {
 // also accepts; nil accepts every such address. False when the interface table
 // cannot be read, like every probe that reads it.
 func probeFamilyAddress(family int, accept func(ip net.IP) bool) bool {
+	found, _ := probeFamilyAddressReadable(family, accept)
+	return found
+}
+
+// probeFamilyAddress, and whether the interface table could be read at all, for
+// the one caller that must not take an unreadable table for a no.
+func probeFamilyAddressReadable(family int, accept func(ip net.IP) bool) (found bool, readable bool) {
 	controlFamilyProbeSource.mu.Lock()
 	enumerate := controlFamilyProbeSource.interfaces
 	controlFamilyProbeSource.mu.Unlock()
 
 	ifaces, err := enumerate()
 	if err != nil {
-		return false
+		return false, false
 	}
 	for _, iface := range ifaces {
 		if iface.flags&net.FlagUp == 0 {
@@ -530,11 +537,11 @@ func probeFamilyAddress(family int, accept func(ip net.IP) bool) bool {
 				continue
 			}
 			if accept == nil || accept(ip) {
-				return true
+				return true, true
 			}
 		}
 	}
-	return false
+	return false, true
 }
 
 // FamilySupported reports whether this device has a usable path of ip version
@@ -573,15 +580,22 @@ var familyPublicExcludedPrefixes = []*net.IPNet{
 // RFC 4193), carrier-grade NAT (RFC 6598) nor a CLAT address (RFC 7335). An
 // operator can dial a public address back, while a host whose addresses of a
 // family are all private is behind a NAT, which forwards the carrier ports to
-// it or not. The extender activation loop reads it to tell a refusal that a
-// retry may change from one that is the NAT's (EXTENDER.md G3). Fails closed on
-// an unreadable interface table.
+// it or not. Fails closed on an unreadable interface table. The extender
+// activation loop reads the same probe through familyPublicReadable, to tell a
+// refusal that a retry may change from one that is a NAT's (EXTENDER.md G3).
 func FamilyPublic(ipVersion int) bool {
+	public, _ := familyPublicReadable(ipVersion)
+	return public
+}
+
+// FamilyPublic, and whether the interface table could be read: a caller that
+// holds a family longer on a no must not take an unreadable table for one.
+func familyPublicReadable(ipVersion int) (public bool, readable bool) {
 	switch ipVersion {
 	case 4, 6:
-		return probeFamilyAddress(ipVersion, isFamilyPublicIP)
+		return probeFamilyAddressReadable(ipVersion, isFamilyPublicIP)
 	default:
-		return false
+		return false, true
 	}
 }
 
