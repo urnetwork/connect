@@ -56,15 +56,20 @@ type extenderCamouflage struct {
 	// the 8-byte short id of the identity key both ends compute (P1)
 	shortId []byte
 
-	// the verified borrowed names this extender splices to (P5), lowercased
-	borrowNames []string
-
 	replay *extenderCamouflageReplaySet
 
-	// retirement and the live splice slots of the total and per-target caps
-	// (P3); resolver construction and shutdown never hold this lock
-	stateLock          sync.Mutex
-	closed             bool
+	// retirement, the verified names and the live splice slots of the total and
+	// per-target caps (P3); resolver construction and shutdown never hold this
+	// lock
+	stateLock sync.Mutex
+	closed    bool
+	// the verified borrowed names this extender splices to (P5), lowercased:
+	// those of the settings until a role replaces them (setBorrowNames)
+	borrowNames []string
+	// a role found that this extender does not cover every name its supported
+	// clients select (ExtenderCamouflageRole), which the status must not report
+	// as coverage whatever the splice can reach
+	coverageIncomplete bool
 	spliceCount        int
 	spliceTargetCounts map[string]int
 	// the cumulative per-borrowed-name splice load (EXTENDER-UPDATE2 §3.3):
@@ -87,17 +92,11 @@ func newExtenderCamouflage(server *ExtenderServer, settings *ExtenderSettings) (
 	camouflage := &extenderCamouflage{
 		server:             server,
 		settings:           settings,
+		borrowNames:        normalizedBorrowNames(settings.CamouflageBorrowNames),
 		spliceTargetCounts: map[string]int{},
 		targetLoadCounts:   map[string]*extenderCamouflageTargetLoad{},
 		replay:             newExtenderCamouflageReplaySet(settings),
 	}
-	borrowNames := []string{}
-	for _, borrowName := range settings.CamouflageBorrowNames {
-		if borrowName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(borrowName), ".")); borrowName != "" {
-			borrowNames = append(borrowNames, borrowName)
-		}
-	}
-	camouflage.borrowNames = borrowNames
 	if 0 < len(settings.IdentityKeySeed) {
 		staticPrivateKey, err := connect.ExtenderRealityStaticPrivateKey(settings.IdentityKeySeed)
 		if err != nil {
@@ -112,6 +111,47 @@ func newExtenderCamouflage(server *ExtenderServer, settings *ExtenderSettings) (
 		camouflage.shortId = connect.ExtenderKeyId(publicKey)
 	}
 	return camouflage, nil
+}
+
+// The lowercased, dot-trimmed form of the borrowed names, dropping the empty.
+func normalizedBorrowNames(names []string) []string {
+	borrowNames := []string{}
+	for _, borrowName := range names {
+		if borrowName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(borrowName), ".")); borrowName != "" {
+			borrowNames = append(borrowNames, borrowName)
+		}
+	}
+	return borrowNames
+}
+
+// Replaces the names the splice dials, for hellos classified after this
+// returns; a splice already relaying keeps its target (ExtenderCamouflageRole).
+func (self *extenderCamouflage) setBorrowNames(names []string) {
+	borrowNames := normalizedBorrowNames(names)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.borrowNames = borrowNames
+}
+
+// Records whether a role found this extender's coverage incomplete.
+func (self *extenderCamouflage) setCoverageIncomplete(coverageIncomplete bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.coverageIncomplete = coverageIncomplete
+}
+
+// Whether a role found this extender's coverage incomplete.
+func (self *extenderCamouflage) isCoverageIncomplete() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.coverageIncomplete
+}
+
+// The names the splice dials now.
+func (self *extenderCamouflage) currentBorrowNames() []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.borrowNames
 }
 
 // The published X25519 static public key, or nil without an identity key.
@@ -394,11 +434,14 @@ const (
 // tell.
 func (self *extenderCamouflage) spliceTargets(serverName string) []string {
 	serverName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(serverName), "."))
-	targets := make([]string, 0, len(self.borrowNames))
-	if serverName != "" && slices.Contains(self.borrowNames, serverName) {
+	// replaced whole (setBorrowNames) and never written through, so the slice
+	// stays as it was read here
+	borrowNames := self.currentBorrowNames()
+	targets := make([]string, 0, len(borrowNames))
+	if serverName != "" && slices.Contains(borrowNames, serverName) {
 		targets = append(targets, serverName)
 	}
-	for _, borrowName := range self.borrowNames {
+	for _, borrowName := range borrowNames {
 		if borrowName != serverName {
 			targets = append(targets, borrowName)
 		}
@@ -485,7 +528,7 @@ func (self *extenderCamouflage) targetLoads() map[string]ExtenderCamouflageTarge
 // The number of verified borrowed names this extender can splice to (§3.3): a
 // splice pilot with none is degraded, never coverage.
 func (self *extenderCamouflage) verifiedTargetCount() int {
-	return len(self.borrowNames)
+	return len(self.currentBorrowNames())
 }
 
 // Opens the tcp connection to a borrowed site for the splice (P3). The injected

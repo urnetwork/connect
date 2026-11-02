@@ -402,9 +402,11 @@ type ExtenderSettings struct {
 	ExtenderCamouflageSpliceMaxCount     int
 	ExtenderCamouflageSpliceMaxPerTarget int
 	// The borrowed names this extender has verified and will splice to (P5),
-	// the role-start-verified subset of the bundled borrow list. Empty leaves
-	// the splice with no target, so an unauthenticated hello in splice mode
-	// degrades to the A5 reverse proxy. Copied at construction.
+	// the verified subset of the bundled borrow list. Empty leaves the splice
+	// with no target, so an unauthenticated hello in splice mode degrades to
+	// the A5 reverse proxy. Copied at construction. A role leaves this empty
+	// and its ExtenderCamouflageRole feeds the running server instead, at start
+	// and every revalidation interval.
 	CamouflageBorrowNames []string
 	// CamouflageSpliceDialContext, when set, opens the tcp connection to a
 	// borrowed site for the splice (P3), its address the borrowed name and port
@@ -536,6 +538,9 @@ type ExtenderServer struct {
 	// probe response. Counted apart from the Phase-A terminate above, since
 	// that one is the intended posture and this one is exposure.
 	camouflageSpliceFallbackTerminatedCount atomic.Int64
+	// how much of those counts the camouflage report has taken
+	// (extender_camouflage_report.go)
+	camouflageReportLedger extenderCamouflageReportLedger
 
 	// the runtime splice posture (EXTENDER-UPDATE2 §3.3): until
 	// SetCamouflageSplice sets one, the posture is the ExtenderCamouflageSplice
@@ -1734,7 +1739,8 @@ type ExtenderCamouflageStatus struct {
 	SpliceDialFailedCount int64
 	// the honest answer: does this extender currently present real-site
 	// behavior to a prober. False whenever it is not in the splice pilot, has
-	// no verified target, or has fallen back to terminate.
+	// no verified target, has fallen back to terminate, or a role found a name
+	// its supported clients select unverified.
 	Covered bool
 	// why Covered is false, for status and telemetry
 	DegradedReason string
@@ -1748,11 +1754,19 @@ const (
 	ExtenderCamouflageDegradedGateClosed       = "splice_gate_closed"
 	ExtenderCamouflageDegradedNoVerifiedTarget = "no_verified_target"
 	ExtenderCamouflageDegradedFallbackActive   = "splice_fallback_active"
+	// the splice runs, but a role found a name this extender's supported
+	// clients select that it did not verify, or a list that is unmeasured or
+	// past its maximum age (connect.ExtenderCamouflageCoverage): a prober
+	// replaying that name is substituted, which is degraded, not coverage
+	ExtenderCamouflageDegradedCoverageIncomplete = "coverage_incomplete"
 )
 
 // CamouflageStatus reports whether this extender provides camouflage coverage
 // now (§3.3). A deployment that has fallen back to legacy termination — splice
-// on but no reachable target — is reported degraded, never as coverage.
+// on but no reachable target — is reported degraded, never as coverage. An
+// enabled extender with no verified name says so in every posture: that is what
+// stands between it and coverage whatever the posture and the gate say, and a
+// role's gate is closed because of it (it publishes no key without a name).
 func (self *ExtenderServer) CamouflageStatus() ExtenderCamouflageStatus {
 	enabled := self.camouflage != nil && self.settings.CamouflageEnabled && self.camouflage.staticPrivateKey != nil
 	spliceOn := self.CamouflageSplice()
@@ -1767,27 +1781,33 @@ func (self *ExtenderServer) CamouflageStatus() ExtenderCamouflageStatus {
 		SpliceFallbackTerminatedCount: self.camouflageSpliceFallbackTerminatedCount.Load(),
 		SpliceDialFailedCount:         self.camouflageSpliceDialFailedCount.Load(),
 	}
+	coverageIncomplete := false
 	if self.camouflage != nil {
 		status.VerifiedTargetCount = self.camouflage.verifiedTargetCount()
+		coverageIncomplete = self.camouflage.isCoverageIncomplete()
 	}
 	switch {
 	case !enabled:
 		status.Phase = ExtenderCamouflagePhaseOff
-		status.DegradedReason = ExtenderCamouflageDegradedCamouflageOff
-	case !spliceOn:
+	case !spliceOn || !gateOpen:
 		status.Phase = ExtenderCamouflagePhaseAuthenticatedRollout
-		status.DegradedReason = ExtenderCamouflageDegradedSpliceOff
-	case !gateOpen:
-		status.Phase = ExtenderCamouflagePhaseAuthenticatedRollout
-		status.DegradedReason = ExtenderCamouflageDegradedGateClosed
-	case status.VerifiedTargetCount == 0:
-		status.Phase = ExtenderCamouflagePhaseSplicePilot
-		status.DegradedReason = ExtenderCamouflageDegradedNoVerifiedTarget
-	case 0 < status.SpliceFallbackTerminatedCount:
-		status.Phase = ExtenderCamouflagePhaseSplicePilot
-		status.DegradedReason = ExtenderCamouflageDegradedFallbackActive
 	default:
 		status.Phase = ExtenderCamouflagePhaseSplicePilot
+	}
+	switch {
+	case !enabled:
+		status.DegradedReason = ExtenderCamouflageDegradedCamouflageOff
+	case status.VerifiedTargetCount == 0:
+		status.DegradedReason = ExtenderCamouflageDegradedNoVerifiedTarget
+	case !spliceOn:
+		status.DegradedReason = ExtenderCamouflageDegradedSpliceOff
+	case !gateOpen:
+		status.DegradedReason = ExtenderCamouflageDegradedGateClosed
+	case 0 < status.SpliceFallbackTerminatedCount:
+		status.DegradedReason = ExtenderCamouflageDegradedFallbackActive
+	case coverageIncomplete:
+		status.DegradedReason = ExtenderCamouflageDegradedCoverageIncomplete
+	default:
 		status.Covered = true
 	}
 	return status

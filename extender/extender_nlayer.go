@@ -117,6 +117,7 @@ func newExtenderNLayerHops(extenderConfigs []*connect.ExtenderConfig) []*extende
 		if extenderConfig != nil {
 			hopConfig := *extenderConfig
 			hopConfig.PublicKey = slices.Clone(extenderConfig.PublicKey)
+			hopConfig.RealityPublicKey = slices.Clone(extenderConfig.RealityPublicKey)
 			hop.extenderConfig = &hopConfig
 			hop.ipVersion = 6
 			if hopConfig.Ip.Unmap().Is4() {
