@@ -7,10 +7,14 @@ package extender
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -505,6 +509,170 @@ func (self *recordingPacketConn) SetReadDeadline(time.Time) error {
 
 func (self *recordingPacketConn) SetWriteDeadline(time.Time) error {
 	return nil
+}
+
+// A carrier socket whose every write fails with one error, as a stand in for what the
+// kernel says of an address.
+type failingAnswerPacketConn struct {
+	*recordingPacketConn
+	err error
+}
+
+func (self *failingAnswerPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, self.err
+}
+
+// Sends one query through the forwarder on `packetConn`, from `client`, whose answer
+// is refused without asking a resolver, and returns what the handler heard of the
+// write that failed.
+func testDnsAnswerWriteError(t *testing.T, packetConn net.PacketConn, client net.Addr) error {
+	t.Helper()
+	answerErrors := make(chan error, 8)
+	settings := DefaultExtenderSettings()
+	settings.ErrorHandler = func(stage string, err error) {
+		if stage != "dns answer" {
+			t.Errorf("stage %q: %v", stage, err)
+			return
+		}
+		select {
+		case answerErrors <- err:
+		default:
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := NewExtenderServer(ctx, nil, nil, nil, nil, settings)
+	defer server.CloseAndWait()
+	forwarder := newExtenderDnsForwarder(server, packetConn)
+	defer forwarder.close()
+
+	forwarder.handleQuery(newTestDnsQuery(t, 0x7777, testForwardName, dnsmessage.TypeALL), client)
+	select {
+	case err := <-answerErrors:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler heard nothing of the failed write")
+		return nil
+	}
+}
+
+// Fails the test if an error names any of these addresses, whole or in part.
+func testExpectNamesNoAddress(t *testing.T, err error, addrs ...*net.UDPAddr) {
+	t.Helper()
+	for _, addr := range addrs {
+		for _, forbidden := range []string{addr.IP.String(), strconv.Itoa(addr.Port)} {
+			if strings.Contains(err.Error(), forbidden) {
+				t.Fatalf("the error names %q: %q", forbidden, err)
+			}
+		}
+	}
+}
+
+// A failed write of an answer says which addresses it failed between, and the far one
+// is a client's. It must not reach a handler, in either family, however the socket
+// fails, and what the handler hears still says why.
+func TestExtenderForwarderAnswerErrorNamesNoAddress(t *testing.T) {
+	for _, addrs := range []struct {
+		name   string
+		source *net.UDPAddr
+		client *net.UDPAddr
+	}{
+		{
+			name:   "ipv4",
+			source: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53866},
+			client: &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444},
+		},
+		{
+			name:   "ipv6",
+			source: &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 53866},
+			client: &net.UDPAddr{IP: net.ParseIP("2001:db8:1234::7"), Port: 44444},
+		},
+	} {
+		opError := func(err error) error {
+			return &net.OpError{Op: "write", Net: "udp", Source: addrs.source, Addr: addrs.client, Err: err}
+		}
+		for _, testCase := range []struct {
+			name       string
+			err        error
+			expectText string
+			expectIs   error
+		}{
+			{
+				name:       "a send that failed",
+				err:        opError(os.NewSyscallError("sendto", syscall.ENETUNREACH)),
+				expectText: syscall.ENETUNREACH.Error(),
+				expectIs:   syscall.ENETUNREACH,
+			},
+			{
+				name:       "a closed socket",
+				err:        opError(net.ErrClosed),
+				expectText: net.ErrClosed.Error(),
+				expectIs:   net.ErrClosed,
+			},
+			{
+				name:       "an address the socket cannot send to",
+				err:        opError(&net.AddrError{Err: "non-IPv4 address", Addr: addrs.client.IP.String()}),
+				expectText: "non-IPv4 address",
+			},
+		} {
+			t.Run(addrs.name+"/"+testCase.name, func(t *testing.T) {
+				err := testDnsAnswerWriteError(t, &failingAnswerPacketConn{
+					recordingPacketConn: newRecordingPacketConn(),
+					err:                 testCase.err,
+				}, addrs.client)
+				testExpectNamesNoAddress(t, err, addrs.source, addrs.client)
+				if !strings.Contains(err.Error(), testCase.expectText) {
+					t.Fatalf("the error = %q, expected the cause %q", err, testCase.expectText)
+				}
+				if testCase.expectIs != nil && !errors.Is(err, testCase.expectIs) {
+					t.Fatalf("the error = %v, expected %v", err, testCase.expectIs)
+				}
+			})
+		}
+	}
+}
+
+// The same with the errors a real socket returns, each of which names the client until
+// it is scrubbed, which is what makes this a test of anything.
+func TestExtenderForwarderAnswerErrorOfARealSocketNamesNoAddress(t *testing.T) {
+	expectScrubbed := func(t *testing.T, packetConn net.PacketConn, client *net.UDPAddr) {
+		t.Helper()
+		_, rawErr := packetConn.WriteTo([]byte("an answer"), client)
+		if rawErr == nil || !strings.Contains(rawErr.Error(), client.IP.String()) {
+			t.Fatalf("the socket's own error = %v, expected it to name %s", rawErr, client.IP)
+		}
+		err := testDnsAnswerWriteError(t, packetConn, client)
+		testExpectNamesNoAddress(t, err, client)
+		localAddr := packetConn.LocalAddr().(*net.UDPAddr)
+		testExpectNamesNoAddress(t, err, localAddr)
+	}
+	v4Client := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444}
+	v6Client := &net.UDPAddr{IP: net.ParseIP("2001:db8:1234::7"), Port: 44444}
+
+	t.Run("a closed ipv4 socket", func(t *testing.T) {
+		packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		packetConn.Close()
+		expectScrubbed(t, packetConn, v4Client)
+	})
+	t.Run("a closed ipv6 socket", func(t *testing.T) {
+		packetConn, err := net.ListenPacket("udp6", "[::1]:0")
+		if err != nil {
+			t.Skipf("this host has no ipv6 loopback: %s", err)
+		}
+		packetConn.Close()
+		expectScrubbed(t, packetConn, v6Client)
+	})
+	t.Run("an ipv6 client on an ipv4 socket", func(t *testing.T) {
+		packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer packetConn.Close()
+		expectScrubbed(t, packetConn, v6Client)
+	})
 }
 
 // Every query is handed to a bounded pool of workers, and a query that arrives

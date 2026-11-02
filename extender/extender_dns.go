@@ -307,7 +307,8 @@ func (self *extenderDnsForwarder) answerStatus(
 // and writes to concurrently.
 func (self *extenderDnsForwarder) writeAnswer(query *extenderDnsQuery, answerBytes []byte) {
 	if _, err := self.packetConn.WriteTo(answerBytes, query.addr); err != nil {
-		self.server.reportError("dns answer", err)
+		// the far end of a failed write is the client's address, which reaches no handler
+		self.server.reportError("dns answer", connect.SocketErrorWithoutAddress(err))
 	}
 }
 
