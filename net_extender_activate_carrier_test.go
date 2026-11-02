@@ -254,6 +254,42 @@ func TestExtenderActivatorTcpCarrierReturnPostsOnlyTheFamilyOwed(t *testing.T) {
 	fixture.expectFamilyPostCounts("after the return", 2, 1)
 }
 
+// A post held back asked nothing of the operator, so what the family last heard stands:
+// a tick or a Reactivate that falls within a flap does not read as a family lost, and
+// the status gives the reason only while the carrier is gone.
+func TestExtenderActivatorHeldPostKeepsAGoodRecord(t *testing.T) {
+	fixture := newTestActivatorFixtureActivated(t, func(settings *ExtenderActivatorSettings) {
+		settings.postJitterForTest = func(maxJitter time.Duration) time.Duration {
+			return 3 * time.Minute
+		}
+	})
+	fixture.setCarriers(ExtenderCarrierQuic)
+	fixture.activator.Reactivate()
+	fixture.waitHeldForCarrier()
+	for _, ipVersion := range []int{4, 6} {
+		status := fixture.activator.Status().Family(ipVersion)
+		if !status.Activated || !status.Ip.IsValid() {
+			t.Fatalf("v%d status = %+v, expected the record to stand", ipVersion, status)
+		}
+	}
+
+	fixture.setCarriers(ExtenderCarrierTcp, ExtenderCarrierQuic)
+	fixture.activator.TcpCarrierReturned()
+	fixture.step(time.Minute)
+	for _, ipVersion := range []int{4, 6} {
+		status := fixture.activator.Status().Family(ipVersion)
+		if !status.Activated || status.LastError != "" {
+			t.Fatalf("v%d status = %+v, expected it active with the carrier back", ipVersion, status)
+		}
+	}
+	// what was held back is still owed, since a post came due
+	fixture.clock.advance(3 * time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 {
+		t.Fatalf("post = v%d after the draw", post.ipVersion)
+	}
+	fixture.waitPost()
+}
+
 // A listener that flaps does not post past what the operator said: a review
 // measured 7 posts in 4 minutes against a retry_after_seconds of 50 minutes, each
 // return making the family due again.

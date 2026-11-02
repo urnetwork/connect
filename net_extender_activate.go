@@ -482,12 +482,12 @@ func (self *ExtenderActivator) State() *ExtenderActivatorState {
 
 // Continues from what the activator this one replaces handed over, unless that was
 // another identity's, which says nothing of this one. A family waiting out a hold, a
-// retry_after_seconds or a private family's day goes on waiting. A post owed now,
-// held back for its carriers or one that had come due, goes within CarrierReturnJitter, as on the
-// carrier's return. A family that stands activated keeps its record and its status
-// and is posted once more within ReplacedPostJitter, sooner if its tick says so:
-// nothing about it is urgent, but the new role has things only a post gives it (the
-// record the camouflage gate reads, the ports that bound this time).
+// retry_after_seconds or a private family's day goes on waiting. A post owed now, held
+// back for its carriers or one that had come due, goes within CarrierReturnJitter, as
+// on the carrier's return. A family that stands activated keeps its record and its
+// status and is posted once more within ReplacedPostJitter, sooner if its tick says
+// so: nothing about it is urgent, but the new role has things only a post gives it
+// (the record the camouflage gate reads, the ports that bound this time).
 func (self *ExtenderActivator) continueFrom(previous *ExtenderActivatorState) {
 	if !slices.Equal(previous.publicKey, self.settings.PublicKey) {
 		return
@@ -757,8 +757,8 @@ func (self *ExtenderActivator) Reactivate() {
 	self.networkChanged()
 }
 
-// Says the tcp carrier is serving again after it was lost (G2): every family with
-// a post that came due while it was gone is posted within CarrierReturnJitter. Any other
+// Says the tcp carrier is serving again after it was lost (G2): every family with a
+// post that came due while it was gone is posted within CarrierReturnJitter. Any other
 // family is left to its schedule, a refusal's retry_after and a private family's day
 // included, so a carrier that came back before anything was owed posts nothing and a
 // flapping listener spends nothing of the operator's. Safe to call from any goroutine.
