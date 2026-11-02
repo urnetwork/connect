@@ -1190,15 +1190,16 @@ is bound again after about 1 s, doubling to 5 minutes with jitter, starting over
 once the carrier has served for 5 minutes. A datagram the dns carrier cannot
 encode or write is lost and nothing more, logged at most once a minute with the
 count since, so one client's address or a path that is down for a moment cannot
-end the socket every client of the carrier shares. A closed socket ends it, and so
-does one that has written nothing for 5 minutes through at least 16 failed writes,
-since a socket that can send nothing serves nothing however it reads: an extender
-rebuilds the carrier and reports it, and the server's alt listener exits for warp
-to replace the block, as for any listener it loses. One write that succeeds starts
-that over, so a sender that only provokes failures cannot end a socket that is
-answering anyone else. `Carriers` and `DnsPorts` say what is serving at each moment,
-and a probe's response, the status and the activation all read them. A first bind
-that fails is still the case above: that udp carrier stays down until the role
+end the socket every client of the carrier shares. Only a closed socket ends it, and
+that holds however long the writes fail: a socket whose every write fails stays up
+and reads as ready, with its line a minute. A sender can bring that about, since a
+source port of 0 fails every write to it and on a quiet port nothing else succeeds in
+between, so any bound on it is one a sender can reach. A bound of 5 minutes was
+tried and a review ended the server's real alt listeners with 160 datagrams, which
+ends the whole process with no drain, and a restart could not cure egress that
+refuses every write anyway. `Carriers` and `DnsPorts` say what is serving at each
+moment, and a probe's response, the status and the activation all read them. A first
+bind that fails is still the case above: that udp carrier stays down until the role
 restarts.
 
 The server itself ends only with `Close` or its context. The role reports its
@@ -4105,7 +4106,7 @@ with the database.
 | `extender.ExtenderSettings` | `AcceptRetryMinBackoff`, `AcceptRetryMaxBackoff`, `AcceptDownTimeout`, `CarrierRebuildMinBackoff`, `CarrierRebuildMaxBackoff`, `CarrierRebuildStableTimeout` and `CarriersChangeHandler` added; `ListenErrorHandler` also receives what ended a carrier that was serving (G2) |
 | `extender.ExtenderServer` | `Carriers` and `DnsPorts` read what is serving now, and nothing once it has ended; `Done` added (G2) |
 | `ExtenderActivator` | `TcpCarrierReturned`, `CarriersChanged` and `State` added, with the settings `CarrierReturnJitter`, `PreviousState` and `ReplacedPostJitter`; no post without a required carrier (G2, G3) |
-| packet translation, server modes | a datagram that cannot be written, or on windows is too long to read, is lost; a temporary read error is waited out; no write succeeding for 5 minutes ends it; `EndError` added; no socket error it logs, keeps or returns names an address (G2) |
+| packet translation, server modes | a datagram that cannot be written, or on windows is too long to read, is lost, however long that goes on; a temporary read error is waited out; a closed socket or any other read error ends it; `EndError` added; no socket error it logs, keeps or returns names an address (G2) |
 | `sdk.ExtenderProvideStatus` | `Listening` is the tcp carrier serving; `ListenError` also carries what ended it, and no family reads as activated meanwhile (G2, N3) |
 
 Old clients keep working: the header's new fields are optional, the hello

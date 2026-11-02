@@ -50,10 +50,6 @@ const (
 	// a temporary accept error. Nothing else paces a socket that keeps failing.
 	packetTranslationReadRetryMinBackoff = 5 * time.Millisecond
 	packetTranslationReadRetryMaxBackoff = 1 * time.Second
-	// How long a server mode's writes may all fail, and how many of them, before the
-	// socket counts as ended rather than the datagrams as lost (dropServerWrite).
-	packetTranslationWriteFailTimeout  = 5 * time.Minute
-	packetTranslationWriteFailMinCount = 16
 )
 
 // WSAEMSGSIZE: what windows answers a read of a datagram longer than the buffer with,
@@ -108,9 +104,6 @@ type PacketTranslationSettings struct {
 	DnsPumpTimeout time.Duration
 	// DnsReadTimeout time.Duration
 	DnsStateTimeout time.Duration
-	// How long a server mode's writes may all fail before the socket counts as ended
-	// (packetTranslationWriteFailTimeout, which zero takes). Tests shorten it.
-	WriteFailTimeout time.Duration
 
 	DnsMaxCombinePerAddress int
 	DnsMaxCombine           int64
@@ -184,12 +177,6 @@ type packetTranslation struct {
 	readRetryLog *logThrottle
 	// the first failure that ended a server mode (EndError)
 	endError atomic.Pointer[error]
-	// when the writes that have all failed since the last that succeeded began, and
-	// how many they are, nil and 0 while the last one succeeded. Every writer of the
-	// socket keeps these (writeWire). A failure and a success at the same moment may
-	// read as either, which a bound of minutes does not notice.
-	writeFailTime  atomic.Pointer[time.Time]
-	writeFailCount atomic.Int64
 
 	deadlineLock         sync.Mutex
 	readDeadline         time.Time
@@ -633,10 +620,7 @@ func (self *packetTranslation) encodeDns() {
 
 				err := self.writeWire(p.data, p.addr)
 				MessagePoolReturn(p.data)
-				if err != nil {
-					err = self.dropServerWrite(err)
-				}
-				if err != nil {
+				if err != nil && self.dropServerWrite(err) != nil {
 					select {
 					case <-self.ctx.Done():
 					default:
@@ -654,17 +638,7 @@ func (self *packetTranslation) encodeDns() {
 // (packetTranslationSocketError).
 func (self *packetTranslation) writeWire(packetData []byte, addr net.Addr) error {
 	_, err := self.packetConn.WriteTo(packetData, addr)
-	if err != nil {
-		now := time.Now()
-		self.writeFailTime.CompareAndSwap(nil, &now)
-		self.writeFailCount.Add(1)
-		return packetTranslationSocketError(err)
-	}
-	if self.writeFailTime.Load() != nil {
-		self.writeFailTime.Store(nil)
-		self.writeFailCount.Store(0)
-	}
-	return nil
+	return packetTranslationSocketError(err)
 }
 
 // A socket's error without the addresses its text carries. A *net.OpError prints
@@ -697,31 +671,19 @@ func packetTranslationSocketError(err error) error {
 // moment, must not end the one socket every client of the carrier shares; nor
 // should it end the quic connection of a client a returned error would close.
 //
-// A closed socket ends the encoder, and that error comes back. So does the error of a
-// socket that has written nothing for packetTranslationWriteFailTimeout through at
-// least packetTranslationWriteFailMinCount failures, which is no longer a matter of
-// datagrams: a socket that can send nothing serves nothing however it reads, and its
-// owner should see that. An extender rebuilds the carrier and reports it, and the
-// server's alt listener exits for warp to replace the block, as for any listener it
-// loses. One write that succeeds starts this over, so a sender that only provokes
-// failures cannot end a socket that is answering anyone else, and the count keeps a
-// rare failure on a quiet socket from standing for it.
+// Only a closed socket ends the encoder, and that error comes back.
+//
+// That holds however long the writes go on failing. A sender can bring that about: a
+// source port of 0 fails every write to it, and on a quiet port nothing else succeeds
+// in between, so any bound here is one a sender can reach. On the server's alt listener
+// losing the socket ends the whole process with no drain, and a restart could not cure
+// egress that refuses every write anyway, so a socket stuck this way stays up, and says
+// so a line a minute.
 func (self *packetTranslation) dropServerWrite(err error) error {
 	if errors.Is(err, net.ErrClosed) {
 		return err
 	}
-	now := time.Now()
-	if failTime := self.writeFailTime.Load(); failTime != nil {
-		writeFailTimeout := self.settings.WriteFailTimeout
-		if writeFailTimeout <= 0 {
-			writeFailTimeout = packetTranslationWriteFailTimeout
-		}
-		failDuration := now.Sub(*failTime)
-		if writeFailTimeout <= failDuration && packetTranslationWriteFailMinCount <= self.writeFailCount.Load() {
-			return fmt.Errorf("no write has succeeded for %s: %w", failDuration.Round(time.Second), err)
-		}
-	}
-	if allowed, suppressed := self.writeDropLog.Allow(now); allowed {
+	if allowed, suppressed := self.writeDropLog.Allow(time.Now()); allowed {
 		self.log.Errorf("[pt]dropped a datagram, %d more since the last line: %s\n", suppressed, err)
 	}
 	return nil
