@@ -93,6 +93,33 @@ func (self *fakeBorrowSite) dialContext() connect.DialContextFunction {
 	}
 }
 
+// The splice dial seam that reaches this site with the extender's side of each
+// connection held open until it is released. A splice closes the prober's side
+// first and counts what it relayed only once both have closed, so the prober sees
+// the end of its stream with the count still to come: a read right after that end
+// finds nothing, whatever the scheduler does.
+func (self *fakeBorrowSite) dialContextHoldingClose(release <-chan struct{}) connect.DialContextFunction {
+	dialContext := self.dialContext()
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		conn, err := dialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &closeHeldConn{Conn: conn, release: release}, nil
+	}
+}
+
+// A connection whose Close waits for a release.
+type closeHeldConn struct {
+	net.Conn
+	release <-chan struct{}
+}
+
+func (self *closeHeldConn) Close() error {
+	<-self.release
+	return self.Conn.Close()
+}
+
 // A TLS borrowed-site handler: it completes a handshake with a self-signed cert,
 // so a spliced client's handshake finishes and then fails its own B3 check.
 func tlsBorrowSiteHandler(t *testing.T) func(conn net.Conn) {
@@ -628,7 +655,8 @@ func TestExtenderCamouflageSpliceByteBound(t *testing.T) {
 }
 
 // A spliced byte is never counted as relay traffic (P10 bounded splice, O1):
-// after a splice the O1 ingress and egress counters are still zero.
+// after a splice the O1 ingress and egress counters are still zero. The read comes
+// after the close joins the splice, so nothing it counts can land after it.
 func TestExtenderCamouflageSpliceNotCountedAsRelay(t *testing.T) {
 	site := newFakeBorrowSite(t, floodBorrowSiteHandler(4096))
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
@@ -640,6 +668,7 @@ func TestExtenderCamouflageSpliceNotCountedAsRelay(t *testing.T) {
 	})
 
 	spliceProberReceiveByteCount(t, fixture)
+	fixture.server.CloseAndWait()
 	stats := fixture.server.Stats()
 	if stats.IngressByteCount != 0 || stats.EgressByteCount != 0 {
 		t.Fatalf("spliced bytes were counted as relay traffic: %+v", stats)
@@ -755,7 +784,9 @@ func openSpliceProber(t *testing.T, fixture *extenderFixture) net.Conn {
 }
 
 // Splices one raw prober and returns how many relayed bytes it received before
-// the connection ended.
+// the connection ended. The splice is still ending when this returns: what it
+// counts when it ends is there once the server has closed and joined it
+// (dialContextHoldingClose).
 func spliceProberReceiveByteCount(t *testing.T, fixture *extenderFixture) int {
 	t.Helper()
 	conn, err := net.Dial("tcp", fixture.authority(fixture.tcpPort))
@@ -766,7 +797,7 @@ func spliceProberReceiveByteCount(t *testing.T, fixture *extenderFixture) int {
 	if _, err := conn.Write(rawUnauthenticatedHelloRecord(t, testBorrowName)); err != nil {
 		t.Fatal(err)
 	}
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	received := 0
 	buffer := make([]byte, 4096)
 	for {

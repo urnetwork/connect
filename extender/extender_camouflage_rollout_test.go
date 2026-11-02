@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -387,18 +388,26 @@ func TestExtenderCamouflageStatusOff(t *testing.T) {
 
 // The per-target load accumulates begins and relayed bytes for one borrowed
 // site, so a fleet telemetry can sum one target's load across extenders (§3.3):
-// per-extender caps alone do not bound a whole fleet's traffic to one site.
+// per-extender caps alone do not bound a whole fleet's traffic to one site. The
+// bytes are counted when the splice ends, and the prober sees its stream end
+// before that, so the site's side is held closed past the prober's end and the
+// count is read once the close has joined the splice.
 func TestExtenderCamouflageTargetLoadMeasured(t *testing.T) {
 	floodByteCount := 4096
 	site := newFakeBorrowSite(t, floodBorrowSiteHandler(floodByteCount))
+	siteCloseRelease := make(chan struct{})
+	releaseSiteClose := sync.OnceFunc(func() { close(siteCloseRelease) })
+	defer releaseSiteClose()
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
 		settings.IdentityKeySeed = mustSeed(t)
 		settings.ExtenderCamouflageSplice = true
 		settings.CamouflageBorrowNames = []string{testBorrowName}
-		settings.CamouflageSpliceDialContext = site.dialContext()
+		settings.CamouflageSpliceDialContext = site.dialContextHoldingClose(siteCloseRelease)
 	})
-	spliceProberReceiveByteCount(t, fixture)
+	receivedByteCount := spliceProberReceiveByteCount(t, fixture)
+	releaseSiteClose()
+	fixture.server.CloseAndWait()
 
 	loads := fixture.server.CamouflageStats().TargetLoads
 	load, ok := loads[testBorrowName]
@@ -410,5 +419,8 @@ func TestExtenderCamouflageTargetLoadMeasured(t *testing.T) {
 	}
 	if load.RelayedByteCount == 0 {
 		t.Fatal("per-target relayed-byte count did not increment")
+	}
+	if load.RelayedByteCount != int64(receivedByteCount) || receivedByteCount != floodByteCount {
+		t.Fatalf("per-target relayed bytes = %d, the prober received %d of %d", load.RelayedByteCount, receivedByteCount, floodByteCount)
 	}
 }
