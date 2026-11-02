@@ -2,11 +2,13 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	// "runtime/debug"
 
@@ -33,6 +35,21 @@ import (
 // there is one master translation with several modes because all the translations must share the same ports
 
 // the dns pt header is 18 bytes: [16 random][1 count][1 index]
+
+// What a decode53 socket does with a failure that is not the socket's end
+// (EXTENDER.md G2): an extender's dns carrier serves every client that reaches
+// it on that one socket, so one datagram that cannot be written, or a read that
+// fails for a moment, costs the datagram and not the carrier.
+const (
+	// The least time between two log lines of one kind of those failures. A
+	// path that is down fails every datagram alike, so one line an interval,
+	// with the count since, says as much as one line a datagram.
+	packetTranslationErrorLogInterval = 1 * time.Minute
+	// The wait after a temporary read error, doubling, as net/http waits after
+	// a temporary accept error. Nothing else paces a socket that keeps failing.
+	packetTranslationReadRetryMinBackoff = 5 * time.Millisecond
+	packetTranslationReadRetryMaxBackoff = 1 * time.Second
+)
 
 type PacketTranslationMode string
 
@@ -147,6 +164,13 @@ type packetTranslation struct {
 	out     chan *packet
 	forward chan *packet
 
+	// what the server modes logged of a datagram they dropped and of a read
+	// they retried, at most a line an interval
+	writeDropLog *logThrottle
+	readRetryLog *logThrottle
+	// the first failure that ended a server mode (EndError)
+	endError atomic.Pointer[error]
+
 	deadlineLock         sync.Mutex
 	readDeadline         time.Time
 	readDeadlineWakeup   bool
@@ -218,6 +242,8 @@ func NewPacketTranslationWithPrefix(
 		in:                   make(chan *packet, settings.SequenceBufferSize),
 		out:                  make(chan *packet, settings.SequenceBufferSize),
 		forward:              make(chan *packet, settings.SequenceBufferSize),
+		writeDropLog:         newLogThrottle(packetTranslationErrorLogInterval),
+		readRetryLog:         newLogThrottle(packetTranslationErrorLogInterval),
 		readDeadlineMonitor:  NewMonitor(),
 		writeDeadlineMonitor: NewMonitor(),
 	}
@@ -255,8 +281,24 @@ func (self *packetTranslation) startWorker(run func()) {
 	self.workerWg.Add(1)
 	go func() {
 		defer self.workerWg.Done()
-		HandleError(run, self.cancel)
+		HandleError(run, self.endWith)
 	}()
+}
+
+// Ends the translation for `err`, which EndError answers with if it is the first.
+func (self *packetTranslation) endWith(err error) {
+	self.endError.CompareAndSwap(nil, &err)
+	self.cancel()
+}
+
+// What ended this translation, nil when nothing has or when it was closed. A
+// carrier reads it for the cause, since what its quic transport sees of any end
+// is only that the translation closed.
+func (self *packetTranslation) EndError() error {
+	if err := self.endError.Load(); err != nil {
+		return *err
+	}
+	return nil
 }
 
 // beginOperation prevents a PacketConn call from publishing into a queue after
@@ -355,7 +397,7 @@ func (self *packetTranslation) encodeDns() {
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-					_, err = self.packetConn.WriteTo(packetData, p.addr)
+					err = self.writeWire(packetData, p.addr)
 					if err != nil {
 						return err
 					}
@@ -425,7 +467,7 @@ func (self *packetTranslation) encodeDns() {
 
 						// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-						_, err = self.packetConn.WriteTo(packetData, mostRecentAddr)
+						err = self.writeWire(packetData, mostRecentAddr)
 						if err != nil {
 							select {
 							case <-self.ctx.Done():
@@ -528,14 +570,14 @@ func (self *packetTranslation) encodeDns() {
 					)
 					n += m
 					if err != nil {
-						return err
+						return self.dropServerWrite(err)
 					}
 
 					// fmt.Printf("PACKET WRITE TO: %v\n", string(packetData))
 
-					_, err = self.packetConn.WriteTo(packetData, p.addr)
+					err = self.writeWire(packetData, p.addr)
 					if err != nil {
-						return err
+						return self.dropServerWrite(err)
 					}
 
 					endTime := time.Now()
@@ -548,7 +590,7 @@ func (self *packetTranslation) encodeDns() {
 					}
 				}
 				if n != len(p.data) {
-					return fmt.Errorf("Header count estimate incorrect.")
+					return self.dropServerWrite(fmt.Errorf("Header count estimate incorrect."))
 				}
 				return nil
 			}
@@ -561,21 +603,87 @@ func (self *packetTranslation) encodeDns() {
 					select {
 					case <-self.ctx.Done():
 					default:
-						self.log.Infof("[pt]write err = %s\n", err)
+						self.log.Errorf("[pt]write err = %s\n", err)
+						self.endWith(err)
 					}
 					return
 				}
 			case p := <-self.forward:
 				// fmt.Printf("PACKET WRITE TO: %v\n", string(p.data))
 
-				_, err := self.packetConn.WriteTo(p.data, p.addr)
+				err := self.writeWire(p.data, p.addr)
 				MessagePoolReturn(p.data)
-				if err != nil {
+				if err != nil && self.dropServerWrite(err) != nil {
+					select {
+					case <-self.ctx.Done():
+					default:
+						self.log.Errorf("[pt]write err = %s\n", err)
+						self.endWith(err)
+					}
 					return
 				}
 			}
 		}
 	}
+}
+
+// One write on the wire, with an error that names no address
+// (packetTranslationSocketError).
+func (self *packetTranslation) writeWire(packetData []byte, addr net.Addr) error {
+	_, err := self.packetConn.WriteTo(packetData, addr)
+	return packetTranslationSocketError(err)
+}
+
+// A socket's error without the addresses its text carries. A *net.OpError prints
+// both ends of the operation, so a failed write reads `write udp4
+// 127.0.0.1:53866->203.0.113.7:4444: sendto: ...`, and on a server the far end is a
+// client's address. What the operator has of these is the log, the status and what
+// sdk/log_upload.go uploads, and none of them may hold a client's address, so nothing
+// here logs, keeps or returns the whole error. A *net.AddrError names its address
+// too. errors.Is still finds net.ErrClosed and the errno, and errors.As the
+// *os.SyscallError quic-go reads.
+func packetTranslationSocketError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		err = opErr.Err
+	}
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return errors.New(addrErr.Err)
+	}
+	return err
+}
+
+// What a server mode does with a datagram it could not encode or write
+// (EXTENDER.md G2): it is a lost datagram, which is what this transport promises
+// nothing about, so the answer is nil and quic's loss recovery owns it. One
+// client's address the socket cannot send to, or a path that is down for a
+// moment, must not end the one socket every client of the carrier shares; nor
+// should it end the quic connection of a client a returned error would close.
+// Only a closed socket ends the encoder, and that error comes back.
+func (self *packetTranslation) dropServerWrite(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	if allowed, suppressed := self.writeDropLog.Allow(time.Now()); allowed {
+		self.log.Errorf("[pt]dropped a datagram, %d more since the last line: %s\n", suppressed, err)
+	}
+	return nil
+}
+
+// Whether a read error of a server mode's socket is one to wait out: what
+// net/http and quic-go read as temporary, which on windows includes the
+// connection reset an unreachable client's icmp leaves on a udp socket. Any
+// other error is the socket's end, which the owner of the carrier rebuilds.
+func packetTranslationReadRetries(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Temporary()
 }
 
 func (self *packetTranslation) decodeDns() {
@@ -610,7 +718,7 @@ func (self *packetTranslation) decodeDns() {
 		childWorkers.Add(1)
 		go func() {
 			defer childWorkers.Done()
-			HandleError(run, self.cancel)
+			HandleError(run, self.endWith)
 		}()
 	}
 
@@ -745,6 +853,7 @@ func (self *packetTranslation) decodeDns() {
 
 	packetData := make([]byte, 2048)
 	var buf [1024]byte
+	var readRetryBackoff time.Duration
 
 	for {
 		// self.packetConn.SetReadDeadline(time.Now().Add(self.settings.DnsReadTimeout))
@@ -752,11 +861,35 @@ func (self *packetTranslation) decodeDns() {
 		if err != nil {
 			select {
 			case <-self.ctx.Done():
+				return
 			default:
-				self.log.Infof("[pt]read err = %s\n", err)
 			}
-			return
+			retries := packetTranslationReadRetries(err)
+			err = packetTranslationSocketError(err)
+			if self.dnsClient {
+				self.log.Infof("[pt]read err = %s\n", err)
+				return
+			}
+			if !retries {
+				self.log.Errorf("[pt]read err = %s\n", err)
+				self.endWith(err)
+				return
+			}
+			if allowed, suppressed := self.readRetryLog.Allow(time.Now()); allowed {
+				self.log.Errorf("[pt]read err, retrying, %d more since the last line: %s\n", suppressed, err)
+			}
+			readRetryBackoff = min(
+				max(2*readRetryBackoff, packetTranslationReadRetryMinBackoff),
+				packetTranslationReadRetryMaxBackoff,
+			)
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-time.After(readRetryBackoff):
+			}
+			continue
 		}
+		readRetryBackoff = 0
 		// self.log.Infof("[pt]read raw\n")
 
 		var header [18]byte

@@ -538,7 +538,9 @@ type extenderRun struct {
 	camouflage *extender.ExtenderCamouflageRole
 
 	serveDone chan error
-	closers   []func()
+	// wakes the run loop when the carriers being served change
+	carriersChange chan struct{}
+	closers        []func()
 }
 
 // extenderCommand is the command entry point: the flags, the signal context,
@@ -576,10 +578,11 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		return nil, err
 	}
 	run := &extenderRun{
-		options:     options,
-		apiHost:     apiHost,
-		networkHost: connect.ExtenderNetworkHostName(apiHost),
-		serveDone:   make(chan error, 1),
+		options:        options,
+		apiHost:        apiHost,
+		networkHost:    connect.ExtenderNetworkHostName(apiHost),
+		serveDone:      make(chan error, 1),
+		carriersChange: make(chan struct{}, 1),
 	}
 	success := false
 	defer func() {
@@ -688,6 +691,14 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	serverSettings.ProbePeerVerifier = run.directory.IsActiveKey
 	serverSettings.ListenErrorHandler = func(carrier string, err error) {
 		Err.Printf("extender %s carrier is not listening: %s", carrier, err)
+	}
+	// a lost carrier comes back on its own; the run loop reports it and tells
+	// the activation when the tcp carrier returns (G2, G3)
+	serverSettings.CarriersChangeHandler = func() {
+		select {
+		case run.carriersChange <- struct{}{}:
+		default:
+		}
 	}
 	serverSettings.Listen = options.listen
 	serverSettings.ListenPacket = options.listenPacket
@@ -888,6 +899,7 @@ func (self *extenderRun) run(ctx context.Context) error {
 	if 0 < self.options.admissionLogTimeout {
 		admissionLogTimeout = self.options.admissionLogTimeout
 	}
+	tcpServing := slices.Contains(self.server.Carriers(), connect.ExtenderCarrierTcp)
 	for {
 		// subscribe before the read, so a change that lands while the lines
 		// below are printed wakes the next wait rather than being lost
@@ -934,8 +946,21 @@ func (self *extenderRun) run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case err := <-self.serveDone:
-			// every carrier went away; there is nothing left to activate
+			// the server ends only with its context or a failure to start, and
+			// this process exists to serve it, so this is an exit with an error
+			// and whatever runs connectctl restarts it (G4)
+			if err == nil && ctx.Err() == nil {
+				err = fmt.Errorf("the extender server ended")
+			}
 			return err
+		case <-self.carriersChange:
+			carriers := self.server.Carriers()
+			Out.Printf("extender carriers: %s", strings.Join(carriers, ","))
+			serving := slices.Contains(carriers, connect.ExtenderCarrierTcp)
+			if serving && !tcpServing {
+				self.activator.TcpCarrierReturned()
+			}
+			tcpServing = serving
 		case <-change:
 		case <-pingerChange:
 		case <-measurementChange:

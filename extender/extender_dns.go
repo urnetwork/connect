@@ -58,6 +58,12 @@ type extenderDnsForwarder struct {
 	packetConn net.PacketConn
 	queries    chan *extenderDnsQuery
 
+	// the life of this forwarder, which is its carrier's: a carrier that is
+	// rebuilt builds a new forwarder, so these end with close, not the server
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
+
 	stateLock    sync.Mutex
 	totalBucket  tokenBucket
 	sourceStates map[string]*extenderDnsSource
@@ -70,17 +76,22 @@ type extenderDnsForwarder struct {
 // is owned by the carrier; the forwarder only answers on it.
 func newExtenderDnsForwarder(server *ExtenderServer, packetConn net.PacketConn) *extenderDnsForwarder {
 	workerCount := max(1, server.settings.DnsForwardWorkerCount)
+	cancelCtx, cancel := context.WithCancel(server.ctx)
 	self := &extenderDnsForwarder{
 		server:       server,
 		packetConn:   packetConn,
 		queries:      make(chan *extenderDnsQuery, workerCount),
+		ctx:          cancelCtx,
+		cancel:       cancel,
 		sourceStates: map[string]*extenderDnsSource{},
 	}
 	for range workerCount {
 		if !server.beginWorker() {
 			break
 		}
+		self.workers.Add(1)
 		go func() {
+			defer self.workers.Done()
 			defer server.endWorker()
 			connect.HandleError(func() {
 				self.run()
@@ -94,7 +105,7 @@ func newExtenderDnsForwarder(server *ExtenderServer, packetConn net.PacketConn) 
 func (self *extenderDnsForwarder) run() {
 	for {
 		select {
-		case <-self.server.ctx.Done():
+		case <-self.ctx.Done():
 			return
 		case query := <-self.queries:
 			self.resolveQuery(query)
@@ -225,7 +236,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		return
 	}
 
-	forwardCtx := self.server.ctx
+	forwardCtx := self.ctx
 	var forwardCancel context.CancelFunc
 	if 0 < self.server.settings.DnsForwardTimeout {
 		forwardCtx, forwardCancel = context.WithTimeout(forwardCtx, self.server.settings.DnsForwardTimeout)
@@ -323,9 +334,12 @@ func (self *extenderDnsForwarder) forward(
 	return self.dohCache.Forward(ctx, qType, name)
 }
 
-// Releases the forwarder's own resolver. The workers exit with the server
-// context, which CloseAndWait joins.
+// Ends the workers and releases the forwarder's own resolver. Joined, because a
+// carrier that is rebuilt must not leave its workers behind, and a worker may be
+// using the resolver until it has returned.
 func (self *extenderDnsForwarder) close() {
+	self.cancel()
+	self.workers.Wait()
 	self.dohOnce.Do(func() {})
 	if self.dohCache != nil {
 		self.dohCache.Close()

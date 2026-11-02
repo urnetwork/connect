@@ -1178,6 +1178,42 @@ advertised. When the user has chosen the feed-only gossip mode, the role
 runs the server and the feed service without a node and refuses the gossip
 service.
 
+A carrier that has bound and then fails does not end the server, and does not
+touch the other carriers (`connect/extender/extender_carrier.go`). An accept
+error that is a passing condition of the host (file descriptors, memory, a
+connection that went away while it queued, a network error pending on the new
+socket) is waited out on the same listener, 5 ms doubling to 1 s as net/http
+does; if it goes on for 30 s the port is reported lost until its accepts stop
+failing. Anything else that ends a port (a listener that closed, a udp socket
+whose read fails, a panic) is logged at error level with its cause and the port
+is bound again after about 1 s, doubling to 5 minutes with jitter, starting over
+once the carrier has served for 5 minutes. A datagram the dns carrier cannot
+encode or write is lost and nothing more, logged at most once a minute with the
+count since, so one client's address or a path that is down for a moment cannot
+end the socket every client of the carrier shares; only a closed socket ends it.
+`Carriers` and `DnsPorts` say what is serving at each moment, and a probe's
+response, the status and the activation all read them. A first bind that fails
+is still the case above: that udp carrier stays down until the role restarts.
+
+The server itself ends only with `Close` or its context. The role reports its
+tcp carrier: `Listening` is true while it serves, and while it is lost
+`ListenError` carries what ended it, no family reads as activated, and no
+activation is posted (G3, N3). A tcp carrier still lost after the 3 minutes of
+the bind retry, or a server that ended under a running role, which nothing does
+but a bug, makes the role ask the provider for a new one, after a further wait of
+up to a minute with jitter, which doubles to an hour while the replacements do
+not last. The new role is the one this section describes: serving, or off for
+want of tcp 443 and retrying it, with no udp carrier held against the process
+that took the port. A role rebuilds rather than exiting the process: it is the
+spare capacity of a provider that is serving (G1), and a desktop app has no
+supervisor to restart it. connectctl, which exists only to run the extender,
+exits with an error instead (G4). Decided 2026-11-02 from the outage on network
+01979e1c on 2026-11-01: one accept error, one udp carrier's exit or one failed
+write on the dns carrier closed every carrier for the life of the process,
+nothing restarted the server, and the status went on saying listening while the
+activation went on posting for a closed port, about 130 extenders at once, with
+their account's hourly budget spent on the refused probes.
+
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
 key observed revoked in the directory and a network change make every family
@@ -1249,6 +1285,15 @@ first post of a run is refused by the operator is not held for the day; a
 third read that record's newest body alone rather than every address the
 directory keeps for the key.
 
+No family is posted while no required carrier is serving (G2, C2a), which today
+means the tcp carrier: the operator's required test dials it, so a post could only
+be refused, and a post that fails at the probe spends a budget the account's other
+extenders share. A family that comes due meanwhile, by any trigger, holds on its
+backoff with the reason in its status. When the tcp carrier returns
+(`ExtenderActivator.TcpCarrierReturned`) every family that is not activated is due
+at once, whatever its hold says, and a family that stayed activated stays on its
+tick, so a listener that flaps posts nothing.
+
 Every post names the run of the process that sent it (2026-11-02): `run_id`,
 32 lower case hex characters of 128 random bits drawn once when the process
 starts, so every activation of one process carries the same id and a restart
@@ -1281,7 +1326,9 @@ service label and the extender dns name by replacing it, keeping an env
 prefix, takes its whitelist from the api host patterns plus the flags,
 does one synchronous hello at start to seed the root keys, and keeps its
 key at the state directory when no key file is given or runs with an
-ephemeral identity when there is neither.
+ephemeral identity when there is neither. A carrier that is lost is rebuilt as in
+G2, and a server that ended, which it has no role to replace, exits with an error
+for whatever runs it to restart.
 
 G5. Peer pinger (GEOMAP §2.1). The role and connectctl's extender run an
 `ExtenderPeerPinger` over the space's directory, which pings at most
@@ -1997,8 +2044,9 @@ in this order, the first match winning:
 - `active`: at least one family is activated. Green; `Active · IPv4 and
   IPv6`, or the one family; when the other family's last activation
   failed, its reason follows on the same line.
-- `error`, listen: no carrier bound. Red; `Could not listen: ` and the
-  carrier errors.
+- `error`, listen: no carrier bound, or the tcp carrier was lost and is being
+  bound again (G2), when no family reads as activated. Red; `Could not listen: `
+  and the carrier errors.
 - `error`, activation: the last activation failed or was refused and no
   family is active. Red; `Activation refused: ` and the operator's reason,
   or `Activation failed: ` and the error.
@@ -4022,6 +4070,10 @@ with the database.
 | api metrics | `urnetwork_extender_activations_total{stage, outcome, family}`, `urnetwork_extender_activation_step_seconds{step, outcome}` (C2b) |
 | `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
 | sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
+| `extender.ExtenderSettings` | `AcceptRetryMinBackoff`, `AcceptRetryMaxBackoff`, `AcceptDownTimeout`, `CarrierRebuildMinBackoff`, `CarrierRebuildMaxBackoff`, `CarrierRebuildStableTimeout` and `CarriersChangeHandler` added; `ListenErrorHandler` also receives what ended a carrier that was serving (G2) |
+| `extender.ExtenderServer` | `Carriers` and `DnsPorts` read what is serving now, and nothing once it has ended; `Done` added (G2) |
+| `ExtenderActivator` | `TcpCarrierReturned` added; no post without a required carrier (G3) |
+| `sdk.ExtenderProvideStatus` | `Listening` is the tcp carrier serving; `ListenError` also carries what ended it, and no family reads as activated meanwhile (G2, N3) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still

@@ -213,7 +213,9 @@ type ExtenderActivatorSettings struct {
 
 	// The carriers that are listening right now (G2). Only these are offered,
 	// so a carrier whose bind failed is never probed. Nil offers none, which
-	// holds every activation.
+	// holds every activation, as does a list with no carrier the operator can
+	// accept an activation on (C2a): a post then could only spend the operator's
+	// probe budget or be refused (TcpCarrierReturned).
 	Carriers func() []string
 
 	// The dns ports that are listening right now (L2), which is what the
@@ -395,6 +397,9 @@ type ExtenderActivator struct {
 	// set by a network change, taken by the next pass, which then posts every
 	// family
 	forcedActivate bool
+	// set when the tcp carrier comes back, taken by the next pass, which then
+	// posts every family that is not activated
+	tcpCarrierReturned bool
 
 	// this extender's id as the operator's last answer reported it, zero
 	// until one has (lag.dev/PLAN.md N4), and whether the last pass forced this
@@ -601,6 +606,21 @@ func (self *ExtenderActivator) Reactivate() {
 	self.networkChanged()
 }
 
+// Says the tcp carrier is serving again after it was lost (G2): every family
+// that is not activated is due at once, whatever its hold says, and a family
+// that stayed activated is left to its tick. While the carrier was gone nothing
+// was posted and the holds kept doubling, so without this a family whose
+// revocation arrived in the meantime could wait up to the hold's cap with a
+// working listener. A carrier that came back before anything was owed posts
+// nothing, so a flapping listener does not spend the operator's budgets. Safe to
+// call from any goroutine.
+func (self *ExtenderActivator) TcpCarrierReturned() {
+	self.stateLock.Lock()
+	self.tcpCarrierReturned = true
+	self.stateLock.Unlock()
+	self.wakeMonitor.NotifyAll()
+}
+
 // Wakes the loop, which re-activates every family (G3). A path change can move
 // this host's public address.
 func (self *ExtenderActivator) networkChanged() {
@@ -679,6 +699,9 @@ func (self *ExtenderActivator) run() {
 		}
 		if self.takeForcedActivate() {
 			self.scheduleEveryFamily()
+		}
+		if self.takeTcpCarrierReturned() {
+			self.scheduleUnactivatedFamilies()
 		}
 
 		if self.settings.HelloUrl != "" && !now.Before(nextAddressCheckTime) {
@@ -791,6 +814,38 @@ func (self *ExtenderActivator) takeForcedActivate() bool {
 func (self *ExtenderActivator) scheduleEveryFamily() {
 	for _, schedule := range self.schedules {
 		schedule.nextActivateTime = time.Time{}
+	}
+}
+
+// Takes and clears the tcp carrier's return.
+func (self *ExtenderActivator) takeTcpCarrierReturned() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	returned := self.tcpCarrierReturned
+	self.tcpCarrierReturned = false
+	return returned
+}
+
+// Makes the families that are not activated due at once (TcpCarrierReturned).
+// The one schedule of the fallback mode is due unless every family an answer
+// has named stands activated.
+func (self *ExtenderActivator) scheduleUnactivatedFamilies() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.fallback {
+		activated := 0 < len(self.families)
+		for _, family := range self.families {
+			activated = activated && family.Activated
+		}
+		if !activated {
+			self.scheduleEveryFamily()
+		}
+		return
+	}
+	for key, schedule := range self.schedules {
+		if family, ok := self.families[key]; !ok || !family.Activated {
+			schedule.nextActivateTime = time.Time{}
+		}
 	}
 }
 
@@ -1079,8 +1134,8 @@ func (self *ExtenderActivator) activateFamily(
 		// back, so it is skipped rather than refused (G3)
 		return extenderActivateSkipped, false, 0
 	}
-	if len(carriers) == 0 {
-		self.recordFailure(ipVersion, now, "no carrier is listening", false)
+	if message := extenderActivateCarrierFailure(carriers); message != "" {
+		self.recordFailure(ipVersion, now, message, false)
 		return extenderActivateFailed, false, 0
 	}
 	// one request a pass, on the first post that can carry it (C4)
@@ -1090,6 +1145,22 @@ func (self *ExtenderActivator) activateFamily(
 	}
 	outcome, retryAfter = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
 	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
+}
+
+// Why these carriers cannot be offered to the operator, empty when they can
+// (G2, C2a). The operator's required test dials the tcp carrier, or the webrtc
+// carrier once that path lands, so a post with neither could only be refused, and
+// a listener that is down must not keep posting: a post it would fail is a probe
+// of the operator's that an hourly budget pays for, and that budget is its
+// account's other extenders' too.
+func extenderActivateCarrierFailure(carriers []string) string {
+	if len(carriers) == 0 {
+		return "no carrier is listening"
+	}
+	if !slices.Contains(carriers, ExtenderCarrierTcp) && !slices.Contains(carriers, ExtenderCarrierWebRtc) {
+		return "the tcp carrier is not listening"
+	}
+	return ""
 }
 
 // The measurement request a post carries (lag.dev/PLAN.md C4): what the
@@ -1168,8 +1239,8 @@ func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
 		return extenderActivateSkipped, false, 0
 	}
-	if len(carriers) == 0 {
-		self.recordFailure(0, now, "no carrier is listening", false)
+	if message := extenderActivateCarrierFailure(carriers); message != "" {
+		self.recordFailure(0, now, message, false)
 		return extenderActivateFailed, false, 0
 	}
 	measurementCsr := self.measurementCsr()
