@@ -1144,6 +1144,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		connectSettings = &self.clientStrategy.settings.ConnectSettings
 	}
 	spoofDomains, _ := directorySpoofDomains(self.directory)
+	borrowCountryCode := directoryBorrowCountryCode(self.directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		select {
 		case <-self.ctx.Done():
@@ -1157,7 +1158,7 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)
 		if extenderConfig == nil {
 			continue
 		}
@@ -1305,10 +1306,16 @@ func orderedExtenderCarriers(carriers []string) []string {
 // carrier is one dial that races its ports (L2, net_extender_dns_ports.go),
 // so the feed, the probe and the peer pinger try both 53 and 4053 as the
 // strategy does.
+//
+// The tcp config also carries the record's camouflage key and the client's
+// borrow country (borrowCountryCode), so a feed, probe or pinger dial of a
+// Phase B extender authenticates as the strategy's does (EXTENDER-UPDATE2
+// §3.2) rather than being spliced away.
 func extenderFeedConfig(
 	candidate *ExtenderCandidate,
 	connectMode ExtenderConnectMode,
 	spoofDomains []string,
+	borrowCountryCode string,
 ) *ExtenderConfig {
 	profile := ExtenderProfile{
 		ConnectMode: connectMode,
@@ -1333,12 +1340,17 @@ func extenderFeedConfig(
 	if profile.Port <= 0 {
 		return nil
 	}
-	return &ExtenderConfig{
+	extenderConfig := &ExtenderConfig{
 		Profile:   profile,
 		Ip:        candidate.Ip,
 		PublicKey: candidate.PublicKey,
 		DnsPorts:  dnsPorts,
 	}
+	if connectMode == ExtenderConnectModeTcpTls {
+		extenderConfig.RealityPublicKey = candidate.RealityPublicKey
+		extenderConfig.CamouflageCountryCode = borrowCountryCode
+	}
+	return extenderConfig
 }
 
 // The hint (DESIGNNOTES4.md §4).
@@ -1916,12 +1928,13 @@ func probeExtenderCandidate(
 	count = max(1, count)
 	var resultErr error
 	spoofDomains, _ := directorySpoofDomains(directory)
+	borrowCountryCode := directoryBorrowCountryCode(directory)
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
 			continue
 		}
-		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains)
+		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)
 		if extenderConfig == nil {
 			continue
 		}

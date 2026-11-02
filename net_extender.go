@@ -175,6 +175,10 @@ type ExtenderConfig struct {
 	// switch ConnectSettings.TlsClientHelloFingerprint is not "go". Empty, or
 	// an identity-only config, dials the legacy attempt alone.
 	RealityPublicKey []byte
+	// The country the directory places this client in (SpoofCountryCode),
+	// whose borrow list the camouflaged attempt selects its front name from
+	// (EXTENDER-UPDATE2 §3.1). Empty selects from the global list.
+	CamouflageCountryCode string
 	// The ports one dns carrier dial races, in launch order (L2), with
 	// Profile.Port the first of them. A config drawn from a directory or
 	// manual address carries the ports its record lists and then whichever
@@ -605,7 +609,7 @@ func dialExtenderTcp(
 
 	var streamConn net.Conn
 	var response *protocol.ExtenderResponse
-	if frontName := extenderCamouflageFrontName(extenderConfig); extenderCamouflageApplies(connectSettings, extenderConfig) && frontName != "" {
+	if frontName, _ := extenderCamouflageDecision(connectSettings, extenderConfig); frontName != "" {
 		camoDial := func(ctx context.Context, roundTrip *ExtenderRoundTrip) (net.Conn, *protocol.ExtenderResponse, error) {
 			return dialExtenderTcpCamouflageConn(ctx, connectSettings, extenderConfig, frontName, headerBytes, roundTrip)
 		}
@@ -697,6 +701,8 @@ func dialExtenderTcpLegacyConn(
 		serverConn = tlsServerConn
 	}
 
+	// the extender's Date is an authenticated time source only when the leaf
+	// was checked under the record key (B3)
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
@@ -704,6 +710,7 @@ func dialExtenderTcpLegacyConn(
 		serverConn,
 		headerBytes,
 		roundTrip,
+		newExtenderCamouflageTimeSource(extenderConfig, extenderTlsConfig != nil && extenderTlsConfig.VerifyPeerCertificate != nil),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -721,6 +728,12 @@ func dialExtenderTcpLegacyConn(
 // connection is positioned at the first byte after the response; it keeps the
 // buffered reader, which may already hold the first bytes the extender sent
 // after the response. On an error the caller still owns serverConn.
+//
+// timeSource, when set, is the record identity the stream's outer leaf already
+// verified under (B3): the response's Date then corrects the camouflage clock
+// for that extender (net_extender_camouflage_clock.go). A stream not verified
+// before the response — no record key, or the webrtc carrier, whose challenge
+// is checked after it — passes nil.
 func extenderStreamRequest(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -728,14 +741,17 @@ func extenderStreamRequest(
 	serverConn net.Conn,
 	headerBytes []byte,
 	roundTrip *ExtenderRoundTrip,
+	timeSource *extenderCamouflageTimeSource,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
 	request := newExtenderRequest(
 		extenderConfig,
 		headerBytes,
 		io.NopCloser(bytes.NewReader(headerBytes)),
 	)
+	var sendTime time.Time
 	if err := withConnWritePhaseDeadline(ctx, serverConn, connectSettings.ConnectTimeout, func() error {
 		roundTrip.markSend()
+		sendTime = extenderCamouflageLocalNow()
 		return request.Write(serverConn)
 	}); err != nil {
 		return nil, nil, err
@@ -751,6 +767,7 @@ func extenderStreamRequest(
 		if err != nil {
 			return err
 		}
+		timeSource.observe(httpResponse.Header, sendTime, extenderCamouflageLocalNow())
 		headerReader.remaining = -1
 		if httpResponse.StatusCode == http.StatusTooManyRequests {
 			return &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
@@ -898,6 +915,7 @@ func dialExtenderQuic(
 		return nil, nil, err
 	}
 	roundTrip.markSend()
+	sendTime := extenderCamouflageLocalNow()
 	if err := stream.SendRequestHeader(request); err != nil {
 		return nil, nil, err
 	}
@@ -908,6 +926,14 @@ func dialExtenderQuic(
 	if err != nil {
 		return nil, nil, err
 	}
+	// the quic handshake checked the leaf under the record key when the config
+	// carries one (B3), so the extender's Date corrects the camouflage clock
+	// for it; the tcp carrier's camouflaged attempt then seals in its time
+	newExtenderCamouflageTimeSource(extenderConfig, quicTlsConfig.VerifyPeerCertificate != nil).observe(
+		httpResponse.Header,
+		sendTime,
+		extenderCamouflageLocalNow(),
+	)
 	if httpResponse.StatusCode == http.StatusTooManyRequests {
 		return nil, nil, &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
 	}

@@ -348,7 +348,11 @@ type ExtenderCandidate struct {
 	// The identity key of a verified record, empty when unverified. The outer
 	// leaf is checked against it (B3, E5).
 	PublicKey []byte
-	Carriers  []string
+	// The camouflage static key of a verified record (EXTENDER.md P6), empty
+	// when unverified or when the record carries none. The tcp carrier fronts
+	// its camouflaged attempt with it (P8, EXTENDER-UPDATE2 §3.2).
+	RealityPublicKey []byte
+	Carriers         []string
 	// The exchange rendezvous id of the webrtc carrier the record lists
 	// (EXTENDER.md S), zero when the record carries none. Carriers names
 	// the carrier only when the directory has it enabled and the record
@@ -2139,6 +2143,11 @@ func (self *ExtenderDirectory) candidateWithLock(
 	candidate.Verified = true
 	candidate.Expired = self.keyRecordExpiredWithLock(keyRecord, now)
 	candidate.PublicKey = slices.Clone(keyRecord.publicKey)
+	// only a key of the right size, from the root-signed body, so a record
+	// that predates the field or carries a malformed one dials legacy alone
+	if len(body.RealityPublicKey) == extenderRealityX25519PublicKeyByteCount {
+		candidate.RealityPublicKey = slices.Clone(body.RealityPublicKey)
+	}
 	candidate.CountryCode = body.CountryCode
 	candidate.ContinentCode = strings.ToUpper(strings.TrimSpace(body.ContinentCode))
 	candidate.DirectoryTier = int(body.DirectoryTier)
