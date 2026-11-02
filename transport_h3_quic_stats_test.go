@@ -2,11 +2,20 @@ package connect
 
 import (
 	"context"
+	"crypto/tls"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
 	"reflect"
 	"testing"
+	"time"
 
 	quic "github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	h3qlog "github.com/quic-go/quic-go/http3/qlog"
 	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 func TestH3QuicPacketStatsReduceFrameBoundaries(t *testing.T) {
@@ -189,5 +198,131 @@ func TestH3QuicPacketFingerprintStatsAreBoundedAndOwned(t *testing.T) {
 	got.Sent[11] = 99
 	if next := fingerprints.Snapshot(); next.Sent[11] != 2 {
 		t.Fatalf("snapshot mutated retained fingerprints: %+v", next)
+	}
+}
+
+// Accepting the http3 schema arms the qlogger close that can panic in quic-go
+// v0.61.0 (see h3QuicPacketStatsTrace.SupportsSchemas). Every way the stats
+// reach a connection has to decline it, including the send flight's wrapper,
+// which forwards any schema that is not its own.
+func TestH3QuicPacketStatsTraceSupportsOnlyTheQuicSchema(t *testing.T) {
+	stats := &H3QuicPacketStats{}
+	sendFlightConfig := &quic.Config{Tracer: stats.Tracer}
+	installQuicSendFlight(sendFlightConfig)
+	for _, test := range []struct {
+		name  string
+		trace qlogwriter.Trace
+	}{
+		{"stats", stats.Tracer(t.Context(), true, quic.ConnectionID{})},
+		{"handshake attempt", stats.tracerForAttempt(stats.beginHandshakeAttempt())(t.Context(), true, quic.ConnectionID{})},
+		{"send flight over stats", sendFlightConfig.Tracer(t.Context(), true, quic.ConnectionID{})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !test.trace.SupportsSchemas(qlog.EventSchema) {
+				t.Errorf("declined the quic schema %q", qlog.EventSchema)
+			}
+			if test.trace.SupportsSchemas(h3qlog.EventSchema) {
+				t.Errorf("accepted the http3 schema %q", h3qlog.EventSchema)
+			}
+		})
+	}
+}
+
+// The extender carrier is where the stats meet an http3 client. A real dial,
+// closed abruptly with its request stream open, records its transport counts
+// through the production composition and closes one recorder, not two.
+func TestH3QuicPacketStatsRecordAnAbruptlyClosedExtenderQuicDial(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	certPEM, keyPEM, err := selfSign([]string{"127.0.0.1"}, "extender-quic-stats", time.Hour, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{http3.NextProtoH3},
+	}, &quic.Config{MaxIdleTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// as an extender does: take the stream over, send an empty response frame,
+	// then relay until the connection goes away
+	server := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stream := w.(http3.HTTPStreamer).HTTPStream()
+		if _, err := stream.Write([]byte{0, 0, 0, 0}); err != nil {
+			return
+		}
+		io.Copy(stream, stream)
+	})}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.ServeListener(listener) }()
+	defer func() {
+		server.Close()
+		listener.Close()
+		<-serverDone
+	}()
+
+	stats := &H3QuicPacketStats{PacketFingerprints: NewH3QuicPacketFingerprintStats(4096)}
+	settings := DefaultPlatformTransportSettings()
+	settings.H3QuicPacketStats = stats
+	extenderConfig := &ExtenderConfig{Ip: netip.MustParseAddr("127.0.0.1")}
+	extenderConfig.Profile.ConnectMode = ExtenderConnectModeQuic
+	extenderConfig.Profile.Port = listener.Addr().(*net.UDPAddr).Port
+	conn, _, err := dialExtenderQuic(
+		(&PlatformTransport{settings: settings}).dialContext(ctx),
+		DefaultConnectSettings(),
+		extenderConfig,
+		&tls.Config{InsecureSkipVerify: true}, // only this loopback fixture
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload := make([]byte, 64*1024)
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+
+	// quic-go closes its producer as its run loop exits, after Close returns
+	for stats.Snapshot().ClosedConnectionCount == 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("the connection's recorder never closed: %+v", stats.Snapshot())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	// A second producer would close from its own goroutine. On a loaded machine
+	// this can miss it, which only ever passes: the schema test is the deterministic pin.
+	time.Sleep(200 * time.Millisecond)
+
+	got := stats.Snapshot()
+	t.Logf("stats: %+v", got)
+	if got.ConnectionCount != 1 || got.ClosedConnectionCount != 1 {
+		t.Errorf("connections=%d closed=%d, want one of each", got.ConnectionCount, got.ClosedConnectionCount)
+	}
+	if got.SentPacketCount == 0 || got.ReceivedPacketCount == 0 {
+		t.Errorf("sent packets=%d received packets=%d", got.SentPacketCount, got.ReceivedPacketCount)
+	}
+	if got.SentPacketByteCount < uint64(len(payload)) || got.ReceivedPacketByteCount < uint64(len(payload)) {
+		t.Errorf("sent bytes=%d received bytes=%d, want at least the %d each way", got.SentPacketByteCount, got.ReceivedPacketByteCount, len(payload))
+	}
+	fingerprints := stats.PacketFingerprints.Snapshot()
+	if len(fingerprints.Sent) == 0 || len(fingerprints.Received) == 0 {
+		t.Errorf("fingerprints sent=%d received=%d", len(fingerprints.Sent), len(fingerprints.Received))
 	}
 }

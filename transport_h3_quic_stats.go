@@ -335,8 +335,17 @@ func (self *h3QuicPacketStatsTrace) AddProducer() qlogwriter.Recorder {
 	return &h3QuicPacketStatsRecorder{stats: self.stats, attempt: self.attempt}
 }
 
-func (self *h3QuicPacketStatsTrace) SupportsSchemas(string) bool {
-	return true
+// SupportsSchemas answers for quic-go's transport schema only. The recorder
+// reduces transport events, which the connection records on a producer it takes
+// without asking, so http3's own events would add nothing here.
+//
+// Accepting http3's schema also risks the process. http3 then closes its
+// producer from a goroutine that calls qloggerWG.Wait while streams can still
+// call Add (quic-go v0.61.0 http3/conn.go:317), and a connection closed at the
+// wrong moment panics with "WaitGroup is reused before previous Wait has
+// returned" where nothing can recover it. As of v0.64.1 no release has the fix.
+func (self *h3QuicPacketStatsTrace) SupportsSchemas(schema string) bool {
+	return schema == qlog.EventSchema
 }
 
 type h3QuicPacketStatsRecorder struct {
