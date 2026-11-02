@@ -4834,3 +4834,129 @@ R4 and P without rewriting them.
   its one place (`ExtenderAttributeBlockedCanaries`) and blocks no other
   record: blocked state stays per record, and the release keeps the epoch's
   order among the rest.
+
+## Design note: the sdk seed lifecycle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The sdk half of the seed bundle, on the format and bootstrap pass of the two
+seed notes above (`sdk/extender_seed*.go`). A verified open record is extender
+knowledge, so none of this is per account.
+
+- A pass takes its sources in order, cheapest first, and stops at the first that
+  makes a record newly usable: the bundles the build carries, the accepted bundle
+  of each network host in the seed store (`.extender_seeds`, per space), then the
+  mirrors. Whatever is accepted is applied with source `seed`, revocations first,
+  and never adds an address. A sign-out keeps the store; "Reset extenders" clears
+  it. A hosted space runs no pass.
+- Mirrors: the space value `ExtenderSeedMirrors`, at most 8 entries, each an https
+  url and optionally an address to dial in place of resolving the host. That
+  address is the route that needs no dns: tls still verifies the url's host, which
+  is also the sni. An entry names one address, so a dual-stack mirror is two
+  entries with one url. A mirror is contacted directly, never through an extender.
+  With none configured a space takes the bundled table for its host, which is empty
+  until the owner decides what it names. A reset keeps them, since they are not
+  something the user learned.
+- Import: `ImportExtenderSeed`, `ImportExtenderSeedData`, `ImportExtenderSeedFile`
+  and the view controller's `ImportSeed*` take `ur-seed:1:` text or the raw
+  envelope and judge it as a fetched bundle, answering with a typed error id. It
+  stays separate from the K7 share: a seed has no settings to confirm, and a seed
+  for another network is refused rather than taken with its settings.
+- Embedded bundle: `res/extender_seed.txt`, empty by default, holds `ur-seed:1:`
+  lines and `min-sequence <host> <sequence>` floors. Being in the binary earns a
+  bundle nothing: it is judged like any other, and a release past its validity
+  reports `expired` on the seed status instead of using it. Bundles are added at
+  release time and not committed, since an old one only reports a failure.
+- Trigger and wake: a pass runs for the release fetch's walk of the control
+  reaches, and for the space's own trigger. Once the network client's first
+  attempt leaves nothing usable, the trigger asks the control route, runs a pass
+  only if it does not answer, and when the pass made something usable asks again
+  through it and calls `requestExtenderRelease`. A pass or an import that makes
+  something usable calls `ExtenderNetworkClient.Wake`, which rearms the hello and
+  hint backoffs and runs a client pass at once. An account change or a path change
+  cancels a pass in flight. Nothing it applied is undone.
+- Timings: a whole pass 60 s; one ask of the control route 20 s; one attempt at one
+  mirror 15 s. After a pass that made nothing usable the mirrors and the trigger
+  back off from 1 min, doubling to 1 h, and a path change or a pass that makes
+  something usable starts that over. After the control route answered with nothing
+  usable, the trigger asks again in 15 min. While something is usable it looks again
+  every 30 s, which is how it notices every usable address going on hold.
+- The `LowWaterCount` caveat: a woken network client still runs its dns bootstrap
+  first while the directory is below `LowWaterCount` (4). With dns black-holed and a
+  seed of fewer than four usable records, the feed sample of the seed's records can
+  wait out `HelloTimeout` (30 s). The trigger's own ask through the strategy does not
+  wait on it, so control reach and the release request land first.
+
+## Design note: the block report sender (EXTENDER-UPDATE2 §1.3, 2026-11-02)
+
+R4 and the outage rule of the note above gave the operator its half of the blocked
+state. No client sent reports, so the policy could not fire. This adds the sender:
+the rule in connect (`net_extender_directory_gated_block.go`), the pace and the
+report in the sdk (`extender_block_report.go`). No wire change, and no new exported
+sdk api.
+
+- The rule. A record is reported only when all of these hold:
+  - A real dial of its verified record failed, which arms it as a suspect and
+    counts for nothing else. The record is one the client was released or that its
+    connection path drew, current under the root keys in force, and not revoked,
+    expired, manual or the extender's own.
+  - Three attempts failed, at least 30 min apart, so at least an hour from first to
+    last. An attempt dials every carrier the record offers on every address it names
+    in the families the client dials now, with the budget of the operator's own
+    probe (15 s a dial).
+  - The control route (`/hello` through the strategy) answered before each attempt,
+    or nothing is dialed, and after it, or it does not count.
+  - All of it on one network path. A path change drops every suspect, ends a pass in
+    flight and holds the next attempt for a minute.
+  - Nothing answered meanwhile: a success or a 429 from any address on any carrier,
+    from an attempt or any other dial, drops the suspect.
+  - The last attempt is within 30 min, and the failure that armed it within 6 h.
+- Carriers. A report names none, and the operator's probe dials tcp alone. No field
+  was added. Since an attempt tries every carrier, tcp first, and a record with no
+  tcp carrier on an address of the client's families is never judged, a report means
+  every carrier failed, including the one the operator can compare. A failure of one
+  carrier is never read as a block, and a carrier field would add nothing the probe
+  could check.
+- Why attempts and not the dials a client makes anyway. After a gated record fails the
+  policy falls back to an open record, and with a dialer that delivers the strategy
+  does not expand again, so the record sits on hold and may not be dialed again that
+  hour. The probe pass stops once its window is full. A dial of the strategy also
+  fails for reasons past the extender (an inner request, a hedged deadline), and the
+  probe dial does not: it is answered by the extender itself. A natural failure is
+  what says a record is worth checking. An attempt is a latency probe with no
+  attestor, so it identifies no client, and it only re-dials an address this client
+  already dialed.
+- What it leaves alone. An attempt never calls `RecordFailure` or `RecordSuccess`, so
+  no hold, count, removal, order or policy mode moves, and a report changes nothing
+  in the directory. Evidence is per process and never stored: a restart starts over,
+  which takes another hour, so the hourly limit needs no store.
+- Bounds. One sender loop per space does one thing at a time. At most one attempt
+  pass per 30 min, of at most 3 records, gated first then the oldest; at most 16
+  suspects. A control route that does not answer holds the next pass from 5 min,
+  doubling to 1 h. At most 4 reports an hour per identity, 60 s apart; a report with
+  no answer backs off from 5 min to 30 min, while its evidence stays fresh; a
+  refusal waits out the hour. A record reported is left alone for a day, and one that
+  answered for 6 h. A client with nothing failing makes no extra dial or request.
+- Controls. Off by default, under the same cohort control as the gated preference
+  (`NetworkSpaceValues.ExtenderGatedPreference`), since a released record is what
+  gives a report its use and a new value would be new exported api. A hosted space
+  builds no sender, and a read-only extender store binds no identity. An account
+  change, through `extenderAccountMonitor`, cancels what is in flight, discards its
+  answer and forgets every suspect, quiet record and draw. Nothing logs an address,
+  key, id or token, the counts are over fixed label sets, and `ExtenderStatus` gains
+  nothing.
+- Release backoff. `requestExtenderRelease`, called once the seed bootstrap or an
+  import has established reach, now clears the failure backoff of the release fetch,
+  and starts a new run of failures with a walk of its own. It keeps the hourly cap,
+  the 60 s spacing and every wait an answer asked for. Before this, a recovery that
+  followed a failed walk waited out the backoff, up to 30 min. A request already out
+  when reach was established, or in its walk, coalesces the call. If it then fails,
+  it failed on the route before the reach, so the next request goes at once, as after
+  the fetch's own walk, within the hourly cap.
+- Tests: `net_extender_directory_gated_block_test.go` pins the rule against a fake
+  clock and a fake dial. `extender_block_report_test.go` (sdk) pins the timeline,
+  bounds, cancellation and logs, and `extender_block_report_routes_test.go` runs it
+  on a real client strategy, a real extender and the real probe: an extender that
+  answers is never reported, and one that answers with another identity is.
+  `extender_release_backoff_test.go` pins the backoff, failing first.
+- Known limit. The server counts distinct `client_id`s, so three devices behind one
+  firewall can block a record for their whole country until the reports age out
+  (24 h). That is the operator's rule and it is unchanged here.
