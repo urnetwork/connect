@@ -381,7 +381,9 @@ func NewExtenderSeedAcceptor(store ExtenderSeedStore, settings *ExtenderSeedAcce
 // The states of the store, with every void state (above) removed under
 // `rootKeys`. `changed` is whether what was loaded differs from what is
 // returned -- a void or inconsistent entry dropped, or a document that was not
-// readable -- so a caller that saves anyway writes the cleaned document.
+// readable -- so a caller that saves anyway writes the cleaned document. An
+// empty key set is the unconfigured state of a space (SetRootKeys) and judges
+// nothing: no floor is dropped for want of keys.
 func (self *ExtenderSeedAcceptor) loadWithLock(rootKeys *ExtenderRootKeySet) (map[string]*ExtenderSeedState, bool, error) {
 	documentBytes, err := self.store.Load()
 	if err != nil {
@@ -389,6 +391,9 @@ func (self *ExtenderSeedAcceptor) loadWithLock(rootKeys *ExtenderRootKeySet) (ma
 	}
 	states, consistent := decodeExtenderSeedStoreDocument(documentBytes)
 	changed := !consistent
+	if rootKeys == nil || rootKeys.Len() == 0 {
+		return states, changed, nil
+	}
 	for networkHost, state := range states {
 		if !extenderSeedStateBinds(state, rootKeys) {
 			delete(states, networkHost)
@@ -409,12 +414,9 @@ func (self *ExtenderSeedAcceptor) saveWithLock(states map[string]*ExtenderSeedSt
 	return nil
 }
 
-// Whether a state's floor binds under `rootKeys`: its envelope signature
-// verifies under a key in force. Freshness plays no part.
+// Whether a state's floor binds under a non-empty `rootKeys`: its envelope
+// signature verifies under a key in force. Freshness plays no part.
 func extenderSeedStateBinds(state *ExtenderSeedState, rootKeys *ExtenderRootKeySet) bool {
-	if rootKeys == nil || rootKeys.Len() == 0 {
-		return false
-	}
 	envelope, err := ParseExtenderSeedEnvelope(state.Envelope)
 	if err != nil {
 		return false
@@ -581,7 +583,8 @@ func (self *ExtenderSeedAcceptor) Stored(
 // Judges every space's floor under `rootKeys` and drops and saves those that
 // are void (above), returning how many were dropped. The owner calls it when
 // the root keys change; every other operation applies the same rule to what it
-// reads, so a missed call never lets a void floor bind.
+// reads, so a missed call never lets a void floor bind. An empty key set judges
+// nothing and drops nothing.
 func (self *ExtenderSeedAcceptor) Revalidate(rootKeys *ExtenderRootKeySet) (int, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -592,10 +595,12 @@ func (self *ExtenderSeedAcceptor) Revalidate(rootKeys *ExtenderRootKeySet) (int,
 	}
 	states, consistent := decodeExtenderSeedStoreDocument(documentBytes)
 	droppedCount := 0
-	for networkHost, state := range states {
-		if !extenderSeedStateBinds(state, rootKeys) {
-			delete(states, networkHost)
-			droppedCount += 1
+	if rootKeys != nil && 0 < rootKeys.Len() {
+		for networkHost, state := range states {
+			if !extenderSeedStateBinds(state, rootKeys) {
+				delete(states, networkHost)
+				droppedCount += 1
+			}
 		}
 	}
 	if 0 < droppedCount || !consistent {
