@@ -79,6 +79,7 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		},
 
 		HeaderTimeout:               10 * time.Second,
+		ForwardDialTimeout:          5 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
 		QuicVersionPolicy:           connect.QuicVersionPolicyPreferV2,
 		MaxConnectionCountPerSource: 64,
@@ -149,6 +150,20 @@ type ExtenderSettings struct {
 	// connection (A9). A client that opens a connection and says nothing is
 	// dropped here.
 	HeaderTimeout time.Duration
+	// Budget of one forward dial, stream or datagram: resolving the
+	// destination and connecting to it on the client's family (A7, A9).
+	// Without it a dial was bounded only by its dialer, and the default
+	// dialer has no timeout. A healthy dial to an operator host takes well
+	// under a second, and 5 s allows two lost SYNs, which Linux resends at
+	// 1 s and 3 s, or a slow resolver. It is half of the operator's 10 s
+	// activation probe budget (C2), which the tcp challenge, the outer
+	// handshake of the forward, this dial, the inner tls and the `GET /hello`
+	// all share: a dial that cannot connect fails here, reaches ErrorHandler
+	// as "forward dial", and closes the stream while the probe still has
+	// budget left to see it close, rather than leaving the probe to wait out
+	// its budget with nothing on either side to say why. <= 0 leaves the dial
+	// to its connection's context.
+	ForwardDialTimeout time.Duration
 	// Idle quic connections close after this (A9).
 	QuicIdleTimeout time.Duration
 	// The QUIC versions the udp and dns carriers accept, and the NLayer hop
@@ -1568,6 +1583,17 @@ func (self *ExtenderServer) RealityPublicKey() []byte {
 }
 
 // Connection errors are observable only when a caller installs the test seam.
+// The ErrorHandler stages of a forward dial that failed (A7): the stream
+// forward's and the datagram relay's. Each is the dial to the destination a
+// client asked for, which the whitelist confines to the operator's hosts
+// (A5), so its error names an operator host and never a client. An embedder
+// that logs forward dial failures matches on these; the other stage names
+// are diagnostics that may change.
+const (
+	ExtenderErrorStageForwardDial         = "forward dial"
+	ExtenderErrorStageDatagramForwardDial = "datagram forward dial"
+)
+
 func (self *ExtenderServer) reportError(stage string, err error) {
 	if self.settings.ErrorHandler != nil {
 		self.settings.ErrorHandler(stage, err)
@@ -1845,7 +1871,9 @@ func (self *ExtenderServer) dialForward(
 	clientAddress string,
 	header *protocol.ExtenderHeader,
 ) (net.Conn, error) {
-	forwardConn, err := self.dialContext()(ctx, forwardNetwork(clientAddress), net.JoinHostPort(
+	dialCtx, dialCancel := self.forwardDialContext(ctx)
+	defer dialCancel()
+	forwardConn, err := self.dialContext()(dialCtx, forwardNetwork(clientAddress), net.JoinHostPort(
 		header.DestinationHost,
 		fmt.Sprintf("%d", header.DestinationPort),
 	))
@@ -1855,15 +1883,26 @@ func (self *ExtenderServer) dialForward(
 		if forwardConn != nil {
 			forwardConn.Close()
 		}
-		self.reportError("forward dial", err)
+		self.reportError(ExtenderErrorStageForwardDial, err)
 		return nil, err
 	}
 	if forwardConn == nil {
 		err = fmt.Errorf("forward dial returned nil connection")
-		self.reportError("forward dial", err)
+		self.reportError(ExtenderErrorStageForwardDial, err)
 		return nil, err
 	}
 	return forwardConn, nil
+}
+
+// The context of one forward dial, stream or datagram: the connection's,
+// bounded by ForwardDialTimeout (A7, A9). The bound is the dial's alone; a
+// connection the dial returns outlives it, as a dialer's connection outlives
+// its dial context.
+func (self *ExtenderServer) forwardDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if 0 < self.settings.ForwardDialTimeout {
+		return context.WithTimeout(ctx, self.settings.ForwardDialTimeout)
+	}
+	return context.WithCancel(ctx)
 }
 
 // The egress of this extender: the configured seam, or the forward dialer.
