@@ -47,6 +47,21 @@ func newTestPeerAttestor(t *testing.T) (*connect.ExtenderProbeAttestor, ed25519.
 	return connect.NewExtenderProbeExtenderAttestor(publicKey, connect.NewExtenderPeerProbeSigner(privateKey)), publicKey, privateKey
 }
 
+// The attestor with a signature that takes this long. A claim is measured before
+// it is signed, so the frame reaches the extender at least this long after its
+// response with the claim already fixed. A busy machine does that now and then;
+// a test that holds the signature does it every run. It is a wait because the
+// elapsed interval itself is what the gate reads.
+func newTestHeldAttestor(attestor *connect.ExtenderProbeAttestor, signHold time.Duration) *connect.ExtenderProbeAttestor {
+	sign := attestor.Sign
+	heldAttestor := *attestor
+	heldAttestor.Sign = func(data []byte) []byte {
+		time.Sleep(signHold)
+		return sign(data)
+	}
+	return &heldAttestor
+}
+
 // The peer verifier of a fixture: the keys it vouches for, and every key it
 // was asked about.
 type testPeerVerifier struct {
@@ -224,9 +239,11 @@ func TestProbeExtenderLatencyCosignsForAProvider(t *testing.T) {
 }
 
 // A peer extender the verifier vouches for is co-signed on every carrier, and
-// the verifier is asked about exactly its key.
+// the verifier is asked about exactly its key. This is about who the pinger is, so
+// a frame later than the default tolerance changes nothing.
 func TestProbeExtenderLatencyCosignsAnActivePeer(t *testing.T) {
-	attestor, pingerPublicKey, _ := newTestPeerAttestor(t)
+	activeAttestor, pingerPublicKey, _ := newTestPeerAttestor(t)
+	attestor := newTestHeldAttestor(activeAttestor, 250*time.Millisecond)
 	verifier := &testPeerVerifier{active: [][]byte{pingerPublicKey}}
 	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
 		settings.ProbePeerVerifier = verifier.verify
@@ -419,12 +436,97 @@ func writeTestAttestation(t *testing.T, conn net.Conn, attestation *protocol.Ext
 	}
 }
 
-// The gate (DESIGNNOTES4.md §3, GEOMAP §2.4) for both kinds of pinger: a
-// claim below what the extender observed is refused, one above accepted; a
-// claim that does not echo this probe's nonce, name this extender, name the
-// pinger the header named, or carry a signature the extender can check is
-// refused whatever it says -- and every one of them is answered with its
-// reason.
+// The rtt check of the gate at its exact bound, for both kinds of pinger, on the
+// interval it is handed: a claim may fall short of the interval by the tolerance
+// and by nothing more. No scheduler has a say in any of these, where an interval
+// measured over a socket would have one.
+func TestExtenderProbeGateJudgesTheIntervalItIsHanded(t *testing.T) {
+	const tolerance = 20 * time.Millisecond
+	provider, _ := newTestProviderAttestor(t)
+	peer, peerPublicKey, _ := newTestPeerAttestor(t)
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		settings.ProbeRttTolerance = tolerance
+		settings.ProbePeerVerifier = (&testPeerVerifier{active: [][]byte{peerPublicKey}}).verify
+	})
+	nonce, err := connect.NewExtenderProbeNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name     string
+		rttMs    uint32
+		observed time.Duration
+		reason   uint32
+	}{
+		{name: "equal to the interval", rttMs: 100, observed: 100 * time.Millisecond, reason: connect.ExtenderProbeVerdictReasonOk},
+		{name: "above the interval", rttMs: 5000, observed: 100 * time.Millisecond, reason: connect.ExtenderProbeVerdictReasonOk},
+		{name: "short by the tolerance", rttMs: 100, observed: 100*time.Millisecond + tolerance, reason: connect.ExtenderProbeVerdictReasonOk},
+		{name: "short by past the tolerance", rttMs: 100, observed: 100*time.Millisecond + tolerance + time.Nanosecond, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved},
+		{name: "no claim within the tolerance", rttMs: 0, observed: tolerance, reason: connect.ExtenderProbeVerdictReasonOk},
+		{name: "no claim past the tolerance", rttMs: 0, observed: tolerance + time.Nanosecond, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved},
+		{name: "deflated", rttMs: 1, observed: 150 * time.Millisecond, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved},
+	} {
+		for _, attestor := range []*connect.ExtenderProbeAttestor{provider, peer} {
+			probe := &extenderProbe{nonce: nonce}
+			attestation := &protocol.ExtenderProbeAttestation{
+				ExtenderPublicKey: publicKey,
+				ProbeNonce:        nonce,
+				RttMs:             c.rttMs,
+				TimestampMs:       uint64(time.Now().UnixMilli()),
+			}
+			switch attestor.Kind() {
+			case connect.ExtenderPingerKindProvider:
+				probe.clientId = attestor.ClientId.Bytes()
+				attestation.ProbeClientId = attestor.ClientId.Bytes()
+			case connect.ExtenderPingerKindExtender:
+				probe.pingerPublicKey = slices.Clone(attestor.ExtenderPublicKey)
+				attestation.PingerExtenderPublicKey = slices.Clone(attestor.ExtenderPublicKey)
+			}
+			if err := connect.SignExtenderProbeAttestation(attestor, attestation); err != nil {
+				t.Fatal(err)
+			}
+			reason, err := fixture.server.gateProbeAttestation(probe, attestation, c.observed)
+			if reason != c.reason || (err == nil) != (c.reason == connect.ExtenderProbeVerdictReasonOk) {
+				t.Fatalf("%s, %s: reason %d (%v), expected %d", c.name, attestor.Kind(), reason, err, c.reason)
+			}
+		}
+	}
+}
+
+// A claim as a pinger measures it passes the check at its default tolerance, on
+// every carrier. The extender's header handling is inside the round trip the pinger
+// measures and outside the interval the gate observes, so holding it puts the claim
+// that far ahead of the interval: only a stall longer than the hold, between the
+// response and the frame, could still refuse it.
+func TestExtenderProbeGateAcceptsAMeasuredClaim(t *testing.T) {
+	const headerHold = 1 * time.Second
+	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		settings.ProbeRttTolerance = DefaultExtenderSettings().ProbeRttTolerance
+		settings.HeaderHandler = func(*protocol.ExtenderHeader) {
+			time.Sleep(headerHold)
+		}
+		// every carrier probes from the one loopback source
+		settings.ProbeMaxRatePerSource = 0
+	})
+	attestor, _ := newTestProviderAttestor(t)
+	for _, carrier := range testProbeCarriers {
+		probe := probeTestFixture(t, fixture, carrier, publicKey, attestor)
+		if !probe.Attested || probe.Attestation.RttMs < uint32(headerHold/time.Millisecond) {
+			t.Fatalf("%s: attested %t, the claim %v does not include the extender's handling", carrier, probe.Attested, probe.Attestation)
+		}
+		if probe.Outcome != connect.ExtenderPingCosigned {
+			t.Fatalf("%s: outcome %q: %v / %v / %v", carrier, probe.Outcome, probe.AttestErr, probe.VerdictErr, probe.Verdict)
+		}
+	}
+}
+
+// The gate (DESIGNNOTES4.md §3, GEOMAP §2.4) over a real stream for both kinds of
+// pinger: a claim held well below what the extender observes is refused, one far
+// above it accepted, whatever the scheduler does to the stream between them; a
+// claim that does not echo this probe's nonce, name this extender, name the pinger
+// the header named, or carry a signature the extender can check is refused whatever
+// it says -- and every one of them is answered with its reason. The check's exact
+// bound is TestExtenderProbeGateJudgesTheIntervalItIsHanded.
 func TestExtenderProbeGate(t *testing.T) {
 	peerAttestor, peerPublicKey, _ := newTestPeerAttestor(t)
 	otherPeerAttestor, otherPeerPublicKey, _ := newTestPeerAttestor(t)
@@ -470,9 +572,7 @@ func TestExtenderProbeGate(t *testing.T) {
 		message     string
 	}{
 		{name: "provider deflated", attestor: provider, hold: 150 * time.Millisecond, rttMs: 1, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
-		{name: "provider just under the tolerance", attestor: provider, hold: 150 * time.Millisecond, rttMs: 100, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
-		{name: "provider honest", attestor: provider, hold: 100 * time.Millisecond, rttMs: 100},
-		{name: "provider inflated", attestor: provider, rttMs: 5000},
+		{name: "provider inflated", attestor: provider, rttMs: 60 * 1000},
 		{name: "provider another nonce", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonNonce, message: "nonce", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
 			nonce, _ := connect.NewExtenderProbeNonce()
 			a.ProbeNonce = nonce
@@ -489,8 +589,7 @@ func TestExtenderProbeGate(t *testing.T) {
 		{name: "provider no signature", attestor: provider, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonBadSignature, message: "signature", mutateAfter: func(a *protocol.ExtenderProbeAttestation) {
 			a.Signature = nil
 		}},
-		{name: "peer honest", attestor: peerAttestor, rttMs: 100},
-		{name: "peer inflated", attestor: peerAttestor, rttMs: 5000},
+		{name: "peer inflated", attestor: peerAttestor, rttMs: 60 * 1000},
 		{name: "peer deflated", attestor: peerAttestor, hold: 150 * time.Millisecond, rttMs: 1, reason: connect.ExtenderProbeVerdictReasonRttBelowObserved, message: "below the observed"},
 		{name: "peer another nonce", attestor: peerAttestor, rttMs: 5000, reason: connect.ExtenderProbeVerdictReasonNonce, message: "nonce", mutate: func(a *protocol.ExtenderProbeAttestation) {
 			nonce, _ := connect.NewExtenderProbeNonce()
@@ -620,6 +719,8 @@ func TestExtenderProbeAttestationTimeout(t *testing.T) {
 // nothing, and it keeps serving.
 func TestExtenderProbeOldProviderClosesFirst(t *testing.T) {
 	fixture, publicKey, _ := newTestProbeFixture(t, func(settings *ExtenderSettings) {
+		// a deflated claim below has to be refused, which a fixture's gate would not do
+		settings.ProbeRttTolerance = 20 * time.Millisecond
 		// every case probes from the one loopback source
 		settings.ProbeMaxRatePerSource = 0
 	})
@@ -674,10 +775,24 @@ func TestExtenderProbeOldProviderClosesFirst(t *testing.T) {
 		}
 		// the extender serves the next probe as if nothing happened, and the
 		// stages it reported are the gate's and, at most, the write of a
-		// verdict nobody read
-		probe := probeTestFixture(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor)
-		if probe.Outcome != connect.ExtenderPingCosigned {
-			t.Fatalf("%s: the next probe came to %q", c.name, probe.Outcome)
+		// verdict nobody read. The next claim is far above any interval, so what
+		// is judged here is the extender and not how busy this machine is
+		nextConn, nextNonce, closeNextProbe := dialTestAttestingProbe(t, fixture, connect.ExtenderCarrierTcp, publicKey, attestor.ClientId.Bytes(), nil)
+		nextAttestation := &protocol.ExtenderProbeAttestation{
+			ProbeClientId:     attestor.ClientId.Bytes(),
+			ExtenderPublicKey: publicKey,
+			ProbeNonce:        nextNonce,
+			RttMs:             60 * 1000,
+			TimestampMs:       uint64(time.Now().UnixMilli()),
+		}
+		if err := connect.SignExtenderProbeAttestation(attestor, nextAttestation); err != nil {
+			t.Fatal(err)
+		}
+		writeTestAttestation(t, nextConn, nextAttestation)
+		nextVerdict := readTestVerdict(t, nextConn)
+		closeNextProbe()
+		if !connect.VerifyExtenderProbeVerdict(publicKey, nextAttestation, nextVerdict) {
+			t.Fatalf("%s: the next probe came to %v", c.name, nextVerdict)
 		}
 		for _, err := range drainFixtureErrors(fixture) {
 			switch {

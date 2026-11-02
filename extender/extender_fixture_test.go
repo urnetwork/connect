@@ -424,6 +424,12 @@ func newExtenderFixtureWithSetup(
 	settings.ProxyTlsConfig = &tls.Config{
 		RootCAs: dest.rootCas,
 	}
+	// The probe gate's rtt check compares two separate round trips of this
+	// machine, and on a busy one either can wait out the scheduler while the other
+	// does not, by more than any tolerance. A fixture's gate takes any claim; a test
+	// of the check sets the tolerance it judges against.
+	settings.ProbeRttTolerance = 24 * time.Hour
+	settings.ProbeAttestationTimeout = 60 * time.Second
 	settings.Listen = func(network string, address string) (net.Listener, error) {
 		if address != fmt.Sprintf(":%d", fixture.tcpPort) {
 			return nil, fmt.Errorf("unexpected extender listen %s %s", network, address)
