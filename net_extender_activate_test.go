@@ -711,10 +711,16 @@ func TestExtenderActivatorSkipsEmptyAndUnsupportedFamilies(t *testing.T) {
 // advancing between the wake and the post would stamp the next time instead of
 // the one under test.
 func TestExtenderActivatorBacksOffOnRefusal(t *testing.T) {
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
-		settings.ApiUrlV6 = ""
-	})
-	fixture.operator.setRefusal("the tcp carrier did not answer")
+	// refused from before the loop starts, so its first post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrlV6 = ""
+		},
+	)
 	startTime := fixture.clock.Now()
 
 	fixture.waitPass()
@@ -809,8 +815,14 @@ func TestExtenderActivatorBacksOffOnRefusal(t *testing.T) {
 // ipv6 failed everywhere spent its ipv4 activation budget again on every
 // retry, reissuing records it already held.
 func TestExtenderActivatorRetriesOnlyTheFamilyThatFailed(t *testing.T) {
-	fixture := newTestActivatorFixture(t, nil)
-	fixture.operator.setIpVersionRefusal(6, "the tcp carrier did not answer")
+	// refused from before the loop starts, so the first ipv6 post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setIpVersionRefusal(6, "the tcp carrier did not answer")
+		},
+		nil,
+	)
 	startTime := fixture.clock.Now()
 
 	fixture.waitPass()
@@ -1197,12 +1209,18 @@ func TestExtenderActivatorUsesThePlainApiUrl(t *testing.T) {
 // in the status: it is held under the placeholder family until an answer names
 // one (C2, F3).
 func TestExtenderActivatorRecordsAPlainApiUrlRefusal(t *testing.T) {
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
-		settings.ApiUrl = settings.ApiUrlV4
-		settings.ApiUrlV4 = ""
-		settings.ApiUrlV6 = ""
-	})
-	fixture.operator.setRefusal("the tcp carrier did not answer")
+	// refused from before the loop starts, so its first post is refused
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setRefusal("the tcp carrier did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.ApiUrl = settings.ApiUrlV4
+			settings.ApiUrlV4 = ""
+			settings.ApiUrlV6 = ""
+		},
+	)
 
 	fixture.waitPass()
 	fixture.waitPost()
