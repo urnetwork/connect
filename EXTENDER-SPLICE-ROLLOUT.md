@@ -136,3 +136,33 @@ no metrics export from client or extender to the server today. Fleet telemetry
 and the per-target aggregate load (gate 7) need a reporting path added before
 Phase B can be judged against the numeric gates. This is operational work, not
 in this slice.
+
+## Operator probes in Phase B (added 2026-11-02)
+
+A Phase B extender splices every unauthenticated tcp hello to its borrowed site,
+the operator's own probes included. A probe that dials the legacy hello alone
+fails the B3 leaf check, so the extender's activation is refused and its uptime
+probe fails, and it drops out of the directory. Before any cohort enters Phase
+B, confirm all of these:
+
+1. The operator runs the camouflage-key probes:
+   `connect.ProbeExtenderCarrierWithCamouflageKey` and
+   `connect.ProbeExtenderForwardWithCamouflageKey`. Server 14b uses them, with
+   the posted key for the activation probe and the stored key for the uptime
+   probe.
+2. The api and taskworker builds carry the measured borrow list. The probe's
+   camouflaged attempt fronts a name of the operator's bundled global list, and
+   with no list the probe is legacy alone.
+3. Each cohort extender's record carries its `RealityPublicKey`. The uptime
+   probe can only use a key the operator stored.
+
+In Phase A the key changes nothing a probe proves. A wrong key still passes
+over the legacy attempt, so a passing Phase A activation is not proof that the
+extender holds its camouflage key. In Phase B only the extender's own key
+passes.
+
+## Splice posture semantics (added 2026-11-02)
+
+`ExtenderCamouflageSplice` is the posture until `SetCamouflageSplice` sets one.
+After that, the run-time value wins over the setting, so a rollback through
+`SetCamouflageSplice(false)` holds even if the setting still says on.
