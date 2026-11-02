@@ -2,9 +2,9 @@
 
 For peer review. Written 2026-11-01.
 
-**Under review:** branch `lagdev/activator-per-family`, commits `fbf99636` ("Give each extender family its own activation schedule") and `5037a818` ("Hold a private family for the day only until it first activates"), which fixes what review found (§4, Review). It is cut from connect main `f7741e6d` and not merged. EXTENDER.md G3 is the normative text. This document explains why it changed and what Main showed.
+**Under review:** branch `lagdev/activator-per-family`, commits `fbf99636` ("Give each extender family its own activation schedule"), `5037a818` ("Hold a private family for the day only until it first activates"), which fixes what review found, and `5f28f120` ("Count a family as activated when the directory holds its own record"), which the re-review asked for (§4, Review). It is cut from connect main `f7741e6d` and not merged. EXTENDER.md G3 is the normative text. This document explains why it changed and what Main showed.
 
-**Already decided:** the owner agreed, 2026-11-01, that a family whose only addresses are private, behind a NAT that never forwards, still gets one post at start and one a day (§4.2). After review that applies only until the family first activates.
+**Already decided:** the owner agreed, 2026-11-01, that a family whose only addresses are private, behind a NAT that never forwards, still gets one post at start and one a day (§4.2). After review that applies only while the family hasn't activated, in this run or, as far as the directory's own record shows, before it.
 
 **Not decided:** everything in §5, and the questions in §6.
 
@@ -44,7 +44,7 @@ The defaults are in `DefaultExtenderActivatorSettings` (l.273).
 
 **The address check** is one hello to the plain dual-stack api url (`hello`, l.841). It compares the caller address the operator saw, by address and not port, with the last one.
 
-**The measurement request** for lag.dev's certificate rides the first post of a pass that can carry it (lag.dev/PLAN.md C4, `followMeasurementCsr`, l.1032).
+**The measurement request** for lag.dev's certificate rides the first post of a pass that can carry it (lag.dev/PLAN.md C4, `followMeasurementCsr`, l.1063).
 
 **Sleep:** the tick, the hourly check and the backoff count time the host slept. A minute after waking from 15 minutes or more of sleep, whatever came due is due.
 
@@ -127,74 +127,85 @@ The hello goes to the plain dual-stack url, so it arrives over v4 one hour and v
 - **The probe count:** an activation resets `consecutive_probe_failures`. So an extender that restarts more often than every 30 min is never deactivated, however long it stalls between restarts.
 - **Country:** for the 39 extenders whose families geolocate to different countries, the stored `country_code` is the family that posted last, which in practice is v6, since v6 posts second. lag.dev's place fix (server branch `lagdev/extender-place`) stops lag.dev depending on it. The column itself is unchanged.
 
-## 4. The fix under review: `lagdev/activator-per-family` (`fbf99636`, `5037a818`)
+## 4. The fix under review: `lagdev/activator-per-family` (`fbf99636`, `5037a818`, `5f28f120`)
 
 **Review (2026-11-01).** An independent review of `fbf99636` found three problems. All three are fixed in `5037a818`, with tests (§4.3); the five tests that cover them fail on `fbf99636`.
 1. **One refusal held a private family for 24 h.** It applied to any refusal of a family whose addresses are all private. That includes docker bridges, pods and cloud VMs reached through a 1:1 NAT, not only home routers, and most refusals aren't a NAT's: the operator's rate budget, its configuration or store, a probe flake, the re-post after a revocation. A v4-only private extender whose re-post after a revocation was refused once went unposted for a day, where the old loop retried in 10 min. **Fixed:** only a private family that hasn't activated since start waits for the tick; once it has activated, its refusals use the backoff. An interface table that can't be read counts as public for this.
 2. **The per-family hello memory went stale.** The address the last check saw on a family stayed "unchanged" after an activation moved the family's published address. So a host whose v4 moved on a network change, whose checks then came over v6, and whose v4 egress returned to the old address kept a record naming the other one until the tick. **Fixed:** an activation that moves a family's published address forgets that family's last check.
 3. **The no-address hold doubled.** A family with no global address was looked at again on a hold that doubled to 6 h, and that hold carried into its first refusal once it had an address. **Fixed:** it's looked at every 10 min without doubling, and its first failure holds 10 min, so "posted within 10 min" holds however long the address was missing.
 
+**Re-review (2026-11-01).** The re-review confirmed the three fixes and found nothing new. It asked for one improvement, made in `5f28f120`: `activatedInRun` starts false at every start, so a private family that does forward, but whose first post of a run the operator refused for its own reasons (a rate budget, a store error, a probe flake), still waited for its tick, and the sdk dropped its mesh address for the day. Now a family also counts as activated when the directory holds this extender's own current record naming an address of the family. The two tests that cover it fail on `5037a818`.
+
 ### 4.1 What changed (`net_extender_activate.go`, `control_family.go`, EXTENDER.md G3)
 
 - **Schedules:** each family has its own `extenderActivateSchedule` (l.380): a 24 h tick, and a hold of 10 min doubling to 6 h (`tick` l.392, `hold` l.400).
   - A refused family holds only itself, so it never re-posts the family that works.
   - A success moves the family back to its tick, resets its hold and marks it activated in this run (`activatedInRun`).
+  - The schedules move once every post of the pass has been answered (`activate`, l.934), so a record that another family's answer brings counts for the family it names.
   - `dueScheduleKeys` (l.746) and `nextActivateWait` (l.758) pick what's due.
 - **Triggers that post every family,** as before: start, an observed revocation, a network change and `Reactivate` (`scheduleEveryFamily`, l.738).
 - **A family with no global address** on the host (`FamilySupported`, `control_family.go` l.557) isn't posted. It's looked at again every 10 min without doubling (`recheck`, l.410), so one that gains an address is posted within 10 min however long it went without one, and its first failure after that holds 10 min.
 - **The address check** (`checkAddress` l.768, `addressChange` l.797) is still one hello to the plain url, now compared within the family it arrived on.
   - These count as unchanged: an address the operator published for any family, and the last address that family's hello saw, while the family's published address is still the one that hello was read against. So a dual-stack host whose hello alternates families posts nothing, and a host whose hello leaves from another of its addresses than its activation posts once, not hourly.
-  - An activation that moves a family's published address forgets that family's last hello (`activateUrl` l.1165, `recordSuccess` l.1252), so a host that returns to an address it left is posted at the next check.
+  - An activation that moves a family's published address forgets that family's last hello (`activateUrl` l.1196, `recordSuccess` l.1283), so a host that returns to an address it left is posted at the next check.
   - A family that really moved posts that family alone.
   - A family that isn't activated is left to its schedule.
 - **The measurement follow-up** goes only to the families the pass activated. So a new identity whose v4 is refused sends its request on v6 at once, and a refusal of the follow-up is held as an activated family's.
 - **Fallback mode** (an operator with no family api hosts) keeps one schedule, posting the plain url once a cycle.
 - `Status()`, its change monitor and every existing setting are unchanged.
 
-### 4.2 Private addresses: one try at start, then the daily tick, until the family first activates (decided)
+### 4.2 Private addresses: one try at start, then the daily tick, while the family hasn't activated (decided)
 
 `FamilyPublic` (`control_family.go` l.586) treats a family as private when all its global addresses are RFC 1918, RFC 4193 (ULA), carrier-grade NAT (100.64/10), link-local or the 464XLAT range.
-- **What happens:** a private family is still posted at start, on its tick and on every trigger, like any family. If it's refused before it has activated since start, it waits for its next tick instead of the backoff (l.959), since a NAT that never forwards refuses every retry alike. For a NAT'd v4 that's one refused try per start plus one a day, down from 4–9 a day.
+- **What happens:** a private family is still posted at start, on its tick and on every trigger, like any family. If it's refused while it hasn't activated, it waits for its next tick instead of the backoff (l.966), since a NAT that never forwards refuses every retry alike. For a NAT'd v4 that's one refused try per start plus one a day, down from 4–9 a day.
+- **What counts as activated:**
+  - it activated since start (`activatedInRun`); or
+  - the directory holds this extender's own current record naming an address of the family (`ownRecordNamesFamily`, l.990): the operator published that family after its probes passed. The address counts whatever the local dial evidence says of it (active, warning or hold). A revoked or expired record, or an address no record names, doesn't count. It reads the snapshot `observeRevocation` reads.
+- **Across a restart:** an app's directory has a store, so it keeps the record. The miner's network space keeps no local state, so its directory starts empty and names the family only once the other family's answer in the same pass, or the feed, brings the record back. So a dual-stack miner whose v4 the operator still holds retries v4 in 10 min, while a v4-only miner whose first post of a run is refused still waits for the tick. Lifting the hold when a later directory change brings the record would close that; it isn't implemented.
 - **Once it has activated,** something forwards to it: a home router's port forward, a published container port, a cloud VM's 1:1 NAT. Its later refusals — the operator's rate budget, its configuration or store, a probe flake, the re-post after a revocation — are held on the backoff as any family's are.
 - **A request that fails,** rather than a refusal, uses the backoff whether or not the family has activated.
-- **An interface table that can't be read** counts as public here (`ipVersionPublic` l.1056, `familyPublicReadable` `control_family.go` l.593), so it never lengthens a hold. `FamilyPublic` itself still fails closed.
+- **An interface table that can't be read** counts as public here (`ipVersionPublic` l.1087, `familyPublicReadable` `control_family.go` l.593), so it never lengthens a hold. `FamilyPublic` itself still fails closed.
 - **Why not skip private families entirely:** that would cut off every host whose only v4 is private but does forward 443, such as home routers and docker-bridge providers with published ports. EXTENDER.md C2a and S plan for NAT hosts, including later UPnP/PCP mapping. Main has such candidates today: `orochimura`, whose v4 serves only tcp, and `ur712`, which is v4 only.
-- **The owner agreed to this on 2026-11-01.** Skipping instead is a one-line change in `activateFamily` (l.979): return skipped when `!ipVersionPublic`.
+- **The owner agreed to this on 2026-11-01.** Skipping instead is a one-line change in `activateFamily` (l.1010): return skipped when `!ipVersionPublic`.
 
 ### 4.3 Tests
 
-New, in `net_extender_activate_family_test.go`, on a fake clock. Ten came with `fbf99636`. Eight more came with `5037a818`, which also renamed `…HoldsARefusedPrivateFamilyForTheDay` to `…HoldsANeverActivatedPrivateFamilyForTheDay`; the rows marked "review" are the five that cover the review's findings.
+New, in `net_extender_activate_family_test.go`, on a fake clock. Ten came with `fbf99636`. Eight more came with `5037a818`, which also renamed `…HoldsARefusedPrivateFamilyForTheDay` to `…HoldsANeverActivatedPrivateFamilyForTheDay`, and three with `5f28f120`. The rows marked "review" cover the review's findings and fail on `fbf99636`; the rows marked "re-review" fail on `5037a818`.
 
 | Test | Line | Covers |
 |---|---|---|
-| `TestExtenderActivatorHoldsARefusedFamilyAlone` | l.72 | a refused v4 holds alone, v6 posts once a day |
-| `TestExtenderActivatorIgnoresAHelloOnTheOtherFamily` | l.133 | hellos alternating between the activated v4 and v6 post nothing |
-| `TestExtenderActivatorPostsTheFamilyWhoseAddressMoved` | l.154 | a moved v4 posts v4 alone, a moved v6 posts v6 alone |
-| `TestExtenderActivatorPostsAnotherSourceAddressOnce` | l.199 | a hello from another source address posts once |
-| `TestExtenderActivatorPostsEveryFamilyOnRevocation` | l.220 | a revocation posts both families mid-hold |
-| `TestExtenderActivatorHoldsANeverActivatedPrivateFamilyForTheDay` | l.256 | a private family refused before it activates waits for the tick (decided) |
-| `TestExtenderActivatorKeepsAnAcceptedPrivateFamily` | l.295 | an accepted private family keeps its tick |
-| `TestExtenderActivatorPostsAFamilyOnceTheHostHasAnAddress` | l.323 | a family gaining an address is posted at the next 10-min look |
-| `TestExtenderActivatorPostsAFamilyThatGainsAnAddressLate` | l.356 | review 3: after 12 h without one, within 10 min |
-| `TestExtenderActivatorRetriesAPrivateFamilyThatActivated` | l.391 | review 1: accepted, refused once, posted again at +10 min |
-| `TestExtenderActivatorRetriesAPrivateFamilyAfterARevocation` | l.423 | review 1: a revocation's re-post refused once, posted again at +10 min |
-| `TestExtenderActivatorHoldsAFailedPrivateFamilyOnTheBackoff` | l.460 | a failed request of a private family uses the backoff |
-| `TestExtenderActivatorIgnoresAHelloOnAFamilyNotActivated` | l.484 | a hello on a family that isn't activated posts nothing |
-| `TestExtenderActivatorForgetsAHelloOnceTheFamilyMoves` | l.505 | review 2: the stale hello posts at the next check |
-| `TestExtenderActivatorReadsTheHostsFamiliesByDefault` | l.551 | the real `FamilySupported` and public-address defaults, through the injectable interface table |
-| `TestExtenderActivatorTakesAnUnreadableTableForPublic` | l.601 | review 1: an unreadable table counts as public |
-| `TestExtenderActivatorMeasurementCsrFollowsOnTheActivatedFamily` | l.621 | the follow-up goes to v6, not the refused v4 |
-| `TestFamilyPublicReadsTheInterfaceTable` | l.644 | `FamilyPublic` over every range |
+| `TestExtenderActivatorHoldsARefusedFamilyAlone` | l.78 | a refused v4 holds alone, v6 posts once a day |
+| `TestExtenderActivatorIgnoresAHelloOnTheOtherFamily` | l.139 | hellos alternating between the activated v4 and v6 post nothing |
+| `TestExtenderActivatorPostsTheFamilyWhoseAddressMoved` | l.160 | a moved v4 posts v4 alone, a moved v6 posts v6 alone |
+| `TestExtenderActivatorPostsAnotherSourceAddressOnce` | l.205 | a hello from another source address posts once |
+| `TestExtenderActivatorPostsEveryFamilyOnRevocation` | l.226 | a revocation posts both families mid-hold |
+| `TestExtenderActivatorHoldsANeverActivatedPrivateFamilyForTheDay` | l.263 | a private family refused before it activates, which the directory doesn't name, waits for the tick (decided) |
+| `TestExtenderActivatorKeepsAnAcceptedPrivateFamily` | l.302 | an accepted private family keeps its tick |
+| `TestExtenderActivatorPostsAFamilyOnceTheHostHasAnAddress` | l.330 | a family gaining an address is posted at the next 10-min look |
+| `TestExtenderActivatorPostsAFamilyThatGainsAnAddressLate` | l.363 | review 3: after 12 h without one, within 10 min |
+| `TestExtenderActivatorRetriesAPrivateFamilyThatActivated` | l.398 | review 1: accepted, refused once, posted again at +10 min |
+| `TestExtenderActivatorRetriesAPrivateFamilyAfterARevocation` | l.430 | review 1: a revocation's re-post refused once, posted again at +10 min |
+| `TestExtenderActivatorRetriesAPrivateFamilyTheDirectoryNames` | l.493 | re-review: the directory names it, its first post after a restart is refused, posted again at +10 min |
+| `TestExtenderActivatorRetriesAPrivateFamilyAnotherAnswerNames` | l.526 | re-review: the other family's answer in the same pass names it, posted again at +10 min |
+| `TestExtenderActivatorDoesNotCountARevokedOwnRecord` | l.559 | a revoked own record doesn't count: the tick |
+| `TestExtenderActivatorHoldsAFailedPrivateFamilyOnTheBackoff` | l.599 | a failed request of a private family uses the backoff |
+| `TestExtenderActivatorIgnoresAHelloOnAFamilyNotActivated` | l.623 | a hello on a family that isn't activated posts nothing |
+| `TestExtenderActivatorForgetsAHelloOnceTheFamilyMoves` | l.644 | review 2: the stale hello posts at the next check |
+| `TestExtenderActivatorReadsTheHostsFamiliesByDefault` | l.690 | the real `FamilySupported` and public-address defaults, through the injectable interface table |
+| `TestExtenderActivatorTakesAnUnreadableTableForPublic` | l.740 | review 1: an unreadable table counts as public |
+| `TestExtenderActivatorMeasurementCsrFollowsOnTheActivatedFamily` | l.760 | the follow-up goes to v6, not the refused v4 |
+| `TestFamilyPublicReadsTheInterfaceTable` | l.783 | `FamilyPublic` over every range |
 
-All 27 `TestExtenderActivator*` tests that predate the branch pass with their assertions unchanged. The fixture in `net_extender_activate_test.go` gained a per-family refusal, a per-family published address and a constructor that prepares the operator before start.
+All 27 `TestExtenderActivator*` tests that predate the branch pass with their assertions unchanged. The fixture in `net_extender_activate_test.go` gained a per-family refusal, a per-family published address and constructors that prepare the operator, or the directory, before start.
 
 | Command | Tests | Result |
 |---|---|---|
-| `GOWORK=off go test -race -run 'TestExtenderActivator\|Activat\|TestFamilySupported\|TestFamilyPublic\|TestProbeFamily' -count=1 -v .` | 57 | pass, no races |
-| `GOWORK=off go test -race -run 'Family\|ControlFamily\|ControlIp\|Demot\|TestExtenderActivator\|Activat' -count=1 .` | 190 | pass, no races |
+| `GOWORK=off go test -race -run 'TestExtenderActivator\|Activat\|TestFamilySupported\|TestFamilyPublic\|TestProbeFamily' -count=1 -v .` | 60 | pass, no races |
+| `GOWORK=off go test -race -run 'Family\|ControlFamily\|ControlIp\|Demot\|TestExtenderActivator\|Activat' -count=1 .` | 193 | pass, no races |
 | `GOWORK=off go test -race -run 'TestLagCert' -count=1 ./extender/` (two drive the real activator) | 20 | pass, no races |
 | sdk extender-role tests against this branch, through a scratch `go.work` | 122 | pass |
 | The five tests that cover the review's findings, against `fbf99636` | 5 | fail, as they should |
+| The two tests that cover the re-review, against `5037a818` | 2 | fail, as they should |
 
 `go vet` is clean for `.`, `./extender/` and `./connectctl/`. The full root suite (over 30 min) wasn't run.
 
