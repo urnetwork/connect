@@ -370,13 +370,13 @@ type ExtenderSettings struct {
 	ExtenderCamouflageSplice bool
 	// CamouflageSpliceGate, when set, is an extra admission gate on the splice
 	// (EXTENDER-UPDATE2 §3.2): splicing runs only while it returns true, even
-	// when the posture is on. The provider role wires it to the safe-flip rule
-	// — its own published record carries the camouflage key and requires
+	// when the posture is on. A role that splices sets this to the Open of an
+	// ExtenderCamouflageSpliceSettle fed from its activations, the safe-flip
+	// rule: its own record carries the camouflage key and requires
 	// tcp-camouflage-v1, and has for at least one record lifetime, so legacy
-	// clients' records issued without the requirement have expired — and to
-	// rollback (requirement gone, or operator flag off). Nil applies no extra
-	// gate, which is the posture flag alone. It runs on the accept path, must
-	// not block, and is read once per unauthenticated hello.
+	// clients' records issued without the requirement have expired. Nil applies
+	// no extra gate, which is the posture flag alone. It runs on the accept
+	// path, must not block, and is read once per unauthenticated hello.
 	CamouflageSpliceGate func() bool
 	// The tolerated clock skew each way of a sealed hello time (P1); a client
 	// outside it is not authenticated. <= 0 takes the default.
