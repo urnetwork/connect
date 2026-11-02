@@ -4667,3 +4667,195 @@ separate signed format beside the unsigned K7 share, which is unchanged.
   `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
   once and runs a pass, so control reach and the gated release follow on the
   seed's verified records.
+
+## Design note: seed bundle follow-up (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+Follow-up to the seed bundle note above, after an audit of connect main
+against EXTENDER-UPDATE2 §2.1–§2.4.
+
+- Mirror reads: a bootstrap pass reads a mirror response to at most one byte
+  past the 64 KiB envelope cap, which is the mirror contract of `/v1/seed.bin`
+  (api/bringyour.yml), and refuses a response with that byte, or a stated
+  length past the cap, as `too_large` before decoding. A mirror may still
+  serve the text form, but only of a bundle whose text fits the cap; a file or
+  paste import keeps the text form's own cap.
+- Stored apply: `ApplyStoredExtenderSeed` applies the accepted bundle of every
+  network host the directory accepts and passes over a host whose bundle no
+  longer verifies or is stale, which keeps its floor. One host's stale bundle
+  never keeps another's fresh one from applying.
+- One store per space: the void rule judges every state a seed document holds
+  under the keys of each call, so an acceptor and its store serve one network
+  space, whose hosts share its root keys. The sdk keeps one store per space.
+- K7 hostile root: `net_extender_seed_k7_test.go` takes a hostile share with its
+  settings through the importer's own path (decode,
+  `ExtenderShareRootKeyHexes`, `SetRootKeys`) and accepts a hostile bundle for
+  the real space at a huge sequence under it. Once the roots change back, by a
+  settings change or by the first hello, the hostile floor binds nothing, is
+  dropped from the document, and never comes back with the stored apply or a
+  restart; the next genuine bundle is accepted at its ordinary sequence. The
+  episode costs the genuine floor, which leaves the fresh-install bound: the
+  configured minimum sequence and the validity window.
+- Wake: `ExtenderNetworkClient.Wake()` rearms the hello and hint backoffs and
+  runs a pass at once. Hello is then read over the client strategy, which draws
+  its extenders from the same directory, so control reach follows the seed at
+  once. The pass itself still bootstraps first while the directory is below
+  `LowWaterCount` (4): with dns black-holed and a seed of fewer than four usable
+  records, the feed sample of the seed's records can wait up to `HelloTimeout`
+  (30 s).
+
+## Design note: gated-preferred selection and the release fetch (EXTENDER-UPDATE2 §1, 2026-11-02)
+
+The client half of EXTENDER-UPDATE2 §1. R3's release policy and the server
+route are unchanged by it; the release outcomes and retry times are the
+server's (contract R).
+
+- Policy (`net_extender_directory_gated.go`): `ExtenderDirectory.SetGatedPreference`,
+  off by default. When on, only the connection path changes: the client
+  strategy expands its extender dialers from `ConnectCandidates` and judges the
+  ones it holds with `ConnectAddressUsable`, while the feed, the probe pass and
+  the gossip node draw as before. The policy is judged at each draw, which the
+  strategy makes only when the dialers it holds did not deliver, so a healthy
+  direct connection is never routed through an extender and never waits for a
+  release.
+  - attempt: usable gated records exist. Only they and the manual addresses
+    the user configured are drawn, under one shared budget
+    (`AttemptTimeout`, 10 s). An open dialer the strategy already holds keeps
+    serving, so a gated record that never answers strands no working
+    connection.
+  - gated: a gated record connected, by a dial, a probe or the feed. The open
+    dialers drain: the collapse drops them for new requests and a live
+    connection through one runs on. A gated record that stopped being usable
+    since the last draw falls back before any open dialer is drained.
+  - fallback: verified open records are drawn after the gated ones, for a
+    reason from a fixed set -- `no_gated_record`, `release_<outcome>`,
+    `release_failed`, `gated_failed`, `gated_timeout`, `control_reach` -- and a
+    reachable release route that released nothing usable is a reason like any
+    other. A gated record that connects, or one newly usable (released since,
+    its hold lapsed), ends it; the hold timeout is the gated retry backoff.
+  - The policy asks for a release through `GatedRefreshMonitor` when the
+    current gated records fall below the low watermark and when it falls back
+    for a reason a release can mend; the fetch coalesces the ask.
+- Never a candidate: a revoked record, in any tier (a revoked record is never
+  lapsed, so never a retained expired identity), and a release record that is
+  not a current gated record of this space under the root keys in force or was
+  requested before a reset (`ApplyReleaseRecord`, by `ResetGeneration`).
+- Publication: the K7 share leaves out every address a gated or
+  channel-restricted record names, whatever source it arrived from and in use
+  or not. It carried them before, in-use first. The feed sample, the
+  subscribers (feed stream and mesh) and the seed publisher already refused
+  them.
+- Release fetch (sdk `extender_release.go`, `extender_release_space.go`): one
+  fetcher per space, `POST /network/extender-release` with the client token of
+  the device bound to the space (`bindExtenderRelease`; a hosted space and a
+  read-only extender store never bind). Every trigger -- the schedule, a path
+  change, the directory's ask, the seed bootstrap (`requestExtenderRelease`) --
+  shares one request and one retry budget. The normal refresh is 6 h after an
+  answer that released a record, brought earlier by a jitter of at most
+  30 min and never later than 1 h before the earliest expiry held; failures
+  back off from 1 min to 30 min; the operator's retry time is clamped to
+  [60 s, 6 h]; the client asks at most 4 times an hour and not within 60 s of
+  an answer. An unknown outcome is `empty`. A request that reaches nothing
+  tries the space's control reaches -- the cached verified open records
+  (`AllowOpenForControlReach`), then the seed bootstrap -- once per failure
+  run, and asks again at once when one made a verified open record usable.
+- Account change: a token of another network or client, a sign-out or an
+  unbind cancels the request that is out, discards its answer (answers apply
+  under the binding lock the change takes) and advances the space's account
+  monitor, which the seed bootstrap watches. When another identity binds, the
+  gated records released to the previous one are forgotten
+  (`ForgetGatedRecords`); revocations, open records, manual addresses and the
+  extender's own record stay. The schedule is stored per identity digest, so a
+  restart of the same identity does not ask again early.
+- Cohort control: `NetworkSpaceValues.ExtenderGatedPreference`, applied in
+  place, turns the policy and the fetch on together; outside the cohort the
+  client asks for nothing and spends no disclosure.
+- Status: `ExtenderStatus` gains the mode, the fallback reason, the usable gated
+  count, the last release outcome and the earliest gated expiry; the policy
+  and the fetch keep counts over fixed label sets (`ExtenderGatedStats`, the
+  fetcher's stats). No address, key, id or token is logged or counted.
+
+## Design note: the TCP splice rollout (EXTENDER-UPDATE2 §3, 2026-11-02)
+
+Slice F of EXTENDER-UPDATE2 implements §3.2 to §3.4 in connect. The pilot
+runbook is `EXTENDER-SPLICE-ROLLOUT.md`. This note records the decisions that
+change or extend section P. It does not revise P.
+
+- Operator probes in Phase B. P6 says the activation probe is unchanged and
+  proves tcp over the terminated path. A Phase B extender has no terminated
+  path for an unauthenticated hello: it splices the operator's legacy probe to
+  its borrowed site, where the B3 leaf check fails it. That refuses the
+  extender's activation and fails its uptime probe. The probes therefore take
+  the extender's camouflage key when the operator has one
+  (`ProbeExtenderCarrierWithCamouflageKey` and
+  `ProbeExtenderForwardWithCamouflageKey`, net_extender_camouflage_probe.go).
+  The tcp dial then runs the client race, camouflaged first and legacy second,
+  and either attempt passing passes the probe. In Phase A the probe proves what
+  it always did and claims nothing about the key: a wrong key passes over the
+  legacy attempt. That is no proof of possession. In Phase B only the
+  extender's own key passes. The camouflaged attempt fronts a name of the
+  operator's bundled global list, so Phase B also needs the operator's build
+  to carry the measured list. Without it the probe is legacy alone. The
+  activation probe uses the key the activation posts, and the uptime probe uses
+  the stored key (server 14b).
+- Splice posture. `ExtenderCamouflageSplice` is the posture until
+  `ExtenderServer.SetCamouflageSplice` sets one at run time. A posture set at
+  run time wins over the setting, so it is the rollback lever, and it applies
+  to new connections only.
+- Front names. A client fronts a given extender with one name: of its country's
+  list, or else the global list, the name with the greatest
+  sha256(domain, identity key, name) score (rendezvous hashing). An extender
+  covers the names of list versions V-1 to V+1 by default. A substituted name is
+  degraded coverage, not success (net_extender_camouflage_select.go).
+- Fingerprint goldens. A real Chrome 156 ClientHello is committed with its
+  version metadata (fingerprint/testdata). Real Chrome now opens
+  signature_algorithms with a grease value, which the diff normalizes like the
+  other ordered lists. The synthetic uTLS golden stays regression coverage
+  only.
+
+## Design note: release outcomes, capability eligibility and the outage rule (2026-11-02)
+
+EXTENDER-UPDATE2 §1.1, §1.3 and §3.2, server half (slice B). This adds to R3,
+R4 and P without rewriting them.
+
+- Outcomes. `ExtenderReleasePolicy.Release` sets `ExtenderReleaseResult.Outcome`
+  on every admitted answer: `ok`, `empty`, `epoch_spent`, `probation`,
+  `country_capacity` or `incompatible`. A refusal is an
+  `*ExtenderReleaseRefusal` (`rate_limited` or `unavailable`), which unwraps to
+  the existing errors and keeps their messages. A spent epoch decides an empty
+  answer before anything else, since nothing else can be released until the
+  epoch ends. `RetryAfter` is set only from the requester's own clock state:
+  the request window plus one second for a limit (the refused request counts
+  too), the epoch's end for `epoch_spent`, and the sooner of the epoch's end
+  and the probation's end for `probation`. `empty`, `country_capacity` and
+  `incompatible` carry none, since when a slot frees depends on other
+  identities. No outcome names a count, a partition or a record. The route
+  carries these as the additive `outcome` and `retry_after_seconds`.
+- Capability eligibility. `ExtenderRecordBody.RequiredCapabilities` is field
+  18 (`repeated string`). Field 18 was free on main, on every remote and local
+  branch, and in every worktree on 2026-11-02. A record lists the capabilities
+  a client must declare before a release hands it out. The policy reads them
+  through `ExtenderReleaseRequest.Compatible`. An incompatible record is skipped
+  like an ineligible one, after the family and blocked checks, and is never
+  charged. The identity's count, partition and epoch disclosures are the same
+  whatever it declares: a capability declared or dropped within an epoch never
+  refunds a disclosure or adds one past the count. The answer is
+  `incompatible` only when nothing compatible is left. The operator sets the
+  field only for an extender a release alone reaches (the gated tier, not a
+  dns canary) whose record carries a `RealityPublicKey`, and only from its
+  configured cohort (server `extender.yml`, `directory.capability_cohorts`). It
+  is therefore inert until the server signs the camouflage key (phase 14b). A
+  value no client knows is one no client satisfies.
+- Outage rule. A block now needs the operator's probe to reach the record
+  now, not merely within the probe window: a failed probe with no success
+  after it is an outage. Reports made before the last failed probe describe
+  that outage and do not count, even after the probe succeeds again.
+  `ExtenderBlockedState.ProbeFailed` records the failure. The server applies
+  the same rule to its tables: every active address's latest probe must have
+  succeeded within the window, a report sent while the extender fails its
+  probe is not recorded, and a failed probe on any family deletes the reports
+  made before it, since the tables keep only each address's latest probe. A
+  report holds the probe rows it read until it commits, so a probe failing
+  meanwhile either refuses it or deletes it after. A blocked canary still names
+  its one place (`ExtenderAttributeBlockedCanaries`) and blocks no other
+  record: blocked state stays per record, and the release keeps the epoch's
+  order among the rest.

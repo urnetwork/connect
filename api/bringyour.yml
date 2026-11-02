@@ -1961,10 +1961,20 @@ paths:
         caller's address is part of the decision.
 
         `ip_versions` lists the address families the client can dial (4, 6);
-        empty means any. The answer carries base64 serialized
+        empty means any. `capabilities` lists what the client can use, such
+        as `tcp-camouflage-v1`. A record that requires a capability the client
+        did not declare is not released to it. Capabilities change which records
+        are eligible, never how many the identity is entitled to; unknown values
+        are ignored. The answer carries base64 serialized
         `protocol.ExtenderRecord` messages, the epoch, how many records the
         identity is entitled to this epoch, and `probation`. A refusal
         answers 200 with `error` and no records.
+
+        `outcome` says why the answer holds what it does, and
+        `retry_after_seconds`, when present, how long until asking again can
+        change it. A client treats an unknown outcome as `empty`, bounds the
+        retry time itself, and keeps its own deadline and rate limits. Neither
+        describes the fleet.
       operationId: extenderRelease
       security:
         - BearerAuth: []
@@ -1994,7 +2004,9 @@ paths:
         Needs a client JWT; the server records it against the country the
         caller's address places it in, once per client, and rate limits
         reports per user. An unknown extender key answers `recorded: false`
-        without an error. A refusal answers 200 with `error`.
+        without an error. So does a report against an extender the
+        operator's own probe does not reach now: that describes an outage, not
+        a block, and is not recorded. A refusal answers 200 with `error`.
       operationId: extenderBlockReport
       security:
         - BearerAuth: []
@@ -10670,6 +10682,14 @@ components:
           items:
             type: integer
             enum: [4, 6]
+        capabilities:
+          description: |
+            What the client can use. `tcp-camouflage-v1` is a client that sends
+            authenticated camouflage hellos and works with spliced extenders.
+            Eligibility only; unknown values are ignored.
+          type: array
+          items:
+            type: string
 
     ExtenderReleaseResult:
       type: object
@@ -10691,6 +10711,24 @@ components:
         error:
           description: Why the release was refused; absent on success.
           type: string
+        outcome:
+          description: |
+            Why the answer holds what it does: `ok`, records released; `empty`,
+            nothing eligible; `epoch_spent`, this epoch's records are spent and
+            none is eligible now; `probation`, the same for an identity still in
+            probation; `country_capacity`, every eligible record is at its limit
+            in the caller's country; `rate_limited`, refused by a request limit;
+            `incompatible`, the only eligible records require capabilities the
+            client did not declare; `unavailable`, the release could not be
+            answered. A client treats an unknown value as `empty`.
+          type: string
+        retry_after_seconds:
+          description: |
+            Seconds until asking again can change the answer, when known: the
+            request window for `rate_limited`, the epoch's end for
+            `epoch_spent`, and the sooner of the epoch's and the probation's end
+            for `probation`. Absent when unknown.
+          type: integer
 
     ExtenderBlockReportArgs:
       type: object
@@ -10708,7 +10746,7 @@ components:
         recorded:
           type: boolean
         error:
-          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          description: Why the report was not recorded; absent when it was, for an unknown key, and for an extender the operator's probe does not reach now.
           type: string
 
     TestBalanceDrainArgs:

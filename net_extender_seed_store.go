@@ -352,7 +352,10 @@ func DefaultExtenderSeedAcceptorSettings() *ExtenderSeedAcceptorSettings {
 // reads the accepted bundles back. Every operation loads the document, so the
 // store's owner may clear it at any time (Reset), and operations are
 // serialized, so a load, a compare and a save are one step. One acceptor
-// serves one store.
+// serves one store, and one store serves one network space, whose hosts share
+// its root keys: every operation judges every state the document holds under
+// the keys it is given (the void rule above), so a store shared with a space
+// of other roots would void that space's floors.
 type ExtenderSeedAcceptor struct {
 	store    ExtenderSeedStore
 	settings *ExtenderSeedAcceptorSettings
