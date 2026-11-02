@@ -69,6 +69,36 @@ func ProbeExtenderCarrier(
 	destinationHost string,
 	destinationPort int,
 ) (*protocol.ExtenderResponse, error) {
+	return probeExtenderCarrier(
+		ctx,
+		connectSettings,
+		ip,
+		connectMode,
+		port,
+		dnsTld,
+		serverName,
+		expectPublicKey,
+		nil,
+		destinationHost,
+		destinationPort,
+	)
+}
+
+// The carrier probe, with the extender's camouflage key when the operator has
+// one (net_extender_camouflage_probe.go); nil probes as ProbeExtenderCarrier.
+func probeExtenderCarrier(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	ip netip.Addr,
+	connectMode ExtenderConnectMode,
+	port int,
+	dnsTld string,
+	serverName string,
+	expectPublicKey []byte,
+	realityPublicKey []byte,
+	destinationHost string,
+	destinationPort int,
+) (*protocol.ExtenderResponse, error) {
 	if !ip.IsValid() {
 		return nil, fmt.Errorf("extender address is not valid")
 	}
@@ -91,8 +121,9 @@ func ProbeExtenderCarrier(
 			Port:        port,
 			DnsTld:      dnsTld,
 		},
-		Ip:        ip,
-		PublicKey: expectPublicKey,
+		Ip:               ip,
+		PublicKey:        expectPublicKey,
+		RealityPublicKey: probeExtenderCamouflageKey(connectMode, realityPublicKey),
 	}
 	conn, response, err := DialExtender(
 		probeCtx,
@@ -148,6 +179,32 @@ func ProbeExtenderForward(
 	apiUrl string,
 	tlsConfig *tls.Config,
 ) (string, error) {
+	return probeExtenderForward(
+		ctx,
+		connectSettings,
+		ip,
+		port,
+		serverName,
+		expectPublicKey,
+		nil,
+		apiUrl,
+		tlsConfig,
+	)
+}
+
+// The forward probe, with the extender's camouflage key when the operator has
+// one (net_extender_camouflage_probe.go); nil probes as ProbeExtenderForward.
+func probeExtenderForward(
+	ctx context.Context,
+	connectSettings *ConnectSettings,
+	ip netip.Addr,
+	port int,
+	serverName string,
+	expectPublicKey []byte,
+	realityPublicKey []byte,
+	apiUrl string,
+	tlsConfig *tls.Config,
+) (string, error) {
 	if !ip.IsValid() {
 		return "", fmt.Errorf("extender address is not valid")
 	}
@@ -167,8 +224,9 @@ func ProbeExtenderForward(
 			ServerName:  serverName,
 			Port:        port,
 		},
-		Ip:        ip,
-		PublicKey: expectPublicKey,
+		Ip:               ip,
+		PublicKey:        expectPublicKey,
+		RealityPublicKey: probeExtenderCamouflageKey(ExtenderConnectModeTcpTls, realityPublicKey),
 	})
 	release := ownOneRequestHttpClient(client)
 	defer release()
