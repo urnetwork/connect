@@ -53,7 +53,7 @@ func TestExtenderCamouflageSpliceClosesSiteOnInitialWriteError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !camouflage.splice(context.Background(), clientConn, []byte("synthetic initial bytes"), "borrow.example") {
+	if camouflage.splice(context.Background(), clientConn, []byte("synthetic initial bytes"), "borrow.example") != extenderCamouflageSpliced {
 		t.Fatal("the injected connection was not selected")
 	}
 	if !siteConn.closed.Load() {
