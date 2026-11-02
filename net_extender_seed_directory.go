@@ -135,12 +135,16 @@ func ImportExtenderSeed(
 	return applyExtenderSeedImport(directory, bundle, outcome)
 }
 
-// Applies the accepted bundle of the directory's space again, which is what a
-// start does before any mirror is asked: verified under the root keys and
-// network hosts in force and fresh by the directory's clock. The first of the
-// directory's network hosts with an accepted bundle is applied. Nil and no
-// error when none has one; the typed refusal when the bundle no longer
-// verifies or is no longer fresh, whose floor stays (ExtenderSeedAcceptor.Stored).
+// Applies the accepted bundles of the directory's space again, which is what a
+// start does before any mirror is asked: the accepted bundle of every one of
+// the directory's network hosts, each verified under the root keys and
+// network hosts in force and fresh by the directory's clock. A host whose
+// bundle no longer verifies or is no longer fresh is passed over and keeps its
+// floor (ExtenderSeedAcceptor.Stored), so a stale bundle of one host never
+// keeps a fresh one of another from applying. The result is the first applied
+// bundle that left a usable record, else the first applied one with its
+// refusal. Nil and no error when no host has an accepted bundle; the first
+// refusal when every host's bundle was refused.
 func ApplyStoredExtenderSeed(
 	directory *ExtenderDirectory,
 	acceptor *ExtenderSeedAcceptor,
@@ -150,17 +154,43 @@ func ApplyStoredExtenderSeed(
 	}
 	rootKeys := directory.RootKeys()
 	networkHosts := directory.settings.NetworkHosts
+	var usableResult *ExtenderSeedImportResult
+	var appliedResult *ExtenderSeedImportResult
+	var appliedErr error
+	var refusal error
 	for _, networkHost := range networkHosts {
 		bundle, err := acceptor.Stored(networkHost, rootKeys, networkHosts, directory.settings.Now())
 		if err != nil {
-			return nil, err
+			if ExtenderSeedErrorCode(err) == ExtenderSeedCodeStore {
+				// the document did not load or save, which no other host can
+				// change
+				return nil, err
+			}
+			if refusal == nil {
+				refusal = err
+			}
+			continue
 		}
 		if bundle == nil {
 			continue
 		}
-		return applyExtenderSeedImport(directory, bundle, "")
+		result, err := applyExtenderSeedImport(directory, bundle, "")
+		if err == nil && usableResult == nil {
+			usableResult = result
+		}
+		if appliedResult == nil {
+			appliedResult = result
+			appliedErr = err
+		}
 	}
-	return nil, nil
+	switch {
+	case usableResult != nil:
+		return usableResult, nil
+	case appliedResult != nil:
+		return appliedResult, appliedErr
+	default:
+		return nil, refusal
+	}
 }
 
 func applyExtenderSeedImport(
