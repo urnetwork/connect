@@ -57,14 +57,32 @@ func (self GoldenRef) describe() string {
 }
 
 // GoldenChrome133Synthetic is the committed synthetic golden: the uTLS v1.8.2
-// HelloChrome_133 profile connect's net_tls_hello.go parrots. it is what Layer
-// A gates against until the owner captures a real-Chrome golden.
+// HelloChrome_133 profile connect's net_tls_hello.go parrots. it is the parrot
+// reference the carrier-hello gate runs against; it is NOT real Chrome, so it
+// does not establish real-browser equivalence (GoldenChrome156Real does that).
 var GoldenChrome133Synthetic = GoldenRef{
 	Path:          "testdata/fingerprints/chrome-133-clienthello-synthetic.bin",
 	ChromeVersion: "133",
 	CaptureDate:   "2026-10-07",
 	Source:        "synthetic, uTLS v1.8.2 HelloChrome_133 via fingerprint.GenerateChromeHello (NOT real Chrome)",
 	Synthetic:     true,
+}
+
+// GoldenChrome156Real is the committed REAL-browser golden: the ClientHello of
+// Google Chrome 156 captured at the local fingerprint endpoint by the
+// -local-browser capture (EXTENDER-UPDATE2 §3.4, fingerprint/README.md). It is
+// the real-browser evidence the carrier and probe paths are exercised against;
+// its sidecar chrome-156-clienthello.meta.json carries the version metadata. It
+// drifts from the uTLS Chrome_133 parrot in signature_algorithms (real Chrome
+// now sends a GREASE value and the ML-DSA scheme codepoints) and in the
+// extension set (an added codepoint), which is the measured parrot gap, not
+// equivalence.
+var GoldenChrome156Real = GoldenRef{
+	Path:          "testdata/fingerprints/chrome-156-clienthello.bin",
+	ChromeVersion: "156",
+	CaptureDate:   "2026-11-02",
+	Source:        "real Google Chrome 156, captured at the local fingerprint endpoint (no Docker)",
+	Synthetic:     false,
 }
 
 // Golden is a loaded golden: its provenance, its raw ClientHello handshake

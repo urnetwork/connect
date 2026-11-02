@@ -4749,6 +4749,44 @@ server's (contract R).
   and the fetch keep counts over fixed label sets (`ExtenderGatedStats`, the
   fetcher's stats). No address, key, id or token is logged or counted.
 
+## Design note: the TCP splice rollout (EXTENDER-UPDATE2 §3, 2026-11-02)
+
+Slice F of EXTENDER-UPDATE2 implements §3.2 to §3.4 in connect. The pilot
+runbook is `EXTENDER-SPLICE-ROLLOUT.md`. This note records the decisions that
+change or extend section P. It does not revise P.
+
+- Operator probes in Phase B. P6 says the activation probe is unchanged and
+  proves tcp over the terminated path. A Phase B extender has no terminated
+  path for an unauthenticated hello: it splices the operator's legacy probe to
+  its borrowed site, where the B3 leaf check fails it. That refuses the
+  extender's activation and fails its uptime probe. The probes therefore take
+  the extender's camouflage key when the operator has one
+  (`ProbeExtenderCarrierWithCamouflageKey` and
+  `ProbeExtenderForwardWithCamouflageKey`, net_extender_camouflage_probe.go).
+  The tcp dial then runs the client race, camouflaged first and legacy second,
+  and either attempt passing passes the probe. In Phase A the probe proves what
+  it always did and claims nothing about the key: a wrong key passes over the
+  legacy attempt. That is no proof of possession. In Phase B only the
+  extender's own key passes. The camouflaged attempt fronts a name of the
+  operator's bundled global list, so Phase B also needs the operator's build
+  to carry the measured list. Without it the probe is legacy alone. The
+  activation probe uses the key the activation posts, and the uptime probe uses
+  the stored key (server 14b).
+- Splice posture. `ExtenderCamouflageSplice` is the posture until
+  `ExtenderServer.SetCamouflageSplice` sets one at run time. A posture set at
+  run time wins over the setting, so it is the rollback lever, and it applies
+  to new connections only.
+- Front names. A client fronts a given extender with one name: of its country's
+  list, or else the global list, the name with the greatest
+  sha256(domain, identity key, name) score (rendezvous hashing). An extender
+  covers the names of list versions V-1 to V+1 by default. A substituted name is
+  degraded coverage, not success (net_extender_camouflage_select.go).
+- Fingerprint goldens. A real Chrome 156 ClientHello is committed with its
+  version metadata (fingerprint/testdata). Real Chrome now opens
+  signature_algorithms with a grease value, which the diff normalizes like the
+  other ordered lists. The synthetic uTLS golden stays regression coverage
+  only.
+
 ## Design note: release outcomes, capability eligibility and the outage rule (2026-11-02)
 
 EXTENDER-UPDATE2 §1.1, §1.3 and §3.2, server half (slice B). This adds to R3,

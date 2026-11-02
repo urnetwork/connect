@@ -91,7 +91,8 @@ type ClientHelloFingerprint struct {
 	// the groups the key_share extension carries a share for, in wire order,
 	// grease in place.
 	KeyShareGroups []uint16
-	// signature_algorithms in wire order (Chrome sends no grease here).
+	// signature_algorithms in wire order, grease in place (real Chrome 156
+	// opens it with one; the uTLS Chrome_133 parrot sends none).
 	SignatureAlgorithms []uint16
 	// supported_versions in wire order, grease in place.
 	SupportedVersions []uint16
