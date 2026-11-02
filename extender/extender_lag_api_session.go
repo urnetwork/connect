@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1073,10 +1074,22 @@ func (self *lagApiSession) write(message any) bool {
 	}
 	self.conn.SetWriteDeadline(time.Now().Add(self.api.timings.writeTimeout))
 	if err := self.conn.WriteMessage(websocket.TextMessage, messageBytes); err != nil {
-		self.api.server.reportError("lag write", err)
-		return false
+		return self.writeFailed("lag write", err)
 	}
 	return true
+}
+
+// Reports a failed write on the control connection, and whether the session goes
+// on. A close already sent has failed nothing: the read side sends one answering the
+// browser's close and ends the session right after, and the extender's own end sends
+// one once the session is ending. Taken for a failed write, the browser closing would
+// end the load as an error (M8).
+func (self *lagApiSession) writeFailed(stage string, err error) bool {
+	if errors.Is(err, websocket.ErrCloseSent) {
+		return true
+	}
+	self.api.server.reportError(stage, err)
+	return false
 }
 
 // Wakes the loop after a phase changed. Never blocks.
@@ -1483,8 +1496,7 @@ func (self *lagApiSession) run() {
 			inFlightSendTime = time.Now()
 			self.inFlight.Store(&lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime})
 			if err := self.conn.WriteControl(websocket.PingMessage, payload, inFlightSendTime.Add(timings.writeTimeout)); err != nil {
-				self.api.server.reportError("lag ping", err)
-				ok = false
+				ok = self.writeFailed("lag ping", err)
 				break
 			}
 			lossTimer.Reset(timings.pingLost)
