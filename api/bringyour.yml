@@ -8723,6 +8723,161 @@ paths:
         "403":
           description: The token is not an admin token.
 
+  /admin/reengagement/results:
+    get:
+      tags: [Other]
+      x-internal: true
+      summary: Aggregated re-engagement experiment results
+      description: |
+        The nightly aggregate the re-engagement experiments are read from
+        (mmm/reengagement/PLAN.md "MEASUREMENT"):
+        `reengagement_results_daily`, recomputed at 02:45 UTC by the
+        `ReengagementResultsRollup` task for the last
+        `reengagement.results.rollup_days` cohort days (120 by default), so
+        the 90-day window matures in place. One row per cohort day,
+        experiment, variant, stream, platform and price tier. Counts are
+        episodes, never events or networks: a network counts once per
+        episode, in the cohort day of that episode.
+
+        The cohort of a day is the episodes whose first step, a real send
+        (`reengage.email.sent`) or a virtual send (`reengage.virtual_send`,
+        the holdout's step logged at the moment it would have been mailed),
+        fell on it (UTC). An episode begins at its `reengage.episode.started`
+        (or its network's current re-engagement row, should that event be
+        missing); a send is the first step when no other send of the network
+        falls between that start and it. `experiment` and `variant` are the
+        first step's, which the step copies from the network's re-engagement
+        row (both empty when no experiment covered the episode); `stream` is
+        the episode's (lapsed, never_activated, fix, winback); `platform` the
+        step's; `tier` the price tier of the network's country, as in the
+        onboarding results. A dimension nothing recorded is `unknown`.
+
+        Column definitions. The episode's own events are the ones from its
+        first step (less a minute: Brevo's webhook times are whole seconds)
+        to the next episode's start: `exposures` = episodes;
+        `virtual_exposures` = those whose first step was virtual (the
+        holdout); `sent`, `delivered`, `landing_clicked`, `reason_answers`,
+        `keeps`, `unsubscribe`, `complaint`, `hard_bounce` = at least one
+        `reengage.email.sent`, `reengage.email.delivered`,
+        `reengage.landing.clicked`, `reengage.reason`, `reengage.keep`,
+        `reengage.email.unsubscribed`, `reengage.email.complained`,
+        `reengage.email.bounced`. The webhook records Brevo's `hard_bounce`,
+        `blocked`, `invalid_email` and `error` as `reengage.email.bounced` and
+        drops `soft_bounce`, so `hard_bounce` counts permanent failures and
+        never a soft bounce. The windows are the network's, from the first
+        step on, whatever came after (intent to treat), each open at the
+        step: `reactivation_7d`, `reactivation_30d` = a `connect.day` (one
+        server event per network per UTC day with a connection, at its first
+        connection) in (step, step + 7 days], (step, step + 30 days];
+        `retention_90d` = a `connect.day` in (step + 60 days, step + 90 days],
+        days 61 through 90; `pro_restart_30d` = a supporter subscription
+        renewal with positive net revenue starting in (step, step + 30 days].
+        A window that has not closed reports 0: `matured_days` is the cohort
+        day's age in whole days at `computed_at`, and since the first steps
+        fall anywhere in the day, a window of W days has closed for every
+        episode of the day once `matured_days` is more than W.
+
+        Volume floor: rows with fewer than `onboarding.results.min_exposures`
+        exposures (default 10) are suppressed, as in
+        /admin/onboarding/results, and no identifier of any kind is
+        returned. Ordered by the dimension tuple; keyset paged by `cursor`.
+
+        Auth: the same admin bearers as /admin/onboarding/results, compared
+        in constant time. A missing or unknown token is 401; a network JWT is
+        403. Without an admin bearer configured the endpoint is closed.
+      operationId: adminReengagementResults
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: experiment
+          in: query
+          required: false
+          description: An experiment id from the re-engagement registry (`reengagement.experiments`). Omitted or empty, every row is returned, the episodes no experiment covered (empty `experiment` and `variant`) included.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          description: First cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          description: Last cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: stream
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/ReengagementStream"
+        - name: platform
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventPlatform"
+        - name: tier
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PriceTierName"
+        - name: cursor
+          in: query
+          required: false
+          description: The `next_cursor` of the previous page.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Rows per page, 1-1000 (default 500).
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A page of aggregated rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReengagementResultsPage"
+              examples:
+                page:
+                  value:
+                    rows:
+                      - cohort_day: "2026-11-20"
+                        experiment: reengage_lapsed_1
+                        variant: holdout
+                        stream: lapsed
+                        platform: android
+                        tier: standard
+                        exposures: 212
+                        virtual_exposures: 212
+                        sent: 0
+                        delivered: 0
+                        landing_clicked: 0
+                        reason_answers: 0
+                        keeps: 0
+                        reactivation_7d: 9
+                        reactivation_30d: 21
+                        retention_90d: 0
+                        pro_restart_30d: 0
+                        unsubscribe: 0
+                        complaint: 0
+                        hard_bounce: 0
+                        matured_days: 41
+                        computed_at: "2026-12-31T02:45:09Z"
+                    next_cursor: null
+                    min_exposures: 10
+        "400":
+          description: A date not YYYY-MM-DD, `to` before `from`, or an invalid cursor.
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is a network token, not an admin bearer.
+
   /updates/brevo:
     post:
       tags: [Other]
@@ -13591,6 +13746,120 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/OnboardingResultsRow"
+        next_cursor:
+          description: The cursor for the next page; null on the last page.
+          type: [string, "null"]
+        min_exposures:
+          type: integer
+          description: The volume floor applied to this page.
+
+    ReengagementStream:
+      type: string
+      description: A re-engagement stream (mmm/reengagement/PLAN.md "AUDIENCES AND STREAMS").
+      enum:
+        - lapsed
+        - never_activated
+        - fix
+        - winback
+
+    ReengagementResultsRow:
+      type: object
+      description: |
+        One aggregated row of the re-engagement results. Counts are
+        episodes, not networks or events; the windows are measured from each
+        episode's first step (see GET /admin/reengagement/results for every
+        column's definition).
+      required:
+        - cohort_day
+        - experiment
+        - variant
+        - stream
+        - platform
+        - tier
+        - exposures
+        - virtual_exposures
+        - sent
+        - delivered
+        - landing_clicked
+        - reason_answers
+        - keeps
+        - reactivation_7d
+        - reactivation_30d
+        - retention_90d
+        - pro_restart_30d
+        - unsubscribe
+        - complaint
+        - hard_bounce
+        - matured_days
+        - computed_at
+      properties:
+        cohort_day:
+          type: string
+          format: date
+          description: The UTC day of the episodes' first step.
+        experiment:
+          type: string
+          description: The registry experiment, or empty when none covered the episodes.
+        variant:
+          type: string
+          description: The experiment variant the episodes were served, or empty.
+        stream:
+          type: string
+          description: A ReengagementStream, or `unknown` when the episode did not record one.
+        platform:
+          type: string
+          description: An EventPlatform, or `unknown` when the episode did not record one.
+        tier:
+          type: string
+          description: A PriceTierName, or `unknown` when the network's country is unknown.
+        exposures:
+          type: integer
+        virtual_exposures:
+          type: integer
+          description: Exposures whose first step was a virtual send (the holdout).
+        sent:
+          type: integer
+        delivered:
+          type: integer
+        landing_clicked:
+          type: integer
+        reason_answers:
+          type: integer
+        keeps:
+          type: integer
+        reactivation_7d:
+          type: integer
+        reactivation_30d:
+          type: integer
+        retention_90d:
+          type: integer
+        pro_restart_30d:
+          type: integer
+        unsubscribe:
+          type: integer
+        complaint:
+          type: integer
+        hard_bounce:
+          type: integer
+          description: Permanent failures (Brevo hard_bounce, blocked, invalid_email, error); soft bounces are not recorded.
+        matured_days:
+          type: integer
+          description: The cohort day's age in whole days at `computed_at`; a window of W days has closed for every episode of the day once this is more than W.
+        computed_at:
+          type: string
+          format: date-time
+
+    ReengagementResultsPage:
+      type: object
+      required:
+        - rows
+        - next_cursor
+        - min_exposures
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReengagementResultsRow"
         next_cursor:
           description: The cursor for the next page; null on the last page.
           type: [string, "null"]
