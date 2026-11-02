@@ -84,8 +84,14 @@ type testActivateOperator struct {
 	stateLock     sync.Mutex
 	clientAddress string
 	// non-empty refuses every activation with this message
-	refusal    string
-	postCounts map[int]int
+	refusal string
+	// non-empty refuses every activation of that family with this message,
+	// ahead of `refusal`
+	familyRefusals map[int]string
+	// the address an activation of a family is answered with, by family; the
+	// family's fixed address while unset
+	publishedIps map[int]string
+	postCounts   map[int]int
 	// how an activation that is not refused is answered
 	answer testActivateAnswer
 	// the addresses this extender has activated, by family. One record names
@@ -109,6 +115,8 @@ func newTestActivateOperator(
 		posts:          make(chan *testActivatePost, 64),
 		hellos:         make(chan struct{}, 64),
 		clientAddress:  testActivateIpv4 + ":41001",
+		familyRefusals: map[int]string{},
+		publishedIps:   map[int]string{},
 		postCounts:     map[int]int{},
 		activatedIps:   map[int]string{},
 	}
@@ -153,6 +161,9 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		now := self.clock.Now()
 		self.stateLock.Lock()
 		refusal := self.refusal
+		if familyRefusal := self.familyRefusals[ipVersion]; familyRefusal != "" {
+			refusal = familyRefusal
+		}
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
 		self.stateLock.Unlock()
@@ -214,6 +225,9 @@ func (self *testActivateOperator) activateResult(
 		ip = testActivateIpv6
 	}
 	self.stateLock.Lock()
+	if publishedIp, ok := self.publishedIps[ipVersion]; ok {
+		ip = publishedIp
+	}
 	self.activatedIps[ipVersion] = ip
 	activatedIps := []string{}
 	for _, activatedIpVersion := range []int{4, 6} {
@@ -305,6 +319,22 @@ func (self *testActivateOperator) setAnswer(answer testActivateAnswer) {
 	self.answer = answer
 }
 
+// Refuses every activation of one family, ahead of the refusal of every
+// family; "" ends it.
+func (self *testActivateOperator) setFamilyRefusal(ipVersion int, refusal string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.familyRefusals[ipVersion] = refusal
+}
+
+// Answers the activations of one family with `ip`, as the operator publishes
+// the address it saw.
+func (self *testActivateOperator) setPublishedIp(ipVersion int, ip string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.publishedIps[ipVersion] = ip
+}
+
 func (self *testActivateOperator) postCount(ipVersion int) int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -341,6 +371,34 @@ func newTestActivatorFixture(
 	configure func(settings *ExtenderActivatorSettings),
 ) *testActivatorFixture {
 	t.Helper()
+	return newTestActivatorFixtureWithOperator(t, nil, configure)
+}
+
+// newTestActivatorFixture with `prepare` run on the operator before the
+// activator starts, so its first pass already meets what `prepare` set.
+func newTestActivatorFixtureWithOperator(
+	t *testing.T,
+	prepare func(operator *testActivateOperator),
+	configure func(settings *ExtenderActivatorSettings),
+) *testActivatorFixture {
+	t.Helper()
+	return newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		if prepare != nil {
+			prepare(fixture.operator)
+		}
+	}, configure)
+}
+
+// newTestActivatorFixture with `prepare` run once the operator, the directory
+// and the extender key exist and before the activator starts, so its first
+// pass already meets what `prepare` set: the operator's answers, or the records
+// a restart finds in the directory.
+func newTestActivatorFixtureWithPrepare(
+	t *testing.T,
+	prepare func(fixture *testActivatorFixture),
+	configure func(settings *ExtenderActivatorSettings),
+) *testActivatorFixture {
+	t.Helper()
 	clock := newTestClock()
 	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
 	operator := newTestActivateOperator(t, clock, rootPrivateKey)
@@ -367,6 +425,9 @@ func newTestActivatorFixture(
 			ExtenderCarrierQuic,
 			ExtenderCarrierDns,
 		},
+	}
+	if prepare != nil {
+		prepare(fixture)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

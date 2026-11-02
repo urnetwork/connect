@@ -2576,6 +2576,43 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 	return snapshot
 }
 
+// Whether the newest record held for `publicKey` is valid -- neither revoked
+// nor expired (B5) -- and names an address of `ipVersion` that is still this
+// key's. Only the record the operator signed last says what it publishes now:
+// the addresses older records of the key listed, which the directory keeps
+// (extenderDirectoryRecord.ips), do not count, nor does an address another key
+// has claimed since. Local dial evidence does not enter, so a held address
+// counts. The extender activation loop reads it for its own key (G3).
+func (self *ExtenderDirectory) CurrentRecordNamesFamily(publicKey []byte, ipVersion int) bool {
+	keyHex := hex.EncodeToString(publicKey)
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return false
+	}
+	if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
+		return false
+	}
+	for _, recordAddress := range keyRecord.recordBody.Addresses {
+		ip, err := netip.ParseAddr(recordAddress.Ip)
+		if err != nil || !ip.IsValid() {
+			continue
+		}
+		ip = ip.Unmap()
+		if addressIpVersion(ip) != ipVersion {
+			continue
+		}
+		if address := self.ipAddresses[ip]; address != nil && address.publicKeyHex == keyHex {
+			return true
+		}
+	}
+	return false
+}
+
 // The count of addresses whose key is active (B5), hold included. This is what
 // the low-water re-bootstrap reads: a held address is still a known extender,
 // and re-resolving dns would not produce a better one.
