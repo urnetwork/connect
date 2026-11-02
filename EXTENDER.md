@@ -593,7 +593,9 @@ or `api-v6` so the caller address has one family. An operator without
 family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
-`{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
+`{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`, and the
+optional `run_id`, `run_start_time` and `previous_exit` of G3, stored when they
+are well formed, and a well-typed one never refuses an activation. Rate
 limits, each per address family over a trailing hour, so one family's
 failures never spend the other's (2026-10-28), and per host (connect#230,
 2026-11-01): 6 per client; 6 per caller address, its /32 or /64, over every
@@ -1291,6 +1293,30 @@ backoff with the reason in its status. When the tcp carrier returns
 (`ExtenderActivator.TcpCarrierReturned`) every family that is not activated is due
 at once, whatever its hold says, and a family that stayed activated stays on its
 tick, so a listener that flaps posts nothing.
+
+Every post names the run of the process that sent it (2026-11-02): `run_id`,
+32 lower case hex characters of 128 random bits drawn once when the process
+starts, so every activation of one process carries the same id and a restart
+a new one; `run_start_time`, when the process started, in utc; and
+`previous_exit`, how the run before it ended, when the host that restarted the
+process says so in the environment variable `URNETWORK_PREVIOUS_EXIT`. Its
+words are `oom` (the host knows the run ran out of memory), `stop` (the host
+stopped it on purpose), the signal that ended it (`sigkill`, `sigterm`,
+`sigint`, `sighup`, `sigquit`, `sigabrt`, `sigsegv`, `sigbus`, `sigill`,
+`sigfpe`, `sigtrap`, `sigpipe`, `sigalrm`, or `signal` for another), and
+`exit-<code>` for an exit code from 0 to 255. The sn miner's supervisor sets it
+for a provider child it restarts; a process restarted any other way has none.
+All three are optional: an operator that predates them ignores them and an
+extender that predates them omits them. The operator stores each on the
+activation's history row when it is well formed -- 32 hex characters; a start
+no earlier than 2026-11-01 and no later than an hour past its clock; one of
+those words -- and null otherwise, and never refuses an activation for a
+well-typed value, since an extender with a wrong clock must still be published.
+A restart is then a run that started recently among an extender's activations,
+rather than something inferred from its platform connections. The process is
+what has a run, so every slot of one sn miner shares it, and separate processes
+on one identity key are a run each, which count as restarts only when they
+start. The queries are in EXTENDER-ACTIVATION.md §7.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
@@ -5089,3 +5115,27 @@ extends P. It does not revise P.
   run-time rollback lever in connectctl, whose rollback is a restart without
   `--camouflage_splice`. The revalidation timer is monotonic, so a desktop that sleeps
   verifies late by the time it slept.
+
+## Design note: block reporters and what a client's errors say (EXTENDER-UPDATE2 §1.3, 2026-11-02)
+
+Two corrections to the block report note above, which this adds to.
+
+- Distinct reporters are networks. The server's threshold counted `client_id`s, so
+  one account's three devices blocked a record for a whole country. It now counts
+  distinct networks through `network_client`, joined on the client id of the report's
+  verified token, so the known limit in the note above is narrower: separate accounts
+  behind one firewall still count separately. The threshold value and the probe check
+  are unchanged. The table records no network, and this needs no migration. Reading
+  the row at count time means a report whose client has since been reaped (30 days
+  after it was deactivated) drops out, which errs toward no block.
+  `ExtenderBlockedState`'s reporter is whatever the caller passes, and the rule there
+  is unchanged.
+- A client's errors name no address. A failed dial names the address it dialed, and
+  sometimes this host's own, and the feed and probe lines of the network client also
+  named each candidate. All of it reached default-level logs, and the feed's text
+  reached `ExtenderStatus.LastError`. Those lines leave a device in feedback and
+  support, and a client holds gated records. Default-level lines of
+  `net_extender_network.go` and `net_extender_dns_progress.go` and `LastError` now go
+  through `extenderErrorText`, which takes every ip literal out by parsing it, and the
+  feed and probe lines no longer name the candidate. Lines behind a verbosity someone
+  opted into still do. Tests: `net_extender_network_log_test.go`.

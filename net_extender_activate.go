@@ -84,6 +84,17 @@ type ExtenderActivateArgs struct {
 	// either stands, and only by an extender that keeps its identity, which
 	// is all that can have a name to withdraw.
 	MeasurementDisabled bool `json:"measurement_disabled,omitempty"`
+	// the run of the extender process that posted this activation (G3,
+	// ExtenderRun): 32 lower case hex characters of 128 random bits drawn
+	// once when the process starts, so every activation of one process
+	// carries the same id and a restarted process a new one. An operator that
+	// predates the three run fields ignores them.
+	RunId string `json:"run_id,omitempty"`
+	// when that process started, utc
+	RunStartTime *time.Time `json:"run_start_time,omitempty"`
+	// how the run before it ended, as the host that restarted the process
+	// reported it (ExtenderPreviousExitEnv); empty when it reported none
+	PreviousExit string `json:"previous_exit,omitempty"`
 }
 
 // The activation answer (C2). A refusal is a normal answer with `Activated`
@@ -241,6 +252,11 @@ type ExtenderActivatorSettings struct {
 	// measurement_disabled and no request, so the operator withdraws the
 	// measurement name (C9). It runs on the loop goroutine and must not block.
 	MeasurementDisabled func() bool
+
+	// The run of the process every post reports (G3). Nil takes
+	// ExtenderProcessRun(), which is what every host wants; a test sets its
+	// own.
+	Run *ExtenderRun
 
 	// The re-activation period of each family (G3).
 	ActivateTimeout time.Duration
@@ -469,6 +485,9 @@ func NewExtenderActivator(
 	if copied.RequestTimeout <= 0 {
 		copied.RequestTimeout = 60 * time.Second
 	}
+	if copied.Run == nil {
+		copied.Run = ExtenderProcessRun()
+	}
 	settings = &copied
 
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -484,6 +503,14 @@ func NewExtenderActivator(
 		schedules:      map[int]*extenderActivateSchedule{},
 		helloAddresses: map[int]netip.Addr{},
 	}
+	// the run every post reports, so a host log names the run the operator's
+	// activation rows carry (G3)
+	self.log.Infof(
+		"[extender]activate run = %s start = %s previous exit = %q\n",
+		settings.Run.Id,
+		settings.Run.StartTime.UTC().Format(time.RFC3339),
+		settings.Run.PreviousExit,
+	)
 	self.fallback = len(self.ipVersions()) == 0 && self.fallbackApiUrl() != ""
 	for _, ipVersion := range self.ipVersions() {
 		self.families[ipVersion] = &ExtenderFamilyActivationStatus{IpVersion: ipVersion}
@@ -1234,6 +1261,7 @@ func (self *ExtenderActivator) activateUrl(
 	measurementCsr string,
 	now time.Time,
 ) (extenderActivateOutcome, time.Duration) {
+	runStartTime := self.settings.Run.StartTime.UTC()
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
 		TcpPort:             self.settings.TcpPort,
@@ -1244,6 +1272,10 @@ func (self *ExtenderActivator) activateUrl(
 		Carriers:            carriers,
 		MeasurementCsr:      measurementCsr,
 		MeasurementDisabled: self.measurementDisabled(),
+		// the same run on every post of this process (G3)
+		RunId:        self.settings.Run.Id,
+		RunStartTime: &runStartTime,
+		PreviousExit: self.settings.Run.PreviousExit,
 	}
 	// publish the camouflage key only when the role set it (EXTENDER.md P6); an
 	// empty key is left off the args so an operator sees no camouflage key
