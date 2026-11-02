@@ -4643,6 +4643,41 @@ separate signed format beside the unsigned K7 share, which is unchanged.
   once and runs a pass, so control reach and the gated release follow on the
   seed's verified records.
 
+## Design note: seed bundle follow-up (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+Follow-up to the seed bundle note above, after an audit of connect main
+against EXTENDER-UPDATE2 §2.1–§2.4.
+
+- Mirror reads: a bootstrap pass reads a mirror response to at most one byte
+  past the 64 KiB envelope cap, which is the mirror contract of `/v1/seed.bin`
+  (api/bringyour.yml), and refuses a response with that byte, or a stated
+  length past the cap, as `too_large` before decoding. A mirror may still
+  serve the text form, but only of a bundle whose text fits the cap; a file or
+  paste import keeps the text form's own cap.
+- Stored apply: `ApplyStoredExtenderSeed` applies the accepted bundle of every
+  network host the directory accepts and passes over a host whose bundle no
+  longer verifies or is stale, which keeps its floor. One host's stale bundle
+  never keeps another's fresh one from applying.
+- One store per space: the void rule judges every state a seed document holds
+  under the keys of each call, so an acceptor and its store serve one network
+  space, whose hosts share its root keys. The sdk keeps one store per space.
+- K7 hostile root: `net_extender_seed_k7_test.go` takes a hostile share with its
+  settings through the importer's own path (decode,
+  `ExtenderShareRootKeyHexes`, `SetRootKeys`) and accepts a hostile bundle for
+  the real space at a huge sequence under it. Once the roots change back, by a
+  settings change or by the first hello, the hostile floor binds nothing, is
+  dropped from the document, and never comes back with the stored apply or a
+  restart; the next genuine bundle is accepted at its ordinary sequence. The
+  episode costs the genuine floor, which leaves the fresh-install bound: the
+  configured minimum sequence and the validity window.
+- Wake: `ExtenderNetworkClient.Wake()` rearms the hello and hint backoffs and
+  runs a pass at once. Hello is then read over the client strategy, which draws
+  its extenders from the same directory, so control reach follows the seed at
+  once. The pass itself still bootstraps first while the directory is below
+  `LowWaterCount` (4): with dns black-holed and a seed of fewer than four usable
+  records, the feed sample of the seed's records can wait up to `HelloTimeout`
+  (30 s).
+
 ## Design note: gated-preferred selection and the release fetch (EXTENDER-UPDATE2 §1, 2026-11-02)
 
 The client half of EXTENDER-UPDATE2 §1. R3's release policy and the server
