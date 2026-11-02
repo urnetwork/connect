@@ -38,9 +38,12 @@ import (
 // A refusal or a failure holds only the family that had it, for ten minutes
 // doubling to six hours, and a success resets that family's hold. So a family
 // the operator always refuses -- a v4 behind a NAT -- no longer re-posts the
-// family that works on every step of its backoff. The ticks, the address check
-// and the holds count the time the host slept, from the first minute it is
-// awake after a sleep of fifteen minutes or more.
+// family that works on every step of its backoff. A refusal that says when the
+// operator has room again (`retry_after_seconds`: a spent activation budget,
+// or an operator too busy to probe; connect#230) holds the family that long
+// instead, within a minute and six hours, and leaves its hold as it was. The
+// ticks, the address check and the holds count the time the host slept, from
+// the first minute it is awake after a sleep of fifteen minutes or more.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `IpVersionPublic`, `AddNetworkChangeListener` -- so
@@ -108,6 +111,11 @@ type ExtenderActivateResult struct {
 	// base64 of serialized protocol.ExtenderRecord messages of other active
 	// extenders, the directory this extender starts from (D6)
 	Bootstrap []string `json:"bootstrap,omitempty"`
+	// on a refusal that judged nothing about this extender -- a spent
+	// activation budget, or an operator too busy to probe -- the seconds until
+	// the operator has room for this family's next post (C2, connect#230). 0
+	// on every other answer, and from an operator that predates the field.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // PostExtenderActivate posts one activation to one family api url (C2). The
@@ -235,6 +243,13 @@ type ExtenderActivatorSettings struct {
 	// family keeps its own.
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
+	// The shortest wait a refusal's `retry_after_seconds` is taken as (C2,
+	// connect#230). A refusal that carries one holds its family exactly that
+	// long, at least this and at most MaxBackoff, and leaves the backoff as it
+	// was: the operator said when it has room, and nothing about this host. A
+	// minute keeps an operator's short answer from turning the loop into a
+	// poll. Non-positive takes the default.
+	MinRetryAfter time.Duration
 	// Budget of one activation post and of one hello.
 	RequestTimeout time.Duration
 	// A resume from a sleep of at least ResumeMinSleep pulls the address
@@ -280,6 +295,7 @@ func DefaultExtenderActivatorSettings() *ExtenderActivatorSettings {
 		AddressCheckTimeout: 1 * time.Hour,
 		MinBackoff:          10 * time.Minute,
 		MaxBackoff:          6 * time.Hour,
+		MinRetryAfter:       1 * time.Minute,
 		RequestTimeout:      60 * time.Second,
 		ResumeCheckTimeout:  defaultResumeCheckTimeout,
 		ResumeMinSleep:      defaultResumeMinSleep,
@@ -436,6 +452,9 @@ func NewExtenderActivator(
 	}
 	if copied.MaxBackoff < copied.MinBackoff {
 		copied.MaxBackoff = copied.MinBackoff
+	}
+	if copied.MinRetryAfter <= 0 {
+		copied.MinRetryAfter = DefaultExtenderActivatorSettings().MinRetryAfter
 	}
 	if copied.RequestTimeout <= 0 {
 		copied.RequestTimeout = 60 * time.Second
@@ -609,15 +628,17 @@ func (self *ExtenderActivator) run() {
 		default:
 		}
 
-		now := self.settings.Now()
+		// the clock and the directory are read below, so the subscribes belong
+		// ahead of both: a revocation applied while this pass runs, or a wake
+		// that arrives as it starts, must wake the next wait, and a wake ahead
+		// of the subscribes is one this pass's reads already see. With no
+		// directory the channel stays nil, which never fires.
 		wake := self.wakeMonitor.NotifyChannel()
-		// the directory is read below, so the subscribe belongs here: a
-		// revocation applied while this pass runs must wake the next wait.
-		// With no directory the channel stays nil, which never fires.
 		var directoryChange chan struct{}
 		if self.settings.Directory != nil {
 			_, directoryChange = self.settings.Directory.ChangeMonitor().Get()
 		}
+		now := self.settings.Now()
 
 		// a revocation and a network change leave every record of this host in
 		// doubt, so every family is due, whatever its own schedule says
@@ -916,9 +937,13 @@ const (
 // and a family with no address on this host to a look again after the floor.
 // So a family the operator keeps refusing holds itself alone and never
 // re-posts another, and a family that gains an address is posted within the
-// floor rather than at its tick.
+// floor rather than at its tick. A refusal that names when the operator has
+// room again (`retry_after_seconds`: a spent activation budget, or an operator
+// too busy to probe; connect#230) is waited out instead, within MinRetryAfter
+// and MaxBackoff, and leaves the hold as it was: the operator probed nothing,
+// so it judged nothing about this host.
 //
-// One refusal is held until the tick instead: that of a family whose host
+// One other refusal is held until the tick instead: that of a family whose host
 // addresses are all private and which has not activated, neither since the
 // activator started nor as far as the directory knows. The operator can dial
 // such an address back only through something that forwards to it, and a NAT
@@ -942,14 +967,16 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	self.measurementFollowUp = false
 
 	outcomes := make([]extenderActivateOutcome, len(due))
+	// the wait each refusal named for its family's next post, if any
+	retryAfters := make([]time.Duration, len(due))
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	for i, key := range due {
 		var carried bool
 		if self.fallback {
-			outcomes[i], carried = self.activateFallback(carriers, now)
+			outcomes[i], carried, retryAfters[i] = self.activateFallback(carriers, now)
 		} else {
-			outcomes[i], carried = self.activateFamily(key, carriers, measurementCarried, now)
+			outcomes[i], carried, retryAfters[i] = self.activateFamily(key, carriers, measurementCarried, now)
 		}
 		measurementCarried = measurementCarried || carried
 	}
@@ -963,6 +990,16 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 			activated = append(activated, key)
 		case outcome == extenderActivateSkipped:
 			schedule.recheck(now, self.settings)
+		case outcome == extenderActivateRefused && 0 < retryAfters[i]:
+			// the operator said when it has room again (C2, connect#230): a
+			// spent activation budget, or an operator too busy to probe. It
+			// probed nothing, so the refusal says nothing about this host,
+			// private or not: the family waits that long, within
+			// MinRetryAfter and MaxBackoff, and its hold stays as it was
+			schedule.nextActivateTime = now.Add(min(
+				max(retryAfters[i], self.settings.MinRetryAfter),
+				self.settings.MaxBackoff,
+			))
 		case outcome == extenderActivateRefused &&
 			!self.fallback &&
 			!schedule.activatedInRun &&
@@ -1004,23 +1041,23 @@ func (self *ExtenderActivator) activateFamily(
 	carriers []string,
 	measurementCarried bool,
 	now time.Time,
-) (outcome extenderActivateOutcome, carried bool) {
+) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
 	if !self.ipVersionSupported(ipVersion) {
 		// a family with no global address on this host cannot be probed
 		// back, so it is skipped rather than refused (G3)
-		return extenderActivateSkipped, false
+		return extenderActivateSkipped, false, 0
 	}
 	if len(carriers) == 0 {
 		self.recordFailure(ipVersion, now, "no carrier is listening", false)
-		return extenderActivateFailed, false
+		return extenderActivateFailed, false, 0
 	}
 	// one request a pass, on the first post that can carry it (C4)
 	measurementCsr := ""
 	if !measurementCarried {
 		measurementCsr = self.measurementCsr()
 	}
-	outcome = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
-	return outcome, outcome == extenderActivateActivated && measurementCsr != ""
+	outcome, retryAfter = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, measurementCsr, now)
+	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
 }
 
 // The measurement request a post carries (lag.dev/PLAN.md C4): what the
@@ -1095,30 +1132,32 @@ func (self *ExtenderActivator) ipVersionPublic(ipVersion int) bool {
 // without one is (G3). The one post carries the measurement request when one
 // is wanted and this extender's id is known, and whether it delivered one
 // comes back with the outcome (C4).
-func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (outcome extenderActivateOutcome, carried bool) {
+func (self *ExtenderActivator) activateFallback(carriers []string, now time.Time) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
-		return extenderActivateSkipped, false
+		return extenderActivateSkipped, false, 0
 	}
 	if len(carriers) == 0 {
 		self.recordFailure(0, now, "no carrier is listening", false)
-		return extenderActivateFailed, false
+		return extenderActivateFailed, false, 0
 	}
 	measurementCsr := self.measurementCsr()
-	outcome = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
-	return outcome, outcome == extenderActivateActivated && measurementCsr != ""
+	outcome, retryAfter = self.activateUrl(0, self.fallbackApiUrl(), carriers, measurementCsr, now)
+	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
 }
 
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
 // fallback mode. `measurementCsr` is the request the post carries, empty for
-// none (C4).
+// none (C4). A refusal that names when the operator has room again
+// (`retry_after_seconds`, C2) returns that wait with it; every other outcome
+// returns none.
 func (self *ExtenderActivator) activateUrl(
 	ipVersion int,
 	apiUrl string,
 	carriers []string,
 	measurementCsr string,
 	now time.Time,
-) extenderActivateOutcome {
+) (extenderActivateOutcome, time.Duration) {
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
 		TcpPort:             self.settings.TcpPort,
@@ -1149,11 +1188,11 @@ func (self *ExtenderActivator) activateUrl(
 		// message hides (connect#229)
 		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
 		self.recordFailure(ipVersion, now, err.Error(), false)
-		return extenderActivateFailed
+		return extenderActivateFailed, 0
 	}
 	if result == nil {
 		self.recordFailure(ipVersion, now, "the operator sent no activation result", false)
-		return extenderActivateFailed
+		return extenderActivateFailed, 0
 	}
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)
@@ -1163,9 +1202,15 @@ func (self *ExtenderActivator) activateUrl(
 		if message == "" {
 			message = "the operator refused the activation"
 		}
-		self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		retryAfter := time.Duration(0)
+		if 0 < result.RetryAfterSeconds {
+			retryAfter = time.Duration(result.RetryAfterSeconds) * time.Second
+			self.log.Infof("[extender]activate v%d refused = %s (retry after %s)\n", ipVersion, message, retryAfter)
+		} else {
+			self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
+		}
 		self.recordFailure(ipVersion, now, message, true)
-		return extenderActivateRefused
+		return extenderActivateRefused, retryAfter
 	}
 
 	// the operator's id of this extender, the same at every activation, which
@@ -1183,7 +1228,7 @@ func (self *ExtenderActivator) activateUrl(
 		// an activation with no family cannot be attributed to one, and the
 		// mesh address of D2 has no family to be published under
 		self.recordFailure(ipVersion, now, "the operator named no address family", false)
-		return extenderActivateFailed
+		return extenderActivateFailed, 0
 	}
 	if moved := self.recordSuccess(ipVersion, now, result); moved {
 		// the address the last check saw on this family was read against
@@ -1195,7 +1240,7 @@ func (self *ExtenderActivator) activateUrl(
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
-	return extenderActivateActivated
+	return extenderActivateActivated, 0
 }
 
 // The family an activation answer belongs to: what the operator reported, else
