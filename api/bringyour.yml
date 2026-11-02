@@ -2004,7 +2004,9 @@ paths:
         Needs a client JWT; the server records it against the country the
         caller's address places it in, once per client, and rate limits
         reports per user. An unknown extender key answers `recorded: false`
-        without an error. A refusal answers 200 with `error`.
+        without an error. So does a report against an extender the
+        operator's own probe does not reach now: that describes an outage, not
+        a block, and is not recorded. A refusal answers 200 with `error`.
       operationId: extenderBlockReport
       security:
         - BearerAuth: []
@@ -10744,7 +10746,7 @@ components:
         recorded:
           type: boolean
         error:
-          description: Why the report was not recorded; absent when it was, or for an unknown key.
+          description: Why the report was not recorded; absent when it was, for an unknown key, and for an extender the operator's probe does not reach now.
           type: string
 
     TestBalanceDrainArgs:

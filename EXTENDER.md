@@ -4681,9 +4681,12 @@ R4 and P without rewriting them.
   after it is an outage. Reports made before the last failed probe describe
   that outage and do not count, even after the probe succeeds again.
   `ExtenderBlockedState.ProbeFailed` records the failure. The server applies
-  the same rule to its tables, within what they keep: every active address's
-  latest probe must have succeeded within the window, and a report sent while
-  the extender fails its probe is not recorded. A blocked canary still names
+  the same rule to its tables: every active address's latest probe must have
+  succeeded within the window, a report sent while the extender fails its
+  probe is not recorded, and a failed probe on any family deletes the reports
+  made before it, since the tables keep only each address's latest probe. A
+  report holds the probe rows it read until it commits, so a probe failing
+  meanwhile either refuses it or deletes it after. A blocked canary still names
   its one place (`ExtenderAttributeBlockedCanaries`) and blocks no other
   record: blocked state stays per record, and the release keeps the epoch's
   order among the rest.
