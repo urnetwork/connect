@@ -440,15 +440,17 @@ var controlFamilyProbeSource = struct {
 
 // controlFamilyTunnelInterfacePrefixes are the interface names a tunnel takes
 // on the platforms this ships to: utunN on darwin/ios, tunN/tapN on
-// linux/android, plus the ipsec/ppp/wg shapes another vpn on the device may
-// present. Matching by NAME rather than by address range is deliberate:
+// linux/android, urnet0 from the linux app, the URnetwork adapter from the
+// windows app (net.Interfaces names an adapter by its friendly name), plus the
+// ipsec/ppp/wg shapes another vpn on the device may present. Matching by NAME
+// rather than by address range is deliberate:
 // RandomLocalIpv4 (tun.go) hands the tun a 10.a.b.h address chosen precisely
 // so it does NOT overlap any real local subnet, so it is indistinguishable
 // from an ordinary home-lan lease by range alone. Matching by the
 // FlagPointToPoint bit is not an option either -- cellular interfaces carry it
 // on android, and excluding the one real path would be worse than useless.
 var controlFamilyTunnelInterfacePrefixes = []string{
-	"utun", "tun", "tap", "ipsec", "ppp", "wg",
+	"utun", "tun", "tap", "urnet", "URnetwork", "ipsec", "ppp", "wg",
 }
 
 // controlFamilyReservedPrefixes are ranges no working path can be numbered
