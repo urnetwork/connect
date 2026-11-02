@@ -97,6 +97,10 @@ func newTestExtenderCarrierRun(t *testing.T) *testExtenderCarrierRun {
 		},
 		packetConnFactory:      testLoopbackPacketConn,
 		configureNetworkClient: testHermeticNetworkClient,
+		configureActivator: func(settings *connect.ExtenderActivatorSettings) {
+			// the return's post goes at once, which is what a test here waits on
+			settings.CarrierReturnJitter = -1
+		},
 		onStart: func(run *extenderRun) {
 			runs <- run
 		},
@@ -242,5 +246,69 @@ func TestExtenderCommandExitsWithAnErrorWhenItsServerEnds(t *testing.T) {
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("the extender did not exit")
+	}
+}
+
+// A carrier whose first bind failed stays down (G2), and the operator accepts no
+// activation without tcp, so a run that starts with no tcp could never post and would
+// never end. It says why and exits, for whatever runs it.
+func TestExtenderCommandExitsWithAnErrorWhenTcpDoesNotBindAtStart(t *testing.T) {
+	operator := newTestExtenderOperator(t)
+	operatorAddress := operator.server.Listener.Addr().String()
+	_, operatorPort, err := net.SplitHostPort(operatorAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quicPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsPacketConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quicPort := quicPacketConn.LocalAddr().(*net.UDPAddr).Port
+	stateDir := t.TempDir()
+	options := &extenderOptions{
+		jwt:      "test-jwt",
+		apiUrl:   fmt.Sprintf("http://%s:%s", testExtenderApiHost, operatorPort),
+		keyFile:  filepath.Join(stateDir, "extender.key"),
+		stateDir: stateDir,
+		tcpPort:  quicPort,
+		udpPort:  quicPort,
+		dnsPort:  dnsPacketConn.LocalAddr().(*net.UDPAddr).Port,
+		listen: func(network string, address string) (net.Listener, error) {
+			return nil, errors.New("the test's port is in use")
+		},
+		listenPacket: func(network string, address string) (net.PacketConn, error) {
+			if address == fmt.Sprintf(":%d", quicPort) {
+				return quicPacketConn, nil
+			}
+			return dnsPacketConn, nil
+		},
+		dialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", operatorAddress)
+		},
+		packetConnFactory:      testLoopbackPacketConn,
+		configureNetworkClient: testHermeticNetworkClient,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runExtender(ctx, options)
+	}()
+	select {
+	case err := <-runDone:
+		if err == nil || !strings.Contains(err.Error(), "the test's port is in use") {
+			t.Fatalf("exit = %v, expected the bind's error", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the extender did not exit")
+	}
+	select {
+	case args := <-operator.activations:
+		t.Fatalf("posted an activation with no tcp: %+v", args)
+	default:
 	}
 }
