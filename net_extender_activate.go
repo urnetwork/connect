@@ -919,13 +919,18 @@ const (
 // floor rather than at its tick.
 //
 // One refusal is held until the tick instead: that of a family whose host
-// addresses are all private and which has not activated since the activator
-// started. The operator can dial such an address back only through something
-// that forwards to it, and a NAT that never forwards refuses every retry
-// alike, so it gets one post at start and then one a day, as the owner decided
-// (2026-11-01). Once the family has activated something does forward to it,
-// so its refusals are the operator's budgets, its probes and its revocations,
-// which the hold retries as for any family.
+// addresses are all private and which has not activated, neither since the
+// activator started nor as far as the directory knows. The operator can dial
+// such an address back only through something that forwards to it, and a NAT
+// that never forwards refuses every retry alike, so it gets one post at start
+// and then one a day, as the owner decided (2026-11-01). Once the family has
+// activated something does forward to it, so its refusals are the operator's
+// budgets, its probes and its revocations, which the hold retries as for any
+// family. The directory carries that across a restart: this extender's own
+// current record naming an address of the family is the operator's word that
+// it published the family after its probes passed (ownRecordNamesFamily). The
+// schedules move once every post of the pass has been answered, so the record
+// another family's answer brought counts too.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	carriers := []string{}
 	if self.settings.Carriers != nil {
@@ -936,21 +941,23 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	followUp := self.measurementFollowUp
 	self.measurementFollowUp = false
 
-	activated := []int{}
+	outcomes := make([]extenderActivateOutcome, len(due))
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
-	for _, key := range due {
-		var outcome extenderActivateOutcome
+	for i, key := range due {
 		var carried bool
 		if self.fallback {
-			outcome, carried = self.activateFallback(carriers, now)
+			outcomes[i], carried = self.activateFallback(carriers, now)
 		} else {
-			outcome, carried = self.activateFamily(key, carriers, measurementCarried, now)
+			outcomes[i], carried = self.activateFamily(key, carriers, measurementCarried, now)
 		}
 		measurementCarried = measurementCarried || carried
+	}
 
+	activated := []int{}
+	for i, key := range due {
 		schedule := self.schedules[key]
-		switch {
+		switch outcome := outcomes[i]; {
 		case outcome == extenderActivateActivated:
 			schedule.tick(now, self.settings)
 			activated = append(activated, key)
@@ -959,6 +966,7 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		case outcome == extenderActivateRefused &&
 			!self.fallback &&
 			!schedule.activatedInRun &&
+			!self.ownRecordNamesFamily(key) &&
 			!self.ipVersionPublic(key):
 			// a NAT that never forwarded refuses every retry alike, so the
 			// family waits for its tick; its hold stays as it was
@@ -970,6 +978,29 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	if 0 < len(activated) && !followUp && !measurementCarried {
 		self.followMeasurementCsr(activated)
 	}
+}
+
+// Whether the directory holds this extender's own current record naming an
+// address of the family: the operator published the family after its probes
+// passed, in this run or an earlier one whose record the directory kept or the
+// feed brought back (G3). An address in the record counts whatever the local
+// dial evidence says of it, active, warning or hold; a revoked or expired
+// record, and an address no record names, do not. It reads the snapshot
+// observeRevocation reads.
+func (self *ExtenderActivator) ownRecordNamesFamily(ipVersion int) bool {
+	if self.settings.Directory == nil || len(self.settings.PublicKey) == 0 {
+		return false
+	}
+	for _, entry := range self.settings.Directory.Snapshot().Entries {
+		if entry.IpVersion != ipVersion || !slices.Equal(entry.PublicKey, self.settings.PublicKey) {
+			continue
+		}
+		switch entry.State {
+		case ExtenderStateActive, ExtenderStateWarning, ExtenderStateHold:
+			return true
+		}
+	}
+	return false
 }
 
 // One family's turn in a pass: its post to its family api url, unless the host

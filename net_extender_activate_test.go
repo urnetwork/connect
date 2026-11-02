@@ -382,12 +382,26 @@ func newTestActivatorFixtureWithOperator(
 	configure func(settings *ExtenderActivatorSettings),
 ) *testActivatorFixture {
 	t.Helper()
+	return newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		if prepare != nil {
+			prepare(fixture.operator)
+		}
+	}, configure)
+}
+
+// newTestActivatorFixture with `prepare` run once the operator, the directory
+// and the extender key exist and before the activator starts, so its first
+// pass already meets what `prepare` set: the operator's answers, or the records
+// a restart finds in the directory.
+func newTestActivatorFixtureWithPrepare(
+	t *testing.T,
+	prepare func(fixture *testActivatorFixture),
+	configure func(settings *ExtenderActivatorSettings),
+) *testActivatorFixture {
+	t.Helper()
 	clock := newTestClock()
 	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
 	operator := newTestActivateOperator(t, clock, rootPrivateKey)
-	if prepare != nil {
-		prepare(operator)
-	}
 
 	seed, err := NewExtenderKeySeed()
 	if err != nil {
@@ -411,6 +425,9 @@ func newTestActivatorFixtureWithOperator(
 			ExtenderCarrierQuic,
 			ExtenderCarrierDns,
 		},
+	}
+	if prepare != nil {
+		prepare(fixture)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

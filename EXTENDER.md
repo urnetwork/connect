@@ -1127,13 +1127,19 @@ long it went without one, and its first failure after that holds 10
 minutes. A family whose global addresses on the host are all private (RFC
 1918, RFC 4193, carrier-grade NAT, the 464XLAT range; `FamilyPublic`) can
 be dialed back only through something that forwards to it: it is posted at
-start, on its tick and on every trigger as any family is, and a refusal
-before it has activated since start holds it until its next tick instead of
-the backoff, since a NAT that never forwards refuses every retry alike. Once
-it has activated, something forwards to it, so its refusals -- the
-operator's budgets, a probe that failed, the re-post of a revocation -- are
-held on the backoff as any family's are. An interface table that cannot be
-read counts as public here, so it never lengthens a hold. The
+start, on its tick and on every trigger as any family is, and a refusal of
+it while it has not activated holds it until its next tick instead of the
+backoff, since a NAT that never forwards refuses every retry alike. It has
+activated once it has since start, or once the directory holds this
+extender's own current record naming an address of the family, which is the
+operator's word that it published the family after its probes passed and
+which carries a restart; a revoked or expired record does not count, and
+the schedules move once every post of the pass is answered, so the record
+another family's answer brings counts too. Once it has activated, something
+forwards to it, so its refusals -- the operator's budgets, a probe that
+failed, the re-post of a revocation -- are held on the backoff as any
+family's are. An interface table that cannot be read counts as public here,
+so it never lengthens a hold. The
 measurement request rides the first post of a pass that can carry it
 (lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
 request that is wanted, the families it activated are posted once more at
@@ -1160,7 +1166,9 @@ Revised the same day on review: the day's hold of a private family's
 refusal was any refusal's, so a revocation's re-post refused once left an
 activated family unposted for a day; the address a check saw outlived an
 activation that moved the family; and the look for a family without an
-address doubled to 6 hours.
+address doubled to 6 hours. A second review carried "activated" across a
+restart, through the directory's own record, so a forwarded family whose
+first post of a run is refused by the operator is not held for the day.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,

@@ -1,12 +1,17 @@
 package connect
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Per-family schedules of the activation loop (EXTENDER.md G3).
@@ -24,7 +29,8 @@ import (
 // was refused by a budget, a probe or a revocation's re-post; a hello address
 // remembered across an activation that moved the family's address; and a
 // family without an address looked at again on a hold that doubled to six
-// hours.
+// hours. A second review carried "activated" across a restart: the directory's
+// own current record of the family counts.
 //
 // These run on the fixture of net_extender_activate_test.go. The fixture's
 // address check is a minute, so every step of a minute or more begins with a
@@ -251,8 +257,9 @@ func TestExtenderActivatorPostsEveryFamilyOnRevocation(t *testing.T) {
 // A family whose host addresses are all private, refused before it has ever
 // activated, is a NAT that does not forward, which no backoff changes: it is
 // posted at start and then not until its tick, where a public family would
-// have been posted eight times (the owner's decision, 2026-11-01). The family
-// with a public address keeps its own tick.
+// have been posted eight times (the owner's decision, 2026-11-01). The record
+// the v6 answer brings names v6 alone, so the directory names no v4 of this
+// extender. The family with a public address keeps its own tick.
 func TestExtenderActivatorHoldsANeverActivatedPrivateFamilyForTheDay(t *testing.T) {
 	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
 		operator.setFamilyRefusal(4, testActivateFamilyRefusal)
@@ -451,6 +458,138 @@ func TestExtenderActivatorRetriesAPrivateFamilyAfterARevocation(t *testing.T) {
 	fixture.waitActivation()
 	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateActive {
 		t.Fatalf("%s state = %q, expected active", testActivateIpv4, state)
+	}
+}
+
+// Applies a record of this extender naming `ips`, signed by the operator, to the
+// directory, as a restart finds one an earlier run's activation published: kept
+// by the directory's store, or brought back by the feed.
+func (self *testActivatorFixture) applyOwnRecord(ips ...string) {
+	self.t.Helper()
+	now := self.clock.Now()
+	recordBase64, err := self.operator.signRecord(
+		self.publicKey, ips, now, now.Add(14*24*time.Hour), []string{ExtenderCarrierTcp})
+	if err != nil {
+		self.t.Fatal(err)
+	}
+	recordBytes, err := base64.StdEncoding.DecodeString(recordBase64)
+	if err != nil {
+		self.t.Fatal(err)
+	}
+	record := &protocol.ExtenderRecord{}
+	if err := proto.Unmarshal(recordBytes, record); err != nil {
+		self.t.Fatal(err)
+	}
+	if _, err := self.directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+		self.t.Fatal(err)
+	}
+}
+
+// A private family the directory holds this extender's own current record for
+// was published by the operator after its probes passed, so something forwards
+// to it: when the first post after a restart is refused -- the operator's
+// budget, a probe that failed -- it is posted again ten minutes later, as an
+// activated family is, not at its tick.
+func TestExtenderActivatorRetriesAPrivateFamilyTheDirectoryNames(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.applyOwnRecord(testActivateIpv4)
+		fixture.operator.setRefusal(testActivateFamilyRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(ipVersion int) bool { return false }
+	})
+	startTime := fixture.clock.Now()
+	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateActive {
+		t.Fatalf("%s state = %q, expected the own record active", testActivateIpv4, state)
+	}
+	fixture.waitPass()
+	if post := fixture.waitPost(); post.postTime != startTime {
+		t.Fatalf("first post at %s, expected the start", post.postTime.Sub(startTime))
+	}
+	fixture.operator.setRefusal("")
+
+	fixture.step(9 * time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of the hold", 1, 0)
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.postTime != startTime.Add(10*time.Minute) {
+		t.Fatalf("post at %s, expected 10m", post.postTime.Sub(startTime))
+	}
+	if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+		t.Fatalf("activated v%d, expected v4", ipVersion)
+	}
+}
+
+// The schedules move once every post of the pass has been answered, so the
+// record another family's answer brings counts: a v4 refused at start, whose
+// address the operator still holds from an earlier run, is named by the record
+// the v6 answer carries, and is posted again ten minutes later.
+func TestExtenderActivatorRetriesAPrivateFamilyAnotherAnswerNames(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.operator.setFamilyRefusal(4, testActivateFamilyRefusal)
+		// the v4 address an earlier run activated, which the operator still
+		// holds, so every record it signs names it
+		fixture.operator.activatedIps[4] = testActivateIpv4
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.IpVersionPublic = func(ipVersion int) bool { return ipVersion == 6 }
+	})
+	startTime := fixture.clock.Now()
+	fixture.waitFirstPass()
+	if ipVersion := fixture.waitActivation(); ipVersion != 6 {
+		t.Fatalf("activated v%d, expected v6", ipVersion)
+	}
+	fixture.operator.setFamilyRefusal(4, "")
+
+	fixture.step(9 * time.Minute)
+	fixture.expectFamilyPostCounts("one minute short of v4's hold", 1, 1)
+	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateActive {
+		t.Fatalf("%s state = %q, expected the own record active", testActivateIpv4, state)
+	}
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.ipVersion != 4 || post.postTime != startTime.Add(10*time.Minute) {
+		t.Fatalf("post = v%d at %s, expected v4 at 10m", post.ipVersion, post.postTime.Sub(startTime))
+	}
+	if ipVersion := fixture.waitActivation(); ipVersion != 4 {
+		t.Fatalf("activated v%d, expected v4", ipVersion)
+	}
+}
+
+// A revoked own record is the operator taking the family back, which says
+// nothing that forwards still does: a private family refused at start, with
+// only a revoked record of its own in the directory, waits for its tick.
+func TestExtenderActivatorDoesNotCountARevokedOwnRecord(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.applyOwnRecord(testActivateIpv4)
+		fixture.clock.advance(time.Minute)
+		revocation := signTestRevocation(
+			t, fixture.operator.rootPrivateKey, fixture.publicKey, fixture.clock.Now())
+		if _, err := fixture.directory.ApplyRevocation(revocation); err != nil {
+			t.Fatal(err)
+		}
+		fixture.operator.setRefusal(testActivateFamilyRefusal)
+	}, func(settings *ExtenderActivatorSettings) {
+		settings.ApiUrlV6 = ""
+		settings.IpVersionPublic = func(ipVersion int) bool { return false }
+	})
+	startTime := fixture.clock.Now()
+	if state := fixture.directoryState(testActivateIpv4); state != ExtenderStateRevoked {
+		t.Fatalf("%s state = %q, expected the own record revoked", testActivateIpv4, state)
+	}
+	fixture.waitPass()
+	fixture.waitPost()
+
+	for _, at := range []time.Duration{
+		10 * time.Minute,
+		30 * time.Minute,
+		70 * time.Minute,
+		6 * time.Hour,
+		24*time.Hour - time.Minute,
+	} {
+		fixture.step(startTime.Add(at).Sub(fixture.clock.Now()))
+		fixture.expectFamilyPostCounts(fmt.Sprintf("at %s", at), 1, 0)
+	}
+	fixture.clock.advance(time.Minute)
+	if post := fixture.wakeForPost(); post.postTime != startTime.Add(24*time.Hour) {
+		t.Fatalf("tick post at %s, expected 24h", post.postTime.Sub(startTime))
 	}
 }
 
