@@ -776,10 +776,12 @@ func TestExtenderActivatorForgetsAHelloOnceTheFamilyMoves(t *testing.T) {
 
 	const movedIpv4 = "198.51.100.8"
 	fixture.operator.setPublishedIp(4, movedIpv4)
+	// the first pass's check saw X. The checks arrive on v6 from here, before the
+	// change: a pass that read the clock just ahead of it posts first and checks in
+	// the next pass, and a check that saw X then would be a move of its own
+	fixture.operator.setClientAddress(fmt.Sprintf("[%s]:42001", testActivateIpv6))
 	fixture.clock.advance(2 * time.Minute)
 	fixture.networkChanged()
-	// the check this pass makes still sees X, the address published then
-	fixture.waitPass()
 	for _, ipVersion := range []int{4, 6} {
 		if post := fixture.waitPost(); post.ipVersion != ipVersion {
 			t.Fatalf("network change posted v%d, expected v%d", post.ipVersion, ipVersion)
@@ -791,7 +793,6 @@ func TestExtenderActivatorForgetsAHelloOnceTheFamilyMoves(t *testing.T) {
 		t.Fatalf("v4 ip = %s, expected %s", ip, movedIpv4)
 	}
 
-	fixture.operator.setClientAddress(fmt.Sprintf("[%s]:42001", testActivateIpv6))
 	fixture.step(2 * time.Minute)
 	fixture.step(2 * time.Minute)
 	fixture.expectFamilyPostCounts("with the checks on v6", 2, 2)
