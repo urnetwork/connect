@@ -126,8 +126,9 @@ func natTcpFlowMemoryByteCount(s *TcpBufferSettings) ByteCount {
 	// The remaining row covers the sequence, maps, channels, timers, socket
 	// wrapper and the dedicated workers. Upload packet roots and return
 	// chunks are separately charged for their complete lifetime.
+	// The recovery worker's cursor/flight metadata is explicitly charged too.
 	packets := 2 + min(s.SequenceBufferSize, max(1, s.WriteBatchSize)) + s.WriteBatchSize + 3
-	return kib(24) + ByteCount(s.ReadBufferByteCount) +
+	return kib(24) + ByteCount(unsafe.Sizeof(tcpReturnRecoveryFlight{})) + ByteCount(s.ReadBufferByteCount) +
 		ByteCount(packets)*retainedMessageCapacity(ByteCount(s.Mtu)) +
 		ByteCount(s.SequenceBufferSize)*128
 }

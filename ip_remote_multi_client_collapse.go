@@ -1,5 +1,7 @@
 package connect
 
+import "time"
+
 // A value copied into the existing send completion closure, not a separately
 // allocated recovery owner. It records only a flow and its admission epoch;
 // it retains no IP bytes or frame. An explicit unwritten failure invalidates
@@ -217,4 +219,59 @@ func (update *multiClientChannelUpdate) updateSequenceCoverageWithLock(packet *p
 		update.sequenceCoveredFrom, update.sequenceCoveredTo = start, end
 	}
 	return changed
+}
+
+// Each unanswered candidate owns its accepted SYN independently of the eventual
+// winner. A native retransmission can still explore an untried candidate. Mixed
+// groups retain their complete ordered admission, including any fresh data.
+func (self *RemoteUserNatMultiClient) filterOwnedRaceSynCandidatesWithLock(group *parsedPacketGroup, update *multiClientChannelUpdate, candidates []*multiClientChannel) ([]*multiClientChannel, bool) {
+	if !self.settings.TcpCollapsePrevention || group.ipPath.Protocol != IpProtocolTcp ||
+		update.client.Load() != nil || update.race == nil || len(group.packets) == 0 {
+		return candidates, false
+	}
+	for index := range group.packets {
+		path := group.packets[index].ipPath
+		if !path.Syn || path.Ack || path.Rst || path.Fin {
+			return candidates, false
+		}
+	}
+	var fresh []*multiClientChannel
+	maxHold := self.reliabilitySettings().TcpCollapseMaxHold
+	for index, client := range candidates {
+		state := update.race.clientStates[client]
+		covered := state != nil
+		if covered {
+			control := &state.collapseControl
+			for packetIndex := range group.packets {
+				packet := &group.packets[packetIndex]
+				// A dequeued different SYN/RST and unresolved raw controls keep
+				// the existing fail-open cohort ordering, including ISN ABA.
+				if control.closed || !update.pendingCandidateSequenceCoversWithLock(packet, client, control) {
+					covered = false
+					break
+				}
+			}
+			if covered && 0 < maxHold {
+				admittedAt := control.admittedAt
+				for claim := update.sequenceClaims; claim != nil; claim = claim.collapseNext {
+					if claim.completionClient == client && claim.collapseAdmission.epoch == update.sequenceAdmissionEpoch && admittedAt.Before(claim.admissionTime) {
+						admittedAt = claim.admissionTime
+					}
+				}
+				covered = admittedAt.IsZero() || time.Since(admittedAt) < maxHold
+			}
+		}
+		if covered {
+			if fresh == nil {
+				fresh = make([]*multiClientChannel, 0, len(candidates)-1)
+				fresh = append(fresh, candidates[:index]...)
+			}
+		} else if fresh != nil {
+			fresh = append(fresh, client)
+		}
+	}
+	if fresh == nil {
+		return candidates, false
+	}
+	return fresh, true
 }

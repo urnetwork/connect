@@ -233,6 +233,7 @@ func TestWindowPacingOwnerSelectionDelayedCarrierKeepsRetryCadence(t *testing.T)
 
 // Younger and retry can share one physical burst timestamp. That equality
 // must not turn the older selection into an already-expired next interval.
+// The younger ACK leaves an earlier timer wake before the older retry is due.
 func TestWindowPacingOwnerSelectionDelayedH1KeepsPaidClock(t *testing.T) {
 	runWindowOwnerProgressFixture(t, false, false, 5*time.Second, func(t *testing.T, fixture *windowOwnerProgressFixture) {
 		sequence, head := fixture.sequence, fixture.head
@@ -271,11 +272,12 @@ func TestWindowPacingOwnerSelectionDelayedH1KeepsPaidClock(t *testing.T) {
 		synctest.Wait()
 		physical := sequence.windowPacer.waiter.sentAt
 		youngerPhysical := sequence.firstPhysicalRecoveryTime(fixture.younger)
+		youngerDue := fixture.younger.resendTime
 		nextDue := youngerPhysical.Add(sequence.resendIntervalForItem(head, 2))
-		arrived, resume := fixture.inspection.arm(nextDue)
+		arrived, resume := fixture.inspection.arm(youngerDue)
 		if time.Now() != fixture.due.Add(5*time.Second) || string(pack.MessageId) != string(head.messageId[:]) ||
 			!physical.Equal(youngerPhysical) || !physical.Equal(fixture.youngerDeadline) ||
-			nextDue != fixture.due.Add(9*time.Second) || head.resendTime != nextDue ||
+			youngerDue != fixture.due.Add(7*time.Second) || nextDue != fixture.due.Add(9*time.Second) || head.resendTime != nextDue ||
 			head.sendCount != 2 || sequence.resendWriteCount.Load() != 1 || fixture.observation().admissions != 2 ||
 			len(fixture.route) != 0 || head.sendTime.Add(head.ackTimeout) != fixture.lifetime {
 			t.Fatalf("equal-time paid H1 retry duplicated or reused selection: copies=%d admissions=%d send_count=%d next=%s want=%s lifetime=%s",
@@ -298,14 +300,26 @@ func TestWindowPacingOwnerSelectionDelayedH1KeepsPaidClock(t *testing.T) {
 			head.sendTime.Add(head.ackTimeout) != fixture.lifetime {
 			t.Fatal("younger selective ACK changed the separate older recovery or ACK ownership")
 		}
-		time.Sleep(time.Until(nextDue.Add(-time.Nanosecond)))
-		synctest.Wait()
-		if len(fixture.route) != 0 || sequence.resendWriteCount.Load() != 1 || head.sendCount != 2 {
-			t.Fatal("equal-time H1 selection emitted an older copy before its exact next deadline")
+		// The deadline timer keeps the younger 9s wake after its selective ACK.
+		// Release that real recompute pass before rearming the 11s inspection;
+		// each handoff orders these reads before the owner's next lifetime write.
+		for _, wakeAt := range []time.Time{youngerDue, nextDue} {
+			time.Sleep(time.Until(wakeAt.Add(-time.Nanosecond)))
+			synctest.Wait()
+			if len(fixture.route) != 0 || sequence.resendWriteCount.Load() != 1 || head.sendCount != 2 {
+				t.Fatal("equal-time H1 selection emitted an older copy before its exact next deadline")
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			resumeWindowOwnerInspection(t, arrived, resume, wakeAt)
+			if wakeAt == youngerDue {
+				arrived, resume = fixture.inspection.arm(nextDue)
+				if len(fixture.route) != 0 || sequence.resendWriteCount.Load() != 1 || head.sendCount != 2 ||
+					head.resendTime != nextDue || head.sendTime.Add(head.ackTimeout) != fixture.lifetime {
+					t.Fatal("earlier younger timer wake changed the older physical cadence or ACK lifetime")
+				}
+			}
 		}
-		time.Sleep(time.Nanosecond)
-		synctest.Wait()
-		resumeWindowOwnerInspection(t, arrived, resume, nextDue)
 		if len(fixture.route) != 1 || sequence.resendWriteCount.Load() != 2 || head.sendCount != 3 ||
 			!sequence.windowPacer.waiter.sentAt.Equal(nextDue) {
 			t.Fatal("equal-time H1 selection lost its next exact paid physical copy")

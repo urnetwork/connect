@@ -489,11 +489,12 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
-		ReadTimeout:             300 * time.Second,
-		ReturnQueueBudget:       NewTransferMemoryBudget(returnBudget),
-		ReturnResendTimeout:     time.Second,
-		ReturnPersistTimeout:    time.Second,
-		ReturnPersistMaxTimeout: 30 * time.Second,
+		ReadTimeout:                  300 * time.Second,
+		ReturnQueueBudget:            NewTransferMemoryBudget(returnBudget),
+		ReturnResendTimeout:          time.Second,
+		ReturnRecoveryMaxPacketCount: 1,
+		ReturnPersistTimeout:         time.Second,
+		ReturnPersistMaxTimeout:      30 * time.Second,
 		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
 		// write pipeline re-arms it on partial progress). A closed window on
 		// the tunnel side legitimately parks the whole pipeline — the device's
@@ -4127,6 +4128,11 @@ type TcpBufferSettings struct {
 	ReturnQueueBudget       *TransferMemoryBudget
 	ReturnQueueMaxByteCount ByteCount
 	ReturnResendTimeout     time.Duration
+	// Maximum packets in one closed recovery flight of already-emitted data.
+	// The default, and non-positive values, preserve single-packet recovery.
+	// Larger values wait for the flight's cumulative ACK before issuing another;
+	// a stalled flight retries only its oldest unacknowledged packet.
+	ReturnRecoveryMaxPacketCount int
 	// A socket reader with unsent bytes probes an ACKed zero window after
 	// this interval. Non-positive disables persist; no idle flow is probed.
 	ReturnPersistTimeout time.Duration
@@ -5162,8 +5168,11 @@ type TcpSequence struct {
 	returnRecoveryActive bool
 	returnRecoveryReady  bool
 	returnPersistPending bool
-	returnWake           chan struct{}
-	returnCapacity       chan struct{}
+	// A validated zero-to-positive window update permits one oldest replay.
+	// This flag uses the remaining byte before returnWake, without a new queue.
+	returnReopenPending bool
+	returnWake          chan struct{}
+	returnCapacity      chan struct{}
 
 	sendMutex         sync.Mutex
 	sendItems         chan *TcpSendItem
@@ -6933,6 +6942,7 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 	if tcp.ack &&
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
+		reopenedPendingReturn := self.receiveWindowSize == 0 && tcp.ackNumber == self.receiveSeqAck
 		self.acknowledgeReturnWithLock(tcp.ackNumber)
 		if !self.handshakeAcked &&
 			0 <= int32(tcp.ackNumber-(self.initialSynSeq+1)) {
@@ -6973,6 +6983,13 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 		}
 		if receiveWindowSize > 0 {
 			self.returnPersistPending = false
+			if reopenedPendingReturn && self.returnHead < len(self.returnChunks) {
+				// The normal reader condition handles unsent data. A retained
+				// return (notably FIN emitted at a closed edge) has its own worker.
+				self.returnAttempts = 0
+				self.returnReopenPending = true
+				self.signalReturnRecoveryWithLock()
+			}
 		}
 	}
 

@@ -1,5 +1,5 @@
-// A real native retransmit can remain queued behind a different source's
-// raw-source consumer while another quality contender explicitly fails.
+// A native retransmit can newly admit an untried quality candidate while its
+// raw-source consumer is held and the other live contenders explicitly fail.
 package connect
 
 import (
@@ -56,12 +56,14 @@ func TestNativeSynRetainedFallbackSurvivesQueuedNativeRetransmit(t *testing.T) {
 		harness = newPrivateCrossWindowHarness(t, []privateCrossWindowExitSpec{
 			{exitSpec: reraceExitSpec{name: "quality-first", tier: 0, answer: reraceAlways(reraceSilent)}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "quality-refused", tier: 1, answer: reraceAlways(reraceSilent)}, windowType: WindowTypeQuality},
-			{exitSpec: reraceExitSpec{name: "quality-held", tier: 1, answer: reraceAlways(reraceSilent), clientSettings: configureHeld}, windowType: WindowTypeQuality},
+			{exitSpec: reraceExitSpec{name: "quality-live", tier: 1, answer: reraceAlways(reraceSilent)}, windowType: WindowTypeQuality},
+			{exitSpec: reraceExitSpec{name: "quality-held", tier: 2, answer: reraceAlways(reraceSilent), clientSettings: configureHeld}, windowType: WindowTypeQuality},
 			{exitSpec: reraceExitSpec{name: "speed-ready", answer: reraceAlways(reraceSilent)}, windowType: WindowTypeSpeed},
 		}, func(settings *MultiClientSettings) { settings.MultiRaceClientCount = 2 })
 		t.Cleanup(finish)
 		first := privateCrossWindowChannel(t, harness, "quality-first")
 		refused := privateCrossWindowChannel(t, harness, "quality-refused")
+		live := privateCrossWindowChannel(t, harness, "quality-live")
 		held := privateCrossWindowChannel(t, harness, "quality-held")
 		ready := privateCrossWindowChannel(t, harness, "speed-ready")
 		heldPeer = harness.exit("quality-held").provider.ClientId()
@@ -90,30 +92,44 @@ func TestNativeSynRetainedFallbackSurvivesQueuedNativeRetransmit(t *testing.T) {
 		owner := synRetryControlOwner(t, update)
 		original := bytes.Clone(owner.packet)
 		credit, serial := owner.credit, owner.serial
+		// Cross-tier fields are weighted, not tier-sorted. Keep this owner
+		// ineligible until its first intended native admission below.
+		held.setWarning(true, warnUnhealthy)
+		t.Cleanup(func() { held.setWarning(false, warnNone) })
 		armed.Store(true)
 		harness.exit("quality-first").sendTo(first.ClientId(), reraceProviderSignal(t, path))
 		harness.settle()
 		privateCrossWindowAssertFailed(t, harness, path, "quality-first")
 		select {
 		case <-entered:
+			t.Fatal("untried quality source ran before its first native admission")
 		default:
-			t.Fatal("the exact held quality source never reached its raw materialization consumer")
 		}
 		update.stateLock.Lock()
 		race := update.race
 		initial := race != nil && !race.single && len(race.clientStates) == 2 &&
-			race.clientStates[refused] != nil && race.clientStates[held] != nil &&
+			race.clientStates[refused] != nil && race.clientStates[live] != nil && race.clientStates[held] == nil &&
 			race.pendingSendCount == 0 && update.client.Load() == nil &&
 			update.synRetry == owner && owner.references == 1 && !owner.queued && owner.validWithLock(update)
 		update.stateLock.Unlock()
-		if !initial || len(harness.exit("quality-refused").syns(path)) != 1 || len(harness.exit("quality-held").syns(path)) != 0 || len(harness.exit("speed-ready").syns(path)) != 0 {
-			t.Fatal("retained retry did not form exactly the live/refused quality race before native retransmission")
+		if !initial || len(harness.exit("quality-refused").syns(path)) != 1 || len(harness.exit("quality-live").syns(path)) != 1 || len(harness.exit("quality-held").syns(path)) != 0 || len(harness.exit("speed-ready").syns(path)) != 0 {
+			t.Fatal("retained retry did not form exactly the two preferred live quality candidates")
 		}
 
-		// This second public input is the same complete SYN, not a fabricated
-		// retry token. Its source admission is real even though held cannot read it.
+		held.setWarning(false, warnNone)
+		if held.IsDone() || held.isWarning() || len(healthyCrossWindowCandidates([]*multiClientChannel{held})) != 1 {
+			t.Fatal("untried quality owner did not regain actual healthy admission eligibility")
+		}
+		// This same complete source SYN must skip its accepted candidates and
+		// newly admit the untried quality source. Its exact raw claim, rather
+		// than a redundant duplicate, exercises retained-fallback ownership.
 		if !privateCrossWindowNativeSyn(harness, path) {
-			t.Fatal("the actual same-attempt native retransmission was not admitted")
+			t.Fatal("same-attempt native input did not newly admit the untried quality owner")
+		}
+		select {
+		case <-entered:
+		default:
+			t.Fatal("newly eligible quality source never reached its raw consumer hold")
 		}
 		select {
 		case identity := <-nativeIdentity:
@@ -136,16 +152,20 @@ func TestNativeSynRetainedFallbackSurvivesQueuedNativeRetransmit(t *testing.T) {
 			pendingNative++
 		}
 		validWhileQueued := owner.validWithLock(update)
-		preserved := update.race == race && update.client.Load() == nil && update.synRetry == owner &&
+		preserved := update.race == race && len(race.clientStates) == 3 &&
+			race.clientStates[refused] != nil && race.clientStates[live] != nil && race.clientStates[held] != nil &&
+			update.client.Load() == nil && update.synRetry == owner &&
 			owner.serial == serial && owner.credit == credit && owner.references == 1 && !owner.queued && bytes.Equal(owner.packet, original)
 		update.stateLock.Unlock()
-		if pendingNative != 1 || !preserved || credit.released.Load() || held.IsDone() {
+		if pendingNative != 1 || !preserved || credit.released.Load() || held.IsDone() ||
+			len(harness.exit("quality-refused").syns(path)) != 1 || len(harness.exit("quality-live").syns(path)) != 1 {
 			t.Fatal("public retransmit did not retain one exact raw held candidate and the original bounded owner")
 		}
 
 		harness.exit("quality-refused").sendTo(refused.ClientId(), reraceProviderSignal(t, path))
+		harness.exit("quality-live").sendTo(live.ClientId(), reraceProviderSignal(t, path))
 		harness.settle()
-		privateCrossWindowAssertFailed(t, harness, path, "quality-refused")
+		privateCrossWindowAssertFailed(t, harness, path, "quality-refused", "quality-live")
 		if count := len(harness.exit("speed-ready").syns(path)); count != 1 {
 			t.Fatalf("NATIVE_RETRANSMIT_PENDING_CLAIM_BLOCKED_RETAINED_FALLBACK: speed_syns=%d want=1 native_inputs=2 pending_native=%d cache_valid_while_queued=%t", count, pendingNative, validWhileQueued)
 		}
@@ -167,7 +187,7 @@ func TestNativeSynRetainedFallbackSurvivesQueuedNativeRetransmit(t *testing.T) {
 		harness.settle()
 		if harness.update(path) != update || harness.boundTo(path) != ready || len(harness.delivered(path)) != 1 ||
 			harness.update(sibling) != siblingUpdate || harness.boundTo(sibling) != ready || len(harness.delivered(sibling)) != 1 ||
-			held.IsDone() || ready.IsDone() || len(harness.generator.clientList()) != 4 {
+			held.IsDone() || ready.IsDone() || len(harness.generator.clientList()) != 5 {
 			t.Fatal("late quality proof or source release disturbed winner, healthy sibling, or owner census")
 		}
 		synRetryControlReleased(t, owner)

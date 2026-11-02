@@ -7660,6 +7660,9 @@ func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
 	defer update.stateLock.Unlock()
 	selection := update.client.loadSelection()
 	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || !self.synRetryDispatchEligibleWithLock(update, sendPacketGroup.synRetry.raceOrder)) {
+		if self.ctx.Err() == nil && sendPacketGroup.validSynRetryWithLock(update) {
+			update.synRetry.preserveRaceRequestWithLock(sendPacketGroup.synRetry.raceOrder)
+		}
 		return selection, false
 	}
 	if sendPacketGroup.onlyPureTcpAcks() {
@@ -7989,6 +7992,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// 	return
 		// }
 
+		collapseStopped := false
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
 			// sendClientPath deliberately snapshots without holding the parent
 			// lock through admission. A concurrent sender can therefore bind this
@@ -7997,6 +8001,20 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// snapshot would otherwise wait forever without sending the packet.
 			if sendBoundClient(update.client.Load(), sendTimeout) {
 				return
+			}
+			if ipPath.Protocol == IpProtocolTcp && self.settings.TcpCollapsePrevention {
+				update.stateLock.Lock()
+				freshClients, collapsed := self.filterOwnedRaceSynCandidatesWithLock(sendPacketGroup, update, orderedClients)
+				update.stateLock.Unlock()
+				orderedClients = freshClients
+				if collapsed && len(orderedClients) == 0 {
+					collapseStopped = true
+					if batchAdmission != nil {
+						batchAdmission.stop = true
+					}
+					self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
+					return
+				}
 			}
 			switch len(orderedClients) {
 			case 0:
@@ -8456,7 +8474,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		}
 
 		raceClients(coalesceOrderedClients(), 0)
-		if success {
+		if success || collapseStopped {
 			return
 		}
 
@@ -8515,7 +8533,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 
 			startTime := time.Now()
 			raceClients(orderedClients, retryTimeout)
-			if success {
+			if success || collapseStopped {
 				return
 			}
 			endTime := time.Now()

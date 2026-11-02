@@ -1045,6 +1045,13 @@ func (self *multiClientChannelUpdate) resetCandidateControlWithLock(client *mult
 // Unknown/conflicting controls fail open. A known exact pending original can
 // suppress a duplicate, but never an intervening zero-window/ACK transition.
 func (self *multiClientChannelUpdate) pendingSequenceCoversWithLock(packet *parsedPacket, client *multiClientChannel) bool {
+	return self.pendingCandidateSequenceCoversWithLock(packet, client, nil)
+}
+
+// Candidate proof starts at its own latest SYN, including an unwritten one.
+// A raw accepted claim has no dequeue order yet: only its current/newer live
+// source may prove coverage, and unresolved conflicting controls still fail open.
+func (self *multiClientChannelUpdate) pendingCandidateSequenceCoversWithLock(packet *parsedPacket, client *multiClientChannel, cohort *tcpCandidateControlState) bool {
 	path := packet.ipPath
 	covered := false
 	for group := self.sequenceClaims; group != nil; group = group.collapseNext {
@@ -1057,6 +1064,20 @@ func (self *multiClientChannelUpdate) pendingSequenceCoversWithLock(packet *pars
 				if prior := group.packets[index].ipPath; prior.Rst ||
 					prior.Syn && (!path.Syn || prior.SequenceNumber != path.SequenceNumber) {
 					return false
+				}
+			}
+		}
+		if cohort != nil {
+			sourceId, order := group.collapseSourceIdWithLock(), group.collapseOrder()
+			if sourceId == (Id{}) || sourceId.LessThan(cohort.sourceId) {
+				continue
+			}
+			if order != 0 {
+				if cohort.synSeen && cohort.synNumber != path.SequenceNumber || order < cohort.synOrder {
+					continue
+				}
+				if order == cohort.synOrder {
+					start = max(start, cohort.synIndex)
 				}
 			}
 		}
