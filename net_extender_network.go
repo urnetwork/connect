@@ -501,6 +501,25 @@ func (self *ExtenderNetworkClient) networkChanged() {
 	self.wakeMonitor.NotifyAll()
 }
 
+// Wake runs a pass now and reads a failed hello and hint again at once, as a
+// path change does, without the path change's other effects: the country, the
+// latency samples and the open subscription are kept. The owner calls it once
+// a seed bundle has made verified extenders dialable (EXTENDER-UPDATE2.md
+// §2.3): the reads that failed for want of reach are worth trying again now,
+// not after the backoffs their failures built up, and the pass that follows
+// dials the seed's records like any other verified candidates.
+func (self *ExtenderNetworkClient) Wake() {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.hintRearmed = true
+		self.helloRearmed = true
+	}()
+	// the hint and the hello loops share the wake
+	self.hintWake.NotifyAll()
+	self.wakeMonitor.NotifyAll()
+}
+
 // Reports whether a path change asked for the hint again since the last call,
 // and clears the request.
 func (self *ExtenderNetworkClient) takeHintRearmed() bool {

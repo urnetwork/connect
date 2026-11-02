@@ -63,6 +63,13 @@ const (
 	// A record the operator released to this client's authenticated identity
 	// (Q3): the gated tier. Not a network event (K4), like a bootstrap.
 	ExtenderSourceRelease = "release"
+	// A record from an authenticated seed bundle (EXTENDER-UPDATE2.md §2,
+	// net_extender_seed.go): an open-tier record verified under the root keys
+	// like any other, applied only through ApplyRecord, never as a bare
+	// address. Not a network event (K4). An expired seed record is never one
+	// of the retained expired identities, so a stale seed cannot become a
+	// last resort of a new cold start (MaxExpiredRecordCount).
+	ExtenderSourceSeed = "seed"
 )
 
 // The address states reported by the status (F2), in precedence order: trust
@@ -290,6 +297,12 @@ type extenderDirectoryRecord struct {
 	// (net_extender_directory_tier.go)
 	tierPool  extenderTierPool
 	tierIndex int
+	// whether `record` was applied from a seed bundle (ExtenderSourceSeed):
+	// set and cleared with each newer record by its source, and stored. An
+	// expired seed record is never one of the retained expired identities
+	// (retainedExpiredKeyHexesWithLock), so a seed past its expiry is not a
+	// last resort for a new cold start (EXTENDER-UPDATE2.md §2.3)
+	seed bool
 }
 
 // The local evidence about one address. `publicKeyHex` is empty while the
@@ -813,6 +826,7 @@ func (self *ExtenderDirectory) applyVerifiedRecord(
 	}
 	keyRecord.record = record
 	keyRecord.recordBody = body
+	keyRecord.seed = source == ExtenderSourceSeed
 	keyRecord.applySerial = self.nextApplySerial
 	self.nextApplySerial += 1
 	if keyRecord.ips == nil {
@@ -2239,6 +2253,14 @@ func (self *ExtenderDirectory) addressActiveWithLock(
 //
 // A manual entry is the operator's own configuration, carries its secret, and
 // is the one case where the person configuring it is the trust anchor.
+//
+// A seed bundle (EXTENDER-UPDATE2.md §2) restores reach without the feed by
+// carrying signed records, not addresses: its records are applied through
+// ApplyRecord, verified under the root keys like any record, and so arrive
+// with their key. An address whose source is ExtenderSourceSeed but that holds
+// no key -- its record was dropped by a root key change, or did not survive a
+// load -- is as undialable as any other bare address: an envelope signature
+// never vouches for an address on its own.
 func (self *ExtenderDirectory) addressDialableWithLock(address *extenderDirectoryAddress) bool {
 	if address.publicKeyHex != "" {
 		return true
@@ -2311,12 +2333,23 @@ func compareExpiredKeyRecords(
 // The retained expired identities -- the newest MaxExpiredRecordCount of the
 // lapsed ones -- and the rest, oldest expiry first, which is the order the
 // policy evicts them in.
+//
+// A lapsed seed record (extenderDirectoryRecord.seed) is never retained: it is
+// evictable whatever the count, ahead of the rest. A seed's freshness is part
+// of its trust (EXTENDER-UPDATE2.md §2.3), and the expiry recovery that keeps
+// the extenders a client last knew must not turn a stale seed into a last
+// resort for a new cold start.
 func (self *ExtenderDirectory) retainedExpiredKeyHexesWithLock(
 	now time.Time,
 ) (retained map[string]bool, evictable []string) {
 	keyHexes := []string{}
+	seedKeyHexes := []string{}
 	for keyHex, keyRecord := range self.keyHexRecords {
 		if self.keyRecordLapsedWithLock(keyRecord, now) {
+			if keyRecord.seed {
+				seedKeyHexes = append(seedKeyHexes, keyHex)
+				continue
+			}
 			keyHexes = append(keyHexes, keyHex)
 		}
 	}
@@ -2328,8 +2361,11 @@ func (self *ExtenderDirectory) retainedExpiredKeyHexesWithLock(
 	for _, keyHex := range keyHexes[0:retainCount] {
 		retained[keyHex] = true
 	}
-	evictable = slices.Clone(keyHexes[retainCount:])
-	slices.Reverse(evictable)
+	notRetained := slices.Clone(keyHexes[retainCount:])
+	slices.Reverse(notRetained)
+	// the lapsed seed records first, in key order so the eviction is stable
+	slices.Sort(seedKeyHexes)
+	evictable = append(seedKeyHexes, notRetained...)
 	return retained, evictable
 }
 
@@ -2338,12 +2374,13 @@ func (self *ExtenderDirectory) retainedExpiredKeyHexesWithLock(
 // identities come before it.
 func (self *ExtenderDirectory) keyRetainedExpiredWithLock(keyHex string, now time.Time) bool {
 	keyRecord := self.keyHexRecords[keyHex]
-	if !self.keyRecordLapsedWithLock(keyRecord, now) {
+	if !self.keyRecordLapsedWithLock(keyRecord, now) || keyRecord.seed {
+		// a lapsed seed record is never retained (retainedExpiredKeyHexesWithLock)
 		return false
 	}
 	newerCount := 0
 	for otherKeyHex, otherKeyRecord := range self.keyHexRecords {
-		if otherKeyHex == keyHex || !self.keyRecordLapsedWithLock(otherKeyRecord, now) {
+		if otherKeyHex == keyHex || !self.keyRecordLapsedWithLock(otherKeyRecord, now) || otherKeyRecord.seed {
 			continue
 		}
 		if compareExpiredKeyRecords(otherKeyHex, otherKeyRecord, keyHex, keyRecord) < 0 {
@@ -2565,6 +2602,43 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 		return strings.Compare(a.Ip.String(), b.Ip.String())
 	})
 	return snapshot
+}
+
+// Whether the newest record held for `publicKey` is valid -- neither revoked
+// nor expired (B5) -- and names an address of `ipVersion` that is still this
+// key's. Only the record the operator signed last says what it publishes now:
+// the addresses older records of the key listed, which the directory keeps
+// (extenderDirectoryRecord.ips), do not count, nor does an address another key
+// has claimed since. Local dial evidence does not enter, so a held address
+// counts. The extender activation loop reads it for its own key (G3).
+func (self *ExtenderDirectory) CurrentRecordNamesFamily(publicKey []byte, ipVersion int) bool {
+	keyHex := hex.EncodeToString(publicKey)
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	keyRecord := self.keyHexRecords[keyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return false
+	}
+	if self.keyRecordRevokedWithLock(keyRecord) || self.keyRecordExpiredWithLock(keyRecord, now) {
+		return false
+	}
+	for _, recordAddress := range keyRecord.recordBody.Addresses {
+		ip, err := netip.ParseAddr(recordAddress.Ip)
+		if err != nil || !ip.IsValid() {
+			continue
+		}
+		ip = ip.Unmap()
+		if addressIpVersion(ip) != ipVersion {
+			continue
+		}
+		if address := self.ipAddresses[ip]; address != nil && address.publicKeyHex == keyHex {
+			return true
+		}
+	}
+	return false
 }
 
 // The count of addresses whose key is active (B5), hold included. This is what
@@ -2964,6 +3038,10 @@ type extenderDirectoryStoreRecord struct {
 	PublicKey  string `json:"public_key"`
 	Record     []byte `json:"record,omitempty"`
 	Revocation []byte `json:"revocation,omitempty"`
+	// ExtenderSourceSeed when the record was applied from a seed bundle
+	// (extenderDirectoryRecord.seed), empty otherwise. A build that predates
+	// it skips it, as it does any field it does not know.
+	RecordSource string `json:"record_source,omitempty"`
 }
 
 type extenderDirectoryStoreAddress struct {
@@ -3019,6 +3097,9 @@ func (self *ExtenderDirectory) save() {
 					return err
 				}
 				storeRecord.Record = recordBytes
+				if keyRecord.seed {
+					storeRecord.RecordSource = ExtenderSourceSeed
+				}
 			}
 			if keyRecord.revocation != nil {
 				revocationBytes, err := proto.Marshal(keyRecord.revocation)
@@ -3140,6 +3221,7 @@ func (self *ExtenderDirectory) load() {
 				proto.Unmarshal(record.Body, body) == nil {
 				keyRecord.record = record
 				keyRecord.recordBody = body
+				keyRecord.seed = storeRecord.RecordSource == ExtenderSourceSeed
 				keyRecord.applySerial = self.nextApplySerial
 				self.nextApplySerial += 1
 				for _, recordAddress := range body.Addresses {

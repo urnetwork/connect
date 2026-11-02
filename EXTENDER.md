@@ -1150,21 +1150,71 @@ advertised. When the user has chosen the feed-only gossip mode, the role
 runs the server and the feed service without a node and refuses the gossip
 service.
 
-G3. Activation loop. At start, every 24 hours, and on triggers: own key
-revoked as observed in the directory, the observed public address from
-hello changing (checked hourly), and network change. Per family with a
-global address (`FamilySupported`), `POST` activate to the family api
-url with the client jwt through a direct-only client strategy, since an
-activation that crossed an extender would publish the extender's address,
-apply the bootstrap records to the directory, and record the status.
-Backoff on failure 10 minutes doubling to 6 hours; a refusal of any
-attempted family holds the whole pass and the retry reissues both, and a
-pass that attempted nothing retries on the backoff rather than the daily
-tick. A family without an address is skipped. The hourly address check is
-one hello for both families and compares the address, not the port. The
-24 hour tick, the hourly check and the backoff count the time the host
-slept: a minute after waking from a sleep of 15 minutes or more, what came
-due during the sleep is due.
+G3. Activation loop. Each family keeps its own schedule. A family is posted
+at start, on its own 24 hour tick, and when a trigger makes it due: the own
+key observed revoked in the directory and a network change make every family
+due, and the hourly caller address check makes due the family whose address
+moved. A pass posts the families that are due, in ip version order, each to
+its family api url with the client jwt through a direct-only client
+strategy, since an activation that crossed an extender would publish the
+extender's address; it applies the bootstrap records to the directory and
+records the status. A success moves the family to its tick. A failure holds
+that family alone, 10 minutes doubling to 6 hours, and a success resets its
+hold, so a family the operator keeps refusing never re-posts one that works.
+A family without a global address on the host (`FamilySupported`) is not
+posted and is looked at again every 10 minutes, without doubling, since the
+look is local; one that gains an address is posted within 10 minutes however
+long it went without one, and its first failure after that holds 10
+minutes. A family whose global addresses on the host are all private (RFC
+1918, RFC 4193, carrier-grade NAT, the 464XLAT range; `FamilyPublic`) can
+be dialed back only through something that forwards to it: it is posted at
+start, on its tick and on every trigger as any family is, and a refusal of
+it while it has not activated holds it until its next tick instead of the
+backoff, since a NAT that never forwards refuses every retry alike. It has
+activated once it has since start, or once the directory holds this
+extender's own current record naming an address of the family, which is the
+operator's word that it published the family after its probes passed and
+which carries a restart. Only the newest record of the key counts
+(`CurrentRecordNamesFamily`): a revoked or expired one does not, nor does an
+address an older record named that the newest no longer does, though the
+directory keeps that address, nor one another key has claimed since. The
+schedules move once every post of the pass is answered, so the record
+another family's answer brings counts too. Once it has activated, something
+forwards to it, so its refusals -- the operator's budgets, a probe that
+failed, the re-post of a revocation -- are held on the backoff as any
+family's are. An interface table that cannot be read counts as public here,
+so it never lengthens a hold. The
+measurement request rides the first post of a pass that can carry it
+(lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
+request that is wanted, the families it activated are posted once more at
+once, and that post is followed by no other. The address check is one
+hello, to the plain api url, compared within the family it arrived on and
+by the address, not the port: an address the operator published for any
+family is unchanged, and so is the one the last check saw on that family
+while the family's published address is still the one that check was read
+against (an activation that moves the published address forgets it), so a
+dual-stack host whose hello arrives on either family, or a host whose hello
+leaves from another of its addresses than its activation, posts nothing,
+and a host that returns to an address it left is posted at the next check;
+a family that is not activated is left to its schedule. An
+operator with no family api hosts is posted once a cycle to its plain api
+url on one schedule. The ticks, the hourly check and the holds count the
+time the host slept: a minute after waking from a sleep of 15 minutes or
+more, what came due during the sleep is due. Per-family schedules decided
+2026-11-01 from the lag.dev health check: one schedule for both families
+made a v4 behind a NAT, refused at every post, re-post the working v6 on
+every step of the shared backoff (every 6 hours at the cap, 4 to 7 times a
+day where 1 was due), and one hello compared with the last read every
+dual-stack host's switch of family as a moved address and re-posted both.
+Revised the same day on review: the day's hold of a private family's
+refusal was any refusal's, so a revocation's re-post refused once left an
+activated family unposted for a day; the address a check saw outlived an
+activation that moved the family; and the look for a family without an
+address doubled to 6 hours. A second review carried "activated" across a
+restart, through the directory's own record, so a forwarded family whose
+first post of a run is refused by the operator is not held for the day; a
+third read that record's newest body alone rather than every address the
+directory keeps for the key.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
@@ -4537,6 +4587,61 @@ The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
 cover these root causes with synthetic fixtures and explicit ordering. This
 review preserves the phased server/SDK and empty borrowed-resource limitations
 listed above; it does not change their deployment status.
+
+## Design note: authenticated seed bundle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The cold-start bootstrap of EXTENDER-UPDATE2 §2 is built in connect as a
+separate signed format beside the unsigned K7 share, which is unchanged.
+
+- Format (`protocol/extender.proto`, new messages only): `ExtenderSeedBody`
+  (format version 1, network host, sequence, issue and expiry times, serialized
+  open-tier records, serialized root-signed revocations) inside
+  `ExtenderSeedEnvelope` (body bytes, signature, key id). The envelope is
+  ed25519 over `ur-extender-seed-v1` || body; the key id is a lookup hint only.
+  The text form is `ur-seed:1:` and base64url without padding
+  (`net_extender_seed.go`).
+- Trust: an envelope verifies only under the root keys the directory already
+  holds (network-space configuration or hello), and every record inside is
+  verified again under its own root signature, network host, tier
+  (`ExtenderRecordOpen`, so no gated or canary record) and expiry. A bundle has
+  no field for keys, hosts, gossip urls or resolver settings, and a body or
+  envelope with a field a v1 reader does not know is refused rather than
+  partly read. Records must list public addresses only, outlive the bundle, and
+  be issued before it.
+- Limits: 64 KiB per envelope (checked before decoding), 8 records, 32
+  addresses, 32 revocations, 8 KiB per record, 1 KiB per revocation, a 30-day
+  maximum validity, and a 5-minute clock allowance either way (the directory's
+  `RecordExpireSkew`). A clock outside the allowance gets an explicit
+  `expired` or `not_yet_valid` refusal.
+- State (`net_extender_seed_store.go`): per normalized network host, the
+  greatest accepted sequence, its body digest and the bundle, all hosts in one
+  document saved through a byte backend (`ExtenderSeedStore`, the shape of
+  `ExtenderDirectoryStore`; `ExtenderSeedFileStore` writes temp, sync, rename).
+  Lower sequences are rollbacks, a different body at the floor a conflict, the
+  same bundle idempotent; nothing is written on a refusal; a backend that cannot
+  load fails closed; an undecodable document is no history. A floor binds only
+  while its envelope verifies under the keys in force, so a floor set by a key
+  a root update removed, or by a root a K7 settings import installed, is void
+  and dropped; a rotation the client followed keeps its floor, and an empty key
+  set judges nothing.
+- Directory: records enter only through `ApplyRecord` and revocations through
+  `ApplyRevocationSource`, both with `ExtenderSourceSeed`, revocations first. No
+  address is ever added, so the dialability rule is unchanged: a seed address
+  without a verified key is not dialable. A record applied from a seed carries
+  a per-key `seed` marker (stored as `record_source`); a lapsed seed record is
+  never one of the retained expired identities, so the expiry recovery never
+  offers a stale seed to a new cold start. A newer record from another source
+  clears the marker.
+- Bootstrap pass (`net_extender_seed_bootstrap.go`): https mirrors, each with
+  an optional dns-independent address (tls still verifies the url's host);
+  redirects only to configured hosts over https within a bound; every mirror
+  runs its own attempts with backoff under one attempt, dial and byte budget and
+  one deadline, so a stalled mirror holds up only itself; the first acceptable
+  bundle wins and the rest are canceled. Per-mirror outcomes are fixed codes
+  with no addresses. After a usable apply the owner calls
+  `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
+  once and runs a pass, so control reach and the gated release follow on the
+  seed's verified records.
 
 ## Design note: release outcomes, capability eligibility and the outage rule (2026-11-02)
 
