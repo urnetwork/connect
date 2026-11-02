@@ -15,8 +15,8 @@ import (
 
 // What a decode53 socket does with a failure that is not its end (EXTENDER.md G2).
 // An extender's dns carrier serves every client on one socket, so a datagram it
-// cannot write, or a read that fails for a moment, costs that datagram. On
-// 2026-11-01 one such write would end the translation, and the extender's whole
+// cannot write, or a read that fails for a moment, costs that datagram. Before
+// 2026-11-02 one such write would end the translation, and the extender's whole
 // server with it.
 
 // A socket whose next writes and reads answer scripted errors.
@@ -317,6 +317,127 @@ func TestPacketTranslationClientEndsOnAReadFailure(t *testing.T) {
 		conn.failReads(temporaryErr)
 	})
 	fixture.waitEnded(t)
+}
+
+// A socket that can send nothing serves nothing, so writes that all fail for long
+// enough end it, with why, for its owner to rebuild or to report: losing a datagram is
+// not what is happening any more.
+func TestPacketTranslationServerEndsWhenEveryWriteKeepsFailing(t *testing.T) {
+	const writeFailTimeout = 200 * time.Millisecond
+	fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, nil, func(settings *PacketTranslationSettings) {
+		settings.WriteFailTimeout = writeFailTimeout
+	})
+	errs := make([]error, 100000)
+	for i := range errs {
+		errs[i] = syscall.ENETUNREACH
+	}
+	fixture.conn.failWrites(errs...)
+
+	startTime := time.Now()
+	for time.Since(startTime) < writeFailTimeout/2 {
+		if _, err := fixture.translation.WriteTo([]byte("a datagram"), fixture.peer.addr); err != nil {
+			t.Fatalf("write within the bound = %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fixture.expectAlive(t, "within the bound")
+
+	var writeErr error
+	for writeErr == nil && time.Since(startTime) < dnsCarrierTestWait {
+		_, writeErr = fixture.translation.WriteTo([]byte("a datagram"), fixture.peer.addr)
+		time.Sleep(time.Millisecond)
+	}
+	if !errors.Is(writeErr, syscall.ENETUNREACH) {
+		t.Fatalf("write past the bound = %v", writeErr)
+	}
+	fixture.waitEnded(t)
+	if err := fixture.translation.EndError(); !errors.Is(err, syscall.ENETUNREACH) ||
+		!strings.Contains(err.Error(), "no write has succeeded") {
+		t.Fatalf("end error = %v", err)
+	}
+}
+
+// One write that succeeds starts the bound over, so failures that one sender provokes
+// cannot end a socket that is answering anyone else.
+func TestPacketTranslationServerWriteThatSucceedsStartsTheBoundOver(t *testing.T) {
+	const writeFailTimeout = 100 * time.Millisecond
+	fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, nil, func(settings *PacketTranslationSettings) {
+		settings.WriteFailTimeout = writeFailTimeout
+	})
+	startTime := time.Now()
+	for time.Since(startTime) < 3*writeFailTimeout {
+		fixture.conn.failWrites(syscall.EINVAL, syscall.EINVAL, syscall.EINVAL)
+		for range 3 {
+			if _, err := fixture.translation.WriteTo([]byte("the failing sender's"), fixture.peer.addr); err != nil {
+				t.Fatalf("failed write = %v", err)
+			}
+		}
+		if _, err := fixture.translation.WriteTo([]byte("another client's"), fixture.peer.addr); err != nil {
+			t.Fatalf("write = %v", err)
+		}
+		fixture.conn.nextWrite(t, "another client's")
+		time.Sleep(time.Millisecond)
+	}
+	fixture.expectAlive(t, "with writes succeeding between the failures")
+}
+
+// A rare failure on a quiet socket does not stand for a socket that cannot send: the
+// bound wants a run of them, however long ago the first was.
+func TestPacketTranslationServerAFewFailuresOnAQuietSocketEndNothing(t *testing.T) {
+	const writeFailTimeout = 20 * time.Millisecond
+	fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, nil, func(settings *PacketTranslationSettings) {
+		settings.WriteFailTimeout = writeFailTimeout
+	})
+	for range packetTranslationWriteFailMinCount - 1 {
+		fixture.conn.failWrites(syscall.EINVAL)
+		if _, err := fixture.translation.WriteTo([]byte("a datagram"), fixture.peer.addr); err != nil {
+			t.Fatalf("write = %v", err)
+		}
+		time.Sleep(2 * writeFailTimeout)
+	}
+	fixture.expectAlive(t, "after a few failures over a long time")
+}
+
+// A datagram too long to read is what windows reports as a read error, and anyone can
+// send one. It costs that datagram and no wait, and a line a minute however many
+// arrive. These are winsock's number, as a real socket's error wraps it, on a socket
+// that is not windows': a windows socket has not been run here.
+func TestPacketTranslationServerDropsADatagramTooLongToRead(t *testing.T) {
+	const tooLongCount = 1000
+	log := &dnsCarrierLogLines{}
+	tooLong := &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("wsarecvfrom", syscall.Errno(10040))}
+	fixture := newDnsCarrierFailingFixtureWithSettings(t, PacketTranslationModeDecode53, func(conn *dnsCarrierFailingConn) {
+		for range tooLongCount {
+			conn.failReads(tooLong)
+		}
+	}, func(settings *PacketTranslationSettings) {
+		settings.Log = log
+	})
+
+	var buf [1024]byte
+	header := dnsCarrierTestHeader(0x12, 1, 0)
+	_, datagram, err := encodeDnsRequest(1, header, []byte("after the long ones"), buf, fixture.tld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.peer.WriteTo(datagram, fixture.conn.addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.translation.SetReadDeadline(time.Now().Add(dnsCarrierTestWait)); err != nil {
+		t.Fatal(err)
+	}
+	var packetData [2048]byte
+	n, _, err := fixture.translation.ReadFrom(packetData[:])
+	if err != nil {
+		t.Fatalf("read after the long ones: %v", err)
+	}
+	if string(packetData[:n]) != "after the long ones" {
+		t.Fatalf("read %q", packetData[:n])
+	}
+	fixture.expectAlive(t, "after the long ones")
+	if count := strings.Count(log.all(), "too long"); count != 1 {
+		t.Fatalf("%d lines of the long ones, expected one a minute", count)
+	}
 }
 
 // A logger that keeps every line, whatever its level.
