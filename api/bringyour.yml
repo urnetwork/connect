@@ -10949,7 +10949,7 @@ components:
           description: Whether this extender presents real-site behavior to a prober now.
           type: boolean
         degraded_reason:
-          description: Why it does not, when it does not. One of `camouflage_off`, `splice_off`, `splice_gate_closed`, `no_verified_target` and `splice_fallback_active`; anything else reads as `other`.
+          description: Why it does not, when it does not. One of `camouflage_off`, `splice_off`, `splice_gate_closed`, `no_verified_target`, `splice_fallback_active` and `coverage_incomplete`; anything else reads as `other`.
           type: string
 
     ExtenderCamouflageReportArgs:

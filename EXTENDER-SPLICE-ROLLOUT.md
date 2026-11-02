@@ -193,7 +193,7 @@ but a name this extender's supported clients select did not verify, or a list is
 unmeasured or past its maximum age. A prober replaying that name meets a
 substitution, which is degraded (`connect.EvaluateExtenderCamouflageCoverage`).
 Roles log the verdict and the counts as one line, which is the only place an
-operator can read them until the reporting path below exists:
+operator can read them on a host outside a reporting cohort (Reporting path, below):
 
     extender camouflage: authenticated_rollout, not covered: splice_off; 3 verified names, 0 failed verifications; 12 authenticated, 0 spliced, 40 terminated, 0 fallback terminated
 
