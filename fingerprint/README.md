@@ -46,9 +46,11 @@ The diff engine (`diff.go`) separates two kinds of field:
 
 Chrome shuffles its **extension order** per connection, so the extension
 comparison is set-based (sorted, GREASE-normalized) with structural GREASE/PSK
-position checks — the JA4 approach. The cipher, group and version lists, which
-Chrome does **not** shuffle, are compared in order (GREASE-normalized): a
-changed GREASE value does not fail, a moved GREASE slot does.
+position checks — the JA4 approach. The cipher, group, signature-algorithm and
+version lists, which Chrome does **not** shuffle, are compared in order
+(GREASE-normalized): a changed GREASE value does not fail, a moved GREASE slot
+does. Real Chrome 156 opens signature_algorithms with a GREASE value too, so
+two captures of one Chrome diff clean there.
 
 ### Layer B — Docker refresh / drift alarm (opt-in; needs Docker, and root for SYN)
 

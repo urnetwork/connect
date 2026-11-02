@@ -39,6 +39,45 @@ func TestRealChromeGoldenIsAModernBrowserHello(t *testing.T) {
 	}
 }
 
+// Real Chrome opens signature_algorithms with a grease value it picks per
+// connection, so two captures of one Chrome differ there. A fresh grease pick
+// in that slot is not drift, which is what lets a maintainer diff a refresh
+// capture against the committed golden; a grease value moved out of its slot
+// still is.
+func TestDiffMasksRealChromeSignatureAlgorithmGrease(t *testing.T) {
+	golden, err := LoadGolden(GoldenChrome156Real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signatureAlgorithms := golden.Fingerprint.SignatureAlgorithms
+	if len(signatureAlgorithms) < 2 || !IsGrease(signatureAlgorithms[0]) {
+		t.Fatalf("real Chrome golden signature_algorithms = %v, expected a leading grease value", signatureAlgorithms)
+	}
+	opts := DiffOptions{
+		ExpectedServerName:        golden.Fingerprint.ServerName,
+		ExpectedAlpnProtocols:     golden.Fingerprint.AlpnProtocols,
+		ExpectApplicationSettings: len(golden.Fingerprint.AlpsProtocols) != 0,
+	}
+
+	// another capture of the same Chrome: a different grease pick
+	recaptured := cloneFingerprint(golden.Fingerprint)
+	if recaptured.SignatureAlgorithms[0] == 0x3a3a {
+		recaptured.SignatureAlgorithms[0] = 0x1a1a
+	} else {
+		recaptured.SignatureAlgorithms[0] = 0x3a3a
+	}
+	if drifts := Diff(golden.Fingerprint, recaptured, opts); len(drifts) != 0 {
+		t.Fatalf("a fresh signature_algorithms grease pick drifted: %s", FormatDrift(GoldenChrome156Real, drifts))
+	}
+
+	// the grease moved out of its leading slot
+	moved := cloneFingerprint(golden.Fingerprint)
+	moved.SignatureAlgorithms[0], moved.SignatureAlgorithms[1] = moved.SignatureAlgorithms[1], moved.SignatureAlgorithms[0]
+	if !slices.Contains(driftFields(Diff(golden.Fingerprint, moved, opts)), "signature_algorithms") {
+		t.Fatal("moving the signature_algorithms grease slot did not drift signature_algorithms")
+	}
+}
+
 // The synthetic Chrome_133 parrot is NOT real-browser equivalent: diffing it
 // against the real Chrome 156 golden reports drift, which is why the synthetic
 // golden is regression coverage only and the real golden is the equivalence
