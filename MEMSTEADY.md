@@ -6434,3 +6434,44 @@ This is one ordered diagnostic pair, with independent fresh processes; it is not
 Evidence: closed reproduction `c48-queue-sensitivity-runtime.RESULT.3n1hu3l7/FINAL-CUSTODY.json` (SHA-256 `5500b9177fbae52ac5499f53a0011f899559366c60e43d6fe9292ea08f4b3ed8`); closed sensitivity `c48-queue-newfirst-runtime.RESULT.p8mxzyg9/FINAL-CUSTODY.json` (SHA-256 `7153ecb1befc2dbbd598f78cf06608f04083388d57f50f92c625a65745f367d4`). Both are under `/Volumes/data/urnetwork-hosted-h1-current112.PREP.RkGOt39T/`. Sensitivity exited 0 with all owners joined, unchanged source fingerprint `f373d82f71c6787473ad4f6779ef414e9031927dbdef05a9018d7f36a0353403`, and released cache ownership. Earlier failing runs remain failures.
 
 The full correctness suite, broader PERFVAR comparisons, and real-device MEMSTEADY/PERFVAR qualification for the 32 MiB iOS surrogate and 64 MiB Android profiles remain outstanding. Android cannot qualify a physical iOS extension's total footprint. No final postmortem or overall qualification is claimed.
+
+
+## 2026-11-02: partial physical components and Fast receive-pressure research
+
+The latest Pixel candidate Wi-Fi/H1 collection retained the following component
+results. These are retained Go-runtime observations, including auxiliary samples,
+not continuous process peaks, Android PSS/RSS or a physical iOS footprint.
+
+| Pixel profile | Runtime peak, MiB | Quiet p50, MiB | Fast trials, Mbit/s | Workload result |
+| --- | ---: | ---: | --- | --- |
+| iOS-profile Android surrogate, 32 MiB | 30.39 | 24.75 | 6.2 / 35 / 15 | Valid median 15; numeric 40 Mbit/s goal miss |
+| Android, 64 MiB | 36.39 | 32.21 | 9.9 / invalid 30 / 23 | No valid three-trial median |
+
+The receipts retain exact runtime peaks of 31,871,008 and 38,162,464 bytes.
+The Android second Fast trial reached the
+unchanged 90-second lifecycle bound during `display-poll`: valid=false and
+completed=false. Its displayed 30 Mbit/s is excluded from a throughput median;
+the failed observation remains retained. Both final cells separately report
+memory_eligible=true and owners_joined=true, while workload_eligible=false.
+The later Galaxy attempt failed before traffic/instrumentation and produced no
+memory or throughput measurement. Full cellular collection remains pending.
+
+These APKs predate the private SYN/cohort/queued-wake fixes. The observations
+cannot measure those fixes, establish a causal 64-versus-32 MiB comparison, or
+qualify the complete device/memory/performance matrix. The two profile cells
+were separate public-provider sessions, not a matched memory intervention.
+
+The [read-only Fast investigation](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/fast-bulk-limit-readonly.baWtD1/REPORT.txt)
+observed receive-admission refusals near retained receive-budget saturation.
+Retained admission charges carrier/frame roots and decoded owners, whereas the
+advertised window counts logical bytes. This accounting boundary is a candidate
+bulk-pressure mechanism, not a proven cause of the Fast slowdown or timeout.
+Route/Pack handoff drop counters were zero in these captures. A controlled
+single-sender experiment is prepared but unrun; no receive-budget or production
+default increase is justified by these observations.
+
+Evidence: [Pixel 32 MiB final cell](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/collection/perf/scoped-h1/memsteady-cell-01.json),
+[Pixel 64 MiB final cell](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/collection/perf/scoped-h1/memsteady-cell-02.json),
+[retained invalid Fast observation](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/SECOND-CELL-FAILURE-PACKET.json),
+[Galaxy pre-traffic failure](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-galaxy-first.a_ft2ikx/FIRST-CELL-FAILURE-PACKET.json),
+and [Fast aggregate receipts](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/fast-bulk-limit-readonly.baWtD1/fast-results.json).

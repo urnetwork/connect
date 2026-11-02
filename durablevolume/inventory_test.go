@@ -287,7 +287,21 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 		if err := errors.Join(file.Sync(), file.Close(), owner.rootFile.Sync(), owner.CheckWrite()); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintln(os.Stdout, "writer-synced")
+		if os.Getenv("URNETWORK_SYNTHETIC_VOLUME_BOUNDARY_REFUSAL") == "1" {
+			diagnostic := "synthetic-writer-boundary-diagnostic\n"
+			if _, err := io.WriteString(os.Stderr, diagnostic); err != nil {
+				t.Fatal(err)
+			}
+			// The echo lets the parent copier proceed to its buffer write
+			// while this child refuses readiness and keeps stderr open.
+			echo, err := bufio.NewReader(os.Stdin).ReadString('\n')
+			if err != nil || echo != diagnostic {
+				t.Fatalf("diagnostic echo: %q %v", echo, err)
+			}
+			fmt.Fprintln(os.Stdout, "writer-boundary-refused")
+		} else {
+			fmt.Fprintln(os.Stdout, "writer-synced")
+		}
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		return
 	}
@@ -313,18 +327,27 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 	defer stdin.Close()
 	var diagnostics bytes.Buffer
 	command.Stderr = &diagnostics
+	if os.Getenv("URNETWORK_SYNTHETIC_VOLUME_BOUNDARY_REFUSAL") == "1" {
+		// Write the buffer after the echo: syscall writes release the race
+		// detector's global I/O clock, which stdout reads would acquire.
+		command.Stderr = io.MultiWriter(stdin, &diagnostics)
+	}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
 	joined := false
-	defer func() {
+	stopAndJoin := func() {
 		if !joined {
 			_ = command.Process.Kill()
 			_ = command.Wait()
+			joined = true
 		}
-	}()
+	}
+	defer stopAndJoin()
 	line, err := bufio.NewReader(stdout).ReadString('\n')
 	if err != nil || line != "writer-synced\n" {
+		// Wait also joins the stderr copier before diagnostics is read.
+		stopAndJoin()
 		t.Fatalf("child boundary: %q %v %s", line, err, diagnostics.String())
 	}
 	if owner, err := OpenWithHost(fixture.reference, fixture.root, Snapshot, fixture.host); !errors.Is(err, ErrBusy) {
@@ -336,10 +359,11 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 	if err := command.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	if err := command.Wait(); err == nil {
+	waitErr := command.Wait()
+	joined = true
+	if waitErr == nil {
 		t.Fatal("child did not die at the forced crash")
 	}
-	joined = true
 	snapshot := fixture.open(t, Snapshot)
 	result, err := snapshot.Inventory(t.Context(), fixture.fence(t), InventoryLimits{MaxEntries: 4, MaxBytes: 4096, MaxDepth: 2, MaxOwnerAttributes: 16, MaxOwnerAttributeBytes: 16384})
 	if err != nil || len(result.Entries) != 2 {
@@ -348,5 +372,23 @@ func TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(fixture.root, "completed"))
 	if err != nil || string(raw) != "synthetic-synced-completed-custody" {
 		t.Fatalf("crash custody: %q %v", raw, err)
+	}
+}
+
+// A malformed readiness boundary still joins the real child and its diagnostic
+// copier. The stderr echo advances that copier to its unsynchronized buffer write.
+func TestOwnerCrashBoundaryFailureJoinsDiagnostics(t *testing.T) {
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes$", "-test.count=1", "-test.timeout=30s")
+	command.Env = append(os.Environ(), "URNETWORK_SYNTHETIC_VOLUME_BOUNDARY_REFUSAL=1")
+	raw, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("child boundary refusal did not fail cleanly: %v %s", err, raw)
+	}
+	if bytes.Count(raw, []byte("--- FAIL: TestOwnerCrashReleasesLeaseAndRetainsCompletedBytes (")) != 1 ||
+		!bytes.Contains(raw, []byte(`child boundary: "writer-boundary-refused\n" <nil> synthetic-writer-boundary-diagnostic`)) ||
+		bytes.Contains(raw, []byte("WARNING: DATA RACE")) ||
+		bytes.Contains(raw, []byte("race detected during execution of test")) {
+		t.Fatalf("child boundary refusal lost its joined diagnostics: %s", raw)
 	}
 }

@@ -738,6 +738,9 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		syn := groupDispositionControlPacket(900, 500, 64, tcpFlagSyn)
 		rst := groupDispositionControlPacket(901, 700, 64, tcpFlagRst|tcpFlagAck)
 		data := groupRecoveryPacket(901, 800, 64, tcpFlagAck, []byte{1})
+		// The later same-ISN SYN carries one byte beyond the preceding data.
+		// Its real progress requires admission without reopening the reset cohort.
+		progressingSyn := groupRecoveryPacket(900, 500, 64, tcpFlagSyn, []byte{1, 2})
 		if f.offer(syn) != 1 || f.offer(rst) != 1 {
 			t.Fatal("initial race admission setup refused")
 		}
@@ -748,7 +751,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		}
 		other.unpark()
 		other.acknowledgeAll(syn)
-		if count, accepted := f.offerWithResults(data, syn); count != 2 || !accepted[0] || !accepted[1] {
+		if count, accepted := f.offerWithResults(data, progressingSyn); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("progressing same-SYN group did not reach both candidates")
 		}
 		synctest.Wait()
@@ -765,6 +768,11 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 				flags&(groupCompletionAdmitted|groupCompletionLinked) == groupCompletionAdmitted|groupCompletionLinked &&
 				flags&(groupCompletionReceived|groupCompletionDequeued|groupCompletionDone|
 					groupCompletionTerminal|groupCompletionAbandoned) == 0 {
+				if len(group.packets) != 1 || group.packets[0].ipPath.SequenceNumber != 900 ||
+					group.packets[0].ipPath.TcpPayloadByteCount != 2 || len(group.packets[0].payload) != 2 ||
+					group.packets[0].payload[0] != 1 || group.packets[0].payload[1] != 2 {
+					t.Fatal("winner's raw same-ISN SYN lost its exact uncovered payload suffix")
+				}
 				pendingSyn = true
 			}
 		}
@@ -772,7 +780,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 			t.Fatal("winner's split SYN lacked exact admitted raw custody after data write")
 		}
 		f.unpark()
-		f.acknowledgeAll(syn, rst, data, syn)
+		f.acknowledgeAll(syn, rst, data, progressingSyn)
 		if f.update.IsDone() || !f.update.sequenceCloseReady.Load() {
 			t.Fatal("same-cohort reset did not wait for the winner's pending raw control")
 		}
@@ -784,7 +792,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 			t.Fatal("winner's earlier open SYN erased the later matching-cohort reset")
 		}
 		unpark()
-		other.acknowledgeAll(data, syn)
+		other.acknowledgeAll(data, progressingSyn)
 		if !f.update.IsDone() || f.update.race != nil || f.update.synGenerationNumber != 900 ||
 			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
 			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
@@ -968,7 +976,7 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 
 // One source accepted an old A/reset while the other accepted A/B/new A.
 // Completed receipts stay charged until selection, including repeated cohorts.
-func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capacityRefusal bool) {
+func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capacityRefusal bool, beforePromotion ...bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -1129,6 +1137,34 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 			t.Fatal("old-A reset falsely matched the different source's ABA cohort")
 		}
 		state := f.update.race.clientStates[f.selected]
+		if len(beforePromotion) != 0 && beforePromotion[0] {
+			if !capacityRefusal || state.collapseControl.synNumber != 900 || !state.collapseControl.ambiguousSyn {
+				t.Fatal("pre-promotion ABA control did not retain its exact disposed final-A semantic tail")
+			}
+			firstBudget.SetTotalByteCount(kib(256))
+			synctest.Wait()
+			beforeAdmissions, beforeStarted := admissions.Load(), f.started.Load()
+			accepted := f.offer(syn)
+			synctest.Wait()
+			t.Logf("CANDIDATE_ABA_PRE_PROMOTION_PROOF: aggregate=%d candidate_admissions=%d->%d candidate_started=%d->%d current_syn_order=%d old_A_order=%d", accepted, beforeAdmissions, admissions.Load(), beforeStarted, f.started.Load(), state.collapseControl.synOrder, firstGroups[0].collapseOrder())
+			if accepted != 1 || admissions.Load() != beforeAdmissions+1 || f.started.Load() != beforeStarted+1 {
+				t.Errorf("CANDIDATE_ABA_UNWRITTEN_RETRY_SUPPRESSED: aggregate=%d candidate_admissions=%d->%d candidate_started=%d->%d", accepted, beforeAdmissions, admissions.Load(), beforeStarted, f.started.Load())
+				return
+			}
+			// Decode the candidate's actual reliable wire frame and apply its
+			// real peer ACK before asserting current-cohort suppression.
+			f.acknowledgeAll(syn)
+			if f.update.client.Load() != nil || f.update.race == nil || f.terminal.Load() != beforeStarted+1 {
+				t.Fatal("pre-promotion retry lost its unbound race or actual candidate peer ACK")
+			}
+			admittedCurrent := admissions.Load()
+			f.offer(syn)
+			synctest.Wait()
+			if admissions.Load() != admittedCurrent || len(f.route) != 0 {
+				t.Fatal("current retained final-A cohort did not suppress its next identical retry")
+			}
+			return
+		}
 		if closeAtEnd {
 			finalPhase.Store(true)
 			if f.offer(rst) != 1 {

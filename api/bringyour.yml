@@ -19791,6 +19791,19 @@ components:
             The extender's identity public key, hex. Every probe requires a
             signature over a fresh challenge under this key.
           type: string
+        reality_public_key_hex:
+          description: |
+            The X25519 static public key of the extender's tcp camouflage, hex
+            (connect/EXTENDER.md P1, P6; EXTENDER-UPDATE2 §3), which a client
+            fronts its camouflaged hello with. A passing activation stores it,
+            and the extender's records carry it while the network that posted
+            it holds the identity key. Omitted, as an extender with camouflage
+            off sends it, a passing activation clears a stored key. A value
+            that is not a usable 32-byte X25519 key is refused before anything
+            is probed. The tcp probes front a camouflaged attempt with it, so
+            a splicing extender passes; the activation does not prove the
+            extender holds the private half.
+          type: string
         tcp_port:
           description: The tcp carrier port. 0 takes the default, 443.
           type: integer
