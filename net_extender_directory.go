@@ -303,6 +303,10 @@ type extenderDirectoryRecord struct {
 	// (retainedExpiredKeyHexesWithLock), so a seed past its expiry is not a
 	// last resort for a new cold start (EXTENDER-UPDATE2.md §2.3)
 	seed bool
+	// whether the connection path drew this identity while block evidence is
+	// on, which is a record the client uses (net_extender_directory_gated_block.go).
+	// Per process, never stored
+	connectDrawn bool
 }
 
 // The local evidence about one address. `publicKeyHex` is empty while the
@@ -549,6 +553,8 @@ type ExtenderDirectory struct {
 	// the gated-preferred connection policy (net_extender_directory_gated.go,
 	// EXTENDER-UPDATE2 §1.1); its zero value is the policy off
 	gated extenderGatedState
+	// what the block report sender acts on (net_extender_directory_gated_block.go)
+	blockEvidence extenderBlockEvidenceState
 }
 
 // One live subscription to the applied messages (D4). The channel is the
@@ -1309,6 +1315,7 @@ func (self *ExtenderDirectory) RecordSuccess(ip netip.Addr, connectMode Extender
 	}
 	self.tierUpdateAddressWithLock(address, now)
 	self.gatedConnectedWithLock(address, now)
+	self.blockEvidenceAnsweredWithLock(address.publicKeyHex, now)
 	self.changedWithLock()
 }
 
@@ -1339,6 +1346,7 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]failure %s %s consecutive=%d\n", ip, connectMode, address.consecutiveFailureCount)
 	}
+	self.blockEvidenceFailedWithLock(address, now)
 	if self.shouldRemoveWithLock(address, now) {
 		delete(self.ipAddresses, ip)
 		self.pruneKeyRecordsWithLock()
@@ -1382,6 +1390,8 @@ func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Dura
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[extender]limited %s until %s\n", ip, address.limitedUntilTime)
 	}
+	// only a reachable extender can answer 429
+	self.blockEvidenceAnsweredWithLock(address.publicKeyHex, now)
 	self.changedWithLock()
 	return address.limitedUntilTime
 }
@@ -3015,6 +3025,7 @@ func (self *ExtenderDirectory) Reset(rootKeySet *ExtenderRootKeySet) {
 		clear(self.eventTimes)
 		self.eventTimes = self.eventTimes[:0]
 		self.eventHead = 0
+		self.blockEvidenceForgetWithLock()
 		self.tierRebuildWithLock(now)
 		self.changedWithLock()
 	}()
