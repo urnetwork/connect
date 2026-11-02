@@ -193,7 +193,7 @@ but a name this extender's supported clients select did not verify, or a list is
 unmeasured or past its maximum age. A prober replaying that name meets a
 substitution, which is degraded (`connect.EvaluateExtenderCamouflageCoverage`).
 Roles log the verdict and the counts as one line, which is the only place an
-operator can read them until the reporting path below exists:
+operator can read them on a host outside a reporting cohort (Reporting path, below):
 
     extender camouflage: authenticated_rollout, not covered: splice_off; 3 verified names, 0 failed verifications; 12 authenticated, 0 spliced, 40 terminated, 0 fallback terminated
 
@@ -207,15 +207,109 @@ camouflaged attempt failed — Phase A terminate vs Phase B splice), and the
 `LegacyOnly*` reasons a dial ran legacy alone.
 
 Aggregate all of the above by country, address family, and client/resource
-version. Never export a gated address, key, client or network id into telemetry.
+version, which the reporting path below does. Never export a gated address, key,
+client or network id into telemetry.
 
-## Reporting path (open gap)
+## Reporting path
 
-Connect and the SDK expose these counts as in-process snapshots only; there is
-no metrics export from client or extender to the server today. Fleet telemetry
-and the per-target aggregate load (gate 7) need a reporting path added before
-Phase B can be judged against the numeric gates. This is operational work, not
-in this slice.
+Client and extender post what they counted to the operator, which adds it to
+Prometheus counters and keeps nothing else. No table and no migration.
+
+Status 2026-11-02: built and off on both sides. Nothing is sent until a cohort is
+turned on and the operator's switch is on. Dashboard: `urnetwork / extender
+camouflage` (`extender-camouflage.json`).
+
+**Turning it on.** All of these, in this order:
+
+1. Operator: `camouflage_report: { enabled: true }` in vault `extender.yml`, then a
+   rolling api restart, in waves. It is read once per process. Off, the default, the
+   route answers `disabled` and counts nothing. **This is the kill switch**: turn it
+   off and restart, and senders go away for about six hours at a time.
+2. Clients and SDK provider roles: `NetworkSpaceValues.ExtenderGatedPreference`, the
+   gated preference's cohort control. Every cohort enabled for gated selection reports,
+   and no new value reaches the exported SDK surface.
+3. Operator hosts: `connectctl extender --camouflage_report`. A host has no network
+   space, so the flag is its cohort control. Off by default.
+
+**What is sent.** `POST /network/extender-camouflage-report` under the sender's client
+JWT, with a random report id and the increase since its last report of
+`ExtenderTcpCamouflageClientStatsSnapshot()` and, for an extender,
+`CamouflageStats()`, the load per borrowed name, and the `CamouflageStatus()` verdict.
+It also carries the build, the borrow list version and the families it dials. It never
+carries a gated address, a key, a client id or a network id. Client and extender run
+the same sender (`connect.ExtenderCamouflageReporter`).
+
+**When.** One loop, one post at a time. The first look is 5 to 15 minutes after the
+sender starts, then hourly within 15 minutes either way. A client that never dials an
+extender never posts; an extender gives its verdict each hour. A failed post is
+retried at most three times over a doubling, jittered backoff from 5 minutes, then the
+report is given up, and each one given up in a row doubles the wait, to six hours. An
+operator gone for a week costs about four posts every six hours per sender. An account
+change cancels what is out and drops everything counted so far.
+
+**Counted once.** The gates can read these as lower bounds. Every failure undercounts
+and none overcounts:
+
+- A retry posts the same id and the same bytes. The operator claims an id in Redis for
+  three hours and a sender stops at two, so a retry of a post whose answer was lost
+  answers `duplicate` and adds nothing. What is counted meanwhile waits for the next
+  report under a new id.
+- A restart starts the counters and the record of what was taken at zero together, both
+  in process memory, so nothing can be sent twice and what was not delivered is lost.
+- Senders in one process share that record, so one count goes to one sender.
+- A report given up is lost, not merged into the next, since merging could count it
+  twice if a post of it had landed.
+
+**What the server does with it.** It authenticates the client JWT, checks the payload
+(16 KiB, the bounds in `controller/extender_camouflage_report.go`, unknown fields
+ignored), spends the client's budget of 12 reports an hour, and claims the id. Then it
+increments counters, and that is all it writes. The identity is not recorded: the
+budget's Redis key is a keyed hash of the client id that expires with its window, and
+the id's claim holds nothing about the caller.
+
+| Metric | Labels |
+| --- | --- |
+| `urnetwork_extender_camouflage_reports_total` | `outcome`: how each report ended |
+| `urnetwork_extender_camouflage_client_outcomes_total` | `outcome`, `country`, `family` |
+| `urnetwork_extender_camouflage_client_version_outcomes_total` | `outcome`, `client_version`, `resource_version` |
+| `urnetwork_extender_camouflage_extender_outcomes_total` | `outcome`, `country`, `family` |
+| `urnetwork_extender_camouflage_extender_version_outcomes_total` | `outcome`, `client_version`, `resource_version` |
+| `urnetwork_extender_camouflage_status_reports_total` | `verdict`, `country`, `family` |
+| `urnetwork_extender_camouflage_status_version_reports_total` | `verdict`, `client_version`, `resource_version` |
+| `urnetwork_extender_camouflage_target_splices_total` | `target` |
+| `urnetwork_extender_camouflage_target_relayed_bytes_total` | `target` |
+
+Every label value comes from a fixed set the server holds. `target` is a name in the
+api build's own bundled borrow lists, else `other`, and with today's empty lists that is
+all of it: gate 7 can be read per site only once the api build carries the measured
+list. `client_version` is a calendar release day while recent and its month after;
+`connectctl` hosts read `unknown` or `other`, so read hosts by `resource_version`.
+`resource_version` is `none`, a version within four of the api's own, or `other`.
+
+**Reading the numbers against the gates.**
+
+- `country` is the server's own lookup of the caller's address, never the report's
+  word. A report that crossed an extender reads `relayed`, whose country says nothing of
+  the client, so a client in a blocked country that reaches the api only through
+  extenders is in `relayed`, not in its country. Its counts still reach the fleet totals
+  and the version series. A relay the operator does not know, a VLESS server or a user's
+  proxy, reads as that relay's country.
+- Clients that cannot reach the api at all are missing, and a process that exits before
+  its first look is missing. A real outage reads better than it is, so read
+  `both_failed` and the release denials together, and never take a quiet series as good
+  news: check `reports_total` first.
+- A client's counts are its own word. One identity can add at most 65,536 per counter
+  per report and 12 reports an hour, enough to move a small cohort's rate, so a jump in
+  one series needs reading against `reports_total` before it moves a gate. An extender's
+  part counts only from a client that activated an extender that is active now, so a
+  stranger cannot trip a rollback threshold through it. That check reads the fleet into
+  process memory once per process per ten minutes.
+- A verdict goes out about once an hour per extender, so
+  `status_reports_total` over an hour is about a count of extenders by verdict, and only
+  of those that report. Only `covered` is coverage.
+- At full reporting the claims take about 120 bytes of Redis per report for three hours,
+  and a budget key about 100 bytes, so about 500 bytes per reporting sender. Check it
+  before a cohort of millions.
 
 ## Operator probes in Phase B (added 2026-11-02)
 

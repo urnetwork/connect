@@ -150,6 +150,14 @@ type extenderOptions struct {
 	// configureServer, when set, sees the server's settings last, just before
 	// the server is built. The test reads what the command passes through it.
 	configureServer func(settings *extender.ExtenderSettings)
+
+	// whether this extender posts what its tcp camouflage came to to the operator
+	// (connect/EXTENDER-SPLICE-ROLLOUT.md): --camouflage_report, off by default.
+	// This is the operator hosts' cohort control, which have no network space.
+	camouflageReport bool
+	// configureCamouflageReport, when set, adjusts the sender's settings. The test
+	// takes the first look without waiting out its minutes.
+	configureCamouflageReport func(settings *connect.ExtenderCamouflageReporterSettings)
 }
 
 // Reads the extender command's flags. Zero ports take the fixed carrier ports
@@ -184,6 +192,9 @@ func extenderOptionsFromOpts(opts docopt.Opts) (*extenderOptions, error) {
 	}
 	if measurementZone, err := opts.String("--measurement_zone"); err == nil {
 		options.measurementZone = strings.TrimSpace(measurementZone)
+	}
+	if camouflageReport, err := opts.Bool("--camouflage_report"); err == nil {
+		options.camouflageReport = camouflageReport
 	}
 	if stateDir, err := opts.String("--state_dir"); err == nil {
 		options.stateDir = stateDir
@@ -834,11 +845,34 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	run.peerPinger = connect.NewExtenderPeerPinger(ctx, run.clientStrategy, run.directory, pingerSettings)
 	run.closers = append(run.closers, run.peerPinger.Close)
 
+	if options.camouflageReport {
+		reporter := connect.NewExtenderCamouflageReporter(ctx, run.camouflageReporterSettings())
+		reporter.SetSource(run.server)
+		reporter.SetEnabled(true)
+		// closes before the server it reads and the strategy it posts through
+		run.closers = append(run.closers, reporter.Close)
+	}
+
 	success = true
 	if options.onStart != nil {
 		options.onStart(run)
 	}
 	return run, nil
+}
+
+// What the sender of the camouflage report posts with: this extender's own strategy
+// and credential, which is the identity that activated it.
+func (self *extenderRun) camouflageReporterSettings() *connect.ExtenderCamouflageReporterSettings {
+	settings := connect.DefaultExtenderCamouflageReporterSettings()
+	settings.ApiUrl = self.options.apiUrl
+	settings.ByJwt = func() string { return self.options.jwt }
+	settings.Post = func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error) {
+		return connect.HttpPostWithStrategyRaw(ctx, self.clientStrategy, requestUrl, requestBodyBytes, byJwt)
+	}
+	if self.options.configureCamouflageReport != nil {
+		self.options.configureCamouflageReport(settings)
+	}
+	return settings
 }
 
 // Serves until the context is done, logging every activation status change

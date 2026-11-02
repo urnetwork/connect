@@ -139,6 +139,7 @@ Usage:
         [--camouflage]
         [--camouflage_splice]
         [--camouflage_revalidate_interval=<duration>]
+        [--camouflage_report]
     
 Options:
     -h --help                        Show this screen.
@@ -174,6 +175,8 @@ Options:
     --admission_unlimited_source=<cidr>
                                      A source prefix exempt from both limits, such as an NLayer front. Repeatable.
     --state_dir=<dir>                Directory for the extender key and the known extenders.
+    --camouflage_report              Post what this extender's tcp camouflage came to to the
+                                     operator, as counts, about once an hour. Off by default.
     --no_measurement                 Do not serve the lag.dev measurement API, and ask the
                                      operator for no measurement certificate. The API needs an
                                      identity kept by --extender_key_file or --state_dir.
