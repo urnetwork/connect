@@ -5,7 +5,9 @@ package connect
 // camo-first-then-legacy ordering is forced with barriers rather than timing.
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net"
 	"sync"
@@ -204,17 +206,25 @@ func TestExtenderCamouflageApplies(t *testing.T) {
 	}
 }
 
-// The front name is drawn from the bundled borrow list, and is empty when none
-// is bundled, which drops the camouflaged attempt to legacy alone (P5, P8).
+// The front name is selected from the client's borrow list for this extender's
+// identity key, and is empty when none is bundled or the config has no key,
+// which drops the camouflaged attempt to legacy alone (P5, P8,
+// EXTENDER-UPDATE2 §3.1).
 func TestExtenderCamouflageFrontName(t *testing.T) {
+	identityKey := bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize)
 	restore := setBorrowDomainsForTest([]string{"front.example"})
 	defer restore()
-	if got := extenderCamouflageFrontName(&ExtenderConfig{}); got != "front.example" {
+	if got := extenderCamouflageFrontName(&ExtenderConfig{PublicKey: identityKey}); got != "front.example" {
 		t.Fatalf("front name = %q, expected front.example", got)
+	}
+	// no identity key: nothing to score with, so the camouflaged attempt is
+	// dropped rather than fronting an arbitrary name
+	if got := extenderCamouflageFrontName(&ExtenderConfig{}); got != "" {
+		t.Fatalf("front name = %q, expected empty with no identity key", got)
 	}
 	restoreEmpty := setBorrowDomainsForTest([]string{})
 	defer restoreEmpty()
-	if got := extenderCamouflageFrontName(&ExtenderConfig{}); got != "" {
+	if got := extenderCamouflageFrontName(&ExtenderConfig{PublicKey: identityKey}); got != "" {
 		t.Fatalf("front name = %q, expected empty with no borrow list", got)
 	}
 }

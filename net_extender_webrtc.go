@@ -336,6 +336,8 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 	conn := newWebRtcDataChannelConn(detached, peerConnection, cancelResolve, int(self.settings.MaxMessageSize))
 	owned = true
 
+	// the challenge is checked after the response, so its Date is not an
+	// authenticated time source
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
@@ -343,6 +345,7 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 		conn,
 		headerBytes,
 		dial.RoundTrip,
+		nil,
 	)
 	if err != nil {
 		_ = conn.Close()

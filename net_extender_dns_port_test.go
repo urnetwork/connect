@@ -209,7 +209,7 @@ func TestExtenderFeedConfigRacesBothDnsPorts(t *testing.T) {
 		if len(candidates) != 1 {
 			t.Fatalf("record %v: candidates = %d, expected the one address", c.recordDnsPorts, len(candidates))
 		}
-		extenderConfig := extenderFeedConfig(candidates[0], ExtenderConnectModeDns, nil)
+		extenderConfig := extenderFeedConfig(candidates[0], ExtenderConnectModeDns, nil, "")
 		if extenderConfig == nil {
 			t.Fatalf("record %v: no dns feed config", c.recordDnsPorts)
 		}

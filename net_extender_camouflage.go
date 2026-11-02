@@ -34,9 +34,9 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/x509"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -64,28 +64,63 @@ func extenderTcpCamouflageStaggerC() <-chan time.Time {
 
 // Whether the tcp dial runs the camouflaged attempt (P7, P8): the config
 // carries both the camouflage static key and the identity key the B3 check
-// needs, and the fingerprint kill switch is not "go".
+// needs, and the fingerprint switch selects the Chrome hello the camouflaged
+// attempt presents ("" or "chrome"; "go" is the kill switch, and an unknown
+// value is not the Chrome hello either). The capability a client claims reads
+// the same switch (extenderCamouflageFingerprintAllows).
 func extenderCamouflageApplies(connectSettings *ConnectSettings, extenderConfig *ExtenderConfig) bool {
-	if len(extenderConfig.RealityPublicKey) != extenderRealityX25519PublicKeyByteCount {
-		return false
-	}
-	if len(extenderConfig.PublicKey) != ed25519.PublicKeySize {
-		return false
-	}
-	return connectSettings.TlsClientHelloFingerprint != TlsClientHelloFingerprintGo
+	return extenderCamouflageKeyed(extenderConfig) &&
+		extenderCamouflageFingerprintAllows(connectSettings.TlsClientHelloFingerprint)
 }
 
-// The borrowed name the camouflaged attempt fronts (P5), drawn at dial time
-// from the bundled borrow list so a later dial fronts a different one. Empty
-// when no borrow name is bundled, which drops the camouflaged attempt and dials
-// the legacy one alone — the same degrade-to-legacy an extender that verified no
-// borrow name produces by publishing no camouflage key.
+// Whether the config carries both keys the camouflaged attempt needs.
+func extenderCamouflageKeyed(extenderConfig *ExtenderConfig) bool {
+	return len(extenderConfig.RealityPublicKey) == extenderRealityX25519PublicKeyByteCount &&
+		len(extenderConfig.PublicKey) == ed25519.PublicKeySize
+}
+
+// The reasons a tcp dial runs the legacy attempt alone.
+const (
+	extenderCamouflageLegacyOnlyNoKey       = "no_key"
+	extenderCamouflageLegacyOnlyFingerprint = "fingerprint"
+	extenderCamouflageLegacyOnlyNoFrontName = "no_front_name"
+)
+
+// What one tcp dial runs (P8, EXTENDER-UPDATE2 §3.2): the front name of the
+// camouflaged attempt, or empty with the reason the legacy attempt runs alone.
+// The reason is counted (ExtenderTcpCamouflageClientStats).
+func extenderCamouflageDecision(connectSettings *ConnectSettings, extenderConfig *ExtenderConfig) (string, string) {
+	if !extenderCamouflageKeyed(extenderConfig) {
+		extenderTcpCamouflageLegacyOnlyNoKeyCount.Add(1)
+		return "", extenderCamouflageLegacyOnlyNoKey
+	}
+	if !extenderCamouflageFingerprintAllows(connectSettings.TlsClientHelloFingerprint) {
+		extenderTcpCamouflageLegacyOnlyFingerprintCount.Add(1)
+		return "", extenderCamouflageLegacyOnlyFingerprint
+	}
+	frontName := extenderCamouflageFrontName(extenderConfig)
+	if frontName == "" {
+		extenderTcpCamouflageLegacyOnlyNoFrontNameCount.Add(1)
+		return "", extenderCamouflageLegacyOnlyNoFrontName
+	}
+	return frontName, ""
+}
+
+// The borrowed name the camouflaged attempt fronts (P5, EXTENDER-UPDATE2
+// §3.1): of the names the client's borrow list selects — its country's list
+// when one is bundled, else the global one — the one ExtenderCamouflageFrontName
+// scores highest for this extender's identity key, so every client of a list
+// version fronts this extender with the one name it verified and splices to.
+// Empty when no borrow name is selectable or the config has no identity key,
+// which drops the camouflaged attempt and dials the legacy one alone — the same
+// degrade-to-legacy an extender that verified no borrow name produces by
+// publishing no camouflage key.
 func extenderCamouflageFrontName(extenderConfig *ExtenderConfig) string {
-	borrowDomains := BorrowDomains()
-	if len(borrowDomains) == 0 {
+	borrowList := ExtenderCamouflageBorrowListForCountry(extenderConfig.CamouflageCountryCode)
+	if borrowList == nil {
 		return ""
 	}
-	return borrowDomains[rand.IntN(len(borrowDomains))]
+	return ExtenderCamouflageFrontName(extenderConfig.PublicKey, borrowList.SelectableNames(borrowList.Version))
 }
 
 // The camouflaged tcp attempt: the Go-TLS dial replaced by an authenticated
@@ -139,6 +174,8 @@ func dialExtenderTcpCamouflageConn(
 		}
 	}
 
+	// the camouflaged handshake always checks the leaf under the record key
+	// (B3), so the extender's Date is an authenticated time source
 	streamConn, response, err := extenderStreamRequest(
 		ctx,
 		connectSettings,
@@ -146,6 +183,7 @@ func dialExtenderTcpCamouflageConn(
 		serverConn,
 		headerBytes,
 		roundTrip,
+		newExtenderCamouflageTimeSource(extenderConfig, true),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -179,6 +217,9 @@ func extenderCamouflageClientHandshake(
 		return nil, err
 	}
 
+	// a leaf the record key did not sign is another site: the splice of a
+	// Phase B extender, told apart so the race can count it
+	leafVerifier := newExtenderLeafVerifier(extenderConfig.PublicKey)
 	uconfig := &utls.Config{
 		ServerName: frontName,
 		// the leaf is checked below against the record key (B3); the browser
@@ -186,7 +227,12 @@ func extenderCamouflageClientHandshake(
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
 		OmitEmptyPsk:           true,
-		VerifyPeerCertificate:  newExtenderLeafVerifier(extenderConfig.PublicKey),
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if err := leafVerifier(rawCerts, verifiedChains); err != nil {
+				return fmt.Errorf("%w: %w", errExtenderCamouflageLeafRejected, err)
+			}
+			return nil
+		},
 	}
 	uconn := utls.UClient(conn, uconfig, utls.HelloCustom)
 	success := false
@@ -198,40 +244,14 @@ func extenderCamouflageClientHandshake(
 	if err := uconn.ApplyPreset(spec); err != nil {
 		return nil, err
 	}
-	// marshal the hello so its random, session id and key shares are set before
-	// the tag is sealed into the session id
-	if err := uconn.BuildHandshakeState(); err != nil {
+	if err := sealExtenderCamouflageHello(
+		uconn,
+		serverStaticPublicKey,
+		extenderConfig.PublicKey,
+		extenderCamouflageSealTime(extenderConfig.PublicKey),
+	); err != nil {
 		return nil, err
 	}
-	hello := uconn.HandshakeState.Hello
-	if len(hello.Raw) < vlessRealitySessionIdOffset+32 || len(hello.SessionId) != 32 || len(hello.Random) != 32 {
-		return nil, errors.New("extender reality: the browser hello has no 32-byte session id")
-	}
-	clientEphemeral := extenderCamouflageClientEphemeral(uconn.HandshakeState.State13.KeyShareKeys)
-	if clientEphemeral == nil {
-		return nil, errors.New("extender reality: the browser hello offers no x25519 tls 1.3 key share")
-	}
-	sharedSecret, err := clientEphemeral.ECDH(serverStaticPublicKey)
-	if err != nil {
-		return nil, err
-	}
-	authKey, err := extenderRealityAuthKey(sharedSecret, hello.Random)
-	if err != nil {
-		return nil, err
-	}
-	// the additional data is the hello with a zero session id
-	clear(hello.Raw[vlessRealitySessionIdOffset : vlessRealitySessionIdOffset+32])
-	shortId := ExtenderKeyId(extenderConfig.PublicKey)
-	sessionId, err := vlessRealitySealSessionId(
-		authKey,
-		hello.Raw,
-		hello.Random,
-		extenderRealitySessionIdPlaintext(shortId, time.Now().Add(extenderCamouflageClientClockOffset(extenderConfig))),
-	)
-	if err != nil {
-		return nil, err
-	}
-	hello.SessionId = sessionId
 
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		return nil, err
@@ -240,10 +260,61 @@ func extenderCamouflageClientHandshake(
 	// is an unauthenticated terminate the attempt must fail on so the race falls
 	// to legacy, never a refusal that would end the race
 	if negotiated := uconn.ConnectionState().NegotiatedProtocol; negotiated != "http/1.1" {
-		return nil, fmt.Errorf("extender reality: the hello was not authenticated (alpn %q)", negotiated)
+		return nil, fmt.Errorf("%w (alpn %q)", errExtenderCamouflageUnauthenticated, negotiated)
 	}
 	success = true
 	return uconn, nil
+}
+
+// sealExtenderCamouflageHello builds the uconn's handshake state and seals the
+// authenticated tag into the hello's 32-byte legacy session id (P1): the proof
+// that the client holds the extender identity key, under a key agreed from the
+// hello's own X25519 ephemeral and the extender static public key, over the
+// hello with a zeroed session id as additional data. After it the hello on the
+// wire is a faithful Chrome hello whose only non-Chrome byte is the session id,
+// which Chrome fills with 32 random bytes anyway. sealTime is the time the tag
+// carries, checked by the server against its window.
+func sealExtenderCamouflageHello(
+	uconn *utls.UConn,
+	serverStaticPublicKey *ecdh.PublicKey,
+	identityPublicKey []byte,
+	sealTime time.Time,
+) error {
+	// marshal the hello so its random, session id and key shares are set before
+	// the tag is sealed into the session id
+	if err := uconn.BuildHandshakeState(); err != nil {
+		return err
+	}
+	hello := uconn.HandshakeState.Hello
+	if len(hello.Raw) < vlessRealitySessionIdOffset+32 || len(hello.SessionId) != 32 || len(hello.Random) != 32 {
+		return errors.New("extender reality: the browser hello has no 32-byte session id")
+	}
+	clientEphemeral := extenderCamouflageClientEphemeral(uconn.HandshakeState.State13.KeyShareKeys)
+	if clientEphemeral == nil {
+		return errors.New("extender reality: the browser hello offers no x25519 tls 1.3 key share")
+	}
+	sharedSecret, err := clientEphemeral.ECDH(serverStaticPublicKey)
+	if err != nil {
+		return err
+	}
+	authKey, err := extenderRealityAuthKey(sharedSecret, hello.Random)
+	if err != nil {
+		return err
+	}
+	// the additional data is the hello with a zero session id
+	clear(hello.Raw[vlessRealitySessionIdOffset : vlessRealitySessionIdOffset+32])
+	shortId := ExtenderKeyId(identityPublicKey)
+	sessionId, err := vlessRealitySealSessionId(
+		authKey,
+		hello.Raw,
+		hello.Random,
+		extenderRealitySessionIdPlaintext(shortId, sealTime),
+	)
+	if err != nil {
+		return err
+	}
+	hello.SessionId = sessionId
+	return nil
 }
 
 // The client ephemeral X25519 private key for the tag's ECDH (P1): the
@@ -260,15 +331,6 @@ func extenderCamouflageClientEphemeral(keyShareKeys *utls.KeySharePrivateKeys) *
 		}
 	}
 	return nil
-}
-
-// The clock correction the client seals its time with (P8). connect keeps no
-// verified server-time offset yet, so this is zero today; 14a adds the offset
-// (the Date header of an authenticated api response or a verified DoH answer)
-// here, which keeps a skewed client's camouflaged attempt from falling to
-// legacy. Reads only the config so the seam is per-dial.
-func extenderCamouflageClientClockOffset(extenderConfig *ExtenderConfig) time.Duration {
-	return 0
 }
 
 // One attempt of the tcp camouflage race and what it came back with.
@@ -319,6 +381,11 @@ func raceExtenderTcpCamouflage(
 			}, func(err error) {
 				attempt.err = err
 			})
+			if camo && attempt.err != nil {
+				// counted here so a camouflaged attempt that fails after the
+				// race ended is counted too
+				countExtenderCamouflageAttemptFailure(attempt.err)
+			}
 			select {
 			case attempts <- attempt:
 			case <-raceCtx.Done():
@@ -359,8 +426,14 @@ func raceExtenderTcpCamouflage(
 				if roundTrip != nil {
 					*roundTrip = *attempt.roundTrip
 				}
+				if attempt.camo {
+					extenderTcpCamouflageCamouflageWonCount.Add(1)
+				} else {
+					extenderTcpCamouflageLegacyWonCount.Add(1)
+				}
 				return attempt.conn, attempt.response, nil
 			case errors.As(attempt.err, &limitedErr), errors.As(attempt.err, &refusedErr):
+				extenderTcpCamouflageRefusedCount.Add(1)
 				return nil, nil, attempt.err
 			default:
 				errs = append(errs, attempt.err)
@@ -372,6 +445,7 @@ func raceExtenderTcpCamouflage(
 					staggerC = nil
 					launch(false, legacyDial)
 				} else if pendingCount == 0 {
+					extenderTcpCamouflageBothFailedCount.Add(1)
 					return nil, nil, errors.Join(errs...)
 				}
 			}

@@ -33,6 +33,16 @@ import (
 // in-process one, bounded, which an operator of one process and every test
 // use; a replicated operator backs the same interface with its database. The
 // policy holds no lock of its own: the ledger is what is shared.
+//
+// Every answer carries an outcome (EXTENDER-UPDATE2 §1.1): ok, or why the
+// release is empty or refused, with the time after which asking again can
+// change it where the policy knows one (the epoch's end, the probation's end,
+// the request window). An outcome is coarse by design. None names a count, a
+// partition or a record, so a requester learns nothing of the fleet from it
+// that its own release does not already show. A record the requester's client
+// cannot use (Compatible, §3.2) is skipped like an ineligible one: the
+// identity's count, partition and epoch disclosures are the same whatever
+// capabilities it declares.
 
 // The defaults.
 const (
@@ -65,6 +75,52 @@ var (
 	ErrExtenderReleaseVantageLimited  = errors.New("the vantage has reached its release request limit")
 	ErrExtenderReleaseLedgerFull      = errors.New("the release ledger is full")
 )
+
+// The outcome of one release request, as the release route's additive
+// `outcome` names it (EXTENDER-UPDATE2 §1.1). A client treats a value it does
+// not know as empty.
+const (
+	// at least one record was released
+	ExtenderReleaseOutcomeOk = "ok"
+	// admitted, and nothing in the identity's partition was eligible for it:
+	// none of its family, all blocked in its country, or no gated fleet
+	ExtenderReleaseOutcomeEmpty = "empty"
+	// the identity's disclosures for this epoch are spent, and none of the
+	// records it was already given is eligible now; the next epoch renews it
+	ExtenderReleaseOutcomeEpochSpent = "epoch_spent"
+	// as epoch_spent, for an identity still in probation, whose count rises
+	// when its probation ends
+	ExtenderReleaseOutcomeProbation = "probation"
+	// every eligible record has been released to as many identities in the
+	// requester's country as the policy allows
+	ExtenderReleaseOutcomeCountryCapacity = "country_capacity"
+	// a request limit refused it, per identity or per vantage
+	ExtenderReleaseOutcomeRateLimited = "rate_limited"
+	// the only eligible records require capabilities the requester's client
+	// did not declare
+	ExtenderReleaseOutcomeIncompatible = "incompatible"
+	// the release could not be answered: the operator's configuration, the
+	// ledger, or the request itself
+	ExtenderReleaseOutcomeUnavailable = "unavailable"
+)
+
+// A refused release request: the outcome to answer with and, when known, how
+// long until asking again can be admitted. It unwraps to the cause, one of the
+// ErrExtenderRelease errors or a ledger error, whose message is the refusal a
+// client that predates outcomes reads.
+type ExtenderReleaseRefusal struct {
+	Outcome    string
+	RetryAfter time.Duration
+	Err        error
+}
+
+func (self *ExtenderReleaseRefusal) Error() string {
+	return self.Err.Error()
+}
+
+func (self *ExtenderReleaseRefusal) Unwrap() error {
+	return self.Err
+}
 
 // The policy numbers, all settings so a test pins every transition.
 type ExtenderReleaseSettings struct {
@@ -147,6 +203,12 @@ type ExtenderReleaseRequest struct {
 	// When set, which records may be released to this requester at all --
 	// the family it can dial, for one. Nil is every record.
 	Eligible func(keyHex string) bool
+	// When set, which of the eligible records the requester's client can
+	// use: the capabilities it declared cover what the record requires
+	// (EXTENDER-UPDATE2 §3.2). An incompatible record is skipped like an
+	// ineligible one and never charged, and an answer it leaves empty is
+	// ExtenderReleaseOutcomeIncompatible. Nil is every record.
+	Compatible func(keyHex string) bool
 }
 
 // One release.
@@ -163,6 +225,12 @@ type ExtenderReleaseResult struct {
 	Count int
 	// Whether the identity is still new.
 	Probation bool
+	// Why the release holds what it does (ExtenderReleaseOutcome).
+	Outcome string
+	// For an empty release, how long until asking again can change it, when
+	// the policy knows: the epoch's end, or the probation's when sooner. Zero
+	// when it does not.
+	RetryAfter time.Duration
 }
 
 // The release policy, keyed by the operator's secret.
@@ -196,8 +264,9 @@ func NewExtenderReleasePolicy(
 }
 
 // Releases to one identity from the gated fleet `keyHexes`, in any order,
-// repeats included. The error is the request limit that refused it; a
-// request that is admitted but finds nothing eligible is an empty release,
+// repeats included. A refusal is an *ExtenderReleaseRefusal, which unwraps to
+// the request limit or ledger error that refused it; a request that is
+// admitted but finds nothing eligible is an empty release with its outcome,
 // not an error.
 func (self *ExtenderReleasePolicy) Release(
 	request *ExtenderReleaseRequest,
@@ -247,6 +316,9 @@ func (self *ExtenderReleasePolicy) Release(
 		availableKeyHexes[strings.ToLower(keyHex)] = true
 	}
 	eligibleKeyHexes := map[string]bool{}
+	// Eligible records the requester's client cannot use. They are never
+	// charged, and they decide the outcome only when nothing else is left.
+	incompatibleCount := 0
 	var blockedKeyHexes map[string]bool
 	batchBlocked, batch := self.blocked.(ExtenderReleaseBlockedBatchSource)
 	if batch {
@@ -263,31 +335,40 @@ func (self *ExtenderReleasePolicy) Release(
 		if blockedKeyHexes[keyHex] || (!batch && self.blocked != nil && self.blocked.Blocked(keyHex, countryCode)) {
 			continue
 		}
+		if request.Compatible != nil && !request.Compatible(keyHex) {
+			incompatibleCount += 1
+			continue
+		}
 		eligibleKeyHexes[keyHex] = true
 	}
 	var releaseErr error
+	// What emptied the answer, read in the transaction that decided it.
+	spent := false
+	countryCapacityLimited := false
 	self.ledger.Transact(request.Identity, request.Vantage, countryCode, candidateKeyHexes, func(ledger ExtenderReleaseLedgerTx) {
 		// Durable transactions may retry after a serialization/commit error.
 		result.KeyHexes = result.KeyHexes[:0]
 		releaseErr = nil
+		spent = false
+		countryCapacityLimited = false
 		identityCount, vantageCount := ledger.RequestCounts(request.Identity, request.Vantage, now.Add(-self.settings.RequestWindow))
 		// Refusals commit too, so retrying cannot reopen a closed gate.
 		ledger.RecordRequest(request.Identity, request.Vantage, now)
 		if 0 < self.settings.IdentityRequestLimit && self.settings.IdentityRequestLimit <= identityCount {
-			releaseErr = ErrExtenderReleaseIdentityLimited
+			releaseErr = self.requestLimitRefusal(ErrExtenderReleaseIdentityLimited)
 			return
 		}
 		if 0 < self.settings.VantageRequestLimit && self.settings.VantageRequestLimit <= vantageCount {
-			releaseErr = ErrExtenderReleaseVantageLimited
+			releaseErr = self.requestLimitRefusal(ErrExtenderReleaseVantageLimited)
 			return
 		}
 		if snapshotErr != nil {
-			releaseErr = snapshotErr
+			releaseErr = &ExtenderReleaseRefusal{Outcome: ExtenderReleaseOutcomeUnavailable, Err: snapshotErr}
 			return
 		}
 		issuedKeyHexes, err := ledger.IssuedKeyHexes(request.Identity, epoch)
 		if err != nil {
-			releaseErr = err
+			releaseErr = &ExtenderReleaseRefusal{Outcome: ExtenderReleaseOutcomeUnavailable, Err: err}
 			return
 		}
 		orderedKeyHexes := append(slices.Clone(issuedKeyHexes), ExtenderPartitionOrder(self.secret, ExtenderChannelGated, request.Identity, epoch, members)...)
@@ -303,6 +384,7 @@ func (self *ExtenderReleasePolicy) Release(
 				continue
 			}
 			if 0 < self.settings.MaxClientsPerExtenderPerCountry && self.settings.MaxClientsPerExtenderPerCountry <= ledger.ClientCount(keyHex, countryCode, request.Identity, now.Add(-self.settings.ClientWindow)) {
+				countryCapacityLimited = true
 				continue
 			}
 			ledger.RecordRelease(request.Identity, keyHex, countryCode, epoch, now)
@@ -311,11 +393,60 @@ func (self *ExtenderReleasePolicy) Release(
 				issuedKeyHexes = append(issuedKeyHexes, keyHex)
 			}
 		}
+		spent = count <= len(issuedKeyHexes)
 	})
 	if releaseErr != nil {
 		return nil, releaseErr
 	}
+
+	// The outcome, most specific first. A spent epoch decides an empty answer
+	// whatever else holds, since nothing else can be released before it ends.
+	switch {
+	case 0 < len(result.KeyHexes):
+		result.Outcome = ExtenderReleaseOutcomeOk
+	case spent:
+		epochEnd := extenderEpochEnd(epoch, self.settings.EpochTimeout)
+		retryTime := epochEnd
+		result.Outcome = ExtenderReleaseOutcomeEpochSpent
+		if probation {
+			result.Outcome = ExtenderReleaseOutcomeProbation
+			// an identity of unknown age stays new, so only its epoch ends
+			if !request.IdentityCreateTime.IsZero() {
+				if probationEnd := request.IdentityCreateTime.Add(self.settings.ProbationTimeout); probationEnd.Before(retryTime) {
+					retryTime = probationEnd
+				}
+			}
+		}
+		result.RetryAfter = max(retryTime.Sub(now), 0)
+	case len(eligibleKeyHexes) == 0 && 0 < incompatibleCount:
+		result.Outcome = ExtenderReleaseOutcomeIncompatible
+	case countryCapacityLimited:
+		result.Outcome = ExtenderReleaseOutcomeCountryCapacity
+	default:
+		result.Outcome = ExtenderReleaseOutcomeEmpty
+	}
 	return result, nil
+}
+
+// The refusal of a request limit. Every request in the window counts, the
+// refused one included, so the gate is open again only once a whole window
+// has passed since this request; asking sooner is refused and extends it.
+func (self *ExtenderReleasePolicy) requestLimitRefusal(err error) *ExtenderReleaseRefusal {
+	return &ExtenderReleaseRefusal{
+		Outcome: ExtenderReleaseOutcomeRateLimited,
+		// the window includes its start (RequestCounts), so one second past it
+		RetryAfter: self.settings.RequestWindow + time.Second,
+		Err:        err,
+	}
+}
+
+// When an epoch ends, which is when the next is dealt (ExtenderEpoch).
+func extenderEpochEnd(epoch uint64, epochTimeout time.Duration) time.Time {
+	epochMs := epochTimeout.Milliseconds()
+	if epochMs <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(epoch+1) * epochMs)
 }
 
 // The in-process ledger: bounded tables under one lock, pruned to their
