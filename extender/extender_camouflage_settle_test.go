@@ -367,6 +367,14 @@ func TestExtenderCamouflageSpliceSettleGatesTheSplice(t *testing.T) {
 		t.Fatalf("a prober reached the borrowed site %d times before the records settled", count)
 	}
 
+	// a qualifying record alone is not enough: legacy clients still hold records
+	// issued without the requirement
+	settle.ObserveActivation(fixture.activation(fixture.body(nil)), fixture.rootKeys)
+	requireTerminated("on the first qualifying record")
+	if count := site.reached.get(); count != 0 {
+		t.Fatalf("a prober reached the borrowed site %d times before the records settled", count)
+	}
+
 	fixture.renewFor(testSettleRecordLifetime + testSettleMargin)
 	settle.ObserveActivation(fixture.activation(fixture.body(nil)), fixture.rootKeys)
 	writeProber(t, server)
