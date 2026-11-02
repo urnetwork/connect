@@ -20,9 +20,10 @@ the capability. What this delivery ships is inert until these exist:
    It derives the key and sets the activator's `RealityPublicKey`, verifies
    borrowed names at start and every revalidation interval, and feeds
    `CamouflageBorrowNames`.
-4. The safe-flip rule below, which that role encodes in `CamouflageSpliceGate`.
-   The gate is a seam with no production caller yet, and the rule reads
-   `RequiredCapabilities` from the extender's own record (slice B).
+4. That role wiring the safe-flip gate below: `CamouflageSpliceGate` set to
+   `ExtenderCamouflageSpliceSettle.Open`, fed by `ObserveActivation` from
+   `OnActivated`. The gate exists and is tested, and no production role uses it
+   yet.
 
 ## Controls
 
@@ -69,11 +70,17 @@ The flip is therefore gated, not a bare toggle:
    sends authenticated hellos.
 3. Only then set `CamouflageSpliceGate` to open (and/or `SetCamouflageSplice(true)`).
 
-`CamouflageSpliceGate` is where the role encodes step 2: open only when its own
-latest activation record carries the key and requires the capability and has for
-≥ the record lifetime. Rollback is the reverse: turn the extender flag off
-first (`SetCamouflageSplice(false)` / gate closed), then remove the key from the
-cohort config. Posture changes apply to new connections; working splices drain.
+`extender.ExtenderCamouflageSpliceSettle` encodes step 2 as the value of
+`CamouflageSpliceGate`. It opens only after the extender's own activation records
+have carried its key and required the capability, unbroken, for the longest
+record lifetime in the run plus a margin (1 h by default, so about 25 h today). A
+record without either, an activation whose record does not verify, or the latest
+record expiring closes it at once and restarts the wait. It keeps no state across
+a restart, so a restart of a cohort host restarts the wait and the host runs as
+Phase A for that long. Rollback is the reverse: turn the extender flag off first
+(`SetCamouflageSplice(false)`), then remove the key from the cohort config; the
+gate also closes when the requirement leaves the record. Posture changes apply to
+new connections; working splices drain.
 
 ## Readiness gates to record before each cohort expands
 
