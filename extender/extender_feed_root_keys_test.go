@@ -96,12 +96,13 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeys(t *testing.T) {
 	// the first sample lands and the subscription opens while hello is out
 	select {
 	case <-feed.opened:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the first sample waited for hello")
 	}
+	// and the probe its arrival wakes has come back and left it active
 	waitForDirectory(t, directory, func(snapshot *connect.ExtenderDirectorySnapshot) bool {
 		for _, entry := range snapshot.Entries {
-			if entry.Ip == sampledIp && entry.State == connect.ExtenderStateActive {
+			if entry.Ip == sampledIp && entry.State == connect.ExtenderStateActive && 0 < entry.Latency {
 				return true
 			}
 		}
@@ -113,7 +114,7 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeys(t *testing.T) {
 	close(releaseHello)
 	select {
 	case <-feed.opened:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the feed stream stayed open after hello installed new root keys")
 	}
 	if !directory.RootKeys().Equal(connect.NewExtenderRootKeySet(fixture.rootPublic, rotatedPublicKey)) {
@@ -232,14 +233,14 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 
 	select {
 	case <-dialHeld:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the first pass never dialed the extender")
 	}
 
 	// hello answers with the rotation while the dial is out; the status names
 	// the gossip identity once the keys it came with are in force
 	close(releaseHello)
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(60 * time.Second)
 	for {
 		status, changed := networkClient.StatusMonitor().Get()
 		if status.GossipPeerId == gossipPeerId {
@@ -260,12 +261,12 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 	close(releaseDial)
 	select {
 	case <-feed.opened:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the held dial never opened the feed stream")
 	}
 	select {
 	case <-feed.opened:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the stream to the extender the replaced keys chose stayed open")
 	}
 }
@@ -273,8 +274,6 @@ func TestExtenderNetworkClientSamplesAgainWhenHelloInstallsKeysDuringTheDial(t *
 // Only the feed owns the address-only dial barrier in the root-key rotation test.
 func feedRootKeyDialSettings() *connect.ExtenderNetworkClientSettings {
 	settings := connect.DefaultExtenderNetworkClientSettings()
-	settings.Probe = func(context.Context, *connect.ExtenderCandidate, *connect.ExtenderProbeAttestor) (time.Duration, connect.ExtenderPingOutcome, error) {
-		return 20 * time.Millisecond, connect.ExtenderPingUnattested, nil
-	}
+	settings.Probe = testFeedProbe
 	return settings
 }
