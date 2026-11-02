@@ -39,7 +39,8 @@ import (
 //   - Every mirror runs its own attempts, so a mirror that stalls holds up
 //     nothing but itself. Attempts, dials and bytes come from one budget, every
 //     attempt has its own timeout, failed attempts back off, and the whole
-//     pass ends at its deadline or its context, whichever is first.
+//     pass ends at its deadline or its context, whichever is first. A
+//     response is read to at most one byte past the 64 KiB envelope cap.
 //   - Nothing fetched is trusted until it verifies. A refused artifact is
 //     never retried within a pass, and nothing a mirror serves can change the
 //     root keys, the network hosts or the resolver.
@@ -117,9 +118,14 @@ func DefaultExtenderSeedBootstrapSettings() *ExtenderSeedBootstrapSettings {
 // The most mirrors one pass reads; mirrors past it are not tried.
 const ExtenderSeedMaxMirrorCount = 16
 
-// The most one response may carry: the longest text form with room for the
-// whitespace around it. The serialized envelope is always shorter.
-const extenderSeedMaxArtifactByteCount = (len(ExtenderSeedTextPrefix) + (4*ExtenderSeedMaxEnvelopeByteCount+2)/3) + 1024
+// The most one mirror response may carry: a serialized envelope at its cap.
+// The mirror contract (api/bringyour.yml, `/v1/seed.bin`) is the raw envelope,
+// at most 64 KiB, and a reader takes at most one byte past it -- which is how
+// it knows a response is too large -- before decoding anything. A mirror may
+// serve the text form instead, read the same way, so its bundle must have a
+// text that fits; a file or a paste has the text form's own longer cap
+// (ExtenderSeedMaxTextByteCount).
+const extenderSeedMaxArtifactByteCount = ExtenderSeedMaxEnvelopeByteCount
 
 // The most header bytes a mirror may send.
 const extenderSeedMaxResponseHeaderByteCount = 16 * 1024
@@ -738,12 +744,15 @@ func (self *extenderSeedBootstrapPass) fetch(ctx context.Context, mirror *extend
 	return artifact, "", false
 }
 
-// Reads at most the artifact cap, every byte taken from the shared budget.
+// Reads the artifact, taking at most one byte past the cap from the body: a
+// response that has that byte is too large. Every byte kept is taken from the
+// shared budget.
 func (self *extenderSeedBootstrapPass) readArtifact(body io.Reader) ([]byte, error) {
+	limited := io.LimitReader(body, int64(extenderSeedMaxArtifactByteCount)+1)
 	artifact := []byte{}
 	buffer := make([]byte, 4096)
 	for {
-		n, err := body.Read(buffer)
+		n, err := limited.Read(buffer)
 		if 0 < n {
 			if extenderSeedMaxArtifactByteCount < len(artifact)+n {
 				return nil, errExtenderSeedTooLarge
