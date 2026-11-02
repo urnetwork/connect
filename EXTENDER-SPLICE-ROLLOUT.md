@@ -173,6 +173,10 @@ over the legacy attempt, so a passing Phase A activation is not proof that the
 extender holds its camouflage key. In Phase B only the extender's own key
 passes.
 
+An NLayer hop URL (`connectctl extender`) has no camouflage key parameter, so a
+hop dials its tcp carrier with the legacy hello. A Phase B extender cannot serve
+as a tcp hop until the hop URL gains one.
+
 ## Splice posture semantics (added 2026-11-02)
 
 `ExtenderCamouflageSplice` is the posture until `SetCamouflageSplice` sets one.
