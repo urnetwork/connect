@@ -32,17 +32,23 @@ For peer review. Written 2026-11-01.
 **Triggers.** A pass runs:
 - at start;
 - on a 24 h tick (`ActivateTimeout`);
-- when the extender sees its own key revoked in the directory (`observeRevocation`, l.699);
+- when the extender sees its own key revoked in the directory (`observeRevocation`);
 - on a network change, and on `Reactivate`;
-- when the hourly address check (`AddressCheckTimeout`, 1 h) sees a moved address.
+- when the hourly address check (`AddressCheckTimeout`, 1 h) sees a moved address;
+- when the tcp carrier returns, for a family whose post came due while it was gone (`TcpCarrierReturned`), within 5 minutes (`CarrierReturnJitter`);
+- when a carrier returns that a family's last post left off, within the same 5 minutes (`CarriersChanged`).
 
-The defaults are in `DefaultExtenderActivatorSettings` (l.273).
+A replaced role is not a start: its activator continues from the old one's schedules and status (`ExtenderActivator.State`), so a hold stands, and a family that stands activated is posted once more within the hour (`ReplacedPostJitter`). Only a new process, or the role being turned off and on, starts every family due.
+
+**The gate.** A post that comes due with no required carrier serving, which today means tcp, is not made (`extenderActivateCarrierFailure`). The operator would refuse the list before probing anything, so this saves a round trip. The status gives the reason, the hold stays as it was, and the family is looked at again after 10 minutes (`holdForCarrier`).
+
+The defaults are in `DefaultExtenderActivatorSettings`.
 
 **A post** goes to the family's api url, for example the v4-only host, with the client jwt, through a direct-only client strategy. An activation relayed through another extender would publish that extender's address. The result's bootstrap records are applied to the local directory and the status is recorded (`applyRecords`, `recordSuccess`, `recordFailure`).
 
 **Backoff:** 10 min doubling to 6 h (`MinBackoff`, `MaxBackoff`).
 
-**The address check** is one hello to the plain dual-stack api url (`hello`, l.841). It compares the caller address the operator saw, by address and not port, with the last one.
+**The address check** is one hello to the plain dual-stack api url (`hello`). It compares the caller address the operator saw, by address and not port, with the last one.
 
 **The measurement request** for lag.dev's certificate rides the first post of a pass that can carry it (lag.dev/PLAN.md C4, `followMeasurementCsr`, l.1055).
 

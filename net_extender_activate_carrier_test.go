@@ -9,9 +9,7 @@ import (
 
 // An extender posts no activation while no required carrier is serving (EXTENDER.md
 // G2, G3, C2a), and a carrier that returns owes the operator only what it held back.
-// On 2026-11-01 extenders whose listeners had probably closed kept posting: each post
-// cost the operator a probe of a closed port, and spent the hourly budget their
-// account's other extenders share.
+// On 2026-11-01 extenders whose listeners had probably closed kept posting for them.
 
 func (self *testActivatorFixture) setCarriers(carriers ...string) {
 	self.stateLock.Lock()
