@@ -6,11 +6,23 @@ for. It names the controls, the readiness gates to record before each cohort
 expands, the telemetry to watch, and the rollback. It does not restate section
 P (connect `EXTENDER.md`), which it builds on.
 
-Status 2026-11-02: Phase A is the default everywhere (`CamouflageEnabled` off).
-No borrowed-site list is bundled yet (`res/extender_borrow.bin` is an empty
+Status 2026-11-02: camouflage is off everywhere. `CamouflageEnabled` defaults
+off and no production role sets it, so not even Phase A is running. No
+borrowed-site list is bundled yet (`res/extender_borrow.bin` is an empty
 placeholder), so no extender has a verified splice target and no client claims
-the capability. Phase B cannot begin until the measured list ships (slice E,
-paused) and the server issues `RealityPublicKey` into records (14b).
+the capability. What this delivery ships is inert until these exist:
+
+1. The measured list and its manifest (slice E, paused). The list's loader
+   populates `ExtenderBorrowList`; today every list is unmeasured.
+2. The server signing `RealityPublicKey` into records (14b).
+3. A role that turns camouflage on (14c in EXTENDER.md for the sdk provider
+   role; `connectctl extender` for operator hosts, which are the gated cohort).
+   It derives the key and sets the activator's `RealityPublicKey`, verifies
+   borrowed names at start and every revalidation interval, and feeds
+   `CamouflageBorrowNames`.
+4. The safe-flip rule below, which that role encodes in `CamouflageSpliceGate`.
+   The gate is a seam with no production caller yet, and the rule reads
+   `RequiredCapabilities` from the extender's own record (slice B).
 
 ## Controls
 
