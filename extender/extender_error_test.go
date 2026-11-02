@@ -7,6 +7,7 @@ package extender
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -643,40 +644,51 @@ func TestExtenderRefusalsOfAProxyRequestReportNoAddress(t *testing.T) {
 func TestExtenderRealSocketFailuresReportNoAddress(t *testing.T) {
 	for _, c := range []struct {
 		description string
-		dial        func(t *testing.T, fixture *extenderFixture) net.Conn
-		stage       string
+		handshake   bool
+		// the second of two only when the one budget of both (A9) ran out in the handshake
+		stages []string
 	}{
 		{
 			description: "a handshake that never comes",
-			dial: func(t *testing.T, fixture *extenderFixture) net.Conn {
-				conn, err := (&net.Dialer{}).Dial("tcp", fixture.authority(fixture.tcpPort))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { conn.Close() })
-				return conn
-			},
-			stage: "outer TLS handshake",
+			stages:      []string{"outer TLS handshake"},
 		},
 		{
 			description: "a header that never comes",
-			dial: func(t *testing.T, fixture *extenderFixture) net.Conn {
-				return dialHandshakedExtenderConn(t, fixture)
-			},
-			stage: "header length",
+			handshake:   true,
+			stages:      []string{"header length", "outer TLS handshake"},
 		},
 	} {
 		t.Run(c.description, func(t *testing.T) {
 			fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 				settings.HeaderTimeout = time.Second
 			})
-			conn := c.dial(t, fixture)
+			conn, err := (&net.Dialer{}).Dial("tcp", fixture.authority(fixture.tcpPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
 			_, portString, err := net.SplitHostPort(conn.LocalAddr().String())
 			if err != nil {
 				t.Fatal(err)
 			}
+			if c.handshake {
+				// however it ends, it is the server's report that is read
+				tls.Client(conn, &tls.Config{
+					ServerName:         testServerName,
+					InsecureSkipVerify: true,
+					MinVersion:         tls.VersionTLS13,
+				}).Handshake()
+			}
 			// the fixture's handler keeps the stage in front of what it heard
-			reported := waitForFixtureError(t, fixture, c.stage)
+			reported, ok := fixture.nextError()
+			if !ok {
+				t.Fatal("the extender did not report the client it dropped")
+			}
+			if !slices.ContainsFunc(c.stages, func(stage string) bool {
+				return strings.HasPrefix(reported.Error(), stage+":")
+			}) {
+				t.Fatalf("heard %v, expected one of the stages %q", reported, c.stages)
+			}
 			heard := errors.Unwrap(reported)
 			testExpectErrorHoldsNone(t, heard, portString, "127.0.0.1")
 			if !errors.Is(heard, os.ErrDeadlineExceeded) {
