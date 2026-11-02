@@ -594,8 +594,30 @@ family hosts, such as a development operator on an ip literal, is
 activated through its plain api url instead, and the family of the
 outcome is the one the result reports. Args
 `{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`. Rate
-limit 6 per hour per client and 60 per hour per account, each per address
-family, so one family's failures never spend the other's (2026-10-28). An
+limits, each per address family over a trailing hour, so one family's
+failures never spend the other's (2026-10-28), and per host (connect#230,
+2026-11-01): 6 per client; 6 per caller address, its /32 or /64, over every
+client and every account, kept under a keyed hash; and per account 60 plus 6
+for each proven host, at most 1200. A proven host is an identity key of the
+account that passed activation on that family between 1 hour and 7 days ago,
+counted once per address and at most 32 per /24 or /48, so a fleet that has
+passed activation restarts at once and a new one ramps an hour at a time;
+each api process reuses an account's proven host candidates for a minute
+and counts them at every read's own time. A key its network already proved
+at the caller's /32 or /64, its last pass there at most 7 days ago, spends
+a budget of its own at that address, 6 an hour, instead of the address's:
+a public extender relays posts to the api from its own address, so other
+accounts' posts through it spend the address's budget, and must not hold
+off its own re-activation. The api process probes at most 64 activations
+at once. A post over a budget, over the probes, or whose wait for a
+budget's lock ran past its 2 s bound is refused with the wait until there
+is room in `retry_after_seconds`, which the activator waits out (G3), and
+spends nothing: for the budgets, the longest wait of those with no room
+and up to a minute more, drawn so a fleet refused together does not come
+back together; for a busy api, one to three minutes. The attempts one
+spend records for its budgets are each recorded up to a second before it,
+so no create_time joins the address's hashed row to its client's and
+account's. An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
 is refused before it is probed. The handler probes the caller ip synchronously
 within one 10 s probe budget, in this order: the required test (C2a) --
@@ -605,8 +627,8 @@ against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
 verified `GET /hello` through the tcp carrier to the api url -- and only
 then each offered optional carrier: each dns port under its own 3 s (L2),
 then quic with what is left. Result `{activated, ip, ip_version,
-carriers, refused_carriers, probe_steps, error, expire_time,
-allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
+carriers, refused_carriers, probe_steps, error, retry_after_seconds,
+expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
 random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
@@ -620,8 +642,9 @@ public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each
 take the C1 defaults. The budgets are spent at the probe: every check that
 refuses without dialing the caller (the arguments, the caller and its
 family, the configuration) precedes them, so a malformed request or an
-unconfigured operator never spends a caller's budget, and the client's and
-the account's budgets are spent together or not at all. Every activation
+unconfigured operator never spends a caller's budget, and the client's, the
+address's and the account's budgets are spent together or not at all, one
+spend of a budget at a time. Every activation
 that dials the caller is counted, whatever its probe finds. A failed
 geolocation leaves the country empty rather than failing the activation.
 The bootstrap records are signed fresh at each activation. Probe requests
@@ -685,9 +708,12 @@ left of the 10 s probe budget: ..." for quic; one that failed on its own
 keeps its probe's error. Old providers decode the answer into
 `connect.ExtenderActivateResult`, which skips the new fields. The api
 counts every activation in `urnetwork_extender_activations_total{stage,
-outcome, family}` -- stage `request`, `config`, `budget`, `tcp`, `forward`
-or `store`; outcome `refused`, `error`, `timeout`, `other_family` or
-`activated`; family `ipv4`, `ipv6` or `unknown` -- and times every step in
+outcome, family}` -- stage `request`, `config`, `busy`, `budget`, `tcp`,
+`forward` or `store`; outcome `refused`, `error`, `timeout`,
+`other_family` or `activated`, and for `busy` why (`probes`,
+`budget_lock`) and for `budget` which budget refused (`client`,
+`address`, `proven_address`, `account`; connect#230); family `ipv4`,
+`ipv6` or `unknown` -- and times every step in
 `urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
 whose buckets end at 10 s. The extenders dashboard shows both.
 
@@ -1161,6 +1187,11 @@ extender's address; it applies the bootstrap records to the directory and
 records the status. A success moves the family to its tick. A failure holds
 that family alone, 10 minutes doubling to 6 hours, and a success resets its
 hold, so a family the operator keeps refusing never re-posts one that works.
+A refusal that carries `retry_after_seconds` (C2: a spent activation budget,
+or an operator too busy to probe; connect#230) holds its family exactly that
+long, at least 1 minute and at most 6 hours, whether or not the family is
+private, and leaves its hold as it was: the operator probed nothing. An
+operator that predates the field gets the hold.
 A family without a global address on the host (`FamilySupported`) is not
 posted and is looked at again every 10 minutes, without doubling, since the
 look is local; one that gains an address is posted within 10 minutes however

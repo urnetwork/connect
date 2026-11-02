@@ -436,3 +436,36 @@ func TestExtenderActivateArgsMeasurementDisabled(t *testing.T) {
 		t.Fatalf("args = %s, expected no measurement_disabled", argsBytes)
 	}
 }
+
+// A new dual-stack identity whose other family is refused (connect#230): the
+// first pass learns the id from the ipv4 answer, so that post carries no
+// measurement request, and the ipv6 post that carries it is refused. With a
+// schedule per family, ipv4 is next posted on its 24 hour tick, so the
+// request rode only the refused ipv6 posts and a process restarted daily
+// never delivered it. One more ipv4 post now follows the pass at once and
+// carries it, while ipv6 waits out its own backoff.
+func TestExtenderActivatorMeasurementCsrFollowsTheFamilyThatPassed(t *testing.T) {
+	hook := &testMeasurementCsrHook{}
+	extenderId := NewId()
+	fixture := newTestActivatorFixtureWithOperator(
+		t,
+		func(operator *testActivateOperator) {
+			operator.setFamilyRefusal(6, "the forward did not answer")
+		},
+		func(settings *ExtenderActivatorSettings) {
+			settings.MeasurementCsr = hook.measurementCsr
+			settings.ApiUrlV4 = newTestMeasurementOperator(t, 4, settings.ApiUrlV4, extenderId)
+			settings.ApiUrlV6 = newTestMeasurementOperator(t, 6, settings.ApiUrlV6, extenderId)
+		},
+	)
+
+	fixture.waitPass()
+	fixture.expectMeasurementPosts(
+		testMeasurementPost{ipVersion: 4},
+		testMeasurementPost{ipVersion: 6, csr: testMeasurementCsr(extenderId)},
+		testMeasurementPost{ipVersion: 4, csr: testMeasurementCsr(extenderId)},
+	)
+	// the clock has not moved for the follow-up, and two minutes on ipv6 is
+	// still inside its ten minute backoff
+	fixture.expectMeasurementPostCounts(2, 1)
+}
