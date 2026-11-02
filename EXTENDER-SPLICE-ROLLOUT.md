@@ -164,6 +164,19 @@ the delivery-gates table. A cohort expands only when all hold.
    fleet's traffic to one site. Before expanding, confirm the summed
    per-target load (below) across the cohort is within what each borrowed site
    can absorb.
+8. **One holder per cohort identity.** An activation that posts no camouflage key
+   clears the stored one (14b), so a network whose clients share one identity on
+   mixed client versions flips the key on and off with each activation. One
+   network shows 12 keys changing holder 332 times in 48 h (2026-11-02). That is
+   harmless in Phase A. In Phase B the record loses its key, and with it the
+   capability requirement, whenever an old client activates, so a client issued
+   that record dials the legacy hello alone and a splicing holder sends it to the
+   borrowed site. The safe-flip gate does not catch this: a camouflaged client
+   sees only its own activations' records, and each carries the key it just
+   posted. Before adding a key to a cohort, confirm that one client holds it, for
+   example with a read-only count of distinct `client_address_hash` per
+   `ip_version` for the extender in `network_extender_activation`. More than one
+   in a family means a shared identity or a host that moved.
 
 ## Telemetry to watch
 
