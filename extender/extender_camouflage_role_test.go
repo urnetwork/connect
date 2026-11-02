@@ -691,6 +691,39 @@ func TestExtenderCamouflageRoleFeedsTheRunningServer(t *testing.T) {
 	requireSpliced("with the name back")
 }
 
+// A pass that loses a name leaves a splice already relaying to it running (§3.3): a
+// new list applies to new hellos, and the slot it holds is its own to release.
+func TestExtenderCamouflageRoleLeavesAWorkingSpliceAlone(t *testing.T) {
+	installTestRoleBorrowLists(t, newTestRoleBorrowList(testBorrowName))
+	release := make(chan struct{})
+	defer close(release)
+	site := newFakeBorrowSite(t, blockingBorrowSiteHandler(release))
+	fixture := newTestRoleFixture(t, func(_ *testRoleFixture, settings *ExtenderCamouflageRoleSettings) {
+		settings.Splice = true
+		settings.SpliceDialContext = site.dialContext()
+	}, nil)
+	fixture.schedule.nextWait(t)
+	fixture.settleTheRecords(t)
+	prober := writeProber(t, fixture.server)
+	select {
+	case <-site.accepted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the splice did not begin")
+	}
+
+	fixture.verifier.setFailing(testBorrowName)
+	fixture.schedule.fireNow(t)
+	fixture.schedule.nextWait(t)
+	if count := fixture.server.server.CamouflageStatus().VerifiedTargetCount; count != 0 {
+		t.Fatalf("verified names = %d, expected the name gone", count)
+	}
+	prober.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err := prober.Read(make([]byte, 1))
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("the working splice was torn down (read err = %v), expected it to stay open", err)
+	}
+}
+
 // The posture sits behind the gate: a role that starts in Phase B terminates a
 // prober until its records have settled, a run-time flip cannot pass the gate of a
 // role that started in Phase A, and the rollback holds whatever the gate says.
