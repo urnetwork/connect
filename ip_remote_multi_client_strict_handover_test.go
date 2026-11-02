@@ -7,6 +7,8 @@ package connect
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -1335,6 +1337,262 @@ func TestStrictHandoverVerdictVictimIsCountedByTheStormBreaker(t *testing.T) {
 				AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalVerdict].Load(), uint64(1))
 				AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalHandover].Load(), uint64(0))
 				AssertEqual(t, after, before+1)
+			})
+		})
+	}
+}
+
+// A discovery that answers every find-providers2 with no providers and the
+// platform override it is given.
+type strictWindowHandoverTestDiscovery struct {
+	mutex                sync.Mutex
+	windowStrictHandover *bool
+	err                  error
+	requests             int
+}
+
+func (self *strictWindowHandoverTestDiscovery) FindProviders2(ctx context.Context, token string, args *FindProviders2Args) (*FindProviders2Result, error) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	self.requests += 1
+	if self.err != nil {
+		return nil, self.err
+	}
+	return &FindProviders2Result{WindowStrictHandover: self.windowStrictHandover}, nil
+}
+
+func (self *strictWindowHandoverTestDiscovery) answer(windowStrictHandover *bool, err error) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	self.windowStrictHandover = windowStrictHandover
+	self.err = err
+}
+
+// The api generator takes the platform's override from every find-providers2
+// answer, on every path that asks: an answer that carries it sets it, an
+// answer without it clears it, and a failed request keeps the last answer's.
+// It crosses as `window_strict_handover`, absent when there is none.
+func TestApiGeneratorTakesTheStrictWindowHandoverOverrideFromEachAnswer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	discovery := &strictWindowHandoverTestDiscovery{}
+	generator := newPostQuantumDiscoveryGenerator(t, ctx, []*ProviderSpec{{BestAvailable: true}}, discovery)
+	off, on := false, true
+	assertOverride := func(name string, wantEnabled bool, wantSet bool) {
+		t.Helper()
+		enabled, set := generator.StrictWindowHandoverOverride()
+		if enabled != wantEnabled || set != wantSet {
+			t.Fatalf("%s: override (%t, set %t), want (%t, set %t)", name, enabled, set, wantEnabled, wantSet)
+		}
+	}
+	assertOverride("before any answer", false, false)
+	for _, step := range []struct {
+		name                 string
+		windowStrictHandover *bool
+		err                  error
+		enabled              bool
+		set                  bool
+	}{
+		{"an answer that turns it off", &off, nil, false, true},
+		{"an answer without it", nil, nil, false, false},
+		{"an answer that leaves it on", &on, nil, true, true},
+		{"an answer that turns it off again", &off, nil, false, true},
+		{"a failed request", nil, errors.New("discovery unavailable"), false, true},
+	} {
+		discovery.answer(step.windowStrictHandover, step.err)
+		generator.NextDestinations(1, nil, "quality")
+		assertOverride(step.name, step.enabled, step.set)
+	}
+	// the named-provider path asks find-providers2 too
+	discovery.answer(nil, nil)
+	if _, err := generator.NextDestinationsForClientId(NewId(), nil, "quality"); err != nil {
+		t.Fatal(err)
+	}
+	assertOverride("a named-provider answer without it", false, false)
+
+	for body, want := range map[string]*bool{
+		`{"providers": [], "window_strict_handover": false}`: &off,
+		`{"providers": [], "window_strict_handover": true}`:  &on,
+		`{"providers": []}`: nil,
+	} {
+		result := &FindProviders2Result{}
+		if err := json.Unmarshal([]byte(body), result); err != nil {
+			t.Fatal(err)
+		}
+		if (result.WindowStrictHandover == nil) != (want == nil) || (want != nil && *result.WindowStrictHandover != *want) {
+			t.Errorf("%s decoded to %v", body, result.WindowStrictHandover)
+		}
+	}
+	encoded, err := json.Marshal(&FindProviders2Result{Providers: []*FindProvidersProvider{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	AssertEqual(t, string(encoded), `{"providers":[]}`)
+}
+
+// A generator that carries a platform override and discovers nothing.
+type strictWindowHandoverOverrideTestGenerator struct {
+	testingEmptyMultiClientGenerator
+	override strictWindowHandoverOverride
+}
+
+func (self *strictWindowHandoverOverrideTestGenerator) StrictWindowHandoverOverride() (enabled bool, set bool) {
+	return self.override.get()
+}
+
+// The platform's override can turn a strict window's handover off, never on:
+// with no override, or one that leaves it on, the host's setting decides; off
+// turns it off; and on does not turn on a handover the host left off, or one a
+// window without a strict hard max never runs.
+func TestStrictWindowHandoverFollowsThePlatformOverride(t *testing.T) {
+	off, on := false, true
+	for _, c := range []struct {
+		name     string
+		strict   bool
+		host     bool
+		override *bool
+		enabled  bool
+	}{
+		{"host on, no override", true, true, nil, true},
+		{"host on, platform off", true, true, &off, false},
+		{"host on, platform on", true, true, &on, true},
+		{"host off, no override", true, false, nil, false},
+		{"host off, platform on", true, false, &on, false},
+		{"host off, platform off", true, false, &off, false},
+		{"not strict, platform on", false, true, &on, false},
+	} {
+		generator := &strictWindowHandoverOverrideTestGenerator{}
+		generator.override.observe(c.override)
+		settings := DefaultMultiClientSettings()
+		settings.StrictWindowSizeHardMax = c.strict
+		settings.StrictWindowHandover = c.host
+		window := &multiClientWindow{settings: settings, generator: generator, clients: map[Id]*multiClientChannel{}}
+		if enabled := window.strictWindowHandoverEnabled(); enabled != c.enabled {
+			t.Errorf("%s: handover enabled = %t, want %t", c.name, enabled, c.enabled)
+		}
+	}
+	// a generator without the capability overrides nothing
+	settings := DefaultMultiClientSettings()
+	settings.StrictWindowSizeHardMax = true
+	settings.StrictWindowHandover = true
+	window := &multiClientWindow{settings: settings, generator: &testingEmptyMultiClientGenerator{}, clients: map[Id]*multiClientChannel{}}
+	AssertEqual(t, window.strictWindowHandoverEnabled(), true)
+}
+
+// The platform turns the handover off for a window about to hand a drained
+// client's slot over: the listing for the handover's candidate carries the
+// override, and from that listing on the window plans as before the handover.
+// The drained client keeps its slot, the candidate is refused at the hard max,
+// and the pass's reservation ends with it.
+func TestStrictWindowHandoverTurnsOffWithinOneListing(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	synctest.Test(t, func(t *testing.T) {
+		h, generator, stats := newWindowStatsTestHarness(t)
+		window := h.multiClient.windows[WindowTypeQuality]
+		h.sleep(time.Second)
+		readsBefore, _, _, _ := generator.counts()
+		off := false
+		generator.platformStrictWindowHandover.Store(&off)
+		drained := h.liveChannels()[0]
+		ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+		h.sleep(40 * time.Second)
+
+		reads, _, _, _ := generator.counts()
+		if reads == readsBefore {
+			t.Fatal("the window listed nothing after the platform turned the handover off")
+		}
+		if enabled, set := generator.StrictWindowHandoverOverride(); enabled || !set {
+			t.Fatal("the listing did not carry the platform's off")
+		}
+		AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), uint64(0))
+		AssertEqual(t, stats.removals[windowStatsWindowQuality][windowRemovalHandover].Load(), uint64(0))
+		if 0 == windowStatsCandidateTotal(stats, windowCandidateDeclinedStrictCap) {
+			t.Fatal("no candidate was refused at the hard max, as before the handover")
+		}
+		if !strictHandoverTestInstalled(window, drained) {
+			t.Fatal("the drained client lost its slot after the platform turned the handover off")
+		}
+		installedCount, _ := strictHandoverTestCounts(window)
+		AssertEqual(t, installedCount, 5)
+		func() {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			if window.strictPass != nil && window.strictPass.handover != nil {
+				t.Fatal("a handover reservation outlived the platform's off")
+			}
+		}()
+	})
+}
+
+// The platform turns the handover off while a pass holds a reservation: an off
+// that arrives before admission takes the slot cancels the swap (the candidate
+// is refused at the hard max and the victim keeps its slot), and one that
+// arrives at the swap lets it finish. Either way the window never holds more
+// than its hard max, the reservation ends with its pass, and the next drained
+// client is not handed over.
+func TestStrictWindowHandoverTurnedOffMidPassFallsBackCleanly(t *testing.T) {
+	for _, atSwap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("at_swap=%t", atSwap), func(t *testing.T) {
+			GetMessagePoolAggregateStats()
+			synctest.Test(t, func(t *testing.T) {
+				h, generator, stats := newWindowStatsTestHarness(t)
+				window := h.multiClient.windows[WindowTypeQuality]
+				h.sleep(time.Second)
+				off := false
+				var turnedOff atomic.Bool
+				turnOff := func() {
+					if turnedOff.CompareAndSwap(false, true) {
+						// as another window's listing would carry it
+						generator.platformStrictWindowHandover.Store(&off)
+						generator.strictWindowHandoverOverride.observe(&off)
+					}
+				}
+				if atSwap {
+					func() {
+						window.stateLock.Lock()
+						defer window.stateLock.Unlock()
+						window.beforeStrictHandoverSwapForTest = turnOff
+					}()
+				} else {
+					func() {
+						generator.mutex.Lock()
+						defer generator.mutex.Unlock()
+						generator.configureNewClient = func(*MultiClientGeneratorClientArgs, *ClientSettings) {
+							turnOff()
+						}
+					}()
+				}
+				clients := h.liveChannels()
+				drained, next := clients[0], clients[1]
+				ageWindowClientForTest(drained, time.Minute, 2*time.Minute)
+				h.sleep(40 * time.Second)
+
+				if !turnedOff.Load() {
+					t.Fatal("the platform's off never arrived during the pass")
+				}
+				handovers := uint64(0)
+				if atSwap {
+					handovers = 1
+				}
+				AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), handovers)
+				AssertEqual(t, strictHandoverTestInstalled(window, drained), !atSwap)
+
+				// the next drained client is not handed over
+				ageWindowClientForTest(next, time.Minute, 2*time.Minute)
+				h.sleep(40 * time.Second)
+				AssertEqual(t, windowStatsCandidateTotal(stats, windowCandidateAdmittedHandover), handovers)
+				if !strictHandoverTestInstalled(window, next) {
+					t.Fatal("a drained client was handed over after the platform turned the handover off")
+				}
+				installedCount, _ := strictHandoverTestCounts(window)
+				AssertEqual(t, installedCount, 5)
+				func() {
+					window.stateLock.Lock()
+					defer window.stateLock.Unlock()
+					if window.strictPass != nil && window.strictPass.handover != nil {
+						t.Fatal("a handover reservation outlived the platform's off")
+					}
+				}()
 			})
 		})
 	}
