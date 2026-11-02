@@ -450,7 +450,7 @@ func TestExtenderActivatorMeasurementCsrFollowsTheFamilyThatPassed(t *testing.T)
 	fixture := newTestActivatorFixtureWithOperator(
 		t,
 		func(operator *testActivateOperator) {
-			operator.setIpVersionRefusal(6, "the forward did not answer")
+			operator.setFamilyRefusal(6, "the forward did not answer")
 		},
 		func(settings *ExtenderActivatorSettings) {
 			settings.MeasurementCsr = hook.measurementCsr
