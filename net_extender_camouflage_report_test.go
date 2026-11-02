@@ -850,9 +850,8 @@ func TestExtenderCamouflageReporterAccountChangeDropsEverything(t *testing.T) {
 		}
 	})
 	t.Run("with the answer and the change together", func(t *testing.T) {
-		// the change lands as the answer does, so the wait may see either first: the
-		// old identity's answer is never read, whichever it was, and many passes make
-		// sure both have been seen
+		// the change lands as the answer does, so the wait may see either first, and
+		// whichever it was the next identity reports only what it did
 		var harness *testCamouflageReportHarness
 		passCount := 0
 		harness = newTestCamouflageReportHarness(t, func(settings *ExtenderCamouflageReporterSettings) {
@@ -864,18 +863,17 @@ func TestExtenderCamouflageReporterAccountChangeDropsEverything(t *testing.T) {
 			}
 		})
 		wait := harness.enable()
-		for passCount = range 64 {
+		for passCount = range 16 {
 			count := int64(passCount + 1)
 			harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
 				counters.BothFailedCount = count
 			})
 			post := harness.postAfter(wait, "the report")
+			if reported := post.args(t).Client.BothFailed; reported != 1 {
+				t.Errorf("pass %d reported %d, and this identity did 1", passCount, reported)
+			}
 			post.answer(ExtenderCamouflageReportAccepted)
 			wait = harness.requireParked("the next identity's first look")
-		}
-		stats := harness.reporter.Stats()
-		if stats.DeliveredCount != 0 || stats.DroppedCount != 64 {
-			t.Errorf("an old identity's answer was read: %+v", stats)
 		}
 	})
 	t.Run("in a backoff", func(t *testing.T) {

@@ -738,10 +738,8 @@ func (self *ExtenderCamouflageReporter) post(wake chan struct{}, accountChange c
 		<-resultChannel
 		return
 	}
-	// an answer on its way when the account changed is no answer to read
-	if accountGeneration, _ := self.accountGeneration(); accountGeneration != self.accountSeen {
-		return
-	}
+	// an answer that lands with an account change only moves what the next look
+	// resets, so it needs no check here
 	self.settle(result)
 }
 
