@@ -5766,6 +5766,9 @@ func (self *TcpSequence) Run() {
 	receiveAckCond := self.receiveAckCondition()
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
+		// Publish cancellation before waking waiters, or they can observe a
+		// live flow, wait again, and strand the child-worker join.
+		self.cancel()
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
