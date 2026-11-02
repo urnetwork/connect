@@ -508,6 +508,9 @@ type ExtenderServer struct {
 	// probe response. Counted apart from the Phase-A terminate above, since
 	// that one is the intended posture and this one is exposure.
 	camouflageSpliceFallbackTerminatedCount atomic.Int64
+	// how much of those counts the camouflage report has taken
+	// (extender_camouflage_report.go)
+	camouflageReportLedger extenderCamouflageReportLedger
 
 	// the runtime splice posture (EXTENDER-UPDATE2 §3.3): until
 	// SetCamouflageSplice sets one, the posture is the ExtenderCamouflageSplice
