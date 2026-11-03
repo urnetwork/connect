@@ -428,3 +428,69 @@ func TestClientNetworkQualityCloseUnregistersGlobalListener(t *testing.T) {
 		t.Fatalf("closed client received global generation %d", generation)
 	}
 }
+
+// A window client hears its exit on the exit's return lane, and that reply lane
+// is a companion contract toward the exit, which an exit with no stream provide
+// key refuses. Its own forward lane is the one it has permission for, so a hint
+// rides that, and no companion sequence opens for it.
+func TestClientNetworkQualityLiveForwardLaneWinsOverObservedReplyLane(t *testing.T) {
+	client := newNetworkQualityTestClient(t)
+	peerId := NewId()
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: "forward"}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !client.SendWithTimeout(frame, peerId, func(error) {}, -1) {
+		MessagePoolReturn(frame.MessageBytes)
+		t.Fatal("the forward send must enqueue")
+	}
+	client.observeNetworkQualityPeer(TransferPath{SourceId: peerId}, Peer{
+		ProvideMode: protocol.ProvideMode_Stream,
+		TransferKey: TransferKey{
+			CompanionContract:   true,
+			EncryptionCompanion: true,
+		},
+	})
+
+	client.networkQuality.queuePeerNotifications(7)
+
+	client.networkQuality.stateLock.Lock()
+	pending, found := client.networkQuality.pendingPeerNotifications[peerId]
+	client.networkQuality.stateLock.Unlock()
+	if !found {
+		t.Fatal("the exit was left out of the fanout")
+	}
+	if pending.peer.transferOptions.CompanionContract || pending.peer.transferKey.CompanionContract {
+		t.Fatalf("the hint rides a companion contract toward an exit with a live forward lane: %+v", pending.peer)
+	}
+}
+
+// With a forward and a companion sequence to one peer, the forward lane is chosen
+// whatever order the map yields them in.
+func TestSendBufferNetworkQualityPeersPrefersForwardLane(t *testing.T) {
+	client := newNetworkQualityTestClient(t)
+	peerId := NewId()
+	send := func(opts ...any) {
+		t.Helper()
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: "lane"}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.SendWithTimeout(frame, peerId, func(error) {}, -1, opts...) {
+			MessagePoolReturn(frame.MessageBytes)
+			t.Fatal("the send must enqueue")
+		}
+	}
+	send(CompanionContract())
+	send()
+	// map iteration order varies per range, so ask enough times to see both orders
+	for range 64 {
+		peer, found := client.sendBuffer.networkQualityPeers()[peerId]
+		if !found {
+			t.Fatal("the peer was left out")
+		}
+		if peer.transferOptions.CompanionContract {
+			t.Fatalf("chose the companion lane over the forward lane: %+v", peer)
+		}
+	}
+}
