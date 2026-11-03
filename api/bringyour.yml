@@ -7304,6 +7304,226 @@ paths:
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
+  /sn/fleet/device:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: What the server asks of a device of a claiming network
+      description: |
+        A device asks this slowly and with jitter: it says when to ask again, and
+        almost always nothing else. It is answered from a short list of the networks
+        that authorized a fleet hotkey. When the network chose this device, the answer
+        carries its binding, the hotkey's signature and the coldkey's authorization, all
+        of which the device checks itself before it signs (sdk `sn_fleet_device.go`).
+        While binding is closed the answer says so and carries no work. Client tokens
+        only.
+      operationId: snFleetDevice
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: need_consent
+          in: query
+          required: false
+          description: "`1` when the device has no pinned coldkey: the answer carries the network's newest consent, as it was signed."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetDeviceResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/fleet/device/signature:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A device's signature on its own binding, or why it refused
+      description: |
+        Stored only when it verifies under the client key in this device's own open
+        binding. A refusal stops the server offering that binding, and shows on the
+        network's card. Client tokens only.
+      operationId: snFleetDeviceSignature
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnFleetDeviceSignatureArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetDeviceSignatureResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/fleet/device/binding:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A device's own newest binding on chain
+      description: |
+        What a device needs to sign its Leave: the deployment, the generation and the
+        current epoch. Client tokens only.
+      operationId: snFleetDeviceBinding
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetDeviceBindingResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/fleet/device/leave:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Leave a fleet from the next epoch
+      description: |
+        Takes a revocation signed with the client key, which is all the coordinator needs,
+        and sends it through the relay. With no signature the device had nothing on chain
+        to end. Either way the device is not chosen again until it is reset. Client tokens
+        only.
+      operationId: snFleetDeviceLeave
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnFleetDeviceLeaveArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetDeviceLeaveResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+
+  /sn/fleet/claim:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The network's Top 200 claim
+      description: |
+        Where the network's claim stands, what the key holder's device has to publish and
+        sign next, and how many of the network's devices are chosen, ready and still to
+        update. The sdk's `SnFleetClaim` reads this and checks everything in it before it
+        signs anything.
+      operationId: snFleetClaim
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetClaimResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /sn/fleet/authorization:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The coldkey's signed authorization of a fleet hotkey
+      description: |
+        Any wallet's signature serves. It must name this network and deployment and be
+        signed by the coldkey of the network's newest payout consent. A consent or any
+        other signed text is refused. The network owner's session only. The admin is
+        emailed when it changes the hotkey.
+      operationId: snFleetAuthorize
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnFleetAuthorizationArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetAuthorizationResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /sn/fleet/hotkey-signatures:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The hotkey's signatures on the newest manifest's bindings
+      description: |
+        Only a signature that verifies under the network's authorized hotkey over an open
+        binding is stored. The network owner's session only.
+      operationId: snFleetHotkeySignatures
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnFleetHotkeySignaturesArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetHotkeySignaturesResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /sn/fleet/top-up:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The network's one top-up
+      description: |
+        Sends the network's coldkey what registering costs: the live burn plus its fee,
+        once per network, only for a network the app prompts to claim. It fails closed with
+        no funded key, and when the burn has spiked. The network owner's session only.
+      operationId: snFleetTopUp
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnFleetTopUpResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
   /sn/head-summary:
     post:
       x-internal: true
@@ -17908,6 +18128,305 @@ components:
           properties:
             message:
               type: string
+
+    SnFleetAutoError:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+
+    SnFleetSignedMessage:
+      type: object
+      required:
+        - message
+        - signature
+      properties:
+        message:
+          type: string
+        signature:
+          description: 0x-hex 64-byte wallet signature over the message.
+          type: string
+
+    SnFleetDeviceResult:
+      type: object
+      required:
+        - binding_open
+        - next_check_seconds
+      properties:
+        binding_open:
+          type: boolean
+        next_check_seconds:
+          description: When to ask again. The device holds this within its own bounds.
+          type: integer
+        consent:
+          $ref: "#/components/schemas/SnFleetSignedMessage"
+        authorization:
+          $ref: "#/components/schemas/SnFleetSignedMessage"
+        binding_json:
+          description: The binding to sign, as json text.
+          type: string
+        hotkey_signature:
+          description: 0x-hex hotkey signature over the binding's digest.
+          type: string
+
+    SnFleetDeviceSignatureArgs:
+      type: object
+      required:
+        - digest
+      properties:
+        digest:
+          description: 0x-hex binding digest the device computed.
+          type: string
+        client_signature:
+          type: string
+        refusal:
+          description: Why the device refused, instead of a signature.
+          type: string
+
+    SnFleetDeviceSignatureResult:
+      type: object
+      required:
+        - accepted
+      properties:
+        accepted:
+          type: boolean
+        error:
+          $ref: "#/components/schemas/SnFleetAutoError"
+
+    SnFleetDeviceBindingResult:
+      type: object
+      required:
+        - bound
+      properties:
+        bound:
+          type: boolean
+        chain_id:
+          type: integer
+        netuid:
+          type: integer
+        coordinator:
+          type: string
+        generation:
+          type: integer
+        valid_from_epoch:
+          type: integer
+        valid_to_epoch:
+          type: integer
+        current_epoch:
+          type: integer
+
+    SnFleetDeviceLeaveArgs:
+      type: object
+      required:
+        - generation
+        - effective_epoch
+      properties:
+        generation:
+          type: integer
+        effective_epoch:
+          type: integer
+        client_signature:
+          description: 0x-hex Ed25519 signature over the revocation digest. Absent when nothing is on chain.
+          type: string
+
+    SnFleetDeviceLeaveResult:
+      type: object
+      required:
+        - left
+      properties:
+        left:
+          type: boolean
+        effective_epoch:
+          description: The first epoch the device is back in the pool.
+          type: integer
+        current_epoch:
+          description: The epoch moved on before this request. Sign again for it.
+          type: integer
+        error:
+          $ref: "#/components/schemas/SnFleetAutoError"
+
+    SnFleetHotkeyWork:
+      type: object
+      required:
+        - binding_json
+      properties:
+        binding_json:
+          type: string
+
+    SnFleetManifestState:
+      type: object
+      required:
+        - generation
+        - manifest
+        - mirrored
+      properties:
+        generation:
+          type: integer
+        manifest:
+          description: The exact canonical manifest whose hash the hotkey publishes.
+          type: string
+        mirrored:
+          type: boolean
+
+    SnFleetDeviceCounts:
+      type: object
+      required:
+        - chosen
+        - ready
+        - bound
+        - refused
+        - still_to_update
+      properties:
+        chosen:
+          type: integer
+        ready:
+          type: integer
+        bound:
+          type: integer
+        refused:
+          type: integer
+        still_to_update:
+          description: The network's online providers that haven't asked for work.
+          type: integer
+
+    SnFleetTopUpState:
+      type: object
+      required:
+        - used
+        - available
+        - landed
+      properties:
+        used:
+          type: boolean
+        available:
+          type: boolean
+        amount_rao:
+          type: integer
+        landed:
+          type: boolean
+
+    SnFleetClaimResult:
+      type: object
+      required:
+        - binding_open
+        - claim_prompt
+        - consent_coldkey
+        - chain_id
+        - netuid
+        - coordinator
+        - authorization_message
+        - registered
+        - uid
+        - current_epoch
+        - current_block
+        - next_epoch_start_block
+        - register_after_block
+        - register_before_block
+        - counts
+        - top_up
+      properties:
+        binding_open:
+          type: boolean
+        claim_prompt:
+          type: boolean
+        consent_coldkey:
+          type: string
+        chain_id:
+          type: integer
+        netuid:
+          type: integer
+        coordinator:
+          type: string
+        authorization_message:
+          type: string
+        registered:
+          type: boolean
+        uid:
+          type: integer
+        current_epoch:
+          type: integer
+        current_block:
+          type: integer
+        next_epoch_start_block:
+          type: integer
+        register_after_block:
+          type: integer
+        register_before_block:
+          type: integer
+        manifest:
+          $ref: "#/components/schemas/SnFleetManifestState"
+        hotkey_work:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnFleetHotkeyWork"
+        counts:
+          $ref: "#/components/schemas/SnFleetDeviceCounts"
+        top_up:
+          $ref: "#/components/schemas/SnFleetTopUpState"
+
+    SnFleetAuthorizationArgs:
+      type: object
+      required:
+        - message
+        - signature
+      properties:
+        message:
+          type: string
+        signature:
+          type: string
+
+    SnFleetAuthorizationResult:
+      type: object
+      required:
+        - accepted
+      properties:
+        accepted:
+          type: boolean
+        error:
+          $ref: "#/components/schemas/SnFleetAutoError"
+
+    SnFleetHotkeySignature:
+      type: object
+      required:
+        - digest
+        - hotkey_signature
+      properties:
+        digest:
+          type: string
+        hotkey_signature:
+          type: string
+
+    SnFleetHotkeySignaturesArgs:
+      type: object
+      required:
+        - signatures
+      properties:
+        signatures:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnFleetHotkeySignature"
+
+    SnFleetHotkeySignaturesResult:
+      type: object
+      required:
+        - accepted
+      properties:
+        accepted:
+          type: integer
+        error:
+          $ref: "#/components/schemas/SnFleetAutoError"
+
+    SnFleetTopUpResult:
+      type: object
+      required:
+        - amount_rao
+      properties:
+        amount_rao:
+          type: integer
+        error:
+          $ref: "#/components/schemas/SnFleetAutoError"
 
     SnHeadSummary:
       type: object
