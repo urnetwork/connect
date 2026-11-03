@@ -537,14 +537,14 @@ func TestPacketTranslationErrorsNameNoAddress(t *testing.T) {
 // from are still there.
 func TestPacketTranslationSocketErrorKeepsTheCause(t *testing.T) {
 	addr := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 44444}
-	if err := SocketErrorWithoutAddress(nil); err != nil {
+	if err := socketErrorWithoutAddress(nil); err != nil {
 		t.Fatalf("nil = %v", err)
 	}
-	closed := SocketErrorWithoutAddress(&net.OpError{Op: "write", Addr: addr, Err: net.ErrClosed})
+	closed := socketErrorWithoutAddress(&net.OpError{Op: "write", Addr: addr, Err: net.ErrClosed})
 	if !errors.Is(closed, net.ErrClosed) {
 		t.Fatalf("closed = %v", closed)
 	}
-	sent := SocketErrorWithoutAddress(&net.OpError{
+	sent := socketErrorWithoutAddress(&net.OpError{
 		Op:   "write",
 		Addr: addr,
 		Err:  os.NewSyscallError("sendto", syscall.EMSGSIZE),
@@ -558,10 +558,10 @@ func TestPacketTranslationSocketErrorKeepsTheCause(t *testing.T) {
 	}
 	// nothing to scrub is left alone
 	plain := errors.New("a failure this does not know")
-	if err := SocketErrorWithoutAddress(plain); err != plain {
+	if err := socketErrorWithoutAddress(plain); err != plain {
 		t.Fatalf("plain = %v", err)
 	}
-	wrapped := SocketErrorWithoutAddress(fmt.Errorf("through a seam: %w", &net.OpError{Op: "write", Addr: addr, Err: syscall.EPERM}))
+	wrapped := socketErrorWithoutAddress(fmt.Errorf("through a seam: %w", &net.OpError{Op: "write", Addr: addr, Err: syscall.EPERM}))
 	if !errors.Is(wrapped, syscall.EPERM) || strings.Contains(wrapped.Error(), "203.0.113.7") {
 		t.Fatalf("wrapped = %v", wrapped)
 	}

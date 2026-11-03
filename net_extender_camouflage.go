@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -57,9 +58,28 @@ const extenderTcpCamouflageStagger = 250 * time.Millisecond
 // the extender request over.
 var extenderCamouflageAlpn = []string{"h2", "http/1.1"}
 
-// The stagger clock the race reads; a test replaces it.
+// Whether the race's stagger is held, for Testing_HoldExtenderTcpCamouflageStagger.
+var extenderTcpCamouflageStaggerHeld atomic.Bool
+
+// The stagger clock the race reads; a test replaces it. Held, it never fires.
 func extenderTcpCamouflageStaggerC() <-chan time.Time {
+	if extenderTcpCamouflageStaggerHeld.Load() {
+		return nil
+	}
 	return time.After(extenderTcpCamouflageStagger)
+}
+
+// Testing_HoldExtenderTcpCamouflageStagger keeps a dial's legacy attempt from
+// launching while its camouflaged attempt is pending, until the returned function
+// lets go. Tests in other packages use it to judge the authenticated attempt alone:
+// on a busy machine that attempt can outlast the stagger, and the extender then sees
+// the legacy attempt's hello as well. A camouflaged attempt that fails still launches
+// the legacy one at once.
+func Testing_HoldExtenderTcpCamouflageStagger() func() {
+	extenderTcpCamouflageStaggerHeld.Store(true)
+	return func() {
+		extenderTcpCamouflageStaggerHeld.Store(false)
+	}
 }
 
 // Whether the tcp dial runs the camouflaged attempt (P7, P8): the config

@@ -2,7 +2,6 @@ package extender
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -47,7 +46,7 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	if req.ProtoMajor == 2 {
-		self.refuse(w, req, "request", fmt.Errorf("an extender request cannot use h2"))
+		self.refuse(w, req, "request", extenderFixedError("an extender request cannot use h2"))
 		return
 	}
 
@@ -57,14 +56,14 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	if !server.IsAllowedSecret(header) {
-		self.refuse(w, req, "header authorization", fmt.Errorf("secret signature is not allowed"))
+		self.refuse(w, req, "header authorization", extenderFixedError("secret signature is not allowed"))
 		return
 	}
 	// every action is admitted under the limits of A12, whichever service it
 	// asks for; a header signed with one of this extender's secrets is spared
 	// the per-subnet one
 	if limit, retryAfter := server.admitAction(req.RemoteAddr, 0 < len(server.allowedSecrets)); limit != extenderAdmitted {
-		self.limit(w, req, extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"), retryAfter)
+		self.limit(w, req, extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"), retryAfter)
 		return
 	}
 
@@ -80,13 +79,13 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 			return
 		}
 		if !server.IsAllowedHost(header.DestinationHost) {
-			self.refuse(w, req, "destination authorization", fmt.Errorf("host %q is not allowed", header.DestinationHost))
+			self.refuse(w, req, "destination authorization", extenderFixedError("the destination host is not allowed"))
 			return
 		}
 		// an NLayer extender whose every hop is limited says so now, while it
 		// still can: once the response is out, a forward can only close (A12)
 		if retryAfter, limited := server.nlayerHopsLimited(); limited {
-			self.limit(w, req, "nlayer limited", fmt.Errorf("every NLayer hop is limited"), retryAfter)
+			self.limit(w, req, "nlayer limited", extenderFixedError("every NLayer hop is limited"), retryAfter)
 			return
 		}
 	case connect.ExtenderServiceGossip:
@@ -114,13 +113,13 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 			return
 		}
 	default:
-		self.refuse(w, req, "service", fmt.Errorf("service %d is not known", header.Service))
+		self.refuse(w, req, "service", extenderFixedError("the service is not known"))
 		return
 	}
 	if header.Service != connect.ExtenderServiceForward &&
 		header.Service != connect.ExtenderServiceProbe &&
 		serviceConnHandler == nil {
-		self.refuse(w, req, "service", fmt.Errorf("service %d is not available", header.Service))
+		self.refuse(w, req, "service", extenderFixedError("the service is not available"))
 		return
 	}
 	if server.settings.HeaderHandler != nil {
@@ -271,14 +270,10 @@ func isExtenderRequest(req *http.Request) bool {
 // content length.
 func readExtenderHeader(req *http.Request) (*protocol.ExtenderHeader, error) {
 	if req.ContentLength < 0 {
-		return nil, fmt.Errorf("extender header has no content length")
+		return nil, extenderFixedError("the extender header has no content length")
 	}
 	if connect.ExtenderMaxHeaderByteCount < req.ContentLength {
-		return nil, fmt.Errorf(
-			"extender header is %d bytes, at most %d",
-			req.ContentLength,
-			connect.ExtenderMaxHeaderByteCount,
-		)
+		return nil, extenderFixedError("the extender header is over its byte limit")
 	}
 	headerBytes := make([]byte, req.ContentLength)
 	if _, err := io.ReadFull(req.Body, headerBytes); err != nil {
@@ -286,7 +281,7 @@ func readExtenderHeader(req *http.Request) (*protocol.ExtenderHeader, error) {
 	}
 	header := &protocol.ExtenderHeader{}
 	if err := proto.Unmarshal(headerBytes, header); err != nil {
-		return nil, err
+		return nil, extenderFixedError("the extender header does not parse")
 	}
 	return header, nil
 }
@@ -308,7 +303,7 @@ func takeOverConn(w http.ResponseWriter, req *http.Request) (net.Conn, error) {
 	}
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		return nil, fmt.Errorf("the extender response writer cannot be taken over")
+		return nil, extenderFixedError("the extender response writer cannot be taken over")
 	}
 	if flusher, ok := w.(http.Flusher); ok {
 		// the hijack releases the connection without flushing the buffered

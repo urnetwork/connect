@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -99,9 +98,7 @@ func (self *extenderHandler) serveNLayerProbe(
 	}
 	if source, ok := nlayerProbeSourceOf(header); ok {
 		if !server.beginNLayerProbeSource(source) {
-			self.refuse(w, req, "nlayer probe", fmt.Errorf(
-				"a relayed probe of this %s pinger is already in flight", source.pingerKind,
-			))
+			self.refuse(w, req, "nlayer probe", extenderFixedError("a relayed probe of this pinger is already in flight"))
 			return
 		}
 		defer server.endNLayerProbeSource(source)
@@ -130,10 +127,10 @@ func (self *extenderHandler) serveNLayerProbe(
 		// with the shortest backoff (A12)
 		var limitedErr *connect.ExtenderLimitedError
 		if errors.As(err, &limitedErr) {
-			self.limit(w, req, "nlayer limited", err, limitedErr.RetryAfter)
+			self.limit(w, req, "nlayer limited", extenderFixedError("every NLayer hop is limited"), limitedErr.RetryAfter)
 			return
 		}
-		self.refuse(w, req, "nlayer probe dial", err)
+		self.refuse(w, req, ExtenderErrorStageNLayerProbeDial, err)
 		return
 	}
 	defer hopConn.Close()
