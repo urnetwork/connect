@@ -320,13 +320,10 @@ func TestPacketTranslationClientEndsOnAReadFailure(t *testing.T) {
 	fixture.waitEnded(t)
 }
 
-// A socket whose every write fails stays up, however long that goes on. A sender can
-// bring it about: a source port of 0 fails every write to it, and on a quiet port
-// nothing else succeeds in between, so anything here that ended the socket is something
-// a sender can reach. On the server's alt listener losing the socket ends the whole
-// process with no drain, and a review measured that on real sockets, with a bound of 5
-// minutes, at 160 datagrams. This is a week of such failures on the fake clock, so a
-// bound of any length fails it, and it is what must keep one from coming back.
+// A socket whose every write fails stays up, however long that goes on: no count or
+// duration of failed writes may end it (EXTENDER.md G2). This is a week of such
+// failures on the fake clock, so a bound of any length fails it, and it is what must
+// keep one from coming back.
 func TestPacketTranslationServerOutlivesWritesThatAllFail(t *testing.T) {
 	// the pools start a goroutine for good at their first use, which must be outside
 	// the bubble
