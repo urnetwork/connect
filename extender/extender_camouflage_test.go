@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +156,25 @@ func blockingBorrowSiteHandler(release <-chan struct{}) func(conn net.Conn) {
 		go io.Copy(io.Discard, conn)
 		<-release
 	}
+}
+
+// The connect settings of a client whose first dial, which is a camouflaged dial's
+// camouflaged attempt, takes longer than the stagger of the race (P8). A busy machine
+// does that now and then. Without the stagger held, the legacy attempt launches and
+// the extender sees its hello too, so a test that counts what the authenticated attempt
+// did holds the stagger, and this keeps it honest.
+func camouflageSlowFirstDialSettings(fixture *extenderFixture) *connect.ConnectSettings {
+	connectSettings := fixture.connectSettings()
+	var dialCount atomic.Int32
+	connectSettings.DialContextSettings = &connect.DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			if dialCount.Add(1) == 1 {
+				time.Sleep(500 * time.Millisecond)
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		},
+	}
+	return connectSettings
 }
 
 // Builds the TLS record bytes of a plain, unauthenticated browser ClientHello
@@ -345,6 +365,7 @@ func TestExtenderCamouflageAuthenticatedNegotiatesHttp11(t *testing.T) {
 	seed, identityPublicKey, realityPublicKey := newCamouflageKeys(t)
 	restore := connect.Testing_SetBorrowDomains([]string{testBorrowName})
 	defer restore()
+	defer connect.Testing_HoldExtenderTcpCamouflageStagger()()
 	outcomes := &recordedValues[ExtenderCamouflageOutcome]{}
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
@@ -354,7 +375,7 @@ func TestExtenderCamouflageAuthenticatedNegotiatesHttp11(t *testing.T) {
 		}
 	})
 	client := connect.NewExtenderHttpClient(
-		fixture.connectSettings(),
+		camouflageSlowFirstDialSettings(fixture),
 		camouflageClientConfig(fixture, identityPublicKey, realityPublicKey),
 	)
 	defer client.CloseIdleConnections()

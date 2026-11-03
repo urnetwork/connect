@@ -26,6 +26,7 @@ func TestExtenderCamouflageAuthenticatedReachesDestinationPhaseB(t *testing.T) {
 	seed, identityPublicKey, realityPublicKey := newCamouflageKeys(t)
 	restore := connect.Testing_SetBorrowDomains([]string{testBorrowName})
 	defer restore()
+	defer connect.Testing_HoldExtenderTcpCamouflageStagger()()
 	site := newFakeBorrowSite(t, tlsBorrowSiteHandler(t))
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
@@ -35,7 +36,7 @@ func TestExtenderCamouflageAuthenticatedReachesDestinationPhaseB(t *testing.T) {
 		settings.CamouflageSpliceDialContext = site.dialContext()
 	})
 	client := connect.NewExtenderHttpClient(
-		fixture.connectSettings(),
+		camouflageSlowFirstDialSettings(fixture),
 		camouflageClientConfig(fixture, identityPublicKey, realityPublicKey),
 	)
 	defer client.CloseIdleConnections()
@@ -183,6 +184,9 @@ func TestExtenderCamouflageReplayedHelloRefusedAndSpliced(t *testing.T) {
 	seed, identityPublicKey, realityPublicKey := newCamouflageKeys(t)
 	restore := connect.Testing_SetBorrowDomains([]string{testBorrowName})
 	defer restore()
+	// the hello captured and the one splice awaited are the authenticated attempt's
+	// and the replay's, so no legacy attempt can send one ahead of them
+	defer connect.Testing_HoldExtenderTcpCamouflageStagger()()
 	site := newFakeBorrowSite(t, tlsBorrowSiteHandler(t))
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
