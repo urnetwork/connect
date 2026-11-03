@@ -3,14 +3,20 @@ package extender
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path"
+	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 
 	"github.com/quic-go/quic-go"
+
+	"github.com/urnetwork/connect"
 )
 
 // What an ErrorHandler hears of a failed connection (EXTENDER.md G2).
@@ -34,7 +40,7 @@ import (
 //
 // The two forward stages dial the destination a client asked for, which the whitelist
 // confines to the operator's hosts (A5, A7), so the error names an operator host, under
-// the label a `*.` pattern leaves to the client.
+// a label a `*.` pattern leaves to the client, which can hold only what a host name can.
 //
 // The two nlayer stages dial a hop the operator configured (A11), so the error names
 // the hop and what connect.DialExtender found there: the status of a refusal, the
@@ -77,6 +83,9 @@ const (
 	extenderErrorUnclassified = extenderFixedError("unclassified")
 )
 
+// The most places the log line of a handler's panic names.
+const extenderPanicLocationCount = 8
+
 // The closes and ends a failure is reported as when it is one of them, kept as the
 // standard values they are so errors.Is finds them through a handler's own wrapping.
 var extenderEndErrors = []error{
@@ -100,6 +109,28 @@ func (self *ExtenderServer) reportError(stage string, err error) {
 		err = extenderErrorClass(err)
 	}
 	self.settings.ErrorHandler(stage, err)
+}
+
+// What is left of a panic in a request's handler: where it happened, which comes from
+// the binary and holds nothing of the request or the panic's value, and its class. A
+// handler that panics is a bug, which an operator should be able to see and report.
+func (self *ExtenderServer) reportHandlerPanic(r any) {
+	if r == http.ErrAbortHandler || connect.IsDoneError(r) {
+		return
+	}
+	// past this function and the deferred call that called it
+	programCounters := make([]uintptr, 32)
+	frames := runtime.CallersFrames(programCounters[:runtime.Callers(3, programCounters)])
+	locations := []string{}
+	for more := true; more && len(locations) < extenderPanicLocationCount; {
+		var frame runtime.Frame
+		frame, more = frames.Next()
+		if !strings.HasPrefix(frame.Function, "runtime.") {
+			locations = append(locations, fmt.Sprintf("%s:%d", path.Base(frame.File), frame.Line))
+		}
+	}
+	connect.DefaultLogger().Errorf("[extender] a request's handler panicked at %s\n", strings.Join(locations, " < "))
+	self.reportError("handler panic", extenderFixedError("the handler panicked"))
 }
 
 // The class of a failure, which is the only thing about it that leaves here. Each

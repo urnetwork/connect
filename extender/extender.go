@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"net"
@@ -738,7 +739,9 @@ func NewExtenderServer(
 		// and net/http clears the deadline on hijack, so the relay that
 		// follows an accepted request keeps only its own deadlines (A9)
 		ReadTimeout: settings.HeaderTimeout,
-		ErrorLog:    log.New(extenderLogWriter{}, "", 0),
+		// what net/http and http2 log names the client, so it goes nowhere. The one
+		// line of theirs an operator needs, a panic, the handler reports itself
+		ErrorLog: log.New(io.Discard, "", 0),
 		// the sni of a terminated tcp connection is not on the request, which
 		// is no longer a *tls.Conn, so it is carried on the connection context
 		// along with the per-connection proxy budget (A3, A5)
@@ -777,15 +780,6 @@ var extenderCarrierOrder = []string{
 	connect.ExtenderCarrierQuic,
 	connect.ExtenderCarrierDns,
 	connect.ExtenderCarrierWebRtc,
-}
-
-// extenderLogWriter keeps the http server's internal errors on the same log as
-// the rest of the extender without exposing a writer to callers.
-type extenderLogWriter struct{}
-
-func (self extenderLogWriter) Write(b []byte) (int, error) {
-	log.Printf("[extender] http: %s", strings.TrimSpace(string(b)))
-	return len(b), nil
 }
 
 // Begins one owned server operation unless shutdown has already started.
@@ -1482,6 +1476,9 @@ func (self *ExtenderServer) IsAllowedSecret(header *protocol.ExtenderHeader) boo
 	return false
 }
 
+// A name the operator wrote out is matched as it is. A name a `*.` pattern admits is the
+// client's own in front of the suffix, so it must be a host name as well, as a proxied
+// name must (A5).
 func (self *ExtenderServer) IsAllowedHost(host string) bool {
 	_, err := idna.ToUnicode(host)
 	if err != nil {
@@ -1493,7 +1490,7 @@ func (self *ExtenderServer) IsAllowedHost(host string) bool {
 			return true
 		}
 		if strings.HasPrefix(allowedHost, "*.") {
-			if strings.HasSuffix(host, allowedHost[1:]) {
+			if strings.HasSuffix(host, allowedHost[1:]) && isHostName(strings.ToLower(host)) {
 				return true
 			}
 		}

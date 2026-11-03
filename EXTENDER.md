@@ -183,7 +183,9 @@ from the extender's configuration; the sdk provider derives them from the
 network space hosts as `<host>` and `*.<host>` for the host and the
 migration host; connectctl takes them by flag. An extender request's
 destination must match an operator pattern; spoof domains are never valid
-destinations. Any other request on a terminated connection, HTTP/1.1, h2
+destinations, and one that only a `*.` pattern admits must be a syntactic host
+name, since the client chooses everything in front of the suffix. Any other
+request on a terminated connection, HTTP/1.1, h2
 or H3, is answered by a reverse proxy to `https://<sni>` when the SNI is
 on the whitelist, using the extender's egress on the client's family with
 normal CA verification upstream, so a prober gets the real site behind a
@@ -1337,6 +1339,13 @@ stage or a new kind of error is scrubbed with nothing further done. Only `forwar
 `datagram forward dial`, `nlayer hop dial` and `nlayer probe dial` keep the whole error,
 since each dials what the operator named (A5, A7, A11) and the client's address only
 chooses the family. Those are what an operator reads, and the role logs the first two.
+
+The extender's http servers keep no log of their own, since every line of theirs an
+operator might read names the client or repeats what the client sent: a broken h2
+greeting, a frame that cannot be read, a panic. The one that matters is the panic, so
+the handler catches its own and logs that it happened and where in the code, from the
+binary and with nothing of the value or the request, and `ErrorHandler` hears it as the
+stage `handler panic`.
 
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
