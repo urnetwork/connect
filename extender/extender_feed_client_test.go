@@ -394,10 +394,11 @@ func TestExtenderNetworkClientSamplesAnExtender(t *testing.T) {
 		}
 	})
 
-	// the sample reached the directory
+	// the sample reached the directory, and the probe its arrival wakes has come
+	// back and left it active
 	waitForDirectory(t, directory, func(snapshot *connect.ExtenderDirectorySnapshot) bool {
 		for _, entry := range snapshot.Entries {
-			if entry.Ip == sampledIp && entry.State == connect.ExtenderStateActive {
+			if entry.Ip == sampledIp && entry.State == connect.ExtenderStateActive && 0 < entry.Latency {
 				return true
 			}
 		}
@@ -514,6 +515,20 @@ func TestExtenderNetworkClientReconnectsWithBackoff(t *testing.T) {
 	}, "the retried sample never reached the directory")
 }
 
+// What a feed fixture's client measures a candidate with, which dials nothing. The
+// records beside the fixture's own carry documentation addresses this client refuses
+// to dial, and a probe that fails holds the address for the HoldTimeout. So a real
+// probe would take a sampled record out of the active state as soon as it woke, and a
+// test waiting to see the record active would wait forever if it looked only after
+// that.
+func testFeedProbe(
+	context.Context,
+	*connect.ExtenderCandidate,
+	*connect.ExtenderProbeAttestor,
+) (time.Duration, connect.ExtenderPingOutcome, error) {
+	return 20 * time.Millisecond, connect.ExtenderPingUnattested, nil
+}
+
 // A directory and a network client wired to this fixture.
 func (self *feedFixture) newDirectory(
 	t *testing.T,
@@ -568,6 +583,7 @@ func (self *feedFixture) newNetworkClient(
 			RootPublicKeyHexes: []string{hex.EncodeToString(self.rootPublic)},
 		}, nil
 	}
+	settings.Probe = testFeedProbe
 	if configure != nil {
 		configure(settings)
 	}
