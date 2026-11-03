@@ -265,27 +265,65 @@ func testExtenderStringConstants(t *testing.T, files []*ast.File) map[string]str
 	return constants
 }
 
-// The expression that names the stage of a call that reports one: reportError itself,
-// and the refusals that report through it. Nil for any other call.
-func testExtenderStageArg(call *ast.CallExpr) ast.Expr {
-	name := ""
+// The name of the function a call calls, whatever its receiver.
+func testExtenderCallName(call *ast.CallExpr) string {
 	switch fun := call.Fun.(type) {
 	case *ast.Ident:
-		name = fun.Name
+		return fun.Name
 	case *ast.SelectorExpr:
-		name = fun.Sel.Name
+		return fun.Sel.Name
 	}
-	switch {
-	case name == "reportError" && len(call.Args) == 2:
-		return call.Args[0]
-	case name == "refuse" && len(call.Args) == 4:
-		return call.Args[2]
-	case name == "limit" && len(call.Args) == 5:
-		return call.Args[2]
-	case name == "refuseRequest" && len(call.Args) == 6:
-		return call.Args[4]
+	return ""
+}
+
+// The parameters of a function, by name.
+func testExtenderParamNames(funcDecl *ast.FuncDecl) []string {
+	paramNames := []string{}
+	for _, field := range funcDecl.Type.Params.List {
+		for _, name := range field.Names {
+			paramNames = append(paramNames, name.Name)
+		}
 	}
-	return nil
+	return paramNames
+}
+
+// Which parameter of a function is the stage it reports, out of how many.
+type testExtenderStageParam struct {
+	index int
+	count int
+}
+
+// Every function that takes a stage: reportError, and whatever passes a parameter of its
+// own on to one that does, such as a refusal.
+func testExtenderStageParams(files []*ast.File) map[string]testExtenderStageParam {
+	stageParams := map[string]testExtenderStageParam{"reportError": {index: 0, count: 2}}
+	for changed := true; changed; {
+		changed = false
+		forEachTestExtenderFunc(files, func(funcDecl *ast.FuncDecl) {
+			if _, ok := stageParams[funcDecl.Name.Name]; ok {
+				return
+			}
+			paramNames := testExtenderParamNames(funcDecl)
+			ast.Inspect(funcDecl.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				stageParam, ok := stageParams[testExtenderCallName(call)]
+				if !ok || len(call.Args) != stageParam.count {
+					return true
+				}
+				if arg, ok := call.Args[stageParam.index].(*ast.Ident); ok {
+					if index := slices.Index(paramNames, arg.Name); 0 <= index {
+						stageParams[funcDecl.Name.Name] = testExtenderStageParam{index: index, count: len(paramNames)}
+						changed = true
+					}
+				}
+				return true
+			})
+		})
+	}
+	return stageParams
 }
 
 // Every stage the sources can report. Fails if a stage is anything but a constant: a
@@ -294,20 +332,23 @@ func testExtenderErrorStages(t *testing.T) []string {
 	t.Helper()
 	fileSet, files := parseTestExtenderSources(t)
 	constants := testExtenderStringConstants(t, files)
+	stageParams := testExtenderStageParams(files)
 	stages := []string{
 		extenderAdmissionStage(extenderLimitedBySubnets),
 		extenderAdmissionStage(extenderLimitedBySource),
 	}
 	forEachTestExtenderFunc(files, func(funcDecl *ast.FuncDecl) {
+		paramNames := testExtenderParamNames(funcDecl)
 		ast.Inspect(funcDecl.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-			stageArg := testExtenderStageArg(call)
-			if stageArg == nil {
+			stageParam, ok := stageParams[testExtenderCallName(call)]
+			if !ok || len(call.Args) != stageParam.count {
 				return true
 			}
+			stageArg := call.Args[stageParam.index]
 			switch arg := stageArg.(type) {
 			case *ast.BasicLit:
 				stage, err := strconv.Unquote(arg.Value)
@@ -321,8 +362,8 @@ func testExtenderErrorStages(t *testing.T) []string {
 					stages = append(stages, stage)
 					return true
 				}
-				// what the refusals pass on, each call of which is checked here
-				if arg.Name == "stage" && slices.Contains([]string{"refuse", "limit", "refuseRequest"}, funcDecl.Name.Name) {
+				// a parameter passed on, each call of whose function is checked here
+				if own, ok := stageParams[funcDecl.Name.Name]; ok && slices.Index(paramNames, arg.Name) == own.index {
 					return true
 				}
 			case *ast.CallExpr:
@@ -409,13 +450,7 @@ func TestExtenderErrorSources(t *testing.T) {
 					violate(n.Pos(), "reaches ErrorHandler outside reportError")
 				}
 			case *ast.CallExpr:
-				name := ""
-				switch fun := n.Fun.(type) {
-				case *ast.Ident:
-					name = fun.Name
-				case *ast.SelectorExpr:
-					name = fun.Sel.Name
-				}
+				name := testExtenderCallName(n)
 				if name == "extenderFixedError" {
 					if len(n.Args) != 1 {
 						violate(n.Pos(), "a fixed error of no one literal")
