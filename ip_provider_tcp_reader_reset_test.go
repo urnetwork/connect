@@ -213,8 +213,10 @@ func (self *tcpReaderResetFixture) assertSiblingProgress(t *testing.T) {
 	}
 }
 
-// Normal peer FIN closes the real writer queue. Its drained worker cancels the
-// exact flow before the held reader exits; no explicit test cancellation does.
+// Normal peer FIN closes the real writer queue. This socket cannot half-close,
+// so its drained worker cancels the exact flow before the held reader exits; no
+// explicit test cancellation does. The send loop acknowledges the FIN first,
+// and the canceled reader publishes nothing after it.
 func TestProviderTcpReaderExitAfterFinDoesNotSynthesizeReset(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	MessagePoolReturn(MessagePoolGet(1))
@@ -231,8 +233,9 @@ func TestProviderTcpReaderExitAfterFinDoesNotSynthesizeReset(t *testing.T) {
 			if drops := fixture.base.provider.CongestionDropStats(); drops != (ProviderCongestionDrops{}) {
 				t.Errorf("IPv%d closed TCP reader synthesized a new reset after normal FIN: %+v", version, drops)
 			}
-			if controls := fixture.base.takeControls(); len(controls) != 0 {
-				t.Errorf("IPv%d canceled reader published new controls: %+v", version, controls)
+			if controls := fixture.base.takeControls(); len(controls) != 1 || controls[0].syn || !controls[0].ack ||
+				controls[0].fin || controls[0].rst || controls[0].payloadByteCount != 0 || controls[0].ackNumber != 1002 {
+				t.Errorf("IPv%d FIN published %+v, want only its acknowledgement", version, controls)
 			}
 			fixture.assertSiblingProgress(t)
 		})
