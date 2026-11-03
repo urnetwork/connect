@@ -45,9 +45,11 @@ import (
 // instead, within a minute and six hours, and leaves its hold as it was. A
 // refusal of the key as another network's (C2c) holds the family until its
 // tick, since no wait changes it, and tells the role, which makes a key of the
-// network's own when it can (OnRefused). The ticks, the address check and the
-// holds count the time the host slept, from the first minute it is awake after
-// a sleep of fifteen minutes or more.
+// network's own when it can (OnRefused). So does a refusal of a family that has
+// not activated whose host is private, or that the operator's required test
+// found no answer from: a NAT or a firewall refuses every retry alike. The
+// ticks, the address check and the holds count the time the host slept, from
+// the first minute it is awake after a sleep of fifteen minutes or more.
 //
 // Every clock and every side effect is a settings seam -- `Now`, `PassAfter`,
 // `IpVersionSupported`, `IpVersionPublic`, `AddNetworkChangeListener` -- so
@@ -136,6 +138,61 @@ type ExtenderActivateResult struct {
 	// predates the field, whose refusal says it in `Error` alone
 	// (KeyHeldByAnotherNetwork).
 	Refusal string `json:"refusal,omitempty"`
+	// every step the operator's probe ran, in the order run (C2b): the tcp
+	// carrier's challenge, the forward through it, each dns port, then quic.
+	// A refusal's last step is the one that refused it, unless the store
+	// refused after the probe passed. Empty on a refusal that probed nothing,
+	// and from an operator that predates the field.
+	ProbeSteps []*ExtenderActivateProbeStep `json:"probe_steps,omitempty"`
+}
+
+// One step of the operator's probe of an activation (C2b).
+type ExtenderActivateProbeStep struct {
+	// tcp, forward, dns or quic
+	Name string `json:"name"`
+	// the family the step dialed
+	IpVersion int `json:"ip_version,omitempty"`
+	// the extender port the step dialed; the forward names the tcp port it
+	// runs over
+	Port int `json:"port,omitempty"`
+	// how long the step ran, and how much of the probe's budget was left when
+	// it started
+	ElapsedMs    int64 `json:"elapsed_ms,omitempty"`
+	BudgetLeftMs int64 `json:"budget_left_ms,omitempty"`
+	// ok; error, the step failed on its own; or timeout, its budget ran out
+	// before it answered
+	Outcome string `json:"outcome"`
+}
+
+// The outcome of a probe step that passed (C2b).
+const extenderActivateProbeStepOk = "ok"
+
+// Whether the answer refuses the activation because the operator's required
+// test found no answer from this host on its tcp carrier (C2a): the tcp step,
+// the probe's first, failed or ran out of time. The operator's steps say so
+// when it sends them (C2b); one that predates them says so in the words of
+// `Error` (ExtenderActivateRefusalUnreachable). A host the internet cannot reach
+// on its tcp port -- a NAT that does not forward it, a firewall that keeps the
+// internet out -- is refused alike at every retry, and the status says what it
+// needs (the sdk's `activation_unreachable`).
+func (self *ExtenderActivateResult) RequiredTestUnreachable() bool {
+	if self == nil || self.Activated {
+		return false
+	}
+	if 0 < len(self.ProbeSteps) {
+		last := self.ProbeSteps[len(self.ProbeSteps)-1]
+		return last != nil && last.Name == ExtenderCarrierTcp && last.Outcome != extenderActivateProbeStepOk
+	}
+	return ExtenderActivateRefusalUnreachable(self.Error)
+}
+
+// Whether a refusal's words are the operator's for its required test finding no
+// answer from the host on the tcp carrier (C2a, C2b): "the tcp carrier did not
+// answer ..." when its budget ran out first, "the tcp carrier failed after ..."
+// when it failed on its own.
+func ExtenderActivateRefusalUnreachable(message string) bool {
+	return strings.HasPrefix(message, "the tcp carrier did not answer") ||
+		strings.HasPrefix(message, "the tcp carrier failed")
 }
 
 // The refusals an extender acts on (C2c).
@@ -1341,6 +1398,9 @@ type extenderActivateAnswer struct {
 	// on a refusal, whether the operator refused the key as another network's
 	// (C2c), which no wait changes
 	keyOtherNetwork bool
+	// on a refusal, whether the operator's required test found no answer from
+	// this host on the tcp carrier (C2a, RequiredTestUnreachable)
+	unreachable bool
 }
 
 // Posts the families in `due`, in key order, and moves each one's schedule by
@@ -1367,6 +1427,17 @@ type extenderActivateAnswer struct {
 // it published the family after its probes passed (ownRecordNamesFamily). The
 // schedules move once every post of the pass has been answered, so the record
 // another family's answer brought counts too.
+//
+// A family with a public address that has not activated is held so too when
+// the operator's required test found no answer from it (RequiredTestUnreachable):
+// a firewall that keeps the internet out, or a router that does not forward
+// the port to a host it gives a public address, refuses every retry alike, as
+// the NAT does, and the status says what the extender needs (decided
+// 2026-11-03, support inbox 8154: stop retrying and explain). A network
+// change, a revocation and the role's restart
+// still post it at once, and its tick once a day, so a host whose port is
+// opened activates within the day. Its other refusals, and every refusal of a
+// family that has activated, are held on the backoff as before.
 //
 // A refusal of the key as another network's (C2c) is held until the tick too:
 // no post of this key for this network can pass however long it waits, so the
@@ -1432,8 +1503,9 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 			!self.fallback &&
 			!schedule.activatedInRun &&
 			!self.ownRecordNamesFamily(key) &&
-			!self.ipVersionPublic(key):
-			// a NAT that never forwarded refuses every retry alike, so the
+			(answer.unreachable || !self.ipVersionPublic(key)):
+			// a NAT that never forwarded, or a host the operator's required
+			// test found no answer from, refuses every retry alike, so the
 			// family waits for its tick; its hold stays as it was
 			schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
 		default:
@@ -1687,6 +1759,7 @@ func (self *ExtenderActivator) activateUrl(
 			outcome:         extenderActivateRefused,
 			retryAfter:      retryAfter,
 			keyOtherNetwork: result.KeyHeldByAnotherNetwork(),
+			unreachable:     result.RequiredTestUnreachable(),
 		}
 	}
 
