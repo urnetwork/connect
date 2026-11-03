@@ -3,7 +3,6 @@ package extender
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -131,7 +130,7 @@ func (self *extenderDnsForwarder) handleQuery(queryBytes []byte, addr net.Addr) 
 	default:
 		// every worker is busy; a dropped query is what a loaded resolver does
 		self.release(source)
-		self.server.reportError("dns query", fmt.Errorf("the dns forward workers are busy"))
+		self.server.reportError("dns query", extenderFixedError("the dns forward workers are busy"))
 	}
 }
 
@@ -148,7 +147,7 @@ func (self *extenderDnsForwarder) admit(source string, now time.Time) error {
 		self.sourceStates[source] = sourceState
 	}
 	if sourceState.inFlight {
-		return fmt.Errorf("%s already has a query in flight", source)
+		return extenderFixedError("the source already has a query in flight")
 	}
 	// both buckets are refilled before either is taken, so a query refused by
 	// one does not spend the other's token
@@ -164,11 +163,11 @@ func (self *extenderDnsForwarder) admit(source string, now time.Time) error {
 	)
 	if !sourceAvailable {
 		self.pruneSourceStatesWithLock(now)
-		return fmt.Errorf("%s is over its query rate", source)
+		return extenderFixedError("the source is over its query rate")
 	}
 	if !totalAvailable {
 		self.pruneSourceStatesWithLock(now)
-		return fmt.Errorf("the extender is over its query rate")
+		return extenderFixedError("the extender is over its query rate")
 	}
 	sourceState.bucket.take()
 	self.totalBucket.take()
@@ -232,7 +231,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 	// answer echoes its own query exactly
 	name := strings.TrimSuffix(question.Name.String(), ".")
 	if name == "" {
-		self.server.reportError("dns query", fmt.Errorf("the query has no name"))
+		self.server.reportError("dns query", extenderFixedError("the query has no name"))
 		return
 	}
 
@@ -249,7 +248,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 	if !ok || len(responseBytes) < 2 {
 		// a resolver that did not answer is silence here too; the client
 		// retries or moves to another resolver
-		self.server.reportError("dns query", fmt.Errorf("%s %s did not resolve", question.Type, name))
+		self.server.reportError("dns query", extenderFixedError("the query did not resolve"))
 		return
 	}
 
@@ -307,8 +306,7 @@ func (self *extenderDnsForwarder) answerStatus(
 // and writes to concurrently.
 func (self *extenderDnsForwarder) writeAnswer(query *extenderDnsQuery, answerBytes []byte) {
 	if _, err := self.packetConn.WriteTo(answerBytes, query.addr); err != nil {
-		// the far end of a failed write is the client's address, which reaches no handler
-		self.server.reportError("dns answer", connect.SocketErrorWithoutAddress(err))
+		self.server.reportError("dns answer", err)
 	}
 }
 

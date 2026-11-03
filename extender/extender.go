@@ -448,7 +448,9 @@ type ExtenderSettings struct {
 	// ErrorHandler, when set, receives connection-stage failures. Measurement
 	// tests use it to make an otherwise client-visible timeout attributable.
 	// It runs synchronously and must not block. Nil retains the silent
-	// production behavior.
+	// production behavior. No client's address reaches it: only the dial of a
+	// destination or a hop reports its whole error, and every other stage reports
+	// which class of failure it was (extender_error.go).
 	ErrorHandler func(stage string, err error)
 	// ListenErrorHandler, when set, receives the bind failure of one carrier
 	// (G2). Each carrier is bound independently: a failure disables that
@@ -1350,7 +1352,7 @@ func (self *ExtenderServer) serveQuicCarrier(
 	// handshake (A12)
 	quicConfig.GetConfigForClient = func(info *quic.ClientInfo) (*quic.Config, error) {
 		if self.closedAtAccept(info.RemoteAddr) {
-			return nil, fmt.Errorf("%s is past its admission refusals", connectionSource(info.RemoteAddr))
+			return nil, extenderFixedError("the source is past its admission refusals")
 		}
 		return quicConfig, nil
 	}
@@ -1828,24 +1830,6 @@ func (self *ExtenderServer) RealityPublicKey() []byte {
 	return self.camouflage.StaticPublicKey()
 }
 
-// Connection errors are observable only when a caller installs the test seam.
-// The ErrorHandler stages of a forward dial that failed (A7): the stream
-// forward's and the datagram relay's. Each is the dial to the destination a
-// client asked for, which the whitelist confines to the operator's hosts
-// (A5), so its error names an operator host and never a client. An embedder
-// that logs forward dial failures matches on these; the other stage names
-// are diagnostics that may change.
-const (
-	ExtenderErrorStageForwardDial         = "forward dial"
-	ExtenderErrorStageDatagramForwardDial = "datagram forward dial"
-)
-
-func (self *ExtenderServer) reportError(stage string, err error) {
-	if self.settings.ErrorHandler != nil {
-		self.settings.ErrorHandler(stage, err)
-	}
-}
-
 // HandleExtenderConnection terminates the outer tls of one tcp connection and
 // serves whatever is inside: the v1 framing, or an http request that carries
 // the extender header. The connection is closed when this returns.
@@ -2044,18 +2028,18 @@ func (self *ExtenderServer) handleV1Connection(
 
 	header := &protocol.ExtenderHeader{}
 	if err := proto.Unmarshal(headerBytes, header); err != nil {
-		self.reportError("header decode", err)
+		self.reportError("header decode", extenderFixedError("the extender header does not parse"))
 		return
 	}
 
 	if !self.IsAllowedSecret(header) {
-		self.reportError("header authorization", fmt.Errorf("secret signature is not allowed"))
+		self.reportError("header authorization", extenderFixedError("secret signature is not allowed"))
 		return
 	}
 	// a v1 header is an action like any other (A12), refused by the close
 	// since v1 has no status to answer with
 	if limit, _ := self.admitAction(remoteAddressString(clientConn.RemoteAddr()), 0 < len(self.allowedSecrets)); limit != extenderAdmitted {
-		self.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		self.reportError(extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
 		return
 	}
 	// v1 has no refusal but the close, and a v1 header is always a forward
@@ -2064,7 +2048,7 @@ func (self *ExtenderServer) handleV1Connection(
 		return
 	}
 	if !self.IsAllowedHost(header.DestinationHost) {
-		self.reportError("destination authorization", fmt.Errorf("host %q is not allowed", header.DestinationHost))
+		self.reportError("destination authorization", extenderFixedError("the destination host is not allowed"))
 		return
 	}
 	if self.settings.HeaderHandler != nil {

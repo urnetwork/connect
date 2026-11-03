@@ -465,8 +465,11 @@ func TestProviderReliableOrphanPayloadResetShutdownDoesNotWaitForAck(t *testing.
 }
 
 // A failed zero-timeout Transfer admission is final for this regenerable
-// response. A separate later orphan owns a fresh target and can succeed; the
-// first target must never be retried or reused after reporting refusal.
+// response. The reset is not retried, but its input is settled: failing the
+// receipt would cancel the whole inbound sequence and discard every item it
+// already acknowledged, for a reset the peer's next retry regenerates. A
+// separate later orphan owns a fresh target and can succeed; the first target
+// must never be retried or reused after reporting refusal.
 func TestProviderReliableOrphanPayloadResetFailedAdmissionThenFreshSuccess(t *testing.T) {
 	for _, version := range []int{4, 6} {
 		for _, protocolVersion := range []int{1, 2} {
@@ -508,11 +511,11 @@ func TestProviderReliableOrphanPayloadResetFailedAdmissionThenFreshSuccess(t *te
 						completeCount != 1 || completeSent || retries.Load() != 0 {
 						t.Fatalf("reset admission counts queued=%d/%t attempt=%d/%t complete=%d/%t retries=%d", queuedCount, wasQueued, attemptCount, attemptSent, completeCount, completeSent, retries.Load())
 					}
-					if present, _ := reliableIngressCumulativeHead(sequence); present || sequence.ctx.Err() == nil {
-						t.Fatal("failed reset admission did not preserve negative receipt outcome")
+					if present, head := reliableIngressCumulativeHead(sequence); !present || head.messageId != firstID {
+						t.Fatal("refused reset admission did not settle its regenerable input")
 					}
-					if ack := sequence.ackWindow.Snapshot(false); ack.selectiveAcks[firstID].messageId == firstID {
-						t.Fatal("failed reset admission falsely selectively acknowledged input")
+					if sequence.ctx.Err() != nil {
+						t.Fatal("refused reset admission canceled the inbound sequence")
 					}
 					f.client.sendBuffer.mutex.Lock()
 					delete(f.client.sendBuffer.sendSequences, id)

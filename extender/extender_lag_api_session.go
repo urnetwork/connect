@@ -546,7 +546,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 	// an admission is one action of its subnet (M3, EXTENDER.md A12),
 	// counted before the ticket is so much as read
 	if limit, _ := self.server.admitAction(r.RemoteAddr, false); limit != extenderAdmitted {
-		self.server.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		self.server.reportError(extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
 		self.refuseSession(conn, lagApiErrorSessions)
 		return
 	}

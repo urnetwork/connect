@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"math"
 	"net"
@@ -247,7 +246,7 @@ func (self *extenderProxy) serve(w http.ResponseWriter, req *http.Request) {
 			req,
 			http.StatusForbidden,
 			"proxy name",
-			fmt.Errorf("server name %q is not on the whitelist", serverName),
+			extenderFixedError("the server name is not on the whitelist"),
 		)
 		return
 	}
@@ -260,7 +259,7 @@ func (self *extenderProxy) serve(w http.ResponseWriter, req *http.Request) {
 			req,
 			http.StatusServiceUnavailable,
 			"proxy limit",
-			fmt.Errorf("%s is over the proxied connection bound", source),
+			extenderFixedError("the source is over the proxied connection bound"),
 		)
 		return
 	}
@@ -315,7 +314,7 @@ func (self *extenderProxy) readRequestBody(req *http.Request) (io.Reader, error)
 		return nil, nil
 	}
 	if 0 < maxByteCount && maxByteCount < req.ContentLength {
-		return nil, fmt.Errorf("request body is %d bytes, at most %d", req.ContentLength, maxByteCount)
+		return nil, extenderFixedError("the request body is over its byte limit")
 	}
 	var reader io.Reader = req.Body
 	if 0 < maxByteCount {
@@ -331,7 +330,7 @@ func (self *extenderProxy) readRequestBody(req *http.Request) (io.Reader, error)
 		return nil, err
 	}
 	if 0 < maxByteCount && maxByteCount < int64(len(bodyBytes)) {
-		return nil, fmt.Errorf("request body is over %d bytes", maxByteCount)
+		return nil, extenderFixedError("the request body is over its byte limit")
 	}
 	return bytes.NewReader(bodyBytes), nil
 }
@@ -404,7 +403,7 @@ func (self *extenderProxy) relayResponse(
 				return
 			case <-progress:
 			case <-time.After(settings.ProxyIdleTimeout):
-				self.server.reportError("proxy relay", fmt.Errorf("the upstream site stopped sending"))
+				self.server.reportError("proxy relay", extenderFixedError("the upstream site stopped sending"))
 				upstreamCancel()
 				return
 			}
@@ -441,10 +440,7 @@ func (self *extenderProxy) copyBody(
 				}
 			}
 			if relayByteCount < n {
-				self.server.reportError("proxy relay", fmt.Errorf(
-					"the relayed response reached %d bytes",
-					maxByteCount,
-				))
+				self.server.reportError("proxy relay", extenderFixedError("the relayed response reached its byte limit"))
 				return
 			}
 			if progress != nil {

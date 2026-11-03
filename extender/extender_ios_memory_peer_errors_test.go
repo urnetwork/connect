@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -92,14 +93,18 @@ func extenderIosMemoryExpectedPeerClosure(err error) bool {
 	if cause := errors.Unwrap(err); cause != nil {
 		return extenderIosMemoryExpectedPeerClosure(cause)
 	}
+	// a socket closed with bytes it has not read resets its peer, which is how the
+	// extender's relay can end its forward connection during a teardown
 	return errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, io.EOF) || errors.Is(err, http.ErrServerClosed) || errors.Is(err, quic.ErrServerClosed)
+		errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, http.ErrServerClosed) || errors.Is(err, quic.ErrServerClosed)
 }
 
 // These closures are ignored only after an explicit shutdown announcement.
 func extenderIosMemoryExpectedPeerErrors() []error {
 	return []error{
 		context.Canceled, net.ErrClosed, io.EOF, http.ErrServerClosed, quic.ErrServerClosed,
+		syscall.ECONNRESET,
 		&quic.ApplicationError{ErrorCode: 0},
 		errors.Join(io.EOF, net.ErrClosed),
 		&websocket.CloseError{Code: websocket.CloseNormalClosure},

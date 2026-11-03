@@ -16,7 +16,7 @@ var errReliableIngressResetPending = errors.New("reliable TCP ingress awaits ter
 // provider/lifecycle/receipt. The queue owner observes it from a cancelable
 // Waiting operation, so provider shutdown never needs a live peer's ACK.
 type providerTerminalResetAckTarget struct {
-	result   atomic.Uint32 // 0 pending, 1 ACKed, 2 refused/failed
+	result   atomic.Uint32 // 0 pending, 1 ACKed, 2 refused/failed, 3 refused by return admission
 	wake     chan struct{}
 	observer sendAckTarget
 }
@@ -33,6 +33,20 @@ func (target *providerTerminalResetAckTarget) complete(acked bool) {
 	if acked {
 		result = 1
 	}
+	target.finish(result)
+}
+
+// The return path had no room for the reset. It stays a regenerable
+// response: the peer's next segment on the dead flow elicits another one, so
+// the input is settled rather than failed. A failed receipt cancels the whole
+// inbound sequence and discards every item it has already acknowledged, and
+// a return path is full exactly when the peer is downloading, so a refused
+// reset would otherwise repeat that cancellation for every retry of the input.
+func (target *providerTerminalResetAckTarget) refuse() {
+	target.finish(3)
+}
+
+func (target *providerTerminalResetAckTarget) finish(result uint32) {
 	if target.result.CompareAndSwap(0, result) {
 		select {
 		case target.wake <- struct{}{}:
@@ -45,7 +59,7 @@ func (target *providerTerminalResetAckTarget) attempt() receiveDeliveryAttempt {
 	switch target.result.Load() {
 	case 0:
 		return receiveDeliveryWaiting
-	case 1:
+	case 1, 3:
 		return receiveDeliverySecured
 	default:
 		return receiveDeliveryRejected

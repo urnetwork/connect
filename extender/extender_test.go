@@ -168,11 +168,13 @@ func TestSelfSignedCertificateValiditySpansPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := time.Now()
-	if delta := certificate.Leaf.NotBefore.Sub(before.Add(-2 * time.Hour)); delta < -time.Second || time.Second < delta {
-		t.Fatalf("NotBefore = %s, expected about two hours before creation", certificate.Leaf.NotBefore)
+	// each must fall between the two reads of the clock, however long the call took;
+	// a certificate's times are whole seconds rounded down, so up to a second early
+	if notBefore := certificate.Leaf.NotBefore; notBefore.Before(before.Add(-2*time.Hour-time.Second)) || after.Add(-2*time.Hour).Before(notBefore) {
+		t.Fatalf("NotBefore = %s, expected two hours before creation", notBefore)
 	}
-	if delta := certificate.Leaf.NotAfter.Sub(after.Add(3 * time.Hour)); delta < -time.Second || time.Second < delta {
-		t.Fatalf("NotAfter = %s, expected about three hours after creation", certificate.Leaf.NotAfter)
+	if notAfter := certificate.Leaf.NotAfter; notAfter.Before(before.Add(3*time.Hour-time.Second)) || after.Add(3*time.Hour).Before(notAfter) {
+		t.Fatalf("NotAfter = %s, expected three hours after creation", notAfter)
 	}
 	if before.Before(certificate.Leaf.NotBefore) || certificate.Leaf.NotAfter.Before(after) {
 		t.Fatalf(

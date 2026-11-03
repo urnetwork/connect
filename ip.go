@@ -8705,6 +8705,14 @@ func (self *RemoteUserNatProvider) takeReturnItem() *providerReturnItem {
 	}
 }
 
+// Whether the return path can still admit work, so a refusal is congestion
+// rather than shutdown.
+func (self *RemoteUserNatProvider) returnPathOpen() bool {
+	self.returnStateLock.RLock()
+	defer self.returnStateLock.RUnlock()
+	return !self.returnClosed && self.ctx.Err() == nil
+}
+
 // releaseReturnItem returns remaining packet shares and then recycles the
 // bounded envelope without blocking its callback or datagram worker.
 func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
@@ -8738,7 +8746,13 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	}
 	self.releaseSourceLifecycle(sourceId, sourceLifecycle)
 	if terminalReset != nil {
-		terminalReset.complete(false)
+		// Released before Transfer took the ACK target: no reset was sent.
+		// A full return path refuses the reset; a closed one fails it.
+		if self.returnPathOpen() {
+			terminalReset.refuse()
+		} else {
+			terminalReset.complete(false)
+		}
 	}
 	if afterRelease != nil {
 		HandleError(afterRelease)

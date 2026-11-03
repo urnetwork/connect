@@ -63,3 +63,20 @@ func TestAckLifetimeWithoutHeadProgressKeepsItemDeadline(t *testing.T) {
 		t.Fatalf("deadline = %v, want zero", deadline)
 	}
 }
+
+// A message that has outlived its send-time lifetime on head progress must
+// still back off. A resend clamped to the old deadline is always already due,
+// which writes the same message in a tight loop.
+func TestAckLifetimeResendDeadlineFollowsProgress(t *testing.T) {
+	origin := time.Unix(1700000000, 0)
+	sequence := &SendSequence{}
+	sequence.lastHeadAckTime = origin.Add(40 * time.Second)
+	item := &sendItem{sendTime: origin, ackTimeout: 30 * time.Second}
+	if deadline, want := sequence.ackLifetimeDeadline(item), origin.Add(70*time.Second); !deadline.Equal(want) {
+		t.Fatalf("deadline = %v, want %v", deadline, want)
+	}
+	sequence.lastHeadAckTime = origin.Add(-time.Second)
+	if deadline, want := sequence.ackLifetimeDeadline(item), origin.Add(30*time.Second); !deadline.Equal(want) {
+		t.Fatalf("deadline without progress = %v, want %v", deadline, want)
+	}
+}
