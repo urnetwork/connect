@@ -1345,7 +1345,9 @@ operator might read names the client or repeats what the client sent: a broken h
 greeting, a frame that cannot be read, a panic. The one that matters is the panic, so
 the handler catches its own and logs that it happened and where in the code, from the
 binary and with nothing of the value or the request, and `ErrorHandler` hears it as the
-stage `handler panic`.
+stage `handler panic`. The gossip listener and the feed server, which the role installs on
+the gossip and feed services, log neither a connection's address nor the text of its
+socket's error.
 
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
