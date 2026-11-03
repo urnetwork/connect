@@ -20552,6 +20552,17 @@ components:
             this family, rounded up. Wait that long rather than backing off.
             Absent on every other answer.
           type: integer
+        refusal:
+          description: |
+            On a refusal an extender acts on, which one (EXTENDER.md C2c).
+            `key_other_network`: the key is registered to another network,
+            which no wait or post of this network changes; the extender needs a
+            key of its network's own, which an updated app makes on its own.
+            Absent on every other answer, and from an operator that predates
+            it, whose `error` begins "This extender key is registered to
+            another network".
+          type: string
+          enum: [key_other_network]
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator

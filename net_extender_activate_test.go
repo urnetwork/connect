@@ -90,6 +90,9 @@ type testActivateOperator struct {
 	familyRefusals map[int]string
 	// the `retry_after_seconds` a refusal carries, 0 for none (connect#230)
 	retryAfterSeconds int
+	// the `refusal` a refusal carries (C2c), "" for none, as an operator that
+	// predates the field sends
+	refusalCode string
 	// the address an activation of a family is answered with, by family; the
 	// family's fixed address while unset
 	publishedIps map[int]string
@@ -169,6 +172,7 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 			refusal = familyRefusal
 		}
 		retryAfterSeconds := self.retryAfterSeconds
+		refusalCode := self.refusalCode
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
 		self.stateLock.Unlock()
@@ -193,6 +197,7 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 				Activated:         false,
 				Error:             refusal,
 				RetryAfterSeconds: retryAfterSeconds,
+				Refusal:           refusalCode,
 			})
 			return
 		}
@@ -355,6 +360,13 @@ func (self *testActivateOperator) setRetryAfterSeconds(retryAfterSeconds int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.retryAfterSeconds = retryAfterSeconds
+}
+
+// The `refusal` every refusal carries from now on (C2c), "" for none.
+func (self *testActivateOperator) setRefusalCode(refusalCode string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.refusalCode = refusalCode
 }
 
 // Answers the activations of one family with `ip`, as the operator publishes
