@@ -290,8 +290,15 @@ func (self *clientNetworkQualityState) applyPending() {
 func (self *clientNetworkQualityState) queuePeerNotifications(generation uint64) {
 	peerByDestinationId := self.client.sendBuffer.networkQualityPeers()
 	self.stateLock.Lock()
+	// An observed peer's reply lane is for a peer this client has no live lane to.
+	// A live send sequence is what this client already has permission for: a
+	// window client hears its exit on the exit's return lane, and replying there
+	// asks for a companion contract the exit may refuse (see
+	// CompanionRefusalHoldMin) while the forward lane is right there.
 	for destinationId, peer := range self.observedPeers {
-		peerByDestinationId[destinationId] = peer
+		if _, found := peerByDestinationId[destinationId]; !found {
+			peerByDestinationId[destinationId] = peer
+		}
 	}
 	for destinationId, peer := range peerByDestinationId {
 		if _, found := self.pendingPeerNotifications[destinationId]; !found &&
@@ -373,8 +380,14 @@ func (self *SendBuffer) networkQualityPeers() map[Id]networkQualityPeer {
 				id.Destination == self.client.clientId {
 				continue
 			}
-			if _, found := peers[id.Destination]; found && id.LogicalLane != 0 {
-				continue
+			// One hint per destination: a forward lane over a companion lane, then
+			// lane zero, whatever order the map yields them in.
+			if existing, found := peers[id.Destination]; found {
+				forwardOverCompanion := existing.transferOptions.CompanionContract && !sequence.companionContract
+				sameContractPolicy := existing.transferOptions.CompanionContract == sequence.companionContract
+				if !forwardOverCompanion && !(sameContractPolicy && id.LogicalLane == 0) {
+					continue
+				}
 			}
 			transferOptions := self.client.settings.DefaultTransferOpts
 			transferOptions.Ack = true
