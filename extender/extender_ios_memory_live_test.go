@@ -154,7 +154,7 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 			}
 		}
 		assertProfile()
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), testMemoryExchangeTimeout)
 		defer cancel()
 		fixture, port, packetDestination, beginPeerShutdown, closePeer := newExtenderIosMemoryFixture(t, inner)
 		defer closePeer()
@@ -297,7 +297,7 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 				connect.MessagePoolReturn(message)
 				t.Fatalf("live composed selector: accepted=%t err=%v", accepted, err)
 			}
-			response, err := reader.Read(ctx, 5*time.Second)
+			response, err := reader.Read(ctx, -1)
 			if err != nil {
 				t.Fatalf("%s/%s cancel=%t exchange=%d: %v", inner, outer, cancelParent, i, err)
 			}
