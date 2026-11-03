@@ -9552,6 +9552,9 @@ sendSequenceLoop:
 				self.ackLifetimes.update(item)
 				retainPastAckTimeout := item.acks.retainPastAckTimeout()
 				itemAckTimeout := item.sendTime.Add(item.ackTimeout).Sub(sendTime)
+				if progressTimeout := self.ackProgressDeadline(item).Sub(sendTime); itemAckTimeout < progressTimeout {
+					itemAckTimeout = progressTimeout
+				}
 				if self.sendBuffer != nil && self.sendBuffer.forceAckTimeoutForTest != nil &&
 					self.sendBuffer.forceAckTimeoutForTest(self.id()) {
 					itemAckTimeout = 0
