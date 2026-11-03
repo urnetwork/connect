@@ -7772,9 +7772,10 @@ paths:
       description: |
         Queues a balance of one of the caller's network's coldkeys for the relay's
         next pass, ahead of the balances over the automatic threshold, under the
-        same daily cap. At most once per coldkey per 30 days, and only once the
-        balance clears the transfer floor. If nothing can be sent for it after
-        all, the tap is given back.
+        same daily cap, once the balance clears the transfer floor. A coldkey can
+        do this once per 30 days, counted from when URnetwork pays a tapped claim
+        it would not have sent by itself, so a tap that sends nothing, or only
+        moves an automatic claim ahead, uses nothing up.
 
         `requested` false with a `reason` is the answer for a balance that cannot
         be claimed for now: the same values as an account's `claim_now_reason`. A
@@ -21422,7 +21423,7 @@ components:
         next_at_millis:
           type: integer
           format: int64
-          description: When this coldkey's Claim now limit ends, unix milliseconds.
+          description: When this coldkey's Claim now limit ends, unix milliseconds, for a tap the limit refused.
         error:
           $ref: "#/components/schemas/SnClaimRelayError"
     SnLedgerAccountResult:
