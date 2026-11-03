@@ -28,6 +28,9 @@ const (
 	contractRetryRateLimit
 	// a valid contract
 	contractRetryGrant
+	// a completed round trip that answers no permission, as a companion request
+	// to a destination that registered no stream provide key is
+	contractRetryNoPermission
 )
 
 // One contract request as the control service saw it.
@@ -108,6 +111,14 @@ func (self *contractRetryOob) SendControl(frames []*protocol.Frame, callback Oob
 				resultFrames = append(resultFrames, resultFrame)
 			}
 			MessagePoolReturn(storedContractBytes)
+		case contractRetryNoPermission:
+			contractError := protocol.ContractError_NoPermission
+			result := &protocol.CreateContractResult{
+				Error: &contractError,
+			}
+			if resultFrame, err := ToFrame(result, DefaultProtocolVersion); err == nil {
+				resultFrames = append(resultFrames, resultFrame)
+			}
 		default:
 			contractError := protocol.ContractError_Setup
 			result := &protocol.CreateContractResult{

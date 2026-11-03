@@ -378,6 +378,14 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		CreateContractRateLimitBackoffMax: 10 * time.Second,
 		CreateContractRateLimitJitter:     0.5,
 
+		// the first answers cover a registration still committing; after them a
+		// refused destination is asked about 12 times an hour, where each passive
+		// p2p generation alone asked 8 times every 15 to 20 s
+		CompanionRefusalHoldAfter:       5,
+		CompanionRefusalHoldMin:         30 * time.Second,
+		CompanionRefusalHoldMax:         5 * time.Minute,
+		CompanionRefusalMaxDestinations: 1024,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -488,6 +496,35 @@ type ContractManagerSettings struct {
 	// [0, n).
 	createContractRateLimitRandomForTest func(n int64) int64
 
+	// A companion contract answered no permission is one whose destination
+	// registered no stream provide key, and it stays so for as long as the pair
+	// lives: a provider built before the 2026-07 consolidation registers only its
+	// public and network modes. A client's own traffic does not ride that lane to
+	// an exit, but passive p2p signals, network quality hints and subprotocol
+	// replies open it, and each new sequence asked about 8 times in its budget.
+	//
+	// After CompanionRefusalHoldAfter such answers in a row for a destination,
+	// the client sends no companion contract request to that destination for a
+	// hold of d, drawn with CreateContractRateLimitJitter, where d starts at
+	// CompanionRefusalHoldMin and doubles per further answer up to
+	// CompanionRefusalHoldMax. The first answers stay free: a same-network peer
+	// can answer no permission while its provide registration commits, and five
+	// cover the first 12 s of a sequence's retries. An answer arriving during a
+	// hold was sent before it and steps nothing. A contract for the destination's
+	// companion lane ends the streak, and so does a quiet spell longer than
+	// CompanionRefusalHoldMax after a hold ended. Sequences wait out their
+	// budget as before; only the requests stop. A non-positive
+	// CompanionRefusalHoldMin disables the hold.
+	CompanionRefusalHoldAfter int
+	CompanionRefusalHoldMin   time.Duration
+	CompanionRefusalHoldMax   time.Duration
+	// How many refused destinations a client remembers. At the bound the one
+	// whose hold ended first is dropped, which at worst costs it the free answers
+	// again. A provider client can be asked to reach many destinations.
+	CompanionRefusalMaxDestinations int
+	// Test hook for the hold's jitter draw. Nil uses math/rand.
+	companionRefusalRandomForTest func(n int64) int64
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -498,6 +535,16 @@ type ContractManagerSettings struct {
 
 func (self *ContractManagerSettings) ContractsEnabled() bool {
 	return self.NetworkEventTimeEnableContracts.Before(time.Now())
+}
+
+// One destination's no-permission streak on its companion lane.
+type companionRefusal struct {
+	// consecutive answers outside a hold
+	refusalCount int
+	// holds begun in this streak
+	holdCount int
+	// the end of the running or last hold, zero before any
+	holdEnd time.Time
 }
 
 type ContractManager struct {
@@ -547,6 +594,10 @@ type ContractManager struct {
 	// sequence and a window make on every write and race
 	// (createContractRateLimitHeld).
 	createContractRateLimitHoldUntil atomic.Pointer[time.Time]
+
+	// Protected by mutex. The no-permission streak of each destination refused
+	// on its companion lane. See CompanionRefusalHoldMin.
+	companionRefusals map[Id]*companionRefusal
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -1134,6 +1185,16 @@ func (self *ContractManager) handleControlFrameForQueue(
 	switch frame.MessageType {
 	case protocol.MessageType_TransferCreateContractResult:
 		contracts, contractErrors := self.parseControlFrame(frame)
+		if contractKey.CompanionContract {
+			if 0 < len(contracts) {
+				self.clearCompanionContractRefused(contractKey.Destination.DestinationId)
+			}
+			for _, contractError := range contractErrors {
+				if contractError == protocol.ContractError_NoPermission {
+					self.noteCompanionContractRefused(contractKey.Destination.DestinationId, time.Now())
+				}
+			}
+		}
 		for _, contract := range contracts {
 			c := func() error {
 				var contractStatus *ContractStatus
@@ -1803,8 +1864,9 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 
 // CreateContract, reporting whether a request for the contract is in flight
 // afterwards: this one, or an identical pending one it joined. False when
-// nothing was sent: the manager is closed, a rate-limit hold is running, the
-// queue generation is drained, or the frame could not be built. A caller
+// nothing was sent: the manager is closed, a rate-limit hold or a companion
+// refusal hold is running, the queue generation is drained, or the frame could
+// not be built. A caller
 // that marks the contract requested must not do so on false, or a request a
 // hold dropped is never made.
 func (self *ContractManager) createContract(contractKey ContractKey, contractSeqIndex uint64, minByteCount ByteCount) bool {
@@ -1823,6 +1885,9 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 			return false
 		}
 		now := time.Now()
+		if contractKey.CompanionContract && self.companionContractHeldWithLock(contractKey.Destination.DestinationId, now) {
+			return false
+		}
 		if self.createContractRateLimitHeld(now) {
 			if !self.createContractRateLimitDroppedKeys[contractKey] {
 				if self.createContractRateLimitDroppedKeys == nil {
@@ -1943,6 +2008,85 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 		},
 	)
 	return true
+}
+
+// Records a no-permission answer to a companion contract request for
+// `destinationId` at `now`. Returns the hold it started, 0 when it started none.
+// See CompanionRefusalHoldMin.
+func (self *ContractManager) noteCompanionContractRefused(destinationId Id, now time.Time) time.Duration {
+	if self.settings.CompanionRefusalHoldMin <= 0 {
+		return 0
+	}
+	hold, started := func() (time.Duration, bool) {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		refusal, found := self.companionRefusals[destinationId]
+		if found {
+			if now.Before(refusal.holdEnd) {
+				return 0, false
+			}
+			streakTimeout := max(self.settings.CompanionRefusalHoldMin, self.settings.CompanionRefusalHoldMax)
+			if !refusal.holdEnd.IsZero() && streakTimeout < now.Sub(refusal.holdEnd) {
+				*refusal = companionRefusal{}
+			}
+		} else {
+			if self.companionRefusals == nil {
+				self.companionRefusals = map[Id]*companionRefusal{}
+			}
+			if limit := self.settings.CompanionRefusalMaxDestinations; 0 < limit && limit <= len(self.companionRefusals) {
+				var oldestId Id
+				var oldest *companionRefusal
+				for candidateId, candidate := range self.companionRefusals {
+					if oldest == nil || candidate.holdEnd.Before(oldest.holdEnd) {
+						oldestId, oldest = candidateId, candidate
+					}
+				}
+				delete(self.companionRefusals, oldestId)
+			}
+			refusal = &companionRefusal{}
+			self.companionRefusals[destinationId] = refusal
+		}
+		refusal.refusalCount += 1
+		if refusal.refusalCount < self.settings.CompanionRefusalHoldAfter {
+			return 0, false
+		}
+		refusal.holdCount += 1
+		hold := jitterContractRetryWait(
+			createContractRateLimitBackoff(
+				refusal.holdCount,
+				self.settings.CompanionRefusalHoldMin,
+				self.settings.CompanionRefusalHoldMax,
+			),
+			self.settings.CreateContractRateLimitJitter,
+			self.settings.companionRefusalRandomForTest,
+		)
+		refusal.holdEnd = now.Add(hold)
+		return hold, true
+	}()
+	if started {
+		// explains the send sequence exits around it, at most once per hold
+		self.client.log.Infof("[contract]companion refused no permission %s, hold %s\n", destinationId, hold)
+	}
+	return hold
+}
+
+// A contract for the destination's companion lane ends its streak.
+func (self *ContractManager) clearCompanionContractRefused(destinationId Id) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	delete(self.companionRefusals, destinationId)
+}
+
+// Whether a companion refusal hold for `destinationId` is running at `now`.
+func (self *ContractManager) companionContractHeld(destinationId Id, now time.Time) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.companionContractHeldWithLock(destinationId, now)
+}
+
+func (self *ContractManager) companionContractHeldWithLock(destinationId Id, now time.Time) bool {
+	refusal, found := self.companionRefusals[destinationId]
+	return found && now.Before(refusal.holdEnd)
 }
 
 // Records a contract request for `contractKey`, made through `contractQueue`
