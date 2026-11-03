@@ -750,10 +750,15 @@ may activate a key, on either family:
   keeps its extender, with its id and its history.
 - A key another network holds: no client. The activation is refused.
 
-The refusal is the ordinary answer of C2, a 200 with `activated: false`, and
-its `error` is fixed: "This extender key is registered to another network, so
-it cannot be activated for this one. Generate a new extender key, or ask
-support to move the key to this network." It names no network, and it has no
+The refusal is the ordinary answer of C2, a 200 with `activated: false` and
+`refusal: "key_other_network"`, and its `error` is fixed: "This extender key is
+registered to another network, so it cannot be activated for this one. An
+updated app makes a new extender key for this network on its own; otherwise
+remove the extender key file and restart to make a new one." Its first sentence
+is what an extender reads the refusal by from an operator that predates
+`refusal` (2026-11-02 to 11-03, whose second sentence read "Generate a new
+extender key, or ask support to move the key to this network."), so it stays as
+it is. It names no network, and it has no
 `retry_after_seconds`, since waiting does not change the answer. The handler
 reads the key's network once the configuration has passed and before the probe
 guard, so the refusal dials nothing, spends no budget and has no
@@ -767,11 +772,13 @@ activation history and the publish queue as they were, and the uptime task goes
 on probing those addresses (C3). The refusal is counted under stage `owner`
 (C2b).
 
-An extender treats it as any refusal with no wait: the family is held on its
-schedule and posted again (G3), and the status reads `error`, case
-`activation_refused`, with the refusal as its reason, unless the directory shows
-the key revoked, which N3 tests first. Only the extender role is refused. The
-device's VPN and its providing go on.
+An extender reads it by `refusal`, or by the first sentence of `error` from an
+operator that predates `refusal` (`connect.ExtenderActivateResult.
+KeyHeldByAnotherNetwork`). The family is held until its tick rather than on the
+backoff, since no wait changes the answer, and a trigger still posts it at once
+(G3). The status reads `error`, case `activation_refused`, with the refusal as
+its reason, unless the directory shows the key revoked, which N3 tests first.
+Only the extender role is refused. The device's VPN and its providing go on.
 
 The key stays on the host when the account changes (B1, E7). So a device
 signed in to another account, one signed in to a new account after the old one
@@ -787,11 +794,33 @@ with no history, under the same rule. The old key's row stays with its network,
 and the uptime probes deactivate its addresses once the host answers for the
 new key (C3).
 
-- Desktop apps have no action for this. Stop the app and whatever runs its
-  device (the linux daemon, the windows service), remove `.extender_key` from
-  that process's local state, and start it again: the sdk creates a key when
-  the file is absent (B1). Mobile apps have no extender role (G1).
-- The sn miner: stop it, remove `.provider.extender.key` from its state
+- The provider role of the sdk (G2) makes the new key itself, for a space with
+  local state, which is every app's (2026-11-03, the owner's "fix these" on the
+  automatic fresh key). On the refusal the role asks the provider for a key of
+  the network's own, at most once a role. The space makes a key, keeps it in
+  `.extender_network_keys` under the id of the network the client jwt names,
+  and the provider starts the role again on it, as a new process starts, with
+  every family due. While the role runs for that network the space presents
+  that key, to the node as well (B1), and the measurement name is the new
+  extender id's (C4), so it is the network's identity from then on. `.extender_key` is left as it was, and a
+  network with no key of its own runs under it, so a device that goes back to
+  the account that holds `.extender_key` presents it again, with its history.
+  Both files are kept across a sign-out (E7). A space makes a network at most
+  one key a day: a key it made is refused as another network's only when
+  another network activated it first, which takes posting it through this
+  extender before the extender's own post lands, and the bound keeps that from
+  churning keys; the refusal stands in the status meanwhile. A refusal of a key
+  the space no longer presents for the network, one the role posted before it
+  was replaced, makes none.
+- An app that predates that does it by hand. Stop the app and whatever runs
+  its device (the linux daemon, the windows service), remove `.extender_key`
+  from that process's local state, and start it again: the sdk creates a key
+  when the file is absent (B1). With the automatic key, a network that has a
+  key of its own runs under it, so making it a new key by hand means removing
+  `.extender_network_keys` too. Mobile apps have no extender role (G1).
+- A space with no local state has nowhere to keep a second key and makes none:
+  its embedder keeps the identity and replacing it is the embedder's. The sn
+  miner: stop it, remove `.provider.extender.key` from its state
   directory (`~/.urnetwork` or `URNETWORK_STATE_DIR`; with `--all-operators`,
   that operator's directory under `operators/`), and start it again.
 - `connectctl extender`: point `--extender_key_file` at a new path, or remove
@@ -805,9 +834,10 @@ holding its file is no ground for one. The records then carry no camouflage key
 until the new network's own passing activation posts one (P6).
 
 What support tells someone refused: what the refusal means, and that it touches
-only the extender role; how to make a new key for what they run, which is the
-default answer, and that it starts with no history; and that a move is made only
-as above. Support does not say which network holds a key or whose it is, and
+only the extender role; that an updated app makes the new key on its own, and
+how to make one by hand for anything else they run, which is the default
+answer, and that it starts with no history; and that a move is made only as
+above. Support does not say which network holds a key or whose it is, and
 does not ask for a key file or its seed, which are the extender's identity. Only
 public keys and the status text belong in a message.
 
@@ -1362,7 +1392,10 @@ A refusal that carries `retry_after_seconds` (C2: a spent activation budget,
 or an operator too busy to probe; connect#230) holds its family exactly that
 long, at least 1 minute and at most 6 hours, whether or not the family is
 private, and leaves its hold as it was: the operator probed nothing. An
-operator that predates the field gets the hold.
+operator that predates the field gets the hold. A refusal of the key as
+another network's (C2c) holds its family until its tick and leaves its hold as
+it was, since no wait changes it, and is told to the role (`OnRefused`), which
+makes a key of the network's own when it can (2026-11-03).
 A family without a global address on the host (`FamilySupported`) is not
 posted and is looked at again every 10 minutes, without doubling, since the
 look is local; one that gains an address is posted within 10 minutes however
