@@ -2073,6 +2073,11 @@ type Client struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 
+	// Path round trip and delivery shared by every sequence to a destination
+	// (transfer_window_latency.go).
+	pathLatencyLock sync.Mutex
+	pathLatencies   map[Id]*pathLatencyState
+
 	clientId  Id
 	clientTag string
 	clientOob OutOfBandControl
@@ -5347,6 +5352,12 @@ type SendBufferSettings struct {
 	// recover the earliest missing Pack before its resend timeout. Zero disables
 	// gap recovery; each item can trigger it at most once.
 	SelectiveAckGapThreshold int
+	// WindowLatencyBudget bounds the admitted window to twice what the
+	// destination delivers within its path round trip plus this budget, so a
+	// window grown on a queue-inflated round trip cannot stand as queue
+	// (transfer_window_latency.go). Zero, the default, disables the bound;
+	// 50ms held a provider's downloads near 250ms of queue.
+	WindowLatencyBudget time.Duration
 	// Bounds distinct missing Packs released from one selective-ACK snapshot.
 	// Zero disables gap recovery even when the threshold is configured.
 	SelectiveAckGapBurstSize int
@@ -12328,19 +12339,19 @@ type SendWindowEstimate struct {
 // propagation; the mean raw RTT also contains that queue. Without a memory
 // budget the configured constant is retained within known byte limits.
 func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, true, false)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, true, false), now)
 }
 
 // Report current evidence without allowing a statistics consumer to change
 // which service rate a later physical drain probe will preserve.
 func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, false, false)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, false, false), now)
 }
 
 // A generation-bound H1-only write uses physical pacing evidence even when
 // the aggregate route set must retain mixed-carrier window and group bounds.
 func (self *SendSequence) sendWindowPacingEstimate(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, true, true)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, true, true), now)
 }
 
 // Admission and statistics share one window rule. Only admission retains
@@ -12573,6 +12584,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 	// first ACK. Read that evidence before the local cold-window decision.
 	adjustedRoundTrip, receiverResidence, receiverSampled := self.receiverWindowTiming(now)
 	roundTrip := self.rttWindow.estimate(now)
+	pathRoundTrip := self.observePathRoundTrip(roundTrip.Min, now)
 	if !roundTrip.Sampled() && !receiverSampled {
 		estimate.Reason = "no round trip samples"
 		return estimate
@@ -12595,6 +12607,15 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 		// A measured receiver queue/application wait still occupies flight.
 		// Pinned per-sample compression reserves only residence not observed.
 		estimate.WindowRoundTrip = receiverResidence
+	}
+	// A queue-inflated round trip would size the window from its own queue.
+	if 0 < pathRoundTrip {
+		if pathRoundTrip < estimate.RoundTrip {
+			estimate.RoundTrip = pathRoundTrip
+		}
+		if limit := pathRoundTrip + estimate.AckCompressTimeout + self.sendBufferSettings.WindowLatencyBudget; limit < estimate.WindowRoundTrip {
+			estimate.WindowRoundTrip = limit
+		}
 	}
 	estimate.SampleCount = self.deliveredSampleCount()
 	serviceHorizon := max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleIntervalAt(now))
