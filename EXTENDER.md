@@ -1317,15 +1317,13 @@ encode or write is lost and nothing more, logged at most once a minute with the
 count since, so one client's address or a path that is down for a moment cannot
 end the socket every client of the carrier shares. Only a closed socket ends it, and
 that holds however long the writes fail: a socket whose every write fails stays up
-and reads as ready, with its line a minute. A sender can bring that about, since a
-source port of 0 fails every write to it and on a quiet port nothing else succeeds in
-between, so any bound on it is one a sender can reach. A bound of 5 minutes was
-tried and a review ended the server's real alt listeners with 160 datagrams, which
-ends the whole process with no drain, and a restart could not cure egress that
-refuses every write anyway. `Carriers` and `DnsPorts` say what is serving at each
-moment, and a probe's response, the status and the activation all read them. A first
-bind that fails is still the case above: that udp carrier stays down until the role
-restarts.
+and reads as ready, with its line a minute. No count or duration of failed writes
+ends it (decided on review, 2026-11-02): a restart could not cure egress that
+refuses every write, and `TestPacketTranslationServerOutlivesWritesThatAllFail`
+keeps such a bound from coming back. `Carriers` and `DnsPorts` say what is serving
+at each moment, and a probe's response, the status and the activation all read
+them. A first bind that fails is still the case above: that udp carrier stays down
+until the role restarts.
 
 The server itself ends only with `Close` or its context. The role reports its
 tcp carrier: `Listening` is true while it serves, and while it is lost
@@ -1352,15 +1350,15 @@ A role rebuilds rather than exiting the process: it is the spare capacity of a
 provider that is serving (G1), and a desktop app has no supervisor to restart it.
 connectctl, which exists only to run the extender, exits with an error instead (G4).
 
-Decided 2026-11-02 from the outage on network 01979e1c on 2026-11-01. Of about 190
-active extenders, 147 were revoked from 20:00Z. 131 of those went on posting, so their
-processes were up, while 46 of 47 sampled addresses did not answer on tcp 443, and the
-10 that refused it when udp 53 was sampled refused that too. One accept error, one udp
-carrier's exit or one failed write on the dns carrier used to close every carrier for
-the life of the process, nothing restarted the server, and the status went on saying
-listening while the activation went on posting. That is probably what happened: a real
-EMFILE reproduces the state, but no host's log confirms it, and which failure it was
-is not known.
+Decided 2026-11-02 from an outage of one operator's extenders on 2026-11-01. Of
+about 190 active extenders, 147 were revoked from 20:00Z. 131 of those went on
+posting, so their processes were up, while 46 of 47 sampled addresses did not answer
+on tcp 443, and the 10 that refused it when udp 53 was sampled refused that too.
+One accept error, one udp carrier's exit or one failed write on the dns carrier used
+to close every carrier for the life of the process, nothing restarted the server,
+and the status went on saying listening while the activation went on posting. That
+is probably what happened: a real EMFILE reproduces the state, but no host's log
+confirms it, and which failure it was is not known.
 
 `ErrorHandler` hears no client's address (`connect/extender/extender_error.go`). A stage
 reports its name and one class of failure: an errno, a timeout, a close, or a constant
