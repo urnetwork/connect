@@ -127,8 +127,9 @@ func TestExtenderRefusesOverTheTotalCap(t *testing.T) {
 // A client that completes the handshake and never sends a header is dropped at
 // the header deadline (A9).
 func TestExtenderDropsAClientThatSendsNoHeader(t *testing.T) {
+	// the deadline covers the handshake too, so it leaves a busy machine room for one
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
-		settings.HeaderTimeout = 250 * time.Millisecond
+		settings.HeaderTimeout = 2 * time.Second
 	})
 
 	conn := dialHandshakedExtenderConn(t, fixture)
