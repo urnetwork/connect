@@ -8262,8 +8262,11 @@ func (self *SendSequence) processLogicalGroupChunk(
 			// cursor and every raw owner remain queued for the budget turn.
 			return false, true, true
 		}
+		// Disposal ends this group only, as the taking serializer's refusal
+		// did. A canceled sequence still finishes this iteration, so its next
+		// drain cleanup-receives the groups queued behind this one.
 		sendPack.disposeUnsentGroup(prepareErr)
-		return true, errors.Is(prepareErr, errPreparedSendCanceled), false
+		return true, true, false
 	}
 	// Until the taking serializer begins, the Pack owns frames and records;
 	// this guard owns only the independent, unpublished memory reservation.
@@ -9979,11 +9982,14 @@ sendSequenceLoop:
 								}
 								return !packsClosed
 							}
+							// Disposal ends these Packs only, as the taking serializer's
+							// refusal did. A canceled sequence still finishes this
+							// iteration, so its next drain cleanup-receives what is queued.
 							for packIndex := range sendPackCount {
 								sendPacks[packIndex].disposeUnsentGroup(prepareErr)
 								processingPacks[packIndex] = nil
 							}
-							return errors.Is(prepareErr, errPreparedSendCanceled) && !packsClosed
+							return !packsClosed
 						}
 						ownPreparedItem := true
 						defer func() {

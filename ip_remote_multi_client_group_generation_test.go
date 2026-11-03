@@ -9,6 +9,8 @@ import (
 	"testing/synctest"
 	"time"
 	"unsafe"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // A SYN already in the channel can precede its producer's admission observer.
@@ -460,6 +462,98 @@ func TestTcpGroupRecoveryCanceledFlowIsolatingDrainKeepsLatestAck(t *testing.T) 
 // Reentrant cancellation must preserve the latest accepted ACK across both.
 func TestTcpGroupRecoveryCanceledColdFlowIsolatingStartupKeepsLatestAck(t *testing.T) {
 	testTcpGroupRecoveryCanceledDrain(t, true, true)
+}
+
+// A single packet is an ordinary reliable Pack on the same source as the
+// groups. Its prepared reservation refused by cancellation disposes only that
+// Pack: the worker finishes its iteration as after a canceled group, and the
+// next flow-isolating drain cleanup-receives the group queued behind it.
+func TestTcpGroupRecoveryCanceledReliablePackStillDrainsQueuedGroup(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		var prepares, receives atomic.Int64
+		prepared, queued := make(chan struct{}), make(chan struct{})
+		budget := NewTransferMemoryBudget(kib(64))
+		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+				if prepares.Add(1) == 1 {
+					close(prepared)
+					<-queued
+				}
+			}
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
+				if receives.Add(1) != 1 || source.ctx.Err() == nil {
+					t.Error("the queued group was not received once, after the cancellation")
+				}
+			}
+		})
+		f.client.RouteManager().UpdateTransportWithProperties(f.transport, []Route{f.route}, TransferCarrierProperties{
+			Unreliable: true, UnreliableFlowIsolation: true,
+		})
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: "reliable"}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packResults := make(chan error, 1)
+		if !f.client.SendWithTimeout(frame, f.peer, func(err error) { packResults <- err }, 0) {
+			MessagePoolReturn(frame.MessageBytes)
+			t.Fatal("the reliable Pack did not reach the source queue")
+		}
+		f.requireParked()
+		var source *SendSequence
+		func() {
+			f.client.sendBuffer.mutex.Lock()
+			defer f.client.sendBuffer.mutex.Unlock()
+			for id, sequence := range f.client.sendBuffer.sendSequences {
+				if id.Destination == f.peer {
+					source = sequence
+				}
+			}
+		}()
+		// Run is parked: its writer state has one fixture owner until unpark.
+		// Normal Run cleanup closes it.
+		if source == nil || source.openContractMultiRouteWriter() == nil || !source.transferFlightPolicy().flowIsolation {
+			t.Fatal("the source has no flow-isolating destination selector")
+		}
+		f.unpark()
+		synctest.Wait()
+		select {
+		case <-prepared:
+		default:
+			t.Fatal("the reliable Pack never reached its prepared reservation")
+		}
+		group := groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
+		if !f.selected.SendGroupWithAck(group, 0, true) {
+			MessagePoolReturn(group.packets[0].packet)
+			t.Fatal("the group did not reach the source queue behind the Pack")
+		}
+		source.Cancel()
+		close(queued)
+		synctest.Wait()
+		select {
+		case err := <-packResults:
+			if err == nil {
+				t.Fatal("the canceled reliable Pack reported success")
+			}
+		default:
+			t.Fatal("the canceled reliable Pack has no result")
+		}
+		if receives.Load() != 1 {
+			t.Fatal("the canceled worker returned before its next drain received the queued group")
+		}
+		if flags := group.completionFlags.Load(); flags&groupCompletionReceived == 0 ||
+			flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
+			t.Fatal("cleanup receive acquired a live control ordinal or retained its source worker")
+		}
+		select {
+		case <-source.done:
+		default:
+			t.Fatal("canceled source worker did not join")
+		}
+		if source.contractMultiRouteWriter != nil || budget.UsedByteCount() != 0 || len(f.route) != 0 {
+			t.Fatal("canceled source retained its selector, a reservation or a physical Pack")
+		}
+	})
 }
 
 // Two real race candidates may replay the same source cohorts at different
