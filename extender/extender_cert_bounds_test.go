@@ -114,11 +114,12 @@ func TestExtenderCertificateValidityFollowsTheSettings(t *testing.T) {
 	settings.ValidFrom = 2 * time.Hour
 	settings.ValidFor = 3 * time.Hour
 
-	assertAbout := func(description string, actual time.Time, expected time.Time) {
+	// a time issued between two reads of the clock falls between them, however long
+	// issuing took; x509 keeps whole seconds rounded down, so up to a second early
+	assertIssued := func(description string, actual time.Time, issuedAt time.Time, issuedBy time.Time, offset time.Duration) {
 		t.Helper()
-		// x509 keeps whole seconds, and issuing takes a moment of its own
-		if delta := actual.Sub(expected); delta < -2*time.Second || 2*time.Second < delta {
-			t.Errorf("%s = %s, expected about %s", description, actual, expected)
+		if actual.Before(issuedAt.Add(offset-time.Second)) || issuedBy.Add(offset).Before(actual) {
+			t.Errorf("%s = %s, expected between %s and %s", description, actual, issuedAt.Add(offset), issuedBy.Add(offset))
 		}
 	}
 
@@ -135,9 +136,10 @@ func TestExtenderCertificateValidityFollowsTheSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	issuedBy := time.Now()
 	leaf := certificate.Leaf
-	assertAbout("identity leaf NotBefore", leaf.NotBefore, issuedAt.Add(-settings.ValidFrom))
-	assertAbout("identity leaf NotAfter", leaf.NotAfter, issuedAt.Add(extenderLeafValidFor))
+	assertIssued("identity leaf NotBefore", leaf.NotBefore, issuedAt, issuedBy, -settings.ValidFrom)
+	assertIssued("identity leaf NotAfter", leaf.NotAfter, issuedAt, issuedBy, extenderLeafValidFor)
 	if leaf.NotBefore.After(issuedAt) || leaf.NotAfter.Before(issuedAt) {
 		t.Errorf("leaf validity %s..%s does not span issuance", leaf.NotBefore, leaf.NotAfter)
 	}
@@ -146,8 +148,8 @@ func TestExtenderCertificateValidityFollowsTheSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertAbout("ca NotBefore", caCertificate.NotBefore, issuedAt.Add(-settings.ValidFrom))
-	assertAbout("ca NotAfter", caCertificate.NotAfter, issuedAt.Add(extenderCaValidFor))
+	assertIssued("ca NotBefore", caCertificate.NotBefore, issuedAt, issuedBy, -settings.ValidFrom)
+	assertIssued("ca NotAfter", caCertificate.NotAfter, issuedAt, issuedBy, extenderCaValidFor)
 	// the ca outlives every leaf it issues, so a leaf is never the shorter of
 	// the two by accident
 	if !leaf.NotAfter.Before(caCertificate.NotAfter) {
@@ -164,9 +166,10 @@ func TestExtenderCertificateValidityFollowsTheSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keylessIssuedBy := time.Now()
 	keylessLeaf := keylessCertificate.Leaf
-	assertAbout("self-signed leaf NotBefore", keylessLeaf.NotBefore, keylessIssuedAt.Add(-settings.ValidFrom))
-	assertAbout("self-signed leaf NotAfter", keylessLeaf.NotAfter, keylessIssuedAt.Add(settings.ValidFor))
+	assertIssued("self-signed leaf NotBefore", keylessLeaf.NotBefore, keylessIssuedAt, keylessIssuedBy, -settings.ValidFrom)
+	assertIssued("self-signed leaf NotAfter", keylessLeaf.NotAfter, keylessIssuedAt, keylessIssuedBy, settings.ValidFor)
 
 	if extenderLeafValidFor != 30*24*time.Hour {
 		t.Errorf("leaf window = %s, expected 30 days", extenderLeafValidFor)
