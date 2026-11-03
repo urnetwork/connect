@@ -14,8 +14,11 @@ import (
 // the ordinary 30-second send lifetime, then a hard channel error and one TCP
 // reset. This deliberately does NOT claim to reproduce why H1 stopped making
 // progress: the peer feedback boundary is controlled here, not a random link.
-// A timely ACK and an acknowledged predecessor distinguish that ownership
-// chain from an echo-server deadline or an aggregate last-progress timer.
+// A timely ACK distinguishes that ownership chain from an echo-server deadline.
+// The lifetime runs from the request's send time and from the last advance of
+// the sequence's cumulative head (f25be1b2, connect PR #231): an acknowledged
+// predecessor renews it, and a head that then stops ends it exactly one
+// lifetime after that advance, with the same owner and reset.
 func TestReadinessAckExpiryOwnsTcpFlowReset(t *testing.T) {
 	for _, mode := range []string{"missing-request-ack", "acknowledged-predecessor", "timely-request-ack"} {
 		t.Run(mode, func(t *testing.T) {
@@ -80,6 +83,7 @@ func TestReadinessAckExpiryOwnsTcpFlowReset(t *testing.T) {
 				}
 				start := time.Now()
 				request := send(200)
+				deadline := start.Add(30 * time.Second)
 				if predecessor != nil {
 					time.Sleep(3393 * time.Millisecond)
 					acknowledgeSendPackLifecycleWirePack(t, client, destination, predecessor)
@@ -87,8 +91,15 @@ func TestReadinessAckExpiryOwnsTcpFlowReset(t *testing.T) {
 					if !channel.lastSendAckTime.Equal(time.Now()) {
 						t.Fatal("predecessor ACK did not reach the real channel callback")
 					}
+					// The head advanced here: the request's lifetime now ends one
+					// lifetime later, and its send-time deadline alone retires nothing.
+					deadline = time.Now().Add(30 * time.Second)
+					time.Sleep(time.Until(start.Add(30 * time.Second)))
+					synctest.Wait()
+					if _, err := channel.WindowStats(); err != nil || channel.IsDone() || len(*forwarded) != 0 || flow.client.Load() != channel {
+						t.Fatalf("the head's advance did not renew the request's lifetime: %v", err)
+					}
 				}
-				deadline := start.Add(30 * time.Second)
 				time.Sleep(time.Until(deadline) - time.Nanosecond)
 				synctest.Wait()
 				if _, err := channel.WindowStats(); err != nil || channel.IsDone() || len(*forwarded) != 0 || flow.client.Load() != channel {
