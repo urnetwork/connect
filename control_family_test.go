@@ -310,6 +310,99 @@ func TestProbeFamilySupportIgnoresOurOwnTunnel(t *testing.T) {
 	}
 }
 
+// The linux and windows apps name their tunnels themselves, urnet0 and the
+// URnetwork adapter, and carry the same addresses: a 10.a.b.h and a ULA from the
+// sdk's /48, both of them IsGlobalUnicast. Read as a path, the ipv6 half wakes
+// the pinned ipv6 transport on an ipv4-only host and lets a failure of ipv4
+// demote the only family it has, and the ipv4 half does the same on an
+// ipv6-only host. 198.18.0.0/15 and 3fff::/20 read as connectivity while naming
+// no real network (TestFamilySupportedReadsTheInterfaceTable).
+func TestProbeFamilySupportIgnoresTheDesktopAppTunnels(t *testing.T) {
+	tunnelAddrs := []net.Addr{ipNet("10.7.3.42/24"), ipNet("fd00:7572:6e65:ffff::2/64")}
+	loopback := controlFamilyInterface{
+		name:  "lo",
+		flags: net.FlagUp | net.FlagLoopback,
+		addrs: []net.Addr{ipNet("127.0.0.1/8"), ipNet("::1/128")},
+	}
+	ipv4Uplink := controlFamilyInterface{
+		name:  "eth0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("198.18.7.20/24"), ipNet("fe80::1/64")},
+	}
+	ipv6Uplink := controlFamilyInterface{
+		name:  "eth0",
+		flags: net.FlagUp,
+		addrs: []net.Addr{ipNet("3fff:db8::1/64"), ipNet("fe80::1/64")},
+	}
+
+	for _, tunnelName := range []string{"urnet0", "URnetwork"} {
+		tunnel := controlFamilyInterface{
+			name:  tunnelName,
+			flags: net.FlagUp | net.FlagPointToPoint,
+			addrs: tunnelAddrs,
+		}
+		tests := []struct {
+			name   string
+			ifaces []controlFamilyInterface
+			want4  bool
+			want6  bool
+		}{
+			{
+				name:   "ipv4-only host",
+				ifaces: []controlFamilyInterface{loopback, ipv4Uplink, tunnel},
+				want4:  true,
+				want6:  false,
+			},
+			{
+				name:   "ipv6-only host",
+				ifaces: []controlFamilyInterface{loopback, ipv6Uplink, tunnel},
+				want4:  false,
+				want6:  true,
+			},
+			{
+				name:   "no uplink",
+				ifaces: []controlFamilyInterface{loopback, tunnel},
+				want4:  false,
+				want6:  false,
+			},
+		}
+		for _, test := range tests {
+			restore := swapControlFamilyInterfaces(
+				func() ([]controlFamilyInterface, error) { return test.ifaces, nil })
+			controlFamilyClear()
+
+			for _, row := range []struct {
+				family int
+				want   bool
+			}{
+				{family: 4, want: test.want4},
+				{family: 6, want: test.want6},
+			} {
+				if got := probeFamilySupport(row.family); got != row.want {
+					t.Errorf("%s, %s up: probeFamilySupport(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				if got := FamilySupported(row.family); got != row.want {
+					t.Errorf("%s, %s up: FamilySupported(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				if got := pinnedFamilySupported(row.family); got != row.want {
+					t.Errorf("%s, %s up: pinnedFamilySupported(%d) = %v, want %v",
+						test.name, tunnelName, row.family, got, row.want)
+				}
+				// demoting a family takes the other one's word that it works
+				other := 10 - row.family
+				if got := controlFamilyDemote(other); got != row.want {
+					t.Errorf("%s, %s up: controlFamilyDemote(%d) = %v, want %v",
+						test.name, tunnelName, other, got, row.want)
+				}
+				controlFamilyClear()
+			}
+			restore()
+		}
+	}
+}
+
 // An unreadable interface table is NO EVIDENCE, and the only job this probe
 // has is to refuse a dangerous demotion. Failing open answers "yes, the other
 // family works" on a device nothing is known about, which is the one answer

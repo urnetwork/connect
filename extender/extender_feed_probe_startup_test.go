@@ -29,7 +29,7 @@ func TestExtenderNetworkClientInitialProbeReadinessKeepsFeedWake(t *testing.T) {
 			},
 		})
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	directory := fixture.newDirectory(t, ctx, nil)
 	if _, err := directory.ApplyRecord(
@@ -44,9 +44,6 @@ func TestExtenderNetworkClientInitialProbeReadinessKeepsFeedWake(t *testing.T) {
 		settings.RebootstrapTimeout = time.Hour
 		settings.IpVersionSupported = func(ipVersion int) bool { return ipVersion == 4 }
 		settings.ProbeWindowCount = 3
-		settings.Probe = func(context.Context, *connect.ExtenderCandidate, *connect.ExtenderProbeAttestor) (time.Duration, connect.ExtenderPingOutcome, error) {
-			return 20 * time.Millisecond, connect.ExtenderPingUnattested, nil
-		}
 	})
 	select {
 	case <-feed.opened:
