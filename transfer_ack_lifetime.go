@@ -123,24 +123,19 @@ func (self *sequenceAckWindow) pendingDeliveryFor(sequenceNumber uint64, message
 // anchored to the actual reply arrival, never to the time this check runs.
 // Zero means no valid renewal; contract requests still do not prove delivery.
 func (self *SendSequence) pendingAckLifetime(item *sendItem) (bool, time.Time) {
-	progressDeadline := self.ackProgressDeadline(item)
 	if self.ackWindow == nil {
-		return false, progressDeadline
+		return false, time.Time{}
 	}
 	delivered, receivedAtNanos := self.ackWindow.pendingLifetimeFeedback(item)
 	if delivered || receivedAtNanos == 0 {
-		return delivered, progressDeadline
+		return delivered, time.Time{}
 	}
 	renewedAt := time.Unix(0, receivedAtNanos)
 	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
 		base := self.client.feedbackTimeBase
 		renewedAt = base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
 	}
-	renewedDeadline := renewedAt.Add(item.ackTimeout)
-	if renewedDeadline.Before(progressDeadline) {
-		renewedDeadline = progressDeadline
-	}
-	return false, renewedDeadline
+	return false, renewedAt.Add(item.ackTimeout)
 }
 
 // An advancing cumulative head proves the receiver is alive and the flight is
@@ -168,6 +163,9 @@ func (self *SendSequence) nextAckLifetime(now time.Time) (time.Time, error) {
 		if delivered {
 			self.ackLifetimes.remove(item)
 			continue
+		}
+		if progressDeadline := self.ackProgressDeadline(item); renewedDeadline.Before(progressDeadline) {
+			renewedDeadline = progressDeadline
 		}
 		if renewedDeadline.After(deadline) {
 			self.ackLifetimes.items[0].at = renewedDeadline
