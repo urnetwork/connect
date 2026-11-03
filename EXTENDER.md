@@ -795,23 +795,21 @@ and the uptime probes deactivate its addresses once the host answers for the
 new key (C3).
 
 - The provider role of the sdk (G2) makes the new key itself, for a space with
-  local state, which is every app's (2026-11-03, the owner's "fix these" on the
-  automatic fresh key). On the refusal the role asks the provider for a key of
-  the network's own, at most once a role. The space makes a key, keeps it in
-  `.extender_network_keys` under the id of the network the client jwt names,
-  and the provider starts the role again on it, as a new process starts, with
-  every family due. While the role runs for that network the space presents
-  that key, to the node as well (B1), and the measurement name is the new
-  extender id's (C4), so it is the network's identity from then on. `.extender_key` is left as it was, and a
-  network with no key of its own runs under it, so a device that goes back to
-  the account that holds `.extender_key` presents it again, with its history.
-  Both files are kept across a sign-out (E7). A space makes a network at most
-  one key a day: a key it made is refused as another network's only when
-  another network activated it first, which takes posting it through this
-  extender before the extender's own post lands, and the bound keeps that from
-  churning keys; the refusal stands in the status meanwhile. A refusal of a key
-  the space no longer presents for the network, one the role posted before it
-  was replaced, makes none.
+  local state, which is every app's (decided 2026-11-03). On the refusal the
+  role asks the provider for a key of the network's own, at most once a role.
+  The space makes a key, keeps it in `.extender_network_keys` under the id of
+  the network the client jwt names, and the provider starts the role again on
+  it, as a new process starts, with every family due. While the role runs for
+  that network the space presents that key, to the node as well (B1), and the
+  measurement name is the new extender id's (C4), so it is the network's
+  identity from then on. `.extender_key` is left as it was, and a network with
+  no key of its own runs under it, so a device that goes back to the account
+  that holds `.extender_key` presents it again, with its history. Both files
+  are kept across a sign-out (E7). A space makes a network at most one key a
+  day, so no run of the operator's answers can make it churn through keys; a
+  refusal of the network's key within the day stands in the status. A refusal
+  of a key the space no longer presents for the network, one the role posted
+  before it was replaced, makes none.
 - An app that predates that does it by hand. Stop the app and whatever runs
   its device (the linux daemon, the windows service), remove `.extender_key`
   from that process's local state, and start it again: the sdk creates a key
