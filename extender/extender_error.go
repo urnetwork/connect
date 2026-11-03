@@ -40,7 +40,7 @@ import (
 //
 // The two forward stages dial the destination a client asked for, which the whitelist
 // confines to the operator's hosts (A5, A7), so the error names an operator host, under
-// the label a `*.` pattern leaves to the client.
+// a label a `*.` pattern leaves to the client, which can hold only what a host name can.
 //
 // The two nlayer stages dial a hop the operator configured (A11), so the error names
 // the hop and what connect.DialExtender found there: the status of a refusal, the
