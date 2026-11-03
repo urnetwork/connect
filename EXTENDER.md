@@ -1340,6 +1340,13 @@ stage or a new kind of error is scrubbed with nothing further done. Only `forwar
 since each dials what the operator named (A5, A7, A11) and the client's address only
 chooses the family. Those are what an operator reads, and the role logs the first two.
 
+The extender's http servers keep no log of their own, since every line of theirs an
+operator might read names the client or repeats what the client sent: a broken h2
+greeting, a frame that cannot be read, a panic. The one that matters is the panic, so
+the handler catches its own and logs that it happened and where in the code, from the
+binary and with nothing of the value or the request, and `ErrorHandler` hears it as the
+stage `handler panic`.
+
 G3. Activation loop. Each family keeps its own schedule. A family is posted
 at start, on its own 24 hour tick, and when a trigger makes it due: the own
 key observed revoked in the directory and a network change make every family
