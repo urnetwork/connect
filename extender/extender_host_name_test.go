@@ -236,5 +236,53 @@ func TestExtenderRefusesADestinationThatIsNoHostName(t *testing.T) {
 		if addresses := hopDials.dialed(); len(addresses) != 1 || addresses[0] != "192.0.2.9:9443" {
 			t.Fatalf("the extender dialed %q", addresses)
 		}
+
+		// a relayed probe carries the pinger the client named, bytes it chose, to the hop,
+		// and what the dial says of a failure is the hop and none of them
+		for _, pinger := range []struct {
+			description string
+			dial        connect.ExtenderDial
+		}{
+			{
+				description: "a provider",
+				dial: connect.ExtenderDial{
+					Service:       connect.ExtenderServiceProbe,
+					ProbeClientId: []byte("line\nbreak bytes"),
+				},
+			},
+			{
+				description: "an extender",
+				dial: connect.ExtenderDial{
+					Service:                connect.ExtenderServiceProbe,
+					ProbeExtenderPublicKey: []byte("line\nbreak and thirty-two bytes!"),
+				},
+			},
+		} {
+			if len(pinger.dial.ProbeClientId) != connect.ExtenderProbeClientIdByteCount && len(pinger.dial.ProbeExtenderPublicKey) != 32 {
+				t.Fatalf("%s: the pinger is not well formed, so the probe would name none", pinger.description)
+			}
+			probeFixture, probeDials := newTestHostNameFixture(t, func(settings *ExtenderSettings) {
+				settings.NLayerHops = []*connect.ExtenderConfig{testErrorHop}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			_, _, err := connect.DialExtender(ctx, probeFixture.connectSettings(), probeFixture.extenderConfig(connect.ExtenderCarrierTcp), &pinger.dial)
+			cancel()
+			var refusedErr *connect.ExtenderRefusedError
+			if !errors.As(err, &refusedErr) {
+				t.Fatalf("%s: the probe ended with %v, expected a refusal", pinger.description, err)
+			}
+			reported := waitForFixtureError(t, probeFixture, "nlayer probe dial")
+			if strings.Contains(reported.Error(), "break") || !strings.Contains(reported.Error(), "192.0.2.9:9443") {
+				t.Fatalf("%s: heard %q, expected the hop and nothing the client chose", pinger.description, reported)
+			}
+			for _, otherErr := range drainFixtureErrors(probeFixture) {
+				if strings.Contains(otherErr.Error(), "break") {
+					t.Fatalf("%s: heard %q", pinger.description, otherErr)
+				}
+			}
+			if addresses := probeDials.dialed(); len(addresses) != 1 || addresses[0] != "192.0.2.9:9443" {
+				t.Fatalf("%s: the extender dialed %q", pinger.description, addresses)
+			}
+		}
 	})
 }
