@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
-	"fmt"
 	"net"
 	"slices"
 	"sync"
@@ -115,10 +114,10 @@ func (self *ExtenderServer) admitProbe(header *protocol.ExtenderHeader, remoteAd
 		self.settings.ProbeMaxRatePerSource,
 		self.settings.ProbeMaxBurstPerSource,
 	) {
-		return fmt.Errorf("%s is over its probe rate", source)
+		return extenderFixedError("the source is over its probe rate")
 	}
 	if 0 < len(header.ProbeClientId) && 0 < len(header.ProbeExtenderPublicKey) {
-		return fmt.Errorf("a probe names both a provider and an extender")
+		return extenderFixedError("a probe names both a provider and an extender")
 	}
 	return nil
 }
@@ -245,46 +244,38 @@ func (self *ExtenderServer) gateProbeAttestation(
 	observed time.Duration,
 ) (uint32, error) {
 	if subtle.ConstantTimeCompare(attestation.ProbeNonce, probe.nonce) != 1 {
-		return connect.ExtenderProbeVerdictReasonNonce, fmt.Errorf("the attestation does not echo the nonce")
+		return connect.ExtenderProbeVerdictReasonNonce, extenderFixedError("the attestation does not echo the nonce")
 	}
 	if !slices.Equal(attestation.ExtenderPublicKey, self.PublicKey()) {
-		return connect.ExtenderProbeVerdictReasonWrongExtender, fmt.Errorf("the attestation names another extender")
+		return connect.ExtenderProbeVerdictReasonWrongExtender, extenderFixedError("the attestation names another extender")
 	}
 	switch {
 	case probe.clientId != nil:
 		if !slices.Equal(attestation.ProbeClientId, probe.clientId) || 0 < len(attestation.PingerExtenderPublicKey) {
-			return connect.ExtenderProbeVerdictReasonUnknownPinger, fmt.Errorf("the attestation names another client id")
+			return connect.ExtenderProbeVerdictReasonUnknownPinger, extenderFixedError("the attestation names another client id")
 		}
 		if len(attestation.Signature) != ed25519.SignatureSize {
-			return connect.ExtenderProbeVerdictReasonBadSignature, fmt.Errorf(
-				"the attestation signature is %d bytes, expected %d",
-				len(attestation.Signature),
-				ed25519.SignatureSize,
-			)
+			return connect.ExtenderProbeVerdictReasonBadSignature, extenderFixedError("the attestation signature is the wrong size")
 		}
 	case probe.pingerPublicKey != nil:
 		if !slices.Equal(attestation.PingerExtenderPublicKey, probe.pingerPublicKey) || 0 < len(attestation.ProbeClientId) {
-			return connect.ExtenderProbeVerdictReasonUnknownPinger, fmt.Errorf("the attestation names another pinger extender")
+			return connect.ExtenderProbeVerdictReasonUnknownPinger, extenderFixedError("the attestation names another pinger extender")
 		}
 		if !connect.VerifyExtenderProbeAttestation(probe.pingerPublicKey, attestation) {
-			return connect.ExtenderProbeVerdictReasonBadSignature, fmt.Errorf("the attestation signature does not verify under the pinger key")
+			return connect.ExtenderProbeVerdictReasonBadSignature, extenderFixedError("the attestation signature does not verify under the pinger key")
 		}
 		if slices.Equal(probe.pingerPublicKey, self.PublicKey()) {
-			return connect.ExtenderProbeVerdictReasonUnknownPinger, fmt.Errorf("the pinger extender is this extender")
+			return connect.ExtenderProbeVerdictReasonUnknownPinger, extenderFixedError("the pinger extender is this extender")
 		}
 		if self.settings.ProbePeerVerifier == nil || !self.settings.ProbePeerVerifier(probe.pingerPublicKey) {
-			return connect.ExtenderProbeVerdictReasonUnknownPinger, fmt.Errorf("the pinger extender is not an active peer")
+			return connect.ExtenderProbeVerdictReasonUnknownPinger, extenderFixedError("the pinger extender is not an active peer")
 		}
 	default:
-		return connect.ExtenderProbeVerdictReasonUnknownPinger, fmt.Errorf("the probe named no pinger")
+		return connect.ExtenderProbeVerdictReasonUnknownPinger, extenderFixedError("the probe named no pinger")
 	}
 	claimed := time.Duration(attestation.RttMs) * time.Millisecond
 	if claimed+self.settings.ProbeRttTolerance < observed {
-		return connect.ExtenderProbeVerdictReasonRttBelowObserved, fmt.Errorf(
-			"the claimed rtt %s is below the observed %s",
-			claimed,
-			observed,
-		)
+		return connect.ExtenderProbeVerdictReasonRttBelowObserved, extenderFixedError("the claimed rtt is below the observed")
 	}
 	return connect.ExtenderProbeVerdictReasonOk, nil
 }
