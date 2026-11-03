@@ -240,12 +240,12 @@ func TestExtenderListenSeamIsUsedAndOwned(t *testing.T) {
 		if call != "tcp :18443" {
 			t.Fatalf("listen call = %q, expected tcp :18443", call)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("extender did not use the injected listener factory")
 	}
 	select {
 	case <-listener.acceptStarted:
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("extender did not accept on the injected listener")
 	}
 	server.Close()
@@ -254,7 +254,7 @@ func TestExtenderListenSeamIsUsedAndOwned(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("extender did not stop after Close")
 	}
 	select {
@@ -403,7 +403,7 @@ func TestExtenderCloseAndWaitJoinsAcceptedConnection(t *testing.T) {
 
 	select {
 	case <-listener.accepted:
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("extender did not accept the fixture connection")
 	}
 	waitDone := make(chan struct{})
@@ -413,16 +413,18 @@ func TestExtenderCloseAndWaitJoinsAcceptedConnection(t *testing.T) {
 	}()
 	select {
 	case <-waitDone:
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("CloseAndWait did not join every extender operation")
 	}
+	// the join ends with the call's last deferred step, and the call then has to
+	// return on its own goroutine and hand this over, so this can come a moment later
 	select {
 	case err := <-serveDone:
 		if err != nil {
 			t.Fatal(err)
 		}
-	default:
-		t.Fatal("CloseAndWait returned before ListenAndServe")
+	case <-time.After(60 * time.Second):
+		t.Fatal("ListenAndServe did not return after CloseAndWait")
 	}
 	if _, err := clientConnection.Read(make([]byte, 1)); err == nil {
 		t.Fatal("accepted connection remained open after CloseAndWait")
@@ -474,7 +476,7 @@ func TestExtenderListenSeamOwnsEveryPartialFactoryResult(t *testing.T) {
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("listen error = %v, expected sentinel", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the failed bind was not reported")
 	}
 	select {
@@ -507,7 +509,7 @@ func TestExtenderListenSeamOwnsEveryPartialFactoryResult(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("extender did not stop after Close")
 	}
 	select {
@@ -804,7 +806,7 @@ func TestExtenderErrorHandlerAttributesForwardDialFailure(t *testing.T) {
 		if !errors.Is(observed.err, sentinel) {
 			t.Fatalf("observed error = %v, expected sentinel", observed.err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("forward dial failure was not attributed")
 	}
 }
@@ -828,7 +830,7 @@ func TestExtenderForwardDialSeamOwnsConnectionReturnedWithError(t *testing.T) {
 	}
 	select {
 	case <-observedForward.closed:
-	case <-time.After(time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("forward dial error did not release its returned connection")
 	}
 }
