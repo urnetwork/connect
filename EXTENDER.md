@@ -1420,7 +1420,21 @@ another family's answer brings counts too. Once it has activated, something
 forwards to it, so its refusals -- the operator's budgets, a probe that
 failed, the re-post of a revocation -- are held on the backoff as any
 family's are. An interface table that cannot be read counts as public here,
-so it never lengthens a hold. The
+so it never lengthens a hold by itself. A family with a public address is
+held the same way when the operator's required test found no answer from it
+while it has not activated (`ExtenderActivateResult.RequiredTestUnreachable`:
+the tcp step of `probe_steps` failed or ran out of time, C2b, or from an
+operator that predates the steps, an `error` that says the tcp carrier did not
+answer or failed): a firewall that keeps the internet out, or a router that
+does not forward the port to a host it gives a public address, refuses every
+retry alike, as the NAT does. Decided 2026-11-03 for the extender behind NAT
+(support inbox 8154): the role stops retrying on the backoff, and the status
+says what it needs (N3's `activation_unreachable`). It is still posted on
+every trigger and on its tick, so a host whose port is opened activates
+within the day, or at once on a network change or a restart of the role
+(turning Extender off and on). Every other refusal of a public family, and
+every refusal of a family that has activated, is held on the backoff as
+before. The
 measurement request rides the first post of a pass that can carry it
 (lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
 request that is wanted, the families it activated are posted once more at
@@ -4464,7 +4478,11 @@ Phase 5b follows 4 because both touch the server.
 - Records lag reality by up to one drip rotation; the directory's local
   failure policy covers the gap.
 - An extender behind NAT or without a public address never activates,
-  which the probe-back guarantees silently.
+  which the probe-back guarantees. It is no longer silent: the status says
+  the internet can't reach the device on tcp 443 and what to open or forward
+  (N3, `activation_unreachable`), and a family that has not activated is
+  posted once a day and on its triggers rather than on the backoff (G3,
+  2026-11-03), until the peer-to-peer webrtc test of C2a lands.
 - The spoof list ships empty until operations provide it, so extender
   dialers appear only after that.
 - A client that never dials an unverified dns address has no extender at
