@@ -6,16 +6,42 @@ import (
 	"net"
 	"net/netip"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 type SocketHandle = syscall.Handle
 
+// duplicateSocketHandle retains a second handle to the connection's socket for
+// the complete TTL choreography without calling TCPConn.File. On Windows File
+// first detaches the socket from the runtime's I/O completion port, for good,
+// because the duplicate it returns may do I/O of its own. After that every read
+// and write on the net.Conn parks an OS thread in an infinite wait, read and
+// write deadlines no longer fire, and Close waits on a parked read until the
+// peer sends or hangs up. The duplicate here only ever carries socket options,
+// never I/O, so it is the in-process WSADuplicateSocket that File makes, minus
+// the detach, and the connection stays on the poller.
 func duplicateSocketHandle(conn *net.TCPConn) (SocketHandle, func(), error) {
-	file, err := conn.File()
+	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		return 0, nil, err
 	}
-	return SocketHandle(file.Fd()), func() { _ = file.Close() }, nil
+	var duplicate windows.Handle
+	var duplicateErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		var info windows.WSAProtocolInfo
+		duplicateErr = windows.WSADuplicateSocket(windows.Handle(fd), windows.GetCurrentProcessId(), &info)
+		if duplicateErr != nil {
+			return
+		}
+		duplicate, duplicateErr = windows.WSASocket(-1, -1, -1, &info, 0, windows.WSA_FLAG_OVERLAPPED|windows.WSA_FLAG_NO_HANDLE_INHERIT)
+	}); err != nil {
+		return 0, nil, err
+	}
+	if duplicateErr != nil {
+		return 0, nil, duplicateErr
+	}
+	return SocketHandle(duplicate), func() { _ = windows.Closesocket(duplicate) }, nil
 }
 
 // socketTtlOption selects the socket option that controls the outgoing hop
