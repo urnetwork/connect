@@ -55,6 +55,31 @@ func newTcpProviderRetirementFixture(t *testing.T) *tcpProviderRetirementFixture
 // any flow starts; existing retirement callers retain the same fixture.
 func newTcpProviderRetirementFixtureWithSetup(t *testing.T, wrapSocket func(net.Conn) net.Conn, setupSequence func(*TcpSequence)) *tcpProviderRetirementFixture {
 	t.Helper()
+	return newTcpProviderRetirementFixtureWithOptions(t, tcpProviderRetirementOptions{
+		wrapSocket:    wrapSocket,
+		setupSequence: setupSequence,
+	})
+}
+
+// What a caller may change before any flow starts.
+type tcpProviderRetirementOptions struct {
+	wrapSocket    func(net.Conn) net.Conn
+	setupSequence func(*TcpSequence)
+	// Builds each generation's in-memory socket pair, the sequence's end first.
+	// Nil is a net.Pipe pair.
+	socketPair func() (net.Conn, net.Conn)
+	// Adjusts the NAT's settings after the fixture has set its own.
+	configureNat func(*LocalUserNatSettings)
+}
+
+func newTcpProviderRetirementFixtureWithOptions(t *testing.T, options tcpProviderRetirementOptions) *tcpProviderRetirementFixture {
+	t.Helper()
+	wrapSocket := options.wrapSocket
+	setupSequence := options.setupSequence
+	socketPair := options.socketPair
+	if socketPair == nil {
+		socketPair = net.Pipe
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture := &tcpProviderRetirementFixture{
 		t:                   t,
@@ -74,7 +99,7 @@ func newTcpProviderRetirementFixtureWithSetup(t *testing.T, wrapSocket func(net.
 
 	sockets := make(chan net.Conn, 2)
 	for range 2 {
-		sequenceSocket, upstream := net.Pipe()
+		sequenceSocket, upstream := socketPair()
 		fixture.sequenceSockets = append(fixture.sequenceSockets, sequenceSocket)
 		fixture.upstreams = append(fixture.upstreams, upstream)
 		if wrapSocket != nil {
@@ -108,6 +133,9 @@ func newTcpProviderRetirementFixtureWithSetup(t *testing.T, wrapSocket func(net.
 			setupSequence(sequence)
 		}
 		fixture.created <- sequence
+	}
+	if options.configureNat != nil {
+		options.configureNat(natSettings)
 	}
 	fixture.nat = NewLocalUserNat(ctx, "synthetic tcp retirement custody", natSettings)
 	providerSettings := DefaultRemoteUserNatProviderSettings()
