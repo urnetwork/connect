@@ -1440,7 +1440,9 @@ func TestLagApiLoadPingsFast(t *testing.T) {
 		if body.PingMicros[i] == 0 {
 			continue
 		}
-		if gap := body.PingOffsetMs[i] - body.PingOffsetMs[i-1]; gap < 250-250/8 {
+		// the loop keeps a ping 218.75 ms after the last at the least, and each offset
+		// is whole milliseconds rounded down, so such a gap can read as 218
+		if gap := body.PingOffsetMs[i] - body.PingOffsetMs[i-1]; gap < 250-250/8-1 {
 			t.Errorf("report pings %d ms apart", gap)
 		}
 	}
