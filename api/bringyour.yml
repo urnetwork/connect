@@ -7726,6 +7726,80 @@ paths:
             is above the finalized cumulative, or an account the server
             recorded is not at its index in the finalized root.
 
+  /sn/claim-relay:
+    get:
+      tags: [Other]
+      summary: What is pending for the network's coldkeys and why
+      description: |
+        URnetwork claims settlement v2 balances for every consented coldkey and
+        pays the gas: automatically once a balance is worth 0.0125 TAO, and on a
+        Claim now once it clears the 0.0001 TAO transfer floor, at most once per
+        coldkey per 30 days. Claims spend at most 0.01 TAO a day; past that they
+        wait for the next UTC day, which costs nothing, since v2 credit never
+        expires. A device can always claim for itself with its gas key.
+
+        This answers for the caller's network: each of its coldkeys with an
+        account in the operator's pool, what a claim would pay now, why it is
+        still pending, and whether Claim now can be tapped. A coldkey the network
+        has replaced stays listed while it has an account, since URnetwork keeps
+        claiming it.
+
+        `state` is the relay's: `running`; `cap_reached`; `in_flight`, a claim's
+        outcome is not final yet; `no_key`, no relayer key is configured, so the
+        relay reads and sends nothing; `bad_key`; `not_configured`; `not_running`,
+        it has no recent pass; `chain_unavailable`; `ledger_unavailable`;
+        `send_failed`; `low_balance`; `gas_price_high`; `griefing_stop`, a claim's
+        gas jumped.
+
+        An `error` means the balances could not be read: they are unavailable,
+        never zero, and `state` still says what the relay is doing.
+      operationId: snClaimRelay
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnClaimRelayResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+  /sn/claim-relay/claim-now:
+    post:
+      tags: [Other]
+      summary: Ask URnetwork to claim one coldkey's balance now
+      description: |
+        Queues a balance of one of the caller's network's coldkeys for the relay's
+        next pass, ahead of the balances over the automatic threshold, under the
+        same daily cap, once the balance clears the transfer floor. A coldkey can
+        do this once per 30 days, counted from when URnetwork pays a tapped claim
+        it would not have sent by itself, so a tap that sends nothing, or only
+        moves an automatic claim ahead, uses nothing up.
+
+        `requested` false with a `reason` is the answer for a balance that cannot
+        be claimed for now: the same values as an account's `claim_now_reason`. A
+        coldkey that is not the network's, or has no account, reads as
+        `nothing_pending`.
+      operationId: snClaimRelayClaimNow
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnClaimRelayClaimNowArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnClaimRelayClaimNowResult"
+        "403":
+          $ref: "#/components/responses/EmbedClientJwtRefused"
+
   /sn/attempt-artifact:
     get:
       tags: [Other]
@@ -21253,6 +21327,105 @@ components:
           description: The cursor for the next page; empty on the last page.
           type: string
 
+    SnClaimRelayResult:
+      type: object
+      required: [state, automatic_threshold_tao_rao, transfer_floor_tao_rao, automatic_threshold_rao, transfer_floor_rao, claim_now_period_days, accounts]
+      properties:
+        state:
+          type: string
+          description: The relay's state. See GET /sn/claim-relay.
+        automatic_threshold_tao_rao:
+          type: integer
+          format: int64
+          description: The TAO value, in rao of TAO, at which a balance is claimed automatically.
+        transfer_floor_tao_rao:
+          type: integer
+          format: int64
+          description: The TAO value, in rao of TAO, under which a claim reverts on chain.
+        automatic_threshold_rao:
+          type: integer
+          format: int64
+          description: The automatic threshold in rao of α at the relay's last price, 0 without one.
+        transfer_floor_rao:
+          type: integer
+          format: int64
+          description: The transfer floor in rao of α at the relay's last price, 0 without one.
+        claim_now_period_days:
+          type: integer
+          description: Days between two Claim now of one coldkey.
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnClaimRelayAccount"
+        error:
+          $ref: "#/components/schemas/SnClaimRelayError"
+    SnClaimRelayAccount:
+      type: object
+      required: [coldkey_ss58, no_id, index, claimable_rao, value_tao_rao, pending_rao, reason, claim_now_available]
+      properties:
+        coldkey_ss58:
+          type: string
+        no_id:
+          type: integer
+          format: int64
+        index:
+          type: integer
+          format: int64
+          description: The account's fixed position in the pool's ledger.
+        claimable_rao:
+          type: integer
+          format: int64
+          description: What a claim would pay now, in rao of α.
+        value_tao_rao:
+          type: integer
+          format: int64
+          description: Its TAO value at the relay's last price, in rao of TAO; 0 without a price.
+        pending_rao:
+          type: integer
+          format: int64
+          description: What a committed root that is not final yet adds, in rao of α.
+        reason:
+          type: string
+          description: Why the balance is pending.
+          enum: [nothing_pending, under_threshold, queued, cap_reached, refused, relay_not_running, relay_paused]
+        claim_now_available:
+          type: boolean
+        claim_now_reason:
+          type: string
+          description: Why Claim now cannot be tapped, when it cannot.
+          enum: [nothing_pending, under_floor, requested, limit, refused, relay_not_running, relay_paused]
+        claim_now_next_at_millis:
+          type: integer
+          format: int64
+          description: When this coldkey's Claim now limit ends, unix milliseconds; absent when none holds.
+    SnClaimRelayError:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    SnClaimRelayClaimNowArgs:
+      type: object
+      required: [coldkey_ss58]
+      properties:
+        coldkey_ss58:
+          type: string
+          description: One of the caller's network's coldkeys, an ss58 address with the Bittensor prefix (42).
+    SnClaimRelayClaimNowResult:
+      type: object
+      required: [requested]
+      properties:
+        requested:
+          type: boolean
+        reason:
+          type: string
+          description: Why not, as an account's claim_now_reason.
+        next_at_millis:
+          type: integer
+          format: int64
+          description: When this coldkey's Claim now limit ends, unix milliseconds, for a tap the limit refused.
+        error:
+          $ref: "#/components/schemas/SnClaimRelayError"
     SnLedgerAccountResult:
       type: object
       required:
