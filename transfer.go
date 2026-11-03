@@ -8245,51 +8245,69 @@ func (self *SendSequence) processLogicalGroupChunk(
 		sendPack.disposeUnsentGroup(err)
 		return true, false, false
 	}
+	var acks sendAckSet
+	acks.add(sendPack.ackRecord())
+	disposition := sendPack.dispositionRange(start, end)
+	item, effectiveAck, groupMemoryBytes, prepareErr := self.prepareSendItem(
+		frames, acks, sendPack.Ack, nil, disposition, true,
+	)
+	if prepareErr != nil {
+		if self.sendContract != nil {
+			self.sendContract.rollbackUnwritten(messageByteCount)
+		}
+		if self.ctx.Err() == nil && (errors.Is(prepareErr, ErrSendPackNotAdmitted) ||
+			errors.Is(prepareErr, errPreparedSendMemoryUnavailable)) {
+			// Pinning and contract work may grow the bound, and another
+			// sequence can win shared bytes after eligibility. The exact
+			// cursor and every raw owner remain queued for the budget turn.
+			return false, true, true
+		}
+		sendPack.disposeUnsentGroup(prepareErr)
+		return true, errors.Is(prepareErr, errPreparedSendCanceled), false
+	}
+	// Until the taking serializer begins, the Pack owns frames and records;
+	// this guard owns only the independent, unpublished memory reservation.
+	ownPreparedItem := true
+	defer func() {
+		if ownPreparedItem {
+			item.acks = sendAckSet{}
+			self.returnSendItem(item)
+		}
+	}()
 	if withoutAckPromotion {
 		self.client.unreliableNoAckAdmissionBypassCount.Add(1)
 	}
-	if sendPack.groupCompletion == nil && end == len(sendPack.Frames) {
-		sendPack.groupFrameIndex = end
-		sendPack.serialized = true
-		self.sendGroupRecord(
-			sendPack.dispositionRange(start, end),
-			frames,
-			sendPack.ackRecord(),
-			sendPack.noAckRecord(),
-			sendPack.Ack,
-			sendPack.ForceUnwrapped,
-			sendPack.schedulingKey,
-		)
-		sendPack.releaseRaw()
-		return true, true, false
-	}
-	if sendPack.groupCompletion == nil {
-		chunkCount := sendGroupChunkCountWithLimits(
-			sendPack.Frames,
-			maxFrames,
-			maxMessageByteCount,
-		)
-		sendPack.groupCompletion = newSendGroupCompletion(sendPack, chunkCount)
-		if self.sendBuffer != nil &&
-			self.sendBuffer.afterCreateSendGroupCompletionForTest != nil {
-			self.sendBuffer.afterCreateSendGroupCompletionForTest(self.id(), chunkCount)
+	ackRecord, noAckRecord := sendPack.ackRecord(), sendPack.noAckRecord()
+	if sendPack.groupCompletion != nil || end < len(sendPack.Frames) {
+		if sendPack.groupCompletion == nil {
+			chunkCount := sendGroupChunkCountWithLimits(
+				sendPack.Frames,
+				maxFrames,
+				maxMessageByteCount,
+			)
+			sendPack.groupCompletion = newSendGroupCompletion(sendPack, chunkCount)
+			if self.sendBuffer != nil &&
+				self.sendBuffer.afterCreateSendGroupCompletionForTest != nil {
+				self.sendBuffer.afterCreateSendGroupCompletionForTest(self.id(), chunkCount)
+			}
 		}
+		ackRecord = sendPack.groupCompletion.chunkAckRecord()
+		noAckRecord = sendPack.groupCompletion.chunkNoAckRecord()
+	}
+	item.acks = sendAckSet{}
+	item.acks.add(ackRecord)
+	var noAckSends noAckSendSet
+	noAckSends.add(noAckRecord)
+	if !sendPack.Ack && self.client != nil {
+		self.client.sendNoAckWriteCount.Add(1)
 	}
 	sendPack.groupFrameIndex = end
 	sendPack.serialized = end == len(sendPack.Frames)
-	materialized := self.sendGroupRecord(
-		sendPack.dispositionRange(start, end),
-		frames,
-		sendPack.groupCompletion.chunkAckRecord(),
-		sendPack.groupCompletion.chunkNoAckRecord(),
-		sendPack.Ack,
-		sendPack.ForceUnwrapped,
-		sendPack.schedulingKey,
+	ownPreparedItem = false
+	self.sendPreparedWithSetContractDisposition(
+		frames, item, noAckSends, effectiveAck, false, sendPack.ForceUnwrapped,
+		sendPack.schedulingKey, nil, disposition, groupMemoryBytes,
 	)
-	if !materialized && end < len(sendPack.Frames) {
-		sendPack.disposeUnsentGroup(sendPack.dispositionRange(end, len(sendPack.Frames)).capacityError(ErrSendPackNotAdmitted))
-		return true, true, false
-	}
 	if end < len(sendPack.Frames) {
 		return false, true, false
 	}
@@ -9919,6 +9937,76 @@ sendSequenceLoop:
 					if bypassedRecoveryAdmission {
 						self.client.unreliableNoAckAdmissionBypassCount.Add(1)
 					}
+					if sendPack.Ack {
+						// Admitted reliable data keeps its original Packs until the
+						// post-contract aggregate reservation has actually succeeded.
+						// Control writes and requested NoAck retain their taking path.
+						var frameValues [sendPackH1GroupMaxFrames]*protocol.Frame
+						frames := sendPack.frameList()
+						if sendPackCount > 1 {
+							frames = frameValues[:0]
+							for packIndex := range sendPackCount {
+								frames = append(frames, sendPacks[packIndex].frameList()...)
+							}
+						}
+						var acks sendAckSet
+						var noAckSends noAckSendSet
+						for packIndex := range sendPackCount {
+							acks.add(sendPacks[packIndex].ackRecord())
+							noAckSends.add(sendPacks[packIndex].noAckRecord())
+						}
+						ownRecords := true
+						defer func() {
+							if ownRecords {
+								returnSendAckSetOverflow(acks.overflow)
+								returnNoAckSendSetOverflow(noAckSends.overflow)
+							}
+						}()
+						item, effectiveAck, groupMemoryBytes, prepareErr := self.prepareSendItem(
+							frames, acks, true, nil, sendGroupDisposition{}, true,
+						)
+						if prepareErr != nil {
+							if self.sendContract != nil {
+								self.sendContract.rollbackUnwritten(messageByteCount)
+							}
+							if self.ctx.Err() == nil && (errors.Is(prepareErr, ErrSendPackNotAdmitted) ||
+								errors.Is(prepareErr, errPreparedSendMemoryUnavailable)) {
+								// PushFront reverses insertion: restore every original in
+								// reverse order so no same-flow member crosses its sibling.
+								for packIndex := sendPackCount - 1; packIndex >= 0; packIndex-- {
+									scheduler.PushFront(sendPacks[packIndex])
+									processingPacks[packIndex] = nil
+								}
+								return !packsClosed
+							}
+							for packIndex := range sendPackCount {
+								sendPacks[packIndex].disposeUnsentGroup(prepareErr)
+								processingPacks[packIndex] = nil
+							}
+							return errors.Is(prepareErr, errPreparedSendCanceled) && !packsClosed
+						}
+						ownPreparedItem := true
+						defer func() {
+							if ownPreparedItem {
+								item.acks = sendAckSet{}
+								self.returnSendItem(item)
+							}
+						}()
+						for packIndex := range sendPackCount {
+							sendPacks[packIndex].serialized = true
+						}
+						ownRecords, ownPreparedItem = false, false
+						self.sendPreparedWithSetContractDisposition(
+							frames, item, noAckSends, effectiveAck, false,
+							sendPack.ForceUnwrapped, schedulingKey, nil,
+							sendGroupDisposition{}, groupMemoryBytes,
+						)
+						for packIndex := range sendPackCount {
+							sendPacks[packIndex].releaseRaw()
+							processingPacks[packIndex] = nil
+						}
+						return !packsClosed
+					}
 					// Serialization takes every frame and record at the call,
 					// on its refusal and an unwinding write too, so the slots
 					// keep only the Packs until their release below.
@@ -11193,9 +11281,9 @@ var errSendSequenceUnwound = errors.New("Send sequence closed.")
 // them once on every exit, its refusal, success, or a writer, observer or hook
 // that unwinds the sequence. Each claim below is cleared as its part is handed
 // on; the deferred release disposes only what an unwind left here.
-func (self *SendSequence) sendWithSetContractDisposition(
+func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	sendFrames []*protocol.Frame,
-	acks sendAckSet,
+	item *sendItem,
 	noAckSends noAckSendSet,
 	ack bool,
 	setContract bool,
@@ -11203,20 +11291,15 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	schedulingKey sendSchedulingKey,
 	aheadContract *sequenceContract,
 	disposition sendGroupDisposition,
+	groupMemoryBytes ByteCount,
 ) bool {
+	acks := item.acks
 	sendTime := time.Now()
 	messageId := NewId()
 
 	var contractId *Id
 	if self.sendContract != nil {
 		contractId = &self.sendContract.contractId
-
-		if !self.sendContractAcked {
-			// (see note above about contracts and nack)
-			// send nack messages as ack until the send contract is acked
-			// this avoid racing the messages with the contract
-			ack = true
-		}
 	}
 	var head bool
 	var sequenceNumber uint64
@@ -11232,8 +11315,6 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		head = false
 		sequenceNumber = 0
 	}
-	item := takeSendItem()
-	*item = sendItem{acks: acks}
 	ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem := true, true, true, true, true
 	defer func() {
 		if ownDisposition {
@@ -11257,60 +11338,10 @@ func (self *SendSequence) sendWithSetContractDisposition(
 			self.returnSendItem(item)
 		}
 	}()
-	groupMemoryBytes := disposition.memoryByteCount()
-	if disposition.target != nil && self.sendBufferSettings.beforeGroupRetainForTest != nil {
-		self.sendBufferSettings.beforeGroupRetainForTest()
-	}
-	admissionErr := item.acks.commitPreparedHandoffs(func() error {
-		if err := self.ctx.Err(); err != nil {
-			return err
-		}
-		if !ack || !self.resendQueue.lifetimeBudget {
-			return nil
-		}
-		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(sendFrames), len(sendFrames))
-		if aheadContract != nil {
-			frameByteCount = addReceiveQueueByteCount(frameByteCount, ByteCount(proto.Size(aheadContract.contract)))
-		}
-		if !item.reservePreparedMemory(self.resendQueue.budget,
-			addReceiveQueueByteCount(groupMemoryBytes,
-				item.retainedMemoryByteCount(frameByteCount, len(sendFrames), self.sendBufferSettings.ProtocolVersion < 2)),
-			&self.resendMemoryGrant) {
-			var credits [sendPackH1GroupMaxFrames]*preparedSendMemory
-			if item.acks.preparedMemories(self.resendQueue.budget, &credits) > 0 {
-				return errPreparedSendMemoryUnavailable
-			}
-			return disposition.capacityError(ErrSendPackNotAdmitted)
-		}
-		return nil
-	})
-	if admissionErr != nil {
-		// The refusal disposes every part itself.
-		ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem = false, false, false, false, false
-		disposition.complete(false)
-		// No frame has been allocated or published. A cross-flow loser
-		// returns every input and cannot leave a sequence/contract gap.
-		if ack {
-			self.nextSequenceNumber--
-		}
-		if self.sendContract != nil {
-			self.sendContract.rollbackUnwritten(MessageByteCount(sendFrames))
-		}
-		for _, frame := range sendFrames {
-			MessagePoolReturn(frame.MessageBytes)
-		}
-		item.acks.firstRouteWrite(admissionErr)
-		noAckSends.complete(admissionErr)
-		if noAckSends.count > 0 {
-			self.client.sendNoAckDiscardCount.Add(uint64(noAckSends.count))
-		}
-		item.acks.invoke(admissionErr)
-		self.returnSendItem(item)
-		return false
-	}
 	if ack {
 		disposition.retainMemory(item, groupMemoryBytes)
 	}
+
 	compactContractHead := head && self.sendContract != nil &&
 		self.sendContractAcked && self.sendBufferSettings.CompactContractHead &&
 		self.sendContract.compactContractRecoverySupported &&

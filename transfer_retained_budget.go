@@ -144,10 +144,17 @@ func (self *SendSequence) retainedSendPackByteCountWithContractBytes(pack *SendP
 }
 
 func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
+	if pack.logicalGroup && self.contractMultiRouteWriter != nil {
+		// Eligibility and materialization must describe the same H1 chunk.
+		// A first selection without a writer is rechecked atomically after
+		// opening it; established writers can pin before selection itself.
+		self.pinLogicalGroupChunkLimits(pack, self.transferFlightPolicy())
+	}
 	if !self.resendQueue.lifetimeBudget || self.resendQueue.budget == nil {
 		return true
 	}
 	required := self.retainedSendPackByteCount(pack)
+
 	if credit := pack.ackRecord().preparedMemory(); credit != nil {
 		credit.require(required)
 	}

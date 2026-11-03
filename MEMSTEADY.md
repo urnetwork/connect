@@ -1,5 +1,28 @@
 # Memory-budget performance research
 
+## 2026-11-03: retained-send custody and unchanged-budget throughput
+
+These receipts precede the checkpoint's incoming-origin sync; qualification of the merged source remains pending.
+
+A retained-memory reservation failure after admission was silently losing provider return chunks. The checkpoint prepares exact post-contract ownership before serialization and defers accepted reliable packets on transient pressure. It covers logical groups, raw singletons and coalesced inputs without raising budgets or changing RTOs. See [LOWBULKFLOW.md](LOWBULKFLOW.md) for the root cause, scope and independent-review corrections.
+
+With the same SDK32 configuration and 2 MiB provider retained budget, five synthetic H1 downloads improved from **2.385–13.631 Mbps** to **215.534–281.070 Mbps** on the extended fix; provider recoverable send-admission events fell from **1,169 to zero**. All runs joined. Route diversity differs across processes, so this is a local causal diagnostic, not a new statistical baseline or public Fast.com result. The 160-root normal/race cohort and separate signed-contract growth root pass. A focused allocation comparison is retained separately; no speculative descriptor optimization is included.
+
+| Pixel Wi-Fi observation using the earlier receive candidate | ios32 surrogate | Android64 |
+| --- | ---: | ---: |
+| Configured Go limit and admission target | 32 MiB | 64 MiB |
+| Receive leaf | 5 MiB | 10 MiB |
+| Observed Go-runtime peak | 27.81 MiB | 29.89 MiB |
+| Fast.com observation | 30 Mbps | 11 Mbps |
+
+These were different hosted-provider sessions, not a profile-speed comparison. Nine primitive samples spanned about 120 seconds; neither run included the canonical 330-second quiet qualification. The ios32 attempt failed a final host metadata deadline; Android64 completed. Both joined and showed no sampled Go-limit breach, but **zero of eight canonical cells are qualified**. Android app PSS is a separate, much larger measure and cannot establish a physical iOS extension footprint below 50 MiB. These observations also predate the final custody build.
+
+The new `memsteady-pixel-wifi` harness operation selects exactly the allowlisted Pixel's ios32 then Android64 cells and explicitly reports two-of-eight partial coverage. Its original traffic, drain, quiet, memory and teardown functions are byte-identical; 75 distinct host controls pass normally and under race. It does not replace the full eight-cell matrix. The next native build must include the newly tracked prepared-item source and a reviewed composition with the still-private receive candidate, followed by fresh device qualification.
+
+A larger H1 chunk policy remains research: six fresh unchanged-budget pairs improved a one-provider diagnostic by a median 25.48%, but phone memory, sparse/control latency and full compatibility qualification remain open. Preserve the 32/64 MiB targets rather than discounting retained allocation charges or filling memory merely to use the allowance.
+
+Evidence: `c49-source-postdocs-pixelobserved.PREP.bwf47al0/PIXEL-TWO-PROFILE-OBSERVATIONS.json`, SHA `17edf5c4f68e131c2056c4797d445dd4dad9f4303aa9fc0abced847ed9971308`; `pixel-selector-outer-race.PREP.0r165get/QUALIFICATION-SUMMARY.json`, SHA `b471b8559cfd691794b4e316f7ae79d239d106e2bed4c1428511f1e0b7ec2d34`, under the retained `/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj` campaign.
+
 ## 2026-10-26: native duplicate-ACK recovery checkpoint
 
 A local real-gVisor pilot exercised the full TUN/H1 path with GRO enabled, a verified **2 MiB** body and exactly one controlled first-segment loss after Transfer delivery. The effective constructor `ReturnResendTimeout` was **1 second in both arms**. The single normal pair measured:

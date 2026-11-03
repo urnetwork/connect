@@ -25,6 +25,7 @@ type windowRoundFrame struct {
 type windowRoundFixture struct {
 	t              *testing.T
 	ctx            context.Context
+	cancel         context.CancelFunc
 	sender         *Client
 	receiver       *Client
 	senderOut      Route
@@ -44,6 +45,7 @@ func newWindowRoundFixture(
 	t *testing.T,
 	configureSend func(*SendBufferSettings),
 	configureReceive func(*ReceiveBufferSettings),
+	sendCarrier ...TransportType,
 ) *windowRoundFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,6 +74,7 @@ func newWindowRoundFixture(
 	fixture := &windowRoundFixture{
 		t:           t,
 		ctx:         ctx,
+		cancel:      cancel,
 		sender:      NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings),
 		receiver:    NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings),
 		senderOut:   make(Route, 128),
@@ -81,7 +84,11 @@ func newWindowRoundFixture(
 	}
 	fixture.sender.ContractManager().AddNoContractPeer(fixture.receiver.ClientId())
 	fixture.receiver.ContractManager().AddNoContractPeer(fixture.sender.ClientId())
-	fixture.sender.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{fixture.senderOut})
+	sendTransport := NewSendGatewayTransport()
+	if len(sendCarrier) != 0 {
+		sendTransport = NewSendGatewayTransportWithType(sendCarrier[0])
+	}
+	fixture.sender.RouteManager().UpdateTransport(sendTransport, []Route{fixture.senderOut})
 	fixture.sender.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fixture.senderIn})
 	fixture.receiver.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{fixture.receiverOut})
 	fixture.receiver.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fixture.receiverIn})
