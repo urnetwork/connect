@@ -217,8 +217,8 @@ func (self *SendSequence) selectDueRecovery(
 				deadline = physicalDeadline
 			}
 		}
-		if !retainPastAckTimeout && deadline.After(item.sendTime.Add(item.ackTimeout)) {
-			deadline = item.sendTime.Add(item.ackTimeout)
+		if ackDeadline := self.ackLifetimeDeadline(item); !retainPastAckTimeout && deadline.After(ackDeadline) {
+			deadline = ackDeadline
 		}
 		if sendTime.Before(deadline) {
 			self.setResendTime(item, deadline)
@@ -497,8 +497,8 @@ func (self *SendSequence) writeSelectedRecovery(item *sendItem, selection sendRe
 		recoveryStart = self.windowPacer.waiter.sentAt
 	}
 	item.resendTime = recoveryStart.Add(itemResendTimeout)
-	if !retainPastAckTimeout && item.resendTime.After(item.sendTime.Add(item.ackTimeout)) {
-		item.resendTime = item.sendTime.Add(item.ackTimeout)
+	if ackDeadline := self.ackLifetimeDeadline(item); !retainPastAckTimeout && item.resendTime.After(ackDeadline) {
+		item.resendTime = ackDeadline
 	}
 	self.addResendItem(item)
 	// A paced recovery write can take a complete service interval.
