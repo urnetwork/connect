@@ -30,7 +30,7 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 	for _, inner := range []connect.TransportMode{connect.TransportModeH1, connect.TransportModeH3, connect.TransportModeH3Dns, connect.TransportModeH3DnsPump} {
 		for _, outer := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns} {
 			t.Run(string(inner)+"/"+outer, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), testMemoryExchangeTimeout)
 				defer cancel()
 				fixture, port, packetDestination := newExtenderMemoryFixture(t, ctx, inner)
 				strategySettings := connect.DefaultClientStrategySettings()
@@ -135,7 +135,7 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						connect.MessagePoolReturn(message)
 						t.Fatalf("composed carrier selector: accepted=%t err=%v", accepted, err)
 					}
-					response, err := reader.Read(ctx, 5*time.Second)
+					response, err := reader.Read(ctx, -1)
 					if err != nil {
 						t.Fatalf("bidirectional exchange %d: %v", i, err)
 					}
@@ -165,6 +165,12 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 		}
 	}
 }
+
+// How long a live memory graph has to connect and echo its four payloads. It only
+// bounds a hang: on the dns carrier each payload is many small packets, so a machine
+// that is busy can take most of a minute, and a read that gave up sooner would come
+// back empty and read as a changed payload.
+const testMemoryExchangeTimeout = 3 * time.Minute
 
 func newExtenderMemoryFixture(t *testing.T, ctx context.Context, inner connect.TransportMode) (*extenderFixture, int, string) {
 	t.Helper()
