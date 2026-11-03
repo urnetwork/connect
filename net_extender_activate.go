@@ -42,7 +42,12 @@ import (
 // family that works on every step of its backoff. A refusal that says when the
 // operator has room again (`retry_after_seconds`: a spent activation budget,
 // or an operator too busy to probe; connect#230) holds the family that long
-// instead, within a minute and six hours, and leaves its hold as it was. The
+// instead, within a minute and six hours, and leaves its hold as it was. A
+// refusal of the key as another network's (C2c) holds the family until its
+// tick, since no wait changes it, and tells the role, which makes a key of the
+// network's own when it can (OnRefused). So does a refusal of a family that has
+// not activated whose host is private, or that the operator's required test
+// found no answer from: a NAT or a firewall refuses every retry alike. The
 // ticks, the address check and the holds count the time the host slept, from
 // the first minute it is awake after a sleep of fifteen minutes or more.
 //
@@ -128,6 +133,92 @@ type ExtenderActivateResult struct {
 	// the operator has room for this family's next post (C2, connect#230). 0
 	// on every other answer, and from an operator that predates the field.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	// on a refusal an extender acts on, which one, an ExtenderActivateRefusal
+	// value (C2c). Empty on every other answer, and from an operator that
+	// predates the field, whose refusal says it in `Error` alone
+	// (KeyHeldByAnotherNetwork).
+	Refusal string `json:"refusal,omitempty"`
+	// every step the operator's probe ran, in the order run (C2b): the tcp
+	// carrier's challenge, the forward through it, each dns port, then quic.
+	// A refusal's last step is the one that refused it, unless the store
+	// refused after the probe passed. Empty on a refusal that probed nothing,
+	// and from an operator that predates the field.
+	ProbeSteps []*ExtenderActivateProbeStep `json:"probe_steps,omitempty"`
+}
+
+// One step of the operator's probe of an activation (C2b).
+type ExtenderActivateProbeStep struct {
+	// tcp, forward, dns or quic
+	Name string `json:"name"`
+	// the family the step dialed
+	IpVersion int `json:"ip_version,omitempty"`
+	// the extender port the step dialed; the forward names the tcp port it
+	// runs over
+	Port int `json:"port,omitempty"`
+	// how long the step ran, and how much of the probe's budget was left when
+	// it started
+	ElapsedMs    int64 `json:"elapsed_ms,omitempty"`
+	BudgetLeftMs int64 `json:"budget_left_ms,omitempty"`
+	// ok; error, the step failed on its own; or timeout, its budget ran out
+	// before it answered
+	Outcome string `json:"outcome"`
+}
+
+// The outcome of a probe step that passed (C2b).
+const extenderActivateProbeStepOk = "ok"
+
+// Whether the answer refuses the activation because the operator's required
+// test found no answer from this host on its tcp carrier (C2a): the tcp step,
+// the probe's first, failed or ran out of time. The operator's steps say so
+// when it sends them (C2b); one that predates them says so in the words of
+// `Error` (ExtenderActivateRefusalUnreachable). A host the internet cannot reach
+// on its tcp port -- a NAT that does not forward it, a firewall that keeps the
+// internet out -- is refused alike at every retry, and the status says what it
+// needs (the sdk's `activation_unreachable`).
+func (self *ExtenderActivateResult) RequiredTestUnreachable() bool {
+	if self == nil || self.Activated {
+		return false
+	}
+	if 0 < len(self.ProbeSteps) {
+		last := self.ProbeSteps[len(self.ProbeSteps)-1]
+		return last != nil && last.Name == ExtenderCarrierTcp && last.Outcome != extenderActivateProbeStepOk
+	}
+	return ExtenderActivateRefusalUnreachable(self.Error)
+}
+
+// Whether a refusal's words are the operator's for its required test finding no
+// answer from the host on the tcp carrier (C2a, C2b): "the tcp carrier did not
+// answer ..." when its budget ran out first, "the tcp carrier failed after ..."
+// when it failed on its own.
+func ExtenderActivateRefusalUnreachable(message string) bool {
+	return strings.HasPrefix(message, "the tcp carrier did not answer") ||
+		strings.HasPrefix(message, "the tcp carrier failed")
+}
+
+// The refusals an extender acts on (C2c).
+const (
+	// The key is registered to another network, which no activation of this
+	// network moves and no wait changes. The extender needs a key of this
+	// network's own.
+	ExtenderActivateRefusalKeyOtherNetwork = "key_other_network"
+)
+
+// How every version of the operator's refusal of a key another network holds
+// begins (C2c). An operator that predates `refusal` says it this way alone.
+const extenderActivateKeyOtherNetworkError = "This extender key is registered to another network"
+
+// Whether the answer refuses this key because another network holds it (C2c):
+// no post of this key for this network can pass, whatever it offers or however
+// long it waits. The operator's `refusal` says so when it sends one; an
+// operator that predates it says so in the fixed text of `Error`.
+func (self *ExtenderActivateResult) KeyHeldByAnotherNetwork() bool {
+	if self == nil || self.Activated {
+		return false
+	}
+	if self.Refusal != "" {
+		return self.Refusal == ExtenderActivateRefusalKeyOtherNetwork
+	}
+	return strings.HasPrefix(self.Error, extenderActivateKeyOtherNetworkError)
 }
 
 // PostExtenderActivate posts one activation to one family api url (C2). The
@@ -233,6 +324,12 @@ type ExtenderActivatorSettings struct {
 	// updated from it (D2, G4). It runs on the loop goroutine and must not
 	// block.
 	OnActivated func(ipVersion int, result *ExtenderActivateResult)
+	// OnRefused runs after each answer of one family that refused the
+	// activation, with that answer, once the status records it. The role reads
+	// what it can act on from it: a key another network holds wants a key of
+	// this network's own (C2c, KeyHeldByAnotherNetwork). It runs on the loop
+	// goroutine and must not block.
+	OnRefused func(ipVersion int, result *ExtenderActivateResult)
 
 	// MeasurementCsr, when set, is asked for the measurement certificate
 	// request a post carries (lag.dev/PLAN.md C4): the base64 DER request
@@ -1288,6 +1385,24 @@ const (
 	extenderActivateActivated
 )
 
+// What one post, or one family's turn in a pass, came to, as its schedule
+// reads it.
+type extenderActivateAnswer struct {
+	outcome extenderActivateOutcome
+	// whether the post delivered the measurement request, which only a post
+	// that activated does (C4)
+	carried bool
+	// on a refusal, the wait the operator named for the family's next post
+	// (`retry_after_seconds`, connect#230), 0 for none
+	retryAfter time.Duration
+	// on a refusal, whether the operator refused the key as another network's
+	// (C2c), which no wait changes
+	keyOtherNetwork bool
+	// on a refusal, whether the operator's required test found no answer from
+	// this host on the tcp carrier (C2a, RequiredTestUnreachable)
+	unreachable bool
+}
+
 // Posts the families in `due`, in key order, and moves each one's schedule by
 // its own outcome (G3): a success to its tick, a failure onto its own hold,
 // and a family with no address on this host to a look again after the floor.
@@ -1312,6 +1427,22 @@ const (
 // it published the family after its probes passed (ownRecordNamesFamily). The
 // schedules move once every post of the pass has been answered, so the record
 // another family's answer brought counts too.
+//
+// A family with a public address that has not activated is held so too when
+// the operator's required test found no answer from it (RequiredTestUnreachable):
+// a firewall that keeps the internet out, or a router that does not forward
+// the port to a host it gives a public address, refuses every retry alike, as
+// the NAT does, and the status says what the extender needs (decided
+// 2026-11-03, support inbox 8154: stop retrying and explain). A network
+// change, a revocation and the role's restart
+// still post it at once, and its tick once a day, so a host whose port is
+// opened activates within the day. Its other refusals, and every refusal of a
+// family that has activated, are held on the backoff as before.
+//
+// A refusal of the key as another network's (C2c) is held until the tick too:
+// no post of this key for this network can pass however long it waits, so the
+// backoff would only repeat the refusal. The role makes a key of the network's
+// own on it when it can (OnRefused), and a trigger still posts at once.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	carriers := self.carriers()
 	dnsPorts := self.dnsPorts()
@@ -1320,25 +1451,23 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	followUp := self.measurementFollowUp
 	self.measurementFollowUp = false
 
-	outcomes := make([]extenderActivateOutcome, len(due))
-	// the wait each refusal named for its family's next post, if any
-	retryAfters := make([]time.Duration, len(due))
+	answers := make([]extenderActivateAnswer, len(due))
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	for i, key := range due {
-		var carried bool
 		if self.fallback {
-			outcomes[i], carried, retryAfters[i] = self.activateFallback(carriers, dnsPorts, now)
+			answers[i] = self.activateFallback(carriers, dnsPorts, now)
 		} else {
-			outcomes[i], carried, retryAfters[i] = self.activateFamily(key, carriers, dnsPorts, measurementCarried, now)
+			answers[i] = self.activateFamily(key, carriers, dnsPorts, measurementCarried, now)
 		}
-		measurementCarried = measurementCarried || carried
+		measurementCarried = measurementCarried || answers[i].carried
 	}
 
 	activated := []int{}
 	for i, key := range due {
 		schedule := self.schedules[key]
-		if outcomes[i] == extenderActivateInterrupted {
+		answer := answers[i]
+		if answer.outcome == extenderActivateInterrupted {
 			continue
 		}
 		schedule.carrierHeld = false
@@ -1346,7 +1475,7 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 		schedule.postedDnsPorts = nil
 		schedule.carrierPostTime = time.Time{}
 		schedule.carrierTickTime = time.Time{}
-		switch outcome := outcomes[i]; {
+		switch outcome := answer.outcome; {
 		case outcome == extenderActivateCarrierHeld:
 			schedule.holdForCarrier(now, self.settings)
 		case outcome == extenderActivateActivated:
@@ -1356,22 +1485,27 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 			activated = append(activated, key)
 		case outcome == extenderActivateSkipped:
 			schedule.recheck(now, self.settings)
-		case outcome == extenderActivateRefused && 0 < retryAfters[i]:
+		case outcome == extenderActivateRefused && 0 < answer.retryAfter:
 			// the operator said when it has room again (C2, connect#230): a
 			// spent activation budget, or an operator too busy to probe. It
 			// probed nothing, so the refusal says nothing about this host,
 			// private or not: the family waits that long, within
 			// MinRetryAfter and MaxBackoff, and its hold stays as it was
 			schedule.nextActivateTime = now.Add(min(
-				max(retryAfters[i], self.settings.MinRetryAfter),
+				max(answer.retryAfter, self.settings.MinRetryAfter),
 				self.settings.MaxBackoff,
 			))
+		case outcome == extenderActivateRefused && answer.keyOtherNetwork:
+			// another network holds the key (C2c), which no wait changes: the
+			// family waits for its tick, and its hold stays as it was
+			schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
 		case outcome == extenderActivateRefused &&
 			!self.fallback &&
 			!schedule.activatedInRun &&
 			!self.ownRecordNamesFamily(key) &&
-			!self.ipVersionPublic(key):
-			// a NAT that never forwarded refuses every retry alike, so the
+			(answer.unreachable || !self.ipVersionPublic(key)):
+			// a NAT that never forwarded, or a host the operator's required
+			// test found no answer from, refuses every retry alike, so the
 			// family waits for its tick; its hold stays as it was
 			schedule.nextActivateTime = now.Add(self.settings.ActivateTimeout)
 		default:
@@ -1408,23 +1542,24 @@ func (self *ExtenderActivator) activateFamily(
 	dnsPorts []int,
 	measurementCarried bool,
 	now time.Time,
-) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
+) extenderActivateAnswer {
 	if !self.ipVersionSupported(ipVersion) {
 		// a family with no global address on this host cannot be probed
 		// back, so it is skipped rather than refused (G3)
-		return extenderActivateSkipped, false, 0
+		return extenderActivateAnswer{outcome: extenderActivateSkipped}
 	}
 	if message := extenderActivateCarrierFailure(carriers); message != "" {
 		self.recordCarrierHeld(ipVersion, now, message)
-		return extenderActivateCarrierHeld, false, 0
+		return extenderActivateAnswer{outcome: extenderActivateCarrierHeld}
 	}
 	// one request a pass, on the first post that can carry it (C4)
 	measurementCsr := ""
 	if !measurementCarried {
 		measurementCsr = self.measurementCsr()
 	}
-	outcome, retryAfter = self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, dnsPorts, measurementCsr, now)
-	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
+	answer := self.activateUrl(ipVersion, self.apiUrl(ipVersion), carriers, dnsPorts, measurementCsr, now)
+	answer.carried = answer.outcome == extenderActivateActivated && measurementCsr != ""
+	return answer
 }
 
 // Why these carriers cannot be offered to the operator, empty when they can
@@ -1525,25 +1660,26 @@ func (self *ExtenderActivator) ipVersionPublic(ipVersion int) bool {
 // without one is (G3). The one post carries the measurement request when one
 // is wanted and this extender's id is known, and whether it delivered one
 // comes back with the outcome (C4).
-func (self *ExtenderActivator) activateFallback(carriers []string, dnsPorts []int, now time.Time) (outcome extenderActivateOutcome, carried bool, retryAfter time.Duration) {
+func (self *ExtenderActivator) activateFallback(carriers []string, dnsPorts []int, now time.Time) extenderActivateAnswer {
 	if !self.ipVersionSupported(4) && !self.ipVersionSupported(6) {
-		return extenderActivateSkipped, false, 0
+		return extenderActivateAnswer{outcome: extenderActivateSkipped}
 	}
 	if message := extenderActivateCarrierFailure(carriers); message != "" {
 		self.recordCarrierHeld(0, now, message)
-		return extenderActivateCarrierHeld, false, 0
+		return extenderActivateAnswer{outcome: extenderActivateCarrierHeld}
 	}
 	measurementCsr := self.measurementCsr()
-	outcome, retryAfter = self.activateUrl(0, self.fallbackApiUrl(), carriers, dnsPorts, measurementCsr, now)
-	return outcome, outcome == extenderActivateActivated && measurementCsr != "", retryAfter
+	answer := self.activateUrl(0, self.fallbackApiUrl(), carriers, dnsPorts, measurementCsr, now)
+	answer.carried = answer.outcome == extenderActivateActivated && measurementCsr != ""
+	return answer
 }
 
 // Posts one activation and records what came back (C2). `ipVersion` is the
 // family the outcome belongs to; 0 takes it from the answer, which is the
 // fallback mode. `measurementCsr` is the request the post carries, empty for
 // none (C4). A refusal that names when the operator has room again
-// (`retry_after_seconds`, C2) returns that wait with it; every other outcome
-// returns none.
+// (`retry_after_seconds`, C2) returns that wait with it, and one of the key as
+// another network's (C2c) says so; every other outcome returns neither.
 func (self *ExtenderActivator) activateUrl(
 	ipVersion int,
 	apiUrl string,
@@ -1551,7 +1687,7 @@ func (self *ExtenderActivator) activateUrl(
 	dnsPorts []int,
 	measurementCsr string,
 	now time.Time,
-) (extenderActivateOutcome, time.Duration) {
+) extenderActivateAnswer {
 	runStartTime := self.settings.Run.StartTime.UTC()
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
@@ -1588,17 +1724,17 @@ func (self *ExtenderActivator) activateUrl(
 	)
 	if err != nil {
 		if self.ctx.Err() != nil {
-			return extenderActivateInterrupted, 0
+			return extenderActivateAnswer{outcome: extenderActivateInterrupted}
 		}
 		// the causes of every attempt, which an exhausted request's own
 		// message hides (connect#229)
 		self.log.Infof("[extender]activate v%d err = %s\n", ipVersion, httpRequestErrorWithCauses(err))
 		self.recordFailure(ipVersion, now, err.Error(), false)
-		return extenderActivateFailed, 0
+		return extenderActivateAnswer{outcome: extenderActivateFailed}
 	}
 	if result == nil {
 		self.recordFailure(ipVersion, now, "the operator sent no activation result", false)
-		return extenderActivateFailed, 0
+		return extenderActivateAnswer{outcome: extenderActivateFailed}
 	}
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)
@@ -1616,7 +1752,15 @@ func (self *ExtenderActivator) activateUrl(
 			self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
 		}
 		self.recordFailure(ipVersion, now, message, true)
-		return extenderActivateRefused, retryAfter
+		if self.settings.OnRefused != nil {
+			self.settings.OnRefused(ipVersion, result)
+		}
+		return extenderActivateAnswer{
+			outcome:         extenderActivateRefused,
+			retryAfter:      retryAfter,
+			keyOtherNetwork: result.KeyHeldByAnotherNetwork(),
+			unreachable:     result.RequiredTestUnreachable(),
+		}
 	}
 
 	// the operator's id of this extender, the same at every activation, which
@@ -1634,7 +1778,7 @@ func (self *ExtenderActivator) activateUrl(
 		// an activation with no family cannot be attributed to one, and the
 		// mesh address of D2 has no family to be published under
 		self.recordFailure(ipVersion, now, "the operator named no address family", false)
-		return extenderActivateFailed, 0
+		return extenderActivateAnswer{outcome: extenderActivateFailed}
 	}
 	if moved := self.recordSuccess(ipVersion, now, result); moved {
 		// the address the last check saw on this family was read against
@@ -1646,7 +1790,7 @@ func (self *ExtenderActivator) activateUrl(
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
-	return extenderActivateActivated, 0
+	return extenderActivateAnswer{outcome: extenderActivateActivated}
 }
 
 // The family an activation answer belongs to: what the operator reported, else

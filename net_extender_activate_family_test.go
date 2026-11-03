@@ -39,7 +39,11 @@ import (
 // hello, the pass barrier: the hello of a pass proves the pass before it
 // finished.
 
-const testActivateFamilyRefusal = "the tcp carrier did not answer"
+// A refusal of a step of the probe that reached the host, which the backoff
+// holds on a public family. A refusal of the tcp step, which found no answer,
+// holds a public family that has not activated for the day instead
+// (net_extender_activate_unreachable_test.go).
+const testActivateFamilyRefusal = "the forward did not answer"
 
 // Wakes the loop, waits for the hello that begins the pass it starts, and
 // returns that pass's first post. Consuming the hello keeps the next step's
