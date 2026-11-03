@@ -354,6 +354,8 @@ func TestMultiClientH1ResidenceCumulativeAckOracle(t *testing.T) {
 // Pin the exact captured predecessor progress, rather than treating it as an
 // end-to-end receipt for the still-held request. The 34.369973417s classifier
 // eligibility is not an execution timestamp: the real 1.25s poll owns that.
+// The same predecessor ACK advances the cumulative head, which renews a 30s
+// request's lifetime to that instant; the lifetime, not the poll, ends it.
 // BusyProbe remains enabled and admits one real IpPing Pack. Its unresolved
 // callback holds the early watchdog before the single-exit sibling gate; local
 // H1 serialization is not a remote verdict or a synthetic probe ACK.
@@ -505,19 +507,32 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					t.Fatalf("independent same-peer stream did not recover the existing request: receipts=%d stats=%+v", f.requests.Load(), stats)
 				}
 				advance(30 * time.Second)
+				// The predecessor's ACK advanced the sequence's cumulative head at
+				// predecessorAt. The request's lifetime runs from that advance as
+				// well as from its send (f25be1b2, connect PR #231), and with the
+				// head stopped there it ends exactly one lifetime later.
+				lifetimeEnd := predecessorAt + tc.lifetime
 				if !survives && tc.lifetime == 30*time.Second {
+					if _, err = channel.WindowStats(); err != nil || channel.IsDone() {
+						t.Fatalf("the head's advance did not renew the request's lifetime: %v", err)
+					}
+					advance(lifetimeEnd - time.Nanosecond)
+					if _, err = channel.WindowStats(); err != nil || channel.IsDone() {
+						t.Fatalf("flow terminated before its renewed lifetime: %v", err)
+					}
+					advance(lifetimeEnd)
 					_, err = channel.WindowStats()
 					if err == nil || !strings.Contains(err.Error(), "Send sequence closed.") {
 						t.Fatalf("30s logical owner did not terminate: %v", err)
 					}
-					if got := time.Duration(f.requestFailureAt.Load() - start.UnixNano()); got != 30*time.Second {
+					if got := time.Duration(f.requestFailureAt.Load() - start.UnixNano()); got != lifetimeEnd {
 						t.Fatalf("physical replacement changed the absolute request lifetime: %s", got)
 					}
-					// ACK expiry and the 30s poll can be ready together. The
-					// callback's 30s verdict is exact; joining health is bounded by
-					// one unchanged poll, not by select ordering at the tie.
-					advance(30*time.Second + channel.settings.BlackholePollInterval)
-					if !channel.IsDone() || healthAt.Load() < int64(30*time.Second) || healthAt.Load() > int64(30*time.Second+channel.settings.BlackholePollInterval) {
+					// ACK expiry and a poll can be ready together. The callback's
+					// verdict is exact; joining health is bounded by one unchanged
+					// poll, not by select ordering at the tie.
+					advance(lifetimeEnd + channel.settings.BlackholePollInterval)
+					if !channel.IsDone() || healthAt.Load() < int64(lifetimeEnd) || healthAt.Load() > int64(lifetimeEnd+channel.settings.BlackholePollInterval) {
 						t.Fatalf("health did not join the terminal request within one poll: at=%s", time.Duration(healthAt.Load()))
 					}
 				} else if !survives {
