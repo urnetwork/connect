@@ -1482,6 +1482,9 @@ func (self *ExtenderServer) IsAllowedSecret(header *protocol.ExtenderHeader) boo
 	return false
 }
 
+// A name the operator wrote out is matched as it is. A name a `*.` pattern admits is the
+// client's own in front of the suffix, so it must be a host name as well, as a proxied
+// name must (A5).
 func (self *ExtenderServer) IsAllowedHost(host string) bool {
 	_, err := idna.ToUnicode(host)
 	if err != nil {
@@ -1493,7 +1496,7 @@ func (self *ExtenderServer) IsAllowedHost(host string) bool {
 			return true
 		}
 		if strings.HasPrefix(allowedHost, "*.") {
-			if strings.HasSuffix(host, allowedHost[1:]) {
+			if strings.HasSuffix(host, allowedHost[1:]) && isHostName(strings.ToLower(host)) {
 				return true
 			}
 		}
