@@ -39,6 +39,15 @@ type extenderHandler struct {
 func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	server := self.server
 
+	// each http server's own record of a panic names the client or repeats the
+	// value, and none of them records this one, which ends the request the same way
+	defer func() {
+		if r := recover(); r != nil {
+			server.reportHandlerPanic(r)
+			panic(http.ErrAbortHandler)
+		}
+	}()
+
 	if !isExtenderRequest(req) {
 		// everything that is not the extender protocol looks like an ordinary
 		// host to whoever asked (A5)
