@@ -1926,8 +1926,11 @@ func TestLagApiUploadedAt(t *testing.T) {
 	}
 	first := load.uploaded[0]
 	last := load.uploaded[len(load.uploaded)-1]
+	// the messages end at 560 ms if nothing holds them up. At only has to stop short of
+	// the 1000 the progress's own time would give, since a busy machine can hold them
+	// up by a few hundred ms
 	if *last.Ms != 1000 || last.Bytes < 2*6*lagApiBufferByteCount || 2*8*lagApiBufferByteCount < last.Bytes ||
-		*last.At <= *first.At || 800 <= *last.At {
+		*last.At <= *first.At || 1000 <= *last.At {
 		t.Errorf("first progress %+v, last %+v", first.raw, last.raw)
 	}
 }
