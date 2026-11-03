@@ -7964,6 +7964,10 @@ paths:
         has replaced stays listed while it has an account, since URnetwork keeps
         claiming it.
 
+        An account whose latest claim URnetwork sent names that claim's
+        transaction, `claim_tx_hash`, and what it paid, `claim_amount_rao`. A
+        claim anyone else sends after it, the device's own included, ends that.
+
         `state` is the relay's: `running`; `cap_reached`; `in_flight`, a claim's
         outcome is not final yet; `no_key`, no relayer key is configured, so the
         relay reads and sends nothing; `bad_key`; `not_configured`; `not_running`,
@@ -21917,6 +21921,13 @@ components:
           type: integer
           format: int64
           description: When this coldkey's Claim now limit ends, unix milliseconds; absent when none holds.
+        claim_tx_hash:
+          type: string
+          description: The transaction of the account's latest claim when URnetwork's relay sent it, while the relay has it on record, about 30 days. Absent for a claim anyone else sent, or before any claim.
+        claim_amount_rao:
+          type: integer
+          format: int64
+          description: What that claim paid, in rao of α; absent without claim_tx_hash.
     SnClaimRelayError:
       type: object
       required: [message]
