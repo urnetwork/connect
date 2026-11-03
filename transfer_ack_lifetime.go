@@ -123,19 +123,35 @@ func (self *sequenceAckWindow) pendingDeliveryFor(sequenceNumber uint64, message
 // anchored to the actual reply arrival, never to the time this check runs.
 // Zero means no valid renewal; contract requests still do not prove delivery.
 func (self *SendSequence) pendingAckLifetime(item *sendItem) (bool, time.Time) {
+	progressDeadline := self.ackProgressDeadline(item)
 	if self.ackWindow == nil {
-		return false, time.Time{}
+		return false, progressDeadline
 	}
 	delivered, receivedAtNanos := self.ackWindow.pendingLifetimeFeedback(item)
 	if delivered || receivedAtNanos == 0 {
-		return delivered, time.Time{}
+		return delivered, progressDeadline
 	}
 	renewedAt := time.Unix(0, receivedAtNanos)
 	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
 		base := self.client.feedbackTimeBase
 		renewedAt = base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
 	}
-	return false, renewedAt.Add(item.ackTimeout)
+	renewedDeadline := renewedAt.Add(item.ackTimeout)
+	if renewedDeadline.Before(progressDeadline) {
+		renewedDeadline = progressDeadline
+	}
+	return false, renewedDeadline
+}
+
+// An advancing cumulative head proves the receiver is alive and the flight is
+// draining in order, so a message still waiting behind it has not been lost to
+// a dead path. Its lifetime runs from the last advance. A head that stops gets
+// no renewal and the sequence expires as before. Zero means no head has advanced.
+func (self *SendSequence) ackProgressDeadline(item *sendItem) time.Time {
+	if self.lastHeadAckTime.IsZero() {
+		return time.Time{}
+	}
+	return self.lastHeadAckTime.Add(item.ackTimeout)
 }
 
 // Future deadlines are constant-time reads. At expiry, reconcile only the due
