@@ -115,10 +115,8 @@ func (self *InProcessListener) Handle(conn net.Conn) {
 	default:
 		// the mesh is not keeping up with new connections; refusing is the
 		// only bounded answer, since this runs on the extender's connection
-		// goroutine
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[gossip]accept queue is full, refusing %s\n", conn.RemoteAddr())
-		}
+		// goroutine. The line names no address, which is a client's (G2).
+		self.log.V(1).Infof("[gossip]accept queue is full, refusing a connection\n")
 		return
 	}
 	select {

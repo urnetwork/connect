@@ -28,6 +28,8 @@ package gossip
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -110,6 +112,23 @@ func (self *FeedServer) Close() {
 	self.cancel()
 }
 
+// What the log says of a request that could not be read: which kind of failure it was,
+// from a fixed set, and never the error's own text, which for a carrier's socket names both
+// of its ends and so the client's address (EXTENDER.md G2).
+func feedRequestErrorClass(err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "the stream ended before the request"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "the request did not arrive in time"
+	case errors.Is(err, net.ErrClosed):
+		return "the stream was closed"
+	default:
+		return "the request could not be read"
+	}
+}
+
 // Serve runs one feed stream to completion (A8, D4). It returns when the
 // sample is served and the client did not subscribe, when the client goes
 // away, when the subscription falls behind, or when the server is closed.
@@ -120,7 +139,7 @@ func (self *FeedServer) Serve(conn net.Conn) {
 	request, err := connect.ReadExtenderFeedRequest(conn)
 	if err != nil {
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[gossip]feed request err = %s\n", err)
+			self.log.Infof("[gossip]feed request err = %s\n", feedRequestErrorClass(err))
 		}
 		return
 	}
