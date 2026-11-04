@@ -10406,16 +10406,16 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	// admits it, and this message takes the successor.
 	if self.sendContract != nil && self.sendContractRetiring(time.Now()) {
 		retiredContract := self.sendContract
-		if self.log.V(1).Enabled() {
-			self.log.Infof(
-				"[s]%s->%s...%s s(%s) contract %s retires ahead of its deadline\n",
-				self.client.ClientTag(),
-				self.contractIntermediaryIds(),
-				self.destination,
-				self.contractMultiRouteWriterAlias.StreamId,
-				retiredContract.contractId,
-			)
-		}
+		// At most once per contract life, and only on a sequence too quiet to
+		// fill its contract: the one trace that the deadline was met in time.
+		self.log.Infof(
+			"[s]%s->%s...%s s(%s) contract %s retires ahead of its deadline\n",
+			self.client.ClientTag(),
+			self.contractIntermediaryIds(),
+			self.destination,
+			self.contractMultiRouteWriterAlias.StreamId,
+			retiredContract.contractId,
+		)
 		self.sendContract = nil
 		self.preparedContractByteCount.Store(0)
 		self.sendContractAcked = false
