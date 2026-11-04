@@ -622,6 +622,19 @@ type MultiClientSettings struct {
 	// turns it on only once the owner approves it for apps (CPUOPT3 D2, owner
 	// question 5).
 	StrictWindowHandover bool
+	// Holds a discovery window's refill while the payer's balance refuses
+	// its contracts (see ip_remote_multi_client_balance_hold.go). After a
+	// refusal with InsufficientBalance, an expansion step sends one contract
+	// probe through the generator (MultiClientGeneratorBalanceProbe) instead
+	// of building candidates, on the same expansion backoff. A granted
+	// contract or a probe that cannot answer releases it, and the window
+	// expands as before. No timing bound changes. Fixed destinations, and
+	// generators without the probe, are unaffected.
+	//
+	// Off by default, which keeps building candidates whose contracts the
+	// balance refuses. A host opts in: the proxy service turns it on for its
+	// hosted devices (server CPUOPT4.md, Part B #1).
+	OutOfBalanceRefillProbe bool
 	// When set, the process's counters of what the windows do with their
 	// window clients (see
 	// ip_remote_multi_client_window_client_stats.go). A host that runs many
@@ -12304,7 +12317,10 @@ type multiClientWindow struct {
 	// Expansion pacing of a discovery window after passes that admitted
 	// nothing. Guarded by stateLock. See
 	// ip_remote_multi_client_discovery_retry.go.
-	discoveryRetry         discoveryExpandRetry
+	discoveryRetry discoveryExpandRetry
+	// Whether the payer's balance holds the refill. Guarded by stateLock. See
+	// ip_remote_multi_client_balance_hold.go.
+	balanceHold            windowBalanceHold
 	discoveryDemand        discoveryAcquisitionDemand
 	discoveryDemandChanged *Monitor
 	// A strict window's current expansion pass: the candidates the
@@ -12981,6 +12997,7 @@ func (self *multiClientWindow) contractStatusFromClient(client *multiClientChann
 			}
 		})
 	}
+	self.noteContractStatusForBalanceHold(status)
 
 	self.contractStatus(status)
 }
@@ -13198,7 +13215,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a strict window at its hard max with no handover to fill lists
 			// and mints nothing until an expansion asks again; a family-swap
 			// probe still asks before the window gives anything up
-			if !probeOnly && !self.strictDiscoveryAdmissible() {
+			// a window the payer's balance holds lists and mints nothing
+			// either; the probe in its expansion step releases it
+			if !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld()) {
 				demandRead = self.waitDiscoveryDemand(generatorNotify, true)
 				if self.ctx.Err() != nil {
 					return
@@ -13297,7 +13316,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					continue
 				}
 
-				if demandRead == nil && !probeOnly && !self.strictDiscoveryAdmissible() {
+				if demandRead == nil && !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld()) {
 					return
 				}
 				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
@@ -14181,7 +14200,15 @@ func (self *multiClientWindow) resize() {
 		if len(clients) < targetWindowSize && redialDeferred {
 			windowClientStats.addExpandPass(self.windowType, windowExpandPassDeferred)
 		}
-		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred {
+		// While the payer's balance refuses the window's contracts, the step
+		// sends one probe instead of building candidates; a restored balance
+		// expands in this same pass (see
+		// ip_remote_multi_client_balance_hold.go)
+		balanceHeld := false
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !fixedDestination {
+			balanceHeld = self.probeBalanceHold(windowClientStats)
+		}
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !balanceHeld {
 			// expand
 			expandPass := windowExpandPassPlan{
 				state: windowExpandPassStateOf(
