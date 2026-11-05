@@ -987,9 +987,11 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		DeferTimeoutResendBackoff:          true,
 		ReliableTimerUsesDeviation:         false,
 		ReliableLaneProvenRecovery:         false,
-		// the whole signed contract: every receiver admits it, and nothing
-		// reads a headroom (FILLFRACTION.md)
-		ContractFillFraction: 1.0,
+		// Acknowledged traffic moves to the next contract at 0.9 of the signed
+		// size. The last tenth is headroom that no-acknowledgement Packs ride
+		// while the successor's acknowledged introduction is in flight
+		// (SendBufferSettings.ContractFillFraction, FILLFRACTION.md).
+		ContractFillFraction: 0.9,
 		// THROUGHPUTFIX §39.1. Two round trips of delivery, which is the
 		// candidate the campaign measures the smallest sufficient multiple
 		// against, and the same scale the window rule uses. The floor is the
@@ -1983,10 +1985,15 @@ type ClientSendRecoveryStatsSnapshot struct {
 	// the Packs carried on the acknowledged lane because their contract was
 	// unacknowledged: after the change only a sequence's opening contract,
 	// which no acknowledgement has introduced yet, promotes.
-	NoAckContractAdvanceCount             uint64
-	NoAckContractHoldCount                uint64
-	NoAckContractExpiredCount             uint64
-	NoAckContractPromotedCount            uint64
+	NoAckContractAdvanceCount  uint64
+	NoAckContractHoldCount     uint64
+	NoAckContractExpiredCount  uint64
+	NoAckContractPromotedCount uint64
+	// FILLFRACTION.md. No-acknowledgement Packs charged to a contract's
+	// headroom, the share above ContractFillFraction, while the next
+	// contract's acknowledged introduction was in flight. Each is one that
+	// would otherwise have waited at the boundary.
+	NoAckContractHeadroomCount            uint64
 	SelectiveGapWriteCount                uint64
 	AckTailProbeWriteCount                uint64
 	CumulativeProbeWriteCount             uint64
@@ -2198,6 +2205,7 @@ type Client struct {
 	noAckContractHoldCount              atomic.Uint64
 	noAckContractExpiredCount           atomic.Uint64
 	noAckContractPromotedCount          atomic.Uint64
+	noAckContractHeadroomCount          atomic.Uint64
 	ackTailProbeWriteCount              atomic.Uint64
 	cumulativeProbeWriteCount           atomic.Uint64
 	recoveryWriteErrorCount             atomic.Uint64
@@ -2620,6 +2628,7 @@ func (self *Client) SendRecoveryStats() ClientSendRecoveryStatsSnapshot {
 		NoAckContractHoldCount:                 self.noAckContractHoldCount.Load(),
 		NoAckContractExpiredCount:              self.noAckContractExpiredCount.Load(),
 		NoAckContractPromotedCount:             self.noAckContractPromotedCount.Load(),
+		NoAckContractHeadroomCount:             self.noAckContractHeadroomCount.Load(),
 		SendEvictionResendCount:                self.sendEvictionResendCount.Load(),
 		SelectiveGapWriteCount:                 self.selectiveGapWriteCount.Load(),
 		AckTailProbeWriteCount:                 self.ackTailProbeWriteCount.Load(),
@@ -5742,21 +5751,31 @@ type SendBufferSettings struct {
 	forceContractFailureForTest func(sendSequenceId) bool
 	forceResendForTest          func(sendSequenceId) bool
 
-	// The share of a send contract's signed transfer byte count this sender
-	// charges before it moves to the next contract, in (0, 1]. Receivers admit
-	// the whole signed size (they build receive contracts with 1.0), so a
-	// value below one leaves that share of every full contract escrowed and
-	// never carried.
+	// The share of a send contract's signed transfer byte count that
+	// acknowledged traffic charges before the sequence moves to the next
+	// contract, in (0, 1]. The rest of the signed size is headroom kept for
+	// no-acknowledgement Packs during a contract switch. Receivers admit the
+	// whole signed size (they build receive contracts with 1.0).
 	//
-	// The headroom once protected no-acknowledgement Packs, which carried no
-	// contract id and were charged to whatever contract the receiver held
-	// current: during a switch the predecessor absorbed the successor's
-	// datagrams. They carry the contract id now and the receiver resolves it
-	// exactly, sender and receiver count the same bytes (data frames, one
-	// minimum message for a control Pack, duplicates dropped before the
-	// debit), and a no-acknowledgement Pack advances to the next contract
-	// itself (FILLFRACTION.md), so nothing reads the headroom. One is the
-	// default; a lower value remains available per owner.
+	// Why the headroom exists (FILLFRACTION.md):
+	//   - No-acknowledgement Packs may arrive out of order with a new contract.
+	//   - A new contract is introduced to the receiver by an acknowledged Pack,
+	//     its contract-only head or its announcement.
+	//   - A no-acknowledgement Pack that names a contract whose introduction
+	//     the receiver has not received yet is dropped there ("drop nack
+	//     contract mismatch"). So such a Pack may name only a contract the
+	//     receiver has acknowledged.
+	//   - While the successor's introduction is in flight, the previous
+	//     contract needs spare capacity to keep carrying no-acknowledgement
+	//     traffic. The receiver keeps accepting it under that contract, which
+	//     it keeps open after superseding it (MaxOpenReceiveContract).
+	//   - With no headroom (1.0), that traffic has no contract the receiver
+	//     accepts until the introduction is acknowledged. It waits at the
+	//     boundary, and is dropped once its deadline passes.
+	//
+	// TestAReceiverDropsANoAckThatOvertakesItsContractUnlessThePredecessorHasHeadroom
+	// and TestNoAckRidesThePredecessorsHeadroomThroughADelayedContractIntroduction
+	// pin this. The default is 0.9.
 	ContractFillFraction float32
 
 	// THROUGHPUTFIX §39.1, the acknowledged-ahead half of contract
@@ -7013,6 +7032,22 @@ type SendSequence struct {
 	// contract boundary, so the loop wakes for its deadline. Owned by the
 	// sequence goroutine.
 	noAckContractHoldActive bool
+	// FILLFRACTION.md. The acknowledged contract this sequence moved away from
+	// while its successor's acknowledged introduction is still in flight. It is
+	// kept open and unretired, so no-acknowledgement Packs can keep riding its
+	// headroom (the share above ContractFillFraction) under a contract the
+	// receiver holds. It is retired once the successor is acknowledged, when
+	// the next switch replaces it, or when the path changes. Its set time and
+	// metadata generation are the ones it had as the current contract. Owned
+	// by the sequence goroutine.
+	noAckHeadroomContract                   *sequenceContract
+	noAckHeadroomContractSetTime            time.Time
+	noAckHeadroomContractMetadataGeneration uint64
+	// The contract whose headroom the debit in progress charged, from the
+	// debit until its Pack is serialized or the debit is rolled back. That
+	// Pack names this contract and is never promoted. Owned by the sequence
+	// goroutine.
+	noAckHeadroomCharge *sequenceContract
 	// The manager's queued-contract generation when an announcement that was
 	// due found nothing queued, and whether one did. The queue is looked at
 	// again only once the generation moves, so a sequence waiting for its
@@ -8455,17 +8490,13 @@ func (self *SendSequence) processLogicalGroupChunk(
 		end = nextSendGroupChunkEndWithLimits(sendPack.Frames, start, maxFrames, maxMessageByteCount)
 		frames = sendPack.Frames[start:end]
 		boundedMessageByteCount := MessageByteCount(frames)
-		if self.sendContract != nil {
-			self.sendContract.reduceUnwrittenDebit(messageByteCount, boundedMessageByteCount)
-		}
+		self.reduceUnwrittenContractDebit(messageByteCount, boundedMessageByteCount)
 		messageByteCount = boundedMessageByteCount
 	}
 	if envelopePolicy.h1Only && envelopePolicy.h1MaxMessageByteCount > 0 {
 		boundedEnd, envelopeErr := self.boundH1LogicalGroup(sendPack, envelopePolicy.h1MaxMessageByteCount)
 		if envelopeErr != nil {
-			if self.sendContract != nil {
-				self.sendContract.rollbackUnwritten(messageByteCount)
-			}
+			self.rollbackUnwrittenContractDebit(messageByteCount)
 			var err error = errSendPackH1Envelope
 			if start == 0 && sendPack.groupCompletion == nil {
 				err = newUnwrittenSendPackError(err)
@@ -8477,9 +8508,7 @@ func (self *SendSequence) processLogicalGroupChunk(
 		frames = sendPack.Frames[start:end]
 		maxFrames, maxMessageByteCount = sendPack.groupChunkLimits()
 		boundedMessageByteCount := MessageByteCount(frames)
-		if self.sendContract != nil {
-			self.sendContract.reduceUnwrittenDebit(messageByteCount, boundedMessageByteCount)
-		}
+		self.reduceUnwrittenContractDebit(messageByteCount, boundedMessageByteCount)
 		messageByteCount = boundedMessageByteCount
 	}
 	var acks sendAckSet
@@ -8489,9 +8518,7 @@ func (self *SendSequence) processLogicalGroupChunk(
 		frames, acks, sendPack.Ack, nil, disposition, true,
 	)
 	if prepareErr != nil {
-		if self.sendContract != nil {
-			self.sendContract.rollbackUnwritten(messageByteCount)
-		}
+		self.rollbackUnwrittenContractDebit(messageByteCount)
 		if self.ctx.Err() == nil && (errors.Is(prepareErr, ErrSendPackNotAdmitted) ||
 			errors.Is(prepareErr, errPreparedSendMemoryUnavailable)) {
 			// Pinning and contract work may grow the bound, and another
@@ -9406,12 +9433,16 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 	if self.client.ContractManager().SendNoContract(self.destination) {
 		return true
 	}
+	byteCount := sendPack.nextSerializedMessageByteCount()
+	// the headroom of a contract the receiver holds (FILLFRACTION.md)
+	if self.noAckHeadroomCarrier(byteCount) != nil {
+		return true
+	}
 	metadata := self.contractMetadata()
 	if self.sendContract == nil || !self.sendContractAcked ||
 		self.sendContractMetadataGeneration != metadata.generation {
 		return false
 	}
-	byteCount := sendPack.nextSerializedMessageByteCount()
 	return self.sendContractCanUpdate(byteCount) ||
 		self.aheadSendContractCanCarryNoAck(byteCount)
 }
@@ -9455,6 +9486,88 @@ func (self *SendSequence) noAckContractIntroductionPending() bool {
 		!ahead.expired()
 }
 
+// FILLFRACTION.md. The acknowledged contract whose headroom can carry a
+// no-acknowledgement Pack of `byteCount` now, or nil. It is one of:
+//   - the acknowledged predecessor, kept open while the current contract,
+//     opened or switched to by acknowledged traffic, is still unacknowledged;
+//   - the acknowledged current contract, past its fill, while its announced
+//     successor is still unacknowledged.
+//
+// The receiver holds either contract, so it accepts a Pack that names it
+// however that Pack is ordered against the successor's acknowledged
+// introduction. A Pack that named the successor before the receiver had it
+// would be dropped there ("drop nack contract mismatch").
+func (self *SendSequence) noAckHeadroomCarrier(byteCount ByteCount) *sequenceContract {
+	generation := self.contractMetadata().generation
+	now := time.Now()
+	usable := func(contract *sequenceContract, setTime time.Time) bool {
+		if contract == nil || contract.expired() {
+			return false
+		}
+		if retireTime, ok := self.contractRetireTime(contract, setTime); ok && !now.Before(retireTime) {
+			return false
+		}
+		return contract.canUpdateNoAckHeadroom(byteCount)
+	}
+	if carrier := self.noAckHeadroomContract; carrier != nil &&
+		self.noAckHeadroomContractMetadataGeneration == generation &&
+		self.sendContract != nil && !self.sendContractAcked &&
+		usable(carrier, self.noAckHeadroomContractSetTime) {
+		return carrier
+	}
+	if self.sendContract != nil && self.sendContractAcked &&
+		self.sendContractMetadataGeneration == generation {
+		ahead := self.aheadSendContract
+		if ahead != nil && !ahead.acknowledgedAhead &&
+			self.aheadSendContractMetadataGeneration == generation &&
+			!ahead.expired() &&
+			usable(self.sendContract, self.sendContractSetTime) {
+			return self.sendContract
+		}
+	}
+	return nil
+}
+
+// Retires the headroom contract once its headroom has done its part: the
+// successor is acknowledged, a later switch replaces it, or the path changed.
+// The Packs it carried stay attributed to it, and it closes once nothing it
+// carries is outstanding.
+func (self *SendSequence) endNoAckHeadroom() {
+	carrier := self.noAckHeadroomContract
+	if carrier == nil {
+		return
+	}
+	self.noAckHeadroomContract = nil
+	if carrier != self.sendContract {
+		self.retireSendContract(carrier)
+	}
+}
+
+// Rolls back the debit in progress, unwritten, on the contract it charged:
+// the headroom contract when the debit rode the headroom, otherwise the
+// current contract.
+func (self *SendSequence) rollbackUnwrittenContractDebit(byteCount ByteCount) {
+	if charge := self.noAckHeadroomCharge; charge != nil {
+		self.noAckHeadroomCharge = nil
+		charge.rollbackUnwrittenNoAckHeadroom(byteCount)
+		return
+	}
+	if self.sendContract != nil {
+		self.sendContract.rollbackUnwritten(byteCount)
+	}
+}
+
+// Shrinks the debit in progress on the contract it charged.
+func (self *SendSequence) reduceUnwrittenContractDebit(original ByteCount, reduced ByteCount) {
+	if charge := self.noAckHeadroomCharge; charge != nil {
+		charge.reduceUnwrittenNoAckHeadroomDebit(original, reduced)
+		return
+	}
+	if self.sendContract != nil {
+		self.sendContract.reduceUnwrittenDebit(original, reduced)
+	}
+}
+
 // Records that this no-acknowledgement Pack waits at a contract boundary:
 // counted once per Pack, and the loop wakes for its caller's deadline.
 func (self *SendSequence) markNoAckContractHeld(sendPack *SendPack) {
@@ -9490,6 +9603,11 @@ func (self *SendSequence) noAckPackHeldAtContract(sendPack *SendPack, now time.T
 		return false
 	}
 	if self.aheadSendContractCanCarryNoAck(byteCount) {
+		return false
+	}
+	// the headroom carries it while the introduction is in flight; only once
+	// the headroom is used up does a Pack wait at the boundary
+	if self.noAckHeadroomCarrier(byteCount) != nil {
 		return false
 	}
 	return self.noAckContractIntroductionPending()
@@ -9584,6 +9702,15 @@ func (self *SendSequence) Run() {
 		// sequence that is closing
 		self.retireNoAckFastPath()
 		self.joinNoAckContractWriters()
+
+		// An announced successor that nothing rode still holds its opening
+		// reservation, which no Pack carried and the receiver never counted
+		// (FILLFRACTION.md §4). Release it, so the two parties close it with
+		// the same count.
+		if ahead := self.aheadSendContract; ahead != nil && ahead.openingReserved {
+			ahead.openingReserved = false
+			ahead.rollbackUnwritten(0)
+		}
 
 		// close contract
 		for _, sendContract := range self.openSendContracts {
@@ -10324,9 +10451,7 @@ sendSequenceLoop:
 								break
 							}
 							if sendPackCount == 1 {
-								if self.sendContract != nil {
-									self.sendContract.rollbackUnwritten(originalMessageByteCount)
-								}
+								self.rollbackUnwrittenContractDebit(originalMessageByteCount)
 								sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errSendPackH1Envelope))
 								processingPacks[0] = nil
 								return !packsClosed
@@ -10341,9 +10466,7 @@ sendSequenceLoop:
 							processingPacks[sendPackCount] = nil
 							sendPacks[sendPackCount] = nil
 						}
-						if self.sendContract != nil {
-							self.sendContract.reduceUnwrittenDebit(originalMessageByteCount, messageByteCount)
-						}
+						self.reduceUnwrittenContractDebit(originalMessageByteCount, messageByteCount)
 					}
 					if bypassedRecoveryAdmission {
 						self.client.unreliableNoAckAdmissionBypassCount.Add(1)
@@ -10377,9 +10500,7 @@ sendSequenceLoop:
 							frames, acks, true, nil, sendGroupDisposition{}, true,
 						)
 						if prepareErr != nil {
-							if self.sendContract != nil {
-								self.sendContract.rollbackUnwritten(messageByteCount)
-							}
+							self.rollbackUnwrittenContractDebit(messageByteCount)
 							if self.ctx.Err() == nil && (errors.Is(prepareErr, ErrSendPackNotAdmitted) ||
 								errors.Is(prepareErr, errPreparedSendMemoryUnavailable)) {
 								// PushFront reverses insertion: restore every original in
@@ -10827,6 +10948,8 @@ func (self *SendSequence) updateContractForMode(
 	messageByteCount ByteCount,
 	mode sendContractUpdateMode,
 ) (updated bool, deferForRecoveryAdmission bool, err error) {
+	// a headroom charge belongs to one debit and its one Pack
+	self.noAckHeadroomCharge = nil
 	if mode == sendContractUpdateNoAckAdvance && !self.sendContractEverAcknowledged {
 		// the opening: nothing the receiver holds exists yet for this Pack to
 		// ride, and the head it opens with carries it in order
@@ -10850,6 +10973,7 @@ func (self *SendSequence) updateContractForMode(
 		// contract accounting when its ack arrives.
 		// do not close the current contract unless it has no pending data;
 		// the contract is tracked in `openSendContracts` and will be closed on ack
+		self.endNoAckHeadroom()
 		if self.sendContract != nil {
 			self.retireSendContract(self.sendContract)
 			self.sendContract = nil
@@ -10859,6 +10983,11 @@ func (self *SendSequence) updateContractForMode(
 	}
 
 	metadata := self.contractMetadata()
+	// a headroom contract on an earlier path cannot carry this path's Packs
+	if self.noAckHeadroomContract != nil &&
+		self.noAckHeadroomContractMetadataGeneration != metadata.generation {
+		self.endNoAckHeadroom()
+	}
 	// Promotion changes the contract path required by every future pack. Keep
 	// an obsolete head only in openSendContracts so outstanding ACK accounting
 	// can finish; it must not debit or authenticate this promoted pack merely
@@ -10923,6 +11052,15 @@ func (self *SendSequence) updateContractForMode(
 		}
 		self.maybeRequestSuccessorContract(messageByteCount)
 		self.maybeAnnounceContractAhead()
+		return true, false, nil
+	}
+	// The headroom (FILLFRACTION.md). No-acknowledgement Packs may arrive out
+	// of order with a new contract, and a new contract is introduced with an
+	// acknowledged Pack. So while the next contract's introduction is in
+	// flight, this Pack rides the share above the fill of a contract the
+	// receiver already holds, instead of waiting at the boundary. It names
+	// that contract and is never promoted.
+	if !allowAckPromotion && self.chargeNoAckHeadroom(messageByteCount) {
 		return true, false, nil
 	}
 	if mode == sendContractUpdateNoAckBypass {
@@ -11198,14 +11336,34 @@ func (self *SendSequence) updateContractForMode(
 		if !ok {
 			return false, false, contractErr
 		}
-		// opened, with its contract-only head in flight: this Pack rides it
-		// once the receiver acknowledges the head
+		// Opened, with its contract-only head in flight. Meanwhile the
+		// acknowledged predecessor's headroom carries this Pack
+		// (FILLFRACTION.md). Without room there, it rides the new contract
+		// once the receiver acknowledges the head.
 		if self.client != nil {
 			self.client.noAckContractAdvanceCount.Add(1)
+		}
+		if self.chargeNoAckHeadroom(messageByteCount) {
+			return true, false, nil
 		}
 		return false, true, nil
 	}
 	return ok, false, contractErr
+}
+
+// Charges a no-acknowledgement Pack to the headroom of the contract that can
+// carry it (`noAckHeadroomCarrier`), and records the charge for the Pack's
+// serialization and any rollback. Reports whether it charged.
+func (self *SendSequence) chargeNoAckHeadroom(messageByteCount ByteCount) bool {
+	carrier := self.noAckHeadroomCarrier(messageByteCount)
+	if carrier == nil || !carrier.updateNoAckHeadroom(messageByteCount) {
+		return false
+	}
+	self.noAckHeadroomCharge = carrier
+	if self.client != nil {
+		self.client.noAckContractHeadroomCount.Add(1)
+	}
+	return true
 }
 
 func nextCreateContractRetryInterval(current time.Duration, maximum time.Duration) time.Duration {
@@ -11691,6 +11849,8 @@ func (self *SendSequence) setAheadContract(messageByteCount ByteCount) bool {
 	self.sendContractAcked = acknowledgedAhead
 	self.sendContractFrameDue = true
 	if acknowledgedAhead {
+		// the successor is already acknowledged, so no headroom is needed
+		self.endNoAckHeadroom()
 		self.sendContractEverAcknowledged = true
 		// `setContract` withdrew the fast path with the predecessor; the
 		// successor is one a caller may charge at once
@@ -11712,7 +11872,21 @@ func (self *SendSequence) setContract(
 	// do not close the current contract unless it has no pending data
 	// the contract is tracked in `openSendContracts` and will be closed on ack
 	if self.sendContract != nil && self.sendContract != nextSendContract {
-		self.retireSendContract(self.sendContract)
+		previous := self.sendContract
+		// one switch's headroom at a time: an older one has done its part
+		self.endNoAckHeadroom()
+		if self.sendContractAcked && !previous.expired() &&
+			previous.minUpdateByteCount <= previous.noAckHeadroomRemainingByteCount() {
+			// FILLFRACTION.md. The receiver holds the predecessor and keeps it
+			// open after the switch, so it stays unretired while the successor
+			// is introduced. No-acknowledgement Packs ride its headroom until
+			// the successor is acknowledged (`noAckHeadroomCarrier`).
+			self.noAckHeadroomContract = previous
+			self.noAckHeadroomContractSetTime = self.sendContractSetTime
+			self.noAckHeadroomContractMetadataGeneration = self.sendContractMetadataGeneration
+		} else {
+			self.retireSendContract(previous)
+		}
 	}
 	self.openSendContracts[nextSendContract.contractId] = nextSendContract
 	self.sendContract = nextSendContract
@@ -11780,6 +11954,10 @@ func (self *SendSequence) setContractAcked(nextSendContract *sequenceContract, a
 		self.sendContractAcked = ack
 		if ack {
 			self.sendContractEverAcknowledged = true
+			// The receiver holds the successor now. No-acknowledgement Packs
+			// advance to it, and the predecessor's headroom has done its part
+			// (FILLFRACTION.md).
+			self.endNoAckHeadroom()
 		}
 		// the moment the contract is acknowledged is the moment a caller may
 		// charge it (THROUGHPUTFIX §38.12)
@@ -11983,7 +12161,12 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	messageId := NewId()
 
 	var contractId *Id
-	if self.sendContract != nil {
+	if charge := self.noAckHeadroomCharge; !ack && charge != nil {
+		// a headroom debit names the contract it charged, one the receiver
+		// holds (FILLFRACTION.md)
+		self.noAckHeadroomCharge = nil
+		contractId = &charge.contractId
+	} else if self.sendContract != nil {
 		contractId = &self.sendContract.contractId
 	}
 	var head bool
@@ -13844,8 +14027,9 @@ func (self *SendSequence) ackItem(item *sendItem) {
 				// a different contract's proof and retain their own callback.
 				self.setContractAcked(itemSendContract, true)
 			}
-			// not current and closed
-			if self.sendContract != itemSendContract {
+			// not current and closed. The headroom contract stays open while
+			// it carries the switch (FILLFRACTION.md).
+			if self.sendContract != itemSendContract && self.noAckHeadroomContract != itemSendContract {
 				self.retireSendContract(itemSendContract)
 			}
 		}
@@ -17926,6 +18110,16 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 
 	if contractId != nil {
 		if _, ok := self.openReceiveContracts[*contractId]; !ok {
+			// FILLFRACTION.md. This is where a no-acknowledgement Pack that
+			// overtakes its contract's acknowledged introduction is lost: it
+			// names a contract this receiver does not hold yet, and nothing
+			// retries it. That is why a sender never puts no-acknowledgement
+			// traffic on a contract the receiver has not acknowledged. While
+			// the next contract is introduced, the sender keeps that traffic in
+			// the headroom of the previous contract, which this receiver still
+			// holds (see setContract).
+			// TestAReceiverDropsANoAckThatOvertakesItsContractUnlessThePredecessorHasHeadroom.
+			//
 			// Fixed-size identities distinguish a wrong contract reference from
 			// an empty or split receive lane without dumping signed proof bytes.
 			currentContractId := Id{}
@@ -18389,6 +18583,15 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		return nil
 	}
 
+	// FILLFRACTION.md. A superseded contract stays in `openReceiveContracts`,
+	// and admits up to its signed size, after the switch on either path above.
+	// That is what lets the sender keep no-acknowledgement traffic in the
+	// predecessor's headroom while it introduces the successor. Those Packs
+	// may arrive here before or after the successor's acknowledged
+	// introduction, and either way they are accepted under the contract they
+	// name. Receivers have kept this window (MaxOpenReceiveContract) since
+	// 2024. TestNoAckRidesThePredecessorsHeadroomThroughADelayedContractIntroduction.
+	//
 	// a genuinely new (typically larger) contract supersedes the current one.
 	// Close the superseded contract's STATS now so it stops showing as an open
 	// contract, mirroring the send side, which closes a drained predecessor in
@@ -18703,6 +18906,13 @@ type sequenceContract struct {
 	// Timed-out sends remain unacknowledged for reporting, but no longer
 	// own a retransmission that could keep an obsolete contract open.
 	abandonedByteCount ByteCount
+	// FILLFRACTION.md. The bytes charged to the headroom above
+	// effectiveTransferByteCount, by no-acknowledgement Packs only, while the
+	// next contract was being introduced. Counted apart from ordinary debits:
+	// ordinary and fast-path debits stay within the effective size, and
+	// headroom debits within the headroom, so together they never pass the
+	// signed size. Send side only; owned by the sequence goroutine.
+	noAckHeadroomByteCount ByteCount
 	// Activated by the send owner on first NoAck snapshot publication. Every
 	// later snapshot and ordinary debit reserves this same atomic headroom;
 	// delayed caller accounting therefore cannot be spent by another owner.
@@ -18940,6 +19150,69 @@ func (self *sequenceContract) ack(byteCount ByteCount) {
 
 	self.unackedByteCount -= effectiveByteCount
 	self.ackedByteCount += effectiveByteCount
+}
+
+// FILLFRACTION.md. Room left in the contract's headroom: the share of its
+// signed size above the effective size, less what headroom debits have
+// already used.
+func (self *sequenceContract) noAckHeadroomRemainingByteCount() ByteCount {
+	return max(0, self.transferByteCount-self.effectiveTransferByteCount-self.noAckHeadroomByteCount)
+}
+
+// Whether a no-acknowledgement Pack of `byteCount` fits the headroom, with
+// the contract's total still within its signed size.
+func (self *sequenceContract) canUpdateNoAckHeadroom(byteCount ByteCount) bool {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+	return !self.expired() &&
+		effectiveByteCount <= self.noAckHeadroomRemainingByteCount() &&
+		self.ackedByteCount+self.unackedByteCount+effectiveByteCount <= self.transferByteCount
+}
+
+// Debits a no-acknowledgement Pack to the headroom. Only the sequence
+// goroutine calls this, and only while the next contract's acknowledged
+// introduction is in flight (`SendSequence.noAckHeadroomCarrier`). It never
+// touches the published fast-path budget, which covers the effective size
+// only.
+func (self *sequenceContract) updateNoAckHeadroom(byteCount ByteCount) bool {
+	if !self.canUpdateNoAckHeadroom(byteCount) {
+		return false
+	}
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+	self.unackedByteCount += effectiveByteCount
+	self.noAckHeadroomByteCount += effectiveByteCount
+	if self.statsEntry != nil {
+		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
+	}
+	return true
+}
+
+// An admission failure before wire publication returns the headroom it took.
+func (self *sequenceContract) rollbackUnwrittenNoAckHeadroom(byteCount ByteCount) {
+	effectiveByteCount := max(self.minUpdateByteCount, byteCount)
+	if self.unackedByteCount < effectiveByteCount || self.noAckHeadroomByteCount < effectiveByteCount {
+		panic("unwritten transfer contract headroom debit missing")
+	}
+	self.unackedByteCount -= effectiveByteCount
+	self.noAckHeadroomByteCount -= effectiveByteCount
+	if self.statsEntry != nil {
+		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
+	}
+}
+
+// Refunds the difference between two minimum-clamped headroom debits.
+func (self *sequenceContract) reduceUnwrittenNoAckHeadroomDebit(original ByteCount, reduced ByteCount) {
+	if reduced < 0 || original < reduced {
+		panic("unwritten transfer debit must only shrink")
+	}
+	refund := max(self.minUpdateByteCount, original) - max(self.minUpdateByteCount, reduced)
+	if self.unackedByteCount < refund || self.noAckHeadroomByteCount < refund {
+		panic("unwritten transfer contract headroom debit missing")
+	}
+	self.unackedByteCount -= refund
+	self.noAckHeadroomByteCount -= refund
+	if self.statsEntry != nil {
+		self.statsEntry.updateUsedByteCount(self.ackedByteCount + self.unackedByteCount)
+	}
 }
 
 type ForwardBufferSettings struct {

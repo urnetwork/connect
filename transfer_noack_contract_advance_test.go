@@ -2,7 +2,10 @@ package connect
 
 // FILLFRACTION.md. A no-acknowledgement Pack advances its sequence's contract
 // itself, the way an acknowledged Pack does, without being promoted onto the
-// acknowledged lane to do it; and a send contract fills to its signed size.
+// acknowledged lane to do it. Acknowledged traffic stops at the fill
+// (ContractFillFraction, 0.9), and the headroom above it carries
+// no-acknowledgement traffic while the next contract is introduced
+// (transfer_noack_contract_headroom_test.go).
 //
 // The root causes these rows pin, as the tree before the change had them:
 //
@@ -15,8 +18,8 @@ package connect
 //     successor ahead: the announcement returned whenever no reliable item was
 //     outstanding (maybeAnnounceContractAhead), which on such a sequence is
 //     always, so every boundary opened its successor unacknowledged;
-//   - the sender stopped every contract at ContractFillFraction, 0.8, of its
-//     signed size, though every receiver accepts the whole contract.
+//   - nothing ever charged the headroom above the fill, the one share of a
+//     contract that a no-acknowledgement Pack can ride during a switch.
 //
 // Each row reads the cause rather than a symptom of it, and the composed rows
 // read it at the public send entry and on the wire between two real clients.
@@ -169,13 +172,17 @@ func TestANoAckOnlySequenceAnnouncesItsSuccessorAhead(t *testing.T) {
 	}
 }
 
-// The fill fraction. The sender charged every message against
-// `transferByteCount * ContractFillFraction` and refused the rest of the
-// contract, while every receiver since the fraction was introduced admits the
-// whole signed size (newSequenceContract with 1.0 on the receive side). The
-// fifth of every full contract was escrowed and never carried.
-func TestASendContractFillsToItsSignedSize(t *testing.T) {
+// The fill fraction (FILLFRACTION.md). Acknowledged and ordinary traffic
+// stops at `transferByteCount * ContractFillFraction`, 0.9 by default. The
+// rest of the signed size is headroom that only no-acknowledgement Packs
+// charge, during a switch, so the contract's total can reach its signed size
+// with no-acknowledgement traffic and never pass it. A rollback returns
+// headroom, never the fast path's budget.
+func TestAcknowledgedTrafficStopsAtTheFillAndTheHeadroomCarriesNoAckToTheSignedSize(t *testing.T) {
 	settings := DefaultSendBufferSettings()
+	if settings.ContractFillFraction != 0.9 {
+		t.Fatalf("the default fill fraction is %.2f, want 0.9", settings.ContractFillFraction)
+	}
 	sourceId, destinationId := NewId(), NewId()
 	contract := noAckAdvanceTestContract(t, sourceId, destinationId, mib(1))
 	sendContract, err := newSequenceContract(
@@ -188,14 +195,29 @@ func TestASendContractFillsToItsSignedSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sendContract.update(mib(1)) {
-		t.Fatalf(
-			"the sender refused to fill its contract: %d of %d signed bytes may be sent (ContractFillFraction %.2f)",
-			sendContract.effectiveTransferByteCount, sendContract.transferByteCount, settings.ContractFillFraction,
-		)
+	fill := sendContract.effectiveTransferByteCount
+	if want := ByteCount(float32(mib(1)) * 0.9); fill != want {
+		t.Fatalf("the fill is %d of %d signed bytes, want %d", fill, sendContract.transferByteCount, want)
 	}
-	if sendContract.canUpdate(1) {
-		t.Error("the sender may send past the contract's signed size")
+	if !sendContract.update(fill) {
+		t.Fatal("ordinary traffic was refused before the fill")
+	}
+	if sendContract.update(1) {
+		t.Fatal("ordinary traffic was charged past the fill")
+	}
+	headroom := sendContract.transferByteCount - fill
+	if !sendContract.updateNoAckHeadroom(headroom) {
+		t.Fatalf("the headroom refused %d bytes of no-ack traffic", headroom)
+	}
+	if used := sendContract.ackedByteCount + sendContract.unackedByteCount; used != sendContract.transferByteCount {
+		t.Fatalf("the contract carries %d bytes, want its signed %d", used, sendContract.transferByteCount)
+	}
+	if sendContract.canUpdateNoAckHeadroom(1) || sendContract.updateNoAckHeadroom(1) {
+		t.Fatal("the headroom charged a byte past the signed size")
+	}
+	sendContract.rollbackUnwrittenNoAckHeadroom(headroom)
+	if remaining := sendContract.noAckHeadroomRemainingByteCount(); remaining != headroom {
+		t.Fatalf("a rolled-back headroom debit left %d of %d headroom bytes", remaining, headroom)
 	}
 }
 
@@ -375,9 +397,19 @@ type noAckAdvanceFixture struct {
 	signedContracts      map[Id]ByteCount
 	dropAnnouncements    int
 	droppedAnnouncements int
-	routes               []Route
-	pumps                sync.WaitGroup
-	closed               bool
+	// FILLFRACTION.md. When set, every acknowledged Pack that introduces a
+	// contract (an announcement, or any Pack carrying a contract frame) is
+	// held in the network this long. No-acknowledgement Packs are not held,
+	// so they overtake it: they arrive out of order with the new contract.
+	introductionDelay    time.Duration
+	delayedIntroductions int
+	// the first contract the pump saw, the opening's, whose own
+	// introduction is never delayed
+	firstContractId   Id
+	haveFirstContract bool
+	routes            []Route
+	pumps             sync.WaitGroup
+	closed            bool
 }
 
 func newNoAckAdvanceFixture(t *testing.T, configure ...func(*ClientSettings)) *noAckAdvanceFixture {
@@ -456,13 +488,26 @@ func newNoAckAdvanceFixture(t *testing.T, configure ...func(*ClientSettings)) *n
 							}
 						}
 						drop := false
+						delay := time.Duration(0)
 						f.stateLock.Lock()
+						introducesSuccessor := pack.ContractAhead
 						if contractId, transferByteCount, ok := noAckAdvanceSignedContract(pack.ContractFrame); ok {
 							f.signedContracts[contractId] = transferByteCount
+							if !f.haveFirstContract {
+								f.firstContractId = contractId
+								f.haveFirstContract = true
+							}
+							if contractId != f.firstContractId {
+								introducesSuccessor = true
+							}
 						}
 						if pack.ContractAhead && f.droppedAnnouncements < f.dropAnnouncements {
 							f.droppedAnnouncements += 1
 							drop = true
+						}
+						if !pack.Nack && 0 < f.introductionDelay && introducesSuccessor {
+							delay = f.introductionDelay
+							f.delayedIntroductions += 1
 						}
 						for _, frame := range pack.Frames {
 							if frame.MessageType != protocol.MessageType_TestSimpleMessage {
@@ -482,6 +527,26 @@ func newNoAckAdvanceFixture(t *testing.T, configure ...func(*ClientSettings)) *n
 						f.stateLock.Unlock()
 						if drop {
 							MessagePoolReturn(wire)
+							continue
+						}
+						if 0 < delay {
+							// the pump itself holds a count, so this Add never
+							// races the close's Wait
+							f.pumps.Add(1)
+							go func(wire []byte) {
+								defer f.pumps.Done()
+								select {
+								case <-time.After(delay):
+								case <-ctx.Done():
+									MessagePoolReturn(wire)
+									return
+								}
+								select {
+								case output <- wire:
+								case <-ctx.Done():
+									MessagePoolReturn(wire)
+								}
+							}(wire)
 							continue
 						}
 					}

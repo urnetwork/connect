@@ -18,7 +18,10 @@ func (self *SendSequence) prepareSendItem(
 	queuedInput bool,
 ) (item *sendItem, effectiveAck bool, groupMemoryBytes ByteCount, err error) {
 	groupMemoryBytes = disposition.memoryByteCount()
-	effectiveAck = ack || self.sendContract != nil && !self.sendContractAcked
+	effectiveAck = ack || self.sendContract != nil && !self.sendContractAcked &&
+		// a headroom debit rides a contract the receiver holds, never the
+		// acknowledged lane (FILLFRACTION.md)
+		self.noAckHeadroomCharge == nil
 	item = takeSendItem()
 	*item = sendItem{acks: acks}
 	prepared := false
@@ -94,9 +97,7 @@ func (self *SendSequence) sendWithSetContractDisposition(
 	item, effectiveAck, groupMemoryBytes, err := self.prepareSendItem(frames, acks, ack, aheadContract, disposition, false)
 	if err != nil {
 		ownInput = false
-		if self.sendContract != nil {
-			self.sendContract.rollbackUnwritten(MessageByteCount(frames))
-		}
+		self.rollbackUnwrittenContractDebit(MessageByteCount(frames))
 		disposition.complete(false)
 		for _, frame := range frames {
 			MessagePoolReturn(frame.MessageBytes)

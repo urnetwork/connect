@@ -295,19 +295,24 @@ func TestTheOpeningIsTheOnlyPromotion(t *testing.T) {
 	})
 }
 
-// The fill fraction's default, chosen from what the same no-acknowledgement
-// traffic costs: with no-acknowledgement Packs advancing contracts themselves
-// nothing reads the headroom, so at one the traffic is delivered the same way
-// and needs fewer contracts, and every contract it leaves behind is carried to
-// within a message of its signed size rather than to the fraction of it.
-func TestTheFillFractionDefaultCarriesTheSameTrafficInFewerContracts(t *testing.T) {
+// The fill fraction's semantics on the same no-acknowledgement traffic, at
+// the default 0.9 and with no headroom at 1.0. At 0.9 the headroom is used:
+// every contract the traffic moves past is closed between its fill and its
+// signed size, never above. At 1.0 nothing can use it. Either way every
+// message is delivered once, none is promoted and none expires. The fixture
+// writes in no time, so its boundaries meet the announcement unacknowledged,
+// which is exactly when the headroom is read.
+// TestNoAckRidesThePredecessorsHeadroomThroughADelayedContractIntroduction
+// shows the default's reason at a real switch.
+func TestTheDefaultFillLetsNoAckTrafficCarryContractsPastTheFillToTheirSignedSize(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	if fraction := DefaultSendBufferSettings().ContractFillFraction; fraction != 1 {
-		t.Fatalf("the default fill fraction is %.2f", fraction)
+	if fraction := DefaultSendBufferSettings().ContractFillFraction; fraction != 0.9 {
+		t.Fatalf("the default fill fraction is %.2f, want 0.9", fraction)
 	}
 	type outcome struct {
 		contracts int
 		holds     uint64
+		headroom  uint64
 		fills     []float64
 	}
 	run := func(fraction float32) outcome {
@@ -350,6 +355,7 @@ func TestTheFillFractionDefaultCarriesTheSameTrafficInFewerContracts(t *testing.
 				t.Errorf("at fraction %.2f: %d promoted, %d expired", fraction, stats.NoAckContractPromotedCount, stats.NoAckContractExpiredCount)
 			}
 			result.holds = stats.NoAckContractHoldCount
+			result.headroom = stats.NoAckContractHeadroomCount
 			sender, _ := f.sequences()
 			current := sender.sendContract
 			f.close()
@@ -364,23 +370,24 @@ func TestTheFillFractionDefaultCarriesTheSameTrafficInFewerContracts(t *testing.
 		})
 		return result
 	}
-	atDefault := run(1)
-	atFormer := run(0.8)
-	if atFormer.contracts <= atDefault.contracts {
-		t.Errorf("the same traffic used %d contracts at 0.8 and %d at 1.0", atFormer.contracts, atDefault.contracts)
-	}
+	atDefault := run(0.9)
+	withoutHeadroom := run(1)
 	if len(atDefault.fills) == 0 {
 		t.Fatal("no contract was filled and closed at the default")
 	}
+	if atDefault.headroom == 0 {
+		t.Error("at the default no no-ack Pack rode the headroom, though its boundaries met unacknowledged announcements")
+	}
+	// A contract switched at its fill, its successor already acknowledged,
+	// leaves less than one message unused below the fill: at most 4 KiB of the
+	// smallest, 64 KiB, contract.
 	for _, fill := range atDefault.fills {
-		if fill < 0.95 {
-			t.Errorf("a contract the traffic moved past was closed %.0f%% full at the default", 100*fill)
+		if fill < 0.9-float64(kib(5))/float64(kib(64)) || 1 < fill {
+			t.Errorf("a contract the traffic moved past was closed %.1f%% full at the default, want between its fill, less a message, and its signed size", 100*fill)
 		}
 	}
-	for _, fill := range atFormer.fills {
-		if 0.81 < fill {
-			t.Errorf("a contract was closed %.0f%% full at 0.8", 100*fill)
-		}
+	if withoutHeadroom.headroom != 0 {
+		t.Errorf("at 1.0, %d no-ack Packs were charged to a headroom that does not exist", withoutHeadroom.headroom)
 	}
-	t.Logf("the same traffic: %d contracts and %d held at 1.0; %d contracts and %d held at 0.8", atDefault.contracts, atDefault.holds, atFormer.contracts, atFormer.holds)
+	t.Logf("the same traffic: %d contracts, %d held, %d in the headroom at 0.9; %d contracts, %d held at 1.0", atDefault.contracts, atDefault.holds, atDefault.headroom, withoutHeadroom.contracts, withoutHeadroom.holds)
 }
