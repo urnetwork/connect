@@ -30,11 +30,16 @@ func (self *idleRefillTestHost) recordActivity() {
 	self.lastActivityNanos.Store(time.Now().UnixNano())
 }
 
-// Loses one of the window's exits, as a failed health check does.
-func idleRefillTestLoseAnExit(h *reraceHarness) {
+// Loses one of the window's exits, as a failed health check does, and returns
+// it. The lost channel stops taking flows at once, but stays in the window's
+// clients until the window's resize pass removes it (removeClient in
+// multiClientWindow.resize), so the window's view of the loss is settled only
+// after synctest.Wait.
+func idleRefillTestLoseAnExit(h *reraceHarness) *multiClientChannel {
 	lost := h.liveChannels()[0]
 	lost.addError(fmt.Errorf("Blackhole no-send-ack (synthetic)"))
 	lost.Cancel()
+	return lost
 }
 
 // The defect, as hosted devices run today with the hold off: a device no one
@@ -151,13 +156,32 @@ func TestHostActivityDecidesTheIdleRefillHold(t *testing.T) {
 	})
 }
 
-// A device a user is active on refills exactly as without the hold: the lost
-// exit is replaced in the same time.
+// A device a user is active on refills exactly as without the hold: the hold
+// never holds its window, so the refill takes the same path, and the lost exit
+// leaves the window and is replaced by one new client within the same
+// expansion, far inside the resize interval at which a held or deferred refill
+// would show.
+//
+// Both runs are read deterministically and each is bounded on its own, not
+// compared with the other. The refill is read from the settled loss: the lost
+// client is gone from the window and five clients are selectable again.
+// Reading the installed count right after the loss raced the window's resize
+// pass, which removes the lost client from the window's clients: a read
+// before that pass counted the lost client and saw a full window at 0s, a
+// read after it saw the gap and the refill one poll step later. And even the
+// settled refill completes in zero or one 10 ms step of fake time at random,
+// with or without the hold (the candidate build draws at random), so an
+// exact comparison of two runs' times failed whatever the hold.
 func TestActiveDeviceWindowRefillTimingUnchangedByTheHold(t *testing.T) {
-	refillTime := func(t *testing.T, hold time.Duration) (elapsed time.Duration) {
+	const refillBound = time.Second
+	resizeInterval := DefaultMultiClientSettings().WindowResizeTimeout
+	if resizeInterval <= refillBound {
+		t.Fatalf("the refill bound %s does not separate the expansion from the next resize pass (%s)", refillBound, resizeInterval)
+	}
+	refill := func(t *testing.T, hold time.Duration) (elapsed time.Duration, heldPasses uint64) {
 		t.Helper()
 		synctest.Test(t, func(t *testing.T) {
-			h, _, _ := newBalanceHoldTestHarness(t, func(settings *MultiClientSettings) {
+			h, generator, stats := newBalanceHoldTestHarness(t, func(settings *MultiClientSettings) {
 				settings.IdleRefillHold = hold
 			})
 			window := h.multiClient.windows[WindowTypeQuality]
@@ -165,26 +189,41 @@ func TestActiveDeviceWindowRefillTimingUnchangedByTheHold(t *testing.T) {
 			// the user is active now
 			h.syn(reraceFlow(4, 0, 40003))
 			h.sleep(time.Second)
-			lost := time.Now()
-			idleRefillTestLoseAnExit(h)
+			_, _, mintsBefore, _ := generator.counts()
+			heldBefore := stats.expandPasses[windowStatsWindowQuality][windowExpandPassHeldIdle].Load()
+			lostAt := time.Now()
+			lostClient := idleRefillTestLoseAnExit(h)
+			if _, selectableCount := strictHandoverTestCounts(window); selectableCount != 4 {
+				t.Fatalf("the lost exit is still selectable: %d selectable", selectableCount)
+			}
+			// the window's resize pass sees the loss before the refill is read
+			synctest.Wait()
 			for {
-				if installedCount, _ := strictHandoverTestCounts(window); installedCount == 5 {
-					elapsed = time.Since(lost)
-					return
+				_, selectableCount := strictHandoverTestCounts(window)
+				if !strictHandoverTestInstalled(window, lostClient) && selectableCount == 5 {
+					elapsed = time.Since(lostAt)
+					break
 				}
-				if 5*time.Minute < time.Since(lost) {
+				if 5*time.Minute < time.Since(lostAt) {
 					t.Fatalf("the active device's window did not refill within 5 minutes (hold %s)", hold)
 				}
-				h.sleep(100 * time.Millisecond)
+				h.sleep(10 * time.Millisecond)
 			}
+			_, _, mintsAfter, _ := generator.counts()
+			AssertEqual(t, mintsAfter-mintsBefore, 1)
+			heldPasses = stats.expandPasses[windowStatsWindowQuality][windowExpandPassHeldIdle].Load() - heldBefore
 		})
 		return
 	}
 	GetMessagePoolAggregateStats()
-	without := refillTime(t, 0)
-	with := refillTime(t, idleRefillTestHold)
-	if with != without {
-		t.Fatalf("an active device refills in %s with the hold, %s without", with, without)
+	for _, hold := range []time.Duration{0, idleRefillTestHold} {
+		elapsed, heldPasses := refill(t, hold)
+		if heldPasses != 0 {
+			t.Fatalf("the hold held an active device's window on %d passes (hold %s)", heldPasses, hold)
+		}
+		if refillBound < elapsed {
+			t.Fatalf("an active device's window refilled in %s (hold %s), not within its expansion (%s)", elapsed, hold, refillBound)
+		}
 	}
 }
 
