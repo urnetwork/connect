@@ -1355,8 +1355,32 @@ paths:
           pay and retry the same request (see `/x402`); otherwise it is 200
           with the error.
 
+        Two more limits apply to every hosted proxy create (a new client
+        with `proxy_config`, top-level or ancillary), and these are always
+        enforced, whether or not the deployment enforces concurrent clients:
+        - The active proxy cap: a free network may hold 5 active hosted
+          proxies and a Pro network 1000. Over it the call answers with
+          `error.client_limit_exceeded` and the message "Your plan's limit
+          of 5 active proxies is reached. Remove a proxy to create another,
+          or upgrade to UR Pro for more." A Pro network's message stops
+          after "create another".
+        - The create rate: a free network may create 5 hosted proxies a
+          minute and a Pro network 20. A create these limits refuse still
+          counts toward its minute. Over the rate the call answers with
+          `error.client_limit_exceeded` and the message "Your plan allows 5
+          new proxies a minute. Try again in a minute, or upgrade to UR Pro
+          for more." A Pro network's message stops after "Try again in a
+          minute".
+        For a free network both refusals also set `error.upgrade_required`,
+        so they answer the way the plan limit above does: HTTP 402 with the
+        terms for a Pro month when x402 inline payments are enabled and a
+        price can be quoted, otherwise 200 with the error. Only a new proxy
+        is refused: the network's existing proxies keep working, and
+        removing one makes room for the next. A re-auth of an existing
+        client counts toward neither limit.
+
         A network on an Embed plan has a per-network client allowance that
-        sets both limits.
+        sets both client limits and its active proxy cap.
 
         A provider install (a device that only provides, such as an embedded
         provider) sets `provide_intent`. Creating a top-level client with it is
