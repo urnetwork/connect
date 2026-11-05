@@ -1,5 +1,5 @@
 // Private eight-frame candidate boundaries. Real client/peer ACK tests cover
-// custody; codec and framer components expose the larger unpooled wire class.
+// custody and the 9 KiB wire root; larger codec and framer paths stay unpooled.
 // These are not process-heap or physical-device performance qualifications.
 package connect
 
@@ -143,8 +143,15 @@ func runH1EightOriginalCustody(t *testing.T, logical bool) {
 				t.Fatalf("actual chunk%d=%+v want%d originals", chunk, wire.pack, wantCount)
 			}
 			pooled, _ := MessagePoolCheck(wire.bytes)
-			if logical && wantCount == 8 && (pooled || len(wire.bytes) <= 8192) {
-				t.Fatal("eight full-MTU originals did not exercise the actual unpooled wire class")
+			if logical && wantCount == 8 {
+				rootBytes := MessagePoolRootByteCount(wire.bytes)
+				if !pooled || len(wire.bytes) <= 8192 || 9216 < len(wire.bytes) ||
+					cap(wire.bytes) != 9216+MessagePoolMetaByteCount || rootBytes != 9216 {
+					t.Fatalf("eight full-MTU originals did not use the 9216-byte pooled wire root: len=%d cap=%d pooled=%t root=%d",
+						len(wire.bytes), cap(wire.bytes), pooled, rootBytes)
+				}
+				t.Logf("h1_eight_wire chunk=%d payloadBytes=%d wireBytes=%d rootCapacity=%d retainedRootBytes=%d pooled=%t",
+					chunk, wantCount*size, len(wire.bytes), cap(wire.bytes), rootBytes, pooled)
 			}
 			for offset, frame := range wire.pack.Frames {
 				if !bytes.Equal(frame.MessageBytes, bytes.Repeat([]byte{byte(wantIndex + offset + 1)}, size)) {
@@ -310,8 +317,13 @@ func TestCanonicalH1EightFullContractRewriteAndEncryptionKeepRetainedCharge(t *t
 			}
 			defer MessagePoolReturn(opened)
 			pooled, _ := MessagePoolCheck(outer)
-			if !bytes.Equal(opened, rewritten) || pooled || len(outer) <= 8192 || ByteCount(len(outer)) > DefaultClientSettings().MinimumMessageLenLimit() {
+			if !bytes.Equal(opened, rewritten) || pooled || len(outer) <= 9216 ||
+				MessagePoolRootByteCount(outer) != ByteCount(len(outer)) ||
+				ByteCount(len(outer)) > DefaultClientSettings().MinimumMessageLenLimit() {
 				t.Fatal("actual encrypted full-contract bytes or admitted unpooled class changed", len(outer), pooled)
+			}
+			if leaf.UsedByteCount() != charge || parent.UsedByteCount() != charge {
+				t.Fatal("larger unpooled codec changed the exact prepaid retained charge")
 			}
 			t.Logf("h1_eight_codec version=%d originalBytes=%d rewriteBytes=%d encryptedBytes=%d encryptedRootCapacity=%d estimatedFullContractBytes=%d senderCharge=%d pooled=%t", version, len(original), len(rewritten), len(outer), cap(outer), estimate, charge, pooled)
 			sequence.releaseRetainedSendItems(context.Canceled)
