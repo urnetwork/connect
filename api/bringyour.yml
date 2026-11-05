@@ -9475,7 +9475,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/BrevoWebhookResult"
         "401":
-          description: No `Authorization`, or one that is not a configured webhook user with an empty password.
+          description: No `Authorization`, or one that is not a configured webhook user, as Basic with an empty password or as a Bearer token.
         "503":
           description: No usable webhook user is configured, so the endpoint accepts nothing.
 
@@ -9936,7 +9936,9 @@ components:
         HTTP Basic with one of the deployment's configured webhook users as
         the username and an empty password, which Brevo sends from the
         registered webhook URL's userinfo or from a registered custom
-        header. Not a URnetwork JWT.
+        header. The same user is also accepted as a Bearer token
+        (`Authorization: Bearer <user>`), which Brevo sends from a webhook's
+        `auth` bearer. Not a URnetwork JWT.
     AdminBearerAuth:
       type: http
       scheme: bearer
@@ -20552,6 +20554,17 @@ components:
             this family, rounded up. Wait that long rather than backing off.
             Absent on every other answer.
           type: integer
+        refusal:
+          description: |
+            On a refusal an extender acts on, which one (EXTENDER.md C2c).
+            `key_other_network`: the key is registered to another network,
+            which no wait or post of this network changes; the extender needs a
+            key of its network's own, which an updated app makes on its own.
+            Absent on every other answer, and from an operator that predates
+            it, whose `error` begins "This extender key is registered to
+            another network".
+          type: string
+          enum: [key_other_network]
         expire_time:
           description: |
             When the signed record expires, 24 hours from issue. The operator

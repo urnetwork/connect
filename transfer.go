@@ -1000,6 +1000,9 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// and a successor that lands this far ahead is used before the
 		// expiry would discard it.
 		ContractPrefetchLeadTime: 30 * time.Second,
+		// Delivery, a few resends and the two clocks' difference, against an
+		// hour of contract life.
+		ContractExpirationMargin: 2 * time.Minute,
 		// A continuous ping charges the one-byte minimum, a few hundred bytes
 		// an hour; a transfer reaches this within a few round trips.
 		ContractPrefetchMinUsedByteCount: kib(64),
@@ -2072,6 +2075,11 @@ type Client struct {
 	feedbackTimeBase time.Time
 	ctx              context.Context
 	cancel           context.CancelFunc
+
+	// Path round trip and delivery shared by every sequence to a destination
+	// (transfer_window_latency.go).
+	pathLatencyLock sync.Mutex
+	pathLatencies   map[Id]*pathLatencyState
 
 	clientId  Id
 	clientTag string
@@ -3549,7 +3557,7 @@ func (self *SendSequence) h1EstablishedEnvelopeAvailable(
 	metadata := self.contractMetadata()
 	return self.sendContract != nil && self.sendContractAcked &&
 		self.sendContractMetadataGeneration == metadata.generation &&
-		self.sendContract.canUpdate(messageByteCount)
+		self.sendContractCanUpdate(messageByteCount)
 }
 
 func (self *SendSequence) pinLogicalGroupChunkLimits(
@@ -5347,6 +5355,12 @@ type SendBufferSettings struct {
 	// recover the earliest missing Pack before its resend timeout. Zero disables
 	// gap recovery; each item can trigger it at most once.
 	SelectiveAckGapThreshold int
+	// WindowLatencyBudget bounds the admitted window to twice what the
+	// destination delivers within its path round trip plus this budget, so a
+	// window grown on a queue-inflated round trip cannot stand as queue
+	// (transfer_window_latency.go). Zero, the default, disables the bound;
+	// 50ms held a provider's downloads near 250ms of queue.
+	WindowLatencyBudget time.Duration
 	// Bounds distinct missing Packs released from one selective-ACK snapshot.
 	// Zero disables gap recovery even when the threshold is configured.
 	SelectiveAckGapBurstSize int
@@ -5667,6 +5681,19 @@ type SendBufferSettings struct {
 	// same-network peer always keep it: they escrow nothing and the queue
 	// retains their newest successor past the expiry.
 	ContractPrefetchLeadTime time.Duration
+	// How long before its signed deadline a send contract stops taking new
+	// messages, capped at a quarter of the contract's life as the sequence
+	// has held it, so a short grant is not retired the moment it arrives.
+	//
+	// The receiver checks the deadline by its own clock as each message
+	// arrives, and refuses one under a contract past it for good: a message
+	// written in the deadline's last moments arrives after it, every resend
+	// carries the same contract, and the sequence stalls until its ACK
+	// lifetime closes it. A sequence that carries little (pings, a quiet
+	// tunnel) never fills its contract and holds it to the deadline; measured
+	// on such a link, it died exactly one hour after its contract was made.
+	// Zero or negative takes new messages up to the deadline itself.
+	ContractExpirationMargin time.Duration
 	// The least a contract must have carried before its successor is
 	// requested at all, capped at half of the contract. Below it a sequence
 	// is carrying pings or probes, which never exhaust a contract within its
@@ -8262,8 +8289,11 @@ func (self *SendSequence) processLogicalGroupChunk(
 			// cursor and every raw owner remain queued for the budget turn.
 			return false, true, true
 		}
+		// Disposal ends this group only, as the taking serializer's refusal
+		// did. A canceled sequence still finishes this iteration, so its next
+		// drain cleanup-receives the groups queued behind this one.
 		sendPack.disposeUnsentGroup(prepareErr)
-		return true, errors.Is(prepareErr, errPreparedSendCanceled), false
+		return true, true, false
 	}
 	// Until the taking serializer begins, the Pack owns frames and records;
 	// this guard owns only the independent, unpublished memory reservation.
@@ -9159,7 +9189,7 @@ func (self *SendSequence) noAckPackCanBypassRecoveryAdmission(
 	metadata := self.contractMetadata()
 	return self.sendContract != nil && self.sendContractAcked &&
 		self.sendContractMetadataGeneration == metadata.generation &&
-		self.sendContract.canUpdate(sendPack.nextSerializedMessageByteCount())
+		self.sendContractCanUpdate(sendPack.nextSerializedMessageByteCount())
 }
 
 // A sequence loop's one lazily armed deadline. The loops wake once per Pack,
@@ -9885,7 +9915,7 @@ sendSequenceLoop:
 						(self.sendContract != nil &&
 							self.sendContractAcked &&
 							0 < len(self.sendItems) &&
-							self.sendContract.canUpdate(nextMessageByteCount))
+							self.sendContractCanUpdate(nextMessageByteCount))
 					compatible := sendPack.Ack == nextSendPack.Ack &&
 						sendPack.ForceUnwrapped == nextSendPack.ForceUnwrapped &&
 						frameCount+nextFrameCount <= maxFrames &&
@@ -9981,11 +10011,14 @@ sendSequenceLoop:
 								}
 								return !packsClosed
 							}
+							// Disposal ends these Packs only, as the taking serializer's
+							// refusal did. A canceled sequence still finishes this
+							// iteration, so its next drain cleanup-receives what is queued.
 							for packIndex := range sendPackCount {
 								sendPacks[packIndex].disposeUnsentGroup(prepareErr)
 								processingPacks[packIndex] = nil
 							}
-							return errors.Is(prepareErr, errPreparedSendCanceled) && !packsClosed
+							return !packsClosed
 						}
 						ownPreparedItem := true
 						defer func() {
@@ -10375,6 +10408,27 @@ func (self *SendSequence) updateContractWithAckPromotion(
 	if self.sendContract != nil &&
 		self.sendContractMetadataGeneration != metadata.generation {
 		retiredContract := self.sendContract
+		self.sendContract = nil
+		self.preparedContractByteCount.Store(0)
+		self.sendContractAcked = false
+		self.retireSendContract(retiredContract)
+	}
+	// A contract within its margin of the signed deadline retires the same way
+	// (ContractExpirationMargin): the messages it carries stay attributed to it
+	// in openSendContracts and are acknowledged while the receiver still
+	// admits it, and this message takes the successor.
+	if self.sendContract != nil && self.sendContractRetiring(time.Now()) {
+		retiredContract := self.sendContract
+		// At most once per contract life, and only on a sequence too quiet to
+		// fill its contract: the one trace that the deadline was met in time.
+		self.log.Infof(
+			"[s]%s->%s...%s s(%s) contract %s retires ahead of its deadline\n",
+			self.client.ClientTag(),
+			self.contractIntermediaryIds(),
+			self.destination,
+			self.contractMultiRouteWriterAlias.StreamId,
+			retiredContract.contractId,
+		)
 		self.sendContract = nil
 		self.preparedContractByteCount.Store(0)
 		self.sendContractAcked = false
@@ -11002,7 +11056,10 @@ func (self *SendSequence) setAheadContract(messageByteCount ByteCount) bool {
 		return false
 	}
 	metadata := self.contractMetadata()
-	if self.aheadSendContractMetadataGeneration != metadata.generation || aheadContract.expired() {
+	// A successor already within its margin of its own deadline would retire on
+	// the message after this one: no successor at all.
+	if retireTime, ok := self.contractRetireTime(aheadContract, time.Time{}); self.aheadSendContractMetadataGeneration != metadata.generation ||
+		aheadContract.expired() || (ok && !time.Now().Before(retireTime)) {
 		self.discardAheadContract()
 		return false
 	}
@@ -12324,19 +12381,19 @@ type SendWindowEstimate struct {
 // propagation; the mean raw RTT also contains that queue. Without a memory
 // budget the configured constant is retained within known byte limits.
 func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, true, false)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, true, false), now)
 }
 
 // Report current evidence without allowing a statistics consumer to change
 // which service rate a later physical drain probe will preserve.
 func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, false, false)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, false, false), now)
 }
 
 // A generation-bound H1-only write uses physical pacing evidence even when
 // the aggregate route set must retain mixed-carrier window and group bounds.
 func (self *SendSequence) sendWindowPacingEstimate(now time.Time) SendWindowEstimate {
-	return self.estimateSendWindow(now, true, true)
+	return self.boundWindowByLatency(self.estimateSendWindow(now, true, true), now)
 }
 
 // Admission and statistics share one window rule. Only admission retains
@@ -12569,6 +12626,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 	// first ACK. Read that evidence before the local cold-window decision.
 	adjustedRoundTrip, receiverResidence, receiverSampled := self.receiverWindowTiming(now)
 	roundTrip := self.rttWindow.estimate(now)
+	pathRoundTrip := self.observePathRoundTrip(roundTrip.Min, now)
 	if !roundTrip.Sampled() && !receiverSampled {
 		estimate.Reason = "no round trip samples"
 		return estimate
@@ -12591,6 +12649,15 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 		// A measured receiver queue/application wait still occupies flight.
 		// Pinned per-sample compression reserves only residence not observed.
 		estimate.WindowRoundTrip = receiverResidence
+	}
+	// A queue-inflated round trip would size the window from its own queue.
+	if 0 < pathRoundTrip {
+		if pathRoundTrip < estimate.RoundTrip {
+			estimate.RoundTrip = pathRoundTrip
+		}
+		if limit := pathRoundTrip + estimate.AckCompressTimeout + self.sendBufferSettings.WindowLatencyBudget; limit < estimate.WindowRoundTrip {
+			estimate.WindowRoundTrip = limit
+		}
 	}
 	estimate.SampleCount = self.deliveredSampleCount()
 	serviceHorizon := max(2*estimate.WindowRoundTrip, 4*self.deliveredBytesSampleIntervalAt(now))

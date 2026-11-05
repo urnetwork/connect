@@ -5926,6 +5926,41 @@ func (self *TcpSequence) Run() {
 			close(writePayloads)
 		}
 	}()
+
+	// RFC 9293 3.6: a FIN closes one direction. The source's FIN closes the
+	// upload once the writer has written every payload before it and
+	// half-closed the upstream; the upstream's EOF closes the download once
+	// the source has acknowledged its FIN and every byte before it. The flow
+	// goes on carrying the other direction until both have closed, and ends
+	// with the second. Each direction closes at most once.
+	var closedDirectionCount atomic.Int32
+	closeDirection := func() {
+		if closedDirectionCount.Add(1) == 2 {
+			self.cancel()
+		}
+	}
+	// Set by the send loop before it closes `writePayloads` for the source's
+	// FIN, and read by the writer once it sees the close.
+	sourceFin := false
+	// The writer half-closes the upstream after the source's FIN. An upstream
+	// that cannot half-close is closed, which ends the flow as a full close.
+	halfCloseUpstream := func() bool {
+		if !sourceFin || self.ctx.Err() != nil {
+			return false
+		}
+		closeWriter, ok := socket.(interface{ CloseWrite() error })
+		if !ok {
+			return false
+		}
+		if err := closeWriter.CloseWrite(); err != nil {
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[final]tcp half-close error = %s\n", err)
+			}
+			return false
+		}
+		return true
+	}
+
 	runChildWorker(func() {
 		// Run is the sole producer and closes the channel after its last
 		// publication. Cancellation alone cannot establish an empty queue:
@@ -5939,7 +5974,16 @@ func (self *TcpSequence) Run() {
 				writePayload.memory.release()
 			}
 		}()
-		defer self.cancel()
+		// Only a half-closed upstream leaves the flow running; every other end
+		// of the writer ends it.
+		halfClosed := false
+		defer func() {
+			if halfClosed {
+				closeDirection()
+			} else {
+				self.cancel()
+			}
+		}()
 
 		batch := make([]writePayload, 0, self.tcpBufferSettings.WriteBatchSize)
 		bufferStorage := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
@@ -5954,6 +5998,7 @@ func (self *TcpSequence) Run() {
 				return
 			case writePayload, ok := <-writePayloads:
 				if !ok {
+					halfClosed = halfCloseUpstream()
 					return
 				}
 				batch = append(batch, writePayload)
@@ -6011,6 +6056,7 @@ func (self *TcpSequence) Run() {
 				return
 			}
 			if closed {
+				halfClosed = halfCloseUpstream()
 				return
 			}
 		}
@@ -6026,8 +6072,19 @@ func (self *TcpSequence) Run() {
 		max(1, self.tcpBufferSettings.WriteBatchSize),
 	)
 	readPackets := make(chan []byte, readQueueSize)
+	// Set by the socket reader before it closes `readPackets`, once the source
+	// has acknowledged the upstream's FIN and every byte before it.
+	var downloadClosed atomic.Bool
 	runChildWorker(func() {
-		defer self.cancel()
+		// A closed download leaves the flow to the upload; any other end of
+		// the reader ends the flow.
+		defer func() {
+			if downloadClosed.Load() {
+				closeDirection()
+			} else {
+				self.cancel()
+			}
+		}()
 
 		defer func() {
 			// drain to the close so that ordered data and any final
@@ -6259,6 +6316,11 @@ func (self *TcpSequence) Run() {
 					self.mutex.Lock()
 					for self.ctx.Err() == nil && self.returnByteCount != 0 {
 						receiveAckCond.Wait()
+					}
+					// The source has every byte and the FIN: the download is
+					// closed, and the upload may still be open (closeDirection).
+					if fin && self.ctx.Err() == nil {
+						downloadClosed.Store(true)
 					}
 					self.mutex.Unlock()
 					return
@@ -6594,14 +6656,42 @@ func (self *TcpSequence) Run() {
 			self.receivePacket(packet, recoveryMode)
 		}
 	}
+	// The send loop acknowledges the source's FIN itself, before the writer
+	// can half-close the upstream and so before either direction can end the
+	// flow. Left to the acknowledgement worker, the acknowledgement could wait
+	// out its coalescing past the end of the flow and never be sent, and the
+	// source would retransmit its FIN into a reset. Built in the critical
+	// section that accepts the FIN, so the worker finds nothing left to
+	// acknowledge. The caller holds mutex.
+	finAckWithLock := func() []byte {
+		packet, err := self.PureAck()
+		if err != nil {
+			self.log.Infof("[r]fin ack err = %s\n", err)
+		}
+		ackedSendSeq = self.sendSeq
+		quiescentNanos = monotonicNanos()
+		lastArrivalNanos = 0
+		return packet
+	}
+	sendFinAck := func(packet []byte) {
+		if packet == nil {
+			return
+		}
+		select {
+		case <-self.ctx.Done():
+			MessagePoolReturn(packet)
+		default:
+			self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
+		}
+	}
 
 	// window scaling depends on `nonBlockingByteCount` and `blockingByteCount` per `self.windowSize`
 	nonBlockingByteCount := uint32(0)
 	blockingByteCount := uint32(0)
-	fin := false
+	// the source's FIN is in: its direction is closed (RFC 9293 3.6)
+	finReceived := false
 	sendIter := uint64(0)
-	// returns false when the send loop must stop:
-	// rst or cancel with `fin` false, or fin flush with `fin` true
+	// returns false when the send loop must stop: a rst or cancel
 	handleSendItem := func(sendItem *TcpSendItem) bool {
 		for sendItem != nil {
 			if self.log.V(2).Enabled() {
@@ -6654,6 +6744,16 @@ func (self *TcpSequence) Run() {
 			}
 
 			start, end := sequenceBounds(sendItem, nextSeq)
+			if finReceived && 0 < end {
+				// Nothing follows the FIN in sequence space, so these bytes lie
+				// past it. RFC 9293 3.10.7.4: once the FIN is in, the text of a
+				// later segment is ignored; the acknowledgement says what was
+				// accepted. A retransmission of what came before the FIN, the
+				// FIN included, is the stale case below.
+				returnSendItem(sendItem)
+				sendCurrentAck(false)
+				return true
+			}
 			if 0 < start {
 				retained := bufferReorderItem(sendItem, nextSeq)
 				if !retained {
@@ -6759,6 +6859,7 @@ func (self *TcpSequence) Run() {
 					self.log.Infof("[r%d]FIN\n", sendIter)
 				}
 			}
+			var finAckPacket []byte
 			func() {
 				self.mutex.Lock()
 				defer self.mutex.Unlock()
@@ -6887,15 +6988,31 @@ func (self *TcpSequence) Run() {
 						}
 					}
 				}
+				if sendItem.tcp.fin {
+					finAckPacket = finAckWithLock()
+				}
 			}()
 
 			if sendItem.tcp.fin {
-				// Flush queued payload before propagating the FIN to the upstream
-				// socket and closing the sequence.
+				// The source's FIN closes its direction only. Acknowledge it, then
+				// have the writer flush the payload queued before it and
+				// half-close the upstream (closeDirection). The upstream's bytes
+				// and its FIN go on returning to the source, and this loop goes
+				// on taking the source's acknowledgements, retransmissions and
+				// reset.
+				sendFinAck(finAckPacket)
+				finReceived = true
+				sourceFin = true
 				close(writePayloads)
 				writePayloadsClosed = true
-				fin = true
-				return false
+				// whatever the reorder buffer still holds lies past the FIN
+				for _, reorderItem := range reorderItems {
+					returnSendItem(reorderItem)
+				}
+				clear(reorderItems)
+				reorderItems = reorderItems[:0]
+				reorderPacketByteCount = 0
+				return true
 			}
 
 			sendItem = takeReadyReorderItem(nextSeq)
@@ -6918,6 +7035,9 @@ func (self *TcpSequence) Run() {
 	armIdleTimer(idleTimeout)
 	lastSendNanos := monotonicNanos()
 	checkpointId := self.idleCondition.Checkpoint()
+	// The loop ends the flow on a reset, the idle timeout or cancellation. The
+	// source's FIN does not end it: the flow ends once both directions have
+	// closed (closeDirection).
 send:
 	for {
 		select {
@@ -6926,10 +7046,7 @@ send:
 		case sendItem := <-self.sendItems:
 			self.admissionCapacity.notify()
 			if !handleSendItem(sendItem) {
-				if !fin {
-					return
-				}
-				break send
+				return
 			}
 			sendIter += 1
 			// opportunistically drain queued send items to reduce wakeups
@@ -6938,10 +7055,7 @@ send:
 				case sendItem := <-self.sendItems:
 					self.admissionCapacity.notify()
 					if !handleSendItem(sendItem) {
-						if !fin {
-							return
-						}
-						break send
+						return
 					}
 					sendIter += 1
 				default:
@@ -6976,11 +7090,6 @@ send:
 			checkpointId = self.idleCondition.Checkpoint()
 			armIdleTimer(idleTimeout)
 		}
-	}
-
-	// wait for `writePayloads` to finish
-	select {
-	case <-self.ctx.Done():
 	}
 }
 

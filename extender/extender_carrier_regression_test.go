@@ -1,5 +1,5 @@
 // The extender server must outlive a failure of one of its carriers (EXTENDER.md
-// G2). On 2026-11-01 most of network 01979e1c's extenders stopped answering on
+// G2). On 2026-11-01 most of one operator's extenders stopped answering on
 // tcp 443 and udp 53 while their processes stayed connected and kept posting
 // activations. One accept error, one udp carrier's exit or one failed write on
 // the dns carrier closed every carrier for the life of the process, and nothing

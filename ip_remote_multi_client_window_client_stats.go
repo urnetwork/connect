@@ -73,6 +73,10 @@ const (
 	// the expansion backoff or a fixed destination's re-dial pacing held the
 	// pass
 	windowExpandPassDeferred
+	// the payer's balance refused the window's contracts, so the pass sent a
+	// balance probe instead of building candidates (see
+	// ip_remote_multi_client_balance_hold.go)
+	windowExpandPassHeldInsufficientBalance
 	windowExpandPassStateCount
 )
 
@@ -91,6 +95,8 @@ func (self windowExpandPassState) String() string {
 		return "skipped_strict_full"
 	case windowExpandPassDeferred:
 		return "deferred"
+	case windowExpandPassHeldInsufficientBalance:
+		return "held_insufficient_balance"
 	default:
 		return "unknown"
 	}
@@ -323,6 +329,8 @@ type WindowClientStats struct {
 	warnings     [windowStatsWindowCount][windowWarningCauseCount]atomic.Uint64
 	removals     [windowStatsWindowCount][windowRemovalCauseCount]atomic.Uint64
 	windows      [windowStatsWindowCount][windowStateCount]atomic.Int64
+	// balance probes held windows sent, by what each learned
+	balanceProbes [windowStatsWindowCount][balanceProbeOutcomeCount]atomic.Uint64
 }
 
 // A process-wide instance to share by every window of the process.
@@ -343,6 +351,14 @@ func (self *WindowClientStats) addCandidate(
 		return
 	}
 	self.candidates[windowStatsWindowOf(windowType)][state][outcome].Add(1)
+}
+
+// One balance probe a held window sent learned the outcome. Nil-safe.
+func (self *WindowClientStats) addBalanceProbe(windowType WindowType, outcome BalanceProbeOutcome) {
+	if self == nil || outcome < 0 || balanceProbeOutcomeCount <= outcome {
+		return
+	}
+	self.balanceProbes[windowStatsWindowOf(windowType)][outcome].Add(1)
 }
 
 // One resize pass wanted to grow and found the window in the state. Nil-safe.
@@ -408,6 +424,19 @@ func (self *WindowClientStats) VisitExpandPasses(visit func(window string, state
 	for window := range windowStatsWindowCount {
 		for state := range windowExpandPassStateCount {
 			visit(window.String(), state.String(), self.expandPasses[window][state].Load())
+		}
+	}
+}
+
+// Calls visit for every balance probe counter, in a fixed order, with its
+// window and outcome label values.
+func (self *WindowClientStats) VisitBalanceProbes(visit func(window string, outcome string, count uint64)) {
+	if self == nil {
+		return
+	}
+	for window := range windowStatsWindowCount {
+		for outcome := range balanceProbeOutcomeCount {
+			visit(window.String(), outcome.String(), self.balanceProbes[window][outcome].Load())
 		}
 	}
 }

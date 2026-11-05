@@ -60,6 +60,9 @@ func DefaultApiMultiClientGeneratorSettings() *ApiMultiClientGeneratorSettings {
 		// the platform acks a committed secret within a round trip or two; a
 		// slow api must not leave a setup hanging past an ordinary ping wait
 		ProvideRegistrationTimeout: 30 * time.Second,
+
+		// the escrow a window client's contract needs
+		BalanceProbeTransferByteCount: DefaultContractManagerSettings().StandardContractTransferByteCount,
 	}
 }
 
@@ -145,6 +148,12 @@ type ApiMultiClientGeneratorSettings struct {
 	// platform to commit its provide secret when its `ControlPingTimeout` is
 	// unset. Non-positive uses the default.
 	ProvideRegistrationTimeout time.Duration
+	// BalanceProbeTransferByteCount is the contract size a held window's
+	// balance probe asks for (ProbeBalance): a window contract's standard
+	// size, so the platform checks the escrow a window client's contract
+	// needs. Non-positive asks for ContractManagerSettings'
+	// StandardContractTransferByteCount default.
+	BalanceProbeTransferByteCount ByteCount
 	// IdentityLoadTimeout bounds the optional persisted-window identity load.
 	// Continuity restoration is abandoned after this deadline so a slow remote
 	// store cannot hold both window enumerators ahead of provider discovery.

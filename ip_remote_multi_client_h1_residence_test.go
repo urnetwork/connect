@@ -507,6 +507,10 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					t.Fatalf("independent same-peer stream did not recover the existing request: receipts=%d stats=%+v", f.requests.Load(), stats)
 				}
 				advance(30 * time.Second)
+				// The predecessor's ACK advanced the sequence's cumulative head at
+				// predecessorAt. The request's lifetime runs from that advance as
+				// well as from its send (f25be1b2, connect PR #231), and with the
+				// head stopped there it ends exactly one lifetime later.
 				if !survives && tc.lifetime == 30*time.Second {
 					if _, err = channel.WindowStats(); err != nil || channel.IsDone() || f.requestFailureAt.Load() != 0 {
 						t.Fatalf("useful predecessor ACK did not preserve the outstanding tail past its original deadline: %v", err)

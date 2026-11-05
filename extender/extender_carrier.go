@@ -18,9 +18,9 @@ import (
 // A carrier that fails must not take the server down with it. One accept error
 // or one udp carrier's exit used to close every carrier for the life of the
 // process, while the provider stayed connected and the activation loop kept
-// posting for a listener that was gone. That is probably what network 01979e1c
-// showed on 2026-11-01, tcp 443 and udp 53 refused with the process up, though no
-// host's log confirms it and which failure it was is not known.
+// posting for a listener that was gone. That is probably what one operator's
+// extenders showed on 2026-11-01, tcp 443 and udp 53 refused with the process up,
+// though no host's log confirms it and which failure it was is not known.
 //
 // So each bound port is supervised on its own. An accept error that is a passing
 // condition of the host is waited out on the same listener, as net/http does.
