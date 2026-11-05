@@ -83,10 +83,10 @@ So a no-acknowledgement Pack sent during a switch must name a contract the recei
 **The fill, 0.9.** `SendBufferSettings.ContractFillFraction` stays a setting with its default in `DefaultSendBufferSettings`. Acknowledged and ordinary traffic stops at `transferByteCount * ContractFillFraction`. The share above it is headroom only no-acknowledgement Packs charge, tracked apart from ordinary debits (`sequenceContract.noAckHeadroomByteCount`). Ordinary and fast-path debits stay within the effective size and headroom debits within the headroom, so together they never pass the signed size.
 
 **The headroom carrier** (`SendSequence.noAckHeadroomCarrier`) is one of:
-- the acknowledged predecessor, while the current contract (opened, or switched to, by acknowledged traffic) is still unacknowledged. `setContract` keeps such a predecessor open and unretired (`noAckHeadroomContract`) instead of retiring it;
+- the acknowledged predecessor, while the current contract (opened, or switched to, by acknowledged traffic) is still unacknowledged. `setContract` keeps such a predecessor open (`noAckHeadroomContract`). Its fast path is retired at the switch exactly as before, so a caller holding the old snapshot is refused and returns to queue admission, and only the sequence loop charges the headroom. Its close waits until the headroom has done its part;
 - the acknowledged current contract, past its fill, while its announced successor is still unacknowledged.
 
-Either way the receiver holds the contract. A no-acknowledgement Pack charged to the headroom names that contract (`noAckHeadroomCharge`, read where the Pack is serialized) and is never promoted. A rollback returns headroom, never fast-path budget. The predecessor is retired (`endNoAckHeadroom`) once the successor is acknowledged, when a later switch replaces it, or when the path changes. While it carries the switch, `ackItem` does not retire it.
+Either way the receiver holds the contract. A no-acknowledgement Pack charged to the headroom names that contract (`noAckHeadroomCharge`, read where the Pack is serialized) and is never promoted. A rollback returns headroom, never fast-path budget. The predecessor's headroom ends (`endNoAckHeadroom`) once the successor is acknowledged, when a later switch replaces it, or when the path changes. Until then `tryCloseRetiredSendContract` defers its close; after it, the predecessor closes exactly once, as soon as nothing it carries is outstanding.
 
 **A no-acknowledgement Pack at a boundary, now** (`updateContractForMode`):
 1. the acknowledged current contract carries it within its fill;
@@ -137,6 +137,8 @@ A held Pack is unwritten and uncharged. The scheduler passes over it (`noAckPack
 **Pins:**
 - `TestAcknowledgedTrafficStopsAtTheFillAndTheHeadroomCarriesNoAckToTheSignedSize`: ordinary traffic stops at 0.9; the headroom carries no-acknowledgement traffic to the signed size and no further; a rollback returns headroom.
 - `TestAReceiverAdmitsAContractFilledToItsSignedSize`.
+- `TestH1NoAckContractRetirementWitness` (existing) keeps every fast-path assertion: a stale reader is refused at the switch, accepted writes finish, and the close happens exactly once with the right bytes. For a predecessor that carries headroom, it now acknowledges the successor before asserting the close.
+- `TestNativeBatchNoAckGroupRetiredContractRefuses` (existing, unchanged): a retired snapshot never consumes a new group.
 
 **Behaviour**, in transfer_noack_contract_advance_behavior_test.go:
 - `TestAFastPathReservationAtTheAnnounceThresholdWakesTheOwner`;
