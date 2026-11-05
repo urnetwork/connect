@@ -170,6 +170,8 @@ func TestNatMemoryNearCapacitySynDoesNotCreateFlow(t *testing.T) {
 	defer cancel()
 	settings := DefaultTcpBufferSettingsWithBufferSize(4)
 	settings.Log = NewNoopLogger()
+	settings.MemoryBudget = NewTransferMemoryBudget(mib(2))
+	settings = boundedNatTcpMemorySettings(settings, settings.MemoryBudget)
 	settings.MemoryBudget = NewTransferMemoryBudget(natTcpFlowMemoryByteCount(settings))
 	var dials atomic.Int64
 	settings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) {
@@ -260,7 +262,8 @@ func TestNatMemoryReplayMetadataAndSiblingWake(t *testing.T) {
 
 func TestNatMemoryPacketizationBoundsTinyMss(t *testing.T) {
 	state := ConnectionState{ipVersion: 4, peerMss: 1}
-	if got := state.natPacketizationByteLimit(DefaultMtu); got != natMemoryBatchCount {
+	maximum := DefaultTcpBufferSettings().MemoryColdWriteBatchSize
+	if got := state.natPacketizationByteLimit(DefaultMtu, maximum); got != maximum {
 		t.Fatalf("MSS=1 packetization grew beyond charged producer roots: %d", got)
 	}
 }

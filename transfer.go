@@ -865,6 +865,7 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 
 func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings {
 	settings := &SendBufferSettings{
+		ChunkSettings:         DefaultSendBufferChunkSettings(),
 		CreateContractTimeout: 30 * time.Second,
 		// Retry a failed/absent contract promptly. A same-network peer connect can
 		// briefly return NoPermission while the target's provide registration is
@@ -1155,6 +1156,9 @@ type SendPack struct {
 	// SendSequence may split it into ordered wire Packs at the transport-safe
 	// frame/byte bounds without returning to Client routing or admission.
 	logicalGroup bool
+	// True only when this pinned partition used known-H1 enlargement. It
+	// survives later shrink so an unknown replacement cannot inherit it.
+	groupH1Known bool
 	// The first frame serialization has not taken. Serialization takes a
 	// chunk when it is called, so the cursor passes the chunk before the call.
 	groupFrameIndex int
@@ -1337,23 +1341,12 @@ func (self *SendPack) releaseRaw() {
 	}
 }
 
-// sendPackBatchMaxFrames / sendPackBatchMaxMessageByteCount bound
-// opportunistic sequence coalescing so the complete TransferFrame remains
-// below both the platform transport limit and H3's bounded DATAGRAM-carrier
-// threshold. The byte bound matches the global tunnel MTU: one full tunnel
-// packet or multiple smaller packets with no more than one MTU of message
-// bytes remain eligible for the hybrid packet lane. There is no batching wait:
-// the sequence only takes a second Pack when it is already queued.
+// These are storage-layout facts: the common completion records stay inline,
+// and the bounded overflow arrays hold sixteen original owners. Grouping policy
+// lives in each SendBufferSettings.ChunkSettings value.
 const sendPackBatchMaxFrames = 2
-const sendPackBatchMaxMessageByteCount = DefaultMtu
 const sendPackH1GroupMaxFrames = 16
-const sendPackH1GroupMaxMessageByteCount = 3 * 1024
 
-// Once no contract frame can ride on the Pack, three complete tunnel-MTU
-// packets still fit the ordinary 4-KiB encrypted H1 data envelope. Opening and
-// rotating contracts retain the 3-KiB bound above; handshake carriers use the
-// larger transport minimum.
-const sendPackH1EstablishedMaxMessageByteCount = 3 * DefaultMtu
 const rawSendPackPoolCapacity = 8
 
 type ReceivePack struct {
@@ -1448,7 +1441,7 @@ func (self *ReceivePack) receiveQueueByteCount() ByteCount {
 		}
 	}
 	if self.decodedOwner != nil {
-		byteCount = addReceiveQueueByteCount(byteCount, decodedPackOwnerQueueByteCount)
+		byteCount = addReceiveQueueByteCount(byteCount, self.decodedOwner.metadataQueueByteCount())
 	}
 	self.retainedQueueByteCount = max(1, max(byteCount, self.MessageByteCount))
 	return self.retainedQueueByteCount
@@ -3459,23 +3452,24 @@ func (self *SendPack) returnFrames() {
 	}
 }
 
-// nextSendGroupChunkEnd returns the exclusive end of the next ordered wire
-// chunk. This phase deliberately retains the historical two-frame / one-MTU
-// message-payload heuristic. That is not exact final TransferFrame sizing;
-// exact protobuf, contract, and encryption-envelope accounting is separate
-// work. One oversized frame still advances alone: admission already owns it,
-// and refusing to advance would strand the group's remaining owners.
+// Splits an ordered group by its pinned frame and payload limits. H1 narrows
+// those limits after selecting the actual full contract. One oversized frame
+// still advances alone here; the H1 wire check explicitly refuses that owner
+// before serialization instead of leaving its cursor queued forever.
 func nextSendGroupChunkEndWithLimits(
 	frames []*protocol.Frame,
 	start int,
 	maxFrames int,
 	maxMessageByteCount ByteCount,
 ) int {
-	if maxFrames <= 0 {
-		maxFrames = sendPackBatchMaxFrames
-	}
-	if maxMessageByteCount <= 0 {
-		maxMessageByteCount = sendPackBatchMaxMessageByteCount
+	if maxFrames <= 0 || maxMessageByteCount <= 0 {
+		defaults := DefaultSendBufferChunkSettings()
+		if maxFrames <= 0 {
+			maxFrames = defaults.SharedMaxFrames
+		}
+		if maxMessageByteCount <= 0 {
+			maxMessageByteCount = defaults.SharedMaxMessageByteCount
+		}
 	}
 	end := start
 	messageByteCount := ByteCount(0)
@@ -3495,12 +3489,8 @@ func nextSendGroupChunkEndWithLimits(
 }
 
 func nextSendGroupChunkEnd(frames []*protocol.Frame, start int) int {
-	return nextSendGroupChunkEndWithLimits(
-		frames,
-		start,
-		sendPackBatchMaxFrames,
-		sendPackBatchMaxMessageByteCount,
-	)
+	defaults := DefaultSendBufferChunkSettings()
+	return nextSendGroupChunkEndWithLimits(frames, start, defaults.SharedMaxFrames, defaults.SharedMaxMessageByteCount)
 }
 
 func sendGroupChunkCountWithLimits(
@@ -3522,16 +3512,14 @@ func sendGroupChunkCountWithLimits(
 }
 
 func sendGroupChunkCount(frames []*protocol.Frame) int {
-	return sendGroupChunkCountWithLimits(
-		frames,
-		sendPackBatchMaxFrames,
-		sendPackBatchMaxMessageByteCount,
-	)
+	defaults := DefaultSendBufferChunkSettings()
+	return sendGroupChunkCountWithLimits(frames, defaults.SharedMaxFrames, defaults.SharedMaxMessageByteCount)
 }
 
 func (self *SendPack) groupChunkLimits() (int, ByteCount) {
 	if self.groupChunkMaxFrames <= 0 || self.groupChunkMaxMessageByteCount <= 0 {
-		return sendPackBatchMaxFrames, sendPackBatchMaxMessageByteCount
+		defaults := DefaultSendBufferChunkSettings()
+		return defaults.SharedMaxFrames, defaults.SharedMaxMessageByteCount
 	}
 	return self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount
 }
@@ -3540,14 +3528,15 @@ func (self *SendPack) pinGroupChunkLimits(policy transferFlightPolicySnapshot) {
 	if self.groupChunkMaxFrames != 0 || self.groupChunkMaxMessageByteCount != 0 {
 		return
 	}
-	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount =
-		sendPackChunkLimits(policy)
+	settings := DefaultSendBufferChunkSettings()
+	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	self.groupH1Known = settings.knownH1Enabled(policy)
 }
 
 // h1EstablishedEnvelopeAvailable proves that every remaining chunk in one
 // logical group stays on a contract-free wire shape. Checking the entire
 // remainder matters: limits are pinned for callback accounting, so a group
-// must not rotate its contract halfway through a 3,300-byte chunk policy.
+// must not rotate its contract halfway through the configured legacy policy.
 func (self *SendSequence) h1EstablishedEnvelopeAvailable(
 	messageByteCount ByteCount,
 ) bool {
@@ -3568,38 +3557,45 @@ func (self *SendSequence) pinLogicalGroupChunkLimits(
 		sendPack.groupChunkMaxMessageByteCount != 0 {
 		return
 	}
-	sendPack.pinGroupChunkLimits(policy)
-	if !policy.h1Only || len(sendPack.Frames) <= sendPack.groupFrameIndex {
+	settings := self.chunkSettings()
+	sendPack.groupChunkMaxFrames, sendPack.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	sendPack.groupH1Known = settings.knownH1Enabled(policy)
+	if !policy.h1Only || sendPack.groupH1Known || len(sendPack.Frames) <= sendPack.groupFrameIndex {
 		return
 	}
 	if self.h1EstablishedEnvelopeAvailable(
 		MessageByteCount(sendPack.Frames[sendPack.groupFrameIndex:]),
 	) {
-		sendPack.groupChunkMaxMessageByteCount =
-			sendPackH1EstablishedMaxMessageByteCount
+		sendPack.groupChunkMaxMessageByteCount = settings.establishedByteLimit()
 	}
 }
 
 func (self *SendSequence) readyDrainChunkLimits(
 	policy transferFlightPolicySnapshot,
 ) (int, ByteCount) {
-	maxFrames, maxMessageByteCount := sendPackReadyDrainLimits(policy)
-	if policy.h1Only && self.h1EstablishedEnvelopeAvailable(0) {
-		maxMessageByteCount = sendPackH1EstablishedMaxMessageByteCount
+	settings := self.chunkSettings()
+	maxFrames, maxMessageByteCount := settings.chunkLimits(policy)
+	if policy.h1Only && !settings.knownH1Enabled(policy) && self.h1EstablishedEnvelopeAvailable(0) {
+		maxMessageByteCount = settings.establishedByteLimit()
 	}
 	return maxFrames, maxMessageByteCount
 }
 
-// H1 is a reliable ordered byte stream whose ordinary data groups target the
-// 4-KiB pooled class inside the larger transport message envelope. It can
-// combine more already-ready small frames than the shared H3-compatible path
-// without adding a batching timer. Mixed, H3, P2P, and unknown routes retain
-// the conservative DATAGRAM-safe bounds.
+// Known H1 ceilings permit eight already-ready tunnel packets, narrowed by the
+// actual full proof before serialization. Unknown H1 retains its historical
+// opening/established policy; mixed, H3, P2P and untyped routes retain the shared
+// bounds. No carrier adds a wait for future frames.
 func sendPackChunkLimits(policy transferFlightPolicySnapshot) (int, ByteCount) {
-	if policy.h1Only {
-		return sendPackH1GroupMaxFrames, sendPackH1GroupMaxMessageByteCount
+	return DefaultSendBufferChunkSettings().chunkLimits(policy)
+}
+
+// Client constructors supply the owner's immutable value. A partial sequence
+// used by codec/queue helpers retains the same conservative defaults.
+func (self *SendSequence) chunkSettings() SendBufferChunkSettings {
+	if self.sendBufferSettings == nil {
+		return DefaultSendBufferChunkSettings()
 	}
-	return sendPackBatchMaxFrames, sendPackBatchMaxMessageByteCount
+	return self.sendBufferSettings.ChunkSettings
 }
 
 // Independently queued Packs use the same physical carrier bounds as logical
@@ -5274,7 +5270,101 @@ func (self *Client) Flush() {
 	self.contractManager.Flush(false)
 }
 
+// Per-sender policy bounds only already-ready message coalescing. It
+// never adds a batching wait and never overrides retained-memory admission or
+// an advertised complete-wire ceiling. The fixed callback storage bounds all
+// positive frame counts, including owner overrides.
+type SendBufferChunkSettings struct {
+	// SharedMaxFrames defaults to the two inline completion records for mixed,
+	// H3, P2P and untyped routes. Nonpositive uses the constructor default.
+	SharedMaxFrames int
+	// SharedMaxMessageByteCount defaults to one tunnel MTU of message bytes.
+	// Nonpositive uses the constructor default; one indivisible owner advances.
+	SharedMaxMessageByteCount ByteCount
+	// H1KnownMaxFrames defaults to eight for H1 routes whose complete-message
+	// ceilings are all known. Nonpositive disables this enlarged policy.
+	H1KnownMaxFrames int
+	// H1KnownMaxMessageByteCount defaults to eight tunnel MTUs of message
+	// bytes, then narrows for the actual proof/AEAD envelope. An indivisible
+	// frame still advances alone only when the complete wire fits. Nonpositive also
+	// disables enlargement; it never means unbounded admission.
+	H1KnownMaxMessageByteCount ByteCount
+	// H1UnknownMaxFrames defaults to sixteen already-ready small originals
+	// for legacy H1 routes. Nonpositive uses the constructor default.
+	H1UnknownMaxFrames int
+	// H1UnknownMaxMessageByteCount defaults to the legacy3KiB opening limit.
+	// Nonpositive uses the constructor default, preserving custom zero values.
+	H1UnknownMaxMessageByteCount ByteCount
+	// H1EstablishedMaxMessageByteCount defaults to three tunnel MTUs only when
+	// the acknowledged current contract can cover the complete remainder.
+	// Nonpositive uses the constructor default; a positive lower limit is kept.
+	H1EstablishedMaxMessageByteCount ByteCount
+}
+
+// Returns one allocation-free value; this constructor is the only policy-default source.
+func DefaultSendBufferChunkSettings() SendBufferChunkSettings {
+	return SendBufferChunkSettings{
+		SharedMaxFrames:                  sendPackBatchMaxFrames,
+		SharedMaxMessageByteCount:        DefaultMtu,
+		H1KnownMaxFrames:                 8,
+		H1KnownMaxMessageByteCount:       8 * DefaultMtu,
+		H1UnknownMaxFrames:               sendPackH1GroupMaxFrames,
+		H1UnknownMaxMessageByteCount:     kib(3),
+		H1EstablishedMaxMessageByteCount: 3 * DefaultMtu,
+	}
+}
+
+// Applies owner overrides while preserving legacy zero values and fixed storage.
+func (self SendBufferChunkSettings) sharedLimits() (int, ByteCount) {
+	defaults := DefaultSendBufferChunkSettings()
+	frames, byteCount := self.SharedMaxFrames, self.SharedMaxMessageByteCount
+	if frames <= 0 {
+		frames = defaults.SharedMaxFrames
+	}
+	if byteCount <= 0 {
+		byteCount = defaults.SharedMaxMessageByteCount
+	}
+	return min(frames, sendPackH1GroupMaxFrames), byteCount
+}
+
+// Requires explicit owner permission and a positive ceiling on every active H1 route.
+func (self SendBufferChunkSettings) knownH1Enabled(policy transferFlightPolicySnapshot) bool {
+	return policy.h1Only && policy.h1MessageLimitsKnown && policy.h1MaxMessageByteCount > 0 &&
+		self.H1KnownMaxFrames > 0 && self.H1KnownMaxMessageByteCount > 0
+}
+
+// Selects only the current carrier policy; full encoded-wire checks remain separate.
+func (self SendBufferChunkSettings) chunkLimits(policy transferFlightPolicySnapshot) (int, ByteCount) {
+	if !policy.h1Only {
+		return self.sharedLimits()
+	}
+	if self.knownH1Enabled(policy) {
+		return min(self.H1KnownMaxFrames, sendPackH1GroupMaxFrames), self.H1KnownMaxMessageByteCount
+	}
+	defaults := DefaultSendBufferChunkSettings()
+	frames, byteCount := self.H1UnknownMaxFrames, self.H1UnknownMaxMessageByteCount
+	if frames <= 0 {
+		frames = defaults.H1UnknownMaxFrames
+	}
+	if byteCount <= 0 {
+		byteCount = defaults.H1UnknownMaxMessageByteCount
+	}
+	return min(frames, sendPackH1GroupMaxFrames), byteCount
+}
+
+// Resolves the legacy established byte cap without raising a positive lower value.
+func (self SendBufferChunkSettings) establishedByteLimit() ByteCount {
+	if self.H1EstablishedMaxMessageByteCount > 0 {
+		return self.H1EstablishedMaxMessageByteCount
+	}
+	return DefaultSendBufferChunkSettings().H1EstablishedMaxMessageByteCount
+}
+
 type SendBufferSettings struct {
+	// ChunkSettings belongs to this sender; its defaults preserve shared and
+	// unknown-H1 policy while enabling the guarded known-H1 eight-frame path.
+	ChunkSettings SendBufferChunkSettings
+
 	// Extra Transfer-level pacing is disabled for every transport by default.
 	// False preserves delivery windows, byte budgets and ACKs without adding
 	// rate/drain waits over the transport's own flow control. True is reserved
@@ -8270,7 +8360,48 @@ func (self *SendSequence) processLogicalGroupChunk(
 			err = newUnwrittenSendPackError(err)
 		}
 		sendPack.disposeUnsentGroup(err)
-		return true, false, false
+		return true, errors.Is(contractErr, errSendPackH1Envelope), false
+	}
+	// Contract acquisition can wait through a carrier replacement. Only the
+	// current published ceiling may bound this still-unwritten chunk.
+	envelopePolicy := self.transferFlightPolicy()
+	// An unknown or mixed replacement cannot inherit permission to enlarge a
+	// still-unwritten chunk. Existing unknown-H1 partitions keep their policy.
+	settings := self.chunkSettings()
+	currentFrames, currentBytes := settings.chunkLimits(envelopePolicy)
+	if sendPack.groupH1Known && !settings.knownH1Enabled(envelopePolicy) &&
+		(currentFrames < maxFrames || currentBytes < maxMessageByteCount) {
+		sendPack.shrinkGroupLimits(min(maxFrames, currentFrames), min(maxMessageByteCount, currentBytes))
+		maxFrames, maxMessageByteCount = sendPack.groupChunkLimits()
+		end = nextSendGroupChunkEndWithLimits(sendPack.Frames, start, maxFrames, maxMessageByteCount)
+		frames = sendPack.Frames[start:end]
+		boundedMessageByteCount := MessageByteCount(frames)
+		if self.sendContract != nil {
+			self.sendContract.reduceUnwrittenDebit(messageByteCount, boundedMessageByteCount)
+		}
+		messageByteCount = boundedMessageByteCount
+	}
+	if envelopePolicy.h1Only && envelopePolicy.h1MaxMessageByteCount > 0 {
+		boundedEnd, envelopeErr := self.boundH1LogicalGroup(sendPack, envelopePolicy.h1MaxMessageByteCount)
+		if envelopeErr != nil {
+			if self.sendContract != nil {
+				self.sendContract.rollbackUnwritten(messageByteCount)
+			}
+			var err error = errSendPackH1Envelope
+			if start == 0 && sendPack.groupCompletion == nil {
+				err = newUnwrittenSendPackError(err)
+			}
+			sendPack.disposeUnsentGroup(err)
+			return true, true, false
+		}
+		end = boundedEnd
+		frames = sendPack.Frames[start:end]
+		maxFrames, maxMessageByteCount = sendPack.groupChunkLimits()
+		boundedMessageByteCount := MessageByteCount(frames)
+		if self.sendContract != nil {
+			self.sendContract.reduceUnwrittenDebit(messageByteCount, boundedMessageByteCount)
+		}
+		messageByteCount = boundedMessageByteCount
 	}
 	var acks sendAckSet
 	acks.add(sendPack.ackRecord())
@@ -8951,7 +9082,7 @@ func (self *SendSequence) applyNoAckFastPathAccounting() {
 // rule out — a contract switch published between the read and the write — can
 // be driven deterministically.
 func (self *SendSequence) readNoAckFastPath(sendPack *SendPack) *noAckFastPathSnapshot {
-	if len(sendPack.noAckFastPathFrames()) == 0 {
+	if len(sendPack.noAckFastPathFrames(self.chunkSettings())) == 0 {
 		return nil
 	}
 	return self.noAckFastPath.Load()
@@ -8960,7 +9091,7 @@ func (self *SendSequence) readNoAckFastPath(sendPack *SendPack) *noAckFastPathSn
 // Only an untouched whole UDP group fitting the conservative shared chunk
 // bounds can use one direct write. Split, reliable and compatibility groups
 // retain their ordinary source-owned cursor and completion path.
-func (self *SendPack) noAckFastPathFrames() []*protocol.Frame {
+func (self *SendPack) noAckFastPathFrames(settings SendBufferChunkSettings) []*protocol.Frame {
 	if self.Ack || self.ForceUnwrapped {
 		return nil
 	}
@@ -8970,10 +9101,11 @@ func (self *SendPack) noAckFastPathFrames() []*protocol.Frame {
 		}
 		return self.frameList()
 	}
+	maxFrames, maxMessageByteCount := settings.sharedLimits()
 	group, ok := self.ackTarget.(*parsedPacketGroup)
 	if !ok || group.ipPath == nil || group.ipPath.Protocol != IpProtocolUdp ||
 		self.groupFrameIndex != 0 || self.groupCompletion != nil ||
-		len(self.Frames) == 0 || sendPackBatchMaxFrames < len(self.Frames) {
+		len(self.Frames) == 0 || maxFrames < len(self.Frames) {
 		return nil
 	}
 	for _, frame := range self.Frames {
@@ -8981,7 +9113,7 @@ func (self *SendPack) noAckFastPathFrames() []*protocol.Frame {
 			return nil
 		}
 	}
-	if sendPackBatchMaxMessageByteCount < MessageByteCount(self.Frames) {
+	if maxMessageByteCount < MessageByteCount(self.Frames) {
 		return nil
 	}
 	return self.Frames
@@ -8994,7 +9126,7 @@ func (self *SendSequence) writeNoAckFastPath(
 	snapshot *noAckFastPathSnapshot,
 	sendPack *SendPack,
 ) (written bool) {
-	frames := sendPack.noAckFastPathFrames()
+	frames := sendPack.noAckFastPathFrames(self.chunkSettings())
 	if len(frames) == 0 {
 		return false
 	}
@@ -9966,6 +10098,51 @@ sendSequenceLoop:
 				}
 				self.currentPreparedHandoff = nil
 				if contractUpdated {
+					// A contract wait may have replaced the carrier generation.
+					envelopePolicy := self.transferFlightPolicy()
+					chunkSettings := self.chunkSettings()
+					lostKnownH1 := chunkSettings.knownH1Enabled(flightPolicy) && !chunkSettings.knownH1Enabled(envelopePolicy)
+					currentFrames, currentBytes := self.readyDrainChunkLimits(envelopePolicy)
+					checkEnvelope := envelopePolicy.h1Only && envelopePolicy.h1MaxMessageByteCount > 0
+					if lostKnownH1 || checkEnvelope {
+						originalMessageByteCount := messageByteCount
+						for {
+							var frameValues [sendPackH1GroupMaxFrames]*protocol.Frame
+							frames := sendPack.frameList()
+							if sendPackCount > 1 {
+								frames = frameValues[:0]
+								for packIndex := range sendPackCount {
+									frames = append(frames, sendPacks[packIndex].frameList()...)
+								}
+							}
+							fitsPolicy := !lostKnownH1 || sendPackCount == 1 ||
+								(frameCount <= currentFrames && messageByteCount <= currentBytes)
+							fitsEnvelope := !checkEnvelope || self.h1FramesEnvelopeFits(frames, envelopePolicy.h1MaxMessageByteCount)
+							if fitsPolicy && fitsEnvelope {
+								break
+							}
+							if sendPackCount == 1 {
+								if self.sendContract != nil {
+									self.sendContract.rollbackUnwritten(originalMessageByteCount)
+								}
+								sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errSendPackH1Envelope))
+								processingPacks[0] = nil
+								return !packsClosed
+							}
+							// Restore tails in reverse insertion order; each keeps its
+							// original raw owner and independent completion records.
+							sendPackCount -= 1
+							tail := sendPacks[sendPackCount]
+							frameCount -= len(tail.frameList())
+							messageByteCount -= tail.serializedMessageByteCount()
+							scheduler.PushFront(tail)
+							processingPacks[sendPackCount] = nil
+							sendPacks[sendPackCount] = nil
+						}
+						if self.sendContract != nil {
+							self.sendContract.reduceUnwrittenDebit(originalMessageByteCount, messageByteCount)
+						}
+					}
 					if bypassedRecoveryAdmission {
 						self.client.unreliableNoAckAdmissionBypassCount.Add(1)
 					}
@@ -10108,7 +10285,8 @@ sendSequenceLoop:
 					sendPacks[packIndex].releaseRaw()
 					processingPacks[packIndex] = nil
 				}
-				return errors.Is(contractErr, errPreparedSendCanceled) && !packsClosed
+				return (errors.Is(contractErr, errPreparedSendCanceled) ||
+					errors.Is(contractErr, errSendPackH1Envelope)) && !packsClosed
 			}
 
 			if !processPack() {
@@ -10307,6 +10485,9 @@ sendSequenceLoop:
 // Reports the exact terminal outcome captured inside contract acquisition.
 // A later sequence cancellation cannot reclassify an already-live exhaustion.
 func (self *SendSequence) classifyContractCreationFailure(err error) error {
+	if errors.Is(err, errSendPackH1Envelope) {
+		return err
+	}
 	if self.sendBuffer != nil && self.sendBuffer.beforeContractFailureClassifyForTest != nil {
 		self.sendBuffer.beforeContractFailureClassifyForTest(self.id())
 	}
@@ -10495,6 +10676,12 @@ func (self *SendSequence) updateContractWithAckPromotion(
 				return false
 			}
 
+			if !self.h1ContractEnvelopeFits(nextSendContract.contract) {
+				contractErr = errSendPackH1Envelope
+				self.client.ContractManager().CloseContract(nextSendContract.contractId, 0, 0)
+				return false
+			}
+
 			// note `update(0)` will use `MinMessageByteCount` byte count
 			// the min message byte count is used to avoid spam
 			if nextSendContract.update(0) && nextSendContract.update(messageByteCount) {
@@ -10617,6 +10804,9 @@ func (self *SendSequence) updateContractWithAckPromotion(
 		}
 
 		for {
+			if errors.Is(contractErr, errSendPackH1Envelope) {
+				return false
+			}
 			if handoff.cancellationRequested() {
 				contractErr = errPreparedSendCanceled
 				return false
@@ -10991,6 +11181,10 @@ func (self *SendSequence) announceContractAhead() {
 	if _, ok := self.openSendContracts[aheadContract.contractId]; ok {
 		return
 	}
+	if !self.h1ContractEnvelopeFits(aheadContract.contract) {
+		self.client.ContractManager().CloseContract(aheadContract.contractId, 0, 0)
+		return
+	}
 	// The announcement's own bytes are charged to the current contract, like
 	// every other control Pack on this sequence. A contract with no room for
 	// one more minimum message is already exhausted, and announcing would
@@ -11059,7 +11253,8 @@ func (self *SendSequence) setAheadContract(messageByteCount ByteCount) bool {
 	// A successor already within its margin of its own deadline would retire on
 	// the message after this one: no successor at all.
 	if retireTime, ok := self.contractRetireTime(aheadContract, time.Time{}); self.aheadSendContractMetadataGeneration != metadata.generation ||
-		aheadContract.expired() || (ok && !time.Now().Before(retireTime)) {
+		aheadContract.expired() || (ok && !time.Now().Before(retireTime)) ||
+		!self.h1ContractEnvelopeFits(aheadContract.contract) {
 		self.discardAheadContract()
 		return false
 	}

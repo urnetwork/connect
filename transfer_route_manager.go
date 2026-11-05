@@ -69,6 +69,10 @@ func h1AckPriorityRoute(route Route) (Route, bool) {
 // ReceiveReliability tells Pack admission whether the physical lane can safely
 // propagate fixed-queue backpressure.
 type TransferCarrierProperties struct {
+	// MaxMessageByteCount is an advertised maximum complete Transfer message,
+	// including encryption but excluding this carrier's own framing header.
+	// Zero is unknown; it must not invent a default ceiling for custom routes.
+	MaxMessageByteCount int
 	// These pointers belong to this exact h1 graph and route generation.
 	// Nil keeps legacy/custom carrier admission unchanged.
 	h1SendRetained     *platformH1RetainedLane
@@ -1699,6 +1703,12 @@ type routeSnapshot struct {
 	// carrier. Transfer uses it to recover H1's larger WebSocket message
 	// envelope without making an H3 DATAGRAM candidate exceed one tunnel MTU.
 	h1Only bool
+	// Minimum advertised positive ceiling among the active H1 routes. Unknown
+	// routes add no invented limit and are not thereby proved capable.
+	h1MaxMessageByteCount int
+	// True only when every active H1 route supplies a positive ceiling. A
+	// known sibling does not prove that an unknown carrier can take eight.
+	h1MessageLimitsKnown bool
 	// preferDirectRoute is non-nil only when every active route is an H1/H3
 	// platform carrier at the same priority and both transport types are live.
 	// routes is published with this route first. Writers use only that first
@@ -1756,13 +1766,15 @@ func (self *routeSnapshot) observeDirectAffinityBlocked() {
 // carrier needs Transfer-level flight control and which publication wakes a
 // sender waiting for that constraint to change.
 type transferFlightPolicySnapshot struct {
-	generation    uint64
-	limited       bool
-	byteLimit     ByteCount
-	messageLimit  int
-	flowIsolation bool
-	flowReserve   bool
-	h1Only        bool
+	generation            uint64
+	limited               bool
+	byteLimit             ByteCount
+	messageLimit          int
+	flowIsolation         bool
+	flowReserve           bool
+	h1Only                bool
+	h1MaxMessageByteCount int
+	h1MessageLimitsKnown  bool
 	// Dispatch eligibility is narrower than the aggregate grouping policy.
 	// Both facts come from this generation and preserve existing affinity.
 	h1WriteOnly         bool
@@ -1785,6 +1797,8 @@ func (self *MultiRouteSelector) transferFlightPolicy() transferFlightPolicySnaps
 		flowIsolation:          snapshot.unreliableFlowIsolation,
 		flowReserve:            snapshot.unreliableFlowReserve,
 		h1Only:                 snapshot.h1Only,
+		h1MaxMessageByteCount:  snapshot.h1MaxMessageByteCount,
+		h1MessageLimitsKnown:   snapshot.h1MessageLimitsKnown,
 		h1WriteOnly:            snapshot.writeH1Only(false),
 		h1ReliableWriteOnly:    snapshot.writeH1Only(true),
 		reliableRouteAvailable: 0 < len(snapshot.reliableRoutes),
@@ -2256,15 +2270,26 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 
 	allDirectRoutes := 0 < len(activeRoutes)
 	h1Only := 0 < len(activeRoutes)
+	h1MaxMessageByteCount := 0
+	h1MessageLimitsKnown := h1Only
 	for _, route := range activeRoutes {
 		transportType := routeTransportTypes[route]
+		if transportType != TransportTypeH1 || routeCarrierProperties[route].MaxMessageByteCount <= 0 {
+			h1MessageLimitsKnown = false
+		}
 		if transportType != TransportTypeH1 {
 			h1Only = false
+		} else if limit := routeCarrierProperties[route].MaxMessageByteCount; limit > 0 &&
+			(h1MaxMessageByteCount == 0 || limit < h1MaxMessageByteCount) {
+			h1MaxMessageByteCount = limit
 		}
 		if transportType != TransportTypeH1 && transportType != TransportTypeH3 {
 			allDirectRoutes = false
 			break
 		}
+	}
+	if !h1Only {
+		h1MaxMessageByteCount = 0
 	}
 	previousPreferredDirectRoute := self.preferredDirectRoute
 	if !slices.Contains(activeRoutes, self.preferredDirectRoute) {
@@ -2362,6 +2387,8 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		unreliableFlowIsolation:        unreliableTransferPath && unreliableFlowIsolation,
 		unreliableFlowReserve:          unreliableTransferPath && unreliableFlowReserve,
 		h1Only:                         h1Only,
+		h1MaxMessageByteCount:          h1MaxMessageByteCount,
+		h1MessageLimitsKnown:           h1MessageLimitsKnown,
 		preferDirectRoute:              preferDirectRoute,
 		weight:                         weight,
 		notify:                         self.transportUpdate.NotifyChannel(),

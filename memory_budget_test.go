@@ -173,20 +173,22 @@ func TestMemoryBudgetFloors(t *testing.T) {
 
 func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 	// The small/full packet classes split the packet budget 1:3; the large
-	// object classes split their budget evenly.
+	// object classes preserve old floors and split only residual allowance.
 	defer ResizeMessagePools(InitialMessagePoolByteCount/2, InitialMessagePoolByteCount/2)
 
 	ResizeMessagePools(mib(4), mib(2))
 	pools := orderedMessagePools()
-	AssertEqual(t, len(pools), 4)
+	AssertEqual(t, len(pools), 5)
 	for _, pool := range pools {
 		switch pool.size {
 		case smallPacketPoolSize:
 			AssertEqual(t, pool.capacity(), int(mib(1))/pool.size)
 		case packetPoolSize:
 			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
-		default:
-			AssertEqual(t, pool.capacity(), int(mib(1))/pool.size)
+		case 4096, 8192:
+			AssertEqual(t, pool.capacity(), int(3*mib(1)/4)/pool.size)
+		case 9216:
+			AssertEqual(t, pool.capacity(), int(mib(1)/2)/pool.size)
 		}
 	}
 
@@ -200,7 +202,8 @@ func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 		}
 	}
 
-	// The historical one-argument API gives every large class the supplied cap
+	// The historical one-argument API keeps both old large caps; the new class
+	// has zero free retention. The old classes receive the supplied cap
 	// while the two packet classes share one supplied cap.
 	ResizeMessagePools(mib(3))
 	for _, pool := range pools {
@@ -209,8 +212,10 @@ func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 			AssertEqual(t, pool.capacity(), int(3*mib(1)/4)/pool.size)
 		case packetPoolSize:
 			AssertEqual(t, pool.capacity(), int(9*mib(1)/4)/pool.size)
-		default:
+		case 4096, 8192:
 			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
+		case 9216:
+			AssertEqual(t, pool.capacity(), 0)
 		}
 	}
 }

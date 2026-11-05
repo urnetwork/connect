@@ -778,9 +778,9 @@ func (owner *decodedPackOwner) nextFrame() *protocol.Frame {
 		owner.framePointers[index] = frame
 		return frame
 	}
-	// A conforming current sender emits at most two data frames per Pack.
-	// Preserve wire compatibility for legacy/untrusted peers with more fields,
-	// but keep that exceptional memory proportional to the exceptional input.
+	// Two inline entries avoid allocation for small Packs. Larger decoded
+	// Packs retain separate frame objects and a grown pointer slice; retained
+	// queue accounting charges that overflow in the metadata envelope.
 	return &protocol.Frame{}
 }
 

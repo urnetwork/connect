@@ -154,7 +154,7 @@ func (self *PlatformTransportSettings) h1RetainedQueueByteCount(count int) ByteC
 	return max(platformH1QueueByteCount(count), retainedMessageCapacity(ByteCount(maximum)))
 }
 
-// The reader can simultaneously hold its 8-KiB read scratch and a grown
+// The reader can simultaneously hold the largest pooled read scratch and a grown
 // allocation including the one-byte over-limit probe; four times the declared
 // maximum bounds the growth/copy overlap. The writer holds one 16-KiB encoded
 // batch and a framed copy including its four-byte header. Custom split policy
@@ -164,10 +164,12 @@ func (self *PlatformTransportSettings) h1RetainedQueueByteCount(count int) ByteC
 // this minimum prevents a custom tiny base from omitting known live scratch.
 func (self *PlatformTransportSettings) h1RetainedScratchMinimum() ByteCount {
 	maximum := ByteCount((&PlatformTransport{settings: self, framerSettings: self.FramerSettings}).h1MaxMessageByteCount())
-	if (ByteCount(math.MaxInt64)-4-8192-MessagePoolMetaByteCount)/4 < maximum {
+	pools := orderedMessagePools()
+	readScratch := ByteCount(pools[len(pools)-1].size) + MessagePoolMetaByteCount
+	if (ByteCount(math.MaxInt64)-4-readScratch)/4 < maximum {
 		return ByteCount(math.MaxInt64)
 	}
-	reader := 4*(maximum+1) + 8192 + MessagePoolMetaByteCount
+	reader := 4*(maximum+1) + readScratch
 	writer := addReceiveQueueByteCount(webSocketWriteBatchMaxByteCount, retainedMessageCapacity(maximum+4))
 	metadata := addReceiveQueueByteCount(platformH1QueueByteCount(self.TransportBufferSize)/platformH1QueueSlotByteCount*96, kib(8))
 	return addReceiveQueueByteCount(addReceiveQueueByteCount(reader, writer), metadata)

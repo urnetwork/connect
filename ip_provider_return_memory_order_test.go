@@ -28,6 +28,7 @@ func TestProviderTcpReturnSlotsPassToOldestWaitingProducer(t *testing.T) {
 		defer cancel()
 		provider := &RemoteUserNatProvider{
 			ctx:              ctx,
+			localUserNat:     &LocalUserNat{settings: &LocalUserNatSettings{TcpBufferSettings: DefaultTcpBufferSettings()}},
 			tcpReturnMemory:  NewTransferMemoryBudget(kib(64)),
 			memoryOperations: newLifecycleAdmission(),
 		}

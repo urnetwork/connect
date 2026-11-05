@@ -460,6 +460,8 @@ func TestTcpReturnFlightMetadataUsesFlowRootClaim(t *testing.T) {
 	settings := DefaultTcpBufferSettingsWithBufferSize(16)
 	settings.Mtu = 44
 	settings.ReturnRecoveryMaxPacketCount = 4
+	settings.MemoryBudget = NewTransferMemoryBudget(mib(2))
+	settings = boundedNatTcpMemorySettings(settings, settings.MemoryBudget)
 	claim := natTcpFlowMemoryByteCount(settings)
 	settings.MemoryBudget = NewTransferMemoryBudget(claim)
 	ctx, cancel := context.WithCancel(t.Context())

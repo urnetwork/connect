@@ -1,3 +1,4 @@
+// Message buffers share bounded free lists while live owners retain exact roots.
 package connect
 
 import (
@@ -8,6 +9,7 @@ import (
 	"hash/maphash"
 	"io"
 	"math"
+	"math/bits"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -47,13 +49,14 @@ const (
 )
 
 // InitialMessagePoolByteCount is the initial total free-list byte budget. One
-// third backs the small/full packet classes and two thirds backs the two large
+// third backs the small/full packet classes and two thirds backs the three large
 // protocol-frame classes (see orderedMessagePools and ResizeMessagePools).
 var InitialMessagePoolByteCount = mib(2)
 
 const (
 	// Four shards cut the measured pool-return convoy while adding only about
-	// 54 KiB of fixed per-tag counter state across the three size classes.
+	// 96 KiB of fixed per-tag counter state across the four existing classes;
+	// the fifth class adds 24 KiB without increasing their free-list byte budget.
 	// The count is a power of two because the immutable buffer id carries the
 	// shard in its low bits.
 	messagePoolShardCount = 4
@@ -417,21 +420,29 @@ func packetPoolFloorCount(poolSize int) int {
 const largeObjectPoolFloorByteCount = 256 * 1024
 
 func largeObjectPoolFloorCount(poolSize int) int {
+	// Preserve the two existing floors. The extended class can reuse only
+	// the caller's remaining large-object allowance and trims to zero.
+	if 8192 < poolSize {
+		return 0
+	}
 	return max(1, largeObjectPoolFloorByteCount/poolSize)
 }
 
 var orderedMessagePools = sync.OnceValue(func() []*messagePool {
 	// Preserve the historical one-third packet / two-thirds large-object
 	// initial split. The packet third is now divided between the small and
-	// full-MTU classes, while each large class keeps its prior byte cap.
-	// 4096 fits an ordinary two-packet transfer batch without retaining an
-	// 8 KiB buffer for a ~3 KiB message. 8192 is the exact pooled class for a
-	// full MinimumMessageLenLimit carrier. Larger frames remain unpooled.
-	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192}
+	// full-MTU classes; the large classes share their existing aggregate cap.
+	// Keep 4096 and 8192 so existing roots retain their allocation geometry.
+	// 9216 payload bytes plus the 12-byte metadata tail expose cap 9228,
+	// distinct from ordinary allocator-rounded append/protobuf capacities.
+	// This covers ordinary eight-packet H1 data while keeping the allocator
+	// request within the local 9472-byte class; full proofs can be larger.
+	// Larger encodings remain unpooled; no wire or admission cap is raised.
+	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192, 9216}
 	initialPacketBytes := InitialMessagePoolByteCount / 3
 	initialSmallPacketBytes, initialFullPacketBytes :=
 		splitPacketPoolByteCount(initialPacketBytes)
-	initialLargeClassBytes := (InitialMessagePoolByteCount - initialPacketBytes) / 2
+	initialLargeClassBytes := (InitialMessagePoolByteCount - initialPacketBytes) / ByteCount(len(poolSizes)-2)
 	pools := []*messagePool{}
 	for _, poolSize := range poolSizes {
 		poolByteCount := initialLargeClassBytes
@@ -496,26 +507,25 @@ func poolStats(pools []*messagePool) {
 	}
 }
 
-// ResizeMessagePools bounds the free lists. With two arguments, the small and
-// full-MTU packet classes split packetByteCount 1:3, and the large object
-// classes split the second byte count evenly. The one-argument form preserves
-// the historical API: packet classes share the supplied cap while every large
-// class receives that cap.
-//
-// Buffers in use are unaffected; this only bounds what the free lists retain,
-// with per-class floors that preserve a working reuse set. Safe to call at
-// runtime.
+// ResizeMessagePools bounds free retention, never live owners. The two-argument
+// form first funds the existing 4/8-KiB floors, then splits the remaining large
+// allowance across all three large classes. The extended class has no floor.
+// The one-argument compatibility form keeps its two historical large caps;
+// the added class retains no free roots under that form. Packet caps keep 1:3.
+// Safe to call at runtime; outstanding shares keep their original lifetime.
 func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...ByteCount) {
 	pools := orderedMessagePools()
 	largeObjectPoolCount := 0
+	largeObjectFloorByteCount := ByteCount(0)
 	for _, pool := range pools {
 		if !isPacketPoolSize(pool.size) {
 			largeObjectPoolCount += 1
+			largeObjectFloorByteCount += ByteCount(largeObjectPoolFloorCount(pool.size) * pool.size)
 		}
 	}
-	largeObjectByteCount := packetByteCount * ByteCount(largeObjectPoolCount)
+	largeObjectExtraByteCount := ByteCount(0)
 	if 0 < len(largeObjectByteCounts) {
-		largeObjectByteCount = largeObjectByteCounts[0]
+		largeObjectExtraByteCount = max(0, max(0, largeObjectByteCounts[0])-largeObjectFloorByteCount) / ByteCount(largeObjectPoolCount)
 	}
 	smallPacketByteCount, fullPacketByteCount := splitPacketPoolByteCount(packetByteCount)
 	for _, pool := range pools {
@@ -531,8 +541,16 @@ func ResizeMessagePools(packetByteCount ByteCount, largeObjectByteCounts ...Byte
 				int(fullPacketByteCount/ByteCount(pool.size)),
 			))
 		default:
-			poolByteCount := largeObjectByteCount / ByteCount(largeObjectPoolCount)
-			pool.Resize(max(largeObjectPoolFloorCount(pool.size), int(poolByteCount/ByteCount(pool.size))))
+			floorCount := largeObjectPoolFloorCount(pool.size)
+			if len(largeObjectByteCounts) == 0 {
+				capacity := 0
+				if 0 < floorCount {
+					capacity = max(floorCount, int(max(0, packetByteCount)/ByteCount(pool.size)))
+				}
+				pool.Resize(capacity)
+			} else {
+				pool.Resize(floorCount + int(largeObjectExtraByteCount/ByteCount(pool.size)))
+			}
 		}
 	}
 }
@@ -602,8 +620,8 @@ func WarmMessagePools() {
 
 // TrimMessagePoolsTo drops an idle burst's excess free buffers while
 // preserving a caller-selected packet reuse set and every class's configured
-// capacity. Larger protocol objects retain their fixed 256-KiB floor per
-// class. Buffers still held by consumers are untouched, and subsequent returns
+// capacity. The existing 4/8-KiB classes retain their 256-KiB floors; the
+// extended class trims to zero. Buffers held by consumers are untouched; returns
 // may refill the original capacity during the next burst.
 func TrimMessagePoolsTo(packetByteCount ByteCount) ByteCount {
 	smallWarmByteCount, fullWarmByteCount :=
@@ -877,6 +895,8 @@ func MessagePoolRootByteCount(message []byte) ByteCount {
 		return 4096
 	case 8192 + MessagePoolMetaByteCount:
 		return 8192
+	case 9216 + MessagePoolMetaByteCount:
+		return 9216
 	default:
 		return ByteCount(len(message))
 	}
@@ -1145,7 +1165,10 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 		b = b2
 	}
 
-	out := make([]byte, i, 2*i)
+	// Preserve the next power-of-two overflow allocation even when the final
+	// pool class is not a power of two. Both 8192 and 9216 grow to 16384.
+	outCapacity := 1 << bits.Len(uint(i))
+	out := make([]byte, i, outCapacity)
 	copy(out, b)
 	defer MessagePoolReturn(b)
 	for {

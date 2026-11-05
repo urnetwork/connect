@@ -1,0 +1,5 @@
+package connect
+
+const privateTcpProfilePressureExpectedMaxBatchCount = 8
+const privateTcpProfilePressureExpectedColdBatchCount = 2
+const privateTcpProfilePressureExpectedColdWorkspaceBytes ByteCount = 0

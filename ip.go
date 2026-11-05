@@ -511,10 +511,12 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		SequenceBufferSize:     bufferSize,
 		Mtu:                    DefaultMtu,
 		// large socket reads are split into mtu-sized data packets by `DataPackets`
-		ReadBufferByteCount: int(MemoryScaledByteCount(kib(64), kib(16))),
-		WriteBatchSize:      64,
-		MinWindowSize:       minWindowSize,
-		InitialWindowSize:   initialWindowSize,
+		ReadBufferByteCount:      int(MemoryScaledByteCount(kib(64), kib(16))),
+		WriteBatchSize:           64,
+		MemoryWriteBatchSize:     8,
+		MemoryColdWriteBatchSize: 2,
+		MinWindowSize:            minWindowSize,
+		InitialWindowSize:        initialWindowSize,
 		MaxWindowSize: scaledPow2WindowSize(
 			uint32(mib(16)),
 			minWindowSize,
@@ -4252,10 +4254,26 @@ type TcpBufferSettings struct {
 	// WritePollTimeout time.Duration
 	IdleTimeout         time.Duration
 	ReadBufferByteCount int
-	// the maximum number of payloads to coalesce into a single socket write
-	WriteBatchSize     int
-	SequenceBufferSize int
-	Mtu                int
+	// Maximum payloads in a socket write or ready return callback. A bounded
+	// NAT normalizes non-positive values to one and applies MemoryWriteBatchSize.
+	WriteBatchSize int
+	// Maximum socket-write/ready-return batch packets with MemoryBudget.
+	// Eight amortizes callbacks for already-ready work without a fill delay.
+	// Non-positive disables expansion beyond the configured
+	// cold working set. One selects single-packet callbacks. The real
+	// queue and provider workspace envelopes can lower larger requests; extra
+	// queued/held roots require exact optional credit before publication.
+	// Ignored without MemoryBudget, preserving the unbudgeted WriteBatchSize.
+	MemoryWriteBatchSize int
+	// Prepaid producer, cold queue and callback packet count with MemoryBudget.
+	// Two preserves the previous cold-flow claim and fanout; non-positive
+	// means one. The constructor reduces it
+	// to the requested hot limit and the original single-slot byte envelope.
+	// Its exact effective value is charged before a flow or packet is created.
+	// Ignored without MemoryBudget; this is not a global producer cap.
+	MemoryColdWriteBatchSize int
+	SequenceBufferSize       int
+	Mtu                      int
 	// the window size is the max amount of packet data in memory for each sequence
 	// `WindowSize / 2^WindowScale` must fit in uint16
 	// see https://datatracker.ietf.org/doc/html/rfc1323#page-8
@@ -4521,6 +4539,7 @@ func newTcpBuffer[BufferId comparable](
 	receiveCallback receiveTransferPacketFunction,
 	tcpBufferSettings *TcpBufferSettings,
 ) *TcpBuffer[BufferId] {
+	tcpBufferSettings = boundedNatTcpMemorySettings(tcpBufferSettings, tcpBufferSettings.MemoryBudget)
 	return &TcpBuffer[BufferId]{
 		log:               loggerOrDefault(tcpBufferSettings.Log),
 		ctx:               ctx,
@@ -5323,6 +5342,7 @@ func newTcpSequenceWithTransferKey(
 	initialSynSeq uint32,
 	tcpBufferSettings *TcpBufferSettings,
 ) *TcpSequence {
+	tcpBufferSettings = boundedNatTcpMemorySettings(tcpBufferSettings, tcpBufferSettings.MemoryBudget)
 	memory, admitted := reserveNatMemory(tcpBufferSettings.MemoryBudget, natTcpFlowMemoryByteCount(tcpBufferSettings))
 	if !admitted {
 		return nil
@@ -5368,13 +5388,14 @@ func newTcpSequenceWithTransferKey(
 			// prime the cached ip path before the sequence goroutines start
 			// (see IpPath)
 			ipPath: &IpPath{
-				Version:          ipVersion,
-				Protocol:         IpProtocolTcp,
-				SourceIp:         sourceIp,
-				SourcePort:       int(sourcePort),
-				DestinationIp:    destinationIp,
-				DestinationPort:  int(destinationPort),
-				tcpReturnContext: cancelCtx,
+				Version:                 ipVersion,
+				Protocol:                IpProtocolTcp,
+				SourceIp:                sourceIp,
+				SourcePort:              int(sourcePort),
+				DestinationIp:           destinationIp,
+				DestinationPort:         int(destinationPort),
+				tcpReturnContext:        cancelCtx,
+				tcpReturnBatchWorkspace: newTcpReturnBatchWorkspace(cancelCtx, tcpBufferSettings),
 			},
 			// The SYN advertises the protocol's literal 16-bit ceiling. The first
 			// post-handshake ACK can immediately advertise this larger scaled
@@ -5589,12 +5610,14 @@ func (self *TcpSequence) receiveBatch(packets [][]byte, recoveryMode receiveReco
 
 func (self *TcpSequence) Run() {
 	defer self.memory.release()
+	var readPackets *tcpReturnReadQueue
 	var childWorkers sync.WaitGroup
 	defer func() {
 		if self.beforeChildWorkersWaitForTest != nil {
 			self.beforeChildWorkersWaitForTest()
 		}
 		childWorkers.Wait()
+		readPackets.releaseAfterJoin()
 		self.releaseReturnChunks()
 	}()
 	defer func() {
@@ -6062,16 +6085,9 @@ func (self *TcpSequence) Run() {
 		}
 	})
 
-	// Keep at most one callback batch of read-ahead per flow. The former
-	// SequenceBufferSize queue reserved a full send window again even though
-	// the socket reader already enforces that window. One batch preserves the
-	// measured socket-read/delivery overlap while a stalled callback still
-	// applies bounded backpressure to its own flow.
-	readQueueSize := min(
-		self.tcpBufferSettings.SequenceBufferSize,
-		max(1, self.tcpBufferSettings.WriteBatchSize),
-	)
-	readPackets := make(chan []byte, readQueueSize)
+	// Configured cold queueing remains available without optional credit.
+	// A full queue with another ready packet may fund larger ready-only drains.
+	readPackets = newTcpReturnReadQueue(self.ctx, self.tcpBufferSettings, self.ipPath.tcpReturnBatchWorkspace)
 	// Set by the socket reader before it closes `readPackets`, once the source
 	// has acknowledged the upstream's FIN and every byte before it.
 	var downloadClosed atomic.Bool
@@ -6087,46 +6103,28 @@ func (self *TcpSequence) Run() {
 		}()
 
 		defer func() {
-			// drain to the close so that ordered data and any final
-			// fin/rst reach the source on teardown. the socket read side
-			// always closes `readPackets` on exit, which is unblocked by
-			// the deferred socket close in `Run`
-			for packet := range readPackets {
-				self.receivePacket(packet, receiveRecoveryModeTcpSocket)
-			}
-		}()
-
-		// reused across drains; receiveBatch consumes it before the next
-		// drain reuses it
-		batch := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
-
-	read:
-		for {
-			select {
-			case <-self.ctx.Done():
-				return
-			case packet, ok := <-readPackets:
+			// Preserve the original one-packet teardown drain until the socket
+			// producer closes, then the Run owner joins every child.
+			for {
+				batch, ok := readPackets.takeBatch(context.Background(), 1)
 				if !ok {
 					return
 				}
-				batch = append(batch[:0], packet)
-				// opportunistically drain queued packets into one batch to
-				// reduce wakeups and coalesce the return-path wire Pack
-				for len(batch) < cap(batch) {
-					select {
-					case packet, ok := <-readPackets:
-						if !ok {
-							self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
-							return
-						}
-						batch = append(batch, packet)
-					default:
-						self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
-						continue read
-					}
-				}
-				self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+				func() {
+					defer readPackets.finishBatch()
+					self.receivePacket(batch[0], receiveRecoveryModeTcpSocket)
+				}()
 			}
+		}()
+		for {
+			batch, ok := readPackets.takeBatch(self.ctx, 0)
+			if !ok {
+				return
+			}
+			func() {
+				defer readPackets.finishBatch()
+				self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+			}()
 		}
 	})
 
@@ -6148,14 +6146,15 @@ func (self *TcpSequence) Run() {
 					packet, err = self.RstAck()
 				}()
 				if err == nil {
-					select {
-					case readPackets <- packet:
+					if readPackets.offerFinal(packet) {
 						fin = true
+					} else {
+						MessagePoolReturn(packet)
 					}
 				}
 			}
 
-			close(readPackets)
+			readPackets.close()
 		}()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
@@ -6219,7 +6218,7 @@ func (self *TcpSequence) Run() {
 								// small replay pools; a large socket read must split to fit.
 								chunkLimit := ByteCount(self.tcpBufferSettings.ReadBufferByteCount)
 								if self.tcpBufferSettings.MemoryBudget != nil {
-									chunkLimit = min(chunkLimit, ByteCount(self.natPacketizationByteLimit(self.tcpBufferSettings.Mtu)))
+									chunkLimit = min(chunkLimit, ByteCount(self.natPacketizationByteLimit(self.tcpBufferSettings.Mtu, self.tcpBufferSettings.MemoryColdWriteBatchSize)))
 								}
 								if limit := self.tcpBufferSettings.ReturnQueueMaxByteCount; limit > 0 {
 									chunkLimit = min(chunkLimit, max(1, (limit-128)/2))
@@ -6260,12 +6259,11 @@ func (self *TcpSequence) Run() {
 						if stop {
 							MessagePoolReturn(packet)
 						} else {
-							select {
-							case <-self.ctx.Done():
+							if readPackets.offer(packet) {
+								packetCount += 1
+							} else {
 								MessagePoolReturn(packet)
 								stop = true
-							case readPackets <- packet:
-								packetCount += 1
 							}
 						}
 					}
@@ -6305,11 +6303,10 @@ func (self *TcpSequence) Run() {
 						return
 					}
 					if finErr == nil {
-						select {
-						case <-self.ctx.Done():
-							MessagePoolReturn(finPacket)
-						case readPackets <- finPacket:
+						if readPackets.offer(finPacket) {
 							fin = true
+						} else {
+							MessagePoolReturn(finPacket)
 						}
 					}
 					// Keep the data/FIN replay owner alive after the origin's EOF.
@@ -9917,8 +9914,17 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	if ipPath != nil {
 		flowCtx = ipPath.tcpReturnContext
 	}
-	memory, sourceLifecycle, admitted := self.startReturnMemoryOperationForSource(
-		packets, recoveryMode, source.SourceId, flowCtx,
+	var batchWorkspace *tcpReturnBatchWorkspace
+	if self.tcpReturnMemory != nil && recoveryMode.waitsForProviderReturnAdmission() &&
+		self.localUserNat.settings.TcpBufferSettings.MemoryColdWriteBatchSize < len(packets) {
+		if ipPath == nil || !ipPath.tcpReturnBatchWorkspace.acquire() {
+			return
+		}
+		batchWorkspace = ipPath.tcpReturnBatchWorkspace
+		defer batchWorkspace.release()
+	}
+	memory, sourceLifecycle, admitted := self.startReturnMemoryOperationForSourceWithWorkspace(
+		packets, recoveryMode, source.SourceId, flowCtx, batchWorkspace,
 	)
 	if !admitted {
 		return
@@ -11293,6 +11299,10 @@ type IpPath struct {
 	// Only a TCP constructor's immutable canonical callback path carries this
 	// generation. Parsed, partial, and reversed packet identities carry none.
 	tcpReturnContext context.Context
+	// Borrowed only by this flow's synchronous socket-reader callback.
+	// Its queue keeps optional credit through every borrowed batch; the base
+	// flow claim remains owned until every callback worker joins.
+	tcpReturnBatchWorkspace *tcpReturnBatchWorkspace
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {

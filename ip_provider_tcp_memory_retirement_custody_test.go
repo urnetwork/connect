@@ -13,6 +13,16 @@ import (
 // Reuses the unchanged retirement fixture's inspection and ownership helpers,
 // but constructs a genuine two-MiB NAT/provider profile and four socket flows.
 func newTcpProviderMemoryRetirementFixture(t *testing.T, budget *TransferMemoryBudget) *tcpProviderRetirementFixture {
+	return newTcpProviderMemoryRetirementFixtureWithWriteBatchSize(t, budget, 1)
+}
+
+// Set the requested batch before NewLocalUserNat applies bounded profile policy.
+// Existing retirement callers retain their one-packet constructor request.
+func newTcpProviderMemoryRetirementFixtureWithWriteBatchSize(t *testing.T, budget *TransferMemoryBudget, writeBatchSize int) *tcpProviderRetirementFixture {
+	return newTcpProviderMemoryRetirementFixtureWithTcpSettings(t, budget, writeBatchSize, nil)
+}
+
+func newTcpProviderMemoryRetirementFixtureWithTcpSettings(t *testing.T, budget *TransferMemoryBudget, writeBatchSize int, configure func(*TcpBufferSettings)) *tcpProviderRetirementFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture := &tcpProviderRetirementFixture{
@@ -42,7 +52,10 @@ func newTcpProviderMemoryRetirementFixture(t *testing.T, budget *TransferMemoryB
 	natSettings.Log = NewNoopLogger()
 	natSettings.MemoryBudget = budget
 	natSettings.TcpBufferSettings.AckCompressTimeout = 0
-	natSettings.TcpBufferSettings.WriteBatchSize = 1
+	natSettings.TcpBufferSettings.WriteBatchSize = writeBatchSize
+	if configure != nil {
+		configure(natSettings.TcpBufferSettings)
+	}
 	natSettings.TcpBufferSettings.DialContextSettings = &DialContextSettings{
 		DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
 			select {

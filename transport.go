@@ -2898,7 +2898,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 
 			self.routeManager.UpdateTransportWithProperties(sendTransport, []Route{exportedSend}, TransferCarrierProperties{
-				h1SendRetained: sendLane, h1PriorityRetained: priorityLane,
+				MaxMessageByteCount: int(self.h1MaxMessageByteCount()),
+				h1SendRetained:      sendLane, h1PriorityRetained: priorityLane,
 			})
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
