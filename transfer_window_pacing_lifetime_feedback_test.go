@@ -11,7 +11,8 @@ import (
 )
 
 // The first record expires at 500 ms; a younger original is paced until 550 ms
-// and expires at 600 ms. Feedback at 400 ms protects only the first record.
+// and initially expires at 600 ms. A selective receipt at 400 ms protects only
+// the first record; cumulative progress also renews the uncovered younger tail.
 func runWindowPacingLifetimeFeedback(t *testing.T, selective bool) {
 	t.Helper()
 	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {

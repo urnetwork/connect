@@ -280,6 +280,37 @@ func (self *RemoteUserNatProvider) startReturnMemoryOperation(packets [][]byte, 
 	return memory, admitted
 }
 
+// A terminal reset pins the exact source before scratch admission. This keeps
+// source retirement distinct from temporary memory pressure without changing
+// the workspace or ownership policy of ordinary return producers. Borrows the
+// reset packet; success transfers the memory operation and source lease.
+// The reliable packet's operation already holds this source generation, so
+// this retain cannot create a new source entry or fail the live-source cap.
+// Its map entry remains covered by the provider's prepaid source envelope.
+func (self *RemoteUserNatProvider) startTerminalResetMemoryOperation(
+	sourceId Id,
+	packet []byte,
+	target *providerTerminalResetAckTarget,
+) (natMemoryReservation, *providerSourceLifecycle, bool) {
+	if self.memoryOperations != nil && !self.memoryOperations.start() {
+		return natMemoryReservation{}, nil, false
+	}
+	sourceLifecycle := self.acquireSourceLifecycle(sourceId)
+	if sourceLifecycle != nil {
+		memory, admitted := reserveNatMemory(self.memoryBudget(), providerPacketOperationBytes([][]byte{packet}))
+		if admitted {
+			return memory, sourceLifecycle, true
+		}
+		self.congestionDrops.addReturnQueue(1, ByteCount(len(packet)))
+		self.refuseTerminalReset(target, sourceLifecycle)
+		self.releaseSourceLifecycle(sourceId, sourceLifecycle)
+	}
+	if self.memoryOperations != nil {
+		self.memoryOperations.finish()
+	}
+	return natMemoryReservation{}, nil, false
+}
+
 // Dedicated TCP producers use the fixed prepaid partition. The memory gate
 // protects source-map access before the slot wait, and one exact source lease
 // remains the callback's until its defer, independent of any child return item.

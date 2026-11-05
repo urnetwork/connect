@@ -3,6 +3,8 @@
 package connect
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -353,13 +355,16 @@ func TestTcpGroupRecoveryCanceledOlderObserverKeepsFollowingAck(t *testing.T) {
 
 // Established drain policies receive both groups before disposing either.
 // A cold flow-isolating destination first receives ordinarily, opens its writer,
-// and disposes that canceled group before its next iteration drains the second.
+// and refuses materialization after cancellation; Close disposes its queued tail.
 func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		var receives atomic.Int64
-		var first *parsedPacketGroup
+		var receives, retains atomic.Int64
+		var observeColdBoundary atomic.Bool
+		var terminalErrs []error
+		var first, second *parsedPacketGroup
+		var source *SendSequence
 		budget := NewTransferMemoryBudget(kib(64))
 		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
 			settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
@@ -372,20 +377,42 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 					// typed target can replay any source-generation controls.
 					source.Cancel()
 				case 2:
+					if coldStart {
+						t.Error("cold canceled source received its queued tail instead of returning before materialization")
+					}
 					flags := first.completionFlags.Load()
 					if source.ctx.Err() == nil || source.flowIsolation.Load() != flowIsolation ||
 						flags&groupCompletionReceived == 0 || flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 {
 						t.Error("second receive lost cancellation or replayed earlier source controls")
 					}
-					if coldStart {
-						if flags&groupCompletionDisposed == 0 || flags&groupCompletionLinked != 0 || first.collapseSource != nil {
-							t.Error("cold writer startup did not dispose the first ordinary receive before the later drain")
-						}
-					} else if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
+					if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
 						t.Error("drain did not retain the earlier cleanup-received group without control replay")
 					}
 				default:
 					t.Error("unexpected extra source receive")
+				}
+			}
+			if coldStart {
+				observeColdBoundary.Store(true)
+				observer := settings.SendBufferSettings.SendPackLifecycleObserver
+				settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+					observer(event)
+					if observeColdBoundary.Load() && event.Phase == SendPackLifecyclePhaseTerminal {
+						terminalErrs = append(terminalErrs, event.Err)
+					}
+				}
+				settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+					if !observeColdBoundary.Load() {
+						return
+					}
+					retains.Add(1)
+					if receives.Load() != 1 || source.ctx.Err() != context.Canceled || !source.flowIsolation.Load() ||
+						source.contractMultiRouteWriter == nil || source.currentPreparedHandoff != nil ||
+						first.completionFlags.Load()&groupCompletionReceived == 0 ||
+						first.completionFlags.Load()&(groupCompletionDisposed|groupCompletionDequeued|groupCompletionSourceControls) != 0 ||
+						second.completionFlags.Load()&groupCompletionReceived != 0 {
+						t.Error("cold cancellation did not reach materialization with exactly one cleanup receive and an untouched queued tail")
+					}
 				}
 			}
 		})
@@ -395,7 +422,7 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 			})
 		}
 		first = groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 700, 64, tcpFlagRst|tcpFlagAck))
-		second := groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
+		second = groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
 		for _, group := range []*parsedPacketGroup{first, second} {
 			if !f.selected.SendGroupWithAck(group, 0, true) {
 				MessagePoolReturn(group.packets[0].packet)
@@ -403,7 +430,7 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 			}
 		}
 		f.requireParked()
-		source := first.collapseSource
+		source = first.collapseSource
 		if source == nil || source != second.collapseSource || f.update.sourceRstSequence() != 800 {
 			t.Fatal("source and latest accepted ACK setup failed")
 		}
@@ -422,26 +449,56 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 		}
 		f.unpark()
 		synctest.Wait()
-		if receives.Load() != 2 || source.flowIsolation.Load() != flowIsolation {
-			t.Fatal("actual carrier branch did not drain both cleanup receives")
-		}
-		if f.update.sourceRstSequence() != 800 || f.update.IsDone() || f.update.sequenceControlOrder != 0 ||
-			f.update.sequenceClaims != nil || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 || len(f.route) != 0 {
-			t.Fatal("cleanup-received predecessor overwrote the later ACK or replayed canceled controls")
-		}
-		for _, group := range []*parsedPacketGroup{first, second} {
-			if flags := group.completionFlags.Load(); flags&groupCompletionReceived == 0 ||
-				flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
-				t.Fatal("cleanup receive acquired a live control ordinal or retained its source worker")
-			}
-		}
 		select {
 		case <-source.done:
 		default:
 			t.Fatal("canceled source worker did not join")
 		}
+		wantReceives := int64(2)
+		if coldStart {
+			wantReceives = 1
+			if retains.Load() != 1 {
+				t.Fatalf("cold cancellation reached materialization %d times, want 1", retains.Load())
+			}
+			if len(terminalErrs) != 2 || !errors.Is(terminalErrs[0], context.Canceled) || terminalErrs[1] == nil {
+				t.Fatalf("cold materialization and queued-tail disposal did not report exactly two failures: %v", terminalErrs)
+			}
+			if stats := budget.Stats(); stats.UsedByteCount != 0 || stats.ReservedByteCount != stats.ReleasedByteCount {
+				t.Fatalf("cold canceled source did not reconcile its exact memory budget: %+v", stats)
+			}
+		}
+		if receives.Load() != wantReceives || source.flowIsolation.Load() != flowIsolation {
+			t.Fatalf("actual carrier branch received %d groups with isolation=%v, want %d with isolation=%v",
+				receives.Load(), source.flowIsolation.Load(), wantReceives, flowIsolation)
+		}
+		if f.update.sourceRstSequence() != 800 || f.update.IsDone() || f.update.sequenceControlOrder != 0 ||
+			f.update.sequenceClaims != nil || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 || len(f.route) != 0 {
+			t.Fatal("cleanup-received predecessor overwrote the later ACK or replayed canceled controls")
+		}
+		for index, group := range []*parsedPacketGroup{first, second} {
+			flags := group.completionFlags.Load()
+			wantReceived := !coldStart || index == 0
+			if (flags&groupCompletionReceived != 0) != wantReceived ||
+				flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
+				t.Fatalf("canceled group %d lost exact cleanup custody or acquired source controls: flags=%x", index, flags)
+			}
+			if coldStart && (flags&groupCompletionDisposed == 0 || flags&groupCompletionTerminal == 0 ||
+				flags&groupCompletionLinked != 0 || group.affinitySourceState&affinitySourceMaterialized != 0 ||
+				group.affinitySourceState&affinitySourceFailed == 0) {
+				t.Fatalf("cold canceled group %d lost raw disposal or acquired materialization: flags=%x", index, flags)
+			}
+		}
 		if source.contractMultiRouteWriter != nil {
 			t.Fatal("canceled source retained its destination selector")
+		}
+		if coldStart {
+			if f.client.initialSendWriteCount.Load() != 0 {
+				t.Fatal("canceled cleanup constructed a physical write")
+			}
+			// The materialization observation belongs only to the joined source.
+			// Its healthy sibling uses the normal production retention path.
+			observeColdBoundary.Store(false)
+			affinitySourceCancellationHealthySibling(t, f)
 		}
 	})
 }
@@ -456,8 +513,8 @@ func TestTcpGroupRecoveryCanceledFlowIsolatingDrainKeepsLatestAck(t *testing.T) 
 	testTcpGroupRecoveryCanceledDrain(t, true, false)
 }
 
-// A cold selector starts with ordinary ingress, then drains after opening.
-// Reentrant cancellation must preserve the latest accepted ACK across both.
+// A cold selector receives one group, then cancellation refuses materialization.
+// Closing its queued tail must preserve the latest accepted ACK and live siblings.
 func TestTcpGroupRecoveryCanceledColdFlowIsolatingStartupKeepsLatestAck(t *testing.T) {
 	testTcpGroupRecoveryCanceledDrain(t, true, true)
 }

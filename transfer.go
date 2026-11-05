@@ -9486,7 +9486,9 @@ sendSequenceLoop:
 		ackSnapshot := ackWindow.Snapshot(true)
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
 		if 0 < ackSnapshot.ackUpdateCount {
-			self.lastHeadAckTime = time.Now()
+			if arrived := self.ackArrivalTime(ackSnapshot.headAck.receivedAtNanos); self.lastHeadAckTime.Before(arrived) {
+				self.lastHeadAckTime = arrived
+			}
 			self.receiveAckFeedbackAt(
 				ackSnapshot.headAck.messageId,
 				false,

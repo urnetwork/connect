@@ -4577,6 +4577,8 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		tcp, timeout, ipPacket, credit, nil)
 }
 
+// Takes the packet on successful queue or terminal-control custody. Reliable
+// terminal dispositions otherwise leave its existing operation as the owner.
 func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	bufferId BufferId,
 	source TransferPath,
@@ -4616,10 +4618,14 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	var orphanSourceIp net.IP
 	var orphanDestinationIp net.IP
 	handledTerminalControl := false
+	obsoleteGeneration := false
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 		if self.ctx.Err() != nil || self.retiredSourceIds[source.SourceId] {
+			return nil
+		}
+		if terminalOwner != nil && !terminalOwner.alive() {
 			return nil
 		}
 
@@ -4640,6 +4646,22 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 				return nil
 			}
 			if sequence.ctx.Err() == nil && (!tcp.syn || tcp.seq == sequence.initialSynSeq) {
+				if terminalOwner != nil && !tcp.syn {
+					generation := sequence.ctx.Done()
+					if terminalOwner.tcpGeneration == nil {
+						terminalOwner.tcpGeneration = generation
+					} else if terminalOwner.tcpGeneration != generation {
+						// Only a canceled bound generation can become obsolete.
+						// Preserve the live successor and never feed it old bytes
+						// or a reset, including on a later capacity retry.
+						select {
+						case <-terminalOwner.tcpGeneration:
+							obsoleteGeneration = true
+						default:
+						}
+						return nil
+					}
+				}
 				return sequence
 			}
 
@@ -4797,6 +4819,9 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		return sequence
 	}
 	finishNoSequence := func() (bool, error) {
+		if obsoleteGeneration {
+			return false, errReliableIngressObsoleteFlow
+		}
 		if orphanRst != nil {
 			path := &IpPath{
 				Version:         ipVersion,
@@ -4807,9 +4832,9 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 				DestinationPort: int(tcp.destinationPort),
 			}
 			if terminalOwner != nil && credit != nil && len(tcp.payload) != 0 && !handledTerminalControl {
-				// A payload orphan has no TCP data owner. Only confirmation of
-				// the explicit terminal reset may settle its original receipt;
-				// the ordinary borrowed callback cannot report that outcome.
+				// A payload orphan has no TCP data owner. Its explicit reset
+				// owns the receipt until ACK or a regenerable capacity refusal;
+				// the ordinary borrowed callback cannot report either outcome.
 				defer MessagePoolReturn(orphanRst)
 				terminalOwner.sendTerminalReset(path, orphanRst)
 				return false, errReliableIngressResetPending
@@ -4852,6 +4877,18 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	if before := self.tcpBufferSettings.beforeSequenceSendForTest; before != nil {
 		before(sequence)
 	}
+	recheckRetirement := credit != nil && !tcp.syn &&
+		(len(tcp.payload) == 0 && (tcp.ack || tcp.fin || tcp.rst) ||
+			len(tcp.payload) != 0 && terminalOwner != nil)
+	if recheckRetirement && sequence.ctx.Err() != nil {
+		// A canceled pure ACK cannot apply inline, and its prepaid control
+		// credit is intentionally not data-queue credit. Resolve retirement
+		// before that unrelated budget check can reject the shared lane.
+		sequence = initSequence()
+		if sequence == nil {
+			return finishNoSequence()
+		}
+	}
 
 	// An established pure ACK has no sequence-space ordering dependency. Apply
 	// its monotonic acknowledgement/window update directly so a download does
@@ -4867,6 +4904,9 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	}
 	if credit != nil && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
 		memory.budget != nil && memory.bytes < natPacketMemoryByteCount(ipPacket)) {
+		if recheckRetirement && sequence.ctx.Err() != nil && initSequence() == nil {
+			return finishNoSequence()
+		}
 		return false, ErrNatMemoryBudget
 	}
 
@@ -4887,18 +4927,22 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	}
 	var err error
 	accepted, err = sequence.send(sendItem, timeout)
-	if !accepted && credit != nil && !tcp.syn && len(tcp.payload) == 0 &&
-		(tcp.ack || tcp.fin || tcp.rst) && sequence.ctx.Err() != nil {
-		// Retirement can race the lookup above. This unconsumed terminal
-		// control still owns its packet and prepaid credit, so recheck the
-		// exact flow/source authority before rejecting the shared lane. A
-		// replacement generation gets one nonblocking admission attempt;
-		// never restart the caller's wait budget or retry application bytes.
-		sequence = initSequence()
-		if sequence == nil {
+	if !accepted && recheckRetirement && sequence.ctx.Err() != nil {
+		// Retirement can race the lookup above. Recheck the map and source
+		// authority before applying the same missing-owner reset decision.
+		// A live replacement may receive one empty control attempt, but
+		// application bytes must never cross into another TCP generation.
+		replacement := initSequence()
+		if replacement == nil {
 			return finishNoSequence()
 		}
-		accepted, err = sequence.send(sendItem, 0)
+		if len(tcp.payload) == 0 {
+			accepted, err = replacement.send(sendItem, 0)
+		} else {
+			// Even a concurrent cancel after a capacity refusal must end this
+			// attempt; retrying later could feed these bytes to the successor.
+			return false, errReliableIngressNoFlow
+		}
 	}
 	if accepted && credit != nil {
 		*credit = natMemoryReservation{}
@@ -8744,16 +8788,9 @@ func (self *RemoteUserNatProvider) releaseReturnItem(item *providerReturnItem) {
 	case self.returnItemPool <- item:
 	default:
 	}
+	// Released before Transfer took the ACK target: no reset was sent.
+	self.refuseTerminalReset(terminalReset, sourceLifecycle)
 	self.releaseSourceLifecycle(sourceId, sourceLifecycle)
-	if terminalReset != nil {
-		// Released before Transfer took the ACK target: no reset was sent.
-		// A full return path refuses the reset; a closed one fails it.
-		if self.returnPathOpen() {
-			terminalReset.refuse()
-		} else {
-			terminalReset.complete(false)
-		}
-	}
 	if afterRelease != nil {
 		HandleError(afterRelease)
 	}
@@ -9976,16 +10013,27 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	// One terminal-reset target belongs to one nonblocking admission attempt.
 	// A retrying socket owner may report failed intermediate attempts to its
 	// ACK target; it cannot share this final-disposition-only response state.
-	if pendingTerminalReset != nil && recoveryMode != receiveRecoveryModeRegenerableControl {
-		return
+	if pendingTerminalReset != nil {
+		if recoveryMode != receiveRecoveryModeRegenerableControl ||
+			source.SourceId == self.client.ClientId() ||
+			!providerTerminalResetPacket(ipPath, packet) {
+			return
+		}
 	}
 	var flowCtx context.Context
 	if ipPath != nil {
 		flowCtx = ipPath.tcpReturnContext
 	}
-	memory, sourceLifecycle, admitted := self.startReturnMemoryOperationForSource(
-		[][]byte{packet}, recoveryMode, source.SourceId, flowCtx,
-	)
+	var memory natMemoryReservation
+	var sourceLifecycle *providerSourceLifecycle
+	var admitted bool
+	if pendingTerminalReset != nil {
+		memory, sourceLifecycle, admitted = self.startTerminalResetMemoryOperation(source.SourceId, packet, pendingTerminalReset)
+	} else {
+		memory, sourceLifecycle, admitted = self.startReturnMemoryOperationForSource(
+			[][]byte{packet}, recoveryMode, source.SourceId, flowCtx,
+		)
+	}
 	if !admitted {
 		return
 	}
@@ -10066,6 +10114,10 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	returnTransferKey := providerReplyTransferKey(transferKey, returnProvideMode)
 	item := self.takeReturnItemForPackets([][]byte{packet}, recoveryMode)
 	if item == nil {
+		if pendingTerminalReset != nil {
+			self.congestionDrops.addReturnQueue(1, ByteCount(len(packet)))
+			self.refuseTerminalReset(pendingTerminalReset, sourceLifecycle)
+		}
 		return
 	}
 	item.source = source

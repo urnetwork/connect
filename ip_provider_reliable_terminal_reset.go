@@ -10,8 +10,13 @@ import (
 // reliable ingress path, never by public NAT packet callbacks.
 var errReliableIngressResetPending = errors.New("reliable TCP ingress awaits terminal reset acknowledgement")
 
+// A live successor superseded this operation's bound, canceled TCP generation.
+// This is a local terminal decision; neither bytes nor reset cross generations.
+var errReliableIngressObsoleteFlow = errors.New("reliable TCP ingress belongs to a superseded downstream generation")
+
 // A successful Transfer ACK proves that the client accepted the explicit
-// reset. It does not claim that the orphan's application bytes were delivered.
+// reset. Refused capacity on a live return path also settles the regenerable
+// input; neither result claims delivery of the orphan's application bytes.
 // This small response state never borrows the incoming packet or retains its
 // provider/lifecycle/receipt. The queue owner observes it from a cancelable
 // Waiting operation, so provider shutdown never needs a live peer's ACK.
@@ -40,8 +45,8 @@ func (target *providerTerminalResetAckTarget) complete(acked bool) {
 // response: the peer's next segment on the dead flow elicits another one, so
 // the input is settled rather than failed. A failed receipt cancels the whole
 // inbound sequence and discards every item it has already acknowledged, and
-// a return path is full exactly when the peer is downloading, so a refused
-// reset would otherwise repeat that cancellation for every retry of the input.
+// return pressure during downloads would otherwise repeat that cancellation
+// for every retry of the input.
 func (target *providerTerminalResetAckTarget) refuse() {
 	target.finish(3)
 }
@@ -66,11 +71,44 @@ func (target *providerTerminalResetAckTarget) attempt() receiveDeliveryAttempt {
 	}
 }
 
-// Keep the shared NAT worker nonblocking. The existing bounded, policy-checked
-// return path either retains this reset until Transfer admission, or rejects
-// it and completes the original receipt as failed. Queue admission alone never
-// secures the receipt. TCP return options retain Transfer ACK/retry semantics
-// and the unchanged ACK lifetime; no synthetic success or new timeout is used.
+// Capacity refusal settles only a regenerable orphan on a live provider/NAT
+// and source. Retirement is a failed receipt, even if the provider still serves
+// other sources. Call before releasing the source lease, which can cancel an
+// otherwise healthy generation when its last owner leaves.
+func (self *RemoteUserNatProvider) refuseTerminalReset(target *providerTerminalResetAckTarget, sourceLifecycle *providerSourceLifecycle) {
+	if target == nil {
+		return
+	}
+	if sourceLifecycle != nil && sourceLifecycle.ctx.Err() == nil &&
+		self.localUserNat.ctx.Err() == nil && self.returnPathOpen() {
+		target.refuse()
+	} else {
+		target.complete(false)
+	}
+}
+
+// Only a separately synthesized, payload-free reset may use the exceptional
+// disposition. Validate without allocating callback workspace, so malformed
+// packets or retained data cannot turn memory refusal into a secured receipt.
+func providerTerminalResetPacket(path *IpPath, packet []byte) bool {
+	if path == nil || path.Protocol != IpProtocolTcp || len(packet) == 0 {
+		return false
+	}
+	var tcp parsedTcp
+	if packet[0]>>4 == 4 {
+		protocol, source, destination, transport, valid := parseIpv4(packet)
+		return valid && path.Version == 4 && protocol == ipProtocolNumberTcp &&
+			parseTcpPacket(source, destination, transport, &tcp) && tcp.rst && len(tcp.payload) == 0
+	}
+	protocol, source, destination, transport, valid := parseIpv6(packet)
+	return valid && path.Version == 6 && protocol == ipProtocolNumberTcp &&
+		parseTcpPacket(source, destination, transport, &tcp) && tcp.rst && len(tcp.payload) == 0
+}
+
+// Keep the shared NAT worker nonblocking. Capacity refusal on an open return
+// path settles this regenerable input; shutdown and policy failures reject it.
+// Once Transfer accepts the reset, its real ACK owns completion. Queue admission
+// alone never secures the receipt, and the reset keeps its ordinary ACK lifetime.
 func (owner *providerReliablePacket) sendTerminalReset(path *IpPath, packet []byte) {
 	target := &providerTerminalResetAckTarget{
 		wake:     owner.peer.deliveryReceipt().queue.wake,

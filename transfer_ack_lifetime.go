@@ -86,18 +86,23 @@ func (self *sendAckLifetimes) Pop() any {
 	return item
 }
 
-// Read already validated feedback without consuming the owner's ACK snapshot.
-// A head finishes lifetime ownership; a SACK or valid contract recovery request
-// can only renew it from that reply's actual arrival, once.
+// Read validated feedback without consuming the owner's acknowledgement snapshot.
+// A pending head delivers its prefix and renews the uncovered tail from its
+// original arrival. Applied heads stay out of this pending-feedback decision.
 func (self *sequenceAckWindow) pendingLifetimeFeedback(item *sendItem) (bool, int64) {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
-	if self.ackUpdateCount > 0 && self.hasHeadAck && item.sequenceNumber <= self.headAck.sequenceNumber {
-		return true, 0
-	}
 	receivedAtNanos := int64(0)
+	if self.ackUpdateCount > 0 && self.hasHeadAck {
+		if item.sequenceNumber <= self.headAck.sequenceNumber {
+			return true, 0
+		}
+		// Duplicate and stale heads do not replace headAck or its arrival.
+		// Pacing may hold Run past expiry while this progress remains pending.
+		receivedAtNanos = self.headAck.receivedAtNanos
+	}
 	if ack, ok := self.selectiveAcks[item.messageId]; ok && ack.sequenceNumber == item.sequenceNumber {
-		receivedAtNanos = ack.receivedAtNanos
+		receivedAtNanos = max(receivedAtNanos, ack.receivedAtNanos)
 	}
 	if ack, ok := self.contractMissingAcks[item.messageId]; ok && ack.sequenceNumber == item.sequenceNumber &&
 		item.contractId != nil && !item.hasContractFrame && ack.missingContractId == *item.contractId {
@@ -130,12 +135,20 @@ func (self *SendSequence) pendingAckLifetime(item *sendItem) (bool, time.Time) {
 	if delivered || receivedAtNanos == 0 {
 		return delivered, time.Time{}
 	}
-	renewedAt := time.Unix(0, receivedAtNanos)
+	return false, self.ackArrivalTime(receivedAtNanos).Add(item.ackTimeout)
+}
+
+// Restore the client's elapsed-time clock. Zero is unavailable feedback, never
+// a reason to renew from the later time when the send owner consumes a snapshot.
+func (self *SendSequence) ackArrivalTime(receivedAtNanos int64) time.Time {
+	if receivedAtNanos == 0 {
+		return time.Time{}
+	}
 	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
 		base := self.client.feedbackTimeBase
-		renewedAt = base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
+		return base.Add(time.Duration(receivedAtNanos - base.UnixNano()))
 	}
-	return false, renewedAt.Add(item.ackTimeout)
+	return time.Unix(0, receivedAtNanos)
 }
 
 // An advancing cumulative head proves the receiver is alive and the flight is

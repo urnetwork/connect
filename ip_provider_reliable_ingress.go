@@ -153,6 +153,8 @@ type providerReliablePacket struct {
 	memory    natMemoryReservation
 	credit    natMemoryReservation
 	operation *receiveDeliveryOperation
+	// Bind retries without retaining the retired sequence's socket/flow graph.
+	tcpGeneration <-chan struct{}
 }
 
 func (self *RemoteUserNatProvider) queueReliablePacket(source TransferPath, peer Peer,
@@ -187,7 +189,15 @@ func (self *RemoteUserNatProvider) queueReliablePacket(source TransferPath, peer
 	}
 }
 
+// Source retirement is terminal even before its asynchronous NAT tombstone.
 func (owner *providerReliablePacket) alive() bool {
+	for _, done := range owner.operation.contexts {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+	}
 	return owner.provider.ctx.Err() == nil && owner.provider.localUserNat.ctx.Err() == nil &&
 		owner.peer.deliveryReceipt().queue.sequence.ctx.Err() == nil
 }
@@ -250,6 +260,8 @@ func (r *receiveDeliveryReceipt) takePacketCredit(target *TransferMemoryBudget, 
 	return reserveNatMemory(target, bytes)
 }
 
+// Retains the original packet until queue custody or an applied terminal flow
+// decision; a replacement generation never inherits this operation's bytes.
 func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer) {
 	if !owner.alive() {
 		owner.operation.complete(false)
@@ -295,6 +307,12 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 		accepted, err := attempt()
 		if accepted {
 			owner.packet = nil
+			return receiveDeliverySecured
+		}
+		if err == errReliableIngressObsoleteFlow {
+			// The locked TCP decision consumed this operation's superseded
+			// generation, not application data for the live replacement.
+			// The ordinary operation release still owns its packet/credit.
 			return receiveDeliverySecured
 		}
 		if err == errReliableIngressResetPending {

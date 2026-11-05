@@ -7,65 +7,12 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/urnetwork/connect/protocol"
 )
 
-// Expiring a younger paced original cannot turn the already delivered prefix
-// into a failed application callback during sequence cleanup.
+// Pending cumulative progress preserves the paced tail, then expires it one
+// configured interval after arrival rather than after snapshot consumption.
 func TestWindowPacingLifetimeAcknowledgedPrefixSurvivesYoungerExpiry(t *testing.T) {
-	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {
-		// ACK preemption can re-inspect recovery without another physical
-		// write. These rows must not pause inside that inspection hook.
-		resumeSecondDue := make(chan struct{})
-		close(resumeSecondDue)
-		fixture.resumeSecondDue = resumeSecondDue
-		olderId := fixture.sequence.resendQueue.PeekFirst().messageId
-		time.Sleep(100 * time.Millisecond)
-		service := fixture.sequence.windowPacer.service
-		service.stateLock.Lock()
-		service.next = fixture.start.Add(800 * time.Millisecond)
-		service.stateLock.Unlock()
-		youngerFailedAt := make(chan time.Time, 1)
-		frame := &protocol.Frame{MessageType: protocol.MessageType_TransferExchangeSignals, MessageBytes: MessagePoolGet(1280)}
-		clear(frame.MessageBytes)
-		if !fixture.client.SendWithTimeout(frame, fixture.sequence.destination, func(err error) {
-			if err != nil {
-				youngerFailedAt <- time.Now()
-			}
-		}, time.Second) {
-			MessagePoolReturn(frame.MessageBytes)
-			t.Fatal("younger message was not admitted")
-		}
-		close(fixture.releaseInitial)
-		synctest.Wait()
-		time.Sleep(300 * time.Millisecond)
-		if ok, err := fixture.sequence.ackMessage(receiveAckMessage{sequenceId: fixture.sequence.sequenceId, messageId: olderId}, 0); !ok || err != nil {
-			t.Fatalf("older delivery reply was refused: %v", err)
-		}
-		synctest.Wait()
-		if !fixture.sequence.ackWindow.PendingDispositionFor(0, olderId) {
-			t.Fatal("older delivery was not published before lifetime expiry")
-		}
-		time.Sleep(200 * time.Millisecond)
-		synctest.Wait()
-		select {
-		case at := <-youngerFailedAt:
-			if at != fixture.start.Add(600*time.Millisecond) {
-				t.Fatal("younger original did not expire at its own lifetime")
-			}
-		default:
-			t.Fatal("younger original outlived its original lifetime")
-		}
-		if len(fixture.route) != 0 || fixture.sequence.ctx.Err() == nil {
-			t.Fatal("younger expiry dispatched data or left its sequence open")
-		}
-		select {
-		case at := <-fixture.ackFailedAt:
-			t.Fatalf("already delivered prefix failed during younger cleanup at %s", at.Sub(fixture.start))
-		default:
-		}
-	})
+	testAckLifetimePendingPacedHead(t, "head")
 }
 
 // Hold a real retry after pacing admission and order feedback on either side

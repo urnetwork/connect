@@ -1,3 +1,4 @@
+// Cumulative progress extends a finite lifetime without defeating resend backoff.
 package connect
 
 import (
@@ -24,34 +25,32 @@ func TestAckLifetimeFollowsCumulativeProgress(t *testing.T) {
 		{name: "head stopped when the message was sent", headAdvanced: 0, expired: true},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			sequence := &SendSequence{resendQueue: newResendQueue(nil, 0)}
-			sequence.lastHeadAckTime = origin.Add(c.headAdvanced)
-			item := &sendItem{
-				transferItem: transferItem{messageId: NewId(), sequenceNumber: 72669},
-				sendTime:     origin,
-				ackTimeout:   ackTimeout,
-				resendTime:   origin.Add(time.Minute),
-				expectsAck:   true,
-			}
-			sequence.addResendItem(item)
-			defer sequence.ackLifetimes.clear()
-			defer sequence.resendQueue.Clear()
+		sequence := &SendSequence{resendQueue: newResendQueue(nil, 0)}
+		sequence.lastHeadAckTime = origin.Add(c.headAdvanced)
+		item := &sendItem{
+			transferItem: transferItem{messageId: NewId(), sequenceNumber: 72669},
+			sendTime:     origin,
+			ackTimeout:   ackTimeout,
+			resendTime:   origin.Add(time.Minute),
+			expectsAck:   true,
+		}
+		sequence.addResendItem(item)
+		defer sequence.ackLifetimes.clear()
+		defer sequence.resendQueue.Clear()
 
-			deadline, err := sequence.nextAckLifetime(origin.Add(ackTimeout))
-			if c.expired {
-				if !errors.Is(err, context.DeadlineExceeded) {
-					t.Fatalf("stalled sequence must expire, got deadline=%v err=%v", deadline, err)
-				}
-				return
+		deadline, err := sequence.nextAckLifetime(origin.Add(ackTimeout))
+		if c.expired {
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s: stalled sequence must expire, got deadline=%v err=%v", c.name, deadline, err)
 			}
-			if err != nil {
-				t.Fatalf("progressing sequence must not expire: %v", err)
-			}
-			if want := origin.Add(c.deadline); !deadline.Equal(want) {
-				t.Fatalf("deadline = %v, want %v", deadline, want)
-			}
-		})
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: progressing sequence must not expire: %v", c.name, err)
+		}
+		if want := origin.Add(c.deadline); !deadline.Equal(want) {
+			t.Fatalf("%s: deadline = %v, want %v", c.name, deadline, want)
+		}
 	}
 }
 
