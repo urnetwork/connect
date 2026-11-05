@@ -11878,12 +11878,18 @@ func (self *SendSequence) setContract(
 		if self.sendContractAcked && !previous.expired() &&
 			previous.minUpdateByteCount <= previous.noAckHeadroomRemainingByteCount() {
 			// FILLFRACTION.md. The receiver holds the predecessor and keeps it
-			// open after the switch, so it stays unretired while the successor
-			// is introduced. No-acknowledgement Packs ride its headroom until
-			// the successor is acknowledged (`noAckHeadroomCarrier`).
+			// open after the switch, so it stays open while the successor is
+			// introduced. No-acknowledgement Packs ride its headroom until the
+			// successor is acknowledged (`noAckHeadroomCarrier`).
 			self.noAckHeadroomContract = previous
 			self.noAckHeadroomContractSetTime = self.sendContractSetTime
 			self.noAckHeadroomContractMetadataGeneration = self.sendContractMetadataGeneration
+			// The fast path retires with the switch, exactly as before. A
+			// caller that read the old snapshot and has not reserved is
+			// refused, and returns to queue admission, where only the
+			// sequence loop charges the headroom. The close waits for
+			// `endNoAckHeadroom` (tryCloseRetiredSendContract).
+			previous.noAckWriterState.Or(noAckContractRetired)
 		} else {
 			self.retireSendContract(previous)
 		}
@@ -14027,9 +14033,8 @@ func (self *SendSequence) ackItem(item *sendItem) {
 				// a different contract's proof and retain their own callback.
 				self.setContractAcked(itemSendContract, true)
 			}
-			// not current and closed. The headroom contract stays open while
-			// it carries the switch (FILLFRACTION.md).
-			if self.sendContract != itemSendContract && self.noAckHeadroomContract != itemSendContract {
+			// not current and closed
+			if self.sendContract != itemSendContract {
 				self.retireSendContract(itemSendContract)
 			}
 		}
