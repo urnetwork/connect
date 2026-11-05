@@ -356,8 +356,8 @@ func TestTcpGroupRecoveryCanceledOlderObserverKeepsFollowingAck(t *testing.T) {
 }
 
 // Established drain policies receive both groups before disposing either.
-// A cold flow-isolating destination first receives ordinarily, opens its writer,
-// and refuses materialization after cancellation; Close disposes its queued tail.
+// A cold destination first receives ordinarily, then opens its isolating writer.
+// Its canceled preparation disposes that group before the next cleanup drain.
 func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
@@ -379,15 +379,20 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 					// typed target can replay any source-generation controls.
 					source.Cancel()
 				case 2:
-					if coldStart {
-						t.Error("cold canceled source received its queued tail instead of returning before materialization")
-					}
 					flags := first.completionFlags.Load()
 					if source.ctx.Err() == nil || source.flowIsolation.Load() != flowIsolation ||
 						flags&groupCompletionReceived == 0 || flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 {
 						t.Error("second receive lost cancellation or replayed earlier source controls")
 					}
-					if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
+					if coldStart {
+						if retains.Load() != 1 || flags&(groupCompletionDisposed|groupCompletionTerminal) !=
+							groupCompletionDisposed|groupCompletionTerminal || flags&groupCompletionLinked != 0 ||
+							first.collapseSource != nil || first.affinitySourceState&affinitySourceMaterialized != 0 ||
+							len(terminalErrs) != 1 || !errors.Is(terminalErrs[0], context.Canceled) ||
+							second.completionFlags.Load()&groupCompletionReceived != 0 {
+							t.Error("cold cleanup received its tail before the predecessor's canceled preparation finished")
+						}
+					} else if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
 						t.Error("drain did not retain the earlier cleanup-received group without control replay")
 					}
 				default:
@@ -407,13 +412,24 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 					if !observeColdBoundary.Load() {
 						return
 					}
-					retains.Add(1)
-					if receives.Load() != 1 || source.ctx.Err() != context.Canceled || !source.flowIsolation.Load() ||
+					attempt := retains.Add(1)
+					if attempt != 1 && attempt != 2 {
+						t.Error("cold cleanup prepared more than its two admitted groups")
+						return
+					}
+					group := first
+					if attempt == 2 {
+						group = second
+					}
+					if receives.Load() != attempt || source.ctx.Err() != context.Canceled || !source.flowIsolation.Load() ||
 						source.contractMultiRouteWriter == nil || source.currentPreparedHandoff != nil ||
-						first.completionFlags.Load()&groupCompletionReceived == 0 ||
-						first.completionFlags.Load()&(groupCompletionDisposed|groupCompletionDequeued|groupCompletionSourceControls) != 0 ||
-						second.completionFlags.Load()&groupCompletionReceived != 0 {
-						t.Error("cold cancellation did not reach materialization with exactly one cleanup receive and an untouched queued tail")
+						group.completionFlags.Load()&groupCompletionReceived == 0 ||
+						group.completionFlags.Load()&(groupCompletionDisposed|groupCompletionDequeued|groupCompletionSourceControls) != 0 ||
+						len(terminalErrs) != int(attempt)-1 {
+						t.Error("cold cleanup did not reach its exact canceled preparation boundary")
+					}
+					if attempt == 1 && second.completionFlags.Load()&groupCompletionReceived != 0 {
+						t.Error("cold cleanup received the queued tail before its predecessor's preparation")
 					}
 				}
 			}
@@ -458,12 +474,11 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 		}
 		wantReceives := int64(2)
 		if coldStart {
-			wantReceives = 1
-			if retains.Load() != 1 {
-				t.Fatalf("cold cancellation reached materialization %d times, want 1", retains.Load())
+			if retains.Load() != 2 {
+				t.Fatalf("cold cancellation reached materialization %d times, want 2", retains.Load())
 			}
-			if len(terminalErrs) != 2 || !errors.Is(terminalErrs[0], context.Canceled) || terminalErrs[1] == nil {
-				t.Fatalf("cold materialization and queued-tail disposal did not report exactly two failures: %v", terminalErrs)
+			if len(terminalErrs) != 2 || !errors.Is(terminalErrs[0], context.Canceled) || !errors.Is(terminalErrs[1], context.Canceled) {
+				t.Fatalf("cold preparations did not report exactly two cancellation failures: %v", terminalErrs)
 			}
 			if stats := budget.Stats(); stats.UsedByteCount != 0 || stats.ReservedByteCount != stats.ReleasedByteCount {
 				t.Fatalf("cold canceled source did not reconcile its exact memory budget: %+v", stats)
@@ -479,8 +494,7 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 		}
 		for index, group := range []*parsedPacketGroup{first, second} {
 			flags := group.completionFlags.Load()
-			wantReceived := !coldStart || index == 0
-			if (flags&groupCompletionReceived != 0) != wantReceived ||
+			if flags&groupCompletionReceived == 0 ||
 				flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
 				t.Fatalf("canceled group %d lost exact cleanup custody or acquired source controls: flags=%x", index, flags)
 			}
@@ -515,8 +529,8 @@ func TestTcpGroupRecoveryCanceledFlowIsolatingDrainKeepsLatestAck(t *testing.T) 
 	testTcpGroupRecoveryCanceledDrain(t, true, false)
 }
 
-// A cold selector receives one group, then cancellation refuses materialization.
-// Closing its queued tail must preserve the latest accepted ACK and live siblings.
+// A cold selector's canceled preparation still permits its next cleanup drain.
+// Both rejected groups preserve the latest accepted ACK and live siblings.
 func TestTcpGroupRecoveryCanceledColdFlowIsolatingStartupKeepsLatestAck(t *testing.T) {
 	testTcpGroupRecoveryCanceledDrain(t, true, true)
 }
