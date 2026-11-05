@@ -25,8 +25,13 @@ type expirationLifecycleAuthority struct {
 	reports               []*protocol.CloseContract
 	firstRenewalRequested time.Time
 	blockRenewals         atomic.Bool
-	renewalEntered        chan struct{}
-	renewalOnce           sync.Once
+	// When nonzero (unix nanoseconds), requests from this time on are
+	// renewals with a fresh hour, as the platform grants every contract, rather
+	// than members of the first cohort; zero keeps the initial deadline as the
+	// cutoff.
+	renewalsFrom   atomic.Int64
+	renewalEntered chan struct{}
+	renewalOnce    sync.Once
 }
 
 // Normal requests belong to the OOB lifecycle. Shutdown cleanup explicitly
@@ -60,7 +65,11 @@ func (self *expirationLifecycleAuthority) SendControlWithCtx(ctx context.Context
 		}
 		deadline := self.initialDeadline
 		requestedAt := time.Now()
-		if !requestedAt.Before(deadline) {
+		cutoff := deadline
+		if from := self.renewalsFrom.Load(); from != 0 {
+			cutoff = time.Unix(0, from)
+		}
+		if !requestedAt.Before(cutoff) {
 			self.stateLock.Lock()
 			if self.firstRenewalRequested.IsZero() {
 				self.firstRenewalRequested = requestedAt
