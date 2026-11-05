@@ -57,6 +57,11 @@ func (self *SendSequence) prepareSendItem(
 	if err != nil {
 		return nil, effectiveAck, groupMemoryBytes, err
 	}
+	if effectiveAck && !ack && self.client != nil {
+		// carried on the acknowledged lane because its contract is not yet
+		// acknowledged (FILLFRACTION.md)
+		self.client.noAckContractPromotedCount.Add(1)
+	}
 	prepared = true
 	return item, effectiveAck, groupMemoryBytes, nil
 }
