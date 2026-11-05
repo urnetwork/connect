@@ -59,6 +59,7 @@ func (self *SendSequence) discardAheadContract() {
 	self.aheadSendContract = nil
 	self.aheadSendContractAttempted = false
 	self.successorContractRequested = false
+	ahead.openingReserved = false
 	ahead.rollbackUnwritten(0)
 	self.retireSendContract(ahead)
 }

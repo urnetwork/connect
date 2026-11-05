@@ -75,6 +75,12 @@ func (self *SendSequence) tryCloseRetiredSendContract(contract *sequenceContract
 	if contract.unackedByteCount != contract.abandonedByteCount || self.openSendContracts[contract.contractId] != contract {
 		return
 	}
+	// FILLFRACTION.md. A predecessor kept for its headroom closes once the
+	// headroom has done its part: `endNoAckHeadroom` clears it and retires it
+	// again, which brings it back here.
+	if contract == self.noAckHeadroomContract {
+		return
+	}
 	self.client.ContractManager().CloseContract(contract.contractId, contract.ackedByteCount, contract.unackedByteCount)
 	delete(self.openSendContracts, contract.contractId)
 }
