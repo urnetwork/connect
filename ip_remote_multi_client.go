@@ -325,8 +325,14 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// a discovery window whose expansion admits nothing expands again
 		// after 5-10s, then half as often per such pass down to once per 1-2
 		// minutes
-		DiscoveryExpandRetryMin:        10 * time.Second,
-		DiscoveryExpandRetryMax:        2 * time.Minute,
+		DiscoveryExpandRetryMin: 10 * time.Second,
+		DiscoveryExpandRetryMax: 2 * time.Minute,
+		// one balance grant restores every held window of its payer within
+		// one expansion backoff; an idle device's window refills at its own
+		// point of the next five minutes instead of with all the others
+		BalanceRestoreSpread:           5 * time.Minute,
+		BalanceRestoreSpreadIdle:       time.Minute,
+		UserSendStampCoarseness:        100 * time.Millisecond,
 		DiscoveryDemandListingsPerPass: 3,
 		DiscoveryDemandListingInterval: time.Second,
 		// long enough for a slow-but-alive platform API round trip; a hung
@@ -635,6 +641,22 @@ type MultiClientSettings struct {
 	// balance refuses. A host opts in: the proxy service turns it on for its
 	// hosted devices (server CPUOPT4.md, Part B #1).
 	OutOfBalanceRefillProbe bool
+	// Spreads the refill of windows the balance held once their probe finds
+	// the balance restored (see ip_remote_multi_client_balance_hold.go). A
+	// restored window whose device sent no user packet in the last
+	// BalanceRestoreSpreadIdle waits a fixed offset in
+	// [0, BalanceRestoreSpread), a function of the window's key, before it
+	// expands, and the device's next user packet ends the wait at once. A
+	// device that is sending expands in the same pass, as before. Nonpositive
+	// BalanceRestoreSpread expands every restored window at once. Only windows
+	// with OutOfBalanceRefillProbe are held, so only they are spread.
+	BalanceRestoreSpread     time.Duration
+	BalanceRestoreSpreadIdle time.Duration
+	// How often the device's latest-user-packet stamp, which the spread
+	// reads, is rewritten while no window waits: a send inside this of the
+	// last stamp stores nothing, so the hot path costs a load. While a window
+	// waits, every send stores it.
+	UserSendStampCoarseness time.Duration
 	// When set, the process's counters of what the windows do with their
 	// window clients (see
 	// ip_remote_multi_client_window_client_stats.go). A host that runs many
@@ -2045,6 +2067,11 @@ type RemoteUserNatMultiClient struct {
 	// uplinkStampCoarseness so a download does not rewrite it per packet. See
 	// stampUplinkIngress and uplinkGate.
 	uplinkLastIngressNanos atomic.Int64
+	// The unix-nano time the device last handed the tunnel a user packet,
+	// coarsened to UserSendStampCoarseness. A window whose balance came back
+	// reads it to tell an idle device from one a user is waiting on
+	// (ip_remote_multi_client_balance_hold.go). See stampUserSend.
+	userLastSendNanos atomic.Int64
 
 	// the uplink staleness epoch, maintained lazily by uplinkGate as the
 	// channels' verdict passes call it. uplinkStaleSince is set while the
@@ -2939,6 +2966,7 @@ func NewRemoteUserNatMultiClient(
 		multiClient.clientAdded,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
+	multiClient.windows[WindowTypeQuality].userSentSinceFunc = multiClient.userSentSince
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
 		multiClient.windows[WindowTypeSpeed] = newMultiClientWindow(
 			cancelCtx,
@@ -2967,6 +2995,7 @@ func NewRemoteUserNatMultiClient(
 			multiClient.clientAdded,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
+		multiClient.windows[WindowTypeSpeed].userSentSinceFunc = multiClient.userSentSince
 	}
 	// else only keep the quality window for fixed destination
 
@@ -6676,6 +6705,7 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 	timeout time.Duration,
 	nativeIngress bool,
 ) bool {
+	self.stampUserSend()
 	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
@@ -7032,6 +7062,9 @@ func (self *RemoteUserNatMultiClient) sendPacketBatchWithPolicy(
 	accepted []bool,
 	nativeIngress bool,
 ) int {
+	if 0 < len(packets) {
+		self.stampUserSend()
+	}
 	containsFragments := false
 	for _, packet := range packets {
 		if isIpFragmentPacket(packet) {
@@ -8608,6 +8641,42 @@ func (self *RemoteUserNatMultiClient) stampUplinkIngress() {
 		return
 	}
 	self.uplinkLastIngressNanos.Store(nowNanos)
+}
+
+// Records that the device handed the tunnel a user packet, and ends the wait of
+// any window whose restored refill waits for one. While no window waits, the
+// stamp is coarsened to UserSendStampCoarseness; while one does, every send
+// stores it, so the packet that ends the wait is the one stamped. A bare
+// fixture without settings stores every send.
+func (self *RemoteUserNatMultiClient) stampUserSend() {
+	waiting := false
+	for _, window := range self.windows {
+		if window != nil && window.balanceRestoreWake.Load() {
+			waiting = true
+		}
+	}
+	nowNanos := time.Now().UnixNano()
+	if !waiting && self.settings != nil {
+		if lastNanos := self.userLastSendNanos.Load(); nowNanos-lastNanos < int64(self.settings.UserSendStampCoarseness) {
+			return
+		}
+	}
+	self.userLastSendNanos.Store(nowNanos)
+	if waiting {
+		for _, window := range self.windows {
+			if window != nil {
+				window.wakeBalanceRestore()
+			}
+		}
+	}
+}
+
+// Whether the device handed the tunnel a user packet at or after `since`. A
+// lock-free read, safe from any goroutine; the windows read it through
+// userSentSinceFunc.
+func (self *RemoteUserNatMultiClient) userSentSince(since time.Time) bool {
+	lastNanos := self.userLastSendNanos.Load()
+	return lastNanos != 0 && since.UnixNano() <= lastNanos
 }
 
 // uplinkLastIngress reads the ingress stamp: when a provider-originated packet
@@ -12325,7 +12394,18 @@ type multiClientWindow struct {
 	discoveryRetry discoveryExpandRetry
 	// Whether the payer's balance holds the refill. Guarded by stateLock. See
 	// ip_remote_multi_client_balance_hold.go.
-	balanceHold            windowBalanceHold
+	balanceHold windowBalanceHold
+	// A restored window's spread refill: when it may expand without a user
+	// packet. Guarded by stateLock; the key its offset is a function of is set
+	// at construction, and the wake flag is read by the parent's send path.
+	// See ip_remote_multi_client_balance_hold.go.
+	balanceRestore     windowBalanceRestore
+	balanceRestoreKey  Id
+	balanceRestoreWake atomic.Bool
+	// The parent's userSentSince, set after construction like
+	// clientMigrateFunc: whether the device sent a user packet at or after a
+	// time. Lock-free. nil (bare test windows) reads as sending.
+	userSentSinceFunc      func(since time.Time) bool
 	discoveryDemand        discoveryAcquisitionDemand
 	discoveryDemandChanged *Monitor
 	// A strict window's current expansion pass: the candidates the
@@ -12470,6 +12550,7 @@ func newMultiClientWindow(
 		clientRemoveCallback:         clientRemoveCallback,
 		clientRetireCallback:         clientRetireCallback,
 		windowType:                   windowType,
+		balanceRestoreKey:            NewId(),
 		performanceProfile:           initialPerformanceProfile,
 		windowSizeLimit:              settings.WindowSizeLimit,
 		settings:                     settings,
@@ -14205,15 +14286,26 @@ func (self *multiClientWindow) resize() {
 		if len(clients) < targetWindowSize && redialDeferred {
 			windowClientStats.addExpandPass(self.windowType, windowExpandPassDeferred)
 		}
+		// A window whose balance came back while its device was idle waits out
+		// its spread offset before it expands; the device's next user packet
+		// ends the wait (see ip_remote_multi_client_balance_hold.go)
+		var restoreTime time.Time
+		restoreDeferred := false
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !fixedDestination {
+			restoreTime, restoreDeferred = self.balanceRestoreDeferral(time.Now())
+			if restoreDeferred {
+				windowClientStats.addExpandPass(self.windowType, windowExpandPassDeferred)
+			}
+		}
 		// While the payer's balance refuses the window's contracts, the step
 		// sends one probe instead of building candidates; a restored balance
-		// expands in this same pass (see
+		// expands in this same pass unless the device is idle (see
 		// ip_remote_multi_client_balance_hold.go)
 		balanceHeld := false
-		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !fixedDestination {
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !restoreDeferred && !fixedDestination {
 			balanceHeld = self.probeBalanceHold(windowClientStats)
 		}
-		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !balanceHeld {
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !restoreDeferred && !balanceHeld {
 			// expand
 			expandPass := windowExpandPassPlan{
 				state: windowExpandPassStateOf(
@@ -14289,7 +14381,7 @@ func (self *multiClientWindow) resize() {
 			if !fixedDestination {
 				// Deferring discovery delays acquisition, not the active goal.
 				// Readiness and provider ownership remain the actual counts.
-				if _, deferred := self.discoveryExpandDeferral(time.Now()); deferred {
+				if _, deferred := self.discoveryExpandDeferral(time.Now()); deferred || restoreDeferred {
 					publishedTargetSize = max(publishedTargetSize, targetWindowSize+len(warnedClients))
 				}
 			}
@@ -14318,6 +14410,9 @@ func (self *multiClientWindow) resize() {
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
 		if redialDeferred {
 			timeout = min(timeout, time.Until(redialTime))
+		}
+		if restoreDeferred {
+			timeout = min(timeout, time.Until(restoreTime))
 		}
 		if timeout <= 0 {
 			select {

@@ -341,9 +341,11 @@ func TestOutOfBalanceWindowProbesInsteadOfBuilding(t *testing.T) {
 	})
 }
 
-// A top-up resumes the refill at the next expansion step, the step at which the
-// window would have expanded without the probe: the probe finds the balance
-// restored and the same pass builds and admits the replacement.
+// A top-up resumes the refill of a device a user is sending on at the next
+// expansion step, the step at which the window would have expanded without the
+// probe: the probe finds the balance restored and the same pass builds and
+// admits the replacement. The restore spread leaves this timing exactly as it
+// was (see ip_remote_multi_client_balance_restore_test.go for an idle device).
 func TestOutOfBalanceWindowResumesWithinOneBackoffStep(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
@@ -366,8 +368,13 @@ func TestOutOfBalanceWindowResumesWithinOneBackoffStep(t *testing.T) {
 			t.Fatalf("the held window has no next expansion step after the top-up")
 		}
 
+		// the user is still trying: a connection attempt inside
+		// BalanceRestoreSpreadIdle of the step
+		h.sleep(max(0, nextStep.Sub(toppedUp)-30*time.Second))
+		h.syn(reraceFlow(4, 0, 40001))
+
 		// nothing is built before the step, as without the probe
-		h.sleep(nextStep.Sub(toppedUp) - time.Second)
+		h.sleep(nextStep.Sub(time.Now()) - time.Second)
 		if installedCount, _ := strictHandoverTestCounts(window); installedCount != 4 {
 			t.Fatalf("the window refilled to %d before its next expansion step", installedCount)
 		}
