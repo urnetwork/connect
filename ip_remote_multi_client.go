@@ -685,10 +685,18 @@ type MultiClientSettings struct {
 	// candidate to the ordinary ping evaluation: the prefilter only
 	// accelerates certain failure, it never admits a candidate.
 	EncryptionCapabilityPrefilter bool
-	PingWriteTimeout              time.Duration
-	CPingWriteTimeout             time.Duration
-	CPingMaxByteCountPerSecond    ByteCount
-	PingTimeout                   time.Duration
+	// Bounds local admission of a window candidate's evaluation ping. Under
+	// `EncryptionModeRequired` the ping's wait for the session's cipher is
+	// network work (two round trips to the provider) and runs within the rest
+	// of `PingTimeout` instead.
+	PingWriteTimeout time.Duration
+	// Bounds local admission of each continuous ping. Before the channel's
+	// first answered ping, a required-encryption refusal at this bound rests
+	// and pings again instead of convicting the channel: the evaluation owns
+	// that wait.
+	CPingWriteTimeout          time.Duration
+	CPingMaxByteCountPerSecond ByteCount
+	PingTimeout                time.Duration
 	// Optional identity-free terminal initial-ping diagnostics; nil is inert.
 	InitialPingObservations *InitialPingObservations
 	// Nil in production; focused controls pin first-ping writer ordering.
@@ -15326,9 +15334,24 @@ requestCandidates:
 					if pingPath != nil {
 						pingOptions = []any{observeTransportWrite(pingPath.observeRouteWrite)}
 					}
+					// Under required encryption the ping cannot leave before the
+					// session's cipher, and bringing the cipher up (the tls
+					// handshake and identity proofs, two round trips to the
+					// provider) is part of the candidate's answer, not local
+					// admission. It gets the rest of the ping budget, which the
+					// ping timer above bounds either way. Charged to the write
+					// budget, a healthy candidate more than about 2.5 s of round
+					// trip away could never pass (connect#220).
+					pingSendTimeout := self.settings.PingWriteTimeout
+					if client.requiresEncryption() {
+						pingSendTimeout = max(
+							pingSendTimeout,
+							pingStartedAt.Add(self.settings.PingTimeout).Sub(time.Now()),
+						)
+					}
 					success, err := client.SendDetailedMessage(
 						&protocol.IpPing{},
-						self.settings.PingWriteTimeout,
+						pingSendTimeout,
 						func(err error) {
 							pingPath.observeAckCallback(err)
 							err = deliveredPingError(err)
@@ -17033,6 +17056,18 @@ func (self *multiClientChannel) IsP2pOnly() bool {
 // the ping evaluation would reach anyway, it never admits a candidate.
 func rejectCandidateMissingEncryptionKey(mode EncryptionMode, publicKey []byte, fetchErr error) bool {
 	return mode == EncryptionModeRequired && fetchErr == nil && len(publicKey) == 0
+}
+
+// requiresEncryption reports whether the channel's client runs
+// `EncryptionModeRequired`, where an application send waits, within its own
+// timeout, for the session's cipher. False for a bare fixture without an
+// underlying client.
+func (self *multiClientChannel) requiresEncryption() bool {
+	if self.client == nil {
+		return false
+	}
+	settings := self.client.EncryptionSessionManager().Settings()
+	return settings != nil && settings.Mode == EncryptionModeRequired
 }
 
 // EncryptionCapabilityFetcher returns a one-shot fetcher for the channel
@@ -20230,6 +20265,10 @@ func (self *multiClientChannel) ping() {
 	pingTimer := time.NewTimer(self.settings.CPingTimeout)
 	pingTimer.Stop()
 	defer pingTimer.Stop()
+	// Set once a ping has been answered. Before that a required-encryption
+	// refusal is the session still coming up, under the evaluation's budget;
+	// after it a refusal means the established session was lost.
+	answered := false
 	for {
 		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
@@ -20260,7 +20299,16 @@ func (self *multiClientChannel) ping() {
 					ackCallback,
 				)
 			}
-			if err != nil {
+			if !answered && errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+				// Nothing was sent: the required session is not up yet, and on
+				// a slow link its handshake can outlast CPingWriteTimeout. The
+				// channel's evaluation owns that wait under PingTimeout, so rest
+				// and ping again rather than convict the provider on a local
+				// refusal (connect#220).
+				if self.log.V(1).Enabled() {
+					self.log.Infof("[multi]cping %s waiting for the required session\n", self.args.Destination)
+				}
+			} else if err != nil {
 				self.addError(err)
 				self.cancel()
 				return
@@ -20293,6 +20341,7 @@ func (self *multiClientChannel) ping() {
 						self.cancel()
 						return
 					}
+					answered = true
 				case <-pingTimer.C:
 					self.log.Infof("[multi]cping %s unanswered: ping loop ended, channel remains\n", self.args.Destination)
 					return

@@ -6591,3 +6591,23 @@ and its 47 controls remain preserved privately and unrun. Native/APK/device
 workloads and the complete 32/64 MiB MEMSTEADY/performance matrix remain
 unqualified. No production-baseline promotion or release qualification is
 claimed by this checkpoint.
+
+
+### 2026-11-05: Corrected ordinary 100-page workload — current-source qualification
+
+The committed production candidate (Connect `b8a746af`, Server `29f80efdd`, SDK `cf90cf6f`) passed one fresh ordinary same-site H1 run using natural provider selection, verified TLS and the complete public SDK/TUN path. It completed 100 HTML requests, 400 asset outcomes, 500 requests total and 99 unfinished-navigation overlaps, with 99 HTML connection reuses.
+
+| HTML TTFB | Current run |
+| --- | ---: |
+| Median | 457.841 ms |
+| p95 | 1,517.564 ms |
+| Maximum | 2,176.993 ms |
+| At least 5 seconds / at least 10 seconds / stalls | 0 / 0 / 0 |
+
+Ready setup took 5,201.424 ms; the first HTML byte arrived at 6,124.368 ms from setup start. Acquire time median/p95 was 0.010/867.569 ms; written-to-first-byte median/p95 was 406.456/1,099.170 ms. Actual traffic used providers 0 and 2, two local channels, with 230/270 requests attributed to their respective masks. All 400 asset tasks and 382 opened bodies joined; HTTP request/connection counts returned to zero, SDK owners joined, and retained-byte reservations balanced releases. The process exited 0 and the resource owner completed its joined final census without a capacity error.
+
+This is one current-source qualification, not an old/new comparison or baseline promotion. It does not erase the earlier pool-pair latency regression signal, prove every browsing pause fixed, or qualify device memory. The ordinary workload reports mechanism qualification separately; a strict fault-injection result is not inferred from it. Inner HTTP/2 has separate coverage and is not exercised by this H1 inner-HTTP workload.
+
+The full correctness attempt first stopped at a stale cold-cancellation test expectation. The corrected test pins the existing two-group cleanup iteration, latest accepted ACK, cancellation fences, balanced budgets and healthy sibling traffic. Twelve focused/adjacent tests passed in each of three fresh normal processes and one race process; both isolated negative controls failed at their expected boundaries. The test-only correction is committed as Connect `f51df986`; production code is unchanged from the performance run. Full six-suite correctness remains pending.
+
+Evidence: `/Volumes/data/urnetwork/runtime-20261105/cold-fixed-and-current100.brka8s7m/ordinary100/COMPACT-READBACK.json`, the associated `TERMINAL.json`, and the four focused positive/two negative phase receipts in the same parent. Real-device 32 MiB iOS-profile and 64 MiB Android-profile MEMSTEADY/PERFVAR qualification remains outstanding.
