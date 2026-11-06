@@ -1684,14 +1684,14 @@ type ClientSettings struct {
 	// and must survive their return-traffic provide registration.
 	ProviderStreamPolicy bool
 
-	// P2pPeerSourceOnly makes a P2P carrier accept only its peer as source. A
-	// frame read from a P2P route whose source is not that route's peer is
-	// dropped and counted before it is decoded, and a route that names no peer
-	// delivers nothing. This holds every lane of the association and every
-	// frame type, so a P2P peer cannot pose as the platform (ControlId), as this
-	// client or as a third client. The peer is the adjacent one, so an endpoint
-	// of a multihop stream also refuses the far end's frames relayed over it, and
-	// that stream carries nothing from the far end (SUBPROTOCOL.md §11.3).
+	// Holds a P2P carrier to its peer as source. A frame read from a P2P route
+	// whose source is not that route's peer is dropped and counted before it is
+	// decoded, and a route that names no peer delivers nothing. This holds every
+	// lane of the association and every frame type, so a P2P peer cannot pose as
+	// the platform (ControlId), as this client or as a third client. The peer is
+	// the adjacent one, so an endpoint of a multihop stream also refuses the far
+	// end's frames relayed over it, and that stream carries nothing from the far
+	// end (SUBPROTOCOL.md §11.3).
 	//
 	// False, the default, accepts any source on a P2P route, as a client always
 	// has: multihop far ends keep working, and so does a forged source.
@@ -4790,8 +4790,8 @@ func (self *Client) run() {
 			// from the decrypting session, the plaintext companion hint, or the
 			// EncryptedControl.
 			receiveCompanion := false
-			// verifiedClientKey is the opening session's peer key, for a frame
-			// that arrived wrapped. See EncryptionSettings.ExposeVerifiedPeerClientKey.
+			// the opening session's peer key, for a frame that arrived wrapped
+			// (EncryptionSettings.ExposeVerifiedPeerClientKey)
 			var verifiedClientKey *[ed25519.PublicKeySize]byte
 
 			// outer encrypted wrap: the inner bytes are themselves a

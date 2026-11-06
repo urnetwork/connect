@@ -86,8 +86,8 @@ type TransferCarrierProperties struct {
 	// DATAGRAM reader remains nonblocking. Unknown preserves compatibility for
 	// custom transports that predate lane-aware receive admission.
 	ReceiveReliability CarrierReliability
-	// receivePeerId is the one client a P2P receive route's association
-	// reaches. Zero is unknown, which `ClientSettings.P2pPeerSourceOnly` refuses.
+	// The one client a P2P receive route's association reaches. Zero is unknown,
+	// which `ClientSettings.P2pPeerSourceOnly` refuses.
 	receivePeerId Id
 	// UnreliableMaxMessageByteCount refines a hybrid send carrier whose lane is
 	// selected by a contiguous message-size threshold. A positive limit means
@@ -346,7 +346,7 @@ type transferReceiveDisposition struct {
 	transportType TransportType
 	reliability   CarrierReliability
 	h1Credit      platformH1ReceiveCredit
-	// peerId is the exact route's TransferCarrierProperties.receivePeerId.
+	// the exact route's TransferCarrierProperties.receivePeerId
 	peerId Id
 }
 

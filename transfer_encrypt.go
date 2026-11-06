@@ -780,10 +780,10 @@ type EncryptionSettings struct {
 	// a receive sequence and must outlive the longer of the two.
 	IdleTimeout time.Duration
 
-	// ExposeVerifiedPeerClientKey makes `Peer.VerifiedClientPublicKey` answer. A
-	// frame opened by a session whose peer proved its client key then carries
-	// that key to the receive callbacks and subprotocol listeners. A frame
-	// that arrived in plaintext carries none, whatever session its peer has.
+	// Makes `Peer.VerifiedClientPublicKey` answer. A frame opened by a session
+	// whose peer proved its client key then carries that key to the receive
+	// callbacks and subprotocol listeners. A frame that arrived in plaintext
+	// carries none, whatever session its peer has.
 	//
 	// False, the default, carries no key, so the accessor reports none and
 	// receive batches form exactly as they would without it: the key is part of
@@ -1178,8 +1178,8 @@ type peerEncryptionSession struct {
 	// grows, and both old and new certs stay trusted. Per-peer: survives
 	// handshake resets.
 	trustedPeerCertPems map[string]bool
-	// verifiedClientKeyValue is peerClientPublicKey as `verifiedClientKey` hands
-	// it to the receive path: allocated once, then shared and never written.
+	// peerClientPublicKey as `verifiedClientKey` hands it to the receive path:
+	// allocated once, then shared and never written.
 	verifiedClientKeyValue *[ed25519.PublicKeySize]byte
 
 	// peerClientKeyHistoryFetcher resolves the peer's signed registration
@@ -3985,12 +3985,12 @@ func (self *peerEncryptionSession) verifiedPeerIdentity() (ed25519.PublicKey, bo
 	return append(ed25519.PublicKey(nil), self.peerClientPublicKey...), true
 }
 
-// verifiedClientKey returns this session's peer client key once its peer has
-// proved it, or nil. A key the signed-identity gate is still holding, or has
-// refused, is not verified, the same answer `Cipher()` gives. Called only for a
-// frame this session opened. The key is first-write-wins for the session, so
-// an epoch's cipher and the established epoch answer for the same key. The
-// value is shared with every Peer that carries it and must not be written.
+// This session's peer client key once its peer has proved it, or nil. A key the
+// signed-identity gate is still holding, or has refused, is not verified, the
+// same answer `Cipher()` gives. Called only for a frame this session opened. The
+// key is first-write-wins for the session, so an epoch's cipher and the
+// established epoch answer for the same key. The value is shared with every Peer
+// that carries it and must not be written.
 func (self *peerEncryptionSession) verifiedClientKey() *[ed25519.PublicKeySize]byte {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

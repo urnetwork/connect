@@ -441,8 +441,8 @@ type p2pReceiveRouteLane struct {
 	transport   Transport
 	route       Route
 	reliability CarrierReliability
-	// peerId is the association's adjacent peer; zero when the constructor's
-	// caller named none.
+	// the association's adjacent peer; zero when the constructor's caller named
+	// none
 	peerId Id
 }
 
