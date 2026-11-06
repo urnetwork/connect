@@ -567,8 +567,9 @@ for the control source, D-PROTO-13 for the key.
 
 A sidecar client takes all three opt-ins: `WithSubprotocolControlSource()` on its
 one registration, `ClientSettings.P2pPeerSourceOnly` and
-`EncryptionSettings.ExposeVerifiedPeerClientKey`. Each fails closed if forgotten:
-pushes are dropped, or the identity check finds no key.
+`EncryptionSettings.ExposeVerifiedPeerClientKey`. The first and last fail closed
+if forgotten: pushes are dropped, or the identity check finds no key. The second
+does not, so a client must set it before it takes any P2P route.
 
 ### 11.1 Known ids
 
