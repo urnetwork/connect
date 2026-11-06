@@ -151,30 +151,55 @@ func (self *peerEncryptionSession) resolvePeerClientKeyHistory(contractPub ed255
 
 		encodedHistory, err := self.peerClientKeyHistoryFetcher(self.ctx)
 		if err != nil {
-			// A healthy store retains the existing network-availability policy.
-			// Local closed/corrupt storage cannot be bypassed by that fallback.
-			if store, ok := self.settings.PeerClientKeyPinStore.(CheckedPeerClientKeyPinStore); ok {
-				if _, _, storeErr := store.GetPeerClientKeyPinChecked(self.peerId); storeErr != nil {
-					self.blockKeyHistoryStore(storeErr)
-					return
-				}
-			}
-			// Availability failure, NOT evidence of substitution. Treating an
-			// unreachable platform API as a verified disagreement would
-			// exclude every provider for every Required client at once the
-			// moment that API blipped — a self-inflicted global outage with
-			// the same shape as the blackhole the window exists to route
-			// around. Fall back to the contract key and say so.
-			// DESIGNNOTES3 §5.3.
-			self.client.log.Infof(
-				"[key]%s signed identity evidence unavailable (%s) — falling back to the contract key\n",
-				self.logTag, err,
-			)
-			self.openKeyHistoryGate(clientKeyHistoryVerified, "")
+			self.applyPeerClientKeyHistoryFetchError(contractPub, err)
 			return
 		}
 		self.applyPeerClientKeyHistory(contractPub, encodedHistory)
 	})
+}
+
+// Reads the peer's pin from the configured store. Only a checked store can
+// fail; no store means no pin.
+func (self *peerEncryptionSession) peerClientKeyPin() (ClientKeyPin, bool, error) {
+	store := self.settings.PeerClientKeyPinStore
+	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
+		return checked.GetPeerClientKeyPinChecked(self.peerId)
+	}
+	if store != nil {
+		pin, pinned := store.GetPeerClientKeyPin(self.peerId)
+		return pin, pinned, nil
+	}
+	return ClientKeyPin{}, false, nil
+}
+
+// Decides a resolution whose signed history could not be fetched. That is an
+// availability failure, not evidence of substitution: treating an unreachable
+// platform API as a verified disagreement would exclude every provider for
+// every Required client the moment it blipped (DESIGNNOTES3 §5.3). So an
+// unpinned peer, or a pinned peer presenting its pinned key, falls back to the
+// contract key. A pinned peer may move off its pinned key only through a
+// signed rotation, which is exactly what cannot be shown now: a different
+// contract key is refused, as the per-peer downgrade an empty history is.
+// Otherwise an operator could answer with an error instead of with nothing.
+// Local closed or corrupt storage blocks rather than falls back.
+func (self *peerEncryptionSession) applyPeerClientKeyHistoryFetchError(
+	contractPub ed25519.PublicKey,
+	fetchErr error,
+) {
+	pin, pinned, storeErr := self.peerClientKeyPin()
+	if storeErr != nil {
+		self.blockKeyHistoryStore(storeErr)
+		return
+	}
+	if pinned && !bytes.Equal(pin.PublicKey[:], contractPub) {
+		self.rejectKeyHistory("contract identity key differs from the pinned signed key while no signed history is available")
+		return
+	}
+	self.client.log.Infof(
+		"[key]%s signed identity evidence unavailable (%s) — falling back to the contract key\n",
+		self.logTag, fetchErr,
+	)
+	self.openKeyHistoryGate(clientKeyHistoryVerified, "")
 }
 
 // applyPeerClientKeyHistory is the decision table of DESIGNNOTES3 §5.2.
@@ -183,17 +208,10 @@ func (self *peerEncryptionSession) applyPeerClientKeyHistory(
 	encodedHistory [][]byte,
 ) {
 	store := self.settings.PeerClientKeyPinStore
-	var pin ClientKeyPin
-	pinned := false
-	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
-		var err error
-		pin, pinned, err = checked.GetPeerClientKeyPinChecked(self.peerId)
-		if err != nil {
-			self.blockKeyHistoryStore(err)
-			return
-		}
-	} else if store != nil {
-		pin, pinned = store.GetPeerClientKeyPin(self.peerId)
+	pin, pinned, err := self.peerClientKeyPin()
+	if err != nil {
+		self.blockKeyHistoryStore(err)
+		return
 	}
 
 	if len(encodedHistory) == 0 {
