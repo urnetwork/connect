@@ -583,8 +583,7 @@ frame can say so. The rule is two conditions:
 
 - **The listener opted in.** `WithSubprotocolControlSource()` at
   `AddSubprotocolRawCallback` or `RegisterSubprotocol` opts that one listener in.
-  A listener of the same id without it never sees the frame, and neither does a
-  listener registered before or after it.
+  A listener of the same id without it never sees the frame.
 - **A platform carrier delivered it.** `peer.TransportType` is `h1`, `h3`,
   `h3dns` or `h3dnspump`. The type comes from the route that read the frame,
   never from the frame. A P2P carrier reaches a peer, and a peer can write any
@@ -650,10 +649,10 @@ opened them at the moment it did, not looked up by peer afterwards, so it says
 nothing about a peer in general:
 
 - A frame that arrived in plaintext has no key, even from a peer with a sealed
-  session, and so does a frame from the control id, loopback, and a key the
-  signed-identity gate holds or has refused. Every path into a callback carries
-  it: the acked and no-ack Pack paths, both delivery dispatches, the generic
-  callbacks and both kinds of subprotocol listener.
+  session. Neither does a frame from the control id or loopback, nor one whose
+  key the signed-identity gate holds or has refused. Every path into a callback
+  carries it: the acked and no-ack Pack paths, both delivery dispatches, the
+  generic callbacks and both kinds of subprotocol listener.
 - One callback carries one `Peer`, so a sealed frame and a plaintext one never
   share a batch while this is on.
 - It is read-only: the result is a value, the session's bytes are not reachable
