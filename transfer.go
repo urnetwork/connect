@@ -1658,6 +1658,19 @@ type ClientSettings struct {
 	// and must survive their return-traffic provide registration.
 	ProviderStreamPolicy bool
 
+	// P2pPeerSourceOnly makes a P2P carrier accept only its peer as source. A
+	// frame read from a P2P route whose source is not that route's peer is
+	// dropped and counted before it is decoded, and a route that names no peer
+	// delivers nothing. This holds every lane of the association and every
+	// frame type, so a P2P peer cannot pose as the platform (ControlId), as this
+	// client or as a third client. The peer is the adjacent one, so an endpoint
+	// of a multihop stream also refuses the far end's frames relayed over it, and
+	// that stream carries nothing from the far end (SUBPROTOCOL.md §11.3).
+	//
+	// False, the default, accepts any source on a P2P route, as a client always
+	// has: multihop far ends keep working, and so does a forged source.
+	P2pPeerSourceOnly bool
+
 	// ClientKeySeed, when set, is the long-lived Ed25519 client identity key
 	// seed (`ed25519.NewKeyFromSeed`); must be `ed25519.SeedSize` (32) bytes.
 	// When empty, `ClientKeyManager` generates a fresh seed. Persist the running
@@ -1692,6 +1705,8 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+	// Nil test barrier reached after `P2pPeerSourceOnly` counts a refused frame.
+	afterP2pSourceDropForTest func()
 
 	// TransportDelay, when set, offers the per-message delay header on this
 	// client's P2P streams as the active side, while the client's edges
@@ -1731,6 +1746,11 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
+	// Transfer frames `ClientSettings.P2pPeerSourceOnly` refused, and their
+	// encoded bytes: read from a P2P route with a source other than its peer.
+	// Zero with the setting off.
+	P2pSourceDropCount              uint64
+	P2pSourceDropByteCount          uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
 	PackHandoffWaitCount            uint64
@@ -2156,6 +2176,9 @@ type Client struct {
 	receiveQueueCommitCount                atomic.Uint64
 	receiveQueueCommitShortfallCount       atomic.Uint64
 	receiveQueueExitWithdrawCount          atomic.Uint64
+	// Frames `ClientSettings.P2pPeerSourceOnly` refused, and their encoded bytes.
+	p2pSourceDropCount     atomic.Uint64
+	p2pSourceDropByteCount atomic.Uint64
 	// A no-acknowledgement Pack asks for delivery out of sequence with no ack
 	// and no retry, so it should never be queued behind a retransmit buffer it
 	// will never occupy, and never dropped because one is full. Offered counts
@@ -2542,6 +2565,8 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
+		P2pSourceDropCount:                     self.p2pSourceDropCount.Load(),
+		P2pSourceDropByteCount:                 self.p2pSourceDropByteCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
@@ -4329,6 +4354,25 @@ func (self *Client) receive(source TransferPath, frames []*protocol.Frame, peer 
 	}
 }
 
+// Counts a frame `ClientSettings.P2pPeerSourceOnly` refused. The log samples
+// at powers of two, so a peer flooding forged sources cannot flood the log.
+func (self *Client) recordP2pSourceDrop(sourceId Id, peerId Id, messageByteCount ByteCount) {
+	count := self.p2pSourceDropCount.Add(1)
+	self.p2pSourceDropByteCount.Add(uint64(messageByteCount))
+	if count&(count-1) == 0 && self.log.V(1).Enabled() {
+		self.log.Infof(
+			"[cr]%s drop p2p source %s from peer %s count=%d\n",
+			self.clientTag,
+			sourceId,
+			peerId,
+			count,
+		)
+	}
+	if self.settings.afterP2pSourceDropForTest != nil {
+		self.settings.afterP2pSourceDropForTest()
+	}
+}
+
 // Counts a receive-side Pack that could not be handed to its sequence
 // immediately. Transfer retransmission is responsible for recovery.
 func (self *Client) recordReceivePackHandoffDrop(messageByteCount ByteCount) {
@@ -4596,6 +4640,7 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var carrierReliability CarrierReliability
+		var carrierPeerId Id
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4606,6 +4651,7 @@ func (self *Client) run() {
 				)
 				transportType = disposition.transportType
 				carrierReliability = disposition.reliability
+				carrierPeerId = disposition.peerId
 				h1ReceiveCredit = disposition.h1Credit
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
@@ -4646,6 +4692,17 @@ func (self *Client) run() {
 		path, err := FilteredTransferPath(transferFrameBytes)
 		if err != nil {
 			// bad protobuf (unexpected, see route note above)
+			MessagePoolReturn(transferFrameBytes)
+			continue
+		}
+		// The source a P2P carrier reports is only what its peer wrote. Refuse
+		// it before anything reads it as that client: ControlId has no contract
+		// and no session, and this client's own id has no contract. Dropped
+		// here, a refused frame leaves no ack and no sequence state, so a
+		// sender's retry custody is untouched.
+		if self.settings.P2pPeerSourceOnly && transportType == TransportTypeP2p &&
+			(carrierPeerId == (Id{}) || path.SourceId != carrierPeerId) {
+			self.recordP2pSourceDrop(path.SourceId, carrierPeerId, ByteCount(len(transferFrameBytes)))
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
