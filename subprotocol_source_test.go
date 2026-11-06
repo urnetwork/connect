@@ -295,6 +295,34 @@ func TestSubprotocolControlSourceDroppedFromOptedInListenerOffPlatformCarriers(t
 	}
 }
 
+// The opt-in belongs to one listener, a typed handler as much as a raw one. Here
+// the raw listener opted in and the handler of the same id did not.
+func TestSubprotocolControlSourceOptInIsPerListener(t *testing.T) {
+	fixture := newSourceRuleFixture(t, TransportTypeH1)
+	receipts := newSubprotocolSourceReceipts()
+	if _, err := fixture.client.AddSubprotocolRawCallback(subprotocolSourceTestId, func(source TransferPath, _ SubprotocolId, messageBytes []byte, peer Peer) {
+		receipts.record("raw", source, messageBytes, peer)
+	}, WithSubprotocolControlSource()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RegisterSubprotocol[*fixedMessage](fixture.client, subprotocolSourceTestId, &fixedCodec{}, func(source TransferPath, m *fixedMessage, peer Peer) {
+		receipts.record("typed", source, m.bytes(), peer)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	control := newSourceRuleSequence(ControlId)
+	fixture.inject(control, subprotocolTestFrame(subprotocolSourceTestId, []byte("hint")))
+	fixture.fence(control)
+
+	if raw := receipts.get("raw"); len(raw) != 1 {
+		t.Fatalf("raw received %v", raw)
+	}
+	if typed := receipts.get("typed"); len(typed) != 0 {
+		t.Fatalf("a handler that did not opt in received %v", typed)
+	}
+}
+
 // Opting in adds the control id and takes nothing away: peers' frames reach
 // every listener as before.
 func TestSubprotocolPeerFramesReachEveryListener(t *testing.T) {
