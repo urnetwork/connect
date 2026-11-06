@@ -9920,8 +9920,8 @@ paths:
         client-token fix is live, `strict_exp` is refused outside the preview
         networks.
 
-        An admitted-only network refuses a tagged or ephemeral enrollment before
-        its first authorization base with `no_genesis`.
+        Before the network's first authorization base, a tagged or ephemeral
+        enrollment is refused with `no_genesis`.
       operationId: networkEnroll
       security: []
       requestBody:
@@ -10419,10 +10419,12 @@ paths:
         "429":
           description: |
             One of `BUSY`, `FOLD_BEHIND`, the budget's `RESOURCE_EXHAUSTED`,
-            `TIME_AHEAD`, or a lease or fence wait, with `retry_after_ms`. These
-            refuse nothing, and the client retries the push.
+            `TIME_AHEAD`, a CLOSURE past its eraser's daily allowance, a drop past
+            the network's daily limit, a refusal that meets 8 live refusal records
+            or a refusal fence under 1 second old, or a lease or fence wait, with
+            `retry_after_ms`.
         "503":
-          description: "`{push_id, outcome: unknown}`, or evs's clock is unsure before it has read the head. The client retries."
+          description: "`{push_id, outcome: unknown}`, or evs's clock is unsure before it read anything. The client retries."
         "507":
           description: "`CLUSTER_FULL` with `Retry-After`, once the head records it."
 
@@ -10779,16 +10781,10 @@ paths:
       x-status: planned
       tags: [Other]
       summary: Remove leases
-      description: Removes the caller's leases the request names.
+      description: Removes leases a `POST` wrote. How a request names them lands with the route.
       operationId: evsSubscriptionDelete
       security:
         - ServiceTokenAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/EvsSubscriptionArgs"
       responses:
         "200":
           description: OK.
