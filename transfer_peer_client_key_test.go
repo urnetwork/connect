@@ -156,6 +156,25 @@ func TestPeerVerifiedClientKeyReachesEveryDeliveryPath(t *testing.T) {
 	requireKey(requirePeerKeyDelivery(t, atA, "generic", "return"), bKey)
 }
 
+// A no-contract peer takes the other branch of the receive head, so the key has
+// to ride that one too. Its session learned the key out of band.
+func TestPeerVerifiedClientKeyOnANoContractPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
+	defer cancel()
+	a, b, bId, _ := contractFreeEncryptedPair(ctx, EncryptionModeRequired, EncryptionModeRequired, true, exposeVerifiedPeerClientKey)
+	defer a.Cancel()
+	defer b.Cancel()
+	a.ContractManager().AddNoContractPeer(bId)
+	b.ContractManager().AddNoContractPeer(a.ClientId())
+	atB := recordPeerKeys(t, b)
+
+	sendAndAwaitAck(t, a, bId, "no contract")
+	delivery := requirePeerKeyDelivery(t, atB, "generic", "no contract")
+	if !delivery.verified || !bytes.Equal(delivery.key[:], a.ClientKeyManager().PublicKey()) {
+		t.Fatalf("delivery %+v", delivery)
+	}
+}
+
 // Off by default: a sealed, identity-verified session delivers its frames as it
 // always has, and the accessor reports nothing.
 func TestPeerVerifiedClientKeyIsOffByDefault(t *testing.T) {
