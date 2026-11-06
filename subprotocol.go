@@ -26,10 +26,10 @@ package connect
 // completed here and never reach application callbacks.
 //
 // The control id may send subprotocol frames to clients and clients never send
-// them to it (SUBPROTOCOL.md §8.6). A frame from the control id reaches only
-// the listeners that opted in with `WithSubprotocolControlSource`, and only when
-// a platform carrier delivered it; the query frames are peer-to-peer and never
-// accepted from it. A peer's frames take no new branch and no new cost.
+// them to it (SUBPROTOCOL.md §8, decision 6). A frame from the control id reaches
+// only the listeners that opted in with `WithSubprotocolControlSource`, and only
+// when a platform carrier delivered it; the query frames are peer-to-peer and
+// never accepted from it. A peer's frame pays one source comparison for this.
 
 import (
 	"context"
@@ -113,19 +113,6 @@ func subprotocolListenerAcceptsControlSource(opts []SubprotocolListenerOption) b
 		}
 	}
 	return false
-}
-
-// Whether a frame from the control id can have come from the platform. A P2P
-// carrier reaches a peer, so it cannot, and an unknown or custom carrier is not
-// taken for one: the transport type comes from the carrier and never from the
-// frame.
-func subprotocolControlCarrier(transportType TransportType) bool {
-	switch transportType {
-	case TransportTypeH1, TransportTypeH3, TransportTypeH3Dns, TransportTypeH3DnsPump:
-		return true
-	default:
-		return false
-	}
 }
 
 var (
@@ -721,12 +708,22 @@ func (self *Client) receiveSubprotocolFrame(table *subprotocolTable, source Tran
 		return
 	}
 	controlSource := source.IsControlSource()
-	if controlSource && !(entry.acceptsControlSource() && subprotocolControlCarrier(peer.TransportType)) {
-		registry.droppedControlSource.Add(1)
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[c]subprotocol %d control source %s carrier=%s dropped\n", subprotocolId, self.clientTag, peer.TransportType)
+	if controlSource {
+		// Only a platform carrier can deliver the platform. A P2P carrier reaches
+		// a peer, and an unknown or custom carrier is not taken for one. The type
+		// comes from the carrier that read the frame, never from the frame.
+		platformCarrier := false
+		switch peer.TransportType {
+		case TransportTypeH1, TransportTypeH3, TransportTypeH3Dns, TransportTypeH3DnsPump:
+			platformCarrier = true
 		}
-		return
+		if !platformCarrier || !entry.acceptsControlSource() {
+			registry.droppedControlSource.Add(1)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[c]subprotocol %d control source %s carrier=%s dropped\n", subprotocolId, self.clientTag, peer.TransportType)
+			}
+			return
+		}
 	}
 	registry.received.Add(1)
 	registry.receivedByteCount.Add(uint64(len(payload)))
