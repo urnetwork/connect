@@ -11,6 +11,8 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// The product MTU carries a QUIC-minimum UDP payload in one IPv4 packet.
+// Fragment-specific regression cases below retain their explicit historical MTU.
 func TestTunProductMtuEmitsAndReassemblesQuicMinimumUdpDatagram(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -21,66 +23,36 @@ func TestTunProductMtuEmitsAndReassemblesQuicMinimumUdpDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tun.Close()
-	conn, err := tun.ListenUDP(&net.UDPAddr{
-		IP:   net.IP(tun.LocalAddresses()[0].AsSlice()),
-		Port: 0,
-	})
+	conn, err := tun.ListenUDP(&net.UDPAddr{IP: net.IP(tun.LocalAddresses()[0].AsSlice()), Port: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
 	payload := fragmentTestPayload(1200)
-	if n, writeErr := conn.WriteTo(
-		payload,
-		&net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 443},
-	); writeErr != nil || n != len(payload) {
-		t.Fatalf("write QUIC-minimum UDP datagram n=%d err=%v", n, writeErr)
+	if n, err := conn.WriteTo(payload, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 443}); err != nil || n != len(payload) {
+		t.Fatalf("write QUIC-minimum UDP datagram n=%d err=%v", n, err)
 	}
-
-	var gate ipv4FragmentGate
-	defer gate.close()
-	var result ipv4FragmentProcessResult
-	source := SourceId(NewId())
-	for result.packet == nil {
-		packet, readErr := tun.Read()
-		if readErr != nil {
-			t.Fatalf("read fragmented TUN packet: %v", readErr)
-		}
-		if DefaultMtu < len(packet) {
-			MessagePoolReturn(packet)
-			t.Fatalf("TUN emitted %d-byte packet above MTU %d", len(packet), DefaultMtu)
-		}
-		if !isIpv4FragmentPacket(packet) {
-			MessagePoolReturn(packet)
-			t.Fatalf("1,200-byte UDP datagram emitted unfragmented packet of %d bytes", len(packet))
-		}
-		result = gate.processOwned(
-			source,
-			TransferKey{},
-			protocol.ProvideMode_Network,
-			packet,
-		)
-		if !result.accepted {
-			t.Fatal("gVisor IPv4 fragment was rejected")
-		}
+	packet, err := tun.Read()
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer returnIpv4FragmentProcessResult(result)
-	if len(result.fragments) != 2 {
-		t.Fatalf("TUN fragment count = %d, want 2", len(result.fragments))
+	defer MessagePoolReturn(packet)
+	if len(packet) != 1228 || DefaultMtu < len(packet) || isIpv4FragmentPacket(packet) {
+		t.Fatalf("product UDP packet bytes=%d fragment=%t MTU=%d", len(packet), isIpv4FragmentPacket(packet), DefaultMtu)
 	}
-	ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(result.packet)
-	if !ok || ipProtocol != ipProtocolNumberUdp {
-		t.Fatalf("reassembled TUN packet parse = (%d, %t), want UDP", ipProtocol, ok)
-	}
+	ipProtocol, sourceIp, destinationIp, transport, ok := parseIpv4(packet)
 	var udp parsedUdp
-	if !parseUdpPacket(sourceIp, destinationIp, transport, &udp) {
-		t.Fatal("reassembled TUN UDP packet did not parse")
-	}
-	if udp.destinationPort != 443 || !bytes.Equal(udp.payload, payload) {
-		t.Fatalf("reassembled TUN UDP destination=%d payload=%d", udp.destinationPort, len(udp.payload))
+	if !ok || ipProtocol != ipProtocolNumberUdp ||
+		checksumFinish(checksumAdd(0, packet[:Ipv4HeaderSizeWithoutExtensions])) != 0 ||
+		transportChecksum(ipProtocolNumberUdp, sourceIp, destinationIp, transport) != 0 ||
+		!parseUdpPacket(sourceIp, destinationIp, transport, &udp) ||
+		udp.destinationPort != 443 || !bytes.Equal(udp.payload, payload) {
+		t.Fatal("product UDP packet lost its checksum, destination, or complete payload")
 	}
 }
+
+// These tests require fragments independently of the current product MTU.
+const fragmentTestHistoricalMtu = 1100
 
 func TestRetainedIpv4FragmentsNormalizeGVisorIdentityBeforeAsyncRouting(t *testing.T) {
 	source := SourceId(NewId())
@@ -101,7 +73,7 @@ func TestRetainedIpv4FragmentsNormalizeGVisorIdentityBeforeAsyncRouting(t *testi
 			false,
 			payload,
 		)
-		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,7 +172,7 @@ func TestProviderInspectsCompleteUdpBeforeForwardingOriginalIpv4Fragments(t *tes
 		false,
 		payload,
 	)
-	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +214,7 @@ func TestProviderInspectsCompleteUdpBeforeForwardingOriginalIpv4Fragments(t *tes
 		t.Fatalf("queued fragment count=%d want=%d", len(queued.packets), len(fragments))
 	}
 	for i, packet := range queued.packets {
-		if !isIpv4FragmentPacket(packet) || DefaultMtu < len(packet) {
+		if !isIpv4FragmentPacket(packet) || fragmentTestHistoricalMtu < len(packet) {
 			t.Fatalf("queued member %d is not an MTU-sized IPv4 fragment: %d bytes", i, len(packet))
 		}
 	}
@@ -292,7 +264,7 @@ func TestClientBlocksFragmentedUdpOnlyAfterCompletePolicyInspection(t *testing.T
 		false,
 		fragmentTestPayload(1200),
 	)
-	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +293,7 @@ func TestProviderBlocksFragmentedUdpOnlyAfterCompletePolicyInspection(t *testing
 		false,
 		fragmentTestPayload(1200),
 	)
-	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+	fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +348,7 @@ func TestFragmentedTcpCannotBypassSmtpRoutingOrProviderPolicy(t *testing.T) {
 		}
 		defer remote.egressIpv4Fragments.close()
 
-		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,7 +374,7 @@ func TestFragmentedTcpCannotBypassSmtpRoutingOrProviderPolicy(t *testing.T) {
 	t.Run("multi-client", func(t *testing.T) {
 		remote := &RemoteUserNatMultiClient{}
 		defer remote.egressIpv4Fragments.close()
-		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -424,7 +396,7 @@ func TestFragmentedTcpCannotBypassSmtpRoutingOrProviderPolicy(t *testing.T) {
 
 	t.Run("provider", func(t *testing.T) {
 		provider, _, localUserNat := newProviderTransferKeyTestFixture(t)
-		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), DefaultMtu)
+		fragments, err := fragmentIpv4Packet(MessagePoolCopy(complete), fragmentTestHistoricalMtu)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -724,8 +696,8 @@ func TestIpv4FragmentReassemblyIsByteAndDatagramBounded(t *testing.T) {
 
 func TestUdpDefaultsReceiveQuicInitialWithoutChangingPacketMtu(t *testing.T) {
 	settings := DefaultUdpBufferSettings()
-	if settings.Mtu != 1100 {
-		t.Fatalf("UDP packet MTU = %d, want product MTU 1100", settings.Mtu)
+	if settings.Mtu != 1280 {
+		t.Fatalf("UDP packet MTU = %d, want standardized inner-IP MTU 1280", settings.Mtu)
 	}
 	if settings.ReadBufferByteCount < 1200 {
 		t.Fatalf("UDP read buffer = %d, cannot receive a QUIC Initial", settings.ReadBufferByteCount)

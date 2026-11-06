@@ -1,6 +1,8 @@
 package connect
 
 import (
+	"bytes"
+	"encoding/binary"
 	"net"
 	"reflect"
 	"testing"
@@ -170,10 +172,56 @@ func TestMultiClientBatchResultsFragmentRuns(t *testing.T) {
 	parent, _, closeParent := groupTestParent(t, &groupTestSecurityPolicy{stats: DefaultSecurityPolicyStatsCollector()})
 	defer closeParent()
 	defer parent.egressIpv4Fragments.close()
-	complete := batchResultTestUdpPacket(udpTestPath(4), append([]byte{0xff}, make([]byte, 1199)...))
+	// One byte above the current IP MTU keeps this a fragment-gate test.
+	payload := make([]byte, DefaultMtu-Ipv4HeaderSizeWithoutExtensions-UdpHeaderSize+1)
+	payload[0] = 0xff
+	path := udpTestPath(4)
+	complete := batchResultTestUdpPacket(path, payload)
+	completeByteCount := len(complete)
+	wantTransport := append([]byte(nil), complete[Ipv4HeaderSizeWithoutExtensions:]...)
+	completePackets := [][]byte{complete}
+	completeWitnesses := groupTestPacketWitnesses(t, completePackets)
 	fragments, err := fragmentIpv4Packet(complete, DefaultMtu)
+	// The fragmenter consumes its input on success and error alike.
+	requireGroupTestWitnessesReleased(t, completePackets, completeWitnesses)
+	defer func() {
+		for _, fragment := range fragments {
+			MessagePoolReturn(fragment)
+		}
+	}()
 	if err != nil || len(fragments) != 2 {
-		t.Fatalf("fragment fixture count=%d err=%v", len(fragments), err)
+		t.Fatalf("BATCH_FRAGMENT_GEOMETRY: packet=%d MTU=%d count=%d err=%v, want two fragments", completeByteCount, DefaultMtu, len(fragments), err)
+	}
+	if completeByteCount != DefaultMtu+1 {
+		t.Fatalf("fragment fixture packet=%d, want MTU+1=%d", completeByteCount, DefaultMtu+1)
+	}
+	fragmentPayloadByteCount := (DefaultMtu - Ipv4HeaderSizeWithoutExtensions) &^ 7
+	transport := make([]byte, 0, len(wantTransport))
+	var identification uint16
+	for index, fragment := range fragments {
+		if len(fragment) < Ipv4HeaderSizeWithoutExtensions || DefaultMtu < len(fragment) || !isIpv4FragmentPacket(fragment) {
+			t.Fatalf("fragment %d bytes=%d, want a real fragment within MTU%d", index, len(fragment), DefaultMtu)
+		}
+		if index == 0 {
+			identification = binary.BigEndian.Uint16(fragment[4:6])
+		}
+		flagsAndOffset := uint16(len(transport) / 8)
+		if index == 0 {
+			flagsAndOffset |= 0x2000
+			if len(fragment)-Ipv4HeaderSizeWithoutExtensions != fragmentPayloadByteCount {
+				t.Fatalf("first fragment payload=%d, want aligned MTU payload=%d", len(fragment)-Ipv4HeaderSizeWithoutExtensions, fragmentPayloadByteCount)
+			}
+		}
+		if identification == 0 || binary.BigEndian.Uint16(fragment[4:6]) != identification ||
+			binary.BigEndian.Uint16(fragment[2:4]) != uint16(len(fragment)) ||
+			binary.BigEndian.Uint16(fragment[6:8]) != flagsAndOffset ||
+			checksumFinish(checksumAdd(0, fragment[:Ipv4HeaderSizeWithoutExtensions])) != 0 {
+			t.Fatalf("fragment %d changed its identity, length, offset, flags or IPv4 checksum", index)
+		}
+		transport = append(transport, fragment[Ipv4HeaderSizeWithoutExtensions:]...)
+	}
+	if !bytes.Equal(transport, wantTransport) || ipPathTransportChecksum(path, ipProtocolNumberUdp, transport) != 0 {
+		t.Fatal("fragmentation changed the complete UDP transport bytes or checksum")
 	}
 	packets := [][]byte{
 		batchResultTestUdpPacket(udpTestPath(4), []byte{0xff}), fragments[0],
@@ -182,6 +230,7 @@ func TestMultiClientBatchResultsFragmentRuns(t *testing.T) {
 	}
 	witnesses := groupTestPacketWitnesses(t, packets)
 	defer requireGroupTestWitnessesReleased(t, packets, witnesses)
+	fragments = nil // The batch and its witnesses now own both fragment references.
 	accepted := make([]bool, len(packets))
 	count := parent.SendPacketBatchWithResults(SourceId(NewId()), protocol.ProvideMode_Network, packets, 0, accepted)
 	want := []bool{false, true, false, true, false}

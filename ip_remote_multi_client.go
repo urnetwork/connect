@@ -1872,7 +1872,11 @@ type RemoteUserNatMultiClient struct {
 	synPublicationDeferredHead, synPublicationDeferredTail *multiClientChannel
 	// Nil test barriers observe real leaf-lock boundaries without waiting on
 	// synctest quiescence while deliberately holding a mutex.
-	beforeSynPublicationOwnerLockForTest    func(*multiClientChannelUpdate)
+	beforeSynPublicationOwnerLockForTest func(*multiClientChannelUpdate)
+	// Nil test seams expose the exact flow-owned parent store/read. They may
+	// intentionally hold one test flow; ordinary packet paths call no observer.
+	beforeSequenceParentWriteForTest        func(*multiClientChannelUpdate)
+	afterSequenceParentReadForTest          func(*multiClientChannelUpdate)
 	beforeSynPublicationIndexCaptureForTest func(*multiClientChannelUpdate)
 	beforeSynPublicationQueueForTest        func(*multiClientChannelUpdate)
 	// Only negative controls install this observation of a blocking wait.
@@ -11144,6 +11148,10 @@ type multiClientChannelUpdate struct {
 	sequenceSourceId           Id
 	sequenceResetSourceId      Id
 	sequenceSourceOrder        uint64
+	// Successful source controls, independent of attempted/refused offers.
+	// The ordered pair survives cache refusal and same-ISN generation reuse.
+	synRetryMaterializedOrder  uint64
+	synRetryMaterializedIndex  int
 	sequenceCommittedRaceOrder uint64
 	sequenceControlOrder       uint64
 	sequenceResetOrder         uint64
@@ -12531,7 +12539,12 @@ type multiClientWindow struct {
 	// Nil test seams expose one initial-evaluation callback across the exact
 	// expand-pass phase and terminal boundaries, and hold the ping's
 	// evaluation-cancellation branch before it takes the pass mutex.
-	// Production leaves all six unset.
+	// Production leaves these unset.
+	// Nil test-only acquisition barrier; called outside every evaluation lock.
+	afterExpandAcquisitionForTest func(*sync.Mutex)
+	// Nil test-only sender boundary: false after the returned error snapshot,
+	// true after its terminal lock is released. Neither call holds a lock.
+	afterExpandPingSendForTest    func(client *multiClientChannel, finished bool)
 	beforeExpandPingResultForTest func()
 	afterExpandPingResultForTest  func()
 	beforeExpandPingCancelForTest func()
@@ -15553,30 +15566,41 @@ requestCandidates:
 				}
 
 				go HandleError(func() {
-					mutex.Lock()
-					defer mutex.Unlock()
+					if hook := self.afterExpandPingSendForTest; hook != nil {
+						defer hook(client, true)
+					}
+					// Publication belongs to the pass; local admission belongs to
+					// this candidate and must never hold another verdict hostage.
+					if !func() bool {
+						mutex.Lock()
+						defer mutex.Unlock()
 
-					select {
-					case <-pingDone.Done():
-						// already done
+						select {
+						case <-pingDone.Done():
+							// already done
+							return false
+						default:
+						}
+
+						added += 1
+						if client.IsP2pOnly() {
+							addedP2pOnly += 1
+						}
+
+						self.monitor.AddProviderEventWithLocationMatch(
+							args.ClientId,
+							ProviderStateInEvaluation,
+							args.Destination.Tail(),
+							args.Location,
+							args.LocationMatch,
+							args.IpFamily,
+							self.clientExtenderIps(client),
+						)
+
+						return true
+					}() {
 						return
-					default:
 					}
-
-					added += 1
-					if client.IsP2pOnly() {
-						addedP2pOnly += 1
-					}
-
-					self.monitor.AddProviderEventWithLocationMatch(
-						args.ClientId,
-						ProviderStateInEvaluation,
-						args.Destination.Tail(),
-						args.Location,
-						args.LocationMatch,
-						args.IpFamily,
-						self.clientExtenderIps(client),
-					)
 
 					var pingOptions []any
 					if pingPath != nil {
@@ -15651,11 +15675,19 @@ requestCandidates:
 						pingOptions...,
 					)
 					err = deliveredPingError(err)
+					if hook := self.afterExpandPingSendForTest; hook != nil {
+						hook(client, false)
+					}
+					mutex.Lock()
+					defer mutex.Unlock()
+					// ACK, timeout, cancellation or returned-pass cleanup may have
+					// completed this candidate while its send was in admission.
+					if pingDone.Err() != nil {
+						return
+					}
 					if err != nil {
-						if pingDone.Err() == nil {
-							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
-							fail(providerFailure, initialPingError)
-						}
+						providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
+						fail(providerFailure, initialPingError)
 					} else if !success {
 						fail(!args.providerEvaluation.localContractUnavailable(), initialPingError)
 					}
@@ -15676,6 +15708,9 @@ requestCandidates:
 	}
 
 	self.endDiscoveryAcquisition(evaluationOwner)
+	if hook := self.afterExpandAcquisitionForTest; hook != nil {
+		hook(&mutex)
+	}
 
 	// Candidate acquisition is over. Retain pass ownership until every ping
 	// resolves, capped at acquisition + setup + one full initial-ping budget.
@@ -19150,7 +19185,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	}
 	if sendPacketGroup.affinitySynReuse && sendPacketGroup.collapseAdmission.update != nil {
 		update := sendPacketGroup.collapseAdmission.update
-		if parent := update.sequenceParent; parent == nil ||
+		if parent := update.sequenceParentSnapshot(); parent == nil ||
 			!parent.reuseAffinitySyn(update, self, sendPacketGroup.packets[0].ipPath) {
 			self.addSendAbandonedGroup(sendPacketGroup)
 			sendPacketGroup.completionSelection = nil

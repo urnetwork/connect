@@ -655,12 +655,12 @@ func TestRetainedExtendedPoolFullBudgetRewriteKeepsCarrier(t *testing.T) {
 					roots = 5
 				}
 				if payloadBytes == 1030 {
-					if estimate <= 8192 || estimate > 9216 || retainedMessageCapacity(estimate) != 9228 ||
-						charge-item.retainedMemoryByteCount(8192, len(frames), version < 2) != roots*(9228-8204) {
+					if estimate <= 8192 || estimate > 12288 || retainedMessageCapacity(estimate) != 12300 ||
+						charge-item.retainedMemoryByteCount(8192, len(frames), version < 2) != roots*(12300-8204) {
 						t.Fatal("extended rewrite did not charge every rounded lifetime root")
 					}
-				} else if estimate <= 9216 || retainedMessageCapacity(estimate) != estimate+MessagePoolMetaByteCount {
-					t.Fatal("eight1280 full envelope silently acquired the smaller pooled charge")
+				} else if estimate <= 8192 || estimate > 12288 || retainedMessageCapacity(estimate) != 12300 {
+					t.Fatal("eight1280 full envelope did not acquire its complete pooled charge")
 				}
 				budget.SetTotalByteCount(charge - 1)
 				if item.reserveMemory(budget, charge) || budget.UsedByteCount() != 0 {
@@ -702,11 +702,11 @@ func TestRetainedExtendedPoolFullBudgetRewriteKeepsCarrier(t *testing.T) {
 				defer MessagePoolReturn(carrier)
 				original := append([]byte(nil), carrier...)
 				pooled, shared := MessagePoolCheck(carrier)
-				if payloadBytes == 1030 && (!pooled || !shared || cap(carrier) != 9228) {
+				if payloadBytes == 1030 && (!pooled || !shared || cap(carrier) != 12300) {
 					t.Fatal("full-budget rewrite did not retain a real pooled carrier share")
 				}
-				if payloadBytes == 1280 && pooled {
-					t.Fatal("eight1280 unexpectedly entered the bounded extended class")
+				if payloadBytes == 1280 && (!pooled || !shared || cap(carrier) != 12300) {
+					t.Fatal("eight1280 did not retain a real pooled carrier share")
 				}
 				sequence.resendQueue.Add(item)
 				sequence.resendQueue.RemoveByMessageId(item.messageId)

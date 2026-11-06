@@ -99,20 +99,20 @@ func TestMessagePoolShare(t *testing.T) {
 	for range 1024 {
 		message := MessagePoolGet(mathrand.Intn(32 * 1024))
 		pooled, shared := MessagePoolCheck(message)
-		AssertEqual(t, pooled, len(message) <= 9216)
+		AssertEqual(t, pooled, len(message) <= 12288)
 		AssertEqual(t, shared, false)
 		k := mathrand.Intn(holdCount)
 		for i := 1; i < k; i += 1 {
 			MessagePoolShareReadOnly(message)
 			pooled, shared = MessagePoolCheck(message)
-			AssertEqual(t, pooled, len(message) <= 9216)
-			AssertEqual(t, shared, len(message) <= 9216)
+			AssertEqual(t, pooled, len(message) <= 12288)
+			AssertEqual(t, shared, len(message) <= 12288)
 		}
 		for i := 1; i < k; i += 1 {
 			MessagePoolReturn(message)
 			pooled, shared = MessagePoolCheck(message)
-			AssertEqual(t, pooled, len(message) <= 9216)
-			AssertEqual(t, shared, len(message) <= 9216)
+			AssertEqual(t, pooled, len(message) <= 12288)
+			AssertEqual(t, shared, len(message) <= 12288)
 		}
 		MessagePoolReturn(message)
 		pooled, shared = MessagePoolCheck(message)
@@ -123,8 +123,8 @@ func TestMessagePoolShare(t *testing.T) {
 	for i := holdCount - 1; 1 <= i; i -= 1 {
 		for _, message := range holdMessages[i] {
 			pooled, shared := MessagePoolCheck(message)
-			AssertEqual(t, pooled, len(message) <= 9216)
-			AssertEqual(t, shared, len(message) <= 9216)
+			AssertEqual(t, pooled, len(message) <= 12288)
+			AssertEqual(t, shared, len(message) <= 12288)
 			r := MessagePoolReturn(message)
 			AssertEqual(t, r, false)
 		}
@@ -301,8 +301,8 @@ func TestMessagePoolRootByteCountChargesBackingClass(t *testing.T) {
 		{name: "full packet", size: 1500, want: 2048},
 		{name: "small frame", size: 3000, want: 4096},
 		{name: "large frame", size: 6000, want: 8192},
-		{name: "extended frame", size: 9000, want: 9216},
-		{name: "unpooled", size: 9217, want: 9217},
+		{name: "extended frame", size: 9000, want: 12288},
+		{name: "unpooled", size: 12289, want: 12289},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			message := MessagePoolGet(testCase.size)

@@ -6,6 +6,8 @@ package connect
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -892,4 +894,66 @@ func captureH3DatagramsForFuzz(
 		return nil
 	})
 	return datagrams, err
+}
+
+// Complete encoded and encrypted Transfer bytes, rather than inner IP length,
+// determine whether a 1280-byte packet can use the current one-datagram lane.
+func TestH3Hybrid1280CompleteEncryptedTransferUsesLivePathLimit(t *testing.T) {
+	block, err := aes.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codec := &sequenceCipher{aead: aead}
+	for _, packetByteCount := range []int{64, 1280} {
+		func() {
+			frames, witnesses := transferGroupTestFrames(t, 1, packetByteCount)
+			defer func() {
+				for _, frame := range frames {
+					MessagePoolReturn(frame.MessageBytes)
+				}
+				releaseTransferGroupTestWitnesses(t, frames, witnesses)
+			}()
+			path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
+			pack := sendPackFrame{path: path, messageId: NewId(), sequenceId: NewId(), sequenceNumber: 1, frames: frames, head: true}
+			encoded := marshalSendPackTransferFrame(&pack)
+			defer MessagePoolReturn(encoded)
+			outer, err := codec.SealOuterFrame(path, encoded, sequenceTlsRoleClient.toProtobuf(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer MessagePoolReturn(outer)
+			if len(outer) <= packetByteCount {
+				t.Fatal("complete transfer omitted its envelope")
+			}
+			for _, liveLimit := range []int{H3InitialDatagramByteCount, 1200, 1360} {
+				settings := DefaultH3DatagramSettings()
+				fragmenter, err := NewH3DatagramFragmenter(settings, &H3DatagramStats{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				sends := 0
+				stream, _, err := fragmenter.SendHybrid(outer, liveLimit, func(datagram []byte) error {
+					sends++
+					if len(datagram) > liveLimit {
+						t.Fatal("datagram exceeded actual live path")
+					}
+					return nil
+				})
+				wantStream := !settings.UseDatagramForPath(len(outer), liveLimit)
+				if err != nil || stream != wantStream || (stream && sends != 0) || (!stream && sends != 1) {
+					t.Fatalf("packet=%d encoded=%d outer=%d path=%d stream=%t sends=%d err=%v", packetByteCount, len(encoded), len(outer), liveLimit, stream, sends, err)
+				}
+				if packetByteCount == 1280 && liveLimit == H3InitialDatagramByteCount && !stream {
+					t.Fatal("full1280 bypassed live-path stream fallback")
+				}
+			}
+		}()
+	}
+	if H3InitialPacketByteCount != 1200 {
+		t.Fatal("inner MTU changed QUIC startup geometry")
+	}
 }

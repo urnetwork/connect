@@ -105,7 +105,7 @@ func TestIcmpPacketTooBigRoundTrip(t *testing.T) {
 // names: after the signal, the return datagrams of that flow leave in
 // fragments no larger than the reported mtu. The tunnel mtu is raised above
 // the v6 floor (1280, rfc 8200 §5) so a v6 signal has room to shrink; the
-// product mtu of 1100 is already below that floor, where a v6 signal is
+// product mtu of 1280 is at that floor, where a v6 signal is
 // correctly ignored.
 func TestLocalUserNatPathMtuShrinksReturn(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {

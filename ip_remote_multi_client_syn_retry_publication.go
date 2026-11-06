@@ -29,10 +29,30 @@ func (self *RemoteUserNatMultiClient) enqueuePublishedSynRetries(client *multiCl
 	self.notifyFlowReaper()
 }
 
-// Called only after materialization releases the flow lock. Index membership
-// holds no extra packet reference; final release must detach before wiping it.
-func (self *multiClientChannelUpdate) indexSynRetryPublication() {
+// Parent identity belongs to the flow lock, including repeated admissions that
+// store the same pointer. This snapshot never holds the parent lock.
+func (self *multiClientChannelUpdate) sequenceParentSnapshot() *RemoteUserNatMultiClient {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.sequenceParentWithLock()
+}
+
+// The observer is an intentional nil-by-default test-only critical-section
+// probe; it owns no packet and must not perform production callback work.
+func (self *multiClientChannelUpdate) sequenceParentWithLock() *RemoteUserNatMultiClient {
 	parent := self.sequenceParent
+	if parent != nil {
+		if hook := parent.afterSequenceParentReadForTest; hook != nil {
+			hook(self)
+		}
+	}
+	return parent
+}
+
+// Called after materialization releases the flow lock. Index membership owns
+// no packet reference, and final release fences attachment before detaching.
+func (self *multiClientChannelUpdate) indexSynRetryPublication() {
+	parent := self.sequenceParentSnapshot()
 	if parent == nil || parent.ctx == nil || parent.flowReaperDone == nil || !parent.synPublicationEnabled() {
 		return
 	}
@@ -42,9 +62,11 @@ func (self *multiClientChannelUpdate) indexSynRetryPublication() {
 		hook(self)
 	}
 	self.stateLock.Lock()
-	owner := self.synRetry
+	currentParent, owner := self.sequenceParentWithLock(), self.synRetry
 	self.stateLock.Unlock()
-	if owner == nil {
+	// The before-capture observer may allow another source admission. Never
+	// index a new parent's current owner through a stale parent snapshot.
+	if currentParent != parent || owner == nil {
 		return
 	}
 	parent.stateLock.Lock()

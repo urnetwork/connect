@@ -4,14 +4,15 @@ package connect
 // `Tun` exposes a packet interface on one side (`Read`/`Write`) and
 // socket interfaces on the other (`DialContext`, `ListenTCP`, `ListenUDP`).
 // each tun instance owns a private gvisor stack with one nic, one link-local
-// ipv4 address and, when the link mtu admits it, one ula ipv6 address.
+// ipv4 address and, when settings permit and the link mtu admits it, one ula
+// ipv6 address.
 //
 // Dual stack (IPV6.md C1): the stack carries both families with a default
 // route for each, so a tun can originate and accept v6 flows exactly like v4.
 // gVisor refuses to emit IPv6 on a link narrower than the protocol's minimum
-// MTU (1280, RFC 8200 §5), so a tun whose settings.Mtu is below
+// MTU (1280, RFC 8200 §5). A tun with DisableIpv6 set or settings.Mtu below
 // tunIpv6MinimumMtu keeps IPv4 only: no v6 address, no v6 route, and v6 dials
-// and writes fail with EAFNOSUPPORT as they always did. See Ipv6Enabled.
+// and writes fail with EAFNOSUPPORT. See Ipv6Enabled.
 
 import (
 	// "bytes"
@@ -117,11 +118,9 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// queue in milliseconds), so ordinary bulk transfer still sees
 		// backpressure rather than drops.
 		OutboundQueueWaitTimeout: 250 * time.Millisecond,
-		// the link mtu, matching the native tunnel interfaces
-		// (`DefaultTunnelMtu`). Packets written into the tun are at most
-		// `DefaultMtu`, which is below this by design. IPv6 needs at least
-		// tunIpv6MinimumMtu here; below that the tun is IPv4 only (see the
-		// file comment).
+		// the link mtu shares the inner packet default with the native
+		// tunnel interfaces. IPv6 also requires tunIpv6MinimumMtu and
+		// remains subject to DisableIpv6 (see the file comment).
 		Mtu: DefaultTunnelMtu,
 
 		DialRace:          2,
@@ -181,6 +180,12 @@ type TunSettings struct {
 
 	ChannelSize int
 	Mtu         int
+
+	// Disables ipv6 addresses, routes, packet injection and dialing without
+	// reducing the link mtu. The zero value allows ipv6 when Mtu meets the
+	// protocol minimum; server-owned ipv4-only paths set this explicitly.
+	DisableIpv6 bool
+
 	// OutboundQueueWaitTimeout bounds how long netstack waits for space in
 	// the outbound (tun read) queue before dropping the rest of a write. The
 	// queue's consumer can be inside an inbound injection itself (SendPacket
@@ -565,7 +570,8 @@ type Tun struct {
 	localIpv4AddressAllocator *LocalIpv4AddressAllocator
 	localIpv6AddressAllocator *LocalIpv6AddressAllocator
 	// ipv6Enabled is whether the stack carries IPv6: a v6 address and default
-	// route exist. False when settings.Mtu is below tunIpv6MinimumMtu.
+	// route exist. False when DisableIpv6 is set or settings.Mtu is below
+	// tunIpv6MinimumMtu.
 	ipv6Enabled bool
 	// mtu                 int
 	// registeredAddresses map[netip.Addr]bool
@@ -873,8 +879,9 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		return nil, fmt.Errorf("No more local addresses")
 	}
 
-	// IPv6 rides only a link wide enough for it (see the file comment)
-	ipv6Enabled := tunIpv6MinimumMtu <= settings.Mtu
+	// Family policy is independent of packet size; the protocol minimum is
+	// still required for an enabled ipv6 link (see the file comment).
+	ipv6Enabled := !settings.DisableIpv6 && tunIpv6MinimumMtu <= settings.Mtu
 	var localIpv6Address netip.Addr
 	if ipv6Enabled {
 		localIpv6Address, ok = localIpv6AddressAllocator.TakeAddr()
@@ -972,7 +979,11 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 		// ::/0 routes the same way as 0.0.0.0/0: everything leaves the nic
 		tun.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: nicId})
 	} else if tun.log.V(1).Enabled() {
-		tun.log.Infof("[tun]ipv6 disabled: mtu %d is below the ipv6 minimum %d\n", settings.Mtu, tunIpv6MinimumMtu)
+		if settings.DisableIpv6 {
+			tun.log.Infof("[tun]ipv6 disabled by settings\n")
+		} else {
+			tun.log.Infof("[tun]ipv6 disabled: mtu %d is below the ipv6 minimum %d\n", settings.Mtu, tunIpv6MinimumMtu)
+		}
 	}
 
 	tun.gro.Init(settings.TcpGro)
@@ -982,7 +993,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 
 // Ipv6Enabled reports whether this tun carries IPv6: a v6 local address and
 // default route exist, so v6 packets are accepted and v6 dials are made.
-// False when the link mtu is below tunIpv6MinimumMtu.
+// False when DisableIpv6 is set or the link mtu is below tunIpv6MinimumMtu.
 func (self *Tun) Ipv6Enabled() bool {
 	return self.ipv6Enabled
 }

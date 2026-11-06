@@ -110,6 +110,7 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 	// A stale demand handoff has minted credentials but no channel. It must
 	// return to the same receive without falling through into construction.
 	staleDemandCleanups := 0
+	endedRefreshCleanups := 0
 	ast.Inspect(function.Body, func(node ast.Node) bool {
 		receive, ok := node.(*ast.CommClause)
 		if !ok {
@@ -124,8 +125,39 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 		}
 		for _, statement := range receive.Body {
 			guard, ok := statement.(*ast.IfStmt)
-			if !ok || guard.Pos() >= construction || guard.Else != nil || len(guard.Body.List) != 2 ||
-				formatAstExpr(t, fileSet, guard.Cond) != "!self.acceptDiscoveryDemandArgs(evaluationOwner, args)" {
+			if !ok || guard.Pos() >= construction || guard.Else != nil || len(guard.Body.List) != 2 {
+				continue
+			}
+			// An ended refresh receives either minted credentials or an inert
+			// fixed offer. Neither reached construction; only the minted one
+			// is retired, and the same receive must terminate afterward.
+			if formatAstExpr(t, fileSet, guard.Cond) == "!self.serviceRefreshLive(pass.serviceRefresh)" {
+				if guard.Init != nil {
+					continue
+				}
+				unowned, ok := guard.Body.List[0].(*ast.IfStmt)
+				if !ok || unowned.Init != nil || unowned.Else != nil || len(unowned.Body.List) != 1 ||
+					formatAstExpr(t, fileSet, unowned.Cond) != "!args.deferredClientArgs" {
+					continue
+				}
+				terminal, ok := guard.Body.List[1].(*ast.ReturnStmt)
+				if !ok || len(terminal.Results) != 0 {
+					continue
+				}
+				expression, ok := unowned.Body.List[0].(*ast.ExprStmt)
+				if !ok {
+					continue
+				}
+				call, ok := expression.X.(*ast.CallExpr)
+				if !ok || formatAstExpr(t, fileSet, call.Fun) != "self.generator.RemoveClientArgs" ||
+					len(call.Args) != 1 || formatAstExpr(t, fileSet, call.Args[0]) != "&args.MultiClientGeneratorClientArgs" {
+					continue
+				}
+				allowed[call.Pos()] = true
+				endedRefreshCleanups++
+				continue
+			}
+			if formatAstExpr(t, fileSet, guard.Cond) != "!self.acceptDiscoveryDemandArgs(evaluationOwner, args)" {
 				continue
 			}
 			expression, ok := guard.Body.List[0].(*ast.ExprStmt)
@@ -148,6 +180,9 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 	})
 	if staleDemandCleanups != 1 {
 		violations = append(violations, fmt.Sprintf("expand has %d guarded stale demand cleanups, want 1", staleDemandCleanups))
+	}
+	if endedRefreshCleanups != 1 {
+		violations = append(violations, fmt.Sprintf("expand has %d guarded ended refresh cleanups, want 1", endedRefreshCleanups))
 	}
 	for _, call := range removals {
 		if !allowed[call.Pos()] {

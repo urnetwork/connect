@@ -287,6 +287,7 @@ func natUdpFlowMemoryByteCount(s *UdpBufferSettings) ByteCount {
 	// datagram and every pool-rounded fragment coexisting during packetization.
 	// At a 576-byte path MTU, several small fragments each own a 2-KiB root;
 	// multiplying only the payload length undercounts this working set.
+	acceptedReadBytes := udpReadScratchByteCount(s.ReadBufferByteCount) - 1
 	packetization := ByteCount(0)
 	for _, ipVersion := range [...]int{4, 6} {
 		header := Ipv4HeaderSizeWithoutExtensions
@@ -295,16 +296,17 @@ func natUdpFlowMemoryByteCount(s *UdpBufferSettings) ByteCount {
 			header = Ipv6HeaderSize
 			fragmentHeader = header + ipv6FragmentHeaderSize
 		}
-		working := retainedMessageCapacity(ByteCount(header + UdpHeaderSize + s.ReadBufferByteCount))
+		working := retainedMessageCapacity(ByteCount(header + UdpHeaderSize + acceptedReadBytes))
 		mtu := min(s.Mtu, ipMinimumPathMtu(ipVersion))
 		fragmentPayload := (mtu - fragmentHeader) &^ 7
 		if fragmentPayload >= 8 {
-			count := (s.ReadBufferByteCount + UdpHeaderSize + fragmentPayload - 1) / fragmentPayload
+			count := (acceptedReadBytes + UdpHeaderSize + fragmentPayload - 1) / fragmentPayload
 			working += ByteCount(count)*(retainedMessageCapacity(ByteCount(s.Mtu))+24) + 128
 		}
 		packetization = max(packetization, working)
 	}
-	return kib(16) + ByteCount(s.ReadBufferByteCount) + packetization +
+	// Include the reader's extra detection byte in the prepaid flow claim.
+	return kib(16) + ByteCount(acceptedReadBytes+1) + packetization +
 		ByteCount(s.SequenceBufferSize)*16
 }
 

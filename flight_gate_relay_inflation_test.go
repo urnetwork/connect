@@ -10,18 +10,30 @@ package connect
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
+
+// The fixture owns a fixed application workload, independently of Pack coalescing.
+const relayInflationMessageCount = 6000
+
+// This is the historical logical-message cap, not an IP or tunnel MTU.
+const relayInflationPackByteLimit ByteCount = 3300
 
 // relayInflationResult is one arm of the schedule.
 type relayInflationResult struct {
-	elapsed     time.Duration
-	deadWindows int
-	windows     int
-	peakQueue   ByteCount
-	stats       ClientSendRecoveryStatsSnapshot
+	elapsed            time.Duration
+	deadWindows        int
+	windows            int
+	peakQueue          ByteCount
+	wirePositions      int
+	wireFrames         int
+	afterStepPositions int
+	stats              ClientSendRecoveryStatsSnapshot
 }
 
 // Builds the historical queue-depth control with the same configuration in
@@ -31,6 +43,7 @@ func newRelayInflationHarness(
 	queueFrames int,
 	deferTimeoutResend bool,
 	boundOff bool,
+	beforeSlowDelivery func([]byte),
 ) *mixedLaneGapHarness {
 	t.Helper()
 	return newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
@@ -40,9 +53,13 @@ func newRelayInflationHarness(
 		slowSerializationAfterStep: 12 * time.Millisecond,
 		slowQueueFrames:            queueFrames,
 		directLaneDisabled:         true,
-		deferTimeoutResend:         deferTimeoutResend,
-		reliableAdmissionUnbounded: boundOff,
-		constantSendWindow:         true,
+		// Keep the historical three-frame load per Pack; a changing IP MTU
+		// must not silently turn the 6000-frame workload into fewer timers.
+		h1EstablishedMessageByteCount: relayInflationPackByteLimit,
+		beforeSlowDelivery:            beforeSlowDelivery,
+		deferTimeoutResend:            deferTimeoutResend,
+		reliableAdmissionUnbounded:    boundOff,
+		constantSendWindow:            true,
 	})
 }
 
@@ -56,8 +73,50 @@ func runRelayInflation(
 	boundOff bool,
 ) relayInflationResult {
 	t.Helper()
-	harness := newRelayInflationHarness(t, queueFrames, deferTimeoutResend, boundOff)
 	start := time.Now()
+	var wireStateLock sync.Mutex
+	wirePositions := map[uint64]int{}
+	wireFrames := 0
+	maximumFrames := 0
+	var wireError error
+	afterStepPositions := 0
+	harness := newRelayInflationHarness(t, queueFrames, deferTimeoutResend, boundOff, func(frameBytes []byte) {
+		number, data := decodeFlightGatePackSequenceNumber(frameBytes)
+		if !data {
+			return
+		}
+		var transfer protocol.TransferFrame
+		err := ProtoUnmarshal(frameBytes, &transfer)
+		pack := transfer.Pack
+		if err == nil && pack == nil {
+			pack = &protocol.Pack{}
+			frame := transfer.GetFrame()
+			if frame == nil {
+				err = fmt.Errorf("data Pack has no frame")
+			} else {
+				err = ProtoUnmarshal(frame.MessageBytes, pack)
+			}
+		}
+		wireStateLock.Lock()
+		defer wireStateLock.Unlock()
+		if err != nil {
+			wireError = err
+			return
+		}
+		if previous, seen := wirePositions[number]; seen {
+			if previous != len(pack.Frames) {
+				wireError = fmt.Errorf("position %d changed its frame count", number)
+			}
+			return
+		}
+		wirePositions[number] = len(pack.Frames)
+		wireFrames += len(pack.Frames)
+		maximumFrames = max(maximumFrames, len(pack.Frames))
+		// A fast-stage packet can still spend 50 ms in propagation.
+		if time.Second+50*time.Millisecond < time.Since(start) {
+			afterStepPositions++
+		}
+	})
 	var peakQueue ByteCount
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -75,9 +134,25 @@ func runRelayInflation(
 			}
 		}
 	}()
+	var stopOnce sync.Once
+	stopSampling := func() { stopOnce.Do(func() { close(stop) }); <-done }
+	defer stopSampling()
 	stats := harness.run(t, messageCount)
-	close(stop)
-	<-done
+	stopSampling()
+	wireStateLock.Lock()
+	positionCount, postStepCount, frameCount := len(wirePositions), afterStepPositions, wireFrames
+	observedError, maximumFrameCount := wireError, maximumFrames
+	completePositions := observedError == nil && frameCount == messageCount && (messageCount+2)/3 <= positionCount && maximumFrameCount <= 3
+	for number := range positionCount {
+		completePositions = completePositions && 0 < wirePositions[uint64(number)]
+	}
+	wireStateLock.Unlock()
+	if !completePositions {
+		t.Fatalf("RELAY_INFLATION_PACK_GEOMETRY: %d/%d application frames occupied %d positions; maximum=%d frames per Pack; error=%v", frameCount, messageCount, positionCount, maximumFrameCount, observedError)
+	}
+	if postStepCount == 0 {
+		t.Fatal("RELAY_INFLATION_RATE_STEP_NOT_REACHED: all data drained before the slower lane")
+	}
 	elapsed := time.Since(start)
 
 	harness.deliveryLock.Lock()
@@ -97,11 +172,14 @@ func runRelayInflation(
 		}
 	}
 	return relayInflationResult{
-		elapsed:     elapsed,
-		deadWindows: deadWindows,
-		windows:     windows,
-		peakQueue:   peakQueue,
-		stats:       stats,
+		elapsed:            elapsed,
+		deadWindows:        deadWindows,
+		windows:            windows,
+		peakQueue:          peakQueue,
+		wirePositions:      positionCount,
+		wireFrames:         frameCount,
+		afterStepPositions: postStepCount,
+		stats:              stats,
 	}
 }
 
@@ -118,7 +196,10 @@ func TestRelayInflationUsesConstantSendWindow(t *testing.T) {
 		{queueFrames: 4096, deferTimeoutResend: false},
 		{queueFrames: 4096, deferTimeoutResend: true},
 	} {
-		harness := newRelayInflationHarness(t, c.queueFrames, c.deferTimeoutResend, true)
+		harness := newRelayInflationHarness(t, c.queueFrames, c.deferTimeoutResend, true, nil)
+		if cap(harness.received) != 4096 {
+			t.Fatal("historical Pack fixture changed the delivery-count observer")
+		}
 		for _, endpoint := range []struct {
 			name   string
 			client *Client
@@ -127,6 +208,11 @@ func TestRelayInflationUsesConstantSendWindow(t *testing.T) {
 			{name: "receiver", client: harness.receiver},
 		} {
 			settings := endpoint.client.settings.SendBufferSettings
+			wantChunks := DefaultSendBufferChunkSettings()
+			wantChunks.H1EstablishedMaxMessageByteCount = relayInflationPackByteLimit
+			if settings.ChunkSettings != wantChunks {
+				t.Fatalf("RELAY_INFLATION_PACK_GEOMETRY: %s constructor changed the historical Pack byte ceiling", endpoint.name)
+			}
 			if settings.WindowSizing != WindowSizingConstant ||
 				settings.DeliverySizedWindowScale != 0 ||
 				settings.TargetGoodputByteRate != 0 || settings.ResendQueueBudget != nil {
@@ -144,8 +230,45 @@ func TestRelayInflationUsesConstantSendWindow(t *testing.T) {
 		t.Fatalf("the historical control changed the process default to %d", got)
 	}
 	harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{})
+	if cap(harness.received) != 4096 || harness.sender.settings.SendBufferSettings.ChunkSettings != DefaultSendBufferChunkSettings() {
+		t.Fatal("relay-specific geometry changed the ordinary mixed-lane fixture")
+	}
 	if got := harness.sender.settings.SendBufferSettings.WindowSizing; got != WindowSizingFromDelivery {
 		t.Fatalf("the ordinary mixed-lane fixture changed policy to %d", got)
+	}
+}
+
+// The actual payload fits three frames under 3300 bytes and four under 3840.
+// The fixed historical cap restores the 2000-Pack offered load at the 1 s step;
+// it does not triple the timer population by forcing 6000 individual Packs.
+func TestRelayInflationBatchLimitPreservesHistoricalPackLoad(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	frames := make([]*protocol.Frame, 0, relayInflationMessageCount)
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
+	content := mixedLaneMessageContent()
+	for index := range relayInflationMessageCount {
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: fmt.Sprintf("%s%d", content, index)}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, frame)
+	}
+	defaults := DefaultSendBufferChunkSettings()
+	oldPositions := sendGroupChunkCountWithLimits(frames, defaults.H1UnknownMaxFrames, 3*1100)
+	currentPositions := sendGroupChunkCountWithLimits(frames, defaults.H1UnknownMaxFrames, defaults.establishedByteLimit())
+	pinned := defaults
+	pinned.H1EstablishedMaxMessageByteCount = relayInflationPackByteLimit
+	pinnedPositions := sendGroupChunkCountWithLimits(frames, pinned.H1UnknownMaxFrames, pinned.establishedByteLimit())
+	if oldPositions != 2000 || currentPositions != 1500 || pinnedPositions != oldPositions {
+		t.Fatalf("RELAY_INFLATION_GEOMETRY_COUNTERFACTUAL: old=%d current=%d pinned=%d", oldPositions, currentPositions, pinnedPositions)
+	}
+	const initialSerialization = 500 * time.Microsecond
+	if time.Duration(currentPositions)*initialSerialization >= time.Second || time.Duration(pinnedPositions)*initialSerialization != time.Second {
+		t.Fatal("RELAY_INFLATION_GEOMETRY_COUNTERFACTUAL: geometry no longer separates the rate-step precondition")
 	}
 }
 
@@ -161,29 +284,43 @@ func TestInflatedRelayQueueDepthDominatesTheStorm(t *testing.T) {
 		t.Skip("relay queue inflation schedule")
 	}
 	const (
-		messageCount    = 6000
+		messageCount    = relayInflationMessageCount
 		shallowQueue    = 64
 		deepQueue       = 4096
-		resendBudgetBar = 2 << 20
+		resendBudgetBar = 2 * 1024 * 1024
 	)
+	assertMessagePoolOwnership(t)
+	measure := func(queueFrames int, deferTimeoutResend bool) relayInflationResult {
+		var result relayInflationResult
+		synctest.Test(t, func(t *testing.T) {
+			// The clock belongs to this arm, not host scheduling or the suite
+			// deadline; cleanup joins each graph before the next arm starts.
+			result = runRelayInflation(struct{ testing.TB }{TB: t}, messageCount, queueFrames, deferTimeoutResend, true)
+		})
+		return result
+	}
 	report := func(name string, result relayInflationResult) {
 		t.Logf(
-			"%s: %s, %d of %d windows dead, peak resend queue %d B, rto=%d deferred=%d gap=%d carrier-change=%d",
+			"%s: %s, %d of %d windows dead, peak resend queue %d B, rto=%d deferred=%d gap=%d carrier-change=%d, positions=%d frames=%d after-step=%d",
 			name, result.elapsed.Truncate(time.Millisecond),
 			result.deadWindows, result.windows, result.peakQueue,
 			result.stats.TimeoutResendWriteCount,
 			result.stats.TimeoutResendDeferCount,
 			result.stats.SelectiveGapWriteCount,
 			result.stats.CarrierChangeWriteCount,
+			result.wirePositions, result.wireFrames, result.afterStepPositions,
 		)
 	}
-	shallow := runRelayInflation(t, messageCount, shallowQueue, true, true)
+	shallow := measure(shallowQueue, true)
 	report("shallow queue, defer on ", shallow)
-	deepOff := runRelayInflation(t, messageCount, deepQueue, false, true)
+	deepOff := measure(deepQueue, false)
 	report("deep queue,    defer off", deepOff)
-	deepOn := runRelayInflation(t, messageCount, deepQueue, true, true)
+	deepOn := measure(deepQueue, true)
 	report("deep queue,    defer on ", deepOn)
 
+	if deepOn.stats.TimeoutResendDeferCount == 0 {
+		t.Fatal("deep-queue defer arm never exercised deferral")
+	}
 	// the instrument still reproduces the storm it was built for
 	if deepOff.stats.TimeoutResendWriteCount < 500 {
 		t.Fatalf(

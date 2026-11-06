@@ -3,7 +3,6 @@
 package connect
 
 import (
-	"context"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -210,53 +209,123 @@ func TestSynRetryRemoteRefusalRejectsOverflowedCapacity(t *testing.T) {
 func TestSynRetryRemoteRefusalBackingRejectsOneByteShortParent(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
-	path := unboundFlowTcpPath(52992)
-	parent := &RemoteUserNatMultiClient{settings: DefaultMultiClientSettings(), flowReaperDone: make(chan struct{})}
-	update := newMultiClientChannelUpdate(context.Background(), path)
-	update.sequenceParent = parent
-	update.noteConnectAttempt(path)
-	t.Cleanup(update.Close)
-	packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, nil))
-	t.Cleanup(func() { MessagePoolReturn(packet) })
-	frame := RequireToFrameWithDefaultProtocolVersion(&protocol.IpPacketToProvider{IpPacket: &protocol.IpPacket{PacketBytes: packet}})
-	capacity := synRetryRemoteTailCapacity(parent, update)
-	metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{}))
-	metadata = (metadata + 63) / 64 * 64
-	metadata = addReceiveQueueByteCount(metadata, retainedMessageCapacity(ByteCount(capacity)*ByteCount(unsafe.Sizeof(Id{}))))
-	total := addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata)
-	total = addReceiveQueueByteCount(total, transferRetainedControlCreditByteCount())
-	root := NewTransferMemoryBudget(total - 1)
-	budget := NewTransferMemoryBudgetWithParent(total, root)
-	queue := retainedControlTestSendQueue()
-	queue.setBudget(budget, total)
-	t.Cleanup(func() { queue.Clear() })
-	source := &SendSequence{ctx: context.Background(), resendQueue: queue}
-	group := &parsedPacketGroup{synRetry: &tcpSynRetryRequest{}, collapseAdmission: tcpCollapseAdmission{update: update}}
-	disposition := sendGroupDisposition{target: group, start: 0, end: 1}
-	disposition.retainSynRetry(source, []*protocol.Frame{frame})
-	if update.synRetry != nil || budget.UsedByteCount() != 0 || root.UsedByteCount() != 0 {
-		t.Fatal("SYN_RETRY_REMOTE_BACKING_ESCAPED_SHORT_PARENT: owner or history acquired without full permission")
-	}
-	root.SetTotalByteCount(total)
-	disposition.retainSynRetry(source, []*protocol.Frame{frame})
-	owner := update.synRetry
-	if owner == nil || cap(owner.refusedRemoteIds) != capacity || owner.credit.byteCount != total ||
-		budget.UsedByteCount() != total || root.UsedByteCount() != total {
-		t.Fatal("exact enlarged-owner parent did not fund the complete descriptor and fixed backing")
-	}
-	update.stateLock.Lock()
-	update.clearSynRetryWithLock()
-	update.stateLock.Unlock()
-	update.releaseSynRetryMemory()
-	if owner.refusedRemoteIds != nil || owner.credit != nil || budget.UsedByteCount() != 0 || root.UsedByteCount() != 0 {
-		t.Fatal("exact enlarged-owner admission did not return all backing and permission")
-	}
-	for _, ledger := range []*TransferMemoryBudget{budget, root} {
-		reserved, released := ledger.Counts()
-		if reserved != total || released != total {
-			t.Fatal("short-parent refusal or exact admission changed credit conservation")
+	synctest.Test(t, func(t *testing.T) {
+		root := NewTransferMemoryBudget(kib(64))
+		budget := NewTransferMemoryBudgetWithParent(kib(64), root)
+		t.Cleanup(func() {
+			for _, ledger := range []*TransferMemoryBudget{budget, root} {
+				r, l := ledger.Counts()
+				if ledger.UsedByteCount() != 0 || r != l {
+					t.Error("actual source left retained permission after join")
+				}
+			}
+		})
+		type snapshot struct {
+			base, total, reserved ByteCount
+			capacity              int
 		}
-	}
+		events := make(chan snapshot, 2)
+		var stage atomic.Int32
+		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.afterGroupDispositionForTest = func(source *SendSequence, disposition sendGroupDisposition, frames []*protocol.Frame) {
+				group, ok := disposition.target.(*parsedPacketGroup)
+				if !ok || group.synRetry == nil {
+					return
+				}
+				update := group.collapseAdmission.update
+				update.stateLock.Lock()
+				parent := update.sequenceParentWithLock()
+				capacity := synRetryRemoteTailCapacity(parent, update)
+				update.stateLock.Unlock()
+				metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{}))
+				metadata = (metadata + 63) / 64 * 64
+				metadata = addReceiveQueueByteCount(metadata, retainedMessageCapacity(ByteCount(capacity)*ByteCount(unsafe.Sizeof(Id{}))))
+				packet, err := ipPacketToProviderBytes(frames[0])
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				total := addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata)
+				total = addReceiveQueueByteCount(total, transferRetainedControlCreditByteCount())
+				base := root.UsedByteCount()
+				if base+total > kib(64) {
+					t.Error("single real group plus complete optional descriptor exceeds the existing bounded fixture envelope")
+					return
+				}
+				budget.SetTotalByteCount(base + total)
+				if stage.Add(1) == 1 {
+					root.SetTotalByteCount(base + total - 1)
+				} else {
+					root.SetTotalByteCount(base + total)
+				}
+				reserved, _ := root.Counts()
+				events <- snapshot{base: base, total: total, reserved: reserved, capacity: capacity}
+			}
+		})
+		// Enable the existing cache path on this real selected-source fixture;
+		// no reaper work or materialization token is fabricated by the test.
+		f.parent.flowReaperDone = make(chan struct{})
+		first := groupDispositionControlPacket(1000, 0, 64, tcpFlagSyn)
+		if f.offer(first) != 1 {
+			t.Fatal("short-cache source lacked actual packet admission")
+		}
+		f.requireParked()
+		f.unpark()
+		synctest.Wait()
+		if len(events) != 1 || len(f.route) != 1 {
+			t.Fatal("short-cache source did not really materialize its Pack")
+		}
+		short := <-events
+		f.update.stateLock.Lock()
+		refused := f.update.synRetry == nil
+		f.update.stateLock.Unlock()
+		if !refused || root.UsedByteCount() != short.base || budget.UsedByteCount() != short.base {
+			t.Fatal("SYN_RETRY_REMOTE_BACKING_ESCAPED_SHORT_PARENT: owner/backing acquired without full permission")
+		}
+		f.acknowledgeAll(first)
+		if root.UsedByteCount() != 0 || budget.UsedByteCount() != 0 {
+			t.Fatal("real first Pack ACK did not return its separate source owners")
+		}
+		root.SetTotalByteCount(kib(64))
+		budget.SetTotalByteCount(kib(64))
+		synctest.Wait()
+		next := groupDispositionControlPacket(1001, 0, 64, tcpFlagSyn)
+		if f.offer(next) != 1 {
+			t.Fatal("exact-cache source lacked actual packet admission")
+		}
+		synctest.Wait()
+		if len(events) != 1 || len(f.route) != 1 {
+			t.Fatal("exact-cache source did not really materialize its Pack")
+		}
+		exact := <-events
+		f.update.stateLock.Lock()
+		owner := f.update.synRetry
+		valid := owner != nil && cap(owner.refusedRemoteIds) == exact.capacity && owner.credit != nil && owner.credit.byteCount == exact.total && owner.references == 1 && owner.readiness == nil
+		f.update.stateLock.Unlock()
+		reserved, _ := root.Counts()
+		if !valid || reserved-exact.reserved != exact.total || root.UsedByteCount() != exact.base+exact.total || budget.UsedByteCount() != exact.base+exact.total {
+			t.Fatal("exact enlarged-owner permission did not fund the whole descriptor and fixed backing")
+		}
+		// No extra permission was granted for the independent optional readiness
+		// owner. This boundary tests the cache graph; that supplement declines.
+		f.acknowledgeAll(next)
+		if root.UsedByteCount() != exact.total || budget.UsedByteCount() != exact.total {
+			t.Fatal("cache permission was confused with the separately ACKed source Pack")
+		}
+		f.update.stateLock.Lock()
+		f.update.clearSynRetryWithLock()
+		f.update.stateLock.Unlock()
+		f.update.releaseSynRetryMemory()
+		if owner.refusedRemoteIds != nil || owner.credit != nil || root.UsedByteCount() != 0 || budget.UsedByteCount() != 0 {
+			t.Fatal("exact enlarged-owner admission did not return all backing and permission")
+		}
+		for _, ledger := range []*TransferMemoryBudget{budget, root} {
+			r, l := ledger.Counts()
+			if r != l {
+				t.Fatal("short/exact actual-source admission changed credit conservation")
+			}
+		}
+	})
 }
 
 // Inference is the existing silence path's policy verdict, not a provider's

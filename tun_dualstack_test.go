@@ -31,19 +31,17 @@ func tunTestApplyIpVersion(settings *TunSettings, ipVersion int) *TunSettings {
 	return settings
 }
 
-// The design (IPV6.md C1) requires the DEFAULT tun to carry IPv6, which gVisor
-// only does on a link at least IPv6MinimumMTU wide. The link mtu is
-// DefaultTunnelMtu; the packet-size contract DefaultMtu stays below it so a
-// full return packet keeps fitting one H3 DATAGRAM. Both live in ip.go.
+// The default tun carries ipv6 at the shared 1280-byte inner packet/link mtu.
+// Carrier framing owns any outer overhead independently of this size.
 func TestDefaultMtuCarriesIpv6(t *testing.T) {
 	if DefaultTunnelMtu < tunIpv6MinimumMtu {
 		t.Fatalf("DefaultTunnelMtu (ip.go) = %d is below the IPv6 minimum mtu %d: a tun at the default mtu is IPv4-only (IPV6.md C1)", DefaultTunnelMtu, tunIpv6MinimumMtu)
 	}
-	if DefaultTunnelMtu < DefaultMtu {
-		t.Fatalf("DefaultTunnelMtu = %d is below the packet-size contract DefaultMtu = %d", DefaultTunnelMtu, DefaultMtu)
+	if DefaultTunnelMtu != DefaultMtu {
+		t.Fatalf("DefaultTunnelMtu = %d differs from the packet-size contract DefaultMtu = %d", DefaultTunnelMtu, DefaultMtu)
 	}
-	if DefaultMtu != 1100 {
-		t.Fatalf("DefaultMtu = %d, want the 1100-byte H3 single-DATAGRAM contract", DefaultMtu)
+	if DefaultMtu != 1280 {
+		t.Fatalf("DefaultMtu = %d, want the 1280-byte inner packet contract", DefaultMtu)
 	}
 }
 

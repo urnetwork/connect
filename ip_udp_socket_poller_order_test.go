@@ -124,7 +124,7 @@ func TestUdpReturnReadPollerShardsShareScarceProviderCreditOnOneProcessor(t *tes
 			backend := newUdpReturnReadOrderBackend(shardCtx)
 			backends = append(backends, backend)
 			poller.shards = append(poller.shards, udpSocketReadPollShard{
-				ctx: shardCtx, backend: backend, readBuffer: make([]byte, udpReturnReadOrderPayloadByteCount),
+				ctx: shardCtx, backend: backend, readBuffer: make([]byte, udpReadScratchByteCount(udpReturnReadOrderPayloadByteCount)),
 				byFd: map[int]*udpSocketReadRegistration{},
 			})
 		}

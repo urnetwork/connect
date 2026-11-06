@@ -15,8 +15,12 @@ package connect
 //     the estimate lags, which is M4's profile with the rule on (row 16).
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // laneDrainRun offers a payload over one reliable lane, with every position
@@ -31,8 +35,11 @@ func laneDrainRun(
 	laneRule bool,
 ) (time.Duration, ClientSendRecoveryStatsSnapshot, []time.Time, uint64) {
 	t.Helper()
+	var wireStateLock sync.Mutex
+	wirePositions := map[uint64]bool{}
 	harness := newMixedLaneHarnessWithOptions(t, mixedLaneOptions{
 		directLaneDisabled:         true,
+		singleFramePacks:           true,
 		slowLatency:                200 * time.Millisecond,
 		slowSerialization:          2 * time.Millisecond,
 		replySerialization:         time.Millisecond,
@@ -40,10 +47,28 @@ func laneDrainRun(
 		slowDropRunCount:           1000,
 		deferTimeoutResend:         true,
 		reliableLaneProvenRecovery: laneRule,
+		beforeSlowDelivery: func(frameBytes []byte) {
+			if number, data := decodeFlightGatePackSequenceNumber(frameBytes); data {
+				wireStateLock.Lock()
+				wirePositions[number] = true
+				wireStateLock.Unlock()
+			}
+		},
 	})
 	start := time.Now()
 	stats := harness.run(t, messageCount)
 	elapsed := time.Since(start)
+	wireStateLock.Lock()
+	positionCount := len(wirePositions)
+	wireStateLock.Unlock()
+	// Every application frame must occupy a real sequence position. A
+	// transport may still coalesce separate Packs into one carrier write.
+	if positionCount != messageCount {
+		t.Fatalf("LANE_DRAIN_PACK_GEOMETRY: %d application frames used %d wire positions", messageCount, positionCount)
+	}
+	if dropped := harness.slowDropped.Load(); dropped != uint64(messageCount-dropFrom) {
+		t.Fatalf("LANE_DRAIN_DROP_GEOMETRY: dropped %d positions, want %d", dropped, messageCount-dropFrom)
+	}
 	harness.deliveryLock.Lock()
 	deliveries := append([]time.Time(nil), harness.deliveryTimes...)
 	harness.deliveryLock.Unlock()
@@ -137,6 +162,9 @@ func TestLaneDrainDroppedBatchDrainsAtOneRoundTripPerItem(t *testing.T) {
 		if dropped < 4 {
 			t.Fatalf("%s: only %d positions were dropped, so the row measured nothing",
 				arm.name, dropped)
+		}
+		if stats.SelectiveGapWriteCount != 0 {
+			t.Fatalf("LANE_DRAIN_GAP_PROOF_PRESENT: %s recovered %d gaps instead of a silent tail", arm.name, stats.SelectiveGapWriteCount)
 		}
 		if !arm.laneRule {
 			continue
@@ -259,4 +287,65 @@ func TestLanePositionM4ProfileHoldsAndPausesWriteTheHeadOnce(t *testing.T) {
 			second.TimeoutResendWriteCount, interval, second,
 		)
 	}
+}
+
+// Uses the harness's actual payload and the production chunk splitter. The
+// legacy three-MTU H1 cap changed 60 frames from 20 positions to 15 at1280;
+// dropping from13 then reaches only two positions if the row leaves grouping on.
+func TestLaneDrainLegacyH1BatchingExplainsInsufficientDrops(t *testing.T) {
+	frames := laneDrainGeometryFrames(t)
+	settings := DefaultSendBufferChunkSettings()
+	oldPositions := sendGroupChunkCountWithLimits(frames, settings.H1UnknownMaxFrames, 3*1100)
+	currentPositions := sendGroupChunkCountWithLimits(frames, settings.H1UnknownMaxFrames, settings.establishedByteLimit())
+	if oldPositions != 20 || currentPositions != 15 || currentPositions-13 != 2 {
+		t.Fatalf("LANE_DRAIN_GEOMETRY_COUNTERFACTUAL: old=%d current=%d tail=%d", oldPositions, currentPositions, currentPositions-13)
+	}
+}
+
+// Covers shared, legacy opening/established and known-H1 paths while keeping
+// default coalescing unchanged for every harness row that does not opt in.
+func TestLaneDrainFixturePinsOneFrameAcrossCarrierPolicies(t *testing.T) {
+	defaults := DefaultSendBufferChunkSettings()
+	if mixedLaneChunkSettings(false) != defaults {
+		t.Fatal("lane-drain fixture changed ordinary harness chunk defaults")
+	}
+	settings := mixedLaneChunkSettings(true)
+	want := defaults
+	want.SharedMaxFrames, want.H1UnknownMaxFrames, want.H1KnownMaxFrames = 1, 1, 1
+	if settings != want {
+		t.Fatal("LANE_DRAIN_SINGLE_FRAME_POLICY: explicit fixture did not pin only frame counts")
+	}
+	frames := laneDrainGeometryFrames(t)
+	for _, policy := range []transferFlightPolicySnapshot{
+		{}, {h1Only: true}, {h1Only: true, h1MessageLimitsKnown: true, h1MaxMessageByteCount: 16 * 1024},
+	} {
+		limit, bytes := settings.chunkLimits(policy)
+		if got := sendGroupChunkCountWithLimits(frames, limit, bytes); got != len(frames) {
+			t.Fatalf("LANE_DRAIN_SINGLE_FRAME_POLICY: %+v used %d positions for %d frames", policy, got, len(frames))
+		}
+		if got := sendGroupChunkCountWithLimits(frames, limit, settings.establishedByteLimit()); got != len(frames) {
+			t.Fatalf("LANE_DRAIN_SINGLE_FRAME_POLICY: established %+v used %d positions for %d frames", policy, got, len(frames))
+		}
+	}
+}
+
+// Real encoded messages match the shared harness payload; only their split is
+// evaluated without a link. The live row independently checks actual wire positions.
+func laneDrainGeometryFrames(t testing.TB) []*protocol.Frame {
+	t.Helper()
+	frames := make([]*protocol.Frame, 0, 60)
+	t.Cleanup(func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	})
+	content := mixedLaneMessageContent()
+	for index := range 60 {
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: fmt.Sprintf("%s%d", content, index)}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, frame)
+	}
+	return frames
 }

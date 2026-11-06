@@ -89,7 +89,7 @@ func TestUdpSocketPollShardCancelWakesUntimedWait(t *testing.T) {
 	shard := &udpSocketReadPollShard{
 		ctx:        ctx,
 		backend:    backend,
-		readBuffer: make([]byte, 64),
+		readBuffer: make([]byte, udpReadScratchByteCount(64)),
 		byFd:       map[int]*udpSocketReadRegistration{},
 	}
 	done := make(chan struct{})

@@ -311,7 +311,7 @@ func TestIpFragmentGateDualstack(t *testing.T) {
 
 func TestOversizedIpv6UdpFragmentsAtIpLayer(t *testing.T) {
 	payload := fragmentTestPayload(1200)
-	packets, err := newFragmentTestStream(6).DataPackets(payload, len(payload), DefaultMtu)
+	packets, err := newFragmentTestStream(6).DataPackets(payload, len(payload), fragmentTestHistoricalMtu)
 	if err != nil {
 		t.Fatalf("oversized IPv6 UDP: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestOversizedIpv6UdpFragmentsAtIpLayer(t *testing.T) {
 		t.Fatalf("packets = %d, want 2 fragments", len(packets))
 	}
 	for _, packet := range packets {
-		if !isIpv6FragmentPacket(packet) || DefaultMtu < len(packet) {
+		if !isIpv6FragmentPacket(packet) || fragmentTestHistoricalMtu < len(packet) {
 			t.Fatalf("packet len=%d fragment=%t", len(packet), isIpv6FragmentPacket(packet))
 		}
 	}

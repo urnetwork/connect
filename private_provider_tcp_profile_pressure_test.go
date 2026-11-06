@@ -300,7 +300,7 @@ func runPrivateTcpProfilePressure(t *testing.T, target ByteCount, overlap bool) 
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newPrivateTcpProfilePressureFixture(t, target, overlap)
 		settings := fixture.nat.settings.TcpBufferSettings
-		if DefaultMtu != 1100 || settings.Mtu != 1100 || settings.SequenceBufferSize != 16 || settings.ReadBufferByteCount != 4096 || settings.WriteBatchSize != privateTcpProfilePressureExpectedMaxBatchCount {
+		if DefaultMtu != 1280 || settings.Mtu != 1280 || settings.SequenceBufferSize != 16 || settings.ReadBufferByteCount != 4096 || settings.WriteBatchSize != privateTcpProfilePressureExpectedMaxBatchCount {
 			t.Fatalf("constructor profile differs from sealed arm: mtu=%d queue=%d read=%d maximum_batch=%d want_maximum_batch=%d", settings.Mtu, settings.SequenceBufferSize, settings.ReadBufferByteCount, settings.WriteBatchSize, privateTcpProfilePressureExpectedMaxBatchCount)
 		}
 		packetRoot := ByteCount(2048 + MessagePoolMetaByteCount)

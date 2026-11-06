@@ -22,7 +22,7 @@ func TestMessagePoolExtendedClassOrderingAndCharges(t *testing.T) {
 	}
 	before := encodingPoolBoundaryNow()
 	t.Cleanup(func() { encodingPoolRequireBalanced(t, before) })
-	wantClasses := []int{256, 2048, 4096, 8192, 9216}
+	wantClasses := []int{256, 2048, 4096, 8192, 12288}
 	pools := orderedMessagePools()
 	if len(pools) != len(wantClasses) {
 		t.Fatalf("EXTENDED_H1_POOL_CLASS_MISSING: classes=%d want=%d", len(pools), len(wantClasses))
@@ -32,7 +32,7 @@ func TestMessagePoolExtendedClassOrderingAndCharges(t *testing.T) {
 			t.Fatalf("pool class %d=%d want=%d", index, pools[index].size, want)
 		}
 	}
-	t.Logf("added_class_fixed_object_bytes=%d counter_bytes=%d payload_class=9216 allocation_request=9228", unsafe.Sizeof(messagePool{}), messagePoolShardCount*3*256*8)
+	t.Logf("added_class_fixed_object_bytes=%d counter_bytes=%d payload_class=12288 allocation_request=12300", unsafe.Sizeof(messagePool{}), messagePoolShardCount*3*256*8)
 	for _, row := range []struct {
 		size   int
 		root   int
@@ -42,11 +42,11 @@ func TestMessagePoolExtendedClassOrderingAndCharges(t *testing.T) {
 		{size: 257, root: 2048, pooled: true},
 		{size: 4097, root: 8192, pooled: true},
 		{size: 8192, root: 8192, pooled: true},
-		{size: 8193, root: 9216, pooled: true},
-		{size: 9000, root: 9216, pooled: true},
-		{size: 9216, root: 9216, pooled: true},
-		{size: 9217, root: 9217, pooled: false},
-		{size: 12 * 1024, root: 12 * 1024, pooled: false},
+		{size: 8193, root: 12288, pooled: true},
+		{size: 9000, root: 12288, pooled: true},
+		{size: 12288, root: 12288, pooled: true},
+		{size: 12289, root: 12289, pooled: false},
+		{size: 16 * 1024, root: 16 * 1024, pooled: false},
 	} {
 		message, pooled := MessagePoolGetDetailed(row.size)
 		capacity := cap(message)
@@ -82,7 +82,7 @@ func TestMessagePoolExtendedH1ScratchUsesFinalClass(t *testing.T) {
 		settings.H1MaxMessageByteCount = 16 * 1024
 		settings.H1BudgetByteCount = 1
 		settings.FramerSettings = DefaultFramerSettings(16 * 1024)
-		want := ByteCount(4*(16*1024+1)+9228+webSocketWriteBatchMaxByteCount+8*1024) + retainedMessageCapacity(16*1024+4)
+		want := ByteCount(4*(16*1024+1)+12300+webSocketWriteBatchMaxByteCount+8*1024) + retainedMessageCapacity(16*1024+4)
 		if got := settings.h1RetainedScratchMinimum(); got != want {
 			t.Fatalf("extended H1 scratch target=%d got=%d want=%d", target, got, want)
 		}
@@ -96,7 +96,7 @@ func TestMessagePoolExtendedH1ScratchUsesFinalClass(t *testing.T) {
 	}
 }
 
-// Actual rotating shards must reuse returned nine-KiB roots. A live read-only
+// Actual rotating shards must reuse returned twelve-KiB roots. A live read-only
 // carrier share prevents reuse, even after trim, resize and free-list clearing.
 func TestMessagePoolExtendedReuseAndSharedLifetime(t *testing.T) {
 	if messagePoolSnapshotInFreshProcess(t) {
@@ -116,19 +116,19 @@ func TestMessagePoolExtendedReuseAndSharedLifetime(t *testing.T) {
 		}
 	})
 	for index := range oldRoots {
-		oldRoots[index] = MessagePoolGet(9000)
+		oldRoots[index] = MessagePoolGet(10800)
 		oldLive[index] = true
 	}
 	for index, message := range oldRoots {
 		returned := MessagePoolReturn(message)
 		oldLive[index] = false
 		if !returned {
-			t.Fatal("nine-KiB owner was not pooled")
+			t.Fatal("twelve-KiB owner was not pooled")
 		}
 	}
 	_, _, created := MessagePoolCounts()
 	for index := range oldRoots {
-		message := MessagePoolGet(9000)
+		message := MessagePoolGet(10800)
 		matched := &message[0] == &oldRoots[index][0]
 		MessagePoolReturn(message)
 		if !matched {
@@ -138,7 +138,7 @@ func TestMessagePoolExtendedReuseAndSharedLifetime(t *testing.T) {
 	if _, _, after := MessagePoolCounts(); after != created {
 		t.Fatalf("bounded extended reuse allocated %d new roots", after-created)
 	}
-	owner := MessagePoolGet(9000)
+	owner := MessagePoolGet(10800)
 	for index := range owner {
 		owner[index] = byte(index)
 	}
@@ -159,7 +159,7 @@ func TestMessagePoolExtendedReuseAndSharedLifetime(t *testing.T) {
 	ResizeMessagePools(0, 0)
 	ClearMessagePools()
 	for range messagePoolShardCount {
-		other := MessagePoolGet(9000)
+		other := MessagePoolGet(10800)
 		aliased := &other[0] == &share[0]
 		MessagePoolReturn(other)
 		if aliased {
@@ -182,7 +182,7 @@ func TestMessagePoolExtendedReuseAndSharedLifetime(t *testing.T) {
 		t.Fatal("last carrier share did not release the extended root")
 	}
 	for _, pool := range orderedMessagePools() {
-		if pool.size == 9216 && (pool.capacity() != 0 || pool.snapshot().retained != 0) {
+		if pool.size == 12288 && (pool.capacity() != 0 || pool.snapshot().retained != 0) {
 			t.Fatal("zero extended free allowance retained a returned root")
 		}
 	}
@@ -204,7 +204,7 @@ func TestMessagePoolExtendedFreeRetentionConservesAllowance(t *testing.T) {
 				continue
 			}
 			largeCapacity += ByteCount(pool.capacity() * pool.size)
-			if pool.size == 9216 && allowance <= 512*1024 && pool.capacity() != 0 {
+			if pool.size == 12288 && allowance <= 512*1024 && pool.capacity() != 0 {
 				t.Fatal("new class took a free-retention floor")
 			}
 		}
@@ -230,13 +230,13 @@ func TestMessagePoolExtendedFreeRetentionConservesAllowance(t *testing.T) {
 	}
 	TrimMessagePoolsTo(0)
 	for _, pool := range orderedMessagePools() {
-		if pool.size == 9216 && pool.snapshot().retained != 0 {
+		if pool.size == 12288 && pool.snapshot().retained != 0 {
 			t.Fatal("trim retained the extended burst")
 		}
 	}
 	ResizeMessagePools(3 * 1024 * 1024)
 	for _, pool := range orderedMessagePools() {
-		if pool.size == 9216 && pool.capacity() != 0 {
+		if pool.size == 12288 && pool.capacity() != 0 {
 			t.Fatal("legacy resize silently multiplied its aggregate cap")
 		}
 		if (pool.size == 4096 || pool.size == 8192) && pool.capacity()*pool.size != 3*1024*1024 {
@@ -245,7 +245,7 @@ func TestMessagePoolExtendedFreeRetentionConservesAllowance(t *testing.T) {
 	}
 }
 
-// Both ordinary Read calls and final n>0,EOF must preserve the real nine-KiB
+// Both ordinary Read calls and final n>0,EOF must preserve the real twelve-KiB
 // stream. Exact-size framers share the same class; the next class stays finite.
 func TestMessagePoolExtendedReadAllAndFramedOwnership(t *testing.T) {
 	if messagePoolSnapshotInFreshProcess(t) {
@@ -253,7 +253,7 @@ func TestMessagePoolExtendedReadAllAndFramedOwnership(t *testing.T) {
 	}
 	before := encodingPoolBoundaryNow()
 	t.Cleanup(func() { encodingPoolRequireBalanced(t, before) })
-	for _, size := range []int{8193, 9000, 9216, 9217, 12 * 1024} {
+	for _, size := range []int{8193, 9000, 10800, 12288, 12289, 16 * 1024} {
 		payload := bytes.Repeat([]byte{0x56}, size)
 		for _, finalEof := range []bool{false, true} {
 			var reader io.Reader = bytes.NewReader(payload)
@@ -267,11 +267,11 @@ func TestMessagePoolExtendedReadAllAndFramedOwnership(t *testing.T) {
 			pooled, _ := MessagePoolCheck(message)
 			// An exact-full final class with deferred EOF retains the existing
 			// overflow path; this experiment does not change reader policy.
-			wantPooled := size < 9216 || (size == 9216 && finalEof)
+			wantPooled := size < 12288 || (size == 12288 && finalEof)
 			match := bytes.Equal(message, payload)
 			capacity := cap(message)
 			MessagePoolReturn(message)
-			if !match || pooled != wantPooled || (pooled && capacity != 9228) || (!pooled && capacity != 16*1024) {
+			if !match || pooled != wantPooled || (pooled && capacity != 12300) || (!pooled && capacity != 16*1024) {
 				t.Fatalf("EXTENDED_H1_READER_ROOT: size=%d finalEof=%t pooled=%t cap=%d", size, finalEof, pooled, capacity)
 			}
 		}
@@ -285,11 +285,11 @@ func TestMessagePoolExtendedReadAllAndFramedOwnership(t *testing.T) {
 		match := bytes.Equal(message, payload)
 		MessagePoolReturn(message)
 		conn.Close()
-		if err != nil || !match || pooled != (size <= 9216) {
+		if err != nil || !match || pooled != (size <= 12288) {
 			t.Fatalf("framed size=%d pooled=%t err=%v", size, pooled, err)
 		}
 	}
-	message, err := MessagePoolReadAllLimit(bytes.NewReader(make([]byte, 9217)), 9216)
+	message, err := MessagePoolReadAllLimit(bytes.NewReader(make([]byte, 12289)), 12288)
 	if message != nil {
 		MessagePoolReturn(message)
 	}
@@ -309,7 +309,7 @@ func TestMessagePoolExtendedReadAllAndFramedOwnership(t *testing.T) {
 }
 
 // Actual Pack encoding, complete AEAD wrapping and owned decode exercise all
-// three byte-root sites. Eight1280 remains a larger, explicit unpooled case.
+// three byte-root sites. Eight1280 must retain pooled complete encoded and encrypted owners.
 func TestMessagePoolExtendedPackEncryptReadDecodeGeometry(t *testing.T) {
 	if messagePoolSnapshotInFreshProcess(t) {
 		return
@@ -374,15 +374,15 @@ func TestMessagePoolExtendedPackEncryptReadDecodeGeometry(t *testing.T) {
 					t.Fatal("decoded packet bytes changed")
 				}
 			}
-			wantPooled := packetBytes == 1100
+			wantPooled := true
 			for _, owner := range [][]byte{encoded, outer, read, plain} {
 				pooled, _ := MessagePoolCheck(owner)
-				if pooled != wantPooled || (pooled && (cap(owner) != 9228 || MessagePoolRootByteCount(owner) != 9216)) {
+				if pooled != wantPooled || (pooled && (cap(owner) != 12300 || MessagePoolRootByteCount(owner) != 12288)) {
 					t.Fatalf("packet=%d encoded=%d outer=%d owner=%d cap=%d pooled=%t", packetBytes, len(encoded), len(outer), len(owner), cap(owner), pooled)
 				}
 			}
-			if packetBytes == 1280 && cap(read) != 16*1024 {
-				t.Fatal("1280 fallback grew beyond the original reader allocation")
+			if packetBytes == 1280 && len(outer) <= 8192 {
+				t.Fatal("1280 complete envelope did not exercise the extended class")
 			}
 			t.Logf("packet_bytes=%d frames=8 encoded_bytes=%d encrypted_bytes=%d root_request_bytes=%d pooled=%t", packetBytes, len(encoded), len(outer), cap(outer), wantPooled)
 		}()
@@ -409,6 +409,31 @@ func TestMessagePoolExtendedRejectsOrdinaryAppendOwnership(t *testing.T) {
 		returnedOwner := MessagePoolReturn(ordinary)
 		if pooled || shared || returnedShare || returnedOwner || !bytes.Equal(ordinary, want) || &share[0] != &ordinary[0] {
 			t.Fatalf("NONPOOL_APPEND_CAPACITY_COLLISION: size=%d cap=%d pooled=%t shared=%t mutated=%t", size, cap(ordinary), pooled, shared, !bytes.Equal(ordinary, want))
+		}
+	}
+}
+
+// A tail-inclusive twelve-KiB class would collide with ordinary append
+// capacity. The chosen payload class preserves a distinct visible capacity.
+func TestMessagePoolExtended1280RejectsRoundedAppendOwnership(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
+	before := encodingPoolBoundaryNow()
+	t.Cleanup(func() { encodingPoolRequireBalanced(t, before) })
+	for _, size := range []int{12288, 12300, 13568} {
+		ordinary := append([]byte(nil), bytes.Repeat([]byte{0x5a}, size)...)
+		ordinary = ordinary[:cap(ordinary)]
+		for index := range ordinary {
+			ordinary[index] = 0x5a
+		}
+		want := append([]byte(nil), ordinary...)
+		share := MessagePoolShareReadOnly(ordinary)
+		pooled, shared := MessagePoolCheck(ordinary)
+		returnedShare := MessagePoolReturn(share)
+		returnedOwner := MessagePoolReturn(ordinary)
+		if pooled || shared || returnedShare || returnedOwner || !bytes.Equal(ordinary, want) || &share[0] != &ordinary[0] {
+			t.Fatalf("EXTENDED1280_APPEND_OWNER_COLLISION: size=%d cap=%d pooled=%t shared=%t", size, cap(ordinary), pooled, shared)
 		}
 	}
 }

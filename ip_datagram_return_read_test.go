@@ -152,7 +152,7 @@ func TestUdpReturnReadPollerPausesInsteadOfClosing(t *testing.T) {
 		events: make(chan udpSocketPollEvent, 8), waits: make(chan struct{}, 8),
 		added: map[int]bool{}, removed: map[int]int{}}
 	poller := &udpSocketReadPoller{shards: []udpSocketReadPollShard{{
-		ctx: ctx, backend: backend, readBuffer: make([]byte, 2048),
+		ctx: ctx, backend: backend, readBuffer: make([]byte, udpReadScratchByteCount(2048)),
 		byFd: map[int]*udpSocketReadRegistration{},
 	}}}
 	sequence.socketReadPoller = poller
@@ -221,7 +221,7 @@ func TestUdpReturnReadNoConsumptionWithoutPreparedCredit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buffer := make([]byte, 2048)
+	buffer := make([]byte, udpReadScratchByteCount(2048))
 	if err := raw.Read(func(fd uintptr) bool {
 		n, _, readErr := syscall.Recvfrom(int(fd), buffer, syscall.MSG_PEEK)
 		if errors.Is(readErr, syscall.EAGAIN) || errors.Is(readErr, syscall.EWOULDBLOCK) {
@@ -289,7 +289,7 @@ func TestUdpReturnReadEmptyDatagramCommitsInsteadOfAborting(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := raw.Read(func(fd uintptr) bool {
-		if err := drainReadyUdpSocket(int(fd), sequence, make([]byte, 64)); err != nil {
+		if err := drainReadyUdpSocket(int(fd), sequence, make([]byte, udpReadScratchByteCount(64))); err != nil {
 			t.Error(err)
 		}
 		return true
@@ -305,7 +305,7 @@ func TestUdpReturnReadPausedQuantumIsFair(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	backend := &udpReturnReadTestBackend{added: map[int]bool{}, removed: map[int]int{}}
 	poller := &udpSocketReadPoller{shards: []udpSocketReadPollShard{{
-		ctx: context.Background(), backend: backend, readBuffer: make([]byte, 2048),
+		ctx: context.Background(), backend: backend, readBuffer: make([]byte, udpReadScratchByteCount(2048)),
 		byFd: map[int]*udpSocketReadRegistration{},
 	}}}
 	shard := &poller.shards[0]
@@ -361,7 +361,7 @@ func TestUdpReturnReadPausedQuantumIsFair(t *testing.T) {
 func TestUdpReturnReadStaleRegistrationCannotRearmReplacement(t *testing.T) {
 	backend := &udpReturnReadTestBackend{added: map[int]bool{}, removed: map[int]int{}}
 	poller := &udpSocketReadPoller{shards: []udpSocketReadPollShard{{
-		ctx: context.Background(), backend: backend, readBuffer: make([]byte, 2048),
+		ctx: context.Background(), backend: backend, readBuffer: make([]byte, udpReadScratchByteCount(2048)),
 		byFd: map[int]*udpSocketReadRegistration{},
 	}}}
 	shard := &poller.shards[0]
@@ -472,7 +472,7 @@ func TestUdpReturnReadPortablePauseCancelsWithoutReading(t *testing.T) {
 	socket := newUdpReturnReadTestSocket(t, []byte("cancel-retains-kernel-owner"))
 	done := make(chan error, 1)
 	go func() {
-		lease, err := sequence.awaitReturnRead(socket, make([]byte, 2048))
+		lease, err := sequence.awaitReturnRead(socket, make([]byte, udpReadScratchByteCount(2048)))
 		if lease != nil {
 			lease.abort()
 		}

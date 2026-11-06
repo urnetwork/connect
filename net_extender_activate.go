@@ -163,9 +163,45 @@ type ExtenderActivateCarrierRefusal struct {
 	// why the probe failed, in the operator's words
 	Error string `json:"error"`
 	// how long the probe ran, and how much of the probe's budget was left when
-	// it started
+	// it started. An older operator may omit either timing.
 	ElapsedMs    int64 `json:"elapsed_ms"`
 	BudgetLeftMs int64 `json:"budget_left_ms"`
+	// Only decoded omissions and nulls suppress a timing. Go literals keep
+	// reporting both values, including zero, and their json stays unchanged.
+	elapsedMsAbsent    bool
+	budgetLeftMsAbsent bool
+}
+
+// Keeps an omitted or null timing distinct from a measured zero without
+// changing the public numeric fields or their json. Each object replaces its
+// timing presence and values, even when the decoder reuses a prior refusal;
+// other omitted fields and a null object retain normal json decode behavior.
+func (self *ExtenderActivateCarrierRefusal) UnmarshalJSON(data []byte) error {
+	type carrierRefusal ExtenderActivateCarrierRefusal
+	value := carrierRefusal(*self)
+	decoded := &struct {
+		*carrierRefusal
+		ElapsedMs    *int64 `json:"elapsed_ms"`
+		BudgetLeftMs *int64 `json:"budget_left_ms"`
+	}{carrierRefusal: &value}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded == nil {
+		return nil
+	}
+	value.ElapsedMs = 0
+	value.BudgetLeftMs = 0
+	value.elapsedMsAbsent = decoded.ElapsedMs == nil
+	value.budgetLeftMsAbsent = decoded.BudgetLeftMs == nil
+	if decoded.ElapsedMs != nil {
+		value.ElapsedMs = *decoded.ElapsedMs
+	}
+	if decoded.BudgetLeftMs != nil {
+		value.BudgetLeftMs = *decoded.BudgetLeftMs
+	}
+	*self = ExtenderActivateCarrierRefusal(value)
+	return nil
 }
 
 // One step of the operator's probe of an activation (C2b).
@@ -1847,19 +1883,26 @@ func extenderActivateProbeStepsText(probeSteps []*ExtenderActivateProbeStep) str
 }
 
 // The carriers an activation left out on one line, in the order offered, each
-// with the operator's error and timing (C2a). A nil refusal is skipped.
+// with the operator's error and each timing it supplied (C2a). A nil refusal
+// is skipped; an older operator's missing timings make no claim of zero.
 func extenderActivateCarrierRefusalsText(carrierRefusals []*ExtenderActivateCarrierRefusal) string {
 	refusalTexts := []string{}
 	for _, carrierRefusal := range carrierRefusals {
 		if carrierRefusal == nil {
 			continue
 		}
+		timingText := ""
+		if !carrierRefusal.elapsedMsAbsent {
+			timingText += fmt.Sprintf(" after %s", extenderActivateMsText(carrierRefusal.ElapsedMs))
+		}
+		if !carrierRefusal.budgetLeftMsAbsent {
+			timingText += fmt.Sprintf(" (%s left)", extenderActivateMsText(carrierRefusal.BudgetLeftMs))
+		}
 		refusalTexts = append(refusalTexts, fmt.Sprintf(
-			"%s:%d after %s (%s left): %s",
+			"%s:%d%s: %s",
 			carrierRefusal.Carrier,
 			carrierRefusal.Port,
-			extenderActivateMsText(carrierRefusal.ElapsedMs),
-			extenderActivateMsText(carrierRefusal.BudgetLeftMs),
+			timingText,
 			carrierRefusal.Error,
 		))
 	}

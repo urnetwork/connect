@@ -149,6 +149,44 @@ func (self *parsedPacketGroup) validSynRetryWithLock(update *multiClientChannelU
 		(self.synRetry.raceOrder == 0 || unansweredSynRetryRaceWithLock(update, self.synRetry.raceOrder))
 }
 
+// Only actually retained source controls advance this receipt. FIFO dequeue
+// order, then in-group position, distinguish admitted cohorts without ordering
+// TCP ISNs. A later refused offer cannot revoke an older materialized SYN.
+func (self *parsedPacketGroup) noteSynRetryControlMaterializedWithLock(index int) {
+	path := self.packets[index].ipPath
+	if path.Protocol != IpProtocolTcp || !(path.Syn && !path.Ack || path.Rst || path.Fin) ||
+		self.completionFlags.Load()&groupCompletionAbandoned != 0 {
+		return
+	}
+	order := self.collapseOrder()
+	if order == 0 {
+		return
+	}
+	update := self.collapseAdmission.update
+	// A still-live older Transfer lane may dequeue after a newer lane. The
+	// existing selected/candidate source policy already ignores that control.
+	sourceId := self.collapseSourceIdWithLock()
+	if sourceId == (Id{}) || update.sequenceClient == self.completionClient && sourceId.LessThan(update.sequenceSourceId) {
+		return
+	}
+	if race := update.race; race != nil {
+		if state := race.clientStates[self.completionClient]; state != nil && sourceId.LessThan(state.collapseControl.sourceId) {
+			return
+		}
+	}
+	if update.synRetryMaterializedOrder < order || update.synRetryMaterializedOrder == order && update.synRetryMaterializedIndex < index {
+		update.synRetryMaterializedOrder, update.synRetryMaterializedIndex = order, index
+	}
+}
+
+// The caller holds the same flow lock used by successful disposition. The
+// receipt survives optional-cache allocation failure and final credit release.
+func (self *parsedPacketGroup) currentSynRetryControlMaterializationWithLock(index int) bool {
+	update := self.collapseAdmission.update
+	order := self.collapseOrder()
+	return order != 0 && update.synRetryMaterializedOrder == order && update.synRetryMaterializedIndex == index
+}
+
 // Materialization has already published source control. These actual borrowed
 // frames still own their bytes in v1 and raw encodings, unlike an old parsed
 // descriptor's packet slice after the legacy public caller returned it.
@@ -167,7 +205,7 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		group.completionFlags.Load()&groupCompletionAbandoned != 0 || !group.validSynRetryWithLock(update) {
 		return
 	}
-	for _, frame := range frames {
+	for frameIndex, frame := range frames {
 		if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 			continue
 		}
@@ -177,6 +215,9 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		}
 		path, err := ParseIpPath(packet)
 		if err != nil || path.Protocol != IpProtocolTcp {
+			continue
+		}
+		if (path.Syn && !path.Ack || path.Rst || path.Fin) && !group.currentSynRetryControlMaterializationWithLock(self.start+frameIndex) {
 			continue
 		}
 		if path.Rst || path.Fin {
@@ -250,13 +291,14 @@ func (self *multiClientChannelUpdate) releaseSynRetryMemory() {
 		return
 	}
 	self.stateLock.Lock()
+	parent := self.sequenceParentWithLock()
 	owners := self.synRetryReleased.Swap(nil)
 	self.stateLock.Unlock()
 	for owners != nil {
 		owner := owners
 		owners, owner.released = owner.released, nil
 		packet, credit, ready := owner.packet, owner.credit, owner.readiness
-		if parent := self.sequenceParent; parent != nil {
+		if parent != nil {
 			parent.removeSynPublicationOwner(owner)
 		}
 		owner.packet, owner.credit, owner.update, owner.next, owner.readiness = nil, nil, nil, nil, nil

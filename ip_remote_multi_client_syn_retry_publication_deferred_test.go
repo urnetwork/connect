@@ -412,8 +412,12 @@ func TestSynPublicationIndexCaptureNeverWaitsBeneathParent(t *testing.T) {
 	releaseCapture, done := make(chan struct{}), make(chan struct{})
 	var releaseOnce, unlockOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseCapture) }) }
-	update.stateLock.Lock()
-	unlock := func() { unlockOnce.Do(update.stateLock.Unlock) }
+	locked := false
+	unlock := func() {
+		if locked {
+			unlockOnce.Do(update.stateLock.Unlock)
+		}
+	}
 	parent.beforeSynPublicationIndexCaptureForTest = func(current *multiClientChannelUpdate) {
 		free := parent.stateLock.TryLock()
 		if free {
@@ -430,9 +434,21 @@ func TestSynPublicationIndexCaptureNeverWaitsBeneathParent(t *testing.T) {
 		parent.removeSynPublicationOwner(owner)
 	}()
 	free := <-available
-	unlock()
+	// The initial parent snapshot has finished. Hold the same source leaf
+	// before resuming the preserved pre-owner-capture hook, never a fake-clock
+	// Wait on a mutex that Go does not classify as durably blocked.
+	update.stateLock.Lock()
+	locked = true
 	release()
+	parentFree := parent.stateLock.TryLock()
+	if parentFree {
+		parent.stateLock.Unlock()
+	}
+	unlock()
 	<-done
+	if !parentFree {
+		t.Fatal("SYN_PUBLICATION_INDEX_WAIT_HELD_PARENT: waiting for source capture held the shared parent")
+	}
 	if !free {
 		t.Fatal("SYN_PUBLICATION_INDEX_WAIT_HELD_PARENT: paid-owner capture attempted its busy leaf beneath the shared parent")
 	}

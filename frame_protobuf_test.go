@@ -914,8 +914,8 @@ func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 // maximum frame-count/byte combination, a bounded ordinary opening contract,
 // and outer sequence encryption still fit the ordinary 4-KiB data class inside
 // the minimum H1 envelope. Opening/rotating contracts retain 3 KiB; an
-// established contract can safely use three full 1,100-byte packets only while
-// no contract frame rides on that Pack.
+// established contract can use its larger payload policy only while
+// no contract frame rides on that Pack; complete encoded carrier limits still apply.
 func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 	const ordinaryH1DataEnvelopeByteCount = 4 * 1024
 
@@ -973,6 +973,10 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 		)
 	}
 
+	if len(wrapped) > ordinaryH1DataEnvelopeByteCount {
+		t.Fatalf("ordinary opening group encrypted=%d exceeds4096", len(wrapped))
+	}
+
 	establishedFrames := make([]*protocol.Frame, 3)
 	for frameIndex := range establishedFrames {
 		establishedFrames[frameIndex] = &protocol.Frame{
@@ -1021,16 +1025,30 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 		t.Fatalf("Seal rotating H1 frame: %s", err)
 	}
 	defer MessagePoolReturn(rotatingWrapped)
-	if remaining := ordinaryH1DataEnvelopeByteCount - len(rotatingWrapped); remaining < 0 || 32 < remaining {
-		t.Fatalf(
-			"contract-bearing three-MTU H1 Pack is %d bytes at ordinary data limit %d, want no more than 32 bytes of fragile headroom",
-			len(rotatingWrapped),
-			ordinaryH1DataEnvelopeByteCount,
-		)
+	if DefaultMtu != 1280 || len(rotatingWrapped) <= ordinaryH1DataEnvelopeByteCount {
+		t.Fatalf("current three1280 contract-bearing Pack=%d must exceed unchanged4096 envelope", len(rotatingWrapped))
 	}
+	// Preserve the old1100-byte codec witness explicitly. Its accidental
+	// narrow margin is a historical counterexample, not the current MTU policy.
+	historicalFrames := make([]*protocol.Frame, 3)
+	for index := range historicalFrames {
+		historicalFrames[index] = &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketFromProvider, MessageBytes: make([]byte, 1100), Raw: true}
+	}
+	m.frames = historicalFrames
+	historicalInner := marshalSendPackTransferFrame(m)
+	defer MessagePoolReturn(historicalInner)
+	historicalWrapped, err := c.SealOuterFrame(path, historicalInner, protocol.SequenceRole_SequenceRoleServer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer MessagePoolReturn(historicalWrapped)
+	if remaining := ordinaryH1DataEnvelopeByteCount - len(historicalWrapped); remaining < 0 || remaining > 32 {
+		t.Fatalf("historical1100 contract-bearing Pack=%d lost fragile4096 margin", len(historicalWrapped))
+	}
+	m.frames = establishedFrames
 
 	// A slightly larger still-ordinary signed contract crosses the deployed
-	// envelope. The established path must therefore prove that no contract
+	// envelope at both old and current MTUs. The established path must prove that no contract
 	// frame can ride on its larger chunk instead of relying on the 512-byte
 	// example's accidental ten-byte margin.
 	m.contractFrame.MessageBytes = make([]byte, 544)

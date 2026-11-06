@@ -53,6 +53,9 @@ func (self *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChann
 func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multiClientChannelUpdate, batchAdmission *ipPacketGroupAdmission, parents ...*RemoteUserNatMultiClient) bool {
 	update.stateLock.Lock()
 	if len(parents) != 0 {
+		if hook := parents[0].beforeSequenceParentWriteForTest; hook != nil {
+			hook(update)
+		}
 		update.sequenceParent = parents[0]
 	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
