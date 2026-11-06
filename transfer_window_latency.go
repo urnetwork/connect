@@ -23,9 +23,10 @@
 // for pathRoundTripProbeInterval, the window drops to its floor for a short
 // drain so the next samples measure the path again, as BBR's ProbeRTT does.
 // The same probe is what lets a path whose real delay grew adopt it within one
-// horizon. That adaptation is slower than the unbounded window's, which is why
-// the budget is off by default and set where latency matters more than
-// throughput on a path whose delay moves.
+// horizon. That is slower than the unbounded window, which follows a longer
+// path within a few round trips, and is the price of not letting the window
+// read its own queue as path delay. The window path cells that characterize the
+// unbounded learner set the budget to zero.
 package connect
 
 import (

@@ -542,6 +542,9 @@ type windowPathCell struct {
 	Warmup                   time.Duration
 	PacingWakeDelay          time.Duration
 	KnownPathRoundTrip       bool
+	// The latency bound (transfer_window_latency.go) for this cell. Zero, the
+	// cells' default, measures the delivery-sized window's own learning.
+	LatencyBudget time.Duration `json:",omitempty"`
 }
 
 type windowPathReading struct {
@@ -633,6 +636,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		}
 		s.SendBufferSettings.ApplyWindowSizing()
+		s.SendBufferSettings.WindowLatencyBudget = cell.LatencyBudget
 		s.SendBufferSettings.ApplicationPacing = cell.Arm == "delivery" || cell.Arm == "path-rtt-only"
 		s.SendBufferSettings.disableWindowPacingForTest = cell.Arm == "unpaced"
 		if cell.KnownPathRoundTrip {
