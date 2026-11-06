@@ -579,6 +579,10 @@ type ContractManager struct {
 	// holding a successor marked requested reads it once per write, and reads
 	// the keys only when it has moved.
 	createContractRateLimitRefusals atomic.Uint64
+	// How many contracts have been queued for any key. A send sequence that
+	// found its queue empty when its successor was due to be announced reads
+	// it once per write, and looks at its queue again only when it has moved.
+	queuedContractGeneration atomic.Uint64
 	// Protected by mutex. How many holds have begun. A request records it when
 	// admitted, under the lock that starts a hold, so a refusal of a request
 	// admitted before the latest hold began is told apart in lock order. A
@@ -1841,6 +1845,7 @@ func (self *ContractManager) addContractToQueue(
 	if err := contractQueue.Add(contract, storedContract); err != nil {
 		return err
 	}
+	self.queuedContractGeneration.Add(1)
 	if !self.contractExpiryStarted {
 		// This admission shares Close's lock, so a successfully queued result
 		// always has a joined final-flush owner, even when expiry is disabled.

@@ -77,6 +77,9 @@ const (
 	// balance probe instead of building candidates (see
 	// ip_remote_multi_client_balance_hold.go)
 	windowExpandPassHeldInsufficientBalance
+	// the window's device has sent no user packet for IdleRefillHold, so the
+	// pass built and probed nothing (see ip_remote_multi_client_idle_refill.go)
+	windowExpandPassHeldIdle
 	windowExpandPassStateCount
 )
 
@@ -97,6 +100,8 @@ func (self windowExpandPassState) String() string {
 		return "deferred"
 	case windowExpandPassHeldInsufficientBalance:
 		return "held_insufficient_balance"
+	case windowExpandPassHeldIdle:
+		return "held_idle"
 	default:
 		return "unknown"
 	}

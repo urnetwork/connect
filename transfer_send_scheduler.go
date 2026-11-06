@@ -3,6 +3,7 @@ package connect
 import (
 	"slices"
 	"sync"
+	"time"
 )
 
 // sendSchedulingKey keeps the exact five-tuple local. The scheduler consumes
@@ -297,6 +298,84 @@ func (self *sendPackScheduler) TakeFifoEligible(
 	return nil
 }
 
+// TakeFifoEligibleAround is TakeFifoEligible with the Packs `held` reports
+// passed over. A held Pack is a no-acknowledgement Pack waiting at a contract
+// boundary for the receiver to acknowledge its next contract
+// (FILLFRACTION.md); no-acknowledgement data is unordered, so what is behind
+// it may go first. The first Pack that is not held keeps the FIFO rule, taken
+// only if it is eligible, so ordered traffic is never reordered among itself.
+// With nothing held this is TakeFifoEligible.
+func (self *sendPackScheduler) TakeFifoEligibleAround(
+	held func(*SendPack) bool,
+	eligible func(*SendPack) bool,
+) *SendPack {
+	for _, sendPack := range self.order {
+		if held(sendPack) {
+			continue
+		}
+		if !eligible(sendPack) {
+			return nil
+		}
+		flow := self.flows[sendPack.schedulingKey]
+		if flow == nil || len(flow.packs) == 0 {
+			return nil
+		}
+		if flow.packs[0] == sendPack {
+			for activeIndex, activeFlow := range self.active {
+				if activeFlow == flow {
+					return self.takeFromFlow(flow, activeIndex, false)
+				}
+			}
+			return nil
+		}
+		// behind a held Pack of its own flow
+		return self.takeUnordered(sendPack)
+	}
+	return nil
+}
+
+// The earliest caller's deadline among Packs that waited at a contract
+// boundary (`SendPack.contractHeld`), and whether any such Pack carries one.
+func (self *sendPackScheduler) earliestContractHeldDeadline() (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, sendPack := range self.order {
+		if !sendPack.contractHeld || sendPack.deadline.IsZero() {
+			continue
+		}
+		if !found || sendPack.deadline.Before(earliest) {
+			earliest = sendPack.deadline
+			found = true
+		}
+	}
+	return earliest, found
+}
+
+// Removes one Pack from wherever it is in its flow and in the ingress order.
+func (self *sendPackScheduler) takeUnordered(sendPack *SendPack) *SendPack {
+	flow := self.flows[sendPack.schedulingKey]
+	for i, candidate := range flow.packs {
+		if candidate == sendPack {
+			copy(flow.packs[i:], flow.packs[i+1:])
+			flow.packs[len(flow.packs)-1] = nil
+			flow.packs = flow.packs[:len(flow.packs)-1]
+			break
+		}
+	}
+	self.removeOrder(sendPack)
+	self.count--
+	if len(flow.packs) == 0 {
+		delete(self.flows, flow.key)
+		for i, candidate := range self.active {
+			if candidate == flow {
+				self.removeActive(i)
+				break
+			}
+		}
+	}
+	return sendPack
+}
+
 // TakeEligible selects the first eligible active flow, then rotates that flow
 // behind every other currently active flow.
 func (self *sendPackScheduler) TakeEligible(
@@ -346,27 +425,7 @@ func (self *sendPackScheduler) TakeUnorderedEligible(eligible func(*SendPack) bo
 		if !eligible(pack) {
 			continue
 		}
-		flow := self.flows[pack.schedulingKey]
-		for i, candidate := range flow.packs {
-			if candidate == pack {
-				copy(flow.packs[i:], flow.packs[i+1:])
-				flow.packs[len(flow.packs)-1] = nil
-				flow.packs = flow.packs[:len(flow.packs)-1]
-				break
-			}
-		}
-		self.removeOrder(pack)
-		self.count--
-		if len(flow.packs) == 0 {
-			delete(self.flows, flow.key)
-			for i, candidate := range self.active {
-				if candidate == flow {
-					self.removeActive(i)
-					break
-				}
-			}
-		}
-		return pack
+		return self.takeUnordered(pack)
 	}
 	return nil
 }

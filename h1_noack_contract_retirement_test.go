@@ -34,6 +34,11 @@ func (w *h1RetirementBarrierWriter) Write(ctx context.Context, wire []byte, time
 // Reservation, not a stale pointer read, is the admission boundary. Already
 // admitted writes keep the old contract open through their final accounting;
 // unreserved retired readers must return untouched to normal queue admission.
+//
+// FILLFRACTION.md: an acknowledged predecessor with headroom left is kept open
+// across the switch, its fast path retired at the switch, so the sequence
+// loop can carry no-acknowledgement traffic in its headroom while the
+// successor is introduced. It closes once the successor is acknowledged.
 func TestH1NoAckContractRetirementWitness(t *testing.T) {
 	for _, kind := range []string{"read-before-reserve", "reserved-success", "reserved-failure", "reserved-cancel", "last-ack", "no-contract", "zero-byte"} {
 		t.Run(kind, func(t *testing.T) {
@@ -68,13 +73,14 @@ func TestH1NoAckContractRetirementWitness(t *testing.T) {
 				go func() { done <- sequence.writeNoAckFastPath(snapshot, pack) }()
 				<-barrier.entered
 			}
+			var second *sequenceContract
 			if kind == "no-contract" {
 				h.client.ContractManager().AddNoContractPeer(h.destinationId)
 				if !sequence.updateContract(0) {
 					t.Error("no-contract transition failed")
 				}
 			} else {
-				second := newContractAheadTestContract(t, h.client, h.destinationId)
+				second = newContractAheadTestContract(t, h.client, h.destinationId)
 				sequence.setContract(second, sequence.contractMetadata().generation)
 				if kind == "last-ack" {
 					sequence.ackItem(newContractSendItem(&first.contractId, 0, 60))
@@ -104,6 +110,14 @@ func TestH1NoAckContractRetirementWitness(t *testing.T) {
 			}
 			if !written {
 				pack.disposeUnsentGroup(context.Canceled)
+			}
+			if second != nil && sequence.noAckHeadroomContract == first {
+				// the predecessor carries the switch's headroom until the
+				// successor is acknowledged (FILLFRACTION.md)
+				if _, open := sequence.openSendContracts[first.contractId]; !open {
+					t.Error("the predecessor closed while it still carried the switch's headroom")
+				}
+				sequence.setContractAcked(second, true)
 			}
 			sequence.applyNoAckFastPathAccounting()
 			wantClosed := ByteCount(60)

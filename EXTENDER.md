@@ -639,8 +639,10 @@ within one 10 s probe budget, in this order: the required test (C2a) --
 name, sends a header with a challenge and verifies the response signature
 against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
 verified `GET /hello` through the tcp carrier to the api url -- and only
-then each offered optional carrier: each dns port under its own 3 s (L2),
-then quic with what is left. Result `{activated, ip, ip_version,
+then every offered optional carrier at once, each dns port (L2) and quic,
+each until it answers or the probe budget ends (connect#230): none waits on
+another, so a port with nothing bound costs only itself and a slow carrier
+has all of what is left of the budget. Result `{activated, ip, ip_version,
 carriers, refused_carriers, probe_steps, error, retry_after_seconds,
 expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
@@ -724,9 +726,9 @@ about the budget, while a step whose budget ran out says how much it had,
 "the forward did not answer within the 0.5 s left of the 10 s probe
 budget: context deadline exceeded" or "the tcp carrier did not answer
 within the 10 s probe budget: ...". A left out carrier that timed out reads
-"no answer within 3 s: ..." for a dns port and "no answer within the 6.5 s
-left of the 10 s probe budget: ..." for quic; one that failed on its own
-keeps its probe's error. Old providers decode the answer into
+"no answer within the 8.5 s left of the 10 s probe budget: ...", the same
+for each, since the optional carriers start together once the required
+test has passed; one that failed on its own keeps its probe's error. Old providers decode the answer into
 `connect.ExtenderActivateResult`, which skips the new fields. The api
 counts every activation in `urnetwork_extender_activations_total{stage,
 outcome, family}` -- stage `request`, `config`, `owner` (the key is registered
