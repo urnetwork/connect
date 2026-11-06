@@ -87,6 +87,60 @@ class SpecTest(unittest.TestCase):
             set(schemas["RotateProxyExitResult"]["properties"]["error"]["properties"]),
         )
 
+    def test_sidecar_routes_are_documented_and_planned(self):
+        # the routes of sidecar DESIGN.md §7, §8 and §11. Each stays planned and
+        # out of the public api until a service serves it; the owner of a route
+        # moves it out of this list when it does.
+        expected = {
+            "/network/enroll": {"post"},
+            "/network/auth-keys": {"get", "post"},
+            "/network/auth-key-revoke": {"post"},
+            "/network/config/projection": {"get", "post"},
+            "/network/config/delta": {"post"},
+            "/network/config/reseed": {"post"},
+            "/acl/ack": {"post"},
+            "/acl/invite": {"post"},
+            "/acl/accept-invite": {"post"},
+            "/evs/v1/repos/{repo_id}": {"put", "get", "delete"},
+            "/evs/v1/repos/{repo_id}/restore": {"post"},
+            "/evs/v1/repos/{repo_id}/reseed": {"post"},
+            "/evs/v1/repos/{repo_id}/segments/{segment_id}": {"put"},
+            "/evs/v1/repos/{repo_id}/push": {"post"},
+            "/evs/v1/repos/{repo_id}/push/{push_id}/{part}": {"post"},
+            "/evs/v1/repos/{repo_id}/push/{push_id}/lease": {"post"},
+            "/evs/v1/repos/{repo_id}/path-epoch": {"post"},
+            "/evs/v1/repos/{repo_id}/path-epoch/block": {"post"},
+            "/evs/v1/repos/{repo_id}/read": {"post"},
+            "/evs/v1/repos/{repo_id}/refs": {"get"},
+            "/evs/v1/repos/{repo_id}/log": {"get"},
+            "/evs/v1/repos/{repo_id}/slots/delete": {"post"},
+            "/evs/v1/repos/{repo_id}/drops/preview": {"post"},
+            "/evs/v1/repos/{repo_id}/drops/preview/{preview_id}": {"get"},
+            "/evs/v1/repos/{repo_id}/drops": {"get"},
+            "/evs/v1/subscriptions": {"post", "get", "delete"},
+        }
+        methods = {"get", "put", "post", "delete", "patch"}
+        paths = self.spec["paths"]
+        for path, want in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+                item = paths[path]
+                self.assertEqual(want, methods & set(item))
+                for method in want:
+                    operation = item[method]
+                    self.assertTrue(operation["x-internal"])
+                    self.assertEqual("planned", operation["x-status"])
+                if path.startswith("/evs/"):
+                    self.assertEqual("https://evs.bringyour.com", item["servers"][0]["url"])
+                    for method in want:
+                        self.assertEqual([{"ServiceTokenAuth": []}], item[method]["security"])
+                else:
+                    self.assertNotIn("servers", item)
+        enroll = paths["/network/enroll"]["post"]
+        self.assertEqual([], enroll["security"])
+        args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
+        self.assertNotIn("bundle", args["properties"])
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

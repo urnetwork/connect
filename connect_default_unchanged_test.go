@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -250,8 +249,8 @@ func TestDefaultClientBatchesWrappedAndPlaintextTogether(t *testing.T) {
 	}
 }
 
-// The wire: a subprotocol frame's bytes and a transfer frame's framing are the
-// same, byte for byte. These goldens predate §11.
+// The wire: a subprotocol frame's bytes and a transfer frame's bytes are the same,
+// byte for byte, and the read loop's path parse agrees with them.
 func TestDefaultWireBytesAreUnchanged(t *testing.T) {
 	wrapped := wrapSubprotocolBytes(21842, []byte("hint"))
 	defer MessagePoolReturn(wrapped)
@@ -259,11 +258,7 @@ func TestDefaultWireBytesAreUnchanged(t *testing.T) {
 		t.Fatalf("subprotocol bytes %s, want %s", got, want)
 	}
 
-	path := TransferPath{
-		SourceId:      Id{1},
-		DestinationId: Id{2},
-	}
-	sourceBytes := strings.Repeat("00", 15)
+	path := TransferPath{SourceId: Id{1}, DestinationId: Id{2}}
 	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(&protocol.TransferFrame{
 		TransferPath: path.ToProtobuf(),
 		Pack: &protocol.Pack{
@@ -280,14 +275,14 @@ func TestDefaultWireBytesAreUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := hex.EncodeToString(wire); !strings.Contains(got, "01"+sourceBytes) || !strings.Contains(got, "02"+sourceBytes) {
-		t.Fatalf("transfer frame %s", got)
+	if got, want := hex.EncodeToString(wire), "0a240a1002000000000000000000000000000000121001000000000000000000000000000000222f0a1003000000000000000000000000000000121004000000000000000000000000000000180720012a05081e120178"; got != want {
+		t.Fatalf("transfer frame %s, want %s", got, want)
 	}
-	frame, err := FilteredTransferPath(wire)
+	parsed, err := FilteredTransferPath(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if frame != path {
-		t.Fatalf("path %s, want %s", frame, path)
+	if parsed != path {
+		t.Fatalf("path %s, want %s", parsed, path)
 	}
 }
