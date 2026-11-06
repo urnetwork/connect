@@ -15608,8 +15608,21 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					return receiveSequence
 				}
 				if headReceiveSequenceId := self.headReceiveSequenceIds[headKey]; headReceiveSequenceId != receiveSequenceId {
+					// The id's live sequence is not this pack's lane head: it
+					// opened on another lane (the lane flags are in the head key,
+					// not the id), and a sender never reuses an id across lanes.
+					// Drop the pack rather than judge the sequence, which its own
+					// exit removes.
 					self.mutex.Unlock()
-					panic(fmt.Errorf("[r]incorrect head sequence %s != %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
+					if self.log.V(1).Enabled() {
+						self.log.Infof(
+							"[r]drop pack of another lane for sequence %s (%s %s c=%t)\n",
+							receivePack.SequenceId, receivePack.Source,
+							receivePack.EncryptionRole, receivePack.EncryptionCompanion,
+						)
+					}
+					receivePack.messagePoolReturn()
+					return nil
 				}
 
 				// The shared receive pump passes a zero timeout. It must not wait
@@ -15657,8 +15670,12 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					return nil
 				}
 				if headReceiveSequenceId.SequenceId == receivePack.SequenceId {
+					// The id has no live sequence (looked up above), so an index
+					// naming it is stale. Heal it, as for a missing older head
+					// below, and open the sequence.
+					delete(self.headReceiveSequenceIds, headKey)
 					self.mutex.Unlock()
-					panic(fmt.Errorf("[r]upgrade older sequence %s = %s\n", headReceiveSequenceId.SequenceId, receivePack.SequenceId))
+					continue
 				}
 				if self.log.V(1).Enabled() {
 					self.log.Infof("[r]upgrade older sequence %s < %s (%s %s c=%t)\n",
