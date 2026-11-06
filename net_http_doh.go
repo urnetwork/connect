@@ -1873,6 +1873,9 @@ func (self *dohClient) queryResult(
 			return &dohQueryResult{
 				AddrTtls: mergedResult.AddrTtls,
 				Txts:     mergedResult.Txts,
+				// Keep an observed empty answer at our own fanout deadline.
+				// Caller cancellation retains the existing deadline outcome.
+				Miss: mergedResult.Miss && ctx.Err() == nil,
 			}
 		case result := <-receiveResults:
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)

@@ -81,6 +81,7 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 		}
 		update.stateLock.Unlock()
 		collapseBeforeLate := h.multiClient.TcpCollapseDropCount()
+		sourceFirst := discoveryDemandTestHoldAutomaticRetry(t, h, failedPath, update)
 		// Strictly after the empty snapshot, construction changes availability
 		// only. The next real source retransmit must reassert discovery demand.
 		time.Sleep(100 * time.Millisecond)
@@ -124,6 +125,7 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 			t.Fatal("late admission exceeded its original read/mint/custody budget")
 		}
 		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+		sourceFirst.requireHeld(t)
 		if !h.syn(failedPath) {
 			t.Logf("DISCOVERY_MANUAL_WINNER_SCALARS %v", discoveryDemandManualWinnerSnapshot(h, failedPath, update, originalOwner, originalSerial, originalCredit, collapseBeforeLate))
 			t.Fatal("original next SYN was not admitted")
@@ -131,6 +133,7 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 		if _, ok := h.synAck(failedPath); !ok || h.boundTo(failedPath) != h.channel("late") {
 			t.Fatal("newly available exit did not answer the unchanged connect attempt")
 		}
+		sourceFirst.requireManualWinnerAndRelease(t)
 		for index, path := range paths {
 			if h.boundTo(path) != owners[index] || owners[index].IsDone() || owners[index].isWarning() || owners[index].dialStarved() ||
 				!h.send(reraceSegment(path, uint32(4*len(payload)), payload)) || len(h.delivered(path)) != 6 {
