@@ -1731,6 +1731,9 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
+	// Frames a direct peer (P2P) route delivered that named the platform or
+	// this client as their source, dropped as forged.
+	ForgedSourceDropCount           uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
 	PackHandoffWaitCount            uint64
@@ -2136,6 +2139,7 @@ type Client struct {
 	// The shared receive pump remains nonblocking for H3/unknown. H1 may spend a
 	// separately configured bounded wait after a queue fills; primitive counters
 	// expose those rare waits and drops without a metrics handoff or hot log.
+	receiveForgedSourceDropCount           atomic.Uint64
 	receivePackHandoffDropCount            atomic.Uint64
 	receivePackHandoffDropByteCount        atomic.Uint64
 	receivePackHandoffWaitCount            atomic.Uint64
@@ -2542,6 +2546,7 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
+		ForgedSourceDropCount:                  self.receiveForgedSourceDropCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
@@ -4652,6 +4657,23 @@ func (self *Client) run() {
 		if path.IsStream() {
 			if self.log.V(1).Enabled() {
 				self.log.Infof("[cr] %s cannot route message with stream\n", self.clientTag)
+			}
+			MessagePoolReturn(transferFrameBytes)
+			continue
+		}
+		// A direct peer (P2P) route carries a stream peer's frames, never the
+		// platform's and never this client's own. A frame on one that names
+		// either as its source is forged: taken as control-plane or self
+		// traffic it would skip contract and session checks and drive
+		// platform-only control (stream setup, sequence close, transport
+		// migration). Other peer ids cannot be checked here, because a
+		// multihop endpoint knows only its adjacent hop (see §2.3 of
+		// audit/EVIDENCE.md).
+		if transportType == TransportTypeP2p &&
+			(path.SourceId == ControlId || path.SourceId == self.clientId) {
+			self.receiveForgedSourceDropCount.Add(1)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
 			}
 			MessagePoolReturn(transferFrameBytes)
 			continue

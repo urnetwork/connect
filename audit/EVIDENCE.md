@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Repository | `github.com/urnetwork/connect` |
-| Commit | `7dbcdd4cd6923e7d8c6b101f4ad0be53af89b61e` (2026-11-06), merged into `main`. It contains the fixes listed in §1.4. |
+| Commit | `5a71282c69b02d92be15738fb064fc9ad7a39bc8` (2026-11-06), which contains both sets of fixes in §1.4 |
 | Prepared | 2026-11-06 |
 | Toolchain | Go 1.27.3 (`go.mod`: `go 1.27.3`) |
 | Work packages | **WP1** connect protocol & data plane · **WP2** session encryption & peer identity |
@@ -78,7 +78,7 @@ oversights we are hiding; they are the areas we most want reviewed.
 |---|---|---|
 | L1 | The operator is the identity-key distributor. An operator that is malicious from a client's first contact, and consistent about it, can substitute keys ("Finding 2"). The signed history makes later substitution attributable; it does not prevent first-contact substitution. | §3.4.5, §4.3, `DESIGNNOTES2.md` §3, `DESIGNNOTES3.md` §8 |
 | L2 | Opportunistic mode is downgradable by design: anyone who can drop or alter `EncryptedControl` frames can force plaintext. Required exists for this reason. | §3.1, §4.1 |
-| L3 | The signed-history gate applies only under Required, and it falls back to the contract key when the history fetch errors (availability policy). | §3.4.5 |
+| L3 | The signed-history gate applies only under Required. When the history fetch errors, it accepts the contract key for an unpinned peer (availability policy), but refuses a key that contradicts a pin. | §3.4.5 |
 | L4 | AES-GCM uses random 96-bit nonces and there is no per-key invocation counter or volume/time rekey trigger. | §4.8.1 |
 | L5 | Some traffic is plaintext by design inside the transport: the control plane, `EncryptedControl` frames, acks, the outer routing header, and frame sizes and timing. | §3.8, §4.6 |
 | L6 | The seal always uses AES-GCM, so CPUs without AES instructions use Go's table-based software AES. | §4.4 |
@@ -89,15 +89,25 @@ The complete list, including the transport, storage and data-plane items
 
 ### 1.4 Fixes made while preparing this document
 
-Preparing this evidence surfaced three defects. They are fixed in the commit
-above (`7dbcdd4c`). Each has a regression test that fails on the previous code
-(`03e98fe5`).
+Preparing this evidence surfaced seven defects, fixed in two sets. Each has a
+regression test that fails on the code before its fix. The first set is
+commit `7dbcdd4c` (previous code `03e98fe5`):
 
 | Defect at `03e98fe5` | Fix | Evidence |
 |---|---|---|
 | `VerifyStoredContract` accepted the legacy contract MAC at any time. That tag is the contract bytes followed by `HMAC(key, "")`, a value of the key alone, so one legacy tag let its holder tag arbitrary contract bytes under the same provide key. | The legacy form verifies only before `NetworkEventTimeChangeHmac` (2026-09-01 by default), never with nil settings, and never for empty bytes. Neither function writes into the caller's spare capacity. | §5.3; `transfer_contract_hmac_test.go` |
 | A sealed inner frame without a transfer path made `Client.run` dereference nil. Any session peer could cancel the receiving client this way. | `TransferPathFromProtobuf` returns an error for a missing path, and the frame is dropped and audited. | §5.1; `TestSealedFrameWithoutInnerPathDoesNotStopTheClient` |
 | `ReceiveBuffer.Pack` panicked on the receive loop for a pack that reused a closing sequence's id under another lane, and asserted on a stale head index. Either one cancelled the client. | The pack is dropped and a stale index is healed. | §5.1; `TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient`, `TestReceiveBufferHealsAStaleHeadIndexForThePacksOwnId` |
+
+The second set is commit `5a71282c` (previous code `7dbcdd4c`, merged to
+`main` as `69967d8a`):
+
+| Defect at `7dbcdd4c` | Fix | Evidence |
+|---|---|---|
+| A P2P stream peer could send frames naming the platform (`ControlId`) or the receiving client as their source. The receive loop took them as control-plane or self traffic: no contract, no session, and platform-only handlers (stream open/close, sequence close, resident migration, peer list) acted on them. | A P2P-route frame naming either source is dropped and counted. | §2.3; `TestP2pRouteFrameClaimingPlatformOrSelfIsDropped` |
+| On a history-fetch error, the signed-identity gate accepted the contract key without consulting the peer's pin. An operator could answer with an error instead of with nothing to get a substituted key past a pinned peer. | A pinned peer whose contract key contradicts its pin is refused. An unpinned peer, or a pinned peer presenting its pinned key, still falls back. | §3.4.5; `TestSignedIdentityFetchErrorRefusesAChangedPinnedKey` |
+| Pin extension compared only the head, and only when it sat at the pinned generation. A validly signed chain that rewrote the pinned generation and appended one more passed as a rotation. | The pinned generation must still name the pinned key. | §3.4.5; `TestPinRefusesForkThatAdvancesPastThePinnedGeneration` |
+| The private-extender admission header compared its secret-keyed HMAC with `slices.Equal`, an early-exit comparison. | `hmac.Equal`. | §5.7; `extender/extender_secret_compare_test.go` |
 
 ---
 
@@ -145,22 +155,28 @@ platform runs the same `Client` code.
 ### 2.3 Where a frame's source identity comes from
 
 The receive loop reads the outer `TransferPath.SourceId` from the frame bytes
-(`transfer.go:4646-4666`). connect does not authenticate it cryptographically,
+(`transfer.go:4651-4688`). connect does not authenticate it cryptographically,
 and the route layer does not compare it with the transport that carried the
 frame. The code expects the route to have done source checks
-(`transfer.go:4642-4645`).
+(`transfer.go:4647-4650`).
 
 - For **sealed** frames, the AEAD key is bound to the peer's identity key by the
   identity proof (§3.4.3), and the sealed inner path must equal the outer path
-  (`transfer.go:4744-4774`). A frame that decrypts under a session for peer *X*
+  (`transfer.go:4766-4796`). A frame that decrypts under a session for peer *X*
   and carries *X*'s inner path is authenticated as *X*'s.
 - For **plaintext** frames (control plane, `EncryptedControl` frames, acks,
   Opportunistic-mode data before sealing), source attribution is only as strong
   as the transport that delivered the frame.
   - Frames relayed by the platform are attributed by the platform (server side,
     outside this repository).
-  - Frames arriving on a direct WebRTC P2P route reach the same receive loop
-    without a per-route source comparison (§5.4).
+  - On a direct WebRTC P2P route, a frame that names the platform
+    (`ControlId`) or this client as its source is dropped and counted
+    (`ClientReceiveStats.ForgedSourceDropCount`, `transfer.go:4664-4680`). A
+    peer route never carries either, and either would otherwise skip contract
+    and session checks.
+  - Other source ids on a P2P route are not compared with the peer at the far
+    end. A multihop stream endpoint knows only its adjacent hop, while
+    forwarded frames name the stream's origin (§5.4, L7).
 
 ---
 
@@ -182,8 +198,8 @@ frame. The code expects the route to have done source checks
   hold Opportunistic sends while a first handshake is in flight. It narrows the
   plaintext window; it does not close it.
 - Control-plane and self traffic never has a session in any mode
-  (`transfer_encrypt.go:3663-3686`; local guards at `transfer.go:7434-7450` and
-  `transfer.go:16283-16294`).
+  (`transfer_encrypt.go:3663-3686`; local guards at `transfer.go:7456-7472` and
+  `transfer.go:16305-16316`).
 
 ### 3.2 Key agreement: TLS 1.3 inside the transfer protocol
 
@@ -216,16 +232,16 @@ input; connect's own call sites use the defaults.
 `net.Conn` (`sequenceTlsTransport`, `transfer_encrypt.go:158-275`). Bytes the
 state machine writes are drained by `outboxLoop` (`:1626-1682`) into
 `EncryptedControl{Handshake}` messages. They are queued through
-`SendBuffer.SendEncryptedControl` (`transfer.go:6532`) with
-`ForceUnwrapped: true` (`transfer.go:6602`), so every send and resend of a
+`SendBuffer.SendEncryptedControl` (`transfer.go:6554`) with
+`ForceUnwrapped: true` (`transfer.go:6624`), so every send and resend of a
 handshake frame stays plaintext (`DESIGNNOTES.md` §3.5).
 
 Inbound handshake frames are delivered in two ways:
 
 - **In order:** `ReceiveSequence.deliverEncryptedControlFrames`
-  (`transfer.go:18374-18403`) → `EncryptionSessionManager.DeliverEncryptedControl`
+  (`transfer.go:18396-18425`) → `EncryptionSessionManager.DeliverEncryptedControl`
   → `deliverHandshake` (`transfer_encrypt.go:2380-2445`).
-- **Optimistically** from the receive loop (`transfer.go:4931-4991`), but only
+- **Optimistically** from the receive loop (`transfer.go:4953-5013`), but only
   for a TLS-server session in the window between sending its flight and
   receiving the client `Finished`, only for record types 20 or 23 (never a
   ClientHello), and only for the exact epoch id
@@ -254,21 +270,21 @@ not send `close_notify` (`transfer_encrypt.go:2996-3005`).
 | Wire | Outer `TransferFrame{transfer_path (clear), encryptedTransferFrame = nonce ‖ ct ‖ tag, session_role?, session_companion?}` | `protocol/transfer.proto:37-60` |
 | Open | Rejects input shorter than nonce + tag; GCM verifies before any plaintext is returned; the pooled buffer is released on failure | `transfer_encrypt.go:314-331` |
 
-**Receive side.** `Client.unwrapFrame` (`transfer.go:2483-2518`) chooses the
+**Receive side.** `Client.unwrapFrame` (`transfer.go:2487-2522`) chooses the
 candidate local sessions from the unauthenticated `session_role` and
 `session_companion` hints. Those hints only select which keys to try; a wrong
 hint simply fails authentication. Each candidate's `[established, prior]`
 ciphers are tried (`transfer_encrypt.go:2922-2938`). The call is wait-free; on
-failure the frame is dropped (`transfer.go:4718-4741`).
+failure the frame is dropped (`transfer.go:4740-4763`).
 
 **Inner/outer path check.** After decryption the inner frame is decoded, and its
 `TransferPath` (source, destination and stream) must equal the outer path. A
 mismatch drops the frame and records a bad message in the peer audit
-(`transfer.go:4744-4774`). This defeats re-routing and reflection of a sealed
+(`transfer.go:4766-4796`). This defeats re-routing and reflection of a sealed
 frame under a modified outer header.
 
 **Acks.** Acks are sealed with the receive sequence's session when the acked
-data arrived sealed (`transfer.go:16962-16984`); see §3.8 for plaintext acks.
+data arrived sealed (`transfer.go:16984-17006`); see §3.8 for plaintext acks.
 
 ### 3.4 Peer identity binding
 
@@ -297,15 +313,15 @@ data arrived sealed (`transfer.go:16962-16984`); see §3.8 for plaintext acks.
 - Contracts carry `destination_client_public_key`, `provide_tls_certificate` and
   `destination_client_key_signed_tls_certificate`. The values inside the
   platform-HMAC'd `StoredContract` are preferred; the outer `Contract` copy is
-  used only when the stored value is empty (`transfer.go:19034-19054`). Both
-  are passed to the session on every contract (`transfer.go:11935-11957`).
+  used only when the stored value is empty (`transfer.go:19056-19076`). Both
+  are passed to the session on every contract (`transfer.go:11957-11979`).
 - `AddTrustedPeerCertChain` admits a chain only if its signature verifies under
   the committed peer key; otherwise the chain is dropped and logged
   (`transfer_encrypt.go:3064-3135`).
 - Before the first sealed write on a non-companion send sequence,
   `verifyPeerCertAgainstContract` requires the established epoch's peer leaf to
   match a trusted certificate by exact DER
-  (`transfer.go:14665-14739`, `transfer_encrypt.go:4310-4347`). An empty
+  (`transfer.go:14687-14761`, `transfer_encrypt.go:4310-4347`). An empty
   trusted set skips the check without latching. This is deliberate; the
   identity proof below is the binding control (`DESIGNNOTES.md` §3.6).
 
@@ -337,7 +353,7 @@ data arrived sealed (`transfer.go:16962-16984`); see §3.8 for plaintext acks.
 
 #### 3.4.4 Where the peer's key comes from
 
-- **From contracts** (`transfer.go:11950-11953`), stored value preferred (§3.4.2).
+- **From contracts** (`transfer.go:11972-11975`), stored value preferred (§3.4.2).
   Contracts reach the sender from the platform API: `POST
   {apiUrl}/connect/control`, authenticated with the client JWT, over the pinned
   platform TLS (`transfer_contract_manager.go:1984`, `api.go:508`; §5.3, §5.4).
@@ -378,13 +394,18 @@ Implemented in `transfer_key_history.go` (verifier) and
   predecessor's content hash (not its signing digest), the same domain, client
   and network, a genuine change, and a non-regressing effective boundary
   (`:321-353`).
-- The history must name the requested client (`:445-448`). Every generation's
-  signer must be authorised by the pinned set or the peer pin (`:489-506`). A
-  tombstoned head is rejected (`:466-472`). The history length is bounded by
+- The history must name the requested client (`:446-449`). Every generation's
+  signer must be authorised by the pinned set or the peer pin (`:491-508`). A
+  tombstoned head is rejected (`:468-474`). The history length is bounded by
   `MaxClientKeyHistoryGenerations` (default 64, `transfer_encrypt.go:803-809`;
   check at `:430-433`).
+- Against a pin, the chain must reach the pinned generation, and that
+  generation must still name the pinned key (`:510-533`). A rotation appends
+  generations; a chain that rewrites the pinned generation is refused even
+  when it also advances past it.
 
-**Decision table** (`transfer_key_history_session.go:180-258`):
+**Decision table** (`transfer_key_history_session.go:205-276`, fetch errors
+`:175-203`):
 
 | Evidence | Outcome |
 |---|---|
@@ -394,22 +415,21 @@ Implemented in `transfer_key_history.go` (verifier) and
 | No history, and the peer was previously pinned | **Terminal reject** (per-peer ratchet) |
 | No history, and the operator has served signed history before | **Terminal reject** (per-operator ratchet) |
 | No history, and nothing has ever been pinned | Accept (unsigned path) |
-| Fetch **error** | Accept the contract key (availability, `DESIGNNOTES3.md` §5.3) — unless the checked pin store itself errors, which is terminal (`:152-175`) |
+| Fetch **error**, peer pinned, contract key differs from the pin | **Terminal reject**: a pinned key may change only through a signed rotation, which an unavailable history cannot show |
+| Fetch **error**, otherwise | Accept the contract key (availability, `DESIGNNOTES3.md` §5.3) — unless the checked pin store itself errors, which is terminal |
 
 A terminal rejection cancels the epoch and emits
-`EncryptionEventKeyIdentityRejected` (`:262-301`, `:314-319`).
+`EncryptionEventKeyIdentityRejected` (`:280-319`, `:332-337`).
 
 **Limits we want reviewed (L1, L3):**
 
 - The scheme is enforced only under Required (`:100-111`).
 - With an empty `TrustedClientKeySigners`, the first verified chain is trusted
-  on first use (`transfer_key_history.go:500-503`).
-- The fetch-error branch accepts the contract key without consulting the peer
-  pin (`transfer_key_history_session.go:152-175`).
-- Pin extension refuses rewinds and a different key at the *same* generation
-  (`transfer_key_history.go:508-521`). A chain whose head is past the pinned
-  generation is treated as a rotation; it is not checked that the pinned
-  generation still carries the pinned key.
+  on first use (`transfer_key_history.go:502-505`).
+- An unpinned peer's contract key is accepted when the history fetch errors.
+- A pin records the key at one generation, not the content hash of the pinned
+  record. A chain that keeps the pinned key but rewrites other fields of the
+  pinned or earlier generations passes.
 - A single operator that is malicious from first contact signs one coherent
   chain and is not detected (`DESIGNNOTES3.md` §8).
 
@@ -464,10 +484,10 @@ certificate, the epoch fails closed (`:1514-1525`). Test:
 
 | Gate | What it does | Evidence |
 |---|---|---|
-| Send entry gate | Before a sequence number is assigned, an application pack waits for `Cipher() != nil` within the caller's budget. A budget of `0` or an exhausted budget refuses with `ErrEncryptionRequiredNotEstablished`: unsent, never plaintext. Handshake controls (`ForceUnwrapped`) pass. A parked sender nudges the client-role handshake to retry. | `transfer.go:7803-7925`; error `transfer_encrypt.go:500-508` |
-| Write backstop | An application frame that reaches the writer without a cipher is refused, not written in plaintext | `transfer.go:14469-14482` |
-| Contract-control pin | A contract-only open pack generated inside the sequence is pinned plaintext while the cipher is down, so establishment is never wedged behind it. A data-bearing head never gets this exemption. | `transfer.go:14456-14464`; `transfer_encrypt.go:2907-2920` |
-| Receive gate (ack-and-discard) | Plaintext application frames from a session-expected peer are discarded after `EncryptedControl` frames are routed to the session. The item still advances and is acked; a peer-audit bad message is recorded. | `transfer.go:18230-18259` |
+| Send entry gate | Before a sequence number is assigned, an application pack waits for `Cipher() != nil` within the caller's budget. A budget of `0` or an exhausted budget refuses with `ErrEncryptionRequiredNotEstablished`: unsent, never plaintext. Handshake controls (`ForceUnwrapped`) pass. A parked sender nudges the client-role handshake to retry. | `transfer.go:7825-7947`; error `transfer_encrypt.go:500-508` |
+| Write backstop | An application frame that reaches the writer without a cipher is refused, not written in plaintext | `transfer.go:14491-14504` |
+| Contract-control pin | A contract-only open pack generated inside the sequence is pinned plaintext while the cipher is down, so establishment is never wedged behind it. A data-bearing head never gets this exemption. | `transfer.go:14478-14486`; `transfer_encrypt.go:2907-2920` |
+| Receive gate (ack-and-discard) | Plaintext application frames from a session-expected peer are discarded after `EncryptedControl` frames are routed to the session. The item still advances and is acked; a peer-audit bad message is recorded. | `transfer.go:18252-18281` |
 | Rekey continuity | No plaintext window during rekeys | `transfer_encrypt.go:2828-2840` |
 | Observability | Edge-triggered `EncryptionEvent`s and `PeerEncryptionStates` (sealed, establishing, negotiated group, failure reason) | `transfer_encrypt.go:510-580`, `:4010-4116` |
 | Candidate prefilter | Under Required, a provider for which the key API positively reports *no* key is rejected; fetch errors never reject | `ip_remote_multi_client.go:17360-17364` |
@@ -480,8 +500,8 @@ explained in `DESIGNNOTES2.md` §8.1–§8.2.
 | Surface | Why | Evidence |
 |---|---|---|
 | Control-plane traffic to or from `ControlId` (the platform) | The platform terminates control traffic itself; no session is ever created for `Id{}` | `transfer_encrypt.go:3663-3686`, `:3698-3700` |
-| `EncryptedControl` frames: handshake bytes, identity proofs, unknown-wrap nacks | They bootstrap the cipher; they are pinned plaintext on every send and resend | `transfer.go:6602`. The identity proof is a signature over an exporter value under a label distinct from the AEAD key's, so publishing it does not expose the AEAD key (§4.8.3). |
-| Acks | An ack mirrors the sealed state of the data it acknowledges. The ack receive path accepts plaintext acks in every mode, so ack integrity is transport-level. A forged ack can cause loss or stall, not disclosure. | `transfer.go:16962-16984`, `:4860-4903` |
+| `EncryptedControl` frames: handshake bytes, identity proofs, unknown-wrap nacks | They bootstrap the cipher; they are pinned plaintext on every send and resend | `transfer.go:6624`. The identity proof is a signature over an exporter value under a label distinct from the AEAD key's, so publishing it does not expose the AEAD key (§4.8.3). |
+| Acks | An ack mirrors the sealed state of the data it acknowledges. The ack receive path accepts plaintext acks in every mode, so ack integrity is transport-level. A forged ack can cause loss or stall, not disclosure. | `transfer.go:16984-17006`, `:4882-4925` |
 | Opportunistic-mode traffic before sealing | Policy (L2) | §3.1 |
 | Outer header: `TransferPath` (source, destination, stream ids), `session_role` / `session_companion` hints | Needed for routing and session selection | `protocol/transfer.proto:37-60` |
 | Sizes and timing | No padding: ciphertext length = plaintext length + 28 bytes | `transfer_encrypt.go:309`, `:344` |
@@ -617,7 +637,7 @@ again within the full-suite run on the fixed code (§10). The command is in §10
   recovery over public data (`transfer_key_history.go:270-304`). There is no
   secret-dependent timing.
 - **Comparisons in the seal** use `bytes.Equal` on public values only: public
-  keys (`transfer_encrypt.go:2215`, `:2282`; `transfer_key_history_session.go:237`)
+  keys (`transfer_encrypt.go:2215`, `:2282`; `transfer_key_history_session.go:255`)
   and certificate DER (`transfer_encrypt.go:4333`). No secret value (AEAD key,
   exporter) is compared; the exporter is only signed, and signatures are only
   verified.
@@ -684,12 +704,12 @@ shuffling and censorship-evasion shaping. Uses that touch the wire or a check:
 ### 4.7 DoS vectors in the seal
 
 - **The receive loop never blocks on TLS state.**
-  - Unwrap is wait-free (`transfer.go:4709-4741`).
+  - Unwrap is wait-free (`transfer.go:4731-4763`).
   - Optimistic delivery only appends to an in-memory inbox, and only in the
     narrow server window (`transfer_encrypt.go:2958-2994`, `:2603-2664`).
   - The historical blocking wait was removed (`DESIGNNOTES.md` §3.5).
 - **Bounded work per frame:** at most 4 sessions × 2 ciphers = 8 AEAD-open
-  attempts for a frame with no hints (`transfer.go:2494-2516`).
+  attempts for a frame with no hints (`transfer.go:2498-2520`).
 - **Rate limits and single-flight:**
   - nack emission 1/s per session, restart cooldown 5 s (§3.9);
   - out-of-band key fetch and history fetch: single-flight, 1/s
@@ -817,12 +837,12 @@ hand-rolled, allocation-free reader of the outer path.
   and checks for errors at every step.
 - Ids must be exactly 16 bytes (`:765-767`).
 - The outer path is skipped. The inner (sealed) path is decoded only for sealed
-  frames (`transfer.go:4674`, `:4747`).
+  frames (`transfer.go:4696`, `:4769`).
 - Inner `Pack`/`Ack` bodies use `proto.Unmarshal`, which copies byte fields
   (`message_pool.go:1395-1397`).
-- A `TransferFrame` must carry exactly one of pack or ack (`transfer.go:4845-4858`).
+- A `TransferFrame` must carry exactly one of pack or ack (`transfer.go:4867-4880`).
 - Some narrowing conversions are validated afterwards: logical lane ≤ 8
-  (`transfer.go:15547`) and session role (`transfer_encrypt.go:135-143`).
+  (`transfer.go:15569`) and session role (`transfer_encrypt.go:135-143`).
 
 **Robustness tests** (all pass on this commit):
 
@@ -840,12 +860,12 @@ Inputs that reach the loop's own assertions are handled without one:
 
 - A sealed inner frame without a transfer path fails the inner/outer path check
   and is dropped and audited. `TransferPathFromProtobuf` refuses a missing path
-  (`connect.go:81-96`, used at `transfer.go:4761`). Test:
+  (`connect.go:81-96`, used at `transfer.go:4783`). Test:
   `TestSealedFrameWithoutInnerPathDoesNotStopTheClient`.
 - In `ReceiveBuffer.Pack`, a pack that reuses a live sequence id under another
   lane (force-stream / companion-contract flags) is dropped
-  (`transfer.go:15610-15626`). A stale head index naming the pack's own id is
-  healed (`transfer.go:15672-15679`). Tests:
+  (`transfer.go:15632-15648`). A stale head index naming the pack's own id is
+  healed (`transfer.go:15694-15701`). Tests:
   `TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient`,
   `TestReceiveBufferHealsAStaleHeadIndexForThePacksOwnId`
   (`transfer_receive_loop_crash_test.go`).
@@ -856,10 +876,10 @@ Inputs that reach the loop's own assertions are handled without one:
 
 - Sequence numbers are `uint64` (`protocol/transfer.proto:95`).
 - A head pack may advance the receiver's next sequence number forward, for
-  receiver reform (`transfer.go:17758-17767`).
+  receiver reform (`transfer.go:17780-17789`).
 - Within a live `ReceiveSequence`:
   - an ack-mode pack below the next sequence number is dropped and re-acked
-    (`transfer.go:17829-17833`);
+    (`transfer.go:17851-17855`);
   - the next number is delivered exactly once (`:17816-17818`);
   - later numbers are held until the gap fills.
 - The guarantee is therefore **at-most-once per sequence number for the lifetime
@@ -869,12 +889,12 @@ Inputs that reach the loop's own assertions are handled without one:
 replay window, §4.2):
 
 - **No-ack packs are not deduplicated.** Each copy is delivered if its contract
-  has room (`ReceiveSequence.receiveNack`, `transfer.go:18074-18170`).
+  has room (`ReceiveSequence.receiveNack`, `transfer.go:18096-18192`).
 - **After a `ReceiveSequence` is removed** (idle 120 s, gap 60 s:
   `transfer.go:1066-1071`), a later pack for the same sequence id creates a new
-  sequence (`transfer.go:15732-15751`).
+  sequence (`transfer.go:15754-15773`).
   - Only sequences that failed contract checks are tombstoned, in a FIFO capped
-    at 1024 (`transfer.go:15370`, `:15500-15512`, `:15522-15530`).
+    at 1024 (`transfer.go:15392`, `:15522-15534`, `:15544-15552`).
   - A replayed head pack with its full contract frame passes the MAC, path and
     expiry checks again and is delivered; the contract is debited from zero in
     the new sequence.
@@ -884,15 +904,15 @@ replay window, §4.2):
     (§3.6);
   - the sealed inner path pins source and destination (§3.3);
   - a newer live sequence for the same head key drops older ids
-    (`transfer.go:15654-15659`).
+    (`transfer.go:15676-15681`).
 
 **Acks.**
 
 - An ack is routed to the send sequence by sequence id and must come from that
-  sequence's destination (`transfer.go:6659-6660`, `:8242`).
+  sequence's destination (`transfer.go:6681-6682`, `:8264`).
 - An ack for a message id that is not retained never advances delivery
   (`transfer_ack_identity.go:39`).
-- Acks are cumulative (`transfer.go:13944-14035`).
+- Acks are cumulative (`transfer.go:13966-14057`).
 - Plaintext acks are accepted in every encryption mode (§3.8).
 
 ### 5.3 Contracts: authorization and accounting
@@ -907,7 +927,7 @@ provide mode, up to a byte count, optionally until an expiry.
 - The key is therefore shared between the provider and the platform.
 
 **Provider-side verification** happens for every contract frame that reaches
-the delivery head (`ReceiveSequence.registerContracts`, `transfer.go:18406-18482`):
+the delivery head (`ReceiveSequence.registerContracts`, `transfer.go:18428-18504`):
 
 1. `ContractManager.Verify` (`transfer_contract_manager.go:1601-1626`).
    - It selects the key by the wrapper's `provide_mode`. The mode is bound
@@ -931,12 +951,12 @@ the delivery head (`ReceiveSequence.registerContracts`, `transfer.go:18406-18482
      `TestStoredContractHmacLeavesCallerBytesUntouched`,
      `TestContractManagerRefusesForgedLegacyContract`.
 2. The stored path must be `(sequence source, local client)`
-   (`transfer.go:18465-18472`).
-3. The contract must not have expired (`transfer.go:18473-18482`).
+   (`transfer.go:18487-18494`).
+3. The contract must not have expired (`transfer.go:18495-18504`).
 
 On failure: the sequence exits, retransmits of that sequence id are rejected
 (tombstoned), and a bad contract is recorded in the peer audit
-(`transfer.go:18424-18472`).
+(`transfer.go:18446-18494`).
 
 **Sender-side trust.**
 
@@ -956,17 +976,17 @@ On failure: the sequence exits, retransmits of that sequence id are rejected
   (`protocol/transfer.proto:595`).
 - Conversions:
   - The signed size is converted without a range check
-    (`transfer.go:19071`).
+    (`transfer.go:19093`).
   - The admission bound is `ByteCount(float32(size) * fillFraction)`
-    (`transfer.go:19072`). The fill fraction is 1.0 on receive
-    (`transfer.go:18454`) and 0.9 on send (`transfer.go:994`).
+    (`transfer.go:19094`). The fill fraction is 1.0 on receive
+    (`transfer.go:18476`) and 0.9 on send (`transfer.go:994`).
   - float32 has a 24-bit significand, so sizes above 16 MiB round by up to a
     relative 2⁻²⁴. The default contract sizes, 1 MiB and 128 MiB, are exact.
 - Receive-side check: `acked + unacked + max(minUpdate, n) <= effective`
-  (`transfer.go:19091-19093`). It counts message-frame bytes per pack (minimum 1
+  (`transfer.go:19113-19115`). It counts message-frame bytes per pack (minimum 1
   byte, `transfer.go:1098`) and debits at the delivery head.
 - Underflow of the unacked counter panics, recovered per sequence
-  (`transfer.go:19176-19178`).
+  (`transfer.go:19198-19200`).
 - Counters are per sequence; there is no cross-sequence ledger on the receive
   side (see the replay note in §5.2).
 - Other floats (`transfer_contract_retry.go:42`, pacing, scoring) do not gate
@@ -1035,7 +1055,7 @@ decided server-side, outside this repository. Mobile builds use `Dial`.
   - A manually configured extender without a key has an unauthenticated outer
     layer (`net_extender.go:164-166`).
   - Private extenders admit a client only with an HMAC header
-    (`extender/extender.go:1461-1477`, §5.7).
+    (`extender/extender.go:1457-1479`, §5.7).
 - **VLESS/REALITY:**
   - The inner platform TLS is pinned (`vless_dial.go:128-146`).
   - The outer TLS honours the link's `allowInsecure` (`vless.go:417`). The uTLS
@@ -1056,9 +1076,11 @@ decided server-side, outside this repository. Mobile builds use `Dial`.
   key.
 - The send side selects the P2P route by destination peer
   (`transport_p2p.go:1734-1746`).
-- The receive side delivers frames into the client's receive loop without a
-  per-route source comparison (`P2pReceiveTransport.MatchesReceive`,
-  `transport_p2p.go:2345-2347`). Source attribution follows §2.3.
+- The receive side delivers frames into the client's receive loop
+  (`P2pReceiveTransport.MatchesReceive`, `transport_p2p.go:2345-2347`). There,
+  a P2P-route frame naming the platform or this client is dropped. Other source
+  ids are not compared with the far-end peer, because a multihop endpoint knows
+  only its adjacent hop (§2.3).
 
 ### 5.5 IP/TUN data plane
 
@@ -1114,15 +1136,15 @@ for 30 s on the audited commit. No crashers were found; they executed about
   (`transfer_contract_manager.go:1648-1654`).
 - An item is admitted without a contract only when `ReceiveNoContract(source)`
   holds. Otherwise it must debit an open, unexpired contract
-  (`ReceiveSequence.updateContract`, `transfer.go:18717-18743`). Items admitted
+  (`ReceiveSequence.updateContract`, `transfer.go:18739-18765`). Items admitted
   without a contract are delivered with `ProvideMode_Network`
-  (`transfer.go:18208-18225`).
+  (`transfer.go:18230-18247`).
 - A frame addressed to another client is passed only to registered forward
-  callbacks (`transfer.go:4426-4445`, `:5048-5069`). connect registers none
+  callbacks (`transfer.go:4431-4450`, `:5070-5091`). connect registers none
   itself: `AddForwardCallback` has no non-test caller in this repository.
 - Network-mode `roles` and `principal` are read only from the MACed stored
-  contract bytes (`transfer.go:19056-19062`). They are surfaced to receive
-  callbacks as `Peer.Roles` / `Peer.Principal` (`transfer.go:18208-18217`).
+  contract bytes (`transfer.go:19078-19084`). They are surfaced to receive
+  callbacks as `Peer.Roles` / `Peer.Principal` (`transfer.go:18230-18239`).
   connect makes no authorization decision on them itself; the embedding code
   does.
 
@@ -1158,12 +1180,12 @@ in the shared message pool.
 - The ownership rules are written down in `message_pool.go:26-38` and
   `README.md` ("Buffer reuse"). A use-after-return would show one owner's bytes
   to another; we consider this the highest-value memory-safety review target.
-- `DebugTransferCopyOnWrite` exists as a diagnostic (`transfer.go:14499-14504`).
+- `DebugTransferCopyOnWrite` exists as a diagnostic (`transfer.go:14521-14526`).
 
 **Panics from malformed input.**
 
 - The client's receive loop runs as `HandleError(client.run, cancel)`
-  (`transfer.go:2420`). `HandleError` recovers the panic, logs it with a stack,
+  (`transfer.go:2424`). `HandleError` recovers the panic, logs it with a stack,
   and runs the handlers (`trace.go:58-97`).
 - Session workers are wrapped the same way (`transfer_encrypt.go:1241-1247`).
 - So a remotely triggerable panic cancels the whole client: a client-wide denial
@@ -1176,7 +1198,7 @@ in the shared message pool.
 |---|---|---|
 | Stored-contract HMAC | `hmac.Equal` | `transfer_contract_manager.go:316`, `:324` |
 | REALITY short id; REALITY certificate HMAC | `subtle.ConstantTimeCompare`; `hmac.Equal` | `extender_reality.go:196`, `:214`; `vless_reality.go:133` |
-| Private-extender header HMAC | **`slices.Equal` (not constant-time)** | `extender/extender.go:1461-1477` |
+| Private-extender header HMAC | `hmac.Equal` | `extender/extender.go:1457-1479`; `extender/extender_secret_compare_test.go` |
 | SCTP state cookie (upstream pion code) | `bytes.Equal` | `sctp/association.go:2352`, `:2356` |
 | Platform auth echo; H3 datagram JWT echo | `bytes.Equal` / `!=` against the server's echo of the client's own token | `transport.go:2597`; `transport_h3_datagram.go:189` |
 
@@ -1209,12 +1231,12 @@ The seal compares only public values (§4.4).
 | Logic bugs and authentication flaws; crashes and memory corruption | Cipher-exposure state machine and fail-closed gates; contract verification; decoder robustness; memory-safety surfaces | 3.5, 3.7, 5.1, 5.3, 5.7 |
 | Functional correctness of designs, implementations and algorithms | TLS 1.3 exporter-keyed AES-256-GCM; Ed25519 binding; signed-history verifier | 3, 4.8 |
 | Attacks from current academic research | Random-nonce GCM bounds; PQ hybrid and downgrade resilience; exporter-bound authentication (unknown key-share, reflection); cross-protocol signature reuse | 4.8, 4.1, 4.3 |
-| Timing attacks; constant-time operations | Go stdlib primitives; hardware AES where available (L6); `hmac.Equal` for contract MACs; one non-constant-time HMAC compare on the private-extender path | 4.4, 5.7 |
+| Timing attacks; constant-time operations | Go stdlib primitives; hardware AES where available (L6); `hmac.Equal` / `subtle` for every secret-keyed MAC compared against peer input | 4.4, 5.7 |
 | Random-number generation | `crypto/rand` for all keys, nonces and secrets; `math/rand` only for identifiers, jitter and shaping | 4.5 |
 | Side channels, information leaks, secure storage and data processing | Metadata, sizes and timing visible to relays; no zeroization; logging review | 4.6, 8 |
 | DoS vectors, information leakage, logic bugs | Wait-free receive loop; rate limits on handshake recovery; bounded trial decryption | 4.7, 5.1, 5.2 |
 | Numeric values and floating point | Byte accounting is `int64`, with an unchecked conversion and a float32 bound (L21). Floats elsewhere only pace and score. | 5.3 |
-| Third-party integrations and dependencies | Direct dependency inventory; in-tree and sibling forks; govulncheck rerun required | 7 |
+| Third-party integrations and dependencies | Direct dependency inventory; in-tree and sibling forks; `govulncheck`: no reachable vulnerabilities | 7 |
 
 ## 7. Third-party dependencies and supply chain
 
@@ -1251,10 +1273,14 @@ The seal compares only public values (§4.4).
 - The most recent dependency security update is `golang.org/x/net` v0.62.0
   (commit `8649d2e3`, merged in `f2fd021c`), for GO-2026-6603, -6610, -6611,
   -6612 and -6617.
-- **`govulncheck`** was not run for this document. The `govulncheck` v1.6.0
-  available when it was prepared was built with Go 1.26 and cannot load this
-  Go 1.27 module ("package requires newer Go version go1.27"). A
-  `govulncheck` built with Go ≥ 1.27 runs as shown in §10.
+- **`govulncheck`** v1.9.0 (built with Go 1.27.3; vulnerability database
+  updated 2026-11-05), run on `./...` at `69967d8a` (`7dbcdd4c` merged into
+  `main`):
+  - Symbol level: **no vulnerabilities in code this module calls.**
+  - Module level: one entry, GO-2026-5932, which marks the deprecated
+    `golang.org/x/crypto/openpgp` package as unsafe. connect does not import
+    it; from `golang.org/x/crypto` it uses only `sha3` and `cryptobyte`.
+  - The second set of fixes (§1.4) changes no dependencies.
 - No cgo is used by the seal; see §5.7 for `unsafe`/assembly/cgo across the
   repository.
 
@@ -1331,13 +1357,13 @@ here so it is an explicit decision.
 | P2P message / receive queue | 64 KiB / 256 messages and 256 KiB | `transport_p2p.go:186-193`, `:42-104`; pion `MaxMessageSize` 64 KiB (`transport_p2p_webrtc.go:863`) |
 | HTTP response / DoH response | 2 MiB / 16 KiB | `net_http.go:63`, `:1306-1312`; `net_http_doh.go:43` |
 | Per-sequence receive queue | ≤ 2.5 MiB (memory-scaled), ≤ 4 open receive contracts | `transfer.go:1063-1115` |
-| Logical lanes | ≤ 8, validated on receive | `transfer_logical_lane.go:8`; `transfer.go:15547` |
+| Logical lanes | ≤ 8, validated on receive | `transfer_logical_lane.go:8`; `transfer.go:15569` |
 | Live stream sequences / stream authorizations / capability records | 1024 / 4096 and 128 / 1024 | `transfer_stream_manager.go:510`; `transfer_stream_authorization.go:20-21`; `transfer_peer_capability_observation.go:40` |
 
 **No count cap (we want this reviewed):**
 
 - the number of distinct receive sequences (sources) per client
-  (`transfer.go:15345-15352`, `:15383`, `:15748`);
+  (`transfer.go:15367-15374`, `:15405`, `:15770`);
 - the number of encryption sessions (§4.7);
 - the per-epoch TLS inbox byte size (§4.7);
 - provider NAT flow tables when no memory target is set. "No target: unlimited
@@ -1360,15 +1386,15 @@ is described.
 | L4 | Random-nonce AES-GCM with no per-key invocation counter or volume/time rekey; one key serves both directions of a session | Open — review requested | §4.8.1 |
 | L5 | Plaintext surfaces inside the transport: the control plane, `EncryptedControl` frames, acks (accepted plaintext in every mode), the outer routing header, sizes and timing | By design | §3.8, §4.6 |
 | L6 | AES-GCM only. CPUs without AES instructions use table-based software AES. | Open — review requested | §4.4 |
-| L7 | Plaintext-frame source attribution is transport-level: connect does not authenticate `TransferPath.SourceId` of plaintext frames, and direct P2P routes do no per-route source comparison | By design for platform-relayed frames; P2P open — review requested | §2.3, §5.4 |
+| L7 | Plaintext-frame source attribution is transport-level: connect does not authenticate `TransferPath.SourceId` of plaintext frames. On P2P routes, frames naming the platform or this client are dropped, but other peer ids are not compared with the far-end peer (a multihop endpoint knows only its adjacent hop). | By design for platform-relayed frames. P2P: platform and self spoofing fixed (§1.4); per-peer binding open — review requested | §2.3, §5.4 |
 | L8 | No post-quantum-only policy; X25519 is accepted for peers without the hybrid | Follow-up (`DESIGNNOTES2.md` §8.4) | §4.1 |
 | L9 | X.509 validity, KeyUsage and EKU are not enforced on seal certificates (identity comes from the Ed25519 binding) | By design | §3.2, §4.8.6 |
 | L10 | No count caps on sessions or receive sequences per client, and no byte cap on the per-epoch TLS inbox. Provider NAT tables are unbounded without a memory target. | Open — review requested | §4.7, §8.4 |
 | L11 | Secret key material is not zeroized | Accepted, recorded | §8.3 |
 | L12 | Contract stores hold contract HMACs in plaintext, integrity-protected by content digests and signatures only | Accepted, recorded | §8.1 |
 | L13 | Always-on logging of stale-DNS query domains (`net_http_doh.go:1036`) | Open | §8.2 |
-| L14 | Private-extender admission header: HMAC compared with `slices.Equal` (not constant-time); timestamp and nonce are MACed but not checked for freshness (`extender/extender.go:1461-1477`) | Open | §5.7 |
-| L15 | `govulncheck` not run for this document (the available build targets Go 1.26) | Not run | §7, §10 |
+| L14 | Private-extender admission header: timestamp and nonce are MACed but not checked for freshness, so a captured header can be replayed (`extender/extender.go:1457-1479`). The HMAC comparison is now constant-time (§1.4). | Freshness open | §5.7 |
+| L15 | `govulncheck`: no reachable vulnerabilities; one module-level entry (GO-2026-5932, `golang.org/x/crypto/openpgp`), a package connect does not import | Resolved | §7, §10 |
 | L16 | Comment drift in seal files | Documentation | §4.9 |
 | L17 | Replay at the sequence layer: no dedupe for no-ack packs; a removed `ReceiveSequence` can be re-opened by a replayed head pack carrying its contract; the seal itself has no replay window | Open — review requested | §4.2, §5.2 |
 | L18 | Desktop/server H3 dials use `DialEarly`, so the JWT auth message can be 0-RTT data when resuming; acceptance is server-side | Open — review requested | §5.4 |
@@ -1396,7 +1422,8 @@ go test -count=1 -timeout 40m -v -run "^(${names})\$" .
 go test -count=1 -run 'TestDecodeTransferFrame|TestFrameCodec|TestAckCodec|TestEncryptedOuterFrameCodec|TestSequenceCipherSealOuterFrame' .
 
 # 2a. Regression tests for the fixes in §1.4
-go test -count=1 -run 'TestLegacyContractHmacForgeryRejectedAfterCutover|TestEmptyStoredContractBytesNeverVerify|TestStoredContractHmacLeavesCallerBytesUntouched|TestContractManagerRefusesForgedLegacyContract|TestStoredContractHmacCutover|TestSealedFrameWithoutInnerPathDoesNotStopTheClient|TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient|TestReceiveBufferHealsAStaleHeadIndexForThePacksOwnId' .
+go test -count=1 -run 'TestLegacyContractHmacForgeryRejectedAfterCutover|TestEmptyStoredContractBytesNeverVerify|TestStoredContractHmacLeavesCallerBytesUntouched|TestContractManagerRefusesForgedLegacyContract|TestStoredContractHmacCutover|TestSealedFrameWithoutInnerPathDoesNotStopTheClient|TestPackOfAnotherLaneForAClosingSequenceDoesNotStopTheClient|TestReceiveBufferHealsAStaleHeadIndexForThePacksOwnId|TestP2pRouteFrameClaimingPlatformOrSelfIsDropped|TestSignedIdentityFetchErrorRefusesAChangedPinnedKey|TestPinRefusesForkThatAdvancesPastThePinnedGeneration' .
+go test -count=1 -run 'TestAllowedSecretComparesInConstantTime|TestAllowedSecretRefusesPartialSignatures' ./extender/
 for f in FuzzParseIpPathWithPayload FuzzSecurityPolicyInspectEgress FuzzH3DatagramReassembler; do
   go test -run '^$' -fuzz "^${f}\$" -fuzztime 30s .
 done
