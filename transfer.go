@@ -616,6 +616,29 @@ type Peer struct {
 	// Private downstream-admission capability; public callbacks still borrow
 	// their frames only for the duration of the call.
 	delivery any
+	// The session's verified peer client key, for frames that session opened;
+	// read through `VerifiedClientPublicKey`. Nil for anything else. Shared
+	// with the session, so it is never handed out or written.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
+}
+
+// The peer's long-lived client key, as the end-to-end session that opened these
+// frames verified it: the peer proved possession of it over that session's
+// channel. Every frame of one callback was opened under it. A frame that was
+// not opened by a session has no such key (plaintext, ControlId, loopback, or
+// a key the signed-identity gate has not cleared), and neither does a client
+// without `EncryptionSettings.ExposeVerifiedPeerClientKey`, so the absence
+// proves nothing about the peer. The result is a value, so a caller cannot reach
+// the session's key, and reading it per frame allocates nothing.
+//
+// This says which key the session verified, never whose it is: the platform
+// binds a key to a client id, so a caller that needs more must check the key
+// against its own binding.
+func (self Peer) VerifiedClientPublicKey() (key [ed25519.PublicKeySize]byte, ok bool) {
+	if self.verifiedClientKey == nil {
+		return key, false
+	}
+	return *self.verifiedClientKey, true
 }
 
 // ReceiveFunction is invoked inline and must not block. A handoff uses a
@@ -1361,6 +1384,9 @@ type ReceivePack struct {
 	// Only pre-admission waits observe the exact retired physical lane. Once
 	// Pack takes ownership, closing that lane never revokes accepted work.
 	carrierDone <-chan struct{}
+	// The peer key of the session that opened this Pack, carried to Peer. Nil
+	// for a plaintext Pack, whatever session the sequence holds.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
 	// Client-relative monotonic ingress; zero means no timing provenance.
 	receivedAtNanos    int64
 	Source             TransferPath
@@ -2503,9 +2529,9 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 // plaintext inner bytes and the local session role and companion that
 // decrypted them (used as the receive sequence's role/companion). Wait-free:
 // it never blocks the receive loop.
-func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, error) {
+func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
-		return nil, sequenceTlsRoleServer, false, fmt.Errorf("encryption disabled")
+		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
 	}
 	// A wrapped frame can only be opened by the complement of the sender's
 	// session role (the other local session is the opposite TLS direction
@@ -2528,16 +2554,22 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 		ordered = self.encryptionSessionManager.sessionsForPeer(sourceId)
 	}
 	if len(ordered) == 0 {
-		return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s", sourceId)
+		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
 	for _, session := range ordered {
 		for _, cipher := range session.decryptCiphers() {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
-				return plaintext, session.role, session.companion, nil
+				// Taken here, from the session that authenticated this frame,
+				// not later from the session a receive sequence holds.
+				var verifiedClientKey *[ed25519.PublicKeySize]byte
+				if self.encryptionSessionManager.settings.ExposeVerifiedPeerClientKey {
+					verifiedClientKey = session.verifiedClientKey()
+				}
+				return plaintext, session.role, session.companion, verifiedClientKey, nil
 			}
 		}
 	}
-	return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
+	return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
 }
 
 func (self *Client) ClientKeyManager() *ClientKeyManager {
@@ -4758,6 +4790,9 @@ func (self *Client) run() {
 			// from the decrypting session, the plaintext companion hint, or the
 			// EncryptedControl.
 			receiveCompanion := false
+			// verifiedClientKey is the opening session's peer key, for a frame
+			// that arrived wrapped. See EncryptionSettings.ExposeVerifiedPeerClientKey.
+			var verifiedClientKey *[ed25519.PublicKeySize]byte
 
 			// outer encrypted wrap: the inner bytes are themselves a
 			// `TransferFrame`. A per-peer session for `source` carries the
@@ -4772,7 +4807,7 @@ func (self *Client) run() {
 				// responder session rebuilds it — the drop is transient, not
 				// a wedge. Keeping the unwrap path wait-free means no single
 				// peer can park the single-threaded, all-peers receive loop.
-				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, err := self.unwrapFrame(
+				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, decryptClientKey, err := self.unwrapFrame(
 					path.SourceId, transferFrame.GetSessionRole(), transferFrame.SessionCompanion, transferFrame.EncryptedTransferFrame)
 				if err != nil {
 					if self.log.V(1).Enabled() {
@@ -4798,6 +4833,7 @@ func (self *Client) run() {
 				}
 				receiveRole = decryptRole
 				receiveCompanion = decryptCompanion
+				verifiedClientKey = decryptClientKey
 				// inner frame: decode the path too — it is tamper-checked against
 				// the routing path below.
 				innerDecodedFrame := inboundDecodedTransferFrames.take()
@@ -5069,6 +5105,7 @@ func (self *Client) run() {
 						Unwrapped:           unwrapped,
 						EncryptionRole:      receiveRole,
 						EncryptionCompanion: receiveCompanion,
+						verifiedClientKey:   verifiedClientKey,
 					}
 					handoffTimeout := self.settings.ReceiveBufferSettings.
 						packHandoffTimeout(transportType, carrierReliability)
@@ -17728,6 +17765,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
+		verifiedClientKey:  receivePack.verifiedClientKey,
 	}
 	self.prepareReceiveDeliveryCredit(item)
 
@@ -18185,7 +18223,8 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		// nack items send no ack, so `unwrapped` was historically unused here;
 		// the EncryptionModeRequired receive gate in `receiveHead` now reads it
 		// to refuse plaintext application frames on this path too
-		unwrapped: receivePack.Unwrapped,
+		unwrapped:         receivePack.Unwrapped,
+		verifiedClientKey: receivePack.verifiedClientKey,
 	}
 
 	if err := self.registerContracts(item); err != nil {
@@ -18266,18 +18305,20 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		receiveContract := self.openReceiveContracts[*item.contractId]
 		receiveContract.ack(item.messageByteCount)
 		peer = Peer{
-			ProvideMode:   receiveContract.provideMode,
-			Roles:         receiveContract.roles,
-			Principal:     receiveContract.principal,
-			TransferKey:   self.transferKey,
-			TransportType: item.transportType,
+			ProvideMode:       receiveContract.provideMode,
+			Roles:             receiveContract.roles,
+			Principal:         receiveContract.principal,
+			TransferKey:       self.transferKey,
+			TransportType:     item.transportType,
+			verifiedClientKey: item.verifiedClientKey,
 		}
 	} else {
 		// no contract peers are considered in network
 		peer = Peer{
-			ProvideMode:   protocol.ProvideMode_Network,
-			TransferKey:   self.transferKey,
-			TransportType: item.transportType,
+			ProvideMode:       protocol.ProvideMode_Network,
+			TransferKey:       self.transferKey,
+			TransportType:     item.transportType,
+			verifiedClientKey: item.verifiedClientKey,
 		}
 	}
 	// EncryptedControl frames are routed into the per-peer session instead
@@ -18315,12 +18356,14 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	}
 
 	// buffer for a combined dispatch: a Peer identity change (contract
-	// rotation) is a batch boundary because one callback carries one peer
+	// rotation, or a sealed frame beside a plaintext one) is a batch boundary
+	// because one callback carries one peer
 	peerEqual := func(a Peer, b Peer) bool {
 		return a.ProvideMode == b.ProvideMode &&
 			a.Principal == b.Principal &&
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
+			a.verifiedClientKey == b.verifiedClientKey &&
 			slices.Equal(a.Roles, b.Roles)
 	}
 	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
@@ -18857,6 +18900,8 @@ type receiveItem struct {
 	decodedOwner       *decodedPackOwner
 	transferFrameBytes []byte
 	transportType      TransportType
+	// The peer key of the session that opened this item; see ReceivePack.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
 	// Keep flags together: this item is embedded in every decodedPackOwner,
 	// whose allocation must fit the fixed 1-KiB receive-budget charge.
 	head                 bool
