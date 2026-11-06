@@ -2004,15 +2004,17 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 }
 
 func (self *routeSnapshot) receiveDisposition(route Route, message []byte) transferReceiveDisposition {
+	// one lookup per frame: this runs for every frame of every client
+	properties := self.routeCarrierProperties[route]
 	return transferReceiveDisposition{
 		transportType: self.transportType(route),
-		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
+		reliability:   properties.ReceiveReliability,
 		h1Credit: platformH1ReceiveCredit{
-			lane:      self.routeCarrierProperties[route].h1ReceiveRetained,
+			lane:      properties.h1ReceiveRetained,
 			byteCount: ByteCount(cap(message)),
-			done:      self.routeCarrierProperties[route].h1ReceiveDone,
+			done:      properties.h1ReceiveDone,
 		},
-		peerId: self.routeCarrierProperties[route].receivePeerId,
+		peerId: properties.receivePeerId,
 	}
 }
 
