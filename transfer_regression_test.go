@@ -878,6 +878,8 @@ func TestSelectiveAckPauseKeepsAProbeScheduled(t *testing.T) {
 //
 // Without the fix A emits exactly one client-role proof, and this fails.
 func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	assertMessagePoolOwnership(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -891,22 +893,9 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 	var proofPackIds sync.Map
 	var proofCount atomic.Int64
 	bReceive := make(chan []byte)
-	go func() {
-		for {
-			var b []byte
-			select {
-			case <-ctx.Done():
-				return
-			case b = <-aSend:
-			}
-			countClientRoleIdentityProofs(b, &proofPackIds, &proofCount)
-			select {
-			case <-ctx.Done():
-				return
-			case bReceive <- b:
-			}
-		}
-	}()
+	tapDone := startOwnedTestWireTap(ctx, aSend, bReceive, func(message []byte) {
+		countClientRoleIdentityProofs(message, &proofPackIds, &proofCount)
+	})
 	bConditioner, aReceive := newConditioner(ctx, bSend)
 	bConditioner.update(func() { bConditioner.randomDelay = 20 * time.Millisecond })
 
@@ -935,6 +924,28 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 	}
 
 	var a, b *Client
+	var producerDone chan struct{}
+	var sinkDones []<-chan struct{}
+	t.Cleanup(func() {
+		cancel()
+		if producerDone != nil {
+			<-producerDone
+		}
+		<-tapDone
+		<-bConditioner.done
+		for _, done := range sinkDones {
+			<-done
+		}
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer joinCancel()
+		for _, client := range []*Client{a, b} {
+			if client != nil {
+				if err := client.CloseAndWait(joinCtx); err != nil {
+					t.Errorf("identity-proof client did not join: %v", err)
+				}
+			}
+		}
+	})
 	aOob := &grantingClientOob{
 		sourceId: aClientId,
 		settings: DefaultContractManagerSettings(),
@@ -957,34 +968,30 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 	}
 
 	a = NewClient(ctx, aClientId, aOob, makeSettings())
-	defer a.Cancel()
 	a.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{aSend})
 	a.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{aReceive})
-	blackholeControlId(ctx, a.RouteManager())
+	sinkDones = append(sinkDones, blackholeControlId(ctx, a.RouteManager()))
 	a.ContractManager().SetProvideModes(provideModes)
 
 	b = NewClient(ctx, bClientId, bOob, makeSettings())
-	defer b.Cancel()
 	b.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{bSend})
 	b.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{bReceive})
-	blackholeControlId(ctx, b.RouteManager())
+	sinkDones = append(sinkDones, blackholeControlId(ctx, b.RouteManager()))
 	b.ContractManager().SetProvideModes(provideModes)
 
 	// drive both directions so each client acquires its per-peer session and
 	// the handshakes run
-	stop := make(chan struct{})
-	defer close(stop)
+	producerDone = make(chan struct{})
 	go func() {
+		defer close(producerDone)
 		send := func(client *Client, dst Id, label string) {
 			m := &protocol.SimpleMessage{Content: label}
 			if frame, err := ToFrame(m, DefaultProtocolVersion); err == nil {
-				client.Send(frame, dst, func(error) {})
+				sendOwnedTestFrame(client, frame, dst)
 			}
 		}
 		for i := 0; ; i += 1 {
 			select {
-			case <-stop:
-				return
 			case <-ctx.Done():
 				return
 			default:
@@ -992,7 +999,7 @@ func TestIdentityProofResendsDuringEstablishment(t *testing.T) {
 			send(a, bClientId, fmt.Sprintf("a%d", i))
 			send(b, aClientId, fmt.Sprintf("b%d", i))
 			select {
-			case <-stop:
+			case <-ctx.Done():
 				return
 			case <-time.After(200 * time.Millisecond):
 			}

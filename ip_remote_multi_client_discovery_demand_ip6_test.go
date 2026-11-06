@@ -72,6 +72,15 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 			generator.holdNextAvailable = true
 			generator.mutex.Unlock()
 		}
+		update.stateLock.Lock()
+		originalOwner := update.synRetry
+		var originalSerial uint64
+		var originalCredit *transferRetainedControlCredit
+		if originalOwner != nil {
+			originalSerial, originalCredit = originalOwner.serial, originalOwner.credit
+		}
+		update.stateLock.Unlock()
+		collapseBeforeLate := h.multiClient.TcpCollapseDropCount()
 		// Strictly after the empty snapshot, construction changes availability
 		// only. The next real source retransmit must reassert discovery demand.
 		time.Sleep(100 * time.Millisecond)
@@ -116,6 +125,7 @@ func testDiscoveryDemandIpv6LateVisibility(t *testing.T, holdEmpty bool) {
 		}
 		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
 		if !h.syn(failedPath) {
+			t.Logf("DISCOVERY_MANUAL_WINNER_SCALARS %v", discoveryDemandManualWinnerSnapshot(h, failedPath, update, originalOwner, originalSerial, originalCredit, collapseBeforeLate))
 			t.Fatal("original next SYN was not admitted")
 		}
 		if _, ok := h.synAck(failedPath); !ok || h.boundTo(failedPath) != h.channel("late") {

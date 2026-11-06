@@ -29,10 +29,22 @@ type grantingClientOob struct {
 	// public key, sealed into the contract so the sender can verify the
 	// destination's per-peer-session identity proof (establishing the cipher).
 	destClientPublicKey func(destinationId Id) []byte
+	// Nil observer borrows the scratch immediately before its owned return.
+	beforeStoredContractReturnForTest func([]byte)
 }
 
+// Takes requests, lends results during the synchronous callback, then
+// returns both. Contract serialization scratch stays local to this call.
 func (self *grantingClientOob) SendControl(frames []*protocol.Frame, callback func([]*protocol.Frame, error)) {
 	var out []*protocol.Frame
+	defer func() {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		for _, frame := range out {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+	}()
 	for _, frame := range frames {
 		message, err := FromFrame(frame)
 		if err != nil {
@@ -72,6 +84,10 @@ func (self *grantingClientOob) SendControl(frames []*protocol.Frame, callback fu
 			},
 		}
 		resultFrame, err := ToFrame(result, DefaultProtocolVersion)
+		if self.beforeStoredContractReturnForTest != nil {
+			self.beforeStoredContractReturnForTest(storedContractBytes)
+		}
+		MessagePoolReturn(storedContractBytes)
 		if err != nil {
 			continue
 		}
@@ -143,19 +159,11 @@ func (self *controlBlackholeTransport) Downgrade(source TransferPath)           
 
 // blackholeControlId registers a controlBlackholeTransport on routeManager and
 // drains it, sinking all ControlId-addressed traffic for the lifetime of ctx.
-func blackholeControlId(ctx context.Context, routeManager *RouteManager) {
+func blackholeControlId(ctx context.Context, routeManager *RouteManager) <-chan struct{} {
 	transport := newControlBlackholeTransport()
 	sink := make(chan []byte)
 	routeManager.UpdateTransport(transport, []Route{sink})
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sink:
-			}
-		}
-	}()
+	return startOwnedTestWireTap(ctx, sink, nil, nil)
 }
 
 // Counts application frames inline without handing receive-pump work to a

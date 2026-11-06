@@ -182,6 +182,15 @@ func TestDiscoveryDemandActualAckTimerPublication(t *testing.T) {
 		if failed != 4 || inbound || firstReads != beforeReads+1 || firstEmpty != beforeEmpty+1 {
 			t.Fatal("actual ACK timer control lacks four refusals followed by a real empty demand read")
 		}
+		update.stateLock.Lock()
+		originalOwner := update.synRetry
+		var originalSerial uint64
+		var originalCredit *transferRetainedControlCredit
+		if originalOwner != nil {
+			originalSerial, originalCredit = originalOwner.serial, originalOwner.credit
+		}
+		update.stateLock.Unlock()
+		collapseBeforeLate := h.multiClient.TcpCollapseDropCount()
 		time.Sleep(100 * time.Millisecond)
 		late := discoveryDemandTestAddAckTimerExit(h, state)
 		h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
@@ -212,6 +221,7 @@ func TestDiscoveryDemandActualAckTimerPublication(t *testing.T) {
 		}
 		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
 		if !h.syn(path) {
+			t.Logf("DISCOVERY_MANUAL_WINNER_SCALARS %v", discoveryDemandManualWinnerSnapshot(h, path, update, originalOwner, originalSerial, originalCredit, collapseBeforeLate))
 			t.Fatal("unchanged3s source SYN was refused")
 		}
 		if _, ok := h.synAck(path); !ok || h.boundTo(path) != h.channel("late") || 5*time.Second <= time.Since(start) {

@@ -149,8 +149,9 @@ func (self *RemoteUserNatMultiClient) clearDestinationServiceFailure(
 		return
 	}
 	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
 	delete(self.destinationServiceFailures, key)
+	self.stateLock.Unlock()
+	self.serviceRefreshConnected(ipPath)
 }
 
 // filterDestinationServiceFailures removes exits that recently failed this

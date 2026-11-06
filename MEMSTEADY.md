@@ -6611,3 +6611,10 @@ This is one current-source qualification, not an old/new comparison or baseline 
 The full correctness attempt first stopped at a stale cold-cancellation test expectation. The corrected test pins the existing two-group cleanup iteration, latest accepted ACK, cancellation fences, balanced budgets and healthy sibling traffic. Twelve focused/adjacent tests passed in each of three fresh normal processes and one race process; both isolated negative controls failed at their expected boundaries. The test-only correction is committed as Connect `f51df986`; production code is unchanged from the performance run. Full six-suite correctness remains pending.
 
 Evidence: `/Volumes/data/urnetwork/runtime-20261105/cold-fixed-and-current100.brka8s7m/ordinary100/COMPACT-READBACK.json`, the associated `TERMINAL.json`, and the four focused positive/two negative phase receipts in the same parent. Real-device 32 MiB iOS-profile and 64 MiB Android-profile MEMSTEADY/PERFVAR qualification remains outstanding.
+
+
+## 2026-11-06 checkpoint: provider send capacity and remaining browsing delay
+
+Two opposite-order mobile-provider synthetic pairs measured about 95% higher bulk throughput when retained TX capacity doubled at fixed total budget. This constrained mobile-provider shape differs from current Linux/SN desktop-provider defaults and is not evidence of a hosted Fast.com fix. An opt-in overlapping permission policy (default zero) passed 40 positive test executions and two negatives, but its own performance and device-memory qualification are pending. See [provider TX research](20261106-PROVIDER-TX-RESEARCH.md).
+
+The original 100-page outage completed all 500 requests and 99 overlaps, but page 1 still failed the unchanged five-second gate at 5.937593 s TTFB, dominated by 5.485661 s TCP connect. The first-page phase recorder is reviewed and unrun; it distinguishes staggered TCP attempts and explicit unknown/overflow state. Full correctness still has five discovery admission failures under audit. See [checkpoint and remaining work](CHECKPOINT-20261106.md). Budgets remain iOS32 MiB and Android64 MiB; this checkpoint adds no new physical qualification.

@@ -5,6 +5,7 @@ package connect
 
 import (
 	"bytes"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -33,6 +34,8 @@ type tcpSynRetry struct {
 	packet                               []byte
 	credit                               *transferRetainedControlCredit
 	readiness                            *tcpSynRetryReadiness
+	refusedRemoteIds                     []Id
+	remoteRefusalOverflow                bool
 	readinessWidth                       int
 	readinessEpoch, readinessSourceOrder uint64
 	readinessOverflow                    bool
@@ -43,6 +46,11 @@ type tcpSynRetry struct {
 	serial                               uint64
 	references                           uint32
 	queued                               bool
+	// Weak index links are detached before final credit release. Cache or
+	// queued/in-flight references own the struct throughout membership.
+	publicationPrevious, publicationNext *tcpSynRetry
+	publicationIndexed                   bool
+	publicationRetired                   atomic.Bool
 	// Queue-local token; the dispatcher snapshots it before releasing the lock.
 	raceOrder uint64
 	next      *tcpSynRetry
@@ -82,12 +90,17 @@ func (self *parsedPacketGroup) prepareSynRetry(source TransferPath, mode protoco
 	self.synRetry = request
 }
 
-func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
+// Exact live cache generation, independent of temporary same-SYN claim readiness.
+func (self *tcpSynRetry) validGenerationWithLock(update *multiClientChannelUpdate) bool {
 	return self != nil && self.update == update && update.synRetry == self &&
 		!update.IsDone() && !update.sourceReset.Load() && !update.receivedInbound.Load() &&
 		!update.affinitySources.closed && !update.pendingCollapseResetWithLock() &&
-		!self.pendingConflictingControlWithLock(update) &&
 		(!update.synGenerationSeen || update.synGenerationNumber == self.sequence)
+}
+
+// Reuse and dispatch retain every existing pending-control fence.
+func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
+	return self.validGenerationWithLock(update) && !self.pendingConflictingControlWithLock(update)
 }
 
 // A queued sibling SYN from this same retained attempt does not introduce a
@@ -147,6 +160,7 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 	}
 	update := group.collapseAdmission.update
 	defer update.releaseSynRetryMemory()
+	defer update.indexSynRetryPublication()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	if update.IsDone() || update.receivedInbound.Load() || update.affinitySources.closed ||
@@ -181,8 +195,13 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		if update.synRetrySerial == ^uint64(0) {
 			continue
 		}
+		remoteCapacity := synRetryRemoteTailCapacity(update.sequenceParent, update)
+		if remoteCapacity <= 0 {
+			continue
+		}
 		metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{})) + ByteCount(len(group.synRetry.pin.appId))
 		metadata = (metadata + 63) / 64 * 64
+		metadata = addReceiveQueueByteCount(metadata, retainedMessageCapacity(ByteCount(remoteCapacity)*ByteCount(unsafe.Sizeof(Id{}))))
 		credit, reserved := source.reserveRetainedControlMemory(addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata))
 		if !reserved {
 			continue
@@ -194,6 +213,7 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 			source: group.synRetry.source, provideMode: group.synRetry.provideMode,
 			pin: group.synRetry.pin, sequence: path.SequenceNumber,
 			serial: update.synRetrySerial, references: 1,
+			refusedRemoteIds: make([]Id, 0, remoteCapacity),
 		}
 		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update))
 		update.synRetry = owner
@@ -206,6 +226,7 @@ func (self *multiClientChannelUpdate) releaseSynRetryReferenceWithLock(owner *tc
 	}
 	owner.references--
 	if owner.references == 0 {
+		owner.publicationRetired.Store(true)
 		owner.released = self.synRetryReleased.Load()
 		self.synRetryReleased.Store(owner)
 	}
@@ -235,7 +256,11 @@ func (self *multiClientChannelUpdate) releaseSynRetryMemory() {
 		owner := owners
 		owners, owner.released = owner.released, nil
 		packet, credit, ready := owner.packet, owner.credit, owner.readiness
+		if parent := self.sequenceParent; parent != nil {
+			parent.removeSynPublicationOwner(owner)
+		}
 		owner.packet, owner.credit, owner.update, owner.next, owner.readiness = nil, nil, nil, nil, nil
+		owner.refusedRemoteIds, owner.remoteRefusalOverflow = nil, false
 		if ready != nil {
 			ready.closed.Store(true)
 			ready.detach()

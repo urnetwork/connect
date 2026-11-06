@@ -187,7 +187,8 @@ func (self *multiClientWindow) discoveryDemandLiveWithLock(now time.Time) bool {
 	return self.ctx.Err() == nil && demand.owner != nil && demand.ctx.Err() == nil &&
 		demand.slotOpen && demand.slotCtx.Err() == nil && now.Before(demand.deadline) &&
 		!now.Before(self.discoveryRetry.notBefore) &&
-		(!self.settings.StrictWindowSizeHardMax || demand.hardMax <= 0 || len(self.clients) < demand.hardMax)
+		(!self.settings.StrictWindowSizeHardMax || demand.hardMax <= 0 || len(self.clients) < demand.hardMax ||
+			self.serviceRefreshLiveWithLock() && self.strictPass != nil && self.strictPass.handover != nil && self.strictPass.handover.serviceRefresh != nil)
 }
 
 func (self *multiClientWindow) discoveryDemandReadLive(read *discoveryDemandRead) bool {
@@ -468,6 +469,7 @@ func (self *RemoteUserNatMultiClient) requestDiscoveryForSourceSyn(update *multi
 		for _, window := range self.windows {
 			window.requestDiscoveryDemand(update, path.Version, path, nil)
 		}
+		self.requestServiceRefresh(update, path)
 	}
 }
 
@@ -476,5 +478,6 @@ func (self *RemoteUserNatMultiClient) requestDiscoveryForFailedAttempt(update *m
 		for _, window := range self.windows {
 			window.requestDiscoveryDemand(update, path.Version, nil, failed)
 		}
+		self.requestServiceRefresh(update, path)
 	}
 }
