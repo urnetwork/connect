@@ -4,13 +4,13 @@ package connect
 // `Tun` exposes a packet interface on one side (`Read`/`Write`) and
 // socket interfaces on the other (`DialContext`, `ListenTCP`, `ListenUDP`).
 // each tun instance owns a private gvisor stack with one nic, one link-local
-// ipv4 address and, when the link mtu admits it, one ula ipv6 address.
+// ipv4 address and, when the link mtu and owner policy admit it, one ula ipv6 address.
 //
 // Dual stack (IPV6.md C1): the stack carries both families with a default
 // route for each, so a tun can originate and accept v6 flows exactly like v4.
 // gVisor refuses to emit IPv6 on a link narrower than the protocol's minimum
 // MTU (1280, RFC 8200 §5), so a tun whose settings.Mtu is below
-// tunIpv6MinimumMtu keeps IPv4 only: no v6 address, no v6 route, and v6 dials
+// tunIpv6MinimumMtu or with DisableIpv6 keeps IPv4 only: no v6 address, no v6 route, and v6 dials
 // and writes fail with EAFNOSUPPORT as they always did. See Ipv6Enabled.
 
 import (
@@ -181,6 +181,9 @@ type TunSettings struct {
 
 	ChannelSize int
 	Mtu         int
+	// DisableIpv6 keeps this owner's inner stack ipv4-only independently of
+	// its link mtu. False preserves mtu-based dual-stack admission.
+	DisableIpv6 bool
 	// OutboundQueueWaitTimeout bounds how long netstack waits for space in
 	// the outbound (tun read) queue before dropping the rest of a write. The
 	// queue's consumer can be inside an inbound injection itself (SendPacket
@@ -874,7 +877,7 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	}
 
 	// IPv6 rides only a link wide enough for it (see the file comment)
-	ipv6Enabled := tunIpv6MinimumMtu <= settings.Mtu
+	ipv6Enabled := !settings.DisableIpv6 && tunIpv6MinimumMtu <= settings.Mtu
 	var localIpv6Address netip.Addr
 	if ipv6Enabled {
 		localIpv6Address, ok = localIpv6AddressAllocator.TakeAddr()
