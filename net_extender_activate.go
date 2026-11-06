@@ -144,6 +144,28 @@ type ExtenderActivateResult struct {
 	// refused after the probe passed. Empty on a refusal that probed nothing,
 	// and from an operator that predates the field.
 	ProbeSteps []*ExtenderActivateProbeStep `json:"probe_steps,omitempty"`
+	// on an activation, the optional carriers that were offered and did not
+	// answer, each dns port that did not, in the order offered (C2a). They are
+	// left out of the published record, so the extender serves on them but no
+	// client is told to dial them. Empty on a refusal, which probes no optional
+	// carrier, and from an operator that predates the field.
+	RefusedCarriers []*ExtenderActivateCarrierRefusal `json:"refused_carriers,omitempty"`
+}
+
+// One optional carrier, or one dns port, the operator's probe left out of an
+// activation (C2a), with its timing, so a late answer reads differently from no
+// answer (connect#230).
+type ExtenderActivateCarrierRefusal struct {
+	// quic or dns
+	Carrier string `json:"carrier"`
+	// the extender port the carrier was probed on
+	Port int `json:"port"`
+	// why the probe failed, in the operator's words
+	Error string `json:"error"`
+	// how long the probe ran, and how much of the probe's budget was left when
+	// it started
+	ElapsedMs    int64 `json:"elapsed_ms"`
+	BudgetLeftMs int64 `json:"budget_left_ms"`
 }
 
 // One step of the operator's probe of an activation (C2b).
@@ -1751,6 +1773,11 @@ func (self *ExtenderActivator) activateUrl(
 		} else {
 			self.log.Infof("[extender]activate v%d refused = %s\n", ipVersion, message)
 		}
+		// where the probe spent its budget: the words alone read the same
+		// whether this host answered late or never (connect#230)
+		if 0 < len(result.ProbeSteps) {
+			self.log.Infof("[extender]activate v%d probe = %s\n", ipVersion, extenderActivateProbeStepsText(result.ProbeSteps))
+		}
 		self.recordFailure(ipVersion, now, message, true)
 		if self.settings.OnRefused != nil {
 			self.settings.OnRefused(ipVersion, result)
@@ -1787,10 +1814,61 @@ func (self *ExtenderActivator) activateUrl(
 		// with this one (addressChange)
 		delete(self.helloAddresses, ipVersion)
 	}
+	// an optional carrier the probe left out is not published, and the
+	// activation passing says nothing of it (C2a, connect#230)
+	if 0 < len(result.RefusedCarriers) {
+		self.log.Infof("[extender]activate v%d left out = %s\n", ipVersion, extenderActivateCarrierRefusalsText(result.RefusedCarriers))
+	}
 	if self.settings.OnActivated != nil {
 		self.settings.OnActivated(ipVersion, result)
 	}
 	return extenderActivateAnswer{outcome: extenderActivateActivated}
+}
+
+// The operator's probe steps on one line, in the order run: each step's name,
+// port and outcome, how long it ran and how much of the budget was left when it
+// started (C2b). A nil step is skipped.
+func extenderActivateProbeStepsText(probeSteps []*ExtenderActivateProbeStep) string {
+	stepTexts := []string{}
+	for _, probeStep := range probeSteps {
+		if probeStep == nil {
+			continue
+		}
+		stepTexts = append(stepTexts, fmt.Sprintf(
+			"%s:%d %s after %s (%s left)",
+			probeStep.Name,
+			probeStep.Port,
+			probeStep.Outcome,
+			extenderActivateMsText(probeStep.ElapsedMs),
+			extenderActivateMsText(probeStep.BudgetLeftMs),
+		))
+	}
+	return strings.Join(stepTexts, ", ")
+}
+
+// The carriers an activation left out on one line, in the order offered, each
+// with the operator's error and timing (C2a). A nil refusal is skipped.
+func extenderActivateCarrierRefusalsText(carrierRefusals []*ExtenderActivateCarrierRefusal) string {
+	refusalTexts := []string{}
+	for _, carrierRefusal := range carrierRefusals {
+		if carrierRefusal == nil {
+			continue
+		}
+		refusalTexts = append(refusalTexts, fmt.Sprintf(
+			"%s:%d after %s (%s left): %s",
+			carrierRefusal.Carrier,
+			carrierRefusal.Port,
+			extenderActivateMsText(carrierRefusal.ElapsedMs),
+			extenderActivateMsText(carrierRefusal.BudgetLeftMs),
+			carrierRefusal.Error,
+		))
+	}
+	return strings.Join(refusalTexts, "; ")
+}
+
+// Milliseconds on the operator's clock as a duration.
+func extenderActivateMsText(ms int64) string {
+	return (time.Duration(ms) * time.Millisecond).String()
 }
 
 // The family an activation answer belongs to: what the operator reported, else
