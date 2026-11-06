@@ -203,6 +203,28 @@ func (self *subprotocolSourceReceipts) register(t *testing.T, client *Client, id
 
 const subprotocolSourceTestId SubprotocolId = 4100
 
+// Every opt-in of SUBPROTOCOL.md §11 starts off, on every default a client is
+// built from. connect_default_unchanged_test.go shows what that means in traffic.
+func TestSourceRuleOptInsAreOffByDefault(t *testing.T) {
+	for _, settings := range []*ClientSettings{
+		DefaultClientSettings(),
+		DefaultClientSettingsWithBufferSize(0),
+	} {
+		if settings.P2pPeerSourceOnly {
+			t.Error("P2pPeerSourceOnly is on by default")
+		}
+		if settings.EncryptionSettings.ExposeVerifiedPeerClientKey {
+			t.Error("ExposeVerifiedPeerClientKey is on by default")
+		}
+	}
+	if DefaultEncryptionSettings().ExposeVerifiedPeerClientKey {
+		t.Error("ExposeVerifiedPeerClientKey is on by default")
+	}
+	if subprotocolListenerAcceptsControlSource(nil) {
+		t.Error("a listener with no options accepts the control id")
+	}
+}
+
 // A listener that did not opt in never sees the control id's frames, and the
 // drop is counted, not delivered: nothing counts as received. Top-level control
 // frames in the same sequence still reach the generic callbacks.
