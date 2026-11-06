@@ -565,6 +565,11 @@ message, a field or a frame order on the wire, and §11.5 lists all a client tha
 opts in to nothing can observe. The sidecar's side is its DESIGN.md §6: D-PROTO-8
 for the control source, D-PROTO-13 for the key.
 
+A sidecar client takes all three opt-ins: `WithSubprotocolControlSource()` on its
+one registration, `ClientSettings.P2pPeerSourceOnly` and
+`EncryptionSettings.ExposeVerifiedPeerClientKey`. Each fails closed if forgotten:
+pushes are dropped, or the identity check finds no key.
+
 ### 11.1 Known ids
 
 `21842` (`0x5552`, "UR") is the sidecar's one subprotocol, and `21843`-`21851`
