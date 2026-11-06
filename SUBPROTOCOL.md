@@ -6,7 +6,8 @@ stats), 57ea9fb (the Client.receive hook) and df6ac10 (end to end over the
 in-process transports). The design was reviewed and approved the same day
 (§8, and the review notes at the end of §10); the implementation followed §9. §3–§6 hold
 the analysis and the shape as first proposed; where a decision in §8 changes
-them, §8 and §10 are authoritative.
+them, §8 and §10 are authoritative. §11 records what the sidecar added on
+2026-11-06: the amended decision 6, the source rules and the verified peer key.
 
 ## 0. What is being asked for
 
@@ -86,8 +87,8 @@ only `FromFrame` does when asked to decode one.
 
 **Size bounds.** A frame must fit one transport message: each transport's
 framer `MaxMessageLen`, whose floor is `ClientSettings.MinimumMessageLenLimit()`
-= 8 KiB (`transfer.go` 1318), minus the pack and encryption overhead. There is
-no fragmentation at the frame layer.
+= 16 KiB (`transfer.go`), minus the pack and encryption overhead. There is no
+fragmentation at the frame layer.
 
 ## 2. Design goals and non-goals
 
@@ -369,8 +370,12 @@ numbers.
 4. **Unregistered ids** reach raw listeners only.
 5. **Reserved ids.** Ids below 1024 are reserved for the network, like
    privileged ports; the public registration refuses them. 0 is invalid.
-6. **The control id speaks only the top-level protocol.** A subprotocol send
-   to `ControlId` is refused by the client; the platform drops any that arrive.
+6. **The control id may send subprotocol frames to clients; clients never send
+   them to it.** A subprotocol send to `ControlId` is refused by the client; the
+   platform drops any that arrive. A frame from the control id reaches only a
+   listener that opted in (§11.2). Amended 2026-11-03 by the sidecar's owner
+   decision 17; it first read "the control id speaks only the top-level
+   protocol".
 7. **Frame size.** The top-level frame rules apply unchanged; a subprotocol adds
    no size rule of its own and no fragmentation.
 8. **Peer query.** `connect/protocol` gains a peer-to-peer query of the
@@ -475,8 +480,11 @@ type SubprotocolRawFunction = func(source TransferPath, subprotocolId Subprotoco
 // the parsed message, after the raw listeners; one codec and one handler per id
 type SubprotocolHandler[T any] = func(source TransferPath, message T, peer Peer)
 
-func (self *Client) AddSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction) (remove func(), err error)
-func RegisterSubprotocol[T any](client *Client, id SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T]) (unregister func(), err error)
+// §11.2; a listener takes frames from peers without it
+func WithSubprotocolControlSource() SubprotocolListenerOption
+
+func (self *Client) AddSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction, opts ...SubprotocolListenerOption) (remove func(), err error)
+func RegisterSubprotocol[T any](client *Client, id SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T], opts ...SubprotocolListenerOption) (unregister func(), err error)
 ```
 
 Both refuse ids below `SubprotocolReservedLimit` (an unexported variant exists
@@ -486,7 +494,8 @@ registry is an immutable table behind an `atomic.Pointer`, copied on change.
 
 Dispatch, in `Client.receive` before the generic callbacks, per `Subprotocol`
 frame: decode the header; if the id has no raw listener and no codec, drop and
-count; call each raw listener with the payload; if a codec is registered, take
+count; if the frame is from the control id, apply §11.2; call each raw listener
+with the payload; if a codec is registered, take
 a message from the codec (a `SubprotocolCodec` may also implement
 `SubprotocolMessagePool[T]{New() T; Release(T)}` to bound its allocations),
 `Unmarshal` in place, call the handler, release. A decode failure after the raw
@@ -529,14 +538,15 @@ as the ping echo does; a failed enqueue returns the reply's pool buffer and is
 counted. Both messages are ordinary top-level frames intercepted in
 `Client.receive` and never delivered to application callbacks. An old peer ignores the query, so a
 query against it times out: absence of a result means "unknown", not "none".
-The control id is not queried.
+The control id is not queried: a query or a result from it is dropped and
+counted (§11.2).
 
 ### 10.5 Stats
 
 `ClientSubprotocolStatsSnapshot{Sent, SentBytes, Received, ReceivedBytes,
-DroppedUnregistered, DroppedDecode, MarshalOverrun, QueriesAnswered}` plus a
-per-id received count, monotonic for the client's lifetime, exposed next to
-`ReceiveStats`.
+DroppedUnregistered, DroppedDecode, DroppedControlSource, MarshalOverrun,
+QueriesAnswered}` plus a per-id received count, monotonic for the client's
+lifetime, exposed next to `ReceiveStats`.
 
 ### 10.6 Review notes (2026-09-10)
 
@@ -545,3 +555,118 @@ codec per id, because a subprotocol needs a deterministic codec or it is raw
 bytes; the query reply uses the provider ping's companion-reply behaviour
 (§10.4); `SendSubprotocolBytes` may copy once, the same cost as a protobuf
 marshal; the enum names of §9; `FromFrame` returns the wrapper for tooling only.
+
+## 11. Sources and identity (2026-11-06)
+
+The sidecar is the first subprotocol to take frames from the platform and the
+first that needs to know which key sealed a peer's frames. What it needed is
+generic, additive, off by default and wire-compatible: nothing here changes a
+message, a field or a frame order on the wire, and §11.5 lists all a client that
+opts in to nothing can observe. The sidecar's side is its DESIGN.md §6: D-PROTO-8
+for the control source, D-PROTO-13 for the key.
+
+### 11.1 Known ids
+
+`21842` (`0x5552`, "UR") is the sidecar's one subprotocol, and `21843`-`21851`
+are held for it. They are public ids to `connect`, which gives them no special
+case: the sidecar registers 21842 per client like any application, and an inner
+type puts all its services behind one dispatcher. Keeping applications off them
+is the sdk's job, not the core's: `EnableSubprotocol` is to refuse `21842`-`21851`
+(DESIGN.md §18). The sidecar's sources, not this document, own what the ids carry.
+
+### 11.2 The control source
+
+A resident's push is a `Subprotocol` frame from `ControlId`, so it arrives with
+no contract and outside any end-to-end session: it is a hint, never content
+(§8 decision 6). A listener must know the platform sent it, and nothing in the
+frame can say so. The rule is two conditions:
+
+- **The listener opted in.** `WithSubprotocolControlSource()` at
+  `AddSubprotocolRawCallback` or `RegisterSubprotocol` opts that one listener in.
+  A listener of the same id without it never sees the frame, and neither does a
+  listener registered before or after it.
+- **A platform carrier delivered it.** `peer.TransportType` is `h1`, `h3`,
+  `h3dns` or `h3dnspump`. The type comes from the route that read the frame,
+  never from the frame. A P2P carrier reaches a peer, and a peer can write any
+  source it likes (§11.3), so an opted-in listener is safe from a forged push
+  whatever else the client set. An unknown or custom carrier is not guessed
+  to be the platform.
+
+Either failing, the frame is dropped and counted in `DroppedControlSource`. It
+counts as nothing received, and the id's other counters do not move. An
+unregistered id and a malformed wrapper keep their own counters. Query frames are
+peer-to-peer, so `TransferSubprotocolsQuery` and
+`TransferSubprotocolsQueryResult` from the control id are always dropped and
+counted: a query is not answered, and a result completes nothing.
+
+Refusal happens after the Transfer layer accepted the Pack, so the Pack is still
+acked, as it is for an id with no listener: a transfer ack is not delivery.
+
+The sends are unchanged: every subprotocol send to `ControlId` is still refused
+(§10.3), so clients never send these frames to it.
+
+### 11.3 P2P carriers
+
+A P2P association delivers whatever the far side writes, and a `TransferFrame`
+states its own source. A peer can therefore name `ControlId`, which needs no
+contract and no session, this client's own id, which needs no contract, or any
+third client. `ClientSettings.P2pPeerSourceOnly` holds a carrier to its peer:
+
+- The client's read loop compares each frame's source with the peer of the
+  exact route that delivered it (`TransferCarrierProperties.receivePeerId`,
+  published with the route) and drops a mismatch before decoding anything, so the
+  rule covers every frame type, Packs and acks alike, and both lanes of an
+  association, frames that beat the ready header included. It reuses the path
+  the loop parses anyway, and adds no lock or allocation.
+- A dropped frame leaves no sequence state and no ack, so a retrying sender keeps
+  custody of it. It counts in `P2pSourceDropCount` and `P2pSourceDropByteCount`
+  of `ReceiveStats`.
+- A P2P route that names no peer delivers nothing: the deprecated
+  `NewP2pReceiveTransport` has no peer to compare.
+- `Transport.MatchesReceive` is not where this lives. It answers for a reader's
+  own path when a route is matched, and never sees a frame.
+
+The peer is the adjacent one, the client the association was set up with, because
+that is the only identity the carrier can vouch for. On a multihop stream the
+endpoint's association is with the next hop, so with this setting an endpoint
+refuses the far end's relayed frames, and the stream carries nothing from the far
+end: its end-to-end probe still passes, so the far end's writer can keep choosing
+a route that loses what it sends. A client with this setting must not be the
+endpoint of a multihop stream. Find-providers returns no such route today, and a
+sidecar pair's stream is direct. Intermediaries forward on private routes that
+never reach a client's read loop, so the setting changes nothing on a relay.
+
+Off by default, a P2P route accepts any source, as it always has, multihop far
+ends and forged sources alike. A forged source still cannot reach a subprotocol
+as the platform (§11.2).
+
+### 11.4 The verified peer key
+
+`Peer.VerifiedClientPublicKey()` answers the question the identity check of
+sidecar DESIGN.md §6.4 asks: which client key did the end-to-end session that
+opened these frames verify? `EncryptionSettings.ExposeVerifiedPeerClientKey` turns
+it on. It holds for the frames of one callback and is taken from the session that
+opened them at the moment it did, not looked up by peer afterwards, so it says
+nothing about a peer in general:
+
+- A frame that arrived in plaintext has no key, even from a peer with a sealed
+  session, and so does a frame from the control id, loopback, and a key the
+  signed-identity gate holds or has refused. Every path into a callback carries
+  it: the acked and no-ack Pack paths, both delivery dispatches, the generic
+  callbacks and both kinds of subprotocol listener.
+- One callback carries one `Peer`, so a sealed frame and a plaintext one never
+  share a batch while this is on.
+- It is read-only: the result is a value, the session's bytes are not reachable
+  from a `Peer`, and reading it per frame allocates nothing.
+- The key is what the session verified, not whose it is. The platform binds a
+  key to a client id; the sidecar closes that gap with its own binding and pin.
+
+Off by default it reports nothing, and the key plays no part in forming a batch.
+
+### 11.5 What a client that opts in to nothing sees
+
+One thing changes: a `Subprotocol` frame from the control id, or either query
+frame from it, is dropped and counted instead of delivered. The platform has never
+sent one, so only a forged frame ever took that path. Everything else is as it
+was: frames from peers, top-level frames from the control id, `Peer`'s existing
+fields, the batches a receive callback gets, and every byte on the wire.
