@@ -173,7 +173,9 @@ func TestTunDialFirstIpFamilyFallsBackFromRefusal(t *testing.T) {
 // family and land on their own.
 func TestTunDialFirstIpFamilyKeepsPinnedFamilies(t *testing.T) {
 	ipv4Only := tunFirstFamilySettings(6)
-	ipv4Only.Mtu = DefaultMtu
+	ipv4Only.DisableIpv6 = true
+	ipv4LowMtu := tunFirstFamilySettings(6)
+	ipv4LowMtu.Mtu = tunIpv6MinimumMtu - 1
 	for _, test := range []struct {
 		name     string
 		settings *TunSettings
@@ -186,6 +188,7 @@ func TestTunDialFirstIpFamilyKeepsPinnedFamilies(t *testing.T) {
 		{name: "v4 literal with first v6", settings: tunFirstFamilySettings(6), network: "tcp", literal: 4, want: 4},
 		{name: "v6 literal with first v4", settings: tunFirstFamilySettings(4), network: "tcp", literal: 6, want: 6},
 		{name: "ipv4-only tun with first v6", settings: ipv4Only, network: "tcp", want: 4},
+		{name: "below-minimum tun with first v6", settings: ipv4LowMtu, network: "tcp", want: 4},
 	} {
 		self := newTunFirstFamilyFixture(t, test.settings, []int{4, 6}, 0)
 		host := self.host

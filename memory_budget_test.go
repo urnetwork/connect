@@ -187,7 +187,7 @@ func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
 		case 4096, 8192:
 			AssertEqual(t, pool.capacity(), int(3*mib(1)/4)/pool.size)
-		case 9216:
+		case 12288:
 			AssertEqual(t, pool.capacity(), int(mib(1)/2)/pool.size)
 		}
 	}
@@ -214,7 +214,7 @@ func TestResizeMessagePoolsSplitsBudget(t *testing.T) {
 			AssertEqual(t, pool.capacity(), int(9*mib(1)/4)/pool.size)
 		case 4096, 8192:
 			AssertEqual(t, pool.capacity(), int(mib(3))/pool.size)
-		case 9216:
+		case 12288:
 			AssertEqual(t, pool.capacity(), 0)
 		}
 	}

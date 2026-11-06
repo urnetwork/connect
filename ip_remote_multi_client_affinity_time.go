@@ -164,7 +164,7 @@ func (self *RemoteUserNatMultiClient) adoptAffinityClientWithLock(
 	}
 	client.stateLock.Lock()
 	defer client.stateLock.Unlock()
-	if client.IsDone() || !client.healthy || client.endErr != nil || client.warning || client.quarantined ||
+	if client.IsDone() || client.serviceRefreshReservation.Load() != nil || !client.healthy || client.endErr != nil || client.warning || client.quarantined ||
 		update.ipPath != nil && !client.supportsIpVersion(update.ipPath.Version) {
 		return false
 	}
@@ -185,6 +185,10 @@ func (self *RemoteUserNatMultiClient) adoptAffinityClientWithLock(
 			return false
 		}
 	}
+	// Initial inheritance has no race candidate. Hold its channel claim until
+	// parent bookkeeping publishes this real selected flow after the first send.
+	client.serviceRefreshRaceReferences.Add(1)
 	update.inheritAffinityClient(client, selection)
+	update.transferServiceRefreshBindingWithLock(client)
 	return true
 }

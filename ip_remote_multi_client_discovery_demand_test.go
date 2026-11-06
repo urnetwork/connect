@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,19 +17,20 @@ import (
 // Availability changes only the provider set; no fixture notification is sent.
 type discoveryDemandTestGenerator struct {
 	*reraceGenerator
-	mutex              sync.Mutex
-	qualityReads       int
-	emptyReads         int
-	mints              int
-	retired            map[Id]int
-	holdNextEmpty      bool
-	emptyEntered       chan struct{}
-	emptyRelease       chan struct{}
-	emptyOnce          sync.Once
-	holdNextAvailable  bool
-	availableEntered   chan struct{}
-	availableRelease   chan struct{}
-	configureNewClient func(*MultiClientGeneratorClientArgs, *ClientSettings)
+	mutex                 sync.Mutex
+	qualityReads          int
+	resultOverrideForTest map[MultiHopId]DestinationStats
+	emptyReads            int
+	mints                 int
+	retired               map[Id]int
+	holdNextEmpty         bool
+	emptyEntered          chan struct{}
+	emptyRelease          chan struct{}
+	emptyOnce             sync.Once
+	holdNextAvailable     bool
+	availableEntered      chan struct{}
+	availableRelease      chan struct{}
+	configureNewClient    func(*MultiClientGeneratorClientArgs, *ClientSettings)
 	// the platform's strict window handover override each listing answers
 	// with, nil for none, which the generator takes from each answer as the
 	// api generator takes it from find-providers2
@@ -54,6 +56,12 @@ func (self *discoveryDemandTestGenerator) NextDestinationsWithIpFamilyContext(ct
 		self.strictWindowHandoverOverride.observe(self.platformStrictWindowHandover.Load())
 	}
 	self.mutex.Lock()
+	if rank == "quality" && self.resultOverrideForTest != nil {
+		result = make(map[MultiHopId]DestinationStats, len(self.resultOverrideForTest))
+		for destination, stats := range self.resultOverrideForTest {
+			result[destination] = stats
+		}
+	}
 	if rank == "quality" {
 		self.qualityReads++
 		if err == nil && len(result) == 0 {
@@ -391,6 +399,16 @@ func testDiscoveryDemandLateVisibility(t *testing.T, holdEmpty bool) {
 			generator.holdNextAvailable = true
 			generator.mutex.Unlock()
 		}
+		update.stateLock.Lock()
+		originalOwner := update.synRetry
+		var originalSerial uint64
+		var originalCredit *transferRetainedControlCredit
+		if originalOwner != nil {
+			originalSerial, originalCredit = originalOwner.serial, originalOwner.credit
+		}
+		update.stateLock.Unlock()
+		collapseBeforeLate := h.multiClient.TcpCollapseDropCount()
+		sourceFirst := discoveryDemandTestHoldAutomaticRetry(t, h, failedPath, update)
 		// Strictly after the empty snapshot, construction changes availability
 		// only. The next real source retransmit must reassert discovery demand.
 		time.Sleep(100 * time.Millisecond)
@@ -427,12 +445,15 @@ func testDiscoveryDemandLateVisibility(t *testing.T, holdEmpty bool) {
 			t.Fatal("late admission exceeded its original read/mint/custody budget")
 		}
 		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+		sourceFirst.requireHeld(t)
 		if !h.syn(failedPath) {
+			t.Logf("DISCOVERY_MANUAL_WINNER_SCALARS %v", discoveryDemandManualWinnerSnapshot(h, failedPath, update, originalOwner, originalSerial, originalCredit, collapseBeforeLate))
 			t.Fatal("original next SYN was not admitted")
 		}
 		if _, ok := h.synAck(failedPath); !ok || h.boundTo(failedPath) != h.channel("late") {
 			t.Fatal("newly available exit did not answer the unchanged connect attempt")
 		}
+		sourceFirst.requireManualWinnerAndRelease(t)
 		for index, path := range paths {
 			if h.boundTo(path) != owners[index] || owners[index].IsDone() || owners[index].isWarning() || owners[index].dialStarved() ||
 				!h.send(reraceSegment(path, uint32(4*len(payload)), payload)) || len(h.delivered(path)) != 6 {
@@ -469,4 +490,253 @@ func discoveryDemandTestEarlierTime(first, second time.Time) time.Time {
 		return first
 	}
 	return second
+}
+
+// A full strict quality window keeps four established siblings and one idle
+// slot. Only the new navigation's exact service fails on its original exits.
+func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		path := unboundFlowTcpPath(52891)
+		specs := make([]reraceExitSpec, 5)
+		for index := range specs {
+			specs[index] = reraceExitSpec{name: string(rune('a' + index)), answer: func(candidate *IpPath) reraceAnswer {
+				if candidate.DestinationIp.Equal(path.DestinationIp) && candidate.DestinationPort == path.DestinationPort {
+					return reraceSignal
+				}
+				return reraceAccept
+			}}
+		}
+		h, generator := newDiscoveryDemandTestHarness(t, specs, func(settings *MultiClientSettings) {
+			settings.StrictWindowHandover = true
+		})
+		window, paths, owners := discoveryDemandTestCarryFour(t, h)
+		synctest.Wait()
+		window.stateLock.Lock()
+		full := len(window.clients) == 5 && window.discoveryDemand.owner == nil
+		window.stateLock.Unlock()
+		if !full || window.strictWindowAdmissionAllowed(NewId(), window.settings.WindowSizes[WindowTypeQuality]) || h.multiClient.backendDegraded() {
+			t.Fatal("full-window control lacks five healthy owners at its exact strict cap")
+		}
+		beforeReads, _, beforeMints, _ := generator.counts()
+		publication := discoveryDemandTestObservePublication(window)
+		start := time.Now()
+		if !privateCrossWindowNativeSyn(h, path) {
+			t.Fatal("original native navigation SYN was not source-admitted")
+		}
+		update := h.update(path)
+		if update == nil {
+			t.Fatal("source-admitted navigation lost its canonical update")
+		}
+		update.stateLock.Lock()
+		refused, inbound, bound := len(update.dialFailedClients), update.receivedInbound.Load(), update.client.Load()
+		update.stateLock.Unlock()
+		if refused != 5 || inbound || bound != nil || h.metrics().DialFailuresIntercepted != 5 {
+			t.Fatalf("full-window control did not observe five actual same-service refusals: failed=%d intercepted=%d", refused, h.metrics().DialFailuresIntercepted)
+		}
+		discoveryDemandServiceRefreshOwner(t, window, update)
+		// Physical availability follows the real refusals. It sends no generator
+		// notification, changes no timer, and creates no discovery identity.
+		h.addExit(reraceExitSpec{name: "late"})
+		h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
+		if !privateCrossWindowNativeSyn(h, path) {
+			t.Fatal("unchanged native retransmission was not source-admitted")
+		}
+		// Use the next unchanged source retransmission boundary. Virtual time
+		// advances only after the real enumerator and packet workers are idle.
+		published := discoveryDemandTestAwaitPublication(t, publication, start.Add(reraceSynSchedule[2]))
+		synctest.Wait()
+		reads, _, mints, _ := generator.counts()
+		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
+		window.stateLock.Lock()
+		installed := len(window.clients)
+		window.stateLock.Unlock()
+		if installed > 5 || mints > beforeMints+1 || reads > beforeReads+3 {
+			t.Fatalf("service recovery exceeded its existing window/read/mint bounds: installed=%d reads=%d mints=%d", installed, reads-beforeReads, mints-beforeMints)
+		}
+		if !published || reads == beforeReads {
+			t.Fatalf("DISCOVERY_DEMAND_FULL_WINDOW_SERVICE_EXHAUSTION_DID_NOT_RELIST: published=%t reads=%d mints=%d installed=%d", published, reads-beforeReads, mints-beforeMints, installed)
+		}
+		late := h.channel("late")
+		if late.IsDone() || late.isWarning() || installed != 5 {
+			t.Fatal("bounded full-window recovery did not publish one healthy late owner at the existing ceiling")
+		}
+		// This control isolates discovery/admission. The separately named
+		// publication control checks retry without a later native source offer.
+		if _, answered := h.synAck(path); !answered {
+			if !privateCrossWindowNativeSyn(h, path) {
+				t.Fatal("original next native SYN was not admitted to its published alternative")
+			}
+		}
+		if _, answered := h.synAck(path); !answered || h.boundTo(path) != late || h.update(path) != update {
+			t.Fatal("published alternative did not establish the unchanged navigation generation")
+		}
+		reraceAssertNoErrorDelivered(t, h, path)
+	})
+}
+
+// A late provider's publication follows the source offer's completed selection.
+// This isolates continuation from discovery in the existing vacant acquisition.
+func TestDiscoveryDemandLatePublicationRetriesRetainedNativeSyn(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		path := unboundFlowTcpPath(52892)
+		specs := make([]reraceExitSpec, 4)
+		for index := range specs {
+			specs[index] = reraceExitSpec{name: string(rune('a' + index)), answer: func(candidate *IpPath) reraceAnswer {
+				if candidate.DestinationIp.Equal(path.DestinationIp) && candidate.DestinationPort == path.DestinationPort {
+					return reraceSignal
+				}
+				return reraceAccept
+			}}
+		}
+		h, generator := newDiscoveryDemandTestHarness(t, specs, func(settings *MultiClientSettings) {
+			settings.StrictWindowHandover = true
+		})
+		window, paths, owners := discoveryDemandTestCarryFour(t, h)
+		synctest.Wait()
+		window.stateLock.Lock()
+		deadline := window.discoveryDemand.deadline
+		live := window.discoveryDemand.owner != nil && window.discoveryDemand.slotOpen && time.Until(deadline) > reraceSynSchedule[2]
+		window.stateLock.Unlock()
+		if !live || len(h.liveChannels()) != 4 || h.multiClient.backendDegraded() {
+			t.Fatal("late-publication control lacks the existing vacant live acquisition")
+		}
+		publication := discoveryDemandTestObservePublication(window)
+		beforeReads, beforeEmpty, beforeMints, beforeRetired := generator.counts()
+		start := time.Now()
+		if !privateCrossWindowNativeSyn(h, path) {
+			t.Fatal("original native navigation SYN was not admitted")
+		}
+		update := h.update(path)
+		if update == nil {
+			t.Fatal("original source lost its canonical update")
+		}
+		update.stateLock.Lock()
+		refused, inbound, bound := len(update.dialFailedClients), update.receivedInbound.Load(), update.client.Load()
+		update.stateLock.Unlock()
+		reads, empty, _, _ := generator.counts()
+		if refused != 4 || inbound || bound != nil || h.metrics().DialFailuresIntercepted != 4 || reads != beforeReads+1 || empty != beforeEmpty+1 {
+			t.Fatal("late-publication control lacks four actual refusals and one completed empty listing")
+		}
+		synRetryControlOwner(t, update)
+		generator.mutex.Lock()
+		generator.holdNextAvailable = true
+		generator.mutex.Unlock()
+		h.addExit(reraceExitSpec{name: "late"})
+		h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
+		if !privateCrossWindowNativeSyn(h, path) {
+			t.Fatal("reasserting native source SYN was not admitted")
+		}
+		select {
+		case <-generator.availableEntered:
+		default:
+			t.Fatal("actual late listing did not reach its owned availability barrier")
+		}
+		if len(h.liveChannels()) != 4 || len(h.exit("late").syns(path)) != 0 || update.receivedInbound.Load() {
+			t.Fatal("late provider escaped before the reasserting source offer returned")
+		}
+		close(generator.availableRelease)
+		publicationBound := discoveryDemandTestEarlierTime(deadline, start.Add(reraceSynSchedule[2]))
+		if !discoveryDemandTestAwaitPublication(t, publication, publicationBound) {
+			t.Fatal("existing vacant acquisition failed to publish the gated real late provider")
+		}
+		synctest.Wait()
+		late := h.channel("late")
+		reads, empty, mints, retired := generator.counts()
+		if len(h.liveChannels()) != 5 || reads != beforeReads+2 || empty != beforeEmpty+1 || mints != beforeMints+1 || retired != beforeRetired {
+			t.Fatal("late-publication control changed its original listing/mint/admission custody")
+		}
+		// Observe the target before healthy sibling sends can wake the parent
+		// worker. Later progress is checked without changing this receipt.
+		_, answered := h.synAck(path)
+		targetOwner, targetSynCount := h.boundTo(path), len(h.exit("late").syns(path))
+		sameUpdate, targetInbound := h.update(path) == update, update.receivedInbound.Load()
+		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
+		if !answered || targetOwner != late || targetSynCount != 1 {
+			t.Fatalf("SYN_RETRY_FRESH_PROVIDER_PUBLICATION_WAS_NOT_CONSUMED: provider_syns=%d answered=%t same_update=%t", targetSynCount, answered, sameUpdate)
+		}
+		if !sameUpdate || !targetInbound {
+			t.Fatal("publication continuation established a different flow generation")
+		}
+		reraceAssertNoErrorDelivered(t, h, path)
+	})
+}
+
+// Exercise each original body owner after the observation, not just its flags.
+func discoveryDemandFullWindowAssertSiblings(t *testing.T, h *reraceHarness, paths []*IpPath, owners []*multiClientChannel) {
+	t.Helper()
+	payload := []byte("held original CSS sibling")
+	for index, path := range paths {
+		if h.boundTo(path) != owners[index] || owners[index].IsDone() || owners[index].isWarning() || owners[index].dialStarved() ||
+			!h.send(reraceSegment(path, uint32(4*len(payload)), payload)) || len(h.delivered(path)) != 6 {
+			t.Fatal("service recovery changed an original healthy body's owner or progress")
+		}
+	}
+}
+
+// The OLD source has only the cache reference. A service-capable source must
+// identify this exact window reservation before its second reference is valid.
+func discoveryDemandServiceRefreshOwner(t *testing.T, window *multiClientWindow, update *multiClientChannelUpdate) *tcpSynRetry {
+	t.Helper()
+	window.stateLock.Lock()
+	defer window.stateLock.Unlock()
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	owner := update.synRetry
+	expected := uint32(1)
+	field := reflect.ValueOf(window).Elem().FieldByName("serviceRefreshOwner")
+	if field.IsValid() && !field.IsNil() {
+		if owner == nil || field.Pointer() != reflect.ValueOf(owner).Pointer() {
+			t.Fatal("service window retained a different source owner")
+		}
+		expected++
+	}
+	if owner == nil || owner.packet == nil || owner.credit == nil || owner.serial == 0 || owner.references != expected {
+		t.Fatalf("service source lacks exact cache/window ownership: expected_refs=%d", expected)
+	}
+	return owner
+}
+
+// Failure-only, sequential observations after h.syn already settled its actual
+// result. No packet, wake, ownership or acceptance predicate is changed.
+func discoveryDemandManualWinnerSnapshot(h *reraceHarness, path *IpPath, update *multiClientChannelUpdate, original *tcpSynRetry, serial uint64, credit *transferRetainedControlCredit, collapseBefore uint64) map[string]any {
+	current := h.update(path)
+	late := h.channel("late")
+	wire := h.exit("late").syns(path)
+	result := map[string]any{"same_update": current == update, "bound_late": h.boundTo(path) == late, "native_offers": len(h.sentSyns(path)), "late_wire_syns": len(wire), "original_serial": serial, "collapse_before": collapseBefore, "collapse_after": h.multiClient.TcpCollapseDropCount(), "late_done": late.IsDone(), "late_warning": late.isWarning()}
+	update.stateLock.Lock()
+	result["received_inbound"] = update.receivedInbound.Load()
+	result["current_owner_present"] = update.synRetry != nil
+	result["current_owner_same_original"] = update.synRetry == original
+	result["failed_clients"] = len(update.dialFailedClients)
+	if original != nil {
+		result["original_refs"] = original.references
+		result["original_queued"] = original.queued
+		result["original_packet_present"] = original.packet != nil
+		result["original_update_present"] = original.update != nil
+		result["original_publication_indexed"] = original.publicationIndexed
+	}
+	update.stateLock.Unlock()
+	result["original_credit_present"] = credit != nil
+	if credit != nil {
+		result["original_credit_released"] = credit.released.Load()
+	}
+	if len(wire) != 0 {
+		result["wire_isn"] = wire[0].path.SequenceNumber
+		result["wire_original_isn"] = wire[0].path.SequenceNumber == path.SequenceNumber
+	}
+	packet, answered := h.synAck(path)
+	result["real_syn_ack"] = answered
+	if answered {
+		reply, err := ParseIpPath(packet.packet)
+		result["syn_ack_parse_ok"] = err == nil
+		if err == nil {
+			result["ack_isn"] = reply.AckSequenceNumber
+			result["ack_original_isn"] = reply.AckSequenceNumber == path.SequenceNumber+1
+		}
+	}
+	return result
 }

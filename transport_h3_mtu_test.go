@@ -11,8 +11,8 @@ import (
 // bounded H3 carrier. Keep this beside the carrier so the global TUN MTU is
 // never changed from IP/UDP/QUIC overhead alone.
 func TestH3SingleDatagramTunnelMtuSizing(t *testing.T) {
-	if DefaultMtu != 1100 {
-		t.Fatalf("global tunnel MTU=%d want=1100", DefaultMtu)
+	if DefaultMtu != 1280 {
+		t.Fatalf("global tunnel MTU=%d want=1280", DefaultMtu)
 	}
 	path := TransferPath{
 		SourceId:      NewId(),
@@ -93,9 +93,9 @@ func TestH3SingleDatagramTunnelMtuSizing(t *testing.T) {
 		"two coalesced packets": {DefaultMtu / 2, DefaultMtu / 2},
 	} {
 		wrapped := wrappedByteCount(packetByteCounts...)
-		if !settings.UseDatagram(wrapped) {
+		if settings.UseDatagram(wrapped) {
 			t.Fatalf(
-				"%s encrypted Transfer bytes=%d exceeds hybrid limit=%d",
+				"%s encrypted Transfer bytes=%d must use stream beyond hybrid limit=%d",
 				name,
 				wrapped,
 				settings.HybridDatagramMessageByteCount,

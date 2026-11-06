@@ -829,6 +829,7 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 		}
 		if materialized {
 			*written |= bit
+			self.noteSynRetryControlMaterializedWithLock(index)
 		} else {
 			*disposed |= bit
 		}

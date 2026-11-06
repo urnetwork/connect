@@ -45,6 +45,48 @@ class SpecTest(unittest.TestCase):
                     responses["403"]["$ref"],
                 )
 
+    def test_unique_exit_names_match_the_server(self):
+        # model/proxy_unique_exit_model.go and model/network_client_model.go
+        schemas = self.spec["components"]["schemas"]
+        proxy_config = schemas["AuthNetworkClientArgs"]["properties"]["proxy_config"]
+        self.assertEqual("boolean", proxy_config["properties"]["unique_exit"]["type"])
+        self.assertEqual(
+            ["auto", "manual"],
+            [o["const"] for o in proxy_config["properties"]["unique_exit_replace"]["oneOf"]],
+        )
+        result = schemas["AuthNetworkClientResult"]["properties"]
+        self.assertEqual(
+            "#/components/schemas/ProxyExit",
+            result["proxy_config_result"]["allOf"][0]["properties"]["exit"]["$ref"],
+        )
+        self.assertEqual("boolean", result["error"]["properties"]["no_unique_supply"]["type"])
+        item = schemas["NetworkClientsResult"]["properties"]["clients"]["items"]
+        self.assertEqual("#/components/schemas/ProxyExit", item["properties"]["exit"]["$ref"])
+        exit = schemas["ProxyExit"]
+        self.assertEqual(
+            {"exit_id", "country_code", "region", "city", "exit_since", "state", "state_reason", "replace_mode"},
+            set(exit["properties"]),
+        )
+        self.assertEqual(
+            ["assigned", "replacing", "no_supply"],
+            [o["const"] for o in exit["properties"]["state"]["oneOf"]],
+        )
+        rotate = self.spec["paths"]["/network/proxy/rotate-exit"]["post"]
+        self.assertEqual(
+            "#/components/schemas/RotateProxyExitArgs",
+            rotate["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        self.assertEqual(
+            "#/components/schemas/RotateProxyExitResult",
+            rotate["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        self.assertEqual("#/components/responses/ClientJwtRefused", rotate["responses"]["403"]["$ref"])
+        self.assertEqual(["client_id"], schemas["RotateProxyExitArgs"]["required"])
+        self.assertEqual(
+            {"no_unique_supply", "rate_limited", "message"},
+            set(schemas["RotateProxyExitResult"]["properties"]["error"]["properties"]),
+        )
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

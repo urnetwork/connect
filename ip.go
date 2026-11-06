@@ -30,32 +30,22 @@ import (
 // use 0 for deadlock testing
 const defaultIpBufferSize = 1024
 
-// packets are written directly into the receiver tap/tun interface,
-// so the packet size must not exceed the device interface MTU.
-// this is a contract with the devices and must not be raised.
-// DefaultMtu is the largest packet the provider-side packetizer builds, for
-// both families. At 1,100 bytes, a full steady-state encrypted IP Transfer
-// frame uses H3's reliable stream at QUIC's safe 1,200-byte packet floor and
-// fits one DATAGRAM on the optimistic discovered path; smaller complete
-// messages that fit one DATAGRAM retain the unordered packet lane. IPv6 does
-// not require packets to be 1,280 bytes, only that the link carry them, so
-// the packetizer keeps this size for v6 as well and the link requirement
-// lives in DefaultTunnelMtu.
-const DefaultMtu = 1100
+// Every inner IP packetizer and native tunnel defaults to the IPv6 minimum
+// link MTU. Carrier selection still uses the complete encoded Transfer size:
+// H3 falls back to its reliable stream when one DATAGRAM cannot fit it.
+const DefaultMtu = 1280
 
-// DefaultTunnelMtu is the interface mtu every native tunnel and the gVisor tun
-// configure. It is 1,280 because Linux, Darwin and gVisor refuse IPv6 on a
-// link below RFC 8200's minimum, and it stays a separate constant from
-// DefaultMtu because raising the packet size would take a full return packet
-// off H3's single-DATAGRAM lane on every real path (see the H3 mtu sizing
-// test). Packets the client originates may be as large as this; the transfer
-// batch bound admits an oversized first frame on its own, and the provider
-// side accepts any size the tun can carry. Must never be below DefaultMtu.
-const DefaultTunnelMtu = 1280
+// Native interfaces and provider packetizers share one default. A smaller
+// configured path or peer MSS remains a per-flow restriction.
+const DefaultTunnelMtu = DefaultMtu
 const Ipv4HeaderSizeWithoutExtensions = 20
 const Ipv6HeaderSize = 40
 const UdpHeaderSize = 8
 const TcpHeaderSizeWithoutExtensions = 20
+
+// RFC 9293 section 3.7.1 defines the send MSS when the peer omits its option.
+const tcpDefaultIpv4Mss = 536
+const tcpDefaultIpv6Mss = 1220
 
 const debugVerifyHeaders = false
 
@@ -445,10 +435,9 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		// pins its channels, read buffer, and goroutines until reaped
 		IdleTimeout: 60 * time.Second,
 		Mtu:         DefaultMtu,
-		// QUIC Initial datagrams are at least 1,200 bytes. The IP packet path
-		// fragments them at DefaultMtu, but the provider-facing UDP socket must
-		// first receive the complete datagram. 2 KiB covers ordinary QUIC and
-		// EDNS responses without a 64 KiB buffer in every UDP flow.
+		// Receive complete ordinary QUIC/EDNS datagrams before packetization.
+		// This accepted-payload bound is independent of the inner IP MTU;
+		// a one-byte scratch sentinel detects and discards larger datagrams.
 		ReadBufferByteCount: defaultUdpReadBufferByteCount,
 		SequenceBufferSize:  bufferSize,
 		WriteBatchSize:      64,
@@ -2159,11 +2148,12 @@ type UdpBufferSettings struct {
 	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
 	EgressTtlMode EgressTtlMode
 	// nil resolves to the local user nat `Log`
-	Log                 Logger
-	ReadTimeout         time.Duration
-	WriteTimeout        time.Duration
-	IdleTimeout         time.Duration
-	Mtu                 int
+	Log          Logger
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
+	Mtu          int
+	// Maximum accepted UDP payload; readers add one bounded detection byte.
 	ReadBufferByteCount int
 	SequenceBufferSize  int
 	// the maximum number of payloads to process under a single write deadline.
@@ -3712,7 +3702,8 @@ func (self *UdpSequence) Run() {
 		// packets remain valid and drain in shard FIFO order.
 		defer self.cancel()
 
-		buffer := make([]byte, self.udpBufferSettings.ReadBufferByteCount)
+		buffer := make([]byte, udpReadScratchByteCount(self.udpBufferSettings.ReadBufferByteCount))
+		maximumReadByteCount := len(buffer) - 1
 		// the reader owns the socket's read deadline
 		readDeadline := newIoDeadline(self.udpBufferSettings.ReadTimeout, socket.SetReadDeadline)
 
@@ -3745,6 +3736,13 @@ func (self *UdpSequence) Run() {
 					continue
 				}
 				break
+			}
+
+			// An oversized datagram was consumed, not accepted. Never turn its
+			// truncated prefix into a new, checksum-valid application datagram.
+			if maximumReadByteCount < n {
+				lease.abort()
+				continue
 			}
 
 			if err != nil {
@@ -5544,6 +5542,10 @@ func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
 	self.receiveWindowScale = tcp.windowScale
 	self.enableTimestamp = tcp.enableTimestamp
 	self.timestampRecent = tcp.timestampValue
+	self.peerMss = tcpDefaultIpv4Mss
+	if self.ipVersion == 6 {
+		self.peerMss = tcpDefaultIpv6Mss
+	}
 	if tcp.enableMss {
 		self.peerMss = tcp.mss
 	}

@@ -550,7 +550,7 @@ func (self *multiClientChannel) windowWarningCause() windowWarningCause {
 	defer self.stateLock.Unlock()
 	if self.warning {
 		switch self.warnCause {
-		case warnDraining:
+		case warnDraining, warnServiceRefresh:
 			return windowWarningDrain
 		case warnStarved:
 			return windowWarningStarved

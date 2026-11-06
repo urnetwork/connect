@@ -647,6 +647,7 @@ func requireTransferFrameBytes(frame *protocol.Frame, sourceId Id, destinationId
 
 type conditioner struct {
 	ctx             context.Context
+	done            chan struct{}
 	fixedDelay      time.Duration
 	randomDelay     time.Duration
 	hold            bool
@@ -660,6 +661,7 @@ type conditioner struct {
 func newConditioner(ctx context.Context, in chan []byte) (*conditioner, chan []byte) {
 	c := &conditioner{
 		ctx:             ctx,
+		done:            make(chan struct{}),
 		fixedDelay:      0,
 		randomDelay:     0,
 		lossProbability: 0,
@@ -696,9 +698,12 @@ func (self *conditioner) calcDelay() time.Duration {
 	return delay
 }
 
+// Owns each received root through loss, delay and handoff. done closes only
+// after the receive loop and every delayed handoff have relinquished custody.
 func (self *conditioner) run(in chan []byte, out chan []byte) {
-	// defer close(out)
-
+	defer close(self.done)
+	var delayedWorkers sync.WaitGroup
+	defer delayedWorkers.Wait()
 	for {
 		select {
 		case <-self.ctx.Done():
@@ -709,33 +714,27 @@ func (self *conditioner) run(in chan []byte, out chan []byte) {
 			if !ok {
 				return
 			}
-
 			if self.calcLoss() {
+				MessagePoolReturn(b)
 				continue
 			}
-
 			delay := self.calcDelay()
-
 			if delay <= 0 {
-				select {
-				case <-self.ctx.Done():
+				if !forwardOwnedTestWire(self.ctx, out, b) {
 					return
-				case out <- b:
 				}
 			} else {
-				go func() {
+				delayedWorkers.Add(1)
+				go func(message []byte) {
+					defer delayedWorkers.Done()
 					select {
 					case <-self.ctx.Done():
+						MessagePoolReturn(message)
 						return
 					case <-time.After(delay):
 					}
-
-					select {
-					case <-self.ctx.Done():
-						return
-					case out <- b:
-					}
-				}()
+					forwardOwnedTestWire(self.ctx, out, message)
+				}(b)
 			}
 		}
 	}

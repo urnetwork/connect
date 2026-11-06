@@ -5737,7 +5737,10 @@ type SendBufferSettings struct {
 	beforeGroupAdmissionForTest         func()
 	beforeGroupDequeueForTest           func(*SendSequence)
 	beforeGroupRetainForTest            func()
-	afterIdleCloseForTest               func(sendSequenceId, bool)
+	// Nil test-only source gate, outside all flow/parent/queue locks. Frames
+	// remain borrowed from this synchronous owner until the callback returns.
+	afterGroupDispositionForTest func(*SendSequence, sendGroupDisposition, []*protocol.Frame)
+	afterIdleCloseForTest        func(sendSequenceId, bool)
 	// Nil observer counts each arm of the send loop's deadline timer.
 	afterDeadlineTimerArmForTest func(sendSequenceId)
 	// Nil observer marks an application Pack entering the Opportunistic
@@ -12414,6 +12417,9 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	}
 	ownDisposition = false
 	disposition.complete(ack)
+	if hook := self.sendBufferSettings.afterGroupDispositionForTest; hook != nil {
+		hook(self, disposition, sendFrames)
+	}
 	disposition.retainSynRetry(self, sendFrames)
 	// Report source ownership before pool return, still synchronously and
 	// before any observer or writer. No deferred frame slice is retained.

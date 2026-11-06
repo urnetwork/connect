@@ -96,6 +96,9 @@ type testActivateOperator struct {
 	// the `probe_steps` a refusal carries (C2b), none as an operator that
 	// predates the field sends
 	probeSteps []*ExtenderActivateProbeStep
+	// the `refused_carriers` an activation carries (C2a), none as an operator
+	// that predates the field sends
+	refusedCarriers []*ExtenderActivateCarrierRefusal
 	// the address an activation of a family is answered with, by family; the
 	// family's fixed address while unset
 	publishedIps map[int]string
@@ -254,6 +257,7 @@ func (self *testActivateOperator) activateResult(
 	if publishedIp, ok := self.publishedIps[ipVersion]; ok {
 		ip = publishedIp
 	}
+	refusedCarriers := self.refusedCarriers
 	self.activatedIps[ipVersion] = ip
 	activatedIps := []string{}
 	for _, activatedIpVersion := range []int{4, 6} {
@@ -279,14 +283,15 @@ func (self *testActivateOperator) activateResult(
 		return nil, err
 	}
 	return &ExtenderActivateResult{
-		Activated:    true,
-		Ip:           ip,
-		IpVersion:    ipVersion,
-		Carriers:     args.Carriers,
-		ExpireTime:   &expireTime,
-		AllowedHosts: []string{testExtenderNetworkHost, "*." + testExtenderNetworkHost},
-		Record:       record,
-		Bootstrap:    []string{bootstrapRecord},
+		Activated:       true,
+		Ip:              ip,
+		IpVersion:       ipVersion,
+		Carriers:        args.Carriers,
+		ExpireTime:      &expireTime,
+		AllowedHosts:    []string{testExtenderNetworkHost, "*." + testExtenderNetworkHost},
+		Record:          record,
+		Bootstrap:       []string{bootstrapRecord},
+		RefusedCarriers: refusedCarriers,
 	}, nil
 }
 
@@ -372,6 +377,14 @@ func (self *testActivateOperator) setRefusalCode(refusalCode string) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.refusalCode = refusalCode
+}
+
+// The `refused_carriers` every activation carries from now on (C2a), nil for
+// none.
+func (self *testActivateOperator) setRefusedCarriers(refusedCarriers []*ExtenderActivateCarrierRefusal) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.refusedCarriers = refusedCarriers
 }
 
 // The `probe_steps` every refusal carries from now on (C2b), nil for none.

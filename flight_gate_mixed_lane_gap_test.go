@@ -194,7 +194,12 @@ type mixedLaneOptions struct {
 	replySerialization time.Duration
 	blockFastReplies   bool
 	directLaneDisabled bool
-	deferTimeoutResend bool
+	// Position-counting rows require one application frame per Transfer Pack.
+	singleFramePacks bool
+	// Historical load rows may fix the logical H1 Pack byte ceiling without
+	// changing the current IP MTU or any transport/receive queue.
+	h1EstablishedMessageByteCount ByteCount
+	deferTimeoutResend            bool
 	// Borrows the slow-lane frame before delivery; deterministic ordering
 	// tests may hold the first handoff while later frames become ready.
 	beforeSlowDelivery func([]byte)
@@ -315,6 +320,17 @@ func fastCarrierProperties(options mixedLaneOptions) TransferCarrierProperties {
 	return properties
 }
 
+// Pins only logical Pack geometry; H1 transport carriage remains unchanged.
+func mixedLaneChunkSettings(singleFramePacks bool) SendBufferChunkSettings {
+	settings := DefaultSendBufferChunkSettings()
+	if singleFramePacks {
+		settings.SharedMaxFrames = 1
+		settings.H1UnknownMaxFrames = 1
+		settings.H1KnownMaxFrames = 1
+	}
+	return settings
+}
+
 func newMixedLaneHarnessWithOptions(
 	t testing.TB,
 	options mixedLaneOptions,
@@ -326,6 +342,10 @@ func newMixedLaneHarnessWithOptions(
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
 		settings := DefaultClientSettings()
+		settings.SendBufferSettings.ChunkSettings = mixedLaneChunkSettings(options.singleFramePacks)
+		if options.h1EstablishedMessageByteCount > 0 {
+			settings.SendBufferSettings.ChunkSettings.H1EstablishedMaxMessageByteCount = options.h1EstablishedMessageByteCount
+		}
 		settings.SendBufferSettings.ApplicationPacing = options.applicationPacing
 		if options.constantSendWindow {
 			settings.SendBufferSettings.WindowSizing = WindowSizingConstant
@@ -751,6 +771,15 @@ func (self *mixedLaneGapHarness) startReverseLoad(interval time.Duration) {
 	}()
 }
 
+// Shares the exact application payload shape with the Pack-geometry control.
+func mixedLaneMessageContent() string {
+	content := ""
+	for len(content) < 900 {
+		content += "mixed-lane-gap-"
+	}
+	return content
+}
+
 // run sends messageCount application frames and waits for the receiver to
 // deliver every one, then returns the sender's recovery counters.
 func (self *mixedLaneGapHarness) run(
@@ -758,10 +787,7 @@ func (self *mixedLaneGapHarness) run(
 	messageCount int,
 ) ClientSendRecoveryStatsSnapshot {
 	t.Helper()
-	content := ""
-	for len(content) < 900 {
-		content += "mixed-lane-gap-"
-	}
+	content := mixedLaneMessageContent()
 	for index := 0; index < messageCount; index += 1 {
 		frame, err := ToFrame(
 			&protocol.SimpleMessage{Content: fmt.Sprintf("%s%d", content, index)},

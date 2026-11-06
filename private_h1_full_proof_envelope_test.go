@@ -274,8 +274,8 @@ type privateH1ProofFixture struct {
 // retained leaf make memory eligibility, rather than wall-clock speed, causal.
 func privateH1NewFixture(t *testing.T, version int, budgetBytes ByteCount, firstSmall bool, carrier TransportType, configure func(*SendBufferSettings)) *privateH1ProofFixture {
 	t.Helper()
-	if DefaultMtu != 1100 {
-		t.Fatal("canonical H1 experiment requires unchanged MTU1100")
+	if DefaultMtu != 1280 {
+		t.Fatal("canonical H1 experiment requires product MTU1280")
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	fixture := &privateH1ProofFixture{windowRoundFixture: &windowRoundFixture{t: t, ctx: ctx, cancel: cancel,
@@ -760,7 +760,7 @@ func privateH1FullWire(t *testing.T, sequence *SendSequence, frames []*protocol.
 	return wire
 }
 
-// At unchanged MTU1100, eight raw packets exceed16KiB with a valid3600-byte
+// At product MTU1280, eight raw packets exceed16KiB with a valid3600-byte
 // commitment under the unguarded eight-frame counterfactual. Version one is
 // an adjacent envelope control; its wrappers already split at the payload cap.
 func TestCanonicalH1FullProofEnvelopeSignedWireBoundary(t *testing.T) {
@@ -787,6 +787,18 @@ func TestCanonicalH1FullProofEnvelopeSignedWireBoundary(t *testing.T) {
 			if oldOuter <= 16*1024 {
 				t.Fatalf("v%d valid large proof did not reproduce old full-head overflow: %d", version, oldOuter)
 			}
+			// Preserve the real signed3600-byte chain: six must fit, while
+			// seven must exceed the actual complete encrypted H1 envelope.
+			for _, count := range []int{6, 7} {
+				for _, maximal := range []bool{false, true} {
+					wire := privateH1FullWire(t, sequence, frames[:count], maximal)
+					outer := privateH1SealedByteCount(t, path, wire)
+					MessagePoolReturn(wire)
+					if (count == 6 && outer > 16*1024) || (count == 7 && outer <= 16*1024) {
+						t.Fatalf("v%d full1280 proof count=%d maximal=%t encrypted=%d", version, count, maximal, outer)
+					}
+				}
+			}
 			maxFrames, requested := 8, ByteCount(8*DefaultMtu)
 			limit := sequence.h1PayloadEnvelopeLimit(frames, maxFrames, requested, 16*1024)
 			chunks := 0
@@ -801,8 +813,8 @@ func TestCanonicalH1FullProofEnvelopeSignedWireBoundary(t *testing.T) {
 						t.Fatalf("v%d bounded full head actual/bound=%d/%d", version, outer, bound)
 					}
 				}
-				if chunks == 0 && end != 7 {
-					t.Fatalf("v%d first physical chunk=%d, want7", version, end)
+				if chunks == 0 && end != 6 {
+					t.Fatalf("v%d first physical chunk=%d, want6", version, end)
 				}
 				start, chunks = end, chunks+1
 			}
@@ -832,7 +844,7 @@ func TestCanonicalH1FullProofLogicalGroupRetryOwnership(t *testing.T) {
 			}
 			first := fixture.data()
 			var last *windowRoundFrame
-			wantFirst := 7
+			wantFirst := 6
 			if wantFirst < 8 {
 				last = fixture.data()
 			}
@@ -962,7 +974,7 @@ func TestCanonicalH1FullProofRotationCompletesExpandedGroup(t *testing.T) {
 			fixture.requirePlatformClose(fixture.sender.ClientId(), firstContract)
 			fixture.requirePlatformControlsSettled()
 			sequence := fixture.sequence()
-			wantMiddle := 7
+			wantMiddle := 6
 			if sequence.sendContract.contractId == firstContract || len(sequence.sendContract.provideTlsCertificate) != 2 || len(middle.pack.Frames) != wantMiddle {
 				t.Fatal("actual replacement proof did not produce the bounded remaining partition")
 			}
@@ -990,7 +1002,7 @@ func TestCanonicalH1FullProofRotationCompletesExpandedGroup(t *testing.T) {
 			fixture.acknowledge()
 			if wantMiddle < 8 {
 				last := fixture.data()
-				if len(last.pack.Frames) != 1 || len(results) != 0 {
+				if len(last.pack.Frames) != 8-wantMiddle || len(results) != 0 {
 					t.Fatal("second ACK used the stale two-chunk completion count")
 				}
 				fixture.forward(last, fixture.receiverIn)
@@ -1071,14 +1083,14 @@ func TestCanonicalH1FullProofReadyDrainPreservesOriginalOwners(t *testing.T) {
 		fixture.releaseBarrier()
 		first := fixture.data()
 		var last *windowRoundFrame
-		wantFirst := 7
+		wantFirst := 6
 		if len(first.pack.Frames) != wantFirst {
 			t.Fatalf("ready physical first frames=%d, want%d", len(first.pack.Frames), wantFirst)
 		}
 		if wantFirst < 8 {
 			last = fixture.data()
-			if len(last.pack.Frames) != 1 {
-				t.Fatalf("ready physical tail frames=%d, want1", len(last.pack.Frames))
+			if len(last.pack.Frames) != 8-wantFirst {
+				t.Fatalf("ready physical tail frames=%d, want%d", len(last.pack.Frames), 8-wantFirst)
 			}
 		}
 		fixture.forward(resident, fixture.receiverIn)
@@ -1101,13 +1113,15 @@ func TestCanonicalH1FullProofReadyDrainPreservesOriginalOwners(t *testing.T) {
 		if last != nil {
 			fixture.forward(last, fixture.receiverIn)
 			fixture.acknowledge()
-			select {
-			case got := <-results:
-				if got != 7 {
-					t.Fatalf("restored tail callback=%d", got)
+			for want := wantFirst; want < 8; want++ {
+				select {
+				case got := <-results:
+					if got != want {
+						t.Fatalf("restored tail callback=%d want%d", got, want)
+					}
+				default:
+					t.Fatal("restored tail stranded")
 				}
-			default:
-				t.Fatal("restored tail stranded")
 			}
 		}
 		if len(fixture.delivered) != 10 || len(results) != 0 {
@@ -1436,7 +1450,7 @@ func TestCanonicalH1FullProofContractWaitRefreshesCarrierCeiling(t *testing.T) {
 			t.Fatalf("post-wait group admission=%+v", admitted)
 		}
 		first := fixture.data()
-		wantFirst := 7
+		wantFirst := 6
 		if len(first.pack.Frames) != wantFirst {
 			t.Fatalf("contract wait used a stale larger ceiling: first frames%d want%d", len(first.pack.Frames), wantFirst)
 		}
@@ -1589,7 +1603,7 @@ func TestCanonicalH1CloseLifecycleKeepsOriginalAndControlCustody(t *testing.T) {
 		firstContract := sequence.sendContract.contractId
 		fixture.forward(first, fixture.receiverIn)
 		fixture.acknowledge()
-		for _, count := range []int{7, 1} {
+		for _, count := range []int{6, 2} {
 			frame := fixture.data()
 			if len(frame.pack.Frames) != count || len(results) != 0 {
 				t.Fatal("close control changed the remaining partition or completed it early")
@@ -1679,7 +1693,7 @@ func (self *privateH1ProofFixture) completeKeyThenCloseGroup() {
 	firstContract := sequence.sendContract.contractId
 	self.forward(first, self.receiverIn)
 	self.acknowledge()
-	for _, count := range []int{7, 1} {
+	for _, count := range []int{6, 2} {
 		frame := self.data()
 		if len(frame.pack.Frames) != count || len(results) != 0 {
 			self.t.Fatal("key-before-close group lost an unacknowledged payload partition")

@@ -433,12 +433,13 @@ var orderedMessagePools = sync.OnceValue(func() []*messagePool {
 	// initial split. The packet third is now divided between the small and
 	// full-MTU classes; the large classes share their existing aggregate cap.
 	// Keep 4096 and 8192 so existing roots retain their allocation geometry.
-	// 9216 payload bytes plus the 12-byte metadata tail expose cap 9228,
+	// 12288 payload bytes plus the 12-byte metadata tail expose cap 12300,
 	// distinct from ordinary allocator-rounded append/protobuf capacities.
-	// This covers ordinary eight-packet H1 data while keeping the allocator
-	// request within the local 9472-byte class; full proofs can be larger.
+	// This covers eight 1280-byte IP packets plus complete Transfer and AEAD
+	// metadata; full contract proofs can be larger. The existing aggregate
+	// free allowance and zero extended-class floor stay unchanged.
 	// Larger encodings remain unpooled; no wire or admission cap is raised.
-	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192, 9216}
+	poolSizes := []int{smallPacketPoolSize, packetPoolSize, 4096, 8192, 12288}
 	initialPacketBytes := InitialMessagePoolByteCount / 3
 	initialSmallPacketBytes, initialFullPacketBytes :=
 		splitPacketPoolByteCount(initialPacketBytes)
@@ -895,8 +896,8 @@ func MessagePoolRootByteCount(message []byte) ByteCount {
 		return 4096
 	case 8192 + MessagePoolMetaByteCount:
 		return 8192
-	case 9216 + MessagePoolMetaByteCount:
-		return 9216
+	case 12288 + MessagePoolMetaByteCount:
+		return 12288
 	default:
 		return ByteCount(len(message))
 	}
@@ -1166,7 +1167,7 @@ func MessagePoolReadAllWithTag(r io.Reader, tag uint8) ([]byte, error) {
 	}
 
 	// Preserve the next power-of-two overflow allocation even when the final
-	// pool class is not a power of two. Both 8192 and 9216 grow to 16384.
+	// pool class is not a power of two. Both 8192 and 12288 grow to 16384.
 	outCapacity := 1 << bits.Len(uint(i))
 	out := make([]byte, i, outCapacity)
 	copy(out, b)

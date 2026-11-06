@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,10 +61,19 @@ func TestMultiClientMonitorPairingFlappingProviders(t *testing.T) {
 	mirror := newGridMirror(removeTimeout)
 
 	monitor := multi.Monitor()
-	unsub := monitor.AddMonitorEventCallback(mirror.monitorEventCallback)
+	var added atomic.Bool
+	observe := func(event *WindowExpandEvent, providers map[Id]*ProviderEvent, reset bool) {
+		for _, provider := range providers {
+			if provider != nil && provider.State == ProviderStateAdded {
+				added.Store(true)
+			}
+		}
+		mirror.monitorEventCallback(event, providers, reset)
+	}
+	unsub := monitor.AddMonitorEventCallback(observe)
 	defer unsub()
 	windowExpandEvent, providerEvents := monitor.Events()
-	mirror.monitorEventCallback(windowExpandEvent, providerEvents, true)
+	observe(windowExpandEvent, providerEvents, true)
 
 	testDuration := 45 * time.Second
 	sampleInterval := 3 * time.Second
@@ -82,6 +92,9 @@ func TestMultiClientMonitorPairingFlappingProviders(t *testing.T) {
 		fmt.Printf("[leaktest2] live=%d stuck=%d maxLive=%d totalSeen=%d states=%v\n", live, stuck, maxLive, mirror.totalSeen(), mirror.states())
 	}
 
+	if !added.Load() {
+		t.Error("flapping provider fixture never reached a real Added state")
+	}
 	live, stuck, maxLive := mirror.sample(settings.PingTimeout + settings.WindowExpandTimeout + settings.StatsWindowMaxUnhealthyDuration + settings.WindowResizeTimeout + removeTimeout + 3*time.Second)
 	fmt.Printf("[leaktest2] final live=%d stuck=%d maxLive=%d totalSeen=%d\n", live, stuck, maxLive, mirror.totalSeen())
 
@@ -122,6 +135,17 @@ type flappingProviderGenerator struct {
 	mu              sync.Mutex
 	providerClients []*Client
 	unsubs          map[*Client]func()
+	// Nil except in routing controls. The observer borrows link metadata,
+	// never packet bytes, and runs outside all client/route/generator locks.
+	observeRoutesForTest func(*Client, []flappingProviderTestRoute, <-chan struct{})
+}
+
+// One candidate's inbound link at each distinct provider. The return route
+// aggregates writers into the candidate's single reader and is not a broadcast.
+type flappingProviderTestRoute struct {
+	provider        *Client
+	toProvider      Route
+	providerReceive Transport
 }
 
 func newFlappingProviderGenerator(ctx context.Context) *flappingProviderGenerator {
@@ -203,18 +227,18 @@ func (self *flappingProviderGenerator) NewClientSettings() *ClientSettings {
 func (self *flappingProviderGenerator) NewClient(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error) {
 	client := NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings)
 
-	routeSend := make(chan []byte)
 	routeReceive := make(chan []byte)
-
-	transportSend := NewSendGatewayTransport()
 	transportReceive := NewReceiveGatewayTransport()
-	client.RouteManager().UpdateTransport(transportSend, []Route{routeSend})
 	client.RouteManager().UpdateTransport(transportReceive, []Route{routeReceive})
 
-	// wire the candidate to every provider: each provider receives the client's
-	// egress and the addressed provider acks, so the evaluation ping succeeds
+	// Each provider has its own input. The existing RouteManager chooses by
+	// destination; one channel cannot broadcast to distinct Client readers.
 	severs := []func(){}
+	var observedRoutes []flappingProviderTestRoute
 	for _, providerClient := range self.providerClients {
+		routeSend := make(chan []byte)
+		transportSend := NewSendClientTransport(DestinationId(providerClient.ClientId()))
+		client.RouteManager().UpdateTransport(transportSend, []Route{routeSend})
 		providerTransportSend := NewSendClientTransport(DestinationId(args.ClientId))
 		providerTransportReceive := NewReceiveGatewayTransport()
 
@@ -222,16 +246,19 @@ func (self *flappingProviderGenerator) NewClient(ctx context.Context, args *Mult
 		providerClient.ContractManager().AddNoContractPeer(client.ClientId())
 		providerClient.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
 		providerClient.RouteManager().UpdateTransport(providerTransportSend, []Route{routeReceive})
+		if self.observeRoutesForTest != nil {
+			observedRoutes = append(observedRoutes, flappingProviderTestRoute{provider: providerClient, toProvider: routeSend, providerReceive: providerTransportReceive})
+		}
 
 		p := providerClient
 		severs = append(severs, func() {
+			client.RouteManager().RemoveTransport(transportSend)
 			p.RouteManager().RemoveTransport(providerTransportReceive)
 			p.RouteManager().RemoveTransport(providerTransportSend)
 		})
 	}
 
 	sever := func() {
-		client.RouteManager().RemoveTransport(transportSend)
 		client.RouteManager().RemoveTransport(transportReceive)
 		for _, s := range severs {
 			s()
@@ -243,10 +270,18 @@ func (self *flappingProviderGenerator) NewClient(ctx context.Context, args *Mult
 		defer self.mu.Unlock()
 		self.unsubs[client] = sever
 	}()
+	var flapDone chan struct{}
+	if self.observeRoutesForTest != nil {
+		flapDone = make(chan struct{})
+		self.observeRoutesForTest(client, observedRoutes, flapDone)
+	}
 
 	// the provider goes dark shortly after: transports severed, the client's
 	// subsequent traffic goes nowhere and it turns unhealthy
 	go HandleError(func() {
+		if flapDone != nil {
+			defer close(flapDone)
+		}
 		select {
 		case <-ctx.Done():
 			return

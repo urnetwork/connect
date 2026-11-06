@@ -30,11 +30,11 @@ func expandOwnershipStaleCleanup() string {
 		"\t\t\t\tgoto awaitCandidate\n\t\t\t}\n"
 }
 
-// The fourth direct retirement belongs to args that never reached construction.
-// The previous three-site inventory deterministically rejects this healthy body.
+// Stale demand and ended-refresh receipts own no constructed channel. Every
+// direct retirement in the healthy body must retain its exact ownership guard.
 func TestExpandArgsCleanupAnchorAcceptsStaleDemandBeforeOwnership(t *testing.T) {
 	body := expandOwnershipControlBody(t)
-	if strings.Count(body, expandOwnershipStaleCleanup()) != 1 || strings.Count(body, "RemoveClientArgs(") != 4 {
+	if strings.Count(body, expandOwnershipStaleCleanup()) != 1 || strings.Count(body, "RemoveClientArgs(") != 5 {
 		t.Fatal("preownership cleanup premises changed")
 	}
 	if violations := expandArgsCleanupViolations(t, body); len(violations) != 0 {
@@ -209,4 +209,134 @@ func TestExpandStaleDemandArgsRetiredBeforeConstruction(t *testing.T) {
 		removedOwnedClientIds[ordinary.ClientId] != 1 || len(removedOwnedClientIds) != 1 {
 		t.Fatalf("unbalanced ownership: constructed=%v unused=%v channel_owned=%v", constructedClientIds, removedArgsClientIds, removedOwnedClientIds)
 	}
+}
+
+// Only a received minted identity can be retired when its refresh ends. The
+// fifth cleanup returns before demand acceptance or channel construction.
+func expandOwnershipEndedRefreshCleanup() string {
+	return "\t\t\tif !self.serviceRefreshLive(pass.serviceRefresh) {\n" +
+		"\t\t\t\tif !args.deferredClientArgs {\n" +
+		"\t\t\t\t\tself.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)\n" +
+		"\t\t\t\t}\n\t\t\t\treturn\n\t\t\t}\n"
+}
+
+// This is the exact current source path that the prior inventory rejected.
+func TestExpandArgsCleanupAnchorAcceptsEndedRefreshBeforeOwnership(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	if strings.Count(body, expandOwnershipEndedRefreshCleanup()) != 1 {
+		t.Fatal("ended refresh cleanup premise changed")
+	}
+	if violations := expandArgsCleanupViolations(t, body); len(violations) != 0 {
+		t.Fatalf("SDK_EXPAND_PREOWNERSHIP_REFRESH_CLEANUP_UNRECOGNIZED: %v", violations)
+	}
+}
+
+// Count-preserving moves into an admitted channel cannot reuse pre-ownership
+// authority, even if the newly added direct cleanup count remains unchanged.
+func TestExpandArgsCleanupAnchorRejectsMovedEndedRefreshRetirement(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	cleanup := "\t\t\t\t\tself.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)\n"
+	ended := expandOwnershipEndedRefreshCleanup()
+	decline := "\n\t\t\tclient.Cancel()\n\t\t\tself.monitor.AddProviderEventWithLocationMatch(\n"
+	if strings.Count(body, ended) != 1 || strings.Count(body, decline) != 1 {
+		t.Fatal("refresh mutation sites changed")
+	}
+	mutated := strings.Replace(body, ended, strings.Replace(ended, cleanup, "", 1), 1)
+	mutated = strings.Replace(mutated, decline, "\n\t\t\tself.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)"+decline, 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, mutated)
+}
+
+// Keeping the live-refresh guard after construction cannot retire owned auth.
+func TestExpandArgsCleanupAnchorRejectsEndedRefreshAfterConstruction(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	constructed := "\n\t\t\tif err != nil {\n\t\t\t\tproviderFailure := self.recordChannelCreationFailure("
+	if strings.Count(body, ended) != 1 || strings.Count(body, constructed) != 1 {
+		t.Fatal("refresh mutation sites changed")
+	}
+	mutated := strings.Replace(body, ended, "", 1)
+	mutated = strings.Replace(mutated, constructed, "\n"+ended+constructed, 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, mutated)
+}
+
+// Deferred fixed offers carry no minted credential. Reversing the guard
+// makes the same direct call revoke authority that was never acquired.
+func TestExpandArgsCleanupAnchorRejectsDeferredEndedRefreshRetirement(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	mutated := strings.Replace(body, ended, strings.Replace(ended, "!args.deferredClientArgs", "args.deferredClientArgs", 1), 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, mutated)
+}
+
+// An else placement must not authorize credential retirement for inert args.
+func TestExpandArgsCleanupAnchorRejectsEndedRefreshCleanupInElse(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	wrong := strings.Replace(ended, "if !args.deferredClientArgs {\n", "if !args.deferredClientArgs {\n\t\t\t\t} else {\n", 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
+}
+
+// Removing terminal return leaves the same args eligible for construction.
+func TestExpandArgsCleanupAnchorRejectsEndedRefreshFallthrough(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	wrong := strings.Replace(ended, "\t\t\t\treturn\n", "", 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
+}
+
+// A return in an immediately called closure does not leave the receive case.
+func TestExpandArgsCleanupAnchorRejectsNestedEndedRefreshCleanup(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	wrong := "\t\t\tfunc() {\n" + ended + "\t\t\t}()\n"
+	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
+}
+
+// All controls preserve the direct retirement count; rejection must identify
+// unproved ownership placement rather than simply counting fewer calls.
+func expandOwnershipRequireRejectedRefreshMutation(t *testing.T, original, mutated string) {
+	t.Helper()
+	if strings.Count(original, "RemoveClientArgs(") != strings.Count(mutated, "RemoveClientArgs(") {
+		t.Fatal("refresh mutation changed direct cleanup count")
+	}
+	violations := expandArgsCleanupViolations(t, mutated)
+	if !strings.Contains(strings.Join(violations, "\n"), "outside a pre-ownership cleanup") {
+		t.Fatalf("unsafe same-count refresh retirement was not rejected: %v", violations)
+	}
+}
+
+// A condition string cannot authorize rebinding received args to a channel's
+// credentials before the otherwise valid ended-refresh branch executes.
+func TestExpandArgsCleanupAnchorRejectsEndedRefreshInitializer(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	wrong := strings.Replace(ended, "if !self.serviceRefreshLive(pass.serviceRefresh)", "if args = self.clients[args.ClientId].args; !self.serviceRefreshLive(pass.serviceRefresh)", 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
+}
+
+// Rebinding inside the non-deferred check is equally outside the received
+// identity's ownership, even when its body and outer return remain intact.
+func TestExpandArgsCleanupAnchorRejectsEndedRefreshDeferredInitializer(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	ended := expandOwnershipEndedRefreshCleanup()
+	if strings.Count(body, ended) != 1 {
+		t.Fatal("refresh mutation site changed")
+	}
+	wrong := strings.Replace(ended, "if !args.deferredClientArgs", "if args = self.clients[args.ClientId].args; !args.deferredClientArgs", 1)
+	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
 }

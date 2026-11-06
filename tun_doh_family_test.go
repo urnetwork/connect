@@ -20,10 +20,11 @@ import (
 )
 
 // Returns a real tun/cache with synthetic, caller-owned resolver endpoints.
-func tunDohFamilyFixture(t *testing.T, mtu int, resolver *DnsResolverSettings, base *DohSettings) *Tun {
+func tunDohFamilyFixture(t *testing.T, mtu int, disableIpv6 bool, resolver *DnsResolverSettings, base *DohSettings) *Tun {
 	t.Helper()
 	settings := DefaultTunSettings()
 	settings.Mtu = mtu
+	settings.DisableIpv6 = disableIpv6
 	settings.Log = NewNoopLogger()
 	settings.DohSettings = base
 	tun, err := CreateTunWithResolver(context.Background(), settings, resolver)
@@ -39,9 +40,11 @@ func tunDohFamilyFixture(t *testing.T, mtu int, resolver *DnsResolverSettings, b
 func TestTunDohQueryHonorsTunnelFamilies(t *testing.T) {
 	for _, test := range []struct {
 		mtu           int
+		disableIpv6   bool
 		wantIpv6Dials int64
 	}{
-		{mtu: DefaultMtu, wantIpv6Dials: 0},
+		{mtu: DefaultMtu, wantIpv6Dials: 1},
+		{mtu: DefaultMtu, disableIpv6: true, wantIpv6Dials: 0},
 		{mtu: tunIpv6MinimumMtu - 1, wantIpv6Dials: 0},
 		{mtu: tunIpv6MinimumMtu, wantIpv6Dials: 1},
 		{mtu: DefaultTunnelMtu, wantIpv6Dials: 1},
@@ -53,7 +56,7 @@ func TestTunDohQueryHonorsTunnelFamilies(t *testing.T) {
 		}
 		base := DefaultDohSettings()
 		base.DohServerStagger = 0
-		tun := tunDohFamilyFixture(t, test.mtu, resolver, base)
+		tun := tunDohFamilyFixture(t, test.mtu, test.disableIpv6, resolver, base)
 		cache := tun.DohCache()
 		var ipv4Dials, ipv6Dials atomic.Int64
 		cache.remoteClient.httpClient.Transport = dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
@@ -73,10 +76,10 @@ func TestTunDohQueryHonorsTunnelFamilies(t *testing.T) {
 		addrs, authoritative := cache.QueryResult(ctx, "A", "missing.example")
 		cancel()
 		if !authoritative || len(addrs) != 0 {
-			t.Fatalf("mtu=%d: authoritative miss changed: addrs=%v authoritative=%v", test.mtu, addrs, authoritative)
+			t.Fatalf("mtu=%d disableIpv6=%t: authoritative miss changed: addrs=%v authoritative=%v", test.mtu, test.disableIpv6, addrs, authoritative)
 		}
 		if ipv4Dials.Load() != 1 || ipv6Dials.Load() != test.wantIpv6Dials {
-			t.Errorf("mtu=%d: resolver legs v4=%d v6=%d, want v4=1 v6=%d", test.mtu, ipv4Dials.Load(), ipv6Dials.Load(), test.wantIpv6Dials)
+			t.Errorf("mtu=%d disableIpv6=%t: resolver legs v4=%d v6=%d, want v4=1 v6=%d", test.mtu, test.disableIpv6, ipv4Dials.Load(), ipv6Dials.Load(), test.wantIpv6Dials)
 		}
 		_ = tun.Close()
 	}
@@ -87,9 +90,12 @@ func TestTunDohQueryHonorsTunnelFamilies(t *testing.T) {
 func TestTunDohForwardHonorsTunnelFamilies(t *testing.T) {
 	for _, test := range []struct {
 		mtu           int
+		disableIpv6   bool
 		wantIpv6Dials int64
 	}{
-		{mtu: DefaultMtu, wantIpv6Dials: 0},
+		{mtu: DefaultMtu, wantIpv6Dials: 1},
+		{mtu: DefaultMtu, disableIpv6: true, wantIpv6Dials: 0},
+		{mtu: tunIpv6MinimumMtu - 1, wantIpv6Dials: 0},
 		{mtu: DefaultTunnelMtu, wantIpv6Dials: 1},
 	} {
 		resolver := &DnsResolverSettings{
@@ -99,7 +105,7 @@ func TestTunDohForwardHonorsTunnelFamilies(t *testing.T) {
 		}
 		base := DefaultDohSettings()
 		base.DohServerStagger = 0
-		tun := tunDohFamilyFixture(t, test.mtu, resolver, base)
+		tun := tunDohFamilyFixture(t, test.mtu, test.disableIpv6, resolver, base)
 		cache := tun.DohCache()
 		var ipv4Dials, ipv6Dials atomic.Int64
 		cache.remoteClient.httpClient.Transport = dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
@@ -118,10 +124,10 @@ func TestTunDohForwardHonorsTunnelFamilies(t *testing.T) {
 		data, ok := cache.Forward(ctx, dnsmessage.Type(65), "forward.example")
 		cancel()
 		if ok || len(data) != 0 {
-			t.Fatalf("mtu=%d: failed upstream became a usable answer", test.mtu)
+			t.Fatalf("mtu=%d disableIpv6=%t: failed upstream became a usable answer", test.mtu, test.disableIpv6)
 		}
 		if ipv4Dials.Load() != 1 || ipv6Dials.Load() != test.wantIpv6Dials {
-			t.Errorf("mtu=%d: forwarding legs v4=%d v6=%d, want v4=1 v6=%d", test.mtu, ipv4Dials.Load(), ipv6Dials.Load(), test.wantIpv6Dials)
+			t.Errorf("mtu=%d disableIpv6=%t: forwarding legs v4=%d v6=%d, want v4=1 v6=%d", test.mtu, test.disableIpv6, ipv4Dials.Load(), ipv6Dials.Load(), test.wantIpv6Dials)
 		}
 		_ = tun.Close()
 	}
@@ -145,7 +151,7 @@ func TestTunDohFamilyConstraintPreservesCustomSettingsAndReload(t *testing.T) {
 		TlsConfig:         &tls.Config{ServerName: "resolver.example", MinVersion: tls.VersionTLS13},
 	}
 	original := *base.DnsResolverSettings
-	tun := tunDohFamilyFixture(t, DefaultMtu, nil, base)
+	tun := tunDohFamilyFixture(t, DefaultMtu, true, nil, base)
 	for generation := range 2 {
 		if generation == 1 {
 			tun.SetDnsResolverSettings(base.DnsResolverSettings, time.Minute)
@@ -200,7 +206,7 @@ func TestTunDohIpv4ConstraintResolvesCustomAnswer(t *testing.T) {
 		RemoteDohUrlsIpv4: []string{"https://192.0.2.53/dns-query"},
 		RemoteDohUrlsIpv6: []string{"https://[2001:db8::53]/dns-query"},
 	}
-	tun := tunDohFamilyFixture(t, DefaultMtu, resolver, nil)
+	tun := tunDohFamilyFixture(t, DefaultMtu, true, resolver, nil)
 	cache := tun.DohCache()
 	answer := netip.MustParseAddr("192.0.2.80")
 	cache.remoteClient.httpClient.Transport = dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
@@ -224,7 +230,7 @@ func TestTunDohIpv4ConstraintPreservesLocalIpv6Answers(t *testing.T) {
 		EnableLocalDoh:   true,
 		LocalDohUrlsIpv6: []string{"https://[2001:db8::55]/dns-query"},
 	}
-	tun := tunDohFamilyFixture(t, DefaultMtu, resolver, nil)
+	tun := tunDohFamilyFixture(t, DefaultMtu, true, resolver, nil)
 	cache := tun.DohCache()
 	var localDials atomic.Int64
 	answer := netip.MustParseAddr("2001:db8::80")

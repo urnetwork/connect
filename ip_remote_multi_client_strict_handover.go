@@ -58,6 +58,7 @@ type strictWindowHandover struct {
 	// the victim's age when the pass chose it, for the collapse deadline's
 	// re-check at admission; the deadline only gets more past with time
 	victimDuration time.Duration
+	serviceRefresh *tcpSynRetry
 	// the swap happened; resize reads it after the pass returns
 	completed atomic.Bool
 }
@@ -150,6 +151,9 @@ func (self *multiClientWindow) strictDiscoveryAdmissible() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	pass := self.strictPass
+	if self.serviceRefreshOwner != nil && !self.serviceRefreshLiveWithLock() {
+		return false
+	}
 	return (pass == nil || 0 < pass.remainingCandidates) &&
 		0 < self.strictAdmissionCapacityWithLock(self.windowSizeWithLock().WindowSizeHardMax)
 }
@@ -162,10 +166,11 @@ func (self *multiClientWindow) offerPassCandidate(
 	demandRead *discoveryDemandRead,
 	args *multiClientChannelArgs,
 	expirationTime time.Time,
+	serviceOwners ...*tcpSynRetry,
 ) bool {
 	var offered bool
 	if demandRead == nil {
-		offered = self.offerClientArgs(args, expirationTime)
+		offered = self.offerClientArgs(args, expirationTime, serviceOwners...)
 	} else {
 		offered = self.offerDiscoveryDemandArgs(demandRead, args)
 	}
@@ -325,6 +330,12 @@ func (self *multiClientWindow) takeStrictHandover(owner *multiClientEvaluationOw
 	if handover == nil {
 		return nil
 	}
+	if handover.serviceRefresh != nil {
+		if !self.serviceRefreshLive(handover.serviceRefresh) || self.flowCount(handover.victim) != 0 {
+			return nil
+		}
+		return handover
+	}
 	if !handover.victim.IsDone() && !self.strictHandoverRemovalAllowed(handover.victim, handover.victimDuration) {
 		return nil
 	}
@@ -352,7 +363,14 @@ func (self *multiClientWindow) classifyHandoverVictimRemoval(
 func (self *multiClientWindow) strictHandoverSwappableWithLock(handover *strictWindowHandover) bool {
 	victim := handover.victim
 	pass := self.strictPass
-	return pass != nil && pass.handover == handover && !handover.completed.Load() &&
-		self.clients[victim.ClientId()] == victim &&
-		(victim.isWarning() || victim.IsDone())
+	valid := pass != nil && pass.handover == handover && !handover.completed.Load() &&
+		self.clients[victim.ClientId()] == victim && (victim.isWarning() || victim.IsDone())
+	if !valid {
+		return false
+	}
+	if handover.serviceRefresh != nil {
+		return self.serviceRefreshOwner == handover.serviceRefresh && self.serviceRefreshLiveWithLock() &&
+			victim.serviceRefreshReservation.CompareAndSwap(handover.serviceRefresh, &serviceRefreshRetiringOwner)
+	}
+	return true
 }

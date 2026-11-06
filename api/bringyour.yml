@@ -1409,6 +1409,28 @@ paths:
         - "Could not parse lock ip " and the entry, for a `lock_ip_list`
           entry that is neither an IP address nor a subnet
 
+        A unique-exit proxy (`proxy_config.unique_exit`) is a hosted proxy
+        whose exit IP no other unique-exit proxy of the network shares (an
+        exact IPv4 address, or an IPv6 /64). It counts toward the active
+        proxy cap and the create rate like any hosted proxy. Its create is
+        refused before anything is created, and without spending the cap or
+        the rate, when:
+        - the network is not on UR Pro: `error.upgrade_required` with the
+          message "Unique exit IPs are a UR Pro feature. Upgrade to UR Pro to
+          create unique-exit proxies." (HTTP 402 with the terms for a Pro
+          month when x402 inline payments are enabled and a price can be
+          quoted, like the plan limit above)
+        - the location names one provider (`connect_location_id.client_id`):
+          "A unique exit picks its own provider: use a country, region, city,
+          group or best available location."
+        - `unique_exit_replace` is not `auto` or `manual`:
+          'unique_exit_replace must be "auto" or "manual".'
+        - no exit the network does not already hold is available in the
+          location: `error.no_unique_supply` with the message "No unique exit
+          IP is available in this location right now. Try another location,
+          or best available."
+        The created proxy reports its exit in `proxy_config_result.exit`.
+
         A re-auth of an existing client (`client_id` set) ignores
         `proxy_config`.
       operationId: authNetworkClient
@@ -2536,8 +2558,9 @@ paths:
         The network's cloud proxy devices: the clients that carry a hosted
         proxy device (created with `proxy_config` on `/network/auth-client`),
         each with its `proxy_client` credentials (proxy URLs, auth token,
-        WireGuard details). Same row shape as `/network/clients` otherwise:
-        resident status, connections, provide status.
+        WireGuard details), and for a unique-exit proxy its `exit`. Same row
+        shape as `/network/clients` otherwise: resident status, connections,
+        provide status.
       operationId: networkProxies
       security:
         - BearerAuth: []
@@ -2548,6 +2571,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkClientsResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/proxy/rotate-exit:
+    post:
+      tags: [Network]
+      summary: Rotate a unique-exit proxy's exit
+      description: |
+        Moves a unique-exit proxy (created with `proxy_config.unique_exit`)
+        to a new unique exit in its location: a provider whose exit IP no
+        other unique-exit proxy of the network holds, and not one the proxy
+        left in the last 24 hours. The proxy keeps its URLs and credentials;
+        its `exit.exit_id` and `exit.exit_since` change. A proxy in `manual`
+        replace mode (`unique_exit_replace`) waiting on a failed exit
+        (`exit.state` `replacing`) is moved with this call.
+
+        A proxy may rotate once a minute and 60 times a day; over that, the
+        call answers 200 with `error.rate_limited`. Without another unique
+        exit in the location it answers 200 with `error.no_unique_supply`,
+        and the proxy keeps its current exit. A `client_id` that is not a
+        unique-exit proxy of the network answers 200 with `error.message`
+        "Not a unique-exit proxy of this network." Rotates are the
+        customer's own request: they spend neither the automatic
+        replacement caps nor the proxy cap or create rate.
+      operationId: networkProxyRotateExit
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateProxyExitArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateProxyExitResult"
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
 
@@ -10188,6 +10251,96 @@ components:
         - title: ProvideModeStream
           const: 4
 
+    ProxyExit:
+      description: |
+        A unique-exit proxy's exit. The exit IP is never reported; any IP
+        echo through the proxy shows it.
+      type: object
+      required:
+        - state
+        - replace_mode
+      properties:
+        exit_id:
+          description: |
+            udid. Opaque, stable while the proxy stays on one exit; a new
+            exit (a replacement or a rotate) has a new id. Absent while the
+            proxy has no exit.
+          type: string
+        country_code:
+          description: The exit's two-letter country code, lower case.
+          type: string
+        region:
+          type: string
+        city:
+          type: string
+        exit_since:
+          description: When the proxy moved to this exit.
+          type: string
+          format: date-time
+        state:
+          description: |
+            `assigned`: the proxy runs on its exit. `replacing`: the exit
+            failed and the proxy waits for a new one (the replacement caps,
+            or `manual` replace mode until `/network/proxy/rotate-exit`).
+            `no_supply`: the exit failed and no other unique exit is
+            available in the location yet; the proxy is retried
+            automatically in `auto` mode.
+          type: string
+          oneOf:
+            - title: ProxyExitStateAssigned
+              const: assigned
+            - title: ProxyExitStateReplacing
+              const: replacing
+            - title: ProxyExitStateNoSupply
+              const: no_supply
+        state_reason:
+          description: |
+            With `replacing` or `no_supply`, why: `offline`,
+            `unreachable`, `verdict`, `collision`, `cap`, `manual`, or
+            `no_supply`.
+          type: string
+        replace_mode:
+          description: The proxy's `unique_exit_replace`, `auto` or `manual`.
+          type: string
+          oneOf:
+            - title: UniqueExitReplaceAuto
+              const: auto
+            - title: UniqueExitReplaceManual
+              const: manual
+
+    RotateProxyExitArgs:
+      type: object
+      required:
+        - client_id
+      properties:
+        client_id:
+          description: udid. The unique-exit proxy's client id.
+          type: string
+
+    RotateProxyExitResult:
+      type: object
+      required: []
+      properties:
+        exit:
+          description: The proxy's new exit.
+          $ref: "#/components/schemas/ProxyExit"
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            no_unique_supply:
+              description: |
+                No other unique exit is available in the location. The
+                proxy keeps its current exit.
+              type: boolean
+            rate_limited:
+              description: |
+                The proxy rotated in the last minute, or 60 times today.
+              type: boolean
+            message:
+              type: string
+
     ProxyClient:
       type: object
       required:
@@ -10903,6 +11056,39 @@ components:
               description: Optional. |
                 If enabled, a WireGuard configuration will be created for the proxy.
               type: boolean
+            unique_exit:
+              description: |
+                Optional, UR Pro. Pins the proxy to one provider whose exit IP
+                no other unique-exit proxy of the network holds: an exact IPv4
+                address, or an IPv6 /64. The provider is chosen in
+                `initial_device_state`'s location (a country, region, city,
+                group, or best available; not a `client_id`), from healthy,
+                high-quality providers whose exit has been observed in the
+                last 24 hours. Each provider serves at most 3 unique-exit
+                proxies across all networks, and gives each at most half its
+                estimated throughput. The exit IP itself is never reported;
+                `proxy_config_result.exit` and `/network/proxies` report its
+                place and an opaque `exit_id`. The refusals are on the
+                endpoint.
+              type: boolean
+            unique_exit_replace:
+              description: |
+                Optional, with `unique_exit`. `auto`, the default, moves the
+                proxy to a new unique exit when its provider goes offline for
+                more than 120 seconds, stops answering, is excluded for a
+                failed verdict, or starts sharing an exit with another of the
+                network's unique-exit proxies (the last two at once), at most
+                6 times an hour per proxy and for a tenth of the network's
+                unique-exit proxies an hour. `manual` keeps the proxy on its
+                failing exit, `exit.state` `replacing`, until
+                `/network/proxy/rotate-exit` moves it: for sessions that must
+                not change IP on their own.
+              type: string
+              oneOf:
+                - title: UniqueExitReplaceAuto
+                  const: auto
+                - title: UniqueExitReplaceManual
+                  const: manual
             initial_device_state:
               description: |
                 Required when the call creates the client (`client_id`
@@ -11159,6 +11345,11 @@ components:
                     If the proxy is removed from memmory, the next call to the proxy will
                     create a new device set up to the `initial_device_state` (if present).
                   type: integer
+                exit:
+                  description: |
+                    Set for a unique-exit proxy (`proxy_config.unique_exit`):
+                    the exit it was created on.
+                  $ref: "#/components/schemas/ProxyExit"
             - $ref: "#/components/schemas/ProxyClient"
 
         error:
@@ -11176,6 +11367,13 @@ components:
                 top-level clients. Unlike `client_limit_exceeded` this is a
                 plan limit, not a hard cap: surface an upgrade prompt. It is
                 the flag the x402 inline-payment round trip keys off.
+              type: boolean
+            no_unique_supply:
+              description: |
+                A unique-exit create (`proxy_config.unique_exit`) found no
+                exit in the location that the network does not already hold.
+                Nothing was created, and neither the proxy cap nor the create
+                rate was spent: try another location, or best available.
               type: boolean
             message:
               type: string
@@ -12507,6 +12705,11 @@ components:
                 $ref: "#/components/schemas/ProvideMode"
               proxy_client:
                 $ref: "#/components/schemas/ProxyClient"
+              exit:
+                description: |
+                  Set for a unique-exit proxy (`proxy_config.unique_exit`):
+                  its current exit.
+                $ref: "#/components/schemas/ProxyExit"
               connections:
                 type: array
                 items:

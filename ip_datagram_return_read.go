@@ -180,6 +180,12 @@ func (self *UdpSequence) returnReadPollShard() *udpSocketReadPollShard {
 	return &self.socketReadPoller.shards[self.socketReadPollShard]
 }
 
+// The UDP length field bounds useful payload space. One extra scratch byte
+// detects truncation without a maximum-datagram allocation for every read.
+func udpReadScratchByteCount(maximumPayloadByteCount int) int {
+	return min(max(0, maximumPayloadByteCount), 65535-UdpHeaderSize) + 1
+}
+
 // The portable reader already owns a per-flow goroutine. Its real UDP socket
 // waits for readability without consuming the datagram, then obtains the same
 // credit as the shared poller. Quiet sockets therefore do not hoard flight
@@ -188,7 +194,8 @@ func (self *UdpSequence) awaitReturnRead(socket net.Conn, readBuffer []byte) (*u
 	if self.prepareReturnReadCallback == nil {
 		return nil, nil
 	}
-	readBytes := len(readBuffer)
+	maximumReadByteCount := udpReadScratchByteCount(self.udpBufferSettings.ReadBufferByteCount) - 1
+	readBytes := min(len(readBuffer), maximumReadByteCount)
 	if raw, ok := socketRawConn(socket); ok {
 		var readErr error
 		awaitReadiness := udpSocketPeekRequiresWait
@@ -204,6 +211,11 @@ func (self *UdpSequence) awaitReturnRead(socket net.Conn, readBuffer []byte) (*u
 		}
 		if readErr != nil {
 			return nil, readErr
+		}
+		// The read will discard this datagram using existing flow scratch;
+		// it needs no retained packet or Transfer-credit owner.
+		if maximumReadByteCount < readBytes {
+			return nil, nil
 		}
 	}
 	for {

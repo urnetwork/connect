@@ -110,6 +110,8 @@ func establishHoldPair(
 	mutateA func(*ClientSettings),
 ) (a *Client, b *Client, bClientId Id, wire *establishHoldWire, receivesB chan string) {
 	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
 	aClientId := NewId()
 	bClientId = NewId()
 
@@ -117,27 +119,12 @@ func establishHoldPair(
 	tapped := make(chan []byte)
 	bSend := make(chan []byte)
 	wire = &establishHoldWire{}
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case wireBytes, ok := <-aSend:
-				if !ok {
-					return
-				}
-				wire.record(time.Now(), wireBytes)
-				select {
-				case tapped <- wireBytes:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
+	tapDone := startOwnedTestWireTap(ctx, aSend, tapped, func(message []byte) {
+		wire.record(time.Now(), message)
+	})
 
-	_, bReceive := newConditioner(ctx, tapped)
-	_, aReceive := newConditioner(ctx, bSend)
+	aConditioner, bReceive := newConditioner(ctx, tapped)
+	bConditioner, aReceive := newConditioner(ctx, bSend)
 
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Network: true}
 
@@ -183,13 +170,13 @@ func establishHoldPair(
 	a = NewClient(ctx, aClientId, aOob, makeSettings(aMode, mutateA))
 	a.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{aSend})
 	a.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{aReceive})
-	blackholeControlId(ctx, a.RouteManager())
+	aSinkDone := blackholeControlId(ctx, a.RouteManager())
 	a.ContractManager().SetProvideModes(provideModes)
 
 	b = NewClient(ctx, bClientId, bOob, makeSettings(bMode, nil))
 	b.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{bSend})
 	b.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{bReceive})
-	blackholeControlId(ctx, b.RouteManager())
+	bSinkDone := blackholeControlId(ctx, b.RouteManager())
 	b.ContractManager().SetProvideModes(provideModes)
 
 	receivesB = make(chan string, 1024)
@@ -206,8 +193,19 @@ func establishHoldPair(
 		}
 	})
 	t.Cleanup(func() {
-		a.Cancel()
-		b.Cancel()
+		cancel()
+		<-tapDone
+		<-aConditioner.done
+		<-bConditioner.done
+		<-aSinkDone
+		<-bSinkDone
+		joinCtx, joinCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer joinCancel()
+		for _, client := range []*Client{a, b} {
+			if err := client.CloseAndWait(joinCtx); err != nil {
+				t.Errorf("establishment-hold client did not join: %v", err)
+			}
+		}
 	})
 	return
 }

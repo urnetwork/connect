@@ -182,6 +182,16 @@ func TestDiscoveryDemandActualAckTimerPublication(t *testing.T) {
 		if failed != 4 || inbound || firstReads != beforeReads+1 || firstEmpty != beforeEmpty+1 {
 			t.Fatal("actual ACK timer control lacks four refusals followed by a real empty demand read")
 		}
+		update.stateLock.Lock()
+		originalOwner := update.synRetry
+		var originalSerial uint64
+		var originalCredit *transferRetainedControlCredit
+		if originalOwner != nil {
+			originalSerial, originalCredit = originalOwner.serial, originalOwner.credit
+		}
+		update.stateLock.Unlock()
+		collapseBeforeLate := h.multiClient.TcpCollapseDropCount()
+		sourceFirst := discoveryDemandTestHoldAutomaticRetry(t, h, path, update)
 		time.Sleep(100 * time.Millisecond)
 		late := discoveryDemandTestAddAckTimerExit(h, state)
 		h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
@@ -211,13 +221,16 @@ func TestDiscoveryDemandActualAckTimerPublication(t *testing.T) {
 			t.Fatal("actual ACK timer did not publish the candidate within its original compression/nextSYN boundaries")
 		}
 		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+		sourceFirst.requireHeld(t)
 		if !h.syn(path) {
+			t.Logf("DISCOVERY_MANUAL_WINNER_SCALARS %v", discoveryDemandManualWinnerSnapshot(h, path, update, originalOwner, originalSerial, originalCredit, collapseBeforeLate))
 			t.Fatal("unchanged3s source SYN was refused")
 		}
 		if _, ok := h.synAck(path); !ok || h.boundTo(path) != h.channel("late") || 5*time.Second <= time.Since(start) {
 			t.Fatal("actual recovered source connect missed original3sSYN/5s outcome")
 		}
 		payload := []byte("held original CSS sibling")
+		sourceFirst.requireManualWinnerAndRelease(t)
 		for index, original := range paths {
 			if h.boundTo(original) != owners[index] || owners[index].IsDone() || owners[index].isWarning() || owners[index].dialStarved() || !h.send(reraceSegment(original, uint32(4*len(payload)), payload)) || len(h.delivered(original)) != 6 {
 				t.Fatal("actual ACK timer control disturbed an original healthy owner")

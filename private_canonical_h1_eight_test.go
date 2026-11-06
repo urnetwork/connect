@@ -21,7 +21,7 @@ import (
 // The experiment changes H1 physical chunking, retaining callback capacity and
 // the conservative mixed/H3/unknown bounds. An owned oversized frame advances.
 func TestCanonicalH1EightPolicyKeepsCompatibilityAndCallbackStorage(t *testing.T) {
-	if DefaultMtu != 1100 || sendPackH1GroupMaxFrames != 16 || sendPackH1EstablishedMaxMessageByteCount != 3*DefaultMtu {
+	if DefaultMtu != 1280 || sendPackH1GroupMaxFrames != 16 || sendPackH1EstablishedMaxMessageByteCount != 3*DefaultMtu {
 		t.Fatal("candidate changed MTU, callback storage or unknown-H1 established policy")
 	}
 	for _, row := range []struct {
@@ -145,9 +145,9 @@ func runH1EightOriginalCustody(t *testing.T, logical bool) {
 			pooled, _ := MessagePoolCheck(wire.bytes)
 			if logical && wantCount == 8 {
 				rootBytes := MessagePoolRootByteCount(wire.bytes)
-				if !pooled || len(wire.bytes) <= 8192 || 9216 < len(wire.bytes) ||
-					cap(wire.bytes) != 9216+MessagePoolMetaByteCount || rootBytes != 9216 {
-					t.Fatalf("eight full-MTU originals did not use the 9216-byte pooled wire root: len=%d cap=%d pooled=%t root=%d",
+				if !pooled || len(wire.bytes) <= 8192 || 12288 < len(wire.bytes) ||
+					cap(wire.bytes) != 12288+MessagePoolMetaByteCount || rootBytes != 12288 {
+					t.Fatalf("eight full-MTU originals did not use the 12288-byte pooled wire root: len=%d cap=%d pooled=%t root=%d",
 						len(wire.bytes), cap(wire.bytes), pooled, rootBytes)
 				}
 				t.Logf("h1_eight_wire chunk=%d payloadBytes=%d wireBytes=%d rootCapacity=%d retainedRootBytes=%d pooled=%t",
@@ -249,7 +249,7 @@ func TestCanonicalH1EightFullContractRewriteAndEncryptionKeepRetainedCharge(t *t
 			sequence := NewSendSequence(context.Background(), &Client{log: NewNoopLogger()}, nil, NewId(), MultiHopId{}, false, false, false, sequenceTlsRoleClient, false, settings)
 			defer sequence.Close()
 			contractId := NewId()
-			contract := &sequenceContract{contractId: contractId, contract: &protocol.Contract{StoredContractBytes: bytes.Repeat([]byte{0x31}, 1100)}}
+			contract := &sequenceContract{contractId: contractId, contract: &protocol.Contract{StoredContractBytes: bytes.Repeat([]byte{0x31}, 4096)}}
 			sequence.sendContract = contract
 			sequence.openSendContracts[contractId] = contract
 			frames := make([]*protocol.Frame, 8)
@@ -317,7 +317,7 @@ func TestCanonicalH1EightFullContractRewriteAndEncryptionKeepRetainedCharge(t *t
 			}
 			defer MessagePoolReturn(opened)
 			pooled, _ := MessagePoolCheck(outer)
-			if !bytes.Equal(opened, rewritten) || pooled || len(outer) <= 9216 ||
+			if !bytes.Equal(opened, rewritten) || pooled || len(outer) <= 12288 ||
 				MessagePoolRootByteCount(outer) != ByteCount(len(outer)) ||
 				ByteCount(len(outer)) > DefaultClientSettings().MinimumMessageLenLimit() {
 				t.Fatal("actual encrypted full-contract bytes or admitted unpooled class changed", len(outer), pooled)

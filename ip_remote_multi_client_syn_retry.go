@@ -5,6 +5,7 @@ package connect
 
 import (
 	"bytes"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -33,6 +34,8 @@ type tcpSynRetry struct {
 	packet                               []byte
 	credit                               *transferRetainedControlCredit
 	readiness                            *tcpSynRetryReadiness
+	refusedRemoteIds                     []Id
+	remoteRefusalOverflow                bool
 	readinessWidth                       int
 	readinessEpoch, readinessSourceOrder uint64
 	readinessOverflow                    bool
@@ -43,6 +46,11 @@ type tcpSynRetry struct {
 	serial                               uint64
 	references                           uint32
 	queued                               bool
+	// Weak index links are detached before final credit release. Cache or
+	// queued/in-flight references own the struct throughout membership.
+	publicationPrevious, publicationNext *tcpSynRetry
+	publicationIndexed                   bool
+	publicationRetired                   atomic.Bool
 	// Queue-local token; the dispatcher snapshots it before releasing the lock.
 	raceOrder uint64
 	next      *tcpSynRetry
@@ -82,12 +90,17 @@ func (self *parsedPacketGroup) prepareSynRetry(source TransferPath, mode protoco
 	self.synRetry = request
 }
 
-func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
+// Exact live cache generation, independent of temporary same-SYN claim readiness.
+func (self *tcpSynRetry) validGenerationWithLock(update *multiClientChannelUpdate) bool {
 	return self != nil && self.update == update && update.synRetry == self &&
 		!update.IsDone() && !update.sourceReset.Load() && !update.receivedInbound.Load() &&
 		!update.affinitySources.closed && !update.pendingCollapseResetWithLock() &&
-		!self.pendingConflictingControlWithLock(update) &&
 		(!update.synGenerationSeen || update.synGenerationNumber == self.sequence)
+}
+
+// Reuse and dispatch retain every existing pending-control fence.
+func (self *tcpSynRetry) validWithLock(update *multiClientChannelUpdate) bool {
+	return self.validGenerationWithLock(update) && !self.pendingConflictingControlWithLock(update)
 }
 
 // A queued sibling SYN from this same retained attempt does not introduce a
@@ -136,6 +149,44 @@ func (self *parsedPacketGroup) validSynRetryWithLock(update *multiClientChannelU
 		(self.synRetry.raceOrder == 0 || unansweredSynRetryRaceWithLock(update, self.synRetry.raceOrder))
 }
 
+// Only actually retained source controls advance this receipt. FIFO dequeue
+// order, then in-group position, distinguish admitted cohorts without ordering
+// TCP ISNs. A later refused offer cannot revoke an older materialized SYN.
+func (self *parsedPacketGroup) noteSynRetryControlMaterializedWithLock(index int) {
+	path := self.packets[index].ipPath
+	if path.Protocol != IpProtocolTcp || !(path.Syn && !path.Ack || path.Rst || path.Fin) ||
+		self.completionFlags.Load()&groupCompletionAbandoned != 0 {
+		return
+	}
+	order := self.collapseOrder()
+	if order == 0 {
+		return
+	}
+	update := self.collapseAdmission.update
+	// A still-live older Transfer lane may dequeue after a newer lane. The
+	// existing selected/candidate source policy already ignores that control.
+	sourceId := self.collapseSourceIdWithLock()
+	if sourceId == (Id{}) || update.sequenceClient == self.completionClient && sourceId.LessThan(update.sequenceSourceId) {
+		return
+	}
+	if race := update.race; race != nil {
+		if state := race.clientStates[self.completionClient]; state != nil && sourceId.LessThan(state.collapseControl.sourceId) {
+			return
+		}
+	}
+	if update.synRetryMaterializedOrder < order || update.synRetryMaterializedOrder == order && update.synRetryMaterializedIndex < index {
+		update.synRetryMaterializedOrder, update.synRetryMaterializedIndex = order, index
+	}
+}
+
+// The caller holds the same flow lock used by successful disposition. The
+// receipt survives optional-cache allocation failure and final credit release.
+func (self *parsedPacketGroup) currentSynRetryControlMaterializationWithLock(index int) bool {
+	update := self.collapseAdmission.update
+	order := self.collapseOrder()
+	return order != 0 && update.synRetryMaterializedOrder == order && update.synRetryMaterializedIndex == index
+}
+
 // Materialization has already published source control. These actual borrowed
 // frames still own their bytes in v1 and raw encodings, unlike an old parsed
 // descriptor's packet slice after the legacy public caller returned it.
@@ -147,13 +198,14 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 	}
 	update := group.collapseAdmission.update
 	defer update.releaseSynRetryMemory()
+	defer update.indexSynRetryPublication()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	if update.IsDone() || update.receivedInbound.Load() || update.affinitySources.closed ||
 		group.completionFlags.Load()&groupCompletionAbandoned != 0 || !group.validSynRetryWithLock(update) {
 		return
 	}
-	for _, frame := range frames {
+	for frameIndex, frame := range frames {
 		if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
 			continue
 		}
@@ -163,6 +215,9 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		}
 		path, err := ParseIpPath(packet)
 		if err != nil || path.Protocol != IpProtocolTcp {
+			continue
+		}
+		if (path.Syn && !path.Ack || path.Rst || path.Fin) && !group.currentSynRetryControlMaterializationWithLock(self.start+frameIndex) {
 			continue
 		}
 		if path.Rst || path.Fin {
@@ -181,8 +236,13 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		if update.synRetrySerial == ^uint64(0) {
 			continue
 		}
+		remoteCapacity := synRetryRemoteTailCapacity(update.sequenceParent, update)
+		if remoteCapacity <= 0 {
+			continue
+		}
 		metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{})) + ByteCount(len(group.synRetry.pin.appId))
 		metadata = (metadata + 63) / 64 * 64
+		metadata = addReceiveQueueByteCount(metadata, retainedMessageCapacity(ByteCount(remoteCapacity)*ByteCount(unsafe.Sizeof(Id{}))))
 		credit, reserved := source.reserveRetainedControlMemory(addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata))
 		if !reserved {
 			continue
@@ -194,6 +254,7 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 			source: group.synRetry.source, provideMode: group.synRetry.provideMode,
 			pin: group.synRetry.pin, sequence: path.SequenceNumber,
 			serial: update.synRetrySerial, references: 1,
+			refusedRemoteIds: make([]Id, 0, remoteCapacity),
 		}
 		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update))
 		update.synRetry = owner
@@ -206,6 +267,7 @@ func (self *multiClientChannelUpdate) releaseSynRetryReferenceWithLock(owner *tc
 	}
 	owner.references--
 	if owner.references == 0 {
+		owner.publicationRetired.Store(true)
 		owner.released = self.synRetryReleased.Load()
 		self.synRetryReleased.Store(owner)
 	}
@@ -229,13 +291,18 @@ func (self *multiClientChannelUpdate) releaseSynRetryMemory() {
 		return
 	}
 	self.stateLock.Lock()
+	parent := self.sequenceParentWithLock()
 	owners := self.synRetryReleased.Swap(nil)
 	self.stateLock.Unlock()
 	for owners != nil {
 		owner := owners
 		owners, owner.released = owner.released, nil
 		packet, credit, ready := owner.packet, owner.credit, owner.readiness
+		if parent != nil {
+			parent.removeSynPublicationOwner(owner)
+		}
 		owner.packet, owner.credit, owner.update, owner.next, owner.readiness = nil, nil, nil, nil, nil
+		owner.refusedRemoteIds, owner.remoteRefusalOverflow = nil, false
 		if ready != nil {
 			ready.closed.Store(true)
 			ready.detach()

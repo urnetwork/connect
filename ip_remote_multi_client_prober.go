@@ -828,6 +828,7 @@ func (self *RemoteUserNatMultiClient) wakeProber() {
 // so the scan the wake brings probes it.
 func (self *RemoteUserNatMultiClient) clientAdded(client *multiClientChannel) {
 	self.wakeProber()
+	self.enqueuePublishedSynRetries(client)
 }
 
 // --- qualification readouts ---

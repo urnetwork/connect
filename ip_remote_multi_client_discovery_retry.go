@@ -166,7 +166,15 @@ func (self *multiClientWindow) waitDiscoveryExpandDeferral() bool {
 // candidate ahead of the pass that takes it, and that identity has contacted
 // no provider, so retiring it during the backoff only made the next expansion
 // mint a replacement. False when the window closed or the candidate expired.
-func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, expirationTime time.Time) bool {
+func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, expirationTime time.Time, serviceOwners ...*tcpSynRetry) bool {
+	var serviceDone <-chan struct{}
+	if len(serviceOwners) != 0 && serviceOwners[0] != nil {
+		snapshot := self.serviceRefreshSnapshot()
+		if snapshot.owner != serviceOwners[0] {
+			return false
+		}
+		serviceDone = snapshot.update.ctx.Done()
+	}
 	// one timer for the offer, stopped as soon as the candidate is taken
 	var expirationTimer *time.Timer
 	defer func() {
@@ -177,6 +185,8 @@ func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, exp
 	for {
 		select {
 		case <-self.ctx.Done():
+			return false
+		case <-serviceDone:
 			return false
 		case self.clientChannelArgs <- args:
 			return true

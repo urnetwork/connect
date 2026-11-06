@@ -72,7 +72,7 @@ func TestDohDialObservationPathOwnership(t *testing.T) {
 		t.Fatalf("custom path=%s", path)
 	}
 	resolver := &DnsResolverSettings{}
-	tun := tunDohFamilyFixture(t, DefaultTunnelMtu, resolver, nil)
+	tun := tunDohFamilyFixture(t, DefaultTunnelMtu, false, resolver, nil)
 	if path := dohRemoteDialPath(tun.DohCache().settings); path != dohPathTun {
 		t.Fatalf("owned tun path=%s", path)
 	}

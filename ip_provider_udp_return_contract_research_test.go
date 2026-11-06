@@ -172,7 +172,7 @@ func TestProviderUdpReturnContractResearchGate(t *testing.T) {
 		}
 		// RawConn.Read provides the kernel readability barrier. The peek itself
 		// consumes nothing and the tested poller drain remains nonblocking.
-		buffer := make([]byte, settings.ReadBufferByteCount)
+		buffer := make([]byte, udpReadScratchByteCount(settings.ReadBufferByteCount))
 		if err := raw.Read(func(fd uintptr) bool {
 			n, _, readErr := syscall.Recvfrom(int(fd), buffer, syscall.MSG_PEEK)
 			if errors.Is(readErr, syscall.EAGAIN) || errors.Is(readErr, syscall.EWOULDBLOCK) {

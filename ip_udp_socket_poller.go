@@ -83,7 +83,7 @@ func newUdpSocketReadPoller(
 		shards = append(shards, udpSocketReadPollShard{
 			ctx:              ctx,
 			backend:          backend,
-			readBuffer:       make([]byte, settings.ReadBufferByteCount),
+			readBuffer:       make([]byte, udpReadScratchByteCount(settings.ReadBufferByteCount)),
 			byFd:             map[int]*udpSocketReadRegistration{},
 			afterWaitForTest: settings.afterSocketPollWaitForTest,
 		})
@@ -428,8 +428,10 @@ func drainReadyUdpSocketWithLimit(fd int, sequence *UdpSequence, buffer []byte, 
 		return syscall.EBADF
 	}
 	defer sequence.finishRetirementOperation()
+	maximumReadByteCount := min(udpReadScratchByteCount(sequence.udpBufferSettings.ReadBufferByteCount)-1, len(buffer)-1)
+	buffer = buffer[:maximumReadByteCount+1]
 	for range maxReads {
-		readBytes := len(buffer)
+		readBytes := maximumReadByteCount
 		if sequence.prepareReturnReadCallback != nil {
 			// Peek borrows the shard's prepaid scratch but leaves the entire
 			// datagram kernel-owned. Charge its actual bounded read length,
@@ -444,15 +446,23 @@ func drainReadyUdpSocketWithLimit(fd int, sequence *UdpSequence, buffer []byte, 
 			}
 			readBytes = n
 		}
-		lease, prepareErr := sequence.prepareReturnRead(readBytes)
-		if prepareErr != nil {
-			return prepareErr
+		var lease *udpReturnReadLease
+		if readBytes <= maximumReadByteCount {
+			var prepareErr error
+			lease, prepareErr = sequence.prepareReturnRead(readBytes)
+			if prepareErr != nil {
+				return prepareErr
+			}
 		}
 		if sequence.ctx.Err() != nil {
 			lease.abort()
 			return syscall.EBADF
 		}
 		n, err := syscall.Read(SocketHandle(fd), buffer)
+		if maximumReadByteCount < n {
+			lease.abort()
+			continue
+		}
 		if 0 < n || n == 0 && err == nil && lease != nil {
 			sequence.UpdateLastActivityTime()
 			packets, packetsErr := sequence.DataPackets(buffer, n, sequence.udpBufferSettings.Mtu)
