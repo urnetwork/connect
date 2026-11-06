@@ -50,10 +50,10 @@ info:
     email provider), the operator's provider probe control plane, the admin
     reports, the operator's own evidence publishing, the validator's head
     summary upload, the provider work intake (the signed originals the SDK
-    and the independent work authorities post), the acceptance-test routes
-    and the extender directory calls the SDK makes on its own. They stay in
-    this document so the server's route and conformance checks cover them;
-    the public API reference leaves them out.
+    and the independent work authorities post), the acceptance-test routes,
+    the extender directory calls the SDK makes on its own and the routes
+    planned for sidecars. They stay in this document so the server's route and
+    conformance checks cover them; the public API reference leaves them out.
 
   termsOfService: https://ur.io/terms
   contact:
@@ -9894,6 +9894,905 @@ paths:
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
 
+  # The sidecar's routes (sidecar DESIGN.md §7, §8, §11). Each is planned until a
+  # service serves it: `x-status: planned` keeps the server's conformance test and
+  # check-routes.sh from failing on it, and `x-internal` keeps it out of the public
+  # reference and the generated client until then. Whoever lands a route lifts
+  # both, with its real schema if this one has moved. The evs routes name their
+  # own host under `servers`.
+  /network/enroll:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Enroll a client with an auth key
+      description: |
+        Creates a top-level client from an auth key. Public: the auth key is the
+        credential, and the route is limited per key and per caller.
+
+        Send only the bearer part of the key. A key's `#` bundle is client-only and
+        never leaves the client, so an `auth_key` containing `#` is refused without
+        being logged or echoed.
+
+        The client that results refuses every administration route, and its token
+        carries a 7-day expiry, when the request sets `admin_refused` and
+        `strict_exp`, which a sidecar always does. Until the second stage of the
+        client-token fix is live, `strict_exp` is refused outside the preview
+        networks.
+
+        An admitted-only network refuses a tagged or ephemeral enrollment before
+        its first authorization base with `no_genesis`.
+      operationId: networkEnroll
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkEnrollArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkEnrollResult"
+        "429":
+          description: Past the limit for this key or caller.
+
+  /network/auth-keys:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: List the network's auth keys
+      description: |
+        The network's auth keys, without their secrets, which only their hash
+        stores.
+      operationId: networkAuthKeys
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkAuthKeysResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Create an auth key
+      description: |
+        Creates a key that lives 5 minutes to 90 days and has a maximum number of
+        uses. The answer is the only time the bearer `ur-authkey-<id>-<secret>`
+        appears; only its hash is kept.
+
+        A pre-approved key's bundle, the genesis hash, the authorization head and
+        a Delegation's seeds, is built on the creating device and never sent here.
+        A `ur-cli` session creates only single-use keys of at most 5 minutes.
+      operationId: networkAuthKeyCreate
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkAuthKeyCreateArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkAuthKeyCreateResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/auth-key-revoke:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Revoke an auth key
+      description: |
+        Stops the key's bearer. It signs nothing, so a copy of a pre-approved key's
+        bundle still admits until its Delegation ends: for such a key the answer
+        says so, and that takes a `DelegationRevoke` statement from a device.
+      operationId: networkAuthKeyRevoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkAuthKeyRevokeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkAuthKeyRevokeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /network/config/projection:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Read the authorization log
+      description: |
+        The network's authorization log entries after a position, verified by the
+        caller against its own pin. An unadmitted client of a member may call this
+        too, for its recovery.
+      operationId: networkConfigProjection
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: The newest position the caller holds. Without it the log starts at the newest base.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The entries, each verbatim as it was signed.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Publish a base
+      description: |
+        A config writer publishes a signed `ProjectionHeader` with its rows.
+        Accepted only if its version is the tip plus one, its `prev_chain` is the
+        tip's chain value, the hash of its rows matches, and neither its config
+        version nor its fold position falls below the newest base's.
+      operationId: networkConfigProjectionPublish
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The base is the new tip.
+        "409":
+          description: The tip moved. The body names it, and the writer re-signs.
+        "429":
+          description: Past the network's base limit. The body gives `retry_after_ms`.
+
+  /network/config/delta:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Append a statement to the authorization log
+      description: |
+        Appends one `Signed` statement after verifying it against the state at the
+        tip. The statement's hash is its retry identity: the same bytes found among
+        the last 4,096 entries answer that entry. Grant chains come through here,
+        and no route takes policy text.
+      operationId: networkConfigDelta
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The entry's position `n` and chain value `A_n`.
+        "403":
+          description: The statement fails at the tip. The body names the tip, and the signer re-evaluates.
+        "429":
+          description: |
+            Past the network's statement limit. The body gives `retry_after_ms`.
+            Revocations, `Suspend`, `BridgeWithdraw` and `RecoveryVeto` are exempt.
+
+  /network/config/reseed:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Network]
+      summary: Upload the authorization log after a site loss
+      description: |
+        After a site loss, member devices other than read-only ones upload the
+        entries they keep verbatim, the rows of their bases, and their pins. Served
+        only while the deployment's re-seed mode is on. The log comes back from
+        devices and is never re-sequenced: an entry is adopted only once devices of
+        two members hold it.
+      operationId: networkConfigReseed
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Taken. Adoption follows from the devices' agreement.
+
+  /acl/ack:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Report the applied projection
+      description: |
+        A client reports the projection version it applied, which measures how far
+        policy has propagated. Kept 7 days.
+      operationId: aclAck
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AclAckArgs"
+      responses:
+        "200":
+          description: OK.
+
+  /acl/invite:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: File a cross-network share invite
+      description: |
+        Files the inviting network's request under a hashed 256-bit code, with a
+        use count and a 7-day window. Each activation is a statement in its own
+        network, and an admin approves it. The body carries the share's sealed
+        tables. Lands with cross-network shares.
+      operationId: aclInvite
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: OK.
+
+  /acl/accept-invite:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Accept a cross-network share invite
+      description: |
+        Files the invited network's side. The server binds the invited network, and
+        the row goes once its uses run out or its window closes. The body carries
+        the share's sealed tables and the accept status. Lands with cross-network
+        shares.
+      operationId: aclAcceptInvite
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}:
+    servers:
+      - url: https://evs.bringyour.com
+    put:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Place and create a repo
+      description: |
+        Places the repo on the metadata cluster that takes new repos, and writes it
+        with its kind and owner from the projection. The sidecar files its
+        `RepoCreate` first. A retried create stays on the cluster it placed. URLs
+        carry only ids: display names are sealed.
+      operationId: evsRepoCreate
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      responses:
+        "200":
+          description: The repo exists.
+        "409":
+          description: Another creator placed this id.
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a repo's record
+      description: The repo's server-held record, which holds no content and no names.
+      operationId: evsRepoGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      responses:
+        "200":
+          description: OK.
+    delete:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Delete a repo
+      description: |
+        Needs `admin` and the `RepoDelete` statement in the newest projection. Takes
+        an active repo to deleted, restorable for 7 days. With `now`, takes it to
+        shredding at once, never restorable.
+      operationId: evsRepoDelete
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - name: now
+          in: query
+          required: false
+          description: "`1` to shred at once."
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK.
+        "409":
+          description: "`STATEMENT_MISSING`: the projection holds no `RepoDelete`."
+
+  /evs/v1/repos/{repo_id}/restore:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Restore a deleted repo
+      description: Needs `admin` and the `RepoRestore` statement in the newest projection.
+      operationId: evsRepoRestore
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      responses:
+        "200":
+          description: OK.
+        "409":
+          description: |
+            `SHREDDING`, the repo is past deleted, or `STATEMENT_MISSING`, the
+            projection holds no `RepoRestore`.
+
+  /evs/v1/repos/{repo_id}/reseed:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Re-seed a repo after a site loss
+      description: Needs `admin`. Honored only in the deployment's re-seed mode.
+      operationId: evsRepoReseed
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/segments/{segment_id}:
+    servers:
+      - url: https://evs.bringyour.com
+    put:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Upload a segment
+      description: |
+        Streams one encrypted segment for a push. Needs `rw` or `deposit`, and
+        `admin` for a closure upload. The receipt in the answer goes back in the
+        push.
+      operationId: evsSegmentUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - name: segment_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: push
+          in: query
+          required: true
+          description: The push this segment belongs to.
+          schema:
+            type: string
+        - name: closure
+          in: query
+          required: false
+          description: "`1` for a closure upload."
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The `EvsUploadReceipt`.
+        "402":
+          description: At the storage limit or spent, with terms when a purchase lifts the limit.
+        "409":
+          description: |
+            `SEGMENT_STALE`, or `VERSIONING` for a kind-5 header naming another
+            push.
+        "429":
+          description: Past a closure upload's rate or daily allowance, with `retry_after_ms`.
+        "503":
+          description: Past the segment cluster's share for the heaviest network, with `Retry-After`.
+        "507":
+          description: "`CLUSTER_FULL`: the repo's metadata cluster stands at its cohort limit."
+
+  /evs/v1/repos/{repo_id}/push:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Push, or seal a push of parts
+      description: |
+        Commits a signed push: `{statement, payload, receipts}`, or to seal a push
+        of parts, `{statement, the parts' places}`. Needs `rw`, and `deposit` allows
+        only the caller's deposit ref. DROP pushes and their cancels ride here too.
+
+        A push id names one statement. Retry with the same push id and statement,
+        one attempt at a time, until a 200, 409 or 412: a committed id answers its
+        version, and a recorded refusal answers again with `recorded: true`.
+      operationId: evsPush
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The committed version.
+        "402":
+          description: At the storage limit or spent, once the head records it, with terms when a purchase lifts the limit.
+        "409":
+          description: |
+            One of `REF_MODE`, `PUSH_ID_REUSED`, `SEGMENT_GONE`, `SEGMENT_STALE`,
+            `SLOT_STALE`, `PARTS_MISSING`, `VERSIONING`, `DIRECTORY_FULL`,
+            `NOTHING_TO_ERASE`, `INDEX_EPOCH`, `SHREDDING`, `DROPPED`, `DROP_KIND`,
+            `DROP_PATH`, `DROP_CONSENT`, `DROP_BOUNDARY`, `DROP_LIST`, `DROP_STATE`,
+            or non-fast-forward, each with the push id.
+        "412":
+          description: One of `GATE_CLOSED`, `PATH_EPOCH`, `PATH_EPOCH_DUE` or `EPOCH_SOURCES_FULL`, with the push id.
+        "429":
+          description: |
+            One of `BUSY`, `FOLD_BEHIND`, the budget's `RESOURCE_EXHAUSTED`,
+            `TIME_AHEAD`, or a lease or fence wait, with `retry_after_ms`. These
+            refuse nothing, and the client retries the push.
+        "503":
+          description: "`{push_id, outcome: unknown}`, or evs's clock is unsure before it has read the head. The client retries."
+        "507":
+          description: "`CLUSTER_FULL` with `Retry-After`, once the head records it."
+
+  /evs/v1/repos/{repo_id}/push/{push_id}/{part}:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Post one part of a large push
+      description: |
+        `{part, receipts}` for one part of a push over 1 MiB or 1,024 entry writes.
+        Needs `rw`, and `deposit` allows only the caller's deposit ref. At most 4 at
+        once. A git-mode push takes the seal lease first.
+      operationId: evsPushPart
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - $ref: "#/components/parameters/EvsPushId"
+        - name: part
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The part's `place`, which the seal names.
+
+  /evs/v1/repos/{repo_id}/push/{push_id}/lease:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Take a git-mode seal lease
+      description: |
+        Takes the ref's seal lease for this push, after its segments and before its
+        parts. Needs `rw`.
+      operationId: evsPushLease
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - $ref: "#/components/parameters/EvsPushId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvsPushLeaseArgs"
+      responses:
+        "200":
+          description: This push holds the lease.
+        "409":
+          description: Non-fast-forward, read from the cluster.
+        "429":
+          description: "`BUSY`, or another push's live lease, with `retry_after_ms`."
+
+  /evs/v1/repos/{repo_id}/path-epoch:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Upload a path-epoch map part
+      description: |
+        Uploads a part of a signed `EvsPathMap` for the newest generation. Needs
+        `rw`. The PATH_EPOCH push that commits the map goes through the push route.
+      operationId: evsPathEpoch
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/path-epoch/block:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Hold path creation for a due epoch
+      description: |
+        Past an epoch's due time, a mapper may stop creation on the ref for at most 2
+        minutes, at most once each 10 minutes, so its tail stops growing. Needs `rw`.
+      operationId: evsPathEpochBlock
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvsPathEpochBlockArgs"
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/read:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a ref, or up to 64 owned streams
+      description: |
+        Needs `r`. Either `{ref_id, pin_version, fresh, paths, ...}`, up to 64 paths
+        with what the caller wants of each, or `{refs}`, up to 64 `(ref_id,
+        pin_version)` of a record-class repo's owned streams. The answer is one
+        framed stream that the caller verifies against its pins.
+      operationId: evsRead
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: One framed stream.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /evs/v1/repos/{repo_id}/refs:
+    servers:
+      - url: https://evs.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List a repo's refs
+      description: |
+        Needs `r`. With `moved_after`, only the refs whose last commit raised the
+        repo's push sequence past that value. A value from before the sequence's
+        restart answers every ref.
+      operationId: evsRefs
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - name: moved_after
+          in: query
+          required: false
+          description: A push sequence, a decimal string that must stay exact.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/log:
+    servers:
+      - url: https://evs.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Page a ref's statements
+      description: Needs `r`. At most 1,000 statements a page, for a pin older than the head's window.
+      operationId: evsLog
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - name: ref
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: true
+          description: The version the page starts after.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/slots/delete:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Erase slot keys
+      description: |
+        Needs `admin`. Commits an ERASE push on the repo's `erasure` ref, then
+        rewrites each named slot without those keys before answering.
+      operationId: evsSlotsDelete
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: OK.
+        "409":
+          description: "`NOTHING_TO_ERASE`, once recorded."
+
+  /evs/v1/repos/{repo_id}/drops/preview:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Start a drop's dry run
+      description: |
+        Needs `admin`. `{ref_id, paths}`, each an `EvsDropPath` whose
+        `through_version` is the one a drop now would keep. One at a time a repo.
+        Lands with storage format 2.
+      operationId: evsDropPreviewCreate
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          description: "`{preview_id}`."
+        "429":
+          description: Past the repo's daily dry runs.
+
+  /evs/v1/repos/{repo_id}/drops/preview/{preview_id}:
+    servers:
+      - url: https://evs.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a drop's dry run
+      description: |
+        Needs `admin`. State, progress, and per path `list_match`, versions, frees,
+        shared, inline, packed, young and snapshot. Lands with storage format 2.
+      operationId: evsDropPreview
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+        - name: preview_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/repos/{repo_id}/drops:
+    servers:
+      - url: https://evs.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List a repo's drops
+      description: |
+        Needs `r`. Each drop's state, progress and freed bytes, a held drop reading
+        done. Lands with storage format 2.
+      operationId: evsDrops
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      responses:
+        "200":
+          description: OK.
+
+  /evs/v1/subscriptions:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Lease change hints
+      description: |
+        Needs `r`. Writes one lease per prefix, and an empty prefix is the whole ref.
+        A lease expires 7 days after its last renewal. The sidecar rereads the head 5
+        seconds after the 200, which covers any commit before the lease.
+      operationId: evsSubscriptionCreate
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvsSubscriptionArgs"
+      responses:
+        "200":
+          description: OK.
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List this client's leases
+      description: The leases the caller holds.
+      operationId: evsSubscriptions
+      security:
+        - ServiceTokenAuth: []
+      responses:
+        "200":
+          description: OK.
+    delete:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Remove leases
+      description: Removes the caller's leases the request names.
+      operationId: evsSubscriptionDelete
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvsSubscriptionArgs"
+      responses:
+        "200":
+          description: OK.
+
 components:
   parameters:
     ClientInfo:
@@ -9929,6 +10828,20 @@ components:
         type: string
       required: true
       description: 64 hex digits, the SDK client's public key.
+    EvsRepoId:
+      in: path
+      name: repo_id
+      schema:
+        type: string
+      required: true
+      description: The repo's random id. URLs carry only ids.
+    EvsPushId:
+      in: path
+      name: push_id
+      schema:
+        type: string
+      required: true
+      description: The push's 16 random bytes, which name one statement.
   responses:
     SessionOperationResult:
       description: Authoritative outcome, including asynchronous cleanup progress.
@@ -10042,6 +10955,14 @@ components:
         compared in constant time. This is not a JWT and names no network. A
         deployment without the secret configured rejects every request to
         these routes.
+    ServiceTokenAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A service token from the token exchange of `POST /oauth/token`, not a
+        URnetwork JWT: 15 minutes, for one audience, with `repo:` scopes. Each
+        route names the scope it needs, and the service honors a scope only
+        while its newest verified authorization state agrees.
 
   schemas:
     ClientInfo:
@@ -23259,3 +24180,200 @@ components:
         content_hash:
           type: string
           description: "`0x`-prefixed sha256 of the chunk bytes."
+
+    NetworkEnrollArgs:
+      type: object
+      required:
+        - auth_key
+        - client_public_key
+        - device_spec
+      properties:
+        auth_key:
+          description: The key's bearer, `<id>-<secret>`. Never a string containing `#`.
+          type: string
+        client_public_key:
+          description: base64 encoded Ed25519 public key of the new client.
+          type: string
+        device_spec:
+          type: string
+        declares_no_egress:
+          description: The client declares it provides no egress.
+          type: boolean
+        admin_refused:
+          description: The client refuses every administration route, as a sidecar always asks.
+          type: boolean
+        strict_exp:
+          description: The client's tokens carry a 7-day expiry, as a sidecar always asks.
+          type: boolean
+        admission:
+          description: The optional admission of a pre-approved key. Its form lands with the route.
+
+    NetworkEnrollResult:
+      type: object
+      required:
+        - by_client_jwt
+        - client_id
+        - approval_state
+        - admin_refused
+      properties:
+        by_client_jwt:
+          type: string
+        client_id:
+          description: udid
+          type: string
+        approval_state:
+          type: string
+        admin_refused:
+          description: A sidecar keeps its keychain only if this confirms the mark.
+          type: boolean
+        close:
+          description: |
+            An ephemeral mint's close capability, 128 random bits returned only
+            here. The server keeps its SHA-256.
+          type: string
+
+    NetworkAuthKey:
+      type: object
+      required:
+        - auth_key_id
+        - expire_time
+      properties:
+        auth_key_id:
+          description: udid
+          type: string
+        creator:
+          description: udid. The user who made the key.
+          type: string
+        tags:
+          description: Keyed tag ids, never tag names.
+          type: array
+          items:
+            type: string
+        expire_time:
+          type: string
+        uses:
+          description: Uses so far.
+          type: integer
+        max_uses:
+          type: integer
+        ephemeral:
+          type: boolean
+        pre_approved:
+          type: boolean
+
+    NetworkAuthKeysResult:
+      type: object
+      required:
+        - auth_keys
+      properties:
+        auth_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkAuthKey"
+
+    NetworkAuthKeyCreateArgs:
+      type: object
+      required:
+        - duration_seconds
+        - max_uses
+      properties:
+        duration_seconds:
+          description: 300 to 7,776,000 seconds, 5 minutes to 90 days.
+          type: integer
+        max_uses:
+          type: integer
+        tags:
+          description: Keyed tag ids, never tag names.
+          type: array
+          items:
+            type: string
+        ephemeral:
+          type: boolean
+        pre_approved:
+          description: The creating device builds this key's client-only bundle.
+          type: boolean
+
+    NetworkAuthKeyCreateResult:
+      type: object
+      required:
+        - auth_key_id
+        - auth_key
+      properties:
+        auth_key_id:
+          description: udid
+          type: string
+        auth_key:
+          description: The bearer `ur-authkey-<id>-<secret>`, returned only here.
+          type: string
+
+    NetworkAuthKeyRevokeArgs:
+      type: object
+      required:
+        - auth_key_id
+      properties:
+        auth_key_id:
+          description: udid
+          type: string
+
+    NetworkAuthKeyRevokeResult:
+      type: object
+      required:
+        - bundle_still_admits
+      properties:
+        bundle_still_admits:
+          description: A pre-approved key's bundle keeps admitting until its Delegation ends.
+          type: boolean
+
+    AclAckArgs:
+      type: object
+      required:
+        - version
+      properties:
+        version:
+          description: The projection version the client applied.
+          type: integer
+
+    EvsPushLeaseArgs:
+      type: object
+      required:
+        - ref_id
+        - base_version
+        - ms
+      properties:
+        ref_id:
+          type: string
+        base_version:
+          type: integer
+        ms:
+          description: At most 120,000.
+          type: integer
+
+    EvsPathEpochBlockArgs:
+      type: object
+      required:
+        - ref_id
+        - ms
+      properties:
+        ref_id:
+          type: string
+        ms:
+          description: At most 120,000.
+          type: integer
+
+    EvsSubscriptionArgs:
+      type: object
+      required:
+        - repo_id
+      properties:
+        repo_id:
+          type: string
+        ref:
+          description: A ref id, or `*` for every ref.
+          type: string
+        path_epoch:
+          type: integer
+        token_prefixes:
+          description: At most 16. An empty prefix is the whole ref.
+          type: array
+          items:
+            type: string
