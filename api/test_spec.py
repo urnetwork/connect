@@ -1,6 +1,7 @@
 """Regression checks for the published OpenAPI document (requires PyYAML)."""
 
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -217,12 +218,37 @@ class GkmRoutesTest(unittest.TestCase):
         lines = [f'\t"{method.upper()} {path}",' for method, path in self.operations(True)]
         return "\n".join(["var routes = []string{", *lines, "}"])
 
-    def check_routes(self, table=None, api_routes=()):
+    def table_without(self, route):
+        """table() less one "METHOD /path" route."""
+        table = self.table()
+        line = f'\t"{route}",\n'
+        self.assertIn(line, table)
+        return table.replace(line, "")
+
+    def unplanned(self, method, path):
+        """bringyour.yml's text with one operation's planned mark lifted, as the
+        task that serves it lifts it."""
+        text = Path(__file__).with_name("bringyour.yml").read_text()
+        start = text.index(f"\n  {path}:\n")
+        end = text.index("\n  /", start + 1)
+        operation = text.index(f"\n    {method}:\n", start, end)
+        mark = "\n      x-status: planned\n"
+        at = text.index(mark, operation, end)
+        return text[:at] + text[at + len(mark) - 1 :]
+
+    def check_routes(self, table=None, api_routes=(), spec=None):
         """check-routes.sh on a fixture beside a routes.go of table, or none, whose
-        api serves the rest of the spec and api_routes."""
+        api serves the rest of the spec and api_routes. A spec given is the
+        bringyour.yml the script reads in place of this one."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        script = self.script
+        if spec is not None:
+            (root / "connect/api").mkdir(parents=True)
+            script = root / "connect/api" / self.script.name
+            shutil.copy(self.script, script)
+            (root / "connect/api/bringyour.yml").write_text(spec)
         (root / "server/api").mkdir(parents=True)
         registered = [
             (method.upper(), re.sub(r"{[^}]*}", "([^/]+)", path))
@@ -238,7 +264,7 @@ class GkmRoutesTest(unittest.TestCase):
             (root / "sidecar/gkmservice").mkdir(parents=True)
             (root / "sidecar/gkmservice/routes.go").write_text(table)
         return subprocess.run(
-            ["zsh", str(self.script), str(root / "server")], capture_output=True, text=True
+            ["zsh", str(script), str(root / "server")], capture_output=True, text=True
         )
 
     def test_every_route_is_documented_planned_and_on_gkms_own_host(self):
@@ -298,26 +324,35 @@ class GkmRoutesTest(unittest.TestCase):
         count = len(self.operations(True))
         self.assertIn(f"gkm: {count} routes in gkmservice's table, {count} documented", result.stdout)
 
-    def test_check_routes_refuses_a_documented_route_the_table_lacks(self):
-        lines = self.table().splitlines()
-        dropped = lines.pop(1)
-        result = self.check_routes("\n".join(lines))
+    def test_check_routes_lets_a_planned_route_wait(self):
+        # gkmservice's table grows a task at a time, as api's does
+        result = self.check_routes(self.table_without("POST /gkm/groups/{group_id}/ack"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        count = len(self.operations(True))
+        self.assertIn(f"gkm: {count - 1} routes in gkmservice's table, {count} documented", result.stdout)
+
+    def test_check_routes_refuses_a_served_route_the_table_lacks(self):
+        result = self.check_routes(
+            self.table_without("POST /gkm/groups/{group_id}/ack"),
+            spec=self.unplanned("post", "/gkm/groups/{group_id}/ack"),
+        )
         self.assertEqual(1, result.returncode)
         self.assertIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
-        self.assertIn(re.sub(r"{[^}]*}", "*", dropped.strip(' \t",')), result.stderr)
+        self.assertIn("POST /gkm/groups/*/ack", result.stderr)
 
     def test_check_routes_refuses_a_table_route_the_spec_lacks(self):
-        table = self.table().replace("}", '\t"GET /gkm/undocumented",\n}')
+        table = self.table().removesuffix("}") + '\t"GET /gkm/undocumented",\n}'
         result = self.check_routes(table)
         self.assertEqual(1, result.returncode)
         self.assertIn("in gkmservice's route table but NOT in bringyour.yml", result.stderr)
         self.assertIn("GET /gkm/undocumented", result.stderr)
+        self.assertNotIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
 
     def test_check_routes_refuses_a_table_it_cannot_read(self):
         # a table in another shape must not pass by naming no route
         result = self.check_routes("var routes = []route{}")
         self.assertEqual(1, result.returncode)
-        self.assertIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
+        self.assertIn("gkmservice's route table names no route", result.stderr)
 
     def test_check_routes_refuses_a_gkm_route_api_registers(self):
         result = self.check_routes(self.table(), api_routes=[("GET", "/gkm/welcomes")])

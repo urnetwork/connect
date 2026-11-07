@@ -26,8 +26,11 @@
 # drift. They are checked against that package's route table instead, looked up
 # at <server>/../sidecar/gkmservice/routes.go, where each route is a net/http
 # pattern in one string literal, as in "POST /gkm/groups/{group_id}/gen/{g}".
-# Until that file exists, or in a checkout without the sidecar repo beside the
-# server, that half of the check is skipped with a note rather than failed.
+# A planned gkm operation may be missing from that table, as one may be from
+# api's (below), but a table that names no route at all fails, so a table in
+# another shape cannot pass by matching nothing. Until that file exists, or in a
+# checkout without the sidecar repo beside the server, that half of the check is
+# skipped with a note rather than failed.
 #
 # Deliberately dependency-free: zsh, grep, sed, sort, comm. No yaml parser and
 # no go toolchain, so it runs in a bare checkout and in CI.
@@ -170,14 +173,17 @@ if [[ -f $gkm_routes ]]; then
         | sed -e 's/^"//' -e 's/"$//' -e 's/{[^}]*}/*/g' \
         | sort -u > $work/routes.gkm
     gkm_route_count=$(grep -c . $work/routes.gkm)
+    gkm_planned_count=$(grep -c ' /gkm/' $work/planned)
+
+    (( gkm_route_count == 0 )) && report "gkmservice's route table names no route" "$gkm_routes"
 
     gkm_missing=$(comm -23 $work/routes.gkm $work/spec.gkm)
-    gkm_extra=$(comm -13 $work/routes.gkm $work/spec.gkm)
+    gkm_extra=$(comm -13 $work/routes.gkm $work/spec.gkm | comm -23 - $work/planned)
 
     [[ -n $gkm_missing ]] && report "in gkmservice's route table but NOT in bringyour.yml" "$gkm_missing"
     [[ -n $gkm_extra ]] && report "in bringyour.yml but NOT in gkmservice's route table" "$gkm_extra"
 
-    print "gkm: $gkm_route_count routes in gkmservice's table, $gkm_spec_count documented operations"
+    print "gkm: $gkm_route_count routes in gkmservice's table, $gkm_spec_count documented operations ($gkm_planned_count planned)"
 else
     print "gkm: $gkm_spec_count documented operations NOT CHECKED (no $gkm_routes)"
 fi
