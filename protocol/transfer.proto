@@ -358,6 +358,9 @@ enum ProvideMode {
     Public = 3;
     Stream = 4;
     PublicStream = 5;
+    // A platform service's edge stream: subprotocol frames only, and only the
+    // ids the receiver lists. It carries no IP, no escrow and no payout.
+    Service = 6;
 }
 
 

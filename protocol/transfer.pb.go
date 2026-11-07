@@ -100,6 +100,9 @@ const (
 	ProvideMode_Public           ProvideMode = 3
 	ProvideMode_Stream           ProvideMode = 4
 	ProvideMode_PublicStream     ProvideMode = 5
+	// A platform service's edge stream: subprotocol frames only, and only the
+	// ids the receiver lists. It carries no IP, no escrow and no payout.
+	ProvideMode_Service ProvideMode = 6
 )
 
 // Enum value maps for ProvideMode.
@@ -111,6 +114,7 @@ var (
 		3: "Public",
 		4: "Stream",
 		5: "PublicStream",
+		6: "Service",
 	}
 	ProvideMode_value = map[string]int32{
 		"None":             0,
@@ -119,6 +123,7 @@ var (
 		"Public":           3,
 		"Stream":           4,
 		"PublicStream":     5,
+		"Service":          6,
 	}
 )
 
@@ -3811,7 +3816,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fSequenceRole\x12\x17\n" +
 	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
 	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +
-	"\x12SequenceRoleServer\x10\x02*d\n" +
+	"\x12SequenceRoleServer\x10\x02*q\n" +
 	"\vProvideMode\x12\b\n" +
 	"\x04None\x10\x00\x12\v\n" +
 	"\aNetwork\x10\x01\x12\x14\n" +
@@ -3820,7 +3825,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\x06Public\x10\x03\x12\n" +
 	"\n" +
 	"\x06Stream\x10\x04\x12\x10\n" +
-	"\fPublicStream\x10\x05*a\n" +
+	"\fPublicStream\x10\x05\x12\v\n" +
+	"\aService\x10\x06*a\n" +
 	"\n" +
 	"SignalType\x12\f\n" +
 	"\bNoSignal\x10\x00\x12\f\n" +
