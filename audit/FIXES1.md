@@ -2,12 +2,14 @@
 
 Preparing `audit/EVIDENCE.md` for the Cure53 audit (WP1 protocol and data
 plane, WP2 session encryption and peer identity) surfaced seven defects. This
-file is the review packet for their fixes.
+file is the review packet for their fixes. The follow-on review below records
+two additional enforcement findings (F8–F9) and their implementation status.
 
 | Set | State | Base | Commit |
 |---|---|---|---|
 | 1 (F1–F3) | Committed, merged to `main` as `69967d8a`, pushed | `03e98fe5` | `7dbcdd4c` on `fix/audit-contract-mac-receive-panics` |
 | 2 (F4–F7) | Committed, merged to `main` with this document | `69967d8a` | `5a71282c` on `fix/audit-p2p-source-key-pins-extender-mac` |
+| Follow-on (F8–F9) | Committed in connect and SDK; targeted and combined race validation passed | `6d4aeb60` | connect `1ffb741c`; SDK `095efb61` on `fix/audit-history-admission` |
 
 Every fix has a deterministic regression test that **fails on the code before
 the fix**. The failure output is quoted with each fix. Line references for
@@ -395,6 +397,213 @@ the machine:
     `service pacing underfilled` (`transfer_window_service_performance_test.go:173`).
 - The two intermittent NAT tests passed in this run.
 - No failure is new.
+
+## Follow-on review — signed-history enforcement (2026-11-06)
+
+An independent review of `7dbcdd4c` and `5a71282c` at merged HEAD
+`6d4aeb60` found two additional enforcement gaps around F5/F6. Both predate
+those commits and remain reachable after them. Deterministic review probes
+reproduced both; a second source review confirmed handshake reachability and
+the shared SDK store's concurrency behavior.
+
+| Item | Finding | Follow-on status |
+|---|---|---|
+| F8 | Required signed-history pending, rejected, or store-unavailable state blocks outbound `Cipher()` but still exposes inbound decryption ciphers and permits application delivery, including queued delivery. | Committed in `1ffb741c`; nine deterministic receive regressions and combined validation with F9 pass under the race detector. |
+| F9 | Pin lookup, chain verification, and pin commit are not one atomic admission operation across sessions/managers sharing a store. A resolution verified against G1 can overwrite a newly pinned G2 with a G3 chain that forks at G2. | Implemented in connect and both SDK stores. Thirteen new connect regressions, the SDK pin-store group, and combined validation pass under the race detector. |
+
+Targeted and combined results are recorded below. The implementation is
+committed as connect `1ffb741c` and SDK `095efb61`; this does not claim a
+deployed release.
+
+The review found no newly introduced blocking defect in F1–F4 or F7. The
+documented first-pass receive-lane mismatch remains a separate nonblocking
+follow-up: a live sequence can receive a pack whose immutable lane flags do
+not match its own before the closing-sequence guard is reached.
+
+### F8 — inbound signed-history admission
+
+The session's history predicate now gates outbound cipher access, inbound
+current/prior decrypt candidates, and final application dispatch. Delivery
+rechecks after queuing; receipt batches recheck each item. Admission is
+linearized under the session lock before invoking a callback, with no lock
+held through the callback. An already-admitted callback may finish after
+rejection; later queued callbacks must recheck.
+
+A refused decoded item retires only its receive sequence, releases its
+reservations and pooled ownership, and withdraws held selective custody.
+A sequence-local refusal latch prevents a later controls-only cleanup batch
+from cumulatively acknowledging refused application data, even if history
+opens before cleanup. Pending ciphertext refusal also suppresses the
+unknown-wrap reset: local admission delay does not mean the peer lost its
+cipher. Plaintext bootstrap and verified rekey overlap remain available.
+
+The nine regressions in `transfer_key_history_receive_test.go` cover:
+
+- `TestRequiredSignedHistoryBlocksInboundCipherCandidates`;
+- `TestRequiredSignedHistoryReceiveRetriesAfterApproval`;
+- `TestRequiredSignedHistoryRejectsAlreadyDecryptedPack`;
+- `TestRequiredSignedHistoryRejectsAlreadyDecryptedNoAck`;
+- `TestRequiredSignedHistoryRejectsBufferedHeldDelivery`;
+- `TestRequiredSignedHistoryRefusalKeepsCleanupAckGap`;
+- `TestRequiredSignedHistoryRejectsLaterReceiptDispatch`;
+- `TestRequiredSignedHistoryKeepsPlaintextBootstrap`;
+- `TestRequiredSignedHistoryBootstrapFinishesBeforeAdmission`.
+
+Seven regression cases fail semantically against pre-fix production behavior:
+exposed pending decrypt candidates, pending ciphertext delivery, decoded queued
+delivery after rejection (including no-ACK), held-custody refusal, cleanup ACK
+gap, and later receipt dispatch. The two bootstrap controls pass before and
+after the fix. The red run overlays the three receive production files from
+`6d4aeb60`, retaining only the new error symbol and P2 settings declaration so
+the tests compile; it does not retain F8 behavior.
+
+All nine final regressions passed with:
+
+```sh
+env GOCACHE=/tmp/codex-go-cache go test -race -count=1 \
+  -run '^TestRequiredSignedHistory' -timeout=120s .
+```
+
+An earlier 20-test race group also passed: the eight then-current new cases,
+identity gating, Required establishment, rekey/data retention, receipt-merge
+custody, and the pool-entry-point heading check. The explicit no-ACK case was
+then added and passed in the nine-test run above. Combined F8/F9 validation
+also passed after the atomic-store changes and fixture upgrades were applied.
+
+### F9 — atomic pin and latch admission
+
+`AtomicPeerClientKeyPinStore` adds a single snapshot of the peer pin, its
+presence, and the global signed-history latch, plus conditional admission
+against that exact snapshot. A non-nil next pin commits the verified head and
+latch together. A nil next pin compares without writing; fetch-error fallback,
+empty-history answers, and rejection decisions therefore cannot use stale
+evidence either.
+
+The resolver verifies outside session/store locks. A failed comparison causes
+a new read and full verification against the current pin, not an unconditional
+head overwrite. Genuine extensions and identical heads can converge; an
+advancing fork is rejected against the intervening pin. Retries are bounded by
+`EncryptionSettings.MaxClientKeyPinAdmissionAttempts` (default 4); nonpositive
+values refuse configured-store admission. Cancellation, exhausted attempts,
+an unchanged snapshot after a refused comparison, or a local store error never
+opens the gate. Local failures retain the distinct store-unavailable outcome.
+
+The successful comparison is the admission point. Later rotations do not
+retroactively revoke an already admitted session. This is atomicity across
+sessions and managers sharing the same store; existing external directory
+ownership requirements remain, including the legacy store's single-owner
+precondition. It does not add cross-process locking to that store.
+
+**Store/API compatibility.** The old Go interfaces remain source-compatible.
+Required signed-history resolution with a configured store now requires the
+atomic interface; an old custom store must be upgraded at its shared owner or
+admission fails closed. Independently wrapping one backing store per client
+would recreate the race. A nil store retains the documented no-persistence
+policy. Both SDK implementations are updated; their JSON format is unchanged.
+The legacy SDK path now reports unreadable/corrupt existing state as a checked
+failure instead of silently treating it as an empty first-contact store.
+
+SDK commits stage complete bytes, sync and close, rename, and sync the parent
+directory before publishing memory. A persistence error retains previous
+memory and makes later checked admission fail closed. After a rename followed
+by a directory-sync error, disk durability is uncertain, but the file is a
+complete old or new state rather than a partial pin/latch update.
+
+Two adjacent compatibility cases are covered:
+
+- An old legacy writer could persist a valid pin and crash before its separate
+  global-latch write. Both loaders recover the in-memory latch from a nonempty
+  set of validated pins without changing the file format or requiring a write
+  during load. A later normal commit persists the recovered latch.
+- A build-authorized forward signer rotation must survive storage admission.
+  The snapshot-bound path accepts a strictly forward signer transition after
+  full chain/trusted-signer verification; unconditional setters keep their
+  stricter signer guard. Real-signature tests verify an authorized A-to-B
+  rotation, refusal without B's authority, stale-token refusal, and reload.
+
+**Deterministic evidence.** Thirteen top-level tests in
+`transfer_key_history_atomic_test.go` cover real
+`SetPeerClientPublicKey` → fetch → resolve interleavings across sessions in
+one manager and across managers sharing a store: advancing and equal-generation
+forks, genuine extension retry, identical-head idempotence, fetch-error
+acceptance/rejection races, empty-history peer/global-latch races, read-only
+store errors, conflict/attempt limits, cancellation, unsupported legacy stores,
+and nil-store policy. All thirteen pass under `-race`.
+
+The advancing-fork, fetch-error, and empty-history regressions fail semantically
+when an overlay restores the entire `6d4aeb60` resolver, retaining only the
+additive public type declarations needed to compile the tests:
+
+```text
+concurrent fork: first=verified later=verified, want verified/rejected
+fetch-error race: state=verified want=rejected
+empty-history race: stale unsigned decision survived the ratchet
+```
+
+SDK regressions in `peer_client_key_pin_store_atomic_test.go` and
+`peer_client_key_pin_store_rotation_test.go` exercise both shipping stores:
+stale advancing forks, valid extension retry, read-only latch comparison,
+identity/generation guards, staged persistence failures with and without a
+prior pin, old-file recovery, authorized signer rotation, and bounded
+capacity/lifecycle/auth-owner guards. The store group and device-level
+propagation/replacement/close-race tests pass under `-race`.
+
+Behavioral overlays that remove each store's snapshot comparison reproduce
+stale fork/latch admission. Publishing legacy memory before persistence
+reproduces a partial in-memory update after a write failure. Removing either
+loader's latch recovery reproduces the old split-write downgrade. Restoring
+strict signer equality in the legacy CAS reproduces refusal of a verified
+forward signer rotation; the same probe fails for the bounded CAS under its
+old guard too. These are assertion failures, not compile failures.
+
+### Follow-on verification
+
+Run on 2026-11-06 with Go 1.27.3, darwin/arm64, against the working tree based
+on connect `6d4aeb60`. The SDK uses its existing local connect replacement;
+no dependency pins, stored formats, or wire formats changed.
+
+- All 54 tests then present in `transfer_key_history*_test.go` passed under
+  `-race` after the core/fixture changes: 45 existing history tests and the
+  nine F8 regressions (package 3.710 s).
+- All 13 new `TestSignedIdentityAtomic...` tests passed under `-race`
+  (3.425 s). Together with F8, there are 22 new connect regression/control
+  tests, including two bootstrap controls that already passed before F8.
+- The final combined connect race group passed (7.342 s), covering all history
+  files, the original HMAC/receive-crash/P2P regressions, HMAC cutover,
+  identity/Required handshake and rekey continuity, receipt-merge custody,
+  pool ownership headings, and the package-layering gate.
+- All 22 selected SDK store tests passed under `-race` after both latch and
+  signer corrections (5.749 s), including ten new atomic/rotation tests.
+  The five device-level pin-store propagation, refusal, replacement,
+  caller-store and close-race tests also passed under `-race` (2.058 s).
+- The original two extender admission regressions passed under `-race`
+  (1.561 s).
+- `gofmt` and `git diff --check` are clean in both repositories. `go vet`
+  passed for connect and its extender package, and for the SDK root package.
+- Pre-fix behavior overlays failed at the intended assertions: F8's seven
+  receive cases; F9's three resolver cases; both stores' stale fork/latch
+  admission; legacy memory publication before persistence; both loaders'
+  old-file latch recovery; and both stores' authorized signer rotation under
+  the old strict guard. Additive API declarations are kept where necessary
+  for compilation; none of these red results is a compile failure.
+
+Focused rerun commands, from the respective repositories:
+
+```sh
+# connect: the 22 new regression/control tests
+env GOCACHE=/tmp/codex-go-cache go test -mod=readonly -race -count=1 \
+  -run '^Test(RequiredSignedHistory|SignedIdentityAtomic)' -timeout=180s .
+
+# sdk: store and actual device-constructor/wiring coverage
+env GOCACHE=/tmp/codex-go-cache go test -mod=readonly -race -count=1 \
+  -run '^Test(PeerPinStores|LegacyPeerPinStore|LocalStatePeerClientKeyPinStore|BoundedPeerPinStore|DeviceLocalPeerPinStore)' \
+  -timeout=180s .
+```
+
+Validation was targeted; the full root and SDK suites were not rerun for this
+follow-on. The historical set-2 full-suite results above remain scoped to that
+commit. The first-pass live-lane mismatch, L7/L14, and the other documented
+residuals below are not claimed fixed by F8/F9.
 
 ## Still open (documented in EVIDENCE §9, not addressed here)
 
