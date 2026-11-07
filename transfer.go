@@ -600,7 +600,8 @@ type TransferKey struct {
 }
 
 // the identity of the source of received frames.
-// `ProvideMode` is the mode of where these frames are from: network, friends and family, public.
+// `ProvideMode` is the mode of where these frames are from: network, friends and family, public,
+// service. A service source's frames are only those `ClientSettings.ServiceSubprotocolIds` lists.
 // `Roles` and `Principal` are the source client's identity from the active contract,
 // set only when the provide mode is network; nil roles and empty principal otherwise.
 // `TransferKey` is immutable for the receive sequence and can be passed as a
@@ -1630,6 +1631,14 @@ type ClientSettings struct {
 	// before the message: at the platform's expiry sweep. Non-positive drops
 	// every id.
 	CloseSequencesMaxPendingCount int
+	// The subprotocols a source in `ProvideMode_Service` may send this client.
+	// Those are all a Service source reaches: its frames of any other id, and
+	// every other frame it sends, IP included, are dropped and counted (see
+	// `ClientSubprotocolStatsSnapshot`). Empty, the default, passes nothing from
+	// a Service source. Connect names no id here, so an owner that provides
+	// Service lists its own. Read on the receive path, so it must not change
+	// after construction.
+	ServiceSubprotocolIds []SubprotocolId
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -18255,6 +18264,16 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			)
 			appFrames = nil
 		}
+	}
+
+	// A Service source reaches only the subprotocols this client lists. The rest
+	// stops here, ahead of delivery receipts and every callback, so no consumer
+	// has to know the mode: a provider cannot take it for a public source, and
+	// a required receipt cannot cancel the sequence over a frame nothing claims.
+	// The item still advances and is acked (ack-and-discard, as above): a
+	// refused frame has no retry that could change the answer.
+	if peer.ProvideMode == protocol.ProvideMode_Service {
+		appFrames = self.client.admitServiceFrames(appFrames)
 	}
 
 	// buffer for a combined dispatch: a Peer identity change (contract

@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -393,6 +394,16 @@ type ClientSubprotocolStatsSnapshot struct {
 	QueryReplyDrops     uint64
 	// per registered id, messages delivered to its listeners
 	ReceivedById map[SubprotocolId]uint64
+
+	// Frames refused from a Service source, by reason: its IP frames, its
+	// subprotocol frames of an id `ClientSettings.ServiceSubprotocolIds` does not
+	// list, and anything else it sent. Zero unless this client provides Service.
+	// An honest peer can add to the second: its network quality hint to a live
+	// lane is sent whatever the lane's mode, so these do not by themselves mean
+	// abuse.
+	DroppedServiceIp          uint64
+	DroppedServiceSubprotocol uint64
+	DroppedServiceOther       uint64
 }
 
 // The per-client registry, pending queries and counters. Registration takes
@@ -413,6 +424,11 @@ type subprotocolRegistry struct {
 	queriesSent         atomic.Uint64
 	queriesAnswered     atomic.Uint64
 	queryReplyDrops     atomic.Uint64
+
+	// see ClientSubprotocolStatsSnapshot.DroppedServiceIp and its neighbors
+	droppedServiceIp          atomic.Uint64
+	droppedServiceSubprotocol atomic.Uint64
+	droppedServiceOther       atomic.Uint64
 }
 
 func newSubprotocolRegistry() *subprotocolRegistry {
@@ -441,6 +457,10 @@ func (self *subprotocolRegistry) snapshot() ClientSubprotocolStatsSnapshot {
 		QueriesAnswered:     self.queriesAnswered.Load(),
 		QueryReplyDrops:     self.queryReplyDrops.Load(),
 		ReceivedById:        byId,
+
+		DroppedServiceIp:          self.droppedServiceIp.Load(),
+		DroppedServiceSubprotocol: self.droppedServiceSubprotocol.Load(),
+		DroppedServiceOther:       self.droppedServiceOther.Load(),
 	}
 }
 
@@ -581,6 +601,54 @@ func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, cod
 }
 
 // --- receive ---
+
+// The frames of a batch a Service source may deliver: subprotocol frames of a
+// listed id. Each other frame is counted by reason and left out, the query frames
+// among them, so a Service source learns nothing of what else this client speaks.
+// The batch itself is never written, since the receive item still owns its frames;
+// one that loses nothing comes back as is, which allocates nothing.
+func (self *Client) admitServiceFrames(frames []*protocol.Frame) []*protocol.Frame {
+	kept := frames
+	refused := false
+	for i, frame := range frames {
+		if self.serviceFrameAdmitted(frame) {
+			if refused {
+				kept = append(kept, frame)
+			}
+			continue
+		}
+		if !refused {
+			refused = true
+			kept = slices.Clone(frames[:i])
+		}
+	}
+	return kept
+}
+
+// Decides one frame of a Service source, counting a refusal. A frame whose
+// wrapper does not decode names no id, so it is not listed.
+func (self *Client) serviceFrameAdmitted(frame *protocol.Frame) bool {
+	if frame == nil {
+		return false
+	}
+	registry := self.subprotocols
+	switch frame.MessageType {
+	case protocol.MessageType_Subprotocol:
+		subprotocolId, _, ok := decodeSubprotocolHeader(frame.MessageBytes)
+		if ok && slices.Contains(self.settings.ServiceSubprotocolIds, subprotocolId) {
+			return true
+		}
+		registry.droppedServiceSubprotocol.Add(1)
+	case protocol.MessageType_IpIpPacketToProvider,
+		protocol.MessageType_IpIpPacketFromProvider,
+		protocol.MessageType_IpIpPing,
+		protocol.MessageType_IpIpProviderDiagnostics:
+		registry.droppedServiceIp.Add(1)
+	default:
+		registry.droppedServiceOther.Add(1)
+	}
+	return false
+}
 
 // Removes the subprotocol frames from a received batch and delivers them, and
 // answers or completes the subprotocol queries, returning the frames the
