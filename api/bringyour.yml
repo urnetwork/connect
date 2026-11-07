@@ -9567,9 +9567,10 @@ paths:
           description: No usable webhook user is configured, so the endpoint accepts nothing.
 
   # gkm's routes (sidecar DESIGN.md §10.14). gkm serves them on its own host and api
-  # never does, so check-routes.sh holds them to gkmservice's route table, not api's.
-  # Each is planned until gkm serves it: `x-status: planned` keeps the server's
-  # conformance test from failing on it, and `x-internal` keeps it out of the public
+  # never does, so check-routes.sh holds them to gkmservice's route table, not api's,
+  # and the server's conformance test leaves them out of api's. Each is planned until
+  # gkm serves it: `x-status: planned` lets gkmservice's table lack it, as api's table
+  # may lack a planned route, and `x-internal` keeps it out of the public
   # reference and the generated client. A body is one of sidecar's protocol/gkm.proto
   # messages or a bare `Signed`, as application/octet-stream, and each description
   # says which and which scope it takes.
@@ -9722,7 +9723,8 @@ paths:
       description: |
         A `GkmReaderKeysRequest` of at most 256 sidecars, answered by a
         `GkmReaderKeysReply`, which a rotator reads instead of a request per
-        recipient. Takes what `GET /gkm/reader-key/{sidecar_id}` takes.
+        recipient. Takes what `GET /gkm/reader-key/{sidecar_id}` takes: a gkm
+        token of an admitted sidecar holding `r`, `rw` or `admin` on some repo.
       operationId: gkmReaderKeys
       security:
         - ServiceTokenAuth: []
@@ -9881,11 +9883,18 @@ paths:
       tags: [Other]
       summary: Re-form a repo's group
       description: |
-        A `Signed` `GroupForm`, purpose `group-form`, by a repo admin's device, in
-        an owner-bound kind only the owner's consented device, or a network
-        admin's outside those. `POST /gkm/groups` files a new group's first form,
-        and this one the form that re-forms it. The only gkm write a repo
-        re-seeded as deleted takes. Needs `admin`.
+        A `GkmGroupReformRequest`: a `Signed` `GroupForm`, purpose `group-form`,
+        naming the group it re-forms and the newest generation the re-former
+        holds, with the new group's epoch 0. The form is by a repo admin's
+        device, in an owner-bound kind only the owner's consented device, or a
+        network admin's outside those. `POST /gkm/groups` files a new group's
+        first form, and this one the form that re-forms it, after a site loss,
+        for a stalled group or for an IANA renumbering of its suite. Writes the
+        GroupForm, then epoch 0, each only if absent, so a retry of equal bytes
+        answers 200 and a crash resumes where it stopped. The ladder route then
+        carries the old generations, and the wraps routes the first wraps. A
+        repo re-seeded as deleted takes this route and the ladder's, in re-seed
+        mode, and no other gkm write. Needs `admin`.
       operationId: gkmRepoForm
       security:
         - ServiceTokenAuth: []
@@ -9906,9 +9915,9 @@ paths:
         "200":
           description: Filed.
         "403":
-          description: Out of scope, or the signer may not form this repo's group.
+          description: Out of scope, the signer may not form this repo's group, or the repo is deleted outside re-seed mode.
         "409":
-          description: That form's place holds other bytes.
+          description: That form's place, or the new group's epoch 0, holds other bytes.
         "429":
           description: Past a rate, or queued out by the write budget.
 
@@ -10198,7 +10207,7 @@ paths:
               format: binary
       responses:
         "200":
-          description: One result per wrap, in order, as the wraps route answers.
+          description: One result per wrap, in order, as the wraps route answers, though a 412's winner is the stored RecoveryWrap's bare ciphertext, which nothing signs.
           content:
             application/octet-stream:
               schema:
@@ -10219,11 +10228,14 @@ paths:
       summary: Carry a re-formed group's ladder
       description: |
         A `GkmLadderRequest`: at most 64 `Signed` `GenRotate`s a call, in ascending
-        order, each the old group's byte for byte. Open only while the newest
-        GroupForm names the group and before its epoch 1 exists, and with the form
-        in re-seed mode. gkm checks the order, each parent commitment and that no
-        generation passes the form's, and skips a claim's time and signer checks.
-        Equal bytes answer success, so a retry is safe. Needs `admin`.
+        order, each the old group's byte for byte. Open to every re-form, a site
+        loss's, a stalled group's or an IANA renumbering's, but only while the
+        newest GroupForm names the group and before its epoch 1 exists. A repo
+        re-seeded as deleted takes it in re-seed mode, as it takes the form. gkm
+        checks the order, each parent commitment and that no generation passes
+        the form's, and skips a claim's time and signer checks. The group takes
+        no commit, wrap or claim until the form's generation is here. Equal
+        bytes answer success, so a retry is safe. Needs `admin`.
       operationId: gkmLadderUpload
       security:
         - ServiceTokenAuth: []
@@ -10413,8 +10425,9 @@ paths:
       summary: Read a member's recovery wraps
       description: |
         A `GkmRecoveryWrapsReply`, from every metadata cluster. For a device of
-        that member, or its unadmitted client under `recovery:<member_id>`, which
-        reaches that member's own wraps and no other gkm route.
+        that member under a gkm token holding `r`, `rw` or `admin` on some repo,
+        or for its unadmitted client under `recovery:<member_id>`, which reaches
+        that member's own wraps and no other gkm route.
       operationId: gkmRecoveryWraps
       security:
         - ServiceTokenAuth: []
@@ -10466,8 +10479,9 @@ paths:
       tags: [Other]
       summary: Delete a retired binding's recovery wraps
       description: |
-        For that member's own device, which deletes an old binding's wraps only
-        once every new one exists, so a crash between leaves both and a retry
+        For that member's own device, under a gkm token holding `r`, `rw` or
+        `admin` on some repo, which deletes an old binding's wraps only once
+        every new one exists, so a crash between leaves both and a retry
         finishes.
       operationId: gkmRecoveryWrapsDelete
       security:

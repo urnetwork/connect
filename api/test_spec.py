@@ -300,6 +300,50 @@ class GkmRoutesTest(unittest.TestCase):
                 for body in bodies:
                     self.assertLessEqual(set(body.get("content", {})), {"application/octet-stream"})
 
+    def description(self, method, path):
+        """An operation's description on one line."""
+        return " ".join(self.spec["paths"][path][method]["description"].split())
+
+    def test_only_drop_key_takes_a_deposit_only_token(self):
+        # QD-177: a token whose only repo scopes are deposit reaches GET drop-key
+        # and nothing else at gkm, so every other route asks for r, rw or admin
+        for method, path in self.operations(True):
+            description = self.description(method, path)
+            with self.subTest(path=path, method=method):
+                if (method, path) == ("get", "/gkm/repos/{repo_id}/drop-key"):
+                    self.assertIn("`deposit`", description)
+                else:
+                    self.assertNotIn("`deposit`", description)
+                    self.assertRegex(description, r"`(r|rw|admin)`")
+
+    def test_a_reform_files_its_epoch_zero_with_its_form(self):
+        # 10.6's checks: a re-form writes the GroupForm, epoch 0, ladder and first
+        # wraps. Only the forms route can carry that epoch 0: POST /gkm/groups is
+        # creation's, and an epoch POST needs the epoch before it
+        description = self.description("post", "/gkm/repos/{repo_id}/forms")
+        self.assertTrue(description.startswith("A `GkmGroupReformRequest`"), description)
+        self.assertIn("epoch 0", description)
+
+    def test_a_deleted_reseed_takes_the_form_and_the_ladder(self):
+        # 10.8: a repo re-seeded as deleted takes only its GroupForm, with its
+        # epoch 0 and ladder. QD-074 opens the ladder to every re-form, a stalled
+        # group's and an IANA renumbering's too, and to that one in re-seed mode
+        taking = {
+            (method, path)
+            for method, path in self.operations(True)
+            if "re-seeded as deleted" in self.description(method, path)
+        }
+        self.assertEqual(
+            {("post", "/gkm/repos/{repo_id}/forms"), ("post", "/gkm/groups/{group_id}/ladder")}, taking
+        )
+        self.assertIn("Open to every re-form", self.description("post", "/gkm/groups/{group_id}/ladder"))
+
+    def test_a_recovery_wraps_412_names_its_unsigned_winner(self):
+        # QD-468: a RecoveryWrap is unsigned, bare enc || ct, so the winner its
+        # 412 carries cannot be the wraps route's Signed delivery
+        responses = self.spec["paths"]["/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}"]["post"]["responses"]
+        self.assertIn("bare ciphertext", responses["200"]["description"])
+
     def test_statuses_are_the_designs(self):
         # a wrap's own 201, 412 and 409 ride its batch's 200
         for path, want in {
