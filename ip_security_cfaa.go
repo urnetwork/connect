@@ -53,6 +53,23 @@ type CfaaSecurityPolicySettings struct {
 	// exact protocol-v12 TCP fallback on port 595. It never overrides the IP
 	// blocklist.
 	AllowTelegramCalls bool
+
+	// Drops a public-rule egress to 100.64.0.0/10 (RFC 6598) with
+	// `SecurityPolicyReasonSharedAddressSpace`, ahead of the static rules and
+	// DPI, so a public exit cannot carry overlay traffic. It is a Drop and never
+	// an Incident, so nobody is reported for reaching a carrier's address.
+	// Network sources keep their bypass.
+	//
+	// False, the default, changes no verdict: the reason is only counted, so a
+	// release can measure what the drop would refuse before one turns it on.
+	// Unlike the rules above it applies whatever `Enabled` says, as the
+	// public-unicast rule beside it does.
+	//
+	// Omitted from JSON while false, so a default policy's SecurityPolicyHash and
+	// rules pin are unchanged, and turning it on changes the hash. Making true
+	// the default is a default change, which raises
+	// SecurityPolicyRulesGeneration.
+	DropSharedAddressSpace bool `json:",omitempty"`
 }
 
 func DefaultCfaaSecurityPolicySettings() *CfaaSecurityPolicySettings {

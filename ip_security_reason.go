@@ -62,6 +62,11 @@ const (
 	// the WhatsApp Noise transport, an application standard
 	// (ip_security_appstandard.go)
 	SecurityPolicyReasonAllowWhatsApp
+	// a public-rule destination in the shared address space, 100.64.0.0/10.
+	// Decides the packet with `CfaaSecurityPolicySettings.DropSharedAddressSpace`
+	// on. With it off the packet keeps its verdict and its deciding reason, and
+	// this is counted beside them as what the drop would have refused.
+	SecurityPolicyReasonSharedAddressSpace
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -129,6 +134,8 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-messaging"
 	case SecurityPolicyReasonAllowWhatsApp:
 		return "allow-app-standard:whatsapp"
+	case SecurityPolicyReasonSharedAddressSpace:
+		return "shared-address-space"
 	default:
 		return "unknown"
 	}
@@ -143,4 +150,7 @@ type securityDecision struct {
 	reason SecurityPolicyReason
 	// the flow's terminal verdict was reached by this packet
 	decidedNow bool
+	// a rule that matched without deciding, counted beside `reason`;
+	// SecurityPolicyReasonUnknown when there is none
+	shadowReason SecurityPolicyReason
 }

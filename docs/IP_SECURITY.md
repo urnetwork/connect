@@ -72,11 +72,19 @@ For each egress packet, in order:
    relationship) → **Allow**.
 2. **Public-unicast** — destination not public unicast (private / loopback /
    link-local / multicast / unspecified) → **Incident**.
-3. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
+3. **Shared address space** — destination in `100.64.0.0/10` (RFC 6598) →
+   **Drop** with `shared-address-space` when
+   `CfaaSecurityPolicySettings.DropSharedAddressSpace` is on. Off, the default,
+   nothing changes: the packet goes on to the rules below and the reason is
+   counted beside the one that decides it (§2.5), which is the shadow release
+   that comes before the drop. It is never an Incident, because this space holds
+   carrier and overlay addresses: `isPublicUnicast` keeps calling it public, so
+   no one is reported for reaching it.
+4. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
    - `cfaaDrop` → **Drop**
    - `cfaaAllow` → **Allow** (definitive; skip DPI)
    - `cfaaPass` → hand to the **DMCA layer**.
-4. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
+5. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
 
 ### 2.3 Ingress pipeline (source)
 
@@ -221,6 +229,12 @@ Egress decisions also record a **verdict reason** (`SecurityPolicyReason`,
 even when `includeIp` is set, share the result table's per-key cardinality bound,
 and are local diagnostics: nothing about them is sent off the device.
 
+`shared-address-space` is the one reason that can be counted without deciding
+anything (§2.2 step 3): with the drop off, such a packet counts once under its
+deciding reason and once under this one, so the reasons of those packets sum to
+twice their result count. Its count is the number of packets the drop would
+refuse.
+
 ### 2.6 Files
 
 | File | Hand-written? | Role |
@@ -363,8 +377,10 @@ section). Both are validated before either is written. For the block tables:
    127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16,
    198.18/15, 198.51.100/24, 203.0.113/24, 224/4, 240/4`) and non-global IPv6
    (`::/8, 64:ff9b::/96, 100::/64, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10,
-   ff00::/8`). The egress path already refuses these before the table; clipping also
-   strips the large reserved blocks feeds (e.g. FireHOL fullbogons) sometimes include.
+   ff00::/8`). The egress path already refuses these before the table, except
+   `100.64/10`, which it refuses only with `DropSharedAddressSpace` on (§2.2);
+   clipping also strips the large reserved blocks feeds (e.g. FireHOL fullbogons)
+   sometimes include.
 6. **Aggregate sanity** — fail under `-min-ranges` (default 10k IPv4 ranges),
    under `-min-ranges6` (default 100 IPv6 ranges), or over `-max-coverage`
    (default 64M IPv4 addresses; poison guard).

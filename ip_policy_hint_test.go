@@ -156,6 +156,7 @@ func TestBlockActionReasonPrecedence(t *testing.T) {
 		{result: SecurityPolicyResultDrop, reason: SecurityPolicyReasonCfaaDropPort, expected: BlockActionReasonSecurityPort},
 		{result: SecurityPolicyResultDrop, reason: SecurityPolicyReasonCfaaDropIp, expected: BlockActionReasonSecurityIp},
 		{result: SecurityPolicyResultIncident, reason: SecurityPolicyReasonNotPublic, expected: BlockActionReasonSecurityIp},
+		{result: SecurityPolicyResultDrop, reason: SecurityPolicyReasonSharedAddressSpace, expected: BlockActionReasonSecurityIp},
 		{result: SecurityPolicyResultDrop, reason: SecurityPolicyReasonUnknown, expected: BlockActionReasonSecurity},
 		{result: SecurityPolicyResultAllow, reason: SecurityPolicyReasonAllowTls, expected: ""},
 		{result: SecurityPolicyResultAllow, blocker: true, expected: BlockActionReasonBlocker},
