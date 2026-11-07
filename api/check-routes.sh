@@ -12,13 +12,22 @@
 # does not. A streaming route (one whose request body the server reads at the
 # client's pace) is a route like any other here.
 #
-# The /competition/* routes are the one exception. This api process serves
+# The /competition/* routes are one exception. This api process serves
 # them, but they are a separate security domain with their own document,
 # sn/api/competition.yml, so bringyour.yml must NOT list them: a competition
 # path found there is drift. They are checked against that document instead,
 # looked up at <server>/../sn/api/competition.yml; when it is not reachable
 # that half of the check is skipped with a note rather than failed, so the
 # script still works in a checkout without the sn repo beside the server.
+#
+# The /gkm/* routes are the other exception, the other way round: bringyour.yml
+# documents them, but server/cli/gkm serves them on its own host from sidecar's
+# gkmservice package, so api must not register them: a gkm path in its table is
+# drift. They are checked against that package's route table instead, looked up
+# at <server>/../sidecar/gkmservice/routes.go, where each route is a net/http
+# pattern in one string literal, as in "POST /gkm/groups/{group_id}/gen/{g}".
+# Until that file exists, or in a checkout without the sidecar repo beside the
+# server, that half of the check is skipped with a note rather than failed.
 #
 # Deliberately dependency-free: zsh, grep, sed, sort, comm. No yaml parser and
 # no go toolchain, so it runs in a bare checkout and in CI.
@@ -64,6 +73,7 @@ if [[ ! -f $spec ]]; then
 fi
 
 competition_spec=${server_dir:A:h}/sn/api/competition.yml
+gkm_routes=${server_dir:A:h}/sidecar/gkmservice/routes.go
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -117,12 +127,12 @@ grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
     | sed -e 's/\\\\\./\./g' -e 's/(\[^\/\]+)/*/g' \
     | sort -u > $work/routes.all
 
-grep -v ' /competition/' $work/routes.all > $work/routes
+grep -v -e ' /competition/' -e ' /gkm/' $work/routes.all > $work/routes
 grep ' /competition/' $work/routes.all > $work/routes.competition
 
 # --- the specs -------------------------------------------------------------
 spec_paths $spec > $work/spec.all
-grep -v ' /competition/' $work/spec.all > $work/spec
+grep -v -e ' /competition/' -e ' /gkm/' $work/spec.all > $work/spec
 grep ' /competition/' $work/spec.all > $work/spec.competition
 planned_paths $spec > $work/planned
 
@@ -146,6 +156,31 @@ missing_from_server=$(comm -13 $work/routes $work/spec | comm -23 - $work/planne
 listed_competition=$(cat $work/spec.competition)
 [[ -n $listed_competition ]] && \
     report "in bringyour.yml but belongs in sn/api/competition.yml" "$listed_competition"
+
+# --- gkmservice's route table ----------------------------------------------
+grep ' /gkm/' $work/spec.all > $work/spec.gkm
+gkm_spec_count=$(grep -c . $work/spec.gkm)
+
+# a gkm path in api's table is drift on its own, whatever gkmservice holds
+registered_gkm=$(grep ' /gkm/' $work/routes.all)
+[[ -n $registered_gkm ]] && report "registered by api but served by gkm" "$registered_gkm"
+
+if [[ -f $gkm_routes ]]; then
+    grep -ohE '"[A-Z]+ /gkm/[^"]*"' $gkm_routes \
+        | sed -e 's/^"//' -e 's/"$//' -e 's/{[^}]*}/*/g' \
+        | sort -u > $work/routes.gkm
+    gkm_route_count=$(grep -c . $work/routes.gkm)
+
+    gkm_missing=$(comm -23 $work/routes.gkm $work/spec.gkm)
+    gkm_extra=$(comm -13 $work/routes.gkm $work/spec.gkm)
+
+    [[ -n $gkm_missing ]] && report "in gkmservice's route table but NOT in bringyour.yml" "$gkm_missing"
+    [[ -n $gkm_extra ]] && report "in bringyour.yml but NOT in gkmservice's route table" "$gkm_extra"
+
+    print "gkm: $gkm_route_count routes in gkmservice's table, $gkm_spec_count documented operations"
+else
+    print "gkm: $gkm_spec_count documented operations NOT CHECKED (no $gkm_routes)"
+fi
 
 # --- sn/api/competition.yml ------------------------------------------------
 route_count=$(grep -c . $work/routes)

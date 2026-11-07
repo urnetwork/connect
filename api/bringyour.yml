@@ -9566,6 +9566,773 @@ paths:
         "503":
           description: No usable webhook user is configured, so the endpoint accepts nothing.
 
+  # gkm's routes (sidecar DESIGN.md §10.14). gkm serves them on its own host and api
+  # never does, so check-routes.sh holds them to gkmservice's route table, not api's.
+  # Each is planned until gkm serves it: `x-status: planned` keeps the server's
+  # conformance test from failing on it, and `x-internal` keeps it out of the public
+  # reference and the generated client. A body is one of sidecar's protocol/gkm.proto
+  # messages or a bare `Signed`, as application/octet-stream, and each description
+  # says which and which scope it takes.
+  /gkm/key-packages:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Upload KeyPackages
+      description: |
+        A `GkmKeyPackagesRequest`. Up to 128 one-time and 1 last-resort KeyPackage
+        per sidecar, each valid 90 days, refilled below 32. Takes any gkm token
+        whose sidecar is the credential's, from a member device admitted and not
+        revoked, parked or suspended. A sidecar's first upload hints `pending` to
+        the writers of each repo it reads.
+      operationId: gkmKeyPackagesUpload
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Not the credential's sidecar, or not a member device.
+        "429":
+          description: Past the sidecar's count, or queued out by the write budget.
+
+  /gkm/key-packages/claim:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Claim a KeyPackage
+      description: |
+        A `GkmKeyPackageClaimRequest`, answered by a `GkmKeyPackageClaimReply`. A
+        one-time KeyPackage serves one claim, for a target the newest verified
+        state lists as a reader, and a last-resort one only once no one-time one
+        remains. 10 a minute per claimer and target. Needs `rw`, or in the config
+        and directory groups the `rw` a member device or a sidecar that is not
+        read-only holds there.
+      operationId: gkmKeyPackageClaim
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The claimed KeyPackage.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope, or the target is no reader.
+        "404":
+          description: The target holds no KeyPackage.
+        "429":
+          description: Past the rate, or queued out by the write budget.
+
+  /gkm/reader-key:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Replace the caller's ReaderKey
+      description: |
+        A `Signed` `ReaderKey`, purpose `reader-key`, which replaces the sidecar's
+        current one. Takes any gkm token whose sidecar is the record's, admitted
+        and not revoked, parked or suspended. At most once per 24 h after its
+        first.
+      operationId: gkmReaderKeyUpload
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Not the record's sidecar.
+        "429":
+          description: Past the daily limit, or queued out by the write budget.
+
+  /gkm/reader-key/{sidecar_id}:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a sidecar's ReaderKey
+      description: |
+        The `Signed` `ReaderKey` gkm serves, a public record, under any gkm token
+        of an admitted sidecar. gkm proves nothing by serving it: a sealer checks
+        it itself before sealing to it.
+      operationId: gkmReaderKey
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: sidecar_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The `Signed` `ReaderKey`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Not an admitted sidecar's token.
+        "404":
+          description: The sidecar holds no ReaderKey.
+
+  /gkm/groups:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Create a repo's group
+      description: |
+        A `GkmGroupCreateRequest`, for a repo that is still `keying`. Writes the
+        GroupForm, then epoch 0, then generation 1, each only if absent, so a
+        retry of equal bytes answers 200 and a crash resumes where it stopped.
+        Needs `admin`.
+      operationId: gkmGroupCreate
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Created.
+        "403":
+          description: Out of scope, or the repo is not `keying`.
+        "409":
+          description: The group holds other bytes.
+        "429":
+          description: Past a rate, or queued out by the write budget.
+
+  /gkm/groups/{group_id}:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a group
+      description: A `GkmGroupReply`. Needs `r`, `rw` or `admin`.
+      operationId: gkmGroup
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+      responses:
+        "200":
+          description: The group.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+        "404":
+          description: No such group.
+
+  /gkm/repos/{repo_id}/forms:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Re-form a repo's group
+      description: |
+        A `Signed` `GroupForm`, purpose `group-form`, by a repo admin's device, in
+        an owner-bound kind only the owner's consented device, or a network
+        admin's outside those. `POST /gkm/groups` files a new group's first form,
+        and this one the form that re-forms it. The only gkm write a repo
+        re-seeded as deleted takes. Needs `admin`.
+      operationId: gkmRepoForm
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Filed.
+        "403":
+          description: Out of scope, or the signer may not form this repo's group.
+        "409":
+          description: That form's place holds other bytes.
+        "429":
+          description: Past a rate, or queued out by the write budget.
+
+  /gkm/groups/{group_id}/epochs:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a group's epochs
+      description: |
+        A `GkmEpochsReply`: the epoch objects after `after`, in order, with their
+        sizes. An answer stops at gkm's bound, so ask again after its last epoch
+        until none comes. Needs `r`, `rw` or `admin`.
+      operationId: gkmEpochs
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - name: after
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The epochs.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
+  /gkm/groups/{group_id}/epochs/{n}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Commit an epoch
+      description: |
+        A `GkmEpochRequest`. Its commit is a PrivateMessage, or an external
+        commit's PublicMessage, whose `authenticated_data` holds a
+        `GkmCommitHeader`, the only part of it gkm reads. The first commit of an
+        epoch wins, once the epoch before it exists. gkm sees no proposal, so
+        members refuse what its committer may not commit. Takes `r`, `rw` or
+        `admin`, from a member device reading the repo.
+      operationId: gkmEpochCommit
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmEpoch"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Committed. A retry of the winning commit answers this too.
+        "403":
+          description: Out of scope, or the header fails the epoch check.
+        "409":
+          description: Another commit won the epoch. The body is the winner, a `GkmEpochObject`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "429":
+          description: Past 60 commits an hour, or queued out by the write budget.
+
+  /gkm/groups/{group_id}/gen:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a group's generations
+      description: |
+        A `GkmGenerationsReply`: the `Signed` `GenRotate` of each generation after
+        `since`, in order. An answer stops at gkm's bound, so ask again after its
+        last generation until none comes. Needs `r`, `rw` or `admin`.
+      operationId: gkmGenerations
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The generations.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
+  /gkm/groups/{group_id}/gen/{g}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Claim a generation
+      description: |
+        The claim, a `Signed` `GenRotate`, purpose `gen-rotate`, and the only
+        place a generation exists, so a rotator stages every delivery first. It
+        must chain from generation `g` - 1, its auth pin must not fall and must
+        match the projection at that version, and its time must be within 10
+        minutes of gkm's clock. Needs `rw`, never a read-only device's, or in the
+        config group a member device's `rw`.
+      operationId: gkmGenerationClaim
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmGeneration"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Claimed.
+        "403":
+          description: Out of scope, or the claim fails its checks.
+        "412":
+          description: Already claimed. The body is the winner, a `Signed` `GenRotate`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "429":
+          description: Past 60 claims an hour, or queued out by the write budget.
+
+  /gkm/groups/{group_id}/wraps/{g}:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read the caller's deliveries of a generation
+      description: |
+        A `GkmWrapsReply`: the caller's own deliveries and its covering
+        Delegation's, the object at `want` first, then the recipient's prefix on
+        a miss, which hints `wrap-pending`. A recipient asks at most once a
+        minute. Needs `r`, `rw` or `admin`.
+      operationId: gkmWraps
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmGeneration"
+        - name: recipient
+          in: query
+          required: true
+          description: "`s:` and a sidecar_id, or `d:` and a delegation_id, in lowercase hex."
+          schema:
+            type: string
+        - name: want
+          in: query
+          required: false
+          description: The first 8 bytes of the wanted key's SHA-256, in hex.
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          description: When the recipient first asked, in ms since the epoch.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The deliveries.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope, or not the caller's recipient.
+
+  /gkm/groups/{group_id}/wraps/{g}/{c8}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Stage or deliver a wrap
+      description: |
+        A `Signed` `ReaderWrap` or `DelegationWrap`, purpose `reader-wrap`, whose
+        body's group, generation, commitment prefix, recipient and key digest
+        agree with its object's path. Staged only while generation `g` is
+        unclaimed, or of generation 1 by its signer while the repo is `keying`.
+        Late only once `g` is the newest and carries the body's commitment. Takes
+        `r`, `rw` or `admin`, from a sidecar that is not read-only.
+      operationId: gkmWrapUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmGeneration"
+        - name: c8
+          in: path
+          required: true
+          description: The first 8 bytes of the generation's commitment, in hex.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Stored.
+        "403":
+          description: Out of scope, or the signer may not deliver.
+        "409":
+          description: Stale kind, generation or key.
+        "412":
+          description: That delivery exists. The body is the winner, a `Signed` wrap.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "429":
+          description: Past the staged rate, or queued out by the write budget.
+
+  /gkm/groups/{group_id}/welcome/{n}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Store epoch n's Welcome
+      description: |
+        A `GkmWelcomeRequest`, only after epoch `n`'s object and only by its
+        uploader, so a lost commit's Welcome never exists. Stores the Welcome and
+        a pointer per recipient, and hints `welcome`. Needs `rw`, or in the
+        config and directory groups the `rw` a member device or a sidecar that is
+        not read-only holds there.
+      operationId: gkmWelcomeUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmEpoch"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Out of scope, or not epoch `n`'s uploader.
+        "429":
+          description: Queued out by the write budget.
+
+  /gkm/groups/{group_id}/group-info:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a group's GroupInfo
+      description: |
+        A `GkmGroupInfoObject`: at most 16 leaves a pointer to the epoch whose
+        object holds the sealed GroupInfo, then probe for later epochs; above, the
+        sealed GroupInfo. One older than `want` also hints `wrap-pending`, every
+        60 s, until a leaf writes the current epoch's. Needs `r`, `rw` or `admin`.
+      operationId: gkmGroupInfo
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - name: want
+          in: query
+          required: false
+          description: The epoch the caller needs.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The pointer or sealed GroupInfo.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+        "404":
+          description: The group holds none.
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Write a group's GroupInfo
+      description: |
+        A `GkmGroupInfoObject`: at most 16 leaves the pointer, rewritten at each
+        Add; above, the sealed GroupInfo a leaf writes on demand, at most once an
+        epoch and never with another commit. Its epoch must rise. Takes `r`, `rw`
+        or `admin`, from a member device reading the repo that is not read-only.
+      operationId: gkmGroupInfoUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Out of scope.
+        "409":
+          description: Its epoch does not rise.
+        "429":
+          description: Past one an epoch, or queued out by the write budget.
+
+  /gkm/groups/{group_id}/ack:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Acknowledge an applied epoch
+      description: |
+        A `GkmAckRequest`, for the caller's own leaf, which retention reads. Soft
+        state, written at most daily. Needs `r`, `rw` or `admin`.
+      operationId: gkmAck
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Taken.
+        "403":
+          description: Out of scope.
+
+  /gkm/groups/{group_id}/drop-key:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a group's drop keys
+      description: |
+        A `GkmGenerationsReply`: the newest `GenRotate`, up to 64 after `since`. A
+        depositor checks them itself before it seals. The only route `deposit`
+        reaches, which `r`, `rw` and `admin` also reach.
+      operationId: gkmDropKey
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The generations.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
+  /gkm/welcomes:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read the caller's Welcomes
+      description: |
+        A `GkmWelcomesReply`: each pending pointer with its Welcome, which no
+        other route serves. Needs `r`, `rw` or `admin` of each Welcome's repo.
+      operationId: gkmWelcomes
+      security:
+        - ServiceTokenAuth: []
+      responses:
+        "200":
+          description: The Welcomes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
+  /gkm/recovery/{member_id}/wraps:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a member's recovery wraps
+      description: |
+        A `GkmRecoveryWrapsReply`, from every metadata cluster. For a device of
+        that member, or its unadmitted client under `recovery:<member_id>`, which
+        reaches that member's own wraps and no other gkm route.
+      operationId: gkmRecoveryWraps
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmMemberId"
+      responses:
+        "200":
+          description: The wraps.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Another member's, or out of scope.
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Stage a recovery wrap
+      description: |
+        A `GkmRecoveryWrap`, from a rotator staging, or from that member's device
+        re-wrapping after a rebind, under `r`, `rw` or `admin` of the group's repo.
+      operationId: gkmRecoveryWrapUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmMemberId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Stored.
+        "403":
+          description: Out of scope.
+        "412":
+          description: That wrap exists.
+        "429":
+          description: Queued out by the write budget.
+    delete:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Delete a retired binding's recovery wraps
+      description: |
+        For that member's own device, which deletes an old binding's wraps only
+        once every new one exists, so a crash between leaves both and a retry
+        finishes.
+      operationId: gkmRecoveryWrapsDelete
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmMemberId"
+        - name: binding
+          in: query
+          required: true
+          description: The first 8 bytes of the SHA-256 of the binding's Ed25519 key, in hex.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted.
+        "403":
+          description: Another member's device.
+
   # ----- oauth authorization server (server/IDP.md) -----
 
   /.well-known/oauth-authorization-server:
@@ -10791,6 +11558,34 @@ paths:
 
 components:
   parameters:
+    GkmGroupId:
+      in: path
+      name: group_id
+      schema:
+        type: string
+      required: true
+      description: The group's 16 random bytes, in lowercase hex. URLs carry only ids.
+    GkmEpoch:
+      in: path
+      name: "n"
+      schema:
+        type: integer
+      required: true
+      description: The epoch.
+    GkmGeneration:
+      in: path
+      name: g
+      schema:
+        type: integer
+      required: true
+      description: The generation.
+    GkmMemberId:
+      in: path
+      name: member_id
+      schema:
+        type: string
+      required: true
+      description: The member's id.
     ClientInfo:
       in: header
       name: X-UR-ClientInfo
