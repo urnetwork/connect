@@ -514,7 +514,7 @@ func TestPublicExitsRefuseOverlayBlocksWithTheDropOn(t *testing.T) {
 	policy, _ := sharedAddressPolicy(ctx, true)
 	for _, c := range cases {
 		for _, entry := range sharedAddressExitEntries() {
-			for _, ipProtocol := range []IpProtocol{IpProtocolTcp, IpProtocolUdp} {
+			for _, ipProtocol := range []IpProtocol{IpProtocolTcp, IpProtocolUdp, IpProtocolIcmp} {
 				ipPath := sharedAddressPath(net.ParseIP(c.ip).To4(), 4, ipProtocol, 8080)
 				result, err := entry.inspect(policy, protocol.ProvideMode_Public, ipPath)
 				if err != nil {

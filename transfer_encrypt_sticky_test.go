@@ -396,7 +396,7 @@ func TestStickyRequiredServesAPeerThatNeverSeals(t *testing.T) {
 	if establishHoldSealed(rig.a, rig.bClientId) {
 		t.Fatal("a session formed with a peer that has encryption off")
 	}
-	if rig.a.encryptionSessionManager.RequireEncryptionForPeer(rig.bClientId) {
+	if rig.a.encryptionSessionManager.requireEncryptionForPeer(rig.bClientId) {
 		t.Fatal("a peer that never sealed is latched")
 	}
 }
@@ -972,7 +972,7 @@ func TestStickyRequiredWithNoDeadlineLastsAsLongAsASession(t *testing.T) {
 			session.observeContract(contract)
 		}
 		establishHoldSealer(t, session)()
-		if !manager.RequireEncryptionForPeer(peerId) {
+		if !manager.requireEncryptionForPeer(peerId) {
 			t.Fatal("the seal set no latch")
 		}
 		sibling := manager.getOrCreate(peerId, sequenceTlsRoleServer, false)
@@ -1022,7 +1022,7 @@ func TestStickyRequiredLatchesAreSwept(t *testing.T) {
 	manager.Testing_DropSessions(heldId)
 
 	visit(64)
-	if !manager.RequireEncryptionForPeer(heldId) {
+	if !manager.requireEncryptionForPeer(heldId) {
 		t.Fatal("the sweep took a latch inside its contract")
 	}
 	if count := latchCount(); 3 < count {
@@ -1061,7 +1061,7 @@ func TestStickyRequiredDefaultsOffAndLeavesTheOtherModes(t *testing.T) {
 	if session := off.Acquire(NewId(), sequenceTlsRoleClient, false); session != nil {
 		t.Fatal("an Off client made a session")
 	}
-	if off.RequireEncryptionForPeer(NewId()) {
+	if off.requireEncryptionForPeer(NewId()) {
 		t.Fatal("an Off client requires encryption")
 	}
 }
@@ -1075,7 +1075,7 @@ func TestStickyRequiredLeavesNoSessionPeersExempt(t *testing.T) {
 	if !manager.SendNoSession(ControlId) || !manager.ReceiveNoSession(ControlId) {
 		t.Fatal("the control plane expects a session")
 	}
-	if manager.RequireEncryptionForPeer(ControlId) {
+	if manager.requireEncryptionForPeer(ControlId) {
 		t.Fatal("the control plane requires encryption")
 	}
 }

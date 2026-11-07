@@ -3741,7 +3741,7 @@ func (self *EncryptionSessionManager) Settings() *EncryptionSettings {
 
 // Whether the manager runs in `EncryptionModeRequired`, i.e. application data must
 // never flow in plaintext to or from any peer for which a session is expected. It
-// says nothing of one peer: RequireEncryptionForPeer does, and the gates read
+// says nothing of one peer: requireEncryptionForPeer does, and the gates read
 // `peerEncryptionSession.RequireEncryption`. Peers exempted by SendNoSession /
 // ReceiveNoSession (control-plane, self) are unaffected because no session is
 // expected for them.
@@ -3752,7 +3752,7 @@ func (self *EncryptionSessionManager) RequireEncryption() bool {
 // Whether application data with this peer must not flow in plaintext: the manager
 // runs in `EncryptionModeRequired`, or `EncryptionSettings.StickyRequired` holds
 // the peer.
-func (self *EncryptionSessionManager) RequireEncryptionForPeer(peerId Id) bool {
+func (self *EncryptionSessionManager) requireEncryptionForPeer(peerId Id) bool {
 	if self.RequireEncryption() {
 		return true
 	}

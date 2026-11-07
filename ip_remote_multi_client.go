@@ -17377,7 +17377,7 @@ func (self *multiClientChannel) requiresEncryption() bool {
 	if self.args == nil || self.args.Destination.Len() == 0 {
 		return manager.RequireEncryption()
 	}
-	return manager.RequireEncryptionForPeer(self.args.Destination.Tail())
+	return manager.requireEncryptionForPeer(self.args.Destination.Tail())
 }
 
 // EncryptionCapabilityFetcher returns a one-shot fetcher for the channel
