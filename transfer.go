@@ -2518,17 +2518,33 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 	return self.encryptionSessionManager
 }
 
-// unwrapFrame opens an outer-wrapped TransferFrame from `sourceId`. `roleHint`
-// (the sender's session role; may be `SequenceRoleUnknown`) selects the
-// complement local session to try first; `companionHint` (the sender's session
-// companion; nil when the sender omitted it) further pins the exact companion
-// session. With a role hint but no companion hint, both companion sessions of
-// the complement role are tried; with no role hint, every per-peer session is
+// Opens an outer-wrapped TransferFrame from `sourceId`. `roleHint` (the
+// sender's session role; may be `SequenceRoleUnknown`) selects the complement
+// local session to try first; `companionHint` (the sender's session companion;
+// nil when the sender omitted it) further pins the exact companion session.
+// With a role hint but no companion hint, both companion sessions of the
+// complement role are tried; with no role hint, every per-peer session is
 // tried. Each candidate session's ciphers are tried (established plus, briefly
-// during a rekey, the prior established) until one authenticates. Returns the
-// plaintext inner bytes and the local session role and companion that
-// decrypted them (used as the receive sequence's role/companion). Wait-free:
+// during a rekey, the prior established) until one authenticates. Wait-free:
 // it never blocks the receive loop.
+//
+// Returns the plaintext inner bytes and the local session role and companion
+// that decrypted them (used as the receive sequence's role/companion). It also
+// returns the peer client key of that same session, which the receive path
+// carries to `Peer.VerifiedClientPublicKey`. The key comes from the session
+// that opened this frame, never from the session a receive sequence holds. It
+// is nil unless `EncryptionSettings.ExposeVerifiedPeerClientKey` is on. It is
+// also nil in four other cases:
+//   - the session's signed-identity gate is pending, has rejected the key, or
+//     could not use its local pin store;
+//   - the session's established epoch has not completed the peer identity
+//     proof;
+//   - the session holds no Ed25519-sized key;
+//   - the call returns an error.
+//
+// `peerEncryptionSession.verifiedClientKey` decides the session's cases. A
+// non-nil key is shared with the session and every Peer that carries it, so it
+// must not be written.
 func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
