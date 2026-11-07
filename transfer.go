@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -599,17 +600,47 @@ type TransferKey struct {
 	LogicalLane uint32
 }
 
+// What a contract may carry, as `Peer.ContractClass` reports it. A receiver reads
+// `ContractClassUnset` as the narrowest class.
+const (
+	ContractClassUnset   = protocol.ContractClass_ContractClassUnset
+	ContractClassData    = protocol.ContractClass_ContractClassData
+	ContractClassControl = protocol.ContractClass_ContractClassControl
+)
+
 // the identity of the source of received frames.
 // `ProvideMode` is the mode of where these frames are from: network, friends and family, public.
 // `Roles` and `Principal` are the source client's identity from the active contract,
 // set only when the provide mode is network; nil roles and empty principal otherwise.
+// `ContractClass`, `SourceSubject`, `SourceNetwork` and `WindowDelegation` are the
+// seals of the contract these frames arrived under, in every provide mode. They come
+// from the same verified parse as `Roles`, so they are the platform's statements: a
+// consistency check on a customer signature, never a substitute for one. A contract
+// older than the seals, and a no-contract source, leaves them all empty. On a
+// companion contract they are the forward contract's, so they name the side that
+// opened the pair, not the source of these frames.
 // `TransferKey` is immutable for the receive sequence and can be passed as a
 // send option when constructing a reply.
+//
+// Every retained provider packet holds a Peer by value, inside a fixed reservation
+// (`providerReliablePacket`), so fields here are paid for per packet.
 type Peer struct {
 	ProvideMode protocol.ProvideMode
-	Roles       []string
-	Principal   string
-	TransferKey TransferKey
+	// `ContractClassUnset` when unsealed or when this build does not know the
+	// value, which a receiver holds to the narrowest class. Read it per frame:
+	// a pair's contracts change.
+	ContractClass protocol.ContractClass
+	Roles         []string
+	Principal     string
+	// The subject the platform stored for the source client; zero when unsealed.
+	SourceSubject Id
+	// The source client's network; zero when unsealed.
+	SourceNetwork Id
+	// The source window client's signed delegation, unverified and exactly as
+	// sealed; nil for any other source. Shared with the contract, so it is never
+	// written, and it outlives the callback.
+	WindowDelegation []byte
+	TransferKey      TransferKey
 	// TransportType is the physical carrier that delivered this Pack. It is
 	// immutable through receive ordering and batching.
 	TransportType TransportType
@@ -18209,11 +18240,15 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		receiveContract := self.openReceiveContracts[*item.contractId]
 		receiveContract.ack(item.messageByteCount)
 		peer = Peer{
-			ProvideMode:   receiveContract.provideMode,
-			Roles:         receiveContract.roles,
-			Principal:     receiveContract.principal,
-			TransferKey:   self.transferKey,
-			TransportType: item.transportType,
+			ProvideMode:      receiveContract.provideMode,
+			Roles:            receiveContract.roles,
+			Principal:        receiveContract.principal,
+			SourceSubject:    receiveContract.sourceSubject,
+			SourceNetwork:    receiveContract.sourceNetwork,
+			ContractClass:    receiveContract.contractClass,
+			WindowDelegation: receiveContract.windowDelegation,
+			TransferKey:      self.transferKey,
+			TransportType:    item.transportType,
 		}
 	} else {
 		// no contract peers are considered in network
@@ -18262,9 +18297,13 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	peerEqual := func(a Peer, b Peer) bool {
 		return a.ProvideMode == b.ProvideMode &&
 			a.Principal == b.Principal &&
+			a.SourceSubject == b.SourceSubject &&
+			a.SourceNetwork == b.SourceNetwork &&
+			a.ContractClass == b.ContractClass &&
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
-			slices.Equal(a.Roles, b.Roles)
+			slices.Equal(a.Roles, b.Roles) &&
+			bytes.Equal(a.WindowDelegation, b.WindowDelegation)
 	}
 	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
 		self.flushDeliver()
@@ -19008,6 +19047,13 @@ type sequenceContract struct {
 	// network; nil/empty for all other provide modes.
 	roles     []string
 	principal string
+
+	// The seals, from the same signed bytes and honored in every provide mode.
+	// Zero or empty when the contract seals none. See `Peer`.
+	sourceSubject    Id
+	sourceNetwork    Id
+	contractClass    protocol.ContractClass
+	windowDelegation []byte
 }
 
 func newSequenceContract(log Logger, tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
@@ -19062,6 +19108,29 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		principal = storedContract.Principal
 	}
 
+	// The seals have no outer copy either, and hold in every provide mode. An
+	// id that is there and malformed refuses the contract, as a malformed
+	// contract id does, rather than read as no subject.
+	sealedId := func(idBytes []byte) (Id, error) {
+		if len(idBytes) == 0 {
+			return Id{}, nil
+		}
+		return IdFromBytes(idBytes)
+	}
+	sourceSubject, err := sealedId(storedContract.SourceSubjectClientId)
+	if err != nil {
+		return nil, fmt.Errorf("Contract source subject malformed: %w", err)
+	}
+	sourceNetwork, err := sealedId(storedContract.SourceNetworkId)
+	if err != nil {
+		return nil, fmt.Errorf("Contract source network malformed: %w", err)
+	}
+	// a class from a later build carries a meaning this one cannot honor
+	contractClass := storedContract.ContractClass
+	if contractClass != ContractClassData && contractClass != ContractClassControl {
+		contractClass = ContractClassUnset
+	}
+
 	return &sequenceContract{
 		log:                                      log,
 		localId:                                  NewId(),
@@ -19081,6 +19150,10 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		destinationClientKeySignedTlsCertificate: destinationClientKeySignedTlsCertificate,
 		roles:                                    roles,
 		principal:                                principal,
+		sourceSubject:                            sourceSubject,
+		sourceNetwork:                            sourceNetwork,
+		contractClass:                            contractClass,
+		windowDelegation:                         storedContract.WindowDelegation,
 	}, nil
 }
 
