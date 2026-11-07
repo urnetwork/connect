@@ -1198,6 +1198,7 @@ func (self *UpgradeMux) SetLocalZone(localZone LocalZone) {
 	}
 }
 
+// The installed zone, or nil when there is none.
 func (self *UpgradeMux) getLocalZone() LocalZone {
 	if z := self.localZone.Load(); z != nil {
 		return *z

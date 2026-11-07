@@ -5,6 +5,23 @@ package connect
 // IP, no generic frame, no query (DESIGN §6.10.1). These run two clients over the
 // in-process gateways under hand-fed contracts, unless a test says otherwise, so a
 // frame takes the real path through contract verification and the receive sequence.
+//
+// The audit behind this file read every `ProvideMode_` site in connect for a default
+// that would widen Service:
+//
+//   - Fell to the public rules, so changed: `egressRelationship` and the policy's
+//     egress, group and ingress paths.
+//   - Would have moved a default client, so changed: `InitProvideSecretKeys`, which
+//     ranges the enum and whose keys the sdk saves, and `observePeer`, which would
+//     open a Stream reply toward a Service peer.
+//   - A range over the enum: the original contract evidence, which now names its
+//     modes and still refuses Service.
+//   - Already narrower, so left: provide pings, inbound provider streams, `Verify`
+//     and `provideFrame` under a pause, roles and principal, P2P priority.
+//   - Past the gate, so left: the provider's return-mode cache and reply keys, and
+//     the query reply's Stream fallback.
+//   - Stamped locally, so left: the multi client's synthesized packets, its window
+//     clients' provide modes, the loopback peer and connectctl.
 
 import (
 	"context"
@@ -638,8 +655,8 @@ func TestDefaultProvideSecretKeysOmitService(t *testing.T) {
 	}
 }
 
-// Service carries nothing in the modes that start a provider's work: no provider
-// streams, and no public provide pings.
+// Providing Service admits no inbound provider stream: a Service pair stays on the
+// relay, where the platform sees the contract it issued.
 func TestServiceModeGrantsNoProviderStream(t *testing.T) {
 	provideModes := map[protocol.ProvideMode]bool{protocol.ProvideMode_Service: true}
 	allowAny, allowNetwork := inboundProviderStreamPolicy(provideModes, false)
@@ -695,6 +712,10 @@ func TestProviderRefusesAServiceSourceUnderAnyPolicy(t *testing.T) {
 			byteCount += int64(len(frame.MessageBytes))
 		}
 		provider.ClientReceive(source, frames, Peer{ProvideMode: protocol.ProvideMode_Service})
+		// a receive callback borrows its frames, so they are still this test's
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
 
 		packetStats := provider.PacketStats()
 		AssertEqual(t, packetStats.RemoteIngressPacketCount, int64(0))
