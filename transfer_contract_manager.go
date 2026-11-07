@@ -1256,11 +1256,12 @@ func (self *ContractManager) handleControlFrameForQueue(
 					self.closeContracts([]*protocol.Contract{contract})
 					return nil
 				}
+				if errors.Is(err, errContractDestinationRefused) {
+					self.refuseContractDestination(contractKey, contract)
+					return err
+				}
 				if err != nil {
 					// contract rejected
-					if errors.Is(err, errContractDestinationRefused) {
-						self.closeContracts([]*protocol.Contract{contract})
-					}
 					contractError := protocol.ContractError_Trust
 					contractStatus = &ContractStatus{
 						Key:   contractKey,
@@ -1772,14 +1773,9 @@ func (self *ContractManager) TakeContract(
 				return contract
 			}
 			// Queued before the check was installed, or before the destination's
-			// expected key moved. Taken and closed unused, and the next queued
-			// contract answers for itself: each pass here spends one.
-			self.closeContracts([]*protocol.Contract{contract})
-			contractError := protocol.ContractError_Trust
-			self.contractStatus(&ContractStatus{
-				Key:   contractKey,
-				Error: &contractError,
-			})
+			// expected key moved. The next queued contract answers for itself,
+			// and each pass here spends one.
+			self.refuseContractDestination(contractKey, contract)
 			continue
 		}
 
@@ -1965,6 +1961,18 @@ func (self *ContractManager) contractDestinationAllowed(contractKey ContractKey,
 		return false
 	}
 	return self.destinationKeyAllowed(destinationId, storedContract.DestinationClientPublicKey)
+}
+
+// Retires a contract the check refused: it closes with nothing spent, and the
+// status tells whoever watches this destination.
+func (self *ContractManager) refuseContractDestination(contractKey ContractKey, contract *protocol.Contract) {
+	self.client.log.Infof("[contract]refused destination %s\n", contractKey.Destination)
+	self.closeContracts([]*protocol.Contract{contract})
+	contractError := protocol.ContractError_Trust
+	self.contractStatus(&ContractStatus{
+		Key:   contractKey,
+		Error: &contractError,
+	})
 }
 
 // Whether `destinationClientPublicKey` is a key this client accepts for

@@ -115,6 +115,7 @@ func (self *contractDelegationWatch) requireUnusedClose(t *testing.T, contractId
 	}
 }
 
+// How many closes the manager has reported.
 func (self *contractDelegationWatch) closeCount() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -292,7 +293,7 @@ func TestContractDelegationOffChangesNothing(t *testing.T) {
 	}
 }
 
-// What a check is given, with the contract the check is run on.
+// One thing a check was asked.
 type contractDelegationCheckCall struct {
 	destinationId Id
 	key           []byte
@@ -306,6 +307,7 @@ type contractDelegationCheck struct {
 	calls     []contractDelegationCheckCall
 }
 
+// The `ContractDestinationCheckFunction` to install.
 func (self *contractDelegationCheck) check(destinationId Id, destinationClientPublicKey []byte) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -313,6 +315,7 @@ func (self *contractDelegationCheck) check(destinationId Id, destinationClientPu
 	return bytes.Equal(destinationClientPublicKey, self.goodKey)
 }
 
+// How many times the check has been asked.
 func (self *contractDelegationCheck) callCount() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -513,14 +516,15 @@ func TestContractDestinationCheckPanicRefuses(t *testing.T) {
 	watch.requireRefusal(t, contractKey)
 }
 
-// A contract granted by a control service whose key the test chooses, for a real
-// sequence to run into.
+// A control service that grants every request a contract naming the key the test
+// chooses, for a real sequence to meet.
 type contractDelegationOob struct {
 	clientId   Id
 	storedKey  func(requestIndex int) []byte
 	grantCount atomic.Int64
 }
 
+// Takes the frames and answers before it returns.
 func (self *contractDelegationOob) SendControl(frames []*protocol.Frame, callback OobResultFunction) {
 	resultFrames := []*protocol.Frame{}
 	for _, frame := range frames {
@@ -807,6 +811,15 @@ func TestContractDestinationCheckHoldsTheFetchedKey(t *testing.T) {
 			}
 			if c.check && check.callCount() != 1 {
 				t.Errorf("%s: %d check calls", c.name, check.callCount())
+			}
+			// a refused fetch holds no slot against the contract that follows it
+			session.SetPeerClientPublicKey(goodKey)
+			want := c.wantKey
+			if want == nil {
+				want = goodKey
+			}
+			if key := session.PeerClientPublicKey(); !bytes.Equal(key, want) {
+				t.Errorf("%s: after a contract the session key is %x, want %x", c.name, key, want)
 			}
 		})
 	}

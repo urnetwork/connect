@@ -24,13 +24,17 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// Every provide mode a contract can carry today. Service joins with C9.
-var contractSealProvideModes = []protocol.ProvideMode{
-	protocol.ProvideMode_Network,
-	protocol.ProvideMode_FriendsAndFamily,
-	protocol.ProvideMode_Public,
-	protocol.ProvideMode_Stream,
-	protocol.ProvideMode_PublicStream,
+// Every provide mode a contract can carry, read from the enum so that a mode added
+// later, as C9's Service will be, is held to the seals without a row to remember.
+func contractSealProvideModes() []protocol.ProvideMode {
+	modes := []protocol.ProvideMode{}
+	values := protocol.ProvideMode_None.Descriptor().Values()
+	for index := range values.Len() {
+		if mode := protocol.ProvideMode(values.Get(index).Number()); mode != protocol.ProvideMode_None {
+			modes = append(modes, mode)
+		}
+	}
+	return modes
 }
 
 // One contract's seals.
@@ -41,6 +45,7 @@ type contractSeals struct {
 	windowDelegation []byte
 }
 
+// Seals with every field set, and ids of their own.
 func newContractSeals() contractSeals {
 	return contractSeals{
 		sourceSubject:    NewId(),
@@ -50,6 +55,7 @@ func newContractSeals() contractSeals {
 	}
 }
 
+// Writes these seals into a contract, as the signer does.
 func (self contractSeals) fill(stored *protocol.StoredContract) {
 	stored.SourceSubjectClientId = self.sourceSubject.Bytes()
 	stored.SourceNetworkId = self.sourceNetwork.Bytes()
@@ -67,6 +73,7 @@ func peerContractSeals(peer Peer) contractSeals {
 	}
 }
 
+// Whether two sets of seals say the same thing.
 func (self contractSeals) equal(other contractSeals) bool {
 	return self.sourceSubject == other.sourceSubject &&
 		self.sourceNetwork == other.sourceNetwork &&
@@ -112,7 +119,7 @@ func newContractSealFixture(t *testing.T) *contractSealFixture {
 	self.client.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{self.route})
 	self.client.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{outbound})
 	provideModes := map[protocol.ProvideMode]bool{}
-	for _, mode := range contractSealProvideModes {
+	for _, mode := range contractSealProvideModes() {
 		provideModes[mode] = true
 	}
 	self.client.ContractManager().SetProvideModes(provideModes)
@@ -185,6 +192,7 @@ func (self *contractSealFixture) contract(
 	}
 }
 
+// A Pack's contract frame, outside the message pool.
 func contractSealContractFrame(t *testing.T, contract *protocol.Contract) *protocol.Frame {
 	t.Helper()
 	contractBytes, err := proto.Marshal(contract)
@@ -223,6 +231,7 @@ func (self *contractSealFixture) inject(pack *protocol.Pack) {
 	synctest.Wait()
 }
 
+// Every delivery since the last call, in order.
 func (self *contractSealFixture) takeDeliveries() []contractSealDelivery {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -247,7 +256,7 @@ func TestContractSealsReachPeerInEveryProvideMode(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newContractSealFixture(t)
-		for _, mode := range contractSealProvideModes {
+		for _, mode := range contractSealProvideModes() {
 			fixture.sourceId = NewId()
 			seals := newContractSeals()
 			pack := contractSealPack(t, NewId(), 0, "sealed")
@@ -689,7 +698,7 @@ func TestContractsWithoutSealsReadEmpty(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newContractSealFixture(t)
-		for _, mode := range contractSealProvideModes {
+		for _, mode := range contractSealProvideModes() {
 			fixture.sourceId = NewId()
 			contract := fixture.contract(mode, nil)
 			// nothing a signer writes without seals is news to an older parser
