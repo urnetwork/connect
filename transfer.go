@@ -7200,6 +7200,10 @@ type SendSequence struct {
 	// callers only signal the immutable channel published in their snapshot.
 	noAckFastPathSettled       chan struct{}
 	pendingNoAckContractCloses map[Id]*sequenceContract
+	// A peer window's move, requested from outside and carried out by the
+	// sequence goroutine (`applyPeerContractMove`). Zero on a client that never
+	// marks a peer.
+	peerContractMove atomic.Uint32
 	// Whether a pack entering now could NOT also enter the resend queue,
 	// published by the send loop each pass. A reliable pack takes its
 	// admission slot only when this is clear (THROUGHPUTFIX §38.11):
@@ -10076,6 +10080,7 @@ sendSequenceLoop:
 		// here, before anything reads the contracts, and what they may write
 		// against next is published after (THROUGHPUTFIX §38.12)
 		fastPathCharged := self.applyNoAckFastPathAccountingReporting()
+		self.applyPeerContractMove()
 		self.publishNoAckFastPath()
 		// fast-path writes are charged only here, so this is where they can
 		// bring the current contract's successor due, and its announcement
@@ -11025,6 +11030,9 @@ const (
 	// a no-acknowledgement Pack in ordinary admission: it advances the
 	// contract and waits for the receiver to acknowledge what it advanced to
 	sendContractUpdateNoAckAdvance
+	// no Pack: a peer window's end takes the sequence's next contract, opened
+	// with its contract-only head like any other (`applyPeerContractMove`)
+	sendContractUpdatePeerMove
 )
 
 func (self *SendSequence) updateContractWithAckPromotion(
@@ -11045,6 +11053,8 @@ func (self *SendSequence) updateContractForMode(
 	messageByteCount ByteCount,
 	mode sendContractUpdateMode,
 ) (updated bool, deferForRecoveryAdmission bool, err error) {
+	// a Pack after the request rides what the move leaves
+	self.applyPeerContractMove()
 	// a headroom charge belongs to one debit and its one Pack
 	self.noAckHeadroomCharge = nil
 	if mode == sendContractUpdateNoAckAdvance && !self.sendContractEverAcknowledged {
@@ -11173,8 +11183,8 @@ func (self *SendSequence) updateContractForMode(
 		return false, true, nil
 	}
 	// an advancing no-acknowledgement Pack opens the contract and is not
-	// charged to it until it can ride it
-	debitMessage := mode != sendContractUpdateNoAckAdvance
+	// charged to it until it can ride it, and a peer window's move has no Pack
+	debitMessage := mode != sendContractUpdateNoAckAdvance && mode != sendContractUpdatePeerMove
 
 	var contractErr error
 	createContract := func() bool {
@@ -11429,6 +11439,9 @@ func (self *SendSequence) updateContractForMode(
 	if d := contractWaitTime; self.sendBufferSettings.ContractWaitLogThreshold <= d {
 		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 	}
+	if mode == sendContractUpdatePeerMove {
+		return ok, false, contractErr
+	}
 	if !debitMessage {
 		if !ok {
 			return false, false, contractErr
@@ -11480,10 +11493,13 @@ func nextCreateContractRetryInterval(current time.Duration, maximum time.Duratio
 // announces the contract, which is how every sequence requested it before
 // `ContractPrefetchLeadTime`. A same-network peer keeps that: its contracts
 // escrow nothing, and the queue retains its newest successor past the expiry,
-// so the early request is what makes its rollover immediate at any rate.
+// so the early request is what makes its rollover immediate at any rate. So does
+// a peer in window accounting, whose contracts must open at window ends and not
+// when a burst brings a successor due.
 func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 	return self.sendBufferSettings.ContractPrefetchLeadTime <= 0 ||
-		self.client.ContractManager().isNetworkPeerContract(key)
+		self.client.ContractManager().isNetworkPeerContract(key) ||
+		self.client.ContractManager().peerWindowAccounting(key.Destination.DestinationId)
 }
 
 // Queues one more contract for this sequence at the next sequence index, sized
@@ -12026,6 +12042,7 @@ func (self *SendSequence) setContract(
 		nextSendContract.path,
 		nextSendContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowSendContract(nextSendContract)
 	// The contract carries the destination's `ProvideTlsCertificate`
 	// commitment (possibly empty). Fold the chain into the session's
 	// trusted-peer-cert set so the peer's TLS-handshake cert can be matched
@@ -16103,8 +16120,11 @@ type ReceiveSequence struct {
 
 	receiveBufferSettings *ReceiveBufferSettings
 
-	openReceiveContracts      map[Id]*sequenceContract
-	receiveContract           *sequenceContract
+	openReceiveContracts map[Id]*sequenceContract
+	receiveContract      *sequenceContract
+	// `receiveContract`, for a reader off the sequence goroutine. Written after
+	// the contract's stats entry, which that reader takes with it.
+	publishedContract         atomic.Pointer[sequenceContract]
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
 	// the owning buffer's index of open contracts by holding sequence; nil
@@ -18677,6 +18697,7 @@ func (self *ReceiveSequence) registerContractAhead(
 		aheadReceiveContract.path,
 		aheadReceiveContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowReceiveContract(aheadReceiveContract)
 	return nil
 }
 
@@ -18699,6 +18720,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		// switch to the current contract
 		superseded := self.receiveContract
 		self.receiveContract = receiveContract
+		self.publishedContract.Store(receiveContract)
 		self.updateContractWriterAlias()
 		// A contract announced ahead reaches this path rather than the one
 		// below, so the predecessor's stats close here too. Without this a
@@ -18745,6 +18767,8 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		nextReceiveContract.path,
 		nextReceiveContract.transferByteCount,
 	)
+	self.publishedContract.Store(nextReceiveContract)
+	self.client.ContractManager().notePeerWindowReceiveContract(nextReceiveContract)
 
 	if superseded != nil {
 		self.client.ContractManager().closeContractStats(superseded.contractId)

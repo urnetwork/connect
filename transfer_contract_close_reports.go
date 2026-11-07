@@ -71,6 +71,9 @@ func (self *ContractManager) completeContractCloseReport(pending *contractCloseR
 // finals already satisfy the request; failed cleanup or shutdown drops only
 // the synthetic obligation and leaves platform expiry as the backstop.
 func (self *ContractManager) requestContractClose(contractId Id) {
+	if self.peerWindowOwns(contractId) {
+		return
+	}
 	self.mutex.Lock()
 	if self.closed || self.ctx.Err() != nil || self.client.IsDone() {
 		self.mutex.Unlock()

@@ -41,6 +41,9 @@ import (
 // gets that sequence's counts in its final rather than a (0, 0) after the
 // sequence has ended.
 //
+// A contract of a peer window is left alone: its report goes out at the window's
+// end, and the sequence holding it keeps running.
+//
 // Safe for concurrent use.
 type sequenceCloser struct {
 	ctx    context.Context
@@ -171,6 +174,9 @@ func (self *sequenceCloser) closeContracts(contractIds []Id) {
 			continue
 		}
 		seenContractIds[contractId] = true
+		if self.client.ContractManager().peerWindowOwns(contractId) {
+			continue
+		}
 		receiveSequence := self.client.receiveBuffer.contractHolders.find(contractId)
 		if receiveSequence != nil && receiveSequence.requestCloseContract(contractId) {
 			continue
