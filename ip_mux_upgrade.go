@@ -194,6 +194,15 @@ func DefaultDnsUpgradeFallbackSettings() *DnsResolverSettings {
 	}
 }
 
+// Answers the names this device owns, so that a query for one never leaves the
+// device (owner decision 85). The mux calls Answer inline on the packet path with
+// a host in lower case and without a trailing dot, so an implementation must be
+// safe for concurrent use and must not block.
+type LocalZone interface { // nil keeps today's behavior
+	// owned with no addrs answers NODATA; !owned passes the query through
+	Answer(host string, qtype uint16) (addrs []netip.Addr, ttl uint32, owned bool)
+}
+
 const (
 	// dnsTypeSvcb / dnsTypeHttps are the SVCB (64) and HTTPS (65) question types
 	// (RFC 9460), not defined by x/net/dns/dnsmessage.
@@ -288,6 +297,11 @@ type UpgradeMux struct {
 	// deliberately not part of the swappable settings, so SetSettings
 	// cannot clear it.
 	blocker atomic.Pointer[Blocker]
+
+	// answers the names it owns ahead of the blocker and of any resolution.
+	// installed by the device via SetLocalZone, outside the swappable settings
+	// like the blocker, so SetSettings cannot clear it.
+	localZone atomic.Pointer[LocalZone]
 
 	// ipv6Unroutable, when set and true, answers every AAAA query with an
 	// empty NOERROR without an upstream lookup (IPV6.md B6): the windows have
@@ -710,6 +724,10 @@ func (self *UpgradeMux) resolveDnsTcpQuery(query []byte) []byte {
 	// name and type in the zone with prompt NODATA.
 	if isResolverArpaDomain(domain) {
 		response, _ := buildDnsResponse(header.ID, question, nil, 0)
+		return response
+	}
+
+	if response, owned := self.localZoneResponse(header.ID, question, domain); owned {
 		return response
 	}
 
@@ -1167,6 +1185,45 @@ func (self *UpgradeMux) getBlocker() Blocker {
 		return *b
 	}
 	return nil
+}
+
+// Installs (or, with nil, removes) the zone consulted for every claimed dns query,
+// over UDP and TCP alike. It answers only what the mux claims: with a nil Resolver
+// queries pass through to the egress without reaching it, as they do the blocker.
+func (self *UpgradeMux) SetLocalZone(localZone LocalZone) {
+	if localZone == nil {
+		self.localZone.Store(nil)
+	} else {
+		self.localZone.Store(&localZone)
+	}
+}
+
+func (self *UpgradeMux) getLocalZone() LocalZone {
+	if z := self.localZone.Load(); z != nil {
+		return *z
+	}
+	return nil
+}
+
+// The reply for a name the local zone owns, built from its addresses of the
+// question's type, so a type with none is NODATA. A nil reply with owned set is a
+// reply that could not be built, which the caller must not resolve in its place.
+// Like a blocked reply it populates neither the reverse index nor the resolver
+// cache: it describes this device, and removing the zone takes effect at once.
+func (self *UpgradeMux) localZoneResponse(id uint16, question dnsmessage.Question, domain string) ([]byte, bool) {
+	localZone := self.getLocalZone()
+	if localZone == nil {
+		return nil, false
+	}
+	addrs, ttl, owned := localZone.Answer(domain, uint16(question.Type))
+	if !owned {
+		return nil, false
+	}
+	response, err := buildDnsResponse(id, question, addrs, ttl)
+	if err != nil {
+		return nil, true
+	}
+	return response, true
 }
 
 // SetIpv6Unroutable installs (or, with nil, removes) the predicate that
@@ -1648,6 +1705,17 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 		}
 		reverse := ipPath.Reverse()
 		self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		return true
+	}
+
+	// a name the local zone owns is answered here for every query type, ahead
+	// of the blocker. The query stays claimed even when no reply can be built:
+	// an unclaimed query would go out the egress, naming a private host.
+	if respPayload, owned := self.localZoneResponse(header.ID, question, domain); owned {
+		if respPayload != nil {
+			reverse := ipPath.Reverse()
+			self.mux.deliverDownstream(source, provideMode, reverse, ipOosPacket(reverse, respPayload))
+		}
 		return true
 	}
 
