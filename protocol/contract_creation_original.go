@@ -197,8 +197,16 @@ func (self OriginalContractAdmission) facts(ctx context.Context) (OriginalContra
 	if len(response.Contract.StoredContractBytes) > MaximumOriginalWorkContractBytes || proto.Unmarshal(response.Contract.StoredContractBytes, &stored) != nil || len(stored.ProtoReflect().GetUnknown()) != 0 || len(stored.ContractId) != 16 || !bytes.Equal(stored.SourceId, request.ClientId[:]) || !bytes.Equal(stored.DestinationId, requested.DestinationId) || stored.TransferByteCount > math.MaxInt64 || len(stored.StreamId) != 0 && len(stored.StreamId) != 16 {
 		return facts, errors.New("original contract returned reservation differs")
 	}
+	// Provide modes are flags, so these are named rather than ranged. Service
+	// is not among them: it has no escrow or payout for this evidence to attribute.
 	mode := response.Contract.ProvideMode
-	if mode < ProvideMode_Network || mode > ProvideMode_PublicStream {
+	switch mode {
+	case ProvideMode_Network,
+		ProvideMode_FriendsAndFamily,
+		ProvideMode_Public,
+		ProvideMode_Stream,
+		ProvideMode_PublicStream:
+	default:
 		return facts, errors.New("original contract provide mode is unsupported")
 	}
 	facts = OriginalContractCreationFacts{

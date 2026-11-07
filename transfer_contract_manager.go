@@ -1354,6 +1354,12 @@ func (self *ContractManager) InitProvideSecretKeys() {
 
 	for i, _ := range protocol.ProvideMode_name {
 		provideMode := protocol.ProvideMode(i)
+		// Service is a relationship a client takes on by name. Its key comes from
+		// `applyProvideModes` then, so a client that never provides it holds none
+		// and the keys its owner saves stay as they were.
+		if provideMode == protocol.ProvideMode_Service {
+			continue
+		}
 		provideSecretKey, ok := self.provideSecretKeys[provideMode]
 		if !ok {
 			// generate a new key
