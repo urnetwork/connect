@@ -9777,12 +9777,13 @@ paths:
       x-internal: true
       x-status: planned
       tags: [Other]
-      summary: File a repo's GroupForm
+      summary: Re-form a repo's group
       description: |
         A `Signed` `GroupForm`, purpose `group-form`, by a repo admin's device, in
         an owner-bound kind only the owner's consented device, or a network
-        admin's outside those. Creates or re-forms the repo's group. The only gkm
-        write a repo re-seeded as deleted takes. Needs `admin`.
+        admin's outside those. `POST /gkm/groups` files a new group's first form,
+        and this one the form that re-forms it. The only gkm write a repo
+        re-seeded as deleted takes. Needs `admin`.
       operationId: gkmRepoForm
       security:
         - ServiceTokenAuth: []
