@@ -236,10 +236,12 @@ class GkmRoutesTest(unittest.TestCase):
         at = text.index(mark, operation, end)
         return text[:at] + text[at + len(mark) - 1 :]
 
-    def check_routes(self, table=None, api_routes=(), spec=None):
+    def check_routes(self, table=None, api_routes=(), spec=None, symlinked=False, competition=None):
         """check-routes.sh on a fixture beside a routes.go of table, or none, whose
         api serves the rest of the spec and api_routes. A spec given is the
-        bringyour.yml the script reads in place of this one."""
+        bringyour.yml the script reads in place of this one. A symlinked server
+        links to a checkout elsewhere, as a track's does, its siblings still
+        beside the link, and competition is the sn/api/competition.yml there."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -249,12 +251,15 @@ class GkmRoutesTest(unittest.TestCase):
             script = root / "connect/api" / self.script.name
             shutil.copy(self.script, script)
             (root / "connect/api/bringyour.yml").write_text(spec)
-        (root / "server/api").mkdir(parents=True)
+        server = root / "checkout/server" if symlinked else root / "server"
+        (server / "api").mkdir(parents=True)
+        if symlinked:
+            (root / "server").symlink_to(server, target_is_directory=True)
         registered = [
             (method.upper(), re.sub(r"{[^}]*}", "([^/]+)", path))
             for method, path in self.operations(False)
         ]
-        (root / "server/api/api.go").write_text(
+        (server / "api/api.go").write_text(
             "\n".join(
                 f'router.NewRoute("{method}", "{path}", handler)'
                 for method, path in [*registered, *api_routes]
@@ -263,6 +268,9 @@ class GkmRoutesTest(unittest.TestCase):
         if table is not None:
             (root / "sidecar/gkmservice").mkdir(parents=True)
             (root / "sidecar/gkmservice/routes.go").write_text(table)
+        if competition is not None:
+            (root / "sn/api").mkdir(parents=True)
+            (root / "sn/api/competition.yml").write_text(competition)
         return subprocess.run(
             ["zsh", str(script), str(root / "server")], capture_output=True, text=True
         )
@@ -353,6 +361,25 @@ class GkmRoutesTest(unittest.TestCase):
         result = self.check_routes("var routes = []route{}")
         self.assertEqual(1, result.returncode)
         self.assertIn("gkmservice's route table names no route", result.stderr)
+
+    def test_check_routes_reads_the_table_beside_a_symlinked_server(self):
+        # a track's server links to the main checkout, and the track's own sidecar
+        # sits beside the link, not beside its target
+        result = self.check_routes("var routes = []route{}", symlinked=True)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("gkmservice's route table names no route", result.stderr)
+        result = self.check_routes(self.table(), symlinked=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        count = len(self.operations(True))
+        self.assertIn(f"gkm: {count} routes in gkmservice's table, {count} documented", result.stdout)
+
+    def test_check_routes_reads_competition_beside_a_symlinked_server(self):
+        # the same lookup finds sn/api/competition.yml
+        competition = "paths:\n  /competition/info:\n    get:\n      summary: Read\n"
+        result = self.check_routes(self.table(), symlinked=True, competition=competition)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("in sn/api/competition.yml but NOT registered", result.stderr)
+        self.assertIn("GET /competition/info", result.stderr)
 
     def test_check_routes_refuses_a_gkm_route_api_registers(self):
         result = self.check_routes(self.table(), api_routes=[("GET", "/gkm/welcomes")])

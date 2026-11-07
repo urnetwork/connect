@@ -75,8 +75,12 @@ if [[ ! -f $spec ]]; then
     exit 2
 fi
 
-competition_spec=${server_dir:A:h}/sn/api/competition.yml
-gkm_routes=${server_dir:A:h}/sidecar/gkmservice/routes.go
+# The siblings are found beside the path given, never beside a symlink's
+# target: a track's server is a symlink to the main checkout's, and its own
+# sidecar and sn sit beside the link. :a makes the path absolute and resolves
+# . and .. as written; :A would follow the link.
+competition_spec=${server_dir:a:h}/sn/api/competition.yml
+gkm_routes=${server_dir:a:h}/sidecar/gkmservice/routes.go
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
