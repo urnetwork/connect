@@ -22,7 +22,7 @@
 #
 # The /gkm/* routes are the other exception, the other way round: bringyour.yml
 # documents them, but server/cli/gkm serves them on its own host from sidecar's
-# gkmservice package, so api must NOT register them: a gkm path in its table is
+# gkmservice package, so api must not register them: a gkm path in its table is
 # drift. They are checked against that package's route table instead, looked up
 # at <server>/../sidecar/gkmservice/routes.go, where each route is a net/http
 # pattern in one string literal, as in "POST /gkm/groups/{group_id}/gen/{g}".
