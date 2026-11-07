@@ -195,9 +195,9 @@ func DefaultDnsUpgradeFallbackSettings() *DnsResolverSettings {
 }
 
 // Answers the names this device owns, so that a query for one never leaves the
-// device (owner decision 85). The mux calls Answer inline on the packet path with
-// a host in lower case and without a trailing dot, so an implementation must be
-// safe for concurrent use and must not block.
+// device. The mux calls Answer inline on the packet path with a host in lower case
+// and without a trailing dot, so an implementation must be safe for concurrent use
+// and must not block.
 type LocalZone interface { // nil keeps today's behavior
 	// owned with no addrs answers NODATA; !owned passes the query through
 	Answer(host string, qtype uint16) (addrs []netip.Addr, ttl uint32, owned bool)
