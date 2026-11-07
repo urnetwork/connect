@@ -176,9 +176,8 @@ type peerWindow struct {
 // first, then the others. Contract ids are platform-minted ULIDs, so id order is
 // creation order and both clients of a pair read the same one. Two clients that
 // hold different sets can name different firsts, and each contract then carries
-// the floor from one client and zero from the other. That costs the window's
-// debit, since the platform settles a contract at the smaller count, and it
-// exposes nothing and charges nothing twice.
+// the floor from one client and zero from the other. Settling those costs at most
+// the window's debit, and it exposes nothing and charges nothing twice.
 func (self *peerWindow) orderedContracts() []*peerWindowContract {
 	contracts := make([]*peerWindowContract, 0, len(self.contracts))
 	for _, contract := range self.contracts {

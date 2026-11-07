@@ -962,8 +962,9 @@ func TestPeerWindowOverflowRollsAndSpillsInsideTheWindow(t *testing.T) {
 // follows a handshake, whose contract the other side took before it marked: the
 // sender retires that contract exactly and opens its window with the next one,
 // while the receiver, already marked, counts it as first. The two clients then name
-// different firsts, which costs that window's debit and exposes nothing: neither
-// reports more than the floor, and the only exact count is the handshake's. The next
+// different firsts, which costs at most that window's debit and exposes nothing:
+// neither reports more than the floor, and the only exact count is the handshake's,
+// which carried nothing of the mode. The next
 // window, which a move opened, has one first on both clients in each direction.
 func TestPeerWindowMoveUnderRequiredEncryption(t *testing.T) {
 	assertMessagePoolOwnership(t)
