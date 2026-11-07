@@ -9583,10 +9583,11 @@ paths:
       summary: Upload KeyPackages
       description: |
         A `GkmKeyPackagesRequest`. Up to 128 one-time and 1 last-resort KeyPackage
-        per sidecar, each valid 90 days, refilled below 32. Takes any gkm token
-        whose sidecar is the credential's, from a member device admitted and not
-        revoked, parked or suspended. A sidecar's first upload hints `pending` to
-        the writers of each repo it reads.
+        per sidecar, each valid 90 days, refilled below 32. Takes a gkm token
+        holding `r`, `rw` or `admin` on some repo, whose sidecar is the
+        credential's, from a member device admitted and not revoked, parked or
+        suspended. A sidecar's first upload hints `pending` to the writers of each
+        repo it reads.
       operationId: gkmKeyPackagesUpload
       security:
         - ServiceTokenAuth: []
@@ -9655,9 +9656,9 @@ paths:
       summary: Replace the caller's ReaderKey
       description: |
         A `Signed` `ReaderKey`, purpose `reader-key`, which replaces the sidecar's
-        current one. Takes any gkm token whose sidecar is the record's, admitted
-        and not revoked, parked or suspended. At most once per 24 h after its
-        first.
+        current one. Takes a gkm token holding `r`, `rw` or `admin` on some repo,
+        whose sidecar is the record's, admitted and not revoked, parked or
+        suspended. At most once per 24 h after its first.
       operationId: gkmReaderKeyUpload
       security:
         - ServiceTokenAuth: []
@@ -9685,9 +9686,9 @@ paths:
       tags: [Other]
       summary: Read a sidecar's ReaderKey
       description: |
-        The `Signed` `ReaderKey` gkm serves, a public record, under any gkm token
-        of an admitted sidecar. gkm proves nothing by serving it: a sealer checks
-        it itself before sealing to it.
+        The `Signed` `ReaderKey` gkm serves, a public record, under a gkm token of
+        an admitted sidecar holding `r`, `rw` or `admin` on some repo. gkm proves
+        nothing by serving it: a sealer checks it itself before sealing to it.
       operationId: gkmReaderKey
       security:
         - ServiceTokenAuth: []
