@@ -121,6 +121,7 @@ class SpecTest(unittest.TestCase):
         }
         methods = {"get", "put", "post", "delete", "patch"}
         paths = self.spec["paths"]
+        evs_hosts = set()
         for path, want in expected.items():
             with self.subTest(path=path):
                 self.assertIn(path, paths)
@@ -131,11 +132,14 @@ class SpecTest(unittest.TestCase):
                     self.assertTrue(operation["x-internal"])
                     self.assertEqual("planned", operation["x-status"])
                 if path.startswith("/evs/"):
-                    self.assertEqual("https://evs.bringyour.com", item["servers"][0]["url"])
+                    evs_hosts.add(item["servers"][0]["url"])
                     for method in want:
                         self.assertEqual([{"ServiceTokenAuth": []}], item[method]["security"])
                 else:
                     self.assertNotIn("servers", item)
+        # evs is one host of its own, so no path falls back to api's
+        self.assertEqual(1, len(evs_hosts))
+        self.assertFalse(evs_hosts & {server["url"] for server in self.spec["servers"]})
         enroll = paths["/network/enroll"]["post"]
         self.assertEqual([], enroll["security"])
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
