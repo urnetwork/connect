@@ -9711,6 +9711,41 @@ paths:
         "404":
           description: The sidecar holds no ReaderKey.
 
+  /gkm/reader-keys:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read many sidecars' ReaderKeys
+      description: |
+        A `GkmReaderKeysRequest` of at most 256 sidecars, answered by a
+        `GkmReaderKeysReply`, which a rotator reads instead of a request per
+        recipient. Takes what `GET /gkm/reader-key/{sidecar_id}` takes.
+      operationId: gkmReaderKeys
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Each `Signed` `ReaderKey` in order, an empty `Signed` for a sidecar with none.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Not an admitted sidecar's token.
+        "429":
+          description: Past a rate.
+
   /gkm/groups:
     servers:
       - url: https://gkm.bringyour.com
@@ -9771,9 +9806,75 @@ paths:
         "404":
           description: No such group.
 
+  /gkm/repos/{repo_id}/drop-key:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a repo's drop keys
+      description: |
+        A `GkmGenerationsReply`: the newest `GenRotate` of the group the repo's
+        newest GroupForm names, up to 64 after `since`, so a depositor, which
+        cannot read the group's id, needs none. A depositor checks them itself
+        before it seals. The only route `deposit` reaches, which `r`, `rw` and
+        `admin` also reach.
+      operationId: gkmDropKey
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The generations.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
   /gkm/repos/{repo_id}/forms:
     servers:
       - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a repo's GroupForms
+      description: |
+        A `GkmFormsReply`: the repo's `Signed` GroupForms, oldest first, whose
+        signers members check. Needs `r`, `rw` or `admin`.
+      operationId: gkmRepoForms
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The forms.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
     post:
       x-internal: true
       x-status: planned
@@ -10018,14 +10119,16 @@ paths:
       x-internal: true
       x-status: planned
       tags: [Other]
-      summary: Stage or deliver a wrap
+      summary: Stage or deliver wraps
       description: |
-        A `Signed` `ReaderWrap` or `DelegationWrap`, purpose `reader-wrap`, whose
-        body's group, generation, commitment prefix, recipient and key digest
-        agree with its object's path. Staged only while generation `g` is
-        unclaimed, or of generation 1 by its signer while the repo is `keying`.
-        Late only once `g` is the newest and carries the body's commitment. Takes
-        `r`, `rw` or `admin`, from a sidecar that is not read-only.
+        A `GkmWrapBatch` of 1 to 256 `Signed` `ReaderWrap`s and `DelegationWrap`s,
+        purpose `reader-wrap`, each body's group, generation, commitment prefix,
+        recipient and key digest agreeing with its object's path. Staged only
+        while generation `g` is unclaimed, or of generation 1 by its signer while
+        the repo is `keying`. Late only once `g` is the newest and carries the
+        body's commitment. Each runs through these checks alone, so a batch of one
+        behaves as one delivery would, and a retry is safe. Takes `r`, `rw` or
+        `admin`, from a sidecar that is not read-only.
       operationId: gkmWrapUpload
       security:
         - ServiceTokenAuth: []
@@ -10046,21 +10149,102 @@ paths:
               type: string
               format: binary
       responses:
-        "201":
-          description: Stored.
-        "403":
-          description: Out of scope, or the signer may not deliver.
-        "409":
-          description: Stale kind, generation or key.
-        "412":
-          description: That delivery exists. The body is the winner, a `Signed` wrap.
+        "200":
+          description: |
+            A `GkmWrapBatchReply`, one result per delivery, in order: 201, 412 with
+            the winner, 403, 409 for a stale kind, generation or key, 429 past the
+            staged rate or queued out by the write budget, or 0 for one not tried
+            in the time the request has.
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
+        "403":
+          description: Out of scope.
         "429":
-          description: Past the staged rate, or queued out by the write budget.
+          description: Past a rate.
+
+  /gkm/groups/{group_id}/recovery-wraps/{g}/{c8}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Stage a rotation's recovery wraps
+      description: |
+        A `GkmRecoveryWrapBatch` of 1 to 256 of a rotator's RecoveryWraps, as the
+        wraps route takes deliveries, answered by a `GkmWrapBatchReply`. Takes `r`,
+        `rw` or `admin` of the group's repo.
+      operationId: gkmRecoveryWrapBatchUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmGeneration"
+        - name: c8
+          in: path
+          required: true
+          description: The first 8 bytes of the generation's commitment, in hex.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: One result per wrap, in order, as the wraps route answers.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+        "429":
+          description: Past a rate.
+
+  /gkm/groups/{group_id}/ladder:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Carry a re-formed group's ladder
+      description: |
+        A `GkmLadderRequest`: at most 64 `Signed` `GenRotate`s a call, in ascending
+        order, each the old group's byte for byte. Open only while the newest
+        GroupForm names the group and before its epoch 1 exists, and with the form
+        in re-seed mode. gkm checks the order, each parent commitment and that no
+        generation passes the form's, and skips a claim's time and signer checks.
+        Equal bytes answer success, so a retry is safe. Needs `admin`.
+      operationId: gkmLadderUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Out of scope, or the ladder is closed.
+        "409":
+          description: Out of order, off the chain, or past the form's generation.
+        "429":
+          description: Past a rate, or queued out by the write budget.
 
   /gkm/groups/{group_id}/welcome/{n}:
     servers:
@@ -10194,39 +10378,6 @@ paths:
         "403":
           description: Out of scope.
 
-  /gkm/groups/{group_id}/drop-key:
-    servers:
-      - url: https://gkm.bringyour.com
-    get:
-      x-internal: true
-      x-status: planned
-      tags: [Other]
-      summary: Read a group's drop keys
-      description: |
-        A `GkmGenerationsReply`: the newest `GenRotate`, up to 64 after `since`. A
-        depositor checks them itself before it seals. The only route `deposit`
-        reaches, which `r`, `rw` and `admin` also reach.
-      operationId: gkmDropKey
-      security:
-        - ServiceTokenAuth: []
-      parameters:
-        - $ref: "#/components/parameters/GkmGroupId"
-        - name: since
-          in: query
-          required: true
-          schema:
-            type: integer
-      responses:
-        "200":
-          description: The generations.
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
-        "403":
-          description: Out of scope.
-
   /gkm/welcomes:
     servers:
       - url: https://gkm.bringyour.com
@@ -10283,10 +10434,11 @@ paths:
       x-internal: true
       x-status: planned
       tags: [Other]
-      summary: Stage a recovery wrap
+      summary: Re-wrap after a rebind
       description: |
-        A `GkmRecoveryWrap`, from a rotator staging, or from that member's device
-        re-wrapping after a rebind, under `r`, `rw` or `admin` of the group's repo.
+        A `GkmRecoveryWrap`, from that member's device re-wrapping after a rebind,
+        under `r`, `rw` or `admin` of the group's repo. A rotator stages through
+        the recovery-wraps route.
       operationId: gkmRecoveryWrapUpload
       security:
         - ServiceTokenAuth: []

@@ -178,19 +178,22 @@ class GkmRoutesTest(unittest.TestCase):
         "/gkm/key-packages/claim": {"post"},
         "/gkm/reader-key": {"post"},
         "/gkm/reader-key/{sidecar_id}": {"get"},
+        "/gkm/reader-keys": {"post"},
         "/gkm/groups": {"post"},
         "/gkm/groups/{group_id}": {"get"},
-        "/gkm/repos/{repo_id}/forms": {"post"},
+        "/gkm/repos/{repo_id}/forms": {"get", "post"},
+        "/gkm/repos/{repo_id}/drop-key": {"get"},
         "/gkm/groups/{group_id}/epochs": {"get"},
         "/gkm/groups/{group_id}/epochs/{n}": {"post"},
         "/gkm/groups/{group_id}/gen": {"get"},
         "/gkm/groups/{group_id}/gen/{g}": {"post"},
         "/gkm/groups/{group_id}/wraps/{g}": {"get"},
         "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"post"},
+        "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"post"},
+        "/gkm/groups/{group_id}/ladder": {"post"},
         "/gkm/groups/{group_id}/welcome/{n}": {"post"},
         "/gkm/groups/{group_id}/group-info": {"get", "post"},
         "/gkm/groups/{group_id}/ack": {"post"},
-        "/gkm/groups/{group_id}/drop-key": {"get"},
         "/gkm/welcomes": {"get"},
         "/gkm/recovery/{member_id}/wraps": {"get", "post", "delete"},
     }
@@ -264,10 +267,12 @@ class GkmRoutesTest(unittest.TestCase):
                     self.assertLessEqual(set(body.get("content", {})), {"application/octet-stream"})
 
     def test_statuses_are_the_designs(self):
+        # a wrap's own 201, 412 and 409 ride its batch's 200
         for path, want in {
             "/gkm/groups/{group_id}/epochs/{n}": {"200", "403", "409", "429"},
             "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "412", "429"},
-            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"201", "403", "409", "412", "429"},
+            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"200", "403", "429"},
+            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"200", "403", "429"},
         }.items():
             with self.subTest(path=path):
                 self.assertEqual(want, set(self.spec["paths"][path]["post"]["responses"]))
@@ -276,7 +281,6 @@ class GkmRoutesTest(unittest.TestCase):
         for path, status in (
             ("/gkm/groups/{group_id}/epochs/{n}", "409"),
             ("/gkm/groups/{group_id}/gen/{g}", "412"),
-            ("/gkm/groups/{group_id}/wraps/{g}/{c8}", "412"),
         ):
             with self.subTest(path=path):
                 response = self.spec["paths"][path]["post"]["responses"][status]
