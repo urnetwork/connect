@@ -12,7 +12,7 @@
 # does not. A streaming route (one whose request body the server reads at the
 # client's pace) is a route like any other here.
 #
-# The /competition/* routes are the one exception. This api process serves
+# The /competition/* routes are one exception. This api process serves
 # them, but they are a separate security domain with their own document,
 # sn/api/competition.yml, so bringyour.yml must NOT list them: a competition
 # path found there is drift. They are checked against that document instead,
