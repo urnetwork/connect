@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -526,8 +528,10 @@ func TestPublicExitsRefuseOverlayBlocksWithTheDropOn(t *testing.T) {
 	}
 }
 
-// An exit client that records abuse audits, and a provider running the policy.
-func newSharedAddressProvider(t *testing.T, ctx context.Context, drop bool) (*RemoteUserNatProvider, *peerAuditRecordingOob) {
+// An exit client that records abuse audits, and a provider running the policy on a
+// NAT that dials nothing. A packet the policy passes stops at the dial, which reports
+// its address, so no test here sends a packet anywhere.
+func newSharedAddressProvider(t *testing.T, ctx context.Context, drop bool) (*RemoteUserNatProvider, *peerAuditRecordingOob, chan string) {
 	t.Helper()
 	settings := DefaultClientSettings()
 	settings.Log = NewNoopLogger()
@@ -545,11 +549,24 @@ func newSharedAddressProvider(t *testing.T, ctx context.Context, drop bool) (*Re
 		cfaa.DropSharedAddressSpace = drop
 		return Reverse(NewSecurityPolicy(ctx, cfaa, DefaultDmcaSecurityPolicySettings(), DefaultWebStandardSettings(), stats))
 	}
-	nat := NewLocalUserNatWithDefaults(ctx, "shared-address exit")
+	dials := make(chan string, 16)
+	refuseDial := &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			select {
+			case dials <- address:
+			default:
+			}
+			return nil, errors.New("this exit dials nothing")
+		},
+	}
+	natSettings := DefaultLocalUserNatSettings()
+	natSettings.TcpBufferSettings.DialContextSettings = refuseDial
+	natSettings.UdpBufferSettings.DialContextSettings = refuseDial
+	nat := NewLocalUserNat(ctx, "shared-address exit", natSettings)
 	t.Cleanup(nat.Close)
 	provider := NewRemoteUserNatProvider(client, nat, providerSettings)
 	t.Cleanup(provider.Close)
-	return provider, oob
+	return provider, oob, dials
 }
 
 // Hands the provider one packet from the tunnel, as its receive callback gets it.
@@ -583,7 +600,7 @@ func sharedAddressAbuseReports(oob *peerAuditRecordingOob) int {
 func TestProviderDropsSharedAddressWithoutReportingAbuse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	provider, oob := newSharedAddressProvider(t, ctx, true)
+	provider, oob, dials := newSharedAddressProvider(t, ctx, true)
 	source := SourceId(NewId())
 
 	flows := []*IpPath{
@@ -615,20 +632,31 @@ func TestProviderDropsSharedAddressWithoutReportingAbuse(t *testing.T) {
 	if reports := sharedAddressAbuseReports(oob); reports != 1 {
 		t.Fatalf("the incident twin reported %d abuse audits, want 1, so this rig reads nothing", reports)
 	}
+	select {
+	case address := <-dials:
+		t.Fatalf("a refused packet reached the dial of %s", address)
+	default:
+	}
 }
 
 // With the drop off, the provider's verdict on the same packet is today's: not
-// blocked, and counted.
+// blocked, counted, and on through the NAT to its dial.
 func TestProviderShadowCountsSharedAddress(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	provider, oob := newSharedAddressProvider(t, ctx, false)
+	provider, oob, dials := newSharedAddressProvider(t, ctx, false)
 
 	flow := sharedAddressPath(sharedAddressIp, 4, IpProtocolUdp, 8080)
 	sharedAddressProviderReceive(t, provider, SourceId(NewId()), ipOosUdpPacket(flow, []byte("query")))
 	AssertEqual(t, provider.PacketStats().BlockIngressPacketCount, int64(0))
 	AssertEqual(t, provider.SecurityPolicyReasons(false)[SecurityPolicyReasonSharedAddressSpace][newSecurityDestinationPort(flow)], uint64(1))
 	AssertEqual(t, sharedAddressAbuseReports(oob), 0)
+	select {
+	case address := <-dials:
+		AssertEqual(t, address, "100.64.0.1:8080")
+	case <-ctx.Done():
+		t.Fatal("the packet the policy passed never reached the dial")
+	}
 }
 
 // The switch defaults off, and off it is absent from the policy's identity, so a
