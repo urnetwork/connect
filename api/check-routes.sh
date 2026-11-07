@@ -41,6 +41,10 @@
 # api/spec_conformance_test.go normalizePath() unescapes them the same way.
 #
 # Test files are excluded: they register routes that are not served.
+#
+# An operation marked `x-status: planned` documents a route a later change
+# lands, so the spec can lead the implementation. It may be missing from the
+# route table, as the server's api/spec_conformance_test.go allows.
 
 set -u
 emulate -L zsh
@@ -91,6 +95,25 @@ spec_paths() {
     ' "$1" | sed -e 's/{[^}]*}/*/g' | sort -u
 }
 
+# planned_paths <file> -- the "METHOD /path" operations marked planned. The mark
+# is an operation key, at six spaces, under the method it follows.
+planned_paths() {
+    awk '
+        /^paths:[[:space:]]*$/ { inpaths = 1; next }
+        /^[A-Za-z]/            { inpaths = 0 }
+        !inpaths               { next }
+        /^  \/[^ ]*:[[:space:]]*$/ { path = $1; sub(/:$/, "", path); method = ""; next }
+        /^    (get|put|post|patch|delete|head|options|trace):[[:space:]]*$/ {
+            method = $1
+            sub(/:$/, "", method)
+            next
+        }
+        /^      x-status:[[:space:]]*planned[[:space:]]*$/ {
+            if (method != "") print toupper(method), path
+        }
+    ' "$1" | sed -e 's/{[^}]*}/*/g' | sort -u
+}
+
 # --- the route table -------------------------------------------------------
 # Every NewRoute( and NewStreamingRoute( occurrence, not every line: some
 # source lines hold two.
@@ -111,6 +134,7 @@ grep ' /competition/' $work/routes.all > $work/routes.competition
 spec_paths $spec > $work/spec.all
 grep -v -e ' /competition/' -e ' /gkm/' $work/spec.all > $work/spec
 grep ' /competition/' $work/spec.all > $work/spec.competition
+planned_paths $spec > $work/planned
 
 drifted=0
 
@@ -122,7 +146,7 @@ report() {
 
 # --- bringyour.yml ---------------------------------------------------------
 missing_from_spec=$(comm -23 $work/routes $work/spec)
-missing_from_server=$(comm -13 $work/routes $work/spec)
+missing_from_server=$(comm -13 $work/routes $work/spec | comm -23 - $work/planned)
 
 [[ -n $missing_from_spec ]] && report "registered but NOT in bringyour.yml" "$missing_from_spec"
 [[ -n $missing_from_server ]] && report "in bringyour.yml but NOT registered" "$missing_from_server"
@@ -161,6 +185,7 @@ fi
 # --- sn/api/competition.yml ------------------------------------------------
 route_count=$(grep -c . $work/routes)
 spec_count=$(grep -c . $work/spec)
+planned_count=$(grep -c . $work/planned)
 competition_route_count=$(grep -c . $work/routes.competition)
 
 if [[ -f $competition_spec ]]; then
@@ -181,9 +206,9 @@ else
 fi
 
 if (( drifted == 0 )); then
-    print "ok: $route_count registered routes, $spec_count documented operations; $competition_summary; no drift"
+    print "ok: $route_count registered routes, $spec_count documented operations ($planned_count planned); $competition_summary; no drift"
 else
-    print -u2 "drift: $route_count registered routes, $spec_count documented operations; $competition_summary"
+    print -u2 "drift: $route_count registered routes, $spec_count documented operations ($planned_count planned); $competition_summary"
 fi
 
 exit $drifted
