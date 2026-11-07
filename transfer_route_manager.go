@@ -340,9 +340,10 @@ type TransportMultiRouteReader interface {
 // interfaces stay source-compatible while the production selector carries the
 // exact route lane into Client admission.
 type transferReceiveDisposition struct {
-	transportType TransportType
-	reliability   CarrierReliability
-	h1Credit      platformH1ReceiveCredit
+	maxMessageByteCount int
+	transportType       TransportType
+	reliability         CarrierReliability
+	h1Credit            platformH1ReceiveCredit
 }
 
 type transferCarrierMultiRouteReader interface {
@@ -2000,8 +2001,9 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 
 func (self *routeSnapshot) receiveDisposition(route Route, message []byte) transferReceiveDisposition {
 	return transferReceiveDisposition{
-		transportType: self.transportType(route),
-		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
+		maxMessageByteCount: self.routeCarrierProperties[route].MaxMessageByteCount,
+		transportType:       self.transportType(route),
+		reliability:         self.routeCarrierProperties[route].ReceiveReliability,
 		h1Credit: platformH1ReceiveCredit{
 			lane:      self.routeCarrierProperties[route].h1ReceiveRetained,
 			byteCount: ByteCount(cap(message)),

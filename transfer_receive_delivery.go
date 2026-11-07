@@ -132,8 +132,8 @@ func (q *receiveDeliveryQueue) prepare(item *receiveItem) bool {
 
 // Shares the exact limits and reservation with the eventual ledger append.
 func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem, admitOne bool) (ByteCount, bool, bool, bool) {
-	if q.sequence.receiveQueue != nil {
-		q.sequence.prepareReceiveDeliveryCredit(item)
+	if q.sequence.receiveQueue != nil && !q.sequence.prepareReceiveDeliveryCredit(item) {
+		return 0, false, false, false
 	}
 	bytes := receiveDeliveryByteCount(item)
 	control := receiveDeliveryIsSmallControl(item)

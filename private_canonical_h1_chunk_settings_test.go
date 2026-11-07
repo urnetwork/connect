@@ -98,8 +98,8 @@ func TestCanonicalH1ChunkSettingsLowerLimitsAndStorageBound(t *testing.T) {
 	}
 }
 
-// Four real senders retain independent owner policy. Every frame and terminal
-// callback crosses its real receiver; no ACK, contract or capability is faked.
+// Five real senders retain independent owner policy. Every frame and terminal
+// callback crosses its real receiver; full proofs narrow only their own chunks.
 func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -110,7 +110,7 @@ func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 			chunks   []int
 			admitted bool
 		}
-		owners := make([]owner, 4)
+		owners := make([]owner, 5)
 		for index := range owners {
 			configure := func(settings *SendBufferSettings) {
 				if index == 1 {
@@ -124,6 +124,14 @@ func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 				}
 			}
 			fixture := privateH1NewFixture(t, 2, mib(1), false, TransportTypeH1, configure)
+			if index == 4 {
+				authority := fixture.sender.ClientOob().(*privateH1ProofAuthority)
+				if authority.grants.Load() != 0 {
+					t.Fatal("compact-proof owner already published a peer contract")
+				}
+				// The authority still signs and HMACs its actual compact grant.
+				authority.chain = nil
+			}
 			owners[index] = owner{fixture: fixture, pack: SendPack{Frames: fixture.frames(8, 2)}, result: make(chan error, 2)}
 			row := &owners[index]
 			t.Cleanup(func() {
@@ -134,7 +142,10 @@ func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 				}
 			})
 		}
-		owners[0].chunks, owners[1].chunks, owners[2].chunks, owners[3].chunks = []int{7, 1}, []int{3, 3, 2}, []int{3, 3, 2}, []int{2, 2, 2, 2}
+		// The real 3600-byte commitment fits six full 1280-byte packets.
+		// A compact proof keeps the default eight; lower owner caps stay exact.
+		owners[0].chunks, owners[1].chunks, owners[2].chunks = []int{6, 2}, []int{3, 3, 2}, []int{3, 3, 2}
+		owners[3].chunks, owners[4].chunks = []int{2, 2, 2, 2}, []int{8}
 		for index := range owners {
 			row := &owners[index]
 			accepted, err := row.fixture.sender.sendGroupWithTimeoutDetailed(row.pack.Frames, row.fixture.receiver.ClientId(), func(err error) { row.result <- err }, time.Second)
@@ -147,9 +158,24 @@ func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 			row := &owners[index]
 			for chunk, want := range row.chunks {
 				wire := row.fixture.data()
-				if len(wire.pack.Frames) != want || len(row.result) != 0 {
-					t.Fatalf("owner%d chunk%d=%d want%d or premature completion", index, chunk, len(wire.pack.Frames), want)
+				if len(wire.pack.Frames) != want {
+					t.Fatalf("H1_OWNER_CHUNK_GEOMETRY: owner%d chunk%d=%d want%d", index, chunk, len(wire.pack.Frames), want)
 				}
+				if len(row.result) != 0 {
+					t.Fatalf("owner%d completed before chunk%d peer ACK", index, chunk)
+				}
+				// The actual write and its complete repair head must both fit,
+				// including later encryption of this plaintext fixture's Pack.
+				sequence := row.fixture.sequence()
+				path := sendTransferPath(row.fixture.sender.ClientId(), DestinationId(row.fixture.receiver.ClientId()))
+				actual := privateH1SealedByteCount(t, path, wire.bytes)
+				repairWire := privateH1FullWire(t, sequence, wire.pack.Frames, true)
+				repair := privateH1SealedByteCount(t, path, repairWire)
+				MessagePoolReturn(repairWire)
+				if actual > 16*1024 || repair > 16*1024 {
+					t.Fatalf("owner%d chunk%d encrypted actual/repair=%d/%d exceeds advertised 16KiB", index, chunk, actual, repair)
+				}
+				t.Logf("h1_owner_wire owner=%d chunk=%d frames=%d encrypted=%d repair=%d", index, chunk, want, actual, repair)
 				row.fixture.forward(wire, row.fixture.receiverIn)
 				row.fixture.acknowledge()
 			}

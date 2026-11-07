@@ -44,6 +44,9 @@ type TransferMemoryBudget struct {
 	hasChildren    atomic.Bool
 	totalByteCount atomic.Int64
 	usedByteCount  atomic.Int64
+	// Encoded quota already backed by a physical owner on another branch.
+	// It limits this branch without charging its shared ancestors again.
+	quotaByteCount atomic.Int64
 	// The sum of the guaranteed floors of every queue attached to this pool.
 	// A queue below its floor is admitted whatever the pool says, so those
 	// bytes are spoken for and are not lendable to anyone else.
@@ -89,6 +92,7 @@ type transferMemoryReserveWaiter struct {
 	budget    *TransferMemoryBudget
 	byteCount ByteCount
 	ready     chan struct{}
+	quotaStop *TransferMemoryBudget
 }
 
 // transferMemoryBudgetWaiter is one reusable admission subscription. The
@@ -220,9 +224,9 @@ func (self *TransferMemoryBudget) LendableByteCount(ownFloorByteCount ByteCount)
 
 // Available is the unreserved remainder of the budget
 func (self *TransferMemoryBudget) Available() ByteCount {
-	available := max(0, self.totalByteCount.Load()-self.usedByteCount.Load())
+	available := max(0, self.totalByteCount.Load()-self.usedByteCount.Load()-self.quotaByteCount.Load())
 	for parent := self.parent; parent != nil; parent = parent.parent {
-		available = min(available, max(0, parent.totalByteCount.Load()-parent.usedByteCount.Load()))
+		available = min(available, max(0, parent.totalByteCount.Load()-parent.usedByteCount.Load()-parent.quotaByteCount.Load()))
 	}
 	return available
 }
@@ -266,7 +270,7 @@ func (self *TransferMemoryBudget) tryReserveWithLock(byteCount ByteCount) bool {
 	}
 	for budget := self; budget != nil; budget = budget.parent {
 		total := budget.totalByteCount.Load()
-		used := budget.usedByteCount.Load()
+		used := budget.usedByteCount.Load() + budget.quotaByteCount.Load()
 		if total < byteCount || total-byteCount < used {
 			return false
 		}
@@ -286,7 +290,6 @@ func (self *TransferMemoryBudget) Release(byteCount ByteCount) {
 		used := budget.usedByteCount.Add(-byteCount)
 		budget.releasedByteCount.Add(byteCount)
 		if used < 0 {
-			// Keep the accounting error observable rather than masking it.
 			DefaultLogger().Errorf("[tmb]release below zero (%d)", used)
 		}
 	}
@@ -326,7 +329,11 @@ func (self *transferMemoryReserveWaiter) abandon() {
 		return
 	}
 	root.admissionLock.Unlock()
-	self.budget.Release(self.byteCount)
+	if self.quotaStop != nil {
+		self.budget.releaseReceiveQuota(self.byteCount, self.quotaStop)
+	} else {
+		self.budget.Release(self.byteCount)
+	}
 }
 
 // Reserves for queued waiters, oldest first, each one that fits. Called on the
@@ -337,7 +344,13 @@ func (self *TransferMemoryBudget) grantReserveWaitersWithLock() {
 	}
 	waiters := self.reserveWaiters[:0]
 	for _, waiter := range self.reserveWaiters {
-		if waiter.budget.tryReserveWithLock(waiter.byteCount) {
+		reserved := false
+		if waiter.quotaStop != nil {
+			reserved = waiter.budget.tryReserveQuotaWithLock(waiter.byteCount, waiter.quotaStop)
+		} else {
+			reserved = waiter.budget.tryReserveWithLock(waiter.byteCount)
+		}
+		if reserved {
 			close(waiter.ready)
 		} else {
 			waiters = append(waiters, waiter)
@@ -377,7 +390,7 @@ func (self *TransferMemoryBudget) tryMoveReservation(target *TransferMemoryBudge
 		}
 	}
 	for budget := target; budget != nil; budget = budget.parent {
-		if !contains(self, budget) && budget.totalByteCount.Load()-budget.usedByteCount.Load() < byteCount {
+		if !contains(self, budget) && budget.totalByteCount.Load()-budget.usedByteCount.Load()-budget.quotaByteCount.Load() < byteCount {
 			root.admissionLock.Unlock()
 			return false
 		}
@@ -518,7 +531,7 @@ func (self *TransferMemoryBudget) notifyEligibleCapacityWaiters() {
 		nextWaiter := waiter.nextCapacityWaiter
 		eligible := waiter.requiredByteCount <= availableByteCount
 		for budget := waiter.budget; eligible && budget != nil; budget = budget.parent {
-			eligible = waiter.requiredByteCount <= max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-granted[budget])
+			eligible = waiter.requiredByteCount <= max(0, budget.totalByteCount.Load()-budget.usedByteCount.Load()-budget.quotaByteCount.Load()-granted[budget])
 		}
 		if eligible {
 			self.removeCapacityWaiterWithLock(waiter)
@@ -548,6 +561,8 @@ func (self *TransferMemoryBudget) Counts() (reservedByteCount ByteCount, release
 // TransferMemoryBudgetStats is one coherent exact-admission sample. Root
 // counters already include descendants; never sum them with child counters.
 type TransferMemoryBudgetStats struct {
+	// A nonphysical permission already covered elsewhere in the same tree.
+	QuotaByteCount    ByteCount
 	TotalByteCount    ByteCount
 	UsedByteCount     ByteCount
 	ReservedByteCount ByteCount
@@ -586,7 +601,22 @@ func (self *TransferMemoryBudget) statsWithLock() TransferMemoryBudgetStats {
 	return TransferMemoryBudgetStats{
 		TotalByteCount:    self.totalByteCount.Load(),
 		UsedByteCount:     self.usedByteCount.Load(),
+		QuotaByteCount:    self.quotaByteCount.Load(),
 		ReservedByteCount: self.reservedByteCount.Load(),
 		ReleasedByteCount: self.releasedByteCount.Load(),
+	}
+}
+
+// The caller owns the root admission lock and publishes capacity after all
+// related claim/promise changes form one complete transaction.
+func (self *TransferMemoryBudget) releaseWithLock(byteCount ByteCount) {
+	if byteCount < 0 {
+		panic("negative physical memory release")
+	}
+	for budget := self; budget != nil; budget = budget.parent {
+		if budget.usedByteCount.Add(-byteCount) < 0 {
+			panic("physical memory released without ownership")
+		}
+		budget.releasedByteCount.Add(byteCount)
 	}
 }

@@ -34,8 +34,11 @@ func (self *transferItem) reserveMemoryWithCredit(budget *TransferMemoryBudget, 
 	if self.memoryBudget != nil {
 		panic("transfer owner already has a memory reservation")
 	}
+	root := budget.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
 	credit := min(max(0, *creditByteCount), byteCount)
-	if remainder := byteCount - credit; 0 < remainder && !budget.TryReserve(remainder) {
+	if remainder := byteCount - credit; 0 < remainder && !budget.tryReserveWithLock(remainder) {
 		return false
 	}
 	*creditByteCount -= credit
@@ -105,6 +108,9 @@ func (self *sendItem) reserveFrameRewrite(frameByteCount ByteCount, frameCount i
 func (self *ReceiveSequence) reserveHeldItem(item *receiveItem, promised bool) bool {
 	if !self.receiveQueue.lifetimeBudget {
 		return true
+	}
+	if item.memoryBudget != nil {
+		return item.memoryBudget == self.receiveQueue.budget
 	}
 	if promised {
 		return item.reserveMemoryWithCredit(self.receiveQueue.budget, item.QueueByteCount(), &self.holdPromise.reservedByteCount)
