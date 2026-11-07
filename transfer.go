@@ -1738,6 +1738,9 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 type ClientReceiveStatsSnapshot struct {
 	ReceiveDecodeReservedByteCount  ByteCount
 	ReceiveDecodePressureDropCount  uint64
+	// Frames a direct peer (P2P) route delivered that named the platform or
+	// this client as their source, dropped as forged.
+	ForgedSourceDropCount           uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
 	PackHandoffWaitCount            uint64
@@ -2147,6 +2150,7 @@ type Client struct {
 	// The shared receive pump remains nonblocking for H3/unknown. H1 may spend a
 	// separately configured bounded wait after a queue fills; primitive counters
 	// expose those rare waits and drops without a metrics handoff or hot log.
+	receiveForgedSourceDropCount           atomic.Uint64
 	receivePackHandoffDropCount            atomic.Uint64
 	receivePackHandoffDropByteCount        atomic.Uint64
 	receivePackHandoffWaitCount            atomic.Uint64
@@ -2520,15 +2524,27 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 	if len(ordered) == 0 {
 		return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
+	historyBlocked := false
 	for _, session := range ordered {
-		for _, cipher := range session.decryptCiphers() {
+		ciphers, admitted := session.decryptCiphers()
+		if !admitted {
+			historyBlocked = true
+			continue
+		}
+		for _, cipher := range ciphers {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
 				return plaintext, session.role, session.companion, nil
 			}
 		}
 	}
+	if historyBlocked {
+		return nil, sequenceTlsRoleServer, false, errInboundKeyHistoryBlocked
+	}
 	return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
 }
+
+// Local identity admission has not opened; this is not evidence of a lost cipher.
+var errInboundKeyHistoryBlocked = errors.New("signed peer identity is not admitted")
 
 func (self *Client) ClientKeyManager() *ClientKeyManager {
 	return self.clientKeyManager
@@ -2557,6 +2573,7 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
 		ReceiveDecodeReservedByteCount:         self.receiveDecodeReservedByteCount.Load(),
 		ReceiveDecodePressureDropCount:         self.receiveDecodePressureDropCount.Load(),
+		ForgedSourceDropCount:                  self.receiveForgedSourceDropCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
@@ -4674,6 +4691,23 @@ func (self *Client) run() {
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
+		// A direct peer (P2P) route carries a stream peer's frames, never the
+		// platform's and never this client's own. A frame on one that names
+		// either as its source is forged: taken as control-plane or self
+		// traffic it would skip contract and session checks and drive
+		// platform-only control (stream setup, sequence close, transport
+		// migration). Other peer ids cannot be checked here, because a
+		// multihop endpoint knows only its adjacent hop (see §2.3 of
+		// audit/EVIDENCE.md).
+		if transportType == TransportTypeP2p &&
+			(path.SourceId == ControlId || path.SourceId == self.clientId) {
+			self.receiveForgedSourceDropCount.Add(1)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
+			}
+			MessagePoolReturn(transferFrameBytes)
+			continue
+		}
 
 		source := path.SourceMask()
 
@@ -4753,7 +4787,7 @@ func (self *Client) run() {
 					// lifecycle recovers (rate-limited; requires the role
 					// hint to pin the session — anonymous wraps keep the
 					// timeout path). See EncryptedControlUnknownWrapNack.
-					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok {
+					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && !errors.Is(err, errInboundKeyHistoryBlocked) {
 						nackCompanion := false
 						if transferFrame.SessionCompanion != nil {
 							nackCompanion = *transferFrame.SessionCompanion
@@ -16151,7 +16185,10 @@ type ReceiveSequence struct {
 	deliverItems  []*receiveItem
 	deliverFrames []*protocol.Frame
 	deliverPeer   Peer
-	deliveryQueue *receiveDeliveryQueue
+	// Owned by the receive worker. Once a batch is refused, cleanup must
+	// discard later controls too: their cumulative ACK would cover the gap.
+	keyHistoryDeliveryRefused bool
+	deliveryQueue             *receiveDeliveryQueue
 }
 
 // id reconstructs the immutable receive-buffer lookup identity used by test
@@ -18434,6 +18471,16 @@ func (self *ReceiveSequence) flushDeliver() {
 	self.deliverItems = self.deliverItems[:0]
 	clear(self.deliverFrames)
 	self.deliverFrames = self.deliverFrames[:0]
+	if self.keyHistoryDeliveryRefused || 0 < len(frames) && self.session != nil && !self.session.admitInboundApplication() {
+		for _, item := range items {
+			self.discardUnadmittedApplication(item)
+		}
+		if self.deliveryQueue != nil {
+			self.deliveryQueue.cancel()
+		}
+		endTransferProgress(progressObserver, progress, "deliver_end", false, errInboundKeyHistoryBlocked)
+		return
+	}
 	if self.needsDeliveryReceipts(items, frames) {
 		self.flushDeliveryReceipts(items, frames, peer)
 		endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
@@ -18488,6 +18535,23 @@ func (self *ReceiveSequence) flushDeliver() {
 			}
 		}
 	})
+}
+
+// Takes an undispatched item's ownership after identity admission closes.
+// Retire only this sequence: its advanced head must never acknowledge the
+// refused data. Withdraw any held lease before releasing roots/reservations;
+// a pending history may later admit the sender's retry on a replacement worker.
+func (self *ReceiveSequence) discardUnadmittedApplication(item *receiveItem) {
+	self.keyHistoryDeliveryRefused = true
+	self.cancel()
+	self.discardReceiveDeliveryAdmission(item)
+	if item.committed && self.receiveBufferSettings.EvictionNotice {
+		self.client.receiveQueueExitWithdrawCount.Add(1)
+		self.noteEviction(item.sequenceNumber)
+	}
+	self.client.receiveQueueDropCount.Add(1)
+	self.client.receiveQueueDropByteCount.Add(uint64(max(item.messageByteCount, 0)))
+	item.messagePoolReturn()
 }
 
 // deliverEncryptedControlFrames splits an incoming Pack's frames: any

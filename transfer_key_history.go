@@ -434,6 +434,7 @@ func VerifyClientKeyHistory(
 
 	var prior *ClientKeyRegistration
 	var domainDigest [32]byte
+	chain := make([]ClientKeyRegistration, 0, len(encodedHistory))
 	for index, encoded := range encodedHistory {
 		registration, err := decodeClientKeyRegistration(encoded)
 		if err != nil {
@@ -461,6 +462,7 @@ func VerifyClientKeyHistory(
 		}
 		owned := registration
 		prior = &owned
+		chain = append(chain, registration)
 	}
 
 	head = *prior
@@ -472,7 +474,7 @@ func VerifyClientKeyHistory(
 	}
 
 	if policy.Pin != nil {
-		if err := policy.Pin.extendedBy(domainDigest, head); err != nil {
+		if err := policy.Pin.extendedBy(domainDigest, chain); err != nil {
 			return ClientKeyRegistration{}, ClientKeyPin{}, err
 		}
 	}
@@ -505,16 +507,26 @@ func (self ClientKeyHistoryPolicy) authorizeSigner(domainDigest [32]byte, signer
 		ErrClientKeyRegistrationInvalid, signer)
 }
 
-// extendedBy checks that a freshly verified head is a forward extension of the
-// pinned state rather than a fork or a rewind.
-func (self *ClientKeyPin) extendedBy(domainDigest [32]byte, head ClientKeyRegistration) error {
+// Checks that a freshly verified chain is a forward extension of the pinned
+// state rather than a fork or a rewind: the same domain, a head at or past
+// the pinned generation, and the pinned generation still naming the pinned
+// key. Generations run contiguously from 1 (see follows), so the pinned one is
+// at index Generation-1. A chain that rewrites the pinned generation is a fork
+// even when it also adds generations past it: that is two signed histories for
+// one generation, not a rotation. A rotation keeps the pinned generation and
+// appends.
+func (self *ClientKeyPin) extendedBy(domainDigest [32]byte, chain []ClientKeyRegistration) error {
 	if self.DomainDigest != domainDigest {
 		return fmt.Errorf("%w: history changed deployment domain", ErrClientKeyRegistrationInvalid)
 	}
-	if head.Generation < self.Generation {
+	if self.Generation == 0 {
+		return fmt.Errorf("%w: pin names no generation", ErrClientKeyRegistrationInvalid)
+	}
+	if uint64(len(chain)) < self.Generation {
 		return fmt.Errorf("%w: history rewound below the pinned generation", ErrClientKeyRegistrationInvalid)
 	}
-	if head.Generation == self.Generation && head.PublicKey != self.PublicKey {
+	pinned := chain[self.Generation-1]
+	if pinned.Generation != self.Generation || !pinned.Present || pinned.PublicKey != self.PublicKey {
 		return fmt.Errorf("%w: pinned generation now names a different key", ErrClientKeyRegistrationInvalid)
 	}
 	return nil

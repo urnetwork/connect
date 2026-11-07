@@ -5,14 +5,13 @@ package connect
 // `transfer_key_history.go` verifies a chain. This file decides what to do
 // with the answer, and the decisions are the security-relevant part.
 //
-// The shape is deliberately NOT "refuse to commit the contract key". The
-// contract key is still committed, so the certificate chain and the identity
-// proof verify exactly as before; what is withheld is `Cipher()`. Because the
-// Required send gate parks application data on `Cipher()` and the receive gate
-// discards plaintext application frames, withholding the cipher is sufficient:
-// no application byte leaves for, or is accepted from, a peer whose identity
-// key has not been corroborated. Withholding also keeps the change to the
-// handshake path small, which matters in a file this delicate.
+// The contract key is committed for certificate and identity-proof checks while
+// its history is resolved. Required application admission checks this gate at
+// outbound Cipher(), inbound cipher selection, and queued/per-receipt delivery.
+// Bootstrap controls can therefore complete while application data stays closed.
+// Store-backed decisions compare and swap the complete pin/latch snapshot used
+// for verification, including decisions that only read the store. The successful
+// compare is the admission point; later rotations do not revoke prior admissions.
 //
 // See DESIGNNOTES3 §5 for the policy this implements and §8 for what it does
 // and does not close.
@@ -90,11 +89,41 @@ type PeerClientKeyPinStore interface {
 // CheckedPeerClientKeyPinStore makes durable admission part of opening the
 // Required cipher gate. Commit must atomically retain the pin and the global
 // signed-history latch, or return an error without dropping existing pins.
-// The optional interface preserves compatibility with legacy Go stores.
+// Kept for compatibility with existing Go stores; Required resolution uses the
+// stronger atomic interface below to bind verification to durable admission.
 type CheckedPeerClientKeyPinStore interface {
 	PeerClientKeyPinStore
 	GetPeerClientKeyPinChecked(Id) (ClientKeyPin, bool, error)
 	CommitPeerClientKeyPin(Id, ClientKeyPin) error
+}
+
+// One atomic view of the peer ratchet and the store-wide signed-history latch.
+// Pinned distinguishes a missing peer from a stored zero value. Missing peers
+// must have a zero Pin so snapshots have one comparable representation.
+type ClientKeyPinSnapshot struct {
+	Pin               ClientKeyPin
+	Pinned            bool
+	SignedHistorySeen bool
+}
+
+// Admits a resolution against the exact snapshot it verified. Implementations
+// synchronize both methods with every other pin/latch mutation in the store,
+// including legacy setters. A failed comparison returns false, nil and changes
+// nothing; success with nextPin != nil durably commits that pin and the latch.
+// A nil nextPin only checks the snapshot, without writing or setting the latch.
+// Errors must preserve existing pins and keep admission closed.
+// A non-nil nextPin must come from complete chain and signer-policy verification
+// against the supplied snapshot. The store conditionally persists that decision;
+// it does not establish cryptographic authority for a new key or signer itself.
+//
+// Required sessions with a configured store require this interface. The older
+// interfaces remain source-compatible, but cannot safely admit a resolution
+// across managers. Owners must upgrade their store once, shared by every user;
+// independently wrapping it per client would recreate the race.
+type AtomicPeerClientKeyPinStore interface {
+	CheckedPeerClientKeyPinStore
+	ReadPeerClientKeyPinSnapshot(Id) (ClientKeyPinSnapshot, error)
+	CompareAndSwapPeerClientKeyPin(Id, ClientKeyPinSnapshot, *ClientKeyPin) (bool, error)
 }
 
 // keyHistoryRequiredWithLock reports whether this session gates `Cipher()` on
@@ -151,110 +180,162 @@ func (self *peerEncryptionSession) resolvePeerClientKeyHistory(contractPub ed255
 
 		encodedHistory, err := self.peerClientKeyHistoryFetcher(self.ctx)
 		if err != nil {
-			// A healthy store retains the existing network-availability policy.
-			// Local closed/corrupt storage cannot be bypassed by that fallback.
-			if store, ok := self.settings.PeerClientKeyPinStore.(CheckedPeerClientKeyPinStore); ok {
-				if _, _, storeErr := store.GetPeerClientKeyPinChecked(self.peerId); storeErr != nil {
-					self.blockKeyHistoryStore(storeErr)
-					return
-				}
-			}
-			// Availability failure, NOT evidence of substitution. Treating an
-			// unreachable platform API as a verified disagreement would
-			// exclude every provider for every Required client at once the
-			// moment that API blipped — a self-inflicted global outage with
-			// the same shape as the blackhole the window exists to route
-			// around. Fall back to the contract key and say so.
-			// DESIGNNOTES3 §5.3.
-			self.client.log.Infof(
-				"[key]%s signed identity evidence unavailable (%s) — falling back to the contract key\n",
-				self.logTag, err,
-			)
-			self.openKeyHistoryGate(clientKeyHistoryVerified, "")
+			self.applyPeerClientKeyHistoryFetchError(contractPub, err)
 			return
 		}
 		self.applyPeerClientKeyHistory(contractPub, encodedHistory)
 	})
 }
 
-// applyPeerClientKeyHistory is the decision table of DESIGNNOTES3 §5.2.
+// Applies the availability policy through the same atomic admission path as a
+// signed response. A changed pin cannot race a fallback into opening the gate.
+func (self *peerEncryptionSession) applyPeerClientKeyHistoryFetchError(
+	contractPub ed25519.PublicKey,
+	fetchErr error,
+) {
+	self.applyPeerClientKeyHistoryResolution(contractPub, nil, fetchErr)
+}
+
+// Resolves signed or explicitly absent evidence against the current ratchet.
 func (self *peerEncryptionSession) applyPeerClientKeyHistory(
 	contractPub ed25519.PublicKey,
 	encodedHistory [][]byte,
 ) {
-	store := self.settings.PeerClientKeyPinStore
-	var pin ClientKeyPin
-	pinned := false
-	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
-		var err error
-		pin, pinned, err = checked.GetPeerClientKeyPinChecked(self.peerId)
-		if err != nil {
-			self.blockKeyHistoryStore(err)
-			return
-		}
-	} else if store != nil {
-		pin, pinned = store.GetPeerClientKeyPin(self.peerId)
+	self.applyPeerClientKeyHistoryResolution(contractPub, encodedHistory, nil)
+}
+
+// Verifies without store or session locks, then conditionally admits the result.
+// Conflicts re-read and re-verify within the owner's attempt bound. No registry
+// or per-manager lock is needed: every manager compares against the same store.
+// A rejection also compares its snapshot so a concurrent legitimate rotation
+// cannot turn a stale disagreement into a terminal peer accusation.
+func (self *peerEncryptionSession) applyPeerClientKeyHistoryResolution(
+	contractPub ed25519.PublicKey,
+	encodedHistory [][]byte,
+	fetchErr error,
+) {
+	if self.ctx.Err() != nil {
+		return
+	}
+	terminal := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.keyHistoryState == clientKeyHistoryRejected || self.keyHistoryState == clientKeyHistoryStoreUnavailable
+	}()
+	if terminal {
+		return
 	}
 
-	if len(encodedHistory) == 0 {
-		// Tier P: the peer has no signed registration. Legitimate for a
-		// legacy client or a platform that does not run the signed path —
-		// unless this peer, or this platform, has produced signed evidence
-		// before, in which case its disappearance is a downgrade.
+	var store AtomicPeerClientKeyPinStore
+	attempts := 1 // No configured store needs no compare/retry.
+	if configured := self.settings.PeerClientKeyPinStore; configured != nil {
+		var ok bool
+		store, ok = configured.(AtomicPeerClientKeyPinStore)
+		if !ok {
+			self.blockKeyHistoryStore(errors.New("peer identity pin store does not support atomic admission"))
+			return
+		}
+		attempts = self.settings.MaxClientKeyPinAdmissionAttempts
+		if attempts <= 0 {
+			self.blockKeyHistoryStore(errors.New("peer identity pin admission attempts must be positive"))
+			return
+		}
+	}
+
+	var previousSnapshot ClientKeyPinSnapshot
+	for attempt := 0; attempt < attempts; attempt++ {
+		if self.ctx.Err() != nil {
+			return
+		}
+		var snapshot ClientKeyPinSnapshot
+		if store != nil {
+			var err error
+			snapshot, err = store.ReadPeerClientKeyPinSnapshot(self.peerId)
+			if err != nil {
+				self.blockKeyHistoryStore(err)
+				return
+			}
+			if !snapshot.Pinned && snapshot.Pin != (ClientKeyPin{}) {
+				self.blockKeyHistoryStore(errors.New("missing peer identity pin has nonzero snapshot state"))
+				return
+			}
+			if attempt != 0 && snapshot == previousSnapshot {
+				self.blockKeyHistoryStore(errors.New("peer identity pin compare failed without a snapshot change"))
+				return
+			}
+		}
+
+		state, reason, nextPin := func() (clientKeyHistoryState, string, *ClientKeyPin) {
+			if fetchErr != nil {
+				if snapshot.Pinned && !bytes.Equal(snapshot.Pin.PublicKey[:], contractPub) {
+					return clientKeyHistoryRejected, "contract identity key differs from the pinned signed key while no signed history is available", nil
+				}
+				return clientKeyHistoryVerified, "", nil
+			}
+			if len(encodedHistory) == 0 {
+				switch {
+				case snapshot.Pinned:
+					return clientKeyHistoryRejected, "peer previously verified with signed evidence now offers none", nil
+				case snapshot.SignedHistorySeen:
+					return clientKeyHistoryRejected, "platform previously served signed evidence and now offers none for this peer", nil
+				default:
+					return clientKeyHistoryVerified, "", nil
+				}
+			}
+
+			policy := ClientKeyHistoryPolicy{
+				TrustedSigners: self.settings.TrustedClientKeySigners,
+				MaxGenerations: self.settings.MaxClientKeyHistoryGenerations,
+			}
+			if snapshot.Pinned {
+				pin := snapshot.Pin
+				policy.Pin = &pin
+			}
+			head, pin, err := VerifyClientKeyHistory(self.peerId, encodedHistory, policy)
+			if err != nil {
+				return clientKeyHistoryRejected, errors.Join(errors.New("signed identity evidence did not verify"), err).Error(), nil
+			}
+			if !bytes.Equal(head.ClientKeyRegistrationPublicKey(), contractPub) {
+				return clientKeyHistoryRejected, "contract identity key contradicts the signed registration head", nil
+			}
+			return clientKeyHistoryVerified, "", &pin
+		}()
+
+		if self.ctx.Err() != nil {
+			return
+		}
+		if store != nil {
+			admitted, err := store.CompareAndSwapPeerClientKeyPin(self.peerId, snapshot, nextPin)
+			if err != nil {
+				self.blockKeyHistoryStore(err)
+				return
+			}
+			if !admitted {
+				previousSnapshot = snapshot
+				continue
+			}
+		}
+		if self.ctx.Err() != nil {
+			return
+		}
+		if state == clientKeyHistoryRejected {
+			self.rejectKeyHistory(reason)
+			return
+		}
 		switch {
-		case pinned:
-			self.rejectKeyHistory("peer previously verified with signed evidence now offers none")
-		case store != nil && store.SignedHistorySeen():
-			self.rejectKeyHistory("platform previously served signed evidence and now offers none for this peer")
+		case fetchErr != nil:
+			self.client.log.Infof("[key]%s signed identity evidence unavailable (%s) — falling back to the contract key\n", self.logTag, fetchErr)
+		case nextPin == nil:
+			self.client.log.Infof("[key]%s peer has no signed identity evidence (unsigned path)\n", self.logTag)
 		default:
-			self.client.log.Infof(
-				"[key]%s peer has no signed identity evidence (unsigned path)\n", self.logTag,
-			)
-			self.openKeyHistoryGate(clientKeyHistoryVerified, "")
+			self.client.log.Infof("[key]%s signed identity verified — generation %d, signer %s\n", self.logTag, nextPin.Generation, nextPin.Signer)
 		}
+		self.openKeyHistoryGate(clientKeyHistoryVerified, "")
 		return
 	}
-
-	policy := ClientKeyHistoryPolicy{
-		TrustedSigners: self.settings.TrustedClientKeySigners,
-		Pin:            nil,
-		MaxGenerations: self.settings.MaxClientKeyHistoryGenerations,
+	if self.ctx.Err() == nil {
+		self.blockKeyHistoryStore(errors.New("peer identity pin admission attempt limit exceeded"))
 	}
-	if pinned {
-		owned := pin
-		policy.Pin = &owned
-	}
-
-	head, nextPin, err := VerifyClientKeyHistory(self.peerId, encodedHistory, policy)
-	if err != nil {
-		// A chain was offered and did not verify. That is a positive answer,
-		// not a missing one: something signed, or failed to sign, evidence
-		// about this peer that does not hold together.
-		self.rejectKeyHistory(errors.Join(errors.New("signed identity evidence did not verify"), err).Error())
-		return
-	}
-
-	if !bytes.Equal(head.ClientKeyRegistrationPublicKey(), contractPub) {
-		// The substitution case the whole mechanism exists for: the platform
-		// handed us one key in the contract and signed a different one.
-		self.rejectKeyHistory("contract identity key contradicts the signed registration head")
-		return
-	}
-
-	if checked, ok := store.(CheckedPeerClientKeyPinStore); ok {
-		if err := checked.CommitPeerClientKeyPin(self.peerId, nextPin); err != nil {
-			self.blockKeyHistoryStore(err)
-			return
-		}
-	} else if store != nil {
-		store.SetPeerClientKeyPin(self.peerId, nextPin)
-		store.SetSignedHistorySeen()
-	}
-	self.client.log.Infof(
-		"[key]%s signed identity verified — generation %d, signer %s\n",
-		self.logTag, head.Generation, head.Signer,
-	)
-	self.openKeyHistoryGate(clientKeyHistoryVerified, "")
 }
 
 // openKeyHistoryGate moves the gate out of pending. A rejected session is
@@ -266,7 +347,7 @@ func (self *peerEncryptionSession) openKeyHistoryGate(state clientKeyHistoryStat
 		if self.keyHistoryState == clientKeyHistoryRejected || self.keyHistoryState == clientKeyHistoryStoreUnavailable {
 			return false
 		}
-		if self.keyHistoryState == state {
+		if self.keyHistoryState == state || state == clientKeyHistoryVerified && self.ctx.Err() != nil {
 			return false
 		}
 		self.keyHistoryState = state
