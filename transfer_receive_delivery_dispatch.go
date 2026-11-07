@@ -182,6 +182,13 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 		appFrames := frames[offset : offset+count]
 		offset += count
 		nextItem++
+		// Each receipt has its own callback. A previous callback may have
+		// rejected this session after the enclosing batch was admitted.
+		if 0 < len(appFrames) && self.session != nil && !self.session.admitInboundApplication() {
+			self.discardUnadmittedApplication(item)
+			q.cancel()
+			continue
+		}
 		q.mutex.Lock()
 		closed := q.closed
 		q.mutex.Unlock()

@@ -2511,15 +2511,27 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 	if len(ordered) == 0 {
 		return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
+	historyBlocked := false
 	for _, session := range ordered {
-		for _, cipher := range session.decryptCiphers() {
+		ciphers, admitted := session.decryptCiphers()
+		if !admitted {
+			historyBlocked = true
+			continue
+		}
+		for _, cipher := range ciphers {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
 				return plaintext, session.role, session.companion, nil
 			}
 		}
 	}
+	if historyBlocked {
+		return nil, sequenceTlsRoleServer, false, errInboundKeyHistoryBlocked
+	}
 	return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
 }
+
+// Local identity admission has not opened; this is not evidence of a lost cipher.
+var errInboundKeyHistoryBlocked = errors.New("signed peer identity is not admitted")
 
 func (self *Client) ClientKeyManager() *ClientKeyManager {
 	return self.clientKeyManager
@@ -4749,7 +4761,7 @@ func (self *Client) run() {
 					// lifecycle recovers (rate-limited; requires the role
 					// hint to pin the session — anonymous wraps keep the
 					// timeout path). See EncryptedControlUnknownWrapNack.
-					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok {
+					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && !errors.Is(err, errInboundKeyHistoryBlocked) {
 						nackCompanion := false
 						if transferFrame.SessionCompanion != nil {
 							nackCompanion = *transferFrame.SessionCompanion
@@ -16120,7 +16132,10 @@ type ReceiveSequence struct {
 	deliverItems  []*receiveItem
 	deliverFrames []*protocol.Frame
 	deliverPeer   Peer
-	deliveryQueue *receiveDeliveryQueue
+	// Owned by the receive worker. Once a batch is refused, cleanup must
+	// discard later controls too: their cumulative ACK would cover the gap.
+	keyHistoryDeliveryRefused bool
+	deliveryQueue             *receiveDeliveryQueue
 }
 
 // id reconstructs the immutable receive-buffer lookup identity used by test
@@ -18331,6 +18346,16 @@ func (self *ReceiveSequence) flushDeliver() {
 	self.deliverItems = self.deliverItems[:0]
 	clear(self.deliverFrames)
 	self.deliverFrames = self.deliverFrames[:0]
+	if self.keyHistoryDeliveryRefused || 0 < len(frames) && self.session != nil && !self.session.admitInboundApplication() {
+		for _, item := range items {
+			self.discardUnadmittedApplication(item)
+		}
+		if self.deliveryQueue != nil {
+			self.deliveryQueue.cancel()
+		}
+		endTransferProgress(progressObserver, progress, "deliver_end", false, errInboundKeyHistoryBlocked)
+		return
+	}
 	if self.needsDeliveryReceipts(items, frames) {
 		self.flushDeliveryReceipts(items, frames, peer)
 		endTransferProgress(progressObserver, progress, "deliver_end", true, nil)
@@ -18385,6 +18410,23 @@ func (self *ReceiveSequence) flushDeliver() {
 			}
 		}
 	})
+}
+
+// Takes an undispatched item's ownership after identity admission closes.
+// Retire only this sequence: its advanced head must never acknowledge the
+// refused data. Withdraw any held lease before releasing roots/reservations;
+// a pending history may later admit the sender's retry on a replacement worker.
+func (self *ReceiveSequence) discardUnadmittedApplication(item *receiveItem) {
+	self.keyHistoryDeliveryRefused = true
+	self.cancel()
+	self.discardReceiveDeliveryAdmission(item)
+	if item.committed && self.receiveBufferSettings.EvictionNotice {
+		self.client.receiveQueueExitWithdrawCount.Add(1)
+		self.noteEviction(item.sequenceNumber)
+	}
+	self.client.receiveQueueDropCount.Add(1)
+	self.client.receiveQueueDropByteCount.Add(uint64(max(item.messageByteCount, 0)))
+	item.messagePoolReturn()
 }
 
 // deliverEncryptedControlFrames splits an incoming Pack's frames: any

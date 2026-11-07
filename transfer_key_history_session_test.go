@@ -5,34 +5,92 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
 
-// testPeerClientKeyPinStore is an in-memory ratchet store.
+// An in-memory ratchet store, safe to share across session managers.
 type testPeerClientKeyPinStore struct {
+	stateLock   sync.Mutex
 	pins        map[Id]ClientKeyPin
 	signedSeen  bool
 	setPinCalls int
 }
 
+// Creates an empty store owned by the calling test.
 func newTestPeerClientKeyPinStore() *testPeerClientKeyPinStore {
 	return &testPeerClientKeyPinStore{pins: map[Id]ClientKeyPin{}}
 }
 
+// Retains the compatibility reader used by existing assertions.
 func (self *testPeerClientKeyPinStore) GetPeerClientKeyPin(peerId Id) (ClientKeyPin, bool) {
-	pin, ok := self.pins[peerId]
-	return pin, ok
+	pin, pinned, _ := self.GetPeerClientKeyPinChecked(peerId)
+	return pin, pinned
 }
 
+// Reads the peer pin from an atomic snapshot.
+func (self *testPeerClientKeyPinStore) GetPeerClientKeyPinChecked(peerId Id) (ClientKeyPin, bool, error) {
+	snapshot, err := self.ReadPeerClientKeyPinSnapshot(peerId)
+	return snapshot.Pin, snapshot.Pinned, err
+}
+
+// Retains the compatibility setter without weakening store synchronization.
 func (self *testPeerClientKeyPinStore) SetPeerClientKeyPin(peerId Id, pin ClientKeyPin) {
-	self.pins[peerId] = pin
-	self.setPinCalls += 1
+	_ = self.CommitPeerClientKeyPin(peerId, pin)
 }
 
-func (self *testPeerClientKeyPinStore) SignedHistorySeen() bool { return self.signedSeen }
+// Commits the pin and global latch together.
+func (self *testPeerClientKeyPinStore) CommitPeerClientKeyPin(peerId Id, pin ClientKeyPin) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.pins[peerId] = pin
+	self.setPinCalls++
+	self.signedSeen = true
+	return nil
+}
 
-func (self *testPeerClientKeyPinStore) SetSignedHistorySeen() { self.signedSeen = true }
+// Snapshots the peer and latch while their common lock is held.
+func (self *testPeerClientKeyPinStore) snapshotWithLock(peerId Id) ClientKeyPinSnapshot {
+	pin, pinned := self.pins[peerId]
+	return ClientKeyPinSnapshot{Pin: pin, Pinned: pinned, SignedHistorySeen: self.signedSeen}
+}
+
+// Reads the complete comparable admission state.
+func (self *testPeerClientKeyPinStore) ReadPeerClientKeyPinSnapshot(peerId Id) (ClientKeyPinSnapshot, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.snapshotWithLock(peerId), nil
+}
+
+// Checks the snapshot even for a read-only admission, then publishes atomically.
+func (self *testPeerClientKeyPinStore) CompareAndSwapPeerClientKeyPin(peerId Id, previous ClientKeyPinSnapshot, next *ClientKeyPin) (bool, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.snapshotWithLock(peerId) != previous {
+		return false, nil
+	}
+	if next != nil {
+		self.pins[peerId] = *next
+		self.setPinCalls++
+		self.signedSeen = true
+	}
+	return true, nil
+}
+
+// Reads the global ratchet under the store lock.
+func (self *testPeerClientKeyPinStore) SignedHistorySeen() bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.signedSeen
+}
+
+// Sets the global ratchet under the store lock.
+func (self *testPeerClientKeyPinStore) SetSignedHistorySeen() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.signedSeen = true
+}
 
 // newTestKeyHistorySession builds a Required-mode session whose peer id is the
 // golden vector's client id, so the golden history applies to it.
