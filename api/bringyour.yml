@@ -9568,10 +9568,11 @@ paths:
 
   # gkm's routes (sidecar DESIGN.md §10.14). gkm serves them on its own host and api
   # never does, so check-routes.sh holds them to gkmservice's route table, not api's.
-  # Each is planned and internal until gkm serves it, for the reason the other sidecar
-  # routes are. A body is one of sidecar's protocol/gkm.proto messages or a bare
-  # `Signed`, as application/octet-stream, and each description says which and which
-  # scope it takes.
+  # Each is planned until gkm serves it: `x-status: planned` keeps the server's
+  # conformance test from failing on it, and `x-internal` keeps it out of the public
+  # reference and the generated client. A body is one of sidecar's protocol/gkm.proto
+  # messages or a bare `Signed`, as application/octet-stream, and each description
+  # says which and which scope it takes.
   /gkm/key-packages:
     servers:
       - url: https://gkm.bringyour.com
