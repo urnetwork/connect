@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	// "errors"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -108,6 +110,17 @@ type ContractStatus struct {
 }
 
 type ContractStatusFunction = func(ContractStatus *ContractStatus)
+
+// Answers whether a destination's client key is the one this client expects of
+// it. For a contract both values are the stored contract's; the key is always
+// `ed25519.PublicKeySize` bytes. For a session key the fetcher found, they are the
+// session's peer and the fetched key.
+//
+// Runs on a control callback or a send sequence, more than once per contract, with
+// no manager lock held, so answer from memory: a slow check stalls that sequence.
+// A client-owned callback, so it must not call `Client.CloseAndWait`. A panic
+// refuses.
+type ContractDestinationCheckFunction = func(destinationId Id, destinationClientPublicKey []byte) bool
 
 type contractStatusCallbackWorker struct {
 	ctx      context.Context
@@ -619,6 +632,12 @@ type ContractManager struct {
 	// Protected by mutex. The no-permission streak of each destination refused
 	// on its companion lane. See CompanionRefusalHoldMin.
 	companionRefusals map[Id]*companionRefusal
+
+	// What each non-companion contract request carries, nil for nothing. The
+	// bytes behind the pointer never change, so a swap cannot tear a request.
+	windowDelegation atomic.Pointer[[]byte]
+	// Every contract answers to this before use; nil for no check.
+	destinationCheck atomic.Pointer[ContractDestinationCheckFunction]
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -1239,6 +1258,9 @@ func (self *ContractManager) handleControlFrameForQueue(
 				}
 				if err != nil {
 					// contract rejected
+					if errors.Is(err, errContractDestinationRefused) {
+						self.closeContracts([]*protocol.Contract{contract})
+					}
 					contractError := protocol.ContractError_Trust
 					contractStatus = &ContractStatus{
 						Key:   contractKey,
@@ -1709,6 +1731,7 @@ func (self *ContractManager) TakeContract(
 			minEnqueueTime = time.Now().Add(-self.settings.ContractQueueExpireTimeout)
 		}
 		var contract *protocol.Contract
+		var storedContract *protocol.StoredContract
 		var expired []*protocol.Contract
 		func() {
 			// Queue removal and open ownership are one manager-to-queue lock
@@ -1720,11 +1743,12 @@ func (self *ContractManager) TakeContract(
 				self.afterPollContractForTest()
 			}
 			if contract != nil {
-				storedContract := &protocol.StoredContract{}
-				if err := ProtoUnmarshal(contract.StoredContractBytes, storedContract); err == nil {
-					if contractId, err := IdFromBytes(storedContract.ContractId); err == nil {
+				parsed := &protocol.StoredContract{}
+				if err := ProtoUnmarshal(contract.StoredContractBytes, parsed); err == nil {
+					storedContract = parsed
+					if contractId, err := IdFromBytes(parsed.ContractId); err == nil {
 						self.localStats.ContractOpenCount += 1
-						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(storedContract.TransferByteCount)
+						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(parsed.TransferByteCount)
 						self.localStats.ContractOpenKeys[contractId] = contractKey
 					}
 				}
@@ -1744,7 +1768,19 @@ func (self *ContractManager) TakeContract(
 		}
 
 		if contract != nil {
-			return contract
+			if self.contractDestinationAllowed(contractKey, storedContract) {
+				return contract
+			}
+			// Queued before the check was installed, or before the destination's
+			// expected key moved. Taken and closed unused, and the next queued
+			// contract answers for itself: each pass here spends one.
+			self.closeContracts([]*protocol.Contract{contract})
+			contractError := protocol.ContractError_Trust
+			self.contractStatus(&ContractStatus{
+				Key:   contractKey,
+				Error: &contractError,
+			})
+			continue
 		}
 
 		if timeout < 0 {
@@ -1847,6 +1883,10 @@ func (self *ContractManager) addContractToQueue(
 	}
 	self.admitOriginalWork(contract.StoredContractBytes)
 
+	if !self.contractDestinationAllowed(contractKey, storedContract) {
+		return errContractDestinationRefused
+	}
+
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
@@ -1874,6 +1914,74 @@ func (self *ContractManager) addContractToQueue(
 	default:
 	}
 	return nil
+}
+
+// Sets the signed bytes that each later non-companion contract request carries,
+// which the platform seals unchanged into that contract. They are copied, and
+// empty means none. A contract already issued, queued or requested keeps what it
+// was requested with, so a re-sign reaches the next contract and no live one. A
+// companion request carries none: the platform gives it its forward contract's
+// seals. Safe for concurrent use.
+func (self *ContractManager) SetWindowDelegation(delegation []byte) {
+	if len(delegation) == 0 {
+		self.windowDelegation.Store(nil)
+		return
+	}
+	cloned := bytes.Clone(delegation)
+	self.windowDelegation.Store(&cloned)
+}
+
+// Installs a check that every contract answers to before it is used: as a
+// `CreateContract` result reaches a queue, and again as a sequence takes it, so
+// one queued before this call or before the destination's expected key moved is
+// caught too. A session key the fetcher finds answers to it as well, so no key
+// reaches a session unchecked. A refused contract is closed unused, spends
+// nothing, and reports `ContractError_Trust` on `AddContractStatusCallback`.
+//
+// None is set by default, and nil clears it. Install it before the client
+// sends: a contract a sequence already holds is not asked again. Safe for
+// concurrent use.
+func (self *ContractManager) SetContractDestinationCheck(check ContractDestinationCheckFunction) {
+	if check == nil {
+		self.destinationCheck.Store(nil)
+		return
+	}
+	self.destinationCheck.Store(&check)
+}
+
+// Whether a contract for `contractKey` may be used. A sequence could fall back to
+// the outer `Contract` copy of the key, which nothing signs, so this reads only
+// the stored contract, and a key that is not there refuses. Nil means the stored
+// bytes did not parse.
+func (self *ContractManager) contractDestinationAllowed(contractKey ContractKey, storedContract *protocol.StoredContract) bool {
+	if self.destinationCheck.Load() == nil {
+		return true
+	}
+	if storedContract == nil {
+		return false
+	}
+	destinationId, err := IdFromBytes(storedContract.DestinationId)
+	if err != nil || destinationId != contractKey.Destination.DestinationId {
+		return false
+	}
+	return self.destinationKeyAllowed(destinationId, storedContract.DestinationClientPublicKey)
+}
+
+// Whether `destinationClientPublicKey` is a key this client accepts for
+// `destinationId`, which any key is with no check set.
+func (self *ContractManager) destinationKeyAllowed(destinationId Id, destinationClientPublicKey []byte) bool {
+	check := self.destinationCheck.Load()
+	if check == nil {
+		return true
+	}
+	if len(destinationClientPublicKey) != ed25519.PublicKeySize {
+		return false
+	}
+	allowed := false
+	HandleError(func() {
+		allowed = (*check)(destinationId, destinationClientPublicKey)
+	})
+	return allowed
 }
 
 // Coalesces an identical pending request within its exact queue generation.
@@ -1964,6 +2072,11 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 		ForceStream:       &contractKey.ForceStream,
 		StreamVersion:     &streamVersion,
 		SenderRole:        &senderRole,
+	}
+	if !contractKey.CompanionContract {
+		if delegation := self.windowDelegation.Load(); delegation != nil {
+			createContract.WindowDelegation = *delegation
+		}
 	}
 	if self.settings.TrackUsedContracts {
 		createContract.UsedContractIds = contractQueue.UsedContractIdBytes()
@@ -2759,6 +2872,8 @@ type contractQueue struct {
 }
 
 var errContractQueueDrained = errors.New("contract queue drained")
+
+var errContractDestinationRefused = errors.New("contract destination refused")
 
 // Linearizes nonblocking admission under this queue generation's lock. A
 // drained generation begins nothing. Neither does an identical request already

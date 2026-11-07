@@ -4623,6 +4623,14 @@ func (self *peerEncryptionSession) maybeFetchPeerClientPublicKeyForIdentity() {
 			}
 			return
 		}
+		// The fetch is the platform's word for this key, as a contract is, and
+		// first-set-wins would hold a substituted key against every later
+		// contract, so it answers to the same check.
+		if manager := self.client.ContractManager(); manager != nil &&
+			!manager.destinationKeyAllowed(self.peerId, fetched) {
+			self.client.log.Errorf("[key]%s identity key fetch refused by the destination check\n", self.logTag)
+			return
+		}
 		// commits through the same first-set-wins path as a contract-carried
 		// key (the redundant cross-check it spawns compares the key against
 		// itself and stays silent)
