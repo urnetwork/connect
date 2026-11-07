@@ -7800,10 +7800,10 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	// sequence before enqueueing so every subsequent contract request uses the
 	// routable metadata; a direct pack is deliberately a no-op here.
 	self.adoptContractIntermediaryIds(sendPack.IntermediaryIds)
-	// Fail-closed entry gate (EncryptionModeRequired): an application pack does
-	// not enter the sequence until the per-peer cipher is established. The gate
-	// must run here — before a sequence number is assigned — because the
-	// client-role handshake rides this same sequence
+	// Fail-closed entry gate (EncryptionModeRequired, or a peer StickyRequired
+	// holds): an application pack does not enter the sequence until the per-peer
+	// cipher is established. The gate must run here — before a sequence number
+	// is assigned — because the client-role handshake rides this same sequence
 	// (`SendBuffer.SendEncryptedControl`): holding or dropping an
 	// already-sequenced plaintext frame leaves a gap in the strictly-ordered
 	// receive side, and the ClientHello queued behind the gap is never
@@ -11948,6 +11948,7 @@ func (self *SendSequence) setContract(
 	// identity proof exchanged inside the per-peer TLS session (defeats
 	// an active MITM that re-handshakes TLS on each leg).
 	if self.session != nil {
+		self.session.observeContract(nextSendContract)
 		if 0 < len(nextSendContract.destinationClientPublicKey) {
 			self.session.SetPeerClientPublicKey(ed25519.PublicKey(nextSendContract.destinationClientPublicKey))
 		}
@@ -14467,12 +14468,13 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		cipher = self.session.Cipher()
 	}
 	if cipher == nil && self.session != nil && !forceUnwrapped && self.session.RequireEncryption() {
-		// Fail-closed backstop (EncryptionModeRequired): an application frame
-		// reached the writer without a cipher. The entry gate
-		// (`SendSequence.Pack`) admits application packs only once the cipher
-		// is established, and an established session keeps serving a cipher
-		// through rekeys (`Cipher()`), so this fires only on a narrow race
-		// (e.g. the session torn down between enqueue and write). Refuse the
+		// Fail-closed backstop (EncryptionModeRequired, or a peer StickyRequired
+		// holds): an application frame reached the writer without a cipher. The
+		// entry gate (`SendSequence.Pack`) admits application packs only once the
+		// cipher is established, and an established session keeps serving a
+		// cipher through rekeys (`Cipher()`), so this fires only on a narrow race
+		// (e.g. the session torn down between enqueue and write), or on a frame
+		// sequenced before a demotion took the cipher away. Refuse the
 		// write — the item stays queued for resend and the sequence winds down
 		// via its own timeouts — rather than ever emitting plaintext.
 		return transferWriteDisposition{}, fmt.Errorf(
@@ -18231,9 +18233,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	if self.session != nil {
 		appFrames = self.deliverEncryptedControlFrames(item.frames)
 		if item.unwrapped && 0 < len(appFrames) && self.session.RequireEncryption() {
-			// Fail-closed receive gate (EncryptionModeRequired): a plaintext
-			// application frame from a peer for which a session is expected is
-			// never delivered to the application — closing the downgrade where
+			// Fail-closed receive gate (EncryptionModeRequired, or a peer
+			// StickyRequired holds): a plaintext application frame from a peer
+			// for which a session is expected is never delivered to the
+			// application — closing the downgrade where
 			// a peer or on-path attacker strips the wrap and the receiver
 			// accepts the plaintext. The item still advances the sequence and
 			// is acked (ack-and-discard): withholding the ack would gap the
@@ -18479,6 +18482,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 			return nil
 		}
 		return errContractExpired
+	}
+	if self.session != nil {
+		self.session.observeContract(nextReceiveContract)
 	}
 
 	// THROUGHPUTFIX §39.1. An announced successor is verified exactly as an

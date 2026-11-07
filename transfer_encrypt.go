@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"runtime/debug"
@@ -58,7 +59,8 @@ import (
 // via the cipher-nil pass-through in `writeMaybeWrappedBytes` and the
 // ack-mirroring in `writeAck`. In `EncryptionModeRequired` that plaintext
 // pass-through is refused for application data (see `writeMaybeWrappedBytes` and
-// the receive-side gate in `Client.run`).
+// the receive-side gate in `Client.run`), and so it is for a peer
+// `EncryptionSettings.StickyRequired` holds.
 //
 // After the handshake both sides export the same key via the TLS session
 // exporter and wrap it in an AEAD. Application TransferFrames are outer-wrapped
@@ -480,6 +482,8 @@ const (
 	// historical `Encrypt = true` behavior: confidentiality when available,
 	// availability otherwise. It is the right mode for a provider that must
 	// keep serving older peers that cannot establish a session.
+	// `EncryptionSettings.StickyRequired` ends the fallback for a peer that has
+	// sealed.
 	EncryptionModeOpportunistic
 	// EncryptionModeRequired refuses to expose application data in plaintext to
 	// or from any peer for which a session is expected. On send, application
@@ -527,14 +531,16 @@ const (
 	// cryptographic verification (or was malformed). Sticky for the epoch —
 	// the session stays unsealed.
 	EncryptionEventIdentityFailed
-	// EncryptionEventRequiredSendBlocked: under `EncryptionModeRequired` an
-	// application send was refused, or has been waiting past `TlsTimeout`,
-	// because the peer session is not established. Fired once per session
-	// until the session seals.
+	// EncryptionEventRequiredSendBlocked: under `EncryptionModeRequired`, or
+	// for a peer `EncryptionSettings.StickyRequired` holds, an application send
+	// was refused, or has been waiting past `TlsTimeout`, because the peer
+	// session is not established. Fired once per session until the session
+	// seals.
 	EncryptionEventRequiredSendBlocked
-	// EncryptionEventRequiredReceiveDiscarded: under `EncryptionModeRequired`
-	// inbound plaintext application frames from the peer were discarded by
-	// the receive gate. Fired once per session until the session seals.
+	// EncryptionEventRequiredReceiveDiscarded: under `EncryptionModeRequired`,
+	// or for a peer `EncryptionSettings.StickyRequired` holds, inbound plaintext
+	// application frames from the peer were discarded by the receive gate. Fired
+	// once per session until the session seals.
 	EncryptionEventRequiredReceiveDiscarded
 	// EncryptionEventKeyIdentityRejected: the peer's contract-supplied
 	// identity key was contradicted by signed evidence, or the signed
@@ -605,6 +611,32 @@ type EncryptionSettings struct {
 	// answers, or a relay that drops the handshake, still gets plaintext once
 	// the hold ends.
 	OpportunisticEstablishHold time.Duration
+	// Ends the plaintext fallback, under EncryptionModeOpportunistic, for a peer
+	// that has sealed. Once a session with the peer seals, the peer acts as under
+	// EncryptionModeRequired: an application send waits for a cipher or is
+	// refused, and a plaintext application pack from it is dropped and audited.
+	// Handshake frames, acks and no-session peers stay exempt, as Required
+	// exempts them. A peer that has not sealed keeps Opportunistic's plaintext,
+	// so a peer that never forms a session is still served.
+	//
+	// The latch belongs to the peer, not to a session (`stickyRequiredPeer`). A
+	// handshake reset does not clear it, so forcing one wins no plaintext, and
+	// neither does losing the session. It covers every session with the peer, so
+	// a reply on a companion or return contract, which can ride a session that
+	// never sealed, is held to it too. It runs to the signed deadline of the last
+	// contract a session sealed under, and with no deadline for as long as a
+	// session with the peer remains. A contract taken after that, with nothing
+	// sealed, starts as Opportunistic does: this binds a peer for a contract and
+	// does not pin it for good.
+	//
+	// The cost is Required's, for the life of the latch: a peer that stops
+	// sealing carries no application traffic until the deadline, and plaintext
+	// the peer sent before it sealed, still in flight when this side seals, is
+	// acknowledged and discarded. The signed-identity gate stays Required's alone
+	// (`keyHistoryRequiredWithLock`).
+	//
+	// False, the default, changes nothing. It has no effect in the other modes.
+	StickyRequired bool
 	// TLS config used when local is in the TLS-client role for a peer.
 	// When nil, a permissive default with InsecureSkipVerify is used.
 	ClientTlsConfig *tls.Config
@@ -996,6 +1028,51 @@ type tlsHandshakeEpoch struct {
 	serverFlightSent bool
 }
 
+// Stands for a contract with no signed deadline, or a seal under no contract.
+const stickyRequiredNoDeadline = math.MaxUint64
+
+// One peer's `EncryptionSettings.StickyRequired` latch. No session can hold it:
+// sessions are keyed by (peer, companion, role), so a reply can ride a session
+// that never sealed, and a session is reaped when idle while the contract it
+// sealed under stays open. The manager keeps one per peer and hands it to each of
+// the peer's sessions. A handshake reset touches neither field. Safe for concurrent
+// use; the gates read it without a lock.
+type stickyRequiredPeer struct {
+	// The latest deadline among the contracts the peer's sequences have taken, in
+	// Unix milliseconds: how far a seal reaches. Zero before the first contract.
+	contractDeadline atomic.Uint64
+	// When the latch ends, in Unix milliseconds. Zero until a session seals.
+	latchedUntil atomic.Uint64
+}
+
+// Whether the peer acts as under `EncryptionModeRequired` now.
+func (self *stickyRequiredPeer) latched() bool {
+	until := self.latchedUntil.Load()
+	return until != 0 && uint64(time.Now().UnixMilli()) < until
+}
+
+// Runs the latch to the peer's newest contract when a session seals.
+func (self *stickyRequiredPeer) seal() {
+	deadline := self.contractDeadline.Load()
+	if deadline == 0 {
+		deadline = stickyRequiredNoDeadline
+	}
+	updateAtomicMaximum(&self.latchedUntil, deadline)
+}
+
+// Whether no deadline holds the latch past the peer's sessions: it never set, has
+// run out, or has no deadline and so lasts only as long as they do.
+func (self *stickyRequiredPeer) ended() bool {
+	until := self.latchedUntil.Load()
+	return until == stickyRequiredNoDeadline || until <= uint64(time.Now().UnixMilli())
+}
+
+// Starts the latch over for a peer with no sessions left.
+func (self *stickyRequiredPeer) clear() {
+	self.contractDeadline.Store(0)
+	self.latchedUntil.Store(0)
+}
+
 // peerEncryptionSession owns the TLS state machine and derived AEAD for a
 // single peer/stream pair. It is shared by every local SendSequence and
 // ReceiveSequence that talks to the same peer/stream. The session lives
@@ -1124,6 +1201,9 @@ type peerEncryptionSession struct {
 	// sealed, an establishment attempt failed, or the deadline passed), so
 	// every later send skips stateLock.
 	establishHoldEnded atomic.Bool
+	// The peer's latch, shared with its other sessions; nil without
+	// `EncryptionSettings.StickyRequired`. Set before the session is published.
+	stickyRequired *stickyRequiredPeer
 
 	// out-of-band identity fetch pacing (see
 	// maybeFetchPeerClientPublicKeyForIdentity). Guarded by stateLock.
@@ -2663,13 +2743,37 @@ func (self *peerEncryptionSession) optimisticallyDeliverHandshakeForEpoch(payloa
 	e.transport.Deliver(payload)
 }
 
-// RequireEncryption reports whether this session runs in
-// `EncryptionModeRequired`. When true, the send path must not fall back to
-// plaintext for application data (see `SendSequence.Pack` and
-// `writeMaybeWrappedBytes`): a nil cipher means "wait or refuse", not "send in
-// the clear".
+// Whether this session runs in `EncryptionModeRequired`, or its peer is latched by
+// `EncryptionSettings.StickyRequired`. Every gate reads the policy here. When
+// true, the send path must not fall back to plaintext for application data (see
+// `SendSequence.Pack` and `writeMaybeWrappedBytes`), a nil cipher meaning "wait or
+// refuse", not "send in the clear", and the receive gate refuses plaintext
+// application frames.
 func (self *peerEncryptionSession) RequireEncryption() bool {
-	return self.settings != nil && self.settings.Mode == EncryptionModeRequired
+	if self.settings != nil && self.settings.Mode == EncryptionModeRequired {
+		return true
+	}
+	return self.stickyRequired != nil && self.stickyRequired.latched()
+}
+
+// Tells the latch that a sequence of this session took a contract: a seal reaches
+// it, and if this session is sealed now the latch does. A contract taken unsealed
+// waits for a seal, so a peer that has stopped sealing cannot stretch the latch by
+// rotating contracts. Called off the packet path, once per contract.
+func (self *peerEncryptionSession) observeContract(contract *sequenceContract) {
+	if self.stickyRequired == nil {
+		return
+	}
+	deadline := uint64(stickyRequiredNoDeadline)
+	if contract.expirationTimeUnixMilli != nil {
+		deadline = uint64(max(0, *contract.expirationTimeUnixMilli))
+	}
+	updateAtomicMaximum(&self.stickyRequired.contractDeadline, deadline)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.establishedEpoch != nil {
+		updateAtomicMaximum(&self.stickyRequired.latchedUntil, deadline)
+	}
 }
 
 // Returns the compatibility retry floor for failed initial handshakes with
@@ -2951,6 +3055,9 @@ func (self *peerEncryptionSession) markEstablishedWithLock(e *tlsHandshakeEpoch)
 	}
 	self.priorEstablishedEpoch = self.establishedEpoch
 	self.establishedEpoch = e
+	if self.stickyRequired != nil {
+		self.stickyRequired.seal()
+	}
 	self.clearInitialHandshakeFailureWithLock()
 	self.notifyRequiredCipherChangedWithLock()
 }
@@ -3352,7 +3459,13 @@ type EncryptionSessionManager struct {
 	stateLock sync.Mutex
 	closed    bool
 	sessions  map[sessionKey]*peerEncryptionSession
-	workers   *lifecycleAdmission
+	// `EncryptionSettings.StickyRequired` latches by peer, kept past the peer's
+	// sessions until their contracts end. Empty without the setting.
+	stickyRequiredPeers map[Id]*stickyRequiredPeer
+	// The size at which the next new peer sweeps the latches. Doubling it keeps
+	// the sweep amortized constant per peer and the map within twice what is live.
+	stickyRequiredSweepCount int
+	workers                  *lifecycleAdmission
 	// Nil test barrier pauses a publisher or session supervisor after cleanup
 	// and before joined completion.
 	beforeWorkerDoneForTest func(string)
@@ -3374,6 +3487,8 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 		settings:         settings,
 		sessions:         map[sessionKey]*peerEncryptionSession{},
 		workers:          newLifecycleAdmission(),
+
+		stickyRequiredPeers: map[Id]*stickyRequiredPeer{},
 
 		peerIdentityChangeCallbacks: NewCallbackList[func()](),
 		encryptionEventCallbacks:    NewCallbackList[func(*EncryptionEvent)](),
@@ -3624,14 +3739,32 @@ func (self *EncryptionSessionManager) Settings() *EncryptionSettings {
 	return self.settings
 }
 
-// RequireEncryption reports whether the manager runs in
-// `EncryptionModeRequired`, i.e. application data must never flow in plaintext
-// to or from a peer for which a session is expected. The send and receive
-// fail-closed gates consult this; peers exempted by SendNoSession /
+// Whether the manager runs in `EncryptionModeRequired`, i.e. application data must
+// never flow in plaintext to or from any peer for which a session is expected. It
+// says nothing of one peer: RequireEncryptionForPeer does, and the gates read
+// `peerEncryptionSession.RequireEncryption`. Peers exempted by SendNoSession /
 // ReceiveNoSession (control-plane, self) are unaffected because no session is
 // expected for them.
 func (self *EncryptionSessionManager) RequireEncryption() bool {
 	return self.settings != nil && self.settings.Mode == EncryptionModeRequired
+}
+
+// Whether application data with this peer must not flow in plaintext: the manager
+// runs in `EncryptionModeRequired`, or `EncryptionSettings.StickyRequired` holds
+// the peer.
+func (self *EncryptionSessionManager) RequireEncryptionForPeer(peerId Id) bool {
+	if self.RequireEncryption() {
+		return true
+	}
+	if !self.settings.StickyRequired {
+		return false
+	}
+	sticky := func() *stickyRequiredPeer {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.stickyRequiredPeers[peerId]
+	}()
+	return sticky != nil && sticky.latched()
 }
 
 // ServesPostQuantumEncryption reports whether this manager answers a peer that
@@ -3798,6 +3931,7 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 		return s
 	}
 	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
+	s.stickyRequired = self.stickyRequiredPeerWithLock(peerId)
 	if !self.workers.start() {
 		s.close()
 		return nil
@@ -3825,6 +3959,51 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 		}
 	}()
 	return s
+}
+
+// The latch for a session of this peer about to be registered, nil without
+// `EncryptionSettings.StickyRequired`. A latch nothing holds any longer starts
+// over here, which is the only place a peer's next traffic can meet it. Caller
+// holds stateLock.
+func (self *EncryptionSessionManager) stickyRequiredPeerWithLock(peerId Id) *stickyRequiredPeer {
+	if !self.settings.StickyRequired || self.settings.Mode != EncryptionModeOpportunistic {
+		return nil
+	}
+	sticky, ok := self.stickyRequiredPeers[peerId]
+	if !ok {
+		self.sweepStickyRequiredPeersWithLock()
+		sticky = &stickyRequiredPeer{}
+		self.stickyRequiredPeers[peerId] = sticky
+	} else if sticky.ended() && !self.hasSessionWithLock(peerId) {
+		sticky.clear()
+	}
+	return sticky
+}
+
+// Forgets the latches nothing holds any longer, once the map has doubled since the
+// last sweep. Caller holds stateLock.
+func (self *EncryptionSessionManager) sweepStickyRequiredPeersWithLock() {
+	if len(self.stickyRequiredPeers) < self.stickyRequiredSweepCount {
+		return
+	}
+	for peerId, sticky := range self.stickyRequiredPeers {
+		if sticky.ended() && !self.hasSessionWithLock(peerId) {
+			delete(self.stickyRequiredPeers, peerId)
+		}
+	}
+	self.stickyRequiredSweepCount = 2 * len(self.stickyRequiredPeers)
+}
+
+// Whether any of the peer's sessions is registered. Caller holds stateLock.
+func (self *EncryptionSessionManager) hasSessionWithLock(peerId Id) bool {
+	for _, role := range []sequenceTlsRole{sequenceTlsRoleClient, sequenceTlsRoleServer} {
+		for _, companion := range []bool{false, true} {
+			if _, ok := self.sessions[sessionKey{peerId: peerId, companion: companion, role: role}]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Lookup returns the existing (peerId, companion, role) session without
@@ -4497,6 +4676,9 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 //     plaintext; the handshake controls lead the recovery and application
 //     flow resumes sealed under the fresh epoch. A forged nack costs a
 //     rate-limited re-handshake, never a downgrade.
+//   - Opportunistic with `EncryptionSettings.StickyRequired`: this session's
+//     peer has sealed, so it is latched and the Required case holds. The nack
+//     wins no plaintext.
 //
 // Restarting the handshake WITHOUT demoting cannot work here: rekey
 // continuity would keep sealing the backlog under the dead epoch, the

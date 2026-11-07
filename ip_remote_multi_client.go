@@ -17365,15 +17365,19 @@ func rejectCandidateMissingEncryptionKey(mode EncryptionMode, publicKey []byte, 
 }
 
 // requiresEncryption reports whether the channel's client runs
-// `EncryptionModeRequired`, where an application send waits, within its own
-// timeout, for the session's cipher. False for a bare fixture without an
+// `EncryptionModeRequired`, or holds the channel's destination to it with
+// `EncryptionSettings.StickyRequired`, where an application send waits, within its
+// own timeout, for the session's cipher. False for a bare fixture without an
 // underlying client.
 func (self *multiClientChannel) requiresEncryption() bool {
 	if self.client == nil {
 		return false
 	}
-	settings := self.client.EncryptionSessionManager().Settings()
-	return settings != nil && settings.Mode == EncryptionModeRequired
+	manager := self.client.EncryptionSessionManager()
+	if self.args == nil || self.args.Destination.Len() == 0 {
+		return manager.RequireEncryption()
+	}
+	return manager.RequireEncryptionForPeer(self.args.Destination.Tail())
 }
 
 // EncryptionCapabilityFetcher returns a one-shot fetcher for the channel
