@@ -132,10 +132,6 @@ type peerWindowContract struct {
 	grantByteCount          ByteCount
 	expirationTimeUnixMilli *int64
 	window                  *peerWindow
-	// Whether this client took it into use or saw a frame on it. A contract
-	// that only waited in a queue never reached the peer, so it is never
-	// first and takes no share of the report.
-	ridden bool
 	// what withheld reports counted
 	reportedByteCount ByteCount
 	// The running count of the sequence holding it, nil when none does. Its
@@ -172,45 +168,44 @@ type peerWindow struct {
 	reported bool
 }
 
-// The window's contracts in report order: those a frame rode, earliest created
-// first, then the others. Contract ids are platform-minted ULIDs, so id order is
-// creation order and both clients of a pair read the same one. Two clients that
-// hold different sets can name different firsts, and each contract then carries
-// the floor from one client and zero from the other. Settling those costs at most
-// the window's debit, and it exposes nothing and charges nothing twice.
-func (self *peerWindow) orderedContracts() []*peerWindowContract {
-	contracts := make([]*peerWindowContract, 0, len(self.contracts))
-	for _, contract := range self.contracts {
-		contracts = append(contracts, contract)
+// One final report per contract, and the count they came from. The window's first
+// is the lowest contract id among the contracts that carried a frame by this
+// client's count: `windowReportByteCount` of the window's count goes on it, what
+// passes its grant goes on the next in id order, each capped by its grant, and the
+// rest report zero. A contract no frame rode reports zero, since its peer may never
+// have heard of it.
+//
+// Contract ids are platform-minted ULIDs, so id order is creation order and both
+// clients of a pair read the same one. Two clients that hold different sets can
+// still name different firsts, and each contract then carries the floor from one
+// client and zero from the other. Settling those costs at most the window's debit,
+// and it exposes nothing and charges nothing twice.
+func (self *peerWindow) reports() ([]peerWindowReport, ByteCount) {
+	// read once: a live sequence keeps moving them
+	contractByteCounts := make(map[Id]ByteCount, len(self.contracts))
+	contractIds := make([]Id, 0, len(self.contracts))
+	byteCount := ByteCount(0)
+	for contractId, contract := range self.contracts {
+		contractByteCounts[contractId] = contract.countedByteCount()
+		contractIds = append(contractIds, contractId)
+		byteCount += contractByteCounts[contractId]
 	}
-	slices.SortFunc(contracts, func(a *peerWindowContract, b *peerWindowContract) int {
-		if a.ridden != b.ridden {
-			if a.ridden {
+	slices.SortFunc(contractIds, func(a Id, b Id) int {
+		aRode, bRode := 0 < contractByteCounts[a], 0 < contractByteCounts[b]
+		if aRode != bRode {
+			if aRode {
 				return -1
 			}
 			return 1
 		}
-		return a.contractId.Cmp(b.contractId)
+		return a.Cmp(b)
 	})
-	return contracts
-}
-
-// One final report: `windowReportByteCount` of the window's count on the first
-// contract, what passes its grant on the next, each capped by its grant, and
-// zero on the rest. A contract no frame rode takes no share: its peer never heard
-// of it.
-func (self *peerWindow) reports() ([]peerWindowReport, ByteCount) {
-	contracts := self.orderedContracts()
-	byteCount := ByteCount(0)
-	for _, contract := range contracts {
-		byteCount += contract.countedByteCount()
-	}
-	reports := make([]peerWindowReport, 0, len(contracts))
+	reports := make([]peerWindowReport, 0, len(contractIds))
 	remainingByteCount := windowReportByteCount(byteCount)
-	for _, contract := range contracts {
-		report := peerWindowReport{contractId: contract.contractId}
-		if contract.ridden {
-			report.byteCount = min(remainingByteCount, contract.grantByteCount)
+	for _, contractId := range contractIds {
+		report := peerWindowReport{contractId: contractId}
+		if 0 < contractByteCounts[contractId] {
+			report.byteCount = min(remainingByteCount, self.contracts[contractId].grantByteCount)
 			remainingByteCount -= report.byteCount
 		}
 		reports = append(reports, report)
@@ -451,10 +446,9 @@ func (self *peerWindowLedger) addContractWithLock(
 	return contract
 }
 
-// A frame rode the contract, so it can be first, and the earliest contract a
-// frame rode sets the window's end.
-func (self *peerWindowLedger) rideWithLock(contract *peerWindowContract) {
-	contract.ridden = true
+// A contract in use brings the window's end to its own signed deadline's margin,
+// so the earliest of them sets it.
+func (self *peerWindowLedger) boundWindowEndWithLock(contract *peerWindowContract) {
 	if contract.expirationTimeUnixMilli != nil {
 		contract.window.endTime = minTime(
 			contract.window.endTime,
@@ -548,7 +542,7 @@ func (self *peerWindowLedger) taken(
 		// queued inside a window
 		contract.holderCount = 1
 		if !contract.window.ended {
-			self.rideWithLock(contract)
+			self.boundWindowEndWithLock(contract)
 		}
 		return true
 	}
@@ -558,7 +552,7 @@ func (self *peerWindowLedger) taken(
 	}
 	contract := self.addContractWithLock(window, contractId, grantByteCount, expirationTimeUnixMilli)
 	contract.holderCount = 1
-	self.rideWithLock(contract)
+	self.boundWindowEndWithLock(contract)
 	return true
 }
 
@@ -605,7 +599,7 @@ func (self *peerWindowLedger) received(
 	contract := self.addContractWithLock(window, contractId, grantByteCount, expirationTimeUnixMilli)
 	contract.holderCount = 1
 	contract.live = live
-	self.rideWithLock(contract)
+	self.boundWindowEndWithLock(contract)
 	return true
 }
 

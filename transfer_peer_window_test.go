@@ -39,6 +39,13 @@ func newPeerWindowTestContract(createTime time.Time, entropy byte) peerWindowTes
 	}
 }
 
+// A sequence's running count.
+func newPeerWindowTestLive(byteCount ByteCount) *contractStatsEntry {
+	live := &contractStatsEntry{}
+	live.usedByteCount.Store(int64(byteCount))
+	return live
+}
+
 // A ledger with one marked peer on a fixed timeline.
 type peerWindowLedgerFixture struct {
 	t      *testing.T
@@ -61,9 +68,11 @@ func newPeerWindowLedgerFixture(t *testing.T) *peerWindowLedgerFixture {
 	return self
 }
 
+// A sequence takes the contract and opens it with a head, which counts.
 func (self *peerWindowLedgerFixture) take(contract peerWindowTestContract, now time.Time) {
 	self.t.Helper()
 	self.ledger.taken(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, now)
+	self.ledger.attachLive(contract.contractId, newPeerWindowTestLive(1))
 }
 
 func (self *peerWindowLedgerFixture) queue(contract peerWindowTestContract, now time.Time) {
@@ -71,9 +80,10 @@ func (self *peerWindowLedgerFixture) queue(contract peerWindowTestContract, now 
 	self.ledger.queued(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, now)
 }
 
+// A sequence registers the contract, with the head that brought it counted.
 func (self *peerWindowLedgerFixture) receive(contract peerWindowTestContract, now time.Time) bool {
 	self.t.Helper()
-	return self.ledger.received(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, &contractStatsEntry{}, false, now)
+	return self.ledger.received(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), false, now)
 }
 
 // The holder closes the contract with this count, and the ledger must keep it.
@@ -283,6 +293,36 @@ func TestPeerWindowQueuedContractIsNeverFirst(t *testing.T) {
 	)
 }
 
+// A contract a sequence took and gave up before a frame rode it counts nothing,
+// so its peer may never have heard of it. It is never first, whatever its id, and
+// the first is the lowest id that carried a frame by this client's count.
+func TestPeerWindowContractNoFrameRodeIsNeverFirst(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	unused := newPeerWindowTestContract(f.start, 1)
+	first := newPeerWindowTestContract(f.start.Add(time.Second), 2)
+	second := newPeerWindowTestContract(f.start.Add(2*time.Second), 3)
+	f.take(unused, f.start)
+	f.take(second, f.start.Add(2*time.Second))
+	f.take(first, f.start.Add(2*time.Second))
+	f.close(unused, 0)
+	f.close(first, 1)
+	f.close(second, 1)
+	requirePeerWindowReports(t, f.end(f.start.Add(55*time.Minute)),
+		peerWindowReport{contractId: first.contractId, byteCount: peerWindowFloorByteCount},
+		peerWindowReport{contractId: second.contractId},
+		peerWindowReport{contractId: unused.contractId},
+	)
+}
+
+// A window no frame rode has no first, so it reports nothing on any contract.
+func TestPeerWindowWithNoFrameReportsZero(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	unused := newPeerWindowTestContract(f.start, 1)
+	f.take(unused, f.start)
+	f.close(unused, 0)
+	requirePeerWindowReports(t, f.end(f.start.Add(55*time.Minute)), peerWindowReport{contractId: unused.contractId})
+}
+
 // A contract result can repeat after its contract was taken, and what the ledger
 // holds of it stands.
 func TestPeerWindowRepeatedQueueResultKeepsTheCount(t *testing.T) {
@@ -339,7 +379,7 @@ func TestPeerWindowUnmarkedPeerStaysOut(t *testing.T) {
 	if f.ledger.taken(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, f.start) {
 		t.Fatal("a contract to an unmarked peer joined a window")
 	}
-	if f.ledger.received(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, &contractStatsEntry{}, false, f.start) {
+	if f.ledger.received(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), false, f.start) {
 		t.Fatal("a contract from an unmarked peer joined a window")
 	}
 	if f.ledger.withhold(contract.contractId, 1) {
@@ -532,8 +572,7 @@ func TestPeerWindowReceiveContractBeforeTheMarkStaysOut(t *testing.T) {
 func TestPeerWindowAdoptedContractOpensTheWindow(t *testing.T) {
 	f := newPeerWindowLedgerFixture(t)
 	contract := newPeerWindowTestContract(f.start.Add(-10*time.Minute), 1)
-	live := &contractStatsEntry{}
-	live.usedByteCount.Store(512)
+	live := newPeerWindowTestLive(512)
 	if !f.ledger.received(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, true, f.start) {
 		t.Fatal("the marking frame's contract was not adopted")
 	}
