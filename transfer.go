@@ -11932,6 +11932,7 @@ func (self *SendSequence) setContract(
 		nextSendContract.path,
 		nextSendContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowSendContract(nextSendContract)
 	// The contract carries the destination's `ProvideTlsCertificate`
 	// commitment (possibly empty). Fold the chain into the session's
 	// trusted-peer-cert set so the peer's TLS-handshake cert can be matched
@@ -16009,8 +16010,11 @@ type ReceiveSequence struct {
 
 	receiveBufferSettings *ReceiveBufferSettings
 
-	openReceiveContracts      map[Id]*sequenceContract
-	receiveContract           *sequenceContract
+	openReceiveContracts map[Id]*sequenceContract
+	receiveContract      *sequenceContract
+	// `receiveContract`, for a reader off the sequence goroutine. Written after
+	// the contract's stats entry, which that reader takes with it.
+	publishedContract         atomic.Pointer[sequenceContract]
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
 	// the owning buffer's index of open contracts by holding sequence; nil
@@ -18577,6 +18581,7 @@ func (self *ReceiveSequence) registerContractAhead(
 		aheadReceiveContract.path,
 		aheadReceiveContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowReceiveContract(aheadReceiveContract)
 	return nil
 }
 
@@ -18599,6 +18604,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		// switch to the current contract
 		superseded := self.receiveContract
 		self.receiveContract = receiveContract
+		self.publishedContract.Store(receiveContract)
 		self.updateContractWriterAlias()
 		// A contract announced ahead reaches this path rather than the one
 		// below, so the predecessor's stats close here too. Without this a
@@ -18645,6 +18651,8 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		nextReceiveContract.path,
 		nextReceiveContract.transferByteCount,
 	)
+	self.publishedContract.Store(nextReceiveContract)
+	self.client.ContractManager().notePeerWindowReceiveContract(nextReceiveContract)
 
 	if superseded != nil {
 		self.client.ContractManager().closeContractStats(superseded.contractId)
