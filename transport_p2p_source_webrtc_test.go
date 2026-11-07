@@ -25,6 +25,8 @@ type p2pSourceStream struct {
 	ready chan struct{}
 }
 
+// A no-contract client on close-wait settings, changed by each of `configure`
+// in order.
 func p2pSourceStreamClient(ctx context.Context, clientId Id, configure ...func(*ClientSettings)) *Client {
 	settings := closeWaitClientSettings()
 	for _, change := range configure {
@@ -33,6 +35,8 @@ func p2pSourceStreamClient(ctx context.Context, clientId Id, configure ...func(*
 	return NewClient(ctx, clientId, NewNoContractClientOob(), settings)
 }
 
+// A WebRTC manager for `clientId` that signals through the stream's in-memory
+// router and gathers loopback candidates only, with no ICE servers.
 func (self *p2pSourceStream) webRtcManager(clientId Id) *WebRtcManager {
 	settings := DefaultWebRtcSettings()
 	settings.Log = NewNoopLogger()
@@ -63,6 +67,8 @@ func (self *p2pSourceStream) streamManager(client *Client, webRtcManager *WebRtc
 	return NewStreamManager(self.ctx, client, webRtcManager, settings)
 }
 
+// Fails the test unless the stream is ready end to end within 30 seconds, and
+// at once if in-memory signaling fails.
 func (self *p2pSourceStream) requireReady() {
 	self.t.Helper()
 	select {
@@ -167,9 +173,10 @@ func p2pSourceSend(t *testing.T, client *Client, destinationId Id, content strin
 	}
 }
 
+// The source-rule fixture's delivery record, for a client that is reached
+// over a real association instead of an injected route.
 type p2pSourceRecorder struct {
 	*sourceRuleFixture
-	drops chan struct{}
 }
 
 // The real client under test, with no route but the association.
@@ -185,6 +192,9 @@ func newP2pSourceRecorder(t *testing.T, client *Client) *p2pSourceRecorder {
 	return self
 }
 
+// A settings change that signals `drops` each time `P2pPeerSourceOnly`
+// refuses a frame. The signal blocks the receive loop until `drops` has room,
+// so give it room for every refusal the test expects.
 func p2pSourceDropSignal(drops chan struct{}) func(*ClientSettings) {
 	return func(settings *ClientSettings) {
 		settings.afterP2pSourceDropForTest = func() {

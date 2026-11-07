@@ -32,6 +32,7 @@ type sourceRuleSequence struct {
 	sequenceNumber uint64
 }
 
+// A new sequence of `sourceId`, numbered from the start.
 func newSourceRuleSequence(sourceId Id) *sourceRuleSequence {
 	return &sourceRuleSequence{sourceId: sourceId, sequenceId: NewId()}
 }
@@ -44,6 +45,8 @@ type sourceRuleFixture struct {
 	deliveries chan sourceRuleDelivery
 }
 
+// Close-wait settings with 30-second ack and gap timeouts, as long as the
+// fixture's waits, so neither end of a sequence gives up while a test waits.
 func sourceRuleClientSettings() *ClientSettings {
 	settings := closeWaitClientSettings()
 	settings.SendBufferSettings.AckTimeout = 30 * time.Second
@@ -91,6 +94,7 @@ func (self *sourceRuleFixture) receive(source TransferPath, frames []*protocol.F
 	}
 }
 
+// A simple message frame carrying `content`.
 func sourceRuleSimpleFrame(content string) *protocol.Frame {
 	return RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: content})
 }
@@ -131,6 +135,8 @@ func (self *sourceRuleFixture) inject(sequence *sourceRuleSequence, frames ...*p
 	}
 }
 
+// Returns the next delivery, failing the test unless it carries `content` and
+// arrives within 30 seconds.
 func (self *sourceRuleFixture) requireDelivery(content string) sourceRuleDelivery {
 	self.t.Helper()
 	select {
@@ -156,34 +162,39 @@ func (self *sourceRuleFixture) fence(sequence *sourceRuleSequence) sourceRuleDel
 
 // What a listener of one id received, by the listener's name.
 type subprotocolSourceReceipts struct {
-	stateLock sync.Mutex
-	listeners map[string][]subprotocolSourceReceipt
+	stateLock        sync.Mutex
+	listenerReceipts map[string][]subprotocolSourceReceipt
 }
 
+// One message a listener received, with the source and Peer it came with.
 type subprotocolSourceReceipt struct {
 	source  TransferPath
 	payload string
 	peer    Peer
 }
 
+// Receipts with nothing received yet.
 func newSubprotocolSourceReceipts() *subprotocolSourceReceipts {
-	return &subprotocolSourceReceipts{listeners: map[string][]subprotocolSourceReceipt{}}
+	return &subprotocolSourceReceipts{listenerReceipts: map[string][]subprotocolSourceReceipt{}}
 }
 
+// Adds one message to the named listener's receipts. Safe to call from the
+// receive goroutine while the test reads.
 func (self *subprotocolSourceReceipts) record(listener string, source TransferPath, payload []byte, peer Peer) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.listeners[listener] = append(self.listeners[listener], subprotocolSourceReceipt{
+	self.listenerReceipts[listener] = append(self.listenerReceipts[listener], subprotocolSourceReceipt{
 		source:  source,
 		payload: string(payload),
 		peer:    peer,
 	})
 }
 
+// A copy of what the named listener has received so far.
 func (self *subprotocolSourceReceipts) get(listener string) []subprotocolSourceReceipt {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return append([]subprotocolSourceReceipt(nil), self.listeners[listener]...)
+	return append([]subprotocolSourceReceipt(nil), self.listenerReceipts[listener]...)
 }
 
 // An id with a raw listener and a typed handler, each with the given options.
@@ -366,7 +377,10 @@ func TestSubprotocolPeerFramesReachEveryListener(t *testing.T) {
 	for _, c := range []struct {
 		receipts *subprotocolSourceReceipts
 		payload  string
-	}{{opted, "a"}, {unopted, "b"}} {
+	}{
+		{receipts: opted, payload: "a"},
+		{receipts: unopted, payload: "b"},
+	} {
 		for _, listener := range []string{"raw", "typed"} {
 			received := c.receipts.get(listener)
 			if len(received) != 1 || received[0].payload != c.payload || received[0].source.SourceId != peerId {
