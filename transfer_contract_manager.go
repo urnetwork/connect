@@ -631,6 +631,11 @@ type ContractManager struct {
 	peerWindows atomic.Pointer[peerWindowLedger]
 	// Wakes the worker that ends windows, to look at the ledger again.
 	peerWindowWake chan struct{}
+	// Listeners for each window's opening, and what wakes their worker.
+	peerWindowCallbacks    *CallbackList[PeerWindowFunction]
+	peerWindowCallbackWake chan struct{}
+	// Protected by mutex.
+	peerWindowCallbacksStarted bool
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -743,6 +748,8 @@ func NewContractManager(
 		destinationContracts:            map[ContractKey]*contractQueue{},
 		contractExpiryWake:              make(chan struct{}, 1),
 		peerWindowWake:                  make(chan struct{}, 1),
+		peerWindowCallbacks:             NewCallbackList[PeerWindowFunction](),
+		peerWindowCallbackWake:          make(chan struct{}, 1),
 		receiveNoContractClientIds:      receiveNoContractClientIds,
 		sendNoContractClientIds:         sendNoContractClientIds,
 		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
@@ -2969,6 +2976,21 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		// drop this contract. it has already been used locally
 	}
 	return nil
+}
+
+// Removes the queued contracts `match` picks and returns them.
+func (self *contractQueue) removeWhere(match func(contractId Id) bool) []*protocol.Contract {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+
+	contracts := []*protocol.Contract{}
+	for contractId, queued := range self.contracts {
+		if match(contractId) {
+			delete(self.contracts, contractId)
+			contracts = append(contracts, queued.contract)
+		}
+	}
+	return contracts
 }
 
 // Removes the listed contracts that are still queued and returns their ids.

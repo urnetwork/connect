@@ -84,10 +84,19 @@ func (self *peerWindowLedgerFixture) close(contract peerWindowTestContract, byte
 	}
 }
 
+// A pass at `now` with no sequence to move.
+func (self *peerWindowLedgerFixture) pass(now time.Time) []*peerWindowEnd {
+	self.t.Helper()
+	for _, move := range self.ledger.takeEnded(now) {
+		self.ledger.releaseMove(move.window, now)
+	}
+	return self.ledger.takeReports(now)
+}
+
 // The window that ends by `now`, which must be the only one.
 func (self *peerWindowLedgerFixture) end(now time.Time) *peerWindowEnd {
 	self.t.Helper()
-	ends := self.ledger.takeEnded(now)
+	ends := self.pass(now)
 	if len(ends) != 1 {
 		self.t.Fatalf("%d windows ended by %s, want 1", len(ends), now)
 	}
@@ -96,7 +105,7 @@ func (self *peerWindowLedgerFixture) end(now time.Time) *peerWindowEnd {
 
 func (self *peerWindowLedgerFixture) requireNoEnd(now time.Time) {
 	self.t.Helper()
-	if ends := self.ledger.takeEnded(now); len(ends) != 0 {
+	if ends := self.pass(now); len(ends) != 0 {
 		self.t.Fatalf("%d windows ended by %s, want none", len(ends), now)
 	}
 }
@@ -274,6 +283,30 @@ func TestPeerWindowQueuedContractIsNeverFirst(t *testing.T) {
 	)
 }
 
+// A contract result can repeat after its contract was taken, and what the ledger
+// holds of it stands.
+func TestPeerWindowRepeatedQueueResultKeepsTheCount(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	contract := newPeerWindowTestContract(f.start, 1)
+	f.take(contract, f.start)
+	f.close(contract, kib(300))
+	f.queue(contract, f.start.Add(time.Minute))
+	requirePeerWindowReports(t, f.end(f.start.Add(55*time.Minute)), peerWindowReport{
+		contractId: contract.contractId,
+		byteCount:  peerWindowFloorByteCount + peerWindowStepByteCount,
+	})
+}
+
+// With no listener a window's opening waits for one only as long as the window.
+func TestPeerWindowOpeningIsForgottenWithItsWindow(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	f.take(newPeerWindowTestContract(f.start, 1), f.start)
+	f.end(f.start.Add(55 * time.Minute))
+	if opened := f.ledger.takeOpened(); len(opened) != 0 {
+		t.Fatalf("a window that ended is still opening: %+v", opened)
+	}
+}
+
 // With no window open a queued contract stays out, so its take opens the window,
 // and until then its close goes out as it always has.
 func TestPeerWindowQueuedContractOpensNothing(t *testing.T) {
@@ -383,6 +416,7 @@ func TestPeerWindowContractAfterTheEndOpensTheNextWindow(t *testing.T) {
 	first := newPeerWindowTestContract(f.start, 1)
 	next := newPeerWindowTestContract(f.start.Add(56*time.Minute), 2)
 	f.take(first, f.start)
+	f.ledger.noteActivity(f.peerId, f.start.Add(54*time.Minute))
 	f.take(next, f.start.Add(56*time.Minute))
 	requirePeerWindowReports(t, f.end(f.start.Add(56*time.Minute)), peerWindowReport{
 		contractId: first.contractId,
@@ -412,6 +446,7 @@ func TestPeerWindowContractNearTheEndOpensTheNextWindowOnBothClients(t *testing.
 
 	sender.take(first, sender.start)
 	sender.close(first, 100)
+	sender.ledger.noteActivity(sender.peerId, sender.start.Add(54*time.Minute))
 	requirePeerWindowReports(t, sender.end(sender.start.Add(55*time.Minute)), peerWindowReport{
 		contractId: first.contractId,
 		byteCount:  peerWindowFloorByteCount,
@@ -420,6 +455,7 @@ func TestPeerWindowContractNearTheEndOpensTheNextWindowOnBothClients(t *testing.
 
 	receiver.receive(first, receiver.start)
 	receiver.close(first, 100)
+	receiver.ledger.noteActivity(receiver.peerId, receiver.start.Add(54*time.Minute))
 	receiver.receive(next, receiver.start.Add(55*time.Minute-90*time.Second))
 	requirePeerWindowReports(t, receiver.end(receiver.start.Add(55*time.Minute-90*time.Second)), peerWindowReport{
 		contractId: first.contractId,
@@ -600,6 +636,122 @@ func (self *closeSequencesHarness) newPeerWindowContract(sourceId Id) (Id, *prot
 		StoredContractHmac:  SignStoredContract(contractManager.settings, secret, storedContractBytes),
 		ProvideMode:         protocol.ProvideMode_Network,
 	})
+}
+
+// A send window's reports wait for its sequences' next contract, so the platform
+// sees that first. They go out at the take.
+func TestPeerWindowSendReportsWaitForTheTake(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	f.take(first, f.start)
+	f.ledger.noteActivity(f.peerId, f.start.Add(54*time.Minute))
+
+	end := f.start.Add(55 * time.Minute)
+	moves := f.ledger.takeEnded(end)
+	if len(moves) != 1 || !moves[0].take || moves[0].peerId != f.peerId {
+		t.Fatalf("moves = %+v, want one that takes", moves)
+	}
+	if f.ledger.holds(first.contractId) {
+		t.Fatal("the ended window still holds its contract")
+	}
+	if ends := f.ledger.takeReports(end); len(ends) != 0 {
+		t.Fatalf("the window reported before the take: %+v", ends[0])
+	}
+	if wait, open := f.ledger.nextWait(end); !open || wait != f.ledger.settings.MoveTimeout {
+		t.Fatalf("wait = %s (open=%t), want the move's timeout", wait, open)
+	}
+	// what the sequence charged on its way off is in the report
+	f.close(first, peerWindowFloorByteCount+1)
+
+	taken := end.Add(100 * time.Millisecond)
+	f.take(newPeerWindowTestContract(taken, 2), taken)
+	ends := f.ledger.takeReports(taken)
+	if len(ends) != 1 {
+		t.Fatalf("%d windows reported at the take", len(ends))
+	}
+	requirePeerWindowReports(t, ends[0], peerWindowReport{
+		contractId: first.contractId,
+		byteCount:  peerWindowFloorByteCount + peerWindowStepByteCount,
+	})
+}
+
+// With no take the reports wait out the timeout, and no longer.
+func TestPeerWindowSendReportsGoAtTheMoveTimeout(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	f.take(first, f.start)
+	f.ledger.noteActivity(f.peerId, f.start.Add(54*time.Minute))
+	end := f.start.Add(55 * time.Minute)
+	f.ledger.takeEnded(end)
+	timeout := end.Add(f.ledger.settings.MoveTimeout)
+	if ends := f.ledger.takeReports(timeout.Add(-time.Millisecond)); len(ends) != 0 {
+		t.Fatalf("the window reported early: %+v", ends[0])
+	}
+	if ends := f.ledger.takeReports(timeout); len(ends) != 1 {
+		t.Fatalf("%d windows reported at the timeout", len(ends))
+	}
+}
+
+// A receive window has nothing to move, and a window that clears the mode takes
+// nothing, so both report at their end.
+func TestPeerWindowReportsAtOnceWithNothingToWaitFor(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	f.receive(newPeerWindowTestContract(f.start, 1), f.start)
+	f.take(newPeerWindowTestContract(f.start, 2), f.start)
+	end := f.start.Add(55 * time.Minute)
+	moves := f.ledger.takeEnded(end)
+	if len(moves) != 1 || moves[0].take {
+		t.Fatalf("moves = %+v, want one that takes nothing", moves)
+	}
+	if ends := f.ledger.takeReports(end); len(ends) != 2 {
+		t.Fatalf("%d windows reported at their end, want both", len(ends))
+	}
+}
+
+// What clears the mode is the window's own last stretch, however late the client
+// runs: activity at its start holds the mode, and a moment before it does not.
+func TestPeerWindowActivityIsReadAgainstTheWindowsEnd(t *testing.T) {
+	end := time.UnixMilli(1_800_000_000_000).Add(55 * time.Minute)
+	cases := []struct {
+		activity   time.Duration
+		accounting bool
+	}{
+		{activity: -2 * time.Minute, accounting: true},
+		{activity: -2*time.Minute - time.Millisecond, accounting: false},
+		{activity: -time.Hour, accounting: false},
+		{activity: time.Hour, accounting: true},
+	}
+	for _, c := range cases {
+		f := newPeerWindowLedgerFixture(t)
+		f.take(newPeerWindowTestContract(f.start, 1), f.start)
+		f.ledger.noteActivity(f.peerId, end.Add(c.activity))
+		// a client that next runs three hours late
+		f.ledger.takeEnded(end.Add(3 * time.Hour))
+		if accounting := f.ledger.accounting(f.peerId); accounting != c.accounting {
+			t.Errorf("activity at %s left the mode %t, want %t", c.activity, accounting, c.accounting)
+		}
+	}
+}
+
+// The window a contract's take ended is done with, and the next one it opened keeps
+// the sequences already on it: a move leaves them there, and the mode holds whatever
+// the activity, since a contract was just taken.
+func TestPeerWindowContractNearTheEndKeepsItsPlaceThroughTheMove(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	near := newPeerWindowTestContract(f.start.Add(54*time.Minute), 2)
+	f.take(first, f.start)
+	f.take(near, f.start.Add(54*time.Minute))
+	if f.ledger.holds(first.contractId) || !f.ledger.holds(near.contractId) {
+		t.Fatal("the contract near the end did not take over from the window")
+	}
+	moves := f.ledger.takeEnded(f.start.Add(54 * time.Minute))
+	if len(moves) != 1 || !moves[0].take {
+		t.Fatalf("moves = %+v, want the other sequences moved at once", moves)
+	}
+	if ends := f.ledger.takeReports(f.start.Add(54 * time.Minute)); len(ends) != 1 {
+		t.Fatalf("%d windows reported, want the one ended, with no take to wait for", len(ends))
+	}
 }
 
 // A client with one marked peer, driven through its receive buffer.

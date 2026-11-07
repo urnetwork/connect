@@ -3,7 +3,7 @@
 //
 // While a peer is in the mode, its contracts are accounted per window instead of
 // per contract. A window is one direction's run of contracts: it opens with a
-// contract and ends 5 minutes before that contract's signed deadline. Every
+// contract and ends a margin before that contract's signed deadline. Every
 // report of a window's contracts, checkpoint or close, is withheld until the
 // window ends. The client then sends one final report per contract: the
 // window's count as `windowReportByteCount` shapes it on the first contract and
@@ -11,7 +11,13 @@
 // bytes moved nor, up to the floor, on how many there were.
 //
 // A contract held before the mark stays out of the ledger and reports exactly,
-// as it always has. A client without the mode has no ledger at all.
+// as it always has: the caller retires those (`RetirePeerContracts`) before its
+// next frame. At a window's end the pair's send sequences move off its contracts,
+// as they would at expiry, onto a new contract each, taken at once with its
+// successor requested then, so a later window opens at a window's end and not at
+// whatever frame comes next. The reports follow the move, so the contracts they
+// close are done with and the pair is never left without a contract. A client
+// without the mode has no ledger at all.
 //
 // `peerWindowLedger` holds the state and the rules. It reads no clock, does no
 // I/O and calls nothing, so a test can run it on any timeline. The contract
@@ -59,8 +65,19 @@ type PeerWindowSettings struct {
 	// ends a window by its own clock and a sender moves on at its own end, so
 	// this covers the two clocks' difference (the transfer margin's
 	// `ContractExpirationMargin` allows the same). The rule reads only signed
-	// values, so both clients of a pair decide it alike.
+	// values, so both clients of a pair decide it alike. Zero leaves it to a
+	// contract created past the end.
 	EndTolerance time.Duration
+	// A window that ends with no activity in this last stretch clears the mode
+	// instead of moving on, until the caller marks the peer again. The caller
+	// says what activity is (`NotePeerWindowActivity`), and marking counts.
+	// Non-positive never clears.
+	ActivityTimeout time.Duration
+	// How long a send window's reports wait for its sequences to take their
+	// next contract, which usually takes one control round trip. They go out at
+	// the first take, or at this at the latest, since a stalled control plane
+	// must not hold them. Non-positive sends them at the window's end.
+	MoveTimeout time.Duration
 	// The longest the worker waits between passes while a window is open. A
 	// timer stops with a suspended process, and this bounds how late a resumed
 	// client notices a window that ended meanwhile. Non-positive leaves only
@@ -68,11 +85,14 @@ type PeerWindowSettings struct {
 	CheckInterval time.Duration
 }
 
+// Windows of 55 minutes, on the platform's 60 minute contracts.
 func DefaultPeerWindowSettings() PeerWindowSettings {
 	return PeerWindowSettings{
 		WindowDuration:   55 * time.Minute,
 		ExpirationMargin: 5 * time.Minute,
 		EndTolerance:     2 * time.Minute,
+		ActivityTimeout:  2 * time.Minute,
+		MoveTimeout:      5 * time.Second,
 		CheckInterval:    1 * time.Minute,
 	}
 }
@@ -128,6 +148,7 @@ type peerWindowContract struct {
 	holderCount int
 }
 
+// What this client has counted on the contract, acked and unacked.
 func (self *peerWindowContract) countedByteCount() ByteCount {
 	byteCount := self.reportedByteCount
 	if self.live != nil {
@@ -136,6 +157,7 @@ func (self *peerWindowContract) countedByteCount() ByteCount {
 	return byteCount
 }
 
+// One direction's run of contracts with one peer.
 type peerWindow struct {
 	peerId    Id
 	direction PeerWindowDirection
@@ -144,6 +166,8 @@ type peerWindow struct {
 	contracts map[Id]*peerWindowContract
 	// no longer open: nothing joins it, and sequences leave its contracts
 	ended bool
+	// when its reports go out, once a pass has seen it end
+	reportTime time.Time
 	// its reports have been handed out
 	reported bool
 }
@@ -211,6 +235,7 @@ func peerWindowContractCreateTime(contractId Id) time.Time {
 	return time.UnixMilli(unixMilli)
 }
 
+// What a caller sees of the window.
 func (self *peerWindow) open() PeerWindow {
 	return PeerWindow{
 		PeerId:    self.peerId,
@@ -223,6 +248,8 @@ func (self *peerWindow) open() PeerWindow {
 // One peer's place in the ledger.
 type peerWindowPeer struct {
 	accounting bool
+	// the last activity the caller noted, and the mark
+	activityTime time.Time
 	// each direction's open window
 	windows [peerWindowDirectionCount]*peerWindow
 	// A receive contract created before this, by more than the tolerance, is
@@ -231,6 +258,7 @@ type peerWindowPeer struct {
 	receiveFloorTime time.Time
 }
 
+// Whether nothing keeps this peer in the ledger.
 func (self *peerWindowPeer) idle() bool {
 	return !self.accounting && self.windows[PeerWindowSend] == nil && self.windows[PeerWindowReceive] == nil
 }
@@ -239,6 +267,14 @@ func (self *peerWindowPeer) idle() bool {
 type peerWindowReport struct {
 	contractId Id
 	byteCount  ByteCount
+}
+
+// A send window that has ended, for the manager to move its sequences off it.
+type peerWindowMove struct {
+	window *peerWindow
+	peerId Id
+	// whether the mode holds, so each sequence takes a new contract at once
+	take bool
 }
 
 // A window that has ended and what it reports.
@@ -261,15 +297,27 @@ type peerWindowLedger struct {
 	// every contract of an open window, and of an ended one until its holders
 	// have reported
 	contracts map[Id]*peerWindowContract
-	// windows that have ended and have not reported
+	// windows that have ended and no pass has seen
 	endedWindows []*peerWindow
+	// windows a pass has seen, each to report at its `reportTime`
+	reportingWindows []*peerWindow
+	// the latest window opened each way per peer, until a callback has seen it
+	openedWindows map[peerWindowKey]*peerWindow
 }
 
+// One way of one peer.
+type peerWindowKey struct {
+	peerId    Id
+	direction PeerWindowDirection
+}
+
+// An empty ledger on `settings`.
 func newPeerWindowLedger(settings PeerWindowSettings) *peerWindowLedger {
 	return &peerWindowLedger{
-		settings:  settings,
-		peers:     map[Id]*peerWindowPeer{},
-		contracts: map[Id]*peerWindowContract{},
+		settings:      settings,
+		peers:         map[Id]*peerWindowPeer{},
+		contracts:     map[Id]*peerWindowContract{},
+		openedWindows: map[peerWindowKey]*peerWindow{},
 	}
 }
 
@@ -292,6 +340,7 @@ func (self *peerWindowLedger) setAccounting(peerId Id, accounting bool, now time
 	}
 	peer.accounting = accounting
 	if accounting {
+		peer.activityTime = now
 		peer.receiveFloorTime = now
 	}
 	if peer.idle() {
@@ -300,6 +349,17 @@ func (self *peerWindowLedger) setAccounting(peerId Id, accounting bool, now time
 	return true
 }
 
+// The caller saw this peer's traffic that keeps a window going.
+func (self *peerWindowLedger) noteActivity(peerId Id, now time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if peer := self.peers[peerId]; peer != nil {
+		peer.activityTime = now
+	}
+}
+
+// Whether the peer is in the mode.
 func (self *peerWindowLedger) accounting(peerId Id) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -308,6 +368,7 @@ func (self *peerWindowLedger) accounting(peerId Id) bool {
 	return peer != nil && peer.accounting
 }
 
+// The peer's mode and its open windows.
 func (self *peerWindowLedger) status(peerId Id) PeerWindowStatus {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -344,6 +405,7 @@ func (self *peerWindowLedger) currentWindowWithLock(
 	return window
 }
 
+// Closes the window to new contracts, for the next pass to see.
 func (self *peerWindowLedger) endWindowWithLock(peer *peerWindowPeer, window *peerWindow) {
 	peer.windows[window.direction] = nil
 	window.ended = true
@@ -353,6 +415,7 @@ func (self *peerWindowLedger) endWindowWithLock(peer *peerWindowPeer, window *pe
 	self.endedWindows = append(self.endedWindows, window)
 }
 
+// Opens a direction's window. The contract that opens it can bring its end nearer.
 func (self *peerWindowLedger) openWindowWithLock(
 	peerId Id,
 	peer *peerWindowPeer,
@@ -367,9 +430,11 @@ func (self *peerWindowLedger) openWindowWithLock(
 		contracts: map[Id]*peerWindowContract{},
 	}
 	peer.windows[direction] = window
+	self.openedWindows[peerWindowKey{peerId: peerId, direction: direction}] = window
 	return window
 }
 
+// Joins a contract to a window, and the ledger to the contract's reports.
 func (self *peerWindowLedger) addContractWithLock(
 	window *peerWindow,
 	contractId Id,
@@ -399,6 +464,7 @@ func (self *peerWindowLedger) rideWithLock(contract *peerWindowContract) {
 	}
 }
 
+// The earlier of two times.
 func minTime(a time.Time, b time.Time) time.Time {
 	if b.Before(a) {
 		return b
@@ -444,6 +510,10 @@ func (self *peerWindowLedger) queued(
 	if peer == nil {
 		return
 	}
+	if self.contracts[contractId] != nil {
+		// a repeated result: what the ledger counted of it stands
+		return
+	}
 	window := self.currentWindowWithLock(peer, PeerWindowSend, now)
 	if window == nil || window.opensNext(contractId, self.settings.EndTolerance) {
 		return
@@ -467,6 +537,14 @@ func (self *peerWindowLedger) taken(
 	if peer == nil {
 		return false
 	}
+	// the take a moving window's reports wait for
+	moved := false
+	for _, window := range self.reportingWindows {
+		if window.peerId == peerId && window.direction == PeerWindowSend && now.Before(window.reportTime) {
+			window.reportTime = now
+			moved = true
+		}
+	}
 	if contract := self.contracts[contractId]; contract != nil {
 		// queued inside a window
 		contract.holderCount = 1
@@ -477,7 +555,7 @@ func (self *peerWindowLedger) taken(
 	}
 	window := self.ridingWindowWithLock(peerId, peer, PeerWindowSend, contractId, now)
 	if window == nil {
-		return false
+		return moved
 	}
 	contract := self.addContractWithLock(window, contractId, grantByteCount, expirationTimeUnixMilli)
 	contract.holderCount = 1
@@ -580,10 +658,21 @@ func (self *peerWindowLedger) owns(contractId Id) bool {
 	return self.contracts[contractId] != nil
 }
 
-// Ends every window past its end and hands out the reports of all that have
-// ended. A client that could not run at a window's end gets them here when it
-// next runs.
-func (self *peerWindowLedger) takeEnded(now time.Time) []*peerWindowEnd {
+// Whether an open window holds this contract, so a sequence on it stays.
+func (self *peerWindowLedger) holds(contractId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	contract := self.contracts[contractId]
+	return contract != nil && !contract.window.ended
+}
+
+// Ends every window past its end, and returns the send windows whose sequences
+// have to leave. A window that saw no activity in its last stretch clears the
+// mode, unless a contract has already opened the next window. A client that could
+// not run at a window's end gets here when it next runs, and what clears the mode
+// is the window's own last stretch, not how late that is.
+func (self *peerWindowLedger) takeEnded(now time.Time) []peerWindowMove {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -592,14 +681,61 @@ func (self *peerWindowLedger) takeEnded(now time.Time) []*peerWindowEnd {
 			self.currentWindowWithLock(peer, PeerWindowDirection(direction), now)
 		}
 	}
-	ends := make([]*peerWindowEnd, 0, len(self.endedWindows))
+	moves := []peerWindowMove{}
 	for _, window := range self.endedWindows {
+		window.reportTime = now
+		peer := self.peers[window.peerId]
+		moved := peer != nil && peer.windows[window.direction] != nil
+		if peer != nil && peer.accounting && !moved && 0 < self.settings.ActivityTimeout &&
+			peer.activityTime.Before(minTime(window.endTime, now).Add(-self.settings.ActivityTimeout)) {
+			peer.accounting = false
+		}
+		self.reportingWindows = append(self.reportingWindows, window)
+		if window.direction != PeerWindowSend {
+			continue
+		}
+		take := peer != nil && peer.accounting
+		if take && !moved {
+			window.reportTime = now.Add(self.settings.MoveTimeout)
+		}
+		moves = append(moves, peerWindowMove{window: window, peerId: window.peerId, take: take})
+	}
+	self.endedWindows = nil
+	return moves
+}
+
+// No sequence holds the window's contracts, so no take is coming.
+func (self *peerWindowLedger) releaseMove(window *peerWindow, now time.Time) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	window.reportTime = minTime(window.reportTime, now)
+}
+
+// Hands out the reports that are due. The counts are read here, after the move,
+// so what the sequences charged on their way off the contracts is in them.
+func (self *peerWindowLedger) takeReports(now time.Time) []*peerWindowEnd {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	ends := []*peerWindowEnd{}
+	waitingWindows := []*peerWindow{}
+	for _, window := range self.reportingWindows {
+		if now.Before(window.reportTime) {
+			waitingWindows = append(waitingWindows, window)
+			continue
+		}
 		reports, byteCount := window.reports()
 		window.reported = true
 		for contractId, contract := range window.contracts {
 			if contract.holderCount == 0 {
 				delete(self.contracts, contractId)
 			}
+		}
+		// a listener has nothing to schedule from a window that is over
+		key := peerWindowKey{peerId: window.peerId, direction: window.direction}
+		if self.openedWindows[key] == window {
+			delete(self.openedWindows, key)
 		}
 		ends = append(ends, &peerWindowEnd{
 			peerId:    window.peerId,
@@ -611,8 +747,21 @@ func (self *peerWindowLedger) takeEnded(now time.Time) []*peerWindowEnd {
 			delete(self.peers, window.peerId)
 		}
 	}
-	self.endedWindows = nil
+	self.reportingWindows = waitingWindows
 	return ends
+}
+
+// The windows opened since the last look, each with the end it has now.
+func (self *peerWindowLedger) takeOpened() []PeerWindow {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	opened := make([]PeerWindow, 0, len(self.openedWindows))
+	for _, window := range self.openedWindows {
+		opened = append(opened, window.open())
+	}
+	clear(self.openedWindows)
+	return opened
 }
 
 // How long until a pass has something to do, and whether anything is open to
@@ -623,17 +772,22 @@ func (self *peerWindowLedger) nextWait(now time.Time) (time.Duration, bool) {
 
 	wait := time.Duration(0)
 	open := false
+	note := func(due time.Time) {
+		dueWait := max(0, due.Sub(now))
+		if !open || dueWait < wait {
+			wait = dueWait
+		}
+		open = true
+	}
 	for _, peer := range self.peers {
 		for _, window := range peer.windows {
-			if window == nil {
-				continue
+			if window != nil {
+				note(window.endTime)
 			}
-			windowWait := max(0, window.endTime.Sub(now))
-			if !open || windowWait < wait {
-				wait = windowWait
-			}
-			open = true
 		}
+	}
+	for _, window := range self.reportingWindows {
+		note(window.reportTime)
 	}
 	if open && 0 < self.settings.CheckInterval {
 		wait = min(wait, self.settings.CheckInterval)
@@ -646,9 +800,11 @@ func (self *peerWindowLedger) nextWait(now time.Time) (time.Duration, bool) {
 //
 // From the mark on, the first contract this client takes to the peer opens the
 // send window, and the first one it receives from the peer opens the receive
-// window. A caller that marks on receipt of a frame also calls
-// `AdoptPeerWindowContract`, since that frame rode a contract already held. Off
-// lets the windows already open run to their end, and their reports go out then.
+// window. A caller that gets true retires what it already holds
+// (`RetirePeerContracts`) before its next frame to the peer, and one that marks on
+// receipt of a frame also calls `AdoptPeerWindowContract`, since that frame rode a
+// contract already held. Off lets the windows already open run to their end, and
+// their reports go out then.
 func (self *ContractManager) SetPeerWindowAccounting(peerId Id, accounting bool) bool {
 	ledger := self.openPeerWindowLedger(accounting)
 	if ledger == nil {
@@ -668,6 +824,53 @@ func (self *ContractManager) PeerWindow(peerId Id) PeerWindowStatus {
 		return PeerWindowStatus{}
 	}
 	return ledger.status(peerId)
+}
+
+// Before this returns, every send sequence to the peer is committed to leave each
+// contract no open window holds, and the queued ones are gone, so the next frame
+// to the peer takes a new contract. Their reports go out at once, as they always
+// have: no frame of the mode rode them. A repeat retires nothing, since the
+// contracts in use by then are the window's.
+func (self *ContractManager) RetirePeerContracts(peerId Id) {
+	var contracts []*protocol.Contract
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		contracts = self.removeUnheldPeerContractsWithLock(peerId)
+	}()
+	self.closeContracts(contracts)
+	self.client.sendBuffer.movePeerContracts(peerId, false)
+}
+
+// Notes this peer's traffic that keeps its window going. A window that ends with
+// none in its last stretch clears the mode (`ActivityTimeout`). Connect does not
+// read what its callers send, so they say.
+func (self *ContractManager) NotePeerWindowActivity(peerId Id) {
+	if ledger := self.peerWindows.Load(); ledger != nil {
+		ledger.noteActivity(peerId, time.Now())
+	}
+}
+
+// Receives each window as it opens.
+type PeerWindowFunction = func(window PeerWindow)
+
+// Adds a listener for each window's opening, for a caller that keeps a schedule
+// from a window's start. Called off the packet paths, one window at a time, and a
+// listener that blocks delays only other listeners: a slow one sees the latest
+// window of each peer and direction. Returns its removal.
+func (self *ContractManager) AddPeerWindowCallback(callback PeerWindowFunction) func() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed {
+		return func() {}
+	}
+	if !self.peerWindowCallbacksStarted {
+		self.peerWindowCallbacksStarted = self.startWorker("peer window callbacks", self.runPeerWindowCallbacks)
+	}
+	callbackId := self.peerWindowCallbacks.Add(callback)
+	return func() {
+		self.peerWindowCallbacks.Remove(callbackId)
+	}
 }
 
 // Joins the contract the peer's last frame on `transferKey` rode to the receive
@@ -717,15 +920,42 @@ func (self *ContractManager) openPeerWindowLedger(create bool) *peerWindowLedger
 	return ledger
 }
 
-// Wakes the worker to look again. Never blocks.
+// Wakes the workers to look again. Never blocks.
 func (self *ContractManager) wakePeerWindows() {
 	select {
 	case self.peerWindowWake <- struct{}{}:
 	default:
 	}
+	select {
+	case self.peerWindowCallbackWake <- struct{}{}:
+	default:
+	}
 }
 
-// Reports each window as it ends. A client that closes with a window open sends
+// Delivers window openings, apart from the worker that ends windows, so no
+// listener holds a window's reports.
+func (self *ContractManager) runPeerWindowCallbacks() {
+	for {
+		if ledger := self.peerWindows.Load(); ledger != nil {
+			for _, window := range ledger.takeOpened() {
+				for _, callback := range self.peerWindowCallbacks.Get() {
+					HandleError(func() {
+						callback(window)
+					})
+				}
+			}
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.client.Done():
+			return
+		case <-self.peerWindowCallbackWake:
+		}
+	}
+}
+
+// Ends and reports each window. A client that closes with a window open sends
 // nothing for it: the mode reports only at a window's end, and the platform's
 // deadline close settles such a contract from what the other party reported.
 func (self *ContractManager) runPeerWindows() {
@@ -749,10 +979,28 @@ func (self *ContractManager) runPeerWindows() {
 	}
 }
 
-// Sends the reports of every window that has ended, each through the same close
-// path as any other report, so each keeps its own report id and retry.
+// One pass over the windows. Ending a window and emptying its peer's queues is one
+// step under the mutex that a take also holds, so no sequence can take a contract
+// of a window that has ended. Each report then goes through the same close path as
+// any other, so it keeps its own report id and retry.
 func (self *ContractManager) reportPeerWindows(ledger *peerWindowLedger, now time.Time) {
-	for _, end := range ledger.takeEnded(now) {
+	var moves []peerWindowMove
+	var contracts []*protocol.Contract
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		moves = ledger.takeEnded(now)
+		for _, move := range moves {
+			contracts = append(contracts, self.removeUnheldPeerContractsWithLock(move.peerId)...)
+		}
+	}()
+	self.closeContracts(contracts)
+	for _, move := range moves {
+		if self.client.sendBuffer.movePeerContracts(move.peerId, move.take) == 0 {
+			ledger.releaseMove(move.window, now)
+		}
+	}
+	for _, end := range ledger.takeReports(now) {
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof("[contract]peer window end %s direction=%d count=%d contracts=%d\n", end.peerId, end.direction, end.byteCount, len(end.reports))
 		}
@@ -766,6 +1014,25 @@ func (self *ContractManager) reportPeerWindows(ledger *peerWindowLedger, now tim
 			)
 		}
 	}
+}
+
+// Takes the contracts queued for a peer that no open window holds, for the caller
+// to close. The queue stays, so a request already in flight still lands.
+func (self *ContractManager) removeUnheldPeerContractsWithLock(peerId Id) []*protocol.Contract {
+	ledger := self.peerWindows.Load()
+	contracts := []*protocol.Contract{}
+	for contractKey, contractQueue := range self.destinationContracts {
+		if contractKey.Destination.DestinationId != peerId {
+			continue
+		}
+		contracts = append(contracts, contractQueue.removeWhere(func(contractId Id) bool {
+			return ledger == nil || !ledger.holds(contractId)
+		})...)
+		if contractQueue.IsDone() {
+			delete(self.destinationContracts, contractKey)
+		}
+	}
+	return contracts
 }
 
 // Keeps a report the ledger answers for, and reports whether it did.
@@ -790,6 +1057,12 @@ func (self *ContractManager) peerWindowOwns(contractId Id) bool {
 func (self *ContractManager) peerWindowAccounting(peerId Id) bool {
 	ledger := self.peerWindows.Load()
 	return ledger != nil && ledger.accounting(peerId)
+}
+
+// Whether a sequence on this contract stays on it through a move.
+func (self *ContractManager) peerWindowHolds(contractId Id) bool {
+	ledger := self.peerWindows.Load()
+	return ledger != nil && ledger.holds(contractId)
 }
 
 // Tells the ledger a contract reached the send queue. The caller holds the mutex.
@@ -853,6 +1126,94 @@ func (self *ContractManager) notePeerWindowReceiveContract(contract *sequenceCon
 		time.Now(),
 	) {
 		self.wakePeerWindows()
+	}
+}
+
+// Asks each send sequence to the peer to leave the contracts no open window holds,
+// and with `take` to move onto a new one at once. Returns how many it asked.
+func (self *SendBuffer) movePeerContracts(peerId Id, take bool) int {
+	sequences := []*SendSequence{}
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		for id, sequence := range self.sendSequences {
+			if id.Destination == peerId {
+				sequences = append(sequences, sequence)
+			}
+		}
+	}()
+	for _, sequence := range sequences {
+		sequence.requestPeerContractMove(take)
+	}
+	return len(sequences)
+}
+
+const (
+	// leave every contract no open window holds
+	peerContractMoveRetire = uint32(1) << iota
+	// and if that left the sequence with none, take a new one at once
+	peerContractMoveTake
+)
+
+// Commits the sequence to the move, which its own goroutine carries out: before
+// any later debit, and on its next pass even with nothing to send. A caller's
+// no-acknowledgement write never reaches that goroutine, so it is fenced here: a
+// caller past this returns to the queue rather than ride the contract.
+func (self *SendSequence) requestPeerContractMove(take bool) {
+	move := peerContractMoveRetire
+	if take {
+		move |= peerContractMoveTake
+	}
+	self.peerContractMove.Or(move)
+	if snapshot := self.noAckFastPath.Load(); snapshot != nil && snapshot.contract != nil &&
+		!self.client.ContractManager().peerWindowHolds(snapshot.contract.contractId) {
+		snapshot.contract.noAckWriterState.Or(noAckContractRetired)
+	}
+	select {
+	case self.retainedAdmissionWake <- struct{}{}:
+	default:
+	}
+}
+
+// Carries out a requested move, as a contract at its deadline retires: what the
+// contract carries stays attributed to it in `openSendContracts` and closes as it
+// is acknowledged, so ordering and acks are untouched, and the sequence's next
+// Pack is in order behind everything it carried. A take that fails leaves the
+// sequence with no contract, and its next Pack asks for one as usual.
+func (self *SendSequence) applyPeerContractMove() {
+	if self.peerContractMove.Load() == 0 {
+		return
+	}
+	move := self.peerContractMove.Swap(0)
+	manager := self.client.ContractManager()
+	if headroom := self.noAckHeadroomContract; headroom != nil && !manager.peerWindowHolds(headroom.contractId) {
+		self.endNoAckHeadroom()
+	}
+	if ahead := self.aheadSendContract; ahead != nil && !manager.peerWindowHolds(ahead.contractId) {
+		self.discardAheadContract()
+	}
+	contract := self.sendContract
+	if contract == nil || manager.peerWindowHolds(contract.contractId) {
+		return
+	}
+	self.log.Infof(
+		"[s]%s->%s...%s s(%s) contract %s moves off\n",
+		self.client.ClientTag(),
+		self.contractIntermediaryIds(),
+		self.destination,
+		self.contractMultiRouteWriterAlias.StreamId,
+		contract.contractId,
+	)
+	self.sendContract = nil
+	self.preparedContractByteCount.Store(0)
+	self.sendContractAcked = false
+	self.retireSendContract(contract)
+	if move&peerContractMoveTake != 0 {
+		// the clock moved this contract, not traffic, so it is sized as an
+		// opening one: the ramp would otherwise reach the standard size after
+		// a few idle windows and reserve that for every contract of the pair
+		self.contractSeqIndex = 0
+		self.updateContractForMode(0, sendContractUpdatePeerMove)
 	}
 }
 
