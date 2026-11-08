@@ -701,7 +701,7 @@ func (self *UpgradeMux) resolveDnsTcpQuery(query []byte) []byte {
 		return nil
 	}
 	domain := strings.ToLower(strings.TrimSuffix(question.Name.String(), "."))
-	responder := &dnsResponder{id: header.ID, question: question}
+	responder := &dnsResponder{id: header.ID, question: question, edns: dnsQueryHasOpt(&parser)}
 
 	// resolver.arpa is a locally served special-use zone (RFC 9462 §6.1).
 	// A tunnel DNS forwarder must not ask an unrelated upstream resolver to
@@ -1578,8 +1578,12 @@ func peekClaim(packet []byte, seg *tlsSegment) peekResult {
 // question: enough to synthesize that client's exact reply — its transaction id and
 // question (casing preserved, for clients that randomize it) — on its reversed path.
 type dnsResponder struct {
-	id          uint16
-	question    dnsmessage.Question
+	id       uint16
+	question dnsmessage.Question
+	// Whether the client's query carried an OPT record (RFC 6891).
+	// A forwarded response loses its OPT record for a client that sent none
+	// (see dnsResponseForResponder): every DoH query asks with OPT.
+	edns        bool
 	source      TransferPath
 	provideMode protocol.ProvideMode
 	reverse     *IpPath
@@ -1629,6 +1633,7 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	if err != nil {
 		return false
 	}
+	edns := dnsQueryHasOpt(&parser)
 	// lower cased: clients that randomize query casing (dns 0x20) must coalesce,
 	// cache, and record as one name — the reverse index and its learned callbacks
 	// key on this. The client's reply echoes the original-cased question, which is
@@ -1714,6 +1719,7 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	responder := dnsResponder{
 		id:          header.ID,
 		question:    question,
+		edns:        edns,
 		source:      source,
 		provideMode: provideMode,
 		// the response flows from the queried resolver back to the client
@@ -2178,12 +2184,18 @@ func (self *UpgradeMux) deliverRawForwardResponse(responders []dnsResponder, dom
 	}
 }
 
-// dnsResponseForResponder copies a one-question DNS response and restores the
-// responder's original question casing. The normalized DoH query and original
-// query differ only by ASCII case, so the wire name has identical length and
-// answer compression offsets remain valid. A compressed/mismatched question is
-// rejected rather than returning a response that can fail DNS 0x20 validation.
+// Copies a one-question DNS response and restores the responder's original
+// question casing. The normalized DoH query and original query differ only by
+// ASCII case, so the wire name has identical length and answer compression
+// offsets remain valid. A compressed/mismatched question is rejected rather
+// than returning a response that can fail DNS 0x20 validation. For a client
+// whose query carried no OPT record the response's OPT record is removed first
+// (RFC 6891 §7: a responder must not include one then); a client that sent one
+// gets the upstream's.
 func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, bool) {
+	if !responder.edns {
+		response = dnsResponseWithoutOpt(response)
+	}
 	if len(response) < 12 || binary.BigEndian.Uint16(response[4:6]) != 1 {
 		return nil, false
 	}
@@ -2233,6 +2245,60 @@ func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, 
 	binary.BigEndian.PutUint16(result[0:2], responder.id)
 	copy(result[12:questionEnd], wireName)
 	return result, true
+}
+
+// Whether a client's query carries an OPT record (RFC 6891), read past the
+// question p has consumed. A query whose tail does not parse counts as having
+// none.
+func dnsQueryHasOpt(p *dnsmessage.Parser) bool {
+	if err := p.SkipAllQuestions(); err != nil {
+		return false
+	}
+	if err := p.SkipAllAnswers(); err != nil {
+		return false
+	}
+	if err := p.SkipAllAuthorities(); err != nil {
+		return false
+	}
+	for {
+		h, err := p.AdditionalHeader()
+		if err != nil {
+			// dnsmessage.ErrSectionDone, or a malformed tail
+			return false
+		}
+		if h.Type == dnsmessage.TypeOPT {
+			return true
+		}
+		if err := p.SkipAdditional(); err != nil {
+			return false
+		}
+	}
+}
+
+// A response with its OPT record removed, for a client whose query carried
+// none. A response with no OPT record, or one that does not parse or repack, is
+// returned as it is: the client gets what it got before every DoH query asked
+// with OPT, when only resolvers that attach one unasked (Quad9) sent it.
+func dnsResponseWithoutOpt(response []byte) []byte {
+	var message dnsmessage.Message
+	if err := message.Unpack(response); err != nil {
+		return response
+	}
+	additionals := make([]dnsmessage.Resource, 0, len(message.Additionals))
+	for _, additional := range message.Additionals {
+		if additional.Header.Type != dnsmessage.TypeOPT {
+			additionals = append(additionals, additional)
+		}
+	}
+	if len(additionals) == len(message.Additionals) {
+		return response
+	}
+	message.Additionals = additionals
+	packed, err := message.Pack()
+	if err != nil {
+		return response
+	}
+	return packed
 }
 
 // parseHttpsHints extracts the ipv4hint (SvcParamKey 4) and ipv6hint (key 6) addresses from the
