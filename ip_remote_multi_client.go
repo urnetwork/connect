@@ -13441,6 +13441,32 @@ func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGener
 	}
 }
 
+// The exclusions of one discovery round: the destinations of the exits the
+// window holds that take new flows or are reserved for a service refresh, the
+// service refresh's refusals, and the providers cooling off unless the
+// starvation escape skips them (ip_remote_multi_client_cooloff.go). For the
+// escape the window holds a provider while one of its exits is live and takes
+// new flows: an exit that is done but not yet reaped, or warned, is on its way
+// out. Returns the cool-off's excluded count and the round's listing.
+func (self *multiClientWindow) discoveryRoundExclusions() (map[MultiHopId]bool, int, cooloffListing) {
+	self.stateLock.Lock()
+	windowDestinations := map[MultiHopId]bool{}
+	heldCount := 0
+	for _, client := range self.clients {
+		warning := client.isWarning()
+		if !warning || client.serviceRefreshReservation.Load() != nil {
+			windowDestinations[client.Destination()] = true
+		}
+		if !warning && !client.IsDone() {
+			heldCount += 1
+		}
+	}
+	self.stateLock.Unlock()
+	self.addServiceRefreshExclusions(windowDestinations)
+	cooloffExcluded, cooloffListing := self.addCooloffExclusions(windowDestinations, heldCount)
+	return windowDestinations, cooloffExcluded, cooloffListing
+}
+
 func (self *multiClientWindow) randomEnumerateClientArgs() {
 	defer func() {
 		close(self.clientChannelArgs)
@@ -13487,17 +13513,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		cooloffExcluded := 0
 		var cooloffListing cooloffListing
 		windowDestinations := func() map[MultiHopId]bool {
-			self.stateLock.Lock()
-			windowDestinations := map[MultiHopId]bool{}
-			for _, client := range self.clients {
-				if !client.isWarning() || client.serviceRefreshReservation.Load() != nil {
-					windowDestinations[client.Destination()] = true
-				}
-			}
-			heldCount := len(self.clients)
-			self.stateLock.Unlock()
-			self.addServiceRefreshExclusions(windowDestinations)
-			cooloffExcluded, cooloffListing = self.addCooloffExclusions(windowDestinations, heldCount)
+			var windowDestinations map[MultiHopId]bool
+			windowDestinations, cooloffExcluded, cooloffListing = self.discoveryRoundExclusions()
 			return windowDestinations
 		}
 

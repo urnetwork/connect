@@ -298,6 +298,46 @@ func TestCooloffRefusesOnlyACandidateListedBeforeItsProviderFailed(t *testing.T)
 	AssertEqual(t, len(log.linesWith("action=refuse")), 4)
 }
 
+// The escape's "holds no provider" counts the exits that are live and take new
+// flows. A window holding only an exit that is done but not yet reaped, or
+// only warned exits, skips the exclusions on that round instead of waiting a
+// round for the empty-round path.
+func TestCooloffWindowWithoutALiveExitHoldsNoProvider(t *testing.T) {
+	failed := RequireMultiHopId(NewId())
+	cases := []struct {
+		name    string
+		exit    func() *multiClientChannel
+		skipped bool
+	}{
+		{name: "live", exit: cooloffTestHeldChannel, skipped: false},
+		{name: "warned", exit: func() *multiClientChannel {
+			client := cooloffTestHeldChannel()
+			client.setWarning(true, warnUnhealthy)
+			return client
+		}, skipped: true},
+		{name: "done", exit: func() *multiClientChannel {
+			client := cooloffTestHeldChannel()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			client.ctx = ctx
+			return client
+		}, skipped: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			window := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+			window.noteFailedDestination(failed, cooloffReasonEvaluation)
+			exit := c.exit()
+			window.clients[exit.ClientId()] = exit
+
+			excluded, count, listing := window.discoveryRoundExclusions()
+			AssertEqual(t, listing.skipped, c.skipped)
+			AssertEqual(t, excluded[failed], !c.skipped)
+			AssertEqual(t, count, map[bool]int{false: 1, true: 0}[c.skipped])
+		})
+	}
+}
+
 // A family-aware generator's discovery with a context, which a demand read
 // asks.
 type cooloffFamilyContextTestGenerator struct {
