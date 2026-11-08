@@ -195,6 +195,109 @@ func cooloffTestNoted(window *multiClientWindow, destination MultiHopId) bool {
 	return ok
 }
 
+// The escape's call-site wiring in a live window: the window holds an exit,
+// and discovery offers only the provider that failed. The round that excludes
+// it comes back empty and reports so (noteCooloffRound), the next round skips
+// the exclusions and lists it, and the expansion evaluates what that round
+// listed.
+func TestCooloffEscapeEvaluatesTheOnlyProviderAgainWhenDiscoveryRunsDry(t *testing.T) {
+	only := RequireMultiHopId(NewId())
+	generator := &recentExitTestGenerator{
+		discoveredDestinations: map[MultiHopId]DestinationStats{only: {}},
+	}
+	window := cooloffTestWindow(t, generator, nil)
+	installStickyTestChannel(window, cooloffTestHeldChannel())
+
+	// the first round that excluded the provider, as a position in the calls
+	excludedAt := func(calls []recentExitTestCall) int {
+		excludes := generator.recordedDiscoveryExcludes()
+		discover := 0
+		for i, call := range calls {
+			if call.kind != "discover" {
+				continue
+			}
+			if discover < len(excludes) && slices.Contains(excludes[discover], only) {
+				return i
+			}
+			discover += 1
+		}
+		return -1
+	}
+	waitRecentExitTestCalls(t, generator, "evaluate the provider again after a round excluded it", func(calls []recentExitTestCall) bool {
+		at := excludedAt(calls)
+		return 0 <= at && 0 <= recentExitTestIndex(calls, at+1, "evaluate", only)
+	})
+}
+
+// An empty probe round says nothing of the pool: a probe asks only the
+// v6-capable request (a legacy generator is asked nothing). The round after it
+// still applies the exclusions, so a failed provider stays out while discovery
+// has others to offer.
+func TestCooloffAnEmptyProbeRoundKeepsTheExclusions(t *testing.T) {
+	failed := RequireMultiHopId(NewId())
+	generator := &cooloffTestGenerator{recentExitTestGenerator{
+		discoveredDestinations: map[MultiHopId]DestinationStats{failed: {}},
+	}}
+	window := cooloffTestWindow(t, generator, nil)
+	installStickyTestChannel(window, cooloffTestHeldChannel())
+
+	waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "evaluate the provider and note it", func(calls []recentExitTestCall) bool {
+		return 0 < recentExitTestCount(calls, "evaluate", failed) && cooloffTestNoted(window, failed)
+	})
+	probeTaken := func() bool {
+		window.stateLock.Lock()
+		defer window.stateLock.Unlock()
+		return !window.ipv6ProbeRequested
+	}
+	for range 3 {
+		window.requestIpv6Probe()
+		deadline := time.Now().Add(30 * time.Second)
+		for !probeTaken() {
+			if deadline.Before(time.Now()) {
+				t.Fatal("the enumerator did not take the probe request")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		// the probe round, then two ordinary rounds that read its report
+		start := recentExitTestCount(generator.recordedCalls(), "discover", MultiHopId{})
+		waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "discover twice after the probe", func(calls []recentExitTestCall) bool {
+			return start+2 <= recentExitTestCount(calls, "discover", MultiHopId{})
+		})
+	}
+	if count := recentExitTestCount(generator.recordedCalls(), "evaluate", failed); count != 1 {
+		t.Errorf("the failed provider was evaluated %d times within its cool-off, want 1: an empty probe lifted the exclusions", count)
+	}
+}
+
+// The exclude line is written when the number of excluded providers changes,
+// not on every round: discovery runs on every expansion pass.
+func TestCooloffLogsTheExclusionsWhenTheirCountChanges(t *testing.T) {
+	window := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+	log := newRecordingLogger()
+	window.log = log
+	first := RequireMultiHopId(NewId())
+	second := RequireMultiHopId(NewId())
+	rounds := func() {
+		for range 3 {
+			window.addCooloffExclusions(map[MultiHopId]bool{}, 1)
+		}
+	}
+
+	window.noteFailedDestination(first, cooloffReasonEvaluation)
+	rounds()
+	AssertEqual(t, len(log.linesWith("action=exclude count=1")), 1)
+	window.noteFailedDestination(second, cooloffReasonEvaluation)
+	rounds()
+	AssertEqual(t, len(log.linesWith("action=exclude count=2")), 1)
+	// both pass their cool-off
+	past := time.Now().Add(-window.cooloffTimeout())
+	window.cooloff.note(first, past, cooloffMaxCount)
+	window.cooloff.note(second, past, cooloffMaxCount)
+	rounds()
+	AssertEqual(t, len(log.linesWith("action=exclude count=0")), 1)
+	AssertEqual(t, len(log.linesWith("action=exclude")), 3)
+}
+
 // A verdict removal is held against the provider only while another exit is
 // receiving: then the uplink demonstrably delivers. With no receiving sibling,
 // in a one-exit window or with the uplink stale past the gate's hold, the
