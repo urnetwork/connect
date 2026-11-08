@@ -156,6 +156,8 @@ func newPeerWindowPairFixture(t *testing.T, configure ...func(*ClientSettings)) 
 		value.ContractManagerSettings.NetworkEventTimeEnableContracts = time.Unix(1, 0)
 		value.ContractManagerSettings.NetworkEventTimeChangeHmac = time.Unix(1, 0)
 		value.SendBufferSettings.AckTailProbeLimit = 0
+		// every ack goes out at once, so no ack timer moves the clock between steps
+		value.ReceiveBufferSettings.AckCompressTimeout = 0
 		value.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		for _, change := range configure {
 			change(value)
@@ -612,34 +614,66 @@ func TestPeerWindowMarkRetiresAndReportsExactly(t *testing.T) {
 	})
 }
 
+// What the sequence's goroutine saw of a debit it made.
+type peerWindowDebit struct {
+	held               *sequenceContract
+	heldByteCount      ByteCount
+	heldByteCountAfter ByteCount
+	debited            *sequenceContract
+	ok                 bool
+}
+
 // A Pack can reach a debit without passing the top of the sequence's loop, batched
-// behind one taken earlier. The move requested before it still comes first.
+// behind one taken earlier. The move requested before it still comes first. The
+// debit runs on the sequence's own goroutine, in the pass the request's wake
+// brings, after the pass reads its acks and before the top of its loop would
+// carry out the move.
 func TestPeerWindowDebitAfterARequestRidesWhatTheMoveLeaves(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		f := newPeerWindowPairFixture(t)
+		var debitSequence atomic.Pointer[SendSequence]
+		debits := make(chan peerWindowDebit, 1)
+		f := newPeerWindowPairFixture(t, func(settings *ClientSettings) {
+			settings.SendBufferSettings.afterApplyAckSnapshotForTest = func(id sendSequenceId) {
+				sequence := debitSequence.Load()
+				if sequence == nil || sequence.id() != id || sequence.peerContractMove.Load() == 0 {
+					return
+				}
+				debitSequence.Store(nil)
+				debit := peerWindowDebit{held: sequence.sendContract}
+				debit.heldByteCount = debit.held.ackedByteCount + debit.held.unackedByteCount
+				debit.ok = sequence.updateContract(16)
+				debit.debited = sequence.sendContract
+				debit.heldByteCountAfter = debit.held.ackedByteCount + debit.held.unackedByteCount
+				if debit.ok {
+					sequence.rollbackUnwrittenContractDebit(16)
+				}
+				debits <- debit
+			}
+		})
 		defer f.close()
 		responderId := f.responder.ClientId()
 		f.send(f.initiator, f.responder, "before-the-mark")
-		manager := f.initiator.ContractManager()
-		manager.SetPeerWindowAccounting(responderId, true)
+		f.initiator.ContractManager().SetPeerWindowAccounting(responderId, true)
 		sequence := f.initiator.sendBuffer.lookupSendSequence(sendSequenceId{Destination: responderId}, nil)
-		held := sequence.sendContract
-		countedByteCount := held.ackedByteCount + held.unackedByteCount
+		debitSequence.Store(sequence)
+		sequence.requestPeerContractMove(false)
 
-		// the request lands with the sequence past its pass, so only the debit
-		// can see it: its goroutine is parked, and nothing wakes it
-		sequence.peerContractMove.Or(peerContractMoveRetire)
-		if !sequence.updateContract(16) {
+		var debit peerWindowDebit
+		select {
+		case debit = <-debits:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the request's wake brought the sequence to no pass")
+		}
+		if !debit.ok || debit.debited == nil {
 			t.Fatal("the debit found no contract")
 		}
-		if sequence.sendContract == held {
+		if debit.debited == debit.held {
 			t.Fatal("a debit after the request rode the retired contract")
 		}
-		if held.ackedByteCount+held.unackedByteCount != countedByteCount {
+		if debit.heldByteCountAfter != debit.heldByteCount {
 			t.Fatal("the retired contract was charged")
 		}
-		sequence.rollbackUnwrittenContractDebit(16)
 	})
 }
 
@@ -1208,13 +1242,14 @@ func TestPeerWindowCallbackNamesEachWindowStart(t *testing.T) {
 			return matching
 		}
 		f.markingExchange()
-		start := time.Now()
 		synctest.Wait()
+		// the take of the initiator's opening contract opened the window
+		opening := f.grants(f.initiator.ClientId())[0]
 		first := opened(PeerWindowSend)
-		if len(first) != 1 || !first[0].StartTime.Equal(start) || first[0].PeerId != f.responder.ClientId() {
+		if len(first) != 1 || !first[0].StartTime.Equal(opening.time) || first[0].PeerId != f.responder.ClientId() {
 			t.Fatalf("the listener heard %+v", first)
 		}
-		if !first[0].EndTime.Equal(start.Add(55 * time.Minute)) {
+		if !first[0].EndTime.Equal(peerWindowContractCreateTime(opening.contractId).Add(55 * time.Minute)) {
 			t.Fatalf("the window's end was named as %s", first[0].EndTime)
 		}
 		if len(opened(PeerWindowReceive)) != 1 {
