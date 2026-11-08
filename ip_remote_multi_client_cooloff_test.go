@@ -133,7 +133,9 @@ func (self *cooloffFamilyTestGenerator) NextDestinationsWithIpFamily(count int, 
 	self.calls = append(self.calls, recentExitTestCall{kind: "discover"})
 	self.familyExcludes[ipFamily] = append(self.familyExcludes[ipFamily], slices.Clone(excludeDestinations))
 	destinations := map[MultiHopId]DestinationStats{}
-	if !slices.Contains(excludeDestinations, self.dualstack) {
+	// offered once the window has asked the v6-capable request, so its
+	// evaluation runs with the IPv6 shortfall open
+	if 0 < len(self.familyExcludes[IpFamilyFilterV6Capable]) && !slices.Contains(excludeDestinations, self.dualstack) {
 		destinations[self.dualstack] = DestinationStats{IpFamily: IpFamilyDualstack}
 	}
 	if ipFamily == IpFamilyFilterV4Capable {
