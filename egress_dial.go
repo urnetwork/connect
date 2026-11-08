@@ -37,6 +37,13 @@ import (
 // set. Linux supplies one whose unmarked path preserves the live system
 // resolver and refreshes only a server made stale by a resolv.conf transition.
 
+// What the Linux and Windows egress resolvers dial when the physical link
+// names no usable resolver: the default remote plain dns servers
+// (DefaultDnsResolverSettings), v4, as plain :53. Both platforms take this
+// one list, so neither can keep an operator the defaults dropped. Unused on
+// the other platforms.
+var egressFallbackDnsServers = DefaultDnsResolverSettings().RemoteDnsIpv4
+
 // egressSelfExcluded is the platform's answer to "are this process's own
 // sockets steered around the tunnel it provides by something other than a
 // forced interface index". Only Linux sets it (from an init in

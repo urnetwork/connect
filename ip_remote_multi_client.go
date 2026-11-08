@@ -7616,8 +7616,8 @@ func (self *RemoteUserNatMultiClient) SetBlockActionOverrides(overrides []*Block
 // cluster with user traffic. the default security and routing decisions and
 // the packet stats still apply to ignored destinations, but no block actions
 // are surfaced for them. safe to call at runtime.
-// the hard coded remote doh resolver ips are always excluded in addition to
-// these host values (see `defaultRemoteDohIgnoreAddrs`).
+// the well known public resolver ips are always excluded in addition to
+// these host values (see `wellKnownResolverAddrs`).
 func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []string) {
 	func() {
 		self.stateLock.Lock()
@@ -7640,14 +7640,14 @@ func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []str
 
 // blockActionIgnored returns whether the destination is excluded from the
 // override and association logic. the result is cached per destination.
-// the hard coded remote doh resolver ips are always excluded (see
-// `defaultRemoteDohIgnoreAddrs`), independent of `SetBlockActionIgnoreHosts`.
+// the well known public resolver ips are always excluded (see
+// `wellKnownResolverAddrs`), independent of `SetBlockActionIgnoreHosts`.
 func (self *RemoteUserNatMultiClient) blockActionIgnored(ipPath *IpPath) bool {
 	addr, ok := ipAssocAddr(ipPath.DestinationIp)
 	if !ok {
 		return false
 	}
-	if defaultRemoteDohIgnoreAddrs()[addr] {
+	if wellKnownResolverAddrs()[addr] {
 		return true
 	}
 	state := self.blockActionIgnoreState.Load()

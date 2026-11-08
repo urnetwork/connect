@@ -739,9 +739,12 @@ func hashHosts(pepper string, set map[string]bool) []uint64 {
 }
 
 // resolverExclusions collects the default resolver endpoints
-// (DefaultDnsResolverSettings): hostnames are added to the allow set, ip
-// endpoints are subtracted from the ip tables. the blocker must never block
-// dns resolution infrastructure.
+// (DefaultDnsResolverSettings) and the well known public resolver addresses
+// (connect.WellKnownResolverAddrs, which keeps resolvers that are no longer
+// defaults, such as Google Public DNS): hostnames are added to the allow set,
+// ip endpoints are subtracted from the ip tables. the blocker must never block
+// dns resolution infrastructure, including the resolvers a device's os or
+// browser queries directly.
 func resolverExclusions() (map[string]bool, []netip.Addr) {
 	names := map[string]bool{}
 	addrs := []netip.Addr{}
@@ -789,6 +792,9 @@ func resolverExclusions() (map[string]bool, []netip.Addr) {
 			}
 			addHost(host)
 		}
+	}
+	for _, addr := range connect.WellKnownResolverAddrs() {
+		addHost(addr.String())
 	}
 	return names, addrs
 }
