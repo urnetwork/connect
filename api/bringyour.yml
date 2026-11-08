@@ -10874,6 +10874,129 @@ paths:
         "429":
           description: Past the limit for this key or caller.
 
+  /sidecar/bind:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Bind a client generation to its sidecar identity
+      description: |
+        Appends the caller's client generation to its sidecar's identity log: a
+        `SignedSidecarIdentityBinding` (sidecar's protocol/bridge/auth.proto),
+        marshalled and base64, signed by the client's key and by the sidecar's
+        identity key over the binding's network, sidecar, client, generation,
+        both public keys and time. The log is never reaped; a peer checks a
+        client against it before trusting the client's bytes.
+
+        The binding must name the bearer's client and network. A sidecar's first
+        binding is generation 1 and creates its identity; each later one is the
+        newest plus one under the same identity key. A client binds exactly
+        once: posting the same bytes again answers the stored generation and
+        writes nothing, and any other bytes for a bound client are refused.
+
+        A refusal answers `{"error", "code"}`: 400 `binding_invalid` (a bad
+        signature, a malformed body, or another client or network than the
+        token's), 403 `sidecar_revoked`, 409 `generation_conflict` and 409
+        `client_bound`.
+      operationId: sidecarBind
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SidecarBindArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarBindResult"
+        "400":
+          $ref: "#/components/responses/SidecarIdentityRefused"
+        "403":
+          description: The sidecar is revoked, with code `sidecar_revoked`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                  - code
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "409":
+          $ref: "#/components/responses/SidecarIdentityRefused"
+
+  /sidecar/identity/{sidecarId}:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: A sidecar's identity and bindings
+      description: |
+        A sidecar of the caller's network: its identity public key and
+        algorithm, its status as the server holds it, its current binding, and a
+        page of its bindings, newest first, at most 64. Pass
+        `before_generation` for the page below a generation. Never a user id.
+        The server is not trusted for any of it: a client checks each binding's
+        signatures and the identity key against its own record.
+      operationId: sidecarIdentity
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: sidecarId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: before_generation
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarIdentityResult"
+        "404":
+          description: The caller's network holds no such sidecar.
+
+  /sidecar/identity:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The sidecar a client is bound to
+      description: |
+        The identity that a client of any generation in the caller's network is
+        bound to, with that client's binding. Never a user id. A client with no
+        binding is 404.
+      operationId: sidecarIdentityByClient
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarIdentityResult"
+        "404":
+          description: No binding names that client in the caller's network.
+
   /network/auth-keys:
     get:
       tags: [Network]
@@ -11827,6 +11950,23 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/SessionOperationResult"
+    SidecarIdentityRefused:
+      description: |
+        A refusal of a sidecar identity route, with its code: `binding_invalid`,
+        `sidecar_revoked`, `generation_conflict` or `client_bound`.
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - error
+              - code
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+
     ClientJwtRefused:
       description: |
         The bearer token is a client JWT (`by_client_jwt`, from
@@ -21275,6 +21415,14 @@ components:
           properties:
             message:
               type: string
+            code:
+              description: |
+                `restore_required`, to a sidecar's client only, while the server
+                lacks the sidecar's identity, binding or a registration, as after
+                a database restore. It is no refusal: the sidecar posts its newest
+                binding to `POST /sidecar/bind` again, re-registers, and refreshes
+                again.
+              type: string
 
     NetworkRefreshTokenResult:
       type: object
@@ -25225,6 +25373,57 @@ components:
             An ephemeral mint's close capability, 128 random bits returned only
             here. The server keeps its SHA-256.
           type: string
+
+    SidecarBindArgs:
+      type: object
+      required:
+        - binding
+      properties:
+        binding:
+          description: A marshalled `SignedSidecarIdentityBinding`, base64.
+          type: string
+          format: byte
+
+    SidecarBindResult:
+      type: object
+      required:
+        - generation
+      properties:
+        generation:
+          description: The generation the server recorded for the client.
+          type: integer
+          format: int64
+
+    SidecarIdentityResult:
+      type: object
+      required:
+        - sidecar_id
+        - identity_public_key
+        - identity_alg
+        - status
+      properties:
+        sidecar_id:
+          type: string
+        identity_public_key:
+          description: The Ed25519 identity public key, base64.
+          type: string
+          format: byte
+        identity_alg:
+          description: "`ed25519`."
+          type: string
+        status:
+          description: "`active` or `revoked`, as the server holds it: never authority."
+          type: string
+        binding:
+          description: The current binding, a marshalled `SignedSidecarIdentityBinding`, base64.
+          type: string
+          format: byte
+        bindings:
+          description: By sidecar id, a page of bindings, newest first, at most 64.
+          type: array
+          items:
+            type: string
+            format: byte
 
     NetworkAuthKey:
       type: object
