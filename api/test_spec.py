@@ -98,8 +98,6 @@ class SpecTest(unittest.TestCase):
         # moves it out of this list when it does.
         expected = {
             "/network/enroll": {"post"},
-            "/network/auth-keys": {"get", "post"},
-            "/network/auth-key-revoke": {"post"},
             "/network/config/projection": {"get", "post"},
             "/network/config/delta": {"post"},
             "/network/config/reseed": {"post"},
@@ -149,6 +147,25 @@ class SpecTest(unittest.TestCase):
         self.assertEqual([], enroll["security"])
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
         self.assertNotIn("bundle", args["properties"])
+
+    def test_auth_key_routes_are_served(self):
+        # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
+        # the network credential's (403 for a client token), and the bundle never
+        # a field of any of them
+        paths = self.spec["paths"]
+        schemas = self.spec["components"]["schemas"]
+        for path, methods in {"/network/auth-keys": {"get", "post"}, "/network/auth-key-revoke": {"post"}}.items():
+            for method in methods:
+                with self.subTest(path=path, method=method):
+                    operation = paths[path][method]
+                    self.assertNotIn("x-status", operation)
+                    self.assertNotIn("x-internal", operation)
+                    self.assertEqual([{"BearerAuth": []}], operation["security"])
+                    self.assertEqual("#/components/responses/ClientJwtRefused", operation["responses"]["403"]["$ref"])
+        self.assertEqual({"bundle_still_admits", "note", "error"}, set(schemas["NetworkAuthKeyRevokeResult"]["properties"]))
+        for name in ("NetworkAuthKey", "NetworkAuthKeyCreateArgs", "NetworkAuthKeyCreateResult", "NetworkAuthKeyRevokeResult"):
+            self.assertNotIn("bundle", schemas[name]["properties"])
+        self.assertLessEqual({"scopes", "duration_seconds"}, set(schemas["CreateApiKeyArgs"]["properties"]))
 
     def test_local_references_resolve(self):
         def visit(value):

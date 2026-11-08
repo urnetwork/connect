@@ -10876,13 +10876,12 @@ paths:
 
   /network/auth-keys:
     get:
-      x-internal: true
-      x-status: planned
       tags: [Network]
       summary: List the network's auth keys
       description: |
-        The network's auth keys, without their secrets, which only their hash
-        stores.
+        The network's auth keys that have not expired, oldest first, without
+        their secrets, which only their hash stores. A key's tags are opaque tag
+        ids, never names.
       operationId: networkAuthKeys
       security:
         - BearerAuth: []
@@ -10896,14 +10895,17 @@ paths:
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
     post:
-      x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Create an auth key
       description: |
         Creates a key that lives 5 minutes to 90 days and has a maximum number of
         uses. The answer is the only time the bearer `ur-authkey-<id>-<secret>`
-        appears; only its hash is kept.
+        appears; only its secret's hash is kept. `<id>` is the key's id and
+        `<secret>` 32 random bytes, each lowercase base32 (RFC 4648) without
+        padding, 26 and 52 characters, so neither holds a `-`.
+
+        Creating a key sends the account's security notice and records an admin
+        event.
 
         A pre-approved key's bundle, the genesis hash, the authorization head and
         a Delegation's seeds, is built on the creating device and never sent here.
@@ -10929,14 +10931,17 @@ paths:
 
   /network/auth-key-revoke:
     post:
-      x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Revoke an auth key
       description: |
         Stops the key's bearer. It signs nothing, so a copy of a pre-approved key's
         bundle still admits until its Delegation ends: for such a key the answer
-        says so, and that takes a `DelegationRevoke` statement from a device.
+        says so in `bundle_still_admits` and `note`, which names
+        `ur admin delegations revoke`, since ending the Delegation takes a
+        `DelegationRevoke` statement from a device.
+
+        Revoking a key sends the account's security notice and records an admin
+        event.
       operationId: networkAuthKeyRevoke
       security:
         - BearerAuth: []
@@ -19345,6 +19350,19 @@ components:
       properties:
         name:
           type: string
+        scopes:
+          description: |
+            What the key may do within its creator's reach: all, devices:core,
+            auth_keys, policy:read or logs:read. Empty is all. Until roles map
+            routes to permissions only all is accepted.
+          type: array
+          items:
+            type: string
+        duration_seconds:
+          description: |
+            The key's lifetime, at most 365 days (31,536,000 seconds), which is
+            also the lifetime of a key created without one.
+          type: integer
 
     CreateApiKeyResult:
       type: object
@@ -19357,6 +19375,13 @@ components:
         api_key:
           type: string
         name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        expire_time:
+          description: datetime
           type: string
         error:
           type: object
@@ -19380,6 +19405,17 @@ components:
           type: string
         create_time:
           description: datetime
+          type: string
+        scopes:
+          description: Absent on a legacy key, which keeps its creator's whole reach.
+          type: array
+          items:
+            type: string
+        expire_time:
+          description: datetime. Absent on a legacy key, which never expires.
+          type: string
+        creator:
+          description: uuid. The user who made the key; absent on a legacy key.
           type: string
 
     GetApiKeysResult:
@@ -25203,11 +25239,15 @@ components:
           description: udid. The user who made the key.
           type: string
         tags:
-          description: Keyed tag ids, never tag names.
+          description: Opaque tag ids, 32 lowercase hex characters each, never tag names.
           type: array
           items:
             type: string
+        create_time:
+          description: datetime
+          type: string
         expire_time:
+          description: datetime
           type: string
         uses:
           description: Uses so far.
@@ -25241,7 +25281,9 @@ components:
         max_uses:
           type: integer
         tags:
-          description: Keyed tag ids, never tag names.
+          description: |
+            Opaque tag ids, 32 lowercase hex characters each, never tag names. At
+            most 64.
           type: array
           items:
             type: string
@@ -25263,6 +25305,16 @@ components:
         auth_key:
           description: The bearer `ur-authkey-<id>-<secret>`, returned only here.
           type: string
+        expire_time:
+          description: datetime
+          type: string
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     NetworkAuthKeyRevokeArgs:
       type: object
@@ -25281,6 +25333,18 @@ components:
         bundle_still_admits:
           description: A pre-approved key's bundle keeps admitting until its Delegation ends.
           type: boolean
+        note:
+          description: |
+            For a pre-approved key, that a copy of its bundle still admits, and
+            that `ur admin delegations revoke` ends it.
+          type: string
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     AclAckArgs:
       type: object
