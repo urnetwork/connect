@@ -14,7 +14,9 @@ import (
 // resolver list, the regional and ingress (bootstrap) chains built from them,
 // and the platform fallback, so an operator removed from the defaults cannot
 // survive in a copy. A user who names Google in their own settings is not
-// covered: that list is theirs.
+// covered: that list is theirs. Nor is the block-action ignore baseline, which
+// is no resolver list and keeps Google so that rules never capture a device's
+// own Google DNS traffic (TestResolverIgnoreBaselineKeepsWellKnownResolvers).
 
 // testIsGoogleDnsEndpoint reports whether a resolver list entry names Google
 // Public DNS: one of its published anycast addresses (v4, or in its v6 /48,
@@ -207,25 +209,57 @@ func TestRegionalRecommendationsSurviveGoogleRemoval(t *testing.T) {
 	}
 }
 
-// The block-action ignore baseline is the default remote DoH addresses
-// (defaultRemoteDohIgnoreAddrs), so Google's left it with the defaults: a
-// user's override rule may now act on a flow to Google Public DNS, as on any
-// other destination.
-func TestDefaultRemoteDohIgnoreBaselineFollowsTheDefaults(t *testing.T) {
-	baseline := defaultRemoteDohIgnoreAddrs()
+// Google Public DNS left every default list, but not the block-action ignore
+// baseline (wellKnownResolverAddrs): a device's os or browser still queries it
+// directly (Android private dns, a browser's secure dns), and a user's
+// override rule that captured that flow could cut off all of the device's
+// dns. The baseline holds every address of the well known operators, second
+// addresses included, and every address the defaults name; the exported copy
+// the blocker generator subtracts is the same set.
+func TestResolverIgnoreBaselineKeepsWellKnownResolvers(t *testing.T) {
+	baseline := wellKnownResolverAddrs()
+	googleAddrs := []string{"8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"}
+	otherAddrs := []string{
+		"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",
+		"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
+		"208.67.222.222", "208.67.220.220", "2620:119:35::35", "2620:119:53::53",
+	}
+	for _, resolver := range slices.Concat(googleAddrs, otherAddrs) {
+		if !baseline[netip.MustParseAddr(resolver)] {
+			t.Errorf("well known resolver %s is not in the ignore baseline", resolver)
+		}
+	}
+	for _, google := range googleAddrs {
+		if !testIsGoogleDnsEndpoint(google) {
+			t.Errorf("%s is not detected as Google Public DNS", google)
+		}
+	}
+
 	resolver := DefaultDnsResolverSettings()
+	defaultHosts := slices.Concat(resolver.RemoteDnsIpv4, resolver.RemoteDnsIpv6, resolver.LocalDnsIpv4, resolver.LocalDnsIpv6)
 	for _, dohUrl := range slices.Concat(resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6) {
 		u, err := url.Parse(dohUrl)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if addr := netip.MustParseAddr(u.Hostname()); !baseline[addr] {
-			t.Errorf("default doh address %s is not in the ignore baseline", addr)
+		defaultHosts = append(defaultHosts, u.Hostname())
+	}
+	for _, host := range defaultHosts {
+		if addr := netip.MustParseAddr(host); !baseline[addr] {
+			t.Errorf("default resolver address %s is not in the ignore baseline", addr)
 		}
 	}
-	for addr := range baseline {
-		if testIsGoogleDnsEndpoint(addr.String()) {
-			t.Errorf("ignore baseline still holds Google Public DNS %s", addr)
+
+	exported := WellKnownResolverAddrs()
+	if len(exported) != len(baseline) {
+		t.Fatalf("WellKnownResolverAddrs has %d addresses, the baseline %d", len(exported), len(baseline))
+	}
+	for i, addr := range exported {
+		if !baseline[addr] {
+			t.Errorf("WellKnownResolverAddrs holds %s, which is not in the baseline", addr)
+		}
+		if 0 < i && 0 <= exported[i-1].Compare(addr) {
+			t.Errorf("WellKnownResolverAddrs is not sorted and unique at %s", addr)
 		}
 	}
 }
