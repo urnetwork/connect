@@ -1107,9 +1107,9 @@ func defaultReceiveBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetBy
 		// cannot multiply the channel capacity into a memory spike.
 		SequenceBufferByteCount:   kib(256),
 		H1SequenceBufferByteCount: kib(256),
-		// A reliable carrier reader may retain its one already-read frame until
-		// the bounded per-sequence queue drains or the sequence/client closes.
-		// This restores stream backpressure without enlarging any queue.
+		// Keep the compatibility policy for dedicated per-sequence callers.
+		// The canonical shared Client pump always uses zero-time admission so
+		// a delayed callback cannot prevent independent ACK processing.
 		ReliablePackHandoffTimeout: -1,
 		// AckBufferSize: DefaultTransferBufferSize,
 		// coalesce acks into a periodic cumulative head ack
@@ -4671,7 +4671,6 @@ func (self *Client) run() {
 
 		var transferFrameBytes []byte
 		var transportType TransportType
-		var carrierReliability CarrierReliability
 		var receiveWireLimit int
 		var err error
 		c := func() error {
@@ -4682,7 +4681,6 @@ func (self *Client) run() {
 					self.settings.ReadTimeout,
 				)
 				transportType = disposition.transportType
-				carrierReliability = disposition.reliability
 				receiveWireLimit = disposition.maxMessageByteCount
 				h1ReceiveCredit = disposition.h1Credit
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
@@ -4690,11 +4688,9 @@ func (self *Client) run() {
 					self.ctx,
 					self.settings.ReadTimeout,
 				)
-				carrierReliability = CarrierReliabilityUnknown
 			} else {
 				transferFrameBytes, err = multiRouteReader.Read(self.ctx, self.settings.ReadTimeout)
 				transportType = TransportTypeUnknown
-				carrierReliability = CarrierReliabilityUnknown
 			}
 			return err
 		}
@@ -4979,12 +4975,12 @@ func (self *Client) run() {
 						ackProgress.Selective = receiveAck.selective
 						ackProgress = beginTransferProgress(progressObserver, ackProgress, nil)
 					}
-					ackHandoffTimeout := self.settings.ReceiveBufferSettings.
-						ackHandoffTimeout(transportType)
+					// This pump reads every sequence and route. A busy ACK owner
+					// must not stop it from reaching other feedback or data.
 					result := self.sendBuffer.ackMessageDetailed(
 						source.SourceId,
 						receiveAck,
-						ackHandoffTimeout,
+						0,
 					)
 					self.recordReceiveAckHandoff(result)
 					if progressObserver != nil {
@@ -5141,8 +5137,6 @@ func (self *Client) run() {
 					if paidRoot != nil {
 						paidRoot.admissionLock.Unlock()
 					}
-					handoffTimeout := self.settings.ReceiveBufferSettings.
-						packHandoffTimeout(transportType, carrierReliability)
 					packProgress := progress
 					if progressObserver != nil {
 						packProgress.Stage = "receive_pack_begin"
@@ -5153,7 +5147,11 @@ func (self *Client) run() {
 						packProgress.NoAck = pack.Nack
 						packProgress = beginTransferProgress(progressObserver, packProgress, nil)
 					}
-					success, err := self.receiveBuffer.Pack(receivePack, handoffTimeout)
+					// An unrelated callback may hold this sequence indefinitely.
+					// Refuse without ACK and return this decoded owner so the
+					// shared reader can reach ACKs; reliable originals retain
+					// their sender retry owner. Dedicated Pack callers may wait.
+					success, err := self.receiveBuffer.Pack(receivePack, 0)
 					endTransferProgress(progressObserver, packProgress, "receive_pack_end", success && err == nil, err)
 					if !success {
 						receivePack.sequenceQueueByteCount = 0
@@ -8385,7 +8383,18 @@ func (self *SendSequence) ackMessageDetailed(
 	timeout time.Duration,
 ) (receiveAckHandoffResult, error) {
 	ack.receivedAtNanos = self.client.feedbackArrivalNanos(time.Now())
-	self.ackMutex.Lock()
+	if timeout == 0 {
+		if !self.ackMutex.TryLock() {
+			select {
+			case <-self.ctx.Done():
+				return receiveAckHandoffSequenceClosed, errors.New("Done.")
+			default:
+				return receiveAckHandoffQueueFull, nil
+			}
+		}
+	} else {
+		self.ackMutex.Lock()
+	}
 	defer self.ackMutex.Unlock()
 
 	if self.sequenceId != ack.sequenceId {
@@ -15344,24 +15353,20 @@ type ReceiveBufferSettings struct {
 	// opt-in diagnostic; default mobile, desktop, and server paths avoid the
 	// extra scan.
 	PackQueueRetainedByteAccounting bool
-	// H1PackHandoffTimeout applies bounded reader backpressure only after an
-	// unclassified legacy H1 ReceiveSequence handoff is full. Exact production
-	// lanes use ReliablePackHandoffTimeout below. This field remains for custom
-	// readers that report only TransportType.
-	// A positive value is a total wait bound, not a per-retry delay. A negative
-	// value waits until capacity or sequence/client cancellation, extending an
-	// already-reliable H1 stream's backpressure without enlarging the channel.
+	// H1PackHandoffTimeout retains the legacy H1 policy for dedicated
+	// per-sequence callers. The shared Client pump never inherits this wait.
+	// Positive capacity waits begin after acquiring the admission mutex;
+	// negative values wait for capacity or cancellation. Zero also refuses a
+	// busy admission mutex without transferring ownership.
 	H1PackHandoffTimeout time.Duration
-	// ReliablePackHandoffTimeout applies to an exact route explicitly published
-	// as reliable (H1, H3/DNS QUIC stream, SCTP, or a framed server exchange).
-	// A negative value waits for capacity or cancellation without enlarging the
-	// queue. Zero preserves nonblocking behavior for explicitly customized
-	// settings; production defaults to a cancellation-bounded wait.
+	// ReliablePackHandoffTimeout is the dedicated-caller policy for an exact
+	// reliable lane (H1, H3/DNS QUIC stream, SCTP or framed server exchange).
+	// The default remains a cancellation-bounded wait for compatibility;
+	// canonical shared Client admission is always zero, for every carrier.
 	ReliablePackHandoffTimeout time.Duration
-	// H1AckHandoffTimeout applies the same reliable-carrier backpressure rule
-	// when an inbound ACK burst momentarily fills its SendSequence queue. ACK
-	// objects are compact values; this wait does not retain the carrier frame.
-	// H3 and unknown carriers always remain nonblocking.
+	// H1AckHandoffTimeout retains the dedicated legacy ACK-channel policy.
+	// Production ACK state coalesces compact values, and the shared Client
+	// pump always refuses a busy ACK admission owner without waiting.
 	H1AckHandoffTimeout time.Duration
 	// AckBufferSize int
 
@@ -16618,11 +16623,24 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 }
 
 // success, error
-// Concurrent callers serialize on packMutex. The canonical Client has one
-// receive pump, so its physical-lane cancellation can end the admission wait
-// without depending on a separate caller that holds this logical queue lock.
+// Dedicated callers may serialize and wait for capacity. A zero-time caller
+// also refuses a busy admission owner before binding or charging its Pack; the
+// shared Client pump must not wait behind an independent explicit-wait caller.
 func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
-	self.packMutex.Lock()
+	if timeout == 0 {
+		if !self.packMutex.TryLock() {
+			select {
+			case <-receivePack.carrierDone:
+				return false, errors.New("receive carrier closed")
+			case <-self.ctx.Done():
+				return false, errors.New("Done.")
+			default:
+				return false, nil
+			}
+		}
+	} else {
+		self.packMutex.Lock()
+	}
 	defer self.packMutex.Unlock()
 
 	select {

@@ -335,10 +335,9 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 }
 
 // TestSharedClientReceivePumpHandoffsUseCarrierPolicy pins the two admissions
-// that run before per-sequence callbacks. Pack may use only the bounded
-// exact carrier-lane handoff policy. Neither may inherit
-// ClientSettings.BufferTimeout; reliable lanes wait and datagrams remain
-// zero-wait independently of the broad transport family.
+// before per-sequence callbacks. The shared pump must not wait for capacity or
+// another admission owner, regardless of carrier or configured dedicated-API
+// timeouts. Physical carrier receipts and classification remain route-owned.
 func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 	parsed := parseProductionGo(t)
 	body := findReceiveCallbackBody(t, parsed, receiveCallbackBody{
@@ -347,22 +346,7 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 		method:   "run",
 	})
 	counts := map[string]int{}
-	packTimeoutPolicyCount := 0
-	ackTimeoutPolicyCount := 0
 	ast.Inspect(body, func(node ast.Node) bool {
-		assignment, ok := node.(*ast.AssignStmt)
-		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&
-			formatAstExpr(t, parsed.fileSet, assignment.Lhs[0]) == "handoffTimeout" &&
-			strings.Join(strings.Fields(formatAstExpr(t, parsed.fileSet, assignment.Rhs[0])), "") ==
-				"self.settings.ReceiveBufferSettings.packHandoffTimeout(transportType,carrierReliability)" {
-			packTimeoutPolicyCount++
-		}
-		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&
-			formatAstExpr(t, parsed.fileSet, assignment.Lhs[0]) == "ackHandoffTimeout" &&
-			strings.Join(strings.Fields(formatAstExpr(t, parsed.fileSet, assignment.Rhs[0])), "") ==
-				"self.settings.ReceiveBufferSettings.ackHandoffTimeout(transportType)" {
-			ackTimeoutPolicyCount++
-		}
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -384,22 +368,12 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 			return true
 		}
 		timeout := formatAstExpr(t, parsed.fileSet, call.Args[argumentIndex])
-		if name == "self.receiveBuffer.Pack" && timeout != "handoffTimeout" {
+		if timeout != "0" {
 			position := parsed.fileSet.Position(call.Pos())
-			t.Errorf("%s timeout = %s at %s, want carrier handoffTimeout", name, timeout, position)
-		}
-		if name == "self.sendBuffer.ackMessageDetailed" && timeout != "ackHandoffTimeout" {
-			position := parsed.fileSet.Position(call.Pos())
-			t.Errorf("%s timeout = %s at %s, want carrier ackHandoffTimeout", name, timeout, position)
+			t.Errorf("%s timeout = %s at %s, want literal zero for the shared pump", name, timeout, position)
 		}
 		return true
 	})
-	if packTimeoutPolicyCount != 1 {
-		t.Errorf("carrier Pack timeout policy assignment count = %d, want 1", packTimeoutPolicyCount)
-	}
-	if ackTimeoutPolicyCount != 1 {
-		t.Errorf("carrier ACK timeout policy assignment count = %d, want 1", ackTimeoutPolicyCount)
-	}
 	for _, name := range []string{"self.receiveBuffer.Pack", "self.sendBuffer.ackMessageDetailed"} {
 		if counts[name] != 1 {
 			t.Errorf("%s call count = %d, want 1", name, counts[name])
