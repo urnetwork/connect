@@ -351,6 +351,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// loss, and short enough that a provider the window has not seen for
 		// longer is found again through discovery like any other
 		RecentExitMemoryTimeout: 5 * time.Minute,
+		// long enough that a pool whose few providers do not answer is not
+		// drawn again every round, short enough that a provider that was only
+		// briefly failing is back within minutes
+		EvaluationFailureCooloff: 5 * time.Minute,
 		// the egress-dial lines' cadence (controlDialLogInterval)
 		EvaluationFailureLogInterval: 5 * time.Second,
 		// WindowMaxScale:              4.0,
@@ -1086,6 +1090,11 @@ type MultiClientSettings struct {
 	// Non-positive disables the memory: lost exits are replaced by discovery
 	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
 	RecentExitMemoryTimeout time.Duration
+	// EvaluationFailureCooloff is how long a window leaves out of its
+	// discovery a provider whose candidate failed evaluation, or whose exit a
+	// verdict removed (ip_remote_multi_client_cooloff.go). Non-positive
+	// disables the cool-off: the next round may offer the same provider again.
+	EvaluationFailureCooloff time.Duration
 	// EvaluationFailureLogInterval is the per-line-shape emission floor for a
 	// window's unconditional evaluation-failure lines: client create, ping,
 	// budget and empty-enumerate failures. A hung window retries
@@ -12685,6 +12694,12 @@ type multiClientWindow struct {
 	// The exits any other window lost to an outage of ours, for the rounds
 	// that re-form it to ask for first. Its own lock inside.
 	recentExits recentExitMemory
+
+	// --- cool-off (see ip_remote_multi_client_cooloff.go) ---
+
+	// The providers this window found failing, left out of its discovery
+	// until their cool-off ends. Its own lock inside.
+	cooloff destinationCooloff
 }
 
 func newMultiClientWindow(
@@ -13469,6 +13484,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			self.stateLock.Unlock()
 			self.addServiceRefreshExclusions(windowDestinations)
+			self.addCooloffExclusions(windowDestinations)
 			return windowDestinations
 		}
 
@@ -13780,6 +13796,10 @@ func (self *windowErrorRemoval) cause() windowRemovalCause {
 func (self *windowErrorRemoval) finish() {
 	if self.rememberLostExit {
 		self.window.rememberRecentExit(self.client, self.lostExit, self.lostExitMaxCount)
+	} else if !self.stickyExit && providerVerdictErr(self.err) {
+		// a verdict against the provider that the recent-exit memory did not
+		// keep as an outage of ours: discovery leaves it out for a while
+		self.window.noteFailedDestination(self.client.Destination())
 	}
 }
 
@@ -15367,6 +15387,7 @@ requestCandidates:
 				}
 				if providerFailure {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
+					self.noteFailedDestination(args.Destination)
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
@@ -15445,6 +15466,7 @@ requestCandidates:
 					state := ProviderStateNotAdded
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
+						self.noteFailedDestination(args.Destination)
 					}
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
