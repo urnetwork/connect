@@ -116,18 +116,36 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   are a fixed set, `wellKnownResolverAddrs` (`ip_block_action.go`): every
   endpoint of the pair tables and of the defaults, so Google and OpenDNS
   stay in both.
-- The policy-filter guard (`parseDohWire`, `dnsResponseUsable`): every DoH
-  query carries an EDNS OPT record; a response with an extended DNS error of
-  4, 15, 16, 17 or 18 under any RCODE, or a NOERROR with only `0.0.0.0` or
-  `::`, is neither an answer nor a miss, never ends the race, earns no
-  success credit and is never cached. When every server is filtered or
-  failed the lookup is a SERVFAIL, with serve-stale. A miss that one server
-  alone reported is cached for `LoneMissExpiration` (30 s), not
-  `MissExpiration`. The guard applies to every resolver list, so a preset
-  that wants its sink answers delivered (B4) needs an exception.
+- The policy-filter guard (`dohBuiltInEndpoints`, `dohGuardedResult`,
+  `dnsResponseFiltered`) covers the built-in endpoints only: the urls of the
+  default remote and local DoH lists and of the regional bootstrap presets
+  (`regionalControlDohServers`, which the ingress strategy and the bootstrap
+  lists draw on), matched by url with the ip in canonical form and the
+  default port and trailing slashes ignored. From a built-in endpoint a
+  response with an extended DNS error of 4, 15, 16, 17 or 18 under any
+  RCODE, or a NOERROR with only `0.0.0.0` or `::`, is neither an answer nor
+  a miss: it never ends the race, earns no success credit and is never
+  cached, and a `0.0.0.0` or `::` beside real addresses is dropped. When
+  every server is filtered or failed the lookup is a SERVFAIL, with
+  serve-stale. Any other server, one the user added or a preset (B4), is
+  answered as it answers: its sink answers and extended-error NXDOMAINs are
+  answers and misses, cached as usual. A user who names a built-in endpoint
+  in their own list (9.9.9.9, say) gets the guard for that endpoint. Plain
+  DNS has no guard: it runs through `net.Resolver`, which shows neither the
+  extended error nor which server answered.
+- Every DoH query carries an EDNS OPT record (UDP size 1232, DO clear). The
+  mux returns a forwarded response without the upstream's OPT record to a
+  client whose query had none (RFC 6891 §7, `dnsResponseForResponder`), and
+  with it to a client that sent one. Its synthesized A and AAAA replies
+  carry no OPT record for any client.
+- A miss that one source alone reported, an operator's v4 and v6 endpoints
+  counting as one source, and that source a built-in endpoint, is cached
+  for `LoneMissExpiration` (30 s), not `MissExpiration`. A custom server's
+  miss is cached as usual.
 - `net_http_doh_removed_operators_test.go` reads every default, regional,
-  ingress and bootstrap list, and `net_http_doh_ede_guard_test.go` pins the
-  guard. Probe targets (`ip_probe_targets.go`) and ICE address discovery
+  ingress and bootstrap list, `net_http_doh_ede_guard_test.go` pins the
+  guard and its scope, and `ip_mux_dns_edns_test.go` pins the OPT rule.
+  Probe targets (`ip_probe_targets.go`) and ICE address discovery
   (`ice_net.go`) still name Google, and the probe pool names OpenDNS; they
   are not resolver lists.
 - sdk migrates saved records. `DefaultServersVersion` 1 (sdk `d1e5e9fd`): a
@@ -167,22 +185,23 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
    resolves the name" (`net_http_doh.go:1894-1905`). The opaque path takes the
    first NOERROR or NXDOMAIN (`:2186-2215`). A filtering resolver mixed with
    an unfiltered one therefore does not filter. On `fix/default-resolvers-v2`
-   the policy-filter guard goes further (3.1): a response with an extended
-   DNS error of 4 or 15-18, or only `0.0.0.0`/`::`, is never an answer on
-   either path, and a server list of filtering resolvers alone gets a SERVFAIL
-   for a blocked name.
+   the policy-filter guard goes further for the built-in endpoints (3.1):
+   from them a response with an extended DNS error of 4 or 15-18, or only
+   `0.0.0.0`/`::`, is never an answer on either path. A server the user added
+   is outside the guard, so a list of filtering resolvers alone filters.
 6. The resolver chain does not stop at a DoH NXDOMAIN: local DoH, remote
    plain DNS and local plain DNS run whenever DoH produced no addresses and
    their toggle is on, without checking the miss (`net_http_doh.go:1195,
    1208, 1231`). Only the bootstrap plain fallback checks it (`:1254`).
 7. An NXDOMAIN becomes an empty NOERROR for A and AAAA (`buildDnsResponse`,
    `ip_mux_upgrade.go:2344-2381`). At `bc3fec12` an answer of `0.0.0.0` or
-   `::` counts as records (`parseDohWire`, `net_http_doh.go:2217-2283`; the
-   guard on `fix/default-resolvers-v2` makes it a filtered response), is recorded in the
-   reverse index (`ip_mux_upgrade.go:1852-1854`) and is bound to the exit that
-   carried the DoH flow (`net_http_doh.go:1181-1189`, `bindDnsResultToExit`
-   `ip_mux_upgrade.go:2734-2756`). A REFUSED or SERVFAIL is a resolver
-   failure, not an answer (`net_http_doh.go:2227-2234`).
+   `::` counts as records (`parseDohWire`, `net_http_doh.go:2217-2283`; on
+   `fix/default-resolvers-v2` it is a filtered response from a built-in
+   endpoint and still counts as records from any other server), is
+   recorded in the reverse index (`ip_mux_upgrade.go:1852-1854`) and is
+   bound to the exit that carried the DoH flow (`net_http_doh.go:1181-1189`,
+   `bindDnsResultToExit` `ip_mux_upgrade.go:2734-2756`). A REFUSED or
+   SERVFAIL is a resolver failure, not an answer (`net_http_doh.go:2227-2234`).
 8. On failure the mux sends no answer and the client retries
    (`ip_mux_upgrade.go:1822-1830`). A cached answer can be served up to five
    minutes stale while fresh resolution fails (`net_http_doh.go:44-56`). A cold
@@ -802,14 +821,20 @@ blocker's rule (`ip_mux_upgrade.go:1658-1660`); without it every blocked name
 lands on one reverse-index entry for `0.0.0.0`. The answer is still cached
 for its TTL; a preset change swaps the cache (3.2 step 11).
 
-Open point (from `fix/default-resolvers-v2`): the policy-filter guard (3.1)
-treats `0.0.0.0`, `::` and an extended DNS error of 4 or 15-18 as no answer
-for every resolver list, so today a preset's blocked name gets a SERVFAIL
-(the mux sends nothing and the client retries) rather than the sink answer
-this section asks for. A preset therefore needs the guard off for its own
-servers, for example a flag on its resolver settings that the sdk sets only
-for a preset or a user's own filtering list. The same applies to a user who
-already names a filtering resolver as their whole custom list.
+Presets are outside the policy-filter guard (decided 2026-11-08 in the
+review of `fix/default-resolvers-v2`). The guard (3.1) covers only the
+built-in endpoints, so a preset's `0.0.0.0` sink answer and Quad9's
+NXDOMAIN with EDE 17 reach the client as the answer and are cached as
+usual; a preset needs no flag for it, and neither does a user's own
+filtering list. The guard follows the endpoint, not the list: a preset url
+that is also a built-in endpoint keeps the guard. Of the presets in A3
+only `quad9` names built-in endpoints (`https://9.9.9.9/dns-query` and
+`https://[2620:fe::fe]/dns-query`); as listed, its blocks from those two
+are no answer, and only its secondaries (`149.112.112.112`,
+`[2620:fe::9]`) deliver them. Before it ships, the preset names only the
+secondaries, or the guard skips the urls of a selected preset, or the
+preset is dropped because the defaults already carry Quad9. That choice is
+the owner's.
 
 A REFUSED or SERVFAIL is a resolver failure to the mux (3.2 step 7). No
 one-tap preset uses them to block. A personal configuration can: AdGuard

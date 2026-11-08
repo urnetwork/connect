@@ -64,9 +64,11 @@ When `Dns.Resolver` is set, `onSend` claims single A/AAAA queries to UDP/53:
    failing fast; retrying aggressively up front would only re-hit the not-yet-ready path. The
    resolver fans out to multiple providers in parallel and the first to return records wins (default
    set: Cloudflare at 1.1.1.1 and 1.0.0.1, and Quad9, all RFC 8484 wire-format; Google Public DNS and
-   OpenDNS are not defaults, see `DefaultDnsResolverSettings`). A policy-filtered response (an
-   extended DNS error of 4 or 15-18, or only `0.0.0.0`/`::`) never wins and is never cached
-   (`parseDohWire`). Concurrent identical queries coalesce onto one
+   OpenDNS are not defaults, see `DefaultDnsResolverSettings`). A built-in endpoint's
+   policy-filtered response (an extended DNS error of 4 or 15-18, or only `0.0.0.0`/`::`) never
+   wins and is never cached (`dohBuiltInEndpoints`); a server the user added answers as it answers,
+   sink answers included. A forwarded response reaches a client whose query had no OPT record
+   without the upstream's OPT (RFC 6891). Concurrent identical queries coalesce onto one
    resolution (single-flight), concurrent resolutions are bounded (`MaxConcurrentResolutions`), and
    each DoH h2 connection is kept warm with keepalive PINGs so bursty lookups don't re-pay a
    handshake over the tunnel.
