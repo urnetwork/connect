@@ -117,10 +117,11 @@ type stickyRigSettings struct {
 	bMode   EncryptionMode
 	aSticky bool
 	bSticky bool
-	// how long every contract runs; zero leaves contracts with no deadline
-	contractLife time.Duration
-	mutateA      func(*ClientSettings)
-	mutateB      func(*ClientSettings)
+	// how long each client's contracts run; zero leaves them no deadline
+	aContractLife time.Duration
+	bContractLife time.Duration
+	mutateA       func(*ClientSettings)
+	mutateB       func(*ClientSettings)
 }
 
 // Two clients on a tapped loopback, granted Network contracts by each other.
@@ -139,8 +140,8 @@ type stickyRig struct {
 	eventsB   chan EncryptionEventType
 	// the audits b sent
 	auditsB chan *protocol.PeerAudit
-	// what every contract carries, zero for no deadline
-	contractDeadlineUnixMilli int64
+	// what a's contracts carry, zero for no deadline
+	aContractDeadlineUnixMilli int64
 }
 
 func stickyReceives(client *Client) chan string {
@@ -183,14 +184,19 @@ func newStickyRig(t *testing.T, ctx context.Context, rigSettings stickyRigSettin
 		bWire:     &stickyWire{},
 		auditsB:   make(chan *protocol.PeerAudit, 1024),
 	}
-	var contractExpirationUnixMilli func() *int64
-	if 0 < rigSettings.contractLife {
-		rig.contractDeadlineUnixMilli = time.Now().Add(rigSettings.contractLife).UnixMilli()
-		contractExpirationUnixMilli = func() *int64 {
-			deadline := rig.contractDeadlineUnixMilli
-			return &deadline
+	contractExpiration := func(life time.Duration) (func() *int64, int64) {
+		if life == 0 {
+			return nil, 0
 		}
+		deadline := time.Now().Add(life).UnixMilli()
+		return func() *int64 {
+			contractDeadline := deadline
+			return &contractDeadline
+		}, deadline
 	}
+	aContractExpiration, aContractDeadline := contractExpiration(rigSettings.aContractLife)
+	bContractExpiration, _ := contractExpiration(rigSettings.bContractLife)
+	rig.aContractDeadlineUnixMilli = aContractDeadline
 
 	aSend := make(chan []byte)
 	aTapped := make(chan []byte)
@@ -231,7 +237,7 @@ func newStickyRig(t *testing.T, ctx context.Context, rigSettings stickyRigSettin
 		destClientPublicKey: func(destinationId Id) []byte {
 			return rig.b.ClientKeyManager().PublicKey()
 		},
-		contractExpirationUnixMilli: contractExpirationUnixMilli,
+		contractExpirationUnixMilli: aContractExpiration,
 	}
 	bOob := &stickyAuditOob{
 		grantingClientOob: &grantingClientOob{
@@ -243,7 +249,7 @@ func newStickyRig(t *testing.T, ctx context.Context, rigSettings stickyRigSettin
 			destClientPublicKey: func(destinationId Id) []byte {
 				return rig.a.ClientKeyManager().PublicKey()
 			},
-			contractExpirationUnixMilli: contractExpirationUnixMilli,
+			contractExpirationUnixMilli: bContractExpiration,
 		},
 		audits: rig.auditsB,
 	}
@@ -814,10 +820,11 @@ func TestStickyRequiredOutlivesTheSessionInsideTheContract(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	rig := newStickyRig(t, ctx, stickyRigSettings{
-		aMode:        EncryptionModeOpportunistic,
-		bMode:        EncryptionModeOpportunistic,
-		aSticky:      true,
-		contractLife: time.Hour,
+		aMode:         EncryptionModeOpportunistic,
+		bMode:         EncryptionModeOpportunistic,
+		aSticky:       true,
+		aContractLife: time.Hour,
+		bContractLife: time.Hour,
 	})
 	rig.seal(t)
 	readable := rig.aWire.readable()
@@ -832,19 +839,23 @@ func TestStickyRequiredOutlivesTheSessionInsideTheContract(t *testing.T) {
 }
 
 // Both ends learn the deadline from the contract: a from the one it took, b from
-// the one it verified.
+// the one it verified. Each client's contracts run differently, and a's run longer,
+// so an end can only reach that deadline through its own side of the contract: a
+// through what it took, and b, whose own contracts stop short of it, through what it
+// verified.
 func TestStickyRequiredRunsToTheSignedDeadlineOnBothEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	rig := newStickyRig(t, ctx, stickyRigSettings{
-		aMode:        EncryptionModeOpportunistic,
-		bMode:        EncryptionModeOpportunistic,
-		aSticky:      true,
-		bSticky:      true,
-		contractLife: time.Hour,
+		aMode:         EncryptionModeOpportunistic,
+		bMode:         EncryptionModeOpportunistic,
+		aSticky:       true,
+		bSticky:       true,
+		aContractLife: 2 * time.Hour,
+		bContractLife: time.Hour,
 	})
 	rig.seal(t)
-	deadline := uint64(rig.contractDeadlineUnixMilli)
+	deadline := uint64(rig.aContractDeadlineUnixMilli)
 	for _, side := range []struct {
 		client *Client
 		peerId Id
