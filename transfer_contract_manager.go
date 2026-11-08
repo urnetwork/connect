@@ -2446,7 +2446,7 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	unackedByteCount ByteCount,
 	checkpoint bool,
 ) {
-	if self.withholdPeerWindowReport(contractId, ackedByteCount+unackedByteCount) {
+	if self.withholdPeerWindowReport(contractId, ackedByteCount, unackedByteCount, checkpoint) {
 		return
 	}
 	self.closeContractWithPendingReport(contractId, ackedByteCount, unackedByteCount, checkpoint, self.newContractCloseReport(contractId, checkpoint))

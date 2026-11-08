@@ -12,7 +12,12 @@
 //
 // A contract held before the mark stays out of the ledger and reports exactly,
 // as it always has: the caller retires those (`RetirePeerContracts`) before its
-// next frame. At a window's end the pair's send sequences move off its contracts,
+// next frame. A receive window is opened by the contract that carried the peer's
+// marking frame, or its answer to this client's, which the caller adopts
+// (`AdoptPeerWindowContract`): the adopted contract is the window's first, and one
+// created before it leaves the window, or never joins, and reports exactly, since
+// its peer took it before marking and retired it. At a window's end the pair's send
+// sequences move off its contracts,
 // as they would at expiry, onto a new contract each, taken at once with its
 // successor requested then, so a later window opens at a window's end and not at
 // whatever frame comes next. The reports follow the move, so the contracts they
@@ -132,8 +137,13 @@ type peerWindowContract struct {
 	grantByteCount          ByteCount
 	expirationTimeUnixMilli *int64
 	window                  *peerWindow
-	// what withheld reports counted
-	reportedByteCount ByteCount
+	// The reports withheld while its window was open, in order and as their
+	// holders asked for them, so a contract that leaves its window before the end
+	// reports exactly what it would have.
+	heldReports []peerWindowHeldReport
+	// A close was asked for from outside while its window was open: the other
+	// party is done with the contract, or no sequence holds it.
+	closeRequested bool
 	// The running count of the sequence holding it, nil when none does. Its
 	// owner keeps it current, which is how a window's end reads a contract
 	// that no report has closed.
@@ -146,11 +156,28 @@ type peerWindowContract struct {
 
 // What this client has counted on the contract, acked and unacked.
 func (self *peerWindowContract) countedByteCount() ByteCount {
-	byteCount := self.reportedByteCount
+	byteCount := ByteCount(0)
+	for _, heldReport := range self.heldReports {
+		byteCount += heldReport.ackedByteCount + heldReport.unackedByteCount
+	}
 	if self.live != nil {
 		byteCount += ByteCount(self.live.usedByteCount.Load())
 	}
 	return byteCount
+}
+
+// One report a holder asked for, as it asked for it.
+type peerWindowHeldReport struct {
+	ackedByteCount   ByteCount
+	unackedByteCount ByteCount
+	checkpoint       bool
+}
+
+// A contract that left its window before the end, with what it withheld there.
+type peerWindowRelease struct {
+	contractId     Id
+	heldReports    []peerWindowHeldReport
+	closeRequested bool
 }
 
 // One direction's run of contracts with one peer.
@@ -160,6 +187,9 @@ type peerWindow struct {
 	startTime time.Time
 	endTime   time.Time
 	contracts map[Id]*peerWindowContract
+	// The receive contract an adoption made first, nil before one. No contract
+	// created before it belongs to the window.
+	firstContractId *Id
 	// no longer open: nothing joins it, and sequences leave its contracts
 	ended bool
 	// when its reports go out, once a pass has seen it end
@@ -218,6 +248,12 @@ func (self *peerWindow) reports() ([]peerWindowReport, ByteCount) {
 // deadline, so this needs no clock and both clients answer alike.
 func (self *peerWindow) opensNext(contractId Id, endTolerance time.Duration) bool {
 	return !peerWindowContractCreateTime(contractId).Before(self.endTime.Add(-endTolerance))
+}
+
+// Whether a contract with this id was created before the window's adopted first,
+// so it belongs to no window.
+func (self *peerWindow) precedesFirst(contractId Id) bool {
+	return self.firstContractId != nil && contractId.Cmp(*self.firstContractId) < 0
 }
 
 // The millisecond in an id's high bits, here the platform's clock at creation.
@@ -556,10 +592,9 @@ func (self *peerWindowLedger) taken(
 	return true
 }
 
-// A receive sequence registered a contract from this peer, or, with `adopted`,
-// the frame that marked the peer already rode one that its sequence holds. A
-// contract created before the mark or a previous window's end stays out, unless
-// adopted: its sender reports it exactly. Reports whether the contract is the
+// A receive sequence registered a contract from this peer. A contract created
+// before the mark, a previous window's end or the window's adopted first stays
+// out: its sender reports it exactly. Reports whether the contract is the
 // ledger's.
 func (self *peerWindowLedger) received(
 	peerId Id,
@@ -567,7 +602,6 @@ func (self *peerWindowLedger) received(
 	grantByteCount ByteCount,
 	expirationTimeUnixMilli *int64,
 	live *contractStatsEntry,
-	adopted bool,
 	now time.Time,
 ) bool {
 	self.stateLock.Lock()
@@ -578,22 +612,20 @@ func (self *peerWindowLedger) received(
 		return false
 	}
 	if contract := self.contracts[contractId]; contract != nil {
-		// a later sequence resumed it, or its holder is adopting it again
-		if !adopted {
-			contract.holderCount += 1
-		}
+		// a later sequence resumed it
+		contract.holderCount += 1
 		if !contract.window.reported {
 			contract.live = live
 		}
 		return true
 	}
-	if !adopted && peerWindowContractCreateTime(contractId).Before(
+	if peerWindowContractCreateTime(contractId).Before(
 		peer.receiveFloorTime.Add(-self.settings.EndTolerance),
 	) {
 		return false
 	}
 	window := self.ridingWindowWithLock(peerId, peer, PeerWindowReceive, contractId, now)
-	if window == nil {
+	if window == nil || window.precedesFirst(contractId) {
 		return false
 	}
 	contract := self.addContractWithLock(window, contractId, grantByteCount, expirationTimeUnixMilli)
@@ -601,6 +633,74 @@ func (self *peerWindowLedger) received(
 	contract.live = live
 	self.boundWindowEndWithLock(contract)
 	return true
+}
+
+// The frame that marked the peer, or the peer's answer to this client's marking
+// frame, rode this contract, which its receive sequence holds. The contract joins
+// the receive window, opening one if none is open and however old it is, and is the
+// window's first: each of the window's contracts created before it leaves, and is
+// returned with what it withheld so it reports exactly, and none created before it
+// joins later. Its peer took those before marking and retired them at its mark, so
+// it reports them exactly too. An open window is pinned once, by its first
+// adoption; a later one only joins. Reports whether the contract is the ledger's.
+func (self *peerWindowLedger) adopt(
+	peerId Id,
+	contractId Id,
+	grantByteCount ByteCount,
+	expirationTimeUnixMilli *int64,
+	live *contractStatsEntry,
+	now time.Time,
+) (bool, []peerWindowRelease) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	peer := self.peers[peerId]
+	if peer == nil {
+		return false, nil
+	}
+	contract := self.contracts[contractId]
+	if contract == nil {
+		window := self.ridingWindowWithLock(peerId, peer, PeerWindowReceive, contractId, now)
+		if window == nil || window.precedesFirst(contractId) {
+			return false, nil
+		}
+		contract = self.addContractWithLock(window, contractId, grantByteCount, expirationTimeUnixMilli)
+		contract.holderCount = 1
+		self.boundWindowEndWithLock(contract)
+	}
+	if !contract.window.reported {
+		contract.live = live
+	}
+	window := contract.window
+	if window.direction != PeerWindowReceive || window.ended || window.firstContractId != nil {
+		return true, nil
+	}
+	firstContractId := contractId
+	window.firstContractId = &firstContractId
+	releases := []peerWindowRelease{}
+	for otherContractId, other := range window.contracts {
+		if otherContractId.Cmp(contractId) < 0 {
+			delete(window.contracts, otherContractId)
+			delete(self.contracts, otherContractId)
+			releases = append(releases, peerWindowRelease{
+				contractId:     otherContractId,
+				heldReports:    other.heldReports,
+				closeRequested: other.closeRequested,
+			})
+		}
+	}
+	if 0 < len(releases) {
+		// One of those opened the window, so it opens again with its first, as the
+		// peer's did, and ends by that contract's deadline. A listener hears of it
+		// again.
+		window.startTime = now
+		window.endTime = now.Add(self.settings.WindowDuration)
+		for _, remaining := range window.contracts {
+			self.boundWindowEndWithLock(remaining)
+		}
+		self.openedWindows[peerWindowKey{peerId: peerId, direction: PeerWindowReceive}] = window
+	}
+	return true, releases
 }
 
 // The running count of a send contract, once its sequence has made it current.
@@ -622,7 +722,12 @@ func (self *peerWindowLedger) attachLive(contractId Id, live *contractStatsEntry
 // A holder reports this contract. The ledger keeps every report of its contracts
 // and answers true: the count goes to its window, and once the window has
 // reported it goes nowhere. False leaves the report to go out as it always has.
-func (self *peerWindowLedger) withhold(contractId Id, byteCount ByteCount) bool {
+func (self *peerWindowLedger) withhold(
+	contractId Id,
+	ackedByteCount ByteCount,
+	unackedByteCount ByteCount,
+	checkpoint bool,
+) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -631,7 +736,11 @@ func (self *peerWindowLedger) withhold(contractId Id, byteCount ByteCount) bool 
 		return false
 	}
 	if !contract.window.reported {
-		contract.reportedByteCount += byteCount
+		contract.heldReports = append(contract.heldReports, peerWindowHeldReport{
+			ackedByteCount:   ackedByteCount,
+			unackedByteCount: unackedByteCount,
+			checkpoint:       checkpoint,
+		})
 		contract.live = nil
 	}
 	if 0 < contract.holderCount {
@@ -639,6 +748,24 @@ func (self *peerWindowLedger) withhold(contractId Id, byteCount ByteCount) bool 
 	}
 	if contract.window.reported && contract.holderCount == 0 {
 		delete(self.contracts, contractId)
+	}
+	return true
+}
+
+// A close was asked for from outside. The ledger keeps the request with the
+// contract and answers true: the window's report is the contract's final, and a
+// contract that leaves its window early carries the request out then. False
+// leaves the request to be carried out as it always has.
+func (self *peerWindowLedger) withholdCloseRequest(contractId Id) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	contract := self.contracts[contractId]
+	if contract == nil {
+		return false
+	}
+	if !contract.window.reported {
+		contract.closeRequested = true
 	}
 	return true
 }
@@ -794,10 +921,11 @@ func (self *peerWindowLedger) nextWait(now time.Time) (time.Duration, bool) {
 // From the mark on, the first contract this client takes to the peer opens the
 // send window, and the first one it receives from the peer opens the receive
 // window. A caller that gets true retires what it already holds
-// (`RetirePeerContracts`) before its next frame to the peer, and one that marks on
+// (`RetirePeerContracts`) before its next frame to the peer. One that marks on
 // receipt of a frame also calls `AdoptPeerWindowContract`, since that frame rode a
-// contract already held. Off lets the windows already open run to their end, and
-// their reports go out then.
+// contract already held, and one that marks before sending calls it on the peer's
+// answer, which makes the answer's contract its receive window's first. Off lets
+// the windows already open run to their end, and their reports go out then.
 func (self *ContractManager) SetPeerWindowAccounting(peerId Id, accounting bool) bool {
 	ledger := self.openPeerWindowLedger(accounting)
 	if ledger == nil {
@@ -866,11 +994,16 @@ func (self *ContractManager) AddPeerWindowCallback(callback PeerWindowFunction) 
 	}
 }
 
-// Joins the contract the peer's last frame on `transferKey` rode to the receive
-// window, for a caller that marks a peer on receipt of that frame: its contract
-// was registered before the mark, so nothing else would bring it in and it would
-// report exactly. `transferKey` is the callback's `Peer.TransferKey`, which names
-// the one sequence the frame rode. Reports whether a contract joined.
+// Makes the contract the peer's last frame on `transferKey` rode the receive
+// window's first. A caller that marks a peer on receipt of a frame adopts that
+// frame's contract, which was registered before the mark, so nothing else would
+// bring it in and it would report exactly. A caller that marked before sending
+// adopts the contract of the peer's answer, so a contract its peer took before
+// marking, such as one that carried a session's handshake, leaves the window. Such
+// a contract reports at once what it withheld, as it would have without the
+// window, and from then on reports exactly. `transferKey` is the callback's
+// `Peer.TransferKey`, which names the one sequence the frame rode. Reports whether
+// the contract is the window's. Never blocks, so a receive callback may call it.
 func (self *ContractManager) AdoptPeerWindowContract(peerId Id, transferKey TransferKey) bool {
 	ledger := self.peerWindows.Load()
 	if ledger == nil {
@@ -880,15 +1013,33 @@ func (self *ContractManager) AdoptPeerWindowContract(peerId Id, transferKey Tran
 	if contract == nil {
 		return false
 	}
-	adopted := ledger.received(
+	adopted, releases := ledger.adopt(
 		peerId,
 		contract.contractId,
 		contract.transferByteCount,
 		contract.expirationTimeUnixMilli,
 		contract.statsEntry,
-		true,
 		time.Now(),
 	)
+	for _, release := range releases {
+		for _, heldReport := range release.heldReports {
+			self.closeContractWithPendingReport(
+				release.contractId,
+				heldReport.ackedByteCount,
+				heldReport.unackedByteCount,
+				heldReport.checkpoint,
+				self.newContractCloseReport(release.contractId, heldReport.checkpoint),
+			)
+		}
+		if release.closeRequested {
+			// as the platform's close would have gone: to the receive sequence that
+			// holds the contract, else a zero final behind the reports above
+			receiveSequence := self.client.receiveBuffer.contractHolders.find(release.contractId)
+			if receiveSequence == nil || !receiveSequence.requestCloseContract(release.contractId) {
+				self.requestContractClose(release.contractId)
+			}
+		}
+	}
 	if adopted {
 		self.wakePeerWindows()
 	}
@@ -1029,9 +1180,14 @@ func (self *ContractManager) removeUnheldPeerContractsWithLock(peerId Id) []*pro
 }
 
 // Keeps a report the ledger answers for, and reports whether it did.
-func (self *ContractManager) withholdPeerWindowReport(contractId Id, byteCount ByteCount) bool {
+func (self *ContractManager) withholdPeerWindowReport(
+	contractId Id,
+	ackedByteCount ByteCount,
+	unackedByteCount ByteCount,
+	checkpoint bool,
+) bool {
 	ledger := self.peerWindows.Load()
-	if ledger == nil || !ledger.withhold(contractId, byteCount) {
+	if ledger == nil || !ledger.withhold(contractId, ackedByteCount, unackedByteCount, checkpoint) {
 		return false
 	}
 	// its sequence stops updating the contract here, as at any report
@@ -1039,11 +1195,13 @@ func (self *ContractManager) withholdPeerWindowReport(contractId Id, byteCount B
 	return true
 }
 
-// Whether the ledger answers for this contract, so a close asked for from
-// outside changes nothing: the report goes out at the window's end.
-func (self *ContractManager) peerWindowOwns(contractId Id) bool {
+// Keeps a close asked for from outside when the ledger answers for the contract,
+// and reports whether it did. A kept request changes nothing now: the report goes
+// out at the window's end, or the request is carried out if the contract leaves
+// its window first.
+func (self *ContractManager) withholdPeerWindowCloseRequest(contractId Id) bool {
 	ledger := self.peerWindows.Load()
-	return ledger != nil && ledger.owns(contractId)
+	return ledger != nil && ledger.withholdCloseRequest(contractId)
 }
 
 // Whether the peer is in the mode.
@@ -1115,7 +1273,6 @@ func (self *ContractManager) notePeerWindowReceiveContract(contract *sequenceCon
 		contract.transferByteCount,
 		contract.expirationTimeUnixMilli,
 		contract.statsEntry,
-		false,
 		time.Now(),
 	) {
 		self.wakePeerWindows()

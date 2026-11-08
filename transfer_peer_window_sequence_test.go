@@ -308,35 +308,41 @@ func (self *peerWindowPairFixture) send(from *Client, to *Client, content string
 	self.finish(self.startSend(from, to, content, options...))
 }
 
+// The lane a client last heard its peer on.
+func (self *peerWindowPairFixture) transferKey(client *Client) TransferKey {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.transferKeys[client.ClientId()]
+}
+
 // Answers a client's last frame on the lane it came in on, as any reply does.
 func (self *peerWindowPairFixture) reply(from *Client, to *Client, content string) {
 	self.t.Helper()
-	self.stateLock.Lock()
-	transferKey := self.transferKeys[from.ClientId()]
-	self.stateLock.Unlock()
-	self.send(from, to, content, transferKey)
+	self.send(from, to, content, self.transferKey(from))
 }
 
 // What the caller above connect does around a marking exchange. The initiator
 // marks and retires before it sends. The other side marks on receipt, adopts what
-// the frame rode, and retires before it answers.
+// the frame rode, and retires before it answers. The initiator then adopts what
+// the answer rode.
 func (self *peerWindowPairFixture) markingExchange() {
 	self.t.Helper()
 	initiatorManager, responderManager := self.initiator.ContractManager(), self.responder.ContractManager()
-	if initiatorManager.SetPeerWindowAccounting(self.responder.ClientId(), true) {
+	initiatorMarked := initiatorManager.SetPeerWindowAccounting(self.responder.ClientId(), true)
+	if initiatorMarked {
 		initiatorManager.RetirePeerContracts(self.responder.ClientId())
 	}
 	self.send(self.initiator, self.responder, "marking-request")
 	if responderManager.SetPeerWindowAccounting(self.initiator.ClientId(), true) {
-		self.stateLock.Lock()
-		transferKey := self.transferKeys[self.responder.ClientId()]
-		self.stateLock.Unlock()
-		if !responderManager.AdoptPeerWindowContract(self.initiator.ClientId(), transferKey) {
+		if !responderManager.AdoptPeerWindowContract(self.initiator.ClientId(), self.transferKey(self.responder)) {
 			self.t.Fatal("the marking frame's contract could not be adopted")
 		}
 		responderManager.RetirePeerContracts(self.initiator.ClientId())
 	}
 	self.reply(self.responder, self.initiator, "marking-reply")
+	if initiatorMarked && !initiatorManager.AdoptPeerWindowContract(self.responder.ClientId(), self.transferKey(self.initiator)) {
+		self.t.Fatal("the answer's contract could not be adopted")
+	}
 }
 
 // The keepalive's exchange, as its caller notes it on both sides.
@@ -961,13 +967,13 @@ func TestPeerWindowOverflowRollsAndSpillsInsideTheWindow(t *testing.T) {
 
 // Under Required encryption a pair's direction has a sequence for each session
 // role, and replies ride the server role. A marking frame that starts a session
-// follows a handshake, whose contract the other side took before it marked: the
-// sender retires that contract exactly and opens its window with the next one,
-// while the receiver, already marked, counts it as first. The two clients then name
-// different firsts, which costs at most that window's debit and exposes nothing:
-// neither reports more than the floor, and the only exact count is the handshake's,
-// which carried nothing of the mode. The next
-// window, which a move opened, has one first on both clients in each direction.
+// follows a handshake, whose contract the other side took before it marked and
+// retires exactly at its mark. That contract opened the sender's receive window,
+// already marked, but the sender adopts what the answer rode, so the answer's
+// contract is that window's first and the handshake's leaves it. Both clients name
+// the answer's contract first, and both report the handshake's exactly, which
+// carried nothing of the mode. The next window, which a move opened, has one first
+// on both clients in each direction.
 func TestPeerWindowMoveUnderRequiredEncryption(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -984,10 +990,12 @@ func TestPeerWindowMoveUnderRequiredEncryption(t *testing.T) {
 			uint64(peerWindowFloorByteCount) <= handshakeReports[0].acked {
 			t.Fatalf("the retired handshake contract reported %+v, want its exact count at the mark", handshakeReports)
 		}
+		if f.initiator.ContractManager().peerWindows.Load().owns(handshake.contractId) {
+			t.Fatal("the handshake's contract stayed in the window the answer's contract opens")
+		}
 		f.keepaliveUntil(window.EndTime)
 		sleepUntilPeerWindowEvent(window.EndTime.Add(time.Second))
-		f.requireReport(initiatorId, handshake.contractId, uint64(peerWindowFloorByteCount))
-		f.requireReport(initiatorId, opening.contractId, 0)
+		f.requireReport(initiatorId, opening.contractId, uint64(peerWindowFloorByteCount))
 		f.requireReport(responderId, opening.contractId, uint64(peerWindowFloorByteCount))
 
 		next := f.sendWindow(f.initiator, f.responder)
@@ -1024,6 +1032,18 @@ func TestPeerWindowMoveUnderRequiredEncryption(t *testing.T) {
 				t.Fatalf("the clients name different firsts: %v and %v", initiatorFirsts, responderFirsts)
 			}
 		}
+
+		// the initiator's sequence lets the handshake's contract go by a trim or, once
+		// the pair is quiet, its exit, and reports what it counted, as the responder did
+		time.Sleep(f.initiator.settings.ReceiveBufferSettings.IdleTimeout + time.Second)
+		synctest.Wait()
+		initiatorHandshakeReports := f.reports(initiatorId, handshake.contractId)
+		if len(initiatorHandshakeReports) != 1 || initiatorHandshakeReports[0].checkpoint ||
+			initiatorHandshakeReports[0].acked+initiatorHandshakeReports[0].unacked !=
+				handshakeReports[0].acked+handshakeReports[0].unacked {
+			f.log()
+			t.Fatalf("the initiator reported the handshake's contract %+v, want its exact count %+v", initiatorHandshakeReports, handshakeReports[0])
+		}
 	})
 }
 
@@ -1044,10 +1064,7 @@ func TestPeerWindowAdoptionFollowsTheFramesLane(t *testing.T) {
 		if status := manager.PeerWindow(initiatorId); status.Receive != nil {
 			t.Fatalf("a failed adoption opened a window: %+v", status.Receive)
 		}
-		f.stateLock.Lock()
-		transferKey := f.transferKeys[f.responder.ClientId()]
-		f.stateLock.Unlock()
-		if !manager.AdoptPeerWindowContract(initiatorId, transferKey) {
+		if !manager.AdoptPeerWindowContract(initiatorId, f.transferKey(f.responder)) {
 			t.Fatal("the frame's own lane adopted nothing")
 		}
 		status := manager.PeerWindow(initiatorId)

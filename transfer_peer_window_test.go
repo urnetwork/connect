@@ -83,13 +83,13 @@ func (self *peerWindowLedgerFixture) queue(contract peerWindowTestContract, now 
 // A sequence registers the contract, with the head that brought it counted.
 func (self *peerWindowLedgerFixture) receive(contract peerWindowTestContract, now time.Time) bool {
 	self.t.Helper()
-	return self.ledger.received(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), false, now)
+	return self.ledger.received(self.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), now)
 }
 
 // The holder closes the contract with this count, and the ledger must keep it.
 func (self *peerWindowLedgerFixture) close(contract peerWindowTestContract, byteCount ByteCount) {
 	self.t.Helper()
-	if !self.ledger.withhold(contract.contractId, byteCount) {
+	if !self.ledger.withhold(contract.contractId, byteCount, 0, false) {
 		self.t.Fatalf("a report of contract %s went out inside its window", contract.contractId)
 	}
 }
@@ -224,7 +224,7 @@ func TestPeerWindowReadsAHeldContractsRunningCount(t *testing.T) {
 	f := newPeerWindowLedgerFixture(t)
 	contract := newPeerWindowTestContract(f.start, 1)
 	live := &contractStatsEntry{}
-	f.ledger.received(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, false, f.start)
+	f.ledger.received(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, f.start)
 	live.usedByteCount.Store(int64(peerWindowFloorByteCount + 1))
 	ended := f.end(f.start.Add(55 * time.Minute))
 	requirePeerWindowReports(t, ended, peerWindowReport{
@@ -356,7 +356,7 @@ func TestPeerWindowQueuedContractOpensNothing(t *testing.T) {
 	if status := f.ledger.status(f.peerId); status.Send != nil {
 		t.Fatalf("a queued contract opened a window: %+v", status.Send)
 	}
-	if f.ledger.withhold(expired.contractId, 0) {
+	if f.ledger.withhold(expired.contractId, 0, 0, false) {
 		t.Fatal("the close of a contract no window holds was withheld")
 	}
 	taken := newPeerWindowTestContract(f.start, 2)
@@ -379,10 +379,10 @@ func TestPeerWindowUnmarkedPeerStaysOut(t *testing.T) {
 	if f.ledger.taken(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, f.start) {
 		t.Fatal("a contract to an unmarked peer joined a window")
 	}
-	if f.ledger.received(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), false, f.start) {
+	if f.ledger.received(otherPeerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), f.start) {
 		t.Fatal("a contract from an unmarked peer joined a window")
 	}
-	if f.ledger.withhold(contract.contractId, 1) {
+	if f.ledger.withhold(contract.contractId, 1, 0, false) {
 		t.Fatal("an unmarked peer's report was withheld")
 	}
 }
@@ -573,11 +573,11 @@ func TestPeerWindowAdoptedContractOpensTheWindow(t *testing.T) {
 	f := newPeerWindowLedgerFixture(t)
 	contract := newPeerWindowTestContract(f.start.Add(-10*time.Minute), 1)
 	live := newPeerWindowTestLive(512)
-	if !f.ledger.received(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, true, f.start) {
+	if adopted, _ := f.ledger.adopt(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, f.start); !adopted {
 		t.Fatal("the marking frame's contract was not adopted")
 	}
 	// adopting twice holds it once
-	f.ledger.received(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, true, f.start)
+	f.ledger.adopt(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, live, f.start)
 	status := f.ledger.status(f.peerId)
 	if status.Receive == nil || !status.Receive.EndTime.Equal(f.start.Add(45*time.Minute)) {
 		t.Fatalf("the adopted window = %+v", status.Receive)
@@ -590,6 +590,128 @@ func TestPeerWindowAdoptedContractOpensTheWindow(t *testing.T) {
 	if f.ledger.owns(contract.contractId) {
 		t.Fatal("the one holder's report left the contract held")
 	}
+}
+
+func requirePeerWindowReleases(t *testing.T, releases []peerWindowRelease, expected ...peerWindowRelease) {
+	t.Helper()
+	equal := slices.EqualFunc(releases, expected, func(a peerWindowRelease, b peerWindowRelease) bool {
+		return a.contractId == b.contractId &&
+			a.closeRequested == b.closeRequested &&
+			slices.Equal(a.heldReports, b.heldReports)
+	})
+	if !equal {
+		t.Fatalf("releases = %+v, want %+v", releases, expected)
+	}
+}
+
+// The answer to this client's marking frame rode a contract its peer took after
+// marking, while one the peer took before, for a session's handshake, already
+// opened the receive window here. Adopted, the answer's contract is the window's
+// first: the earlier contract leaves with what it withheld and reports as it
+// always has, one created before the first never joins however late it comes,
+// and the window runs from the adoption to the first's signed deadline.
+func TestPeerWindowAdoptionMakesItsContractTheWindowsFirst(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	handshake := newPeerWindowTestContract(f.start.Add(time.Second), 1)
+	first := newPeerWindowTestContract(f.start.Add(2*time.Second), 2)
+	successor := newPeerWindowTestContract(f.start.Add(2*time.Second), 3)
+	f.receive(handshake, f.start.Add(time.Second))
+	f.close(handshake, 300)
+	f.receive(first, f.start.Add(2*time.Second))
+	f.receive(successor, f.start.Add(2*time.Second))
+	f.ledger.takeOpened()
+
+	adoptTime := f.start.Add(3 * time.Second)
+	adopted, releases := f.ledger.adopt(f.peerId, first.contractId, first.grantByteCount, first.expirationTimeUnixMilli, newPeerWindowTestLive(1), adoptTime)
+	if !adopted {
+		t.Fatal("the answer's contract was not adopted")
+	}
+	requirePeerWindowReleases(t, releases, peerWindowRelease{
+		contractId:  handshake.contractId,
+		heldReports: []peerWindowHeldReport{{ackedByteCount: 300}},
+	})
+	if f.ledger.owns(handshake.contractId) || f.ledger.withhold(handshake.contractId, 1, 0, false) {
+		t.Fatal("the contract before the first is still the window's")
+	}
+	straggler := newPeerWindowTestContract(f.start.Add(1500*time.Millisecond), 4)
+	if f.receive(straggler, f.start.Add(10*time.Minute)) {
+		t.Fatal("a contract created before the first joined the window")
+	}
+	firstEnd := f.start.Add(2*time.Second + 55*time.Minute)
+	status := f.ledger.status(f.peerId)
+	if status.Receive == nil || !status.Receive.StartTime.Equal(adoptTime) || !status.Receive.EndTime.Equal(firstEnd) {
+		t.Fatalf("the window after the adoption = %+v", status.Receive)
+	}
+	if opened := f.ledger.takeOpened(); len(opened) != 1 || !opened[0].StartTime.Equal(adoptTime) {
+		t.Fatalf("a listener hears %+v, want the window as it now runs", opened)
+	}
+
+	f.close(first, kib(64))
+	f.close(successor, 0)
+	requirePeerWindowReports(t, f.end(firstEnd),
+		peerWindowReport{contractId: first.contractId, byteCount: peerWindowFloorByteCount},
+		peerWindowReport{contractId: successor.contractId},
+	)
+}
+
+// A contract that leaves its window carries out what it withheld as its holders
+// asked for it: in order, split into acked and unacked as they split it, a
+// checkpoint still a checkpoint, and a close asked for meanwhile.
+func TestPeerWindowContractThatLeavesKeepsItsReportsAsAsked(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	handshake := newPeerWindowTestContract(f.start, 1)
+	first := newPeerWindowTestContract(f.start.Add(time.Second), 2)
+	f.receive(handshake, f.start)
+	f.ledger.withhold(handshake.contractId, 100, 20, true)
+	// a later sequence resumed it and closed it
+	f.receive(handshake, f.start.Add(time.Second))
+	f.ledger.withhold(handshake.contractId, 50, 0, false)
+	if !f.ledger.withholdCloseRequest(handshake.contractId) {
+		t.Fatal("a close request for a contract of an open window went out")
+	}
+	f.receive(first, f.start.Add(time.Second))
+	_, releases := f.ledger.adopt(f.peerId, first.contractId, first.grantByteCount, first.expirationTimeUnixMilli, newPeerWindowTestLive(1), f.start.Add(time.Second))
+	requirePeerWindowReleases(t, releases, peerWindowRelease{
+		contractId: handshake.contractId,
+		heldReports: []peerWindowHeldReport{
+			{ackedByteCount: 100, unackedByteCount: 20, checkpoint: true},
+			{ackedByteCount: 50},
+		},
+		closeRequested: true,
+	})
+	if f.ledger.withholdCloseRequest(handshake.contractId) {
+		t.Fatal("a close request after the contract left was withheld")
+	}
+}
+
+// An open window takes its first from its first adoption. A later adoption only
+// joins, and moves neither the first nor the window, and a contract created
+// before the first cannot be adopted into it.
+func TestPeerWindowAdoptionPinsAnOpenWindowOnce(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	early := newPeerWindowTestContract(f.start, 1)
+	first := newPeerWindowTestContract(f.start.Add(time.Second), 2)
+	later := newPeerWindowTestContract(f.start.Add(2*time.Second), 3)
+	adopt := func(contract peerWindowTestContract, now time.Time) (bool, []peerWindowRelease) {
+		return f.ledger.adopt(f.peerId, contract.contractId, contract.grantByteCount, contract.expirationTimeUnixMilli, newPeerWindowTestLive(1), now)
+	}
+	if adopted, releases := adopt(first, f.start.Add(time.Second)); !adopted || len(releases) != 0 {
+		t.Fatalf("the first adoption = (%t, %+v)", adopted, releases)
+	}
+	window := f.ledger.status(f.peerId).Receive
+	if adopted, releases := adopt(later, f.start.Add(2*time.Second)); !adopted || len(releases) != 0 {
+		t.Fatalf("a later adoption = (%t, %+v), want a join", adopted, releases)
+	}
+	if adopted, _ := adopt(early, f.start.Add(3*time.Second)); adopted {
+		t.Fatal("a contract created before the first was adopted into its window")
+	}
+	if status := f.ledger.status(f.peerId); status.Receive == nil || *status.Receive != *window {
+		t.Fatalf("a later adoption moved the window from %+v to %+v", window, status.Receive)
+	}
+	requirePeerWindowReports(t, f.end(window.EndTime),
+		peerWindowReport{contractId: first.contractId, byteCount: peerWindowFloorByteCount},
+		peerWindowReport{contractId: later.contractId},
+	)
 }
 
 // A window lasts its setting at most, whatever the contract's deadline says.
@@ -889,6 +1011,55 @@ func TestPeerWindowWithholdsAZeroFinalRequest(t *testing.T) {
 		time.Sleep(harness.windowDuration())
 		synctest.Wait()
 		harness.requireReports(contractId, closeSequencesReport{acked: uint64(peerWindowFloorByteCount)})
+	})
+}
+
+// A contract that opened the receive window before the adopted first leaves it at
+// the adoption, and its reports go out then as they would have without the window:
+// the checkpoint its sequence's idle exit made, then the zero final the platform's
+// close asked for meanwhile. The window's end reports the floor on the first alone.
+func TestPeerWindowAdoptionReleasesWhatAnEarlierContractWithheld(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		harness, sender := newPeerWindowHarness(t)
+		harness.holdControlAcknowledgements()()
+		handshakeContractId, handshakeFrame := harness.newPeerWindowContract(sender.sourceId)
+		handshakeByteCount := harness.deliver(sender, handshakeFrame, closeSequencesMessageFrame("handshake"))
+		synctest.Wait()
+		time.Sleep(harness.idleTimeout() + time.Second)
+		synctest.Wait()
+		harness.closeSequences([]Id{handshakeContractId}, nil)
+		synctest.Wait()
+		harness.requireReports(handshakeContractId)
+
+		answer := &closeSequencesSender{sourceId: sender.sourceId, sequenceId: NewId()}
+		firstContractId, firstFrame := harness.newPeerWindowContract(sender.sourceId)
+		harness.deliver(answer, firstFrame, closeSequencesMessageFrame("answer"))
+		synctest.Wait()
+		sequences := harness.receiveSequences(sender.sourceId)
+		if len(sequences) != 1 {
+			t.Fatalf("%d receive sequences carry the answer", len(sequences))
+		}
+		manager := harness.client.ContractManager()
+		if !manager.AdoptPeerWindowContract(sender.sourceId, sequences[0].transferKey) {
+			t.Fatal("the answer's contract was not adopted")
+		}
+		synctest.Wait()
+		released := []closeSequencesReport{
+			{acked: uint64(handshakeByteCount), checkpoint: true},
+			{},
+		}
+		harness.requireReports(handshakeContractId, released...)
+		harness.requireReports(firstContractId)
+
+		window := manager.PeerWindow(sender.sourceId).Receive
+		if window == nil || !window.EndTime.Equal(peerWindowContractCreateTime(firstContractId).Add(harness.windowDuration())) {
+			t.Fatalf("the window after the adoption = %+v", window)
+		}
+		time.Sleep(time.Until(window.EndTime) + time.Second)
+		synctest.Wait()
+		harness.requireReports(firstContractId, closeSequencesReport{acked: uint64(peerWindowFloorByteCount)})
+		harness.requireReports(handshakeContractId, released...)
 	})
 }
 

@@ -174,7 +174,7 @@ func (self *sequenceCloser) closeContracts(contractIds []Id) {
 			continue
 		}
 		seenContractIds[contractId] = true
-		if self.client.ContractManager().peerWindowOwns(contractId) {
+		if self.client.ContractManager().withholdPeerWindowCloseRequest(contractId) {
 			continue
 		}
 		receiveSequence := self.client.receiveBuffer.contractHolders.find(contractId)
