@@ -1020,7 +1020,12 @@ func TestRecentExitTransportLossAsksByIdBeforeDiscovery(t *testing.T) {
 		discoveredDestinations: map[MultiHopId]DestinationStats{other: {}},
 		onlineClientIds:        map[Id]bool{lost.Tail(): true},
 	}
-	window := recentExitTestWindow(t, generator, unfixedTestProfile(WindowTypeSpeed), nil, nil)
+	// every evaluation here fails, so a round before the loss can fail
+	// discovery's provider, which the cool-off would then leave out of the
+	// round under test; the order of the round is what this test checks
+	window := recentExitTestWindow(t, generator, unfixedTestProfile(WindowTypeSpeed), nil, nil, func(settings *MultiClientSettings) {
+		settings.EvaluationFailureCooloff = 0
+	})
 	installStickyTestChannel(window, client)
 
 	calls := waitRecentExitTestCalls(t, generator, "offer its lost provider and then discovery's", func(calls []recentExitTestCall) bool {

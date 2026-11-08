@@ -11,7 +11,9 @@ package connect
 // ping timeout before it failed again. The window now notes each provider it
 // found failing and passes it to discovery as an exclusion until
 // MultiClientSettings.EvaluationFailureCooloff has passed; non-positive
-// disables the cool-off.
+// disables the cool-off. Discovery runs ahead of the expansion, so a candidate
+// listed before its provider failed is also dropped when the expansion takes
+// it (cooloffHolds).
 //
 // What is noted:
 //   - a candidate whose evaluation failed for the provider: its channel could
@@ -82,6 +84,14 @@ func (self *destinationCooloff) addExclusions(excluded map[MultiHopId]bool, now 
 	}
 }
 
+// Whether destination failed within timeout of now.
+func (self *destinationCooloff) holds(destination MultiHopId, now time.Time, timeout time.Duration) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	failTime, ok := self.failTimes[destination]
+	return ok && now.Sub(failTime) < timeout
+}
+
 // The window's cool-off; non-positive is off.
 func (self *multiClientWindow) cooloffTimeout() time.Duration {
 	if self.settings == nil {
@@ -102,6 +112,16 @@ func (self *multiClientWindow) noteFailedDestination(destination MultiHopId) {
 		}
 	}
 	self.cooloff.note(destination, time.Now(), cooloffMaxCount)
+}
+
+// Whether destination is cooling off now: a candidate listed before its
+// provider failed in this window is dropped when the expansion takes it.
+func (self *multiClientWindow) cooloffHolds(destination MultiHopId) bool {
+	timeout := self.cooloffTimeout()
+	if timeout <= 0 {
+		return false
+	}
+	return self.cooloff.holds(destination, time.Now(), timeout)
 }
 
 // Adds the providers still cooling off to a discovery request's exclusions.
