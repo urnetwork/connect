@@ -518,10 +518,13 @@ func (self *multiClientWindow) discoverDestinations(excludeDestinations []MultiH
 
 	now := time.Now()
 	if wanted := self.ipv6FillWanted(now); 0 < wanted {
+		// providers that failed while filling the shortfall stay out of this
+		// request only (ip_remote_multi_client_cooloff.go)
+		ipv6ExcludeDestinations := self.cooloffIpv6Exclusions(excludeDestinations)
 		destinations, err := call(func() (map[MultiHopId]DestinationStats, error) {
 			return familyGenerator.NextDestinationsWithIpFamily(
 				wanted,
-				excludeDestinations,
+				ipv6ExcludeDestinations,
 				rankMode,
 				IpFamilyFilterV6Capable,
 			)

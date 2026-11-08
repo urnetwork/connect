@@ -675,6 +675,9 @@ func (self *multiClientWindow) rebuildWindow(elapsed time.Duration) {
 	if cancelEpoch != nil {
 		cancelEpoch()
 	}
+	// the rebuild is the programmatic form of a reconnect, and a reconnect
+	// starts with no cool-off (ip_remote_multi_client_cooloff.go)
+	self.clearCooloff("rebuild")
 
 	// zero Added means no installed clients by construction; cancel any
 	// straggler so the resize pass reaps it through the ordinary WindowStats

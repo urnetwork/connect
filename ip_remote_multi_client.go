@@ -13473,7 +13473,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			return
 		}
 
-		// exclude healthy destinations that are already in the window
+		// exclude healthy destinations that are already in the window, and
+		// the providers cooling off (ip_remote_multi_client_cooloff.go)
+		cooloffExcluded := 0
 		windowDestinations := func() map[MultiHopId]bool {
 			self.stateLock.Lock()
 			windowDestinations := map[MultiHopId]bool{}
@@ -13482,9 +13484,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					windowDestinations[client.Destination()] = true
 				}
 			}
+			heldCount := len(self.clients)
 			self.stateLock.Unlock()
 			self.addServiceRefreshExclusions(windowDestinations)
-			self.addCooloffExclusions(windowDestinations)
+			cooloffExcluded = self.addCooloffExclusions(windowDestinations, heldCount)
 			return windowDestinations
 		}
 
@@ -13547,6 +13550,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			continue
 		}
+		// a round whose cool-off exclusions left it empty lets the next round
+		// run without them (the starvation escape); a probe asks only the
+		// v6-capable request, and its empty answer says nothing of the pool
+		self.noteCooloffRound(cooloffExcluded, len(destinations) == 0 && !probeOnly)
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
@@ -13796,10 +13803,11 @@ func (self *windowErrorRemoval) cause() windowRemovalCause {
 func (self *windowErrorRemoval) finish() {
 	if self.rememberLostExit {
 		self.window.rememberRecentExit(self.client, self.lostExit, self.lostExitMaxCount)
-	} else if !self.stickyExit && providerVerdictErr(self.err) {
+	} else if !self.stickyExit && providerVerdictErr(self.err) && self.window.verdictJudgeable(self.client) {
 		// a verdict against the provider that the recent-exit memory did not
-		// keep as an outage of ours: discovery leaves it out for a while
-		self.window.noteFailedDestination(self.client.Destination())
+		// keep as an outage of ours, judged while another exit receives:
+		// discovery leaves it out for a while
+		self.window.noteFailedDestination(self.client.Destination(), cooloffScopeAll, cooloffReasonVerdict)
 	}
 }
 
@@ -15387,7 +15395,7 @@ requestCandidates:
 				}
 				if providerFailure {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
-					self.noteFailedDestination(args.Destination)
+					self.noteFailedDestination(args.Destination, cooloffEvaluationScope(ipv6Shortfall, args.IpFamily), cooloffReasonEvaluation)
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
@@ -15466,7 +15474,7 @@ requestCandidates:
 					state := ProviderStateNotAdded
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
-						self.noteFailedDestination(args.Destination)
+						self.noteFailedDestination(args.Destination, cooloffEvaluationScope(ipv6Shortfall, args.IpFamily), cooloffReasonEvaluation)
 					}
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {

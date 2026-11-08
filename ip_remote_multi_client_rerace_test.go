@@ -77,6 +77,9 @@ type reraceExitSpec struct {
 	answer func(path *IpPath) reraceAnswer
 	// Optional source settings are applied before real Client construction.
 	clientSettings func(*ClientSettings)
+	// the first this many channels minted for the provider fail their
+	// construction, as a provider whose evaluation fails does
+	failEvaluations int
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -99,6 +102,8 @@ type reraceExit struct {
 
 	mutex   sync.Mutex
 	packets []reraceExitPacket
+	// the channel constructions for this provider so far
+	evaluations atomic.Int32
 }
 
 type reraceReply struct {
@@ -345,6 +350,9 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 	self.mutex.Unlock()
 	if exit == nil {
 		return nil, errors.New("client args were not minted for a destination")
+	}
+	if evaluation := int(exit.evaluations.Add(1)); evaluation <= exit.failEvaluations {
+		return nil, errors.New("the provider did not answer its evaluation")
 	}
 
 	if exit.clientSettings != nil {
