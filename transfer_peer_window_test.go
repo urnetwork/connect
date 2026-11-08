@@ -522,6 +522,89 @@ func TestPeerWindowContractBeforeTheToleranceJoinsTheWindow(t *testing.T) {
 	)
 }
 
+// A contract created inside a window can first register after the window's end,
+// as at a client suspended across it. It belongs to that window and not the next:
+// before the window has reported, its count joins the window's.
+func TestPeerWindowContractCreatedInsideJoinsTheWindowAfterItsEnd(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	inside := newPeerWindowTestContract(f.start.Add(30*time.Minute), 2)
+	f.receive(first, f.start)
+	f.close(first, kib(200))
+	f.ledger.noteActivity(f.peerId, f.start.Add(54*time.Minute))
+	late := f.start.Add(56 * time.Minute)
+	if !f.receive(inside, late) {
+		t.Fatal("a contract created inside the window was refused after its end")
+	}
+	if status := f.ledger.status(f.peerId); status.Receive != nil {
+		t.Fatalf("a contract created inside the ended window opened the next: %+v", status.Receive)
+	}
+	f.close(inside, kib(100))
+	requirePeerWindowReports(t, f.end(late),
+		peerWindowReport{contractId: first.contractId, byteCount: peerWindowFloorByteCount + peerWindowStepByteCount},
+		peerWindowReport{contractId: inside.contractId},
+	)
+}
+
+// After the window has reported, such a contract is held and its reports and close
+// requests go nowhere, as the window's reports were its final. That holds when the
+// window's quiet end cleared the mode too: the contract reports nothing exactly and
+// opens nothing.
+func TestPeerWindowContractCreatedInsideAReportedWindowIsHeld(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	inside := newPeerWindowTestContract(f.start.Add(30*time.Minute), 2)
+	f.receive(first, f.start)
+	f.close(first, 1)
+	requirePeerWindowReports(t, f.end(f.start.Add(55*time.Minute)), peerWindowReport{
+		contractId: first.contractId,
+		byteCount:  peerWindowFloorByteCount,
+	})
+	if f.ledger.accounting(f.peerId) {
+		t.Fatal("a quiet window left the mode on")
+	}
+	if !f.receive(inside, f.start.Add(70*time.Minute)) {
+		t.Fatal("a contract created inside a reported window would report exactly")
+	}
+	if !f.ledger.withholdCloseRequest(inside.contractId) || !f.ledger.withhold(inside.contractId, kib(100), 0, true) {
+		t.Fatal("a report of a contract created inside a reported window went out")
+	}
+	if f.ledger.owns(inside.contractId) {
+		t.Fatal("the ledger kept the contract after its one holder reported")
+	}
+	if ends := f.pass(f.start.Add(71 * time.Minute)); len(ends) != 0 {
+		t.Fatalf("the held contract reported again: %+v", ends[0])
+	}
+	if status := f.ledger.status(f.peerId); status.Receive != nil {
+		t.Fatalf("the held contract opened a window: %+v", status.Receive)
+	}
+}
+
+// An ended window is kept while a contract created inside it can still carry a
+// frame, a window and its margin past its end, and the first pass after forgets it
+// and the peer it kept. A contract that registers then reports exactly.
+func TestPeerWindowEndedWindowIsForgottenWhenItsContractsHaveExpired(t *testing.T) {
+	f := newPeerWindowLedgerFixture(t)
+	first := newPeerWindowTestContract(f.start, 1)
+	f.receive(first, f.start)
+	f.close(first, 1)
+	end := f.start.Add(55 * time.Minute)
+	f.end(end)
+	retainTime := end.Add(60 * time.Minute)
+	f.pass(retainTime.Add(-time.Millisecond))
+	if len(f.ledger.peers) != 1 {
+		t.Fatal("the ledger forgot the window while a contract of it could carry a frame")
+	}
+	f.pass(retainTime)
+	if len(f.ledger.peers) != 0 || len(f.ledger.contracts) != 0 {
+		t.Fatalf("the ledger kept %d peers and %d contracts", len(f.ledger.peers), len(f.ledger.contracts))
+	}
+	inside := newPeerWindowTestContract(f.start.Add(30*time.Minute), 2)
+	if f.receive(inside, retainTime) {
+		t.Fatal("a contract joined a forgotten window")
+	}
+}
+
 // A sequence that still holds a contract after its window reported reports it
 // later, at a trim or at its exit. Nothing goes out: one contract reports once,
 // and that count would be exact.

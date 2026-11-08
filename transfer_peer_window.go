@@ -190,6 +190,9 @@ type peerWindow struct {
 	// The receive contract an adoption made first, nil before one. No contract
 	// created before it belongs to the window.
 	firstContractId *Id
+	// For a receive window, the floor its contracts' creation met when it opened:
+	// the mark or the previous window's end.
+	floorTime time.Time
 	// no longer open: nothing joins it, and sequences leave its contracts
 	ended bool
 	// when its reports go out, once a pass has seen it end
@@ -256,6 +259,15 @@ func (self *peerWindow) precedesFirst(contractId Id) bool {
 	return self.firstContractId != nil && contractId.Cmp(*self.firstContractId) < 0
 }
 
+// Whether a receive contract with this id was created inside the window, by the
+// rules that let a contract join it while it was open, so it belongs to the window
+// however late it registers.
+func (self *peerWindow) createdInside(contractId Id, endTolerance time.Duration) bool {
+	return !peerWindowContractCreateTime(contractId).Before(self.floorTime.Add(-endTolerance)) &&
+		!self.opensNext(contractId, endTolerance) &&
+		!self.precedesFirst(contractId)
+}
+
 // The millisecond in an id's high bits, here the platform's clock at creation.
 func peerWindowContractCreateTime(contractId Id) time.Time {
 	unixMilli := int64(0)
@@ -282,15 +294,23 @@ type peerWindowPeer struct {
 	activityTime time.Time
 	// each direction's open window
 	windows [peerWindowDirectionCount]*peerWindow
-	// A receive contract created before this, by more than the tolerance, is
-	// no part of any window: the mark, then each window's end. It predates what
-	// the mode covers, or it is a straggler of a window already reported.
+	// A receive contract created before this, by more than the tolerance, opens
+	// no window: the mark, then each window's end. It predates what the mode
+	// covers, or it belongs to a window that has ended.
 	receiveFloorTime time.Time
+	// The receive window that ended last, kept until `retainTime`, when no
+	// contract created inside it can still carry a frame. A contract created
+	// inside it that first registers after its end, as at a client suspended
+	// across the end, belongs to it and not to the next window, and does not
+	// report exactly.
+	endedReceiveWindow *peerWindow
+	retainTime         time.Time
 }
 
 // Whether nothing keeps this peer in the ledger.
 func (self *peerWindowPeer) idle() bool {
-	return !self.accounting && self.windows[PeerWindowSend] == nil && self.windows[PeerWindowReceive] == nil
+	return !self.accounting && self.windows[PeerWindowSend] == nil && self.windows[PeerWindowReceive] == nil &&
+		self.endedReceiveWindow == nil
 }
 
 // One contract's final report.
@@ -441,6 +461,11 @@ func (self *peerWindowLedger) endWindowWithLock(peer *peerWindowPeer, window *pe
 	window.ended = true
 	if window.direction == PeerWindowReceive {
 		peer.receiveFloorTime = window.endTime
+		// A contract created inside the window, known here or not, was created
+		// before its end and lives a window and its margin, the platform's 60
+		// minutes, so none outlives this.
+		peer.endedReceiveWindow = window
+		peer.retainTime = window.endTime.Add(self.settings.WindowDuration + self.settings.ExpirationMargin)
 	}
 	self.endedWindows = append(self.endedWindows, window)
 }
@@ -458,6 +483,7 @@ func (self *peerWindowLedger) openWindowWithLock(
 		startTime: now,
 		endTime:   now.Add(self.settings.WindowDuration),
 		contracts: map[Id]*peerWindowContract{},
+		floorTime: peer.receiveFloorTime,
 	}
 	peer.windows[direction] = window
 	self.openedWindows[peerWindowKey{peerId: peerId, direction: direction}] = window
@@ -594,8 +620,10 @@ func (self *peerWindowLedger) taken(
 
 // A receive sequence registered a contract from this peer. A contract created
 // before the mark, a previous window's end or the window's adopted first stays
-// out: its sender reports it exactly. Reports whether the contract is the
-// ledger's.
+// out: its sender reports it exactly. One created inside the window that ended
+// last belongs to that window, however late it registers: counted with it if the
+// window has yet to report, and otherwise held so its reports go nowhere, as the
+// window's reports were its final. Reports whether the contract is the ledger's.
 func (self *peerWindowLedger) received(
 	peerId Id,
 	contractId Id,
@@ -616,6 +644,22 @@ func (self *peerWindowLedger) received(
 		contract.holderCount += 1
 		if !contract.window.reported {
 			contract.live = live
+		}
+		return true
+	}
+	// a window past its end has ended, whether or not a pass has seen it
+	self.currentWindowWithLock(peer, PeerWindowReceive, now)
+	if ended := peer.endedReceiveWindow; ended != nil && now.Before(peer.retainTime) &&
+		ended.createdInside(contractId, self.settings.EndTolerance) {
+		contract := self.addContractWithLock(ended, contractId, grantByteCount, expirationTimeUnixMilli)
+		contract.holderCount = 1
+		if !ended.reported {
+			contract.live = live
+		}
+		if expirationTimeUnixMilli != nil {
+			if deadline := time.UnixMilli(*expirationTimeUnixMilli); deadline.After(peer.retainTime) {
+				peer.retainTime = deadline
+			}
 		}
 		return true
 	}
@@ -821,6 +865,16 @@ func (self *peerWindowLedger) takeEnded(now time.Time) []peerWindowMove {
 		moves = append(moves, peerWindowMove{window: window, peerId: window.peerId, take: take})
 	}
 	self.endedWindows = nil
+	// No frame rides a contract past its deadline, so an ended window is kept no
+	// longer. A peer kept only by one is forgotten at the first pass after.
+	for peerId, peer := range self.peers {
+		if peer.endedReceiveWindow != nil && !now.Before(peer.retainTime) {
+			peer.endedReceiveWindow = nil
+		}
+		if peer.idle() {
+			delete(self.peers, peerId)
+		}
+	}
 	return moves
 }
 
