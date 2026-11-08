@@ -28,6 +28,7 @@ package connect
 
 import (
 	"time"
+	"weak"
 )
 
 // A discovery window's consecutive passes that admitted nothing, the earliest
@@ -36,10 +37,17 @@ type discoveryExpandRetry struct {
 	failureCount int
 	notBefore    time.Time
 	clientCount  int
+	// A weak exact source identity never retains its packet/flow graph.
+	serviceUpdate  weak.Pointer[multiClientChannelUpdate]
+	serviceLineage uint64
 }
 
 // Records an expansion pass that admitted no candidate and defers the next.
-func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
+func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time, serviceOwners ...*tcpSynRetry) {
+	var serviceOwner *tcpSynRetry
+	if len(serviceOwners) == 1 {
+		serviceOwner = serviceOwners[0]
+	}
 	// bare fixture windows carry no settings and no pacing
 	if self.settings == nil {
 		return
@@ -52,11 +60,22 @@ func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
 	if retryMax < retryMin {
 		retryMax = retryMin
 	}
+	if hook := self.beforeDiscoveryRetryPublishForTest; hook != nil {
+		hook(serviceOwner)
+	}
 	var failureCount int
 	var delay time.Duration
-	func() {
+	recorded := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		if serviceOwner != nil && self.serviceRefreshPassAnsweredWithLock(serviceOwner) {
+			return false
+		}
+		self.discoveryRetry.serviceUpdate, self.discoveryRetry.serviceLineage = weak.Pointer[multiClientChannelUpdate]{}, 0
+		if serviceOwner != nil && self.serviceRefreshOwner == serviceOwner && self.serviceRefreshAttempted && serviceOwner.update != nil {
+			self.discoveryRetry.serviceUpdate = weak.Make(serviceOwner.update)
+			self.discoveryRetry.serviceLineage = serviceOwner.retryLineage
+		}
 		self.discoveryRetry.failureCount += 1
 		delay = self.retryJitter(fixedDestinationRetryDelay(self.discoveryRetry.failureCount, retryMin, retryMax))
 		self.discoveryRetry.notBefore = now.Add(delay)
@@ -64,7 +83,11 @@ func (self *multiClientWindow) noteDiscoveryExpandUnproductive(now time.Time) {
 			self.resizeMonitor.NotifyAll()
 		}
 		failureCount = self.discoveryRetry.failureCount
+		return true
 	}()
+	if !recorded {
+		return
+	}
 	if self.log != nil {
 		self.log.Infof("%s\n", relEvent(
 			"discovery_expand_deferred",
@@ -197,5 +220,21 @@ func (self *multiClientWindow) offerClientArgs(args *multiClientChannelArgs, exp
 			}
 			expirationTime = notBefore.Add(self.settings.WindowResizeTimeout)
 		}
+	}
+}
+
+// A useful reply clears only the failed attempted pass for this exact owned
+// update and paid native lineage. Ordinary or future passes remain.
+func (self *multiClientWindow) clearDiscoveryExpandRetryForService(update *multiClientChannelUpdate, lineage uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	retry := &self.discoveryRetry
+	if update == nil || retry.serviceUpdate.Value() != update || lineage == 0 || retry.serviceLineage != lineage {
+		return
+	}
+	deferred := !retry.notBefore.IsZero()
+	self.discoveryRetry = discoveryExpandRetry{clientCount: retry.clientCount}
+	if deferred && self.resizeMonitor != nil {
+		self.resizeMonitor.NotifyAll()
 	}
 }

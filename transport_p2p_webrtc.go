@@ -842,6 +842,11 @@ func (self *clientSignalReceiver) dequeue() *receivedSignalFrame {
 }
 
 func DefaultWebRtcSettings() *WebRtcSettings {
+	return defaultWebRtcSettingsWithMemoryTarget(MemoryBudget())
+}
+
+// The explicit client factory sizes peer admission from its own target.
+func defaultWebRtcSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *WebRtcSettings {
 	return &WebRtcSettings{
 		// FIXME
 		// SendBufferSize: mib(1),
@@ -851,7 +856,7 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// queues coexist within the client memory target — each new
 		// connection reserves this amount from the shared client budget
 		// (see MemoryBudget)
-		ReceiveBufferSize: MemoryScaledByteCount(kib(512), kib(256)),
+		ReceiveBufferSize: MemoryTargetScaledByteCount(memoryTargetByteCount, kib(512), kib(256)),
 		// Pion's receive MTU is a per-packet demux buffer, not the SCTP
 		// receive window. Its SCTP path MTU stays below Ethernet's 1500-byte
 		// packet size, so the former 4 KiB value only enlarged persistent and
@@ -866,7 +871,7 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		// by the memory budget). At the cap new p2p setups are refused and
 		// those streams stay on the platform transport; the p2p transport
 		// retries with backoff, so capacity recovers as connections close.
-		MaxPeerConnectionCount: MemoryScaledCount(32, 8),
+		MaxPeerConnectionCount: memoryTargetScaledCount(memoryTargetByteCount, 32, 8),
 		DisconnectedTimeout:    30 * time.Second,
 		FailedTimeout:          30 * time.Second,
 		// Pion's two-second default halves idle STUN/radio wakeups versus the

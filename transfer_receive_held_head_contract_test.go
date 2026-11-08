@@ -17,11 +17,11 @@ import (
 
 // Reuses controlled wire rounds, but requires real signed contracts instead
 // of the no-contract shortcut. Every captured or queued wire has one owner.
-func newHeldHeadContractFixture(t *testing.T, budget *TransferMemoryBudget) (*windowRoundFixture, *receiveGapTestLogger) {
+func newHeldHeadContractFixture(t *testing.T, budget *TransferMemoryBudget, configureReceive ...func(*ReceiveBufferSettings)) (*windowRoundFixture, *receiveGapTestLogger) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	log := &receiveGapTestLogger{Logger: NewNoopLogger()}
-	settings := func() *ClientSettings {
+	settings := func(receiver bool) *ClientSettings {
 		value := DefaultClientSettingsWithBufferSize(64)
 		value.Log = log
 		value.EncryptionSettings.Mode = EncryptionModeOff
@@ -38,6 +38,11 @@ func newHeldHeadContractFixture(t *testing.T, budget *TransferMemoryBudget) (*wi
 		value.ReceiveBufferSettings.ReceiveHoldPolicy = ReceiveHoldRefuse
 		value.ReceiveBufferSettings.ReceiveQueueBudget = budget
 		value.ReceiveBufferSettings.ReceiveQueueRetainedByteAccounting = budget != nil
+		if receiver {
+			for _, configure := range configureReceive {
+				configure(value.ReceiveBufferSettings)
+			}
+		}
 		return value
 	}
 	senderId, receiverId := NewId(), NewId()
@@ -46,10 +51,10 @@ func newHeldHeadContractFixture(t *testing.T, budget *TransferMemoryBudget) (*wi
 		receiverOut: make(Route, 128), receiverIn: make(Route, 128)}
 	fixture.sender = NewClient(ctx, senderId, &idleContractTestOob{
 		sourceId: senderId, peer: func() *Client { return fixture.receiver },
-	}, settings())
+	}, settings(false))
 	fixture.receiver = NewClient(ctx, receiverId, &idleContractTestOob{
 		sourceId: receiverId, peer: func() *Client { return fixture.sender },
-	}, settings())
+	}, settings(true))
 	fixture.sender.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{fixture.senderOut})
 	fixture.sender.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fixture.senderIn})
 	fixture.receiver.RouteManager().UpdateTransport(newDataGatewayTransport(), []Route{fixture.receiverOut})
@@ -59,7 +64,7 @@ func newHeldHeadContractFixture(t *testing.T, budget *TransferMemoryBudget) (*wi
 	}
 	fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 		for _, frame := range frames {
-			if frame.MessageType == protocol.MessageType_TestSimpleMessage {
+			if frame.MessageType == protocol.MessageType_TestSimpleMessage || frame.MessageType == protocol.MessageType_IpIpPacketFromProvider {
 				fixture.deliveredCount++
 			}
 		}
@@ -461,7 +466,7 @@ func TestReceiveHeldHeadContractOldProofDoesNotReplay(t *testing.T) {
 			budget := NewTransferMemoryBudget(kib(64))
 			fixture, log := newHeldHeadContractFixture(t, budget)
 			sequence, held, promoted := stageHeldHeadContract(t, fixture, true, legacy)
-			if (held.decodedOwner == nil) != legacy {
+			if held.decodedOwner == nil || (held.decodedOwner.receivePack.Pack != &held.decodedOwner.pack) != legacy {
 				t.Fatal("held full proof did not exercise its selected wire decoder ownership")
 			}
 			originalProof := held.contractFrame
@@ -479,11 +484,7 @@ func TestReceiveHeldHeadContractOldProofDoesNotReplay(t *testing.T) {
 					*held.contractId != sequence.receiveContract.contractId || held.decodedOwner != originalOwner || after != reserved {
 					t.Error("old proof replayed or lost its charged owner before payload return")
 				}
-				if legacy {
-					if len(originalProof.MessageBytes) != 0 {
-						t.Error("legacy direct proof owner was not returned before unlinking")
-					}
-				} else if originalOwner.pack.ContractFrame != originalProof || len(originalProof.MessageBytes) == 0 {
+				if originalOwner.receivePack.Pack.ContractFrame != originalProof || len(originalProof.MessageBytes) == 0 {
 					t.Error("decoded owner lost its original proof before normal return")
 				}
 			})

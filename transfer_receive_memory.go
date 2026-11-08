@@ -142,7 +142,7 @@ func (self *ReceiveSequence) bindReceiveMemoryOwner(pack *ReceivePack) bool {
 	recoveryOwner := budget != self.receiveQueue.budget
 	if recoveryOwner {
 		if budget == nil || budget != self.receiveBufferSettings.receiveHeadRecoveryBudget() ||
-			pack.ingressSequence != self || pack.ingressLoanByteCount != 0 || !receiveHeadRecoveryPack(pack.Pack) {
+			pack.ingressSequence != self || pack.ingressLoanByteCount != 0 {
 			return false
 		}
 	}
@@ -153,6 +153,11 @@ func (self *ReceiveSequence) bindReceiveMemoryOwner(pack *ReceivePack) bool {
 		return false
 	}
 	if recoveryOwner {
+		if !receiveHeadRecoveryPack(pack.Pack) && !receiveHeadRecoveryOpeningPack(pack.Pack) &&
+			self.heldHeadRepair.owner != pack.decodedOwner &&
+			(self.client == nil || !self.client.reliableProviderIngress.Load() || !receiveProviderHeadRecoveryPack(pack.Pack)) {
+			return false
+		}
 		registered := false
 		for current := self.holdPromise.ingressHead; current != nil; current = current.ingressNext {
 			if current == pack {
@@ -220,6 +225,9 @@ func (self *ReceiveSequence) publishReceiveMemoryFloor() {
 	root.admissionLock.Lock()
 	promise := &self.holdPromise
 	promise.ingressFloor = self.nextSequenceNumber
+	if self.receiveContract != nil && self.receiveContract.verifiedReceiveProofSet {
+		promise.establishedContract = true
+	}
 	released := ByteCount(0)
 	state := &self.memoryPressure
 	if state.activeSet && state.active.sequenceNumber < promise.ingressFloor {
@@ -255,9 +263,20 @@ func (self *receiveItem) growReceiveMemory(byteCount ByteCount) bool {
 	if self.decodedOwner != nil && self.decodedOwner.receivePack.receiveMemoryOwned {
 		pack = &self.decodedOwner.receivePack
 		if sequence := pack.ingressSequence; sequence != nil {
-			// Consumer recovery owns a fixed whole claim in its sibling child.
-			// It must never spend RX prefix/pressure or downstream growth credit.
+			// Consumer recovery owns a fixed whole claim. A provider head may
+			// buy its distinct downstream custody only from that same child;
+			// neither role may spend RX prefix or pressure credit here.
 			if budget != sequence.receiveQueue.budget {
+				if budget == sequence.receiveBufferSettings.receiveHeadRecoveryBudget() &&
+					sequence.client != nil && sequence.client.reliableProviderIngress.Load() &&
+					self.ack && !self.committed && !self.deliveryPrepared &&
+					!sequence.holdPromise.closed && sequence.ctx.Err() == nil && pack.ingressLoanByteCount == 0 &&
+					budget.totalByteCount.Load() <= sequence.receiveQueue.budget.totalByteCount.Load() &&
+					receiveProviderHeadRecoveryFrames(self.frames) && budget.tryReserveWithLock(byteCount) {
+					self.queueByteCount = addReceiveQueueByteCount(self.queueByteCount, byteCount)
+					root.admissionLock.Unlock()
+					return true
+				}
 				root.admissionLock.Unlock()
 				return false
 			}
@@ -303,12 +322,14 @@ func (self *decodedPackOwner) releaseReceiveMemory() {
 	if budget == nil || !self.receivePack.receiveMemoryOwned {
 		return
 	}
-	item.memoryBudget = nil
 	pack := &self.receivePack
 	root := budget.admissionRoot()
 	root.admissionLock.Lock()
+	// Registered prefix readers share this lock until actual owner unlink.
+	item.memoryBudget = nil
 	var pressureWake *ReceiveSequence
 	if sequence := pack.ingressSequence; sequence != nil {
+		byteCount = sequence.returnReceiveHeldHeadRepairWithLock(self, budget, byteCount)
 		promise := &sequence.holdPromise
 		previous := &promise.ingressHead
 		for *previous != nil && *previous != pack {

@@ -89,8 +89,13 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 		buffer.mutex.Unlock()
 	}
 	owner := self.receiveBuffer.takeReceiveMemoryOwner(sequence, scan.messageId, scan.sequenceNumber, scan.retainedByteCount)
+	repairCopy := false
 	if owner == nil {
-		owner = self.receiveBuffer.takeReceiveHeadRecoveryOwner(sequence, scan)
+		owner = self.receiveBuffer.takeReceiveHeldHeadRepairOwner(sequence, scan, carrier)
+		repairCopy = owner != nil
+	}
+	if owner == nil {
+		owner = self.receiveBuffer.takeReceiveHeadRecoveryOwnerInSession(sequence, scan, decrypted)
 	}
 	if owner == nil {
 		if sequence != nil {
@@ -102,7 +107,13 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 	// Cleanup custody is established before either decoder can allocate/fail.
 	decoded.packOwner = owner
 	body := carrier[scan.packOffset : scan.packOffset+scan.packByteCount]
-	if scan.legacy {
+	if repairCopy {
+		if !decodeReceiveHeldHeadRepair(body, scan, owner) {
+			return false, false
+		}
+		owner.receivePack.Pack = &owner.pack
+		decoded.frame.Pack = &owner.pack
+	} else if scan.legacy {
 		owner.receivePack.Pack = &protocol.Pack{}
 		if err := ProtoUnmarshal(body, owner.receivePack.Pack); err != nil {
 			return false, false
