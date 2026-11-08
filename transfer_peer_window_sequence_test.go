@@ -439,7 +439,7 @@ func (self *peerWindowPairFixture) log() {
 	}
 }
 
-// Sleeps until just past `when`.
+// Sleeps until `when` and lets what it woke settle.
 func sleepUntilPeerWindowEvent(when time.Time) {
 	time.Sleep(time.Until(when))
 	synctest.Wait()
@@ -471,7 +471,8 @@ func TestPeerWindowSequenceIdleExitsSendNothingInsideAWindow(t *testing.T) {
 			t.Fatalf("%d receive sequences did not idle out", liveReceiveSequenceCount)
 		}
 		if f.reportCount() != reportCount {
-			t.Fatalf("idle exits reported inside the window: %+v", f.events[reportCount:])
+			f.log()
+			t.Fatal("idle exits reported inside the window")
 		}
 
 		sleepUntilPeerWindowEvent(window.EndTime.Add(-time.Second))
@@ -525,7 +526,8 @@ func TestPeerWindowKeepaliveOpensNoContractAtAnExchange(t *testing.T) {
 			t.Fatalf("%d contracts opened inside the window", f.grantCount()-grantCount)
 		}
 		if f.reportCount() != reportCount {
-			t.Fatalf("a report went out inside the window: %+v", f.events[reportCount:])
+			f.log()
+			t.Fatal("a report went out inside the window")
 		}
 
 		sleepUntilPeerWindowEvent(window.EndTime)
