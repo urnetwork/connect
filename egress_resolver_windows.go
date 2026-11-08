@@ -47,14 +47,8 @@ const egressResolverDialTimeout = 5 * time.Second
 // same dead one.
 var egressResolverRotation atomic.Uint64
 
-// egressFallbackDnsServers are dialed when the egress adapter names no usable
-// resolver. The same operators as DefaultDnsResolverSettings, as plain :53.
-var egressFallbackDnsServers = []string{
-	"1.1.1.1",
-	"9.9.9.9",
-	"8.8.8.8",
-	"208.67.222.222",
-}
+// When the egress adapter names no usable resolver, egressDnsServers dials
+// egressFallbackDnsServers (egress_dial.go), the list the Linux file shares.
 
 func egressResolverDial(ctx context.Context, network string, addr string) (net.Conn, error) {
 	index4, index6 := EgressInterfaceIndex()

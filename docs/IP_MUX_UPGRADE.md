@@ -63,8 +63,8 @@ When `Dns.Resolver` is set, `onSend` claims single A/AAAA queries to UDP/53:
    handshake budgets are `30s` each — so a slow first attempt *waits* for the tunnel rather than
    failing fast; retrying aggressively up front would only re-hit the not-yet-ready path. The
    resolver fans out to multiple providers in parallel and the first to return records wins (default
-   set: Cloudflare + Google via the JSON API, Quad9 + OpenDNS via RFC 8484 wire-format — each
-   `DohServer` is tagged with the format it speaks). Concurrent identical queries coalesce onto one
+   set: Cloudflare, Quad9 and OpenDNS, all RFC 8484 wire-format; Google Public DNS is not a default,
+   see `DefaultDnsResolverSettings`). Concurrent identical queries coalesce onto one
    resolution (single-flight), concurrent resolutions are bounded (`MaxConcurrentResolutions`), and
    each DoH h2 connection is kept warm with keepalive PINGs so bursty lookups don't re-pay a
    handshake over the tunnel.

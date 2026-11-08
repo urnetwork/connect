@@ -145,10 +145,14 @@ func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
 //
 // the remote doh servers are queried as RFC 8484 wire-format (application/dns-message) in a
 // staggered, weighted-random order (see dohClient.queryResult); the first server to return records
-// wins. each must present an IP-SAN cert when addressed by IP (these do). Cloudflare, Google, Quad9,
-// and OpenDNS all serve wire-format on :443 /dns-query.
+// wins. each must present an IP-SAN cert when addressed by IP (these do). Cloudflare, Quad9 and
+// OpenDNS all serve wire-format on :443 /dns-query.
 // https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/
-// https://developers.google.com/speed/public-dns/docs/doh
+//
+// Google Public DNS is in none of these lists, nor in the regional ones
+// (net_http_doh_regional.go): the owner removed it for user privacy
+// (2026-11-08, support inbox 8236). A user can still name it in their own
+// settings.
 func DefaultDnsResolverSettings() *DnsResolverSettings {
 	return &DnsResolverSettings{
 		EnableRemoteDoh:       true,
@@ -158,13 +162,11 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// query races each pair as one wave (see dohLaunchWaves)
 		RemoteDohUrlsIpv4: []string{
 			"https://1.1.1.1/dns-query",        // Cloudflare
-			"https://8.8.8.8/dns-query",        // Google
 			"https://9.9.9.9/dns-query",        // Quad9
 			"https://208.67.222.222/dns-query", // OpenDNS
 		},
 		RemoteDohUrlsIpv6: []string{
 			"https://[2606:4700:4700::1111]/dns-query", // Cloudflare
-			"https://[2001:4860:4860::8888]/dns-query", // Google
 			"https://[2620:fe::fe]/dns-query",          // Quad9
 			"https://[2620:119:35::35]/dns-query",      // OpenDNS
 		},
@@ -176,13 +178,11 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		RemoteDnsIpv4: []string{
 			"1.1.1.1",        // Cloudflare
 			"9.9.9.9",        // Quad9
-			"8.8.8.8",        // Google
 			"208.67.222.222", // OpenDNS
 		},
 		RemoteDnsIpv6: []string{
 			"2606:4700:4700::1111", // Cloudflare
 			"2620:fe::fe",          // Quad9
-			"2001:4860:4860::8888", // Google
 			"2620:119:35::35",      // OpenDNS
 		},
 		// local plain-dns servers: host-side resolution, and the actual tunnel
@@ -1500,10 +1500,12 @@ type dohClient struct {
 	siblings map[string]string
 }
 
-// knownDohUrlPairs are the v4/v6 endpoint pairs of the default DoH
-// operators. A pair is what "race each operator's v4 and v6 endpoint" means
-// for a url the defaults ship; a url outside this table pairs by index only
-// with another url outside it (see familySiblings).
+// knownDohUrlPairs are the v4/v6 endpoint pairs of well known DoH operators:
+// the defaults, and Google Public DNS, which is no longer a default but which
+// a user may still name. A pair is what "race each operator's v4 and v6
+// endpoint" means for a url in this table; a url outside this table pairs by
+// index only with another url outside it (see familySiblings). The table only
+// pairs urls a list already holds; it never adds a server to a list.
 var knownDohUrlPairs = [][2]string{
 	{"https://1.1.1.1/dns-query", "https://[2606:4700:4700::1111]/dns-query"},
 	{"https://1.0.0.1/dns-query", "https://[2606:4700:4700::1001]/dns-query"},
@@ -1516,7 +1518,8 @@ var knownDohUrlPairs = [][2]string{
 }
 
 // knownDnsServerPairs are the v4/v6 pairs of the default and regional plain
-// dns operators, the same rule for the plain-dns lists.
+// dns operators, and of Google Public DNS for a user who names it, the same
+// rule for the plain-dns lists.
 var knownDnsServerPairs = [][2]string{
 	{"1.1.1.1", "2606:4700:4700::1111"},
 	{"1.0.0.1", "2606:4700:4700::1001"},

@@ -44,8 +44,9 @@ const (
 	ControlDohErrorTooMany = "too_many"
 )
 
-// The most bootstrap DoH servers of one family a user can name. The defaults
-// add four of each, and a protected lookup races the servers ahead of them.
+// The most bootstrap DoH servers of one family a user can name. The default
+// servers of the family follow them, and a protected lookup races the named
+// servers ahead of the defaults.
 const ControlDohMaxUrlCount = 8
 
 // What is wrong with a bootstrap DoH url, as a code from the list above.

@@ -729,9 +729,9 @@ func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
 // the baseline.
 func testHardCodedRemoteDohIps(ipVersion int) (hardCodedIps []string, controlIp string) {
 	if ipVersion == 4 {
-		return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}, "1.0.0.1"
+		return []string{"1.1.1.1", "9.9.9.9", "208.67.222.222"}, "1.0.0.1"
 	}
-	return []string{"2606:4700:4700::1111", "2001:4860:4860::8888", "2620:fe::fe", "2620:119:35::35"}, "2606:4700:4700::1001"
+	return []string{"2606:4700:4700::1111", "2620:fe::fe", "2620:119:35::35"}, "2606:4700:4700::1001"
 }
 
 // TestMultiClientBlockActionDefaultRemoteDohIgnored verifies the built-in
