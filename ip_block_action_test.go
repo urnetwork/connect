@@ -724,11 +724,11 @@ func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
 	})
 }
 
-// testWellKnownResolverIps are resolver ips of the family in the built-in
-// ignore baseline (wellKnownResolverAddrs): the default remote doh servers,
-// Google Public DNS (no longer a default, still queried directly by devices)
-// and another operator's second address. The control ip is a same-operator
-// neighbor that is not in the baseline.
+// Resolver ips of the family in the built-in ignore baseline
+// (wellKnownResolverAddrs): the default remote doh servers, Google Public DNS
+// (no longer a default, still queried directly by devices) and another
+// operator's second address. The control ip is a same-operator neighbor that
+// is not in the baseline.
 func testWellKnownResolverIps(ipVersion int) (resolverIps []string, controlIp string) {
 	if ipVersion == 4 {
 		return []string{"1.1.1.1", "9.9.9.9", "208.67.222.222", "8.8.8.8", "8.8.4.4", "149.112.112.112"}, "1.1.1.2"
@@ -736,11 +736,11 @@ func testWellKnownResolverIps(ipVersion int) (resolverIps []string, controlIp st
 	return []string{"2606:4700:4700::1111", "2620:fe::fe", "2620:119:35::35", "2001:4860:4860::8888", "2001:4860:4860::8844", "2620:fe::9"}, "2606:4700:4700::1112"
 }
 
-// TestMultiClientBlockActionWellKnownResolversIgnored verifies the built-in
-// ignore baseline: the well known resolver ips, Google Public DNS included,
-// are excluded from override decisions with NO SetBlockActionIgnoreHosts
-// wiring at all, while a neighboring non-baseline ip still matches overrides.
-// Both families: the baseline carries the v6 resolver endpoints too.
+// The built-in ignore baseline: the well known resolver ips, Google Public DNS
+// included, are excluded from override decisions with NO
+// SetBlockActionIgnoreHosts wiring at all, while a neighboring non-baseline ip
+// still matches overrides. Both families: the baseline carries the v6
+// resolver endpoints too.
 func TestMultiClientBlockActionWellKnownResolversIgnored(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())

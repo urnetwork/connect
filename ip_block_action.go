@@ -870,15 +870,15 @@ func (self *blockActionCache) delete(addr netip.Addr) {
 	delete(self.decisions, addr)
 }
 
-// wellKnownResolverAddrs is the built-in ignore baseline: the addresses of
-// the well known public dns resolvers, every endpoint of the known operator
-// pairs (`knownDohUrlPairs`, `knownDnsServerPairs`) and of the default
-// resolver lists. These are always excluded from the override and association
-// logic, independent of the host's `SetBlockActionIgnoreHosts` wiring: the os
-// or a browser may query them directly (Android private dns, a browser's
-// secure dns), a resolver flow is co-active with nearly every site, and a user
-// override rule that captured one could cut off all of a device's dns. The
-// blocker generator never blocks them either (`WellKnownResolverAddrs`).
+// The built-in ignore baseline: the addresses of the well known public dns
+// resolvers, every endpoint of the known operator pairs (`knownDohUrlPairs`,
+// `knownDnsServerPairs`) and of the default resolver lists. These are always
+// excluded from the override and association logic, independent of the
+// host's `SetBlockActionIgnoreHosts` wiring: the os or a browser may query
+// them directly (Android private dns, a browser's secure dns), a resolver flow
+// is co-active with nearly every site, and a user override rule that captured
+// one could cut off all of a device's dns. The blocker generator never blocks
+// them either (`WellKnownResolverAddrs`).
 //
 // The set is fixed rather than read from the defaults alone, so a resolver
 // that leaves the defaults stays protected: Google Public DNS left them for
@@ -921,9 +921,9 @@ var wellKnownResolverAddrs = sync.OnceValue(func() map[netip.Addr]bool {
 	return addrs
 })
 
-// WellKnownResolverAddrs returns the well known public dns resolver addresses
-// of the block-action ignore baseline (see `wellKnownResolverAddrs`), sorted,
-// for the blocker generator (blocker/main.go), which must never block them.
+// The well known public dns resolver addresses of the block-action ignore
+// baseline (see `wellKnownResolverAddrs`), sorted, for the blocker generator
+// (blocker/main.go), which must never block them.
 func WellKnownResolverAddrs() []netip.Addr {
 	addrs := make([]netip.Addr, 0, len(wellKnownResolverAddrs()))
 	for addr := range wellKnownResolverAddrs() {

@@ -18,8 +18,8 @@ import (
 // is no resolver list and keeps Google so that rules never capture a device's
 // own Google DNS traffic (TestResolverIgnoreBaselineKeepsWellKnownResolvers).
 
-// testIsGoogleDnsEndpoint reports whether a resolver list entry names Google
-// Public DNS: one of its published anycast addresses (v4, or in its v6 /48,
+// Whether a resolver list entry names Google Public DNS: one of its
+// published anycast addresses (v4, or in its v6 /48,
 // dns64 included), a DoH url on one, or one of its host names. The addresses
 // are the operator's public service constants, the subject of the test, not
 // live configuration.
@@ -85,7 +85,7 @@ func TestIsGoogleDnsEndpointDetectsEveryForm(t *testing.T) {
 	}
 }
 
-// testResolverLists names each server list of resolver settings.
+// Each server list of resolver settings, by name.
 func testResolverLists(name string, resolver *DnsResolverSettings) map[string][]string {
 	if resolver == nil {
 		return map[string][]string{}
