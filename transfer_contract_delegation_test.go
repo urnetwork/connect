@@ -382,6 +382,37 @@ func TestContractDestinationCheckReadsOnlyTheStoredKey(t *testing.T) {
 	}
 }
 
+// A key that is not there, or is not a key, refuses before the check is asked, so
+// a check need not know the shape of one to fail closed.
+func TestContractDestinationCheckRefusesAMalformedKeyUnasked(t *testing.T) {
+	for name, storedKey := range map[string][]byte{
+		"empty": nil,
+		"short": make([]byte, ed25519.PublicKeySize-1),
+		"long":  make([]byte, ed25519.PublicKeySize+1),
+	} {
+		client, oob := newPendingContractClient(t, nil)
+		manager := client.ContractManager()
+		watch := watchContractDelegation(t, client)
+		asked := atomic.Int64{}
+		manager.SetContractDestinationCheck(func(Id, []byte) bool {
+			asked.Add(1)
+			return true
+		})
+
+		destinationId := NewId()
+		contractKey := ContractKey{Destination: DestinationId(destinationId)}
+		result, contractId := contractDelegationResult(t, client, destinationId, storedKey, nil)
+		requestContractDelegationResult(t, client, oob, contractKey, 0, result)
+		if manager.TakeContract(context.Background(), contractKey, 0) != nil {
+			t.Errorf("%s: a sequence took the contract", name)
+		}
+		watch.requireUnusedClose(t, contractId)
+		if asked.Load() != 0 {
+			t.Errorf("%s: the check was asked %d times", name, asked.Load())
+		}
+	}
+}
+
 // A contract for another destination is no use on this key however good its own
 // key is, and the check is never asked about it.
 func TestContractDestinationCheckRefusesAnotherDestination(t *testing.T) {
@@ -516,12 +547,12 @@ func TestContractDestinationCheckPanicRefuses(t *testing.T) {
 	watch.requireRefusal(t, contractKey)
 }
 
-// A control service that grants every request a contract naming the key the test
-// chooses, for a real sequence to meet.
+// A control service that answers each request with a contract naming the key the
+// test chooses, for a real sequence to meet. A nil key answers with an error.
 type contractDelegationOob struct {
-	clientId   Id
-	storedKey  func(requestIndex int) []byte
-	grantCount atomic.Int64
+	clientId     Id
+	storedKey    func(requestIndex int) []byte
+	requestCount atomic.Int64
 }
 
 // Takes the frames and answers before it returns.
@@ -537,21 +568,27 @@ func (self *contractDelegationOob) SendControl(frames []*protocol.Frame, callbac
 		if !ok {
 			continue
 		}
-		index := int(self.grantCount.Add(1)) - 1
-		storedBytes, err := proto.Marshal(&protocol.StoredContract{
-			ContractId:                 NewId().Bytes(),
-			TransferByteCount:          createContract.TransferByteCount,
-			SourceId:                   self.clientId.Bytes(),
-			DestinationId:              createContract.DestinationId,
-			DestinationClientPublicKey: self.storedKey(index),
-		})
-		if err != nil {
-			continue
+		result := &protocol.CreateContractResult{}
+		if storedKey := self.storedKey(int(self.requestCount.Add(1)) - 1); storedKey == nil {
+			contractError := protocol.ContractError_Setup
+			result.Error = &contractError
+		} else {
+			storedBytes, err := proto.Marshal(&protocol.StoredContract{
+				ContractId:                 NewId().Bytes(),
+				TransferByteCount:          createContract.TransferByteCount,
+				SourceId:                   self.clientId.Bytes(),
+				DestinationId:              createContract.DestinationId,
+				DestinationClientPublicKey: storedKey,
+			})
+			if err != nil {
+				continue
+			}
+			result.Contract = &protocol.Contract{
+				StoredContractBytes: storedBytes,
+				ProvideMode:         protocol.ProvideMode_Network,
+			}
 		}
-		resultBytes, err := proto.Marshal(&protocol.CreateContractResult{Contract: &protocol.Contract{
-			StoredContractBytes: storedBytes,
-			ProvideMode:         protocol.ProvideMode_Network,
-		}})
+		resultBytes, err := proto.Marshal(result)
 		if err != nil {
 			continue
 		}
@@ -638,8 +675,8 @@ func TestContractDestinationCheckRefusalSendsNothing(t *testing.T) {
 		destinationId := NewId()
 		join := startContractDelegationSend(t, client, destinationId)
 		synctest.Wait()
-		if oob.grantCount.Load() == 0 || check.callCount() == 0 {
-			t.Fatalf("no contract reached the check: grants=%d calls=%d", oob.grantCount.Load(), check.callCount())
+		if oob.requestCount.Load() == 0 || check.callCount() == 0 {
+			t.Fatalf("no contract reached the check: grants=%d calls=%d", oob.requestCount.Load(), check.callCount())
 		}
 		if key := contractDelegationSessionKey(client, destinationId); key != nil {
 			t.Errorf("the session learned a key: %x", key)
@@ -658,8 +695,8 @@ func TestContractDestinationCheckRefusalSendsNothing(t *testing.T) {
 				t.Errorf("a frame reached the destination: %v", path)
 			}
 		}
-		if int64(watch.closeCount()) != oob.grantCount.Load() {
-			t.Errorf("%d closes for %d grants", watch.closeCount(), oob.grantCount.Load())
+		if int64(watch.closeCount()) != oob.requestCount.Load() {
+			t.Errorf("%d closes for %d grants", watch.closeCount(), oob.requestCount.Load())
 		}
 		watch.stateLock.Lock()
 		for _, report := range watch.closes {
@@ -669,8 +706,8 @@ func TestContractDestinationCheckRefusalSendsNothing(t *testing.T) {
 		}
 		watch.stateLock.Unlock()
 		statuses := watch.dispatchedStatuses()
-		if int64(len(statuses)) != oob.grantCount.Load() {
-			t.Errorf("%d statuses for %d grants", len(statuses), oob.grantCount.Load())
+		if int64(len(statuses)) != oob.requestCount.Load() {
+			t.Errorf("%d statuses for %d grants", len(statuses), oob.requestCount.Load())
 		}
 		for _, status := range statuses {
 			if status.Error == nil || *status.Error != protocol.ContractError_Trust {
@@ -728,6 +765,8 @@ func TestContractDestinationCheckRunsBeforeTheSessionLearnsTheKey(t *testing.T) 
 
 // A contract queued before the check was installed meets it at a sequence's real
 // take: the sequence asks again, and only the replacement's key reaches the session.
+// The first request is answered with an error, so that the take can only find the
+// queued contract: a queue hands out its contracts in no fixed order.
 func TestContractDestinationCheckRefusesAQueuedContractAtARealTake(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	resetBackendDegraded()
@@ -735,8 +774,13 @@ func TestContractDestinationCheckRefusesAQueuedContractAtARealTake(t *testing.T)
 	synctest.Test(t, func(t *testing.T) {
 		goodKey, substituted := contractDelegationTestKey(t), contractDelegationTestKey(t)
 		oob := &contractDelegationOob{
-			clientId:  NewId(),
-			storedKey: func(int) []byte { return goodKey },
+			clientId: NewId(),
+			storedKey: func(requestIndex int) []byte {
+				if requestIndex == 0 {
+					return nil
+				}
+				return goodKey
+			},
 		}
 		client, _ := newContractDelegationSendClient(t, oob)
 		manager := client.ContractManager()
@@ -753,6 +797,13 @@ func TestContractDestinationCheckRefusesAQueuedContractAtARealTake(t *testing.T)
 		join := startContractDelegationSend(t, client, destinationId)
 		synctest.Wait()
 		watch.requireUnusedClose(t, refusedId)
+		if key := contractDelegationSessionKey(client, destinationId); key != nil {
+			t.Errorf("the session learned the refused contract's key: %x", key)
+		}
+
+		// past the sequence's retry interval, on the bubble's clock
+		time.Sleep(client.settings.SendBufferSettings.CreateContractRetryInterval)
+		synctest.Wait()
 		if key := contractDelegationSessionKey(client, destinationId); !bytes.Equal(key, goodKey) {
 			t.Errorf("session key %x, want the replacement's %x", key, goodKey)
 		}
