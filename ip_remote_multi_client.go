@@ -11070,9 +11070,12 @@ type multiClientChannelUpdate struct {
 	dialFailedSynEnd  uint32
 	dialFailedSynSeen bool
 	// Source-observed attempt time/version, independent of collapse replay.
-	discoveryAttemptStarted      time.Time
-	discoveryAttemptStamp        atomic.Uint64
-	serviceRefreshRequested      bool
+	discoveryAttemptStarted time.Time
+	discoveryAttemptStamp   atomic.Uint64
+	serviceRefreshRequested bool
+	// Exact optional acquisition lineage survives metadata successors and
+	// receive-cache release; a new native attempt invalidates it.
+	serviceRefreshLineage        atomic.Uint64
 	pendingServiceRefreshBinding *multiClientChannel
 	// Those of dialFailedClients whose failure arrived as the provider's own
 	// signal rather than the silence inference. An exit that said it cannot
@@ -11849,6 +11852,7 @@ func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 		return
 	}
 	self.serviceRefreshRequested = false
+	self.serviceRefreshLineage.Store(0)
 	self.discoveryAttemptStarted = time.Now()
 	self.discoveryAttemptStamp.Add(1)
 	self.dialFailedSynSeen, self.dialFailedSyn, self.dialFailedSynEnd = true, ipPath.SequenceNumber, end
@@ -12436,6 +12440,10 @@ type multiClientWindow struct {
 	// Replaces the uniform jitter offset in [0, half) with a deterministic
 	// one. Production leaves it unset.
 	retryJitterForTest func(half time.Duration) time.Duration
+	// Nil in production; a focused test holds accounting before its lock.
+	beforeDiscoveryRetryPublishForTest func(*tcpSynRetry)
+	// Nil in production; orders source invalidation before owned retirement.
+	beforeServiceRefreshRetireForTest func(*tcpSynRetry, *multiClientChannel)
 
 	generator                    MultiClientGenerator
 	clientReceivePacketCallback  clientReceivePacketFunction
@@ -13812,7 +13820,7 @@ func (self *multiClientWindow) resize() {
 		update := self.resizeMonitor.NotifyChannel()
 		refresh := self.serviceRefreshSnapshot()
 		if refresh.owner == nil {
-			self.finishServiceRefresh(nil)
+			self.pruneInvalidServiceRefresh()
 		}
 
 		var windowSize WindowSizeSettings
@@ -14583,7 +14591,7 @@ func (self *multiClientWindow) resize() {
 				if 0 < addedCount && (refresh.owner == nil || refresh.update.receivedInbound.Load()) {
 					self.noteDiscoveryExpandAdmitted()
 				} else {
-					self.noteDiscoveryExpandUnproductive(time.Now())
+					self.noteDiscoveryExpandUnproductive(time.Now(), expandPass.serviceRefresh)
 				}
 			}
 			if self.log.V(1).Enabled() {
@@ -14971,6 +14979,9 @@ func (self *multiClientWindow) expand(
 			}
 			// the victim's ordinary removal, after the swap: its remaining
 			// flows move or end with it, and its channel cleanup retires it
+			if self.beforeServiceRefreshRetireForTest != nil && strictHandover.serviceRefresh != nil {
+				self.beforeServiceRefreshRetireForTest(strictHandover.serviceRefresh, victim)
+			}
 			victim.Close()
 			self.removeClients(victim)
 			if victimRemoval != nil {

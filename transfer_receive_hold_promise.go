@@ -166,7 +166,7 @@ func (self *ReceiveSequence) releaseHoldPromise() {
 		root := budget.admissionRoot()
 		root.admissionLock.Lock()
 		self.holdPromise.closed = true
-		released := self.clearReceiveMemoryPressureWithLock()
+		released := self.clearReceiveMemoryPressureWithLock() + self.releaseReceiveHeldHeadRepairWithLock()
 		root.admissionLock.Unlock()
 		if released != 0 {
 			budget.notifyCapacityChanged()

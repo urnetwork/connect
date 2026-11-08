@@ -238,6 +238,11 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 		}
 	})
 	entered := make(chan nativeSynDispositionOrderEvent, 1)
+	// The initial B cache must be newer than the actual held A disposition.
+	// Admission is concurrent; only the existing dequeue boundary establishes
+	// that order. Later native controls still exercise their original oracle.
+	initialAMaterialized := make(chan struct{})
+	var orderInitialB atomic.Bool
 	specs := make([]reraceExitSpec, 3)
 	for index := range specs {
 		name := string(rune('a' + index))
@@ -253,6 +258,20 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 			settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
 			if configure != nil {
 				configure(name, settings, f)
+			}
+			if name == "b" {
+				previous := settings.SendBufferSettings.beforeGroupDequeueForTest
+				settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
+					if orderInitialB.CompareAndSwap(true, false) {
+						select {
+						case <-initialAMaterialized:
+						case <-source.ctx.Done():
+						}
+					}
+					if previous != nil {
+						previous(source)
+					}
+				}
 			}
 			if name != "a" {
 				return
@@ -327,6 +346,7 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 						!f.held.CompareAndSwap(false, true) {
 						continue
 					}
+					close(initialAMaterialized)
 					entered <- nativeSynDispositionOrderEvent{source: source, group: group, update: group.collapseAdmission.update, bytes: len(packet)}
 					select {
 					case <-f.release:
@@ -411,6 +431,7 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 		f.budgets["b"].SetTotalByteCount(0)
 	}
 	f.h.concurrent = true
+	orderInitialB.Store(true)
 	if !privateCrossWindowNativeSyn(f.h, f.path) {
 		t.Fatal("old ordinary native source was not admitted")
 	}
@@ -518,8 +539,26 @@ func (self *nativeSynDispositionOrderFixture) cache(t *testing.T, sequence uint3
 		valid = credit.byteCount <= self.funding.cache && cap(owner.refusedRemoteIds) <= self.funding.remoteCapacity &&
 			ready != nil && ready.credit != nil && !ready.credit.released.Load() && ready.credit.byteCount <= self.funding.readiness && len(ready.slots) <= self.funding.readyCapacity
 	}
+	var diagnostic string
+	if !valid {
+		// Current-source assertion census; every original assertion is preserved.
+		diagnostic = fmt.Sprintf("valid=%t owner_present=%t budget_root_matches=%t child_used=%d child_cap=%d root_used=%d root_cap=%d funded_cache=%d funded_ready=%d funded_remote_capacity=%d funded_slots=%d", valid, owner != nil, budget.root == self.root, budget.UsedByteCount(), budget.TotalByteCount(), self.root.UsedByteCount(), self.root.TotalByteCount(), self.funding.cache, self.funding.readiness, self.funding.remoteCapacity, self.funding.readyCapacity)
+		if owner != nil {
+			diagnostic += fmt.Sprintf(" refs=%d packet_present=%t sequence=%d expected_sequence=%d serial=%d credit_present=%t refused_capacity=%d readiness_present=%t", owner.references, owner.packet != nil, owner.sequence, sequence, owner.serial, owner.credit != nil, cap(owner.refusedRemoteIds), owner.readiness != nil)
+			if value := owner.credit; value != nil {
+				diagnostic += fmt.Sprintf(" credit_budget_matches=%t credit_released=%t cache_bytes=%d", value.budget == budget, value.released.Load(), value.byteCount)
+			}
+			if ready := owner.readiness; ready != nil {
+				diagnostic += fmt.Sprintf(" ready_credit_present=%t ready_slots=%d", ready.credit != nil, len(ready.slots))
+				if value := ready.credit; value != nil {
+					diagnostic += fmt.Sprintf(" ready_released=%t ready_bytes=%d", value.released.Load(), value.byteCount)
+				}
+			}
+		}
+	}
 	self.update.stateLock.Unlock()
 	if !valid || self.root.UsedByteCount() < credit.byteCount {
+		t.Logf("MASTER_CURRENT_CACHE_CENSUS %s", diagnostic)
 		t.Fatal("actual cached source lacks its exact live paid child/root ownership")
 	}
 	return owner, credit

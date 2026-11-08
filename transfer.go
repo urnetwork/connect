@@ -642,6 +642,12 @@ func DefaultClientSettings() *ClientSettings {
 }
 
 func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
+	return DefaultClientSettingsWithBufferSizeAndMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Derive complete client defaults from one owner's target without changing
+// process sizing. A nonpositive target selects unscaled defaults.
+func DefaultClientSettingsWithBufferSizeAndMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *ClientSettings {
 	settings := &ClientSettings{
 		SendBufferSize:    bufferSize,
 		ForwardBufferSize: bufferSize,
@@ -649,14 +655,14 @@ func DefaultClientSettingsWithBufferSize(bufferSize int) *ClientSettings {
 		ReadTimeout:             time.Duration(-1),
 		BufferTimeout:           15 * time.Second,
 		ControlPingTimeout:      time.Duration(0),
-		SendBufferSettings:      DefaultSendBufferSettingsWithBufferSize(bufferSize),
-		ReceiveBufferSettings:   DefaultReceiveBufferSettingsWithBufferSize(bufferSize),
+		SendBufferSettings:      defaultSendBufferSettingsWithMemoryTarget(bufferSize, memoryTargetByteCount),
+		ReceiveBufferSettings:   defaultReceiveBufferSettingsWithMemoryTarget(bufferSize, memoryTargetByteCount),
 		ForwardBufferSettings:   DefaultForwardBufferSettingsWithBufferSize(bufferSize),
 		ContractManagerSettings: DefaultContractManagerSettingsWithBufferSize(bufferSize),
 		ControlSyncOobSettings:  DefaultControlSyncOobSettings(),
 		StreamManagerSettings:   DefaultStreamManagerSettings(),
 		PeerManagerSettings:     DefaultPeerManagerSettings(),
-		WebRtcSettings:          DefaultWebRtcSettings(),
+		WebRtcSettings:          defaultWebRtcSettingsWithMemoryTarget(memoryTargetByteCount),
 		EncryptionSettings:      DefaultEncryptionSettings(),
 		ProtocolVersion:         DefaultProtocolVersion,
 		DefaultTransferOpts:     DefaultTransferOpts(),
@@ -741,7 +747,11 @@ const transferBudgetShareDivisor = 8
 // absence of the surface, and the caller must then keep today's constant
 // rather than fall to a floor.
 func transferBudgetShareByteCount() ByteCount {
-	budget := MemoryBudget()
+	return transferBudgetShareByteCountForTarget(MemoryBudget())
+}
+
+// The same share rule applies to process defaults and an explicit owner.
+func transferBudgetShareByteCountForTarget(budget ByteCount) ByteCount {
 	if budget <= 0 {
 		return 0
 	}
@@ -801,6 +811,11 @@ func DefaultWindowSizing() WindowSizingPolicyKind {
 // deployment sets one thing rather than three that must agree. Constant leaves
 // the settings exactly as a tree without this program would build them.
 func (self *SendBufferSettings) ApplyWindowSizing() {
+	self.applyWindowSizingForMemoryTarget(MemoryBudget())
+}
+
+// Explicit construction must not sample the host process again for its share.
+func (self *SendBufferSettings) applyWindowSizingForMemoryTarget(memoryTargetByteCount ByteCount) {
 	switch self.WindowSizing {
 	case WindowSizingFromDelivery:
 		// The rule and the delivery-bounded reliable admission of
@@ -829,7 +844,7 @@ func (self *SendBufferSettings) ApplyWindowSizing() {
 		// falling to the floor would make every unbudgeted provider slower the
 		// moment the rule is turned on.
 		if self.ResendQueueBudget == nil {
-			if share := transferBudgetShareByteCount(); 0 < share {
+			if share := transferBudgetShareByteCountForTarget(memoryTargetByteCount); 0 < share {
 				self.ResendQueueBudget = NewTransferMemoryBudget(share)
 			}
 		}
@@ -865,8 +880,14 @@ func DefaultSendBufferSettings() *SendBufferSettings {
 }
 
 func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings {
+	return defaultSendBufferSettingsWithMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Shared implementation keeps every non-memory default identical.
+func defaultSendBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *SendBufferSettings {
 	settings := &SendBufferSettings{
 		ChunkSettings:         DefaultSendBufferChunkSettings(),
+		LiveDiagnostics:       false,
 		CreateContractTimeout: 30 * time.Second,
 		// Retry a failed/absent contract promptly. A same-network peer connect can
 		// briefly return NoPermission while the target's provide registration is
@@ -960,7 +981,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		// per send sequence (per peer), so scaled by the memory budget.
 		// when a shared budget is set, the max acts as the per-sequence
 		// borrow cap and the min as the guaranteed floor.
-		ResendQueueMaxByteCount: MemoryScaledByteCount(mib(2), kib(256)),
+		ResendQueueMaxByteCount: MemoryTargetScaledByteCount(memoryTargetByteCount, mib(2), kib(256)),
 		ResendQueueMinByteCount: kib(256),
 		// THROUGHPUTFIX §37.17 guard two. On by default: a selective
 		// acknowledgement earned by a route that has since died is not proof
@@ -1020,7 +1041,7 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 		ProtocolVersion:      DefaultProtocolVersion,
 	}
 	settings.WindowSizing = DefaultWindowSizing()
-	settings.ApplyWindowSizing()
+	settings.applyWindowSizingForMemoryTarget(memoryTargetByteCount)
 	settings.ApplicationPacing = false
 	return settings
 }
@@ -1044,9 +1065,14 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 // names the term that bound it — rather than silently at a constant, which is
 // the whole difference between this and what it replaces.
 func (self *ReceiveBufferSettings) ApplyWindowSizing() {
+	self.applyWindowSizingForMemoryTarget(MemoryBudget())
+}
+
+// Explicit construction uses its owner share for both hold and admission.
+func (self *ReceiveBufferSettings) applyWindowSizingForMemoryTarget(memoryTargetByteCount ByteCount) {
 	switch self.WindowSizing {
 	case WindowSizingFromDelivery:
-		if share := transferBudgetShareByteCount(); 0 < share {
+		if share := transferBudgetShareByteCountForTarget(memoryTargetByteCount); 0 < share {
 			self.ReceiveQueueMaxByteCount = max(share, self.ReceiveQueueMinByteCount)
 			if self.ReceiveQueueBudget == nil {
 				self.ReceiveQueueBudget = NewTransferMemoryBudget(share)
@@ -1065,6 +1091,11 @@ func DefaultReceiveBufferSettings() *ReceiveBufferSettings {
 }
 
 func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSettings {
+	return defaultReceiveBufferSettingsWithMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Shared implementation keeps every non-memory default identical.
+func defaultReceiveBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *ReceiveBufferSettings {
 	settings := &ReceiveBufferSettings{
 		GapTimeout: 60 * time.Second,
 		// the receive idle timeout should be a bit longer than the send idle timeout
@@ -1105,10 +1136,13 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// per receive sequence (per peer), so scaled by the memory budget.
 		// when a shared budget is set, the max acts as the per-sequence
 		// borrow cap and the min as the guaranteed floor.
-		ReceiveQueueMaxByteCount: MemoryScaledByteCount(mib(2)+kib(512), kib(320)),
+		ReceiveQueueMaxByteCount: MemoryTargetScaledByteCount(memoryTargetByteCount, mib(2)+kib(512), kib(320)),
 		EvictionNotice:           true,
 		ReceiveQueueMinByteCount: kib(320),
-		AllowLegacyNack:          true,
+		// One bounded proof-only decode can restore contract authority for a
+		// retained original even after ordinary RX capacity is exhausted.
+		ReceiveHeadContractRepairByteCount: kib(16) + decodedPackOwnerQueueByteCount,
+		AllowLegacyNack:                    true,
 		// Four contracts cover the receive reorder window. Accepted successors
 		// remain stored until activation; that transition trims predecessors
 		// without closing the current contract or newer announcements.
@@ -1117,7 +1151,7 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		ProtocolVersion:        DefaultProtocolVersion,
 	}
 	settings.WindowSizing = DefaultWindowSizing()
-	settings.ApplyWindowSizing()
+	settings.applyWindowSizingForMemoryTarget(memoryTargetByteCount)
 	return settings
 }
 
@@ -1371,9 +1405,10 @@ type ReceivePack struct {
 	ReceiveCallback    ReceiveFunction
 	MessageByteCount   ByteCount
 	TransferFrameBytes []byte
-	// sequenceQueueByteCount is owned by ReceiveSequence between successful
-	// Pack admission and channel dequeue. It is the per-flow logical encoded
-	// byte charge and is zero outside that interval.
+	// A proof-only ingress supplies its observed encoded length here after
+	// returning the carrier. Successful Pack admission makes it a logical
+	// queue reservation; dequeue clears it. The packed flag distinguishes the
+	// supplied length from capacity already reserved for the channel.
 	sequenceQueueByteCount ByteCount
 	// sequenceQueueBudgetByteCount is the independently selected aggregate
 	// charge. Opt-in diagnostics can use the retained allocation computed by
@@ -1405,9 +1440,17 @@ type ReceivePack struct {
 	// inbound stream (shared by both peers, not complemented). Derived from the
 	// wire companion hint, the decrypting session, or the EncryptedControl;
 	// defaults false. Keys the ReceiveSequence and its session.
-	EncryptionCompanion bool
-	receiveMemoryOwned  bool
-	sequenceQueueQuota  bool
+	EncryptionCompanion    bool
+	receiveMemoryOwned     bool
+	sequenceQueueQuota     bool
+	sequenceQueueReserved  bool
+	heldHeadRepairEligible bool
+	// Copied before publication; payload roots may return before the ingress
+	// link is removed. Recovery must never classify those returned frames.
+	receiveConsumerData bool
+	// The decoder assigns Pack before acquiring the publication lock. Root
+	// readers use this copied flag until the owner actually unlinks.
+	receivePublishedReliable bool
 }
 
 // The owned-decoder envelope includes its pointer-bearing allocator header.
@@ -1736,8 +1779,8 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
-	ReceiveDecodeReservedByteCount  ByteCount
-	ReceiveDecodePressureDropCount  uint64
+	ReceiveDecodeReservedByteCount ByteCount
+	ReceiveDecodePressureDropCount uint64
 	// Frames a direct peer (P2P) route delivered that named the platform or
 	// this client as their source, dropped as forged.
 	ForgedSourceDropCount           uint64
@@ -2074,10 +2117,10 @@ type ClientSendRecoveryStatsSnapshot struct {
 	// campaign seed from another independently of any candidate: §27.1
 	// predicts the collapsing seed reads the smallest interval at onset.
 	// No behaviour depends on them.
-	// RouteUnacknowledgedDuration is how long the route carrying this
-	// sequence's oldest outstanding item has gone without acknowledging
-	// anything, and RouteRetainedItemCount how many of its items are still
-	// held. Together they make the exchange-h3 hang visible in a campaign
+	// RouteUnacknowledgedDuration and RouteRetainedItemCount are independent
+	// lifetime maxima of observed route silence and retained count, not current
+	// values or necessarily observations from the same instant. Together they
+	// make the exchange-h3 hang visible in a campaign
 	// without a log dive: a route that has acknowledged nothing for the
 	// whole of a workload while holding items their flow retains past their
 	// acknowledgement timeout. Observation only; no behaviour depends on
@@ -5061,6 +5104,14 @@ func (self *Client) run() {
 						receivePack = &ReceivePack{}
 					}
 					paid := receivePack.receiveMemoryOwned
+					repairCopy := receivePack.ingressSequence != nil && receivePack.ingressSequence.receiveHeldHeadRepairCopy(receivePack)
+					encodedByteCount := ByteCount(0)
+					if repairCopy {
+						messageByteCount = receivePack.MessageByteCount
+						encodedByteCount = ByteCount(len(transferFrameBytes))
+						MessagePoolReturn(transferFrameBytes)
+						transferFrameBytes = nil
+					}
 					var paidRoot *TransferMemoryBudget
 					if paid {
 						paidRoot = decodedOwner.receiveItem.memoryBudget.admissionRoot()
@@ -5070,19 +5121,22 @@ func (self *Client) run() {
 					*receivePack = ReceivePack{
 						receiveMemoryOwned: paid,
 						ingressSequence:    ingress, ingressNext: next, ingressLoanByteCount: loan,
-						carrierDone:         h1ReceiveCredit.done,
-						receivedAtNanos:     receivedAtNanos,
-						Source:              source,
-						SequenceId:          sequenceId,
-						Pack:                pack,
-						decodedOwner:        decodedOwner,
-						ReceiveCallback:     self.receiveCallback,
-						MessageByteCount:    messageByteCount,
-						TransferFrameBytes:  transferFrameBytes,
-						TransportType:       transportType,
-						Unwrapped:           unwrapped,
-						EncryptionRole:      receiveRole,
-						EncryptionCompanion: receiveCompanion,
+						carrierDone:              h1ReceiveCredit.done,
+						receivedAtNanos:          receivedAtNanos,
+						sequenceQueueByteCount:   encodedByteCount,
+						Source:                   source,
+						SequenceId:               sequenceId,
+						Pack:                     pack,
+						decodedOwner:             decodedOwner,
+						receiveConsumerData:      receiveHeadRecoveryPack(pack),
+						receivePublishedReliable: !pack.Nack,
+						ReceiveCallback:          self.receiveCallback,
+						MessageByteCount:         messageByteCount,
+						TransferFrameBytes:       transferFrameBytes,
+						TransportType:            transportType,
+						Unwrapped:                unwrapped,
+						EncryptionRole:           receiveRole,
+						EncryptionCompanion:      receiveCompanion,
 					}
 					if paidRoot != nil {
 						paidRoot.admissionLock.Unlock()
@@ -5102,6 +5156,7 @@ func (self *Client) run() {
 					success, err := self.receiveBuffer.Pack(receivePack, handoffTimeout)
 					endTransferProgress(progressObserver, packProgress, "receive_pack_end", success && err == nil, err)
 					if !success {
+						receivePack.sequenceQueueByteCount = 0
 						if err == nil {
 							self.recordReceivePackHandoffDrop(messageByteCount)
 						}
@@ -5484,6 +5539,9 @@ type SendBufferSettings struct {
 	// rate/drain waits over the transport's own flow control. True is reserved
 	// for explicit controller experiments, never inferred from transport type.
 	ApplicationPacing bool
+	// Opt-in owner samples for diagnostic runs. False allocates no observer;
+	// performance qualification keeps this disabled. Reads request samples.
+	LiveDiagnostics bool
 
 	// Isolates path-RTT-only sizing in deterministic performance controls.
 	ackCompressionResidenceOverrideForTest *time.Duration
@@ -6784,6 +6842,10 @@ type SendDestinationStats struct {
 	Rtt RttEstimate
 	// how many of this destination's sequences contributed a sampled estimate
 	RttSequenceCount int
+	// Separate timestamped owner samples; never derived from historical route
+	// maxima. Each sequence has its own sampling instant and missing-data flag.
+	LiveDiagnosticsEnabled bool
+	LiveSequences          []SendSequenceLiveSnapshot
 }
 
 func (self *SendBuffer) DestinationSendStats(destinationId Id) SendDestinationStats {
@@ -6800,11 +6862,17 @@ func (self *SendBuffer) DestinationSendStats(destinationId Id) SendDestinationSt
 	self.mutex.Unlock()
 
 	stats := SendDestinationStats{SequenceCount: len(sequences)}
+	if self.sendBufferSettings != nil {
+		stats.LiveDiagnosticsEnabled = self.sendBufferSettings.LiveDiagnostics
+	}
 	meanRttTotal := time.Duration(0)
 	newestSampleAge := time.Duration(0)
 	minimumRtt := time.Duration(0)
 	now := time.Now()
 	for sequence := range sequences {
+		if stats.LiveDiagnosticsEnabled || sequence.liveDiagnostics != nil {
+			stats.LiveSequences = append(stats.LiveSequences, sequence.readSendLiveSnapshot())
+		}
 		stats.WriteCount += sequence.writeCount.Load()
 		stats.WriteByteCount += sequence.writeByteCount.Load()
 		stats.ResendWriteCount += sequence.resendWriteCount.Load()
@@ -7278,6 +7346,9 @@ type SendSequence struct {
 	writeByteCount       atomic.Uint64
 	resendWriteCount     atomic.Uint64
 	resendWriteByteCount atomic.Uint64
+	// Nil unless explicitly enabled. Only the send owner scans retained items;
+	// diagnostic readers request an immutable sample without taking its locks.
+	liveDiagnostics *sendLiveDiagnostics
 
 	// The send worker owns replacement and all direct uses. Statistics copy
 	// the handle under this leaf lock before reading its concurrent policy.
@@ -7504,6 +7575,7 @@ func newSendSequenceWithLogicalLane(
 		windowPacer:            windowBurstPacer{afterWaitForTest: sendBufferSettings.afterWindowPacingWaitForTest},
 		contractSeqIndex:       0,
 		peerCapabilityRecorder: client.peerCapabilityRecorder,
+		liveDiagnostics:        newSendLiveDiagnostics(sendBufferSettings.LiveDiagnostics),
 	}
 	if sendBufferSettings.ResendQueueRetainedByteAccounting {
 		seq.resendQueue.setLifetimeBudget()
@@ -9753,6 +9825,10 @@ func (self *sequenceDeadlineTimer) stop() {
 }
 
 func (self *SendSequence) Run() {
+	var liveDiagnosticsWake <-chan struct{}
+	if self.liveDiagnostics != nil {
+		liveDiagnosticsWake = self.liveDiagnostics.wake
+	}
 	defer self.windowPacer.close()
 	defer self.resetPacingReadyWrite()
 	var ackWorkerDone chan struct{}
@@ -10344,6 +10420,9 @@ sendSequenceLoop:
 			}
 		}
 		if sendPack != nil {
+			if self.liveDiagnostics != nil && self.liveDiagnostics.requested.Load() {
+				self.publishSendLiveSnapshot("ready", time.Now(), false)
+			}
 			// The caller's budget is absolute, so a pack that waited longer
 			// than the caller was willing to wait is dropped here and counted,
 			// rather than waiting in the scheduler with no bound at all —
@@ -10851,6 +10930,22 @@ sendSequenceLoop:
 		if deadlineTimer.armBy(wakeDeadline) && self.sendBufferSettings.afterDeadlineTimerArmForTest != nil {
 			self.sendBufferSettings.afterDeadlineTimerArmForTest(self.id())
 		}
+		if self.liveDiagnostics != nil && self.liveDiagnostics.requested.Load() {
+			reason := "awaiting_work_or_ack"
+			switch {
+			case memoryWaiter != nil:
+				reason = "retained_memory"
+			case !reliableAdmission:
+				reason = "reliable_delivery"
+			case flightBlocked:
+				reason = "unreliable_flight"
+			case self.noAckContractHoldActive:
+				reason = "contract_boundary"
+			case !resendCapacity:
+				reason = "resend_capacity"
+			}
+			self.publishSendLiveSnapshot(reason, time.Now(), false)
+		}
 		select {
 		case <-self.ctx.Done():
 			if !flightWaitStart.IsZero() {
@@ -10858,6 +10953,9 @@ sendSequenceLoop:
 			}
 			return
 		case <-ackSnapshot.ackNotify:
+		case <-liveDiagnosticsWake:
+			// A diagnostic request is not traffic and cannot renew idle life.
+			timerWake = true
 		case <-self.noAckFastPathSettled:
 		case <-self.preparedHandoffWake:
 			drainPreparedCancellation = true
@@ -13950,6 +14048,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	if selective {
 		self.selectiveAckObserved = true
 		if !item.deliveryObserved {
+			self.observeLiveSelectiveAck(item, receivedAtNanos)
 			bytes := item.MessageByteCount()
 			if self.windowPacer.service != nil {
 				bytes = item.pacingByteCount
@@ -14085,6 +14184,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 	}
 	self.sendItems = self.sendItems[i:]
+	self.observeLiveCumulativeAck(ackSequenceNumber, i, receivedAtNanos)
 	self.applyFifoRepair(fifoRepair, self.lastCumulativeAckTime)
 	if len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber > ackSequenceNumber+1 {
 		// An expired interior control becomes a skippable prefix only after
@@ -14144,6 +14244,7 @@ func (self *SendSequence) releaseRetainedSendItems(err error) {
 		item.acks.invoke(err)
 		self.returnSendItem(item)
 	}
+	self.publishSendLiveSnapshot("closed", time.Now(), true)
 }
 
 // writeMaybeWrappedBytes writes `transferFrameBytes` through the contract
@@ -15184,6 +15285,13 @@ type ReceiveBufferSettings struct {
 	ProgressObserver func(TransferProgressEvent)
 	GapTimeout       time.Duration
 	IdleTimeout      time.Duration
+	// Physical escrow reserved before acknowledging a retained original. One
+	// exact same-identity promoted head may borrow it; nonpositive withholds
+	// those commitments. The default covers a 16-KiB proof root plus the inline
+	// owner. Custom larger contract envelopes need a matching value. An original
+	// already carrying a larger proof cannot commit against a smaller slot.
+	// Explicit no-contract peers reserve only the inline owner.
+	ReceiveHeadContractRepairByteCount ByteCount
 
 	SequenceBufferSize int
 	// H1SequenceBufferSize optionally gives reliable H1 arrivals more burst
@@ -15328,10 +15436,15 @@ type ReceiveBufferSettings struct {
 	// payload window. Constrained mobile profiles enable this; server/default
 	// paths retain their historical accounting and avoid the extra scan.
 	ReceiveQueueRetainedByteAccounting bool
-	// Optional shared consumer-head partition. It must be a sibling of RX
-	// under the same immutable parent; its capacity cannot exceed RX. Only a
-	// promised exact-next FromProvider original may use it after ordinary
-	// admission fails. Every physical byte remains charged to the shared root.
+	// Optional shared head partition, a sibling of RX under the same immutable
+	// parent with capacity at most RX. An exact-next FromProvider original may
+	// use it after ordinary admission fails when a promise or actual paid later
+	// data exists in its sequence. Actual paid consumer data also permits its
+	// empty opening control or a full contract proof promoting that exact
+	// tentative original. A registered provider's exact promised raw TCP/UDP
+	// ToProvider head may also use it; actual TCP downstream custody is prepaid
+	// before acceptance. Ordinary proof and packet policy govern delivery.
+	// Every physical byte uses the same parent and root.
 	ReceiveHeadRecoveryBudget *TransferMemoryBudget
 	// Positive caps the legacy encoded-byte permission advertised on ACKs,
 	// independently of logical hold and physical RX capacity. Nonpositive
@@ -16079,6 +16192,9 @@ type ReceiveSequence struct {
 	holdPromise receiveHoldPromise
 	// Bounded scalar pressure handoff; the RX root lock guards reservations.
 	memoryPressure receiveMemoryPressure
+	// One paid repair copy can restore authority for already-owned originals.
+	// The RX root admission lock guards the escrow and eligible-owner count.
+	heldHeadRepair receiveHeldHeadRepair
 	// reused by commitHeldPrefix so walking the hold in order allocates
 	// nothing per arrival
 	heldScratch []*receiveItem
@@ -16527,7 +16643,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	}
 	h1SaturationRecorded := false
 	packQueueBudget := self.receiveBufferSettings.PackQueueBudget
-	byteCount := ByteCount(len(receivePack.TransferFrameBytes))
+	byteCount := max(ByteCount(len(receivePack.TransferFrameBytes)), receivePack.sequenceQueueByteCount)
 	if byteCount <= 0 {
 		byteCount = max(1, receivePack.MessageByteCount)
 	}
@@ -16535,7 +16651,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	var quotaStop *TransferMemoryBudget
 	if receivePack.receiveMemoryOwned {
 		owner := &receivePack.decodedOwner.receiveItem
-		if owner.memoryBudget == nil || owner.QueueByteCount() < byteCount {
+		if owner.memoryBudget == nil || owner.QueueByteCount() < ByteCount(len(receivePack.TransferFrameBytes)) {
 			panic("handoff lacks its physical backing")
 		}
 		quotaStop = receiveMemoryQuotaStop(packQueueBudget, owner.memoryBudget)
@@ -16557,6 +16673,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	var budgetWaitQueueByteCount ByteCount
 	admit := func(count int64, queueByteCount ByteCount) {
 		receivePack.sequenceQueueByteCount = byteCount
+		receivePack.sequenceQueueReserved = true
 		if packQueueBudget != nil {
 			receivePack.sequenceQueueBudgetByteCount = budgetByteCount
 			receivePack.sequenceQueueBudget = packQueueBudget
@@ -16748,9 +16865,10 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 // receiveQueue ownership has its own budget and must not be double-counted as
 // handoff-channel retention.
 func (self *ReceiveSequence) releasePackQueue(receivePack *ReceivePack) {
-	if receivePack == nil || receivePack.sequenceQueueByteCount <= 0 {
+	if receivePack == nil || !receivePack.sequenceQueueReserved {
 		return
 	}
+	receivePack.sequenceQueueReserved = false
 	byteCount := receivePack.sequenceQueueByteCount
 	receivePack.sequenceQueueByteCount = 0
 	budget := receivePack.sequenceQueueBudget
@@ -17808,12 +17926,6 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	if paidBudget != nil {
 		paidBudget.admissionRoot().admissionLock.Unlock()
 	}
-	if !self.prepareReceiveDeliveryCredit(item) {
-		self.client.receiveQueueDropCount.Add(1)
-		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
-		return false, nil
-	}
-
 	// A compact head is meaningful only against a contract verified earlier in
 	// this sequence. Keep the sequence number pending and request the proof;
 	// treating this as delivery or a malformed contract would either lose data
@@ -17842,6 +17954,9 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			held = self.receiveQueue.GetBySequenceNumber(sequenceNumber)
 		}
 	}
+	if held == nil && self.receiveHeldHeadRepairCopy(receivePack) {
+		return false, nil
+	}
 	// A sequence-number collision is not proof for the committed message.
 	// Successor announcements also cannot become ordinary head authority.
 	if held != nil && item.head && (held.messageId != item.messageId ||
@@ -17852,6 +17967,11 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	admissionItem := item
 	if held != nil {
 		admissionItem = held
+	}
+	if !self.prepareReceiveDeliveryCredit(admissionItem) {
+		self.client.receiveQueueDropCount.Add(1)
+		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
+		return false, nil
 	}
 
 	// Exact retained owners reserve before advancing; legacy heads reserve
@@ -17984,6 +18104,19 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			return false, nil
 		}
 	} else {
+		// Recovery-child ownership can cover a contiguous ingress train before
+		// the worker advances. If a predecessor failed or has not arrived here,
+		// this future consumer cannot enter the RX-owned retained queue. Refuse
+		// before eviction can withdraw an unrelated paid suffix or its ACK.
+		if sequenceNumber > self.nextSequenceNumber && !item.head &&
+			self.receiveQueue.lifetimeBudget && item.decodedOwner != nil &&
+			receivePack.receiveMemoryOwned && receivePack.receiveConsumerData &&
+			receivePack.ingressSequence == self &&
+			item.memoryBudget != nil && item.memoryBudget == self.receiveBufferSettings.receiveHeadRecoveryBudget() {
+			self.client.receiveQueueDropCount.Add(1)
+			self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
+			return false, nil
+		}
 		if !self.receiveDeliveryFits(item) {
 			self.client.receiveQueueDropCount.Add(1)
 			self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
@@ -18084,7 +18217,8 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 		}
 
-		if canQueue(item) && self.reserveHeldItem(item, promised) {
+		if canQueue(item) && self.reserveHeldItem(item, promised) &&
+			(self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix || self.reserveReceiveHeldHeadRepair(item)) {
 			// the largest frame seen is the conservative gap estimate:
 			// over-counting commits fewer items and costs churn at the
 			// boundary, under-counting commits an item that is later evicted,
@@ -18168,13 +18302,27 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 		required := ByteCount(missing) * retainedByteCount
 		if self.holdPromiseFits(heldTotal, missing, frameByteCount) && self.reserveHoldPromise(required) {
 			self.heldScratch = self.receiveQueue.UnorderedItems(self.heldScratch)
+			complete := true
 			for _, held := range self.heldScratch {
 				if !held.committed {
-					self.commitHeldItem(held)
+					if _, ok := self.receiveHeldHeadRepairLimit(held); !ok {
+						complete = false
+						break
+					}
 				}
 			}
-			self.settleHoldPromise(true, newest.sequenceNumber, required)
-			return
+			if complete {
+				for _, held := range self.heldScratch {
+					if !held.committed && !self.commitHeldItem(held) {
+						complete = false
+						break
+					}
+				}
+			}
+			if complete {
+				self.settleHoldPromise(true, newest.sequenceNumber, required)
+				return
+			}
 		}
 	}
 
@@ -18191,8 +18339,7 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 		missing := heldMissingBelow(held.sequenceNumber, self.nextSequenceNumber, i)
 		if committing && !held.committed {
 			if self.holdPromiseFits(heldByteCount, missing, frameByteCount) &&
-				self.reserveHoldPromise(ByteCount(missing)*retainedByteCount) {
-				self.commitHeldItem(held)
+				self.reserveHoldPromise(ByteCount(missing)*retainedByteCount) && self.commitHeldItem(held) {
 			} else {
 				committing = false
 			}
@@ -18205,7 +18352,10 @@ func (self *ReceiveSequence) commitHeldPrefix() {
 }
 
 // Acknowledges one held item as it crosses the boundary.
-func (self *ReceiveSequence) commitHeldItem(held *receiveItem) {
+func (self *ReceiveSequence) commitHeldItem(held *receiveItem) bool {
+	if !self.reserveReceiveHeldHeadRepair(held) {
+		return false
+	}
 	held.committed = true
 	self.client.receiveQueueCommitCount.Add(1)
 	self.sendAckAt(
@@ -18217,6 +18367,7 @@ func (self *ReceiveSequence) commitHeldItem(held *receiveItem) {
 		held.transportType,
 		held.receivedAtNanos,
 	)
+	return true
 }
 
 func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error) {

@@ -25,48 +25,51 @@ const (
 // Legacy Pack uses a funded external ProtoUnmarshal graph; normal v2 keeps its
 // inline owned decoder. ACK repeats may require merging the selected category.
 type receiveMemoryPackScan struct {
-	path                 TransferPath
-	loanSafe             bool
-	compatibility        bool
-	routingPath          TransferPath
-	pathMatches          bool
-	messageId            Id
-	messageIdSet         bool
-	sequenceId           Id
-	sequenceIdSet        bool
-	contractId           Id
-	contractIdSet        bool
-	contractFrameSet     bool
-	contractProof        [32]byte
-	sequenceNumber       uint64
-	logicalLane          uint32
-	head                 bool
-	nack                 bool
-	forceStream          bool
-	companionContract    bool
-	contractAhead        bool
-	sessionRole          int32
-	sessionRoleSet       bool
-	sessionCompanion     bool
-	sessionCompanionSet  bool
-	legacy               bool
-	encrypted            bool
-	encryptedOffset      int
-	encryptedByteCount   int
-	ack                  bool
-	ackOffset            int
-	ackByteCount         int
-	ackLegacy            bool
-	ackNeedsMerge        bool
-	hasEncryptedControl  bool
-	packOffset           int
-	packByteCount        int
-	frameCount           int
-	consumerFrameCount   int
-	messageByteCount     ByteCount
-	payloadRootByteCount ByteCount
-	metadataByteCount    ByteCount
-	retainedByteCount    ByteCount
+	path                  TransferPath
+	loanSafe              bool
+	compatibility         bool
+	routingPath           TransferPath
+	pathMatches           bool
+	messageId             Id
+	messageIdSet          bool
+	sequenceId            Id
+	sequenceIdSet         bool
+	contractId            Id
+	contractIdSet         bool
+	contractFrameSet      bool
+	contractFrameType     int32
+	contractProof         [32]byte
+	sequenceNumber        uint64
+	logicalLane           uint32
+	head                  bool
+	nack                  bool
+	forceStream           bool
+	companionContract     bool
+	contractAhead         bool
+	sessionRole           int32
+	sessionRoleSet        bool
+	sessionCompanion      bool
+	sessionCompanionSet   bool
+	legacy                bool
+	encrypted             bool
+	encryptedOffset       int
+	encryptedByteCount    int
+	ack                   bool
+	ackOffset             int
+	ackByteCount          int
+	ackLegacy             bool
+	ackNeedsMerge         bool
+	hasEncryptedControl   bool
+	packOffset            int
+	packByteCount         int
+	frameCount            int
+	consumerFrameCount    int
+	providerFrameCount    int
+	providerTcpFrameCount int
+	messageByteCount      ByteCount
+	payloadRootByteCount  ByteCount
+	metadataByteCount     ByteCount
+	retainedByteCount     ByteCount
 }
 
 // These local views borrow only for the current scan; neither is published.
@@ -288,6 +291,28 @@ func receiveMemoryScanFrame(body []byte, base int) (messageType int32, messageBy
 	return
 }
 
+// Raw provider classification borrows the validated final frame payload.
+// Wrapped packets keep ordinary admission; inspecting them would allocate
+// before the decode owner was funded. Duplicate frame scalars never reach a
+// recovery loan because the caller also requires scan.loanSafe.
+func receiveMemoryScanRawProviderProtocol(body []byte, packet []byte) IpProtocol {
+	raw := false
+	cursor := receiveMemoryWireCursor{bytes: body}
+	for cursor.offset < len(body) {
+		field, ok := cursor.next()
+		if !ok {
+			return IpProtocolUnknown
+		}
+		if field.number == 3 {
+			raw = field.wireType == protowire.VarintType && field.value != 0
+		}
+	}
+	if !raw {
+		return IpProtocolUnknown
+	}
+	return receiveProviderHeadRecoveryProtocol(packet)
+}
+
 // Known Tag scalars follow last-value behavior; no payload allocation occurs.
 func receiveMemoryScanTag(body []byte) bool {
 	cursor := receiveMemoryWireCursor{bytes: body}
@@ -419,6 +444,7 @@ func receiveMemoryScanPackBody(body []byte, base int, scan *receiveMemoryPackSca
 				return false
 			}
 			if field.number == 7 {
+				scan.contractFrameType = kind
 				if size == 0 {
 					scan.contractProof = sha256.Sum256(nil)
 				} else {
@@ -440,6 +466,16 @@ func receiveMemoryScanPackBody(body []byte, base int, scan *receiveMemoryPackSca
 				scan.frameCount++
 				if kind == int32(protocol.MessageType_IpIpPacketFromProvider) && size > 0 {
 					scan.consumerFrameCount++
+				}
+				if kind == int32(protocol.MessageType_IpIpPacketToProvider) && size > 0 {
+					start := offset - field.bodyOffset
+					packetProtocol := receiveMemoryScanRawProviderProtocol(field.bytes, field.bytes[start:start+size])
+					if packetProtocol != IpProtocolUnknown {
+						scan.providerFrameCount++
+					}
+					if packetProtocol == IpProtocolTcp {
+						scan.providerTcpFrameCount++
+					}
 				}
 				scan.messageByteCount, ok = receiveMemoryScanAdd(scan.messageByteCount, ByteCount(size))
 				if !ok {

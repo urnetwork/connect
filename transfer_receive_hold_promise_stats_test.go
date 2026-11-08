@@ -37,22 +37,31 @@ func TestReceiveGapTimeoutCountsTheAcknowledgementsItWithdraws(t *testing.T) {
 	})
 }
 
-// A predecessor larger than the reservation is the one counted shortfall, and
-// each acknowledgement withdrawn for it is also an eviction.
-func TestReceiveHoldCountsAShortfallForAPredecessorLargerThanItsReservation(t *testing.T) {
+// The former queue-admission regression expected committed withdrawals here.
+// Owned predecode now refuses first and preserves every SACK owner: its loss
+// belongs to handoff counters, with no queue shortfall or eviction invented.
+func TestReceiveHoldCountsPredecodeRefusalWithoutWithdrawingAcknowledgements(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
 		fixture := newReceiveHoldPromiseFixture(t, budget)
-		_, next, large, _ := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, 4)
+		sequence, next, large, committed := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, 4)
+		owners := receiveHoldPromiseCommittedOwners(t, fixture, sequence, committed)
+		reserved, released := budget.Counts()
 		before := fixture.receiver.ReceiveStats()
 		fixture.forward(large, fixture.receiverIn)
 		after := fixture.receiver.ReceiveStats()
-		evictions := after.ReceiveQueueEvictionCount - before.ReceiveQueueEvictionCount
-		shortfalls := after.ReceiveQueueCommitShortfallCount - before.ReceiveQueueCommitShortfallCount
-		if evictions == 0 || shortfalls != evictions {
-			t.Errorf("%d acknowledgements withdrawn and %d counted as shortfall; every withdrawal for a promised predecessor is one", evictions, shortfalls)
+		afterReserved, afterReleased := budget.Counts()
+		if after.PackHandoffDropCount != before.PackHandoffDropCount+1 ||
+			after.PackHandoffDropByteCount-before.PackHandoffDropByteCount != uint64(MessageByteCount(large.pack.Frames)) ||
+			after.ReceiveQueueDropCount != before.ReceiveQueueDropCount ||
+			after.ReceiveQueueCommitShortfallCount != before.ReceiveQueueCommitShortfallCount ||
+			after.ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount ||
+			after.ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount ||
+			reserved != afterReserved || released != afterReleased || fixture.deliveredCount != 4 {
+			t.Fatal("predecode refusal changed funded custody or counted an unexecuted queue admission")
 		}
+		assertReceiveHoldPromiseCommittedOwners(t, fixture, sequence, owners)
 		fixture.drop(next)
 	})
 }

@@ -88,7 +88,7 @@ func newReceivePressureTestFixture(t *testing.T) *receivePressureTestFixture {
 // A bounded blocking read lets synctest advance the unchanged source timer.
 // Every other emitted original remains owned by the fixture and cannot repair
 // the gap first. No force-resend or sender-owned mutable field is used.
-func (self *receivePressureTestFixture) naturalRetry(original *windowRoundFrame) *windowRoundFrame {
+func (self *windowRoundFixture) naturalRetry(original *windowRoundFrame) *windowRoundFrame {
 	self.t.Helper()
 	for _, held := range self.heldFrames {
 		if held != original && held.bytes != nil && held.pack != nil &&
@@ -449,8 +449,10 @@ func TestReceiveMemoryPressurePackRefusalRestoresExactRetry(t *testing.T) {
 func TestReceiveMemoryPressureNeverPreemptsCommittedOwners(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		root := NewTransferMemoryBudget(3 * receivePressureTestCost)
-		rx := NewTransferMemoryBudgetWithParent(3*receivePressureTestCost, root)
+		// Three physical cells and the exact metadata-only promotion escrow.
+		capacity := 3*receivePressureTestCost + decodedPackOwnerQueueByteCount
+		root := NewTransferMemoryBudget(capacity)
+		rx := NewTransferMemoryBudgetWithParent(capacity, root)
 		t.Cleanup(func() {
 			if root.UsedByteCount() != 0 || rx.UsedByteCount() != 0 {
 				t.Error("committed control leaked owners or promise")
@@ -490,13 +492,14 @@ func TestReceiveMemoryPressureNeverPreemptsCommittedOwners(t *testing.T) {
 			}
 			fixture.forward(ack, fixture.senderIn)
 		}
-		if root.UsedByteCount() != 3*receivePressureTestCost || sequence.holdPromise.reservedByteCount != receivePressureTestCost {
+		if root.UsedByteCount() != capacity || sequence.holdPromise.reservedByteCount != receivePressureTestCost ||
+			sequence.heldHeadRepair.reservedByteCount != decodedPackOwnerQueueByteCount {
 			t.Fatal("SACK predecessor promise did not saturate three cells")
 		}
 		before := fixture.receiver.ReceiveStats()
 		fixture.forward(missing, fixture.receiverIn)
 		after := fixture.receiver.ReceiveStats()
-		if root.UsedByteCount() != 3*receivePressureTestCost || sequence.holdPromise.reservedByteCount != receivePressureTestCost ||
+		if root.UsedByteCount() != capacity || sequence.holdPromise.reservedByteCount != receivePressureTestCost ||
 			sequence.receiveQueue.Len() != 2 || sequence.memoryPressure.activeSet ||
 			after.ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount || after.ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount ||
 			len(fixture.receiverOut) != 0 || sequence.ctx.Err() != nil || fixture.receiver.ctx.Err() != nil {

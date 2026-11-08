@@ -45,7 +45,7 @@ func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) boo
 	}
 	additional := prepaid + (metadata+63)/64*64
 	if item.memoryBudget != nil {
-		if !item.growReceiveMemory(additional) {
+		if !item.growReceiveMemory(additional) && !self.recoverProviderReceiveDeliveryCredit(item, additional) {
 			self.requestReceiveMemoryGrowth(item, additional)
 			return false
 		}

@@ -389,3 +389,69 @@ func (self *listingCountDiscoveryGenerator) listings() int {
 	defer self.stateLock.Unlock()
 	return self.listingCount
 }
+
+// A real old provider reply completes while the attempted refresh's failed
+// accounting is paused before publication. Its one-shot clear must not be lost.
+func TestEarlyIdleServiceRefusalAnswerBeforeRetryPublicationIsAtomic(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53129, false)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		finish := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(finish)
+		f.window.beforeDiscoveryRetryPublishForTest = func(owner *tcpSynRetry) {
+			if owner != nil {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+		}
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		credit := f.owner.credit
+		if !discoveryDemandTestAwaitPublication(t, entered, f.started.Add(f.window.settings.WindowExpandTimeout+time.Second)) {
+			t.Fatal("atomic accounting control never reached the actual attempted pass publication gap")
+		}
+		f.window.stateLock.Lock()
+		pending := f.window.serviceRefreshOwner == f.owner && f.window.serviceRefreshAttempted && f.window.discoveryRetry.failureCount == 0
+		f.window.stateLock.Unlock()
+		if !pending {
+			t.Fatal("accounting gap lacks its exact still-owned attempted refresh")
+		}
+		f.answerOld(t)
+		f.update.stateLock.Lock()
+		consumed := f.update.receivedInbound.Load() && !f.update.serviceRefreshRequested
+		f.update.stateLock.Unlock()
+		f.window.stateLock.Lock()
+		clearedBeforePublish := f.window.discoveryRetry.failureCount == 0 && f.window.discoveryRetry.notBefore.IsZero()
+		f.window.stateLock.Unlock()
+		if !consumed || !clearedBeforePublish {
+			t.Fatal("actual answer did not finish its one-shot clear before accounting resumed")
+		}
+		finish()
+		f.h.settle()
+		f.window.stateLock.Lock()
+		failures, deferred, owner := f.window.discoveryRetry.failureCount, !f.window.discoveryRetry.notBefore.IsZero(), f.window.serviceRefreshOwner
+		f.window.stateLock.Unlock()
+		if failures != 0 || deferred || owner != nil || f.owner.packet != nil || !credit.released.Load() {
+			t.Fatalf("EARLY_IDLE_REFUSAL_ANSWER_GAP_LEFT_BACKOFF: failures=%d deferred=%t owned=%t", failures, deferred, owner != nil)
+		}
+		// A later ordinary failure is independent, even though this source's
+		// body continues delivering after its useful answer consumed the flag.
+		f.window.noteDiscoveryExpandUnproductive(time.Now())
+		f.window.stateLock.Lock()
+		deadline, count := f.window.discoveryRetry.notBefore, f.window.discoveryRetry.failureCount
+		f.window.stateLock.Unlock()
+		if count != 1 || !time.Now().Before(deadline) || !f.h.send(reraceSegment(f.path, 0, []byte("atomic old winner body"))) {
+			t.Fatal("atomic accounting control lacks a later real ordinary deferral/body")
+		}
+		f.window.stateLock.Lock()
+		kept := f.window.discoveryRetry.failureCount == count && f.window.discoveryRetry.notBefore.Equal(deadline)
+		f.window.stateLock.Unlock()
+		if !kept {
+			t.Fatal("atomic answer handling erased a later ordinary failure")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
