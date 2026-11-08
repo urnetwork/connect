@@ -11728,6 +11728,165 @@ paths:
         "200":
           description: OK.
 
+  # §13.15's certificate routes (sidecar DESIGN.md §13.8). api serves them, and
+  # route_authz.go classifies them sidecar, so a `strict_exp` bearer reaches them
+  # under §7.4's allowlist while each route's own class below still applies.
+  # Each is planned until the certs routes land, and internal until then. Bytes
+  # are base64; `attestation` is the encoded `Signed` of a `TlsKeyAttestation`
+  # (sidecar protocol/tls.proto) by the device's identity key, purpose
+  # `tls-key`. `POST /tls/suspend` is not listed: it stays a model call inside
+  # api and taskworker until a caller outside them exists.
+  /tls/cert-order:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Order a certificate for a device's key
+      description: |
+        A device's CSR for its own P-256 key, with that key's attestation. Takes
+        a service token for audience `certs` from a client that holds a `tls/` or
+        `smtp/` grant; the token names the caller, never the body. The CSR's
+        names must be exactly the caller's set: its network's pair, each live
+        alias's pair, or its scope's pair alone. The attestation must verify
+        under the caller's identity key for the CSR's key and those names. The
+        row is written before anything else happens and the order runs later, so
+        the answer gives its id and state, and the caller polls
+        `GET /tls/cert-order/{cert_id}`.
+
+        `replaces` names the live certificate this order renews, by RFC 9773's
+        certificate id, which takes it out of the order limits. It is stored
+        nowhere.
+      operationId: tlsCertOrder
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertOrderArgs"
+      responses:
+        "200":
+          description: The row, written before the order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderResult"
+        "403":
+          description: |
+            No `tls/` or `smtp/` grant, a CSR for other names or another curve,
+            or an attestation that does not verify for this key and these names.
+        "429":
+          description: Past the set's limit. The body gives `retry_after_ms`.
+
+  /tls/cert-order/{cert_id}:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read an order
+      description: |
+        The caller's own order: its state, how long to wait before asking again,
+        the chain once it issues, leaf first, and the CA's suggested renewal
+        window. Takes a service token for audience `certs`, from the order's own
+        sidecar; another caller's order answers 404.
+      operationId: tlsCertOrderGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: cert_id
+          in: path
+          required: true
+          description: udid. The row's id from `POST /tls/cert-order`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderStatus"
+        "404":
+          description: No such order of this caller's.
+
+  /tls/cert-register:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Register a custom domain's chain
+      description: |
+        A Team custom domain's chain (v1), from a desktop that ordered it under
+        the domain's own ACME account. The chain's key and names must match a
+        queued row, or the attestation sent with it, so a device cannot register
+        another device's key. Takes a client token of the network.
+      operationId: tlsCertRegister
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRegisterArgs"
+      responses:
+        "200":
+          description: Registered.
+        "403":
+          description: The chain's key or names match no queued row and no attestation.
+
+  /tls/certs:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the network's certificates
+      description: |
+        The network's certificates with their attestations, for each device's
+        certificate transparency watch, and the custom-domain CSRs waiting for an
+        ordering desktop. A reader verifies each attestation itself, under the
+        identity key its own verified state holds, and never trusts this answer
+        for it. Takes a client token of the network.
+      operationId: tlsCerts
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertsResult"
+
+  /tls/cert-revoke:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Revoke a certificate
+      description: |
+        Revokes a certificate of the caller's own client, or, with a network
+        admin's token, any of the network's. `key_compromise` revokes with reason
+        keyCompromise. The revocation runs after the answer, and the row reads
+        `revoking` until the CA takes it.
+      operationId: tlsCertRevoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRevokeArgs"
+      responses:
+        "200":
+          description: The revocation is queued.
+        "403":
+          description: Another client's certificate, without a network admin's token.
+        "404":
+          description: No such certificate in the network.
+
 components:
   parameters:
     GkmGroupId:
@@ -25399,3 +25558,198 @@ components:
           type: array
           items:
             type: string
+
+    TlsCertState:
+      description: |
+        Where a certificate row stands: queued for certs' queue or, for a custom
+        domain, an ordering desktop; ordering at its CA; waiting_dns for its
+        challenge's serial and the canary; issued; failed, with no retry;
+        revoking until the CA takes a revocation; revoked; expired. A reader
+        takes a state it does not know as no certificate.
+      type: string
+      enum: [queued, ordering, waiting_dns, issued, failed, revoking, revoked, expired]
+
+    TlsCertOrderArgs:
+      type: object
+      required:
+        - csr
+        - attestation
+      properties:
+        csr:
+          description: A PKCS 10 request in DER, by the device's own P-256 key, for its set of names.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for that key and set.
+          type: string
+          format: byte
+        replaces:
+          description: RFC 9773's certificate id of the live certificate this order renews.
+          type: string
+
+    TlsCertOrderResult:
+      type: object
+      required:
+        - cert_id
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+
+    TlsCertOrderStatus:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+        chain:
+          description: Each certificate in DER, leaf first. Absent until the order issues.
+          type: array
+          items:
+            type: string
+            format: byte
+        ari_window_start:
+          description: datetime. RFC 9773's suggested renewal window, absent until the CA gives one.
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+
+    TlsCertRecord:
+      type: object
+      required:
+        - cert_id
+        - network_id
+        - client_id
+        - sidecar_id
+        - identifier_set_sha256
+        - spki_sha256
+        - attestation
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        network_id:
+          description: udid
+          type: string
+        client_id:
+          description: udid
+          type: string
+        sidecar_id:
+          description: udid
+          type: string
+        identifier_set_sha256:
+          description: SHA-256 over the set's names, sorted, each followed by one zero byte.
+          type: string
+          format: byte
+        spki_sha256:
+          description: SHA-256 of the key's DER SubjectPublicKeyInfo.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of the key's `TlsKeyAttestation`, for a reader to verify itself.
+          type: string
+          format: byte
+        csr:
+          description: The PKCS 10 request in DER, on a custom domain's queued row only.
+          type: string
+          format: byte
+        ca:
+          type: string
+        account_uri:
+          type: string
+        profile:
+          type: string
+        serial:
+          description: Lowercase hex. Absent until it issues.
+          type: string
+        not_before:
+          description: datetime
+          type: string
+          format: date-time
+        not_after:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_start:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        successor_cert_id:
+          description: udid. The row that took over from this one.
+          type: string
+        chain:
+          description: A custom domain's registered chain, each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+
+    TlsCertsResult:
+      type: object
+      required:
+        - certs
+      properties:
+        certs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+        queued_csrs:
+          description: Custom-domain CSRs waiting for an ordering desktop (v1).
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+
+    TlsCertRegisterArgs:
+      type: object
+      required:
+        - chain
+        - account_uri
+      properties:
+        cert_id:
+          description: udid. The queued row this chain answers. Absent when the attestation is sent instead.
+          type: string
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for the chain's key and names.
+          type: string
+          format: byte
+        chain:
+          description: Each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+        account_uri:
+          description: The custom domain's ACME account that ordered it.
+          type: string
+
+    TlsCertRevokeArgs:
+      type: object
+      required:
+        - cert_id
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        key_compromise:
+          description: Revoke with reason keyCompromise.
+          type: boolean

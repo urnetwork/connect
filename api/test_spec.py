@@ -148,6 +148,59 @@ class SpecTest(unittest.TestCase):
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
         self.assertNotIn("bundle", args["properties"])
 
+    def test_tls_routes_are_documented_and_planned(self):
+        # sidecar DESIGN.md §13.15's certificate routes, each with its class: the
+        # order and its status take a service token for audience certs, the rest
+        # a bearer. Each stays planned and out of the public api until certs
+        # serves it, on api's own host. POST /tls/suspend stays a model call, so
+        # it is no path here.
+        expected = {
+            ("/tls/cert-order", "post"): "ServiceTokenAuth",
+            ("/tls/cert-order/{cert_id}", "get"): "ServiceTokenAuth",
+            ("/tls/cert-register", "post"): "BearerAuth",
+            ("/tls/certs", "get"): "BearerAuth",
+            ("/tls/cert-revoke", "post"): "BearerAuth",
+        }
+        methods = {"get", "put", "post", "delete", "patch"}
+        paths = self.spec["paths"]
+        self.assertEqual(
+            {path for path, _ in expected},
+            {path for path in paths if path.startswith("/tls/")},
+        )
+        for (path, method), scheme in expected.items():
+            with self.subTest(path=path, method=method):
+                item = paths[path]
+                self.assertEqual({method}, methods & set(item))
+                self.assertNotIn("servers", item)
+                operation = item[method]
+                self.assertTrue(operation["x-internal"])
+                self.assertEqual("planned", operation["x-status"])
+                self.assertEqual([{scheme: []}], operation["security"])
+        # the bodies' fields are sidecar tls_api.go's JSON names, which its
+        # TestTlsBodiesKeepTheirWireNames pins on that side
+        schemas = self.spec["components"]["schemas"]
+        fields = {
+            "TlsCertOrderArgs": {"csr", "attestation", "replaces"},
+            "TlsCertOrderResult": {"cert_id", "state", "retry_after_ms"},
+            "TlsCertOrderStatus": {"state", "retry_after_ms", "chain", "ari_window_start", "ari_window_end"},
+            "TlsCertsResult": {"certs", "queued_csrs"},
+            "TlsCertRegisterArgs": {"cert_id", "attestation", "chain", "account_uri"},
+            "TlsCertRevokeArgs": {"cert_id", "key_compromise"},
+            "TlsCertRecord": {
+                "cert_id", "network_id", "client_id", "sidecar_id", "identifier_set_sha256",
+                "spki_sha256", "attestation", "csr", "ca", "account_uri", "profile", "serial",
+                "not_before", "not_after", "ari_window_start", "ari_window_end", "state",
+                "successor_cert_id", "chain",
+            },
+        }
+        for name, want in fields.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, set(schemas[name]["properties"]))
+        self.assertEqual(
+            ["queued", "ordering", "waiting_dns", "issued", "failed", "revoking", "revoked", "expired"],
+            schemas["TlsCertState"]["enum"],
+        )
+
     def test_auth_key_routes_are_served(self):
         # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
         # the network credential's (403 for a client token), and the bundle never
