@@ -11200,12 +11200,19 @@ paths:
   /acl/ack:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Report the applied projection
       description: |
-        A client reports the projection version it applied, which measures how far
-        policy has propagated. Kept 7 days.
+        A client reports the projection version it applied, the authorization
+        log position of the newest entry its engine installed, which measures how
+        far policy has propagated. The client is the bearer's own; a client token
+        only. One row per client holds its newest version and when it was
+        reported, kept 7 days.
+
+        An ack counts only when it is newer than the client's last and at or
+        below its network's verified head, so a network without a config repo
+        records nothing. `time_ms` is the entry's own time, as the client read it
+        from the verified entry, and only measures the delay.
       operationId: aclAck
       security:
         - BearerAuth: []
@@ -11218,6 +11225,16 @@ paths:
       responses:
         "200":
           description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AclAckResult"
+        "400":
+          description: The version or time is invalid.
+        "403":
+          description: Not a client token.
+        "503":
+          description: Acks are not available on this server yet.
 
   /acl/invite:
     post:
@@ -25864,8 +25881,24 @@ components:
         - version
       properties:
         version:
-          description: The projection version the client applied.
+          description: The projection version the client applied, a log position from 1.
           type: integer
+          format: int64
+        time_ms:
+          description: That entry's time, ms since the epoch, as the entry carries it. Optional.
+          type: integer
+          format: int64
+
+    AclAckResult:
+      type: object
+      required:
+        - recorded
+      properties:
+        recorded:
+          description: |
+            Whether the ack counted: false for a version not above the client's last
+            ack, above its network's head, or in a network with no head.
+          type: boolean
 
     EvsPushLeaseArgs:
       type: object
