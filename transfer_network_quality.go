@@ -149,6 +149,11 @@ func (self *clientNetworkQualityState) observePeer(source TransferPath, peer Pee
 	if destinationId == (Id{}) || destinationId == ControlId || destinationId == self.client.clientId {
 		return
 	}
+	// Service carries only the subprotocols its receiver lists, so a quality
+	// notification would be refused there, after opening a return contract for it.
+	if peer.ProvideMode == protocol.ProvideMode_Service {
+		return
+	}
 	provideMode := protocol.ProvideMode_Stream
 	if peer.ProvideMode == protocol.ProvideMode_Network {
 		provideMode = protocol.ProvideMode_Network

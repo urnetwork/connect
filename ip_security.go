@@ -380,9 +380,14 @@ func inspectAndRefreshIngressFallback(
 // enforces on egress. ProvideMode is a set of flags with no ordinal meaning (see
 // its definition in protocol) — this is a per-case decision, never max/min:
 // egress may reach non-public destinations (e.g. a LAN) only under a genuine
-// same-Network relationship on BOTH sides. Anything else, including an
+// same-Network relationship on BOTH sides. Service on either side stays Service,
+// which the policy refuses: it has no ip path at all, so the public rules, which
+// admit public destinations, must never see it. Anything else, including an
 // unspecified None, is treated as Public so the public-destination rules apply.
 func egressRelationship(source, client protocol.ProvideMode) protocol.ProvideMode {
+	if source == protocol.ProvideMode_Service || client == protocol.ProvideMode_Service {
+		return protocol.ProvideMode_Service
+	}
 	if source == protocol.ProvideMode_Network && client == protocol.ProvideMode_Network {
 		return protocol.ProvideMode_Network
 	}
@@ -514,7 +519,10 @@ func (self *securityPolicy) inspectAndRefreshEgressGroupDetailedBorrowed(
 	ipPath := &ipPaths[0]
 	result := SecurityPolicyResultAllow
 	decision := securityDecision{reason: SecurityPolicyReasonNetwork}
-	if provideMode != protocol.ProvideMode_Network {
+	if provideMode == protocol.ProvideMode_Service {
+		result = SecurityPolicyResultIncident
+		decision.reason = SecurityPolicyReasonServiceSource
+	} else if provideMode != protocol.ProvideMode_Network {
 		destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
 		drop, shadowReason := self.inspectSharedAddressSpace(destinationIp)
 		if !isPublicUnicast(ipPath.DestinationIp) {
@@ -585,6 +593,15 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 ) (SecurityPolicyResult, securityDecision) {
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, securityDecision{reason: SecurityPolicyReasonNetwork}
+	}
+
+	// A Service source has no ip path. An incident, not a drop: a drop can still
+	// leave by the local route, under the bypass or an override, and an incident
+	// never does. No flow of any other relationship reaches this, so the rules
+	// generation stays: raising it would demote every older provider for rules
+	// no client's traffic can meet.
+	if protocol.ProvideMode_Service == provideMode {
+		return SecurityPolicyResultIncident, securityDecision{reason: SecurityPolicyReasonServiceSource}
 	}
 
 	// apply public rules:
@@ -709,6 +726,11 @@ func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipP
 	// (including the p2p range) is not filtered here.
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
+	}
+
+	// mirrors the egress refusal: a Service source has no ip path either way
+	if protocol.ProvideMode_Service == provideMode {
+		return SecurityPolicyResultIncident, nil
 	}
 
 	// mirror the egress static drops (blocked ips + port policy), evaluated on the

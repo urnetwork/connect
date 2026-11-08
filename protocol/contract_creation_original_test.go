@@ -108,6 +108,53 @@ func TestOriginalContractCreationRetainsStreamFallbackDirection(t *testing.T) {
 
 // Mutations are made before a fresh SDK receipt signature is attempted; the
 // nested pre-send request must still prevent a response from changing its party.
+// The modes that carry this evidence are named, not ranged, so each is decided on
+// its own. Service has no escrow or payout to attribute, and the unset and unknown
+// modes have no meaning to bind.
+func TestOriginalContractCreationNamesItsProvideModes(t *testing.T) {
+	cases := []struct {
+		mode      ProvideMode
+		supported bool
+	}{
+		{mode: ProvideMode_None, supported: false},
+		{mode: ProvideMode_Network, supported: true},
+		{mode: ProvideMode_FriendsAndFamily, supported: true},
+		{mode: ProvideMode_Public, supported: true},
+		{mode: ProvideMode_Stream, supported: true},
+		{mode: ProvideMode_PublicStream, supported: true},
+		{mode: ProvideMode_Service, supported: false},
+		{mode: ProvideMode(7), supported: false},
+		{mode: ProvideMode(-1), supported: false},
+	}
+	_, admission, key := originalContractFixture(t, false, ProvideMode_Public)
+	var frame Frame
+	if err := proto.Unmarshal(admission.ResultFrame, &frame); err != nil {
+		t.Fatal(err)
+	}
+	var result CreateContractResult
+	if err := proto.Unmarshal(frame.MessageBytes, &result); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		result.Contract.ProvideMode = c.mode
+		resultBody, err := proto.Marshal(&result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultFrame, err := proto.Marshal(&Frame{MessageType: MessageType_TransferCreateContractResult, MessageBytes: resultBody})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = SignOriginalContractAdmission(t.Context(), OriginalContractAdmission{Request: admission.Request, ResultFrame: resultFrame}, key)
+		if c.supported && err != nil {
+			t.Errorf("mode %v: %v", c.mode, err)
+		}
+		if !c.supported && err == nil {
+			t.Errorf("mode %v was admitted", c.mode)
+		}
+	}
+}
+
 func TestOriginalContractCreationRejectsResignedChangedEndpoint(t *testing.T) {
 	_, admission, key := originalContractFixture(t, false, ProvideMode_Public)
 	var frame Frame

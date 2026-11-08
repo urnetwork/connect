@@ -62,6 +62,8 @@ const (
 	// the WhatsApp Noise transport, an application standard
 	// (ip_security_appstandard.go)
 	SecurityPolicyReasonAllowWhatsApp
+	// the source is in Service mode, which has no ip path
+	SecurityPolicyReasonServiceSource
 	// a public-rule destination in the shared address space, 100.64.0.0/10.
 	// Decides the packet with `CfaaSecurityPolicySettings.DropSharedAddressSpace`
 	// on. With it off the packet keeps its verdict and its deciding reason, and
@@ -134,6 +136,8 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-messaging"
 	case SecurityPolicyReasonAllowWhatsApp:
 		return "allow-app-standard:whatsapp"
+	case SecurityPolicyReasonServiceSource:
+		return "service-source"
 	case SecurityPolicyReasonSharedAddressSpace:
 		return "shared-address-space"
 	default:

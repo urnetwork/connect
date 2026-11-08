@@ -70,9 +70,15 @@ For each egress packet, in order:
 
 1. **Network bypass** — `provideMode == ProvideMode_Network` (same-network
    relationship) → **Allow**.
-2. **Public-unicast** — destination not public unicast (private / loopback /
+2. **Service refusal** — `ProvideMode_Service` has no ip path → **Incident**, the
+   verdict the local bypass and block overrides cannot route. It is the third
+   layer: the client drops such a source's frames before any callback, and a
+   provider refuses them whatever policy it runs. No other relationship reaches
+   this rule, so it needs no rules generation (§2.4.2): the generation orders
+   rules a client's flows can meet.
+3. **Public-unicast** — destination not public unicast (private / loopback /
    link-local / multicast / unspecified) → **Incident**.
-3. **Shared address space** — destination in `100.64.0.0/10` (RFC 6598) →
+4. **Shared address space** — destination in `100.64.0.0/10` (RFC 6598) →
    **Drop** with `shared-address-space` when
    `CfaaSecurityPolicySettings.DropSharedAddressSpace` is on. Off, the default,
    nothing changes: the packet goes on to the rules below and the reason is
@@ -80,11 +86,11 @@ For each egress packet, in order:
    that comes before the drop. It is never an Incident, because this space holds
    carrier and overlay addresses: `isPublicUnicast` keeps calling it public, so
    no one is reported for reaching it.
-4. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
+5. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
    - `cfaaDrop` → **Drop**
    - `cfaaAllow` → **Allow** (definitive; skip DPI)
    - `cfaaPass` → hand to the **DMCA layer**.
-5. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
+6. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
 
 ### 2.3 Ingress pipeline (source)
 
@@ -92,7 +98,8 @@ Ingress mirrors only the static **drops**, evaluated on the *source* endpoint, a
 does **not** run payload inspection:
 
 1. **Network bypass** — `ProvideMode_Network` → **Allow**.
-2. **CFAA layer** — `cfaa.inspect(srcIp, srcPort, proto, version) == cfaaDrop` →
+2. **Service refusal** — `ProvideMode_Service` → **Incident**, as on egress.
+3. **CFAA layer** — `cfaa.inspect(srcIp, srcPort, proto, version) == cfaaDrop` →
    **Drop**; otherwise **Allow**. (Ingress does not distinguish `cfaaAllow` from
    `cfaaPass` — only the drops are enforced.)
 
@@ -230,7 +237,7 @@ even when `includeIp` is set, share the result table's per-key cardinality bound
 and are local diagnostics: nothing about them is sent off the device.
 
 `shared-address-space` is the one reason that can be counted without deciding
-anything (§2.2 step 3): with the drop off, such a packet counts once under its
+anything (§2.2 step 4): with the drop off, such a packet counts once under its
 deciding reason and once under this one, so the reasons of those packets sum to
 twice their result count. Its count is the number of packets the drop would
 refuse.

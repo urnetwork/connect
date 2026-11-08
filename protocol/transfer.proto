@@ -358,6 +358,9 @@ enum ProvideMode {
     Public = 3;
     Stream = 4;
     PublicStream = 5;
+    // A platform service's edge stream: subprotocol frames only, and only the
+    // ids the receiver lists. It carries no IP, no escrow and no payout.
+    Service = 6;
 }
 
 
@@ -528,6 +531,13 @@ message CreateContract {
     // select or alter a route, contract, or encryption session. Presence
     // proves the sender can report the lane; absence remains unknown.
     optional SequenceRole sender_role = 9;
+
+    // A window client's signed `WindowDelegation`, opaque here. The platform
+    // copies these bytes unchanged into `StoredContract.window_delegation`.
+    // Empty on a companion request, whose contract inherits the forward
+    // contract's seals, and on every request from a client that holds no
+    // delegation.
+    bytes window_delegation = 10;
 }
 // the creator knows all the hops on the stream from the enumerated linpaths
 // when evaluating the completed contracts, the send and receive count involving the source_id
@@ -590,6 +600,20 @@ message Contract {
     bytes destination_client_key_signed_tls_certificate = 6;
 }
 
+// What a contract may carry, sealed in `StoredContract.contract_class`.
+enum ContractClass {
+    // Nothing classed this contract, as with every contract older than the
+    // class. A receiver reads it as the narrowest class. So does a value this
+    // build does not know.
+    ContractClassUnset = 0;
+    // Whatever the provide mode allows.
+    ContractClassData = 1;
+    // Only witnessing and remote search between two admitted sidecars of one
+    // network, with no IP, for a pair no reach grant covers.
+    ContractClassControl = 2;
+}
+
+
 message StoredContract {
     bytes contract_id = 1;
     uint64 transfer_byte_count = 2;
@@ -641,6 +665,28 @@ message StoredContract {
     // Missing preserves legacy contracts without a time limit. At or after
     // this Unix millisecond timestamp no new transfer bytes may be debited.
     optional int64 expiration_time_unix_milli = 12;
+
+    // The four fields below are the seals. The platform sets them in every
+    // provide mode, from its own records and never from a request value,
+    // except `window_delegation`, which it copies. A companion contract
+    // carries its forward contract's seals, so on a companion contract they
+    // describe the forward contract's source, not this contract's. They are
+    // the platform's statements and prove nothing a customer key has not
+    // signed. A contract older than them has them empty, and a receiver that
+    // predates them ignores them.
+
+    // ulid
+    // The subject the platform has stored for the source client: its
+    // `network_client.acl_subject_client_id`, or the source client itself when
+    // that is null.
+    optional bytes source_subject_client_id = 13;
+    // ulid
+    // The source client's network.
+    optional bytes source_network_id = 14;
+    ContractClass contract_class = 15;
+    // The source window client's `CreateContract.window_delegation`, unchanged.
+    // Empty for any other client.
+    bytes window_delegation = 16;
 
     // FIXME companion contract id
 }
