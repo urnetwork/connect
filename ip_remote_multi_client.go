@@ -7974,6 +7974,21 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				sendPacketGroup.affinitySynReuse = false
 			}
 		}
+		// The same inference for a SYN still racing. A race commits a SYN only
+		// on an answer, and the collapse filter keeps every retransmit from
+		// the candidates that already hold it, so a race whose candidates are
+		// all silent held the flow until a verdict removed them, about 30s.
+		// Past the wait each silent candidate leaves the race as an explicit
+		// signal would take it out (clientDialFailure: withdrawn, with its
+		// strike and its failure for the destination), so this retransmit
+		// races the window's other exits: the destination failure widens the
+		// field across tiers (destinationServiceFailurePresent).
+		if currentClient == nil && ipPath.Protocol == IpProtocolTcp && dialProbePacket(ipPath) &&
+			!update.receivedInbound.Load() && self.reliabilitySettings().DialFailureRerace {
+			for _, client := range update.silentRaceCandidates(ipPath, inferredDialFailureTimeout) {
+				self.clientDialFailure(client, ipPath, false)
+			}
+		}
 		if self.beforePacketGroupGateForTest != nil {
 			self.beforePacketGroupGateForTest(update, currentClient, sendPacketGroup)
 		}
@@ -11361,6 +11376,32 @@ func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel
 		return true
 	}
 	return false
+}
+
+// silentRaceCandidates is the candidates of the flow's race, unbound, for
+// ipPath's connect attempt, when every one was sent the SYN at least timeout
+// ago and has answered nothing; nil otherwise. A race with a candidate that
+// answered, whose send is still being admitted, or that joined later, still
+// has its chance.
+func (self *multiClientChannelUpdate) silentRaceCandidates(ipPath *IpPath, timeout time.Duration) []*multiClientChannel {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	race := self.race
+	if race == nil || len(race.clientStates) == 0 || self.client.Load() != nil || self.IsDone() ||
+		self.sourceReset.Load() || self.receivedInbound.Load() ||
+		!self.dialFailedSynSeen || self.dialFailedSyn != ipPath.SequenceNumber {
+		return nil
+	}
+	now := time.Now()
+	candidates := make([]*multiClientChannel, 0, len(race.clientStates))
+	for client, state := range race.clientStates {
+		if 0 < len(state.packets) || !state.receiveTime.IsZero() || 0 < state.pendingSendCount ||
+			state.sentPacketCount == 0 || state.sendTime.IsZero() || now.Sub(state.sendTime) < timeout {
+			return nil
+		}
+		candidates = append(candidates, client)
+	}
+	return candidates
 }
 
 func (self *multiClientChannelUpdate) resetSequence(sendPacket *parsedPacket) {
