@@ -70,13 +70,19 @@ For each egress packet, in order:
 
 1. **Network bypass** — `provideMode == ProvideMode_Network` (same-network
    relationship) → **Allow**.
-2. **Public-unicast** — destination not public unicast (private / loopback /
+2. **Service refusal** — `ProvideMode_Service` has no ip path → **Incident**, the
+   verdict the local bypass and block overrides cannot route. It is the third
+   layer: the client drops such a source's frames before any callback, and a
+   provider refuses them whatever policy it runs. No other relationship reaches
+   this rule, so it needs no rules generation (§2.4.2): the generation orders
+   rules a client's flows can meet.
+3. **Public-unicast** — destination not public unicast (private / loopback /
    link-local / multicast / unspecified) → **Incident**.
-3. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
+4. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
    - `cfaaDrop` → **Drop**
    - `cfaaAllow` → **Allow** (definitive; skip DPI)
    - `cfaaPass` → hand to the **DMCA layer**.
-4. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
+5. **DMCA layer** — `dmca.inspect(ipPath, payload)` → Allow / Drop / Incident.
 
 ### 2.3 Ingress pipeline (source)
 
@@ -84,7 +90,8 @@ Ingress mirrors only the static **drops**, evaluated on the *source* endpoint, a
 does **not** run payload inspection:
 
 1. **Network bypass** — `ProvideMode_Network` → **Allow**.
-2. **CFAA layer** — `cfaa.inspect(srcIp, srcPort, proto, version) == cfaaDrop` →
+2. **Service refusal** — `ProvideMode_Service` → **Incident**, as on egress.
+3. **CFAA layer** — `cfaa.inspect(srcIp, srcPort, proto, version) == cfaaDrop` →
    **Drop**; otherwise **Allow**. (Ingress does not distinguish `cfaaAllow` from
    `cfaaPass` — only the drops are enforced.)
 

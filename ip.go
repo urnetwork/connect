@@ -10257,6 +10257,10 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 
 // `connect.ReceiveFunction`
 func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
+	if peer.ProvideMode == protocol.ProvideMode_Service {
+		self.refuseServiceFrames(frames)
+		return
+	}
 	if peer.delivery != nil {
 		self.receiveReliableFrames(source, frames, peer)
 		return
@@ -10269,6 +10273,22 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	}
 	defer self.finishMemoryOperation(&memory)
 	self.clientReceiveAdmitted(source, frames, peer)
+}
+
+// A Service source gets no ip through a provider, whatever policy this provider
+// runs: a disabled or custom one would pass it. The client refuses these frames
+// before any callback (`Client.admitServiceFrames`), so this holds the rule at the
+// provider should that ever change. It creates no source state and sends nothing
+// back, since a provider never answers a Service source.
+func (self *RemoteUserNatProvider) refuseServiceFrames(frames []*protocol.Frame) {
+	var byteCount int64
+	for _, frame := range frames {
+		if frame != nil {
+			byteCount += int64(len(frame.MessageBytes))
+		}
+	}
+	self.client.subprotocols.droppedServiceIp.Add(uint64(len(frames)))
+	self.countBlockIngress(int64(len(frames)), byteCount)
 }
 
 // Both ordinary admission and the independently prepaid control fallback

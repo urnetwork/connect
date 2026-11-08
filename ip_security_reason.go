@@ -62,6 +62,8 @@ const (
 	// the WhatsApp Noise transport, an application standard
 	// (ip_security_appstandard.go)
 	SecurityPolicyReasonAllowWhatsApp
+	// the source is in Service mode, which has no ip path
+	SecurityPolicyReasonServiceSource
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -129,6 +131,8 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-messaging"
 	case SecurityPolicyReasonAllowWhatsApp:
 		return "allow-app-standard:whatsapp"
+	case SecurityPolicyReasonServiceSource:
+		return "service-source"
 	default:
 		return "unknown"
 	}

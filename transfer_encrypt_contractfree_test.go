@@ -29,6 +29,7 @@ func contractFreeEncryptedPair(
 	aMode EncryptionMode,
 	bMode EncryptionMode,
 	wireKeyFetchers bool,
+	mutateSettings ...func(*ClientSettings),
 ) (a *Client, b *Client, bClientId Id, receivesB chan string) {
 	aClientId := NewId()
 	bClientId = NewId()
@@ -61,6 +62,9 @@ func contractFreeEncryptedPair(
 		// no contracts means no companion contracts: the EC reply carrier
 		// must ride the plain path
 		s.EncryptionSettings.EncryptionControlUseCompanion = false
+		for _, mutate := range mutateSettings {
+			mutate(s)
+		}
 		return s
 	}
 

@@ -609,7 +609,8 @@ const (
 )
 
 // the identity of the source of received frames.
-// `ProvideMode` is the mode of where these frames are from: network, friends and family, public.
+// `ProvideMode` is the mode of where these frames are from: network, friends and family, public,
+// service. A service source's frames are only those `ClientSettings.ServiceSubprotocolIds` lists.
 // `Roles` and `Principal` are the source client's identity from the active contract,
 // set only when the provide mode is network; nil roles and empty principal otherwise.
 // `ContractClass`, `SourceSubject`, `SourceNetwork` and `WindowDelegation` are the
@@ -647,6 +648,29 @@ type Peer struct {
 	// Private downstream-admission capability; public callbacks still borrow
 	// their frames only for the duration of the call.
 	delivery any
+	// The session's verified peer client key, for frames that session opened;
+	// read through `VerifiedClientPublicKey`. Nil for anything else. Shared
+	// with the session, so it is never handed out or written.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
+}
+
+// The peer's long-lived client key, as the end-to-end session that opened these
+// frames verified it: the peer proved possession of it over that session's
+// channel. Every frame of one callback was opened under it. A frame that was
+// not opened by a session has no such key (plaintext, ControlId, loopback, or
+// a key the signed-identity gate has not cleared), and neither does a client
+// without `EncryptionSettings.ExposeVerifiedPeerClientKey`, so the absence
+// proves nothing about the peer. The result is a value, so a caller cannot reach
+// the session's key, and reading it per frame allocates nothing.
+//
+// This says which key the session verified, never whose it is: the platform
+// binds a key to a client id, so a caller that needs more must check the key
+// against its own binding.
+func (self Peer) VerifiedClientPublicKey() (key [ed25519.PublicKeySize]byte, ok bool) {
+	if self.verifiedClientKey == nil {
+		return key, false
+	}
+	return *self.verifiedClientKey, true
 }
 
 // ReceiveFunction is invoked inline and must not block. A handoff uses a
@@ -1392,6 +1416,9 @@ type ReceivePack struct {
 	// Only pre-admission waits observe the exact retired physical lane. Once
 	// Pack takes ownership, closing that lane never revokes accepted work.
 	carrierDone <-chan struct{}
+	// The peer key of the session that opened this Pack, carried to Peer. Nil
+	// for a plaintext Pack, whatever session the sequence holds.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
 	// Client-relative monotonic ingress; zero means no timing provenance.
 	receivedAtNanos    int64
 	Source             TransferPath
@@ -1661,6 +1688,14 @@ type ClientSettings struct {
 	// before the message: at the platform's expiry sweep. Non-positive drops
 	// every id.
 	CloseSequencesMaxPendingCount int
+	// The subprotocols a source in `ProvideMode_Service` may send this client.
+	// Those are all a Service source reaches: its frames of any other id, and
+	// every other frame it sends, IP included, are dropped and counted (see
+	// `ClientSubprotocolStatsSnapshot`). Empty, the default, passes nothing from
+	// a Service source. Connect names no id here, so an owner that provides
+	// Service lists its own. Read on the receive path, so it must not change
+	// after construction.
+	ServiceSubprotocolIds []SubprotocolId
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -1688,6 +1723,19 @@ type ClientSettings struct {
 	// destination clients: their destination-only streams are outbound work
 	// and must survive their return-traffic provide registration.
 	ProviderStreamPolicy bool
+
+	// Holds a P2P carrier to its peer as source. A frame read from a P2P route
+	// whose source is not that route's peer is dropped and counted before it is
+	// decoded, and a route that names no peer delivers nothing. This holds every
+	// lane of the association and every frame type, so a P2P peer cannot pose as
+	// the platform (ControlId), as this client or as a third client. The peer is
+	// the adjacent one, so an endpoint of a multihop stream also refuses the far
+	// end's frames relayed over it, and that stream carries nothing from the far
+	// end (SUBPROTOCOL.md §11.3).
+	//
+	// False, the default, accepts any source on a P2P route, as a client always
+	// has: multihop far ends keep working, and so does a forged source.
+	P2pPeerSourceOnly bool
 
 	// ClientKeySeed, when set, is the long-lived Ed25519 client identity key
 	// seed (`ed25519.NewKeyFromSeed`); must be `ed25519.SeedSize` (32) bytes.
@@ -1723,6 +1771,8 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+	// Nil test barrier reached after `P2pPeerSourceOnly` counts a refused frame.
+	afterP2pSourceDropForTest func()
 
 	// TransportDelay, when set, offers the per-message delay header on this
 	// client's P2P streams as the active side, while the client's edges
@@ -1762,6 +1812,11 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
+	// Transfer frames `ClientSettings.P2pPeerSourceOnly` refused, and their
+	// encoded bytes: read from a P2P route with a source other than its peer.
+	// Zero with the setting off.
+	P2pSourceDropCount              uint64
+	P2pSourceDropByteCount          uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
 	PackHandoffWaitCount            uint64
@@ -2187,6 +2242,9 @@ type Client struct {
 	receiveQueueCommitCount                atomic.Uint64
 	receiveQueueCommitShortfallCount       atomic.Uint64
 	receiveQueueExitWithdrawCount          atomic.Uint64
+	// Frames `ClientSettings.P2pPeerSourceOnly` refused, and their encoded bytes.
+	p2pSourceDropCount     atomic.Uint64
+	p2pSourceDropByteCount atomic.Uint64
 	// A no-acknowledgement Pack asks for delivery out of sequence with no ack
 	// and no retry, so it should never be queued behind a retransmit buffer it
 	// will never occupy, and never dropped because one is full. Offered counts
@@ -2500,20 +2558,36 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 	return self.encryptionSessionManager
 }
 
-// unwrapFrame opens an outer-wrapped TransferFrame from `sourceId`. `roleHint`
-// (the sender's session role; may be `SequenceRoleUnknown`) selects the
-// complement local session to try first; `companionHint` (the sender's session
-// companion; nil when the sender omitted it) further pins the exact companion
-// session. With a role hint but no companion hint, both companion sessions of
-// the complement role are tried; with no role hint, every per-peer session is
+// Opens an outer-wrapped TransferFrame from `sourceId`. `roleHint` (the
+// sender's session role; may be `SequenceRoleUnknown`) selects the complement
+// local session to try first; `companionHint` (the sender's session companion;
+// nil when the sender omitted it) further pins the exact companion session.
+// With a role hint but no companion hint, both companion sessions of the
+// complement role are tried; with no role hint, every per-peer session is
 // tried. Each candidate session's ciphers are tried (established plus, briefly
-// during a rekey, the prior established) until one authenticates. Returns the
-// plaintext inner bytes and the local session role and companion that
-// decrypted them (used as the receive sequence's role/companion). Wait-free:
+// during a rekey, the prior established) until one authenticates. Wait-free:
 // it never blocks the receive loop.
-func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, error) {
+//
+// Returns the plaintext inner bytes and the local session role and companion
+// that decrypted them (used as the receive sequence's role/companion). It also
+// returns the peer client key of that same session, which the receive path
+// carries to `Peer.VerifiedClientPublicKey`. The key comes from the session
+// that opened this frame, never from the session a receive sequence holds. It
+// is nil unless `EncryptionSettings.ExposeVerifiedPeerClientKey` is on. It is
+// also nil in four other cases:
+//   - the session's signed-identity gate is pending, has rejected the key, or
+//     could not use its local pin store;
+//   - the session's established epoch has not completed the peer identity
+//     proof;
+//   - the session holds no Ed25519-sized key;
+//   - the call returns an error.
+//
+// `peerEncryptionSession.verifiedClientKey` decides the session's cases. A
+// non-nil key is shared with the session and every Peer that carries it, so it
+// must not be written.
+func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
-		return nil, sequenceTlsRoleServer, false, fmt.Errorf("encryption disabled")
+		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
 	}
 	// A wrapped frame can only be opened by the complement of the sender's
 	// session role (the other local session is the opposite TLS direction
@@ -2536,16 +2610,22 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 		ordered = self.encryptionSessionManager.sessionsForPeer(sourceId)
 	}
 	if len(ordered) == 0 {
-		return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s", sourceId)
+		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
 	for _, session := range ordered {
 		for _, cipher := range session.decryptCiphers() {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
-				return plaintext, session.role, session.companion, nil
+				// Taken here, from the session that authenticated this frame,
+				// not later from the session a receive sequence holds.
+				var verifiedClientKey *[ed25519.PublicKeySize]byte
+				if self.encryptionSessionManager.settings.ExposeVerifiedPeerClientKey {
+					verifiedClientKey = session.verifiedClientKey()
+				}
+				return plaintext, session.role, session.companion, verifiedClientKey, nil
 			}
 		}
 	}
-	return nil, sequenceTlsRoleServer, false, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
+	return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
 }
 
 func (self *Client) ClientKeyManager() *ClientKeyManager {
@@ -2573,6 +2653,8 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
+		P2pSourceDropCount:                     self.p2pSourceDropCount.Load(),
+		P2pSourceDropByteCount:                 self.p2pSourceDropByteCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
@@ -4360,6 +4442,25 @@ func (self *Client) receive(source TransferPath, frames []*protocol.Frame, peer 
 	}
 }
 
+// Counts a frame `ClientSettings.P2pPeerSourceOnly` refused. The log samples
+// at powers of two, so a peer flooding forged sources cannot flood the log.
+func (self *Client) recordP2pSourceDrop(sourceId Id, peerId Id, messageByteCount ByteCount) {
+	count := self.p2pSourceDropCount.Add(1)
+	self.p2pSourceDropByteCount.Add(uint64(messageByteCount))
+	if count&(count-1) == 0 && self.log.V(1).Enabled() {
+		self.log.Infof(
+			"[cr]%s drop p2p source %s from peer %s count=%d\n",
+			self.clientTag,
+			sourceId,
+			peerId,
+			count,
+		)
+	}
+	if self.settings.afterP2pSourceDropForTest != nil {
+		self.settings.afterP2pSourceDropForTest()
+	}
+}
+
 // Counts a receive-side Pack that could not be handed to its sequence
 // immediately. Transfer retransmission is responsible for recovery.
 func (self *Client) recordReceivePackHandoffDrop(messageByteCount ByteCount) {
@@ -4627,6 +4728,7 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var carrierReliability CarrierReliability
+		var carrierPeerId Id
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4637,6 +4739,7 @@ func (self *Client) run() {
 				)
 				transportType = disposition.transportType
 				carrierReliability = disposition.reliability
+				carrierPeerId = disposition.peerId
 				h1ReceiveCredit = disposition.h1Credit
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
@@ -4677,6 +4780,17 @@ func (self *Client) run() {
 		path, err := FilteredTransferPath(transferFrameBytes)
 		if err != nil {
 			// bad protobuf (unexpected, see route note above)
+			MessagePoolReturn(transferFrameBytes)
+			continue
+		}
+		// The source a P2P carrier reports is only what its peer wrote. Refuse
+		// it before anything reads it as that client: ControlId has no contract
+		// and no session, and this client's own id has no contract. Dropped
+		// here, a refused frame leaves no ack and no sequence state, so a
+		// sender's retry custody is untouched.
+		if self.settings.P2pPeerSourceOnly && transportType == TransportTypeP2p &&
+			(carrierPeerId == (Id{}) || path.SourceId != carrierPeerId) {
+			self.recordP2pSourceDrop(path.SourceId, carrierPeerId, ByteCount(len(transferFrameBytes)))
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
@@ -4732,6 +4846,9 @@ func (self *Client) run() {
 			// from the decrypting session, the plaintext companion hint, or the
 			// EncryptedControl.
 			receiveCompanion := false
+			// the opening session's peer key, for a frame that arrived wrapped
+			// (EncryptionSettings.ExposeVerifiedPeerClientKey)
+			var verifiedClientKey *[ed25519.PublicKeySize]byte
 
 			// outer encrypted wrap: the inner bytes are themselves a
 			// `TransferFrame`. A per-peer session for `source` carries the
@@ -4746,7 +4863,7 @@ func (self *Client) run() {
 				// responder session rebuilds it — the drop is transient, not
 				// a wedge. Keeping the unwrap path wait-free means no single
 				// peer can park the single-threaded, all-peers receive loop.
-				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, err := self.unwrapFrame(
+				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, decryptClientKey, err := self.unwrapFrame(
 					path.SourceId, transferFrame.GetSessionRole(), transferFrame.SessionCompanion, transferFrame.EncryptedTransferFrame)
 				if err != nil {
 					if self.log.V(1).Enabled() {
@@ -4772,6 +4889,7 @@ func (self *Client) run() {
 				}
 				receiveRole = decryptRole
 				receiveCompanion = decryptCompanion
+				verifiedClientKey = decryptClientKey
 				// inner frame: decode the path too — it is tamper-checked against
 				// the routing path below.
 				innerDecodedFrame := inboundDecodedTransferFrames.take()
@@ -5043,6 +5161,7 @@ func (self *Client) run() {
 						Unwrapped:           unwrapped,
 						EncryptionRole:      receiveRole,
 						EncryptionCompanion: receiveCompanion,
+						verifiedClientKey:   verifiedClientKey,
 					}
 					handoffTimeout := self.settings.ReceiveBufferSettings.
 						packHandoffTimeout(transportType, carrierReliability)
@@ -7137,6 +7256,10 @@ type SendSequence struct {
 	// callers only signal the immutable channel published in their snapshot.
 	noAckFastPathSettled       chan struct{}
 	pendingNoAckContractCloses map[Id]*sequenceContract
+	// A peer window's move, requested from outside and carried out by the
+	// sequence goroutine (`applyPeerContractMove`). Zero on a client that never
+	// marks a peer.
+	peerContractMove atomic.Uint32
 	// Whether a pack entering now could NOT also enter the resend queue,
 	// published by the send loop each pass. A reliable pack takes its
 	// admission slot only when this is clear (THROUGHPUTFIX §38.11):
@@ -10013,6 +10136,7 @@ sendSequenceLoop:
 		// here, before anything reads the contracts, and what they may write
 		// against next is published after (THROUGHPUTFIX §38.12)
 		fastPathCharged := self.applyNoAckFastPathAccountingReporting()
+		self.applyPeerContractMove()
 		self.publishNoAckFastPath()
 		// fast-path writes are charged only here, so this is where they can
 		// bring the current contract's successor due, and its announcement
@@ -10962,6 +11086,9 @@ const (
 	// a no-acknowledgement Pack in ordinary admission: it advances the
 	// contract and waits for the receiver to acknowledge what it advanced to
 	sendContractUpdateNoAckAdvance
+	// no Pack: a peer window's end takes the sequence's next contract, opened
+	// with its contract-only head like any other (`applyPeerContractMove`)
+	sendContractUpdatePeerMove
 )
 
 func (self *SendSequence) updateContractWithAckPromotion(
@@ -10982,6 +11109,8 @@ func (self *SendSequence) updateContractForMode(
 	messageByteCount ByteCount,
 	mode sendContractUpdateMode,
 ) (updated bool, deferForRecoveryAdmission bool, err error) {
+	// a Pack after the request rides what the move leaves
+	self.applyPeerContractMove()
 	// a headroom charge belongs to one debit and its one Pack
 	self.noAckHeadroomCharge = nil
 	if mode == sendContractUpdateNoAckAdvance && !self.sendContractEverAcknowledged {
@@ -11110,8 +11239,8 @@ func (self *SendSequence) updateContractForMode(
 		return false, true, nil
 	}
 	// an advancing no-acknowledgement Pack opens the contract and is not
-	// charged to it until it can ride it
-	debitMessage := mode != sendContractUpdateNoAckAdvance
+	// charged to it until it can ride it, and a peer window's move has no Pack
+	debitMessage := mode != sendContractUpdateNoAckAdvance && mode != sendContractUpdatePeerMove
 
 	var contractErr error
 	createContract := func() bool {
@@ -11366,6 +11495,9 @@ func (self *SendSequence) updateContractForMode(
 	if d := contractWaitTime; self.sendBufferSettings.ContractWaitLogThreshold <= d {
 		self.log.Infof("[s]contract wait %.0fms ok=%t c=%t %s->%s...%s s(%s)\n", float64(d.Microseconds())/1000.0, ok, self.companionContract, self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
 	}
+	if mode == sendContractUpdatePeerMove {
+		return ok, false, contractErr
+	}
 	if !debitMessage {
 		if !ok {
 			return false, false, contractErr
@@ -11417,10 +11549,13 @@ func nextCreateContractRetryInterval(current time.Duration, maximum time.Duratio
 // announces the contract, which is how every sequence requested it before
 // `ContractPrefetchLeadTime`. A same-network peer keeps that: its contracts
 // escrow nothing, and the queue retains its newest successor past the expiry,
-// so the early request is what makes its rollover immediate at any rate.
+// so the early request is what makes its rollover immediate at any rate. So does
+// a peer in window accounting, whose contracts must open at window ends and not
+// when a burst brings a successor due.
 func (self *SendSequence) successorContractEagerForKey(key ContractKey) bool {
 	return self.sendBufferSettings.ContractPrefetchLeadTime <= 0 ||
-		self.client.ContractManager().isNetworkPeerContract(key)
+		self.client.ContractManager().isNetworkPeerContract(key) ||
+		self.client.ContractManager().peerWindowAccounting(key.Destination.DestinationId)
 }
 
 // Queues one more contract for this sequence at the next sequence index, sized
@@ -11963,6 +12098,7 @@ func (self *SendSequence) setContract(
 		nextSendContract.path,
 		nextSendContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowSendContract(nextSendContract)
 	// The contract carries the destination's `ProvideTlsCertificate`
 	// commitment (possibly empty). Fold the chain into the session's
 	// trusted-peer-cert set so the peer's TLS-handshake cert can be matched
@@ -16040,8 +16176,11 @@ type ReceiveSequence struct {
 
 	receiveBufferSettings *ReceiveBufferSettings
 
-	openReceiveContracts      map[Id]*sequenceContract
-	receiveContract           *sequenceContract
+	openReceiveContracts map[Id]*sequenceContract
+	receiveContract      *sequenceContract
+	// `receiveContract`, for a reader off the sequence goroutine. Written after
+	// the contract's stats entry, which that reader takes with it.
+	publishedContract         atomic.Pointer[sequenceContract]
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
 	// the owning buffer's index of open contracts by holding sequence; nil
@@ -17702,6 +17841,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		transferFrameBytes: receivePack.TransferFrameBytes,
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
+		verifiedClientKey:  receivePack.verifiedClientKey,
 	}
 	self.prepareReceiveDeliveryCredit(item)
 
@@ -18159,7 +18299,8 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		// nack items send no ack, so `unwrapped` was historically unused here;
 		// the EncryptionModeRequired receive gate in `receiveHead` now reads it
 		// to refuse plaintext application frames on this path too
-		unwrapped: receivePack.Unwrapped,
+		unwrapped:         receivePack.Unwrapped,
+		verifiedClientKey: receivePack.verifiedClientKey,
 	}
 
 	if err := self.registerContracts(item); err != nil {
@@ -18240,22 +18381,24 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		receiveContract := self.openReceiveContracts[*item.contractId]
 		receiveContract.ack(item.messageByteCount)
 		peer = Peer{
-			ProvideMode:      receiveContract.provideMode,
-			Roles:            receiveContract.roles,
-			Principal:        receiveContract.principal,
-			SourceSubject:    receiveContract.sourceSubject,
-			SourceNetwork:    receiveContract.sourceNetwork,
-			ContractClass:    receiveContract.contractClass,
-			WindowDelegation: receiveContract.windowDelegation,
-			TransferKey:      self.transferKey,
-			TransportType:    item.transportType,
+			ProvideMode:       receiveContract.provideMode,
+			Roles:             receiveContract.roles,
+			Principal:         receiveContract.principal,
+			SourceSubject:     receiveContract.sourceSubject,
+			SourceNetwork:     receiveContract.sourceNetwork,
+			ContractClass:     receiveContract.contractClass,
+			WindowDelegation:  receiveContract.windowDelegation,
+			TransferKey:       self.transferKey,
+			TransportType:     item.transportType,
+			verifiedClientKey: item.verifiedClientKey,
 		}
 	} else {
 		// no contract peers are considered in network
 		peer = Peer{
-			ProvideMode:   protocol.ProvideMode_Network,
-			TransferKey:   self.transferKey,
-			TransportType: item.transportType,
+			ProvideMode:       protocol.ProvideMode_Network,
+			TransferKey:       self.transferKey,
+			TransportType:     item.transportType,
+			verifiedClientKey: item.verifiedClientKey,
 		}
 	}
 	// EncryptedControl frames are routed into the per-peer session instead
@@ -18292,8 +18435,19 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		}
 	}
 
+	// A Service source reaches only the subprotocols this client lists. The rest
+	// stops here, ahead of delivery receipts and every callback, so no consumer
+	// has to know the mode: a provider cannot take it for a public source, and
+	// a required receipt cannot cancel the sequence over a frame nothing claims.
+	// The item still advances and is acked (ack-and-discard, as above): a
+	// refused frame has no retry that could change the answer.
+	if peer.ProvideMode == protocol.ProvideMode_Service {
+		appFrames = self.client.admitServiceFrames(appFrames)
+	}
+
 	// buffer for a combined dispatch: a Peer identity change (contract
-	// rotation) is a batch boundary because one callback carries one peer
+	// rotation, or a sealed frame beside a plaintext one) is a batch boundary
+	// because one callback carries one peer
 	peerEqual := func(a Peer, b Peer) bool {
 		return a.ProvideMode == b.ProvideMode &&
 			a.Principal == b.Principal &&
@@ -18302,6 +18456,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			a.ContractClass == b.ContractClass &&
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
+			a.verifiedClientKey == b.verifiedClientKey &&
 			slices.Equal(a.Roles, b.Roles) &&
 			bytes.Equal(a.WindowDelegation, b.WindowDelegation)
 	}
@@ -18616,6 +18771,7 @@ func (self *ReceiveSequence) registerContractAhead(
 		aheadReceiveContract.path,
 		aheadReceiveContract.transferByteCount,
 	)
+	self.client.ContractManager().notePeerWindowReceiveContract(aheadReceiveContract)
 	return nil
 }
 
@@ -18638,6 +18794,7 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		// switch to the current contract
 		superseded := self.receiveContract
 		self.receiveContract = receiveContract
+		self.publishedContract.Store(receiveContract)
 		self.updateContractWriterAlias()
 		// A contract announced ahead reaches this path rather than the one
 		// below, so the predecessor's stats close here too. Without this a
@@ -18684,6 +18841,8 @@ func (self *ReceiveSequence) setContract(nextReceiveContract *sequenceContract) 
 		nextReceiveContract.path,
 		nextReceiveContract.transferByteCount,
 	)
+	self.publishedContract.Store(nextReceiveContract)
+	self.client.ContractManager().notePeerWindowReceiveContract(nextReceiveContract)
 
 	if superseded != nil {
 		self.client.ContractManager().closeContractStats(superseded.contractId)
@@ -18839,6 +18998,8 @@ type receiveItem struct {
 	decodedOwner       *decodedPackOwner
 	transferFrameBytes []byte
 	transportType      TransportType
+	// The peer key of the session that opened this item; see ReceivePack.
+	verifiedClientKey *[ed25519.PublicKeySize]byte
 	// Keep flags together: this item is embedded in every decodedPackOwner,
 	// whose allocation must fit the fixed 1-KiB receive-budget charge.
 	head                 bool
