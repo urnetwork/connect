@@ -148,8 +148,8 @@ func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
 //
 // the remote doh servers are queried as RFC 8484 wire-format (application/dns-message) in a
 // staggered, weighted-random order (see dohClient.queryResult); the first server to return records
-// wins, and a policy-filtered response never does (see parseDohWire). each must present an IP-SAN
-// cert when addressed by IP (these do). Cloudflare and Quad9 serve wire-format on :443 /dns-query.
+// wins, and a built-in endpoint's policy-filtered response never does (see dohBuiltInEndpoints).
+// each must present an IP-SAN cert when addressed by IP; these do, serving wire-format on :443.
 // https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/
 //
 // The defaults are Cloudflare, at both of its addresses (1.1.1.1 and 1.0.0.1, which guards
@@ -214,13 +214,14 @@ type DohSettings struct {
 	ConnectSettings
 	IpVersion      int
 	MissExpiration time.Duration
-	// LoneMissExpiration is how long an authoritative miss stays cached when
-	// only one DoH server reported it and every other server asked failed or
-	// was policy-filtered (see parseDohWire), instead of MissExpiration.
-	// Nothing corroborates such a miss: a resolver withdrawing from a country,
-	// or a censor, may answer NXDOMAIN without an extended dns error, and the
-	// default is short so the next lookup soon asks again. Non-positive caches
-	// it for MissExpiration like any miss.
+	// How long an authoritative miss stays cached when one source alone
+	// reported it, a DoH endpoint and its other-family sibling counting as one
+	// source, and that source is a built-in endpoint (see dohBuiltInEndpoints),
+	// instead of MissExpiration. Nothing corroborates such a miss: a resolver
+	// withdrawing from a country, or a censor, may answer NXDOMAIN without an
+	// extended dns error, and the default is short so the next lookup soon asks
+	// again. A miss from a server the user chose is cached for MissExpiration.
+	// Non-positive caches every miss for MissExpiration.
 	LoneMissExpiration time.Duration
 	LocalExpiration    time.Duration
 	// MinCacheTtl floors the cache lifetime of a resolved record so very-low / zero-TTL records
@@ -856,6 +857,11 @@ warmLoop:
 				defer func() { <-client.httpSem }()
 			}
 			result, queryErr := client.queryWireDetailed(queryCtx, dohUrl, "A", dohWarmDomain)
+			// a built-in endpoint's filtered answer earns no success credit here
+			// either (see dohBuiltInEndpoints)
+			if dohEndpointGuarded(dohUrl) {
+				result = dohGuardedResult(result)
+			}
 			ok := 0 < len(result.AddrTtls) || result.Miss
 			if ok {
 				client.stats.record(dohUrl, true)
@@ -1181,7 +1187,7 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool) {
 	addrExpirations := map[netip.Addr]time.Time{}
 	cacheMiss := false
-	// the miss is one DoH server's alone (see DohSettings.LoneMissExpiration);
+	// the miss is one source's alone (see DohSettings.LoneMissExpiration);
 	// a later resolver path that also finds the name absent corroborates it
 	loneMiss := false
 	minCacheTtl := self.settings.MinCacheTtl
@@ -1498,14 +1504,18 @@ type dohQueryResult struct {
 	// a long TXT value reads them. Empty for an address query.
 	Txts []string
 	Miss bool
-	// Filtered marks one server's policy-filtered response (see
-	// parseDohWire): empty and no Miss, so it counts as that server failing.
+	// A policy-filtered response (see parseDohWire). For a built-in endpoint
+	// the guard (dohGuardedResult) makes it empty with no Miss, so it counts
+	// as that endpoint failing; any other endpoint's response keeps its
+	// records or Miss.
 	Filtered bool
-	// LoneMiss marks a merged Miss that exactly one server reported while
-	// at least one other server failed, was filtered or did not answer in
-	// time (see DohSettings.LoneMissExpiration).
+	// A merged Miss that one source alone reported, an endpoint and its
+	// other-family sibling counting as one source, and that source a built-in
+	// endpoint (see DohSettings.LoneMissExpiration).
 	LoneMiss bool
-	Route    *DohRoute
+	// The DoH url that answered, for one server's result.
+	Server string
+	Route  *DohRoute
 }
 
 func newDohQueryResult() *dohQueryResult {
@@ -1891,11 +1901,17 @@ func (self *dohClient) queryResult(
 							defer func() { <-self.primarySem }()
 						}
 						result := self.queryWire(queryCtx, dohUrl, recordType, name)
+						result.Server = dohUrl
+						// the policy-filter guard covers built-in endpoints only: a server the
+						// user chose answers as it answers (see dohBuiltInEndpoints)
+						if dohEndpointGuarded(dohUrl) {
+							result = dohGuardedResult(result)
+						}
 						// a server that returns records or an authoritative no-record answer is healthy;
-						// anything else (error, non-200, or no answer before it was beaten) counts
-						// against it. The large stagger means the first wave is the usual winner, so a
-						// later wave is only launched — and only judged — when an earlier server was
-						// slow or failed.
+						// anything else (error, non-200, a guarded filtered response, or no answer before
+						// it was beaten) counts against it. The large stagger means the first wave is the
+						// usual winner, so a later wave is only launched — and only judged — when an
+						// earlier server was slow or failed.
 						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || 0 < len(result.Txts) || result.Miss)
 						select {
 						case receiveResults <- result:
@@ -1908,11 +1924,20 @@ func (self *dohClient) queryResult(
 	})
 
 	mergedResult := newDohQueryResult()
-	// the misses and the failures (a transport error, a failure rcode, a
-	// policy-filtered response) received, for LoneMiss
-	missCount := 0
-	failureCount := 0
-	for received := range queryCount {
+	// the sources that reported a miss, an endpoint and its other-family
+	// sibling counting as one (one operator's nxdomain on both families
+	// corroborates nothing), and whether every miss came from a built-in
+	// endpoint, for LoneMiss. A miss from a server the user chose is cached
+	// normally.
+	missSources := map[string]bool{}
+	builtInMisses := true
+	missSource := func(dohUrl string) string {
+		if sibling, ok := self.siblings[dohUrl]; ok && sibling < dohUrl {
+			return sibling
+		}
+		return dohUrl
+	}
+	for range queryCount {
 		select {
 		case <-queryCtx.Done():
 			miss := mergedResult.Miss && ctx.Err() == nil
@@ -1921,9 +1946,8 @@ func (self *dohClient) queryResult(
 				Txts:     mergedResult.Txts,
 				// Keep an observed empty answer at our own fanout deadline.
 				// Caller cancellation retains the existing deadline outcome.
-				Miss: miss,
-				// a server still unanswered at the deadline failed to answer
-				LoneMiss: miss && missCount == 1 && 0 < failureCount+queryCount-received,
+				Miss:     miss,
+				LoneMiss: miss && len(missSources) == 1 && builtInMisses,
 			}
 		case result := <-receiveResults:
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
@@ -1938,16 +1962,17 @@ func (self *dohClient) queryResult(
 			}
 			if result.Miss {
 				mergedResult.Miss = true
-				missCount += 1
-			} else if !answered {
-				failureCount += 1
+				missSources[missSource(result.Server)] = true
+				if !dohEndpointGuarded(result.Server) {
+					builtInMisses = false
+				}
 			}
 			// fastest-record-wins: return as soon as any server returns records rather than
 			// waiting for the rest, so a slow or dead server can't delay a successful lookup. an
 			// authoritative miss is not short-circuited — keep collecting so a filtering
-			// resolver's NXDOMAIN can't override a server that resolves the name. a
-			// policy-filtered response is neither (see parseDohWire), so it counts as its
-			// server failing.
+			// resolver's NXDOMAIN can't override a server that resolves the name. a built-in
+			// endpoint's policy-filtered response is neither (see dohGuardedResult), so it
+			// counts as that endpoint failing.
 			if 0 < len(mergedResult.AddrTtls) || 0 < len(mergedResult.Txts) {
 				stopLaunching()
 				return &dohQueryResult{
@@ -1959,7 +1984,7 @@ func (self *dohClient) queryResult(
 		}
 	}
 	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && len(mergedResult.Txts) == 0 && mergedResult.Miss
-	mergedResult.LoneMiss = mergedResult.Miss && missCount == 1 && 0 < failureCount
+	mergedResult.LoneMiss = mergedResult.Miss && len(missSources) == 1 && builtInMisses
 	return mergedResult
 }
 
@@ -2234,7 +2259,11 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 						defer func() { <-self.primarySem }()
 					}
 					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
-					usable := ok && dnsResponseUsable(data)
+					// a built-in endpoint's policy-filtered response is no answer: the next
+					// server is tried (see dohBuiltInEndpoints); a server the user chose is
+					// forwarded as it answers
+					usable := ok && dnsResponseUsable(data) &&
+						!(dohEndpointGuarded(dohUrl) && dnsResponseFiltered(data))
 					self.stats.record(dohUrl, usable)
 					select {
 					case results <- rawResult{data: data, usable: usable}:
@@ -2260,25 +2289,35 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	return nil, false
 }
 
-// dnsResponseUsable reports whether a raw DNS response is a well-formed answer worth forwarding:
-// a NOERROR (records or NODATA) or NXDOMAIN that is not policy-filtered. A SERVFAIL, REFUSED or
-// other RCODE is not, and neither is a response that carries a policy extended dns error
-// (dnsPolicyEdeCode) or a NOERROR whose A and AAAA answers are all 0.0.0.0 or ::; the caller
-// tries the next server. A body that does not parse past the header is forwarded as before: the
-// guard only refuses what it can read as filtered.
+// Whether a raw DNS response is a well-formed answer worth forwarding: a NOERROR (records or
+// NODATA) or NXDOMAIN. A SERVFAIL/REFUSED/other is not (the caller tries the next server). A
+// response from a built-in endpoint must also not be policy-filtered (dnsResponseFiltered);
+// forwardRaw checks that per endpoint.
 func dnsResponseUsable(response []byte) bool {
+	if len(response) < 12 {
+		return false
+	}
+	// header flags are bytes 2-3; RCODE is the low 4 bits of byte 3
+	switch response[3] & 0x0f {
+	case 0, 3: // NOERROR, NXDOMAIN
+		return true
+	default:
+		return false
+	}
+}
+
+// Whether a raw DNS response is policy-filtered: it carries a policy extended dns error
+// (dnsPolicyEdeCode) under any RCODE, or it is a NOERROR whose A and AAAA answers are all
+// 0.0.0.0 or ::. A body that does not parse past the header reads as not filtered: the guard
+// only refuses what it can read as filtered.
+func dnsResponseFiltered(response []byte) bool {
 	var p dnsmessage.Parser
 	header, err := p.Start(response)
 	if err != nil {
 		return false
 	}
-	switch header.RCode {
-	case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
-	default:
-		return false
-	}
 	if err := p.SkipAllQuestions(); err != nil {
-		return true
+		return false
 	}
 	unspecified := false
 	specified := false
@@ -2288,25 +2327,25 @@ func dnsResponseUsable(response []byte) bool {
 			break
 		}
 		if err != nil {
-			return true
+			return false
 		}
 		var ip netip.Addr
 		switch ah.Type {
 		case dnsmessage.TypeA:
 			r, err := p.AResource()
 			if err != nil {
-				return true
+				return false
 			}
 			ip = netip.AddrFrom4(r.A)
 		case dnsmessage.TypeAAAA:
 			r, err := p.AAAAResource()
 			if err != nil {
-				return true
+				return false
 			}
 			ip = netip.AddrFrom16(r.AAAA)
 		default:
 			if err := p.SkipAnswer(); err != nil {
-				return true
+				return false
 			}
 			continue
 		}
@@ -2317,9 +2356,9 @@ func dnsResponseUsable(response []byte) bool {
 		}
 	}
 	if dnsResponsePolicyEde(&p) {
-		return false
+		return true
 	}
-	return !(header.RCode == dnsmessage.RCodeSuccess && unspecified && !specified)
+	return header.RCode == dnsmessage.RCodeSuccess && unspecified && !specified
 }
 
 // The extended dns error option code (RFC 8914 §2).
@@ -2377,19 +2416,95 @@ func dnsResponsePolicyEde(p *dnsmessage.Parser) bool {
 	}
 }
 
-// parseDohWire parses an RFC 8484 wire-format DNS response, extracting the A or AAAA answers
-// matching qType, or the TXT values. NXDOMAIN, and a NOERROR with no matching answer, is a Miss;
-// any other RCODE is a failure (empty, not a Miss).
+// A DoH url as an endpoint key: lower case scheme, the host (an ip in its
+// canonical form), the port unless it is 443, and the path without trailing
+// slashes. Two spellings of one endpoint get one key.
+func dohEndpointKey(dohUrl string) string {
+	u, err := url.Parse(strings.TrimSpace(dohUrl))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(dohUrl)
+	}
+	host := strings.ToLower(u.Hostname())
+	if addr, err := netip.ParseAddr(host); err == nil {
+		host = addr.Unmap().String()
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		host = host + ":" + port
+	}
+	return strings.ToLower(u.Scheme) + "://" + host + strings.TrimRight(u.Path, "/")
+}
+
+// The DoH endpoints connect ships, by endpoint key (dohEndpointKey): the default
+// remote and local DoH lists and the regional bootstrap DoH presets of every
+// country. The policy-filter guard (dohGuardedResult) applies to their
+// responses only. It exists so that filtering or censorship by URnetwork's own
+// defaults never wins the race or is cached, and it never overrides filtering a
+// user chose: a server the user added, or a filtering preset, is answered as it
+// answers, 0.0.0.0 sink answers and extended-error nxdomains included. A user
+// who names a built-in endpoint in their own list (9.9.9.9, say) gets the guard
+// for that endpoint, because it is the same endpoint.
 //
-// The policy-filter guard: a response that carries a policy extended dns error under any RCODE
-// (dnsPolicyEdeCode, a Quad9 malware block or a country withdrawal), or a NOERROR whose matching
-// answers are all 0.0.0.0 or :: (a sink answer, sent by some filters with no extended error), is
-// a failure too, with Filtered set: neither an answer nor a Miss. So it never ends the race, never
-// earns its server success credit, and can never merge into an authoritative miss and be cached
-// for MissExpiration; when every server failed or was filtered the lookup is a SERVFAIL, with
-// serve-stale. It decides which redundant upstream to believe and what to cache, and only ever
-// turns a policy answer into no answer from that server (RFC 8914 §6). A 0.0.0.0 or :: next to
-// real addresses is dropped and the real addresses kept.
+// Plain dns servers have no guard: their lookups go through net.Resolver, which
+// shows neither the extended error nor which server answered.
+var dohBuiltInEndpoints = sync.OnceValue(func() map[string]bool {
+	endpoints := map[string]bool{}
+	resolver := DefaultDnsResolverSettings()
+	for _, dohUrl := range slices.Concat(
+		resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6,
+		resolver.LocalDohUrlsIpv4, resolver.LocalDohUrlsIpv6,
+	) {
+		endpoints[dohEndpointKey(dohUrl)] = true
+	}
+	for _, server := range regionalControlDohServers {
+		for _, dohUrl := range []string{server.DohUrlIpv4, server.DohUrlIpv6} {
+			if dohUrl != "" {
+				endpoints[dohEndpointKey(dohUrl)] = true
+			}
+		}
+	}
+	return endpoints
+})
+
+// Whether a DoH url is a built-in endpoint, whose responses the policy-filter
+// guard applies to (see dohBuiltInEndpoints).
+func dohEndpointGuarded(dohUrl string) bool {
+	return dohBuiltInEndpoints()[dohEndpointKey(dohUrl)]
+}
+
+// The policy-filter guard, for one built-in endpoint's parsed response (see
+// dohBuiltInEndpoints): a policy-filtered response (parseDohWire) becomes that
+// endpoint failing, neither an answer nor a Miss, so it never ends the race,
+// never earns its endpoint success credit, and can never merge into an
+// authoritative miss and be cached for MissExpiration; when every endpoint
+// failed or was filtered the lookup is a SERVFAIL, with serve-stale. A 0.0.0.0
+// or :: beside real addresses is dropped and the real addresses kept. It
+// decides which redundant upstream to believe and what to cache, and only ever
+// turns a policy answer into no answer from that endpoint (RFC 8914 §6).
+func dohGuardedResult(result *dohQueryResult) *dohQueryResult {
+	if result.Filtered {
+		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Filtered: true, Server: result.Server}
+	}
+	for addr := range result.AddrTtls {
+		if addr.IsUnspecified() {
+			delete(result.AddrTtls, addr)
+		}
+	}
+	return result
+}
+
+// Parses an RFC 8484 wire-format DNS response, extracting the A or AAAA answers matching qType,
+// or the TXT values. NXDOMAIN, and a NOERROR with no matching answer, is a Miss; any other RCODE
+// is a failure (empty, not a Miss).
+//
+// It also classifies the response: Filtered is set when the response carries a policy extended
+// dns error under any RCODE (dnsPolicyEdeCode: a Quad9 malware block, a country withdrawal), or is
+// a NOERROR whose matching answers are all 0.0.0.0 or :: (a sink answer, which some filters send
+// with no extended error). The result is otherwise as the server answered, sink addresses
+// included: the caller applies the guard (dohGuardedResult) to a built-in endpoint's response
+// only.
 func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 	result := newDohQueryResult()
 
@@ -2404,18 +2519,19 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		return result
 	}
 	nxdomain := header.RCode == dnsmessage.RCodeNameError
-	// an nxdomain is a Miss whatever its sections hold, unless it carries a
-	// policy extended error; a section that does not parse ends the read
-	nxdomainResult := func() *dohQueryResult {
-		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Miss: true}
+	// an nxdomain is a Miss whatever its sections hold; a section that does
+	// not parse ends the read before any extended error
+	nxdomainResult := func(filtered bool) *dohQueryResult {
+		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Miss: true, Filtered: filtered}
 	}
 	if err := p.SkipAllQuestions(); err != nil {
 		if nxdomain {
-			return nxdomainResult()
+			return nxdomainResult(false)
 		}
 		return result
 	}
 	unspecified := false
+	specified := false
 	for {
 		ah, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
@@ -2423,7 +2539,7 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		}
 		if err != nil {
 			if nxdomain {
-				return nxdomainResult()
+				return nxdomainResult(false)
 			}
 			return result
 		}
@@ -2432,35 +2548,37 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			r, err := p.AResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult()
+					return nxdomainResult(false)
 				}
 				return result
 			}
 			ip := netip.AddrFrom4(r.A)
 			if ip.IsUnspecified() {
 				unspecified = true
-				continue
+			} else {
+				specified = true
 			}
 			result.AddrTtls[ip] = max(result.AddrTtls[ip], int(ah.TTL))
 		case ah.Type == dnsmessage.TypeAAAA && qType == dnsmessage.TypeAAAA:
 			r, err := p.AAAAResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult()
+					return nxdomainResult(false)
 				}
 				return result
 			}
 			ip := netip.AddrFrom16(r.AAAA)
 			if ip.IsUnspecified() {
 				unspecified = true
-				continue
+			} else {
+				specified = true
 			}
 			result.AddrTtls[ip] = max(result.AddrTtls[ip], int(ah.TTL))
 		case ah.Type == dnsmessage.TypeTXT && qType == dnsmessage.TypeTXT:
 			r, err := p.TXTResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult()
+					return nxdomainResult(false)
 				}
 				return result
 			}
@@ -2474,19 +2592,17 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		default:
 			if err := p.SkipAnswer(); err != nil {
 				if nxdomain {
-					return nxdomainResult()
+					return nxdomainResult(false)
 				}
 				return result
 			}
 		}
 	}
-	if dnsResponsePolicyEde(&p) ||
-		(!nxdomain && unspecified && len(result.AddrTtls) == 0 && len(result.Txts) == 0) {
-		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Filtered: true}
-	}
+	policyEde := dnsResponsePolicyEde(&p)
 	if nxdomain {
-		return nxdomainResult()
+		return nxdomainResult(policyEde)
 	}
+	result.Filtered = policyEde || (unspecified && !specified && len(result.Txts) == 0)
 	if len(result.AddrTtls) == 0 && len(result.Txts) == 0 {
 		result.Miss = true
 	}
@@ -2693,9 +2809,9 @@ type DohResult struct {
 	Time            time.Time
 	AddrExpirations map[netip.Addr]time.Time
 	Miss            bool
-	// MissExpiration, when positive and shorter than the cache's
-	// MissExpiration, is how long this miss stays valid: a lone miss (see
-	// DohSettings.LoneMissExpiration). Zero keeps the cache's.
+	// When positive and shorter than the cache's MissExpiration, how long
+	// this miss stays valid: a lone miss (see DohSettings.LoneMissExpiration).
+	// Zero keeps the cache's.
 	MissExpiration time.Duration
 }
 
