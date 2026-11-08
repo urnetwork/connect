@@ -77,6 +77,9 @@ type reraceExitSpec struct {
 	answer func(path *IpPath) reraceAnswer
 	// Optional source settings are applied before real Client construction.
 	clientSettings func(*ClientSettings)
+	// the first this many channels minted for the provider fail their
+	// construction, as a provider whose evaluation fails does
+	failEvaluations int
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -99,6 +102,30 @@ type reraceExit struct {
 
 	mutex   sync.Mutex
 	packets []reraceExitPacket
+	// the channel constructions for this provider so far
+	evaluations atomic.Int32
+	// the next this many constructions fail (failEvaluations to start, and
+	// failNextEvaluations later)
+	failNext atomic.Int32
+}
+
+// The provider's next count channel constructions fail, as its evaluations
+// fail when a transient loses them.
+func (self *reraceExit) failNextEvaluations(count int) {
+	self.failNext.Store(int32(count))
+}
+
+// Consumes one of the provider's pending construction failures.
+func (self *reraceExit) takeEvaluationFailure() bool {
+	for {
+		pending := self.failNext.Load()
+		if pending <= 0 {
+			return false
+		}
+		if self.failNext.CompareAndSwap(pending, pending-1) {
+			return true
+		}
+	}
 }
 
 type reraceReply struct {
@@ -346,6 +373,10 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 	if exit == nil {
 		return nil, errors.New("client args were not minted for a destination")
 	}
+	exit.evaluations.Add(1)
+	if exit.takeEvaluationFailure() {
+		return nil, errors.New("the provider did not answer its evaluation")
+	}
 
 	if exit.clientSettings != nil {
 		exit.clientSettings(clientSettings)
@@ -497,6 +528,7 @@ func (self *reraceHarness) addExit(spec reraceExitSpec) *reraceExit {
 	if exit.family == "" {
 		exit.family = IpFamilyDualstack
 	}
+	exit.failNext.Store(int32(spec.failEvaluations))
 	exit.destination = RequireMultiHopId(exit.provider.ClientId())
 	exit.provider.AddReceiveCallback(exit.receive)
 	self.exitWorkers.Add(1)
