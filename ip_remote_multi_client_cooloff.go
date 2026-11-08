@@ -42,8 +42,11 @@ package connect
 // The starvation escape. A pool of one to three providers can be emptied by a
 // cool-off, and a transient failure of ours (a ping lost to the uplink) is
 // enough to cause it. So the exclusions are skipped for a discovery round
-// when the window holds no provider at all, and for the round after one whose
-// exclusions left discovery empty. A candidate such a round lists after its
+// when the window holds no provider at all (no live exit that takes new flows
+// or is kept from them only because it is full, holdsWindowForCooloff), and
+// for the round after one whose exclusions left discovery empty (a round that
+// asked only for v6-capable providers does not count,
+// cooloffRoundAsksThePool). A candidate such a round lists after its
 // provider failed was listed knowingly, and the expansion evaluates it: the
 // refusal is only for a candidate listed before its provider failed, or one a
 // round returned despite excluding it. The entries stay, so the next round
