@@ -104,6 +104,28 @@ type reraceExit struct {
 	packets []reraceExitPacket
 	// the channel constructions for this provider so far
 	evaluations atomic.Int32
+	// the next this many constructions fail (failEvaluations to start, and
+	// failNextEvaluations later)
+	failNext atomic.Int32
+}
+
+// The provider's next count channel constructions fail, as its evaluations
+// fail when a transient loses them.
+func (self *reraceExit) failNextEvaluations(count int) {
+	self.failNext.Store(int32(count))
+}
+
+// Consumes one of the provider's pending construction failures.
+func (self *reraceExit) takeEvaluationFailure() bool {
+	for {
+		pending := self.failNext.Load()
+		if pending <= 0 {
+			return false
+		}
+		if self.failNext.CompareAndSwap(pending, pending-1) {
+			return true
+		}
+	}
 }
 
 type reraceReply struct {
@@ -351,7 +373,8 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 	if exit == nil {
 		return nil, errors.New("client args were not minted for a destination")
 	}
-	if evaluation := int(exit.evaluations.Add(1)); evaluation <= exit.failEvaluations {
+	exit.evaluations.Add(1)
+	if exit.takeEvaluationFailure() {
 		return nil, errors.New("the provider did not answer its evaluation")
 	}
 
@@ -505,6 +528,7 @@ func (self *reraceHarness) addExit(spec reraceExitSpec) *reraceExit {
 	if exit.family == "" {
 		exit.family = IpFamilyDualstack
 	}
+	exit.failNext.Store(int32(spec.failEvaluations))
 	exit.destination = RequireMultiHopId(exit.provider.ClientId())
 	exit.provider.AddReceiveCallback(exit.receive)
 	self.exitWorkers.Add(1)

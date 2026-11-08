@@ -213,14 +213,15 @@ func TestCooloffNotesAVerdictOnlyWhenASiblingReceives(t *testing.T) {
 		delete(window.clients, client.ClientId())
 		removal.finish()
 
-		AssertEqual(t, window.cooloffHolds(client.Destination()), receiving != 0)
+		AssertEqual(t, cooloffTestNoted(window, client.Destination()), receiving != 0)
 		AssertEqual(t, len(log.linesWith("action=note")), receiving)
 	}
 }
 
 // The starvation escape: the exclusions are skipped for a round while the
 // window holds no provider, and for the round after one whose exclusions left
-// discovery empty. Each skip that leaves entries out says so.
+// discovery empty. Each skip that leaves entries out says so, and its listing
+// says it skipped. The entries stay for the rounds that apply the exclusions.
 func TestCooloffStarvationEscape(t *testing.T) {
 	window := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	log := newRecordingLogger()
@@ -229,28 +230,72 @@ func TestCooloffStarvationEscape(t *testing.T) {
 	window.noteFailedDestination(destination, cooloffReasonEvaluation)
 
 	excluded := map[MultiHopId]bool{}
-	AssertEqual(t, window.addCooloffExclusions(excluded, 0), 0)
+	count, listing := window.addCooloffExclusions(excluded, 0)
+	AssertEqual(t, count, 0)
+	AssertEqual(t, listing.skipped, true)
 	AssertEqual(t, len(excluded), 0)
 	AssertEqual(t, len(log.linesWith("reason=empty_window")), 1)
 
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 1)
+	count, listing = window.addCooloffExclusions(excluded, 1)
+	AssertEqual(t, count, 1)
+	AssertEqual(t, listing.skipped, false)
 	AssertEqual(t, excluded, map[MultiHopId]bool{destination: true})
 	window.noteCooloffRound(1, true)
 
 	excluded = map[MultiHopId]bool{}
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 0)
+	count, listing = window.addCooloffExclusions(excluded, 1)
+	AssertEqual(t, count, 0)
+	AssertEqual(t, listing.skipped, true)
 	AssertEqual(t, len(excluded), 0)
 	AssertEqual(t, len(log.linesWith("reason=empty_round")), 1)
 
 	// the skip is spent, and a round that found something sets none
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 1)
+	count, _ = window.addCooloffExclusions(excluded, 1)
+	AssertEqual(t, count, 1)
 	window.noteCooloffRound(1, false)
 	excluded = map[MultiHopId]bool{}
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 1)
+	count, _ = window.addCooloffExclusions(excluded, 1)
+	AssertEqual(t, count, 1)
+}
 
-	// the entry is still held for the expansion's refusal through the skips
-	AssertEqual(t, window.cooloffHolds(destination), true)
-	AssertEqual(t, len(log.linesWith("action=refuse")), 1)
+// The expansion refuses a candidate listed before its provider failed, and
+// one a round returned despite excluding it. A candidate the escape listed
+// after the failure is evaluated: refusing it too minted and retired an
+// identity for nothing and kept the window empty for the whole cool-off.
+func TestCooloffRefusesOnlyACandidateListedBeforeItsProviderFailed(t *testing.T) {
+	window := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+	log := newRecordingLogger()
+	window.log = log
+	destination := RequireMultiHopId(NewId())
+
+	// a round listed the provider, and then it failed
+	_, before := window.addCooloffExclusions(map[MultiHopId]bool{}, 0)
+	window.noteFailedDestination(destination, cooloffReasonEvaluation)
+	AssertEqual(t, window.cooloffRefuses(destination, before), true)
+
+	// an escape round lists it after the failure
+	_, escape := window.addCooloffExclusions(map[MultiHopId]bool{}, 0)
+	AssertEqual(t, escape.skipped, true)
+	AssertEqual(t, window.cooloffRefuses(destination, escape), false)
+
+	// a round that excluded it, whose request returned it anyway
+	_, excluding := window.addCooloffExclusions(map[MultiHopId]bool{}, 1)
+	AssertEqual(t, excluding.skipped, false)
+	AssertEqual(t, window.cooloffRefuses(destination, excluding), true)
+	AssertEqual(t, window.cooloffRefuses(destination, cooloffListing{}), true)
+
+	// it fails again after the escape round listed it
+	window.noteFailedDestination(destination, cooloffReasonEvaluation)
+	AssertEqual(t, window.cooloffRefuses(destination, escape), true)
+
+	// a provider that never failed, or whose cool-off has passed, is never
+	// refused
+	AssertEqual(t, window.cooloffRefuses(RequireMultiHopId(NewId()), excluding), false)
+	expired := RequireMultiHopId(NewId())
+	window.cooloff.note(expired, time.Now().Add(-window.cooloffTimeout()), cooloffMaxCount)
+	AssertEqual(t, window.cooloffRefuses(expired, cooloffListing{}), false)
+
+	AssertEqual(t, len(log.linesWith("action=refuse")), 4)
 }
 
 // The watchdog's silent rebuild is the programmatic form of a reconnect, and
@@ -265,9 +310,9 @@ func TestCooloffClearedByTheRebuild(t *testing.T) {
 	window := outcomeTestWindow(ctx, log)
 	window.armOutcome()
 	window.noteFailedDestination(destination, cooloffReasonEvaluation)
-	AssertEqual(t, window.cooloffHolds(destination), true)
+	AssertEqual(t, cooloffTestNoted(window, destination), true)
 	window.rebuildWindow(45 * time.Second)
-	AssertEqual(t, window.cooloffHolds(destination), false)
+	AssertEqual(t, cooloffTestNoted(window, destination), false)
 	if lines := log.linesWith("action=clear"); len(lines) != 1 || !strings.Contains(lines[0], "reason=rebuild") {
 		t.Fatalf("want one clear line naming the rebuild, got %v", lines)
 	}
@@ -277,7 +322,7 @@ func TestCooloffClearedByTheRebuild(t *testing.T) {
 	aborted.noteFailedDestination(destination, cooloffReasonEvaluation)
 	aborted.noteClientAdded(nil)
 	aborted.rebuildWindow(45 * time.Second)
-	AssertEqual(t, aborted.cooloffHolds(destination), true)
+	AssertEqual(t, cooloffTestNoted(aborted, destination), true)
 }
 
 // An entry excludes its provider until the cool-off has passed, then is

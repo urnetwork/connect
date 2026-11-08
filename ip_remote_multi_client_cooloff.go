@@ -13,7 +13,9 @@ package connect
 // MultiClientSettings.EvaluationFailureCooloff has passed; non-positive
 // disables the cool-off. Discovery runs ahead of the expansion, so a candidate
 // listed before its provider failed is also refused when the expansion takes
-// it (acceptDiscoveryDemandArgs, cooloffHolds).
+// it (acceptDiscoveryDemandArgs, cooloffRefuses). Each candidate carries the
+// listing of the round that drew it (cooloffListing): whether that round
+// skipped the exclusions, and the last note it had seen.
 //
 // What is noted:
 //   - a candidate whose evaluation failed for the provider: its channel could
@@ -41,9 +43,14 @@ package connect
 // cool-off, and a transient failure of ours (a ping lost to the uplink) is
 // enough to cause it. So the exclusions are skipped for a discovery round
 // when the window holds no provider at all, and for the round after one whose
-// exclusions left discovery empty. The window's silent rebuild (the outcome
-// watchdog's programmatic reconnect) clears the cool-off, as a reconnect
-// starts with none.
+// exclusions left discovery empty. A candidate such a round lists after its
+// provider failed was listed knowingly, and the expansion evaluates it: the
+// refusal is only for a candidate listed before its provider failed, or one a
+// round returned despite excluding it. The entries stay, so the next round
+// that applies the exclusions leaves the providers out again. The window's
+// silent rebuild (the outcome watchdog's programmatic reconnect) clears the
+// cool-off, as a reconnect starts with none; the watchdog acts only on a
+// window that never formed, and the escape is what serves the rest.
 //
 // Bounds: one entry per provider, at most cooloffMaxCount, the oldest
 // dropped first; an entry past the cool-off is dropped when discovery reads
@@ -72,12 +79,25 @@ const (
 
 type cooloffEntry struct {
 	failTime time.Time
+	// the note's place in the cool-off's sequence of notes
+	generation uint64
+}
+
+// How a discovery round read the cool-off: the last note it had seen, and
+// whether it skipped the exclusions. The zero value is a listing that applied
+// them.
+type cooloffListing struct {
+	generation uint64
+	skipped    bool
 }
 
 type destinationCooloff struct {
 	stateLock sync.Mutex
 	// when each provider last failed
 	entries map[MultiHopId]cooloffEntry
+	// the notes so far, never reset, so a listing can tell an entry noted
+	// after it from one it saw
+	generation uint64
 	// the last round whose exclusions applied came back empty: the next round
 	// runs without them
 	skipNext bool
@@ -93,7 +113,8 @@ func (self *destinationCooloff) note(destination MultiHopId, failTime time.Time,
 	if self.entries == nil {
 		self.entries = map[MultiHopId]cooloffEntry{}
 	}
-	self.entries[destination] = cooloffEntry{failTime: failTime}
+	self.generation += 1
+	self.entries[destination] = cooloffEntry{failTime: failTime, generation: self.generation}
 	for maxCount < len(self.entries) {
 		var oldest MultiHopId
 		var oldestTime time.Time
@@ -137,12 +158,19 @@ func (self *destinationCooloff) expireWithLock(now time.Time, timeout time.Durat
 	}
 }
 
-// Whether destination failed within timeout of now.
-func (self *destinationCooloff) holds(destination MultiHopId, now time.Time, timeout time.Duration) bool {
+// Whether a candidate for destination that listing drew is refused at now:
+// its provider failed within timeout, and either after the listing read the
+// cool-off, or the listing applied the exclusions, so the provider was left
+// out of the request that still returned it. A candidate a skipping round
+// listed after its provider failed is not refused.
+func (self *destinationCooloff) refuses(destination MultiHopId, listing cooloffListing, now time.Time, timeout time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	entry, ok := self.entries[destination]
-	return ok && now.Sub(entry.failTime) < timeout
+	if !ok || timeout <= now.Sub(entry.failTime) {
+		return false
+	}
+	return !listing.skipped || listing.generation < entry.generation
 }
 
 // Drops every entry and the pending skip, and returns how many entries it
@@ -187,12 +215,12 @@ func (self *multiClientWindow) noteFailedDestination(destination MultiHopId, rea
 	))
 }
 
-// Whether destination is cooling off now: a candidate
-// listed before its provider failed in this window is refused when the
-// expansion takes it. Logs the refusal.
-func (self *multiClientWindow) cooloffHolds(destination MultiHopId) bool {
+// Whether the expansion refuses a candidate for destination that listing
+// drew: one listed before its provider failed in this window, or returned
+// despite the exclusions (destinationCooloff.refuses). Logs the refusal.
+func (self *multiClientWindow) cooloffRefuses(destination MultiHopId, listing cooloffListing) bool {
 	timeout := self.cooloffTimeout()
-	if timeout <= 0 || !self.cooloff.holds(destination, time.Now(), timeout) {
+	if timeout <= 0 || !self.cooloff.refuses(destination, listing, time.Now(), timeout) {
 		return false
 	}
 	loggerOrDefault(self.log).Infof("%s\n", relEvent(
@@ -205,18 +233,19 @@ func (self *multiClientWindow) cooloffHolds(destination MultiHopId) bool {
 }
 
 // Adds the providers still cooling off to a discovery round's exclusions,
-// unless the starvation escape skips them: the window
-// holds no provider (heldCount 0), or the last round with exclusions came back
-// empty. Returns how many it added; the round reports its result to
+// unless the starvation escape skips them: the window holds no provider
+// (heldCount 0), or the last round with exclusions came back empty. Returns
+// how many it added, and the listing the round's candidates carry to the
+// expansion's refusal (cooloffRefuses); the round reports its result to
 // noteCooloffRound.
-func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool, heldCount int) int {
+func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool, heldCount int) (int, cooloffListing) {
 	timeout := self.cooloffTimeout()
 	if timeout <= 0 {
-		return 0
+		return 0, cooloffListing{}
 	}
 	now := time.Now()
 	skipReason := ""
-	count, changed, pending := func() (int, bool, int) {
+	count, changed, pending, listing := func() (int, bool, int, cooloffListing) {
 		self.cooloff.stateLock.Lock()
 		defer self.cooloff.stateLock.Unlock()
 		if heldCount == 0 {
@@ -225,15 +254,16 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 			skipReason = "empty_round"
 		}
 		self.cooloff.skipNext = false
+		listing := cooloffListing{generation: self.cooloff.generation, skipped: skipReason != ""}
 		if skipReason != "" {
 			// expire what is due, and keep the rest for the next round
 			self.cooloff.expireWithLock(now, timeout)
-			return 0, false, len(self.cooloff.entries)
+			return 0, false, len(self.cooloff.entries), listing
 		}
 		count := self.cooloff.addExclusionsWithLock(excluded, now, timeout)
 		changed := count != self.cooloff.loggedExcludedCount
 		self.cooloff.loggedExcludedCount = count
-		return count, changed, 0
+		return count, changed, 0, listing
 	}()
 	if skipReason != "" {
 		if 0 < pending {
@@ -245,7 +275,7 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 				"held", pending,
 			))
 		}
-		return 0
+		return 0, listing
 	}
 	if changed {
 		loggerOrDefault(self.log).Infof("%s\n", relEvent(
@@ -255,7 +285,7 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 			"count", count,
 		))
 	}
-	return count
+	return count, listing
 }
 
 // Reports a discovery round's result: a round whose cool-off exclusions

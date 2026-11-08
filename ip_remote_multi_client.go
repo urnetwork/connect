@@ -13482,8 +13482,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}
 
 		// exclude healthy destinations that are already in the window, and
-		// the providers cooling off (ip_remote_multi_client_cooloff.go)
+		// the providers cooling off (ip_remote_multi_client_cooloff.go). The
+		// round's candidates carry its cool-off listing to the expansion.
 		cooloffExcluded := 0
+		var cooloffListing cooloffListing
 		windowDestinations := func() map[MultiHopId]bool {
 			self.stateLock.Lock()
 			windowDestinations := map[MultiHopId]bool{}
@@ -13495,7 +13497,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			heldCount := len(self.clients)
 			self.stateLock.Unlock()
 			self.addServiceRefreshExclusions(windowDestinations)
-			cooloffExcluded = self.addCooloffExclusions(windowDestinations, heldCount)
+			cooloffExcluded, cooloffListing = self.addCooloffExclusions(windowDestinations, heldCount)
 			return windowDestinations
 		}
 
@@ -13710,6 +13712,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						FixedDestination:               fixedDestination,
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
+						cooloffListing:                 cooloffListing,
 					}
 					offered := self.offerPassCandidate(demandRead, args, time.Now().Add(timeout), serviceOwner)
 					if !offered {
@@ -16620,6 +16623,12 @@ type multiClientChannelArgs struct {
 	// name (enumerateRecentExits). It is evaluated and admitted like any other
 	// candidate; the mark only names its outcome in the log.
 	recentExit bool
+
+	// How the discovery round that listed this candidate read the window's
+	// cool-off; the expansion refuses a candidate listed before its provider
+	// failed (ip_remote_multi_client_cooloff.go). The zero value is a round
+	// that applied the exclusions.
+	cooloffListing cooloffListing
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry

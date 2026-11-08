@@ -110,8 +110,9 @@ func (self *multiClientWindow) acceptDiscoveryDemandArgs(owner *multiClientEvalu
 	// Listed before its provider failed in this window: the cool-off
 	// (ip_remote_multi_client_cooloff.go) refuses it here, before the demand
 	// slot is taken, so the expansion retires its args and waits for the
-	// next candidate.
-	if !args.deferredClientArgs && self.cooloffHolds(args.Destination) {
+	// next candidate. A candidate the starvation escape listed after the
+	// failure is evaluated.
+	if !args.deferredClientArgs && self.cooloffRefuses(args.Destination, args.cooloffListing) {
 		return false
 	}
 	var cancel context.CancelFunc
