@@ -334,6 +334,24 @@ func (self *multiClientWindow) clearCooloff(reason string) {
 	}
 }
 
+// Whether the exit holds its window for the starvation escape: it is live,
+// and it takes new flows or is kept from them only because it is full (the
+// window's source ulimit, warnCapacity), which a hosted proxy's profile can
+// set. A full window is not starving, and skipping the cool-off there would
+// draw its failed providers again on every expansion. An exit warned for
+// anything else is on its way out, as is one that is done but not yet reaped.
+func (self *multiClientChannel) holdsWindowForCooloff() bool {
+	if self.IsDone() {
+		return false
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.quarantined || self.serviceRefreshReservation.Load() != nil {
+		return false
+	}
+	return !self.warning || self.warnCause == warnCapacity
+}
+
 // Whether the window can judge a verdict against client as the provider's:
 // another exit is receiving right now, so the uplink demonstrably delivers.
 // With no receiving sibling (a one-exit window, or an uplink stale past the

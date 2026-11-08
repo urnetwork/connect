@@ -402,9 +402,10 @@ func TestCooloffRefusesOnlyACandidateListedBeforeItsProviderFailed(t *testing.T)
 }
 
 // The escape's "holds no provider" counts the exits that are live and take new
-// flows. A window holding only an exit that is done but not yet reaped, or
-// only warned exits, skips the exclusions on that round instead of waiting a
-// round for the empty-round path.
+// flows, or are kept from them only because they are full. A window holding
+// only an exit that is done but not yet reaped, or only exits warned for
+// anything else, skips the exclusions on that round instead of waiting a round
+// for the empty-round path. A full window is not starving: it keeps them.
 func TestCooloffWindowWithoutALiveExitHoldsNoProvider(t *testing.T) {
 	failed := RequireMultiHopId(NewId())
 	cases := []struct {
@@ -416,6 +417,16 @@ func TestCooloffWindowWithoutALiveExitHoldsNoProvider(t *testing.T) {
 		{name: "warned", exit: func() *multiClientChannel {
 			client := cooloffTestHeldChannel()
 			client.setWarning(true, warnUnhealthy)
+			return client
+		}, skipped: true},
+		{name: "full", exit: func() *multiClientChannel {
+			client := cooloffTestHeldChannel()
+			client.setWarning(true, warnCapacity)
+			return client
+		}, skipped: false},
+		{name: "quarantined", exit: func() *multiClientChannel {
+			client := cooloffTestHeldChannel()
+			client.quarantined = true
 			return client
 		}, skipped: true},
 		{name: "done", exit: func() *multiClientChannel {

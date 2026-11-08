@@ -13445,19 +13445,18 @@ func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGener
 // window holds that take new flows or are reserved for a service refresh, the
 // service refresh's refusals, and the providers cooling off unless the
 // starvation escape skips them (ip_remote_multi_client_cooloff.go). For the
-// escape the window holds a provider while one of its exits is live and takes
-// new flows: an exit that is done but not yet reaped, or warned, is on its way
-// out. Returns the cool-off's excluded count and the round's listing.
+// escape the window holds a provider while one of its exits does
+// (holdsWindowForCooloff). Returns the cool-off's excluded count and the
+// round's listing.
 func (self *multiClientWindow) discoveryRoundExclusions() (map[MultiHopId]bool, int, cooloffListing) {
 	self.stateLock.Lock()
 	windowDestinations := map[MultiHopId]bool{}
 	heldCount := 0
 	for _, client := range self.clients {
-		warning := client.isWarning()
-		if !warning || client.serviceRefreshReservation.Load() != nil {
+		if !client.isWarning() || client.serviceRefreshReservation.Load() != nil {
 			windowDestinations[client.Destination()] = true
 		}
-		if !warning && !client.IsDone() {
+		if client.holdsWindowForCooloff() {
 			heldCount += 1
 		}
 	}
