@@ -13561,9 +13561,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			continue
 		}
 		// a round whose cool-off exclusions left it empty lets the next round
-		// run without them (the starvation escape); a probe asks only the
-		// v6-capable request, and its empty answer says nothing of the pool
-		self.noteCooloffRound(cooloffExcluded, len(destinations) == 0 && !probeOnly)
+		// run without them (the starvation escape), unless it asked only for
+		// v6-capable providers, whose absence says nothing of the pool
+		self.noteCooloffRound(cooloffExcluded, len(destinations) == 0 && self.cooloffRoundAsksThePool(probeOnly, demandRead))
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed

@@ -288,6 +288,24 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 	return count, listing
 }
 
+// Whether a discovery round's empty answer says the pool has nothing left
+// outside the exclusions, so the starvation escape may skip them next round.
+// Not for a probe, which asks only the v6-capable request, nor for a demand
+// read for an IPv6 flow, which asks a family-aware generator for one
+// v6-capable candidate: a pool of providers that carry only IPv4 answers
+// either with nothing.
+func (self *multiClientWindow) cooloffRoundAsksThePool(probeOnly bool, demandRead *discoveryDemandRead) bool {
+	if probeOnly {
+		return false
+	}
+	if demandRead != nil && demandRead.ipVersion == 6 {
+		// listDiscoveryDemand filters by family only with this capability
+		_, familyAware := self.generator.(multiClientGeneratorFamilyDiscoveryContext)
+		return !familyAware
+	}
+	return true
+}
+
 // Reports a discovery round's result: a round whose cool-off exclusions
 // applied and that came back empty makes the next round run without them.
 func (self *multiClientWindow) noteCooloffRound(excludedCount int, empty bool) {

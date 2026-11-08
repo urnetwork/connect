@@ -298,6 +298,36 @@ func TestCooloffRefusesOnlyACandidateListedBeforeItsProviderFailed(t *testing.T)
 	AssertEqual(t, len(log.linesWith("action=refuse")), 4)
 }
 
+// A family-aware generator's discovery with a context, which a demand read
+// asks.
+type cooloffFamilyContextTestGenerator struct {
+	recentExitTestGenerator
+}
+
+func (self *cooloffFamilyContextTestGenerator) NextDestinationsWithIpFamilyContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	return map[MultiHopId]DestinationStats{}, nil
+}
+
+// An empty answer lets the starvation escape skip the next round's exclusions
+// only when the round asked the whole pool. A probe asks only the v6-capable
+// request, and a demand read for an IPv6 flow asks a family-aware generator
+// for one v6-capable candidate: a pool of providers that carry only IPv4
+// answers either with nothing, and counting that lifted the cool-off in a pool
+// that had plenty else to offer.
+func TestCooloffRoundAsksThePoolUnlessItAskedOnlyForIpv6(t *testing.T) {
+	familyAware := recentExitBareWindow(&cooloffFamilyContextTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+	legacy := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+	ipv4 := &discoveryDemandRead{ipVersion: 4}
+	ipv6 := &discoveryDemandRead{ipVersion: 6}
+
+	AssertEqual(t, familyAware.cooloffRoundAsksThePool(false, nil), true)
+	AssertEqual(t, familyAware.cooloffRoundAsksThePool(true, nil), false)
+	AssertEqual(t, familyAware.cooloffRoundAsksThePool(false, ipv4), true)
+	AssertEqual(t, familyAware.cooloffRoundAsksThePool(false, ipv6), false)
+	// without the family filter a demand read asks the whole pool
+	AssertEqual(t, legacy.cooloffRoundAsksThePool(false, ipv6), true)
+}
+
 // The watchdog's silent rebuild is the programmatic form of a reconnect, and
 // a reconnect starts with no cool-off: the rebuild clears it. A rebuild that
 // stands down because a provider landed first leaves it.
