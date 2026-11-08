@@ -15274,13 +15274,6 @@ requestCandidates:
 				self.log.V(2).Infof("[multi]expand window timeout before candidate evaluation\n")
 				break requestCandidates
 			}
-			if !args.deferredClientArgs && self.cooloffHolds(args.Destination) {
-				// listed before its provider failed in this window: the
-				// cool-off holds it now, and it consumes no candidate slot
-				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
-				i--
-				continue requestCandidates
-			}
 			if args.deferredClientArgs {
 				if self.fixedDestinationPresent(args.Destination) {
 					// Discovery may predate a sibling's admission. An inert

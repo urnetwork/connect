@@ -12,8 +12,8 @@ package connect
 // found failing and passes it to discovery as an exclusion until
 // MultiClientSettings.EvaluationFailureCooloff has passed; non-positive
 // disables the cool-off. Discovery runs ahead of the expansion, so a candidate
-// listed before its provider failed is also dropped when the expansion takes
-// it (cooloffHolds).
+// listed before its provider failed is also refused when the expansion takes
+// it (acceptDiscoveryDemandArgs, cooloffHolds).
 //
 // What is noted:
 //   - a candidate whose evaluation failed for the provider: its channel could
