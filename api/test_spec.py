@@ -201,6 +201,81 @@ class SpecTest(unittest.TestCase):
             schemas["TlsCertState"]["enum"],
         )
 
+    def test_socket_routes_are_documented_and_planned(self):
+        # sidecar DESIGN.md §9.15's routes, each with its class: the three
+        # Client routes take a client token, and GET /socket/keys is public.
+        # sockets serves them on one host of its own, never api's, so each
+        # stays planned and out of the public api until it does.
+        expected = {
+            ("/socket/registrations", "post"): [{"BearerAuth": []}],
+            ("/socket/find", "post"): [{"BearerAuth": []}],
+            ("/socket/list", "get"): [{"BearerAuth": []}],
+            ("/socket/keys", "get"): [],
+        }
+        methods = {"get", "put", "post", "delete", "patch"}
+        paths = self.spec["paths"]
+        self.assertEqual(
+            {path for path, _ in expected},
+            {path for path in paths if path.startswith("/socket/")},
+        )
+        hosts = set()
+        for (path, method), security in expected.items():
+            with self.subTest(path=path, method=method):
+                item = paths[path]
+                self.assertEqual({method}, methods & set(item))
+                hosts.add(item["servers"][0]["url"])
+                operation = item[method]
+                self.assertTrue(operation["x-internal"])
+                self.assertEqual("planned", operation["x-status"])
+                self.assertEqual(security, operation["security"])
+        # one host of its own, so no path falls back to api's
+        self.assertEqual(1, len(hosts))
+        self.assertFalse(hosts & {server["url"] for server in self.spec["servers"]})
+        # the bodies' fields are sidecar socket_api.go's JSON names, which its
+        # TestSocketRouteBodyNames pins on that side
+        schemas = self.spec["components"]["schemas"]
+        fields = {
+            "SocketRegistrationsArgs": {"set_version", "key_start", "key_end", "registrations"},
+            "SocketRegistration": {
+                "name", "name_token", "sealed_name", "listen_id", "protocol", "version", "alpn",
+                "app_mode", "weight", "max_streams", "exclusive", "affinity", "serving", "draining",
+                "inflight", "claim",
+            },
+            "SocketRegistrationsResult": {
+                "statuses", "set_version", "server_time", "ticket_keys", "urnetwork_edge",
+                "streams_stopped", "error",
+            },
+            "SocketError": {"code", "retry_after_ms"},
+            "SocketTicketKey": {"key_id", "public_key", "expire_time_millis"},
+            "SocketFindArgs": {
+                "name", "name_token", "network_id", "affinity_key", "failed_tickets", "client_ids",
+            },
+            "SocketFailedTicket": {"ticket", "reason"},
+            "SocketFindTicket": {"ticket", "claim"},
+            "SocketFindResult": {"primary", "backup", "error"},
+            "SocketListName": {"name", "name_token", "sealed_name"},
+            "SocketListResult": {"names", "next_cursor", "error"},
+            "SocketKeysResult": {"keys"},
+        }
+        for name, want in fields.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, set(schemas[name]["properties"]))
+        enums = {
+            "SocketRegistrationStatus": ["ok", "revoked", "denied", "taken", "invalid"],
+            "SocketErrorCode": [
+                "no_listener", "busy", "denied", "quota", "unavailable", "stale", "invalid",
+            ],
+            "SocketFailedReason": ["timeout", "refused"],
+        }
+        for name, want in enums.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, schemas[name]["enum"])
+        # a dial's protocol, version and ALPN stay off the wire until the
+        # metadata list names them for Find (plan-SOCK-metadata-rows)
+        self.assertFalse(
+            {"protocol", "min_version", "alpn"} & set(schemas["SocketFindArgs"]["properties"])
+        )
+
     def test_auth_key_routes_are_served(self):
         # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
         # the network credential's (403 for a client token), and the bundle never
