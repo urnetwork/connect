@@ -881,9 +881,9 @@ func (self *blockActionCache) delete(addr netip.Addr) {
 // them either (`WellKnownResolverAddrs`).
 //
 // The set is fixed rather than read from the defaults alone, so a resolver
-// that leaves the defaults stays protected: Google Public DNS left them for
-// user privacy (2026-11-08), but devices still query it. The set sends
-// nothing to any resolver.
+// that leaves the defaults stays protected: Google Public DNS and OpenDNS
+// left them (2026-11-08), but devices still query both. The set sends nothing
+// to any resolver.
 var wellKnownResolverAddrs = sync.OnceValue(func() map[netip.Addr]bool {
 	addrs := map[netip.Addr]bool{}
 	addHost := func(host string) {
