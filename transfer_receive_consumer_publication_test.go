@@ -1,5 +1,6 @@
 // A reserved decoder owner precedes publication of its reliable payload role.
-// Root linkage alone must not let unfinished ingress fund head recovery.
+// Root linkage supplies no backlog authority; established generations have a
+// separate, independently paid permission for their exact current original.
 package connect
 
 import (
@@ -10,9 +11,10 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// Pause an actual paid tail between owned decode and Client publication. Its
-// real current predecessor may use the child only after that tail is published.
-func TestReceiveConsumerCurrentHeadRequiresPublishedBacklog(t *testing.T) {
+// Pause an actual paid tail between owned decode and Client publication. The
+// signed established generation can fund its current original independently;
+// the unfinished tail must remain neither backlog nor delivery authority.
+func TestReceiveConsumerEstablishedCurrentHeadPreservesUnpublishedTail(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		assertMessagePoolOwnership(t)
@@ -82,16 +84,34 @@ func TestReceiveConsumerCurrentHeadRequiresPublishedBacklog(t *testing.T) {
 			len(pending.pack.Frames) != 1 || pending.pack.Frames[0].MessageType != protocol.MessageType_IpIpPacketFromProvider {
 			t.Fatal("publication fixture crossed Client publication or lost paid pending custody")
 		}
+		currentScan, status := scanReceiveMemoryPack(current.bytes, path)
+		if status != receiveMemoryPackScanReady || currentScan.retainedByteCount <= 1536 || currentScan.retainedByteCount > child.TotalByteCount() {
+			t.Fatal("publication fixture current predecessor lost its funded envelope")
+		}
+		root.admissionLock.Lock()
+		established := sequence.holdPromise.establishedContract
+		unpublishedBacklog := sequence.receiveConsumerHeadBacklogWithLock(currentScan)
+		root.admissionLock.Unlock()
+		if !established || unpublishedBacklog {
+			t.Fatal("unpublished tail became backlog authority or signed generation was not established")
+		}
 		reserved, released := root.Counts()
 		decoded := &decodedTransferFrame{}
 		ok, pressure := fixture.receiver.unmarshalReceiveMemoryFrame(current.bytes, decoded, true, path, false, sequenceTlsRoleServer, false)
 		admitted := decoded.packOwner != nil
+		paid := admitted && decoded.packOwner.receiveItem.memoryBudget == child &&
+			decoded.packOwner.receiveItem.QueueByteCount() == currentScan.retainedByteCount &&
+			decoded.packOwner.receivePack.ingressLoanByteCount == 0 &&
+			child.UsedByteCount() == currentScan.retainedByteCount &&
+			rx.UsedByteCount() == 6656 && root.UsedByteCount() == 6656+currentScan.retainedByteCount
 		decoded.release()
 		synctest.Wait()
 		afterReserved, afterReleased := root.Counts()
-		if ok || admitted || !pressure || reserved != afterReserved || released != afterReleased || child.UsedByteCount() != 0 {
-			t.Fatalf("UNPUBLISHED_OWNER_FUNDED_CURRENT_HEAD ok=%t owner=%t pressure=%t rx=%d child=%d root=%d reserved_delta=%d released_delta=%d",
-				ok, admitted, pressure, rx.UsedByteCount(), child.UsedByteCount(), root.UsedByteCount(),
+		if !ok || !admitted || !paid || pressure ||
+			afterReserved-reserved != currentScan.retainedByteCount || afterReleased-released != currentScan.retainedByteCount ||
+			child.UsedByteCount() != 0 || rx.UsedByteCount() != 6656 || root.UsedByteCount() != 6656 {
+			t.Fatalf("ESTABLISHED_CURRENT_DECODE_LOST_INDEPENDENT_CUSTODY ok=%t owner=%t paid=%t pressure=%t rx=%d child=%d root=%d reserved_delta=%d released_delta=%d",
+				ok, admitted, paid, pressure, rx.UsedByteCount(), child.UsedByteCount(), root.UsedByteCount(),
 				afterReserved-reserved, afterReleased-released)
 		}
 		if sequence.nextSequenceNumber != 1 || sequence.receiveQueue.Len() != 0 || fixture.deliveredCount != 0 || fixture.ackedCount != 0 {
@@ -111,9 +131,11 @@ func TestReceiveConsumerCurrentHeadRequiresPublishedBacklog(t *testing.T) {
 			rx.UsedByteCount() != 6656 || root.UsedByteCount() != 6656 || sequence.holdPromise.set || len(fixture.receiverOut) != 0 {
 			t.Fatal("actual Client did not publish the reliable tail role")
 		}
-		currentScan, status := scanReceiveMemoryPack(current.bytes, path)
-		if status != receiveMemoryPackScanReady || currentScan.retainedByteCount <= 1536 || currentScan.retainedByteCount > child.TotalByteCount() {
-			t.Fatal("publication fixture current predecessor lost its funded envelope")
+		root.admissionLock.Lock()
+		publishedBacklog := sequence.receiveConsumerHeadBacklogWithLock(currentScan)
+		root.admissionLock.Unlock()
+		if !publishedBacklog {
+			t.Fatal("published actual reliable tail did not acquire its separate backlog authority")
 		}
 		observed, paid := false, false
 		sequence.receiveBufferSettings.receiveOwnerStageForTest = func(actual *ReceiveSequence, owner *decodedPackOwner, stage string) {

@@ -33,6 +33,10 @@ type receiveHoldPromise struct {
 	ingressLoanByteCount ByteCount
 	ingressFloor         uint64
 	closed               bool
+	// Published only after the receive worker advances an ordered generation
+	// under a verified contract. This buys physical current-item storage, not
+	// contract validity, delivery or ACK authority; those remain worker checks.
+	establishedContract bool
 }
 
 // holdPromised reports whether an arrival at this number is a missing

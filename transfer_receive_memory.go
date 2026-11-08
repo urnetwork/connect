@@ -225,6 +225,9 @@ func (self *ReceiveSequence) publishReceiveMemoryFloor() {
 	root.admissionLock.Lock()
 	promise := &self.holdPromise
 	promise.ingressFloor = self.nextSequenceNumber
+	if self.receiveContract != nil && self.receiveContract.verifiedReceiveProofSet {
+		promise.establishedContract = true
+	}
 	released := ByteCount(0)
 	state := &self.memoryPressure
 	if state.activeSet && state.active.sequenceNumber < promise.ingressFloor {

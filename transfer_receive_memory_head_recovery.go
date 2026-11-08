@@ -21,6 +21,12 @@ func (self *ReceiveBufferSettings) receiveHeadRecoveryBudget() *TransferMemoryBu
 // prefix/pressure loan. The ordinary worker still verifies contracts before
 // delivery; invalid proof keeps its existing error and close behavior.
 func (self *ReceiveBuffer) takeReceiveHeadRecoveryOwner(sequence *ReceiveSequence, scan receiveMemoryPackScan) *decodedPackOwner {
+	return self.takeReceiveHeadRecoveryOwnerInSession(sequence, scan, false)
+}
+
+// The decoder supplies its actual decrypted context. A plaintext retry cannot
+// use the new established-generation fallback to cross Required encryption.
+func (self *ReceiveBuffer) takeReceiveHeadRecoveryOwnerInSession(sequence *ReceiveSequence, scan receiveMemoryPackScan, decrypted bool) *decodedPackOwner {
 	budget := self.receiveBufferSettings.receiveHeadRecoveryBudget()
 	if budget == nil || sequence == nil || !scan.loanSafe || scan.compatibility || scan.nack || scan.contractAhead ||
 		scan.hasEncryptedControl || scan.retainedByteCount <= 0 {
@@ -47,8 +53,16 @@ func (self *ReceiveBuffer) takeReceiveHeadRecoveryOwner(sequence *ReceiveSequenc
 	// use the same bounded child without turning future tails into authority.
 	consumerPrefix := consumer && !promise.closed && sequence.ctx.Err() == nil &&
 		receiveConsumerRecoverySession(scan) && sequence.receiveConsumerRecoveryPrefixWithLock(scan.sequenceNumber, budget)
+	// A verified ordered generation can be quiet while other sequences fill
+	// RX. Its exact current original has the same bounded physical need as a
+	// missing predecessor, even without a later owner in its own list. It
+	// reserves independently; foreign RX promises and escrows stay untouched.
+	establishedCurrent := consumer && promise.establishedContract &&
+		scan.sequenceNumber == promise.ingressFloor && !scan.head &&
+		!scan.contractIdSet && !scan.contractFrameSet && receiveConsumerRecoverySession(scan) &&
+		(decrypted || sequence.session == nil || !sequence.session.RequireEncryption())
 	allowed := provider && promised ||
-		consumer && (promised || consumerPrefix || sequence.receiveConsumerHeadBacklogWithLock(scan)) ||
+		consumer && (promised || consumerPrefix || establishedCurrent || sequence.receiveConsumerHeadBacklogWithLock(scan)) ||
 		opening && sequence.receiveConsumerOpeningBacklogWithLock()
 	if promise.closed || sequence.ctx.Err() != nil ||
 		scan.sequenceNumber != promise.ingressFloor && !consumerPrefix ||

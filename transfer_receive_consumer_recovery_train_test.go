@@ -147,8 +147,12 @@ func testReceiveConsumerPaidRecoveryTrain(t *testing.T, mode string) {
 		MessagePoolShareReadOnly(targetTail.bytes)
 		tailBackup := &windowRoundFrame{bytes: targetTail.bytes, pack: targetTail.pack}
 		fixture.heldFrames = append(fixture.heldFrames, tailBackup)
-		var other *windowRoundFrame
+		var otherCurrent, other *windowRoundFrame
 		if mode == "other-sequence" {
+			// A signed current original can now reserve its own child credit.
+			// Keep that real source unoffered and test its future successor,
+			// which has no same-sequence paid prefix or independent entitlement.
+			otherCurrent = write(2, 32)
 			other = write(2, 32)
 		}
 		findSequence := func(frame *windowRoundFrame) *ReceiveSequence {
@@ -177,6 +181,17 @@ func testReceiveConsumerPaidRecoveryTrain(t *testing.T, mode string) {
 			return changed
 		}
 		sequence, foreign := findSequence(originals[0]), findSequence(foreignFirst)
+		if mode == "other-sequence" {
+			unrelated := findSequence(other)
+			if unrelated == sequence || unrelated == foreign || unrelated.receiveContract == nil ||
+				!unrelated.receiveContract.verifiedReceiveProofSet || other.pack.Head ||
+				other.pack.SequenceNumber != otherCurrent.pack.SequenceNumber+1 ||
+				unrelated.nextSequenceNumber != otherCurrent.pack.SequenceNumber ||
+				unrelated.holdPromise.ingressFloor != otherCurrent.pack.SequenceNumber ||
+				unrelated.holdPromise.ingressHead != nil || unrelated.holdPromise.set || unrelated.receiveQueue.Len() != 0 {
+				t.Fatal("unrelated successor did not retain a genuine unpaid predecessor")
+			}
+		}
 		firstId = RequireIdFromBytes(originals[0].pack.MessageId)
 		firstNumber := originals[0].pack.SequenceNumber
 		if targetTail.pack.SequenceNumber != firstNumber+uint64(len(originals)) {
@@ -332,22 +347,23 @@ func testReceiveConsumerPaidRecoveryTrain(t *testing.T, mode string) {
 				root.admissionLock.Lock()
 				pressure := sequence.memoryPressure
 				root.admissionLock.Unlock()
-				if !pressure.activeSet || !pressure.ready || pressure.owner != nil ||
-					pressure.active.sequenceNumber != originals[1].pack.SequenceNumber ||
-					pressure.reservedByteCount != smallCost || sequence.nextSequenceNumber != firstNumber+1 ||
-					sequence.receiveQueue.Len() != 0 || fixture.deliveredCount != 1 || fixture.ackedCount != 1 ||
-					fixture.receiver.receiveQueueCommitCount.Load() != 0 {
-					t.Fatal("earlier genuine retry did not replace the later pressure demand without delivery or SACK")
+				if pressure.activeSet || pressure.owner != nil || pressure.reservedByteCount != 0 ||
+					pressure.borrowedByteCount != 0 || sequence.nextSequenceNumber != targetTail.pack.SequenceNumber+1 ||
+					sequence.receiveQueue.Len() != 0 || fixture.deliveredCount != 5 || fixture.ackedCount != 5 ||
+					fixture.receiver.receiveQueueCommitCount.Load() != 0 || rx.UsedByteCount() != foreignCost ||
+					head.UsedByteCount() != 0 || root.UsedByteCount() != foreignCost {
+					t.Fatal("independently paid exact-current retry did not drain the genuine gap without suffix SACK or residual credit")
 				}
-				t.Logf("[recovery-train-pressure-switch] from=%d to=%d reserved=%d delivered=1 acked=1 no_suffix_sack=true", originals[2].pack.SequenceNumber, pressure.active.sequenceNumber, pressure.reservedByteCount)
+				t.Log("RECEIVE_RECOVERY_GAP_CURRENT_PROGRESS_AFTER_WORKER_RELEASE no_suffix_sack=true delivered=5 acked=5")
 			}
 			t.Logf("[recovery-train-completion] round=%d first=%d last=%d tail=%d target_next=%d tail_retained=%t delivered=%d", round+1, firstNumber, originals[len(originals)-1].pack.SequenceNumber, targetTail.pack.SequenceNumber, sequence.nextSequenceNumber, sequence.receiveQueue.GetByMessageId(RequireIdFromBytes(targetTail.pack.MessageId)) != nil, fixture.deliveredCount)
 		}
 		fixture.forward(foreignFirst, fixture.receiverIn)
 		fixture.acknowledge()
 		if mode == "other-sequence" {
-			// The unrelated first original was truly refused; its sender still
-			// owns it until cleanup. Its ordinary receive worker stays empty.
+			// The unrelated future original was truly refused; both its real
+			// missing predecessor and this successor stay sender-owned until
+			// cleanup. Its ordinary receive worker stays empty.
 			if findSequence(other).receiveQueue.Len() != 0 {
 				t.Fatal("unrelated generation acquired a retained payload")
 			}

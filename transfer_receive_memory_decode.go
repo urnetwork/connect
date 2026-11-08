@@ -95,7 +95,7 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 		repairCopy = owner != nil
 	}
 	if owner == nil {
-		owner = self.receiveBuffer.takeReceiveHeadRecoveryOwner(sequence, scan)
+		owner = self.receiveBuffer.takeReceiveHeadRecoveryOwnerInSession(sequence, scan, decrypted)
 	}
 	if owner == nil {
 		if sequence != nil {
