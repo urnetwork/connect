@@ -50,7 +50,9 @@ package connect
 // that applies the exclusions leaves the providers out again. The window's
 // silent rebuild (the outcome watchdog's programmatic reconnect) clears the
 // cool-off, as a reconnect starts with none; the watchdog acts only on a
-// window that never formed, and the escape is what serves the rest.
+// window that never formed, and the escape is what serves the rest. A network
+// change clears it too, as it starts the expansion backoff over: failures on
+// the old path say nothing about the new one.
 //
 // Bounds: one entry per provider, at most cooloffMaxCount, the oldest
 // dropped first; an entry past the cool-off is dropped when discovery reads
@@ -318,7 +320,8 @@ func (self *multiClientWindow) noteCooloffRound(excludedCount int, empty bool) {
 }
 
 // Clears the cool-off for the window's silent rebuild, which is the
-// programmatic form of a reconnect: a reconnect starts with no cool-off.
+// programmatic form of a reconnect (a reconnect starts with no cool-off), and
+// for a network change, after which the failures say nothing of the path.
 func (self *multiClientWindow) clearCooloff(reason string) {
 	if count := self.cooloff.clear(); 0 < count {
 		loggerOrDefault(self.log).Infof("%s\n", relEvent(

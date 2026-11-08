@@ -395,6 +395,34 @@ func TestCooloffClearedByTheRebuild(t *testing.T) {
 	AssertEqual(t, cooloffTestNoted(aborted, destination), true)
 }
 
+// A network change clears every window's cool-off, as it starts the expansion
+// backoff over: the providers a window found failing failed on the old path,
+// and a phone that lost its uplink must not come back to windows that leave
+// them out for the rest of the cool-off.
+func TestCooloffClearedByANetworkChange(t *testing.T) {
+	parent, _, closeParent := groupTestParent(t, DisableSecurityPolicy())
+	defer closeParent()
+	log := newRecordingLogger()
+	failed := RequireMultiHopId(NewId())
+	for _, kind := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
+		window := &multiClientWindow{
+			ctx: parent.ctx, log: log, settings: parent.settings,
+			windowType: kind, clients: map[Id]*multiClientChannel{},
+			resizeMonitor: NewMonitor(),
+		}
+		window.noteFailedDestination(failed, cooloffReasonEvaluation)
+		AssertEqual(t, cooloffTestNoted(window, failed), true)
+		parent.windows[kind] = window
+	}
+	parent.NotifyNetworkChanged()
+	for _, window := range parent.windows {
+		if cooloffTestNoted(window, failed) {
+			t.Errorf("the %s window kept its cool-off across a network change", window.windowName())
+		}
+	}
+	AssertEqual(t, len(log.linesWith("action=clear reason=network_change")), 2)
+}
+
 // An entry excludes its provider until the cool-off has passed, then is
 // dropped; the memory keeps the newest providers up to its bound.
 func TestCooloffEntriesExpireAndAreBounded(t *testing.T) {

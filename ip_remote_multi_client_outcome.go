@@ -438,6 +438,9 @@ func (self *multiClientWindow) notifyNetworkChanged() {
 	self.errorStreak.Store(0)
 	// a discovery window's expansion backoff grew on the old path too
 	self.clearDiscoveryExpandRetry()
+	// and the providers it found failing failed on the old path
+	// (ip_remote_multi_client_cooloff.go)
+	self.clearCooloff("network_change")
 	if self.networkChangeMonitor != nil {
 		self.networkChangeMonitor.NotifyAll()
 	}
