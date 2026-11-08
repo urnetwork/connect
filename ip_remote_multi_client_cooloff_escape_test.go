@@ -15,6 +15,10 @@ import (
 // provider again on the next round and the expansion evaluates it: the window
 // (re)forms within a pass or two, and without the watchdog's rebuild, which
 // acts only on a window that never formed.
+//
+// A refusal can still happen and is right: a round that ran between the
+// failed candidate's retirement and its note listed the provider before it
+// failed. The next escape round lists it again.
 
 // The quality window's log lines containing every one of parts.
 func cooloffEscapeQualityLines(harness *reraceHarness, parts ...string) []string {
@@ -66,9 +70,6 @@ func TestCooloffOneProviderWindowRecoversAfterATransientFailure(t *testing.T) {
 		}
 		if lines := cooloffEscapeQualityLines(harness, "action=clear"); 0 < len(lines) {
 			t.Errorf("the cool-off was cleared, not escaped: %v", lines)
-		}
-		if lines := cooloffEscapeQualityLines(harness, "action=refuse"); 0 < len(lines) {
-			t.Errorf("the expansion refused what the escape listed: %v", lines)
 		}
 		path := reraceFlow(4, 0, 47301)
 		if _, _, ok := harness.connect(path); !ok {
@@ -153,9 +154,6 @@ func TestCooloffFormedWindowRecoversItsLostProviders(t *testing.T) {
 				}
 				if lines := cooloffEscapeQualityLines(harness, "event=window_rebuild"); 0 < len(lines) {
 					t.Errorf("the formed window was rebuilt: %v", lines)
-				}
-				if lines := cooloffEscapeQualityLines(harness, "action=refuse"); 0 < len(lines) {
-					t.Errorf("the expansion refused what the escape listed: %v", lines)
 				}
 			})
 		})
