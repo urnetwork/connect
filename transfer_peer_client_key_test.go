@@ -23,6 +23,7 @@ import (
 // What the accessor gives when it has no key.
 var noPeerKey [ed25519.PublicKeySize]byte
 
+// Opts a client in to `EncryptionSettings.ExposeVerifiedPeerClientKey`.
 func exposeVerifiedPeerClientKey(settings *ClientSettings) {
 	settings.EncryptionSettings.ExposeVerifiedPeerClientKey = true
 }
@@ -35,6 +36,7 @@ type peerKeyDelivery struct {
 	verified bool
 }
 
+// A delivery with the key its Peer reported, if it reported one.
 func newPeerKeyDelivery(listener string, content string, peer Peer) peerKeyDelivery {
 	key, verified := peer.VerifiedClientPublicKey()
 	return peerKeyDelivery{listener: listener, content: content, key: key, verified: verified}
@@ -79,6 +81,8 @@ func recordPeerKeys(t *testing.T, client *Client) <-chan peerKeyDelivery {
 	return deliveries
 }
 
+// Returns the next delivery, failing the test unless `listener` got `content`
+// within 60 seconds.
 func requirePeerKeyDelivery(t *testing.T, deliveries <-chan peerKeyDelivery, listener string, content string) peerKeyDelivery {
 	t.Helper()
 	select {
@@ -311,11 +315,11 @@ func TestPeerVerifiedClientKeyFollowsTheSignedIdentityGate(t *testing.T) {
 		state    clientKeyHistoryState
 		verified bool
 	}{
-		{clientKeyHistoryNotRequired, true},
-		{clientKeyHistoryPending, false},
-		{clientKeyHistoryVerified, true},
-		{clientKeyHistoryRejected, false},
-		{clientKeyHistoryStoreUnavailable, false},
+		{state: clientKeyHistoryNotRequired, verified: true},
+		{state: clientKeyHistoryPending, verified: false},
+		{state: clientKeyHistoryVerified, verified: true},
+		{state: clientKeyHistoryRejected, verified: false},
+		{state: clientKeyHistoryStoreUnavailable, verified: false},
 	} {
 		func() {
 			sess.stateLock.Lock()
@@ -328,6 +332,7 @@ func TestPeerVerifiedClientKeyFollowsTheSignedIdentityGate(t *testing.T) {
 	}
 }
 
+// An AES-GCM sequence cipher under a fresh random 256-bit key.
 func testPeerKeyCipher(t *testing.T) *sequenceCipher {
 	t.Helper()
 	key := make([]byte, 32)
@@ -386,8 +391,8 @@ func TestUnwrapFrameTakesTheKeyOfTheSessionThatOpenedIt(t *testing.T) {
 		key           ed25519.PublicKey
 		companion     bool
 	}{
-		{regularCipher, regularKey, false},
-		{companionCipher, companionKey, true},
+		{sessionCipher: regularCipher, key: regularKey, companion: false},
+		{sessionCipher: companionCipher, key: companionKey, companion: true},
 	} {
 		wrapped, err := c.sessionCipher.Seal([]byte("frame"))
 		if err != nil {

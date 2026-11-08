@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -599,17 +600,48 @@ type TransferKey struct {
 	LogicalLane uint32
 }
 
+// What a contract may carry, as `Peer.ContractClass` reports it. A receiver reads
+// `ContractClassUnset` as the narrowest class.
+const (
+	ContractClassUnset   = protocol.ContractClass_ContractClassUnset
+	ContractClassData    = protocol.ContractClass_ContractClassData
+	ContractClassControl = protocol.ContractClass_ContractClassControl
+)
+
 // the identity of the source of received frames.
-// `ProvideMode` is the mode of where these frames are from: network, friends and family, public.
+// `ProvideMode` is the mode of where these frames are from: network, friends and family, public,
+// service. A service source's frames are only those `ClientSettings.ServiceSubprotocolIds` lists.
 // `Roles` and `Principal` are the source client's identity from the active contract,
 // set only when the provide mode is network; nil roles and empty principal otherwise.
+// `ContractClass`, `SourceSubject`, `SourceNetwork` and `WindowDelegation` are the
+// seals of the contract these frames arrived under, in every provide mode. They come
+// from the same verified parse as `Roles`, so they are the platform's statements: a
+// consistency check on a customer signature, never a substitute for one. A contract
+// older than the seals, and a no-contract source, leaves them all empty. On a
+// companion contract they are the forward contract's, so they name the side that
+// opened the pair, not the source of these frames.
 // `TransferKey` is immutable for the receive sequence and can be passed as a
 // send option when constructing a reply.
+//
+// Every retained provider packet holds a Peer by value, inside a fixed reservation
+// (`providerReliablePacket`), so fields here are paid for per packet.
 type Peer struct {
 	ProvideMode protocol.ProvideMode
-	Roles       []string
-	Principal   string
-	TransferKey TransferKey
+	// `ContractClassUnset` when unsealed or when this build does not know the
+	// value, which a receiver holds to the narrowest class. Read it per frame:
+	// a pair's contracts change.
+	ContractClass protocol.ContractClass
+	Roles         []string
+	Principal     string
+	// The subject the platform stored for the source client; zero when unsealed.
+	SourceSubject Id
+	// The source client's network; zero when unsealed.
+	SourceNetwork Id
+	// The source window client's signed delegation, unverified and exactly as
+	// sealed; nil for any other source. Shared with the contract, so it is never
+	// written, and it outlives the callback.
+	WindowDelegation []byte
+	TransferKey      TransferKey
 	// TransportType is the physical carrier that delivered this Pack. It is
 	// immutable through receive ordering and batching.
 	TransportType TransportType
@@ -1656,6 +1688,14 @@ type ClientSettings struct {
 	// before the message: at the platform's expiry sweep. Non-positive drops
 	// every id.
 	CloseSequencesMaxPendingCount int
+	// The subprotocols a source in `ProvideMode_Service` may send this client.
+	// Those are all a Service source reaches: its frames of any other id, and
+	// every other frame it sends, IP included, are dropped and counted (see
+	// `ClientSubprotocolStatsSnapshot`). Empty, the default, passes nothing from
+	// a Service source. Connect names no id here, so an owner that provides
+	// Service lists its own. Read on the receive path, so it must not change
+	// after construction.
+	ServiceSubprotocolIds []SubprotocolId
 
 	// Log, when set, is used by the client and all nested components
 	// (propagated to nested settings `Log` fields that are nil).
@@ -2518,17 +2558,33 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 	return self.encryptionSessionManager
 }
 
-// unwrapFrame opens an outer-wrapped TransferFrame from `sourceId`. `roleHint`
-// (the sender's session role; may be `SequenceRoleUnknown`) selects the
-// complement local session to try first; `companionHint` (the sender's session
-// companion; nil when the sender omitted it) further pins the exact companion
-// session. With a role hint but no companion hint, both companion sessions of
-// the complement role are tried; with no role hint, every per-peer session is
+// Opens an outer-wrapped TransferFrame from `sourceId`. `roleHint` (the
+// sender's session role; may be `SequenceRoleUnknown`) selects the complement
+// local session to try first; `companionHint` (the sender's session companion;
+// nil when the sender omitted it) further pins the exact companion session.
+// With a role hint but no companion hint, both companion sessions of the
+// complement role are tried; with no role hint, every per-peer session is
 // tried. Each candidate session's ciphers are tried (established plus, briefly
-// during a rekey, the prior established) until one authenticates. Returns the
-// plaintext inner bytes and the local session role and companion that
-// decrypted them (used as the receive sequence's role/companion). Wait-free:
+// during a rekey, the prior established) until one authenticates. Wait-free:
 // it never blocks the receive loop.
+//
+// Returns the plaintext inner bytes and the local session role and companion
+// that decrypted them (used as the receive sequence's role/companion). It also
+// returns the peer client key of that same session, which the receive path
+// carries to `Peer.VerifiedClientPublicKey`. The key comes from the session
+// that opened this frame, never from the session a receive sequence holds. It
+// is nil unless `EncryptionSettings.ExposeVerifiedPeerClientKey` is on. It is
+// also nil in four other cases:
+//   - the session's signed-identity gate is pending, has rejected the key, or
+//     could not use its local pin store;
+//   - the session's established epoch has not completed the peer identity
+//     proof;
+//   - the session holds no Ed25519-sized key;
+//   - the call returns an error.
+//
+// `peerEncryptionSession.verifiedClientKey` decides the session's cases. A
+// non-nil key is shared with the session and every Peer that carries it, so it
+// must not be written.
 func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
@@ -7898,10 +7954,10 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	// sequence before enqueueing so every subsequent contract request uses the
 	// routable metadata; a direct pack is deliberately a no-op here.
 	self.adoptContractIntermediaryIds(sendPack.IntermediaryIds)
-	// Fail-closed entry gate (EncryptionModeRequired): an application pack does
-	// not enter the sequence until the per-peer cipher is established. The gate
-	// must run here — before a sequence number is assigned — because the
-	// client-role handshake rides this same sequence
+	// Fail-closed entry gate (EncryptionModeRequired, or a peer StickyRequired
+	// holds): an application pack does not enter the sequence until the per-peer
+	// cipher is established. The gate must run here — before a sequence number
+	// is assigned — because the client-role handshake rides this same sequence
 	// (`SendBuffer.SendEncryptedControl`): holding or dropping an
 	// already-sequenced plaintext frame leaves a gap in the strictly-ordered
 	// receive side, and the ClientHello queued behind the gap is never
@@ -12059,6 +12115,7 @@ func (self *SendSequence) setContract(
 	// identity proof exchanged inside the per-peer TLS session (defeats
 	// an active MITM that re-handshakes TLS on each leg).
 	if self.session != nil {
+		self.session.observeContract(nextSendContract)
 		if 0 < len(nextSendContract.destinationClientPublicKey) {
 			self.session.SetPeerClientPublicKey(ed25519.PublicKey(nextSendContract.destinationClientPublicKey))
 		}
@@ -14578,12 +14635,13 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		cipher = self.session.Cipher()
 	}
 	if cipher == nil && self.session != nil && !forceUnwrapped && self.session.RequireEncryption() {
-		// Fail-closed backstop (EncryptionModeRequired): an application frame
-		// reached the writer without a cipher. The entry gate
-		// (`SendSequence.Pack`) admits application packs only once the cipher
-		// is established, and an established session keeps serving a cipher
-		// through rekeys (`Cipher()`), so this fires only on a narrow race
-		// (e.g. the session torn down between enqueue and write). Refuse the
+		// Fail-closed backstop (EncryptionModeRequired, or a peer StickyRequired
+		// holds): an application frame reached the writer without a cipher. The
+		// entry gate (`SendSequence.Pack`) admits application packs only once the
+		// cipher is established, and an established session keeps serving a
+		// cipher through rekeys (`Cipher()`), so this fires only on a narrow race
+		// (e.g. the session torn down between enqueue and write), or on a frame
+		// sequenced before a demotion took the cipher away. Refuse the
 		// write — the item stays queued for resend and the sequence winds down
 		// via its own timeouts — rather than ever emitting plaintext.
 		return transferWriteDisposition{}, fmt.Errorf(
@@ -18328,6 +18386,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			ProvideMode:       receiveContract.provideMode,
 			Roles:             receiveContract.roles,
 			Principal:         receiveContract.principal,
+			SourceSubject:     receiveContract.sourceSubject,
+			SourceNetwork:     receiveContract.sourceNetwork,
+			ContractClass:     receiveContract.contractClass,
+			WindowDelegation:  receiveContract.windowDelegation,
 			TransferKey:       self.transferKey,
 			TransportType:     item.transportType,
 			verifiedClientKey: item.verifiedClientKey,
@@ -18349,9 +18411,10 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	if self.session != nil {
 		appFrames = self.deliverEncryptedControlFrames(item.frames)
 		if item.unwrapped && 0 < len(appFrames) && self.session.RequireEncryption() {
-			// Fail-closed receive gate (EncryptionModeRequired): a plaintext
-			// application frame from a peer for which a session is expected is
-			// never delivered to the application — closing the downgrade where
+			// Fail-closed receive gate (EncryptionModeRequired, or a peer
+			// StickyRequired holds): a plaintext application frame from a peer
+			// for which a session is expected is never delivered to the
+			// application — closing the downgrade where
 			// a peer or on-path attacker strips the wrap and the receiver
 			// accepts the plaintext. The item still advances the sequence and
 			// is acked (ack-and-discard): withholding the ack would gap the
@@ -18375,16 +18438,30 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 		}
 	}
 
+	// A Service source reaches only the subprotocols this client lists. The rest
+	// stops here, ahead of delivery receipts and every callback, so no consumer
+	// has to know the mode: a provider cannot take it for a public source, and
+	// a required receipt cannot cancel the sequence over a frame nothing claims.
+	// The item still advances and is acked (ack-and-discard, as above): a
+	// refused frame has no retry that could change the answer.
+	if peer.ProvideMode == protocol.ProvideMode_Service {
+		appFrames = self.client.admitServiceFrames(appFrames)
+	}
+
 	// buffer for a combined dispatch: a Peer identity change (contract
 	// rotation, or a sealed frame beside a plaintext one) is a batch boundary
 	// because one callback carries one peer
 	peerEqual := func(a Peer, b Peer) bool {
 		return a.ProvideMode == b.ProvideMode &&
 			a.Principal == b.Principal &&
+			a.SourceSubject == b.SourceSubject &&
+			a.SourceNetwork == b.SourceNetwork &&
+			a.ContractClass == b.ContractClass &&
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
 			a.verifiedClientKey == b.verifiedClientKey &&
-			slices.Equal(a.Roles, b.Roles)
+			slices.Equal(a.Roles, b.Roles) &&
+			bytes.Equal(a.WindowDelegation, b.WindowDelegation)
 	}
 	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
 		self.flushDeliver()
@@ -18599,6 +18676,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 			return nil
 		}
 		return errContractExpired
+	}
+	if self.session != nil {
+		self.session.observeContract(nextReceiveContract)
 	}
 
 	// THROUGHPUTFIX §39.1. An announced successor is verified exactly as an
@@ -19134,6 +19214,13 @@ type sequenceContract struct {
 	// network; nil/empty for all other provide modes.
 	roles     []string
 	principal string
+
+	// The seals, from the same signed bytes and honored in every provide mode.
+	// Zero or empty when the contract seals none. See `Peer`.
+	sourceSubject    Id
+	sourceNetwork    Id
+	contractClass    protocol.ContractClass
+	windowDelegation []byte
 }
 
 func newSequenceContract(log Logger, tag string, contract *protocol.Contract, minUpdateByteCount ByteCount, contractFillFraction float32) (*sequenceContract, error) {
@@ -19188,6 +19275,29 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		principal = storedContract.Principal
 	}
 
+	// The seals have no outer copy either, and hold in every provide mode. An
+	// id that is there and malformed refuses the contract, as a malformed
+	// contract id does, rather than read as no subject.
+	sealedId := func(idBytes []byte) (Id, error) {
+		if len(idBytes) == 0 {
+			return Id{}, nil
+		}
+		return IdFromBytes(idBytes)
+	}
+	sourceSubject, err := sealedId(storedContract.SourceSubjectClientId)
+	if err != nil {
+		return nil, fmt.Errorf("Contract source subject malformed: %w", err)
+	}
+	sourceNetwork, err := sealedId(storedContract.SourceNetworkId)
+	if err != nil {
+		return nil, fmt.Errorf("Contract source network malformed: %w", err)
+	}
+	// a class from a later build carries a meaning this one cannot honor
+	contractClass := storedContract.ContractClass
+	if contractClass != ContractClassData && contractClass != ContractClassControl {
+		contractClass = ContractClassUnset
+	}
+
 	return &sequenceContract{
 		log:                                      log,
 		localId:                                  NewId(),
@@ -19207,6 +19317,10 @@ func newSequenceContract(log Logger, tag string, contract *protocol.Contract, mi
 		destinationClientKeySignedTlsCertificate: destinationClientKeySignedTlsCertificate,
 		roles:                                    roles,
 		principal:                                principal,
+		sourceSubject:                            sourceSubject,
+		sourceNetwork:                            sourceNetwork,
+		contractClass:                            contractClass,
+		windowDelegation:                         storedContract.WindowDelegation,
 	}, nil
 }
 

@@ -169,6 +169,8 @@ func TestOperatorClientSettingsCopiesExactlyTheNestedSettingsItOwns(t *testing.T
 		"TransportDelay": true,
 		// read-only: each out-of-band control sync copies it at construction
 		"ControlSyncOobSettings": true,
+		// read-only: the receive path reads the list and never writes it
+		"ServiceSubprotocolIds": true,
 	}
 	isReference := func(kind reflect.Kind) bool {
 		switch kind {
@@ -184,6 +186,7 @@ func TestOperatorClientSettingsCopiesExactlyTheNestedSettingsItOwns(t *testing.T
 	settings := DefaultClientSettings()
 	settings.Log = NewNoopLogger()
 	settings.ClientKeySeed = bytes.Repeat([]byte{7}, ed25519.SeedSize)
+	settings.ServiceSubprotocolIds = []SubprotocolId{SubprotocolReservedLimit}
 	settings.DefaultTransferOpts = TransferOptions{
 		Ack:               false,
 		CompanionContract: true,

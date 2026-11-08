@@ -20,18 +20,22 @@ type p2pSourceFastConn struct {
 	messages chan p2pFastPathReceivedMessage
 }
 
+// Always ready, so the transport reads the fast lane from the start.
 func (self *p2pSourceFastConn) FastPathReady() bool {
 	return true
 }
 
+// Ready without waiting.
 func (self *p2pSourceFastConn) WaitFastPathReady(context.Context, time.Duration) bool {
 	return true
 }
 
+// Discards what the client writes: these tests only inject.
 func (self *p2pSourceFastConn) WriteFastPathMessage([]byte) (int, error) {
 	return 1, nil
 }
 
+// The messages the test injects, read as the carrier's fast lane.
 func (self *p2pSourceFastConn) FastPathMessages() <-chan p2pFastPathReceivedMessage {
 	return self.messages
 }
@@ -118,6 +122,7 @@ func (self *p2pSourceFixture) writeFast(sequence *sourceRuleSequence, frames ...
 	self.fast <- p2pFastPathReceivedMessage{message: wire, fragmentCount: 1}
 }
 
+// Fails the test unless the client refuses a frame within 30 seconds.
 func (self *p2pSourceFixture) requireDrop() {
 	self.t.Helper()
 	select {
@@ -127,6 +132,7 @@ func (self *p2pSourceFixture) requireDrop() {
 	}
 }
 
+// Opts a client in to `ClientSettings.P2pPeerSourceOnly`.
 func requireP2pPeerSourceOnly(settings *ClientSettings) {
 	settings.P2pPeerSourceOnly = true
 }

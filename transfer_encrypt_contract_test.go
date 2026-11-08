@@ -29,6 +29,8 @@ type grantingClientOob struct {
 	// public key, sealed into the contract so the sender can verify the
 	// destination's per-peer-session identity proof (establishing the cipher).
 	destClientPublicKey func(destinationId Id) []byte
+	// the deadline sealed into each contract; nil leaves none
+	contractExpirationUnixMilli func() *int64
 	// Nil observer borrows the scratch immediately before its owned return.
 	beforeStoredContractReturnForTest func([]byte)
 }
@@ -70,6 +72,9 @@ func (self *grantingClientOob) SendControl(frames []*protocol.Frame, callback fu
 		}
 		if self.destClientPublicKey != nil {
 			storedContract.DestinationClientPublicKey = self.destClientPublicKey(destinationId)
+		}
+		if self.contractExpirationUnixMilli != nil {
+			storedContract.ExpirationTimeUnixMilli = self.contractExpirationUnixMilli()
 		}
 		storedContractBytes, err := ProtoMarshal(storedContract)
 		if err != nil {

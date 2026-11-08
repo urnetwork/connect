@@ -144,7 +144,9 @@ func blockActionReason(r SecurityPolicyResult, reason SecurityPolicyReason, bloc
 		return BlockActionReasonSecurityBittorrent
 	case SecurityPolicyReasonCfaaDropPort:
 		return BlockActionReasonSecurityPort
-	case SecurityPolicyReasonCfaaDropIp, SecurityPolicyReasonNotPublic:
+	case SecurityPolicyReasonCfaaDropIp,
+		SecurityPolicyReasonNotPublic,
+		SecurityPolicyReasonSharedAddressSpace:
 		return BlockActionReasonSecurityIp
 	default:
 		return BlockActionReasonSecurity

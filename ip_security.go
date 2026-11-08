@@ -380,9 +380,14 @@ func inspectAndRefreshIngressFallback(
 // enforces on egress. ProvideMode is a set of flags with no ordinal meaning (see
 // its definition in protocol) — this is a per-case decision, never max/min:
 // egress may reach non-public destinations (e.g. a LAN) only under a genuine
-// same-Network relationship on BOTH sides. Anything else, including an
+// same-Network relationship on BOTH sides. Service on either side stays Service,
+// which the policy refuses: it has no ip path at all, so the public rules, which
+// admit public destinations, must never see it. Anything else, including an
 // unspecified None, is treated as Public so the public-destination rules apply.
 func egressRelationship(source, client protocol.ProvideMode) protocol.ProvideMode {
+	if source == protocol.ProvideMode_Service || client == protocol.ProvideMode_Service {
+		return protocol.ProvideMode_Service
+	}
 	if source == protocol.ProvideMode_Network && client == protocol.ProvideMode_Network {
 		return protocol.ProvideMode_Network
 	}
@@ -455,8 +460,22 @@ func (self *securityPolicy) inspectEgressDetailed(
 		return SecurityPolicyResultIncident, securityDecision{}, fmt.Errorf("missing ip path")
 	}
 	result, decision := self.inspectEgressForSenderDetailed(Id{}, provideMode, ipPath, payload)
-	self.stats.addDestinationReason(ipPath, result, decision.reason, 1)
+	self.addDecisionStats(ipPath, result, decision, 1)
 	return result, decision, nil
+}
+
+// Records an egress result, the reason that decided it, and any reason counted
+// beside that one.
+func (self *securityPolicy) addDecisionStats(
+	ipPath *IpPath,
+	result SecurityPolicyResult,
+	decision securityDecision,
+	count uint64,
+) {
+	self.stats.addDestinationReason(ipPath, result, decision.reason, count)
+	if decision.shadowReason != SecurityPolicyReasonUnknown {
+		self.stats.addShadowReason(ipPath, decision.shadowReason, count)
+	}
 }
 
 func (self *securityPolicy) inspectAndRefreshEgressBorrowed(
@@ -474,7 +493,7 @@ func (self *securityPolicy) inspectAndRefreshEgressForSenderBorrowed(
 	payload []byte,
 ) (SecurityPolicyResult, error) {
 	result, decision := self.inspectEgressForSenderDetailed(senderClientId, provideMode, &ipPath, payload)
-	self.stats.addDestinationReason(&ipPath, result, decision.reason, 1)
+	self.addDecisionStats(&ipPath, result, decision, 1)
 	self.dmca.touchEgressForSender(senderClientId, &ipPath)
 	return result, nil
 }
@@ -500,12 +519,20 @@ func (self *securityPolicy) inspectAndRefreshEgressGroupDetailedBorrowed(
 	ipPath := &ipPaths[0]
 	result := SecurityPolicyResultAllow
 	decision := securityDecision{reason: SecurityPolicyReasonNetwork}
-	if provideMode != protocol.ProvideMode_Network {
+	if provideMode == protocol.ProvideMode_Service {
+		result = SecurityPolicyResultIncident
+		decision.reason = SecurityPolicyReasonServiceSource
+	} else if provideMode != protocol.ProvideMode_Network {
+		destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+		drop, shadowReason := self.inspectSharedAddressSpace(destinationIp)
 		if !isPublicUnicast(ipPath.DestinationIp) {
 			result = SecurityPolicyResultIncident
 			decision.reason = SecurityPolicyReasonNotPublic
+		} else if drop {
+			result = SecurityPolicyResultDrop
+			decision.reason = SecurityPolicyReasonSharedAddressSpace
 		} else {
-			destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+			decision.shadowReason = shadowReason
 			verdict, cfaaReason := self.cfaa.inspectReason(
 				destinationIp,
 				ipPath.DestinationPort,
@@ -537,7 +564,7 @@ func (self *securityPolicy) inspectAndRefreshEgressGroupDetailedBorrowed(
 			}
 		}
 	}
-	self.stats.addDestinationReason(ipPath, result, decision.reason, uint64(len(ipPaths)))
+	self.addDecisionStats(ipPath, result, decision, uint64(len(ipPaths)))
 	self.dmca.touchEgress(ipPath)
 	return result, decision, nil
 }
@@ -568,6 +595,15 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 		return SecurityPolicyResultAllow, securityDecision{reason: SecurityPolicyReasonNetwork}
 	}
 
+	// A Service source has no ip path. An incident, not a drop: a drop can still
+	// leave by the local route, under the bypass or an override, and an incident
+	// never does. No flow of any other relationship reaches this, so the rules
+	// generation stays: raising it would demote every older provider for rules
+	// no client's traffic can meet.
+	if protocol.ProvideMode_Service == provideMode {
+		return SecurityPolicyResultIncident, securityDecision{reason: SecurityPolicyReasonServiceSource}
+	}
+
 	// apply public rules:
 	// - only public unicast network destinations
 	// - block insecure or known unencrypted traffic
@@ -575,14 +611,19 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 		return SecurityPolicyResultIncident, securityDecision{reason: SecurityPolicyReasonNotPublic}
 	}
 
+	destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
+	drop, shadowReason := self.inspectSharedAddressSpace(destinationIp)
+	if drop {
+		return SecurityPolicyResultDrop, securityDecision{reason: SecurityPolicyReasonSharedAddressSpace}
+	}
+
 	// static endpoint reputation (blocked ips + port policy) on the destination,
 	// with a v4-mapped v6 destination judged as its v4 address
-	destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
 	switch verdict, cfaaReason := self.cfaa.inspectReason(destinationIp, ipPath.DestinationPort, ipPath.Protocol, destinationVersion); verdict {
 	case cfaaDrop:
-		return SecurityPolicyResultDrop, securityDecision{reason: cfaaReason}
+		return SecurityPolicyResultDrop, securityDecision{reason: cfaaReason, shadowReason: shadowReason}
 	case cfaaAllow:
-		return SecurityPolicyResultAllow, securityDecision{reason: cfaaReason}
+		return SecurityPolicyResultAllow, securityDecision{reason: cfaaReason, shadowReason: shadowReason}
 	default:
 		// No static verdict — run stateful payload DPI. Switch on the verdict so
 		// the policy reads explicitly: a positive BitTorrent signature is reported;
@@ -593,7 +634,7 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 		// Enforcement of each verdict honors the detector settings (log-only,
 		// drop/report toggles), applied by result().
 		v, reason, decidedNow := self.dmca.classifyForSenderDetailed(senderClientId, ipPath, payload)
-		decision := securityDecision{reason: reason, decidedNow: decidedNow}
+		decision := securityDecision{reason: reason, decidedNow: decidedNow, shadowReason: shadowReason}
 		switch v {
 		case dmcaBittorrent:
 			return self.dmca.result(v), decision
@@ -604,6 +645,19 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 			return SecurityPolicyResultAllow, decision
 		}
 	}
+}
+
+// Applies `DropSharedAddressSpace` to a destination the public rules are about to
+// judge, already through policyAddress. Both public-rule paths share it, so what a
+// shadow release counts is what the drop would refuse.
+func (self *securityPolicy) inspectSharedAddressSpace(destinationIp net.IP) (drop bool, shadowReason SecurityPolicyReason) {
+	if !isSharedAddressSpace(destinationIp) {
+		return false, SecurityPolicyReasonUnknown
+	}
+	if self.cfaa.settings.DropSharedAddressSpace {
+		return true, SecurityPolicyReasonUnknown
+	}
+	return false, SecurityPolicyReasonSharedAddressSpace
 }
 
 func (self *securityPolicy) InspectIngress(provideMode protocol.ProvideMode, ipPath *IpPath, payload []byte) (SecurityPolicyResult, error) {
@@ -672,6 +726,11 @@ func (self *securityPolicy) inspectIngress(provideMode protocol.ProvideMode, ipP
 	// (including the p2p range) is not filtered here.
 	if protocol.ProvideMode_Network == provideMode {
 		return SecurityPolicyResultAllow, nil
+	}
+
+	// mirrors the egress refusal: a Service source has no ip path either way
+	if protocol.ProvideMode_Service == provideMode {
+		return SecurityPolicyResultIncident, nil
 	}
 
 	// mirror the egress static drops (blocked ips + port policy), evaluated on the
@@ -905,6 +964,16 @@ func isPublicUnicast(ip net.IP) bool {
 		return false
 	}
 	return true
+}
+
+// Whether an address is in 100.64.0.0/10, the RFC 6598 space that carriers and
+// overlay networks use. An IPv4-mapped v6 address is judged as the v4 address it
+// carries. It is a separate check because isPublicUnicast decides Incidents, which
+// call ReportAbuse: this range stays public there, and is refused only as a Drop
+// (`DropSharedAddressSpace`).
+func isSharedAddressSpace(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64
 }
 
 // isReservedIpv6 lists the v6 prefixes that are never a public unicast
@@ -1192,6 +1261,24 @@ func (self *SecurityPolicyStatsCollector) addDestinationReason(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.addResultWithLock(destination, result, count)
+	self.addReasonWithLock(portDestination, reason, count)
+}
+
+// Counts a reason that decided nothing, so it touches the reason table alone: the
+// packet's result and deciding reason are already counted by addDestinationReason.
+// The reason is keyed by destination port only.
+func (self *SecurityPolicyStatsCollector) addShadowReason(
+	ipPath *IpPath,
+	reason SecurityPolicyReason,
+	count uint64,
+) {
+	if count == 0 {
+		return
+	}
+	portDestination := newSecurityDestinationPort(ipPath)
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
 	self.addReasonWithLock(portDestination, reason, count)
 }
 

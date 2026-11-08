@@ -146,6 +146,12 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 			mode:   protocol.ProvideMode_Public,
 			reason: SecurityPolicyReasonNotPublic,
 		},
+		// the default policy counts this beside the reason that decides it
+		{
+			ipPath: &IpPath{Version: 4, Protocol: IpProtocolTcp, SourceIp: securityFixtureSourceIp, DestinationIp: net.ParseIP("100.64.0.1").To4(), DestinationPort: 8082},
+			mode:   protocol.ProvideMode_Public,
+			reason: SecurityPolicyReasonSharedAddressSpace,
+		},
 	}
 	for _, c := range static {
 		if _, err := policy.InspectEgress(c.mode, c.ipPath, nil); err != nil {
@@ -155,5 +161,18 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 		if count := stats.Reasons(false)[c.reason][portDestination]; count == 0 {
 			t.Errorf("port %d: reason %s not recorded; reasons = %v", c.ipPath.DestinationPort, c.reason, stats.Reasons(false))
 		}
+	}
+
+	// with the drop on, that rule decides the packet
+	dropStats := DefaultSecurityPolicyStatsCollector()
+	cfaaSettings := DefaultCfaaSecurityPolicySettings()
+	cfaaSettings.DropSharedAddressSpace = true
+	dropPolicy := NewSecurityPolicy(ctx, cfaaSettings, DefaultDmcaSecurityPolicySettings(), DefaultWebStandardSettings(), dropStats)
+	ipPath := &IpPath{Version: 4, Protocol: IpProtocolTcp, SourceIp: securityFixtureSourceIp, DestinationIp: net.ParseIP("100.64.0.1").To4(), DestinationPort: 8083}
+	if _, err := dropPolicy.InspectEgress(protocol.ProvideMode_Public, ipPath, nil); err != nil {
+		t.Fatal(err)
+	}
+	if count := dropStats.Reasons(false)[SecurityPolicyReasonSharedAddressSpace][newSecurityDestinationPort(ipPath)]; count != 1 {
+		t.Errorf("drop: reason %s counted %d times; reasons = %v", SecurityPolicyReasonSharedAddressSpace, count, dropStats.Reasons(false))
 	}
 }

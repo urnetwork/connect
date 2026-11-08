@@ -1,6 +1,7 @@
 """Regression checks for the published OpenAPI document (requires PyYAML)."""
 
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -97,8 +98,6 @@ class SpecTest(unittest.TestCase):
         # moves it out of this list when it does.
         expected = {
             "/network/enroll": {"post"},
-            "/network/auth-keys": {"get", "post"},
-            "/network/auth-key-revoke": {"post"},
             "/network/config/projection": {"get", "post"},
             "/network/config/delta": {"post"},
             "/network/config/reseed": {"post"},
@@ -149,6 +148,153 @@ class SpecTest(unittest.TestCase):
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
         self.assertNotIn("bundle", args["properties"])
 
+    def test_tls_routes_are_documented_and_planned(self):
+        # sidecar DESIGN.md §13.15's certificate routes, each with its class: the
+        # order and its status take a service token for audience certs, the rest
+        # a bearer. Each stays planned and out of the public api until certs
+        # serves it, on api's own host. POST /tls/suspend stays a model call, so
+        # it is no path here.
+        expected = {
+            ("/tls/cert-order", "post"): "ServiceTokenAuth",
+            ("/tls/cert-order/{cert_id}", "get"): "ServiceTokenAuth",
+            ("/tls/cert-register", "post"): "BearerAuth",
+            ("/tls/certs", "get"): "BearerAuth",
+            ("/tls/cert-revoke", "post"): "BearerAuth",
+        }
+        methods = {"get", "put", "post", "delete", "patch"}
+        paths = self.spec["paths"]
+        self.assertEqual(
+            {path for path, _ in expected},
+            {path for path in paths if path.startswith("/tls/")},
+        )
+        for (path, method), scheme in expected.items():
+            with self.subTest(path=path, method=method):
+                item = paths[path]
+                self.assertEqual({method}, methods & set(item))
+                self.assertNotIn("servers", item)
+                operation = item[method]
+                self.assertTrue(operation["x-internal"])
+                self.assertEqual("planned", operation["x-status"])
+                self.assertEqual([{scheme: []}], operation["security"])
+        # the bodies' fields are sidecar tls_api.go's JSON names, which its
+        # TestTlsBodiesKeepTheirWireNames pins on that side
+        schemas = self.spec["components"]["schemas"]
+        fields = {
+            "TlsCertOrderArgs": {"csr", "attestation", "replaces"},
+            "TlsCertOrderResult": {"cert_id", "state", "retry_after_ms"},
+            "TlsCertOrderStatus": {"state", "retry_after_ms", "chain", "ari_window_start", "ari_window_end"},
+            "TlsCertsResult": {"certs", "queued_csrs"},
+            "TlsCertRegisterArgs": {"cert_id", "attestation", "chain", "account_uri"},
+            "TlsCertRevokeArgs": {"cert_id", "key_compromise"},
+            "TlsCertRecord": {
+                "cert_id", "network_id", "client_id", "sidecar_id", "identifier_set_sha256",
+                "spki_sha256", "attestation", "csr", "ca", "account_uri", "profile", "serial",
+                "not_before", "not_after", "ari_window_start", "ari_window_end", "state",
+                "successor_cert_id", "chain",
+            },
+        }
+        for name, want in fields.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, set(schemas[name]["properties"]))
+        self.assertEqual(
+            ["queued", "ordering", "waiting_dns", "issued", "failed", "revoking", "revoked", "expired"],
+            schemas["TlsCertState"]["enum"],
+        )
+
+    def test_socket_routes_are_documented_and_planned(self):
+        # sidecar DESIGN.md §9.15's routes, each with its class: the three
+        # Client routes take a client token, and GET /socket/keys is public.
+        # sockets serves them on one host of its own, never api's, so each
+        # stays planned and out of the public api until it does.
+        expected = {
+            ("/socket/registrations", "post"): [{"BearerAuth": []}],
+            ("/socket/find", "post"): [{"BearerAuth": []}],
+            ("/socket/list", "get"): [{"BearerAuth": []}],
+            ("/socket/keys", "get"): [],
+        }
+        methods = {"get", "put", "post", "delete", "patch"}
+        paths = self.spec["paths"]
+        self.assertEqual(
+            {path for path, _ in expected},
+            {path for path in paths if path.startswith("/socket/")},
+        )
+        hosts = set()
+        for (path, method), security in expected.items():
+            with self.subTest(path=path, method=method):
+                item = paths[path]
+                self.assertEqual({method}, methods & set(item))
+                hosts.add(item["servers"][0]["url"])
+                operation = item[method]
+                self.assertTrue(operation["x-internal"])
+                self.assertEqual("planned", operation["x-status"])
+                self.assertEqual(security, operation["security"])
+        # one host of its own, so no path falls back to api's
+        self.assertEqual(1, len(hosts))
+        self.assertFalse(hosts & {server["url"] for server in self.spec["servers"]})
+        # the bodies' fields are sidecar socket_api.go's JSON names, which its
+        # TestSocketRouteBodyNames pins on that side
+        schemas = self.spec["components"]["schemas"]
+        fields = {
+            "SocketRegistrationsArgs": {"set_version", "key_start", "key_end", "registrations"},
+            "SocketRegistration": {
+                "name", "name_token", "sealed_name", "listen_id", "protocol", "version", "alpn",
+                "app_mode", "weight", "max_streams", "exclusive", "affinity", "serving", "draining",
+                "inflight", "claim",
+            },
+            "SocketRegistrationsResult": {
+                "statuses", "set_version", "server_time", "ticket_keys", "urnetwork_edge",
+                "streams_stopped", "error",
+            },
+            "SocketError": {"code", "retry_after_ms"},
+            "SocketTicketKey": {"key_id", "public_key", "expire_time_millis"},
+            "SocketFindArgs": {
+                "name", "name_token", "network_id", "affinity_key", "failed_tickets", "client_ids",
+            },
+            "SocketFailedTicket": {"ticket", "reason"},
+            "SocketFindTicket": {"ticket", "claim"},
+            "SocketFindResult": {"primary", "backup", "error"},
+            "SocketListName": {"name", "name_token", "sealed_name"},
+            "SocketListResult": {"names", "next_cursor", "error"},
+            "SocketKeysResult": {"keys"},
+        }
+        for name, want in fields.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, set(schemas[name]["properties"]))
+        enums = {
+            "SocketRegistrationStatus": ["ok", "revoked", "denied", "taken", "invalid"],
+            "SocketErrorCode": [
+                "no_listener", "busy", "denied", "quota", "unavailable", "stale", "invalid",
+            ],
+            "SocketFailedReason": ["timeout", "refused"],
+        }
+        for name, want in enums.items():
+            with self.subTest(schema=name):
+                self.assertEqual(want, schemas[name]["enum"])
+        # a dial's protocol, version and ALPN stay off the wire until the
+        # metadata list names them for Find (plan-SOCK-metadata-rows)
+        self.assertFalse(
+            {"protocol", "min_version", "alpn"} & set(schemas["SocketFindArgs"]["properties"])
+        )
+
+    def test_auth_key_routes_are_served(self):
+        # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
+        # the network credential's (403 for a client token), and the bundle never
+        # a field of any of them
+        paths = self.spec["paths"]
+        schemas = self.spec["components"]["schemas"]
+        for path, methods in {"/network/auth-keys": {"get", "post"}, "/network/auth-key-revoke": {"post"}}.items():
+            for method in methods:
+                with self.subTest(path=path, method=method):
+                    operation = paths[path][method]
+                    self.assertNotIn("x-status", operation)
+                    self.assertNotIn("x-internal", operation)
+                    self.assertEqual([{"BearerAuth": []}], operation["security"])
+                    self.assertEqual("#/components/responses/ClientJwtRefused", operation["responses"]["403"]["$ref"])
+        self.assertEqual({"bundle_still_admits", "note", "error"}, set(schemas["NetworkAuthKeyRevokeResult"]["properties"]))
+        for name in ("NetworkAuthKey", "NetworkAuthKeyCreateArgs", "NetworkAuthKeyCreateResult", "NetworkAuthKeyRevokeResult"):
+            self.assertNotIn("bundle", schemas[name]["properties"])
+        self.assertLessEqual({"scopes", "duration_seconds"}, set(schemas["CreateApiKeyArgs"]["properties"]))
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):
@@ -178,19 +324,22 @@ class GkmRoutesTest(unittest.TestCase):
         "/gkm/key-packages/claim": {"post"},
         "/gkm/reader-key": {"post"},
         "/gkm/reader-key/{sidecar_id}": {"get"},
+        "/gkm/reader-keys": {"post"},
         "/gkm/groups": {"post"},
         "/gkm/groups/{group_id}": {"get"},
-        "/gkm/repos/{repo_id}/forms": {"post"},
+        "/gkm/repos/{repo_id}/forms": {"get", "post"},
+        "/gkm/repos/{repo_id}/drop-key": {"get"},
         "/gkm/groups/{group_id}/epochs": {"get"},
         "/gkm/groups/{group_id}/epochs/{n}": {"post"},
         "/gkm/groups/{group_id}/gen": {"get"},
         "/gkm/groups/{group_id}/gen/{g}": {"post"},
         "/gkm/groups/{group_id}/wraps/{g}": {"get"},
         "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"post"},
+        "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"post"},
+        "/gkm/groups/{group_id}/ladder": {"post"},
         "/gkm/groups/{group_id}/welcome/{n}": {"post"},
         "/gkm/groups/{group_id}/group-info": {"get", "post"},
         "/gkm/groups/{group_id}/ack": {"post"},
-        "/gkm/groups/{group_id}/drop-key": {"get"},
         "/gkm/welcomes": {"get"},
         "/gkm/recovery/{member_id}/wraps": {"get", "post", "delete"},
     }
@@ -214,18 +363,48 @@ class GkmRoutesTest(unittest.TestCase):
         lines = [f'\t"{method.upper()} {path}",' for method, path in self.operations(True)]
         return "\n".join(["var routes = []string{", *lines, "}"])
 
-    def check_routes(self, table=None, api_routes=()):
+    def table_without(self, route):
+        """table() less one "METHOD /path" route."""
+        table = self.table()
+        line = f'\t"{route}",\n'
+        self.assertIn(line, table)
+        return table.replace(line, "")
+
+    def unplanned(self, method, path):
+        """bringyour.yml's text with one operation's planned mark lifted, as the
+        task that serves it lifts it."""
+        text = Path(__file__).with_name("bringyour.yml").read_text()
+        start = text.index(f"\n  {path}:\n")
+        end = text.index("\n  /", start + 1)
+        operation = text.index(f"\n    {method}:\n", start, end)
+        mark = "\n      x-status: planned\n"
+        at = text.index(mark, operation, end)
+        return text[:at] + text[at + len(mark) - 1 :]
+
+    def check_routes(self, table=None, api_routes=(), spec=None, symlinked=False, competition=None):
         """check-routes.sh on a fixture beside a routes.go of table, or none, whose
-        api serves the rest of the spec and api_routes."""
+        api serves the rest of the spec and api_routes. A spec given is the
+        bringyour.yml the script reads in place of this one. A symlinked server
+        links to a checkout elsewhere, as a track's does, its siblings still
+        beside the link, and competition is the sn/api/competition.yml there."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        (root / "server/api").mkdir(parents=True)
+        script = self.script
+        if spec is not None:
+            (root / "connect/api").mkdir(parents=True)
+            script = root / "connect/api" / self.script.name
+            shutil.copy(self.script, script)
+            (root / "connect/api/bringyour.yml").write_text(spec)
+        server = root / "checkout/server" if symlinked else root / "server"
+        (server / "api").mkdir(parents=True)
+        if symlinked:
+            (root / "server").symlink_to(server, target_is_directory=True)
         registered = [
             (method.upper(), re.sub(r"{[^}]*}", "([^/]+)", path))
             for method, path in self.operations(False)
         ]
-        (root / "server/api/api.go").write_text(
+        (server / "api/api.go").write_text(
             "\n".join(
                 f'router.NewRoute("{method}", "{path}", handler)'
                 for method, path in [*registered, *api_routes]
@@ -234,8 +413,11 @@ class GkmRoutesTest(unittest.TestCase):
         if table is not None:
             (root / "sidecar/gkmservice").mkdir(parents=True)
             (root / "sidecar/gkmservice/routes.go").write_text(table)
+        if competition is not None:
+            (root / "sn/api").mkdir(parents=True)
+            (root / "sn/api/competition.yml").write_text(competition)
         return subprocess.run(
-            ["zsh", str(self.script), str(root / "server")], capture_output=True, text=True
+            ["zsh", str(script), str(root / "server")], capture_output=True, text=True
         )
 
     def test_every_route_is_documented_planned_and_on_gkms_own_host(self):
@@ -263,11 +445,57 @@ class GkmRoutesTest(unittest.TestCase):
                 for body in bodies:
                     self.assertLessEqual(set(body.get("content", {})), {"application/octet-stream"})
 
+    def description(self, method, path):
+        """An operation's description on one line."""
+        return " ".join(self.spec["paths"][path][method]["description"].split())
+
+    def test_only_drop_key_takes_a_deposit_only_token(self):
+        # QD-177: a token whose only repo scopes are deposit reaches GET drop-key
+        # and nothing else at gkm, so every other route asks for r, rw or admin
+        for method, path in self.operations(True):
+            description = self.description(method, path)
+            with self.subTest(path=path, method=method):
+                if (method, path) == ("get", "/gkm/repos/{repo_id}/drop-key"):
+                    self.assertIn("`deposit`", description)
+                else:
+                    self.assertNotIn("`deposit`", description)
+                    self.assertRegex(description, r"`(r|rw|admin)`")
+
+    def test_a_reform_files_its_epoch_zero_with_its_form(self):
+        # 10.6's checks: a re-form writes the GroupForm, epoch 0, ladder and first
+        # wraps. Only the forms route can carry that epoch 0: POST /gkm/groups is
+        # creation's, and an epoch POST needs the epoch before it
+        description = self.description("post", "/gkm/repos/{repo_id}/forms")
+        self.assertTrue(description.startswith("A `GkmGroupReformRequest`"), description)
+        self.assertIn("epoch 0", description)
+
+    def test_a_deleted_reseed_takes_the_form_and_the_ladder(self):
+        # 10.8: a repo re-seeded as deleted takes only its GroupForm, with its
+        # epoch 0 and ladder. QD-074 opens the ladder to every re-form, a stalled
+        # group's and an IANA renumbering's too, and to that one in re-seed mode
+        taking = {
+            (method, path)
+            for method, path in self.operations(True)
+            if "re-seeded as deleted" in self.description(method, path)
+        }
+        self.assertEqual(
+            {("post", "/gkm/repos/{repo_id}/forms"), ("post", "/gkm/groups/{group_id}/ladder")}, taking
+        )
+        self.assertIn("Open to every re-form", self.description("post", "/gkm/groups/{group_id}/ladder"))
+
+    def test_a_recovery_wraps_412_names_its_unsigned_winner(self):
+        # QD-468: a RecoveryWrap is unsigned, bare enc || ct, so the winner its
+        # 412 carries cannot be the wraps route's Signed delivery
+        responses = self.spec["paths"]["/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}"]["post"]["responses"]
+        self.assertIn("bare ciphertext", responses["200"]["description"])
+
     def test_statuses_are_the_designs(self):
+        # a wrap's own 201, 412 and 409 ride its batch's 200
         for path, want in {
             "/gkm/groups/{group_id}/epochs/{n}": {"200", "403", "409", "429"},
             "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "412", "429"},
-            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"201", "403", "409", "412", "429"},
+            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"200", "403", "429"},
+            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"200", "403", "429"},
         }.items():
             with self.subTest(path=path):
                 self.assertEqual(want, set(self.spec["paths"][path]["post"]["responses"]))
@@ -276,7 +504,6 @@ class GkmRoutesTest(unittest.TestCase):
         for path, status in (
             ("/gkm/groups/{group_id}/epochs/{n}", "409"),
             ("/gkm/groups/{group_id}/gen/{g}", "412"),
-            ("/gkm/groups/{group_id}/wraps/{g}/{c8}", "412"),
         ):
             with self.subTest(path=path):
                 response = self.spec["paths"][path]["post"]["responses"][status]
@@ -294,26 +521,54 @@ class GkmRoutesTest(unittest.TestCase):
         count = len(self.operations(True))
         self.assertIn(f"gkm: {count} routes in gkmservice's table, {count} documented", result.stdout)
 
-    def test_check_routes_refuses_a_documented_route_the_table_lacks(self):
-        lines = self.table().splitlines()
-        dropped = lines.pop(1)
-        result = self.check_routes("\n".join(lines))
+    def test_check_routes_lets_a_planned_route_wait(self):
+        # gkmservice's table grows a task at a time, as api's does
+        result = self.check_routes(self.table_without("POST /gkm/groups/{group_id}/ack"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        count = len(self.operations(True))
+        self.assertIn(f"gkm: {count - 1} routes in gkmservice's table, {count} documented", result.stdout)
+
+    def test_check_routes_refuses_a_served_route_the_table_lacks(self):
+        result = self.check_routes(
+            self.table_without("POST /gkm/groups/{group_id}/ack"),
+            spec=self.unplanned("post", "/gkm/groups/{group_id}/ack"),
+        )
         self.assertEqual(1, result.returncode)
         self.assertIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
-        self.assertIn(re.sub(r"{[^}]*}", "*", dropped.strip(' \t",')), result.stderr)
+        self.assertIn("POST /gkm/groups/*/ack", result.stderr)
 
     def test_check_routes_refuses_a_table_route_the_spec_lacks(self):
-        table = self.table().replace("}", '\t"GET /gkm/undocumented",\n}')
+        table = self.table().removesuffix("}") + '\t"GET /gkm/undocumented",\n}'
         result = self.check_routes(table)
         self.assertEqual(1, result.returncode)
         self.assertIn("in gkmservice's route table but NOT in bringyour.yml", result.stderr)
         self.assertIn("GET /gkm/undocumented", result.stderr)
+        self.assertNotIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
 
     def test_check_routes_refuses_a_table_it_cannot_read(self):
         # a table in another shape must not pass by naming no route
         result = self.check_routes("var routes = []route{}")
         self.assertEqual(1, result.returncode)
-        self.assertIn("in bringyour.yml but NOT in gkmservice's route table", result.stderr)
+        self.assertIn("gkmservice's route table names no route", result.stderr)
+
+    def test_check_routes_reads_the_table_beside_a_symlinked_server(self):
+        # a track's server links to the main checkout, and the track's own sidecar
+        # sits beside the link, not beside its target
+        result = self.check_routes("var routes = []route{}", symlinked=True)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("gkmservice's route table names no route", result.stderr)
+        result = self.check_routes(self.table(), symlinked=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+        count = len(self.operations(True))
+        self.assertIn(f"gkm: {count} routes in gkmservice's table, {count} documented", result.stdout)
+
+    def test_check_routes_reads_competition_beside_a_symlinked_server(self):
+        # the same lookup finds sn/api/competition.yml
+        competition = "paths:\n  /competition/info:\n    get:\n      summary: Read\n"
+        result = self.check_routes(self.table(), symlinked=True, competition=competition)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("in sn/api/competition.yml but NOT registered", result.stderr)
+        self.assertIn("GET /competition/info", result.stderr)
 
     def test_check_routes_refuses_a_gkm_route_api_registers(self):
         result = self.check_routes(self.table(), api_routes=[("GET", "/gkm/welcomes")])

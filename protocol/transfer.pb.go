@@ -100,6 +100,9 @@ const (
 	ProvideMode_Public           ProvideMode = 3
 	ProvideMode_Stream           ProvideMode = 4
 	ProvideMode_PublicStream     ProvideMode = 5
+	// A platform service's edge stream: subprotocol frames only, and only the
+	// ids the receiver lists. It carries no IP, no escrow and no payout.
+	ProvideMode_Service ProvideMode = 6
 )
 
 // Enum value maps for ProvideMode.
@@ -111,6 +114,7 @@ var (
 		3: "Public",
 		4: "Stream",
 		5: "PublicStream",
+		6: "Service",
 	}
 	ProvideMode_value = map[string]int32{
 		"None":             0,
@@ -119,6 +123,7 @@ var (
 		"Public":           3,
 		"Stream":           4,
 		"PublicStream":     5,
+		"Service":          6,
 	}
 )
 
@@ -267,6 +272,62 @@ func (ContractError) EnumDescriptor() ([]byte, []int) {
 	return file_transfer_proto_rawDescGZIP(), []int{3}
 }
 
+// What a contract may carry, sealed in `StoredContract.contract_class`.
+type ContractClass int32
+
+const (
+	// Nothing classed this contract, as with every contract older than the
+	// class. A receiver reads it as the narrowest class. So does a value this
+	// build does not know.
+	ContractClass_ContractClassUnset ContractClass = 0
+	// Whatever the provide mode allows.
+	ContractClass_ContractClassData ContractClass = 1
+	// Only witnessing and remote search between two admitted sidecars of one
+	// network, with no IP, for a pair no reach grant covers.
+	ContractClass_ContractClassControl ContractClass = 2
+)
+
+// Enum value maps for ContractClass.
+var (
+	ContractClass_name = map[int32]string{
+		0: "ContractClassUnset",
+		1: "ContractClassData",
+		2: "ContractClassControl",
+	}
+	ContractClass_value = map[string]int32{
+		"ContractClassUnset":   0,
+		"ContractClassData":    1,
+		"ContractClassControl": 2,
+	}
+)
+
+func (x ContractClass) Enum() *ContractClass {
+	p := new(ContractClass)
+	*p = x
+	return p
+}
+
+func (x ContractClass) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ContractClass) Descriptor() protoreflect.EnumDescriptor {
+	return file_transfer_proto_enumTypes[4].Descriptor()
+}
+
+func (ContractClass) Type() protoreflect.EnumType {
+	return &file_transfer_proto_enumTypes[4]
+}
+
+func (x ContractClass) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ContractClass.Descriptor instead.
+func (ContractClass) EnumDescriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{4}
+}
+
 type EncryptedControlType int32
 
 const (
@@ -342,11 +403,11 @@ func (x EncryptedControlType) String() string {
 }
 
 func (EncryptedControlType) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[4].Descriptor()
+	return file_transfer_proto_enumTypes[5].Descriptor()
 }
 
 func (EncryptedControlType) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[4]
+	return &file_transfer_proto_enumTypes[5]
 }
 
 func (x EncryptedControlType) Number() protoreflect.EnumNumber {
@@ -355,7 +416,7 @@ func (x EncryptedControlType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use EncryptedControlType.Descriptor instead.
 func (EncryptedControlType) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{4}
+	return file_transfer_proto_rawDescGZIP(), []int{5}
 }
 
 type ResidentMoveKind int32
@@ -394,11 +455,11 @@ func (x ResidentMoveKind) String() string {
 }
 
 func (ResidentMoveKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[5].Descriptor()
+	return file_transfer_proto_enumTypes[6].Descriptor()
 }
 
 func (ResidentMoveKind) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[5]
+	return &file_transfer_proto_enumTypes[6]
 }
 
 func (x ResidentMoveKind) Number() protoreflect.EnumNumber {
@@ -407,7 +468,7 @@ func (x ResidentMoveKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ResidentMoveKind.Descriptor instead.
 func (ResidentMoveKind) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{5}
+	return file_transfer_proto_rawDescGZIP(), []int{6}
 }
 
 type ResidentMoveOutcome int32
@@ -440,11 +501,11 @@ func (x ResidentMoveOutcome) String() string {
 }
 
 func (ResidentMoveOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[6].Descriptor()
+	return file_transfer_proto_enumTypes[7].Descriptor()
 }
 
 func (ResidentMoveOutcome) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[6]
+	return &file_transfer_proto_enumTypes[7]
 }
 
 func (x ResidentMoveOutcome) Number() protoreflect.EnumNumber {
@@ -453,7 +514,7 @@ func (x ResidentMoveOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ResidentMoveOutcome.Descriptor instead.
 func (ResidentMoveOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{6}
+	return file_transfer_proto_rawDescGZIP(), []int{7}
 }
 
 type ResidentMoveReason int32
@@ -519,11 +580,11 @@ func (x ResidentMoveReason) String() string {
 }
 
 func (ResidentMoveReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_transfer_proto_enumTypes[7].Descriptor()
+	return file_transfer_proto_enumTypes[8].Descriptor()
 }
 
 func (ResidentMoveReason) Type() protoreflect.EnumType {
-	return &file_transfer_proto_enumTypes[7]
+	return &file_transfer_proto_enumTypes[8]
 }
 
 func (x ResidentMoveReason) Number() protoreflect.EnumNumber {
@@ -532,7 +593,7 @@ func (x ResidentMoveReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ResidentMoveReason.Descriptor instead.
 func (ResidentMoveReason) EnumDescriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{7}
+	return file_transfer_proto_rawDescGZIP(), []int{8}
 }
 
 type TransferPath struct {
@@ -2161,9 +2222,15 @@ type CreateContract struct {
 	// contract. This is diagnostic capability metadata only: it does not
 	// select or alter a route, contract, or encryption session. Presence
 	// proves the sender can report the lane; absence remains unknown.
-	SenderRole    *SequenceRole `protobuf:"varint,9,opt,name=sender_role,json=senderRole,proto3,enum=bringyour.SequenceRole,oneof" json:"sender_role,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SenderRole *SequenceRole `protobuf:"varint,9,opt,name=sender_role,json=senderRole,proto3,enum=bringyour.SequenceRole,oneof" json:"sender_role,omitempty"`
+	// A window client's signed `WindowDelegation`, opaque here. The platform
+	// copies these bytes unchanged into `StoredContract.window_delegation`.
+	// Empty on a companion request, whose contract inherits the forward
+	// contract's seals, and on every request from a client that holds no
+	// delegation.
+	WindowDelegation []byte `protobuf:"bytes,10,opt,name=window_delegation,json=windowDelegation,proto3" json:"window_delegation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *CreateContract) Reset() {
@@ -2250,6 +2317,13 @@ func (x *CreateContract) GetSenderRole() SequenceRole {
 		return *x.SenderRole
 	}
 	return SequenceRole_SequenceRoleUnknown
+}
+
+func (x *CreateContract) GetWindowDelegation() []byte {
+	if x != nil {
+		return x.WindowDelegation
+	}
+	return nil
 }
 
 type CreateContractResult struct {
@@ -2468,8 +2542,20 @@ type StoredContract struct {
 	// Missing preserves legacy contracts without a time limit. At or after
 	// this Unix millisecond timestamp no new transfer bytes may be debited.
 	ExpirationTimeUnixMilli *int64 `protobuf:"varint,12,opt,name=expiration_time_unix_milli,json=expirationTimeUnixMilli,proto3,oneof" json:"expiration_time_unix_milli,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// ulid
+	// The subject the platform has stored for the source client: its
+	// `network_client.acl_subject_client_id`, or the source client itself when
+	// that is null.
+	SourceSubjectClientId []byte `protobuf:"bytes,13,opt,name=source_subject_client_id,json=sourceSubjectClientId,proto3,oneof" json:"source_subject_client_id,omitempty"`
+	// ulid
+	// The source client's network.
+	SourceNetworkId []byte        `protobuf:"bytes,14,opt,name=source_network_id,json=sourceNetworkId,proto3,oneof" json:"source_network_id,omitempty"`
+	ContractClass   ContractClass `protobuf:"varint,15,opt,name=contract_class,json=contractClass,proto3,enum=bringyour.ContractClass" json:"contract_class,omitempty"`
+	// The source window client's `CreateContract.window_delegation`, unchanged.
+	// Empty for any other client.
+	WindowDelegation []byte `protobuf:"bytes,16,opt,name=window_delegation,json=windowDelegation,proto3" json:"window_delegation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *StoredContract) Reset() {
@@ -2584,6 +2670,34 @@ func (x *StoredContract) GetExpirationTimeUnixMilli() int64 {
 		return *x.ExpirationTimeUnixMilli
 	}
 	return 0
+}
+
+func (x *StoredContract) GetSourceSubjectClientId() []byte {
+	if x != nil {
+		return x.SourceSubjectClientId
+	}
+	return nil
+}
+
+func (x *StoredContract) GetSourceNetworkId() []byte {
+	if x != nil {
+		return x.SourceNetworkId
+	}
+	return nil
+}
+
+func (x *StoredContract) GetContractClass() ContractClass {
+	if x != nil {
+		return x.ContractClass
+	}
+	return ContractClass_ContractClassUnset
+}
+
+func (x *StoredContract) GetWindowDelegation() []byte {
+	if x != nil {
+		return x.WindowDelegation
+	}
+	return nil
 }
 
 // control message
@@ -3685,7 +3799,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\x03sdp\x18\x04 \x01(\fH\x00R\x03sdp\x88\x01\x01\x12(\n" +
 	"\rice_candidate\x18\x05 \x01(\fH\x01R\ficeCandidate\x88\x01\x01B\x06\n" +
 	"\x04_sdpB\x10\n" +
-	"\x0e_ice_candidate\"\xcc\x03\n" +
+	"\x0e_ice_candidate\"\xf9\x03\n" +
 	"\x0eCreateContract\x12*\n" +
 	"\x0edestination_id\x18\x01 \x01(\fH\x00R\rdestinationId\x88\x01\x01\x12.\n" +
 	"\x13transfer_byte_count\x18\x02 \x01(\x04R\x11transferByteCount\x12\x1c\n" +
@@ -3695,7 +3809,9 @@ const file_transfer_proto_rawDesc = "" +
 	"\fforce_stream\x18\a \x01(\bH\x01R\vforceStream\x88\x01\x01\x12*\n" +
 	"\x0estream_version\x18\b \x01(\rH\x02R\rstreamVersion\x88\x01\x01\x12=\n" +
 	"\vsender_role\x18\t \x01(\x0e2\x17.bringyour.SequenceRoleH\x03R\n" +
-	"senderRole\x88\x01\x01B\x11\n" +
+	"senderRole\x88\x01\x01\x12+\n" +
+	"\x11window_delegation\x18\n" +
+	" \x01(\fR\x10windowDelegationB\x11\n" +
 	"\x0f_destination_idB\x0f\n" +
 	"\r_force_streamB\x11\n" +
 	"\x0f_stream_versionB\x0e\n" +
@@ -3713,7 +3829,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
 	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
 	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
-	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x9f\x05\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\xaf\a\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -3728,14 +3844,20 @@ const file_transfer_proto_rawDesc = "" +
 	"\x05roles\x18\n" +
 	" \x03(\tR\x05roles\x12\x1c\n" +
 	"\tprincipal\x18\v \x01(\tR\tprincipal\x12@\n" +
-	"\x1aexpiration_time_unix_milli\x18\f \x01(\x03H\x04R\x17expirationTimeUnixMilli\x88\x01\x01B\f\n" +
+	"\x1aexpiration_time_unix_milli\x18\f \x01(\x03H\x04R\x17expirationTimeUnixMilli\x88\x01\x01\x12<\n" +
+	"\x18source_subject_client_id\x18\r \x01(\fH\x05R\x15sourceSubjectClientId\x88\x01\x01\x12/\n" +
+	"\x11source_network_id\x18\x0e \x01(\fH\x06R\x0fsourceNetworkId\x88\x01\x01\x12?\n" +
+	"\x0econtract_class\x18\x0f \x01(\x0e2\x18.bringyour.ContractClassR\rcontractClass\x12+\n" +
+	"\x11window_delegation\x18\x10 \x01(\fR\x10windowDelegationB\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_idB\f\n" +
 	"\n" +
 	"_stream_idB\v\n" +
 	"\t_priorityB\x1d\n" +
-	"\x1b_expiration_time_unix_milli\"\x9d\x02\n" +
+	"\x1b_expiration_time_unix_milliB\x1b\n" +
+	"\x19_source_subject_client_idB\x14\n" +
+	"\x12_source_network_id\"\x9d\x02\n" +
 	"\rCloseContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12(\n" +
@@ -3811,7 +3933,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\fSequenceRole\x12\x17\n" +
 	"\x13SequenceRoleUnknown\x10\x00\x12\x16\n" +
 	"\x12SequenceRoleClient\x10\x01\x12\x16\n" +
-	"\x12SequenceRoleServer\x10\x02*d\n" +
+	"\x12SequenceRoleServer\x10\x02*q\n" +
 	"\vProvideMode\x12\b\n" +
 	"\x04None\x10\x00\x12\v\n" +
 	"\aNetwork\x10\x01\x12\x14\n" +
@@ -3820,7 +3942,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\x06Public\x10\x03\x12\n" +
 	"\n" +
 	"\x06Stream\x10\x04\x12\x10\n" +
-	"\fPublicStream\x10\x05*a\n" +
+	"\fPublicStream\x10\x05\x12\v\n" +
+	"\aService\x10\x06*a\n" +
 	"\n" +
 	"SignalType\x12\f\n" +
 	"\bNoSignal\x10\x00\x12\f\n" +
@@ -3834,7 +3957,11 @@ const file_transfer_proto_rawDesc = "" +
 	"\x05Setup\x10\x02\x12\t\n" +
 	"\x05Trust\x10\x03\x12\v\n" +
 	"\aInvalid\x10\x04\x12\x0f\n" +
-	"\vReliability\x10\x05*\x97\x01\n" +
+	"\vReliability\x10\x05*X\n" +
+	"\rContractClass\x12\x16\n" +
+	"\x12ContractClassUnset\x10\x00\x12\x15\n" +
+	"\x11ContractClassData\x10\x01\x12\x18\n" +
+	"\x14ContractClassControl\x10\x02*\x97\x01\n" +
 	"\x14EncryptedControlType\x12\x18\n" +
 	"\x14EncryptedControlNone\x10\x00\x12\x1d\n" +
 	"\x19EncryptedControlHandshake\x10\x01\x12!\n" +
@@ -3875,91 +4002,93 @@ func file_transfer_proto_rawDescGZIP() []byte {
 	return file_transfer_proto_rawDescData
 }
 
-var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
 var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_transfer_proto_goTypes = []any{
 	(SequenceRole)(0),              // 0: bringyour.SequenceRole
 	(ProvideMode)(0),               // 1: bringyour.ProvideMode
 	(SignalType)(0),                // 2: bringyour.SignalType
 	(ContractError)(0),             // 3: bringyour.ContractError
-	(EncryptedControlType)(0),      // 4: bringyour.EncryptedControlType
-	(ResidentMoveKind)(0),          // 5: bringyour.ResidentMoveKind
-	(ResidentMoveOutcome)(0),       // 6: bringyour.ResidentMoveOutcome
-	(ResidentMoveReason)(0),        // 7: bringyour.ResidentMoveReason
-	(*TransferPath)(nil),           // 8: bringyour.TransferPath
-	(*TransferFrame)(nil),          // 9: bringyour.TransferFrame
-	(*FilteredTransferFrame)(nil),  // 10: bringyour.FilteredTransferFrame
-	(*Pack)(nil),                   // 11: bringyour.Pack
-	(*FilteredPack)(nil),           // 12: bringyour.FilteredPack
-	(*Ack)(nil),                    // 13: bringyour.Ack
-	(*Tag)(nil),                    // 14: bringyour.Tag
-	(*Auth)(nil),                   // 15: bringyour.Auth
-	(*Provide)(nil),                // 16: bringyour.Provide
-	(*ProvideKey)(nil),             // 17: bringyour.ProvideKey
-	(*StreamOpen)(nil),             // 18: bringyour.StreamOpen
-	(*StreamClose)(nil),            // 19: bringyour.StreamClose
-	(*StreamReset)(nil),            // 20: bringyour.StreamReset
-	(*CloseSequences)(nil),         // 21: bringyour.CloseSequences
-	(*NetworkPeer)(nil),            // 22: bringyour.NetworkPeer
-	(*NetworkPeersReset)(nil),      // 23: bringyour.NetworkPeersReset
-	(*NetworkPeersUpdate)(nil),     // 24: bringyour.NetworkPeersUpdate
-	(*ExchangeSignals)(nil),        // 25: bringyour.ExchangeSignals
-	(*ExchangeSignal)(nil),         // 26: bringyour.ExchangeSignal
-	(*CreateContract)(nil),         // 27: bringyour.CreateContract
-	(*CreateContractResult)(nil),   // 28: bringyour.CreateContractResult
-	(*Contract)(nil),               // 29: bringyour.Contract
-	(*StoredContract)(nil),         // 30: bringyour.StoredContract
-	(*CloseContract)(nil),          // 31: bringyour.CloseContract
-	(*PeerAudit)(nil),              // 32: bringyour.PeerAudit
-	(*ControlPing)(nil),            // 33: bringyour.ControlPing
-	(*ProvidePing)(nil),            // 34: bringyour.ProvidePing
-	(*EncryptedKey)(nil),           // 35: bringyour.EncryptedKey
-	(*ClientKey)(nil),              // 36: bringyour.ClientKey
-	(*EncryptedControl)(nil),       // 37: bringyour.EncryptedControl
-	(*ResidentMigrate)(nil),        // 38: bringyour.ResidentMigrate
-	(*ResidentMoveTarget)(nil),     // 39: bringyour.ResidentMoveTarget
-	(*ResidentMoveResult)(nil),     // 40: bringyour.ResidentMoveResult
-	(*NetworkSessionsChanged)(nil), // 41: bringyour.NetworkSessionsChanged
-	(*StreamAuthorization)(nil),    // 42: bringyour.StreamAuthorization
-	(*Frame)(nil),                  // 43: bringyour.Frame
-	(MessageType)(0),               // 44: bringyour.MessageType
+	(ContractClass)(0),             // 4: bringyour.ContractClass
+	(EncryptedControlType)(0),      // 5: bringyour.EncryptedControlType
+	(ResidentMoveKind)(0),          // 6: bringyour.ResidentMoveKind
+	(ResidentMoveOutcome)(0),       // 7: bringyour.ResidentMoveOutcome
+	(ResidentMoveReason)(0),        // 8: bringyour.ResidentMoveReason
+	(*TransferPath)(nil),           // 9: bringyour.TransferPath
+	(*TransferFrame)(nil),          // 10: bringyour.TransferFrame
+	(*FilteredTransferFrame)(nil),  // 11: bringyour.FilteredTransferFrame
+	(*Pack)(nil),                   // 12: bringyour.Pack
+	(*FilteredPack)(nil),           // 13: bringyour.FilteredPack
+	(*Ack)(nil),                    // 14: bringyour.Ack
+	(*Tag)(nil),                    // 15: bringyour.Tag
+	(*Auth)(nil),                   // 16: bringyour.Auth
+	(*Provide)(nil),                // 17: bringyour.Provide
+	(*ProvideKey)(nil),             // 18: bringyour.ProvideKey
+	(*StreamOpen)(nil),             // 19: bringyour.StreamOpen
+	(*StreamClose)(nil),            // 20: bringyour.StreamClose
+	(*StreamReset)(nil),            // 21: bringyour.StreamReset
+	(*CloseSequences)(nil),         // 22: bringyour.CloseSequences
+	(*NetworkPeer)(nil),            // 23: bringyour.NetworkPeer
+	(*NetworkPeersReset)(nil),      // 24: bringyour.NetworkPeersReset
+	(*NetworkPeersUpdate)(nil),     // 25: bringyour.NetworkPeersUpdate
+	(*ExchangeSignals)(nil),        // 26: bringyour.ExchangeSignals
+	(*ExchangeSignal)(nil),         // 27: bringyour.ExchangeSignal
+	(*CreateContract)(nil),         // 28: bringyour.CreateContract
+	(*CreateContractResult)(nil),   // 29: bringyour.CreateContractResult
+	(*Contract)(nil),               // 30: bringyour.Contract
+	(*StoredContract)(nil),         // 31: bringyour.StoredContract
+	(*CloseContract)(nil),          // 32: bringyour.CloseContract
+	(*PeerAudit)(nil),              // 33: bringyour.PeerAudit
+	(*ControlPing)(nil),            // 34: bringyour.ControlPing
+	(*ProvidePing)(nil),            // 35: bringyour.ProvidePing
+	(*EncryptedKey)(nil),           // 36: bringyour.EncryptedKey
+	(*ClientKey)(nil),              // 37: bringyour.ClientKey
+	(*EncryptedControl)(nil),       // 38: bringyour.EncryptedControl
+	(*ResidentMigrate)(nil),        // 39: bringyour.ResidentMigrate
+	(*ResidentMoveTarget)(nil),     // 40: bringyour.ResidentMoveTarget
+	(*ResidentMoveResult)(nil),     // 41: bringyour.ResidentMoveResult
+	(*NetworkSessionsChanged)(nil), // 42: bringyour.NetworkSessionsChanged
+	(*StreamAuthorization)(nil),    // 43: bringyour.StreamAuthorization
+	(*Frame)(nil),                  // 44: bringyour.Frame
+	(MessageType)(0),               // 45: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
-	8,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	43, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	44, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
-	11, // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
-	13, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
+	9,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	44, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	45, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	12, // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
+	14, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
 	0,  // 5: bringyour.TransferFrame.session_role:type_name -> bringyour.SequenceRole
-	8,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	43, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
-	43, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
-	14, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
-	43, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
-	14, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
-	17, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
+	9,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
+	44, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	44, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	15, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
+	44, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	15, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
+	18, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
 	1,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
-	18, // 14: bringyour.StreamReset.streams:type_name -> bringyour.StreamOpen
+	19, // 14: bringyour.StreamReset.streams:type_name -> bringyour.StreamOpen
 	1,  // 15: bringyour.NetworkPeer.provide_modes:type_name -> bringyour.ProvideMode
-	22, // 16: bringyour.NetworkPeersUpdate.peers:type_name -> bringyour.NetworkPeer
-	26, // 17: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
+	23, // 16: bringyour.NetworkPeersUpdate.peers:type_name -> bringyour.NetworkPeer
+	27, // 17: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
 	2,  // 18: bringyour.ExchangeSignal.signal_type:type_name -> bringyour.SignalType
 	0,  // 19: bringyour.CreateContract.sender_role:type_name -> bringyour.SequenceRole
 	3,  // 20: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	29, // 21: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	27, // 22: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	30, // 21: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	28, // 22: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
 	1,  // 23: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
-	4,  // 24: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
-	0,  // 25: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
-	5,  // 26: bringyour.ResidentMigrate.kind:type_name -> bringyour.ResidentMoveKind
-	39, // 27: bringyour.ResidentMigrate.targets:type_name -> bringyour.ResidentMoveTarget
-	6,  // 28: bringyour.ResidentMoveResult.outcome:type_name -> bringyour.ResidentMoveOutcome
-	7,  // 29: bringyour.ResidentMoveResult.reason:type_name -> bringyour.ResidentMoveReason
-	30, // [30:30] is the sub-list for method output_type
-	30, // [30:30] is the sub-list for method input_type
-	30, // [30:30] is the sub-list for extension type_name
-	30, // [30:30] is the sub-list for extension extendee
-	0,  // [0:30] is the sub-list for field type_name
+	4,  // 24: bringyour.StoredContract.contract_class:type_name -> bringyour.ContractClass
+	5,  // 25: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
+	0,  // 26: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
+	6,  // 27: bringyour.ResidentMigrate.kind:type_name -> bringyour.ResidentMoveKind
+	40, // 28: bringyour.ResidentMigrate.targets:type_name -> bringyour.ResidentMoveTarget
+	7,  // 29: bringyour.ResidentMoveResult.outcome:type_name -> bringyour.ResidentMoveOutcome
+	8,  // 30: bringyour.ResidentMoveResult.reason:type_name -> bringyour.ResidentMoveReason
+	31, // [31:31] is the sub-list for method output_type
+	31, // [31:31] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_transfer_proto_init() }
@@ -3985,7 +4114,7 @@ func file_transfer_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
-			NumEnums:      8,
+			NumEnums:      9,
 			NumMessages:   35,
 			NumExtensions: 0,
 			NumServices:   0,

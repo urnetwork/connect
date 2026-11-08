@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -106,6 +107,8 @@ func WithSubprotocolControlSource() SubprotocolListenerOption {
 	return SubprotocolListenerOption{acceptControlSource: true}
 }
 
+// Whether a registration's options opt its listener in to the control id's
+// frames. No options, the default, leave it out.
 func subprotocolListenerAcceptsControlSource(opts []SubprotocolListenerOption) bool {
 	for _, opt := range opts {
 		if opt.acceptControlSource {
@@ -317,6 +320,9 @@ type subprotocolTypedDeliverer interface {
 	acceptsControlSource() bool
 }
 
+// One id's codec and typed handler. Message instances come from the codec when
+// it is a `SubprotocolMessagePool[T]`, and from a factory otherwise. Immutable
+// once registered.
 type subprotocolTyped[T any] struct {
 	subprotocolCodec SubprotocolCodec[T]
 	handler          SubprotocolHandler[T]
@@ -328,14 +334,25 @@ type subprotocolTyped[T any] struct {
 	acceptControlSource bool
 }
 
+// The registered codec, type-erased. A send that names no codec of its own
+// uses it (`subprotocolSendCodec`).
 func (self *subprotocolTyped[T]) codec() any {
 	return self.subprotocolCodec
 }
 
+// Whether the handler was registered with `WithSubprotocolControlSource`. It
+// decides only which listeners a frame from the control id reaches. Whether
+// such a frame is delivered at all also depends on its carrier, which
+// `receiveSubprotocolFrame` checks first.
 func (self *subprotocolTyped[T]) acceptsControlSource() bool {
 	return self.acceptControlSource
 }
 
+// Decodes one message and hands it to the handler. A pooled instance is
+// released after the handler returns, and also on a decode error. A decode
+// error is returned without calling the handler, and the caller counts it. A
+// handler panic is recovered, and logged at verbosity 1, so it cannot stop the
+// receive goroutine.
 func (self *subprotocolTyped[T]) deliver(source TransferPath, messageBytes []byte, peer Peer) error {
 	var m T
 	if self.pool != nil {
@@ -359,6 +376,9 @@ func (self *subprotocolTyped[T]) deliver(source TransferPath, messageBytes []byt
 	return nil
 }
 
+// One raw listener of an id. Its callback id is what its remove function
+// matches, and its control-source opt-in is its own: opting one listener in
+// opts no other listener of the id in.
 type subprotocolRawCallback struct {
 	callbackId uint64
 	callback   SubprotocolRawFunction
@@ -446,6 +466,16 @@ type ClientSubprotocolStatsSnapshot struct {
 	QueryReplyDrops      uint64
 	// per registered id, messages delivered to its listeners
 	ReceivedById map[SubprotocolId]uint64
+
+	// Frames refused from a Service source, by reason: its IP frames, its
+	// subprotocol frames of an id `ClientSettings.ServiceSubprotocolIds` does not
+	// list, and anything else it sent. Zero unless this client provides Service.
+	// An honest peer can add to the second: its network quality hint to a live
+	// lane is sent whatever the lane's mode, so these do not by themselves mean
+	// abuse.
+	DroppedServiceIp          uint64
+	DroppedServiceSubprotocol uint64
+	DroppedServiceOther       uint64
 }
 
 // The per-client registry, pending queries and counters. Registration takes
@@ -468,6 +498,11 @@ type subprotocolRegistry struct {
 	queriesSent          atomic.Uint64
 	queriesAnswered      atomic.Uint64
 	queryReplyDrops      atomic.Uint64
+
+	// see ClientSubprotocolStatsSnapshot.DroppedServiceIp and its neighbors
+	droppedServiceIp          atomic.Uint64
+	droppedServiceSubprotocol atomic.Uint64
+	droppedServiceOther       atomic.Uint64
 }
 
 func newSubprotocolRegistry() *subprotocolRegistry {
@@ -497,6 +532,10 @@ func (self *subprotocolRegistry) snapshot() ClientSubprotocolStatsSnapshot {
 		QueriesAnswered:      self.queriesAnswered.Load(),
 		QueryReplyDrops:      self.queryReplyDrops.Load(),
 		ReceivedById:         byId,
+
+		DroppedServiceIp:          self.droppedServiceIp.Load(),
+		DroppedServiceSubprotocol: self.droppedServiceSubprotocol.Load(),
+		DroppedServiceOther:       self.droppedServiceOther.Load(),
 	}
 }
 
@@ -533,6 +572,10 @@ func (self *subprotocolRegistry) updateEntry(subprotocolId SubprotocolId, update
 	return nil
 }
 
+// Attaches a raw listener to an id and returns the function that removes it.
+// `allowReserved` admits the reserved ids, for the network's own listeners.
+// `acceptControlSource` opts this one listener in to the id's frames from the
+// control id.
 func (self *subprotocolRegistry) addRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction, allowReserved bool, acceptControlSource bool) (func(), error) {
 	if err := checkSubprotocolId(subprotocolId, allowReserved); err != nil {
 		return nil, err
@@ -622,6 +665,10 @@ func registerReservedSubprotocol[T any](client *Client, subprotocolId Subprotoco
 	return registerSubprotocol(client, subprotocolId, codec, handler, true, false)
 }
 
+// The registration behind `RegisterSubprotocol` and the reserved one, which
+// returns the function that unregisters it. `allowReserved` admits the reserved
+// ids, for the network's own subprotocols. `acceptControlSource` opts the
+// handler in to the id's frames from the control id.
 func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T], allowReserved bool, acceptControlSource bool) (func(), error) {
 	if codec == nil {
 		return nil, errors.New("nil codec")
@@ -645,6 +692,54 @@ func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, cod
 }
 
 // --- receive ---
+
+// The frames of a batch a Service source may deliver: subprotocol frames of a
+// listed id. Each other frame is counted by reason and left out, the query frames
+// among them, so a Service source learns nothing of what else this client speaks.
+// The batch itself is never written, since the receive item still owns its frames;
+// one that loses nothing comes back as is, which allocates nothing.
+func (self *Client) admitServiceFrames(frames []*protocol.Frame) []*protocol.Frame {
+	kept := frames
+	refused := false
+	for i, frame := range frames {
+		if self.serviceFrameAdmitted(frame) {
+			if refused {
+				kept = append(kept, frame)
+			}
+			continue
+		}
+		if !refused {
+			refused = true
+			kept = slices.Clone(frames[:i])
+		}
+	}
+	return kept
+}
+
+// Decides one frame of a Service source, counting a refusal. A frame whose
+// wrapper does not decode names no id, so it is not listed.
+func (self *Client) serviceFrameAdmitted(frame *protocol.Frame) bool {
+	if frame == nil {
+		return false
+	}
+	registry := self.subprotocols
+	switch frame.MessageType {
+	case protocol.MessageType_Subprotocol:
+		subprotocolId, _, ok := decodeSubprotocolHeader(frame.MessageBytes)
+		if ok && slices.Contains(self.settings.ServiceSubprotocolIds, subprotocolId) {
+			return true
+		}
+		registry.droppedServiceSubprotocol.Add(1)
+	case protocol.MessageType_IpIpPacketToProvider,
+		protocol.MessageType_IpIpPacketFromProvider,
+		protocol.MessageType_IpIpPing,
+		protocol.MessageType_IpIpProviderDiagnostics:
+		registry.droppedServiceIp.Add(1)
+	default:
+		registry.droppedServiceOther.Add(1)
+	}
+	return false
+}
 
 // Removes the subprotocol frames from a received batch and delivers them, and
 // answers or completes the subprotocol queries, returning the frames the
@@ -695,6 +790,13 @@ func (self *Client) dispatchSubprotocolFrames(source TransferPath, frames []*pro
 	return kept
 }
 
+// Delivers one subprotocol frame to every raw listener of its id, then to the
+// id's typed handler. A frame whose header does not decode, or whose id has no
+// listener, is dropped and counted. The same holds for a frame from the control
+// id unless two conditions are met: a platform carrier (h1, h3, h3dns or
+// h3dnspump) read it, and a listener of the id opted in. When both hold, only
+// the listeners that opted in get the frame. A payload the typed codec cannot
+// decode is counted after the raw listeners have had it.
 func (self *Client) receiveSubprotocolFrame(table *subprotocolTable, source TransferPath, frame *protocol.Frame, peer Peer) {
 	registry := self.subprotocols
 	subprotocolId, payload, ok := decodeSubprotocolHeader(frame.MessageBytes)

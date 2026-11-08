@@ -1,6 +1,8 @@
 package connect
 
 import (
+	"time"
+
 	gojwt "github.com/golang-jwt/jwt/v5"
 )
 
@@ -11,6 +13,9 @@ type ByJwt struct {
 	ClientId     Id
 	SessionId    *Id
 	RootClientId *Id
+	// The `exp` claim. Zero when it is absent or malformed, which bounds nothing,
+	// so a caller holding a limit to it must refuse zero.
+	ExpireTime time.Time
 }
 
 func ParseByJwtUnverified(byJwtStr string) (*ByJwt, error) {
@@ -47,6 +52,9 @@ func ParseByJwtUnverified(byJwtStr string) (*ByJwt, error) {
 	byJwt.NetworkName, _ = claims["network_name"].(string)
 	byJwt.SessionId = readId("session_id")
 	byJwt.RootClientId = readId("root_client_id")
+	if expireTime, err := claims.GetExpirationTime(); err == nil && expireTime != nil {
+		byJwt.ExpireTime = expireTime.Time
+	}
 
 	return byJwt, nil
 }

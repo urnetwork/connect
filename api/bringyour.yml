@@ -9567,9 +9567,10 @@ paths:
           description: No usable webhook user is configured, so the endpoint accepts nothing.
 
   # gkm's routes (sidecar DESIGN.md §10.14). gkm serves them on its own host and api
-  # never does, so check-routes.sh holds them to gkmservice's route table, not api's.
-  # Each is planned until gkm serves it: `x-status: planned` keeps the server's
-  # conformance test from failing on it, and `x-internal` keeps it out of the public
+  # never does, so check-routes.sh holds them to gkmservice's route table, not api's,
+  # and the server's conformance test leaves them out of api's. Each is planned until
+  # gkm serves it: `x-status: planned` lets gkmservice's table lack it, as api's table
+  # may lack a planned route, and `x-internal` keeps it out of the public
   # reference and the generated client. A body is one of sidecar's protocol/gkm.proto
   # messages or a bare `Signed`, as application/octet-stream, and each description
   # says which and which scope it takes.
@@ -9583,10 +9584,11 @@ paths:
       summary: Upload KeyPackages
       description: |
         A `GkmKeyPackagesRequest`. Up to 128 one-time and 1 last-resort KeyPackage
-        per sidecar, each valid 90 days, refilled below 32. Takes any gkm token
-        whose sidecar is the credential's, from a member device admitted and not
-        revoked, parked or suspended. A sidecar's first upload hints `pending` to
-        the writers of each repo it reads.
+        per sidecar, each valid 90 days, refilled below 32. Takes a gkm token
+        holding `r`, `rw` or `admin` on some repo, whose sidecar is the
+        credential's, from a member device admitted and not revoked, parked or
+        suspended. A sidecar's first upload hints `pending` to the writers of each
+        repo it reads.
       operationId: gkmKeyPackagesUpload
       security:
         - ServiceTokenAuth: []
@@ -9655,9 +9657,9 @@ paths:
       summary: Replace the caller's ReaderKey
       description: |
         A `Signed` `ReaderKey`, purpose `reader-key`, which replaces the sidecar's
-        current one. Takes any gkm token whose sidecar is the record's, admitted
-        and not revoked, parked or suspended. At most once per 24 h after its
-        first.
+        current one. Takes a gkm token holding `r`, `rw` or `admin` on some repo,
+        whose sidecar is the record's, admitted and not revoked, parked or
+        suspended. At most once per 24 h after its first.
       operationId: gkmReaderKeyUpload
       security:
         - ServiceTokenAuth: []
@@ -9685,9 +9687,9 @@ paths:
       tags: [Other]
       summary: Read a sidecar's ReaderKey
       description: |
-        The `Signed` `ReaderKey` gkm serves, a public record, under any gkm token
-        of an admitted sidecar. gkm proves nothing by serving it: a sealer checks
-        it itself before sealing to it.
+        The `Signed` `ReaderKey` gkm serves, a public record, under a gkm token of
+        an admitted sidecar holding `r`, `rw` or `admin` on some repo. gkm proves
+        nothing by serving it: a sealer checks it itself before sealing to it.
       operationId: gkmReaderKey
       security:
         - ServiceTokenAuth: []
@@ -9709,6 +9711,42 @@ paths:
           description: Not an admitted sidecar's token.
         "404":
           description: The sidecar holds no ReaderKey.
+
+  /gkm/reader-keys:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read many sidecars' ReaderKeys
+      description: |
+        A `GkmReaderKeysRequest` of at most 256 sidecars, answered by a
+        `GkmReaderKeysReply`, which a rotator reads instead of a request per
+        recipient. Takes what `GET /gkm/reader-key/{sidecar_id}` takes: a gkm
+        token of an admitted sidecar holding `r`, `rw` or `admin` on some repo.
+      operationId: gkmReaderKeys
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Each `Signed` `ReaderKey` in order, an empty `Signed` for a sidecar with none.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Not an admitted sidecar's token.
+        "429":
+          description: Past a rate.
 
   /gkm/groups:
     servers:
@@ -9770,20 +9808,93 @@ paths:
         "404":
           description: No such group.
 
+  /gkm/repos/{repo_id}/drop-key:
+    servers:
+      - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a repo's drop keys
+      description: |
+        A `GkmGenerationsReply`: the newest `GenRotate` of the group the repo's
+        newest GroupForm names, up to 64 after `since`, so a depositor, which
+        cannot read the group's id, needs none. A depositor checks them itself
+        before it seals. The only route `deposit` reaches, which `r`, `rw` and
+        `admin` also reach.
+      operationId: gkmDropKey
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The generations.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+
   /gkm/repos/{repo_id}/forms:
     servers:
       - url: https://gkm.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a repo's GroupForms
+      description: |
+        A `GkmFormsReply`: the repo's `Signed` GroupForms, oldest first, whose
+        signers members check. Needs `r`, `rw` or `admin`.
+      operationId: gkmRepoForms
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The forms.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
     post:
       x-internal: true
       x-status: planned
       tags: [Other]
       summary: Re-form a repo's group
       description: |
-        A `Signed` `GroupForm`, purpose `group-form`, by a repo admin's device, in
-        an owner-bound kind only the owner's consented device, or a network
-        admin's outside those. `POST /gkm/groups` files a new group's first form,
-        and this one the form that re-forms it. The only gkm write a repo
-        re-seeded as deleted takes. Needs `admin`.
+        A `GkmGroupReformRequest`: a `Signed` `GroupForm`, purpose `group-form`,
+        naming the group it re-forms and the newest generation the re-former
+        holds, with the new group's epoch 0. The form is by a repo admin's
+        device, in an owner-bound kind only the owner's consented device, or a
+        network admin's outside those. `POST /gkm/groups` files a new group's
+        first form, and this one the form that re-forms it, after a site loss,
+        for a stalled group or for an IANA renumbering of its suite. Writes the
+        GroupForm, then epoch 0, each only if absent, so a retry of equal bytes
+        answers 200 and a crash resumes where it stopped. The ladder route then
+        carries the old generations, and the wraps routes the first wraps. A
+        repo re-seeded as deleted takes this route and the ladder's, in re-seed
+        mode, and no other gkm write. Needs `admin`.
       operationId: gkmRepoForm
       security:
         - ServiceTokenAuth: []
@@ -9804,9 +9915,9 @@ paths:
         "200":
           description: Filed.
         "403":
-          description: Out of scope, or the signer may not form this repo's group.
+          description: Out of scope, the signer may not form this repo's group, or the repo is deleted outside re-seed mode.
         "409":
-          description: That form's place holds other bytes.
+          description: That form's place, or the new group's epoch 0, holds other bytes.
         "429":
           description: Past a rate, or queued out by the write budget.
 
@@ -10017,14 +10128,16 @@ paths:
       x-internal: true
       x-status: planned
       tags: [Other]
-      summary: Stage or deliver a wrap
+      summary: Stage or deliver wraps
       description: |
-        A `Signed` `ReaderWrap` or `DelegationWrap`, purpose `reader-wrap`, whose
-        body's group, generation, commitment prefix, recipient and key digest
-        agree with its object's path. Staged only while generation `g` is
-        unclaimed, or of generation 1 by its signer while the repo is `keying`.
-        Late only once `g` is the newest and carries the body's commitment. Takes
-        `r`, `rw` or `admin`, from a sidecar that is not read-only.
+        A `GkmWrapBatch` of 1 to 256 `Signed` `ReaderWrap`s and `DelegationWrap`s,
+        purpose `reader-wrap`, each body's group, generation, commitment prefix,
+        recipient and key digest agreeing with its object's path. Staged only
+        while generation `g` is unclaimed, or of generation 1 by its signer while
+        the repo is `keying`. Late only once `g` is the newest and carries the
+        body's commitment. Each runs through these checks alone, so a batch of one
+        behaves as one delivery would, and a retry is safe. Takes `r`, `rw` or
+        `admin`, from a sidecar that is not read-only.
       operationId: gkmWrapUpload
       security:
         - ServiceTokenAuth: []
@@ -10045,21 +10158,105 @@ paths:
               type: string
               format: binary
       responses:
-        "201":
-          description: Stored.
-        "403":
-          description: Out of scope, or the signer may not deliver.
-        "409":
-          description: Stale kind, generation or key.
-        "412":
-          description: That delivery exists. The body is the winner, a `Signed` wrap.
+        "200":
+          description: |
+            A `GkmWrapBatchReply`, one result per delivery, in order: 201, 412 with
+            the winner, 403, 409 for a stale kind, generation or key, 429 past the
+            staged rate or queued out by the write budget, or 0 for one not tried
+            in the time the request has.
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
+        "403":
+          description: Out of scope.
         "429":
-          description: Past the staged rate, or queued out by the write budget.
+          description: Past a rate.
+
+  /gkm/groups/{group_id}/recovery-wraps/{g}/{c8}:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Stage a rotation's recovery wraps
+      description: |
+        A `GkmRecoveryWrapBatch` of 1 to 256 of a rotator's RecoveryWraps, as the
+        wraps route takes deliveries, answered by a `GkmWrapBatchReply`. Takes `r`,
+        `rw` or `admin` of the group's repo.
+      operationId: gkmRecoveryWrapBatchUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmGeneration"
+        - name: c8
+          in: path
+          required: true
+          description: The first 8 bytes of the generation's commitment, in hex.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: One result per wrap, in order, as the wraps route answers, though a 412's winner is the stored RecoveryWrap's bare ciphertext, which nothing signs.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Out of scope.
+        "429":
+          description: Past a rate.
+
+  /gkm/groups/{group_id}/ladder:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Carry a re-formed group's ladder
+      description: |
+        A `GkmLadderRequest`: at most 64 `Signed` `GenRotate`s a call, in ascending
+        order, each the old group's byte for byte. Open to every re-form, a site
+        loss's, a stalled group's or an IANA renumbering's, but only while the
+        newest GroupForm names the group and before its epoch 1 exists. A repo
+        re-seeded as deleted takes it in re-seed mode, as it takes the form. gkm
+        checks the order, each parent commitment and that no generation passes
+        the form's, and skips a claim's time and signer checks. The group takes
+        no commit, wrap or claim until the form's generation is here. Equal
+        bytes answer success, so a retry is safe. Needs `admin`.
+      operationId: gkmLadderUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored.
+        "403":
+          description: Out of scope, or the ladder is closed.
+        "409":
+          description: Out of order, off the chain, or past the form's generation.
+        "429":
+          description: Past a rate, or queued out by the write budget.
 
   /gkm/groups/{group_id}/welcome/{n}:
     servers:
@@ -10193,39 +10390,6 @@ paths:
         "403":
           description: Out of scope.
 
-  /gkm/groups/{group_id}/drop-key:
-    servers:
-      - url: https://gkm.bringyour.com
-    get:
-      x-internal: true
-      x-status: planned
-      tags: [Other]
-      summary: Read a group's drop keys
-      description: |
-        A `GkmGenerationsReply`: the newest `GenRotate`, up to 64 after `since`. A
-        depositor checks them itself before it seals. The only route `deposit`
-        reaches, which `r`, `rw` and `admin` also reach.
-      operationId: gkmDropKey
-      security:
-        - ServiceTokenAuth: []
-      parameters:
-        - $ref: "#/components/parameters/GkmGroupId"
-        - name: since
-          in: query
-          required: true
-          schema:
-            type: integer
-      responses:
-        "200":
-          description: The generations.
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
-        "403":
-          description: Out of scope.
-
   /gkm/welcomes:
     servers:
       - url: https://gkm.bringyour.com
@@ -10261,8 +10425,9 @@ paths:
       summary: Read a member's recovery wraps
       description: |
         A `GkmRecoveryWrapsReply`, from every metadata cluster. For a device of
-        that member, or its unadmitted client under `recovery:<member_id>`, which
-        reaches that member's own wraps and no other gkm route.
+        that member under a gkm token holding `r`, `rw` or `admin` on some repo,
+        or for its unadmitted client under `recovery:<member_id>`, which reaches
+        that member's own wraps and no other gkm route.
       operationId: gkmRecoveryWraps
       security:
         - ServiceTokenAuth: []
@@ -10282,10 +10447,11 @@ paths:
       x-internal: true
       x-status: planned
       tags: [Other]
-      summary: Stage a recovery wrap
+      summary: Re-wrap after a rebind
       description: |
-        A `GkmRecoveryWrap`, from a rotator staging, or from that member's device
-        re-wrapping after a rebind, under `r`, `rw` or `admin` of the group's repo.
+        A `GkmRecoveryWrap`, from that member's device re-wrapping after a rebind,
+        under `r`, `rw` or `admin` of the group's repo. A rotator stages through
+        the recovery-wraps route.
       operationId: gkmRecoveryWrapUpload
       security:
         - ServiceTokenAuth: []
@@ -10313,8 +10479,9 @@ paths:
       tags: [Other]
       summary: Delete a retired binding's recovery wraps
       description: |
-        For that member's own device, which deletes an old binding's wraps only
-        once every new one exists, so a crash between leaves both and a retry
+        For that member's own device, under a gkm token holding `r`, `rw` or
+        `admin` on some repo, which deletes an old binding's wraps only once
+        every new one exists, so a crash between leaves both and a retry
         finishes.
       operationId: gkmRecoveryWrapsDelete
       security:
@@ -10707,15 +10874,137 @@ paths:
         "429":
           description: Past the limit for this key or caller.
 
-  /network/auth-keys:
+  /sidecar/bind:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Bind a client generation to its sidecar identity
+      description: |
+        Appends the caller's client generation to its sidecar's identity log: a
+        `SignedSidecarIdentityBinding` (sidecar's protocol/bridge/auth.proto),
+        marshalled and base64, signed by the client's key and by the sidecar's
+        identity key over the binding's network, sidecar, client, generation,
+        both public keys and time. The log is never reaped; a peer checks a
+        client against it before trusting the client's bytes.
+
+        The binding must name the bearer's client and network. A sidecar's first
+        binding is generation 1 and creates its identity; each later one is the
+        newest plus one under the same identity key. A client binds exactly
+        once: posting the same bytes again answers the stored generation and
+        writes nothing, and any other bytes for a bound client are refused.
+
+        A refusal answers `{"error", "code"}`: 400 `binding_invalid` (a bad
+        signature, a malformed body, or another client or network than the
+        token's), 403 `sidecar_revoked`, 409 `generation_conflict` and 409
+        `client_bound`.
+      operationId: sidecarBind
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SidecarBindArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarBindResult"
+        "400":
+          $ref: "#/components/responses/SidecarIdentityRefused"
+        "403":
+          description: The sidecar is revoked, with code `sidecar_revoked`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                  - code
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "409":
+          $ref: "#/components/responses/SidecarIdentityRefused"
+
+  /sidecar/identity/{sidecarId}:
     get:
       x-internal: true
-      x-status: planned
+      tags: [Network]
+      summary: A sidecar's identity and bindings
+      description: |
+        A sidecar of the caller's network: its identity public key and
+        algorithm, its status as the server holds it, its current binding, and a
+        page of its bindings, newest first, at most 64. Pass
+        `before_generation` for the page below a generation. Never a user id.
+        The server is not trusted for any of it: a client checks each binding's
+        signatures and the identity key against its own record.
+      operationId: sidecarIdentity
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: sidecarId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: before_generation
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarIdentityResult"
+        "404":
+          description: The caller's network holds no such sidecar.
+
+  /sidecar/identity:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The sidecar a client is bound to
+      description: |
+        The identity that a client of any generation in the caller's network is
+        bound to, with that client's binding. Never a user id. A client with no
+        binding is 404.
+      operationId: sidecarIdentityByClient
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarIdentityResult"
+        "404":
+          description: No binding names that client in the caller's network.
+
+  /network/auth-keys:
+    get:
       tags: [Network]
       summary: List the network's auth keys
       description: |
-        The network's auth keys, without their secrets, which only their hash
-        stores.
+        The network's auth keys that have not expired, oldest first, without
+        their secrets, which only their hash stores. A key's tags are opaque tag
+        ids, never names.
       operationId: networkAuthKeys
       security:
         - BearerAuth: []
@@ -10729,14 +11018,17 @@ paths:
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
     post:
-      x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Create an auth key
       description: |
         Creates a key that lives 5 minutes to 90 days and has a maximum number of
         uses. The answer is the only time the bearer `ur-authkey-<id>-<secret>`
-        appears; only its hash is kept.
+        appears; only its secret's hash is kept. `<id>` is the key's id and
+        `<secret>` 32 random bytes, each lowercase base32 (RFC 4648) without
+        padding, 26 and 52 characters, so neither holds a `-`.
+
+        Creating a key sends the account's security notice and records an admin
+        event.
 
         A pre-approved key's bundle, the genesis hash, the authorization head and
         a Delegation's seeds, is built on the creating device and never sent here.
@@ -10762,14 +11054,17 @@ paths:
 
   /network/auth-key-revoke:
     post:
-      x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Revoke an auth key
       description: |
         Stops the key's bearer. It signs nothing, so a copy of a pre-approved key's
         bundle still admits until its Delegation ends: for such a key the answer
-        says so, and that takes a `DelegationRevoke` statement from a device.
+        says so in `bundle_still_admits` and `note`, which names
+        `ur admin delegations revoke`, since ending the Delegation takes a
+        `DelegationRevoke` statement from a device.
+
+        Revoking a key sends the account's security notice and records an admin
+        event.
       operationId: networkAuthKeyRevoke
       security:
         - BearerAuth: []
@@ -10905,12 +11200,19 @@ paths:
   /acl/ack:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Report the applied projection
       description: |
-        A client reports the projection version it applied, which measures how far
-        policy has propagated. Kept 7 days.
+        A client reports the projection version it applied, the authorization
+        log position of the newest entry its engine installed, which measures how
+        far policy has propagated. The client is the bearer's own; a client token
+        only. One row per client holds its newest version and when it was
+        reported, kept 7 days.
+
+        An ack counts only when it is newer than the client's last and at or
+        below its network's verified head, so a network without a config repo
+        records nothing. `time_ms` is the entry's own time, as the client read it
+        from the verified entry, and only measures the delay.
       operationId: aclAck
       security:
         - BearerAuth: []
@@ -10923,6 +11225,16 @@ paths:
       responses:
         "200":
           description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AclAckResult"
+        "400":
+          description: The version or time is invalid.
+        "403":
+          description: Not a client token.
+        "503":
+          description: Acks are not available on this server yet.
 
   /acl/invite:
     post:
@@ -11556,6 +11868,319 @@ paths:
         "200":
           description: OK.
 
+  # §13.15's certificate routes (sidecar DESIGN.md §13.8). api serves them, and
+  # route_authz.go classifies them sidecar, so a `strict_exp` bearer reaches them
+  # under §7.4's allowlist while each route's own class below still applies.
+  # Each is planned until the certs routes land, and internal until then. Bytes
+  # are base64; `attestation` is the encoded `Signed` of a `TlsKeyAttestation`
+  # (sidecar protocol/tls.proto) by the device's identity key, purpose
+  # `tls-key`. `POST /tls/suspend` is not listed: it stays a model call inside
+  # api and taskworker until a caller outside them exists.
+  /tls/cert-order:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Order a certificate for a device's key
+      description: |
+        A device's CSR for its own P-256 key, with that key's attestation. Takes
+        a service token for audience `certs` from a client that holds a `tls/` or
+        `smtp/` grant; the token names the caller, never the body. The CSR's
+        names must be exactly the caller's set: its network's pair, each live
+        alias's pair, or its scope's pair alone. The attestation must verify
+        under the caller's identity key for the CSR's key and those names. The
+        row is written before anything else happens and the order runs later, so
+        the answer gives its id and state, and the caller polls
+        `GET /tls/cert-order/{cert_id}`.
+
+        `replaces` names the live certificate this order renews, by RFC 9773's
+        certificate id, which takes it out of the order limits. It is stored
+        nowhere.
+      operationId: tlsCertOrder
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertOrderArgs"
+      responses:
+        "200":
+          description: The row, written before the order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderResult"
+        "403":
+          description: |
+            No `tls/` or `smtp/` grant, a CSR for other names or another curve,
+            or an attestation that does not verify for this key and these names.
+        "429":
+          description: Past the set's limit. The body gives `retry_after_ms`.
+
+  /tls/cert-order/{cert_id}:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read an order
+      description: |
+        The caller's own order: its state, how long to wait before asking again,
+        the chain once it issues, leaf first, and the CA's suggested renewal
+        window. Takes a service token for audience `certs`, from the order's own
+        sidecar; another caller's order answers 404.
+      operationId: tlsCertOrderGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: cert_id
+          in: path
+          required: true
+          description: udid. The row's id from `POST /tls/cert-order`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderStatus"
+        "404":
+          description: No such order of this caller's.
+
+  /tls/cert-register:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Register a custom domain's chain
+      description: |
+        A Team custom domain's chain (v1), from a desktop that ordered it under
+        the domain's own ACME account. The chain's key and names must match a
+        queued row, or the attestation sent with it, so a device cannot register
+        another device's key. Takes a client token of the network.
+      operationId: tlsCertRegister
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRegisterArgs"
+      responses:
+        "200":
+          description: Registered.
+        "403":
+          description: The chain's key or names match no queued row and no attestation.
+
+  /tls/certs:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the network's certificates
+      description: |
+        The network's certificates with their attestations, for each device's
+        certificate transparency watch, and the custom-domain CSRs waiting for an
+        ordering desktop. A reader verifies each attestation itself, under the
+        identity key its own verified state holds, and never trusts this answer
+        for it. Takes a client token of the network.
+      operationId: tlsCerts
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertsResult"
+
+  /tls/cert-revoke:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Revoke a certificate
+      description: |
+        Revokes a certificate of the caller's own client, or, with a network
+        admin's token, any of the network's. `key_compromise` revokes with reason
+        keyCompromise. The revocation runs after the answer, and the row reads
+        `revoking` until the CA takes it.
+      operationId: tlsCertRevoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRevokeArgs"
+      responses:
+        "200":
+          description: The revocation is queued.
+        "403":
+          description: Another client's certificate, without a network admin's token.
+        "404":
+          description: No such certificate in the network.
+
+  # §9.15's socket routes (sidecar DESIGN.md §9.5, §9.6, §9.8). server/cli/sockets
+  # serves them on its own host, on every lb host, and api never does. They are
+  # sidecar routes under §7.4, so a `strict_exp` bearer reaches them under its
+  # allowlist, while each route's own class below still applies. Each is planned
+  # until sockets serves it, and internal until then. Bodies are sidecar's
+  # socket_api.go: bytes are base64 and ids udid. A ticket is the encoded
+  # `SignedSocketTicket` and a claim the encoded `Signed` of a
+  # `SocketRegistrationClaim` by the listener's identity key, purpose
+  # `socket-registration` (sidecar protocol/socket.proto), and each crosses every
+  # hop unchanged, because only the bytes received verify. A refusal is a 200
+  # whose body holds `error`, and it signs and writes nothing.
+  /socket/registrations:
+    servers:
+      - url: https://sockets.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Register the caller's listeners
+      description: |
+        The calling client's full set of registrations, so listen, heartbeat,
+        drain and unlisten are one idempotent call. Each entry is a 45 s lease,
+        renewed by a heartbeat every 15 s that carries the listener's load. A
+        set of over 1,024 entries goes as pages over consecutive name-key ranges
+        under one `set_version`. A page is the whole set within
+        `[key_start, key_end)`: an entry it lacks there unlistens at once, and an
+        entry outside the range refuses the page. A name outside `tls/`, `smtp/`
+        and `ur/` arrives only as its token path, with its seal.
+
+        Every call re-checks each entry against the network's newest verified
+        projection and recreates missing state, so the answer is authoritative
+        for its page. Takes a client token whose client is the listener. Each
+        page takes one token of the caller's control-plane bucket.
+      operationId: socketRegistrations
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SocketRegistrationsArgs"
+      responses:
+        "200":
+          description: |
+            A status per entry, or `error` for the whole page: `unavailable` past
+            the bucket, with `retry_after_ms`; `stale` for a `set_version` older
+            than the stored one, which `set_version` gives back; `invalid` for a
+            page over 1,024 entries, out of order, or holding an entry outside its
+            range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketRegistrationsResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/find:
+    servers:
+      - url: https://sockets.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Find a listener
+      description: |
+        Picks two listeners of a name by weighted power of two choices and signs
+        a single-use 30 s ticket for each, a primary and a backup. The service
+        never contacts a listener: the dialer checks the listener's claim and
+        presents the ticket in its stream's open. A Find after failed tickets
+        carries them, and the service counts one only once it verifies and the
+        caller holds it.
+
+        The checks run in order, and a refusal signs nothing: the caller's
+        control-plane bucket, `unavailable`; the projection, `denied`, checked
+        before any listener is read; the paying network not spent, `quota`; the
+        pick, `no_listener` or `busy`. Takes a client token. A `urnetwork-edge`
+        caller sends its K client ids, one of which each ticket names, and any
+        other caller sending them is refused.
+      operationId: socketFind
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SocketFindArgs"
+      responses:
+        "200":
+          description: The tickets, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketFindResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/list:
+    servers:
+      - url: https://sockets.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the network's registered names
+      description: |
+        The caller's own network's registered names: an edge name as it is, and
+        any other name as its token path with its seal, which only a holder of
+        the network's socket key opens, so a client unseals names locally. Takes
+        a client token of the network. Each page takes one token of the caller's
+        control-plane bucket.
+      operationId: socketList
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: The previous page's `next_cursor`. Absent for the first page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of names, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketListResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/keys:
+    servers:
+      - url: https://sockets.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the ticket keys
+      description: |
+        The public keys a ticket verifies under. Keys rotate every 30 days with
+        overlap, so a holder keeps each key it is given until that key's
+        expiry. Public.
+      operationId: socketKeys
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketKeysResult"
+
 components:
   parameters:
     GkmGroupId:
@@ -11655,6 +12280,23 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/SessionOperationResult"
+    SidecarIdentityRefused:
+      description: |
+        A refusal of a sidecar identity route, with its code: `binding_invalid`,
+        `sidecar_revoked`, `generation_conflict` or `client_bound`.
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - error
+              - code
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+
     ClientJwtRefused:
       description: |
         The bearer token is a client JWT (`by_client_jwt`, from
@@ -19178,6 +19820,19 @@ components:
       properties:
         name:
           type: string
+        scopes:
+          description: |
+            What the key may do within its creator's reach: all, devices:core,
+            auth_keys, policy:read or logs:read. Empty is all. Until roles map
+            routes to permissions only all is accepted.
+          type: array
+          items:
+            type: string
+        duration_seconds:
+          description: |
+            The key's lifetime, at most 365 days (31,536,000 seconds), which is
+            also the lifetime of a key created without one.
+          type: integer
 
     CreateApiKeyResult:
       type: object
@@ -19190,6 +19845,13 @@ components:
         api_key:
           type: string
         name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        expire_time:
+          description: datetime
           type: string
         error:
           type: object
@@ -19213,6 +19875,17 @@ components:
           type: string
         create_time:
           description: datetime
+          type: string
+        scopes:
+          description: Absent on a legacy key, which keeps its creator's whole reach.
+          type: array
+          items:
+            type: string
+        expire_time:
+          description: datetime. Absent on a legacy key, which never expires.
+          type: string
+        creator:
+          description: uuid. The user who made the key; absent on a legacy key.
           type: string
 
     GetApiKeysResult:
@@ -21071,6 +21744,14 @@ components:
             - message
           properties:
             message:
+              type: string
+            code:
+              description: |
+                `restore_required`, to a sidecar's client only, while the server
+                lacks the sidecar's identity, binding or a registration, as after
+                a database restore. It is no refusal: the sidecar posts its newest
+                binding to `POST /sidecar/bind` again, re-registers, and refreshes
+                again.
               type: string
 
     NetworkRefreshTokenResult:
@@ -25023,6 +25704,57 @@ components:
             here. The server keeps its SHA-256.
           type: string
 
+    SidecarBindArgs:
+      type: object
+      required:
+        - binding
+      properties:
+        binding:
+          description: A marshalled `SignedSidecarIdentityBinding`, base64.
+          type: string
+          format: byte
+
+    SidecarBindResult:
+      type: object
+      required:
+        - generation
+      properties:
+        generation:
+          description: The generation the server recorded for the client.
+          type: integer
+          format: int64
+
+    SidecarIdentityResult:
+      type: object
+      required:
+        - sidecar_id
+        - identity_public_key
+        - identity_alg
+        - status
+      properties:
+        sidecar_id:
+          type: string
+        identity_public_key:
+          description: The Ed25519 identity public key, base64.
+          type: string
+          format: byte
+        identity_alg:
+          description: "`ed25519`."
+          type: string
+        status:
+          description: "`active` or `revoked`, as the server holds it: never authority."
+          type: string
+        binding:
+          description: The current binding, a marshalled `SignedSidecarIdentityBinding`, base64.
+          type: string
+          format: byte
+        bindings:
+          description: By sidecar id, a page of bindings, newest first, at most 64.
+          type: array
+          items:
+            type: string
+            format: byte
+
     NetworkAuthKey:
       type: object
       required:
@@ -25036,11 +25768,15 @@ components:
           description: udid. The user who made the key.
           type: string
         tags:
-          description: Keyed tag ids, never tag names.
+          description: Opaque tag ids, 32 lowercase hex characters each, never tag names.
           type: array
           items:
             type: string
+        create_time:
+          description: datetime
+          type: string
         expire_time:
+          description: datetime
           type: string
         uses:
           description: Uses so far.
@@ -25074,7 +25810,9 @@ components:
         max_uses:
           type: integer
         tags:
-          description: Keyed tag ids, never tag names.
+          description: |
+            Opaque tag ids, 32 lowercase hex characters each, never tag names. At
+            most 64.
           type: array
           items:
             type: string
@@ -25096,6 +25834,16 @@ components:
         auth_key:
           description: The bearer `ur-authkey-<id>-<secret>`, returned only here.
           type: string
+        expire_time:
+          description: datetime
+          type: string
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     NetworkAuthKeyRevokeArgs:
       type: object
@@ -25114,6 +25862,18 @@ components:
         bundle_still_admits:
           description: A pre-approved key's bundle keeps admitting until its Delegation ends.
           type: boolean
+        note:
+          description: |
+            For a pre-approved key, that a copy of its bundle still admits, and
+            that `ur admin delegations revoke` ends it.
+          type: string
+        error:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
 
     AclAckArgs:
       type: object
@@ -25121,8 +25881,24 @@ components:
         - version
       properties:
         version:
-          description: The projection version the client applied.
+          description: The projection version the client applied, a log position from 1.
           type: integer
+          format: int64
+        time_ms:
+          description: That entry's time, ms since the epoch, as the entry carries it. Optional.
+          type: integer
+          format: int64
+
+    AclAckResult:
+      type: object
+      required:
+        - recorded
+      properties:
+        recorded:
+          description: |
+            Whether the ack counted: false for a version not above the client's last
+            ack, above its network's head, or in a network with no head.
+          type: boolean
 
     EvsPushLeaseArgs:
       type: object
@@ -25168,3 +25944,501 @@ components:
           type: array
           items:
             type: string
+
+    TlsCertState:
+      description: |
+        Where a certificate row stands: queued for certs' queue or, for a custom
+        domain, an ordering desktop; ordering at its CA; waiting_dns for its
+        challenge's serial and the canary; issued; failed, with no retry;
+        revoking until the CA takes a revocation; revoked; expired. A reader
+        takes a state it does not know as no certificate.
+      type: string
+      enum: [queued, ordering, waiting_dns, issued, failed, revoking, revoked, expired]
+
+    TlsCertOrderArgs:
+      type: object
+      required:
+        - csr
+        - attestation
+      properties:
+        csr:
+          description: A PKCS 10 request in DER, by the device's own P-256 key, for its set of names.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for that key and set.
+          type: string
+          format: byte
+        replaces:
+          description: RFC 9773's certificate id of the live certificate this order renews.
+          type: string
+
+    TlsCertOrderResult:
+      type: object
+      required:
+        - cert_id
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+
+    TlsCertOrderStatus:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+        chain:
+          description: Each certificate in DER, leaf first. Absent until the order issues.
+          type: array
+          items:
+            type: string
+            format: byte
+        ari_window_start:
+          description: datetime. RFC 9773's suggested renewal window, absent until the CA gives one.
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+
+    TlsCertRecord:
+      type: object
+      required:
+        - cert_id
+        - network_id
+        - client_id
+        - sidecar_id
+        - identifier_set_sha256
+        - spki_sha256
+        - attestation
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        network_id:
+          description: udid
+          type: string
+        client_id:
+          description: udid
+          type: string
+        sidecar_id:
+          description: udid
+          type: string
+        identifier_set_sha256:
+          description: SHA-256 over the set's names, sorted, each followed by one zero byte.
+          type: string
+          format: byte
+        spki_sha256:
+          description: SHA-256 of the key's DER SubjectPublicKeyInfo.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of the key's `TlsKeyAttestation`, for a reader to verify itself.
+          type: string
+          format: byte
+        csr:
+          description: The PKCS 10 request in DER, on a custom domain's queued row only.
+          type: string
+          format: byte
+        ca:
+          type: string
+        account_uri:
+          type: string
+        profile:
+          type: string
+        serial:
+          description: Lowercase hex. Absent until it issues.
+          type: string
+        not_before:
+          description: datetime
+          type: string
+          format: date-time
+        not_after:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_start:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        successor_cert_id:
+          description: udid. The row that took over from this one.
+          type: string
+        chain:
+          description: A custom domain's registered chain, each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+
+    TlsCertsResult:
+      type: object
+      required:
+        - certs
+      properties:
+        certs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+        queued_csrs:
+          description: Custom-domain CSRs waiting for an ordering desktop (v1).
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+
+    TlsCertRegisterArgs:
+      type: object
+      required:
+        - chain
+        - account_uri
+      properties:
+        cert_id:
+          description: udid. The queued row this chain answers. Absent when the attestation is sent instead.
+          type: string
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for the chain's key and names.
+          type: string
+          format: byte
+        chain:
+          description: Each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+        account_uri:
+          description: The custom domain's ACME account that ordered it.
+          type: string
+
+    TlsCertRevokeArgs:
+      type: object
+      required:
+        - cert_id
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        key_compromise:
+          description: Revoke with reason keyCompromise.
+          type: boolean
+
+    SocketRegistrationsArgs:
+      description: |
+        A page of the calling client's set of registrations, sorted by name key:
+        the name of a `tls/`, `smtp/` or `ur/` name, else its token path.
+      type: object
+      required:
+        - set_version
+        - registrations
+      properties:
+        set_version:
+          description: Per client and increasing. A set's pages share it, and an older set is refused.
+          type: integer
+          format: int64
+        key_start:
+          description: The name key this page's range starts at.
+          type: string
+          format: byte
+        key_end:
+          description: The name key this page's range ends before. Empty, the range is unbounded.
+          type: string
+          format: byte
+        registrations:
+          description: At most 1,024 entries, each inside the range.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketRegistration"
+
+    SocketRegistration:
+      description: |
+        A lease on (network, name, listener client), at most one per client and
+        name. Exactly one of `name` and `name_token` names it. A client fills in
+        each default, since a zero cannot be told from a value left out.
+      type: object
+      required:
+        - listen_id
+        - claim
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name. Empty for any other name.
+          type: string
+        name_token:
+          description: Any other name's token path, 16 bytes a segment.
+          type: string
+          format: byte
+        sealed_name:
+          description: With `name_token`, the name's 152-byte seal, for listings.
+          type: string
+          format: byte
+        listen_id:
+          description: udid. Random per listen; a ticket for an older one is refused.
+          type: string
+        protocol:
+          description: Default `tcp`. A group serves one protocol.
+          type: string
+        version:
+          type: integer
+        alpn:
+          description: For `tls/`, the ALPN ids served.
+          type: array
+          items:
+            type: string
+        app_mode:
+          description: For `tls/`, `http` (the default) or `raw`. Empty for any other name.
+          type: string
+        weight:
+          description: Default 100, from 1 to 1000. The listener's relative share.
+          type: integer
+        max_streams:
+          description: Default 256. The hard cap at the listener.
+          type: integer
+        exclusive:
+          description: Refuse later registrations of the name.
+          type: boolean
+        affinity:
+          description: Honor affinity keys.
+          type: boolean
+        serving:
+          description: Default true. False keeps the lease and takes no tickets.
+          type: boolean
+        draining:
+          description: No new tickets; issued ones are accepted.
+          type: boolean
+        inflight:
+          description: The load report, the listener's streams in flight.
+          type: integer
+        claim:
+          description: |
+            The encoded `Signed` of a `SocketRegistrationClaim` by the listener's
+            identity key, purpose `socket-registration`. Find hands it to each
+            dialer beside the ticket.
+          type: string
+          format: byte
+
+    SocketRegistrationStatus:
+      description: |
+        How one entry stands: ok holds its lease; revoked passed before and no
+        longer does, so it closes with its streams; denied, refused by the gate
+        or its namespace; taken, an exclusive listener or another protocol holds
+        the group; invalid, the entry itself is malformed. A client takes a
+        status it does not know as no lease.
+      type: string
+      enum: [ok, revoked, denied, taken, invalid]
+
+    SocketRegistrationsResult:
+      type: object
+      required:
+        - statuses
+        - set_version
+        - server_time
+        - ticket_keys
+      properties:
+        statuses:
+          description: One per entry, in the page's order. Empty when `error` refused the page.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketRegistrationStatus"
+        set_version:
+          description: The stored `set_version`, which a refused client jumps past.
+          type: integer
+          format: int64
+        server_time:
+          description: The service's clock in Unix milliseconds, whose offset a listener applies to ticket expiries.
+          type: integer
+          format: int64
+        ticket_keys:
+          description: Every key a ticket may verify under.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketTicketKey"
+        urnetwork_edge:
+          description: udid. The `urnetwork-edge` network's id, which a listener compares a ticket's dialer network to.
+          type: string
+        streams_stopped:
+          description: The network's balance has stopped new streams, so a listener answers them `quota`.
+          type: boolean
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketErrorCode:
+      description: |
+        Why a whole call was refused: no_listener, nothing live and matching;
+        busy, every match at its `max_streams`; denied, the projection does not
+        allow the dial; quota, the paying network is spent; unavailable, the
+        caller's control-plane bucket, or a network the service has not loaded;
+        stale, a page's `set_version` is older than the stored one; invalid, a
+        page over its size, out of order or holding an entry outside its range.
+      type: string
+      enum: [no_listener, busy, denied, quota, unavailable, stale, invalid]
+
+    SocketError:
+      description: One refusal of a whole call. Nothing was signed or written.
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          $ref: "#/components/schemas/SocketErrorCode"
+        retry_after_ms:
+          description: How long to wait, for no_listener, busy, quota and unavailable. Absent sets no wait.
+          type: integer
+
+    SocketTicketKey:
+      description: A key tickets verify under. Its id fixes the algorithm, which is Ed25519.
+      type: object
+      required:
+        - key_id
+        - public_key
+        - expire_time_millis
+      properties:
+        key_id:
+          type: string
+        public_key:
+          description: The 32-byte Ed25519 public key.
+          type: string
+          format: byte
+        expire_time_millis:
+          description: The Unix millisecond from which nothing verifies under it.
+          type: integer
+          format: int64
+
+    SocketFindArgs:
+      description: |
+        Exactly one of `name` and `name_token` names the group. A dial's
+        protocol, version and ALPN are not sent until the metadata list names
+        them for Find, so meanwhile a dialer checks them in the listener's claim.
+      type: object
+      required:
+        - network_id
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name.
+          type: string
+        name_token:
+          description: Any other name's token path.
+          type: string
+          format: byte
+        network_id:
+          description: udid. The network the name is in, resolved per call; for a `ur/` name, `urnetwork-edge`.
+          type: string
+        affinity_key:
+          description: tlsedge's keyed hash of the visitor's /24 or /48, never stored.
+          type: string
+          format: byte
+        failed_tickets:
+          description: The tickets of the caller's last Find that failed it.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketFailedTicket"
+        client_ids:
+          description: udids. A `urnetwork-edge` caller's K clients, one of which each ticket names.
+          type: array
+          items:
+            type: string
+
+    SocketFailedReason:
+      description: |
+        Why a dialer gave up on a ticket: timeout, no accept within the accept
+        timeout, the only reason an edge sends; refused, the listener refused
+        it, or its claim failed the dialer's own check.
+      type: string
+      enum: [timeout, refused]
+
+    SocketFailedTicket:
+      type: object
+      required:
+        - ticket
+        - reason
+      properties:
+        ticket:
+          description: The ticket as its Find returned it.
+          type: string
+          format: byte
+        reason:
+          $ref: "#/components/schemas/SocketFailedReason"
+
+    SocketFindTicket:
+      description: One listener's ticket, and the claim its dialer checks before the stream's open.
+      type: object
+      required:
+        - ticket
+        - claim
+      properties:
+        ticket:
+          description: The encoded `SignedSocketTicket`, which the stream's open carries as it came.
+          type: string
+          format: byte
+        claim:
+          description: The listener's registration claim.
+          type: string
+          format: byte
+
+    SocketFindResult:
+      description: The tickets or one refusal. `backup` is absent when one listener is all the group has.
+      type: object
+      properties:
+        primary:
+          $ref: "#/components/schemas/SocketFindTicket"
+        backup:
+          $ref: "#/components/schemas/SocketFindTicket"
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketListName:
+      description: One registered name. Exactly one of `name` and `name_token` names it.
+      type: object
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name.
+          type: string
+        name_token:
+          description: Any other name's token path.
+          type: string
+          format: byte
+        sealed_name:
+          description: With `name_token`, its seal, which a client opens; a seal that does not open is dropped.
+          type: string
+          format: byte
+
+    SocketListResult:
+      type: object
+      required:
+        - names
+      properties:
+        names:
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketListName"
+        next_cursor:
+          description: The next page's `cursor`. Empty on the last page.
+          type: string
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketKeysResult:
+      type: object
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketTicketKey"

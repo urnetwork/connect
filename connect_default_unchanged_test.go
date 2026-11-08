@@ -27,6 +27,8 @@ type defaultClientFixture struct {
 	deliveries chan string
 }
 
+// Default settings with encryption and the control ping off and a quiet log.
+// None of the opt-ins under test is set.
 func defaultClientFixtureSettings() *ClientSettings {
 	settings := DefaultClientSettings()
 	settings.EncryptionSettings.Mode = EncryptionModeOff
@@ -35,6 +37,9 @@ func defaultClientFixtureSettings() *ClientSettings {
 	return settings
 }
 
+// A default client whose generic receive callback records each simple
+// message as "generic <source> <carrier> <content>". The client is canceled
+// when the test ends.
 func newDefaultClientFixture(t *testing.T) *defaultClientFixture {
 	t.Helper()
 	self := &defaultClientFixture{
@@ -59,6 +64,7 @@ func newDefaultClientFixture(t *testing.T) *defaultClientFixture {
 	return self
 }
 
+// A source as a delivery line names it: control, self or peer.
 func defaultClientSourceName(client *Client, source TransferPath) string {
 	switch {
 	case source.IsControlSource():
@@ -102,6 +108,8 @@ func (self *defaultClientFixture) inject(route chan []byte, sourceId Id, frames 
 	}
 }
 
+// Fails the test unless the next delivery line is `want`, waiting up to 30
+// seconds.
 func (self *defaultClientFixture) requireDelivery(want string) {
 	self.t.Helper()
 	select {
@@ -114,10 +122,12 @@ func (self *defaultClientFixture) requireDelivery(want string) {
 	}
 }
 
+// A simple message frame carrying `content`.
 func defaultClientSimpleFrame(content string) *protocol.Frame {
 	return RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: content})
 }
 
+// A subprotocol frame of `id` carrying `payload`.
 func defaultClientSubprotocolFrame(id SubprotocolId, payload string) *protocol.Frame {
 	return &protocol.Frame{
 		MessageType:  protocol.MessageType_Subprotocol,
