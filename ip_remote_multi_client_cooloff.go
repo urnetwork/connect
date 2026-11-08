@@ -31,11 +31,11 @@ package connect
 // action, the user's Fixed IP exit, and fixed destination sets, which their
 // own retry backoff governs (FixedDestinationRetryMin).
 //
-// Family: a candidate that failed while the window was filling an IPv6
-// shortfall is drawn by the v6-capable request, and its failure is kept to
-// that request (cooloffScopeIpv6). The v4-capable fill may still draw it, so a
-// small pool does not lose a provider whose IPv4 works. A later failure of any
-// other kind widens the entry to every request.
+// Every note leaves the provider out of every discovery request. The
+// evaluation is a control-plane ping to the provider and its construction a
+// contract and transport setup, neither of which involves the provider's
+// egress families, so a failure while the window fills an IPv6 shortfall is
+// as much a failure for the v4-capable fill.
 //
 // The starvation escape. A pool of one to three providers can be emptied by a
 // cool-off, and a transient failure of ours (a ping lost to the uplink) is
@@ -64,24 +64,6 @@ import (
 // read by the exclusions it is sent.
 const cooloffMaxCount = 64
 
-// Which discovery requests leave a cooled-off provider out.
-type cooloffScope int
-
-const (
-	// every request: the provider failed as a provider
-	cooloffScopeAll cooloffScope = iota
-	// only the v6-capable request that fills an IPv6 shortfall: the provider
-	// failed while the window was filling that shortfall
-	cooloffScopeIpv6
-)
-
-func (self cooloffScope) String() string {
-	if self == cooloffScopeIpv6 {
-		return "ipv6"
-	}
-	return "all"
-}
-
 // Why a provider was noted: the reason value of its log line.
 const (
 	cooloffReasonEvaluation = "evaluation"
@@ -90,35 +72,28 @@ const (
 
 type cooloffEntry struct {
 	failTime time.Time
-	scope    cooloffScope
 }
 
 type destinationCooloff struct {
 	stateLock sync.Mutex
-	// when each provider last failed, and which requests leave it out
+	// when each provider last failed
 	entries map[MultiHopId]cooloffEntry
 	// the last round whose exclusions applied came back empty: the next round
 	// runs without them
 	skipNext bool
-	// whether the current discovery round applies the exclusions; the round's
-	// v6-capable request reads it (cooloffIpv6Exclusions)
-	roundActive bool
 	// the excluded count last logged, so the line is written on a change
 	loggedExcludedCount int
 }
 
-// Notes that destination failed at failTime in scope, keeping at most
-// maxCount providers, the newest. An all-scope failure widens an IPv6 entry.
-func (self *destinationCooloff) note(destination MultiHopId, failTime time.Time, scope cooloffScope, maxCount int) cooloffScope {
+// Notes that destination failed at failTime, keeping at most maxCount
+// providers, the newest.
+func (self *destinationCooloff) note(destination MultiHopId, failTime time.Time, maxCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.entries == nil {
 		self.entries = map[MultiHopId]cooloffEntry{}
 	}
-	if previous, ok := self.entries[destination]; ok && previous.scope == cooloffScopeAll {
-		scope = cooloffScopeAll
-	}
-	self.entries[destination] = cooloffEntry{failTime: failTime, scope: scope}
+	self.entries[destination] = cooloffEntry{failTime: failTime}
 	for maxCount < len(self.entries) {
 		var oldest MultiHopId
 		var oldestTime time.Time
@@ -129,24 +104,23 @@ func (self *destinationCooloff) note(destination MultiHopId, failTime time.Time,
 		}
 		delete(self.entries, oldest)
 	}
-	return scope
 }
 
-// Adds each provider that failed in scope within timeout of now to excluded,
-// drops the expired, and returns how many it added.
-func (self *destinationCooloff) addExclusions(excluded map[MultiHopId]bool, now time.Time, timeout time.Duration, scope cooloffScope) int {
+// Adds each provider that failed within timeout of now to excluded, drops the
+// expired, and returns how many it added.
+func (self *destinationCooloff) addExclusions(excluded map[MultiHopId]bool, now time.Time, timeout time.Duration) int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return self.addExclusionsWithLock(excluded, now, timeout, scope)
+	return self.addExclusionsWithLock(excluded, now, timeout)
 }
 
-func (self *destinationCooloff) addExclusionsWithLock(excluded map[MultiHopId]bool, now time.Time, timeout time.Duration, scope cooloffScope) int {
+func (self *destinationCooloff) addExclusionsWithLock(excluded map[MultiHopId]bool, now time.Time, timeout time.Duration) int {
 	count := 0
 	for destination, entry := range self.entries {
 		switch {
 		case timeout <= now.Sub(entry.failTime):
 			delete(self.entries, destination)
-		case entry.scope == scope && !excluded[destination]:
+		case !excluded[destination]:
 			excluded[destination] = true
 			count += 1
 		}
@@ -163,12 +137,12 @@ func (self *destinationCooloff) expireWithLock(now time.Time, timeout time.Durat
 	}
 }
 
-// Whether destination failed for every request within timeout of now.
+// Whether destination failed within timeout of now.
 func (self *destinationCooloff) holds(destination MultiHopId, now time.Time, timeout time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	entry, ok := self.entries[destination]
-	return ok && entry.scope == cooloffScopeAll && now.Sub(entry.failTime) < timeout
+	return ok && now.Sub(entry.failTime) < timeout
 }
 
 // Drops every entry and the pending skip, and returns how many entries it
@@ -179,7 +153,6 @@ func (self *destinationCooloff) clear() int {
 	count := len(self.entries)
 	self.entries = nil
 	self.skipNext = false
-	self.roundActive = false
 	self.loggedExcludedCount = 0
 	return count
 }
@@ -192,9 +165,9 @@ func (self *multiClientWindow) cooloffTimeout() time.Duration {
 	return self.settings.EvaluationFailureCooloff
 }
 
-// Notes a provider this window found failing, for reason, in scope. See the
-// file comment for which failures call this.
-func (self *multiClientWindow) noteFailedDestination(destination MultiHopId, scope cooloffScope, reason string) {
+// Notes a provider this window found failing, for reason. See the file
+// comment for which failures call this.
+func (self *multiClientWindow) noteFailedDestination(destination MultiHopId, reason string) {
 	if self.cooloffTimeout() <= 0 || destination.Len() == 0 {
 		return
 	}
@@ -203,28 +176,18 @@ func (self *multiClientWindow) noteFailedDestination(destination MultiHopId, sco
 			return
 		}
 	}
-	scope = self.cooloff.note(destination, time.Now(), scope, cooloffMaxCount)
+	self.cooloff.note(destination, time.Now(), cooloffMaxCount)
 	loggerOrDefault(self.log).Infof("%s\n", relEvent(
 		"cooloff",
 		"window", self.windowName(),
 		"provider", destination.Tail(),
 		"action", "note",
 		"reason", reason,
-		"scope", scope,
 		"for", self.cooloffTimeout(),
 	))
 }
 
-// The scope of a candidate's evaluation failure: kept to the v6-capable
-// request when the candidate was evaluated to fill an open IPv6 shortfall.
-func cooloffEvaluationScope(ipv6Shortfall int, ipFamily IpFamily) cooloffScope {
-	if 0 < ipv6Shortfall && ipFamily.SupportsIpv6() {
-		return cooloffScopeIpv6
-	}
-	return cooloffScopeAll
-}
-
-// Whether destination is cooling off for every request now: a candidate
+// Whether destination is cooling off now: a candidate
 // listed before its provider failed in this window is refused when the
 // expansion takes it. Logs the refusal.
 func (self *multiClientWindow) cooloffHolds(destination MultiHopId) bool {
@@ -241,8 +204,8 @@ func (self *multiClientWindow) cooloffHolds(destination MultiHopId) bool {
 	return true
 }
 
-// Adds the providers still cooling off for every request to a discovery
-// round's exclusions, unless the starvation escape skips them: the window
+// Adds the providers still cooling off to a discovery round's exclusions,
+// unless the starvation escape skips them: the window
 // holds no provider (heldCount 0), or the last round with exclusions came back
 // empty. Returns how many it added; the round reports its result to
 // noteCooloffRound.
@@ -263,13 +226,11 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 		}
 		self.cooloff.skipNext = false
 		if skipReason != "" {
-			self.cooloff.roundActive = false
 			// expire what is due, and keep the rest for the next round
 			self.cooloff.expireWithLock(now, timeout)
 			return 0, false, len(self.cooloff.entries)
 		}
-		self.cooloff.roundActive = true
-		count := self.cooloff.addExclusionsWithLock(excluded, now, timeout, cooloffScopeAll)
+		count := self.cooloff.addExclusionsWithLock(excluded, now, timeout)
 		changed := count != self.cooloff.loggedExcludedCount
 		self.cooloff.loggedExcludedCount = count
 		return count, changed, 0
@@ -306,48 +267,6 @@ func (self *multiClientWindow) noteCooloffRound(excludedCount int, empty bool) {
 	self.cooloff.stateLock.Lock()
 	defer self.cooloff.stateLock.Unlock()
 	self.cooloff.skipNext = true
-}
-
-// The exclusions of a round's v6-capable request: the round's own, plus the
-// providers whose failure was kept to that request, while the round applies
-// the cool-off.
-func (self *multiClientWindow) cooloffIpv6Exclusions(excludeDestinations []MultiHopId) []MultiHopId {
-	timeout := self.cooloffTimeout()
-	if timeout <= 0 {
-		return excludeDestinations
-	}
-	extra := map[MultiHopId]bool{}
-	for _, destination := range excludeDestinations {
-		extra[destination] = true
-	}
-	added := func() int {
-		self.cooloff.stateLock.Lock()
-		defer self.cooloff.stateLock.Unlock()
-		if !self.cooloff.roundActive {
-			return 0
-		}
-		return self.cooloff.addExclusionsWithLock(extra, time.Now(), timeout, cooloffScopeIpv6)
-	}()
-	if added == 0 {
-		return excludeDestinations
-	}
-	combined := make([]MultiHopId, 0, len(extra))
-	combined = append(combined, excludeDestinations...)
-	for destination := range extra {
-		if !containsMultiHopId(excludeDestinations, destination) {
-			combined = append(combined, destination)
-		}
-	}
-	return combined
-}
-
-func containsMultiHopId(destinations []MultiHopId, destination MultiHopId) bool {
-	for _, candidate := range destinations {
-		if candidate == destination {
-			return true
-		}
-	}
-	return false
 }
 
 // Clears the cool-off for the window's silent rebuild, which is the

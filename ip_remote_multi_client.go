@@ -13815,7 +13815,7 @@ func (self *windowErrorRemoval) finish() {
 		// a verdict against the provider that the recent-exit memory did not
 		// keep as an outage of ours, judged while another exit receives:
 		// discovery leaves it out for a while
-		self.window.noteFailedDestination(self.client.Destination(), cooloffScopeAll, cooloffReasonVerdict)
+		self.window.noteFailedDestination(self.client.Destination(), cooloffReasonVerdict)
 	}
 }
 
@@ -15406,7 +15406,7 @@ requestCandidates:
 				}
 				if providerFailure {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
-					self.noteFailedDestination(args.Destination, cooloffEvaluationScope(ipv6Shortfall, args.IpFamily), cooloffReasonEvaluation)
+					self.noteFailedDestination(args.Destination, cooloffReasonEvaluation)
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
@@ -15485,7 +15485,7 @@ requestCandidates:
 					state := ProviderStateNotAdded
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
-						self.noteFailedDestination(args.Destination, cooloffEvaluationScope(ipv6Shortfall, args.IpFamily), cooloffReasonEvaluation)
+						self.noteFailedDestination(args.Destination, cooloffReasonEvaluation)
 					}
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {

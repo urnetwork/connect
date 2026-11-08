@@ -15,8 +15,16 @@ import (
 // passed, except where the starvation escape lets it back.
 
 // A live quality window over the recent-exit test generator, which fails
-// every evaluation, with the given receiving-siblings seam and a fresh uplink.
+// every evaluation, with the given receiving-siblings seam and a fresh uplink,
+// sized by a quality profile of two to four exits. A profile pins the window,
+// so it opens no IPv6 shortfall.
 func cooloffTestWindow(t *testing.T, generator MultiClientGenerator, receivingSiblings func(*multiClientChannel) int) *multiClientWindow {
+	return cooloffTestWindowWithProfile(t, generator, receivingSiblings, unfixedTestProfile(WindowTypeQuality))
+}
+
+// cooloffTestWindow with the given performance profile; nil sizes the window
+// by the default settings, with their soft minimum of one v6-capable exit.
+func cooloffTestWindowWithProfile(t *testing.T, generator MultiClientGenerator, receivingSiblings func(*multiClientChannel) int, performanceProfile *PerformanceProfile) *multiClientWindow {
 	t.Helper()
 	resetBackendDegraded()
 	t.Cleanup(resetBackendDegraded)
@@ -42,7 +50,7 @@ func cooloffTestWindow(t *testing.T, generator MultiClientGenerator, receivingSi
 		func(*multiClientChannel) {},
 		nil,
 		WindowTypeQuality,
-		unfixedTestProfile(WindowTypeQuality),
+		performanceProfile,
 		settings,
 		func() *ReliabilitySettings { return ReliabilitySettingsFrom(settings) },
 		fresh,
@@ -110,6 +118,83 @@ func TestCooloffExcludesProvidersThatFailedEvaluation(t *testing.T) {
 	}
 }
 
+// Family-aware discovery: both requests offer the dual-stack provider unless
+// they exclude it, and the v4-capable fill adds one IPv4 provider it has not
+// offered before, so a round is never empty. Every evaluation fails.
+type cooloffFamilyTestGenerator struct {
+	cooloffTestGenerator
+	dualstack      MultiHopId
+	familyExcludes map[IpFamilyFilter][][]MultiHopId
+}
+
+func (self *cooloffFamilyTestGenerator) NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.calls = append(self.calls, recentExitTestCall{kind: "discover"})
+	self.familyExcludes[ipFamily] = append(self.familyExcludes[ipFamily], slices.Clone(excludeDestinations))
+	destinations := map[MultiHopId]DestinationStats{}
+	if !slices.Contains(excludeDestinations, self.dualstack) {
+		destinations[self.dualstack] = DestinationStats{IpFamily: IpFamilyDualstack}
+	}
+	if ipFamily == IpFamilyFilterV4Capable {
+		destinations[RequireMultiHopId(NewId())] = DestinationStats{IpFamily: IpFamilyV4Only}
+	}
+	return destinations, nil
+}
+
+func (self *cooloffFamilyTestGenerator) recordedFamilyExcludes(ipFamily IpFamilyFilter) [][]MultiHopId {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.familyExcludes[ipFamily])
+}
+
+// The evaluation is a control-plane ping, which says nothing of the
+// provider's egress families: a dual-stack provider that failed while the
+// window filled its IPv6 shortfall (the window's one exit carries no IPv6)
+// is left out of the v4-capable fill too, and evaluated once in its
+// cool-off. Kept to the v6-capable request, it was drawn again by the
+// v4-capable fill, which the platform draws dual-stack first, on every round.
+func TestCooloffLeavesAProviderThatFailedDuringAnIpv6ShortfallOutOfEveryRequest(t *testing.T) {
+	dualstack := RequireMultiHopId(NewId())
+	generator := &cooloffFamilyTestGenerator{
+		dualstack:      dualstack,
+		familyExcludes: map[IpFamilyFilter][][]MultiHopId{},
+	}
+	window := cooloffTestWindowWithProfile(t, generator, nil, nil)
+	installStickyTestChannel(window, cooloffTestHeldChannel())
+
+	waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "evaluate the dual-stack provider and note it", func(calls []recentExitTestCall) bool {
+		return 0 < recentExitTestCount(calls, "evaluate", dualstack) && cooloffTestNoted(window, dualstack)
+	})
+	if len(generator.recordedFamilyExcludes(IpFamilyFilterV6Capable)) == 0 {
+		t.Fatal("the window never asked the v6-capable request: its IPv6 shortfall was not open")
+	}
+	start := len(generator.recordedFamilyExcludes(IpFamilyFilterV4Capable))
+	calls := waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "fill five more times", func(calls []recentExitTestCall) bool {
+		return start+5 <= len(generator.recordedFamilyExcludes(IpFamilyFilterV4Capable))
+	})
+	if count := recentExitTestCount(calls, "evaluate", dualstack); count != 1 {
+		t.Errorf("the dual-stack provider was evaluated %d times within its cool-off, want 1", count)
+	}
+	// the first fill may come from a round that read the cool-off before the
+	// note
+	fills := generator.recordedFamilyExcludes(IpFamilyFilterV4Capable)
+	for i, excludes := range fills[start+1:] {
+		if !slices.Contains(excludes, dualstack) {
+			t.Errorf("v4-capable fill %d after the failure did not exclude the dual-stack provider", i+2)
+		}
+	}
+}
+
+// Whether the window's cool-off holds an entry for destination, read without
+// the refusal's log line.
+func cooloffTestNoted(window *multiClientWindow, destination MultiHopId) bool {
+	window.cooloff.stateLock.Lock()
+	defer window.cooloff.stateLock.Unlock()
+	_, ok := window.cooloff.entries[destination]
+	return ok
+}
+
 // A verdict removal is held against the provider only while another exit is
 // receiving: then the uplink demonstrably delivers. With no receiving sibling,
 // in a one-exit window or with the uplink stale past the gate's hold, the
@@ -141,7 +226,7 @@ func TestCooloffStarvationEscape(t *testing.T) {
 	log := newRecordingLogger()
 	window.log = log
 	destination := RequireMultiHopId(NewId())
-	window.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	window.noteFailedDestination(destination, cooloffReasonEvaluation)
 
 	excluded := map[MultiHopId]bool{}
 	AssertEqual(t, window.addCooloffExclusions(excluded, 0), 0)
@@ -168,39 +253,6 @@ func TestCooloffStarvationEscape(t *testing.T) {
 	AssertEqual(t, len(log.linesWith("action=refuse")), 1)
 }
 
-// A candidate that failed while the window filled an IPv6 shortfall is kept
-// out of the v6-capable request only; the v4-capable fill may still draw it.
-// A later failure of any other kind widens it to every request.
-func TestCooloffKeepsAnIpv6FillFailureToTheIpv6Request(t *testing.T) {
-	window := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
-	destination := RequireMultiHopId(NewId())
-	other := RequireMultiHopId(NewId())
-	AssertEqual(t, cooloffEvaluationScope(1, IpFamilyDualstack), cooloffScopeIpv6)
-	AssertEqual(t, cooloffEvaluationScope(1, IpFamilyV4Only), cooloffScopeAll)
-	AssertEqual(t, cooloffEvaluationScope(0, IpFamilyDualstack), cooloffScopeAll)
-	window.noteFailedDestination(destination, cooloffScopeIpv6, cooloffReasonEvaluation)
-
-	excluded := map[MultiHopId]bool{}
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 0)
-	AssertEqual(t, len(excluded), 0)
-	AssertEqual(t, window.cooloffHolds(destination), false)
-	ipv6 := window.cooloffIpv6Exclusions([]MultiHopId{other})
-	AssertEqual(t, len(ipv6), 2)
-	AssertEqual(t, slices.Contains(ipv6, destination) && slices.Contains(ipv6, other), true)
-
-	// a skipped round applies neither
-	window.addCooloffExclusions(map[MultiHopId]bool{}, 0)
-	AssertEqual(t, window.cooloffIpv6Exclusions([]MultiHopId{other}), []MultiHopId{other})
-
-	window.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonVerdict)
-	excluded = map[MultiHopId]bool{}
-	AssertEqual(t, window.addCooloffExclusions(excluded, 1), 1)
-	AssertEqual(t, window.cooloffHolds(destination), true)
-	// and a narrower note never narrows it again
-	window.noteFailedDestination(destination, cooloffScopeIpv6, cooloffReasonEvaluation)
-	AssertEqual(t, window.cooloffHolds(destination), true)
-}
-
 // The watchdog's silent rebuild is the programmatic form of a reconnect, and
 // a reconnect starts with no cool-off: the rebuild clears it. A rebuild that
 // stands down because a provider landed first leaves it.
@@ -212,7 +264,7 @@ func TestCooloffClearedByTheRebuild(t *testing.T) {
 	log := newRecordingLogger()
 	window := outcomeTestWindow(ctx, log)
 	window.armOutcome()
-	window.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	window.noteFailedDestination(destination, cooloffReasonEvaluation)
 	AssertEqual(t, window.cooloffHolds(destination), true)
 	window.rebuildWindow(45 * time.Second)
 	AssertEqual(t, window.cooloffHolds(destination), false)
@@ -222,7 +274,7 @@ func TestCooloffClearedByTheRebuild(t *testing.T) {
 
 	aborted := outcomeTestWindow(ctx, newRecordingLogger())
 	aborted.armOutcome()
-	aborted.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	aborted.noteFailedDestination(destination, cooloffReasonEvaluation)
 	aborted.noteClientAdded(nil)
 	aborted.rebuildWindow(45 * time.Second)
 	AssertEqual(t, aborted.cooloffHolds(destination), true)
@@ -237,22 +289,22 @@ func TestCooloffEntriesExpireAndAreBounded(t *testing.T) {
 	start := time.Now()
 	timeout := time.Minute
 	cooloff := &destinationCooloff{}
-	cooloff.note(first, start, cooloffScopeAll, 2)
-	cooloff.note(second, start.Add(time.Second), cooloffScopeAll, 2)
+	cooloff.note(first, start, 2)
+	cooloff.note(second, start.Add(time.Second), 2)
 
 	excluded := map[MultiHopId]bool{}
-	AssertEqual(t, cooloff.addExclusions(excluded, start.Add(timeout-time.Second), timeout, cooloffScopeAll), 2)
+	AssertEqual(t, cooloff.addExclusions(excluded, start.Add(timeout-time.Second), timeout), 2)
 	AssertEqual(t, excluded, map[MultiHopId]bool{first: true, second: true})
 
 	// past the bound the oldest leaves
-	cooloff.note(third, start.Add(2*time.Second), cooloffScopeAll, 2)
+	cooloff.note(third, start.Add(2*time.Second), 2)
 	excluded = map[MultiHopId]bool{}
-	cooloff.addExclusions(excluded, start.Add(2*time.Second), timeout, cooloffScopeAll)
+	cooloff.addExclusions(excluded, start.Add(2*time.Second), timeout)
 	AssertEqual(t, excluded, map[MultiHopId]bool{second: true, third: true})
 
 	// past the cool-off an entry leaves
 	excluded = map[MultiHopId]bool{}
-	cooloff.addExclusions(excluded, start.Add(timeout+time.Second), timeout, cooloffScopeAll)
+	cooloff.addExclusions(excluded, start.Add(timeout+time.Second), timeout)
 	AssertEqual(t, excluded, map[MultiHopId]bool{third: true})
 	AssertEqual(t, len(cooloff.entries), 1)
 }
@@ -263,19 +315,19 @@ func TestCooloffSkipsFixedDestinationsAndCanBeTurnedOff(t *testing.T) {
 	destination := RequireMultiHopId(NewId())
 
 	fixed := recentExitBareWindow(&recentExitFixedTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
-	fixed.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	fixed.noteFailedDestination(destination, cooloffReasonEvaluation)
 	excluded := map[MultiHopId]bool{}
 	fixed.addCooloffExclusions(excluded, 1)
 	AssertEqual(t, len(excluded), 0)
 
 	off := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	off.settings.EvaluationFailureCooloff = 0
-	off.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	off.noteFailedDestination(destination, cooloffReasonEvaluation)
 	off.addCooloffExclusions(excluded, 1)
 	AssertEqual(t, len(excluded), 0)
 
 	on := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
-	on.noteFailedDestination(destination, cooloffScopeAll, cooloffReasonEvaluation)
+	on.noteFailedDestination(destination, cooloffReasonEvaluation)
 	on.addCooloffExclusions(excluded, 1)
 	AssertEqual(t, excluded, map[MultiHopId]bool{destination: true})
 }
