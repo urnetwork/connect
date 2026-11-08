@@ -281,7 +281,7 @@ func TestCooloffLogsTheExclusionsWhenTheirCountChanges(t *testing.T) {
 	second := RequireMultiHopId(NewId())
 	rounds := func() {
 		for range 3 {
-			window.addCooloffExclusions(map[MultiHopId]bool{}, 1)
+			window.addCooloffExclusions(map[MultiHopId]bool{}, 1, true)
 		}
 	}
 
@@ -335,31 +335,31 @@ func TestCooloffStarvationEscape(t *testing.T) {
 	window.noteFailedDestination(destination, cooloffReasonEvaluation)
 
 	excluded := map[MultiHopId]bool{}
-	count, listing := window.addCooloffExclusions(excluded, 0)
+	count, listing := window.addCooloffExclusions(excluded, 0, true)
 	AssertEqual(t, count, 0)
 	AssertEqual(t, listing.skipped, true)
 	AssertEqual(t, len(excluded), 0)
 	AssertEqual(t, len(log.linesWith("reason=empty_window")), 1)
 
-	count, listing = window.addCooloffExclusions(excluded, 1)
+	count, listing = window.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, count, 1)
 	AssertEqual(t, listing.skipped, false)
 	AssertEqual(t, excluded, map[MultiHopId]bool{destination: true})
 	window.noteCooloffRound(1, true)
 
 	excluded = map[MultiHopId]bool{}
-	count, listing = window.addCooloffExclusions(excluded, 1)
+	count, listing = window.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, count, 0)
 	AssertEqual(t, listing.skipped, true)
 	AssertEqual(t, len(excluded), 0)
 	AssertEqual(t, len(log.linesWith("reason=empty_round")), 1)
 
 	// the skip is spent, and a round that found something sets none
-	count, _ = window.addCooloffExclusions(excluded, 1)
+	count, _ = window.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, count, 1)
 	window.noteCooloffRound(1, false)
 	excluded = map[MultiHopId]bool{}
-	count, _ = window.addCooloffExclusions(excluded, 1)
+	count, _ = window.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, count, 1)
 }
 
@@ -374,17 +374,17 @@ func TestCooloffRefusesOnlyACandidateListedBeforeItsProviderFailed(t *testing.T)
 	destination := RequireMultiHopId(NewId())
 
 	// a round listed the provider, and then it failed
-	_, before := window.addCooloffExclusions(map[MultiHopId]bool{}, 0)
+	_, before := window.addCooloffExclusions(map[MultiHopId]bool{}, 0, true)
 	window.noteFailedDestination(destination, cooloffReasonEvaluation)
 	AssertEqual(t, window.cooloffRefuses(destination, before), true)
 
 	// an escape round lists it after the failure
-	_, escape := window.addCooloffExclusions(map[MultiHopId]bool{}, 0)
+	_, escape := window.addCooloffExclusions(map[MultiHopId]bool{}, 0, true)
 	AssertEqual(t, escape.skipped, true)
 	AssertEqual(t, window.cooloffRefuses(destination, escape), false)
 
 	// a round that excluded it, whose request returned it anyway
-	_, excluding := window.addCooloffExclusions(map[MultiHopId]bool{}, 1)
+	_, excluding := window.addCooloffExclusions(map[MultiHopId]bool{}, 1, true)
 	AssertEqual(t, excluding.skipped, false)
 	AssertEqual(t, window.cooloffRefuses(destination, excluding), true)
 	AssertEqual(t, window.cooloffRefuses(destination, cooloffListing{}), true)
@@ -446,7 +446,7 @@ func TestCooloffWindowWithoutALiveExitHoldsNoProvider(t *testing.T) {
 			exit := c.exit()
 			window.clients[exit.ClientId()] = exit
 
-			excluded, count, listing := window.discoveryRoundExclusions()
+			excluded, count, listing := window.discoveryRoundExclusions(false, nil)
 			AssertEqual(t, listing.skipped, c.skipped)
 			AssertEqual(t, excluded[failed], !c.skipped)
 			AssertEqual(t, count, map[bool]int{false: 1, true: 0}[c.skipped])
@@ -482,6 +482,45 @@ func TestCooloffRoundAsksThePoolUnlessItAskedOnlyForIpv6(t *testing.T) {
 	AssertEqual(t, familyAware.cooloffRoundAsksThePool(false, ipv6), false)
 	// without the family filter a demand read asks the whole pool
 	AssertEqual(t, legacy.cooloffRoundAsksThePool(false, ipv6), true)
+}
+
+// Only a round that asks the pool spends the skip an empty round left. A probe,
+// or a family-filtered IPv6 demand read, landing between the empty round and
+// the next ordinary one applies the exclusions and leaves the skip for it, so
+// the escape is not a round late.
+func TestCooloffRoundThatAsksOnlyForIpv6LeavesTheSkip(t *testing.T) {
+	window := recentExitBareWindow(&cooloffFamilyContextTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
+	failed := RequireMultiHopId(NewId())
+	window.noteFailedDestination(failed, cooloffReasonEvaluation)
+	held := cooloffTestHeldChannel()
+	window.clients[held.ClientId()] = held
+
+	cases := []struct {
+		name       string
+		probeOnly  bool
+		demandRead *discoveryDemandRead
+	}{
+		{name: "probe", probeOnly: true},
+		{name: "ipv6 demand read", demandRead: &discoveryDemandRead{ipVersion: 6}},
+	}
+	for _, c := range cases {
+		// a round that applied the exclusions came back empty
+		_, count, listing := window.discoveryRoundExclusions(false, nil)
+		AssertEqual(t, listing.skipped, false)
+		window.noteCooloffRound(count, true)
+
+		// the round that asks only for IPv6 applies them and leaves the skip
+		excluded, _, listing := window.discoveryRoundExclusions(c.probeOnly, c.demandRead)
+		if listing.skipped || !excluded[failed] {
+			t.Errorf("%s: spent the skip an empty round left (skipped=%v excluded=%v)", c.name, listing.skipped, excluded[failed])
+		}
+
+		// the next round that asks the pool spends it
+		excluded, _, listing = window.discoveryRoundExclusions(false, nil)
+		if !listing.skipped || excluded[failed] {
+			t.Errorf("%s: the next round that asks the pool did not skip (skipped=%v excluded=%v)", c.name, listing.skipped, excluded[failed])
+		}
+	}
 }
 
 // The watchdog's silent rebuild is the programmatic form of a reconnect, and
@@ -576,17 +615,17 @@ func TestCooloffSkipsFixedDestinationsAndCanBeTurnedOff(t *testing.T) {
 	fixed := recentExitBareWindow(&recentExitFixedTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	fixed.noteFailedDestination(destination, cooloffReasonEvaluation)
 	excluded := map[MultiHopId]bool{}
-	fixed.addCooloffExclusions(excluded, 1)
+	fixed.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, len(excluded), 0)
 
 	off := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	off.settings.EvaluationFailureCooloff = 0
 	off.noteFailedDestination(destination, cooloffReasonEvaluation)
-	off.addCooloffExclusions(excluded, 1)
+	off.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, len(excluded), 0)
 
 	on := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	on.noteFailedDestination(destination, cooloffReasonEvaluation)
-	on.addCooloffExclusions(excluded, 1)
+	on.addCooloffExclusions(excluded, 1, true)
 	AssertEqual(t, excluded, map[MultiHopId]bool{destination: true})
 }

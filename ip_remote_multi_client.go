@@ -13446,9 +13446,11 @@ func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGener
 // service refresh's refusals, and the providers cooling off unless the
 // starvation escape skips them (ip_remote_multi_client_cooloff.go). For the
 // escape the window holds a provider while one of its exits does
-// (holdsWindowForCooloff). Returns the cool-off's excluded count and the
-// round's listing.
-func (self *multiClientWindow) discoveryRoundExclusions() (map[MultiHopId]bool, int, cooloffListing) {
+// (holdsWindowForCooloff), and only a round that asks the pool spends the
+// skip an empty round left (cooloffRoundAsksThePool: not a probe, nor a
+// family-filtered IPv6 demand read). Returns the cool-off's excluded count
+// and the round's listing.
+func (self *multiClientWindow) discoveryRoundExclusions(probeOnly bool, demandRead *discoveryDemandRead) (map[MultiHopId]bool, int, cooloffListing) {
 	self.stateLock.Lock()
 	windowDestinations := map[MultiHopId]bool{}
 	heldCount := 0
@@ -13462,7 +13464,7 @@ func (self *multiClientWindow) discoveryRoundExclusions() (map[MultiHopId]bool, 
 	}
 	self.stateLock.Unlock()
 	self.addServiceRefreshExclusions(windowDestinations)
-	cooloffExcluded, cooloffListing := self.addCooloffExclusions(windowDestinations, heldCount)
+	cooloffExcluded, cooloffListing := self.addCooloffExclusions(windowDestinations, heldCount, self.cooloffRoundAsksThePool(probeOnly, demandRead))
 	return windowDestinations, cooloffExcluded, cooloffListing
 }
 
@@ -13506,6 +13508,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			return
 		}
 
+		// whether this round is a resize-pass probe, decided before its
+		// listing below
+		probeOnly := false
+
 		// exclude healthy destinations that are already in the window, and
 		// the providers cooling off (ip_remote_multi_client_cooloff.go). The
 		// round's candidates carry its cool-off listing to the expansion.
@@ -13513,7 +13519,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		var cooloffListing cooloffListing
 		windowDestinations := func() map[MultiHopId]bool {
 			var windowDestinations map[MultiHopId]bool
-			windowDestinations, cooloffExcluded, cooloffListing = self.discoveryRoundExclusions()
+			windowDestinations, cooloffExcluded, cooloffListing = self.discoveryRoundExclusions(probeOnly, demandRead)
 			return windowDestinations
 		}
 
@@ -13524,7 +13530,6 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// family-aware discovery order: v6-capable first while a shortfall
 		// is open, then the main fill -- or, for a resize-pass probe, the
 		// v6-capable request alone; see enumerateDestinations
-		probeOnly := false
 		var destinations []enumeratedDestination
 		var err error
 		if demandRead == nil {

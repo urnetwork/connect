@@ -239,11 +239,14 @@ func (self *multiClientWindow) cooloffRefuses(destination MultiHopId, listing co
 
 // Adds the providers still cooling off to a discovery round's exclusions,
 // unless the starvation escape skips them: the window holds no provider
-// (heldCount 0), or the last round with exclusions came back empty. Returns
-// how many it added, and the listing the round's candidates carry to the
-// expansion's refusal (cooloffRefuses); the round reports its result to
-// noteCooloffRound.
-func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool, heldCount int) (int, cooloffListing) {
+// (heldCount 0), or the last round with exclusions came back empty. Only a
+// round that asks the pool (asksThePool, cooloffRoundAsksThePool) spends that
+// skip: a probe or a family-filtered IPv6 demand read landing between an
+// empty round and the next ordinary one applies the exclusions and leaves the
+// skip for it. Returns how many it added, and the listing the round's
+// candidates carry to the expansion's refusal (cooloffRefuses); the round
+// reports its result to noteCooloffRound.
+func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool, heldCount int, asksThePool bool) (int, cooloffListing) {
 	timeout := self.cooloffTimeout()
 	if timeout <= 0 {
 		return 0, cooloffListing{}
@@ -255,10 +258,12 @@ func (self *multiClientWindow) addCooloffExclusions(excluded map[MultiHopId]bool
 		defer self.cooloff.stateLock.Unlock()
 		if heldCount == 0 {
 			skipReason = "empty_window"
-		} else if self.cooloff.skipNext {
+		} else if asksThePool && self.cooloff.skipNext {
 			skipReason = "empty_round"
 		}
-		self.cooloff.skipNext = false
+		if asksThePool {
+			self.cooloff.skipNext = false
+		}
 		listing := cooloffListing{generation: self.cooloff.generation, skipped: skipReason != ""}
 		if skipReason != "" {
 			// expire what is due, and keep the rest for the next round
