@@ -545,8 +545,9 @@ counted (§11.2).
 
 `ClientSubprotocolStatsSnapshot{Sent, SentBytes, Received, ReceivedBytes,
 DroppedUnregistered, DroppedDecode, DroppedControlSource, MarshalOverrun,
-QueriesAnswered}` plus a per-id received count, monotonic for the client's
-lifetime, exposed next to `ReceiveStats`.
+QueriesAnswered, DroppedServiceIp, DroppedServiceSubprotocol,
+DroppedServiceOther}` plus a per-id received count, monotonic for the client's
+lifetime, exposed next to `ReceiveStats`. The three Service counters are §11.6's.
 
 ### 10.6 Review notes (2026-09-10)
 
@@ -675,3 +676,34 @@ frame from it, is dropped and counted instead of delivered. The platform has nev
 sent one, so only a forged frame ever took that path. Everything else is as it
 was: frames from peers, top-level frames from the control id, `Peer`'s existing
 fields, the batches a receive callback gets, and every byte on the wire.
+
+### 11.6 Service sources (2026-11-08)
+
+`ProvideMode_Service` (6) is the relationship of a platform edge's streams, both
+ways (sidecar DESIGN.md §6.10.1, C9). A Service source reaches subprotocols and
+nothing else, and only the ids the receiver lists in
+`ClientSettings.ServiceSubprotocolIds`:
+
+- The gate runs once per received item in `ReceiveSequence.receiveHead`, after the
+  Required receive gate and before delivery receipts and every callback, on the
+  acked and no-ack paths alike. No listener and no generic callback has to know
+  the mode. A listed id is delivered as from any peer, with `peer.ProvideMode`
+  Service and no roles or principal.
+- Everything else is dropped and counted: an unlisted id, or a wrapper that does
+  not decode, in `DroppedServiceSubprotocol`; IP frames in `DroppedServiceIp`; and
+  the rest, both query frames among them, in `DroppedServiceOther`. A query is
+  never answered, so a Service source learns nothing of what else the client
+  speaks. The item is still acked, as for an id with no listener.
+- The list is empty by default, which passes nothing. Connect names no id here: a
+  sidecar lists 21842 (§11.1). The receive path reads the list, so it must not
+  change after the client is built.
+- A Service contract verifies only at a client that provides Service, and only
+  while providing is not paused. `InitProvideSecretKeys` makes no Service key, so
+  a client that never chooses the mode holds none and refuses the contract.
+- A provider refuses a Service source under any security policy. The built-in
+  policy answers one with an incident, which neither the local bypass nor an
+  override can route (docs/IP_SECURITY.md §2.2 and §2.3).
+
+A client that opts in to nothing sees no change: no Service contract verifies at
+it, so the gate never runs, and the other modes' bytes on the wire are as they
+were.
