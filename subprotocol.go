@@ -24,6 +24,12 @@ package connect
 // the typed handler when the id has a codec and the bytes decode. An id with
 // neither is dropped and counted. The two query frame types are answered and
 // completed here and never reach application callbacks.
+//
+// The control id may send subprotocol frames to clients and clients never send
+// them to it (SUBPROTOCOL.md §8, decision 6). A frame from the control id reaches
+// only the listeners that opted in with `WithSubprotocolControlSource`, and only
+// when a platform carrier delivered it; the query frames are peer-to-peer and
+// never accepted from it. A peer's frame pays one source comparison for this.
 
 import (
 	"context"
@@ -85,13 +91,40 @@ type SubprotocolRawFunction = func(source TransferPath, subprotocolId Subprotoco
 // aliases are borrowed until the function returns.
 type SubprotocolHandler[T any] = func(source TransferPath, message T, peer Peer)
 
+// One listener's policy, set at registration: a raw callback or a typed
+// handler takes zero or more of these.
+type SubprotocolListenerOption struct {
+	acceptControlSource bool
+}
+
+// Opts one listener in to the id's frames from the control id, which it then
+// receives as well as its peers' frames. A listener without it never sees
+// them. Only a platform carrier delivers such a frame, so a P2P carrier cannot
+// reach an opted-in listener by forging the control id, whatever else the
+// client has set. These frames are the platform's: not end-to-end encrypted and
+// under no contract, so a listener must treat them as hints.
+func WithSubprotocolControlSource() SubprotocolListenerOption {
+	return SubprotocolListenerOption{acceptControlSource: true}
+}
+
+// Whether a registration's options opt its listener in to the control id's
+// frames. No options, the default, leave it out.
+func subprotocolListenerAcceptsControlSource(opts []SubprotocolListenerOption) bool {
+	for _, opt := range opts {
+		if opt.acceptControlSource {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	errSubprotocolIdZero        = errors.New("subprotocol id 0 is invalid")
 	errSubprotocolIdReserved    = fmt.Errorf("subprotocol ids below %d are reserved for the network", SubprotocolReservedLimit)
 	errSubprotocolCodecExists   = errors.New("subprotocol already has a codec")
 	errSubprotocolNoCodec       = errors.New("subprotocol has no codec: register one or pass WithSubprotocolCodec")
 	errSubprotocolCodecType     = errors.New("subprotocol codec message type does not match")
-	errSubprotocolControl       = errors.New("the control id speaks only the top-level protocol")
+	errSubprotocolControl       = errors.New("clients do not send subprotocols to the control id")
 	errSubprotocolNegativeSize  = errors.New("subprotocol codec reported a negative size")
 	errSubprotocolShortEncoding = errors.New("subprotocol codec discarded the wrapper header")
 	errSubprotocolQueryNoResult = errors.New("subprotocols query got no result")
@@ -284,8 +317,12 @@ func newSubprotocolMessageFactory[T any]() func() T {
 type subprotocolTypedDeliverer interface {
 	deliver(source TransferPath, messageBytes []byte, peer Peer) error
 	codec() any
+	acceptsControlSource() bool
 }
 
+// One id's codec and typed handler. Message instances come from the codec when
+// it is a `SubprotocolMessagePool[T]`, and from a factory otherwise. Immutable
+// once registered.
 type subprotocolTyped[T any] struct {
 	subprotocolCodec SubprotocolCodec[T]
 	handler          SubprotocolHandler[T]
@@ -293,12 +330,29 @@ type subprotocolTyped[T any] struct {
 	factory          func() T
 	log              Logger
 	clientTag        string
+	// opted in with WithSubprotocolControlSource
+	acceptControlSource bool
 }
 
+// The registered codec, type-erased. A send that names no codec of its own
+// uses it (`subprotocolSendCodec`).
 func (self *subprotocolTyped[T]) codec() any {
 	return self.subprotocolCodec
 }
 
+// Whether the handler was registered with `WithSubprotocolControlSource`. It
+// decides only which listeners a frame from the control id reaches. Whether
+// such a frame is delivered at all also depends on its carrier, which
+// `receiveSubprotocolFrame` checks first.
+func (self *subprotocolTyped[T]) acceptsControlSource() bool {
+	return self.acceptControlSource
+}
+
+// Decodes one message and hands it to the handler. A pooled instance is
+// released after the handler returns, and also on a decode error. A decode
+// error is returned without calling the handler, and the caller counts it. A
+// handler panic is recovered, and logged at verbosity 1, so it cannot stop the
+// receive goroutine.
 func (self *subprotocolTyped[T]) deliver(source TransferPath, messageBytes []byte, peer Peer) error {
 	var m T
 	if self.pool != nil {
@@ -322,9 +376,14 @@ func (self *subprotocolTyped[T]) deliver(source TransferPath, messageBytes []byt
 	return nil
 }
 
+// One raw listener of an id. Its callback id is what its remove function
+// matches, and its control-source opt-in is its own: opting one listener in
+// opts no other listener of the id in.
 type subprotocolRawCallback struct {
 	callbackId uint64
 	callback   SubprotocolRawFunction
+	// opted in with WithSubprotocolControlSource
+	acceptControlSource bool
 }
 
 // One id's listeners. Immutable once published; the received counter is a
@@ -341,6 +400,16 @@ func (self *subprotocolEntry) clone() *subprotocolEntry {
 		typed:         self.typed,
 		receivedCount: self.receivedCount,
 	}
+}
+
+// Whether any listener of the id opted in to frames from the control id.
+func (self *subprotocolEntry) acceptsControlSource() bool {
+	for _, rawCallback := range self.rawCallbacks {
+		if rawCallback.acceptControlSource {
+			return true
+		}
+	}
+	return self.typed != nil && self.typed.acceptsControlSource()
 }
 
 // The immutable table the receive path reads.
@@ -388,10 +457,13 @@ type ClientSubprotocolStatsSnapshot struct {
 	ReceivedByteCount   uint64
 	DroppedUnregistered uint64
 	DroppedDecode       uint64
-	MarshalOverrun      uint64
-	QueriesSent         uint64
-	QueriesAnswered     uint64
-	QueryReplyDrops     uint64
+	// frames from the control id that no listener opted in to, or that no
+	// platform carrier delivered, and query frames from the control id
+	DroppedControlSource uint64
+	MarshalOverrun       uint64
+	QueriesSent          uint64
+	QueriesAnswered      uint64
+	QueryReplyDrops      uint64
 	// per registered id, messages delivered to its listeners
 	ReceivedById map[SubprotocolId]uint64
 
@@ -420,10 +492,12 @@ type subprotocolRegistry struct {
 	receivedByteCount   atomic.Uint64
 	droppedUnregistered atomic.Uint64
 	droppedDecode       atomic.Uint64
-	marshalOverrun      atomic.Uint64
-	queriesSent         atomic.Uint64
-	queriesAnswered     atomic.Uint64
-	queryReplyDrops     atomic.Uint64
+	// see ClientSubprotocolStatsSnapshot.DroppedControlSource
+	droppedControlSource atomic.Uint64
+	marshalOverrun       atomic.Uint64
+	queriesSent          atomic.Uint64
+	queriesAnswered      atomic.Uint64
+	queryReplyDrops      atomic.Uint64
 
 	// see ClientSubprotocolStatsSnapshot.DroppedServiceIp and its neighbors
 	droppedServiceIp          atomic.Uint64
@@ -446,17 +520,18 @@ func (self *subprotocolRegistry) snapshot() ClientSubprotocolStatsSnapshot {
 		byId[id] = entry.receivedCount.Load()
 	}
 	return ClientSubprotocolStatsSnapshot{
-		Sent:                self.sent.Load(),
-		SentByteCount:       self.sentByteCount.Load(),
-		Received:            self.received.Load(),
-		ReceivedByteCount:   self.receivedByteCount.Load(),
-		DroppedUnregistered: self.droppedUnregistered.Load(),
-		DroppedDecode:       self.droppedDecode.Load(),
-		MarshalOverrun:      self.marshalOverrun.Load(),
-		QueriesSent:         self.queriesSent.Load(),
-		QueriesAnswered:     self.queriesAnswered.Load(),
-		QueryReplyDrops:     self.queryReplyDrops.Load(),
-		ReceivedById:        byId,
+		Sent:                 self.sent.Load(),
+		SentByteCount:        self.sentByteCount.Load(),
+		Received:             self.received.Load(),
+		ReceivedByteCount:    self.receivedByteCount.Load(),
+		DroppedUnregistered:  self.droppedUnregistered.Load(),
+		DroppedDecode:        self.droppedDecode.Load(),
+		DroppedControlSource: self.droppedControlSource.Load(),
+		MarshalOverrun:       self.marshalOverrun.Load(),
+		QueriesSent:          self.queriesSent.Load(),
+		QueriesAnswered:      self.queriesAnswered.Load(),
+		QueryReplyDrops:      self.queryReplyDrops.Load(),
+		ReceivedById:         byId,
 
 		DroppedServiceIp:          self.droppedServiceIp.Load(),
 		DroppedServiceSubprotocol: self.droppedServiceSubprotocol.Load(),
@@ -497,7 +572,11 @@ func (self *subprotocolRegistry) updateEntry(subprotocolId SubprotocolId, update
 	return nil
 }
 
-func (self *subprotocolRegistry) addRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction, allowReserved bool) (func(), error) {
+// Attaches a raw listener to an id and returns the function that removes it.
+// `allowReserved` admits the reserved ids, for the network's own listeners.
+// `acceptControlSource` opts this one listener in to the id's frames from the
+// control id.
+func (self *subprotocolRegistry) addRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction, allowReserved bool, acceptControlSource bool) (func(), error) {
 	if err := checkSubprotocolId(subprotocolId, allowReserved); err != nil {
 		return nil, err
 	}
@@ -508,7 +587,11 @@ func (self *subprotocolRegistry) addRawCallback(subprotocolId SubprotocolId, cal
 	err := self.updateEntry(subprotocolId, func(entry *subprotocolEntry) error {
 		self.nextCallbackId += 1
 		callbackId = self.nextCallbackId
-		entry.rawCallbacks = append(entry.rawCallbacks, subprotocolRawCallback{callbackId: callbackId, callback: callback})
+		entry.rawCallbacks = append(entry.rawCallbacks, subprotocolRawCallback{
+			callbackId:          callbackId,
+			callback:            callback,
+			acceptControlSource: acceptControlSource,
+		})
 		return nil
 	})
 	if err != nil {
@@ -555,31 +638,38 @@ func (self *subprotocolRegistry) registerTyped(subprotocolId SubprotocolId, type
 }
 
 // Attaches a raw listener to a subprotocol id. Any number may be attached to
-// one id; each receives every message of the id before the typed handler.
+// one id; each receives every message of the id from a peer, before the typed
+// handler, and from the control id only with `WithSubprotocolControlSource`.
 // Refuses id 0 and the reserved ids.
-func (self *Client) AddSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction) (remove func(), err error) {
-	return self.subprotocols.addRawCallback(subprotocolId, callback, false)
+func (self *Client) AddSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction, opts ...SubprotocolListenerOption) (remove func(), err error) {
+	return self.subprotocols.addRawCallback(subprotocolId, callback, false, subprotocolListenerAcceptsControlSource(opts))
 }
 
 // The network's own listeners may use reserved ids.
 func (self *Client) addReservedSubprotocolRawCallback(subprotocolId SubprotocolId, callback SubprotocolRawFunction) (remove func(), err error) {
-	return self.subprotocols.addRawCallback(subprotocolId, callback, true)
+	return self.subprotocols.addRawCallback(subprotocolId, callback, true, false)
 }
 
 // Registers the codec and typed handler of a subprotocol id on a client. One
 // codec per id; a second registration is an error. Refuses id 0 and the
 // reserved ids. The codec may implement SubprotocolMessagePool to own its
-// instances. Package-level because Go methods cannot be generic.
-func RegisterSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T]) (unregister func(), err error) {
-	return registerSubprotocol(client, subprotocolId, codec, handler, false)
+// instances. The handler gets messages from peers, and from the control id only
+// with `WithSubprotocolControlSource`. Package-level because Go methods cannot
+// be generic.
+func RegisterSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T], opts ...SubprotocolListenerOption) (unregister func(), err error) {
+	return registerSubprotocol(client, subprotocolId, codec, handler, false, subprotocolListenerAcceptsControlSource(opts))
 }
 
 // The network's own subprotocols may use reserved ids.
 func registerReservedSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T]) (unregister func(), err error) {
-	return registerSubprotocol(client, subprotocolId, codec, handler, true)
+	return registerSubprotocol(client, subprotocolId, codec, handler, true, false)
 }
 
-func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T], allowReserved bool) (func(), error) {
+// The registration behind `RegisterSubprotocol` and the reserved one, which
+// returns the function that unregisters it. `allowReserved` admits the reserved
+// ids, for the network's own subprotocols. `acceptControlSource` opts the
+// handler in to the id's frames from the control id.
+func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, codec SubprotocolCodec[T], handler SubprotocolHandler[T], allowReserved bool, acceptControlSource bool) (func(), error) {
 	if codec == nil {
 		return nil, errors.New("nil codec")
 	}
@@ -587,10 +677,11 @@ func registerSubprotocol[T any](client *Client, subprotocolId SubprotocolId, cod
 		return nil, errors.New("nil handler")
 	}
 	typed := &subprotocolTyped[T]{
-		subprotocolCodec: codec,
-		handler:          handler,
-		log:              client.log,
-		clientTag:        client.clientTag,
+		subprotocolCodec:    codec,
+		handler:             handler,
+		log:                 client.log,
+		clientTag:           client.clientTag,
+		acceptControlSource: acceptControlSource,
 	}
 	if pool, ok := codec.(SubprotocolMessagePool[T]); ok {
 		typed.pool = pool
@@ -670,11 +761,20 @@ func (self *Client) dispatchSubprotocolFrames(source TransferPath, frames []*pro
 			}
 			self.receiveSubprotocolFrame(table, source, frame, peer)
 		case protocol.MessageType_TransferSubprotocolsQuery:
+			if source.IsControlSource() {
+				// the control id is not queried and is never answered
+				self.subprotocols.droppedControlSource.Add(1)
+				break
+			}
 			if table == nil {
 				table = self.subprotocols.table.Load()
 			}
 			self.answerSubprotocolsQuery(table, source, frame, peer)
 		case protocol.MessageType_TransferSubprotocolsQueryResult:
+			if source.IsControlSource() {
+				self.subprotocols.droppedControlSource.Add(1)
+				break
+			}
 			self.completeSubprotocolsQuery(frame)
 		default:
 			if 0 < removed {
@@ -690,6 +790,13 @@ func (self *Client) dispatchSubprotocolFrames(source TransferPath, frames []*pro
 	return kept
 }
 
+// Delivers one subprotocol frame to every raw listener of its id, then to the
+// id's typed handler. A frame whose header does not decode, or whose id has no
+// listener, is dropped and counted. The same holds for a frame from the control
+// id unless two conditions are met: a platform carrier (h1, h3, h3dns or
+// h3dnspump) read it, and a listener of the id opted in. When both hold, only
+// the listeners that opted in get the frame. A payload the typed codec cannot
+// decode is counted after the raw listeners have had it.
 func (self *Client) receiveSubprotocolFrame(table *subprotocolTable, source TransferPath, frame *protocol.Frame, peer Peer) {
 	registry := self.subprotocols
 	subprotocolId, payload, ok := decodeSubprotocolHeader(frame.MessageBytes)
@@ -702,13 +809,34 @@ func (self *Client) receiveSubprotocolFrame(table *subprotocolTable, source Tran
 		registry.droppedUnregistered.Add(1)
 		return
 	}
+	controlSource := source.IsControlSource()
+	if controlSource {
+		// Only a platform carrier can deliver the platform. A P2P carrier reaches
+		// a peer, and an unknown or custom carrier is not taken for one. The type
+		// comes from the carrier that read the frame, never from the frame.
+		platformCarrier := false
+		switch peer.TransportType {
+		case TransportTypeH1, TransportTypeH3, TransportTypeH3Dns, TransportTypeH3DnsPump:
+			platformCarrier = true
+		}
+		if !platformCarrier || !entry.acceptsControlSource() {
+			registry.droppedControlSource.Add(1)
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[c]subprotocol %d control source %s carrier=%s dropped\n", subprotocolId, self.clientTag, peer.TransportType)
+			}
+			return
+		}
+	}
 	registry.received.Add(1)
 	registry.receivedByteCount.Add(uint64(len(payload)))
 	entry.receivedCount.Add(1)
 	for _, rawCallback := range entry.rawCallbacks {
+		if controlSource && !rawCallback.acceptControlSource {
+			continue
+		}
 		self.callSubprotocolRaw(rawCallback.callback, source, subprotocolId, payload, peer)
 	}
-	if entry.typed != nil {
+	if entry.typed != nil && (!controlSource || entry.typed.acceptsControlSource()) {
 		if err := entry.typed.deliver(source, payload, peer); err != nil {
 			registry.droppedDecode.Add(1)
 			if self.log.V(1).Enabled() {
@@ -818,7 +946,7 @@ func (self *Client) completeSubprotocolsQuery(frame *protocol.Frame) {
 
 // Asks a peer which subprotocol ids it can receive. Waits for the result or
 // ctx; an old peer ignores the query, so a timeout means unknown, not none.
-// The control id is not queried.
+// The control id is not queried, and a result from it is dropped.
 func (self *Client) QuerySubprotocols(ctx context.Context, destinationId Id, opts ...any) ([]SubprotocolId, error) {
 	if destinationId == ControlId {
 		return nil, errSubprotocolControl

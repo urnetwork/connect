@@ -86,6 +86,9 @@ type TransferCarrierProperties struct {
 	// DATAGRAM reader remains nonblocking. Unknown preserves compatibility for
 	// custom transports that predate lane-aware receive admission.
 	ReceiveReliability CarrierReliability
+	// The one client a P2P receive route's association reaches. Zero is unknown,
+	// which `ClientSettings.P2pPeerSourceOnly` refuses.
+	receivePeerId Id
 	// UnreliableMaxMessageByteCount refines a hybrid send carrier whose lane is
 	// selected by a contiguous message-size threshold. A positive limit means
 	// frames at or below the limit are unreliable and larger frames are reliable.
@@ -343,6 +346,8 @@ type transferReceiveDisposition struct {
 	transportType TransportType
 	reliability   CarrierReliability
 	h1Credit      platformH1ReceiveCredit
+	// the exact route's TransferCarrierProperties.receivePeerId
+	peerId Id
 }
 
 type transferCarrierMultiRouteReader interface {
@@ -1999,14 +2004,17 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 }
 
 func (self *routeSnapshot) receiveDisposition(route Route, message []byte) transferReceiveDisposition {
+	// one lookup per frame: this runs for every frame of every client
+	properties := self.routeCarrierProperties[route]
 	return transferReceiveDisposition{
 		transportType: self.transportType(route),
-		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
+		reliability:   properties.ReceiveReliability,
 		h1Credit: platformH1ReceiveCredit{
-			lane:      self.routeCarrierProperties[route].h1ReceiveRetained,
+			lane:      properties.h1ReceiveRetained,
 			byteCount: ByteCount(cap(message)),
-			done:      self.routeCarrierProperties[route].h1ReceiveDone,
+			done:      properties.h1ReceiveDone,
 		},
+		peerId: properties.receivePeerId,
 	}
 }
 

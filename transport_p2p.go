@@ -441,6 +441,9 @@ type p2pReceiveRouteLane struct {
 	transport   Transport
 	route       Route
 	reliability CarrierReliability
+	// the association's adjacent peer; zero when the constructor's caller named
+	// none
+	peerId Id
 }
 
 // updateP2pConnectionReceiveRoutes publishes or retires both physical receive
@@ -473,7 +476,10 @@ func updateP2pConnectionReceiveRoutes(
 		manager.UpdateTransportWithProperties(
 			lane.transport,
 			[]Route{lane.route},
-			TransferCarrierProperties{ReceiveReliability: lane.reliability},
+			TransferCarrierProperties{
+				ReceiveReliability: lane.reliability,
+				receivePeerId:      lane.peerId,
+			},
 		)
 	}
 	if hooks.afterConnectedUpdate != nil {
@@ -927,6 +933,9 @@ func (self *P2pTransport) run() {
 					messageHandler,
 					ready.transportDelay,
 				)
+				for laneIndex := range receiveLanes {
+					receiveLanes[laneIndex].peerId = self.peerId
+				}
 				if self.settings.afterReceiveTransportForTest != nil {
 					self.settings.afterReceiveTransportForTest(p2pReceiveTransport)
 				}
@@ -2342,6 +2351,10 @@ func (self *P2pReceiveTransport) MatchesSend(destination TransferPath) bool {
 	return false
 }
 
+// Answers for the reader's own path, once, when the route is matched: it never
+// sees a frame, so it cannot judge a frame's source. That is
+// `ClientSettings.P2pPeerSourceOnly`, in the client receive loop, where the
+// frame's path is already parsed.
 func (self *P2pReceiveTransport) MatchesReceive(destination TransferPath) bool {
 	return true
 }
