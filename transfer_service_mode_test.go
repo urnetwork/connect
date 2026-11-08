@@ -2,9 +2,10 @@ package connect
 
 // C9: `ProvideMode_Service`, the relationship of a platform edge's streams. A
 // Service source reaches the subprotocols its receiver lists and nothing else: no
-// IP, no generic frame, no query (DESIGN §6.10.1). These run two clients over the
-// in-process gateways under hand-fed contracts, unless a test says otherwise, so a
-// frame takes the real path through contract verification and the receive sequence.
+// IP, no generic frame, no query (sidecar DESIGN.md §6.10.1). These run two
+// clients over the in-process gateways under hand-fed contracts, unless a test
+// says otherwise, so a frame takes the real path through contract verification
+// and the receive sequence.
 //
 // The audit behind this file read every `ProvideMode_` site in connect for a default
 // that would widen Service:

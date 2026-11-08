@@ -1,7 +1,7 @@
 package connect
 
 // C14: the mux answers a local zone's names on the device, for every query type,
-// over UDP and TCP, so no query for one leaves it (DESIGN §12.9, owner decision 85).
+// over UDP and TCP, so no query for one leaves it (sidecar DESIGN.md §12.9).
 // These run a real client stack against a real mux and a fake DoH upstream that
 // remembers what it was asked, unless a test says otherwise.
 
