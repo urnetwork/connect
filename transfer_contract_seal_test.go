@@ -25,7 +25,7 @@ import (
 )
 
 // Every provide mode a contract can carry, read from the enum so that a mode added
-// later, as C9's Service will be, is held to the seals without a row to remember.
+// later, as C9's Service was, is held to the seals without a row to remember.
 func contractSealProvideModes() []protocol.ProvideMode {
 	modes := []protocol.ProvideMode{}
 	values := protocol.ProvideMode_None.Descriptor().Values()
@@ -36,6 +36,10 @@ func contractSealProvideModes() []protocol.ProvideMode {
 	}
 	return modes
 }
+
+// The one subprotocol a Service source may reach here. C9 delivers nothing else
+// from such a source, so its messages ride this rather than the test message.
+const contractSealServiceSubprotocolId = SubprotocolId(4402)
 
 // One contract's seals.
 type contractSeals struct {
@@ -109,6 +113,7 @@ func newContractSealFixture(t *testing.T) *contractSealFixture {
 	settings.ContractManagerSettings.NetworkEventTimeChangeHmac = time.Unix(1, 0)
 	// nothing here answers the key publisher, so it does not run
 	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	settings.ServiceSubprotocolIds = []SubprotocolId{contractSealServiceSubprotocolId}
 	self := &contractSealFixture{
 		t:        t,
 		client:   NewClient(ctx, NewId(), NewNoContractClientOob(), settings),
@@ -136,13 +141,13 @@ func newContractSealFixture(t *testing.T) *contractSealFixture {
 			}
 			contents = append(contents, message.Content)
 		}
-		if len(contents) == 0 {
-			return
-		}
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		self.deliveries = append(self.deliveries, contractSealDelivery{contents: contents, peer: peer})
+		self.record(contents, peer)
 	})
+	if _, err := self.client.AddSubprotocolRawCallback(contractSealServiceSubprotocolId, func(_ TransferPath, _ SubprotocolId, payload []byte, peer Peer) {
+		self.record([]string{string(payload)}, peer)
+	}); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		cancel()
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -157,6 +162,16 @@ func newContractSealFixture(t *testing.T) *contractSealFixture {
 		}
 	})
 	return self
+}
+
+// Keeps one callback's messages, if it carried any.
+func (self *contractSealFixture) record(contents []string, peer Peer) {
+	if len(contents) == 0 {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.deliveries = append(self.deliveries, contractSealDelivery{contents: contents, peer: peer})
 }
 
 // A contract from this fixture's source, as `fill` leaves it, signed under `mode`.
@@ -217,6 +232,26 @@ func contractSealPack(t *testing.T, sequenceId Id, sequenceNumber uint64, conten
 	}
 }
 
+// `contractSealPack`, carried as a source of `mode` may carry it here: a Service
+// source's message rides the listed subprotocol, and every other mode's the test
+// message.
+func contractSealModePack(t *testing.T, mode protocol.ProvideMode, sequenceId Id, sequenceNumber uint64, content string) *protocol.Pack {
+	t.Helper()
+	pack := contractSealPack(t, sequenceId, sequenceNumber, content)
+	if mode != protocol.ProvideMode_Service {
+		return pack
+	}
+	messageBytes, err := proto.Marshal(&protocol.SubprotocolMessage{
+		SubprotocolId: uint32(contractSealServiceSubprotocolId),
+		MessageBytes:  []byte(content),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack.Frames = []*protocol.Frame{{MessageType: protocol.MessageType_Subprotocol, MessageBytes: messageBytes}}
+	return pack
+}
+
 // Puts a Pack on the route and waits for all it causes.
 func (self *contractSealFixture) inject(pack *protocol.Pack) {
 	self.t.Helper()
@@ -259,7 +294,7 @@ func TestContractSealsReachPeerInEveryProvideMode(t *testing.T) {
 		for _, mode := range contractSealProvideModes() {
 			fixture.sourceId = NewId()
 			seals := newContractSeals()
-			pack := contractSealPack(t, NewId(), 0, "sealed")
+			pack := contractSealModePack(t, mode, NewId(), 0, "sealed")
 			pack.Head = true
 			pack.ContractFrame = contractSealContractFrame(t, fixture.contract(mode, seals.fill))
 			fixture.inject(pack)
@@ -569,9 +604,9 @@ func TestCompanionContractCarriesForwardSeals(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newContractSealFixture(t)
 		forward := newContractSeals()
-		for _, mode := range []protocol.ProvideMode{protocol.ProvideMode_Network, protocol.ProvideMode_Stream} {
+		for _, mode := range contractSealProvideModes() {
 			fixture.sourceId = NewId()
-			pack := contractSealPack(t, NewId(), 0, "reply")
+			pack := contractSealModePack(t, mode, NewId(), 0, "reply")
 			pack.Head = true
 			pack.CompanionContract = true
 			pack.ContractFrame = contractSealContractFrame(t, fixture.contract(mode, forward.fill))
@@ -709,7 +744,7 @@ func TestContractsWithoutSealsReadEmpty(t *testing.T) {
 			if 0 < len(older.GetUnknown()) {
 				t.Fatalf("%s: an unsealed contract writes %x past the older fields", mode, older.GetUnknown())
 			}
-			pack := contractSealPack(t, NewId(), 0, "older")
+			pack := contractSealModePack(t, mode, NewId(), 0, "older")
 			pack.Head = true
 			pack.ContractFrame = contractSealContractFrame(t, contract)
 			fixture.inject(pack)
