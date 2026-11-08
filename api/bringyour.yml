@@ -11851,6 +11851,319 @@ paths:
         "200":
           description: OK.
 
+  # §13.15's certificate routes (sidecar DESIGN.md §13.8). api serves them, and
+  # route_authz.go classifies them sidecar, so a `strict_exp` bearer reaches them
+  # under §7.4's allowlist while each route's own class below still applies.
+  # Each is planned until the certs routes land, and internal until then. Bytes
+  # are base64; `attestation` is the encoded `Signed` of a `TlsKeyAttestation`
+  # (sidecar protocol/tls.proto) by the device's identity key, purpose
+  # `tls-key`. `POST /tls/suspend` is not listed: it stays a model call inside
+  # api and taskworker until a caller outside them exists.
+  /tls/cert-order:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Order a certificate for a device's key
+      description: |
+        A device's CSR for its own P-256 key, with that key's attestation. Takes
+        a service token for audience `certs` from a client that holds a `tls/` or
+        `smtp/` grant; the token names the caller, never the body. The CSR's
+        names must be exactly the caller's set: its network's pair, each live
+        alias's pair, or its scope's pair alone. The attestation must verify
+        under the caller's identity key for the CSR's key and those names. The
+        row is written before anything else happens and the order runs later, so
+        the answer gives its id and state, and the caller polls
+        `GET /tls/cert-order/{cert_id}`.
+
+        `replaces` names the live certificate this order renews, by RFC 9773's
+        certificate id, which takes it out of the order limits. It is stored
+        nowhere.
+      operationId: tlsCertOrder
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertOrderArgs"
+      responses:
+        "200":
+          description: The row, written before the order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderResult"
+        "403":
+          description: |
+            No `tls/` or `smtp/` grant, a CSR for other names or another curve,
+            or an attestation that does not verify for this key and these names.
+        "429":
+          description: Past the set's limit. The body gives `retry_after_ms`.
+
+  /tls/cert-order/{cert_id}:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read an order
+      description: |
+        The caller's own order: its state, how long to wait before asking again,
+        the chain once it issues, leaf first, and the CA's suggested renewal
+        window. Takes a service token for audience `certs`, from the order's own
+        sidecar; another caller's order answers 404.
+      operationId: tlsCertOrderGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: cert_id
+          in: path
+          required: true
+          description: udid. The row's id from `POST /tls/cert-order`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertOrderStatus"
+        "404":
+          description: No such order of this caller's.
+
+  /tls/cert-register:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Register a custom domain's chain
+      description: |
+        A Team custom domain's chain (v1), from a desktop that ordered it under
+        the domain's own ACME account. The chain's key and names must match a
+        queued row, or the attestation sent with it, so a device cannot register
+        another device's key. Takes a client token of the network.
+      operationId: tlsCertRegister
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRegisterArgs"
+      responses:
+        "200":
+          description: Registered.
+        "403":
+          description: The chain's key or names match no queued row and no attestation.
+
+  /tls/certs:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the network's certificates
+      description: |
+        The network's certificates with their attestations, for each device's
+        certificate transparency watch, and the custom-domain CSRs waiting for an
+        ordering desktop. A reader verifies each attestation itself, under the
+        identity key its own verified state holds, and never trusts this answer
+        for it. Takes a client token of the network.
+      operationId: tlsCerts
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCertsResult"
+
+  /tls/cert-revoke:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Revoke a certificate
+      description: |
+        Revokes a certificate of the caller's own client, or, with a network
+        admin's token, any of the network's. `key_compromise` revokes with reason
+        keyCompromise. The revocation runs after the answer, and the row reads
+        `revoking` until the CA takes it.
+      operationId: tlsCertRevoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCertRevokeArgs"
+      responses:
+        "200":
+          description: The revocation is queued.
+        "403":
+          description: Another client's certificate, without a network admin's token.
+        "404":
+          description: No such certificate in the network.
+
+  # §9.15's socket routes (sidecar DESIGN.md §9.5, §9.6, §9.8). server/cli/sockets
+  # serves them on its own host, on every lb host, and api never does. They are
+  # sidecar routes under §7.4, so a `strict_exp` bearer reaches them under its
+  # allowlist, while each route's own class below still applies. Each is planned
+  # until sockets serves it, and internal until then. Bodies are sidecar's
+  # socket_api.go: bytes are base64 and ids udid. A ticket is the encoded
+  # `SignedSocketTicket` and a claim the encoded `Signed` of a
+  # `SocketRegistrationClaim` by the listener's identity key, purpose
+  # `socket-registration` (sidecar protocol/socket.proto), and each crosses every
+  # hop unchanged, because only the bytes received verify. A refusal is a 200
+  # whose body holds `error`, and it signs and writes nothing.
+  /socket/registrations:
+    servers:
+      - url: https://sockets.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Register the caller's listeners
+      description: |
+        The calling client's full set of registrations, so listen, heartbeat,
+        drain and unlisten are one idempotent call. Each entry is a 45 s lease,
+        renewed by a heartbeat every 15 s that carries the listener's load. A
+        set of over 1,024 entries goes as pages over consecutive name-key ranges
+        under one `set_version`. A page is the whole set within
+        `[key_start, key_end)`: an entry it lacks there unlistens at once, and an
+        entry outside the range refuses the page. A name outside `tls/`, `smtp/`
+        and `ur/` arrives only as its token path, with its seal.
+
+        Every call re-checks each entry against the network's newest verified
+        projection and recreates missing state, so the answer is authoritative
+        for its page. Takes a client token whose client is the listener. Each
+        page takes one token of the caller's control-plane bucket.
+      operationId: socketRegistrations
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SocketRegistrationsArgs"
+      responses:
+        "200":
+          description: |
+            A status per entry, or `error` for the whole page: `unavailable` past
+            the bucket, with `retry_after_ms`; `stale` for a `set_version` older
+            than the stored one, which `set_version` gives back; `invalid` for a
+            page over 1,024 entries, out of order, or holding an entry outside its
+            range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketRegistrationsResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/find:
+    servers:
+      - url: https://sockets.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Find a listener
+      description: |
+        Picks two listeners of a name by weighted power of two choices and signs
+        a single-use 30 s ticket for each, a primary and a backup. The service
+        never contacts a listener: the dialer checks the listener's claim and
+        presents the ticket in its stream's open. A Find after failed tickets
+        carries them, and the service counts one only once it verifies and the
+        caller holds it.
+
+        The checks run in order, and a refusal signs nothing: the caller's
+        control-plane bucket, `unavailable`; the projection, `denied`, checked
+        before any listener is read; the paying network not spent, `quota`; the
+        pick, `no_listener` or `busy`. Takes a client token. A `urnetwork-edge`
+        caller sends its K client ids, one of which each ticket names, and any
+        other caller sending them is refused.
+      operationId: socketFind
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SocketFindArgs"
+      responses:
+        "200":
+          description: The tickets, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketFindResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/list:
+    servers:
+      - url: https://sockets.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the network's registered names
+      description: |
+        The caller's own network's registered names: an edge name as it is, and
+        any other name as its token path with its seal, which only a holder of
+        the network's socket key opens, so a client unseals names locally. Takes
+        a client token of the network. Each page takes one token of the caller's
+        control-plane bucket.
+      operationId: socketList
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: The previous page's `next_cursor`. Absent for the first page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of names, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketListResult"
+        "401":
+          description: No client token, or one revoked or rotated.
+
+  /socket/keys:
+    servers:
+      - url: https://sockets.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: List the ticket keys
+      description: |
+        The public keys a ticket verifies under. Keys rotate every 30 days with
+        overlap, so a holder keeps each key it is given until that key's
+        expiry. Public.
+      operationId: socketKeys
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SocketKeysResult"
+
 components:
   parameters:
     GkmGroupId:
@@ -25598,3 +25911,501 @@ components:
           type: array
           items:
             type: string
+
+    TlsCertState:
+      description: |
+        Where a certificate row stands: queued for certs' queue or, for a custom
+        domain, an ordering desktop; ordering at its CA; waiting_dns for its
+        challenge's serial and the canary; issued; failed, with no retry;
+        revoking until the CA takes a revocation; revoked; expired. A reader
+        takes a state it does not know as no certificate.
+      type: string
+      enum: [queued, ordering, waiting_dns, issued, failed, revoking, revoked, expired]
+
+    TlsCertOrderArgs:
+      type: object
+      required:
+        - csr
+        - attestation
+      properties:
+        csr:
+          description: A PKCS 10 request in DER, by the device's own P-256 key, for its set of names.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for that key and set.
+          type: string
+          format: byte
+        replaces:
+          description: RFC 9773's certificate id of the live certificate this order renews.
+          type: string
+
+    TlsCertOrderResult:
+      type: object
+      required:
+        - cert_id
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+
+    TlsCertOrderStatus:
+      type: object
+      required:
+        - state
+      properties:
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        retry_after_ms:
+          description: How long to wait before asking again. Absent sets no wait.
+          type: integer
+        chain:
+          description: Each certificate in DER, leaf first. Absent until the order issues.
+          type: array
+          items:
+            type: string
+            format: byte
+        ari_window_start:
+          description: datetime. RFC 9773's suggested renewal window, absent until the CA gives one.
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+
+    TlsCertRecord:
+      type: object
+      required:
+        - cert_id
+        - network_id
+        - client_id
+        - sidecar_id
+        - identifier_set_sha256
+        - spki_sha256
+        - attestation
+        - state
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        network_id:
+          description: udid
+          type: string
+        client_id:
+          description: udid
+          type: string
+        sidecar_id:
+          description: udid
+          type: string
+        identifier_set_sha256:
+          description: SHA-256 over the set's names, sorted, each followed by one zero byte.
+          type: string
+          format: byte
+        spki_sha256:
+          description: SHA-256 of the key's DER SubjectPublicKeyInfo.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded `Signed` of the key's `TlsKeyAttestation`, for a reader to verify itself.
+          type: string
+          format: byte
+        csr:
+          description: The PKCS 10 request in DER, on a custom domain's queued row only.
+          type: string
+          format: byte
+        ca:
+          type: string
+        account_uri:
+          type: string
+        profile:
+          type: string
+        serial:
+          description: Lowercase hex. Absent until it issues.
+          type: string
+        not_before:
+          description: datetime
+          type: string
+          format: date-time
+        not_after:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_start:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+        state:
+          $ref: "#/components/schemas/TlsCertState"
+        successor_cert_id:
+          description: udid. The row that took over from this one.
+          type: string
+        chain:
+          description: A custom domain's registered chain, each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+
+    TlsCertsResult:
+      type: object
+      required:
+        - certs
+      properties:
+        certs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+        queued_csrs:
+          description: Custom-domain CSRs waiting for an ordering desktop (v1).
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCertRecord"
+
+    TlsCertRegisterArgs:
+      type: object
+      required:
+        - chain
+        - account_uri
+      properties:
+        cert_id:
+          description: udid. The queued row this chain answers. Absent when the attestation is sent instead.
+          type: string
+        attestation:
+          description: The encoded `Signed` of a `TlsKeyAttestation` for the chain's key and names.
+          type: string
+          format: byte
+        chain:
+          description: Each certificate in DER, leaf first.
+          type: array
+          items:
+            type: string
+            format: byte
+        account_uri:
+          description: The custom domain's ACME account that ordered it.
+          type: string
+
+    TlsCertRevokeArgs:
+      type: object
+      required:
+        - cert_id
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        key_compromise:
+          description: Revoke with reason keyCompromise.
+          type: boolean
+
+    SocketRegistrationsArgs:
+      description: |
+        A page of the calling client's set of registrations, sorted by name key:
+        the name of a `tls/`, `smtp/` or `ur/` name, else its token path.
+      type: object
+      required:
+        - set_version
+        - registrations
+      properties:
+        set_version:
+          description: Per client and increasing. A set's pages share it, and an older set is refused.
+          type: integer
+          format: int64
+        key_start:
+          description: The name key this page's range starts at.
+          type: string
+          format: byte
+        key_end:
+          description: The name key this page's range ends before. Empty, the range is unbounded.
+          type: string
+          format: byte
+        registrations:
+          description: At most 1,024 entries, each inside the range.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketRegistration"
+
+    SocketRegistration:
+      description: |
+        A lease on (network, name, listener client), at most one per client and
+        name. Exactly one of `name` and `name_token` names it. A client fills in
+        each default, since a zero cannot be told from a value left out.
+      type: object
+      required:
+        - listen_id
+        - claim
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name. Empty for any other name.
+          type: string
+        name_token:
+          description: Any other name's token path, 16 bytes a segment.
+          type: string
+          format: byte
+        sealed_name:
+          description: With `name_token`, the name's 152-byte seal, for listings.
+          type: string
+          format: byte
+        listen_id:
+          description: udid. Random per listen; a ticket for an older one is refused.
+          type: string
+        protocol:
+          description: Default `tcp`. A group serves one protocol.
+          type: string
+        version:
+          type: integer
+        alpn:
+          description: For `tls/`, the ALPN ids served.
+          type: array
+          items:
+            type: string
+        app_mode:
+          description: For `tls/`, `http` (the default) or `raw`. Empty for any other name.
+          type: string
+        weight:
+          description: Default 100, from 1 to 1000. The listener's relative share.
+          type: integer
+        max_streams:
+          description: Default 256. The hard cap at the listener.
+          type: integer
+        exclusive:
+          description: Refuse later registrations of the name.
+          type: boolean
+        affinity:
+          description: Honor affinity keys.
+          type: boolean
+        serving:
+          description: Default true. False keeps the lease and takes no tickets.
+          type: boolean
+        draining:
+          description: No new tickets; issued ones are accepted.
+          type: boolean
+        inflight:
+          description: The load report, the listener's streams in flight.
+          type: integer
+        claim:
+          description: |
+            The encoded `Signed` of a `SocketRegistrationClaim` by the listener's
+            identity key, purpose `socket-registration`. Find hands it to each
+            dialer beside the ticket.
+          type: string
+          format: byte
+
+    SocketRegistrationStatus:
+      description: |
+        How one entry stands: ok holds its lease; revoked passed before and no
+        longer does, so it closes with its streams; denied, refused by the gate
+        or its namespace; taken, an exclusive listener or another protocol holds
+        the group; invalid, the entry itself is malformed. A client takes a
+        status it does not know as no lease.
+      type: string
+      enum: [ok, revoked, denied, taken, invalid]
+
+    SocketRegistrationsResult:
+      type: object
+      required:
+        - statuses
+        - set_version
+        - server_time
+        - ticket_keys
+      properties:
+        statuses:
+          description: One per entry, in the page's order. Empty when `error` refused the page.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketRegistrationStatus"
+        set_version:
+          description: The stored `set_version`, which a refused client jumps past.
+          type: integer
+          format: int64
+        server_time:
+          description: The service's clock in Unix milliseconds, whose offset a listener applies to ticket expiries.
+          type: integer
+          format: int64
+        ticket_keys:
+          description: Every key a ticket may verify under.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketTicketKey"
+        urnetwork_edge:
+          description: udid. The `urnetwork-edge` network's id, which a listener compares a ticket's dialer network to.
+          type: string
+        streams_stopped:
+          description: The network's balance has stopped new streams, so a listener answers them `quota`.
+          type: boolean
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketErrorCode:
+      description: |
+        Why a whole call was refused: no_listener, nothing live and matching;
+        busy, every match at its `max_streams`; denied, the projection does not
+        allow the dial; quota, the paying network is spent; unavailable, the
+        caller's control-plane bucket, or a network the service has not loaded;
+        stale, a page's `set_version` is older than the stored one; invalid, a
+        page over its size, out of order or holding an entry outside its range.
+      type: string
+      enum: [no_listener, busy, denied, quota, unavailable, stale, invalid]
+
+    SocketError:
+      description: One refusal of a whole call. Nothing was signed or written.
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          $ref: "#/components/schemas/SocketErrorCode"
+        retry_after_ms:
+          description: How long to wait, for no_listener, busy, quota and unavailable. Absent sets no wait.
+          type: integer
+
+    SocketTicketKey:
+      description: A key tickets verify under. Its id fixes the algorithm, which is Ed25519.
+      type: object
+      required:
+        - key_id
+        - public_key
+        - expire_time_millis
+      properties:
+        key_id:
+          type: string
+        public_key:
+          description: The 32-byte Ed25519 public key.
+          type: string
+          format: byte
+        expire_time_millis:
+          description: The Unix millisecond from which nothing verifies under it.
+          type: integer
+          format: int64
+
+    SocketFindArgs:
+      description: |
+        Exactly one of `name` and `name_token` names the group. A dial's
+        protocol, version and ALPN are not sent until the metadata list names
+        them for Find, so meanwhile a dialer checks them in the listener's claim.
+      type: object
+      required:
+        - network_id
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name.
+          type: string
+        name_token:
+          description: Any other name's token path.
+          type: string
+          format: byte
+        network_id:
+          description: udid. The network the name is in, resolved per call; for a `ur/` name, `urnetwork-edge`.
+          type: string
+        affinity_key:
+          description: tlsedge's keyed hash of the visitor's /24 or /48, never stored.
+          type: string
+          format: byte
+        failed_tickets:
+          description: The tickets of the caller's last Find that failed it.
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketFailedTicket"
+        client_ids:
+          description: udids. A `urnetwork-edge` caller's K clients, one of which each ticket names.
+          type: array
+          items:
+            type: string
+
+    SocketFailedReason:
+      description: |
+        Why a dialer gave up on a ticket: timeout, no accept within the accept
+        timeout, the only reason an edge sends; refused, the listener refused
+        it, or its claim failed the dialer's own check.
+      type: string
+      enum: [timeout, refused]
+
+    SocketFailedTicket:
+      type: object
+      required:
+        - ticket
+        - reason
+      properties:
+        ticket:
+          description: The ticket as its Find returned it.
+          type: string
+          format: byte
+        reason:
+          $ref: "#/components/schemas/SocketFailedReason"
+
+    SocketFindTicket:
+      description: One listener's ticket, and the claim its dialer checks before the stream's open.
+      type: object
+      required:
+        - ticket
+        - claim
+      properties:
+        ticket:
+          description: The encoded `SignedSocketTicket`, which the stream's open carries as it came.
+          type: string
+          format: byte
+        claim:
+          description: The listener's registration claim.
+          type: string
+          format: byte
+
+    SocketFindResult:
+      description: The tickets or one refusal. `backup` is absent when one listener is all the group has.
+      type: object
+      properties:
+        primary:
+          $ref: "#/components/schemas/SocketFindTicket"
+        backup:
+          $ref: "#/components/schemas/SocketFindTicket"
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketListName:
+      description: One registered name. Exactly one of `name` and `name_token` names it.
+      type: object
+      properties:
+        name:
+          description: A `tls/`, `smtp/` or `ur/` name.
+          type: string
+        name_token:
+          description: Any other name's token path.
+          type: string
+          format: byte
+        sealed_name:
+          description: With `name_token`, its seal, which a client opens; a seal that does not open is dropped.
+          type: string
+          format: byte
+
+    SocketListResult:
+      type: object
+      required:
+        - names
+      properties:
+        names:
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketListName"
+        next_cursor:
+          description: The next page's `cursor`. Empty on the last page.
+          type: string
+        error:
+          $ref: "#/components/schemas/SocketError"
+
+    SocketKeysResult:
+      type: object
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/SocketTicketKey"
