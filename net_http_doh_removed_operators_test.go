@@ -169,11 +169,12 @@ func TestNoDefaultResolverListNamesARemovedOperator(t *testing.T) {
 	testErrorRemovedOperatorEntries(t, lists)
 }
 
-// The default lists exactly: Cloudflare with both of its addresses, and Quad9
-// on its unfiltered 9.9.9.10, never its filtering 9.9.9.9. The operators
-// interleave, so a list walked in order asks Quad9 second, and the sdk's
+// The default lists exactly: Cloudflare with both of its addresses, Quad9 on
+// its unfiltered 9.9.9.10, never its filtering 9.9.9.9, then DNS.SB with both
+// of its addresses (2026-11-09). Cloudflare and Quad9 interleave, so a list
+// walked in order asks Quad9 second; DNS.SB follows them, and the sdk's
 // migration of an older default list reproduces this order.
-func TestDefaultResolverListsAreCloudflareAndQuad9(t *testing.T) {
+func TestDefaultResolverListsAreCloudflareQuad9AndDnsSb(t *testing.T) {
 	resolver := DefaultDnsResolverSettings()
 	for name, c := range map[string]struct {
 		got  []string
@@ -181,21 +182,25 @@ func TestDefaultResolverListsAreCloudflareAndQuad9(t *testing.T) {
 	}{
 		"RemoteDohUrlsIpv4": {resolver.RemoteDohUrlsIpv4, []string{
 			"https://1.1.1.1/dns-query", "https://9.9.9.10/dns-query", "https://1.0.0.1/dns-query",
+			"https://185.222.222.222/dns-query", "https://45.11.45.11/dns-query",
 		}},
 		"RemoteDohUrlsIpv6": {resolver.RemoteDohUrlsIpv6, []string{
 			"https://[2606:4700:4700::1111]/dns-query", "https://[2620:fe::10]/dns-query", "https://[2606:4700:4700::1001]/dns-query",
+			"https://[2a09::]/dns-query", "https://[2a11::]/dns-query",
 		}},
-		"RemoteDnsIpv4": {resolver.RemoteDnsIpv4, []string{"1.1.1.1", "9.9.9.10", "1.0.0.1"}},
-		"RemoteDnsIpv6": {resolver.RemoteDnsIpv6, []string{"2606:4700:4700::1111", "2620:fe::10", "2606:4700:4700::1001"}},
-		"LocalDnsIpv4":  {resolver.LocalDnsIpv4, []string{"9.9.9.10", "1.1.1.1", "1.0.0.1"}},
-		"LocalDnsIpv6":  {resolver.LocalDnsIpv6, []string{"2620:fe::10", "2606:4700:4700::1111", "2606:4700:4700::1001"}},
+		"RemoteDnsIpv4":    {resolver.RemoteDnsIpv4, []string{"1.1.1.1", "9.9.9.10", "1.0.0.1", "185.222.222.222", "45.11.45.11"}},
+		"RemoteDnsIpv6":    {resolver.RemoteDnsIpv6, []string{"2606:4700:4700::1111", "2620:fe::10", "2606:4700:4700::1001", "2a09::", "2a11::"}},
+		"LocalDohUrlsIpv4": {resolver.LocalDohUrlsIpv4, nil},
+		"LocalDohUrlsIpv6": {resolver.LocalDohUrlsIpv6, nil},
+		"LocalDnsIpv4":     {resolver.LocalDnsIpv4, []string{"9.9.9.10", "1.1.1.1", "1.0.0.1", "185.222.222.222", "45.11.45.11"}},
+		"LocalDnsIpv6":     {resolver.LocalDnsIpv6, []string{"2620:fe::10", "2606:4700:4700::1111", "2606:4700:4700::1001", "2a09::", "2a11::"}},
 	} {
 		if !slices.Equal(c.got, c.want) {
 			t.Errorf("default %s = %v, want %v", name, c.got, c.want)
 		}
 	}
 	// every v4 entry races its v6 sibling: the pair tables know both
-	// Cloudflare pairs and Quad9's
+	// Cloudflare pairs, Quad9's and both of DNS.SB's
 	dohSiblings := familySiblings(resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6, knownDohUrlPairs)
 	dnsSiblings := familySiblings(resolver.RemoteDnsIpv4, resolver.RemoteDnsIpv6, knownDnsServerPairs)
 	localDnsSiblings := familySiblings(resolver.LocalDnsIpv4, resolver.LocalDnsIpv6, knownDnsServerPairs)
@@ -312,6 +317,7 @@ func TestResolverIgnoreBaselineKeepsWellKnownResolvers(t *testing.T) {
 	otherAddrs := []string{
 		"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",
 		"9.9.9.10", "2620:fe::10", "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
+		"185.222.222.222", "45.11.45.11", "2a09::", "2a11::",
 	}
 	for _, resolver := range slices.Concat(removedAddrs, otherAddrs) {
 		if !baseline[netip.MustParseAddr(resolver)] {

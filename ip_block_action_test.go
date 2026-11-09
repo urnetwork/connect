@@ -725,15 +725,16 @@ func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
 }
 
 // Resolver ips of the family in the built-in ignore baseline
-// (wellKnownResolverAddrs): the default remote doh servers, Quad9's filtering
-// 9.9.9.9, Google Public DNS and OpenDNS (no longer defaults, still queried
-// directly by devices) and another operator's second address. The control ip
-// is a same-operator neighbor that is not in the baseline.
+// (wellKnownResolverAddrs): the default remote doh servers, DNS.SB's included,
+// Quad9's filtering 9.9.9.9, Google Public DNS and OpenDNS (no longer
+// defaults, still queried directly by devices) and another operator's second
+// address. The control ip is a same-operator neighbor that is not in the
+// baseline.
 func testWellKnownResolverIps(ipVersion int) (resolverIps []string, controlIp string) {
 	if ipVersion == 4 {
-		return []string{"1.1.1.1", "1.0.0.1", "9.9.9.10", "9.9.9.9", "208.67.222.222", "8.8.8.8", "8.8.4.4", "149.112.112.112"}, "1.1.1.2"
+		return []string{"1.1.1.1", "1.0.0.1", "9.9.9.10", "185.222.222.222", "45.11.45.11", "9.9.9.9", "208.67.222.222", "8.8.8.8", "8.8.4.4", "149.112.112.112"}, "1.1.1.2"
 	}
-	return []string{"2606:4700:4700::1111", "2606:4700:4700::1001", "2620:fe::10", "2620:fe::fe", "2620:119:35::35", "2001:4860:4860::8888", "2001:4860:4860::8844", "2620:fe::9"}, "2606:4700:4700::1112"
+	return []string{"2606:4700:4700::1111", "2606:4700:4700::1001", "2620:fe::10", "2a09::", "2a11::", "2620:fe::fe", "2620:119:35::35", "2001:4860:4860::8888", "2001:4860:4860::8844", "2620:fe::9"}, "2606:4700:4700::1112"
 }
 
 // The built-in ignore baseline: the well known resolver ips, Google Public DNS
