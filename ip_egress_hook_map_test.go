@@ -338,3 +338,50 @@ func TestEgressHookRefusesUnusableMapTargets(t *testing.T) {
 		t.Fatalf("a mapped v4 target with port 0 dialed %s ok=%t", dial, ok)
 	}
 }
+
+// A datagram or echo whose flow the hook refused before it was queued is
+// refused with that flow, never retried into a second flow that asks the hook
+// and answers the source again.
+func TestEgressHookRefusedFlowsDatagramIsNotRetried(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, ipProtocol := range []IpProtocol{IpProtocolUdp, IpProtocolIcmp} {
+		hook := newEgressTestHook()
+		hook.setResolver(func(*EgressFlow) EgressDecision {
+			return EgressDecision{Verdict: EgressVerdictDeny}
+		})
+		rig := newEgressTestNat(t, hook, func(settings *LocalUserNatSettings) {
+			// the shard queues the first datagram only once its flow has ended
+			settings.UdpBufferSettings.beforeSequenceSendForTest = func(sequence *UdpSequence) {
+				<-sequence.ctx.Done()
+			}
+			settings.IcmpBufferSettings.beforeSequenceSendForTest = func(sequence *IcmpSequence) {
+				<-sequence.ctx.Done()
+			}
+		})
+		handled := make(chan struct{}, 1)
+		rig.nat.afterSendPacketForTest = func() {
+			handled <- struct{}{}
+		}
+		if ipProtocol == IpProtocolUdp {
+			rig.send(ipOosUdpPacket(egressTestFlowPath(IpProtocolUdp, net.IPv4(192, 0, 2, 97), 5353), []byte("query")))
+		} else {
+			rig.send(testingIcmp4EchoPacket("192.0.2.2", "192.0.2.97", 0x6666, 1, []byte("ping")))
+		}
+		select {
+		case <-handled:
+		case <-time.After(egressTestTimeout):
+			t.Fatalf("the %s datagram was never handled", ipProtocol)
+		}
+		rig.close()
+		if asked := len(hook.flowsSeen); asked != 1 {
+			t.Fatalf("one refused %s datagram asked the hook %d times", ipProtocol, asked)
+		}
+		answers := len(rig.received)
+		if want := map[IpProtocol]int{IpProtocolUdp: 1, IpProtocolIcmp: 0}[ipProtocol]; answers != want {
+			t.Fatalf("one refused %s datagram was answered %d times, want %d", ipProtocol, answers, want)
+		}
+		for len(rig.received) != 0 {
+			<-rig.received
+		}
+	}
+}

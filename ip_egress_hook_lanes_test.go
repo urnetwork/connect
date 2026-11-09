@@ -199,6 +199,13 @@ func TestEgressHookOrdinaryLaneCarriesSeals(t *testing.T) {
 		for ipProtocol, packet := range egressLanePackets(version) {
 			rig.receive(t, source, sealed.peer(ContractClassData), packet)
 			sealed.checkFlow(t, hook.takeFlow(t), source, ipProtocol)
+			// one hook call per packet: a refused flow's own datagram is not
+			// retried into a second flow
+			select {
+			case flow := <-hook.flowsSeen:
+				t.Fatalf("a %s packet reached the hook again: %+v", ipProtocol, flow)
+			default:
+			}
 		}
 	}
 	if count := hook.verifyCount(); count != 1 {

@@ -140,6 +140,9 @@ type IcmpBufferSettings struct {
 	// Tests count the arms of a flow's idle timer. Runs on the flow's send
 	// loop; nil is a production no-op.
 	afterIdleTimerArmForTest func()
+	// Tests order a flow's end before its first echo is queued. Runs on the
+	// dispatch shard, after the flow's lookup; nil is a production no-op.
+	beforeSequenceSendForTest func(*IcmpSequence)
 }
 
 const defaultIcmpFlowBufferSize = 64
@@ -484,11 +487,19 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 	if sequence == nil {
 		return false, nil
 	}
+	if before := self.icmpBufferSettings.beforeSequenceSendForTest; before != nil {
+		before(sequence)
+	}
 	if success, err := sequence.send(sendItem, timeout); err == nil {
 		accepted = success
 		return success, nil
 	} else {
 		// sequence closed
+		if sequence.egressFlow.closed.Load() {
+			// the egress hook refused or closed this flow: its echo goes with
+			// it, rather than into a new flow that would ask the hook again
+			return false, nil
+		}
 		sequence = initSequence(sequence)
 		if sequence == nil {
 			return false, nil
