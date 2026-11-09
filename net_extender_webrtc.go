@@ -393,6 +393,9 @@ func (self *WebRtcExtenderCarrier) negotiateOffer(
 	if err != nil {
 		return fmt.Errorf("exchange extender offer: %w", err)
 	}
+	// an extender is never a same-network peer: its candidates may not point
+	// this host's checks at itself or its lan (transport_p2p_webrtc_candidate.go)
+	answer.SDP = filterRemoteSdpCandidates(answer.SDP, self.settings.callerOwnsIceTopology(), processProviderLocalNetworks)
 	if err := peerConnection.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("set extender answer: %w", err)
 	}
@@ -467,6 +470,10 @@ func (self *WebRtcExtenderCarrier) Answer(
 		})
 	})
 
+	// any client may dial an extender, and its offer carries its candidates:
+	// none may point this host's checks at itself or its lan
+	// (transport_p2p_webrtc_candidate.go)
+	offer.SDP = filterRemoteSdpCandidates(offer.SDP, self.settings.callerOwnsIceTopology(), processProviderLocalNetworks)
 	if err := peerConnection.SetRemoteDescription(offer); err != nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("set extender offer: %w", err)
 	}
