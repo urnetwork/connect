@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -23,7 +24,7 @@ func newEgressIdleHook() *egressTestHook {
 	hook := newEgressTestHook()
 	hook.setResolver(func(flow *EgressFlow) EgressDecision {
 		decision := EgressDecision{Verdict: EgressVerdictPass}
-		if flow.From.Port() == 42001 || flow.Protocol == IpProtocolIcmp && flow.From.Addr().As4()[3] == 1 {
+		if flow.From.Port() == 42001 || flow.Protocol == IpProtocolIcmp && flow.From.Addr() == netip.MustParseAddr("192.0.2.1") {
 			decision.IdleTimeout = 600 * time.Second
 		}
 		return decision
