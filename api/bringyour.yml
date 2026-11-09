@@ -11356,6 +11356,99 @@ paths:
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
 
+  /network/team-create:
+    post:
+      tags: [Network]
+      summary: Create a team network
+      description: |
+        Makes a new team network named `network_name`, with the caller its first
+        Owner. A personal network is never converted: the caller's own network
+        is unchanged, and the team is a network of its own beside it.
+
+        The team's admin user is a synthetic owner of record that has no sign-in
+        method and never authenticates, so every person in the team, its first
+        Owner included, is a member that a removal can take out. The answer
+        names the team's network and the caller's membership; `member_id` is new
+        for this join.
+
+        The name meets a rename's rules: no other network holds it or one a
+        single edit from it, no released name's 24-hour hold covers it, and it
+        is no DNS label or alias. A user creates at most 5 teams in 24 hours.
+        Each refusal is a 200 with `error` and its `code`: `invalid`,
+        `not_available` or `rate_limited`.
+
+        The new network is outside the team tier until its checkout, so its Team
+        routes answer a `QuotaRefusal` until then. Creating a team records two
+        admin events in its own log. 503 while teams are not available.
+      operationId: networkTeamCreate
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkTeamCreateArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTeamCreateResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/members:
+    get:
+      tags: [Network]
+      summary: List a team's members
+      description: |
+        The caller's team network's members in `member_id` order, at most 1,000
+        at a time: `more` says others follow, and `after` reads from the last
+        one's `member_id`. The server holds only each member's user, email and
+        role, with the pending state of a first IdP login that no admin device
+        has admitted yet and the deadline by which its IdP must sign it in
+        again; groups, tags, device names and admissions live in the team's
+        config repo, never here.
+
+        The team's Owner reads the list; any other caller is refused 403 with
+        the plain text message "Only the team's Owner may list its members." A
+        network outside the team tier is refused 402 with a `QuotaRefusal`
+        whose `limit_key` is `team` and whose `upgrade` is set. 503 while teams
+        are not available.
+      operationId: networkMembers
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: udid. The `member_id` to read after.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkMembersResult"
+        "400":
+          description: "`after` is not a member id."
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
   /network/config/projection:
     get:
       x-internal: true
@@ -26565,6 +26658,83 @@ components:
           properties:
             message:
               type: string
+
+    NetworkTeamCreateArgs:
+      type: object
+      required:
+        - network_name
+      properties:
+        network_name:
+          description: The team network's name, 5 to 50 lowercase letters, digits and dashes.
+          type: string
+
+    NetworkTeamCreateResult:
+      type: object
+      properties:
+        network_id:
+          description: udid. The team's network.
+          type: string
+        network_name:
+          description: The name as the network holds it.
+          type: string
+        member_id:
+          description: udid. The caller's membership, new for this join.
+          type: string
+        role:
+          description: "`owner`."
+          type: string
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              description: "`invalid`, `not_available` or `rate_limited`."
+              type: string
+            message:
+              type: string
+
+    NetworkMember:
+      type: object
+      required:
+        - member_id
+        - user_id
+        - role
+      properties:
+        member_id:
+          description: udid. New for each join, so a re-invite is a new member.
+          type: string
+        user_id:
+          description: udid
+          type: string
+        email:
+          description: The member's sign-in email, absent when it has none.
+          type: string
+        role:
+          description: |
+            One of `owner`, `admin`, `network_admin`, `it_admin`,
+            `billing_admin`, `auditor` and `member`.
+          type: string
+        pending:
+          description: A first IdP login that no admin device has admitted yet.
+          type: boolean
+        reauth_deadline:
+          description: datetime. When the member's access ends unless its IdP signs it in again.
+          type: string
+
+    NetworkMembersResult:
+      type: object
+      required:
+        - members
+      properties:
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkMember"
+        more:
+          description: Members follow the last one.
+          type: boolean
 
     NetworkConfigDeltaArgs:
       type: object

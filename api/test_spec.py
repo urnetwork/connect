@@ -324,6 +324,32 @@ class SpecTest(unittest.TestCase):
         for name in ("EvsRefusalReply", "EvsUploadReceipt"):
             self.assertEqual({"type": "string", "format": "binary"}, {key: schemas[name][key] for key in ("type", "format")})
 
+    def test_team_routes_are_served(self):
+        # TEAM-M6-01 serves §7.5's team-create and member list: out of the
+        # planned list, the network credential's (403 for a client token), the
+        # list refused outside the team tier with a QuotaRefusal, and no member
+        # field for a group, a tag, a device name or an admission (owner
+        # decision 46)
+        paths = self.spec["paths"]
+        schemas = self.spec["components"]["schemas"]
+        for path, method in (("/network/team-create", "post"), ("/network/members", "get")):
+            with self.subTest(path=path, method=method):
+                operation = paths[path][method]
+                self.assertNotIn("x-status", operation)
+                self.assertNotIn("x-internal", operation)
+                self.assertEqual([{"BearerAuth": []}], operation["security"])
+                self.assertEqual("#/components/responses/ClientJwtRefused", operation["responses"]["403"]["$ref"])
+                self.assertIn("503", operation["responses"])
+        self.assertEqual(
+            "#/components/schemas/QuotaRefusal",
+            paths["/network/members"]["get"]["responses"]["402"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        self.assertEqual(
+            {"member_id", "user_id", "email", "role", "pending", "reauth_deadline"},
+            set(schemas["NetworkMember"]["properties"]),
+        )
+        self.assertEqual({"network_name"}, set(schemas["NetworkTeamCreateArgs"]["properties"]))
+
     def test_auth_key_routes_are_served(self):
         # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
         # the network credential's (403 for a client token), and the bundle never
