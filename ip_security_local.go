@@ -349,6 +349,18 @@ func (self *providerLocalNetworks) setObservedAddresses(addrs []netip.Addr) {
 	}
 }
 
+// containsAddr reports whether addr is this host or on one of its links in
+// the current snapshot, at the default provider policy's IPv6 width. Before
+// the first read it reports false: a caller that must fail closed uses a
+// guard instead. Not for the packet path: it allocates.
+func (self *providerLocalNetworks) containsAddr(addr netip.Addr) bool {
+	snapshot := self.snapshot.Load()
+	if snapshot == nil || !addr.IsValid() {
+		return false
+	}
+	return snapshot.contains(net.IP(addr.Unmap().AsSlice()), DefaultProviderLocalSecurityPolicySettings().effectiveIpv6PrefixBits())
+}
+
 // hostProviderLocalAddresses reads every address of every interface, up or
 // down. anet and not net, for the reason hostControlFamilyInterfaces gives:
 // Android 11 refuses the netlink request net uses. One address dump serves

@@ -168,12 +168,20 @@ rule is still refused when it is this host or on one of its links:
   reports a `/128` (DHCPv6). The default is `/56`, the prefix a household is
   commonly delegated, so the router's other subnets are local too; values outside
   1 to 64 mean 64. A wider interface prefix is kept as reported.
-- **Observed addresses.** `SetProviderObservedAddresses` replaces the public
-  addresses the platform sees this host connecting from: an IPv4 one is local as
-  itself (`/32`), an IPv6 one as the IPv6 local prefix around it. Behind a NAT
-  that is the router's public address, which a consumer would otherwise reach by
-  hairpin NAT; in a container it is the host's. Non-public addresses are ignored,
-  and at most 16 are kept, in order.
+- **Observed addresses.** The addresses the platform sees this host connecting
+  from: an IPv4 one is local as itself (`/32`), an IPv6 one as the IPv6 local
+  prefix around it. Behind a NAT that is the router's public address, which a
+  consumer would otherwise reach by hairpin NAT; in a container it is the host's.
+  Neither is on any interface the guard can read. The platform's resident holds
+  every transport of a client, each with the address its edge resolved behind
+  the ingress, and sends the client the set as `ObservedAddresses`
+  (`TransferObservedAddresses`) from the control id whenever it changes (server
+  `connect/resident_observed_addresses.go`). Every client applies it, provider
+  or not, so a provider started later on the host starts with it; a frame from
+  any source but the control id is ignored (`transfer_observed_addresses.go`).
+  The message replaces the set, like `SetProviderObservedAddresses`.
+  Non-public addresses are ignored, and at most 16 are kept, in order. A client
+  older than the message type ignores it, as it ignores `CloseSequences`.
 - **Mapped addresses.** An IPv4-mapped IPv6 destination of a local IPv4 address
   is local.
 
@@ -203,6 +211,23 @@ nothing wrong and an incident reports it for abuse once per packet. Because a
 provider policy reads synchronously, a provider is in that state only while the
 platform refuses the read, which the loop retries every interval and after every
 network change. A failed later read keeps the last snapshot.
+
+#### 2.2.3 Peer-to-peer candidates
+
+The policy judges tunneled packets. A peer-to-peer association is another way a
+peer can make this host send packets: its ICE candidates name the addresses this
+host sends connectivity checks to (STUN over UDP, and a TCP connect for a passive
+TCP candidate). Accepted as offered, any peer, a consumer of this provider among
+them, could point those checks at this host or its LAN. So a peer's candidates
+are checked before Pion sees them (`transport_p2p_webrtc_candidate.go`), the
+trickled ones and the candidate lines of its offer or answer alike: the address
+must be public unicast (§2.2.1) and not in this host's provider-local snapshot
+(§2.2.2); a hostname candidate is dropped. A same-network peer
+(`ProvideMode_Network`, the user's own device) may offer any address, its LAN
+included, so a user's devices still connect directly on their own network. The
+extender's WebRTC carrier (`net_extender_webrtc.go`) applies the same check to
+both sides: any client may dial an extender. Tests that build their own ICE
+topology (loopback-only or an injected network) are exempt.
 
 ### 2.3 Ingress pipeline (source)
 

@@ -217,3 +217,112 @@ func TestRemoteUserNatProviderRefusesObservedAddressAtClientReceive(t *testing.T
 		t.Fatalf("provider-local count = %d, want 1", count)
 	}
 }
+
+// receivePacket hands the provider one crafted consumer packet.
+func (self *providerLocalEntryRig) receivePacket(t *testing.T, source TransferPath, packet []byte) {
+	t.Helper()
+	frame, err := ToFrame(&protocol.IpPacketToProvider{
+		IpPacket: &protocol.IpPacket{PacketBytes: packet},
+	}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self.provider.ClientReceive(source, []*protocol.Frame{frame}, Peer{ProvideMode: protocol.ProvideMode_Public})
+}
+
+// ICMP echo and UDP reach the provider host no more than TCP does: echo
+// requests to its own addresses of both families, and DNS to its router and
+// to tailscale's MagicDNS, never reach the exit LocalUserNat, while an echo to
+// an ordinary public destination does.
+func TestRemoteUserNatProviderRefusesProviderHostIcmpAndUdp(t *testing.T) {
+	rig := newProviderLocalEntryRig(t, "2a01:4f8:c17:1234::10/64", "203.0.113.10/32")
+	source := SourceId(NewId())
+
+	rig.receivePacket(t, source, testingIcmp6EchoPacket("fd00::9", "2a01:4f8:c17:1234::10", 1, 1, []byte("ping")))
+	rig.receivePacket(t, source, testingIcmp6EchoPacket("fd00::9", "2a01:4f8:c17:1234::1", 2, 1, []byte("ping")))
+	rig.receivePacket(t, source, testingIcmp4EchoPacket("10.0.0.9", "203.0.113.10", 3, 1, []byte("ping")))
+	for i, destination := range []string{"2a01:4f8:c17:1234::1", "100.100.100.100", "203.0.113.10"} {
+		flow := providerLocalEntryFlow(IpProtocolUdp, destination, 53)
+		flow.SourcePort = 48000 + i
+		rig.receive(t, source, flow)
+	}
+	if len(rig.admitted) != 0 {
+		t.Fatalf("packets to the provider host reached the exit: %v", rig.admitted)
+	}
+
+	rig.receivePacket(t, source, testingIcmp4EchoPacket("10.0.0.9", "198.51.100.77", 4, 1, []byte("ping")))
+	if !rig.admittedTo("198.51.100.77") || len(rig.admitted) != 1 {
+		t.Fatalf("an echo to an ordinary public destination did not reach the exit: admitted %v", rig.admitted)
+	}
+	if diagnostics := rig.provider.providerDiagnosticsMessage(source.SourceId); diagnostics == nil || diagnostics.BlockIngressPacketCount != 6 {
+		t.Fatalf("provider diagnostics = %+v, want 6 blocked ingress packets", diagnostics)
+	}
+}
+
+// Every kind of interface the provider host has counts: a physical link's
+// global prefix, a vpn tun or utun with a public address, a wireguard
+// interface on a public /24 and a docker bridge with a public IPv6 prefix are
+// refused as provider-local, while tailscale's, docker's default bridge and
+// loopback are in blocks the public rule refuses for every relationship but a
+// same-network one. A same-network peer still reaches all of them.
+func TestProviderRefusesEveryInterfaceKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	read := newTestProviderLocalRead(t,
+		// en0: slaac on the provider's /64
+		"2a01:4f8:c17:1234::10/64",
+		// utun3: a vpn with a public address on a point-to-point /32
+		"198.51.100.77/32",
+		// wg0: a wireguard interface on a public /24
+		"203.0.113.1/24",
+		// docker: a bridge with a routed public IPv6 prefix
+		"2a01:4f8:c17:2000::1/80",
+		// tailscale0, docker0, lo
+		"100.101.102.103/32",
+		"fd7a:115c:a1e0::5/128",
+		"172.17.0.1/16",
+		"127.0.0.1/8",
+		"::1/128",
+	)
+	networks, _ := newTestProviderLocalNetworks(t, read)
+	stats := DefaultSecurityPolicyStatsCollector()
+	policy := newTestProviderSecurityPolicy(ctx, networks, stats)
+
+	sourcePort := 49000
+	for _, c := range []struct {
+		destination string
+		reason      SecurityPolicyReason
+	}{
+		{"2a01:4f8:c17:1234::10", SecurityPolicyReasonProviderLocal},
+		{"2a01:4f8:c17:1234::1", SecurityPolicyReasonProviderLocal},
+		{"198.51.100.77", SecurityPolicyReasonProviderLocal},
+		{"203.0.113.1", SecurityPolicyReasonProviderLocal},
+		{"203.0.113.200", SecurityPolicyReasonProviderLocal},
+		{"2a01:4f8:c17:2000::2", SecurityPolicyReasonProviderLocal},
+		{"100.101.102.104", SecurityPolicyReasonNotPublic},
+		{"fd7a:115c:a1e0::6", SecurityPolicyReasonNotPublic},
+		{"172.17.0.2", SecurityPolicyReasonNotPublic},
+		{"127.0.0.1", SecurityPolicyReasonNotPublic},
+		{"::1", SecurityPolicyReasonNotPublic},
+	} {
+		version := 6
+		if net.ParseIP(c.destination).To4() != nil {
+			version = 4
+		}
+		path := testEgressPath(version, c.destination)
+		sourcePort += 1
+		path.SourcePort = sourcePort
+		path.DestinationPort = 8080
+		if r, _ := policy.InspectIngress(protocol.ProvideMode_Public, path, nil); r != SecurityPolicyResultIncident {
+			t.Errorf("%s = %s, want incident", c.destination, r)
+		}
+		if count := stats.Reasons(false)[c.reason][newSecurityDestinationPort(path)]; count == 0 {
+			t.Errorf("%s: no %s count", c.destination, c.reason)
+		}
+		path.SourcePort += 1000
+		if r, _ := policy.InspectIngress(protocol.ProvideMode_Network, path, nil); r != SecurityPolicyResultAllow {
+			t.Errorf("%s from a same-network peer = %s, want allow", c.destination, r)
+		}
+	}
+}

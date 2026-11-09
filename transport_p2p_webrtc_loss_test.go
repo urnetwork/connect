@@ -326,6 +326,11 @@ func TestWebRtcIdleResumeSctpBlackholeReconnects(t *testing.T) {
 	// the one-way blackhole. Keep that side alive for the duration of this
 	// test so it can prove reverse DATA does not refresh the active deadline.
 	settingsB.SctpNoProgressTimeout = 0
+	// the factories below are built on these virtual networks: declare them,
+	// so the peers' 10.2.0.x candidates are applied as the caller's topology
+	// (transport_p2p_webrtc_candidate.go)
+	settingsA.Network = netA
+	settingsB.Network = netB
 
 	signalPipeA := newSignalPipe(nil)
 	signalPipeB := newSignalPipe(nil)

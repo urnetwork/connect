@@ -1790,6 +1790,57 @@ func (x *CloseSequences) GetPeerIds() [][]byte {
 	return nil
 }
 
+// The public addresses the platform observes this client's transports
+// connecting from, across all of them, sent only from the control id and
+// again whenever the set changes (server connect/resident_observed_addresses.go).
+// The client replaces its observed set with them. A provider counts each as
+// its own address (connect ip_security_local.go), so a consumer cannot reach
+// the router the provider sits behind by hairpin NAT to its public address.
+type ObservedAddresses struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// each a 4-byte IPv4 or a 16-byte IPv6 address
+	Addresses     [][]byte `protobuf:"bytes,1,rep,name=addresses,proto3" json:"addresses,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ObservedAddresses) Reset() {
+	*x = ObservedAddresses{}
+	mi := &file_transfer_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ObservedAddresses) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ObservedAddresses) ProtoMessage() {}
+
+func (x *ObservedAddresses) ProtoReflect() protoreflect.Message {
+	mi := &file_transfer_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ObservedAddresses.ProtoReflect.Descriptor instead.
+func (*ObservedAddresses) Descriptor() ([]byte, []int) {
+	return file_transfer_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ObservedAddresses) GetAddresses() [][]byte {
+	if x != nil {
+		return x.Addresses
+	}
+	return nil
+}
+
 // a network peer: a connected top-level client in the same network and its
 // identity metadata. When `disconnect_time` is set, this entry is a
 // disconnect marker for a recently disconnected peer.
@@ -1814,7 +1865,7 @@ type NetworkPeer struct {
 
 func (x *NetworkPeer) Reset() {
 	*x = NetworkPeer{}
-	mi := &file_transfer_proto_msgTypes[14]
+	mi := &file_transfer_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1826,7 +1877,7 @@ func (x *NetworkPeer) String() string {
 func (*NetworkPeer) ProtoMessage() {}
 
 func (x *NetworkPeer) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[14]
+	mi := &file_transfer_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1839,7 +1890,7 @@ func (x *NetworkPeer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkPeer.ProtoReflect.Descriptor instead.
 func (*NetworkPeer) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{14}
+	return file_transfer_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *NetworkPeer) GetClientId() []byte {
@@ -1902,7 +1953,7 @@ type NetworkPeersReset struct {
 
 func (x *NetworkPeersReset) Reset() {
 	*x = NetworkPeersReset{}
-	mi := &file_transfer_proto_msgTypes[15]
+	mi := &file_transfer_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1914,7 +1965,7 @@ func (x *NetworkPeersReset) String() string {
 func (*NetworkPeersReset) ProtoMessage() {}
 
 func (x *NetworkPeersReset) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[15]
+	mi := &file_transfer_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1927,7 +1978,7 @@ func (x *NetworkPeersReset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkPeersReset.ProtoReflect.Descriptor instead.
 func (*NetworkPeersReset) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{15}
+	return file_transfer_proto_rawDescGZIP(), []int{16}
 }
 
 // control message. Upserts peers (and disconnect markers) into the
@@ -1941,7 +1992,7 @@ type NetworkPeersUpdate struct {
 
 func (x *NetworkPeersUpdate) Reset() {
 	*x = NetworkPeersUpdate{}
-	mi := &file_transfer_proto_msgTypes[16]
+	mi := &file_transfer_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1953,7 +2004,7 @@ func (x *NetworkPeersUpdate) String() string {
 func (*NetworkPeersUpdate) ProtoMessage() {}
 
 func (x *NetworkPeersUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[16]
+	mi := &file_transfer_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1966,7 +2017,7 @@ func (x *NetworkPeersUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkPeersUpdate.ProtoReflect.Descriptor instead.
 func (*NetworkPeersUpdate) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{16}
+	return file_transfer_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NetworkPeersUpdate) GetPeers() []*NetworkPeer {
@@ -2006,7 +2057,7 @@ type ExchangeSignals struct {
 
 func (x *ExchangeSignals) Reset() {
 	*x = ExchangeSignals{}
-	mi := &file_transfer_proto_msgTypes[17]
+	mi := &file_transfer_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2018,7 +2069,7 @@ func (x *ExchangeSignals) String() string {
 func (*ExchangeSignals) ProtoMessage() {}
 
 func (x *ExchangeSignals) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[17]
+	mi := &file_transfer_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2031,7 +2082,7 @@ func (x *ExchangeSignals) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExchangeSignals.ProtoReflect.Descriptor instead.
 func (*ExchangeSignals) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{17}
+	return file_transfer_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ExchangeSignals) GetStreamId() []byte {
@@ -2090,7 +2141,7 @@ type ExchangeSignal struct {
 
 func (x *ExchangeSignal) Reset() {
 	*x = ExchangeSignal{}
-	mi := &file_transfer_proto_msgTypes[18]
+	mi := &file_transfer_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2102,7 +2153,7 @@ func (x *ExchangeSignal) String() string {
 func (*ExchangeSignal) ProtoMessage() {}
 
 func (x *ExchangeSignal) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[18]
+	mi := &file_transfer_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2115,7 +2166,7 @@ func (x *ExchangeSignal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExchangeSignal.ProtoReflect.Descriptor instead.
 func (*ExchangeSignal) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{18}
+	return file_transfer_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ExchangeSignal) GetSignalType() SignalType {
@@ -2168,7 +2219,7 @@ type CreateContract struct {
 
 func (x *CreateContract) Reset() {
 	*x = CreateContract{}
-	mi := &file_transfer_proto_msgTypes[19]
+	mi := &file_transfer_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2180,7 +2231,7 @@ func (x *CreateContract) String() string {
 func (*CreateContract) ProtoMessage() {}
 
 func (x *CreateContract) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[19]
+	mi := &file_transfer_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2193,7 +2244,7 @@ func (x *CreateContract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateContract.ProtoReflect.Descriptor instead.
 func (*CreateContract) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{19}
+	return file_transfer_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CreateContract) GetDestinationId() []byte {
@@ -2266,7 +2317,7 @@ type CreateContractResult struct {
 
 func (x *CreateContractResult) Reset() {
 	*x = CreateContractResult{}
-	mi := &file_transfer_proto_msgTypes[20]
+	mi := &file_transfer_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2278,7 +2329,7 @@ func (x *CreateContractResult) String() string {
 func (*CreateContractResult) ProtoMessage() {}
 
 func (x *CreateContractResult) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[20]
+	mi := &file_transfer_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2291,7 +2342,7 @@ func (x *CreateContractResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateContractResult.ProtoReflect.Descriptor instead.
 func (*CreateContractResult) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{20}
+	return file_transfer_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *CreateContractResult) GetError() ContractError {
@@ -2351,7 +2402,7 @@ type Contract struct {
 
 func (x *Contract) Reset() {
 	*x = Contract{}
-	mi := &file_transfer_proto_msgTypes[21]
+	mi := &file_transfer_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2363,7 +2414,7 @@ func (x *Contract) String() string {
 func (*Contract) ProtoMessage() {}
 
 func (x *Contract) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[21]
+	mi := &file_transfer_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2376,7 +2427,7 @@ func (x *Contract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Contract.ProtoReflect.Descriptor instead.
 func (*Contract) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{21}
+	return file_transfer_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *Contract) GetStoredContractBytes() []byte {
@@ -2474,7 +2525,7 @@ type StoredContract struct {
 
 func (x *StoredContract) Reset() {
 	*x = StoredContract{}
-	mi := &file_transfer_proto_msgTypes[22]
+	mi := &file_transfer_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2486,7 +2537,7 @@ func (x *StoredContract) String() string {
 func (*StoredContract) ProtoMessage() {}
 
 func (x *StoredContract) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[22]
+	mi := &file_transfer_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2499,7 +2550,7 @@ func (x *StoredContract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoredContract.ProtoReflect.Descriptor instead.
 func (*StoredContract) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{22}
+	return file_transfer_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StoredContract) GetContractId() []byte {
@@ -2613,7 +2664,7 @@ type CloseContract struct {
 
 func (x *CloseContract) Reset() {
 	*x = CloseContract{}
-	mi := &file_transfer_proto_msgTypes[23]
+	mi := &file_transfer_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2625,7 +2676,7 @@ func (x *CloseContract) String() string {
 func (*CloseContract) ProtoMessage() {}
 
 func (x *CloseContract) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[23]
+	mi := &file_transfer_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2638,7 +2689,7 @@ func (x *CloseContract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseContract.ProtoReflect.Descriptor instead.
 func (*CloseContract) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{23}
+	return file_transfer_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *CloseContract) GetContractId() []byte {
@@ -2716,7 +2767,7 @@ type PeerAudit struct {
 
 func (x *PeerAudit) Reset() {
 	*x = PeerAudit{}
-	mi := &file_transfer_proto_msgTypes[24]
+	mi := &file_transfer_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2728,7 +2779,7 @@ func (x *PeerAudit) String() string {
 func (*PeerAudit) ProtoMessage() {}
 
 func (x *PeerAudit) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[24]
+	mi := &file_transfer_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2741,7 +2792,7 @@ func (x *PeerAudit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerAudit.ProtoReflect.Descriptor instead.
 func (*PeerAudit) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{24}
+	return file_transfer_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *PeerAudit) GetPeerId() []byte {
@@ -2843,7 +2894,7 @@ type ControlPing struct {
 
 func (x *ControlPing) Reset() {
 	*x = ControlPing{}
-	mi := &file_transfer_proto_msgTypes[25]
+	mi := &file_transfer_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2855,7 +2906,7 @@ func (x *ControlPing) String() string {
 func (*ControlPing) ProtoMessage() {}
 
 func (x *ControlPing) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[25]
+	mi := &file_transfer_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2868,7 +2919,7 @@ func (x *ControlPing) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlPing.ProtoReflect.Descriptor instead.
 func (*ControlPing) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{25}
+	return file_transfer_proto_rawDescGZIP(), []int{26}
 }
 
 type ProvidePing struct {
@@ -2879,7 +2930,7 @@ type ProvidePing struct {
 
 func (x *ProvidePing) Reset() {
 	*x = ProvidePing{}
-	mi := &file_transfer_proto_msgTypes[26]
+	mi := &file_transfer_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2891,7 +2942,7 @@ func (x *ProvidePing) String() string {
 func (*ProvidePing) ProtoMessage() {}
 
 func (x *ProvidePing) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[26]
+	mi := &file_transfer_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2904,7 +2955,7 @@ func (x *ProvidePing) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProvidePing.ProtoReflect.Descriptor instead.
 func (*ProvidePing) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{26}
+	return file_transfer_proto_rawDescGZIP(), []int{27}
 }
 
 // EncryptedKey publishes this client's public TLS certificate to the
@@ -2934,7 +2985,7 @@ type EncryptedKey struct {
 
 func (x *EncryptedKey) Reset() {
 	*x = EncryptedKey{}
-	mi := &file_transfer_proto_msgTypes[27]
+	mi := &file_transfer_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2946,7 +2997,7 @@ func (x *EncryptedKey) String() string {
 func (*EncryptedKey) ProtoMessage() {}
 
 func (x *EncryptedKey) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[27]
+	mi := &file_transfer_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2959,7 +3010,7 @@ func (x *EncryptedKey) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EncryptedKey.ProtoReflect.Descriptor instead.
 func (*EncryptedKey) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{27}
+	return file_transfer_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *EncryptedKey) GetProvideTlsCertificate() [][]byte {
@@ -2999,7 +3050,7 @@ type ClientKey struct {
 
 func (x *ClientKey) Reset() {
 	*x = ClientKey{}
-	mi := &file_transfer_proto_msgTypes[28]
+	mi := &file_transfer_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3011,7 +3062,7 @@ func (x *ClientKey) String() string {
 func (*ClientKey) ProtoMessage() {}
 
 func (x *ClientKey) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[28]
+	mi := &file_transfer_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3024,7 +3075,7 @@ func (x *ClientKey) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientKey.ProtoReflect.Descriptor instead.
 func (*ClientKey) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{28}
+	return file_transfer_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ClientKey) GetPublicKey() []byte {
@@ -3095,7 +3146,7 @@ type EncryptedControl struct {
 
 func (x *EncryptedControl) Reset() {
 	*x = EncryptedControl{}
-	mi := &file_transfer_proto_msgTypes[29]
+	mi := &file_transfer_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3107,7 +3158,7 @@ func (x *EncryptedControl) String() string {
 func (*EncryptedControl) ProtoMessage() {}
 
 func (x *EncryptedControl) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[29]
+	mi := &file_transfer_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3120,7 +3171,7 @@ func (x *EncryptedControl) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EncryptedControl.ProtoReflect.Descriptor instead.
 func (*EncryptedControl) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{29}
+	return file_transfer_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *EncryptedControl) GetControlType() EncryptedControlType {
@@ -3193,7 +3244,7 @@ type ResidentMigrate struct {
 
 func (x *ResidentMigrate) Reset() {
 	*x = ResidentMigrate{}
-	mi := &file_transfer_proto_msgTypes[30]
+	mi := &file_transfer_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3205,7 +3256,7 @@ func (x *ResidentMigrate) String() string {
 func (*ResidentMigrate) ProtoMessage() {}
 
 func (x *ResidentMigrate) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[30]
+	mi := &file_transfer_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3218,7 +3269,7 @@ func (x *ResidentMigrate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResidentMigrate.ProtoReflect.Descriptor instead.
 func (*ResidentMigrate) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{30}
+	return file_transfer_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ResidentMigrate) GetMigrateTime() uint64 {
@@ -3273,7 +3324,7 @@ type ResidentMoveTarget struct {
 
 func (x *ResidentMoveTarget) Reset() {
 	*x = ResidentMoveTarget{}
-	mi := &file_transfer_proto_msgTypes[31]
+	mi := &file_transfer_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3285,7 +3336,7 @@ func (x *ResidentMoveTarget) String() string {
 func (*ResidentMoveTarget) ProtoMessage() {}
 
 func (x *ResidentMoveTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[31]
+	mi := &file_transfer_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3298,7 +3349,7 @@ func (x *ResidentMoveTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResidentMoveTarget.ProtoReflect.Descriptor instead.
 func (*ResidentMoveTarget) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{31}
+	return file_transfer_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ResidentMoveTarget) GetIp() []byte {
@@ -3326,7 +3377,7 @@ type ResidentMoveResult struct {
 
 func (x *ResidentMoveResult) Reset() {
 	*x = ResidentMoveResult{}
-	mi := &file_transfer_proto_msgTypes[32]
+	mi := &file_transfer_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3338,7 +3389,7 @@ func (x *ResidentMoveResult) String() string {
 func (*ResidentMoveResult) ProtoMessage() {}
 
 func (x *ResidentMoveResult) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[32]
+	mi := &file_transfer_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3351,7 +3402,7 @@ func (x *ResidentMoveResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResidentMoveResult.ProtoReflect.Descriptor instead.
 func (*ResidentMoveResult) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{32}
+	return file_transfer_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ResidentMoveResult) GetMoveId() []byte {
@@ -3400,7 +3451,7 @@ type NetworkSessionsChanged struct {
 
 func (x *NetworkSessionsChanged) Reset() {
 	*x = NetworkSessionsChanged{}
-	mi := &file_transfer_proto_msgTypes[33]
+	mi := &file_transfer_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3412,7 +3463,7 @@ func (x *NetworkSessionsChanged) String() string {
 func (*NetworkSessionsChanged) ProtoMessage() {}
 
 func (x *NetworkSessionsChanged) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[33]
+	mi := &file_transfer_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3425,7 +3476,7 @@ func (x *NetworkSessionsChanged) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkSessionsChanged.ProtoReflect.Descriptor instead.
 func (*NetworkSessionsChanged) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{33}
+	return file_transfer_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *NetworkSessionsChanged) GetGeneration() string {
@@ -3459,7 +3510,7 @@ type StreamAuthorization struct {
 
 func (x *StreamAuthorization) Reset() {
 	*x = StreamAuthorization{}
-	mi := &file_transfer_proto_msgTypes[34]
+	mi := &file_transfer_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3471,7 +3522,7 @@ func (x *StreamAuthorization) String() string {
 func (*StreamAuthorization) ProtoMessage() {}
 
 func (x *StreamAuthorization) ProtoReflect() protoreflect.Message {
-	mi := &file_transfer_proto_msgTypes[34]
+	mi := &file_transfer_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3484,7 +3535,7 @@ func (x *StreamAuthorization) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamAuthorization.ProtoReflect.Descriptor instead.
 func (*StreamAuthorization) Descriptor() ([]byte, []int) {
-	return file_transfer_proto_rawDescGZIP(), []int{34}
+	return file_transfer_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *StreamAuthorization) GetStreamId() []byte {
@@ -3657,7 +3708,9 @@ const file_transfer_proto_rawDesc = "" +
 	"\astreams\x18\x01 \x03(\v2\x15.bringyour.StreamOpenR\astreams\"N\n" +
 	"\x0eCloseSequences\x12!\n" +
 	"\fcontract_ids\x18\x01 \x03(\fR\vcontractIds\x12\x19\n" +
-	"\bpeer_ids\x18\x02 \x03(\fR\apeerIds\"\x9f\x02\n" +
+	"\bpeer_ids\x18\x02 \x03(\fR\apeerIds\"1\n" +
+	"\x11ObservedAddresses\x12\x1c\n" +
+	"\taddresses\x18\x01 \x03(\fR\taddresses\"\x9f\x02\n" +
 	"\vNetworkPeer\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\fR\bclientId\x12;\n" +
 	"\rprovide_modes\x18\x02 \x03(\x0e2\x16.bringyour.ProvideModeR\fprovideModes\x12\x1c\n" +
@@ -3876,7 +3929,7 @@ func file_transfer_proto_rawDescGZIP() []byte {
 }
 
 var file_transfer_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_transfer_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_transfer_proto_goTypes = []any{
 	(SequenceRole)(0),              // 0: bringyour.SequenceRole
 	(ProvideMode)(0),               // 1: bringyour.ProvideMode
@@ -3900,59 +3953,60 @@ var file_transfer_proto_goTypes = []any{
 	(*StreamClose)(nil),            // 19: bringyour.StreamClose
 	(*StreamReset)(nil),            // 20: bringyour.StreamReset
 	(*CloseSequences)(nil),         // 21: bringyour.CloseSequences
-	(*NetworkPeer)(nil),            // 22: bringyour.NetworkPeer
-	(*NetworkPeersReset)(nil),      // 23: bringyour.NetworkPeersReset
-	(*NetworkPeersUpdate)(nil),     // 24: bringyour.NetworkPeersUpdate
-	(*ExchangeSignals)(nil),        // 25: bringyour.ExchangeSignals
-	(*ExchangeSignal)(nil),         // 26: bringyour.ExchangeSignal
-	(*CreateContract)(nil),         // 27: bringyour.CreateContract
-	(*CreateContractResult)(nil),   // 28: bringyour.CreateContractResult
-	(*Contract)(nil),               // 29: bringyour.Contract
-	(*StoredContract)(nil),         // 30: bringyour.StoredContract
-	(*CloseContract)(nil),          // 31: bringyour.CloseContract
-	(*PeerAudit)(nil),              // 32: bringyour.PeerAudit
-	(*ControlPing)(nil),            // 33: bringyour.ControlPing
-	(*ProvidePing)(nil),            // 34: bringyour.ProvidePing
-	(*EncryptedKey)(nil),           // 35: bringyour.EncryptedKey
-	(*ClientKey)(nil),              // 36: bringyour.ClientKey
-	(*EncryptedControl)(nil),       // 37: bringyour.EncryptedControl
-	(*ResidentMigrate)(nil),        // 38: bringyour.ResidentMigrate
-	(*ResidentMoveTarget)(nil),     // 39: bringyour.ResidentMoveTarget
-	(*ResidentMoveResult)(nil),     // 40: bringyour.ResidentMoveResult
-	(*NetworkSessionsChanged)(nil), // 41: bringyour.NetworkSessionsChanged
-	(*StreamAuthorization)(nil),    // 42: bringyour.StreamAuthorization
-	(*Frame)(nil),                  // 43: bringyour.Frame
-	(MessageType)(0),               // 44: bringyour.MessageType
+	(*ObservedAddresses)(nil),      // 22: bringyour.ObservedAddresses
+	(*NetworkPeer)(nil),            // 23: bringyour.NetworkPeer
+	(*NetworkPeersReset)(nil),      // 24: bringyour.NetworkPeersReset
+	(*NetworkPeersUpdate)(nil),     // 25: bringyour.NetworkPeersUpdate
+	(*ExchangeSignals)(nil),        // 26: bringyour.ExchangeSignals
+	(*ExchangeSignal)(nil),         // 27: bringyour.ExchangeSignal
+	(*CreateContract)(nil),         // 28: bringyour.CreateContract
+	(*CreateContractResult)(nil),   // 29: bringyour.CreateContractResult
+	(*Contract)(nil),               // 30: bringyour.Contract
+	(*StoredContract)(nil),         // 31: bringyour.StoredContract
+	(*CloseContract)(nil),          // 32: bringyour.CloseContract
+	(*PeerAudit)(nil),              // 33: bringyour.PeerAudit
+	(*ControlPing)(nil),            // 34: bringyour.ControlPing
+	(*ProvidePing)(nil),            // 35: bringyour.ProvidePing
+	(*EncryptedKey)(nil),           // 36: bringyour.EncryptedKey
+	(*ClientKey)(nil),              // 37: bringyour.ClientKey
+	(*EncryptedControl)(nil),       // 38: bringyour.EncryptedControl
+	(*ResidentMigrate)(nil),        // 39: bringyour.ResidentMigrate
+	(*ResidentMoveTarget)(nil),     // 40: bringyour.ResidentMoveTarget
+	(*ResidentMoveResult)(nil),     // 41: bringyour.ResidentMoveResult
+	(*NetworkSessionsChanged)(nil), // 42: bringyour.NetworkSessionsChanged
+	(*StreamAuthorization)(nil),    // 43: bringyour.StreamAuthorization
+	(*Frame)(nil),                  // 44: bringyour.Frame
+	(MessageType)(0),               // 45: bringyour.MessageType
 }
 var file_transfer_proto_depIdxs = []int32{
 	8,  // 0: bringyour.TransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	43, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
-	44, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
+	44, // 1: bringyour.TransferFrame.frame:type_name -> bringyour.Frame
+	45, // 2: bringyour.TransferFrame.message_type:type_name -> bringyour.MessageType
 	11, // 3: bringyour.TransferFrame.pack:type_name -> bringyour.Pack
 	13, // 4: bringyour.TransferFrame.ack:type_name -> bringyour.Ack
 	0,  // 5: bringyour.TransferFrame.session_role:type_name -> bringyour.SequenceRole
 	8,  // 6: bringyour.FilteredTransferFrame.transfer_path:type_name -> bringyour.TransferPath
-	43, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
-	43, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
+	44, // 7: bringyour.Pack.frames:type_name -> bringyour.Frame
+	44, // 8: bringyour.Pack.contract_frame:type_name -> bringyour.Frame
 	14, // 9: bringyour.Pack.tag:type_name -> bringyour.Tag
-	43, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
+	44, // 10: bringyour.FilteredPack.contract_frame:type_name -> bringyour.Frame
 	14, // 11: bringyour.Ack.tag:type_name -> bringyour.Tag
 	17, // 12: bringyour.Provide.keys:type_name -> bringyour.ProvideKey
 	1,  // 13: bringyour.ProvideKey.mode:type_name -> bringyour.ProvideMode
 	18, // 14: bringyour.StreamReset.streams:type_name -> bringyour.StreamOpen
 	1,  // 15: bringyour.NetworkPeer.provide_modes:type_name -> bringyour.ProvideMode
-	22, // 16: bringyour.NetworkPeersUpdate.peers:type_name -> bringyour.NetworkPeer
-	26, // 17: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
+	23, // 16: bringyour.NetworkPeersUpdate.peers:type_name -> bringyour.NetworkPeer
+	27, // 17: bringyour.ExchangeSignals.signals:type_name -> bringyour.ExchangeSignal
 	2,  // 18: bringyour.ExchangeSignal.signal_type:type_name -> bringyour.SignalType
 	0,  // 19: bringyour.CreateContract.sender_role:type_name -> bringyour.SequenceRole
 	3,  // 20: bringyour.CreateContractResult.error:type_name -> bringyour.ContractError
-	29, // 21: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
-	27, // 22: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
+	30, // 21: bringyour.CreateContractResult.contract:type_name -> bringyour.Contract
+	28, // 22: bringyour.CreateContractResult.create_contract:type_name -> bringyour.CreateContract
 	1,  // 23: bringyour.Contract.provide_mode:type_name -> bringyour.ProvideMode
 	4,  // 24: bringyour.EncryptedControl.control_type:type_name -> bringyour.EncryptedControlType
 	0,  // 25: bringyour.EncryptedControl.session_role:type_name -> bringyour.SequenceRole
 	5,  // 26: bringyour.ResidentMigrate.kind:type_name -> bringyour.ResidentMoveKind
-	39, // 27: bringyour.ResidentMigrate.targets:type_name -> bringyour.ResidentMoveTarget
+	40, // 27: bringyour.ResidentMigrate.targets:type_name -> bringyour.ResidentMoveTarget
 	6,  // 28: bringyour.ResidentMoveResult.outcome:type_name -> bringyour.ResidentMoveOutcome
 	7,  // 29: bringyour.ResidentMoveResult.reason:type_name -> bringyour.ResidentMoveReason
 	30, // [30:30] is the sub-list for method output_type
@@ -3974,19 +4028,19 @@ func file_transfer_proto_init() {
 	file_transfer_proto_msgTypes[4].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[5].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[10].OneofWrappers = []any{}
-	file_transfer_proto_msgTypes[14].OneofWrappers = []any{}
-	file_transfer_proto_msgTypes[18].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[15].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[19].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[20].OneofWrappers = []any{}
-	file_transfer_proto_msgTypes[22].OneofWrappers = []any{}
-	file_transfer_proto_msgTypes[29].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[21].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[23].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[30].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transfer_proto_rawDesc), len(file_transfer_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   35,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
