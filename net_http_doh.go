@@ -156,7 +156,11 @@ func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
 // against one address being blocked or hijacked but not against an operator-wide outage), and
 // Quad9 at 9.9.9.10, its unfiltered service: the defaults do not filter (2026-11-08), so
 // 9.9.9.9, Quad9's malware filter, is not among them. The operators interleave, so a list
-// walked in order asks Quad9 second. None of these lists, nor the regional ones
+// walked in order asks Quad9 second. DNS.SB (xTom GmbH, Düsseldorf) follows them at both of its
+// addresses (owner decision 2026-11-09): it is unfiltered, keeps no query logs, sends no ECS and
+// validates DNSSEC, and its ip-literal DoH certificate names its v4 and v6 addresses (research
+// 2026-11-08). A third operator also means fewer lookups whose two picks both fail on a French
+// exit once Quad9 leaves France on 2026-11-24. None of these lists, nor the regional ones
 // (net_http_doh_regional.go), names Google Public DNS (owner decision 2026-11-08 for user
 // privacy, support inbox 8236) or OpenDNS (it refuses French clients and has left Portugal and
 // Belgium, answers blocks with ordinary records, forwards the client's /24 as ECS, and its free
@@ -169,14 +173,18 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// the v4 and v6 lists pair by operator (knownDohUrlPairs) and a
 		// query races each pair as one wave (see dohLaunchWaves)
 		RemoteDohUrlsIpv4: []string{
-			"https://1.1.1.1/dns-query",  // Cloudflare
-			"https://9.9.9.10/dns-query", // Quad9, unfiltered
-			"https://1.0.0.1/dns-query",  // Cloudflare
+			"https://1.1.1.1/dns-query",         // Cloudflare
+			"https://9.9.9.10/dns-query",        // Quad9, unfiltered
+			"https://1.0.0.1/dns-query",         // Cloudflare
+			"https://185.222.222.222/dns-query", // DNS.SB
+			"https://45.11.45.11/dns-query",     // DNS.SB
 		},
 		RemoteDohUrlsIpv6: []string{
 			"https://[2606:4700:4700::1111]/dns-query", // Cloudflare
 			"https://[2620:fe::10]/dns-query",          // Quad9, unfiltered
 			"https://[2606:4700:4700::1001]/dns-query", // Cloudflare
+			"https://[2a09::]/dns-query",               // DNS.SB
+			"https://[2a11::]/dns-query",               // DNS.SB
 		},
 		// remote plain-dns servers, dialed through the tunnel. remote dns
 		// stays disabled by default for general resolution — while disabled,
@@ -184,28 +192,36 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// it (see DohCache.resolve), so a hostname-form doh server never
 		// leaks to the local resolver
 		RemoteDnsIpv4: []string{
-			"1.1.1.1",  // Cloudflare
-			"9.9.9.10", // Quad9, unfiltered
-			"1.0.0.1",  // Cloudflare
+			"1.1.1.1",         // Cloudflare
+			"9.9.9.10",        // Quad9, unfiltered
+			"1.0.0.1",         // Cloudflare
+			"185.222.222.222", // DNS.SB
+			"45.11.45.11",     // DNS.SB
 		},
 		RemoteDnsIpv6: []string{
 			"2606:4700:4700::1111", // Cloudflare
 			"2620:fe::10",          // Quad9, unfiltered
 			"2606:4700:4700::1001", // Cloudflare
+			"2a09::",               // DNS.SB
+			"2a11::",               // DNS.SB
 		},
 		// local plain-dns servers: host-side resolution, and the actual tunnel
 		// resolver targets when the local-dns toggle is explicitly enabled. These
 		// are independent of DnsUpgradeMaskAddress, which is only the destination
 		// advertised to the OS while UpgradeMux owns plain DNS interception.
 		LocalDnsIpv4: []string{
-			"9.9.9.10", // Quad9, unfiltered
-			"1.1.1.1",  // Cloudflare
-			"1.0.0.1",  // Cloudflare
+			"9.9.9.10",        // Quad9, unfiltered
+			"1.1.1.1",         // Cloudflare
+			"1.0.0.1",         // Cloudflare
+			"185.222.222.222", // DNS.SB
+			"45.11.45.11",     // DNS.SB
 		},
 		LocalDnsIpv6: []string{
 			"2620:fe::10",          // Quad9, unfiltered
 			"2606:4700:4700::1111", // Cloudflare
 			"2606:4700:4700::1001", // Cloudflare
+			"2a09::",               // DNS.SB
+			"2a11::",               // DNS.SB
 		},
 	}
 }
@@ -1942,7 +1958,8 @@ type dohClient struct {
 // is what "race each operator's v4 and v6 endpoint" means for a url in this
 // table; a url outside this table pairs by index only with another url outside
 // it (see familySiblings). The table only pairs urls a list already holds; it
-// never adds a server to a list.
+// never adds a server to a list. DNS.SB's pairs are its two published servers,
+// public-dns-a and public-dns-b.
 var knownDohUrlPairs = [][2]string{
 	{"https://1.1.1.1/dns-query", "https://[2606:4700:4700::1111]/dns-query"},
 	{"https://1.0.0.1/dns-query", "https://[2606:4700:4700::1001]/dns-query"},
@@ -1951,6 +1968,8 @@ var knownDohUrlPairs = [][2]string{
 	{"https://9.9.9.10/dns-query", "https://[2620:fe::10]/dns-query"},
 	{"https://9.9.9.9/dns-query", "https://[2620:fe::fe]/dns-query"},
 	{"https://149.112.112.112/dns-query", "https://[2620:fe::9]/dns-query"},
+	{"https://185.222.222.222/dns-query", "https://[2a09::]/dns-query"},
+	{"https://45.11.45.11/dns-query", "https://[2a11::]/dns-query"},
 	{"https://208.67.222.222/dns-query", "https://[2620:119:35::35]/dns-query"},
 	{"https://208.67.220.220/dns-query", "https://[2620:119:53::53]/dns-query"},
 }
@@ -1966,6 +1985,8 @@ var knownDnsServerPairs = [][2]string{
 	{"9.9.9.10", "2620:fe::10"},
 	{"9.9.9.9", "2620:fe::fe"},
 	{"149.112.112.112", "2620:fe::9"},
+	{"185.222.222.222", "2a09::"},
+	{"45.11.45.11", "2a11::"},
 	{"208.67.222.222", "2620:119:35::35"},
 	{"208.67.220.220", "2620:119:53::53"},
 	{"223.5.5.5", "2400:3200::1"},
