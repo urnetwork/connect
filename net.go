@@ -252,10 +252,12 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 	} else {
 		netDialer := self.NetDialer()
 		if self.ProxySettings != nil {
-			// the proxy resolves names on its side; there is nothing to race
-			dialContext = self.ProxySettings.NewDialContext(
-				ctx,
+			// the proxy resolves names on its side; there is nothing to race.
+			// A CONNECT's exchange is part of the connect, so ConnectTimeout
+			// bounds it with the dial to the proxy (net_proxy_http.go)
+			dialContext = self.ProxySettings.newDialContext(
 				netDialer,
+				self.ConnectTimeout,
 			)
 		} else {
 			dialContext = self.raceDialContext(netDialer)
@@ -330,13 +332,26 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	}))
 }
 
+// A proxy every stream dial of a ConnectSettings goes through. The zero
+// Protocol is SOCKS5, as before Protocol existed; ProxyProtocolHttpConnect
+// selects HTTP CONNECT (net_proxy_http.go). A dial through a proxy never
+// falls back to a direct one.
 type ProxySettings struct {
 	Network string
 	Address string
 	Auth    *proxy.Auth
+	// How the proxy is spoken to. Empty is ProxyProtocolSocks5.
+	Protocol ProxyProtocol
 }
 
+// A dial through the proxy, bounded only by each dial's ctx.
 func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dialer) DialContextFunction {
+	return self.newDialContext(forward, 0)
+}
+
+// The SOCKS5 dial, unchanged since before Protocol: bounded only by each
+// dial's ctx.
+func (self *ProxySettings) newSocks5DialContext(forward proxy.Dialer) DialContextFunction {
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
 		proxyDialer, err := proxy.SOCKS5(
 			self.Network,
