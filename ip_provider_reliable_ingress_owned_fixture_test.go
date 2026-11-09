@@ -12,10 +12,16 @@ import (
 // Legacy direct fixtures keep their separate admission/accounting premise.
 func (self *reliableTcpIngressFixture) packOwned(sequence *ReceiveSequence, number uint64, payload []byte) Id {
 	self.t.Helper()
+	return self.packOwnedTcp(sequence, number, 101, payload)
+}
+
+// The same paid handoff with the inner TCP sequence number chosen by the caller.
+func (self *reliableTcpIngressFixture) packOwnedTcp(sequence *ReceiveSequence, number uint64, tcpSequenceNumber uint32, payload []byte) Id {
+	self.t.Helper()
 	if !sequence.receiveBufferSettings.ownsDecodedReceiveMemory() {
 		self.t.Fatal("owned provider fixture requires exact receive accounting")
 	}
-	input, id := self.uploadPack(sequence, number, 101, payload)
+	input, id := self.uploadPack(sequence, number, tcpSequenceNumber, payload)
 	pack := func() *ReceivePack {
 		defer input.messagePoolReturn()
 		return self.decodeOwnedPack(sequence, input)
