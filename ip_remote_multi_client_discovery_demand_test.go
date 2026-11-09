@@ -536,6 +536,16 @@ func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.
 			t.Fatalf("full-window control did not observe five actual same-service refusals: failed=%d intercepted=%d", refused, h.metrics().DialFailuresIntercepted)
 		}
 		discoveryDemandServiceRefreshOwner(t, window, update)
+		// Since 00d4f62b the idle victim's own refusal claims the refresh, so the
+		// other owners' refusals land in the live pass and can leave demand
+		// pending after its empty read. The paced read then lists the late
+		// provider at this same boundary, the retained SYN retry can be answered
+		// first, and this retransmission becomes a covered duplicate the collapse
+		// guard refuses. Hold that listing's answer so publication follows the
+		// unchanged source offer whether a refusal or the offer requested it.
+		generator.mutex.Lock()
+		generator.holdNextAvailable = true
+		generator.mutex.Unlock()
 		// Physical availability follows the real refusals. It sends no generator
 		// notification, changes no timer, and creates no discovery identity.
 		h.addExit(reraceExitSpec{name: "late"})
@@ -543,6 +553,15 @@ func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.
 		if !privateCrossWindowNativeSyn(h, path) {
 			t.Fatal("unchanged native retransmission was not source-admitted")
 		}
+		select {
+		case <-generator.availableEntered:
+		default:
+			t.Fatal("late listing did not reach its owned barrier by the retransmission boundary")
+		}
+		if len(h.liveChannels()) != 4 || h.boundTo(path) != nil || update.receivedInbound.Load() || len(h.exit("late").syns(path)) != 0 {
+			t.Fatal("late provider published before the unchanged source offer completed")
+		}
+		close(generator.availableRelease)
 		// Use the next unchanged source retransmission boundary. Virtual time
 		// advances only after the real enumerator and packet workers are idle.
 		published := discoveryDemandTestAwaitPublication(t, publication, start.Add(reraceSynSchedule[2]))
