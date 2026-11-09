@@ -868,6 +868,10 @@ func TestUpgradeMuxFallbackOnlyDuringTheConnectWindow(t *testing.T) {
 		settings.Dns.LocalFallbackTimeout = 50 * time.Millisecond
 		settings.Dns.ColdLocalFallbackTimeout = 10 * time.Millisecond
 		settings.Dns.ResolveTimeout = time.Second
+		// a family preset: no Failover, and one failure while ready is enough
+		// to read its health
+		settings.Dns.ResolverFailingMinCount = 1
+		settings.Dns.ResolverFailingMinDuration = 0
 	})
 	// a tunnel resolver that never answers
 	mux.mux.Tun().DohCache().remoteClient.httpClient.Transport = dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
@@ -894,6 +898,10 @@ func TestUpgradeMuxFallbackOnlyDuringTheConnectWindow(t *testing.T) {
 	reply = testPresetQuery(t, mux, rec, "w3.example", dnsTypeHttps, 0x1003)
 	if rcode, _ := testPresetReplyAnswers(t, reply); rcode != dnsmessage.RCodeServerFailure {
 		t.Fatalf("a forwarded query once the tunnel was ready = %v, expected SERVFAIL from the tunnel alone", rcode)
+	}
+	// the family preset stays failing, with nothing racing it (C3, C7)
+	if got := mux.DnsResolverHealth(); got.State != DnsResolverHealthFailing {
+		t.Fatalf("health once the tunnel was ready = %+v, expected the preset failing", got)
 	}
 	if fallback.asked("w2.example") || fallback.asked("w3.example") {
 		t.Fatalf("the fallback raced once the tunnel was ready: %v", fallback.asks())

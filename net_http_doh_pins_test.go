@@ -806,3 +806,66 @@ func TestDohServerHostAddrsCopies(t *testing.T) {
 		t.Fatalf("the v4-only tun copy lists = %v %v", copied.RemoteDohUrlsIpv4, copied.RemoteDohUrlsIpv6)
 	}
 }
+
+// The DoH-only chain of a preset (ADBLOCK3RD A6): a filtering server's NXDOMAIN
+// is the answer, an authoritative miss carrying the block, and no later step
+// of the chain runs, so plain dns can never answer the name the filter
+// blocked. The control turns local plain dns on, as custom settings may, and
+// shows the fall-through the preset shape rules out.
+func TestDohOnlyChainKeepsAFilteringNxdomain(t *testing.T) {
+	newCache := func(enableLocalDns bool, remoteDns *fakeDnsServer, localDns *fakeDnsServer) *DohCache {
+		settings := DefaultDohSettings()
+		settings.Log = NewNoopLogger()
+		settings.RequestTimeout = 5 * time.Second
+		settings.DohServerStagger = 0
+		settings.DnsResolverSettings = &DnsResolverSettings{
+			EnableRemoteDoh:   true,
+			EnableLocalDns:    enableLocalDns,
+			RemoteDohUrlsIpv4: []string{testCustomDohA},
+			RemoteDnsIpv4:     []string{"192.0.2.53"},
+			LocalDnsIpv4:      []string{"192.0.2.54"},
+		}
+		dialer := &testPinDialer{dns: remoteDns}
+		dialer.refuse.Store(true)
+		settings.DialContextSettings = &DialContextSettings{DialContext: dialer.dial}
+		cache := NewDohCache(settings)
+		t.Cleanup(cache.Close)
+		cache.localResolver = localDns.resolver()
+		cache.remoteClient.httpClient.Transport = dohRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			recorder := httptest.NewRecorder()
+			recorder.Header().Set("Content-Type", "application/dns-message")
+			recorder.Write(testingDohPolicyWire(t, testingDohRequestQuery(t, request), testingDohNxdomain(17)))
+			response := recorder.Result()
+			response.Request = request
+			return response, nil
+		})
+		return cache
+	}
+	plainAddr := netip.MustParseAddr("192.0.2.98")
+	remoteDns := newFakeDnsServer(t, map[string]netip.Addr{"blocked.example": plainAddr})
+	defer remoteDns.close()
+	localDns := newFakeDnsServer(t, map[string]netip.Addr{"blocked.example": plainAddr})
+	defer localDns.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cache := newCache(false, remoteDns, localDns)
+	result := cache.lookup(ctx, "A", "blocked.example")
+	if 0 < len(result.addrs) || !result.authoritative || !result.fresh || !result.blocked {
+		t.Fatalf("lookup = %+v, expected a fresh authoritative miss carrying the block", result)
+	}
+	if entry := testingDohCacheEntry(cache, "A", "blocked.example"); entry == nil || !entry.Miss || !entry.Blocked {
+		t.Fatalf("cache entry = %+v, expected a blocked miss", entry)
+	}
+	if got := remoteDns.requests.Load() + localDns.requests.Load(); got != 0 {
+		t.Fatalf("plain dns saw %d queries after the filter's NXDOMAIN", got)
+	}
+
+	control := newCache(true, remoteDns, localDns)
+	if addrs, _ := control.QueryResult(ctx, "A", "blocked.example"); !slices.Equal(addrs, []netip.Addr{plainAddr}) {
+		t.Fatalf("control lookup = %v, expected local plain dns to answer the blocked name", addrs)
+	}
+	if localDns.requests.Load() == 0 {
+		t.Fatal("the control never reached local plain dns")
+	}
+}
