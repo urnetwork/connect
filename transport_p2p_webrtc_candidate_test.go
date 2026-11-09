@@ -5,8 +5,10 @@ package connect
 // the candidate lines of a remote description.
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRemoteIceCandidateAllowed(t *testing.T) {
@@ -89,5 +91,40 @@ func TestFilterRemoteSdpCandidates(t *testing.T) {
 	}
 	if got := filterRemoteSdpCandidates(sdp, true, networks); got != sdp {
 		t.Fatal("a same-network peer's description changed")
+	}
+}
+
+// The trust that lets a same-network peer's candidates through is recorded on
+// every association of the peer when the manager remembers it, and a later
+// association of a remembered peer starts trusted; another peer's never is.
+func TestWebRtcManagerTrustsRememberedNetworkPeer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := &WebRtcManager{peerConns: map[peerConnKey]*peerConn{}}
+	networkPeerId := NewId()
+	publicPeerId := NewId()
+	networkConn := &peerConn{ctx: ctx, settings: DefaultWebRtcSettings()}
+	publicConn := &peerConn{ctx: ctx, settings: DefaultWebRtcSettings()}
+	manager.peerConns[peerConnKey{PeerId: networkPeerId, StreamId: NewId()}] = networkConn
+	manager.peerConns[peerConnKey{PeerId: publicPeerId, StreamId: NewId()}] = publicConn
+
+	if manager.trustedNetworkPeerLocked(networkPeerId) || networkConn.remoteCandidatesTrusted() {
+		t.Fatal("a peer is trusted before it is remembered")
+	}
+	manager.rememberNetworkPeerLocked(networkPeerId, time.Now())
+	if !networkConn.remoteCandidatesTrusted() {
+		t.Fatal("the remembered peer's live association is not trusted")
+	}
+	if publicConn.remoteCandidatesTrusted() || manager.trustedNetworkPeerLocked(publicPeerId) {
+		t.Fatal("another peer became trusted")
+	}
+	if !manager.trustedNetworkPeerLocked(networkPeerId) {
+		t.Fatal("a new association of the remembered peer would not start trusted")
+	}
+	// a test topology is trusted whatever the peer
+	loopback := DefaultWebRtcSettings()
+	loopback.UseLoopbackOnlyIceInterfaces = true
+	if !(&peerConn{ctx: ctx, settings: loopback}).remoteCandidatesTrusted() {
+		t.Fatal("the loopback-only test topology is filtered")
 	}
 }
