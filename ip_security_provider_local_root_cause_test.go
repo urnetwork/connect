@@ -14,14 +14,17 @@ package connect
 // This test drives the provider role's policy through each entry the
 // provider can take (the public reversed API, the borrowed sender path
 // RemoteUserNatProvider.ClientReceive calls, and the policy's group path)
-// for every relationship but a same-network one, on a host with a global
-// IPv6 /64 and a public IPv4 address. It asserts results only, so it runs
-// unchanged against the code before the fix.
+// for every relationship but a same-network one, unspecified included, on a
+// host with a global IPv6 /64 and a public IPv4 address: tcp, udp dns and
+// icmp echo, to the host, its router, its /64, its IPv4 address in both
+// forms, carrier-grade nat and tailscale's MagicDNS. It asserts results only,
+// so it runs unchanged against the code before the fix.
 
 import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -57,6 +60,8 @@ func TestProviderPolicyRefusesProviderHostAndLink(t *testing.T) {
 		{IpProtocolTcp, 2375, httpGet},
 		{IpProtocolTcp, 6379, redisPing},
 		{IpProtocolUdp, 53, dnsQuery},
+		// an echo request: icmp has no port
+		{IpProtocolIcmp, 0, nil},
 	} {
 		for _, host := range []struct {
 			what string
@@ -66,7 +71,9 @@ func TestProviderPolicyRefusesProviderHostAndLink(t *testing.T) {
 			{"the router at <prefix>::1", "2a01:4f8:c17:1234::1"},
 			{"another host in the /64", "2a01:4f8:c17:1234::beef"},
 			{"the host's own public ipv4", "203.0.113.10"},
+			{"the host's own public ipv4, v4-mapped", "::ffff:203.0.113.10"},
 			{"a 100.64.0.0/10 address", "100.101.102.103"},
+			{"tailscale MagicDNS", "100.100.100.100"},
 		} {
 			destinations = append(destinations, destination{
 				what:     host.what,
@@ -84,7 +91,8 @@ func TestProviderPolicyRefusesProviderHostAndLink(t *testing.T) {
 		ip := net.ParseIP(d.ip)
 		version := 6
 		sourceIp := net.ParseIP("fd00::9")
-		if ip4 := ip.To4(); ip4 != nil {
+		// a v4-mapped destination stays in its v6 packet
+		if ip4 := ip.To4(); ip4 != nil && !strings.HasPrefix(d.ip, "::ffff:") {
 			ip = ip4
 			version = 4
 			sourceIp = net.ParseIP("10.0.0.9").To4()
@@ -116,6 +124,8 @@ func TestProviderPolicyRefusesProviderHostAndLink(t *testing.T) {
 	}
 
 	for _, mode := range []protocol.ProvideMode{
+		// unspecified is treated as public
+		protocol.ProvideMode_None,
 		protocol.ProvideMode_Public,
 		protocol.ProvideMode_FriendsAndFamily,
 		protocol.ProvideMode_Stream,
