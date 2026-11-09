@@ -1,8 +1,9 @@
 # Third-party ad-blocking DNS presets plan
 
 Status: final plan, 2026-11-09. The owner decided every open question on
-2026-11-09, in two rounds; section 8 records the decisions, no decision is
-pending, and the sections below follow them. Adblock provider facts come from
+2026-11-09, in two rounds and a later answer on preset names; section 8
+records the decisions, no decision is pending, and the sections below
+follow them. Adblock provider facts come from
 the ad-blocking DNS research of 2026-11-08 (the report and its notes, kept in
 the private factury repo); this document cites the adblock providers' public
 pages the report cites, and marks the report's own live probes as "probed
@@ -23,7 +24,10 @@ and the policy-filter guard, 3.1) landed in connect `829a5a54`, sdk
 `5c7a6eb7` and mmm `927c0bd04`. `feature/dns-defaults-v3` (DNS.SB among the
 defaults, the sdk's `DefaultServersVersion` 3 with the kz migration, and
 DNS4EU's family names; decisions 19, 20 and 22) lands in connect and the sdk
-with the next build.
+with the next build. `feature/dns-preset-names` (every preset's own name,
+decision 24) landed in sdk `12199300`, localizations `276765f`, apple
+`48459757`, android `549ad0107`, windows `fdcf359c`, linux
+`c893407` and mmm `2f5499ee5`, and ships with the next build.
 
 ## 1. Original request
 
@@ -60,7 +64,9 @@ the sdk and change only with releases; and a local count of blocked lookups
 ships in the first release. A second round the same day settled the
 terminology, made DNS.SB a default resolver, named DNS4EU's two family
 presets, let the personal ID show in its own edit field, and moves the old
-Google-only kz recommendation to today's (decisions 18 to 23).
+Google-only kz recommendation to today's (decisions 18 to 23). Later that
+day the owner gave every preset a short, descriptive name of its own, such
+as "AdGuard Family" or "Cloudflare Malware Blocking" (decision 24).
 
 ## 2. Goals and non-goals
 
@@ -592,6 +598,9 @@ A2. Data model, internal to the sdk:
 type dnsPresetProvider struct {
 	providerId   string // stable: "adguard"
 	name         string // "AdGuard DNS"
+	// the name its presets' names begin with, where the name is longer than
+	// they need: "AdGuard" (decision 24); empty uses name
+	shortName    string
 	operator     string // "AdGuard Software Ltd"
 	jurisdiction string // "Cyprus"
 	helpUrl      string
@@ -603,10 +612,10 @@ type dnsPresetProvider struct {
 type dnsPreset struct {
 	presetId   string // stable and stored on devices: "adguard"
 	providerId string
-	// the name the preset shows where its provider's alone would not tell it
-	// from the provider's other presets in its group, else empty: "DNS4EU
-	// Child" and "DNS4EU Child, no ads" (decision 20)
-	name string
+	// the localization key of the preset's own short, descriptive name, with
+	// its adblock provider's short name as {provider}:
+	// dns_preset_name_ad_blocking, "AdGuard Ad Blocking" (decision 24, A3)
+	nameKey string
 	// the outcome group: adblock, security, family, unfiltered or personal
 	group string
 	// whether it blocks ads; false shows "not ads" in the picker
@@ -676,23 +685,23 @@ by adblock provider name. Every adblock provider is approved (owner,
 still passes F3 before it merges. The No-filtering picks are in the catalog
 proper (O1); `cloudflare` answers 8236's "use Cloudflare" directly.
 
-| Id | Group | Picker copy | DoH urls | Pins | Block answer | Canary | On failure | Gate |
+| Id | Group | Name: picker copy | DoH urls | Pins | Block answer | Canary | On failure | Gate |
 |---|---|---|---|---|---|---|---|---|
-| `adguard` | adblock | AdGuard DNS: blocks ads, trackers, phishing | `https://dns.adguard-dns.com/dns-query` | `94.140.14.14`, `94.140.15.15`, `2a10:50c0::ad1:ff`, `2a10:50c0::ad2:ff` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
-| `controld-ads` | adblock | Control D: blocks ads, trackers, malware | `https://freedns.controld.com/p2` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
-| `dns4eu-noads` | adblock | DNS4EU: blocks ads, trackers, malware, phishing | `https://noads.joindns4.eu/dns-query` | `86.54.11.13`, `86.54.11.213`, `2a13:1001::86:54:11:13`, `2a13:1001::86:54:11:213` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
-| `cloudflare-security` | security | Cloudflare: blocks malware, not ads | `https://1.1.1.2/dns-query`, `https://1.0.0.2/dns-query`; `https://[2606:4700:4700::1112]/dns-query`, `https://[2606:4700:4700::1002]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | approved (owner, 2026-11-09); F3 |
-| `dns4eu-protective` | security | DNS4EU: blocks malware and phishing, not ads | `https://protective.joindns4.eu/dns-query` | `86.54.11.1`, `86.54.11.201`, `2a13:1001::86:54:11:1`, `2a13:1001::86:54:11:201` | `0.0.0.0` expected (section 10) | none | fail closed | approved (owner, 2026-11-09); F3 |
-| `quad9` | security | Quad9: blocks malware and phishing, not ads | `https://9.9.9.9/dns-query`, `https://149.112.112.112/dns-query`; `https://[2620:fe::fe]/dns-query`, `https://[2620:fe::9]/dns-query` | none | NXDOMAIN, EDE 17 | `examplemalwaredomain.com` | fail closed | approved (owner, 2026-11-09); F3 |
-| `adguard-family` | family | AdGuard DNS Family: ads, trackers, adult sites, Safe Search | `https://family.adguard-dns.com/dns-query` | `94.140.14.15`, `94.140.15.16`, `2a10:50c0::bad1:ff`, `2a10:50c0::bad2:ff` | `0.0.0.0` | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
+| `adguard` | adblock | AdGuard Ad Blocking: blocks ads, trackers, phishing | `https://dns.adguard-dns.com/dns-query` | `94.140.14.14`, `94.140.15.15`, `2a10:50c0::ad1:ff`, `2a10:50c0::ad2:ff` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `controld-ads` | adblock | Control D Ad Blocking: blocks ads, trackers, malware | `https://freedns.controld.com/p2` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `dns4eu-noads` | adblock | DNS4EU Ad Blocking: blocks ads, trackers, malware, phishing | `https://noads.joindns4.eu/dns-query` | `86.54.11.13`, `86.54.11.213`, `2a13:1001::86:54:11:13`, `2a13:1001::86:54:11:213` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `cloudflare-security` | security | Cloudflare Malware Blocking: blocks malware, not ads | `https://1.1.1.2/dns-query`, `https://1.0.0.2/dns-query`; `https://[2606:4700:4700::1112]/dns-query`, `https://[2606:4700:4700::1002]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `dns4eu-protective` | security | DNS4EU Malware Blocking: blocks malware and phishing, not ads | `https://protective.joindns4.eu/dns-query` | `86.54.11.1`, `86.54.11.201`, `2a13:1001::86:54:11:1`, `2a13:1001::86:54:11:201` | `0.0.0.0` expected (section 10) | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `quad9` | security | Quad9 Malware Blocking: blocks malware and phishing, not ads | `https://9.9.9.9/dns-query`, `https://149.112.112.112/dns-query`; `https://[2620:fe::fe]/dns-query`, `https://[2620:fe::9]/dns-query` | none | NXDOMAIN, EDE 17 | `examplemalwaredomain.com` | fail closed | approved (owner, 2026-11-09); F3 |
+| `adguard-family` | family | AdGuard Family: ads, trackers, adult sites, Safe Search | `https://family.adguard-dns.com/dns-query` | `94.140.14.15`, `94.140.15.16`, `2a10:50c0::bad1:ff`, `2a10:50c0::bad2:ff` | `0.0.0.0` | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
 | `cloudflare-family` | family | Cloudflare Family: blocks malware and adult sites, not ads | `https://1.1.1.3/dns-query`, `https://1.0.0.3/dns-query`; `https://[2606:4700:4700::1113]/dns-query`, `https://[2606:4700:4700::1003]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | approved (owner, 2026-11-09); F3 |
 | `controld-family` | family | Control D Family: ads, trackers, malware, adult, drugs | `https://freedns.controld.com/family` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
 | `dns4eu-child` | family | DNS4EU Child: blocks malware, adult sites, gambling, drugs, violence, not ads | `https://child.joindns4.eu/dns-query` | `86.54.11.12`, `86.54.11.212`, `2a13:1001::86:54:11:12`, `2a13:1001::86:54:11:212` | `0.0.0.0` expected (section 10) | none | fail closed | approved (owner, 2026-11-09); F3 |
 | `dns4eu-child-noads` | family | DNS4EU Child, no ads: ads, trackers, malware, adult sites, gambling, drugs, violence | `https://child-noads.joindns4.eu/dns-query` | `86.54.11.11`, `86.54.11.211`, `2a13:1001::86:54:11:11`, `2a13:1001::86:54:11:211` | `0.0.0.0` expected (section 10) | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
-| `adguard-unfiltered` | unfiltered | AdGuard DNS: no filtering | `https://unfiltered.adguard-dns.com/dns-query` | `94.140.14.140`, `94.140.14.141`, `2a10:50c0::1:ff`, `2a10:50c0::2:ff` | none | none | fall back | approved (owner, 2026-11-09); F3 |
-| `cloudflare` | unfiltered | Cloudflare: no filtering | `https://1.1.1.1/dns-query`, `https://1.0.0.1/dns-query`; `https://[2606:4700:4700::1111]/dns-query`, `https://[2606:4700:4700::1001]/dns-query` | none | none | none | fall back | approved (owner, 2026-11-09); F3 |
-| `controld-unfiltered` | unfiltered | Control D: no filtering | `https://freedns.controld.com/p0` | `76.76.2.11`, `2606:1a40::11` | none | none | fall back | approved (owner, 2026-11-09); F3 |
-| `dns4eu-unfiltered` | unfiltered | DNS4EU: no protective filtering; court-ordered blocks still apply | `https://unfiltered.joindns4.eu/dns-query` | `86.54.11.100`, `86.54.11.200`, `2a13:1001::86:54:11:100`, `2a13:1001::86:54:11:200` | court orders only; the form is unverified (section 10) | none | fall back | approved (owner, 2026-11-09); F3 |
+| `adguard-unfiltered` | unfiltered | AdGuard No Filtering: no filtering | `https://unfiltered.adguard-dns.com/dns-query` | `94.140.14.140`, `94.140.14.141`, `2a10:50c0::1:ff`, `2a10:50c0::2:ff` | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `cloudflare` | unfiltered | Cloudflare No Filtering: no filtering | `https://1.1.1.1/dns-query`, `https://1.0.0.1/dns-query`; `https://[2606:4700:4700::1111]/dns-query`, `https://[2606:4700:4700::1001]/dns-query` | none | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `controld-unfiltered` | unfiltered | Control D No Filtering: no filtering | `https://freedns.controld.com/p0` | `76.76.2.11`, `2606:1a40::11` | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `dns4eu-unfiltered` | unfiltered | DNS4EU No Filtering: no protective filtering; court-ordered blocks still apply | `https://unfiltered.joindns4.eu/dns-query` | `86.54.11.100`, `86.54.11.200`, `2a13:1001::86:54:11:100`, `2a13:1001::86:54:11:200` | court orders only; the form is unverified (section 10) | none | fall back | approved (owner, 2026-11-09); F3 |
 
 What the presets were seen to do, probed 2026-11-08: AdGuard Default,
 AdGuard Family, Control D p2 and DNS4EU's ad-blocking variant answered
@@ -724,22 +733,41 @@ why its No-filtering copy says "no protective filtering". Its 14 resolvers
 sit in 14 EU member states, and its policy aims the Public Service primarily
 at individuals in the EU (H3).
 
-Each pick shows its adblock provider's name, as the copy column starts,
-except DNS4EU's two family presets, which show names of their own: "DNS4EU
-Child" (`dns4eu-child`) and "DNS4EU Child, no ads" (`dns4eu-child-noads`)
-(decision 20), since "DNS4EU" alone would show twice in Family. The name is
-the preset's `ProviderName`, on its row and as `{provider}` in the summary,
-the status line, the blocked-lookups count and the dropped-preset notice, so
-the apps need no change; the `DnsPresetProvider` keeps "DNS4EU". A catalog
-test requires every pick to show a name no other pick of its group shows,
-and a preset's own name to begin with its adblock provider's.
+Each pick shows a short, descriptive name of its own (decision 24), as the
+name column starts: its adblock provider's short name, then what it does by
+its group, "Ad Blocking", "Malware Blocking", "Family", "No Filtering" or
+"Personal". DNS4EU's two family presets keep "DNS4EU Child"
+(`dns4eu-child`) and "DNS4EU Child, no ads" (`dns4eu-child-noads`)
+(decision 20), since two DNS4EU presets share Family. The short name is the
+adblock provider's name, except "AdGuard" for AdGuard DNS, so the picks read
+"AdGuard Family", not "AdGuard DNS Family". A name is a localization key
+(`dns_preset_name_ad_blocking`, `_malware_blocking`, `_family`, `_child`,
+`_child_ads`, `_no_filtering`, `_personal`; G1) with the short name as
+`{provider}`: the purpose is translated, the adblock provider's name never
+is (G2), and every language puts the name first, so a group stays in
+alphabetical order. The sdk hands it as `NameKey` and `NameProvider` on the
+preset, the summary and the status, and `DroppedNameKey` and
+`DroppedNameProvider` for the dropped-preset notice (A5). The apps render
+it on the row and pass it, rendered, as `{provider}` to the lines that name
+the selected preset: the summary row, which is "DNS: <name>" for every
+preset (`dns_status_provider`, the status line's text, since the name says
+what the preset does), the status line, the blocked-lookups count, the
+Fast DNS note, Android's Private DNS line and the dropped-preset notice.
+The lines that name the adblock provider keep its name (`ProviderName`):
+the disclosure, the personal ID field and the verification line with its
+link. The `DnsPresetProvider` keeps "AdGuard DNS" and "DNS4EU". Catalog
+tests require every preset to have a name of its group's purpose, no two
+presets of the catalog to show the same name, DNS4EU's two child names to
+say what they do about ads, and a short name to shorten its adblock
+provider's name.
 
 None of the filtering presets above names a built-in endpoint (3.1), so the
 policy-filter guard leaves their blocks alone (B4). The `quad9` preset's
 `9.9.9.9` became an ordinary endpoint when the defaults moved to Quad9's
 unfiltered `9.9.9.10`.
 
-Personal presets (D), the "Use my account" group, in display order:
+Personal presets (D), the "Use my account" group, in display order, named
+"AdGuard Personal", "Control D Personal" and "NextDNS Personal":
 
 | Id | DoH form stored | Pins | Unknown or wrong id, probed 2026-11-08 | Free tier |
 |---|---|---|---|---|
@@ -803,6 +831,13 @@ type DnsPresetProvider struct {
 type DnsPreset struct {
 	PresetId   string
 	ProviderId string
+	// the preset's own name, which the apps render: its localization key and
+	// the adblock provider's short name (decision 24, A3); the summary and
+	// the status carry it too, and the summary the dropped preset's
+	NameKey      string
+	NameProvider string
+	// the adblock provider's name, for the lines that name it (A3)
+	ProviderName string
 	Group      string // adblock, security, family, unfiltered, personal
 	BlocksAds  bool
 	// whether a failing preset falls back to URnetwork's resolvers
@@ -914,12 +949,12 @@ sdk ignores the selection and uses the lists (E5).
 A7. Catalog changes reach devices only with an app release (O13), because
 the device derives the lists from the current catalog at every apply. When a
 release drops a preset, the catalog keeps its id, with the name it showed
-(its adblock provider's, or its own, A3), as reserved (A4). A device whose
-stored selection names a dropped id switches to URnetwork's DNS: it applies
-`default` in its place, and the DNS screen and the summary show a notice
-that names the adblock provider and says its filtering is off, with "Choose
-another preset" and "Enter it yourself under
-Custom" (O8). This holds for every group, family and personal included, and
+(its name key and short name, A3) and its adblock provider's name, as
+reserved (A4). A device whose stored selection names a dropped id switches
+to URnetwork's DNS: it applies `default` in its place, and the DNS screen
+and the summary show a notice that names the preset as it showed, such as
+"AdGuard Family is no longer available", and says its filtering is off,
+with "Choose another preset" and "Enter it yourself under Custom" (O8). This holds for every group, family and personal included, and
 never happens silently; dismissing the notice saves `default`.
 
 ### B. The resolution path (connect)
@@ -1191,15 +1226,18 @@ personal configuration is never tied to it. While a preset is selected:
 
 Default and custom selections keep today's fallback.
 
-C8. What the user sees. The status line names the adblock provider, by the
-name its pick shows (A3), and the state: "DNS: AdGuard DNS"; for a preset
-that falls back, "Ad blocking paused: AdGuard DNS isn't answering" (a
-no-filtering preset, which pauses no ad blocking, reads "Cloudflare isn't
-answering. Using URnetwork DNS."); for one that fails closed, "DNS4EU Child
-isn't answering". Each comes with two
-actions, "Use URnetwork DNS" (selects `default` in one tap) and "Change
-location". No local notification: this is not a disconnect-class event. A
-personal preset shows "NextDNS · your profile", never the id (D5).
+C8. What the user sees. The status line names the preset, by its own name
+(A3, decision 24), and the state: "DNS: AdGuard Ad Blocking"; for a preset
+that falls back, "Ad blocking paused: AdGuard Ad Blocking isn't answering"
+(a no-filtering preset, which pauses no ad blocking, reads "Cloudflare No
+Filtering isn't answering. Using URnetwork DNS."); for one that fails
+closed, "AdGuard Family isn't answering" or "DNS4EU Child isn't answering".
+Each comes with two actions, "Use URnetwork DNS" (selects `default` in one
+tap) and "Change location". No local notification: this is not a
+disconnect-class event. A personal preset shows its name, "NextDNS
+Personal", never the id (D5). The verification line under it names the
+adblock provider, whose answers it judges: "AdGuard DNS isn't filtering
+from this location" (C6).
 
 C9. Regional and court-order blocks. Inside a working tunnel a preset's
 queries leave from the exit's country, so a user in Tehran exiting in Germany
@@ -1294,7 +1332,8 @@ D5. Secrecy. Whoever holds a personal id can send queries under the user's
 configuration: track the user across sessions and exits, pollute their logs,
 and use up a free plan's quota (D1). It is never logged (B7), never sent to URnetwork's servers, stored
 only in the local record (wiped at logout), and crosses only the local
-device rpc. The summary shows "your profile", not the id. The saved id may
+device rpc. The summary shows the preset's name, "NextDNS Personal", not the
+id (decision 24). The saved id may
 show in its own edit field on every app, and nowhere else: never in a
 summary, a status line or a log (decision 21). The derived urls
 in the settings carry it too; nothing logs a settings value today (the rpc
@@ -1402,26 +1441,32 @@ screen opens on the current selection, which for nearly everyone is
 default in every app (N1).
 
 1. The picks, in this order (O9), adblock providers alphabetical within each
-   group: "URnetwork (default)"; "Block ads and trackers" (AdGuard DNS,
-   Control D, DNS4EU); "Block malware" (Cloudflare, DNS4EU, Quad9); "Family"
-   (AdGuard DNS, Cloudflare, Control D, DNS4EU Child, DNS4EU Child, no ads);
-   "Use my account" (AdGuard DNS, Control D, NextDNS); "No filtering"
-   (AdGuard DNS, Cloudflare, Control D, DNS4EU); "Custom", today's editor,
-   always there (O1); then "Regional (<country>), unencrypted", shown only
-   while the exit's country has a recommendation and never selected
-   automatically (O6).
-2. Each pick shows its adblock provider's name, or its own for DNS4EU's two
-   family presets (A3, decision 20), never a logo (O10), what it blocks (its
-   picker copy, A3), the operator's jurisdiction and a privacy-policy link,
-   as AdGuard's iOS app and Chrome do.
+   group: "URnetwork (default)"; "Block ads and trackers" (AdGuard Ad
+   Blocking, Control D Ad Blocking, DNS4EU Ad Blocking); "Block malware"
+   (Cloudflare Malware Blocking, DNS4EU Malware Blocking, Quad9 Malware
+   Blocking); "Family" (AdGuard Family, Cloudflare Family, Control D Family,
+   DNS4EU Child, DNS4EU Child, no ads); "Use my account" (AdGuard Personal,
+   Control D Personal, NextDNS Personal); "No filtering" (AdGuard No
+   Filtering, Cloudflare No Filtering, Control D No Filtering, DNS4EU No
+   Filtering); "Custom", today's editor, always there (O1); then "Regional
+   (<country>), unencrypted", shown only while the exit's country has a
+   recommendation and never selected automatically (O6).
+2. Each pick shows its own short, descriptive name (A3, decisions 20 and
+   24), the purpose translated and the adblock provider's name as it is,
+   never a logo (O10), what it blocks (its picker copy, A3), the operator's
+   jurisdiction and a privacy-policy link, as AdGuard's iOS app and Chrome
+   do.
 3. Under the selected pick: "Your DNS lookups go to <Provider> through the
    tunnel. <Provider>'s privacy policy applies.", with "Privacy policy" and
-   "Help" links (H2).
+   "Help" links (H2). It names the adblock provider, "AdGuard DNS", since
+   its policy applies whichever of its presets is picked.
 4. The status line (C8) and the verification result (C6).
 5. While a filtering preset is selected (the ad-blocking, malware, family
    and personal groups), the blocked-lookups count for this connection
-   (O16, I3): "<count> lookups blocked by <Provider> this connection", with
-   a note that some blocks are not counted, so the figure is a floor.
+   (O16, I3): "<count> lookups blocked by <Preset> this connection", with
+   the preset's name, such as "120 lookups blocked by AdGuard Ad Blocking
+   this connection", and a note that some blocks are not counted, so the
+   figure is a floor.
 6. The existing toggles stay: Fast DNS on connect, with the preset note
    (C7), and the built-in blocker, labeled as URnetwork's own. Both blockers
    can be on; the built-in one answers first (3.6).
@@ -1433,9 +1478,12 @@ default in every app (N1).
    `ResponseTtl` 60 s, `ip_mux_upgrade.go:157`).
 
 The summary row wherever DNS is shown today reads, for example, "DNS:
-URnetwork", "DNS: AdGuard DNS · Ad blocking", "DNS: NextDNS · your profile",
-"DNS: Custom" or "DNS: Regional (unencrypted)", from
-`DescribeDnsResolverSettings`.
+URnetwork", "DNS: AdGuard Ad Blocking", "DNS: NextDNS Personal", "DNS:
+Custom" or "DNS: Regional (unencrypted)", from
+`DescribeDnsResolverSettings`. A preset's row is "DNS: <name>", the status
+line's text and key (`dns_status_provider`), since its name already says
+what it does (decision 24); the per-group summary rows ("DNS: AdGuard DNS ·
+Ad blocking") are retired.
 
 F2. Per platform. The picker goes at the top of the existing Custom DNS
 editor on every app, under the connection region row and the "Traffic DNS"
@@ -1506,6 +1554,12 @@ family):
   `dns_group_family`, `dns_group_my_account`, `dns_group_no_filtering`,
   `dns_provider_default`, `dns_provider_custom`, `dns_provider_regional`
   (country);
+- each preset's name (decision 24), one key per purpose with the adblock
+  provider's short name as `{provider}`: `dns_preset_name_ad_blocking`,
+  `dns_preset_name_malware_blocking`, `dns_preset_name_family`,
+  `dns_preset_name_child`, `dns_preset_name_child_ads`,
+  `dns_preset_name_no_filtering`, `dns_preset_name_personal` ("{provider}
+  Ad Blocking", ..., "{provider} Personal");
 - picker copy, one key per preset (the adblock provider's name as a
   placeholder, so the name stays untranslated), e.g. `dns_preset_adguard_copy`,
   `dns_preset_quad9_copy` ("blocks malware and phishing, not ads");
@@ -1531,8 +1585,11 @@ family):
   `dns_apple_profiles_note`;
 - the error ids of A5.
 
-G2. Adblock provider names, DNS4EU's two family names (A3), operators and
-jurisdictions are not translated; group names, copy and messages are. A
+G2. Adblock provider names, operators and jurisdictions are not translated;
+group names, copy, messages and the purpose in each preset's name are (A3,
+decision 24), so "AdGuard Family" reads "AdGuard Familie" and "DNS4EU
+Child" reads "DNS4EU Kinderschutz" in German, the adblock provider's name
+first in every language. A
 string that names the kind of company says "adblock provider", never a bare
 "provider", in every language (decision 18); the `{provider}` placeholder
 and the key ids keep their names.
@@ -1676,8 +1733,12 @@ only the catalog-integrity test reads the catalog itself.
 
 ### 6.1 sdk
 
-- Catalog integrity (A4), table-driven over every entry, and every pick
-  showing a name no other pick of its group shows (A3, decision 20).
+- Catalog integrity (A4), table-driven over every entry, and every preset
+  named by a key of its group's purpose and its adblock provider's short
+  name, no two presets of the catalog showing the same name (A3, decisions
+  20 and 24); every preset's English name pinned on its row, the adblock
+  provider list, the summary, the status line and the dropped notice, and the name
+  keys' English checked against the store when it is at hand.
 - Normalization and validation per adblock provider, from D4: bare ids;
   dashboard urls with and without a device name; DoT hostnames with and
   without a device name; upper case; whitespace; a url or hostname of
@@ -1890,7 +1951,8 @@ The owner decided every question on 2026-11-09, and the sections above
 follow these decisions. Later that day the approvals (O12) replaced the
 permission parts of O1, O12 and O14, and then the owner dropped RethinkDNS
 from the catalog (O14). A second round the same day, numbered 18 to 23 in
-the owner's decision list, follows the O items.
+the owner's decision list, follows the O items, and decision 24, the
+presets' names, came later that day.
 
 - O1. The first catalog is the full set (A3): one-tap presets to block ads
   and trackers, to block malware and for families, the "No filtering" picks
@@ -2004,6 +2066,21 @@ The second round, later on 2026-11-09:
   is a server change, outside connect and the sdk (section 7).
 - 23. The owner compiles the apps, with a build starting soon, and the
   ur.io help lands with it (section 7).
+- 24. Every preset gets a short, descriptive name of its own (owner,
+  2026-11-09). Asked whether the AdGuard, Cloudflare and Control D family
+  presets should get names of their own, as DNS4EU's two did (decision 20),
+  the owner answered: "Give each preset descriptive and short names." A
+  preset's name is its adblock provider's short name and what it does:
+  "AdGuard Ad Blocking", "Cloudflare Malware Blocking", "AdGuard Family",
+  "Cloudflare No Filtering", "NextDNS Personal", with DNS4EU's family
+  presets keeping "DNS4EU Child" and "DNS4EU Child, no ads" (A3). The
+  purpose is translated through the localization store and the adblock
+  provider's name never is (G1, G2). The picker row, the summary row ("DNS:
+  <name>"), the status line, the blocked-lookups count, the Fast DNS note
+  and the dropped-preset notice name the preset; the disclosure, the
+  personal ID field and the verification line name the adblock provider
+  (A3, A7, C8, F1). The Play listing and the VpnService disclosure keep the
+  wording "DNS provider" (O15, H4 unchanged).
 
 ## 9. Known limitations
 
