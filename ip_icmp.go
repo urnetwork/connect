@@ -478,6 +478,8 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		icmp:        *icmp,
 		ipPacket:    ipPacket,
 	}
+	// a flow reads its peer once, when it opens; a queued echo keeps none
+	sendItem.icmp.egressPeer = nil
 	sequence := initSequence(nil)
 	if sequence == nil {
 		return false, nil

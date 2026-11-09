@@ -3225,6 +3225,8 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		udp:         *udp,
 		ipPacket:    ipPacket,
 	}
+	// a flow reads its peer once, when it opens; a queued datagram keeps none
+	sendItem.udp.egressPeer = nil
 	sequence := initSequence(nil)
 	if sequence == nil {
 		return false, nil
@@ -5131,6 +5133,8 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		tcp:         *tcp,
 		ipPacket:    ipPacket,
 	}
+	// a flow reads its peer once, when it opens; a queued segment keeps none
+	sendItem.tcp.egressPeer = nil
 	var err error
 	accepted, err = sequence.send(sendItem, timeout)
 	if !accepted && recheckRetirement && sequence.ctx.Err() != nil {
