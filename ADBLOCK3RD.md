@@ -40,13 +40,15 @@ them as requirements:
   block some operators, or the regional presets.
 
 Owner decisions, 2026-11-09 (section 8): the full first catalog, with the
-"No filtering" picks and with DNS4EU and RethinkDNS added; every provider
-counts as approved, so no preset waits for a provider's answer; manual entry
-under "Custom" always stays; ad blocking is off by default in every app, and
-URnetwork's default DNS stays the default everywhere; a failing preset falls
-back or fails closed by purpose; Fast DNS on connect uses URnetwork's DNS;
-the catalog and its addresses are built into the sdk and change only with
-releases; and a local count of blocked lookups ships in the first release.
+"No filtering" picks and with DNS4EU added, while RethinkDNS stays out
+because its resolver forwards to Google upstream; every provider in the
+catalog counts as approved, so no preset waits for a provider's answer;
+manual entry under "Custom" always stays; ad blocking is off by default in
+every app, and URnetwork's default DNS stays the default everywhere; a
+failing preset falls back or fails closed by purpose; Fast DNS on connect
+uses URnetwork's DNS; the catalog and its addresses are built into the sdk
+and change only with releases; and a local count of blocked lookups ships in
+the first release.
 
 ## 2. Goals and non-goals
 
@@ -183,9 +185,12 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   a user who chose 9.9.9.9 outside an exact old default list keeps it, and a
   record at the current version never migrates. The editors start from the
   mux resolver, which has no local plain lists, so none of those migrates.
-  A record below version 2 whose remote plain lists hold exactly the
-  version 1 kz recommendation (Cloudflare and Quad9's 9.9.9.9, both
-  families, in any order) loads with the current kz recommendation.
+  A version 1 record whose remote plain lists hold exactly the version 1
+  kz recommendation (Cloudflare and Quad9's 9.9.9.9, both families, in any
+  order) loads with the current kz recommendation. A version 0 record with
+  those lists keeps them as saved, 9.9.9.9 included, because before version
+  1 kz recommended Google alone, so there they are the user's own choice
+  (sdk `29df346d`).
 - mmm updates the ur.io threat model's resolver rows to match.
 
 ### 3.2 How a user's DNS flows while connected
@@ -587,10 +592,8 @@ A3. The catalog. Values are verbatim from the providers' pages (AdGuard's
 [Quad9](https://quad9.net/service/service-addresses-and-features),
 Cloudflare's [setup](https://developers.cloudflare.com/1.1.1.1/setup/) and
 [addresses](https://developers.cloudflare.com/1.1.1.1/ip-addresses/) pages,
-and DNS4EU's [public service](https://www.joindns4.eu/for-public) page;
-RethinkDNS's url as the [curl wiki](https://github.com/curl/curl/wiki/DNS-over-HTTPS)
-and the [DNSCrypt list](https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md)
-give it); the Control D bootstrap pair is the one Control D's own client uses
+and DNS4EU's [public service](https://www.joindns4.eu/for-public) page);
+the Control D bootstrap pair is the one Control D's own client uses
 ([ctrld config.go](https://github.com/Control-D-Inc/ctrld/blob/37c33315591632c5f08df8062d1c77e07b3a465f/config.go#L52-L63)).
 
 One-tap presets, in display order (O9): by group in the screen's order, then
@@ -616,7 +619,6 @@ The No-filtering picks are in the catalog proper (O1); `cloudflare` answers
 | `cloudflare` | unfiltered | Cloudflare: no filtering | `https://1.1.1.1/dns-query`, `https://1.0.0.1/dns-query`; `https://[2606:4700:4700::1111]/dns-query`, `https://[2606:4700:4700::1001]/dns-query` | none | none | none | fall back | approved (owner, 2026-11-09); F3 |
 | `controld-unfiltered` | unfiltered | Control D: no filtering | `https://freedns.controld.com/p0` | `76.76.2.11`, `2606:1a40::11` | none | none | fall back | approved (owner, 2026-11-09); F3 |
 | `dns4eu-unfiltered` | unfiltered | DNS4EU: no protective filtering; court-ordered blocks still apply | `https://unfiltered.joindns4.eu/dns-query` | `86.54.11.100`, `86.54.11.200`, `2a13:1001::86:54:11:100`, `2a13:1001::86:54:11:200` | court orders only; the form is unverified (section 10) | none | fall back | approved (owner, 2026-11-09); F3 |
-| `rethinkdns-unfiltered` | unfiltered | RethinkDNS: no filtering | `https://sky.rethinkdns.com/dns-query` | the addresses F3 records; none published (section 10) | none | none | fall back | approved (owner, 2026-11-09); F3 and pin stability (section 10) |
 
 What the presets were seen to do, probed 2026-11-08: AdGuard Default,
 AdGuard Family, Control D p2 and DNS4EU's ad-blocking variant answered
@@ -626,17 +628,16 @@ with NXDOMAIN and EDE 17, and a genuinely nonexistent name without EDE; none
 of the free tiers of Quad9 and Cloudflare blocked any of eight ad and
 tracker domains, which is why their copy says "not ads"; Cloudflare 1.1.1.3
 also forced Google SafeSearch and Bing strict mode by CNAME, which
-Cloudflare does not document; RethinkDNS's `sky.rethinkdns.com/dns-query`
-returned real answers. DNS4EU's two child variants and Protective's malware
-blocks were not probed, so their block answers are expected, not seen
-(section 10). AdGuard accepted HTTP/2 and HTTP/1.1, Quad9 has required
+Cloudflare does not document. DNS4EU's two child variants and Protective's
+malware blocks were not probed, so their block answers are expected, not
+seen (section 10). AdGuard accepted HTTP/2 and HTTP/1.1, Quad9 has required
 HTTP/2 since 2025-12-15 (HTTP 505 on 1.1,
 [FAQ](https://docs.quad9.net/FAQs/)), and DNS4EU refused a TLS client that
 offered no ALPN, with a `no_application_protocol` alert, and answered over
 HTTP/2. The research reports that every recommended preset answered RFC 8484
-GET, and its DNS4EU and RethinkDNS probes were GET too. connect offers ALPN
-`h2` ahead of `http/1.1` on every DoH client and sends GET only (3.2 step
-10, section 7), so all of them fit.
+GET, and its DNS4EU probes were GET too. connect offers ALPN `h2` ahead of
+`http/1.1` on every DoH client and sends GET only (3.2 step 10, section 7),
+so all of them fit.
 
 DNS4EU's DoH stamps carry no address, so its presets use hostname urls with
 pins, the addresses its public-service page lists for each variant.
@@ -647,13 +648,7 @@ French ARCOM and Paris court orders and Russian state-media domains
 ([legal](https://www.joindns4.eu/legal-information-and-compliance)), which is
 why its No-filtering copy says "no protective filtering". Its 14 resolvers
 sit in 14 EU member states, and its policy aims the Public Service primarily
-at individuals in the EU (H3). RethinkDNS's `sky` is a DoH stub on
-Cloudflare Workers in 280+ locations that forwards to Cloudflare's resolver
-first and Google's second
-([env.js](https://github.com/serverless-dns/serverless-dns/blob/b0b7fe52ecc053562d1fc425f9c5c6f984d37e11/src/core/env.js#L139-L154)),
-its hosting is funded by donations and grants, and it publishes no
-addresses, so its pins are the addresses F3 records and whether they stay
-put is a fact to verify (section 10).
+at individuals in the EU (H3).
 
 None of the filtering presets above names a built-in endpoint (3.1), so the
 policy-filter guard leaves their blocks alone (B4). The `quad9` preset's
@@ -677,16 +672,15 @@ router guide also lists `94.140.14.59` and `2a10:50c0::dad:ff` for private
 servers ([KB](https://adguard-dns.io/kb/private-dns/connect-devices/routers/universal/)),
 which F3 checks before they become pins.
 
-Left out, with reasons (the research's, and for RethinkDNS stamps the lack
-of a recommended one):
+Left out, with reasons (the research's, and for RethinkDNS the owner's):
 
 | Provider | Why not |
 |---|---|
-| RethinkDNS blocklist stamps | no stamp RethinkDNS recommends for ads and trackers is on record; the code's `rec` alias is the candidate (section 10); a user can paste a stamp url under Custom |
 | CleanBrowsing | free tier "for parents, not organizations", a "Throttled Service", no selling access; Family blocks "proxy and VPN domains" ([terms](https://cleanbrowsing.org/terms/), [filters](https://cleanbrowsing.org/filters/)) |
 | OpenDNS FamilyShield | returned block pages for `nordvpn.com`, `protonvpn.com` and `hidemyass.com`; free terms labeled "expired"; withdrawn from France and Portugal ([terms](https://umbrella.cisco.com/terms/)) |
 | NextDNS without an id | filters nothing (probed) |
 | Mullvad DNS | shut down 2026-11-02 ([announcement](https://mullvad.net/en/blog/shutting-down-our-public-encrypted-dns-servers-and-sponsoring-quad9-instead)); nothing in connect, sdk or the apps references it |
+| RethinkDNS | its non-filtering resolver, `sky.rethinkdns.com`, forwards to Cloudflare's resolver and then Google's ([env.js](https://github.com/serverless-dns/serverless-dns/blob/b0b7fe52ecc053562d1fc425f9c5c6f984d37e11/src/core/env.js#L139-L154)), and 8236 asked to avoid Google; dropped by the owner (2026-11-09, O14), its blocklist stamps with it. Manual entry under Custom still works |
 | LibreDNS, dnsforge.de, BlahDNS and other community resolvers | single-operator, non-anycast hobby servers (dnsforge caps 100 queries per 10 s, BlahDNS asks for no large traffic); custom url only |
 | Quad9 with ECS (`9.9.9.11`) | it forwards a client subnet, which behind URnetwork is the exit provider's home network |
 
@@ -955,9 +949,8 @@ the SANs but were not reached. The other Cloudflare secondaries (`1.0.0.2`,
 IPv6 literals pass F3 before they ship; a literal that fails falls back to
 the provider's hostname (`cloudflare-dns.com`,
 `security.cloudflare-dns.com`, `family.cloudflare-dns.com`,
-`dns.quad9.net`) with the same addresses as pins. AdGuard, Control D,
-DNS4EU and RethinkDNS were not tested by ip literal and use hostname urls
-with pins.
+`dns.quad9.net`) with the same addresses as pins. AdGuard, Control D and
+DNS4EU were not tested by ip literal and use hostname urls with pins.
 
 B7. Logs carry a DoH url as scheme and host only. Error strings that include
 the url (`net_http_doh.go:2033,2055,2059,2063`) and the warm failure line
@@ -1130,7 +1123,6 @@ notices; patchy and partly dated):
 | Quad9 | mixed (stale data) | DoT SNI blocked (2020), DoH blocked (2022) | not blocked (2021) | leaves France 2026-11-24 ([Quad9](https://quad9.net/news/blog/au-revoir-france/)) |
 | Cloudflare | SNI blocking reported (2025, unconfirmed) | `cloudflare-dns.com` blocked since September 2022 | DoT to 1.1.1.1 reset since August 2026 | complies with some French orders; fined in Italy |
 | DNS4EU | not yet tested (GreatFire) | no data | no data | court-ordered blocks on every variant: French ARCOM and Paris court orders, Russian state-media domains ([DNS4EU](https://www.joindns4.eu/legal-information-and-compliance)) |
-| RethinkDNS | `rethinkdns.com` "Mostly blocked"; OONI 35 of 39 anomalous for `sky` | no data | no data | none |
 
 The status reports such a failure per exit (C5), and the screen suggests
 another location, `default`, or the regional pick for the exit's country.
@@ -1309,10 +1301,10 @@ default in every app (N1).
    DNS4EU); "Block malware" (Cloudflare, DNS4EU, Quad9); "Family" (AdGuard
    DNS Family, Cloudflare Family, Control D Family, DNS4EU Child, DNS4EU
    Child with ad blocking); "Use my account" (AdGuard DNS, Control D,
-   NextDNS); "No filtering" (AdGuard DNS, Cloudflare, Control D, DNS4EU,
-   RethinkDNS); "Custom", today's editor, always there (O1); then "Regional
-   (<country>), unencrypted", shown only while the exit's country has a
-   recommendation and never selected automatically (O6).
+   NextDNS); "No filtering" (AdGuard DNS, Cloudflare, Control D, DNS4EU);
+   "Custom", today's editor, always there (O1); then "Regional (<country>),
+   unencrypted", shown only while the exit's country has a recommendation
+   and never selected automatically (O6).
 2. Each pick shows the provider's name, never a logo (O10), what it blocks
    (its picker copy, A3), the operator's jurisdiction and a privacy-policy
    link, as AdGuard's iOS app and Chrome do.
@@ -1394,11 +1386,9 @@ and pin, through connect's own DoH client so the ALPN offer is the one users
 send, the certificate verified against the url's host (an IP SAN for ip
 literals), both families, a normal name resolving, the canary answered as
 the catalog says, and the HTTPS record of a blocked name carrying no address
-hints (B4). For RethinkDNS, which publishes no addresses, it also resolves
-the host and fails if the set differs from the pins (section 10). Results
-and the date go into each entry's `checked`. It never runs as a unit test
-(tests touch no network); running it in the nightly as a non-blocking report
-is a later step.
+hints (B4). Results and the date go into each entry's `checked`. It never
+runs as a unit test (tests touch no network); running it in the nightly as a
+non-blocking report is a later step.
 
 ### G. Localization
 
@@ -1465,7 +1455,6 @@ keeps, per the research:
 | Quad9 | "does not collect or record user IP addresses"; no ECS on `9.9.9.9` ([privacy](https://quad9.net/privacy/policy/)) | Quad9 Foundation, Zürich, Swiss law |
 | Cloudflare | no querying IPs in non-volatile storage, truncated IPs deleted within 25 hours; KPMG examined the 1.1.1.1 controls, not named for the Families addresses ([privacy](https://developers.cloudflare.com/1.1.1.1/privacy/public-dns-resolver/)) | Cloudflare, Inc., San Francisco |
 | DNS4EU | per-query logs (the query, the response, its type, a timestamp, the resolver, the ASN and more) kept "for up to six (6) months"; client IPs replaced on the resolver by an HMAC whose key is "regenerated daily"; anonymized logs shared with project partners "who train the machine learning models" ([policy](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-DNS-Resolver-policy-2025.pdf)) | Whalebone, s.r.o., Brno, Czech Republic; Czech law and that of each member state where a resolver runs |
-| RethinkDNS | "Rethink DNS resolvers do not log requests"; `sky` runs on Cloudflare's network and forwards to Cloudflare's resolver first and Google's second ([privacy](https://rethinkdns.com/privacy), [env.js](https://github.com/serverless-dns/serverless-dns/blob/b0b7fe52ecc053562d1fc425f9c5c6f984d37e11/src/core/env.js#L139-L154)) | Celzero; legal entity and jurisdiction not stated (section 10) |
 | NextDNS | "If not specifically requested by the user, no data is logged"; the user picks retention and region, and a Privacy Guides thread argues logging is effectively on for new configurations ([privacy](https://nextdns.io/privacy)) | NextDNS Inc., Delaware |
 | Control D custom | analytics off, counts only, or full, at the user's choice ([levels](https://docs.controld.com/docs/analytics-levels)) | as above |
 | AdGuard private | per the user's dashboard | as above |
@@ -1480,7 +1469,6 @@ resolvers, so each general term was read against URnetwork's case:
 | DNS4EU | free "strictly for their use in a personal capacity", "designed for manual configuration", "not eligible for enterprises or connectivity providers" ([terms](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-Resolver-Terms-of-Use.pdf)); the resolvers "are aimed to be used primarily by individuals (consumers)", preferably in the EU; response rate limiting "doesn't affect regular users" ([policy](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-DNS-Resolver-policy-2025.pdf)) | ships without waiting for an answer (owner, 2026-11-09); free to all users, never Pro-only; draft 04 asks whether the use is acceptable, whether to offer it only on EU exits, and about rate limits |
 | Quad9 | none found; aggregate data "may be licensed for a fee" | approved with the rest (owner, 2026-11-09); a courtesy note, and sponsorship as Mullvad does, stay optional |
 | Cloudflare | operators "may wish to provide end users with options to change from the default 1.1.1.1 resolver"; "proxied traffic may be rate limited" ([guidance](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/)) | optional note to resolver@cloudflare.com |
-| RethinkDNS | no terms for the public resolver, only a privacy policy ([privacy](https://rethinkdns.com/privacy)); hosting funded by donations and grants (`max` is "sponsored by FLOSS/fund and FOSS United", [README](https://github.com/serverless-dns/serverless-dns/blob/b0b7fe52ecc053562d1fc425f9c5c6f984d37e11/README.md#L1-L22)) | ships without waiting for an answer (owner, 2026-11-09); draft 05 offers sponsorship or a self-hosted serverless-dns (MPL-2.0) and asks for a recommended ad-blocking stamp |
 | NextDNS | §4(i) allows integration, §4(h) bars circumventing limits | nothing for user-entered ids |
 
 The owner treats all DNS usage in this plan as approved (2026-11-09:
@@ -1492,11 +1480,12 @@ expressly authorized by AdGuard Software Limited with a written consent",
 and Control D's terms bar reselling it without "prior written
 authorization"; DNS4EU's terms describe a personal, manually configured
 service. The permission drafts live in the private factury repo
-(`factury/adblock/`: 01 AdGuard, 02 Control D, 04 DNS4EU and 05 RethinkDNS,
-and 03 DNS.SB for a change to the defaults outside this plan), and sending
-them is the owner's choice. The preset drafts promise that URnetwork removes
-the provider "in the next release" if asked, which a built-in catalog can
-keep (O13).
+(`factury/adblock/`: 01 AdGuard, 02 Control D and 04 DNS4EU for presets,
+and 03 DNS.SB for a change to the defaults outside this plan; 05 RethinkDNS
+no longer applies, since RethinkDNS left the catalog, O14), and sending them
+is the owner's choice. The preset drafts promise that URnetwork removes the
+provider "in the next release" if asked, which a built-in catalog can keep
+(O13).
 
 None requires attribution and none grants logo or trademark use, so the apps
 show names only (O10). No affiliate or referral parameters.
@@ -1749,25 +1738,25 @@ have their deterministic tests in the sdk.
    `https://ur.io/docs/api`. ur.io deploys are manual.
 
 Later, outside this plan: POST for custom urls (B8), presets for hosted
-proxies (O7), device names on personal presets (O4), a RethinkDNS
-ad-blocking stamp once one is recommended (section 10), DoT or DoQ
-upstreams, and a URnetwork-run blocklist in the mux (N10). There is no
-server-delivered catalog (O13).
+proxies (O7), device names on personal presets (O4), DoT or DoQ upstreams,
+and a URnetwork-run blocklist in the mux (N10). There is no server-delivered
+catalog (O13).
 
 ## 8. Owner decisions (2026-11-09)
 
 The owner decided every question on 2026-11-09, and the sections above
-follow these decisions. The approvals (O12) came last that day and replace
-the permission parts of O1, O12 and O14.
+follow these decisions. Later that day the approvals (O12) replaced the
+permission parts of O1, O12 and O14, and then the owner dropped RethinkDNS
+from the catalog (O14).
 
 - O1. The first catalog is the full set (A3): one-tap presets to block ads
   and trackers, to block malware and for families, the "No filtering" picks
   (Cloudflare 1.1.1.1, AdGuard Non-filtering, Control D p0) in the catalog
-  proper, and the three personal-ID providers. DNS4EU and RethinkDNS join it
-  (O14). The owner added that manual entry stays available always, as
-  today: "Custom" keeps today's editor of DoH urls and DNS servers beside
-  Default, the presets and Use my account, and notes that mixing a filtering
-  server with the defaults doesn't filter (E2, F1).
+  proper, and the three personal-ID providers. DNS4EU joins it, and
+  RethinkDNS does not (O14). The owner added that manual entry stays
+  available always, as today: "Custom" keeps today's editor of DoH urls and
+  DNS servers beside Default, the presets and Use my account, and notes that
+  mixing a filtering server with the defaults doesn't filter (E2, F1).
 - O2. Failure policy: split by purpose (C1). Ad-blocking and no-filtering
   presets fall back to URnetwork's default DNS through the tunnel, with "Ad
   blocking paused: <Provider> isn't answering", and return on their own
@@ -1808,19 +1797,21 @@ the permission parts of O1, O12 and O14.
   presets waiting for its written OK. Replaced the same day: the owner
   treats all DNS usage in this plan as approved ("Consider all dns usage as
   approved for this implementation. We will go ahead as if they are
-  approved."), so AdGuard, Control D, DNS4EU and RethinkDNS ship without
-  waiting for answers. The drafts in the private factury repo
-  (`factury/adblock/`) are the owner's to send (H3). DNS.SB as a built-in
-  default is a change to the defaults, outside this plan.
+  approved."), so AdGuard, Control D and DNS4EU ship without waiting for
+  answers. The drafts in the private factury repo (`factury/adblock/`) are
+  the owner's to send (H3). DNS.SB as a built-in default is a change to the
+  defaults, outside this plan.
 - O13. Catalog delivery: built into the sdk only, changed by app releases;
   no server-delivered catalog and no withdraw list (A1, A7). The drafts
   promise removal "in the next release" on request. Rejected: a signed
   server copy that could withdraw ids without a release.
-- O14. DNS4EU and RethinkDNS: first decided as ask both, joining in a later
-  release. With the approvals of O12 both join the first catalog: DNS4EU's
-  five variants, and RethinkDNS's non-filtering resolver (A3). A RethinkDNS
-  ad-blocking stamp waits for one RethinkDNS recommends (section 10); until
-  then a user can paste one under Custom.
+- O14. DNS4EU joins the first catalog with its five variants (A3). Both
+  DNS4EU and RethinkDNS were first to be asked and to join in a later
+  release; the approvals of O12 brought both into the first catalog. Then
+  the owner dropped RethinkDNS ("yes drop it"): its non-filtering resolver
+  forwards to Cloudflare and then Google upstream, and 8236 asked to avoid
+  Google. It is in the "Left out" table (A3), and users can still enter it
+  manually under Custom.
 - O15. Play build: the same catalog, carefully presented. Ad blocking is off
   by default and always user-chosen, and the Play listing and the VpnService
   disclosure describe it as a user-selected DNS provider. If review objects,
@@ -1851,9 +1842,7 @@ the permission parts of O1, O12 and O14.
   switch.
 - Pins can go stale between releases, since addresses are built in only
   (O5, C11): a family, malware or personal preset then fails closed and an
-  ad-blocking or no-filtering one falls back, until an update. RethinkDNS
-  publishes no addresses, so its pins are the likeliest to move (section
-  10).
+  ad-blocking or no-filtering one falls back, until an update.
 - DNS4EU's 14 resolvers are all in the EU, so exits elsewhere see longer
   round trips, and court-ordered blocks apply to every variant, Unfiltered
   included (A3).
@@ -1897,7 +1886,3 @@ before the affected preset ships.
 | DNS4EU's listed addresses serve each variant's DoH host, with a certificate for that host, over HTTP/2 negotiated by connect's ALPN | F3 at each pin; the DoT certificate on `noads.joindns4.eu:853` named `doh.joindns4.eu`, so the DoH certificate's names are F3's to read |
 | DNS4EU's block answers for Protective's malware blocks and for the two child variants, and `doubleclick.net` as the child-noads canary | F3 with a blocked name per variant; only the ad-blocking variant's `0.0.0.0` for `doubleclick.net` was probed |
 | How DNS4EU answers a court-ordered block, on every variant, Unfiltered included | F3 with a domain from its compliance page; the copy and the count (B9) follow what it sends |
-| `sky.rethinkdns.com`'s addresses stay fixed, so its pins hold: RethinkDNS publishes none, the host is Cloudflare Workers anycast, and built-in addresses only (O5) rule out re-resolution | resolve `sky.rethinkdns.com` A and AAAA over DoH from at least three exits on different continents, daily for 14 days before the catalog change merges, and require one unchanging set, which F3 records as the pins; ask Celzero whether they can be pinned. If the set moves, the preset stays out and the url works only under Custom. If pins go stale after a release, every pin fails, and as a no-filtering preset it falls back to URnetwork's default DNS through the tunnel with its status line (O2, C1) until a release carries new addresses (C11); a `sky` url a user entered under Custom gets the same pins (A6) and fails closed instead |
-| A RethinkDNS ad-blocking stamp that RethinkDNS recommends for ads and trackers | Celzero's answer to draft 05, or a recommendation on rethinkdns.com. The research names none: the code's `rec` alias (`1:YAYBACABEDAgAA==`: OISD, 1Hosts mini, the AdGuard SDNS filter and four more lists) is the candidate, but its contents can change on the server, and `sky` answered its blocks with NXDOMAIN, so F3 must show whether an extended error marks them before C6 or the count (B9) can see them. Until then a user can paste a stamp url under Custom |
-| Celzero's legal entity and jurisdiction, which the RethinkDNS pick shows (O10) | rethinkdns.com/privacy names none, and "Celzero Pvt Ltd, India" is an unverified directory claim; ask Celzero or check a company registry; until then the pick says the jurisdiction is not stated |
-| `sky`'s upstreams in production: the code at `b0b7fe5` forwards to Cloudflare first and Google second | ask Celzero; H2 names both until then |
