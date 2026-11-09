@@ -74,17 +74,37 @@ func cooloffTestHeldChannel() *multiClientChannel {
 }
 
 // Discovery offers the two failing providers and, on every call, one provider
-// it has not offered before, so a round is never empty.
+// it has not offered before, so a round is never empty. While set, every call
+// waits for listingHeld to close.
 type cooloffTestGenerator struct {
 	recentExitTestGenerator
+	listingHeld <-chan struct{}
 }
 
 func (self *cooloffTestGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	if self.listingHeld != nil {
+		<-self.listingHeld
+	}
 	destinations, err := self.recentExitTestGenerator.NextDestinations(count, excludeDestinations, rankMode)
 	if err == nil {
 		destinations[RequireMultiHopId(NewId())] = DestinationStats{}
 	}
 	return destinations, err
+}
+
+// A live cool-off window over generator that holds its exit before any round
+// lists. The constructor starts the enumerator, and a round before the install
+// holds no provider, so the starvation escape rightly skips the exclusions: a
+// second such round evaluated again a provider the first had noted. Only the
+// first round can read the window early, and it has nothing noted to skip.
+func cooloffTestHeldWindow(t *testing.T, generator *cooloffTestGenerator) *multiClientWindow {
+	t.Helper()
+	listingHeld := make(chan struct{})
+	generator.listingHeld = listingHeld
+	window := cooloffTestWindow(t, generator, nil)
+	installStickyTestChannel(window, cooloffTestHeldChannel())
+	close(listingHeld)
+	return window
 }
 
 // While the window holds a provider and discovery still has others to offer,
@@ -93,11 +113,10 @@ func (self *cooloffTestGenerator) NextDestinations(count int, excludeDestination
 func TestCooloffExcludesProvidersThatFailedEvaluation(t *testing.T) {
 	first := RequireMultiHopId(NewId())
 	second := RequireMultiHopId(NewId())
-	generator := &cooloffTestGenerator{recentExitTestGenerator{
+	generator := &cooloffTestGenerator{recentExitTestGenerator: recentExitTestGenerator{
 		discoveredDestinations: map[MultiHopId]DestinationStats{first: {}, second: {}},
 	}}
-	window := cooloffTestWindow(t, generator, nil)
-	installStickyTestChannel(window, cooloffTestHeldChannel())
+	cooloffTestHeldWindow(t, generator)
 
 	calls := waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "evaluate both providers", func(calls []recentExitTestCall) bool {
 		return 0 < recentExitTestCount(calls, "evaluate", first) && 0 < recentExitTestCount(calls, "evaluate", second)
@@ -237,11 +256,10 @@ func TestCooloffEscapeEvaluatesTheOnlyProviderAgainWhenDiscoveryRunsDry(t *testi
 // has others to offer.
 func TestCooloffAnEmptyProbeRoundKeepsTheExclusions(t *testing.T) {
 	failed := RequireMultiHopId(NewId())
-	generator := &cooloffTestGenerator{recentExitTestGenerator{
+	generator := &cooloffTestGenerator{recentExitTestGenerator: recentExitTestGenerator{
 		discoveredDestinations: map[MultiHopId]DestinationStats{failed: {}},
 	}}
-	window := cooloffTestWindow(t, generator, nil)
-	installStickyTestChannel(window, cooloffTestHeldChannel())
+	window := cooloffTestHeldWindow(t, generator)
 
 	waitRecentExitTestCalls(t, &generator.recentExitTestGenerator, "evaluate the provider and note it", func(calls []recentExitTestCall) bool {
 		return 0 < recentExitTestCount(calls, "evaluate", failed) && cooloffTestNoted(window, failed)
