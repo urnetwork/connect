@@ -11334,7 +11334,10 @@ paths:
         the device it names; one genesis wins a race for base 1, and a retry of
         base 1 finishes a missing step. A retry of a landed base answers its
         entry. `config_pushes` carries the Signed EvsPush of each config version
-        the base adds, oldest first.
+        the base adds, oldest first and at most 4,096, none when the version is
+        unchanged: api walks the config repo's chain through them from the
+        newest base's head, or for base 1 from the start of the genesis's config
+        repo, and refuses a base whose walk does not end at its head.
       operationId: networkConfigProjectionPublish
       security:
         - BearerAuth: []
@@ -26349,6 +26352,7 @@ components:
         config_pushes:
           description: The marshalled `Signed` `EvsPush` of each config version the base adds, oldest first, base64.
           type: array
+          maxItems: 4096
           items:
             type: string
             format: byte
