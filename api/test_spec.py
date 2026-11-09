@@ -92,10 +92,23 @@ class SpecTest(unittest.TestCase):
             set(schemas["RotateProxyExitResult"]["properties"]["error"]["properties"]),
         )
 
+    # the routes of sidecar DESIGN.md §7, §8 and §11 a service serves, out of the
+    # planned list: api the authorization log's and §8.9's acks, and evs's host
+    # its engine's routes (EVS1-M2-21). Each route's own task adds it here when it
+    # lifts the planned mark
+    served = {
+        ("/network/config/projection", "get"),
+        ("/network/config/projection", "post"),
+        ("/network/config/delta", "post"),
+        ("/acl/ack", "post"),
+        ("/evs/v1/repos/{repo_id}", "put"),
+        ("/evs/v1/repos/{repo_id}/segments/{segment_id}", "put"),
+    }
+
     def test_sidecar_routes_are_documented_and_planned(self):
         # the routes of sidecar DESIGN.md §7, §8 and §11. Each stays planned and
         # out of the public api until a service serves it; the owner of a route
-        # moves it out of this list when it does.
+        # moves it to served when it does.
         expected = {
             "/network/enroll": {"post"},
             "/network/config/projection": {"get", "post"},
@@ -106,6 +119,7 @@ class SpecTest(unittest.TestCase):
             "/acl/accept-invite": {"post"},
             "/evs/v1/repos/{repo_id}": {"put", "get", "delete"},
             "/evs/v1/repos/{repo_id}/restore": {"post"},
+            "/evs/v1/repos/{repo_id}/activate": {"post"},
             "/evs/v1/repos/{repo_id}/reseed": {"post"},
             "/evs/v1/repos/{repo_id}/segments/{segment_id}": {"put"},
             "/evs/v1/repos/{repo_id}/push": {"post"},
@@ -133,7 +147,10 @@ class SpecTest(unittest.TestCase):
                 for method in want:
                     operation = item[method]
                     self.assertTrue(operation["x-internal"])
-                    self.assertEqual("planned", operation["x-status"])
+                    if (path, method) in self.served:
+                        self.assertNotIn("x-status", operation)
+                    else:
+                        self.assertEqual("planned", operation["x-status"])
                 if path.startswith("/evs/"):
                     evs_hosts.add(item["servers"][0]["url"])
                     for method in want:
@@ -143,6 +160,7 @@ class SpecTest(unittest.TestCase):
         # evs is one host of its own, so no path falls back to api's
         self.assertEqual(1, len(evs_hosts))
         self.assertFalse(evs_hosts & {server["url"] for server in self.spec["servers"]})
+        self.assertLessEqual({path for path, _ in self.served}, set(expected))
         enroll = paths["/network/enroll"]["post"]
         self.assertEqual([], enroll["security"])
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
@@ -276,6 +294,36 @@ class SpecTest(unittest.TestCase):
             {"protocol", "min_version", "alpn"} & set(schemas["SocketFindArgs"]["properties"])
         )
 
+    def test_served_evs_routes_answer_in_evs_messages(self):
+        # plan-EVS1-format-bytes #8: evs's bodies are evs.proto messages as
+        # application/x-protobuf, but a segment's raw bytes, and every answer but
+        # a 200 is an EvsRefusalReply (connect-m1-c11-route-scope #2: the task
+        # that serves a route fixes its encoding as it lifts planned)
+        paths = self.spec["paths"]
+        refusal = {"$ref": "#/components/schemas/EvsRefusalReply"}
+        for path, method in sorted(self.served):
+            if not path.startswith("/evs/"):
+                continue
+            operation = paths[path][method]
+            with self.subTest(path=path, method=method):
+                self.assertEqual([{"ServiceTokenAuth": []}], operation["security"])
+                for status, response in operation["responses"].items():
+                    if status == "200":
+                        continue
+                    self.assertEqual({"application/x-protobuf": {"schema": refusal}}, response["content"], status)
+        create = paths["/evs/v1/repos/{repo_id}"]["put"]
+        self.assertNotIn("requestBody", create)
+        self.assertNotIn("content", create["responses"]["200"])
+        upload = paths["/evs/v1/repos/{repo_id}/segments/{segment_id}"]["put"]
+        self.assertEqual({"application/octet-stream"}, set(upload["requestBody"]["content"]))
+        self.assertEqual(
+            {"application/x-protobuf": {"schema": {"$ref": "#/components/schemas/EvsUploadReceipt"}}},
+            upload["responses"]["200"]["content"],
+        )
+        schemas = self.spec["components"]["schemas"]
+        for name in ("EvsRefusalReply", "EvsUploadReceipt"):
+            self.assertEqual({"type": "string", "format": "binary"}, {key: schemas[name][key] for key in ("type", "format")})
+
     def test_auth_key_routes_are_served(self):
         # TEAM-M1-03 serves §7.8's auth key routes: out of the planned list,
         # the network credential's (403 for a client token), and the bundle never
@@ -358,6 +406,14 @@ class GkmRoutesTest(unittest.TestCase):
             for method in self.methods & set(item)
         ]
 
+    def on_api(self, path):
+        """Whether api serves path: it names no servers of its own, or its own name
+        one of the document's."""
+        own = self.spec["paths"][path].get("servers")
+        if not own:
+            return True
+        return bool({server["url"] for server in own} & {server["url"] for server in self.spec["servers"]})
+
     def table(self):
         """gkmservice's routes.go, holding every documented route."""
         lines = [f'\t"{method.upper()} {path}",' for method, path in self.operations(True)]
@@ -403,6 +459,7 @@ class GkmRoutesTest(unittest.TestCase):
         registered = [
             (method.upper(), re.sub(r"{[^}]*}", "([^/]+)", path))
             for method, path in self.operations(False)
+            if self.on_api(path)
         ]
         (server / "api/api.go").write_text(
             "\n".join(
@@ -575,6 +632,42 @@ class GkmRoutesTest(unittest.TestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("registered by api but served by gkm", result.stderr)
         self.assertIn("GET /gkm/welcomes", result.stderr)
+
+    def test_check_routes_leaves_other_hosts_routes_to_them(self):
+        # evs's and sockets' paths name servers of their own: api serves none of
+        # them, and a route evs serves, out of the planned list, is not one api
+        # lacks
+        other = [(method, path) for method, path in self.operations(False) if not self.on_api(path)]
+        self.assertTrue(any(path.startswith("/evs/") for _, path in other))
+        self.assertTrue(any(path.startswith("/socket/") for _, path in other))
+        served = [(method, path) for method, path in other if "x-status" not in self.spec["paths"][path][method]]
+        self.assertTrue(served)
+        result = self.check_routes(self.table())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f"other hosts: {len(other)} documented operations", result.stdout)
+
+    def test_check_routes_refuses_an_other_hosts_route_api_registers(self):
+        result = self.check_routes(self.table(), api_routes=[("PUT", "/evs/v1/repos/([^/]+)")])
+        self.assertEqual(1, result.returncode)
+        self.assertIn("registered by api but served on another host", result.stderr)
+        self.assertIn("PUT /evs/v1/repos/*", result.stderr)
+        self.assertNotIn("registered but NOT in bringyour.yml", result.stderr)
+
+    def test_check_routes_holds_a_path_whose_servers_name_api(self):
+        # a path whose own servers name one of api's hosts is still api's
+        text = Path(__file__).with_name("bringyour.yml").read_text()
+        at = text.index("\n  /evs/v1/repos/{repo_id}:\n")
+        extra = (
+            "\n  /network/v4-only:\n"
+            "    servers:\n"
+            f"      - url: {self.spec['servers'][1]['url']}\n"
+            "    get:\n"
+            "      summary: Read\n"
+        )
+        result = self.check_routes(self.table(), spec=text[:at] + extra + text[at:])
+        self.assertEqual(1, result.returncode)
+        self.assertIn("in bringyour.yml but NOT registered", result.stderr)
+        self.assertIn("GET /network/v4-only", result.stderr)
 
     def test_check_routes_still_refuses_api_drift(self):
         # the carve-out must not take the rest of the spec out of the check

@@ -11605,14 +11605,19 @@ paths:
       - url: https://evs.bringyour.com
     put:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Place and create a repo
       description: |
-        Places the repo on the metadata cluster that takes new repos, and writes it
-        with its kind and owner from the projection. The sidecar files its
-        `RepoCreate` first. A retried create stays on the cluster it placed. URLs
-        carry only ids: display names are sealed.
+        Places the repo on the metadata cluster that takes new repos, then writes
+        its record there, `keying` until its group's first generation, with its
+        kind and owner from the projection. Needs `admin`: the sidecar files its
+        `RepoCreate` first, which makes it the repo's admin. A retried create by
+        the same sidecar continues on the cluster it placed and answers as the
+        first did. No body. URLs carry only ids: display names are sealed.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 429 or 503 carries `Retry-After`, and a 503 is retried with the
+        same request.
       operationId: evsRepoCreate
       security:
         - ServiceTokenAuth: []
@@ -11620,9 +11625,50 @@ paths:
         - $ref: "#/components/parameters/EvsRepoId"
       responses:
         "200":
-          description: The repo exists.
+          description: The repo is placed and created, with no body.
+        "400":
+          description: "`INVALID`: the id is not 32 lowercase hex digits."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token, a binding or an `admin` scope the newest
+            verified state does not hold, or a projection's repo of another network.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
-          description: Another creator placed this id.
+          description: |
+            `STATEMENT_MISSING`: the projection holds no `RepoCreate` for this id. Or
+            another sidecar placed this id first, which carries no code yet.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: "`RESOURCE_EXHAUSTED`: the write budget's queue is past its delay, with `retry_after_ms`. Nothing is refused."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network, its
+            authorization state is not loaded, a store did not answer, or a write's
+            outcome is unknown (`outcome`), which the same request settles.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
     get:
       x-internal: true
       x-status: planned
@@ -11685,6 +11731,32 @@ paths:
             `SHREDDING`, the repo is past deleted, or `STATEMENT_MISSING`, the
             projection holds no `RepoRestore`.
 
+  /evs/v1/repos/{repo_id}/activate:
+    servers:
+      - url: https://evs.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Activate a repo whose group has formed
+      description: |
+        Needs `admin`. No body. Takes a `keying` repo to `active` once its gkm group
+        has formed: evs reads the repo's newest `GroupForm` and the group's first
+        generation, then swaps the repo's record. An `active` repo answers 200, so a
+        retry is harmless; a repo past `active` answers that state's refusal.
+      operationId: evsRepoActivate
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EvsRepoId"
+      responses:
+        "200":
+          description: The repo is active.
+        "409":
+          description: |
+            `GROUP_NOT_READY`: the group has no `GroupForm` or no first generation yet.
+            Or the refusal of the state the repo is in past `active`.
+
   /evs/v1/repos/{repo_id}/reseed:
     servers:
       - url: https://evs.bringyour.com
@@ -11715,13 +11787,18 @@ paths:
       - url: https://evs.bringyour.com
     put:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Upload a segment
       description: |
-        Streams one encrypted segment for a push. Needs `rw` or `deposit`, and
-        `admin` for a closure upload. The receipt in the answer goes back in the
-        push.
+        Streams one encrypted segment for a push: its raw bytes, at most 8 MiB, sent
+        with their length, beginning with the 32-byte public header that names this
+        repo. The id in the path is the SHA-256 of every byte, and bytes that are not
+        that id are stored nowhere. Needs `rw` or `deposit`, and `admin` for a closure
+        upload. The receipt in the answer goes back in the push, which adopts the
+        segment only within 24 hours of its upload.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 429 or 503 carries `Retry-After`.
       operationId: evsSegmentUpload
       security:
         - ServiceTokenAuth: []
@@ -11730,12 +11807,13 @@ paths:
         - name: segment_id
           in: path
           required: true
+          description: 64 lowercase hex digits, the SHA-256 of the segment's bytes.
           schema:
             type: string
         - name: push
           in: query
           required: true
-          description: The push this segment belongs to.
+          description: The push this segment belongs to, 32 lowercase hex digits.
           schema:
             type: string
         - name: closure
@@ -11753,19 +11831,73 @@ paths:
               format: binary
       responses:
         "200":
-          description: The `EvsUploadReceipt`.
+          description: The segment is stored, or was within the last 23 hours, and its receipt.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsUploadReceipt"
+        "400":
+          description: |
+            `INVALID`: an id, push id, length or public header that does not parse, or
+            bytes that are not the id.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "402":
-          description: At the storage limit or spent, with terms when a purchase lifts the limit.
+          description: "`QUOTA_PAYMENT`: at the storage limit or spent, with terms when a purchase lifts the limit."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: "`SCOPE`, or `QUOTA_LIMIT` at a limit no purchase lifts."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: no repo of this id was ever placed."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
           description: |
-            `SEGMENT_STALE`, or `VERSIONING` for a kind-5 header naming another
-            push.
+            `SEGMENT_STALE`: stored over 23 hours ago, so the client re-seals;
+            `STATEMENT_MISSING`: the projection holds no `RepoCreate`; or
+            `FORMAT_UNSUPPORTED` with `needs_format` for a format 2 header. Format 2
+            adds `VERSIONING` for a kind-5 header naming another push.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "429":
-          description: Past a closure upload's rate or daily allowance, with `retry_after_ms`.
+          description: "`RESOURCE_EXHAUSTED`: past a closure upload's rate or daily allowance, with `retry_after_ms`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "503":
-          description: Past the segment cluster's share for the heaviest network, with `Retry-After`.
+          description: |
+            Past the segment cluster's share for the heaviest network, or a store or
+            state that did not answer, with `Retry-After`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "507":
           description: "`CLUSTER_FULL`: the repo's metadata cluster stands at its cohort limit."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/push:
     servers:
@@ -26483,6 +26615,23 @@ components:
           description: The invited side only, with its aliases.
           type: string
           enum: [active, refused_too_large, refused_no_space]
+
+    EvsRefusalReply:
+      description: |
+        sidecar protocol/evs.proto's `EvsRefusalReply`, the body of every evs answer
+        but a 200: its code, which fixes the status, the push id where there is one,
+        and as the code needs `recorded`, `retry_after_ms`, `paths`, `outcome`,
+        `needs_format`, `quota` and `deposit_head`.
+      type: string
+      format: binary
+
+    EvsUploadReceipt:
+      description: |
+        sidecar protocol/evs.proto's `EvsUploadReceipt`: the segment's repo, id, size,
+        upload time and uploader under evs's MAC, which the push adopting the segment
+        carries back.
+      type: string
+      format: binary
 
     EvsPushLeaseArgs:
       type: object

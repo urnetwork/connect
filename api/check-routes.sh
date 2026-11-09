@@ -20,7 +20,7 @@
 # that half of the check is skipped with a note rather than failed, so the
 # script still works in a checkout without the sn repo beside the server.
 #
-# The /gkm/* routes are the other exception, the other way round: bringyour.yml
+# The /gkm/* routes are another exception, the other way round: bringyour.yml
 # documents them, but server/cli/gkm serves them on its own host from sidecar's
 # gkmservice package, so api must not register them: a gkm path in its table is
 # drift. They are checked against that package's route table instead, looked up
@@ -32,8 +32,16 @@
 # checkout without the sidecar repo beside the server, that half of the check is
 # skipped with a note rather than failed.
 #
-# Deliberately dependency-free: zsh, grep, sed, sort, comm. No yaml parser and
-# no go toolchain, so it runs in a bare checkout and in CI.
+# More generally, a path whose own `servers:` entry names none of the document's
+# top-level servers is served on another host: /gkm/'s, /evs/'s at evs, and
+# /socket/'s at sockets. Its operations are not api's, planned or not, so they
+# are left out of the comparison with api's table, and api registering one is
+# drift. Each such host holds them to its own table: gkm's here, below, and evs's
+# in server/evshost's route table test, which reads this file against the
+# engine's routes.
+#
+# Deliberately dependency-free: zsh, awk, grep, sed, sort, comm. No yaml parser
+# and no go toolchain, so it runs in a bare checkout and in CI.
 #
 # Normalization:
 #   route  ([^/]+)   -> *      spec  {name} -> *
@@ -121,6 +129,39 @@ planned_paths() {
     ' "$1" | sed -e 's/{[^}]*}/*/g' | sort -u
 }
 
+# other_host_paths <file> -- the paths whose own `servers:` entry names none of
+# the document's top-level servers: each served on a host of its own, never api.
+# A path's entry is its four-space `servers:` key, with each url a six-space list
+# item; the document's are the top-level key's two-space items.
+other_host_paths() {
+    awk '
+        function flush() {
+            if (path != "" && own && !api) print path
+            path = ""; own = 0; api = 0; inservers = 0
+        }
+        /^servers:[[:space:]]*$/      { intop = 1; next }
+        intop && /^  - url:/          { top[$3] = 1; next }
+        intop && /^[^ ]/              { intop = 0 }
+        /^paths:[[:space:]]*$/        { inpaths = 1; next }
+        /^[A-Za-z]/                   { if (inpaths) flush(); inpaths = 0 }
+        !inpaths                      { next }
+        /^  \/[^ ]*:[[:space:]]*$/    { flush(); path = $1; sub(/:$/, "", path); next }
+        /^    servers:[[:space:]]*$/  { inservers = 1; next }
+        inservers && /^      - url:/  { own = 1; if ($3 in top) api = 1; next }
+        /^    [^ ]/                   { inservers = 0 }
+        END                           { flush() }
+    ' "$1" | sed -e 's/{[^}]*}/*/g' | sort -u
+}
+
+# on_paths <paths file> <operations file> -- the "METHOD /path" operations whose
+# path the first file lists; off_paths those whose path it does not.
+on_paths() {
+    awk 'NR == FNR { listed[$1] = 1; next } ($2 in listed)' "$1" "$2"
+}
+off_paths() {
+    awk 'NR == FNR { listed[$1] = 1; next } !($2 in listed)' "$1" "$2"
+}
+
 # --- the route table -------------------------------------------------------
 # Every NewRoute( and NewStreamingRoute( occurrence, not every line: some
 # source lines hold two.
@@ -134,14 +175,21 @@ grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
     | sed -e 's/\\\\\./\./g' -e 's/(\[^\/\]+)/*/g' \
     | sort -u > $work/routes.all
 
-grep -v -e ' /competition/' -e ' /gkm/' $work/routes.all > $work/routes
-grep ' /competition/' $work/routes.all > $work/routes.competition
-
 # --- the specs -------------------------------------------------------------
 spec_paths $spec > $work/spec.all
-grep -v -e ' /competition/' -e ' /gkm/' $work/spec.all > $work/spec
+other_host_paths $spec > $work/paths.other
+# a first file awk reads must not be empty, so it holds a line no path matches
+print -- '-' >> $work/paths.other
+grep -v -e ' /competition/' -e ' /gkm/' $work/spec.all | off_paths $work/paths.other - > $work/spec
 grep ' /competition/' $work/spec.all > $work/spec.competition
+grep -v ' /gkm/' $work/spec.all | on_paths $work/paths.other - > $work/spec.other
 planned_paths $spec > $work/planned
+
+# api's own routes, apart from the competition's, gkm's and those of a path
+# another host serves, which are drift there
+grep -v -e ' /competition/' -e ' /gkm/' $work/routes.all | off_paths $work/paths.other - > $work/routes
+grep -v -e ' /competition/' -e ' /gkm/' $work/routes.all | on_paths $work/paths.other - > $work/routes.other
+grep ' /competition/' $work/routes.all > $work/routes.competition
 
 drifted=0
 
@@ -157,6 +205,11 @@ missing_from_server=$(comm -13 $work/routes $work/spec | comm -23 - $work/planne
 
 [[ -n $missing_from_spec ]] && report "registered but NOT in bringyour.yml" "$missing_from_spec"
 [[ -n $missing_from_server ]] && report "in bringyour.yml but NOT registered" "$missing_from_server"
+
+# a path another host serves is drift in api's table, documented or not; gkm's
+# say so below, by their own name
+registered_other=$(cat $work/routes.other)
+[[ -n $registered_other ]] && report "registered by api but served on another host" "$registered_other"
 
 # a competition path in bringyour.yml is drift on its own: they belong to
 # sn/api/competition.yml and must not be dual-listed
@@ -191,6 +244,9 @@ if [[ -f $gkm_routes ]]; then
 else
     print "gkm: $gkm_spec_count documented operations NOT CHECKED (no $gkm_routes)"
 fi
+
+other_count=$(grep -c . $work/spec.other)
+print "other hosts: $other_count documented operations on paths with servers of their own, held to their own tables"
 
 # --- sn/api/competition.yml ------------------------------------------------
 route_count=$(grep -c . $work/routes)
