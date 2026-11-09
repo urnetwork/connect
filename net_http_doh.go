@@ -3142,6 +3142,10 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 type serverStats struct {
 	lock  sync.Mutex
 	byUrl map[string]*serverStat
+	// Stands in for the uniform draw in [0, 1) of each server's key in the
+	// weighted order (orderAt), by url, so a test can force an order. nil
+	// draws from math/rand. Guarded by lock.
+	draw func(dohUrl string) float64
 }
 
 func newServerStats() *serverStats {
@@ -3301,7 +3305,12 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 	self.lock.Lock()
 	for i, url := range ordered {
 		weight := dohServerWeightFloor + self.scoreLocked(url, now)
-		u := mathrand.Float64()
+		var u float64
+		if self.draw != nil {
+			u = self.draw(url)
+		} else {
+			u = mathrand.Float64()
+		}
 		if u <= 0 {
 			u = math.SmallestNonzeroFloat64
 		}
