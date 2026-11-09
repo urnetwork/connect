@@ -11079,6 +11079,126 @@ paths:
         "404":
           description: No binding names that client in the caller's network.
 
+  /sidecar/sync/poll:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: Long-poll the caller's push hints
+      description: |
+        The HTTP form of the server push a sidecar's connect client otherwise
+        gets from its resident (sidecar's protocol/push.proto). A poll answers
+        200 at once when the caller's hint stream holds hints past `cursor`,
+        and otherwise holds up to 25 s, answering on the next hint or, after
+        an empty hold, with no hints and the cursor it came with. It never
+        answers 204.
+
+        The body is a binary `PollResponse`. `cursor` is opaque: send back
+        the last one received, base64url without padding. An empty cursor,
+        or one the stream has moved past (trimmed, or the hourly expiry of
+        the caller's hint state), gets a `reset` first: one part of at most
+        48 topic versions, complete only when that is all of them; an
+        incomplete one sends the caller to `/sidecar/sync/versions`. Hints
+        carry topics, versions and ids, never content.
+
+        A poll also refreshes the caller's liveness for at most once every
+        300 s. 503 with Retry-After while push is disabled, or when the
+        server holds as many polls as it allows.
+      operationId: sidecarSyncPoll
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A binary `PollResponse`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: The cursor is not base64url.
+        "503":
+          description: Push is disabled, or the server holds too many polls; see Retry-After.
+
+  /sidecar/sync/versions:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: Page through the caller's topic versions
+      description: |
+        A binary `PollResponse` with `reset` set and no hints: the caller's
+        topic versions in name order, at most 48 a page, one `epoch` for
+        every page of a run. Every page but the last is `complete = false`
+        and carries a `cursor`, base64url without padding, for the next; the
+        caller applies the run's versions only once a page is complete.
+        `core` is always present, so a caller's hourly resync always fetches
+        it. A topic whose state has expired is omitted, and the caller keeps
+        its own version of it.
+      operationId: sidecarSyncVersions
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A binary `PollResponse`.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: The cursor is not one this route gave.
+
+  /sidecar/sync/{topic}:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's state for a topic
+      description: |
+        Serves `core` alone; every other topic is 404 and is read from its
+        owner's routes. `version` is a decimal string, since versions pass
+        what a JSON number holds exactly. `min_secure_version` is the floor
+        the server asserts, unsigned, which a client applies as no more than
+        its own version and never stores. `gates` are the services enabled
+        for the caller's network. `revoked` says whether the server holds
+        the caller's sidecar revoked, which the client checks against its own
+        signed configuration and never acts on alone.
+      operationId: sidecarSyncTopic
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: topic
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarSyncCoreResult"
+        "400":
+          description: The since parameter is not a decimal version.
+        "404":
+          description: The topic is not served here.
+
   /network/auth-keys:
     get:
       tags: [Network]
@@ -25896,6 +26016,25 @@ components:
           type: integer
           format: int64
 
+    SidecarSyncCoreResult:
+      type: object
+      required:
+        - version
+        - min_secure_version
+        - gates
+        - revoked
+      properties:
+        version:
+          type: string
+        min_secure_version:
+          type: integer
+          format: int32
+        gates:
+          type: array
+          items:
+            type: string
+        revoked:
+          type: boolean
     SidecarIdentityResult:
       type: object
       required:
