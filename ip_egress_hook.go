@@ -22,11 +22,12 @@ import (
 // Generic, additive and off by default. A NAT without a hook behaves exactly as
 // before, and its one cost is a nil check when a flow is created.
 //
-// The source's identity reaches the flow on every lane. Each packet carries an
-// `egressSource`, built from the receive callback's `Peer`, down the ordinary,
-// reliable and fallback lanes into the parsed packet that opens a flow, as the
-// packet's TTL rides today. A lane that dropped it would read as a source with
-// no seals, no contract and no session, which a hook denies.
+// The source's identity reaches the flow on every lane. Each packet carries the
+// receive callback's `Peer`, by a pointer to an unshared copy, down the
+// ordinary, reliable and fallback lanes into the parsed packet that opens a
+// flow, as the packet's TTL rides today; the flow keeps an `egressSource` from
+// it. A lane that dropped it would read as a source with no seals, no contract
+// and no session, which a hook denies.
 //
 // A flow registers its decision before it dials, opens its socket or sends its
 // first echo, all under its own context, so `SetEgressHook` can close every
@@ -256,7 +257,11 @@ type egressSource struct {
 	verifiedClientKey *[ed25519.PublicKeySize]byte
 }
 
-func newEgressSource(peer Peer) egressSource {
+// The seals of the peer a packet came from; the zero source for none.
+func newEgressSource(peer *Peer) egressSource {
+	if peer == nil {
+		return egressSource{}
+	}
 	return egressSource{
 		contractClass:     peer.ContractClass,
 		sourceSubject:     peer.SourceSubject,

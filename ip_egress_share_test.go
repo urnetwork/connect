@@ -155,12 +155,12 @@ func TestEgressShareFlowRepliesFromItsAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstream.Close()
+	defer upstream.Close()
 	denied := *alias
 	denied.SourcePort = 42103
 	sendShare(egressTestTcpPacket(&denied, tcpFlagSyn, 100, 0, nil))
-	if !egressTestParse(t, rig.receive()).Rst {
-		t.Fatal("the denied share flow was not reset")
+	if answer := egressTestParse(t, rig.receive()); !answer.Rst || answer.DestinationPort != 42103 {
+		t.Fatalf("the denied share flow got %+v, want a reset", answer)
 	}
 	rig.close()
 	if admittedPath == nil || !admittedPath.egressAdmitted {

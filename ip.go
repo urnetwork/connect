@@ -1161,14 +1161,14 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 		packets, timeout, completed...)
 }
 
-// Queues provider ingress with what the provider knows of its sender, so each
-// flow the packets open reaches the egress hook with its peer's seals. A nil
-// source is a packet with no peer.
+// Queues provider ingress with the peer it came from, so each flow the packets
+// open reaches the egress hook with that peer's seals. A nil peer is a packet
+// with none; a non-nil one must not be written after this call.
 func (self *LocalUserNat) sendEgressTransferPacketsWithTimeout(
 	source TransferPath,
 	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
-	egressSource *egressSource,
+	egressPeer *Peer,
 	packets [][]byte,
 	timeout time.Duration,
 	completed ...func(),
@@ -1180,7 +1180,7 @@ func (self *LocalUserNat) sendEgressTransferPacketsWithTimeout(
 		}
 		return false
 	}
-	return self.sendAdmittedTransferPacketsWithTimeout(source, transferKey, provideMode, egressSource,
+	return self.sendAdmittedTransferPacketsWithTimeout(source, transferKey, provideMode, egressPeer,
 		packets, timeout, memory, completed...)
 }
 
@@ -1204,7 +1204,7 @@ func (self *LocalUserNat) sendAdmittedTransferPacketsWithTimeout(
 	source TransferPath,
 	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
-	egressSource *egressSource,
+	egressPeer *Peer,
 	packets [][]byte,
 	timeout time.Duration,
 	memory natMemoryReservation,
@@ -1229,11 +1229,9 @@ func (self *LocalUserNat) sendAdmittedTransferPacketsWithTimeout(
 		source:      source.LocalMask(),
 		transferKey: transferKey,
 		provideMode: provideMode,
+		egressPeer:  egressPeer,
 		packets:     packets,
 		disposition: disposition,
-	}
-	if egressSource != nil {
-		sendPacket.egressSource = *egressSource
 	}
 	// fast path without arming a timer
 	select {
@@ -1530,12 +1528,12 @@ func (self *LocalUserNat) Run() {
 				continue
 			}
 			shardSendPacket := &SendPacket{
-				source:       sendPacket.source,
-				transferKey:  sendPacket.transferKey,
-				provideMode:  sendPacket.provideMode,
-				egressSource: sendPacket.egressSource,
-				packets:      packets,
-				disposition:  sendPacket.disposition,
+				source:      sendPacket.source,
+				transferKey: sendPacket.transferKey,
+				provideMode: sendPacket.provideMode,
+				egressPeer:  sendPacket.egressPeer,
+				packets:     packets,
+				disposition: sendPacket.disposition,
 			}
 			if !forward(packetShard, shardSendPacket) {
 				for _, returnPackets := range shardPackets[packetShard+1:] {
@@ -1768,7 +1766,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	var tcpPacket parsedTcp
 	var icmpPacket parsedIcmp
 
-	handleIpPacket := func(source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode, egressSource *egressSource, ipPacket []byte) {
+	handleIpPacket := func(source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode, egressPeer *Peer, ipPacket []byte) {
 		if len(ipPacket) == 0 {
 			MessagePoolReturn(ipPacket)
 			return
@@ -1794,7 +1792,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				udpPacket.ttl = ipPacket[8]
-				udpPacket.egressSource = *egressSource
+				udpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := udp4Buffer.sendTransferKey(
 						source,
@@ -1826,7 +1824,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				tcpPacket.ttl = ipPacket[8]
-				tcpPacket.egressSource = *egressSource
+				tcpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := tcp4Buffer.sendTransferKey(
 						source,
@@ -1873,7 +1871,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				icmpPacket.ttl = ipPacket[8]
-				icmpPacket.egressSource = *egressSource
+				icmpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := icmp4Buffer.sendTransferKey(
 						source,
@@ -1921,7 +1919,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				udpPacket.ttl = ipPacket[7]
-				udpPacket.egressSource = *egressSource
+				udpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := udp6Buffer.sendTransferKey(
 						source,
@@ -1953,7 +1951,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				tcpPacket.ttl = ipPacket[7]
-				tcpPacket.egressSource = *egressSource
+				tcpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := tcp6Buffer.sendTransferKey(
 						source,
@@ -2005,7 +2003,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 				}
 				// hop limit
 				icmpPacket.ttl = ipPacket[7]
-				icmpPacket.egressSource = *egressSource
+				icmpPacket.egressPeer = egressPeer
 				c := func() bool {
 					success, err := icmp6Buffer.sendTransferKey(
 						source,
@@ -2063,7 +2061,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 			return
 		}
 		for _, ipPacket := range sendPacket.packets {
-			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, &sendPacket.egressSource, ipPacket)
+			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, sendPacket.egressPeer, ipPacket)
 			if self.afterSendPacketForTest != nil {
 				self.afterSendPacketForTest()
 			}
@@ -2111,11 +2109,11 @@ type SendPacket struct {
 	source      TransferPath
 	transferKey TransferKey
 	provideMode protocol.ProvideMode
-	// what the provider knows of the packets' sender, for the egress hook
-	egressSource egressSource
-	packets      [][]byte
-	disposition  *localUserNatSendDisposition
-	reliable     *providerReliablePacket
+	// the peer the packets came from, for the egress hook; nil for none
+	egressPeer  *Peer
+	packets     [][]byte
+	disposition *localUserNatSendDisposition
+	reliable    *providerReliablePacket
 }
 
 // One provider admission can fan into several LocalUserNat send shards. The
@@ -2319,8 +2317,8 @@ type parsedUdp struct {
 	sourcePort      uint16
 	destinationPort uint16
 	payload         []byte
-	// the sender as the provider knew it, for the flow this packet opens
-	egressSource egressSource
+	// the peer this packet came from, read when it opens a flow; nil for none
+	egressPeer *Peer
 }
 
 type parsedTcp struct {
@@ -2346,8 +2344,8 @@ type parsedTcp struct {
 	timestampValue    uint32
 	timestampEcho     uint32
 	payload           []byte
-	// the sender as the provider knew it, for the flow this SYN opens
-	egressSource egressSource
+	// the peer this SYN came from, read when it opens a flow; nil for none
+	egressPeer *Peer
 }
 
 func (self *parsedTcp) flagsString() string {
@@ -3149,7 +3147,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		sequence.socketReadPoller = self.socketReadPoller
 		sequence.kernelReceiveDropCount = self.kernelReceiveDropCount
 		sequence.egressFlow.nat = self.egress
-		sequence.egressFlow.source = udp.egressSource
+		sequence.egressFlow.source = newEgressSource(udp.egressPeer)
 		// A hooked NAT's flows take the per-flow loop: the shared lifecycle opens
 		// its socket here, under this mutex, where the hook must not run
 		// (plan-BRIDGE-small-readings #8). A shared flow opened before a hook was
@@ -4990,7 +4988,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		sequence.egressRealism = self.egressRealism
 		sequence.flowCloseCallback = self.flowCloseCallback
 		sequence.egressFlow.nat = self.egress
-		sequence.egressFlow.source = tcp.egressSource
+		sequence.egressFlow.source = newEgressSource(tcp.egressPeer)
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
@@ -10616,8 +10614,15 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	transferKey := peer.TransferKey
 	// Every flow these frames open reaches the NAT's egress hook with this
-	// peer's seals, contract and session key, on whichever lane it takes.
-	egressSource := newEgressSource(peer)
+	// peer's seals, contract and session key, on whichever lane it takes. A
+	// NAT without a hook carries none, at no cost; one installed after this
+	// callback meets these packets' flows unsealed, and denies them.
+	var egressPeer *Peer
+	if self.localUserNat.egress.hooked() {
+		owned := peer
+		owned.delivery = nil
+		egressPeer = &owned
+	}
 
 	provideMode := peer.ProvideMode
 	// C18: a hook that takes FriendsAndFamily flows to private destinations
@@ -10906,7 +10911,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 				source,
 				transferKey,
 				provideMode,
-				&egressSource,
+				egressPeer,
 				packetGroup.packets,
 				0,
 				func() {
@@ -10931,7 +10936,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 							continue
 						}
 						if self.localUserNat.sendEgressTransferPacketsWithTimeout(
-							source, transferKey, provideMode, &egressSource, [][]byte{packet}, 0,
+							source, transferKey, provideMode, egressPeer, [][]byte{packet}, 0,
 							func() { self.releaseSourceLifecycle(source.SourceId, sourceLifecycle) },
 						) {
 							self.countRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))

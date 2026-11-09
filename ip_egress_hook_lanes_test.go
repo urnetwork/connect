@@ -303,7 +303,7 @@ func TestEgressHookFallbackLanesCarrySeals(t *testing.T) {
 	admitted := make(chan egressSource, 8)
 	rig := newEgressLaneProvider(t, hook, budget, nil)
 	rig.nat.beforeSendPacketForTest = func(sendPacket *SendPacket) {
-		admitted <- sendPacket.egressSource
+		admitted <- newEgressSource(sendPacket.egressPeer)
 	}
 	// leave the NAT its packet admission but not the provider's ordinary
 	// workspace, so every frame takes a fallback
@@ -489,10 +489,11 @@ func TestEgressHookNilHookResolvesWithoutAllocation(t *testing.T) {
 	}); allocations != 0 || outcome != egressOutcomeLegacy {
 		t.Fatalf("a hookless resolve allocated %g and gave %d", allocations, outcome)
 	}
+	// a NAT without a hook is handed no peer, and a flow reads the nil one
 	if allocations := testing.AllocsPerRun(100, func() {
-		_ = newEgressSource(Peer{ProvideMode: protocol.ProvideMode_Network})
+		_ = newEgressSource(nil)
 	}); allocations != 0 {
-		t.Fatalf("carrying a source allocated %g", allocations)
+		t.Fatalf("reading a flow's source allocated %g", allocations)
 	}
 }
 

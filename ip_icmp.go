@@ -61,8 +61,8 @@ type parsedIcmp struct {
 	// ip header ttl (v4) or hop limit (v6), forwarded to the egress backend
 	ttl     uint8
 	payload []byte
-	// the sender as the provider knew it, for the flow this echo opens
-	egressSource egressSource
+	// the peer this echo came from, read when it opens a flow; nil for none
+	egressPeer *Peer
 }
 
 // parses an icmp transport into `icmp`. echo request and reply with code 0
@@ -426,7 +426,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.egressFlow.nat = self.egress
-		sequence.egressFlow.source = icmp.egressSource
+		sequence.egressFlow.source = newEgressSource(icmp.egressPeer)
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence

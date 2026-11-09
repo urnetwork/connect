@@ -10,6 +10,7 @@ package connect
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -397,8 +398,20 @@ func TestEgressFenceSparesOtherTagsAndNewerDecisions(t *testing.T) {
 	if closed := rig.nat.CloseFlows(1); closed != 1 {
 		t.Fatalf("CloseFlows ended %d flows, want 1", closed)
 	}
-	if reset := egressTestParse(t, rig.receive()); !reset.Rst || reset.DestinationPort != 42010 {
-		t.Fatalf("the revocation answered %+v", reset)
+	// the spared flows may acknowledge at any time; the revoked one's reset
+	// is the answer this waits for
+	for {
+		answer := egressTestParse(t, rig.receive())
+		if answer.DestinationPort != 42010 {
+			if answer.Rst {
+				t.Fatalf("a spared flow was reset: %+v", answer)
+			}
+			continue
+		}
+		if !answer.Rst {
+			t.Fatalf("the revocation answered %+v", answer)
+		}
+		break
 	}
 	if received := readEgressFenceUpstream(t, revoked.upstream); len(received) != 0 {
 		t.Fatalf("the revoked flow's target received %q", received)
@@ -434,7 +447,9 @@ func TestEgressFenceClosesAnEstablishedFlowOnce(t *testing.T) {
 		rig.send(egressTestTcpPacket(path, tcpFlagAck|tcpFlagPsh, sequence, ack, []byte("x")))
 		sequence += 1
 	}
-	if _, err := upstream.Read(make([]byte, 16)); err != nil {
+	// every segment the source sent has arrived, so none is left to meet the
+	// closed flow and draw an orphan reset of its own
+	if _, err := io.ReadFull(upstream, make([]byte, 16)); err != nil {
 		t.Fatal(err)
 	}
 	if locks := stateLocks.Load(); locks != locksEstablished {
