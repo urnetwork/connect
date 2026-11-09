@@ -2,7 +2,6 @@ package extender
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"strings"
 	"sync"
@@ -220,6 +219,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		self.server.reportError("dns query", err)
 		return
 	}
+	edns := connect.DnsQueryHasOpt(&parser)
 
 	if question.Type == dnsmessage.TypeALL {
 		// ANY is a reflection amplifier and answers nothing useful (A6)
@@ -227,8 +227,8 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		return
 	}
 
-	// the name keeps the case it was asked in: a 0x20 client checks that the
-	// answer echoes its own query exactly
+	// the resolver asks with the name in lower case; the answer gets the
+	// query's own case back below
 	name := strings.TrimSuffix(question.Name.String(), ".")
 	if name == "" {
 		self.server.reportError("dns query", extenderFixedError("the query has no name"))
@@ -251,19 +251,26 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		self.server.reportError("dns query", extenderFixedError("the query did not resolve"))
 		return
 	}
+	// the upstream answer carries the id and the lower case name of the query
+	// the cache made, and an OPT record, since every DoH query asks with one.
+	// A resolver echoes the query's id and exact name (a 0x20 client checks
+	// the case) and answers a query without OPT without one (RFC 6891 §7);
+	// anything else would mark the forwarder as not a resolver (A6). An answer
+	// to another question is not forwarded.
+	answerBytes, ok := connect.DnsResponseForQuery(responseBytes, header.ID, question, edns)
+	if !ok {
+		self.server.reportError("dns query", extenderFixedError("the answer is not for the query"))
+		return
+	}
 
 	maxByteCount := self.server.settings.DnsMaxResponseByteCount
-	if 0 < maxByteCount && maxByteCount < len(responseBytes) {
+	if 0 < maxByteCount && maxByteCount < len(answerBytes) {
 		// over what the datagram may carry: answer the header with TC set and
 		// no sections, which is what tells the client to ask again over tcp
 		self.answerStatus(query, header, question, dnsmessage.RCodeSuccess, true)
 		return
 	}
 
-	// the upstream answer carries the id of the query the cache made
-	answerBytes := make([]byte, len(responseBytes))
-	copy(answerBytes, responseBytes)
-	binary.BigEndian.PutUint16(answerBytes[0:2], header.ID)
 	self.writeAnswer(query, answerBytes)
 }
 

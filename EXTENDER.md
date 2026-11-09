@@ -206,8 +206,12 @@ DnsOtherHandler(query []byte, addr net.Addr)` hook, which the extender sets
 to a forwarder: parse the query, refuse `ANY`, resolve the question through
 the extender's own DoH cache (`DohCache.Forward` for the raw response, with
 the connect default DoH server list, overridable in `ExtenderSettings`),
-rewrite the message id, and write the answer on the dns socket it came
-in on directly. Per-source limit 10 queries per second with burst 20, total 500
+give the answer the query's message id and question name, case included
+for a 0x20 client (the cache asks in lower case), drop the upstream's OPT
+record for a query that had none (RFC 6891), and write the answer on the
+dns socket it came in on directly (`connect.DnsResponseForQuery`, as the
+mux does). An answer to another question is not sent. Per-source limit 10
+queries per second with burst 20, total 500
 per second with the same burst, one in-flight query per source address, a
 bounded worker pool of 64 so the translation's read loop never blocks,
 a 5 s forward timeout, and a response cap of 4096 bytes with the TC bit
