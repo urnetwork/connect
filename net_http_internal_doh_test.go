@@ -405,7 +405,8 @@ func TestInternalDohRawDialFallsBackAcrossAddressFamilies(t *testing.T) {
 // default server is black-holed (P216). The named server is tried first, in
 // one of the internal cache's four request slots, rather than queued behind
 // defaults that never answer: without that every lookup that drew four
-// defaults first would time out.
+// defaults first would time out. The draw is random here, so this failed only
+// now and then; net_http_doh_lead_test.go forces the draw that starved it.
 func TestInternalDohResolvesThroughControlDohWhenTheDefaultsAreUnreachable(t *testing.T) {
 	answer := netip.MustParseAddr("192.0.2.53")
 	var queries atomic.Int32
