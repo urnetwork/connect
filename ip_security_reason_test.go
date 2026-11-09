@@ -157,3 +157,26 @@ func TestSecurityPolicyReasonsAttributeEachRule(t *testing.T) {
 		}
 	}
 }
+
+// Every reason has its own name, so the statistics tell each rule apart
+// (provider-local apart from not-public), and a reason added without a name
+// fails here rather than reading as "unknown".
+func TestSecurityPolicyReasonNamesAreDistinct(t *testing.T) {
+	names := map[string]SecurityPolicyReason{}
+	for reason := SecurityPolicyReasonUnknown + 1; reason < securityPolicyReasonEnd; reason++ {
+		name := reason.String()
+		if name == "unknown" {
+			t.Errorf("reason %d has no name", int(reason))
+			continue
+		}
+		if other, ok := names[name]; ok {
+			t.Errorf("reasons %d and %d share the name %q", int(other), int(reason), name)
+		}
+		names[name] = reason
+	}
+	for _, reason := range []SecurityPolicyReason{SecurityPolicyReasonProviderLocal, SecurityPolicyReasonProviderLocalUnknown} {
+		if _, ok := names[reason.String()]; !ok {
+			t.Errorf("reason %s is not enumerated", reason)
+		}
+	}
+}

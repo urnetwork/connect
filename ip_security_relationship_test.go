@@ -72,14 +72,20 @@ func testNonPublicDestinations(ipVersion int) []string {
 			"192.168.1.10",    // RFC1918
 			"127.0.0.1",       // loopback
 			"169.254.169.254", // link-local: the cloud metadata endpoint
+			"100.101.102.103", // shared address space: carrier-grade nat, tailscale peers
+			"100.100.100.100", // tailscale MagicDNS
+			"192.0.0.170",     // nat64 discovery
+			"240.0.0.1",       // reserved
 		}
 	}
 	return []string{
-		"fd00::5",       // ULA (RFC 4193)
-		"fc00:1::10",    // ULA
-		"::1",           // loopback
-		"fe80::1",       // link-local
-		"fd00:ec2::254", // the cloud metadata endpoint's v6 identity (ULA)
+		"fd00::5",           // ULA (RFC 4193)
+		"fc00:1::10",        // ULA
+		"::1",               // loopback
+		"fe80::1",           // link-local
+		"fd00:ec2::254",     // the cloud metadata endpoint's v6 identity (ULA)
+		"fd7a:115c:a1e0::1", // tailscale's ULA
+		"5f00::1",           // srv6 sids
 	}
 }
 

@@ -4331,12 +4331,13 @@ type TcpBufferSettings struct {
 	// valve: orphan packets are attacker-influenceable). <= 0 is unlimited.
 	OrphanRstPerSecond int
 
-	// EnableSyntheticSpeed terminates TCP flows to the RFC 2544 benchmark
-	// range 198.18.0.0/15 at an in-memory synthetic speed server instead of
-	// dialing upstream (see ip_synthetic_speed.go). The range is never
-	// publicly routable, so no real destination is shadowed. Serves
-	// measurement of the tunnel path itself, isolated from origin and
-	// upstream network variability.
+	// EnableSyntheticSpeed terminates TCP flows to the benchmark ranges
+	// 198.18.0.0/15 (RFC 2544) and 2001:2::/48 (RFC 5180) at an in-memory
+	// synthetic speed server instead of dialing upstream (see
+	// ip_synthetic_speed.go). The ranges are never publicly routable, so no
+	// real destination is shadowed. Serves measurement of the tunnel path
+	// itself, isolated from origin and upstream network variability. False
+	// refuses those flows; they are never dialed either way.
 	EnableSyntheticSpeed bool
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
@@ -5757,14 +5758,21 @@ func (self *TcpSequence) Run() {
 	var err error
 	var egressDial *providerEgressDial
 	var dialDuration time.Duration
-	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp)
+	synthetic := isSyntheticSpeedIp(self.IpPath().DestinationIp)
 	if synthetic {
 		// benchmark-range destination: terminate at the in-memory synthetic
-		// speed server (see ip_synthetic_speed.go)
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+		// speed server (see ip_synthetic_speed.go), or refuse it. It is never
+		// dialed: the security policy admits tcp to this range only because
+		// it is served here, and on a host the range can be a local proxy's
+		// fake-ip space (ip_security_public.go).
+		if self.tcpBufferSettings.EnableSyntheticSpeed {
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+			}
+			socket = newSyntheticSpeedConn()
+		} else {
+			err = errSyntheticSpeedDisabled
 		}
-		socket = newSyntheticSpeedConn()
 	} else {
 		var dialCtx context.Context
 		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)

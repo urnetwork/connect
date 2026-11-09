@@ -144,7 +144,12 @@ func blockActionReason(r SecurityPolicyResult, reason SecurityPolicyReason, bloc
 		return BlockActionReasonSecurityBittorrent
 	case SecurityPolicyReasonCfaaDropPort:
 		return BlockActionReasonSecurityPort
-	case SecurityPolicyReasonCfaaDropIp, SecurityPolicyReasonNotPublic:
+	case SecurityPolicyReasonCfaaDropIp,
+		SecurityPolicyReasonNotPublic,
+		SecurityPolicyReasonProviderLocal,
+		SecurityPolicyReasonProviderLocalUnknown:
+		// the provider-local reasons only decide in the provider role; named
+		// here so a policy that reports them still labels the block
 		return BlockActionReasonSecurityIp
 	default:
 		return BlockActionReasonSecurity
