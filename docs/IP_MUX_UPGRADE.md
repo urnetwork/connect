@@ -63,8 +63,9 @@ When `Dns.Resolver` is set, `onSend` claims single A/AAAA queries to UDP/53:
    handshake budgets are `30s` each — so a slow first attempt *waits* for the tunnel rather than
    failing fast; retrying aggressively up front would only re-hit the not-yet-ready path. The
    resolver fans out to multiple providers in parallel and the first to return records wins (default
-   set: Cloudflare at 1.1.1.1 and 1.0.0.1, and Quad9, all RFC 8484 wire-format; Google Public DNS and
-   OpenDNS are not defaults, see `DefaultDnsResolverSettings`). A built-in endpoint's
+   set: Cloudflare at 1.1.1.1 and 1.0.0.1, and Quad9 at its unfiltered 9.9.9.10, all RFC 8484
+   wire-format; Quad9's filtering 9.9.9.9, Google Public DNS and OpenDNS are not defaults, see
+   `DefaultDnsResolverSettings`). A built-in endpoint's
    policy-filtered response (an extended DNS error of 4 or 15-18, or only `0.0.0.0`/`::`) never
    wins and is never cached (`dohBuiltInEndpoints`); a server the user added answers as it answers,
    sink answers included. A forwarded response reaches a client whose query had no OPT record

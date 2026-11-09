@@ -66,8 +66,8 @@ Goals:
 Non-goals:
 
 - N1. No preset becomes a default. The defaults stay URnetwork's built-in
-  list, Cloudflare (1.1.1.1 and 1.0.0.1) and Quad9 once
-  `fix/default-resolvers-v2` lands, and the screen opens on it.
+  list, Cloudflare (1.1.1.1 and 1.0.0.1) and Quad9's unfiltered 9.9.9.10
+  once `fix/default-resolvers-v2` lands, and the screen opens on it.
 - N2. The control-name (ingress) DNS does not change. Presets never touch
   the bootstrap DoH servers, the connection region or the bootstrap plain
   fallback (3.4). An ad-blocking resolver adds nothing there, and a filter
@@ -95,27 +95,32 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
 - `DefaultDnsResolverSettings` (`net_http_doh.go:143-211`) turns on remote
   DoH and local plain DNS. Remote DoH v4 and v6 (`:171-180`) and remote
   plain DNS (`:186-195`) name Cloudflare at 1.1.1.1 and 1.0.0.1 and Quad9 at
-  9.9.9.9, interleaved (Cloudflare, Quad9, Cloudflare); the local plain-DNS
-  lists (`:200-209`) name Quad9 and both Cloudflare addresses. Switching
-  Quad9 to its unfiltered 9.9.9.10 is an owner decision.
+  its unfiltered 9.9.9.10 (v6 `2620:fe::10`), interleaved (Cloudflare,
+  Quad9, Cloudflare); the local plain-DNS lists (`:200-209`) name Quad9's
+  9.9.9.10 and both Cloudflare addresses. The defaults do not filter, so
+  Quad9's malware filter at 9.9.9.9 is not among them (2026-11-08).
 - History: Google Public DNS left the defaults in connect `b49cbc21`
   (`fix/no-google-dns`), and kz's regional entry (Google) became Cloudflare
   and Quad9; tm keeps Turkmentelecom alone. OpenDNS left them on
   `fix/default-resolvers-v2`: it refuses French clients (REFUSED, EDE 16),
   has left Portugal and Belgium, answers blocks with ordinary records,
   forwards the client's /24 as ECS, and its free terms are marked expired.
-  Everything derived from the lists follows (tunnel DoH, the Fast DNS
-  projection, the control-name DoH and its built-in copy, the Linux and
-  Windows egress fallback in `egress_dial.go`).
+  On the same branch Quad9 moved from 9.9.9.9 to 9.9.9.10: 9.9.9.9 answers
+  a blocked name with NXDOMAIN and EDE 17, and 9.9.9.10 has the same
+  operator, certificate and privacy terms without the filter. kz's regional
+  plain-DNS entry for Quad9 still names 9.9.9.9. Everything derived from
+  the default lists follows (tunnel DoH, the Fast DNS projection, the
+  control-name DoH and its built-in copy, the Linux and Windows egress
+  fallback in `egress_dial.go`).
 - The operator pair tables `knownDohUrlPairs` and `knownDnsServerPairs`
-  pair each operator's v4 and v6 endpoints, and keep Google's and OpenDNS's
-  pairs for a user who names them. A url outside the tables pairs by list
-  index with another url outside them (`familySiblings`), and
-  `dualStackList` drops repeats.
+  pair each operator's v4 and v6 endpoints, and keep the pairs of Quad9's
+  filtering 9.9.9.9, Google and OpenDNS for a user who names them. A url
+  outside the tables pairs by list index with another url outside them
+  (`familySiblings`), and `dualStackList` drops repeats.
 - The block-action ignore baseline and the blocker's resolver subtraction
   are a fixed set, `wellKnownResolverAddrs` (`ip_block_action.go`): every
-  endpoint of the pair tables and of the defaults, so Google and OpenDNS
-  stay in both.
+  endpoint of the pair tables and of the defaults, so Quad9's 9.9.9.9,
+  Google and OpenDNS stay in both.
 - The policy-filter guard (`dohBuiltInEndpoints`, `dohGuardedResult`,
   `dnsResponseFiltered`) covers the built-in endpoints only: the urls of the
   default remote and local DoH lists and of the regional bootstrap presets
@@ -130,9 +135,10 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   serve-stale. Any other server, one the user added or a preset (B4), is
   answered as it answers: its sink answers and extended-error NXDOMAINs are
   answers and misses, cached as usual. A user who names a built-in endpoint
-  in their own list (9.9.9.9, say) gets the guard for that endpoint. Plain
-  DNS has no guard: it runs through `net.Resolver`, which shows neither the
-  extended error nor which server answered.
+  in their own list (1.1.1.1, say) gets the guard for that endpoint. Quad9's
+  filtering 9.9.9.9 is not a built-in endpoint, so a user who names it gets
+  its blocks. Plain DNS has no guard: it runs through `net.Resolver`, which
+  shows neither the extended error nor which server answered.
 - Every DoH query carries an EDNS OPT record (UDP size 1232, DO clear). The
   mux returns a forwarded response without the upstream's OPT record to a
   client whose query had none (RFC 6891 §7, `dnsResponseForResponder`), and
@@ -154,8 +160,12 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   current default list, keeping the saved order of the servers that remain;
   so does the old tm recommendation (Turkmentelecom and Google). Version 2
   (`fix/default-resolvers-v2`): a record below version 2 holding exactly an
-  OpenDNS-era default list loads with the current list too. Every other list
-  loads as saved, and a record at the current version never migrates.
+  OpenDNS-era default list loads with the current list too. In every
+  migrated list Quad9's 9.9.9.10 takes the place of its 9.9.9.9, and the
+  other servers keep their saved order. Every other list loads as saved, so
+  a user who chose 9.9.9.9 outside an exact old default list keeps it, and a
+  record at the current version never migrates. The editors start from the
+  mux resolver, which has no local plain lists, so none of those migrates.
 - mmm updates the ur.io threat model's resolver rows to match.
 
 ### 3.2 How a user's DNS flows while connected
@@ -580,6 +590,11 @@ accepted HTTP/2 and HTTP/1.1, Quad9 has required HTTP/2 since 2025-12-15
 reports that every recommended preset answered RFC 8484 GET. connect speaks
 HTTP/2 only and GET only (3.2 step 10), so all of them fit.
 
+None of the filtering presets above names a built-in endpoint (3.1), so the
+policy-filter guard leaves their blocks alone (B4). The `quad9` preset's
+`9.9.9.9` became an ordinary endpoint when the defaults moved to Quad9's
+unfiltered `9.9.9.10`.
+
 Optional "no filtering" variants (O1): `adguard-unfiltered`
 (`https://unfiltered.adguard-dns.com/dns-query`, pins `94.140.14.140`,
 `94.140.14.141`, `2a10:50c0::1:ff`, `2a10:50c0::2:ff`),
@@ -827,14 +842,13 @@ built-in endpoints, so a preset's `0.0.0.0` sink answer and Quad9's
 NXDOMAIN with EDE 17 reach the client as the answer and are cached as
 usual; a preset needs no flag for it, and neither does a user's own
 filtering list. The guard follows the endpoint, not the list: a preset url
-that is also a built-in endpoint keeps the guard. Of the presets in A3
-only `quad9` names built-in endpoints (`https://9.9.9.9/dns-query` and
-`https://[2620:fe::fe]/dns-query`); as listed, its blocks from those two
-are no answer, and only its secondaries (`149.112.112.112`,
-`[2620:fe::9]`) deliver them. Before it ships, the preset names only the
-secondaries, or the guard skips the urls of a selected preset, or the
-preset is dropped because the defaults already carry Quad9. That choice is
-the owner's.
+that is also a built-in endpoint keeps the guard. No filtering preset in A3
+names one. Since the defaults moved to Quad9's unfiltered `9.9.9.10`, the
+`quad9` preset's `9.9.9.9` and `[2620:fe::fe]` are outside the guard and
+deliver its blocks, as its secondaries do, which settles the choice this
+paragraph used to leave to the owner. The unfiltered `cloudflare` variant
+(O1) names built-in endpoints and keeps the guard, which takes nothing from
+a resolver that does not filter.
 
 A REFUSED or SERVFAIL is a resolver failure to the mux (3.2 step 7). No
 one-tap preset uses them to block. A personal configuration can: AdGuard
@@ -855,14 +869,21 @@ F3 does.
 
 B6. Ip-literal urls where the certificate allows. Ip-literal urls need no
 bootstrap and send no SNI. They are proven for `https://1.1.1.2/dns-query`
-and `https://1.1.1.3/dns-query` (probed), and for `9.9.9.9`,
-`[2620:fe::fe]`, `1.1.1.1` and `[2606:4700:4700::1111]`, which today's
-defaults use. The Cloudflare secondaries (`1.0.0.1`, `1.0.0.2`,
-`1.0.0.3`), Quad9's `149.112.112.112` and `[2620:fe::9]`, and the other IPv6
-literals pass F3 before they ship; a literal that fails falls back to the
-provider's hostname (`cloudflare-dns.com`, `security.cloudflare-dns.com`,
-`family.cloudflare-dns.com`, `dns.quad9.net`) with the same addresses as
-pins. AdGuard and Control D were
+and `https://1.1.1.3/dns-query` (probed), for `9.9.9.9`, `[2620:fe::fe]`,
+`1.1.1.1` and `[2606:4700:4700::1111]`, which the defaults used before
+`fix/default-resolvers-v2`, and for the v4 defaults it adds. Probed
+2026-11-09 from a host without an IPv6 route: `9.9.9.10` presented Quad9's
+certificate, whose ip SANs include `9.9.9.10` and `2620:fe::10`, verified
+for its ip and answered over HTTP/2, and connect's own DoH client resolved
+through it; `1.0.0.1` presented Cloudflare's, whose ip SANs include
+`1.0.0.1` and `2606:4700:4700::1001`, verified for its ip and answered over
+HTTP/2. The v6 literals `[2620:fe::10]` and `[2606:4700:4700::1001]` carry
+the SANs but were not reached. The other Cloudflare secondaries (`1.0.0.2`,
+`1.0.0.3`), Quad9's `149.112.112.112` and `[2620:fe::9]`, and the other
+IPv6 literals pass F3 before they ship; a literal that fails falls back to
+the provider's hostname (`cloudflare-dns.com`,
+`security.cloudflare-dns.com`, `family.cloudflare-dns.com`,
+`dns.quad9.net`) with the same addresses as pins. AdGuard and Control D were
 not tested by ip literal and use hostname urls with pins.
 
 B7. Logs carry a DoH url as scheme and host only. Error strings that include
