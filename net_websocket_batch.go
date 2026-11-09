@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// webSocketWriteBatchMaxByteCount is the default coalescing bound and the
+// buffer every batching connection starts with. An owner whose ready drain is
+// larger may raise its own bound with SetWriteBatchByteLimit.
 const webSocketWriteBatchMaxByteCount = 16 * 1024
 
 // A rejected liveness bound is terminal even when the WebSocket dependency
@@ -34,6 +37,9 @@ type WebSocketWriteBatchConn struct {
 	writeBuffer   []byte
 	batching      bool
 	deadlineError atomic.Pointer[webSocketDeadlineError]
+	// maxByteCount is this connection's coalescing bound; zero is the
+	// default. Guarded by stateLock.
+	maxByteCount int
 
 	// Tests place batch activation and a concurrent control write at one exact
 	// boundary. Nil in production.
@@ -42,11 +48,32 @@ type WebSocketWriteBatchConn struct {
 }
 
 // Creates a pass-through connection whose explicit batches are bounded by the
-// package's fixed 16 KiB coalescing buffer.
+// package's 16 KiB coalescing buffer until its owner raises the bound.
 func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
 	return &WebSocketWriteBatchConn{
 		conn: conn,
 	}
+}
+
+// SetWriteBatchByteLimit raises this connection's coalescing bound. The buffer
+// still starts at 16 KiB and grows to limit only while one explicit batch
+// holds more complete frames; a limit at or below the default keeps the fixed
+// buffer.
+func (self *WebSocketWriteBatchConn) SetWriteBatchByteLimit(limit int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if limit <= webSocketWriteBatchMaxByteCount {
+		limit = 0
+	}
+	self.maxByteCount = limit
+}
+
+func (self *WebSocketWriteBatchConn) batchByteLimitWithLock() int {
+	if self.maxByteCount <= 0 {
+		return webSocketWriteBatchMaxByteCount
+	}
+	return self.maxByteCount
 }
 
 // Starts one explicit ready-only batch on the connection's single writer.
@@ -141,13 +168,21 @@ func (self *WebSocketWriteBatchConn) Write(buffer []byte) (int, error) {
 	if !self.batching {
 		return self.conn.Write(buffer)
 	}
-	if webSocketWriteBatchMaxByteCount < len(self.writeBuffer)+len(buffer) {
+	limit := self.batchByteLimitWithLock()
+	if limit < len(self.writeBuffer)+len(buffer) {
 		if err := self.flushWriteBufferWithLock(); err != nil {
 			return 0, err
 		}
 	}
-	if webSocketWriteBatchMaxByteCount < len(buffer) {
+	if limit < len(buffer) {
 		return self.conn.Write(buffer)
+	}
+	if cap(self.writeBuffer) < len(self.writeBuffer)+len(buffer) {
+		// One step to the bound: a batch that outgrows the initial buffer is a
+		// sustained ready backlog, so intermediate sizes would only add copies.
+		grown := make([]byte, len(self.writeBuffer), limit)
+		copy(grown, self.writeBuffer)
+		self.writeBuffer = grown
 	}
 	self.writeBuffer = append(self.writeBuffer, buffer...)
 	return len(buffer), nil

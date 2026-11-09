@@ -91,20 +91,34 @@ func TestWriteH1FramedReadyBatchAckFairnessAndOwnership(t *testing.T) {
 
 func TestWriteH1FramedReadyBatchByteBoundAndReadyOnly(t *testing.T) {
 	baseline := MessagePoolOutstandingCount()
-	ordinary := make(chan []byte, 20)
+	// Three tunnel-MTU packets per established H1 Transfer message. The drain
+	// takes messages until the batch reaches the byte bound.
+	const dataByteCount = 3 * DefaultMtu
+	want := 1
+	for platformWebSocketWriteBatchCanDrain(want, want*dataByteCount) {
+		want++
+	}
+	queued := want + 8
+	ordinary := make(chan []byte, queued)
 	defer h1PlusDrainTestOwnedMessages(ordinary)
-	for i := range 20 {
-		ordinary <- h1PlusOwnedTestMessage(byte(i+1), 1200)
+	for i := range queued {
+		ordinary <- h1PlusOwnedTestMessage(byte(i+1), dataByteCount)
 	}
 	raw := newH1UpgradeScriptConn(nil)
-	conn, err := NewFramedMessageConn(raw, H1FramerProtocol, 1200, nil)
+	conn, err := NewFramedMessageConn(raw, H1FramerProtocol, 4096, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	conn.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
 	sent := 0
-	_, err = writeH1FramedReadyBatch(context.Background(), conn, ordinary, nil, h1PlusOwnedTestMessage(0, 1200), false, time.Second, func() { sent++ })
-	if err != nil || sent != 11 || raw.writeCalls != 1 || len(ordinary) != 10 {
-		t.Fatalf("1200-byte ready batch changed12KiB threshold: sent=%d writes=%d queued=%d err=%v", sent, raw.writeCalls, len(ordinary), err)
+	_, err = writeH1FramedReadyBatch(context.Background(), conn, ordinary, nil, h1PlusOwnedTestMessage(0, dataByteCount), false, time.Second, func() { sent++ })
+	wire := want * (dataByteCount + 4)
+	if err != nil || sent != want || raw.writeCalls != 1 || len(ordinary) != queued+1-want ||
+		raw.output.Len() != wire || platformH1WriteBatchMaxByteCount < wire {
+		t.Fatalf("3-packet ready batch left the drain bound or one write: sent=%d/%d writes=%d queued=%d wire=%d err=%v", sent, want, raw.writeCalls, len(ordinary), raw.output.Len(), err)
+	}
+	if framedMessageWriteStorageByteCount < wire && len(conn.storage) != platformH1WriteBatchMaxByteCount {
+		t.Fatalf("bulk batch scratch=%d, want the %d-byte write bound", len(conn.storage), platformH1WriteBatchMaxByteCount)
 	}
 	h1PlusDrainTestOwnedMessages(ordinary)
 	// An open, empty lane must not delay a singleton while trying to fill a

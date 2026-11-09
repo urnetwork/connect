@@ -494,6 +494,10 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		ReturnResendTimeout:     time.Second,
 		ReturnPersistTimeout:    time.Second,
 		ReturnPersistMaxTimeout: 30 * time.Second,
+		// scheduling itself is off unless a profile sets its allowance
+		ReturnScheduleStallTimeout: defaultTcpReturnScheduleStallTimeout,
+		ReturnScheduleAgeTimeout:   defaultTcpReturnScheduleAgeTimeout,
+		ReturnScheduleAgeByteCount: defaultTcpReturnScheduleAgeByteCount,
 		// WriteTimeout bounds ZERO-progress time on the upstream socket (the
 		// write pipeline re-arms it on partial progress). A closed window on
 		// the tunnel side legitimately parks the whole pipeline — the device's
@@ -640,6 +644,10 @@ func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
 // counts and the provider udp idle, whether or not a process budget is set.
 func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCount) *LocalUserNatSettings {
 	settings := DefaultLocalUserNatSettings()
+	// One uplink carries the return traffic of every client this provider
+	// serves: complete the responses already in progress first rather than
+	// slowing all of them for each newcomer (see tcpReturnScheduler).
+	settings.TcpBufferSettings.ReturnScheduleByteCount = defaultProviderTcpReturnScheduleByteCount
 	if 0 < targetByteCount {
 		// the provider target has its own gate, independent of the process
 		// budget. Half the target sizes the egress nat flow tables (60% udp /
@@ -784,6 +792,8 @@ type LocalUserNat struct {
 
 	settings      *LocalUserNatSettings
 	controlMemory *TransferMemoryBudget
+	// Shared by the TCP flows of every shard and family; nil when disabled.
+	tcpReturnScheduler *tcpReturnScheduler
 
 	// receive callback
 	receiveCallbacks *CallbackList[ReceivePacketFunction]
@@ -902,6 +912,7 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		sendPackets:                     make(chan *SendPacket, settings.SequenceBufferSize),
 		runDone:                         make(chan struct{}),
 		settings:                        settings,
+		tcpReturnScheduler:              newTcpReturnScheduler(settings.TcpBufferSettings),
 		receiveCallbacks:                NewCallbackList[ReceivePacketFunction](),
 		receiveTransferCallbacks:        NewCallbackList[receiveTransferPacketFunction](),
 		receivePacketsCallbacks:         NewCallbackList[ReceivePacketsFunction](),
@@ -1637,6 +1648,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	tcp6Buffer.admissionCapacity = &self.reliableCapacity
 	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
 	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
+	tcp4Buffer.returnScheduler = self.tcpReturnScheduler
+	tcp6Buffer.returnScheduler = self.tcpReturnScheduler
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	icmp6Buffer := newIcmp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	sourceRetirementUnsub := self.addSourceRetirementCallback(func(sourceId Id, retired bool) []<-chan struct{} {
@@ -4073,6 +4086,19 @@ type TcpBufferSettings struct {
 	// Exponential persist backoff cap. A value at or below the initial
 	// interval keeps that interval fixed. Independent of data retry timing.
 	ReturnPersistMaxTimeout time.Duration
+	// Oldest-burst-first return scheduling across every TCP flow of one
+	// LocalUserNat (see tcpReturnScheduler): the unacknowledged bytes a burst
+	// may share with the older bursts still in progress. Zero disables it;
+	// the provider profile enables it.
+	ReturnScheduleByteCount ByteCount
+	// The progress guard: a burst whose acknowledgements have not advanced
+	// for this long stops counting against younger bursts.
+	ReturnScheduleStallTimeout time.Duration
+	// The age guard: a burst held for ReturnScheduleAgeTimeout may always
+	// keep ReturnScheduleAgeByteCount in flight. Non-positive guard values
+	// take their defaults; the guards cannot be disabled.
+	ReturnScheduleAgeTimeout   time.Duration
+	ReturnScheduleAgeByteCount ByteCount
 
 	// nil resolves to the local user nat `Log`
 	Log Logger
@@ -4432,6 +4458,8 @@ type TcpBuffer[BufferId comparable] struct {
 	egressRealism                  *egressRealismCounters
 	flowCloseCallback              tcpFlowCloseFunction
 	admissionCapacity              *receiveCapacitySignal
+	// The owning NAT's return scheduler; nil leaves flows unscheduled.
+	returnScheduler *tcpReturnScheduler
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -4691,6 +4719,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.admissionCapacity = self.admissionCapacity
 		sequence.egressRealism = self.egressRealism
+		sequence.returnSchedule = self.returnScheduler.newFlow()
 		sequence.flowCloseCallback = self.flowCloseCallback
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
@@ -5033,6 +5062,15 @@ type TcpSequence struct {
 	returnPersistPending bool
 	returnWake           chan struct{}
 	returnCapacity       chan struct{}
+	// Guarded by the connection mutex. Decides whether a timeout episode
+	// repairs a loss or a late flight (see runReturnRecovery).
+	returnEvidence tcpReturnEvidence
+	// Return packets this flow has emitted into its read-ahead queue that
+	// the callback has not yet handed to Transfer. They are queued, not lost.
+	returnUnsent atomic.Int64
+	// This flow's place in the NAT's return schedule (see tcpReturnScheduler).
+	// Set before Run; nil leaves the flow unscheduled.
+	returnSchedule *tcpReturnScheduleFlow
 
 	sendMutex         sync.Mutex
 	sendItems         chan *TcpSendItem
@@ -5410,6 +5448,9 @@ func (self *TcpSequence) Run() {
 		}
 		childWorkers.Wait()
 		self.releaseReturnChunks()
+		// the socket reader leaves the schedule itself; this covers a flow
+		// whose reader never started
+		self.returnSchedule.close()
 	}()
 	defer func() {
 		self.cancel()
@@ -5620,6 +5661,13 @@ func (self *TcpSequence) Run() {
 	receiveAckCond := self.receiveAckCondition()
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
+		// This is the last wakeup either condition receives. Run can end on
+		// its own (a source reset or the idle timeout) before any worker has
+		// canceled the flow, and every waiter re-checks cancellation under the
+		// mutex and otherwise waits again. Cancel first so a woken waiter
+		// always observes the teardown; otherwise it parks with no later
+		// wakeup and the child-worker join never completes.
+		self.cancel()
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
@@ -5845,6 +5893,7 @@ func (self *TcpSequence) Run() {
 			// the deferred socket close in `Run`
 			for packet := range readPackets {
 				self.receivePacket(packet, receiveRecoveryModeTcpSocket)
+				self.returnUnsent.Add(-1)
 			}
 		}()
 
@@ -5869,15 +5918,18 @@ func (self *TcpSequence) Run() {
 					case packet, ok := <-readPackets:
 						if !ok {
 							self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+							self.returnUnsent.Add(-int64(len(batch)))
 							return
 						}
 						batch = append(batch, packet)
 					default:
 						self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+						self.returnUnsent.Add(-int64(len(batch)))
 						continue read
 					}
 				}
 				self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+				self.returnUnsent.Add(-int64(len(batch)))
 			}
 		}
 	})
@@ -5900,6 +5952,7 @@ func (self *TcpSequence) Run() {
 					packet, err = self.RstAck()
 				}()
 				if err == nil {
+					self.returnUnsent.Add(1)
 					select {
 					case readPackets <- packet:
 						fin = true
@@ -5908,6 +5961,15 @@ func (self *TcpSequence) Run() {
 			}
 
 			close(readPackets)
+		}()
+		// Leave the NAT's return schedule as soon as this reader stops, so a
+		// finished flow never holds younger bursts.
+		defer self.returnSchedule.close()
+		var scheduleTimer *time.Timer
+		defer func() {
+			if scheduleTimer != nil {
+				scheduleTimer.Stop()
+			}
 		}()
 
 		buffer := make([]byte, self.tcpBufferSettings.ReadBufferByteCount)
@@ -5934,6 +5996,8 @@ func (self *TcpSequence) Run() {
 
 			if 0 < n {
 				self.UpdateLastActivityTime()
+				// data arriving with nothing outstanding starts a burst
+				self.returnSchedule.read()
 
 				// Retain origin chunks until the inner TCP acknowledges delivery.
 				// Transfer delivery alone does not prove a TUN kept the segment.
@@ -5948,6 +6012,7 @@ func (self *TcpSequence) Run() {
 					var chunkPackets [][]byte
 					var chunkPayload []byte
 					var chunkStart uint32
+					held := false
 					func() {
 						self.mutex.Lock()
 						defer self.mutex.Unlock()
@@ -5975,6 +6040,15 @@ func (self *TcpSequence) Run() {
 									chunkLimit = min(chunkLimit, max(1, (budget.TotalByteCount()-128)/2))
 								}
 								j := min(i+windowByteCount, i+int(chunkLimit), n)
+								// The NAT's return schedule may hold the chunk. It is
+								// held before it takes sequence space, so the source
+								// has nothing to time out (see tcpReturnScheduler).
+								grant := self.returnSchedule.admit(ByteCount(self.receiveSeq-self.receiveSeqAck), j-i)
+								if grant <= 0 {
+									held = true
+									return
+								}
+								j = i + grant
 								chunkPayload, chunkStart = buffer[i:j], self.receiveSeq
 								var err error
 								chunkPackets, err = self.DataPackets(buffer[i:j], j-i, self.tcpBufferSettings.Mtu)
@@ -6000,6 +6074,17 @@ func (self *TcpSequence) Run() {
 							receiveAckCond.Wait()
 						}
 					}()
+					if held {
+						// A held flow has a response in progress: it must not
+						// look idle to the flow table's LRU eviction.
+						self.UpdateLastActivityTime()
+						// waits without the connection mutex, so acknowledgements
+						// keep flowing; cancellation ends the wait at once
+						if !self.returnSchedule.wait(self.ctx, &scheduleTimer) {
+							stop = true
+						}
+						continue
+					}
 					if len(chunkPackets) != 0 && !self.retainReturnChunk(chunkPayload, chunkStart, false) {
 						stop = true
 					}
@@ -6007,8 +6092,10 @@ func (self *TcpSequence) Run() {
 						if stop {
 							MessagePoolReturn(packet)
 						} else {
+							self.returnUnsent.Add(1)
 							select {
 							case <-self.ctx.Done():
+								self.returnUnsent.Add(-1)
 								MessagePoolReturn(packet)
 								stop = true
 							case readPackets <- packet:
@@ -6020,6 +6107,8 @@ func (self *TcpSequence) Run() {
 				if stop {
 					return
 				}
+				// the burst can end once this read is acknowledged
+				self.returnSchedule.drained()
 
 				if 1 < packetCount {
 					if self.log.V(2).Enabled() {
@@ -6052,8 +6141,10 @@ func (self *TcpSequence) Run() {
 						return
 					}
 					if finErr == nil {
+						self.returnUnsent.Add(1)
 						select {
 						case <-self.ctx.Done():
+							self.returnUnsent.Add(-1)
 							MessagePoolReturn(finPacket)
 						case readPackets <- finPacket:
 							fin = true
@@ -6750,7 +6841,7 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 	if tcp.ack &&
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
-		self.acknowledgeReturnWithLock(tcp.ackNumber)
+		self.acknowledgeReturnWithLock(tcp)
 		if !self.handshakeAcked &&
 			0 <= int32(tcp.ackNumber-(self.initialSynSeq+1)) {
 			self.handshakeAcked = true
@@ -6784,9 +6875,14 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 			receiveWindowSize = self.receiveWindowEnd - receiveSeqAck
 		}
 		if self.receiveSeqAck != receiveSeqAck || self.receiveWindowSize != receiveWindowSize {
+			acknowledged := self.receiveSeqAck != receiveSeqAck
 			self.receiveSeqAck = receiveSeqAck
 			self.receiveWindowSize = receiveWindowSize
 			receiveAckUpdated = true
+			if acknowledged {
+				// returns this flow's share of the NAT's return schedule
+				self.returnSchedule.acknowledged(ByteCount(self.receiveSeq - self.receiveSeqAck))
+			}
 		}
 		if receiveWindowSize > 0 {
 			self.returnPersistPending = false

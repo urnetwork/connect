@@ -166,6 +166,115 @@ func TestTcpSequenceRunDoesNotReturnWhilePureAckWorkerHeld(t *testing.T) {
 	harness.close()
 }
 
+// Holds the sequence's upstream Close until the test releases it. Run closes
+// its socket after its final condition wakeup and before its own deferred
+// cancellation, so holding Close keeps that interval open deterministically.
+type tcpSequenceHeldCloseSocket struct {
+	net.Conn
+	closing     chan struct{}
+	released    chan struct{}
+	closingOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func (self *tcpSequenceHeldCloseSocket) Close() error {
+	self.closingOnce.Do(func() { close(self.closing) })
+	<-self.released
+	return self.Conn.Close()
+}
+
+func (self *tcpSequenceHeldCloseSocket) release() {
+	self.releaseOnce.Do(func() { close(self.released) })
+}
+
+// A flow can end on its own, by a source reset or the idle timeout, while no
+// worker has canceled it yet. Its condition waiters are then parked: the
+// pure-ACK worker with nothing to acknowledge, which is the normal state of an
+// idle flow, and the socket reader on a full source receive window. Their
+// final wakeup must observe the teardown: a waiter that parks again is never
+// woken, Run never joins it, and the owning NAT's close never completes. The
+// upstream peer never reads the acknowledged upload, so the socket writer
+// stays inside its write and cannot cancel the flow first.
+func TestTcpSequenceSelfEndedFlowReleasesParkedWorkers(t *testing.T) {
+	for _, trigger := range []string{"source reset", "idle timeout"} {
+		t.Run(trigger, func(t *testing.T) {
+			// Start the global pool's statistics worker outside the bubble.
+			MessagePoolReturn(MessagePoolGet(1))
+			synctest.Test(t, func(t *testing.T) {
+				socket := &tcpSequenceHeldCloseSocket{
+					closing:  make(chan struct{}),
+					released: make(chan struct{}),
+				}
+				ackWorkerStopped := make(chan struct{})
+				harness := newTcpReorderTestHarnessWithSetup(t, 1000, 8, 0, func(sequence *TcpSequence) {
+					settings := sequence.tcpBufferSettings
+					// only the idle timer may end the flow by time
+					settings.ReadTimeout = time.Minute
+					settings.WriteTimeout = time.Minute
+					// one socket read covers the source's whole opening window
+					settings.ReadBufferByteCount = 64 * 1024
+					dial := settings.DialContextSettings.DialContext
+					settings.DialContextSettings = &DialContextSettings{
+						DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+							conn, err := dial(ctx, network, address)
+							if err != nil {
+								return nil, err
+							}
+							socket.Conn = conn
+							return socket, nil
+						},
+					}
+					sequence.afterPureAckWorkerStopForTest = func() { close(ackWorkerStopped) }
+				})
+				t.Cleanup(socket.release)
+
+				harness.sendPayload(harness.nextSeq, "request", false)
+				harness.waitAck(harness.nextSeq + uint32(len("request")))
+				go func() {
+					if _, err := harness.upstreamSocket.Write(make([]byte, 64*1024)); err != nil {
+						t.Errorf("origin write: %v", err)
+					}
+				}()
+				synctest.Wait()
+				harness.sequence.mutex.Lock()
+				windowFull := harness.sequence.receiveSeq-harness.sequence.receiveSeqAck == harness.sequence.receiveWindowSize
+				harness.sequence.mutex.Unlock()
+				if !windowFull {
+					t.Fatal("socket reader did not fill the source receive window")
+				}
+
+				switch trigger {
+				case "source reset":
+					reset := harness.newSendItem(harness.nextSeq+uint32(len("request")), nil, false)
+					reset.tcp.rst = true
+					harness.sendItem(reset)
+				case "idle timeout":
+					time.Sleep(harness.sequence.tcpBufferSettings.IdleTimeout)
+				}
+				synctest.Wait()
+				select {
+				case <-socket.closing:
+				default:
+					t.Fatalf("%s did not end the flow", trigger)
+				}
+
+				socket.release()
+				synctest.Wait()
+				select {
+				case <-ackWorkerStopped:
+				default:
+					t.Fatal("pure-ACK worker stayed parked after the flow ended")
+				}
+				select {
+				case <-harness.runDone:
+				default:
+					t.Fatal("TcpSequence.Run did not join its workers after the flow ended")
+				}
+			})
+		})
+	}
+}
+
 func TestTcpSequenceAcceptsPureAckAheadOfDeliveredUpload(t *testing.T) {
 	sequence := newTcpAckOrderingTestSequence()
 	updated := sequence.applySendAckWithLock(&parsedTcp{

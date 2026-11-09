@@ -404,3 +404,208 @@ func TestFramedMessageConnOneReaderAndWriterInParallel(t *testing.T) {
 		})
 	}
 }
+
+func h1WriteBoundTestMessages(count int, size int) [][]byte {
+	messages := make([][]byte, count)
+	for i := range messages {
+		messages[i] = bytes.Repeat([]byte{byte(i + 1)}, size)
+	}
+	return messages
+}
+
+// h1WriteBoundTestReadFrames parses compact frames and checks order/content.
+func h1WriteBoundTestReadFrames(t *testing.T, wire []byte, want [][]byte) {
+	t.Helper()
+	reader := bytes.NewReader(wire)
+	for i, message := range want {
+		var header [4]byte
+		if _, err := io.ReadFull(reader, header[:]); err != nil {
+			t.Fatalf("frame %d header: %v", i, err)
+		}
+		got := make([]byte, binary.BigEndian.Uint16(header[:2]))
+		if _, err := io.ReadFull(reader, got); err != nil || !bytes.Equal(got, message) {
+			t.Fatalf("frame %d changed order or content", i)
+		}
+	}
+	if reader.Len() != 0 {
+		t.Fatalf("%d trailing wire bytes", reader.Len())
+	}
+}
+
+// Without an owner opt-in (the server, RPC) the framed writer keeps its fixed
+// 16-KiB scratch and splits a larger ready batch into bounded writes.
+func TestFramedMessageConnDefaultWriteBoundNeverGrows(t *testing.T) {
+	raw := newH1UpgradeScriptConn(nil)
+	conn, err := NewFramedMessageConn(raw, H1FramerProtocol, 4096, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := h1WriteBoundTestMessages(20, 3*DefaultMtu)
+	if err := conn.WriteMessages(messages); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount || cap(conn.storage) != framedMessageWriteStorageByteCount {
+		t.Fatalf("default scratch grew: len=%d cap=%d", len(conn.storage), cap(conn.storage))
+	}
+	// four 3,304-byte frames fit 16 KiB, so twenty frames need five writes
+	if raw.writeCalls != 5 {
+		t.Fatalf("default bound writes=%d, want 5", raw.writeCalls)
+	}
+	h1WriteBoundTestReadFrames(t, raw.output.Bytes(), messages)
+}
+
+// The client opt-in grows scratch once, exactly to the bound, only for a
+// multi-message batch that needs it; a larger batch still splits at message
+// boundaries; an idle heartbeat releases the grown scratch.
+func TestFramedMessageConnWriteBoundGrowsOnDemandAndIdleReleases(t *testing.T) {
+	const limit = 3 * framedMessageWriteStorageByteCount
+	raw := newH1UpgradeScriptConn(nil)
+	conn, err := NewFramedMessageConn(raw, H1FramerProtocol, 32*1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetWriteBatchByteLimit(limit)
+	if conn.storage != nil {
+		t.Fatal("setting the bound allocated scratch")
+	}
+
+	// A small batch keeps the default scratch.
+	small := h1WriteBoundTestMessages(3, 1200)
+	if err := conn.WriteMessages(small); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount || raw.writeCalls != 1 {
+		t.Fatalf("sparse batch grew scratch=%d or split writes=%d", len(conn.storage), raw.writeCalls)
+	}
+
+	// A singleton larger than the default never grows scratch: it keeps the
+	// bounded split fallback.
+	single := h1WriteBoundTestMessages(1, 20*1024)
+	if err := conn.WriteMessages(single); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount {
+		t.Fatalf("large singleton grew scratch to %d", len(conn.storage))
+	}
+
+	// A ready bulk batch within the bound is one write and grows scratch to
+	// exactly the bound.
+	raw.output.Reset()
+	raw.writeCalls = 0
+	bulk := h1WriteBoundTestMessages(limit/(3*DefaultMtu+4), 3*DefaultMtu)
+	if err := conn.WriteMessages(bulk); err != nil {
+		t.Fatal(err)
+	}
+	if raw.writeCalls != 1 || len(conn.storage) != limit || cap(conn.storage) != limit {
+		t.Fatalf("bulk batch writes=%d scratch=%d/%d, want one write and %d", raw.writeCalls, len(conn.storage), cap(conn.storage), limit)
+	}
+	h1WriteBoundTestReadFrames(t, raw.output.Bytes(), bulk)
+
+	// A batch above the bound splits at message boundaries, every write within
+	// the bound, without growing further.
+	raw.output.Reset()
+	raw.writeCalls = 0
+	over := h1WriteBoundTestMessages(2*len(bulk)+1, 3*DefaultMtu)
+	if err := conn.WriteMessages(over); err != nil {
+		t.Fatal(err)
+	}
+	if raw.writeCalls != 3 || len(conn.storage) != limit {
+		t.Fatalf("oversized batch writes=%d scratch=%d, want 3 and %d", raw.writeCalls, len(conn.storage), limit)
+	}
+	h1WriteBoundTestReadFrames(t, raw.output.Bytes(), over)
+
+	// The zero-length heartbeat marks an idle writer and releases bulk scratch.
+	if err := conn.WriteMessages([][]byte{nil}); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount || cap(conn.storage) != framedMessageWriteStorageByteCount {
+		t.Fatalf("heartbeat kept bulk scratch: len=%d cap=%d", len(conn.storage), cap(conn.storage))
+	}
+
+	// A bound at or below the default disables growth again.
+	conn.SetWriteBatchByteLimit(framedMessageWriteStorageByteCount)
+	if err := conn.WriteMessages(bulk); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount {
+		t.Fatalf("disabled bound still grew scratch to %d", len(conn.storage))
+	}
+}
+
+// The WebSocket coalescer keeps 16 KiB unless its owner raises the bound; then
+// it grows once, to exactly the bound, only for a batch that needs it.
+func TestWebSocketWriteBatchConnRaisedBoundGrowsOnDemand(t *testing.T) {
+	const limit = 3 * webSocketWriteBatchMaxByteCount
+	underlying := &recordingWriteConn{}
+	conn := NewWebSocketWriteBatchConn(underlying)
+	conn.SetWriteBatchByteLimit(limit)
+
+	frame := func(label byte) []byte { return bytes.Repeat([]byte{label}, 10*1024) }
+	conn.BeginWriteBatch()
+	if _, err := conn.Write(frame(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(conn.writeBuffer) != webSocketWriteBatchMaxByteCount || len(underlying.writes) != 1 {
+		t.Fatalf("small batch cap=%d writes=%d", cap(conn.writeBuffer), len(underlying.writes))
+	}
+
+	// Four 10-KiB frames: one delegated write after growing to the bound.
+	underlying.writes = nil
+	conn.BeginWriteBatch()
+	var want []byte
+	for label := byte(2); label < 6; label++ {
+		if _, err := conn.Write(frame(label)); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, frame(label)...)
+	}
+	if err := conn.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(conn.writeBuffer) != limit || len(underlying.writes) != 1 || !bytes.Equal(underlying.writes[0], want) {
+		t.Fatalf("bulk batch cap=%d writes=%d, want one ordered write and cap %d", cap(conn.writeBuffer), len(underlying.writes), limit)
+	}
+
+	// Six 10-KiB frames exceed 48 KiB: the bounded wrapper flushes a complete
+	// prefix, never more than the bound per delegated write.
+	underlying.writes = nil
+	conn.BeginWriteBatch()
+	want = nil
+	for label := byte(6); label < 12; label++ {
+		if _, err := conn.Write(frame(label)); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, frame(label)...)
+	}
+	if err := conn.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+	var joined []byte
+	for _, write := range underlying.writes {
+		if limit < len(write) {
+			t.Fatalf("delegated write %d exceeds bound %d", len(write), limit)
+		}
+		joined = append(joined, write...)
+	}
+	if len(underlying.writes) != 2 || !bytes.Equal(joined, want) || cap(conn.writeBuffer) != limit {
+		t.Fatalf("oversized batch writes=%d cap=%d", len(underlying.writes), cap(conn.writeBuffer))
+	}
+}
+
+// The mobile ledger charges the client's raised writer bound, so a connection
+// that grows its batch buffer stays inside its admitted claim.
+func TestPlatformH1ScratchMinimumChargesWriteBound(t *testing.T) {
+	settings := DefaultPlatformTransportSettings()
+	settings.h1RetainedByteAccounting = true
+	maximum := ByteCount((&PlatformTransport{settings: settings, framerSettings: settings.FramerSettings}).h1MaxMessageByteCount())
+	writer := ByteCount(platformH1WriteBatchMaxByteCount) + retainedMessageCapacity(maximum+4)
+	if got := settings.h1RetainedScratchMinimum(); got < writer {
+		t.Fatalf("scratch minimum %d omits the %d-byte writer bound", got, writer)
+	}
+	if settings.H1MemoryReservationByteCount() < settings.h1RetainedScratchMinimum() {
+		t.Fatal("reservation below its own scratch minimum")
+	}
+}

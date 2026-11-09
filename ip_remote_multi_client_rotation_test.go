@@ -300,6 +300,34 @@ func TestLifetimeJitterDisabledStaysDisabled(t *testing.T) {
 	AssertEqual(t, jitterClientLifetime(-time.Minute), -time.Minute)
 }
 
+// --- the per-listing expiry jitter ---
+
+// A listing's offer must stay within [windowExpandArgsJitterMinFraction, 1.0)
+// x the configured expiry across many draws, and must vary: a constant
+// fraction would keep windows that listed together re-listing together.
+func TestExpandArgsJitterBounds(t *testing.T) {
+	timeout := 2 * time.Minute
+	low := time.Duration(float64(timeout) * windowExpandArgsJitterMinFraction)
+
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 2000; i += 1 {
+		effective := jitterExpandArgsTimeout(timeout)
+		if effective < low || timeout < effective {
+			t.Fatalf("listing expiry %v outside [%v, %v]", effective, low, timeout)
+		}
+		seen[effective] = true
+	}
+	if len(seen) < 2 {
+		t.Error("listing expiry never varies: re-listing stays synchronized")
+	}
+}
+
+// A non-positive expiry is returned unchanged.
+func TestExpandArgsJitterNonPositiveUnchanged(t *testing.T) {
+	AssertEqual(t, jitterExpandArgsTimeout(0), time.Duration(0))
+	AssertEqual(t, jitterExpandArgsTimeout(-time.Minute), -time.Minute)
+}
+
 // The jitter must be drawn once at construction and used wherever removeTime
 // derives from the lifetime. windowStatsWithCoalesce is the derivation site:
 // it must read the stored effectiveLifetime, and must no longer read

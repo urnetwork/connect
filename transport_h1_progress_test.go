@@ -72,7 +72,7 @@ func TestH1PhysicalProgressBoundedAndAbortedMetadata(t *testing.T) {
 	p.finishWebSocketBatch()
 	takeProgressTraceEvents(events)
 	p.beginWebSocketBatch()
-	p.prepareWebSocketWrite(make([]byte, webSocketWriteBatchMaxByteCount))
+	p.prepareWebSocketWrite(make([]byte, platformH1WriteBatchMaxByteCount))
 	if unsupported := h1TraceStage(takeProgressTraceEvents(events), "h1_trace_unsupported"); len(unsupported) != 1 {
 		t.Fatalf("possible early WebSocket auto-flush was not explicit: %+v", unsupported)
 	}

@@ -110,7 +110,7 @@ func TestPlatformH1RetainedNarrowAndOverflowProfiles(t *testing.T) {
 	settings.H1BudgetByteCount = 1
 	settings.FramerSettings = DefaultFramerSettings(128 * 1024)
 	settings.FramerSettings.SplitMinimumLen = 256 * 1024
-	minimum := ByteCount(4*(128*1024+1)+8192+MessagePoolMetaByteCount+webSocketWriteBatchMaxByteCount) + retainedMessageCapacity(128*1024+4)
+	minimum := ByteCount(4*(128*1024+1)+8192+MessagePoolMetaByteCount+platformH1WriteBatchMaxByteCount) + retainedMessageCapacity(128*1024+4)
 	if settings.h1RetainedScratchMinimum() < minimum || settings.H1MemoryReservationByteCount() < minimum+3*retainedMessageCapacity(128*1024) {
 		t.Fatal("custom split/tiny base omitted the full framed writer copy")
 	}

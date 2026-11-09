@@ -247,3 +247,221 @@ func TestReconnectFastPathHonorsItsSettings(t *testing.T) {
 		t.Fatalf("kick re-dial with no jitter dialed %s late", lead)
 	}
 }
+
+func coldConnectFastPathCount(strategy *ClientStrategy) int {
+	strategy.mutex.Lock()
+	defer strategy.mutex.Unlock()
+	return strategy.coldConnectFastPathCount
+}
+
+// The candidates of one window expansion each dial a new platform transport on
+// the device's strategy at once. On the staircase the fourth waits three
+// 100ms-1s steps behind the first; on the cold-connect fast path all four dial
+// within the small jitter. All arithmetic on returned times -- no sleeps.
+func TestColdConnectFastPathExpansionBurst(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	AssertEqual(t, settings.ColdConnectFastPathLimit, 4)
+	AssertEqual(t, settings.ColdConnectFastPathLimit, multiClientExpandStepMax)
+	if settings.MinNextConnectDelay < settings.ColdConnectFastPathMaxDelay {
+		t.Fatalf("cold jitter %s exceeds the staircase step %s", settings.ColdConnectFastPathMaxDelay, settings.MinNextConnectDelay)
+	}
+
+	staircase := NewClientStrategy(ctx, settings)
+	start := time.Now()
+	var staircaseLast time.Time
+	for range multiClientExpandStepMax {
+		staircaseLast, _ = staircase.NextConnectTime()
+	}
+	if lead := staircaseLast.Sub(start); lead < time.Duration(multiClientExpandStepMax-1)*settings.MinNextConnectDelay {
+		t.Fatalf("staircase burst too shallow: %s", lead)
+	}
+
+	strategy := NewClientStrategy(ctx, settings)
+	releases := []func(){}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	for i := range multiClientExpandStepMax {
+		start := time.Now()
+		connectTime, release, cancelConnect := strategy.NextColdConnectTime()
+		releases = append(releases, release)
+		// a fast-path caller holds no staircase reservation
+		cancelConnect()
+		if lead := connectTime.Sub(start); settings.ColdConnectFastPathMaxDelay+50*time.Millisecond <= lead {
+			t.Fatalf("first dial %d paced %s ahead, want within the %s jitter", i, lead, settings.ColdConnectFastPathMaxDelay)
+		}
+	}
+	AssertEqual(t, coldConnectFastPathCount(strategy), multiClientExpandStepMax)
+}
+
+// Independent jitter, capped concurrency, no effect on the shared staircase,
+// slots that recycle on release, and an idempotent release.
+func TestNextColdConnectTimeCapAndRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	// the serialized step is larger than the fast-path jitter so the two
+	// shapes are provably disjoint
+	settings.MinNextConnectDelay = 300 * time.Millisecond
+	settings.MaxNextConnectDelay = 400 * time.Millisecond
+	settings.ColdConnectFastPathLimit = 3
+	settings.ColdConnectFastPathMaxDelay = 50 * time.Millisecond
+	strategy := NewClientStrategy(ctx, settings)
+
+	// prime the staircase well past the fast-path jitter range
+	start := time.Now()
+	var serialLast time.Time
+	for range 3 {
+		serialLast, _ = strategy.NextConnectTime()
+	}
+	if serialLast.Before(start.Add(2 * settings.MinNextConnectDelay)) {
+		t.Fatalf("staircase priming failed: %s", serialLast.Sub(start))
+	}
+
+	releases := []func(){}
+	for i := range settings.ColdConnectFastPathLimit {
+		connectTime, release, cancelConnect := strategy.NextColdConnectTime()
+		cancelConnect()
+		releases = append(releases, release)
+		if !connectTime.Before(serialLast) {
+			t.Errorf("fast path call %d landed on the staircase: %s >= %s", i, connectTime, serialLast)
+		}
+		if lead := connectTime.Sub(start); settings.ColdConnectFastPathMaxDelay+100*time.Millisecond <= lead {
+			t.Errorf("fast path call %d jitter too large: %s", i, lead)
+		}
+	}
+	AssertEqual(t, coldConnectFastPathCount(strategy), settings.ColdConnectFastPathLimit)
+
+	// over the cap: the staircase, which the fast-path callers did not advance
+	// -- one serialized step from serialLast
+	overCapTime, overCapRelease, overCapCancel := strategy.NextColdConnectTime()
+	if overCapTime.Before(serialLast) {
+		t.Errorf("over-cap call bypassed the staircase: %s < %s", overCapTime, serialLast)
+	}
+	if step := overCapTime.Sub(serialLast); settings.MaxNextConnectDelay+100*time.Millisecond <= step {
+		t.Errorf("fast-path callers advanced the shared timestamp: step %s", step)
+	}
+	// the over-cap caller holds no slot; its staircase reservation is returned
+	overCapRelease()
+	AssertEqual(t, coldConnectFastPathCount(strategy), settings.ColdConnectFastPathLimit)
+	overCapCancel()
+	next, nextCancel := strategy.NextConnectTime()
+	nextCancel()
+	if step := next.Sub(serialLast); settings.MaxNextConnectDelay+100*time.Millisecond <= step {
+		t.Errorf("cancelled over-cap wait kept its staircase step: %s", step)
+	}
+
+	// releasing a slot restores the fast path
+	releases[0]()
+	againTime, againRelease, _ := strategy.NextColdConnectTime()
+	if !againTime.Before(serialLast) {
+		t.Errorf("released slot did not restore the fast path: %s >= %s", againTime, serialLast)
+	}
+	againRelease()
+
+	// release is idempotent: a double release does not free a slot twice
+	releases[0]()
+	for _, release := range releases[1:] {
+		release()
+	}
+	AssertEqual(t, coldConnectFastPathCount(strategy), 0)
+}
+
+// A non-positive limit disables the fast path: every first dial takes the
+// staircase and no slot is ever held. A strategy without connect pacing adds
+// no jitter on the fast path either.
+func TestNextColdConnectTimeHonorsItsSettings(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	disabledSettings := DefaultClientStrategySettings()
+	disabledSettings.MinNextConnectDelay = 100 * time.Millisecond
+	disabledSettings.MaxNextConnectDelay = 100 * time.Millisecond
+	disabledSettings.ColdConnectFastPathLimit = 0
+	disabled := NewClientStrategy(ctx, disabledSettings)
+	start := time.Now()
+	var last time.Time
+	for range 4 {
+		var release func()
+		last, release, _ = disabled.NextColdConnectTime()
+		release()
+		AssertEqual(t, coldConnectFastPathCount(disabled), 0)
+	}
+	if lead := last.Sub(start); lead < 3*disabledSettings.MinNextConnectDelay {
+		t.Errorf("disabled fast path did not staircase: %s", lead)
+	}
+
+	unpacedSettings := DefaultClientStrategySettings()
+	unpacedSettings.MinNextConnectDelay = 0
+	unpacedSettings.MaxNextConnectDelay = 0
+	unpaced := NewClientStrategy(ctx, unpacedSettings)
+	for i := range 64 {
+		start := time.Now()
+		connectTime, release, _ := unpaced.NextColdConnectTime()
+		release()
+		if lead := connectTime.Sub(start); 10*time.Millisecond < lead {
+			t.Fatalf("unpaced first dial %d waited %s", i, lead)
+		}
+	}
+}
+
+// The transport's pacing: only a runner's first dial takes the cold-connect
+// fast path; a retry takes the staircase, a re-dial after a connection the
+// reconnect fast path, and a pinned transport its own backoff.
+func TestNextDialTimeFirstDialTakesColdConnectFastPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	settings := DefaultClientStrategySettings()
+	settings.MinNextConnectDelay = 300 * time.Millisecond
+	settings.MaxNextConnectDelay = 300 * time.Millisecond
+	strategy := NewClientStrategy(ctx, settings)
+	transport := newDialBackoffTestTransport(time.Hour, 4*time.Hour)
+	transport.clientStrategy = strategy
+
+	// prime the staircase so a staircase dial is provably later than a cold one
+	start := time.Now()
+	serialLast, _ := strategy.NextConnectTime()
+	serialLast, _ = strategy.NextConnectTime()
+	if serialLast.Before(start.Add(settings.MinNextConnectDelay)) {
+		t.Fatalf("staircase priming failed: %s", serialLast.Sub(start))
+	}
+
+	first, releaseFirst, cancelFirst := transport.nextDialTime(false, false, true)
+	cancelFirst()
+	if !first.Before(serialLast) {
+		t.Fatalf("first dial took the staircase: %s >= %s", first, serialLast)
+	}
+	AssertEqual(t, coldConnectFastPathCount(strategy), 1)
+	releaseFirst()
+	AssertEqual(t, coldConnectFastPathCount(strategy), 0)
+
+	retry, releaseRetry, cancelRetry := transport.nextDialTime(false, false, false)
+	releaseRetry()
+	if retry.Before(serialLast) {
+		t.Fatalf("a retry bypassed the staircase: %s < %s", retry, serialLast)
+	}
+	AssertEqual(t, coldConnectFastPathCount(strategy), 0)
+	cancelRetry()
+
+	_, releaseReconnect, _ := transport.nextDialTime(true, false, false)
+	func() {
+		strategy.mutex.Lock()
+		defer strategy.mutex.Unlock()
+		AssertEqual(t, strategy.reconnectFastPathCount, 1)
+		AssertEqual(t, strategy.coldConnectFastPathCount, 0)
+	}()
+	releaseReconnect()
+
+	transport.ipFamily = 4
+	_, releasePinned, cancelPinned := transport.nextDialTime(false, false, true)
+	releasePinned()
+	cancelPinned()
+	AssertEqual(t, coldConnectFastPathCount(strategy), 0)
+}

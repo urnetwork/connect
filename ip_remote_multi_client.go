@@ -11063,6 +11063,17 @@ const (
 	// requirement.
 	clientLifetimeJitterMinFraction = 0.75
 
+	// windowExpandArgsJitterMinFraction is the low end of the per-listing
+	// expiry jitter: the destinations one enumeration lists stay on offer for
+	// WindowExpandArgsTimeout scaled by a uniform draw from [this, 1.0), taken
+	// once per listing. Without it, windows that list in the same burst --
+	// clients starting together, or every window re-forming after a platform
+	// outage -- let their unused listings expire on the same tick and list
+	// again together, so the burst returns to discovery once per
+	// WindowExpandArgsTimeout for as long as they run. 0.5 spreads a 2m expiry
+	// over a 1m band while never offering a listing longer than configured.
+	windowExpandArgsJitterMinFraction = 0.5
+
 	// collapseDeadlineLifetimes sets the capacity-collapse hard deadline at
 	// this many MaxClientLifetimes past a client's first event. The collapse
 	// gate keeps a flow-carrying client alive through capacity collapse --
@@ -11101,6 +11112,20 @@ func jitterClientLifetime(maxClientLifetime time.Duration) time.Duration {
 	}
 	fraction := clientLifetimeJitterMinFraction + mathrand.Float64()*(1.0-clientLifetimeJitterMinFraction)
 	return time.Duration(float64(maxClientLifetime) * fraction)
+}
+
+// jitterExpandArgsTimeout returns how long one listing's destinations stay on
+// offer: timeout scaled by uniform [windowExpandArgsJitterMinFraction, 1.0).
+// Drawing per listing is what desynchronizes re-listing, as
+// jitterClientLifetime does for rotation: windows that listed in the same
+// burst expire across the jitter band instead of on one tick. A non-positive
+// timeout is returned unchanged.
+func jitterExpandArgsTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return timeout
+	}
+	fraction := windowExpandArgsJitterMinFraction + mathrand.Float64()*(1.0-windowExpandArgsJitterMinFraction)
+	return time.Duration(float64(timeout) * fraction)
 }
 
 // standingReserveTarget applies the standing reserve to a window's computed
@@ -12146,8 +12171,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			self.resizeMonitor.NotifyAll()
 		}
 		func() {
-			// destinations must be used by `expirationTime`
-			expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
+			// destinations must be used by `expirationTime`, jittered so
+			// windows that listed together do not list again together
+			expirationTime := time.Now().Add(jitterExpandArgsTimeout(self.settings.WindowExpandArgsTimeout))
 			for _, enumerated := range destinations {
 				destination, stats := enumerated.destination, enumerated.stats
 				if _, fixed := self.generator.FixedDestinationSize(); fixed {

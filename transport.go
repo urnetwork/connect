@@ -59,19 +59,29 @@ const TransportVersion = 2
 // note we don't run this because it's most efficient to let the gc handle some infrequent orphaned messages
 const DebugCloseSend = false
 
-// The platform WebSocket writer combines only messages already waiting on its
-// bounded route. ACK-sized traffic may drain thirty-two at once; ordinary data
-// stops once the batch has reached 12 KiB, so one complete ordinary <=4-KiB H1
-// data message fits the existing 16-KiB coalescer. A larger handshake carrier
-// may make the bounded wrapper flush its prefix before the batch ends. A
-// dedicated ACK lane may consume at most eight ready slots before one ready
-// ordinary packet gets a turn. The writer then starts another ACK burst and
-// repeats both bursts inside the same nonblocking physical flush. If either
-// lane is empty, the other drains without an artificial flush boundary. This
-// changes neither storage nor sparse latency and prevents Transfer feedback
-// from starving inner TCP ACKs or request data during a sustained download.
+// The platform WebSocket/H1+ writer combines only messages already waiting on
+// its bounded route; it never waits to fill a batch, so sparse traffic is
+// written immediately and alone. ACK-sized traffic may drain thirty-two at
+// once; ordinary data stops once the batch has reached the drain bound, 4 KiB
+// below the physical write bound, so one complete ordinary <=4-KiB H1 data
+// message still fits a single write. With the 20-KiB write bound a sustained
+// download carries five three-packet Transfer messages per stream write instead
+// of four: a fifth fewer writer wake-ups, deadline arms, framer flushes and TLS
+// Write calls per byte. The bound stays modest so one flush adds little
+// head-of-line delay for the ACK and control traffic queued behind it on a slow
+// uplink. Both client writer buffers start at the historical 16 KiB and grow to
+// the bound only on a connection whose ready batch needs it (an H1+ heartbeat
+// returns idle scratch); the server drains at most 12 KiB and never grows them.
+// A larger handshake carrier may make the bounded wrapper flush its prefix
+// before the batch ends. A dedicated ACK lane may consume at most eight ready
+// slots before one ready ordinary packet gets a turn. The writer then starts
+// another ACK burst and repeats both bursts inside the same nonblocking
+// physical flush. If either lane is empty, the other drains without an
+// artificial flush boundary. This prevents Transfer feedback from starving
+// inner TCP ACKs or request data during a sustained download.
 const platformWebSocketWriteBatchMaxMessages = 32
-const platformWebSocketWriteBatchDrainByteCount = 12 * 1024
+const platformH1WriteBatchMaxByteCount = 20 * 1024
+const platformWebSocketWriteBatchDrainByteCount = platformH1WriteBatchMaxByteCount - 4*1024
 const platformWebSocketAckPriorityBurstMaxMessages = 8
 
 func platformWebSocketWriteBatchCanDrain(
@@ -2344,9 +2354,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// died: only that first re-dial takes the reconnect fast path
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing. afterKick marks a re-dial that a
-	// network change asked for (see nextDialTime).
+	// network change asked for (see nextDialTime). firstDial marks this
+	// runner's first dial, which takes the cold-connect fast path
+	// (NextColdConnectTime); every later dial clears it.
 	hadConnection := false
 	afterKick := false
+	firstDial := true
 	// a compulsory move's replacement tries its target once per carrier
 	// (transport_move.go)
 	moveTargetAttempted := false
@@ -2495,16 +2508,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 		// a transport that was connected and just died takes the reconnect
 		// fast path (small independent jitter, capped concurrency) instead of
-		// the shared serializing staircase; see NextReconnectTime. The release
-		// frees the fast-path slot as soon as the dial attempt completes, on
-		// every exit path.
+		// the shared serializing staircase; see NextReconnectTime. A first
+		// dial takes the cold-connect fast path the same way; see
+		// NextColdConnectTime. The release frees the fast-path slot as soon as
+		// the dial attempt completes, on every exit path.
 		// cancelConnect gives the staircase reservation back if this wait is
 		// cancelled before the dial happens; it must NOT be called once the
 		// dial proceeds — see NextConnectTime. A pinned transport paces
 		// itself and returns no-ops for both.
-		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick)
+		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick, firstDial)
 		hadConnection = false
 		afterKick = false
+		firstDial = false
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-self.ctx.Done():
@@ -2778,6 +2793,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
 			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
+				framed.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
+			} else if batch, ok := ws.UnderlyingConn().(*WebSocketWriteBatchConn); ok {
+				batch.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
 			}
 			self.setRegistered(true)
 			// a move's replacement arrived at its target once its connection
@@ -3321,9 +3339,12 @@ func (self *PlatformTransport) runH3(
 	// died: only that first re-dial takes the reconnect fast path
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing. afterKick marks a re-dial that a
-	// network change asked for (see nextDialTime).
+	// network change asked for (see nextDialTime). firstDial marks this
+	// runner's first dial, which takes the cold-connect fast path
+	// (NextColdConnectTime); every later dial clears it.
 	hadConnection := false
 	afterKick := false
+	firstDial := true
 	// a compulsory move's replacement tries its target once per carrier
 	// (transport_move.go)
 	moveTargetAttempted := false
@@ -3534,16 +3555,18 @@ func (self *PlatformTransport) runH3(
 
 		// a transport that was connected and just died takes the reconnect
 		// fast path (small independent jitter, capped concurrency) instead of
-		// the shared serializing staircase; see NextReconnectTime. The release
-		// frees the fast-path slot as soon as the dial attempt completes, on
-		// every exit path.
+		// the shared serializing staircase; see NextReconnectTime. A first
+		// dial takes the cold-connect fast path the same way; see
+		// NextColdConnectTime. The release frees the fast-path slot as soon as
+		// the dial attempt completes, on every exit path.
 		// cancelConnect gives the staircase reservation back if this wait is
 		// cancelled before the dial happens; it must NOT be called once the
 		// dial proceeds — see NextConnectTime. A pinned transport paces
 		// itself and returns no-ops for both.
-		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick)
+		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick, firstDial)
 		hadConnection = false
 		afterKick = false
+		firstDial = false
 		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
 			select {
 			case <-ctx.Done():

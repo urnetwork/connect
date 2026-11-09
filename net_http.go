@@ -74,6 +74,9 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		ReconnectFastPathMaxDelay: 250 * time.Millisecond,
 		KickReconnectLimit:        12,
 
+		ColdConnectFastPathLimit:    4,
+		ColdConnectFastPathMaxDelay: 50 * time.Millisecond,
+
 		Http2SendPingTimeout: 10 * time.Second,
 		Http2PingTimeout:     5 * time.Second,
 
@@ -283,6 +286,21 @@ type ClientStrategySettings struct {
 	// in transports per device. Callers past the cap take the ordinary
 	// reconnect path (NextReconnectTime). Non-positive removes the cap.
 	KickReconnectLimit int
+	// ColdConnectFastPathLimit caps how many first dials may hold the
+	// cold-connect fast path (NextColdConnectTime) at once. A multi-client
+	// creates the candidate exits of one window expansion together (at most
+	// multiClientExpandStepMax, four) and evaluates them by which answers its
+	// first ping, so the default covers one expansion. First dials past the cap
+	// take the serialized NextConnectTime staircase. Non-positive disables the
+	// fast path: every first dial takes the staircase.
+	ColdConnectFastPathLimit int
+	// ColdConnectFastPathMaxDelay is the independent per-caller jitter of a
+	// first dial on the cold-connect fast path: uniform in [0, this). Enough
+	// spread that the candidates of one expansion do not reach the platform in
+	// the same instant, and small next to a provider round trip, which is what
+	// the expansion measures. Never more than MinNextConnectDelay, so a
+	// strategy without connect pacing adds none. Non-positive dials at once.
+	ColdConnectFastPathMaxDelay time.Duration
 
 	// ExtraHeaders, when set, are applied (Set semantics, overriding same-named
 	// headers) to every request this strategy issues: http serial/parallel,
@@ -355,6 +373,10 @@ type ClientStrategy struct {
 	// kickReconnectCount is the number of kick re-dial slots currently held
 	// (see NextKickReconnectTime). Guarded by mutex; zero means all free.
 	kickReconnectCount int
+	// coldConnectFastPathCount is the number of cold-connect fast-path slots
+	// currently held (see NextColdConnectTime). Guarded by mutex; zero means
+	// all free.
+	coldConnectFastPathCount int
 
 	// Delivery evidence scales static route weights and controls serial
 	// preference. NetworkChanged advances a private path generation; hosts
@@ -1093,6 +1115,69 @@ func (self *ClientStrategy) NextReconnectTime() (time.Time, func()) {
 // uniform in [0, ReconnectFastPathMaxDelay); none when that is non-positive.
 func (self *ClientStrategy) reconnectFastPathJitter() time.Duration {
 	if maxDelay := self.settings.ReconnectFastPathMaxDelay; 0 < maxDelay {
+		return time.Duration(mathrand.Int63n(int64(maxDelay)))
+	}
+	return 0
+}
+
+// NextColdConnectTime paces the first dial of a transport that has never
+// connected. The burst this serves is a multi-client window expansion: it
+// creates up to multiClientExpandStepMax candidate exits together, each with
+// its own platform transport on this strategy, and admits them in the order
+// they answer their first ping. On the NextConnectTime staircase each of those
+// first dials waits 100ms-1s behind the previous one, so the candidates come up
+// on average 0.55s, 1.1s and 1.65s after the first. Every exit after the first
+// is that much later, and the evaluation's answer order is decided by the
+// staircase -- the candidate whose transport it served first answers first --
+// rather than by how quickly each provider responds.
+//
+// So a first dial takes a small independent jitter (ColdConnectFastPathMaxDelay)
+// that neither reads nor advances the shared timestamp, on one of at most
+// ColdConnectFastPathLimit slots; a first dial past the cap takes the staircase
+// as before. Only a first dial comes here. A failed first dial retries through
+// NextConnectTime, so an outage still paces every retry on the staircase and
+// behind the transport's own failure backoff.
+//
+// The first release frees the fast-path slot and must be called once the dial
+// attempt completes, on every exit path (as with NextReconnectTime). The second
+// gives a staircase reservation back if the wait is cancelled before the dial
+// (as with NextConnectTime) and must not be called once the dial proceeds.
+// Exactly one of the two does anything; both are idempotent and never nil.
+func (self *ClientStrategy) NextColdConnectTime() (time.Time, func(), func()) {
+	acquired := false
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if limit := self.settings.ColdConnectFastPathLimit; 0 < limit && self.coldConnectFastPathCount < limit {
+			self.coldConnectFastPathCount += 1
+			acquired = true
+		}
+	}()
+	if !acquired {
+		// NextConnectTime takes the mutex itself, so it is called with the lock
+		// released (done above)
+		connectTime, cancelConnect := self.NextConnectTime()
+		return connectTime, func() {}, cancelConnect
+	}
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+			self.coldConnectFastPathCount -= 1
+		})
+	}
+	return time.Now().Add(self.coldConnectFastPathJitter()), release, func() {}
+}
+
+// coldConnectFastPathJitter is one draw of the cold-connect fast path's
+// independent jitter, uniform in [0, ColdConnectFastPathMaxDelay). It never
+// exceeds the staircase's own smallest step, so a strategy configured without
+// connect pacing (MinNextConnectDelay <= 0) dials a first connection at once
+// here too; none when either is non-positive.
+func (self *ClientStrategy) coldConnectFastPathJitter() time.Duration {
+	if maxDelay := min(self.settings.ColdConnectFastPathMaxDelay, self.settings.MinNextConnectDelay); 0 < maxDelay {
 		return time.Duration(mathrand.Int63n(int64(maxDelay)))
 	}
 	return 0

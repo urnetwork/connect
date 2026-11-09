@@ -27,11 +27,18 @@ type H1MessageConn interface {
 	UnderlyingConn() net.Conn
 }
 
+// framedMessageWriteStorageByteCount is the writer scratch every framed stream
+// lazily owns. It is also the default bound on one coalesced stream write.
+const framedMessageWriteStorageByteCount = 16 * 1024
+
 // FramedMessageConn has one reader and one writer, which may run concurrently.
 // Each stream has a fixed, negotiated wire format and explicit admission cap.
-// The writer lazily owns 16 KiB scratch. Larger compact frames use Framer's
-// split path; larger XL frames use a full frame-local temporary buffer that is
-// released on return. Read state never retains an application message.
+// The writer lazily owns 16 KiB scratch. An owner that drains larger ready
+// batches may raise the coalescing bound with SetWriteBatchByteLimit; the
+// scratch then grows to that bound only when a multi-message batch needs it and
+// is released again by the next idle heartbeat. Larger compact frames use
+// Framer's split path; larger XL frames use a full frame-local temporary buffer
+// that is released on return. Read state never retains an application message.
 type FramedMessageConn struct {
 	net.Conn
 	framer    *Framer
@@ -39,9 +46,12 @@ type FramedMessageConn struct {
 	maximum   int
 	readLimit atomic.Int64
 	storage   []byte
-	body      framedMessageBody
-	stats     *H1PlusStats
-	progress  *h1PhysicalProgress
+	// storageLimit is the largest scratch a ready multi-message batch may grow
+	// to. Zero keeps the fixed default. Writer-owned, like storage.
+	storageLimit int
+	body         framedMessageBody
+	stats        *H1PlusStats
+	progress     *h1PhysicalProgress
 }
 
 func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1PlusStats) (*FramedMessageConn, error) {
@@ -61,6 +71,46 @@ func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1
 }
 
 func (c *FramedMessageConn) UnderlyingConn() net.Conn { return c.Conn }
+
+// SetWriteBatchByteLimit lets the single writer coalesce a ready multi-message
+// batch of up to limit framed bytes into one stream write. Scratch is not
+// allocated here: it grows to limit only when such a batch is written, and an
+// idle heartbeat returns it to the default. A singleton never grows it, so
+// large frames keep their bounded split or frame-local temporary. A limit at or
+// below the default keeps the fixed 16-KiB scratch. Call it before the writer
+// starts or from the writer goroutine.
+func (c *FramedMessageConn) SetWriteBatchByteLimit(limit int) {
+	if limit <= framedMessageWriteStorageByteCount {
+		c.storageLimit = 0
+		return
+	}
+	c.storageLimit = limit
+}
+
+// prepareWriteStorage sizes scratch for the next stream write of messages.
+func (c *FramedMessageConn) prepareWriteStorage(messages [][]byte) {
+	if len(messages) == 1 && len(messages[0]) == 0 && framedMessageWriteStorageByteCount < len(c.storage) {
+		// A zero-length heartbeat means the writer has been idle; do not keep
+		// bulk scratch on an idle socket.
+		c.storage = nil
+	}
+	if c.storage == nil {
+		c.storage = make([]byte, framedMessageWriteStorageByteCount)
+	}
+	if len(messages) < 2 || c.storageLimit <= len(c.storage) {
+		return
+	}
+	need := 0
+	for _, message := range messages {
+		if c.storageLimit-need < len(message)+4 {
+			break
+		}
+		need += len(message) + 4
+	}
+	if len(c.storage) < need {
+		c.storage = make([]byte, c.storageLimit)
+	}
+}
 
 // Write delegates encoded bytes and counts actual stream calls, including
 // the legacy split path of a compact frame larger than its caller storage.
@@ -198,9 +248,7 @@ func (c *FramedMessageConn) WriteMessages(messages [][]byte) error {
 	if len(messages) == 0 {
 		return nil
 	}
-	if c.storage == nil {
-		c.storage = make([]byte, 16*1024)
-	}
+	c.prepareWriteStorage(messages)
 	for len(messages) != 0 {
 		count, bytes := 1, len(messages[0])+4
 		for count < len(messages) && bytes <= len(c.storage)-4 && len(messages[count]) <= len(c.storage)-bytes-4 {

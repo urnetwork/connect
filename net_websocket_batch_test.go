@@ -270,13 +270,21 @@ func TestPlatformWebSocketReadyDrainBalancesAcksAndPayloadBytes(t *testing.T) {
 	if count, bytes := readyCount(128); count != 32 || bytes != 4*1024 {
 		t.Fatalf("ACK-sized ready drain=(%d, %dB), want (32, 4096B)", count, bytes)
 	}
-	if count, bytes := readyCount(DefaultMtu); count != 12 ||
-		bytes >= webSocketWriteBatchMaxByteCount {
-		t.Fatalf("tunnel-MTU ready drain=(%d, %dB), want 12 below 16KiB", count, bytes)
+	// Ordinary H1 data up to the 4-KiB envelope: the drain stops only at a
+	// bound, and the drained batch plus its worst-case per-message framing
+	// (H1+ length header or masked WebSocket header) fits one physical write.
+	for _, size := range []int{DefaultMtu, 3 * DefaultMtu, 4 * 1024} {
+		count, bytes := readyCount(size)
+		if count < platformWebSocketWriteBatchMaxMessages && bytes < platformWebSocketWriteBatchDrainByteCount {
+			t.Fatalf("%d-byte ready drain=(%d, %dB) stopped below both bounds", size, count, bytes)
+		}
+		if platformH1WriteBatchMaxByteCount < bytes+count*14 {
+			t.Fatalf("%d-byte ready drain=(%d, %dB) exceeds one %d-byte write", size, count, bytes, platformH1WriteBatchMaxByteCount)
+		}
 	}
-	if count, bytes := readyCount(4 * 1024); count != 3 ||
+	if count, bytes := readyCount(4 * 1024); count != platformWebSocketWriteBatchDrainByteCount/(4*1024) ||
 		bytes != platformWebSocketWriteBatchDrainByteCount {
-		t.Fatalf("maximum H1 ready drain=(%d, %dB), want (3, 12288B)", count, bytes)
+		t.Fatalf("maximum H1 ready drain=(%d, %dB), want the %dB drain bound", count, bytes, platformWebSocketWriteBatchDrainByteCount)
 	}
 }
 

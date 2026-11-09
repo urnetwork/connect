@@ -571,7 +571,16 @@ func (self *PlatformTransport) authIntent() int32 {
 // onto the staircase behind each other for seconds. That burst is bounded by
 // the transports themselves, so it takes the fast path's jitter on its own,
 // larger cap (KickReconnectLimit).
-func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
+//
+// firstDial is a runner's first dial of this transport. The candidates of one
+// window expansion are created together, so their first dials take the
+// cold-connect fast path (NextColdConnectTime) instead of staircasing behind
+// each other; a retry after a failed first dial takes the staircase.
+//
+// releaseReconnect frees a fast-path slot once the dial attempt completes;
+// cancelConnect gives a staircase reservation back if the wait is cancelled
+// before the dial.
+func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool, firstDial bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
 	releaseReconnect = func() {}
 	cancelConnect = func() {}
 	if self.pinned() {
@@ -583,6 +592,8 @@ func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) 
 	}
 	if hadConnection {
 		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
+	} else if firstDial {
+		connectTime, releaseReconnect, cancelConnect = self.clientStrategy.NextColdConnectTime()
 	} else {
 		connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
 	}

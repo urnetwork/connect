@@ -156,8 +156,9 @@ func (self *PlatformTransportSettings) h1RetainedQueueByteCount(count int) ByteC
 
 // The reader can simultaneously hold its 8-KiB read scratch and a grown
 // allocation including the one-byte over-limit probe; four times the declared
-// maximum bounds the growth/copy overlap. The writer holds one 16-KiB encoded
-// batch and a framed copy including its four-byte header. Custom split policy
+// maximum bounds the growth/copy overlap. The writer holds one encoded batch of
+// at most platformH1WriteBatchMaxByteCount (its buffer grows to that bound
+// only under a ready backlog) and a framed copy including its four-byte header. Custom split policy
 // may copy the whole message rather than half. Original
 // writer roots and the Client-held wire root remain charged to their lanes.
 // The existing base additionally retains connection/socket/handshake overhead;
@@ -168,7 +169,7 @@ func (self *PlatformTransportSettings) h1RetainedScratchMinimum() ByteCount {
 		return ByteCount(math.MaxInt64)
 	}
 	reader := 4*(maximum+1) + 8192 + MessagePoolMetaByteCount
-	writer := addReceiveQueueByteCount(webSocketWriteBatchMaxByteCount, retainedMessageCapacity(maximum+4))
+	writer := addReceiveQueueByteCount(platformH1WriteBatchMaxByteCount, retainedMessageCapacity(maximum+4))
 	metadata := addReceiveQueueByteCount(platformH1QueueByteCount(self.TransportBufferSize)/platformH1QueueSlotByteCount*96, kib(8))
 	return addReceiveQueueByteCount(addReceiveQueueByteCount(reader, writer), metadata)
 }

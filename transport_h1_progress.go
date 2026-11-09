@@ -57,7 +57,7 @@ func (p *h1PhysicalProgress) queue(wire []byte) {
 		return
 	}
 	p.pendingBytes += len(wire) + 14 // conservative maximum WS frame header
-	if p.kind == "websocket" && webSocketWriteBatchMaxByteCount < p.pendingBytes {
+	if p.kind == "websocket" && platformH1WriteBatchMaxByteCount < p.pendingBytes {
 		// Oversized WebSocket messages may bypass the coalescing buffer before
 		// the explicit flush. Mark this unsupported join instead of claiming
 		// that its begin timestamp is the physical socket-write start.
