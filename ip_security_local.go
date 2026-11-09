@@ -24,8 +24,8 @@ package connect
 //     the IPv6 prefix above. Behind a NAT that is the router's public address,
 //     which a consumer would otherwise reach by hairpin NAT, and in a
 //     container it is the host's;
-//   - the port control anycast addresses (providerLocalAnycastAddrs), which
-//     the gateway in front of this host answers, snapshot or not.
+//   - the service anycast addresses (providerLocalAnycastAddrs), which the
+//     network in front of this host answers, snapshot or not.
 //
 // A non-public interface address (RFC 1918, CGNAT, ULA, link-local, ...)
 // contributes nothing: its link is inside a block the public rule already
@@ -71,23 +71,34 @@ import (
 // address is never narrower.
 const ipv6SubnetBits = 64
 
-// The port control anycast addresses (PCP, RFC 7723), 192.0.0.9 and 2001:1::1,
-// the only port control anycast the IANA special-purpose registries list
-// (checked 2026-11-09). The registries mark both globally reachable, so the
-// public rule admits them (ip_security_public.go). But a request to either is
-// answered by the gateway in front of the sender, a home router or an ISP's
-// carrier-grade NAT, which maps a port of its public address to the sender
-// for whoever asks. From a provider, the sender is the provider host. They are
-// local wherever the provider is, with or without a snapshot. The TURN anycast
-// addresses (192.0.0.10, 2001:1::2) and the DNS-SD service registration
-// anycast (2001:1::3) stay public.
+// The service anycast addresses: every anycast address the IANA
+// special-purpose registries list for a service the network in front of the
+// sender provides (checked 2026-11-09). The registries mark them globally
+// reachable, so the public rule admits them (ip_security_public.go), but a
+// request to one is answered by that network, and from a provider the sender
+// is the provider host:
+//   - port control (PCP, RFC 7723): the gateway in front of the sender, a home
+//     router or an ISP's carrier-grade NAT, maps a port of its public address
+//     to the sender for whoever asks;
+//   - TURN (RFC 8155): the network's own TURN server allocates relays for the
+//     sender, from inside that network;
+//   - DNS-SD service registration (SRP, RFC 9665): the network's registrar
+//     publishes services on its links for the sender.
+//
+// They are local wherever the provider is, with or without a snapshot.
 var providerLocalAnycastAddrs = []netip.Addr{
+	// port control
 	netip.MustParseAddr("192.0.0.9"),
 	netip.MustParseAddr("2001:1::1"),
+	// turn
+	netip.MustParseAddr("192.0.0.10"),
+	netip.MustParseAddr("2001:1::2"),
+	// dns-sd service registration
+	netip.MustParseAddr("2001:1::3"),
 }
 
 // isProviderLocalAnycastAddr reports whether addr, or the IPv4 address it
-// maps, is a port control anycast address. It never allocates.
+// maps, is a service anycast address. It never allocates.
 func isProviderLocalAnycastAddr(addr netip.Addr) bool {
 	return slices.Contains(providerLocalAnycastAddrs, addr.Unmap().WithZone(""))
 }
@@ -374,9 +385,9 @@ func (self *providerLocalNetworks) setObservedAddresses(addrs []netip.Addr) {
 
 // containsAddr reports whether addr is this host or on one of its links in
 // the current snapshot, at the default provider policy's IPv6 width, or a
-// port control anycast address. Before the first read it reports false for
-// all but the anycast addresses: a caller that must fail closed uses a guard
-// instead. Not for the packet path: it allocates.
+// service anycast address. Before the first read it reports false for all but
+// the anycast addresses: a caller that must fail closed uses a guard instead.
+// Not for the packet path: it allocates.
 func (self *providerLocalNetworks) containsAddr(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return false
@@ -485,7 +496,7 @@ type providerLocalVerdict int
 const (
 	// not this host and not on its links
 	providerLocalNo providerLocalVerdict = iota
-	// this host, on one of its links, an observed address or a port control
+	// this host, on one of its links, an observed address or a service
 	// anycast address
 	providerLocalYes
 	// no read of this host's addresses has succeeded yet

@@ -194,7 +194,7 @@ func TestProviderDiagnosticsReportSecurityPolicyGeneration(t *testing.T) {
 // SecurityPolicyHash identifies them. From generation 3 it also holds the
 // provider-local guard's defaults (the policy's and the process snapshot's)
 // and the special-purpose registry tables of the public-destination rule,
-// and from generation 4 the guard's port control anycast addresses.
+// and from generation 4 the guard's service anycast addresses.
 func securityPolicyRulesPreimage(t *testing.T) []byte {
 	t.Helper()
 	dmca := DefaultDmcaSecurityPolicySettings()
@@ -249,12 +249,12 @@ func securityPolicyRulesDigest(t *testing.T) string {
 // own default settings (connect 4138f101). Generation 3's pin is of the
 // preimage that also holds the provider-local defaults and the
 // special-purpose registry tables; generations 1 and 2 had neither.
-// Generation 4's also holds the port control anycast addresses.
+// Generation 4's also holds the service anycast addresses.
 var securityPolicyRulesPins = map[uint64]string{
 	1: "265961a0f2b445d75fd5a851ec49198f580e3778f4bbe27315af7f3290c7e8c9",
 	2: "2798a1cef586738de34759ff274f084e950cbd09b9c17b35a3baeba57d80141f",
 	3: "6dbeba6f777c7ec4d3567a06f344295945a11dbef6260a0ef0a048c59edf1ee0",
-	4: "7f6bbb95de27e05a5f3df0dc0539c9191d7f345c2eb7960dc2c4659c75f37cbd",
+	4: "c800071a98af8523400e22c9b0212d353ecb21589a97873bab2baff4bfd3dd32",
 }
 
 // A change to the default settings or a hand-maintained exception table must
@@ -300,7 +300,7 @@ func TestSecurityPolicyRulesPinCoversHandMaintainedTablesOnly(t *testing.T) {
 	}
 	for _, addr := range providerLocalAnycastAddrs {
 		if !bytes.Contains(preimage, []byte("local anycast")) || !bytes.Contains(preimage, []byte(addr.String())) {
-			t.Fatalf("the rules pin does not cover the port control anycast address %s", addr)
+			t.Fatalf("the rules pin does not cover the service anycast address %s", addr)
 		}
 	}
 	for _, prefix := range metaNetworkPrefixes {

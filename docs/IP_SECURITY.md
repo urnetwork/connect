@@ -86,7 +86,7 @@ For each egress packet, in order:
 2. **Public-unicast** — destination not globally reachable (§2.2.1) →
    **Incident** (`not-public`), except TCP to the synthetic speed server.
 3. **Provider-local** — provider role only (§2.2.2): destination is the provider
-   host, on one of its links or a port control anycast address → **Incident**
+   host, on one of its links or a service anycast address → **Incident**
    (`provider-local`); no read of the host's addresses has succeeded yet →
    **Drop** (`provider-local-unknown`).
 4. **CFAA layer** — `cfaa.inspect(destIp, destPort, proto, version)`:
@@ -115,7 +115,7 @@ Not public, IPv4:
 | `100.64.0.0/10` | shared address space (RFC 6598): carrier-grade NAT, tailscale peers and MagicDNS `100.100.100.100` |
 | `127.0.0.0/8` | loopback |
 | `169.254.0.0/16` | link local, with the cloud metadata endpoint |
-| `192.0.0.0/24` except `192.0.0.9/32` (PCP anycast, provider-local in the provider role, §2.2.2) and `192.0.0.10/32` (TURN anycast) | IETF protocol assignments: the 464XLAT prefix, the dummy address, NAT64 discovery |
+| `192.0.0.0/24` except `192.0.0.9/32` (PCP anycast) and `192.0.0.10/32` (TURN anycast), both provider-local in the provider role (§2.2.2) | IETF protocol assignments: the 464XLAT prefix, the dummy address, NAT64 discovery |
 | `192.88.99.2/32` | 6a44 relay anycast (RFC 6751) |
 | `198.18.0.0/15` | benchmarking (RFC 2544), also the fake-ip range of local proxies (Clash, sing-box, Surge) |
 | `224.0.0.0/4` | multicast |
@@ -128,7 +128,7 @@ Not public, IPv6:
 | `::/96` | unspecified, loopback, the deprecated IPv4-compatible form |
 | `64:ff9b::/96`, `64:ff9b:1::/48` | NAT64 (the well-known prefix embeds an IPv4 address; refused although the registry marks it reachable) |
 | `100::/64`, `100:0:0:1::/64` | discard-only (RFC 6666), dummy prefix (RFC 9780) |
-| `2001::/23` except `2001:1::1/128` (PCP anycast, provider-local in the provider role, §2.2.2), `2001:1::2/128`, `2001:1::3/128`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28` | IETF protocol assignments: Teredo `2001::/32`, benchmarking `2001:2::/48`, the deprecated ORCHID `2001:10::/28` |
+| `2001::/23` except `2001:1::1/128` (PCP anycast), `2001:1::2/128` (TURN anycast), `2001:1::3/128` (DNS-SD service registration anycast), all three provider-local in the provider role (§2.2.2), `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28` | IETF protocol assignments: Teredo `2001::/32`, benchmarking `2001:2::/48`, the deprecated ORCHID `2001:10::/28` |
 | `2001:db8::/32`, `3fff::/20` | documentation |
 | `2002::/16` | 6to4 (embeds an IPv4 address) |
 | `3ffe::/16` | the historical 6bone |
@@ -183,16 +183,20 @@ rule is still refused when it is this host or on one of its links:
   The message replaces the set, like `SetProviderObservedAddresses`.
   Non-public addresses are ignored, and at most 16 are kept, in order. A client
   older than the message type ignores it, as it ignores `CloseSequences`.
-- **Port control anycast.** `192.0.0.9` and `2001:1::1` (PCP, RFC 7723), the
-  only port control anycast the registries list (`providerLocalAnycastAddrs`).
-  The registries mark both globally reachable, so §2.2.1 admits them, but a
-  request to either is answered by the gateway in front of the sender, a home
-  router or an ISP's carrier-grade NAT, which maps a port of its public address
-  to the sender for whoever asks: through a provider, a consumer could open a
-  port to the provider host. They are local wherever the provider is, before
-  the first read too (an incident then, not the drop below). The TURN anycast
-  addresses (`192.0.0.10`, `2001:1::2`) and the DNS-SD service registration
-  anycast (`2001:1::3`) stay public (§6). Since rules generation 4.
+- **Service anycast.** Every anycast address the registries list for a service
+  the network in front of the sender provides (`providerLocalAnycastAddrs`):
+  port control (PCP, RFC 7723) `192.0.0.9` and `2001:1::1`, TURN (RFC 8155)
+  `192.0.0.10` and `2001:1::2`, and DNS-SD service registration (SRP,
+  RFC 9665) `2001:1::3`. The registries mark them globally reachable, so §2.2.1
+  admits them, but a request to one is answered by the provider's own network:
+  through a provider, a consumer could have the provider's gateway, a home
+  router or an ISP's carrier-grade NAT, map a port of its public address to the
+  provider host, allocate relays on that network's TURN server from inside it,
+  or publish services on the provider's links through its registrar. They and
+  their IPv4-mapped forms are local wherever the provider is, before the first
+  read too (an incident then, not the drop below). The registries' other
+  anycast, AS112 and AMT relays, are global services and stay public. Since
+  rules generation 4.
 - **Mapped addresses.** An IPv4-mapped IPv6 destination of a local IPv4 address
   is local.
 
@@ -233,7 +237,7 @@ them, could point those checks at this host or its LAN. So a peer's candidates
 are checked before Pion sees them (`transport_p2p_webrtc_candidate.go`), the
 trickled ones and the candidate lines of its offer or answer alike: the address
 must be public unicast (§2.2.1) and not provider-local (§2.2.2): not in this
-host's snapshot and not a port control anycast address; a hostname candidate is
+host's snapshot and not a service anycast address; a hostname candidate is
 dropped. A same-network peer
 (`ProvideMode_Network`, the user's own device) may offer any address, its LAN
 included, so a user's devices still connect directly on their own network. The
@@ -333,7 +337,7 @@ on its first packet and after every block:
   hand-maintained tables (the special-purpose registry tables of §2.2.1
   included); a change made only in detector code must be raised by hand.
   Generation 3 added the registry tables and the provider-local guard,
-  generation 4 the guard's port control anycast addresses.
+  generation 4 the guard's service anycast addresses.
 - **Feed-generated tables**, the CFAA blocklists (§3.3) and the Meta prefixes
   of the WhatsApp exception (§4.4.1a), are regenerated by every release build
   and identified only by `security_policy_hash`, which digests them. They are
@@ -1064,12 +1068,6 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   (`SetProviderObservedAddresses`). A default gateway outside every on-link
   prefix (a `/32` address with an on-link route) is not covered, nor is a home's
   other IPv4 subnets beyond the RFC 1918 and CGNAT blocks.
-- **Other service anycast stays public.** The provider role refuses port
-  control anycast (§2.2.2), but `192.0.0.10`/`2001:1::2` (TURN, RFC 8155) and
-  `2001:1::3` (DNS-SD service registration, RFC 9665) are globally reachable in
-  the registries and stay public. Where the provider's own network answers one
-  of them, a consumer reaches that network's TURN server or service registrar
-  through the provider.
 - **IPv6 reputation coverage is feed-limited.** Both families now have a reputation
   table, but public feeds carry far fewer IPv6 entries than IPv4 (currently ~200 v6
   ranges vs. ~64k v4), so IPv6 destinations lean more on the port policy in practice.
@@ -1132,16 +1130,17 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   same-network one, through each provider entry. The real entry point
   (`ip_provider_local_test.go`): `RemoteUserNatProvider.ClientReceive` never
   hands a frame to the provider's own addresses or an observed address to the
-  exit NAT, and still egresses a public destination. Port control anycast
-  (`ip_security_provider_anycast_test.go`): a PCP MAP request, TCP and an echo
-  to `192.0.0.9`, its mapped form and `2001:1::1` are provider-local incidents
+  exit NAT, and still egresses a public destination. Service anycast
+  (`ip_security_provider_anycast_test.go`): each service's request (PCP MAP,
+  TURN Allocate, an SRP update), TCP and an echo to every service anycast
+  address and the mapped forms of the IPv4 ones are provider-local incidents
   through each provider entry and at `ClientReceive`, before the first read
-  too, and refused as ICE candidates, while TURN anycast and the client role
-  are unchanged. The dial control (`ip_security_dial_test.go`): every class
-  of address it receives, failing closed before the first read, and as the
-  control of `ConnectSettings` and of a datagram dialer, names that resolve to
-  loopback, a private address, an observed address, the router or PCP anycast
-  refused before any socket connects.
+  too, and refused as ICE candidates, while AS112 and AMT anycast and the
+  client role are unchanged. The dial control (`ip_security_dial_test.go`):
+  every class of address it receives, failing closed before the first read,
+  and as the control of `ConnectSettings` and of a datagram dialer, names that
+  resolve to loopback, a private address, an observed address, the router or
+  PCP anycast refused before any socket connects.
   `TestSyntheticSpeedRangeIsNeverDialed`: the NAT never dials the benchmarking
   blocks.
 - **CFAA:** `TestCfaaPortClassification` (full port table), `TestCfaaBlockedIps` (IP

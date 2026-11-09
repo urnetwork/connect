@@ -36,8 +36,9 @@ import (
 // public-destination rule (ip_security_public.go) and the provider-local
 // guard (ip_security_local.go).
 //
-// Generation 4 (2026-11-09): the port control anycast addresses are
-// provider-local (ip_security_local.go, providerLocalAnycastAddrs).
+// Generation 4 (2026-11-09): the service anycast addresses, port control,
+// TURN and DNS-SD service registration, are provider-local
+// (ip_security_local.go, providerLocalAnycastAddrs).
 const SecurityPolicyRulesGeneration uint64 = 4
 
 // The rules generation a policy enforces:

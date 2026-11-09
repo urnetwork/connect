@@ -78,7 +78,8 @@ var publicIpv4Exceptions = []netip.Prefix{
 	// port control protocol anycast (RFC 7723), provider-local in the provider
 	// role (ip_security_local.go)
 	netip.MustParsePrefix("192.0.0.9/32"),
-	// traversal using relays around nat anycast (RFC 8155)
+	// traversal using relays around nat anycast (RFC 8155), provider-local in
+	// the provider role (ip_security_local.go)
 	netip.MustParsePrefix("192.0.0.10/32"),
 }
 
@@ -127,9 +128,11 @@ var publicIpv6Exceptions = []netip.Prefix{
 	// port control protocol anycast (RFC 7723), provider-local in the provider
 	// role (ip_security_local.go)
 	netip.MustParsePrefix("2001:1::1/128"),
-	// traversal using relays around nat anycast (RFC 8155)
+	// traversal using relays around nat anycast (RFC 8155), provider-local in
+	// the provider role (ip_security_local.go)
 	netip.MustParsePrefix("2001:1::2/128"),
-	// dns-sd service registration protocol anycast (RFC 9665)
+	// dns-sd service registration protocol anycast (RFC 9665), provider-local
+	// in the provider role (ip_security_local.go)
 	netip.MustParsePrefix("2001:1::3/128"),
 	// automatic multicast tunneling (RFC 7450)
 	netip.MustParsePrefix("2001:3::/32"),

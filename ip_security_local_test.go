@@ -636,7 +636,7 @@ func TestProcessProviderLocalLoopStaysOutOfBubbles(t *testing.T) {
 }
 
 // The per-packet check never allocates: the public rule, the guard on a hit
-// and a miss of both families and the mapped form, the port control anycast
+// and a miss of both families and the mapped form, the service anycast
 // addresses, and the provider policy's refusal of a local destination.
 func TestProviderLocalCheckZeroAlloc(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -657,6 +657,8 @@ func TestProviderLocalCheckZeroAlloc(t *testing.T) {
 		net.ParseIP("192.0.0.9").To4(),
 		net.ParseIP("::ffff:192.0.0.9"),
 		net.ParseIP("2001:1::1"),
+		net.ParseIP("192.0.0.10").To4(),
+		net.ParseIP("2001:1::3"),
 	}
 	if allocs := testing.AllocsPerRun(1000, func() {
 		for _, destination := range destinations {

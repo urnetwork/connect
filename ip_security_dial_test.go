@@ -38,7 +38,7 @@ func assertProviderDialRefused(t *testing.T, err error, address string, reason S
 
 // Every address the control receives: not public, provider-local (the host,
 // its links, the /56 around its IPv6 address, an observed address in both
-// forms, port control anycast) and public.
+// forms, service anycast) and public.
 func TestProviderDialControlRefusesNonPublicAndLocalAddresses(t *testing.T) {
 	networks, _ := newTestProviderLocalNetworks(t, newTestProviderLocalRead(t, "2a01:4f8:c17:1234::10/64", "198.51.100.20/32"))
 	networks.setObservedAddresses([]netip.Addr{netip.MustParseAddr("203.0.113.77")})
@@ -69,9 +69,14 @@ func TestProviderDialControlRefusesNonPublicAndLocalAddresses(t *testing.T) {
 		{address: "[::ffff:203.0.113.77]:443", reason: SecurityPolicyReasonProviderLocal},
 		{address: "192.0.0.9:5351", reason: SecurityPolicyReasonProviderLocal},
 		{address: "[2001:1::1]:5351", reason: SecurityPolicyReasonProviderLocal},
+		{address: "192.0.0.10:3478", reason: SecurityPolicyReasonProviderLocal},
+		{address: "[::ffff:192.0.0.10]:3478", reason: SecurityPolicyReasonProviderLocal},
+		{address: "[2001:1::2]:3478", reason: SecurityPolicyReasonProviderLocal},
+		{address: "[2001:1::3]:53", reason: SecurityPolicyReasonProviderLocal},
 		{address: "198.51.100.7:443", allowed: true},
 		{address: "[2001:4860:4860::8888]:443", allowed: true},
-		{address: "192.0.0.10:3478", allowed: true},
+		// global anycast no network in front of a provider answers: as112
+		{address: "192.31.196.1:53", allowed: true},
 	} {
 		err := control("tcp", c.address, nil)
 		if c.allowed {
