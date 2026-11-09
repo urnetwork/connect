@@ -252,7 +252,9 @@ refused when it is the provider host or on one of its links
 interface prefix, at least the `/56` around every IPv6 address
 (`ProviderLocalSecurityPolicySettings.Ipv6PrefixBits`) even when the
 interface reports a `/128`, the addresses the platform observes the host
-connecting from, and the v4-mapped form of a local IPv4 address.
+connecting from, the port control anycast addresses (`192.0.0.9`,
+`2001:1::1`), which the gateway in front of the host answers, and the
+v4-mapped form of a local IPv4 address.
 
 C5. DoH. Populate `RemoteDohUrlsIpv6`, `RemoteDnsIpv6` and `LocalDnsIpv6`
 with the v6 endpoints of the existing operators; `DefaultDohSettings().

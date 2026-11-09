@@ -23,7 +23,9 @@ package connect
 //     (SetProviderObservedAddresses): an IPv4 one as itself, an IPv6 one as
 //     the IPv6 prefix above. Behind a NAT that is the router's public address,
 //     which a consumer would otherwise reach by hairpin NAT, and in a
-//     container it is the host's.
+//     container it is the host's;
+//   - the port control anycast addresses (providerLocalAnycastAddrs), which
+//     the gateway in front of this host answers, snapshot or not.
 //
 // A non-public interface address (RFC 1918, CGNAT, ULA, link-local, ...)
 // contributes nothing: its link is inside a block the public rule already
@@ -68,6 +70,27 @@ import (
 // The width of an IPv6 subnet (RFC 4291): the local prefix around an IPv6
 // address is never narrower.
 const ipv6SubnetBits = 64
+
+// The port control anycast addresses (PCP, RFC 7723), 192.0.0.9 and 2001:1::1,
+// the only port control anycast the IANA special-purpose registries list
+// (checked 2026-11-09). The registries mark both globally reachable, so the
+// public rule admits them (ip_security_public.go). But a request to either is
+// answered by the gateway in front of the sender, a home router or an ISP's
+// carrier-grade NAT, which maps a port of its public address to the sender
+// for whoever asks. From a provider, the sender is the provider host. They are
+// local wherever the provider is, with or without a snapshot. The TURN anycast
+// addresses (192.0.0.10, 2001:1::2) and the DNS-SD service registration
+// anycast (2001:1::3) stay public.
+var providerLocalAnycastAddrs = []netip.Addr{
+	netip.MustParseAddr("192.0.0.9"),
+	netip.MustParseAddr("2001:1::1"),
+}
+
+// isProviderLocalAnycastAddr reports whether addr, or the IPv4 address it
+// maps, is a port control anycast address. It never allocates.
+func isProviderLocalAnycastAddr(addr netip.Addr) bool {
+	return slices.Contains(providerLocalAnycastAddrs, addr.Unmap().WithZone(""))
+}
 
 // ProviderLocalSecurityPolicySettings configures the provider-local guard of
 // the provider role's policy (DefaultProviderSecurityPolicy). The client role
@@ -350,12 +373,19 @@ func (self *providerLocalNetworks) setObservedAddresses(addrs []netip.Addr) {
 }
 
 // containsAddr reports whether addr is this host or on one of its links in
-// the current snapshot, at the default provider policy's IPv6 width. Before
-// the first read it reports false: a caller that must fail closed uses a
-// guard instead. Not for the packet path: it allocates.
+// the current snapshot, at the default provider policy's IPv6 width, or a
+// port control anycast address. Before the first read it reports false for
+// all but the anycast addresses: a caller that must fail closed uses a guard
+// instead. Not for the packet path: it allocates.
 func (self *providerLocalNetworks) containsAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	if isProviderLocalAnycastAddr(addr) {
+		return true
+	}
 	snapshot := self.snapshot.Load()
-	if snapshot == nil || !addr.IsValid() {
+	if snapshot == nil {
 		return false
 	}
 	return snapshot.contains(net.IP(addr.Unmap().AsSlice()), DefaultProviderLocalSecurityPolicySettings().effectiveIpv6PrefixBits())
@@ -455,7 +485,8 @@ type providerLocalVerdict int
 const (
 	// not this host and not on its links
 	providerLocalNo providerLocalVerdict = iota
-	// this host, on one of its links, or an observed address
+	// this host, on one of its links, an observed address or a port control
+	// anycast address
 	providerLocalYes
 	// no read of this host's addresses has succeeded yet
 	providerLocalUnknown
@@ -464,6 +495,9 @@ const (
 // inspect judges a destination the public rule admitted. It never blocks or
 // allocates.
 func (self *providerLocalGuard) inspect(ip net.IP) providerLocalVerdict {
+	if addr, ok := netip.AddrFromSlice(ip); ok && isProviderLocalAnycastAddr(addr) {
+		return providerLocalYes
+	}
 	snapshot := self.networks.snapshot.Load()
 	if snapshot == nil {
 		return providerLocalUnknown

@@ -35,7 +35,10 @@ import (
 // Generation 3 (2026-11-09): the special-purpose registry tables of the
 // public-destination rule (ip_security_public.go) and the provider-local
 // guard (ip_security_local.go).
-const SecurityPolicyRulesGeneration uint64 = 3
+//
+// Generation 4 (2026-11-09): the port control anycast addresses are
+// provider-local (ip_security_local.go, providerLocalAnycastAddrs).
+const SecurityPolicyRulesGeneration uint64 = 4
 
 // The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,

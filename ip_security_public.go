@@ -75,7 +75,8 @@ var nonPublicIpv4Prefixes = []netip.Prefix{
 // publicIpv4Exceptions are the globally reachable blocks inside
 // nonPublicIpv4Prefixes.
 var publicIpv4Exceptions = []netip.Prefix{
-	// port control protocol anycast (RFC 7723)
+	// port control protocol anycast (RFC 7723), provider-local in the provider
+	// role (ip_security_local.go)
 	netip.MustParsePrefix("192.0.0.9/32"),
 	// traversal using relays around nat anycast (RFC 8155)
 	netip.MustParsePrefix("192.0.0.10/32"),
@@ -123,7 +124,8 @@ var nonPublicIpv6Prefixes = []netip.Prefix{
 // publicIpv6Exceptions are the globally reachable blocks inside
 // nonPublicIpv6Prefixes (all inside 2001::/23).
 var publicIpv6Exceptions = []netip.Prefix{
-	// port control protocol anycast (RFC 7723)
+	// port control protocol anycast (RFC 7723), provider-local in the provider
+	// role (ip_security_local.go)
 	netip.MustParsePrefix("2001:1::1/128"),
 	// traversal using relays around nat anycast (RFC 8155)
 	netip.MustParsePrefix("2001:1::2/128"),
