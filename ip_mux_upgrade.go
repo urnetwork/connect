@@ -102,6 +102,43 @@ type DnsUpgradeSettings struct {
 	// during startup, which can reveal those lookups to the local network. nil (the default)
 	// disables the fallback: DNS then resolves only through the tunnel.
 	Fallback *DnsResolverSettings
+	// Limits Fallback to the connect window: it races a query only while the
+	// tunnel is not ready (see UpgradeMux.SetTunnelReady), and once the tunnel
+	// is ready only the tunnel resolvers answer. The device sets it while a
+	// third-party preset is selected (ADBLOCK3RD decision 5), with Fallback
+	// set to URnetwork's default resolver on the host network: the preset
+	// provider then never sees the user's own address, and once connected an
+	// unfiltered resolver never races a filtering preset's answers. False, the
+	// default, races Fallback for every query, as before.
+	FallbackUntilTunnelReady bool
+	// The resolver the mux falls back to, through the tunnel, while Resolver
+	// is failing (ResolverFailingMinCount, ResolverFailingMinDuration) and
+	// once Failover itself has answered. Queries go to one resolver at a time
+	// and never share a fan-out. While failed over, the mux probes Resolver
+	// every FailoverProbeInterval and returns to it at its first answer; a
+	// network change or a settings swap starts again on Resolver. Never
+	// plaintext and never the host network: it is a tunnel DoH resolver like
+	// Resolver. nil, the default, fails closed: a failing Resolver is retried,
+	// never replaced. The device sets URnetwork's default resolver here for
+	// an ad-blocking or unfiltered preset (ADBLOCK3RD C2, decision 3).
+	Failover *DnsResolverSettings
+	// How many consecutive failed resolutions make Resolver failing. A
+	// failure counts only while the tunnel is ready (UpgradeMux.SetTunnelReady)
+	// both when the resolution starts and when it fails; a resolution canceled
+	// because another path answered first is not a failure, an answer served
+	// stale is, and a cache hit is no evidence either way. Any fresh answer
+	// clears the run. Non-positive disables failure detection: Resolver never
+	// reports failing, so Failover never engages.
+	ResolverFailingMinCount int
+	// The least time a run of consecutive failures must span, from the start
+	// of its first failed resolution to the latest failure, before Resolver is
+	// failing, so that one burst of lookups failing together is not enough.
+	// Non-positive lets ResolverFailingMinCount alone decide.
+	ResolverFailingMinDuration time.Duration
+	// How often the mux probes Resolver while failed over to Failover; the
+	// first answer switches back. Non-positive never probes, so the mux stays
+	// failed over until a network change or a settings swap.
+	FailoverProbeInterval time.Duration
 	// MemoryTarget, when set, is the owner's live dns byte budget, shared by
 	// the mux's tunnel and fallback resolver caches: every in-flight DoH
 	// request reserves the response read ceiling from it, so the owner's
@@ -178,6 +215,23 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// no host-network fallback by default: DNS resolves only through the tunnel.
 			// The owner opts in by setting Fallback (see DefaultDnsUpgradeFallbackSettings)
 			Fallback: nil,
+			// a Fallback, when set, races for every query unless the owner limits it
+			// to the connect window
+			FallbackUntilTunnelReady: false,
+			// no failover resolver by default: a failing resolver fails closed
+			Failover: nil,
+			// a page load asks A and AAAA for a few names at once, so four failures
+			// in a row is a handful of lookups, not one name's pair
+			ResolverFailingMinCount: 4,
+			// and those failures span ten seconds from the start of the first, so
+			// one burst failing together (a dial timeout shared by every lookup in
+			// flight) needs one more failure later to count, while a provider that
+			// black-holes the exit still trips on its first dial timeout (30s)
+			ResolverFailingMinDuration: 10 * time.Second,
+			// far below the cold prober's five minute cap: a failed over preset
+			// returns within half a minute of answering again, at the cost of one
+			// small query per server each interval
+			FailoverProbeInterval: 30 * time.Second,
 		},
 		Http: &HttpUpgradeSettings{Mode: HttpUpgradeUnencrypted},
 	}
@@ -298,6 +352,19 @@ type UpgradeMux struct {
 	// blocker. A NOERROR with no records (not NXDOMAIN) keeps the A answer
 	// for the same name valid.
 	ipv6Unroutable atomic.Pointer[func() bool]
+
+	// tunnelReady, when set, reports whether the tunnel is ready to carry
+	// traffic (SetTunnelReady). Installed by the device outside the swappable
+	// settings, like ipv6Unroutable. nil counts as not ready.
+	tunnelReady atomic.Pointer[func() bool]
+
+	// resolverHealthCallbacks are called with the new health on a state change
+	// (see ip_mux_upgrade_resolver_health.go)
+	resolverHealthCallbacks *CallbackList[DnsResolverHealthFunction]
+
+	// blockedAnswerCount counts the block answers delivered to clients by this
+	// mux (DnsResolverHealth.BlockedAnswerCount)
+	blockedAnswerCount atomic.Uint64
 
 	// fallbackDohCache resolves over the local host egress (not the tun); the handicapped local
 	// fallback used when the tunnel-DoH is slow to come up. nil when no Fallback is configured.
@@ -493,16 +560,17 @@ func NewUpgradeMux(
 	// while the tunnel is still establishing
 	tunSettings.DialRace = 1
 	self := &UpgradeMux{
-		ctx:                  cancelCtx,
-		cancel:               cancel,
-		source:               source,
-		provideMode:          provideMode,
-		inflight:             map[DohKey]*dnsFlight{},
-		dnsTcpSem:            make(chan struct{}, maxDnsTcpConnections),
-		dnsTcpFlows:          map[dnsTcpFlowKey]dnsTcpFlow{},
-		dnsProberWake:        make(chan struct{}, 1),
-		dnsProbeInitialDelay: dnsColdProbeInitialInterval,
-		dnsProbeMaxDelay:     dnsColdProbeMaxInterval,
+		ctx:                     cancelCtx,
+		cancel:                  cancel,
+		source:                  source,
+		provideMode:             provideMode,
+		inflight:                map[DohKey]*dnsFlight{},
+		dnsTcpSem:               make(chan struct{}, maxDnsTcpConnections),
+		dnsTcpFlows:             map[dnsTcpFlowKey]dnsTcpFlow{},
+		dnsProberWake:           make(chan struct{}, 1),
+		dnsProbeInitialDelay:    dnsColdProbeInitialInterval,
+		dnsProbeMaxDelay:        dnsColdProbeMaxInterval,
+		resolverHealthCallbacks: NewCallbackList[DnsResolverHealthFunction](),
 	}
 	self.markTunnelDohUnproven()
 	self.settings.Store(settings)

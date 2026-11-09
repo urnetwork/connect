@@ -374,6 +374,18 @@ type DnsResolverSettings struct {
 	RemoteDnsIpv6     []string `json:"remote_dns_ipv6,omitempty"`
 	LocalDnsIpv4      []string `json:"local_dns_ipv4,omitempty"`
 	LocalDnsIpv6      []string `json:"local_dns_ipv6,omitempty"`
+	// The addresses a hostname-form DoH server is dialed at, by host: lower
+	// case, as in the url, without a port. A listed host is never looked up,
+	// not over remote plain dns, not with the host's resolver and not over
+	// DoH, on any path: every DoH client dials the host's addresses of the
+	// dial's family, and a lookup of the host through the cache answers them
+	// authoritatively for the query's family, so a family with no address
+	// answers empty and the dial uses the other. TLS still verifies the server
+	// against the host name. A listed host with no usable address fails
+	// closed; an address that does not parse is ignored. Nil pins nothing: an
+	// unlisted hostname resolves as before (see DohCache.resolve). The device
+	// sets it for the DoH hosts of the third-party presets (ADBLOCK3RD B1).
+	DohServerHostAddrs map[string][]string `json:"doh_server_host_addrs,omitempty"`
 
 	// TlsConfig, if set, is used by the DoH HTTP clients — production cert pinning,
 	// or trusting a local server's cert in tests. Not serialized.
@@ -2417,6 +2429,19 @@ func dnsResponsePolicyEde(p *dnsmessage.Parser) bool {
 			}
 		}
 	}
+}
+
+// A DoH url as it may appear in a log, an error or a feedback upload: the
+// scheme and the host (with its port), never the user info, path, query or
+// fragment, so a personal configuration id in the path (ADBLOCK3RD D1, B7)
+// never leaves the device. A url that does not parse as one with a host is
+// replaced by a fixed placeholder rather than echoed.
+func DohUrlForLog(dohUrl string) string {
+	u, err := url.Parse(strings.TrimSpace(dohUrl))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<doh url>"
+	}
+	return strings.ToLower(u.Scheme) + "://" + u.Host
 }
 
 // A DoH url as an endpoint key: lower case scheme, the host (an ip in its
