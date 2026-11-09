@@ -3066,10 +3066,15 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			}
 		}
 
+		// a foreign flow goes before a local one when the hook takes shares
+		var udpShedFirst func(*UdpSequence) bool
+		if shedFirst := self.egress.shedFirst(); shedFirst != nil {
+			udpShedFirst = func(sequence *UdpSequence) bool { return shedFirst(sequence.provideMode) }
+		}
 		if 0 < self.udpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.udpBufferSettings.UserLimit <= len(sourceSequences) {
-				applyLruMapLimit(sourceSequences, self.udpBufferSettings.UserLimit-1, func(bufferId BufferId, sequence *UdpSequence) bool {
+				applyLruMapLimitPreferring(sourceSequences, self.udpBufferSettings.UserLimit-1, udpShedFirst, func(bufferId BufferId, sequence *UdpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]udp limit source %s->%s\n",
@@ -3089,7 +3094,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			// limit the total connections across all sources, an aggregate
 			// flow state and fd ceiling
 			if self.udpBufferSettings.GlobalLimit <= len(self.sequences) {
-				applyLruMapLimit(self.sequences, self.udpBufferSettings.GlobalLimit-1, func(bufferId BufferId, sequence *UdpSequence) bool {
+				applyLruMapLimitPreferring(self.sequences, self.udpBufferSettings.GlobalLimit-1, udpShedFirst, func(bufferId BufferId, sequence *UdpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]udp limit global %s->%s\n",
@@ -4914,10 +4919,15 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		// 		delete(self.sourceSequences, sequence.source)
 		// 	}
 		// }
+		// a foreign flow goes before a local one when the hook takes shares
+		var tcpShedFirst func(*TcpSequence) bool
+		if shedFirst := self.egress.shedFirst(); shedFirst != nil {
+			tcpShedFirst = func(sequence *TcpSequence) bool { return shedFirst(sequence.provideMode) }
+		}
 		if 0 < self.tcpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit <= len(sourceSequences) {
-				applyLruMapLimit(sourceSequences, self.tcpBufferSettings.UserLimit-1, func(bufferId BufferId, sequence *TcpSequence) bool {
+				applyLruMapLimitPreferring(sourceSequences, self.tcpBufferSettings.UserLimit-1, tcpShedFirst, func(bufferId BufferId, sequence *TcpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]tcp limit source %s->%s\n",
@@ -4937,7 +4947,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 			// limit the total connections across all sources, an aggregate
 			// flow state and fd ceiling
 			if self.tcpBufferSettings.GlobalLimit <= len(self.sequences) {
-				applyLruMapLimit(self.sequences, self.tcpBufferSettings.GlobalLimit-1, func(bufferId BufferId, sequence *TcpSequence) bool {
+				applyLruMapLimitPreferring(self.sequences, self.tcpBufferSettings.GlobalLimit-1, tcpShedFirst, func(bufferId BufferId, sequence *TcpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]tcp limit global %s->%s\n",
@@ -9624,6 +9634,29 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 	return fallback
 }
 
+// A return of a flow the egress hook passed or mapped for a FriendsAndFamily
+// source (C18). Its replies come from a share's private address, which the
+// reversed policy's source check would refuse, so they are admitted on the
+// hook's decision alone; a flow the hook denied, or one it never decided, gets
+// the policy as before.
+func shareEgressReturn(ipPath *IpPath, provideMode protocol.ProvideMode) bool {
+	return ipPath != nil && ipPath.egressAdmitted && provideMode == protocol.ProvideMode_FriendsAndFamily
+}
+
+// The mode a flow's returns ride: its source's recorded mode, except that a
+// share's flow keeps its own, since a share never normalizes to Network
+// (sidecar design §6.10.1).
+func (self *RemoteUserNatProvider) flowReturnProvideMode(
+	sourceId Id,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+) protocol.ProvideMode {
+	if shareEgressReturn(ipPath, provideMode) {
+		return provideMode
+	}
+	return self.sourceReturnProvideMode(sourceId, provideMode)
+}
+
 // Derives the provider's return contract, reproducing the session the client
 // opened and not the lane it opened on. The authenticated source remains
 // separate.
@@ -10063,6 +10096,18 @@ func (self *RemoteUserNatProvider) inspectReturnPacketsForSender(
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
 ) (SecurityPolicyResult, error) {
+	return self.inspectReturnPacketsForFlow(senderClientId, provideMode, packets, false)
+}
+
+// inspectReturnPacketsForSender for one flow's packets. A share's return
+// (shareEgressReturn) is admitted without the policy, whose source check would
+// refuse its private address; its packets still retire SMTP state.
+func (self *RemoteUserNatProvider) inspectReturnPacketsForFlow(
+	senderClientId Id,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	shareReturn bool,
+) (SecurityPolicyResult, error) {
 	var returnIpPath *IpPath
 	for _, packet := range packets {
 		packetIpPath, err := ParseIpPath(packet)
@@ -10076,6 +10121,9 @@ func (self *RemoteUserNatProvider) inspectReturnPacketsForSender(
 	}
 	if returnIpPath == nil {
 		return SecurityPolicyResultDrop, errors.New("empty provider return packet group")
+	}
+	if shareReturn {
+		return SecurityPolicyResultAllow, nil
 	}
 	return inspectAndRefreshEgressForSenderBorrowed(
 		self.securityPolicy,
@@ -10107,13 +10155,16 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 		return false
 	}
 	self.smtpIngressGuard.retireReturnForOwner(source.SourceId, returnIpPath)
-	r, err := inspectAndRefreshEgressForSenderBorrowed(
-		self.securityPolicy,
-		source.SourceId,
-		provideMode,
-		*returnIpPath,
-		nil,
-	)
+	r, err := SecurityPolicyResultAllow, error(nil)
+	if !shareEgressReturn(canonicalIpPath, provideMode) {
+		r, err = inspectAndRefreshEgressForSenderBorrowed(
+			self.securityPolicy,
+			source.SourceId,
+			provideMode,
+			*returnIpPath,
+			nil,
+		)
+	}
 	if err != nil {
 		return false
 	}
@@ -10128,7 +10179,7 @@ func (self *RemoteUserNatProvider) enqueueFragmentedReturn(
 		return false
 	}
 
-	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+	returnProvideMode := self.flowReturnProvideMode(source.SourceId, provideMode, canonicalIpPath)
 	returnTransferKey := providerReplyTransferKey(transferKey, returnProvideMode)
 	item := self.takeReturnItemForPackets(fragments, recoveryMode)
 	if item == nil {
@@ -10241,10 +10292,11 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	// chunking and keeps a single routing/admission decision for the group.
 	// Every member has the same reverse tuple. Scan all members so a trailing
 	// FIN/RST retires SMTP state before the flow-level policy decision.
-	r, err := self.inspectReturnPacketsForSender(
+	r, err := self.inspectReturnPacketsForFlow(
 		source.SourceId,
 		provideMode,
 		packets,
+		shareEgressReturn(ipPath, provideMode),
 	)
 	if err != nil {
 		return
@@ -10260,7 +10312,7 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 		return
 	}
 
-	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+	returnProvideMode := self.flowReturnProvideMode(source.SourceId, provideMode, ipPath)
 	returnTransferKey := providerReplyTransferKey(transferKey, returnProvideMode)
 	item := self.takeReturnItemForPackets(packets, recoveryMode)
 	if item == nil {
@@ -10442,10 +10494,12 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	// the provider's egress is the return into the tunnel (destination->client); the reversed
 	// provider policy applies the client-ingress source check here, then refreshes the flow so an
 	// active download isn't reclaimed while the outbound side is quiet
-	r, err := self.inspectReturnPacketsForSender(
+	shareReturn := shareEgressReturn(ipPath, provideMode)
+	r, err := self.inspectReturnPacketsForFlow(
 		source.SourceId,
 		provideMode,
 		[][]byte{packet},
+		shareReturn,
 	)
 	if err != nil {
 		// ParseIpPath rejects icmp errors. The one this provider originates
@@ -10455,13 +10509,16 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 		if !ok {
 			return
 		}
-		r, err = inspectAndRefreshEgressForSenderBorrowed(
-			self.securityPolicy,
-			source.SourceId,
-			provideMode,
-			*returnIpPath,
-			nil,
-		)
+		r, err = SecurityPolicyResultAllow, nil
+		if !shareReturn {
+			r, err = inspectAndRefreshEgressForSenderBorrowed(
+				self.securityPolicy,
+				source.SourceId,
+				provideMode,
+				*returnIpPath,
+				nil,
+			)
+		}
 		if err != nil {
 			return
 		}
@@ -10478,7 +10535,7 @@ func (self *RemoteUserNatProvider) receiveTransferWithRecoveryAndRelease(
 	// which uses the network relationship (no companion contract) so the device
 	// receives it as network mode and skips the public ingress rules. Other
 	// modes ride a companion contract (verified as Stream) as before.
-	returnProvideMode := self.sourceReturnProvideMode(source.SourceId, provideMode)
+	returnProvideMode := self.flowReturnProvideMode(source.SourceId, provideMode, ipPath)
 	returnTransferKey := providerReplyTransferKey(transferKey, returnProvideMode)
 	item := self.takeReturnItemForPackets([][]byte{packet}, recoveryMode)
 	if item == nil {
@@ -10563,6 +10620,11 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	egressSource := newEgressSource(peer)
 
 	provideMode := peer.ProvideMode
+	// C18: a hook that takes FriendsAndFamily flows to private destinations
+	// decides them in place of the public rules, which would make each one
+	// an incident (`EgressHook.FriendsAndFamilyEgress`).
+	shareEgress := provideMode == protocol.ProvideMode_FriendsAndFamily &&
+		self.localUserNat.egress.friendsAndFamilyEgress()
 	// One observation per delivered Pack is enough. The former call inside
 	// every packet case serialized a large coalesced return batch on this
 	// provider-global lock even though every frame has the same source and
@@ -10642,13 +10704,16 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 					var ipPath IpPath
 					payload, parseErr := parseIpPathWithPayloadBorrowed(result.packet, &ipPath)
 					if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
-						r, inspectErr := inspectAndRefreshIngressForSenderBorrowed(
-							self.securityPolicy,
-							source.SourceId,
-							provideMode,
-							ipPath,
-							payload,
-						)
+						r, inspectErr := SecurityPolicyResultAllow, error(nil)
+						if !shareEgress || !egressPrivateAddress(ipPath.DestinationIp) {
+							r, inspectErr = inspectAndRefreshIngressForSenderBorrowed(
+								self.securityPolicy,
+								source.SourceId,
+								provideMode,
+								ipPath,
+								payload,
+							)
+						}
 						if inspectErr == nil && r == SecurityPolicyResultAllow {
 							if 0 < len(result.fragments) && appendIpPacketGroup(
 								&packetGroups,
@@ -10746,14 +10811,18 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 					continue
 				}
 				// the provider's ingress is the remote client's egress (outbound, received from the
-				// tunnel); the reversed provider policy applies the client-egress DPI here
-				r, err := inspectAndRefreshIngressForSenderBorrowed(
-					self.securityPolicy,
-					source.SourceId,
-					provideMode,
-					ipPath,
-					payload,
-				)
+				// tunnel); the reversed provider policy applies the client-egress DPI here, except
+				// to a share's flow to a private destination, which the egress hook decides
+				r, err := SecurityPolicyResultAllow, error(nil)
+				if !shareEgress || !egressPrivateAddress(ipPath.DestinationIp) {
+					r, err = inspectAndRefreshIngressForSenderBorrowed(
+						self.securityPolicy,
+						source.SourceId,
+						provideMode,
+						ipPath,
+						payload,
+					)
+				}
 				if err == nil {
 					switch r {
 					case SecurityPolicyResultAllow:
@@ -11580,6 +11649,10 @@ type IpPath struct {
 	// Its queue keeps optional credit through every borrowed batch; the base
 	// flow claim remains owned until every callback worker joins.
 	tcpReturnBatchWorkspace *tcpReturnBatchWorkspace
+	// The egress hook passed or mapped this flow. Only a flow's own path
+	// carries it, written before the flow's first reply; a provider's return
+	// path reads it to admit a share's replies (C18).
+	egressAdmitted bool
 }
 
 func ParseIpPath(ipPacket []byte) (*IpPath, error) {
@@ -12028,11 +12101,27 @@ func applyLruMapLimit[K comparable, R UserLimited](
 	limit int,
 	limitCallback func(K, R) bool,
 ) {
+	applyLruMapLimitPreferring(resources, limit, nil, limitCallback)
+}
+
+// applyLruMapLimit that sheds what `prefer` selects first: the oldest selected
+// resource of the same bounded sample goes before any other, and a sample with
+// none falls back to its oldest. A nil `prefer` is applyLruMapLimit.
+func applyLruMapLimitPreferring[K comparable, R UserLimited](
+	resources map[K]R,
+	limit int,
+	prefer func(R) bool,
+	limitCallback func(K, R) bool,
+) {
 	for limit < len(resources) {
 		var oldestKey K
 		var oldest R
 		var oldestTime time.Time
 		found := false
+		var preferredKey K
+		var preferred R
+		var preferredTime time.Time
+		preferredFound := false
 		sampled := 0
 		for key, resource := range resources {
 			activityTime := resource.LastActivityTime()
@@ -12042,13 +12131,37 @@ func applyLruMapLimit[K comparable, R UserLimited](
 				oldestTime = activityTime
 				found = true
 			}
+			if prefer != nil && prefer(resource) && (!preferredFound || activityTime.Before(preferredTime)) {
+				preferredKey = key
+				preferred = resource
+				preferredTime = activityTime
+				preferredFound = true
+			}
 			sampled += 1
 			if lruEvictionSampleSize <= sampled {
 				break
 			}
 		}
+		if preferredFound {
+			oldestKey = preferredKey
+			oldest = preferred
+		}
 		if !found || !limitCallback(oldestKey, oldest) {
 			return
 		}
+	}
+}
+
+// What a flow table at its cap sheds first: with a hook that takes
+// FriendsAndFamily flows (C18), a foreign flow before a local one (sidecar
+// design §17.9); otherwise nothing is preferred. It reads the hook's answer as
+// last asked, never the hook itself, since a flow table calls it under its
+// mutex. Nil-safe.
+func (self *localUserNatEgress) shedFirst() func(protocol.ProvideMode) bool {
+	if self == nil || !self.foreignFirst.Load() {
+		return nil
+	}
+	return func(provideMode protocol.ProvideMode) bool {
+		return provideMode == protocol.ProvideMode_FriendsAndFamily
 	}
 }

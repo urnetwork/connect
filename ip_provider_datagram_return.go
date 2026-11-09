@@ -88,7 +88,7 @@ func (sender *providerDatagramSender) prepareUdp(sequence *UdpSequence, readByte
 		provider.memoryOperations.finish()
 		return nil, false
 	}
-	provideMode := provider.sourceReturnProvideMode(source.SourceId, sequence.provideMode)
+	provideMode := provider.flowReturnProvideMode(source.SourceId, sequence.provideMode, sequence.IpPath())
 	return &providerDatagramReturn{
 		sender: sender, flowContext: sequence.ctx, path: *sequence.IpPath(), prepared: credit, released: released,
 		item: providerReturnItem{
@@ -253,8 +253,11 @@ func (owner *providerDatagramReturn) step(retry time.Duration) bool {
 		// Inspect the same real server-to-client identity as the legacy path,
 		// including fragmented datagrams, without a second reassembly queue.
 		path := owner.path.ReverseValue()
-		result, err := inspectAndRefreshEgressForSenderBorrowed(provider.securityPolicy,
-			owner.item.source.SourceId, owner.item.provideMode, path, nil)
+		result, err := SecurityPolicyResultAllow, error(nil)
+		if !shareEgressReturn(&owner.path, owner.item.provideMode) {
+			result, err = inspectAndRefreshEgressForSenderBorrowed(provider.securityPolicy,
+				owner.item.source.SourceId, owner.item.provideMode, path, nil)
+		}
 		if err != nil || result != SecurityPolicyResultAllow {
 			provider.countBlockEgress(int64(len(owner.item.packets)), int64(owner.item.packetByteCount))
 			provider.recordProviderBlock(owner.item.source.SourceId, false, len(owner.item.packets), owner.item.packetByteCount)

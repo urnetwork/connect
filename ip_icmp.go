@@ -370,10 +370,15 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			}
 		}
 
+		// a foreign flow goes before a local one when the hook takes shares
+		var icmpShedFirst func(*IcmpSequence) bool
+		if shedFirst := self.egress.shedFirst(); shedFirst != nil {
+			icmpShedFirst = func(sequence *IcmpSequence) bool { return shedFirst(sequence.provideMode) }
+		}
 		if 0 < self.icmpBufferSettings.UserLimit {
 			// limit the total flows per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.icmpBufferSettings.UserLimit <= len(sourceSequences) {
-				applyLruMapLimit(sourceSequences, self.icmpBufferSettings.UserLimit-1, func(bufferId BufferId, sequence *IcmpSequence) bool {
+				applyLruMapLimitPreferring(sourceSequences, self.icmpBufferSettings.UserLimit-1, icmpShedFirst, func(bufferId BufferId, sequence *IcmpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]icmp limit source %s->%s\n",
@@ -390,7 +395,7 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			// limit the total flows across all sources, an aggregate flow
 			// and fd ceiling
 			if self.icmpBufferSettings.GlobalLimit <= len(self.sequences) {
-				applyLruMapLimit(self.sequences, self.icmpBufferSettings.GlobalLimit-1, func(bufferId BufferId, sequence *IcmpSequence) bool {
+				applyLruMapLimitPreferring(self.sequences, self.icmpBufferSettings.GlobalLimit-1, icmpShedFirst, func(bufferId BufferId, sequence *IcmpSequence) bool {
 					if self.log.V(1).Enabled() {
 						self.log.Infof(
 							"[lnr]icmp limit global %s->%s\n",

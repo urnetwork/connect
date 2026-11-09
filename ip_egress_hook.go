@@ -139,7 +139,10 @@ type EgressHook interface {
 	// an older one is resolved again before its first byte.
 	PolicyGeneration() uint64
 	// C18: true hands FriendsAndFamily flows to private destinations to
-	// `ResolveEgress` in place of the public-only rules.
+	// `ResolveEgress` in place of the public-only rules, admits the replies of
+	// those it passes or maps, and sheds foreign flows first when a flow table
+	// is full. Asked once per provider callback and per flow, so like
+	// `PolicyGeneration` it must be one load.
 	FriendsAndFamilyEgress() bool
 }
 
@@ -323,6 +326,10 @@ type egressFlowHandle interface {
 type localUserNatEgress struct {
 	settings *LocalUserNatSettings
 	hook     atomic.Pointer[egressHookBox]
+	// The hook's `FriendsAndFamilyEgress` as last asked, at its install and at
+	// each flow's resolve, for a flow table at its cap, which must not call
+	// the hook under its mutex (shedFirst).
+	foreignFirst atomic.Bool
 
 	stateLock       sync.Mutex
 	principals      map[egressPrincipalKey]*egressPrincipalAnswer
@@ -348,6 +355,16 @@ func (self *localUserNatEgress) hooked() bool {
 	return self != nil && self.hook.Load() != nil
 }
 
+// Whether the installed hook takes FriendsAndFamily flows to private
+// destinations (C18). Nil-safe, for a NAT built without one.
+func (self *localUserNatEgress) friendsAndFamilyEgress() bool {
+	if self == nil {
+		return false
+	}
+	box := self.hook.Load()
+	return box != nil && box.hook.FriendsAndFamilyEgress()
+}
+
 func (self *localUserNatEgress) lockStateWithLock() {
 	self.stateLock.Lock()
 	if self.settings.afterEgressStateLockForTest != nil {
@@ -365,6 +382,7 @@ func (self *localUserNatEgress) install(closer EgressFlowCloser, hook EgressHook
 	if hook != nil {
 		box = &egressHookBox{hook: hook}
 	}
+	self.foreignFirst.Store(hook != nil && hook.FriendsAndFamilyEgress())
 	var previousUnbind func()
 	func() {
 		self.lockStateWithLock()
@@ -621,6 +639,7 @@ func (self *egressFlowState) resolve(
 	if box == nil {
 		return egressOutcomeLegacy, netip.AddrPort{}
 	}
+	self.nat.foreignFirst.Store(box.hook.FriendsAndFamilyEgress())
 	flow := EgressFlow{
 		Source:        source,
 		ProvideMode:   provideMode,
@@ -638,6 +657,9 @@ func (self *egressFlowState) resolve(
 	if !ok {
 		return egressOutcomeDeny, netip.AddrPort{}
 	}
+	// the flow's own path, before its first reply: a provider admits a
+	// share's replies only for a flow its hook passed or mapped (C18)
+	ipPath.egressAdmitted = true
 	self.registration.Store(&egressRegistration{
 		box:       box,
 		decision:  decision,

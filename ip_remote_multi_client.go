@@ -595,6 +595,13 @@ type MultiClientSettings struct {
 	// locally: the local route, an un-blocked destination, and SMTP. Nil dials
 	// from the host. Tests keep a locally routed packet in the process with it.
 	LocalDialContextSettings *DialContextSettings
+	// A cross-network share link's private destinations (C18, sidecar design
+	// §17.9): the aliases its routes carry. A packet to an address inside them
+	// is admitted as a same-network one is, and a reply from inside them is
+	// admitted; a reply from any other private address is dropped. Every
+	// other packet keeps this client's relationship, so on a FriendsAndFamily
+	// link it stays Public. Nil, the default, admits nothing new.
+	SharePrivateDestinations []netip.Prefix
 
 	SequenceBufferSize int
 	// Maximum paid SYN owners or empty publication events examined per reaper
@@ -6788,6 +6795,43 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	return self.sendPacketWithPolicy(source, provideMode, packet, timeout, false)
 }
 
+// The relationship the security policy enforces on one egress packet: a
+// destination inside the share's private destinations is admitted as a
+// same-network one (C18), and every other packet keeps egressRelationship's
+// rule. A Service source stays refused either way.
+func (self *RemoteUserNatMultiClient) egressRelationshipFor(
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+) protocol.ProvideMode {
+	relationship := egressRelationship(provideMode, self.provideMode)
+	if relationship != protocol.ProvideMode_Service &&
+		sharePrivateDestinationContains(self.settings.SharePrivateDestinations, ipPath.DestinationIp) {
+		return protocol.ProvideMode_Network
+	}
+	return relationship
+}
+
+// The client-side check of one reply. With a share's private destinations
+// (C18), a reply from inside them is admitted as a same-network reply is, a
+// reply from any other private address is dropped, and every other reply keeps
+// the policy's check. A same-network reply and a Service source are the
+// policy's as before.
+func (self *RemoteUserNatMultiClient) inspectIngressFor(
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+) (SecurityPolicyResult, error) {
+	if prefixes := self.settings.SharePrivateDestinations; 0 < len(prefixes) &&
+		provideMode != protocol.ProvideMode_Network && provideMode != protocol.ProvideMode_Service {
+		if sharePrivateDestinationContains(prefixes, ipPath.SourceIp) {
+			return SecurityPolicyResultAllow, nil
+		}
+		if egressPrivateAddress(ipPath.SourceIp) {
+			return SecurityPolicyResultDrop, nil
+		}
+	}
+	return self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
+}
+
 // Takes on success; native input changes only remote admission, after local
 // policy classification. Fragment, SMTP and local ownership remain unchanged.
 func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
@@ -6823,13 +6867,12 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 		return true
 	}
 
-	relationship := egressRelationship(provideMode, self.provideMode)
-
 	ipPath, payload, err := ParseIpPathWithPayload(packet)
 	if err != nil {
 		self.logSparseSendDrop("parse", &self.sendParseDropCount, err)
 		return false
 	}
+	relationship := self.egressRelationshipFor(provideMode, ipPath)
 	if ipPath.Protocol == IpProtocolIcmp && !self.settings.EnableIcmp {
 		// the client send gate (see ICMP.md): default off until the provider
 		// fleet broadly parses icmp, since a not-yet-upgraded provider
@@ -6997,7 +7040,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 	if err != nil || ipPath.Protocol != IpProtocolUdp {
 		return false
 	}
-	relationship := egressRelationship(provideMode, self.provideMode)
+	relationship := self.egressRelationshipFor(provideMode, ipPath)
 	r, securityDecision, err := inspectEgressDetailed(self.securityPolicy, relationship, ipPath, payload)
 	if err != nil {
 		self.logSparseSendDrop("fragment policy", &self.sendPolicyDropCount, err)
@@ -7364,7 +7407,7 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	}
 	result, securityDecision, err := inspectAndRefreshEgressGroupDetailedBorrowed(
 		self.securityPolicy,
-		egressRelationship(provideMode, self.provideMode),
+		self.egressRelationshipFor(provideMode, ipPath),
 		memberIpPaths,
 		group.payloads,
 	)
@@ -9780,7 +9823,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 
 		// mirror clientReceivePacket's pre-delivery pipeline exactly
 		self.smtpEgressGuard.retireReturn(ipPath)
-		r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
+		r, err := self.inspectIngressFor(provideMode, ipPath)
 		if err != nil {
 			continue
 		}
@@ -9852,7 +9895,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	packet []byte,
 ) {
 	self.smtpEgressGuard.retireReturn(ipPath)
-	r, err := self.securityPolicy.InspectIngress(provideMode, ipPath, nil)
+	r, err := self.inspectIngressFor(provideMode, ipPath)
 	if err != nil {
 		return
 	}

@@ -12,9 +12,9 @@ import (
 	// "slices"
 	"strconv"
 	// "strings"
+	"net/netip"
 	"sync"
 	// "time"
-	// "net/netip"
 
 	// "github.com/gopacket/gopacket"
 	// "github.com/gopacket/gopacket/layers"
@@ -974,6 +974,34 @@ func isPublicUnicast(ip net.IP) bool {
 func isSharedAddressSpace(ip net.IP) bool {
 	ip4 := ip.To4()
 	return ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64
+}
+
+// Whether an egress destination is one the public rules refuse as private:
+// not public unicast, or in the shared address space carriers and overlay
+// networks use (isSharedAddressSpace). A v4-mapped v6 address is judged as the
+// v4 address it carries. A share's aliases and targets are all private here
+// (C18, sidecar design §17.9).
+func egressPrivateAddress(ip net.IP) bool {
+	return !isPublicUnicast(ip) || isSharedAddressSpace(ip)
+}
+
+// Whether an address lies in one of a share's private destinations. A
+// v4-mapped v6 address is judged as the v4 address it carries.
+func sharePrivateDestinationContains(prefixes []netip.Prefix, ip net.IP) bool {
+	if len(prefixes) == 0 {
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // isReservedIpv6 lists the v6 prefixes that are never a public unicast
