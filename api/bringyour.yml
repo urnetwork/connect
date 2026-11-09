@@ -11289,13 +11289,17 @@ paths:
   /network/config/projection:
     get:
       x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Read the authorization log
       description: |
-        The network's authorization log entries after a position, verified by the
-        caller against its own pin. An unadmitted client of a member may call this
-        too, for its recovery.
+        The network's authorization log entries after a position, each an
+        `AuthEntry` verbatim, which the caller verifies against its own pin: a
+        page at most, with `more` when entries follow the last one. From 0 the
+        answer carries the Signed Genesis, and while entry 1 exists without it
+        the route answers 503. A position before the retention point reads from
+        the retention point, where a new reader starts at the newest base. The
+        rows of each base among the entries come beside them. An unadmitted
+        client of a member may call this too, for its recovery.
       operationId: networkConfigProjection
       security:
         - BearerAuth: []
@@ -11303,75 +11307,106 @@ paths:
         - name: after
           in: query
           required: false
-          description: The newest position the caller holds. Without it the log starts at the newest base.
+          description: The newest position the caller holds. 0, or none, reads from the genesis.
           schema:
             type: integer
+            format: int64
       responses:
         "200":
-          description: The entries, each verbatim as it was signed.
+          description: The entries, each verbatim.
           content:
-            application/octet-stream:
+            application/json:
               schema:
-                type: string
-                format: binary
+                $ref: "#/components/schemas/NetworkConfigProjectionResult"
+        "503":
+          description: The log or its genesis is not readable yet.
     post:
       x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Publish a base
       description: |
         A config writer publishes a signed `ProjectionHeader` with its rows.
         Accepted only if its version is the tip plus one, its `prev_chain` is the
-        tip's chain value, the hash of its rows matches, and neither its config
-        version nor its fold position falls below the newest base's.
+        tip's chain value, the hash of its rows matches, its signer writes config
+        at the tip, and neither its config version nor its fold position falls
+        below the newest base's; an unchanged config version names the newest
+        base's head. Base 1 carries the network's Signed Genesis and comes from
+        the device it names; one genesis wins a race for base 1, and a retry of
+        base 1 finishes a missing step. A retry of a landed base answers its
+        entry. `config_pushes` carries the Signed EvsPush of each config version
+        the base adds, oldest first.
       operationId: networkConfigProjectionPublish
       security:
         - BearerAuth: []
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/json:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/NetworkConfigProjectionPublishArgs"
       responses:
         "200":
           description: The base is the new tip.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigPinResult"
+        "403":
+          description: The base fails at the tip, or the client publishes no base.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigRefusal"
         "409":
           description: The tip moved. The body names it, and the writer re-signs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigRefusal"
         "429":
           description: Past the network's base limit. The body gives `retry_after_ms`.
+        "503":
+          description: The store's outcome is unknown or the log is unavailable; retry the same bytes.
 
   /network/config/delta:
     post:
       x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Append a statement to the authorization log
       description: |
         Appends one `Signed` statement after verifying it against the state at the
         tip. The statement's hash is its retry identity: the same bytes found among
         the last 4,096 entries answer that entry. Grant chains come through here,
-        and no route takes policy text.
+        and no route takes policy text. An unadmitted client of a member posts a
+        recovery-signed statement only.
       operationId: networkConfigDelta
       security:
         - BearerAuth: []
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/json:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/NetworkConfigDeltaArgs"
       responses:
         "200":
           description: The entry's position `n` and chain value `A_n`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigPinResult"
         "403":
           description: The statement fails at the tip. The body names the tip, and the signer re-evaluates.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigRefusal"
         "429":
           description: |
             Past the network's statement limit. The body gives `retry_after_ms`.
             Revocations, `Suspend`, `BridgeWithdraw` and `RecoveryVeto` are exempt.
+        "503":
+          description: The store's outcome is unknown or the log is unavailable; retry the same bytes.
 
   /network/config/reseed:
     post:
@@ -26267,6 +26302,99 @@ components:
           properties:
             message:
               type: string
+
+    NetworkConfigDeltaArgs:
+      type: object
+      required:
+        - signed
+      properties:
+        signed:
+          description: One marshalled `Signed` statement, verbatim, base64.
+          type: string
+          format: byte
+
+    NetworkConfigPinResult:
+      type: object
+      required:
+        - n
+        - chain
+      properties:
+        n:
+          description: The entry's position in the network's authorization log.
+          type: integer
+          format: int64
+        chain:
+          description: The entry's chain value `A_n`, 32 bytes, base64.
+          type: string
+          format: byte
+
+    NetworkConfigProjectionPublishArgs:
+      type: object
+      required:
+        - signed_header
+        - rows
+      properties:
+        signed_header:
+          description: The marshalled `Signed` `ProjectionHeader`, verbatim, base64.
+          type: string
+          format: byte
+        rows:
+          description: The `ProjectionRows` bytes the header names, verbatim, at most 4 MiB, base64.
+          type: string
+          format: byte
+        genesis:
+          description: The network's marshalled `Signed` `Genesis`, verbatim, with base 1 only, base64.
+          type: string
+          format: byte
+        config_pushes:
+          description: The marshalled `Signed` `EvsPush` of each config version the base adds, oldest first, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+
+    NetworkConfigProjectionResult:
+      type: object
+      required:
+        - entries
+        - rows
+        - more
+      properties:
+        genesis:
+          description: The network's marshalled `Signed` `Genesis`, verbatim, when the read starts at 0, base64.
+          type: string
+          format: byte
+        entries:
+          description: The `AuthEntry` bytes after the position asked, verbatim and in order, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+        rows:
+          description: The `ProjectionRows` bytes of each base among the entries, verbatim, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+        tip:
+          $ref: "#/components/schemas/NetworkConfigPinResult"
+        more:
+          description: Whether entries follow the last one.
+          type: boolean
+
+    NetworkConfigRefusal:
+      type: object
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+        code:
+          description: config_refused, config_tip_moved, config_unadmitted or config_no_log.
+          type: string
+        tip:
+          $ref: "#/components/schemas/NetworkConfigPinResult"
 
     AclAckArgs:
       type: object
