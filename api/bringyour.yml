@@ -40,6 +40,16 @@ info:
     body. A refusal's body says why. Any other failure is internal: a 500
     with a fixed body, whose cause stays in the server's log.
 
+    A sidecar's client JWT (one minted with `strict_exp`, see
+    `POST /network/auth-client`) lives 7 days, administers nothing, and
+    reaches only the routes the server classifies for sidecars: renewal
+    (`GET /auth/refresh`) and minting (`POST /network/auth-client`), each with
+    a `DPoP` proof of the client's key, removing its own client, key lookup,
+    `POST /connect/control` and the sidecar routes. Every other route answers
+    it 403 with the plain text "A sidecar token cannot call this route." (see
+    `SidecarTokenRefused`) before doing anything, a 403 and never a 401, so a
+    client does not sign out.
+
     This api process also serves the sim-latency competition under
     `/competition`. Those routes are a separate, fail-closed security domain
     with their own opaque role-scoped tokens, and they are documented in
@@ -757,9 +767,15 @@ paths:
 
         The refreshed JWT keeps the create time of the JWT it refreshes, so a
         password reset that expires one expires the other.
+
+        A sidecar's client JWT (`strict_exp`) refreshes into another 7-day
+        sidecar JWT, and only with a `DPoP` proof of its client's key; one
+        past its `exp` is refused with 401, and the sidecar enrolls again.
       operationId: authRefreshToken
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Dpop"
       responses:
         "200":
           description: OK.
@@ -767,6 +783,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RefreshTokenResult"
+        "403":
+          $ref: "#/components/responses/SidecarProofRefused"
 
   /auth/network-refresh:
     post:
@@ -1396,6 +1414,18 @@ paths:
         client limit exceeded close. A person's device that also provides
         declares intent on its connections instead and stays a network peer.
 
+        A new client may be marked, for life: `admin_refused` keeps every
+        token of it off the routes that administer the network or the
+        account, and `strict_exp` makes it a sidecar's, whose tokens live 7
+        days and reach only the sidecar routes (`admin_refused` with it). A
+        re-auth may repeat a client's marks but never add one, and a child of
+        a marked client inherits its marks. The reply confirms them. Until the
+        second stage of the client-token fix is live, a call that would end in
+        a `strict_exp` token, an inherited mark included, is refused outside
+        the deployment's preview networks with `error.message` "This network
+        cannot hold sidecar clients yet.", and nothing is created. A sidecar's
+        JWT calls this route only with a `DPoP` proof of its client's key.
+
         Like roles or a principal the call may not set, a `proxy_config`
         the call cannot use is refused before anything is created: the call
         answers 200 with `error.message` and no `client_id` or
@@ -1436,6 +1466,8 @@ paths:
       operationId: authNetworkClient
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Dpop"
       requestBody:
         required: true
         content:
@@ -1451,6 +1483,8 @@ paths:
                 $ref: "#/components/schemas/AuthNetworkClientResult"
         "401":
           description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/SidecarProofRefused"
         "402":
           description: |
             The plan's concurrent connected client limit is reached and x402
@@ -12258,6 +12292,24 @@ components:
         type: string
       required: true
       description: The push's 16 random bytes, which name one statement.
+    Dpop:
+      in: header
+      name: DPoP
+      required: false
+      description: |
+        A proof that the caller holds its client's key (RFC 9449), required
+        when the bearer is a sidecar's client JWT (`strict_exp`) and ignored
+        otherwise. A compact JWS whose header is `{"typ": "dpop+jwt", "alg":
+        "EdDSA", "jwk": <the client's Ed25519 public key>}` and whose claims
+        are `jti` (unique, single use), `htm` (the request's method), `htu`
+        (the request's https url at the api's public origin, without query or
+        fragment), `iat` (within 60 seconds of the server's clock) and `ath`
+        (the unpadded base64url of SHA-256 over the bearer token). The key
+        must be the client's newest bound key (`POST /sidecar/bind`). One
+        header, one proof; a request without one, with a replayed `jti`, or
+        by another key is refused (see `SidecarProofRefused`).
+      schema:
+        type: string
   responses:
     SessionOperationResult:
       description: Authoritative outcome, including asynchronous cleanup progress.
@@ -12327,6 +12379,32 @@ components:
           schema:
             type: string
           example: A client token cannot administer the network. Use the network's root token or an API key.
+    SidecarTokenRefused:
+      description: |
+        The bearer token is a sidecar's client JWT (`strict_exp`), and this
+        route is not one a sidecar token reaches. The route did nothing. The
+        body is the plain text message "A sidecar token cannot call this
+        route." It is 403, not 401: the token is good, only not here.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A sidecar token cannot call this route.
+    SidecarProofRefused:
+      description: |
+        The bearer token is a sidecar's client JWT (`strict_exp`), and the
+        request did not carry a `DPoP` proof of the client's newest bound key
+        for this request and this token: no proof, two, a replayed `jti`, an
+        `iat` outside its 60 seconds, another key, method, url or token, or a
+        client with no key bound. The route did nothing. The body is the plain
+        text message "A sidecar token needs a proof of its client key on this
+        route." It is 403, not 401, so a client does not sign out: sign a new
+        proof and retry.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: A sidecar token needs a proof of its client key on this route.
   securitySchemes:
     BearerAuth:
       type: http
@@ -13368,6 +13446,21 @@ components:
             Identity principal assigned to the client at creation, immutable after. |
             Only a network session may set this; when omitted, the session's own principal is inherited.
           type: string
+        admin_refused:
+          description: |
+            Optional, default false. The new client's tokens never administer
+            the network or the account, whatever route they call. Assigned at
+            creation and inherited by its children; a re-auth may repeat it
+            but not add it.
+          type: boolean
+        strict_exp:
+          description: |
+            Optional, default false. The new client is a sidecar's: its tokens
+            live 7 days, reach only the sidecar routes and renew and mint only
+            with a `DPoP` proof of its key. Implies `admin_refused`. Refused
+            outside the preview networks until the second stage of the
+            client-token fix (see the endpoint).
+          type: boolean
         provide_intent:
           description: |
             Optional, default false. The new client is a provider install: it
@@ -13674,6 +13767,12 @@ components:
         client_id:
           description: udid
           type: string
+        admin_refused:
+          description: The client is marked `admin_refused`, which the request asked for or a parent passed down.
+          type: boolean
+        strict_exp:
+          description: The client is a sidecar's (`strict_exp`), and `by_client_jwt` lives 7 days.
+          type: boolean
         # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
           description: |
