@@ -652,6 +652,10 @@ type Peer struct {
 	// read through `VerifiedClientPublicKey`. Nil for anything else. Shared
 	// with the session, so it is never handed out or written.
 	verifiedClientKey *[ed25519.PublicKeySize]byte
+	// The contract these frames arrived under; zero for a no-contract source.
+	// A provider keeps its egress hook's principal per contract by it
+	// (`EgressHook.VerifyPrincipal`), so a callback never mixes two contracts.
+	contractId Id
 }
 
 // The peer's long-lived client key, as the end-to-end session that opened these
@@ -18393,6 +18397,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			TransferKey:       self.transferKey,
 			TransportType:     item.transportType,
 			verifiedClientKey: item.verifiedClientKey,
+			contractId:        receiveContract.contractId,
 		}
 	} else {
 		// no contract peers are considered in network
@@ -18460,6 +18465,7 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			a.TransferKey == b.TransferKey &&
 			a.TransportType == b.TransportType &&
 			a.verifiedClientKey == b.verifiedClientKey &&
+			a.contractId == b.contractId &&
 			slices.Equal(a.Roles, b.Roles) &&
 			bytes.Equal(a.WindowDelegation, b.WindowDelegation)
 	}

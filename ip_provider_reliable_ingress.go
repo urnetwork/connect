@@ -227,7 +227,8 @@ func (owner *providerReliablePacket) enterNat() receiveDeliveryAttempt {
 	}
 	defer nat.sendWg.Done()
 	queued := &SendPacket{source: owner.source, transferKey: owner.peer.TransferKey,
-		provideMode: owner.peer.ProvideMode, packets: [][]byte{owner.packet}, reliable: owner}
+		provideMode: owner.peer.ProvideMode, egressSource: newEgressSource(owner.peer),
+		packets: [][]byte{owner.packet}, reliable: owner}
 	packetBytes := ByteCount(len(owner.packet))
 	select {
 	case nat.sendPackets <- queued:
@@ -277,6 +278,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			return
 		}
 		tcp.ttl = packet[8]
+		tcp.egressSource = newEgressSource(owner.peer)
 		attempt = func() (bool, error) {
 			return tcp4.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}
@@ -287,6 +289,7 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			return
 		}
 		tcp.ttl = packet[7]
+		tcp.egressSource = newEgressSource(owner.peer)
 		attempt = func() (bool, error) {
 			return tcp6.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}

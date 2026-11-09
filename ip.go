@@ -553,10 +553,17 @@ func DefaultLocalUserNatSettings() *LocalUserNatSettings {
 		SequenceBufferSize: MemoryScaledCount(defaultIpBufferSize, 256),
 		SendShardCount:     1,
 		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings:  DefaultUdpBufferSettings(),
-		TcpBufferSettings:  DefaultTcpBufferSettings(),
-		IcmpBufferSettings: DefaultIcmpBufferSettings(),
+		UdpBufferSettings:       DefaultUdpBufferSettings(),
+		TcpBufferSettings:       DefaultTcpBufferSettings(),
+		IcmpBufferSettings:      DefaultIcmpBufferSettings(),
+		EgressPrincipalMaxCount: defaultEgressPrincipalMaxCount(),
 	}
+}
+
+// One kept principal answer per source a provider tracks, so the answers stay
+// within the provider's own source bound (`MaxSourceCount`'s default).
+func defaultEgressPrincipalMaxCount() int {
+	return MemoryScaledCount(8192, 1024)
 }
 
 // providerUdpIdleTimeout is the udp idle reap for an unbudgeted
@@ -713,11 +720,12 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 // choice). The window and read buffer defaults still scale.
 func DefaultLocalUserNatSettingsWithBufferSize(bufferSize int) *LocalUserNatSettings {
 	return &LocalUserNatSettings{
-		SequenceBufferSize: bufferSize,
-		SendShardCount:     1,
-		UdpBufferSettings:  DefaultUdpBufferSettingsWithBufferSize(bufferSize),
-		TcpBufferSettings:  DefaultTcpBufferSettingsWithBufferSize(bufferSize),
-		IcmpBufferSettings: DefaultIcmpBufferSettingsWithBufferSize(bufferSize),
+		SequenceBufferSize:      bufferSize,
+		SendShardCount:          1,
+		UdpBufferSettings:       DefaultUdpBufferSettingsWithBufferSize(bufferSize),
+		TcpBufferSettings:       DefaultTcpBufferSettingsWithBufferSize(bufferSize),
+		IcmpBufferSettings:      DefaultIcmpBufferSettingsWithBufferSize(bufferSize),
+		EgressPrincipalMaxCount: defaultEgressPrincipalMaxCount(),
 	}
 }
 
@@ -745,9 +753,29 @@ type LocalUserNatSettings struct {
 	// via a private copy — the caller's settings are never mutated).
 	// nil resolves to `DefaultLogger()`.
 	Log Logger
+
+	// The provider's per-flow egress policy (ip_egress_hook.go), installed at
+	// construction; `LocalUserNat.SetEgressHook` changes it later. Nil, the
+	// default, keeps every flow as it was before hooks existed. Install it only
+	// on a NAT that egresses other clients' flows, never on one that carries
+	// the device's own.
+	EgressHook EgressHook
+	// The most principal answers a hooked NAT keeps, one per source and
+	// contract (`EgressHook.VerifyPrincipal`). The default matches the
+	// provider's own source bound. Past it a finished answer is dropped and its
+	// contract asks again on its next flow; zero or negative keeps none, so
+	// every flow asks.
+	EgressPrincipalMaxCount int
+
 	// Tests observe the terminal dispatch-to-flow join edge. Nil is a
 	// production no-op.
 	beforeFlowWorkersWaitForTest func()
+	// Tests hold a flow that found another flow of its contract asking the
+	// hook, before it waits for that answer. Nil is a production no-op.
+	beforeEgressPrincipalWaitForTest func()
+	// Tests count the egress state lock's acquisitions. Nil is a production
+	// no-op.
+	afterEgressStateLockForTest func()
 }
 
 // Forwards packets using user-space sockets. Transfer is expected to remain
@@ -802,6 +830,9 @@ type LocalUserNat struct {
 	sourceRetirementSourceIds map[Id]map[uint64]bool
 	sourceRetirementDoneIds   map[Id][]<-chan struct{}
 	sourceRetirementCallbacks map[uint64]sourceRetirementFunction
+
+	// The egress hook, its principal answers and its view of the flows.
+	egress *localUserNatEgress
 
 	// Test-only completed-disposition edge. Nil is a production no-op.
 	// Tests can hold a queued owner before its final protocol admission.
@@ -904,12 +935,21 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		sourceRetirementSourceIds:       map[Id]map[uint64]bool{},
 		sourceRetirementDoneIds:         map[Id][]<-chan struct{}{},
 		sourceRetirementCallbacks:       map[uint64]sourceRetirementFunction{},
+		egress:                          newLocalUserNatEgress(settings),
 	}
 	if settings.MemoryBudget != nil {
 		// A subpartition of memory's fixed reservation, not another allowance.
 		// It admits ACKs even when replay/data owners fill the shared root.
 		localUserNat.controlMemory = NewTransferMemoryBudget(kib(16))
 	}
+	// a retired source's principal answers go with it, so the answers stay
+	// within the sources the provider tracks
+	localUserNat.addSourceRetirementCallback(func(sourceId Id, retired bool) []<-chan struct{} {
+		if retired {
+			localUserNat.egress.dropSource(sourceId)
+		}
+		return nil
+	})
 	go func() {
 		defer close(localUserNat.runDone)
 		defer memory.release()
@@ -1048,7 +1088,7 @@ func (self *LocalUserNat) SendPacketWithTimeout(source TransferPath, provideMode
 	}
 	// This list escapes into the queue. Build it only after admission; the
 	// temporary list used by reserveSendPacketsMemory stays on the stack.
-	return self.sendAdmittedTransferPacketsWithTimeout(source, TransferKey{}, provideMode,
+	return self.sendAdmittedTransferPacketsWithTimeout(source, TransferKey{}, provideMode, nil,
 		[][]byte{packet}, timeout, memory)
 }
 
@@ -1112,6 +1152,22 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 	timeout time.Duration,
 	completed ...func(),
 ) bool {
+	return self.sendEgressTransferPacketsWithTimeout(source, transferKey, provideMode, nil,
+		packets, timeout, completed...)
+}
+
+// Queues provider ingress with what the provider knows of its sender, so each
+// flow the packets open reaches the egress hook with its peer's seals. A nil
+// source is a packet with no peer.
+func (self *LocalUserNat) sendEgressTransferPacketsWithTimeout(
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	egressSource *egressSource,
+	packets [][]byte,
+	timeout time.Duration,
+	completed ...func(),
+) bool {
 	memory, admitted := self.reserveSendPacketsMemory(packets)
 	if !admitted {
 		if len(completed) > 0 && completed[0] != nil {
@@ -1119,7 +1175,7 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 		}
 		return false
 	}
-	return self.sendAdmittedTransferPacketsWithTimeout(source, transferKey, provideMode,
+	return self.sendAdmittedTransferPacketsWithTimeout(source, transferKey, provideMode, egressSource,
 		packets, timeout, memory, completed...)
 }
 
@@ -1143,6 +1199,7 @@ func (self *LocalUserNat) sendAdmittedTransferPacketsWithTimeout(
 	source TransferPath,
 	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
+	egressSource *egressSource,
 	packets [][]byte,
 	timeout time.Duration,
 	memory natMemoryReservation,
@@ -1169,6 +1226,9 @@ func (self *LocalUserNat) sendAdmittedTransferPacketsWithTimeout(
 		provideMode: provideMode,
 		packets:     packets,
 		disposition: disposition,
+	}
+	if egressSource != nil {
+		sendPacket.egressSource = *egressSource
 	}
 	// fast path without arming a timer
 	select {
@@ -1465,11 +1525,12 @@ func (self *LocalUserNat) Run() {
 				continue
 			}
 			shardSendPacket := &SendPacket{
-				source:      sendPacket.source,
-				transferKey: sendPacket.transferKey,
-				provideMode: sendPacket.provideMode,
-				packets:     packets,
-				disposition: sendPacket.disposition,
+				source:       sendPacket.source,
+				transferKey:  sendPacket.transferKey,
+				provideMode:  sendPacket.provideMode,
+				egressSource: sendPacket.egressSource,
+				packets:      packets,
+				disposition:  sendPacket.disposition,
 			}
 			if !forward(packetShard, shardSendPacket) {
 				for _, returnPackets := range shardPackets[packetShard+1:] {
@@ -1674,6 +1735,27 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	tcp6Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	icmp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	icmp6Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
+	// every flow these buffers open asks the NAT's egress hook, and the hook's
+	// closes reach them through this shard's scan
+	udp4Buffer.egress = self.egress
+	udp6Buffer.egress = self.egress
+	tcp4Buffer.egress = self.egress
+	tcp6Buffer.egress = self.egress
+	icmp4Buffer.egress = self.egress
+	icmp6Buffer.egress = self.egress
+	egressScanUnsub := self.egress.addShardScan(func(
+		match func(*egressFlowState) bool,
+		handles []egressFlowHandle,
+	) []egressFlowHandle {
+		handles = tcp4Buffer.appendEgressFlows(match, handles)
+		handles = tcp6Buffer.appendEgressFlows(match, handles)
+		handles = udp4Buffer.appendEgressFlows(match, handles)
+		handles = udp6Buffer.appendEgressFlows(match, handles)
+		handles = icmp4Buffer.appendEgressFlows(match, handles)
+		handles = icmp6Buffer.appendEgressFlows(match, handles)
+		return handles
+	})
+	defer egressScanUnsub()
 
 	// parsed per-packet views. these are copied by value into the send items,
 	// so the locals can be reused across packets.
@@ -1681,7 +1763,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	var tcpPacket parsedTcp
 	var icmpPacket parsedIcmp
 
-	handleIpPacket := func(source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode, ipPacket []byte) {
+	handleIpPacket := func(source TransferPath, transferKey TransferKey, provideMode protocol.ProvideMode, egressSource *egressSource, ipPacket []byte) {
 		if len(ipPacket) == 0 {
 			MessagePoolReturn(ipPacket)
 			return
@@ -1707,6 +1789,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				udpPacket.ttl = ipPacket[8]
+				udpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := udp4Buffer.sendTransferKey(
 						source,
@@ -1738,6 +1821,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				tcpPacket.ttl = ipPacket[8]
+				tcpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := tcp4Buffer.sendTransferKey(
 						source,
@@ -1784,6 +1868,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				icmpPacket.ttl = ipPacket[8]
+				icmpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := icmp4Buffer.sendTransferKey(
 						source,
@@ -1831,6 +1916,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				udpPacket.ttl = ipPacket[7]
+				udpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := udp6Buffer.sendTransferKey(
 						source,
@@ -1862,6 +1948,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 					return
 				}
 				tcpPacket.ttl = ipPacket[7]
+				tcpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := tcp6Buffer.sendTransferKey(
 						source,
@@ -1913,6 +2000,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 				}
 				// hop limit
 				icmpPacket.ttl = ipPacket[7]
+				icmpPacket.egressSource = *egressSource
 				c := func() bool {
 					success, err := icmp6Buffer.sendTransferKey(
 						source,
@@ -1970,7 +2058,7 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 			return
 		}
 		for _, ipPacket := range sendPacket.packets {
-			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, ipPacket)
+			handleIpPacket(sendPacket.source, sendPacket.transferKey, sendPacket.provideMode, &sendPacket.egressSource, ipPacket)
 			if self.afterSendPacketForTest != nil {
 				self.afterSendPacketForTest()
 			}
@@ -2018,9 +2106,11 @@ type SendPacket struct {
 	source      TransferPath
 	transferKey TransferKey
 	provideMode protocol.ProvideMode
-	packets     [][]byte
-	disposition *localUserNatSendDisposition
-	reliable    *providerReliablePacket
+	// what the provider knows of the packets' sender, for the egress hook
+	egressSource egressSource
+	packets      [][]byte
+	disposition  *localUserNatSendDisposition
+	reliable     *providerReliablePacket
 }
 
 // One provider admission can fan into several LocalUserNat send shards. The
@@ -2224,6 +2314,8 @@ type parsedUdp struct {
 	sourcePort      uint16
 	destinationPort uint16
 	payload         []byte
+	// the sender as the provider knew it, for the flow this packet opens
+	egressSource egressSource
 }
 
 type parsedTcp struct {
@@ -2249,6 +2341,8 @@ type parsedTcp struct {
 	timestampValue    uint32
 	timestampEcho     uint32
 	payload           []byte
+	// the sender as the provider knew it, for the flow this SYN opens
+	egressSource egressSource
 }
 
 func (self *parsedTcp) flagsString() string {
@@ -2898,6 +2992,9 @@ type UdpBuffer[BufferId comparable] struct {
 	// for its socket close; nil leaves the drops uncounted
 	kernelReceiveDropCount *atomic.Uint64
 	egressRealism          *egressRealismCounters
+	// the NAT's egress hook, which each new flow asks before its socket
+	// opens; nil for a buffer built outside a NAT
+	egress *localUserNatEgress
 
 	mutex sync.Mutex
 
@@ -3041,8 +3138,15 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		}
 		sequence.socketReadPoller = self.socketReadPoller
 		sequence.kernelReceiveDropCount = self.kernelReceiveDropCount
+		sequence.egressFlow.nat = self.egress
+		sequence.egressFlow.source = udp.egressSource
+		// A hooked NAT's flows take the per-flow loop: the shared lifecycle opens
+		// its socket here, under this mutex, where the hook must not run
+		// (plan-BRIDGE-small-readings #8). A shared flow opened before a hook was
+		// installed holds no decision, so the install closes it.
 		sequence.sharedSocketLifecycle =
-			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle
+			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle &&
+				!self.egress.hooked()
 		sequence.sharedLifecycleWake = self.sharedLifecycleWake
 		sequence.memoryIndexed.Store(true)
 		self.sequences[bufferId] = sequence
@@ -3291,6 +3395,7 @@ type UdpSequence struct {
 	sharedLifecycleWake            chan struct{}
 	udpBufferSettings              *UdpBufferSettings
 	egressTarget                   providerEgressTarget
+	egressFlow                     egressFlowState
 	sharedSocket                   net.Conn
 	sharedSocketErr                error
 	closeOnce                      sync.Once
@@ -3586,19 +3691,41 @@ func (self *UdpSequence) receiveBatch(packets [][]byte) {
 
 func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.log.V(2).Infof("[init]udp connect\n")
+	// The egress hook decides the flow before its socket opens. A map dials
+	// its target, while the flow keeps its destination for every datagram
+	// built toward the source. The shared lifecycle opens under the buffer
+	// mutex and is never hooked (see udpSend).
+	dialHostPort := self.IpPath().DestinationHostPort()
+	if self.sharedSocketLifecycle {
+		self.egressFlow.resolved.Store(true)
+	} else {
+		_, transferKey := self.transferState.get()
+		switch outcome, dial := self.egressFlow.resolve(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()); outcome {
+		case egressOutcomeDial:
+			if dial.IsValid() {
+				dialHostPort = dial.String()
+			}
+		case egressOutcomeDeny:
+			self.denyEgress()
+			return nil, errEgressRefused
+		case egressOutcomeEnd:
+			return nil, errEgressRefused
+		}
+	}
 	dialCtx, egressDial := self.egressTarget.dialContext(self.ctx)
 	dialStart := time.Now()
 	socket, err := self.udpBufferSettings.DialContext(
 		dialCtx,
 		"udp",
-		self.IpPath().DestinationHostPort(),
+		dialHostPort,
 	)
 	if err != nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[init]udp connect error = %s\n", err)
 		}
-		// A UDP dial cannot yield a meaningful refusal to the inner source.
-		if _, signal := classifyDialFailure(self.IpPath(), err, time.Since(dialStart)); signal != nil {
+		// A UDP dial cannot yield a meaningful refusal to the inner source. A
+		// flow an egress close ended has had its one answer.
+		if _, signal := classifyDialFailure(self.IpPath(), err, time.Since(dialStart)); signal != nil && !self.egressFlow.closed.Load() {
 			self.receivePacket(MessagePoolCopy(signal))
 		}
 		return nil, err
@@ -3926,6 +4053,40 @@ func (self *UdpSequence) Run() {
 
 func (self *UdpSequence) Cancel() {
 	self.Close()
+}
+
+func (self *UdpSequence) egressState() *egressFlowState {
+	return &self.egressFlow
+}
+
+// Answers a flow its hook refused with an unreachable, unless a close already
+// ended it. The caller ends the flow.
+func (self *UdpSequence) denyEgress() {
+	if self.egressFlow.closed.CompareAndSwap(false, true) {
+		self.sendEgressUnreachable()
+	}
+}
+
+// Ends the flow from outside its goroutine, first answering the source with an
+// unreachable when `answer` is set. The answer goes before the close, since a
+// socket the close ends answers nothing.
+func (self *UdpSequence) closeEgress(answer bool) bool {
+	if !self.egressFlow.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	if answer {
+		self.sendEgressUnreachable()
+	}
+	self.Close()
+	return true
+}
+
+// The port unreachable a failed dial sends: the one ICMP error the provider's
+// return path passes for this flow (`providerDialFailureReturnPath`).
+func (self *UdpSequence) sendEgressUnreachable() {
+	if signal, ok := ipOosUnreachable(self.IpPath()); ok {
+		self.receivePacket(MessagePoolCopy(signal))
+	}
 }
 
 func (self *UdpSequence) Close() {
@@ -4517,6 +4678,9 @@ type TcpBuffer[BufferId comparable] struct {
 	egressRealism                  *egressRealismCounters
 	flowCloseCallback              tcpFlowCloseFunction
 	admissionCapacity              *receiveCapacitySignal
+	// the NAT's egress hook, which each new flow asks before its dial; nil
+	// for a buffer built outside a NAT
+	egress *localUserNatEgress
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -4800,6 +4964,8 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		sequence.admissionCapacity = self.admissionCapacity
 		sequence.egressRealism = self.egressRealism
 		sequence.flowCloseCallback = self.flowCloseCallback
+		sequence.egressFlow.nat = self.egress
+		sequence.egressFlow.source = tcp.egressSource
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
@@ -5213,6 +5379,7 @@ type TcpSequence struct {
 	tcpBufferSettings *TcpBufferSettings
 	egressRealism     *egressRealismCounters
 	egressTarget      providerEgressTarget
+	egressFlow        egressFlowState
 
 	// Guarded by the connection mutex. Chunk copies survive Transfer delivery
 	// until the source's inner cumulative TCP acknowledgement releases them.
@@ -5723,16 +5890,36 @@ func (self *TcpSequence) Run() {
 
 	// connect to upstream before sending the syn+ack
 	self.log.V(2).Infof("[init]tcp connect\n")
+	// The egress hook decides the flow before anything dials, the synthetic
+	// speed server included. A map dials its target, while the flow keeps its
+	// destination for every packet built toward the source.
+	dialHostPort := self.IpPath().DestinationHostPort()
+	dialIp := self.IpPath().DestinationIp
+	_, transferKey := self.transferState.get()
+	switch outcome, dial := self.egressFlow.resolve(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()); outcome {
+	case egressOutcomeDial:
+		if dial.IsValid() {
+			dialHostPort = dial.String()
+			dialIp = net.IP(dial.Addr().AsSlice())
+		}
+	case egressOutcomeDeny:
+		MessagePoolReturn(packet)
+		self.denyEgress()
+		return
+	case egressOutcomeEnd:
+		MessagePoolReturn(packet)
+		return
+	}
 	var socket net.Conn
 	var err error
 	var egressDial *providerEgressDial
 	var dialDuration time.Duration
-	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp)
+	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(dialIp)
 	if synthetic {
 		// benchmark-range destination: terminate at the in-memory synthetic
 		// speed server (see ip_synthetic_speed.go)
 		if self.log.V(1).Enabled() {
-			self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+			self.log.Infof("[init]tcp connect synthetic %s\n", dialHostPort)
 		}
 		socket = newSyntheticSpeedConn()
 	} else {
@@ -5742,7 +5929,7 @@ func (self *TcpSequence) Run() {
 		socket, err = self.tcpBufferSettings.DialContext(
 			dialCtx,
 			"tcp",
-			self.IpPath().DestinationHostPort(),
+			dialHostPort,
 		)
 		dialDuration = time.Since(dialStart)
 	}
@@ -7154,6 +7341,46 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 func (self *TcpSequence) Cancel() {
 	self.cancel()
 	self.admissionCapacity.notify()
+}
+
+func (self *TcpSequence) egressState() *egressFlowState {
+	return &self.egressFlow
+}
+
+// Answers a flow its hook refused with a reset, unless a close already ended
+// it. The caller ends the flow.
+func (self *TcpSequence) denyEgress() {
+	if self.egressFlow.closed.CompareAndSwap(false, true) {
+		self.sendEgressReset()
+	}
+}
+
+// Ends the flow from outside its goroutine, first resetting the source when
+// `answer` is set, which needs the SYN taken in. The reset goes before the
+// cancel: a dial the cancel ends sends nothing of its own.
+func (self *TcpSequence) closeEgress(answer bool) bool {
+	if !self.egressFlow.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	if answer {
+		self.sendEgressReset()
+	}
+	self.Cancel()
+	return true
+}
+
+// A reset toward the source on the lane a refused dial's reset takes.
+func (self *TcpSequence) sendEgressReset() {
+	var rstPacket []byte
+	var rstErr error
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		rstPacket, rstErr = self.RstAck()
+	}()
+	if rstErr == nil {
+		self.receivePacket(rstPacket, receiveRecoveryModeRegenerableControl)
+	}
 }
 
 func (self *TcpSequence) Close() {
@@ -10307,6 +10534,9 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	}
 	defer self.releaseSourceLifecycle(source.SourceId, sourceLifecycle)
 	transferKey := peer.TransferKey
+	// Every flow these frames open reaches the NAT's egress hook with this
+	// peer's seals, contract and session key, on whichever lane it takes.
+	egressSource := newEgressSource(peer)
 
 	provideMode := peer.ProvideMode
 	// One observation per delivered Pack is enough. The former call inside
@@ -10579,10 +10809,11 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 				dropPacketGroup()
 				return false
 			}
-			success := self.localUserNat.sendTransferPacketsWithTimeout(
+			success := self.localUserNat.sendEgressTransferPacketsWithTimeout(
 				source,
 				transferKey,
 				provideMode,
+				&egressSource,
 				packetGroup.packets,
 				0,
 				func() {
@@ -10606,8 +10837,8 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 						if !smallNatControlPacket(packet) || !sourceLifecycle.admissions.start() {
 							continue
 						}
-						if self.localUserNat.sendTransferPacketsWithTimeout(
-							source, transferKey, provideMode, [][]byte{packet}, 0,
+						if self.localUserNat.sendEgressTransferPacketsWithTimeout(
+							source, transferKey, provideMode, &egressSource, [][]byte{packet}, 0,
 							func() { self.releaseSourceLifecycle(source.SourceId, sourceLifecycle) },
 						) {
 							self.countRemoteIngress(peer.TransportType, 1, ByteCount(len(packet)))

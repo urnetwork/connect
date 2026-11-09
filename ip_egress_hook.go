@@ -1,10 +1,15 @@
 package connect
 
 import (
+	"context"
+	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -16,6 +21,16 @@ import (
 // exists: pass it to its destination, map it to another address, or deny it.
 // Generic, additive and off by default. A NAT without a hook behaves exactly as
 // before, and its one cost is a nil check when a flow is created.
+//
+// The source's identity reaches the flow on every lane. Each packet carries an
+// `egressSource`, built from the receive callback's `Peer`, down the ordinary,
+// reliable and fallback lanes into the parsed packet that opens a flow, as the
+// packet's TTL rides today. A lane that dropped it would read as a source with
+// no seals, no contract and no session, which a hook denies.
+//
+// A flow registers its decision before it dials, opens its socket or sends its
+// first echo, all under its own context, so `SetEgressHook` can close every
+// flow its new hook did not decide.
 
 // What a hook decides for one flow.
 type EgressVerdict int
@@ -222,4 +237,486 @@ func administrativeRejectHosts(sourceIp net.IP, destinationIp net.IP) bool {
 		return !ip.IsUnspecified() && !ip.IsMulticast() && !ip.Equal(net.IPv4bcast)
 	}
 	return single(sourceIp) && single(destinationIp)
+}
+
+// What a provider knows of the sender of a packet, carried with the packet from
+// the receive callback to the flow it opens: the contract seals, the contract
+// id and the session's verified client key, from `Peer` without its delivery
+// capability. The zero value is a packet a caller handed the NAT directly, with
+// no peer: no seals, no contract and no session key.
+type egressSource struct {
+	contractClass     protocol.ContractClass
+	sourceSubject     Id
+	sourceNetwork     Id
+	contractId        Id
+	windowDelegation  []byte
+	verifiedClientKey *[ed25519.PublicKeySize]byte
+}
+
+func newEgressSource(peer Peer) egressSource {
+	return egressSource{
+		contractClass:     peer.ContractClass,
+		sourceSubject:     peer.SourceSubject,
+		sourceNetwork:     peer.SourceNetwork,
+		contractId:        peer.contractId,
+		windowDelegation:  peer.WindowDelegation,
+		verifiedClientKey: peer.verifiedClientKey,
+	}
+}
+
+// The peer `EgressHook.VerifyPrincipal` sees: the carried seals, delegation and
+// session key, without roles, principal or delivery.
+func (self *egressSource) peer(provideMode protocol.ProvideMode, transferKey TransferKey) Peer {
+	return Peer{
+		ProvideMode:       provideMode,
+		ContractClass:     self.contractClass,
+		SourceSubject:     self.sourceSubject,
+		SourceNetwork:     self.sourceNetwork,
+		WindowDelegation:  self.windowDelegation,
+		TransferKey:       transferKey,
+		verifiedClientKey: self.verifiedClientKey,
+		contractId:        self.contractId,
+	}
+}
+
+// One installed hook, boxed so a single atomic pointer swaps it. A decision and
+// a principal answer remember the box they came from, so nothing one hook
+// decided outlives its replacement.
+type egressHookBox struct {
+	hook EgressHook
+}
+
+// The principal answers are kept per source and contract.
+type egressPrincipalKey struct {
+	source     TransferPath
+	contractId Id
+}
+
+// One contract's principal. `done` closes once `principal` and `generation`
+// are set; the first flow to ask answers, and the others wait for it.
+type egressPrincipalAnswer struct {
+	box        *egressHookBox
+	done       chan struct{}
+	principal  *BridgePrincipal
+	generation uint64
+}
+
+// Lists the flows of one send shard's buffers that `match` selects. `match`
+// runs under each buffer's mutex and may only read atomics.
+type egressShardScan func(match func(*egressFlowState) bool, handles []egressFlowHandle) []egressFlowHandle
+
+// A flow sequence, as a scan of the shards lists it.
+type egressFlowHandle interface {
+	egressState() *egressFlowState
+	// Ends the flow, first answering its source when `answer` is set: a reset
+	// for TCP, an unreachable for UDP, nothing for an ICMP echo. False when the
+	// flow had already been ended by its own deny or by another close.
+	closeEgress(answer bool) bool
+}
+
+// A NAT's part in the egress hook, shared by its send shards and their flows.
+// The hook is one atomic load. The principal answers and the shard registry sit
+// under `stateLock`, which no packet path takes: a flow takes it when it
+// resolves, before its dial, and `SetEgressHook` takes it off the packet path.
+// Safe for concurrent use.
+type localUserNatEgress struct {
+	settings *LocalUserNatSettings
+	hook     atomic.Pointer[egressHookBox]
+
+	// Serializes installs, so each hook's binding and unbinding pair up.
+	installLock sync.Mutex
+
+	stateLock       sync.Mutex
+	principals      map[egressPrincipalKey]*egressPrincipalAnswer
+	nextShardScanId uint64
+	shardScans      map[uint64]egressShardScan
+}
+
+func newLocalUserNatEgress(settings *LocalUserNatSettings) *localUserNatEgress {
+	egress := &localUserNatEgress{
+		settings:   settings,
+		principals: map[egressPrincipalKey]*egressPrincipalAnswer{},
+		shardScans: map[uint64]egressShardScan{},
+	}
+	if settings.EgressHook != nil {
+		egress.hook.Store(&egressHookBox{hook: settings.EgressHook})
+	}
+	return egress
+}
+
+// Whether a hook is installed now. A flow that read false may still meet a
+// hook installed after, which closes it (`SetEgressHook`).
+func (self *localUserNatEgress) hooked() bool {
+	return self != nil && self.hook.Load() != nil
+}
+
+func (self *localUserNatEgress) lockStateWithLock() {
+	self.stateLock.Lock()
+	if self.settings.afterEgressStateLockForTest != nil {
+		self.settings.afterEgressStateLockForTest()
+	}
+}
+
+// Swaps in `hook`, nil removing it, and drops every principal answer the old
+// one gave. Returns the new box, nil when the hook was removed.
+func (self *localUserNatEgress) install(hook EgressHook) *egressHookBox {
+	var box *egressHookBox
+	if hook != nil {
+		box = &egressHookBox{hook: hook}
+	}
+	self.hook.Store(box)
+	func() {
+		self.lockStateWithLock()
+		defer self.stateLock.Unlock()
+		clear(self.principals)
+	}()
+	return box
+}
+
+// Registers one send shard's scan; the returned function removes it.
+func (self *localUserNatEgress) addShardScan(scan egressShardScan) func() {
+	self.lockStateWithLock()
+	defer self.stateLock.Unlock()
+	self.nextShardScanId += 1
+	shardScanId := self.nextShardScanId
+	self.shardScans[shardScanId] = scan
+	return func() {
+		self.lockStateWithLock()
+		defer self.stateLock.Unlock()
+		delete(self.shardScans, shardScanId)
+	}
+}
+
+// The live flows `match` selects, across every shard. Each buffer is scanned
+// under its own mutex, and no lock is held between buffers or after the scan.
+func (self *localUserNatEgress) flows(match func(*egressFlowState) bool) []egressFlowHandle {
+	var shardScans []egressShardScan
+	func() {
+		self.lockStateWithLock()
+		defer self.stateLock.Unlock()
+		for _, shardScan := range self.shardScans {
+			shardScans = append(shardScans, shardScan)
+		}
+	}()
+	var handles []egressFlowHandle
+	for _, shardScan := range shardScans {
+		handles = shardScan(match, handles)
+	}
+	return handles
+}
+
+// The flow's principal: the contract's kept answer, or the hook's, asked once
+// per source and contract. Concurrent flows of one contract wait for the first
+// one's answer under their own contexts. A nil answer is asked again once the
+// published generation has moved, since it may only mean the hook did not yet
+// know the subject. A flow with no contract asks every time, which costs
+// nothing: with no contract there is no delegation to verify.
+func (self *localUserNatEgress) verifyPrincipal(
+	ctx context.Context,
+	box *egressHookBox,
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	egressSource *egressSource,
+) *BridgePrincipal {
+	peer := egressSource.peer(provideMode, transferKey)
+	if egressSource.contractId == (Id{}) {
+		return box.hook.VerifyPrincipal(source, peer)
+	}
+	key := egressPrincipalKey{source: source, contractId: egressSource.contractId}
+	for {
+		answer, owner := self.takePrincipalAnswer(box, key)
+		if owner {
+			return self.answerPrincipal(box, key, answer, source, peer)
+		}
+		select {
+		case <-answer.done:
+		default:
+			if self.settings.beforeEgressPrincipalWaitForTest != nil {
+				self.settings.beforeEgressPrincipalWaitForTest()
+			}
+			select {
+			case <-answer.done:
+			case <-ctx.Done():
+				return nil
+			}
+		}
+		if answer.principal != nil || answer.generation == box.hook.PolicyGeneration() {
+			return answer.principal
+		}
+		// a refusal under an older policy: ask the hook again
+		self.dropPrincipalAnswer(key, answer)
+	}
+}
+
+// The kept answer for `key` from this box, or a new pending one this caller
+// must give (owner).
+func (self *localUserNatEgress) takePrincipalAnswer(
+	box *egressHookBox,
+	key egressPrincipalKey,
+) (answer *egressPrincipalAnswer, owner bool) {
+	self.lockStateWithLock()
+	defer self.stateLock.Unlock()
+	if answer = self.principals[key]; answer != nil && answer.box == box {
+		return answer, false
+	}
+	answer = &egressPrincipalAnswer{box: box, done: make(chan struct{})}
+	self.principals[key] = answer
+	if maxCount := self.settings.EgressPrincipalMaxCount; 0 < maxCount && maxCount < len(self.principals) {
+		// arbitrary eviction of finished answers, as the provider bounds its
+		// per-source maps; an evicted contract asks again on its next flow
+		for evictKey, evictAnswer := range self.principals {
+			if len(self.principals) <= maxCount {
+				break
+			}
+			select {
+			case <-evictAnswer.done:
+				delete(self.principals, evictKey)
+			default:
+			}
+		}
+	}
+	return answer, true
+}
+
+// Asks the hook and publishes the answer to every flow waiting on it. A hook
+// that panics leaves no kept answer, and its waiters read a refusal.
+func (self *localUserNatEgress) answerPrincipal(
+	box *egressHookBox,
+	key egressPrincipalKey,
+	answer *egressPrincipalAnswer,
+	source TransferPath,
+	peer Peer,
+) *BridgePrincipal {
+	answered := false
+	defer func() {
+		if !answered || self.settings.EgressPrincipalMaxCount <= 0 {
+			self.dropPrincipalAnswer(key, answer)
+		}
+		close(answer.done)
+	}()
+	answer.generation = box.hook.PolicyGeneration()
+	answer.principal = box.hook.VerifyPrincipal(source, peer)
+	answered = true
+	return answer.principal
+}
+
+func (self *localUserNatEgress) dropPrincipalAnswer(key egressPrincipalKey, answer *egressPrincipalAnswer) {
+	self.lockStateWithLock()
+	defer self.stateLock.Unlock()
+	if self.principals[key] == answer {
+		delete(self.principals, key)
+	}
+}
+
+// Forgets a retired source's answers, so a returning source verifies afresh.
+func (self *localUserNatEgress) dropSource(sourceId Id) {
+	self.lockStateWithLock()
+	defer self.stateLock.Unlock()
+	for key := range self.principals {
+		if key.source.SourceId == sourceId {
+			delete(self.principals, key)
+		}
+	}
+}
+
+// Ends a flow its hook denied or a close ended. Never an incident.
+var errEgressRefused = errors.New("egress refused")
+
+// What a flow does after it asks its hook.
+type egressOutcome int
+
+const (
+	// no hook: dial the destination as before hooks existed
+	egressOutcomeLegacy egressOutcome = iota
+	// dial the destination, or the returned map target when it is valid
+	egressOutcomeDial
+	// the hook refused: answer the source, then end the flow
+	egressOutcomeDeny
+	// end the flow without an answer: its context ended, or a close ended it
+	egressOutcomeEnd
+)
+
+// A decision as its flow registered it.
+type egressRegistration struct {
+	box       *egressHookBox
+	decision  EgressDecision
+	principal *BridgePrincipal
+	// what the flow dials: the destination, or the map's target with its port
+	dial netip.AddrPort
+}
+
+// One flow's part in the egress hook, kept on its sequence: the identity its
+// first packet carried and the decision it registered. The flow's goroutine
+// writes the registration once, before its dial, and everything else reads it
+// with one atomic load; no packet path touches it.
+type egressFlowState struct {
+	// nil for a flow outside any NAT's egress (a sequence a caller built
+	// directly), which resolves as a NAT without a hook does
+	nat    *localUserNatEgress
+	source egressSource
+	// the flow's decision; nil until it resolves under a hook
+	registration atomic.Pointer[egressRegistration]
+	// the flow reached its decision, with or without a hook, so its first
+	// packet has been taken in and a close may answer its source
+	resolved atomic.Bool
+	// set by whichever ends the flow first, its own deny or a close from
+	// outside, so the source gets at most one answer
+	closed atomic.Bool
+}
+
+// Asks the hook for the flow's decision and registers it, in the flow's own
+// goroutine before its dial. A hook that panics ends the flow there, before any
+// socket exists: the panic reaches the sequence's own handler.
+func (self *egressFlowState) resolve(
+	ctx context.Context,
+	source TransferPath,
+	transferKey TransferKey,
+	provideMode protocol.ProvideMode,
+	ipPath *IpPath,
+) (egressOutcome, netip.AddrPort) {
+	self.resolved.Store(true)
+	if self.nat == nil {
+		return egressOutcomeLegacy, netip.AddrPort{}
+	}
+	box := self.nat.hook.Load()
+	if box == nil {
+		return egressOutcomeLegacy, netip.AddrPort{}
+	}
+	flow := EgressFlow{
+		Source:        source,
+		ProvideMode:   provideMode,
+		ContractClass: self.source.contractClass,
+		SourceSubject: self.source.sourceSubject,
+		SourceNetwork: self.source.sourceNetwork,
+		Sealed:        self.source.verifiedClientKey != nil,
+		Protocol:      ipPath.Protocol,
+		From:          egressAddrPort(ipPath.SourceIp, ipPath.SourcePort, ipPath.Protocol),
+		To:            egressAddrPort(ipPath.DestinationIp, ipPath.DestinationPort, ipPath.Protocol),
+	}
+	flow.Principal = self.nat.verifyPrincipal(ctx, box, source, transferKey, provideMode, &self.source)
+	decision := box.hook.ResolveEgress(&flow)
+	dial, ok := egressDial(&flow, decision, ipPath.Version)
+	if !ok {
+		return egressOutcomeDeny, netip.AddrPort{}
+	}
+	self.registration.Store(&egressRegistration{
+		box:       box,
+		decision:  decision,
+		principal: flow.Principal,
+		dial:      dial,
+	})
+	if ctx.Err() != nil || self.closed.Load() {
+		return egressOutcomeEnd, netip.AddrPort{}
+	}
+	if decision.Verdict == EgressVerdictPass {
+		// the destination exactly as a flow without a hook dials it
+		return egressOutcomeDial, netip.AddrPort{}
+	}
+	return egressOutcomeDial, dial
+}
+
+// What a decision dials, or false when it refuses the flow: a deny, an unknown
+// verdict, a map to no address, or an echo mapped across address families.
+func egressDial(flow *EgressFlow, decision EgressDecision, ipVersion int) (netip.AddrPort, bool) {
+	switch decision.Verdict {
+	case EgressVerdictPass:
+		return flow.To, true
+	case EgressVerdictMap:
+		addr := decision.Target.Addr().Unmap()
+		if !addr.IsValid() || addr.IsUnspecified() {
+			return netip.AddrPort{}, false
+		}
+		if flow.Protocol == IpProtocolIcmp && addr.Is4() != (ipVersion == 4) {
+			return netip.AddrPort{}, false
+		}
+		port := decision.Target.Port()
+		if port == 0 {
+			port = flow.To.Port()
+		}
+		return netip.AddrPortFrom(addr, port), true
+	default:
+		return netip.AddrPort{}, false
+	}
+}
+
+// An address and port as a hook sees them: a v4-mapped v6 address as its v4
+// address, and no port for ICMP.
+func egressAddrPort(ip net.IP, port int, ipProtocol IpProtocol) netip.AddrPort {
+	addr, _ := netip.AddrFromSlice(ip)
+	if ipProtocol == IpProtocolIcmp {
+		port = 0
+	}
+	return netip.AddrPortFrom(addr.Unmap(), uint16(port))
+}
+
+// Installs, replaces or removes this NAT's hook while it runs. The hook decides
+// every flow opened after the call, and every live flow it did not decide is
+// closed: one that has taken in its first packet answers its source with a
+// reset or an unreachable, and one still opening ends before it dials. So no
+// flow opened under an earlier hook, or under none, outlives the change
+// (plan-BRIDGE-small-readings #4). Removing the hook leaves live flows open.
+//
+// Safe for concurrent use, but not from a packet path: it scans every flow.
+func (self *LocalUserNat) SetEgressHook(hook EgressHook) {
+	box := func() *egressHookBox {
+		self.egress.installLock.Lock()
+		defer self.egress.installLock.Unlock()
+		return self.egress.install(hook)
+	}()
+	if box == nil {
+		return
+	}
+	undecided := self.egress.flows(func(state *egressFlowState) bool {
+		registration := state.registration.Load()
+		return registration == nil || registration.box != box
+	})
+	for _, handle := range undecided {
+		handle.closeEgress(handle.egressState().resolved.Load())
+	}
+}
+
+// Appends this buffer's flows that `match` selects, under its mutex.
+func (self *TcpBuffer[BufferId]) appendEgressFlows(
+	match func(*egressFlowState) bool,
+	handles []egressFlowHandle,
+) []egressFlowHandle {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for _, sequence := range self.sequences {
+		if match(&sequence.egressFlow) {
+			handles = append(handles, sequence)
+		}
+	}
+	return handles
+}
+
+// Appends this buffer's flows that `match` selects, under its mutex.
+func (self *UdpBuffer[BufferId]) appendEgressFlows(
+	match func(*egressFlowState) bool,
+	handles []egressFlowHandle,
+) []egressFlowHandle {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for _, sequence := range self.sequences {
+		if match(&sequence.egressFlow) {
+			handles = append(handles, sequence)
+		}
+	}
+	return handles
+}
+
+// Appends this buffer's flows that `match` selects, under its mutex.
+func (self *IcmpBuffer[BufferId]) appendEgressFlows(
+	match func(*egressFlowState) bool,
+	handles []egressFlowHandle,
+) []egressFlowHandle {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for _, sequence := range self.sequences {
+		if match(&sequence.egressFlow) {
+			handles = append(handles, sequence)
+		}
+	}
+	return handles
 }

@@ -61,6 +61,8 @@ type parsedIcmp struct {
 	// ip header ttl (v4) or hop limit (v6), forwarded to the egress backend
 	ttl     uint8
 	payload []byte
+	// the sender as the provider knew it, for the flow this echo opens
+	egressSource egressSource
 }
 
 // parses an icmp transport into `icmp`. echo request and reply with code 0
@@ -305,6 +307,9 @@ type IcmpBuffer[BufferId comparable] struct {
 	receiveCallback                receiveTransferPacketFunction
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	icmpBufferSettings             *IcmpBufferSettings
+	// the NAT's egress hook, which each new flow asks before its first echo;
+	// nil for a buffer built outside a NAT
+	egress *localUserNatEgress
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -415,6 +420,8 @@ func (self *IcmpBuffer[BufferId]) icmpSend(
 			return nil
 		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
+		sequence.egressFlow.nat = self.egress
+		sequence.egressFlow.source = icmp.egressSource
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
@@ -563,6 +570,7 @@ type IcmpSequence struct {
 	sendTimer *time.Timer
 
 	idleCondition *IdleCondition
+	egressFlow    egressFlowState
 
 	source        TransferPath
 	transferState transferState
@@ -779,11 +787,27 @@ func (self *IcmpSequence) Run() {
 	}()
 
 	self.log.V(2).Infof("[init]icmp connect\n")
+	// The egress hook decides the flow before its first echo. A map echoes its
+	// target, while every reply keeps the flow's destination as its source
+	// (echoReplyPacket). A refused echo gets no answer.
+	echoIp := self.destinationIp
+	_, transferKey := self.transferState.get()
+	switch outcome, dial := self.egressFlow.resolve(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()); outcome {
+	case egressOutcomeDial:
+		if dial.IsValid() {
+			echoIp = net.IP(dial.Addr().AsSlice())
+		}
+	case egressOutcomeDeny:
+		self.egressFlow.closed.Store(true)
+		return
+	case egressOutcomeEnd:
+		return
+	}
 	newEgress := newIcmpEgress
 	if self.icmpBufferSettings.newEgressForTest != nil {
 		newEgress = self.icmpBufferSettings.newEgressForTest
 	}
-	egress, err := newEgress(self.ctx, self.ipVersion, self.destinationIp, self.icmpBufferSettings)
+	egress, err := newEgress(self.ctx, self.ipVersion, echoIp, self.icmpBufferSettings)
 	if err != nil {
 		// fail soft: the platform cannot open an unprivileged echo socket,
 		// so the flow drops exactly as before icmp support
@@ -984,6 +1008,20 @@ func (self *IcmpSequence) echoReplyPacket(sequenceNumber uint16, payload []byte)
 
 func (self *IcmpSequence) Cancel() {
 	self.cancel()
+}
+
+func (self *IcmpSequence) egressState() *egressFlowState {
+	return &self.egressFlow
+}
+
+// Ends the flow from outside its goroutine. A refused echo is dropped without
+// an answer (plan-BRIDGE-small-readings #9), so `answer` changes nothing.
+func (self *IcmpSequence) closeEgress(answer bool) bool {
+	if !self.egressFlow.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	self.Cancel()
+	return true
 }
 
 func (self *IcmpSequence) Close() {
