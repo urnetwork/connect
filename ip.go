@@ -950,9 +950,14 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		}
 		return nil
 	})
+	if settings.EgressHook != nil {
+		localUserNat.egress.install(localUserNat, settings.EgressHook)
+	}
 	go func() {
 		defer close(localUserNat.runDone)
 		defer memory.release()
+		// a hook bound to this NAT lets go of it once its flows have ended
+		defer localUserNat.egress.close()
 		HandleError(localUserNat.Run)
 	}()
 
@@ -3345,7 +3350,8 @@ func (self *UdpBuffer[BufferId]) runSharedSocketLifecycle() {
 			if !sequence.sharedSocketLifecycle {
 				continue
 			}
-			deadline := sequence.LastActivityTime().Add(self.udpBufferSettings.IdleTimeout)
+			// each flow's own idle: an egress decision's, else this buffer's
+			deadline := sequence.LastActivityTime().Add(sequence.egressFlow.idleTimeout(self.udpBufferSettings.IdleTimeout))
 			if udpSequenceDone(sequence) || !now.Before(deadline) {
 				self.removeSequenceWithLock(bufferId, sequence)
 				continue
@@ -3356,7 +3362,9 @@ func (self *UdpBuffer[BufferId]) runSharedSocketLifecycle() {
 		}
 		self.mutex.Unlock()
 
-		if nextDeadline.IsZero() || self.udpBufferSettings.IdleTimeout <= 0 {
+		// a non-positive idle reaps a flow at its first scan, so only flows
+		// with a positive one remain to set the next deadline
+		if nextDeadline.IsZero() {
 			stopTimer()
 			idleTimerChannel = nil
 			continue
@@ -3819,6 +3827,13 @@ func (self *UdpSequence) Run() {
 		return
 	}
 	defer self.closeSocket(socket)
+	// The dial fence: before the first datagram is written. The shared
+	// lifecycle never registers a decision (a hooked NAT's flows take this
+	// loop), so its first write needs no fence.
+	if _, transferKey := self.transferState.get(); !self.egressFlow.recheck(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()) {
+		self.denyEgress()
+		return
+	}
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
@@ -3997,7 +4012,7 @@ func (self *UdpSequence) Run() {
 	// it re-arms to that point, so a close is never early. The IdleCondition
 	// checkpoint taken after the last send still decides the close, so a send
 	// racing it keeps its datagram.
-	idleTimeout := self.udpBufferSettings.IdleTimeout
+	idleTimeout := self.egressFlow.idleTimeout(self.udpBufferSettings.IdleTimeout)
 	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
 	armIdleTimer := func(timeout time.Duration) {
@@ -5999,6 +6014,15 @@ func (self *TcpSequence) Run() {
 		}
 	}
 
+	// The dial fence: a decision the hook's published policy has since moved
+	// past is asked again before the source sees the SYN+ACK, and a close
+	// that ended the flow during its dial has already answered it.
+	if !self.egressFlow.recheck(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()) {
+		MessagePoolReturn(packet)
+		self.denyEgress()
+		return
+	}
+
 	self.log.V(2).Infof("[init]receive SYN+ACK\n")
 	// The upstream may be server-first (SMTP/587, SSH, IMAP): socket bytes can
 	// be readable immediately after connect. Keep the SYN+ACK on the same
@@ -7211,7 +7235,7 @@ func (self *TcpSequence) Run() {
 	// passed since it re-arms to that point, so a close is never early. The
 	// IdleCondition checkpoint taken after the last send still decides the
 	// close, so a send or a pure ACK since then defers it a full window.
-	idleTimeout := self.tcpBufferSettings.IdleTimeout
+	idleTimeout := self.egressFlow.idleTimeout(self.tcpBufferSettings.IdleTimeout)
 	armIdleTimer := func(timeout time.Duration) {
 		idleTimer.Reset(timeout)
 		if self.tcpBufferSettings.afterIdleTimerArmForTest != nil {

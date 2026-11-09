@@ -817,6 +817,11 @@ func (self *IcmpSequence) Run() {
 		return
 	}
 	defer egress.Close()
+	// The dial fence: before the first echo. A refused echo gets no answer.
+	if !self.egressFlow.recheck(self.ctx, self.source, transferKey, self.provideMode, self.IpPath()) {
+		self.egressFlow.closed.Store(true)
+		return
+	}
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]icmp connect success\n")
 
@@ -875,7 +880,7 @@ func (self *IcmpSequence) Run() {
 	// a send moves lastSendNanos, and a fire before IdleTimeout has passed since
 	// it re-arms to that point, so a close is never early. The IdleCondition
 	// checkpoint taken after the last send still decides the close.
-	idleTimeout := self.icmpBufferSettings.IdleTimeout
+	idleTimeout := self.egressFlow.idleTimeout(self.icmpBufferSettings.IdleTimeout)
 	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
 	armIdleTimer := func(timeout time.Duration) {

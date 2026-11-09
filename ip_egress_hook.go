@@ -315,33 +315,31 @@ type egressFlowHandle interface {
 }
 
 // A NAT's part in the egress hook, shared by its send shards and their flows.
-// The hook is one atomic load. The principal answers and the shard registry sit
-// under `stateLock`, which no packet path takes: a flow takes it when it
-// resolves, before its dial, and `SetEgressHook` takes it off the packet path.
-// Safe for concurrent use.
+// The hook is one atomic load. The principal answers, the shard registry and
+// the hook's binding sit under `stateLock`, which no packet path takes: a flow
+// takes it when it resolves, before its dial, and `SetEgressHook`,
+// `CloseFlows` and the NAT's close take it off the packet path. Safe for
+// concurrent use.
 type localUserNatEgress struct {
 	settings *LocalUserNatSettings
 	hook     atomic.Pointer[egressHookBox]
-
-	// Serializes installs, so each hook's binding and unbinding pair up.
-	installLock sync.Mutex
 
 	stateLock       sync.Mutex
 	principals      map[egressPrincipalKey]*egressPrincipalAnswer
 	nextShardScanId uint64
 	shardScans      map[uint64]egressShardScan
+	// the installed hook's `EgressHookBinder` unbind; nil when it has none
+	unbind func()
+	// the NAT has ended, and binds no hook again
+	closed bool
 }
 
 func newLocalUserNatEgress(settings *LocalUserNatSettings) *localUserNatEgress {
-	egress := &localUserNatEgress{
+	return &localUserNatEgress{
 		settings:   settings,
 		principals: map[egressPrincipalKey]*egressPrincipalAnswer{},
 		shardScans: map[uint64]egressShardScan{},
 	}
-	if settings.EgressHook != nil {
-		egress.hook.Store(&egressHookBox{hook: settings.EgressHook})
-	}
-	return egress
 }
 
 // Whether a hook is installed now. A flow that read false may still meet a
@@ -357,20 +355,60 @@ func (self *localUserNatEgress) lockStateWithLock() {
 	}
 }
 
-// Swaps in `hook`, nil removing it, and drops every principal answer the old
-// one gave. Returns the new box, nil when the hook was removed.
-func (self *localUserNatEgress) install(hook EgressHook) *egressHookBox {
+// Swaps in `hook`, nil removing it, drops every principal answer the old hook
+// gave, and moves the binding: the old hook's binder is unbound and the new one
+// bound to `closer` (`EgressHookBinder`). Binders run outside every lock, and a
+// bind that a later install or the NAT's end overtook is unbound at once.
+// Returns the new box, nil when the hook was removed.
+func (self *localUserNatEgress) install(closer EgressFlowCloser, hook EgressHook) *egressHookBox {
 	var box *egressHookBox
 	if hook != nil {
 		box = &egressHookBox{hook: hook}
 	}
-	self.hook.Store(box)
+	var previousUnbind func()
 	func() {
 		self.lockStateWithLock()
 		defer self.stateLock.Unlock()
+		self.hook.Store(box)
 		clear(self.principals)
+		previousUnbind = self.unbind
+		self.unbind = nil
 	}()
+	if previousUnbind != nil {
+		previousUnbind()
+	}
+	if binder, ok := hook.(EgressHookBinder); ok {
+		unbind := binder.BindFlowCloser(closer)
+		if unbind != nil {
+			func() {
+				self.lockStateWithLock()
+				defer self.stateLock.Unlock()
+				if !self.closed && self.hook.Load() == box {
+					self.unbind = unbind
+					unbind = nil
+				}
+			}()
+			if unbind != nil {
+				unbind()
+			}
+		}
+	}
 	return box
+}
+
+// Unbinds the installed hook when the NAT ends.
+func (self *localUserNatEgress) close() {
+	var unbind func()
+	func() {
+		self.lockStateWithLock()
+		defer self.stateLock.Unlock()
+		self.closed = true
+		unbind = self.unbind
+		self.unbind = nil
+	}()
+	if unbind != nil {
+		unbind()
+	}
 }
 
 // Registers one send shard's scan; the returned function removes it.
@@ -659,17 +697,18 @@ func egressAddrPort(ip net.IP, port int, ipProtocol IpProtocol) netip.AddrPort {
 //
 // Safe for concurrent use, but not from a packet path: it scans every flow.
 func (self *LocalUserNat) SetEgressHook(hook EgressHook) {
-	box := func() *egressHookBox {
-		self.egress.installLock.Lock()
-		defer self.egress.installLock.Unlock()
-		return self.egress.install(hook)
-	}()
-	if box == nil {
+	if self.egress.install(self, hook) == nil {
 		return
 	}
+	// judged against the hook installed when each flow is scanned, so a later
+	// install's flows are never closed by an earlier one's sweep
 	undecided := self.egress.flows(func(state *egressFlowState) bool {
+		current := self.egress.hook.Load()
+		if current == nil {
+			return false
+		}
 		registration := state.registration.Load()
-		return registration == nil || registration.box != box
+		return registration == nil || registration.box != current
 	})
 	for _, handle := range undecided {
 		handle.closeEgress(handle.egressState().resolved.Load())
