@@ -10593,13 +10593,30 @@ paths:
   /oauth/token:
     post:
       tags: [Other]
-      summary: Exchange a code or refresh token
+      summary: Exchange a code, a refresh token or a sidecar's client token
       description: |
-        The rfc 6749 token endpoint, as a form post. Two grants are supported:
-        `authorization_code` (with the PKCE `code_verifier`, and optionally the
-        rfc 8707 `resource` indicator) and `refresh_token`. Clients are public
-        -- the token endpoint auth method is `none` -- so `client_id` is
-        always required and there is no client secret.
+        The rfc 6749 token endpoint, as a form post. Three grants are
+        supported: `authorization_code` (with the PKCE `code_verifier`, and
+        optionally the rfc 8707 `resource` indicator), `refresh_token`, and
+        the rfc 8693 token exchange. For the first two, clients are public --
+        the token endpoint auth method is `none` -- so `client_id` is required
+        and there is no client secret.
+
+        The token exchange (`urn:ietf:params:oauth:grant-type:token-exchange`)
+        trades a sidecar's client JWT, the `subject_token` of type
+        `urn:ur:params:oauth:token-type:client-jwt`, for a 15-minute service
+        token for one service: `resource` is the service's own https origin,
+        never the api's. It names no `client_id` and sends no bearer: the
+        subject token is the credential, with a `DPoP` header proving the
+        client's key, its `htu` this token endpoint at the issuer's origin and
+        its `ath` the hash of the subject token. A subject token past its
+        `exp`, an inactive client, a missing, replayed or foreign proof, and
+        more than 64 `repo:` scopes are refused. The service token's claims
+        are `aud`, `scope`, `proj_v`, `network_id`, `ur_client_id` and, where
+        they apply, `ur_subject_client_id`, `ur_sidecar_id`, `member_id` and
+        `act`; it is signed by the issuer's service key set. Scopes come from
+        the network's authorization projection, so until a network has one
+        the exchange grants no scope.
 
         Errors are the rfc 6749 section 5.2 envelope. The descriptions are
         deliberately terse and the detail is logged rather than returned, so
@@ -10607,19 +10624,37 @@ paths:
         never cached by a shared cache.
       operationId: oauthToken
       security: []
+      parameters:
+        - in: header
+          name: DPoP
+          required: false
+          description: |
+            Token exchange only, and required there: one rfc 9449 proof by the
+            client's Ed25519 key, `htm` POST, `htu` this endpoint at the
+            issuer's origin, `ath` the unpadded base64url of SHA-256 over the
+            subject token, `iat` within 60 seconds, its `jti` single use.
+          schema:
+            type: string
       requestBody:
         required: true
         content:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              required: [client_id, grant_type]
+              required: [grant_type]
               properties:
                 grant_type:
                   type: string
-                  enum: [authorization_code, refresh_token]
+                  enum: [authorization_code, refresh_token, "urn:ietf:params:oauth:grant-type:token-exchange"]
                 client_id:
                   type: string
+                  description: authorization_code and refresh_token grants, which require it.
+                subject_token:
+                  type: string
+                  description: token exchange; the sidecar's client JWT.
+                subject_token_type:
+                  type: string
+                  description: token exchange; `urn:ur:params:oauth:token-type:client-jwt`.
                 code:
                   type: string
                   description: authorization_code grant.
@@ -10631,22 +10666,35 @@ paths:
                   description: authorization_code grant; the PKCE verifier.
                 resource:
                   type: string
-                  description: authorization_code grant; the rfc 8707 resource indicator.
+                  description: |
+                    authorization_code grant: the rfc 8707 resource indicator.
+                    token exchange: exactly one, the https origin of the
+                    service the token is for.
                 refresh_token:
                   type: string
                   description: refresh_token grant.
                 scope:
                   type: string
-                  description: refresh_token grant; a space-separated subset of the granted scopes.
+                  description: |
+                    refresh_token grant: a space-separated subset of the
+                    granted scopes. token exchange: the capabilities asked
+                    for, such as `repo:<id>:r`, at most 64 `repo:` scopes.
       responses:
         "200":
-          description: OK.
+          description: OK. `OauthTokenResponse`, or for the token exchange `OauthTokenExchangeResponse`.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OauthTokenResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/OauthTokenResponse"
+                  - $ref: "#/components/schemas/OauthTokenExchangeResponse"
         "400":
-          description: invalid_request, invalid_client, invalid_grant, or unsupported_grant_type.
+          description: |
+            invalid_request, invalid_client, invalid_grant, or
+            unsupported_grant_type; for the token exchange also invalid_target
+            (the resource is no service, or is the api), invalid_scope,
+            invalid_dpop_proof, and restore_required while a site-loss
+            restore holds the exchange.
           content:
             application/json:
               schema:
@@ -25260,6 +25308,31 @@ components:
           type: string
         scope:
           type: string
+
+    OauthTokenExchangeResponse:
+      type: object
+      description: The rfc 8693 section 2.2.1 answer of the token exchange.
+      required:
+        - access_token
+        - issued_token_type
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          description: The service token. Never stored by the server.
+        issued_token_type:
+          type: string
+          description: "`urn:ietf:params:oauth:token-type:access_token`."
+        token_type:
+          type: string
+          description: "`Bearer`."
+        expires_in:
+          type: integer
+          description: Seconds until the token's `exp`, at most 900.
+        scope:
+          type: string
+          description: The scopes granted, which may be fewer than asked for. Absent for none.
 
     OauthError:
       type: object
