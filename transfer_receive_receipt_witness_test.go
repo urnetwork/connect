@@ -197,6 +197,7 @@ func TestReceiveReceiptAdmissionUnpooledHeldCancelClearsOwners(t *testing.T) {
 			settings.ReceiveQueueMaxByteCount = 16 * 1024
 			settings.ReceiveHoldPolicy = ReceiveHoldRefuse
 		})
+		f.paidOffers = true
 		delivered := f.observeGeneric()
 		messageId := NewId()
 		f.offerGeneric(1, messageId, 12*1024+1)
