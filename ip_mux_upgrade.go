@@ -103,10 +103,14 @@ type DnsUpgradeSettings struct {
 	// during startup, which can reveal those lookups to the local network. nil (the default)
 	// disables the fallback: DNS then resolves only through the tunnel.
 	Fallback *DnsResolverSettings
-	// Limits Fallback to the connect window: it races a query only while the
-	// tunnel is not ready (see UpgradeMux.SetTunnelReady), and once the tunnel
-	// is ready only the tunnel resolvers answer. The device sets it while a
-	// third-party preset is selected (ADBLOCK3RD C7), with Fallback
+	// Limits Fallback to the connect window: it races a query, and warms,
+	// only while the tunnel is not ready (see UpgradeMux.SetTunnelReady), and
+	// once the tunnel is ready only the tunnel resolvers answer. The window is
+	// read when a query starts and again when its handicap ends, so a query
+	// that started just before the tunnel became ready never asks the host
+	// after all. Without a SetTunnelReady predicate the window cannot be seen
+	// open and Fallback never races: the flag fails closed. The device sets it
+	// while a third-party preset is selected (ADBLOCK3RD C7), with Fallback
 	// set to URnetwork's default resolver on the host network: the preset
 	// provider then never sees the user's own address, and once connected an
 	// unfiltered resolver never races a filtering preset's answers. False, the
@@ -123,13 +127,16 @@ type DnsUpgradeSettings struct {
 	// never replaced. The device sets URnetwork's default resolver here for
 	// an ad-blocking or no-filtering preset (ADBLOCK3RD C1, C2).
 	Failover *DnsResolverSettings
-	// How many consecutive failed resolutions make Resolver failing. A
-	// failure counts only while the tunnel is ready (UpgradeMux.SetTunnelReady)
-	// both when the resolution starts and when it fails; a resolution canceled
-	// because another path answered first is not a failure, an answer served
-	// stale is, and a cache hit is no evidence either way. Any fresh answer
-	// clears the run. Non-positive disables failure detection: Resolver never
-	// reports failing, so Failover never engages.
+	// How many consecutive failed resolutions make Resolver failing. A query's
+	// first failed attempt is its one failure, counted as soon as it fails
+	// rather than when its retries run out, so a resolver that black-holes the
+	// exit counts at the first dial timeout. A failure counts only while the
+	// tunnel is ready (UpgradeMux.SetTunnelReady) both when the query starts
+	// and when the attempt fails; an attempt canceled because another path
+	// answered first is not a failure, an answer served stale is, and a cache
+	// hit is no evidence either way. Any fresh answer clears the run.
+	// Non-positive disables failure detection: Resolver never reports failing,
+	// so Failover never engages.
 	ResolverFailingMinCount int
 	// The least time a run of consecutive failures must span, from the start
 	// of its first failed resolution to the latest failure, before Resolver is
@@ -225,9 +232,11 @@ func DefaultUpgradeMuxSettings() *UpgradeMuxSettings {
 			// in a row is a handful of lookups, not one name's pair
 			ResolverFailingMinCount: 4,
 			// and those failures span ten seconds from the start of the first, so
-			// one burst failing together (a dial timeout shared by every lookup in
-			// flight) needs one more failure later to count, while a provider that
-			// black-holes the exit still trips on its first dial timeout (30s)
+			// one burst failing together needs one more failure later to count,
+			// while a provider that black-holes the exit still trips on the first
+			// dial timeout (the tun's 30s) of a burst of lookups: each query's
+			// first failed attempt counts when it fails, and the run starts when
+			// the earliest of those queries did
 			ResolverFailingMinDuration: 10 * time.Second,
 			// far below the cold prober's five minute cap: a failed over preset
 			// returns within half a minute of answering again, at the cost of one
@@ -1502,7 +1511,7 @@ func (self *UpgradeMux) wakeColdProber() {
 }
 
 func (self *UpgradeMux) warmFallbackDns() {
-	if !self.dnsUpgradeEnabled() || self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil {
+	if !self.dnsUpgradeEnabled() || self.ctx.Err() != nil || self.fallbackDohCache.Load() == nil || !self.fallbackWarmWindowOpen() {
 		self.fallbackDohWarmPending.Store(false)
 		return
 	}
@@ -1524,12 +1533,23 @@ func (self *UpgradeMux) warmFallbackDns() {
 			}
 			fallback := self.fallbackDohCache.Load()
 			warmFunction := self.fallbackDohWarmFunction
-			if fallback == nil || warmFunction == nil {
+			if fallback == nil || warmFunction == nil || !self.fallbackWarmWindowOpen() {
 				return
 			}
 			warmFunction(self.ctx, fallback, 2)
 		}
 	})
+}
+
+// Whether the host fallback may warm now: outside the connect window of a
+// FallbackUntilTunnelReady fallback a warm would be a host-network query the
+// fallback itself may no longer make (see fallbackWindowOpen).
+func (self *UpgradeMux) fallbackWarmWindowOpen() bool {
+	fallbackUntilTunnelReady := false
+	if settings := self.settings.Load(); settings != nil && settings.Dns != nil {
+		fallbackUntilTunnelReady = settings.Dns.FallbackUntilTunnelReady
+	}
+	return self.fallbackWindowOpen(fallbackUntilTunnelReady)
 }
 
 // WarmDns opens the DoH server connections in the background, ahead of the first user query:
@@ -1924,9 +1944,9 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 		fallbackUntilTunnelReady = dns.FallbackUntilTunnelReady
 	}
 	fallback := self.fallbackDohCache.Load()
-	if fallback != nil && fallbackUntilTunnelReady && self.isTunnelReady() {
-		// the connect window has closed: only the tunnel resolvers answer
-		// (DnsUpgradeSettings.FallbackUntilTunnelReady)
+	if fallback != nil && !self.fallbackWindowOpen(fallbackUntilTunnelReady) {
+		// the connect window has closed, or cannot be seen open: only the
+		// tunnel resolvers answer (DnsUpgradeSettings.FallbackUntilTunnelReady)
 		fallback = nil
 	}
 	// while the tunnel-DoH is cold (unproven, or stalled after consecutive failures),
@@ -2053,14 +2073,9 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 	go HandleError(func() {
 		defer workerDone()
 		tunnelDohGeneration := self.tunnelDohGeneration.Load()
-		// the resolver's health counts this resolution only if the tunnel was
-		// ready from its start (see recordResolverEvidence)
-		readyAtStart := self.isTunnelReady()
-		start := self.healthNow()
+		// the resolver's health evidence is recorded attempt by attempt inside
+		// (see resolveTunnelDoh)
 		result := self.resolveTunnelDoh(queryCtx, recordType, domain)
-		// read before reply cancels the shared ctx on this worker's own answer:
-		// canceled here means another path answered first, or the mux closed
-		canceled := errors.Is(queryCtx.Err(), context.Canceled)
 		if 0 < len(result.addrs) || result.authoritative {
 			// the tunnel path works: restore the full fallback handicap (see tunnelDohCold)
 			self.markTunnelDohProvenForGeneration(tunnelDohGeneration)
@@ -2074,9 +2089,6 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			}
 		}
 		reply(result.addrs, result.authoritative, result.blocked)
-		if result.primary {
-			self.recordResolverEvidence(tunnelDohGeneration, start, readyAtStart, canceled, result.dohLookupResult)
-		}
 	})
 
 	// handicapped local fallback: if the tunnel-DoH hasn't produced an answer within
@@ -2094,6 +2106,10 @@ func (self *UpgradeMux) startDnsPipeline(key DohKey, fl *dnsFlight, recordType s
 			case <-tunnelOk:
 				return
 			case <-queryCtx.Done():
+				return
+			}
+			if !self.fallbackWindowOpen(fallbackUntilTunnelReady) {
+				// the connect window closed while this query waited its handicap
 				return
 			}
 			result := fallback.lookup(queryCtx, recordType, domain)
@@ -2125,8 +2141,9 @@ func (self *UpgradeMux) startRawForwardPipeline(key DohKey, fl *dnsFlight, qType
 		fallbackUntilTunnelReady = dns.FallbackUntilTunnelReady
 	}
 	fallback := self.fallbackDohCache.Load()
-	if fallback != nil && fallbackUntilTunnelReady && self.isTunnelReady() {
-		// the connect window has closed (DnsUpgradeSettings.FallbackUntilTunnelReady)
+	if fallback != nil && !self.fallbackWindowOpen(fallbackUntilTunnelReady) {
+		// the connect window has closed, or cannot be seen open
+		// (DnsUpgradeSettings.FallbackUntilTunnelReady)
 		fallback = nil
 	}
 	if fallback != nil && 0 < localFallbackTimeout && 0 < coldLocalFallbackTimeout && self.tunnelDohCold() {
@@ -2186,6 +2203,10 @@ func (self *UpgradeMux) startRawForwardPipeline(key DohKey, fl *dnsFlight, qType
 				case <-tunnelOk:
 					return
 				case <-queryCtx.Done():
+					return
+				}
+				if !self.fallbackWindowOpen(fallbackUntilTunnelReady) {
+					// the connect window closed while this query waited its handicap
 					return
 				}
 				response, ok := fallback.Forward(queryCtx, qType, domain)
@@ -2542,13 +2563,32 @@ type tunnelDohResult struct {
 // while failed over; see activeTunnelDohCache), retrying on dnsRetryBackoff until it gets a
 // real answer (records, or an authoritative no-record), the backoff is exhausted, or ctx is done.
 // Each attempt asks one cache: the two never share a fan-out.
+//
+// An attempt that went to the resolver is health evidence as soon as it ends
+// (recordResolverEvidence): a fresh answer a success, and the query's first
+// failed attempt its one failure, so a resolver that black-holes the exit
+// counts at the first dial timeout rather than when the retries run out. The
+// query's later failed attempts add nothing. ctx is canceled only by another
+// path answering first or the mux closing, since the caller replies after this
+// returns, so a canceled attempt is no failure.
 func (self *UpgradeMux) resolveTunnelDoh(ctx context.Context, recordType string, domain string) tunnelDohResult {
+	generation := self.tunnelDohGeneration.Load()
+	readyAtStart := self.isTunnelReady()
+	start := self.healthNow()
+	failureSeen := false
 	var result tunnelDohResult
 	for i := 0; ; i++ {
 		doh, primary := self.activeTunnelDohCache()
 		result = tunnelDohResult{
 			dohLookupResult: doh.lookup(ctx, recordType, domain),
 			primary:         primary,
+		}
+		if result.primary {
+			failure := result.stale || (len(result.addrs) == 0 && !result.authoritative)
+			if !failure || !failureSeen {
+				failureSeen = failureSeen || failure
+				self.recordResolverEvidence(generation, start, readyAtStart, errors.Is(ctx.Err(), context.Canceled), result.dohLookupResult)
+			}
 		}
 		if 0 < len(result.addrs) || result.authoritative {
 			return result

@@ -92,7 +92,9 @@ type DnsResolverProbeResult struct {
 // tunnel is ready to carry traffic. Resolver failures count toward failing
 // only while it reports true, and a FallbackUntilTunnelReady fallback races
 // only while it reports false. Without a predicate the tunnel never counts as
-// ready. The device installs it with the window, as it installs
+// ready, so failures never count, and a FallbackUntilTunnelReady fallback
+// never races either: the connect window cannot be seen open, and the flag
+// fails closed. The device installs it with the window, as it installs
 // SetIpv6Unroutable.
 func (self *UpgradeMux) SetTunnelReady(tunnelReady func() bool) {
 	if tunnelReady == nil {
@@ -108,6 +110,19 @@ func (self *UpgradeMux) isTunnelReady() bool {
 		return (*f)()
 	}
 	return false
+}
+
+// Whether the host fallback may race a query now, or warm: always without
+// FallbackUntilTunnelReady; with it, only while a tunnel-ready predicate is
+// installed and reports the tunnel not ready (the connect window). Asked when
+// a query starts and again when its handicap ends, so a window that closed in
+// between keeps the fallback out.
+func (self *UpgradeMux) fallbackWindowOpen(fallbackUntilTunnelReady bool) bool {
+	if !fallbackUntilTunnelReady {
+		return true
+	}
+	f := self.tunnelReady.Load()
+	return f != nil && !(*f)()
 }
 
 // The current health of the tunnel resolver, with the block count.
@@ -245,10 +260,16 @@ func (self *UpgradeMux) healthNow() time.Time {
 }
 
 // Starts a new generation's health: cold on the resolver, which a network
-// change or a settings swap does (markTunnelDohUnproven).
+// change or a settings swap does (markTunnelDohUnproven). Generations only
+// grow, and two changes racing can finish their resets out of order, so a
+// reset to a generation the health has already passed is stale and changes
+// nothing: otherwise the health would stay on the older generation and drop
+// every later piece of evidence.
 func (self *UpgradeMux) resetResolverHealth(generation uint64) {
 	self.updateResolverHealth(func(health *resolverHealthState) {
-		*health = resolverHealthState{generation: generation}
+		if health.generation < generation {
+			*health = resolverHealthState{generation: generation}
+		}
 	})
 	// a running failover prober re-reads the state now instead of at its next
 	// interval, and finds nothing left to do
@@ -322,22 +343,49 @@ func (self *UpgradeMux) activeTunnelDohCache() (*DohCache, bool) {
 // The failover resolver's tunnel DoH cache for the settings, or nil without a
 // Failover: built on the tun like the resolver's, so it egresses at the exit,
 // shares the owner's memory target and wave caps, and binds its answers to
-// the exit that carried them.
+// the exit that carried them. It is tunnel DoH only whatever it is given
+// (DnsUpgradeSettings.Failover): a copy with local DoH, local plain dns and
+// remote plain dns turned off and their servers dropped, so it never answers
+// over the host network or in plaintext.
 func buildFailoverDohCache(tun *Tun, settings *UpgradeMuxSettings) *DohCache {
 	if settings == nil || settings.Dns == nil || settings.Dns.Resolver == nil || settings.Dns.Failover == nil {
 		return nil
 	}
-	return tun.buildDohCache(settings.Dns.Failover, dohRequestTimeout(settings))
+	failover := *settings.Dns.Failover
+	failover.EnableLocalDoh = false
+	failover.EnableLocalDns = false
+	failover.EnableRemoteDns = false
+	failover.LocalDohUrlsIpv4 = nil
+	failover.LocalDohUrlsIpv6 = nil
+	failover.LocalDnsIpv4 = nil
+	failover.LocalDnsIpv6 = nil
+	failover.RemoteDnsIpv4 = nil
+	failover.RemoteDnsIpv6 = nil
+	failover.DohServerHostAddrs = cloneDohServerHostAddrs(failover.DohServerHostAddrs)
+	return tun.buildDohCache(&failover, dohRequestTimeout(settings))
 }
 
-// Whether the failover prober has work: a failing resolver with a failover to
-// prove, or a failed over mux whose resolver it probes.
+// Whether the failover prober has work it can do: a failing resolver with a
+// failover to prove, or a failed over mux whose resolver it probes, which
+// needs a positive FailoverProbeInterval. With no work, or no warm function to
+// do it with, the prober stays stopped: a prober that started only to find
+// nothing to do would be restarted by its own exit, forever.
 func (self *UpgradeMux) failoverProbeNeeded() bool {
-	if self.ctx.Err() != nil || self.failoverDohCache.Load() == nil {
+	if self.ctx.Err() != nil || self.failoverDohCache.Load() == nil || self.failoverWarmFunction == nil {
 		return false
 	}
-	_, failing, _ := self.resolverHealthPhase()
-	return failing
+	_, failing, failedOver := self.resolverHealthPhase()
+	if !failing {
+		return false
+	}
+	if failedOver {
+		var probeInterval time.Duration
+		if dns := self.settings.Load().Dns; dns != nil {
+			probeInterval = dns.FailoverProbeInterval
+		}
+		return 0 < probeInterval
+	}
+	return true
 }
 
 // Starts the failover prober when it has work. At most one runs; a request
@@ -453,7 +501,11 @@ func (self *UpgradeMux) runFailoverProber() {
 // Changes are coalesced: each delivery carries the current health. Runs until
 // the mux closes.
 func (self *UpgradeMux) runResolverHealthCallbacks() {
-	deliveredState := self.resolverHealthStateMonitor.Value()
+	// every mux's health starts cold (markTunnelDohUnproven at construction),
+	// so any other state is a change to deliver, even one made before this
+	// goroutine first ran: reading the state here instead would take that
+	// change as already delivered
+	deliveredState := DnsResolverHealthCold
 	for {
 		state, update := self.resolverHealthStateMonitor.Get()
 		if state != deliveredState {
