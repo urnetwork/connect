@@ -241,6 +241,27 @@ extender's WebRTC carrier (`net_extender_webrtc.go`) applies the same check to
 both sides: any client may dial an extender. Tests that build their own ICE
 topology (loopback-only or an injected network) are exempt.
 
+#### 2.2.4 Dials a remote client names
+
+The device-hosted extender (`EXTENDER.md` G2) forwards a client's stream or
+datagrams to a host name it allows (A5), the operator's own or one under its
+wildcard, and the name resolves on the provider host, through that host's
+resolver. No packet of the forward passes the policy, and the name can resolve
+to a private or loopback address, to the host's own public address, or to
+whatever a rebinding resolver returns. So the extender's dialers carry
+`ProviderDialControl` (`ip_security_dial.go`) as their control: it judges the
+address each socket is about to connect to, after resolution, and refuses one
+that is not public unicast (§2.2.1) or is provider-local (§2.2.2) with a
+`ProviderDialRefusedError` naming the reason (`not-public`, `provider-local`,
+`provider-local-unknown`). It holds a provider-local guard for the check, so
+with no provider policy live it reads the host's addresses first, and with no
+successful read it refuses every otherwise public address. The synthetic speed
+exception does not apply: a dial is never served in memory. The sdk installs it
+on the stream forward, which the reverse proxy and the camouflage splice share,
+and on the datagram relay. A dial the host supplies itself
+(`DeviceLocalSettings.ProviderDialContextSettings`, a seam of headless test
+harnesses) is the host's and is not checked.
+
 ### 2.3 Ingress pipeline (source)
 
 Ingress mirrors only the static **drops**, evaluated on the *source* endpoint, and
@@ -398,6 +419,7 @@ and are local diagnostics: nothing about them is sent off the device.
 | `ip_security.go`             | yes | Interface, results, egress/ingress/disable policies, the destination rules' place in the pipeline, stats. |
 | `ip_security_public.go`      | yes | `isPublicUnicast`: the special-purpose registry tables (§2.2.1) and the synthetic speed exception. |
 | `ip_security_local.go`       | yes | The provider-local guard (§2.2.2): its settings, the process-wide snapshot, its refresh loop, `SetProviderObservedAddresses`. |
+| `ip_security_dial.go`        | yes | `ProviderDialControl`: the provider's destination rules on the sockets of a dial a remote client names (§2.2.4). |
 | `ip_security_reason.go`      | yes | Verdict reasons recorded with the egress statistics. |
 | `ip_security_cfaa.go`        | yes | CFAA detector: settings, verdicts, port policy, `cfaaBlockedIp4`/`cfaaBlockedIp6` range lookups. |
 | `ip_security_telegram.go`    | yes | Exact Telegram call-reflector endpoint/port exception. |
@@ -1115,7 +1137,11 @@ discovery by leaving discovery v4 enabled, which is admitted (§4.4.2).
   to `192.0.0.9`, its mapped form and `2001:1::1` are provider-local incidents
   through each provider entry and at `ClientReceive`, before the first read
   too, and refused as ICE candidates, while TURN anycast and the client role
-  are unchanged.
+  are unchanged. The dial control (`ip_security_dial_test.go`): every class
+  of address it receives, failing closed before the first read, and as the
+  control of `ConnectSettings` and of a datagram dialer, names that resolve to
+  loopback, a private address, an observed address, the router or PCP anycast
+  refused before any socket connects.
   `TestSyntheticSpeedRangeIsNeverDialed`: the NAT never dials the benchmarking
   blocks.
 - **CFAA:** `TestCfaaPortClassification` (full port table), `TestCfaaBlockedIps` (IP

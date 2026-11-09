@@ -1279,7 +1279,11 @@ tcp 443 first, the one port an extender requires, and only then start
 device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
 L2), each udp carrier bound independently and a failed udp bind disabling
 that carrier alone; the forward dialer is
-the device's egress-aware connect dial narrowed by family, and its failures
+the device's egress-aware connect dial narrowed by family, and it and the
+datagram relay's dialer carry the provider dial control, which refuses before
+the socket connects an address a destination name resolved to that is not
+public or is the provider host's own, on one of its links, an observed
+address or port control anycast (IP_SECURITY.md §2.2.4); its failures
 (A7) are logged, the first of each kind at once and then at most one line a
 minute carrying the count since, so an extender whose egress cannot reach
 the operator says so (connect#230); the whitelist is
