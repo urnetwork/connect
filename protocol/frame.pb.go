@@ -115,6 +115,11 @@ const (
 	// `Frame.message_bytes` is a marshaled `CloseSequences`. An older client
 	// ignores the unknown message type.
 	MessageType_TransferCloseSequences MessageType = 36
+	// the public addresses the platform observes the client's transports
+	// connecting from. Sent only from the control id, on every change of the
+	// set. `Frame.message_bytes` is a marshaled `ObservedAddresses`. An older
+	// client ignores the unknown message type.
+	MessageType_TransferObservedAddresses MessageType = 37
 	// ── URmessage (beta/message). Block 1000-1099 reserved so parallel beta
 	// branches do not collide. Every operation lives in a oneof inside
 	// MessageServerRequest/Response/Push, NOT as its own MessageType.
@@ -179,6 +184,7 @@ var (
 		34:   "TransferStreamAuthorization",
 		35:   "TransferResidentMoveResult",
 		36:   "TransferCloseSequences",
+		37:   "TransferObservedAddresses",
 		1000: "MessageMessageServerRequest",
 		1001: "MessageMessageServerResponse",
 		1002: "MessageMessageServerPush",
@@ -222,6 +228,7 @@ var (
 		"TransferStreamAuthorization":     34,
 		"TransferResidentMoveResult":      35,
 		"TransferCloseSequences":          36,
+		"TransferObservedAddresses":       37,
 		"MessageMessageServerRequest":     1000,
 		"MessageMessageServerResponse":    1001,
 		"MessageMessageServerPush":        1002,
@@ -326,7 +333,7 @@ const file_frame_proto_rawDesc = "" +
 	"\x05Frame\x129\n" +
 	"\fmessage_type\x18\x01 \x01(\x0e2\x16.bringyour.MessageTypeR\vmessageType\x12#\n" +
 	"\rmessage_bytes\x18\x02 \x01(\fR\fmessageBytes\x12\x10\n" +
-	"\x03raw\x18\x03 \x01(\bR\x03raw*\xe5\b\n" +
+	"\x03raw\x18\x03 \x01(\bR\x03raw*\x84\t\n" +
 	"\vMessageType\x12\x10\n" +
 	"\fTransferPack\x10\x00\x12\x0f\n" +
 	"\vTransferAck\x10\x01\x12\x14\n" +
@@ -365,7 +372,8 @@ const file_frame_proto_rawDesc = "" +
 	"\x1eTransferNetworkSessionsChanged\x10!\x12\x1f\n" +
 	"\x1bTransferStreamAuthorization\x10\"\x12\x1e\n" +
 	"\x1aTransferResidentMoveResult\x10#\x12\x1a\n" +
-	"\x16TransferCloseSequences\x10$\x12 \n" +
+	"\x16TransferCloseSequences\x10$\x12\x1d\n" +
+	"\x19TransferObservedAddresses\x10%\x12 \n" +
 	"\x1bMessageMessageServerRequest\x10\xe8\a\x12!\n" +
 	"\x1cMessageMessageServerResponse\x10\xe9\a\x12\x1d\n" +
 	"\x18MessageMessageServerPush\x10\xea\a\x12!\n" +

@@ -1740,6 +1740,10 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+	// The provider-local snapshot the platform's ObservedAddresses feed
+	// (transfer_observed_addresses.go). Nil, outside tests, is the process
+	// snapshot every provider policy reads.
+	providerLocalNetworksForTest *providerLocalNetworks
 
 	// TransportDelay, when set, offers the per-message delay header on this
 	// client's P2P streams as the active side, while the client's edges
@@ -2336,10 +2340,11 @@ type Client struct {
 	beforeLoopbackReleaseForTest func()
 
 	// contractManagerUnsub func()
-	webRtcManagerUnsub  func()
-	streamManagerUnsub  func()
-	peerManagerUnsub    func()
-	sequenceCloserUnsub func()
+	webRtcManagerUnsub     func()
+	streamManagerUnsub     func()
+	peerManagerUnsub       func()
+	sequenceCloserUnsub    func()
+	observedAddressesUnsub func()
 }
 
 func NewClientWithDefaults(
@@ -2469,6 +2474,7 @@ func NewClientWithTag(
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 	client.sequenceCloser = newSequenceCloser(client)
 	client.sequenceCloserUnsub = client.AddReceiveCallback(client.sequenceCloser.Receive)
+	client.observedAddressesUnsub = client.AddReceiveCallback(client.receiveObservedAddresses)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 	client.networkQuality = newClientNetworkQualityState(client)
@@ -5305,6 +5311,7 @@ func (self *Client) Close() {
 	self.streamManagerUnsub()
 	self.peerManagerUnsub()
 	self.sequenceCloserUnsub()
+	self.observedAddressesUnsub()
 }
 
 // CloseAndWait closes the client and joins its reader, close worker,
