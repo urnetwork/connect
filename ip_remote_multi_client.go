@@ -6805,10 +6805,18 @@ func (self *RemoteUserNatMultiClient) egressRelationshipFor(
 ) protocol.ProvideMode {
 	relationship := egressRelationship(provideMode, self.provideMode)
 	if relationship != protocol.ProvideMode_Service &&
-		sharePrivateDestinationContains(self.settings.SharePrivateDestinations, ipPath.DestinationIp) {
+		sharePrivateDestinationContains(self.sharePrivateDestinations(), ipPath.DestinationIp) {
 		return protocol.ProvideMode_Network
 	}
 	return relationship
+}
+
+// The share's private destinations; none for a client built without settings.
+func (self *RemoteUserNatMultiClient) sharePrivateDestinations() []netip.Prefix {
+	if self.settings == nil {
+		return nil
+	}
+	return self.settings.SharePrivateDestinations
 }
 
 // The client-side check of one reply. With a share's private destinations
@@ -6820,7 +6828,7 @@ func (self *RemoteUserNatMultiClient) inspectIngressFor(
 	provideMode protocol.ProvideMode,
 	ipPath *IpPath,
 ) (SecurityPolicyResult, error) {
-	if prefixes := self.settings.SharePrivateDestinations; 0 < len(prefixes) &&
+	if prefixes := self.sharePrivateDestinations(); 0 < len(prefixes) &&
 		provideMode != protocol.ProvideMode_Network && provideMode != protocol.ProvideMode_Service {
 		if sharePrivateDestinationContains(prefixes, ipPath.SourceIp) {
 			return SecurityPolicyResultAllow, nil
