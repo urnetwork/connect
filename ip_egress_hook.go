@@ -243,11 +243,11 @@ func administrativeRejectHosts(sourceIp net.IP, destinationIp net.IP) bool {
 	return single(sourceIp) && single(destinationIp)
 }
 
-// What a provider knows of the sender of a packet, carried with the packet from
-// the receive callback to the flow it opens: the contract seals, the contract
-// id and the session's verified client key, from `Peer` without its delivery
-// capability. The zero value is a packet a caller handed the NAT directly, with
-// no peer: no seals, no contract and no session key.
+// What a flow keeps of the peer whose packet opened it: the contract seals, the
+// contract id and the session's verified client key, from `Peer` without its
+// roles, principal or delivery. The zero value is a flow a caller's packet
+// opened with no peer, or one a NAT without a hook opened: no seals, no
+// contract and no session key.
 type egressSource struct {
 	contractClass     protocol.ContractClass
 	sourceSubject     Id
