@@ -87,6 +87,7 @@ func internalDohSettings(settings *DohSettings, domains []string) *DohSettings {
 		resolver.RemoteDnsIpv6 = append([]string(nil), resolver.RemoteDnsIpv6...)
 		resolver.LocalDnsIpv4 = append([]string(nil), resolver.LocalDnsIpv4...)
 		resolver.LocalDnsIpv6 = append([]string(nil), resolver.LocalDnsIpv6...)
+		resolver.DohServerHostAddrs = cloneDohServerHostAddrs(resolver.DohServerHostAddrs)
 		copied.DnsResolverSettings = &resolver
 	}
 	copied.DnsResolverSettings.EnableRemoteDns = false

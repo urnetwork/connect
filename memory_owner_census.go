@@ -2,6 +2,7 @@ package connect
 
 import (
 	"net/http"
+	"slices"
 	"unsafe"
 )
 
@@ -393,13 +394,14 @@ func (self *UpgradeMux) MemoryOwnerCensus() DnsOwnerCensus {
 	if self == nil {
 		return out
 	}
-	var caches [2]*DohCache
+	var caches [3]*DohCache
 	if self.mux != nil && self.mux.Tun() != nil {
 		caches[0] = self.mux.Tun().DohCache()
 	}
 	caches[1] = self.fallbackDohCache.Load()
+	caches[2] = self.failoverDohCache.Load()
 	for i, cache := range caches {
-		if cache == nil || (i == 1 && cache == caches[0]) {
+		if cache == nil || slices.Contains(caches[:i], cache) {
 			continue
 		}
 		cache.stateLock.Lock()

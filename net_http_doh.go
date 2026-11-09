@@ -435,8 +435,11 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 		tlsConfig.ClientSessionCache = sessionCache
 	}
 	tr.TLSClientConfig = tlsConfig
-	// most doh providers discontinued http1.1 late 2025; force h2 instead of the default
-	// h1->h2 autonegotiate, since that no longer works.
+	// most doh providers discontinued http1.1 late 2025, and some (Quad9, DNS4EU)
+	// require h2 negotiated by ALPN. A transport with its own dialer and tls config
+	// does not attempt h2 at all, so ConfigureTransports registers it here and puts
+	// "h2" first in the ALPN offer, ahead of "http/1.1": an h2 server is spoken to
+	// over h2, and a server that only speaks HTTP/1.1 still answers over it.
 	// see https://quad9.net/news/blog/doh-http-1-1-retirement/
 	// ConfigureTransports (plural) returns the h2 transport so we can keep the connection
 	// warm: ReadIdleTimeout sends keepalive PINGs while idle, which both holds the pooled
@@ -472,6 +475,12 @@ type DohCache struct {
 	// plain dns through the tunnel even when EnableRemoteDns is false — the
 	// one permitted consumer while it is disabled (see resolve)
 	dohServerNames map[string]bool
+
+	// the pinned DoH server hosts (DnsResolverSettings.DohServerHostAddrs, see
+	// dohPinnedHostAddrs): a lookup of one answers its addresses (see lookup)
+	// and is never resolved, and every DoH client dials them
+	// (dohPinnedDialContext). nil pins nothing.
+	pinnedHostAddrs map[string][]netip.Addr
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
@@ -564,13 +573,163 @@ func (self *dohCacheLifecycle) shutdown() {
 }
 
 // dohFlight is one in-flight resolution shared by every caller waiting on the same query. the
-// leader resolves, sets addrs/authoritative, then closes done to release the waiters.
+// leader resolves, sets the result fields (those of dohLookupResult), then closes done to
+// release the waiters.
 type dohFlight struct {
 	done          chan struct{}
 	addrs         []netip.Addr
 	authoritative bool
+	fresh         bool
 	stale         bool
+	blocked       bool
 	ownerCanceled bool
+}
+
+// The flight's published outcome, for a waiter.
+func (self *dohFlight) result() dohLookupResult {
+	return dohLookupResult{
+		addrs:         self.addrs,
+		authoritative: self.authoritative,
+		fresh:         self.fresh,
+		stale:         self.stale,
+		blocked:       self.blocked,
+	}
+}
+
+// Publishes a leader's outcome on the flight, and returns it.
+func (self *dohFlight) setResult(result dohLookupResult) dohLookupResult {
+	self.addrs = result.addrs
+	self.authoritative = result.authoritative
+	self.fresh = result.fresh
+	self.stale = result.stale
+	self.blocked = result.blocked
+	return result
+}
+
+// One lookup's outcome (DohCache.lookup): what QueryResult returns, and the
+// evidence the mux needs for its resolver health and block count.
+type dohLookupResult struct {
+	addrs []netip.Addr
+	// records, or an authoritative no-record answer (NXDOMAIN, NODATA)
+	authoritative bool
+	// a network resolution produced the answer, records or an authoritative
+	// miss: false for a cache hit, a pinned host, an answer served stale and
+	// a failure
+	fresh bool
+	// the answer is a retained one served stale (RFC 8767) because the fresh
+	// resolution failed
+	stale bool
+	// the authoritative miss is a filtering block: an NXDOMAIN carrying an
+	// extended dns error of 15, 16 or 17 (dnsBlockEdeCode)
+	blocked bool
+}
+
+// The pinned addresses of DnsResolverSettings.DohServerHostAddrs by host, lower
+// case and without a trailing dot: parsed, unmapped and without repeats. An
+// address that does not parse, has a zone, or is unspecified is dropped. A
+// listed host keeps its entry with no usable address, so it still never
+// resolves. An ip literal key is ignored: it needs no pin. nil for none.
+func dohPinnedHostAddrs(rs *DnsResolverSettings) map[string][]netip.Addr {
+	if rs == nil || len(rs.DohServerHostAddrs) == 0 {
+		return nil
+	}
+	pinnedHostAddrs := make(map[string][]netip.Addr, len(rs.DohServerHostAddrs))
+	for host, values := range rs.DohServerHostAddrs {
+		host = dohPinnedHostKey(host)
+		if host == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			continue
+		}
+		addrs := pinnedHostAddrs[host]
+		if addrs == nil {
+			addrs = []netip.Addr{}
+		}
+		for _, value := range values {
+			addr, err := netip.ParseAddr(strings.TrimSpace(value))
+			if err != nil || addr.Zone() != "" {
+				continue
+			}
+			addr = addr.Unmap()
+			if addr.IsUnspecified() || slices.Contains(addrs, addr) {
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
+		pinnedHostAddrs[host] = addrs
+	}
+	return pinnedHostAddrs
+}
+
+// A host as the key of the pinned host table: trimmed, lower case, without a
+// trailing dot.
+func dohPinnedHostKey(host string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+// A deep copy of DnsResolverSettings.DohServerHostAddrs, nil for nil, for the
+// copies of resolver settings that clone their lists.
+func cloneDohServerHostAddrs(hostAddrs map[string][]string) map[string][]string {
+	if hostAddrs == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(hostAddrs))
+	for host, addrs := range hostAddrs {
+		cloned[host] = slices.Clone(addrs)
+	}
+	return cloned
+}
+
+// Wraps a DoH client's dial so that a pinned host (dohPinnedHostAddrs) is
+// dialed at its addresses of the dial's family, raced as a stream dial races
+// resolved addresses (dialHostPortRace), and never looked up: the dial below
+// sees ip literals only, whether it is the tun's (which would resolve a name
+// through its cache), the host's (the OS resolver) or a caller's. A pinned host
+// with no address of the family fails, so a dead pin set fails closed instead
+// of falling back to a lookup. Every other address passes through unchanged,
+// and with no pins the dial is returned as it is. onPinned, when set, is
+// called with the host and the addresses before they are dialed.
+func dohPinnedDialContext(pinnedHostAddrs map[string][]netip.Addr, onPinned func(host string, addrs []netip.Addr), dial DialContextFunction) DialContextFunction {
+	if len(pinnedHostAddrs) == 0 {
+		return dial
+	}
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return dial(ctx, network, address)
+		}
+		pins, ok := pinnedHostAddrs[dohPinnedHostKey(host)]
+		if !ok {
+			return dial(ctx, network, address)
+		}
+		addrs := orderDialAddrs(dialAddrsMatchNetwork(network, pins))
+		if len(addrs) == 0 {
+			return nil, &net.DNSError{Err: "no pinned address of the dial's family", Name: host, IsNotFound: true}
+		}
+		if onPinned != nil {
+			HandleError(func() {
+				onPinned(dohPinnedHostKey(host), addrs)
+			})
+		}
+		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, dial)
+	}
+}
+
+// Whether addrs is a sink answer: at least one address, every one 0.0.0.0 or
+// ::. A filtering resolver answers a blocked name so (ADBLOCK3RD B4); the mux
+// delivers it but never records it in the reverse index or binds it to an
+// exit, as with the built-in blocker's answers.
+func dnsSinkAddrs(addrs []netip.Addr) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	for _, addr := range addrs {
+		if !addr.IsUnspecified() {
+			return false
+		}
+	}
+	return true
 }
 
 func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []string {
@@ -692,12 +851,22 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		maxResolutions = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
 	}
 
+	// a pinned DoH server host is dialed at its addresses on both paths and never
+	// looked up (DnsResolverSettings.DohServerHostAddrs). The tunnel path reports
+	// the pins as the host's addresses, as a resolution of the name would
+	// (DohServerResolvedCallback), so the reverse index names them.
+	pinnedHostAddrs := dohPinnedHostAddrs(settings.DnsResolverSettings)
+	onRemotePinned := func(host string, addrs []netip.Addr) {
+		if settings.DohServerResolvedCallback != nil {
+			settings.DohServerResolvedCallback(host, addrs)
+		}
+	}
 	// distinct TLS session caches per dial path: a ticket obtained via the host egress
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
-	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, onRemotePinned, wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, nil, wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
 	httpConcurrency := maxConcurrentHttpRequests(settings)
@@ -745,6 +914,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		settings:              settings,
 		log:                   loggerOrDefault(settings.Log),
 		dohServerNames:        dohServerNames,
+		pinnedHostAddrs:       pinnedHostAddrs,
 		queryResultExpiration: map[DohKey]*DohResult{},
 		inflight:              map[DohKey]*dohFlight{},
 		resolveSem:            make(chan struct{}, maxResolutions),
@@ -885,11 +1055,12 @@ warmLoop:
 				successCancelOnce.Do(queryCancel)
 			} else if successCount.Load() == 0 {
 				client.stats.record(dohUrl, false)
+				// the url by scheme and host only: its path can hold a personal id
 				var failure string
 				if queryErr != nil {
 					failure = queryErr.Error()
 				} else {
-					failure = fmt.Sprintf("%s returned no usable A answer", dohUrl)
+					failure = fmt.Sprintf("%s returned no usable A answer", DohUrlForLog(dohUrl))
 				}
 				failureLock.Lock()
 				if firstFailure == "" {
@@ -907,6 +1078,128 @@ warmLoop:
 		self.log.Infof("[dns]warm failed: %s\n", firstFailure)
 	}
 	return false
+}
+
+// probe asks every remote DoH url of the cache for the A records of name, once
+// each and concurrently, and returns each url's response in the cache's url
+// order (see UpgradeMux.ProbeDnsResolver). It reads nothing from and writes
+// nothing to the answer cache, records no server score, fires no callback and
+// applies no guard: the responses are reported as the servers sent them. Each
+// request holds an in-flight slot and the dns memory reservation like any
+// query and is bounded by ctx and RequestTimeout. nil when the cache has no
+// remote DoH.
+func (self *DohCache) probe(ctx context.Context, name string) []DnsResolverProbeResult {
+	if self.lifecycle.retired.Load() {
+		return nil
+	}
+	probeLifetimeCtx, probeLifetimeDone, ok := self.lifecycle.context(ctx)
+	if !ok {
+		return nil
+	}
+	defer probeLifetimeDone()
+
+	settings := self.settings
+	rs := settings.DnsResolverSettings
+	if rs == nil || !rs.EnableRemoteDoh || settings.RequestTimeout <= 0 {
+		return nil
+	}
+	dohUrls := remoteDohUrls(settings, settings.IpVersion)
+	if len(dohUrls) == 0 {
+		return nil
+	}
+	results := make([]DnsResolverProbeResult, len(dohUrls))
+	for i, dohUrl := range dohUrls {
+		results[i].Url = dohUrl
+	}
+	asciiName, err := Punycode(name)
+	if err != nil {
+		for i := range results {
+			results[i].Err = fmt.Errorf("probe name: %w", err)
+		}
+		return results
+	}
+
+	queryCtx, queryCancel := context.WithTimeout(probeLifetimeCtx, settings.RequestTimeout)
+	defer queryCancel()
+	client := self.remoteClient
+	var probeWg sync.WaitGroup
+	for i, dohUrl := range dohUrls {
+		if client.httpSem != nil {
+			select {
+			case client.httpSem <- struct{}{}:
+			case <-queryCtx.Done():
+				results[i].Err = queryCtx.Err()
+				continue
+			}
+		}
+		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
+			if client.httpSem != nil {
+				<-client.httpSem
+			}
+			results[i].Err = context.Cause(queryCtx)
+			if results[i].Err == nil {
+				results[i].Err = fmt.Errorf("probe %s: no dns memory", DohUrlForLog(dohUrl))
+			}
+			continue
+		}
+		probeWg.Add(1)
+		go HandleError(func() {
+			defer probeWg.Done()
+			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
+			if client.httpSem != nil {
+				defer func() { <-client.httpSem }()
+			}
+			data, err := client.queryWireRawDetailed(queryCtx, dohUrl, dnsmessage.TypeA, asciiName)
+			if err != nil {
+				results[i].Err = err
+				return
+			}
+			results[i] = dnsProbeResult(dohUrl, data)
+		})
+	}
+	probeWg.Wait()
+	return results
+}
+
+// One url's probe result from its raw response: the response code, the A
+// records and the extended dns error codes. A response that does not parse
+// past its header is no answer.
+func dnsProbeResult(dohUrl string, response []byte) DnsResolverProbeResult {
+	result := DnsResolverProbeResult{Url: dohUrl}
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		result.Err = fmt.Errorf("probe %s: malformed response: %w", DohUrlForLog(dohUrl), err)
+		return result
+	}
+	result.Answered = true
+	result.RCode = header.RCode
+	if err := p.SkipAllQuestions(); err != nil {
+		return result
+	}
+	for {
+		ah, err := p.AnswerHeader()
+		if err != nil {
+			// dnsmessage.ErrSectionDone, or a malformed answer
+			if err != dnsmessage.ErrSectionDone {
+				return result
+			}
+			break
+		}
+		if ah.Type != dnsmessage.TypeA {
+			if err := p.SkipAnswer(); err != nil {
+				return result
+			}
+			continue
+		}
+		r, err := p.AResource()
+		if err != nil {
+			return result
+		}
+		result.Addrs = append(result.Addrs, netip.AddrFrom4(r.A))
+	}
+	result.EdeCodes = dnsResponseEdeCodes(&p)
+	return result
 }
 
 // ShedMemory drops the query result cache and releases the pooled connections, for the host's
@@ -973,23 +1266,37 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 // through the normal resolve() caching. The stale entry never suppresses the resolution attempt
 // itself — every expired-entry query still resolves (or joins the in-flight resolution) first.
 func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain string) (addrs []netip.Addr, authoritative bool) {
+	result := self.lookup(ctx, recordType, domain)
+	return result.addrs, result.authoritative
+}
+
+// QueryResult with the evidence of the outcome (dohLookupResult): whether a
+// network resolution produced it, whether it was served stale, and whether a
+// miss was a filtering block. A pinned host (DnsResolverSettings.
+// DohServerHostAddrs) is answered from its pins before anything else, never
+// resolved, cached or held behind the resolution bounds: it is the name a DoH
+// request through this cache's own tun dials.
+func (self *DohCache) lookup(ctx context.Context, recordType string, domain string) (result dohLookupResult) {
+	if addrs, ok := self.pinnedHostAnswer(recordType, domain); ok {
+		return dohLookupResult{addrs: addrs, authoritative: true}
+	}
+
 	callerCtx := ctx
 	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeAddress)
-	stale := false
 	defer func() {
 		resultCtx := callerCtx
 		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
 			resultCtx = self.lifecycle.ctx
 		}
-		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(addrs), authoritative, stale))
+		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(result.addrs), result.authoritative, result.stale))
 	}()
 
 	q := NewDohKey(recordType, domain)
 	retryDeadline := time.Now().Add(self.settings.RequestTimeout)
 	var retry bool
-	addrs, authoritative, stale, retry = self.queryResult(ctx, q)
+	result, retry = self.queryResult(ctx, q)
 	if !retry || ctx.Err() != nil || self.lifecycle.retired.Load() || self.settings.RequestTimeout <= 0 {
-		return addrs, authoritative
+		return result
 	}
 
 	// One remaining-budget owner covers every handoff, never one deferred
@@ -998,36 +1305,83 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	defer retryCancel()
 	for {
 		if retryCtx.Err() != nil || self.lifecycle.retired.Load() {
-			return nil, false
+			return dohLookupResult{}
 		}
 		reconnect := NewPacedReconnect(DefaultDialFallbackDelay)
-		addrs, authoritative, stale, retry = self.queryResult(retryCtx, q)
+		result, retry = self.queryResult(retryCtx, q)
 		if !retry {
-			return addrs, authoritative
+			return result
 		}
 		// Repeated foreign cancellation cannot spin or replenish the budget.
 		select {
 		case <-retryCtx.Done():
-			return nil, false
+			return dohLookupResult{}
 		case <-self.lifecycle.ctx.Done():
-			return nil, false
+			return dohLookupResult{}
 		case <-reconnect.After():
 		}
 	}
 }
 
+// Whether domain is a pinned DoH server host (dohPinnedHostAddrs).
+func (self *DohCache) pinnedHost(domain string) bool {
+	if len(self.pinnedHostAddrs) == 0 {
+		return false
+	}
+	_, ok := self.pinnedHostAddrs[dohPinnedHostKey(domain)]
+	return ok
+}
+
+// The answer to a lookup of a pinned DoH server host: its addresses of the
+// record type's family, authoritative even when there are none, so a dial of
+// the name uses the other family and never falls through to a resolver. Any
+// other record type of a pinned host answers empty. ok is false for a host
+// that is not pinned. The pins are reported like a resolution of the name
+// (DohServerResolvedCallback).
+func (self *DohCache) pinnedHostAnswer(recordType string, domain string) (addrs []netip.Addr, ok bool) {
+	if len(self.pinnedHostAddrs) == 0 {
+		return nil, false
+	}
+	host := dohPinnedHostKey(domain)
+	pins, ok := self.pinnedHostAddrs[host]
+	if !ok {
+		return nil, false
+	}
+	addrs = []netip.Addr{}
+	switch strings.ToUpper(recordType) {
+	case "A":
+		for _, pin := range pins {
+			if pin.Is4() {
+				addrs = append(addrs, pin)
+			}
+		}
+	case "AAAA":
+		for _, pin := range pins {
+			if pin.Is6() {
+				addrs = append(addrs, pin)
+			}
+		}
+	}
+	if 0 < len(addrs) && self.settings.DohServerResolvedCallback != nil {
+		HandleError(func() {
+			self.settings.DohServerResolvedCallback(host, addrs)
+		})
+	}
+	return addrs, true
+}
+
 // Resolves or joins one generation; only an empty canceled owner permits retry.
-func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.Addr, authoritative bool, stale bool, retry bool) {
+func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLookupResult, retry bool) {
 	callerCtx := ctx
 	if self.lifecycle.retired.Load() {
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
 	now := time.Now()
 
 	var fl *dohFlight
 	var leader bool
 	var hit bool
-	var hitAddrs []netip.Addr
+	var hitResult dohLookupResult
 	var staleAddrs []netip.Addr
 	func() {
 		self.stateLock.Lock()
@@ -1036,7 +1390,9 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		if r := self.queryResultExpiration[q]; r != nil {
 			if r.Valid(now, self.settings.MissExpiration) {
 				hit = true
-				hitAddrs = r.Addrs()
+				// a cached entry (records or an authoritative miss) is itself
+				// authoritative, and no network resolution produced it now
+				hitResult = dohLookupResult{addrs: r.Addrs(), authoritative: true, blocked: r.Blocked}
 				return
 			}
 			if r.staleUsable(now) {
@@ -1057,20 +1413,18 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		}
 	}()
 	if hit {
-		// a cached entry (records or an authoritative miss) is itself authoritative
-		return hitAddrs, true, false, false
+		return hitResult, false
 	}
 
 	// serveStale is the one place a stale answer leaves this method: it logs (one line per
 	// stale serve, naming the domain — the field signal that failover leaned on the cache) and
 	// counts, so neither can drift from the other.
-	serveStale := func() ([]netip.Addr, bool) {
-		stale = true
+	serveStale := func() dohLookupResult {
 		self.staleServeCount.Add(1)
 		// loggerOrDefault: nil-safe against a literally-constructed cache (NewDohCache always
 		// sets log, but a panic in the DNS fallback path is never acceptable)
 		loggerOrDefault(self.log).Infof("[doh]serve stale %s %s (%d addrs)\n", q.RecordType, q.Domain, len(staleAddrs))
-		return staleAddrs, true
+		return dohLookupResult{addrs: staleAddrs, authoritative: true, stale: true}
 	}
 
 	if !leader {
@@ -1079,24 +1433,21 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		select {
 		case <-fl.done:
 			if fl.ownerCanceled && !fl.authoritative && len(fl.addrs) == 0 && ctx.Err() == nil {
-				return nil, false, false, true
+				return dohLookupResult{}, true
 			}
-			stale = fl.stale
-			return fl.addrs, fl.authoritative, stale, false
+			return fl.result(), false
 		case <-ctx.Done():
 			if 0 < len(staleAddrs) {
-				addrs, authoritative = serveStale()
-				return addrs, authoritative, stale, false
+				return serveStale(), false
 			}
-			return nil, false, false, false
+			return dohLookupResult{}, false
 		case <-self.lifecycle.ctx.Done():
-			return nil, false, false, false
+			return dohLookupResult{}, false
 		}
 	}
 
 	// leader: resolve once, publish to any waiters, and drop the in-flight entry
 	defer func() {
-		fl.stale = stale
 		// Cleanup cancels resolveCtx before this defer; only the original
 		// owner's context can authorize a foreign waiter's new generation.
 		fl.ownerCanceled = callerCtx.Err() != nil && !fl.authoritative && len(fl.addrs) == 0
@@ -1111,7 +1462,7 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 	// Close and keep using the retired tunnel generation.
 	resolveCtx, resolveDone, ok := self.lifecycle.context(ctx)
 	if !ok {
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
 	defer resolveDone()
 	ctx = resolveCtx
@@ -1124,20 +1475,19 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		defer func() { <-self.resolveSem }()
 	case <-ctx.Done():
 		if 0 < len(staleAddrs) {
-			fl.addrs, fl.authoritative = serveStale()
-			return fl.addrs, fl.authoritative, stale, false
+			return fl.setResult(serveStale()), false
 		}
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
-	fl.addrs, fl.authoritative = self.resolve(ctx, q, now)
-	if !fl.authoritative && len(fl.addrs) == 0 && 0 < len(staleAddrs) {
+	addrs, authoritative, blocked := self.resolve(ctx, q, now)
+	if !authoritative && len(addrs) == 0 && 0 < len(staleAddrs) {
 		// the exact SERVFAIL shape (resolve returns authoritative=false only with no
 		// addresses: every resolver path failed or answered non-authoritatively empty):
 		// serve the retained stale answer instead. An authoritative NXDOMAIN/NODATA came
 		// back authoritative=true and is deliberately NOT overridden.
-		fl.addrs, fl.authoritative = serveStale()
+		return fl.setResult(serveStale()), false
 	}
-	return fl.addrs, fl.authoritative, stale, false
+	return fl.setResult(dohLookupResult{addrs: addrs, authoritative: authoritative, fresh: authoritative, blocked: blocked}), false
 }
 
 // Forward resolves qType for domain and returns the raw RFC 8484 response wire
@@ -1166,8 +1516,9 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 	ctx = forwardCtx
 
 	rs := self.settings.DnsResolverSettings
-	if self.dohServerNames[domain] {
-		// a doh server name must not resolve through doh (circular)
+	if self.dohServerNames[domain] || self.pinnedHost(domain) {
+		// a doh server name must not resolve through doh (circular), and a
+		// pinned host is never looked up at all
 		return nil, false
 	}
 	if rs.EnableRemoteDoh {
@@ -1194,14 +1545,17 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 }
 
 // resolve runs the resolver chain (remote DoH -> local DoH -> remote DNS -> local DNS) for one
-// query, caches an authoritative result, and returns the addresses plus whether the answer was
-// authoritative. it is not single-flighted itself; QueryResult coalesces concurrent callers.
-func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool) {
+// query, caches an authoritative result, and returns the addresses, whether the answer was
+// authoritative, and whether an authoritative miss was a filtering block (dohQueryResult.Blocked).
+// it is not single-flighted itself; QueryResult coalesces concurrent callers.
+func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool, bool) {
 	addrExpirations := map[netip.Addr]time.Time{}
 	cacheMiss := false
 	// the miss is one source's alone (see DohSettings.LoneMissExpiration);
 	// a later resolver path that also finds the name absent corroborates it
 	loneMiss := false
+	// a DoH miss carried a filtering block's extended dns error
+	blockedMiss := false
 	minCacheTtl := self.settings.MinCacheTtl
 
 	// a doh server name can not resolve through doh (circular). it resolves
@@ -1222,13 +1576,18 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			for addr := range queryResult.AddrTtls {
 				addrs = append(addrs, addr)
 			}
-			HandleError(func() {
-				self.settings.DohResultCallback(q.Domain, addrs, queryResult.Route)
-			})
+			// a sink answer (0.0.0.0, ::) is a filter's block, not a destination:
+			// it is never bound to an exit (ADBLOCK3RD B4). A mixed answer is.
+			if !dnsSinkAddrs(addrs) {
+				HandleError(func() {
+					self.settings.DohResultCallback(q.Domain, addrs, queryResult.Route)
+				})
+			}
 		}
 		if len(addrExpirations) == 0 && queryResult.Miss {
 			cacheMiss = true
 			loneMiss = queryResult.LoneMiss
+			blockedMiss = queryResult.Blocked
 		}
 	}
 
@@ -1242,6 +1601,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			// a second path's miss corroborates the first's
 			loneMiss = !cacheMiss && queryResult.LoneMiss
 			cacheMiss = true
+			blockedMiss = blockedMiss || queryResult.Blocked
 		}
 	}
 
@@ -1332,11 +1692,13 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	}
 
 	authoritative := 0 < len(addrExpirations) || cacheMiss
+	blocked := blockedMiss && cacheMiss && len(addrExpirations) == 0
 	if ctx.Err() == nil && authoritative {
 		r := &DohResult{
 			Time:            now,
 			AddrExpirations: addrExpirations,
 			Miss:            cacheMiss && len(addrExpirations) == 0,
+			Blocked:         blocked,
 		}
 		if r.Miss && loneMiss {
 			r.MissExpiration = self.settings.LoneMissExpiration
@@ -1353,7 +1715,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	return (&DohResult{
 		Time:            now,
 		AddrExpirations: addrExpirations,
-	}).Addrs(), authoritative
+	}).Addrs(), authoritative, blocked
 }
 
 func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...string) map[netip.Addr]int {
@@ -1371,7 +1733,11 @@ func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []stri
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
+		lifecycle.dialContext(dohPinnedDialContext(
+			dohPinnedHostAddrs(settings.DnsResolverSettings),
+			nil,
+			wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext),
+		)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	c := &dohClient{
@@ -1405,7 +1771,11 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
+		lifecycle.dialContext(dohPinnedDialContext(
+			dohPinnedHostAddrs(settings.DnsResolverSettings),
+			nil,
+			wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext),
+		)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	result := dohQueryWithClient(
@@ -1521,6 +1891,12 @@ type dohQueryResult struct {
 	// as that endpoint failing; any other endpoint's response keeps its
 	// records or Miss.
 	Filtered bool
+	// A Miss that is a filtering block: an NXDOMAIN carrying an extended dns
+	// error of 15, 16 or 17 (dnsBlockEdeCode), as Quad9 answers a blocked
+	// name. Also Filtered, so a built-in endpoint's is guarded away. A merged
+	// Miss is Blocked when any of its sources' was. The mux counts these
+	// (ADBLOCK3RD decision 16); a plain NXDOMAIN never is one.
+	Blocked bool
 	// A merged Miss that one source alone reported, an endpoint and its
 	// other-family sibling counting as one source, and that source a built-in
 	// endpoint (see DohSettings.LoneMissExpiration).
@@ -1946,6 +2322,8 @@ func (self *dohClient) queryResult(
 	// normally.
 	missSources := map[string]bool{}
 	builtInMisses := true
+	// any miss source reported a filtering block (dohQueryResult.Blocked)
+	blockedMiss := false
 	missSource := func(dohUrl string) string {
 		if sibling, ok := self.siblings[dohUrl]; ok && sibling < dohUrl {
 			return sibling
@@ -1962,6 +2340,7 @@ func (self *dohClient) queryResult(
 				// Keep an observed empty answer at our own fanout deadline.
 				// Caller cancellation retains the existing deadline outcome.
 				Miss:     miss,
+				Blocked:  miss && blockedMiss,
 				LoneMiss: miss && len(missSources) == 1 && builtInMisses,
 			}
 		case result := <-receiveResults:
@@ -1981,6 +2360,9 @@ func (self *dohClient) queryResult(
 				if !dohEndpointGuarded(result.Server) {
 					builtInMisses = false
 				}
+				if result.Blocked {
+					blockedMiss = true
+				}
 			}
 			// fastest-record-wins: return as soon as any server returns records rather than
 			// waiting for the rest, so a slow or dead server can't delay a successful lookup. an
@@ -1999,6 +2381,7 @@ func (self *dohClient) queryResult(
 		}
 	}
 	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && len(mergedResult.Txts) == 0 && mergedResult.Miss
+	mergedResult.Blocked = mergedResult.Miss && blockedMiss
 	mergedResult.LoneMiss = mergedResult.Miss && len(missSources) == 1 && builtInMisses
 	return mergedResult
 }
@@ -2129,10 +2512,18 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 		return nil, nil, fmt.Errorf("pack query: %w", err)
 	}
 	requestUrl := fmt.Sprintf("%s?dns=%s", dohUrl, base64.RawURLEncoding.EncodeToString(wire))
+	// errors name the server by scheme and host only: the path can hold a
+	// personal configuration id, and the query encodes the looked up name
+	// (ADBLOCK3RD B7)
+	logUrl := DohUrlForLog(dohUrl)
 
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build request for %s: %w", dohUrl, err)
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
+			err = urlError.Err
+		}
+		return nil, nil, fmt.Errorf("build request for %s: %w", logUrl, err)
 	}
 	var route atomic.Pointer[DohRoute]
 	if self.captureRoute {
@@ -2154,15 +2545,15 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
-		return nil, nil, fmt.Errorf("request %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("request %s: %w", logUrl, err)
 	}
 	defer releaseHttpResponseBody(ctx, response)
 	if response.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
+		return nil, nil, fmt.Errorf("request %s: HTTP status %s", logUrl, response.Status)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("read %s: %w", logUrl, err)
 	}
 	return data, route.Load(), nil
 }
@@ -2397,37 +2788,118 @@ func dnsPolicyEdeCode(infoCode uint16) bool {
 	}
 }
 
+// Whether an extended dns error INFO-CODE marks a filtering resolver's block,
+// for the count of block answers (ADBLOCK3RD decision 16): 15 Blocked, 16
+// Censored, 17 Filtered. 4 (Forged Answer) and 18 (Prohibited) are policy codes
+// to the guard (dnsPolicyEdeCode) but not the block of a filter the user chose.
+func dnsBlockEdeCode(infoCode uint16) bool {
+	switch infoCode {
+	case 15, 16, 17:
+		return true
+	default:
+		return false
+	}
+}
+
 // Reads the rest of a response whose answer section p has consumed: skips the
 // authority section and reports whether an OPT record in the additional
 // section carries a policy extended dns error (dnsPolicyEdeCode). Quad9 sends
 // one even to a query without OPT. A response without OPT, or a tail that does
 // not parse, has none.
 func dnsResponsePolicyEde(p *dnsmessage.Parser) bool {
+	return slices.ContainsFunc(dnsResponseEdeCodes(p), dnsPolicyEdeCode)
+}
+
+// Reads the rest of a response whose answer section p has consumed: skips the
+// authority section and returns the extended dns error INFO-CODEs (RFC 8914)
+// of the OPT records in the additional section, in order. A response without
+// OPT has none; a tail that stops parsing yields the codes read before it.
+func dnsResponseEdeCodes(p *dnsmessage.Parser) []uint16 {
 	if err := p.SkipAllAuthorities(); err != nil {
-		return false
+		return nil
 	}
+	var codes []uint16
 	for {
 		h, err := p.AdditionalHeader()
 		if err != nil {
 			// dnsmessage.ErrSectionDone, or a malformed tail
-			return false
+			return codes
 		}
 		if h.Type != dnsmessage.TypeOPT {
 			if err := p.SkipAdditional(); err != nil {
-				return false
+				return codes
 			}
 			continue
 		}
 		opt, err := p.OPTResource()
 		if err != nil {
-			return false
+			return codes
 		}
 		for _, option := range opt.Options {
-			if option.Code == dnsEdeOptionCode && 2 <= len(option.Data) &&
-				dnsPolicyEdeCode(binary.BigEndian.Uint16(option.Data[:2])) {
-				return true
+			if option.Code == dnsEdeOptionCode && 2 <= len(option.Data) {
+				codes = append(codes, binary.BigEndian.Uint16(option.Data[:2]))
 			}
 		}
+	}
+}
+
+// Whether a raw DNS response is a recognizable block answer (ADBLOCK3RD
+// decision 16): a NOERROR whose A and AAAA answers are all 0.0.0.0 or :: (one
+// at least), or an NXDOMAIN carrying an extended dns error of 15, 16 or 17
+// (dnsBlockEdeCode). A plain NXDOMAIN, a REFUSED or a SERVFAIL is not, and a
+// body that does not parse is not.
+func dnsResponseBlockAnswer(response []byte) bool {
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		return false
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return false
+	}
+	unspecified := false
+	specified := false
+	for {
+		ah, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return false
+		}
+		var ip netip.Addr
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom4(r.A)
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom16(r.AAAA)
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				return false
+			}
+			continue
+		}
+		if ip.IsUnspecified() {
+			unspecified = true
+		} else {
+			specified = true
+		}
+	}
+	switch header.RCode {
+	case dnsmessage.RCodeSuccess:
+		return unspecified && !specified
+	case dnsmessage.RCodeNameError:
+		return slices.ContainsFunc(dnsResponseEdeCodes(&p), dnsBlockEdeCode)
+	default:
+		return false
 	}
 }
 
@@ -2532,7 +3004,8 @@ func dohGuardedResult(result *dohQueryResult) *dohQueryResult {
 // It also classifies the response: Filtered is set when the response carries a policy extended
 // dns error under any RCODE (dnsPolicyEdeCode: a Quad9 malware block, a country withdrawal), or is
 // a NOERROR whose matching answers are all 0.0.0.0 or :: (a sink answer, which some filters send
-// with no extended error). The result is otherwise as the server answered, sink addresses
+// with no extended error). Blocked is set on an NXDOMAIN whose extended dns error is a block's
+// (dnsBlockEdeCode). The result is otherwise as the server answered, sink addresses
 // included: the caller applies the guard (dohGuardedResult) to a built-in endpoint's response
 // only.
 func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
@@ -2551,12 +3024,12 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 	nxdomain := header.RCode == dnsmessage.RCodeNameError
 	// an nxdomain is a Miss whatever its sections hold; a section that does
 	// not parse ends the read before any extended error
-	nxdomainResult := func(filtered bool) *dohQueryResult {
-		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Miss: true, Filtered: filtered}
+	nxdomainResult := func(filtered bool, blocked bool) *dohQueryResult {
+		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Miss: true, Filtered: filtered, Blocked: blocked}
 	}
 	if err := p.SkipAllQuestions(); err != nil {
 		if nxdomain {
-			return nxdomainResult(false)
+			return nxdomainResult(false, false)
 		}
 		return result
 	}
@@ -2569,7 +3042,7 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		}
 		if err != nil {
 			if nxdomain {
-				return nxdomainResult(false)
+				return nxdomainResult(false, false)
 			}
 			return result
 		}
@@ -2578,7 +3051,7 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			r, err := p.AResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult(false)
+					return nxdomainResult(false, false)
 				}
 				return result
 			}
@@ -2593,7 +3066,7 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			r, err := p.AAAAResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult(false)
+					return nxdomainResult(false, false)
 				}
 				return result
 			}
@@ -2608,7 +3081,7 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			r, err := p.TXTResource()
 			if err != nil {
 				if nxdomain {
-					return nxdomainResult(false)
+					return nxdomainResult(false, false)
 				}
 				return result
 			}
@@ -2622,15 +3095,16 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		default:
 			if err := p.SkipAnswer(); err != nil {
 				if nxdomain {
-					return nxdomainResult(false)
+					return nxdomainResult(false, false)
 				}
 				return result
 			}
 		}
 	}
-	policyEde := dnsResponsePolicyEde(&p)
+	edeCodes := dnsResponseEdeCodes(&p)
+	policyEde := slices.ContainsFunc(edeCodes, dnsPolicyEdeCode)
 	if nxdomain {
-		return nxdomainResult(policyEde)
+		return nxdomainResult(policyEde, slices.ContainsFunc(edeCodes, dnsBlockEdeCode))
 	}
 	result.Filtered = policyEde || (unspecified && !specified && len(result.Txts) == 0)
 	if len(result.AddrTtls) == 0 && len(result.Txts) == 0 {
@@ -2843,6 +3317,9 @@ type DohResult struct {
 	// this miss stays valid: a lone miss (see DohSettings.LoneMissExpiration).
 	// Zero keeps the cache's.
 	MissExpiration time.Duration
+	// The miss was a filtering block (dohQueryResult.Blocked), so a cache hit
+	// still counts as a block answer delivered.
+	Blocked bool
 }
 
 func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
