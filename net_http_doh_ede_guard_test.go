@@ -29,8 +29,8 @@ import (
 // Built-in endpoints (DefaultDnsResolverSettings), the subject of the guard,
 // and visibly synthetic custom servers standing in for a user's own choice.
 const (
-	testBuiltInDohA     = "https://9.9.9.9/dns-query"
-	testBuiltInDohAIpv6 = "https://[2620:fe::fe]/dns-query"
+	testBuiltInDohA     = "https://9.9.9.10/dns-query"
+	testBuiltInDohAIpv6 = "https://[2620:fe::10]/dns-query"
 	testBuiltInDohB     = "https://1.1.1.1/dns-query"
 	testCustomDohA      = "https://192.0.2.71/dns-query"
 	testCustomDohB      = "https://192.0.2.72/dns-query"
@@ -170,7 +170,8 @@ func testingDohCacheEntry(cache *DohCache, recordType string, domain string) *Do
 }
 
 // The guard's endpoint set: the default DoH urls and the regional presets, in
-// any spelling of the same endpoint, and nothing a user would add.
+// any spelling of the same endpoint, and nothing a user would add, Quad9's
+// filtering 9.9.9.9 family included.
 func TestDohBuiltInEndpointsAreTheDefaultsAndPresets(t *testing.T) {
 	defaults := DefaultDnsResolverSettings()
 	presetsIpv4, presetsIpv6 := RegionalControlDohUrls("cn")
@@ -182,9 +183,10 @@ func TestDohBuiltInEndpointsAreTheDefaultsAndPresets(t *testing.T) {
 		presetsIpv4,
 		presetsIpv6,
 		[]string{
-			"https://9.9.9.9:443/dns-query/",
+			"https://9.9.9.10:443/dns-query/",
 			"HTTPS://1.1.1.1/dns-query",
 			"https://[2606:4700:4700:0:0:0:0:1111]/dns-query",
+			"https://[2620:fe:0:0:0:0:0:10]/dns-query",
 		},
 	) {
 		if !dohEndpointGuarded(dohUrl) {
@@ -193,11 +195,14 @@ func TestDohBuiltInEndpointsAreTheDefaultsAndPresets(t *testing.T) {
 	}
 	for _, dohUrl := range []string{
 		testCustomDohA,
+		"https://9.9.9.9/dns-query",
+		"https://[2620:fe::fe]/dns-query",
+		"https://149.112.112.112/dns-query",
 		"https://94.140.14.14/dns-query",
 		"https://8.8.8.8/dns-query",
 		"https://208.67.222.222/dns-query",
-		"https://9.9.9.9:8443/dns-query",
-		"https://9.9.9.9/other-path",
+		"https://9.9.9.10:8443/dns-query",
+		"https://9.9.9.10/other-path",
 	} {
 		if dohEndpointGuarded(dohUrl) {
 			t.Errorf("%s is guarded, want a user's own endpoint", dohUrl)
@@ -277,7 +282,7 @@ func TestDohPolicyFilteredResponseIsNeverAnswer(t *testing.T) {
 		recordType string
 		answer     testingDohPolicyAnswer
 	}{
-		{name: "nxdomain ede 17 filtered (quad9)", recordType: "A", answer: testingDohNxdomain(17)},
+		{name: "nxdomain ede 17 filtered", recordType: "A", answer: testingDohNxdomain(17)},
 		{name: "nxdomain ede 15 blocked", recordType: "A", answer: testingDohNxdomain(15)},
 		{name: "nxdomain ede 16 censored", recordType: "A", answer: testingDohNxdomain(16)},
 		{name: "nxdomain ede 18 prohibited", recordType: "A", answer: testingDohNxdomain(18)},
@@ -289,8 +294,8 @@ func TestDohPolicyFilteredResponseIsNeverAnswer(t *testing.T) {
 	}
 	for _, c := range cases {
 		cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-			"9.9.9.9": c.answer,
-			"1.1.1.1": testingDohFailure(),
+			"9.9.9.10": c.answer,
+			"1.1.1.1":  testingDohFailure(),
 		}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 		addrs, authoritative := cache.QueryResult(context.Background(), c.recordType, "filtered.example")
 		if authoritative || len(addrs) != 0 {
@@ -310,8 +315,8 @@ func TestDohPolicyFilteredResponseIsNeverAnswer(t *testing.T) {
 func TestDohCensoredNxdomainLosesToRealAnswer(t *testing.T) {
 	realAddr := netip.MustParseAddr("198.51.100.22")
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNxdomain(16),
-		"1.1.1.1": testingDohNoError(-1, realAddr),
+		"9.9.9.10": testingDohNxdomain(16),
+		"1.1.1.1":  testingDohNoError(-1, realAddr),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	addrs, authoritative := cache.QueryResult(context.Background(), "A", "censored.example")
 	if !authoritative || !slices.Equal(addrs, []netip.Addr{realAddr}) {
@@ -324,8 +329,8 @@ func TestDohCensoredNxdomainLosesToRealAnswer(t *testing.T) {
 // real address the 0.0.0.0 is dropped and the real address kept.
 func TestDohUnspecifiedAnswerIsNotAccepted(t *testing.T) {
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNoError(-1, netip.MustParseAddr("0.0.0.0")),
-		"1.1.1.1": testingDohFailure(),
+		"9.9.9.10": testingDohNoError(-1, netip.MustParseAddr("0.0.0.0")),
+		"1.1.1.1":  testingDohFailure(),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "sink.example"); authoritative || len(addrs) != 0 {
 		t.Fatalf("0.0.0.0 lookup = %v authoritative %t, want a SERVFAIL", addrs, authoritative)
@@ -336,8 +341,8 @@ func TestDohUnspecifiedAnswerIsNotAccepted(t *testing.T) {
 
 	realAddr := netip.MustParseAddr("198.51.100.23")
 	cache = testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNoError(-1, netip.MustParseAddr("0.0.0.0"), realAddr),
-		"1.1.1.1": testingDohFailure(),
+		"9.9.9.10": testingDohNoError(-1, netip.MustParseAddr("0.0.0.0"), realAddr),
+		"1.1.1.1":  testingDohFailure(),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "mixed.example"); !authoritative || !slices.Equal(addrs, []netip.Addr{realAddr}) {
 		t.Fatalf("mixed lookup = %v authoritative %t, want only %v", addrs, authoritative, realAddr)
@@ -349,8 +354,8 @@ func TestDohUnspecifiedAnswerIsNotAccepted(t *testing.T) {
 // real answer keeps the answer: those codes arrive on genuine responses.
 func TestDohIgnoredExtendedErrorsKeepTheAnswer(t *testing.T) {
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNxdomain(29),
-		"1.1.1.1": testingDohNxdomain(29),
+		"9.9.9.10": testingDohNxdomain(29),
+		"1.1.1.1":  testingDohNxdomain(29),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "synthesized.invalid"); !authoritative || len(addrs) != 0 {
 		t.Fatalf("ede 29 nxdomain = %v authoritative %t, want an authoritative miss", addrs, authoritative)
@@ -362,8 +367,8 @@ func TestDohIgnoredExtendedErrorsKeepTheAnswer(t *testing.T) {
 	realAddr := netip.MustParseAddr("198.51.100.24")
 	for _, ede := range []int{6, 7, 9, 21, 29} {
 		cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-			"9.9.9.9": testingDohNoError(ede, realAddr),
-			"1.1.1.1": testingDohFailure(),
+			"9.9.9.10": testingDohNoError(ede, realAddr),
+			"1.1.1.1":  testingDohFailure(),
 		}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 		if addrs, authoritative := cache.QueryResult(context.Background(), "A", "genuine.example"); !authoritative || !slices.Equal(addrs, []netip.Addr{realAddr}) {
 			t.Errorf("ede %d answer = %v authoritative %t, want %v", ede, addrs, authoritative, realAddr)
@@ -407,7 +412,7 @@ func TestDohCustomFilteringServerAnswersAsItAnswers(t *testing.T) {
 func TestDohGuardAppliesPerEndpointInAMixedList(t *testing.T) {
 	sink := netip.MustParseAddr("0.0.0.0")
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9":    testingDohNxdomain(17),
+		"9.9.9.10":   testingDohNxdomain(17),
 		"192.0.2.71": testingDohNoError(-1, sink),
 	}, []string{testBuiltInDohA, testCustomDohA}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "mixed-sink.example"); !authoritative || !slices.Equal(addrs, []netip.Addr{sink}) {
@@ -415,7 +420,7 @@ func TestDohGuardAppliesPerEndpointInAMixedList(t *testing.T) {
 	}
 
 	cache = testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9":    testingDohNoError(-1, sink),
+		"9.9.9.10":   testingDohNoError(-1, sink),
 		"192.0.2.71": testingDohFailure(),
 	}, []string{testBuiltInDohA, testCustomDohA}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "builtin-sink.example"); authoritative || len(addrs) != 0 {
@@ -423,7 +428,7 @@ func TestDohGuardAppliesPerEndpointInAMixedList(t *testing.T) {
 	}
 
 	cache = testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9":    testingDohFailure(),
+		"9.9.9.10":   testingDohFailure(),
 		"192.0.2.71": testingDohNxdomain(17),
 	}, []string{testBuiltInDohA, testCustomDohA}, nil)
 	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "custom-miss.example"); !authoritative || len(addrs) != 0 {
@@ -435,11 +440,44 @@ func TestDohGuardAppliesPerEndpointInAMixedList(t *testing.T) {
 // that endpoint: it is the same endpoint, in any spelling.
 func TestDohUserNamedBuiltInEndpointKeepsTheGuard(t *testing.T) {
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
+		"1.1.1.1":    testingDohNxdomain(16),
+		"192.0.2.71": testingDohFailure(),
+	}, []string{"https://1.1.1.1:443/dns-query/", testCustomDohA}, nil)
+	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "named.example"); authoritative || len(addrs) != 0 {
+		t.Fatalf("user-named built-in endpoint's filter = %v authoritative %t, want a SERVFAIL", addrs, authoritative)
+	}
+}
+
+// Quad9's filtering 9.9.9.9 is not a built-in endpoint (the default is its
+// unfiltered 9.9.9.10), so a user who names it gets its blocks: its NXDOMAIN
+// with EDE 17 is an authoritative miss cached for MissExpiration on the parsed
+// path, and is forwarded on the raw path.
+func TestDohUserNamedFilteringQuad9GetsItsBlocks(t *testing.T) {
+	const filteringQuad9 = "https://9.9.9.9/dns-query"
+	if dohEndpointGuarded(filteringQuad9) {
+		t.Fatalf("%s is guarded, want a user's own endpoint", filteringQuad9)
+	}
+	answers := map[string]testingDohPolicyAnswer{
 		"9.9.9.9":    testingDohNxdomain(17),
 		"192.0.2.71": testingDohFailure(),
-	}, []string{"https://9.9.9.9:443/dns-query/", testCustomDohA}, nil)
-	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "named.example"); authoritative || len(addrs) != 0 {
-		t.Fatalf("user-named quad9 filter = %v authoritative %t, want a SERVFAIL", addrs, authoritative)
+	}
+	cache := testingDohPolicyCache(t, answers, []string{filteringQuad9, testCustomDohA}, nil)
+	if addrs, authoritative := cache.QueryResult(context.Background(), "A", "malware.example"); !authoritative || len(addrs) != 0 {
+		t.Fatalf("user-named 9.9.9.9 block = %v authoritative %t, want an authoritative miss", addrs, authoritative)
+	}
+	entry := testingDohCacheEntry(cache, "A", "malware.example")
+	if entry == nil || !entry.Miss || !entry.Valid(entry.Time.Add(cache.settings.LoneMissExpiration+time.Second), cache.settings.MissExpiration) {
+		t.Fatalf("user-named 9.9.9.9 block cached %+v, want a miss for MissExpiration", entry)
+	}
+
+	cache = testingDohPolicyCache(t, answers, []string{filteringQuad9, testCustomDohA}, nil)
+	response, ok := cache.Forward(context.Background(), dnsTypeHttps, "malware.example")
+	if !ok {
+		t.Fatal("user-named 9.9.9.9 block was not forwarded")
+	}
+	var p dnsmessage.Parser
+	if header, err := p.Start(response); err != nil || header.RCode != dnsmessage.RCodeNameError {
+		t.Fatalf("user-named 9.9.9.9 raw forward = rcode %v, err %v; want its NXDOMAIN", header.RCode, err)
 	}
 }
 
@@ -449,16 +487,16 @@ func TestDohUserNamedBuiltInEndpointKeepsTheGuard(t *testing.T) {
 // custom server's filtered response is forwarded as it is.
 func TestDohRawForwardSkipsPolicyFilteredResponses(t *testing.T) {
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNxdomain(17),
-		"1.1.1.1": testingDohFailure(),
+		"9.9.9.10": testingDohNxdomain(17),
+		"1.1.1.1":  testingDohFailure(),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	if response, ok := cache.Forward(context.Background(), dnsTypeHttps, "filtered.example"); ok || len(response) != 0 {
 		t.Fatalf("filtered raw forward = %d bytes usable %t, want none", len(response), ok)
 	}
 
 	cache = testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNxdomain(17),
-		"1.1.1.1": testingDohNoError(-1),
+		"9.9.9.10": testingDohNxdomain(17),
+		"1.1.1.1":  testingDohNoError(-1),
 	}, []string{testBuiltInDohA, testBuiltInDohB}, nil)
 	response, ok := cache.Forward(context.Background(), dnsTypeHttps, "filtered.example")
 	if !ok {
@@ -545,26 +583,26 @@ func TestDohLoneNxdomainIsCachedBriefly(t *testing.T) {
 	}{
 		{
 			name:        "nxdomain and a failure",
-			answers:     map[string]testingDohPolicyAnswer{"9.9.9.9": testingDohNxdomain(-1), "1.1.1.1": testingDohFailure()},
+			answers:     map[string]testingDohPolicyAnswer{"9.9.9.10": testingDohNxdomain(-1), "1.1.1.1": testingDohFailure()},
 			dohUrlsIpv4: []string{testBuiltInDohA, testBuiltInDohB},
 			lone:        true,
 		},
 		{
 			name:        "nxdomain and a filtered nxdomain",
-			answers:     map[string]testingDohPolicyAnswer{"9.9.9.9": testingDohNxdomain(-1), "1.1.1.1": testingDohNxdomain(17)},
+			answers:     map[string]testingDohPolicyAnswer{"9.9.9.10": testingDohNxdomain(-1), "1.1.1.1": testingDohNxdomain(17)},
 			dohUrlsIpv4: []string{testBuiltInDohA, testBuiltInDohB},
 			lone:        true,
 		},
 		{
 			name:        "one operator's nxdomain on both families",
-			answers:     map[string]testingDohPolicyAnswer{"9.9.9.9": testingDohNxdomain(-1), "2620:fe::fe": testingDohNxdomain(-1)},
+			answers:     map[string]testingDohPolicyAnswer{"9.9.9.10": testingDohNxdomain(-1), "2620:fe::10": testingDohNxdomain(-1)},
 			dohUrlsIpv4: []string{testBuiltInDohA},
 			dohUrlsIpv6: []string{testBuiltInDohAIpv6},
 			lone:        true,
 		},
 		{
 			name:        "two operators' nxdomain",
-			answers:     map[string]testingDohPolicyAnswer{"9.9.9.9": testingDohNxdomain(-1), "1.1.1.1": testingDohNxdomain(-1)},
+			answers:     map[string]testingDohPolicyAnswer{"9.9.9.10": testingDohNxdomain(-1), "1.1.1.1": testingDohNxdomain(-1)},
 			dohUrlsIpv4: []string{testBuiltInDohA, testBuiltInDohB},
 			lone:        false,
 		},
@@ -603,7 +641,7 @@ func TestDohLoneNxdomainIsCachedBriefly(t *testing.T) {
 func TestDohWarmGuardsBuiltInEndpointsOnly(t *testing.T) {
 	sink := netip.MustParseAddr("0.0.0.0")
 	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
-		"9.9.9.9": testingDohNoError(-1, sink),
+		"9.9.9.10": testingDohNoError(-1, sink),
 	}, []string{testBuiltInDohA}, nil)
 	if cache.Warm(context.Background(), 1) {
 		t.Error("a built-in endpoint's 0.0.0.0 warmed the cache")

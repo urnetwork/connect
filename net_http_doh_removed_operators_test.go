@@ -170,9 +170,9 @@ func TestNoDefaultResolverListNamesARemovedOperator(t *testing.T) {
 }
 
 // The default lists exactly: Cloudflare with both of its addresses, and Quad9
-// on 9.9.9.9 (switching to the unfiltered 9.9.9.10 is an owner decision). The
-// operators interleave, so a list walked in order asks Quad9 second, and the
-// sdk's migration of an older default list reproduces this order.
+// on its unfiltered 9.9.9.10, never its filtering 9.9.9.9. The operators
+// interleave, so a list walked in order asks Quad9 second, and the sdk's
+// migration of an older default list reproduces this order.
 func TestDefaultResolverListsAreCloudflareAndQuad9(t *testing.T) {
 	resolver := DefaultDnsResolverSettings()
 	for name, c := range map[string]struct {
@@ -180,15 +180,15 @@ func TestDefaultResolverListsAreCloudflareAndQuad9(t *testing.T) {
 		want []string
 	}{
 		"RemoteDohUrlsIpv4": {resolver.RemoteDohUrlsIpv4, []string{
-			"https://1.1.1.1/dns-query", "https://9.9.9.9/dns-query", "https://1.0.0.1/dns-query",
+			"https://1.1.1.1/dns-query", "https://9.9.9.10/dns-query", "https://1.0.0.1/dns-query",
 		}},
 		"RemoteDohUrlsIpv6": {resolver.RemoteDohUrlsIpv6, []string{
-			"https://[2606:4700:4700::1111]/dns-query", "https://[2620:fe::fe]/dns-query", "https://[2606:4700:4700::1001]/dns-query",
+			"https://[2606:4700:4700::1111]/dns-query", "https://[2620:fe::10]/dns-query", "https://[2606:4700:4700::1001]/dns-query",
 		}},
-		"RemoteDnsIpv4": {resolver.RemoteDnsIpv4, []string{"1.1.1.1", "9.9.9.9", "1.0.0.1"}},
-		"RemoteDnsIpv6": {resolver.RemoteDnsIpv6, []string{"2606:4700:4700::1111", "2620:fe::fe", "2606:4700:4700::1001"}},
-		"LocalDnsIpv4":  {resolver.LocalDnsIpv4, []string{"9.9.9.9", "1.1.1.1", "1.0.0.1"}},
-		"LocalDnsIpv6":  {resolver.LocalDnsIpv6, []string{"2620:fe::fe", "2606:4700:4700::1111", "2606:4700:4700::1001"}},
+		"RemoteDnsIpv4": {resolver.RemoteDnsIpv4, []string{"1.1.1.1", "9.9.9.10", "1.0.0.1"}},
+		"RemoteDnsIpv6": {resolver.RemoteDnsIpv6, []string{"2606:4700:4700::1111", "2620:fe::10", "2606:4700:4700::1001"}},
+		"LocalDnsIpv4":  {resolver.LocalDnsIpv4, []string{"9.9.9.10", "1.1.1.1", "1.0.0.1"}},
+		"LocalDnsIpv6":  {resolver.LocalDnsIpv6, []string{"2620:fe::10", "2606:4700:4700::1111", "2606:4700:4700::1001"}},
 	} {
 		if !slices.Equal(c.got, c.want) {
 			t.Errorf("default %s = %v, want %v", name, c.got, c.want)
@@ -198,12 +198,18 @@ func TestDefaultResolverListsAreCloudflareAndQuad9(t *testing.T) {
 	// Cloudflare pairs and Quad9's
 	dohSiblings := familySiblings(resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6, knownDohUrlPairs)
 	dnsSiblings := familySiblings(resolver.RemoteDnsIpv4, resolver.RemoteDnsIpv6, knownDnsServerPairs)
+	localDnsSiblings := familySiblings(resolver.LocalDnsIpv4, resolver.LocalDnsIpv6, knownDnsServerPairs)
 	for i := range resolver.RemoteDohUrlsIpv4 {
 		if dohSiblings[resolver.RemoteDohUrlsIpv4[i]] != resolver.RemoteDohUrlsIpv6[i] {
 			t.Errorf("doh %s does not pair with %s", resolver.RemoteDohUrlsIpv4[i], resolver.RemoteDohUrlsIpv6[i])
 		}
 		if dnsSiblings[resolver.RemoteDnsIpv4[i]] != resolver.RemoteDnsIpv6[i] {
 			t.Errorf("dns %s does not pair with %s", resolver.RemoteDnsIpv4[i], resolver.RemoteDnsIpv6[i])
+		}
+	}
+	for i := range resolver.LocalDnsIpv4 {
+		if localDnsSiblings[resolver.LocalDnsIpv4[i]] != resolver.LocalDnsIpv6[i] {
+			t.Errorf("local dns %s does not pair with %s", resolver.LocalDnsIpv4[i], resolver.LocalDnsIpv6[i])
 		}
 	}
 }
@@ -280,7 +286,7 @@ func TestResolverIgnoreBaselineKeepsWellKnownResolvers(t *testing.T) {
 	}
 	otherAddrs := []string{
 		"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",
-		"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
+		"9.9.9.10", "2620:fe::10", "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
 	}
 	for _, resolver := range slices.Concat(removedAddrs, otherAddrs) {
 		if !baseline[netip.MustParseAddr(resolver)] {

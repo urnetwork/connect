@@ -154,13 +154,13 @@ func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
 //
 // The defaults are Cloudflare, at both of its addresses (1.1.1.1 and 1.0.0.1, which guards
 // against one address being blocked or hijacked but not against an operator-wide outage), and
-// Quad9 at 9.9.9.9, a malware filter whose blocks the guard keeps from becoming the answer
-// (switching to its unfiltered 9.9.9.10 is an owner decision). The operators interleave, so a
-// list walked in order asks Quad9 second. None of these lists, nor the regional ones
+// Quad9 at 9.9.9.10, its unfiltered service: the defaults do not filter (2026-11-08), so
+// 9.9.9.9, Quad9's malware filter, is not among them. The operators interleave, so a list
+// walked in order asks Quad9 second. None of these lists, nor the regional ones
 // (net_http_doh_regional.go), names Google Public DNS (owner decision 2026-11-08 for user
 // privacy, support inbox 8236) or OpenDNS (it refuses French clients and has left Portugal and
 // Belgium, answers blocks with ordinary records, forwards the client's /24 as ECS, and its free
-// terms are marked expired). A user can still name either in their own settings.
+// terms are marked expired). A user can still name any of them in their own settings.
 func DefaultDnsResolverSettings() *DnsResolverSettings {
 	return &DnsResolverSettings{
 		EnableRemoteDoh:       true,
@@ -169,13 +169,13 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// the v4 and v6 lists pair by operator (knownDohUrlPairs) and a
 		// query races each pair as one wave (see dohLaunchWaves)
 		RemoteDohUrlsIpv4: []string{
-			"https://1.1.1.1/dns-query", // Cloudflare
-			"https://9.9.9.9/dns-query", // Quad9
-			"https://1.0.0.1/dns-query", // Cloudflare
+			"https://1.1.1.1/dns-query",  // Cloudflare
+			"https://9.9.9.10/dns-query", // Quad9, unfiltered
+			"https://1.0.0.1/dns-query",  // Cloudflare
 		},
 		RemoteDohUrlsIpv6: []string{
 			"https://[2606:4700:4700::1111]/dns-query", // Cloudflare
-			"https://[2620:fe::fe]/dns-query",          // Quad9
+			"https://[2620:fe::10]/dns-query",          // Quad9, unfiltered
 			"https://[2606:4700:4700::1001]/dns-query", // Cloudflare
 		},
 		// remote plain-dns servers, dialed through the tunnel. remote dns
@@ -184,13 +184,13 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// it (see DohCache.resolve), so a hostname-form doh server never
 		// leaks to the local resolver
 		RemoteDnsIpv4: []string{
-			"1.1.1.1", // Cloudflare
-			"9.9.9.9", // Quad9
-			"1.0.0.1", // Cloudflare
+			"1.1.1.1",  // Cloudflare
+			"9.9.9.10", // Quad9, unfiltered
+			"1.0.0.1",  // Cloudflare
 		},
 		RemoteDnsIpv6: []string{
 			"2606:4700:4700::1111", // Cloudflare
-			"2620:fe::fe",          // Quad9
+			"2620:fe::10",          // Quad9, unfiltered
 			"2606:4700:4700::1001", // Cloudflare
 		},
 		// local plain-dns servers: host-side resolution, and the actual tunnel
@@ -198,12 +198,12 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// are independent of DnsUpgradeMaskAddress, which is only the destination
 		// advertised to the OS while UpgradeMux owns plain DNS interception.
 		LocalDnsIpv4: []string{
-			"9.9.9.9", // Quad9
-			"1.1.1.1", // Cloudflare
-			"1.0.0.1", // Cloudflare
+			"9.9.9.10", // Quad9, unfiltered
+			"1.1.1.1",  // Cloudflare
+			"1.0.0.1",  // Cloudflare
 		},
 		LocalDnsIpv6: []string{
-			"2620:fe::fe",          // Quad9
+			"2620:fe::10",          // Quad9, unfiltered
 			"2606:4700:4700::1111", // Cloudflare
 			"2606:4700:4700::1001", // Cloudflare
 		},
@@ -1549,16 +1549,18 @@ type dohClient struct {
 }
 
 // knownDohUrlPairs are the v4/v6 endpoint pairs of well known DoH operators:
-// the defaults, and Google Public DNS and OpenDNS, which are no longer
-// defaults but which a user may still name. A pair is what "race each operator's v4 and v6
-// endpoint" means for a url in this table; a url outside this table pairs by
-// index only with another url outside it (see familySiblings). The table only
-// pairs urls a list already holds; it never adds a server to a list.
+// the defaults, and Quad9's filtering 9.9.9.9 family, Google Public DNS and
+// OpenDNS, which are no longer defaults but which a user may still name. A pair
+// is what "race each operator's v4 and v6 endpoint" means for a url in this
+// table; a url outside this table pairs by index only with another url outside
+// it (see familySiblings). The table only pairs urls a list already holds; it
+// never adds a server to a list.
 var knownDohUrlPairs = [][2]string{
 	{"https://1.1.1.1/dns-query", "https://[2606:4700:4700::1111]/dns-query"},
 	{"https://1.0.0.1/dns-query", "https://[2606:4700:4700::1001]/dns-query"},
 	{"https://8.8.8.8/dns-query", "https://[2001:4860:4860::8888]/dns-query"},
 	{"https://8.8.4.4/dns-query", "https://[2001:4860:4860::8844]/dns-query"},
+	{"https://9.9.9.10/dns-query", "https://[2620:fe::10]/dns-query"},
 	{"https://9.9.9.9/dns-query", "https://[2620:fe::fe]/dns-query"},
 	{"https://149.112.112.112/dns-query", "https://[2620:fe::9]/dns-query"},
 	{"https://208.67.222.222/dns-query", "https://[2620:119:35::35]/dns-query"},
@@ -1566,13 +1568,14 @@ var knownDohUrlPairs = [][2]string{
 }
 
 // knownDnsServerPairs are the v4/v6 pairs of the default and regional plain
-// dns operators, and of Google Public DNS and OpenDNS for a user who names
-// them, the same rule for the plain-dns lists.
+// dns operators, and of Quad9's filtering 9.9.9.9 family, Google Public DNS and
+// OpenDNS for a user who names them, the same rule for the plain-dns lists.
 var knownDnsServerPairs = [][2]string{
 	{"1.1.1.1", "2606:4700:4700::1111"},
 	{"1.0.0.1", "2606:4700:4700::1001"},
 	{"8.8.8.8", "2001:4860:4860::8888"},
 	{"8.8.4.4", "2001:4860:4860::8844"},
+	{"9.9.9.10", "2620:fe::10"},
 	{"9.9.9.9", "2620:fe::fe"},
 	{"149.112.112.112", "2620:fe::9"},
 	{"208.67.222.222", "2620:119:35::35"},
@@ -2444,8 +2447,10 @@ func dohEndpointKey(dohUrl string) string {
 // defaults never wins the race or is cached, and it never overrides filtering a
 // user chose: a server the user added, or a filtering preset, is answered as it
 // answers, 0.0.0.0 sink answers and extended-error nxdomains included. A user
-// who names a built-in endpoint in their own list (9.9.9.9, say) gets the guard
-// for that endpoint, because it is the same endpoint.
+// who names a built-in endpoint in their own list (1.1.1.1, say) gets the guard
+// for that endpoint, because it is the same endpoint. Quad9's filtering
+// 9.9.9.9 is not built-in (the default is its unfiltered 9.9.9.10), so a user
+// who names it gets its blocks.
 //
 // Plain dns servers have no guard: their lookups go through net.Resolver, which
 // shows neither the extended error nor which server answered.

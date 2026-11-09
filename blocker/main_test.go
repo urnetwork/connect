@@ -496,8 +496,9 @@ func TestResolverExclusions(t *testing.T) {
 }
 
 // The subtraction keeps every well known public resolver, not only the
-// defaults: Google Public DNS left the defaults (2026-11-08), but a device's
-// os or browser still queries it, so a regenerated table must never block it.
+// defaults: Google Public DNS and Quad9's filtering 9.9.9.9 left the defaults
+// (2026-11-08), but a device's os or browser still queries them, so a
+// regenerated table must never block them.
 // The other operators' second addresses are kept too. These are the
 // operators' published service addresses, the subject of the test.
 func TestResolverExclusionsKeepWellKnownResolvers(t *testing.T) {
@@ -509,7 +510,7 @@ func TestResolverExclusionsKeepWellKnownResolvers(t *testing.T) {
 	for _, resolver := range []string{
 		"8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",
 		"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",
-		"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
+		"9.9.9.10", "2620:fe::10", "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9",
 		"208.67.222.222", "208.67.220.220", "2620:119:35::35", "2620:119:53::53",
 	} {
 		if !subtracted[netip.MustParseAddr(resolver)] {
