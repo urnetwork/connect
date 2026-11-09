@@ -701,7 +701,7 @@ func (self *UpgradeMux) resolveDnsTcpQuery(query []byte) []byte {
 		return nil
 	}
 	domain := strings.ToLower(strings.TrimSuffix(question.Name.String(), "."))
-	responder := &dnsResponder{id: header.ID, question: question, edns: dnsQueryHasOpt(&parser)}
+	responder := &dnsResponder{id: header.ID, question: question, edns: DnsQueryHasOpt(&parser)}
 
 	// resolver.arpa is a locally served special-use zone (RFC 9462 §6.1).
 	// A tunnel DNS forwarder must not ask an unrelated upstream resolver to
@@ -1633,7 +1633,7 @@ func (self *UpgradeMux) handleDns(source TransferPath, provideMode protocol.Prov
 	if err != nil {
 		return false
 	}
-	edns := dnsQueryHasOpt(&parser)
+	edns := DnsQueryHasOpt(&parser)
 	// lower cased: clients that randomize query casing (dns 0x20) must coalesce,
 	// cache, and record as one name — the reverse index and its learned callbacks
 	// key on this. The client's reply echoes the original-cased question, which is
@@ -2194,7 +2194,7 @@ func (self *UpgradeMux) deliverRawForwardResponse(responders []dnsResponder, dom
 // gets the upstream's.
 func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, bool) {
 	if !responder.edns {
-		response = dnsResponseWithoutOpt(response)
+		response = DnsResponseWithoutOpt(response)
 	}
 	if len(response) < 12 || binary.BigEndian.Uint16(response[4:6]) != 1 {
 		return nil, false
@@ -2247,10 +2247,11 @@ func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, 
 	return result, true
 }
 
-// Whether a client's query carries an OPT record (RFC 6891), read past the
-// question p has consumed. A query whose tail does not parse counts as having
-// none.
-func dnsQueryHasOpt(p *dnsmessage.Parser) bool {
+// Whether a DNS query carries an OPT record (RFC 6891), read past the question
+// p has consumed. A query whose tail does not parse counts as having none. The
+// mux and the extender's udp 53 forwarder read it so that a client that sent
+// none gets no OPT record back (DnsResponseWithoutOpt).
+func DnsQueryHasOpt(p *dnsmessage.Parser) bool {
 	if err := p.SkipAllQuestions(); err != nil {
 		return false
 	}
@@ -2275,11 +2276,11 @@ func dnsQueryHasOpt(p *dnsmessage.Parser) bool {
 	}
 }
 
-// A response with its OPT record removed, for a client whose query carried
-// none. A response with no OPT record, or one that does not parse or repack, is
-// returned as it is: the client gets what it got before every DoH query asked
-// with OPT, when only resolvers that attach one unasked (Quad9) sent it.
-func dnsResponseWithoutOpt(response []byte) []byte {
+// A DNS response with its OPT record removed, for a client whose query carried
+// none (RFC 6891 §7). Every DoH query asks with OPT, so a forwarded upstream
+// response carries one. A response with no OPT record, or one that does not
+// parse or repack, is returned as it is.
+func DnsResponseWithoutOpt(response []byte) []byte {
 	var message dnsmessage.Message
 	if err := message.Unpack(response); err != nil {
 		return response

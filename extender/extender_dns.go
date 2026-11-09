@@ -220,6 +220,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		self.server.reportError("dns query", err)
 		return
 	}
+	edns := connect.DnsQueryHasOpt(&parser)
 
 	if question.Type == dnsmessage.TypeALL {
 		// ANY is a reflection amplifier and answers nothing useful (A6)
@@ -250,6 +251,12 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 		// retries or moves to another resolver
 		self.server.reportError("dns query", extenderFixedError("the query did not resolve"))
 		return
+	}
+	if !edns {
+		// every DoH query asks with OPT, so the upstream answer carries one; a
+		// resolver answers a query without OPT without one (RFC 6891 §7), and
+		// an OPT here would mark the forwarder as not a resolver (A6)
+		responseBytes = connect.DnsResponseWithoutOpt(responseBytes)
 	}
 
 	maxByteCount := self.server.settings.DnsMaxResponseByteCount

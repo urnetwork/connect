@@ -191,8 +191,8 @@ func TestDnsQueryHasOpt(t *testing.T) {
 		if _, err := p.Question(); err != nil {
 			t.Fatal(err)
 		}
-		if hasOpt := dnsQueryHasOpt(&p); hasOpt != edns {
-			t.Errorf("query with opt %t: dnsQueryHasOpt = %t", edns, hasOpt)
+		if hasOpt := DnsQueryHasOpt(&p); hasOpt != edns {
+			t.Errorf("query with opt %t: DnsQueryHasOpt = %t", edns, hasOpt)
 		}
 	}
 }
