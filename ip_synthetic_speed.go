@@ -23,6 +23,11 @@ package connect
 //
 // Connections are close-delimited per response (Connection: close), which
 // keeps the state machine one-shot and measurement bursts independent.
+//
+// The benchmarking ranges are not public destinations (ip_security_public.go:
+// on a host they can be a local proxy's fake-ip space). The security policy
+// admits TCP to them only because the NAT serves it here: with the server
+// disabled a flow is refused, never dialed.
 
 import (
 	"fmt"
@@ -31,8 +36,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+// errSyntheticSpeedDisabled refuses a benchmark-range flow when the synthetic
+// server is off. It wraps ECONNREFUSED so the source is reset at once
+// (classifyDialFailure), as by a destination that refused.
+var errSyntheticSpeedDisabled = fmt.Errorf("the synthetic speed server is disabled and the benchmark range is never dialed: %w", syscall.ECONNREFUSED)
 
 const (
 	syntheticSpeedDefaultByteCount = ByteCount(100 * 1024 * 1024)

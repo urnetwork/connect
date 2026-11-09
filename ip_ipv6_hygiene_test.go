@@ -9,9 +9,10 @@ import (
 )
 
 // ip_ipv6_hygiene_test.go — egress address hygiene (IPV6.md C4): the v6
-// prefixes that embed or tunnel to v4, the non-routable v6 ranges, and the
-// IPv4-mapped form must never reach an egress socket under a public
-// relationship, and a mapped address is judged by the v4 tables it wraps.
+// prefixes that embed or tunnel to v4, the v6 blocks the special-purpose
+// registry marks not globally reachable, and the IPv4-mapped form must never
+// reach an egress socket under a public relationship, and a mapped address
+// is judged by the v4 tables it wraps.
 
 // testEgressPath6 is testEgressPath for a v6 destination string (which may
 // be an IPv4-mapped literal).
@@ -28,7 +29,9 @@ func testEgressPath6(dstIp string) *IpPath {
 }
 
 // every reserved prefix, one representative address each, plus the mapped
-// forms of private and public v4 addresses
+// forms of private and public v4 addresses. The benchmarking block
+// 2001:2::/48 is not here: tcp to it is the synthetic speed server
+// (TestPolicyAdmitsOnlyTcpToSyntheticSpeedServer).
 var testNonPublicIpv6 = []string{
 	"::ffff:10.0.0.5",                      // v4-mapped RFC1918
 	"::ffff:127.0.0.1",                     // v4-mapped loopback
@@ -39,7 +42,13 @@ var testNonPublicIpv6 = []string{
 	"64:ff9b::10.0.0.5",                    // nat64 well-known prefix
 	"64:ff9b:1::10.0.0.5",                  // nat64 local-use prefix
 	"100::1",                               // discard-only
+	"100:0:0:1::1",                         // dummy prefix (RFC 9780)
 	"2001:db8::1",                          // documentation
+	"3fff::1",                              // documentation (RFC 9637)
+	"2001:10::1",                           // the deprecated orchid
+	"2001:1::4",                            // ietf protocol assignments outside the anycast exceptions
+	"5f00::1",                              // srv6 sids (RFC 9602)
+	"::ffff:100.64.0.1",                    // v4-mapped shared address space
 	"fc00::1",                              // ula
 	"fd12:3456::1",                         // ula
 	"fe80::1",                              // link-local
@@ -55,8 +64,10 @@ var testPublicIpv6 = []string{
 	"2001:4860:4860::8888",
 	"::ffff:8.8.8.8", // v4-mapped public
 	"2a00:1450:4001:80e::200e",
-	"2001:1::1", // adjacent to teredo (2001:0::/32) but outside it
-	"2003::1",   // adjacent to 6to4 (2002::/16) but outside it
+	"2001:1::1", // pcp anycast, globally reachable inside 2001::/23 and next to teredo
+	"2001:3::1", // amt, globally reachable inside 2001::/23
+	"2001:20::1",
+	"2003::1", // adjacent to 6to4 (2002::/16) but outside it
 	"64:ff9c::1",
 	"101::1", // adjacent to discard-only
 }
@@ -72,14 +83,17 @@ func TestIsPublicUnicastIpv6Reserved(t *testing.T) {
 			t.Errorf("isPublicUnicast(%s) = false, want true", literal)
 		}
 	}
-	// the v4 answers are unchanged by the v6 additions
-	for _, literal := range []string{"10.0.0.5", "127.0.0.1", "169.254.169.254", "224.0.0.1", "0.0.0.0"} {
+	// the v4 answers: the predicates' blocks and the registry's other
+	// non-globally-reachable blocks (ip_security_public_test.go has every edge)
+	for _, literal := range []string{"10.0.0.5", "127.0.0.1", "169.254.169.254", "224.0.0.1", "0.0.0.0", "100.64.0.1", "198.18.0.1", "240.0.0.1", "255.255.255.255", "192.0.0.1"} {
 		if isPublicUnicast(net.ParseIP(literal)) {
 			t.Errorf("isPublicUnicast(%s) = true, want false", literal)
 		}
 	}
-	if !isPublicUnicast(net.ParseIP("8.8.8.8")) {
-		t.Errorf("isPublicUnicast(8.8.8.8) = false, want true")
+	for _, literal := range []string{"8.8.8.8", "192.0.0.9"} {
+		if !isPublicUnicast(net.ParseIP(literal)) {
+			t.Errorf("isPublicUnicast(%s) = false, want true", literal)
+		}
 	}
 }
 

@@ -31,7 +31,11 @@ import (
 // generation for a registry refresh would mark every provider not yet on that
 // release as older to the clients that are, so the client preference would
 // arm on any drop at most of the fleet (docs/IP_SECURITY.md §2.4.2).
-const SecurityPolicyRulesGeneration uint64 = 2
+//
+// Generation 3 (2026-11-09): the special-purpose registry tables of the
+// public-destination rule (ip_security_public.go) and the provider-local
+// guard (ip_security_local.go).
+const SecurityPolicyRulesGeneration uint64 = 3
 
 // The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,
@@ -88,10 +92,16 @@ func writeSecurityPolicyIdentity(digest io.Writer, policy SecurityPolicy) {
 			Cfaa *CfaaSecurityPolicySettings `json:"cfaa"`
 			Dmca *DmcaSecurityPolicySettings `json:"dmca"`
 			Web  *WebStandardSettings        `json:"web"`
+			// the provider role's guard; absent in the client role, whose
+			// digest is unchanged by it
+			Local *ProviderLocalSecurityPolicySettings `json:"local,omitempty"`
 		}{
 			Cfaa: concrete.cfaa.settings,
 			Dmca: concrete.dmca.settings,
 			Web:  concrete.dmca.web.settings,
+		}
+		if concrete.providerLocal != nil {
+			configuration.Local = concrete.providerLocal.settings
 		}
 		encoded, err := json.Marshal(configuration)
 		if err != nil {
