@@ -11229,6 +11229,46 @@ paths:
               schema:
                 $ref: "#/components/schemas/QuotaLimits"
 
+  /sidecar/push-token:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Set or delete the caller's wake token
+      description: |
+        The caller's own client's APNs or FCM token, which an app posts
+        at every launch and again after a refresh answers
+        `restore_required`. The server keeps one per client and wakes the
+        app with a content-free push that names a topic class and a
+        version, never an id. An empty `token` deletes it, whatever
+        `platform` says. A post equal to what the server holds changes
+        nothing.
+
+        `token` is 1 to 4096 printable ASCII characters with no space.
+        The server never logs it or answers it back. 503 with Retry-After
+        while wakes are not enabled.
+      operationId: sidecarPushToken
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SidecarPushTokenArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarPushTokenResult"
+        "400":
+          description: The platform is not `apns` or `fcm`, or the token is not one the route takes.
+        "401":
+          description: The caller is not a client, or its client is removed.
+        "503":
+          description: Wakes are not enabled; see Retry-After.
+
   /network/auth-keys:
     get:
       tags: [Network]
@@ -26297,6 +26337,25 @@ components:
           description: The generation the server recorded for the client.
           type: integer
           format: int64
+
+    SidecarPushTokenArgs:
+      type: object
+      required:
+        - platform
+        - token
+      properties:
+        platform:
+          description: The vendor, `apns` or `fcm`. May be empty when `token` is.
+          type: string
+          enum: ["apns", "fcm", ""]
+        token:
+          description: The device's token for that vendor; empty deletes it.
+          type: string
+          maxLength: 4096
+
+    SidecarPushTokenResult:
+      type: object
+      properties: {}
 
     SidecarSyncCoreResult:
       type: object
