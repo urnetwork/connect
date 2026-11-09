@@ -133,7 +133,9 @@ func newTestPresetMux(t *testing.T, configure func(settings *UpgradeMuxSettings)
 	return mux, rec
 }
 
-// Installs the synthetic resolver behind the mux's tunnel resolver.
+// Installs the synthetic resolver behind the mux's tunnel resolver. Call before
+// anything queries the cache: after construction, or after a settings swap with
+// the cold prober quieted (testPresetQuietColdProber).
 func (self *testPresetResolver) installPrimary(mux *UpgradeMux) {
 	mux.mux.Tun().DohCache().remoteClient.httpClient.Transport = dohRoundTripperFunc(self.roundTrip)
 }
@@ -146,6 +148,14 @@ func (self *testPresetResolver) installFailover(t *testing.T, mux *UpgradeMux) {
 		t.Fatal("the mux built no failover resolver")
 	}
 	failover.remoteClient.httpClient.Transport = dohRoundTripperFunc(self.roundTrip)
+}
+
+// Keeps the mux's cold prober from querying through its tunnel caches: a
+// settings swap wakes it, and its warm would read a replaced cache's transport
+// while a test installs a fake one. Call before any traffic, while no prober
+// runs.
+func testPresetQuietColdProber(mux *UpgradeMux) {
+	mux.tunnelDohWarmFunction = func(context.Context, int) bool { return false }
 }
 
 // The reply to the client query with id among the packets the mux delivered,
@@ -176,6 +186,14 @@ func testPresetFlightRetired(mux *UpgradeMux, key DohKey) bool {
 // reply, or nil when the mux gave up without one.
 func testPresetQuery(t *testing.T, mux *UpgradeMux, rec *ipMuxRecorder, name string, qType dnsmessage.Type, id uint16) []byte {
 	t.Helper()
+	testPresetSend(t, mux, name, qType, id)
+	return testPresetAwait(t, mux, rec, name, qType, id)
+}
+
+// Sends one client query over UDP/53. The mux starts its pipeline before this
+// returns.
+func testPresetSend(t *testing.T, mux *UpgradeMux, name string, qType dnsmessage.Type, id uint16) {
+	t.Helper()
 	query := testingDnsClientQuery(t, name+".", qType, id, false)
 	packet := ipOosPacket(&IpPath{
 		Version:         4,
@@ -188,6 +206,10 @@ func testPresetQuery(t *testing.T, mux *UpgradeMux, rec *ipMuxRecorder, name str
 	if !mux.SendPacket(TransferPath{}, protocol.ProvideMode_Network, packet, 0) {
 		t.Fatalf("the query for %s was not claimed", name)
 	}
+}
+
+// The mux's flight key of a query.
+func testPresetKey(name string, qType dnsmessage.Type) DohKey {
 	recordType := qType.String()
 	switch qType {
 	case dnsmessage.TypeA:
@@ -195,7 +217,14 @@ func testPresetQuery(t *testing.T, mux *UpgradeMux, rec *ipMuxRecorder, name str
 	case dnsmessage.TypeAAAA:
 		recordType = "AAAA"
 	}
-	key := NewDohKey(recordType, name)
+	return NewDohKey(recordType, name)
+}
+
+// Waits until the mux answered a sent query or retired its flight unanswered,
+// and returns the reply, or nil when there was none.
+func testPresetAwait(t *testing.T, mux *UpgradeMux, rec *ipMuxRecorder, name string, qType dnsmessage.Type, id uint16) []byte {
+	t.Helper()
+	key := testPresetKey(name, qType)
 	if !waitForCondition(20*time.Second, func() bool {
 		return testPresetReply(rec, id) != nil || testPresetFlightRetired(mux, key)
 	}) {
@@ -302,6 +331,8 @@ func TestUpgradeMuxSinkAnswersAreDeliveredButNeverNamed(t *testing.T) {
 // and an opaque reply included; nothing else counts.
 func TestUpgradeMuxBlockedCount(t *testing.T) {
 	mux, rec := newTestPresetMux(t, nil)
+	// the settings swap below installs a fake transport on the new cache
+	testPresetQuietColdProber(mux)
 	resolver := newTestPresetResolver(t, func(host string, question dnsmessage.Question) (testingDohPolicyAnswer, bool) {
 		switch strings.TrimSuffix(question.Name.String(), ".") {
 		case "zero.example", "zerotcp.example":
@@ -673,6 +704,8 @@ func TestUpgradeMuxResolverHealthMovesPerGeneration(t *testing.T) {
 		settings.Dns.ResolveTimeout = 300 * time.Millisecond
 	})
 	clock := newTestPresetClock(mux)
+	// the settings swap below installs a fake transport on the new cache
+	testPresetQuietColdProber(mux)
 	states := make(chan DnsResolverHealthState, 16)
 	removeCallback := mux.AddDnsResolverHealthCallback(func(health DnsResolverHealth) {
 		states <- health.State
@@ -1193,5 +1226,32 @@ func TestUpgradeMuxWithoutPresetSettingsResolvesAsBefore(t *testing.T) {
 	}
 	if _, primaryActive := mux.activeTunnelDohCache(); !primaryActive {
 		t.Fatal("the default resolver was replaced")
+	}
+
+	// a hostname DoH url without pins is still looked up as before: over remote
+	// plain dns through the tunnel, to the configured server, even with remote
+	// dns disabled for every other name
+	unpinned, _ := newTestPresetMux(t, func(settings *UpgradeMuxSettings) {
+		settings.Dns.Resolver = &DnsResolverSettings{
+			EnableRemoteDoh:   true,
+			RemoteDohUrlsIpv4: []string{"https://doh.example/dns-query"},
+			RemoteDnsIpv4:     []string{"192.0.2.53"},
+		}
+		settings.Dns.ResolveTimeout = 2 * time.Second
+	})
+	var serverNameLookedUp atomic.Bool
+	unpinned.SetUpstream(func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
+		ipPath, payload, err := ParseIpPathWithPayload(packet)
+		if err != nil || ipPath.Protocol != IpProtocolUdp || ipPath.DestinationPort != 53 || ipPath.DestinationIp.String() != "192.0.2.53" {
+			return true
+		}
+		if name, ok := dnsQuestionName(payload); ok && name == "doh.example" {
+			serverNameLookedUp.Store(true)
+		}
+		return true
+	})
+	testPresetSend(t, unpinned, "site.example", dnsmessage.TypeA, 0x1410)
+	if !waitForCondition(10*time.Second, serverNameLookedUp.Load) {
+		t.Fatal("an unpinned hostname DoH server was not looked up over remote plain dns through the tunnel")
 	}
 }
