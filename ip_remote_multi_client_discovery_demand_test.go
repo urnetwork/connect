@@ -158,6 +158,11 @@ func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configu
 		emptyEntered: make(chan struct{}), emptyRelease: make(chan struct{}),
 		availableEntered: make(chan struct{}), availableRelease: make(chan struct{})}
 	t.Cleanup(func() {
+		// The close cleanup below can return before the last retirement: a
+		// channel retires its identity on its context.AfterFunc cleanup, and
+		// the enumerator drains its minted args after cancellation. Neither is
+		// joined by CloseAndWait, so count once the bubble has settled.
+		h.settle()
 		_, _, mints, retired := g.counts()
 		if mints != retired {
 			t.Errorf("joined public fixture retired %d of %d actual minted identities", retired, mints)
