@@ -1,13 +1,15 @@
-// The udp 53 forwarder answers as a resolver does under RFC 6891: every DoH
-// query asks with an OPT record, so the upstream answer carries one, and a
-// prober whose query had none gets the answer without it (A6). A prober that
-// sent one keeps it.
+// The udp 53 forwarder answers as a resolver does (A6). Every DoH query asks
+// with an OPT record, so the upstream answer carries one, and a prober whose
+// query had none gets the answer without it (RFC 6891); a prober that sent one
+// keeps it. The DoH query asks with the name in lower case, and the prober gets
+// its own name back, case and all, as a 0x20 client checks.
 
 package extender
 
 import (
 	"context"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -106,5 +108,46 @@ func TestExtenderForwardedAnswerHasOptOnlyForEdnsQueries(t *testing.T) {
 		if optCount != expectedOptCount {
 			t.Errorf("edns %t: %d OPT records, expected %d", c.edns, optCount, expectedOptCount)
 		}
+	}
+}
+
+// A mixed-case query, as a 0x20 client sends, gets its own name back, while
+// the upstream answer names the question in lower case as the DoH cache asks
+// it. The answer record, which points at the question name, reads the same.
+func TestExtenderForwardedAnswerEchoesTheQueryCase(t *testing.T) {
+	const mixedCaseName = "ReSoLvE.ExAmPlE."
+	addr := netip.MustParseAddr("192.0.2.13")
+	lowerCaseAnswerBytes := newTestDnsAnswer(t, strings.ToLower(mixedCaseName), dnsmessage.TypeA, addr, 1)
+	forwardNames := make(chan string, 1)
+	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
+		settings.DnsForward = func(_ context.Context, _ dnsmessage.Type, name string) ([]byte, bool) {
+			select {
+			case forwardNames <- name:
+			default:
+			}
+			return lowerCaseAnswerBytes, true
+		}
+	})
+	conn := newTestDnsClient(t, fixture)
+
+	responseBytes := exchangeTestDnsQuery(t, conn, newTestDnsQuery(t, 0x0020, mixedCaseName, dnsmessage.TypeA))
+	if name := <-forwardNames; !strings.EqualFold(name, strings.TrimSuffix(mixedCaseName, ".")) {
+		t.Fatalf("forwarded name = %q", name)
+	}
+	var message dnsmessage.Message
+	if err := message.Unpack(responseBytes); err != nil {
+		t.Fatalf("the answer does not parse: %v", err)
+	}
+	if message.Header.ID != 0x0020 {
+		t.Fatalf("answer id = %#x, expected the query id", message.Header.ID)
+	}
+	if len(message.Questions) != 1 || message.Questions[0].Name.String() != mixedCaseName {
+		t.Fatalf("answer question = %v, expected the query's %s", message.Questions, mixedCaseName)
+	}
+	if len(message.Answers) != 1 || message.Answers[0].Header.Name.String() != mixedCaseName {
+		t.Fatalf("answer records = %v, expected one for %s", message.Answers, mixedCaseName)
+	}
+	if resource, ok := message.Answers[0].Body.(*dnsmessage.AResource); !ok || netip.AddrFrom4(resource.A) != addr {
+		t.Fatalf("answer = %v, expected %v", message.Answers[0].Body, addr)
 	}
 }

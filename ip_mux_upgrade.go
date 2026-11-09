@@ -2184,22 +2184,30 @@ func (self *UpgradeMux) deliverRawForwardResponse(responders []dnsResponder, dom
 	}
 }
 
-// Copies a one-question DNS response and restores the responder's original
-// question casing. The normalized DoH query and original query differ only by
-// ASCII case, so the wire name has identical length and answer compression
-// offsets remain valid. A compressed/mismatched question is rejected rather
-// than returning a response that can fail DNS 0x20 validation. For a client
-// whose query carried no OPT record the response's OPT record is removed first
-// (RFC 6891 §7: a responder must not include one then); a client that sent one
-// gets the upstream's.
+// The responder's copy of a forwarded response (DnsResponseForQuery).
 func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, bool) {
-	if !responder.edns {
+	return DnsResponseForQuery(response, responder.id, responder.question, responder.edns)
+}
+
+// A copy of a one-question DNS response for one client query: the query's
+// transaction id, and the query's question name byte for byte. The DoH lookup
+// asks with the normalized lower case name (Punycode), but a DNS 0x20 client
+// validates that the response echoes its exact query casing. The names differ
+// only by ASCII case, so the wire name has the same length and answer
+// compression offsets remain valid. A compressed or mismatched question is
+// rejected (false) rather than returning a response that can fail 0x20
+// validation. For a query that carried no OPT record the response's OPT record
+// is removed first (RFC 6891 §7: a responder must not include one then); a
+// query that carried one gets the upstream's. The mux and the extender's udp 53
+// forwarder answer through it.
+func DnsResponseForQuery(response []byte, id uint16, question dnsmessage.Question, edns bool) ([]byte, bool) {
+	if !edns {
 		response = DnsResponseWithoutOpt(response)
 	}
 	if len(response) < 12 || binary.BigEndian.Uint16(response[4:6]) != 1 {
 		return nil, false
 	}
-	name := responder.question.Name.String()
+	name := question.Name.String()
 	if name == "" || name[len(name)-1] != '.' {
 		return nil, false
 	}
@@ -2235,14 +2243,14 @@ func dnsResponseForResponder(response []byte, responder *dnsResponder) ([]byte, 
 			return nil, false
 		}
 	}
-	if dnsmessage.Type(binary.BigEndian.Uint16(response[questionEnd:questionEnd+2])) != responder.question.Type ||
-		dnsmessage.Class(binary.BigEndian.Uint16(response[questionEnd+2:questionEnd+4])) != responder.question.Class {
+	if dnsmessage.Type(binary.BigEndian.Uint16(response[questionEnd:questionEnd+2])) != question.Type ||
+		dnsmessage.Class(binary.BigEndian.Uint16(response[questionEnd+2:questionEnd+4])) != question.Class {
 		return nil, false
 	}
 
 	result := make([]byte, len(response))
 	copy(result, response)
-	binary.BigEndian.PutUint16(result[0:2], responder.id)
+	binary.BigEndian.PutUint16(result[0:2], id)
 	copy(result[12:questionEnd], wireName)
 	return result, true
 }

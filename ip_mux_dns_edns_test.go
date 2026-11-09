@@ -313,3 +313,56 @@ func TestUpgradeMuxCoalescedForwardKeepsOptPerResponder(t *testing.T) {
 		t.Fatalf("OPT records per responder = %v, want 0 for %#x and 1 for %#x", optCounts, 0x6896, 0x6897)
 	}
 }
+
+// The DoH cache asks with the name in lower case, so a forwarded response
+// names the question in lower case; DnsResponseForQuery gives a query its own
+// id and name back, case and all, removes the OPT record for a query without
+// one, and refuses a response to another question.
+func TestDnsResponseForQueryRestoresTheQueryCase(t *testing.T) {
+	cache := testingDohPolicyCache(t, map[string]testingDohPolicyAnswer{
+		"192.0.2.71": testingDohNoError(17, netip.MustParseAddr("198.51.100.40")),
+	}, []string{testCustomDohA}, nil)
+	response, ok := cache.Forward(context.Background(), dnsmessage.TypeA, "ReSoLvE.ExAmPlE")
+	if !ok {
+		t.Fatal("forward failed")
+	}
+	var upstream dnsmessage.Message
+	if err := upstream.Unpack(response); err != nil {
+		t.Fatal(err)
+	}
+	if got := upstream.Questions[0].Name.String(); got != "resolve.example." {
+		t.Fatalf("upstream question = %s, want the lower case name the cache asked", got)
+	}
+
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("ReSoLvE.ExAmPlE."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	for _, edns := range []bool{false, true} {
+		patched, ok := DnsResponseForQuery(response, 0x2020, question, edns)
+		if !ok {
+			t.Fatalf("edns %t: the response was refused", edns)
+		}
+		optCount, answerCount := testingDnsReplyOpt(t, patched, 0x2020)
+		var message dnsmessage.Message
+		if err := message.Unpack(patched); err != nil {
+			t.Fatal(err)
+		}
+		if got := message.Questions[0].Name.String(); got != "ReSoLvE.ExAmPlE." || answerCount != 1 {
+			t.Errorf("edns %t: question %s with %d answers, want ReSoLvE.ExAmPlE. with 1", edns, got, answerCount)
+		}
+		if want := map[bool]int{false: 0, true: 1}[edns]; optCount != want {
+			t.Errorf("edns %t: %d OPT records, want %d", edns, optCount, want)
+		}
+	}
+
+	for _, other := range []dnsmessage.Question{
+		{Name: dnsmessage.MustNewName("other.example."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+		{Name: dnsmessage.MustNewName("ReSoLvE.ExAmPlE."), Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET},
+	} {
+		if _, ok := DnsResponseForQuery(response, 0x2020, other, true); ok {
+			t.Errorf("a response for resolve.example A was given to %s %v", other.Name, other.Type)
+		}
+	}
+}
