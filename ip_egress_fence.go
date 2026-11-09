@@ -46,8 +46,11 @@ type EgressHookBinder interface {
 	BindFlowCloser(closer EgressFlowCloser) (unbind func())
 }
 
-// With no hook installed, every flow registered with the tag ends, since no
-// generation is published to keep one.
+// The NAT's `EgressFlowCloser`: answers and ends every flow registered with
+// the tag below the installed hook's published generation, dials in progress
+// included, scanning each send shard's buffers under their own mutexes. With no
+// hook installed every flow registered with the tag ends, since no generation
+// is published to keep one.
 func (self *LocalUserNat) CloseFlows(ruleTag uint64) int {
 	box := self.egress.hook.Load()
 	var published uint64
