@@ -11199,6 +11199,36 @@ paths:
         "404":
           description: The topic is not served here.
 
+  /sidecar/limits:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's network's effective limits
+      description: |
+        The caller's network's tier and every sidecar limit after its
+        overrides, for local pre-checks: the tier's `sidecar:` keys of
+        `pro.yml`, then its `sidecar_abuse:` keys, `directory_*` among them,
+        each after the network's `network_sidecar_limit` rows, so a tightening
+        reaches daemons and readers. A limit counts bytes as bytes, a true as
+        1 and a false as 0, and -1 means none. A key the body lacks reads 0,
+        not included. The limits are the plan's whether or not the server
+        enforces them yet.
+
+        A refusal by any of these limits elsewhere answers a `QuotaRefusal`:
+        429 with Retry-After when a window resets, 402 when a purchase or a
+        higher tier lifts the limit, with x402 terms where the server can
+        quote them, else 429 with no Retry-After.
+      operationId: sidecarLimits
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaLimits"
+
   /network/auth-keys:
     get:
       tags: [Network]
@@ -26286,6 +26316,45 @@ components:
           items:
             type: string
         revoked:
+          type: boolean
+    QuotaLimits:
+      type: object
+      required:
+        - tier
+        - limits
+      properties:
+        tier:
+          description: "`free` (Community), `pro` or `team`."
+          type: string
+        limits:
+          description: Each limit by its key, the key a `QuotaRefusal` names.
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+    QuotaRefusal:
+      type: object
+      required:
+        - limit_key
+        - limit
+        - used
+        - retry_after_ms
+        - upgrade
+      properties:
+        limit_key:
+          type: string
+        limit:
+          type: integer
+          format: int64
+        used:
+          type: integer
+          format: int64
+        retry_after_ms:
+          description: Until the limit's window resets; 0 for a limit with no window.
+          type: integer
+          format: int64
+        upgrade:
+          description: A purchase or a higher tier lifts the limit.
           type: boolean
     SidecarIdentityResult:
       type: object
