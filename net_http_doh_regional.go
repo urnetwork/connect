@@ -22,8 +22,10 @@ type RegionalDnsServer struct {
 // both default operators already, take its place. In OONI dnscheck from kz,
 // Cloudflare's DoH answered every Oct-Nov 2026 measurement on three networks
 // and Quad9's most of them, and the two networks that blocked DoH (Aug, Sep)
-// blocked Google's too. tm keeps Turkmentelecom alone until another resolver
-// is verified from there.
+// blocked Google's too. Quad9 is its unfiltered 9.9.9.10, as in the defaults;
+// the measurements were of its filtering 9.9.9.9, the same operator and
+// anycast network. tm keeps Turkmentelecom alone until another resolver is
+// verified from there.
 var regionalDnsServers = []*RegionalDnsServer{
 	{CountryCode: "cn", Name: "Alidns", Ipv4: "223.5.5.5", Ipv6: "2400:3200::1"},
 	{CountryCode: "cn", Name: "DNSPod/Tencent", Ipv4: "119.29.29.29", Ipv6: "2402:4e00::"},
@@ -34,7 +36,7 @@ var regionalDnsServers = []*RegionalDnsServer{
 	{CountryCode: "tr", Name: "TTNET", Ipv4: "195.175.39.39"},
 	{CountryCode: "tr", Name: "Turkcell Superonline", Ipv4: "212.252.114.8"},
 	{CountryCode: "kz", Name: "Cloudflare", Ipv4: "1.1.1.1", Ipv6: "2606:4700:4700::1111"},
-	{CountryCode: "kz", Name: "Quad9", Ipv4: "9.9.9.9", Ipv6: "2620:fe::fe"},
+	{CountryCode: "kz", Name: "Quad9", Ipv4: "9.9.9.10", Ipv6: "2620:fe::10"},
 	{CountryCode: "tm", Name: "Turkmentelecom", Ipv4: "217.174.238.141"},
 }
 

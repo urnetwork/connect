@@ -108,7 +108,7 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   On the same branch Quad9 moved from 9.9.9.9 to 9.9.9.10: 9.9.9.9 answers
   a blocked name with NXDOMAIN and EDE 17, and 9.9.9.10 has the same
   operator, certificate and privacy terms without the filter. kz's regional
-  plain-DNS entry for Quad9 still names 9.9.9.9. Everything derived from
+  plain-DNS entry for Quad9 moved to 9.9.9.10 too. Everything derived from
   the default lists follows (tunnel DoH, the Fast DNS projection, the
   control-name DoH and its built-in copy, the Linux and Windows egress
   fallback in `egress_dial.go`).
@@ -166,6 +166,9 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   a user who chose 9.9.9.9 outside an exact old default list keeps it, and a
   record at the current version never migrates. The editors start from the
   mux resolver, which has no local plain lists, so none of those migrates.
+  A record below version 2 whose remote plain lists hold exactly the
+  version 1 kz recommendation (Cloudflare and Quad9's 9.9.9.9, both
+  families, in any order) loads with the current kz recommendation.
 - mmm updates the ur.io threat model's resolver rows to match.
 
 ### 3.2 How a user's DNS flows while connected

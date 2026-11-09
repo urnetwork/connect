@@ -271,6 +271,31 @@ func TestRegionalRecommendationsSurviveGoogleRemoval(t *testing.T) {
 	}
 }
 
+// kz's recommendation is Cloudflare and Quad9's unfiltered 9.9.9.10, as the
+// defaults are, and no regional recommendation or bootstrap preset names
+// Quad9's filtering 9.9.9.9 family.
+func TestKzRecommendationIsCloudflareAndUnfilteredQuad9(t *testing.T) {
+	if got, want := RegionalDnsServerIps("kz"), []string{"1.1.1.1", "9.9.9.10"}; !slices.Equal(got, want) {
+		t.Errorf("kz v4 recommendation = %v, want %v", got, want)
+	}
+	if got, want := RegionalDnsServerIpv6s("kz"), []string{"2606:4700:4700::1111", "2620:fe::10"}; !slices.Equal(got, want) {
+		t.Errorf("kz v6 recommendation = %v, want %v", got, want)
+	}
+	filteringQuad9 := []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}
+	for _, server := range RegionalDnsServers() {
+		if slices.Contains(filteringQuad9, server.Ipv4) || slices.Contains(filteringQuad9, server.Ipv6) {
+			t.Errorf("%s %s names Quad9's filtering service: %s %s", server.CountryCode, server.Name, server.Ipv4, server.Ipv6)
+		}
+	}
+	for _, server := range regionalControlDohServers {
+		for _, dohUrl := range []string{server.DohUrlIpv4, server.DohUrlIpv6} {
+			if u, err := url.Parse(dohUrl); err == nil && slices.Contains(filteringQuad9, u.Hostname()) {
+				t.Errorf("%s %s names Quad9's filtering service: %s", server.CountryCode, server.Name, dohUrl)
+			}
+		}
+	}
+}
+
 // Google Public DNS and OpenDNS left every default list, but not the
 // block-action ignore baseline (wellKnownResolverAddrs): a device's os or
 // browser still queries them directly (Android private dns, a browser's secure
