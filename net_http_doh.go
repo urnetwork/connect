@@ -114,7 +114,11 @@ func DefaultDohSettings() *DohSettings {
 		DohServerWarmStagger:     100 * time.Millisecond,
 		DohServerRaceMaxInFlight: 4,
 		DohServerHedgeReserve:    4,
-		DnsResolverSettings:      DefaultDnsResolverSettings(),
+		// it applies only to settings with lead servers: the control names'
+		// when a user named a server or the ingress country has presets,
+		// never the tunnel's
+		DohServerLeadReserve: 1,
+		DnsResolverSettings:  DefaultDnsResolverSettings(),
 	}
 }
 
@@ -279,6 +283,18 @@ type DohSettings struct {
 	// second-server hedges can therefore run even when a stale/dead primary
 	// has filled the ordinary wave. Zero disables the reserve.
 	DohServerHedgeReserve int
+	// DohServerLeadReserve keeps this many MaxConcurrentHttpRequests slots
+	// unavailable to every server but the lead servers (NamedRemoteDohUrls)
+	// when the settings have any. A request to a server that a network
+	// black-holes holds its slot until the query deadline, so without the
+	// reserve the defaults could hold every slot, and a lead server's request
+	// would wait for one until its lookup failed: a lookup collecting past an
+	// empty answer, for one, holds its defaults to its deadline. One slot is
+	// enough, because a lead server is the one expected to answer, which frees
+	// its slot at once. At least one slot always stays open to the other
+	// servers. Zero or negative disables the reserve; the lead servers still
+	// launch first.
+	DohServerLeadReserve int
 	// DohPathWarm reports whether the shared tunnel path is proven/warm.
 	// nil means state-aware staggering and hedge reservation are disabled.
 	// UpgradeMux supplies an atomic, allocation-free callback.
@@ -298,9 +314,21 @@ type DohSettings struct {
 	// server that was fastest then — instead of uniform-random. Live results take over as
 	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
 	ServerStatsSeed map[string]float64
+	// NamedRemoteDohUrls are the remote DoH servers a user named ahead of the
+	// default servers, of both families (`ControlDohSettings`). They and the
+	// regional presets of `RegionalRemoteDoh` are the lead servers: a query
+	// launches every lead server before any other server, each group in its
+	// weighted order, so no draw of the order can put defaults that a network
+	// black-holes ahead of them, and the other servers leave them
+	// `DohServerLeadReserve` of the request slots. A lead server that a
+	// network black-holes holds the slot it takes until the query deadline,
+	// like any server; with fewer lead servers than slots the others still
+	// race them. Only a url in a server list is queried. nil names none.
+	NamedRemoteDohUrls []string
 	// RegionalRemoteDoh puts the regional bootstrap DoH presets of the
 	// ingress country (`RegionalControlDohUrls` of `IngressCountryCode`)
-	// ahead of the remote DoH servers. Only the control-name
+	// ahead of the remote DoH servers, as lead servers (NamedRemoteDohUrls).
+	// Only the control-name
 	// settings (`ControlDohSettings`) turn it on: in a country that blocks the
 	// default servers (cn) the space's own names still resolve, and the
 	// regional servers see only those names, as any bootstrap DoH server
@@ -888,6 +916,10 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	httpConcurrency := maxConcurrentHttpRequests(settings)
 	httpSem := make(chan struct{}, httpConcurrency)
 	primarySem := newDohPrimarySem(httpConcurrency, settings.DohServerHedgeReserve)
+	// the lead servers' reserve is cache wide too, so the defaults of every
+	// lookup together leave it free
+	leadDohUrls := dohLeadUrls(settings)
+	followerSem := newDohFollowerSem(httpConcurrency, settings.DohServerLeadReserve, leadDohUrls)
 	activeQueries := &atomic.Int64{}
 	stats := newServerStats()
 	// seed the fan-out order from the last session's per-server scores (if the owner
@@ -922,8 +954,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	siblings := dohServerSiblings(settings.DnsResolverSettings)
 
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings},
-		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, followerSem: followerSem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings, leadDohUrls: leadDohUrls},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, followerSem: followerSem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings, leadDohUrls: leadDohUrls},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		bootstrapLookupIP:     newBootstrapPlainDnsLookup(settings, lifecycle, netDialer),
@@ -948,6 +980,37 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 func newDohPrimarySem(httpConcurrency int, hedgeReserve int) chan struct{} {
 	reserve := min(max(0, hedgeReserve), max(0, httpConcurrency-1))
 	if reserve == 0 {
+		return nil
+	}
+	return make(chan struct{}, httpConcurrency-reserve)
+}
+
+// The lead servers of settings (DohSettings.NamedRemoteDohUrls): the servers a
+// user named and, with RegionalRemoteDoh, the regional presets of the ingress
+// country, which are the servers remoteDohUrls puts ahead of the defaults. nil
+// for none, as for the tunnel's settings.
+func dohLeadUrls(settings *DohSettings) map[string]bool {
+	dohUrls := settings.NamedRemoteDohUrls
+	if settings.RegionalRemoteDoh {
+		ingressDnsStrategy := IngressDnsStrategyForCountry(settings.IngressCountryCode)
+		dohUrls = slices.Concat(dohUrls, ingressDnsStrategy.DohUrlsIpv4, ingressDnsStrategy.DohUrlsIpv6)
+	}
+	if len(dohUrls) == 0 {
+		return nil
+	}
+	leadDohUrls := make(map[string]bool, len(dohUrls))
+	for _, dohUrl := range dohUrls {
+		leadDohUrls[dohUrl] = true
+	}
+	return leadDohUrls
+}
+
+// The share of the request slots the servers outside the lead tier may hold:
+// all but the lead reserve (DohSettings.DohServerLeadReserve), and at least
+// one. nil, no share, without a lead server or a reserve.
+func newDohFollowerSem(httpConcurrency int, leadReserve int, leadDohUrls map[string]bool) chan struct{} {
+	reserve := min(max(0, leadReserve), max(0, httpConcurrency-1))
+	if reserve == 0 || len(leadDohUrls) == 0 {
 		return nil
 	}
 	return make(chan struct{}, httpConcurrency-reserve)
@@ -1014,7 +1077,7 @@ func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
 	default:
 		return false
 	}
-	ordered := client.stats.order(dohUrls)
+	ordered := client.launchOrder(dohUrls)
 	if 0 < serverCount && serverCount < len(ordered) {
 		ordered = ordered[:serverCount]
 	}
@@ -1030,30 +1093,18 @@ func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
 	var failureLock sync.Mutex
 	var firstFailure string
 	var warmWg sync.WaitGroup
-warmLoop:
 	for _, dohUrl := range ordered {
-		// respect the shared in-flight cap and byte budget like any real request, so a warm
-		// can never crowd out a user query
-		if client.httpSem != nil {
-			select {
-			case client.httpSem <- struct{}{}:
-			case <-queryCtx.Done():
-				break warmLoop
-			}
-		}
-		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
-			if client.httpSem != nil {
-				<-client.httpSem
-			}
-			break warmLoop
+		// respect the shared in-flight cap, the lead servers' reserve and the
+		// byte budget like any real request, so a warm can never crowd out a
+		// user query
+		follower := !client.leadDohUrls[dohUrl]
+		if !client.admitRequest(queryCtx, false, follower) {
+			break
 		}
 		warmWg.Add(1)
 		go HandleError(func() {
 			defer warmWg.Done()
-			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
-			if client.httpSem != nil {
-				defer func() { <-client.httpSem }()
-			}
+			defer client.releaseRequest(false, follower)
 			result, queryErr := client.queryWireDetailed(queryCtx, dohUrl, "A", dohWarmDomain)
 			// a built-in endpoint's filtered answer earns no success credit here
 			// either (see dohBuiltInEndpoints)
@@ -1756,15 +1807,18 @@ func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []stri
 		)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
+	leadDohUrls := dohLeadUrls(settings)
 	c := &dohClient{
 		httpClient:    httpClient,
 		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
 		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		followerSem:   newDohFollowerSem(maxConcurrentHttpRequests(settings), settings.DohServerLeadReserve, leadDohUrls),
 		activeQueries: &atomic.Int64{},
 		stats:         nil,
 		memoryTarget:  settings.MemoryTarget,
 		lifecycle:     lifecycle,
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		leadDohUrls:   leadDohUrls,
 	}
 	// both families' servers: a txt answer has no family of its own
 	result := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name)
@@ -1844,16 +1898,19 @@ func dohQueryWithClient(
 	}
 	ctx, observation := newDohResolverObservation(ctx, path, dohScopeOneShot)
 	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
-	// (nil stats -> uniform-random fan-out order)
+	// (nil stats -> uniform-random fan-out order within the lead and the other servers)
+	leadDohUrls := dohLeadUrls(settings)
 	c := &dohClient{
 		httpClient:    httpClient,
 		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
 		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		followerSem:   newDohFollowerSem(maxConcurrentHttpRequests(settings), settings.DohServerLeadReserve, leadDohUrls),
 		activeQueries: &atomic.Int64{},
 		stats:         nil,
 		memoryTarget:  settings.MemoryTarget,
 		lifecycle:     lifecycle,
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		leadDohUrls:   leadDohUrls,
 	}
 	result := c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...)
 	observation.finish(settings.Log, dohFinalResolverOutcome(callerCtx, 0 < len(result.AddrTtls), result.Miss, false))
@@ -1933,9 +1990,13 @@ func newDohQueryResult() *dohQueryResult {
 // order toward recently-successful servers. stats may be nil (one-shot queries: uniform-random
 // order, no recording).
 type dohClient struct {
-	httpClient    *http.Client
-	httpSem       chan struct{}
-	primarySem    chan struct{}
+	httpClient *http.Client
+	httpSem    chan struct{}
+	primarySem chan struct{}
+	// the share of httpSem the servers outside the lead tier may hold, all
+	// but the lead reserve (newDohFollowerSem); shared like httpSem. nil when
+	// there is no lead server.
+	followerSem   chan struct{}
 	activeQueries *atomic.Int64
 	stats         *serverStats
 	// the owner's live dns byte budget (see DohSettings.MemoryTarget).
@@ -1950,6 +2011,9 @@ type dohClient struct {
 	// siblings pairs each server url with the same operator's other-family
 	// url (dohServerSiblings), so a fan-out launches the pair as one wave.
 	siblings map[string]string
+	// the lead servers (dohLeadUrls), launched ahead of the others and
+	// exempt from followerSem. nil for none.
+	leadDohUrls map[string]bool
 }
 
 // knownDohUrlPairs are the v4/v6 endpoint pairs of well known DoH operators:
@@ -2184,11 +2248,105 @@ func waitDohLaunchStagger(
 	}
 }
 
+// The order a query launches its servers in: the lead servers (leadDohUrls),
+// then the others, each group in the weighted order of the stats. A launcher
+// takes request slots in this order, and a request to a server that a network
+// black-holes holds its slot until the query deadline, so a lead server drawn
+// behind such defaults would wait for a slot until its lookup failed: with the
+// internal resolver's four slots, whenever two default pairs were drawn ahead
+// of it (DNS defaults v3 follow-up, 2026-11-09).
+func (self *dohClient) launchOrder(dohUrls []string) []string {
+	ordered := self.stats.order(dohUrls)
+	if len(self.leadDohUrls) == 0 {
+		return ordered
+	}
+	launchOrdered := make([]string, 0, len(ordered))
+	for _, dohUrl := range ordered {
+		if self.leadDohUrls[dohUrl] {
+			launchOrdered = append(launchOrdered, dohUrl)
+		}
+	}
+	for _, dohUrl := range ordered {
+		if !self.leadDohUrls[dohUrl] {
+			launchOrdered = append(launchOrdered, dohUrl)
+		}
+	}
+	return launchOrdered
+}
+
+// Admits one request of a launcher, in lock order: the first-wave share of a
+// warm path when primary (primarySem), the share of the servers outside the
+// lead tier when follower (followerSem), the in-flight slot (httpSem), then
+// the byte reservation against the owner's dns memory target, which a request
+// holds for up to a full response read. Waiting work parks in the launcher
+// rather than in one goroutine per request. It takes nothing and returns
+// false when ctx ends first. A true return hands the admission to the
+// request, which gives it back with releaseRequest and the same flags.
+func (self *dohClient) admitRequest(ctx context.Context, primary bool, follower bool) bool {
+	acquire := func(sem chan struct{}) bool {
+		if sem == nil {
+			return true
+		}
+		select {
+		case sem <- struct{}{}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	release := func(sem chan struct{}) {
+		if sem != nil {
+			<-sem
+		}
+	}
+	var primarySem chan struct{}
+	if primary {
+		primarySem = self.primarySem
+	}
+	var followerSem chan struct{}
+	if follower {
+		followerSem = self.followerSem
+	}
+	if !acquire(primarySem) {
+		return false
+	}
+	if !acquire(followerSem) {
+		release(primarySem)
+		return false
+	}
+	if !acquire(self.httpSem) {
+		release(followerSem)
+		release(primarySem)
+		return false
+	}
+	if !self.memoryTarget.Acquire(ctx, dohQueryReserveByteCount) {
+		release(self.httpSem)
+		release(followerSem)
+		release(primarySem)
+		return false
+	}
+	return true
+}
+
+// Gives back an admission of admitRequest, with its flags.
+func (self *dohClient) releaseRequest(primary bool, follower bool) {
+	self.memoryTarget.Release(dohQueryReserveByteCount)
+	if self.httpSem != nil {
+		<-self.httpSem
+	}
+	if follower && self.followerSem != nil {
+		<-self.followerSem
+	}
+	if primary && self.primarySem != nil {
+		<-self.primarySem
+	}
+}
+
 // queryResult resolves recordType for the given domains across dohUrls (RFC 8484 wire), returning
-// as soon as any server returns records. Servers are tried in a weighted-random order biased toward
-// recent success, and launched one wave per DohServerStagger so a fast primary answers before the
-// rest fire — which bounds concurrent in-flight requests and skips the redundant fan-out entirely
-// when an early server wins.
+// as soon as any server returns records. Servers are tried lead servers first (launchOrder), each
+// group in a weighted-random order biased toward recent success, and launched one wave per
+// DohServerStagger so a fast primary answers before the rest fire — which bounds concurrent
+// in-flight requests and skips the redundant fan-out entirely when an early server wins.
 func (self *dohClient) queryResult(
 	ctx context.Context,
 	dohUrls []string,
@@ -2223,9 +2381,9 @@ func (self *dohClient) queryResult(
 	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
 	defer queryCancel()
 
-	// weighted-random order: the best recent performers tend to fire first (and the rest are
-	// skipped when an early server wins)
-	ordered := self.stats.order(dohUrls)
+	// the lead servers first, then weighted-random order: the best recent performers tend to
+	// fire first (and the rest are skipped when an early server wins)
+	ordered := self.launchOrder(dohUrls)
 	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
 		ordered = ordered[:settings.MaxServersPerQuery]
 	}
@@ -2253,65 +2411,25 @@ func (self *dohClient) queryResult(
 	// snapshot before launchers acquired their slots, so a synchronized burst
 	// could nondeterministically admit many more hedges than intended.
 
-	// launcher: start one server-wave per stagger interval (in weighted order) until an early
+	// launcher: start one server-wave per stagger interval (in launch order) until an early
 	// server wins (stop), the deadline passes, or every server has been launched.
 	go HandleError(func() {
 		for waveIndex, wave := range waves {
 			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
 				return
 			}
+			// a warm path's first wave leaves the hedges their reserve
+			primary := pathWarm && waveIndex == 0
 			for _, dohUrl := range wave {
+				// a server outside the lead tier leaves the lead servers theirs
+				follower := !self.leadDohUrls[dohUrl]
 				for _, name := range names {
-					primaryAcquired := false
-					if pathWarm && waveIndex == 0 && self.primarySem != nil {
-						select {
-						case self.primarySem <- struct{}{}:
-							primaryAcquired = true
-						case <-stop:
-							return
-						case <-queryCtx.Done():
-							return
-						}
-					}
-					// acquire the in-flight slot and byte reservation here so work
-					// waiting on the caps parks in this one launcher instead of one
-					// parked goroutine per (server, name); the request goroutine owns
-					// both and releases them when done
-					if self.httpSem != nil {
-						select {
-						case self.httpSem <- struct{}{}:
-						case <-stop:
-							if primaryAcquired {
-								<-self.primarySem
-							}
-							return
-						case <-queryCtx.Done():
-							if primaryAcquired {
-								<-self.primarySem
-							}
-							return
-						}
-					}
-					// the request pins up to a full response read; the owner's dns
-					// memory target bounds its total in-flight bytes across all of
-					// its resolver caches
-					if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-						if self.httpSem != nil {
-							<-self.httpSem
-						}
-						if primaryAcquired {
-							<-self.primarySem
-						}
+					// launchCtx ends at stop or at the deadline
+					if !self.admitRequest(launchCtx, primary, follower) {
 						return
 					}
 					go HandleError(func() {
-						defer self.memoryTarget.Release(dohQueryReserveByteCount)
-						if self.httpSem != nil {
-							defer func() { <-self.httpSem }()
-						}
-						if primaryAcquired {
-							defer func() { <-self.primarySem }()
-						}
+						defer self.releaseRequest(primary, follower)
 						result := self.queryWire(queryCtx, dohUrl, recordType, name)
 						result.Server = dohUrl
 						// the policy-filter guard covers built-in endpoints only: a server the
@@ -2579,10 +2697,11 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 	return data, route.Load(), nil
 }
 
-// forwardRaw resolves qType for domain across dohUrls (best recent performers
-// first) and returns the fastest usable raw response wire (NOERROR/NXDOMAIN).
-// It uses the same load-aware stagger, quiet-query admission, hedge reserve,
-// shared HTTP cap, and live memory target as parsed A/AAAA queries. This is
+// forwardRaw resolves qType for domain across dohUrls (lead servers, then best
+// recent performers first) and returns the fastest usable raw response wire
+// (NOERROR/NXDOMAIN). It uses the same launch order, load-aware stagger,
+// quiet-query admission, hedge and lead reserves, shared HTTP cap, and live
+// memory target as parsed A/AAAA queries. This is
 // important for browsers: Chromium commonly waits for HTTPS before opening an
 // origin, so serially waiting for one slow DoH server multiplied its delay
 // across an entire parallel first-load fan-out.
@@ -2601,7 +2720,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
 	defer queryCancel()
 
-	ordered := self.stats.order(dohUrls)
+	ordered := self.launchOrder(dohUrls)
 	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
 		ordered = ordered[:settings.MaxServersPerQuery]
 	}
@@ -2639,52 +2758,16 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
 				return
 			}
+			primary := pathWarm && waveIndex == 0
 			for _, dohUrl := range wave {
-
-				primaryAcquired := false
-				if pathWarm && waveIndex == 0 && self.primarySem != nil {
-					select {
-					case self.primarySem <- struct{}{}:
-						primaryAcquired = true
-					case <-stop:
-						return
-					case <-queryCtx.Done():
-						return
-					}
-				}
-				if self.httpSem != nil {
-					select {
-					case self.httpSem <- struct{}{}:
-					case <-stop:
-						if primaryAcquired {
-							<-self.primarySem
-						}
-						return
-					case <-queryCtx.Done():
-						if primaryAcquired {
-							<-self.primarySem
-						}
-						return
-					}
-				}
-				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-					if self.httpSem != nil {
-						<-self.httpSem
-					}
-					if primaryAcquired {
-						<-self.primarySem
-					}
+				follower := !self.leadDohUrls[dohUrl]
+				// launchCtx ends at stop or at the deadline
+				if !self.admitRequest(launchCtx, primary, follower) {
 					return
 				}
 
 				go HandleError(func() {
-					defer self.memoryTarget.Release(dohQueryReserveByteCount)
-					if self.httpSem != nil {
-						defer func() { <-self.httpSem }()
-					}
-					if primaryAcquired {
-						defer func() { <-self.primarySem }()
-					}
+					defer self.releaseRequest(primary, follower)
 					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
 					// a built-in endpoint's policy-filtered response is no answer: the next
 					// server is tried (see dohBuiltInEndpoints); a server the user chose is
@@ -3142,6 +3225,10 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 type serverStats struct {
 	lock  sync.Mutex
 	byUrl map[string]*serverStat
+	// Stands in for the uniform draw in [0, 1) of each server's key in the
+	// weighted order (orderAt), by url, so a test can force an order. nil
+	// draws from math/rand. Guarded by lock.
+	draw func(dohUrl string) float64
 }
 
 func newServerStats() *serverStats {
@@ -3301,7 +3388,12 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 	self.lock.Lock()
 	for i, url := range ordered {
 		weight := dohServerWeightFloor + self.scoreLocked(url, now)
-		u := mathrand.Float64()
+		var u float64
+		if self.draw != nil {
+			u = self.draw(url)
+		} else {
+			u = mathrand.Float64()
+		}
 		if u <= 0 {
 			u = math.SmallestNonzeroFloat64
 		}
