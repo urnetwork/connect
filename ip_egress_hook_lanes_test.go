@@ -531,3 +531,37 @@ func TestEgressHookPrincipalAnswersAreBounded(t *testing.T) {
 		t.Fatalf("%d verifies for 16 contracts", verifies.Load())
 	}
 }
+
+// A hook installed while a flow is still being decided by the previous one
+// ends that flow before it dials, and answers nothing on a path the decision
+// may still be writing: the source retransmits into the new hook.
+func TestSetEgressHookEndsAFlowStillResolving(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	previous := newEgressTestHook()
+	previous.setResolver(func(*EgressFlow) EgressDecision {
+		entered <- struct{}{}
+		<-release
+		return EgressDecision{Verdict: EgressVerdictPass}
+	})
+	rig := newEgressTestNat(t, previous, nil)
+	path := egressTestFlowPath(IpProtocolTcp, net.IPv4(192, 0, 2, 96), 8443)
+	rig.send(egressTestTcpPacket(path, tcpFlagSyn, 100, 0, nil))
+	select {
+	case <-entered:
+	case <-time.After(egressTestTimeout):
+		t.Fatal("the flow never reached its hook")
+	}
+	rig.nat.SetEgressHook(newEgressTestHook())
+	close(release)
+	rig.close()
+	if dials := rig.dials.Load(); dials != 0 {
+		t.Fatalf("a flow ended by the install dialed %d times", dials)
+	}
+	select {
+	case packet := <-rig.received:
+		t.Fatalf("a flow ended while resolving was answered: %x", packet)
+	default:
+	}
+}

@@ -619,7 +619,8 @@ type egressFlowState struct {
 	// the flow's decision; nil until it resolves under a hook
 	registration atomic.Pointer[egressRegistration]
 	// the flow reached its decision, with or without a hook, so its first
-	// packet has been taken in and a close may answer its source
+	// packet has been taken in and a close may answer its source; set after
+	// everything the decision writes on the flow's path
 	resolved atomic.Bool
 	// set by whichever ends the flow first, its own deny or a close from
 	// outside, so the source gets at most one answer
@@ -636,12 +637,13 @@ func (self *egressFlowState) resolve(
 	provideMode protocol.ProvideMode,
 	ipPath *IpPath,
 ) (egressOutcome, netip.AddrPort) {
-	self.resolved.Store(true)
 	if self.nat == nil {
+		self.resolved.Store(true)
 		return egressOutcomeLegacy, netip.AddrPort{}
 	}
 	box := self.nat.hook.Load()
 	if box == nil {
+		self.resolved.Store(true)
 		return egressOutcomeLegacy, netip.AddrPort{}
 	}
 	self.nat.foreignFirst.Store(box.hook.FriendsAndFamilyEgress())
@@ -660,10 +662,13 @@ func (self *egressFlowState) resolve(
 	decision := box.hook.ResolveEgress(&flow)
 	dial, ok := egressDial(&flow, decision, ipPath.Version)
 	if !ok {
+		self.resolved.Store(true)
 		return egressOutcomeDeny, netip.AddrPort{}
 	}
 	// the flow's own path, before its first reply: a provider admits a
-	// share's replies only for a flow its hook passed or mapped (C18)
+	// share's replies only for a flow its hook passed or mapped (C18). Written
+	// before `resolved`, which a close from outside reads before it answers on
+	// this path, so the two never race.
 	ipPath.egressAdmitted = true
 	self.registration.Store(&egressRegistration{
 		box:       box,
@@ -671,6 +676,7 @@ func (self *egressFlowState) resolve(
 		principal: flow.Principal,
 		dial:      dial,
 	})
+	self.resolved.Store(true)
 	if ctx.Err() != nil || self.closed.Load() {
 		return egressOutcomeEnd, netip.AddrPort{}
 	}
