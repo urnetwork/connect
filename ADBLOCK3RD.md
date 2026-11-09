@@ -2032,13 +2032,25 @@ The second round, later on 2026-11-09:
 - DNS.SB, a default since decision 19, has no point of presence in France,
   Portugal or Belgium, so a cold lookup on an exit there that draws it pays
   a longer round trip, and its six-day Let's Encrypt IP certificates need
-  watching (3.1). A named bootstrap DoH server on a network that black-holes
-  the defaults now shares the control-name fan-out with five default pairs
-  instead of three, so a lookup is slightly more often launched behind two
-  of them and starved of the internal resolver's four request slots
+  watching (3.1).
+- Fixed (2026-11-09): a named bootstrap DoH server on a network that
+  black-holes the defaults could be starved of the internal resolver's four
+  request slots. A query launched its servers in the weighted random order,
+  and a request to a black-holed default holds its slot until the query
+  deadline, so a lookup that drew two default pairs ahead of the named
+  server failed at its deadline. DNS.SB's longer lists made that more likely
   (`TestInternalDohResolvesThroughControlDohWhenTheDefaultsAreUnreachable`
-  failed 7 of 3000 runs before DNS.SB and 20 of 3000 after); the seed of
-  `ControlDohSettings` keeps it rare.
+  failed 7 of 3000 runs before DNS.SB and 20 of 3000 after; the seed of
+  `ControlDohSettings` only made it rare), and the cn regional presets,
+  which carry no seed, were starved on about half of the cold lookups. Now
+  the named servers and the regional presets are lead servers
+  (`DohSettings.NamedRemoteDohUrls`): every query launches them ahead of the
+  defaults whatever the draw, and the defaults leave them a request slot
+  (`DohSettings.DohServerLeadReserve`, one), so neither a draw nor a lookup
+  collecting past an empty answer can give the defaults all four. The slot
+  count is unchanged. The deterministic tests are in connect's
+  `net_http_doh_lead_test.go`; the test above passed 3000 of 3000 runs
+  after the fix.
 - A wrong NextDNS or AdGuard id, or an exhausted free quota, answers
   unfiltered; the device can say only that it cannot confirm the profile
   (C6).

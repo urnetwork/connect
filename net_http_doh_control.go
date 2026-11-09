@@ -131,16 +131,23 @@ func ParseControlDohUrl(dohUrl string) (string, netip.Addr, error) {
 // the defaults, with the named servers ahead of the default servers of their
 // family. With none named it is the defaults.
 //
-// The named servers are also seeded as the best recent performers
-// (`ServerStatsSeed`), because a query fans out in a weighted random order
-// under a small concurrency cap rather than in list order. Without the seed a
-// lookup on a network that black-holes the defaults could fill every slot
-// with them and time out before it reached a named server. The seed decays
-// like any score, so after the first minutes the servers that actually answer
-// lead.
+// A query fans out in a weighted random order under a small concurrency cap
+// (four request slots for the control names), not in list order, and on a
+// network that black-holes the defaults a request to one holds its slot until
+// the query deadline. So the named servers are the lead servers of every
+// query (`DohSettings.NamedRemoteDohUrls`): they launch ahead of the defaults
+// whatever the draw, and the defaults leave them a slot
+// (`DohSettings.DohServerLeadReserve`). Before that, a lookup that drew two
+// default pairs ahead of a named server, or that came while another lookup's
+// defaults held every slot, failed at its deadline (DNS defaults v3 follow-up,
+// 2026-11-09). The named servers are also seeded as the best recent performers
+// (`ServerStatsSeed`), which orders them ahead of the regional presets below
+// among the lead servers. The seed decays like any score, so after the first
+// minutes the servers that actually answer lead.
 //
 // In an ingress country with regional presets (cn) those are queried as well, ahead of
-// the lists (`DohSettings.RegionalRemoteDoh`), whether or not any are named.
+// the lists and as lead servers (`DohSettings.RegionalRemoteDoh`), whether or not any
+// are named.
 //
 // The urls are used as given: `ParseControlDohUrl` is the rule a caller reads
 // them by.
@@ -160,8 +167,9 @@ func IngressDohSettings(ingressCountryCode string, dohUrlsIpv4 []string, dohUrls
 	resolverSettings := settings.DnsResolverSettings
 	resolverSettings.RemoteDohUrlsIpv4 = controlDohUrlsFirst(dohUrlsIpv4, resolverSettings.RemoteDohUrlsIpv4)
 	resolverSettings.RemoteDohUrlsIpv6 = controlDohUrlsFirst(dohUrlsIpv6, resolverSettings.RemoteDohUrlsIpv6)
+	settings.NamedRemoteDohUrls = slices.Concat(dohUrlsIpv4, dohUrlsIpv6)
 	settings.ServerStatsSeed = map[string]float64{}
-	for _, dohUrl := range slices.Concat(dohUrlsIpv4, dohUrlsIpv6) {
+	for _, dohUrl := range settings.NamedRemoteDohUrls {
 		settings.ServerStatsSeed[dohUrl] = dohSeedMaxScore
 	}
 	return settings
@@ -181,8 +189,9 @@ func controlDohUrlsFirst(dohUrls []string, defaultDohUrls []string) []string {
 // A copy of DoH settings that names only the built-in servers: the server
 // lists of `DefaultDnsResolverSettings`, no pinned hosts, which belong to
 // servers a user or a preset named (`DnsResolverSettings.DohServerHostAddrs`),
-// and no seed, which only ever favors a named server. Everything else is kept
-// as given. A strategy that refuses
+// no named servers to lead (`NamedRemoteDohUrls`), and no seed, which only
+// ever favors a named server. Everything else is kept as given, the built-in
+// regional presets of `RegionalRemoteDoh` included. A strategy that refuses
 // custom DoH servers (`ClientStrategySettings.DisableCustomDohServers`) takes
 // this in place of any settings it is handed, `ControlDohSettings` included.
 func builtInDohServerSettings(settings *DohSettings) *DohSettings {
@@ -206,6 +215,7 @@ func builtInDohServerSettings(settings *DohSettings) *DohSettings {
 		resolverSettings.DohServerHostAddrs = nil
 		copied.DnsResolverSettings = &resolverSettings
 	}
+	copied.NamedRemoteDohUrls = nil
 	copied.ServerStatsSeed = nil
 	return &copied
 }

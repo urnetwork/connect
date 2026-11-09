@@ -159,7 +159,7 @@ func TestClientStrategyDisableCustomDohServersKeepsBuiltInServers(t *testing.T) 
 				return true
 			}
 		}
-		return 0 < len(settings.ServerStatsSeed)
+		return 0 < len(settings.ServerStatsSeed) || 0 < len(settings.NamedRemoteDohUrls)
 	}
 	newStrategySettings := func(disableCustomDohServers bool) *ClientStrategySettings {
 		settings := DefaultClientStrategySettings()
