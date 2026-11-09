@@ -1348,12 +1348,18 @@ paths:
           answers 200 with `error.client_limit_exceeded` and the message
           "Client limit exceeded."
         - The plan's limit on concurrently connected top-level clients. Over
-          it the call answers with `error.client_limit_exceeded` and
-          `error.upgrade_required` -- a plan limit, not a hard cap. When x402
-          inline payments are enabled and a price can be quoted, the answer
-          is HTTP 402 with the terms for a Pro month instead, so an agent can
-          pay and retry the same request (see `/x402`); otherwise it is 200
-          with the error.
+          it the call answers 200 with `error.client_limit_exceeded` and
+          `error.upgrade_required` -- a plan limit, not a hard cap.
+
+        An agent that pays over x402 may ask for the terms instead of the
+        error: with the request header `X-UR-X402: 1`, a refusal with
+        `error.upgrade_required` answers HTTP 402 with the terms for a Pro
+        month when x402 inline payments are enabled and a price can be
+        quoted, so the agent can pay and retry the same request with
+        `X-PAYMENT` (see `/x402`). x402 has no header a client sends before
+        it is quoted, so without `X-UR-X402: 1` every refusal is the 200 with
+        the error, which the apps, the browser extension and ur.io prompt on.
+        A request that carries `X-PAYMENT` is never quoted again.
 
         Two more limits apply to every hosted proxy create (a new client
         with `proxy_config`, top-level or ancillary), and these are always
@@ -1372,12 +1378,12 @@ paths:
           for more." A Pro network's message stops after "Try again in a
           minute".
         For a free network both refusals also set `error.upgrade_required`,
-        so they answer the way the plan limit above does: HTTP 402 with the
-        terms for a Pro month when x402 inline payments are enabled and a
-        price can be quoted, otherwise 200 with the error. Only a new proxy
-        is refused: the network's existing proxies keep working, and
-        removing one makes room for the next. A re-auth of an existing
-        client counts toward neither limit.
+        so they answer the way the plan limit above does: 200 with the
+        error, or HTTP 402 with the terms for a Pro month to a caller that
+        asks for them with `X-UR-X402: 1`. Only a new proxy is refused: the
+        network's existing proxies keep working, and removing one makes room
+        for the next. A re-auth of an existing client counts toward neither
+        limit.
 
         A network on an Embed plan has a per-network client allowance that
         sets both client limits and its active proxy cap.
@@ -1418,8 +1424,8 @@ paths:
         - the network is not on UR Pro: `error.upgrade_required` with the
           message "Unique exit IPs are a UR Pro feature. Upgrade to UR Pro to
           create unique-exit proxies." (HTTP 402 with the terms for a Pro
-          month when x402 inline payments are enabled and a price can be
-          quoted, like the plan limit above)
+          month to a caller that asks with `X-UR-X402: 1`, like the plan
+          limit above)
         - the location names one provider (`connect_location_id.client_id`):
           "A unique exit picks its own provider: use a country, region, city,
           group or best available location."
@@ -1453,10 +1459,11 @@ paths:
           description: Missing or invalid bearer token.
         "402":
           description: |
-            The plan's concurrent connected client limit is reached and x402
-            inline payments are enabled: the body carries the x402 payment
-            terms for a Pro month. Pay, then retry the same request with
-            `X-PAYMENT` (see `/x402`).
+            The caller asked for x402 terms (`X-UR-X402: 1`), a plan limit
+            that UR Pro lifts refused the request (`error.upgrade_required`),
+            and x402 inline payments are enabled: the body carries the x402
+            payment terms for a Pro month. Pay, then retry the same request
+            with `X-PAYMENT` (see `/x402`).
 
   /network/register-client-v1:
     post:
@@ -4271,8 +4278,11 @@ paths:
         `X-PAYMENT-RESPONSE` header. Requires a network session.
 
         The same 402 round trip is also carried inline by
-        `POST /network/auth-client`, where an agent meets the plan's
-        concurrent-client limit.
+        `POST /network/auth-client`, where an agent meets the plan's limits,
+        for an agent that asks for terms with `X-UR-X402: 1`. An agent that
+        did not ask reads `error.upgrade_required` there and can buy
+        `pro_1month` here, then retry, or pay on its auth-client retry with
+        `X-PAYMENT`.
       operationId: x402Purchase
       security:
         - BearerAuth: []
@@ -11363,10 +11373,13 @@ components:
               type: boolean
             upgrade_required:
               description: |
-                The network is at its plan's limit for concurrent connected
-                top-level clients. Unlike `client_limit_exceeded` this is a
-                plan limit, not a hard cap: surface an upgrade prompt. It is
-                the flag the x402 inline-payment round trip keys off.
+                A plan limit that UR Pro lifts refused the request: the free
+                plan's limit for concurrent connected top-level clients, its
+                hosted proxy cap or create rate, or a Pro-only feature. Unlike
+                `client_limit_exceeded` alone this is a plan limit, not a hard
+                cap: surface an upgrade prompt. It is the flag the x402
+                inline-payment round trip keys off, for a caller that asks for
+                terms with `X-UR-X402: 1`.
               type: boolean
             no_unique_supply:
               description: |
