@@ -11488,6 +11488,80 @@ paths:
         "200":
           description: OK.
 
+  /network/bridge/share/{shareId}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: Read a cross-network share's tables
+      description: |
+        Both of a share's tables, to a sidecar of either of its networks: the
+        sharing network's targets and, once the invited network has accepted,
+        its aliases with the accept status. Both are sealed under a key the
+        invite code derives, which the server cannot, so the server stores and
+        serves only ciphertext and versions. A share neither of the caller's
+        networks is a side of answers as one that does not exist. A sidecar's
+        client token only, on the sidecar allowlist.
+      operationId: getNetworkBridgeShare
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NetworkBridgeShareId"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkBridgeShareResult"
+        "400":
+          description: The share id is invalid.
+        "403":
+          description: Not a sidecar's client token.
+        "404":
+          description: No such share, or none of the caller's network.
+        "503":
+          description: Shares are not available on this server yet.
+    put:
+      x-internal: true
+      tags: [Other]
+      summary: Replace the caller's own side of a cross-network share
+      description: |
+        Replaces the sealed table of the caller's own network, the targets of the
+        sharing network or the aliases of the invited one, at a version above
+        the stored one; the other side's table is untouched. The invited side may
+        carry a new accept status with its aliases. A lower or equal version is
+        refused, so an older table is never replayed. A sharing network whose
+        standing gives it no outbound share is refused. A sidecar's client token
+        only, on the sidecar allowlist.
+      operationId: putNetworkBridgeShare
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NetworkBridgeShareId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutNetworkBridgeShareArgs"
+      responses:
+        "200":
+          description: The table was replaced; both tables as they now stand.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkBridgeShareResult"
+        "400":
+          description: An empty or oversized table, a version below 1, or a status the caller's side cannot set.
+        "403":
+          description: Not a sidecar's client token, or the sharing network may not share outbound.
+        "404":
+          description: No such share, or none of the caller's network.
+        "409":
+          description: The version is not above the stored one.
+        "503":
+          description: Shares are not available on this server yet.
+
   /evs/v1/repos/{repo_id}:
     servers:
       - url: https://evs.bringyour.com
@@ -12446,6 +12520,14 @@ components:
         type: string
       required: true
       description: 64 hex digits, the SDK client's public key.
+    NetworkBridgeShareId:
+      in: path
+      name: shareId
+      schema:
+        type: string
+        format: uuid
+      required: true
+      description: The share's id, which the invite fixed.
     EvsRepoId:
       in: path
       name: repo_id
@@ -26210,6 +26292,65 @@ components:
             Whether the ack counted: false for a version not above the client's last
             ack, above its network's head, or in a network with no head.
           type: boolean
+
+    NetworkBridgeShareResult:
+      type: object
+      required:
+        - share_id
+        - network_id
+        - target_table
+        - target_table_version
+        - alias_table_version
+      properties:
+        share_id:
+          type: string
+          format: uuid
+        network_id:
+          description: The sharing network, whose targets the share names.
+          type: string
+          format: uuid
+        invited_network_id:
+          description: The invited network, once it has accepted.
+          type: string
+          format: uuid
+        target_table:
+          description: The sharing network's targets, sealed; base64.
+          type: string
+          format: byte
+        target_table_version:
+          type: integer
+          format: int64
+        alias_table:
+          description: The invited network's aliases, sealed; base64. Absent before it accepts.
+          type: string
+          format: byte
+        alias_table_version:
+          description: 0 before the invited network accepts.
+          type: integer
+          format: int64
+        accept_status:
+          description: Absent before the invited network accepts.
+          type: string
+          enum: [active, refused_too_large, refused_no_space]
+
+    PutNetworkBridgeShareArgs:
+      type: object
+      required:
+        - table
+        - version
+      properties:
+        table:
+          description: The caller's own side's table, sealed; base64.
+          type: string
+          format: byte
+        version:
+          description: Above the stored version of that table.
+          type: integer
+          format: int64
+        accept_status:
+          description: The invited side only, with its aliases.
+          type: string
+          enum: [active, refused_too_large, refused_no_space]
 
     EvsPushLeaseArgs:
       type: object
