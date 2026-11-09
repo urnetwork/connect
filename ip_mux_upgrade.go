@@ -106,7 +106,7 @@ type DnsUpgradeSettings struct {
 	// Limits Fallback to the connect window: it races a query only while the
 	// tunnel is not ready (see UpgradeMux.SetTunnelReady), and once the tunnel
 	// is ready only the tunnel resolvers answer. The device sets it while a
-	// third-party preset is selected (ADBLOCK3RD decision 5), with Fallback
+	// third-party preset is selected (ADBLOCK3RD C7), with Fallback
 	// set to URnetwork's default resolver on the host network: the preset
 	// provider then never sees the user's own address, and once connected an
 	// unfiltered resolver never races a filtering preset's answers. False, the
@@ -121,7 +121,7 @@ type DnsUpgradeSettings struct {
 	// plaintext and never the host network: it is a tunnel DoH resolver like
 	// Resolver. nil, the default, fails closed: a failing Resolver is retried,
 	// never replaced. The device sets URnetwork's default resolver here for
-	// an ad-blocking or unfiltered preset (ADBLOCK3RD C2, decision 3).
+	// an ad-blocking or no-filtering preset (ADBLOCK3RD C1, C2).
 	Failover *DnsResolverSettings
 	// How many consecutive failed resolutions make Resolver failing. A
 	// failure counts only while the tunnel is ready (UpgradeMux.SetTunnelReady)

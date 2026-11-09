@@ -1895,7 +1895,7 @@ type dohQueryResult struct {
 	// error of 15, 16 or 17 (dnsBlockEdeCode), as Quad9 answers a blocked
 	// name. Also Filtered, so a built-in endpoint's is guarded away. A merged
 	// Miss is Blocked when any of its sources' was. The mux counts these
-	// (ADBLOCK3RD decision 16); a plain NXDOMAIN never is one.
+	// (ADBLOCK3RD B9); a plain NXDOMAIN never is one.
 	Blocked bool
 	// A merged Miss that one source alone reported, an endpoint and its
 	// other-family sibling counting as one source, and that source a built-in
@@ -2789,7 +2789,7 @@ func dnsPolicyEdeCode(infoCode uint16) bool {
 }
 
 // Whether an extended dns error INFO-CODE marks a filtering resolver's block,
-// for the count of block answers (ADBLOCK3RD decision 16): 15 Blocked, 16
+// for the count of block answers (ADBLOCK3RD B9): 15 Blocked, 16
 // Censored, 17 Filtered. 4 (Forged Answer) and 18 (Prohibited) are policy codes
 // to the guard (dnsPolicyEdeCode) but not the block of a filter the user chose.
 func dnsBlockEdeCode(infoCode uint16) bool {
@@ -2844,7 +2844,7 @@ func dnsResponseEdeCodes(p *dnsmessage.Parser) []uint16 {
 }
 
 // Whether a raw DNS response is a recognizable block answer (ADBLOCK3RD
-// decision 16): a NOERROR whose A and AAAA answers are all 0.0.0.0 or :: (one
+// B9): a NOERROR whose A and AAAA answers are all 0.0.0.0 or :: (one
 // at least), or an NXDOMAIN carrying an extended dns error of 15, 16 or 17
 // (dnsBlockEdeCode). A plain NXDOMAIN, a REFUSED or a SERVFAIL is not, and a
 // body that does not parse is not.
