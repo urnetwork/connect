@@ -9636,6 +9636,15 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 	return fallback
 }
 
+// The egress hook state of this provider's NAT; nil for a provider built
+// without a NAT, which hooks nothing.
+func (self *RemoteUserNatProvider) natEgress() *localUserNatEgress {
+	if self.localUserNat == nil {
+		return nil
+	}
+	return self.localUserNat.egress
+}
+
 // A return of a flow the egress hook passed or mapped for a FriendsAndFamily
 // source (C18). Its replies come from a share's private address, which the
 // reversed policy's source check would refuse, so they are admitted on the
@@ -10622,7 +10631,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	// NAT without a hook carries none, at no cost; one installed after this
 	// callback meets these packets' flows unsealed, and denies them.
 	var egressPeer *Peer
-	if self.localUserNat.egress.hooked() {
+	if self.natEgress().hooked() {
 		owned := peer
 		owned.delivery = nil
 		egressPeer = &owned
@@ -10633,7 +10642,7 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 	// decides them in place of the public rules, which would make each one
 	// an incident (`EgressHook.FriendsAndFamilyEgress`).
 	shareEgress := provideMode == protocol.ProvideMode_FriendsAndFamily &&
-		self.localUserNat.egress.friendsAndFamilyEgress()
+		self.natEgress().friendsAndFamilyEgress()
 	// One observation per delivered Pack is enough. The former call inside
 	// every packet case serialized a large coalesced return batch on this
 	// provider-global lock even though every frame has the same source and
