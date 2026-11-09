@@ -57,6 +57,7 @@ type HttpConnectProxyError struct {
 	Reason string
 }
 
+// The classification and status, which name nothing of the dial.
 func (self *HttpConnectProxyError) Error() string {
 	return fmt.Sprintf("http connect proxy: %s (status %d)", self.Reason, self.StatusCode)
 }
@@ -221,6 +222,7 @@ type httpConnectConn struct {
 	reader io.Reader
 }
 
+// Reads what the response's read had taken first, then the connection.
 func (self *httpConnectConn) Read(p []byte) (int, error) {
 	return self.reader.Read(p)
 }
