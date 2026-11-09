@@ -1,18 +1,20 @@
 # Third-party ad-blocking DNS presets plan
 
-Status: design for review, 2026-11-08. Provider facts come from the
-ad-blocking DNS research of 2026-11-08 (the report and its notes, kept in
-the private factury repo); this document cites the providers' public pages
-the report cites, and marks the report's own live probes as "probed
-2026-11-08". Facts the research could not settle are listed in section 10
-with the check that settles each. Section 8 lists the decisions the owner
-needs to make.
+Status: final plan, 2026-11-09. The owner decided every open question on
+2026-11-09; section 8 records the decisions, no decision is pending, and the
+sections below follow them. Provider facts come from the ad-blocking DNS
+research of 2026-11-08 (the report and its notes, kept in the private
+factury repo); this document cites the providers' public pages the report
+cites, and marks the report's own live probes as "probed 2026-11-08". Facts
+the research could not settle are listed in section 10 with the check that
+settles each.
 
 Line numbers refer to connect `bc3fec12`, sdk `90b7a59f` and server
 `562ead790` unless a section says otherwise. The Google removal landed in
-connect `b49cbc21`, sdk `92553ef0` and mmm `f7135bb6d`. The OpenDNS removal,
-Cloudflare's second address and the policy-filter guard are on
-`fix/default-resolvers-v2`, in review (3.1).
+connect `b49cbc21`, sdk `92553ef0` and mmm `f7135bb6d`.
+`fix/default-resolvers-v2` (the OpenDNS removal, Cloudflare's second address
+and the policy-filter guard, 3.1) landed in connect `829a5a54`, sdk
+`5c7a6eb7` and mmm `927c0bd04`.
 
 ## 1. Original request
 
@@ -37,6 +39,17 @@ them as requirements:
 - A change to the default lists must not break bootstrap on networks that
   block some operators, or the regional presets.
 
+Owner decisions, 2026-11-09 (section 8): the full first catalog, with the
+"No filtering" picks and with DNS4EU added, while RethinkDNS stays out
+because its resolver forwards to Google upstream; every provider in the
+catalog counts as approved, so no preset waits for a provider's answer;
+manual entry under "Custom" always stays; ad blocking is off by default in
+every app, and URnetwork's default DNS stays the default everywhere; a
+failing preset falls back or fails closed by purpose; Fast DNS on connect
+uses URnetwork's DNS; the catalog and its addresses are built into the sdk
+and change only with releases; and a local count of blocked lookups ships in
+the first release.
+
 ## 2. Goals and non-goals
 
 Goals:
@@ -45,19 +58,21 @@ Goals:
   settings of every app: apple, android, windows and linux. The web and the
   extension control hosted devices, which take no resolver settings (3.9).
 - G2. The picks are grouped by outcome, "Block ads and trackers", "Block
-  malware" and "Family", and each says plainly what it blocks, including
-  "not ads" for the malware and family filters that block no ads (4.A3).
+  malware", "Family" and "No filtering", and each says plainly what it
+  blocks, including "not ads" for the malware and family filters that block
+  no ads (4.A3).
 - G3. A user with an account at NextDNS, Control D or AdGuard DNS enters a
   personal configuration ID, which travels only in the encrypted DoH path
   and is checked in the sdk (4.D).
 - G4. A preset resolves on the same path as the defaults: DoH from the
   device, through the tunnel, egressing at the exit provider. It is encrypted
   end to end, the resolver's own name is never looked up in plaintext, and
-  nothing resolves off the tunnel unless the user turned on Fast DNS on
-  connect.
+  the preset is never queried off the tunnel: with Fast DNS on connect, the
+  connect window uses URnetwork's default DNS (C7).
 - G5. When the chosen resolver fails, the user is told, and nothing switches
-  to plaintext or to the host network. Whether an ad-blocking preset falls
-  back to URnetwork's resolvers or fails closed is the owner's call (O2).
+  to plaintext or to the host network. Ad-blocking and no-filtering presets
+  fall back to URnetwork's default DNS through the tunnel; family, malware
+  and personal presets fail closed (O2, C1).
 - G6. One catalog, one selection model and one set of validation,
   verification and status rules, in the sdk. The apps keep screens only
   (owner rule, 2026-11-03: app logic goes in the sdk).
@@ -65,9 +80,12 @@ Goals:
 
 Non-goals:
 
-- N1. No preset becomes a default. The defaults stay URnetwork's built-in
-  list, Cloudflare (1.1.1.1 and 1.0.0.1) and Quad9's unfiltered 9.9.9.10
-  once `fix/default-resolvers-v2` lands, and the screen opens on it.
+- N1. No preset becomes a default (owner rule, 2026-11-09, for every app:
+  URnetwork's default DNS is the default everywhere, ad blocking is off by
+  default, and presets are only ever user-chosen). The defaults stay
+  URnetwork's built-in list, Cloudflare (1.1.1.1 and 1.0.0.1) and Quad9's
+  unfiltered 9.9.9.10 (`fix/default-resolvers-v2`, 3.1), and the screen
+  opens on it.
 - N2. The control-name (ingress) DNS does not change. Presets never touch
   the bootstrap DoH servers, the connection region or the bootstrap plain
   fallback (3.4). An ad-blocking resolver adds nothing there, and a filter
@@ -78,7 +96,8 @@ Non-goals:
 - N5. No DoT or DoQ upstream and no plaintext presets. The existing regional
   recommendation (plain DNS in cn, ru, ir and others) stays as it is.
 - N6. No network-wide settings sync. Logout still wipes local DNS settings.
-- N7. No presets for hosted proxies or hosted devices in this plan.
+- N7. No presets for hosted proxies or hosted devices in this plan (O7,
+  later).
 - N8. No change to the built-in blocker or its lists, and no URnetwork-side
   allowlist for a third party's blocks.
 - N9. No server-side telemetry of which preset a user picks.
@@ -166,9 +185,12 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
   a user who chose 9.9.9.9 outside an exact old default list keeps it, and a
   record at the current version never migrates. The editors start from the
   mux resolver, which has no local plain lists, so none of those migrates.
-  A record below version 2 whose remote plain lists hold exactly the
-  version 1 kz recommendation (Cloudflare and Quad9's 9.9.9.9, both
-  families, in any order) loads with the current kz recommendation.
+  A version 1 record whose remote plain lists hold exactly the version 1
+  kz recommendation (Cloudflare and Quad9's 9.9.9.9, both families, in any
+  order) loads with the current kz recommendation. A version 0 record with
+  those lists keeps them as saved, 9.9.9.9 included, because before version
+  1 kz recommended Google alone, so there they are the user's own choice
+  (sdk `29df346d`).
 - mmm updates the ur.io threat model's resolver rows to match.
 
 ### 3.2 How a user's DNS flows while connected
@@ -227,11 +249,12 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`.
    name, readable by the exit operator. The production defaults are ip
    literals and never use it.
 10. DoH TLS uses the system roots; nothing pins certificates in production
-    (`net_http_doh.go:33,359-361,397-406`). The client speaks HTTP/2 only
-    (`:407-418`) and sends RFC 8484 GET only (`:2031`). Each dial path has
-    its own TLS session cache, so a ticket from the host path is never
-    redeemed through the tunnel (`:664-669`). DoH error strings embed the
-    server url (`:2033,2055,2059,2063`), and the warm failure line logs one
+    (`net_http_doh.go:33,359-361,397-406`). The client negotiates HTTP/2 by
+    ALPN, offering `h2` ahead of `http/1.1` (`:407-418`), and sends RFC 8484
+    GET only (`:2031`). Each dial path has its own TLS session cache, so a
+    ticket from the host path is never redeemed through the tunnel
+    (`:664-669`). DoH error strings embed the server url
+    (`:2033,2055,2059,2063`), and the warm failure line logs one
     (`:856,871`).
 11. A settings change swaps the tun's DoH cache, with an empty answer cache,
     and the fallback cache (`UpgradeMux.SetSettings`,
@@ -487,8 +510,9 @@ included, because the device derives the resolver lists from the stored
 selection when it applies them (A6). `sdk/dns_presets_ui.go`
 (`//go:build !ios_extension`) holds what the screens call, as
 `control_doh_ui.go` and `transport_settings_view.go` do. connect gets
-generic mechanisms only (B). Whether a server-delivered copy of the catalog
-should also exist is O13.
+generic mechanisms only (B). The catalog is built into the sdk only and
+changes with app releases; there is no server-delivered copy and no withdraw
+list (O13, A7).
 
 A2. Data model, internal to the sdk:
 
@@ -556,64 +580,88 @@ Reserved ids, not catalog entries: `default` (URnetwork's built-in lists,
 derived from `connect.DefaultUpgradeMuxSettings` when applied, so a device
 on the default follows later default changes, E4); custom, stored as an
 empty `PresetId` (the explicit lists of the advanced editor, the behavior of
-every record today); and `regional-<cc>` (the existing regional
-recommendation as a pick, O6, derived from
-`connect.RegionalDnsResolverSettings` and labeled unencrypted).
+every record today, which every app keeps offering, O1); and `regional-<cc>`
+(the existing regional recommendation as a pick, O6, derived from
+`connect.RegionalDnsResolverSettings`, labeled unencrypted, offered only
+while the exit's country has a recommendation and never selected
+automatically).
 
 A3. The catalog. Values are verbatim from the providers' pages (AdGuard's
 [knowledge base](https://adguard-dns.io/kb/general/dns-providers/), Control D's
 [free-DNS docs](https://docs.controld.com/docs/free-dns),
-[Quad9](https://quad9.net/service/service-addresses-and-features) and
+[Quad9](https://quad9.net/service/service-addresses-and-features),
 Cloudflare's [setup](https://developers.cloudflare.com/1.1.1.1/setup/) and
-[addresses](https://developers.cloudflare.com/1.1.1.1/ip-addresses/) pages);
+[addresses](https://developers.cloudflare.com/1.1.1.1/ip-addresses/) pages,
+and DNS4EU's [public service](https://www.joindns4.eu/for-public) page);
 the Control D bootstrap pair is the one Control D's own client uses
 ([ctrld config.go](https://github.com/Control-D-Inc/ctrld/blob/37c33315591632c5f08df8062d1c77e07b3a465f/config.go#L52-L63)).
 
-One-tap presets, each shipped only once its gate clears:
+One-tap presets, in display order (O9): by group in the screen's order, then
+by provider name. Every provider is approved (owner, 2026-11-09, O12), so no
+entry waits for a provider's answer; each still passes F3 before it merges.
+The No-filtering picks are in the catalog proper (O1); `cloudflare` answers
+8236's "use Cloudflare" directly.
 
 | Id | Group | Picker copy | DoH urls | Pins | Block answer | Canary | On failure | Gate |
 |---|---|---|---|---|---|---|---|---|
-| `adguard` | adblock | AdGuard DNS: blocks ads, trackers, phishing | `https://dns.adguard-dns.com/dns-query` | `94.140.14.14`, `94.140.15.15`, `2a10:50c0::ad1:ff`, `2a10:50c0::ad2:ff` | `0.0.0.0` | `doubleclick.net` | O2 | AdGuard's written OK |
-| `adguard-family` | family | AdGuard DNS Family: ads, trackers, adult sites, Safe Search | `https://family.adguard-dns.com/dns-query` | `94.140.14.15`, `94.140.15.16`, `2a10:50c0::bad1:ff`, `2a10:50c0::bad2:ff` | `0.0.0.0` | `doubleclick.net` | fail closed | AdGuard's written OK |
-| `controld-ads` | adblock | Control D: blocks ads, trackers, malware | `https://freedns.controld.com/p2` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | O2 | Control D's written OK |
-| `controld-family` | family | Control D Family: ads, trackers, malware, adult, drugs | `https://freedns.controld.com/family` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fail closed | Control D's written OK |
-| `quad9` | security | Quad9: blocks malware and phishing, not ads | `https://9.9.9.9/dns-query`, `https://149.112.112.112/dns-query`; `https://[2620:fe::fe]/dns-query`, `https://[2620:fe::9]/dns-query` | none | NXDOMAIN, EDE 17 | `examplemalwaredomain.com` | fail closed | confirm with Quad9; F3 |
-| `cloudflare-security` | security | Cloudflare: blocks malware, not ads | `https://1.1.1.2/dns-query`, `https://1.0.0.2/dns-query`; `https://[2606:4700:4700::1112]/dns-query`, `https://[2606:4700:4700::1002]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | F3 |
-| `cloudflare-family` | family | Cloudflare Family: blocks malware and adult sites, not ads | `https://1.1.1.3/dns-query`, `https://1.0.0.3/dns-query`; `https://[2606:4700:4700::1113]/dns-query`, `https://[2606:4700:4700::1003]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | F3 |
+| `adguard` | adblock | AdGuard DNS: blocks ads, trackers, phishing | `https://dns.adguard-dns.com/dns-query` | `94.140.14.14`, `94.140.15.15`, `2a10:50c0::ad1:ff`, `2a10:50c0::ad2:ff` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `controld-ads` | adblock | Control D: blocks ads, trackers, malware | `https://freedns.controld.com/p2` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `dns4eu-noads` | adblock | DNS4EU: blocks ads, trackers, malware, phishing | `https://noads.joindns4.eu/dns-query` | `86.54.11.13`, `86.54.11.213`, `2a13:1001::86:54:11:13`, `2a13:1001::86:54:11:213` | `0.0.0.0` | `doubleclick.net` | fall back | approved (owner, 2026-11-09); F3 |
+| `cloudflare-security` | security | Cloudflare: blocks malware, not ads | `https://1.1.1.2/dns-query`, `https://1.0.0.2/dns-query`; `https://[2606:4700:4700::1112]/dns-query`, `https://[2606:4700:4700::1002]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `dns4eu-protective` | security | DNS4EU: blocks malware and phishing, not ads | `https://protective.joindns4.eu/dns-query` | `86.54.11.1`, `86.54.11.201`, `2a13:1001::86:54:11:1`, `2a13:1001::86:54:11:201` | `0.0.0.0` expected (section 10) | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `quad9` | security | Quad9: blocks malware and phishing, not ads | `https://9.9.9.9/dns-query`, `https://149.112.112.112/dns-query`; `https://[2620:fe::fe]/dns-query`, `https://[2620:fe::9]/dns-query` | none | NXDOMAIN, EDE 17 | `examplemalwaredomain.com` | fail closed | approved (owner, 2026-11-09); F3 |
+| `adguard-family` | family | AdGuard DNS Family: ads, trackers, adult sites, Safe Search | `https://family.adguard-dns.com/dns-query` | `94.140.14.15`, `94.140.15.16`, `2a10:50c0::bad1:ff`, `2a10:50c0::bad2:ff` | `0.0.0.0` | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
+| `cloudflare-family` | family | Cloudflare Family: blocks malware and adult sites, not ads | `https://1.1.1.3/dns-query`, `https://1.0.0.3/dns-query`; `https://[2606:4700:4700::1113]/dns-query`, `https://[2606:4700:4700::1003]/dns-query` | none | `0.0.0.0`, EDE 17 | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `controld-family` | family | Control D Family: ads, trackers, malware, adult, drugs | `https://freedns.controld.com/family` | `76.76.2.11`, `2606:1a40::11` | `0.0.0.0` | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
+| `dns4eu-child` | family | DNS4EU Child: blocks malware, adult sites, gambling, drugs, violence, not ads | `https://child.joindns4.eu/dns-query` | `86.54.11.12`, `86.54.11.212`, `2a13:1001::86:54:11:12`, `2a13:1001::86:54:11:212` | `0.0.0.0` expected (section 10) | none | fail closed | approved (owner, 2026-11-09); F3 |
+| `dns4eu-child-noads` | family | DNS4EU Child with ad blocking: ads, trackers, malware, adult sites, gambling, drugs, violence | `https://child-noads.joindns4.eu/dns-query` | `86.54.11.11`, `86.54.11.211`, `2a13:1001::86:54:11:11`, `2a13:1001::86:54:11:211` | `0.0.0.0` expected (section 10) | `doubleclick.net` | fail closed | approved (owner, 2026-11-09); F3 |
+| `adguard-unfiltered` | unfiltered | AdGuard DNS: no filtering | `https://unfiltered.adguard-dns.com/dns-query` | `94.140.14.140`, `94.140.14.141`, `2a10:50c0::1:ff`, `2a10:50c0::2:ff` | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `cloudflare` | unfiltered | Cloudflare: no filtering | `https://1.1.1.1/dns-query`, `https://1.0.0.1/dns-query`; `https://[2606:4700:4700::1111]/dns-query`, `https://[2606:4700:4700::1001]/dns-query` | none | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `controld-unfiltered` | unfiltered | Control D: no filtering | `https://freedns.controld.com/p0` | `76.76.2.11`, `2606:1a40::11` | none | none | fall back | approved (owner, 2026-11-09); F3 |
+| `dns4eu-unfiltered` | unfiltered | DNS4EU: no protective filtering; court-ordered blocks still apply | `https://unfiltered.joindns4.eu/dns-query` | `86.54.11.100`, `86.54.11.200`, `2a13:1001::86:54:11:100`, `2a13:1001::86:54:11:200` | court orders only; the form is unverified (section 10) | none | fall back | approved (owner, 2026-11-09); F3 |
 
 What the presets were seen to do, probed 2026-11-08: AdGuard Default,
-AdGuard Family and Control D p2 answered `doubleclick.net` with `0.0.0.0`;
-Quad9 answered `examplemalwaredomain.com` with NXDOMAIN and EDE 17, and a
-genuinely nonexistent name without EDE; none of the free tiers of Quad9 and
-Cloudflare blocked any of eight ad and tracker domains, which is why their
-copy says "not ads"; Cloudflare 1.1.1.3 also forced Google SafeSearch and
-Bing strict mode by CNAME, which Cloudflare does not document. AdGuard
-accepted HTTP/2 and HTTP/1.1, Quad9 has required HTTP/2 since 2025-12-15
-(HTTP 505 on 1.1, [FAQ](https://docs.quad9.net/FAQs/)), and the research
-reports that every recommended preset answered RFC 8484 GET. connect speaks
-HTTP/2 only and GET only (3.2 step 10), so all of them fit.
+AdGuard Family, Control D p2 and DNS4EU's ad-blocking variant answered
+`doubleclick.net` with `0.0.0.0`, while DNS4EU's Protective and Unfiltered
+variants returned a real address; Quad9 answered `examplemalwaredomain.com`
+with NXDOMAIN and EDE 17, and a genuinely nonexistent name without EDE; none
+of the free tiers of Quad9 and Cloudflare blocked any of eight ad and
+tracker domains, which is why their copy says "not ads"; Cloudflare 1.1.1.3
+also forced Google SafeSearch and Bing strict mode by CNAME, which
+Cloudflare does not document. DNS4EU's two child variants and Protective's
+malware blocks were not probed, so their block answers are expected, not
+seen (section 10). AdGuard accepted HTTP/2 and HTTP/1.1, Quad9 has required
+HTTP/2 since 2025-12-15 (HTTP 505 on 1.1,
+[FAQ](https://docs.quad9.net/FAQs/)), and DNS4EU refused a TLS client that
+offered no ALPN, with a `no_application_protocol` alert, and answered over
+HTTP/2. The research reports that every recommended preset answered RFC 8484
+GET, and its DNS4EU probes were GET too. connect offers ALPN `h2` ahead of
+`http/1.1` on every DoH client and sends GET only (3.2 step 10, section 7),
+so all of them fit.
+
+DNS4EU's DoH stamps carry no address, so its presets use hostname urls with
+pins, the addresses its public-service page lists for each variant.
+Court-ordered blocks apply to every DNS4EU variant ("Court-ordered domain
+blocks apply to every variant, including this one",
+[DNS4EU](https://www.joindns4.eu/for-public)): its compliance page lists
+French ARCOM and Paris court orders and Russian state-media domains
+([legal](https://www.joindns4.eu/legal-information-and-compliance)), which is
+why its No-filtering copy says "no protective filtering". Its 14 resolvers
+sit in 14 EU member states, and its policy aims the Public Service primarily
+at individuals in the EU (H3).
 
 None of the filtering presets above names a built-in endpoint (3.1), so the
 policy-filter guard leaves their blocks alone (B4). The `quad9` preset's
 `9.9.9.9` became an ordinary endpoint when the defaults moved to Quad9's
 unfiltered `9.9.9.10`.
 
-Optional "no filtering" variants (O1): `adguard-unfiltered`
-(`https://unfiltered.adguard-dns.com/dns-query`, pins `94.140.14.140`,
-`94.140.14.141`, `2a10:50c0::1:ff`, `2a10:50c0::2:ff`),
-`controld-unfiltered` (`https://freedns.controld.com/p0`, the Control D
-pins), and `cloudflare` (`https://1.1.1.1/dns-query`,
-`https://1.0.0.1/dns-query`, `https://[2606:4700:4700::1111]/dns-query`,
-`https://[2606:4700:4700::1001]/dns-query`), the last of which answers
-8236's "use Cloudflare" directly.
-
-Personal presets (D):
+Personal presets (D), the "Use my account" group, in display order:
 
 | Id | DoH form stored | Pins | Unknown or wrong id, probed 2026-11-08 | Free tier |
 |---|---|---|---|---|
-| `nextdns-personal` | `https://dns.nextdns.io/<id>` | `45.90.28.0`, `45.90.30.0`, `2a07:a8c0::`, `2a07:a8c1::` | malformed ids (`zzzzzz`, `0x0x0x`) and no id: HTTP 200 with unfiltered answers; a well-formed unknown id was not probed, and the research expects the same | 300,000 queries a month, then "like a classic non-blocking DNS service" ([pricing](https://nextdns.io/pricing)) |
-| `controld-personal` | `https://dns.controld.com/<id>` | `76.76.2.22`, `2606:1a40::22` | REFUSED to every query | none: a 14-day trial, then from $3 a month |
 | `adguard-personal` | `https://d.adguard-dns.com/dns-query/<id>` | `94.140.14.49`, `2a10:50c0::ded:ff` | a well-formed unknown id answers unfiltered; a malformed one gets SERVFAIL | Starter: 300,000 requests a month; what happens at the cap is undocumented ([plans](https://adguard-dns.io/en/license.html)) |
+| `controld-personal` | `https://dns.controld.com/<id>` | `76.76.2.22`, `2606:1a40::22` | REFUSED to every query | none: a 14-day trial, then from $3 a month |
+| `nextdns-personal` | `https://dns.nextdns.io/<id>` | `45.90.28.0`, `45.90.30.0`, `2a07:a8c0::`, `2a07:a8c1::` | malformed ids (`zzzzzz`, `0x0x0x`) and no id: HTTP 200 with unfiltered answers; a well-formed unknown id was not probed, and the research expects the same | 300,000 queries a month, then "like a classic non-blocking DNS service" ([pricing](https://nextdns.io/pricing)) |
 
 The NextDNS pins are the official CLI's bootstrap
 ([run.go](https://github.com/nextdns/nextdns/blob/a7e835115da831b0267c98dfd0be4de0175d9ad9/run.go#L605-L626));
@@ -624,16 +672,15 @@ router guide also lists `94.140.14.59` and `2a10:50c0::dad:ff` for private
 servers ([KB](https://adguard-dns.io/kb/private-dns/connect-devices/routers/universal/)),
 which F3 checks before they become pins.
 
-Left out, with reasons (the research's):
+Left out, with reasons (the research's, and for RethinkDNS the owner's):
 
 | Provider | Why not |
 |---|---|
-| DNS4EU | terms: free "strictly for their use in a personal capacity", "designed for manual configuration", "not eligible for enterprises or connectivity providers"; per-query logs kept up to six months; EU-only footprint ([terms](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-Resolver-Terms-of-Use.pdf)). Whalebone's written permission first (O14). |
 | CleanBrowsing | free tier "for parents, not organizations", a "Throttled Service", no selling access; Family blocks "proxy and VPN domains" ([terms](https://cleanbrowsing.org/terms/), [filters](https://cleanbrowsing.org/filters/)) |
 | OpenDNS FamilyShield | returned block pages for `nordvpn.com`, `protonvpn.com` and `hidemyass.com`; free terms labeled "expired"; withdrawn from France and Portugal ([terms](https://umbrella.cisco.com/terms/)) |
 | NextDNS without an id | filters nothing (probed) |
 | Mullvad DNS | shut down 2026-11-02 ([announcement](https://mullvad.net/en/blog/shutting-down-our-public-encrypted-dns-servers-and-sponsoring-quad9-instead)); nothing in connect, sdk or the apps references it |
-| RethinkDNS | no terms, volunteer and grant-funded infrastructure; custom url only (O14) |
+| RethinkDNS | its non-filtering resolver, `sky.rethinkdns.com`, forwards to Cloudflare's resolver and then Google's ([env.js](https://github.com/serverless-dns/serverless-dns/blob/b0b7fe52ecc053562d1fc425f9c5c6f984d37e11/src/core/env.js#L139-L154)), and 8236 asked to avoid Google; dropped by the owner (2026-11-09, O14), its blocklist stamps with it. Manual entry under Custom still works |
 | LibreDNS, dnsforge.de, BlahDNS and other community resolvers | single-operator, non-anycast hobby servers (dnsforge caps 100 queries per 10 s, BlahDNS asks for no large traffic); custom url only |
 | Quad9 with ECS (`9.9.9.11`) | it forwards a client subnet, which behind URnetwork is the exit provider's home network |
 
@@ -649,8 +696,9 @@ A4. Catalog rules, enforced by sdk tests (6.1):
 - A personal template has exactly one `{id}` filling one whole path segment,
   and every id pattern is anchored and admits only `[A-Za-z0-9-]`.
 - No preset is `default`, preselected or marked as recommended (H1).
-- Groups are consistent: `family` and `security` never fail over; a preset
-  whose `blocksAds` is false never sits in `adblock`.
+- Groups are consistent: `adblock` and `unfiltered` presets fail over, and
+  `family`, `security` and `personal` ones never do (O2); a preset whose
+  `blocksAds` is false never sits in `adblock`.
 - Every entry has a `checked` date (F3).
 
 A5. The surface the apps call (gomobile, cgo and JS), in
@@ -711,9 +759,15 @@ func DnsResolverSettingsAsCustom(base *DnsResolverSettings) *DnsResolverSettings
 func CopyDnsResolverSettings(settings *DnsResolverSettings) *DnsResolverSettings
 
 // What the summary row shows, given the exit's country: the preset, the
-// group, whether the selection is custom, retired (A7) or unencrypted, and
-// which pill to show, if any (F2).
+// group, whether the selection is custom or unencrypted, the notice of a
+// dropped preset (A7), which pill to show, if any (F2), and whether the
+// screen shows the blocked-lookups count (I3).
 func DescribeDnsResolverSettings(settings *DnsResolverSettings, exitCountryCode string) *DnsSelectionSummary
+
+// Hides every preset that blocks ads, for the Play-only catalog if Play
+// review objects (O15, H4). The android play flavor calls it at startup; a
+// stored selection it hides is handled as a dropped preset (A7).
+func SetDnsPresetsHideAdBlocking(hide bool)
 ```
 
 The editors never build a `DnsResolverSettings` from scratch: they start
@@ -732,9 +786,11 @@ derives it each time it applies the settings. One conversion does it:
 `DnsResolverSettings.toConnect()` (`device_local.go:8266-8288`) derives a
 preset's lists and attaches the catalog pins. The mux settings
 (`upgradeMuxSettingsWithDnsResolverSettings`, `:8303-8324`) and the socket
-resolver (`socket.go:147-160`) already go through it; the host fallback
+resolver (`socket.go:147-160`) already go through it. The host fallback
 projection (`hostFallbackDnsResolverSettings`, `:8330-8350`) builds a new
-struct from the result and must copy the pins. The result:
+struct from the result: while a preset is selected it is URnetwork's default
+resolver instead, never the preset (C7), and for custom settings it must
+copy the pins. The result:
 
 - `EnableRemoteDoh` true; `EnableLocalDoh`, `EnableRemoteDns` and
   `EnableLocalDns` false. This makes the chain DoH-only, so a filter's
@@ -749,7 +805,9 @@ struct from the result and must copy the pins. The result:
 - `RemoteDnsIpv4` and `RemoteDnsIpv6` empty. With pins nothing needs them,
   and empty lists make a missing pin fail closed instead of falling back to a
   plaintext lookup (B3).
-- `DnsUpgradeMaskAddress` and `EnableFallback` as the user has them.
+- `DnsUpgradeMaskAddress` and `EnableFallback` as the user has them. With
+  `EnableFallback`, the mux settings' `Fallback` is URnetwork's default
+  resolver over the host egress, with `FallbackUntilTunnelReady` set (C7).
 - The ignore list (`dnsIgnoreHostValues`, `device_local.go:8427-8472`) also
   gets the pins, so block actions and the built-in blocker never capture
   resolver traffic.
@@ -768,11 +826,15 @@ behavior, not a newly offered resolver.
 The stored record keeps the derived lists as well as the selection. An older
 sdk ignores the selection and uses the lists (E5).
 
-A7. Catalog changes reach devices with a release, because the device derives
-the lists from the current catalog at every apply. A stored preset id the
-catalog no longer knows keeps working from the stored lists; the summary
-marks it retired and the DNS screen asks the user to choose again. It never
-switches silently (O8).
+A7. Catalog changes reach devices only with an app release (O13), because
+the device derives the lists from the current catalog at every apply. When a
+release drops a preset, the catalog keeps its id, with its provider's name,
+as reserved (A4). A device whose stored selection names a dropped id
+switches to URnetwork's DNS: it applies `default` in its place, and the DNS
+screen and the summary show a notice that names the provider and says its
+filtering is off, with "Choose another preset" and "Enter it yourself under
+Custom" (O8). This holds for every group, family and personal included, and
+never happens silently; dismissing the notice saves `default`.
 
 ### B. The resolution path (connect)
 
@@ -817,8 +879,9 @@ B2. Through the tunnel. A preset is queried by the mux's tun, the remote DoH
 path, exactly as the defaults are (3.2 step 4). The resolver sees the exit
 provider's address, answers match the exit's location (the 2026-10-02
 rationale for tunnel-only DNS), and the local network sees only tunnel
-traffic. The one host-network path is Fast DNS on connect, when the user
-turned it on (C7).
+traffic. A preset never takes the host-network path: Fast DNS on connect,
+when the user turned it on, uses URnetwork's default DNS for the connect
+window (C7).
 
 B3. No plaintext. Preset settings have remote plain DNS off with empty
 lists, and pins for every hostname. The resolver's name is never looked up
@@ -829,11 +892,11 @@ the tunnel's plain DNS until pins land; that is the plaintext lookup the 8236
 safety constraint rules out, and it shows the exit operator which provider
 the user chose, so pins land first (section 7).
 
-B4. Sink answers. AdGuard, Control D and Cloudflare answer a blocked name
-with `0.0.0.0`; Quad9 answers NXDOMAIN with EDE 17 (A3). The mux delivers a
-`0.0.0.0` or `::` answer to the client but does not record it in the reverse
-index or bind it to an exit: skip `reverse.record` in the reply
-(`ip_mux_upgrade.go:1852-1854`) and the `DohResultCallback` in
+B4. Sink answers. AdGuard, Control D, Cloudflare and DNS4EU answer a
+blocked name with `0.0.0.0`; Quad9 answers NXDOMAIN with EDE 17 (A3). The
+mux delivers a `0.0.0.0` or `::` answer to the client but does not record it
+in the reverse index or bind it to an exit: skip `reverse.record` in the
+reply (`ip_mux_upgrade.go:1852-1854`) and the `DohResultCallback` in
 `DohCache.resolve` (`net_http_doh.go:1181-1189`). This matches the built-in
 blocker's rule (`ip_mux_upgrade.go:1658-1660`); without it every blocked name
 lands on one reverse-index entry for `0.0.0.0`. The answer is still cached
@@ -886,8 +949,8 @@ the SANs but were not reached. The other Cloudflare secondaries (`1.0.0.2`,
 IPv6 literals pass F3 before they ship; a literal that fails falls back to
 the provider's hostname (`cloudflare-dns.com`,
 `security.cloudflare-dns.com`, `family.cloudflare-dns.com`,
-`dns.quad9.net`) with the same addresses as pins. AdGuard and Control D were
-not tested by ip literal and use hostname urls with pins.
+`dns.quad9.net`) with the same addresses as pins. AdGuard, Control D and
+DNS4EU were not tested by ip literal and use hostname urls with pins.
 
 B7. Logs carry a DoH url as scheme and host only. Error strings that include
 the url (`net_http_doh.go:2033,2055,2059,2063`) and the warm failure line
@@ -902,31 +965,51 @@ LibreDNS and dnsforge.de were probed only with POST, so the custom editor
 needs a per-url POST option before it can promise those servers. It is not
 needed for any preset and is outside this plan's first release.
 
+B9. The blocked-lookups count (O16). The mux counts each client query it
+answers with a recognizable block from a resolver: a `0.0.0.0` or `::`
+sink, which B4 already tells apart from an address in the reply that skips
+the reverse index, and an NXDOMAIN carrying extended DNS error 15 (Blocked),
+16 (Censored) or 17 (Filtered), read as the guard reads its policy codes
+(`dnsResponsePolicyEde`, `net_http_doh.go:2393` on `829a5a54`) but with the
+owner's narrower set, so 4 and 18 do not count. The parsed result and its
+cache entry carry whether a miss came with one of those codes, so a cached
+block counts again when it answers another query, and an opaque reply (3.2
+step 3) counts by the same rule. Not counted: an NXDOMAIN without one of
+those codes (a personal configuration that blocks with plain NXDOMAIN, or a
+name that does not exist), a REFUSED (a failure, C10), the built-in
+blocker's answers (URnetwork's own, 3.6), and anything from a built-in
+endpoint, whose filtered answers never win (3.1). The figure is therefore a
+floor. New `UpgradeMux.DnsBlockedCount()` returns the count and
+`ResetDnsBlockedCount()` zeroes it; the mux keeps no names with it and never
+logs it. The sdk exposes it (I3).
+
 ### C. Failure behavior
 
-C1. Two policies, per preset (the catalog's `failover`), for the owner to
-choose between (O2):
+C1. Split by purpose, per preset (the catalog's `failover`), as the owner
+decided (O2):
 
-- Option A, the research's recommendation and this plan's: an ad-blocking
-  preset (and an unfiltered one) falls back to URnetwork's default resolver
-  while it fails from the current exit, with a visible "Ad blocking paused"
-  status, and returns to the preset as soon as it answers again. Family and
-  security presets fail closed, because a silent fallback would defeat their
-  purpose (Apple's encrypted-DNS payload defaults `AllowFailover` to false
-  for the same reason). Personal presets fail closed too: the app cannot
-  know whether the user's configuration is a parental one.
-- Option B, this plan's first draft: every preset fails closed.
+- Ad-blocking and no-filtering presets fall back to URnetwork's default DNS
+  while they fail from the current exit, with the status "Ad blocking
+  paused: <Provider> isn't answering" (C8), and return to the preset on
+  their own as soon as it answers again.
+- Family, malware (`security`) and personal presets fail closed (C3), with
+  a status line and a one-tap "Use URnetwork DNS", because a silent fallback
+  would defeat their purpose (Apple's encrypted-DNS payload defaults
+  `AllowFailover` to false for the same reason). Personal presets fail
+  closed because the app cannot know whether the user's configuration is a
+  parental one.
 
-Option A is recommended because URnetwork's exits are residential
-connections in many countries, so per-exit failures are certain: AdGuard's
-DoH is blocked in China, Control D's `freedns` is blocked there too, and
-Quad9 leaves France on 2026-11-24 (C9). Under option B an ad blocker that
-cannot be reached from an exit turns into "the VPN doesn't work"; under
-option A it turns into ads for a while, with a notice. Both options keep the
-safety constraint: the fallback is the built-in DoH list through the tunnel,
-never plaintext and never the host network, and never silent.
+The split suits URnetwork's exits, residential connections in many
+countries where per-exit failures are certain: AdGuard's DoH is blocked in
+China, Control D's `freedns` is blocked there too, and Quad9 leaves France
+on 2026-11-24 (C9). Failing every preset closed, the rejected alternative,
+would turn an ad blocker that cannot be reached from an exit into "the VPN
+doesn't work"; the fallback turns it into ads for a while, with a notice.
+Both groups keep the safety constraint: the fallback is the built-in DoH
+list through the tunnel, never plaintext and never the host network, and
+never silent.
 
-C2. The fallback mechanism (option A), in connect:
+C2. The fallback mechanism, in connect:
 
 - `DnsUpgradeSettings.Failover *DnsResolverSettings`: nil fails closed (the
   behavior of every mux today). When set, the mux builds a second tunnel DoH
@@ -944,13 +1027,14 @@ C2. The fallback mechanism (option A), in connect:
   `SetIpv6Unroutable`, `ip_mux_upgrade.go:1172-1188`), so a tunnel that is
   forming or down never triggers a fallback.
 
-C3. Fail closed (option B, and family, security and personal presets under
-option A): the mux sends no answer, as today; cached names can be served up
-to five minutes stale; the cold prober keeps retrying the preset with
-backoff. Nothing falls back to the default servers, to plaintext, or to the
-host network unless Fast DNS on connect is on.
+C3. Fail closed (family, security and personal presets): the mux sends no
+answer, as today; cached names can be served up to five minutes stale; the
+cold prober keeps retrying the preset with backoff. Nothing falls back to
+the default servers, to plaintext, or to the host network; Fast DNS on
+connect stops racing once the tunnel is ready (C7). The status line offers
+"Use URnetwork DNS", which selects `default` in one tap (C8).
 
-C4. Encrypted stays encrypted, under either option, by B3 and C2, with tests
+C4. Encrypted stays encrypted, for every preset, by B3 and C2, with tests
 that fail if any plaintext or OS lookup happens for a preset (6.2).
 
 C5. Detection. The mux reports resolver health from state it already keeps
@@ -994,26 +1078,42 @@ Echo services that could confirm a NextDNS or AdGuard profile exist
 (`test.nextdns.io`, AdGuard's `dnscheck`) but neither is usable yet (section
 10).
 
-C7. Fast DNS on connect with a preset. The host projection
-(`hostFallbackDnsResolverSettings`) queries the preset from the user's own
-network address, with the pins (B1). That keeps filtering consistent during
-connect, and it shows the user's real address to the provider, which for a
-personal configuration ties the address to the user's account there. The
-DNS screen says so next to the toggle while a preset is selected (O3).
+C7. Fast DNS on connect with a preset (O3). During the connect window,
+lookups use URnetwork's default DNS; the preset applies once the tunnel is
+connected, so the provider never sees the user's own address and a personal
+configuration is never tied to it. While a preset is selected:
+
+- The host projection (`hostFallbackDnsResolverSettings`) is URnetwork's
+  default resolver over the host egress (`DefaultDnsUpgradeFallbackSettings`,
+  `ip_mux_upgrade.go:188` on `829a5a54`), never the preset or its pins.
+- The fallback races only while the tunnel is not ready, connecting or
+  reconnecting (the C2 predicate). Today it races any query the tunnel has
+  not answered within `LocalFallbackTimeout` (1 s), connected or not
+  (`ip_mux_upgrade.go:79-84` on `829a5a54`). With a preset that would let an
+  unfiltered host answer bypass a family preset that fails closed (C3) and
+  race the tunnel failover (C2). New
+  `DnsUpgradeSettings.FallbackUntilTunnelReady`, which the sdk sets whenever
+  a preset is selected, stops the race once the tunnel is ready.
+- Lookups during the connect window are not filtered by the preset. The DNS
+  screen says so next to the toggle while a preset is selected.
+
+Default and custom selections keep today's fallback.
 
 C8. What the user sees. The status line names the provider and the state:
-"DNS: AdGuard DNS", "AdGuard DNS isn't reachable from this exit", "AdGuard DNS
-isn't reachable from this exit. Ad blocking is paused." (option A), with two
+"DNS: AdGuard DNS"; for a preset that falls back, "Ad blocking paused:
+AdGuard DNS isn't answering" (a no-filtering preset, which pauses no ad
+blocking, reads "Cloudflare isn't answering. Using URnetwork DNS."); for one
+that fails closed, "AdGuard DNS Family isn't answering". Each comes with two
 actions, "Use URnetwork DNS" (selects `default` in one tap) and "Change
 location". No local notification: this is not a disconnect-class event. A
 personal preset shows "NextDNS · your profile", never the id (D5).
 
 C9. Regional and court-order blocks. Inside a working tunnel a preset's
 queries leave from the exit's country, so a user in Tehran exiting in Germany
-is unaffected. Blocks bite when the exit itself sits in a censoring country,
-and when Fast DNS on connect sends early lookups over the host network. What
-the research found (GreatFire, OONI and the providers' own notices; patchy
-and partly dated):
+is unaffected. Blocks bite when the exit itself sits in a censoring country;
+Fast DNS on connect never sends a preset's lookups over the host network
+(C7). What the research found (GreatFire, OONI and the providers' own
+notices; patchy and partly dated):
 
 | Provider | China | Iran | Russia | Withdrawals and orders |
 |---|---|---|---|---|
@@ -1022,9 +1122,26 @@ and partly dated):
 | NextDNS | blocked (OONI 153 of 159 anomalous) | OONI 158 of 223 confirmed blocked, June to November 2026 | failure reports from about 2026-10-28 | none |
 | Quad9 | mixed (stale data) | DoT SNI blocked (2020), DoH blocked (2022) | not blocked (2021) | leaves France 2026-11-24 ([Quad9](https://quad9.net/news/blog/au-revoir-france/)) |
 | Cloudflare | SNI blocking reported (2025, unconfirmed) | `cloudflare-dns.com` blocked since September 2022 | DoT to 1.1.1.1 reset since August 2026 | complies with some French orders; fined in Italy |
+| DNS4EU | not yet tested (GreatFire) | no data | no data | court-ordered blocks on every variant: French ARCOM and Paris court orders, Russian state-media domains ([DNS4EU](https://www.joindns4.eu/legal-information-and-compliance)) |
 
 The status reports such a failure per exit (C5), and the screen suggests
 another location, `default`, or the regional pick for the exit's country.
+
+C10. REFUSED is a failure, as today (O11). A REFUSED or SERVFAIL from a
+preset is a resolver failure to the mux (3.2 step 7), never a block, so an
+outage or a rate limit shows as one (C5, C8) and the preset's failure policy
+applies (C1). A wrong Control D resolver id answers REFUSED to every query,
+and verification shows "Control D doesn't recognize this resolver ID" (C6).
+The personal-ID help text says to keep the provider's block response at
+"zero IP" (the default) or NXDOMAIN, since a configuration that blocks with
+REFUSED reads as a failing resolver (B4).
+
+C11. Built-in addresses only (O5). Pins ship in the catalog and change only
+with an app release; nothing re-resolves a provider's name, encrypted or
+not. When a provider moves its addresses, every pin fails: a family,
+security or personal preset fails closed and an ad-blocking or no-filtering
+one falls back (C1), until a release carries the new addresses. F3 checks
+the addresses before every catalog change.
 
 ### D. Personal IDs
 
@@ -1089,14 +1206,23 @@ that way. NextDNS terms allow a user's own id in another product (§4(i)) and
 forbid circumventing usage limits (§4(h)), so URnetwork never ships a shared
 configuration ([terms](https://docs.google.com/document/d/1gG2nq9fQ5lOyTlWXo5GIm7kEpcgZxFc22w11qvkLZ0o/preview)).
 
+D6. No device names in the first release (O4). Personal presets send only
+the configuration id: no device name as a path segment (NextDNS `/<name>`,
+Control D `/<client>`), and none of NextDNS's device query parameters or
+`X-Device-*` headers
+([NextDNS](https://help.nextdns.io/t/x2h76ay/device-information-log-enrichment)).
+The screen has no device-name field, and a name in a pasted url or hostname
+is dropped (D4).
+
 ### E. Settings storage and sync
 
 E1. `sdk.DnsResolverSettings` gains two fields:
 
 ```go
 // The selected preset (dns_presets.go), "default" for the built-in lists,
-// or empty for the explicit lists below (the custom editor). When set, the
-// device derives the lists from the catalog and ignores the ones given.
+// "regional-<cc>" for a regional recommendation, or empty for the explicit
+// lists below (the custom editor). When set, the device derives the lists
+// and ignores the ones given.
 PresetId string
 // The personal configuration id of a personal preset, else empty.
 PresetPersonalId string
@@ -1111,7 +1237,18 @@ editor starts from `DnsResolverSettingsAsCustom`, so its saves are custom;
 the Fast DNS toggle goes through `DnsResolverSettingsWithFallback`, so it
 keeps the selection.
 
-E3. Every crossing carries both fields, and the status of C5 and C6:
+The selections, in the screen's order (O9): `default`, the default in every
+app and for every new or migrated record (N1, E4); a preset from the
+ad-blocking, malware, family, personal or no-filtering groups, only ever
+chosen by the user; custom, today's editor of DoH urls and DNS servers,
+which every app keeps offering (O1); and `regional-<cc>`, offered only while
+the exit's country has a recommendation and never selected automatically
+(O6). The provider picks show names only, no logos (O10). Nothing changes
+the selection on its own except the switch to `default` when a release
+drops the selected preset (A7).
+
+E3. Every crossing carries both fields, the status of C5 and C6, and the
+count of I3:
 
 - the record codec (`local_state.go:603-626`);
 - `cloneDnsResolverSettings` (`device_local.go:8390-8397`), which must copy
@@ -1120,8 +1257,8 @@ E3. Every crossing carries both fields, and the status of C5 and C6:
   DeviceLocal field that holds the selection beside `upgradeMuxSettings`;
 - `DnsResolverSettingsRpc`, `newDnsResolverSettingsRpc` and
   `toDnsResolverSettings` (`device_rpc.go:8293-8355`), the sync apply
-  (`:10602-10606`), and the new status listener. Gob ignores fields an older
-  peer lacks;
+  (`:10602-10606`), the new status listener and the blocked-lookups count
+  getter (I3). Gob ignores fields an older peer lacks;
 - the hand-written JS mapping (`js/device_remote.go:905-963`,
   `js/src/types.ts:979-1002`), for completeness;
 - the cgo headers and packaging bindings, regenerated and committed in the
@@ -1156,25 +1293,36 @@ plan (N7).
 
 F1. Layout, the same on every app, with content and rules from the sdk. The
 screen opens on the current selection, which for nearly everyone is
-"URnetwork (default)", the tunnel's encrypted, unfiltered resolver.
+"URnetwork (default)", the tunnel's encrypted, unfiltered resolver and the
+default in every app (N1).
 
-1. The picks, grouped by outcome as the research recommends: "Block ads and
-   trackers" (AdGuard DNS, Control D), "Block malware" (Quad9, Cloudflare),
-   "Family" (AdGuard DNS Family, Control D Family, Cloudflare Family), then
-   "Use my account" (NextDNS, Control D, AdGuard DNS), then the optional "No
-   filtering" picks (O1), "Custom" (the existing editor) and "Regional
-   (<country>)" when the sdk has a recommendation (O6).
-2. Each pick shows its picker copy (A3) with capability badges, the
-   operator's jurisdiction and a privacy-policy link, as AdGuard's iOS app and
-   Chrome do.
+1. The picks, in this order (O9), providers alphabetical within each group:
+   "URnetwork (default)"; "Block ads and trackers" (AdGuard DNS, Control D,
+   DNS4EU); "Block malware" (Cloudflare, DNS4EU, Quad9); "Family" (AdGuard
+   DNS Family, Cloudflare Family, Control D Family, DNS4EU Child, DNS4EU
+   Child with ad blocking); "Use my account" (AdGuard DNS, Control D,
+   NextDNS); "No filtering" (AdGuard DNS, Cloudflare, Control D, DNS4EU);
+   "Custom", today's editor, always there (O1); then "Regional (<country>),
+   unencrypted", shown only while the exit's country has a recommendation
+   and never selected automatically (O6).
+2. Each pick shows the provider's name, never a logo (O10), what it blocks
+   (its picker copy, A3), the operator's jurisdiction and a privacy-policy
+   link, as AdGuard's iOS app and Chrome do.
 3. Under the selected pick: "Your DNS lookups go to <Provider> through the
    tunnel. <Provider>'s privacy policy applies.", with "Privacy policy" and
    "Help" links (H2).
 4. The status line (C8) and the verification result (C6).
-5. The existing toggles stay: Fast DNS on connect, with the preset note
+5. While a filtering preset is selected (the ad-blocking, malware, family
+   and personal groups), the blocked-lookups count for this connection
+   (O16, I3): "<count> lookups blocked by <Provider> this connection", with
+   a note that some blocks are not counted, so the figure is a floor.
+6. The existing toggles stay: Fast DNS on connect, with the preset note
    (C7), and the built-in blocker, labeled as URnetwork's own. Both blockers
    can be on; the built-in one answers first (3.6).
-6. A footnote: changes apply to new lookups at once, and apps may keep
+7. Under "Custom", a note that a filtering server mixed with URnetwork's
+   servers does not filter, because the fastest answer wins (3.2 step 5,
+   O1).
+8. A footnote: changes apply to new lookups at once, and apps may keep
    cached answers for about a minute (synthesized answers carry
    `ResponseTtl` 60 s, `ip_mux_upgrade.go:157`).
 
@@ -1210,8 +1358,11 @@ tunnel ("resolution within the VPN tunnel will use the VPN's DNS settings",
 Android: the picker goes in `DnsSettingsScreen.kt`; `DnsSettingsViewModel.apply`
 (`:190-218`) builds from the helpers and reports whether anything was
 applied. The strict Private DNS notice (`ConnectActions.kt:628-660`) gains a
-line naming the selected preset, since strict mode overrides it. On the Play
-build ad blocking stays an explicit choice with its disclosure (H4).
+line naming the selected preset, since strict mode overrides it. The Play
+build shows the same catalog (O15): ad blocking stays off by default and an
+explicit choice with its disclosure (H4). If review objects, the `play`
+flavor (`android/app/app/build.gradle:327-342`, `BRINGYOUR_BUNDLE_STORE`
+"play") calls `SetDnsPresetsHideAdBlocking` at startup (A5).
 
 Windows: the picker goes in `DnsEditorSheet`; its `Draft` carries the new
 fields or keeps the sdk struct whole as linux does, and
@@ -1231,7 +1382,8 @@ ride `initial_device_state.dns_resolver_settings` at connect, which the sdk's
 F3. Catalog verification. Before a catalog change merges, a Go program
 (`sdk/dnspresetcheck`, per CODESTYLE's rule for helpers) checks every preset
 live from at least one dual-stack host: RFC 8484 GET over HTTP/2 at each url
-and pin, the certificate verified against the url's host (an IP SAN for ip
+and pin, through connect's own DoH client so the ALPN offer is the one users
+send, the certificate verified against the url's host (an IP SAN for ip
 literals), both families, a normal name resolving, the canary answered as
 the catalog says, and the HTTPS record of a blocked name carrying no address
 hints (B4). Results and the date go into each entry's `checked`. It never
@@ -1255,17 +1407,22 @@ family):
   (provider), `dns_personal_id_format_nextdns`,
   `dns_personal_id_format_controld`, `dns_personal_id_format_adguard`,
   `dns_personal_id_quota_nextdns`, `dns_personal_id_quota_adguard`,
-  `dns_personal_id_linked_ip_note`;
+  `dns_personal_id_linked_ip_note`, `dns_personal_id_block_response` (C10);
 - verification: `dns_verify_unconfirmed` (provider),
   `dns_verify_rejected_controld`, `dns_verify_malformed_adguard`,
   `dns_verify_not_filtering` (provider);
 - status: `dns_status_provider` (provider), `dns_status_unreachable`
-  (provider), `dns_status_paused` (provider), `dns_status_use_default`,
+  (provider), `dns_status_paused` (provider), `dns_status_fallback`
+  (provider, a no-filtering preset's fallback, C8), `dns_status_use_default`,
   `dns_status_change_location`;
+- the blocked-lookups count (I3): `dns_blocked_count` (count, provider),
+  `dns_blocked_count_floor_note`;
 - disclosure and notes: `dns_preset_disclosure` (provider),
   `dns_preset_privacy_link`, `dns_preset_help_link`,
-  `dns_preset_fast_dns_note` (provider), `dns_preset_retired` (provider),
-  `dns_preset_apply_note`, `dns_apple_profiles_note`;
+  `dns_preset_fast_dns_note` (provider), `dns_preset_dropped` (provider),
+  `dns_preset_dropped_choose`, `dns_preset_dropped_custom` (A7),
+  `dns_custom_mix_note` (F1), `dns_preset_apply_note`,
+  `dns_apple_profiles_note`;
 - the error ids of A5.
 
 G2. Provider names, operators and jurisdictions are not translated; group
@@ -1278,16 +1435,18 @@ edit.
 
 ### H. Privacy, terms and legal
 
-H1. Opt-in only. No preset is a default, preselected, promoted or ordered as
-a recommendation; within a group the order is alphabetical (O9). Existing
-users keep what they have, and every preset is offered to every user, never
-behind Pro (H3).
+H1. Opt-in only (owner rule, 2026-11-09, every app): ad blocking is off by
+default, URnetwork's default DNS is the default everywhere, and presets are
+only ever user-chosen. No preset is a default, preselected, promoted or
+ordered as a recommendation; within a group the order is alphabetical (O9).
+Existing users keep what they have, and every preset is offered to every
+user, never behind Pro (H3).
 
 H2. Disclosure before use: the selected pick's line (F1 item 3) is on the
 screen where the pick is made. What each provider receives: every name looked
-up while connected, its timing, and the exit provider's address (the user's
-own only with Fast DNS on connect, C7); for a personal preset, the id. What
-each provider says it keeps, per the research:
+up while connected, its timing, and the exit provider's address, never the
+user's own (C7); for a personal preset, the id. What each provider says it
+keeps, per the research:
 
 | Provider | Logging | Operator and law |
 |---|---|---|
@@ -1295,6 +1454,7 @@ each provider says it keeps, per the research:
 | Control D free | "Not store logs (no individual browsing history, timestamps, or query logs)" ([docs](https://docs.controld.com/docs/free-dns)) | ControlD Inc, Ontario, Canada; founded by Windscribe's founders ([about](https://controld.com/about-us)) |
 | Quad9 | "does not collect or record user IP addresses"; no ECS on `9.9.9.9` ([privacy](https://quad9.net/privacy/policy/)) | Quad9 Foundation, Zürich, Swiss law |
 | Cloudflare | no querying IPs in non-volatile storage, truncated IPs deleted within 25 hours; KPMG examined the 1.1.1.1 controls, not named for the Families addresses ([privacy](https://developers.cloudflare.com/1.1.1.1/privacy/public-dns-resolver/)) | Cloudflare, Inc., San Francisco |
+| DNS4EU | per-query logs (the query, the response, its type, a timestamp, the resolver, the ASN and more) kept "for up to six (6) months"; client IPs replaced on the resolver by an HMAC whose key is "regenerated daily"; anonymized logs shared with project partners "who train the machine learning models" ([policy](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-DNS-Resolver-policy-2025.pdf)) | Whalebone, s.r.o., Brno, Czech Republic; Czech law and that of each member state where a resolver runs |
 | NextDNS | "If not specifically requested by the user, no data is logged"; the user picks retention and region, and a Privacy Guides thread argues logging is effectively on for new configurations ([privacy](https://nextdns.io/privacy)) | NextDNS Inc., Delaware |
 | Control D custom | analytics off, counts only, or full, at the user's choice ([levels](https://docs.controld.com/docs/analytics-levels)) | as above |
 | AdGuard private | per the user's dashboard | as above |
@@ -1304,11 +1464,28 @@ resolvers, so each general term was read against URnetwork's case:
 
 | Provider | Terms | What URnetwork does |
 |---|---|---|
-| AdGuard | EULA bars users to "rent, lease, loan, export or sell access", and other uses need "written consent" ([EULA](https://adguard-dns.io/en/eula.html)); sample rate limit 300 queries per 10 s per IPv4 /24, production values unpublished | written OK from support@adguard-dns.io before shipping; free to all users, never Pro-only; agree on limits for exit traffic (O12) |
-| Control D | no reselling without "prior written authorization"; may "impose usage or service limits ... at our sole discretion" ([terms](https://controld.com/terms)) | written OK from Control D Partnerships; decide on the Windscribe tie (O12) |
-| Quad9 | none found; aggregate data "may be licensed for a fee" | confirm with Quad9; consider sponsorship, as Mullvad does |
+| AdGuard | EULA bars users to "rent, lease, loan, export or sell access", and other uses need "written consent" ([EULA](https://adguard-dns.io/en/eula.html)); sample rate limit 300 queries per 10 s per IPv4 /24, production values unpublished | ships without waiting for consent (owner, 2026-11-09); free to all users, never Pro-only; draft 01 asks for consent and for limits on exit traffic |
+| Control D | no reselling without "prior written authorization"; may "impose usage or service limits ... at our sole discretion" ([terms](https://controld.com/terms)) | ships without waiting for authorization (owner, 2026-11-09), and stays in the catalog though it is Windscribe's sister company (O1); draft 02 asks for authorization, limits and the partner route |
+| DNS4EU | free "strictly for their use in a personal capacity", "designed for manual configuration", "not eligible for enterprises or connectivity providers" ([terms](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-Resolver-Terms-of-Use.pdf)); the resolvers "are aimed to be used primarily by individuals (consumers)", preferably in the EU; response rate limiting "doesn't affect regular users" ([policy](https://legal-documents-dns4eu.s3.fr-par.scw.cloud/DNS4EU-Public-DNS-Resolver-policy-2025.pdf)) | ships without waiting for an answer (owner, 2026-11-09); free to all users, never Pro-only; draft 04 asks whether the use is acceptable, whether to offer it only on EU exits, and about rate limits |
+| Quad9 | none found; aggregate data "may be licensed for a fee" | approved with the rest (owner, 2026-11-09); a courtesy note, and sponsorship as Mullvad does, stay optional |
 | Cloudflare | operators "may wish to provide end users with options to change from the default 1.1.1.1 resolver"; "proxied traffic may be rate limited" ([guidance](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/)) | optional note to resolver@cloudflare.com |
 | NextDNS | §4(i) allows integration, §4(h) bars circumventing limits | nothing for user-entered ids |
+
+The owner treats all DNS usage in this plan as approved (2026-11-09:
+"Consider all dns usage as approved for this implementation. We will go
+ahead as if they are approved."), so no preset waits for a provider's
+answer. That is a decision to proceed despite terms that ask for written
+permission: the AdGuard EULA prohibits using AdGuard DNS "in any way not
+expressly authorized by AdGuard Software Limited with a written consent",
+and Control D's terms bar reselling it without "prior written
+authorization"; DNS4EU's terms describe a personal, manually configured
+service. The permission drafts live in the private factury repo
+(`factury/adblock/`: 01 AdGuard, 02 Control D and 04 DNS4EU for presets,
+and 03 DNS.SB for a change to the defaults outside this plan; 05 RethinkDNS
+no longer applies, since RethinkDNS left the catalog, O14), and sending them
+is the owner's choice. The preset drafts promise that URnetwork removes the
+provider "in the next release" if asked, which a built-in catalog can keep
+(O13).
 
 None requires attribution and none grants logo or trademark use, so the apps
 show names only (O10). No affiliate or referral parameters.
@@ -1319,13 +1496,21 @@ VpnService policy says "Any manipulation of ads that can impact monetization
 will result in rejection" and requires a declaration with the disclosure flow
 ([Play](https://support.google.com/googleplay/android-developer/answer/12564964)).
 Proton and Windscribe ship DNS ad blocking on Android, which shows it is
-tolerated in practice, not that it is safe. So ad blocking stays off by
-default and an explicit choice with disclosure, and the VpnService
-declaration and video are reviewed before the Android release (O15). Apple's
-stance was not researched.
+tolerated in practice, not that it is safe. The owner chose the same catalog
+on Play, carefully presented (O15): ad blocking is off by default and always
+the user's choice, with disclosure; the Play listing and the VpnService
+disclosure describe it as a user-selected DNS provider; and the VpnService
+declaration and video are reviewed before the Android stable release. If
+review objects, the Play build ships a Play-only catalog without the presets
+that block ads (`blocksAds`: the four AdGuard and Control D presets and
+DNS4EU's two ad-blocking variants), through the sdk flag of A5; malware,
+family, no-filtering, personal IDs and Custom stay. Apple's stance was not
+researched.
 
 H5. URnetwork sends nothing new to its servers: the selection stays on the
-device (N9).
+device (N9), and so does the blocked-lookups count, which is counted on the
+device only, never sent anywhere, not logged, and reset at each connect
+(I3).
 
 ### I. Observability
 
@@ -1338,8 +1523,17 @@ the applied selection, health changes and verification results,
 `[dns]preset=<id> personal=<yes|no> state=<state> verification=<result>`,
 which a feedback upload carries for support; never the id itself.
 
-I3. The status and verification are local. A per-session count of sink
-answers ("lookups blocked by <Provider>") is possible from B4 and is O16.
+I3. The status and verification are local, and so is the blocked-lookups
+count, which ships in the first release (O16). connect counts recognizable
+block answers (B9); the sdk exposes the count as `GetDnsBlockedCount()` on
+DeviceLocal and DeviceRemote, across the device rpc and JS, and resets the
+mux's count each time the device connects and when the selected preset
+changes, so the figure always belongs to one connection and the provider it
+names. The DNS screen shows it only while a filtering preset is selected
+(F1). It is counted on the device only, never sent anywhere, kept with no
+names, and left out of logs and feedback uploads (H5, consistent with N9).
+It is a floor: blocks answered with a plain NXDOMAIN or a REFUSED are not
+counted (B9).
 
 I4. No server-side counters of preset use (N9).
 
@@ -1348,13 +1542,14 @@ I4. No server-side counters of preset use (N9).
 | Surface | Change |
 |---|---|
 | connect `DnsResolverSettings` (Go and JSON) | `DohServerHostAddrs map[string][]string`, `doh_server_host_addrs`, omitempty |
-| connect `DnsUpgradeSettings` | `Failover *DnsResolverSettings`; `ResolverFailingMinCount`, `ResolverFailingMinDuration`, `FailoverProbeInterval` |
-| connect `UpgradeMux` | `DnsResolverHealth()`, `ProbeDnsResolver(ctx, name)`, `SetTunnelReady(func() bool)` |
+| connect `DnsUpgradeSettings` | `Failover *DnsResolverSettings`; `ResolverFailingMinCount`, `ResolverFailingMinDuration`, `FailoverProbeInterval`; `FallbackUntilTunnelReady` (C7) |
+| connect `UpgradeMux` | `DnsResolverHealth()`, `ProbeDnsResolver(ctx, name)`, `SetTunnelReady(func() bool)`, `DnsBlockedCount()`, `ResetDnsBlockedCount()` (B9) |
 | connect logs | DoH urls as scheme and host |
 | sdk `DnsResolverSettings` (gomobile, cgo, JS) | `PresetId`, `PresetPersonalId` |
 | sdk `.dns_resolver_settings` record | the two fields, `PresetVersion` |
 | sdk `DnsResolverSettingsRpc` (gob) | the two fields |
-| sdk new types and functions | A5; `DnsResolverStatus` (state, verification, preset, since); `GetDnsResolverStatus`, `AddDnsResolverStatusChangeListener` on DeviceLocal and DeviceRemote |
+| sdk device rpc (gob) | the status listener and the blocked-lookups count |
+| sdk new types and functions | A5, including `SetDnsPresetsHideAdBlocking`; `DnsResolverStatus` (state, verification, preset, since); `GetDnsResolverStatus`, `AddDnsResolverStatusChangeListener` and `GetDnsBlockedCount` on DeviceLocal and DeviceRemote |
 | sdk settings | `DnsResolverVerifyMinInterval` |
 
 All changes are backward compatible: an older reader ignores the new fields
@@ -1380,9 +1575,15 @@ only the catalog-integrity test reads the catalog itself.
   for a preset that takes none.
 - Expansion (A6): the lists hold only the preset's urls; ip-literal v4 and
   v6 urls pair by index; pins set; the chain is DoH-only; remote plain DNS
-  empty; the fallback projection carries the pins; the ignore list carries
-  hosts and pins; `Failover` is the default resolver exactly for presets with
+  empty; the fallback projection of a preset is URnetwork's default resolver,
+  with no preset url or pin, and sets `FallbackUntilTunnelReady` (C7), while
+  that of custom settings carries the pins; the ignore list carries hosts
+  and pins; `Failover` is the default resolver exactly for presets with
   `failover`.
+- Play-only catalog (O15): with `SetDnsPresetsHideAdBlocking(true)`,
+  `GetDnsPresetProviders` lists no preset whose `blocksAds` is true and
+  every other preset, and a stored selection it hides applies as `default`
+  with the dropped-preset notice.
 - Pins follow the host: custom settings that name a catalog host get its
   pins; preset settings copied as custom with a fresh struct, as today's
   editors build them, still carry no plaintext lookup.
@@ -1400,7 +1601,9 @@ only the catalog-integrity test reads the catalog itself.
 - Migration (E4): a record with the old Google defaults loads, through
   `d1e5e9fd`'s migration, as `default`; a record with the current defaults
   loads as `default`; a near-default (one operator removed) loads as custom;
-  a record with an unknown preset id keeps its lists and reads retired (A7).
+  a record whose preset id a release dropped applies as `default`, and its
+  summary carries the notice naming the provider until it is dismissed,
+  which saves `default` (A7).
 - Refusals (E2): an unknown preset id or an invalid personal id is neither
   saved nor applied, and the previous resolver stays.
 - Verification (C6), with a fake probe: each row of the table maps to its
@@ -1409,16 +1612,22 @@ only the catalog-integrity test reads the catalog itself.
 - Status (C5): `unknown` while the window forms; `failing` only past both
   thresholds; `failedOver` only for presets with `failover`; recovery returns
   to `ok`. Thresholds from settings, clock injected.
+- Blocked count (I3): with a fake mux count, `GetDnsBlockedCount` returns it
+  through DeviceLocal, the rpc and DeviceRemote; the summary shows it only
+  for a filtering preset, never for `default`, custom, regional or a
+  no-filtering preset; a connect and a change of preset reset it, and a Fast
+  DNS toggle does not.
 - Hosted devices refuse a preset like any resolver settings.
 - Logs: applying a personal preset and every status or verification change
-  write no id to the sdk log.
+  write no id to the sdk log, and the count never reaches it.
 
 ### 6.2 connect
 
 - Pins, tun path: a hostname DoH url with pins resolves through an
   `httptest` TLS server whose certificate names `dns.example`, with a fake
   plain-DNS server (`newFakeDnsServer`, `net_http_doh_modes_test.go:86`) that
-  must see zero queries.
+  must see zero queries, and the handler sees HTTP/2, so the pinned dial
+  keeps the transport's ALPN (section 7).
 - Pins, host path: the local DoH client dials the pins; a host resolver that
   fails the test if called.
 - Pins fail closed: every pin refused by the tunnel dialer; no plain-DNS
@@ -1449,16 +1658,28 @@ only the catalog-integrity test reads the catalog itself.
   error strings contain no path.
 - Health (C5): consecutive failures and last success move as resolutions
   fail and succeed, per generation; a settings swap resets them.
+- Blocked count (B9): in `newDnsClientHarness` with a fake filtering server,
+  a `0.0.0.0` answer, a `::` answer and an NXDOMAIN with EDE 15, 16 or 17
+  each count once per client query, a cached block included; a real NXDOMAIN
+  without an extended error, an NXDOMAIN with EDE 4 or 18, a REFUSED, the
+  built-in blocker's answers and a built-in endpoint's filtered response
+  count nothing; `ResetDnsBlockedCount` zeroes it.
+- Fast DNS window (C7): with `Fallback` and `FallbackUntilTunnelReady` set
+  and a tunnel resolver that never answers, a query gets the fallback's
+  answer while the tunnel-ready predicate is false and none once it is true;
+  without the flag the fallback races as today.
 
 ### 6.3 Regional failure and ingress
 
 - A dialer that refuses the preset's pins (an exit network blocking the
-  provider): a family preset stays failing with no fallback and no plaintext;
-  an ad-blocking preset under option A moves to the failover and back when
-  the dialer heals; the sdk status follows (backoff and intervals from
-  settings, clock injected).
-- The same with Fast DNS on connect: the host projection queries the preset
-  at its pins and nothing else.
+  provider, or pins gone stale, C11): a family preset stays failing with no
+  fallback and no plaintext; an ad-blocking or no-filtering preset moves to
+  the failover and back when the dialer heals; the sdk status follows
+  (backoff and intervals from settings, clock injected).
+- The same with Fast DNS on connect: while the tunnel is not ready the host
+  projection queries URnetwork's default resolvers and never the preset or
+  its pins; once it is ready nothing races, and the family preset stays
+  failing (C7).
 - A regional pick (`regional-cn`) expands to exactly
   `RegionalDnsResolverSettings("cn")`.
 - Ingress is untouched: with any preset selected, the control-name DoH
@@ -1480,89 +1701,136 @@ have their deterministic tests in the sdk.
 
 ## 7. Rollout
 
-1. `fix/no-google-dns` merges first; E4 builds on its migration.
-2. Owner gates in parallel (section 8): the written OKs from AdGuard and
-   Control D, a confirmation from Quad9 and an optional note to Cloudflare,
-   the failure policy, and the Play review. A provider whose gate has not
-   cleared stays out of the catalog.
-3. connect: B1, B4, B7, C2, C5 and the probe, with 6.2. Inert until a
-   resolver setting carries pins or a failover. A connect merge reaches the
-   provider fleet with the next finished nightly; providers run no
-   `UpgradeMux`, so nothing changes for them, but the merge is still a miner
-   release and is timed like one.
-4. sdk: the catalog with the cleared providers (after an F3 run), the
-   selection fields and A5 helpers, derive on apply, migration, verification,
-   status, rpc and the JS mapping, with 6.1 and 6.3; then `make generate`.
-   Also reaches providers with the next nightly, inert there.
+1. `fix/no-google-dns` (connect `b49cbc21`) and `fix/default-resolvers-v2`
+   (connect `829a5a54`, sdk `5c7a6eb7`) have merged; E4 builds on their
+   migrations.
+2. No permission gates: every provider is approved (owner, 2026-11-09, O12),
+   and sending the drafts in `factury/adblock/` blocks nothing. The Play
+   review stays: the VpnService declaration, the disclosure video and the
+   listing text are reviewed before the Android stable release (O15, H4).
+3. connect: B1, B4, B7, B9, C2, C5, the probe and C7's
+   `FallbackUntilTunnelReady`, with 6.2. Inert until a resolver setting
+   carries pins, a failover or the flag; the count changes no answer.
+   HTTP/2 needs no new work for DNS4EU, which refuses a client that offers
+   no ALPN: every DoH client in connect is built by `httpClientWithDialer`
+   (`net_http_doh.go:687-688`, `:1360` and `:1394` on `829a5a54`), whose
+   `http2.ConfigureTransports` call (`:433`) puts `h2` ahead of `http/1.1`
+   in the ClientHello's ALPN list (x/net v0.62.0,
+   `http2/transport.go:124-129`). B1's pin dialer stays a `DialContext`
+   below TLS, so pinned dials keep that list, and 6.2's pin test checks that
+   `h2` was negotiated. A connect merge reaches the provider fleet with the
+   next finished nightly; providers run no `UpgradeMux`, so nothing changes
+   for them, but the merge is still a miner release and is timed like one.
+4. sdk: the catalog (after an F3 run), the selection fields and A5 helpers,
+   derive on apply, migration, the dropped-preset notice, the Play flag,
+   verification, status, the blocked-lookups count, rpc and the JS mapping,
+   with 6.1 and 6.3; then `make generate`. Also reaches providers with the
+   next nightly, inert there.
 5. Apps: apple, android, windows and linux (F2), with English strings, each
    on a branch of the same name per repo. App builds reach testers in the
    nightlies; stable releases are manual per app repo, the Android one after
    the Play review.
-6. Localizations: the G1 keys in all 28 languages, then the stable releases.
+6. Localizations: the G1 keys in all 28 languages, the count's strings
+   included (O16), then the stable releases.
 7. Help: a DNS providers section in `mmm/ur.io/docs` with an explicit
    `{#dns-providers}` anchor so translations keep it, the tours' stale "Local
    DNS fallback" renamed, and a link from the screens, as the apps link
    `https://ur.io/docs/api`. ur.io deploys are manual.
 
 Later, outside this plan: POST for custom urls (B8), presets for hosted
-proxies, a server-delivered catalog (O13), DoT or DoQ upstreams, and a
-URnetwork-run blocklist in the mux (N10).
+proxies (O7), device names on personal presets (O4), DoT or DoQ upstreams,
+and a URnetwork-run blocklist in the mux (N10). There is no server-delivered
+catalog (O13).
 
-## 8. Open decisions for the owner
+## 8. Owner decisions (2026-11-09)
 
-- O1. The first catalog: the seven one-tap presets and three personal
-  providers of A3 (recommended), and whether to add the "No filtering" picks
-  (AdGuard Non-filtering, Control D p0, Cloudflare 1.1.1.1; recommended for
-  Cloudflare at least, which answers 8236 directly).
-- O2. Failure policy: option A, ad-blocking and unfiltered presets fall back
-  to URnetwork's resolvers with a "paused" status while family, security and
-  personal presets fail closed (recommended, and the research's), or option
-  B, every preset fails closed (C1).
-- O3. Fast DNS on connect with a preset: query the preset from the user's
-  network with the disclosure of C7 (recommended, as the research also
-  suggests), use the defaults for the fallback, or turn the fallback off
-  while a preset is selected.
-- O4. Device names on personal presets: not in the first release
-  (recommended). If added: off by default, reduced to `[A-Za-z0-9-]`, and sent
-  only as a DoH path segment, never in a hostname.
-- O5. Pins only (recommended), or also an encrypted re-resolution of the
-  resolver's name through the default DoH servers when every pin fails.
-- O6. The regional recommendation as a pick in the same list (recommended),
-  or kept where it is today.
-- O7. Presets for hosted proxies through the proxy API, later.
-- O8. A preset removed from the catalog: keep it working from the stored
-  lists with a notice (recommended), or move the user to the default.
-- O9. Order: grouped by outcome, alphabetical within a group (recommended).
-- O10. Provider names only, no logos (recommended); none of the terms grants
-  logo use.
-- O11. REFUSED from a preset resolver: a failure, as today (recommended), or
-  a block, which would also hide real outages, rate limiting and a wrong
-  Control D id.
-- O12. The written OKs before AdGuard and Control D ship: AdGuard
-  (support@adguard-dns.io; the EULA's "written consent"; free to all, never
-  Pro-only; limits for exit traffic) and Control D (Partnerships; whether
-  routing users to Windscribe's sister company is acceptable; the partner
-  program if volume grows).
-- O13. Catalog delivery: bundled in the sdk, updated by releases
-  (recommended for the first release), or also server-delivered with a
-  bundled copy, as the research suggests so a dead or hostile provider can be
-  pulled without an app release. A server copy must be signed, as the
-  extender records are, and is safest if it can only withdraw ids, never add
-  or change endpoints.
-- O14. DNS4EU: ask Whalebone (contact@joindns4.eu); until then custom url
-  only. RethinkDNS: ask Celzero, or self-host serverless-dns (MPL-2.0); until
-  then custom url only.
-- O15. The Play build: ad blocking off by default and opt-in (recommended),
-  and a review of the VpnService declaration and disclosure video; a
-  Play-specific catalog without the ad-blocking picks if review objects.
-- O16. A local "lookups blocked" count on the DNS screen.
-- O17. Adjacent, outside this plan: OpenDNS's standard resolver is in the
-  default race. It answers phishing names with Cisco block-page addresses,
-  which win a fastest-record race (3.2 step 5), and OpenDNS Home applies
-  account settings by source IP, so behind a residential exit registered to
-  an OpenDNS Home account users could plausibly inherit that stranger's
-  filtering (an untested inference). Whether OpenDNS should stay a default is
-  worth a decision of its own.
+The owner decided every question on 2026-11-09, and the sections above
+follow these decisions. Later that day the approvals (O12) replaced the
+permission parts of O1, O12 and O14, and then the owner dropped RethinkDNS
+from the catalog (O14).
+
+- O1. The first catalog is the full set (A3): one-tap presets to block ads
+  and trackers, to block malware and for families, the "No filtering" picks
+  (Cloudflare 1.1.1.1, AdGuard Non-filtering, Control D p0) in the catalog
+  proper, and the three personal-ID providers. DNS4EU joins it, and
+  RethinkDNS does not (O14). The owner added that manual entry stays
+  available always, as today: "Custom" keeps today's editor of DoH urls and
+  DNS servers beside Default, the presets and Use my account, and notes that
+  mixing a filtering server with the defaults doesn't filter (E2, F1).
+- O2. Failure policy: split by purpose (C1). Ad-blocking and no-filtering
+  presets fall back to URnetwork's default DNS through the tunnel, with "Ad
+  blocking paused: <Provider> isn't answering", and return on their own
+  when the provider answers. Family, malware and personal presets fail
+  closed, with a status line and a one-tap "Use URnetwork DNS". Never
+  plaintext, never the host network. Rejected: every preset fails closed.
+- O3. Fast DNS on connect with a preset: during the connect window lookups
+  use URnetwork's default DNS, and the preset applies once the tunnel is
+  connected, so the provider never sees the user's own address (C7).
+  Rejected: querying the preset from the user's network, which this plan
+  first recommended.
+- O4. Device names on personal presets: not in the first release. Personal
+  presets send only the configuration id (D6).
+- O5. Addresses: built in only, "the simplest route at first". Nothing
+  re-resolves a provider's name; an address change waits for an app release
+  (C11). Rejected: an encrypted re-resolution through the default DoH
+  servers when every pin fails.
+- O6. The regional recommendation is a pick in the new list, "Regional
+  (<country>), unencrypted", shown only when the exit's country has a
+  recommendation and never selected automatically (E2, F1).
+- O7. Presets for hosted proxies through the proxy API: later, outside this
+  plan (N7).
+- O8. A preset dropped from the catalog in a later release: users on it
+  switch to URnetwork DNS with a notice that names the provider and says its
+  filtering is off, offering "Choose another preset" and "Enter it yourself
+  under Custom"; this applies to every group (A7). Rejected: keeping it
+  working from the stored lists, which this plan first recommended.
+- O9. Order: Default, Block ads and trackers, Block malware, Family, Use my
+  account, No filtering, Custom, then Regional; providers alphabetical within
+  each group (A3, F1).
+- O10. Names only, no logos. Each pick shows the provider's name, what it
+  blocks, its jurisdiction and a privacy-policy link (F1).
+- O11. REFUSED from a preset is a failure, as today (C10). A wrong Control D
+  id shows "Control D doesn't recognize this resolver ID"; outages and rate
+  limiting show as failures; the personal-ID help text says to keep the
+  block response at "zero IP" (the default) or NXDOMAIN.
+- O12. Provider permission: first decided as ask first, each provider's
+  presets waiting for its written OK. Replaced the same day: the owner
+  treats all DNS usage in this plan as approved ("Consider all dns usage as
+  approved for this implementation. We will go ahead as if they are
+  approved."), so AdGuard, Control D and DNS4EU ship without waiting for
+  answers. The drafts in the private factury repo (`factury/adblock/`) are
+  the owner's to send (H3). DNS.SB as a built-in default is a change to the
+  defaults, outside this plan.
+- O13. Catalog delivery: built into the sdk only, changed by app releases;
+  no server-delivered catalog and no withdraw list (A1, A7). The drafts
+  promise removal "in the next release" on request. Rejected: a signed
+  server copy that could withdraw ids without a release.
+- O14. DNS4EU joins the first catalog with its five variants (A3). Both
+  DNS4EU and RethinkDNS were first to be asked and to join in a later
+  release; the approvals of O12 brought both into the first catalog. Then
+  the owner dropped RethinkDNS ("yes drop it"): its non-filtering resolver
+  forwards to Cloudflare and then Google upstream, and 8236 asked to avoid
+  Google. It is in the "Left out" table (A3), and users can still enter it
+  manually under Custom.
+- O15. Play build: the same catalog, carefully presented. Ad blocking is off
+  by default and always user-chosen, and the Play listing and the VpnService
+  disclosure describe it as a user-selected DNS provider. If review objects,
+  a Play-only catalog drops every preset that blocks ads (the four AdGuard
+  and Control D presets and DNS4EU's two ad-blocking variants), and malware,
+  family, no-filtering, personal IDs and Custom stay (H4). The owner's rule
+  for every app: ad blocking is off by default, URnetwork's default DNS is
+  the default everywhere, and presets are only ever user-chosen (N1, H1).
+- O16. A local "lookups blocked" count ships in the first release (B9, F1,
+  I3): a per-connection count on the DNS screen while a filtering preset is
+  selected, counted on the device only, never sent anywhere and reset at
+  each connect. It counts recognizable block answers, `0.0.0.0` or `::`
+  sinks and NXDOMAIN with EDE 15 to 17; a block answered with a plain
+  NXDOMAIN or a REFUSED is not counted, so the figure is a floor. connect
+  counts, the sdk exposes it, and the apps show it, with new strings in all
+  28 languages (G1).
+- O17. OpenDNS in the default race: resolved outside this plan.
+  `fix/default-resolvers-v2` removed OpenDNS from the defaults (3.1, connect
+  `829a5a54`).
 
 ## 9. Known limitations
 
@@ -1572,8 +1840,14 @@ URnetwork-run blocklist in the mux (N10).
   inside the tunnel the VPN's DNS settings apply (F2).
 - OS and browser caches keep earlier answers for about a minute after a
   switch.
-- Pins can go stale between releases; DNS then fails closed (or, under option
-  A, falls back) until an update.
+- Pins can go stale between releases, since addresses are built in only
+  (O5, C11): a family, malware or personal preset then fails closed and an
+  ad-blocking or no-filtering one falls back, until an update.
+- DNS4EU's 14 resolvers are all in the EU, so exits elsewhere see longer
+  round trips, and court-ordered blocks apply to every variant, Unfiltered
+  included (A3).
+- The blocked-lookups count is a floor: blocks answered with a plain
+  NXDOMAIN or a REFUSED are not counted (B9).
 - No provider publishes numeric rate limits for its public tier. URnetwork
   spreads queries over many home addresses, which makes per-address
   throttling less likely than on a datacenter VPN, though a busy exit could
@@ -1604,8 +1878,11 @@ before the affected preset ships.
 | Control D's per-filter addresses (`76.76.2.2`, `76.76.10.2`, ...) and AdGuard's `94.140.14.59`, `2a10:50c0::dad:ff` serve their DoH hosts | F3; only then extra pins |
 | HTTPS/SVCB answers for blocked names carry no address hints | F3 (B4) |
 | Control D resolver id alphabet and length | a real id from a Control D account; until then the provisional pattern (D4) |
-| What AdGuard's Starter plan does at its 300,000-request cap | ask AdGuard with the written-OK request (O12) |
+| What AdGuard's Starter plan does at its 300,000-request cap | ask AdGuard support; the free-tier note (D3) stays until then |
 | A NextDNS or AdGuard echo that confirms a profile over DoH (`test.nextdns.io` returned an empty body; AdGuard's `dnscheck` hostname is unpublished) | engineering test; until then `unconfirmed` (C6) |
 | How Quad9 implements its French exit from 2026-11-24 | watch Quad9's notice; the status reports it per exit either way |
 | Apple App Review's view of DNS ad blocking inside a VPN | ask before the iOS release |
-| Numeric rate limits | ask AdGuard and Control D with the OKs (O12) |
+| Numeric rate limits | the drafts in `factury/adblock/` ask AdGuard, Control D and DNS4EU, if the owner sends them; the status reports a limit as a failure either way (C10) |
+| DNS4EU's listed addresses serve each variant's DoH host, with a certificate for that host, over HTTP/2 negotiated by connect's ALPN | F3 at each pin; the DoT certificate on `noads.joindns4.eu:853` named `doh.joindns4.eu`, so the DoH certificate's names are F3's to read |
+| DNS4EU's block answers for Protective's malware blocks and for the two child variants, and `doubleclick.net` as the child-noads canary | F3 with a blocked name per variant; only the ad-blocking variant's `0.0.0.0` for `doubleclick.net` was probed |
+| How DNS4EU answers a court-ordered block, on every variant, Unfiltered included | F3 with a domain from its compliance page; the copy and the count (B9) follow what it sends |
