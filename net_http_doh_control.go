@@ -179,8 +179,10 @@ func controlDohUrlsFirst(dohUrls []string, defaultDohUrls []string) []string {
 }
 
 // A copy of DoH settings that names only the built-in servers: the server
-// lists of `DefaultDnsResolverSettings`, and no seed, which only ever favors a
-// named server. Everything else is kept as given. A strategy that refuses
+// lists of `DefaultDnsResolverSettings`, no pinned hosts, which belong to
+// servers a user or a preset named (`DnsResolverSettings.DohServerHostAddrs`),
+// and no seed, which only ever favors a named server. Everything else is kept
+// as given. A strategy that refuses
 // custom DoH servers (`ClientStrategySettings.DisableCustomDohServers`) takes
 // this in place of any settings it is handed, `ControlDohSettings` included.
 func builtInDohServerSettings(settings *DohSettings) *DohSettings {
@@ -201,6 +203,7 @@ func builtInDohServerSettings(settings *DohSettings) *DohSettings {
 		resolverSettings.RemoteDnsIpv6 = defaultResolverSettings.RemoteDnsIpv6
 		resolverSettings.LocalDnsIpv4 = defaultResolverSettings.LocalDnsIpv4
 		resolverSettings.LocalDnsIpv6 = defaultResolverSettings.LocalDnsIpv6
+		resolverSettings.DohServerHostAddrs = nil
 		copied.DnsResolverSettings = &resolverSettings
 	}
 	copied.ServerStatsSeed = nil

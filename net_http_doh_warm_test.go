@@ -266,8 +266,13 @@ func TestDohQueryDiagnosticErrorDoesNotExposeQuestion(t *testing.T) {
 		if strings.Contains(message, secretDomain) || strings.Contains(message, "dns=") {
 			t.Fatalf("diagnostic error exposed the encoded DNS question: %q", message)
 		}
-		if !strings.Contains(message, server.URL+"/dns-query") {
+		// the server by scheme and host only (ADBLOCK3RD B7): a path can hold
+		// a personal configuration id
+		if !strings.Contains(message, server.URL) {
 			t.Fatalf("diagnostic error omitted the failed DoH server: %q", message)
+		}
+		if strings.Contains(message, "/dns-query") {
+			t.Fatalf("diagnostic error exposed the DoH url path: %q", message)
 		}
 	})
 }
