@@ -163,6 +163,40 @@ func TestIngressEgressDnsSeparate(t *testing.T) {
 		t.Fatalf("new ingress = %v after an egress change, expected %v", urls, ingressBefore)
 	}
 
+	// a preset selected for the tunnel (ADBLOCK3RD 6.3): its hostname url,
+	// pins and failover touch nothing on the ingress side, whose servers stay
+	// the built-in and regional ones with no pins, so a filter can never
+	// affect the control names
+	presetMux := DefaultUpgradeMuxSettings()
+	presetMux.Dns.Resolver.RemoteDohUrlsIpv4 = []string{"https://dns.example/dns-query"}
+	presetMux.Dns.Resolver.RemoteDohUrlsIpv6 = []string{"https://dns.example/dns-query"}
+	presetMux.Dns.Resolver.RemoteDnsIpv4 = nil
+	presetMux.Dns.Resolver.RemoteDnsIpv6 = nil
+	presetMux.Dns.Resolver.DohServerHostAddrs = map[string][]string{"dns.example": {"192.0.2.95", "2001:db8::95"}}
+	presetMux.Dns.Failover = DefaultUpgradeMuxSettings().Dns.Resolver
+	presetMux.Dns.FallbackUntilTunnelReady = true
+	presetEgress := DefaultDohSettings()
+	presetEgress.DnsResolverSettings.RemoteDohUrlsIpv4 = presetMux.Dns.Resolver.RemoteDohUrlsIpv4
+	presetEgress.DnsResolverSettings.DohServerHostAddrs = presetMux.Dns.Resolver.DohServerHostAddrs
+	if DefaultDnsResolverSettings().DohServerHostAddrs != nil || DefaultUpgradeMuxSettings().Dns.Resolver.DohServerHostAddrs != nil {
+		t.Fatal("a preset's pins leaked into the defaults")
+	}
+	for _, countryCode := range []string{"", "cn", "ru"} {
+		ingress := IngressDohSettings(countryCode, nil, nil)
+		reference := IngressDohSettings(countryCode, nil, nil)
+		if ingress.DnsResolverSettings.DohServerHostAddrs != nil {
+			t.Fatalf("%q ingress carries pins %v", countryCode, ingress.DnsResolverSettings.DohServerHostAddrs)
+		}
+		for _, ipVersion := range []int{0, 4, 6} {
+			if urls, want := remoteDohUrls(ingress, ipVersion), remoteDohUrls(reference, ipVersion); !slices.Equal(urls, want) || slices.Contains(urls, "https://dns.example/dns-query") {
+				t.Fatalf("%q ingress v%d = %v with a preset selected, expected %v", countryCode, ipVersion, urls, want)
+			}
+		}
+		if builtIn := builtInDohServerSettings(ingress); builtIn.DnsResolverSettings.DohServerHostAddrs != nil {
+			t.Fatalf("%q built-in ingress carries pins", countryCode)
+		}
+	}
+
 	// a tunnel cache with every DoH blocked never falls back to plain dns
 	plainDns := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.99")}
 	tunnelSettings := DefaultDohSettings()
