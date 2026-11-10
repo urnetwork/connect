@@ -10590,6 +10590,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/JwkSet"
 
+  /.well-known/ur/id-jwks.json:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: The edge login signing keys
+      description: |
+        The public keys of the key set that signs edge login's ID tokens, a
+        set apart from `/.well-known/jwks.json`'s, as a JWK set: a published
+        name's own front verifies the ID token its visitor's sign-in redeems
+        for against these. Every current key is listed, so tokens stay
+        verifiable across a rotation.
+      operationId: oauthEdgeJwks
+      security: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JwkSet"
+
   /oauth/token:
     post:
       tags: [Other]
@@ -10868,6 +10889,31 @@ paths:
           $ref: "#/components/responses/ClientJwtRefused"
 
   /oauth/authorize:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: Send a visitor on to the consent page
+      description: |
+        Edge login's authorization request: a published name's own front
+        sends a visitor here with `client_id` its own origin
+        (`https://<host>.<net>.<root>`), `redirect_uri` exactly that
+        origin's `/.well-known/ur/callback`, `scope=openid`, a `nonce`,
+        `state` and a PKCE S256 challenge. The answer is a 302 to the
+        advertised `authorization_endpoint`, the consent page where the
+        signed-in session lives, with the query unchanged.
+
+        An origin is a client only while its network publishes its host to
+        the network's members by an active grant; then only a member of that
+        network may sign in, and the code redeems at `/oauth/token` for an ID
+        token alone, `{iss, aud = origin, network_id, nonce, exp = 60 s, sub
+        = member_id}`, signed by the keys `/.well-known/ur/id-jwks.json`
+        lists. Any other origin, any other `redirect_uri`, and an origin
+        whose grant has ended are refused.
+      operationId: oauthAuthorizeRedirect
+      security: []
+      responses:
+        "302":
+          description: On to the consent page, the query unchanged.
     post:
       tags: [Other]
       summary: Mint an authorization code for an approved request
@@ -10919,25 +10965,47 @@ paths:
   /network/enroll:
     post:
       x-internal: true
-      x-status: planned
       tags: [Network]
       summary: Enroll a client with an auth key
       description: |
-        Creates a top-level client from an auth key. Public: the auth key is the
-        credential, and the route is limited per key and per caller.
+        Creates a sidecar's top-level client from an auth key, as the key's
+        creator, and spends one of the key's uses. Public: the auth key is the
+        credential, and the route is limited per key and per caller address,
+        which the server counts by a hash of the address, never the address.
 
-        Send only the bearer part of the key. A key's `#` bundle is client-only and
-        never leaves the client, so an `auth_key` containing `#` is refused without
-        being logged or echoed.
+        Send only the bearer part of the key, `ur-authkey-<id>-<secret>` or
+        `<id>-<secret>`. A key's `#` bundle is client-only and never leaves
+        the client, so an `auth_key` containing `#`, or a `urn_` API key, is
+        refused with 400 `bad_request`, and its value is never logged or
+        answered back.
 
-        The client that results refuses every administration route, and its token
-        carries a 7-day expiry, when the request sets `admin_refused` and
-        `strict_exp`, which a sidecar always does. Until the second stage of the
-        client-token fix is live, `strict_exp` is refused outside the preview
-        networks.
+        The client that results always refuses every administration route,
+        and its token carries a 7-day expiry, renewing only with a `DPoP`
+        proof of `client_public_key` until the client binds a sidecar
+        identity, whatever `admin_refused` and `strict_exp` say; a sidecar
+        sends both. Until the second stage of the client-token fix is live,
+        such a client is refused with 403 `not_preview` outside the preview
+        networks. An untagged key's client belongs to the key's creator; a
+        tagged key's client has no owner and the creator sponsors it.
 
         Before the network's first authorization base, a tagged or ephemeral
-        enrollment is refused with `no_genesis`.
+        key's enrollment is refused with 403 `no_genesis`. An ephemeral key's
+        client is removed 35 minutes after its last poll and its last
+        disconnect, or at once by `POST /sidecar/close` with the `close`
+        capability this answer returns once.
+
+        `approval_state` is `pending`: the client is admitted by its
+        sidecar's admission in the network's authorization log, never here.
+        `admission`, a pre-approved key's admission, is not taken yet: a
+        request that carries one is refused with 400 `bad_request`.
+
+        A refusal answers `{"error", "code"}`: 400 `bad_request`, 401
+        `auth_key_invalid` (unknown, expired or spent, said alike), 403
+        `not_preview`, `no_genesis` or `refused`, and 429 `rate_limited`
+        with Retry-After or `refused` at the network's client limit. A
+        network at its `sidecar_clients` limit answers a `QuotaRefusal`, 402
+        when a higher tier lifts it. 503 while enrollment or the network's
+        log is unavailable.
       operationId: networkEnroll
       security: []
       requestBody:
@@ -10953,8 +11021,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkEnrollResult"
+        "400":
+          description: bad_request -- the key holds a bundle or is an API key, or the client key or device is missing.
+        "401":
+          description: auth_key_invalid -- the key is unknown, expired or spent.
+        "402":
+          description: The network is at its `sidecar_clients` limit, which a higher tier lifts; the body is a `QuotaRefusal`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          description: not_preview, no_genesis or refused.
         "429":
-          description: Past the limit for this key or caller.
+          description: rate_limited, with Retry-After, or the network's client or `sidecar_clients` limit.
+        "503":
+          description: Enrollment or the network's log is not available.
 
   /sidecar/bind:
     post:
@@ -14111,6 +14193,29 @@ components:
             outside the preview networks until the second stage of the
             client-token fix (see the endpoint).
           type: boolean
+        declares_no_egress:
+          description: |
+            Optional, default false. The new client provides no egress: it is
+            kept out of the concurrent client limit and the top-level client
+            cap, is not listed as a peer, and its token says so. Assigned at
+            creation and inherited by its children; a re-auth may repeat it
+            but not add it.
+          type: boolean
+        acl_enforcing:
+          description: |
+            Optional, default false. The new client is an app device client
+            whose forwarding enforces its network's access rules, which the
+            network's client list shows. Assigned at creation and inherited by
+            its children; a re-auth may repeat it but not add it.
+          type: boolean
+        ephemeral:
+          description: |
+            Optional, default false. The new top-level client is ephemeral: it
+            is removed 35 minutes after its last poll and its last disconnect,
+            or at once by `POST /sidecar/close` with the `close` capability the
+            answer returns once. Refused with `source_client_id` or
+            `client_id`.
+          type: boolean
         provide_intent:
           description: |
             Optional, default false. The new client is a provider install: it
@@ -14423,6 +14528,18 @@ components:
         strict_exp:
           description: The client is a sidecar's (`strict_exp`), and `by_client_jwt` lives 7 days.
           type: boolean
+        declares_no_egress:
+          description: The client is marked `declares_no_egress`, which the request asked for or a parent passed down.
+          type: boolean
+        acl_enforcing:
+          description: The client is marked `acl_enforcing`, which the request asked for or a parent passed down.
+          type: boolean
+        close:
+          description: |
+            An ephemeral client's close capability, 128 random bits as 22
+            characters of base64url without padding, returned only here, which
+            `POST /sidecar/close` takes. The server keeps its SHA-256.
+          type: string
         # the returned proxy urls are valid as long as the client is not removed
         proxy_config_result:
           description: |
@@ -15804,6 +15921,11 @@ components:
               principal:
                 description: identity principal assigned at creation
                 type: string
+              acl_enforcing:
+                description: |
+                  The client is an app device client whose forwarding enforces
+                  the network's access rules; false for a legacy client.
+                type: boolean
               provide_mode:
                 $ref: "#/components/schemas/ProvideMode"
               proxy_client:
@@ -26452,7 +26574,9 @@ components:
           description: The client's tokens carry a 7-day expiry, as a sidecar always asks.
           type: boolean
         admission:
-          description: The optional admission of a pre-approved key. Its form lands with the route.
+          description: |
+            The optional admission of a pre-approved key, which the server
+            does not take yet: a request carrying one is refused.
 
     NetworkEnrollResult:
       type: object
@@ -26474,8 +26598,9 @@ components:
           type: boolean
         close:
           description: |
-            An ephemeral mint's close capability, 128 random bits returned only
-            here. The server keeps its SHA-256.
+            An ephemeral key's close capability, 128 random bits as 22
+            characters of base64url without padding, returned only here, which
+            `POST /sidecar/close` takes. The server keeps its SHA-256.
           type: string
 
     SidecarBindArgs:
