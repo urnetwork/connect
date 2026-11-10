@@ -11269,6 +11269,39 @@ paths:
         "503":
           description: Wakes are not enabled; see Retry-After.
 
+  /sidecar/close:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Close an ephemeral client at once
+      description: |
+        An ephemeral page's best-effort unload beacon. `navigator.sendBeacon`
+        sets no Authorization header, so the route takes none: the body, as
+        `text/plain`, is the close capability that `POST /network/enroll` or
+        `POST /network/auth-client` returned once when the ephemeral client was
+        minted, 128 random bits as 22 characters of base64url without padding.
+        The server keeps only its SHA-256.
+
+        A capability that matches removes its client at once, as an idle
+        ephemeral client is removed 35 minutes after its last poll and its last
+        disconnect. The answer is 204 whether or not anything matched, and the
+        body is never logged or answered back.
+      operationId: sidecarClose
+      security: []
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "204":
+          description: Done, whether or not the capability matched.
+        "400":
+          description: The body is longer than a capability.
+        "503":
+          description: The server could not look the capability up.
+
   /network/auth-keys:
     get:
       tags: [Network]
