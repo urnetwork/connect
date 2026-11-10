@@ -12067,17 +12067,20 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Push, or seal a push of parts
       description: |
         Commits a signed push: `{statement, payload, receipts}`, or to seal a push
         of parts, `{statement, the parts' places}`. Needs `rw`, and `deposit` allows
         only the caller's deposit ref. DROP pushes and their cancels ride here too.
+        Until the seal is served it answers 503.
 
         A push id names one statement. Retry with the same push id and statement,
         one attempt at a time, until a 200, 409 or 412: a committed id answers its
         version, and a recorded refusal answers again with `recorded: true`.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 429 or 503 carries `Retry-After`.
       operationId: evsPush
       security:
         - ServiceTokenAuth: []
@@ -12086,15 +12089,46 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsPushRequest"
       responses:
         "200":
-          description: The committed version.
+          description: The committed version, the original one on a retry, and on the caller's own deposit ref its head.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsPushReply"
+        "400":
+          description: "`INVALID`: a body, statement, payload or signature that does not parse or verify, which refuses nothing."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "402":
           description: At the storage limit or spent, once the head records it, with terms when a purchase lifts the limit.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: "`SCOPE`, or `QUOTA_LIMIT` once the head records it."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo was never placed or created."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
           description: |
             One of `REF_MODE`, `PUSH_ID_REUSED`, `SEGMENT_GONE`, `SEGMENT_STALE`,
@@ -26920,6 +26954,21 @@ components:
         but a 200: its code, which fixes the status, the push id where there is one,
         and as the code needs `recorded`, `retry_after_ms`, `paths`, `outcome`,
         `needs_format`, `quota` and `deposit_head`.
+      type: string
+      format: binary
+
+    EvsPushRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsPushRequest`: the Signed `EvsPush` bytes as
+        signed, a one-part push's payload and its upload receipts, or for a seal the
+        parts' places and no payload.
+      type: string
+      format: binary
+
+    EvsPushReply:
+      description: |
+        sidecar protocol/evs.proto's `EvsPushReply`: a push's or seal's version, a
+        part's place, and on the caller's own deposit ref that ref's head.
       type: string
       format: binary
 
