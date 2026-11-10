@@ -12253,12 +12253,14 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Upload a path-epoch map part
       description: |
-        Uploads a part of a signed `EvsPathMap` for the newest generation. Needs
-        `rw`. The PATH_EPOCH push that commits the map goes through the push route.
+        Uploads a part of a signed `EvsPathMap` for the newest generation, with the
+        map's `path_map_sha256`, which names its parts' keys. Needs `rw`; the part
+        must name this repo and be signed by the caller's sidecar. A retry of the
+        same part is success. The PATH_EPOCH push that commits the map goes
+        through the push route.
       operationId: evsPathEpoch
       security:
         - ServiceTokenAuth: []
@@ -12267,20 +12269,30 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsPathMapRequest"
       responses:
         "200":
-          description: OK.
+          description: The part is stored, with no body.
+        "400":
+          description: "`INVALID`: a part out of shape, of another repo, or not signed by the caller's sidecar."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: "`MAP_PARTS`: another part already stands under this map's key."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/path-epoch/block:
     servers:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Hold path creation for a due epoch
       description: |
@@ -12294,12 +12306,24 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/x-protobuf:
             schema:
-              $ref: "#/components/schemas/EvsPathEpochBlockArgs"
+              $ref: "#/components/schemas/EvsPathEpochBlockRequest"
       responses:
         "200":
-          description: OK.
+          description: The block is set, with no body.
+        "412":
+          description: "`PATH_EPOCH`: nothing is due on the ref; or `EPOCH_SOURCES_FULL` for a batched epoch while two sources stand."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: "`WAIT` with `retry_after_ms`: before 10 minutes past the due time, or within 10 minutes of the last block; `BUSY`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/read:
     servers:
@@ -12396,12 +12420,13 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Erase slot keys
       description: |
-        Needs `admin`. Commits an ERASE push on the repo's `erasure` ref, then
-        rewrites each named slot without those keys before answering.
+        Needs `admin`, refused below it before any read or write. Commits an ERASE
+        push on the repo's `erasure` ref, then rewrites each named slot without
+        those keys before answering; a retry of a committed ERASE rewrites again.
+        The body and answers are the push route's.
       operationId: evsSlotsDelete
       security:
         - ServiceTokenAuth: []
@@ -12410,15 +12435,34 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsPushRequest"
       responses:
         "200":
-          description: OK.
+          description: The ERASE's version, its slots rewritten.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsPushReply"
+        "403":
+          description: "`SCOPE`: below `admin`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
           description: "`NOTHING_TO_ERASE`, once recorded."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: "`{push_id, outcome: unknown}`: the rewrites did not finish; a retry finishes them."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/drops/preview:
     servers:
@@ -27088,17 +27132,19 @@ components:
           description: At most 120,000.
           type: integer
 
-    EvsPathEpochBlockArgs:
-      type: object
-      required:
-        - ref_id
-        - ms
-      properties:
-        ref_id:
-          type: string
-        ms:
-          description: At most 120,000.
-          type: integer
+    EvsPathMapRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsPathMapRequest`: the map's `path_map_sha256`
+        and one Signed `EvsPathMap` part as signed.
+      type: string
+      format: binary
+
+    EvsPathEpochBlockRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsPathEpochBlockRequest`: the ref and the
+        block's length in ms, at most 120,000.
+      type: string
+      format: binary
 
     EvsSubscriptionRequest:
       description: |
