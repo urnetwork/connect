@@ -4,7 +4,6 @@ package connect
 
 import (
 	"bytes"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -131,31 +130,15 @@ func testAggregateIdleRefusalMetadataPublication(t *testing.T, materialize bool)
 		if !successor {
 			t.Fatal("publication control did not materialize its distinct paid metadata successor")
 		}
-		// The reaper's publication visit only tries the paid flow's lock and
-		// defers a contended visit by SynRetryPublicationRetryDelay. The pass
-		// that publishes the provider then takes that lock in finishServiceRefresh,
-		// so hold the visit at its barrier until the bubble settles.
-		atQueue, queueRelease := make(chan struct{}), make(chan struct{})
-		var queueOnce, releaseOnce sync.Once
-		releaseQueue := func() { releaseOnce.Do(func() { close(queueRelease) }) }
-		t.Cleanup(releaseQueue)
-		f.h.multiClient.beforeSynPublicationQueueForTest = func(current *multiClientChannelUpdate) {
-			if current == f.update {
-				queueOnce.Do(func() {
-					close(atQueue)
-					select {
-					case <-queueRelease:
-					case <-f.h.multiClient.ctx.Done():
-					}
-				})
-			}
-		}
+		// The pass that publishes the provider can hold the flow lock when the
+		// paid SYN's publication visit arrives; hold the visit until it settles.
+		visit, releaseVisit := f.holdPublicationVisit(t)
 		close(f.generator.availableRelease)
-		if !discoveryDemandTestAwaitPublication(t, atQueue, f.started.Add(2500*time.Millisecond)) {
+		if !discoveryDemandTestAwaitPublication(t, visit, f.started.Add(2500*time.Millisecond)) {
 			t.Fatal("published provider never reached the paid flow's publication visit")
 		}
 		f.h.settle()
-		releaseQueue()
+		releaseVisit()
 		f.requireLate(t, publication, f.started.Add(2500*time.Millisecond), "AGGREGATE_IDLE_REFUSAL_PUBLICATION_STALLED")
 		select {
 		case actual := <-wire:
