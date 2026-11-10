@@ -11533,6 +11533,58 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/team-checkout:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Buy a team network its plan
+      description: |
+        Creates a Stripe Checkout Session for the caller's team network, one
+        `POST /network/team-create` made. The session sells one subscription:
+        the monthly base, which covers the included seats, each active seat
+        above them, and transfer overage; storage overage joins it once it is
+        priced. The amounts are the server's, and a Stripe price whose amount
+        differs is never sold.
+
+        The session expires an hour after it is made. The billing cycle is
+        anchored at the first 00:00:00 UTC after that, so the first period runs
+        from the payment to the anchor and every later one starts at 00:00:00
+        UTC. The plan is granted by the `invoice.paid` webhook, never by the
+        client: the network's Team routes answer a `QuotaRefusal` until then.
+
+        `ui_mode` and `redirect_on_completion` are as
+        `POST /stripe/create-checkout-session` takes them: "hosted" (the
+        default) returns `checkout_url`, "embedded" returns `client_secret` and
+        `publishable_key`.
+
+        The team's Owner or a Billing admin buys its plan: any other member is
+        refused by the role gate (`RolePermissionRefused`). Each other refusal
+        is a 200 with `error` and its `code`: `not_team` for a network that is
+        not a team, `already_subscribed`, `plan_unavailable` while no team
+        price is configured or one differs, `checkout_unavailable` while team
+        checkout is not open, `invalid_request` or `start_failed`. 503 while
+        teams are not available.
+      operationId: networkTeamCheckout
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkTeamCheckoutArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTeamCheckoutResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
   /network/idp:
     post:
       x-internal: true
@@ -27755,6 +27807,46 @@ components:
           properties:
             code:
               description: "`invalid`, `not_available` or `rate_limited`."
+              type: string
+            message:
+              type: string
+
+    NetworkTeamCheckoutArgs:
+      type: object
+      properties:
+        ui_mode:
+          description: "`hosted` (the default) or `embedded`."
+          type: string
+        redirect_on_completion:
+          description: "`never` keeps an embedded checkout inline. Only with `ui_mode` `embedded`."
+          type: string
+
+    NetworkTeamCheckoutResult:
+      type: object
+      properties:
+        ui_mode:
+          description: Which of the two shapes is set, `hosted` or `embedded`.
+          type: string
+        checkout_url:
+          description: Hosted. Stripe's checkout url, which the client opens.
+          type: string
+        client_secret:
+          description: Embedded. The client secret Stripe.js mounts Embedded Checkout with.
+          type: string
+        publishable_key:
+          description: Embedded. The publishable key Stripe.js is initialized with.
+          type: string
+        session_id:
+          description: The Checkout Session's id.
+          type: string
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              description: "`not_team`, `already_subscribed`, `plan_unavailable`, `checkout_unavailable`, `invalid_request` or `start_failed`."
               type: string
             message:
               type: string
