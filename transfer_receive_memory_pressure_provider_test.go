@@ -239,7 +239,14 @@ func newReceiveProviderPressureFixtureWithHold(t *testing.T, smallPrefix bool, h
 			self.sequence.holdPromise.reservedByteCount >= self.decodeBytes || self.sequence.holdPromise.boundary != 2 {
 			t.Fatal("larger tentative owners changed the smaller committed prefix promise")
 		}
-		expectedBytes += 2 * prefix.QueueByteCount()
+		// Since 00d4f62b the committed prefix's selective lease also holds
+		// its repair escrow: the inline owner, for this no-contract peer.
+		repair := self.sequence.receiveBufferSettings.receiveHeldHeadRepairByteCount(true)
+		if repair <= 0 || self.sequence.heldHeadRepair.eligibleCount != 1 ||
+			self.sequence.heldHeadRepair.reservedByteCount != repair || self.sequence.heldHeadRepair.owner != nil {
+			t.Fatal("small committed original did not hold exactly its repair escrow")
+		}
+		expectedBytes += 2*prefix.QueueByteCount() + repair
 	}
 	if root.Available() != 0 || rx.UsedByteCount() != expectedBytes || self.sequence.holdPromise.set != smallPrefix ||
 		!smallPrefix && self.sequence.holdPromise.reservedByteCount != 0 || len(self.receiverOut) != 0 || self.ackedCount != 1 {

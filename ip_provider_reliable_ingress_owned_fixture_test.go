@@ -12,10 +12,16 @@ import (
 // Legacy direct fixtures keep their separate admission/accounting premise.
 func (self *reliableTcpIngressFixture) packOwned(sequence *ReceiveSequence, number uint64, payload []byte) Id {
 	self.t.Helper()
+	return self.packOwnedTcp(sequence, number, 101, payload)
+}
+
+// The same paid handoff with the inner TCP sequence number chosen by the caller.
+func (self *reliableTcpIngressFixture) packOwnedTcp(sequence *ReceiveSequence, number uint64, tcpSequenceNumber uint32, payload []byte) Id {
+	self.t.Helper()
 	if !sequence.receiveBufferSettings.ownsDecodedReceiveMemory() {
 		self.t.Fatal("owned provider fixture requires exact receive accounting")
 	}
-	input, id := self.uploadPack(sequence, number, 101, payload)
+	input, id := self.uploadPack(sequence, number, tcpSequenceNumber, payload)
 	pack := func() *ReceivePack {
 		defer input.messagePoolReturn()
 		return self.decodeOwnedPack(sequence, input)
@@ -150,6 +156,47 @@ func TestProviderReliableTcpSelectiveLeaseRequiresDecodedOwner(t *testing.T) {
 			t.Logf("ipv%d direct old premise: prepaid=%d retained=%d spare=%d owner=nil committed=false repair=0",
 				version, held.deliveryPrepaid, held.queueByteCount, budget.Available())
 		})
+	}
+}
+
+// The policies that acknowledge on admission refuse a direct Pack outright:
+// it cannot fund repair escrow. That refusal must leave no queue reservation
+// behind. The old order reserved the item first, and once refused nothing
+// owned that reservation; the receive root stayed charged after every join.
+func TestProviderReliableTcpRefusedDirectHoldReturnsItsReservation(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, policy := range []ReceiveHoldPolicyKind{ReceiveHoldRefuse, ReceiveHoldEvict} {
+		for _, version := range []int{4, 6} {
+			synctest.Test(t, func(t *testing.T) {
+				budget := NewTransferMemoryBudget(kib(64))
+				f := newReliableTcpIngressFixture(t, version, nil)
+				f.establishForControl()
+				sequence := f.runningReceiveSequence(reliableIngressBudgetSettings(budget), func(settings *ReceiveBufferSettings) {
+					settings.ReceiveHoldPolicy = policy
+				})
+				before := f.client.ReceiveStats()
+				pack, id := f.uploadPack(sequence, 1, 101, []byte("direct construction cannot fund repair custody"))
+				if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
+					pack.messagePoolReturn()
+					t.Fatalf("direct fixture did not reach the hold: accepted=%t err=%v", ok, err)
+				}
+				synctest.Wait()
+				after := f.client.ReceiveStats()
+				if sequence.receiveQueue.GetByMessageId(id) != nil || after.ReceiveQueueDropCount != before.ReceiveQueueDropCount+1 {
+					t.Fatalf("policy=%d ipv%d: direct Pack was not refused at the hold", policy, version)
+				}
+				if budget.UsedByteCount() != 0 || budget.reservedByteCount.Load() != budget.releasedByteCount.Load() ||
+					sequence.holdPromise.reservedByteCount != 0 ||
+					sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0 {
+					t.Fatalf("policy=%d ipv%d: refused direct Pack kept a receive reservation: used=%d reserved=%d released=%d",
+						policy, version, budget.UsedByteCount(), budget.reservedByteCount.Load(), budget.releasedByteCount.Load())
+				}
+				ack := sequence.ackWindow.Snapshot(false)
+				if ack.ackUpdateCount != 0 || len(ack.selectiveAcks) != 0 || sequence.ctx.Err() != nil {
+					t.Fatal("refused direct Pack gained feedback or canceled a healthy sequence")
+				}
+			})
+		}
 	}
 }
 

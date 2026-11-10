@@ -73,15 +73,20 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 
 	// The ingredients of the window, and the only functions allowed to read
 	// each. Everything else must read the estimate's Window.
+	//
+	// The settings derivation lives in applyWindowSizingForMemoryTarget and
+	// defaultSendBufferSettingsWithMemoryTarget. Since 00d4f62b, the public
+	// ApplyWindowSizing and DefaultSendBufferSettingsWithBufferSize only pass
+	// the process memory target to them, so they read no ingredient.
 	owners := map[string][]string{
 		"DeliverySizedWindowCeilingByteCount": {
-			"ApplyWindowSizing",
-			"DefaultSendBufferSettingsWithBufferSize",
+			"applyWindowSizingForMemoryTarget",
+			"defaultSendBufferSettingsWithMemoryTarget",
 			"estimateSendWindow",
 		},
 		"TargetGoodputByteRate": {
-			"ApplyWindowSizing",
-			"DefaultSendBufferSettingsWithBufferSize",
+			"applyWindowSizingForMemoryTarget",
+			"defaultSendBufferSettingsWithMemoryTarget",
 			"estimateSendWindow",
 			"bindingTerm",
 		},

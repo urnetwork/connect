@@ -18242,8 +18242,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 		}
 
-		if canQueue(item) && self.reserveHeldItem(item, promised) &&
-			(self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix || self.reserveReceiveHeldHeadRepair(item)) {
+		// Acknowledging on admission first needs the repair escrow. Check it
+		// before the item reserves: a direct or otherwise unpaid item can never
+		// fund it, and a refusal after reserveHeldItem would leave that queue
+		// reservation with no owner to release it. A paid RX owner that gets
+		// its escrow is already charged, so reserveHeldItem cannot then fail.
+		if canQueue(item) &&
+			(self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix || self.reserveReceiveHeldHeadRepair(item)) &&
+			self.reserveHeldItem(item, promised) {
 			// the largest frame seen is the conservative gap estimate:
 			// over-counting commits fewer items and costs churn at the
 			// boundary, under-counting commits an item that is later evicted,
