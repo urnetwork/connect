@@ -11802,6 +11802,132 @@ paths:
         "503":
           description: Sign-in through an IdP is not available.
 
+  /network/admin-events:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: Read a team's admin events
+      description: |
+        The caller's team network's admin events after seq `after`, in `seq`
+        order, at most `limit` and at most 1,000 at a time: `more` says others
+        follow. An event records an admin action the server executed: who
+        acted, the action, what it acted on, the result and the request's id.
+        Each field is an opaque id or a fixed word; no event holds a client
+        address or a name. Events are kept 400 days.
+
+        Each network's events form a hash chain, which a reader verifies
+        itself. `chain_sha256` is SHA-256 over the 32 bytes of `prev_sha256`
+        followed by the event's canonical form: the 2-byte big-endian length
+        and the bytes of `urnetwork network_admin_event v1`; the network id's
+        16 bytes; `seq` as 8 bytes big-endian; `event_time` as microseconds
+        since the Unix epoch, 8 bytes big-endian; then `actor_kind`,
+        `actor_id`, `action`, `target_kind`, `target_id`, `result` and
+        `request_id` in that order, each string as its 2-byte big-endian length
+        and its bytes, and each id as the byte 1 and its 16 bytes, or the byte
+        0 when absent. `prev_sha256` is the previous event's `chain_sha256`,
+        and 32 zero bytes for `seq` 1.
+
+        Auditors and above read the events; a Member is refused by the role
+        gate (`RolePermissionRefused`). A network outside the team tier is
+        refused 402 with a `QuotaRefusal`. 503 while teams are not available.
+      operationId: networkAdminEvents
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: The `seq` to read after. 0, the default, reads from the oldest event kept.
+          schema:
+            type: integer
+            format: int64
+        - name: limit
+          in: query
+          required: false
+          description: The most events to answer, at most 1,000.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkAdminEventsResult"
+        "400":
+          description: "`after` or `limit` is not a number."
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/audit-webhook:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Send a team's admin events to a webhook
+      description: |
+        Adds a webhook to the caller's team network with `url`, removes one
+        with `remove_webhook_id`, or, with neither, lists them. The answer
+        always carries the network's `webhooks` after the call. A network
+        holds at most 5.
+
+        `url` is an https URL whose host is public. The server never follows a
+        redirect from it and never connects to an address that is not public,
+        whatever the name resolves to. Adding a webhook answers its
+        `signing_key` once: 32 bytes, base64url with no padding.
+
+        The server posts the network's admin events, from the webhook's
+        creation on, as JSON: `webhook_id`, `network_id` and `events`, each
+        event as `GET /network/admin-events` answers it, oldest first, at most
+        100 in one delivery. Each delivery carries `Urnetwork-Webhook-Id` and
+        `Urnetwork-Signature: t=<unix seconds>,v1=<hex>`, where the hex is
+        HMAC-SHA256 under the signing key of the decimal `t`, a period and the
+        body's bytes. A receiver answers 2xx to take a delivery. Any other
+        answer is retried with a growing wait for 24 hours; then the events
+        the failing run held are skipped, the skip is recorded as an admin
+        event, and the webhook stays. A delivery may repeat, so a receiver
+        drops a `seq` it already has, and a gap in `seq` shows a skip.
+
+        The team's Owner changes its webhooks: any other member is refused by
+        the role gate (`RolePermissionRefused`). A network outside the team
+        tier is refused 402 with a `QuotaRefusal`. An argument the server
+        cannot take answers 200 with `error`. Adding or removing a webhook
+        records an admin event, and adding one sends the network's Owners and
+        Admins a security notice. 503 while teams are not available.
+      operationId: networkAuditWebhook
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkAuditWebhookArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkAuditWebhookResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
   /network/members:
     get:
       tags: [Network]
@@ -27176,6 +27302,122 @@ components:
         authorization_url:
           description: The IdP's authorization request to send the browser to. Absent when the address's domain routes to no IdP.
           type: string
+
+    NetworkAdminEvent:
+      type: object
+      required:
+        - seq
+        - event_time
+        - actor_kind
+        - action
+        - target_kind
+        - result
+        - prev_sha256
+        - chain_sha256
+      properties:
+        seq:
+          description: The event's position in its network's log, from 1.
+          type: integer
+          format: int64
+        event_time:
+          description: datetime, to the microsecond.
+          type: string
+        actor_kind:
+          description: "`user`, `client`, `api_key`, `system` or `sidecar`."
+          type: string
+        actor_id:
+          description: udid. Absent for `system`.
+          type: string
+        action:
+          description: A fixed word, such as `auth_key.create` or `domain.verify`.
+          type: string
+        target_kind:
+          type: string
+        target_id:
+          description: udid. Absent where the target has no id.
+          type: string
+        result:
+          type: string
+        request_id:
+          description: udid. The request that made the change, when one did.
+          type: string
+        prev_sha256:
+          description: The previous event's `chain_sha256`, lowercase hex; 64 zeros for `seq` 1.
+          type: string
+        chain_sha256:
+          description: The event's chain value, lowercase hex.
+          type: string
+
+    NetworkAdminEventsResult:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkAdminEvent"
+        more:
+          description: Events follow the last one.
+          type: boolean
+
+    NetworkAuditWebhookArgs:
+      type: object
+      properties:
+        url:
+          description: Adds a webhook that posts to this https URL.
+          type: string
+        remove_webhook_id:
+          description: udid. Removes this webhook.
+          type: string
+
+    NetworkAuditWebhook:
+      type: object
+      required:
+        - webhook_id
+        - url
+        - delivered_seq
+      properties:
+        webhook_id:
+          description: udid
+          type: string
+        url:
+          type: string
+        delivered_seq:
+          description: The newest admin event `seq` the receiver took, or was skipped past.
+          type: integer
+          format: int64
+        fail_time:
+          description: datetime. A failing run began here; its events are skipped 24 hours on.
+          type: string
+        next_time:
+          description: datetime. The failing run's next try.
+          type: string
+
+    NetworkAuditWebhookResult:
+      type: object
+      required:
+        - webhooks
+      properties:
+        webhook_id:
+          description: udid. The webhook this call added.
+          type: string
+        signing_key:
+          description: The added webhook's signing key, 32 bytes as base64url with no padding. Answered this once.
+          type: string
+        removed:
+          description: This call removed a webhook.
+          type: boolean
+        webhooks:
+          description: The network's webhooks after the call, oldest first.
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkAuditWebhook"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     NetworkEnrollArgs:
       type: object
