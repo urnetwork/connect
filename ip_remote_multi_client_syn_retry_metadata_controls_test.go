@@ -142,6 +142,11 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 		var originalPacket []byte
 		var history []Id
 		wire := make(chan []byte, 16)
+		// The same metadata SYN races several sequences. An acknowledgement of
+		// one sequence's Pack releases its bytes, which reopens room for another
+		// sequence's successor after that sequence froze the budget. Hold the
+		// original providers' frames from the first metadata Pack to afterRetry.
+		providerHold := newReraceProviderHold()
 		configure := func(settings *ClientSettings) {
 			settings.SendBufferSettings.ResendQueueBudget = budget
 			settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
@@ -158,6 +163,8 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 						t.Error("metadata Pack changed its actual source budget")
 						return
 					}
+					// before this Pack is written, so its acknowledgement is held
+					providerHold.set(true)
 					budget.SetTotalByteCount(budget.UsedByteCount())
 					root.SetTotalByteCount(root.UsedByteCount())
 					denied.Add(1)
@@ -168,7 +175,10 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 			packet: func(path *IpPath, ordinal int) []byte {
 				return synMetadataTestPacket(path, uint32(100+ordinal), uint16(200+ordinal), nil)
 			},
+			providerHold: providerHold,
 			beforeRetry: func(f *synPublicationTestFixture) {
+				// runs before the harness closes, even after a failed check
+				t.Cleanup(func() { providerHold.set(false) })
 				original, credit = f.owner, f.owner.credit
 				originalPacket, history = bytes.Clone(original.packet), slices.Clone(original.refusedRemoteIds)
 				for _, exit := range f.h.generator.exitList() {
@@ -201,6 +211,10 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 				}
 				root.SetTotalByteCount(8 * 1024 * 1024)
 				budget.SetTotalByteCount(root.TotalByteCount())
+				// The held acknowledgements and refusals land before the fixture
+				// continues, as they would have within the offer.
+				providerHold.set(false)
+				f.h.settle()
 			},
 		}
 		f := newSynPublicationPacketFixture(t, 4, false, configure, options)
