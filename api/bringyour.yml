@@ -50,6 +50,16 @@ info:
     `SidecarTokenRefused`) before doing anything, a 403 and never a 401, so a
     client does not sign out.
 
+    In a team network, a member's credential (a JWT naming a `member_id`, an
+    API key its creator made as a member, or a member's admin token) reaches a
+    route that administers the network or the account only where the member's
+    role holds the route's permission, cut by the credential's own scopes; no
+    role reaches the network's own account (its sign-ins, seedphrases and auth
+    codes). Every other such call answers 403 with the plain text "Your role in
+    this network does not permit this route." (see `RolePermissionRefused`)
+    before doing anything, never a 401. A personal network's owner reaches
+    every such route, within an API key's scopes.
+
     This api process also serves the sim-latency competition under
     `/competition`. Those routes are a separate, fail-closed security domain
     with their own opaque role-scoped tokens, and they are documented in
@@ -11523,6 +11533,95 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/idp:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Add a team's OIDC IdP
+      description: |
+        Adds an OpenID Connect IdP to the caller's team network. Only OIDC: the
+        code flow with PKCE S256, `state` and `nonce`. `client_auth` is
+        `private_key_jwt` or `client_secret`; a client secret is sealed at once
+        under a key only the server's vault holds, and is never answered
+        back. The issuer is an https URL whose host is public. The IdP signs
+        in to this network alone, and its identities are `(idp_id, sub)`,
+        never an email. The team's Owner adds it: any other member is refused
+        by the role gate (`RolePermissionRefused`). A network outside the team
+        tier is refused 402 with a `QuotaRefusal`. An argument the server
+        cannot take answers 200 with `error`. 503 while teams are not
+        available.
+      operationId: networkIdpCreate
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateNetworkIdpArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateNetworkIdpResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /auth/sso/callback:
+    get:
+      x-internal: true
+      tags: [Authentication]
+      summary: Finish a sign-in through a team's IdP
+      description: |
+        The redirect a team's IdP sends the browser back to. `state` names the
+        sign-in flow, which is taken once, so a replayed state is refused. The
+        server redeems `code` with the flow's PKCE verifier and verifies the
+        ID token, its issuer, audience, expiry and the flow's `nonce`, under
+        the IdP's keys. An identity the server has not seen links only to the
+        user whose own sign-in began the flow, never by its email; one with
+        no such user is refused with `error`. A first sign-in to the team makes
+        a pending member, answered `pending` with no credential until an admin
+        device admits it; a live member gets `by_jwt`, a network credential
+        for the IdP's team alone, and its access lasts 7 days past its newest
+        IdP sign-in. 503 while sign-in through an IdP is not available.
+      operationId: authSsoCallback
+      security: []
+      parameters:
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: error
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkSsoCallbackResult"
+        "503":
+          description: Sign-in through an IdP is not available.
+
   /network/members:
     get:
       tags: [Network]
@@ -11536,8 +11635,10 @@ paths:
         again; groups, tags, device names and admissions live in the team's
         config repo, never here.
 
-        The team's Owner reads the list; any other caller is refused 403 with
-        the plain text message "Only the team's Owner may list its members." A
+        The team's Owners and Admins read the list; any other caller is
+        refused 403, a member's credential by the role gate
+        (`RolePermissionRefused`) and any other with the plain text message
+        "Only the team's Owners and Admins may list its members." A
         network outside the team tier is refused 402 with a `QuotaRefusal`
         whose `limit_key` is `team` and whose `upgrade` is set. 503 while teams
         are not available.
@@ -13322,6 +13423,23 @@ components:
           schema:
             type: string
           example: A client token cannot administer the network. Use the network's root token or an API key.
+    RolePermissionRefused:
+      description: |
+        The bearer is a team member's credential, and the member's role, cut
+        by the credential's scopes, does not hold the permission this route
+        asks: Owners hold all but the network's own account; Admins members,
+        settings, devices, policy, keys and reads; Network admins policy and
+        reads; IT admins devices and reads; Billing admins billing and reads;
+        Auditors reads; Members their own credential only. A route no
+        permission maps is the Owner's. The route did nothing. The body is the
+        plain text message "Your role in this network does not permit this
+        route." It is 403, not 401: the credential is good, its role is not
+        enough.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Your role in this network does not permit this route.
     SidecarTokenRefused:
       description: |
         The bearer token is a sidecar's client JWT (`strict_exp`), and this
@@ -26759,6 +26877,58 @@ components:
         content_hash:
           type: string
           description: "`0x`-prefixed sha256 of the chunk bytes."
+
+    CreateNetworkIdpArgs:
+      type: object
+      required:
+        - issuer
+        - client_id
+        - client_auth
+      properties:
+        issuer:
+          description: The IdP's issuer, an https URL whose host is public.
+          type: string
+        client_id:
+          type: string
+        client_auth:
+          description: "`private_key_jwt` or `client_secret`."
+          type: string
+        client_secret:
+          description: With `client_secret` only. Sealed at once, never answered back.
+          type: string
+
+    CreateNetworkIdpResult:
+      type: object
+      properties:
+        idp_id:
+          description: udid
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkSsoCallbackResult:
+      type: object
+      properties:
+        by_jwt:
+          description: A live member's network credential for the IdP's team; absent for a pending member.
+          type: string
+        network_id:
+          description: udid
+          type: string
+        pending:
+          description: The member awaits an admin device's admission.
+          type: boolean
+        linked:
+          description: This sign-in linked the IdP identity to the user that began it.
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
 
     NetworkEnrollArgs:
       type: object
