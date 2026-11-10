@@ -4451,7 +4451,9 @@ Phase 5b follows 4 because both touch the server.
 
 ## 6. Known limitations
 
-- Extender relay traffic is not attributed or credited. PROXY-protocol
+- The bytes an extender relays, api and control traffic included, are
+  not measured. Extender pay comes from J2/J3 instead: each contract pays
+  every extender recorded on it an equal hop share. PROXY-protocol
   attribution to a dedicated edge port is a later phase.
 - The reverse proxy answers probers behind a self-signed cert; an active
   prober that validates certificates sees a misconfigured host, which is
