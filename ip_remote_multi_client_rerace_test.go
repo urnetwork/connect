@@ -80,6 +80,66 @@ type reraceExitSpec struct {
 	// the first this many channels minted for the provider fail their
 	// construction, as a provider whose evaluation fails does
 	failEvaluations int
+	// Optional test-owned hold on this provider's frames to its source
+	// clients, acknowledgements included. Nil keeps the direct route.
+	providerHold *reraceProviderHold
+}
+
+// While held, a relay per source client keeps the provider's frames in order
+// without blocking the provider; release forwards them. A frame still held
+// when its source client ends returns to the pool. Safe for concurrent use.
+type reraceProviderHold struct {
+	stateLock sync.Mutex
+	held      bool
+	changed   chan struct{}
+}
+
+func newReraceProviderHold() *reraceProviderHold {
+	return &reraceProviderHold{changed: make(chan struct{})}
+}
+
+func (self *reraceProviderHold) set(held bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.held == held {
+		return
+	}
+	self.held = held
+	close(self.changed)
+	self.changed = make(chan struct{})
+}
+
+func (self *reraceProviderHold) snapshot() (bool, <-chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.held, self.changed
+}
+
+// Owns each frame read from the provider until the source route takes it.
+func (self *reraceProviderHold) relay(ctx context.Context, provider <-chan []byte, source chan<- []byte) {
+	var pending [][]byte
+	defer func() {
+		for _, frame := range pending {
+			MessagePoolReturn(frame)
+		}
+	}()
+	for {
+		held, changed := self.snapshot()
+		var out chan<- []byte
+		var next []byte
+		if !held && 0 < len(pending) {
+			out, next = source, pending[0]
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-provider:
+			pending = append(pending, frame)
+		case out <- next:
+			pending = pending[1:]
+		case <-changed:
+		}
+	}
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -392,8 +452,13 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 
 	providerTransportSend := NewSendClientTransport(DestinationId(args.ClientId))
 	providerTransportReceive := NewReceiveGatewayTransport()
+	providerRoute := routeReceive
+	if hold := exit.providerHold; hold != nil {
+		providerRoute = make(chan []byte)
+		go hold.relay(ctx, providerRoute, routeReceive)
+	}
 	exit.provider.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
-	exit.provider.RouteManager().UpdateTransport(providerTransportSend, []Route{routeReceive})
+	exit.provider.RouteManager().UpdateTransport(providerTransportSend, []Route{providerRoute})
 	exit.provider.ContractManager().AddNoContractPeer(client.ClientId())
 
 	self.mutex.Lock()

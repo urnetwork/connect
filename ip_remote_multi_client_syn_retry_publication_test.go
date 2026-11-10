@@ -53,6 +53,8 @@ type synPublicationPacketOptions struct {
 	packet            func(*IpPath, int) []byte
 	beforeRetry       func(*synPublicationTestFixture)
 	afterRetry        func(*synPublicationTestFixture)
+	// Holds the four original providers' frames to their sources while set.
+	providerHold *reraceProviderHold
 }
 
 // Nil options retain the original public native packet and every old oracle.
@@ -67,10 +69,14 @@ func newSynPublicationPacketFixture(t *testing.T, version int, partial bool, con
 		}
 		return synRetryControlOffer(t, f.h, MessagePoolCopy(options.packet(f.path, offerCount)))
 	}
+	var providerHold *reraceProviderHold
+	if options != nil {
+		providerHold = options.providerHold
+	}
 	specs := make([]reraceExitSpec, 4)
 	for index := range specs {
 		position := index
-		specs[index] = reraceExitSpec{name: string(rune('a' + index)), clientSettings: configure,
+		specs[index] = reraceExitSpec{name: string(rune('a' + index)), clientSettings: configure, providerHold: providerHold,
 			answer: func(candidate *IpPath) reraceAnswer {
 				if reraceSameFlow(candidate, f.path) {
 					if options != nil && options.silentRepeat != nil && options.silentRepeat.Load() && position == options.silentRepeatIndex {
