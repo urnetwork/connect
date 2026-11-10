@@ -11949,10 +11949,13 @@ paths:
                 $ref: "#/components/schemas/EvsRefusalReply"
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a repo's record
-      description: The repo's server-held record, which holds no content and no names.
+      description: |
+        Needs `r`. The repo's server-held record while it is `keying` or `active`: its
+        kind and owner, its network, its object format, its sealed display name and
+        its state. It holds no content and no names. Every answer but a 200 is an
+        `EvsRefusalReply`.
       operationId: evsRepoGet
       security:
         - ServiceTokenAuth: []
@@ -11960,16 +11963,41 @@ paths:
         - $ref: "#/components/parameters/EvsRepoId"
       responses:
         "200":
-          description: OK.
+          description: The record.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRepoObject"
+        "404":
+          description: "`NOT_FOUND`: no repo with this id, or its record is not written yet."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: "`REPO_DELETED` while the repo is deleted; `SHREDDING` once it is shredding or shredded."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: Unavailable, with `Retry-After`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
     delete:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Delete a repo
       description: |
-        Needs `admin` and the `RepoDelete` statement in the newest projection. Takes
-        an active repo to deleted, restorable for 7 days. With `now`, takes it to
-        shredding at once, never restorable.
+        Needs `admin` and the `RepoDelete` statement in the newest projection, not
+        restored, whose `now` matches the request's. Takes an active repo to
+        deleted, restorable for 7 days, taking the statement's deletion id, its
+        entry's time and signer; its shred starts 7 days and 10 minutes after that
+        entry unless a restore comes first. With `now`, takes an active repo, or a
+        deleted one under a newer `RepoDelete{now}`, to shredding at once, never
+        restorable. A retry answers as the first did. No body.
       operationId: evsRepoDelete
       security:
         - ServiceTokenAuth: []
@@ -11983,19 +12011,47 @@ paths:
             type: integer
       responses:
         "200":
-          description: OK.
+          description: The repo is deleted, or shredding with `now`, with no body.
+        "400":
+          description: "`INVALID`: `now` is neither absent nor `1`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
-          description: "`STATEMENT_MISSING`: the projection holds no `RepoDelete`."
+          description: |
+            `STATEMENT_MISSING`: the projection holds no such `RepoDelete`.
+            `REPO_KEYING` before activation; `REPO_DELETED` for a newer delete
+            without `now` while deleted; `SHREDDING` for a repo shredding or
+            shredded under another deletion.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: "`BUSY`: the record changed under every attempt. Nothing is refused."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: Unavailable, with `Retry-After`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/restore:
     servers:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Restore a deleted repo
-      description: Needs `admin` and the `RepoRestore` statement in the newest projection.
+      description: |
+        Needs `admin` and, in the newest projection, the `RepoRestore` of the newest
+        `RepoDelete`. Takes the repo deleted under that deletion back to active; an
+        active repo answers 200, so a retry is harmless. No body.
       operationId: evsRepoRestore
       security:
         - ServiceTokenAuth: []
@@ -12003,18 +12059,34 @@ paths:
         - $ref: "#/components/parameters/EvsRepoId"
       responses:
         "200":
-          description: OK.
+          description: The repo is active, with no body.
         "409":
           description: |
-            `SHREDDING`, the repo is past deleted, or `STATEMENT_MISSING`, the
-            projection holds no `RepoRestore`.
+            `SHREDDING`, the repo is past deleted; `STATEMENT_MISSING`, the
+            projection holds no `RepoRestore` of the deletion the repo shows;
+            `REPO_KEYING` before activation.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: "`BUSY`: the record changed under every attempt. Nothing is refused."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: Unavailable, with `Retry-After`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/activate:
     servers:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Activate a repo whose group has formed
       description: |
@@ -12029,11 +12101,28 @@ paths:
         - $ref: "#/components/parameters/EvsRepoId"
       responses:
         "200":
-          description: The repo is active.
+          description: The repo is active, with no body.
         "409":
           description: |
             `GROUP_NOT_READY`: the group has no `GroupForm` or no first generation yet.
-            Or the refusal of the state the repo is in past `active`.
+            Or the refusal of the state the repo is in past `active`: `REPO_DELETED`
+            or `SHREDDING`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: "`RESOURCE_EXHAUSTED`: the write budget's queue is past its delay, with `retry_after_ms`; or `BUSY`. Nothing is refused."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: Unavailable, with `Retry-After`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/reseed:
     servers:
@@ -27261,6 +27350,14 @@ components:
       description: |
         sidecar protocol/evs.proto's `EvsPathMapRequest`: the map's `path_map_sha256`
         and one Signed `EvsPathMap` part as signed.
+      type: string
+      format: binary
+
+    EvsRepoObject:
+      description: |
+        sidecar protocol/evs.proto's `EvsRepoObject`, `repo/<repo>` as evs holds it: the
+        repo id, kind and owner, its state and when it began, a deletion's id and
+        signer, the object format, the sealed display name and the network.
       type: string
       format: binary
 
