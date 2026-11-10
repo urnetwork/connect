@@ -651,8 +651,9 @@ func TestBlockerDefaultDataSmoke(t *testing.T) {
 	if b.BlockHost("doubleclick.net") && !b.BlockHost("x.y.doubleclick.net") {
 		t.Fatalf("subdomain of a blocked base not blocked")
 	}
-	// infrastructure never blocked
-	for _, host := range []string{"ur.network", "api.ur.network", "example.com", "en.wikipedia.org"} {
+	// infrastructure never blocked: the user root's apex and the platform names
+	// on bringyour.com, as blocker/allowlist.txt keeps them
+	for _, host := range []string{"ur.network", "api.bringyour.com", "connect.bringyour.com", "example.com", "en.wikipedia.org"} {
 		if b.BlockHost(host) {
 			t.Fatalf("%s is blocked in the default data", host)
 		}

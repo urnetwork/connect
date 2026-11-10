@@ -3,11 +3,16 @@
 # removes an entry equal to the name; it cannot punch a hole under a blocked
 # parent domain. grow this file from breakage reports.
 
-# urnetwork control plane — never block our own services
+# urnetwork control plane — never block our own services. platform names live
+# on bringyour.com (sidecar DESIGN §12.4, owner decision 16). ur.network
+# carries user content only: its apex stays, since it redirects to ur.io and
+# its exact entry keeps a feed that lists the root from blocking every name
+# under it, while a feed's entry for one name under it still blocks that name.
 ur.network
-api.ur.network
-connect.ur.network
-extender.ur.network
+bringyour.com
+api.bringyour.com
+connect.bringyour.com
+extender.bringyour.com
 
 # well known doh resolver hostnames (belt and braces; the resolver endpoints
 # from DefaultDnsResolverSettings are excluded automatically)
