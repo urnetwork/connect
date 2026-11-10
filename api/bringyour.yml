@@ -5990,15 +5990,24 @@ paths:
       description: |
         The coins the server takes payment in now, and what each sells:
         `usdc_solana` (USDC on Solana), `zec` (Zcash, to shielded addresses
-        only) and `xmr` (Monero). Only enabled assets are listed, so an asset
-        that is switched off disappears from the list; a client never offers
-        an asset or an item the list does not name. The order means nothing:
-        clients show the methods as Card, USDC, Zcash, Monero. No asset sells
+        only) and `xmr` (Monero). `assets` lists only the coins that can be
+        paid with now, so a coin that is switched off, or whose quotes the
+        server refuses for now, is not in it; a client never offers an asset
+        or an item `assets` does not name. The order means nothing: clients
+        show the methods as Card, USDC, Zcash, Monero. No asset sells
         `monthly`, which is card only.
 
-        The same list rides on /subscription/balance as `crypto_assets`, which
-        the apps read. This route is for pages without a sign-in, such as the
-        ur.io buy-data page. Unauthenticated, per-ip rate limited.
+        A Zcash or Monero coin that is on but cannot be quoted now (its wallet
+        scanner lags the network, has stopped, or does not know the network's
+        height) is in `unavailable_assets` instead, with `available: false`
+        and an `unavailable_reason`, for a page that shows it as temporarily
+        unavailable. It is never offered: /pay/crypto/intent,
+        /pay/data/crypto-intent and /pay/crypto/requote refuse it with
+        `asset_unavailable`, from the same decision.
+
+        The `assets` list rides on /subscription/balance as `crypto_assets`,
+        which the apps read. This route is for pages without a sign-in, such
+        as the ur.io buy-data page. Unauthenticated, per-ip rate limited.
       operationId: cryptoPaymentAssets
       security: []
       responses:
@@ -13631,9 +13640,11 @@ components:
           type: array
           description: |
             The coins the network can pay in now and what each sells, as
-            /pay/crypto/assets lists them. Absent when none is enabled, and
-            from older servers, so an older client never shows a crypto method
-            and a newer one shows none then.
+            /pay/crypto/assets lists them in `assets`: never a coin whose
+            quotes the server refuses for now. The temporarily unavailable
+            coins are not sent here. Absent when there is none, and from older
+            servers, so an older client never shows a crypto method and a
+            newer one shows none then.
           items:
             $ref: "#/components/schemas/CryptoPaymentAsset"
         crypto_term:
@@ -20056,7 +20067,10 @@ components:
 
     CryptoPaymentAsset:
       type: object
-      description: An asset the server takes payment in now, and what it sells.
+      description: |
+        An asset the server takes payment in, and what it sells: one that can
+        be paid with now (`available` true), or, in `unavailable_assets`, one
+        that is on but whose quotes are refused for now.
       required:
         - asset
         - confirmations_required
@@ -20080,6 +20094,28 @@ components:
         quote_ttl_seconds:
           type: integer
           description: how long a quote holds, in seconds
+        available:
+          type: boolean
+          description: |
+            Whether the asset can be paid with now: true for every asset of
+            `assets` and of `crypto_assets`, false for one of
+            `unavailable_assets`. Absent from older servers, which listed only
+            assets they would sell.
+        unavailable_reason:
+          $ref: "#/components/schemas/CryptoAssetUnavailableReason"
+
+    CryptoAssetUnavailableReason:
+      type: string
+      description: |
+        Why an asset that is on cannot be paid with now; absent when it can.
+        `scanner_lagging`: its wallet scanner has not succeeded within three
+        scan intervals (or never), or the wallet lags the network by more than
+        the coin's allowed blocks. `network_height_unknown`: the scanner knows
+        no network height or wallet height, so the lag cannot be judged. A UI
+        shows any value as temporarily unavailable.
+      enum:
+        - scanner_lagging
+        - network_height_unknown
 
     CryptoPaymentAssetsResult:
       type: object
@@ -20088,7 +20124,18 @@ components:
       properties:
         assets:
           type: array
-          description: the enabled assets; empty when no coin is enabled
+          description: |
+            The assets that can be paid with now, the only ones a client
+            offers; empty when no coin can be.
+          items:
+            $ref: "#/components/schemas/CryptoPaymentAsset"
+        unavailable_assets:
+          type: array
+          description: |
+            The assets that are on but whose quotes the server refuses for now,
+            each with `available` false and its `unavailable_reason`, for a
+            page that shows them as temporarily unavailable. Never offered.
+            Empty when there is none; absent from older servers.
           items:
             $ref: "#/components/schemas/CryptoPaymentAsset"
 
