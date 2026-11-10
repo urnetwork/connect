@@ -12467,49 +12467,109 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Lease change hints
       description: |
-        Needs `r`. Writes one lease per prefix, and an empty prefix is the whole ref.
-        A lease expires 7 days after its last renewal. The sidecar rereads the head 5
-        seconds after the 200, which covers any commit before the lease.
+        Needs `r` on the body's repo. Writes one lease per prefix, at most 16, and
+        none or an empty prefix is the whole ref. A lease expires 7 days after its
+        last renewal. The sidecar rereads the head 5 seconds after the 200, which
+        covers any commit before the lease. A new holder past the repo's
+        `evs_subscribers_per_repo`, or in the team directory its network's
+        `config_admissions`, is refused with a `QuotaRefusal` naming the key.
       operationId: evsSubscriptionCreate
       security:
         - ServiceTokenAuth: []
       requestBody:
         required: true
         content:
-          application/json:
+          application/x-protobuf:
             schema:
-              $ref: "#/components/schemas/EvsSubscriptionArgs"
+              $ref: "#/components/schemas/EvsSubscriptionRequest"
       responses:
         "200":
-          description: OK.
+          description: The leases are written, with no body.
+        "400":
+          description: "`INVALID`: a body out of shape, or more than 16 prefixes."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: "`SCOPE`, or `QUOTA_LIMIT` past a cap, naming its key."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: The state or Redis did not answer. The client retries.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List this client's leases
-      description: The leases the caller holds.
+      description: The live leases the caller holds on `repo_id`, which takes `r`.
       operationId: evsSubscriptions
       security:
         - ServiceTokenAuth: []
+      parameters:
+        - name: repo_id
+          in: query
+          required: true
+          schema:
+            type: string
       responses:
         "200":
-          description: OK.
+          description: The leases.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsSubscriptionsReply"
+        "400":
+          description: "`INVALID`: no repo id in key form."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: "`SCOPE`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
     delete:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Remove leases
-      description: Removes leases a `POST` wrote. How a request names them lands with the route.
+      description: |
+        Removes the caller's leases the body names, as a `POST` names them, or
+        with no prefix every lease of the caller's on that repo and ref.
       operationId: evsSubscriptionDelete
       security:
         - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              $ref: "#/components/schemas/EvsSubscriptionRequest"
       responses:
         "200":
-          description: OK.
+          description: The leases are removed, with no body.
+        "403":
+          description: "`SCOPE`."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   # §13.15's certificate routes (sidecar DESIGN.md §13.8). api serves them, and
   # route_authz.go classifies them sidecar, so a `strict_exp` bearer reaches them
@@ -27007,23 +27067,20 @@ components:
           description: At most 120,000.
           type: integer
 
-    EvsSubscriptionArgs:
-      type: object
-      required:
-        - repo_id
-      properties:
-        repo_id:
-          type: string
-        ref:
-          description: A ref id, or `*` for every ref.
-          type: string
-        path_epoch:
-          type: integer
-        token_prefixes:
-          description: At most 16. An empty prefix is the whole ref.
-          type: array
-          items:
-            type: string
+    EvsSubscriptionRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsSubscriptionRequest`: the repo, a ref id or
+        none for every ref, the path epoch its prefixes' tokens are in, and at most
+        16 token prefixes.
+      type: string
+      format: binary
+
+    EvsSubscriptionsReply:
+      description: |
+        sidecar protocol/evs.proto's `EvsSubscriptionsReply`: each live lease's ref,
+        path epoch, prefix and expiry.
+      type: string
+      format: binary
 
     TlsCertState:
       description: |
