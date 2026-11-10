@@ -23,16 +23,20 @@ type fifoRepairPrefixCase struct {
 }
 
 type fifoRepairPrefixDecision struct {
-	at, retry, lifetime, deferAck              time.Time
+	at, observedAt, retry, lifetime, deferAck  time.Time
+	probeInterval                              time.Duration
 	deferrals, sends                           int
 	writes                                     uint64
 	message                                    Id
 	number, highest, generation                uint64
 	retained, outstanding, leased, changed, h1 bool
+	passed                                     bool
 }
 
-// This assertion concerns the worker's queue-residence decision, not a new
-// recovery deadline. The fixture lets the existing timer choose when to run.
+// Physical-order proof remains independent from a bounded newly-current probe.
+// A bad/absent Tag or a changed generation cannot prove FIFO passage, even if
+// the genuine cumulative ACK separately schedules that current owner's probe.
+// The fixture lets the actual send worker choose and execute its timer.
 func TestWindowPacingTaggedRepairCannotRenewQueueResidence(t *testing.T) {
 	runFifoRepairPrefixCausality(t, fifoRepairPrefixCase{})
 }
@@ -115,14 +119,16 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 		snapshot := func(sequence *SendSequence, item *sendItem) fifoRepairPrefixDecision {
 			highest, _ := sequence.laneHighestAcked(item.carrierRoute)
 			return fifoRepairPrefixDecision{
-				at: sequence.lastCumulativeAckTime, retry: item.resendTime,
-				lifetime: item.sendTime.Add(item.ackTimeout), deferAck: item.timeoutDeferAckTime,
+				at: sequence.lastCumulativeAckTime, observedAt: time.Now(), retry: item.resendTime,
+				probeInterval: sequence.rttWindow.probeRtt(sequence.lastCumulativeAckTime),
+				lifetime:      item.sendTime.Add(item.ackTimeout), deferAck: item.timeoutDeferAckTime,
 				deferrals: item.timeoutDeferCount, sends: item.sendCount,
 				writes: sequence.resendWriteCount.Load(), message: item.messageId,
 				number: item.sequenceNumber, highest: highest, generation: sequence.transferFlightPolicy().generation,
 				retained:    sequence.resendQueue.GetByMessageId(item.messageId) == item,
 				outstanding: item.deferralOutstanding, leased: item.selectiveAcked,
 				changed: item.carrierChanged, h1: item.rttH1 && item.reliableCarrierObserved && !item.unreliableCarrierObserved,
+				passed: sequence.fifoRepairPassed(item),
 			}
 		}
 		settings := DefaultClientSettings()
@@ -175,13 +181,13 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 					}
 				})
 			}
+			if c.earlierCopy && number == 1 && priorCopyCompletedNanos > 0 {
+				prefixSelectionNanos = client.feedbackArrivalNanos(time.Now())
+			}
 			if item.timeoutDeferCount == 0 {
 				return
 			}
-			if c.earlierCopy && number == 1 {
-				prefixSelectionNanos = client.feedbackArrivalNanos(time.Now())
-			}
-			if c.futureDeferral {
+			if c.futureDeferral || c.earlierCopy {
 				return
 			}
 			if c.selectiveCopy && number == 2 {
@@ -226,7 +232,13 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 				return
 			}
 			sequence := client.sendBuffer.lookupSendSequence(id, nil)
-			if c.futureDeferral && phase.Load() == 0 && len(sequence.sendItems) > 0 &&
+			priorCopyReady := !c.earlierCopy || sequence.resendWriteCount.Load() > 3 && len(sequence.sendItems) > 1 &&
+				sequence.sendItems[1].sequenceNumber == 2 && sequence.sendItems[1].sendCount == 2 &&
+				sequence.sendItems[1].timeoutDeferCount > 0
+			// Stop after the actual later prefix rewrite and the successor's
+			// natural first deferral, before another physical copy can obscure
+			// the prior three writes or their order. No timer is changed.
+			if (c.futureDeferral || c.earlierCopy) && priorCopyReady && phase.Load() == 0 && len(sequence.sendItems) > 0 &&
 				sequence.sendItems[0].sequenceNumber == 1 && sequence.sendItems[0].promotedHead && sequence.resendWriteCount.Load() > 0 {
 				futureOnce.Do(func() {
 					close(dueReached)
@@ -381,7 +393,7 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 			}
 			if !found || head.sendCount != 2 || head.rttState != sendItemRttUnavailable || !head.rttH1 ||
 				priorCopyCompletedNanos >= prefixSelectionNanos || prefixSelectionNanos == 0 {
-				t.Fatal("prior successful successor copy did not precede the new prefix envelope")
+				t.Fatalf("prior successful successor copy did not precede the new prefix envelope: found=%t sends=%d rtt_state=%v h1=%t prior=%d selected=%d", found, head.sendCount, head.rttState, head.rttH1, priorCopyCompletedNanos, prefixSelectionNanos)
 			}
 		} else if !c.originalOnly {
 			prefix = readPack()
@@ -436,6 +448,9 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 		case "absent":
 			ackTag = nil
 		}
+		// The worker is held at dueResume, so this is the exact pre-ACK
+		// owner deadline. Earlier generic deadlines must stay earlier.
+		priorRetry := head.resendTime
 		phase.Store(1)
 		if ok, err := sequence.Ack(&protocol.Ack{SequenceId: prefix.SequenceId, MessageId: prefix.MessageId, Tag: ackTag}, 0); !ok || err != nil {
 			t.Fatalf("named prefix ACK was not admitted: %t %v", ok, err)
@@ -468,10 +483,32 @@ func runFifoRepairPrefixCausality(t *testing.T, c fifoRepairPrefixCase) {
 			t.Fatalf("decision changed retention/lifetime: %s %+v", premise, after)
 		}
 		wantDeferral := c.originalOnly || c.ackTag != "" || c.newGeneration || c.failedWrite || c.laterCopy
+		// Preserve the exact repaired-prefix authority oracle, independently
+		// from the generic current probe. Neither unknown metadata nor a new
+		// FIFO generation is allowed to manufacture a physical-passage mark.
+		if before.passed != !wantDeferral {
+			t.Fatalf("exact repaired-prefix passage=%t want=%t; case=%+v", before.passed, !wantDeferral, c)
+		}
+		currentProbe := (before.outstanding || before.sends > 1) && before.deferAck.Equal(before.at)
+		if currentProbe {
+			wantRetry := before.at.Add(before.probeInterval)
+			if before.sends > 1 && priorRetry.Before(wantRetry) {
+				wantRetry = priorRetry
+			}
+			if before.passed || !wantDeferral || !before.retry.Equal(wantRetry) ||
+				after.observedAt.Before(before.retry) || after.passed {
+				t.Fatal("generic current probe changed its earlier/capped deadline or acquired physical-passage authority")
+			}
+			if after.deferrals != before.deferrals || after.sends != before.sends+1 || after.outstanding {
+				t.Fatal("the same cumulative ACK was reused instead of completing one current-owner probe")
+			}
+		} else if before.passed && before.at.Before(before.retry) {
+			t.Fatal("the generic probe postponed an already-proved FIFO hole")
+		}
 		renewed := after.deferrals > before.deferrals && after.deferAck.Equal(before.at)
 		t.Logf("case=%+v prefixTag=%v generation=%d->%d before=%+v after=%+v", c, ackTag, generation, before.generation, before, after)
-		if renewed != wantDeferral {
-			t.Fatalf("actual worker reused prefix ACK as queue-residence evidence=%t want=%t; successful distinct promoted envelope=%t; no response-time bound asserted", renewed, wantDeferral, !wantDeferral)
+		if renewed != (wantDeferral && !currentProbe) {
+			t.Fatalf("actual worker renewed queue residence=%t want=%t; exact passage=%t bounded_current_probe=%t", renewed, wantDeferral && !currentProbe, before.passed, currentProbe)
 		}
 		if !wantDeferral && (after.deferrals != before.deferrals || after.sends != before.sends+1 || after.outstanding) {
 			t.Fatalf("contradicted queue residence did not return to ordinary recovery: %+v", after)

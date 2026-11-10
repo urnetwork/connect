@@ -61,6 +61,12 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 	if status != receiveMemoryPackScanReady && status != receiveMemoryPackScanCompatibility {
 		return false, false
 	}
+	// Protocol ownership is bounded by its sequence/lifecycle state, not by
+	// application-memory permission. A mixed or ambiguous Pack stays DATA.
+	if scan.loanSafe && !scan.compatibility && scan.protocolFrameCount == scan.frameCount &&
+		(!scan.contractFrameSet || scan.contractFrameType == int32(protocol.MessageType_TransferContract)) {
+		return unmarshalOwnedTransferFrame(carrier, decoded, decodePath), false
+	}
 	if !decrypted {
 		role, companion = sequenceTlsRoleServer, false
 		if scan.sessionRoleSet {
@@ -96,6 +102,9 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 	}
 	if owner == nil {
 		owner = self.receiveBuffer.takeReceiveHeadRecoveryOwnerInSession(sequence, scan, decrypted)
+	}
+	if owner == nil && sequence == nil {
+		owner = self.receiveBuffer.takeReceiveFreshOpeningOwnerInSession(scan, role, companion, decrypted)
 	}
 	if owner == nil {
 		if sequence != nil {

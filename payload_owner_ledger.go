@@ -155,6 +155,13 @@ func (l *TransferPayloadOwnerLedger) update(kind transferPayloadOwnerKind, selec
 // The sequence already owns the immutable ledger pointer and shard selector.
 // Keeping these at the sequence boundary avoids growing every sendItem.
 func (s *SendSequence) returnSendItem(item *sendItem) {
+	if item.immediateCounted {
+		if s.immediateSendCount <= 0 {
+			panic("immediate send count released twice")
+		}
+		item.immediateCounted = false
+		s.immediateSendCount--
+	}
 	s.forgetFifoRepairItem(item)
 	var ledger *TransferPayloadOwnerLedger
 	var bytes int64

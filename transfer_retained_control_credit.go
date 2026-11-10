@@ -1,5 +1,5 @@
-// Retained controls borrow existing transfer permission without owning a queue.
-// The legacy queue keeps its historical one-item/approximate admission semantics.
+// Pure protocol cache state owns detached lifetime tokens. DATA backing keeps
+// the existing retained permission and legacy queue admission semantics.
 package connect
 
 import (
@@ -24,6 +24,7 @@ type transferRetainedControlCredit struct {
 	wake      chan struct{}
 	byteCount ByteCount
 	released  atomic.Bool
+	noBudget  bool
 }
 
 // Use the existing conservative backing-class envelope for both allocations.
@@ -38,11 +39,21 @@ func transferRetainedControlCreditByteCount() ByteCount {
 	return addReceiveQueueByteCount(owners, retainedMessageCapacity(0))
 }
 
-// Admission is zero-wait and never uses a queue floor or empty-item exception.
-// Caller bytes already include its copied packet and complete retained owner.
-func (self *SendSequence) reserveRetainedControlMemory(requiredBytes ByteCount) (*transferRetainedControlCredit, bool) {
+// The caller classifies the complete original before taking custody. Pure
+// protocol cache/readiness state has one bounded owner per existing flow and
+// takes only a detached lifetime token. DATA, including a payload-bearing SYN,
+// keeps its existing complete backing charge and ordinary queue permission.
+func (self *SendSequence) reserveRetainedControlMemory(requiredBytes ByteCount, noBudget ...bool) (*transferRetainedControlCredit, bool) {
 	if self == nil || self.ctx == nil || self.ctx.Err() != nil || self.resendQueue == nil || requiredBytes <= 0 {
 		return nil, false
+	}
+	if len(noBudget) != 0 && noBudget[0] {
+		self.resendQueue.stateLock.Lock()
+		defer self.resendQueue.stateLock.Unlock()
+		if self.resendQueue.retainedControlClosed || self.ctx.Err() != nil {
+			return nil, false
+		}
+		return &transferRetainedControlCredit{wake: self.retainedAdmissionWake, noBudget: true}, true
 	}
 	overhead := transferRetainedControlCreditByteCount()
 	total := addReceiveQueueByteCount(requiredBytes, overhead)

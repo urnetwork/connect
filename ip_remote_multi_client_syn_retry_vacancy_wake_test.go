@@ -46,11 +46,14 @@ func nativeSynRetryVacancyReopens(t *testing.T, gate string, retire string) {
 		}
 
 		path := privateCrossWindowFlow(4, 71, 48371)
-		if !privateCrossWindowNativeSyn(harness, path) || harness.boundTo(path) != first {
+		if !privateNativeDataSyn(t, harness, path, reraceSendTimeout) || harness.boundTo(path) != first {
 			t.Fatal("original native source did not acquire the preferred owner")
 		}
 		update := harness.update(path)
 		owner := synRetryControlOwner(t, update)
+		if owner.credit.noBudget || protocolClassPureTcpControl(owner.packet) {
+			t.Fatal("DATA-credit readiness fixture retained a protocol-only SYN")
+		}
 		original := bytes.Clone(owner.packet)
 		harness.exit("first").sendTo(first.ClientId(), reraceProviderSignal(t, path))
 		harness.settle()
@@ -150,7 +153,7 @@ func nativeSynRetryVacancyReopens(t *testing.T, gate string, retire string) {
 		}
 		nativeResult := make(chan bool, 1)
 		go func() {
-			packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, nil))
+			packet := MessagePoolCopy(original)
 			accepted := [1]bool{}
 			count := harness.multiClient.SendNativePacketBatchWithResults(harness.source, protocol.ProvideMode_Network, [][]byte{packet}, 0, accepted[:])
 			nativeResult <- count == 1 && accepted[0]

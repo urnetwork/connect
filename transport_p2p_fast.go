@@ -21,8 +21,6 @@ const (
 	p2pFastPathMaximumFragmentCount     = 64
 	p2pFastPathReassemblySlotCount      = 64
 	p2pFastPathReassemblyTimeout        = 2 * time.Second
-	p2pFastPathWarmupInterval           = 25 * time.Millisecond
-	p2pFastPathWarmupTimeout            = 5 * time.Second
 	p2pFastPathRtpClockRate             = 90000
 	p2pFastPathRtpPayloadType           = 127
 	// The unchanged codec name lets mixed-version peers establish WebRTC and

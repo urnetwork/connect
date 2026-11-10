@@ -119,7 +119,16 @@ func newNativeDuplicateAckFixture(t *testing.T, loss bool, returnFlightPacketCou
 	return newNativeDuplicateAckFixtureWithWindow(t, loss, 4096, returnFlightPacketCount...)
 }
 
+// Optional provider policy belongs to fixture construction, never a live budget mutation.
+func newNativeDuplicateAckFixtureWithProviderSettings(t *testing.T, providerSettings *RemoteUserNatProviderSettings) *nativeDuplicateAckFixture {
+	return newNativeDuplicateAckFixtureConfigured(t, false, 4096, providerSettings)
+}
+
 func newNativeDuplicateAckFixtureWithWindow(t *testing.T, loss bool, window uint16, returnFlightPacketCount ...int) *nativeDuplicateAckFixture {
+	return newNativeDuplicateAckFixtureConfigured(t, loss, window, nil, returnFlightPacketCount...)
+}
+
+func newNativeDuplicateAckFixtureConfigured(t *testing.T, loss bool, window uint16, providerSettings *RemoteUserNatProviderSettings, returnFlightPacketCount ...int) *nativeDuplicateAckFixture {
 	t.Helper()
 	if len(returnFlightPacketCount) > 1 {
 		t.Fatal("native recovery fixture accepts at most one explicit flight bound")
@@ -186,7 +195,9 @@ func newNativeDuplicateAckFixtureWithWindow(t *testing.T, loss bool, window uint
 		return local, nil
 	}}
 	f.nat = NewLocalUserNat(ctx, "native duplicate ACK recovery", natSettings)
-	providerSettings := DefaultRemoteUserNatProviderSettings()
+	if providerSettings == nil {
+		providerSettings = DefaultRemoteUserNatProviderSettings()
+	}
 	providerSettings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
 	f.provider = NewRemoteUserNatProvider(f.receiver, f.nat, providerSettings)
 	multiSettings := DefaultMultiClientSettings()

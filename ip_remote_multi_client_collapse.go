@@ -52,6 +52,11 @@ func (self *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChann
 // Carries the synchronous native refusal receipt through the final lease gate.
 func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multiClientChannelUpdate, batchAdmission *ipPacketGroupAdmission, parents ...*RemoteUserNatMultiClient) bool {
 	update.stateLock.Lock()
+	if batchAdmission != nil && batchAdmission.expectedUpdate != nil &&
+		(batchAdmission.expectedUpdate != update || batchAdmission.expectedEpoch != update.sequenceAdmissionEpoch || update.IsDone()) {
+		update.stateLock.Unlock()
+		return false
+	}
 	if len(parents) != 0 {
 		if hook := parents[0].beforeSequenceParentWriteForTest; hook != nil {
 			hook(update)

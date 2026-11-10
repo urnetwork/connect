@@ -122,6 +122,8 @@ func TestNativeSynMetadataRefreshKeepsIdentityAndControlFences(t *testing.T) {
 
 // The second actual Pack owns its charge before optional successor admission
 // sees no spare capacity. Keeping the paid old image never invents latest bytes.
+// An early-data SYN is DATA-funded; pure protocol-only SYN metadata is
+// intentionally exempt from byte credit and cannot prove this denial premise.
 func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
@@ -151,7 +153,7 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 						continue
 					}
 					packet, err := ipPacketToProviderBytes(frame)
-					if err != nil || len(packet) != 52 || binary.BigEndian.Uint32(packet[44:48]) != 102 {
+					if err != nil || len(packet) != 53 || binary.BigEndian.Uint32(packet[44:48]) != 102 {
 						continue
 					}
 					if source.resendQueue.Budget() != budget {
@@ -166,7 +168,7 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 		}
 		options := &synPublicationPacketOptions{
 			packet: func(path *IpPath, ordinal int) []byte {
-				return synMetadataTestPacket(path, uint32(100+ordinal), uint16(200+ordinal), nil)
+				return synMetadataTestPacket(path, uint32(100+ordinal), uint16(200+ordinal), []byte("x"))
 			},
 			beforeRetry: func(f *synPublicationTestFixture) {
 				original, credit = f.owner, f.owner.credit
@@ -178,7 +180,7 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 								continue
 							}
 							packet, err := ipPacketToProviderBytes(frame)
-							if err == nil && len(packet) == 52 && binary.BigEndian.Uint32(packet[44:48]) == 102 {
+							if err == nil && len(packet) == 53 && binary.BigEndian.Uint32(packet[44:48]) == 102 {
 								wire <- bytes.Clone(packet)
 							}
 						}
@@ -195,7 +197,7 @@ func TestNativeSynMetadataRefreshExactBudgetKeepsPaidHistory(t *testing.T) {
 					t.Fatal("unfunded metadata successor lost or mutated the old paid cache/history, or hid ordinary wire progress")
 				}
 				for len(wire) != 0 {
-					if !bytes.Equal(<-wire, synMetadataTestPacket(f.path, 102, 202, nil)) {
+					if !bytes.Equal(<-wire, synMetadataTestPacket(f.path, 102, 202, []byte("x"))) {
 						t.Fatal("ordinary native retry sent different wire bytes")
 					}
 				}

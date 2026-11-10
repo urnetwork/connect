@@ -27,7 +27,8 @@ func h1FullHeadEnvelopeByteCount(frameWireByteCount int, contractByteCount int, 
 	path := TransferPath{SourceId: Id{1}, DestinationId: Id{2}}
 	contractId := Id{3}
 	pack := sendPackFrame{
-		path: path, sequenceNumber: ^uint64(0), head: true, nack: true,
+		deliverImmediately: true,
+		path:               path, sequenceNumber: ^uint64(0), head: true, nack: true,
 		tagSendTime: ^uint64(0), contractId: &contractId,
 		forceStream: true, companionContract: true, logicalLane: 8,
 		contractAhead: true,

@@ -14,7 +14,7 @@ import (
 
 // Both actual providers refuse the original SYN. A later source generation
 // can make both silent, so no new refusal depends on provider selection order.
-func newSynRetryRemoteRefusalFixture(t *testing.T, laterSilent *atomic.Bool) (*reraceHarness, *IpPath, *multiClientChannelUpdate) {
+func newSynRetryRemoteRefusalFixture(t *testing.T, laterSilent *atomic.Bool, applicationData ...bool) (*reraceHarness, *IpPath, *multiClientChannelUpdate) {
 	t.Helper()
 	h := newReraceHarness(t, []reraceExitSpec{
 		{name: "refused-first", tier: 0, answer: func(*IpPath) reraceAnswer {
@@ -42,7 +42,14 @@ func newSynRetryRemoteRefusalFixture(t *testing.T, laterSilent *atomic.Bool) (*r
 		t.Fatal("COMMON_REMOTE_FIXTURE_ACQUISITION_NOT_FINISHED: the exact two-provider initial pass must complete before a retirement edge")
 	}
 	path := unboundFlowTcpPath(52991)
-	if !privateCrossWindowNativeSyn(h, path) {
+	accepted := false
+	if len(applicationData) != 0 && applicationData[0] {
+		packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+		accepted = synRetryControlOffer(t, h, packet)
+	} else {
+		accepted = privateCrossWindowNativeSyn(h, path)
+	}
+	if !accepted {
 		t.Fatal("original native source was not admitted")
 	}
 	update := h.update(path)
@@ -88,13 +95,13 @@ func TestSynRetryRemoteRefusalSurvivesLocalChannelRetirement(t *testing.T) {
 	})
 }
 
-// The backing and slice descriptor are charged before construction, and a
+// For a DATA-bearing SYN, backing and the descriptor are charged before construction, and a
 // terminal source returns the backing together with the exact credit owner.
 func TestSynRetryRemoteRefusalBackingIsPaidAndReleased(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		h, _, update := newSynRetryRemoteRefusalFixture(t, nil)
+		h, _, update := newSynRetryRemoteRefusalFixture(t, nil, true)
 		owner := synRetryControlOwner(t, update)
 		capacity := synRetryRemoteTailCapacity(h.multiClient, update)
 		metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{})) + ByteCount(len(owner.pin.appId))
@@ -103,7 +110,7 @@ func TestSynRetryRemoteRefusalBackingIsPaidAndReleased(t *testing.T) {
 		wanted := addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(owner.packet))), metadata)
 		wanted = addReceiveQueueByteCount(wanted, transferRetainedControlCreditByteCount())
 		credit := owner.credit
-		if cap(owner.refusedRemoteIds) != capacity || credit.byteCount != wanted || credit.released.Load() {
+		if protocolClassPureTcpControl(owner.packet) || credit.noBudget || cap(owner.refusedRemoteIds) != capacity || credit.byteCount != wanted || credit.released.Load() {
 			t.Fatalf("SYN_RETRY_REMOTE_BACKING_UNPAID: capacity=%d credit=%d wanted=%d", cap(owner.refusedRemoteIds), credit.byteCount, wanted)
 		}
 		update.Close()
@@ -265,7 +272,7 @@ func TestSynRetryRemoteRefusalBackingRejectsOneByteShortParent(t *testing.T) {
 		// Enable the existing cache path on this real selected-source fixture;
 		// no reaper work or materialization token is fabricated by the test.
 		f.parent.flowReaperDone = make(chan struct{})
-		first := groupDispositionControlPacket(1000, 0, 64, tcpFlagSyn)
+		first := groupRecoveryPacket(1000, 0, 64, tcpFlagSyn, []byte{0x64})
 		if f.offer(first) != 1 {
 			t.Fatal("short-cache source lacked actual packet admission")
 		}
@@ -289,7 +296,7 @@ func TestSynRetryRemoteRefusalBackingRejectsOneByteShortParent(t *testing.T) {
 		root.SetTotalByteCount(kib(64))
 		budget.SetTotalByteCount(kib(64))
 		synctest.Wait()
-		next := groupDispositionControlPacket(1001, 0, 64, tcpFlagSyn)
+		next := groupRecoveryPacket(1001, 0, 64, tcpFlagSyn, []byte{0x64})
 		if f.offer(next) != 1 {
 			t.Fatal("exact-cache source lacked actual packet admission")
 		}

@@ -909,7 +909,9 @@ func defaultWebRtcSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *Web
 		// ICE/DTLS/SRTP association. Transfer frames sent on that lane avoid
 		// SCTP's duplicate reliability and head-of-line behavior; an older peer
 		// simply omits the codec and continues on the data channel.
-		EnableDatagramFastPath: true,
+		EnableDatagramFastPath:         true,
+		DatagramFastPathWarmupInterval: 25 * time.Millisecond,
+		DatagramFastPathWarmupTimeout:  5 * time.Second,
 		// At one gigabit, a 64-message queue covers only about 1.5 ms of
 		// ordinary two-packet Transfer messages. That made a normal scheduler
 		// turn or short GC pause look like network loss on the device receive
@@ -1018,6 +1020,13 @@ type WebRtcSettings struct {
 	// (net.core.rmem_max/wmem_max on Linux). Zero keeps the kernel default.
 	UdpSocketBufferByteCount          int
 	DatagramFastPathReceiveBufferSize int
+	// DatagramFastPathWarmupInterval spaces readiness probes; non-positive
+	// disables probes. The default tolerates brief setup loss without an idle
+	// data-plane heartbeat. Replies remain available until peer cancellation.
+	DatagramFastPathWarmupInterval time.Duration
+	// DatagramFastPathWarmupTimeout bounds periodic readiness probes; non-positive
+	// disables probes. The default gives ICE/DTLS/SRTP setup five seconds.
+	DatagramFastPathWarmupTimeout time.Duration
 	// DatagramFastPathWriteQueueSize bounds the native WebRTC socket's copied
 	// userspace send buffer. A full queue blocks the carrier writer, preserving
 	// backpressure instead of dropping before the kernel socket.

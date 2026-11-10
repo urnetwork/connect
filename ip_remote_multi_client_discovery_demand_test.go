@@ -495,6 +495,19 @@ func discoveryDemandTestEarlierTime(first, second time.Time) time.Time {
 // A full strict quality window keeps four established siblings and one idle
 // slot. Only the new navigation's exact service fails on its original exits.
 func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.T) {
+	testDiscoveryDemandFullWindowPublicationOrder(t, false)
+}
+
+// The retained source may establish before an unchanged native offer passes
+// its gate. That earlier success must keep its exact duplicate suppression.
+func TestDiscoveryDemandFullWindowRetainedPublicationWinsBeforeNativeSyn(t *testing.T) {
+	testDiscoveryDemandFullWindowPublicationOrder(t, true)
+}
+
+// Real API, dispatch and response barriers choose each winner while keeping
+// the full strict window, four carrying siblings and original paid generation.
+func testDiscoveryDemandFullWindowPublicationOrder(t *testing.T, automaticFirst bool) {
+	t.Helper()
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -535,20 +548,106 @@ func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.
 		if refused != 5 || inbound || bound != nil || h.metrics().DialFailuresIntercepted != 5 {
 			t.Fatalf("full-window control did not observe five actual same-service refusals: failed=%d intercepted=%d", refused, h.metrics().DialFailuresIntercepted)
 		}
-		discoveryDemandServiceRefreshOwner(t, window, update)
+		originalOwner := discoveryDemandServiceRefreshOwner(t, window, update)
+		originalSerial, originalCredit := originalOwner.serial, originalOwner.credit
+		publicationBound := start.Add(reraceSynSchedule[2])
+		dispatchEntered, dispatchRelease, answeredEvent := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce, answeredOnce sync.Once
+		var dispatchVisits, retainedGateVisits, sourceGateVisits atomic.Uint32
+		var dispatchOwnerValid, retainedOwnerValid atomic.Bool
+		releaseDispatch := func() { releaseOnce.Do(func() { close(dispatchRelease) }) }
+		t.Cleanup(releaseDispatch)
+		h.multiClient.beforeSynRetryDispatchForTest = func(current *multiClientChannelUpdate) {
+			if current != update {
+				return
+			}
+			current.stateLock.Lock()
+			valid := current.synRetry == originalOwner && originalOwner.update == current && originalOwner.serial == originalSerial &&
+				originalOwner.credit == originalCredit && originalOwner.packet != nil && originalOwner.sequence == path.SequenceNumber &&
+				!originalOwner.queued && originalOwner.validWithLock(current)
+			current.stateLock.Unlock()
+			dispatchOwnerValid.Store(valid)
+			dispatchVisits.Add(1)
+			enteredOnce.Do(func() { close(dispatchEntered) })
+			select {
+			case <-dispatchRelease:
+			case <-h.multiClient.ctx.Done():
+			}
+		}
+		h.multiClient.SetReceivePacketCallback(discoveryDemandPublicationReceiveObserver(h.receive, func(reply *IpPath, packet []byte) {
+			if reply == nil || !(reraceSameFlow(reply, path) || reraceSameFlow(reply, path.Reverse())) {
+				return
+			}
+			if parsed, err := ParseIpPath(packet); err == nil && parsed.Syn && parsed.Ack && parsed.AckSequenceNumber == path.SequenceNumber+1 {
+				answeredOnce.Do(func() { close(answeredEvent) })
+			}
+		}))
+		generator.mutex.Lock()
+		generator.holdNextAvailable = true
+		generator.mutex.Unlock()
+		h.multiClient.beforePacketGroupGateForTest = func(current *multiClientChannelUpdate, snapshot *multiClientChannel, group *parsedPacketGroup) {
+			if current != update || !reraceSameFlow(group.ipPath, path) {
+				return
+			}
+			if group.isSynRetry() {
+				retainedOwnerValid.Store(group.synRetry.update == update && group.synRetry.serial == originalSerial &&
+					group.synRetry.source == h.source && group.ipPath.SequenceNumber == path.SequenceNumber)
+				retainedGateVisits.Add(1)
+				return
+			}
+			if sourceGateVisits.Add(1) != 1 {
+				return
+			}
+			if snapshot != nil || !group.ipPath.Syn || group.ipPath.Ack || group.synRetry == nil ||
+				group.synRetry.update != update || group.synRetry.nativeOwnerSerial != originalSerial || group.ipPath.SequenceNumber != path.SequenceNumber {
+				t.Fatal("full-window publication gate lost the unchanged native source and exact retained owner")
+			}
+			if !discoveryDemandTestAwaitPublication(t, generator.availableEntered, publicationBound) {
+				t.Fatal("full-window demand did not reach its real available API response")
+			}
+			close(generator.availableRelease)
+			if !discoveryDemandTestAwaitPublication(t, publication, publicationBound) || !time.Now().Before(publicationBound) ||
+				!discoveryDemandTestAwaitPublication(t, dispatchEntered, publicationBound) {
+				t.Fatal("full-window demand did not publish and dispatch before the original next native SYN")
+			}
+			synctest.Wait()
+			window.stateLock.Lock()
+			finished := window.serviceRefreshOwner == nil && window.discoveryDemand.owner == nil && len(window.clients) == 5
+			window.stateLock.Unlock()
+			update.stateLock.Lock()
+			held := update.synRetry == originalOwner && originalOwner.references == 2 && originalOwner.validWithLock(update) &&
+				update.client.Load() == nil && !update.receivedInbound.Load()
+			update.stateLock.Unlock()
+			if !finished || !held || !dispatchOwnerValid.Load() || dispatchVisits.Load() != 1 || originalCredit.released.Load() ||
+				retainedGateVisits.Load() != 0 || len(h.exit("late").syns(path)) != 0 {
+				t.Fatal("full-window publication did not leave exactly cache and held dispatcher ownership")
+			}
+			if automaticFirst {
+				releaseDispatch()
+				if !discoveryDemandTestAwaitPublication(t, answeredEvent, publicationBound) {
+					t.Fatal("full-window retained source did not deliver its actual SYN-ACK before native selection")
+				}
+				synctest.Wait()
+				if h.update(path) != update || h.boundTo(path) != h.channel("late") || !update.receivedInbound.Load() ||
+					len(h.exit("late").syns(path)) != 1 || retainedGateVisits.Load() != 1 || !retainedOwnerValid.Load() {
+					t.Fatal("full-window retained winner lost the original source, physical SYN or response ownership")
+				}
+			}
+		}
 		// Physical availability follows the real refusals. It sends no generator
 		// notification, changes no timer, and creates no discovery identity.
 		h.addExit(reraceExitSpec{name: "late"})
 		h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
-		if !privateCrossWindowNativeSyn(h, path) {
-			t.Fatal("unchanged native retransmission was not source-admitted")
+		collapseBefore := h.multiClient.TcpCollapseDropCount()
+		accepted := privateCrossWindowNativeSyn(h, path)
+		if accepted != !automaticFirst {
+			t.Fatalf("full-window winner admission mismatch: automatic_first=%t accepted=%t", automaticFirst, accepted)
 		}
 		// Use the next unchanged source retransmission boundary. Virtual time
 		// advances only after the real enumerator and packet workers are idle.
-		published := discoveryDemandTestAwaitPublication(t, publication, start.Add(reraceSynSchedule[2]))
+		published := discoveryDemandTestAwaitPublication(t, publication, publicationBound)
 		synctest.Wait()
 		reads, _, mints, _ := generator.counts()
-		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
 		window.stateLock.Lock()
 		installed := len(window.clients)
 		window.stateLock.Unlock()
@@ -562,16 +661,44 @@ func TestDiscoveryDemandFullWindowServiceExhaustionFindsLateProvider(t *testing.
 		if late.IsDone() || late.isWarning() || installed != 5 {
 			t.Fatal("bounded full-window recovery did not publish one healthy late owner at the existing ceiling")
 		}
-		// This control isolates discovery/admission. The separately named
-		// publication control checks retry without a later native source offer.
-		if _, answered := h.synAck(path); !answered {
-			if !privateCrossWindowNativeSyn(h, path) {
-				t.Fatal("original next native SYN was not admitted to its published alternative")
-			}
-		}
 		if _, answered := h.synAck(path); !answered || h.boundTo(path) != late || h.update(path) != update {
 			t.Fatal("published alternative did not establish the unchanged navigation generation")
 		}
+		wantedCollapse, wantedRetainedVisits := uint64(0), uint32(0)
+		if automaticFirst {
+			wantedCollapse, wantedRetainedVisits = 1, 1
+		} else {
+			update.stateLock.Lock()
+			held := update.synRetry == nil && originalOwner.update == update && originalOwner.references == 1
+			update.stateLock.Unlock()
+			if !held || originalCredit.released.Load() {
+				t.Fatal("full-window native winner lost its held dispatch reference or released credit early")
+			}
+		}
+		if h.multiClient.TcpCollapseDropCount() != collapseBefore+wantedCollapse || sourceGateVisits.Load() != 1 ||
+			retainedGateVisits.Load() != wantedRetainedVisits || len(h.exit("late").syns(path)) != 1 {
+			t.Fatal("full-window winner changed exact duplicate suppression or sent duplicate retained bytes")
+		}
+		releaseDispatch()
+		h.settle()
+		synRetryControlReleased(t, originalOwner)
+		if !originalCredit.released.Load() || !originalOwner.publicationRetired.Load() || originalOwner.publicationIndexed ||
+			dispatchVisits.Load() != 1 || retainedGateVisits.Load() != wantedRetainedVisits {
+			t.Fatal("full-window publication retained paid cache, dispatch or index ownership")
+		}
+		wire := h.exit("late").syns(path)
+		reply, answered := h.synAck(path)
+		parsed, err := ParseIpPath(reply.packet)
+		if !answered || err != nil || parsed.AckSequenceNumber != path.SequenceNumber+1 || len(wire) != 1 || wire[0].path.SequenceNumber != path.SequenceNumber {
+			t.Fatal("full-window publication changed the original native SYN or SYN-ACK generation")
+		}
+		h.sleep(start.Add(reraceSynSchedule[2]).Sub(time.Now()))
+		if privateCrossWindowNativeSyn(h, path) || h.multiClient.TcpCollapseDropCount() != collapseBefore+wantedCollapse+1 ||
+			len(h.exit("late").syns(path)) != 1 || h.boundTo(path) != late {
+			t.Fatal("full-window established source lost exact duplicate suppression")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
+		t.Logf("full-window publication: automatic_first=%t native_accepted=%t source_gate_visits=%d retained_gate_visits=%d collapse_delta=%d late_syns=%d reads=%d mints=%d installed=%d credit_released=%t", automaticFirst, accepted, sourceGateVisits.Load(), retainedGateVisits.Load(), h.multiClient.TcpCollapseDropCount()-collapseBefore, len(h.exit("late").syns(path)), reads-beforeReads, mints-beforeMints, installed, originalCredit.released.Load())
 		reraceAssertNoErrorDelivered(t, h, path)
 	})
 }

@@ -55,9 +55,10 @@ func checkNativeMixedAckAllocationCapacity(t *testing.T, mode string) {
 		packets := make([][]byte, len(templates))
 		membership := make([]bool, len(templates))
 		for index := range templates {
-			// Distinct controls make the decoded prefix identify exact original
-			// indices even though every member is a pure acknowledgement.
-			templates[index] = groupRecoveryPacket(100, 500, uint16(64+index), tcpFlagAck, nil)
+			// Distinct fresh DATA retains the original capacity premise. Pure
+			// acknowledgements have separate NoBudget lifetime controls.
+			templates[index] = groupRecoveryPacket(100+uint32(4*index), 500, uint16(64+index), tcpFlagAck,
+				[]byte{byte(index), 1, 2, 3})
 			packets[index] = MessagePoolCopy(templates[index])
 			fixture.witnesses = append(fixture.witnesses, MessagePoolShareReadOnly(packets[index]))
 		}
@@ -171,7 +172,7 @@ func checkNativeMixedAckAllocationCapacity(t *testing.T, mode string) {
 			}
 			// Age only the real classifier's now argument. The source and its
 			// timers remain at the original fake time; no receive or connect
-			// attempt can supply another verdict in this pure-ACK fixture.
+			// attempt can supply another verdict in this held-peer fixture.
 			noAckBar := time.Second
 			future := lastAck.Add(2 * noAckBar)
 			reason, held := blackholeReasonFromStats(future, stats, noAckBar, 0, 0, blackholeGates{})

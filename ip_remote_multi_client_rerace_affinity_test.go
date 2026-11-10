@@ -22,7 +22,16 @@ func reraceHealthySibling(t *testing.T, harness *reraceHarness, version int) *Ip
 		t.Fatal("healthy sibling SYN was not admitted")
 	}
 	if _, ok := harness.synAck(path); !ok || harness.boundTo(path) != a {
-		t.Fatal("healthy sibling did not establish on A")
+		actualSyns := map[string]int{}
+		bound := "none"
+		selected := harness.boundTo(path)
+		for _, exit := range harness.generator.exitList() {
+			actualSyns[exit.name] = len(exit.syns(path))
+			if selected != nil && selected.Destination() == exit.destination {
+				bound = exit.name
+			}
+		}
+		t.Fatalf("healthy sibling did not establish on A: actual_syn_ack=%t bound=%s provider_syns=%v app_packets=%d", ok, bound, actualSyns, len(harness.delivered(path)))
 	}
 	payload := []byte("health")
 	for index := range 4 {

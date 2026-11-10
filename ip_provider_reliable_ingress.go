@@ -80,6 +80,18 @@ func reliableFrameControl(frame *protocol.Frame) bool {
 // Decodes one frame under transient workspace. Waiting means no workspace
 // can be had now but some can later; the frame is untouched.
 func (self *RemoteUserNatProvider) receiveReliableFrame(source TransferPath, frame *protocol.Frame, peer Peer) receiveDeliveryAttempt {
+	if natProtocolOnlyFrames([]*protocol.Frame{frame}) {
+		if self.memoryOperations != nil && !self.memoryOperations.start() {
+			return receiveDeliveryRejected
+		}
+		if self.memoryOperations != nil {
+			defer self.memoryOperations.finish()
+		}
+		if self.clientReceiveAdmitted(source, []*protocol.Frame{frame}, peer) {
+			return receiveDeliverySecured
+		}
+		return receiveDeliveryRejected
+	}
 	bytes := providerFrameOperationBytes([]*protocol.Frame{frame})
 	memory, admitted := self.startMemoryOperation(bytes)
 	if !admitted {
@@ -207,11 +219,9 @@ func (owner *providerReliablePacket) enterNat() receiveDeliveryAttempt {
 		return receiveDeliveryRejected
 	}
 	nat := owner.provider.localUserNat
-	if owner.memory.budget == nil && nat.settings.MemoryBudget != nil {
+	protocolOnly := protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, owner.packet)
+	if !protocolOnly && owner.memory.budget == nil && nat.settings.MemoryBudget != nil {
 		budget := nat.settings.MemoryBudget
-		if smallNatControlPacket(owner.packet) {
-			budget = nat.controlMemory
-		}
 		bytes := ByteCount(320) + natPacketMemoryByteCount(owner.packet)
 		if budget == nil || budget.TotalByteCount() < bytes {
 			return receiveDeliveryRejected
@@ -291,11 +301,13 @@ func (owner *providerReliablePacket) enterTcp(tcp4 *Tcp4Buffer, tcp6 *Tcp6Buffer
 			return tcp6.sendTransferKeyWithOwner(owner.source, owner.peer.TransferKey, owner.peer.ProvideMode, &tcp, 0, owner.packet, &owner.credit, owner)
 		}
 	}
-	var valid bool
-	owner.credit, valid = owner.memory.split(natPacketMemoryByteCount(packet))
-	if !valid {
-		owner.operation.complete(false)
-		return
+	if !protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, packet) {
+		var valid bool
+		owner.credit, valid = owner.memory.split(natPacketMemoryByteCount(packet))
+		if !valid {
+			owner.operation.complete(false)
+			return
+		}
 	}
 	finalAttempt := func() receiveDeliveryAttempt {
 		if !owner.alive() {

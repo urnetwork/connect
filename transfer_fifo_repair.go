@@ -1,13 +1,14 @@
-// Exact repaired-prefix acknowledgements can disprove queue residence for
-// one successor without changing recovery clocks or growing retained items.
+// An exact repaired-prefix acknowledgement proves passage of a captured
+// retained cohort. Each later cumulative advance exposes at most one repair.
 package connect
 
 import "time"
 
-// Only the send worker owns these scalar records. A pending promoted envelope
-// and an accepted successor are independent: a failed later promotion cannot
-// erase an already accepted proof. Neither record retains a pooled item.
+// Only the send worker owns these scalar records and the two item flags. A
+// pending promoted envelope cannot erase an already accepted cohort. Neither
+// record retains a pooled item; all membership stays on existing paid owners.
 type fifoRepairState struct {
+	maxItems             int
 	generation           uint64
 	generationStartNanos int64
 	pending              fifoRepairFence
@@ -15,7 +16,7 @@ type fifoRepairState struct {
 }
 
 // The creation fence belongs to this exact tag, including repeated writes of
-// that envelope. A later successful write of the named successor cancels it.
+// that envelope. Later successful copies leave their captured cohort.
 type fifoRepairFence struct {
 	prefixMessageId Id
 	nextMessageId   Id
@@ -29,8 +30,8 @@ type fifoRepairFence struct {
 	successful      bool
 }
 
-// An accepted proof lasts only until this exact head is delivered, written
-// again, or loses its unchanged FIFO generation.
+// The exact head marker is consumed by its next successful write or delivery.
+// The route remains while other accepted owners await cumulative advancement.
 type fifoPassedHead struct {
 	messageId Id
 	number    uint64
@@ -38,10 +39,28 @@ type fifoPassedHead struct {
 	set       bool
 }
 
+// Captured owners cannot move out of this prefix: the worker only appends new
+// originals and retires older positions. This also bounds flag clearing after
+// generation changes, including a queue containing arbitrarily many NoBudget
+// originals. The settings object is immutable for the worker's lifetime.
+func (self *SendSequence) fifoRepairItems() []*sendItem {
+	if self.fifoRepair.maxItems == 0 {
+		// Production snapshots this before publication. Inert worker fixtures
+		// initialize lazily under the same exclusive worker ownership.
+		self.fifoRepair.maxItems = max(2, self.sendBufferSettings.FifoRepairMaxItems)
+	}
+	return self.sendItems[:min(len(self.sendItems), self.fifoRepair.maxItems)]
+}
+
 // A route channel can be reused by another FIFO. Originals older than this
 // conservative monotonic epoch floor cannot establish physical order in it.
 func (self *SendSequence) resetFifoRepairGeneration(generation uint64) {
-	self.fifoRepair = fifoRepairState{generation: generation}
+	for _, item := range self.fifoRepairItems() {
+		if item != nil {
+			item.fifoRepairPending, item.fifoRepairAccepted = false, false
+		}
+	}
+	self.fifoRepair = fifoRepairState{generation: generation, maxItems: self.fifoRepair.maxItems}
 	if self.client != nil && !self.client.feedbackTimeBase.IsZero() {
 		self.fifoRepair.generationStartNanos = self.client.feedbackArrivalNanos(time.Now())
 	}
@@ -65,10 +84,16 @@ func fifoRepairItemOnRoute(item *sendItem, route Route) bool {
 		!item.hybridReliableCarrierObserved && !item.carrierChanged
 }
 
-// Capture only the current head's new promoted envelope and its exact next
-// retained item. Tag order distinguishes the original envelope; physical
-// order uses the client's monotonic clock, never the tag's wall-clock value.
+// Capture only a current head's distinct promoted envelope. The immediate
+// successor establishes the existing conservative route premise; other paid
+// originals already written on that route join the same cohort. Initial-write
+// time establishes the lower bound, while per-owner flags reject later copies.
 func (self *SendSequence) prepareFifoRepair(item *sendItem, original, promoted sequenceTag, forceFullContract bool) {
+	for _, retained := range self.fifoRepairItems() {
+		if retained != nil {
+			retained.fifoRepairPending = false
+		}
+	}
 	self.fifoRepair.pending = fifoRepairFence{}
 	if forceFullContract || item.head || !original.set || original.sendTime == 0 ||
 		!promoted.set || promoted.sendTime <= original.sendTime || len(self.sendItems) < 2 || self.sendItems[0] != item {
@@ -85,10 +110,23 @@ func (self *SendSequence) prepareFifoRepair(item *sendItem, original, promoted s
 	confirmed := func() bool {
 		self.resendQueue.stateLock.Lock()
 		defer self.resendQueue.stateLock.Unlock()
-		// Earlier copies make RTT sampling ambiguous, but precede this
-		// owner-created fence. Every later successful copy invalidates it.
-		return self.resendQueue.messageIdItems[next.messageId] == next && next.rttH1 &&
-			self.fifoRepair.generationStartNanos <= next.pacingSentAtNanos && next.pacingSentAtNanos < createdNanos
+		if self.resendQueue.messageIdItems[next.messageId] != next ||
+			self.resendQueue.sequenceNumberItems[next.sequenceNumber] != next || !next.rttH1 ||
+			next.pacingSentAtNanos < self.fifoRepair.generationStartNanos || createdNanos <= next.pacingSentAtNanos {
+			return false
+		}
+		for _, retained := range self.fifoRepairItems()[1:] {
+			// Expansion covers DATA only. The original immediate-successor
+			// proof retains its prior protocol compatibility boundary.
+			if retained != nil && (retained == next || !retained.noBudget) && fifoRepairItemOnRoute(retained, item.carrierRoute) &&
+				!retained.selectiveAcked && !retained.deliveryObserved && retained.recoveryKind == sendRecoveryNone &&
+				retained.sequenceNumber > item.sequenceNumber && self.resendQueue.messageIdItems[retained.messageId] == retained &&
+				self.resendQueue.sequenceNumberItems[retained.sequenceNumber] == retained && retained.rttH1 &&
+				self.fifoRepair.generationStartNanos <= retained.pacingSentAtNanos && retained.pacingSentAtNanos < createdNanos {
+				retained.fifoRepairPending = true
+			}
+		}
+		return true
 	}()
 	if !confirmed {
 		return
@@ -105,11 +143,9 @@ func (self *SendSequence) prepareFifoRepair(item *sendItem, original, promoted s
 // copies also pass here even when their ordinary send counter stays unchanged.
 func (self *SendSequence) observeFifoRepairWrite(item *sendItem, disposition transferWriteDisposition) {
 	state := &self.fifoRepair
+	item.fifoRepairPending, item.fifoRepairAccepted = false, false
 	if state.passed.set && state.passed.messageId == item.messageId && state.passed.number == item.sequenceNumber {
-		state.passed = fifoPassedHead{}
-	}
-	if state.pending.set && state.pending.nextMessageId == item.messageId && state.pending.nextNumber == item.sequenceNumber {
-		state.pending = fifoRepairFence{}
+		state.passed = fifoPassedHead{route: state.passed.route}
 	}
 	if !state.pending.set || state.pending.prefixMessageId != item.messageId || state.pending.prefixNumber != item.sequenceNumber {
 		return
@@ -140,22 +176,54 @@ func (self *SendSequence) acknowledgedFifoRepair(item *sendItem, tag sequenceTag
 	return proof
 }
 
-// Accept only the captured successor after prefix retirement. Untouched RTOs
-// keep their clock; only a future queue-residence deferral is already disproved.
+// Accept a cohort only from the exact explicitly acknowledged promoted copy.
+// Later cumulative advances create no evidence: they expose at most one owner
+// already marked by that proof. Proven absence also supersedes an untouched
+// initial deadline, while all existing lifetime and physical service gates stay.
 func (self *SendSequence) applyFifoRepair(proof fifoRepairFence, at time.Time) {
-	if !proof.set || len(self.sendItems) == 0 {
+	if len(self.sendItems) == 0 {
+		self.fifoRepair.passed = fifoPassedHead{}
 		return
 	}
 	policy, eligible := self.fifoRepairPolicy()
-	item := self.sendItems[0]
-	if !eligible || proof.generation != policy.generation || item.messageId != proof.nextMessageId ||
-		item.sequenceNumber != proof.nextNumber || !fifoRepairItemOnRoute(item, proof.route) ||
-		item.selectiveAcked || item.deliveryObserved || item.recoveryKind != sendRecoveryNone ||
-		self.resendQueue.GetByMessageId(item.messageId) != item {
+	if !eligible {
 		return
 	}
-	self.fifoRepair.passed = fifoPassedHead{messageId: item.messageId, number: item.sequenceNumber, route: proof.route, set: true}
-	if item.deferralOutstanding && at.Before(item.resendTime) && self.setResendTimeIfRetained(item, at) {
+	item := self.sendItems[0]
+	eligibleHead := func() bool {
+		self.resendQueue.stateLock.Lock()
+		defer self.resendQueue.stateLock.Unlock()
+		if proof.set && proof.successful && proof.generation == policy.generation &&
+			item.messageId == proof.nextMessageId && item.sequenceNumber == proof.nextNumber {
+			changedRoute := self.fifoRepair.passed.route != nil && self.fifoRepair.passed.route != proof.route
+			for _, retained := range self.fifoRepairItems() {
+				if retained == nil {
+					continue
+				}
+				if changedRoute {
+					retained.fifoRepairAccepted = false
+				}
+				if retained.fifoRepairPending && fifoRepairItemOnRoute(retained, proof.route) &&
+					!retained.selectiveAcked && !retained.deliveryObserved && retained.recoveryKind == sendRecoveryNone &&
+					self.resendQueue.messageIdItems[retained.messageId] == retained &&
+					self.resendQueue.sequenceNumberItems[retained.sequenceNumber] == retained {
+					retained.fifoRepairAccepted = true
+				}
+				retained.fifoRepairPending = false
+			}
+			self.fifoRepair.passed = fifoPassedHead{route: proof.route}
+		}
+		route := self.fifoRepair.passed.route
+		return item.fifoRepairAccepted && fifoRepairItemOnRoute(item, route) &&
+			!item.selectiveAcked && !item.deliveryObserved && item.recoveryKind == sendRecoveryNone &&
+			self.resendQueue.messageIdItems[item.messageId] == item && self.resendQueue.sequenceNumberItems[item.sequenceNumber] == item
+	}()
+	if !eligibleHead {
+		return
+	}
+	route := self.fifoRepair.passed.route
+	self.fifoRepair.passed = fifoPassedHead{messageId: item.messageId, number: item.sequenceNumber, route: route, set: true}
+	if at.Before(item.resendTime) && self.setResendTimeIfRetained(item, at) {
 		item.deferralOutstanding = false
 	}
 }
@@ -175,11 +243,11 @@ func (self *SendSequence) fifoRepairPassed(item *sendItem) bool {
 // Forget identities before delivery or pooling. No pointer outlives its owner.
 func (self *SendSequence) forgetFifoRepairItem(item *sendItem) {
 	state := &self.fifoRepair
-	if state.pending.set && ((state.pending.prefixMessageId == item.messageId && state.pending.prefixNumber == item.sequenceNumber) ||
-		(state.pending.nextMessageId == item.messageId && state.pending.nextNumber == item.sequenceNumber)) {
+	item.fifoRepairPending, item.fifoRepairAccepted = false, false
+	if state.pending.set && state.pending.prefixMessageId == item.messageId && state.pending.prefixNumber == item.sequenceNumber {
 		state.pending = fifoRepairFence{}
 	}
 	if state.passed.set && state.passed.messageId == item.messageId && state.passed.number == item.sequenceNumber {
-		state.passed = fifoPassedHead{}
+		state.passed = fifoPassedHead{route: state.passed.route}
 	}
 }

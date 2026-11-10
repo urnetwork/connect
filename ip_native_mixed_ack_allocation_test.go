@@ -89,9 +89,9 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 				}
 			}()
 		}
-		// AllocsPerRun uses one processor. One complete offered group must fit
-		// before a peer ACK runs; otherwise the intentional raw-suffix capacity
-		// refusal measures less useful work than this census promises.
+		// AllocsPerRun uses one processor. Every independently admitted DATA
+		// run must fit before a peer ACK; otherwise raw-suffix capacity refusal
+		// measures less useful work than this census promises.
 		budgetTemplates := make([][]byte, 32)
 		for index := range budgetTemplates {
 			budgetTemplates[index] = ack
@@ -118,7 +118,7 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 			}
 			return source
 		}()
-		flightCost := nativeMixedAckFlightRetainedCost(t, source, budgetTemplates)
+		flightCost := nativeMixedAckPartitionRetainedCost(t, source, budgetTemplates)
 		budget := fixture.sender.settings.SendBufferSettings.ResendQueueBudget
 		if budget == nil || budget.UsedByteCount() != 0 {
 			t.Fatal("allocation census calibration requires an empty owned sender budget")
@@ -191,10 +191,11 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 			t.Fatalf("allocation census lost actual useful work: mode=%s offers=%d accepted=%d provider=%d transfer=%d/%d elapsed=%s",
 				mode, offers, acceptedTotal, dispatched, queued, queuedBytes, time.Since(before))
 		}
-		t.Logf("NATIVE_MIXED_ACK_ALLOCATION_CENSUS mode=%s offers_including_warmup=%d input_packets_per_offer=32 accepted_packets=%d provider_dispatches=%d socket_bytes=%d source_terminals=%d collapse_drops=%d allocations_per_offer=%g parsed_group_bytes=%d admission_bytes=%d sender_budget_limit=%d full_flight_chunks=%d full_flight_metadata=%d sender_budget_after=%d elapsed=%s",
+		t.Logf("NATIVE_MIXED_ACK_ALLOCATION_CENSUS mode=%s offers_including_warmup=%d input_packets_per_offer=32 accepted_packets=%d provider_dispatches=%d socket_bytes=%d source_terminals=%d collapse_drops=%d allocations_per_offer=%g parsed_group_bytes=%d admission_bytes=%d sender_budget_limit=%d full_flight_chunks=%d full_flight_graph_metadata=%d full_flight_owners=%d full_flight_data_owners=%d full_flight_data_metadata=%d sender_budget_after=%d elapsed=%s",
 			mode, offers, acceptedTotal, dispatched, socketBytes, fixture.senderTerminals.Load()-beforeTerminals,
 			fixture.parent.TcpCollapseDropCount()-beforeDrops, allocations, unsafe.Sizeof(parsedPacketGroup{}),
 			unsafe.Sizeof(ipPacketGroupAdmission{}), budget.TotalByteCount(), len(flightCost.chunks), flightCost.metadata,
+			flightCost.owners, flightCost.dataOwners, flightCost.dataMetadata,
 			budget.UsedByteCount(), time.Since(before))
 	})
 }
@@ -203,10 +204,42 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 // and each transport-bounded retained item. These setup-only slices borrow
 // template packet bytes; any legacy wrapper is returned before failure.
 type nativeMixedAckFlightCost struct {
-	total    ByteCount
-	metadata ByteCount
-	chunks   []ByteCount
-	ends     []int
+	total        ByteCount
+	metadata     ByteCount
+	chunks       []ByteCount
+	ends         []int
+	owners       int
+	dataOwners   int
+	dataMetadata ByteCount
+}
+
+// Borrows established TCP templates. Contiguous protocol/DATA runs are
+// separate source owners; only DATA debits the resend budget. Graph metadata
+// remains descriptive for both classes, independent of that permission.
+func nativeMixedAckPartitionRetainedCost(t *testing.T, source *SendSequence, templates [][]byte) nativeMixedAckFlightCost {
+	t.Helper()
+	cost := nativeMixedAckFlightCost{}
+	for start := 0; start < len(templates); {
+		control := protocolClassPureTcpControl(templates[start])
+		end := start + 1
+		for end < len(templates) && protocolClassPureTcpControl(templates[end]) == control {
+			end++
+		}
+		run := nativeMixedAckFlightRetainedCost(t, source, templates[start:end])
+		cost.owners++
+		cost.metadata += run.metadata
+		if !control {
+			cost.dataOwners++
+			cost.dataMetadata += run.metadata
+			cost.total += run.total
+		}
+		cost.chunks = append(cost.chunks, run.chunks...)
+		for _, runEnd := range run.ends {
+			cost.ends = append(cost.ends, start+runEnd)
+		}
+		start = end
+	}
+	return cost
 }
 
 // Borrows templates and source. Uses the serializer's own chunk, pool-class

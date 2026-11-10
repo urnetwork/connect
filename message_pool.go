@@ -147,23 +147,16 @@ type messagePoolSnapshot struct {
 	createdTags                [256]uint64
 }
 
-// snapshot locks shards in index order and copies the whole class in one
-// pass. Observability therefore costs four locks per class rather than four
-// locks per tag, and capacity/retention/counters describe one consistent
-// instant instead of being sampled across packet-path mutations.
+// snapshot samples one shard at a time. Fields within a shard describe one
+// locked cut; their class aggregate is not one simultaneous cross-shard cut.
+// Never hold an earlier packet Get/Return shard while waiting for a later one.
+// This changes telemetry only: ownership/refcounts and every free-list capacity
+// remain governed by the original single-shard packet operations.
 func (self *messagePool) snapshot() messagePoolSnapshot {
-	for shardIndex := range messagePoolShardCount {
-		self.shards[shardIndex].stateLock.Lock()
-	}
-	defer func() {
-		for shardIndex := messagePoolShardCount - 1; 0 <= shardIndex; shardIndex -= 1 {
-			self.shards[shardIndex].stateLock.Unlock()
-		}
-	}()
-
 	var snapshot messagePoolSnapshot
 	for shardIndex := range messagePoolShardCount {
 		shard := &self.shards[shardIndex]
+		shard.stateLock.Lock()
 		snapshot.capacity += shard.maxCount
 		snapshot.retained += shard.count
 		snapshot.deviceTunEgressOutstanding += shard.deviceTunEgressOutstanding
@@ -172,6 +165,7 @@ func (self *messagePool) snapshot() messagePoolSnapshot {
 			snapshot.returnedTags[tag] += shard.returnedTags[tag]
 			snapshot.createdTags[tag] += shard.createdTags[tag]
 		}
+		shard.stateLock.Unlock()
 	}
 	return snapshot
 }
@@ -1031,7 +1025,7 @@ func GetMessagePoolAggregateStats() MessagePoolAggregateStats {
 	return stats
 }
 
-// MessagePoolClassStats is a point-in-time view of one size class. Capacity
+// MessagePoolClassStats combines independently locked shard samples of one size class. Capacity
 // and Retained count free-list buffers; Taken/Returned/Created are cumulative
 // since process start or ResetMessagePoolStats.
 type MessagePoolClassStats struct {

@@ -7913,9 +7913,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	ipPath := sendPacketGroup.ipPath
 	var sentUpdate *multiClientChannelUpdate
 	self.sendAffinityClientPath(sendPacketGroup, timeout, func(update *multiClientChannelUpdate, currentClient *multiClientChannel, affinityTimeout time.Duration) {
+		if batchAdmission != nil && batchAdmission.expectedUpdate != nil && batchAdmission.expectedUpdate != update {
+			return
+		}
 		timeout = affinityTimeout
 		defer update.releaseCollapseClaims()
 		sentUpdate = update
+		var protocolEpoch uint64
+		if batchAdmission != nil && batchAdmission.partitionProtocol {
+			update.stateLock.Lock()
+			protocolEpoch = update.sequenceAdmissionEpoch
+			update.stateLock.Unlock()
+		}
 		enterTime := time.Now()
 		if !sendPacketGroup.isSynRetry() {
 			for packetIndex := range sendPacketGroup.packets {
@@ -7981,6 +7990,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				batchAdmission.stop = true
 			}
 			self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
+			return
+		}
+		if batchAdmission != nil && batchAdmission.partitionProtocol && sendPacketGroup.nativeProtocolPartitionCandidate() {
+			// No child has acquired ownership. Return to the native owner so
+			// contiguous class runs get independent ordinary admission.
+			update.stateLock.Lock()
+			if !update.IsDone() && update.sequenceAdmissionEpoch == protocolEpoch {
+				batchAdmission.protocolUpdate, batchAdmission.protocolEpoch = update, protocolEpoch
+			}
+			update.stateLock.Unlock()
 			return
 		}
 		// Passing the gate is only an offer. Neither SYN generation nor the
@@ -19223,6 +19242,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	}
 	defer sendPacketGroup.finishGroupOffer()
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
+	opts = multiClientProtocolTransferOpts(opts, frames)
 	if sendPacketGroup.admissionObservations != nil && self.client != nil {
 		if observer := self.client.settings.SendBufferSettings.SendPackLifecycleObserver; observer != nil {
 			opts = append(opts, sendPackLifecycleObserverOption{
@@ -19328,6 +19348,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 
 		opts := []any{scheduleIpFlow(parsedPacket.ipPath)}
+		opts = multiClientProtocolTransferOpts(opts, []*protocol.Frame{frame})
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
@@ -19506,6 +19527,7 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
 	} else {
+		opts = multiClientProtocolTransferOpts(opts, []*protocol.Frame{frame})
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}

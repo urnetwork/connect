@@ -154,7 +154,7 @@ func TestReceiveHeldProofAdjacentReturnedCarrierCannotChangeProof(t *testing.T) 
 		proofBytes := append([]byte(nil), promoted.pack.ContractFrame.MessageBytes...)
 		messageBytes := MessageByteCount(promoted.pack.Frames)
 		fixture.receiver.receivePackHandoffMaxByteCount.Store(0)
-		originalOwner, originalTag := held.decodedOwner, held.tag
+		originalOwner, originalTag := held.decodedOwner, held.receiveTag()
 		originalPayload := append([]byte(nil), held.frames[0].MessageBytes...)
 		var reacquired [][]byte
 		defer func() {
@@ -191,7 +191,7 @@ func TestReceiveHeldProofAdjacentReturnedCarrierCannotChangeProof(t *testing.T) 
 			valid = bytes.Equal(owner.pack.ContractFrame.MessageBytes, proofBytes)
 		}
 		fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
-			if held.decodedOwner != originalOwner || held.tag != originalTag || len(frames) != 1 ||
+			if held.decodedOwner != originalOwner || held.receiveTag() != originalTag || len(frames) != 1 ||
 				!bytes.Equal(frames[0].MessageBytes, originalPayload) {
 				valid = false
 			}
@@ -459,7 +459,7 @@ func TestReceiveHeldProofAdjacentRotatedProofKeepsOriginalBody(t *testing.T) {
 		budget := NewTransferMemoryBudget(kib(64))
 		fixture, log := newHeldHeadContractFixture(t, budget)
 		sequence, held, promoted := stageHeldHeadContract(t, fixture)
-		originalOwner, originalTag := held.decodedOwner, held.tag
+		originalOwner, originalTag := held.decodedOwner, held.receiveTag()
 		originalPayload := append([]byte(nil), held.frames[0].MessageBytes...)
 		pack := proto.Clone(promoted.pack).(*protocol.Pack)
 		pack.ContractFrame = newHeldHeadContractProof(t, fixture.receiver, pack.ContractFrame)
@@ -470,7 +470,7 @@ func TestReceiveHeldProofAdjacentRotatedProofKeepsOriginalBody(t *testing.T) {
 		observed := false
 		fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 			observed = true
-			if held.decodedOwner != originalOwner || held.tag != originalTag || len(frames) != 1 ||
+			if held.decodedOwner != originalOwner || held.receiveTag() != originalTag || len(frames) != 1 ||
 				!bytes.Equal(frames[0].MessageBytes, originalPayload) || held.contractId == nil ||
 				sequence.receiveContract == nil || *held.contractId != sequence.receiveContract.contractId {
 				t.Error("rotated proof replaced original application/tag authority")

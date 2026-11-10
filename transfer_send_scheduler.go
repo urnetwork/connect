@@ -49,6 +49,9 @@ type sendPackAdmission struct {
 	byKey    map[sendSchedulingKey]int
 	waiters  []*sendPackAdmissionWaiter
 	closed   bool
+	// Created only after a retained protocol SYN actually refuses. The same
+	// mutex publishes count vacancy after ordinary waiters receive their slots.
+	protocolReadiness *resendCapacityGate
 }
 
 // One blocked acquire. A grant sets granted under the admission mutex before
@@ -80,7 +83,35 @@ func (self *sendPackAdmission) tryTakeWithLock(key sendSchedulingKey) bool {
 	}
 	self.count += 1
 	self.byKey[key] += 1
+	self.publishProtocolReadinessWithLock()
 	return true
+}
+
+// A protocol Pack has no per-flow slot restriction. Its refused native SYN
+// may watch the total count without adding a worker, timer or packet owner.
+// Capture current vacancy under the same lock as release; an opening before
+// registration remains a level that watch rechecks rather than a lost edge.
+func (self *sendPackAdmission) protocolReadinessGate() *resendCapacityGate {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.protocolReadiness == nil {
+		self.protocolReadiness = new(resendCapacityGate)
+		self.publishProtocolReadinessWithLock()
+	}
+	return self.protocolReadiness
+}
+
+// Ordinary FIFO grants already own their slots before readiness opens. The
+// directed subscriber gets a retry turn, never a second slot or capacity credit.
+func (self *sendPackAdmission) publishProtocolReadinessWithLock() {
+	if self.protocolReadiness == nil {
+		return
+	}
+	if self.closed {
+		self.protocolReadiness.close()
+	} else {
+		self.protocolReadiness.Store(self.capacity <= self.count)
+	}
 }
 
 // Takes a slot that fits key. Otherwise, when wait is set and admission is
@@ -115,6 +146,7 @@ func (self *sendPackAdmission) tryAcquireEmpty(key sendSchedulingKey) bool {
 	}
 	self.count = 1
 	self.byKey[key] = 1
+	self.publishProtocolReadinessWithLock()
 	return true
 }
 
@@ -143,6 +175,7 @@ func (self *sendPackAdmission) releaseWithLock(key sendSchedulingKey) {
 			return
 		}
 	}
+	self.publishProtocolReadinessWithLock()
 }
 
 // Withdraws a waiter whose caller stopped waiting. A slot granted to it in the
@@ -166,6 +199,7 @@ func (self *sendPackAdmission) close() {
 		return
 	}
 	self.closed = true
+	self.publishProtocolReadinessWithLock()
 	for _, waiter := range self.waiters {
 		close(waiter.ready)
 	}
@@ -440,4 +474,23 @@ func (self *sendPackScheduler) Drain(dispose func(*SendPack)) {
 	self.active = nil
 	self.order = nil
 	self.count = 0
+}
+
+// Only ordinary TCP feedback may pass older DATA of its own flow. A lifecycle
+// owner cannot pass any predecessor, and no later member may cross that fence.
+// Cancellation uses the separate removal path and never writes around it.
+func (self *sendPackScheduler) canPassTcpLifecycle(candidate *SendPack) bool {
+	flow := self.flows[candidate.schedulingKey]
+	if flow == nil {
+		return false
+	}
+	for _, prior := range flow.packs {
+		if prior == candidate {
+			return true
+		}
+		if candidate.tcpOrderBarrier || prior.tcpOrderBarrier {
+			return false
+		}
+	}
+	return false
 }

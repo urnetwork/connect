@@ -287,7 +287,7 @@ func TestReceiveSequenceBurstTailEncodedCostIncludesWrapping(t *testing.T) {
 				}
 				item := &receiveItem{
 					transferItem: transferItem{messageId: NewId(), sequenceNumber: math.MaxUint64, messageByteCount: 100 * ackResponseEntryMaxByteCount},
-					ack:          true, transportType: TransportTypeH1, tag: sequenceTag{set: true, sendTime: math.MaxUint64},
+					ack:          true, transportType: TransportTypeH1, tagSendTime: math.MaxUint64, tagSet: true,
 				}
 				want := item.messageId
 				deliverBurstTailTestBatch(t, sequence, []*receiveItem{item})

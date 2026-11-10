@@ -131,8 +131,8 @@ func TestFifoRepairRequiresExactPhysicalProvenance(t *testing.T) {
 	}
 }
 
-// Once physical provenance is established, applying it changes only an already
-// outstanding future deferral. The original timer, heaps and lifetime stay owned.
+// Exact physical provenance can pull in an untouched initial deadline or an
+// ordinary deferral. Earlier timers, heaps, lifetime and paid custody stay owned.
 func TestFifoRepairPreservesRecoveryOwnership(t *testing.T) {
 	for _, test := range []struct {
 		name         string
@@ -140,7 +140,7 @@ func TestFifoRepairPreservesRecoveryOwnership(t *testing.T) {
 		mark, revoke bool
 	}{
 		{name: "future ordinary deferral", mark: true, revoke: true},
-		{name: "first deferral not yet taken", mark: true, change: func(f fifoRepairFixture) { f.items[1].deferralOutstanding = false; f.items[1].timeoutDeferCount = 0 }},
+		{name: "first deferral not yet taken", mark: true, revoke: true, change: func(f fifoRepairFixture) { f.items[1].deferralOutstanding = false; f.items[1].timeoutDeferCount = 0 }},
 		{name: "already due ordinary deferral", mark: true, change: func(f fifoRepairFixture) { f.sequence.setResendTime(f.items[1], f.now.Add(-time.Second)) }},
 		{name: "leased head", change: func(f fifoRepairFixture) { f.items[1].selectiveAcked = true }},
 		{name: "delivered head", change: func(f fifoRepairFixture) { f.items[1].deliveryObserved = true }},
@@ -208,8 +208,9 @@ func TestFifoRepairAcceptedHeadSurvivesFailedPromotion(t *testing.T) {
 		t.Fatal("new unconfirmed envelope erased accepted head proof")
 	}
 	s.observeCarrierWrite(next, transferWriteDisposition{transportType: TransportTypeH1, reliable: true, route: f.route})
-	if s.fifoRepair.pending.set || !s.fifoRepairPassed(head) {
-		t.Fatal("successor copy did not independently invalidate only its pending proof")
+	if !s.fifoRepair.pending.set || !s.fifoRepairPassed(head) || fifoCohortFlag(t, next, "fifoRepairPending") ||
+		!fifoCohortFlag(t, f.items[2], "fifoRepairPending") {
+		t.Fatal("successor copy did not independently invalidate only its own captured membership")
 	}
 	s.prepareFifoRepair(head, sequenceTag{set: true, sendTime: 100}, sequenceTag{set: true, sendTime: 200}, false)
 	s.observeCarrierWrite(head, transferWriteDisposition{transportType: TransportTypeH1, reliable: true, route: f.route})
@@ -289,7 +290,7 @@ func TestFifoRepairSelectedPhysicalCopyInvalidatesProof(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if item.sendCount != 1 || item.selectiveAcked || item.deliveryObserved || s.fifoRepair.pending.set != failed || s.fifoRepair.passed.set != failed {
+			if item.sendCount != 1 || item.selectiveAcked || item.deliveryObserved || !s.fifoRepair.pending.set || s.fifoRepair.passed.set != failed {
 				t.Fatalf("failed=%t: selected physical outcome lost proof ownership or changed ordinary count", failed)
 			}
 			if failed {

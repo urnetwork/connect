@@ -282,15 +282,25 @@ func TestColdSynNativeIdenticalUdpDatagramsKeepBothAdmissions(t *testing.T) {
 	})
 }
 
-// A real source can accept a SYN and then dispose it wholly unwritten for
-// retained-memory pressure. Only that candidate must be eligible on retry;
+// A real source can accept a SYN and then close before its first write.
+// Only that candidate must be eligible on retry;
 // another candidate's still-accepted raw owner must not be duplicated.
 func TestColdSynUnwrittenRaceCandidateCanRetryExactSyn(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		budget := NewTransferMemoryBudget(1)
-		failed := newGroupDispositionQueueFixture(t, budget, nil)
+		budget := NewTransferMemoryBudget(0)
+		var cancelOnce sync.Once
+		var failedSource *SendSequence
+		var admittedGroups []*parsedPacketGroup
+		failed := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+				admittedGroups = append(admittedGroups, target.(*parsedPacketGroup))
+			}
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
+				cancelOnce.Do(func() { failedSource = source; source.Cancel() })
+			}
+		})
 		owned := newGroupDispositionQueueFixture(t, nil, nil)
 		failed.update.client.Store(nil)
 		failed.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
@@ -304,13 +314,29 @@ func TestColdSynUnwrittenRaceCandidateCanRetryExactSyn(t *testing.T) {
 		owned.requireParked()
 		failed.unpark()
 		synctest.Wait()
+		if failedSource == nil {
+			t.Fatal("pure SYN did not reach its actual source cancellation boundary")
+		}
+		select {
+		case <-failedSource.done:
+		default:
+			t.Fatal("canceled source did not join its wholly-unwritten cleanup")
+		}
 		if len(failed.route) != 0 || failed.started.Load() != 1 || failed.terminal.Load() != 1 || budget.UsedByteCount() != 0 || failed.update.race == nil {
 			t.Fatal("first candidate did not complete the actual wholly-unwritten source failure")
 		}
-		budget.SetTotalByteCount(kib(128))
-		synctest.Wait()
+		first := admittedGroups[0]
+		if failed.client.IsDone() || failed.update.IsDone() || first.collapseOwner != nil || first.collapseSource != nil ||
+			first.completionFlags.Load()&groupCompletionDequeued != 0 || owned.started.Load() != 1 || owned.terminal.Load() != 0 {
+			t.Fatal("source cancellation changed the shared lifetime or another candidate's raw custody")
+		}
 		if count, accepted := failed.offerWithResults(syn); count != 1 || !accepted[0] {
-			t.Fatal("failed candidate could not immediately acquire the exact retry after real capacity publication")
+			t.Fatal("live candidate could not acquire the exact pure-SYN retry on its next source generation")
+		}
+		synctest.Wait()
+		if len(admittedGroups) != 2 || admittedGroups[1].collapseSource == nil ||
+			admittedGroups[1].collapseSource == failedSource || budget.TotalByteCount() != 0 {
+			t.Fatal("pure-SYN retry did not use a fresh source under the unchanged full DATA budget")
 		}
 		failed.acknowledgeAll(syn)
 		owned.unpark()

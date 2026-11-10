@@ -42,7 +42,7 @@ func TestReceiverAckTimingDurationBounds(t *testing.T) {
 	if got := client.feedbackTimeNanos(base.Add(-time.Nanosecond)); got != 0 {
 		t.Fatalf("negative clock-origin ingress became available: %d", got)
 	}
-	if unsafe.Sizeof(sequenceAck{}) != 96 || unsafe.Sizeof(decodedPackOwner{}) > uintptr(decodedPackOwnerQueueByteCount) {
+	if unsafe.Sizeof(sequenceAck{}) != 96+immediateAckOrdinalStateByteCount || unsafe.Sizeof(decodedPackOwner{}) > uintptr(decodedPackOwnerQueueByteCount) {
 		t.Fatalf("timing escaped existing compact ACK/owner bounds: ack=%d owner=%d", unsafe.Sizeof(sequenceAck{}), unsafe.Sizeof(decodedPackOwner{}))
 	}
 }

@@ -184,9 +184,6 @@ func (self *privateTcpProfilePressureFixture) dispatched() {
 	default:
 		self.t.Fatal("admitted packet did not reach its completed shard disposition")
 	}
-	if self.nat.controlMemory.UsedByteCount() != 0 {
-		self.t.Fatal("completed control kept a prepaid packet owner")
-	}
 }
 
 func (self *privateTcpProfilePressureFixture) syn(index int, wantConstructor bool) *TcpSequence {

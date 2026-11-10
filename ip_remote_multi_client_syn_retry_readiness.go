@@ -58,7 +58,7 @@ func synRetryReadyCapacity(parent *RemoteUserNatMultiClient, update *multiClient
 	return capacity
 }
 
-func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientChannelUpdate, source *SendSequence, serial uint64, sequence uint32, capacity int) *tcpSynRetryReadiness {
+func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientChannelUpdate, source *SendSequence, serial uint64, sequence uint32, capacity int, noBudget ...bool) *tcpSynRetryReadiness {
 	if parent == nil || parent.flowReaperDone == nil {
 		return nil
 	}
@@ -67,7 +67,7 @@ func newSynRetryReadiness(parent *RemoteUserNatMultiClient, update *multiClientC
 		return nil
 	}
 	bytes := addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(unsafe.Sizeof(tcpSynRetryReadiness{}))), retainedMessageCapacity(ByteCount(capacity*slotBytes)))
-	credit, ok := source.reserveRetainedControlMemory(bytes)
+	credit, ok := source.reserveRetainedControlMemory(bytes, noBudget...)
 	if !ok {
 		return nil
 	}
@@ -137,7 +137,7 @@ func (group *parsedPacketGroup) prepareSynRetryReadinessCapacity(source *SendSeq
 		return
 	}
 	parent := update.sequenceParent
-	fresh := newSynRetryReadiness(parent, update, source, owner.serial, owner.sequence, width)
+	fresh := newSynRetryReadiness(parent, update, source, owner.serial, owner.sequence, width, owner.credit != nil && owner.credit.noBudget)
 	if fresh == nil || old != nil && old.indexed.Load() {
 		owner.readinessOverflow = true
 		if parent != nil {
