@@ -10544,6 +10544,83 @@ paths:
         "403":
           description: Another member's device.
 
+  /gkm/delegation-keys/{delegation_id}:
+    servers:
+      - url: https://gkm.bringyour.com
+    put:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Store a forwarding Delegation's reader key
+      description: |
+        The 1,216-byte X-Wing public key of a forwarding Delegation, which the
+        Delegation's row names only by its SHA-256, from the sidecar the
+        Delegation forwards for, under a gkm token holding `r`, `rw` or
+        `admin` on some repo, that sidecar admitted and not revoked, parked or
+        suspended. gkm creates the object once, holding the key to the row in
+        its newest verified state; the same bytes again answer 200, so a retry
+        after a lost answer is safe.
+      operationId: gkmDelegationKeyUpload
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          description: The Delegation's id, 64 lowercase hex characters.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Stored, or stored before with the same bytes.
+        "400":
+          description: An id out of form, or a key of another size.
+        "403":
+          description: Not that Delegation's sidecar, a Delegation that does not forward, or a key the row does not name.
+        "409":
+          description: gkm's newest verified state does not hold the Delegation's row yet; the same request goes again once it does.
+        "429":
+          description: Queued out by the write budget.
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read a forwarding Delegation's reader key
+      description: |
+        The stored key, byte for byte, under a gkm token holding `r`, `rw` or
+        `admin` on the network's config repo, a forwarding Delegation's whole
+        reach. gkm proves nothing by serving it: a sealer holds it to the
+        Delegation's row before sealing to it.
+      operationId: gkmDelegationKey
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          description: The Delegation's id, 64 lowercase hex characters.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The key.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Not a reader of the config.
+        "404":
+          description: No such object, or a Delegation that keeps its key in its row.
+
   # ----- oauth authorization server (server/IDP.md) -----
 
   /.well-known/oauth-authorization-server:
