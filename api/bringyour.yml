@@ -11622,6 +11622,186 @@ paths:
         "503":
           description: Sign-in through an IdP is not available.
 
+  /network/domain-add:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Add a team's domain to verify
+      description: |
+        Adds a DNS domain to the caller's team network, unverified, and answers
+        the record that proves it: a TXT record at `txt_name`,
+        `_urnetwork-challenge.<domain>`, whose value is `txt_value`. Adding a
+        domain the team already holds answers the same record. The domain is
+        lowercase ASCII with at least two labels; an internationalized domain
+        goes in its `xn--` form. A team holds at most 20 domains, and one that
+        is not verified within 7 days is dropped.
+
+        The team's Owner changes its domains: any other member is refused by
+        the role gate (`RolePermissionRefused`). A network outside the team
+        tier is refused 402 with a `QuotaRefusal`. An argument the server
+        cannot take answers 200 with `error`. Adding a domain records an admin
+        event and sends the network's Owners and Admins a security notice.
+        503 while teams are not available.
+      operationId: networkDomainAdd
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkDomainArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkDomainResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/domain-verify:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Verify a team's domain
+      description: |
+        Looks up the TXT record of a domain the team added. When one of its
+        values is the domain's `txt_value`, the domain is verified: from then
+        on `POST /auth/sso-discover` routes its sign-ins to the team's IdP.
+        One network holds a verified domain: while another network does, the
+        proof is refused with `error`. A record that is not found answers
+        `error` with the domain still unverified; one row is looked up at most
+        once in 10 seconds.
+
+        A verified domain is looked up again once a day. A check that does not
+        find the record starts a failing run, shown in `fail_time`, a check
+        that finds it ends the run, and a domain whose run reaches 7 days is
+        dropped and routes nothing.
+
+        The team's Owner verifies its domains. A network outside the team tier
+        is refused 402 with a `QuotaRefusal`. Verifying a domain records an
+        admin event and sends the network's Owners and Admins a security
+        notice. 503 while teams are not available.
+      operationId: networkDomainVerify
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkDomainArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkDomainResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/domain-remove:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Remove a team's domain
+      description: |
+        Removes a domain from the caller's team network, verified or not.
+        Discovery stops routing it at once. `removed` says whether the team
+        held it. The team's Owner removes its domains. A network outside the
+        team tier is refused 402 with a `QuotaRefusal`. Removing a domain
+        records an admin event. 503 while teams are not available.
+      operationId: networkDomainRemove
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkDomainArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkDomainResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /auth/sso-discover:
+    post:
+      x-internal: true
+      tags: [Authentication]
+      summary: Find the IdP an address signs in through
+      description: |
+        Takes the address a person signs in with. When its domain is one a
+        team holds verified and the team has an IdP, the server begins a
+        sign-in through that IdP and answers `authorization_url`, where the
+        browser goes next; the sign-in ends at `GET /auth/sso/callback`.
+
+        Only the address's domain is read, never a user, so the answer says
+        nothing of whether the address exists. Every address that routes
+        nowhere answers alike, an empty object: one that does not parse, a
+        domain no network added, one added and not verified, one dropped, and
+        a verified one whose team has no IdP.
+
+        A request may carry the caller's own network credential. An IdP
+        identity the server has not seen links only to that user, never by its
+        email. A caller address makes at most 30 discoveries in 10 minutes
+        (429). 503 while sign-in through an IdP is not available.
+      operationId: authSsoDiscover
+      security:
+        - {}
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkSsoDiscoverArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkSsoDiscoverResult"
+        "429":
+          description: Too many discoveries from the caller's address.
+        "502":
+          description: The IdP is unavailable.
+        "503":
+          description: Sign-in through an IdP is not available.
+
   /network/members:
     get:
       tags: [Network]
@@ -26929,6 +27109,73 @@ components:
           properties:
             message:
               type: string
+
+    NetworkDomainArgs:
+      type: object
+      required:
+        - domain
+      properties:
+        domain:
+          description: The DNS domain, such as `example.com`.
+          type: string
+
+    NetworkDomain:
+      type: object
+      required:
+        - domain
+        - txt_name
+        - txt_value
+        - verified
+      properties:
+        domain:
+          type: string
+        txt_name:
+          description: The name of the TXT record to publish, `_urnetwork-challenge.<domain>`.
+          type: string
+        txt_value:
+          description: The value the TXT record must hold.
+          type: string
+        verified:
+          type: boolean
+        verify_time:
+          description: datetime. When the network proved the domain.
+          type: string
+        check_time:
+          description: datetime. The newest lookup of the record.
+          type: string
+        fail_time:
+          description: datetime. A verified domain's failing run began here, and it is dropped 7 days on unless a check finds the record; an unverified domain is dropped 7 days after this.
+          type: string
+
+    NetworkDomainResult:
+      type: object
+      properties:
+        domain:
+          $ref: "#/components/schemas/NetworkDomain"
+        removed:
+          description: "`domain-remove`: the team held the domain and it is gone."
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    NetworkSsoDiscoverArgs:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          description: The address the person signs in with. Only its domain is read.
+          type: string
+
+    NetworkSsoDiscoverResult:
+      type: object
+      properties:
+        authorization_url:
+          description: The IdP's authorization request to send the browser to. Absent when the address's domain routes to no IdP.
+          type: string
 
     NetworkEnrollArgs:
       type: object
