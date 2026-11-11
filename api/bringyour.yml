@@ -10544,6 +10544,48 @@ paths:
         "403":
           description: Another member's device.
 
+  /gkm/delegation-keys:
+    servers:
+      - url: https://gkm.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Read many forwarding Delegations' reader keys
+      description: |
+        A `GkmDelegationKeysRequest` of at most 256 forwarding Delegations'
+        ids, answered by a `GkmDelegationKeysReply`, which a config rotator
+        reads instead of a request per Delegation. Takes what
+        `GET /gkm/delegation-keys/{delegation_id}` takes: a gkm token holding
+        `r`, `rw` or `admin` on the network's config repo. Each key comes byte
+        for byte in the request's order, an empty entry for a Delegation gkm
+        stores none for; a sealer holds each to its Delegation's row before
+        sealing to it.
+      operationId: gkmDelegationKeys
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Each stored key in order, an empty entry for none stored.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: No id, more than 256, or an id of another size.
+        "403":
+          description: Not a reader of the config.
+        "404":
+          description: No id names a forwarding Delegation gkm's newest verified state holds.
+
   /gkm/delegation-keys/{delegation_id}:
     servers:
       - url: https://gkm.bringyour.com
