@@ -1,9 +1,11 @@
-// A refused native SYN has no provider-delivery evidence. Real queue controls
-// distinguish that local attempt from an admitted unanswered connection.
+// A refused native DATA-bearing SYN has no provider-delivery evidence. Pure
+// SYN controls remain exempt from that DATA gate and earn an admission clock.
 package connect
 
 import (
+	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -12,8 +14,8 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// The canonical fixture owns a real retained original and its closed credit
-// gate. Only routing lookup is selected by its existing seam; sends, native
+// The canonical fixture owns a real retained DATA original and its closed
+// DATA credit gate. Only routing lookup is selected by its existing seam; sends, native
 // results, collapse admission, source queues and pooled ownership stay real.
 type nativeSynAdmissionClockFixture struct {
 	credit     *nativeBatchCreditFixture
@@ -25,9 +27,9 @@ type nativeSynAdmissionClockFixture struct {
 
 // Register the exact tuple used by clientDialFailure, rather than letting a
 // test-only lookup hide that path by leaving the parent's flow map empty.
-func newNativeSynAdmissionClockFixture(t *testing.T) *nativeSynAdmissionClockFixture {
+func newNativeSynAdmissionClockFixture(t *testing.T, synPayload []byte, configures ...func(*ClientSettings)) *nativeSynAdmissionClockFixture {
 	t.Helper()
-	self := &nativeSynAdmissionClockFixture{credit: newNativeBatchCreditFixture(t)}
+	self := &nativeSynAdmissionClockFixture{credit: newNativeBatchCreditFixture(t, configures...)}
 	parent := self.credit.base.parent
 	parent.settings.DialFailureRerace = true
 	self.path = &IpPath{
@@ -40,7 +42,7 @@ func newNativeSynAdmissionClockFixture(t *testing.T) *nativeSynAdmissionClockFix
 		Syn:             true,
 		SequenceNumber:  71000,
 	}
-	self.syn = ipOosTcpPacketSequence(self.path, tcpFlagSyn, self.path.SequenceNumber, nil)
+	self.syn = ipOosTcpPacketSequence(self.path, tcpFlagSyn, self.path.SequenceNumber, synPayload)
 	self.update = newMultiClientChannelUpdate(parent.ctx, self.path)
 	self.update.client.Store(self.credit.base.selected)
 	key := self.path.ToIp4Path()
@@ -121,13 +123,16 @@ func (self *nativeSynAdmissionClockFixture) failureState(t *testing.T) (serviceF
 	return serviceFailures, strikes, metrics.FlowsReraced, metrics.DialFailuresIntercepted
 }
 
-// The first SYN and both retransmissions meet a real closed source-credit
-// gate. Advancing virtual protocol time must not convert those three local
-// refusals into evidence that the provider failed an upstream connection.
+// The first DATA-bearing SYN and both exact retransmissions meet a real
+// closed source DATA gate. Time cannot turn those three local refusals into
+// evidence that the provider failed an upstream connection.
 func TestNativeSynAdmissionClockLocallyRefusedDoesNotBlameProvider(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		f := newNativeSynAdmissionClockFixture(t)
+		f := newNativeSynAdmissionClockFixture(t, []byte("early application data"))
+		if protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, f.syn) {
+			t.Fatal("local-refusal clock control must contain genuine TCP application bytes")
+		}
 		selected := f.credit.base.selected
 		selected.stateLock.Lock()
 		priorCount, priorBytes, priorPending := selected.packetStats.sendNackCount,
@@ -235,13 +240,16 @@ func TestNativeSynAdmissionClockAcceptedSilentStillReraces(t *testing.T) {
 	})
 }
 
-// A source retry admitted after the real gate opens gets the new admission's
-// clock. The preceding refused offer must neither consume its SYN generation
-// nor prevent reliable wire progress on the same selected provider.
+// A DATA-bearing source retry admitted after the real gate opens gets the new
+// admission's clock. Refusal cannot consume its SYN generation or prevent
+// reliable wire progress on the same selected provider.
 func TestNativeSynAdmissionClockCapacityOpenAdmitsOriginal(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		f := newNativeSynAdmissionClockFixture(t)
+		f := newNativeSynAdmissionClockFixture(t, []byte("early application data"))
+		if protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, f.syn) {
+			t.Fatal("capacity-open clock control must contain genuine TCP application bytes")
+		}
 		if f.offer(t, f.syn) || f.admissions.Load() != 0 || len(f.credit.base.route) != 0 {
 			t.Fatal("capacity-open control did not begin with a genuinely refused native SYN")
 		}
@@ -264,5 +272,159 @@ func TestNativeSynAdmissionClockCapacityOpenAdmitsOriginal(t *testing.T) {
 		if serviceFailures != 0 || strikes != 0 || reraces != 0 || intercepted != 0 || f.update.client.Load() != f.credit.base.selected {
 			t.Fatal("capacity opening fabricated a provider failure or changed the selected flow")
 		}
+	})
+}
+
+// Pure SYN admission and actual wire progress remain independent of the DATA
+// window. Its real retained DATA sibling is not refunded to make room.
+func TestNativeSynAdmissionClockPureControlPassesClosedDataCredit(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		type phaseReceipt struct {
+			token                  uint64
+			phase                  SendPackLifecyclePhase
+			hadError, localRefusal bool
+			boundary               string
+		}
+		var receiptLock sync.Mutex
+		var receipts []phaseReceipt
+		f := newNativeSynAdmissionClockFixture(t, nil, func(settings *ClientSettings) {
+			previous := settings.SendBufferSettings.SendPackLifecycleObserver
+			settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+				previous(event)
+				if event.DestinationId == ControlId {
+					return
+				}
+				receipt := phaseReceipt{token: event.Token, phase: event.Phase, hadError: event.Err != nil}
+				var admission *SendPackAdmissionError
+				if errors.As(event.Err, &admission) {
+					receipt.boundary = admission.Boundary
+					receipt.localRefusal = errors.Is(admission, ErrSendPackNotAdmitted)
+				}
+				receiptLock.Lock()
+				receipts = append(receipts, receipt)
+				receiptLock.Unlock()
+			}
+		})
+		// Copy immutable receipt fields: the native owner may update its
+		// diagnostic error after callback return, so no error pointer escapes.
+		snapshot := func() []phaseReceipt {
+			receiptLock.Lock()
+			defer receiptLock.Unlock()
+			return append([]phaseReceipt(nil), receipts...)
+		}
+		startedTokens := func() []uint64 {
+			var tokens []uint64
+			for _, receipt := range snapshot() {
+				if receipt.phase == SendPackLifecyclePhaseStarted {
+					tokens = append(tokens, receipt.token)
+				}
+			}
+			return tokens
+		}
+		type originalFate struct {
+			token   uint64
+			last    SendPackLifecyclePhase
+			refused bool
+		}
+		requireFates := func(expected ...originalFate) {
+			t.Helper()
+			actual := snapshot()
+			var expectedReceipts, terminals int
+			for _, want := range expected {
+				expectedReceipts += int(want.last)
+				if want.last == SendPackLifecyclePhaseTerminal {
+					terminals++
+				}
+				phase := SendPackLifecyclePhase(0)
+				for _, got := range actual {
+					if got.token != want.token {
+						continue
+					}
+					phase++
+					failed := want.refused && phase != SendPackLifecyclePhaseStarted
+					if got.phase != phase || got.hadError != failed || got.localRefusal != failed ||
+						failed && got.boundary != "resend-capacity" {
+						t.Fatalf("original lifecycle changed: want=%+v receipt=%+v phase=%d", want, got, phase)
+					}
+				}
+				if phase != want.last {
+					t.Fatalf("original %d reached phase%d, want%d", want.token, phase, want.last)
+				}
+			}
+			if len(actual) != expectedReceipts || f.credit.base.started.Load() != int64(len(expected)) || f.credit.base.terminal.Load() != int64(terminals) {
+				t.Fatalf("original receipts lost bounded accounting: events=%d want=%d started=%d terminal=%d", len(actual), expectedReceipts, f.credit.base.started.Load(), f.credit.base.terminal.Load())
+			}
+		}
+		if !protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, f.syn) {
+			t.Fatal("pure-SYN positive control contains application data")
+		}
+		tokens := startedTokens()
+		if len(tokens) != 1 {
+			t.Fatalf("actual retained seed has %d lifecycle originals", len(tokens))
+		}
+		seed := tokens[0]
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseFirstRouteWrite})
+		beforeCount, beforeBytes := f.credit.source.resendQueue.QueueSize()
+		if beforeCount != 1 || beforeBytes <= 1 || !f.credit.source.resendCapacityUnavailable.Load() || f.offer(t, f.credit.tcp) {
+			t.Fatal("pure-SYN control lacks a genuinely closed DATA gate and refused DATA sibling")
+		}
+		tokens = startedTokens()
+		if len(tokens) != 2 {
+			t.Fatalf("first refused DATA has %d lifecycle originals", len(tokens))
+		}
+		refusedBefore := tokens[1]
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true})
+		acceptedAt := time.Now()
+		accepted := f.offer(t, f.syn)
+		if !accepted || f.admissions.Load() != 1 || len(f.credit.base.route) != 0 {
+			t.Fatalf("pure SYN did not acquire real raw ownership behind the held source boundary: admitted=%t receipts=%d route=%d", accepted, f.admissions.Load(), len(f.credit.base.route))
+		}
+		tokens = startedTokens()
+		if len(tokens) != 3 {
+			t.Fatalf("pure SYN has %d lifecycle originals", len(tokens))
+		}
+		syn := tokens[2]
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true}, originalFate{token: syn, last: SendPackLifecyclePhaseStarted})
+		f.update.stateLock.Lock()
+		acceptedClock, acceptedClient := f.update.synWaitStart, f.update.synWaitClient
+		f.update.stateLock.Unlock()
+		if acceptedClock.IsZero() || acceptedClock.Before(acceptedAt) || acceptedClient != f.credit.base.selected {
+			t.Fatal("successful pure SYN did not arm its own provider-specific admission clock")
+		}
+		// Wake the real owner without sending the retained DATA's peer ACK.
+		f.credit.releaseCapacity()
+		synctest.Wait()
+		if count, size := f.credit.source.resendQueue.QueueSize(); count != 2 || size != beforeBytes ||
+			len(f.credit.base.route) != 1 || !f.credit.source.resendCapacityUnavailable.Load() || time.Now() != acceptedAt {
+			t.Fatalf("pure-SYN wire progress changed DATA custody: originals=%d bytes=%d route=%d", count, size, len(f.credit.base.route))
+		}
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true}, originalFate{token: syn, last: SendPackLifecyclePhaseFirstRouteWrite})
+		if f.offer(t, f.credit.tcp) {
+			t.Fatal("pure-SYN progress reopened the unrelated DATA permission")
+		}
+		tokens = startedTokens()
+		if len(tokens) != 4 {
+			t.Fatalf("second refused DATA has %d lifecycle originals", len(tokens))
+		}
+		refusedAfter := tokens[3]
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true}, originalFate{token: syn, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedAfter, last: SendPackLifecyclePhaseTerminal, refused: true})
+		// The captured DATA prefix is acknowledged first. The later decoded
+		// SYN wire then supplies its own genuine cumulative peer receipt.
+		f.credit.releasePeerCredit()
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseTerminal}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true}, originalFate{token: syn, last: SendPackLifecyclePhaseFirstRouteWrite}, originalFate{token: refusedAfter, last: SendPackLifecyclePhaseTerminal, refused: true})
+		f.credit.finishPackets(f.syn)
+		requireFates(originalFate{token: seed, last: SendPackLifecyclePhaseTerminal}, originalFate{token: refusedBefore, last: SendPackLifecyclePhaseTerminal, refused: true}, originalFate{token: syn, last: SendPackLifecyclePhaseTerminal}, originalFate{token: refusedAfter, last: SendPackLifecyclePhaseTerminal, refused: true})
+		f.update.stateLock.Lock()
+		preserved := f.update.synGenerationSeen && f.update.synGenerationNumber == f.path.SequenceNumber &&
+			f.update.synWaitStart.Equal(acceptedClock) && f.update.synWaitClient == acceptedClient && !f.update.receivedInbound.Load()
+		f.update.stateLock.Unlock()
+		count, size := f.credit.source.resendQueue.QueueSize()
+		serviceFailures, strikes, reraces, intercepted := f.failureState(t)
+		if !preserved || count != 0 || size != 0 || serviceFailures != 0 || strikes != 0 || reraces != 0 || intercepted != 0 ||
+			f.update.client.Load() != f.credit.base.selected || f.credit.base.client.Ctx().Err() != nil || time.Now() != acceptedAt {
+			t.Fatal("actual SYN ACK/refund changed its clock, sibling health or provider attribution")
+		}
+		t.Log("PURE_SYN_DATA_PRESSURE_CUSTODY retained_DATA_and_SYN=2 refused_DATA=2 actual_ACK_terminals=2 local_refusal_terminals=2 final_originals=0 timer_advance=0")
 	})
 }

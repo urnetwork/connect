@@ -26,9 +26,9 @@ type pendingReceiverRtt struct {
 	compressionMicros uint32
 }
 
-// One pending reservation can coexist with its previous confirmed tail. Only
-// that tail publishes ready demand; history never retains a physical route.
-// The resend lock protects both records and the acquired carrier generation.
+// One pending reservation coexists with its confirmed tail and one consecutive
+// run of ready originals. A run never stores items or additional routes. The
+// resend lock protects these records and the acquired carrier generation.
 type windowPacingReadyWrite struct {
 	pendingId           Id
 	pendingAtNanos      int64
@@ -38,6 +38,10 @@ type windowPacingReadyWrite struct {
 	confirmedGeneration uint64
 	route               Route
 	lane                Id
+	runFirstNumber      uint64
+	runLastNumber       uint64
+	runReadyAtNanos     int64
+	runLastSentAtNanos  int64
 }
 
 // Route retirement and owner teardown must release the one live channel too.
@@ -68,6 +72,14 @@ func (self *SendSequence) finishPacingReadyWrite(item *sendItem, disposition tra
 	if item == nil || self.resendQueue == nil {
 		return
 	}
+	qualityAfter := int64(0)
+	if self.sendBufferSettings != nil && self.sendBufferSettings.ApplicationPacing {
+		if service := self.windowPacer.service; service != nil {
+			if at := service.qualityGeneration(); !at.IsZero() {
+				qualityAfter = at.UnixNano()
+			}
+		}
+	}
 	self.resendQueue.stateLock.Lock()
 	defer self.resendQueue.stateLock.Unlock()
 	ready := &self.pacingReadyWrite
@@ -79,9 +91,17 @@ func (self *SendSequence) finishPacingReadyWrite(item *sendItem, disposition tra
 		*ready = windowPacingReadyWrite{}
 		return
 	}
-	if ready.route != disposition.route || ready.confirmedGeneration != generation {
+	// The minimum existing proof interval is sufficient for every sampler.
+	// This is actual pre-pacing readiness, never inferred from offer spacing.
+	continuous := ready.runReadyAtNanos > qualityAfter && ready.runLastSentAtNanos > 0 &&
+		ready.runLastNumber < item.sequenceNumber && item.sequenceNumber-ready.runLastNumber == 1 &&
+		ready.pendingAtNanos >= ready.runLastSentAtNanos &&
+		ready.pendingAtNanos-ready.runLastSentAtNanos <= int64(2*deliverySizedWindowSampleInterval)
+	if ready.route != disposition.route || ready.confirmedGeneration != generation || !continuous {
 		ready.route, ready.lane = disposition.route, NewId()
+		ready.runFirstNumber, ready.runReadyAtNanos = item.sequenceNumber, ready.pendingAtNanos
 	}
+	ready.runLastNumber, ready.runLastSentAtNanos = item.sequenceNumber, item.pacingSentAtNanos
 	ready.confirmedId, ready.confirmedAtNanos = item.messageId, ready.pendingAtNanos
 	ready.confirmedGeneration = generation
 	ready.pendingId, ready.pendingAtNanos, ready.pendingGeneration = Id{}, 0, 0

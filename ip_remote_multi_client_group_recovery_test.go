@@ -459,9 +459,9 @@ func TestTcpGroupRecoveryRefusedDescriptorReuseKeepsChargeUntilReturn(t *testing
 		callerOwns = false
 		f.acknowledgeAll(template)
 		if group.collapseOwner == nil || group.completionFlags.Load()&groupCompletionTerminal == 0 ||
-			group.completionFlags.Load()&groupCompletionReturned != 0 || budget.UsedByteCount() != group.collapseOwner.budgetBytes ||
-			budget.UsedByteCount() == 0 || group.completionSelection != retrySelection {
-			t.Fatal("callback-before-return reused a stale selection/refusal flag or released live descriptor charge")
+			group.completionFlags.Load()&groupCompletionReturned != 0 || budget.UsedByteCount() != 0 ||
+			group.collapseOwner.budget != nil || group.collapseOwner.budgetBytes <= 0 || group.completionSelection != retrySelection {
+			t.Fatal("callback-before-return reused a stale selection/refusal flag or released live protocol descriptor")
 		}
 		unpark()
 		if !<-result {
@@ -711,9 +711,9 @@ func TestTcpGroupRecoveryEncryptedKeyOwnsIndependentBudget(t *testing.T) {
 		}
 		unpark()
 		synctest.Wait()
-		if len(controlRoute) != 1 || budget.UsedByteCount() == 0 || f.started.Load() != 0 ||
+		if len(controlRoute) != 1 || budget.UsedByteCount() != 0 || f.started.Load() != 0 ||
 			f.update.sequenceClaims != nil || !f.update.sequenceTime.IsZero() {
-			t.Fatal("independent encrypted-key send did not exclusively own its retained budget")
+			t.Fatal("independent encrypted-key publication changed DATA charge or application ownership")
 		}
 		wire := <-controlRoute
 		pack := decodeSendPackLifecycleWirePack(t, wire)
@@ -721,14 +721,25 @@ func TestTcpGroupRecoveryEncryptedKeyOwnsIndependentBudget(t *testing.T) {
 			MessagePoolReturn(wire)
 			t.Fatal("independent retained wire was not the reliable encrypted-key publication")
 		}
+		f.client.sendBuffer.mutex.Lock()
+		sequence := f.client.sendBuffer.sendSequencesBySequenceId[RequireIdFromBytes(pack.SequenceId)]
+		f.client.sendBuffer.mutex.Unlock()
+		// All workers are quiescent; this does not request another owner wake.
+		if sequence == nil || len(sequence.sendItems) != 1 || !sequence.sendItems[0].noBudget ||
+			sequence.sendItems[0].messageId != RequireIdFromBytes(pack.MessageId) ||
+			MessagePoolRootByteCount(sequence.sendItems[0].transferFrameBytes) == 0 ||
+			!protocolOnlyFrames(pack.Frames) {
+			MessagePoolReturn(wire)
+			t.Fatal("encrypted-key publication lost its actual retained protocol original")
+		}
 		accepted := f.client.sendBuffer.Ack(ControlId, &protocol.Ack{MessageId: pack.MessageId, SequenceId: pack.SequenceId}, 0)
 		MessagePoolReturn(wire)
 		if !accepted {
 			t.Fatal("actual control peer acknowledgement refused")
 		}
 		synctest.Wait()
-		if budget.UsedByteCount() != 0 || f.started.Load() != 0 {
-			t.Fatal("independent control ACK failed to release its own retained budget")
+		if budget.UsedByteCount() != 0 || f.started.Load() != 0 || len(sequence.sendItems) != 0 {
+			t.Fatal("independent ControlId ACK failed to release its actual retained original")
 		}
 	})
 }
@@ -1372,7 +1383,7 @@ func TestTcpGroupRecoveryUnwrittenCandidateDoesNotRetainPromotionHistory(t *test
 			return []*multiClientChannel{f.selected}
 		}
 		result := make(chan int, 1)
-		syn := groupDispositionControlPacket(900, 500, 64, tcpFlagSyn)
+		syn := groupRecoveryPacket(900, 500, 64, tcpFlagSyn, []byte{1})
 		go func() { result <- f.offerTimeout(-1, syn) }()
 		f.requireParked()
 		if len(admitted) != 1 {

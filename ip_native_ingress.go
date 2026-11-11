@@ -112,10 +112,11 @@ func (self *RemoteUserNatMultiClient) sendNativePacketGroupWithResults(
 	if group == nil {
 		return 0
 	}
-	admission := ipPacketGroupAdmission{nativeIngress: true, partitionPureAcks: true}
+	admission := ipPacketGroupAdmission{nativeIngress: true, partitionPureAcks: true, partitionProtocol: true}
 	previousAdmission := group.batchAdmission
 	group.batchAdmission = &admission
 	allAccepted, acksAccepted := false, false
+	var protocolAccepted []bool
 	memberIsAck := func(index int) bool {
 		path := &group.ipPaths[index]
 		return path.Protocol == IpProtocolTcp && path.Ack && !path.Syn && !path.Fin && !path.Rst &&
@@ -128,9 +129,10 @@ func (self *RemoteUserNatMultiClient) sendNativePacketGroupWithResults(
 		group.batchAdmission = previousAdmission
 		if !allAccepted {
 			for index, packet := range group.packets {
-				if !acksAccepted || !memberIsAck(index) {
-					MessagePoolReturn(packet)
+				if protocolAccepted != nil && protocolAccepted[index] || acksAccepted && memberIsAck(index) {
+					continue
 				}
+				MessagePoolReturn(packet)
 			}
 		}
 	}()
@@ -147,6 +149,15 @@ func (self *RemoteUserNatMultiClient) sendNativePacketGroupWithResults(
 		allAccepted = true
 		report(false)
 		return len(group.packets)
+	}
+	if admission.protocolUpdate != nil {
+		protocolAccepted = make([]bool, len(group.packets))
+		return self.sendNativeProtocolRuns(source, provideMode, admission.parsed, admission.protocolUpdate, admission.protocolEpoch, func(index int) {
+			protocolAccepted[index] = true
+			if admitted != nil {
+				admitted(index)
+			}
+		})
 	}
 	if !admission.collapseRejected {
 		return 0

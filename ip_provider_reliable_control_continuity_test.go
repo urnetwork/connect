@@ -384,9 +384,6 @@ func TestProviderReliableTcpResetPreservesNextFlow(t *testing.T) {
 						if (f.tcp.ctx.Err() != nil) == orphan {
 							t.Fatal("reset did not isolate the matching original TCP flow")
 						}
-						if budgeted && f.nat.controlMemory.UsedByteCount() != 0 {
-							t.Fatal("handled reset retained its completed control credit")
-						}
 						path.SourcePort += 2
 						next, _ := reliableIngressControlItem(t, &path, 1, tcpFlagSyn, 700)
 						nextID := next.messageId

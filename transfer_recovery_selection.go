@@ -206,7 +206,8 @@ func (self *SendSequence) selectDueRecovery(
 	// Explicit recovery and a proved same-lane hole retain their
 	// own due boundary. Drained probes share the same fixed bound.
 	if service := self.windowPacer.service; service != nil &&
-		item.recoveryKind == sendRecoveryNone && laneVerdict != laneTimerEndpointDrop && item.sendCount == 1 &&
+		item.recoveryKind == sendRecoveryNone && laneVerdict != laneTimerEndpointDrop &&
+		!self.fifoRepairPassed(item) && item.sendCount == 1 &&
 		item.reliableCarrierObserved && !item.unreliableCarrierObserved &&
 		!item.carrierChanged && flightPolicy.h1Only {
 		deadline := service.probeRecoveryDeadline(self.sequenceId, item.messageId,

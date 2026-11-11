@@ -194,7 +194,9 @@ func TestNativeStaleBoundGateRefusedFreshSourceKeepsOwnership(t *testing.T) {
 				h.inject("a", reraceProviderSignal(t, path))
 			}
 		}
-		accepted := privateStaleBoundNativeSyn(t, h, path)
+		// This control saturates DATA credit. Keep its public native offer paid
+		// with one TFO byte; pure SYN count refusal has separate controls.
+		accepted := privateNativeDataSyn(t, h, path, 5*time.Second)
 		h.multiClient.beforePacketGroupGateForTest = nil
 		update.stateLock.Lock()
 		unchanged := update.client.Load() == nil && update.sequenceAdmissionEpoch == epoch &&

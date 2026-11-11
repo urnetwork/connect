@@ -89,7 +89,7 @@ func (self *windowPermissionCapacityObserver) install(cell windowPathCell, sende
 			at: now, sequenceId: sequence.sequenceId, physicalWrites: sequence.writeCount.Load(),
 			pacerRate: sequence.windowPacer.rate, pacerEstimate: sequence.windowPacer.estimateRate,
 			pacerUpdated: sequence.windowPacer.rateUpdated,
-			permission: ByteCount(sequence.receiveWindowByteCount.Load()),
+			permission:   ByteCount(sequence.receiveWindowByteCount.Load()),
 		}
 		if at := sequence.receiveWindowSetAtNanos.Load(); at != 0 {
 			snapshot.permissionAt = time.Unix(0, at)
@@ -261,16 +261,17 @@ func TestWindowPacingUnchangedLimitedPermissionKeepsOwnership(t *testing.T) {
 }
 
 // Keep the physical matched-ceiling oracle, then inspect joined value copies.
-func checkWindowPermissionCapacity(t *testing.T, after ByteCount, growth bool) {
+func checkWindowPermissionCapacity(t *testing.T, after ByteCount, growth bool, observe ...func(windowPathCell, *Client, *Client)) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	observer := &windowPermissionCapacityObserver{}
+	observers := append([]func(windowPathCell, *Client, *Client){observer.install}, observe...)
 	reading := checkWindowMismatchCell(t, windowPathCell{
 		SendWindow: mib(48), ReceiveWindow: kib(64), ReceiveWindowAfter: after,
 		WindowChangeAfter: 2 * time.Second, Warmup: 4 * time.Second,
 		RoundTrip: 100 * time.Millisecond, Compression: 50 * time.Millisecond,
 		Flows: 8, Rate: 12500000,
-	}, observer.install)
+	}, observers...)
 	// The unchanged helper has canceled and joined every worker/client and
 	// checked each owned budget before any final witness is inspected.
 	observer.stateLock.Lock()

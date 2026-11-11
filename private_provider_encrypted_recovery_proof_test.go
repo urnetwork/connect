@@ -1,7 +1,7 @@
-// Recovery memory is not contract authority. A real signed Required-encryption
+// Protocol exemption is not contract authority. A real signed Required
 // session carries a source-owned headed retry with a complete proof; the
-// invalid control changes only that proof's MAC before sealing with the real
-// source cipher. Both controls reach the same bounded recovery child.
+// invalid control changes only its MAC before sealing with the real cipher.
+// Separate actual DATA custody fills RX, with no protocol byte reservation.
 package connect
 
 import (
@@ -77,16 +77,16 @@ func privateProviderRecoveryFullProof(t *testing.T, f *privateProviderEncryptedA
 	return frame
 }
 
-// Ten committed real ACK tails saturate RX while one actual return chunk waits
-// for the missing head. Both proof variants must allocate actual child custody;
-// only a valid proof may reach NAT or advance cumulative delivery authority.
+// The proof-bearing owner must authenticate before actual NAT dispatch. A
+// real accepted successor stays unencoded behind its occupied count-one slot;
+// only a valid head ACK permits the remaining ten actual ACK originals.
 func testPrivateProviderEncryptedRecoveryProof(t *testing.T, changed bool) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
 		f := newPrivateProviderEncryptedAckFixture(t)
 		f.gate = make(chan struct{})
 		rootTotal, parentTotal := f.root.TotalByteCount(), f.parent.TotalByteCount()
-		verified, first := f.sequence.receiveContract, f.nextNumber
+		verified := f.sequence.receiveContract
 		verifiedProof := verified.verifiedReceiveProof
 		end := uint32(500 + 1280)
 		f.tcp.mutex.Lock()
@@ -100,86 +100,95 @@ func testPrivateProviderEncryptedRecoveryProof(t *testing.T, changed bool) {
 			t.Fatal("full-proof fixture has no live paid TCP return chunk")
 		}
 		head := f.writeAcks(2, end)
-		tails := make([]*privateProviderEncryptedAckFrame, 10)
-		for index := range tails {
-			tails[index] = f.writeAcks(1, end)
-		}
-		cost := func(frame *privateProviderEncryptedAckFrame) ByteCount {
-			probe := &receiveItem{transferItem: transferItem{queueByteCount: frame.scan.retainedByteCount}, ack: true, frames: frame.pack.Frames}
-			if !f.sequence.prepareReceiveDeliveryCredit(probe) || !probe.deliveryPrepared {
-				t.Fatal("full-proof fixture could not estimate actual downstream ownership")
-			}
-			return probe.QueueByteCount()
-		}
-		tailFull := cost(tails[0])
-		repairMetadata, rxTarget := privateProviderRepairFixtureGeometry(t, f.sequence, tailFull, 10)
-		f.rx.SetTotalByteCount(rxTarget)
-		f.recovery.SetTotalByteCount(f.rx.TotalByteCount())
-		for _, tail := range tails {
-			f.forward(tail.windowRoundFrame, f.receiverIn)
-			item := f.sequence.receiveQueue.GetBySequenceNumber(tail.pack.SequenceNumber)
-			if item == nil || !item.committed || !item.deliveryPrepared || item.QueueByteCount() != tailFull {
-				t.Fatal("full-proof fixture did not retain an actual committed ACK original")
-			}
-			f.feedback()
-		}
-		privateProviderAssertRepairFixtureCustody(t, f.sequence, repairMetadata, 10)
-		if f.rx.UsedByteCount() != f.rx.TotalByteCount() || f.sequence.holdPromise.reservedByteCount != tailFull ||
-			f.ackedCount != 1 || f.deliveredCount != 1 || f.tcp.returnByteCount != retained || len(f.entered) != 0 {
-			t.Fatal("full-proof fixture did not isolate the missing head under actual RX pressure")
-		}
+		first := head.pack.SequenceNumber
 		retry := f.retry(head)
 		candidate := privateProviderRecoveryFullProof(t, f, retry, changed)
-		full := cost(candidate)
-		if full <= tailFull || full > f.recovery.Available() || candidate.scan.retainedByteCount <= 0 {
-			t.Fatal("full-proof fixture did not require available bounded child growth")
+		if !candidate.pack.DeliverImmediately || !protocolOnlyPack(candidate.pack) {
+			t.Fatal("full-proof control changed the actual pure ACK immediate policy")
 		}
+		pressure := newPrivateProviderProtocolDataPressure(t, f.rx)
+		queued := f.enqueueAcks(1, end)
+		f.assertQueuedAckOriginal(head.pack, queued)
 		before := f.recovery.Stats()
 		f.forward(candidate.windowRoundFrame, f.receiverIn)
-		after := f.recovery.Stats()
-		if after.ReservedByteCount-before.ReservedByteCount != full ||
-			f.root.TotalByteCount() != rootTotal || f.parent.TotalByteCount() != parentTotal ||
-			verified.verifiedReceiveProof != verifiedProof {
-			t.Fatalf("changed=%t: proof control did not reach the exact paid child before changing delivery authority: before=%+v after=%+v full=%d next=%d", changed, before, after, full, f.sequence.nextSequenceNumber)
+		pressure.check(t)
+		privateProviderAssertImmediateCount(t, f.windowRoundFixture, head.pack, 1)
+		if f.recovery.Stats() != before || f.root.TotalByteCount() != rootTotal || f.parent.TotalByteCount() != parentTotal ||
+			verified.verifiedReceiveProof != verifiedProof || f.ackedCount != 1 || f.ackCounts[first] != 0 || queued.callbacks != 0 {
+			t.Fatal("protocol proof changed byte/count permission, prior verification or actual ACK authority")
 		}
+		privateProviderAssertOriginalPending(t, f.windowRoundFixture, head.pack, true, true)
 		if changed {
 			f.feedback()
 			if !f.sequence.rejectRetransmits || f.sequence.ctx.Err() == nil || len(f.entered) != 0 ||
 				f.tcp.returnByteCount != retained || f.natBudget.UsedByteCount() != natUsed ||
-				f.ackedCount != 1 || f.ackCounts[first] != 0 || f.deliveredCount != 1 ||
-				f.sequence.nextSequenceNumber != first ||
-				after.UsedByteCount != 0 || after.ReleasedByteCount-before.ReleasedByteCount != full ||
-				f.sequence.holdPromise.ingressHead != nil {
-				t.Fatal("changed signed proof used child memory as delivery authority or retained failed custody")
+				f.ackedCount != 1 || f.ackCounts[first] != 0 || queued.callbacks != 0 || f.deliveredCount != 1 ||
+				f.sequence.nextSequenceNumber != first || f.sequence.holdPromise.ingressHead != nil {
+				t.Fatal("changed signed proof used protocol exemption as authority or falsely completed its queued successor")
 			}
 		} else {
-			if f.sequence.ctx.Err() != nil || len(f.entered) == 0 || f.recovery.UsedByteCount() <= 0 ||
-				f.tcp.returnByteCount != retained || f.ackedCount != 1 || f.ackCounts[first] != 0 {
-				t.Fatal("valid signed proof did not reach the held NAT boundary with paid child custody")
+			if f.sequence.ctx.Err() != nil || len(f.entered) == 0 || f.tcp.returnByteCount != retained {
+				t.Fatal("valid signed proof did not reach the held actual NAT owner under full DATA pressure")
 			}
+			privateProviderAssertProtocolReceiptCustody(t, f.sequence, 1)
+			f.assertQueuedAckOriginal(head.pack, queued)
 			close(f.gate)
 			synctest.Wait()
+			privateProviderAssertReturnFrontier(t, f.tcp, end)
+			privateProviderAssertOriginalPending(t, f.windowRoundFixture, head.pack, true, true)
 			f.feedback()
+			if f.ackCounts[first] != 1 || f.ackedCount != 2 {
+				t.Fatal("the source serialized its successor without the actual valid-proof head ACK")
+			}
+			privateProviderAssertOriginalRetired(t, f.windowRoundFixture, head.pack)
+			originals := []*privateProviderEncryptedAckFrame{head}
+			for index := range 10 {
+				var tail *privateProviderEncryptedAckFrame
+				if index == 0 {
+					tail = f.takeAckOriginal(queued)
+				} else {
+					tail = f.writeAcks(1, end)
+				}
+				originals = append(originals, tail)
+				privateProviderAssertOriginalPending(t, f.windowRoundFixture, tail.pack, true, true)
+				privateProviderAssertImmediateCount(t, f.windowRoundFixture, tail.pack, 1)
+				f.forward(tail.windowRoundFrame, f.receiverIn)
+				privateProviderAssertReturnFrontier(t, f.tcp, end)
+				privateProviderAssertOriginalPending(t, f.windowRoundFixture, tail.pack, true, true)
+				f.feedback()
+				if f.ackCounts[tail.pack.SequenceNumber] != 1 || f.ackedCount != 3+index {
+					t.Fatal("full-proof ACK train recycled count one without exactly one actual terminal ACK")
+				}
+				privateProviderAssertOriginalRetired(t, f.windowRoundFixture, tail.pack)
+				privateProviderAssertImmediateCount(t, f.windowRoundFixture, tail.pack, 0)
+			}
+			pressure.check(t)
+			f.assertCompletedOriginals(originals)
 			if f.ackedCount != 12 || f.deliveredCount != 13 || f.ackCounts[first] != 1 ||
-				f.sequence.nextSequenceNumber != first+11 || f.tcp.returnByteCount != 0 ||
-				f.rx.UsedByteCount() != 0 || f.recovery.UsedByteCount() != 0 || f.sequence.receiveQueue.Len() != 0 {
-				t.Fatal("valid signed full-proof child did not retire the actual return chunk and all cumulative callbacks")
+				f.recovery.Stats() != before || f.sequence.receiveQueue.Len() != 0 {
+				t.Fatal("valid signed proof did not retire actual return custody and all eleven real reliable originals")
+			}
+			for _, original := range originals {
+				if f.ackCounts[original.pack.SequenceNumber] != 1 {
+					t.Fatal("full-proof delivery skipped or repeated an original's actual terminal callback")
+				}
 			}
 		}
+		pressure.close()
 		f.close()
-		t.Logf("[provider-child-proof] changed_mac=%t encrypted=true actual_signed_contract=true head_c=%d child_d=%d retained_chunk_bytes=%d cumulative_head_ack=%d root=0 rx=0 child=0 nat=0 joined=true", changed, candidate.scan.retainedByteCount, full, retained, f.ackCounts[first])
+		t.Logf("[provider-protocol-proof] changed_mac=%t encrypted=true actual_signed_contract=true immediate_limit=1 encoded_head=1 queued_successor=1 protocol_data_bytes=0 retained_chunk_bytes=%d cumulative_head_ack=%d root=0 rx=0 child=0 nat=0 joined=true", changed, retained, f.ackCounts[first])
 	})
 }
 
-// The unchanged signed proof is the positive control for the actual encrypted
-// child path, including retained origin-chunk retirement and final cleanup.
+// The unchanged signed proof authorizes actual encrypted protocol delivery,
+// retained origin-chunk retirement and exact final ownership cleanup.
 func TestPrivateProviderEncryptedRecoveryAcceptsVerifiedFullProof(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	testPrivateProviderEncryptedRecoveryProof(t, false)
 }
 
-// A changed signed MAC reaches bounded child custody but is rejected by the
-// ordinary contract verifier before NAT delivery, inner ACK or cumulative ACK.
+// A changed signed MAC remains uncharged protocol but is rejected by the
+// ordinary verifier before NAT delivery, inner ACK or a real Transfer ACK.
 func TestPrivateProviderEncryptedRecoveryRejectsChangedSignedProof(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	testPrivateProviderEncryptedRecoveryProof(t, true)

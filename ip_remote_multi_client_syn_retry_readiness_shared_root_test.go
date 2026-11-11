@@ -1,4 +1,4 @@
-// Shared-root metadata refusal preserves the full ordinary retry field.
+// DATA-bearing SYN shared-root metadata refusal preserves the full ordinary retry field.
 package connect
 
 import (
@@ -15,7 +15,7 @@ func TestNativeSynRetryReadinessSharedRootRefusalDoesNotNarrowField(t *testing.T
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		control := newSynRetryReadyControl(t, 51412)
+		control := newSynRetryDataReadyControl(t, 51412)
 		ready, paid, packetPaid := control.owner.readiness, control.owner.readiness.credit, control.owner.credit
 		count := len(ready.slots) + 1
 		const childMaximum ByteCount = 64 * 1024

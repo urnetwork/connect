@@ -9,103 +9,126 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Transfers the constructed input through the existing paid scanner/decoder.
+// The resulting original has real repair custody; input roots return separately.
+func receiveDeliveryMergeOwnedPack(t *testing.T, fixture *reliableTcpIngressFixture, sequence *ReceiveSequence, input *ReceivePack) *ReceivePack {
+	t.Helper()
+	defer input.messagePoolReturn()
+	owned := fixture.decodeOwnedPack(sequence, input)
+	if owned == nil {
+		t.Fatal("merge original did not acquire real owned decode custody")
+	}
+	if owned.decodedOwner == nil || !owned.receiveMemoryOwned || owned.ingressSequence != sequence ||
+		owned.decodedOwner.receiveItem.memoryBudget != sequence.receiveQueue.budget {
+		owned.messagePoolReturn()
+		t.Fatal("merge original lacks its exact bound physical owner")
+	}
+	return owned
+}
+
 // Runs the real worker's contract failure on either a fresh or held head,
-// using both legacy accounting and exact retained admission.
-//
-// Exact retained admission decodes every Pack through the production scanner
-// and paid decoder, as the client's receive loop does for that setting. Since
-// 00d4f62b a held original commits its selective ACK only with repair escrow,
-// and an explicit no-contract peer reserves just the inline owner, which
-// cannot cover an original carrying a proof (receiveHeldHeadRepairLimit; see
-// ReceiveHeadContractRepairByteCount). So under exact admission the held bad
-// contract waits tentatively, without a lease, and must still release every
-// owner when it reaches the head. Legacy accounting keeps its SACK lease.
+// using legacy accounting and exact retained admission. Held proofs cover
+// both a paid repair lease and a larger proof that must remain tentative.
 func runReceiveDeliveryMergeContractFailure(t *testing.T, held bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	for _, retained := range []bool{false, true} {
-		synctest.Test(t, func(t *testing.T) {
-			f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
-			budget := NewTransferMemoryBudget(kib(256))
-			sequence := f.runningReceiveSequence(func(settings *ReceiveBufferSettings) {
-				settings.SequenceBufferSize = 4
-				settings.ReceiveQueueMinByteCount = 0
-				settings.ReceiveQueueMaxByteCount = kib(64)
-				settings.ReceiveQueueRetainedByteAccounting = retained
+		for _, repairFits := range []bool{true, false} {
+			if !repairFits && (!held || !retained) {
+				continue
+			}
+			synctest.Test(t, func(t *testing.T) {
+				f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
+				budget := NewTransferMemoryBudget(kib(256))
+				sequence := f.runningReceiveSequence(func(settings *ReceiveBufferSettings) {
+					settings.SequenceBufferSize = 4
+					settings.ReceiveQueueMinByteCount = 0
+					settings.ReceiveQueueMaxByteCount = kib(64)
+					settings.ReceiveQueueRetainedByteAccounting = retained
+					if retained {
+						settings.ReceiveQueueBudget = budget
+					}
+				})
+				number := uint64(0)
+				if held {
+					number = 1
+				}
+				pack, id := f.uploadPack(sequence, number, 101, []byte("rejected contract owner"))
+				pack.Pack.ContractFrame = &protocol.Frame{MessageBytes: []byte{0x80}}
 				if retained {
-					settings.ReceiveQueueBudget = budget
+					if repairFits {
+						pack.Pack.ContractFrame.MessageType = protocol.MessageType_TransferContract
+					}
+					if held && repairFits {
+						// A no-contract peer's repair escrow covers its inline owner,
+						// not a copied proof root. This present empty proof still fails
+						// real verification after the committed owner reaches the head.
+						pack.Pack.ContractFrame.MessageBytes = nil
+						if f.client.ContractManager().Verify(nil, nil, protocol.ProvideMode(0)) {
+							pack.messagePoolReturn()
+							t.Fatal("empty invalid proof unexpectedly verified")
+						}
+					}
+					pack = receiveDeliveryMergeOwnedPack(t, f, sequence, pack)
 				}
-			})
-			upload := func(number uint64, payload []byte, configure func(*protocol.Pack)) (*ReceivePack, Id) {
-				t.Helper()
-				pack, id := f.uploadPack(sequence, number, 101, payload)
-				if configure != nil {
-					configure(pack.Pack)
-				}
-				if !retained {
-					return pack, id
-				}
-				defer pack.messagePoolReturn()
-				owned := f.decodeOwnedPack(sequence, pack)
-				if owned == nil {
-					t.Fatal("paid decoder refused a Pack with free receive capacity")
-				}
-				return owned, id
-			}
-			number := uint64(0)
-			if held {
-				number = 1
-			}
-			pack, id := upload(number, []byte("rejected contract owner"), func(pack *protocol.Pack) {
-				pack.ContractFrame = &protocol.Frame{MessageBytes: []byte{0x80}}
-			})
-			witness := MessagePoolShareReadOnly(pack.Pack.Frames[0].MessageBytes)
-			defer func() { MessagePoolReturn(witness) }()
-			if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
-				pack.messagePoolReturn()
-				t.Fatalf("contract fixture handoff: ok=%t err=%v", ok, err)
-			}
-			synctest.Wait()
-			if held {
-				item := sequence.receiveQueue.GetByMessageId(id)
-				if item == nil || item.committed == retained || retained && item.memoryBudget != budget ||
-					retained && (sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0) {
-					t.Fatal("bad contract did not reach the real held-owner boundary")
-				}
-				head, _ := upload(0, []byte("valid predecessor"), nil)
-				if ok, err := sequence.Pack(head, 0); !ok || err != nil {
-					head.messagePoolReturn()
-					t.Fatalf("predecessor handoff: ok=%t err=%v", ok, err)
+				witness := MessagePoolShareReadOnly(pack.Pack.Frames[0].MessageBytes)
+				defer func() { MessagePoolReturn(witness) }()
+				if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
+					pack.messagePoolReturn()
+					t.Fatalf("contract fixture handoff: ok=%t err=%v", ok, err)
 				}
 				synctest.Wait()
-			}
-			select {
-			case <-sequence.exit:
-			default:
-				t.Fatal("contract failure did not join the receive worker")
-			}
-			q := sequence.deliveryQueue
-			if sequence.ctx.Err() == nil || !sequence.rejectRetransmits ||
-				sequence.nextSequenceNumber != number || q == nil {
-				t.Fatal("fixture missed the terminal contract boundary before advancement")
-			}
-			if len(q.items) != 0 || len(q.admitted) != 0 || q.bytes != 0 || q.controlCount != 0 ||
-				sequence.receiveQueue.Len() != 0 || budget.UsedByteCount() != 0 {
-				t.Fatalf("retained=%t held=%t: contract failure stranded a receipt or reservation", retained, held)
-			}
-			if present, head := reliableIngressCumulativeHead(sequence); present && head.sequenceNumber >= number {
-				t.Fatal("rejected contract acquired cumulative delivery evidence")
-			}
-			if f.client.Ctx().Err() != nil || f.provider.ctx.Err() != nil {
-				t.Fatal("one contract failure closed the shared client/provider")
-			}
-			// The witness must be the only remaining pool owner after exit.
-			probe := witness
-			witness = nil
-			if !MessagePoolReturn(probe) {
-				t.Fatal("contract failure left the packet rooted outside its witness")
-			}
-		})
+				if held {
+					item := sequence.receiveQueue.GetByMessageId(id)
+					if item == nil || item.committed != (!retained || repairFits) || retained && item.memoryBudget != budget ||
+						retained && !repairFits && (sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0) {
+						t.Fatal("bad contract did not reach the real held-owner boundary")
+					}
+					if retained && repairFits {
+						assertReliableIngressRepairCustody(t, sequence, item)
+						if item.contractFrame == nil || len(item.contractFrame.MessageBytes) != 0 ||
+							!item.deliveryPrepared || item.deliveryPrepaid <= 0 {
+							t.Fatal("committed held original lost its invalid proof or paid downstream custody")
+						}
+					}
+					head, _ := f.uploadPack(sequence, 0, 101, []byte("valid predecessor"))
+					if retained {
+						head = receiveDeliveryMergeOwnedPack(t, f, sequence, head)
+					}
+					if ok, err := sequence.Pack(head, 0); !ok || err != nil {
+						head.messagePoolReturn()
+						t.Fatalf("predecessor handoff: ok=%t err=%v", ok, err)
+					}
+					synctest.Wait()
+				}
+				select {
+				case <-sequence.exit:
+				default:
+					t.Fatal("contract failure did not join the receive worker")
+				}
+				q := sequence.deliveryQueue
+				if sequence.ctx.Err() == nil || !sequence.rejectRetransmits ||
+					sequence.nextSequenceNumber != number || q == nil {
+					t.Fatal("fixture missed the terminal contract boundary before advancement")
+				}
+				if len(q.items) != 0 || len(q.admitted) != 0 || q.bytes != 0 || q.controlCount != 0 ||
+					sequence.receiveQueue.Len() != 0 || budget.UsedByteCount() != 0 {
+					t.Fatalf("retained=%t held=%t: contract failure stranded a receipt or reservation", retained, held)
+				}
+				if present, head := reliableIngressCumulativeHead(sequence); present && head.sequenceNumber >= number {
+					t.Fatal("rejected contract acquired cumulative delivery evidence")
+				}
+				if f.client.Ctx().Err() != nil || f.provider.ctx.Err() != nil {
+					t.Fatal("one contract failure closed the shared client/provider")
+				}
+				// The witness must be the only remaining pool owner after exit.
+				probe := witness
+				witness = nil
+				if !MessagePoolReturn(probe) {
+					t.Fatal("contract failure left the packet rooted outside its witness")
+				}
+			})
+		}
 	}
 }
 
@@ -170,12 +193,6 @@ func TestReceiveDeliveryMergeFatalBatchReleasesAdmittedReceipt(t *testing.T) {
 // A head-reset duplicate can pass exact preflight before the original held
 // owner wins. The refused copy must release only its new reservation, not the
 // original's SACK lease or the hold's promised predecessor credit.
-//
-// Since 00d4f62b a selective lease needs repair escrow that only a paid decoded
-// owner can fund, so every copy enters through the production scanner and paid
-// decoder, as in the client's receive loop. A copy's new reservation is then
-// its own decode claim, taken before receive; it must be exactly what the
-// refused copy returns.
 func TestReceiveDeliveryMergeHeadDuplicateReturnsPreflightCredit(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -203,37 +220,27 @@ func TestReceiveDeliveryMergeHeadDuplicateReturnsPreflightCredit(t *testing.T) {
 				t.Error("duplicate cleanup retained memory without a packet owner")
 			}
 		}()
-		owned := func(number uint64, configure func(*protocol.Pack)) *ReceivePack {
-			t.Helper()
-			input, _ := f.uploadPack(sequence, number, 101, []byte("original held bytes"))
-			defer input.messagePoolReturn()
-			if configure != nil {
-				configure(input.Pack)
-			}
-			pack := f.decodeOwnedPack(sequence, input)
-			if pack == nil {
-				t.Fatal("paid decoder refused a copy with free receive capacity")
-			}
-			return pack
-		}
 		// The later committed item makes sequence 1 itself lie below the
 		// promise boundary. A duplicate must not spend that shared promise.
-		later := owned(2, nil)
+		later, _ := f.uploadPack(sequence, 2, 101, []byte("original held bytes"))
+		later = receiveDeliveryMergeOwnedPack(t, f, sequence, later)
 		if accepted, err := sequence.receive(later); !accepted || err != nil {
 			later.messagePoolReturn()
 			t.Fatalf("later receive: accepted=%t err=%v", accepted, err)
 		}
-		original := owned(1, nil)
-		id := RequireIdFromBytes(original.Pack.MessageId)
+		original, id := f.uploadPack(sequence, 1, 101, []byte("original held bytes"))
+		original = receiveDeliveryMergeOwnedPack(t, f, sequence, original)
 		if accepted, err := sequence.receive(original); !accepted || err != nil {
 			original.messagePoolReturn()
 			t.Fatalf("original receive: accepted=%t err=%v", accepted, err)
 		}
 		held := sequence.receiveQueue.GetByMessageId(id)
-		if held == nil || !held.committed || held.memoryBudget != budget {
+		if held == nil || !held.committed || held.memoryBudget != budget || held.decodedOwner == nil ||
+			!held.decodedOwner.receivePack.receiveMemoryOwned || !held.decodedOwner.receivePack.heldHeadRepairEligible {
 			t.Fatal("original did not acquire real exact held custody")
 		}
 		before, promised, heldCharge := budget.UsedByteCount(), sequence.holdPromise.reservedByteCount, held.queueByteCount
+		reserved, released := budget.reservedByteCount.Load(), budget.releasedByteCount.Load()
 		if !sequence.holdPromised(1) || promised <= 0 {
 			t.Fatal("duplicate does not lie inside an actually funded promise")
 		}
@@ -241,16 +248,8 @@ func TestReceiveDeliveryMergeHeadDuplicateReturnsPreflightCredit(t *testing.T) {
 		// Cover an out-of-order duplicate, a sender head reset, and then a
 		// duplicate of the now-current held head, without running its drain.
 		for _, head := range []bool{false, true, false} {
-			reserved, released := budget.reservedByteCount.Load(), budget.releasedByteCount.Load()
-			duplicate := owned(1, func(pack *protocol.Pack) {
-				pack.MessageId, pack.Head = id.Bytes(), head
-			})
-			claim := duplicate.decodedOwner.receiveItem.QueueByteCount()
-			if claim <= 0 || budget.reservedByteCount.Load()-reserved != int64(claim) ||
-				sequence.holdPromise.reservedByteCount != promised {
-				duplicate.messagePoolReturn()
-				t.Fatal("duplicate decode borrowed the predecessor promise instead of paying for itself")
-			}
+			duplicate, _ := f.uploadPack(sequence, 1, 101, []byte("original held bytes"))
+			duplicate.Pack.MessageId, duplicate.Pack.Head = id.Bytes(), head
 			accepted, err := sequence.receive(duplicate)
 			if !accepted {
 				duplicate.messagePoolReturn()
@@ -262,7 +261,7 @@ func TestReceiveDeliveryMergeHeadDuplicateReturnsPreflightCredit(t *testing.T) {
 				sequence.receiveQueue.GetByMessageId(id) != held || held.memoryBudget != budget ||
 				budget.UsedByteCount() != before || held.queueByteCount != heldCharge ||
 				sequence.holdPromise.reservedByteCount != promised ||
-				budget.reservedByteCount.Load()-reserved != int64(claim) || budget.releasedByteCount.Load()-released != int64(claim) {
+				budget.reservedByteCount.Load() != reserved || budget.releasedByteCount.Load() != released {
 				t.Fatal("duplicate changed the original owner, spent its predecessor promise, or reserved fresh credit")
 			}
 		}

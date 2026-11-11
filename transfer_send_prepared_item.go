@@ -23,7 +23,7 @@ func (self *SendSequence) prepareSendItem(
 		// acknowledged lane (FILLFRACTION.md)
 		self.noAckHeadroomCharge == nil
 	item = takeSendItem()
-	*item = sendItem{acks: acks}
+	*item = sendItem{acks: acks, noBudget: len(frames) == 0 || acks.bypassesBudget(), deliverImmediately: acks.deliversImmediately()}
 	prepared := false
 	defer func(owner *sendItem) {
 		if !prepared {
@@ -39,7 +39,7 @@ func (self *SendSequence) prepareSendItem(
 		if err := self.ctx.Err(); err != nil {
 			return err
 		}
-		if !effectiveAck || !self.resendQueue.lifetimeBudget {
+		if item.noBudget || !effectiveAck || !self.resendQueue.lifetimeBudget {
 			return nil
 		}
 		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(frames), len(frames))

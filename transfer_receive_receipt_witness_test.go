@@ -197,10 +197,9 @@ func TestReceiveReceiptAdmissionUnpooledHeldCancelClearsOwners(t *testing.T) {
 			settings.ReceiveQueueMaxByteCount = 16 * 1024
 			settings.ReceiveHoldPolicy = ReceiveHoldRefuse
 		})
-		f.paidOffers = true
 		delivered := f.observeGeneric()
 		messageId := NewId()
-		f.offerGeneric(1, messageId, 12*1024+1)
+		f.offerGenericWithDecodedOwner(true, 1, messageId, 12*1024+1)
 		sequence := f.sequence(f.sequenceId, 0)
 		if sequence == nil {
 			t.Fatal("actual unpooled held sequence was not constructed")
@@ -208,7 +207,8 @@ func TestReceiveReceiptAdmissionUnpooledHeldCancelClearsOwners(t *testing.T) {
 		held := sequence.receiveQueue.GetByMessageId(messageId)
 		if held == nil || len(held.frames) != 1 || !held.committed || held.memoryBudget != f.receiveBudget ||
 			!f.hasAck(f.sequenceId, messageId, true) || f.hasAck(f.sequenceId, messageId, false) ||
-			delivered.Load() != 0 || sequence.deliveryQueue != nil {
+			held.decodedOwner == nil || !held.decodedOwner.receivePack.receiveMemoryOwned ||
+			!held.decodedOwner.receivePack.heldHeadRepairEligible || delivered.Load() != 0 || sequence.deliveryQueue != nil {
 			t.Fatal("actual unpooled selective owner was not established")
 		}
 		frame := held.frames[0]

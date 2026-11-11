@@ -6,11 +6,47 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Observes the real protocol-count waiter through its unchanged cancellation
+// channel. Installed only after the seed caller returns and the source is
+// parked before Run, before the evaluator receives this client. No owner,
+// counter, grant, deadline, or cancellation state is manufactured.
+type expandProtocolAdmissionWaitContext struct {
+	context.Context
+	admission *sendPackAdmission
+	waiting   chan *sendPackAdmissionWaiter
+	reported  atomic.Bool
+}
+
+// acquirePackAdmissionWithin evaluates the source Done channel after its
+// tryAcquire has registered and unlocked the actual waiter. TryLock makes this
+// observer nonblocking even at other Done call sites or during cancellation;
+// only a real full gate with its one ungranted waiter can publish the witness.
+func (self *expandProtocolAdmissionWaitContext) Done() <-chan struct{} {
+	done := self.Context.Done()
+	if self.reported.Load() || !self.admission.mutex.TryLock() {
+		return done
+	}
+	var waiter *sendPackAdmissionWaiter
+	if !self.admission.closed && self.admission.count == self.admission.capacity &&
+		self.admission.capacity == 1 && len(self.admission.waiters) == 1 && !self.admission.waiters[0].granted {
+		waiter = self.admission.waiters[0]
+	}
+	self.admission.mutex.Unlock()
+	if waiter != nil && self.reported.CompareAndSwap(false, true) {
+		select {
+		case self.waiting <- waiter:
+		default: // The one publication has a private buffer of one.
+		}
+	}
+	return done
+}
 
 // The acquisition caller and A's real ACK remain explicitly parked while B is
 // in its actual source capacity queue. No fake-clock wait samples a blocked lock.
@@ -47,17 +83,18 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 	window.clientChannelArgs <- firstArgs
 	budget := NewTransferMemoryBudget(0)
 	capacityPublished := make(chan struct{})
-	capacityWaiting := make(chan struct{})
+	capacityWaiting := make(chan *sendPackAdmissionWaiter, 1)
 	createdB := make(chan *Client, 1)
 	addedA := make(chan *multiClientChannel, 1)
 	acquisition := make(chan *sync.Mutex, 1)
 	releaseAcquisition := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseAcquisition) }) }
-	var capacityOnce, waitingOnce sync.Once
+	var capacityOnce sync.Once
 	var clientsLock sync.Mutex
 	clients := []*Client{}
 	var sourceB *SendSequence
+	var blockedB *sendPackAdmissionWaiter
 	var expandDone <-chan int
 	knownSenders := 0 // Only this test goroutine writes cleanup eligibility.
 	aReturned, aFinished := make(chan struct{}), make(chan struct{})
@@ -119,13 +156,16 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 		if isB {
 			settings.SendBufferSettings.ResendQueueBudget = budget
 			settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
-			previous := settings.SendBufferSettings.beforeResendCapacityWaitForTest
-			settings.SendBufferSettings.beforeResendCapacityWaitForTest = func(id sendSequenceId) {
+			settings.SendBufferSettings.SequenceBufferSize = 1
+			settings.EncryptionSettings.Mode = EncryptionModeOff
+			previous := settings.SendBufferSettings.beforeRunSendSequenceForTest
+			settings.SendBufferSettings.beforeRunSendSequenceForTest = func(id sendSequenceId) {
 				if previous != nil {
 					previous(id)
 				}
-				if id.Destination == secondArgs.Destination.Tail() && id.LogicalLane == 0 {
+				if id.Destination == secondArgs.Destination.Tail() && id.LogicalLane == 0 && !id.ForceStream && !id.CompanionContract {
 					capacityOnce.Do(func() { close(capacityPublished) })
+					<-ctx.Done()
 				}
 			}
 		}
@@ -139,12 +179,16 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 		if !isB {
 			return client, nil
 		}
-		// This real ordinary probe creates the exact provider sequence. With a
-		// zero exact retained budget it cannot materialize a provider frame.
+		// The real NoBudget seed fills the constructor-owned protocol slot,
+		// independently of the unchanged zero DATA budget. Its worker cannot
+		// dequeue the seed before this candidate is canceled.
 		frame := RequireToFrameWithDefaultProtocolVersion(&protocol.IpPing{})
-		accepted, _ := client.SendMultiHopWithTimeoutDetailed(frame, secondArgs.Destination, nil, 0)
+		accepted, seedErr := client.SendMultiHopWithTimeoutDetailed(frame, secondArgs.Destination, nil, 0, NoBudget())
 		if !accepted {
 			MessagePoolReturn(frame.MessageBytes)
+		}
+		if !accepted || seedErr != nil {
+			return client, fmt.Errorf("B protocol seed was not admitted: accepted=%t err=%v", accepted, seedErr)
 		}
 		select {
 		case <-capacityPublished:
@@ -159,19 +203,46 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 			}
 		}
 		client.sendBuffer.mutex.Unlock()
-		if sourceB == nil || sourceB.resendQueue.Budget() != budget || !sourceB.resendCapacityUnavailable.Load() {
-			return client, fmt.Errorf("B did not publish its actual zero-budget source capacity")
+		if sourceB == nil || sourceB.resendQueue.Budget() != budget || sourceB.resendCapacityUnavailable.Load() ||
+			sourceB.resendCapacityUnavailable.waiterCount.Load() != 0 || sourceB.resendQueue.Len() != 0 || len(sourceB.packs) != 1 {
+			return client, fmt.Errorf("B protocol seed did not remain independently queued before Run")
 		}
-		// Installed before B is handed to the evaluator; the seed had no
-		// positive admission timeout and cannot invoke this producer hook.
-		source := sourceB
-		source.afterRetainedAdmissionDemandForTest = func() {
-			if source.resendCapacityUnavailable.waiterCount.Load() != 0 {
-				waitingOnce.Do(func() { close(capacityWaiting) })
-			}
+		admission := sourceB.protocolAdmission
+		admission.mutex.Lock()
+		count, capacity, waiters := admission.count, admission.capacity, len(admission.waiters)
+		admission.mutex.Unlock()
+		sourceB.packAdmission.mutex.Lock()
+		dataCount, dataWaiters := sourceB.packAdmission.count, len(sourceB.packAdmission.waiters)
+		sourceB.packAdmission.mutex.Unlock()
+		if count != 1 || capacity != 1 || waiters != 0 || dataCount != 0 || dataWaiters != 0 || budget.UsedByteCount() != 0 {
+			return client, fmt.Errorf("B did not fill only its real protocol count: count=%d/%d waiters=%d data=%d/%d", count, capacity, waiters, dataCount, dataWaiters)
+		}
+		// The source owner is parked, the seed call has returned, and B has not
+		// been published to the evaluator. Future Done calls still return the
+		// same real cancellation channel; the original cancel function remains.
+		sourceCtx := sourceB.ctx
+		sourceB.ctx = &expandProtocolAdmissionWaitContext{Context: sourceCtx, admission: admission, waiting: capacityWaiting}
+		if sourceB.ctx.Done() != sourceCtx.Done() || sourceB.ctx.Err() != sourceCtx.Err() {
+			return client, fmt.Errorf("B count-wait observer changed source cancellation")
 		}
 		createdB <- client
 		return client, nil
+	}
+	// The real waiter identity, not merely a count, must survive A's progress.
+	blocked := func() bool {
+		if sourceB == nil || blockedB == nil {
+			return false
+		}
+		admission := sourceB.protocolAdmission
+		admission.mutex.Lock()
+		held := !admission.closed && admission.capacity == 1 && admission.count == 1 &&
+			len(admission.waiters) == 1 && admission.waiters[0] == blockedB && !blockedB.granted
+		admission.mutex.Unlock()
+		sourceB.packAdmission.mutex.Lock()
+		dataCount, dataWaiters := sourceB.packAdmission.count, len(sourceB.packAdmission.waiters)
+		sourceB.packAdmission.mutex.Unlock()
+		return held && dataCount == 0 && dataWaiters == 0 &&
+			!sourceB.resendCapacityUnavailable.Load() && sourceB.resendCapacityUnavailable.waiterCount.Load() == 0
 	}
 	// This cleanup runs before the base fixture's provider/client joins. Every
 	// early return releases both gates and cancels the blocked source first.
@@ -182,17 +253,8 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 		release()
 		fixture.cancelEvaluation()
 		fixture.cancelWindow()
-		clientsLock.Lock()
-		joinedClients := append([]*Client(nil), clients...)
-		clientsLock.Unlock()
 		joinCtx, cancelJoin := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelJoin()
-		for _, client := range joinedClients {
-			client.Cancel()
-			if err := client.CloseAndWait(joinCtx); err != nil {
-				t.Errorf("join evaluation-isolation client: %v", err)
-			}
-		}
 		if expandDone != nil {
 			select {
 			case <-expandDone:
@@ -200,11 +262,30 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 				t.Error("evaluation-isolation expansion did not join")
 			}
 		}
+		clientsLock.Lock()
+		joinedClients := append([]*Client(nil), clients...)
+		clientsLock.Unlock()
+		for _, client := range joinedClients {
+			client.Cancel()
+			if err := client.CloseAndWait(joinCtx); err != nil {
+				t.Errorf("join evaluation-isolation client: %v", err)
+			}
+		}
 		for _, sender := range []<-chan struct{}{aFinished, bFinished}[:knownSenders] {
 			select {
 			case <-sender:
 			case <-joinCtx.Done():
 				t.Error("evaluation-isolation sender did not join")
+			}
+		}
+		if sourceB != nil {
+			for _, admission := range []*sendPackAdmission{sourceB.packAdmission, sourceB.protocolAdmission} {
+				admission.mutex.Lock()
+				count, waiters, closed := admission.count, len(admission.waiters), admission.closed
+				admission.mutex.Unlock()
+				if count != 0 || waiters != 0 || !closed {
+					t.Errorf("joined B retained count custody: count=%d waiters=%d closed=%t", count, waiters, closed)
+				}
 			}
 		}
 		reserved, released := budget.Counts()
@@ -227,24 +308,28 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 	var clientB *Client
 	select {
 	case clientB = <-createdB:
+		knownSenders = 2
 	case <-fixture.waitCtx.Done():
 		t.Fatal("B real client did not finish setup")
 	}
-	fixture.wait(t, "B's actual local retained-capacity waiter", capacityWaiting)
-	knownSenders = 2
+	select {
+	case blockedB = <-capacityWaiting:
+	case <-fixture.waitCtx.Done():
+		t.Fatal("B evaluator did not register its real protocol-count waiter")
+	}
 	var evaluationMutex *sync.Mutex
 	select {
 	case evaluationMutex = <-acquisition:
 	case <-fixture.waitCtx.Done():
 		t.Fatal("candidate acquisition did not reach its outside-lock barrier")
 	}
-	if clientB.ctx.Err() != nil || sourceB == nil || sourceB.ctx.Err() != nil || budget.TotalByteCount() != 0 || budget.UsedByteCount() != 0 || sourceB.resendCapacityUnavailable.waiterCount.Load() != 1 {
+	if clientB.ctx.Err() != nil || sourceB == nil || sourceB.ctx.Err() != nil || budget.TotalByteCount() != 0 || budget.UsedByteCount() != 0 || !blocked() {
 		t.Fatal("isolation observation lost the one actual blocked candidate producer")
 	}
 	// A is parked before this mutex, and acquisition is parked outside it.
 	// B is therefore the only possible owner at this exact observation.
 	if !evaluationMutex.TryLock() {
-		cause = "EVALUATION_LOCAL_ADMISSION_HELD_HEALTHY_VERDICT: real_ack=true local_waiter=1 candidate_budget=0"
+		cause = "EVALUATION_LOCAL_ADMISSION_HELD_HEALTHY_VERDICT: real_ack=true local_waiter=1 candidate_budget=0 protocol_count=1"
 		return
 	}
 	evaluationMutex.Unlock()
@@ -268,7 +353,7 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 		select {
 		case <-clientB.ctx.Done():
 		case <-fixture.waitCtx.Done():
-			t.Fatal("ended pass could not cancel blocked B before releasing its budget")
+			t.Fatal("ended pass could not cancel blocked B before its occupied protocol slot drains")
 		}
 		if mode == "pass-ended" {
 			fixture.wait(t, "B's actual failed send return after pass cancellation", bReturned)
@@ -313,7 +398,7 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 	case <-fixture.waitCtx.Done():
 		t.Fatal("healthy real ping ACK was not admitted beside B's local pressure")
 	}
-	if healthy.ClientId() != firstArgs.ClientId || healthy.IsDone() || clientB.ctx.Err() != nil || sourceB.resendCapacityUnavailable.waiterCount.Load() != 1 || budget.TotalByteCount() != 0 {
+	if healthy.ClientId() != firstArgs.ClientId || healthy.IsDone() || clientB.ctx.Err() != nil || !blocked() || budget.TotalByteCount() != 0 {
 		t.Fatal("healthy admission disturbed the independently blocked B producer")
 	}
 	if mode == "ack-first" {
@@ -349,11 +434,11 @@ func testMultiClientExpandLocalAdmissionIsolation(t *testing.T, mode string) {
 	case <-fixture.waitCtx.Done():
 		t.Fatal("healthy sibling's real ACK did not complete")
 	}
-	if sourceB.resendCapacityUnavailable.waiterCount.Load() != 1 || clientB.ctx.Err() != nil {
+	if !blocked() || clientB.ctx.Err() != nil {
 		t.Fatal("healthy sibling progress released or canceled B's unrelated local wait")
 	}
 	// The existing timeout branch must acquire the verdict mutex and cancel B
-	// while its admission is still blocked, before any budget is returned.
+	// while admission is still blocked, before its protocol slot can drain.
 	close(expirePing)
 	select {
 	case <-clientB.ctx.Done():

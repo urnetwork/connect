@@ -546,18 +546,22 @@ func TestNativeSynLatePublicationKeepsSharedRetainedBudget(t *testing.T) {
 				t.Fatalf("publication retained budget unbalanced: used=%d root=%d reserved=%d released=%d", shared.UsedByteCount(), root.UsedByteCount(), reserved, released)
 			}
 		})
-		f := newSynPublicationTestFixture(t, 4, false, func(settings *ClientSettings) {
+		// This shared-credit arm intentionally carries one real TFO DATA byte.
+		options := &synPublicationPacketOptions{packet: func(path *IpPath, _ int) []byte {
+			return reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64})
+		}}
+		f := newSynPublicationPacketFixture(t, 4, false, func(settings *ClientSettings) {
 			settings.SendBufferSettings.ResendQueueBudget = shared
 			settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
-		})
+		}, options)
 		credit, packet := f.owner.credit, bytes.Clone(f.owner.packet)
-		if credit.budget != shared || credit.local != nil || root.UsedByteCount() > root.TotalByteCount() {
+		if protocolClassPureTcpControl(packet) || credit.noBudget || credit.budget != shared || credit.local != nil || root.UsedByteCount() > root.TotalByteCount() {
 			t.Fatal("retained publication cache did not use the composed source budget")
 		}
 		f.resume()
 		synctest.Wait()
 		f.requireAnswer(t)
-		if !credit.released.Load() || !bytes.Equal(packet, reraceTcpPacket(f.path, tcpFlagSyn, f.path.SequenceNumber, 0, nil)) {
+		if !credit.released.Load() || !bytes.Equal(packet, reraceTcpPacket(f.path, tcpFlagSyn, f.path.SequenceNumber, 0, []byte{0x64})) {
 			t.Fatal("publication changed original source bytes or kept its charged cache")
 		}
 	})

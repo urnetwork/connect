@@ -33,6 +33,7 @@ type receiveDeliveryQueue struct {
 	maxBytes     ByteCount
 	bytes        ByteCount
 	closed       bool
+	immediate    bool
 	failedFrom   uint64
 	operations   []*receiveDeliveryOperation
 	wake         chan struct{}
@@ -51,6 +52,10 @@ type receiveDeliveryReceipt struct {
 	claimed             bool
 	sealed              bool
 	secured             bool
+	failed              bool
+	immediateHistory    *receiveImmediateHistory
+	immediateRange      *receiveImmediateRange
+	immediateToken      uint64
 	control             bool
 	controlReserve      bool
 	firstSequenceNumber uint64
@@ -132,6 +137,15 @@ func (q *receiveDeliveryQueue) prepare(item *receiveItem) bool {
 
 // Shares the exact limits and reservation with the eventual ledger append.
 func (q *receiveDeliveryQueue) prepareWithLock(item *receiveItem, admitOne bool) (ByteCount, bool, bool, bool) {
+	if q.immediate && len(q.items) >= q.maxCount {
+		return 0, false, false, false
+	}
+	if item.noBudget {
+		// Distinct protocol receipts keep their ordinary ordered lifetime.
+		// They do not consume either DATA bytes or DATA receipt slots; a
+		// pending SYN must not prevent the ACK needed by an established flow.
+		return 0, true, true, !q.closed
+	}
 	if q.sequence.receiveQueue != nil && !q.sequence.prepareReceiveDeliveryCredit(item) {
 		return 0, false, false, false
 	}
@@ -180,7 +194,7 @@ func (q *receiveDeliveryQueue) appendLocked(item *receiveItem, required bool, ad
 	r := &receiveDeliveryReceipt{queue: q, item: item, bytes: bytes, messageBytes: item.messageByteCount,
 		required: required, control: control, controlReserve: controlReserve, firstSequenceNumber: item.sequenceNumber, ack: sequenceAck{
 			receivedAtNanos: item.receivedAtNanos, sequenceNumber: item.sequenceNumber,
-			messageId: item.messageId, tag: item.tag, compactContractRecoverySupported: true,
+			messageId: item.messageId, tag: item.receiveTag(), compactContractRecoverySupported: true,
 			unwrapped: item.unwrapped, transportType: item.transportType,
 		}}
 	q.items = append(q.items, r)
@@ -271,6 +285,7 @@ func (r *receiveDeliveryReceipt) seal() {
 	}
 	r.sealed = true
 	failed := r.required && !r.claimed
+	r.failed = r.failed || failed
 	if failed && !q.closed {
 		if ackLineageTraceEnabled {
 			q.traceReceiptStateLocked(r, "delivery_receipt_rejected", false, "unclaimed")
@@ -293,6 +308,7 @@ func (claim *receiveDeliveryClaim) complete(secured bool) {
 	r, q := claim.receipt, claim.receipt.queue
 	q.mutex.Lock()
 	r.pending--
+	r.failed = r.failed || !secured
 	if !secured && !q.closed {
 		if ackLineageTraceEnabled {
 			q.traceReceiptStateLocked(r, "delivery_receipt_rejected", false, "claim")
@@ -311,6 +327,9 @@ func (claim *receiveDeliveryClaim) complete(secured bool) {
 // The callback must return before a borrowed item can go back to the pool,
 // even if its downstream owner completed synchronously during the callback.
 func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []*receiveItem {
+	if q.immediate {
+		return q.advanceImmediateLocked()
+	}
 	var returns []*receiveItem
 	if changed.sealed && changed.pending == 0 && !q.closed {
 		if ackLineageTraceEnabled && !changed.secured {
@@ -396,6 +415,7 @@ func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []
 		q.sequence.ackWindow.UpdateDeliveredPrefix(func() {
 			for _, r := range run[:secured] {
 				q.sequence.ackWindow.updateDeliveredWithLock(r.ack, r.messageBytes)
+				q.sequence.immediateDeliveryHistory.Load().noteCumulative(r.ack)
 			}
 		})
 		clear(run[:secured])

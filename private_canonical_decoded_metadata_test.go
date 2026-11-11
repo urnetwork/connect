@@ -22,12 +22,13 @@ type canonicalDecodedMetadataWitness struct {
 	carrierWitness   []byte
 	want             ByteCount
 	handed           bool
+	returned         bool
 }
 
 // Encodes ordinary FromProvider frames with the real codec, then detaches the
 // real owned decoder result exactly as Client.run does. No protocol import or
 // synthetic decoded-owner accounting substitute is needed in this test.
-func canonicalDecodeMetadataPacket(t *testing.T, source Id, destination Id, sequence Id, message Id, number uint64, head bool, count int) *canonicalDecodedMetadataWitness {
+func canonicalDecodeMetadataPacket(t *testing.T, source Id, destination Id, sequence Id, message Id, number uint64, head bool, count int, clients ...*Client) *canonicalDecodedMetadataWitness {
 	t.Helper()
 	frames, witnesses := transferGroupTestFrames(t, count, DefaultMtu)
 	defer func() {
@@ -46,7 +47,16 @@ func canonicalDecodeMetadataPacket(t *testing.T, source Id, destination Id, sequ
 	wire := marshalSendPackTransferFrame(&sendPackFrame{path: NewTransferPath(source, destination, Id{}),
 		messageId: message, sequenceId: sequence, sequenceNumber: number, head: head, frames: frames, tagSendTime: 1})
 	decoded := inboundDecodedTransferFrames.take()
-	if !unmarshalOwnedTransferFrame(wire, decoded, true) {
+	ok := false
+	if len(clients) == 0 {
+		ok = unmarshalOwnedTransferFrame(wire, decoded, true)
+	} else {
+		var pressure bool
+		ok, pressure = clients[0].unmarshalReceiveMemoryFrame(wire, decoded, true,
+			NewTransferPath(source, destination, Id{}), false, sequenceTlsRoleServer, false)
+		ok = ok && !pressure
+	}
+	if !ok {
 		inboundDecodedTransferFrames.put(decoded)
 		MessagePoolReturn(wire)
 		t.Fatal("actual owned Transfer decode failed")
@@ -58,9 +68,18 @@ func canonicalDecodeMetadataPacket(t *testing.T, source Id, destination Id, sequ
 		t.Fatal("actual decoder did not create an owned Pack")
 	}
 	pack := &owner.receivePack
+	paid, ingress, next, loan := pack.receiveMemoryOwned, pack.ingressSequence, pack.ingressNext, pack.ingressLoanByteCount
+	if paid {
+		owner.receiveItem.memoryBudget.admissionRoot().admissionLock.Lock()
+	}
 	*pack = ReceivePack{Source: SourceId(source), SequenceId: sequence, Pack: &owner.pack, decodedOwner: owner,
 		TransferFrameBytes: wire, MessageByteCount: MessageByteCount(owner.pack.Frames), Unwrapped: true,
-		EncryptionRole: sequenceTlsRoleServer, TransportType: TransportTypeH1}
+		EncryptionRole: sequenceTlsRoleServer, TransportType: TransportTypeH1,
+		receiveMemoryOwned: paid, ingressSequence: ingress, ingressNext: next, ingressLoanByteCount: loan,
+		receivePublishedReliable: true, receiveConsumerData: receiveHeadRecoveryPack(&owner.pack)}
+	if paid {
+		owner.receiveItem.memoryBudget.admissionRoot().admissionLock.Unlock()
+	}
 	result := &canonicalDecodedMetadataWitness{owner: owner, pack: pack, frames: SendPack{Frames: owner.pack.Frames}}
 	if pooled, _ := MessagePoolCheck(wire); pooled {
 		result.carrierWitness = MessagePoolShareReadOnly(wire)
@@ -75,72 +94,6 @@ func canonicalDecodeMetadataPacket(t *testing.T, source Id, destination Id, sequ
 	}
 	if capacity := cap(owner.pack.Frames); len(owner.framePointers) < capacity {
 		result.want += ByteCount(capacity)*8 + 16
-	}
-	return result
-}
-
-// The same canonical wire through the receiving client's production scanner
-// and paid decoder, with the Pack fields its receive loop sets before handoff.
-// With a receive budget that owns decoded memory, this is how Client.run
-// decodes; the claim it prepays must be exactly the canonical envelope.
-func canonicalDecodeMetadataPaidPacket(t *testing.T, client *Client, source Id, destination Id, sequence Id, message Id, number uint64, head bool, count int) *canonicalDecodedMetadataWitness {
-	t.Helper()
-	frames, witnesses := transferGroupTestFrames(t, count, DefaultMtu)
-	defer func() {
-		for _, frame := range frames {
-			MessagePoolReturn(frame.MessageBytes)
-		}
-		releaseTransferGroupTestWitnesses(t, frames, witnesses)
-	}()
-	model, err := ipPacketFromProviderFrame(nil, DefaultProtocolVersion)
-	if err != nil || model == nil {
-		t.Fatal("raw provider-frame type unavailable", err)
-	}
-	for _, frame := range frames {
-		frame.MessageType = model.MessageType
-	}
-	path := NewTransferPath(source, destination, Id{})
-	wire := marshalSendPackTransferFrame(&sendPackFrame{path: path,
-		messageId: message, sequenceId: sequence, sequenceNumber: number, head: head, frames: frames, tagSendTime: 1})
-	decoded := inboundDecodedTransferFrames.take()
-	if ok, pressure := client.unmarshalReceiveMemoryFrame(wire, decoded, false, path, false, sequenceTlsRoleServer, false); !ok || pressure {
-		decoded.release()
-		inboundDecodedTransferFrames.put(decoded)
-		MessagePoolReturn(wire)
-		t.Fatalf("actual paid Transfer decode failed: pressure=%t", pressure)
-	}
-	owner := decoded.detachPackOwner()
-	inboundDecodedTransferFrames.put(decoded)
-	if owner == nil || !owner.receivePack.receiveMemoryOwned || owner.receiveItem.memoryBudget == nil {
-		MessagePoolReturn(wire)
-		t.Fatal("actual paid decoder did not create a charged Pack owner")
-	}
-	pack := &owner.receivePack
-	root := owner.receiveItem.memoryBudget.admissionRoot()
-	root.admissionLock.Lock()
-	pack.Source, pack.SequenceId, pack.TransferFrameBytes = SourceId(source), sequence, wire
-	pack.MessageByteCount, pack.Unwrapped = MessageByteCount(owner.pack.Frames), true
-	pack.EncryptionRole, pack.TransportType = sequenceTlsRoleServer, TransportTypeH1
-	pack.receiveConsumerData = receiveHeadRecoveryPack(pack.Pack)
-	pack.receivePublishedReliable = !pack.Pack.Nack
-	root.admissionLock.Unlock()
-	result := &canonicalDecodedMetadataWitness{owner: owner, pack: pack, frames: SendPack{Frames: owner.pack.Frames}}
-	if pooled, _ := MessagePoolCheck(wire); pooled {
-		result.carrierWitness = MessagePoolShareReadOnly(wire)
-	}
-	result.want = MessagePoolRootByteCount(wire) + decodedPackOwnerQueueByteCount
-	for _, frame := range owner.pack.Frames {
-		result.want += MessagePoolRootByteCount(frame.MessageBytes)
-		result.payloadWitnesses = append(result.payloadWitnesses, MessagePoolShareReadOnly(frame.MessageBytes))
-	}
-	if extra := len(owner.pack.Frames) - len(owner.frames); extra > 0 {
-		result.want += ByteCount(extra) * 128
-	}
-	if capacity := cap(owner.pack.Frames); len(owner.framePointers) < capacity {
-		result.want += ByteCount(capacity)*8 + 16
-	}
-	if owner.receiveItem.QueueByteCount() != result.want {
-		t.Errorf("paid decode prepaid %d, want the canonical envelope %d", owner.receiveItem.QueueByteCount(), result.want)
 	}
 	return result
 }
@@ -159,7 +112,7 @@ func (self *canonicalDecodedMetadataWitness) checkLayout(t *testing.T) {
 // retired through cancellation or delivery before this final witness runs.
 func (self *canonicalDecodedMetadataWitness) finish(t *testing.T) {
 	t.Helper()
-	if !self.handed {
+	if !self.handed && !self.returned {
 		self.pack.messagePoolReturn()
 	}
 	if self.owner.inUse {
@@ -208,32 +161,24 @@ func TestCanonicalDecodedMetadataActualDecodeBoundaries(t *testing.T) {
 }
 
 // Exercises an underfunded real Pack handoff, exact-capacity retry of that same
-// decoded owner, and full receive-leaf custody.
-//
-// The receive budget here owns decoded memory, so the client's receive loop
-// decodes paid: the receive leaf is charged at decode, and the Pack leaf, a
-// sibling under the same parent, takes a quota for the handoff rather than a
-// second physical charge. Since 00d4f62b the held original commits its
-// selective ACK only with repair escrow, which for this no-contract peer is the
-// inline owner; the full leaf is the owner plus that escrow. A full leaf has
-// no room for the drain arm's predecessor to decode, so that arm first funds
-// the receive leaf for it explicitly, as the retry funds the Pack leaf.
+// decoded owner, and full receive-leaf custody. A DATA predecessor is paid
+// before saturation; the sibling handoff leaf grants quota over those roots.
 func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		var witnesses []*canonicalDecodedMetadataWitness
-		t.Cleanup(func() {
-			for _, witness := range witnesses {
-				witness.finish(t)
-			}
-		})
 		parent := NewTransferMemoryBudget(mib(2))
 		packBudget := NewTransferMemoryBudgetWithParent(mib(1), parent)
 		receiveBudget := NewTransferMemoryBudgetWithParent(mib(1), parent)
 		t.Cleanup(func() {
 			for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
 				assertRetainedBudgetBalance(t, budget)
+			}
+		})
+		t.Cleanup(func() {
+			for _, witness := range witnesses {
+				witness.finish(t)
 			}
 		})
 		fixture := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
@@ -252,40 +197,41 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 			enterOnce.Do(func() { close(entered) })
 			<-released
 		}
-		packQuota := func() ByteCount { return packBudget.Stats().QuotaByteCount }
-		escrow := fixture.receiver.settings.ReceiveBufferSettings.receiveHeldHeadRepairByteCount(true)
-		if escrow != decodedPackOwnerQueueByteCount {
-			t.Fatal("no-contract repair escrow is not the inline owner")
-		}
 		sequenceId, messageId := NewId(), NewId()
-		witness := canonicalDecodeMetadataPaidPacket(t, fixture.receiver, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, messageId, 1, false, 8)
+		witness := canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, messageId, 1, false, 8, fixture.receiver)
 		witnesses = append(witnesses, witness)
 		witness.checkLayout(t)
 		witness.pack.Ctx, witness.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
-		parent.SetTotalByteCount(2*witness.want + escrow)
-		packBudget.SetTotalByteCount(witness.want - 1)
-		receiveBudget.SetTotalByteCount(witness.want + escrow)
-		if receiveBudget.UsedByteCount() != witness.want || parent.UsedByteCount() != witness.want {
-			t.Fatal("paid decode did not charge the receive leaf exactly once")
+		predecessor := canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, NewId(), 0, true, 1, fixture.receiver)
+		witnesses = append(witnesses, predecessor)
+		predecessor.pack.Ctx, predecessor.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
+		repairBytes := fixture.receiver.settings.ReceiveBufferSettings.receiveHeldHeadRepairByteCount(true)
+		paidBytes := witness.want + predecessor.want
+		if repairBytes <= 0 || !witness.pack.receiveMemoryOwned || !predecessor.pack.receiveMemoryOwned ||
+			witness.owner.receiveItem.memoryBudget != receiveBudget || predecessor.owner.receiveItem.memoryBudget != receiveBudget ||
+			witness.owner.receiveItem.queueByteCount != witness.want || predecessor.owner.receiveItem.queueByteCount != predecessor.want {
+			t.Fatal("real decoded originals were not paid before handoff")
 		}
+		parent.SetTotalByteCount(2 * witness.want)
+		packBudget.SetTotalByteCount(witness.want - 1)
+		receiveBudget.SetTotalByteCount(paidBytes + repairBytes)
 		accepted, err := fixture.receiver.receiveBuffer.Pack(witness.pack, 0)
 		witness.handed = accepted
 		<-entered
 		if accepted || err != nil {
 			t.Fatalf("underfunded actual decoded Pack handoff accepted=%t error=%v", accepted, err)
 		}
-		if packBudget.UsedByteCount() != 0 || packQuota() != 0 || receiveBudget.UsedByteCount() != witness.want ||
-			parent.UsedByteCount() != witness.want || len(fixture.receiverOut) != 0 ||
+		if packBudget.UsedByteCount() != 0 || packBudget.Stats().QuotaByteCount != 0 ||
+			receiveBudget.UsedByteCount() != paidBytes || parent.UsedByteCount() != paidBytes || len(fixture.receiverOut) != 0 ||
 			!witness.owner.inUse || len(witness.pack.Pack.Frames) != 8 || !bytes.Equal(witness.pack.Pack.MessageId, messageId.Bytes()) {
 			t.Fatal("refused handoff transferred custody, charged a partial owner or emitted an ACK")
 		}
 		packBudget.SetTotalByteCount(witness.want)
 		accepted, err = fixture.receiver.receiveBuffer.Pack(witness.pack, 0)
 		witness.handed = accepted
-		if !accepted || err != nil || packBudget.UsedByteCount() != 0 || packQuota() != witness.want ||
-			receiveBudget.UsedByteCount() != witness.want || parent.UsedByteCount() != witness.want {
-			t.Fatalf("exact decoded handoff retry=%t/%v pack=%d/%d receive=%d parent=%d want%d", accepted, err,
-				packBudget.UsedByteCount(), packQuota(), receiveBudget.UsedByteCount(), parent.UsedByteCount(), witness.want)
+		if !accepted || err != nil || packBudget.UsedByteCount() != 0 || packBudget.Stats().QuotaByteCount != witness.want ||
+			receiveBudget.UsedByteCount() != paidBytes || parent.UsedByteCount() != paidBytes {
+			t.Fatalf("exact decoded handoff retry=%t/%v packQuota=%d parent=%d want%d", accepted, err, packBudget.Stats().QuotaByteCount, parent.UsedByteCount(), paidBytes)
 		}
 		release()
 		synctest.Wait()
@@ -298,9 +244,10 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 		}
 		held := sequence.receiveQueue.GetByMessageId(messageId)
 		if held == nil || held.decodedOwner != witness.owner || held.QueueByteCount() != witness.want || !held.committed ||
-			packBudget.UsedByteCount() != 0 || packQuota() != 0 || sequence.heldHeadRepair.reservedByteCount != escrow ||
-			receiveBudget.UsedByteCount() != witness.want+escrow || receiveBudget.Available() != 0 ||
-			parent.UsedByteCount() != witness.want+escrow || fixture.deliveredCount != 0 {
+			packBudget.UsedByteCount() != 0 || packBudget.Stats().QuotaByteCount != 0 || receiveBudget.Available() != 0 ||
+			receiveBudget.UsedByteCount() != paidBytes+repairBytes || parent.UsedByteCount() != paidBytes+repairBytes || fixture.deliveredCount != 0 ||
+			sequence.heldHeadRepair.reservedByteCount != repairBytes || sequence.heldHeadRepair.eligibleCount != 1 ||
+			sequence.heldHeadRepair.owner != nil || !witness.pack.heldHeadRepairEligible || witness.pack.ingressSequence != sequence {
 			t.Fatal("full receive leaf lost exact metadata custody across the handoff/reorder boundary")
 		}
 		selective := fixture.take(fixture.receiverOut)
@@ -308,8 +255,36 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 			t.Fatal("actual held decoded Pack did not acquire its selective ACK lease")
 		}
 		fixture.drop(selective)
-		retired := witness.want + escrow
 		if cancelHeld {
+			siblingBudget := NewTransferMemoryBudgetWithParent(kib(64), parent)
+			sibling := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
+				settings.SequenceBufferSize, settings.H1SequenceBufferSize = 4, 4
+				settings.ReceiveQueueBudget, settings.ReceiveQueueRetainedByteAccounting = siblingBudget, true
+				settings.ReceiveQueueMinByteCount = 0
+			}, TransportTypeH1)
+			siblingSequenceId := NewId()
+			deliverSibling := func(number uint64) {
+				packet := canonicalDecodeMetadataPacket(t, sibling.sender.ClientId(), sibling.receiver.ClientId(),
+					siblingSequenceId, NewId(), number, number == 0, 2, sibling.receiver)
+				witnesses = append(witnesses, packet)
+				packet.pack.Ctx, packet.pack.ReceiveCallback = sibling.ctx, sibling.receiver.receiveCallback
+				accepted, err := sibling.receiver.receiveBuffer.Pack(packet.pack, 0)
+				packet.handed = accepted
+				if !accepted || err != nil {
+					t.Fatal("healthy sibling refused its paid owner", accepted, err)
+				}
+				synctest.Wait()
+				ack := sibling.take(sibling.receiverOut)
+				if ack.ack == nil || ack.ack.Selective || sibling.deliveredCount != 2*int(number+1) || sibling.ctx.Err() != nil {
+					t.Fatal("canceled receive child interrupted shared-parent sibling delivery")
+				}
+				sibling.drop(ack)
+				assertRetainedBudgetBalance(t, siblingBudget)
+			}
+			deliverSibling(0)
+			if receiveBudget.Available() != 0 || parent.UsedByteCount() != paidBytes+repairBytes {
+				t.Fatal("healthy sibling borrowed the held original's full receive leaf")
+			}
 			fixture.cancel()
 			if err := fixture.receiver.CloseAndWait(context.Background()); err != nil {
 				t.Fatal(err)
@@ -317,15 +292,14 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 			if fixture.deliveredCount != 0 {
 				t.Fatal("canceled held Pack was delivered")
 			}
-		} else {
-			receiveBudget.SetTotalByteCount(2*witness.want + escrow)
-			predecessor := canonicalDecodeMetadataPaidPacket(t, fixture.receiver, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, NewId(), 0, true, 0)
-			witnesses = append(witnesses, predecessor)
-			predecessor.pack.Ctx, predecessor.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
-			retired += predecessor.want
-			if receiveBudget.UsedByteCount() != retired {
-				t.Fatal("separately funded predecessor did not pay its own decode")
+			if receiveBudget.UsedByteCount() != predecessor.want || !predecessor.owner.inUse ||
+				sequence.heldHeadRepair.reservedByteCount != 0 || sequence.heldHeadRepair.eligibleCount != 0 {
+				t.Fatal("cancellation lost the still caller-owned predecessor or retained repair custody")
 			}
+			predecessor.pack.messagePoolReturn()
+			predecessor.returned = true
+			deliverSibling(1)
+		} else {
 			accepted, err := fixture.receiver.receiveBuffer.Pack(predecessor.pack, 0)
 			predecessor.handed = accepted
 			if !accepted || err != nil {
@@ -340,21 +314,24 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 				}
 				fixture.drop(ack)
 			}
-			if !cumulative || fixture.deliveredCount != 8 || sequence.nextSequenceNumber != 2 {
+			if !cumulative || fixture.deliveredCount != 9 || sequence.nextSequenceNumber != 2 {
 				t.Fatal("real predecessor did not drain the original owner through callback and cumulative ACK")
 			}
 		}
 		for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
 			assertRetainedBudgetBalance(t, budget)
+			if budget.Stats().QuotaByteCount != 0 {
+				t.Fatal("joined decoder owner retained handoff quota")
+			}
 		}
 		stats := receiveBudget.Stats()
-		if stats.ReservedByteCount != retired || stats.ReleasedByteCount != retired || stats.QuotaByteCount != 0 {
-			t.Fatalf("held metadata reservation did not retire exactly once: %+v want%d", stats, retired)
+		if stats.ReservedByteCount != paidBytes+repairBytes || stats.ReleasedByteCount != paidBytes+repairBytes {
+			t.Fatalf("held metadata reservation did not retire exactly once: %+v want%d", stats, paidBytes+repairBytes)
 		}
 	})
 }
 
-// The actual empty predecessor drains a full receive leaf without fake ACKs.
+// An actual paid DATA predecessor drains the full receive leaf without fake ACKs.
 func TestCanonicalDecodedMetadataFullBudgetDelivery(t *testing.T) {
 	runCanonicalDecodedMetadataFullBudget(t, false)
 }
@@ -362,4 +339,54 @@ func TestCanonicalDecodedMetadataFullBudgetDelivery(t *testing.T) {
 // Cancellation joins the held decoder owner before any witness is retired.
 func TestCanonicalDecodedMetadataFullBudgetCancel(t *testing.T) {
 	runCanonicalDecodedMetadataFullBudget(t, true)
+}
+
+// An empty protocol predecessor still owns its real decoded carrier and ACK
+// while requiring no DATA byte credit, even with every DATA leaf at zero.
+func TestCanonicalDecodedMetadataEmptyProtocolPredecessorNoBudget(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		parent := NewTransferMemoryBudget(0)
+		packBudget := NewTransferMemoryBudgetWithParent(0, parent)
+		receiveBudget := NewTransferMemoryBudgetWithParent(0, parent)
+		var witness *canonicalDecodedMetadataWitness
+		t.Cleanup(func() {
+			if witness != nil {
+				witness.finish(t)
+			}
+			for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
+				assertRetainedBudgetBalance(t, budget)
+			}
+		})
+		fixture := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
+			settings.PackQueueBudget, settings.PackQueueRetainedByteAccounting = packBudget, true
+			settings.ReceiveQueueBudget, settings.ReceiveQueueRetainedByteAccounting = receiveBudget, true
+			settings.ReceiveQueueMinByteCount = 0
+		}, TransportTypeH1)
+		messageId := NewId()
+		witness = canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(),
+			NewId(), messageId, 0, true, 0, fixture.receiver)
+		witness.pack.Ctx, witness.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
+		if witness.pack.receiveMemoryOwned || !witness.owner.inUse || witness.want <= 0 {
+			t.Fatal("empty protocol Pack lost its actual decoded owner or acquired DATA credit")
+		}
+		accepted, err := fixture.receiver.receiveBuffer.Pack(witness.pack, 0)
+		witness.handed = accepted
+		if !accepted || err != nil {
+			t.Fatal("empty protocol predecessor was refused by zero DATA credit", err)
+		}
+		synctest.Wait()
+		ack := fixture.take(fixture.receiverOut)
+		if ack.ack == nil || ack.ack.Selective || !bytes.Equal(ack.ack.MessageId, messageId.Bytes()) || fixture.deliveredCount != 0 {
+			fixture.drop(ack)
+			t.Fatal("empty protocol predecessor lost its exact cumulative ACK or invented DATA delivery")
+		}
+		fixture.drop(ack)
+		for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
+			stats := budget.Stats()
+			if stats.UsedByteCount != 0 || stats.QuotaByteCount != 0 || stats.ReservedByteCount != 0 {
+				t.Fatalf("empty protocol predecessor consumed DATA credit: %+v", stats)
+			}
+		}
+	})
 }

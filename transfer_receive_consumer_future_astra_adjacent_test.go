@@ -142,8 +142,9 @@ func TestReceiveConsumerFutureAdjacentInvalidMacUsesOrdinaryVerifier(t *testing.
 	})
 }
 
-// An exact retained identity is required before copying proof. These mutants
-// keep the original and its real valid retry untouched for subsequent controls.
+// An exact retained identity is required before copying its proof. An absent
+// valid context may instead prepay a whole, unbound full-proof data head; it
+// must leave the original and its actual retry/escrow authority untouched.
 func TestReceiveConsumerFutureAdjacentIdentityAndRoleExclusions(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
@@ -153,23 +154,24 @@ func TestReceiveConsumerFutureAdjacentIdentityAndRoleExclusions(t *testing.T) {
 			t.Fatal(err)
 		}
 		rows := []struct {
-			name   string
-			change func(*protocol.TransferFrame)
+			name         string
+			freshContext bool
+			change       func(*protocol.TransferFrame)
 		}{
 			{name: "message", change: func(v *protocol.TransferFrame) { v.Pack.MessageId = NewId().Bytes() }},
 			{name: "number", change: func(v *protocol.TransferFrame) { v.Pack.SequenceNumber++ }},
-			{name: "generation", change: func(v *protocol.TransferFrame) { v.Pack.SequenceId = NewId().Bytes() }},
-			{name: "source", change: func(v *protocol.TransferFrame) { v.TransferPath.SourceId = NewId().Bytes() }},
+			{name: "generation", freshContext: true, change: func(v *protocol.TransferFrame) { v.Pack.SequenceId = NewId().Bytes() }},
+			{name: "source", freshContext: true, change: func(v *protocol.TransferFrame) { v.TransferPath.SourceId = NewId().Bytes() }},
 			{name: "destination", change: func(v *protocol.TransferFrame) { v.TransferPath.DestinationId = NewId().Bytes() }},
-			{name: "lane", change: func(v *protocol.TransferFrame) { v.Pack.LogicalLane = 1 }},
+			{name: "lane", freshContext: true, change: func(v *protocol.TransferFrame) { v.Pack.LogicalLane = 1 }},
 			{name: "stream", change: func(v *protocol.TransferFrame) { v.Pack.ForceStream = !v.Pack.ForceStream }},
 			{name: "contract companion", change: func(v *protocol.TransferFrame) { v.Pack.CompanionContract = !v.Pack.CompanionContract }},
-			{name: "session role", change: func(v *protocol.TransferFrame) {
+			{name: "session role", freshContext: true, change: func(v *protocol.TransferFrame) {
 				role := protocol.SequenceRole_SequenceRoleServer
 				v.SessionRole = &role
 			}},
 			{name: "unsupported role", change: func(v *protocol.TransferFrame) { role := protocol.SequenceRole(99); v.SessionRole = &role }},
-			{name: "session companion", change: func(v *protocol.TransferFrame) { value := true; v.SessionCompanion = &value }},
+			{name: "session companion", freshContext: true, change: func(v *protocol.TransferFrame) { value := true; v.SessionCompanion = &value }},
 			{name: "non-head", change: func(v *protocol.TransferFrame) { v.Pack.Head = false }},
 			{name: "no ack", change: func(v *protocol.TransferFrame) { v.Pack.Nack = true }},
 			{name: "ahead", change: func(v *protocol.TransferFrame) { v.Pack.ContractAhead = true }},
@@ -194,7 +196,15 @@ func TestReceiveConsumerFutureAdjacentIdentityAndRoleExclusions(t *testing.T) {
 			}
 			func() {
 				defer MessagePoolReturn(wire)
-				refuseConsumerAdjacentWire(t, f.fixture, f.root, f.child, wire, row.name)
+				if row.name == "source" {
+					path := TransferPath{SourceId: f.fixture.sender.ClientId(), DestinationId: f.fixture.receiver.ClientId()}
+					refuseConsumerAdjacentWireAtPath(t, f.fixture, f.root, f.child, wire, path, "source differs from original route")
+				}
+				if row.freshContext {
+					requireConsumerAdjacentFreshPhysical(t, f.fixture, f.sequence, f.root, f.child, wire, row.name)
+				} else {
+					refuseConsumerAdjacentWire(t, f.fixture, f.root, f.child, wire, row.name)
+				}
 			}()
 		}
 		if f.sequence.receiveQueue.GetByMessageId(f.original.messageId) != f.original || f.original.committed ||

@@ -17,7 +17,7 @@ import (
 const tcpRetirementNetworkProvideMode = 1
 
 // Two in-memory upstreams belong to successive generations of the same tuple.
-// A paused Transfer sequence owns at most two admitted packets throughout.
+// A paused Transfer sequence retains separately bounded DATA/protocol owners.
 type tcpProviderRetirementFixture struct {
 	t                   *testing.T
 	client              *Client
@@ -65,6 +65,9 @@ func newTcpProviderRetirementFixtureWithSetup(t *testing.T, wrapSocket func(net.
 type tcpProviderRetirementOptions struct {
 	wrapSocket    func(net.Conn) net.Conn
 	setupSequence func(*TcpSequence)
+	// Positive adds the independently bounded protocol admission used by the
+	// aggregate; the raw FIFO holds the sum of the two admission capacities.
+	protocolAdmissionCapacity int
 	// Builds each generation's in-memory socket pair, the sequence's end first.
 	// Nil is a net.Pipe pair.
 	socketPair func() (net.Conn, net.Conn)
@@ -152,8 +155,9 @@ func newTcpProviderRetirementFixtureWithOptions(t *testing.T, options tcpProvide
 	fixture.transfer.encryptionRole = sequenceTlsRoleClient
 	fixture.transfer.sendBufferSettings = clientSettings.SendBufferSettings
 	fixture.transfer.log = NewNoopLogger()
-	fixture.transfer.packs = make(chan *SendPack, 2)
+	fixture.transfer.packs = make(chan *SendPack, 2+max(0, options.protocolAdmissionCapacity))
 	fixture.transfer.packAdmission = newSendPackAdmission(2)
+	fixture.transfer.protocolAdmission = newSendPackAdmission(options.protocolAdmissionCapacity)
 	fixture.transfer.resendQueue = newResendQueue(clientSettings.SendBufferSettings.ResendQueueBudget, 0)
 	t.Cleanup(func() {
 		// Cleanup may close the shared owner after all flow-only assertions.
@@ -304,6 +308,14 @@ func (self *tcpProviderRetirementFixture) releasePressure() []tcpProviderRetirem
 	if waiterCount != 0 || count != 0 {
 		self.t.Fatalf("bounded control drain left admission ownership: waiters=%d count=%d", waiterCount, count)
 	}
+	if admission := self.transfer.protocolAdmission; admission != nil {
+		admission.mutex.Lock()
+		protocolWaiters, protocolCount := len(admission.waiters), admission.count
+		admission.mutex.Unlock()
+		if protocolWaiters != 0 || protocolCount != 0 {
+			self.t.Fatalf("bounded control drain left protocol admission: waiters=%d count=%d", protocolWaiters, protocolCount)
+		}
+	}
 	return controls
 }
 
@@ -341,7 +353,9 @@ func runTcpProviderRetirementCustody(t *testing.T, replaceWhileBlocked bool) {
 	assertMessagePoolOwnership(t)
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
-		fixture := newTcpProviderRetirementFixture(t)
+		fixture := newTcpProviderRetirementFixtureWithOptions(t, tcpProviderRetirementOptions{
+			protocolAdmissionCapacity: 2,
+		})
 		fixture.send(tcpFlagSyn, 1000, 0, nil)
 		old := fixture.nextSequence(1000)
 		synAck := fixture.takeControls()
@@ -349,11 +363,30 @@ func runTcpProviderRetirementCustody(t *testing.T, replaceWhileBlocked bool) {
 			t.Fatalf("initial constructor-wired handshake=%+v", synAck)
 		}
 		fixture.fillFromSocket()
+		// Pure ACKs now use protocol admission independently of the two real
+		// queued DATA owners. Fill both protocol slots through actual uploads;
+		// the target is the next ACK, not either already accepted original.
+		for index := range 2 {
+			fixture.upload(old, fixture.upstreams[0], 1001+uint32(index), "p")
+			select {
+			case witness := <-fixture.oldAckPackets:
+				MessagePoolReturn(witness)
+			default:
+				t.Fatal("protocol pressure did not retain a real pure acknowledgement")
+			}
+		}
+		protocolAdmission := fixture.transfer.protocolAdmission
+		protocolAdmission.mutex.Lock()
+		protocolCount, protocolWaiters := protocolAdmission.count, len(protocolAdmission.waiters)
+		protocolAdmission.mutex.Unlock()
+		if protocolCount != 2 || protocolWaiters != 0 || len(fixture.transfer.packs) != 4 {
+			t.Fatalf("not at separate DATA2/protocol2/FIFO4 pressure: protocol=%d waiters=%d queued=%d", protocolCount, protocolWaiters, len(fixture.transfer.packs))
+		}
 		started := make(chan struct{}, 4)
 		attempts := make(chan providerReturnSendResult, 4)
 		fixture.provider.returnSendStarted = func() { started <- struct{}{} }
 		fixture.provider.afterReturnSendAttemptForTest = func(result providerReturnSendResult) { attempts <- result }
-		fixture.upload(old, fixture.upstreams[0], 1001, "x")
+		fixture.upload(old, fixture.upstreams[0], 1003, "x")
 		select {
 		case <-started:
 		default:
@@ -369,15 +402,15 @@ func runTcpProviderRetirementCustody(t *testing.T, replaceWhileBlocked bool) {
 			t.Fatalf("old pure acknowledgement completed instead of waiting for capacity: %+v", result)
 		default:
 		}
-		fixture.transfer.packAdmission.mutex.Lock()
-		waiters := fixture.transfer.packAdmission.waiters
+		protocolAdmission.mutex.Lock()
+		waiters := protocolAdmission.waiters
 		var oldWaiter *sendPackAdmissionWaiter
 		if len(waiters) == 1 {
 			oldWaiter = waiters[0]
 		}
-		fixture.transfer.packAdmission.mutex.Unlock()
+		protocolAdmission.mutex.Unlock()
 		if oldWaiter == nil {
-			t.Fatal("old acknowledgement is not the one explicit Transfer admission waiter")
+			t.Fatal("old acknowledgement is not the one explicit protocol admission waiter")
 		}
 
 		var replacement *TcpSequence
@@ -412,15 +445,21 @@ func runTcpProviderRetirementCustody(t *testing.T, replaceWhileBlocked bool) {
 		default:
 			t.Error("canceled TCP generation did not retire while provider and Transfer capacity remained live and unchanged")
 		}
-		fixture.transfer.packAdmission.mutex.Lock()
+		protocolAdmission.mutex.Lock()
 		oldStillWaiting := false
-		for _, waiter := range fixture.transfer.packAdmission.waiters {
+		for _, waiter := range protocolAdmission.waiters {
 			oldStillWaiting = oldStillWaiting || waiter == oldWaiter
 		}
-		count := fixture.transfer.packAdmission.count
-		fixture.transfer.packAdmission.mutex.Unlock()
+		count := protocolAdmission.count
+		protocolAdmission.mutex.Unlock()
 		if oldStillWaiting || count != 2 {
 			t.Errorf("flow cancellation did not withdraw only its waiter: old_waiting=%t admitted=%d, want false and 2", oldStillWaiting, count)
+		}
+		fixture.transfer.packAdmission.mutex.Lock()
+		dataCount, dataWaiters := fixture.transfer.packAdmission.count, len(fixture.transfer.packAdmission.waiters)
+		fixture.transfer.packAdmission.mutex.Unlock()
+		if dataCount != 2 || dataWaiters != 0 || len(fixture.transfer.packs) != 4 {
+			t.Errorf("protocol cancellation disturbed independently admitted DATA/FIFO custody: data=%d waiters=%d queued=%d", dataCount, dataWaiters, len(fixture.transfer.packs))
 		}
 		if !MessagePoolReturn(fixture.oldAckWitness) {
 			t.Error("canceled flow still owns a pooled pure acknowledgement at the retirement barrier")
@@ -429,7 +468,7 @@ func runTcpProviderRetirementCustody(t *testing.T, replaceWhileBlocked bool) {
 
 		controls := fixture.releasePressure()
 		for _, packet := range controls {
-			if !packet.syn && packet.ack && !packet.fin && !packet.rst && packet.payloadByteCount == 0 && packet.ackNumber == 1002 {
+			if !packet.syn && packet.ack && !packet.fin && !packet.rst && packet.payloadByteCount == 0 && packet.ackNumber == 1004 {
 				t.Error("retired generation's acknowledgement entered Transfer after capacity returned")
 			}
 		}

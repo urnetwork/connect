@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -64,55 +65,72 @@ func TestAFlowDeliversWhatItsWindowPermits(t *testing.T) {
 	const payloadByteCount = 4 * 1024
 	const offerWindow = 6 * time.Second
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	harness := newRateLimitedSendWindowHarness(t, ctx, propagation, bytesPerSecond,
-		func(settings *SendBufferSettings) {
-			settings.ResendQueueMaxByteCount = window
-		})
-	harness.receiveHold(window)
-	delivered := &atomic.Int64{}
-	harness.receiver.AddReceiveCallback(
-		func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
-			delivered.Add(int64(len(frames)) * payloadByteCount)
-		},
-	)
+	// The pure in-memory sender, serializer and receiver share one exact
+	// six-second clock; host scheduling cannot consume the payload interval.
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		harness := newPacedSendWindowHarnessWithClient(t, ctx, propagation, bytesPerSecond, deepCarrierFrameCapacity,
+			func(settings *SendBufferSettings) {
+				settings.ResendQueueMaxByteCount = window
+			}, func(settings *ClientSettings) {
+				settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+			})
+		harness.receiveHold(window)
+		delivered := &atomic.Int64{}
+		harness.receiver.AddReceiveCallback(
+			func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
+				delivered.Add(int64(len(frames)) * payloadByteCount)
+			},
+		)
 
-	start := time.Now()
-	harness.offer(t, payloadByteCount, offerWindow)
-	elapsed := time.Since(start)
+		start := time.Now()
+		harness.offer(t, payloadByteCount, offerWindow)
+		synctest.Wait()
+		elapsed := time.Since(start)
+		if elapsed != offerWindow || delivered.Load() == 0 {
+			t.Fatalf("modeled flow delivered %d payload bytes over %s, want positive delivery over %s", delivered.Load(), elapsed, offerWindow)
+		}
 
-	stats := harness.sender.DestinationSendStats(harness.receiverId)
-	receiveStats := harness.receiver.ReceiveStats()
-	permitted := float64(stats.SendWindow.Window) / stats.Rtt.Min.Seconds()
-	achieved := float64(delivered.Load()) / elapsed.Seconds()
+		stats := harness.sender.DestinationSendStats(harness.receiverId)
+		receiveStats := harness.receiver.ReceiveStats()
+		if stats.Rtt.Min <= 0 {
+			t.Fatal("modeled flow did not observe a positive actual ACK round trip")
+		}
+		permitted := float64(stats.SendWindow.Window) / stats.Rtt.Min.Seconds()
+		achieved := float64(delivered.Load()) / elapsed.Seconds()
 
-	t.Logf(
-		"window %d over a %s minimum round trip permits %.2f MB/s; delivered %.2f MB/s (%.2f of it). resends %d bytes, receiver drops %d, evictions %d",
-		stats.SendWindow.Window, stats.Rtt.Min, permitted/1e6, achieved/1e6,
-		achieved/permitted, stats.ResendWriteByteCount,
-		receiveStats.ReceiveQueueDropCount, receiveStats.ReceiveQueueEvictionCount,
-	)
-
-	// the preconditions the contract binds under
-	if 0 < receiveStats.ReceiveQueueDropCount || 0 < receiveStats.ReceiveQueueEvictionCount {
-		t.Fatalf(
-			"the receiver refused %d arrivals and evicted %d, so this run's shortfall is explained and the contract does not bind on it",
+		t.Logf(
+			"window %d over a %s minimum round trip permits %.2f MB/s; delivered %.2f MB/s (%.2f of it). resends %d bytes, receiver drops %d, evictions %d",
+			stats.SendWindow.Window, stats.Rtt.Min, permitted/1e6, achieved/1e6,
+			achieved/permitted, stats.ResendWriteByteCount,
 			receiveStats.ReceiveQueueDropCount, receiveStats.ReceiveQueueEvictionCount,
 		)
-	}
-	if 0 < stats.ResendWriteByteCount {
-		t.Fatalf(
-			"%d bytes were retransmitted, so this run had loss and the contract does not bind on it",
-			stats.ResendWriteByteCount,
-		)
-	}
 
-	if achieved < 0.85*permitted {
-		t.Errorf(
-			"the flow delivered %.2f MB/s against the %.2f MB/s its %d byte window permits over a %s round trip, %.2f of it, with no loss and no queueing; a window is permission to have that many bytes outstanding, and a flow that never loses one and never waits behind one should be limited by nothing else",
-			achieved/1e6, permitted/1e6, stats.SendWindow.Window,
-			stats.Rtt.Min, achieved/permitted,
-		)
-	}
+		// The same workload must reach the exact virtual cutoff without loss.
+		if receiveStats.PackHandoffDropCount != 0 || harness.sender.ReceiveStats().SendPackDeadlineDropCount != 0 {
+			t.Fatalf("modeled flow lost accepted traffic: handoff drops=%d deadline drops=%d", receiveStats.PackHandoffDropCount, harness.sender.ReceiveStats().SendPackDeadlineDropCount)
+		}
+		// the preconditions the contract binds under
+		if 0 < receiveStats.ReceiveQueueDropCount || 0 < receiveStats.ReceiveQueueEvictionCount {
+			t.Fatalf(
+				"the receiver refused %d arrivals and evicted %d, so this run's shortfall is explained and the contract does not bind on it",
+				receiveStats.ReceiveQueueDropCount, receiveStats.ReceiveQueueEvictionCount,
+			)
+		}
+		if 0 < stats.ResendWriteByteCount {
+			t.Fatalf(
+				"%d bytes were retransmitted, so this run had loss and the contract does not bind on it",
+				stats.ResendWriteByteCount,
+			)
+		}
+
+		if achieved < 0.85*permitted {
+			t.Errorf(
+				"the flow delivered %.2f MB/s against the %.2f MB/s its %d byte window permits over a %s round trip, %.2f of it, with no loss and no queueing; a window is permission to have that many bytes outstanding, and a flow that never loses one and never waits behind one should be limited by nothing else",
+				achieved/1e6, permitted/1e6, stats.SendWindow.Window,
+				stats.Rtt.Min, achieved/permitted,
+			)
+		}
+	})
 }

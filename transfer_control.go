@@ -186,6 +186,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 					},
 					-1,
 					Ctx(handleCtx),
+					NoBudget(),
 				)
 				if !success {
 					// the send did not accept the frame (no enqueue), so no ack will
@@ -259,6 +260,7 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		},
 		0,
 		Ctx(handleCtx),
+		NoBudget(),
 	)
 	if success {
 		return

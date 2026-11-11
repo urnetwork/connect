@@ -34,6 +34,7 @@ func synMetadataTestPacket(path *IpPath, timestamp uint32, identification uint16
 	return packet
 }
 
+// Explicit one-byte TFO originals preserve the DATA-credit publication premise.
 // The same leaf compiles against the unchanged production baseline. Its
 // failure is delayed until every real client/provider and credit has joined.
 func testNativeSynMetadataPublication(t *testing.T, version int, mode string) {
@@ -87,13 +88,13 @@ func testNativeSynMetadataPublication(t *testing.T, version int, mode string) {
 				// The maintained partial fixture offers initial / just-before-age /
 				// exact-age. Only the first retry changes metadata; the third is exact.
 				generation := min(ordinal, 2)
-				return synMetadataTestPacket(path, uint32(100+generation), uint16(200+generation), nil)
+				return synMetadataTestPacket(path, uint32(100+generation), uint16(200+generation), []byte{0x64})
 			},
 			afterRetry: func(f *synPublicationTestFixture) {
-				latestPacket = synMetadataTestPacket(f.path, 102, 202, nil)
+				latestPacket = synMetadataTestPacket(f.path, 102, 202, []byte{0x64})
 				f.update.stateLock.Lock()
 				current = f.update.synRetry
-				valid := current != nil && current.credit != nil && current.credit.budget == budget && !current.credit.released.Load() &&
+				valid := current != nil && current.credit != nil && !protocolClassPureTcpControl(current.packet) && !current.credit.noBudget && current.credit.budget == budget && !current.credit.released.Load() &&
 					current.source == f.h.source && current.sequence == f.path.SequenceNumber && current.validWithLock(f.update) &&
 					(bytes.Equal(current.packet, oldPacket) || bytes.Equal(current.packet, latestPacket)) &&
 					!f.update.receivedInbound.Load() && f.update.client.Load() == nil

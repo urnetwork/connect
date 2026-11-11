@@ -1,4 +1,4 @@
-// Real retained source ACKs drive readiness; public native and receive entries
+// DATA-bearing SYNs and real retained source ACKs drive readiness; public native and receive entries
 // exercise stale generations without assigning production capacity or clocks.
 package connect
 
@@ -33,6 +33,23 @@ func newSynRetryReadyControl(t *testing.T, port int) *synRetryReadyControl {
 	owner := synRetryControlOwner(t, update)
 	if owner.readiness == nil {
 		t.Fatal("initial source could not prepay readiness metadata")
+	}
+	return &synRetryReadyControl{harness: harness, path: path, owner: owner, update: update, original: bytes.Clone(owner.packet)}
+}
+
+// DATA-credit readiness controls deliberately retain a one-byte TFO payload.
+// Bare SYN state is protocol and is tested independently without byte credit.
+func newSynRetryDataReadyControl(t *testing.T, port int) *synRetryReadyControl {
+	t.Helper()
+	harness, path := synRetryControlHarness(t, port, nil, DefaultProtocolVersion)
+	packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+	if !synRetryControlOffer(t, harness, packet) {
+		t.Fatal("initial DATA-bearing native SYN refused")
+	}
+	update := harness.update(path)
+	owner := synRetryControlOwner(t, update)
+	if protocolClassPureTcpControl(owner.packet) || owner.credit.noBudget || owner.readiness == nil || owner.readiness.credit.noBudget {
+		t.Fatal("DATA-credit fixture did not retain actual charged TFO state")
 	}
 	return &synRetryReadyControl{harness: harness, path: path, owner: owner, update: update, original: bytes.Clone(owner.packet)}
 }
@@ -110,7 +127,7 @@ func TestNativeSynRetryReadinessDoesNotSpinAndPublishesDemand(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51401)
+		control := newSynRetryDataReadyControl(t, 51401)
 		var demand atomic.Int32
 		credit.source.afterRetainedAdmissionDemandForTest = func() { demand.Add(1) }
 		started := credit.base.started.Load()
@@ -144,7 +161,7 @@ func TestNativeSynRetryReadinessAckBeforeRegistration(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51402)
+		control := newSynRetryDataReadyControl(t, 51402)
 		entered, release := synRetryReadyHold(t, control.harness.multiClient, true)
 		control.harness.multiClient.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel { return []*multiClientChannel{credit.base.selected} }
 		control.harness.inject("a", reraceProviderSignal(t, control.path))
@@ -173,7 +190,7 @@ func TestNativeSynRetryReadinessSourceCancelWithdraws(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51403)
+		control := newSynRetryDataReadyControl(t, 51403)
 		started := credit.base.started.Load()
 		control.refuseOn(t, credit)
 		ready, paid := control.owner.readiness, control.owner.readiness.credit
@@ -193,7 +210,7 @@ func TestNativeSynRetryReadinessParentCloseWithdraws(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51404)
+		control := newSynRetryDataReadyControl(t, 51404)
 		started := credit.base.started.Load()
 		control.refuseOn(t, credit)
 		ready, paid := control.owner.readiness, control.owner.readiness.credit
@@ -214,7 +231,7 @@ func TestNativeSynRetryReadinessHeldGrantRejectsNewSyn(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51405)
+		control := newSynRetryDataReadyControl(t, 51405)
 		control.refuseOn(t, credit)
 		ready, paid, packetCredit := control.owner.readiness, control.owner.readiness.credit, control.owner.credit
 		entered, release := synRetryReadyHold(t, control.harness.multiClient, false)
@@ -245,7 +262,7 @@ func TestNativeSynRetryReadinessHeldGrantRejectsSameCacheRaceCycle(t *testing.T)
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		old, first, second := newNativeBatchCreditFixture(t), newNativeBatchCreditFixture(t), newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51406)
+		control := newSynRetryDataReadyControl(t, 51406)
 		control.refuseOn(t, old)
 		ready, paid := control.owner.readiness, control.owner.readiness.credit
 		entered, release := synRetryReadyHold(t, control.harness.multiClient, false)
@@ -257,8 +274,10 @@ func TestNativeSynRetryReadinessHeldGrantRejectsSameCacheRaceCycle(t *testing.T)
 		control.harness.multiClient.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
 			return []*multiClientChannel{first.base.selected, second.base.selected}
 		}
-		if privateStaleBoundNativeSyn(t, control.harness, control.path) {
-			t.Fatal("closed new-race sources unexpectedly accepted original")
+		// Re-offer the exact cached TFO DATA, preserving this same source's
+		// identity while the replacement sources lack DATA permission.
+		if synRetryControlOffer(t, control.harness, MessagePoolCopy(control.original)) {
+			t.Fatal("DATA-full new-race sources unexpectedly accepted original DATA")
 		}
 		canonical := control.harness.update(control.path)
 		control.update.stateLock.Lock()
@@ -300,7 +319,7 @@ func TestNativeSynRetryReadinessResizesForActualCandidateField(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		control := newSynRetryReadyControl(t, 51407)
+		control := newSynRetryDataReadyControl(t, 51407)
 		oldReady, oldCredit := control.owner.readiness, control.owner.readiness.credit
 		count := len(oldReady.slots) + 1
 		credits := make([]*nativeBatchCreditFixture, count)
@@ -333,7 +352,7 @@ func TestNativeSynRetryReadinessCoalescesSeveralReadySources(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		first, second := newNativeBatchCreditFixture(t), newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, 51408)
+		control := newSynRetryDataReadyControl(t, 51408)
 		seedOne, seedTwo := first.base.started.Load(), second.base.started.Load()
 		var selections, dispatches, arms, grants, beforeFirst, beforeSecond atomic.Int64
 		first.base.selected.beforeGroupCompletionForTest = func() { beforeFirst.Add(1) }
@@ -431,7 +450,7 @@ func TestNativeSynRetryReadinessMetadataRefusalDoesNotNarrowField(t *testing.T) 
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		control := newSynRetryReadyControl(t, 51409)
+		control := newSynRetryDataReadyControl(t, 51409)
 		count := len(control.owner.readiness.slots) + 1
 		credits := make([]*nativeBatchCreditFixture, count)
 		budgets := make([]*TransferMemoryBudget, count)
@@ -502,7 +521,7 @@ func testSynRetryReadinessTerminalControl(t *testing.T, port int, flags byte) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
-		control := newSynRetryReadyControl(t, port)
+		control := newSynRetryDataReadyControl(t, port)
 		control.refuseOn(t, credit)
 		ready, paid, packetCredit := control.owner.readiness, control.owner.readiness.credit, control.owner.credit
 		entered, release := synRetryReadyHold(t, control.harness.multiClient, false)

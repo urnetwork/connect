@@ -55,6 +55,7 @@ func testAckLifetimePendingPacedHead(t *testing.T, feedback string) {
 	t.Helper()
 	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {
 		sequence := fixture.sequence
+		snapshots := observeWindowRetryOwner(fixture)
 		resume := make(chan struct{})
 		close(resume)
 		fixture.resumeSecondDue = resume
@@ -85,10 +86,11 @@ func testAckLifetimePendingPacedHead(t *testing.T, feedback string) {
 		}
 		close(fixture.releaseInitial)
 		synctest.Wait()
+		before := releaseWindowRetryOwnerWrite(t, snapshots, fixture.start.Add(100*time.Millisecond))
 		service.stateLock.Lock()
 		waiting := service.pacingReservations == 1 && service.waiterHead == &sequence.windowPacer.waiter
 		service.stateLock.Unlock()
-		if !waiting || len(sequence.sendItems) != 2 || sequence.sendItems[1].transportWriteObserved {
+		if !waiting || before.retained != 2 || before.written {
 			t.Fatal("real younger original did not retain its pacing reservation")
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -175,7 +177,14 @@ func testAckLifetimePendingPacedHead(t *testing.T, feedback string) {
 				}
 				time.Sleep(100 * time.Millisecond)
 				synctest.Wait()
-				if len(fixture.route) != 1 || sequence.lastHeadAckTime != arrival || len(fixture.ackFailedAt) != 0 {
+				var written windowRetryOwnerObservation
+				select {
+				case written = <-snapshots.afterWrite:
+				default:
+					t.Fatal("resumed owner did not publish its real younger write")
+				}
+				if len(fixture.route) != 1 || written.lastHeadAckTime != arrival || len(fixture.ackFailedAt) != 0 ||
+					before.written || !written.written || written.messageId != before.messageId {
 					t.Fatal("resumed owner lost arrival time, prefix delivery, or the one younger write")
 				}
 				wire := <-fixture.route

@@ -527,6 +527,41 @@ func (self *privateH1ProofFixture) requirePlatformClose(sourceId Id, contractId 
 	self.t.Fatal("actual platform did not receive the expected original close")
 }
 
+// Withheld platform ACKs retain the encoded protocol original independently
+// of DATA credit. The real platform receipt and later ACK prove its lifetime.
+func (self *privateH1ProofFixture) requirePlatformRetainedControl(owner *Client, kind protocol.MessageType) {
+	self.t.Helper()
+	synctest.Wait()
+	owner.sendBuffer.mutex.Lock()
+	var sequences []*SendSequence
+	for _, sequence := range owner.sendBuffer.sendSequencesBySequenceId {
+		if sequence.destination == ControlId {
+			sequences = append(sequences, sequence)
+		}
+	}
+	owner.sendBuffer.mutex.Unlock()
+	retained := 0
+	for _, sequence := range sequences {
+		for _, item := range sequence.resendQueue.UnorderedItems(nil) {
+			if !item.expectsAck || !item.noBudget || item.QueueByteCount() != 0 || len(item.transferFrameBytes) == 0 {
+				self.t.Fatal("platform control lost reliable custody or consumed DATA credit")
+			}
+			wire := &protocol.TransferFrame{}
+			if err := ProtoUnmarshal(item.transferFrameBytes, wire); err != nil || wire.Pack == nil || wire.Pack.Nack {
+				self.t.Fatal("retained platform control lost its encoded reliable original", err)
+			}
+			for _, frame := range wire.Pack.Frames {
+				if frame.MessageType == kind {
+					retained++
+				}
+			}
+		}
+	}
+	if retained != 1 {
+		self.t.Fatalf("withheld platform ACK retained %d controls of type %v, want one", retained, kind)
+	}
+}
+
 // A real ACK must release both reliable Transfer and manager report custody;
 // merely excluding close observations from the application stream is not enough.
 func (self *privateH1ProofFixture) requirePlatformControlsSettled() {
@@ -1550,7 +1585,7 @@ func TestCanonicalH1FullProofContractWaitLosesKnownCeiling(t *testing.T) {
 }
 
 // An actual retired-contract close may outlive the application ACK. Its separate
-// observer and retained charge cannot complete or consume the original group.
+// observer and retained original cannot complete or consume the application group.
 func TestCanonicalH1CloseLifecycleKeepsOriginalAndControlCustody(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -1619,8 +1654,8 @@ func TestCanonicalH1CloseLifecycleKeepsOriginalAndControlCustody(t *testing.T) {
 		default:
 			t.Fatal("peer ACK did not complete the original application group")
 		}
-		if len(results) != 0 || len(fixture.delivered) != 16 || sequence.resendQueue.Len() != 0 || fixture.budget.UsedByteCount() <= 0 {
-			t.Fatal("application completion consumed close credit or retained peer originals")
+		if len(results) != 0 || len(fixture.delivered) != 16 || sequence.resendQueue.Len() != 0 || fixture.budget.UsedByteCount() != 0 {
+			t.Fatal("application completion retained peer originals or protocol consumed DATA credit")
 		}
 		for index, witness := range fixture.witnesses {
 			if !bytes.Equal(fixture.delivered[index], witness) {
@@ -1629,6 +1664,7 @@ func TestCanonicalH1CloseLifecycleKeepsOriginalAndControlCustody(t *testing.T) {
 		}
 		privateH1GroupLifecycle(t, applicationEvents, started, false, false)
 		fixture.requirePlatformClose(fixture.sender.ClientId(), firstContract)
+		fixture.requirePlatformRetainedControl(fixture.sender, protocol.MessageType_TransferCloseContract)
 		var controlStarted SendPackLifecycleObservation
 		for _, phase := range []SendPackLifecyclePhase{SendPackLifecyclePhaseStarted, SendPackLifecyclePhaseFirstRouteWrite} {
 			select {
@@ -1742,8 +1778,9 @@ func TestCanonicalH1PlatformClientKeyBeforeCloseUsesActualAck(t *testing.T) {
 		acks := make(chan error, 2)
 		control.Send(frame, nil, func(err error) { acks <- err })
 		fixture.requirePlatformKey(fixture.sender)
-		if len(acks) != 0 || fixture.budget.UsedByteCount() <= 0 {
-			t.Fatal("key delivery without its platform ACK lost reliable ownership")
+		fixture.requirePlatformRetainedControl(fixture.sender, protocol.MessageType_TransferClientKey)
+		if len(acks) != 0 || fixture.budget.UsedByteCount() != 0 {
+			t.Fatal("key delivery completed without its platform ACK or consumed DATA credit")
 		}
 		fixture.enablePlatformAcknowledgements()
 		select {

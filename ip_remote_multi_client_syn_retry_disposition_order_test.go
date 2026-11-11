@@ -39,7 +39,8 @@ type nativeSynDispositionCacheEvent struct {
 	live   bool
 }
 
-// Numeric permission follows the same production accounting helpers. One key
+// DATA permission follows the production accounting helpers. SYN originals
+// in this paid-cache fixture deliberately carry one real TFO application byte. One key
 // publication remains unACKed in this fixture's absent platform path. A has one
 // held native source, B may retain its three actually offered generations, and
 // C may retain SYN plus its two healthy bodies until ACK compression fires.
@@ -91,7 +92,8 @@ func nativeSynDispositionFundingFor(settings *MultiClientSettings) nativeSynDisp
 	nativeSlots := [3]int{1, 3, 3}
 	cacheSlots := [3]int{1, 2, 1}
 	for index := range funding.children {
-		// One real control publisher (encryption is Off), the bounded native
+		// Bootstrap protocol publishers remain uncharged (encryption is Off).
+		// This unchanged cap conservatively includes the bounded native
 		// cohort plus one continuous ping, and exact cache/readiness overlap.
 		child := ordinary
 		child = addReceiveQueueByteCount(child, ByteCount(nativeSlots[index]+1)*addReceiveQueueByteCount(ordinary, group))
@@ -103,7 +105,7 @@ func nativeSynDispositionFundingFor(settings *MultiClientSettings) nativeSynDisp
 }
 
 // Real initial-ping admission and quiescent owner snapshots precede the first
-// application SYN. Unrelated key controls remain explicit funded owners.
+// DATA-bearing SYN. Key controls remain explicit uncharged lifetime owners.
 func (self *nativeSynDispositionOrderFixture) requireFundedBootstrap(t *testing.T) {
 	t.Helper()
 	self.h.settle()
@@ -200,6 +202,21 @@ type nativeSynDispositionOrderFixture struct {
 	afterOld   chan nativeSynDispositionCacheEvent
 	sampledOld atomic.Bool
 	answerB    atomic.Bool
+}
+
+// These paid-cache/disposition controls use one explicit application byte.
+// Bare-SYN protocol progress has independent NoBudget pressure coverage.
+func nativeSynDispositionDataOffer(t *testing.T, harness *reraceHarness, path *IpPath) bool {
+	t.Helper()
+	packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+	if protocolClassPureTcpControl(packet) {
+		MessagePoolReturn(packet)
+		t.Fatal("DATA disposition fixture accidentally offered pure protocol")
+	}
+	accepted := [1]bool{}
+	count := harness.multiClient.SendNativePacketBatchWithResults(harness.source, protocol.ProvideMode_Network, [][]byte{packet}, reraceSendTimeout, accepted[:])
+	harness.settle()
+	return count == 1 && accepted[0]
 }
 
 func newNativeSynDispositionOrderFixture(t *testing.T, failedNewSource bool) *nativeSynDispositionOrderFixture {
@@ -304,7 +321,7 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 						continue
 					}
 					path, err := ParseIpPath(packet)
-					if err != nil || !reraceSameFlow(path, f.path) || !path.Syn || path.Ack || path.SequenceNumber != f.path.SequenceNumber || len(packet) != 40 || !f.held.Load() || !f.sampledOld.CompareAndSwap(false, true) {
+					if err != nil || !reraceSameFlow(path, f.path) || !path.Syn || path.Ack || path.SequenceNumber != f.path.SequenceNumber || len(packet) != 41 || !f.held.Load() || !f.sampledOld.CompareAndSwap(false, true) {
 						continue
 					}
 					update := f.update
@@ -427,12 +444,12 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 	}
 	if failedNewSource {
 		// The old A source is genuinely admitted; the newer B source will own
-		// no raw packet. The root bound is never raised or waived.
+		// no raw DATA packet. The root bound is never raised or waived.
 		f.budgets["b"].SetTotalByteCount(0)
 	}
 	f.h.concurrent = true
 	orderInitialB.Store(true)
-	if !privateCrossWindowNativeSyn(f.h, f.path) {
+	if !nativeSynDispositionDataOffer(t, f.h, f.path) {
 		t.Fatal("old ordinary native source was not admitted")
 	}
 	timer := time.NewTimer(2500 * time.Millisecond)
@@ -445,7 +462,7 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 	f.h.concurrent = false
 	f.h.settle()
 	f.update = f.h.update(f.path)
-	if f.update == nil || f.event.update != f.update || f.event.bytes != 40 || f.event.source.resendQueue.Budget() != f.budgets["a"] {
+	if f.update == nil || f.event.update != f.update || f.event.bytes != 41 || f.event.source.resendQueue.Budget() != f.budgets["a"] {
 		t.Fatal("held disposition lacks the actual canonical source, owned SYN and paid A queue")
 	}
 	f.update.stateLock.Lock()
@@ -493,8 +510,8 @@ func newNativeSynDispositionOrderFixtureConfigured(t *testing.T, failedNewSource
 		t.Logf("NATIVE_SYN_DISPOSITION_BOUNDARY_DIAGNOSTIC published=%t candidate_local=%t flags=%x source_materialized=%t global_syn_seen=%t global_syn=%d wanted_syn=%d selected_source=%t race_width=%d race_single=%t root_used=%d root_cap=%d", published, candidateLocal, flags, sourceMaterialized, synSeen, synNumber, f.path.SequenceNumber, selectedSource, raceWidth, raceSingle, f.root.UsedByteCount(), f.root.TotalByteCount())
 		t.Fatal("old-source barrier lacks its actual live wide-candidate materialization before physical write")
 	}
-	if failedNewSource && (!bUnmaterialized || len(f.h.exit("b").syns(f.path)) != 0 || f.budgets["b"].UsedByteCount() != f.funding.ordinary) {
-		t.Fatal("zero-budget B materialized application bytes or retained more than its actual bootstrap control")
+	if failedNewSource && (!bUnmaterialized || len(f.h.exit("b").syns(f.path)) != 0 || f.budgets["b"].UsedByteCount() != 0) {
+		t.Fatal("zero-budget B materialized DATA or charged its protocol bootstrap")
 	}
 	return f
 }
@@ -509,6 +526,9 @@ func (self *nativeSynDispositionOrderFixture) resumeOld() {
 func (self *nativeSynDispositionOrderFixture) waitWire(t *testing.T, provider string, sequence uint32, reset bool, byteCounts ...int) {
 	t.Helper()
 	bytes := 40
+	if !reset {
+		bytes++ // the default paid-SYN source carries one TFO byte
+	}
 	if len(byteCounts) != 0 {
 		bytes = byteCounts[0]
 	}
@@ -532,7 +552,7 @@ func (self *nativeSynDispositionOrderFixture) cache(t *testing.T, sequence uint3
 	owner := self.update.synRetry
 	var credit *transferRetainedControlCredit
 	valid := owner != nil && owner.references != 0 && owner.packet != nil && owner.sequence == sequence && owner.serial != 0 &&
-		owner.credit != nil && owner.credit.budget == budget && !owner.credit.released.Load() && budget.root == self.root
+		owner.credit != nil && !owner.credit.noBudget && !protocolClassPureTcpControl(owner.packet) && owner.credit.budget == budget && !owner.credit.released.Load() && budget.root == self.root
 	if valid {
 		credit = owner.credit
 		ready := owner.readiness
@@ -644,7 +664,7 @@ func testNativeSynDispositionOrder(t *testing.T, mode string) {
 				}
 				f.waitWire(t, "b", fresh.SequenceNumber, false, 40+len(payload))
 			} else {
-				if !privateCrossWindowNativeSyn(f.h, &fresh) {
+				if !nativeSynDispositionDataOffer(t, f.h, &fresh) {
 					t.Fatal("newer different-ISN native source was not admitted")
 				}
 				f.waitWire(t, "b", fresh.SequenceNumber, false)
@@ -690,7 +710,7 @@ func testNativeSynDispositionOrder(t *testing.T, mode string) {
 			}
 		case "equal":
 			collapse := f.h.multiClient.TcpCollapseDropCount()
-			accepted := privateCrossWindowNativeSyn(f.h, f.path)
+			accepted := nativeSynDispositionDataOffer(t, f.h, f.path)
 			if accepted || f.h.multiClient.TcpCollapseDropCount()-collapse != 1 {
 				t.Fatal("equal-ISN native retransmit did not retain its ordinary persistent collapse behavior")
 			}
@@ -700,11 +720,11 @@ func testNativeSynDispositionOrder(t *testing.T, mode string) {
 			f.budgets["a"].SetTotalByteCount(0)
 			// Zero timeout selects the actual non-waiting capacity gate;
 			// positive-timeout raw handoff alone is not materialization proof.
-			packet := MessagePoolCopy(reraceTcpPacket(&fresh, tcpFlagSyn, fresh.SequenceNumber, 0, nil))
+			packet := MessagePoolCopy(reraceTcpPacket(&fresh, tcpFlagSyn, fresh.SequenceNumber, 0, []byte{0x64}))
 			accepted := [1]bool{}
 			count := f.h.multiClient.SendNativePacketBatchWithResults(f.h.source, protocol.ProvideMode_Network, [][]byte{packet}, 0, accepted[:])
 			f.h.settle()
-			if count != 0 || accepted[0] || len(f.h.exit("b").syns(f.path)) != 0 || f.budgets["b"].UsedByteCount() != f.funding.ordinary {
+			if count != 0 || accepted[0] || len(f.h.exit("b").syns(f.path)) != 0 || f.budgets["b"].UsedByteCount() != 0 {
 				t.Fatal("non-waiting newer source lacked an actual admission refusal with zero B materialization")
 			}
 			f.update.stateLock.Lock()
@@ -848,7 +868,7 @@ func TestNativeSynCacheUnfundedNewMaterializationRejectsOlderResurrection(t *tes
 		_, oldCredit := f.cache(t, f.path.SequenceNumber, f.budgets["b"])
 		fresh := *f.path
 		fresh.SequenceNumber++
-		if !privateCrossWindowNativeSyn(f.h, &fresh) {
+		if !nativeSynDispositionDataOffer(t, f.h, &fresh) {
 			t.Fatal("new source did not acquire its actual Pack before optional-cache refusal")
 		}
 		f.waitWire(t, "b", fresh.SequenceNumber, false)
@@ -886,7 +906,7 @@ func TestNativeSynCacheSelectedPromotionRejectsDelayedLoser(t *testing.T) {
 		fresh := *f.path
 		fresh.SequenceNumber++
 		f.answerB.Store(true)
-		if !privateCrossWindowNativeSyn(f.h, &fresh) {
+		if !nativeSynDispositionDataOffer(t, f.h, &fresh) {
 			t.Fatal("new selected-generation native source was not admitted")
 		}
 		f.waitWire(t, "b", fresh.SequenceNumber, false)
@@ -928,7 +948,7 @@ func TestNativeSynCacheCanceledSourcePreservesNewerPaidOwner(t *testing.T) {
 		f.waitWire(t, "b", f.path.SequenceNumber, false)
 		fresh := *f.path
 		fresh.SequenceNumber++
-		if !privateCrossWindowNativeSyn(f.h, &fresh) {
+		if !nativeSynDispositionDataOffer(t, f.h, &fresh) {
 			t.Fatal("newer source was not admitted before canceling old source")
 		}
 		f.waitWire(t, "b", fresh.SequenceNumber, false)
@@ -1000,7 +1020,7 @@ func TestNativeSynCacheLateMaterializationCannotReplaceNewerAdmission(t *testing
 			return []*multiClientChannel{b}
 		}
 		armed.Store(true)
-		if !privateCrossWindowNativeSyn(f.h, &older) {
+		if !nativeSynDispositionDataOffer(t, f.h, &older) {
 			t.Fatal("older B source was not publicly admitted")
 		}
 		timer := time.NewTimer(2500 * time.Millisecond)
@@ -1028,7 +1048,7 @@ func TestNativeSynCacheLateMaterializationCannotReplaceNewerAdmission(t *testing
 		if !valid {
 			t.Fatal("held writer was not the exact older, dequeued but unmaterialized native B group")
 		}
-		if !privateCrossWindowNativeSyn(f.h, &newer) {
+		if !nativeSynDispositionDataOffer(t, f.h, &newer) {
 			t.Fatal("newer A source was not publicly admitted while B stayed held")
 		}
 		f.waitWire(t, "a", newer.SequenceNumber, false)

@@ -804,8 +804,7 @@ type LocalUserNat struct {
 	sendWg           sync.WaitGroup
 	runDone          chan struct{}
 
-	settings      *LocalUserNatSettings
-	controlMemory *TransferMemoryBudget
+	settings *LocalUserNatSettings
 
 	// receive callback
 	receiveCallbacks *CallbackList[ReceivePacketFunction]
@@ -934,11 +933,6 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		sourceRetirementSourceIds:       map[Id]map[uint64]bool{},
 		sourceRetirementDoneIds:         map[Id][]<-chan struct{}{},
 		sourceRetirementCallbacks:       map[uint64]sourceRetirementFunction{},
-	}
-	if settings.MemoryBudget != nil {
-		// A subpartition of memory's fixed reservation, not another allowance.
-		// It admits ACKs even when replay/data owners fill the shared root.
-		localUserNat.controlMemory = NewTransferMemoryBudget(kib(16))
 	}
 	go func() {
 		defer close(localUserNat.runDone)
@@ -1098,8 +1092,10 @@ func (self *LocalUserNat) SendPacketsWithTimeout(source TransferPath, provideMod
 	)
 }
 
-// SendPacketBatch transfers every packet on successful all-or-nothing local
-// admission. A rejection returns every packet to the pool.
+// SendPacketBatch consumes every input packet and borrows the outer slice.
+// A protocol-only burst uses bounded local owners and returns the accepted
+// prefix count; a refused chunk and its unoffered suffix are returned here.
+// DATA and mixed batches retain their single all-or-nothing admission.
 func (self *LocalUserNat) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -1109,9 +1105,43 @@ func (self *LocalUserNat) SendPacketBatch(
 	if len(packets) == 0 {
 		return 0
 	}
+	protocolOnly := natProtocolOnlyPackets(packets)
+	if protocolOnly && providerReturnBatchMaxFrames < len(packets) {
+		// Bound each queued protocol owner without rejecting a legal native
+		// read burst merely because its caller collected more than one owner.
+		// The recursive calls have at most the fixed frame count, so recursion
+		// is one level. Each owns its copied slice and consumes its full input.
+		var deadline time.Time
+		if timeout > 0 {
+			deadline = time.Now().Add(timeout)
+		}
+		accepted := 0
+		for start := 0; start < len(packets); {
+			end := min(start+providerReturnBatchMaxFrames, len(packets))
+			remaining := timeout
+			if timeout > 0 {
+				remaining = max(time.Duration(0), time.Until(deadline))
+			}
+			count := self.SendPacketBatch(source, provideMode, packets[start:end], remaining)
+			accepted += count
+			if count != end-start {
+				// This chunk already consumed its own rejected roots. Only
+				// later, never-offered roots remain ours to return.
+				for _, packet := range packets[end:] {
+					MessagePoolReturn(packet)
+				}
+				return accepted
+			}
+			start = end
+		}
+		return accepted
+	}
 	var budget *TransferMemoryBudget
 	if self.settings != nil {
 		budget = self.settings.MemoryBudget
+	}
+	if protocolOnly {
+		budget = nil
 	}
 	metadata, admitted := reserveNatMemory(budget, ByteCount(128+24*len(packets)))
 	if !admitted {
@@ -1154,15 +1184,17 @@ func (self *LocalUserNat) sendTransferPacketsWithTimeout(
 }
 
 func (self *LocalUserNat) reserveSendPacketsMemory(packets [][]byte) (natMemoryReservation, bool) {
+	if natProtocolOnlyPackets(packets) {
+		// A public batch previously drew its packet-list/root bound from byte
+		// admission. Retain a concrete owner-count limit after the exemption.
+		return natMemoryReservation{}, len(packets) <= providerReturnBatchMaxFrames
+	}
 	if self.settings != nil && self.settings.MemoryBudget != nil {
 		bytes := ByteCount(256 + 64*len(packets))
 		for _, packet := range packets {
 			bytes = addReceiveQueueByteCount(bytes, natPacketMemoryByteCount(packet))
 		}
 		budget := self.settings.MemoryBudget
-		if natControlPackets(packets) {
-			budget = self.controlMemory
-		}
 		return reserveNatMemory(budget, bytes)
 	}
 	return natMemoryReservation{}, true
@@ -4640,17 +4672,18 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	terminalOwner *providerReliablePacket,
 ) (bool, error) {
 	source = source.LocalMask()
+	protocolOnly := protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, ipPacket)
 	// A new flow must already own its initiating packet. Reserve that packet
 	// first so a near-full pool cannot install an idle, SYN-less generation.
 	var memory natMemoryReservation
 	accepted := false
 	if credit != nil {
 		memory = *credit
-		if tcp.syn && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
+		if !protocolOnly && tcp.syn && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
 			memory.budget != nil && memory.bytes < natPacketMemoryByteCount(ipPacket)) {
 			return false, ErrNatMemoryBudget
 		}
-	} else if tcp.syn {
+	} else if tcp.syn && !protocolOnly {
 		var admitted bool
 		memory, admitted = reserveNatMemory(self.tcpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
 		if !admitted {
@@ -4950,7 +4983,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		}
 		return true, nil
 	}
-	if credit != nil && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
+	if !protocolOnly && credit != nil && (memory.budget != self.tcpBufferSettings.MemoryBudget ||
 		memory.budget != nil && memory.bytes < natPacketMemoryByteCount(ipPacket)) {
 		if recheckRetirement && sequence.ctx.Err() != nil && initSequence() == nil {
 			return finishNoSequence()
@@ -4958,7 +4991,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		return false, ErrNatMemoryBudget
 	}
 
-	if !tcp.syn && credit == nil {
+	if !tcp.syn && credit == nil && !protocolOnly {
 		var admitted bool
 		memory, admitted = reserveNatMemory(self.tcpBufferSettings.MemoryBudget, natPacketMemoryByteCount(ipPacket))
 		if !admitted {
@@ -9595,6 +9628,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 	ackTarget := self.returnSendAckTarget(item)
 	var sent bool
 	if 2 <= self.settings.ProtocolVersion {
+		returnOption.NoBudget = protocolOnlyFrame(protocol.MessageType_IpIpPacketFromProvider, true, packet)
+		returnOption.DeliverImmediately = immediateIpAckFrame(protocol.MessageType_IpIpPacketFromProvider, true, packet)
 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
 			attemptSent, _ := self.client.sendRawWithTimeoutDetailed(
 				protocol.MessageType_IpIpPacketFromProvider,
@@ -9628,6 +9663,8 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 			}
 			panic(err)
 		}
+		returnOption.NoBudget = protocolOnlyFrame(frame.MessageType, frame.Raw, frame.MessageBytes)
+		returnOption.DeliverImmediately = immediateIpAckFrame(frame.MessageType, frame.Raw, frame.MessageBytes)
 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
 			return self.client.SendWithTimeout(
 				frame,
@@ -9710,6 +9747,9 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 		}
 		sendFrames := frames
 		frames = make([]*protocol.Frame, 0, maxFrames)
+		groupOptions := returnOption
+		groupOptions.NoBudget = protocolOnlyFrames(sendFrames)
+		groupOptions.DeliverImmediately = immediateIpAckFrames(sendFrames)
 		frameCount := len(sendFrames)
 		packetBytes := chunkPacketBytes
 		transportAttribution := newTransportPacketAttribution(
@@ -9727,7 +9767,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					destinationId,
 					func(err error) {},
 					writeTimeout,
-					returnOption,
+					groupOptions,
 					returnTransferKey,
 					Ctx(item.sendContext(self.ctx)),
 					sendSchedulingKeyOption{key: item.schedulingKey},
@@ -9771,7 +9811,9 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 		// SendSequence later applies its H1/H3 wire-size limit without rerunning
 		// provider routing or changing packet order.
 		if 0 < len(frames) &&
-			maxBytes < chunkBytes+int64(len(frame.MessageBytes)) {
+			(maxBytes < chunkBytes+int64(len(frame.MessageBytes)) ||
+				protocolOnlyFrame(frame.MessageType, frame.Raw, frame.MessageBytes) !=
+					protocolOnlyFrame(frames[0].MessageType, frames[0].Raw, frames[0].MessageBytes)) {
 			flush()
 		}
 		if frame.Raw {
@@ -10299,6 +10341,16 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 		self.receiveReliableFrames(source, frames, peer)
 		return
 	}
+	if natProtocolOnlyFrames(frames) {
+		if providerReturnBatchMaxFrames < len(frames) || self.memoryOperations != nil && !self.memoryOperations.start() {
+			return
+		}
+		if self.memoryOperations != nil {
+			defer self.memoryOperations.finish()
+		}
+		self.clientReceiveAdmitted(source, frames, peer)
+		return
+	}
 	memory, admitted := self.startMemoryOperation(providerFrameOperationBytes(frames))
 	if !admitted {
 		self.receiveControlFrames(source, frames, peer)
@@ -10309,8 +10361,8 @@ func (self *RemoteUserNatProvider) ClientReceive(source TransferPath, frames []*
 	self.clientReceiveAdmitted(source, frames, peer)
 }
 
-// Both ordinary admission and the independently prepaid control fallback
-// retain the provider graph and callback workspace before entering here.
+// Ordinary DATA admission retains its callback workspace. Validated protocol
+// callbacks hold the same lifecycle gate without a packet-byte claim.
 func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, frames []*protocol.Frame, peer Peer) bool {
 	// receive functions should be non-blocking
 	// clients should manage their own congestion protocols on top to avoid overflowing the sequence queues
@@ -10522,13 +10574,11 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 					switch r {
 					case SecurityPolicyResultAllow:
 						var packet []byte
-						if frame.Raw && (self.memoryBudget() == nil || !smallNatControlPacket(packetBytes)) {
+						if frame.Raw && !protocolOnlyFrame(frame.MessageType, true, packetBytes) {
 							packet = MessagePoolShareReadOnly(packetBytes)
 						} else {
-							// A small control must retain a small root even when
-							// Transfer lent it from a larger raw Pack. Otherwise
-							// scratch admission can succeed but leave too little
-							// data capacity for the ACK to reach the NAT.
+							// A protocol owner must not retain the DATA root of
+							// a larger mixed Pack after its ordinary credit retires.
 							packet = MessagePoolCopy(packetBytes)
 						}
 						if !appendIpPacketGroup(
@@ -10616,8 +10666,8 @@ func (self *RemoteUserNatProvider) clientReceiveAdmitted(source TransferPath, fr
 			} else {
 				// A flow group can contain both upload data and the ACKs
 				// needed to release its download replay owners. If the data
-				// admission refused the group, offer each small control to
-				// the prepaid NAT control partition before discarding it.
+				// admission refused the group, offer each small independent
+				// control without a packet-byte claim before discarding it.
 				// Each successful handoff owns its packet and source gate.
 				if self.memoryBudget() != nil {
 					for i, packet := range packetGroup.packets {
@@ -10931,6 +10981,9 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 			// before the send consumes the packet that ipPath borrows
 			self.dialFailures.syn(&ipPath, destination.Tail())
 		}
+		transferOptions := self.client.settings.DefaultTransferOpts
+		transferOptions.NoBudget = protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, packet)
+		transferOptions.DeliverImmediately = immediateIpAckFrame(protocol.MessageType_IpIpPacketToProvider, true, packet)
 
 		// The default v2 path embeds the raw frame in the pooled SendPack. It
 		// consumes packet only when the send accepts it and avoids both a frame
@@ -10944,6 +10997,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 				nil,
 				0,
 				timeout,
+				transferOptions,
 				// This layer has already parsed the packet for policy and
 				// routing, so it knows the flow and the transfer layer does
 				// not. Telling it costs nothing — the key never crosses the
@@ -10977,6 +11031,7 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 			destination,
 			func(err error) {},
 			timeout,
+			transferOptions,
 			scheduleIpFlow(&ipPath),
 		)
 		if success {

@@ -33,6 +33,10 @@ type SendSequenceLiveSnapshot struct {
 	// Originals remain owned after a selective ack until cumulative retirement.
 	// Encoded bytes exclude retransmitted copies. Retained charge counts actual
 	// item lifetime reservations; it is not a root-budget or queue-window sum.
+	ImmediateOriginalCount          int
+	ImmediateOriginalLimit          int
+	ImmediateCapacityWaitCount      uint64
+	ImmediateCapacityWait           time.Duration
 	OriginalItemCount               int
 	OriginalEncodedByteCount        ByteCount
 	OriginalRetainedChargeByteCount ByteCount
@@ -166,6 +170,13 @@ func (self *SendSequence) publishSendLiveSnapshot(reason string, now time.Time, 
 	sample.MonotonicTimeBase = self.client != nil && !self.client.feedbackTimeBase.IsZero()
 	sample.Closed = closed
 	sample.AdmissionReason = reason
+	sample.ImmediateOriginalCount = self.immediateSendCount
+	sample.ImmediateOriginalLimit = max(1, self.immediateSendLimit)
+	sample.ImmediateCapacityWaitCount = self.immediateWaitCount
+	sample.ImmediateCapacityWait = self.immediateWaitNanos
+	if !self.immediateWaitStart.IsZero() {
+		sample.ImmediateCapacityWait += max(time.Duration(0), now.Sub(self.immediateWaitStart))
+	}
 	if self.resendQueue != nil {
 		sample.RetainedAccountingEnabled = self.resendQueue.lifetimeBudget
 	}
@@ -175,13 +186,13 @@ func (self *SendSequence) publishSendLiveSnapshot(reason string, now time.Time, 
 			continue
 		}
 		sample.OriginalItemCount++
-		sample.OriginalEncodedByteCount += item.MessageByteCount()
+		sample.OriginalEncodedByteCount += ByteCount(len(item.transferFrameBytes))
 		if item.memoryBudget != nil {
 			sample.OriginalRetainedChargeByteCount += item.queueByteCount
 		}
 		if !item.selectiveAcked {
 			sample.UnacknowledgedItemCount++
-			sample.UnacknowledgedEncodedByteCount += item.MessageByteCount()
+			sample.UnacknowledgedEncodedByteCount += ByteCount(len(item.transferFrameBytes))
 		}
 		// sendTime is deliberately absent: a selective ack refreshes it.
 		if item.pacingSentAtNanos == 0 {

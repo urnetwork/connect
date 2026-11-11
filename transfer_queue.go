@@ -89,7 +89,10 @@ type transferQueue[T transferQueueItem] struct {
 	// useful per-flow payload window.
 	byteCount      ByteCount
 	queueByteCount ByteCount
-	stateLock      sync.Mutex
+	// Receive protocol owners consume no DATA bytes. Track their queued
+	// cardinality through the heap, without scanning unrelated DATA owners.
+	protocolItemCount int
+	stateLock         sync.Mutex
 
 	// shared budget accounting (see `TransferMemoryBudget`): the bytes held
 	// above `minByteCount` are borrowed from `budget`. every byte count
@@ -292,6 +295,7 @@ func (self *transferQueue[T]) Clear() []T {
 
 	items := self.orderedItems
 	self.orderedItems = []T{}
+	self.protocolItemCount = 0
 	self.maxHeap = newTransferQueueMaxHeap[T](self.cmp)
 	clear(self.messageIdItems)
 	clear(self.sequenceNumberItems)
@@ -476,6 +480,9 @@ func (self *transferQueue[T]) Push(x any) {
 	item := x.(T)
 	item.SetHeapIndex(len(self.orderedItems))
 	self.orderedItems = append(self.orderedItems, item)
+	if receive, ok := x.(*receiveItem); ok && receive.noBudget {
+		self.protocolItemCount++
+	}
 }
 
 func (self *transferQueue[T]) Pop() any {
@@ -485,6 +492,9 @@ func (self *transferQueue[T]) Pop() any {
 	item := self.orderedItems[i]
 	self.orderedItems[i] = empty
 	self.orderedItems = self.orderedItems[:n-1]
+	if receive, ok := any(item).(*receiveItem); ok && receive.noBudget {
+		self.protocolItemCount--
+	}
 	return item
 }
 

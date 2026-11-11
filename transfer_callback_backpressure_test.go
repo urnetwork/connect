@@ -337,6 +337,40 @@ func callbackBackpressurePackBytes(
 	return transferFrameBytes
 }
 
+// Builds DATA so this fixture fills DATA admission, independently of the
+// separate protocol mailbox used by exchange signals.
+func callbackBackpressureDataPackBytes(
+	t *testing.T,
+	sourceId Id,
+	destinationId Id,
+	sequenceId Id,
+	sequenceNumber uint64,
+	head bool,
+	content string,
+) []byte {
+	t.Helper()
+	transferFrameBytes, err := proto.Marshal(&protocol.TransferFrame{
+		TransferPath: TransferPath{
+			SourceId:      sourceId,
+			DestinationId: destinationId,
+		}.ToProtobuf(),
+		Pack: &protocol.Pack{
+			MessageId:      NewId().Bytes(),
+			SequenceId:     sequenceId.Bytes(),
+			SequenceNumber: sequenceNumber,
+			Head:           head,
+			Frames: []*protocol.Frame{{
+				MessageType:  protocol.MessageType_IpIpPacketToProvider,
+				MessageBytes: []byte(content),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal receive Pack: %v", err)
+	}
+	return transferFrameBytes
+}
+
 // TestClientReceivePackHandoffDoesNotBlockUnrelatedSource fills one receive
 // sequence while its callback is parked, then puts another Pack for that
 // sequence ahead of an unrelated source. The full handoff must drop
@@ -387,7 +421,7 @@ func TestClientReceivePackHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 	})
 
 	blockedSequenceId := NewId()
-	incoming <- callbackBackpressurePackBytes(
+	incoming <- callbackBackpressureDataPackBytes(
 		t,
 		blockedSourceId,
 		client.ClientId(),
@@ -405,7 +439,7 @@ func TestClientReceivePackHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 	// The blocked sequence can retain one queued Pack. Its next Pack is the
 	// deterministic full-handoff case, and it precedes the unrelated source in
 	// the single shared receive pump.
-	incoming <- callbackBackpressurePackBytes(
+	incoming <- callbackBackpressureDataPackBytes(
 		t,
 		blockedSourceId,
 		client.ClientId(),
@@ -414,7 +448,7 @@ func TestClientReceivePackHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 		false,
 		"queued",
 	)
-	incoming <- callbackBackpressurePackBytes(
+	incoming <- callbackBackpressureDataPackBytes(
 		t,
 		blockedSourceId,
 		client.ClientId(),
@@ -423,7 +457,7 @@ func TestClientReceivePackHandoffDoesNotBlockUnrelatedSource(t *testing.T) {
 		false,
 		"dropped",
 	)
-	incoming <- callbackBackpressurePackBytes(
+	incoming <- callbackBackpressureDataPackBytes(
 		t,
 		unrelatedSourceId,
 		client.ClientId(),

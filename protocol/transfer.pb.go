@@ -813,8 +813,12 @@ type Pack struct {
 	// a sender announces ahead only to a receiver that advertised
 	// `Ack.contract_ahead`.
 	ContractAhead bool `protobuf:"varint,13,opt,name=contract_ahead,json=contractAhead,proto3" json:"contract_ahead,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Requests reliable delivery before a missing sequence predecessor. The
+	// receiver still validates identity, encryption, contracts and receipts.
+	// Older receivers ignore this field and keep ordinary ordered delivery.
+	DeliverImmediately bool `protobuf:"varint,14,opt,name=deliver_immediately,json=deliverImmediately,proto3" json:"deliver_immediately,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Pack) Reset() {
@@ -934,6 +938,13 @@ func (x *Pack) GetLogicalLane() uint32 {
 func (x *Pack) GetContractAhead() bool {
 	if x != nil {
 		return x.ContractAhead
+	}
+	return false
+}
+
+func (x *Pack) GetDeliverImmediately() bool {
+	if x != nil {
+		return x.DeliverImmediately
 	}
 	return false
 }
@@ -1099,8 +1110,16 @@ type Ack struct {
 	// Field 10 rather than the design's 8: 8 and 9 were taken by the receive
 	// window advertisement and the eviction notice while §39.1 was written.
 	ContractAhead bool `protobuf:"varint,10,opt,name=contract_ahead,json=contractAhead,proto3" json:"contract_ahead,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// With selective=true, the exact named immediate original was delivered,
+	// not merely retained. It retires only that original, never predecessors.
+	// Older receivers omit this field and preserve ordered reliable custody.
+	DeliveredImmediately bool `protobuf:"varint,13,opt,name=delivered_immediately,json=deliveredImmediately,proto3" json:"delivered_immediately,omitempty"`
+	// Actual ordinal of a deterministically identified immediate original.
+	// This is not independent ACK authority: the sender verifies the exact
+	// identity against its live original or known terminal-delivery range.
+	ImmediateSequenceNumber *uint64 `protobuf:"varint,14,opt,name=immediate_sequence_number,json=immediateSequenceNumber,proto3,oneof" json:"immediate_sequence_number,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
@@ -1215,6 +1234,20 @@ func (x *Ack) GetContractAhead() bool {
 		return x.ContractAhead
 	}
 	return false
+}
+
+func (x *Ack) GetDeliveredImmediately() bool {
+	if x != nil {
+		return x.DeliveredImmediately
+	}
+	return false
+}
+
+func (x *Ack) GetImmediateSequenceNumber() uint64 {
+	if x != nil && x.ImmediateSequenceNumber != nil {
+		return *x.ImmediateSequenceNumber
+	}
+	return 0
 }
 
 type Tag struct {
@@ -3618,7 +3651,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\r_session_roleB\x14\n" +
 	"\x12_session_companion\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\x93\x04\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xc4\x04\n" +
 	"\x04Pack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3636,13 +3669,14 @@ const file_transfer_proto_rawDesc = "" +
 	" \x01(\bR\vforceStream\x12-\n" +
 	"\x12companion_contract\x18\v \x01(\bR\x11companionContract\x12!\n" +
 	"\flogical_lane\x18\f \x01(\rR\vlogicalLane\x12%\n" +
-	"\x0econtract_ahead\x18\r \x01(\bR\rcontractAheadB\x11\n" +
+	"\x0econtract_ahead\x18\r \x01(\bR\rcontractAhead\x12/\n" +
+	"\x13deliver_immediately\x18\x0e \x01(\bR\x12deliverImmediatelyB\x11\n" +
 	"\x0f_contract_frameB\x06\n" +
 	"\x04_tagB\x0e\n" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\xce\x05\n" +
+	"\x0f_contract_frame\"\xe2\x06\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3658,12 +3692,15 @@ const file_transfer_proto_rawDesc = "" +
 	"\x19receiver_ack_delay_micros\x18\f \x01(\rH\x04R\x16receiverAckDelayMicros\x88\x01\x01\x128\n" +
 	"\x18evicted_sequence_numbers\x18\t \x03(\x04R\x16evictedSequenceNumbers\x12%\n" +
 	"\x0econtract_ahead\x18\n" +
-	" \x01(\bR\rcontractAheadB\x06\n" +
+	" \x01(\bR\rcontractAhead\x123\n" +
+	"\x15delivered_immediately\x18\r \x01(\bR\x14deliveredImmediately\x12?\n" +
+	"\x19immediate_sequence_number\x18\x0e \x01(\x04H\x05R\x17immediateSequenceNumber\x88\x01\x01B\x06\n" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_idB\x1c\n" +
 	"\x1a_receive_window_byte_countB\x1e\n" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
-	"\x1a_receiver_ack_delay_micros\"\"\n" +
+	"\x1a_receiver_ack_delay_microsB\x1c\n" +
+	"\x1a_immediate_sequence_number\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
 	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x9c\x04\n" +
 	"\x04Auth\x12\x15\n" +

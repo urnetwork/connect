@@ -4,6 +4,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,7 +18,7 @@ func runWindowOwnerContractContinuation(t *testing.T, acknowledge bool, beforeAp
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		sequence, older, _, route, _, _ := newWindowRouteAccountingFixture(t, 1)
+		sequence, older, _, route, observations, state := newWindowRouteAccountingFixture(t, 1)
 		older.ackTimeout = time.Minute
 		sequence.nextSequenceNumber = older.sequenceNumber + 1
 		disposition, err := sequence.writeMaybeWrappedBytes(older.transferFrameBytes, TransferPath{}, true, older, false, false)
@@ -32,7 +33,8 @@ func runWindowOwnerContractContinuation(t *testing.T, acknowledge bool, beforeAp
 		inspection := &windowOwnerInspection{ctx: sequence.ctx}
 		arrived, resumeInspection := inspection.arm(due)
 		sequence.beforeContractWriterAccessForTest = inspection.beforeWriterAccess
-		MessagePoolReturn(<-route)
+		// Keep the already-accepted original's real route share in the one-slot
+		// carrier. The empty announcement waits for physical readiness, not DATA credit.
 		service := sequence.windowPacer.service
 		service.stateLock.Lock()
 		expiry := service.burst.start.Add(windowPacingBurstMaximumTime(service.burstEstimateTime))
@@ -40,24 +42,45 @@ func runWindowOwnerContractContinuation(t *testing.T, acknowledge bool, beforeAp
 		if !expiry.After(time.Now()) || !expiry.Before(due) || due != physical.Add(2*time.Second) {
 			t.Fatal("fixture did not preserve the cold physical recovery boundary")
 		}
-		time.Sleep(time.Until(expiry))
+		entry, acceptedAt := due.Add(-500*time.Millisecond), due.Add(250*time.Millisecond)
+		if !expiry.Before(entry) || sequence.sendBufferSettings.WriteTimeout != time.Second {
+			t.Fatal("fixture changed the existing burst or absolute writer budget")
+		}
+		time.Sleep(time.Until(entry))
 		service.stateLock.Lock()
 		service.next = due.Add(time.Second)
+		unchangedNext, unchangedProbe := service.next, service.probeSent
+		unchangedSent, unchangedTotal := service.sent, service.total
 		service.stateLock.Unlock()
+		var deadline time.Time
+		deadlineObservations := 0
+		sequence.sendBufferSettings.afterTransferWriteDeadlineForTest = func(until time.Time) {
+			deadline, deadlineObservations = until, deadlineObservations+1
+		}
+		callbackCounts, callbackErrors := [3]int{}, [3]error{}
+		callback := func(index int) AckFunction {
+			return func(err error) {
+				callbackCounts[index]++
+				callbackErrors[index] = err
+			}
+		}
+		older.acks.add(sendAckRecord{callback: callback(0)})
+		applicationStarted := false
 		ahead := newContractAheadTestContract(t, sequence.client, sequence.destination)
 		announced, resume, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		go func() {
 			defer close(finished)
-			sequence.sendContractAheadAnnouncement(ahead, func(error) {})
+			sequence.sendContractAheadAnnouncement(ahead, callback(1))
 			close(announced)
 			select {
 			case <-sequence.ctx.Done():
 				return
 			case <-resume:
 			}
+			applicationStarted = true
 			frame := &protocol.Frame{MessageType: protocol.MessageType_TransferExchangeSignals, MessageBytes: MessagePoolGet(32)}
 			clear(frame.MessageBytes)
-			sequence.send([]*protocol.Frame{frame}, func(error) {}, true, true)
+			sequence.send([]*protocol.Frame{frame}, callback(2), true, true)
 		}()
 		defer func() {
 			sequence.cancel()
@@ -65,45 +88,83 @@ func runWindowOwnerContractContinuation(t *testing.T, acknowledge bool, beforeAp
 			sequence.pendingRecovery = nil
 			sequence.ackLifetimes.clear()
 			sequence.releaseRetainedSendItems(context.Canceled)
+			for index := range callbackCounts {
+				want := 1
+				if index == 2 && !applicationStarted {
+					want = 0
+				}
+				if callbackCounts[index] != want || want == 1 && !errors.Is(callbackErrors[index], context.Canceled) {
+					t.Errorf("original %d terminal callbacks=%d want=%d error=%v", index, callbackCounts[index], want, callbackErrors[index])
+				}
+			}
+			if count, bytes := sequence.resendQueue.QueueSize(); count != 0 || bytes != 0 || len(sequence.sendItems) != 0 || len(sequence.ackLifetimes.items) != 0 {
+				t.Error("joined continuation retained an original owner")
+			}
 		}()
 		synctest.Wait()
-		deadline := sequence.windowPacer.waiter.deadline
 		service.stateLock.Lock()
-		chargedNext, chargedProbe := service.next, service.probeSent
-		owned := service.pacingReservations == 1 && service.waiterHead == &sequence.windowPacer.waiter
+		unreserved := service.pacingReservations == 0 && service.reservedByteCount == 0 &&
+			service.waiterHead == nil && service.waiterTail == nil &&
+			service.next == unchangedNext && service.probeSent == unchangedProbe &&
+			service.sent == unchangedSent && service.total == unchangedTotal
 		service.stateLock.Unlock()
-		if !owned || !deadline.After(due) || len(route) != 0 || len(sequence.sendItems) != 2 {
-			t.Fatal("actual announcement did not retain one charged original reservation")
+		if !unreserved || time.Now() != entry || deadline != entry.Add(time.Second) || deadlineObservations != 1 ||
+			!acceptedAt.Before(deadline) || len(route) != 1 || len(sequence.sendItems) != 2 ||
+			*observations != 2 || state.pendingLocalWrites.Load() != 1 {
+			t.Fatal("real empty announcement did not wait at the bounded physical writer without DATA credit")
+		}
+		announcement := sequence.sendItems[1]
+		if !announcement.contractControl || !announcement.noBudget || !announcement.expectsAck ||
+			announcement.pacingByteCount != 0 || announcement.transportWriteObserved ||
+			announcement.sendCount != 1 || announcement.sequenceNumber != older.sequenceNumber+1 || callbackCounts != [3]int{} {
+			t.Fatal("blocked announcement lost its protocol classification or retained ACK ownership")
 		}
 		time.Sleep(time.Until(due.Add(-time.Nanosecond)))
 		synctest.Wait()
-		if sequence.pendingRecovery != nil || older.head || len(route) != 0 {
+		if sequence.pendingRecovery != nil || older.head || len(route) != 1 || *observations != 2 {
 			t.Fatal("announcement selected or dispatched the older retry before its real due time")
 		}
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		resumeWindowOwnerInspection(t, arrived, resumeInspection, due)
 		service.stateLock.Lock()
-		kept := service.next == chargedNext && service.probeSent == chargedProbe && service.pacingReservations == 1
+		kept := service.next == unchangedNext && service.probeSent == unchangedProbe &&
+			service.sent == unchangedSent && service.total == unchangedTotal &&
+			service.pacingReservations == 0 && service.reservedByteCount == 0 &&
+			service.waiterHead == nil && service.waiterTail == nil
 		service.stateLock.Unlock()
 		if !kept || sequence.pendingRecovery == nil || sequence.pendingRecovery.messageId != olderId ||
-			!older.head || !older.promotedHead || older.sendTime.Add(older.ackTimeout) != lifetime || len(route) != 0 {
-			t.Fatal("announcement wait did not perform real due preparation while preserving its charged owner")
+			!older.head || !older.promotedHead || older.sendTime.Add(older.ackTimeout) != lifetime ||
+			len(route) != 1 || *observations != 2 || deadlineObservations != 1 ||
+			state.pendingLocalWrites.Load() != 1 || announcement.transportWriteObserved || callbackCounts != [3]int{} {
+			t.Fatal("physical announcement wait did not select real due recovery without charging protocol DATA credit")
 		}
-		time.Sleep(time.Until(deadline))
+		time.Sleep(time.Until(acceptedAt))
+		wire := <-route
+		original := decodeSendPackLifecycleWirePack(t, wire)
+		MessagePoolReturn(wire)
+		if string(original.MessageId) != string(olderId[:]) || original.SequenceNumber != older.sequenceNumber || original.Head {
+			t.Fatal("readiness release did not consume the original physical share")
+		}
 		synctest.Wait()
 		select {
 		case <-announced:
 		default:
-			t.Fatal("paid announcement did not finish before the next synchronous entry")
+			t.Fatal("physically released announcement did not finish before the next synchronous entry")
 		}
-		if len(route) != 1 || sequence.pendingRecovery == nil {
-			t.Fatal("announcement return lost either its physical result or selected recovery")
+		if time.Now() != acceptedAt || !time.Now().Before(deadline) || !time.Now().Before(due.Add(time.Second)) ||
+			len(route) != 1 || sequence.pendingRecovery == nil || deadlineObservations != 1 ||
+			*observations != 2 || state.pendingLocalWrites.Load() != 0 ||
+			!announcement.transportWriteObserved || announcement.pacingByteCount != 0 || callbackCounts != [3]int{} {
+			t.Fatal("announcement return lost its physical result, selected recovery or original writer bound")
 		}
-		wire := <-route
+		sequence.sendBufferSettings.afterTransferWriteDeadlineForTest = nil
+		wire = <-route
 		pack := decodeSendPackLifecycleWirePack(t, wire)
 		MessagePoolReturn(wire)
-		if !pack.ContractAhead || pack.SequenceNumber != older.sequenceNumber+1 || len(pack.Frames) != 0 {
+		if !pack.ContractAhead || pack.Head || pack.Nack || pack.DeliverImmediately || pack.ContractFrame == nil ||
+			string(pack.MessageId) != string(announcement.messageId[:]) ||
+			pack.SequenceNumber != older.sequenceNumber+1 || len(pack.Frames) != 0 {
 			t.Fatal("fixture did not dispatch a real successor contract announcement")
 		}
 		if acknowledge {
@@ -148,7 +209,7 @@ func runWindowOwnerContractContinuation(t *testing.T, acknowledge bool, beforeAp
 		if acknowledge {
 			wantRetries = 0
 		}
-		if sequence.resendWriteCount.Load() != wantRetries || len(sequence.sendItems) != 3 {
+		if sequence.resendWriteCount.Load() != wantRetries || len(sequence.sendItems) != 3 || callbackCounts != [3]int{} {
 			t.Fatal("synchronous continuation duplicated recovery or moved original ACK ownership")
 		}
 		if afterApplication != nil {

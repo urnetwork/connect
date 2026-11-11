@@ -95,7 +95,7 @@ func TestFastPathWiresOnlyFragmentsAndWarmup(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the fast path did not deliver its first reverse message")
 	}
-	time.Sleep(2 * p2pFastPathWarmupTimeout)
+	time.Sleep(2 * pair.active.settings.DatagramFastPathWarmupTimeout)
 
 	// from here the receiver's complete-message count changes steadily,
 	// which is exactly the condition §13.3's reporter reported under

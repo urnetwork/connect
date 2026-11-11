@@ -1,11 +1,12 @@
-// A real signed, Required-encryption session carries repeated provider ACK
-// gaps. The actual TCP return ledger retains multiple chunks each round; a
-// parked socket worker isolates deterministic ACK custody from throughput.
+// A real signed, Required-encryption session carries repeated immediate ACK
+// originals under full independent DATA pressure. Their encoded reliable
+// lifetime and the actual TCP return ledger remain owned until real ACKs.
 package connect
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -34,7 +35,7 @@ type privateProviderEncryptedAckFixture struct {
 	gate                                  chan struct{}
 	entered                               chan *providerReliablePacket
 	ackCounts                             map[uint64]int
-	childHeld                             ByteCount
+	ackOffers                             []*privateProviderAckOffer
 	closed                                bool
 }
 
@@ -256,6 +257,7 @@ func (self *privateProviderEncryptedAckFixture) capture(wire []byte, receiver *C
 			self.t.Fatal("actual encrypted application body has no canonical owned scan")
 		}
 	}
+	self.assertCapturedControlOriginal(frame)
 	return frame
 }
 
@@ -269,24 +271,23 @@ func (self *privateProviderEncryptedAckFixture) feedback() {
 	}
 }
 
-func (self *privateProviderEncryptedAckFixture) takeAckOriginal(number uint64) *privateProviderEncryptedAckFrame {
+func (self *privateProviderEncryptedAckFixture) takeAckOriginal(offer *privateProviderAckOffer) *privateProviderEncryptedAckFrame {
 	self.t.Helper()
 	synctest.Wait()
 	for len(self.senderOut) != 0 {
 		frame := self.capture(<-self.senderOut, self.receiver)
 		if frame.pack != nil && receiveProviderHeadRecoveryFrames(frame.pack.Frames) {
-			if frame.pack.SequenceNumber == number {
-				if !frame.encrypted || RequireIdFromBytes(frame.pack.SequenceId) != self.sequence.sequenceId {
-					self.t.Fatal("provider ACK original escaped actual encrypted source sequence")
-				}
-				return frame
+			if self.boundAckOriginal(frame.pack) {
+				continue
 			}
-			continue
+			offer.bind(self, frame)
+			return frame
 		}
 		self.forward(frame.windowRoundFrame, self.receiverIn)
 		self.feedback()
 	}
-	self.t.Fatal("actual source did not emit the requested encrypted ACK original")
+	source := privateProviderImmediateSource(self.t, self.windowRoundFixture, self.sequence.sequenceId.Bytes())
+	self.t.Fatalf("actual source did not emit the requested encrypted ACK original: offered_frames=%d next=%d immediate=%d limit=%d lane=%d", len(offer.frames), source.nextSequenceNumber, source.immediateSendCount, source.immediateSendLimit, source.logicalLane)
 	return nil
 }
 
@@ -321,7 +322,7 @@ func (self *privateProviderEncryptedAckFixture) retry(original *privateProviderE
 }
 
 // Successful Send owns the pooled packet; refusal leaves it with this fixture.
-func (self *privateProviderEncryptedAckFixture) writeAcks(count int, acknowledgement uint32) *privateProviderEncryptedAckFrame {
+func (self *privateProviderEncryptedAckFixture) enqueueAcks(count int, acknowledgement uint32) *privateProviderAckOffer {
 	self.t.Helper()
 	frames := make([]*protocol.Frame, count)
 	for index := range frames {
@@ -336,20 +337,30 @@ func (self *privateProviderEncryptedAckFixture) writeAcks(count int, acknowledge
 		}
 		frames[index] = frame
 	}
-	number := self.nextNumber
-	if !self.sender.SendMultiWithTimeout(frames, self.receiver.ClientId(), func(err error) {
-		if err == nil {
-			self.ackedCount++
-			self.ackCounts[number]++
+	if !protocolOnlyFrames(frames) || !immediateIpAckFrames(frames) {
+		for _, frame := range frames {
+			MessagePoolReturn(frame.MessageBytes)
 		}
-	}, time.Second) {
+		self.t.Fatal("actual encrypted ACK batch does not qualify for the production protocol policy")
+	}
+	offer := newPrivateProviderAckOffer(frames)
+	self.ackOffers = append(self.ackOffers, offer)
+	if !self.sender.SendMultiWithTimeout(frames, self.receiver.ClientId(), func(err error) {
+		offer.complete(self, err)
+	}, time.Second, NoBudget(), DeliverImmediately()) {
 		for _, frame := range frames {
 			MessagePoolReturn(frame.MessageBytes)
 		}
 		self.t.Fatal("actual encrypted source refused its ACK original")
 	}
-	self.nextNumber++
-	return self.takeAckOriginal(number)
+	return offer
+}
+
+// Capture is a separate transition: an accepted owner may remain queued while
+// the unchanged count-one sender awaits the previous actual terminal ACK.
+func (self *privateProviderEncryptedAckFixture) writeAcks(count int, acknowledgement uint32) *privateProviderEncryptedAckFrame {
+	self.t.Helper()
+	return self.takeAckOriginal(self.enqueueAcks(count, acknowledgement))
 }
 
 // Shutdown returns all route copies after joining the clients and the real NAT.
@@ -383,10 +394,6 @@ func (self *privateProviderEncryptedAckFixture) close() {
 			MessagePoolReturn(<-route)
 		}
 	}
-	if self.childHeld != 0 {
-		self.recovery.Release(self.childHeld)
-		self.childHeld = 0
-	}
 	for _, budget := range []*TransferMemoryBudget{self.root, self.parent, self.rx, self.recovery, self.natBudget} {
 		stats := budget.Stats()
 		if stats.UsedByteCount != 0 || stats.QuotaByteCount != 0 || stats.ReservedByteCount != stats.ReleasedByteCount {
@@ -395,8 +402,9 @@ func (self *privateProviderEncryptedAckFixture) close() {
 	}
 }
 
-// Repeated real return-ledger occupancy survives the first child-pressure
-// refusal, then drains through an unchanged encrypted headed source retry.
+// Repeated real return-ledger occupancy drains one actual immediate original
+// at a time. A queued successor cannot serialize until the previous real ACK
+// recycles the configured count one, even though both consume zero DATA bytes.
 func TestPrivateProviderEncryptedAckRecoveryRetiresSustainedChunks(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -421,85 +429,368 @@ func TestPrivateProviderEncryptedAckRecoveryRetiresSustainedChunks(t *testing.T)
 			if retained <= 0 || len(f.tcp.returnChunks)-f.tcp.returnHead != 4 || len(f.tcp.sendItems) != 1 {
 				t.Fatal("sustained round did not retain four actual paid origin chunks")
 			}
-			first := f.nextNumber
+			pressure := newPrivateProviderProtocolDataPressure(t, f.rx)
+			before, childBefore := f.receiver.ReceiveStats(), f.recovery.Stats()
 			head := f.writeAcks(2, start+2*1280)
-			tails := make([]*privateProviderEncryptedAckFrame, 10)
-			for index := range tails {
-				tails[index] = f.writeAcks(1, end)
-			}
-			cost := func(frame *privateProviderEncryptedAckFrame) ByteCount {
-				probe := &receiveItem{transferItem: transferItem{queueByteCount: frame.scan.retainedByteCount}, ack: true, frames: frame.pack.Frames}
-				if !f.sequence.prepareReceiveDeliveryCredit(probe) || !probe.deliveryPrepared {
-					t.Fatal("encrypted inner ACK has no actual downstream ownership estimate")
-				}
-				return probe.QueueByteCount()
-			}
-			headFull, tailFull := cost(head), cost(tails[0])
-			if head.scan.retainedByteCount > tailFull || tailFull >= headFull || f.rx.UsedByteCount() != 0 {
-				t.Fatal("encrypted ACK cycle did not isolate C <= prefix < actual D")
-			}
-			repairMetadata, rxTarget := privateProviderRepairFixtureGeometry(t, f.sequence, tailFull, 10)
-			f.rx.SetTotalByteCount(rxTarget)
-			f.recovery.SetTotalByteCount(f.rx.TotalByteCount())
-			owners := make(map[uint64]*receiveItem, len(tails))
-			for _, tail := range tails {
-				f.forward(tail.windowRoundFrame, f.receiverIn)
-				item := f.sequence.receiveQueue.GetBySequenceNumber(tail.pack.SequenceNumber)
-				if item == nil || !item.committed || item.QueueByteCount() != tailFull || !item.deliveryPrepared {
-					t.Fatal("encrypted later ACK did not acquire actual committed custody")
-				}
-				owners[item.sequenceNumber] = item
-				f.feedback()
-			}
-			privateProviderAssertRepairFixtureCustody(t, f.sequence, repairMetadata, 10)
-			if f.rx.UsedByteCount() != f.rx.TotalByteCount() || f.sequence.holdPromise.reservedByteCount != tailFull ||
-				f.sequence.nextSequenceNumber != first || f.tcp.returnByteCount != retained || len(f.entered) != 0 {
-				t.Fatal("encrypted committed ACK tails did not preserve the exact missing head and return chunks")
-			}
-			f.childHeld = f.recovery.Available()
-			if !f.recovery.TryReserve(f.childHeld) {
-				t.Fatal("could not establish bounded independent child pressure")
-			}
-			before := f.receiver.ReceiveStats()
+			first := head.pack.SequenceNumber
+			privateProviderAssertImmediateCount(t, f.windowRoundFixture, head.pack, 1)
 			f.forward(head.windowRoundFrame, f.receiverIn)
-			if len(f.entered) != 0 || f.tcp.returnByteCount != retained || f.ackedCount != 1+round*11 ||
-				f.sequence.ctx.Err() != nil || f.sequence.holdPromise.ingressLoanByteCount != 0 {
-				t.Fatal("first encrypted child refusal changed ACK truth or retained chunk custody")
-			}
-			for number, owner := range owners {
-				if f.sequence.receiveQueue.GetBySequenceNumber(number) != owner || !owner.committed {
-					t.Fatal("encrypted child refusal evicted or replaced a committed original")
-				}
-			}
-			f.recovery.Release(f.childHeld)
-			f.childHeld = 0
-			retry := f.retry(head)
-			f.forward(retry.windowRoundFrame, f.receiverIn)
-			if len(f.entered) == 0 || f.tcp.returnByteCount != retained || f.recovery.UsedByteCount() <= 0 ||
-				f.ackedCount != 1+round*11 || f.sequence.ctx.Err() != nil {
-				t.Fatal("released child capacity did not admit the unchanged encrypted headed retry before ACK")
+			privateProviderAssertProtocolReceiptCustody(t, f.sequence, 1)
+			queued := f.enqueueAcks(1, end)
+			f.assertQueuedAckOriginal(head.pack, queued)
+			pressure.check(t)
+			if len(f.entered) == 0 || f.tcp.returnByteCount != retained || f.ackedCount != 1+round*11 ||
+				f.recovery.Stats() != childBefore || f.sequence.nextSequenceNumber != first {
+				t.Fatal("encrypted count-one barrier lost actual source/NAT custody or spent DATA permission")
 			}
 			close(f.gate)
 			synctest.Wait()
+			f.tcp.mutex.Lock()
+			partial := f.tcp.receiveSeqAck == start+2*1280 && f.tcp.returnByteCount > 0 && len(f.tcp.returnChunks)-f.tcp.returnHead == 2
+			f.tcp.mutex.Unlock()
+			if !partial {
+				t.Fatal("the first actual partial inner ACK did not retire exactly two of four chunks")
+			}
+			privateProviderAssertOriginalPending(t, f.windowRoundFixture, head.pack, true, true)
 			f.feedback()
+			if f.ackCounts[first] != 1 || f.ackedCount != 2+round*11 {
+				t.Fatal("encrypted immediate slot recycled without its actual head delivery ACK")
+			}
+			privateProviderAssertOriginalRetired(t, f.windowRoundFixture, head.pack)
+			originals := []*privateProviderEncryptedAckFrame{head}
+			for index := range 10 {
+				var tail *privateProviderEncryptedAckFrame
+				if index == 0 {
+					tail = f.takeAckOriginal(queued)
+				} else {
+					tail = f.writeAcks(1, end)
+				}
+				originals = append(originals, tail)
+				privateProviderAssertOriginalPending(t, f.windowRoundFixture, tail.pack, true, true)
+				privateProviderAssertImmediateCount(t, f.windowRoundFixture, tail.pack, 1)
+				f.forward(tail.windowRoundFrame, f.receiverIn)
+				privateProviderAssertReturnFrontier(t, f.tcp, end)
+				privateProviderAssertOriginalPending(t, f.windowRoundFixture, tail.pack, true, true)
+				pressure.check(t)
+				f.feedback()
+				if f.ackCounts[tail.pack.SequenceNumber] != 1 || f.ackedCount != 3+round*11+index {
+					t.Fatal("encrypted tail slot recycled without exactly one real terminal ACK")
+				}
+				privateProviderAssertOriginalRetired(t, f.windowRoundFixture, tail.pack)
+				privateProviderAssertImmediateCount(t, f.windowRoundFixture, tail.pack, 0)
+			}
+			f.assertCompletedOriginals(originals)
 			if f.ackedCount != 1+(round+1)*11 || f.deliveredCount != 1+(round+1)*12 ||
-				f.sequence.nextSequenceNumber != first+11 || f.sequence.receiveQueue.Len() != 0 ||
-				f.rx.UsedByteCount() != 0 || f.recovery.UsedByteCount() != 0 || f.tcp.returnByteCount != 0 ||
-				f.tcp.returnHead != len(f.tcp.returnChunks) || len(f.tcp.sendItems) != 1 ||
+				f.sequence.receiveQueue.Len() != 0 ||
+				f.rx.Stats() != pressure.before || f.recovery.Stats() != childBefore || len(f.tcp.sendItems) != 1 ||
 				f.root.TotalByteCount() != rootTotal || f.parent.TotalByteCount() != parentTotal ||
+				f.receiver.ReceiveStats().ReceiveDecodePressureDropCount != before.ReceiveDecodePressureDropCount ||
 				f.receiver.ReceiveStats().ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount ||
 				f.receiver.ReceiveStats().ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount {
-				t.Fatalf("encrypted round %d failed cumulative/inner ownership closure: callbacks=%d delivered=%d next=%d rx=%d child=%d chunks=%d", round, f.ackedCount, f.deliveredCount, f.sequence.nextSequenceNumber, f.rx.UsedByteCount(), f.recovery.UsedByteCount(), f.tcp.returnByteCount)
+				t.Fatalf("encrypted round %d failed actual count-one ownership closure: callbacks=%d delivered=%d next=%d", round, f.ackedCount, f.deliveredCount, f.sequence.nextSequenceNumber)
 			}
-			for number := first; number < first+11; number++ {
-				if f.ackCounts[number] != 1 {
-					t.Fatal("encrypted headed repair skipped or duplicated an actual cumulative callback")
+			for _, original := range originals {
+				if f.ackCounts[original.pack.SequenceNumber] != 1 {
+					t.Fatal("encrypted count-one train skipped or duplicated a terminal callback")
 				}
+				privateProviderAssertOriginalRetired(t, f.windowRoundFixture, original.pack)
 			}
-			t.Logf("[provider-encrypted-cycle] round=%d chunks=4 retained_bytes=%d head_c=%d head_d=%d prefix=%d actual_headed_retry=true signed_contract=true root_cap=%d provider_cap=%d", round, retained, head.scan.retainedByteCount, headFull, tailFull, rootTotal, parentTotal)
+			pressure.close()
+			t.Logf("[provider-encrypted-cycle] round=%d chunks=4 retained_bytes=%d protocol_originals=11 immediate_limit=1 protocol_data_bytes=0 root_cap=%d provider_cap=%d", round, retained, rootTotal, parentTotal)
 			start = end
 		}
 		f.close()
 		t.Log("[provider-encrypted-complete] cycles=3 chunks=12 cumulative_callbacks=34 rx=0 child=0 nat=0 root=0 joined=true")
 	})
+}
+
+// These digests are copied before Send takes the pooled frame bytes. The offer
+// has no predicted ordinal and cannot complete successfully before binding.
+type privateProviderAckFrameStamp struct {
+	messageType protocol.MessageType
+	raw         bool
+	digest      [32]byte
+}
+
+type privateProviderAckOffer struct {
+	frames    []privateProviderAckFrameStamp
+	pack      *protocol.Pack
+	callbacks int
+}
+
+func newPrivateProviderAckOffer(frames []*protocol.Frame) *privateProviderAckOffer {
+	offer := &privateProviderAckOffer{frames: make([]privateProviderAckFrameStamp, len(frames))}
+	for index, frame := range frames {
+		offer.frames[index] = privateProviderAckFrameStamp{messageType: frame.MessageType, raw: frame.Raw, digest: sha256.Sum256(frame.MessageBytes)}
+	}
+	return offer
+}
+
+// Capture precedes every delivery of this offered original to the receiver.
+func (self *privateProviderAckOffer) bind(f *privateProviderEncryptedAckFixture, frame *privateProviderEncryptedAckFrame) {
+	f.t.Helper()
+	pack := frame.pack
+	if self.pack != nil || self.callbacks != 0 || !frame.encrypted || pack == nil || pack.Nack ||
+		!pack.DeliverImmediately || !protocolOnlyPack(pack) ||
+		!bytes.Equal(pack.SequenceId, f.sequence.sequenceId.Bytes()) || len(pack.Frames) != len(self.frames) {
+		f.t.Fatal("actual ACK original did not bind its unique offered frames and encrypted immediate policy")
+	}
+	for index, member := range pack.Frames {
+		stamp := self.frames[index]
+		if member.MessageType != stamp.messageType || member.Raw != stamp.raw || sha256.Sum256(member.MessageBytes) != stamp.digest {
+			f.t.Fatal("actual encoded ACK original changed an offered frame")
+		}
+	}
+	self.pack = pack
+	f.nextNumber = pack.SequenceNumber + 1
+}
+
+// Error completion retains its ordinary cancellation semantics. Success must
+// name the captured original, not an arithmetic guess made at raw admission.
+func (self *privateProviderAckOffer) complete(f *privateProviderEncryptedAckFixture, err error) {
+	if err != nil {
+		return
+	}
+	self.callbacks++
+	f.ackedCount++
+	if self.pack == nil || self.callbacks != 1 {
+		f.t.Error("ACK callback completed before actual identity binding or completed more than once")
+		return
+	}
+	f.ackCounts[self.pack.SequenceNumber]++
+}
+
+// Previously captured application originals stay held when they are retried.
+func (self *privateProviderEncryptedAckFixture) boundAckOriginal(pack *protocol.Pack) bool {
+	for _, offer := range self.ackOffers {
+		if offer.pack != nil && bytes.Equal(offer.pack.SequenceId, pack.SequenceId) && bytes.Equal(offer.pack.MessageId, pack.MessageId) {
+			return true
+		}
+	}
+	for _, previous := range self.heldFrames[:len(self.heldFrames)-1] {
+		if previous.pack != nil && bytes.Equal(previous.pack.SequenceId, pack.SequenceId) && bytes.Equal(previous.pack.MessageId, pack.MessageId) {
+			return true
+		}
+	}
+	return false
+}
+
+// This is an ordered reliable session control, never an immediate IP receipt.
+// Authentication and generation handling remain the real receiver's work.
+func privateProviderEncryptedControl(pack *protocol.Pack) bool {
+	if pack == nil || pack.Nack || pack.DeliverImmediately || pack.ContractAhead || len(pack.Frames) != 1 {
+		return false
+	}
+	frame := pack.Frames[0]
+	if frame == nil || frame.Raw || frame.MessageType != protocol.MessageType_TransferEncryptedControl {
+		return false
+	}
+	var control protocol.EncryptedControl
+	if ProtoUnmarshal(frame.MessageBytes, &control) != nil {
+		return false
+	}
+	if _, valid := sequenceTlsRoleFromProtobuf(control.SessionRole); !valid {
+		return false
+	}
+	if len(control.EpochId) != 0 {
+		if _, err := IdFromBytes(control.EpochId); err != nil {
+			return false
+		}
+	}
+	switch control.ControlType {
+	case protocol.EncryptedControlType_EncryptedControlHandshake,
+		protocol.EncryptedControlType_EncryptedControlIdentityProof,
+		protocol.EncryptedControlType_EncryptedControlUnknownWrapNack:
+		return true
+	default:
+		return false
+	}
+}
+
+// Its first real wire cannot have received feedback: it must still own the
+// exact unwrapped reliable encoding, with no data debit or immediate slot.
+func (self *privateProviderEncryptedAckFixture) assertCapturedControlOriginal(frame *privateProviderEncryptedAckFrame) {
+	pack := frame.pack
+	if self.sequence == nil || !privateProviderEncryptedControl(pack) ||
+		!bytes.Equal(pack.SequenceId, self.sequence.sequenceId.Bytes()) || self.boundAckOriginal(pack) {
+		return
+	}
+	privateProviderAssertOriginalPending(self.t, self.windowRoundFixture, pack, true, false)
+	source := privateProviderImmediateSource(self.t, self.windowRoundFixture, pack.SequenceId)
+	item := source.resendQueue.GetByMessageId(RequireIdFromBytes(pack.MessageId))
+	var control protocol.EncryptedControl
+	if err := ProtoUnmarshal(pack.Frames[0].MessageBytes, &control); err != nil || frame.encrypted || !item.forceUnwrapped ||
+		control.SessionRole != self.sequence.encryptionRole.complement().toProtobuf() || control.Companion != self.sequence.encryptionCompanion {
+		self.t.Fatal("actual control original lost its source-owned unwrapped session scope")
+	}
+	self.t.Logf("[provider-source-control-pending] ordinal=%d kind=%d subtype=%d payload_bytes=%d no_data_debit=true immediate=false encoded_owner=true", pack.SequenceNumber, pack.Frames[0].MessageType, control.ControlType, len(control.Payload))
+}
+
+// Captured Pack projections are ordinary copies. Forwarded wire shares still
+// belong to the real receive pump; held recovery copies return only at cleanup.
+func (self *privateProviderEncryptedAckFixture) sourceOriginals(first, next uint64) map[uint64]*protocol.Pack {
+	self.t.Helper()
+	originals := map[uint64]*protocol.Pack{}
+	messageNumbers := map[Id]uint64{}
+	for _, frame := range self.heldFrames {
+		pack := frame.pack
+		if pack == nil || !bytes.Equal(pack.SequenceId, self.sequence.sequenceId.Bytes()) || pack.SequenceNumber < first {
+			continue
+		}
+		if pack.Nack || pack.SequenceNumber >= next {
+			self.t.Fatal("captured original escaped the actual reliable source frontier")
+		}
+		if previous := originals[pack.SequenceNumber]; previous != nil {
+			if !bytes.Equal(previous.MessageId, pack.MessageId) || previous.DeliverImmediately != pack.DeliverImmediately ||
+				len(previous.Frames) != len(pack.Frames) {
+				self.t.Fatal("actual source reused an ordinal for a different original")
+			}
+			for index, member := range pack.Frames {
+				old := previous.Frames[index]
+				if member.MessageType != old.MessageType || member.Raw != old.Raw || !bytes.Equal(member.MessageBytes, old.MessageBytes) {
+					self.t.Fatal("actual source retry changed its original application or control frames")
+				}
+			}
+			continue
+		}
+		id := RequireIdFromBytes(pack.MessageId)
+		if number, exists := messageNumbers[id]; exists && number != pack.SequenceNumber {
+			self.t.Fatal("actual source reused a reliable message identity at a different ordinal")
+		}
+		messageNumbers[id] = pack.SequenceNumber
+		originals[pack.SequenceNumber] = pack
+	}
+	return originals
+}
+
+// Drain only already-published wires. Real provider retries remain withheld;
+// session controls and reverse feedback take their existing ordinary paths.
+func (self *privateProviderEncryptedAckFixture) forwardSourceControls() {
+	self.t.Helper()
+	synctest.Wait()
+	for count := 0; len(self.senderOut) != 0 || len(self.receiverOut) != 0; count++ {
+		if count == cap(self.senderOut)+cap(self.receiverOut) {
+			self.t.Fatal("bounded source-control wire drain did not quiesce")
+		}
+		if len(self.senderOut) != 0 {
+			frame := self.capture(<-self.senderOut, self.receiver)
+			provider := false
+			if frame.pack != nil {
+				for _, member := range frame.pack.Frames {
+					provider = provider || member != nil && member.MessageType == protocol.MessageType_IpIpPacketToProvider
+				}
+				if !provider && !privateProviderEncryptedControl(frame.pack) {
+					self.t.Fatal("unclassified actual source original cannot explain an ordinal gap")
+				}
+			}
+			if !provider {
+				self.forward(frame.windowRoundFrame, self.receiverIn)
+			}
+		}
+		self.feedback()
+	}
+}
+
+// The current immediate owner keeps the only slot. Any intervening ordinal
+// must belong to an observed ordinary session control, not the queued offer.
+func (self *privateProviderEncryptedAckFixture) assertQueuedAckOriginal(current *protocol.Pack, offer *privateProviderAckOffer) {
+	self.t.Helper()
+	self.forwardSourceControls()
+	source := privateProviderImmediateSource(self.t, self.windowRoundFixture, current.SequenceId)
+	observed := self.sourceOriginals(current.SequenceNumber+1, source.nextSequenceNumber)
+	controls := make([]*protocol.Pack, 0, len(observed))
+	for _, pack := range observed {
+		if !privateProviderEncryptedControl(pack) {
+			self.t.Fatal("accepted raw ACK successor published an encoded original before its predecessor ACK")
+		}
+		controls = append(controls, pack)
+	}
+	if offer.pack != nil || offer.callbacks != 0 {
+		self.t.Fatal("queued ACK offer bound or completed before the actual immediate predecessor ACK")
+	}
+	privateProviderAssertQueuedImmediateSuccessor(self.t, self.windowRoundFixture, current, controls...)
+}
+
+// Every final ordinal is an actual application original or a captured session
+// control. Both receiver progress and encoded retirement must reach that exact
+// source frontier before cancellation or cleanup can make the assertion pass.
+func (self *privateProviderEncryptedAckFixture) assertCompletedOriginals(applications []*privateProviderEncryptedAckFrame) {
+	self.t.Helper()
+	self.forwardSourceControls()
+	if len(applications) == 0 {
+		self.t.Fatal("source closure has no actual application originals")
+	}
+	first := applications[0].pack.SequenceNumber
+	source := privateProviderImmediateSource(self.t, self.windowRoundFixture, self.sequence.sequenceId.Bytes())
+	observed := self.sourceOriginals(first, source.nextSequenceNumber)
+	applicationIds := map[uint64]Id{}
+	for _, original := range applications {
+		pack := original.pack
+		if !bytes.Equal(pack.SequenceId, self.sequence.sequenceId.Bytes()) || applicationIds[pack.SequenceNumber] != (Id{}) ||
+			self.ackCounts[pack.SequenceNumber] != 1 {
+			self.t.Fatal("actual application original lost its exact unique terminal callback")
+		}
+		applicationIds[pack.SequenceNumber] = RequireIdFromBytes(pack.MessageId)
+	}
+	if source.nextSequenceNumber < first || source.nextSequenceNumber-first != uint64(len(observed)) {
+		self.t.Fatal("actual source frontier contains an uncaptured reliable original")
+	}
+	terminalAcks := map[uint64]bool{}
+	for _, frame := range self.heldFrames {
+		ack := frame.ack
+		if ack == nil || !bytes.Equal(ack.SequenceId, self.sequence.sequenceId.Bytes()) || len(ack.MissingContractId) != 0 {
+			continue
+		}
+		for number, original := range observed {
+			if !bytes.Equal(original.MessageId, ack.MessageId) {
+				continue
+			}
+			if ack.Selective {
+				if ack.DeliveredImmediately && original.DeliverImmediately && ack.ImmediateSequenceNumber != nil && *ack.ImmediateSequenceNumber == number {
+					terminalAcks[number] = true
+				}
+			} else {
+				for candidate := range observed {
+					if candidate <= number {
+						terminalAcks[candidate] = true
+					}
+				}
+			}
+			break
+		}
+	}
+	controlCount := 0
+	for number := first; number < source.nextSequenceNumber; number++ {
+		pack := observed[number]
+		if pack == nil || !terminalAcks[number] {
+			self.t.Fatalf("actual source frontier lacks an observed original or real terminal ACK: ordinal=%d original=%t terminal_ack=%t", number, pack != nil, terminalAcks[number])
+		}
+		if id, application := applicationIds[number]; application {
+			if id != RequireIdFromBytes(pack.MessageId) {
+				self.t.Fatal("captured original does not match the application's actual identity")
+			}
+		} else {
+			if !privateProviderEncryptedControl(pack) {
+				self.t.Fatal("non-application ordinal is not an actual ordinary encryption control")
+			}
+			var control protocol.EncryptedControl
+			if err := ProtoUnmarshal(pack.Frames[0].MessageBytes, &control); err != nil ||
+				control.SessionRole != self.sequence.encryptionRole.complement().toProtobuf() ||
+				control.Companion != self.sequence.encryptionCompanion {
+				self.t.Fatal("actual encryption control escaped its application sequence's role or companion")
+			}
+			controlCount++
+			self.t.Logf("[provider-source-control] ordinal=%d kind=%d subtype=%d payload_bytes=%d immediate=false actual_terminal_retirement=true", number, pack.Frames[0].MessageType, control.ControlType, len(control.Payload))
+		}
+		privateProviderAssertOriginalRetired(self.t, self.windowRoundFixture, pack)
+	}
+	source.protocolAdmission.mutex.Lock()
+	queued := source.protocolAdmission.count
+	source.protocolAdmission.mutex.Unlock()
+	if self.sequence.nextSequenceNumber != source.nextSequenceNumber || self.sequence.holdPromise.ingressFloor != source.nextSequenceNumber ||
+		self.sequence.receiveQueue.Len() != 0 || source.resendQueue.Len() != 0 || len(source.sendItems) != 0 || source.immediateSendCount != 0 || queued != 0 {
+		self.t.Fatalf("actual original closure: receiver_next=%d receiver_floor=%d source_next=%d applications=%d controls=%d receive_queue=%d retained=%d items=%d immediate=%d queued=%d", self.sequence.nextSequenceNumber, self.sequence.holdPromise.ingressFloor, source.nextSequenceNumber, len(applications), controlCount, self.sequence.receiveQueue.Len(), source.resendQueue.Len(), len(source.sendItems), source.immediateSendCount, queued)
+	}
+	self.nextNumber = source.nextSequenceNumber
+	self.t.Logf("[provider-source-originals-complete] first=%d source_next=%d receiver_next=%d applications=%d controls=%d all_actual_originals_retired=true", first, source.nextSequenceNumber, self.sequence.nextSequenceNumber, len(applications), controlCount)
 }

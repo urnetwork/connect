@@ -110,7 +110,7 @@ func TestNatProviderMemoryMixedControlPacksNormalizeBorrowedRoots(t *testing.T) 
 	}
 }
 
-func TestNatProviderMemoryControlWorkspaceBoundsConcurrencyAndJoinsClose(t *testing.T) {
+func TestNatProviderMemoryProtocolCallbacksOmitByteClaimsAndJoinClose(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	budget := NewTransferMemoryBudget(mib(2))
 	nat := newNatProviderMemoryNat(t, budget)
@@ -130,26 +130,50 @@ func TestNatProviderMemoryControlWorkspaceBoundsConcurrencyAndJoinsClose(t *test
 		t.Fatal("could not fill data budget")
 	}
 	defer budget.Release(fill)
-	entered, release, received := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	before := budget.Stats()
+	entered, release, received := make(chan struct{}, 2), make(chan struct{}), make(chan struct{}, 2)
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	defer unblock()
-	provider.beforeLocalUserNatAdmissionForTest = func(Id, [][]byte) { close(entered); <-release }
-	go func() { provider.ClientReceive(source, frames, peer); close(received) }()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("prepaid control was not admitted")
+	provider.beforeLocalUserNatAdmissionForTest = func(Id, [][]byte) { entered <- struct{}{}; <-release }
+	for range 2 {
+		go func() { provider.ClientReceive(source, frames, peer); received <- struct{}{} }()
 	}
-	if provider.ingressControlMemory.UsedByteCount() != natProviderControlBytes {
-		t.Fatal("callback did not retain the control workspace")
+	joined := false
+	defer func() {
+		unblock()
+		if !joined {
+			for range 2 {
+				select {
+				case <-received:
+				case <-time.After(5 * time.Second):
+					t.Error("protocol callback did not join after releasing the barrier")
+				}
+			}
+		}
+	}()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("full DATA budget prevented an independent protocol callback")
+		}
 	}
-	if allocations := testing.AllocsPerRun(100, func() { provider.ClientReceive(source, frames, peer) }); allocations != 0 {
-		t.Fatalf("a full control workspace allocated %g objects per refused callback", allocations)
+	if provider.ingressControlMemory.UsedByteCount() != 0 || budget.Stats() != before {
+		t.Fatal("protocol callbacks acquired DATA or reserved protocol bytes")
 	}
-	// Return callbacks have a separate prepaid partition; either direction
-	// occupying its workspace cannot consume the other's recovery admission.
-	returnMemory, admitted := provider.startReturnMemoryOperation([][]byte{packet}, receiveRecoveryModeTcpSocket)
+	oversized := make([]*protocol.Frame, providerReturnBatchMaxFrames+1)
+	for index := range oversized {
+		oversized[index] = frames[0]
+	}
+	if allocations := testing.AllocsPerRun(100, func() { provider.ClientReceive(source, oversized, peer) }); allocations != 0 || len(entered) != 0 || budget.Stats() != before {
+		t.Fatalf("oversized protocol callback escaped the count bound: allocations=%g", allocations)
+	}
+	// Ordinary DATA return workspace stays independently owned while protocol
+	// callback lifetimes are held; protocol progress creates no extra capacity.
+	dataPacket := MessagePoolCopy(ipOosTcpPacket(path, tcpFlagAck, []byte("data")))
+	defer MessagePoolReturn(dataPacket)
+	returnMemory, admitted := provider.startReturnMemoryOperation([][]byte{dataPacket}, receiveRecoveryModeTcpSocket)
 	if !admitted {
 		t.Fatal("ingress control consumed the synchronous return workspace")
 	}
@@ -173,7 +197,10 @@ func TestNatProviderMemoryControlWorkspaceBoundsConcurrencyAndJoinsClose(t *test
 	case <-time.After(5 * time.Second):
 		t.Fatal("provider close did not join ingress control")
 	}
-	<-received
+	for range 2 {
+		<-received
+	}
+	joined = true
 	if provider.ingressControlMemory.UsedByteCount() != 0 || budget.UsedByteCount() != natMemoryFixedBytes+fill {
 		t.Fatalf("closed control owner leaked claims: %+v", budget.Stats())
 	}

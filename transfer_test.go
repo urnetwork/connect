@@ -116,11 +116,12 @@ func TestCumulativeAckBoundarySurvivesImmediateSendItemReuse(t *testing.T) {
 		},
 	}
 	sequence := &SendSequence{
-		client:           client,
-		log:              client.log,
-		resendQueue:      newResendQueue(nil, 0),
-		sendItems:        []*sendItem{target, later},
-		flightController: newSendFlightController(DefaultSendBufferSettings()),
+		sendBufferSettings: DefaultSendBufferSettings(),
+		client:             client,
+		log:                client.log,
+		resendQueue:        newResendQueue(nil, 0),
+		sendItems:          []*sendItem{target, later},
+		flightController:   newSendFlightController(DefaultSendBufferSettings()),
 	}
 	sequence.resendQueue.Add(target)
 	sequence.resendQueue.Add(later)
