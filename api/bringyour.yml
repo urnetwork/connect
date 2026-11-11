@@ -11405,6 +11405,192 @@ paths:
               schema:
                 $ref: "#/components/schemas/QuotaLimits"
 
+  /internal/gate/limits/{network_id}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: A network's effective limits, for a host with no Postgres
+      description: |
+        The network's `QuotaLimits`, as `GET /sidecar/limits` answers them,
+        for the hosts that hold no Postgres (evs, gkm, sockets, tlsedge and
+        mxedge), which cache them 5 s. One of the internal gate's routes:
+        each takes only the bearers of the services it lists, here every one
+        of the five, and the lb refuses the prefix from outside. 503 while
+        the limits cannot be read.
+      operationId: internalGateLimits
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaLimits"
+        "400":
+          description: The network id does not parse, or is zero.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "503":
+          description: The limits cannot be read.
+
+  /internal/gate/over-limit:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: The networks over their storage limit, and the spent ones
+      description: |
+        Every network over its storage limit and every spent one, apart,
+        each with the `QuotaRefusal` a host answers it, which evs, sockets
+        and mxedge read every 5 s and keep, marked stale, while api is away.
+        evs's, sockets' and mxedge's bearers only. 503 while the list cannot
+        be read.
+      operationId: internalGateOverLimit
+      security:
+        - InternalGateAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateOverLimit"
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "503":
+          description: The list cannot be read.
+
+  /internal/gate/draw-order/{network_id}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: A payer's balances in draw order, for an edge lease
+      description: |
+        The network's in-window transfer balances in the order debits draw on
+        them, a team credit line last, each with its credit as read now (0
+        when it is negative), which an edge lease reserves from one balance
+        at a time. tlsedge's and mxedge's bearers only. 503 while the
+        balances cannot be read.
+      operationId: internalGateDrawOrder
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateDrawOrder"
+        "400":
+          description: The network id does not parse, or is zero.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "503":
+          description: The balances cannot be read.
+
+  /internal/gate/spent/{network_id}:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Mark a network spent, for an edge lease
+      description: |
+        Marks the network spent, as an edge lease does when its draw reserved
+        nothing from any balance: new streams and payload-adding writes are
+        refused until a balance has room again. tlsedge's and mxedge's
+        bearers only. The body is empty, and the answer is `{}`. 503 while the
+        mark cannot be written.
+      operationId: internalGateSpent
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Marked.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: The network id does not parse, or is zero.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "503":
+          description: The mark cannot be written.
+
+  /internal/gate/usage-batch:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Apply a host's usage batch
+      description: |
+        A producer's 60 s usage batch with the lease carves its host made,
+        applied once by `batch_id`: a batch applied before answers
+        `applied` false and applies nothing again. evs's, tlsedge's and
+        mxedge's bearers only, and the batch's `producer` must be the
+        caller's own service, or 403. A batch the server refuses (an unknown
+        producer or meter, a zero network, too many events or carves, or a
+        lease meter's bytes its carves do not cover exactly) answers 400
+        with the reason as plain text and applies nothing. At most 4 MiB.
+      operationId: internalGateUsageBatch
+      security:
+        - InternalGateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalGateUsageBatch"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateUsageBatchResult"
+        "400":
+          description: The batch does not parse, or the server refused it; nothing was applied.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "413":
+          description: The body is past 4 MiB.
+        "503":
+          description: The batch cannot be applied now; the producer retries it.
+
   /sidecar/push-token:
     post:
       x-internal: true
@@ -14025,6 +14211,17 @@ components:
         URnetwork JWT: 15 minutes, for one audience, with `repo:` scopes. Each
         route names the scope it needs, and the service honors a scope only
         while its newest verified authorization state agrees.
+
+    InternalGateAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A service's internal bearer: 256 random bits in unpadded base64url,
+        which each service with no Postgres holds in its own credential file
+        with its previous value during a rotation. api holds only their
+        SHA-256, each with its service, compares in constant time, and each
+        internal gate route takes only the services it lists. Not a URnetwork
+        JWT, and never a user's.
 
   schemas:
     ClientInfo:
@@ -27794,6 +27991,120 @@ components:
           format: int64
         upgrade:
           description: A purchase or a higher tier lifts the limit.
+          type: boolean
+    InternalGateNetworkRefusal:
+      type: object
+      required: [network_id, refusal]
+      properties:
+        network_id:
+          type: string
+          format: uuid
+        refusal:
+          $ref: "#/components/schemas/QuotaRefusal"
+    InternalGateOverLimit:
+      type: object
+      required: [storage, spent]
+      properties:
+        storage:
+          description: The networks over their storage limit.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateNetworkRefusal"
+        spent:
+          description: The spent networks, with no balance left.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateNetworkRefusal"
+    InternalGateBalance:
+      type: object
+      required: [balance_id, credit_byte_count, credit, end_time]
+      properties:
+        balance_id:
+          type: string
+          format: uuid
+        credit_byte_count:
+          description: The balance's bytes left when read, 0 when it is negative.
+          type: integer
+          format: int64
+        credit:
+          description: A team credit line, drawn after every other balance.
+          type: boolean
+        end_time:
+          type: string
+          format: date-time
+    InternalGateDrawOrder:
+      type: object
+      required: [balances]
+      properties:
+        balances:
+          description: In the order debits draw on them.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateBalance"
+    InternalGateUsageEvent:
+      type: object
+      required: [network_id, meter, transfer_byte_count, stored_byte_delta]
+      properties:
+        network_id:
+          description: The caller's network for transfer, the repo's for a stored-byte delta.
+          type: string
+          format: uuid
+        meter:
+          type: string
+        transfer_byte_count:
+          type: integer
+          format: int64
+        stored_byte_delta:
+          type: integer
+          format: int64
+    InternalGateUsageCarve:
+      type: object
+      required: [usage_id, network_id, meter, balance_id, byte_count]
+      properties:
+        usage_id:
+          description: The first 16 bytes of SHA-256(batch_id || network_id || meter || balance_id).
+          type: string
+          format: uuid
+        network_id:
+          type: string
+          format: uuid
+        meter:
+          type: string
+        balance_id:
+          type: string
+          format: uuid
+        byte_count:
+          type: integer
+          format: int64
+    InternalGateUsageBatch:
+      type: object
+      required: [batch_id, producer, window_start, events, carves]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        producer:
+          description: The caller's own service.
+          type: string
+          enum: [evs, tlsedge, mxedge]
+        window_start:
+          type: string
+          format: date-time
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateUsageEvent"
+        carves:
+          description: The bytes a lease's host carved from each balance's reservation.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateUsageCarve"
+    InternalGateUsageBatchResult:
+      type: object
+      required: [applied]
+      properties:
+        applied:
+          description: False when the batch id was applied before, so nothing was applied twice.
           type: boolean
     SidecarIdentityResult:
       type: object
