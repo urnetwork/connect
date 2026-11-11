@@ -12591,6 +12591,45 @@ paths:
         "503":
           description: Acks are not available on this server yet.
 
+  /approval/cancel:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Cancel a server-gated approval's remaining uses
+      description: |
+        An approver's signed ApprovalCancel, with the server-gated ApprovalDecision
+        it cancels, each a Signed as the approver made it. The cancel's signer must
+        be the decision's approver, by an approval-capable device of that member or
+        a presence key registered to it. Each use of the decision that no gate has
+        spent becomes cancelled, so no gate spends it afterwards; a use a gate
+        committed first stays done.
+
+        A client token only. The server stores, per use, the approval id, the use
+        index, its state and the decision's expiry, and keeps each row a day past
+        that expiry; the decision and the cancel are held only in memory.
+      operationId: approvalCancel
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalCancelArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalCancelResult"
+        "400":
+          description: The cancel or the decision does not parse.
+        "403":
+          description: Not a client token, or the cancel is not the decision's approver's.
+        "503":
+          description: Server-gated approvals are not available on this server yet.
+
   /acl/invite:
     post:
       x-internal: true
@@ -28534,6 +28573,30 @@ components:
             Whether the ack counted: false for a version not above the client's last
             ack, above its network's head, or in a network with no head.
           type: boolean
+
+    ApprovalCancelArgs:
+      type: object
+      required:
+        - cancel
+        - decision
+      properties:
+        cancel:
+          description: The approver's Signed ApprovalCancel (§6.9, purpose approval), as it was signed.
+          type: string
+          format: byte
+        decision:
+          description: The Signed ApprovalDecision the cancel names, as it was signed.
+          type: string
+          format: byte
+
+    ApprovalCancelResult:
+      type: object
+      required:
+        - cancelled_use_count
+      properties:
+        cancelled_use_count:
+          description: The uses this cancel made cancelled; 0 when every use was spent or cancelled already.
+          type: integer
 
     NetworkBridgeShareResult:
       type: object
