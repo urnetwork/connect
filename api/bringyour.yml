@@ -2594,6 +2594,16 @@ paths:
         WireGuard details), and for a unique-exit proxy its `exit`. Same row
         shape as `/network/clients` otherwise: resident status, connections,
         provide status.
+
+        SOCKS and WireGuard are part of Pro. Each proxy's `pro_features` lists
+        the Pro-only features it holds credentials for (`socks_proxy` for a
+        SOCKS url, `wireguard_proxy` for a WireGuard config), and the list's
+        `plan` says whether the network holds Pro now, read live, and whether
+        the platform enforces the Pro-only features. While
+        `plan.pro_features_enforced` is false every plan uses them. Once it is
+        true, a network without Pro is issued neither, and its proxies' SOCKS
+        sign-ins are refused and their WireGuard peers dropped; HTTP and HTTPS
+        keep working.
       operationId: networkProxies
       security:
         - BearerAuth: []
@@ -4279,11 +4289,18 @@ paths:
         The catalog an agent can buy from, so a skill can discover it without
         triggering a `402`. Prices come from the Pro price list, never from
         the x402 configuration, so an agent is quoted the same number a human
-        pays by card; a sku with no price is not offered at all. It names the
-        x402 protocol versions spoken (v2 and v1), each network's x402 v2
-        (CAIP-2) id, and each sku's exact `amount` in atomic units of the
-        asset, from which an agent sets its client's per-payment cap: x402
-        clients refuse a payment over $1 by default.
+        pays on any other rail; a sku with no price is not offered at all. It
+        names the x402 protocol versions spoken (v2 and v1), each network's
+        x402 v2 (CAIP-2) id, and each sku's exact `amount` in atomic units of
+        the asset, from which an agent sets its client's per-payment cap:
+        x402 clients refuse a payment over $1 by default.
+
+        The skus are `pro_1month`, `data_1tib`, `data_10tib` and
+        `data_256gib`. `data_256gib` is 256 GiB of data for $0.75 (`amount`
+        "750000"): the pack for clients with a $1 per-payment cap, such as
+        Cloudflare Agents' `withX402Client`, which cannot raise it. It is
+        sold only over x402 and with Gamma, and it adds data only: it does
+        not lift a limit that UR Pro lifts.
       operationId: x402Skus
       security: []
       responses:
@@ -4313,7 +4330,8 @@ paths:
         The terms' `error` states the price. The x402 SDK clients refuse any
         payment over $1 unless their per-payment cap is raised
         (`maxAmountPerPayment`; `maxPaymentUsdc` in Coinbase AgentKit), so
-        an agent raises the cap to the price first.
+        an agent raises the cap to the price first. A client that cannot
+        raise it can buy `data_256gib`, 256 GiB of data for $0.75.
 
         A v2 payment's `accepted` terms must equal one of the quoted terms
         (every field but `extra`, which must hold the quoted `extra`). A
@@ -4549,6 +4567,12 @@ paths:
                         min_daily_cap_gamma: "20"
                         renews: false
                         indicative_tao: "0.094583"
+                      - item_id: data_256gib
+                        price_gamma: "0.75"
+                        price_usd: 0.75
+                        min_daily_cap_gamma: "0.75"
+                        renews: false
+                        indicative_tao: "0.003547"
                     auto_min_daily_cap_gamma: "40"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
@@ -4598,6 +4622,12 @@ paths:
                         min_daily_cap_gamma: "20"
                         renews: false
                         indicative_tao: ""
+                      - item_id: data_256gib
+                        price_gamma: "0.75"
+                        price_usd: 0.75
+                        min_daily_cap_gamma: "0.75"
+                        renews: false
+                        indicative_tao: ""
                     auto_min_daily_cap_gamma: "40"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
@@ -4611,11 +4641,13 @@ paths:
         Start a purchase paid from the signed-in network's SN25 gamma
         deposit: Pro `monthly`, `yearly` or `yearly_onboarding` (the welcome
         offer, while redeemable), or a data pack (`data_1tib`,
-        `data_10tib`), to the network (delivery `account`) or as a balance
-        code (delivery `code`, data packs only; with `email`, the code is
-        emailed too). Give exactly one of `plan` and `item_id`. The price is
-        the card price in US dollars at the caller's tier, and one gamma is
-        one dollar, so `amount_gamma` needs no rate.
+        `data_10tib`, or `data_256gib`: 256 GiB for $0.75, sold only with
+        Gamma and over x402), to the network (delivery `account`) or as a
+        balance code (delivery `code`, data packs only; with `email`, the
+        code is emailed too). Give exactly one of `plan` and `item_id`. The
+        price is the card price in US dollars at the caller's tier (the
+        256 GiB pack's is the same on both rails that sell it), and one gamma
+        is one dollar, so `amount_gamma` needs no rate.
 
         The answer names `deposit_hotkey`: the hotkey URnetwork assigned
         this account, on `netuid` 25. It is not a pay-to address, and there
@@ -4864,9 +4896,10 @@ paths:
           a welcome-offer year renews at the yearly price). Unless the network
           pays for Pro elsewhere past that term.
         - `auto_topup`: when the data balance runs out, or will within the
-          next check, buy `topup_item_id` (`data_1tib` unless set), at most one
-          an hour; and when a free account hits its client limit
-          (`client_limit_exceeded` with `upgrade_required`), buy Pro
+          next check, buy `topup_item_id` (`data_1tib` unless set; any pack
+          Gamma sells), at most one an hour; and when a free account hits
+          its client limit (`client_limit_exceeded` with
+          `upgrade_required`), buy Pro
           (`renew_plan`, else `monthly`), at most once a day. A Pro account at
           its limit gets the error as before. An automatic upgrade never
           changes how the network provides.
@@ -4909,10 +4942,11 @@ paths:
       summary: Set Gamma Settings
       description: |
         Set the automatic gamma charges' switches (see GET), the top-up item
-        (`data_1tib` or `data_10tib`) and the monthly limit (a decimal amount
-        of gamma; "0" or "" removes it). A field left out is unchanged. The
-        answer is the settings as they now are; a refusal returns `error`
-        (`item_unavailable`, `invalid_request`). Network credential only.
+        (`data_1tib`, `data_10tib` or `data_256gib`) and the monthly limit (a
+        decimal amount of gamma; "0" or "" removes it). A field left out is
+        unchanged. The answer is the settings as they now are; a refusal
+        returns `error` (`item_unavailable`, `invalid_request`). Network
+        credential only.
       operationId: gammaSetSettings
       security:
         - BearerAuth: []
@@ -14135,6 +14169,18 @@ components:
                   Set for a unique-exit proxy (`proxy_config.unique_exit`):
                   its current exit.
                 $ref: "#/components/schemas/ProxyExit"
+              pro_features:
+                description: |
+                  `/network/proxies` only: the Pro-only features the proxy
+                  holds credentials for, `socks_proxy` for a SOCKS url and
+                  `wireguard_proxy` for a WireGuard config. A network without
+                  Pro loses them at the proxy once
+                  `plan.pro_features_enforced` is true. Absent for a proxy
+                  that holds neither. A client ignores a name it does not
+                  know.
+                type: array
+                items:
+                  type: string
               connections:
                 type: array
                 items:
@@ -14163,6 +14209,27 @@ components:
                       type: string
                     connection_block:
                       type: string
+        plan:
+          description: |
+            `/network/proxies` only: the network's plan beside its proxies.
+            Absent from `/network/clients`.
+          type: object
+          required:
+            - pro
+            - pro_features_enforced
+          properties:
+            pro:
+              description: |
+                The network holds Pro now, read live, not from the jwt's
+                `pro` claim.
+              type: boolean
+            pro_features_enforced:
+              description: |
+                The platform refuses the Pro-only features (SOCKS and
+                WireGuard) to a network without Pro: none is issued, and
+                the credentials a proxy already holds stop working at the
+                proxy. While false, every plan uses them.
+              type: boolean
 
     NetworkPeer:
       type: object
@@ -21550,7 +21617,9 @@ components:
             type: string
         items:
           type: array
-          description: the data packs the asset sells (`data_1tib`, `data_10tib`)
+          description: |
+            the data packs the asset sells (`data_1tib`, `data_10tib`); never
+            `data_256gib`, which is sold only over x402 and with Gamma
           items:
             type: string
         confirmations_required:
@@ -22039,6 +22108,11 @@ components:
         - item_id
       properties:
         item_id:
+          description: |
+            `pro_monthly`, `pro_yearly`, or a data pack sold by card:
+            `data_1tib` or `data_10tib`. The 256 GiB pack (`data_256gib`) is
+            sold only over x402 and with Gamma, and is refused here with
+            `item_unavailable`.
           type: string
         storefront_country:
           type: string
@@ -23359,6 +23433,10 @@ components:
         - pro
       properties:
         sku_id:
+          description: |
+            `pro_1month`, `data_1tib`, `data_10tib` or `data_256gib` (256 GiB
+            for $0.75, the pack for clients with a $1 per-payment cap, sold
+            only over x402 and with Gamma).
           type: string
         description:
           type: string
@@ -23536,6 +23614,7 @@ components:
       required: [sku_id]
       properties:
         sku_id:
+          description: A sku of `GET /x402/skus`.
           type: string
         network:
           description: |
@@ -25199,7 +25278,11 @@ components:
           enum: [monthly, yearly]
         item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: |
+            A data pack Gamma sells. `data_256gib` is 256 GiB for $0.75, the
+            pack for clients with a $1 per-payment cap; it is sold only with
+            Gamma and over x402, never by card or with the crypto invoices.
+          enum: [data_1tib, data_10tib, data_256gib]
         price_gamma:
           type: string
           description: The price in gamma, one gamma per US dollar.
@@ -25277,7 +25360,8 @@ components:
           enum: [monthly, yearly, yearly_onboarding]
         item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: A data pack Gamma sells; `data_256gib` is 256 GiB for $0.75.
+          enum: [data_1tib, data_10tib, data_256gib]
         delivery:
           type: string
           enum: [account, code]
@@ -25440,7 +25524,8 @@ components:
           type: boolean
         topup_item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: The data pack an automatic top-up buys, any pack Gamma sells.
+          enum: [data_1tib, data_10tib, data_256gib]
         monthly_limit_gamma:
           type: string
           description: A decimal amount of gamma; "0" or "" removes the limit.
