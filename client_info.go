@@ -35,8 +35,8 @@ type ClientInfo struct {
 // with the device type, as unknown and keeps the rest of the object, so a
 // newer build's value never costs an older parser the device type.
 const (
-	// the App Store builds for iOS, iPadOS and macOS, and their TestFlight
-	// builds: the App Store bills
+	// the App Store builds for iOS, iPadOS and macOS, their beta builds
+	// included: the App Store bills
 	ClientDistributionAppStore = "app_store"
 	// the direct-download macOS build (the Developer ID DMG with the system
 	// extension tunnel, DIRECT_DOWNLOAD): Stripe bills
