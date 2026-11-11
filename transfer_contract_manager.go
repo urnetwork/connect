@@ -401,6 +401,24 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		CompanionRefusalHoldMax:         5 * time.Minute,
 		CompanionRefusalMaxDestinations: 1024,
 
+		// Waits of 0.5-1, 1-2, 2-4 and 4-8 s spread five attempts over 7.5-15 s
+		// when each failure answers at once, which rides out a deploy's 502/503
+		// edge or a short api overload. A black-holed route spends each attempt's
+		// full RequestTimeout (15 s by default), so it still gets about one more
+		// attempt within 30 s, as after a network handover. Retries of failures
+		// that answer at once end well inside the 30 s that owners already give a
+		// closing client's join (the SN25 validator's tunnel retirement cancels
+		// its transport past that). A retired window client keeps its identity,
+		// and its device's close join waits, for at most 30 s or one
+		// RequestTimeout if that is longer, where the one attempt before held
+		// them for up to one RequestTimeout.
+		CloseReportRetry: OobRetrySettings{
+			MaxAttemptCount: 5,
+			Timeout:         30 * time.Second,
+			RetryTimeout:    1 * time.Second,
+			RetryMaxTimeout: 8 * time.Second,
+		},
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -541,6 +559,23 @@ type ContractManagerSettings struct {
 	CompanionRefusalMaxDestinations int
 	// Test hook for the hold's jitter draw. Nil uses math/rand.
 	companionRefusalRandomForTest func(n int64) int64
+
+	// Bounds the retries of a close report's out-of-band cleanup, the one
+	// request that carries a checkpoint or final report once its native
+	// delivery has lost the client lifecycle: every report made after the
+	// client closed, and every earlier one still unacknowledged then. The
+	// request is retried after no answer (a network error or a timeout), a 408,
+	// a 429 or a 5xx, and never after any other answer: a 401 from a retired
+	// identity or a rejected unknown contract ends it. Retrying is safe because
+	// each report carries its identity (ReportId), so the platform applies an
+	// exact repeat once. The first attempt is the request sent before, with its
+	// RequestTimeout; the retries run inside the same admitted request, so the
+	// client control's join, and the identity retirement of a window client
+	// behind it, wait for them within this bound. A control without
+	// SendControlWithRetry, the zero value and a MaxAttemptCount at or below 1
+	// send once, as before; server-side contract expiry remains the backstop
+	// when every attempt fails.
+	CloseReportRetry OobRetrySettings
 
 	ProtocolVersion int
 
@@ -2387,9 +2422,13 @@ func (self *ContractManager) closeContractWithPendingReport(
 		return
 	}
 
-	// Takes the retained frame for one cleanup attempt after native delivery
-	// loses its lifecycle. The external OOB owner takes custody on return;
-	// server expiry remains the backstop if that attempt fails.
+	// The report's identity makes its exact bytes safe to deliver more than
+	// once, which is what lets its cleanup retry.
+	identified := len(report.ReportId) != 0
+	// Takes the retained frame for one cleanup request after native delivery
+	// loses its lifecycle. The external OOB owner takes custody on return and
+	// retries a transient failure within CloseReportRetry; server expiry
+	// remains the backstop if every attempt fails.
 	sendCleanup := func(cleanupFrame *protocol.Frame) {
 		var stateLock sync.Mutex
 		cleanupReturned, cleanupCompleted, cleanupSucceeded := false, false, false
@@ -2415,7 +2454,10 @@ func (self *ContractManager) closeContractWithPendingReport(
 			}
 		}
 		frames := []*protocol.Frame{cleanupFrame}
-		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
+		if retryOob, ok := self.client.ClientOob().(OutOfBandControlWithRetry); ok && identified {
+			retry := self.settings.CloseReportRetry
+			retryOob.SendControlWithRetry(context.Background(), frames, &retry, sendCallback)
+		} else if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
 			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)
