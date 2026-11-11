@@ -160,9 +160,11 @@ tags:
       - crypto invoices (`/pay/crypto`, `/pay/data/crypto-intent`): Pro and
         data packs paid in USDC on Solana, Zcash or Monero, with the enabled
         coins, each invoice's status and a new quote for an unpaid one
-      - inline agent payments over the x402 header protocol (`/x402`): an
-        agent asks for a sku, is answered `402` with the payment terms, and
-        retries the same request with a signed payment in `X-PAYMENT`
+      - inline agent payments over the x402 header protocol (`/x402`), in
+        x402 v2 and v1: an agent asks for a sku, is answered `402` with the
+        payment terms (v2 in the `PAYMENT-REQUIRED` header, v1 in the body),
+        and retries the same request with a signed payment in
+        `PAYMENT-SIGNATURE` (v2) or `X-PAYMENT` (v1)
       - the subnet (`/sn`): payout wallets and their consents, head mining,
         pool claims and epochs, the public, content-addressed payout
         artifacts, settlement v2 ledger objects and release evidence,
@@ -1356,10 +1358,11 @@ paths:
         `error.upgrade_required` answers HTTP 402 with the terms for a Pro
         month when x402 inline payments are enabled and a price can be
         quoted, so the agent can pay and retry the same request with
-        `X-PAYMENT` (see `/x402`). x402 has no header a client sends before
-        it is quoted, so without `X-UR-X402: 1` every refusal is the 200 with
-        the error, which the apps, the browser extension and ur.io prompt on.
-        A request that carries `X-PAYMENT` is never quoted again.
+        `PAYMENT-SIGNATURE` (x402 v2) or `X-PAYMENT` (x402 v1) (see `/x402`).
+        x402 has no header a client sends before it is quoted, so without
+        `X-UR-X402: 1` every refusal is the 200 with the error, which the
+        apps, the browser extension and ur.io prompt on. A request that
+        carries a payment is never quoted again.
 
         Two more limits apply to every hosted proxy create (a new client
         with `proxy_config`, top-level or ancillary), and these are always
@@ -1461,9 +1464,25 @@ paths:
           description: |
             The caller asked for x402 terms (`X-UR-X402: 1`), a plan limit
             that UR Pro lifts refused the request (`error.upgrade_required`),
-            and x402 inline payments are enabled: the body carries the x402
-            payment terms for a Pro month. Pay, then retry the same request
-            with `X-PAYMENT` (see `/x402`).
+            and x402 inline payments are enabled: the terms for a Pro month,
+            in x402 v2 in the `PAYMENT-REQUIRED` header and in x402 v1 as the
+            body. Their `error` is the refusal's message, then the price and,
+            since x402 clients refuse a payment over $1 by default, the cap to
+            allow. Pay, then retry the same request with `PAYMENT-SIGNATURE`
+            (v2) or `X-PAYMENT` (v1) (see `/x402/purchase`). A payment that
+            was refused is answered 402 with the terms again, the reason as
+            their `error`.
+          headers:
+            PAYMENT-REQUIRED:
+              description: |
+                The x402 v2 terms: base64 of the JSON of
+                `#/components/schemas/X402PaymentRequiredV2`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/X402PaymentRequired"
 
   /network/register-client-v1:
     post:
@@ -4253,7 +4272,11 @@ paths:
         The catalog an agent can buy from, so a skill can discover it without
         triggering a `402`. Prices come from the Pro price list, never from
         the x402 configuration, so an agent is quoted the same number a human
-        pays by card; a sku with no price is not offered at all.
+        pays by card; a sku with no price is not offered at all. It names the
+        x402 protocol versions spoken (v2 and v1), each network's x402 v2
+        (CAIP-2) id, and each sku's exact `amount` in atomic units of the
+        asset, from which an agent sets its client's per-payment cap: x402
+        clients refuse a payment over $1 by default.
       operationId: x402Skus
       security: []
       responses:
@@ -4271,26 +4294,54 @@ paths:
       tags: [Other]
       summary: Quote or settle an inline payment
       description: |
-        Buy a sku inline. Without an `X-PAYMENT` header the answer is `402`
-        carrying the payment terms; the agent signs them and retries the SAME
-        request with the signed payment in `X-PAYMENT`, which is settled and
-        granted. The receipt is returned both as the body and in the
-        `X-PAYMENT-RESPONSE` header. Requires a network session.
+        Buy a sku inline, over x402 v2 or v1. Without a payment the answer is
+        `402` carrying the payment terms: x402 v2 in the `PAYMENT-REQUIRED`
+        header (base64 JSON, networks as CAIP-2 ids such as `eip155:8453`)
+        and x402 v1 as the body. The agent signs one of them and retries the
+        SAME request with the signed payment in `PAYMENT-SIGNATURE` (v2) or
+        `X-PAYMENT` (v1), which is settled and granted. The receipt is the
+        body and, in the payment's version, the `PAYMENT-RESPONSE` (v2) or
+        `X-PAYMENT-RESPONSE` (v1) header. Requires a network session.
+
+        The terms' `error` states the price. The x402 SDK clients refuse any
+        payment over $1 unless their per-payment cap is raised
+        (`maxAmountPerPayment`; `maxPaymentUsdc` in Coinbase AgentKit), so
+        an agent raises the cap to the price first.
+
+        A v2 payment's `accepted` terms must equal one of the quoted terms
+        (every field but `extra`, which must hold the quoted `extra`). A
+        malformed payment, or one sent in both headers, is answered 400. A
+        payment the terms or the facilitator refuse is answered 402 with the
+        terms again, the reason as their `error` (in v2 the x402 error code),
+        and for a refused settlement its SettlementResponse in the receipt
+        header. A settlement the facilitator broadcast but could not confirm
+        (`settlement_pending`) grants nothing yet and is recorded: do not
+        sign another payment for it.
 
         The same 402 round trip is also carried inline by
         `POST /network/auth-client`, where an agent meets the plan's limits,
         for an agent that asks for terms with `X-UR-X402: 1`. An agent that
         did not ask reads `error.upgrade_required` there and can buy
-        `pro_1month` here, then retry, or pay on its auth-client retry with
-        `X-PAYMENT`.
+        `pro_1month` here, then retry, or pay on its auth-client retry.
       operationId: x402Purchase
       security:
         - BearerAuth: []
       parameters:
         - in: header
+          name: PAYMENT-SIGNATURE
+          required: false
+          description: |
+            The signed x402 v2 payment for terms previously quoted by a 402:
+            base64 of the JSON PaymentPayload, naming the terms it `accepted`.
+          schema:
+            type: string
+        - in: header
           name: X-PAYMENT
           required: false
-          description: The signed payment for terms previously quoted by a 402.
+          description: |
+            The signed x402 v1 payment for terms previously quoted by a 402:
+            base64 of the JSON PaymentPayload. Send one payment header, not
+            both.
           schema:
             type: string
       requestBody:
@@ -4301,10 +4352,21 @@ paths:
               $ref: "#/components/schemas/X402PurchaseArgs"
       responses:
         "200":
-          description: Settled and granted. The receipt is also in `X-PAYMENT-RESPONSE`.
+          description: |
+            Settled and granted. The receipt is also in the payment
+            response header of the payment's version.
           headers:
+            PAYMENT-RESPONSE:
+              description: |
+                For an x402 v2 payment: the SettlementResponse, base64 of its
+                JSON (`success`, `transaction`, `network` as a CAIP-2 id,
+                `payer`).
+              schema:
+                type: string
             X-PAYMENT-RESPONSE:
-              description: The receipt, JSON encoded.
+              description: |
+                For an x402 v1 payment: the SettlementResponse, base64 of its
+                JSON (`success`, `transaction`, `network` by name, `payer`).
               schema:
                 type: string
           content:
@@ -4312,11 +4374,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/X402PurchaseResult"
         "400":
-          description: No `sku_id`, or the body could not be parsed.
+          description: |
+            No `sku_id` or an unknown one, the body could not be parsed, or
+            the payment is malformed or sent in both payment headers.
         "401":
           description: Missing or invalid bearer token.
         "402":
-          description: Payment required; the body carries the terms to sign.
+          description: |
+            Payment required: the terms to sign, in x402 v2 in the
+            `PAYMENT-REQUIRED` header and in x402 v1 as the body. Also the
+            answer to a payment the terms or the facilitator refused, with
+            the reason as the terms' `error`; a refused settlement's
+            SettlementResponse (`success: false`, `errorReason`) is then in
+            `PAYMENT-RESPONSE` (v2) or `X-PAYMENT-RESPONSE` (v1).
+          headers:
+            PAYMENT-REQUIRED:
+              description: |
+                The x402 v2 terms: base64 of the JSON of
+                `#/components/schemas/X402PaymentRequiredV2`.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -4324,7 +4401,10 @@ paths:
         "404":
           description: x402 is not configured or not enabled on this deployment.
         "502":
-          description: Settlement failed at the facilitator.
+          description: |
+            The facilitator could not be asked or answered with an error, or
+            the grant failed after the payment settled (it is then retried
+            from the settle transaction).
 
   # ----- store and processor notifications -----
 
@@ -21715,6 +21795,11 @@ components:
           type: string
         price_usd:
           type: number
+        amount:
+          description: |
+            The price in atomic units of the asset, exactly as the terms quote
+            it (USDC has 6 decimals: "5000000" is $5.00).
+          type: string
         pro:
           description: True for the Pro-month sku, which grants the Pro entitlement. The data skus never do.
           type: boolean
@@ -21730,10 +21815,22 @@ components:
         - skus
       properties:
         x402_version:
+          description: The newest x402 protocol version spoken, 2.
           type: integer
-        networks:
+        x402_versions:
+          description: Every x402 protocol version spoken, newest first.
           type: array
           items:
+            type: integer
+        networks:
+          description: The networks, by name, as x402 v1 and `X402PurchaseArgs.network` name them.
+          type: array
+          items:
+            type: string
+        network_ids:
+          description: Each network's x402 v2 id (CAIP-2), by name.
+          type: object
+          additionalProperties:
             type: string
         asset:
           type: string
@@ -21744,7 +21841,7 @@ components:
 
     X402Accept:
       type: object
-      description: One set of payment terms the agent may satisfy.
+      description: One set of x402 v1 payment terms the agent may satisfy.
       required:
         - scheme
         - network
@@ -21774,10 +21871,18 @@ components:
           type: string
         maxTimeoutSeconds:
           type: integer
+        extra:
+          description: |
+            What the scheme needs to build the payment: the token's EIP-712
+            domain (`name`, `version`) on EVM networks, the facilitator's
+            `feePayer` (and `transactionVersions`, when it names them) on
+            Solana.
+          type: object
+          additionalProperties: true
 
     X402PaymentRequired:
       type: object
-      description: The body of a 402 response.
+      description: The x402 v1 terms, the body of a 402 response.
       required:
         - x402Version
         - error
@@ -21792,6 +21897,71 @@ components:
           items:
             $ref: "#/components/schemas/X402Accept"
 
+    X402ResourceInfo:
+      type: object
+      description: What an x402 v2 payment pays for.
+      required:
+        - url
+      properties:
+        url:
+          type: string
+        description:
+          type: string
+        mimeType:
+          type: string
+
+    X402AcceptV2:
+      type: object
+      description: One set of x402 v2 payment terms the agent may satisfy.
+      required:
+        - scheme
+        - network
+        - amount
+        - asset
+        - payTo
+        - maxTimeoutSeconds
+      properties:
+        scheme:
+          type: string
+        network:
+          description: The network's CAIP-2 id, such as `eip155:8453` (Base).
+          type: string
+        amount:
+          description: The price in atomic units of the asset.
+          type: string
+        asset:
+          description: The token's address on the network.
+          type: string
+        payTo:
+          type: string
+        maxTimeoutSeconds:
+          type: integer
+        extra:
+          description: The same scheme data as `X402Accept.extra`.
+          type: object
+          additionalProperties: true
+
+    X402PaymentRequiredV2:
+      type: object
+      description: |
+        The x402 v2 terms, which a 402 carries in its `PAYMENT-REQUIRED`
+        header as base64 of this object's JSON.
+      required:
+        - x402Version
+        - resource
+        - accepts
+      properties:
+        x402Version:
+          type: integer
+        error:
+          type: string
+        resource:
+          $ref: "#/components/schemas/X402ResourceInfo"
+        accepts:
+          type: array
+          items:
+            $ref: "#/components/schemas/X402AcceptV2"
+
     X402PurchaseArgs:
       type: object
       required: [sku_id]
@@ -21799,7 +21969,10 @@ components:
         sku_id:
           type: string
         network:
-          description: The network the agent intends to pay on. Must be one that was quoted. Optional when only one is configured.
+          description: |
+            The network the agent intends to pay on, by name. Must be one that
+            was quoted. Optional when only one is configured, and for an x402
+            v2 payment, which names its network itself.
           type: string
         email:
           description: Where to send the receipt. Optional.
@@ -21823,7 +21996,14 @@ components:
         transaction:
           type: string
         network:
+          description: The network, by name, whichever x402 version paid.
           type: string
+        payer:
+          description: The paying wallet, as the facilitator reported it.
+          type: string
+        x402_version:
+          description: The x402 protocol version the payment was made in.
+          type: integer
 
     # ----- store and processor notifications -----
 
