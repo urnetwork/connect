@@ -939,3 +939,52 @@ func TestExtenderActivatorWithNoPreviousStateStartsDue(t *testing.T) {
 	fixture.waitPost()
 	fixture.waitPost()
 }
+
+// Root cause: an operator that predates the webrtc carrier refuses a list
+// naming it as an unknown carrier, so an extender serving webrtc beside tcp
+// would be refused there for good (S8), the miner's other operators among
+// them. Observable: the refused post goes again at once without the carrier
+// and activates, in the same pass, and no later post names the carrier.
+func TestExtenderActivatorPostsWithoutWebRtcToAnOperatorThatPredatesIt(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierWebRtc}
+		fixture.operator.predatesWebRtc = true
+	}, nil)
+	fixture.waitPass()
+	for _, ipVersion := range []int{4, 6} {
+		refused := fixture.waitPost()
+		if refused.ipVersion != ipVersion || !slices.Contains(refused.args.Carriers, ExtenderCarrierWebRtc) {
+			t.Fatalf("post = v%d %v, expected v%d with webrtc first", refused.ipVersion, refused.args.Carriers, ipVersion)
+		}
+		again := fixture.waitPost()
+		if again.ipVersion != ipVersion || !slices.Equal(again.args.Carriers, []string{ExtenderCarrierTcp, ExtenderCarrierQuic}) {
+			t.Fatalf("post = v%d %v, expected v%d again without webrtc", again.ipVersion, again.args.Carriers, ipVersion)
+		}
+		if refused.postTime != again.postTime {
+			t.Fatalf("the post without webrtc went at %s, expected at once at %s", again.postTime, refused.postTime)
+		}
+		fixture.waitActivation()
+	}
+
+	fixture.activator.Reactivate()
+	for range 2 {
+		if post := fixture.waitPost(); slices.Contains(post.args.Carriers, ExtenderCarrierWebRtc) {
+			t.Fatalf("a later post named webrtc again: %v", post.args.Carriers)
+		}
+	}
+}
+
+// A host serving webrtc and no tcp has no carrier such an operator accepts,
+// so after the refusal it is held for its carriers, as one without tcp always
+// was, and posts nothing more.
+func TestExtenderActivatorHoldsAWebRtcOnlyHostForAnOperatorThatPredatesIt(t *testing.T) {
+	fixture := newTestActivatorFixtureWithPrepare(t, func(fixture *testActivatorFixture) {
+		fixture.carriers = []string{ExtenderCarrierQuic, ExtenderCarrierWebRtc}
+		fixture.operator.predatesWebRtc = true
+	}, nil)
+	fixture.waitHeldForCarrier()
+	fixture.expectFamilyPostCounts("after the refusal", 1, 1)
+	fixture.step(2 * time.Minute)
+	fixture.step(30 * time.Minute)
+	fixture.expectFamilyPostCounts("held for the carrier", 1, 1)
+}
