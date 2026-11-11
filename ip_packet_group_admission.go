@@ -7,6 +7,13 @@ import "time"
 // Policy preparation belongs to one synchronous input group, never a flow
 // cache. A refused group remains caller-owned while this bounded scope waits.
 type ipPacketGroupAdmission struct {
+	// Fresh native runs split only after the whole group's security and
+	// collapse gates. Child offers cannot cross a concurrent SYN generation.
+	partitionProtocol bool
+	protocolUpdate    *multiClientChannelUpdate
+	protocolEpoch     uint64
+	expectedUpdate    *multiClientChannelUpdate
+	expectedEpoch     uint64
 	nativeIngress     bool
 	partitionPureAcks bool
 	collapseRejected  bool

@@ -23,6 +23,23 @@ type multiH1ResidenceWire struct {
 	at      time.Time
 }
 
+// Bounded scalar observations from existing owner hooks; no retained wire roots.
+type privateH1ReplayObservation struct {
+	kind         string
+	at           time.Time
+	sequence     Id
+	number       uint64
+	message      Id
+	itemPresent  bool
+	recovery     sendRecoveryKind
+	sendCount    int
+	deferCount   int
+	resendAt     time.Time
+	cumulativeAt time.Time
+	resend       bool
+	promoted     bool
+}
+
 type multiH1ResidenceCarrier struct {
 	pair         *h1TLSResidencePair
 	sendA, sendB Transport
@@ -53,13 +70,15 @@ type multiH1ResidenceFixture struct {
 	probesTerminal         atomic.Uint64
 	requestAt              atomic.Int64
 	requestFailureAt       atomic.Int64
+	replayObservations     chan privateH1ReplayObservation
+	replayOmitted          atomic.Uint64
 }
 
 func newMultiH1ResidenceFixture(t *testing.T, certificate tls.Certificate, lifetime time.Duration) *multiH1ResidenceFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &multiH1ResidenceFixture{ctx: ctx, cancel: cancel, log: newRecordingLogger(),
-		errors: make(chan error, 16), wire: make(chan multiH1ResidenceWire, 256), ackRelease: make(chan struct{})}
+		errors: make(chan error, 16), wire: make(chan multiH1ResidenceWire, 256), ackRelease: make(chan struct{}), replayObservations: make(chan privateH1ReplayObservation, 512)}
 	settings := func(timeout time.Duration) *ClientSettings {
 		s := DefaultClientSettings()
 		s.Log = f.log
@@ -81,6 +100,49 @@ func newMultiH1ResidenceFixture(t *testing.T, certificate tls.Certificate, lifet
 		}
 		if event.Phase == SendPackLifecyclePhaseTerminal && event.MessageType == protocol.MessageType_IpIpPacketToProvider && event.Err != nil {
 			f.requestFailureAt.CompareAndSwap(0, time.Now().UnixNano())
+		}
+	}
+	f.settingsA.SendBufferSettings.beforeDueResendForTest = func(id sendSequenceId, number uint64) {
+		f.observeReplayOwner("due", id, number)
+	}
+	var cumulativeLock sync.Mutex
+	cumulativeSeen := make(map[Id]time.Time)
+	f.settingsA.SendBufferSettings.afterApplyAckSnapshotForTest = func(id sendSequenceId) {
+		if f.clientB == nil || id.Destination != f.clientB.ClientId() {
+			return
+		}
+		f.clientA.sendBuffer.mutex.Lock()
+		sequence := f.clientA.sendBuffer.sendSequences[id]
+		f.clientA.sendBuffer.mutex.Unlock()
+		if sequence == nil || sequence.lastCumulativeAckTime.IsZero() {
+			return
+		}
+		cumulativeLock.Lock()
+		changed := !cumulativeSeen[sequence.sequenceId].Equal(sequence.lastCumulativeAckTime)
+		cumulativeSeen[sequence.sequenceId] = sequence.lastCumulativeAckTime
+		cumulativeLock.Unlock()
+		if changed {
+			f.observeReplayOwner("cumulative", id, 0)
+		}
+	}
+	f.settingsA.SendBufferSettings.TransferWireMessageObserver = func(event TransferWireMessageObservation) {
+		wire := &protocol.TransferFrame{}
+		if err := ProtoUnmarshal(event.TransferFrameBytes, wire); err != nil || wire.Pack == nil {
+			return
+		}
+		sequenceId, err := IdFromBytes(wire.Pack.SequenceId)
+		if err != nil {
+			return
+		}
+		// A prepared initial write may run on its admitted caller, so this
+		// observer copies only its immutable event, never sender-owner state.
+		observation := privateH1ReplayObservation{kind: "wire", at: time.Now(), sequence: sequenceId,
+			number: event.SequenceNumber, message: event.MessageId, sendCount: event.SendCount,
+			resend: event.Resend, promoted: event.PromotedHead}
+		select {
+		case f.replayObservations <- observation:
+		default:
+			f.replayOmitted.Add(1)
 		}
 	}
 	f.clientA = NewClient(ctx, NewId(), NewNoContractClientOob(), f.settingsA)
@@ -124,6 +186,32 @@ func newMultiH1ResidenceFixture(t *testing.T, certificate tls.Certificate, lifet
 	f.addCarrier(t, certificate, false)
 	ready = true
 	return f
+}
+
+// The hooks run on the existing sender owner. Immutable queue snapshots are
+// copied before publication; the trace neither waits nor changes recovery state.
+func (f *multiH1ResidenceFixture) observeReplayOwner(kind string, id sendSequenceId, number uint64) {
+	if f.clientA == nil || f.clientB == nil || id.Destination != f.clientB.ClientId() {
+		return
+	}
+	f.clientA.sendBuffer.mutex.Lock()
+	sequence := f.clientA.sendBuffer.sendSequences[id]
+	f.clientA.sendBuffer.mutex.Unlock()
+	if sequence == nil {
+		return
+	}
+	observation := privateH1ReplayObservation{kind: kind, at: time.Now(), sequence: sequence.sequenceId,
+		number: number, cumulativeAt: sequence.lastCumulativeAckTime}
+	if item := sequence.resendQueue.GetBySequenceNumber(number); item != nil {
+		observation.itemPresent, observation.message = true, item.messageId
+		observation.recovery, observation.sendCount = item.recoveryKind, item.sendCount
+		observation.deferCount, observation.resendAt = item.timeoutDeferCount, item.resendTime
+	}
+	select {
+	case f.replayObservations <- observation:
+	default:
+		f.replayOmitted.Add(1)
+	}
 }
 
 func (f *multiH1ResidenceFixture) report(err error) {
@@ -589,6 +677,7 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 					}
 				}
 				requestCopies, replacementCopies, coveringAcks, exactNamingAcks := 0, 0, 0, 0
+				var requestCopyTimes []string
 				outbound := map[string]*protocol.Pack{string(request.MessageId): request}
 				type decodedWire struct {
 					fromA bool
@@ -614,6 +703,7 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 							t.Fatal("replacement changed reliable Pack identity")
 						}
 						requestCopies++
+						requestCopyTimes = append(requestCopyTimes, fmt.Sprintf("at=%s carrier=%d", event.at.Sub(start), event.carrier))
 						if event.carrier == 1 {
 							replacementCopies++
 						}
@@ -633,8 +723,42 @@ func TestMultiClientH1ResidenceHealthAndSamePeerReplacement(t *testing.T) {
 				if !survives && tc.permanent && f.requests.Load() != 0 {
 					t.Fatal("permanent blackhole produced data receipt")
 				}
-				if tc.replace && (tc.shared || tc.permanent) && (requestCopies > 5 || replacementCopies > 4) {
-					t.Fatalf("shared stall amplified replay beyond one immediate replacement flight: copies=%d replacement=%d", requestCopies, replacementCopies)
+				if tc.replace && (tc.shared || tc.permanent) {
+					t.Logf("H1_REPLAY_ATTRIBUTION actual_copy_times=%v omitted=%d", requestCopyTimes, f.replayOmitted.Load())
+					for len(f.replayObservations) != 0 {
+						event := <-f.replayObservations
+						var cumulativeAt, resendAt time.Duration
+						if !event.cumulativeAt.IsZero() {
+							cumulativeAt = event.cumulativeAt.Sub(start)
+						}
+						if !event.resendAt.IsZero() {
+							resendAt = event.resendAt.Sub(start)
+						}
+						t.Logf("H1_REPLAY_EVENT kind=%s at=%s sequence=%s number=%d message=%s item_present=%t recovery=%d send_count=%d defer_count=%d due_at=%s cumulative_at=%s resend=%t promoted=%t", event.kind, event.at.Sub(start), event.sequence, event.number, event.message, event.itemPresent, event.recovery, event.sendCount, event.deferCount, resendAt, cumulativeAt, event.resend, event.promoted)
+					}
+				}
+				if tc.replace && (tc.shared || tc.permanent) {
+					// The initial write was consumed above. Two ordinary cold-path
+					// retries precede replacement; its immediate replay starts the
+					// separate four-copy replacement flight. Pin every wire time,
+					// rather than conflating both phases in a total-copy ceiling.
+					wantCopies := []string{
+						"at=2s carrier=0", "at=6s carrier=0",
+						"at=8s carrier=1", "at=16s carrier=1",
+						"at=24s carrier=1", "at=32s carrier=1",
+					}
+					if f.settingsA.SendBufferSettings.MinResendInterval != 2*time.Second ||
+						f.settingsA.SendBufferSettings.MaxResendInterval != 8*time.Second {
+						t.Fatal("replay timeline fixture requires the shipping 2s/8s resend bounds")
+					}
+					if requestCopies != len(wantCopies) || replacementCopies != 4 || f.replayOmitted.Load() != 0 {
+						t.Fatalf("replay phase ownership changed: copies=%d replacement=%d omitted=%d", requestCopies, replacementCopies, f.replayOmitted.Load())
+					}
+					for index, want := range wantCopies {
+						if requestCopyTimes[index] != want {
+							t.Fatalf("replay copy %d=%s, want %s", index, requestCopyTimes[index], want)
+						}
+					}
 				}
 				requestElapsed := time.Duration(0)
 				if f.requestAt.Load() != 0 {

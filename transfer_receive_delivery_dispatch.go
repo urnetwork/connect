@@ -17,7 +17,7 @@ func (peer Peer) deliveryReceipt() *receiveDeliveryReceipt {
 // distinct amount, in addition to all still-live receive roots and metadata.
 // Classify TCP before provider publication; admission precedes any SACK lease.
 func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) bool {
-	if item.deliveryPrepared || !item.ack || self.receiveQueue == nil ||
+	if item.noBudget || item.deliveryPrepared || !item.ack || self.receiveQueue == nil ||
 		!self.receiveQueue.lifetimeBudget ||
 		!receiveDeliveryHasTcp(item.frames) {
 		return true
@@ -79,6 +79,9 @@ func receiveDeliveryHasTcp(frames []*protocol.Frame) bool {
 // not a failure: the held head keeps the cumulative ACK, and with it the
 // sender's byte window, where it is until a drain wakes the sequence.
 func (self *ReceiveSequence) holdHead(item *receiveItem) bool {
+	if item.deliverImmediately {
+		return false
+	}
 	if !item.ack {
 		return false
 	}
@@ -110,6 +113,11 @@ func (self *ReceiveSequence) deliveryWake() <-chan struct{} {
 }
 
 func (self *ReceiveSequence) needsDeliveryReceipts(items []*receiveItem, frames []*protocol.Frame) bool {
+	for _, item := range items {
+		if item.immediateReceipt != nil {
+			return true
+		}
+	}
 	if self.deliveryQueue != nil {
 		return true
 	}
@@ -130,6 +138,9 @@ func (self *ReceiveSequence) needsDeliveryReceipts(items []*receiveItem, frames 
 // batch receipts in holdHead and may retain a fresh head in its bounded hold.
 // An existing held item keeps its owner and SACK lease in either mode.
 func (self *ReceiveSequence) prepareReceiveDelivery(item *receiveItem) bool {
+	if item.deliverImmediately {
+		return true
+	}
 	if !item.ack || self.deliveryQueue == nil && !receiveDeliveryHasTcp(item.frames) {
 		return true
 	}
@@ -146,6 +157,11 @@ func (self *ReceiveSequence) prepareReceiveDelivery(item *receiveItem) bool {
 // A contract failure precedes dispatch, so the worker must undo a legacy
 // receipt reservation before its existing caller returns the packet roots.
 func (self *ReceiveSequence) discardReceiveDeliveryAdmission(item *receiveItem) {
+	if item.immediateReceipt != nil && self.immediateDeliveryQueue != nil {
+		self.immediateDeliveryQueue.discardAdmission(item)
+		item.immediateReceipt.immediateHistory.complete(item.immediateReceipt.immediateRange, item.immediateReceipt.immediateToken, false)
+		return
+	}
 	if self.deliveryQueue != nil {
 		self.deliveryQueue.discardAdmission(item)
 	}
@@ -154,7 +170,7 @@ func (self *ReceiveSequence) discardReceiveDeliveryAdmission(item *receiveItem) 
 // A TCP owner must fit before it can acquire a selective lease. Ordinary
 // callbacks retain their one-oversize-owner rule once earlier receipts drain.
 func (self *ReceiveSequence) receiveDeliveryFits(item *receiveItem) bool {
-	if !item.ack || !receiveDeliveryHasTcp(item.frames) {
+	if item.noBudget || !item.ack || !receiveDeliveryHasTcp(item.frames) {
 		return true
 	}
 	bytes := receiveDeliveryByteCount(item)
@@ -173,7 +189,7 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 		// An internal dispatcher panic must not strand later pre-admitted
 		// receipts or their roots. The current callback has its own defer.
 		for _, item := range items[nextItem:] {
-			q.discardAdmission(item)
+			self.discardReceiveDeliveryAdmission(item)
 			item.messagePoolReturn()
 		}
 	}()
@@ -181,6 +197,10 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 	// The fallback is for callers constructing unfiltered items directly.
 	offset := 0
 	for _, item := range items {
+		q = self.deliveryQueue
+		if item.immediateReceipt != nil {
+			q = self.immediateDeliveryQueue
+		}
 		count := item.deliverFrameCount
 		if !item.deliverFrameCountSet {
 			count = len(item.frames)
@@ -276,6 +296,9 @@ func (self *ReceiveSequence) sendDeliveredDuplicateAck(number uint64, id Id, tag
 func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePack, bool, bool) {
 	q := self.deliveryQueue
 	wakes := q.pump()
+	if self.immediateDeliveryQueue != nil {
+		wakes = append(wakes, self.immediateDeliveryQueue.pump()...)
+	}
 	var blocked *receiveItem
 	if self.receiveQueue != nil {
 		blocked = self.receiveQueue.PeekFirst()
@@ -293,11 +316,11 @@ func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePac
 			return nil, true, false
 		}
 	}
-	if blocked == nil && !q.pending() {
+	if blocked == nil && !q.pending() && (self.immediateDeliveryQueue == nil || !self.immediateDeliveryQueue.pending()) {
 		return nil, true, false
 	}
-	cases := make([]reflect.SelectCase, 0, 5+len(wakes))
-	for _, channel := range []any{self.ctx.Done(), self.packs, timeout, q.wake, self.closeNotify} {
+	cases := make([]reflect.SelectCase, 0, 6+len(wakes))
+	for _, channel := range []any{self.ctx.Done(), self.packs, timeout, q.wake, self.closeNotify, self.protocolPacks, self.immediateWake()} {
 		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(channel)})
 	}
 	for _, wake := range wakes {
@@ -309,7 +332,7 @@ func (self *ReceiveSequence) waitDelivery(timeout <-chan time.Time) (*ReceivePac
 	if chosen == 4 {
 		return nil, true, self.applyCloseRequests()
 	}
-	if chosen == 1 {
+	if chosen == 1 || chosen == 5 {
 		if !ok {
 			return nil, false, true
 		}

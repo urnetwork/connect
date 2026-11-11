@@ -144,6 +144,11 @@ message Pack {
     // a sender announces ahead only to a receiver that advertised
     // `Ack.contract_ahead`.
     bool contract_ahead = 13;
+
+    // Requests reliable delivery before a missing sequence predecessor. The
+    // receiver still validates identity, encryption, contracts and receipts.
+    // Older receivers ignore this field and keep ordinary ordered delivery.
+    bool deliver_immediately = 14;
 }
 
 
@@ -277,6 +282,16 @@ message Ack {
     // Field 10 rather than the design's 8: 8 and 9 were taken by the receive
     // window advertisement and the eviction notice while §39.1 was written.
     bool contract_ahead = 10;
+
+    // With selective=true, the exact named immediate original was delivered,
+    // not merely retained. It retires only that original, never predecessors.
+    // Older receivers omit this field and preserve ordered reliable custody.
+    bool delivered_immediately = 13;
+
+    // Actual ordinal of a deterministically identified immediate original.
+    // This is not independent ACK authority: the sender verifies the exact
+    // identity against its live original or known terminal-delivery range.
+    optional uint64 immediate_sequence_number = 14;
 }
 
 

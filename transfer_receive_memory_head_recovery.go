@@ -36,7 +36,7 @@ func (self *ReceiveBuffer) takeReceiveHeadRecoveryOwnerInSession(sequence *Recei
 	provider := scan.frameCount != 0 && scan.providerFrameCount == scan.frameCount &&
 		self.client != nil && self.client.reliableProviderIngress.Load()
 	opening := receiveConsumerOpeningHeadScan(scan)
-	if !consumer && !provider && !opening {
+	if !consumer && !provider && !opening && scan.frameCount == 0 {
 		return nil
 	}
 	rx := self.receiveBufferSettings.ReceiveQueueBudget
@@ -57,15 +57,29 @@ func (self *ReceiveBuffer) takeReceiveHeadRecoveryOwnerInSession(sequence *Recei
 	// RX. Its exact current original has the same bounded physical need as a
 	// missing predecessor, even without a later owner in its own list. It
 	// reserves independently; foreign RX promises and escrows stay untouched.
+	// Real quiet/promoted Heads carry a compact reference or full proof. A
+	// midstream switch can carry its full proof without Head. Storage is not
+	// proof authority: the normal worker still verifies before delivery/ACK.
+	establishedContractShape := !scan.legacy && scan.sequenceNumber != ^uint64(0) &&
+		(scan.head && scan.contractIdSet && !scan.contractFrameSet ||
+			!scan.contractIdSet && scan.contractFrameSet && scan.contractFrameType == int32(protocol.MessageType_TransferContract))
 	establishedCurrent := consumer && promise.establishedContract &&
-		scan.sequenceNumber == promise.ingressFloor && !scan.head &&
-		!scan.contractIdSet && !scan.contractFrameSet && receiveConsumerRecoverySession(scan) &&
+		scan.sequenceNumber == promise.ingressFloor &&
+		(establishedContractShape || !scan.head && !scan.contractIdSet && !scan.contractFrameSet) && receiveConsumerRecoverySession(scan) &&
 		(decrypted || sequence.session == nil || !sequence.session.RequireEncryption())
-	allowed := provider && promised ||
+	// Already-delivered originals need bounded physical decode custody to
+	// repeat their ACK under DATA pressure. They never enter delivery again.
+	// The ordinary worker retains duplicate/receipt and contract checks.
+	establishedPast := !scan.legacy && !(scan.contractIdSet && scan.contractFrameSet) &&
+		(!scan.contractFrameSet || scan.contractFrameType == int32(protocol.MessageType_TransferContract)) &&
+		scan.sequenceNumber < promise.ingressFloor &&
+		receiveConsumerRecoverySession(scan) &&
+		(decrypted || sequence.session == nil || !sequence.session.RequireEncryption())
+	allowed := establishedPast || provider && promised ||
 		consumer && (promised || consumerPrefix || establishedCurrent || sequence.receiveConsumerHeadBacklogWithLock(scan)) ||
 		opening && sequence.receiveConsumerOpeningBacklogWithLock()
 	if promise.closed || sequence.ctx.Err() != nil ||
-		scan.sequenceNumber != promise.ingressFloor && !consumerPrefix ||
+		scan.sequenceNumber != promise.ingressFloor && !consumerPrefix && !establishedPast ||
 		!allowed ||
 		sequence.receiveIngressDuplicateWithLock(scan.messageId, scan.sequenceNumber) ||
 		budget.totalByteCount.Load() > rx.totalByteCount.Load() || !budget.tryReserveWithLock(scan.retainedByteCount) {
@@ -111,7 +125,10 @@ func (self *ReceiveSequence) receiveConsumerRecoveryPrefixWithLock(number uint64
 	}
 	span := number - floor
 	required := ^uint64(0) >> (64 - span)
-	var present uint64
+	present := self.receiveConsumerSecuredImmediatePrefixMask(floor, number)
+	if present == required {
+		return true
+	}
 	visits := 0
 	for pack := self.holdPromise.ingressHead; pack != nil; pack = pack.ingressNext {
 		// This opportunistic path cannot turn a large retained flight into
@@ -125,7 +142,9 @@ func (self *ReceiveSequence) receiveConsumerRecoveryPrefixWithLock(number uint64
 			continue
 		}
 		item := &pack.decodedOwner.receiveItem
-		if item.memoryBudget != budget || item.sequenceNumber < floor || number <= item.sequenceNumber {
+		// Exact ordinary RX and recovery owners both pay a real predecessor.
+		// An arbitrary sibling, an outstanding loan or a returned owner does not.
+		if item.memoryBudget != budget && item.memoryBudget != self.receiveBufferSettings.ReceiveQueueBudget || item.sequenceNumber < floor || number <= item.sequenceNumber {
 			continue
 		}
 		present |= uint64(1) << (item.sequenceNumber - floor)
@@ -340,4 +359,127 @@ func receiveHeadRecoveryPack(pack *protocol.Pack) bool {
 		}
 	}
 	return true
+}
+
+// Secured protocol ordinals already completed delivery in this generation.
+// Copy only their bounded64-position coverage; pending or foreign history is
+// never physical DATA credit. The atomic pointer is safe on decoder ingress.
+func (self *ReceiveSequence) receiveConsumerSecuredImmediatePrefixMask(floor, number uint64) uint64 {
+	history := self.immediateDeliveryHistory.Load()
+	if history == nil || number <= floor || number-floor > 64 {
+		return 0
+	}
+	history.stateLock.Lock()
+	defer history.stateLock.Unlock()
+	if history.sequenceId != self.sequenceId {
+		return 0
+	}
+	var covered uint64
+	for _, span := range history.ranges {
+		if span == nil || !span.secured || span.pending || span.last < floor || span.first >= number {
+			continue
+		}
+		first, last := max(span.first, floor), min(span.last, number-1)
+		if first > last {
+			continue
+		}
+		width := last - first + 1
+		covered |= (^uint64(0) >> (64 - width)) << (first - floor)
+	}
+	return covered
+}
+
+// Compatibility callers cannot assert authenticated decryption. Physical
+// permission for application frames must honor the actual Required policy.
+func (self *ReceiveBuffer) takeReceiveFreshOpeningOwner(scan receiveMemoryPackScan, role sequenceTlsRole, companion bool) *decodedPackOwner {
+	return self.takeReceiveFreshOpeningOwnerInSession(scan, role, companion, false)
+}
+
+// A never-seen generation has no published backlog from which to derive
+// prefix permission. Its full-proof opening still needs physical memory
+// before the ordinary worker can validate it. Spend only available recovery
+// and ancestor bytes; create no sequence, promise, ACK or pending queue here.
+func (self *ReceiveBuffer) takeReceiveFreshOpeningOwnerInSession(scan receiveMemoryPackScan, role sequenceTlsRole, companion, decrypted bool) *decodedPackOwner {
+	budget := self.receiveBufferSettings.receiveHeadRecoveryBudget()
+	opening := receiveConsumerOpeningHeadScan(scan)
+	consumer := scan.frameCount != 0 && scan.consumerFrameCount == scan.frameCount
+	if budget == nil || self.client == nil || self.ctx == nil || !scan.loanSafe || scan.compatibility || scan.legacy ||
+		!scan.head || scan.nack || scan.contractAhead || scan.hasEncryptedControl ||
+		!scan.contractFrameSet || scan.contractFrameType != int32(protocol.MessageType_TransferContract) || scan.contractIdSet ||
+		!receiveConsumerRecoverySession(scan) || !opening && !consumer || scan.sequenceNumber == ^uint64(0) ||
+		!scan.pathMatches || scan.retainedByteCount <= 0 || scan.logicalLane > maxLogicalDataLaneCount ||
+		(role != sequenceTlsRoleClient && role != sequenceTlsRoleServer) ||
+		scan.path.DestinationId != self.client.ClientId() || scan.path.SourceId == ControlId ||
+		scan.path.SourceId == self.client.ClientId() || scan.path.IsStream() {
+		return nil
+	}
+	if consumer && !decrypted {
+		manager := self.client.encryptionSessionManager
+		if manager != nil && manager.RequireEncryption() && !manager.ReceiveNoSession(scan.path.SourceId) {
+			return nil
+		}
+	}
+	id := receiveSequenceId{Source: scan.path.SourceMask(), SequenceId: scan.sequenceId,
+		EncryptionRole: role, EncryptionCompanion: companion, LogicalLane: scan.logicalLane}
+	head := receiveSequenceHeadKey{Source: id.Source, EncryptionRole: role, EncryptionCompanion: companion,
+		ForceStream: scan.forceStream, CompanionContract: scan.companionContract, LogicalLane: scan.logicalLane}
+	// Keep closed, rejected and already-published generations outside this
+	// new physical path. A newer opening may still reach the existing normal
+	// supersession path, which cancels/refunds before its exact retry binds.
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.closed || self.ctx.Err() != nil || self.receiveSequences[id] != nil {
+		return nil
+	}
+	if rejected, ok := self.rejectedReceiveSequenceIds[head]; ok &&
+		(scan.sequenceId == rejected || scan.sequenceId.LessThan(rejected)) {
+		return nil
+	}
+	if current, ok := self.headReceiveSequenceIds[head]; ok && scan.sequenceId.LessThan(current.SequenceId) {
+		return nil
+	}
+	rx := self.receiveBufferSettings.ReceiveQueueBudget
+	root := budget.admissionRoot()
+	root.admissionLock.Lock()
+	defer root.admissionLock.Unlock()
+	if budget.totalByteCount.Load() > rx.totalByteCount.Load() || !budget.tryReserveWithLock(scan.retainedByteCount) {
+		return nil
+	}
+	owner := inboundDecodedPackOwners.take()
+	owner.receiveItem.transferItem = transferItem{messageId: scan.messageId, sequenceNumber: scan.sequenceNumber,
+		memoryBudget: budget, queueByteCount: scan.retainedByteCount}
+	pack := &owner.receivePack
+	pack.decodedOwner, pack.receiveMemoryOwned = owner, true
+	pack.Source, pack.SequenceId = id.Source, id.SequenceId
+	pack.EncryptionRole, pack.EncryptionCompanion = role, companion
+	pack.Unwrapped = !decrypted
+	owner.receiveItem.receiveFreshOpening = true
+	return owner
+}
+
+// The decoder and normal Client handoff keep this owner exclusive until this
+// root-locked bind. The copied physical provenance cannot authorize another
+// source, session, lane, message or generation. Concurrent private decoders
+// may each prepay bytes, but only the first exact live owner may register;
+// every refused caller retains its ordinary refund responsibility.
+func (self *ReceiveSequence) bindReceiveFreshOpeningWithLock(pack *ReceivePack) bool {
+	if pack != &pack.decodedOwner.receivePack || pack.Pack == nil || !pack.Pack.Head ||
+		pack.Pack.SequenceNumber == ^uint64(0) || pack.Pack.ContractFrame == nil || pack.Pack.ContractId != nil ||
+		pack.Pack.ContractFrame.MessageType != protocol.MessageType_TransferContract ||
+		!receiveHeadRecoveryOpeningPack(pack.Pack) && !receiveHeadRecoveryPack(pack.Pack) ||
+		len(pack.Pack.Frames) != 0 && pack.Unwrapped && self.session != nil && self.session.RequireEncryption() ||
+		self.receiveQueue == nil || !self.receiveQueue.lifetimeBudget ||
+		self.holdPromise.ingressFloor != 0 || self.holdPromise.ingressHead != nil ||
+		self.holdPromise.establishedContract || pack.Source != self.source || pack.SequenceId != self.sequenceId ||
+		pack.EncryptionRole != self.encryptionRole || pack.EncryptionCompanion != self.encryptionCompanion ||
+		pack.Pack.LogicalLane != self.transferKey.LogicalLane || pack.Pack.ForceStream != self.transferKey.ForceStream ||
+		pack.Pack.CompanionContract != self.transferKey.CompanionContract {
+		return false
+	}
+	messageId, messageErr := IdFromBytes(pack.Pack.MessageId)
+	sequenceId, sequenceErr := IdFromBytes(pack.Pack.SequenceId)
+	item := &pack.decodedOwner.receiveItem
+	return messageErr == nil && sequenceErr == nil && sequenceId == self.sequenceId &&
+		item.messageId == messageId && item.sequenceNumber == pack.Pack.SequenceNumber &&
+		!self.receiveIngressDuplicateWithLock(messageId, item.sequenceNumber)
 }

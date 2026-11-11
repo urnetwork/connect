@@ -575,8 +575,8 @@ func testClient[P comparable](
 // these tests use a `Tun` as the client network stack, bridged to a
 // `LocalUserNat` that egresses to servers on loopback. the bridge mirrors the
 // provider data path: tun read -> local user nat send, and
-// local user nat receive -> tun write. the bridge is lossless and in order in
-// both directions, which the tcp and udp sequence implementations assume.
+// local user nat receive -> tun write. Admitted packets preserve per-flow
+// order; an ordinary admission refusal never retires the shared reader.
 
 // connects the packet side of `tun` to `localUserNat`.
 // returns a function that removes the receive callback.
@@ -592,29 +592,35 @@ func bridgeTunToLocalUserNatWithBatchSize(
 	source TransferPath,
 	maximumPacketCount int,
 ) func() {
+	remove, _ := bridgeTunToLocalUserNatWithLifecycle(tun, localUserNat, source, maximumPacketCount)
+	return remove
+}
+
+// The focused refusal regression joins the real shared pump after cancellation.
+// Existing callers retain the same callback-removal API and cleanup order.
+func bridgeTunToLocalUserNatWithLifecycle(tun *Tun, localUserNat *LocalUserNat, source TransferPath, maximumPacketCount int) (func(), <-chan struct{}) {
+	done := make(chan struct{})
 	go HandleError(func() {
+		defer close(done)
 		packets := make([][]byte, max(1, maximumPacketCount))
 		for {
 			n, err := tun.ReadBatch(packets)
 			if err != nil {
 				return
 			}
-			// the local user nat owns the batch when send succeeds
-			batch := make([][]byte, n)
-			copy(batch, packets[0:n])
-			if !localUserNat.SendPackets(source, protocol.ProvideMode_Network, batch, -1) {
-				for _, packet := range batch {
-					MessagePoolReturn(packet)
-				}
-				return
-			}
+			// Use the same consuming batch entry as SDK/native callers. It owns
+			// accepted packets and returns refused ones; ordinary refusal must
+			// not stop this shared reader or double-return its packet roots.
+			localUserNat.SendPacketBatch(source, protocol.ProvideMode_Network, packets[:n], -1)
+			clear(packets[:n])
 		}
 	})
-	return localUserNat.AddReceivePacketCallback(func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
+	remove := localUserNat.AddReceivePacketCallback(func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte) {
 		// `Tun.Write` copies the packet into the gvisor stack,
 		// so the packet is not retained past the callback
 		tun.Write(packet)
 	})
+	return remove, done
 }
 
 // creates a deterministic payload so that corrupted, reordered,

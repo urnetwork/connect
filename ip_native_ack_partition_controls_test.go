@@ -95,9 +95,9 @@ func nativeAckPartitionMetadataLowerBound() ByteCount {
 		32*round(ByteCount(unsafe.Sizeof(IpPath{})))
 }
 
-// The range owner and full original graph must be funded before the route
-// observes bytes; discarded scalar/path slots cannot retain auxiliary roots.
-func TestNativeAckCompactionChargesThirtyTwoMemberMetadata(t *testing.T) {
+// The full original graph remains owned through serialization without DATA
+// permission; discarded scalar/path slots cannot retain auxiliary roots.
+func TestNativeAckCompactionRetainsThirtyTwoMemberGraph(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, data, ack := nativeAckPartitionCoveredFixture(t)
@@ -144,8 +144,8 @@ func TestNativeAckCompactionChargesThirtyTwoMemberMetadata(t *testing.T) {
 			}
 			fixture.update.stateLock.Unlock()
 			wireCharge.Store(int64(charge))
-			if budget.UsedByteCount() < baseline+charge {
-				t.Error("route write escaped the joint graph reservation")
+			if budget.UsedByteCount() != baseline {
+				t.Error("pure acknowledgement graph acquired DATA permission")
 			}
 		}
 		templates := nativeAckPartitionThirtyTwo(data, ack)
@@ -194,9 +194,9 @@ func TestNativeAckCompactionChargesThirtyTwoMemberMetadata(t *testing.T) {
 	})
 }
 
-// A joint reservation failure occurs before range allocation or any write.
-// Returning capacity admits a fresh identical burst without a double return.
-func TestNativeAckCompactionMetadataRefusalThenRetry(t *testing.T) {
+// Exhausted DATA permission cannot block a compacted protocol graph. Its
+// actual descriptor and terminal owner still follow the reliable lifecycle.
+func TestNativeAckCompactionFullDataBudgetKeepsProtocolGraph(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, data, ack := nativeAckPartitionCoveredFixture(t)
@@ -234,7 +234,7 @@ func TestNativeAckCompactionMetadataRefusalThenRetry(t *testing.T) {
 				fixture.parent.provideMode, nativeAckPartitionOwnPackets(t, fixture, templates...), 5*time.Second, membership)
 			return count, membership
 		}
-		before := time.Now()
+		before, terminals := time.Now(), fixture.senderTerminals.Load()
 		count, membership := offer()
 		synctest.Wait()
 		select {
@@ -252,9 +252,9 @@ func TestNativeAckCompactionMetadataRefusalThenRetry(t *testing.T) {
 		if graphCharge < nativeAckPartitionMetadataLowerBound() {
 			t.Fatal("metadata refusal premise lacks the original full graph charge")
 		}
-		held := budget.Available() - (graphCharge - 1)
+		held := budget.Available()
 		if held <= 0 || !budget.TryReserve(held) {
-			t.Fatal("metadata test could not leave one byte less than its exact graph")
+			t.Fatal("metadata test could not fill its unchanged DATA budget")
 		}
 		defer func() {
 			if held > 0 {
@@ -263,19 +263,28 @@ func TestNativeAckCompactionMetadataRefusalThenRetry(t *testing.T) {
 		}()
 		resume()
 		synctest.Wait()
-		if providerPackets.Load() != 0 || unwrittenRefusals.Load() != 1 || group.collapseOwner != nil ||
+		fixture.update.stateLock.Lock()
+		owner := group.collapseOwner
+		var retained ByteCount
+		if owner != nil {
+			retained = owner.budgetBytes
+		}
+		fixture.update.stateLock.Unlock()
+		if providerPackets.Load() != 1 || unwrittenRefusals.Load() != 0 || owner == nil || retained != 0 ||
+			group.completionFlags.Load()&(groupCompletionReturned|groupCompletionTerminal) != groupCompletionReturned|groupCompletionTerminal ||
+			fixture.senderTerminals.Load() != terminals+1 || budget.Available() != 0 ||
 			budget.UsedByteCount() != baseline+held || fixture.parent.ctx.Err() != nil || fixture.update.client.Load() != fixture.selected ||
 			time.Since(before) != 0 {
-			t.Fatalf("unfunded metadata acquired serializer ownership: provider=%d unwritten=%d owner=%p budget=%d held=%d elapsed=%s",
+			t.Fatalf("full DATA budget changed protocol graph ownership: provider=%d unwritten=%d owner=%p budget=%d held=%d elapsed=%s",
 				providerPackets.Load(), unwrittenRefusals.Load(), group.collapseOwner, budget.UsedByteCount(), held, time.Since(before))
 		}
 		budget.Release(held)
 		held = 0
 		count, membership = offer()
 		synctest.Wait()
-		if count != 1 || !slices.Equal(membership, want) || providerPackets.Load() != 1 || unwrittenRefusals.Load() != 1 ||
+		if count != 1 || !slices.Equal(membership, want) || providerPackets.Load() != 2 || unwrittenRefusals.Load() != 0 || fixture.senderTerminals.Load() != terminals+2 ||
 			budget.UsedByteCount() != baseline || time.Since(before) != 0 {
-			t.Fatalf("metadata capacity retry changed exact owners: count=%d membership=%v provider=%d unwritten=%d budget=%d elapsed=%s",
+			t.Fatalf("repeated protocol graph changed exact owners: count=%d membership=%v provider=%d unwritten=%d budget=%d elapsed=%s",
 				count, membership, providerPackets.Load(), unwrittenRefusals.Load(), budget.UsedByteCount(), time.Since(before))
 		}
 	})
@@ -325,8 +334,8 @@ func TestNativeAckCompactionQueueRefusalThenRetry(t *testing.T) {
 }
 
 // Dequeue and the actual provider acknowledgement may beat the enqueue
-// observer; metadata credit survives until that producer returns.
-func TestNativeAckCompactionCallbackBeforeReturnKeepsCharge(t *testing.T) {
+// observer; the graph remains owned until that producer returns, with no DATA charge.
+func TestNativeAckCompactionCallbackBeforeReturnKeepsGraph(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, data, ack := nativeAckPartitionCoveredFixture(t)
@@ -384,7 +393,7 @@ func TestNativeAckCompactionCallbackBeforeReturnKeepsCharge(t *testing.T) {
 		}
 		if providerPackets.Load() != 1 || flags&groupCompletionTerminal == 0 || flags&groupCompletionReturned != 0 ||
 			flags&groupCompletionCompactedMetadata == 0 || retainedCharge < nativeAckPartitionMetadataLowerBound() ||
-			budget.UsedByteCount() < baseline+retainedCharge || time.Since(before) != 0 {
+			budget.UsedByteCount() != baseline || time.Since(before) != 0 {
 			t.Fatalf("callback released compacted metadata before return: provider=%d flags=%x charge=%d budget=%d baseline=%d elapsed=%s",
 				providerPackets.Load(), flags, retainedCharge, budget.UsedByteCount(), baseline, time.Since(before))
 		}
@@ -400,15 +409,19 @@ func TestNativeAckCompactionCallbackBeforeReturnKeepsCharge(t *testing.T) {
 		default:
 			t.Fatal("released producer did not finish its native owner")
 		}
-		if budget.UsedByteCount() != baseline || group.completionFlags.Load()&groupCompletionCompactedMetadata == 0 || time.Since(before) != 0 {
-			t.Fatal("joined return did not release exactly one full metadata charge")
+		<-done
+		fixture.update.stateLock.Lock()
+		remainingGraph := group.collapseOwner.budgetBytes
+		fixture.update.stateLock.Unlock()
+		if remainingGraph != 0 || budget.UsedByteCount() != baseline || group.completionFlags.Load()&groupCompletionCompactedMetadata == 0 || time.Since(before) != 0 {
+			t.Fatal("joined return did not release exactly one full metadata graph")
 		}
 	})
 }
 
-// Fresh data follows the unchanged complete-group admission and actual socket
-// write, with the following pure acknowledgement kept in that same group.
-func TestNativeAckCompactionLeavesFreshDataGroupWhole(t *testing.T) {
+// Fresh DATA and its following acknowledgement keep original member order
+// while separate logical groups choose their own DATA admission policy.
+func TestNativeProtocolGroupsSeparateFreshDataFromAck(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, _, ack := nativeAckPartitionCoveredFixture(t)
@@ -425,20 +438,30 @@ func TestNativeAckCompactionLeavesFreshDataGroupWhole(t *testing.T) {
 				uploaded <- received
 			}
 		}()
-		var admitted atomic.Pointer[parsedPacketGroup]
+		var admitted [2]atomic.Pointer[parsedPacketGroup]
+		var admissionCount atomic.Int32
 		fixture.sender.settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
-			admitted.Store(target.(*parsedPacketGroup))
+			index := admissionCount.Add(1) - 1
+			if index < int32(len(admitted)) {
+				admitted[index].Store(target.(*parsedPacketGroup))
+			} else {
+				t.Error("fresh class runs acquired an extra logical owner")
+			}
 		}
 		before, drops := time.Now(), fixture.parent.TcpCollapseDropCount()
 		membership := []bool{false, false}
 		count := fixture.parent.SendNativePacketBatchWithResults(SourceId(fixture.sender.ClientId()),
 			fixture.parent.provideMode, nativeAckPartitionOwnPackets(t, fixture, data, nextAck), 5*time.Second, membership)
 		synctest.Wait()
-		group := admitted.Load()
-		if count != 2 || !slices.Equal(membership, []bool{true, true}) || group == nil || len(group.packets) != 2 ||
-			group.completionFlags.Load()&groupCompletionCompactedMetadata != 0 || fixture.parent.TcpCollapseDropCount() != drops || time.Since(before) != 0 {
-			t.Fatalf("fresh data group changed admission: count=%d membership=%v group=%p drops=%d elapsed=%s",
-				count, membership, group, fixture.parent.TcpCollapseDropCount()-drops, time.Since(before))
+		dataGroup, controlGroup := admitted[0].Load(), admitted[1].Load()
+		if count != 2 || !slices.Equal(membership, []bool{true, true}) || admissionCount.Load() != 2 ||
+			dataGroup == nil || controlGroup == nil || len(dataGroup.packets) != 1 || len(controlGroup.packets) != 1 ||
+			dataGroup.onlyPureTcpAcks() || !controlGroup.onlyPureTcpAcks() ||
+			dataGroup.completionFlags.Load()&groupCompletionCompactedMetadata != 0 ||
+			controlGroup.completionFlags.Load()&groupCompletionCompactedMetadata != 0 ||
+			fixture.parent.TcpCollapseDropCount() != drops || time.Since(before) != 0 {
+			t.Fatalf("fresh class runs lost exact admission: count=%d membership=%v groups=%p/%p admissions=%d drops=%d elapsed=%s",
+				count, membership, dataGroup, controlGroup, admissionCount.Load(), fixture.parent.TcpCollapseDropCount()-drops, time.Since(before))
 		}
 		select {
 		case actual := <-uploaded:
@@ -655,7 +678,7 @@ func TestNativeAckCompactionLeaseRefusalReceipt(t *testing.T) {
 // Withdrawing the selected owner between collapse and ACK admission enters
 // actual provider selection. Its race copy owns one parsed member but retains
 // all 32 original path slots until actual provider return selects the winner.
-func TestNativeAckCompactionRaceCloneKeepsOriginalPathCharge(t *testing.T) {
+func TestNativeAckCompactionRaceCloneKeepsOriginalPathGraph(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, data, ack := nativeAckPartitionCoveredFixture(t)
@@ -764,7 +787,7 @@ func TestNativeAckCompactionRaceCloneKeepsOriginalPathCharge(t *testing.T) {
 		fixture.update.stateLock.Unlock()
 		flags := group.completionFlags.Load()
 		if providerPackets.Load() != 1 || !pendingRace || flags&(groupCompletionReturned|groupCompletionTerminal) != groupCompletionReturned|groupCompletionTerminal ||
-			retainedCharge != charge || ByteCount(wireCharge.Load()) != charge || budget.UsedByteCount() < baseline+charge || time.Since(before) != 0 {
+			retainedCharge != charge || ByteCount(wireCharge.Load()) != charge || budget.UsedByteCount() != baseline || time.Since(before) != 0 {
 			t.Fatalf("acknowledged race clone released original metadata before promotion: provider=%d pending_race=%t flags=%x retained=%d wire=%d want=%d budget=%d elapsed=%s",
 				providerPackets.Load(), pendingRace, flags, retainedCharge, wireCharge.Load(), charge, budget.UsedByteCount(), time.Since(before))
 		}
@@ -824,10 +847,10 @@ func TestNativeAckCompactionPathReceiptChecksRepresentableCapacity(t *testing.T)
 	}
 }
 
-// A real readerless source first refuses after completing preparation. Restored
-// proof then rejects the full group at the late selected-client gate; one fresh
-// preparation reuses that descriptor for its pure acknowledgement only.
-func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
+// A real readerless source first prepares and refuses the exact DATA child.
+// Restored proof rejects that same child at the late gate; the separate ACK
+// child then prepares a fresh source registration without inheriting custody.
+func checkNativeProtocolRunPreparedRefusal(t *testing.T, throughMux bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -837,10 +860,10 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 		baselineB := budgetB.UsedByteCount()
 		budgetA := NewTransferMemoryBudget(128 * 1024)
 		var refusingOwner atomic.Pointer[groupDispositionQueueFixture]
-		var original atomic.Pointer[parsedPacketGroup]
-		var preparedA, settledA, compactedAfterRefusal, preparedB atomic.Bool
+		var parent, original, ackRun atomic.Pointer[parsedPacketGroup]
+		var preparedA, settledA, ackAfterDataRefusal, preparedB atomic.Bool
 		var aRegistration atomic.Uint64
-		var sourceCreates, enumerations, compactedGates, bAdmissions atomic.Int64
+		var sourceCreates, enumerations, ackRunGates, bAdmissions atomic.Int64
 		var lifecycleLock sync.Mutex
 		lifecyclePhases := map[uint64]uint8{}
 		lifecycleProblem := false
@@ -950,37 +973,46 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 		}
 		fixture.parent.beforePacketGroupGateForTest = func(_ *multiClientChannelUpdate, _ *multiClientChannel, group *parsedPacketGroup) {
 			if len(group.packets) == len(templates) {
-				if !original.CompareAndSwap(nil, group) && original.Load() != group {
-					t.Error("late-refusal control replaced its original descriptor")
+				if !parent.CompareAndSwap(nil, group) && parent.Load() != group {
+					t.Error("native batch replaced its authorized parent descriptor")
 				}
 				return
 			}
-			if group.completionFlags.Load()&groupCompletionCompactedMetadata == 0 {
+			if len(group.packets) == len(templates)-1 {
+				if !original.CompareAndSwap(nil, group) && original.Load() != group {
+					t.Error("refused DATA run replaced its prepared descriptor")
+				}
 				return
 			}
-			compactedGates.Add(1)
+			ackRunGates.Add(1)
+			ackRun.Store(group)
 			valid := false
 			func() {
 				fixture.update.stateLock.Lock()
 				defer fixture.update.stateLock.Unlock()
-				flags := group.completionFlags.Load()
-				valid = group == original.Load() && len(group.packets) == 1 && cap(group.packets) == 32 &&
-					group.retainedIpPathCount == 32 &&
+				dataRun := original.Load()
+				if dataRun == nil {
+					return
+				}
+				flags := dataRun.completionFlags.Load()
+				valid = parent.Load() != nil && group != parent.Load() && group != dataRun &&
+					len(group.packets) == 1 && cap(group.packets) == 1 && group.retainedIpPathCount == 0 &&
+					group.completionFlags.Load() == 0 && group.affinitySourceRegistration == 0 &&
+					len(dataRun.packets) == 31 && cap(dataRun.packets) == 31 &&
 					flags&(groupCompletionTracked|groupCompletionReturned) == groupCompletionTracked|groupCompletionReturned &&
-					flags&(groupCompletionAdmitted|groupCompletionTerminal) == 0 &&
-					group.collapseOwner == nil && group.completionClient == refusing.selected &&
-					group.affinitySourceRegistration == aRegistration.Load() &&
-					group.affinitySourceState&(affinitySourceReturned|affinitySourceSettled) == affinitySourceReturned|affinitySourceSettled
+					flags&(groupCompletionAdmitted|groupCompletionTerminal|groupCompletionCompactedMetadata) == 0 &&
+					dataRun.collapseOwner == nil && dataRun.completionClient == refusing.selected &&
+					dataRun.affinitySourceRegistration == aRegistration.Load() &&
+					dataRun.affinitySourceState&(affinitySourceReturned|affinitySourceSettled) == affinitySourceReturned|affinitySourceSettled
 			}()
-			// A refused source never took these bytes, and B has not yet been
-			// offered them. This verifies compaction preserves the original root.
 			valid = valid && bytes.Equal(group.packets[0].packet, ack) &&
 				&group.packets[0].packet[0] == &packets[len(packets)-1][0]
-			compactedAfterRefusal.Store(valid)
+			ackAfterDataRefusal.Store(valid)
 			if !valid {
-				t.Error("same descriptor did not retain its completed refusal state through compaction")
+				t.Error("ACK child inherited an unsettled DATA source or another original")
 			}
 		}
+
 		fixture.parent.groupRaceCandidatesForTest = func(group *parsedPacketGroup) []*multiClientChannel {
 			enumerations.Add(1)
 			valid := false
@@ -990,7 +1022,7 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 				flags := group.completionFlags.Load()
 				registration := group.affinitySourceRegistration
 				entry := fixture.update.affinitySources.entryWithLock(int(registration&0xff) - 1)
-				valid = group == original.Load() && len(group.packets) == len(templates) &&
+				valid = group == original.Load() && group != parent.Load() && len(group.packets) == len(templates)-1 && cap(group.packets) == len(templates)-1 &&
 					flags&(groupCompletionTracked|groupCompletionReturned) == groupCompletionTracked|groupCompletionReturned &&
 					flags&(groupCompletionAdmitted|groupCompletionTerminal|groupCompletionCompactedMetadata) == 0 &&
 					group.collapseOwner == nil && group.completionClient == refusing.selected && group.completionSelection == nil &&
@@ -1019,11 +1051,12 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 				fixture.update.stateLock.Lock()
 				defer fixture.update.stateLock.Unlock()
 				flags := group.completionFlags.Load()
-				valid = group == original.Load() && len(group.packets) == 1 && group.packets[0].pureTcpAck() &&
+				valid = group == ackRun.Load() && group != original.Load() && group != parent.Load() &&
+					len(group.packets) == 1 && cap(group.packets) == 1 && group.retainedIpPathCount == 0 && group.packets[0].pureTcpAck() &&
 					group.completionClient == fixture.selected && group.affinitySourceRegistration != 0 &&
 					group.affinitySourceRegistration != aRegistration.Load() &&
 					flags&(groupCompletionTracked|groupCompletionAdmitted|groupCompletionCompactedMetadata) ==
-						groupCompletionTracked|groupCompletionAdmitted|groupCompletionCompactedMetadata &&
+						groupCompletionTracked|groupCompletionAdmitted &&
 					flags&(groupCompletionReturned|groupCompletionTerminal) == 0 &&
 					group.affinitySourceState&affinitySourceAdmitted != 0 &&
 					group.affinitySourceState&(affinitySourceReturned|affinitySourceTerminal|affinitySourceMaterialized|affinitySourceFailed|affinitySourceSettled) == 0
@@ -1085,14 +1118,14 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 			t.Fatal("prepared refusal never produced an actual B source owner")
 		}
 		if count != 1 || !throughMux && !slices.Equal(membership, want) ||
-			sourceCreates.Load() != 1 || enumerations.Load() != 1 || compactedGates.Load() != 1 || bAdmissions.Load() != 1 ||
-			!preparedA.Load() || !settledA.Load() || !compactedAfterRefusal.Load() || !preparedB.Load() ||
+			sourceCreates.Load() != 1 || enumerations.Load() != 1 || ackRunGates.Load() != 1 || bAdmissions.Load() != 1 ||
+			!preparedA.Load() || !settledA.Load() || !ackAfterDataRefusal.Load() || !preparedB.Load() ||
 			group.collapseOwner != nil || budgetA.UsedByteCount() != 0 || budgetB.UsedByteCount() != baselineB ||
 			len(refusing.route) != 0 || providerPackets.Load() != 0 ||
 			fixture.parent.TcpCollapseDropCount() != drops+31 || time.Since(before) != 0 {
-			t.Fatalf("PREPARED_REFUSAL_LOST_NATIVE_ACK_REOFFER: entry_has_indexed_results=%t count=%d membership=%v creates=%d enumerations=%d compacted_gates=%d B_admissions=%d prepared_A=%t settled_A=%t compacted=%t prepared_B=%t owner=%p budget_A=%d budget_B=%d provider=%d drops=%d elapsed=%s",
-				!throughMux, count, membership, sourceCreates.Load(), enumerations.Load(), compactedGates.Load(), bAdmissions.Load(),
-				preparedA.Load(), settledA.Load(), compactedAfterRefusal.Load(), preparedB.Load(), group.collapseOwner,
+			t.Fatalf("PROTOCOL_RUN_REFUSAL_LOST_NATIVE_ACK_REOFFER: entry_has_indexed_results=%t count=%d membership=%v creates=%d enumerations=%d compacted_gates=%d B_admissions=%d prepared_A=%t settled_A=%t compacted=%t prepared_B=%t owner=%p budget_A=%d budget_B=%d provider=%d drops=%d elapsed=%s",
+				!throughMux, count, membership, sourceCreates.Load(), enumerations.Load(), ackRunGates.Load(), bAdmissions.Load(),
+				preparedA.Load(), settledA.Load(), ackAfterDataRefusal.Load(), preparedB.Load(), group.collapseOwner,
 				budgetA.UsedByteCount(), budgetB.UsedByteCount(), providerPackets.Load(), fixture.parent.TcpCollapseDropCount()-drops, time.Since(before))
 		}
 		for index, witness := range witnesses {
@@ -1114,8 +1147,8 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 			t.Fatal("actual A refusal did not publish each lifecycle phase exactly once")
 		}
 		charge := group.sendGroupMemoryByteCount()
-		if charge < nativeAckPartitionMetadataLowerBound() {
-			t.Fatal("prepared-refusal reuse lost the original full metadata charge")
+		if charge != (ByteCount(unsafe.Sizeof(tcpCollapseGroup{}))+63)/64*64 {
+			t.Fatal("fresh ACK child inherited another run's promotion graph")
 		}
 		resumeB()
 		synctest.Wait()
@@ -1139,12 +1172,12 @@ func checkNativeAckCompactionPreparedRefusal(t *testing.T, throughMux bool) {
 	})
 }
 
-// The indexed native path must reset a previously refused descriptor safely.
-func TestNativeAckCompactionPreparedRefusalReoffersSameDescriptor(t *testing.T) {
-	checkNativeAckCompactionPreparedRefusal(t, false)
+// Indexed native input settles the DATA child before a fresh ACK source owns bytes.
+func TestNativeProtocolRunsPreparedRefusalPreservesChildCustody(t *testing.T) {
+	checkNativeProtocolRunPreparedRefusal(t, false)
 }
 
-// The concrete mux count-only bridge must preserve that same exact custody.
-func TestUpgradeMuxAckCompactionPreparedRefusalReoffersSameDescriptor(t *testing.T) {
-	checkNativeAckCompactionPreparedRefusal(t, true)
+// The concrete mux count-only bridge preserves both exact child lifecycles.
+func TestUpgradeMuxProtocolRunsPreparedRefusalPreservesChildCustody(t *testing.T) {
+	checkNativeProtocolRunPreparedRefusal(t, true)
 }

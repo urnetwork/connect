@@ -24,7 +24,17 @@ type establishedHeadGuardFixture struct {
 }
 
 func newEstablishedHeadGuardFixture(t *testing.T) *establishedHeadGuardFixture {
+	return newEstablishedHeadGuardFixtureWithShape(t, "implicit", 1)
+}
+
+// Wire shapes and all hard capacities are selected before any allocation.
+// The full-proof bytes below are decoder-envelope metadata only; signed wire
+// verification and contract-missing recovery use the separate live fixtures.
+func newEstablishedHeadGuardFixtureWithShape(t *testing.T, shape string, copies int) *establishedHeadGuardFixture {
 	t.Helper()
+	if copies < 1 {
+		t.Fatal("guard requires at least one real pressure owner")
+	}
 	assertMessagePoolOwnership(t)
 	path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
 	var frames []*protocol.Frame
@@ -38,18 +48,30 @@ func newEstablishedHeadGuardFixture(t *testing.T) *establishedHeadGuardFixture {
 	}
 	pack := sendPackFrame{messageId: NewId(), sequenceId: NewId(), sequenceNumber: 9, frames: frames,
 		logicalLane: 3, forceStream: true, companionContract: true}
+	switch shape {
+	case "implicit":
+	case "compact":
+		id := NewId()
+		pack.head, pack.contractId = true, &id
+	case "full", "switch":
+		pack.head = shape == "full"
+		pack.contractFrame = &protocol.Frame{MessageType: protocol.MessageType_TransferContract, MessageBytes: []byte{0x08, 0x01}}
+	default:
+		t.Fatal("unknown established-head guard wire shape")
+	}
 	wire := MessagePoolCopy(receiveMemoryScanTestWire(path, pack.appendPack(nil), false))
 	scan, status := scanReceiveMemoryPack(wire, path)
-	if status != receiveMemoryPackScanReady || !scan.loanSafe || scan.head || scan.contractIdSet || scan.contractFrameSet ||
+	if status != receiveMemoryPackScanReady || !scan.loanSafe || scan.head != (shape == "compact" || shape == "full") ||
+		scan.contractIdSet != (shape == "compact") || scan.contractFrameSet != (shape == "full" || shape == "switch") ||
 		scan.consumerFrameCount != 8 || scan.frameCount != 8 || scan.retainedByteCount <= 0 {
 		MessagePoolReturn(wire)
 		t.Fatal("established-head guard has no complete consumer allocation envelope")
 	}
 	cost := scan.retainedByteCount
-	root := NewTransferMemoryBudget(4 * cost)
-	parent := NewTransferMemoryBudgetWithParent(3*cost, root)
-	rx := NewTransferMemoryBudgetWithParent(cost, parent)
-	head := NewTransferMemoryBudgetWithParent(cost, parent)
+	root := NewTransferMemoryBudget(ByteCount(2*copies+2) * cost)
+	parent := NewTransferMemoryBudgetWithParent(ByteCount(2*copies+1)*cost, root)
+	rx := NewTransferMemoryBudgetWithParent(ByteCount(copies)*cost, parent)
+	head := NewTransferMemoryBudgetWithParent(ByteCount(copies)*cost, parent)
 	settings := DefaultReceiveBufferSettingsWithBufferSize(64)
 	settings.ReceiveQueueBudget, settings.ReceiveHeadRecoveryBudget = rx, head
 	settings.ReceiveQueueRetainedByteAccounting = true
@@ -79,8 +101,10 @@ func newEstablishedHeadGuardFixture(t *testing.T) *establishedHeadGuardFixture {
 			}
 		}
 	})
-	f.allocate(t, rx)
-	if rx.Available() != 0 || head.Available() != cost || parent.Available() < cost || root.Available() < cost ||
+	for range copies {
+		f.allocate(t, rx)
+	}
+	if rx.Available() != 0 || head.Available() != ByteCount(copies)*cost || parent.Available() < cost || root.Available() < cost ||
 		sequence.holdPromise.ingressHead != nil || sequence.holdPromise.set || sequence.holdPromise.reservedByteCount != 0 {
 		t.Fatal("established-head guard did not isolate foreign-only RX pressure")
 	}
@@ -114,6 +138,9 @@ func (self *establishedHeadGuardFixture) decode(t *testing.T, owner *decodedPack
 	owner.receivePack.MessageByteCount = MessageByteCount(owner.pack.Frames)
 	owner.receiveItem.decodedOwner = owner
 	physical := MessagePoolRootByteCount(wire) + owner.metadataQueueByteCount()
+	if owner.pack.ContractFrame != nil {
+		physical += MessagePoolRootByteCount(owner.pack.ContractFrame.MessageBytes)
+	}
 	for _, frame := range owner.pack.Frames {
 		physical += MessagePoolRootByteCount(frame.MessageBytes)
 	}
@@ -188,7 +215,8 @@ func TestReceiveConsumerEstablishedHeadRejectsUnknownAndWireClasses(t *testing.T
 		{"unknown-contract-id", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) {
 			s.contractIdSet, s.contractId = true, NewId()
 		}},
-		{"proof", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) {
+		{"legacy-proof", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) {
+			s.legacy = true
 			s.contractFrameSet = true
 			s.contractFrameType = int32(protocol.MessageType_TransferContract)
 		}},
@@ -208,7 +236,6 @@ func TestReceiveConsumerEstablishedHeadRejectsUnknownAndWireClasses(t *testing.T
 			s.providerFrameCount = s.frameCount
 		}},
 		{"zero-cost", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) { s.retainedByteCount = 0 }},
-		{"past", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) { s.sequenceNumber-- }},
 		{"future", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) { s.sequenceNumber++ }},
 		{"future-span65", func(_ *establishedHeadGuardFixture, s *receiveMemoryPackScan) { s.sequenceNumber += 65 }},
 	} {

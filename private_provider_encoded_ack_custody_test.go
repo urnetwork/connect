@@ -16,9 +16,10 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// Both arms hold ten actual one-ACK originals and their missing-head promise.
-// Only the head's frame count changes. TCP's worker is held before its run;
-// the established pure-ACK entry still applies directly through the real NAT.
+// Every pure ACK uses the actual IP producer policy: reliable, no DATA byte
+// charge and immediate delivery. A separate actual DATA callback fills RX;
+// the held NAT boundary retains one encoded owner and one queued successor
+// until its real ACK recycles the unchanged immediate count-one slot.
 func testPrivateProviderEncodedAckCustody(t *testing.T, headFrameCount int) {
 	testPrivateProviderEncodedAckCustodyWithCancel(t, headFrameCount, false)
 }
@@ -152,148 +153,130 @@ func testPrivateProviderEncodedAckCustodyWithCancel(t *testing.T, headFrameCount
 			}
 			return result
 		}
-		originals := make(map[uint64]*windowRoundFrame, 11)
 		ackCounts := make(map[uint64]int, 11)
-		for number := uint64(1); number <= 11; number++ {
-			count := 1
-			if number == 1 {
-				count = headFrameCount
-			}
+		enqueue := func(number uint64, count int) {
 			batch := frames(count)
+			if !protocolOnlyFrames(batch) || !immediateIpAckFrames(batch) {
+				for _, frame := range batch {
+					MessagePoolReturn(frame.MessageBytes)
+				}
+				t.Fatal("actual pure ACK batch does not qualify for the production protocol policy")
+			}
 			if !f.sender.SendMultiWithTimeout(batch, f.receiver.ClientId(), func(err error) {
 				if err == nil {
 					f.ackedCount++
 					ackCounts[number]++
 				}
-			}, time.Second) {
+			}, time.Second, NoBudget(), DeliverImmediately()) {
 				for _, frame := range batch {
 					MessagePoolReturn(frame.MessageBytes)
 				}
-				t.Fatal("actual sender refused encoded pure ACK original")
+				t.Fatal("actual sender refused its pure ACK owner")
 			}
+		}
+		capture := func(number uint64, count int) *windowRoundFrame {
 			original := f.takePack(number)
-			if original.pack.Nack || original.pack.SequenceNumber != number || len(original.pack.Frames) != count ||
+			if original.pack.Nack || !original.pack.DeliverImmediately || !protocolOnlyPack(original.pack) ||
+				original.pack.SequenceNumber != number || len(original.pack.Frames) != count ||
 				!bytes.Equal(original.pack.SequenceId, warm.pack.SequenceId) {
-				t.Fatal("pure ACK batch lost its reliable source sequence or frame count")
+				t.Fatal("pure ACK original lost its actual source identity, policy or frame count")
 			}
-			originals[number] = original
+			privateProviderAssertOriginalPending(t, f, original.pack, true, true)
+			privateProviderAssertImmediateCount(t, f, original.pack, 1)
+			return original
 		}
-		cost := func(original *windowRoundFrame) (ByteCount, ByteCount) {
-			scan, status := scanReceiveMemoryPack(original.bytes, TransferPath{SourceId: f.sender.ClientId(), DestinationId: f.receiver.ClientId()})
-			probe := &receiveItem{transferItem: transferItem{queueByteCount: scan.retainedByteCount}, ack: true, frames: original.pack.Frames}
-			if status != receiveMemoryPackScanReady || !scan.loanSafe || scan.nack || !sequence.prepareReceiveDeliveryCredit(probe) || !probe.deliveryPrepared {
-				t.Fatal("encoded ACK did not have a paid decode and downstream-delivery shape")
-			}
-			return scan.retainedByteCount, probe.QueueByteCount()
-		}
-		headDecode, headFull := cost(originals[1])
-		tailDecode, tailFull := cost(originals[2])
-		if headDecode <= 0 || headFull <= headDecode || tailFull <= tailDecode ||
-			(headFrameCount == 1 && headFull != tailFull) ||
-			(headFrameCount == 2 && !(headDecode <= tailFull && tailFull < headFull)) ||
-			(headFrameCount > 2 && !(tailFull < headDecode && headFull <= 11*tailFull)) {
-			t.Fatalf("ACK C/D geometry does not isolate the intended admission stage: head=%d/%d tail=%d/%d", headDecode, headFull, tailDecode, tailFull)
-		}
-		repairMetadata, rxTarget := privateProviderRepairFixtureGeometry(t, sequence, tailFull, 10)
-		rx.SetTotalByteCount(rxTarget)
-		recovery.SetTotalByteCount(rx.TotalByteCount())
-		owners := make(map[uint64]*receiveItem, 10)
-		for number := uint64(2); number <= 11; number++ {
-			f.forward(originals[number], f.receiverIn)
-			item := sequence.receiveQueue.GetBySequenceNumber(number)
-			if item == nil || !item.committed || !item.ack || item.decodedOwner == nil ||
-				item.QueueByteCount() != tailFull || !item.deliveryPrepared || item.deliveryPrepaid <= 0 {
-				t.Fatal("later pure ACK was not a real committed fully prepaid owner")
-			}
-			owners[number] = item
+		feedback := func() {
 			for len(f.receiverOut) != 0 {
-				ack := f.take(f.receiverOut)
-				if ack.ack == nil || !ack.ack.Selective || !bytes.Equal(ack.ack.MessageId, originals[number].pack.MessageId) {
-					t.Fatal("later pure ACK did not acquire its actual selective promise")
+				wire := f.take(f.receiverOut)
+				if wire.ack == nil {
+					if wire.pack == nil || len(wire.pack.Frames) != 1 ||
+						wire.pack.Frames[0].MessageType != protocol.MessageType_IpIpProviderDiagnostics {
+						t.Fatal("unexpected reverse provider feedback")
+					}
+					continue
 				}
-				f.forward(ack, f.senderIn)
+				f.forward(wire, f.senderIn)
 			}
 		}
-		privateProviderAssertRepairFixtureCustody(t, sequence, repairMetadata, 10)
-		if rx.UsedByteCount() != rx.TotalByteCount() || sequence.holdPromise.reservedByteCount != tailFull ||
-			sequence.nextSequenceNumber != 1 || sequence.receiveQueue.Len() != 10 || len(entered) != 0 ||
-			f.ackedCount != 1 || tcp.returnByteCount != retainedBefore || root.Available() < headFull {
-			t.Fatal("committed ACK tails did not isolate RX from the shared root and actual retained return chunk")
-		}
-		t.Logf("[provider-encoded-ack-before] head_frames=%d head_c=%d head_d=%d tail_c=%d tail_d=%d prefix=%d rx_used=%d rx_cap=%d root_spare=%d return_chunk=%d committed=10", headFrameCount, headDecode, headFull, tailDecode, tailFull, tailFull, rx.UsedByteCount(), rx.TotalByteCount(), root.Available(), retainedBefore)
-		before := f.receiver.ReceiveStats()
-		f.forward(originals[1], f.receiverIn)
-		if len(entered) == 0 || tcp.returnByteCount != retainedBefore || f.ackedCount != 1 {
-			t.Fatal("provider recovery did not admit the original encoded head while retaining its inner chunk; manual capacity rescue is forbidden")
-		}
-		if rx.TotalByteCount() != rxTarget || recovery.TotalByteCount() != rx.TotalByteCount() ||
-			(headFrameCount == 1 && recovery.UsedByteCount() != 0) ||
-			(headFrameCount > 1 && recovery.UsedByteCount() <= 0) ||
-			root.UsedByteCount() != rx.UsedByteCount()+recovery.UsedByteCount()+natBudget.UsedByteCount() {
-			t.Fatal("provider recovery changed a ceiling or omitted/double-charged the child owner")
-		}
-		for _, item := range owners {
-			if !item.committed || item.memoryBudget != rx || item.decodedOwner == nil || !item.decodedOwner.receivePack.receiveMemoryOwned {
-				t.Fatal("provider head recovery evicted, replaced or released an accepted ACK tail before actual delivery")
-			}
+		pressure := newPrivateProviderProtocolDataPressure(t, rx)
+		defer pressure.close()
+		before, childBefore := f.receiver.ReceiveStats(), recovery.Stats()
+		enqueue(1, headFrameCount)
+		head := capture(1, headFrameCount)
+		f.forward(head, f.receiverIn)
+		privateProviderAssertProtocolReceiptCustody(t, sequence, 1)
+		enqueue(2, 1)
+		privateProviderAssertQueuedImmediateSuccessor(t, f, head.pack)
+		pressure.check(t)
+		if len(entered) == 0 || tcp.returnByteCount != retainedBefore || f.ackedCount != 1 ||
+			sequence.nextSequenceNumber != 1 || recovery.Stats() != childBefore ||
+			root.UsedByteCount() != rx.UsedByteCount()+natBudget.UsedByteCount() {
+			t.Fatal("count-one protocol/NAT barrier lost actual custody, spent DATA credit or falsely ACKed")
 		}
 		if cancelAfterAdmission {
+			pressure.close()
 			closeOwners()
 			if f.ackedCount != 1 || root.UsedByteCount() != 0 || recovery.UsedByteCount() != 0 || tcp.returnByteCount != 0 {
-				t.Fatal("canceled provider head falsely acknowledged delivery or retained its real return chunk/child")
+				t.Fatal("cancellation falsely completed the encoded first owner or its accepted unencoded successor")
 			}
-			t.Logf("[provider-encoded-ack-canceled] head_frames=%d cumulative=1 root=0 child=0 nat=0 return_chunk=0 joined=true", headFrameCount)
+			t.Logf("[provider-encoded-ack-canceled] head_frames=%d encoded=1 queued=1 immediate_limit=1 cumulative=1 root=0 child=0 nat=0 joined=true", headFrameCount)
 			return
 		}
-		t.Logf("[provider-encoded-ack-natural-recovery] head_frames=%d head_c=%d head_d=%d child_used=%d retries=0 manual_rescue=false", headFrameCount, headDecode, headFull, recovery.UsedByteCount())
 		close(gate)
 		synctest.Wait()
-		// Provider diagnostics is a separate reverse reliable Pack. Accept only
-		// that known telemetry while applying every real Transfer ACK.
-		for len(f.receiverOut) != 0 {
-			feedback := f.take(f.receiverOut)
-			if feedback.ack == nil {
-				if feedback.pack == nil || len(feedback.pack.Frames) != 1 ||
-					feedback.pack.Frames[0].MessageType != protocol.MessageType_IpIpProviderDiagnostics {
-					t.Fatal("unexpected reverse provider feedback")
-				}
-				continue
-			}
-			f.forward(feedback, f.senderIn)
+		privateProviderAssertReturnFrontier(t, tcp, 1780)
+		privateProviderAssertOriginalPending(t, f, head.pack, true, true)
+		pressure.check(t)
+		feedback()
+		if f.ackedCount != 2 || ackCounts[1] != 1 {
+			t.Fatal("only the actual head delivery ACK may recycle the occupied immediate slot")
 		}
-		if f.ackedCount != 12 || f.deliveredCount != 11+headFrameCount || sequence.nextSequenceNumber != 12 ||
-			sequence.receiveQueue.Len() != 0 || rx.UsedByteCount() != 0 || tcp.returnByteCount != 0 ||
-			tcp.returnHead != len(tcp.returnChunks) || len(tcp.sendItems) != 1 ||
+		privateProviderAssertOriginalRetired(t, f, head.pack)
+		for number := uint64(2); number <= 11; number++ {
+			if number > 2 {
+				enqueue(number, 1)
+			}
+			original := capture(number, 1)
+			f.forward(original, f.receiverIn)
+			privateProviderAssertReturnFrontier(t, tcp, 1780)
+			privateProviderAssertOriginalPending(t, f, original.pack, true, true)
+			pressure.check(t)
+			feedback()
+			if ackCounts[number] != 1 || f.ackedCount != int(number)+1 {
+				t.Fatal("real ACK train skipped or duplicated a terminal callback while recycling count one")
+			}
+			privateProviderAssertOriginalRetired(t, f, original.pack)
+			privateProviderAssertImmediateCount(t, f, original.pack, 0)
+		}
+		if f.deliveredCount != 11+headFrameCount || sequence.nextSequenceNumber != 12 ||
+			sequence.receiveQueue.Len() != 0 || rx.Stats() != pressure.before || recovery.Stats() != childBefore ||
+			len(tcp.sendItems) != 1 || f.receiver.ReceiveStats().ReceiveDecodePressureDropCount != before.ReceiveDecodePressureDropCount ||
 			f.receiver.ReceiveStats().ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount ||
 			f.receiver.ReceiveStats().ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount {
-			t.Fatalf("pure ACKs did not retire the actual return chunk and their Transfer owners: ack=%d delivered=%d next=%d rx=%d chunk=%d queued=%d", f.ackedCount, f.deliveredCount, sequence.nextSequenceNumber, rx.UsedByteCount(), tcp.returnByteCount, len(tcp.sendItems))
+			t.Fatal("actual count-one ACK train did not close protocol ownership without changing DATA custody")
 		}
-		for number := uint64(1); number <= 11; number++ {
-			if ackCounts[number] != 1 {
-				t.Fatal("encoded ACK recovery skipped or duplicated an original cumulative callback")
-			}
-		}
+		pressure.close()
 		closeOwners()
 		t.Logf("[provider-encoded-ack-complete] head_frames=%d returned_chunk=%d callbacks=12 committed_evictions=0 root=0 rx=0 nat=0 joined=true", headFrameCount, retainedBefore)
 	})
 }
 
-// An equal-size pure ACK head uses the promised bytes without new permission.
+// One real pure ACK remains uncharged but owned until its actual delivery ACK.
 func TestPrivateProviderEncodedSingleAckRetiresReturnChunk(t *testing.T) {
 	testPrivateProviderEncodedAckCustody(t, 1)
 }
 
-// The historical arm is expected to fail only after full rescue/ownership proof.
+// A two-frame pure-ACK original has the same zero-DATA policy and real custody.
 func TestPrivateProviderEncodedDoubleAckGrowthProgress(t *testing.T) {
 	testPrivateProviderEncodedAckCustody(t, 2)
 }
 
-// A larger raw-TCP head also recovers when C exceeds the committed promise.
+// Eight actual ACK frames remain bounded by normal count and ownership rules.
 func TestPrivateProviderEncodedEightAckPredecodeProgress(t *testing.T) {
 	testPrivateProviderEncodedAckCustody(t, 8)
 }
 
-// Real provider cancellation ends the child-funded receipt before TCP applies it.
+// Cancellation before actual NAT admission returns every uncharged ACK owner.
 func TestPrivateProviderEncodedDoubleAckCancellationReturnsOwners(t *testing.T) {
 	testPrivateProviderEncodedAckCustodyWithCancel(t, 2, true)
 }

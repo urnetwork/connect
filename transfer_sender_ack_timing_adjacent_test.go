@@ -44,10 +44,10 @@ func TestRttReceiverTimingKeepsRawRecoveryAndPairedWindowResidence(t *testing.T)
 	if got := unsafe.Sizeof(rttWindowItem{}); got != 40 {
 		t.Fatalf("paired timing ring record size=%d want40", got)
 	}
-	if got := unsafe.Sizeof(sendItem{}); got != 584+retainedBudgetOwnerByteCount {
+	if got := unsafe.Sizeof(sendItem{}); got != 584+retainedBudgetOwnerByteCount+immediateSendItemPolicyStateByteCount {
 		t.Fatalf("timing duplicated the existing physical timestamp: sendItem=%d", got)
 	}
-	if got := unsafe.Sizeof(sequenceAck{}); got != 96 {
+	if got := unsafe.Sizeof(sequenceAck{}); got != 96+immediateAckOrdinalStateByteCount {
 		t.Fatalf("timing grew per-ACK record: %d", got)
 	}
 }

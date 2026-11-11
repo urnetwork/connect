@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 var ErrNatMemoryBudget = errors.New("local NAT retained memory budget is full")
@@ -78,12 +80,12 @@ const (
 
 // Fixed ledger: 128 KiB for the two 16-KiB fragment caches plus worst-case
 // tiny-fragment geometric metadata/maps; 16 KiB reconstruction scratch;
-// 16 KiB precharged ACK/RST admission; 64 KiB shared maps/channel backing,
+// 64 KiB shared maps/channel backing,
 // readiness buffers/workers and callback metadata; 32 KiB allocator slack.
 // Packet owners
 // in dispatch and flow queues are separately admitted, never multiplied into
 // a guessed per-flow count. The strict profile has one send shard.
-const natMemoryFixedBytes ByteCount = 256 * 1024
+const natMemoryFixedBytes ByteCount = 240 * 1024
 
 // A small, explicit working set for byte-budgeted NATs. Flow counts remain
 // secondary FD safeguards; they cannot override exact byte admission. Larger
@@ -238,9 +240,37 @@ func (self *tcpReturnBatchWorkspace) release() {
 	}
 }
 
-// Header-only ACK/RST packets need no data reservation: their separately
-// bounded 16-KiB allowance is already part of the NAT's fixed reservation.
-// This breaks the full-replay-budget -> refused-ACK -> no-release cycle.
+// A protocol packet carries no application bytes. Count and existing flow
+// limits own its lifetime; no DATA credit or separate byte reserve is used.
+func natProtocolOnlyPackets(packets [][]byte) bool {
+	if len(packets) == 0 {
+		return false
+	}
+	for _, packet := range packets {
+		if !protocolOnlyFrame(protocol.MessageType_IpIpPacketToProvider, true, packet) {
+			return false
+		}
+	}
+	return true
+}
+
+// Only actual ToProvider TCP packets enter the byte-free provider workspace;
+// control enums and empty lists do not confer NAT packet authority.
+func natProtocolOnlyFrames(frames []*protocol.Frame) bool {
+	if len(frames) == 0 {
+		return false
+	}
+	for _, frame := range frames {
+		if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketToProvider ||
+			!protocolOnlyFrame(frame.MessageType, frame.Raw, frame.MessageBytes) {
+			return false
+		}
+	}
+	return true
+}
+
+// Small ACK/RST packets can pass pending DATA without consuming sequence
+// space. SYN/FIN retain their ordinary ordering; this is not byte admission.
 func natControlPackets(packets [][]byte) bool {
 	if len(packets) == 0 || len(packets) > 16 {
 		return false

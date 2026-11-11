@@ -263,7 +263,8 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		metadata := ByteCount(unsafe.Sizeof(tcpSynRetry{})) + ByteCount(len(group.synRetry.pin.appId))
 		metadata = (metadata + 63) / 64 * 64
 		metadata = addReceiveQueueByteCount(metadata, retainedMessageCapacity(ByteCount(remoteCapacity)*ByteCount(unsafe.Sizeof(Id{}))))
-		credit, reserved := source.reserveRetainedControlMemory(addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata))
+		noBudget := protocolClassPureTcpControl(packet)
+		credit, reserved := source.reserveRetainedControlMemory(addReceiveQueueByteCount(retainedMessageCapacity(ByteCount(len(packet))), metadata), noBudget)
 		if !reserved {
 			continue
 		}
@@ -283,7 +284,7 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 			owner.remoteRefusalOverflow = previous.remoteRefusalOverflow || count != len(previous.refusedRemoteIds)
 			update.clearSynRetryWithLock()
 		}
-		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update))
+		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update), noBudget)
 		update.synRetry = owner
 	}
 }

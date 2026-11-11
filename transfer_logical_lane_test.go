@@ -337,6 +337,13 @@ func TestLogicalLaneBuffersShareFixedLazyBudgets(t *testing.T) {
 	applyTestEncryptionSettings(settings, encryptionModeOff)
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	defer client.Cancel()
+	t.Cleanup(func() {
+		joined, cancelJoin := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelJoin()
+		if err := client.CloseAndWait(joined); err != nil {
+			t.Error(err)
+		}
+	})
 	if client.sendBuffer.logicalLaneResendBudget != nil {
 		t.Fatal("disabled logical lanes eagerly allocated a resend budget")
 	}
@@ -367,6 +374,8 @@ func TestLogicalLaneBuffersShareFixedLazyBudgets(t *testing.T) {
 			resendBudget,
 		)
 		sendSequences = append(sendSequences, sequence)
+		t.Cleanup(func() { sequence.resendQueue.Clear(); sequence.Close() })
+		assertLogicalLaneClassAdmission(t, sequence, logicalLaneSequenceBufferSize(settings.SendBufferSettings.SequenceBufferSize, lane))
 		sendChannelCapacity += cap(sequence.packs)
 		ackChannelCapacity += cap(sequence.acks)
 		if sequence.resendQueue.budget != resendBudget || sequence.resendQueue.minByteCount != 0 {
@@ -380,16 +389,18 @@ func TestLogicalLaneBuffersShareFixedLazyBudgets(t *testing.T) {
 			transferFrameBytes: make([]byte, 1024),
 		})
 	}
-	maxSendCapacity := logicalLaneSequenceBufferSize(
+	maxSendCapacity := 2 * logicalLaneSequenceBufferSize(
 		settings.SendBufferSettings.SequenceBufferSize,
 		1,
 	) * maxLogicalDataLaneCount
-	// Constructor-owned ACK feedback is coalesced directly; no lane needs a
-	// compatibility queue. The actual data-channel bound stays unchanged.
+	// Accepted DATA/protocol originals share a 2N FIFO, with independent N
+	// count ownership proved by actual Pack calls above. This is physical
+	// mailbox capacity, not twice the DATA admission or a free byte floor.
+	// Constructor-owned ACK feedback is coalesced without a per-lane queue.
 	maxAckCapacity := 0
 	if sendChannelCapacity != maxSendCapacity || ackChannelCapacity != maxAckCapacity {
 		t.Fatalf(
-			"data-lane channels = (%d,%d), want bounded (%d,%d)",
+			"merged raw lane channels = (%d,%d), want bounded (%d,%d)",
 			sendChannelCapacity,
 			ackChannelCapacity,
 			maxSendCapacity,
@@ -853,4 +864,93 @@ func TestNegotiatedLogicalLanePreventsCrossFlowHeadOfLineBlocking(t *testing.T) 
 	close(releaseLaneOne)
 	waitForReceive("held", 1, 5*time.Second)
 	waitForAck("held")
+}
+
+// A cold actual sequence accepts each class independently without a worker
+// consuming or acknowledging it. Dequeue alone cannot release its count slot.
+func assertLogicalLaneClassAdmission(t *testing.T, sequence *SendSequence, capacity int) {
+	t.Helper()
+	if capacity <= 0 || cap(sequence.packs) != 2*capacity || sequence.protocolPacks != nil || sequence.packAdmission == nil || sequence.protocolAdmission == nil {
+		t.Fatal("positive lane did not construct one FIFO and two bounded admissions")
+	}
+	var borrowed *SendPack
+	defer func() {
+		if borrowed != nil {
+			borrowed.disposeUnsentGroup(context.Canceled)
+		}
+		for len(sequence.packs) != 0 {
+			(<-sequence.packs).disposeUnsentGroup(context.Canceled)
+		}
+	}()
+	offer := func(protocolOnly bool, want bool) *SendPack {
+		t.Helper()
+		frame := budgetTestFrame(16)
+		if protocolOnly {
+			MessagePoolReturn(frame.MessageBytes)
+			frame = &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketToProvider, Raw: true,
+				MessageBytes: MessagePoolCopy(protocolClassTestPacket(false, 0x10, 0, 0))}
+		}
+		pack := &SendPack{TransferOptions: TransferOptions{Ack: true, NoBudget: protocolOnly},
+			Ctx: sequence.ctx, Frame: frame, MessageByteCount: MessageByteCount([]*protocol.Frame{frame})}
+		accepted, err := sequence.Pack(pack, 0)
+		if accepted != want || err != nil {
+			if !accepted {
+				pack.disposeUnsentGroup(context.Canceled)
+			}
+			t.Fatalf("class=%t capacity=%d accepted=%t expected=%t error=%v", protocolOnly, capacity, accepted, want, err)
+		}
+		if !accepted {
+			if pack.admissionFailure != sendAdmissionPack {
+				t.Errorf("class refusal came from %v instead of its count bound", pack.admissionFailure)
+			}
+			pack.disposeUnsentGroup(context.Canceled)
+			return nil
+		}
+		expectedAdmission := sequence.packAdmission
+		if protocolOnly {
+			expectedAdmission = sequence.protocolAdmission
+		}
+		if pack.admission != expectedAdmission {
+			t.Fatal("accepted original charged the wrong class count")
+		}
+		return pack
+	}
+	data := make([]*SendPack, 0, capacity)
+	controls := make([]*SendPack, 0, capacity)
+	for range capacity {
+		data = append(data, offer(false, true))
+	}
+	if len(sequence.packs) != capacity {
+		t.Fatal("DATA count did not fill exactly N FIFO entries")
+	}
+	offer(false, false) // There are still N physical entries free.
+	for range capacity {
+		controls = append(controls, offer(true, true))
+	}
+	borrowed = <-sequence.packs
+	if borrowed != data[0] || len(sequence.packs) != 2*capacity-1 {
+		t.Fatal("accepted FIFO order changed before serialization")
+	}
+	offer(false, false)
+	offer(true, false) // One physical entry is free, but both class tokens live.
+	borrowed.disposeUnsentGroup(context.Canceled)
+	borrowed = nil
+	replacement := offer(false, true) // Protocol remains full independently.
+	expected := append(append(append([]*SendPack{}, data[1:]...), controls...), replacement)
+	for _, wanted := range expected {
+		actual := <-sequence.packs
+		if actual != wanted {
+			actual.disposeUnsentGroup(context.Canceled)
+			t.Fatal("accepted classes lost their single FIFO order")
+		}
+		actual.disposeUnsentGroup(context.Canceled)
+	}
+	for _, admission := range []*sendPackAdmission{sequence.packAdmission, sequence.protocolAdmission} {
+		admission.mutex.Lock()
+		count, bound := admission.count, admission.capacity
+		admission.mutex.Unlock()
+		if count != 0 || bound != capacity {
+			t.Fatalf("class count failed terminal refund: count=%d bound=%d expected=%d", count, bound, capacity)
+		}
+	}
 }

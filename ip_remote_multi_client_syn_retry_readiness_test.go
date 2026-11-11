@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 )
 
 // A local refusal must remain quiet while readiness is unchanged, but cannot
@@ -29,11 +30,14 @@ func TestNativeSynRetryRefusedReplacementResumesAfterCapacity(t *testing.T) {
 				sourceOffers.Add(1)
 			}
 		}
-		if !privateStaleBoundNativeSyn(t, harness, path) {
+		if !privateNativeDataSyn(t, harness, path, 5*time.Second) {
 			t.Fatal("initial native SYN refused")
 		}
 		update := harness.update(path)
 		owner := synRetryControlOwner(t, update)
+		if owner.credit.noBudget || protocolClassPureTcpControl(owner.packet) {
+			t.Fatal("DATA-credit readiness fixture retained a protocol-only SYN")
+		}
 		update.stateLock.Lock()
 		ownerCredit, ownerSerial := owner.credit, owner.serial
 		original := bytes.Clone(owner.packet)

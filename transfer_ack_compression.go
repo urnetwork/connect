@@ -27,15 +27,16 @@ type sequenceAckWindow struct {
 	// There is exactly one draining consumer per sequence. A
 	// capacity-one signal coalesces any number of updates while that consumer
 	// is running and avoids allocating/closing a broadcast channel per packet.
-	ackNotify              chan struct{}
-	ackLock                sync.Mutex
-	headAck                sequenceAck
-	hasHeadAck             bool
-	ackUpdateCount         int
-	headQuietNotify        chan struct{}
-	headDeliveredByteCount ByteCount
-	headUpdatedAt          time.Time
-	selectiveAcks          map[Id]sequenceAck
+	ackNotify                 chan struct{}
+	ackLock                   sync.Mutex
+	headAck                   sequenceAck
+	hasHeadAck                bool
+	cumulativeProgressPending bool
+	ackUpdateCount            int
+	headQuietNotify           chan struct{}
+	headDeliveredByteCount    ByteCount
+	headUpdatedAt             time.Time
+	selectiveAcks             map[Id]sequenceAck
 	// Recovery requests never acknowledge delivery and therefore remain
 	// separate from both cumulative and selective acknowledgement windows.
 	contractMissingAcks map[Id]sequenceAck
@@ -115,7 +116,7 @@ func (self *sequenceAckWindow) Pending() bool {
 func (self *sequenceAckWindow) PendingCumulativeProgress() bool {
 	self.ackLock.Lock()
 	defer self.ackLock.Unlock()
-	return 0 < self.ackUpdateCount
+	return self.cumulativeProgressPending
 }
 
 // PendingDispositionFor reports whether the not-yet-snapshotted window can
@@ -229,6 +230,10 @@ func (self *sequenceAckWindow) Restore(acks []sequenceAck) {
 			newer, exists = self.selectiveAcks[ack.messageId]
 		}
 		if exists {
+			if !newer.immediateSequenceNumberSet && ack.immediateSequenceNumberSet {
+				newer.immediateSequenceNumber, newer.immediateSequenceNumberSet = ack.immediateSequenceNumber, true
+			}
+			newer.deliveredImmediately = newer.deliveredImmediately || ack.deliveredImmediately
 			newer.unwrapped = newer.unwrapped || ack.unwrapped
 			newer.receiverTiming = newer.receiverTiming || ack.receiverTiming
 			newer.compactContractRecoverySupported = newer.compactContractRecoverySupported || ack.compactContractRecoverySupported
@@ -252,6 +257,10 @@ func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCoun
 			if prior, ok := self.selectiveAcks[ack.messageId]; ok {
 				// Exact receiver timing is handled before byte application.
 				// A duplicate without metadata cannot re-enable legacy sampling.
+				if !ack.immediateSequenceNumberSet && prior.immediateSequenceNumberSet {
+					ack.immediateSequenceNumber, ack.immediateSequenceNumberSet = prior.immediateSequenceNumber, true
+				}
+				ack.deliveredImmediately = ack.deliveredImmediately || prior.deliveredImmediately
 				ack.receiverTiming = ack.receiverTiming || prior.receiverTiming
 				if prior.unwrapped {
 					// Coalesced selective Ack for the same message preserves any
@@ -318,6 +327,7 @@ func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCoun
 				}
 			}
 			self.ackUpdateCount += 1
+			self.cumulativeProgressPending = true
 			if 0 < deliveredByteCount || 0 < self.headDeliveredByteCount {
 				self.headUpdatedAt = time.Now()
 			}
@@ -331,6 +341,9 @@ func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCoun
 				}
 			}
 			if prior, ok := self.selectiveAcks[ack.messageId]; ok {
+				if !ack.immediateSequenceNumberSet && prior.immediateSequenceNumberSet {
+					ack.immediateSequenceNumber, ack.immediateSequenceNumberSet = prior.immediateSequenceNumber, true
+				}
 				ack.receiverTiming = ack.receiverTiming || prior.receiverTiming
 			}
 			self.headAck = ack
@@ -404,6 +417,7 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 		// keep the head ack in place. clear() reuses the live map's storage
 		// instead of allocating a fresh map; the caller holds only a copy.
 		self.ackUpdateCount = 0
+		self.cumulativeProgressPending = false
 		self.headDeliveredByteCount = 0
 		select {
 		case <-self.headQuietNotify:
@@ -442,6 +456,7 @@ func (self *sequenceAckWindow) takeResponse(scratch []sequenceAck, limit int) ([
 	if self.ackUpdateCount != 0 {
 		acks = append(acks, self.headAck)
 		self.ackUpdateCount = 0
+		self.cumulativeProgressPending = false
 		self.headDeliveredByteCount = 0
 		select {
 		case <-self.headQuietNotify:
@@ -518,6 +533,7 @@ func (self *sequenceAckWindow) takeQuietHead(now time.Time, quiet time.Duration)
 	}
 	ack := self.headAck
 	self.ackUpdateCount = 0
+	self.cumulativeProgressPending = false
 	self.headDeliveredByteCount = 0
 	select {
 	case <-self.headQuietNotify:

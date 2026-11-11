@@ -106,6 +106,9 @@ func (self *sendItem) reserveFrameRewrite(frameByteCount ByteCount, frameCount i
 // A promised predecessor draws first on the reservation its committed
 // successor made for it (see transfer_receive_hold_promise.go).
 func (self *ReceiveSequence) reserveHeldItem(item *receiveItem, promised bool) bool {
+	if item.noBudget {
+		return true
+	}
 	if !self.receiveQueue.lifetimeBudget {
 		return true
 	}
@@ -150,6 +153,9 @@ func (self *SendSequence) retainedSendPackByteCountWithContractBytes(pack *SendP
 }
 
 func (self *SendSequence) retainedSendPackFits(pack *SendPack) bool {
+	if pack.NoBudget {
+		return true
+	}
 	if pack.logicalGroup && self.contractMultiRouteWriter != nil {
 		// Eligibility and materialization must describe the same H1 chunk.
 		// A first selection without a writer is rechecked atomically after

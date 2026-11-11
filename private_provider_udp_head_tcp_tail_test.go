@@ -1,6 +1,6 @@
-// A reliable UDP head can precede TCP ACK tails on one public Transfer
-// sequence. Its own downstream TCP growth is zero, but refusing its encoded
-// owner can still strand the tails that release an actual TCP return chunk.
+// A reliable UDP DATA head stays byte-budgeted and ordered. Later genuine
+// TCP ACKs use immediate protocol delivery, so its real DATA refusal cannot
+// strand the actual TCP return chunk or falsely acknowledge the UDP original.
 package connect
 
 import (
@@ -60,26 +60,18 @@ func privateProviderReliableUdpHeadWire(t *testing.T, f *privateProviderEncrypte
 	}
 }
 
-// Ordinary public delivery is the positive control. Pressure changes only RX
-// and child ceilings; real committed TCP tails and source retries must still
-// make progress without converting the UDP member into a TCP receipt owner.
+// Ordinary public delivery and an exact full-DATA refusal use the same real
+// UDP original. Immediate TCP ACK tails must retire return custody before the
+// refused UDP head's unchanged natural retry can acquire DATA permission.
 func TestPrivateProviderReliableUdpHeadReleasesTcpTailChunks(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, pressure := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			f := newPrivateProviderEncryptedAckFixture(t)
-			t.Cleanup(func() {
-				f.close()
-				t.Logf("[provider-udp-head-cleanup] pressure=%t root=%d rx=%d child=%d nat=%d joined=%t", pressure,
-					f.root.UsedByteCount(), f.rx.UsedByteCount(), f.recovery.UsedByteCount(), f.natBudget.UsedByteCount(), f.closed)
-			})
-			// No UDP flow exists yet. All family buffers use this exact settings
-			// pointer, and this test never permits an external socket dial.
 			f.nat.settings.UdpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) {
 				return nil, context.Canceled
 			}}
 			f.gate = make(chan struct{})
-			rootTotal, parentTotal := f.root.TotalByteCount(), f.parent.TotalByteCount()
 			end := uint32(500 + 1280)
 			f.tcp.mutex.Lock()
 			f.tcp.receiveSeq, f.tcp.receiveWindowEnd = end, end+65535
@@ -87,7 +79,7 @@ func TestPrivateProviderReliableUdpHeadReleasesTcpTailChunks(t *testing.T) {
 			if !f.tcp.retainReturnChunk(bytes.Repeat([]byte{0x53}, 1280), 500, false) {
 				t.Fatal("UDP-head fixture could not retain the actual TCP return chunk")
 			}
-			retained, first := f.tcp.returnByteCount, f.nextNumber
+			first := f.nextNumber
 			udpPath := *f.path
 			udpPath.Protocol, udpPath.SourcePort = IpProtocolUdp, f.path.SourcePort+1
 			packet := MessagePoolCopy(ipOosUdpPacket(&udpPath, bytes.Repeat([]byte{0x23}, 1252)))
@@ -103,83 +95,14 @@ func TestPrivateProviderReliableUdpHeadReleasesTcpTailChunks(t *testing.T) {
 			}
 			f.nextNumber++
 			head := privateProviderReliableUdpHeadWire(t, f, first, nil)
-			headCost := head.scan.retainedByteCount
-			headProbe := &receiveItem{transferItem: transferItem{queueByteCount: headCost}, ack: true, frames: head.pack.Frames}
-			if !f.sequence.prepareReceiveDeliveryCredit(headProbe) || headProbe.deliveryPrepared || headProbe.QueueByteCount() != headCost {
-				t.Fatal("reliable UDP head incorrectly acquired TCP downstream prepayment")
+			probe := &receiveItem{transferItem: transferItem{queueByteCount: head.scan.retainedByteCount}, ack: true, frames: head.pack.Frames}
+			if protocolOnlyPack(head.pack) || head.pack.DeliverImmediately || immediateIpAckFrames(head.pack.Frames) ||
+				!f.sequence.prepareReceiveDeliveryCredit(probe) || probe.deliveryPrepared || probe.QueueByteCount() != head.scan.retainedByteCount {
+				t.Fatal("reliable UDP DATA head incorrectly inherited protocol exemption or TCP prepayment")
 			}
-			tails := make([]*privateProviderEncryptedAckFrame, 10)
-			for index := range tails {
-				tails[index] = f.writeAcks(1, end)
-			}
-			tailProbe := &receiveItem{transferItem: transferItem{queueByteCount: tails[0].scan.retainedByteCount}, ack: true, frames: tails[0].pack.Frames}
-			if !f.sequence.prepareReceiveDeliveryCredit(tailProbe) || !tailProbe.deliveryPrepared {
-				t.Fatal("actual later TCP ACK did not prepay its reliable downstream owner")
-			}
-			tailFull := tailProbe.QueueByteCount()
-			if headCost <= tailFull {
-				t.Fatalf("UDP head has no encoded cost shortfall: c=%d prefix=%d", headCost, tailFull)
-			}
-			repairMetadata, rxTarget := privateProviderRepairFixtureGeometry(t, f.sequence, tailFull, 10)
-			if pressure {
-				f.rx.SetTotalByteCount(rxTarget)
-				f.recovery.SetTotalByteCount(f.rx.TotalByteCount())
-			}
-			owners := map[uint64]*receiveItem{}
-			for _, tail := range tails {
-				f.forward(tail.windowRoundFrame, f.receiverIn)
-				item := f.sequence.receiveQueue.GetBySequenceNumber(tail.pack.SequenceNumber)
-				if item == nil || !item.committed || item.QueueByteCount() != tailFull {
-					t.Fatal("UDP-head fixture did not commit actual TCP ACK tails")
-				}
-				owners[item.sequenceNumber] = item
-				f.feedback()
-			}
-			privateProviderAssertRepairFixtureCustody(t, f.sequence, repairMetadata, 10)
-			if f.sequence.holdPromise.reservedByteCount != tailFull || f.sequence.nextSequenceNumber != first ||
-				f.tcp.returnByteCount != retained || len(f.entered) != 0 || f.ackedCount != 1 ||
-				pressure && f.rx.Available() != 0 || f.recovery.Available() < headCost || f.root.Available() < headCost {
-				t.Fatal("UDP-head fixture did not isolate the exact reliable gap with free child/root capacity")
-			}
-			before := f.receiver.ReceiveStats()
-			childBefore := f.recovery.Stats()
-			f.forward(head.windowRoundFrame, f.receiverIn)
-			attempts := 1
-			for len(f.entered) == 0 && attempts < 4 {
-				if f.sequence.ctx.Err() != nil || f.ackedCount != 1 || f.deliveredCount != 1 || f.tcp.returnByteCount != retained {
-					t.Fatal("UDP-head refusal changed reliable ACK truth or live TCP return custody")
-				}
-				for number, owner := range owners {
-					if f.sequence.receiveQueue.GetBySequenceNumber(number) != owner || !owner.committed {
-						t.Fatal("UDP-head refusal evicted an actual committed TCP ACK original")
-					}
-				}
-				retry := privateProviderReliableUdpHeadWire(t, f, first, head)
-				f.forward(retry.windowRoundFrame, f.receiverIn)
-				attempts++
-			}
-			if len(f.entered) == 0 {
-				t.Fatalf("valid reliable UDP head stranded TCP ACK tails after %d actual source attempts: pressure=%t c=%d prefix=%d tcp_growth=0 rx=%d child=%d root_spare=%d retained_chunk=%d", attempts,
-					pressure, headCost, tailFull, f.rx.UsedByteCount(), f.recovery.UsedByteCount(), f.root.Available(), f.tcp.returnByteCount)
-			}
-			if f.tcp.returnByteCount != retained || f.ackedCount < 1 || f.ackedCount > 2 || f.ackCounts[first] > 1 ||
-				pressure && f.recovery.Stats().ReservedByteCount-childBefore.ReservedByteCount != headCost {
-				t.Fatal("UDP head did not pay its exact decoded owner before enabling the held TCP tail")
-			}
-			close(f.gate)
-			synctest.Wait()
-			f.feedback()
-			if f.ackedCount != 12 || f.deliveredCount != 12 || f.ackCounts[first] != 1 ||
-				f.sequence.nextSequenceNumber != first+11 || f.sequence.receiveQueue.Len() != 0 ||
-				f.rx.UsedByteCount() != 0 || f.recovery.UsedByteCount() != 0 || f.tcp.returnByteCount != 0 ||
-				f.root.TotalByteCount() != rootTotal || f.parent.TotalByteCount() != parentTotal ||
-				f.receiver.ReceiveStats().ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount ||
-				f.receiver.ReceiveStats().ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount {
-				t.Fatal("reliable UDP head did not release all real TCP tails, return bytes and cumulative callbacks")
-			}
-			f.close()
-			t.Logf("[provider-udp-head] pressure=%t encrypted=true signed=true head_c=%d prefix=%d head_tcp_growth=0 tcp_tails=10 retained_chunk_bytes=%d attempts=%d callbacks=12 root=0 rx=0 child=0 nat=0 joined=true", pressure,
-				headCost, tailFull, retained, attempts)
+			privateProviderDataHeadWithProtocolTails(t, f, head, end, pressure, func() *privateProviderEncryptedAckFrame {
+				return privateProviderReliableUdpHeadWire(t, f, first, head)
+			})
 		})
 	}
 }

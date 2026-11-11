@@ -284,6 +284,7 @@ func TestDeferredExpiriesReduceOncePerPass(t *testing.T) {
 // The baselines are the sizes at c289a7e, before D4 added the bool to
 // sendItem and the byte to the two ack structs.
 const (
+	// Historical flightgate_next baseline, without removed first-DATA provenance.
 	sendItemByteCountBaseline          = 560
 	sequenceAckByteCountBaseline       = 88
 	receiveAckMessageByteCountBaseline = 72

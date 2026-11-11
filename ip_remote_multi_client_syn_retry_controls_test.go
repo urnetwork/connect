@@ -126,11 +126,16 @@ func TestNativeSynRetryReplacementRefusalDoesNotSpin(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
 		harness, path := synRetryControlHarness(t, 51303, nil, DefaultProtocolVersion)
-		if !privateStaleBoundNativeSyn(t, harness, path) {
+		// This refusal is DATA credit pressure, so retain a real TFO byte.
+		packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+		if !synRetryControlOffer(t, harness, packet) {
 			t.Fatal("initial native SYN refused")
 		}
 		update := harness.update(path)
 		owner := synRetryControlOwner(t, update)
+		if protocolClassPureTcpControl(owner.packet) || owner.credit.noBudget {
+			t.Fatal("replacement-refusal fixture did not retain DATA-bearing SYN state")
+		}
 		started := credit.base.started.Load()
 		harness.multiClient.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel { return []*multiClientChannel{credit.base.selected} }
 		harness.inject("a", reraceProviderSignal(t, path))
@@ -348,12 +353,14 @@ func TestNativeSynRetryShared32BudgetCreditsEveryOwner(t *testing.T) {
 			settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
 		}
 		harness, path := synRetryControlHarness(t, 51307, configure, DefaultProtocolVersion)
-		if !privateStaleBoundNativeSyn(t, harness, path) {
+		// One real TFO byte makes this the DATA ownership control.
+		packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+		if !synRetryControlOffer(t, harness, packet) {
 			t.Fatal("shared-budget original refused")
 		}
 		owner := synRetryControlOwner(t, harness.update(path))
 		credit := owner.credit
-		if credit.budget != shared || credit.local != nil || shared.UsedByteCount() < credit.byteCount || root.UsedByteCount() > root.TotalByteCount() {
+		if protocolClassPureTcpControl(owner.packet) || credit.noBudget || credit.budget != shared || credit.local != nil || shared.UsedByteCount() < credit.byteCount || root.UsedByteCount() > root.TotalByteCount() {
 			t.Fatal("SYN cache bypassed its existing shared retained budget")
 		}
 		harness.inject("a", reraceProviderSignal(t, path))
@@ -375,8 +382,10 @@ func TestNativeSynRetryRefusedOriginalHasNoAuthority(t *testing.T) {
 		credit := newNativeBatchCreditFixture(t)
 		harness, path := synRetryControlHarness(t, 51308, nil, DefaultProtocolVersion)
 		harness.multiClient.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel { return []*multiClientChannel{credit.base.selected} }
-		if privateStaleBoundNativeSyn(t, harness, path) {
-			t.Fatal("closed actual source queue accepted a SYN")
+		// The fixture fills DATA credit; it does not close the protocol mailbox.
+		packet := MessagePoolCopy(reraceTcpPacket(path, tcpFlagSyn, path.SequenceNumber, 0, []byte{0x64}))
+		if synRetryControlOffer(t, harness, packet) {
+			t.Fatal("full DATA source accepted a DATA-bearing SYN")
 		}
 		update := harness.update(path)
 		started := credit.base.started.Load()

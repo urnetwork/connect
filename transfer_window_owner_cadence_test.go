@@ -356,8 +356,9 @@ func TestWindowPacingOwnerSelectionDelayedContractKeepsRetryCadence(t *testing.T
 				if sequence.pendingRecovery == nil || sequence.pendingRecovery.at != older.sendTime.Add(2*time.Second) {
 					t.Fatal("contract continuation lost its earlier selected recovery")
 				}
-				// The real announcement was accepted at 3s and is itself due
-				// at 5s. Its exact selective ACK suppresses only that copy:
+				// The real announcement was accepted at 2.25s, within its
+				// original 1s writer budget, and is itself due before 5s.
+				// Its exact selective ACK suppresses only that copy:
 				// cumulative delivery here would falsely acknowledge the old hole.
 				var announcement *sendItem
 				for _, item := range sequence.sendItems {

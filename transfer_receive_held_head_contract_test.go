@@ -236,7 +236,7 @@ func TestReceiveHeldHeadContractProofPreservesOwner(t *testing.T) {
 			}
 			fixture, log := newHeldHeadContractFixture(t, budget)
 			sequence, held, promoted := stageHeldHeadContract(t, fixture)
-			originalTag, originalCharge := held.tag, held.queueByteCount
+			originalTag, originalCharge := held.receiveTag(), held.queueByteCount
 			originalPayload := append([]byte(nil), held.frames[0].MessageBytes...)
 			var reserved ByteCount
 			if budget != nil {
@@ -246,7 +246,7 @@ func TestReceiveHeldHeadContractProofPreservesOwner(t *testing.T) {
 			observedOwner := false
 			fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 				observedOwner = true
-				if held.tag != originalTag || held.queueByteCount != originalCharge ||
+				if held.receiveTag() != originalTag || held.queueByteCount != originalCharge ||
 					!held.committed || len(frames) != 1 || !bytes.Equal(frames[0].MessageBytes, originalPayload) {
 					t.Error("head proof replaced the committed payload, tag, or retained charge")
 				}
@@ -364,7 +364,7 @@ func TestReceiveHeldHeadContractRejectsUntrustedPromotion(t *testing.T) {
 			}
 			budget.SetTotalByteCount(budget.UsedByteCount())
 			reserved, released := budget.Counts()
-			originalTag, originalCharge := held.tag, held.queueByteCount
+			originalTag, originalCharge := held.receiveTag(), held.queueByteCount
 			var ackUpdates atomic.Int32
 			sequence.ackWindow.afterUpdateForTest = func() { ackUpdates.Add(1) }
 			accepted, receiveErr := receiveHeldHeadContractControl(t, sequence, pack)
@@ -377,7 +377,7 @@ func TestReceiveHeldHeadContractRejectsUntrustedPromotion(t *testing.T) {
 			afterReserved, afterReleased := budget.Counts()
 			if sequence.nextSequenceNumber != 0 || sequence.receiveContract != nil || len(sequence.openReceiveContracts) != 0 ||
 				sequence.receiveQueue.GetByMessageId(held.messageId) != held || !held.committed || held.head ||
-				held.contractFrame != nil || held.contractId != nil || held.tag != originalTag || held.queueByteCount != originalCharge ||
+				held.contractFrame != nil || held.contractId != nil || held.receiveTag() != originalTag || held.queueByteCount != originalCharge ||
 				held.memoryBudget != budget || reserved != afterReserved || released != afterReleased || ackUpdates.Load() != 0 || fixture.deliveredCount != 2 {
 				t.Errorf("%s proof changed prefix, ACK, contract authority, or committed ownership before rejection", kind)
 			}

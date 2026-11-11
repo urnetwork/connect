@@ -102,6 +102,7 @@ func (self *SendSequence) expireSendItem(item *sendItem, now time.Time) {
 	self.forgetUnreliableFlight(item)
 	self.abandonPacingService(item)
 	self.sendItems = slices.Delete(self.sendItems, index, index+1)
+	self.retireFifoRepairAdmission()
 	if item.contractId != nil {
 		if contract := self.openSendContracts[*item.contractId]; contract != nil {
 			contract.abandonedByteCount += max(contract.minUpdateByteCount, item.messageByteCount)

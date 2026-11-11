@@ -704,6 +704,7 @@ func (self *Client) answerSubprotocolsQuery(table *subprotocolTable, source Tran
 		0,
 		returnOptions,
 		returnTransferKey,
+		NoBudget(),
 	) {
 		registry.queryReplyDrops.Add(1)
 		MessagePoolReturn(resultFrame.MessageBytes)
@@ -778,6 +779,7 @@ func (self *Client) QuerySubprotocols(ctx context.Context, destinationId Id, opt
 		default:
 		}
 	}
+	opts = append(opts, NoBudget())
 	success, err := self.SendWithTimeoutDetailed(frame, destinationId, ackCallback, -1, opts...)
 	if !success {
 		MessagePoolReturn(frame.MessageBytes)

@@ -102,6 +102,9 @@ type webRtcFastPath struct {
 	nextMessageId             uint32
 	nextSequenceNumber        uint16
 	warmupVersion             byte
+	warmupInterval            time.Duration
+	warmupTimeout             time.Duration
+	warmupRequests            chan struct{}
 	afterWarmupReceiveForTest func(byte)
 
 	// Tests retain an exact reassembly-buffer witness before queue handoff.
@@ -199,6 +202,9 @@ func (self *peerConn) configureFastPath() error {
 		warmupVersion: p2pFastPathWarmupVersionForSettings(
 			self.settings,
 		),
+		warmupInterval: self.settings.DatagramFastPathWarmupInterval,
+		warmupTimeout:  self.settings.DatagramFastPathWarmupTimeout,
+		warmupRequests: make(chan struct{}, 1),
 		afterWarmupReceiveForTest: self.settings.
 			afterFastPathWarmupReceiveForTest,
 	}
@@ -437,45 +443,80 @@ func (self *peerConn) startFastPathWarmup() {
 	}
 }
 
-// runWarmup sends a tiny carrier marker until a remote marker proves that
-// both RTP receive workers are active. Pion fires OnTrack from the first RTP
-// packet; repeating only during this setup window prevents that trigger packet
-// from becoming a cold-path application loss.
+// Repeats setup markers until local readiness or the probe deadline, then
+// remains the generation's responder. A peer can still need a reply after our
+// own probes finish. The bounded request signal keeps writes off the reader.
 func (self *webRtcFastPath) runWarmup() {
-	ticker := time.NewTicker(p2pFastPathWarmupInterval)
-	defer ticker.Stop()
-	timer := time.NewTimer(p2pFastPathWarmupTimeout)
-	defer timer.Stop()
+	var ticker *time.Ticker
+	var timer *time.Timer
+	var tick <-chan time.Time
+	var timeout <-chan time.Time
+	probe := self.warmupInterval > 0 && self.warmupTimeout > 0
+	if probe {
+		ticker = time.NewTicker(self.warmupInterval)
+		defer ticker.Stop()
+		timer = time.NewTimer(self.warmupTimeout)
+		defer timer.Stop()
+		tick = ticker.C
+		timeout = timer.C
+	}
+	stopProbes := func() {
+		if ticker != nil {
+			ticker.Stop()
+			timer.Stop()
+		}
+		tick = nil
+		timeout = nil
+	}
+	ready := self.ready
 	for {
-		if self.track.bound.Load() {
-			if err := self.writeWarmup(); err != nil {
+		if probe && self.track.bound.Load() {
+			if err := self.writeWarmupPacket(false); err != nil {
 				if self.log.V(1).Enabled() {
 					self.log.Infof("[p2p-fast]warmup err = %s\n", err)
 				}
 				return
 			}
-			if self.receiveReady.Load() {
-				return
-			}
 		}
+		probe = false
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-ticker.C:
-		case <-timer.C:
-			return
+		case <-ready:
+			stopProbes()
+			ready = nil
+		case <-self.warmupRequests:
+			if self.track.bound.Load() {
+				if err := self.writeWarmupPacket(true); err != nil {
+					if self.log.V(1).Enabled() {
+						self.log.Infof("[p2p-fast]warmup reply err = %s\n", err)
+					}
+					return
+				}
+			}
+		case <-tick:
+			probe = true
+		case <-timeout:
+			stopProbes()
 		}
 	}
 }
 
 // writeWarmup emits one marker under the same sequence-number lock as data.
 func (self *webRtcFastPath) writeWarmup() error {
+	return self.writeWarmupPacket(false)
+}
+
+// Uses the RTP marker bit to distinguish a reply without changing the warmup
+// payload accepted by older peers. Replies never request another reply.
+func (self *webRtcFastPath) writeWarmupPacket(reply bool) error {
 	self.sendMutex.Lock()
 	defer self.sendMutex.Unlock()
 	self.nextSequenceNumber += 1
 	return self.track.track.WriteRTP(&rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
+			Marker:         reply,
 			SequenceNumber: self.nextSequenceNumber,
 		},
 		Payload: []byte{'U', 'R', 'W', self.warmupVersion},
@@ -533,6 +574,12 @@ func (self *webRtcFastPath) readTrack(reader p2pFastPathPacketReader) {
 				self.afterWarmupReceiveForTest(payload[3])
 			}
 			if payload[3] == self.warmupVersion {
+				if !header.Marker {
+					select {
+					case self.warmupRequests <- struct{}{}:
+					default:
+					}
+				}
 				self.receiveReady.Store(true)
 				self.readyOnce.Do(func() {
 					close(self.ready)

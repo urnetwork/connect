@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -44,6 +45,17 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 		t.Fatalf("read %s: %v", sourcePath, err)
 	}
 	t.Logf("window source: %s", sourcePath)
+	violations, consumers := windowOwnershipViolations(source)
+	t.Logf("window consumers: %v", consumers)
+	for _, violation := range violations {
+		t.Error(violation)
+	}
+}
+
+// Keep the existing lexical ownership rule independently testable with source
+// mutations; constructor refactors do not authorize new runtime consumers.
+func windowOwnershipViolations(source []byte) ([]string, map[string]bool) {
+	var violations []string
 	lines := strings.Split(string(source), "\n")
 
 	// the function each line belongs to, derived by scanning back to the
@@ -132,17 +144,17 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 			}
 			found += 1
 			if !allowedSet[enclosing[i]] {
-				t.Errorf(
+				violations = append(violations, fmt.Sprintf(
 					"transfer.go:%d reads %s inside %s, which is not one of the window's owners (%s); a consumer that reaches for an ingredient rather than for the window the estimator returns is the shape of the three defects this program has already paid for",
 					i+1, symbol, enclosing[i], strings.Join(allowed, ", "),
-				)
+				))
 			}
 		}
 		if found == 0 {
-			t.Errorf(
+			violations = append(violations, fmt.Sprintf(
 				"%s was not found at all, so this row is guarding a name that no longer exists and is asserting nothing",
 				symbol,
-			)
+			))
 		}
 	}
 
@@ -156,11 +168,70 @@ func TestTheWindowHasOneOwner(t *testing.T) {
 			consumers[enclosing[i]] = true
 		}
 	}
-	t.Logf("window consumers: %v", consumers)
 	if len(consumers) != 3 || !consumers["sendWindowEstimate"] || !consumers["sendWindowPacingEstimate"] || !consumers["sendWindowSnapshot"] {
-		t.Errorf(
+		violations = append(violations, fmt.Sprintf(
 			"%d functions reach the window arithmetic; admission, physical pacing and read-only statistics must use the same owner",
 			len(consumers),
-		)
+		))
+	}
+	return violations, consumers
+}
+
+// Every protected ingredient and the shared estimator still reject an added
+// consumer. Missing ingredients cannot silently turn this guard into a no-op.
+func TestWindowOwnerGuardRejectsIngredientAndConsumerMutations(t *testing.T) {
+	sourcePath := os.Getenv("CONNECT_TEST_WINDOW_OWNER_SOURCE")
+	if sourcePath == "" {
+		sourcePath = "transfer.go"
+	}
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failures, _ := windowOwnershipViolations(source); len(failures) != 0 {
+		t.Fatalf("unmodified ownership source failed: %v", failures)
+	}
+	for _, symbol := range []string{
+		"DeliverySizedWindowCeilingByteCount", "TargetGoodputByteRate",
+		"LendableByteCount", "receivedWindowAdvertisement", "deliveredRate",
+		"deliveredServiceRate", "deliveryServiceEstimate",
+	} {
+		consumer := "\nfunc windowIngredientIntruder() {\n\t_ = owner." + symbol + "\n}\n"
+		mutated := append(append([]byte(nil), source...), consumer...)
+		failures, _ := windowOwnershipViolations(mutated)
+		if len(failures) != 1 || !strings.Contains(failures[0], "reads "+symbol+" inside windowIngredientIntruder") {
+			t.Errorf("ingredient %s escaped exact owner guard: %v", symbol, failures)
+		}
+		missing := []byte(strings.ReplaceAll(string(source), symbol, "removedWindowIngredient"))
+		failures, _ = windowOwnershipViolations(missing)
+		expected := []string{symbol + " was not found at all,"}
+		if symbol == "deliveredServiceRate" {
+			// Renaming this helper also withdraws its authority to call the
+			// distinct service estimator. Both violations must remain visible.
+			expected = append(expected, " reads deliveryServiceEstimate inside removedWindowIngredient, which is not one of the window's owners (")
+		}
+		if len(failures) != len(expected) {
+			t.Errorf("missing ingredient %s produced %d errors, want %d: %v", symbol, len(failures), len(expected), failures)
+		}
+		// Guard iteration uses a map, so require each distinct cause once
+		// without assuming which valid diagnostic arrives first.
+		for _, cause := range expected {
+			count := 0
+			for _, failure := range failures {
+				if strings.Contains(failure, cause) {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Errorf("missing ingredient %s reported cause %q %d times, want once: %v", symbol, cause, count, failures)
+			}
+		}
+	}
+	consumer := "\nfunc windowArithmeticIntruder() {\n\t_ = owner.estimateSendWindow(now, false, false)\n}\n"
+	mutated := append(append([]byte(nil), source...), consumer...)
+	failures, consumers := windowOwnershipViolations(mutated)
+	if len(failures) != 1 || len(consumers) != 4 || !consumers["windowArithmeticIntruder"] ||
+		!strings.Contains(failures[0], "4 functions reach the window arithmetic") {
+		t.Errorf("additional estimator consumer escaped guard: %v consumers=%v", failures, consumers)
 	}
 }

@@ -65,13 +65,21 @@ func (self *reliableTcpIngressFixture) decodeOwnedPack(sequence *ReceiveSequence
 		}
 		return nil
 	}
+	decodedPack := decoded.frame.Pack
 	owner := decoded.detachPackOwner()
 	if owner == nil {
 		self.t.Fatal("exact provider fixture did not decode a physical owner")
 	}
 	output := &owner.receivePack
-	root := owner.receiveItem.memoryBudget.admissionRoot()
-	root.admissionLock.Lock()
+	// Match the production handoff envelope for both paid and protocol owners.
+	output.Pack, output.decodedOwner = decodedPack, owner
+	// Protocol-only originals deliberately own pool roots without a data-byte
+	// reservation. Only a validated protocol Pack may use that branch.
+	root := owner.receiveItem.memoryBudget
+	if root != nil {
+		root = root.admissionRoot()
+		root.admissionLock.Lock()
+	}
 	output.Source, output.SequenceId = self.source, sequence.sequenceId
 	output.Ctx, output.Unwrapped, output.EncryptionRole = self.ctx, true, sequenceTlsRoleServer
 	output.ReceiveCallback, output.MessageByteCount = self.client.receiveCallback, MessageByteCount(output.Pack.Frames)
@@ -87,7 +95,12 @@ func (self *reliableTcpIngressFixture) decodeOwnedPack(sequence *ReceiveSequence
 	}
 	paid := output.receiveMemoryOwned && output.ingressSequence == sequence &&
 		owner.receiveItem.memoryBudget == sequence.receiveQueue.budget && owner.receiveItem.queueByteCount == actual
-	root.admissionLock.Unlock()
+	if protocolOnlyPack(output.Pack) && root == nil && !output.receiveMemoryOwned && owner.receiveItem.queueByteCount == 0 {
+		paid = true
+	}
+	if root != nil {
+		root.admissionLock.Unlock()
+	}
 	wire = nil
 	if !paid {
 		output.messagePoolReturn()

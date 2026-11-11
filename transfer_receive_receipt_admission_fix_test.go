@@ -40,11 +40,6 @@ type receiptAdmissionFixture struct {
 	dials            atomic.Int64
 	stateLock        sync.Mutex
 	deliveryPorts    map[int]int
-	// Set before the first offer. Packs then enter through the production
-	// scanner and paid decoder, as the client's receive loop decodes them
-	// whenever the receive budget owns decoded memory. Since 00d4f62b only
-	// such an owner can fund the repair escrow a selective lease needs.
-	paidOffers bool
 }
 
 // Construction uses the production Client, ReceiveBuffer, provider and NAT.
@@ -183,6 +178,18 @@ func receiptAdmissionPacket(port int, flags byte, number uint32, payload []byte)
 // Success transfers the packet; refusal leaves it for the caller to return.
 func (self *receiptAdmissionFixture) offer(sequenceId Id, lane uint32, number uint64, messageId Id, port int, flags byte, payload []byte, configure ...func(*ReceivePack)) {
 	self.t.Helper()
+	self.offerWithDecodedOwner(false, sequenceId, lane, number, messageId, port, flags, payload, configure...)
+}
+
+// Only retained-custody controls opt into the real owned wire decoder. Existing
+// direct admission controls keep their original API boundary and byte geometry.
+func (self *receiptAdmissionFixture) offerDecoded(sequenceId Id, lane uint32, number uint64, messageId Id, port int, flags byte, payload []byte, configure ...func(*ReceivePack)) {
+	self.t.Helper()
+	self.offerWithDecodedOwner(true, sequenceId, lane, number, messageId, port, flags, payload, configure...)
+}
+
+func (self *receiptAdmissionFixture) offerWithDecodedOwner(decoded bool, sequenceId Id, lane uint32, number uint64, messageId Id, port int, flags byte, payload []byte, configure ...func(*ReceivePack)) {
+	self.t.Helper()
 	tcpNumber := uint32(100)
 	if flags&tcpFlagSyn == 0 {
 		tcpNumber++
@@ -202,20 +209,8 @@ func (self *receiptAdmissionFixture) offer(sequenceId Id, lane uint32, number ui
 	for _, apply := range configure {
 		apply(pack)
 	}
-	if self.paidOffers {
-		input := pack
-		pack = func() *ReceivePack {
-			defer input.messagePoolReturn()
-			return self.decodeOwned(input)
-		}()
-		// Witness the decoded roots the receive owner actually holds.
-		for _, frame := range pack.Pack.Frames {
-			if pooled, _ := MessagePoolCheck(frame.MessageBytes); pooled {
-				self.witnesses = append(self.witnesses, MessagePoolShareReadOnly(frame.MessageBytes))
-			} else {
-				self.genericFrames = append(self.genericFrames, frame)
-			}
-		}
+	if decoded {
+		pack = self.decodeReceiptAdmissionPack(pack)
 	}
 	if err := self.gateway.expectPack(pack.Pack); err != nil {
 		pack.messagePoolReturn()
@@ -227,44 +222,6 @@ func (self *receiptAdmissionFixture) offer(sequenceId Id, lane uint32, number ui
 	}
 	synctest.Wait()
 	self.collectAcks()
-}
-
-// Borrows input. Encodes it as the peer would and returns the client's own
-// paid decode, with the fields its receive loop sets before Pack handoff.
-func (self *receiptAdmissionFixture) decodeOwned(input *ReceivePack) *ReceivePack {
-	self.t.Helper()
-	pack := input.Pack
-	wire := marshalSendPackTransferFrame(&sendPackFrame{path: self.source,
-		messageId: RequireIdFromBytes(pack.MessageId), sequenceId: RequireIdFromBytes(pack.SequenceId),
-		sequenceNumber: pack.SequenceNumber, head: pack.Head, nack: pack.Nack,
-		frames: pack.Frames, contractFrame: pack.ContractFrame, contractAhead: pack.ContractAhead,
-		forceStream: pack.ForceStream, companionContract: pack.CompanionContract, logicalLane: pack.LogicalLane})
-	defer func() { MessagePoolReturn(wire) }()
-	decoded := &decodedTransferFrame{}
-	defer decoded.release()
-	if ok, pressure := self.client.unmarshalReceiveMemoryFrame(wire, decoded, true, self.source, false, sequenceTlsRoleServer, false); !ok || pressure {
-		self.t.Fatalf("paid receipt fixture could not decode its Pack: decoded=%t pressure=%t", ok, pressure)
-	}
-	owner := decoded.detachPackOwner()
-	if owner == nil {
-		self.t.Fatal("paid receipt fixture did not decode a physical owner")
-	}
-	output := &owner.receivePack
-	if !output.receiveMemoryOwned || owner.receiveItem.memoryBudget != self.receiveBudget {
-		output.messagePoolReturn()
-		self.t.Fatal("paid receipt fixture's owner was not charged to the receive budget")
-	}
-	root := owner.receiveItem.memoryBudget.admissionRoot()
-	root.admissionLock.Lock()
-	output.Source, output.SequenceId = input.Source, input.SequenceId
-	output.Ctx, output.Unwrapped, output.EncryptionRole = input.Ctx, input.Unwrapped, input.EncryptionRole
-	output.ReceiveCallback, output.MessageByteCount = input.ReceiveCallback, MessageByteCount(output.Pack.Frames)
-	output.TransferFrameBytes, output.TransportType = wire, input.TransportType
-	output.receivePublishedReliable = !output.Pack.Nack
-	output.receiveConsumerData = receiveHeadRecoveryPack(output.Pack)
-	root.admissionLock.Unlock()
-	wire = nil
-	return output
 }
 
 // Read the constructor-owned index only after durable quiescence, without
@@ -349,6 +306,7 @@ func TestReceiveReceiptAdmissionRefusalKeepsExactRetry(t *testing.T) {
 		f := newReceiptAdmissionFixture(t, 1)
 		firstId, refusedId := NewId(), NewId()
 		payload := []byte("synthetic pending TCP data")
+		secondPayload := []byte("DATA on the refused SYN")
 		f.offer(f.sequenceId, 0, 0, firstId, 41000, tcpFlagAck, payload)
 		sequence := f.sequence(f.sequenceId, 0)
 		if sequence == nil || sequence.deliveryQueue == nil {
@@ -362,7 +320,7 @@ func TestReceiveReceiptAdmissionRefusalKeepsExactRetry(t *testing.T) {
 		if present, _ := reliableIngressCumulativeHead(sequence); present || len(f.acks) != 0 {
 			t.Fatal("pending original already owns ACK evidence")
 		}
-		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, nil)
+		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, secondPayload, f.requireDataPack)
 		if sequence.nextSequenceNumber != 1 || sequence.ctx.Err() != nil || q.closed ||
 			len(q.items) != 1 || q.items[0].pending != 1 || f.delivered(41001) != 0 {
 			t.Fatal("receipt pressure advanced or canceled the receive owner instead of refusing the complete Pack")
@@ -370,7 +328,7 @@ func TestReceiveReceiptAdmissionRefusalKeepsExactRetry(t *testing.T) {
 		if f.hasAck(f.sequenceId, firstId, false) || f.hasAck(f.sequenceId, firstId, true) {
 			t.Error("capacity refusal acknowledged the first flow without final admission")
 		}
-		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, nil)
+		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, secondPayload, f.requireDataPack)
 		f.offer(f.sequenceId, 0, 0, firstId, 41000, tcpFlagAck, payload)
 		if f.hasAck(f.sequenceId, refusedId, false) || f.hasAck(f.sequenceId, refusedId, true) ||
 			sequence.nextSequenceNumber != 1 || f.delivered(41000) != 1 || f.delivered(41001) != 0 {
@@ -399,12 +357,12 @@ func TestReceiveReceiptAdmissionRefusalKeepsExactRetry(t *testing.T) {
 			t.Fatal("capacity release lost the original pending owner")
 		}
 		f.releaseTcp(f.firstTcp, 41000, payload)
-		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, nil)
+		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, secondPayload, f.requireDataPack)
 		if f.sequence(f.sequenceId, 0) != sequence || f.delivered(41001) != 1 || !f.hasAck(f.sequenceId, refusedId, false) {
 			t.Fatal("same-sequence retry was ACKed without one actual dispatch/final owner")
 		}
-		f.releaseTcp(f.takeTcp(), 41001, nil)
-		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, nil)
+		f.releaseTcp(f.takeTcp(), 41001, secondPayload)
+		f.offer(f.sequenceId, 0, 1, refusedId, 41001, tcpFlagSyn, secondPayload, f.requireDataPack)
 		if f.delivered(41001) != 1 {
 			t.Error("already secured duplicate delivered the second flow twice")
 		}
@@ -548,15 +506,16 @@ func TestReceiveReceiptAdmissionRetainsSelectiveHeldOwner(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		f := newReceiptAdmissionFixture(t, 1)
-		f.paidOffers = true
 		firstId, heldId := NewId(), NewId()
-		f.offer(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, nil)
+		heldPayload := []byte("DATA with selective custody")
+		f.offerDecoded(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, heldPayload, f.requireDataPack)
 		sequence := f.sequence(f.sequenceId, 0)
 		if sequence == nil {
 			t.Fatal("out-of-order owner was not constructed")
 		}
 		held := sequence.receiveQueue.GetByMessageId(heldId)
-		if held == nil || !held.committed || !f.hasAck(f.sequenceId, heldId, true) || held.memoryBudget == nil {
+		if held == nil || !held.committed || !f.hasAck(f.sequenceId, heldId, true) || held.memoryBudget != f.receiveBudget || held.decodedOwner == nil ||
+			!held.decodedOwner.receivePack.receiveMemoryOwned || !held.decodedOwner.receivePack.heldHeadRepairEligible {
 			t.Fatal("actual reorder admission did not secure a selective retained owner")
 		}
 		payload := []byte("pending before retained selective owner")
@@ -565,7 +524,7 @@ func TestReceiveReceiptAdmissionRetainsSelectiveHeldOwner(t *testing.T) {
 			sequence.receiveQueue.GetByMessageId(heldId) != held || f.delivered(41001) != 0 || f.hasAck(f.sequenceId, heldId, false) {
 			t.Fatal("receipt pressure discarded or cumulatively promoted the selectively held owner")
 		}
-		f.offer(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, nil)
+		f.offerDecoded(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, heldPayload, f.requireDataPack)
 		if sequence.receiveQueue.GetByMessageId(heldId) != held || f.delivered(41001) != 0 {
 			t.Fatal("held duplicate replaced the exact selective owner under pressure")
 		}
@@ -575,7 +534,7 @@ func TestReceiveReceiptAdmissionRetainsSelectiveHeldOwner(t *testing.T) {
 			t.Fatal("capacity-only wake did not drain the retained selective owner")
 		}
 		f.releaseTcp(f.firstTcp, 41000, payload)
-		f.releaseTcp(f.takeTcp(), 41001, nil)
+		f.releaseTcp(f.takeTcp(), 41001, heldPayload)
 	})
 }
 
@@ -585,9 +544,9 @@ func TestReceiveReceiptAdmissionSelectiveCancelReturnsOwners(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		f := newReceiptAdmissionFixture(t, 1)
-		f.paidOffers = true
 		firstId, heldId := NewId(), NewId()
-		f.offer(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, nil)
+		heldPayload := []byte("DATA with selective custody")
+		f.offerDecoded(f.sequenceId, 0, 1, heldId, 41001, tcpFlagSyn, heldPayload, f.requireDataPack)
 		f.offer(f.sequenceId, 0, 0, firstId, 41000, tcpFlagAck, []byte("cancel retained selective owner"))
 		sequence := f.sequence(f.sequenceId, 0)
 		if sequence == nil || sequence.ctx.Err() != nil || sequence.receiveQueue.Len() != 1 ||
@@ -618,21 +577,22 @@ func TestReceiveReceiptAdmissionRefusedHeadDoesNotJump(t *testing.T) {
 		f := newReceiptAdmissionFixture(t, 1)
 		firstId, headId := NewId(), NewId()
 		payload := []byte("pending recovery-head predecessor")
+		headPayload := []byte("DATA on the recovery SYN")
 		f.offer(f.sequenceId, 0, 0, firstId, 41000, tcpFlagAck, payload)
 		sequence := f.sequence(f.sequenceId, 0)
 		head := func(pack *ReceivePack) { pack.Pack.Head = true }
-		f.offer(f.sequenceId, 0, 5, headId, 41001, tcpFlagSyn, nil, head)
+		f.offer(f.sequenceId, 0, 5, headId, 41001, tcpFlagSyn, headPayload, head, f.requireDataPack)
 		if sequence == nil || sequence.ctx.Err() != nil || sequence.nextSequenceNumber != 1 ||
 			f.delivered(41001) != 0 || f.hasAck(f.sequenceId, headId, false) {
 			t.Fatal("refused recovery head jumped the receive sequence")
 		}
 		f.releaseTcp(f.firstTcp, 41000, nil)
 		f.releaseTcp(f.firstTcp, 41000, payload)
-		f.offer(f.sequenceId, 0, 5, headId, 41001, tcpFlagSyn, nil, head)
+		f.offer(f.sequenceId, 0, 5, headId, 41001, tcpFlagSyn, headPayload, head, f.requireDataPack)
 		if sequence.nextSequenceNumber != 6 || f.delivered(41001) != 1 || !f.hasAck(f.sequenceId, headId, false) {
 			t.Fatal("admitted recovery head lost existing sender-directed reset semantics")
 		}
-		f.releaseTcp(f.takeTcp(), 41001, nil)
+		f.releaseTcp(f.takeTcp(), 41001, headPayload)
 	})
 }
 
@@ -884,7 +844,12 @@ func TestReceiveReceiptAdmissionUnrelatedPacketClassesStayOrdinary(t *testing.T)
 // pooled: observe their actual frame and joined receive owners instead.
 func (self *receiptAdmissionFixture) offerGeneric(number uint64, messageId Id, size int) {
 	self.t.Helper()
-	self.offer(self.sequenceId, 0, number, messageId, 41000, tcpFlagAck, nil, func(pack *ReceivePack) {
+	self.offerGenericWithDecodedOwner(false, number, messageId, size)
+}
+
+func (self *receiptAdmissionFixture) offerGenericWithDecodedOwner(decoded bool, number uint64, messageId Id, size int) {
+	self.t.Helper()
+	self.offerWithDecodedOwner(decoded, self.sequenceId, 0, number, messageId, 41000, tcpFlagAck, nil, func(pack *ReceivePack) {
 		content := bytes.Repeat([]byte("g"), size-3)
 		frame, err := ToFrame(&protocol.SimpleMessage{Content: string(content)}, DefaultProtocolVersion)
 		if err != nil {
@@ -985,19 +950,18 @@ func TestReceiveReceiptAdmissionLateTcpKeepsOversizeGenericOwner(t *testing.T) {
 					settings.ReceiveQueueBudget = nil
 				}
 			})
-			// Without a receive budget the client decodes unpaid, which this
-			// direct construction matches; the exact arm decodes paid.
-			f.paidOffers = retained
 			delivered := f.observeGeneric()
 			heldId, firstId := NewId(), NewId()
-			f.offerGeneric(1, heldId, size)
+			f.offerGenericWithDecodedOwner(retained, 1, heldId, size)
 			sequence := f.sequence(f.sequenceId, 0)
 			if sequence == nil {
 				t.Fatal("actual ordinary held sequence was not constructed")
 			}
 			held := sequence.receiveQueue.GetByMessageId(heldId)
 			if held == nil || !held.committed || !f.hasAck(f.sequenceId, heldId, true) ||
-				(held.memoryBudget != nil) != retained || sequence.deliveryQueue != nil {
+				(held.memoryBudget != nil) != retained || sequence.deliveryQueue != nil ||
+				retained && (held.decodedOwner == nil || !held.decodedOwner.receivePack.receiveMemoryOwned ||
+					!held.decodedOwner.receivePack.heldHeadRepairEligible) {
 				t.Fatal("ordinary selective custody did not predate provider activation")
 			}
 			providerSettings := DefaultRemoteUserNatProviderSettings()

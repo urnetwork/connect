@@ -1613,8 +1613,8 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 	size := unsafe.Sizeof(decodedTransferFrame{})
 	// Includes optional compression metadata and inline capacity/compression
 	// storage: the hot decoder keeps these fields allocation-free.
-	if size > 680 {
-		t.Fatalf("decoded TransferFrame owner size = %d, want <= 680 bytes", size)
+	if want := uintptr(680 + immediateDecodeWrapperStateByteCount); size != want || size+8 > 704 || decodedTransferFramePoolCapacity != 256 {
+		t.Fatalf("decoded TransferFrame owner=%d expected=%d, header-inclusive limit704, fixed pool256", size, want)
 	}
 	t.Logf(
 		"decoded TransferFrame owner=%d bytes; exact pool ceiling=%d bytes",
@@ -1622,8 +1622,11 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 		uintptr(decodedTransferFramePoolCapacity)*size,
 	)
 	ackSize := unsafe.Sizeof(receiveAckMessage{})
-	if ackSize > 104 {
-		t.Fatalf("compact receive ACK size = %d, want <= 104 bytes", ackSize)
+	// The existing 104-byte compact handoff gains exactly the declared
+	// Immediate ordinal/flags/alignment state, not a new queue or count.
+	// Keep the separately accounted wrapper class and fixed 1-KiB Pack envelope.
+	if want := uintptr(104 + immediateAckOrdinalStateByteCount); ackSize != want {
+		t.Fatalf("compact receive ACK size = %d, want exact baseline plus Immediate receipt state, %d", ackSize, want)
 	}
 	t.Logf("compact receive ACK=%d bytes", ackSize)
 }
@@ -1635,9 +1638,9 @@ func TestDecodedPackOwnerPoolRetentionIsBounded(t *testing.T) {
 		t.Fatalf("decoded Pack owner charge = %d, exceeds the 1-KiB allowance", decodedPackOwnerQueueByteCount)
 	}
 	size := unsafe.Sizeof(decodedPackOwner{})
-	if size > uintptr(decodedPackOwnerQueueByteCount) {
+	if size+8 > uintptr(decodedPackOwnerQueueByteCount) {
 		t.Fatalf(
-			"decoded Pack owner size = %d, exceeds %d-byte receive-budget charge",
+			"decoded Pack owner size = %d plus header8 exceeds %d-byte receive-budget charge",
 			size,
 			decodedPackOwnerQueueByteCount,
 		)

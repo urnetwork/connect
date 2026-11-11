@@ -163,7 +163,7 @@ func TestReceiveConsumerFutureHeldHeadUsesPaidChild(t *testing.T) {
 			len(fixture.receiverOut) != 0 || fixture.deliveredCount != 1 || fixture.ackedCount != 1 {
 			t.Fatal("CONSUMER_FUTURE_HELD_TENTATIVE_REPLACEMENT_PREMISE_FAILED")
 		}
-		originalOwner, originalTag, originalReceipt := held.decodedOwner, held.tag, held.receiveTime
+		originalOwner, originalTag, originalReceipt := held.decodedOwner, held.receiveTag(), held.receiveTime
 		originalPayload := append([]byte(nil), held.frames[0].MessageBytes...)
 		arrival := pressureContractNaturalRetry(t, fixture, tail.pack)
 		if !arrival.pack.Head || arrival.pack.ContractFrame == nil || arrival.pack.ContractId != nil ||
@@ -199,7 +199,7 @@ func TestReceiveConsumerFutureHeldHeadUsesPaidChild(t *testing.T) {
 		}
 		fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, peer Peer) {
 			if peer.TransferKey.LogicalLane == tail.pack.LogicalLane {
-				originalDelivered = held.decodedOwner == originalOwner && held.tag == originalTag && held.receiveTime == originalReceipt &&
+				originalDelivered = held.decodedOwner == originalOwner && held.receiveTag() == originalTag && held.receiveTime == originalReceipt &&
 					len(frames) == 1 && bytes.Equal(frames[0].MessageBytes, originalPayload)
 			}
 		})

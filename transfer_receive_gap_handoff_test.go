@@ -98,8 +98,8 @@ func TestReceiveSequenceGapHandoffDoesNotRefillExpiredPrefix(t *testing.T) {
 		startReceiveGapHandoffTest(t, sequence)
 		waitReceiveGapTestExit(t, sequence)
 		entries := log.messages()
-		if snapshots != 1 || prefix != 1 || !admitted || admissionErr != nil || sequence.nextSequenceNumber != 0 || delivered.Load() != 0 || len(sequence.packs) != 1 || len(entries) != 1 || !strings.Contains(entries[0], "exit gap timeout expected=0 queued=1") {
-			t.Fatalf("expired prefix was refilled: first=%d snapshots=%d prefix=%d admitted=%t err=%v next=%d delivered=%d queued=%d logs=%v", first, snapshots, prefix, admitted, admissionErr, sequence.nextSequenceNumber, delivered.Load(), len(sequence.packs), entries)
+		if snapshots != 1 || prefix != 1 || !admitted || admissionErr != nil || sequence.nextSequenceNumber != 0 || delivered.Load() != 0 || len(sequence.protocolPacks) != 1 || len(entries) != 1 || !strings.Contains(entries[0], "exit gap timeout expected=0 queued=1") {
+			t.Fatalf("expired prefix was refilled: first=%d snapshots=%d prefix=%d admitted=%t err=%v next=%d delivered=%d queued=%d logs=%v", first, snapshots, prefix, admitted, admissionErr, sequence.nextSequenceNumber, delivered.Load(), len(sequence.protocolPacks), entries)
 		}
 	}
 }
@@ -121,8 +121,8 @@ func TestReceiveSequenceGapHandoffCancellationPreservesOwnership(t *testing.T) {
 	}
 	startReceiveGapHandoffTest(t, sequence)
 	waitReceiveGapTestExit(t, sequence)
-	if snapshots != 1 || delivered.Load() != 0 || sequence.nextSequenceNumber != 0 || len(log.messages()) != 0 || len(sequence.packs) != 1 {
-		t.Fatalf("canceled census dispatched or timed out: snapshots=%d delivered=%d next=%d retained=%d logs=%v", snapshots, delivered.Load(), sequence.nextSequenceNumber, len(sequence.packs), log.messages())
+	if snapshots != 1 || delivered.Load() != 0 || sequence.nextSequenceNumber != 0 || len(log.messages()) != 0 || len(sequence.protocolPacks) != 1 {
+		t.Fatalf("canceled census dispatched or timed out: snapshots=%d delivered=%d next=%d retained=%d logs=%v", snapshots, delivered.Load(), sequence.nextSequenceNumber, len(sequence.protocolPacks), log.messages())
 	}
 }
 
@@ -159,6 +159,7 @@ func TestReceiveSequenceGapHandoffReconcilesReadyRendezvous(t *testing.T) {
 		})
 		addReceiveGapTestItem(t, sequence, 1, time.Now().Add(-time.Hour), true)
 		pack := receiveGapHandoffPackTest(sequence, 0)
+		pack.Pack.Frames[0].MessageType = protocol.MessageType_TestSimpleMessage
 		type admissionResult struct {
 			admitted bool
 			err      error

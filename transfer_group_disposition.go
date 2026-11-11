@@ -134,6 +134,9 @@ func (self *SendSequence) groupDequeued(pack *SendPack) {
 // An already-admitted raw group cannot wait while holding a retained range
 // charge needed by its suffix. Dispose only raw members; prefix proof stays.
 func (self *SendSequence) unfundedRawGroup(pack *SendPack) bool {
+	if pack.NoBudget {
+		return false
+	}
 	group, tracked := pack.ackTarget.(*parsedPacketGroup)
 	if !tracked || group.completionFlags.Load()&groupCompletionTracked == 0 || !pack.logicalGroup ||
 		!self.resendQueue.lifetimeBudget || self.resendQueue.budget == nil {

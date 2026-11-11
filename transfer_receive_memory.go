@@ -140,9 +140,10 @@ func (self *ReceiveSequence) bindReceiveMemoryOwner(pack *ReceivePack) bool {
 	}
 	budget := pack.decodedOwner.receiveItem.memoryBudget
 	recoveryOwner := budget != self.receiveQueue.budget
+	freshOpening := recoveryOwner && pack.decodedOwner.receiveItem.receiveFreshOpening && pack.ingressSequence == nil
 	if recoveryOwner {
 		if budget == nil || budget != self.receiveBufferSettings.receiveHeadRecoveryBudget() ||
-			pack.ingressSequence != self || pack.ingressLoanByteCount != 0 {
+			(!freshOpening && pack.ingressSequence != self) || pack.ingressLoanByteCount != 0 {
 			return false
 		}
 	}
@@ -152,8 +153,19 @@ func (self *ReceiveSequence) bindReceiveMemoryOwner(pack *ReceivePack) bool {
 	if self.holdPromise.closed || self.ctx.Err() != nil {
 		return false
 	}
+	if freshOpening {
+		if !self.bindReceiveFreshOpeningWithLock(pack) {
+			return false
+		}
+		self.registerReceiveIngressWithLock(pack)
+		return true
+	}
 	if recoveryOwner {
-		if !receiveHeadRecoveryPack(pack.Pack) && !receiveHeadRecoveryOpeningPack(pack.Pack) &&
+		// A fully paid past original carries receipt recovery, regardless of
+		// application frame type. It cannot enter application delivery again.
+		pastDuplicate := pack.Pack != nil && !pack.Pack.Nack && !pack.Pack.ContractAhead &&
+			pack.Pack.SequenceNumber < self.holdPromise.ingressFloor
+		if !pastDuplicate && !receiveHeadRecoveryPack(pack.Pack) && !receiveHeadRecoveryOpeningPack(pack.Pack) &&
 			self.heldHeadRepair.owner != pack.decodedOwner &&
 			(self.client == nil || !self.client.reliableProviderIngress.Load() || !receiveProviderHeadRecoveryPack(pack.Pack)) {
 			return false

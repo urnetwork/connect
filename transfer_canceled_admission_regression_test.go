@@ -71,6 +71,10 @@ func TestSendBufferCallerCancelWhileWaitingForCreationLock(t *testing.T) {
 	accepted := &sendPackCallerOwnerFixture{client: client,
 		id: sendSequenceId{Destination: NewId(), EncryptionRole: sequenceTlsRoleClient}}
 	accepted.fill(t)
+	before := ledger.Snapshot()
+	if !before.Complete || before.Send.Workers != 1 || before.Send.AdmittedTotal != 1 || before.Send.KnownChannelSlotBytes <= 0 {
+		t.Fatalf("accepted sibling did not publish its actual fixed ownership: %+v", before)
+	}
 	refused := &sendPackCallerOwnerFixture{client: client,
 		id: sendSequenceId{Destination: NewId(), EncryptionRole: sequenceTlsRoleClient}}
 	callerCtx, cancelCaller := context.WithCancel(context.Background())
@@ -101,8 +105,7 @@ func TestSendBufferCallerCancelWhileWaitingForCreationLock(t *testing.T) {
 	// The only allowed worker, channel slots and cache entries belong to the
 	// earlier accepted siblings. Include admitted_total to catch transient owners.
 	snapshot := ledger.Snapshot()
-	if !snapshot.Complete || snapshot.Send.Workers != 1 || snapshot.Send.AdmittedTotal != 1 ||
-		snapshot.Send.KnownChannelSlotBytes != 2*8 || snapshot.Send.CleanupWorkers != 0 {
+	if !snapshot.Complete || snapshot.Send != before.Send {
 		t.Errorf("canceled caller acquired sequence ownership: %+v", snapshot)
 	}
 	buffer.mutex.Lock()

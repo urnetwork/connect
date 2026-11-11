@@ -17,22 +17,38 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root := NewTransferMemoryBudget(mib(1))
 		budget := NewTransferMemoryBudgetWithParent(kib(64), root)
+		t.Cleanup(func() {
+			for _, owner := range []*TransferMemoryBudget{budget, root} {
+				if owner.UsedByteCount() != 0 || owner.reservedByteCount.Load() != owner.releasedByteCount.Load() {
+					t.Error("promised data fixture did not return every physical reservation")
+				}
+			}
+		})
 		f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
 		sequence := f.runningReceiveSequence(reliableIngressBudgetSettings(budget))
 		payload := bytes.Repeat([]byte{0x6d}, 1200)
-		// Since 00d4f62b only a paid decoded owner can fund the repair escrow
-		// a selective lease needs, so both originals use the production
-		// scanner and paid decoder, as the client's receive loop does.
-		laterId := f.packOwnedTcp(sequence, 1, 1301, payload)
+		later, laterId := f.uploadPack(sequence, 1, 1301, payload)
+		later = receiveDeliveryMergeOwnedPack(t, f, sequence, later)
+		if protocolOnlyPack(later.Pack) || later.decodedOwner.receiveItem.QueueByteCount() <= 0 {
+			later.messagePoolReturn()
+			t.Fatal("promised successor did not enter as genuine paid DATA")
+		}
+		if ok, err := sequence.Pack(later, 0); !ok || err != nil {
+			later.messagePoolReturn()
+			t.Fatalf("later Pack handoff: ok=%t err=%v", ok, err)
+		}
 		synctest.Wait()
 		held := sequence.receiveQueue.GetByMessageId(laterId)
 		if held == nil || !held.committed || held.memoryBudget != budget ||
 			sequence.holdPromise.reservedByteCount != held.queueByteCount {
 			t.Fatal("successor did not prepay its missing data head")
 		}
+		// Real decoded custody pays the original, its equal-size predecessor
+		// and the separate no-contract repair owner before issuing a SACK.
 		repairBytes := assertReliableIngressRepairCustody(t, sequence, held)
-		if budget.UsedByteCount() != held.queueByteCount+sequence.holdPromise.reservedByteCount+repairBytes {
-			t.Fatal("successor's lease has unexplained receive ownership")
+		if repairBytes != 1024 || budget.UsedByteCount() != 2*held.queueByteCount+repairBytes ||
+			!held.deliveryPrepared || held.deliveryPrepaid <= 0 {
+			t.Fatal("successor did not separately fund DATA, downstream custody and repair metadata")
 		}
 		fill := root.Available()
 		if !root.TryReserve(fill) {
@@ -40,13 +56,12 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 		}
 		defer root.Release(fill)
 		reserved, released := root.reservedByteCount.Load(), root.releasedByteCount.Load()
-		input, _ := f.uploadPack(sequence, 0, 101, payload)
-		head := func() *ReceivePack {
-			defer input.messagePoolReturn()
-			return f.decodeOwnedPack(sequence, input)
-		}()
-		if head == nil {
-			t.Fatal("prepaid data head could not decode at the full root from its promised credit")
+		head, _ := f.uploadPack(sequence, 0, 101, payload)
+		head = receiveDeliveryMergeOwnedPack(t, f, sequence, head)
+		if protocolOnlyPack(head.Pack) || head.ingressLoanByteCount != head.decodedOwner.receiveItem.QueueByteCount() ||
+			head.ingressLoanByteCount <= 0 || root.reservedByteCount.Load() != reserved || root.releasedByteCount.Load() != released {
+			head.messagePoolReturn()
+			t.Fatal("head decode did not take exact physical custody from the already paid predecessor promise")
 		}
 		if ok, err := sequence.Pack(head, 0); !ok || err != nil {
 			head.messagePoolReturn()
@@ -59,7 +74,8 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 			t.Fatal("prepaid data head was refused at the full root instead of taking its promised owner")
 		}
 		if root.UsedByteCount() != root.TotalByteCount() || root.reservedByteCount.Load() != reserved ||
-			root.releasedByteCount.Load() != released {
+			root.releasedByteCount.Load() != released || sequence.heldHeadRepair.reservedByteCount != repairBytes ||
+			sequence.heldHeadRepair.eligibleCount != 1 {
 			t.Fatal("head admission released or re-reserved promised memory")
 		}
 		if present, _ := reliableIngressCumulativeHead(sequence); present {
@@ -81,7 +97,8 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 			}
 		}
 		synctest.Wait()
-		if present, ack := reliableIngressCumulativeHead(sequence); !present || ack.messageId != laterId || budget.UsedByteCount() != 0 {
+		if present, ack := reliableIngressCumulativeHead(sequence); !present || ack.messageId != laterId || budget.UsedByteCount() != 0 ||
+			sequence.heldHeadRepair != (receiveHeldHeadRepair{}) {
 			t.Fatal("final admission did not settle the exact receive owners and cumulative prefix")
 		}
 	})

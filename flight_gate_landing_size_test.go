@@ -49,32 +49,42 @@ const (
 	pacingBurstStateByteCount = 8
 	// Mobile retained admission follows an item through retries and teardown.
 	retainedBudgetOwnerByteCount = 8
+	// Reliable Immediate adds one ordinal, its presence and terminal flags,
+	// plus alignment to both ACK values: actual arm64 descriptors are 112/120
+	// versus 96/104 before this option. Ordinary message IDs are unchanged.
+	immediateAckOrdinalStateByteCount = 16
+	// The generated ACK optional ordinal adds8 and its owned decoder's scalar
+	// storage adds8; the fixed256 wrapper cache retains the same pool count.
+	immediateDecodeWrapperStateByteCount = 16
+	// The two per-item Immediate flags extend the existing eight-byte flag
+	// run across one aligned word. The retained item is 600 bytes without first-DATA reservations.
+	immediateSendItemPolicyStateByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
-	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount+ackArrivalStateByteCount); got != want {
-		t.Errorf("sequenceAck is %d bytes, want baseline plus one arrival timestamp, %d",
+	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount+ackArrivalStateByteCount+immediateAckOrdinalStateByteCount); got != want {
+		t.Errorf("sequenceAck is %d bytes, want baseline plus arrival and Immediate receipt state, %d",
 			got, want)
 	}
 	if got, want := unsafe.Sizeof(receiveAckMessage{}),
 		uintptr(mergedReceiveAckMessageByteCount+
 			receiveAdvertisementStateByteCount+
-			evictionNoticeStateByteCount+ackCompressionStateByteCount+ackArrivalStateByteCount); got != want {
+			evictionNoticeStateByteCount+ackCompressionStateByteCount+ackArrivalStateByteCount+immediateAckOrdinalStateByteCount); got != want {
 		t.Errorf(
-			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions, %d for compression and 8 for arrival",
+			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions, %d for compression and 8 for arrival plus %d for Immediate receipt state",
 			got, mergedReceiveAckMessageByteCount,
-			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount, ackCompressionStateByteCount,
+			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount, ackCompressionStateByteCount, immediateAckOrdinalStateByteCount,
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount + immediateSendItemPolicyStateByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
 				"and %d for the lane position it last looked at, plus %d for paced wire bytes and actual write time "+
-				"and %d for the actual burst epoch plus %d for the lifetime budget owner; "+
+				"and %d for the actual burst epoch plus %d for the lifetime budget owner plus %d for aligned Immediate flags; "+
 				"anything else means a removed mechanism left a field behind",
-			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount, retainedBudgetOwnerByteCount,
+			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount, retainedBudgetOwnerByteCount, immediateSendItemPolicyStateByteCount,
 		)
 	}
 }

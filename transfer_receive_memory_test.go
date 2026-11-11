@@ -303,7 +303,7 @@ func TestReceiveMemoryOwnerEnvelopeStillFitsAllocationClass(t *testing.T) {
 // key without modifying ciphertext. No new root reservation is available.
 func TestReceiveMemoryKnownCarrierDecryptAtFullPromisedRoot(t *testing.T) {
 	assertMessagePoolOwnership(t)
-	for _, count := range []int{0, 8} {
+	for _, count := range []int{0, 1, 8} {
 		func() {
 			const maximum = 16 * 1024
 			root, rx, buffer, sequence := receiveMemoryTestState(t, 128*1024)
@@ -322,8 +322,8 @@ func TestReceiveMemoryKnownCarrierDecryptAtFullPromisedRoot(t *testing.T) {
 			preview := MessagePoolCopy(plain)
 			scan, status := scanReceiveMemoryPack(preview, path)
 			MessagePoolReturn(preview)
-			if status != receiveMemoryPackScanReady {
-				t.Fatal("valid inner preflight failed")
+			if status != receiveMemoryPackScanReady || !scan.loanSafe || scan.frameCount != count || scan.protocolFrameCount != 0 {
+				t.Fatal("inner preflight lost empty-protocol versus genuine DATA classification")
 			}
 			sequence.transferKey = TransferKey{ForceStream: true, CompanionContract: true, LogicalLane: 3}
 			buffer.receiveSequences = map[receiveSequenceId]*ReceiveSequence{{Source: path.SourceMask(), SequenceId: sequenceId, EncryptionRole: sequenceTlsRoleServer, LogicalLane: 3}: sequence}
@@ -401,14 +401,24 @@ func TestReceiveMemoryKnownCarrierDecryptAtFullPromisedRoot(t *testing.T) {
 			}
 			owner := decoded.detachPackOwner()
 			decoded.release()
-			if owner == nil || owner.receiveItem.memoryBudget != rx || owner.receivePack.ingressLoanByteCount != scan.retainedByteCount || root.Available() != 0 {
+			funded := owner != nil && owner.receiveItem.memoryBudget == rx && owner.receivePack.receiveMemoryOwned &&
+				owner.receivePack.ingressLoanByteCount == scan.retainedByteCount && sequence.holdPromise.reservedByteCount == 0
+			if count == 0 {
+				// Empty openings are protocol, so their real owned decode must not
+				// consume the unrelated paid DATA prefix even at the full root.
+				funded = owner != nil && owner.receiveItem.memoryBudget == nil && !owner.receivePack.receiveMemoryOwned &&
+					owner.receivePack.ingressLoanByteCount == 0 && sequence.holdPromise.ingressLoanByteCount == 0 &&
+					sequence.holdPromise.reservedByteCount == scan.retainedByteCount
+			}
+			if !funded || root.Available() != 0 {
 				MessagePoolReturn(inner)
 				inner = nil
 				if owner != nil {
 					owner.release()
 				}
-				t.Fatal("decrypted owner was not converted from its exact promise")
+				t.Fatal("decrypted DATA/protocol owner violated its exact application-memory custody")
 			}
+			t.Logf("[rx-full-root-decrypt] frames=%d protocol=%t physical=%d loan=%d root_free=0", count, count == 0, scan.retainedByteCount, owner.receivePack.ingressLoanByteCount)
 			owner.receivePack.TransferFrameBytes = inner
 			inner = nil
 			MessagePoolReturn(outer)
@@ -435,16 +445,19 @@ func TestReceiveMemoryNoAckCannotBorrowReliablePrefix(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
 	messageId, sequenceId := NewId(), NewId()
+	data := receiveMemoryTestFromProviderFrame(t, []byte{0x42})
 	encode := func(nack bool) []byte {
 		frame := sendPackFrame{messageId: messageId, sequenceId: sequenceId, sequenceNumber: 0, nack: nack,
-			forceStream: true, companionContract: true, logicalLane: 3}
+			forceStream: true, companionContract: true, logicalLane: 3, frames: []*protocol.Frame{data}}
 		return MessagePoolCopy(receiveMemoryScanTestWire(path, frame.appendPack(nil), false))
 	}
 	noAck, head := encode(true), encode(false)
 	defer func() { MessagePoolReturn(noAck); MessagePoolReturn(head) }()
 	scan, status := scanReceiveMemoryPack(noAck, path)
 	headScan, headStatus := scanReceiveMemoryPack(head, path)
-	if status != receiveMemoryPackScanReady || !scan.nack || !scan.loanSafe || scan.sequenceNumber != 0 || headStatus != receiveMemoryPackScanReady || scan.retainedByteCount != headScan.retainedByteCount {
+	if status != receiveMemoryPackScanReady || !scan.nack || !scan.loanSafe || scan.sequenceNumber != 0 ||
+		scan.frameCount != 1 || scan.protocolFrameCount != 0 || headStatus != receiveMemoryPackScanReady ||
+		headScan.nack || !headScan.loanSafe || headScan.frameCount != 1 || headScan.protocolFrameCount != 0 || scan.retainedByteCount != headScan.retainedByteCount {
 		t.Fatal("NoAck/reliable zero-sequence premise changed")
 	}
 	cost := scan.retainedByteCount
@@ -503,16 +516,18 @@ func TestReceiveMemoryNoAckOwnerDoesNotBlockPromisedHead(t *testing.T) {
 		func() {
 			path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
 			sequenceId, noAckId, headId := NewId(), NewId(), NewId()
+			data := receiveMemoryTestFromProviderFrame(t, []byte{0x42})
 			encode := func(id Id, nack bool) []byte {
 				frame := sendPackFrame{messageId: id, sequenceId: sequenceId, sequenceNumber: 0, nack: nack,
-					forceStream: true, companionContract: true, logicalLane: 3}
+					forceStream: true, companionContract: true, logicalLane: 3, frames: []*protocol.Frame{data}}
 				return MessagePoolCopy(receiveMemoryScanTestWire(path, frame.appendPack(nil), false))
 			}
 			noAckWire, headWire := encode(noAckId, true), encode(headId, false)
 			defer func() { MessagePoolReturn(noAckWire); MessagePoolReturn(headWire) }()
 			scan, status := scanReceiveMemoryPack(noAckWire, path)
 			headScan, headStatus := scanReceiveMemoryPack(headWire, path)
-			if status != receiveMemoryPackScanReady || !scan.nack || !scan.loanSafe || headStatus != receiveMemoryPackScanReady || headScan.nack || !headScan.loanSafe || scan.retainedByteCount != headScan.retainedByteCount {
+			if status != receiveMemoryPackScanReady || !scan.nack || !scan.loanSafe || scan.frameCount != 1 || scan.protocolFrameCount != 0 ||
+				headStatus != receiveMemoryPackScanReady || headScan.nack || !headScan.loanSafe || headScan.frameCount != 1 || headScan.protocolFrameCount != 0 || scan.retainedByteCount != headScan.retainedByteCount {
 				t.Fatal("coexisting zero-original premise changed")
 			}
 			cost := scan.retainedByteCount
@@ -602,5 +617,102 @@ func TestReceiveMemoryNoAckOwnerDoesNotBlockPromisedHead(t *testing.T) {
 			}
 			t.Logf("[rx-noack-coexistence] legacy_binding=%t cost=%d same_head_retry=%t root_balanced=true", legacyBinding, cost, legacyBinding)
 		}()
+	}
+}
+
+// ipOosTcpPacketSequence returns ordinary immutable Go storage. Encoding borrows
+// it; only the caller's pooled wire and actual decoded roots need returning.
+func receiveMemoryTestFromProviderFrame(t *testing.T, payload []byte) *protocol.Frame {
+	t.Helper()
+	packet := ipOosTcpPacketSequence(reliableDeliveryTestPath(4), tcpFlagAck, 7, payload)
+	frame, err := ipPacketFromProviderFrame(packet, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
+}
+
+// Empty and pure TCP ACK Packs keep their protocol exemption, for reliable and
+// NoAck delivery alike. This is an ingress decode/custody test, not a claim
+// about how many future protocol originals the receive worker may retain.
+func TestReceiveMemoryProtocolDecodeKeepsReliablePromiseAtFullRoot(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	for _, empty := range []bool{true, false} {
+		for _, nack := range []bool{false, true} {
+			func() {
+				path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
+				sequenceId := NewId()
+				encode := func(frames []*protocol.Frame, noAck bool) []byte {
+					frame := sendPackFrame{messageId: NewId(), sequenceId: sequenceId, sequenceNumber: 0,
+						nack: noAck, forceStream: true, companionContract: true, logicalLane: 3, frames: frames}
+					return MessagePoolCopy(receiveMemoryScanTestWire(path, frame.appendPack(nil), false))
+				}
+				dataWire := encode([]*protocol.Frame{receiveMemoryTestFromProviderFrame(t, []byte{0x42})}, false)
+				defer MessagePoolReturn(dataWire)
+				dataScan, dataStatus := scanReceiveMemoryPack(dataWire, path)
+				if dataStatus != receiveMemoryPackScanReady || !dataScan.loanSafe || dataScan.nack || dataScan.frameCount != 1 || dataScan.protocolFrameCount != 0 {
+					t.Fatal("reliable prefix capacity must come from a real nonempty DATA owner")
+				}
+				var frames []*protocol.Frame
+				if !empty {
+					frames = []*protocol.Frame{receiveMemoryTestFromProviderFrame(t, nil)}
+				}
+				wire := encode(frames, nack)
+				defer func() { MessagePoolReturn(wire) }()
+				scan, status := scanReceiveMemoryPack(wire, path)
+				if status != receiveMemoryPackScanReady || !scan.loanSafe || scan.nack != nack || scan.frameCount != len(frames) || scan.protocolFrameCount != len(frames) {
+					t.Fatal("empty/pure ACK protocol classification changed")
+				}
+				cost := dataScan.retainedByteCount
+				root, rx, buffer, sequence := receiveMemoryTestState(t, cost)
+				sequence.nextSequenceNumber = 0
+				sequence.transferKey = TransferKey{ForceStream: true, CompanionContract: true, LogicalLane: 3}
+				buffer.receiveSequences = map[receiveSequenceId]*ReceiveSequence{{Source: path.SourceMask(), SequenceId: sequenceId, EncryptionRole: sequenceTlsRoleClient, LogicalLane: 3}: sequence}
+				settings := DefaultClientSettings()
+				settings.ReceiveBufferSettings = sequence.receiveBufferSettings
+				settings.EncryptionSettings.Mode = EncryptionModeOff
+				client := &Client{settings: settings, receiveBuffer: buffer, log: DefaultLogger()}
+				if !sequence.reserveHoldPromise(cost) {
+					t.Fatal("real DATA prefix promise was not funded")
+				}
+				sequence.settleHoldPromise(true, 1, cost)
+				if root.Available() != 0 || root.Stats().UsedByteCount != cost || rx.Stats().UsedByteCount != cost {
+					t.Fatal("protocol ingress premise is not an exactly full paid DATA root")
+				}
+				rootReserved, rootReleased := root.Counts()
+				rxReserved, rxReleased := rx.Counts()
+				decoded := &decodedTransferFrame{}
+				ok, pressure := client.unmarshalReceiveMemoryFrame(wire, decoded, false, path, false, sequenceTlsRoleServer, false)
+				owner := decoded.detachPackOwner()
+				decoded.release()
+				defer func() {
+					if owner != nil {
+						owner.release()
+					}
+				}()
+				if !ok || pressure || owner == nil || owner.receivePack.receiveMemoryOwned || owner.receiveItem.memoryBudget != nil ||
+					owner.receivePack.ingressLoanByteCount != 0 || owner.receivePack.ingressSequence != nil ||
+					sequence.holdPromise.reservedByteCount != cost || sequence.holdPromise.ingressLoanByteCount != 0 || sequence.holdPromise.ingressHead != nil {
+					t.Fatal("protocol decode borrowed, registered, or consumed the paid DATA prefix")
+				}
+				// This decoder-only fixture has not attached a ReceivePack for
+				// worker handoff. Return its detached owner and carrier separately.
+				owner.release()
+				owner = nil
+				MessagePoolReturn(wire)
+				wire = nil
+				afterRootReserved, afterRootReleased := root.Counts()
+				afterRxReserved, afterRxReleased := rx.Counts()
+				if afterRootReserved != rootReserved || afterRootReleased != rootReleased || afterRxReserved != rxReserved || afterRxReleased != rxReleased ||
+					root.Available() != 0 || root.Stats().UsedByteCount != cost || rx.Stats().UsedByteCount != cost || sequence.holdPromise.reservedByteCount != cost {
+					t.Fatal("protocol owner return changed application capacity or its exact promise")
+				}
+				sequence.releaseHoldPromise()
+				if root.Stats().UsedByteCount != 0 || rx.Stats().UsedByteCount != 0 || rx.Stats().QuotaByteCount != 0 {
+					t.Fatal("protocol decode/prefix terminal custody did not balance")
+				}
+				t.Logf("[rx-protocol-full-root] empty=%t nack=%t data_cost=%d application_charge=0 promise_unchanged=true", empty, nack, cost)
+			}()
+		}
 	}
 }

@@ -1,5 +1,5 @@
 // A cold consumer lane can retain paid application data while its genuine
-// opening contract is missing. That empty control needs funded decode too.
+// opening contract is missing. Empty control must bypass DATA byte pressure.
 package connect
 
 import (
@@ -161,11 +161,12 @@ func testReceiveConsumerOpeningHead(t *testing.T, badMac bool) {
 		sequence.ackWindow.afterUpdateForTest = func() { ackUpdates.Add(1) }
 		observed, paid := false, false
 		sequence.receiveBufferSettings.receiveOwnerStageForTest = func(actual *ReceiveSequence, owner *decodedPackOwner, stage string) {
-			if actual == sequence && owner != nil && stage == "pack_released" && owner.receiveItem.messageId == scan.messageId {
+			if actual == sequence && owner != nil && stage == "pack_released" && bytes.Equal(owner.pack.MessageId, scan.messageId[:]) {
 				observed = true
-				paid = owner.receiveItem.memoryBudget == recovery && owner.receiveItem.QueueByteCount() == scan.retainedByteCount &&
-					owner.receivePack.ingressLoanByteCount == 0 && recovery.UsedByteCount() == scan.retainedByteCount &&
-					rx.UsedByteCount() == rxBytes && root.UsedByteCount() == rxBytes+scan.retainedByteCount &&
+				paid = owner.receiveItem.memoryBudget == nil && owner.receiveItem.QueueByteCount() == 0 &&
+					!owner.receivePack.receiveMemoryOwned && owner.receivePack.ingressSequence == nil &&
+					owner.receivePack.ingressLoanByteCount == 0 && recovery.UsedByteCount() == 0 &&
+					rx.UsedByteCount() == rxBytes && root.UsedByteCount() == rxBytes &&
 					root.UsedByteCount() <= root.TotalByteCount() && !sequence.holdPromise.set &&
 					sequence.holdPromise.reservedByteCount == 0 && !sequence.memoryPressure.activeSet
 			}
@@ -200,12 +201,12 @@ func testReceiveConsumerOpeningHead(t *testing.T, badMac bool) {
 
 // Empty opening control derives its consumer role from the same sequence's
 // actual paid later FromProvider data, then uses ordinary contract verification.
-func TestReceiveConsumerOpeningContractUsesPaidChild(t *testing.T) {
+func TestReceiveProtocolOpeningContractAtFullDataBudget(t *testing.T) {
 	testReceiveConsumerOpeningHead(t, false)
 }
 
 // A paid control still has no proof authority. A changed MAC closes only its
 // own cold lane without acknowledging or delivering the retained application.
-func TestReceiveConsumerOpeningContractBadMacUsesPaidChild(t *testing.T) {
+func TestReceiveProtocolOpeningContractBadMacAtFullDataBudget(t *testing.T) {
 	testReceiveConsumerOpeningHead(t, true)
 }

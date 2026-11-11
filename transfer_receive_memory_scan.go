@@ -63,6 +63,7 @@ type receiveMemoryPackScan struct {
 	packOffset            int
 	packByteCount         int
 	frameCount            int
+	protocolFrameCount    int
 	consumerFrameCount    int
 	providerFrameCount    int
 	providerTcpFrameCount int
@@ -375,7 +376,7 @@ func receiveMemoryScanPackBody(body []byte, base int, scan *receiveMemoryPackSca
 		if !ok {
 			return false
 		}
-		if field.number >= 1 && field.number <= 13 && field.number != 5 {
+		if field.number >= 1 && field.number <= 14 && field.number != 5 {
 			bit := uint16(1) << uint(field.number-1)
 			if seen&bit != 0 {
 				scan.loanSafe = false
@@ -412,7 +413,7 @@ func receiveMemoryScanPackBody(body []byte, base int, scan *receiveMemoryPackSca
 				scan.contractIdSet = true
 				contractValid = valid
 			}
-		case 3, 4, 6, 10, 11, 12, 13:
+		case 3, 4, 6, 10, 11, 12, 13, 14:
 			if field.wireType != protowire.VarintType {
 				return false
 			}
@@ -464,6 +465,9 @@ func receiveMemoryScanPackBody(body []byte, base int, scan *receiveMemoryPackSca
 					return false
 				}
 				scan.frameCount++
+				if protocolOnlyWireFrame(field.bytes) {
+					scan.protocolFrameCount++
+				}
 				if kind == int32(protocol.MessageType_IpIpPacketFromProvider) && size > 0 {
 					scan.consumerFrameCount++
 				}
