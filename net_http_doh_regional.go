@@ -17,6 +17,19 @@ type RegionalDnsServer struct {
 // the well known regional dns servers, associated to country codes.
 // these are suggestions that clients can surface when connected to the region.
 //
+// Each entry serves two paths. The egress recommendation
+// (RegionalDnsResolverSettings), which the apps, the server's hosted proxies
+// and its quality probe use, sends plain dns through the tunnel, so the
+// server must answer queries from provider exits in the country, on any of
+// its networks. The ingress fallback (IngressDnsStrategyForCountry) sends
+// plain dns from the user's own network in the country. So an entry is a
+// public address (isPublicUnicastAddr): the egress policy of both roles
+// refuses any other destination (ip_security_public.go), and the plain dns
+// path, which walks its servers one per resolver attempt, would spend an
+// attempt of every other lookup on a query that never leaves the device. And
+// an entry answers recursively from every network of its country, not only
+// from its operator's own customers.
+//
 // No country lists Google Public DNS (owner decision 2026-11-08, see
 // DefaultDnsResolverSettings). kz listed only Google; Cloudflare and Quad9,
 // both default operators already, take its place. In OONI dnscheck from kz,
@@ -24,7 +37,50 @@ type RegionalDnsServer struct {
 // and Quad9's most of them, and the two networks that blocked DoH (Aug, Sep)
 // blocked Google's too. Quad9 is its unfiltered 9.9.9.10, as in the defaults;
 // the measurements were of its filtering 9.9.9.9, the same operator and
-// anycast network. tm keeps Turkmentelecom alone until another resolver is
+// anycast network.
+//
+// ir's recommendation is Shecan and Electro, open recursive resolvers in
+// Iran (AS43754 and AS62442). Until 2026-11-11 it also named 403.online at
+// 10.202.10.10, a private address that only Iranian networks route and that
+// no query through the tunnel can reach. On 2026-11-11 both answered
+// recursively from the US, 220-290 ms away and so in Iran, with the
+// platform's names and common names right, and with Iran's rewrites
+// (google.com as its SafeSearch address, some Cloudflare-hosted names as other
+// Cloudflare addresses). URnetwork has no exit in Iran (provider-locations,
+// 2026-11-11) and OONI does not query them, so neither is measured from
+// inside. In OONI from Iran (Oct-Nov 2026) DoH to Cloudflare and Quad9 failed
+// 99% of the time on nine networks, TCI and MCI among them, and plain UDP to
+// 1.1.1.1 answered 94% of queries on eight networks (TCI, MCI, RighTel,
+// Respina, Shatel, Farahoosh, FDI and Afagh), blocked names with Iran's
+// injected 10.10.34.x. Shecan's second address (185.51.200.2) answers no
+// recursive query from outside, and no v6 resolver of either is known.
+//
+// tr has no recommendation (owner decision 2026-11-11): DoH works in Turkey,
+// so the apps never suggest unencrypted dns on a Turkish exit, and the
+// defaults serve both the tunnel and the ingress fallback. Until 2026-11-11 tr
+// named TTNET (195.175.39.39) and Turkcell Superonline (212.252.114.8), which
+// answer only their own networks: through the 14 URnetwork exits in Turkey on
+// 2026-11-11 (TurkNet, 2E Telekom, TTNET, two small networks and one that
+// Cloudflare places in Germany), TTNET's resolvers answered only the 2E
+// Telekom exit, Superonline's no exit, and TurkNet's own only TurkNet's, and
+// only the ISP resolvers answered with Turkey's block address (discord.com as
+// 195.175.254.2). 1.1.1.1 answered on all 13 exits that carried udp and
+// 9.9.9.10 on 9, the other 4 all on one network, none intercepted. In OONI
+// from Turkey (Oct-Nov 2026) DoH to Cloudflare and Quad9 answered on Türk
+// Telekom, TT Mobil, Superonline, Turkcell and TurkNet, and plain UDP to them
+// answered 99% of queries on Superonline, 97% on TurkNet and all on Turkcell
+// mobile.
+//
+// tm has no recommendation. Until 2026-11-11 it named Turkmentelecom
+// (217.174.238.141), which refuses recursion to clients outside its network
+// and still answers them 127.0.0.1 for the names it blocks, bringyour.com and
+// its subdomains among them, along with example.com and cloudflare.com, so as
+// the ingress fallback it could not resolve the platform's names. URnetwork
+// has no exit in Turkmenistan, and no plain resolver was measurable from
+// inside: in OONI from its four networks (Apr 2025-Mar 2026) DoH and DoT to
+// Cloudflare, Quad9 and Google failed in all but 18 of 2,527 measurements,
+// and the system resolvers answered blocked names with 127.0.0.1.
+// Turkmenistan stays an undisclosed connection region until a resolver is
 // verified from there.
 //
 // ru's National DNS (NSDI) entries are its public recursive resolvers,
@@ -42,12 +98,9 @@ var regionalDnsServers = []*RegionalDnsServer{
 	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.4.1"},
 	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.5.1"},
 	{CountryCode: "ir", Name: "Shecan", Ipv4: "178.22.122.100"},
-	{CountryCode: "ir", Name: "403.online", Ipv4: "10.202.10.10"},
-	{CountryCode: "tr", Name: "TTNET", Ipv4: "195.175.39.39"},
-	{CountryCode: "tr", Name: "Turkcell Superonline", Ipv4: "212.252.114.8"},
+	{CountryCode: "ir", Name: "Electro", Ipv4: "78.157.42.100"},
 	{CountryCode: "kz", Name: "Cloudflare", Ipv4: "1.1.1.1", Ipv6: "2606:4700:4700::1111"},
 	{CountryCode: "kz", Name: "Quad9", Ipv4: "9.9.9.10", Ipv6: "2620:fe::10"},
-	{CountryCode: "tm", Name: "Turkmentelecom", Ipv4: "217.174.238.141"},
 }
 
 // RegionalDnsServers enumerates the well known regional dns servers
