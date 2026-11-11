@@ -32,7 +32,7 @@ func (self *multiClientChannelUpdate) noteSynRetryRemoteRefusalWithLock(client *
 // A standing signal records a fact for this exact live owner. A pending
 // ordinary sibling may delay dispatch without erasing that received fact.
 func (self *tcpSynRetry) noteRemoteRefusalWithLock(update *multiClientChannelUpdate, client *multiClientChannel) {
-	if client == nil || client.args == nil || !self.validGenerationWithLock(update) ||
+	if client == nil || client.args == nil || !self.validGenerationWithLock(update) || self.openingSerial != 0 ||
 		self.serial == 0 || self.references == 0 || !update.dialFailedSynSeen || self.sequence != update.dialFailedSyn ||
 		self.pendingGenerationChangeWithLock(update) {
 		return
@@ -72,7 +72,7 @@ func (self *tcpSynRetry) pendingGenerationChangeWithLock(update *multiClientChan
 // The flow lock protects the paid owner and its exact current source sequence.
 func (self *multiClientChannelUpdate) synRetryHasRemoteRefusalWithLock() bool {
 	owner := self.synRetry
-	return owner != nil && owner.validWithLock(self) && self.dialFailedSynSeen &&
+	return owner != nil && owner.openingSerial == 0 && owner.validWithLock(self) && self.dialFailedSynSeen &&
 		owner.sequence == self.dialFailedSyn && len(owner.refusedRemoteIds) != 0
 }
 
@@ -80,7 +80,7 @@ func (self *multiClientChannelUpdate) synRetryHasRemoteRefusalWithLock() bool {
 // A later ordinary native source offer retains its existing routing policy.
 func (self *multiClientChannelUpdate) synRetryRemoteTailRefusedWithLock(client *multiClientChannel) bool {
 	owner := self.synRetry
-	if client == nil || client.args == nil || owner == nil || !owner.validWithLock(self) ||
+	if client == nil || client.args == nil || owner == nil || owner.openingSerial != 0 || !owner.validWithLock(self) ||
 		!self.dialFailedSynSeen || owner.sequence != self.dialFailedSyn {
 		return false
 	}
