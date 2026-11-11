@@ -15,7 +15,7 @@ import (
 )
 
 // portmap.go — the router port mapping of the provider extender role
-// (connect/EXTENDER.md S8, the port mapping).
+// (connect/EXTENDER.md S10, the port mapping).
 //
 // A host behind a home router has no inbound path on the extender's ports
 // unless the router forwards them, and many routers forward a port when asked:

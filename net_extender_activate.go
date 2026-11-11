@@ -363,7 +363,7 @@ type ExtenderActivatorSettings struct {
 	// OfferedPorts, when set, is read at each post and replaces TcpPort, UdpPort
 	// and DnsPort, each a zero of it leaving that one as it is: the ports a
 	// router's mapping forwards to this extender, which the router picks and may
-	// change while the role runs (S8, the port mapping, connect/portmap). DnsPorts
+	// change while the role runs (S10, the port mapping, connect/portmap). DnsPorts
 	// answers the mapped dns ports beside it. It runs on the loop goroutine and
 	// must not block.
 	OfferedPorts func() (tcpPort int, udpPort int, dnsPort int)

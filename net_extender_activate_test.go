@@ -1742,7 +1742,7 @@ func TestExtenderActivatorSendsDnsPorts(t *testing.T) {
 
 // A post offers the ports a router's mapping forwards to this extender, read
 // at each post: they replace the configured ports one by one, and a mapping the
-// router moved is offered by the next post (S8, the port mapping).
+// router moved is offered by the next post (S10, the port mapping).
 func TestExtenderActivatorOffersTheMappedPorts(t *testing.T) {
 	var stateLock sync.Mutex
 	tcpPort, udpPort, dnsPort := 40443, 0, 44053
