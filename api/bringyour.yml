@@ -7320,9 +7320,10 @@ paths:
                     uri: bitcoin:bc1qnpacsprej8hdfqttcwp444pdsxglyfhns4rk9g?amount=0.00054715&label=URnetwork&message=URnetwork%20Pro%20yearly
                     uri_note: ""
                     network: bitcoin
-                    network_warning: "Send BTC on the Bitcoin network to this address, exactly the amount. BTC on another network (Lightning, Base, Ethereum, Solana) is not credited. A payment needs 1 confirmation."
+                    network_warning: "Send BTC on the Bitcoin network to this address, exactly the amount, before the quote expires. BTC on another network (Lightning, Base, Ethereum, Solana) is not credited. A payment needs 1 confirmation, which can take a while: one sent before the quote expires is credited at the quoted price if it confirms within 3 hours of the expiry."
                     quoted_at: "2026-11-10T20:00:00Z"
                     expires_at: "2026-11-10T20:30:00Z"
+                    confirmation_grace_seconds: 10800
                     confirmations_required: 1
                 ethYearly:
                   summary: ETH (a Coinbase deposit address of the invoice's own, in EIP-55 case)
@@ -21774,7 +21775,16 @@ components:
           description: the confirmations a payment needs before it is credited (for TAO, ETH and SOL, 1 is a finalized block)
         quote_ttl_seconds:
           type: integer
-          description: how long a quote holds, in seconds
+          description: how long a quote holds, in seconds; the window to send the payment in
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            How long past a quote's expiry a payment sent within it may confirm
+            and still be credited at the quoted price: 10800 (3 hours) for
+            `btc`, whose payments the server sees only once mined. A Bitcoin
+            invoice stays `pending` through the grace and is not re-quoted in
+            it. Left out for every other coin, whose quote ends at its expiry,
+            and by older servers.
         available:
           type: boolean
           description: |
@@ -21961,6 +21971,9 @@ components:
         quote_ttl_seconds:
           type: integer
           description: how long an invoice's quote holds, in seconds
+        confirmation_grace_seconds:
+          type: integer
+          description: as CryptoPaymentAsset's (10800 for `btc`); left out for every other coin
         confirmations_required:
           type: integer
           description: the confirmations a payment needs before it is credited
@@ -22108,11 +22121,18 @@ components:
         confirmations_required:
           type: integer
         expires_at:
-          description: when the quote ends; null for `unknown`
+          description: when the quote ends, the end of the window to send in; null for `unknown`
           oneOf:
             - type: string
               format: date-time
             - type: "null"
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            As CryptoPaymentAsset's: 10800 for `btc`, whose invoice stays
+            `pending` (or `seen`) through this long past `expires_at`, since a
+            payment sent in time may not be mined yet; left out for every
+            other coin.
         credited_at:
           oneOf:
             - type: string
@@ -22234,11 +22254,17 @@ components:
               format: date-time
             - type: "null"
         expires_at:
-          description: when the quote ends
+          description: when the quote ends, the end of the window to send the payment in
           oneOf:
             - type: string
               format: date-time
             - type: "null"
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            As CryptoPaymentAsset's: 10800 for `btc`, a payment sent before
+            `expires_at` is credited at this quote's price while it is mined
+            within this long after it. Left out for every other coin.
         confirmations_required:
           type: integer
         status:
