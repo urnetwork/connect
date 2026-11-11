@@ -923,6 +923,9 @@ func (self *packetTranslation) decodeDns() {
 				buf,
 				self.settings.DnsTlds,
 			)
+			if err != nil {
+				continue
+			}
 		} else {
 			var id uint16
 			var otherData bool
@@ -932,6 +935,9 @@ func (self *packetTranslation) decodeDns() {
 				buf,
 				self.settings.DnsTlds,
 			)
+			if err != nil {
+				continue
+			}
 			if otherData {
 				// a normal non-pt dns request
 				self.handleDnsOther(packetData[:n], addr)
