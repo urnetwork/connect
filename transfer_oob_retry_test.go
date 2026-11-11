@@ -75,7 +75,8 @@ func closeReportEventOffsets(platform *closeReportPlatform, start time.Time) []t
 
 // Each bound ends a request whose attempts keep failing: the attempt count, a
 // wait that would cross the time budget, and the time budget itself, which
-// cancels the running attempt.
+// cancels a running retry. A budget shorter than the strategy's RequestTimeout
+// never cuts the first attempt, which is the request sent once.
 func TestOobRetryBudgetBoundsAttemptsAndTime(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
@@ -115,11 +116,20 @@ func TestOobRetryBudgetBoundsAttemptsAndTime(t *testing.T) {
 			{
 				// the first attempt ends at its 15 s RequestTimeout; the second
 				// starts 0.5 s later and is canceled at the 20 s bound
-				name:        "time in an attempt",
+				name:        "time in a retry",
 				answer:      closeReportBlackHoleAnswer,
 				retry:       OobRetrySettings{MaxAttemptCount: 100, Timeout: 20 * time.Second, RetryTimeout: time.Second, RetryMaxTimeout: 4 * time.Second},
 				wantAnswers: []time.Duration{15 * time.Second, 20 * time.Second},
 				wantDone:    20 * time.Second,
+			},
+			{
+				// the first attempt runs its whole 15 s RequestTimeout past the
+				// 10 s bound, which then leaves no retry
+				name:        "first attempt past the time",
+				answer:      closeReportBlackHoleAnswer,
+				retry:       OobRetrySettings{MaxAttemptCount: 100, Timeout: 10 * time.Second, RetryTimeout: time.Second, RetryMaxTimeout: 4 * time.Second},
+				wantAnswers: []time.Duration{15 * time.Second},
+				wantDone:    15 * time.Second,
 			},
 		} {
 			platform := &closeReportPlatform{t: t, answers: []closeReportAnswer{c.answer}}
@@ -133,7 +143,7 @@ func TestOobRetryBudgetBoundsAttemptsAndTime(t *testing.T) {
 				t.Fatalf("%s: attempts answered at %v and ended at %s, want %v and %s", c.name, answers, done, c.wantAnswers, c.wantDone)
 			}
 			var statusErr *HttpStatusError
-			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("after %d attempts", len(c.wantAnswers))) ||
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("after %d of %d attempts", len(c.wantAnswers), c.retry.MaxAttemptCount)) ||
 				errors.As(err, &statusErr) != c.wantStatus {
 				t.Fatalf("%s: request error %v does not name its attempts and last failure", c.name, err)
 			}

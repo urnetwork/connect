@@ -59,9 +59,12 @@ type OobRetrySettings struct {
 	// Attempts of one request, the first included. At or below 1 the request is
 	// sent once.
 	MaxAttemptCount int
-	// Bounds the request from the start of its first attempt: a running attempt
-	// is canceled at the bound, and a wait that would reach it ends the request
-	// instead. Each attempt also keeps the strategy's RequestTimeout.
+	// Bounds the retries from the start of the first attempt: a running retry is
+	// canceled at the bound, and a wait that would reach it ends the request
+	// instead. The first attempt keeps only the strategy's RequestTimeout, as a
+	// request sent once does, so a request never ends sooner than its one
+	// attempt would have; a first attempt that outlasts the bound leaves no
+	// retry. Every attempt also keeps the strategy's RequestTimeout.
 	// Non-positive bounds the request by MaxAttemptCount alone.
 	Timeout time.Duration
 	// The nominal wait after a request's first failed attempt. It doubles per
@@ -328,7 +331,7 @@ func (self *ApiOutOfBandControl) SendControlWithRetry(
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
 		count(oobRetryEventRequest)
 		startTime := time.Now()
-		// one budget for every attempt and wait of the request
+		// one budget for every wait and retry of the request
 		var retryCtx context.Context
 		var retryCancel context.CancelFunc
 		if 0 < settings.Timeout {
@@ -369,7 +372,13 @@ func (self *ApiOutOfBandControl) SendControlWithRetry(
 		var attempt func()
 		attempt = func() {
 			attemptCount += 1
-			self.api.connectControlWithCtx(retryCtx, connectControlArgs, NewApiCallback(func(result *ConnectControlResult, err error) {
+			// The first attempt is the request sent once; only retries spend the
+			// time budget.
+			attemptCtx := retryCtx
+			if attemptCount == 1 {
+				attemptCtx = ctx
+			}
+			self.api.connectControlWithCtx(attemptCtx, connectControlArgs, NewApiCallback(func(result *ConnectControlResult, err error) {
 				// Every path that launches no further attempt publishes this
 				// attempt's outcome, so admission always finishes.
 				retried := false
@@ -396,13 +405,13 @@ func (self *ApiOutOfBandControl) SendControlWithRetry(
 				if !oobRetryable(err) {
 					count(oobRetryEventRefused)
 					if 1 < attemptCount {
-						err = fmt.Errorf("control refused on attempt %d: %w", attemptCount, err)
+						err = fmt.Errorf("control refused on attempt %d of %d: %w", attemptCount, settings.MaxAttemptCount, err)
 					}
 					return
 				}
 				giveUp := func() {
 					count(oobRetryEventGiveUp)
-					err = fmt.Errorf("control retries ended after %d attempts in %s: %w", attemptCount, time.Since(startTime).Round(time.Millisecond), err)
+					err = fmt.Errorf("control gave up after %d of %d attempts in %s: %w", attemptCount, settings.MaxAttemptCount, time.Since(startTime).Round(time.Millisecond), err)
 				}
 				if settings.MaxAttemptCount <= attemptCount || retryCtx.Err() != nil {
 					giveUp()

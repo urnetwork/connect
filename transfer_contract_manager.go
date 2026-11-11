@@ -401,18 +401,22 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		CompanionRefusalHoldMax:         5 * time.Minute,
 		CompanionRefusalMaxDestinations: 1024,
 
-		// Waits of 0.5-1, 1-2, 2-4, 4-8 and 8-16 s spread six attempts over
-		// 15-31 s when each failure answers at once, which rides out a deploy's
-		// 502/503 edge or a network handover. A black-holed route spends each
-		// attempt's full RequestTimeout (15 s), so 60 s gives it three or four
-		// attempts. A retired window client keeps its identity, and its device's
-		// close join waits, for at most these 60 s, where the one attempt before
-		// held them for up to one RequestTimeout.
+		// Waits of 0.5-1, 1-2, 2-4 and 4-8 s spread five attempts over 7.5-15 s
+		// when each failure answers at once, which rides out a deploy's 502/503
+		// edge or a short api overload. A black-holed route spends each attempt's
+		// full RequestTimeout (15 s by default), so it still gets about one more
+		// attempt within 30 s, as after a network handover. Retries of failures
+		// that answer at once end well inside the 30 s that owners already give a
+		// closing client's join (the SN25 validator's tunnel retirement cancels
+		// its transport past that). A retired window client keeps its identity,
+		// and its device's close join waits, for at most 30 s or one
+		// RequestTimeout if that is longer, where the one attempt before held
+		// them for up to one RequestTimeout.
 		CloseReportRetry: OobRetrySettings{
-			MaxAttemptCount: 6,
-			Timeout:         60 * time.Second,
+			MaxAttemptCount: 5,
+			Timeout:         30 * time.Second,
 			RetryTimeout:    1 * time.Second,
-			RetryMaxTimeout: 16 * time.Second,
+			RetryMaxTimeout: 8 * time.Second,
 		},
 
 		ProtocolVersion: DefaultProtocolVersion,
@@ -564,8 +568,9 @@ type ContractManagerSettings struct {
 	// a 429 or a 5xx, and never after any other answer: a 401 from a retired
 	// identity or a rejected unknown contract ends it. Retrying is safe because
 	// each report carries its identity (ReportId), so the platform applies an
-	// exact repeat once. The retries run inside the one admitted request, so
-	// the client control's join, and the identity retirement of a window client
+	// exact repeat once. The first attempt is the request sent before, with its
+	// RequestTimeout; the retries run inside the same admitted request, so the
+	// client control's join, and the identity retirement of a window client
 	// behind it, wait for them within this bound. A control without
 	// SendControlWithRetry, the zero value and a MaxAttemptCount at or below 1
 	// send once, as before; server-side contract expiry remains the backstop
