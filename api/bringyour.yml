@@ -4694,6 +4694,10 @@ paths:
               examples:
                 yearly:
                   summary: A yearly plan
+                  description: >-
+                    `<deposit_hotkey>` stands for the hotkey in your own answer,
+                    which belongs to your account. Mint only into that one, never
+                    into a hotkey copied from an example.
                   value:
                     intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
                     status_token: kq3s0d9-q0mJp1v5n2xQd3J7mH0bWzM4tYcRrUeA8kE
@@ -4707,7 +4711,7 @@ paths:
                     amount_gamma: "40"
                     reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
                     netuid: 25
-                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                    deposit_hotkey: "<deposit_hotkey>"
                     service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
                     spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
                     min_daily_cap_gamma: "40"
@@ -4715,8 +4719,8 @@ paths:
                     min_mint_gamma: "0.1"
                     indicative_tao: "0.189165"
                     mint_available: true
-                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
-                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
                     expires_at: "2026-11-12T12:00:00Z"
@@ -4730,7 +4734,7 @@ paths:
                       review_reason: ""
                       amount_gamma: "40"
                       reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
-                      deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                      deposit_hotkey: "<deposit_hotkey>"
                       deposit_balance_gamma: ""
                       spendable_gamma: ""
                       remaining_gamma: "40"
@@ -4821,7 +4825,7 @@ paths:
                     review_reason: ""
                     amount_gamma: "40"
                     reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
-                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                    deposit_hotkey: "<deposit_hotkey>"
                     deposit_balance_gamma: "10"
                     spendable_gamma: "10"
                     remaining_gamma: "0"
@@ -4894,8 +4898,8 @@ paths:
                     monthly_limit_gamma: ""
                     month_spent_gamma: "0"
                     renew_plan: yearly
-                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
-                    deposit_hotkeys: [5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw]
+                    deposit_hotkey: "<deposit_hotkey>"
+                    deposit_hotkeys: ["<deposit_hotkey>"]
         "401":
           description: Missing or invalid bearer token.
         "403":
