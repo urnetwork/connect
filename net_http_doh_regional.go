@@ -79,7 +79,7 @@ type RegionalDnsServer struct {
 // the ingress fallback it could not resolve the platform's names. URnetwork
 // has no exit in Turkmenistan, and no plain resolver was measurable from
 // inside: in OONI from its four networks (Apr 2025-Mar 2026) DoH and DoT to
-// Cloudflare, Quad9 and Google failed in all but 18 of 2,440 measurements,
+// Cloudflare, Quad9 and Google failed in all but 18 of 2,527 measurements,
 // and the system resolvers answered blocked names with 127.0.0.1.
 // Turkmenistan stays an undisclosed connection region until a resolver is
 // verified from there.
