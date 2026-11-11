@@ -24,7 +24,7 @@ default_script_url="https://raw.githubusercontent.com/urnetwork/connect/refs/hea
 script_url="${URNETWORK_TOOLS_URL:-${URNETWORK_TOOLS_SCRIPT_URL:-$default_script_url}}"
 # raise with every change to this script: `update' never installs a urnet-tools
 # with a lower number, so a revert or an old mirror can't downgrade installs
-tools_version=2
+tools_version=3
 api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
 default_interval="6h"
 # the service runs without URNETWORK_STATE_DIR, so the miner this script runs
@@ -42,7 +42,7 @@ show_help ()
         echo "  $me [options] status"
         echo "  $me [options] logs"
         echo "  $me [options] update"
-        echo "  $me [options] reinstall [--tag TAG] [--no-modify-bashrc]"
+        echo "  $me [options] reinstall [--tag TAG] [--no-modify-bashrc] [--system]"
         echo "  $me [options] restart"
         echo "  $me [options] version"
         echo "  $me [options] uninstall [--remove-identity [--yes]] [--no-modify-bashrc]"
@@ -83,6 +83,8 @@ show_help ()
         echo "Options for reinstall:"
         echo "  -t, --tag TAG           Reinstall a specific version of URnetwork"
         echo "  -B, --no-modify-bashrc  Do not modify ~/.bashrc"
+        echo "  --system                Run the provider as a system service, as you, that may"
+        echo "                          listen on TCP port 443 for the extender (asks for sudo once)"
         echo ""
         echo "Options for uninstall:"
         echo "  --remove-identity       Also delete ~/.urnetwork (this device's miner identity)"
@@ -103,6 +105,8 @@ show_help ()
         echo "                          Without it, the installer asks when run in a terminal."
         echo "  --no-start              Install only: don't sign in or start the provider"
         echo "  -y, --yes               Don't ask anything (sign in only with --auth-code)"
+        echo "  --system                Run the provider as a system service, as you, that may"
+        echo "                          listen on TCP port 443 for the extender (asks for sudo once)"
     fi
 
     echo ""
@@ -324,6 +328,7 @@ purge=0
 assume_yes=0
 auth_code="${URNETWORK_AUTH_CODE:-}"
 no_start=0
+system_service=0
 want_version=0
 used_opts=""
 arg1=""
@@ -427,6 +432,11 @@ while [ $# -gt 0 ]; do
         --no-start)
             no_start=1
             note_opt --no-start
+            ;;
+
+        --system)
+            system_service=1
+            note_opt --system
             ;;
 
         --)
@@ -584,6 +594,259 @@ unit_enabled ()
 unit_active ()
 {
     systemctl --user is-active --quiet "$1" 2>/dev/null
+}
+
+#
+# The system service (--system). A user service may not listen on a port
+# below 1024, and the extender needs TCP port 443, so on request the provider
+# runs from a system unit instead: as this user, from this install, with the
+# one capability CAP_NET_BIND_SERVICE, which systemd grants at every start, so
+# it survives the updates that replace the binary (a setcap file capability
+# would not). The update timer stays this user's; a root path unit restarts
+# the provider when an update writes .version, since this user may not restart
+# a system service. Root runs only systemctl, never this user's files.
+#
+
+system_unit_dir="/etc/systemd/system"
+system_service_file="$system_unit_dir/urnetwork.service"
+system_restart_path="$system_unit_dir/urnetwork-restart.path"
+system_restart_service="$system_unit_dir/urnetwork-restart.service"
+# present when systemd is the init system
+systemd_booted_dir="/run/systemd/system"
+system_unit_marker="# Installed by urnet-tools --system"
+
+# whether urnetwork.service is this script's system unit for this user
+system_unit_ours ()
+{
+    [ -f "$system_service_file" ] &&
+        [ "$(head -n1 "$system_service_file" | cut -d. -f1)" = "$system_unit_marker" ] &&
+        [ "$(sed -n 's/^User=//p' "$system_service_file" | head -n1)" = "$(id -un)" ]
+}
+
+# Whether this install runs the provider as a system service: asked for with
+# --system, already installed so, or a new install by root with no systemd
+# user session, where a user service can't run at all.
+want_system_service ()
+{
+    if [ "$system_service" -eq 1 ] || system_unit_ours; then
+        return 0
+    fi
+
+    [ "$operation" = "install" ] && [ "$(id -u)" -eq 0 ] && [ "$no_user_manager" -eq 1 ] &&
+        [ -d "$systemd_booted_dir" ]
+}
+
+# runs a command as root: directly as root, else through sudo
+as_root ()
+{
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# $1: the user; prints the system unit
+render_system_service ()
+{
+    cat <<EOF
+$system_unit_marker. Remove with: urnet-tools uninstall
+[Unit]
+Description=URnetwork Provider
+Documentation=https://ur.xyz/docs/miner/extender
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=$1
+ExecStart="$(unit_path "$install_path")/bin/urnetwork" provide
+Restart=on-failure
+RestartSec=30
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_system_restart_path ()
+{
+    cat <<EOF
+$system_unit_marker
+[Unit]
+Description=Restart the URnetwork Provider when urnet-tools installs a new version
+
+[Path]
+PathChanged=$(unit_path "$install_path")/.version
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# $1: the absolute path of systemctl
+render_system_restart_service ()
+{
+    cat <<EOF
+$system_unit_marker
+[Unit]
+Description=Restart the URnetwork Provider after an update
+
+[Service]
+Type=oneshot
+ExecStart=$1 try-restart urnetwork.service
+EOF
+}
+
+# the provider service's state, either kind
+service_active ()
+{
+    if system_unit_ours; then
+        systemctl is-active --quiet urnetwork.service 2>/dev/null
+    else
+        unit_active urnetwork.service
+    fi
+}
+
+service_enabled ()
+{
+    if system_unit_ours; then
+        [ "$(systemctl is-enabled urnetwork.service 2>/dev/null)" = "enabled" ]
+    else
+        unit_enabled urnetwork.service
+    fi
+}
+
+# systemctl for the provider service, either kind; the system one as root
+service_ctl ()
+{
+    if system_unit_ours; then
+        as_root systemctl "$@"
+    else
+        systemctl --user "$@"
+    fi
+}
+
+# where the provider service logs
+service_log_hint ()
+{
+    if system_unit_ours; then
+        echo "journalctl -u urnetwork"
+    else
+        echo "journalctl --user -u urnetwork"
+    fi
+}
+
+# Installs the system units and takes the provider over from the user unit,
+# so the two never run together. Asks for sudo when not root.
+setup_system_service ()
+{
+    if ! command -v systemctl > /dev/null || [ ! -d "$systemd_booted_dir" ]; then
+        pr_err "--system needs systemd as the init system, and this system doesn't run it"
+        return 1
+    fi
+
+    if [ "$(id -u)" -ne 0 ] && ! command -v sudo > /dev/null; then
+        pr_err "--system needs root once to install the system service, and there is no sudo here"
+        pr_err "Run this again as root, or without --system"
+        return 1
+    fi
+
+    systemctl_path="$(command -v systemctl)"
+    service_user="$(id -un)"
+
+    if ! { render_system_service "$service_user" > "$workdir/urnetwork.service" &&
+        render_system_restart_path > "$workdir/urnetwork-restart.path" &&
+        render_system_restart_service "$systemctl_path" > "$workdir/urnetwork-restart.service"; }; then
+        pr_err "Could not write the system service"
+        return 1
+    fi
+
+    changed=0
+
+    if ! cmp -s "$workdir/urnetwork.service" "$system_service_file" ||
+        ! cmp -s "$workdir/urnetwork-restart.path" "$system_restart_path" ||
+        ! cmp -s "$workdir/urnetwork-restart.service" "$system_restart_service"; then
+        changed=1
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        if [ "$(id -u)" -ne 0 ]; then
+            pr_info "Installing the system service needs sudo once (it runs the provider as %s, not as root)" "$service_user"
+        fi
+
+        pr_info "Installing urnetwork.service in %s" "$system_unit_dir"
+
+        if ! as_root install -m 644 "$workdir/urnetwork.service" "$system_service_file" ||
+            ! as_root install -m 644 "$workdir/urnetwork-restart.path" "$system_restart_path" ||
+            ! as_root install -m 644 "$workdir/urnetwork-restart.service" "$system_restart_service"; then
+            pr_err "Could not install the system service"
+            return 1
+        fi
+    fi
+
+    # the user unit no longer runs the provider: two would mine one identity
+    enable_system=0
+
+    if [ -f "$systemd_service" ]; then
+        if [ "$has_systemd" -eq 1 ] && unit_active urnetwork.service; then
+            # the system service starts in its place
+            service_stopped=1
+        fi
+
+        # and starts at boot in its place
+        if [ "$has_systemd" -eq 1 ] && unit_enabled urnetwork.service; then
+            enable_system=1
+        fi
+
+        if [ "$has_systemd" -eq 1 ]; then
+            systemctl --user disable --now urnetwork.service > /dev/null 2>&1
+        fi
+
+        if [ "$has_systemd" -eq 1 ] && unit_active urnetwork.service; then
+            pr_err "Could not stop the user's urnetwork.service; stop it and run this again"
+            return 1
+        fi
+
+        rm -f "$systemd_service"
+
+        if [ "$has_systemd" -eq 1 ]; then
+            systemctl --user daemon-reload
+            systemctl --user reset-failed urnetwork.service > /dev/null 2>&1
+        fi
+
+        pr_info "Replaced the user's urnetwork.service with the system service"
+    fi
+
+    if ! as_root systemctl daemon-reload ||
+        ! as_root systemctl enable --now urnetwork-restart.path > /dev/null 2>&1; then
+        pr_err "Could not turn on the system service's restart after updates"
+        return 1
+    fi
+
+    if [ "$enable_system" -eq 1 ] && ! as_root systemctl enable urnetwork.service > /dev/null 2>&1; then
+        pr_err "warning: Could not enable urnetwork.service to start at boot"
+    fi
+
+    # an install that changed the unit of a running provider restarts it on it
+    if [ "$changed" -eq 1 ] && systemctl is-active --quiet urnetwork.service 2>/dev/null; then
+        as_root systemctl try-restart urnetwork.service
+    fi
+
+    return 0
+}
+
+# the command that lets this user's provider listen on TCP port 443, for a
+# user service; nothing for root, who may already, or a system service
+extender_bind_hint ()
+{
+    if [ "$(id -u)" -eq 0 ] || system_unit_ours; then
+        return 0
+    fi
+
+    echo "urnet-tools reinstall --system"
 }
 
 signed_in ()
@@ -771,9 +1034,11 @@ write_systemd_units ()
         exit 1
     fi
 
-    pr_info "Installing urnetwork.service in %s" "$systemd_service"
+    # the system service (--system) runs the provider instead
+    if ! want_system_service; then
+        pr_info "Installing urnetwork.service in %s" "$systemd_service"
 
-    cat > "$systemd_service" <<EOF
+        cat > "$systemd_service" <<EOF
 [Unit]
 Description=URnetwork Provider
 Documentation=https://ur.xyz/docs/miner
@@ -786,6 +1051,7 @@ RestartSec=30
 [Install]
 WantedBy=default.target
 EOF
+    fi
 
     pr_info "Installing urnetwork-update.service in %s" "$systemd_update_service"
 
@@ -867,7 +1133,11 @@ cleanup ()
 
     # a failed update must not leave the miner stopped
     if [ "$service_stopped" -eq 1 ]; then
-        systemctl --user start urnetwork.service > /dev/null 2>&1
+        if [ -f "$systemd_service" ]; then
+            systemctl --user start urnetwork.service > /dev/null 2>&1
+        elif system_unit_ours; then
+            as_root systemctl start urnetwork.service > /dev/null 2>&1
+        fi
     fi
 }
 
@@ -996,7 +1266,12 @@ setup_systemd ()
 {
     new_install=0
 
-    if [ ! -f "$systemd_service" ]; then
+    if want_system_service; then
+        # the user units are the update timer's alone
+        if [ ! -f "$systemd_update_timer" ]; then
+            new_install=1
+        fi
+    elif [ ! -f "$systemd_service" ]; then
         new_install=1
     fi
 
@@ -1032,7 +1307,7 @@ setup_systemd ()
     fi
 
     # the provider is only enabled once it is signed in, or it would fail at every boot
-    if [ "$service_was_enabled" -eq 1 ] && ! systemctl --user enable urnetwork.service; then
+    if [ "$service_was_enabled" -eq 1 ] && ! want_system_service && ! systemctl --user enable urnetwork.service; then
         pr_err "warning: Could not re-enable urnetwork.service"
     fi
 }
@@ -1081,29 +1356,29 @@ start_provider ()
         fi
 
         pr_err "warning: %s has no sign-in; if the provider stops, run \`urnetwork auth' (code at https://ur.io)" "$state_dir"
-    elif ! unit_active urnetwork.service && ! register_device; then
+    elif ! service_active && ! register_device; then
         return 1
     fi
 
-    if ! systemctl --user enable urnetwork.service > /dev/null 2>&1; then
+    if ! service_ctl enable urnetwork.service > /dev/null 2>&1; then
         pr_err "warning: Could not enable urnetwork.service to start at boot/login"
     fi
 
-    if unit_active urnetwork.service; then
+    if service_active; then
         return 0
     fi
 
     pr_info "Starting urnetwork.service"
 
-    if ! systemctl --user start urnetwork.service; then
-        pr_err "Failed to start urnetwork.service. See: journalctl --user -u urnetwork"
+    if ! service_ctl start urnetwork.service; then
+        pr_err "Failed to start urnetwork.service. See: %s" "$(service_log_hint)"
         return 1
     fi
 
     sleep 2
 
-    if ! unit_active urnetwork.service; then
-        pr_err "urnetwork.service stopped right after starting. See: journalctl --user -u urnetwork"
+    if ! service_active; then
+        pr_err "urnetwork.service stopped right after starting. See: %s" "$(service_log_hint)"
         return 1
     fi
 
@@ -1138,7 +1413,7 @@ do_install ()
 {
     case "$operation" in
         install)
-            allow_opts --tag --no-modify-bashrc --interval --auth-code --no-start --yes
+            allow_opts --tag --no-modify-bashrc --interval --auth-code --no-start --yes --system
             ;;
 
         update)
@@ -1147,7 +1422,7 @@ do_install ()
             ;;
 
         reinstall)
-            allow_opts --tag --no-modify-bashrc
+            allow_opts --tag --no-modify-bashrc --system
 
             if [ -z "$tag" ]; then
                 tag="$(installed_version)"
@@ -1184,7 +1459,7 @@ do_install ()
         exit 1
     fi
 
-    if [ "$no_user_manager" -eq 1 ]; then
+    if [ "$no_user_manager" -eq 1 ] && ! { want_system_service && [ "$(id -u)" -eq 0 ]; }; then
         explain_no_user_manager
     fi
 
@@ -1424,10 +1699,17 @@ EOF
         setup_systemd "$default_interval"
     fi
 
+    # an update keeps a system service as it is: it needs no root, and the
+    # restart path unit restarts the provider on the new .version
+    if want_system_service && [ "$operation" != "update" ] && ! setup_system_service; then
+        pr_err "The provider stays as it was"
+        exit 1
+    fi
+
     if [ "$service_stopped" -eq 1 ]; then
         service_stopped=0
 
-        if ! systemctl --user start urnetwork.service; then
+        if ! service_ctl start urnetwork.service; then
             pr_err "warning: Unable to restart urnetwork.service after the update; run \`urnet-tools start'"
         fi
     fi
@@ -1465,14 +1747,23 @@ install_summary ()
 {
     running=0
 
-    if [ "$no_start" -eq 0 ] && sign_in && [ "$has_systemd" -eq 1 ] && start_provider; then
+    if [ "$no_start" -eq 0 ] && sign_in && { [ "$has_systemd" -eq 1 ] || system_unit_ours; } && start_provider; then
         running=1
     fi
 
     pr_info "Installed URnetwork %s in %s" "$version_to_install" "$install_path"
     printf "\n"
 
-    if [ "$running" -eq 1 ]; then
+    if [ "$running" -eq 1 ] && system_unit_ours; then
+        printf "%sThe provider is running%s as a system service (urnetwork.service, as %s) and starts again after a reboot.\n" "$bold" "$plain" "$(id -un)"
+        printf "It may listen on TCP port 443 for the extender: <https://ur.xyz/docs/miner/extender>\n"
+
+        if [ "$has_systemd" -eq 1 ]; then
+            printf "Automatic updates: %s (urnet-tools auto-update)\n\n" "$(unit_enabled urnetwork-update.timer && echo "on, $(interval_label "$(current_interval)")" || echo off)"
+        else
+            printf "No automatic updates without a systemd user session; update with \`urnet-tools update'.\n\n"
+        fi
+    elif [ "$running" -eq 1 ]; then
         if [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" = "yes" ]; then
             printf "%sThe provider is running%s in the background and starts again after a reboot.\n" "$bold" "$plain"
         else
@@ -1506,6 +1797,21 @@ install_summary ()
         printf "Check on it:     %surnet-tools status%s\n" "$bold" "$plain"
         printf "Live log:        %surnet-tools logs%s\n" "$bold" "$plain"
         printf "Stop:            %surnet-tools stop%s\n" "$bold" "$plain"
+
+        if [ -n "$(extender_bind_hint)" ]; then
+            printf "Extender:        %s%s%s   # lets it listen on TCP port 443 (asks for sudo once)\n" "$bold" "$(extender_bind_hint)" "$plain"
+        fi
+    elif system_unit_ours; then
+        if [ "$running" -eq 0 ]; then
+            if ! signed_in; then
+                printf "Sign in:         %surnetwork auth%s              # auth code from <https://ur.io>\n" "$bold" "$plain"
+            fi
+
+            printf "Start:           %surnet-tools start%s           # asks for sudo\n" "$bold" "$plain"
+        fi
+
+        printf "Check on it:     %surnet-tools status%s\n" "$bold" "$plain"
+        printf "Live log:        %surnet-tools logs%s\n" "$bold" "$plain"
     else
         if ! signed_in; then
             printf "Sign in:         %surnetwork auth%s              # auth code from <https://ur.io>\n" "$bold" "$plain"
@@ -1613,6 +1919,24 @@ do_uninstall ()
         fi
     fi
 
+    if system_unit_ours; then
+        found=1
+        pr_info "Stopping and removing the system service (asks for sudo)"
+
+        for unit in urnetwork.service urnetwork-restart.path; do
+            as_root systemctl disable --now "$unit" > /dev/null 2>&1
+        done
+
+        if systemctl is-active --quiet urnetwork.service 2>/dev/null; then
+            pr_err "Could not stop urnetwork.service; nothing else was removed"
+            exit 1
+        fi
+
+        as_root rm -f "$system_service_file" "$system_restart_path" "$system_restart_service"
+        as_root systemctl daemon-reload
+        as_root systemctl reset-failed urnetwork.service > /dev/null 2>&1
+    fi
+
     if [ -d "$install_path" ]; then
         found=1
         pr_info "Removing: %s" "$install_path"
@@ -1663,7 +1987,7 @@ change_auto_update_prefs ()
     require_systemd
 
     if [ -z "$mode" ] && [ -n "$interval" ]; then
-        if [ ! -f "$systemd_service" ]; then
+        if [ ! -f "$systemd_service" ] && ! system_unit_ours; then
             pr_err "URnetwork's systemd units are missing; run \`%s reinstall' first" "$me"
             exit 1
         fi
@@ -1698,7 +2022,7 @@ change_auto_update_prefs ()
 
             pr_info "Updating systemd unit files (interval: %s)" "$new_interval"
 
-            if [ ! -f "$systemd_service" ]; then
+            if [ ! -f "$systemd_service" ] && ! system_unit_ours; then
                 pr_err "URnetwork's systemd units are missing; run \`%s reinstall' first" "$me"
                 exit 1
             fi
@@ -1727,7 +2051,10 @@ change_auto_update_prefs ()
 toggle_auto_start ()
 {
     allow_opts
-    require_systemd
+
+    if ! system_unit_ours; then
+        require_systemd
+    fi
 
     if test -z "$arg1"; then
         pr_err "Must provide an argument: Either 'on' or 'off'"
@@ -1740,18 +2067,18 @@ toggle_auto_start ()
     fi
 
     if test "$arg1" = on; then
-        if unit_enabled urnetwork.service; then
+        if service_enabled; then
             pr_info "urnetwork.service already starts at boot/login"
         else
             pr_info "Enabling urnetwork.service (at boot/login)"
-            systemctl --user enable urnetwork.service || exit 1
+            service_ctl enable urnetwork.service || exit 1
         fi
     else
-        if ! unit_enabled urnetwork.service; then
+        if ! service_enabled; then
             pr_info "urnetwork.service is already disabled"
         else
             pr_info "Disabling urnetwork.service"
-            systemctl --user disable urnetwork.service || exit 1
+            service_ctl disable urnetwork.service || exit 1
         fi
     fi
 }
@@ -1760,9 +2087,12 @@ do_start ()
 {
     allow_opts
     no_more_args
-    require_systemd
 
-    if unit_active urnetwork.service; then
+    if ! system_unit_ours; then
+        require_systemd
+    fi
+
+    if service_active; then
         pr_info "Service urnetwork.service is already active"
         return 0
     fi
@@ -1775,11 +2105,14 @@ do_stop ()
 {
     allow_opts
     no_more_args
-    require_systemd
 
-    if unit_active urnetwork.service; then
+    if ! system_unit_ours; then
+        require_systemd
+    fi
+
+    if service_active; then
         pr_info "Stopping urnetwork.service"
-        systemctl --user stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
+        service_ctl stop urnetwork.service || { pr_err "Failed to stop urnetwork.service"; exit 1; }
     else
         pr_info "Service urnetwork.service is not active"
     fi
@@ -1799,6 +2132,29 @@ show_status ()
     echo "Signed in:     $(yes_no signed_in)"
     echo "Registered:    $(yes_no device_registered)"
 
+    if system_unit_ours; then
+        echo "Service:       system (urnetwork.service as $(id -un), may listen on TCP port 443)"
+        echo "Running:       $(systemctl is-active urnetwork.service 2>/dev/null)"
+        echo "Start at boot: $(yes_no service_enabled)"
+
+        if [ "$has_systemd" -ne 1 ]; then
+            echo "Auto-update:   none (no systemd user session)"
+        elif unit_enabled urnetwork-update.timer; then
+            echo "Auto-update:   on, $(interval_label "$(current_interval)")"
+        else
+            echo "Auto-update:   off"
+        fi
+
+        echo ""
+        systemctl status urnetwork.service --no-pager -n 5 2>/dev/null
+
+        if service_active; then
+            return 0
+        fi
+
+        return 3
+    fi
+
     if [ "$has_systemd" -ne 1 ]; then
         echo "Service:       none (no systemd user session)"
         exit 3
@@ -1817,6 +2173,10 @@ show_status ()
         echo "Note:          lingering is off, so the provider stops when you log out"
     fi
 
+    if [ -n "$(extender_bind_hint)" ]; then
+        echo "Extender:      a user service can't listen on TCP port 443; $(extender_bind_hint) lets it"
+    fi
+
     echo ""
     systemctl --user status urnetwork.service --no-pager -n 5 2>/dev/null
 
@@ -1831,6 +2191,11 @@ show_logs ()
 {
     allow_opts
     no_more_args
+
+    if system_unit_ours; then
+        exec journalctl -u urnetwork.service -f
+    fi
+
     require_systemd
     exec journalctl --user -u urnetwork.service -f
 }
@@ -1874,8 +2239,14 @@ case "$operation" in
     restart)
         allow_opts
         no_more_args
-        require_systemd
-        systemctl --user stop urnetwork.service
+
+        if system_unit_ours; then
+            service_ctl stop urnetwork.service
+        else
+            require_systemd
+            systemctl --user stop urnetwork.service
+        fi
+
         do_start
         exit 0
         ;;
