@@ -19,6 +19,8 @@ const receiveConsumerBulkTails = 175
 
 // The census accounts each live physical claim once. Prefix and retry credits
 // are unused paid capacity; ingress loans are already part of the live owner.
+// Repair is the held-head repair escrow that every selective lease has
+// reserved since 00d4f62b; a decoded repair copy is a live ingress owner.
 type receiveConsumerBulkCensus struct {
 	rx, recovery, root, parentSpare, packQuota               ByteCount
 	committed, tentative, buffered, callback, ingress        ByteCount
@@ -434,7 +436,8 @@ func testReceiveConsumerBulkGap(t *testing.T, tailShortPacketBytes int) {
 			before.ingress != 0 || before.buffered != 0 || before.callback != 0 || before.escrow != 0 ||
 			before.prefixBorrowed != 0 || before.escrowBorrowed != 0 || fixture.ackedPacks != 0 || fixture.deliveredPackets != 0 ||
 			before.committedItems != before.held || before.tentative != 0 || !before.promised ||
-			before.prefix != tailScan.retainedByteCount || before.pressureActive || before.pressurePending || before.recovery != 0 {
+			before.prefix != tailScan.retainedByteCount || before.pressureActive || before.pressurePending || before.recovery != 0 ||
+			before.repair != fixture.sequence.receiveBufferSettings.receiveHeldHeadRepairByteCount(false) {
 			t.Fatalf("consumer bulk did not retain owned tails behind the withheld head: %+v", before)
 		}
 		free := fixture.rx.TotalByteCount() - before.rx
@@ -491,7 +494,7 @@ func testReceiveConsumerBulkGap(t *testing.T, tailShortPacketBytes int) {
 			finalStats := fixture.receiver.ReceiveStats()
 			if fixture.sequence.nextSequenceNumber != fixture.first+uint64(len(fixture.originals)) ||
 				fixture.deliveredPackets != 8*len(fixture.originals) || fixture.ackedPacks != len(fixture.originals) ||
-				final.rx != 0 || final.held != 0 || final.prefix != 0 || final.escrow != 0 || fixture.sequence.ctx.Err() != nil ||
+				final.rx != 0 || final.held != 0 || final.prefix != 0 || final.escrow != 0 || final.repair != 0 || fixture.sequence.ctx.Err() != nil ||
 				finalStats.ReceiveQueueEvictionCount != 0 || finalStats.ReceiveQueueCommitShortfallCount != 0 || finalStats.ReceiveQueueExitWithdrawCount != 0 {
 				t.Fatalf("consumer prefix did not recover every original exactly once: %+v delivered=%d acked=%d", final, fixture.deliveredPackets, fixture.ackedPacks)
 			}
@@ -555,7 +558,8 @@ func TestReceiveMemoryConsumerBulkPreservesExistingCommitment(t *testing.T) {
 		sent := fixture.windowRoundFixture.sequence().resendQueue.GetByMessageId(held.messageId)
 		before := fixture.census()
 		if sent == nil || !sent.selectiveAcked || before.committedItems != 1 || before.committed != cost ||
-			before.prefix != cost || before.boundary != held.sequenceNumber || fixture.ackedPacks != 0 {
+			before.prefix != cost || before.boundary != held.sequenceNumber || fixture.ackedPacks != 0 ||
+			before.repair != sequence.receiveBufferSettings.receiveHeldHeadRepairByteCount(false) {
 			t.Fatal("existing-commitment control did not publish a genuine paid selective acknowledgement")
 		}
 		fixture.forward(later, fixture.receiverIn)
@@ -572,7 +576,7 @@ func TestReceiveMemoryConsumerBulkPreservesExistingCommitment(t *testing.T) {
 		final := fixture.census()
 		stats := fixture.receiver.ReceiveStats()
 		if fixture.deliveredPackets != 24 || fixture.ackedPacks != 3 || sequence.nextSequenceNumber != fixture.first+3 ||
-			final.rx != 0 || final.held != 0 || final.prefix != 0 || final.escrow != 0 ||
+			final.rx != 0 || final.held != 0 || final.prefix != 0 || final.escrow != 0 || final.repair != 0 ||
 			stats.ReceiveQueueEvictionCount != 0 || stats.ReceiveQueueCommitShortfallCount != 0 || stats.ReceiveQueueExitWithdrawCount != 0 {
 			t.Fatal("existing commitment did not drain its three real originals without withdrawal")
 		}

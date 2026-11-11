@@ -107,6 +107,14 @@ func (self *multiClientWindow) beginDiscoveryDemandSlot(owner *multiClientEvalua
 // The normal receiver owns the handoff. A demand result for an older request
 // is retired before evaluation and does not consume a new acquisition slot.
 func (self *multiClientWindow) acceptDiscoveryDemandArgs(owner *multiClientEvaluationOwner, args *multiClientChannelArgs) bool {
+	// Listed before its provider failed in this window: the cool-off
+	// (ip_remote_multi_client_cooloff.go) refuses it here, before the demand
+	// slot is taken, so the expansion retires its args and waits for the
+	// next candidate. A candidate the starvation escape listed after the
+	// failure is evaluated.
+	if !args.deferredClientArgs && self.cooloffRefuses(args.Destination, args.cooloffListing) {
+		return false
+	}
 	var cancel context.CancelFunc
 	self.stateLock.Lock()
 	demand := &self.discoveryDemand

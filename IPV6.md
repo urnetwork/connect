@@ -236,7 +236,26 @@ Destination Unreachable; drop NS/NA/RS/RA silently. Before policy checks on
 egress, unmap v4-mapped addresses and block 6to4 (`2002::/16`), Teredo
 (`2001::/32`), the NAT64 well-known prefix (`64:ff9b::/96`), ULA, link-local,
 multicast, loopback and unspecified, so a v6 packet cannot reach private v4
-space.
+space. The rule is the IANA special-purpose registries' "Globally Reachable"
+column for both families (docs/IP_SECURITY.md §2.2.1): the rest of
+`2001::/23` outside its globally reachable sub-blocks (`2001:1::1-3`,
+`2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`), with
+benchmarking `2001:2::/48` and the deprecated ORCHID `2001:10::/28`; the
+documentation blocks `2001:db8::/32` and `3fff::/20`; SRv6 SIDs `5f00::/16`;
+the discard-only and dummy prefixes `100::/64` and `100:0:0:1::/64`; and on
+the IPv4 side `0.0.0.0/8`, `100.64.0.0/10`, `192.0.0.0/24` (but its PCP and
+TURN anycast addresses), `198.18.0.0/15` and `240.0.0.0/4`. TCP to the
+benchmarking blocks is the synthetic speed server, which every NAT serves in
+memory and never dials. In the provider role a public destination is also
+refused when it is the provider host or on one of its links
+(docs/IP_SECURITY.md §2.2.2): every public interface address with its
+interface prefix, at least the `/56` around every IPv6 address
+(`ProviderLocalSecurityPolicySettings.Ipv6PrefixBits`) even when the
+interface reports a `/128`, the addresses the platform observes the host
+connecting from, the service anycast addresses the network in front of the
+host answers (PCP `192.0.0.9` and `2001:1::1`, TURN `192.0.0.10` and
+`2001:1::2`, DNS-SD service registration `2001:1::3`), and the v4-mapped form
+of a local IPv4 address.
 
 C5. DoH. Populate `RemoteDohUrlsIpv6`, `RemoteDnsIpv6` and `LocalDnsIpv6`
 with the v6 endpoints of the existing operators; `DefaultDohSettings().

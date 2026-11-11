@@ -79,7 +79,15 @@ func newNatProviderSecurityPolicy(ctx context.Context, settings *RemoteUserNatPr
 	}
 	dmca := DefaultDmcaSecurityPolicySettings()
 	dmca.MaxFlows = 64
-	return Reverse(NewSecurityPolicy(ctx, DefaultCfaaSecurityPolicySettings(), dmca, DefaultWebStandardSettings(), stats))
+	return newProviderSecurityPolicy(
+		ctx,
+		DefaultCfaaSecurityPolicySettings(),
+		dmca,
+		DefaultWebStandardSettings(),
+		DefaultProviderLocalSecurityPolicySettings(),
+		processProviderLocalNetworks,
+		stats,
+	)
 }
 
 func waitNatProviderSecurityPolicy(policy SecurityPolicy) {

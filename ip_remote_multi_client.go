@@ -351,6 +351,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// loss, and short enough that a provider the window has not seen for
 		// longer is found again through discovery like any other
 		RecentExitMemoryTimeout: 5 * time.Minute,
+		// long enough that a pool whose few providers do not answer is not
+		// drawn again every round, short enough that a provider that was only
+		// briefly failing is back within minutes
+		EvaluationFailureCooloff: 5 * time.Minute,
 		// the egress-dial lines' cadence (controlDialLogInterval)
 		EvaluationFailureLogInterval: 5 * time.Second,
 		// WindowMaxScale:              4.0,
@@ -1086,6 +1090,11 @@ type MultiClientSettings struct {
 	// Non-positive disables the memory: lost exits are replaced by discovery
 	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
 	RecentExitMemoryTimeout time.Duration
+	// EvaluationFailureCooloff is how long a window leaves out of its
+	// discovery a provider whose candidate failed evaluation, or whose exit a
+	// verdict removed (ip_remote_multi_client_cooloff.go). Non-positive
+	// disables the cool-off: the next round may offer the same provider again.
+	EvaluationFailureCooloff time.Duration
 	// EvaluationFailureLogInterval is the per-line-shape emission floor for a
 	// window's unconditional evaluation-failure lines: client create, ping,
 	// budget and empty-enumerate failures. A hung window retries
@@ -7614,8 +7623,8 @@ func (self *RemoteUserNatMultiClient) SetBlockActionOverrides(overrides []*Block
 // cluster with user traffic. the default security and routing decisions and
 // the packet stats still apply to ignored destinations, but no block actions
 // are surfaced for them. safe to call at runtime.
-// the hard coded remote doh resolver ips are always excluded in addition to
-// these host values (see `defaultRemoteDohIgnoreAddrs`).
+// the well known public resolver ips are always excluded in addition to
+// these host values (see `wellKnownResolverAddrs`).
 func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []string) {
 	func() {
 		self.stateLock.Lock()
@@ -7638,14 +7647,14 @@ func (self *RemoteUserNatMultiClient) SetBlockActionIgnoreHosts(hostValues []str
 
 // blockActionIgnored returns whether the destination is excluded from the
 // override and association logic. the result is cached per destination.
-// the hard coded remote doh resolver ips are always excluded (see
-// `defaultRemoteDohIgnoreAddrs`), independent of `SetBlockActionIgnoreHosts`.
+// the well known public resolver ips are always excluded (see
+// `wellKnownResolverAddrs`), independent of `SetBlockActionIgnoreHosts`.
 func (self *RemoteUserNatMultiClient) blockActionIgnored(ipPath *IpPath) bool {
 	addr, ok := ipAssocAddr(ipPath.DestinationIp)
 	if !ok {
 		return false
 	}
-	if defaultRemoteDohIgnoreAddrs()[addr] {
+	if wellKnownResolverAddrs()[addr] {
 		return true
 	}
 	state := self.blockActionIgnoreState.Load()
@@ -12738,6 +12747,12 @@ type multiClientWindow struct {
 	// The exits any other window lost to an outage of ours, for the rounds
 	// that re-form it to ask for first. Its own lock inside.
 	recentExits recentExitMemory
+
+	// --- cool-off (see ip_remote_multi_client_cooloff.go) ---
+
+	// The providers this window found failing, left out of its discovery
+	// until their cool-off ends. Its own lock inside.
+	cooloff destinationCooloff
 }
 
 func newMultiClientWindow(
@@ -13471,6 +13486,33 @@ func (self *multiClientWindow) removeLateClientArgs(clientArgs *MultiClientGener
 	}
 }
 
+// The exclusions of one discovery round: the destinations of the exits the
+// window holds that take new flows or are reserved for a service refresh, the
+// service refresh's refusals, and the providers cooling off unless the
+// starvation escape skips them (ip_remote_multi_client_cooloff.go). For the
+// escape the window holds a provider while one of its exits does
+// (holdsWindowForCooloff), and only a round that asks the pool spends the
+// skip an empty round left (cooloffRoundAsksThePool: not a probe, nor a
+// family-filtered IPv6 demand read). Returns the cool-off's excluded count
+// and the round's listing.
+func (self *multiClientWindow) discoveryRoundExclusions(probeOnly bool, demandRead *discoveryDemandRead) (map[MultiHopId]bool, int, cooloffListing) {
+	self.stateLock.Lock()
+	windowDestinations := map[MultiHopId]bool{}
+	heldCount := 0
+	for _, client := range self.clients {
+		if !client.isWarning() || client.serviceRefreshReservation.Load() != nil {
+			windowDestinations[client.Destination()] = true
+		}
+		if client.holdsWindowForCooloff() {
+			heldCount += 1
+		}
+	}
+	self.stateLock.Unlock()
+	self.addServiceRefreshExclusions(windowDestinations)
+	cooloffExcluded, cooloffListing := self.addCooloffExclusions(windowDestinations, heldCount, self.cooloffRoundAsksThePool(probeOnly, demandRead))
+	return windowDestinations, cooloffExcluded, cooloffListing
+}
+
 func (self *multiClientWindow) randomEnumerateClientArgs() {
 	defer func() {
 		close(self.clientChannelArgs)
@@ -13511,17 +13553,18 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			return
 		}
 
-		// exclude healthy destinations that are already in the window
+		// whether this round is a resize-pass probe, decided before its
+		// listing below
+		probeOnly := false
+
+		// exclude healthy destinations that are already in the window, and
+		// the providers cooling off (ip_remote_multi_client_cooloff.go). The
+		// round's candidates carry its cool-off listing to the expansion.
+		cooloffExcluded := 0
+		var cooloffListing cooloffListing
 		windowDestinations := func() map[MultiHopId]bool {
-			self.stateLock.Lock()
-			windowDestinations := map[MultiHopId]bool{}
-			for _, client := range self.clients {
-				if !client.isWarning() || client.serviceRefreshReservation.Load() != nil {
-					windowDestinations[client.Destination()] = true
-				}
-			}
-			self.stateLock.Unlock()
-			self.addServiceRefreshExclusions(windowDestinations)
+			var windowDestinations map[MultiHopId]bool
+			windowDestinations, cooloffExcluded, cooloffListing = self.discoveryRoundExclusions(probeOnly, demandRead)
 			return windowDestinations
 		}
 
@@ -13532,7 +13575,6 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// family-aware discovery order: v6-capable first while a shortfall
 		// is open, then the main fill -- or, for a resize-pass probe, the
 		// v6-capable request alone; see enumerateDestinations
-		probeOnly := false
 		var destinations []enumeratedDestination
 		var err error
 		if demandRead == nil {
@@ -13584,6 +13626,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			continue
 		}
+		// a round whose cool-off exclusions left it empty lets the next round
+		// run without them (the starvation escape), unless it asked only for
+		// v6-capable providers, whose absence says nothing of the pool
+		self.noteCooloffRound(cooloffExcluded, len(destinations) == 0 && self.cooloffRoundAsksThePool(probeOnly, demandRead))
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
@@ -13732,6 +13778,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						FixedDestination:               fixedDestination,
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
+						cooloffListing:                 cooloffListing,
 					}
 					offered := self.offerPassCandidate(demandRead, args, time.Now().Add(timeout), serviceOwner)
 					if !offered {
@@ -13833,6 +13880,11 @@ func (self *windowErrorRemoval) cause() windowRemovalCause {
 func (self *windowErrorRemoval) finish() {
 	if self.rememberLostExit {
 		self.window.rememberRecentExit(self.client, self.lostExit, self.lostExitMaxCount)
+	} else if !self.stickyExit && providerVerdictErr(self.err) && self.window.verdictJudgeable(self.client) {
+		// a verdict against the provider that the recent-exit memory did not
+		// keep as an outage of ours, judged while another exit receives:
+		// discovery leaves it out for a while
+		self.window.noteFailedDestination(self.client.Destination(), cooloffReasonVerdict)
 	}
 }
 
@@ -15423,6 +15475,7 @@ requestCandidates:
 				}
 				if providerFailure {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
+					self.noteFailedDestination(args.Destination, cooloffReasonEvaluation)
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
@@ -15501,6 +15554,7 @@ requestCandidates:
 					state := ProviderStateNotAdded
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
+						self.noteFailedDestination(args.Destination, cooloffReasonEvaluation)
 					}
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
@@ -16635,6 +16689,12 @@ type multiClientChannelArgs struct {
 	// name (enumerateRecentExits). It is evaluated and admitted like any other
 	// candidate; the mark only names its outcome in the log.
 	recentExit bool
+
+	// How the discovery round that listed this candidate read the window's
+	// cool-off; the expansion refuses a candidate listed before its provider
+	// failed (ip_remote_multi_client_cooloff.go). The zero value is a round
+	// that applied the exclusions.
+	cooloffListing cooloffListing
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry

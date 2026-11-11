@@ -27,99 +27,108 @@ func receiveDeliveryMergeOwnedPack(t *testing.T, fixture *reliableTcpIngressFixt
 }
 
 // Runs the real worker's contract failure on either a fresh or held head,
-// using both legacy accounting and exact retained admission.
+// using legacy accounting and exact retained admission. Held proofs cover
+// both a paid repair lease and a larger proof that must remain tentative.
 func runReceiveDeliveryMergeContractFailure(t *testing.T, held bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	for _, retained := range []bool{false, true} {
-		synctest.Test(t, func(t *testing.T) {
-			f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
-			budget := NewTransferMemoryBudget(kib(256))
-			sequence := f.runningReceiveSequence(func(settings *ReceiveBufferSettings) {
-				settings.SequenceBufferSize = 4
-				settings.ReceiveQueueMinByteCount = 0
-				settings.ReceiveQueueMaxByteCount = kib(64)
-				settings.ReceiveQueueRetainedByteAccounting = retained
-				if retained {
-					settings.ReceiveQueueBudget = budget
-				}
-			})
-			number := uint64(0)
-			if held {
-				number = 1
+		for _, repairFits := range []bool{true, false} {
+			if !repairFits && (!held || !retained) {
+				continue
 			}
-			pack, id := f.uploadPack(sequence, number, 101, []byte("rejected contract owner"))
-			pack.Pack.ContractFrame = &protocol.Frame{MessageBytes: []byte{0x80}}
-			if retained {
-				pack.Pack.ContractFrame.MessageType = protocol.MessageType_TransferContract
+			synctest.Test(t, func(t *testing.T) {
+				f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
+				budget := NewTransferMemoryBudget(kib(256))
+				sequence := f.runningReceiveSequence(func(settings *ReceiveBufferSettings) {
+					settings.SequenceBufferSize = 4
+					settings.ReceiveQueueMinByteCount = 0
+					settings.ReceiveQueueMaxByteCount = kib(64)
+					settings.ReceiveQueueRetainedByteAccounting = retained
+					if retained {
+						settings.ReceiveQueueBudget = budget
+					}
+				})
+				number := uint64(0)
 				if held {
-					// A no-contract peer's repair escrow covers its inline owner,
-					// not a copied proof root. This present empty proof still fails
-					// real verification after the committed owner reaches the head.
-					pack.Pack.ContractFrame.MessageBytes = nil
-					if f.client.ContractManager().Verify(nil, nil, protocol.ProvideMode(0)) {
-						pack.messagePoolReturn()
-						t.Fatal("empty invalid proof unexpectedly verified")
-					}
+					number = 1
 				}
-				pack = receiveDeliveryMergeOwnedPack(t, f, sequence, pack)
-			}
-			witness := MessagePoolShareReadOnly(pack.Pack.Frames[0].MessageBytes)
-			defer func() { MessagePoolReturn(witness) }()
-			if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
-				pack.messagePoolReturn()
-				t.Fatalf("contract fixture handoff: ok=%t err=%v", ok, err)
-			}
-			synctest.Wait()
-			if held {
-				item := sequence.receiveQueue.GetByMessageId(id)
-				if item == nil || !item.committed || retained && item.memoryBudget != budget {
-					t.Fatal("bad contract did not reach the real held-owner boundary")
-				}
+				pack, id := f.uploadPack(sequence, number, 101, []byte("rejected contract owner"))
+				pack.Pack.ContractFrame = &protocol.Frame{MessageBytes: []byte{0x80}}
 				if retained {
-					assertReliableIngressRepairCustody(t, sequence, item)
-					if item.contractFrame == nil || len(item.contractFrame.MessageBytes) != 0 ||
-						!item.deliveryPrepared || item.deliveryPrepaid <= 0 {
-						t.Fatal("committed held original lost its invalid proof or paid downstream custody")
+					if repairFits {
+						pack.Pack.ContractFrame.MessageType = protocol.MessageType_TransferContract
 					}
+					if held && repairFits {
+						// A no-contract peer's repair escrow covers its inline owner,
+						// not a copied proof root. This present empty proof still fails
+						// real verification after the committed owner reaches the head.
+						pack.Pack.ContractFrame.MessageBytes = nil
+						if f.client.ContractManager().Verify(nil, nil, protocol.ProvideMode(0)) {
+							pack.messagePoolReturn()
+							t.Fatal("empty invalid proof unexpectedly verified")
+						}
+					}
+					pack = receiveDeliveryMergeOwnedPack(t, f, sequence, pack)
 				}
-				head, _ := f.uploadPack(sequence, 0, 101, []byte("valid predecessor"))
-				if retained {
-					head = receiveDeliveryMergeOwnedPack(t, f, sequence, head)
-				}
-				if ok, err := sequence.Pack(head, 0); !ok || err != nil {
-					head.messagePoolReturn()
-					t.Fatalf("predecessor handoff: ok=%t err=%v", ok, err)
+				witness := MessagePoolShareReadOnly(pack.Pack.Frames[0].MessageBytes)
+				defer func() { MessagePoolReturn(witness) }()
+				if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
+					pack.messagePoolReturn()
+					t.Fatalf("contract fixture handoff: ok=%t err=%v", ok, err)
 				}
 				synctest.Wait()
-			}
-			select {
-			case <-sequence.exit:
-			default:
-				t.Fatal("contract failure did not join the receive worker")
-			}
-			q := sequence.deliveryQueue
-			if sequence.ctx.Err() == nil || !sequence.rejectRetransmits ||
-				sequence.nextSequenceNumber != number || q == nil {
-				t.Fatal("fixture missed the terminal contract boundary before advancement")
-			}
-			if len(q.items) != 0 || len(q.admitted) != 0 || q.bytes != 0 || q.controlCount != 0 ||
-				sequence.receiveQueue.Len() != 0 || budget.UsedByteCount() != 0 {
-				t.Fatalf("retained=%t held=%t: contract failure stranded a receipt or reservation", retained, held)
-			}
-			if present, head := reliableIngressCumulativeHead(sequence); present && head.sequenceNumber >= number {
-				t.Fatal("rejected contract acquired cumulative delivery evidence")
-			}
-			if f.client.Ctx().Err() != nil || f.provider.ctx.Err() != nil {
-				t.Fatal("one contract failure closed the shared client/provider")
-			}
-			// The witness must be the only remaining pool owner after exit.
-			probe := witness
-			witness = nil
-			if !MessagePoolReturn(probe) {
-				t.Fatal("contract failure left the packet rooted outside its witness")
-			}
-		})
+				if held {
+					item := sequence.receiveQueue.GetByMessageId(id)
+					if item == nil || item.committed != (!retained || repairFits) || retained && item.memoryBudget != budget ||
+						retained && !repairFits && (sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0) {
+						t.Fatal("bad contract did not reach the real held-owner boundary")
+					}
+					if retained && repairFits {
+						assertReliableIngressRepairCustody(t, sequence, item)
+						if item.contractFrame == nil || len(item.contractFrame.MessageBytes) != 0 ||
+							!item.deliveryPrepared || item.deliveryPrepaid <= 0 {
+							t.Fatal("committed held original lost its invalid proof or paid downstream custody")
+						}
+					}
+					head, _ := f.uploadPack(sequence, 0, 101, []byte("valid predecessor"))
+					if retained {
+						head = receiveDeliveryMergeOwnedPack(t, f, sequence, head)
+					}
+					if ok, err := sequence.Pack(head, 0); !ok || err != nil {
+						head.messagePoolReturn()
+						t.Fatalf("predecessor handoff: ok=%t err=%v", ok, err)
+					}
+					synctest.Wait()
+				}
+				select {
+				case <-sequence.exit:
+				default:
+					t.Fatal("contract failure did not join the receive worker")
+				}
+				q := sequence.deliveryQueue
+				if sequence.ctx.Err() == nil || !sequence.rejectRetransmits ||
+					sequence.nextSequenceNumber != number || q == nil {
+					t.Fatal("fixture missed the terminal contract boundary before advancement")
+				}
+				if len(q.items) != 0 || len(q.admitted) != 0 || q.bytes != 0 || q.controlCount != 0 ||
+					sequence.receiveQueue.Len() != 0 || budget.UsedByteCount() != 0 {
+					t.Fatalf("retained=%t held=%t: contract failure stranded a receipt or reservation", retained, held)
+				}
+				if present, head := reliableIngressCumulativeHead(sequence); present && head.sequenceNumber >= number {
+					t.Fatal("rejected contract acquired cumulative delivery evidence")
+				}
+				if f.client.Ctx().Err() != nil || f.provider.ctx.Err() != nil {
+					t.Fatal("one contract failure closed the shared client/provider")
+				}
+				// The witness must be the only remaining pool owner after exit.
+				probe := witness
+				witness = nil
+				if !MessagePoolReturn(probe) {
+					t.Fatal("contract failure left the packet rooted outside its witness")
+				}
+			})
+		}
 	}
 }
 

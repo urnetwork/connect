@@ -436,6 +436,17 @@ message CloseSequences {
     repeated bytes peer_ids = 2;
 }
 
+// The public addresses the platform observes this client's transports
+// connecting from, across all of them, sent only from the control id and
+// again whenever the set changes (server connect/resident_observed_addresses.go).
+// The client replaces its observed set with them. A provider counts each as
+// its own address (connect ip_security_local.go), so a consumer cannot reach
+// the router the provider sits behind by hairpin NAT to its public address.
+message ObservedAddresses {
+    // each a 4-byte IPv4 or a 16-byte IPv6 address
+    repeated bytes addresses = 1;
+}
+
 
 // a network peer: a connected top-level client in the same network and its
 // identity metadata. When `disconnect_time` is set, this entry is a

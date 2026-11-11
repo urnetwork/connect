@@ -1,8 +1,9 @@
 package connect
 
 // Verdict reasons name the rule that decided a security policy result: the
-// static CFAA layer, the privileged-port skip, a positive standard, the RTP
-// probation, the plaintext/budget allowances, or the encrypted heuristic.
+// destination rules (not public, provider-local), the static CFAA layer, the
+// privileged-port skip, a positive standard, the RTP probation, the
+// plaintext/budget allowances, or the encrypted heuristic.
 //
 // Reasons are local diagnostics only. The statistics keyed by reason use the
 // port-only destination (version, protocol, port) regardless of the collector's
@@ -62,6 +63,12 @@ const (
 	// the WhatsApp Noise transport, an application standard
 	// (ip_security_appstandard.go)
 	SecurityPolicyReasonAllowWhatsApp
+	// the destination is the provider host itself or on one of its links
+	// (ip_security_local.go); provider role only
+	SecurityPolicyReasonProviderLocal
+	// the provider has not read its own addresses yet, so it refuses every
+	// otherwise public destination (ip_security_local.go); provider role only
+	SecurityPolicyReasonProviderLocalUnknown
 
 	// one past the last reason
 	securityPolicyReasonEnd
@@ -129,6 +136,10 @@ func (self SecurityPolicyReason) String() string {
 		return "allow-messaging"
 	case SecurityPolicyReasonAllowWhatsApp:
 		return "allow-app-standard:whatsapp"
+	case SecurityPolicyReasonProviderLocal:
+		return "provider-local"
+	case SecurityPolicyReasonProviderLocalUnknown:
+		return "provider-local-unknown"
 	default:
 		return "unknown"
 	}

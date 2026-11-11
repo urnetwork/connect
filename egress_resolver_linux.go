@@ -143,15 +143,9 @@ const egressResolverDialTimeout = 5 * time.Second
 // same dead one.
 var egressResolverRotation atomic.Uint64
 
-// egressFallbackDnsServers are dialed when the physical link's own resolvers
-// cannot be read. The same operators as DefaultDnsResolverSettings, as plain
-// :53, and the same list as the Windows file's fallback.
-var egressFallbackDnsServers = []string{
-	"1.1.1.1",
-	"9.9.9.9",
-	"8.8.8.8",
-	"208.67.222.222",
-}
+// When the physical link's own resolvers cannot be read, egressDnsServers
+// dials egressFallbackDnsServers (egress_dial.go), the list the Windows file
+// shares.
 
 func egressResolverDial(ctx context.Context, network string, addr string) (net.Conn, error) {
 	if !egressSelfMarked() {

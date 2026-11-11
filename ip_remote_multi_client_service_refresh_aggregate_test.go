@@ -130,7 +130,15 @@ func testAggregateIdleRefusalMetadataPublication(t *testing.T, materialize bool)
 		if !successor {
 			t.Fatal("publication control did not materialize its distinct paid metadata successor")
 		}
+		// The pass that publishes the provider can hold the flow lock when the
+		// paid SYN's publication visit arrives; hold the visit until it settles.
+		visit, releaseVisit := f.holdPublicationVisit(t)
 		close(f.generator.availableRelease)
+		if !discoveryDemandTestAwaitPublication(t, visit, f.started.Add(2500*time.Millisecond)) {
+			t.Fatal("published provider never reached the paid flow's publication visit")
+		}
+		f.h.settle()
+		releaseVisit()
 		f.requireLate(t, publication, f.started.Add(2500*time.Millisecond), "AGGREGATE_IDLE_REFUSAL_PUBLICATION_STALLED")
 		select {
 		case actual := <-wire:

@@ -1762,6 +1762,10 @@ type ClientSettings struct {
 	// Nil test barrier pauses the actual client-key publisher after readiness,
 	// before it publishes or skips publication.
 	beforeClientKeyPublishForTest func()
+	// The provider-local snapshot the platform's ObservedAddresses feed
+	// (transfer_observed_addresses.go). Nil, outside tests, is the process
+	// snapshot every provider policy reads.
+	providerLocalNetworksForTest *providerLocalNetworks
 
 	// TransportDelay, when set, offers the per-message delay header on this
 	// client's P2P streams as the active side, while the client's edges
@@ -2358,10 +2362,11 @@ type Client struct {
 	beforeLoopbackReleaseForTest func()
 
 	// contractManagerUnsub func()
-	webRtcManagerUnsub  func()
-	streamManagerUnsub  func()
-	peerManagerUnsub    func()
-	sequenceCloserUnsub func()
+	webRtcManagerUnsub     func()
+	streamManagerUnsub     func()
+	peerManagerUnsub       func()
+	sequenceCloserUnsub    func()
+	observedAddressesUnsub func()
 }
 
 func NewClientWithDefaults(
@@ -2491,6 +2496,7 @@ func NewClientWithTag(
 	client.streamManagerUnsub = client.AddReceiveCallback(streamManager.Receive)
 	client.sequenceCloser = newSequenceCloser(client)
 	client.sequenceCloserUnsub = client.AddReceiveCallback(client.sequenceCloser.Receive)
+	client.observedAddressesUnsub = client.AddReceiveCallback(client.receiveObservedAddresses)
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 	client.networkQuality = newClientNetworkQualityState(client)
@@ -5347,6 +5353,7 @@ func (self *Client) Close() {
 	self.streamManagerUnsub()
 	self.peerManagerUnsub()
 	self.sequenceCloserUnsub()
+	self.observedAddressesUnsub()
 }
 
 // CloseAndWait closes the client and joins its reader, close worker,
@@ -18723,8 +18730,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 		}
 
-		if canQueue(item) && self.reserveHeldItem(item, promised) &&
-			(item.noBudget || self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix || self.reserveReceiveHeldHeadRepair(item)) {
+		// Acknowledging on admission first needs the repair escrow. Check it
+		// before the item reserves: a direct or otherwise unpaid item can never
+		// fund it, and a refusal after reserveHeldItem would leave that queue
+		// reservation with no owner to release it. A paid RX owner that gets
+		// its escrow is already charged, so reserveHeldItem cannot then fail.
+		if canQueue(item) &&
+			(item.noBudget || self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix || self.reserveReceiveHeldHeadRepair(item)) &&
+			self.reserveHeldItem(item, promised) {
 			// the largest frame seen is the conservative gap estimate:
 			// over-counting commits fewer items and costs churn at the
 			// boundary, under-counting commits an item that is later evicted,

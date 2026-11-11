@@ -10,6 +10,8 @@ import (
 	"slices"
 	"sync"
 	"testing"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Bootstrap fallback tests (support inbox 7956, 7957, 7973): the China DoH
@@ -161,6 +163,72 @@ func TestIngressEgressDnsSeparate(t *testing.T) {
 	}
 	if urls := remoteDohUrls(IngressDohSettings("cn", nil, nil), 4); !slices.Equal(urls, ingressBefore) {
 		t.Fatalf("new ingress = %v after an egress change, expected %v", urls, ingressBefore)
+	}
+
+	// a preset selected for the tunnel (ADBLOCK3RD 6.3) changes nothing on the
+	// ingress side. The ingress servers of each country are read first; then a
+	// preset is applied in place to the settings objects a device starts from
+	// (the mux and egress defaults), a mux runs with it, and the ingress
+	// settings and control-name resolver built afterwards must match what was
+	// read, with no pins, so a filter can never affect the control names.
+	ingressCountryCodes := []string{"", "cn", "ru"}
+	ingressBeforePreset := map[string][][]string{}
+	for _, countryCode := range ingressCountryCodes {
+		ingress := IngressDohSettings(countryCode, nil, nil)
+		for _, ipVersion := range []int{0, 4, 6} {
+			ingressBeforePreset[countryCode] = append(ingressBeforePreset[countryCode], remoteDohUrls(ingress, ipVersion))
+		}
+	}
+	const presetDohUrl = "https://dns.example/dns-query"
+	presetPins := map[string][]string{"dns.example": {"192.0.2.95", "2001:db8::95"}}
+	presetMux := DefaultUpgradeMuxSettings()
+	presetMux.Dns.Resolver.RemoteDohUrlsIpv4 = []string{presetDohUrl}
+	presetMux.Dns.Resolver.RemoteDohUrlsIpv6 = []string{presetDohUrl}
+	presetMux.Dns.Resolver.RemoteDnsIpv4 = nil
+	presetMux.Dns.Resolver.RemoteDnsIpv6 = nil
+	presetMux.Dns.Resolver.DohServerHostAddrs = presetPins
+	presetMux.Dns.Failover = DefaultUpgradeMuxSettings().Dns.Resolver
+	presetMux.Dns.Fallback = DefaultDnsUpgradeFallbackSettings()
+	presetMux.Dns.FallbackUntilTunnelReady = true
+	presetEgress := DefaultDohSettings()
+	presetEgress.DnsResolverSettings.RemoteDohUrlsIpv4 = []string{presetDohUrl}
+	presetEgress.DnsResolverSettings.RemoteDohUrlsIpv6 = []string{presetDohUrl}
+	presetEgress.DnsResolverSettings.DohServerHostAddrs = presetPins
+	presetCtx, presetCancel := context.WithCancel(context.Background())
+	defer presetCancel()
+	presetUpgradeMux, err := NewUpgradeMux(presetCtx, TransferPath{}, protocol.ProvideMode_Network, 0, func(TransferPath, protocol.ProvideMode, *IpPath, []byte) {}, presetMux, NewNoopLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer presetUpgradeMux.Close()
+	presetCache := NewDohCache(presetEgress)
+	defer presetCache.Close()
+	if presetCache.pinnedHostAddrs == nil || presetUpgradeMux.mux.Tun().DohCache().pinnedHostAddrs == nil {
+		t.Fatal("the preset settings did not pin their host")
+	}
+	for _, countryCode := range ingressCountryCodes {
+		ingress := IngressDohSettings(countryCode, nil, nil)
+		internal := internalDohSettings(ingress, []string{"api.example"})
+		for i, ipVersion := range []int{0, 4, 6} {
+			want := ingressBeforePreset[countryCode][i]
+			if urls := remoteDohUrls(ingress, ipVersion); !slices.Equal(urls, want) {
+				t.Fatalf("%q ingress v%d = %v with a preset running, expected %v", countryCode, ipVersion, urls, want)
+			}
+			if urls := remoteDohUrls(internal, ipVersion); !slices.Equal(urls, want) {
+				t.Fatalf("%q control-name resolver v%d = %v with a preset running, expected %v", countryCode, ipVersion, urls, want)
+			}
+		}
+		if ingress.DnsResolverSettings.DohServerHostAddrs != nil || internal.DnsResolverSettings.DohServerHostAddrs != nil {
+			t.Fatalf("%q ingress carries the preset's pins", countryCode)
+		}
+		if ingress.DnsResolverSettings == presetMux.Dns.Resolver || ingress.DnsResolverSettings == presetEgress.DnsResolverSettings {
+			t.Fatalf("%q ingress shares resolver settings with the preset", countryCode)
+		}
+		internalCache := NewDohCache(internal)
+		if internalCache.pinnedHostAddrs != nil || internalCache.dohServerNames["dns.example"] {
+			t.Fatalf("%q control-name resolver knows the preset's host", countryCode)
+		}
+		internalCache.Close()
 	}
 
 	// a tunnel cache with every DoH blocked never falls back to plain dns

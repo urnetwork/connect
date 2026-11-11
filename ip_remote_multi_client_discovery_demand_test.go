@@ -158,6 +158,8 @@ func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configu
 		emptyEntered: make(chan struct{}), emptyRelease: make(chan struct{}),
 		availableEntered: make(chan struct{}), availableRelease: make(chan struct{})}
 	t.Cleanup(func() {
+		// Channel and enumerator retirement may finish after CloseAndWait.
+		h.settle()
 		_, _, mints, retired := g.counts()
 		if mints != retired {
 			t.Errorf("joined public fixture retired %d of %d actual minted identities", retired, mints)

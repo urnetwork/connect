@@ -365,27 +365,62 @@ func TestNatMemoryUdpCallbackRetainsFlowThroughClose(t *testing.T) {
 }
 
 func TestNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
-	testNatMemoryTcpAckProgressAtFullDataBudget(t, 0)
+	assertMessagePoolOwnership(t)
+	testNatMemoryTcpAckProgressAtFullDataBudget(t, 0, false)
 }
 
 func TestNatProviderMemoryTcpAckProgressAtFullDataBudget(t *testing.T) {
-	t.Run("legacy", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 1) })
-	t.Run("raw", func(t *testing.T) { testNatMemoryTcpAckProgressAtFullDataBudget(t, 2) })
+	t.Run("legacy", func(t *testing.T) {
+		assertMessagePoolOwnership(t)
+		testNatMemoryTcpAckProgressAtFullDataBudget(t, 1, false)
+	})
+	t.Run("raw", func(t *testing.T) {
+		assertMessagePoolOwnership(t)
+		testNatMemoryTcpAckProgressAtFullDataBudget(t, 2, false)
+	})
 }
 
-func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolVersion int) {
+// The NAT dispatch shard is held from the pressure boundary until the bubble
+// is idle, so no ACK is applied while the synthetic peer answers every segment
+// it has. At a full data budget the source then holds only the return chunk
+// that was in flight at the fill, and the NAT has admitted its ACKs.
+//
+// The fixture used to fill the budget while the flow's adaptive return queue
+// held its optional hot funding. The queue's demotion returned that credit,
+// the reader retained the rest of the download with no ACK applied, and the
+// peer's ACK per segment overran the NAT's 16-KiB control partition whenever
+// the shard lagged 16 ACKs behind it.
+func TestNatMemoryTcpAckProgressAtFullDataBudgetWithHeldDispatch(t *testing.T) {
 	assertMessagePoolOwnership(t)
+	for _, providerProtocolVersion := range []int{0, 1, 2} {
+		t.Logf("provider protocol version %d", providerProtocolVersion)
+		synctest.Test(t, func(t *testing.T) {
+			testNatMemoryTcpAckProgressAtFullDataBudget(t, providerProtocolVersion, true)
+		})
+	}
+}
+
+// Version 0 sends the synthetic peer's packets to the NAT directly; versions 1
+// and 2 send them through provider ingress. heldDispatch requires a synctest
+// bubble. Callers assert pool ownership first, outside any bubble, which also
+// starts the pool's lazy stats worker outside it.
+func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolVersion int, heldDispatch bool) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	budget := NewTransferMemoryBudget(mib(2))
 	settings := DefaultLocalUserNatSettings()
 	settings.MemoryBudget = budget
 	settings.Log = NewNoopLogger()
-	created := make(chan *TcpSequence, 1)
-	settings.TcpBufferSettings.beforeSequenceRunWithStateForTest = func(sequence *TcpSequence) { created <- sequence }
 	local, origin := net.Pipe()
 	defer origin.Close()
 	settings.TcpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) { return local, nil }}
+	sequences := make(chan *TcpSequence, 1)
+	settings.TcpBufferSettings.beforeSequenceRunWithStateForTest = func(sequence *TcpSequence) {
+		select {
+		case sequences <- sequence:
+		default:
+		}
+	}
 	nat, err := TryNewLocalUserNat(ctx, "tcp-full", settings)
 	if err != nil {
 		t.Fatal(err)
@@ -395,6 +430,20 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 		select {
 		case processed <- struct{}{}:
 		default:
+		}
+	}
+	var dispatchHeld atomic.Bool
+	var heldSendPacketCount atomic.Int64
+	releaseDispatch := make(chan struct{})
+	var releaseDispatchOnce sync.Once
+	unblockDispatch := func() { releaseDispatchOnce.Do(func() { close(releaseDispatch) }) }
+	if heldDispatch {
+		// Installed before the first packet, so the shard reads it race-free.
+		nat.beforeSendPacketForTest = func(*SendPacket) {
+			if dispatchHeld.Load() {
+				heldSendPacketCount.Add(1)
+				<-releaseDispatch
+			}
 		}
 	}
 	var provider *RemoteUserNatProvider
@@ -433,11 +482,12 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	var allowAckOnce sync.Once
 	unblockAck := func() { allowAckOnce.Do(func() { close(allowAck) }) }
 	defer func() {
-		// A setup failure must release the callback barrier before joining the
-		// NAT, rather than waiting for the test deadline and reporting teardown
-		// cancellation as additional ACK-admission failures.
+		// A setup failure must release the callback and dispatch barriers
+		// before joining the NAT, rather than waiting for the test deadline and
+		// reporting teardown cancellation as additional ACK-admission failures.
 		cancel()
 		unblockAck()
+		unblockDispatch()
 		nat.CloseAndWait(context.Background())
 	}()
 	var handshakeOnce sync.Once
@@ -529,12 +579,27 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	var flow *TcpSequence
+	var sequence *TcpSequence
 	select {
-	case flow = <-created:
+	case sequence = <-sequences:
 	case <-ctx.Done():
-		t.Fatal("actual TCP flow was not published")
+		t.Fatal(ctx.Err())
 	}
+	// The origin sends exactly one return chunk before the fill and the rest
+	// after it. The reader cuts chunks at the read queue's cold depth (its
+	// window and replay limits are larger here), so these segments fit that
+	// queue without promotion and the fill captures no optional funding that a
+	// later demotion could hand back to the reader. Every later chunk is then
+	// retained only after an ACK releases an earlier one, which bounds the
+	// peer's outstanding ACKs to about one chunk's segments.
+	firstChunkByteCount := func() int {
+		sequence.mutex.Lock()
+		defer sequence.mutex.Unlock()
+		tcp := sequence.tcpBufferSettings
+		return min(tcp.ReadBufferByteCount, sequence.natPacketizationByteLimit(tcp.Mtu, tcp.MemoryColdWriteBatchSize))
+	}()
+	payload := bytes.Repeat([]byte{1}, total)
+	pressured := make(chan struct{})
 	written := make(chan error, 1)
 	writerJoined := false
 	defer func() {
@@ -548,16 +613,32 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 			}
 		}
 	}()
-	go func() { _, err := origin.Write(bytes.Repeat([]byte{1}, total)); written <- err }()
+	go func() {
+		if _, err := origin.Write(payload[:firstChunkByteCount]); err != nil {
+			written <- err
+			return
+		}
+		select {
+		case <-pressured:
+		case <-ctx.Done():
+			written <- ctx.Err()
+			return
+		}
+		_, err := origin.Write(payload[firstChunkByteCount:])
+		written <- err
+	}()
 	select {
 	case <-firstData:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	// The callback barrier does not stop socket read-ahead from retaining its
-	// next replay chunk. Fill atomically with respect to those legitimate
-	// claims; Available followed by TryReserve is only an advisory snapshot
-	// and can correctly fail under contention before this test starts.
+	if heldDispatch {
+		// The reader has retained the first chunk and waits on the origin.
+		synctest.Wait()
+	}
+	// Fill atomically with respect to other legitimate claims; Available
+	// followed by TryReserve is only an advisory snapshot and can correctly
+	// fail under contention before this test starts.
 	admissionRoot := budget.admissionRoot()
 	admissionRoot.admissionLock.Lock()
 	fill := budget.Available()
@@ -571,7 +652,25 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	if !full {
 		t.Fatal("data budget was not full at the pressure boundary")
 	}
+	if workspace := sequence.IpPath().tcpReturnBatchWorkspace; workspace != nil && workspace.funded.Load() {
+		t.Fatal("the fill captured the return queue's optional funding")
+	}
+	dispatchHeld.Store(heldDispatch)
+	close(pressured)
 	unblockAck()
+	if heldDispatch {
+		synctest.Wait()
+		if heldSendPacketCount.Load() != 1 {
+			t.Fatalf("dispatch held %d packets, want the first ACK after the fill", heldSendPacketCount.Load())
+		}
+		if got := received.Load(); got != int64(firstChunkByteCount) {
+			t.Fatalf("source received %d bytes with every ACK held, want only the %d in flight at the fill", got, firstChunkByteCount)
+		}
+		if budget.UsedByteCount() != budget.TotalByteCount() {
+			t.Fatal("data budget released capacity before any ACK was applied")
+		}
+		unblockDispatch()
+	}
 	select {
 	case <-complete:
 	case <-ctx.Done():
@@ -590,11 +689,11 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 		t.Fatalf("unique cumulative progress=%d, admitted ACKs=%d", uniqueReceived, ackAdmissions.Load())
 	}
 	for {
-		flow.mutex.Lock()
-		actualAck, retained := flow.receiveSeqAck, flow.returnByteCount
-		flow.mutex.Unlock()
+		sequence.mutex.Lock()
+		actualAck, retained := sequence.receiveSeqAck, sequence.returnByteCount
+		sequence.mutex.Unlock()
 		if actualAck == wantAck && retained == 0 {
-			if flow.ctx.Err() != nil {
+			if sequence.ctx.Err() != nil {
 				t.Fatal("flow teardown cannot stand in for cumulative ACK progress")
 			}
 			break

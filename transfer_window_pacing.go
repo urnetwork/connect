@@ -1949,6 +1949,23 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 		after := self.receiverHeldPrefixAtNanos
 		return measured > hold && after != 0 && (atNanos <= after || span >= atNanos-after)
 	}
+	// A compressed raw window ends on the receiver's timer, not on an arrival.
+	// Exact cumulative heads time the credited bytes themselves. When the
+	// reply's own wait is shorter than one more message at the held rate, that
+	// message may still have been serializing as the turn ended: at 125 kB/s a
+	// 50 ms turn holds one or two 31.688 ms messages. The window's excess over
+	// the heads then proves no slower serializer, so a decrease falls no lower
+	// than the heads show. A longer wait proves a stall; the window stands.
+	headBoundedDecrease := func(measured, bytes ByteCount, atNanos int64, supply windowServiceSupply, headStart int64) ByteCount {
+		if measured >= hold || compression <= 0 || self.maxMessageByteCount <= 0 || !supply.headComplete ||
+			headStart <= 0 || supply.headMaximumAtNanos <= headStart || atNanos < supply.headMaximumAtNanos {
+			return measured
+		}
+		if time.Duration(atNanos-supply.headMaximumAtNanos) >= windowPacingSerializationTime(self.maxMessageByteCount, hold) {
+			return measured
+		}
+		return min(hold, max(measured, byteRate(bytes, supply.headMaximumAtNanos-headStart)))
+	}
 	// A bounded drain has not yet distinguished queueing from propagation.
 	// Preserve qualified service through its physical proof and write handoff;
 	// expiry or abandonment ends the hold, while new bytes may raise it.
@@ -2056,6 +2073,9 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			return false
 		}
 		measured := byteRate(bytes, span)
+		if !receiverTimed {
+			measured = headBoundedDecrease(measured, bytes, atNanos, supply, headStart)
+		}
 		if heldPrefixIncrease(measured, span, atNanos) || measured > hold && intervalLimited && span < increaseSpan && (hold > 0 || firstQueued) {
 			// A retained prefix or carrier reader can empty a completed flight
 			// at memory speed. Preserve its delivery without letting that release
@@ -2256,7 +2276,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				if span <= 0 {
 					break
 				}
-				measured := byteRate(bytes, span)
+				measured := headBoundedDecrease(byteRate(bytes, span), bytes, newer.lastAtNanos, candidateSupply, headStart)
 				if !heldPrefixIncrease(measured, span, newer.lastAtNanos) && self.outstandingWithLock() > self.flightBoundAtWithLock(measured, timing.residence) {
 					heldAfterRejection = false
 					latest = measured

@@ -247,8 +247,9 @@ type AuthNetworkClientError struct {
 	ClientLimitExceeded bool `json:"client_limit_exceeded"`
 	// the network is at its PLAN's limit for concurrent connected clients, rather
 	// than a hard cap. The client should prompt the user to upgrade (or, for an
-	// agent, pay inline over x402 -- the same request answers 402 with payment
-	// terms). Distinct from ClientLimitExceeded, which no upgrade can lift.
+	// agent, pay inline over x402 -- a request that asks with `X-UR-X402: 1` is
+	// answered 402 with payment terms instead). Distinct from
+	// ClientLimitExceeded, which no upgrade can lift.
 	UpgradeRequired bool   `json:"upgrade_required,omitempty"`
 	Message         string `json:"message"`
 }

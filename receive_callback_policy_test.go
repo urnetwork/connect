@@ -285,6 +285,7 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		{path: "ip.go", callback: "userNatClient.ClientReceive"},
 		{path: "ip.go", callback: "userNatProvider.ClientReceive"},
 		{path: "ip_remote_multi_client.go", callback: "clientChannel.clientReceive"},
+		{path: "transfer.go", callback: "client.receiveObservedAddresses"},
 		{path: "transfer.go", callback: "client.sequenceCloser.Receive"},
 		{path: "transfer.go", callback: "peerManager.Receive"},
 		{path: "transfer.go", callback: "streamManager.Receive"},
@@ -309,6 +310,10 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		// records bounded ids under a leaf lock and wakes its worker without waiting
 		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "Receive"},
 		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "add"},
+		// replaces the observed set under the snapshot's leaf lock and
+		// republishes from the last interface read; it never reads interfaces
+		{path: "transfer_observed_addresses.go", receiver: "Client", method: "receiveObservedAddresses"},
+		{path: "ip_security_local.go", receiver: "providerLocalNetworks", method: "setObservedAddresses"},
 		{path: "transfer_peer_manager.go", receiver: "PeerManager", method: "Receive"},
 		{path: "transfer_stream_manager.go", receiver: "StreamManager", method: "Receive"},
 		{path: "transport_p2p_webrtc.go", receiver: "clientSignalDispatcher", method: "Receive"},

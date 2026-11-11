@@ -77,6 +77,69 @@ type reraceExitSpec struct {
 	answer func(path *IpPath) reraceAnswer
 	// Optional source settings are applied before real Client construction.
 	clientSettings func(*ClientSettings)
+	// the first this many channels minted for the provider fail their
+	// construction, as a provider whose evaluation fails does
+	failEvaluations int
+	// Optional test-owned hold on this provider's frames to its source
+	// clients, acknowledgements included. Nil keeps the direct route.
+	providerHold *reraceProviderHold
+}
+
+// While held, a relay per source client keeps the provider's frames in order
+// without blocking the provider; release forwards them. A frame still held
+// when its source client ends returns to the pool. Safe for concurrent use.
+type reraceProviderHold struct {
+	stateLock sync.Mutex
+	held      bool
+	changed   chan struct{}
+}
+
+func newReraceProviderHold() *reraceProviderHold {
+	return &reraceProviderHold{changed: make(chan struct{})}
+}
+
+func (self *reraceProviderHold) set(held bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.held == held {
+		return
+	}
+	self.held = held
+	close(self.changed)
+	self.changed = make(chan struct{})
+}
+
+func (self *reraceProviderHold) snapshot() (bool, <-chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.held, self.changed
+}
+
+// Owns each frame read from the provider until the source route takes it.
+func (self *reraceProviderHold) relay(ctx context.Context, provider <-chan []byte, source chan<- []byte) {
+	var pending [][]byte
+	defer func() {
+		for _, frame := range pending {
+			MessagePoolReturn(frame)
+		}
+	}()
+	for {
+		held, changed := self.snapshot()
+		var out chan<- []byte
+		var next []byte
+		if !held && 0 < len(pending) {
+			out, next = source, pending[0]
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-provider:
+			pending = append(pending, frame)
+		case out <- next:
+			pending = pending[1:]
+		case <-changed:
+		}
+	}
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -99,6 +162,30 @@ type reraceExit struct {
 
 	mutex   sync.Mutex
 	packets []reraceExitPacket
+	// the channel constructions for this provider so far
+	evaluations atomic.Int32
+	// the next this many constructions fail (failEvaluations to start, and
+	// failNextEvaluations later)
+	failNext atomic.Int32
+}
+
+// The provider's next count channel constructions fail, as its evaluations
+// fail when a transient loses them.
+func (self *reraceExit) failNextEvaluations(count int) {
+	self.failNext.Store(int32(count))
+}
+
+// Consumes one of the provider's pending construction failures.
+func (self *reraceExit) takeEvaluationFailure() bool {
+	for {
+		pending := self.failNext.Load()
+		if pending <= 0 {
+			return false
+		}
+		if self.failNext.CompareAndSwap(pending, pending-1) {
+			return true
+		}
+	}
 }
 
 type reraceReply struct {
@@ -346,6 +433,10 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 	if exit == nil {
 		return nil, errors.New("client args were not minted for a destination")
 	}
+	exit.evaluations.Add(1)
+	if exit.takeEvaluationFailure() {
+		return nil, errors.New("the provider did not answer its evaluation")
+	}
 
 	if exit.clientSettings != nil {
 		exit.clientSettings(clientSettings)
@@ -361,8 +452,13 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 
 	providerTransportSend := NewSendClientTransport(DestinationId(args.ClientId))
 	providerTransportReceive := NewReceiveGatewayTransport()
+	providerRoute := routeReceive
+	if hold := exit.providerHold; hold != nil {
+		providerRoute = make(chan []byte)
+		go hold.relay(ctx, providerRoute, routeReceive)
+	}
 	exit.provider.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
-	exit.provider.RouteManager().UpdateTransport(providerTransportSend, []Route{routeReceive})
+	exit.provider.RouteManager().UpdateTransport(providerTransportSend, []Route{providerRoute})
 	exit.provider.ContractManager().AddNoContractPeer(client.ClientId())
 
 	self.mutex.Lock()
@@ -497,6 +593,7 @@ func (self *reraceHarness) addExit(spec reraceExitSpec) *reraceExit {
 	if exit.family == "" {
 		exit.family = IpFamilyDualstack
 	}
+	exit.failNext.Store(int32(spec.failEvaluations))
 	exit.destination = RequireMultiHopId(exit.provider.ClientId())
 	exit.provider.AddReceiveCallback(exit.receive)
 	self.exitWorkers.Add(1)

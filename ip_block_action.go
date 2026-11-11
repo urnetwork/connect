@@ -144,7 +144,12 @@ func blockActionReason(r SecurityPolicyResult, reason SecurityPolicyReason, bloc
 		return BlockActionReasonSecurityBittorrent
 	case SecurityPolicyReasonCfaaDropPort:
 		return BlockActionReasonSecurityPort
-	case SecurityPolicyReasonCfaaDropIp, SecurityPolicyReasonNotPublic:
+	case SecurityPolicyReasonCfaaDropIp,
+		SecurityPolicyReasonNotPublic,
+		SecurityPolicyReasonProviderLocal,
+		SecurityPolicyReasonProviderLocalUnknown:
+		// the provider-local reasons only decide in the provider role; named
+		// here so a policy that reports them still labels the block
 		return BlockActionReasonSecurityIp
 	default:
 		return BlockActionReasonSecurity
@@ -870,32 +875,70 @@ func (self *blockActionCache) delete(addr netip.Addr) {
 	delete(self.decisions, addr)
 }
 
-// defaultRemoteDohIgnoreAddrs is the built-in ignore baseline: the hard coded
-// remote doh resolver ips from `DefaultDnsResolverSettings`. these are always
-// excluded from the override and association logic, independent of the host's
-// `SetBlockActionIgnoreHosts` wiring — user override rules must never capture
-// dns to the well known resolvers, which the os or browser may query directly.
-var defaultRemoteDohIgnoreAddrs = sync.OnceValue(func() map[netip.Addr]bool {
+// The built-in ignore baseline: the addresses of the well known public dns
+// resolvers, every endpoint of the known operator pairs (`knownDohUrlPairs`,
+// `knownDnsServerPairs`) and of the default resolver lists. These are always
+// excluded from the override and association logic, independent of the
+// host's `SetBlockActionIgnoreHosts` wiring: the os or a browser may query
+// them directly (Android private dns, a browser's secure dns), a resolver flow
+// is co-active with nearly every site, and a user override rule that captured
+// one could cut off all of a device's dns. The blocker generator never blocks
+// them either (`WellKnownResolverAddrs`).
+//
+// The set is fixed rather than read from the defaults alone, so a resolver
+// that leaves the defaults stays protected: Google Public DNS, OpenDNS and
+// Quad9's filtering 9.9.9.9 left them (2026-11-08), but devices still query
+// them. The set sends nothing to any resolver.
+var wellKnownResolverAddrs = sync.OnceValue(func() map[netip.Addr]bool {
 	addrs := map[netip.Addr]bool{}
-	resolver := DefaultDnsResolverSettings()
-	dohUrlLists := [][]string{
-		resolver.RemoteDohUrlsIpv4,
-		resolver.RemoteDohUrlsIpv6,
-	}
-	for _, dohUrls := range dohUrlLists {
-		for _, dohUrl := range dohUrls {
-			u, err := url.Parse(strings.TrimSpace(dohUrl))
-			if err != nil {
-				continue
-			}
-			if addr, err := netip.ParseAddr(u.Hostname()); err == nil {
-				// unmapped, matching the `ipAssocAddr` normalization
-				addrs[addr.Unmap()] = true
-			}
+	addHost := func(host string) {
+		if addr, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil {
+			// unmapped, matching the `ipAssocAddr` normalization
+			addrs[addr.Unmap()] = true
 		}
+	}
+	addDohUrl := func(dohUrl string) {
+		if u, err := url.Parse(strings.TrimSpace(dohUrl)); err == nil {
+			addHost(u.Hostname())
+		}
+	}
+	for _, pair := range knownDohUrlPairs {
+		addDohUrl(pair[0])
+		addDohUrl(pair[1])
+	}
+	for _, pair := range knownDnsServerPairs {
+		addHost(pair[0])
+		addHost(pair[1])
+	}
+	resolver := DefaultDnsResolverSettings()
+	for _, dohUrl := range slices.Concat(
+		resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6,
+		resolver.LocalDohUrlsIpv4, resolver.LocalDohUrlsIpv6,
+	) {
+		addDohUrl(dohUrl)
+	}
+	for _, server := range slices.Concat(
+		resolver.RemoteDnsIpv4, resolver.RemoteDnsIpv6,
+		resolver.LocalDnsIpv4, resolver.LocalDnsIpv6,
+	) {
+		addHost(server)
 	}
 	return addrs
 })
+
+// The well known public dns resolver addresses of the block-action ignore
+// baseline (see `wellKnownResolverAddrs`), sorted, for the blocker generator
+// (blocker/main.go), which must never block them.
+func WellKnownResolverAddrs() []netip.Addr {
+	addrs := make([]netip.Addr, 0, len(wellKnownResolverAddrs()))
+	for addr := range wellKnownResolverAddrs() {
+		addrs = append(addrs, addr)
+	}
+	slices.SortFunc(addrs, func(a netip.Addr, b netip.Addr) int {
+		return a.Compare(b)
+	})
+	return addrs
+}
 
 // destinations excluded from the override and association logic,
 // e.g. the dns resolver endpoints. host values use the same forms as

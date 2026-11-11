@@ -798,6 +798,30 @@ func (self *earlyIdleRefusalFixture) requireLate(t *testing.T, publication <-cha
 	reraceAssertNoErrorDelivered(t, self.h, self.path)
 }
 
+// Holds the reaper's publication visit to this source until release. The visit
+// only tries the flow lock and defers a contended visit by
+// SynRetryPublicationRetryDelay, and the pass that publishes the provider then
+// takes that lock in finishServiceRefresh. Settle while the visit waits.
+func (self *earlyIdleRefusalFixture) holdPublicationVisit(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	releaseVisit := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseVisit)
+	self.h.multiClient.beforeSynPublicationQueueForTest = func(current *multiClientChannelUpdate) {
+		if current == self.update {
+			enteredOnce.Do(func() {
+				close(entered)
+				select {
+				case <-release:
+				case <-self.h.multiClient.ctx.Done():
+				}
+			})
+		}
+	}
+	return entered, releaseVisit
+}
+
 // The production OLD guard cannot use the one actual-refused idle tail while
 // four old contenders remain silent. Availability0.733 and reoffer1.109 precede
 // the unchanged3s age gate and complete field exhaustion.
@@ -809,8 +833,26 @@ func TestEarlyIdleServiceRefusalListsBeforeUnfinishedContenders(t *testing.T) {
 		publication := discoveryDemandTestObservePublication(f.window)
 		f.start(t)
 		f.h.sleep(f.started.Add(733 * time.Millisecond).Sub(time.Now()))
+		// A listing inside the reoffer can publish the provider there: that
+		// retires the refused idle victim, which renews the attempt stamp, while
+		// the paid SYN's visit can still wait behind finishServiceRefresh. The
+		// reoffer then sees an unanswered source it cannot call retained. Hold
+		// the listing until the reoffer completes, and the visit until it settles.
+		f.generator.mutex.Lock()
+		f.generator.holdNextAvailable = true
+		f.generator.mutex.Unlock()
 		f.h.addExit(reraceExitSpec{name: "early-late"})
 		f.offerAt(t, 1109*time.Millisecond)
+		if !discoveryDemandTestAwaitPublication(t, f.generator.availableEntered, f.started.Add(2*time.Second)) {
+			t.Fatal("EARLY_IDLE_REFUSAL_DID_NOT_RELIST: the available provider was never listed")
+		}
+		visit, releaseVisit := f.holdPublicationVisit(t)
+		close(f.generator.availableRelease)
+		if !discoveryDemandTestAwaitPublication(t, visit, f.started.Add(2*time.Second)) {
+			t.Fatal("published provider never reached the paid source's publication visit")
+		}
+		f.h.settle()
+		releaseVisit()
 		f.requireLate(t, publication, f.started.Add(2*time.Second), "EARLY_IDLE_REFUSAL_DID_NOT_RELIST")
 	})
 }

@@ -1,10 +1,15 @@
 package connect
 
 import (
+	"context"
 	"io"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 func syntheticRequest(t *testing.T, request string) (header string, bodyByteCount int) {
@@ -102,5 +107,84 @@ func TestIsSyntheticSpeedIp(t *testing.T) {
 	}
 	if isSyntheticSpeedIp(nil) {
 		t.Errorf("isSyntheticSpeedIp(nil) = true, want false")
+	}
+}
+
+// The benchmark ranges are never dialed: the security policy admits tcp to
+// them only because the nat serves them in memory (ip_security_public.go), so
+// with the synthetic server on the flow is answered in memory and with it off
+// the flow is refused with a reset, and the upstream dialer is not called
+// either way. The response follows the decision to dial or not, so once it
+// arrives a dial would already have been recorded.
+func TestSyntheticSpeedRangeIsNeverDialed(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		for _, destination := range []string{"198.18.0.1", "198.19.255.254", "2001:2::1"} {
+			func() {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				settings := DefaultLocalUserNatSettings()
+				settings.Log = NewNoopLogger()
+				settings.TcpBufferSettings.EnableSyntheticSpeed = enabled
+				dialed := make(chan string, 4)
+				settings.TcpBufferSettings.DialContextSettings = &DialContextSettings{
+					DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+						dialed <- address
+						return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+					},
+				}
+				nat := NewLocalUserNat(ctx, "synthetic speed test", settings)
+				defer nat.Close()
+				version := 6
+				sourceIp := net.ParseIP("fd00::9")
+				headerByteCount := Ipv6HeaderSize
+				destinationIp := net.ParseIP(destination)
+				if ip4 := destinationIp.To4(); ip4 != nil {
+					version = 4
+					sourceIp = net.ParseIP("10.0.0.9").To4()
+					headerByteCount = Ipv4HeaderSizeWithoutExtensions
+					destinationIp = ip4
+				}
+				flags := make(chan byte, 4)
+				nat.AddReceivePacketCallback(func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
+					if headerByteCount+13 < len(packet) {
+						select {
+						case flags <- packet[headerByteCount+13]:
+						default:
+						}
+					}
+				})
+				flow := &IpPath{
+					Version:         version,
+					Protocol:        IpProtocolTcp,
+					SourceIp:        sourceIp,
+					SourcePort:      42001,
+					DestinationIp:   destinationIp,
+					DestinationPort: 80,
+				}
+				packet := MessagePoolCopy(ipOosTcpPacketSequence(flow, tcpFlagSyn, 0x5eed, nil))
+				if !nat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Network, packet, 0) {
+					MessagePoolReturn(packet)
+					t.Fatalf("%s: the syn did not enter the nat", destination)
+				}
+				want := byte(tcpFlagSyn | tcpFlagAck)
+				if !enabled {
+					want = tcpFlagRst | tcpFlagAck
+				}
+				select {
+				case got := <-flags:
+					if got&(tcpFlagSyn|tcpFlagAck|tcpFlagRst) != want {
+						t.Errorf("synthetic=%t %s: answered with flags %08b, want %08b", enabled, destination, got, want)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("synthetic=%t %s: no answer", enabled, destination)
+				}
+				select {
+				case address := <-dialed:
+					t.Errorf("synthetic=%t %s: the nat dialed %s", enabled, destination, address)
+				default:
+				}
+			}()
+		}
 	}
 }

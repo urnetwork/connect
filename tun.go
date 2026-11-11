@@ -1043,6 +1043,7 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 		// Only the remote paths traverse this tun. Keep host-side fallback and
 		// explicit resolver choices intact; never mutate the caller's settings.
 		resolverSettings := *dohSettings.DnsResolverSettings
+		resolverSettings.DohServerHostAddrs = cloneDohServerHostAddrs(resolverSettings.DohServerHostAddrs)
 		resolverSettings.RemoteDohUrlsIpv6 = nil
 		resolverSettings.RemoteDnsIpv6 = nil
 		if dohSettings.IpVersion == 6 {

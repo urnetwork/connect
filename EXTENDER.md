@@ -206,8 +206,12 @@ DnsOtherHandler(query []byte, addr net.Addr)` hook, which the extender sets
 to a forwarder: parse the query, refuse `ANY`, resolve the question through
 the extender's own DoH cache (`DohCache.Forward` for the raw response, with
 the connect default DoH server list, overridable in `ExtenderSettings`),
-rewrite the message id, and write the answer on the dns socket it came
-in on directly. Per-source limit 10 queries per second with burst 20, total 500
+give the answer the query's message id and question name, case included
+for a 0x20 client (the cache asks in lower case), drop the upstream's OPT
+record for a query that had none (RFC 6891), and write the answer on the
+dns socket it came in on directly (`connect.DnsResponseForQuery`, as the
+mux does). An answer to another question is not sent. Per-source limit 10
+queries per second with burst 20, total 500
 per second with the same burst, one in-flight query per source address, a
 bounded worker pool of 64 so the translation's read loop never blocks,
 a 5 s forward timeout, and a response cap of 4096 bytes with the TC bit
@@ -1275,7 +1279,11 @@ tcp 443 first, the one port an extender requires, and only then start
 device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
 L2), each udp carrier bound independently and a failed udp bind disabling
 that carrier alone; the forward dialer is
-the device's egress-aware connect dial narrowed by family, and its failures
+the device's egress-aware connect dial narrowed by family, and it and the
+datagram relay's dialer carry the provider dial control, which refuses before
+the socket connects an address a destination name resolved to that is not
+public or is the provider host's own, on one of its links, an observed
+address or service anycast (IP_SECURITY.md §2.2.4); its failures
 (A7) are logged, the first of each kind at once and then at most one line a
 minute carrying the count since, so an extender whose egress cannot reach
 the operator says so (connect#230); the whitelist is
@@ -4443,7 +4451,9 @@ Phase 5b follows 4 because both touch the server.
 
 ## 6. Known limitations
 
-- Extender relay traffic is not attributed or credited. PROXY-protocol
+- The bytes an extender relays, api and control traffic included, are
+  not measured. Extender pay comes from J2/J3 instead: each contract pays
+  every extender recorded on it an equal hop share. PROXY-protocol
   attribution to a dedicated edge port is a later phase.
 - The reverse proxy answers probers behind a self-signed cert; an active
   prober that validates certificates sees a misconfigured host, which is

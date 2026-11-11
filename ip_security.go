@@ -395,6 +395,9 @@ type securityPolicy struct {
 	stats *SecurityPolicyStatsCollector
 	cfaa  *cfaaDetector
 	dmca  *dmcaDetector
+	// the provider role's provider-local guard (ip_security_local.go); nil in
+	// the client role
+	providerLocal *providerLocalGuard
 }
 
 func DefaultSecurityPolicy(ctx context.Context) SecurityPolicy {
@@ -411,7 +414,13 @@ func DefaultSecurityPolicyWithStats(ctx context.Context, stats *SecurityPolicySt
 	)
 }
 
+// NewSecurityPolicy is the client role's policy: it has no provider-local
+// guard.
 func NewSecurityPolicy(ctx context.Context, cfaaSettings *CfaaSecurityPolicySettings, dmcaSettings *DmcaSecurityPolicySettings, webSettings *WebStandardSettings, stats *SecurityPolicyStatsCollector) SecurityPolicy {
+	return newSecurityPolicy(ctx, cfaaSettings, dmcaSettings, webSettings, stats)
+}
+
+func newSecurityPolicy(ctx context.Context, cfaaSettings *CfaaSecurityPolicySettings, dmcaSettings *DmcaSecurityPolicySettings, webSettings *WebStandardSettings, stats *SecurityPolicyStatsCollector) *securityPolicy {
 	return &securityPolicy{
 		stats: stats,
 		cfaa:  newCfaaDetector(cfaaSettings),
@@ -423,13 +432,61 @@ func NewSecurityPolicy(ctx context.Context, cfaaSettings *CfaaSecurityPolicySett
 // client's traffic, so it runs Reverse(client policy). The provider's ingress (the remote client's
 // outbound, received from the tunnel) gets the client policy's egress DPI; the provider's egress
 // (the return into the tunnel) gets the client policy's ingress source check. A provider keeps its
-// own detector + stats, independent of the device's multi-client policy.
+// own detector + stats, independent of the device's multi-client policy. Unlike the client
+// policy it also refuses the provider host itself and its links (ip_security_local.go), reading
+// the process-wide snapshot of this host's addresses.
 func DefaultProviderSecurityPolicy(ctx context.Context) SecurityPolicy {
 	return DefaultProviderSecurityPolicyWithStats(ctx, DefaultSecurityPolicyStatsCollector())
 }
 
 func DefaultProviderSecurityPolicyWithStats(ctx context.Context, stats *SecurityPolicyStatsCollector) SecurityPolicy {
-	return Reverse(DefaultSecurityPolicyWithStats(ctx, stats))
+	return newProviderSecurityPolicy(
+		ctx,
+		DefaultCfaaSecurityPolicySettings(),
+		DefaultDmcaSecurityPolicySettings(),
+		DefaultWebStandardSettings(),
+		DefaultProviderLocalSecurityPolicySettings(),
+		processProviderLocalNetworks,
+		stats,
+	)
+}
+
+// newProviderSecurityPolicy is every provider construction path's policy:
+// Reverse of the client policy with the provider-local guard over `networks`.
+// The guard's registration ends with ctx.
+func newProviderSecurityPolicy(
+	ctx context.Context,
+	cfaaSettings *CfaaSecurityPolicySettings,
+	dmcaSettings *DmcaSecurityPolicySettings,
+	webSettings *WebStandardSettings,
+	localSettings *ProviderLocalSecurityPolicySettings,
+	networks *providerLocalNetworks,
+	stats *SecurityPolicyStatsCollector,
+) SecurityPolicy {
+	policy := newSecurityPolicy(ctx, cfaaSettings, dmcaSettings, webSettings, stats)
+	policy.providerLocal = newProviderLocalGuard(ctx, localSettings, networks)
+	return Reverse(policy)
+}
+
+// inspectDestination applies the destination rules of every relationship but
+// a same-network one: the destination is public unicast (ip_security_public.go)
+// or the synthetic speed server, and in the provider role it is not this host
+// or on one of its links. decided is false when the destination passes.
+func (self *securityPolicy) inspectDestination(ipPath *IpPath) (result SecurityPolicyResult, reason SecurityPolicyReason, decided bool) {
+	if !isPublicUnicast(ipPath.DestinationIp) && !isSyntheticSpeedDestination(ipPath) {
+		return SecurityPolicyResultIncident, SecurityPolicyReasonNotPublic, true
+	}
+	if self.providerLocal != nil {
+		switch self.providerLocal.inspect(ipPath.DestinationIp) {
+		case providerLocalYes:
+			return SecurityPolicyResultIncident, SecurityPolicyReasonProviderLocal, true
+		case providerLocalUnknown:
+			// not the consumer's doing, so a drop and not an incident: an
+			// incident reports the source for abuse once per packet
+			return SecurityPolicyResultDrop, SecurityPolicyReasonProviderLocalUnknown, true
+		}
+	}
+	return SecurityPolicyResultAllow, SecurityPolicyReasonUnknown, false
 }
 
 func (self *securityPolicy) Stats() *SecurityPolicyStatsCollector {
@@ -501,9 +558,11 @@ func (self *securityPolicy) inspectAndRefreshEgressGroupDetailedBorrowed(
 	result := SecurityPolicyResultAllow
 	decision := securityDecision{reason: SecurityPolicyReasonNetwork}
 	if provideMode != protocol.ProvideMode_Network {
-		if !isPublicUnicast(ipPath.DestinationIp) {
-			result = SecurityPolicyResultIncident
-			decision.reason = SecurityPolicyReasonNotPublic
+		// a group is one directional flow, so its first path decides the
+		// destination for every member
+		if destinationResult, destinationReason, decided := self.inspectDestination(ipPath); decided {
+			result = destinationResult
+			decision.reason = destinationReason
 		} else {
 			destinationIp, destinationVersion := policyAddress(ipPath.DestinationIp, ipPath.Version)
 			verdict, cfaaReason := self.cfaa.inspectReason(
@@ -569,10 +628,11 @@ func (self *securityPolicy) inspectEgressForSenderDetailed(
 	}
 
 	// apply public rules:
-	// - only public unicast network destinations
+	// - only public unicast network destinations, and in the provider role
+	//   not the provider host or its links
 	// - block insecure or known unencrypted traffic
-	if !isPublicUnicast(ipPath.DestinationIp) {
-		return SecurityPolicyResultIncident, securityDecision{reason: SecurityPolicyReasonNotPublic}
+	if result, reason, decided := self.inspectDestination(ipPath); decided {
+		return result, securityDecision{reason: reason}
 	}
 
 	// static endpoint reputation (blocked ips + port policy) on the destination,
@@ -881,76 +941,6 @@ func (self *reverseSecurityPolicy) Testing_FlowCount() int {
 		return p.Testing_FlowCount()
 	}
 	return 0
-}
-
-// isPublicUnicast reports whether an egress destination is on the public
-// internet. An IPv4-mapped v6 address (::ffff:a.b.c.d) is judged as the v4
-// address it carries, so a v6 packet cannot reach private v4 space by
-// wrapping the address; the v6 prefixes that embed or tunnel to v4 (6to4,
-// Teredo, NAT64, IPv4-compatible) and the non-routable v6 ranges are not
-// public either. See IPV6.md C4.
-func isPublicUnicast(ip net.IP) bool {
-	if ip4 := ip.To4(); ip4 != nil {
-		ip = ip4
-	}
-	switch {
-	case ip.IsPrivate(),
-		ip.IsLoopback(),
-		ip.IsLinkLocalUnicast(),
-		ip.IsMulticast(),
-		ip.IsUnspecified():
-		return false
-	}
-	if len(ip) == net.IPv6len && isReservedIpv6(ip) {
-		return false
-	}
-	return true
-}
-
-// isReservedIpv6 lists the v6 prefixes that are never a public unicast
-// egress destination but pass net.IP's own predicates: the ranges that embed
-// a v4 address (6to4 2002::/16, Teredo 2001::/32, NAT64 64:ff9b::/96 and
-// its local-use 64:ff9b:1::/48, the deprecated IPv4-compatible ::/96), the
-// discard-only 100::/64, documentation 2001:db8::/32, the deprecated
-// site-local fec0::/10 and the historical 6bone 3ffe::/16. `ip` must be a
-// 16-byte address that is not v4-mapped.
-func isReservedIpv6(ip net.IP) bool {
-	switch {
-	case ip[0] == 0x20 && ip[1] == 0x02:
-		// 6to4
-		return true
-	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00:
-		// teredo
-		return true
-	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8:
-		// documentation
-		return true
-	case ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
-		((ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
-			ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0) ||
-			(ip[4] == 0 && ip[5] == 1)):
-		// nat64 well-known prefix and its local-use prefix
-		return true
-	case ip[0] == 0x01 && ip[1] == 0x00 &&
-		ip[2] == 0 && ip[3] == 0 && ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0:
-		// discard-only
-		return true
-	case ip[0] == 0xfe && ip[1]&0xc0 == 0xc0:
-		// site-local
-		return true
-	case ip[0] == 0x3f && ip[1] == 0xfe:
-		// 6bone
-		return true
-	}
-	// ipv4-compatible ::a.b.c.d: the first 96 bits zero. :: itself is
-	// unspecified and ::1 loopback, both already excluded by the caller, so
-	// this only matches the deprecated embedded-v4 form.
-	for _, b := range ip[:12] {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // policyAddress is the address a v4-keyed policy table sees for a packet: an
