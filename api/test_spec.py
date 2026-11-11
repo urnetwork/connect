@@ -174,6 +174,41 @@ class SpecTest(unittest.TestCase):
         in_flight = delete["responses"]["200"]["content"]["application/json"]["examples"]["gammaChargeInFlight"]
         self.assertIn("Gamma payment", in_flight["value"]["error"]["message"])
 
+    def test_gamma_settings_document_what_a_switch_turned_off_cancels(self):
+        # server controller/gamma_controller.go SetGammaSettings: a switch
+        # turned off cancels the automatic charges it governs not yet sent; one
+        # already sent is listed in charging and said in notice; an upgrade at
+        # the client limit needs auto_renew too
+        schemas = self.spec["components"]["schemas"]
+        settings = self.spec["paths"]["/pay/gamma/settings"]
+        get = " ".join(settings["get"]["description"].split())
+        self.assertIn("at most once a day, while `auto_renew` is on too", get)
+        self.assertIn("`charging`", get)
+        post = " ".join(settings["post"]["description"].split())
+        self.assertIn("cancels the open automatic charges it governs", post)
+        self.assertIn("can still be charged this once", post)
+        self.assertIn("`charging`", post)
+        self.assertIn("`notice`", post)
+
+        result = schemas["GammaSettingsResult"]["properties"]
+        self.assertEqual("#/components/schemas/GammaSettingsCharge", result["charging"]["items"]["$ref"])
+        self.assertEqual("string", result["notice"]["type"])
+        charge = schemas["GammaSettingsCharge"]["properties"]
+        self.assertEqual(["renew", "topup", "seat"], charge["purpose"]["enum"])
+        self.assertEqual(["confirming"], charge["status"]["enum"])
+        for name in ("intent_id", "plan", "item_id", "amount_gamma"):
+            self.assertIn(name, charge)
+
+        examples = settings["post"]["responses"]["200"]["content"]["application/json"]["examples"]
+        charging = examples["chargingOnceMore"]["value"]
+        self.assertEqual(False, charging["auto_renew"])
+        self.assertEqual("renew", charging["charging"][0]["purpose"])
+        self.assertEqual("confirming", charging["charging"][0]["status"])
+        self.assertIn("charged this once", charging["notice"])
+        self.assertEqual([], examples["otherProRenews"]["value"]["charging"])
+        defaults = settings["get"]["responses"]["200"]["content"]["application/json"]["examples"]["defaults"]["value"]
+        self.assertEqual([], defaults["charging"])
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

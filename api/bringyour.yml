@@ -4988,11 +4988,12 @@ paths:
           Gamma sells), at most one an hour; and when a free account hits
           its client limit (`client_limit_exceeded` with
           `upgrade_required`), buy Pro
-          (`renew_plan`, else `monthly`), at most once a day, unless another
-          Pro subscription already pays for or still bills now. A Pro account at
-          its limit gets the error as before. An automatic upgrade never
-          changes how the network provides; a Gamma plan bought while it waits
-          replaces it, as it does a renewal.
+          (`renew_plan`, else `monthly`), at most once a day, while
+          `auto_renew` is on too (an upgrade is an automatic Pro charge), and
+          unless another Pro subscription already pays for or still bills
+          now. A Pro account at its limit gets the error as before. An
+          automatic upgrade never changes how the network provides; a Gamma
+          plan bought while it waits replaces it, as it does a renewal.
 
         `monthly_limit_gamma` caps what the automatic charges take in a
         calendar month (UTC; "" for no limit); `month_spent_gamma` is this
@@ -5000,7 +5001,10 @@ paths:
         purpose, period) with its own reference, is spent from
         `deposit_hotkey` (the hotkey that paid last), sends a receipt email,
         and when the chain skips it, one notice; it is tried again only after
-        the deposit changes. Network credential only.
+        the deposit changes. `charging` lists the automatic charges whose
+        switch is off that were already being charged when it was turned off
+        (see POST), and `notice` says it in a sentence. Network credential
+        only.
       operationId: gammaSettings
       security:
         - BearerAuth: []
@@ -5023,6 +5027,7 @@ paths:
                     renew_plan: yearly
                     deposit_hotkey: "<deposit_hotkey>"
                     deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging: []
         "401":
           description: Missing or invalid bearer token.
         "403":
@@ -5042,6 +5047,18 @@ paths:
         whose renewal Stripe is still retrying): both would bill the same
         days. That answer carries the settings unchanged. Turning automatic
         renewal off is always allowed. Network credential only.
+
+        Turning a switch off cancels the open automatic charges it governs
+        that are not yet sent to the chain: the renewal waiting at the end of
+        a term (`auto_renew`), a data top-up (`auto_topup`), and an upgrade at
+        the client limit (either switch). They are never charged, and turning
+        the switch back on makes them again for the same term, hour or day. A
+        charge already sent to the chain cannot be recalled, and is not
+        cancelled: the switch is still turned off, and the answer lists that
+        charge in `charging` (status `confirming`) and says in `notice` that
+        it can still be charged this once, and none after it while the switch
+        is off. If its payment lands, it is credited as usual (a renewal adds
+        its term).
       operationId: gammaSetSettings
       security:
         - BearerAuth: []
@@ -5065,6 +5082,25 @@ paths:
               schema:
                 $ref: "#/components/schemas/GammaSettingsResult"
               examples:
+                chargingOnceMore:
+                  summary: Renewal turned off while the renewal's payment was already sent
+                  value:
+                    auto_renew: false
+                    auto_topup: true
+                    topup_item_id: data_1tib
+                    monthly_limit_gamma: ""
+                    month_spent_gamma: "5"
+                    renew_plan: monthly
+                    deposit_hotkey: "<deposit_hotkey>"
+                    deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging:
+                      - intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                        purpose: renew
+                        plan: monthly
+                        item_id: ""
+                        amount_gamma: "5"
+                        status: confirming
+                    notice: "The renewal of your plan (URnetwork Pro monthly, 5 gamma) was already being charged when you turned this off. A payment already sent to the chain can't be recalled, so it can still be charged this once, but none after it while the switch is off."
                 otherProRenews:
                   summary: Renewal not turned on beside another renewing subscription
                   value:
@@ -5076,6 +5112,7 @@ paths:
                     renew_plan: monthly
                     deposit_hotkey: "<deposit_hotkey>"
                     deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging: []
                     error:
                       code: already_subscribed
                       message: "You have another Pro subscription that renews, so Gamma renewal was not turned on: both would charge you for the same days. Cancel that subscription, then turn Gamma renewal on once it has ended."
@@ -25661,8 +25698,44 @@ components:
           type: array
           items:
             type: string
+        charging:
+          type: array
+          description: |
+            The automatic charges whose switch is off that were already being
+            charged when it was turned off: their payment was sent to the
+            chain (or landed and is being credited), so each can still be
+            charged this once, and none after it while the switch is off.
+            Empty when there is none. A charge not yet sent when its switch
+            was turned off is cancelled and never listed.
+          items:
+            $ref: "#/components/schemas/GammaSettingsCharge"
+        notice:
+          type: string
+          description: "`charging` in a plain sentence for the customer; absent when it is empty."
         error:
           $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaSettingsCharge:
+      type: object
+      properties:
+        intent_id:
+          type: string
+        purpose:
+          type: string
+          description: "`renew` (the renewal at the end of a term), `topup` (a data top-up) or `seat` (the upgrade to Pro at the client limit)."
+          enum: [renew, topup, seat]
+        plan:
+          type: string
+          description: The plan it buys; "" for a data pack.
+        item_id:
+          type: string
+          description: The data pack it buys; "" for a plan.
+        amount_gamma:
+          type: string
+        status:
+          type: string
+          description: "`confirming`: its payment was sent to the chain, or landed and is being credited."
+          enum: [confirming]
 
     GammaPaymentError:
       type: object
