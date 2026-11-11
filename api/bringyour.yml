@@ -21066,13 +21066,20 @@ components:
         - grace_end_time
       properties:
         asset:
+          type: string
           description: |
             The coin the term was paid with. USDC and native SOL share the
             `solana` market; `asset` tells them apart (`usdc_solana` or
             `sol`) for the whole term, after the payment's 30-day unlink
             too.
-          allOf:
-            - $ref: "#/components/schemas/CryptoAsset"
+          enum:
+            - usdc_solana
+            - sol
+            - xmr
+            - zec
+            - tao
+            - btc
+            - eth
         market:
           type: string
           description: |
