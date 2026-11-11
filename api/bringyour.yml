@@ -11295,13 +11295,23 @@ components:
       name: X-UR-ClientInfo
       required: false
       description: |
-        Optional JSON ClientInfo v1, at most 512 UTF-8 bytes. Advisory display
-        metadata only. Duplicate headers/fields, unsupported version or invalid
-        fields become unknown metadata without rejecting authentication.
-        App and SDK version strings are at most 64 UTF-8 bytes.
+        Optional JSON ClientInfo v1 (the ClientInfo schema), at most 512 UTF-8
+        bytes. Advisory metadata only, never authentication, a device binding
+        or an entitlement. Duplicate headers/fields, unsupported version or
+        invalid fields become unknown metadata without rejecting
+        authentication. App and SDK version strings are at most 64 UTF-8
+        bytes. The optional `distribution` names how the app's build reached
+        the device; a value the server does not know, or one that does not
+        pair with `device_type`, is read as unknown and the rest of the object
+        still stands, and leaving it out means unknown. With the device type
+        it decides the platform recorded for the account's onboarding at
+        sign-up and when a device authenticates (the onboarding email copy
+        and offers): the App Store and direct-download macOS builds send the
+        same device type and version, and only the distribution tells them
+        apart.
       schema:
         type: string
-      example: '{"v":1,"device_type":"android","app_version":"1.2.3","sdk_version":"1.2.3"}'
+      example: '{"v":1,"device_type":"android","app_version":"1.2.3","sdk_version":"1.2.3","distribution":"play"}'
     ProviderWorkDomain:
       in: query
       name: domain
@@ -11454,6 +11464,24 @@ components:
         sdk_version:
           type: string
           maxLength: 64
+        distribution:
+          type: string
+          enum: [app_store, mac_direct, play, android_direct, solana_dapp, ethos_dapp, windows, linux, linux_appimage, linux_flatpak, web, extension_chrome, extension_firefox]
+          description: |
+            How the build reached the device, stamped by the build; absent is
+            unknown. Each value pairs with device types, and any other
+            pairing, or a value not listed here, is read as unknown:
+            `app_store` (ios, macos: the App Store builds and their TestFlight
+            builds, which the App Store bills); `mac_direct` (macos: the
+            Developer ID DMG, which Stripe bills); `play` (android: the play
+            flavor, which Google Play bills); `android_direct` (android: the
+            github flavor, the GitHub APK and the F-Droid build);
+            `solana_dapp` and `ethos_dapp` (android: those dApp store
+            flavors); `windows` (windows); `linux` (linux, the package not
+            known), `linux_appimage` and `linux_flatpak` (linux); `web`,
+            `extension_chrome` and `extension_firefox` (web: ur.io and the
+            browser extension's two builds). Every distribution but
+            `app_store` and `play` is billed by Stripe.
     SessionLastUsed:
       type: object
       required: [unix_time, city, region, country, country_code, device_type, app_version]
