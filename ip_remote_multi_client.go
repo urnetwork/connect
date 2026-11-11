@@ -1861,6 +1861,9 @@ type RemoteUserNatMultiClient struct {
 	// Pending SYN retries use the existing parent worker and intrusive owners.
 	synRetryHead *tcpSynRetry
 	synRetryTail *tcpSynRetry
+	// One unsent window-reopen owner per existing flow, dispatched by this reaper.
+	nativeAckRetryHead, nativeAckRetryTail *tcpNativeAckRetry
+	nativeAckRetryCount                    int
 	// Paid cache index and coalesced publication work; parent-lock guarded.
 	synPublicationOwnerHead, synPublicationOwnerTail       *tcpSynRetry
 	synPublicationOwnerCount                               int
@@ -5269,6 +5272,7 @@ func stopFlowReaperTimer(timer *time.Timer) {
 
 func (self *RemoteUserNatMultiClient) runFlowReaper() {
 	defer func() {
+		self.discardNativeAckRetries()
 		self.discardSynPublications()
 		self.discardSynRetryReadiness()
 		self.discardSynRetries()
@@ -5281,6 +5285,7 @@ func (self *RemoteUserNatMultiClient) runFlowReaper() {
 	defer timer.Stop()
 
 	for {
+		self.drainNativeAckRetries()
 		self.drainSynRetryReadiness()
 		self.drainSynPublications()
 		self.drainSynRetries()
@@ -5821,6 +5826,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 			update.stateLock.Lock()
 			update.discoveryAttemptStamp.Add(1)
 			update.sourceReset.Store(true)
+			update.invalidateNativeAckRetryWithLock()
 			update.clearSynRetryWithLock()
 			update.client.Store(nil)
 			update.releaseServiceRefreshBindingWithLock()
@@ -6113,6 +6119,7 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				delete(updates, update)
 				update.discoveryAttemptStamp.Add(1)
 				update.sourceReset.Store(true)
+				update.invalidateNativeAckRetryWithLock()
 				update.client.Store(nil)
 				if update.cancel != nil {
 					update.cancel()
@@ -8042,6 +8049,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
+			if !success && err == nil && nativeIngress {
+				self.retainNativeAckRetry(sendPacketGroup, sendPacketGroup.nativeAckRetry, source, provideMode)
+			}
 			if !success && err == nil && update.client.loadSelection() != selection {
 				sendPacketGroup.affinitySynReuse = false
 				return false
@@ -8089,6 +8099,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					update.releaseServiceRefreshBindingWithLock()
 					update.discoveryAttemptStamp.Add(1)
 					update.sourceReset.Store(true)
+					update.invalidateNativeAckRetryWithLock()
 					update.clearSynRetryWithLock()
 					return true
 				}()
@@ -11001,6 +11012,8 @@ type multiClientChannelUpdate struct {
 	synRetry         *tcpSynRetry
 	synRetrySerial   uint64
 	synRetryReleased atomic.Pointer[tcpSynRetry]
+	nativeAckRetry   *tcpNativeAckRetry
+	nativeAckSerial  uint64
 	// openTime and activityTime bound one TCP generation's active lifetime for
 	// the affinity-performance learner; no timer or goroutine is retained per
 	// flow. Construction initializes it, and a same-tuple fresh SYN resets it
@@ -11396,6 +11409,7 @@ func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsed
 
 // Must be called with stateLock.
 func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
+	self.invalidateNativeAckRetryWithLock()
 	ipPath := sendPacket.ipPath
 	if ipPath.Syn && (!self.synGenerationSeen || self.synGenerationNumber != ipPath.SequenceNumber) {
 		self.resetSynGenerationWithLock(ipPath.SequenceNumber,
@@ -11427,6 +11441,7 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 // A real new source cohort clears both close directions. Candidate promotion
 // can force this transition even when an intervening unwritten SYN reused an ISN.
 func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32, ends ...uint32) {
+	self.invalidateNativeAckRetryWithLock()
 	if self.synRetry != nil && self.synRetry.sequence != sequence {
 		self.clearSynRetryWithLock()
 	}
@@ -11627,6 +11642,7 @@ func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpContr
 	}
 
 	if control.rst || control.fin {
+		self.invalidateNativeAckRetryWithLock()
 		self.clearSynRetryWithLock()
 	}
 	if control.rst {
@@ -11858,11 +11874,17 @@ func (self *multiClientChannelUpdate) withdrawRaceCandidateWithLock(client *mult
 // runs before the SYN is sent, so the record belongs to the attempt by the
 // time an exit can answer it.
 func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
-	if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack {
+	if ipPath.Protocol != IpProtocolTcp || !(ipPath.Syn || ipPath.Fin || ipPath.Rst) {
 		return
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// Even a later control refused by collapse cannot leave an older local
+	// window reopening eligible. This does not change the connect clock.
+	self.invalidateNativeAckRetryWithLock()
+	if !ipPath.Syn || ipPath.Ack {
+		return
+	}
 	end := tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, ipPath.TcpPayloadByteCount)
 	if self.dialFailedSynSeen && self.dialFailedSyn == ipPath.SequenceNumber {
 		if 0 < int32(end-self.dialFailedSynEnd) {
@@ -12087,6 +12109,7 @@ func (self *multiClientChannelUpdate) Close() {
 	defer self.releaseCollapseClaims()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.invalidateNativeAckRetryWithLock()
 	self.clearSynRetryWithLock()
 	self.clearRaceWithLock()
 	self.releaseServiceRefreshBindingWithLock()
@@ -12217,8 +12240,11 @@ type parsedPacketGroup struct {
 	affinitySourceState        uint8
 	affinitySynReuse           bool
 	// Compacted race copies retain the original owned path allocation.
-	retainedIpPathCount uint32
-	synRetry            *tcpSynRetryRequest
+	retainedIpPathCount     uint32
+	synRetry                *tcpSynRetryRequest
+	nativeAckRetry          *tcpNativeAckRetryAttempt
+	nativeAckRetrySelection *multiClientAffinitySelection
+	nativeAckRetrySerial    uint64
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -19242,6 +19268,9 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	}
 	defer sendPacketGroup.finishGroupOffer()
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
+	if attempt := sendPacketGroup.nativeAckRetry; attempt != nil && attempt.replay {
+		opts = append(opts, Ctx(attempt.update.ctx))
+	}
 	opts = multiClientProtocolTransferOpts(opts, frames)
 	if sendPacketGroup.admissionObservations != nil && self.client != nil {
 		if observer := self.client.settings.SendBufferSettings.SendPackLifecycleObserver; observer != nil {
@@ -19510,7 +19539,7 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 		self.addSendGroupCompletion(sendPacketGroup, ack)
 		return
 	}
-	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) {
+	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) || errors.Is(err, errNativeAckRetrySuperseded) {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		return
 	}

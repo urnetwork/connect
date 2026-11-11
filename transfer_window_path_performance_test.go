@@ -629,7 +629,7 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 		s.EncryptionSettings.Mode = EncryptionModeOff
 		s.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		s.SendBufferSettings.WindowSizing = WindowSizingConstant
-		if cell.Arm == "delivery" || cell.Arm == "path-rtt-only" || cell.Arm == "unpaced" {
+		if cell.Arm == "delivery" || cell.Arm == "path-rtt-only" || cell.Arm == "unpaced" || cell.Arm == "window-only" {
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		}
 		s.SendBufferSettings.ApplyWindowSizing()

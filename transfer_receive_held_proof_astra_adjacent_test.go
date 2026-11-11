@@ -297,19 +297,59 @@ func TestReceiveHeldProofAdjacentLegacyCopyRootRefusesUndersizedEscrow(t *testin
 		const limit = decodedPackOwnerQueueByteCount + proofRoot - 1
 		budget := NewTransferMemoryBudget(kib(64))
 		var originalId Id
+		armed := false
+		unarmedZeroMatches := 0
+		unarmedProtocolHead := false
 		observed, fundedLegacy := false, false
+		var boundary struct {
+			packPresent, proofPresent, external, head, budgetMatches, memoryOwned bool
+			queueBytes, proofBytes, proofBackingBytes, copyRootBytes              ByteCount
+		}
 		fixture, log := newHeldHeadContractFixture(t, budget, func(settings *ReceiveBufferSettings) {
 			settings.ReceiveHeadContractRepairByteCount = limit
 			settings.receiveOwnerStageForTest = func(_ *ReceiveSequence, owner *decodedPackOwner, stage string) {
-				if observed || owner == nil || stage != "pack_released" || owner.receiveItem.messageId != originalId {
+				if owner == nil || stage != "pack_released" {
+					return
+				}
+				pack := owner.receivePack.Pack
+				if !armed {
+					// Protocol decode leaves receiveItem empty until receive().
+					// Its zero ID must not match the not-yet-selected DATA ID.
+					if originalId == (Id{}) && owner.receiveItem.messageId == originalId {
+						unarmedZeroMatches++
+						if pack != nil && pack == &owner.pack && pack.Head && pack.ContractFrame != nil &&
+							protocolOnlyPack(pack) && !owner.receivePack.receiveMemoryOwned &&
+							owner.receiveItem.memoryBudget == nil && owner.receiveItem.QueueByteCount() == 0 {
+							unarmedProtocolHead = true
+						}
+					}
+					return
+				}
+				if observed || owner.receiveItem.messageId != originalId || pack == nil {
+					return
+				}
+				wireId, err := IdFromBytes(pack.MessageId)
+				if err != nil || wireId != originalId {
 					return
 				}
 				observed = true
-				pack := owner.receivePack.Pack
-				if pack == nil || pack.ContractFrame == nil {
+				boundary.packPresent = pack != nil
+				boundary.budgetMatches = owner.receiveItem.memoryBudget == budget
+				boundary.memoryOwned = owner.receivePack.receiveMemoryOwned
+				boundary.queueBytes = owner.receiveItem.QueueByteCount()
+				if pack == nil {
+					return
+				}
+				boundary.external = pack != &owner.pack
+				boundary.head = pack.Head
+				boundary.proofPresent = pack.ContractFrame != nil
+				if pack.ContractFrame == nil {
 					return
 				}
 				proof := pack.ContractFrame.MessageBytes
+				boundary.proofBytes = ByteCount(len(proof))
+				boundary.proofBackingBytes = MessagePoolRootByteCount(proof)
+				boundary.copyRootBytes = receiveMemoryScanCopyRoot(len(proof))
 				fundedLegacy = pack != &owner.pack && !pack.Head && owner.receiveItem.memoryBudget == budget &&
 					owner.receivePack.receiveMemoryOwned && owner.receiveItem.QueueByteCount() > decodedPackOwnerQueueByteCount &&
 					0 < len(proof) && ByteCount(len(proof)) < proofRoot && MessagePoolRootByteCount(proof) == ByteCount(len(proof)) &&
@@ -343,10 +383,22 @@ func TestReceiveHeldProofAdjacentLegacyCopyRootRefusesUndersizedEscrow(t *testin
 		pack.ContractFrame = proto.Clone(promoted.pack.ContractFrame).(*protocol.Frame)
 		rewriteHeldHeadContractWire(t, tail, pack, true)
 		originalId = RequireIdFromBytes(pack.MessageId)
+		path := TransferPath{SourceId: fixture.sender.ClientId(), DestinationId: fixture.receiver.ClientId()}
+		scan, status := scanReceiveMemoryPack(tail.bytes, path)
+		if originalId == (Id{}) || status != receiveMemoryPackScanReady || !scan.legacy || scan.head || scan.nack ||
+			scan.messageId != originalId || scan.protocolFrameCount == scan.frameCount || protocolOnlyPack(pack) {
+			t.Fatal("legacy proof boundary lost its exact paid non-head DATA wire premise")
+		}
+		if unarmedZeroMatches == 0 || !unarmedProtocolHead || observed {
+			t.Fatalf("opening protocol control no longer demonstrates the unarmed zero-ID collision: matches=%d protocol_head=%t observed=%t", unarmedZeroMatches, unarmedProtocolHead, observed)
+		}
+		// All earlier forwards are quiescent. Select and arm the actual wire
+		// identity immediately before that single legacy original is published.
+		armed = true
 		fixture.forward(tail, fixture.receiverIn)
 		sequence := fixture.receiveSequence()
 		if !observed || !fundedLegacy {
-			t.Fatal("legacy proof boundary did not reach the real funded external decoder graph")
+			t.Fatalf("legacy proof boundary did not reach the real funded external decoder graph: observed=%t pack=%t proof=%t external=%t head=%t budget=%t owned=%t queue_bytes=%d metadata_bytes=%d proof_bytes=%d proof_backing_bytes=%d copy_root_bytes=%d expected_root_bytes=%d escrow_limit_bytes=%d", observed, boundary.packPresent, boundary.proofPresent, boundary.external, boundary.head, boundary.budgetMatches, boundary.memoryOwned, boundary.queueBytes, decodedPackOwnerQueueByteCount, boundary.proofBytes, boundary.proofBackingBytes, boundary.copyRootBytes, proofRoot, limit)
 		}
 		if sequence == old || sequence.nextSequenceNumber != 0 || sequence.receiveContract != nil ||
 			sequence.receiveQueue.Len() != 0 || len(sequence.ackWindow.selectiveAcks) != 0 || len(fixture.receiverOut) != 0 ||

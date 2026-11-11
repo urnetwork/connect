@@ -63,6 +63,9 @@ func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multi
 		}
 		update.sequenceParent = parents[0]
 	}
+	if batchAdmission != nil && batchAdmission.nativeIngress && self.ipPath.Protocol == IpProtocolTcp {
+		self.prepareNativeAckRetryWithLock(update)
+	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
 	if len(parents) != 0 && parents[0].settings.TcpCollapsePrevention &&
 		!self.reserveTcpRecoveryWithLock(update, parents[0], &admission) {

@@ -218,12 +218,15 @@ func TestReceiveMemoryHeadRecoveryRefusalPreservesCredit(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	f := newReceiveHeadRecoveryFixture(t)
 	prefix, escrow := f.sequence.holdPromise.reservedByteCount, f.sequence.memoryPressure.reservedByteCount
-	for _, number := range []uint64{f.scan.sequenceNumber - 1, f.scan.sequenceNumber + 1} {
+	// An unbacked future ordinal still has no child authority. A past ordinal
+	// is a separate bounded duplicate-decode path, covered below and by the
+	// real delivered-duplicate controls; it must not be labeled current data.
+	for _, number := range []uint64{f.scan.sequenceNumber + 1, f.scan.sequenceNumber + 2} {
 		scan := f.scan
 		scan.sequenceNumber = number
 		if owner := f.buffer.takeReceiveHeadRecoveryOwner(f.sequence, scan); owner != nil {
 			owner.release()
-			t.Fatal("non-current head acquired recovery")
+			t.Fatal("unbacked future head acquired recovery")
 		}
 	}
 	if owner := f.buffer.takeReceiveHeadRecoveryOwner(nil, f.scan); owner != nil {
@@ -270,6 +273,58 @@ func TestReceiveMemoryHeadRecoveryRefusalPreservesCredit(t *testing.T) {
 	}
 	if first.receiveItem.memoryBudget != f.recovery || f.root.UsedByteCount() != 2*f.scan.retainedByteCount {
 		t.Fatal("duplicate refusal changed the original owner")
+	}
+}
+
+// Current-prefix credit belongs to its original. A bounded past-decode owner
+// uses only the recovery child and cannot spend or manufacture that credit.
+// This transaction grants storage, not a receipt or another payload delivery.
+func TestReceiveMemoryPastDecodePreservesCurrentCredit(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	f := newReceiveHeadRecoveryFixture(t)
+	beforeRx, beforeRoot := f.rx.UsedByteCount(), f.root.UsedByteCount()
+	prefix, escrow := f.sequence.holdPromise.reservedByteCount, f.sequence.memoryPressure.reservedByteCount
+	floor, next := f.sequence.holdPromise.ingressFloor, f.sequence.nextSequenceNumber
+	scan := f.scan
+	scan.sequenceNumber--
+	owner := f.buffer.takeReceiveHeadRecoveryOwner(f.sequence, scan)
+	if owner == nil {
+		t.Fatal("valid past original lost bounded duplicate-decode custody")
+	}
+	f.owner = owner
+	if owner.receiveItem.memoryBudget != f.recovery || owner.receiveItem.QueueByteCount() != scan.retainedByteCount ||
+		owner.receivePack.ingressSequence != f.sequence || owner.receivePack.ingressLoanByteCount != 0 ||
+		f.rx.UsedByteCount() != beforeRx || f.recovery.UsedByteCount() != scan.retainedByteCount ||
+		f.root.UsedByteCount() != beforeRoot+scan.retainedByteCount ||
+		f.sequence.holdPromise.reservedByteCount != prefix || f.sequence.memoryPressure.reservedByteCount != escrow ||
+		f.sequence.holdPromise.ingressFloor != floor || f.sequence.nextSequenceNumber != next {
+		t.Fatal("past physical custody spent current credit or changed delivery authority")
+	}
+	if duplicate := f.buffer.takeReceiveHeadRecoveryOwner(f.sequence, scan); duplicate != nil {
+		duplicate.release()
+		t.Fatal("same pending past original obtained duplicate physical custody")
+	}
+	owner.release()
+	f.owner = nil
+	if f.recovery.UsedByteCount() != 0 || f.root.UsedByteCount() != beforeRoot || f.rx.UsedByteCount() != beforeRx ||
+		f.sequence.holdPromise.reservedByteCount != prefix || f.sequence.memoryPressure.reservedByteCount != escrow ||
+		f.sequence.holdPromise.ingressHead != nil {
+		t.Fatal("past owner return changed current credit or left a physical claim")
+	}
+	for _, mutate := range []func(*receiveMemoryPackScan){
+		func(value *receiveMemoryPackScan) { value.legacy = true },
+		func(value *receiveMemoryPackScan) { value.nack = true },
+		func(value *receiveMemoryPackScan) { value.sessionRoleSet, value.sessionRole = true, 99 },
+	} {
+		invalid := scan
+		mutate(&invalid)
+		if refused := f.buffer.takeReceiveHeadRecoveryOwner(f.sequence, invalid); refused != nil {
+			refused.release()
+			t.Fatal("invalid past shape acquired bounded recovery custody")
+		}
+		if f.root.UsedByteCount() != beforeRoot || f.rx.UsedByteCount() != beforeRx || f.recovery.UsedByteCount() != 0 {
+			t.Fatal("invalid past refusal changed a physical claim")
+		}
 	}
 }
 

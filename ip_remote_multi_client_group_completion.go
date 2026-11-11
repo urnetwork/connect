@@ -908,6 +908,9 @@ func (self *parsedPacketGroup) releaseCollapseMemory() {
 	update := self.collapseAdmission.update
 	update.stateLock.Lock()
 	self.collapseSource = nil
+	self.nativeAckRetry = nil
+	self.nativeAckRetrySelection = nil
+	self.nativeAckRetrySerial = 0
 	if self.completionFlags.Load()&groupCompletionLinked != 0 {
 		// No owner may read these roots after both ownership boundaries.
 		// Existing parsed scalar metadata is sufficient for later promotion.

@@ -7957,6 +7957,12 @@ func (self *SendSequence) acquirePackAdmissionWithin(
 	sendPack *SendPack,
 	wait *sendPackWait,
 ) (bool, error) {
+	if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok {
+		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay &&
+			(attempt.source != self || !attempt.current()) {
+			return false, nil
+		}
+	}
 	admission := self.packAdmission
 	if sendPack.NoBudget {
 		admission = self.protocolAdmission
@@ -7996,8 +8002,13 @@ func (self *SendSequence) acquirePackAdmissionWithin(
 	}
 	if !acquired {
 		if sendPack.NoBudget && timeout == 0 {
-			if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok && group.isSynRetry() {
-				group.noteSynRetryCapacityRefusal(self, admission.protocolReadinessGate())
+			if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok {
+				if group.isSynRetry() {
+					group.noteSynRetryCapacityRefusal(self, admission.protocolReadinessGate())
+				}
+				if group.nativeAckRetry != nil || group.nativeAckRetrySerial != 0 {
+					group.noteNativeAckCapacityRefusal(self, admission.protocolReadinessGate())
+				}
 			}
 		}
 		return false, nil
@@ -8704,6 +8715,13 @@ func (self *SendSequence) processLogicalGroupChunk(
 	withoutAckPromotion bool,
 	flightPolicy transferFlightPolicySnapshot,
 ) (complete bool, success bool, deferForRecoveryAdmission bool) {
+	if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok {
+		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay &&
+			(attempt.source != self || !attempt.current()) {
+			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeAckRetrySuperseded))
+			return true, true, false
+		}
+	}
 	// A new sequence has no writer when the scheduler takes its first Pack, so
 	// the loop's initial policy snapshot is necessarily conservative. Open only
 	// at the point where a logical group is actually ready to send, then refresh
@@ -10462,9 +10480,22 @@ sendSequenceLoop:
 			)
 			reliableAdmissionWaitStart = time.Time{}
 		}
-		resendCapacity = resendCapacity && reliableAdmission
+		// Do not refill ahead of a fixed, already-passed recovery cohort.
+		// Protocol and genuine NoAck selection below keep their existing path.
+		cohortAdmission := !self.fifoRepair.admission.set
+		if !cohortAdmission {
+			if memoryWaiter != nil {
+				memoryWaiter.abandon()
+				memoryWaiter = nil
+			}
+			if self.resendMemoryGrant > 0 {
+				self.resendQueue.budget.Release(self.resendMemoryGrant)
+				self.resendMemoryGrant = 0
+			}
+		}
+		resendCapacity = resendCapacity && reliableAdmission && cohortAdmission
 		self.resendCapacityUnavailable.Store(!resendCapacity)
-		preparedFlightAvailable := reliableAdmission &&
+		preparedFlightAvailable := reliableAdmission && cohortAdmission &&
 			self.resendQueue.preparedWindowAvailable(self.sendWindowEstimate(sendTime).Window)
 		self.preparedFlightUnavailable.Store(!preparedFlightAvailable)
 		self.observeImmediateCapacityWait(scheduler, sendTime)
@@ -10498,41 +10529,50 @@ sendSequenceLoop:
 		}
 		var sendPack *SendPack
 		bypassedRecoveryAdmission := false
-		if flightPolicy.flowIsolation {
-			ordinaryFlightAvailable := self.flightController.canSend()
-			fifoHead := scheduler.FifoHead()
-			sendPack = scheduler.TakeEligible(sendEligible)
-			if sendPack != nil {
-				bypassedRecoveryAdmission =
-					self.noAckPackCanBypassRecoveryAdmission(sendPack) &&
-						(!resendCapacity || !ordinaryFlightAvailable)
-				if fifoHead != nil && sendPack != fifoHead {
-					self.client.unreliableFlowIsolationBypassCount.Add(1)
+		if !cohortAdmission {
+			// A Pack already admitted before this hold keeps its absolute
+			// caller deadline, even though it is no longer write-eligible.
+			sendPack = scheduler.TakeUnorderedEligible(func(candidate *SendPack) bool {
+				return !candidate.deadline.IsZero() && candidate.deadline.Before(sendTime)
+			})
+		}
+		if sendPack == nil {
+			if flightPolicy.flowIsolation {
+				ordinaryFlightAvailable := self.flightController.canSend()
+				fifoHead := scheduler.FifoHead()
+				sendPack = scheduler.TakeEligible(sendEligible)
+				if sendPack != nil {
+					bypassedRecoveryAdmission =
+						self.noAckPackCanBypassRecoveryAdmission(sendPack) &&
+							(!resendCapacity || !ordinaryFlightAvailable)
+					if fifoHead != nil && sendPack != fifoHead {
+						self.client.unreliableFlowIsolationBypassCount.Add(1)
+					}
+					if !bypassedRecoveryAdmission && !ordinaryFlightAvailable {
+						self.client.unreliableFlowReserveSelectionCount.Add(1)
+					}
 				}
-				if !bypassedRecoveryAdmission && !ordinaryFlightAvailable {
-					self.client.unreliableFlowReserveSelectionCount.Add(1)
-				}
+			} else if resendCapacity {
+				sendPack = scheduler.TakeFifoEligibleAround(held, func(candidate *SendPack) bool {
+					return flightEligible(candidate) &&
+						(self.noAckPackCanBypassRecoveryAdmission(candidate) || self.retainedSendPackFits(candidate))
+				})
+			} else {
+				// Capacity is unavailable, and a no-acknowledgement pack does not
+				// need it: it will never enter the resend queue, so the bound it is
+				// waiting behind is one it can never occupy. The flow-isolated
+				// branch above already selects on that basis; without isolation the
+				// whole selection used to be gated on capacity, so a pack that
+				// could progress waited on packs that could not. That is the other
+				// half of the same composition defect admission had
+				// (THROUGHPUTFIX §38.11).
+				sendPack = scheduler.TakeFifoEligibleAround(held, func(candidate *SendPack) bool {
+					return (candidate.NoBudget || self.noAckPackCanBypassRecoveryAdmission(candidate) ||
+						preparedFlightAvailable && self.preparedPackFits(candidate)) &&
+						flightEligible(candidate)
+				})
+				bypassedRecoveryAdmission = sendPack != nil && self.noAckPackCanBypassRecoveryAdmission(sendPack)
 			}
-		} else if resendCapacity {
-			sendPack = scheduler.TakeFifoEligibleAround(held, func(candidate *SendPack) bool {
-				return flightEligible(candidate) &&
-					(self.noAckPackCanBypassRecoveryAdmission(candidate) || self.retainedSendPackFits(candidate))
-			})
-		} else {
-			// Capacity is unavailable, and a no-acknowledgement pack does not
-			// need it: it will never enter the resend queue, so the bound it is
-			// waiting behind is one it can never occupy. The flow-isolated
-			// branch above already selects on that basis; without isolation the
-			// whole selection used to be gated on capacity, so a pack that
-			// could progress waited on packs that could not. That is the other
-			// half of the same composition defect admission had
-			// (THROUGHPUTFIX §38.11).
-			sendPack = scheduler.TakeFifoEligibleAround(held, func(candidate *SendPack) bool {
-				return (candidate.NoBudget || self.noAckPackCanBypassRecoveryAdmission(candidate) ||
-					preparedFlightAvailable && self.preparedPackFits(candidate)) &&
-					flightEligible(candidate)
-			})
-			bypassedRecoveryAdmission = sendPack != nil && self.noAckPackCanBypassRecoveryAdmission(sendPack)
 		}
 		if sendPack == nil {
 			sendPack = scheduler.TakeUnorderedEligible(func(candidate *SendPack) bool {
@@ -10946,7 +10986,7 @@ sendSequenceLoop:
 			producerWaiting := self.resendCapacityUnavailable.waiterCount.Load() != 0
 			head := scheduler.FifoHead()
 			need := ByteCount(0)
-			if blocked && head != nil && !head.NoBudget && !self.noAckPackCanBypassRecoveryAdmission(head) &&
+			if cohortAdmission && blocked && head != nil && !head.NoBudget && !self.noAckPackCanBypassRecoveryAdmission(head) &&
 				!self.noAckPackHeldAtContract(head, sendTime) {
 				// Only an actual retention owner takes a place in the line. A
 				// no-acknowledgement Pack held at a contract boundary is none:
@@ -11056,6 +11096,15 @@ sendSequenceLoop:
 				}
 			} else {
 				self.noAckContractHoldActive = false
+			}
+		}
+		if !cohortAdmission {
+			for _, queued := range scheduler.order {
+				if !queued.deadline.IsZero() {
+					if expiry := queued.deadline.Add(time.Nanosecond); expiry.Before(wakeDeadline) {
+						wakeDeadline = expiry
+					}
+				}
 			}
 		}
 		// Snapshot may drain a withdrawal's wake after the earlier cut.
@@ -12482,6 +12531,30 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	groupMemoryBytes ByteCount,
 ) bool {
 	acks := item.acks
+	disposeErr := errSendSequenceUnwound
+	ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem := true, true, true, true, true
+	defer func() {
+		if ownDisposition {
+			disposition.complete(false)
+		}
+		if ownFrames {
+			for _, frame := range sendFrames {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		// Route-write phases precede the terminal one: a group's terminal
+		// waits until every chunk has reported its first route write.
+		if ownRouteWrite {
+			item.acks.firstRouteWrite(disposeErr)
+		}
+		if ownNoAck {
+			noAckSends.complete(disposeErr)
+		}
+		if ownItem {
+			item.acks.invoke(disposeErr)
+			self.returnSendItem(item)
+		}
+	}()
 	sendTime := time.Now()
 	messageId := NewId()
 
@@ -12501,9 +12574,34 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 		// contract's frame, and this Pack's frame is the successor's. The
 		// sequence is established by construction, since a delivery
 		// acknowledgement is what let this sender announce at all.
-		head = (0 == len(self.sendItems)) && aheadContract == nil
-		sequenceNumber = self.nextSequenceNumber
-		self.nextSequenceNumber += 1
+		assign := func() {
+			head = (0 == len(self.sendItems)) && aheadContract == nil
+			sequenceNumber = self.nextSequenceNumber
+			self.nextSequenceNumber += 1
+		}
+		if group, ok := disposition.target.(*parsedPacketGroup); ok &&
+			group.nativeAckRetry != nil && group.nativeAckRetry.replay {
+			attempt := group.nativeAckRetry
+			// Contract/route/preparation can wait. Native feedback and this
+			// ordinal assignment share the flow lock, so supersession either
+			// rejects an unwritten retry or follows an immutable original.
+			allowed := func() bool {
+				attempt.update.stateLock.Lock()
+				defer attempt.update.stateLock.Unlock()
+				if attempt.source != self || !attempt.currentWithLock() {
+					return false
+				}
+				assign()
+				return true
+			}()
+			if !allowed {
+				disposeErr = newUnwrittenSendPackError(errNativeAckRetrySuperseded)
+				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
+				return false
+			}
+		} else {
+			assign()
+		}
 		if item.deliverImmediately {
 			messageId = immediateMessageId(self.client.ClientId(), self.sequenceId, sequenceNumber)
 		}
@@ -12511,29 +12609,6 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 		head = false
 		sequenceNumber = 0
 	}
-	ownDisposition, ownFrames, ownRouteWrite, ownNoAck, ownItem := true, true, true, true, true
-	defer func() {
-		if ownDisposition {
-			disposition.complete(false)
-		}
-		if ownFrames {
-			for _, frame := range sendFrames {
-				MessagePoolReturn(frame.MessageBytes)
-			}
-		}
-		// Route-write phases precede the terminal one: a group's terminal
-		// waits until every chunk has reported its first route write.
-		if ownRouteWrite {
-			item.acks.firstRouteWrite(errSendSequenceUnwound)
-		}
-		if ownNoAck {
-			noAckSends.complete(errSendSequenceUnwound)
-		}
-		if ownItem {
-			item.acks.invoke(errSendSequenceUnwound)
-			self.returnSendItem(item)
-		}
-	}()
 	if ack {
 		disposition.retainMemory(item, groupMemoryBytes)
 	}
@@ -13396,7 +13471,16 @@ func (self *ReceiveSequence) takeEvictions() []uint64 {
 func (self *ReceiveSequence) receiveWindowAdvertisement() uint64 {
 	share := self.receiveBufferSettings.ReceiveQueueMaxByteCount
 	if budget := self.receiveQueue.Budget(); budget != nil {
-		share = min(share, budget.TotalByteCount())
+		physical := budget.TotalByteCount()
+		numerator := uint64(self.receiveBufferSettings.AdvertisedReceiveWindowBudgetScaleNumerator)
+		denominator := uint64(self.receiveBufferSettings.AdvertisedReceiveWindowBudgetScaleDenominator)
+		if physical > 0 && 0 < numerator && numerator < denominator {
+			// Divide first; the remaining uint8 products cannot overflow. The
+			// numerical permission follows capacity, never current free bytes.
+			value := uint64(physical)
+			physical = ByteCount(value/denominator*numerator + value%denominator*numerator/denominator)
+		}
+		share = min(share, physical)
 	}
 	if maximum := self.receiveBufferSettings.AdvertisedReceiveWindowMaxByteCount; maximum > 0 {
 		share = min(share, maximum)
@@ -14356,6 +14440,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		self.observeImmediateCumulativeBoundary(ackSequenceNumber, receivedAtNanos)
 	}
 	self.retireImmediateTerminalsThrough(ackSequenceNumber)
+	self.retireFifoRepairAdmission()
 	self.applyFifoRepair(fifoRepair, self.lastCumulativeAckTime)
 	if len(self.sendItems) > 0 && self.sendItems[0].sequenceNumber > ackSequenceNumber+1 {
 		// An expired interior control becomes a skippable prefix only after
@@ -14433,6 +14518,7 @@ func (self *SendSequence) releaseRetainedSendItems(err error) {
 		}
 	}
 	self.sendItems = nil
+	self.retireFifoRepairAdmission()
 	// Also support direct/test queue construction without an identity list.
 	for _, item := range self.resendQueue.Clear() {
 		item.acks.invoke(err)
@@ -15673,6 +15759,12 @@ type ReceiveBufferSettings struct {
 	// independently of logical hold and physical RX capacity. Nonpositive
 	// preserves the existing advertisement; it does not reserve shared rights.
 	AdvertisedReceiveWindowMaxByteCount ByteCount
+	// Optional encoded/physical conversion for the attached RX budget total.
+	// Positive numerator smaller than denominator applies that exact rational
+	// scale; zero or identity preserves legacy sizing. This neither reserves
+	// receive rights nor changes the wire field, logical hold or physical owner.
+	AdvertisedReceiveWindowBudgetScaleNumerator   uint8
+	AdvertisedReceiveWindowBudgetScaleDenominator uint8
 
 	// whether to allow nacks without a contract_id
 	AllowLegacyNack bool
@@ -16536,10 +16628,10 @@ type ReceiveSequence struct {
 	// deliverItems/deliverFrames buffer consecutive in-order head items so
 	// their app frames dispatch in ONE receive callback per drain burst
 	// instead of one per pack (see receiveHead / flushDeliver). Batch depth
-	// mirrors the packs channel occupancy: a lone item flushes on the very
-	// next loop pass (no added latency), a saturated stream flushes at
-	// receiveDeliverBatchMaxFrames. Items are retained here until flush,
-	// which sends their acks and returns their pool buffers.
+	// follows ready input: a drained mailbox flushes immediately, while frame,
+	// item and processed-Pack bounds also flush a continuously ready stream.
+	// Duplicates cannot postpone a buffered callback by adding no frames.
+	// Flush sends the delivered items' ACKs and returns their pool buffers.
 	deliverItems  []*receiveItem
 	deliverFrames []*protocol.Frame
 	deliverPeer   Peer
@@ -16564,9 +16656,14 @@ func (self *ReceiveSequence) id() receiveSequenceId {
 	}
 }
 
-// receiveDeliverBatchMaxFrames bounds the frames buffered for one combined
-// receive callback (memory and worst-case delivery latency under saturation).
-const receiveDeliverBatchMaxFrames = 64
+// Separate bounds cover application frames, empty/filtered owners and input
+// turns that contribute no new callback frames. Contiguous DATA keeps the same
+// 64-frame callback; duplicate ingress cannot make its dispatch wait for quiet.
+const (
+	receiveDeliverBatchMaxFrames    = 64
+	receiveDeliverBatchMaxItems     = 64
+	receiveDeliverBatchMaxPackTurns = 64
+)
 
 func NewReceiveSequence(
 	ctx context.Context,
@@ -17781,16 +17878,18 @@ func (self *ReceiveSequence) Run() {
 	idleSince := time.Now()
 	timerWake := false
 	protocolYieldData := false
+	pendingDeliverPackTurns := 0
 
 	// A timed-out hole may already have its predecessor in the local handoff
 	// queue. Reconcile only the prefix present at first expiry, never replenish
 	// it for newer traffic or duplicate arrivals that keep the same hole open.
 	var immediateGapItem receiveItem
 	var gapHandoff struct {
-		active     bool
-		next       uint64
-		receivedAt time.Time
-		remaining  int
+		active            bool
+		next              uint64
+		receivedAt        time.Time
+		dataRemaining     int
+		protocolRemaining int
 	}
 	for {
 		if self.ctx.Err() != nil {
@@ -17865,11 +17964,18 @@ func (self *ReceiveSequence) Run() {
 							gapHandoff.active = true
 							gapHandoff.next = self.nextSequenceNumber
 							gapHandoff.receivedAt = item.receiveTime
-							// An empty channel also gets one nonblocking rendezvous;
-							// an unbuffered ready producer otherwise has no census.
-							gapHandoff.remaining = max(1, len(self.packs))
+							// Each mailbox owns a fixed prefix. Only an unbuffered
+							// mailbox also gets one immediate rendezvous probe.
+							gapHandoff.dataRemaining = len(self.packs)
+							gapHandoff.protocolRemaining = len(self.protocolPacks)
+							if cap(self.packs) == 0 {
+								gapHandoff.dataRemaining = 1
+							}
+							if cap(self.protocolPacks) == 0 {
+								gapHandoff.protocolRemaining = 1
+							}
 							if self.receiveBufferSettings.afterGapHandoffSnapshotForTest != nil {
-								self.receiveBufferSettings.afterGapHandoffSnapshotForTest(self.id(), gapHandoff.remaining)
+								self.receiveBufferSettings.afterGapHandoffSnapshotForTest(self.id(), gapHandoff.dataRemaining+gapHandoff.protocolRemaining)
 							}
 						}
 						expiredGap = item
@@ -17949,6 +18055,12 @@ func (self *ReceiveSequence) Run() {
 			if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
 				hook(self, receivePack.decodedOwner, "pack_released")
 			}
+			// A ready channel can win a select concurrently with cancellation.
+			// Return this new owner; exit still flushes earlier buffered heads.
+			if self.ctx.Err() != nil {
+				receivePack.messagePoolReturn()
+				return false
+			}
 
 			if receivePack.Pack.Nack {
 				received, err := self.receiveNack(receivePack)
@@ -17995,7 +18107,69 @@ func (self *ReceiveSequence) Run() {
 					receivePack.messagePoolReturn()
 				}
 			}
+			// Both mailboxes pass here. A past or held duplicate can consume a
+			// turn without appending frames, so ready input alone is not progress
+			// toward dispatching the already-buffered application batch.
+			if len(self.deliverItems) == 0 {
+				pendingDeliverPackTurns = 0
+			} else {
+				pendingDeliverPackTurns++
+				if receiveDeliverBatchMaxPackTurns <= pendingDeliverPackTurns {
+					self.flushDeliver()
+					pendingDeliverPackTurns = 0
+				}
+			}
 			return true
+		}
+
+		if expiredGap != nil {
+			if self.ctx.Err() != nil {
+				return
+			}
+			var receivePack *ReceivePack
+			var ok, received bool
+			// Keep protocol/DATA alternation, but never let ordinary priority
+			// consume traffic beyond either first-expiry prefix.
+			for attempt := 0; attempt < 2; attempt++ {
+				protocol := !protocolYieldData
+				if attempt != 0 {
+					protocol = !protocol
+				}
+				handoff, remaining := self.packs, &gapHandoff.dataRemaining
+				if protocol {
+					handoff, remaining = self.protocolPacks, &gapHandoff.protocolRemaining
+				}
+				if *remaining == 0 {
+					continue
+				}
+				select {
+				case receivePack, ok = <-handoff:
+					*remaining--
+					received = true
+					protocolYieldData = protocol
+					if !protocol {
+						self.releasePackQueue(receivePack)
+					}
+				default:
+					// An absent rendezvous is consumed now, not retried after
+					// another mailbox gives a future producer time to arrive.
+					*remaining = 0
+				}
+				if received {
+					break
+				}
+			}
+			if received {
+				if !processPack(receivePack, ok) {
+					return
+				}
+				continue
+			}
+			if self.ctx.Err() != nil {
+				return
+			}
+			self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, expiredGap.sequenceNumber, time.Since(gapHandoff.receivedAt), self.receiveBufferSettings.GapTimeout)
+			return
 		}
 
 		// One protocol turn yields to the existing ready-DATA and deadline
@@ -18014,31 +18188,6 @@ func (self *ReceiveSequence) Run() {
 			}
 		}
 
-		if expiredGap != nil {
-			if self.ctx.Err() != nil {
-				return
-			}
-			if 0 < gapHandoff.remaining {
-				select {
-				case <-self.ctx.Done():
-					return
-				case receivePack, ok := <-self.packs:
-					gapHandoff.remaining--
-					self.releasePackQueue(receivePack)
-					if !processPack(receivePack, ok) {
-						return
-					}
-					continue
-				default:
-				}
-			}
-			if self.ctx.Err() != nil {
-				return
-			}
-			self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, expiredGap.sequenceNumber, time.Since(gapHandoff.receivedAt), self.receiveBufferSettings.GapTimeout)
-			return
-		}
-
 		// fast path without arming a timer
 		select {
 		case <-self.ctx.Done():
@@ -18055,6 +18204,7 @@ func (self *ReceiveSequence) Run() {
 		// the packs channel is drained: dispatch the buffered head items in
 		// one combined receive callback before waiting
 		self.flushDeliver()
+		pendingDeliverPackTurns = 0
 
 		checkpointId := self.idleCondition.Checkpoint()
 		now := time.Now()
@@ -18064,7 +18214,14 @@ func (self *ReceiveSequence) Run() {
 		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending() ||
 			self.immediateDeliveryQueue != nil && self.immediateDeliveryQueue.pending()) {
 			pack, ok, shouldExit := self.waitDelivery(resetOrCreateTimer(&deliveryTimer, timeout))
-			if shouldExit || self.ctx.Err() != nil {
+			if pack != nil {
+				if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
+					hook(self, pack.decodedOwner, "delivery_wait_pack")
+				}
+			}
+			// waitDelivery returns a Pack only with shouldExit=false. Let
+			// processPack return its new custody if cancellation won meanwhile.
+			if shouldExit {
 				return
 			}
 			if pack != nil {
@@ -18951,7 +19108,8 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
 		hook(self, item.decodedOwner, "head_buffered")
 	}
-	if receiveDeliverBatchMaxFrames <= len(self.deliverFrames) {
+	if receiveDeliverBatchMaxFrames <= len(self.deliverFrames) ||
+		receiveDeliverBatchMaxItems <= len(self.deliverItems) {
 		self.flushDeliver()
 	}
 }

@@ -9,6 +9,23 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Transfers the constructed input through the existing paid scanner/decoder.
+// The resulting original has real repair custody; input roots return separately.
+func receiveDeliveryMergeOwnedPack(t *testing.T, fixture *reliableTcpIngressFixture, sequence *ReceiveSequence, input *ReceivePack) *ReceivePack {
+	t.Helper()
+	defer input.messagePoolReturn()
+	owned := fixture.decodeOwnedPack(sequence, input)
+	if owned == nil {
+		t.Fatal("merge original did not acquire real owned decode custody")
+	}
+	if owned.decodedOwner == nil || !owned.receiveMemoryOwned || owned.ingressSequence != sequence ||
+		owned.decodedOwner.receiveItem.memoryBudget != sequence.receiveQueue.budget {
+		owned.messagePoolReturn()
+		t.Fatal("merge original lacks its exact bound physical owner")
+	}
+	return owned
+}
+
 // Runs the real worker's contract failure on either a fresh or held head,
 // using both legacy accounting and exact retained admission.
 func runReceiveDeliveryMergeContractFailure(t *testing.T, held bool) {
@@ -33,6 +50,20 @@ func runReceiveDeliveryMergeContractFailure(t *testing.T, held bool) {
 			}
 			pack, id := f.uploadPack(sequence, number, 101, []byte("rejected contract owner"))
 			pack.Pack.ContractFrame = &protocol.Frame{MessageBytes: []byte{0x80}}
+			if retained {
+				pack.Pack.ContractFrame.MessageType = protocol.MessageType_TransferContract
+				if held {
+					// A no-contract peer's repair escrow covers its inline owner,
+					// not a copied proof root. This present empty proof still fails
+					// real verification after the committed owner reaches the head.
+					pack.Pack.ContractFrame.MessageBytes = nil
+					if f.client.ContractManager().Verify(nil, nil, protocol.ProvideMode(0)) {
+						pack.messagePoolReturn()
+						t.Fatal("empty invalid proof unexpectedly verified")
+					}
+				}
+				pack = receiveDeliveryMergeOwnedPack(t, f, sequence, pack)
+			}
 			witness := MessagePoolShareReadOnly(pack.Pack.Frames[0].MessageBytes)
 			defer func() { MessagePoolReturn(witness) }()
 			if ok, err := sequence.Pack(pack, 0); !ok || err != nil {
@@ -45,7 +76,17 @@ func runReceiveDeliveryMergeContractFailure(t *testing.T, held bool) {
 				if item == nil || !item.committed || retained && item.memoryBudget != budget {
 					t.Fatal("bad contract did not reach the real held-owner boundary")
 				}
+				if retained {
+					assertReliableIngressRepairCustody(t, sequence, item)
+					if item.contractFrame == nil || len(item.contractFrame.MessageBytes) != 0 ||
+						!item.deliveryPrepared || item.deliveryPrepaid <= 0 {
+						t.Fatal("committed held original lost its invalid proof or paid downstream custody")
+					}
+				}
 				head, _ := f.uploadPack(sequence, 0, 101, []byte("valid predecessor"))
+				if retained {
+					head = receiveDeliveryMergeOwnedPack(t, f, sequence, head)
+				}
 				if ok, err := sequence.Pack(head, 0); !ok || err != nil {
 					head.messagePoolReturn()
 					t.Fatalf("predecessor handoff: ok=%t err=%v", ok, err)
@@ -173,17 +214,20 @@ func TestReceiveDeliveryMergeHeadDuplicateReturnsPreflightCredit(t *testing.T) {
 		// The later committed item makes sequence 1 itself lie below the
 		// promise boundary. A duplicate must not spend that shared promise.
 		later, _ := f.uploadPack(sequence, 2, 101, []byte("original held bytes"))
+		later = receiveDeliveryMergeOwnedPack(t, f, sequence, later)
 		if accepted, err := sequence.receive(later); !accepted || err != nil {
 			later.messagePoolReturn()
 			t.Fatalf("later receive: accepted=%t err=%v", accepted, err)
 		}
 		original, id := f.uploadPack(sequence, 1, 101, []byte("original held bytes"))
+		original = receiveDeliveryMergeOwnedPack(t, f, sequence, original)
 		if accepted, err := sequence.receive(original); !accepted || err != nil {
 			original.messagePoolReturn()
 			t.Fatalf("original receive: accepted=%t err=%v", accepted, err)
 		}
 		held := sequence.receiveQueue.GetByMessageId(id)
-		if held == nil || !held.committed || held.memoryBudget != budget {
+		if held == nil || !held.committed || held.memoryBudget != budget || held.decodedOwner == nil ||
+			!held.decodedOwner.receivePack.receiveMemoryOwned || !held.decodedOwner.receivePack.heldHeadRepairEligible {
 			t.Fatal("original did not acquire real exact held custody")
 		}
 		before, promised, heldCharge := budget.UsedByteCount(), sequence.holdPromise.reservedByteCount, held.queueByteCount

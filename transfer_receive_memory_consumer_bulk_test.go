@@ -23,9 +23,17 @@ type receiveConsumerBulkCensus struct {
 	rx, recovery, root, parentSpare, packQuota               ByteCount
 	committed, tentative, buffered, callback, ingress        ByteCount
 	prefix, prefixBorrowed, escrow, escrowBorrowed           ByteCount
+	repair, repairCopy                                       ByteCount
 	held, committedItems, owners, callbackPackets            int
+	repairEligible                                           int
 	next, boundary, pressureNumber                           uint64
 	promised, pressureActive, pressurePending, pressureReady bool
+}
+
+// Borrowed prefix/pressure bytes already belong to a live owner. Only unused
+// repair escrow is additional; a decoded repair copy is in ingress custody.
+func (self receiveConsumerBulkCensus) classifiedByteCount() ByteCount {
+	return self.committed + self.tentative + self.buffered + self.callback + self.ingress + self.prefix + self.escrow + self.repair
 }
 
 // Routes keep original wire custody until explicitly delivered. The callback
@@ -271,16 +279,25 @@ func (self *receiveConsumerBulkFixture) census() receiveConsumerBulkCensus {
 	root := self.rx.admissionRoot()
 	root.admissionLock.Lock()
 	promise, pressure := &sequence.holdPromise, &sequence.memoryPressure
+	repair := &sequence.heldHeadRepair
 	result.promised, result.boundary, result.prefix = promise.set, promise.boundary, promise.reservedByteCount
 	result.prefixBorrowed = promise.ingressLoanByteCount
 	result.pressureActive, result.pressurePending, result.pressureReady = pressure.activeSet, pressure.pendingSet, pressure.ready
 	result.escrow, result.escrowBorrowed, result.pressureNumber = pressure.reservedByteCount, pressure.borrowedByteCount, pressure.active.sequenceNumber
+	result.repair, result.repairEligible = repair.reservedByteCount, repair.eligibleCount
+	eligible := 0
 	for pack := promise.ingressHead; pack != nil; pack = pack.ingressNext {
 		owner := pack.decodedOwner
 		result.owners++
 		if owner == nil || owner.receiveItem.memoryBudget != self.rx && owner.receiveItem.memoryBudget != self.recovery {
 			root.admissionLock.Unlock()
 			self.t.Fatal("consumer census found an unbacked live owner")
+		}
+		if pack.heldHeadRepairEligible {
+			eligible++
+		}
+		if owner == repair.owner && owner.receiveItem.memoryBudget == self.rx {
+			result.repairCopy = owner.receiveItem.QueueByteCount()
 		}
 		if held[owner] {
 			continue
@@ -294,10 +311,19 @@ func (self *receiveConsumerBulkFixture) census() receiveConsumerBulkCensus {
 		}
 	}
 	root.admissionLock.Unlock()
+	// These are real signed contract peers. The independently fixed policy is
+	// one 16 KiB copied-proof envelope plus the 1 KiB decoder owner per active
+	// commitment set, not per held packet.
+	if result.repairEligible != eligible || result.repairEligible < 0 ||
+		result.repairEligible == 0 && result.repair != 0 ||
+		result.repairEligible > 0 && (result.repair+result.repairCopy != 17408 ||
+			sequence.receiveBufferSettings.receiveHeldHeadRepairByteCount(false) != 17408) {
+		self.t.Fatalf("consumer repair escrow lost its exact eligible owners or proof envelope: %+v eligible=%d", result, eligible)
+	}
 	if budget := sequence.receiveBufferSettings.PackQueueBudget; budget != nil {
 		result.packQuota = budget.Stats().QuotaByteCount
 	}
-	classified := result.committed + result.tentative + result.buffered + result.callback + result.ingress + result.prefix + result.escrow
+	classified := result.classifiedByteCount()
 	if result.root != classified || result.root != result.rx+result.recovery || result.parentSpare <= 0 || result.packQuota != 0 ||
 		self.rx.TotalByteCount() != receiveConsumerBulkLeaf || self.root.TotalByteCount() != 10*receiveConsumerBulkLeaf ||
 		self.recovery.TotalByteCount() != receiveConsumerBulkLeaf || result.recovery > receiveConsumerBulkLeaf ||
@@ -372,7 +398,8 @@ func (self *receiveConsumerBulkFixture) close() {
 		}
 	}
 	if self.sequence != nil && (self.sequence.holdPromise.ingressHead != nil || self.sequence.holdPromise.reservedByteCount != 0 ||
-		self.sequence.memoryPressure.activeSet || self.sequence.memoryPressure.pendingSet || self.sequence.memoryPressure.reservedByteCount != 0) {
+		self.sequence.memoryPressure.activeSet || self.sequence.memoryPressure.pendingSet || self.sequence.memoryPressure.reservedByteCount != 0 ||
+		self.sequence.heldHeadRepair != (receiveHeldHeadRepair{})) {
 		self.t.Error("consumer bulk cleanup retained a sequence credit or owner")
 	}
 	self.t.Log("[rx-consumer-bulk-cleanup] clients_joined=true routes_returned=true rx=0 root=0")
@@ -551,5 +578,36 @@ func TestReceiveMemoryConsumerBulkPreservesExistingCommitment(t *testing.T) {
 		}
 		fixture.close()
 		t.Log("[rx-consumer-existing-commitment] genuine_sack=true owner_preserved=true all_originals_delivered=true root=0")
+	})
+}
+
+// A real SACK owns three separate costs. Deliberately omitting only M from a
+// copied census must fail the equality; no physical credit or owner changes.
+func TestReceiveMemoryConsumerBulkCensusRequiresRepairEscrow(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newReceiveConsumerBulkFixture(t)
+		fixture.writePackets(1280) // Keep the actual current original on its route.
+		tail := fixture.writePackets(1280)
+		fixture.forward(tail, fixture.receiverIn)
+		fixture.acknowledge()
+		state := fixture.census()
+		held := fixture.sequence.receiveQueue.GetBySequenceNumber(tail.pack.SequenceNumber)
+		sent := fixture.windowRoundFixture.sequence().resendQueue.GetByMessageId(RequireIdFromBytes(tail.pack.MessageId))
+		if held == nil || !held.committed || sent == nil || !sent.selectiveAcked ||
+			state.committed != 30544 || state.prefix != 30544 || state.repair != 17408 || state.repairCopy != 0 ||
+			state.repairEligible != 1 || state.root != 78496 || state.rx != state.root || fixture.ackedPacks != 0 {
+			t.Fatalf("actual original/prefix/repair ownership changed: %+v", state)
+		}
+		omitted := state
+		omitted.repair = 0
+		if state.classifiedByteCount() != state.root || omitted.classifiedByteCount() == state.root ||
+			state.root-omitted.classifiedByteCount() != 17408 {
+			t.Fatal("physical census accepted the historical missing-repair total")
+		}
+		fixture.close()
+		if fixture.sequence.heldHeadRepair != (receiveHeldHeadRepair{}) || fixture.rx.UsedByteCount() != 0 || fixture.root.UsedByteCount() != 0 {
+			t.Fatal("cancellation retained the actual repair escrow or original")
+		}
 	})
 }

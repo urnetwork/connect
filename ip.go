@@ -1092,8 +1092,10 @@ func (self *LocalUserNat) SendPacketsWithTimeout(source TransferPath, provideMod
 	)
 }
 
-// SendPacketBatch transfers every packet on successful all-or-nothing local
-// admission. A rejection returns every packet to the pool.
+// SendPacketBatch consumes every input packet and borrows the outer slice.
+// A protocol-only burst uses bounded local owners and returns the accepted
+// prefix count; a refused chunk and its unoffered suffix are returned here.
+// DATA and mixed batches retain their single all-or-nothing admission.
 func (self *LocalUserNat) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -1103,18 +1105,43 @@ func (self *LocalUserNat) SendPacketBatch(
 	if len(packets) == 0 {
 		return 0
 	}
+	protocolOnly := natProtocolOnlyPackets(packets)
+	if protocolOnly && providerReturnBatchMaxFrames < len(packets) {
+		// Bound each queued protocol owner without rejecting a legal native
+		// read burst merely because its caller collected more than one owner.
+		// The recursive calls have at most the fixed frame count, so recursion
+		// is one level. Each owns its copied slice and consumes its full input.
+		var deadline time.Time
+		if timeout > 0 {
+			deadline = time.Now().Add(timeout)
+		}
+		accepted := 0
+		for start := 0; start < len(packets); {
+			end := min(start+providerReturnBatchMaxFrames, len(packets))
+			remaining := timeout
+			if timeout > 0 {
+				remaining = max(time.Duration(0), time.Until(deadline))
+			}
+			count := self.SendPacketBatch(source, provideMode, packets[start:end], remaining)
+			accepted += count
+			if count != end-start {
+				// This chunk already consumed its own rejected roots. Only
+				// later, never-offered roots remain ours to return.
+				for _, packet := range packets[end:] {
+					MessagePoolReturn(packet)
+				}
+				return accepted
+			}
+			start = end
+		}
+		return accepted
+	}
 	var budget *TransferMemoryBudget
 	if self.settings != nil {
 		budget = self.settings.MemoryBudget
 	}
-	if natProtocolOnlyPackets(packets) {
+	if protocolOnly {
 		budget = nil
-		if providerReturnBatchMaxFrames < len(packets) {
-			for _, packet := range packets {
-				MessagePoolReturn(packet)
-			}
-			return 0
-		}
 	}
 	metadata, admitted := reserveNatMemory(budget, ByteCount(128+24*len(packets)))
 	if !admitted {

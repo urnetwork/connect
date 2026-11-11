@@ -161,7 +161,7 @@ func TestCanonicalDecodedMetadataActualDecodeBoundaries(t *testing.T) {
 }
 
 // Exercises an underfunded real Pack handoff, exact-capacity retry of that same
-// decoded owner, and full receive-leaf custody. The empty predecessor is paid
+// decoded owner, and full receive-leaf custody. A DATA predecessor is paid
 // before saturation; the sibling handoff leaf grants quota over those roots.
 func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 	t.Helper()
@@ -202,7 +202,7 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 		witnesses = append(witnesses, witness)
 		witness.checkLayout(t)
 		witness.pack.Ctx, witness.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
-		predecessor := canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, NewId(), 0, true, 0, fixture.receiver)
+		predecessor := canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(), sequenceId, NewId(), 0, true, 1, fixture.receiver)
 		witnesses = append(witnesses, predecessor)
 		predecessor.pack.Ctx, predecessor.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
 		repairBytes := fixture.receiver.settings.ReceiveBufferSettings.receiveHeldHeadRepairByteCount(true)
@@ -314,7 +314,7 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 				}
 				fixture.drop(ack)
 			}
-			if !cumulative || fixture.deliveredCount != 8 || sequence.nextSequenceNumber != 2 {
+			if !cumulative || fixture.deliveredCount != 9 || sequence.nextSequenceNumber != 2 {
 				t.Fatal("real predecessor did not drain the original owner through callback and cumulative ACK")
 			}
 		}
@@ -331,7 +331,7 @@ func runCanonicalDecodedMetadataFullBudget(t *testing.T, cancelHeld bool) {
 	})
 }
 
-// The actual empty predecessor drains a full receive leaf without fake ACKs.
+// An actual paid DATA predecessor drains the full receive leaf without fake ACKs.
 func TestCanonicalDecodedMetadataFullBudgetDelivery(t *testing.T) {
 	runCanonicalDecodedMetadataFullBudget(t, false)
 }
@@ -339,4 +339,54 @@ func TestCanonicalDecodedMetadataFullBudgetDelivery(t *testing.T) {
 // Cancellation joins the held decoder owner before any witness is retired.
 func TestCanonicalDecodedMetadataFullBudgetCancel(t *testing.T) {
 	runCanonicalDecodedMetadataFullBudget(t, true)
+}
+
+// An empty protocol predecessor still owns its real decoded carrier and ACK
+// while requiring no DATA byte credit, even with every DATA leaf at zero.
+func TestCanonicalDecodedMetadataEmptyProtocolPredecessorNoBudget(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		parent := NewTransferMemoryBudget(0)
+		packBudget := NewTransferMemoryBudgetWithParent(0, parent)
+		receiveBudget := NewTransferMemoryBudgetWithParent(0, parent)
+		var witness *canonicalDecodedMetadataWitness
+		t.Cleanup(func() {
+			if witness != nil {
+				witness.finish(t)
+			}
+			for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
+				assertRetainedBudgetBalance(t, budget)
+			}
+		})
+		fixture := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
+			settings.PackQueueBudget, settings.PackQueueRetainedByteAccounting = packBudget, true
+			settings.ReceiveQueueBudget, settings.ReceiveQueueRetainedByteAccounting = receiveBudget, true
+			settings.ReceiveQueueMinByteCount = 0
+		}, TransportTypeH1)
+		messageId := NewId()
+		witness = canonicalDecodeMetadataPacket(t, fixture.sender.ClientId(), fixture.receiver.ClientId(),
+			NewId(), messageId, 0, true, 0, fixture.receiver)
+		witness.pack.Ctx, witness.pack.ReceiveCallback = fixture.ctx, fixture.receiver.receiveCallback
+		if witness.pack.receiveMemoryOwned || !witness.owner.inUse || witness.want <= 0 {
+			t.Fatal("empty protocol Pack lost its actual decoded owner or acquired DATA credit")
+		}
+		accepted, err := fixture.receiver.receiveBuffer.Pack(witness.pack, 0)
+		witness.handed = accepted
+		if !accepted || err != nil {
+			t.Fatal("empty protocol predecessor was refused by zero DATA credit", err)
+		}
+		synctest.Wait()
+		ack := fixture.take(fixture.receiverOut)
+		if ack.ack == nil || ack.ack.Selective || !bytes.Equal(ack.ack.MessageId, messageId.Bytes()) || fixture.deliveredCount != 0 {
+			fixture.drop(ack)
+			t.Fatal("empty protocol predecessor lost its exact cumulative ACK or invented DATA delivery")
+		}
+		fixture.drop(ack)
+		for _, budget := range []*TransferMemoryBudget{packBudget, receiveBudget, parent} {
+			stats := budget.Stats()
+			if stats.UsedByteCount != 0 || stats.QuotaByteCount != 0 || stats.ReservedByteCount != 0 {
+				t.Fatalf("empty protocol predecessor consumed DATA credit: %+v", stats)
+			}
+		}
+	})
 }

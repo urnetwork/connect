@@ -109,67 +109,67 @@ type persistNativeOffer struct {
 	wire                          *persistNativeWire
 }
 
-// Copied by the source worker at its own stable observation boundaries.
-type persistNativeCapacityObservation struct {
-	at                time.Time
-	observations      uint64
-	afterPublication  bool
-	currentGeneration bool
-	retained          bool
-	held              bool
-	number            uint64
-	queued            int
-	unavailable       bool
-	effectiveWindow   ByteCount
-	ceiling           ByteCount
+// Optional barriers belong to the actual native read owner. Before offer
+// borrows the native packet; afterReceipt owns its small independent copy and
+// follows the exact established pure-ACK terminal receipt.
+type persistNativeBridgeHooks struct {
+	beforeOffer   func(*persistNativeFixture, []byte, persistNativeHeader, bool)
+	afterReceipt  func(*persistNativeFixture, persistNativeOffer)
+	writeResponse func(*persistNativeFixture, http.ResponseWriter, *http.Request, []byte)
 }
 
-// One connection, one held receipt, one paused read owner, one probe packet.
+// One connection, one held receipt, one queued ACK, one paused native reader.
 // Prelude/recovery serialization waits for genuine Transfer ACKs; the exact
 // discriminating reopen offers remain ordinary public zero-wait offers.
 type persistNativeFixture struct {
-	t                                    *testing.T
-	ctx                                  context.Context
-	cancel                               context.CancelFunc
-	closing                              atomic.Bool
-	holdZero                             bool
-	tun                                  *Tun
-	connection                           net.Conn
-	sender, receiver                     *Client
-	parent                               *RemoteUserNatMultiClient
-	selected                             *multiClientChannel
-	nat                                  *LocalUserNat
-	provider                             *RemoteUserNatProvider
-	local, origin                        net.Conn
-	listener                             *persistNativeListener
-	server                               *http.Server
-	serverDone, bridgeDone               chan struct{}
-	serverConnections, handlers          sync.WaitGroup
-	bridgeStarted                        bool
-	forward, reverse                     Route
-	body                                 []byte
-	dials                                atomic.Int64
-	providerSequence                     atomic.Pointer[TcpSequence]
-	waits                                chan zeroWindowWaitSnapshot
-	waitLocker                           atomic.Pointer[zeroWindowWaitLocker]
-	syn, synAck                          atomic.Pointer[persistNativeHeader]
-	firstReturnData                      atomic.Pointer[persistNativeHeader]
-	zero                                 atomic.Pointer[persistNativeHeader]
-	zeroWire, sourceWire, openWire       atomic.Pointer[persistNativeWire]
-	held                                 atomic.Pointer[receiveDeliveryClaim]
-	claimTaken                           atomic.Bool
-	claimReady, capacityReady, zeroAcked chan struct{}
-	capacityDo, zeroAckDo                sync.Once
-	capacityStateLock                    sync.Mutex
-	capacityState, capacityPublished     persistNativeCapacityObservation
-	zeroOffered                          chan persistNativeOffer
-	serialAcks                           chan persistNativeWire
-	resumeBridge, releaseProbe           chan struct{}
-	resumeDo, probeReleaseDo             sync.Once
-	probeSeen                            chan persistNativeHeader
-	probeDo                              sync.Once
-	regenerated                          chan persistNativeOffer
-	nativeOffers                         atomic.Int64
+	// Existing persist controls keep unsupported multi-member native custody
+	// explicit; the singleton recovery roots leave this fixture switch false.
+	batchReopen                    atomic.Bool
+	t                              *testing.T
+	ctx                            context.Context
+	cancel                         context.CancelFunc
+	closing                        atomic.Bool
+	holdZero                       bool
+	nativeBridgeHooks              *persistNativeBridgeHooks
+	tun                            *Tun
+	connection                     net.Conn
+	sender, receiver               *Client
+	parent                         *RemoteUserNatMultiClient
+	selected                       *multiClientChannel
+	nat                            *LocalUserNat
+	provider                       *RemoteUserNatProvider
+	local, origin                  net.Conn
+	listener                       *persistNativeListener
+	server                         *http.Server
+	serverDone, bridgeDone         chan struct{}
+	serverConnections, handlers    sync.WaitGroup
+	bridgeStarted                  bool
+	forward, reverse               Route
+	body                           []byte
+	dials                          atomic.Int64
+	providerSequence               atomic.Pointer[TcpSequence]
+	waits                          chan zeroWindowWaitSnapshot
+	waitLocker                     atomic.Pointer[zeroWindowWaitLocker]
+	syn, synAck                    atomic.Pointer[persistNativeHeader]
+	firstReturnData                atomic.Pointer[persistNativeHeader]
+	zero                           atomic.Pointer[persistNativeHeader]
+	zeroWire, sourceWire, openWire atomic.Pointer[persistNativeWire]
+	protocolSeedWire               atomic.Pointer[persistNativeWire]
+	protocolSeedActive             atomic.Bool
+	protocolSeedAcked              chan struct{}
+	protocolSeedAckDo              sync.Once
+	held                           atomic.Pointer[receiveDeliveryClaim]
+	claimTaken                     atomic.Bool
+	claimReady, zeroAcked          chan struct{}
+	zeroAckDo                      sync.Once
+	zeroOffered                    chan persistNativeOffer
+	serialAcks                     chan persistNativeWire
+	resumeBridge, releaseProbe     chan struct{}
+	resumeDo, probeReleaseDo       sync.Once
+	probeSeen                      chan persistNativeHeader
+	probeDo                        sync.Once
+	regenerated                    chan persistNativeOffer
+	nativeOffers                   atomic.Int64
 }
 
 // Root one requires the complete native-refusal -> persist -> actual ACK chain.
@@ -190,13 +190,24 @@ func TestTcpPersistNativeRefusedReopenCancellationOwnsBuffers(t *testing.T) {
 // All test policy is fixed before constructors; no production/lane/NoAck or
 // collapse setting is changed after a packet has been admitted.
 func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture {
+	return newPersistNativeFixtureConfigured(t, holdZero, nil, nil)
+}
+
+// Optional test configuration runs before either Client or TCP flow starts.
+// The original fixture and its three existing roots keep their exact policy.
+func newPersistNativeFixtureConfigured(t *testing.T, holdZero bool, configureClient func(*ClientSettings, bool), configureSequence func(*TcpSequence)) *persistNativeFixture {
+	return newPersistNativeFixtureWithBridge(t, holdZero, configureClient, configureSequence, nil)
+}
+
+// Nil hooks preserve the existing fixture's complete bridge schedule.
+func newPersistNativeFixtureWithBridge(t *testing.T, holdZero bool, configureClient func(*ClientSettings, bool), configureSequence func(*TcpSequence), bridgeHooks *persistNativeBridgeHooks) *persistNativeFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	local, origin := net.Pipe()
-	f := &persistNativeFixture{t: t, ctx: ctx, cancel: cancel, holdZero: holdZero, local: local, origin: origin,
+	f := &persistNativeFixture{t: t, ctx: ctx, cancel: cancel, holdZero: holdZero, nativeBridgeHooks: bridgeHooks, local: local, origin: origin,
 		forward: make(Route, 16), reverse: make(Route, 16), body: bytes.Repeat([]byte("native-persist"), 2600),
 		serverDone: make(chan struct{}), bridgeDone: make(chan struct{}), waits: make(chan zeroWindowWaitSnapshot, 16),
-		claimReady: make(chan struct{}), capacityReady: make(chan struct{}), zeroAcked: make(chan struct{}),
+		claimReady: make(chan struct{}), zeroAcked: make(chan struct{}), protocolSeedAcked: make(chan struct{}),
 		zeroOffered: make(chan persistNativeOffer, 1), serialAcks: make(chan persistNativeWire, 16),
 		resumeBridge: make(chan struct{}), releaseProbe: make(chan struct{}), probeSeen: make(chan persistNativeHeader, 1), regenerated: make(chan persistNativeOffer, 8)}
 	t.Cleanup(f.close)
@@ -216,6 +227,10 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 			body = []byte("reuse")
 		}
 		writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if bridgeHooks != nil && bridgeHooks.writeResponse != nil {
+			bridgeHooks.writeResponse(f, writer, request, body)
+			return
+		}
 		_, _ = writer.Write(body)
 	})}
 	go func() { defer close(f.serverDone); _ = f.server.Serve(f.listener) }()
@@ -235,8 +250,9 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 		settings.SendBufferSettings.ResendQueueBudget = NewTransferMemoryBudget(2 * 1024 * 1024)
 		settings.SendBufferSettings.ResendQueueRetainedByteAccounting = true
 		if source {
-			// An accepted ACK alone fills this deliberately tiny protocol window.
-			// Both arms use it; the entire real retained budget remains fixed.
+			// One retained immediate ACK fills flight, and one actual queued ACK
+			// fills the independent raw protocol slot. DATA byte credit stays fixed.
+			settings.SendBufferSettings.SequenceBufferSize = 1
 			settings.SendBufferSettings.ResendQueueMaxByteCount = 1
 			settings.SendBufferSettings.ResendQueueMinByteCount = 0
 			// Max is only the adaptive opening. Pin this fixture's intended
@@ -279,6 +295,12 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 						continue
 					}
 					wire := &persistNativeWire{owner: owner, generation: generation, message: message, number: pack.SequenceNumber, sequence: sequence, header: header}
+					if zero := f.zeroWire.Load(); f.protocolSeedActive.Load() && zero != nil && header == zero.header && message != zero.message {
+						if !f.protocolSeedWire.CompareAndSwap(nil, wire) {
+							t.Error("protocol pressure created more than one additional zero-window ACK")
+						}
+						continue
+					}
 					// One accepted native offer is outstanding. Negotiated lane
 					// activation may move later packets away from the initial SYN.
 					f.sourceWire.Store(wire)
@@ -290,47 +312,12 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 					}
 				}
 			}
-			observeCapacity := func(owner sendSequenceId, afterPublication bool) {
-				wire := f.zeroWire.Load()
-				if wire == nil || owner != wire.owner || !f.claimTaken.Load() || f.closing.Load() {
+			settings.SendBufferSettings.afterAckSendItemForTest = func(owner sendSequenceId, number uint64) {
+				if seed := f.protocolSeedWire.Load(); seed != nil && owner == seed.owner && number == seed.number {
+					f.protocolSeedActive.Store(false)
+					f.protocolSeedAckDo.Do(func() { close(f.protocolSeedAcked) })
 					return
 				}
-				number, retained := wire.sequence.retainedAckSequenceNumber(wire.message)
-				client.sendBuffer.mutex.Lock()
-				current := client.sendBuffer.sendSequences[owner] == wire.sequence &&
-					client.sendBuffer.sendSequencesBySequenceId[wire.generation] == wire.sequence
-				client.sendBuffer.mutex.Unlock()
-				window := wire.sequence.sendWindowSnapshot(time.Now())
-				observation := persistNativeCapacityObservation{
-					at: time.Now(), afterPublication: afterPublication, currentGeneration: current,
-					retained: retained, held: f.held.Load() != nil, number: number,
-					queued:          wire.sequence.resendQueue.Len(),
-					unavailable:     wire.sequence.resendCapacityUnavailable.Load(),
-					effectiveWindow: window.Window, ceiling: window.Ceiling,
-				}
-				ready := afterPublication && observation.unavailable && current && retained &&
-					number == wire.number && observation.held && window.Window == 1 && window.Ceiling == 1
-				func() {
-					f.capacityStateLock.Lock()
-					defer f.capacityStateLock.Unlock()
-					observation.observations = f.capacityState.observations + 1
-					f.capacityState = observation
-					if ready {
-						f.capacityPublished = observation
-					}
-				}()
-				if ready {
-					f.capacityDo.Do(func() { close(f.capacityReady) })
-				}
-			}
-			// The ACK snapshot precedes capacity publication; it is evidence only.
-			settings.SendBufferSettings.afterApplyAckSnapshotForTest = func(owner sendSequenceId) {
-				observeCapacity(owner, false)
-			}
-			settings.SendBufferSettings.beforeResendCapacityWaitForTest = func(owner sendSequenceId) {
-				observeCapacity(owner, true)
-			}
-			settings.SendBufferSettings.afterAckSendItemForTest = func(owner sendSequenceId, number uint64) {
 				wire := f.sourceWire.Load()
 				if wire == nil || owner != wire.owner || number != wire.number || f.closing.Load() {
 					return
@@ -351,6 +338,9 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 					f.zeroAckDo.Do(func() { close(f.zeroAcked) })
 				}
 			}
+		}
+		if configureClient != nil {
+			configureClient(settings, source)
 		}
 		client = NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 		return client
@@ -429,6 +419,9 @@ func newPersistNativeFixture(t *testing.T, holdZero bool) *persistNativeFixture 
 			}
 			original(source, key, mode, recovery, path, packet)
 		}
+		if configureSequence != nil {
+			configureSequence(sequence)
+		}
 	}
 	natSettings.TcpBufferSettings.DialContextSettings = &DialContextSettings{DialContext: func(context.Context, string, string) (net.Conn, error) {
 		if f.dials.Add(1) != 1 {
@@ -498,16 +491,36 @@ func (self *persistNativeFixture) offer(packet []byte, keepCopy bool) persistNat
 		copiedPath = *path
 		copiedPath.SourceIp, copiedPath.DestinationIp = bytes.Clone(path.SourceIp), bytes.Clone(path.DestinationIp)
 		update, _, _ = self.parent.sendUpdate(path, flowPin{})
+		if update == nil {
+			// Closing the parent can remove the flow after the bridge read.
+			// This offer still owns its original until the consuming entry.
+			MessagePoolReturn(packet)
+			return result
+		}
 		update.stateLock.Lock()
 		result.beforeEligible = update.canUpdateSequenceForClientWithLock(&parsedPacket{ipPath: path}, self.selected, true)
 		result.beforeSeen, result.beforeWindow, result.beforeAck = update.sequenceAdmissionStateSeen, update.sequenceAdmissionWindow, update.sequenceAdmissionAck
 		update.stateLock.Unlock()
 	}
 	beforeDrops := self.parent.TcpCollapseDropCount()
-	accepted := []bool{true}
+	packets := [][]byte{packet}
+	if zero := self.zero.Load(); zero != nil && self.batchReopen.Load() && header.opens(*zero) {
+		packets = append(packets, MessagePoolCopy(packet))
+	}
+	accepted := make([]bool, len(packets))
+	for index := range accepted {
+		accepted[index] = true
+	}
 	started := time.Now()
-	result.count = self.parent.SendNativePacketBatchWithResults(SourceId(self.sender.ClientId()), protocol.ProvideMode_Network, [][]byte{packet}, 5*time.Second, accepted)
+	result.count = self.parent.SendNativePacketBatchWithResults(SourceId(self.sender.ClientId()), protocol.ProvideMode_Network, packets, 5*time.Second, accepted)
 	result.elapsed = time.Since(started)
+	if result.count == 0 {
+		for _, admitted := range accepted {
+			if admitted {
+				self.t.Error("refused native batch left a stale true indexed result")
+			}
+		}
+	}
 	result.accepted = accepted[0]
 	result.collapseDrops = self.parent.TcpCollapseDropCount() - beforeDrops
 	if update != nil {
@@ -541,6 +554,10 @@ func (self *persistNativeFixture) runBridge() {
 			copyHeader := header
 			self.syn.CompareAndSwap(nil, &copyHeader)
 			update, _, _ := self.parent.sendUpdate(path, flowPin{})
+			if update == nil {
+				MessagePoolReturn(packet)
+				return
+			}
 			update.client.Store(self.selected)
 			self.parent.bindClientFlow(update, self.selected)
 		}
@@ -549,7 +566,10 @@ func (self *persistNativeFixture) runBridge() {
 			copyHeader := header
 			self.zero.Store(&copyHeader)
 		}
-		result := self.offer(packet, false)
+		if hooks := self.nativeBridgeHooks; hooks != nil && hooks.beforeOffer != nil {
+			hooks.beforeOffer(self, packet, header, firstZero)
+		}
+		result := self.offer(packet, firstZero || self.nativeBridgeHooks != nil && header.pureAck())
 		if firstZero {
 			self.zeroOffered <- result
 			select {
@@ -564,6 +584,9 @@ func (self *persistNativeFixture) runBridge() {
 				return
 			}
 			result.wire = self.sourceWire.Load()
+			if hooks := self.nativeBridgeHooks; hooks != nil && hooks.afterReceipt != nil {
+				hooks.afterReceipt(self, result)
+			}
 		}
 		if zero := self.zero.Load(); zero != nil && header.opens(*zero) {
 			select {
@@ -696,6 +719,10 @@ func checkPersistNativeReopen(t *testing.T, holdZero, cancelAfterRefusal bool) {
 	MessagePoolReturn(MessagePoolGet(1))
 	assertMessagePoolOwnership(t)
 	f := newPersistNativeFixture(t, holdZero)
+	// A singleton zero->positive ACK now owns optional local recovery. The
+	// persist fallback remains required for an unsupported whole native batch;
+	// each member is a byte-exact copy of the actual emitted window update.
+	f.batchReopen.Store(holdZero)
 	connection, err := f.tun.DialContext(f.ctx, "tcp4", "198.51.100.19:80")
 	if err != nil {
 		t.Fatal(err)
@@ -738,22 +765,26 @@ func checkPersistNativeReopen(t *testing.T, holdZero, cancelAfterRefusal bool) {
 	}
 	if holdZero {
 		f.await(f.claimReady, "real zero-window ACK delivery claim")
-		select {
-		case <-f.capacityReady:
-		case <-f.ctx.Done():
-			observation := func() persistNativeCapacityObservation {
-				f.capacityStateLock.Lock()
-				defer f.capacityStateLock.Unlock()
-				return f.capacityState
-			}()
-			t.Fatalf("actual source Transfer capacity publication: %v; last_worker_state=%+v", f.ctx.Err(), observation)
+		// The held original is already applied to provider TCP, but its real
+		// delivery receipt withholds Transfer ACK. A second genuine zero-window
+		// ACK fills the raw protocol slot behind that one-item immediate flight.
+		if len(zeroOffer.copy) == 0 || !protocolClassPureTcpControl(zeroOffer.copy) {
+			t.Fatal("protocol pressure lacks the original native zero-window ACK bytes")
 		}
-		published := func() persistNativeCapacityObservation {
-			f.capacityStateLock.Lock()
-			defer f.capacityStateLock.Unlock()
-			return f.capacityPublished
-		}()
-		t.Logf("actual source Transfer capacity publication: %+v", published)
+		f.protocolSeedActive.Store(true)
+		seed := f.offer(MessagePoolCopy(zeroOffer.copy), false)
+		if !seed.accepted || seed.count != 1 || seed.collapseDrops != 0 || seed.header != zero {
+			t.Fatalf("duplicate zero-window ACK did not acquire its real protocol slot: %+v", seed)
+		}
+		admission := wire.sequence.protocolAdmission
+		admission.mutex.Lock()
+		protocolCount, protocolCapacity, protocolWaiters := admission.count, admission.capacity, len(admission.waiters)
+		admission.mutex.Unlock()
+		if protocolCount != 1 || protocolCapacity != 1 || protocolWaiters != 0 ||
+			wire.sequence.immediateSendLimit != 1 || f.protocolSeedWire.Load() != nil || wire.sequence.resendQueue.Len() != 1 {
+			t.Fatalf("actual protocol pressure lacks retained1/raw1 custody: count=%d cap=%d waiters=%d", protocolCount, protocolCapacity, protocolWaiters)
+		}
+		t.Logf("actual protocol capacity: retained=%d raw=%d/%d DATA_gate_closed=%t", wire.sequence.resendQueue.Len(), protocolCount, protocolCapacity, wire.sequence.resendCapacityUnavailable.Load())
 		if number, retained := wire.sequence.retainedAckSequenceNumber(wire.message); !retained || number != wire.number || f.held.Load() == nil {
 			t.Fatal("held zero-window ACK lost its exact queued/detached retry owner")
 		}
@@ -837,6 +868,27 @@ func checkPersistNativeReopen(t *testing.T, holdZero, cancelAfterRefusal bool) {
 	if openOffers == 0 {
 		t.Fatal("actual application drain produced no native window-reopen ACK")
 	}
+	f.batchReopen.Store(false)
+	if holdZero {
+		path, _, err := ParseIpPathWithPayload(refused.copy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.parent.stateLock.Lock()
+		update := f.parent.affinityUpdateWithLock(path)
+		pending := f.parent.nativeAckRetryCount
+		if update != nil {
+			update.stateLock.Lock()
+			if update.nativeAckRetry != nil {
+				pending++
+			}
+			update.stateLock.Unlock()
+		}
+		f.parent.stateLock.Unlock()
+		if pending != 0 {
+			t.Fatal("unsupported two-member native refusal gained singleton retry custody")
+		}
+	}
 	if holdZero && f.openWire.Load() != nil {
 		t.Fatal("a refused native reopen ACK unexpectedly acquired Transfer custody")
 	}
@@ -862,6 +914,7 @@ func checkPersistNativeReopen(t *testing.T, holdZero, cancelAfterRefusal bool) {
 		}
 		f.held.Swap(nil).complete(true)
 		f.await(f.zeroAcked, "canceled flow's already-applied ACK custody release")
+		f.await(f.protocolSeedAcked, "canceled flow's queued protocol ACK retirement")
 		if used := f.nat.settings.TcpBufferSettings.ReturnQueueBudget.UsedByteCount(); used != 0 {
 			t.Fatalf("joined canceled TCP flow retained %d inner return bytes", used)
 		}
@@ -874,6 +927,14 @@ func checkPersistNativeReopen(t *testing.T, holdZero, cancelAfterRefusal bool) {
 		}
 		claim.complete(true)
 		f.await(f.zeroAcked, "released zero-window ACK genuine peer feedback")
+		f.await(f.protocolSeedAcked, "queued protocol ACK actual wire/receipt drain")
+		admission := wire.sequence.protocolAdmission
+		admission.mutex.Lock()
+		remaining := admission.count
+		admission.mutex.Unlock()
+		if remaining != 0 {
+			t.Fatal("actual protocol ACK drain did not release its raw slot")
+		}
 	} else if acceptedOpen == 0 {
 		t.Fatal("positive control admitted no actual window-reopen ACK")
 	}

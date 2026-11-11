@@ -360,14 +360,27 @@ func runPrivateTcpProfilePressure(t *testing.T, target ByteCount, overlap bool) 
 		if fixture.budget.Available() != 0 || fixture.root.Available() != 0 {
 			t.Fatal("sibling witness did not fill the unchanged NAT and root ceilings")
 		}
-		packet := fixture.packet(fanout+1, tcpFlagSyn, 50000, 0)
+		// Bare SYN admission is protocol-only, but its new flow still requires
+		// the ordinary constructor claim. Its accepted packet retires at refusal.
+		fullStats := fixture.budget.Stats()
+		fixture.syn(fanout+1, false)
+		if fixture.dials.Load() != int64(fanout) || fixture.budget.UsedByteCount() != fullStats.UsedByteCount ||
+			len(fixture.sequences) != fanout || fixture.root.Available() != 0 {
+			t.Fatal("full-budget protocol SYN created a dial/flow or retained packet ownership")
+		}
+		// One real TFO byte keeps the adjacent DATA admission refusal explicit.
+		packet := MessagePoolCopy(ipOosTcpPacketSequence(fixture.path(fanout+1), tcpFlagSyn, 50000, []byte{0x64}))
+		if protocolClassPureTcpControl(packet) {
+			MessagePoolReturn(packet)
+			t.Fatal("TFO refusal control did not contain DATA")
+		}
 		if fixture.nat.SendPacket(fixture.source, protocol.ProvideMode_Network, packet, 0) {
-			t.Fatal("full data budget admitted another SYN")
+			t.Fatal("full DATA budget admitted a SYN with early DATA")
 		}
 		MessagePoolReturn(packet)
 		synctest.Wait()
-		if fixture.dials.Load() != int64(fanout) {
-			t.Fatal("full-budget refusal reached the socket constructor")
+		if fixture.dials.Load() != int64(fanout) || fixture.budget.UsedByteCount() != fullStats.UsedByteCount {
+			t.Fatal("refused TFO reached the socket constructor or retained packet credit")
 		}
 		// The ACK names only bytes observed on the real socket-return packet.
 		fixture.control(tcpFlagAck, data.sequenceNumber+uint32(len(data.payload)))

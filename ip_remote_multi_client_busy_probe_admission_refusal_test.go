@@ -16,9 +16,9 @@ import (
 )
 
 // Uses the qualified first-write barrier, with exactly one constructor-owned
-// admission slot. The original's serializer still owns that slot after its
-// physical write, so subsequent probes cannot acquire it until the barrier
-// opens. This changes only test settings, never live admission counters.
+// DATA slot and one protocol slot. The original serializer is held after its
+// physical write while an actual protocol seed owns the separate protocol slot.
+// Subsequent probes must refuse until the barrier opens; no counter is assigned.
 func newBusyAdmissionRefusalFixture(t *testing.T) *busyExpiryFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,6 +107,13 @@ func newBusyAdmissionRefusalFixture(t *testing.T) *busyExpiryFixture {
 	if pending != 1 || pendingBytes != 1000 || acked != 0 {
 		t.Fatalf("real initial flow accounting=%d/%d/%d, want 1/1000/0", pending, pendingBytes, acked)
 	}
+	seed := RequireToFrameWithDefaultProtocolVersion(&protocol.IpPing{})
+	accepted, err := client.SendMultiHopWithTimeoutDetailed(seed, RequireMultiHopId(destination), nil, 0, NoBudget(),
+		sendPackLifecycleObserverOption{observer: func(SendPackLifecycleObservation) {}})
+	if !accepted || err != nil {
+		MessagePoolReturn(seed.MessageBytes)
+		t.Fatal("real protocol seed did not fill its independent admission slot", err)
+	}
 	return fixture
 }
 
@@ -183,6 +190,18 @@ func TestBusyProbeRealLocalAdmissionRefusalsPreserveWrittenFlow(t *testing.T) {
 		synctest.Wait()
 		acknowledgeSendPackLifecycleWirePack(t, fixture.client, fixture.destination, fixture.firstPack)
 		synctest.Wait()
+		if len(fixture.route) != 1 {
+			t.Fatalf("released protocol seed route writes=%d, want one", len(fixture.route))
+		}
+		seedWire := <-fixture.route
+		seed := decodeSendPackLifecycleWirePack(t, seedWire)
+		MessagePoolReturn(seedWire)
+		if seed.Nack || seed.SequenceNumber != 1 || len(seed.Frames) != 1 ||
+			seed.Frames[0].MessageType != protocol.MessageType_IpIpPing || !bytes.Equal(seed.SequenceId, fixture.firstPack.SequenceId) {
+			t.Fatal("released protocol seed changed its reliable identity or order")
+		}
+		acknowledgeSendPackLifecycleWirePack(t, fixture.client, fixture.destination, seed)
+		synctest.Wait()
 		packet := MessagePoolGet(1000)
 		clear(packet)
 		if !fixture.channel.SendWithAck(&parsedPacket{packet: packet, ipPath: icmpTcpTestPath(4)}, time.Second, true) {
@@ -196,7 +215,7 @@ func TestBusyProbeRealLocalAdmissionRefusalsPreserveWrittenFlow(t *testing.T) {
 		wire := <-fixture.route
 		pack := decodeSendPackLifecycleWirePack(t, wire)
 		MessagePoolReturn(wire)
-		if pack.Nack || pack.SequenceNumber != 1 || !bytes.Equal(pack.SequenceId, fixture.firstPack.SequenceId) {
+		if pack.Nack || pack.SequenceNumber != 2 || !bytes.Equal(pack.SequenceId, fixture.firstPack.SequenceId) {
 			t.Fatal("refused probes changed the surviving reliable sequence")
 		}
 		acknowledgeSendPackLifecycleWirePack(t, fixture.client, fixture.destination, pack)

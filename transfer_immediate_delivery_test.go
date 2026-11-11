@@ -212,7 +212,7 @@ func TestImmediateIpAckPolicyKeepsPayloadAndLifecycleOrdered(t *testing.T) {
 		for _, payload := range [][]byte{nil, {0x31}} {
 			packet := ipOosTcpPacketSequence(reliableDeliveryTestPath(4), flags, 4000, payload)
 			frame := &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketFromProvider, Raw: true, MessageBytes: packet}
-			expected := flags == tcpFlagAck && len(payload) == 0
+			expected := (flags == tcpFlagAck || flags == tcpFlagSyn|tcpFlagAck) && len(payload) == 0
 			if immediateIpAckFrames([]*protocol.Frame{frame}) != expected {
 				t.Fatalf("automatic immediate policy changed flags=%d payload=%d", flags, len(payload))
 			}

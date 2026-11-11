@@ -233,17 +233,25 @@ func newReceiveProviderPressureFixtureWithHold(t *testing.T, smallPrefix bool, h
 		}
 	}
 	expectedBytes := 2 * self.deliveryBytes
+	repairBytes := ByteCount(0)
 	if smallPrefix {
 		prefix := self.sequence.receiveQueue.GetBySequenceNumber(2)
 		if prefix == nil || !prefix.committed || self.sequence.holdPromise.reservedByteCount != prefix.QueueByteCount() ||
 			self.sequence.holdPromise.reservedByteCount >= self.decodeBytes || self.sequence.holdPromise.boundary != 2 {
 			t.Fatal("larger tentative owners changed the smaller committed prefix promise")
 		}
-		expectedBytes += 2 * prefix.QueueByteCount()
+		repairBytes = assertReliableIngressRepairCustody(t, self.sequence, prefix)
+		if repairBytes != 1024 {
+			t.Fatal("no-contract SACK did not own exactly its independent decoder repair envelope")
+		}
+		expectedBytes += 2*prefix.QueueByteCount() + repairBytes
+	} else if self.sequence.heldHeadRepair != (receiveHeldHeadRepair{}) {
+		t.Fatal("tentative provider tails created unfunded repair authority")
 	}
 	if root.Available() != 0 || rx.UsedByteCount() != expectedBytes || self.sequence.holdPromise.set != smallPrefix ||
 		!smallPrefix && self.sequence.holdPromise.reservedByteCount != 0 || len(self.receiverOut) != 0 || self.ackedCount != 1 {
-		t.Fatal("provider pressure did not fill the root without a SACK or prefix promise")
+		t.Fatalf("provider pressure changed exact tail/prefix/repair ownership: root_free=%d rx=%d want=%d repair=%d small_prefix=%t",
+			root.Available(), rx.UsedByteCount(), expectedBytes, repairBytes, smallPrefix)
 	}
 	return self
 }
@@ -487,6 +495,10 @@ func (self *receiveProviderPressureFixture) close() {
 			clean = false
 			self.t.Errorf("provider pressure cleanup imbalance: %+v", stats)
 		}
+	}
+	if self.sequence != nil && self.sequence.heldHeadRepair != (receiveHeldHeadRepair{}) {
+		clean = false
+		self.t.Error("provider cleanup retained a repair owner or escrow after join")
 	}
 	if clean {
 		self.t.Log("[rx-provider-pressure-cleanup] root=0 rx=0 nat=0 foreign=0 quota=0 clients_joined=true nat_joined=true")

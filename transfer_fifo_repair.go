@@ -13,6 +13,14 @@ type fifoRepairState struct {
 	generationStartNanos int64
 	pending              fifoRepairFence
 	passed               fifoPassedHead
+	admission            fifoRepairAdmission
+}
+
+// Fresh ordinary DATA waits for this fixed pre-existing cohort to retire.
+// A later proof cannot extend it, and no item pointer survives retirement.
+type fifoRepairAdmission struct {
+	through uint64
+	set     bool
 }
 
 // The creation fence belongs to this exact tag, including repeated writes of
@@ -178,8 +186,8 @@ func (self *SendSequence) acknowledgedFifoRepair(item *sendItem, tag sequenceTag
 
 // Accept a cohort only from the exact explicitly acknowledged promoted copy.
 // Later cumulative advances create no evidence: they expose at most one owner
-// already marked by that proof. Proven absence also supersedes an untouched
-// initial deadline, while all existing lifetime and physical service gates stay.
+// already marked by that proof. Only the exposed head becomes immediately due;
+// later owners may still be held at the receiver and keep their existing clocks.
 func (self *SendSequence) applyFifoRepair(proof fifoRepairFence, at time.Time) {
 	if len(self.sendItems) == 0 {
 		self.fifoRepair.passed = fifoPassedHead{}
@@ -196,6 +204,10 @@ func (self *SendSequence) applyFifoRepair(proof fifoRepairFence, at time.Time) {
 		if proof.set && proof.successful && proof.generation == policy.generation &&
 			item.messageId == proof.nextMessageId && item.sequenceNumber == proof.nextNumber {
 			changedRoute := self.fifoRepair.passed.route != nil && self.fifoRepair.passed.route != proof.route
+			if changedRoute {
+				self.fifoRepair.admission = fifoRepairAdmission{}
+			}
+			admission := fifoRepairAdmission{}
 			for _, retained := range self.fifoRepairItems() {
 				if retained == nil {
 					continue
@@ -208,8 +220,15 @@ func (self *SendSequence) applyFifoRepair(proof fifoRepairFence, at time.Time) {
 					self.resendQueue.messageIdItems[retained.messageId] == retained &&
 					self.resendQueue.sequenceNumberItems[retained.sequenceNumber] == retained {
 					retained.fifoRepairAccepted = true
+					if !retained.noBudget {
+						admission.through = max(admission.through, retained.sequenceNumber)
+						admission.set = true
+					}
 				}
 				retained.fifoRepairPending = false
+			}
+			if !self.fifoRepair.admission.set {
+				self.fifoRepair.admission = admission
 			}
 			self.fifoRepair.passed = fifoPassedHead{route: proof.route}
 		}
@@ -250,4 +269,18 @@ func (self *SendSequence) forgetFifoRepairItem(item *sendItem) {
 	if state.passed.set && state.passed.messageId == item.messageId && state.passed.number == item.sequenceNumber {
 		state.passed = fifoPassedHead{route: state.passed.route}
 	}
+}
+
+// Called only after cumulative delivery, explicit expiry or close removes
+// ownership. A successful retry and SACK retain this fixed DATA boundary.
+func (self *SendSequence) retireFifoRepairAdmission() {
+	if !self.fifoRepair.admission.set {
+		return
+	}
+	for _, item := range self.fifoRepairItems() {
+		if item != nil && item.sequenceNumber <= self.fifoRepair.admission.through && !item.noBudget {
+			return
+		}
+	}
+	self.fifoRepair.admission = fifoRepairAdmission{}
 }

@@ -68,6 +68,9 @@ type sendWindowHarness struct {
 	// decides whether a window's permission can become occupancy at all
 	// (THROUGHPUTFIX §37.15), so a cell that reads a queue records it.
 	wireFrameCapacity int
+	// Nil on the ordinary drop/recovery workload; only the explicit modeled
+	// lossless carrier waits for the receiver's local handoff release.
+	wireCredit *sendWindowWireCredit
 }
 
 // Sets and advertises the receiver's full hold capacity, independent of its
@@ -149,9 +152,14 @@ func newPacedSendWindowHarnessWithClient(
 	carrierFrameCapacity int,
 	configure func(*SendBufferSettings),
 	configureClient func(*ClientSettings),
+	losslessCredit ...*sendWindowWireCredit,
 ) *sendWindowHarness {
 	t.Helper()
-	newSettings := func() *ClientSettings {
+	var credit *sendWindowWireCredit
+	if len(losslessCredit) != 0 {
+		credit = losslessCredit[0]
+	}
+	newSettings := func(receiver bool) *ClientSettings {
 		settings := DefaultClientSettings()
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.SendBufferSettings.AckTimeout = 60 * time.Second
@@ -165,12 +173,25 @@ func newPacedSendWindowHarnessWithClient(
 		if configureClient != nil {
 			configureClient(settings)
 		}
+		if receiver && credit != nil {
+			previous := settings.ReceiveBufferSettings.receiveOwnerStageForTest
+			settings.ReceiveBufferSettings.receiveOwnerStageForTest = func(sequence *ReceiveSequence, owner *decodedPackOwner, stage string) {
+				if previous != nil {
+					previous(sequence, owner, stage)
+				}
+				credit.observe(sequence, owner, stage)
+			}
+		}
 		return settings
 	}
 	senderId := NewId()
 	receiverId := NewId()
-	sender := NewClient(ctx, senderId, NewNoContractClientOob(), newSettings())
-	receiver := NewClient(ctx, receiverId, NewNoContractClientOob(), newSettings())
+	sender := NewClient(ctx, senderId, NewNoContractClientOob(), newSettings(false))
+	receiver := NewClient(ctx, receiverId, NewNoContractClientOob(), newSettings(true))
+	if credit != nil {
+		credit.receiver = receiver
+		credit.path = TransferPath{SourceId: senderId, DestinationId: receiverId}
+	}
 	sender.ContractManager().AddNoContractPeer(receiverId)
 	receiver.ContractManager().AddNoContractPeer(senderId)
 
@@ -178,9 +199,9 @@ func newPacedSendWindowHarnessWithClient(
 	senderIn := make(Route, deepCarrierFrameCapacity)
 	receiverIn := make(Route, deepCarrierFrameCapacity)
 	receiverOut := make(Route, deepCarrierFrameCapacity)
-	// These lossless links retain complete frames under receive backpressure.
-	// Leave the carrier family unspecified so this fixture does not enable
-	// transport-specific pacing, but identify each reliable physical lane.
+	// Reliable lane metadata does not make shared Client admission wait.
+	// Default traffic may drop/recover there; an explicit local wire credit
+	// below supplies the separate lossless modeled-carrier precondition.
 	carrier := TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable}
 	sender.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{senderOut})
 	sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransport(), []Route{senderIn}, carrier)
@@ -241,10 +262,18 @@ func newPacedSendWindowHarnessWithClient(
 			link.run(ctx, from, to)
 		}()
 	}
+	dataDestination := receiverIn
+	if credit != nil {
+		// No added propagation, serialization or buffered queue. This one
+		// carrier stage owns at most one pending physical Pack identity.
+		dataDestination = make(Route)
+		pumpsDone = append(pumpsDone, credit.done)
+		go credit.run(ctx, dataDestination, receiverIn)
+	}
 	if 0 < bytesPerSecond {
-		ratePump(senderOut, receiverIn)
+		ratePump(senderOut, dataDestination)
 	} else {
-		pump(senderOut, receiverIn, 0)
+		pump(senderOut, dataDestination, 0)
 	}
 	pump(receiverOut, senderIn, ackDelay)
 	t.Cleanup(func() {
@@ -277,6 +306,7 @@ func newPacedSendWindowHarnessWithClient(
 		receiverId:        receiverId,
 		bytesPerSecond:    rate,
 		wireFrameCapacity: cap(senderOut),
+		wireCredit:        credit,
 	}
 }
 
@@ -964,7 +994,7 @@ func TestALargerWindowIsFasterAtALongRoundTrip(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			harness := newSendWindowHarnessWithClient(t, ctx, propagation,
+			harness := newLosslessSendWindowHarnessWithClient(t, ctx, propagation,
 				func(settings *SendBufferSettings) {
 					settings.WindowSizing = WindowSizingConstant
 					if sized {
@@ -993,6 +1023,11 @@ func TestALargerWindowIsFasterAtALongRoundTrip(t *testing.T) {
 			elapsed := time.Since(start)
 			if elapsed != offerWindow || delivered.Load() == 0 {
 				t.Fatalf("modeled offer delivered %d payload bytes over %s, want positive delivery over %s", delivered.Load(), elapsed, offerWindow)
+			}
+			credit := harness.wireCredit.snapshot()
+			if credit.maxPending != 1 || credit.released == 0 || credit.released > credit.transferred ||
+				credit.transferred > credit.armed || credit.armed-credit.released > 1 || credit.closed {
+				t.Fatalf("modeled lossless carrier did not preserve one actual handoff credit: %+v", credit)
 			}
 			stats := harness.sender.DestinationSendStats(harness.receiverId)
 			receiveStats := harness.receiver.ReceiveStats()

@@ -19,7 +19,7 @@ func TestTransferProductionAckOwnerDoesNotReserveCompatibilityQueue(t *testing.T
 		}
 	})
 	const owners = 32
-	var unusedSlots, dataSlots uintptr
+	var unusedSlots, sharedSlots uintptr
 	for range owners {
 		sequence := NewSendSequence(t.Context(), client, client.sendBuffer, NewId(),
 			MultiHopId{}, false, false, false, sequenceTlsRoleClient, false, settings.SendBufferSettings)
@@ -28,11 +28,15 @@ func TestTransferProductionAckOwnerDoesNotReserveCompatibilityQueue(t *testing.T
 			t.Fatal("constructor did not publish direct ACK ownership")
 		}
 		unusedSlots += uintptr(cap(sequence.acks)) * unsafe.Sizeof(receiveAckMessage{})
-		dataSlots += uintptr(cap(sequence.packs)) * unsafe.Sizeof((*SendPack)(nil))
+		if sequence.packAdmission == nil || sequence.packAdmission.capacity != 4096 ||
+			sequence.protocolAdmission == nil || sequence.protocolAdmission.capacity != 4096 {
+			t.Fatal("DATA/protocol admission capacity changed")
+		}
+		sharedSlots += uintptr(cap(sequence.packs)) * unsafe.Sizeof((*SendPack)(nil))
 	}
-	t.Logf("owners=%d compatibility_ack_bytes=%d data_channel_bytes=%d", owners, unusedSlots, dataSlots)
-	if dataSlots != owners*4096*unsafe.Sizeof((*SendPack)(nil)) {
-		t.Fatal("data admission capacity changed")
+	t.Logf("owners=%d compatibility_ack_bytes=%d shared_data_protocol_channel_bytes=%d", owners, unusedSlots, sharedSlots)
+	if sharedSlots != owners*2*4096*unsafe.Sizeof((*SendPack)(nil)) {
+		t.Fatal("shared FIFO no longer matches the two independent class capacities")
 	}
 	if unusedSlots != 0 {
 		t.Fatalf("direct ACK owners still reserve %d unused compatibility channel bytes", unusedSlots)

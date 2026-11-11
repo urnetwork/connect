@@ -249,6 +249,10 @@ func runReceiptBurstBenchmarkOwner(cancelQueued bool) (result receiptBurstBenchm
 				SequenceNumber: uint64(index), Head: index == 0, Frames: []*protocol.Frame{frame}},
 			ReceiveCallback: client.receiveCallback, Ctx: ctx, Unwrapped: true,
 			EncryptionRole: sequenceTlsRoleServer, TransportType: TransportTypeH1, MessageByteCount: ByteCount(len(packet))}
+		if !protocolOnlyReceivePack(pack) {
+			pack.messagePoolReturn()
+			return result, errors.New("benchmark SYN-only original lost protocol classification")
+		}
 		if err := gateway.expectPack(pack.Pack); err != nil {
 			pack.messagePoolReturn()
 			return result, err
@@ -267,8 +271,10 @@ func runReceiptBurstBenchmarkOwner(cancelQueued bool) (result receiptBurstBenchm
 	sequence = client.receiveBuffer.receiveSequences[receiveSequenceId{Source: source,
 		SequenceId: sequenceId, EncryptionRole: sequenceTlsRoleServer}]
 	client.receiveBuffer.mutex.Unlock()
-	if sequence == nil || len(sequence.packs) != receiptBurstBenchmarkCount || receive.ProgressObserver != nil {
-		return result, errors.New("benchmark did not establish one nil-observer queued 32-Pack burst")
+	if sequence == nil || len(sequence.protocolPacks) != receiptBurstBenchmarkCount || len(sequence.packs) != 0 ||
+		cap(sequence.protocolPacks) != receiptBurstBenchmarkCount || receive.ProgressObserver != nil ||
+		receiveBudget.UsedByteCount() != 0 || packBudget.UsedByteCount() != 0 {
+		return result, errors.New("benchmark did not establish one nil-observer queued 32-protocol-Pack burst")
 	}
 	result.queued = true
 	finalAck, diagnosticSeen := make(chan struct{}, 1), make(chan struct{}, 1)
