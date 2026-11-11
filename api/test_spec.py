@@ -138,6 +138,42 @@ class SpecTest(unittest.TestCase):
         self.assertIn(pack, card["description"])
         self.assertIn("item_unavailable", card["description"])
 
+    def test_gamma_documents_already_subscribed_and_the_deletion_refusal(self):
+        # server controller/gamma_controller.go: a Gamma plan or Gamma renewal
+        # is refused, and a plan's status is covered, with already_subscribed
+        # (the owner, 2026-11-11: never charge twice for the same period);
+        # account deletion waits for a Gamma charge in flight
+        schemas = self.spec["components"]["schemas"]
+        paths = self.spec["paths"]
+        code = schemas["GammaPaymentError"]["properties"]["code"]
+        self.assertIn("already_subscribed", code["enum"])
+        self.assertIn("already_subscribed", code["description"])
+
+        intent = paths["/pay/gamma/intent"]["post"]
+        self.assertIn("already_subscribed", intent["description"])
+        self.assertIn("replaces it", intent["description"])
+        examples = intent["responses"]["200"]["content"]["application/json"]["examples"]
+        self.assertEqual("already_subscribed", examples["renewalBeingCharged"]["value"]["error"]["code"])
+        self.assertEqual("already_subscribed", examples["otherProRenews"]["value"]["error"]["code"])
+
+        status = paths["/pay/gamma/status"]["post"]
+        self.assertIn("covered", status["description"])
+        self.assertIn("already_subscribed", status["description"])
+        covered = status["responses"]["200"]["content"]["application/json"]["examples"]["covered"]["value"]
+        self.assertEqual("seen", covered["status"])
+        self.assertEqual("already_subscribed", covered["error"]["code"])
+
+        settings = paths["/pay/gamma/settings"]["post"]
+        self.assertIn("already_subscribed", settings["description"])
+        refused = settings["responses"]["200"]["content"]["application/json"]["examples"]["otherProRenews"]["value"]
+        self.assertEqual(False, refused["auto_renew"])
+        self.assertEqual("already_subscribed", refused["error"]["code"])
+
+        delete = paths["/auth/network-delete"]["post"]
+        self.assertIn("Pay with Gamma charge in flight", delete["description"])
+        in_flight = delete["responses"]["200"]["content"]["application/json"]["examples"]["gammaChargeInFlight"]
+        self.assertIn("Gamma payment", in_flight["value"]["error"]["message"])
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

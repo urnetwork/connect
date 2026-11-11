@@ -997,6 +997,19 @@ paths:
 
         A caller that is not the network's admin is also refused with a 403,
         with the plain text body `Could not remove network`.
+
+        A deletion that cannot go ahead yet answers 200 with `error.message`
+        and removes nothing; retry once its cause is gone. The causes: an App
+        Store subscription that may still renew (only its owner can cancel it,
+        in the App Store), a Stripe or Google Play subscription that could not
+        be cancelled, a store renewal credited while the deletion ran, and a
+        Pay with Gamma charge in flight: a spend from the network's gamma
+        deposit in a spend batch that can still land, or spent and not yet
+        credited. Gamma cannot be refunded, so the deletion waits for that
+        charge to be credited, minutes at most. Retried then, it deletes the
+        network, turns its automatic gamma renewal, top-up and seat upgrade
+        off, and voids its open gamma purchases; the deposit is on chain and
+        keeps its gamma.
       operationId: authNetworkDelete
       security:
         - BearerAuth: []
@@ -1007,6 +1020,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkDeleteResult"
+              examples:
+                deleted:
+                  summary: Deleted
+                  value: {}
+                gammaChargeInFlight:
+                  summary: Refused while a Gamma charge is in flight
+                  value:
+                    error:
+                      message: A Gamma payment for your account is still being processed, so your account was not deleted. Please try again in a few minutes.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
         "409":
@@ -4687,11 +4709,39 @@ paths:
         purchase needs; `auto_min_daily_cap_gamma` the cap the automatic
         charges need.
 
+        A plan is never charged for days another Pro payment pays for:
+
+        - Beside another Pro subscription that renews (the App Store, Google
+          Play, or a card subscription, also one whose renewal Stripe is still
+          retrying), a plan is refused (`already_subscribed`); a prepaid
+          crypto year refuses nothing. A plan started before such a
+          subscription began waits while it pays for the days the plan would
+          buy, and is charged only if it ends before the purchase expires.
+        - A plan bought while the network's Gamma renewal (or an automatic
+          upgrade at the client limit) waits to be charged replaces it: the
+          renewal waits while the purchase is open, is voided once the
+          purchase is paid, and goes ahead if the purchase expires unpaid.
+        - While a Gamma payment for the network's Pro plan is being charged
+          (its renewal, an upgrade at the client limit, or another plan), a
+          plan is refused (`already_subscribed`): that spend may still land,
+          so it cannot be voided. Asking again for the purchase being charged
+          returns it. Check again in a few minutes.
+        - A plan purchase made before another Gamma plan of the network was
+          paid is never charged: of two plans opened together, the first the
+          deposit can pay is charged and the other is not. Its status says so
+          (`already_subscribed`).
+
+        Otherwise a plan bought while the network has a paid Gamma plan starts
+        at once, as an upgrade; the rest of the paid term is not carried over.
+        A data pack is not Pro, and is sold beside any of these.
+
         A refusal returns `error` with a 200 (GammaPaymentError):
         `invalid_request`, `asset_unavailable` (purchases are off, or minting
         is off while the deposit cannot already pay: `mint_unavailable_reason`
         says why), `plan_unavailable`, `item_unavailable`,
         `guest_sign_in_required` (plans only), `offer_unavailable`,
+        `already_subscribed` (plans only: another Pro subscription renews, or
+        a Gamma payment for the network's Pro plan is being charged),
         `invalid_email`, `deposit_coldkey_mismatch` (every hotkey of the
         account belongs to another coldkey), `rate_limited` or
         `start_failed`.
@@ -4785,6 +4835,18 @@ paths:
                     error:
                       code: asset_unavailable
                       message: "Minting gamma is paused: the chain's TAO/USD price is more than 300 blocks old. Try again later, or pay with TAO or x402."
+                renewalBeingCharged:
+                  summary: A plan while the Gamma renewal is being charged
+                  value:
+                    error:
+                      code: already_subscribed
+                      message: "A Gamma payment for your Pro plan is being charged now (its renewal, an upgrade at your client limit, or a plan you bought), so no Gamma payment was started: paying for a plan as well would charge you twice for the same days. Check again in a few minutes, once it is paid."
+                otherProRenews:
+                  summary: A plan beside another Pro subscription that renews
+                  value:
+                    error:
+                      code: already_subscribed
+                      message: "You already have a Pro subscription that renews, so no Gamma payment was started: paying with Gamma as well would charge you twice for the same days. Cancel that subscription, then pay with Gamma once it has ended."
         "401":
           description: Missing or invalid bearer token.
 
@@ -4807,6 +4869,15 @@ paths:
           run spends it.
         - `expired`: past `expires_at` with nothing spent (`quote_expired`).
           Unspent gamma stays in the deposit for the next purchase.
+        - covered, a plan only: `seen` (`pending` with no gamma at the hotkey
+          yet) with `error.code` `already_subscribed`. Another payment pays
+          for the days the plan would buy, so it is not charged now, whatever
+          the deposit holds; `error.message` says which: another Pro
+          subscription pays for or still bills those days (the plan is charged
+          only if that one ends before `expires_at`), another Gamma payment for
+          the network's Pro plan is being charged (if that one is paid, this
+          one is not), or another Gamma plan was paid after this purchase
+          started (it is never charged; unspent gamma stays in the deposit).
         - `seen`: the deposit holds gamma but cannot pay yet: less than the
           price (`remaining_gamma` is how much more to mint), a daily cap
           below the price (`daily_cap_too_low`; raise it to at least
@@ -4880,6 +4951,18 @@ paths:
                     error:
                       code: insufficient_gamma
                       message: The deposit held less gamma than the price when we spent. Mint more; we try again once the deposit changes.
+                covered:
+                  summary: A plan another payment pays for
+                  value:
+                    intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                    status: seen
+                    plan: yearly
+                    amount_gamma: "40"
+                    deposit_balance_gamma: "45"
+                    remaining_gamma: "0"
+                    error:
+                      code: already_subscribed
+                      message: "Another Gamma payment for your Pro plan was paid after this one was started, so this one is not charged: both would pay for the same days."
         "429":
           description: Too many requests from this address this minute. Plain text body.
 
@@ -4893,16 +4976,23 @@ paths:
 
         - `auto_renew`: at the end of each term of a plan paid with gamma,
           charge the plan's current price from the deposit (`renew_plan`;
-          a welcome-offer year renews at the yearly price). Unless the network
-          pays for Pro elsewhere past that term.
+          a welcome-offer year renews at the yearly price). Not while another
+          Pro subscription of the network pays for or still bills those days
+          (the App Store, Google Play, or a card subscription, also one whose
+          renewal Stripe is still retrying): the renewal waits, and when that
+          one ends within the term's 30-day grace, the new term starts where
+          it ended. A Gamma plan bought while the renewal waits replaces it
+          (/pay/gamma/intent).
         - `auto_topup`: when the data balance runs out, or will within the
           next check, buy `topup_item_id` (`data_1tib` unless set; any pack
           Gamma sells), at most one an hour; and when a free account hits
           its client limit (`client_limit_exceeded` with
           `upgrade_required`), buy Pro
-          (`renew_plan`, else `monthly`), at most once a day. A Pro account at
+          (`renew_plan`, else `monthly`), at most once a day, unless another
+          Pro subscription already pays for or still bills now. A Pro account at
           its limit gets the error as before. An automatic upgrade never
-          changes how the network provides.
+          changes how the network provides; a Gamma plan bought while it waits
+          replaces it, as it does a renewal.
 
         `monthly_limit_gamma` caps what the automatic charges take in a
         calendar month (UTC; "" for no limit); `month_spent_gamma` is this
@@ -4945,8 +5035,13 @@ paths:
         (`data_1tib`, `data_10tib` or `data_256gib`) and the monthly limit (a
         decimal amount of gamma; "0" or "" removes it). A field left out is
         unchanged. The answer is the settings as they now are; a refusal
-        returns `error` (`item_unavailable`, `invalid_request`). Network
-        credential only.
+        returns `error` and applies nothing in the request:
+        `item_unavailable`, `invalid_request`, or `already_subscribed` for
+        `auto_renew: true` while another Pro subscription of the network
+        renews (the App Store, Google Play, or a card subscription, also one
+        whose renewal Stripe is still retrying): both would bill the same
+        days. That answer carries the settings unchanged. Turning automatic
+        renewal off is always allowed. Network credential only.
       operationId: gammaSetSettings
       security:
         - BearerAuth: []
@@ -4969,6 +5064,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GammaSettingsResult"
+              examples:
+                otherProRenews:
+                  summary: Renewal not turned on beside another renewing subscription
+                  value:
+                    auto_renew: false
+                    auto_topup: true
+                    topup_item_id: data_1tib
+                    monthly_limit_gamma: ""
+                    month_spent_gamma: "0"
+                    renew_plan: monthly
+                    deposit_hotkey: "<deposit_hotkey>"
+                    deposit_hotkeys: ["<deposit_hotkey>"]
+                    error:
+                      code: already_subscribed
+                      message: "You have another Pro subscription that renews, so Gamma renewal was not turned on: both would charge you for the same days. Cancel that subscription, then turn Gamma renewal on once it has ended."
         "401":
           description: Missing or invalid bearer token.
         "403":
@@ -25568,7 +25678,11 @@ components:
             The PurchaseError codes `invalid_request`, `asset_unavailable`,
             `plan_unavailable`, `item_unavailable`, `offer_unavailable`,
             `guest_sign_in_required`, `invalid_email`, `rate_limited`,
-            `start_failed` and `quote_expired`, and Gamma's own:
+            `start_failed` and `quote_expired`; `already_subscribed`: a plan
+            (or Gamma renewal) refused, or a plan's status covered, because
+            another payment pays for or bills the same days (another Pro
+            subscription that renews, or another Gamma payment for the
+            network's Pro plan); and Gamma's own:
             `insufficient_gamma`: the deposit holds, or held when we spent,
             less gamma than the price.
             `daily_cap_exceeded`: the deposit's daily spend cap did not allow
@@ -25587,6 +25701,6 @@ components:
             to `mint_liquidity_exceeded`, `SlippageTooHigh` (less than the
             mint's minimum) to `mint_slippage`, `TaoUsdPriceUnavailable` and
             `GammaDisabled` to `asset_unavailable`.
-          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
+          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
         message:
           type: string
