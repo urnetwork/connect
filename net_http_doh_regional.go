@@ -52,9 +52,8 @@ type RegionalDnsServer struct {
 // 99% of the time on nine networks, TCI and MCI among them, and plain UDP to
 // 1.1.1.1 answered 94% of queries on eight networks (TCI, MCI, RighTel,
 // Respina, Shatel, Farahoosh, FDI and Afagh), blocked names with Iran's
-// injected 10.10.34.x.
-// Shecan's second address (185.51.200.2) answers no recursive query from
-// outside, and neither operator publishes a v6 resolver.
+// injected 10.10.34.x. Shecan's second address (185.51.200.2) answers no
+// recursive query from outside, and no v6 resolver of either is known.
 //
 // tr's recommendation is Cloudflare and Quad9, as kz's. Until 2026-11-11 it
 // named TTNET (195.175.39.39) and Turkcell Superonline (212.252.114.8), which
@@ -63,7 +62,7 @@ type RegionalDnsServer struct {
 // Cloudflare places in Germany), TTNET's resolvers answered only the 2E
 // Telekom exit, Superonline's no exit, and TurkNet's own only TurkNet's.
 // 1.1.1.1 answered on all 13 exits that carried udp and 9.9.9.10 on 9; the
-// other 4, all on one network, answered only 1.1.1.1. Their answers were
+// other 4, all on one network, answered only Cloudflare's. Their answers were
 // right and none was intercepted; only the ISP resolvers answered with
 // Turkey's block address (discord.com as 195.175.254.2). In OONI from Turkey
 // (Oct-Nov 2026) plain UDP to their v4 addresses answered 99% of queries on
