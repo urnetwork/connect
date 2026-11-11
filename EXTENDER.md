@@ -4250,6 +4250,13 @@ nothing, and every webrtc test was refused.
   (`WebRtcManager.RemoveExtenderCarrierAnswerer`), so a successor's stays.
   A role that started on the carrier without tcp 443 has no tcp carrier to
   lose, so it is not replaced every three minutes for one.
+- Operators that predate the carrier. Such an operator's carrier check
+  refuses a list naming webrtc, `unknown carrier "webrtc"`, before it
+  probes or spends anything. The activator then posts the same list again at
+  once without the carrier and leaves the carrier off for that operator for
+  its life (`ExtenderActivator`), so the miner's other operators, and an api
+  not yet deployed, still activate the socket carriers; a host serving
+  webrtc alone is held for its carriers there, as before.
 - connectctl. `connectctl extender --webrtc` connects a client under its
   client jwt to `--connect_url` and answers on its manager; the server lists
   the carrier and a run without a tcp bind serves on it. That client
@@ -4258,10 +4265,13 @@ nothing, and every webrtc test was refused.
   signals ride a contract to it, do not.
 - Deploy order. The connect service first (the residents' listener and the
   `{*}w_offer` pattern), then the api, alt (which mounts the api router) and
-  the taskworker (the prober); the clients and the miner through the
-  nightly's sdk. An api ahead of the connect processes finds no listener:
-  the offer expires, the webrtc test fails as it did before, and tcp is
-  unaffected. No migration, no services version, no rpc version.
+  the taskworker (the prober), and only then the clients and the miner,
+  through the nightly's sdk, whose role offers the carrier by default: an
+  api that predates it answers each role's first post of each family with
+  the unknown-carrier refusal above, one round trip lost per role. An api
+  ahead of the connect processes finds no listener: the offer expires, the
+  webrtc test fails as it did before, and tcp is unaffected. No migration,
+  no services version, no rpc version.
 - Tests. connect: the gate and the resolver of the dial signaling, an offer
   resolved through it reaching the extender over the bridged signaling, the
   dialer's port, outer name, shaping and priority, the directory's failure
