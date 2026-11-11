@@ -148,7 +148,8 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`;
   malware filter at 9.9.9.9 is not among them (2026-11-08).
 - History: Google Public DNS left the defaults in connect `b49cbc21`
   (`fix/no-google-dns`), and kz's regional entry (Google) became Cloudflare
-  and Quad9; tm keeps Turkmentelecom alone. OpenDNS left them on
+  and Quad9; tm kept Turkmentelecom alone (until 2026-11-11, see version 4
+  below). OpenDNS left them on
   `fix/default-resolvers-v2`: it refuses French clients (REFUSED, EDE 16),
   has left Portugal and Belgium, answers blocks with ordinary records,
   forwards the client's /24 as ECS, and its free terms are marked expired.
@@ -228,7 +229,8 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`;
   record without it whose list holds exactly the servers of a Google-era
   default list (2026-07-02 to 2026-11-08), in any order, loads with the
   current default list, keeping the saved order of the servers that remain;
-  so does the old tm recommendation (Turkmentelecom and Google). Version 2
+  so did the old tm recommendation (Turkmentelecom and Google), until
+  version 4. Version 2
   (`fix/default-resolvers-v2`): a record below version 2 holding exactly an
   OpenDNS-era default list loads with the current list too. In every
   migrated list Quad9's 9.9.9.10 takes the place of its 9.9.9.9, and the
@@ -266,6 +268,22 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`;
   exactly that Google-only list moves too. Any other list with Google loads
   as saved, and so does the Google-only list in a record at version 3, which
   can only be a choice made after the move.
+- Version 4 (`fix/regional-dns-ir-tr-tm-1111`, 2026-11-11): ir's regional
+  recommendation names Shecan and Electro instead of Shecan and 403.online's
+  private 10.202.10.10, which no query through the tunnel reaches; tr's names
+  Cloudflare and Quad9's 9.9.9.10, as kz's, instead of TTNET's and Turkcell
+  Superonline's resolvers, which answer only their own customers; and tm has
+  none, since Turkmentelecom refuses outside clients and answers the
+  platform's own names with 127.0.0.1 (`net_http_doh_regional.go` records
+  the measurements). In sdk a record from before the presets that holds an
+  earlier ir, tr or tm recommendation exactly (remote plain DNS alone, the
+  tm one with or without Google, servers in any order, any fallback choice
+  and mask) loads as that country's regional pick, so ir and tr follow
+  today's lists and `regional-tm` applies URnetwork's default with its
+  notice. The edit rule reads a regional selection holding an earlier
+  recommendation of its country as that release's derivation
+  (`dnsResolverSettingsEarlierRegionalRecommendations`). The Google-era tm
+  pair no longer migrates to the current tm list, which tm no longer has.
 - mmm updated the ur.io threat model's resolver rows to match
   (`927c0bd04`); DNS.SB's rows are a follow-up there.
 

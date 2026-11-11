@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Regional bootstrap DoH tests (`DohSettings.RegionalRemoteDoh`): in a country
@@ -239,5 +241,235 @@ func TestRuRecommendationResolvesThroughEveryServer(t *testing.T) {
 		if !slices.Contains(dialed, server) {
 			t.Fatalf("server %s was never asked: %v", server, dialed)
 		}
+	}
+}
+
+// The resolvers the 2026-11-11 measurements found unable to answer an exit in
+// their country, which no recommendation may name again: 403.online's
+// 10.202.10.10, a private address no query through the tunnel reaches; the
+// resolvers of TTNET (195.175.39.39, 195.175.39.40) and Turkcell Superonline
+// (212.252.114.8), which answer only their own networks' customers; and
+// Turkmentelecom's (217.174.238.141), which refuses clients outside its
+// network and answers the platform's own names with 127.0.0.1. The addresses
+// are the operators' published resolver constants, the subject of the test,
+// not live configuration.
+var testRegionalDnsServersUnableToAnswerExits = []string{
+	"10.202.10.10",
+	"195.175.39.39",
+	"195.175.39.40",
+	"212.252.114.8",
+	"217.174.238.141",
+}
+
+// The countries of the tests below: every connection region, the countries
+// whose recommendation changed on 2026-11-11, and undisclosed.
+func testRegionalDnsCountryCodes() []string {
+	countryCodes := slices.Concat(IngressCountryCodes(), []string{"ir", "tr", "tm", ""})
+	slices.Sort(countryCodes)
+	return slices.Compact(countryCodes)
+}
+
+// Every regional server, as a udp query to port 53 from a public relationship,
+// passes both roles' egress policy: the client's, which drops what it refuses
+// before it leaves the device, and the provider's. A server the policy refuses
+// can never answer the egress recommendation through the tunnel. ir named
+// 403.online's private 10.202.10.10 until 2026-11-11, an incident in both
+// roles.
+func TestRegionalDnsServersPassTheEgressPolicy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	query := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 1, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	payload, err := query.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policies := testConsumerEgressPolicies(t, ctx, "198.51.100.0/24")
+	for _, server := range RegionalDnsServers() {
+		for _, address := range []string{server.Ipv4, server.Ipv6} {
+			if address == "" {
+				continue
+			}
+			addr, err := netip.ParseAddr(address)
+			if err != nil {
+				t.Errorf("%s %s names %q, which is not an address", server.CountryCode, server.Name, address)
+				continue
+			}
+			if !isPublicUnicastAddr(addr) {
+				t.Errorf("%s %s names %s, which is not public", server.CountryCode, server.Name, address)
+			}
+			version := 4
+			if addr.Is6() {
+				version = 6
+			}
+			for role, policy := range policies {
+				path := testEgressPath(version, address)
+				path.Protocol = IpProtocolUdp
+				path.DestinationPort = 53
+				path.Syn = false
+				if r, _ := policy.InspectEgress(protocol.ProvideMode_Public, path, payload); r != SecurityPolicyResultAllow {
+					t.Errorf("%s %s: %s policy judges a udp query to %s:53 %s, want allow", server.CountryCode, server.Name, role, address, r)
+				}
+			}
+		}
+	}
+}
+
+// ir's recommendation is Shecan and Electro, in that order, v4 only: neither
+// publishes a v6 resolver.
+func TestIrRecommendationIsShecanAndElectro(t *testing.T) {
+	if got, want := RegionalDnsServerIps("ir"), []string{"178.22.122.100", "78.157.42.100"}; !slices.Equal(got, want) {
+		t.Errorf("ir v4 recommendation = %v, want %v", got, want)
+	}
+	if got := RegionalDnsServerIpv6s("ir"); len(got) != 0 {
+		t.Errorf("ir v6 recommendation = %v, want none", got)
+	}
+	if strategy := IngressDnsStrategyForCountry("ir"); !slices.Equal(strategy.PlainDnsIpv4, []string{"178.22.122.100", "78.157.42.100"}) || len(strategy.PlainDnsIpv6) != 0 {
+		t.Errorf("ir ingress plain dns = %v %v, want the recommendation", strategy.PlainDnsIpv4, strategy.PlainDnsIpv6)
+	}
+}
+
+// tr's recommendation is Cloudflare and Quad9's unfiltered 9.9.9.10, as kz's,
+// in both families, each v6 server paired with its operator's v4 one so the
+// dual-stack walk keeps both.
+func TestTrRecommendationIsCloudflareAndQuad9(t *testing.T) {
+	ipv4 := RegionalDnsServerIps("tr")
+	ipv6 := RegionalDnsServerIpv6s("tr")
+	if want := []string{"1.1.1.1", "9.9.9.10"}; !slices.Equal(ipv4, want) {
+		t.Errorf("tr v4 recommendation = %v, want %v", ipv4, want)
+	}
+	if want := []string{"2606:4700:4700::1111", "2620:fe::10"}; !slices.Equal(ipv6, want) {
+		t.Errorf("tr v6 recommendation = %v, want %v", ipv6, want)
+	}
+	if want := []string{"1.1.1.1", "2606:4700:4700::1111", "9.9.9.10", "2620:fe::10"}; !slices.Equal(dualStackList(ipv4, ipv6, knownDnsServerPairs), want) {
+		t.Errorf("tr dual-stack walk = %v, want %v", dualStackList(ipv4, ipv6, knownDnsServerPairs), want)
+	}
+	if strategy := IngressDnsStrategyForCountry("tr"); !slices.Equal(strategy.PlainDnsIpv4, ipv4) || !slices.Equal(strategy.PlainDnsIpv6, ipv6) {
+		t.Errorf("tr ingress plain dns = %v %v, want the recommendation", strategy.PlainDnsIpv4, strategy.PlainDnsIpv6)
+	}
+}
+
+// tm has no recommendation and is no connection region: a user who declared
+// it is undisclosed, with the defaults' bootstrap plain servers, and the
+// tunnel uses the default resolvers.
+func TestTmHasNoRecommendation(t *testing.T) {
+	if resolver := RegionalDnsResolverSettings("tm"); resolver != nil {
+		t.Errorf("tm recommendation = %+v, want none", resolver)
+	}
+	if slices.Contains(IngressCountryCodes(), "tm") {
+		t.Errorf("tm is a connection region: %v", IngressCountryCodes())
+	}
+	strategy := IngressDnsStrategyForCountry("tm")
+	if 0 < len(strategy.DohUrlsIpv4) || 0 < len(strategy.DohUrlsIpv6) || 0 < len(strategy.PlainDnsIpv4) || 0 < len(strategy.PlainDnsIpv6) {
+		t.Errorf("tm ingress strategy = %+v, want the defaults", strategy)
+	}
+	for _, network := range []string{"udp", "udp4", "udp6", "tcp"} {
+		if got, want := bootstrapPlainDnsServers(IngressDohSettings("tm", nil, nil), network), bootstrapPlainDnsServers(IngressDohSettings("", nil, nil), network); !slices.Equal(got, want) {
+			t.Errorf("tm bootstrap plain dns %s = %v, want the undisclosed %v", network, got, want)
+		}
+	}
+}
+
+// No regional recommendation, bootstrap preset, ingress strategy or bootstrap
+// plain fallback of any country names a resolver that could not answer an
+// exit in its country (testRegionalDnsServersUnableToAnswerExits).
+func TestNoRegionalListNamesAServerUnableToAnswerExits(t *testing.T) {
+	lists := map[string][]string{}
+	for _, server := range RegionalDnsServers() {
+		lists["regionalDnsServers."+server.CountryCode+"."+server.Name] = []string{server.Ipv4, server.Ipv6}
+	}
+	for _, countryCode := range testRegionalDnsCountryCodes() {
+		prefix := "[" + countryCode + "]"
+		for name, list := range testResolverLists(prefix+"RegionalDnsResolverSettings", RegionalDnsResolverSettings(countryCode)) {
+			lists[name] = list
+		}
+		strategy := IngressDnsStrategyForCountry(countryCode)
+		lists[prefix+"IngressDnsStrategy.PlainDnsIpv4"] = strategy.PlainDnsIpv4
+		lists[prefix+"IngressDnsStrategy.PlainDnsIpv6"] = strategy.PlainDnsIpv6
+		for _, network := range []string{"udp", "udp4", "udp6", "tcp"} {
+			lists[prefix+"bootstrapPlainDnsServers."+network] = bootstrapPlainDnsServers(IngressDohSettings(countryCode, nil, nil), network)
+		}
+	}
+	for name, list := range lists {
+		for _, server := range list {
+			if slices.Contains(testRegionalDnsServersUnableToAnswerExits, server) {
+				t.Errorf("%s names %s, which cannot answer an exit in its country", name, server)
+			}
+		}
+	}
+}
+
+// Every lookup through every country's recommendation resolves on the first
+// server it asks, from an exit on any network of the country. The dialer
+// models such an exit as measured on 2026-11-11: a server that is not public
+// never answers (the egress policy drops the query before it leaves the
+// device), and neither does a resolver that answers only its own network's
+// customers (testRegionalDnsServersUnableToAnswerExits); every other server
+// answers. The plain dns path takes the next server for each resolver attempt,
+// so with tr's TTNET and Superonline no lookup resolved, and with ir's
+// 10.202.10.10 every other lookup spent an attempt, a resolver timeout on a
+// device, before it reached Shecan. The names are rooted, so the host's
+// resolv.conf search list adds no lookups, and nothing leaves the process.
+func TestRegionalRecommendationsResolveOnTheFirstServerFromAnyExit(t *testing.T) {
+	answer := [4]byte{192, 0, 2, 42}
+	for _, countryCode := range testRegionalDnsCountryCodes() {
+		resolver := RegionalDnsResolverSettings(countryCode)
+		if resolver == nil {
+			continue
+		}
+		settings := DefaultDohSettings()
+		settings.IpVersion = 4
+		settings.DnsResolverSettings = resolver
+		names := []string{}
+		for i := range 2*len(resolver.RemoteDnsIpv4) + 1 {
+			names = append(names, fmt.Sprintf("%s-lookup-%d.example.", countryCode, i))
+		}
+		var dialLock sync.Mutex
+		dialed := []string{}
+		var serving sync.WaitGroup
+		settings.DialContextSettings = &DialContextSettings{DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil || port != "53" || !strings.HasPrefix(network, "udp") {
+				return nil, errors.New("unexpected regional dns dial")
+			}
+			dialLock.Lock()
+			dialed = append(dialed, host)
+			dialLock.Unlock()
+			addr, err := netip.ParseAddr(host)
+			if err != nil || !isPublicUnicastAddr(addr) || slices.Contains(testRegionalDnsServersUnableToAnswerExits, host) {
+				return nil, &net.OpError{Op: "read", Net: network, Err: errors.New("i/o timeout")}
+			}
+			client, server := net.Pipe()
+			serving.Add(1)
+			go func() {
+				defer serving.Done()
+				serveRegionalDnsQuery(t, server, host, names, answer)
+			}()
+			return client, nil
+		}}
+		cache := NewDohCache(settings)
+		for i, name := range names {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			addrs, authoritative := cache.QueryResult(ctx, "A", name)
+			cancel()
+			if !authoritative || len(addrs) != 1 || addrs[0] != netip.AddrFrom4(answer) {
+				t.Errorf("%s lookup %d did not resolve: addrs=%v authoritative=%t", countryCode, i, addrs, authoritative)
+			}
+		}
+		cache.Close()
+		serving.Wait()
+		dialLock.Lock()
+		if len(dialed) != len(names) {
+			t.Errorf("%s: %d lookups dialed %d times, want one dial each: %v", countryCode, len(names), len(dialed), dialed)
+		}
+		for _, server := range resolver.RemoteDnsIpv4 {
+			if !slices.Contains(dialed, server) {
+				t.Errorf("%s: server %s was never asked: %v", countryCode, server, dialed)
+			}
+		}
+		dialLock.Unlock()
 	}
 }

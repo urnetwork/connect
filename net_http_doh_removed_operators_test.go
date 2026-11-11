@@ -253,10 +253,13 @@ func TestNoRegionalOrBootstrapListNamesARemovedOperator(t *testing.T) {
 
 // Removing operators left no regional recommendation empty: every country
 // that had one keeps one, stays offered as a connection region, and pairs each
-// v6 server with its v4 one so the dual-stack walk keeps both.
+// v6 server with its v4 one so the dual-stack walk keeps both. tm kept
+// Turkmentelecom alone through the removal and lost its recommendation on
+// 2026-11-11, when nothing could be verified from inside
+// (TestTmHasNoRecommendation).
 func TestRegionalRecommendationsSurviveGoogleRemoval(t *testing.T) {
 	ingressCountryCodes := IngressCountryCodes()
-	for _, countryCode := range []string{"cn", "ru", "ir", "tr", "kz", "tm"} {
+	for _, countryCode := range []string{"cn", "ru", "ir", "tr", "kz"} {
 		if !slices.Contains(ingressCountryCodes, countryCode) {
 			t.Errorf("%s is no longer an ingress country: %v", countryCode, ingressCountryCodes)
 		}
