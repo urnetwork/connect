@@ -26,11 +26,21 @@ type RegionalDnsServer struct {
 // the measurements were of its filtering 9.9.9.9, the same operator and
 // anycast network. tm keeps Turkmentelecom alone until another resolver is
 // verified from there.
+//
+// ru's National DNS (NSDI) entries are its public recursive resolvers,
+// a.res-nsdi.ru and b.res-nsdi.ru. Until 2026-11-11 the list named
+// 195.208.6.1, which is a.auth-nsdi.ru, an authoritative server of NSDI's
+// root zone: it answers every query with a referral and offers no recursion,
+// and Go's resolver, which the remote plain dns path uses, reads a referral
+// with glue as no such host, so a lookup that reached it failed as an
+// authoritative miss. Their published v6 addresses (2a0c:a9c7:8::1 and
+// 2a0c:a9c7:9::1) are left out until they are checked over v6.
 var regionalDnsServers = []*RegionalDnsServer{
 	{CountryCode: "cn", Name: "Alidns", Ipv4: "223.5.5.5", Ipv6: "2400:3200::1"},
 	{CountryCode: "cn", Name: "DNSPod/Tencent", Ipv4: "119.29.29.29", Ipv6: "2402:4e00::"},
 	{CountryCode: "ru", Name: "Yandex.DNS", Ipv4: "77.88.8.8", Ipv6: "2a02:6b8::feed:0ff"},
-	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.6.1"},
+	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.4.1"},
+	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.5.1"},
 	{CountryCode: "ir", Name: "Shecan", Ipv4: "178.22.122.100"},
 	{CountryCode: "ir", Name: "403.online", Ipv4: "10.202.10.10"},
 	{CountryCode: "tr", Name: "TTNET", Ipv4: "195.175.39.39"},
