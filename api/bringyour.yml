@@ -163,6 +163,10 @@ tags:
       - inline agent payments over the x402 header protocol (`/x402`): an
         agent asks for a sku, is answered `402` with the payment terms, and
         retries the same request with a signed payment in `X-PAYMENT`
+      - Pay with Gamma (`/pay/gamma`): Pro and data paid from an SN25 gamma
+        deposit at a hotkey URnetwork assigns the account, with the terms,
+        the services document SN25's on-chain service record points at, each
+        purchase's status and the automatic renewal and top-up switches
       - the subnet (`/sn`): payout wallets and their consents, head mining,
         pool claims and epochs, the public, content-addressed payout
         artifacts, settlement v2 ledger objects and release evidence,
@@ -4325,6 +4329,527 @@ paths:
           description: x402 is not configured or not enabled on this deployment.
         "502":
           description: Settlement failed at the facilitator.
+
+  # ----- Pay with Gamma (SN25 gamma deposits; mmm/BTCPAY.md §18) -----
+
+  /pay/gamma/services.json:
+    get:
+      tags: [Other]
+      summary: Gamma Services Document
+      description: |
+        The services document that SN25's on-chain service record
+        (`set_service` on the owner hotkey) points at, in the Bittensor
+        services format: what URnetwork serves, where its API and this spec
+        are, and how it is paid for, by SN25 gamma (`gamma`) or over the x402
+        header protocol (`x402`, see /x402/skus). Readers skip fields and
+        types they do not know. `max_spend` is the most one gamma charge
+        takes. Served with `Access-Control-Allow-Origin: *`, so web apps can
+        read it. Unauthenticated.
+      operationId: gammaServices
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaServicesDocument"
+              examples:
+                document:
+                  summary: The document
+                  value:
+                    version: 1
+                    name: URnetwork
+                    description: A decentralized VPN and proxy network. UR Pro plans and data, paid from an SN25 gamma deposit or over x402, entirely by API.
+                    publishers:
+                      - netuid: 25
+                        hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
+                    services:
+                      - type: openapi
+                        endpoint: https://api.bringyour.com
+                        spec: https://ur.io/api/bringyour.yml
+                    payments:
+                      - type: gamma
+                        max_spend: "40"
+                        terms: https://api.bringyour.com/pay/gamma/terms
+                      - type: x402
+                        skus: https://api.bringyour.com/x402/skus
+
+  /pay/gamma/terms:
+    get:
+      tags: [Other]
+      summary: Gamma Terms
+      description: |
+        What paying with SN25 gamma takes now. Gamma is a Bittensor chain
+        feature, not an app or a wallet: a coldkey mints a subnet's gamma by
+        burning its alpha (bought with TAO, or taken from stake) into a
+        deposit keyed by a hotkey, one gamma per US dollar, and the subnet's
+        service spends it. URnetwork accepts SN25 gamma only.
+
+        - `available`: purchases are on. Otherwise `unavailable_reason`:
+          `not_configured`, `chain_unreachable` (the biller cannot read the
+          chain, or has not run for three minutes), `runtime_unsupported` (the
+          chain runs a runtime whose Gamma calls or events are not as
+          reviewed; billing pauses until it is reviewed),
+          `service_not_published`, `service_spender_mismatch`,
+          `billing_proxy_missing`, `fee_float_low`, `watcher_behind` or
+          `batch_in_review`.
+        - `mint_available`: minting works now. Otherwise
+          `mint_unavailable_reason`: `gamma_disabled` (off network-wide),
+          `subnet_gamma_disabled` (SN25 has not switched gamma on),
+          `price_stale` (the chain's TAO/USD oracle last fed more than
+          `max_price_age_blocks`, 300 blocks, ago: every mint fails with
+          `TaoUsdPriceUnavailable` until it feeds again; pay with a coin or
+          x402 meanwhile). A deposit that already holds the price can still
+          pay while minting is off.
+        - `items`: each plan and data pack at the caller's price tier, with
+          its price in gamma (one gamma per dollar), the daily spend cap a
+          deposit needs for it (`min_daily_cap_gamma`: a spend takes its
+          whole amount or is skipped, so the cap must allow the price), and an
+          indicative TAO amount (`indicative_tao`) from the chain's own
+          simulation of a mint, plus 3%; "" while minting is off. Plans renew
+          (`renews`).
+        - `auto_min_daily_cap_gamma`: the daily cap that lets every
+          automatic charge (a renewal, a top-up, a seat upgrade) be spent.
+
+        `disclaimer` is the wording every surface shows; `automatic_notice`
+        says what is charged automatically. Unauthenticated.
+      operationId: gammaTerms
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaTermsResult"
+              examples:
+                live:
+                  summary: Purchases on, minting on
+                  value:
+                    available: true
+                    mint_available: true
+                    netuid: 25
+                    service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
+                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    services_url: https://api.bringyour.com/pay/gamma/services.json
+                    price_tier: standard
+                    tao_usd: "217.808001475"
+                    price_age_blocks: 42
+                    max_price_age_blocks: 300
+                    min_mint_gamma: "0.1"
+                    finalized_block: 9479625
+                    items:
+                      - plan: monthly
+                        price_gamma: "5"
+                        price_usd: 5
+                        min_daily_cap_gamma: "5"
+                        renews: true
+                        indicative_tao: "0.023645"
+                      - plan: yearly
+                        price_gamma: "40"
+                        price_usd: 40
+                        min_daily_cap_gamma: "40"
+                        renews: true
+                        indicative_tao: "0.189165"
+                      - item_id: data_1tib
+                        price_gamma: "3"
+                        price_usd: 3
+                        min_daily_cap_gamma: "3"
+                        renews: false
+                        indicative_tao: "0.014187"
+                      - item_id: data_10tib
+                        price_gamma: "20"
+                        price_usd: 20
+                        min_daily_cap_gamma: "20"
+                        renews: false
+                        indicative_tao: "0.094583"
+                    auto_min_daily_cap_gamma: "40"
+                    disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
+                    automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
+                    updated_at: "2026-11-11T12:00:00Z"
+                staleOracle:
+                  summary: Minting paused by a stale oracle
+                  description: >-
+                    Existing deposits can still pay (`available`), but no new
+                    gamma can be minted until the TAO/USD oracle feeds again,
+                    so `indicative_tao` is empty.
+                  value:
+                    available: true
+                    mint_available: false
+                    mint_unavailable_reason: price_stale
+                    netuid: 25
+                    service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
+                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    services_url: https://api.bringyour.com/pay/gamma/services.json
+                    price_tier: standard
+                    tao_usd: "217.808001475"
+                    price_age_blocks: 1210
+                    max_price_age_blocks: 300
+                    min_mint_gamma: "0.1"
+                    finalized_block: 9479410
+                    items:
+                      - plan: monthly
+                        price_gamma: "5"
+                        price_usd: 5
+                        min_daily_cap_gamma: "5"
+                        renews: true
+                        indicative_tao: ""
+                      - plan: yearly
+                        price_gamma: "40"
+                        price_usd: 40
+                        min_daily_cap_gamma: "40"
+                        renews: true
+                        indicative_tao: ""
+                      - item_id: data_1tib
+                        price_gamma: "3"
+                        price_usd: 3
+                        min_daily_cap_gamma: "3"
+                        renews: false
+                        indicative_tao: ""
+                      - item_id: data_10tib
+                        price_gamma: "20"
+                        price_usd: 20
+                        min_daily_cap_gamma: "20"
+                        renews: false
+                        indicative_tao: ""
+                    auto_min_daily_cap_gamma: "40"
+                    disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
+                    automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
+                    updated_at: "2026-11-10T19:30:00Z"
+
+  /pay/gamma/intent:
+    post:
+      tags: [Other]
+      summary: Gamma Payment Intent
+      description: |
+        Start a purchase paid from the signed-in network's SN25 gamma
+        deposit: Pro `monthly`, `yearly` or `yearly_onboarding` (the welcome
+        offer, while redeemable), or a data pack (`data_1tib`,
+        `data_10tib`), to the network (delivery `account`) or as a balance
+        code (delivery `code`, data packs only; with `email`, the code is
+        emailed too). Give exactly one of `plan` and `item_id`. The price is
+        the card price in US dollars at the caller's tier, and one gamma is
+        one dollar, so `amount_gamma` needs no rate.
+
+        The answer names `deposit_hotkey`: the hotkey URnetwork assigned
+        this account, on `netuid` 25. It is not a pay-to address, and there
+        is no wallet URI: never send TAO to it. Mint into it with your
+        coldkey, previewing first (`mint_dry_run_command`, then
+        `mint_command`):
+
+        ```bash
+        btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> \
+          --amount-tao <TAO> --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
+        ```
+
+        `--service-hotkey` names URnetwork's spender for a new deposit, and
+        refuses a deposit that names another. The mint is the only step
+        outside this API, and the only signature: the bearer token is the only
+        authentication, since whoever mints into this account's hotkey pays
+        for this account. The same hotkey serves every later purchase; each
+        purchase has its own 32-byte `reference`, which our spend carries.
+
+        Once the deposit can pay (its spendable gamma covers the price), the
+        biller spends exactly `amount_gamma` with `spend_gamma` and credits
+        the purchase only when that spend is finalized. A spend the chain
+        skips (the gamma moved away, the cap, another spender) buys nothing,
+        and is tried again only after the deposit changes. Poll
+        /pay/gamma/status with `status_token`, a bearer secret for this one
+        purchase (keep it out of urls and logs).
+
+        A payer whose coldkey cannot open a deposit at this hotkey (another
+        coldkey already owns that deposit, or the hotkey: the mint fails with
+        `NonAssociatedColdKey`) asks again with `coldkey`, and gets a hotkey
+        that coldkey can use. An open purchase of the same item for the same
+        hotkey is returned again, with a new `status_token`.
+
+        Paying with gamma turns on, by default, the automatic renewal of a
+        plan paid with gamma and the automatic data top-up and seat upgrade
+        (/pay/gamma/settings). `min_daily_cap_gamma` is the daily cap this
+        purchase needs; `auto_min_daily_cap_gamma` the cap the automatic
+        charges need.
+
+        A refusal returns `error` with a 200 (GammaPaymentError):
+        `invalid_request`, `asset_unavailable` (purchases are off, or minting
+        is off while the deposit cannot already pay: `mint_unavailable_reason`
+        says why), `plan_unavailable`, `item_unavailable`,
+        `guest_sign_in_required` (plans only), `offer_unavailable`,
+        `invalid_email`, `deposit_coldkey_mismatch` (every hotkey of the
+        account belongs to another coldkey), `rate_limited` or
+        `start_failed`.
+      operationId: gammaPaymentIntent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGammaPaymentIntentArgs"
+            examples:
+              yearly:
+                summary: Pro for a year, paid from the account's deposit
+                value:
+                  plan: yearly
+              code:
+                summary: A data code, from a known coldkey
+                value:
+                  item_id: data_1tib
+                  delivery: code
+                  email: me@example.com
+                  coldkey: 5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
+      responses:
+        "200":
+          description: The purchase, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaPaymentIntentResult"
+              examples:
+                yearly:
+                  summary: A yearly plan
+                  value:
+                    intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                    status_token: kq3s0d9-q0mJp1v5n2xQd3J7mH0bWzM4tYcRrUeA8kE
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    amount_gamma: "40"
+                    reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
+                    netuid: 25
+                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                    service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
+                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    min_daily_cap_gamma: "40"
+                    auto_min_daily_cap_gamma: "40"
+                    min_mint_gamma: "0.1"
+                    indicative_tao: "0.189165"
+                    mint_available: true
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
+                    disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
+                    automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
+                    expires_at: "2026-11-12T12:00:00Z"
+                    status:
+                      intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                      purpose: purchase
+                      plan: yearly
+                      item_id: ""
+                      delivery: account
+                      status: pending
+                      review_reason: ""
+                      amount_gamma: "40"
+                      reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
+                      deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                      deposit_balance_gamma: ""
+                      spendable_gamma: ""
+                      remaining_gamma: "40"
+                      daily_cap_gamma: ""
+                      min_daily_cap_gamma: "40"
+                      observed_block: null
+                      spent_block: null
+                      expires_at: "2026-11-12T12:00:00Z"
+                      credited_at: null
+                      balance_code: ""
+                      stray_tao_rao: 0
+                mintPaused:
+                  summary: Minting paused while the deposit cannot already pay
+                  value:
+                    mint_unavailable_reason: price_stale
+                    error:
+                      code: asset_unavailable
+                      message: "Minting gamma is paused: the chain's TAO/USD price is more than 300 blocks old. Try again later, or pay with TAO or x402."
+        "401":
+          description: Missing or invalid bearer token.
+
+  /pay/gamma/status:
+    post:
+      tags: [Other]
+      summary: Gamma Payment Status
+      description: |
+        The state of a gamma purchase, read with its `status_token`, in the
+        words of /pay/crypto/status. `status`, first match wins:
+
+        - `unknown`: no such purchase, or the token does not match.
+        - `paid`: credited, on our own finalized `GammaSpent` that carries
+          `reference` (`spent_block`). Never on a mint alone. `balance_code`
+          is set for delivery `code`.
+        - `review`: an operator looks (`review_reason` `voided`, or
+          `credit_failed`: the spend landed and the credit keeps failing).
+        - `confirming`: our spend is pending or landed and the credit is
+          being written, or the deposit covers the price and the next biller
+          run spends it.
+        - `expired`: past `expires_at` with nothing spent (`quote_expired`).
+          Unspent gamma stays in the deposit for the next purchase.
+        - `seen`: the deposit holds gamma but cannot pay yet: less than the
+          price (`remaining_gamma` is how much more to mint), a daily cap
+          below the price (`daily_cap_too_low`; raise it to at least
+          `min_daily_cap_gamma`), another spender (`wrong_spender`; point it
+          back with `btcli gamma set-spender --netuid 25 --hotkey
+          <deposit_hotkey> --service-hotkey <service_hotkey>`), or our last
+          spend was skipped (`error.code` from the chain's reason:
+          `insufficient_gamma`, `daily_cap_exceeded`, `wrong_spender`,
+          `no_deposit`), tried again only after the deposit changes.
+        - `pending`: no gamma at the hotkey yet.
+
+        Amounts are exact decimal strings of gamma (10^9 units per gamma), as
+        the biller last saw the deposit (`observed_block`). `stray_tao_rao` is
+        plain TAO someone sent to the deposit hotkey: a mistake (TAO sent to a
+        hotkey does not pay); write to support@ur.io to have it returned.
+        Unauthenticated, per-ip rate limited.
+      operationId: gammaPaymentStatus
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GammaPaymentStatusArgs"
+            examples:
+              poll:
+                summary: Poll a purchase
+                value:
+                  intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                  status_token: kq3s0d9-q0mJp1v5n2xQd3J7mH0bWzM4tYcRrUeA8kE
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaPaymentStatusResult"
+              examples:
+                paid:
+                  summary: Paid
+                  value:
+                    intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                    purpose: purchase
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    status: paid
+                    review_reason: ""
+                    amount_gamma: "40"
+                    reference: "0x5d0c6b9e3e3c5c0a5b8f2a0f1d4a3e9b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f"
+                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                    deposit_balance_gamma: "10"
+                    spendable_gamma: "10"
+                    remaining_gamma: "0"
+                    daily_cap_gamma: ""
+                    min_daily_cap_gamma: "40"
+                    observed_block: 9479650
+                    spent_block: 9479641
+                    expires_at: "2026-11-12T12:00:00Z"
+                    credited_at: "2026-11-11T12:01:12Z"
+                    balance_code: ""
+                    stray_tao_rao: 0
+                skipped:
+                  summary: Our spend was skipped
+                  value:
+                    intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                    status: seen
+                    amount_gamma: "40"
+                    deposit_balance_gamma: "12.5"
+                    remaining_gamma: "27.5"
+                    error:
+                      code: insufficient_gamma
+                      message: The deposit held less gamma than the price when we spent. Mint more; we try again once the deposit changes.
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/gamma/settings:
+    get:
+      tags: [Other]
+      summary: Gamma Settings
+      description: |
+        The network's automatic gamma charges. Both switches are on by
+        default for every account that pays with gamma:
+
+        - `auto_renew`: at the end of each term of a plan paid with gamma,
+          charge the plan's current price from the deposit (`renew_plan`;
+          a welcome-offer year renews at the yearly price). Unless the network
+          pays for Pro elsewhere past that term.
+        - `auto_topup`: when the data balance runs out, or will within the
+          next check, buy `topup_item_id` (`data_1tib` unless set), at most one
+          an hour; and when a free account hits its client limit
+          (`client_limit_exceeded` with `upgrade_required`), buy Pro
+          (`renew_plan`, else `monthly`), at most once a day. A Pro account at
+          its limit gets the error as before. An automatic upgrade never
+          changes how the network provides.
+
+        `monthly_limit_gamma` caps what the automatic charges take in a
+        calendar month (UTC; "" for no limit); `month_spent_gamma` is this
+        month's so far. Each automatic charge is one purchase per (account,
+        purpose, period) with its own reference, is spent from
+        `deposit_hotkey` (the hotkey that paid last), sends a receipt email,
+        and when the chain skips it, one notice; it is tried again only after
+        the deposit changes. Network credential only.
+      operationId: gammaSettings
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaSettingsResult"
+              examples:
+                defaults:
+                  summary: An account that paid with gamma
+                  value:
+                    auto_renew: true
+                    auto_topup: true
+                    topup_item_id: data_1tib
+                    monthly_limit_gamma: ""
+                    month_spent_gamma: "0"
+                    renew_plan: yearly
+                    deposit_hotkey: 5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw
+                    deposit_hotkeys: [5CMWj1VteMAXa2Popwo7PvjoCtwEC7HYZraqaXLk1FKktqVw]
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+    post:
+      tags: [Other]
+      summary: Set Gamma Settings
+      description: |
+        Set the automatic gamma charges' switches (see GET), the top-up item
+        (`data_1tib` or `data_10tib`) and the monthly limit (a decimal amount
+        of gamma; "0" or "" removes it). A field left out is unchanged. The
+        answer is the settings as they now are; a refusal returns `error`
+        (`item_unavailable`, `invalid_request`). Network credential only.
+      operationId: gammaSetSettings
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GammaSettingsArgs"
+            examples:
+              off:
+                summary: No automatic renewal, a 20 gamma monthly limit
+                value:
+                  auto_renew: false
+                  monthly_limit_gamma: "20"
+      responses:
+        "200":
+          description: The settings, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaSettingsResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
 
   # ----- store and processor notifications -----
 
@@ -23319,3 +23844,391 @@ components:
         content_hash:
           type: string
           description: "`0x`-prefixed sha256 of the chunk bytes."
+
+    # ----- Pay with Gamma (mmm/BTCPAY.md §18) -----
+
+    GammaServicesDocument:
+      type: object
+      description: |
+        The services document of the Bittensor services guide, which SN25's
+        on-chain service record points at. Readers skip fields and types they
+        do not know.
+      required: [version, name, services, payments]
+      properties:
+        version:
+          type: integer
+          description: Always 1.
+        name:
+          type: string
+        description:
+          type: string
+        publishers:
+          type: array
+          description: The published services that may point at this document.
+          items:
+            $ref: "#/components/schemas/GammaServicesPublisher"
+        services:
+          type: array
+          items:
+            $ref: "#/components/schemas/GammaServicesService"
+        payments:
+          type: array
+          items:
+            $ref: "#/components/schemas/GammaServicesPayment"
+
+    GammaServicesPublisher:
+      type: object
+      required: [netuid, hotkey]
+      properties:
+        netuid:
+          type: integer
+        hotkey:
+          type: string
+          description: The SS58 hotkey the service is published under (SN25's owner hotkey).
+
+    GammaServicesService:
+      type: object
+      required: [type, endpoint]
+      properties:
+        type:
+          type: string
+          description: "`openapi`"
+        endpoint:
+          type: string
+        spec:
+          type: string
+          description: Where this OpenAPI spec is published.
+
+    GammaServicesPayment:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: "`gamma` (SN25 gamma deposits) or `x402`."
+        max_spend:
+          type: string
+          description: "gamma: the most one spend takes, in gamma (an exact decimal string)."
+        terms:
+          type: string
+          description: "gamma: GET /pay/gamma/terms."
+        skus:
+          type: string
+          description: "x402: GET /x402/skus."
+
+    GammaTermsItem:
+      type: object
+      description: A plan (`plan`) or a data pack (`item_id`) at the caller's price tier.
+      required: [price_gamma, price_usd, min_daily_cap_gamma, renews, indicative_tao]
+      properties:
+        plan:
+          type: string
+          enum: [monthly, yearly]
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        price_gamma:
+          type: string
+          description: The price in gamma, one gamma per US dollar.
+        price_usd:
+          type: number
+        min_daily_cap_gamma:
+          type: string
+          description: The daily spend cap a deposit needs for this item.
+        renews:
+          type: boolean
+          description: Plans renew automatically from the deposit unless turned off.
+        indicative_tao:
+          type: string
+          description: About the TAO that mints the price now (the chain's simulation, plus 3%); "" while minting is off.
+
+    GammaTermsResult:
+      type: object
+      required: [available, mint_available, netuid, items, max_price_age_blocks, min_mint_gamma, disclaimer]
+      properties:
+        available:
+          type: boolean
+        unavailable_reason:
+          type: string
+          enum: [not_configured, chain_unreachable, runtime_unsupported, service_not_published, service_spender_mismatch, billing_proxy_missing, fee_float_low, watcher_behind, batch_in_review]
+        mint_available:
+          type: boolean
+        mint_unavailable_reason:
+          type: string
+          enum: [gamma_disabled, subnet_gamma_disabled, price_stale, not_configured, chain_unreachable, runtime_unsupported]
+        netuid:
+          type: integer
+        service_hotkey:
+          type: string
+        spender:
+          type: string
+          description: The SS58 account every URnetwork deposit names as its spender.
+        services_url:
+          type: string
+        price_tier:
+          type: string
+        tao_usd:
+          type: string
+          description: The oracle's accepted TAO/USD price, in dollars; "" before any feed.
+        price_age_blocks:
+          type: integer
+          description: Blocks since the oracle last fed.
+        max_price_age_blocks:
+          type: integer
+          description: A mint needs a feed at most this old (300).
+        min_mint_gamma:
+          type: string
+          description: The smallest mint, "0.1".
+        finalized_block:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/GammaTermsItem"
+        auto_min_daily_cap_gamma:
+          type: string
+          description: The daily cap every automatic charge needs.
+        disclaimer:
+          type: string
+        automatic_notice:
+          type: string
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+
+    CreateGammaPaymentIntentArgs:
+      type: object
+      properties:
+        plan:
+          type: string
+          enum: [monthly, yearly, yearly_onboarding]
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        delivery:
+          type: string
+          enum: [account, code]
+          description: "`account` (the default) or `code` (data packs only)."
+        email:
+          type: string
+          description: "Delivery `code`: where the code is also emailed."
+        storefront_country:
+          type: string
+        coldkey:
+          type: string
+          description: The SS58 coldkey that will mint, to get a hotkey whose deposit it can open or owns.
+
+    GammaPaymentIntentResult:
+      type: object
+      description: |
+        A gamma purchase. On a refusal only `error` (and, with minting off,
+        `mint_unavailable_reason`) is filled in.
+      properties:
+        intent_id:
+          type: string
+          format: uuid
+        status_token:
+          type: string
+          description: The purchase's bearer secret, for /pay/gamma/status.
+        plan:
+          type: string
+        item_id:
+          type: string
+        delivery:
+          type: string
+        tier:
+          type: string
+        offer_applied:
+          type: boolean
+        price_usd:
+          type: number
+        regular_price_usd:
+          type: number
+        amount_gamma:
+          type: string
+          description: The price in gamma, exactly what our spend takes.
+        reference:
+          type: string
+          description: The purchase's public 32-byte spend reference (0x hex), carried by our GammaSpent.
+        netuid:
+          type: integer
+        deposit_hotkey:
+          type: string
+          description: The SS58 hotkey to mint into. Not a pay-to address; never send TAO to it.
+        service_hotkey:
+          type: string
+        spender:
+          type: string
+        min_daily_cap_gamma:
+          type: string
+        auto_min_daily_cap_gamma:
+          type: string
+        min_mint_gamma:
+          type: string
+        indicative_tao:
+          type: string
+          description: About the TAO that mints what the deposit still needs (at least 0.1 gamma); "" while minting is off.
+        mint_available:
+          type: boolean
+        mint_unavailable_reason:
+          type: string
+        mint_dry_run_command:
+          type: string
+        mint_command:
+          type: string
+        disclaimer:
+          type: string
+        automatic_notice:
+          type: string
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        status:
+          $ref: "#/components/schemas/GammaPaymentStatusResult"
+        error:
+          $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaPaymentStatusArgs:
+      type: object
+      required: [intent_id, status_token]
+      properties:
+        intent_id:
+          type: string
+          format: uuid
+        status_token:
+          type: string
+
+    GammaPaymentStatusResult:
+      type: object
+      required: [intent_id, status]
+      properties:
+        intent_id:
+          type: string
+        purpose:
+          type: string
+          enum: [purchase, renew, topup, seat]
+        plan:
+          type: string
+        item_id:
+          type: string
+        delivery:
+          type: string
+        status:
+          type: string
+          enum: [unknown, pending, seen, confirming, paid, expired, review]
+        review_reason:
+          type: string
+          description: "With `review`: `voided` or `credit_failed`; else \"\"."
+        amount_gamma:
+          type: string
+        reference:
+          type: string
+        deposit_hotkey:
+          type: string
+        deposit_balance_gamma:
+          type: string
+          description: The deposit's balance as last seen; "" when there is no deposit.
+        spendable_gamma:
+          type: string
+          description: The balance within what the daily cap allows now; "" when there is no deposit.
+        remaining_gamma:
+          type: string
+          description: How much more gamma the deposit needs for the price.
+        daily_cap_gamma:
+          type: string
+          description: The deposit's daily spend cap; "" for none.
+        min_daily_cap_gamma:
+          type: string
+        observed_block:
+          type: [integer, "null"]
+        spent_block:
+          type: [integer, "null"]
+          description: The finalized block of our GammaSpent.
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        credited_at:
+          type: [string, "null"]
+          format: date-time
+        balance_code:
+          type: string
+        stray_tao_rao:
+          type: integer
+          description: Plain TAO sent to the deposit hotkey by mistake, in rao.
+        error:
+          $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaSettingsArgs:
+      type: object
+      properties:
+        auto_renew:
+          type: boolean
+        auto_topup:
+          type: boolean
+        topup_item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        monthly_limit_gamma:
+          type: string
+          description: A decimal amount of gamma; "0" or "" removes the limit.
+
+    GammaSettingsResult:
+      type: object
+      properties:
+        auto_renew:
+          type: boolean
+        auto_topup:
+          type: boolean
+        topup_item_id:
+          type: string
+        monthly_limit_gamma:
+          type: string
+        month_spent_gamma:
+          type: string
+        renew_plan:
+          type: string
+        deposit_hotkey:
+          type: string
+        deposit_hotkeys:
+          type: array
+          items:
+            type: string
+        error:
+          $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaPaymentError:
+      type: object
+      description: |
+        Why a gamma purchase was refused, or why its status needs attention.
+        Clients pick a localized message by `code` and fall back to
+        `message`.
+      required: [message]
+      properties:
+        code:
+          type: string
+          description: |
+            The PurchaseError codes `invalid_request`, `asset_unavailable`,
+            `plan_unavailable`, `item_unavailable`, `offer_unavailable`,
+            `guest_sign_in_required`, `invalid_email`, `rate_limited`,
+            `start_failed` and `quote_expired`, and Gamma's own:
+            `insufficient_gamma`: the deposit holds, or held when we spent,
+            less gamma than the price.
+            `daily_cap_exceeded`: the deposit's daily spend cap did not allow
+            the price when we spent.
+            `daily_cap_too_low`: the deposit's daily spend cap is below the
+            price, so no spend can pass; raise it to `min_daily_cap_gamma`.
+            `wrong_spender`: the deposit names another spender.
+            `no_deposit`: there was no deposit at the hotkey when we spent.
+            `invalid_amount`: the chain refused the amount.
+            `deposit_coldkey_mismatch`: the hotkey's deposit, or the hotkey,
+            belongs to another coldkey (the chain's `NonAssociatedColdKey`);
+            ask again with `coldkey`.
+            The mint failures a client sees from btcli map to: `AmountTooLow`
+            (a mint below 0.1 gamma) to `mint_too_small`,
+            `InsufficientLiquidity` (a mint above the pool's swap input limit)
+            to `mint_liquidity_exceeded`, `SlippageTooHigh` (less than the
+            mint's minimum) to `mint_slippage`, `TaoUsdPriceUnavailable` and
+            `GammaDisabled` to `asset_unavailable`.
+          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
+        message:
+          type: string
