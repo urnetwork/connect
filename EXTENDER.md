@@ -851,11 +851,36 @@ the address was accepted on (C2a), 15 s timeout.
 A failure increments `consecutive_probe_failures`; at 6 the address is
 deactivated. When an extender has no active address it becomes inactive,
 `revoke_time` is set and a revocation publish row is inserted. A success
-resets the counter and stamps `last_probe_success_time`. A deactivated
-address is re-probed only by a new activation. The read of an extender's
-remaining active addresses is locked, so two probes losing both families
-of one extender in the same tick cannot each see the other still active
-and leave the extender active with no address and no revocation.
+resets the counter and stamps `last_probe_success_time`. The read of an
+extender's remaining active addresses is locked, so two probes losing both
+families of one extender in the same tick cannot each see the other still
+active and leave the extender active with no address and no revocation.
+
+A pass's failures count only when the prober could have passed them
+(server 6845ebf36, 2026-11-11; `taskworker/work/extender_probe_common_mode.go`,
+`extender_probe_control.go`). Each family of a pass is judged first: it is
+held as the prober's own fault when at least three quarters of its addresses
+failed and either at least three quarters of its networks lost half or more of
+theirs (with at least 4 networks and 8 addresses in the pass), or the prober's
+control target failed over that family with them -- a tls handshake, before and
+after the pass, with the operator's api host, the destination every probe
+names, which counts only once it has answered in this process. A held family's
+failures record nothing, deactivate nothing and revoke no one; its successes
+count as always, and each held pass logs an error line.
+
+A deactivated address is probed for its return as well as re-activated by a new
+activation (`extender_probe_recovery.go`, `model/network_extender_recovery_model.go`).
+For 72 h after it last worked -- an uptime probe or its activation passed --
+an address the probes deactivated, with the failure count that deactivated it
+and on the ip it was deactivated on, is probed in the same passes with the same
+dial: every pass for the first 2 h, then at most every 30 minutes, after the
+active addresses and never counting toward the pass's verdict. The first time it
+passes the same tcp challenge under the extender's published key at that ip, the
+address is active again with a clean count, and a revoked extender is active
+again with a record queued in the same transaction, issued after the revocation
+so it supersedes it in every directory (B5). Only what the probes took away is
+restored: a dead extender still fails its six probes, is revoked half an hour
+after it stopped answering, and never answers a probe for its return.
 
 C4. Publish tick. Taskworker task every 10 minutes. Drip: select up to 8
 active extenders ordered by the oldest `last_publish_time` (nulls first),
