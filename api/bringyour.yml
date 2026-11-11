@@ -11415,8 +11415,8 @@ paths:
         for the hosts that hold no Postgres (evs, gkm, sockets, tlsedge and
         mxedge), which cache them 5 s. One of the internal gate's routes:
         each takes only the bearers of the services it lists, here every one
-        of the five, and the lb refuses the prefix from outside. 503 while
-        the limits cannot be read.
+        of the five, and none is meant to be reached from outside the
+        services network. 503 while the limits cannot be read.
       operationId: internalGateLimits
       security:
         - InternalGateAuth: []
