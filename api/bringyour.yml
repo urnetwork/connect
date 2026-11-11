@@ -4452,7 +4452,7 @@ paths:
                     services:
                       - type: openapi
                         endpoint: https://api.bringyour.com
-                        spec: https://ur.io/api/bringyour.yml
+                        spec: https://ur.io/openapi.yml
                     payments:
                       - type: gamma
                         max_spend: "40"
