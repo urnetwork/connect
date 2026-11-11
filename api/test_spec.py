@@ -87,6 +87,57 @@ class SpecTest(unittest.TestCase):
             set(schemas["RotateProxyExitResult"]["properties"]["error"]["properties"]),
         )
 
+    def test_256gib_pack_is_sold_over_x402_and_gamma_only(self):
+        # config/all/pro.yml: data_256gib, 256 GiB for $0.75, the pack for
+        # clients with a $1 per-payment cap, rails [x402, gamma] (the owner,
+        # 2026-11-11). The server refuses it on every other path.
+        pack = "data_256gib"
+        schemas = self.spec["components"]["schemas"]
+        paths = self.spec["paths"]
+
+        for name, field in (
+            ("GammaTermsItem", "item_id"),
+            ("CreateGammaPaymentIntentArgs", "item_id"),
+            ("GammaSettingsArgs", "topup_item_id"),
+        ):
+            with self.subTest(schema=name):
+                self.assertIn(pack, schemas[name]["properties"][field]["enum"])
+        terms = paths["/pay/gamma/terms"]["get"]["responses"]["200"]
+        for name, example in terms["content"]["application/json"]["examples"].items():
+            with self.subTest(example=name):
+                items = {
+                    item["item_id"]: item
+                    for item in example["value"]["items"]
+                    if "item_id" in item
+                }
+                self.assertEqual("0.75", items[pack]["price_gamma"])
+                self.assertEqual(0.75, items[pack]["price_usd"])
+                self.assertEqual("0.75", items[pack]["min_daily_cap_gamma"])
+        self.assertIn(pack, paths["/pay/gamma/intent"]["post"]["description"])
+
+        skus = paths["/x402/skus"]["get"]["description"]
+        self.assertIn(pack, skus)
+        self.assertIn("$0.75", skus)
+        self.assertIn("$1 per-payment cap", skus)
+        self.assertIn(pack, schemas["X402Sku"]["properties"]["sku_id"]["description"])
+        self.assertIn(pack, paths["/x402/purchase"]["post"]["description"])
+
+        # card, the crypto invoices and USDC by Solana Pay never offer it
+        for name in (
+            "PayDataCheckoutArgs",
+            "PayDataSolanaIntentArgs",
+            "PayDataSolanaStatusResult",
+            "CryptoPaymentQuoteArgs",
+            "CreateCryptoPaymentIntentArgs",
+            "CreateDataCryptoPaymentIntentArgs",
+        ):
+            with self.subTest(schema=name):
+                enum = schemas[name]["properties"]["item_id"]["enum"]
+                self.assertEqual(["data_1tib", "data_10tib"], enum)
+        card = schemas["StripeCreateCheckoutSessionArgs"]["properties"]["item_id"]
+        self.assertIn(pack, card["description"])
+        self.assertIn("item_unavailable", card["description"])
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):
