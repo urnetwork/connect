@@ -162,7 +162,11 @@ func ipPacketToProviderBytes(frame *protocol.Frame) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return message.(*protocol.IpPacketToProvider).IpPacket.PacketBytes, nil
+	packet := message.(*protocol.IpPacketToProvider).IpPacket
+	if packet == nil {
+		return nil, fmt.Errorf("IP packet to provider is missing ip_packet")
+	}
+	return packet.PacketBytes, nil
 }
 
 // ipPacketFromProviderBytes is the return-path counterpart to
@@ -175,7 +179,11 @@ func ipPacketFromProviderBytes(frame *protocol.Frame) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return message.(*protocol.IpPacketFromProvider).IpPacket.PacketBytes, nil
+	packet := message.(*protocol.IpPacketFromProvider).IpPacket
+	if packet == nil {
+		return nil, fmt.Errorf("IP packet from provider is missing ip_packet")
+	}
+	return packet.PacketBytes, nil
 }
 
 func RequireToFrameWithDefaultProtocolVersion(message proto.Message) *protocol.Frame {
