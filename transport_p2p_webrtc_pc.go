@@ -168,6 +168,14 @@ func newWebRtcPeerConnectionFactory(
 	if 0 < settings.StunGatherTimeout {
 		s.SetSTUNGatherTimeout(settings.StunGatherTimeout)
 	}
+	// one family when the owner pins it (WebRtcSettings.IceIpVersion): no
+	// candidate of the other is gathered, so no pair of it can be selected
+	switch settings.IceIpVersion {
+	case 4:
+		s.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	case 6:
+		s.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP6})
+	}
 	if certificate == nil {
 		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {

@@ -1072,6 +1072,13 @@ type WebRtcSettings struct {
 	// loopback-capable connect past the test deadline at STUN check pacing.
 	// Production callers leave it false.
 	UseLoopbackOnlyIceInterfaces bool
+	// IceIpVersion, 4 or 6, gathers candidates of that family alone, so every
+	// ICE pair is of it. The operator's webrtc probe of an extender
+	// activation pins the family the activation was posted for, since the
+	// extender's forward follows the family of the pair it was reached on
+	// (EXTENDER.md A7, S5, S8). 0, the default, and any other value gather
+	// both. Browser WebRTC ignores it.
+	IceIpVersion int
 
 	// Network, when set, supplies native Pion's socket network. Tests use it
 	// to put ICE, DTLS, SCTP, and SRTP below a userspace impairment model.
