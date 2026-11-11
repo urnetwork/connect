@@ -158,8 +158,9 @@ tags:
       - Stripe checkout and the customer portal (`/stripe`), and data packs
         bought without signing in (`/pay/data`)
       - crypto invoices (`/pay/crypto`, `/pay/data/crypto-intent`): Pro and
-        data packs paid in USDC on Solana, Zcash or Monero, with the enabled
-        coins, each invoice's status and a new quote for an unpaid one
+        data packs paid in USDC on Solana, Zcash, Monero, TAO, Bitcoin, ETH
+        or SOL, end to end through the API alone: the coins on offer, a quote,
+        the invoice, its status and a new quote for an unpaid one
       - inline agent payments over the x402 header protocol (`/x402`): an
         agent asks for a sku, is answered `402` with the payment terms, and
         retries the same request with a signed payment in `X-PAYMENT`
@@ -4455,6 +4456,47 @@ paths:
               schema:
                 $ref: "#/components/schemas/HeliusWebhookResult"
 
+  /pay/alchemy:
+    post:
+      tags: [Other]
+      x-internal: true
+      summary: Alchemy webhook
+      description: |
+        Every Alchemy webhook of the crypto payment rail delivers here: ETH's
+        Address Activity webhook, and Bitcoin's when Alchemy offers one. A
+        delivery is routed by its `webhookId` and verified with that
+        webhook's own signing key (`X-Alchemy-Signature`, the hex HMAC-SHA256
+        of the raw body), before anything else of it is read; a delivery
+        whose webhook is not configured, or whose signature does not match,
+        is refused. With no webhook configured at all, every delivery is
+        refused with 503 before its body is read.
+
+        A delivery is a fast path only. It is answered at once, and the
+        invoice addresses it names as recipients are read on the coin's next
+        scan, whatever their age; that read of the chain credits. ETH sent on
+        another network than `ETH_MAINNET`, and token transfers, are ignored.
+        Polling the chain is the source of truth, so no coin's availability
+        depends on this webhook.
+      operationId: alchemyWebhook
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlchemyWebhookArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlchemyWebhookResult"
+        "400":
+          description: The delivery's webhook is not configured, its signature does not match, or its body is not a delivery. Plain text body.
+        "503":
+          description: No Alchemy webhook is configured, so no delivery can be verified. Plain text body.
+
   /pay/circle:
     post:
       tags: [Other]
@@ -5990,24 +6032,42 @@ paths:
       description: |
         The coins the server takes payment in now, and what each sells:
         `usdc_solana` (USDC on Solana), `zec` (Zcash, to shielded addresses
-        only) and `xmr` (Monero). `assets` lists only the coins that can be
-        paid with now, so a coin that is switched off, or whose quotes the
-        server refuses for now, is not in it; a client never offers an asset
-        or an item `assets` does not name. The order means nothing: clients
-        show the methods as Card, USDC, Zcash, Monero. No asset sells
+        only), `xmr` (Monero), `tao` (TAO on Bittensor), `btc` (Bitcoin),
+        `eth` (ETH on Ethereum mainnet) and `sol` (native SOL). `assets` lists
+        only the coins that can be paid with now, so a coin that is switched
+        off, or whose quotes the server refuses for now, is not in it; a
+        client never offers an asset or an item `assets` does not name. The
+        order means nothing: the apps show Card, then USDC, Zcash and Monero,
+        then "More coins" with TAO, Bitcoin, ETH and SOL. No asset sells
         `monthly`, which is card only.
 
-        A Zcash or Monero coin that is on but cannot be quoted now (its wallet
-        scanner lags the network, has stopped, or does not know the network's
-        height) is in `unavailable_assets` instead, with `available: false`
-        and an `unavailable_reason`, for a page that shows it as temporarily
-        unavailable. It is never offered: /pay/crypto/intent,
-        /pay/data/crypto-intent and /pay/crypto/requote refuse it with
-        `asset_unavailable`, from the same decision.
+        Each entry names the coin's `network` (the chain to send on), its
+        atomic `decimals`, the most decimals a quoted amount has
+        (`quote_decimals`: 8 for `btc`, 6 for every other coin) and whether
+        its invoices carry a payment link (`payment_link`: false for `tao`,
+        which has no payment link standard).
+
+        A coin that is on but cannot be paid with now is in
+        `unavailable_assets` instead, with `available: false` and an
+        `unavailable_reason`, for a page that shows it as temporarily
+        unavailable: its scanner lags the network, has stopped, or does not
+        know a height; its backend is not configured (`not_configured`: TAO,
+        Bitcoin, ETH and SOL each need their chain source and the key that
+        makes their deposit addresses); its address pool is empty; or its
+        rates were found stale or too far apart lately. It is never offered:
+        /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent and
+        /pay/crypto/requote refuse it with `asset_unavailable`, from the same
+        decision.
+
+        To pay through the API alone: read this list, price an item with
+        /pay/crypto/quote, make the invoice with /pay/crypto/intent (signed
+        in) or /pay/data/crypto-intent (a data pack without signing in), send
+        exactly `amount` to `address` on `network` (or open `uri`), and poll
+        /pay/crypto/status with the invoice's `status_token` until `paid`.
 
         The `assets` list rides on /subscription/balance as `crypto_assets`,
-        which the apps read. This route is for pages without a sign-in, such
-        as the ur.io buy-data page. Unauthenticated, per-ip rate limited.
+        and `unavailable_assets` as `crypto_unavailable_assets`.
+        Unauthenticated, per-ip rate limited.
       operationId: cryptoPaymentAssets
       security: []
       responses:
@@ -6017,6 +6077,193 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CryptoPaymentAssetsResult"
+              examples:
+                mixed:
+                  summary: Five coins can be paid with now; Bitcoin and ETH await their configuration
+                  value:
+                    assets:
+                      - asset: usdc_solana
+                        network: solana
+                        decimals: 6
+                        quote_decimals: 6
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 3600
+                        available: true
+                      - asset: zec
+                        network: zcash
+                        decimals: 8
+                        quote_decimals: 6
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 10
+                        quote_ttl_seconds: 1800
+                        available: true
+                      - asset: xmr
+                        network: monero
+                        decimals: 12
+                        quote_decimals: 6
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 1800
+                        available: true
+                      - asset: tao
+                        network: bittensor
+                        decimals: 9
+                        quote_decimals: 6
+                        payment_link: false
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 1800
+                        available: true
+                      - asset: sol
+                        network: solana
+                        decimals: 9
+                        quote_decimals: 6
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 1800
+                        available: true
+                    unavailable_assets:
+                      - asset: btc
+                        network: bitcoin
+                        decimals: 8
+                        quote_decimals: 8
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 1800
+                        available: false
+                        unavailable_reason: not_configured
+                      - asset: eth
+                        network: ethereum
+                        decimals: 18
+                        quote_decimals: 6
+                        payment_link: true
+                        plans: [yearly, yearly_onboarding]
+                        items: [data_1tib, data_10tib]
+                        confirmations_required: 1
+                        quote_ttl_seconds: 1800
+                        available: false
+                        unavailable_reason: not_configured
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/crypto/quote:
+    post:
+      tags: [Other]
+      summary: Crypto Payment Quote
+      description: |
+        What a plan or a data pack costs in a coin now, without making an
+        invoice: an agent or a script compares coins with it before it pays.
+        No receive address is drawn and nothing is written. The invoice
+        (/pay/crypto/intent or /pay/data/crypto-intent) quotes again when it
+        is made, by the same rules, so the amount the invoice gives is the one
+        to pay.
+
+        Give exactly one of `plan` and `item_id`. The bearer token is
+        optional: with one, a plan is priced at the network's tier, and the
+        welcome offer (`yearly_onboarding`) is quoted when the network may
+        redeem it; without one, a plan is priced at the caller's tier and
+        `yearly_onboarding` is refused (`offer_unavailable`).
+
+        `amount` is the price × (1 + the coin's buffer: 1% for TAO, 0.5% for
+        the others) ÷ `rate_usd`, rounded up to `quote_decimals`, with
+        `amount_atomic` its twin in the coin's atomic unit. A USDC invoice
+        adds a unique sub-cent suffix to the price, so a USDC quote is the
+        price alone, at `rate_usd` 1.
+
+        A refusal returns `error` with a 200 and a stable `error.code`
+        (PurchaseError): `invalid_request` (an unknown asset, or not exactly
+        one of `plan` and `item_id`), `asset_unavailable` (the coin is off,
+        not configured, or cannot be quoted right now), `plan_unavailable`,
+        `item_unavailable` (also a price over the per-invoice cap) or
+        `offer_unavailable`. Per-ip rate limited.
+      operationId: cryptoPaymentQuote
+      # optional auth: anonymous callers get the caller's tier, a bearer adds the network's tier and offer
+      security:
+        - {}
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CryptoPaymentQuoteArgs"
+            examples:
+              btcYearly:
+                summary: Pro for a year, in Bitcoin
+                value:
+                  asset: btc
+                  plan: yearly
+              taoData:
+                summary: A 1 TiB data pack, in TAO
+                value:
+                  asset: tao
+                  item_id: data_1tib
+      responses:
+        "200":
+          description: The quote, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CryptoPaymentQuoteResult"
+              examples:
+                btcYearly:
+                  summary: Pro for a year, in Bitcoin (quoted to the satoshi)
+                  value:
+                    asset: btc
+                    plan: yearly
+                    item_id: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 73472.4
+                    amount: "0.00054715"
+                    amount_atomic: "54715"
+                    network: bitcoin
+                    decimals: 8
+                    quote_decimals: 8
+                    payment_link: true
+                    quote_ttl_seconds: 1800
+                    confirmations_required: 1
+                    quoted_at: "2026-11-10T20:00:00Z"
+                taoData:
+                  summary: A 1 TiB data pack, in TAO (with TAO's 1% buffer)
+                  value:
+                    asset: tao
+                    plan: ""
+                    item_id: data_1tib
+                    tier: ""
+                    offer_applied: false
+                    price_usd: 3
+                    regular_price_usd: 3
+                    rate_usd: 217.47
+                    amount: "0.013933"
+                    amount_atomic: "13933000"
+                    network: bittensor
+                    decimals: 9
+                    quote_decimals: 6
+                    payment_link: false
+                    quote_ttl_seconds: 1800
+                    confirmations_required: 1
+                    quoted_at: "2026-11-10T20:00:00Z"
+                refused:
+                  summary: A coin that cannot be quoted now
+                  value:
+                    error:
+                      code: asset_unavailable
+                      message: Paying with this coin is temporarily unavailable.
         "429":
           description: Too many requests from this address this minute. Plain text body.
 
@@ -6026,18 +6273,34 @@ paths:
       summary: Crypto Payment Intent
       description: |
         Start an invoice for Pro or a data pack, paid in an enabled asset
-        (`usdc_solana`, `zec` or `xmr`), for the signed-in network (delivery
-        `account`). Give exactly one of `plan` and `item_id`. The price is the
-        card price at the caller's regional tier, from `storefront_country`
-        when the app knows it; it is quoted by the server and never taken from
-        the client.
+        (`usdc_solana`, `zec`, `xmr`, `tao`, `btc`, `eth` or `sol`), for the
+        signed-in network (delivery `account`). Give exactly one of `plan` and
+        `item_id`. The price is the card price at the caller's regional tier,
+        from `storefront_country` when the app knows it; it is quoted by the
+        server and never taken from the client. The bearer token is the API's
+        normal one: an app's client token, or an agent's or a script's.
 
-        Each invoice has its own receive address (`address`) and an exact
-        `amount` in the coin, good until `expires_at`. Zcash and Monero are
-        quoted from at least two rate sources. Show `uri` as a QR code and
-        open it in a wallet. A client never builds a payment uri of its own,
-        and refuses to show one that does not pay `address`. `memo` is set for
-        `usdc_solana` only: the reference, for a transfer sent by hand.
+        Each invoice has its own receive address (`address`), except USDC,
+        which pays the one merchant address with a unique amount and a
+        reference, and an exact `amount` in the coin, good until
+        `expires_at`. Every coin but USDC is quoted from at least two rate
+        sources that agree. Send exactly `amount` (every decimal) to
+        `address` on `network`; `network_warning` says what is not credited
+        (a coin sent on another network, or a token instead of the coin). The
+        address alone identifies the invoice for every coin but USDC; `memo`
+        is the Solana Pay reference for `usdc_solana` (a USDC transfer sent by
+        hand carries it as its memo) and for `sol` (optional there), and
+        empty for every other coin.
+
+        `uri` is the payment link to show as a QR code and open in a wallet:
+        `solana:` (Solana Pay; USDC names the USDC mint as its one
+        `spl-token`, SOL names none), `zcash:` (ZIP 321), `monero:`,
+        `bitcoin:` (BIP 21, with `amount`, `label` and `message` only) and
+        `ethereum:<address>@1?value=<wei>` (EIP 681, Ethereum mainnet). TAO
+        has no payment link standard: its `uri` is empty and `uri_note` says
+        so; send the amount to the address by hand. A client never builds a
+        payment uri of its own, and refuses to show one that does not pay
+        `address` byte for byte.
 
         `status_token` is a bearer secret for this one invoice, for
         /pay/crypto/status and /pay/crypto/requote. Keep it in memory, in
@@ -6051,9 +6314,9 @@ paths:
 
         A refusal returns `error` with a 200 and a stable `error.code`
         (PurchaseError): `invalid_request` (an unknown asset, or not exactly
-        one of `plan` and `item_id`), `asset_unavailable` (the asset is off,
-        or cannot be quoted right now), `plan_unavailable` (a plan the asset
-        does not sell, `monthly` included), `item_unavailable`,
+        one of `plan` and `item_id`), `asset_unavailable` (the asset is off or
+        not configured, or cannot be quoted right now), `plan_unavailable` (a
+        plan the asset does not sell, `monthly` included), `item_unavailable`,
         `guest_sign_in_required` (plans only), `offer_unavailable`
         (`yearly_onboarding` without a redeemable welcome offer),
         `rate_limited` (too many invoices from this network this minute) or
@@ -6067,6 +6330,43 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateCryptoPaymentIntentArgs"
+            examples:
+              usdcYearly:
+                summary: Pro for a year, in USDC on Solana
+                value:
+                  asset: usdc_solana
+                  plan: yearly
+              zecYearly:
+                summary: Pro for a year, in Zcash
+                value:
+                  asset: zec
+                  plan: yearly
+              xmrYearly:
+                summary: Pro for a year, in Monero
+                value:
+                  asset: xmr
+                  plan: yearly
+              taoYearly:
+                summary: Pro for a year, in TAO
+                value:
+                  asset: tao
+                  plan: yearly
+              btcYearly:
+                summary: Pro for a year, in Bitcoin
+                value:
+                  asset: btc
+                  plan: yearly
+                  storefront_country: US
+              ethYearly:
+                summary: Pro for a year, in ETH
+                value:
+                  asset: eth
+                  plan: yearly
+              solData:
+                summary: A 1 TiB data pack for this network, in SOL
+                value:
+                  asset: sol
+                  item_id: data_1tib
       responses:
         "200":
           description: The invoice, or a refusal.
@@ -6074,6 +6374,218 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CryptoPaymentIntentResult"
+              examples:
+                usdcYearly:
+                  summary: USDC on Solana (one merchant address, a unique amount and a reference)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c01
+                    status_token: kq3H9cY2bW5Zt0p8Lr4mXaVnQe7JfGs1Ud6Ho9KiRwE
+                    asset: usdc_solana
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 1
+                    address: 3PPWxbYk39RHUDEDrVWabo8iXEMh2dA6ekUDdkVPQW5W
+                    amount: "40.004123"
+                    amount_atomic: "40004123"
+                    memo: 8Ug86erH6xX14G7SAqCYxTUi3zAwChCcw5fUaBweTvyc
+                    uri: solana:3PPWxbYk39RHUDEDrVWabo8iXEMh2dA6ekUDdkVPQW5W?amount=40.004123&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&reference=8Ug86erH6xX14G7SAqCYxTUi3zAwChCcw5fUaBweTvyc&label=URnetwork&message=URnetwork%20Pro%20yearly
+                    uri_note: ""
+                    network: solana
+                    network_warning: "Send USDC on Solana (the USDC token, mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v) to this address, exactly the amount. USDC on another network, or SOL, is not credited. A transfer sent by hand carries the memo."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T21:00:00Z"
+                    confirmations_required: 1
+                    status:
+                      intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c01
+                      asset: usdc_solana
+                      plan: yearly
+                      item_id: ""
+                      delivery: account
+                      network_name: ""
+                      status: pending
+                      review_reason: ""
+                      amount: "40.004123"
+                      amount_atomic: "40004123"
+                      received: "0"
+                      received_atomic: "0"
+                      remaining: "40.004123"
+                      remaining_atomic: "40004123"
+                      excess: "0"
+                      excess_atomic: "0"
+                      network: solana
+                      confirmations: 0
+                      confirmations_required: 1
+                      expires_at: "2026-11-10T21:00:00Z"
+                      credited_at: null
+                      balance_code: ""
+                zecYearly:
+                  summary: Zcash (a unified address of the invoice's own)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c02
+                    status_token: R2m8sZ5vXq1Lc7TnB0yWkHd4JpFe9AuGo3Ni6EtSaQw
+                    asset: zec
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 1304.6
+                    address: u1xuy05vn57x0par8xaxqmrneqvyjxdkqxs9u4vahkjal6rne5rvruvdx68xw87qssvyxc89ya0ypq7yvd8ljavpy236uhsltv2pnf4g7v6fhl4fnzye6effde6kzxxac3gkdz8wzx8ffq65e5slj9
+                    amount: "0.030815"
+                    amount_atomic: "3081500"
+                    memo: ""
+                    uri: zcash:u1xuy05vn57x0par8xaxqmrneqvyjxdkqxs9u4vahkjal6rne5rvruvdx68xw87qssvyxc89ya0ypq7yvd8ljavpy236uhsltv2pnf4g7v6fhl4fnzye6effde6kzxxac3gkdz8wzx8ffq65e5slj9?amount=0.030815&message=URnetwork%20Pro%20yearly
+                    uri_note: ""
+                    network: zcash
+                    network_warning: "Send ZEC to this shielded address. ZEC sent from a transparent address is credited; ZEC sent to a transparent address is not. A payment needs 10 confirmations."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 10
+                xmrYearly:
+                  summary: Monero (a subaddress of the invoice's own)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c03
+                    status_token: Wc4Tq9Lm2Bv7Xn0Rk5Zs8Hy1Fd6Jg3Ae9Pu2Mi4OtQk
+                    asset: xmr
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 555.36
+                    address: 87738veDQcZCXcGdFfyLc9DRG2HvVfATPVY96Wa9zGqrQhJLG5GCj288V19nZFN9mqnH3HRQTAJbinUM8koHDmMWft2TFHX
+                    amount: "0.072386"
+                    amount_atomic: "72386000000"
+                    memo: ""
+                    uri: monero:87738veDQcZCXcGdFfyLc9DRG2HvVfATPVY96Wa9zGqrQhJLG5GCj288V19nZFN9mqnH3HRQTAJbinUM8koHDmMWft2TFHX?tx_amount=0.072386&tx_description=URnetwork%20Pro%20yearly
+                    uri_note: ""
+                    network: monero
+                    network_warning: "Send XMR to this subaddress, exactly the amount."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 1
+                taoYearly:
+                  summary: TAO (a Coinbase deposit address of the invoice's own; no payment link)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c04
+                    status_token: Ht6Yp1Nc8Vk3Rw0Bz5Lq9Gs2Mf7Xa4Ej1Ud8Ko3TiWe
+                    asset: tao
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 217.47
+                    address: 5FPDwhaGz5funxwM6dJTSDbU1FikToHGJx77pGiECzRbeKdd
+                    amount: "0.185773"
+                    amount_atomic: "185773000"
+                    memo: ""
+                    uri: ""
+                    uri_note: "TAO has no payment link standard: copy the address and send exactly the amount."
+                    network: bittensor
+                    network_warning: "Send TAO on the Bittensor network (Finney) to this address, exactly the amount. TAO has no memo: the address alone identifies this invoice. TAO sent on another network or as a wrapped token is not credited."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 1
+                btcYearly:
+                  summary: Bitcoin (a Coinbase deposit address of the invoice's own, quoted to the satoshi)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c05
+                    status_token: Pm2Kx7Wq4Tb9Hn1Zs6Cv3Rf8Ld5Ja0Ye2Ug7Oi4NtBk
+                    asset: btc
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 73472.4
+                    address: bc1qnpacsprej8hdfqttcwp444pdsxglyfhns4rk9g
+                    amount: "0.00054715"
+                    amount_atomic: "54715"
+                    memo: ""
+                    uri: bitcoin:bc1qnpacsprej8hdfqttcwp444pdsxglyfhns4rk9g?amount=0.00054715&label=URnetwork&message=URnetwork%20Pro%20yearly
+                    uri_note: ""
+                    network: bitcoin
+                    network_warning: "Send BTC on the Bitcoin network to this address, exactly the amount. BTC on another network (Lightning, Base, Ethereum, Solana) is not credited. A payment needs 1 confirmation."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 1
+                ethYearly:
+                  summary: ETH (a Coinbase deposit address of the invoice's own, in EIP-55 case)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c06
+                    status_token: Dn5Rv8Lc1Wx4Tq7Bk0Zs3Hm9Gp2Fy6Je1Ua5Ko8IwQt
+                    asset: eth
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    tier: standard
+                    offer_applied: false
+                    price_usd: 40
+                    regular_price_usd: 40
+                    rate_usd: 2044.9
+                    address: "0xc28E00C36c93DfEB2236322f613595dec486BcE4"
+                    amount: "0.019659"
+                    amount_atomic: "19659000000000000"
+                    memo: ""
+                    uri: ethereum:0xc28E00C36c93DfEB2236322f613595dec486BcE4@1?value=19659000000000000
+                    uri_note: ""
+                    network: ethereum
+                    network_warning: "Send ETH on Ethereum mainnet to this address, exactly the amount. ETH on another network (Base, Arbitrum, Optimism) or a token is not credited. A payment is credited once its block is finalized, about 15 minutes."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 1
+                solData:
+                  summary: Native SOL (a Coinbase deposit address of the invoice's own)
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c07
+                    status_token: Lz3Bq6Wt9Rk2Hc5Xn8Vm1Fs4Jd7Gy0Ep3Ua6Ki9OwTr
+                    asset: sol
+                    plan: ""
+                    item_id: data_1tib
+                    delivery: account
+                    network_name: ""
+                    tier: ""
+                    offer_applied: false
+                    price_usd: 3
+                    regular_price_usd: 3
+                    rate_usd: 82.89
+                    address: FRVmftNSNTjqLYroX272fSaPYoSJw2XDLS7Wre4Sm6zr
+                    amount: "0.036374"
+                    amount_atomic: "36374000"
+                    memo: HqExRvNq6XGUrsy9F9sjkugK1AinoL3YpDw8eXtztJjF
+                    uri: solana:FRVmftNSNTjqLYroX272fSaPYoSJw2XDLS7Wre4Sm6zr?amount=0.036374&reference=HqExRvNq6XGUrsy9F9sjkugK1AinoL3YpDw8eXtztJjF&label=URnetwork&message=URnetwork%201%20TiB%20data
+                    uri_note: ""
+                    network: solana
+                    network_warning: "Send native SOL on Solana to this address, exactly the amount. A token (SPL) transfer is not credited. The address alone identifies this invoice; the memo is optional."
+                    quoted_at: "2026-11-10T20:00:00Z"
+                    expires_at: "2026-11-10T20:30:00Z"
+                    confirmations_required: 1
+                refused:
+                  summary: A refusal (every other field empty)
+                  value:
+                    error:
+                      code: asset_unavailable
+                      message: Paying with this coin is temporarily unavailable.
         "401":
           description: Missing or invalid bearer token.
 
@@ -6083,8 +6595,8 @@ paths:
       summary: Pay Data Crypto Intent
       description: |
         Start an invoice for a data pack without signing in (the ur.io
-        buy-data page), paid in an enabled asset. Data packs only: a `plan` is
-        refused with `invalid_request`.
+        buy-data page, or an agent or a script), paid in an enabled asset.
+        Data packs only: a `plan` is refused with `invalid_request`.
 
         With `network_name`, the data goes to that network (delivery
         `network`), matched like /pay/data/network-lookup; no such network is
@@ -6095,7 +6607,9 @@ paths:
         `code`). /pay/crypto/status shows the code as `balance_code` once the
         invoice is paid, and it is emailed too when `email` is given. An
         `email` that does not look like one is refused with `invalid_email`.
-        Each request is a new invoice.
+        Each request is a new invoice, and an asset that does not deliver
+        codes, or has its most open code invoices, refuses it with
+        `asset_unavailable`.
 
         Otherwise the rules and the result are those of /pay/crypto/intent.
         Unauthenticated, per-ip rate limited (`rate_limited`).
@@ -6107,6 +6621,19 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateDataCryptoPaymentIntentArgs"
+            examples:
+              ethForNetwork:
+                summary: A 10 TiB data pack for a network by name, in ETH
+                value:
+                  asset: eth
+                  item_id: data_10tib
+                  network_name: alice
+              solCode:
+                summary: A 1 TiB balance code, in SOL, emailed once paid
+                value:
+                  asset: sol
+                  item_id: data_1tib
+                  email: alice@example.com
       responses:
         "200":
           description: The invoice, or a refusal.
@@ -6123,36 +6650,55 @@ paths:
       summary: Crypto Payment Status
       description: |
         The state of an invoice started with /pay/crypto/intent or
-        /pay/data/crypto-intent, read with its `status_token`, for a client to
-        poll while the invoice is on screen. `status`, first match wins:
+        /pay/data/crypto-intent, read with its `status_token`, for a client,
+        an agent or a script to poll until it is `paid` (every 5 to 10
+        seconds while it waits; past 60 a minute from one address the answer
+        is a 429, and the last state stands). `status`, first match wins:
 
         - `unknown`: no such invoice, or the token does not match. Nothing
           else is filled in.
-        - `paid`: credited. `balance_code` is set for delivery `code`.
-        - `review`: a payment needs an operator. `review_reason` is
+        - `paid`: credited. `balance_code` is set for delivery `code`. An
+          overpayment is credited too, with what arrived beyond the amount in
+          `excess`; the surplus is returned on request to support, in the
+          same coin, to an address the customer gives. A credited invoice
+          that later receives a second payment stays `paid`.
+        - `review`: a payment needs an operator. `review_reason` says why:
           `underpaid` (short at expiry), `late_underpaid` (arrived after
           expiry, worth less than the price at the rate of when it was first
-          seen), `orphaned` (a credited payment left the chain and its
-          entitlement was ended; reported although the invoice was credited)
-          or `voided` (a payment to an invoice an operator closed), and
-          `error.code` is `underpaid` for the first two. A credited invoice
-          that later receives a second payment stays `paid`.
+          seen), `extra` (a second payment to a paid invoice), `orphaned` (a
+          credited payment left the chain and its entitlement was ended;
+          reported although the invoice was credited), `voided` (a payment to
+          an invoice an operator closed), `credit_failed` (the payment is
+          there but its credit kept failing), `screening` (the payment's
+          senders are being checked against the sanctions list before
+          credit; it is credited once the check passes or an operator
+          decides), `transfer_shape` (a TAO transfer of a kind the rail does
+          not credit by itself: a batch, a proxy or multisig call, an EVM
+          precompile send, a stake transfer) or `amount_unmatched` (a payment
+          to a coin's shared deposit address whose amount is no open
+          invoice's). `error.code` is `underpaid` for the first two. A UI
+          shows the review copy for any value.
         - `confirming`: at least 99.5% of `amount` arrived (or, after expiry,
           a late payment worth the price at the rate of when it was first
           seen), with fewer than `confirmations_required` confirmations.
         - `seen`: something arrived, but less than that; `remaining` is how
-          much more to send to the same address.
+          much more to send to the same address, before `expires_at`. A
+          top-up to the same address counts toward the invoice.
         - `expired`: past `expires_at` with nothing received. `error.code` is
           `quote_expired`, and /pay/crypto/requote gives a new quote.
         - `pending`: nothing received yet.
 
         `received` counts payments in the mempool and on chain;
         `confirmations` is the lowest among the payments that make up the
-        amount (0 in the mempool). `usdc_solana` only reports `pending`,
-        `paid` or `expired`. A late payment that covers the price at the rate
-        of when it was first seen is still credited. Amounts are exact decimal
-        strings in the coin, each beside its atomic twin in piconero, zatoshi
-        or millionths of a USDC. Unauthenticated, per-ip rate limited.
+        amount (0 in the mempool). It counts blocks for Bitcoin (credited at
+        1), Zcash (10) and Monero (1); for TAO, ETH and SOL it is 1 once the
+        payment's block is finalized and 0 before (ETH finalizes in about 15
+        minutes, TAO in about half a minute). `usdc_solana` only reports
+        `pending`, `paid` or `expired`. A late payment that covers the price
+        at the rate of when it was first seen is still credited. Amounts are
+        exact decimal strings in the coin, each beside its atomic twin
+        (piconero, zatoshi, millionths of a USDC, rao, satoshi, wei or
+        lamport). Unauthenticated, per-ip rate limited.
       operationId: cryptoPaymentStatus
       security: []
       requestBody:
@@ -6161,6 +6707,12 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CryptoPaymentStatusArgs"
+            examples:
+              poll:
+                summary: An invoice's status, by its id and token
+                value:
+                  intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c05
+                  status_token: Pm2Kx7Wq4Tb9Hn1Zs6Cv3Rf8Ld5Ja0Ye2Ug7Oi4NtBk
       responses:
         "200":
           description: OK
@@ -6168,6 +6720,213 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CryptoPaymentStatusResult"
+              examples:
+                btcSeen:
+                  summary: Bitcoin, part of the amount arrived; send the rest to the same address
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c05
+                    asset: btc
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: seen
+                    review_reason: ""
+                    amount: "0.00054715"
+                    amount_atomic: "54715"
+                    received: "0.0003"
+                    received_atomic: "30000"
+                    remaining: "0.00024715"
+                    remaining_atomic: "24715"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: bitcoin
+                    confirmations: 0
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: null
+                    balance_code: ""
+                ethConfirming:
+                  summary: ETH, the amount arrived; credited once its block is finalized
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c06
+                    asset: eth
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: confirming
+                    review_reason: ""
+                    amount: "0.019659"
+                    amount_atomic: "19659000000000000"
+                    received: "0.019659"
+                    received_atomic: "19659000000000000"
+                    remaining: "0"
+                    remaining_atomic: "0"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: ethereum
+                    confirmations: 0
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: null
+                    balance_code: ""
+                taoPaid:
+                  summary: TAO, credited at finality
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c04
+                    asset: tao
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: paid
+                    review_reason: ""
+                    amount: "0.185773"
+                    amount_atomic: "185773000"
+                    received: "0.185773"
+                    received_atomic: "185773000"
+                    remaining: "0"
+                    remaining_atomic: "0"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: bittensor
+                    confirmations: 1
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: "2026-11-10T20:04:31Z"
+                    balance_code: ""
+                solPaidOverpaid:
+                  summary: SOL, overpaid as a balance code; the surplus is returned on request
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c07
+                    asset: sol
+                    plan: ""
+                    item_id: data_1tib
+                    delivery: code
+                    network_name: ""
+                    status: paid
+                    review_reason: ""
+                    amount: "0.036374"
+                    amount_atomic: "36374000"
+                    received: "0.04"
+                    received_atomic: "40000000"
+                    remaining: "0"
+                    remaining_atomic: "0"
+                    excess: "0.003626"
+                    excess_atomic: "3626000"
+                    network: solana
+                    confirmations: 1
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: "2026-11-10T20:02:10Z"
+                    balance_code: "JX7Q2K9M4W8R5T3B"
+                usdcPaid:
+                  summary: USDC on Solana, credited
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c01
+                    asset: usdc_solana
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: paid
+                    review_reason: ""
+                    amount: "40.004123"
+                    amount_atomic: "40004123"
+                    received: "40.004123"
+                    received_atomic: "40004123"
+                    remaining: "0"
+                    remaining_atomic: "0"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: solana
+                    confirmations: 1
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T21:00:00Z"
+                    credited_at: "2026-11-10T20:01:02Z"
+                    balance_code: ""
+                zecUnderpaid:
+                  summary: Zcash, short at expiry; an operator reviews it
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c02
+                    asset: zec
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: review
+                    review_reason: underpaid
+                    amount: "0.030815"
+                    amount_atomic: "3081500"
+                    received: "0.02"
+                    received_atomic: "2000000"
+                    remaining: "0.010815"
+                    remaining_atomic: "1081500"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: zcash
+                    confirmations: 0
+                    confirmations_required: 10
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: null
+                    balance_code: ""
+                    error:
+                      code: underpaid
+                      message: The payment is short of the quote. Contact support.
+                btcScreening:
+                  summary: Bitcoin, held while its senders are checked
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c08
+                    asset: btc
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: review
+                    review_reason: screening
+                    amount: "0.00054715"
+                    amount_atomic: "54715"
+                    received: "0.00054715"
+                    received_atomic: "54715"
+                    remaining: "0"
+                    remaining_atomic: "0"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: bitcoin
+                    confirmations: 0
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: null
+                    balance_code: ""
+                xmrExpired:
+                  summary: Monero, nothing received before expiry; ask for a new quote
+                  value:
+                    intent_id: 6f1d3c2a-8b4e-4f0a-9c1d-2e3f4a5b6c03
+                    asset: xmr
+                    plan: yearly
+                    item_id: ""
+                    delivery: account
+                    network_name: ""
+                    status: expired
+                    review_reason: ""
+                    amount: "0.072386"
+                    amount_atomic: "72386000000"
+                    received: "0"
+                    received_atomic: "0"
+                    remaining: "0.072386"
+                    remaining_atomic: "72386000000"
+                    excess: "0"
+                    excess_atomic: "0"
+                    network: monero
+                    confirmations: 0
+                    confirmations_required: 1
+                    expires_at: "2026-11-10T20:30:00Z"
+                    credited_at: null
+                    balance_code: ""
+                    error:
+                      code: quote_expired
+                      message: The quote expired with nothing received.
         "429":
           description: Too many requests from this address this minute. Plain text body.
 
@@ -6177,16 +6936,17 @@ paths:
       summary: Crypto Payment Requote
       description: |
         A new quote for an invoice that nothing has been paid to (`pending` or
-        `expired`), read with its `status_token`. For `zec` and `xmr` it is a
-        new rate, amount and expiry for the same address; the old quote is
-        kept in the invoice's history. A `usdc_solana` amount is already in
+        `expired`), read with its `status_token`. For every coin but USDC it
+        is a new rate, amount and expiry for the same address; the old quote
+        is kept in the invoice's history. A `usdc_solana` amount is already in
         dollars, so its quote only gets a later `expires_at`. The result is
-        the invoice, as /pay/crypto/intent returns it.
+        the invoice, as /pay/crypto/intent returns it, with the caller's own
+        `status_token`.
 
         Refused with `invalid_request` once something was received, or for an
-        unknown invoice or token, and with `asset_unavailable` when the asset
-        cannot be quoted right now. Unauthenticated, per-ip rate limited
-        (`rate_limited`).
+        unknown invoice or token or a closed one, and with
+        `asset_unavailable` when the asset is off or cannot be quoted right
+        now. Unauthenticated, per-ip rate limited (`rate_limited`).
       operationId: cryptoPaymentRequote
       security: []
       requestBody:
@@ -13641,16 +14401,27 @@ components:
           description: |
             The coins the network can pay in now and what each sells, as
             /pay/crypto/assets lists them in `assets`: never a coin whose
-            quotes the server refuses for now. The temporarily unavailable
-            coins are not sent here. Absent when there is none, and from older
-            servers, so an older client never shows a crypto method and a
-            newer one shows none then.
+            quotes the server refuses for now. Absent when there is none, and
+            from older servers, so an older client never shows a crypto method
+            and a newer one shows none then.
+          items:
+            $ref: "#/components/schemas/CryptoPaymentAsset"
+        crypto_unavailable_assets:
+          type: array
+          description: |
+            The coins that are on but cannot be paid with now, as
+            /pay/crypto/assets lists them in `unavailable_assets`: each with
+            `available` false and its `unavailable_reason`, for an app that
+            shows a coin greyed out (the "More coins" tab while all four of its
+            coins are unavailable). Never offered. Absent when there is none,
+            and from older servers.
           items:
             $ref: "#/components/schemas/CryptoPaymentAsset"
         crypto_term:
           description: |
-            The network's latest one-time crypto credit (USDC, Zcash or Monero)
-            whose grace has not ended; absent when there is none.
+            The network's latest one-time crypto credit (USDC or SOL on Solana,
+            Zcash, Monero, TAO, Bitcoin or ETH) whose grace has not ended;
+            absent when there is none.
           $ref: "#/components/schemas/CryptoTerm"
 
     Subscription:
@@ -13924,8 +14695,9 @@ components:
         Why a checkout or payment intent was refused (/stripe/create-checkout-session,
         /stripe/payment-intent, /subscription/stripe/payment-sheet,
         /solana/payment-intent, /pay/data/checkout, /pay/data/solana-intent,
-        /pay/crypto/intent, /pay/data/crypto-intent and /pay/crypto/requote),
-        or why a crypto invoice's status needs attention (/pay/crypto/status).
+        /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent and
+        /pay/crypto/requote), or why a crypto invoice's status needs attention
+        (/pay/crypto/status).
         Every refusal carries `message`, worded as before the codes, and a
         stable `code` beside it.
       required:
@@ -13959,10 +14731,11 @@ components:
             minute.
             `start_failed`: the payment could not be started (Stripe or the
             database failed); a retry may work.
-            `asset_unavailable`: the coin is switched off, or cannot be quoted
-            right now (rates missing, stale or too far apart, the node or the
-            scanner behind, no free receive address, too many open invoices).
-            The UI says it is temporarily unavailable.
+            `asset_unavailable`: the coin is switched off or not configured, or
+            cannot be quoted right now (rates missing, stale or too far apart,
+            the node or the scanner behind, no free receive address, too many
+            open invoices), or does not deliver balance codes. The UI says it
+            is temporarily unavailable.
             `quote_expired`: the quote's time ran out with nothing received;
             /pay/crypto/requote gives a new one.
             `underpaid`: the invoice ended short, and an operator reviews it.
@@ -13990,9 +14763,9 @@ components:
             cancel it there (`manage_url`).
             `managed_by_google_play`: Google Play bills this subscription;
             cancel it there (`manage_url`).
-            `does_not_renew`: a one-time crypto payment (USDC, Zcash or
-            Monero) covers one period and never renews, so there is nothing
-            to cancel.
+            `does_not_renew`: a one-time crypto payment (USDC, Zcash, Monero,
+            TAO, Bitcoin, ETH or SOL) covers one period and never renews, so
+            there is nothing to cancel.
             `not_cancelable`: a store the server cannot act on.
             `no_subscription`: no Stripe subscription is billing this network.
             `no_customer`: this network has no Stripe customer, so there is no
@@ -20047,11 +20820,33 @@ components:
       type: string
       description: |
         A coin a crypto invoice is paid in: `usdc_solana` (USDC on Solana),
-        `zec` (Zcash, shielded) or `xmr` (Monero).
+        `zec` (Zcash, shielded), `xmr` (Monero), `tao` (TAO on Bittensor),
+        `btc` (Bitcoin), `eth` (ETH on Ethereum mainnet) or `sol` (native SOL).
+        TAO, Bitcoin, ETH and SOL are received into a Coinbase deposit address
+        of each invoice's own and credited from the chain.
       enum:
         - usdc_solana
         - zec
         - xmr
+        - tao
+        - btc
+        - eth
+        - sol
+
+    CryptoNetwork:
+      type: string
+      description: |
+        The chain a coin is paid on: `solana` (`usdc_solana` and `sol`),
+        `zcash`, `monero`, `bittensor` (`tao`, the Finney network), `bitcoin`
+        and `ethereum` (`eth`, Ethereum mainnet only). A coin sent on another
+        network is not credited.
+      enum:
+        - solana
+        - zcash
+        - monero
+        - bittensor
+        - bitcoin
+        - ethereum
 
     CryptoPaymentStatus:
       type: string
@@ -20078,6 +20873,24 @@ components:
       properties:
         asset:
           $ref: "#/components/schemas/CryptoAsset"
+        network:
+          description: the chain to send on; absent from older servers
+          $ref: "#/components/schemas/CryptoNetwork"
+        decimals:
+          type: integer
+          description: |
+            The decimals of the coin's atomic unit: `amount_atomic` is
+            `amount` × 10^decimals (6 for USDC, 8 for Zcash and Bitcoin, 9 for
+            TAO and SOL, 12 for Monero, 18 for ETH). Absent from older servers.
+        quote_decimals:
+          type: integer
+          description: the most decimals a quoted amount has (8 for `btc`, 6 for every other coin); absent from older servers
+        payment_link:
+          type: boolean
+          description: |
+            Whether the coin's invoices carry a payment uri: false for `tao`,
+            which has no payment link standard (the invoice gives the address
+            and the amount, and `uri_note` says so). Absent from older servers.
         plans:
           type: array
           description: the plans the asset sells (`yearly`, `yearly_onboarding`); never `monthly`
@@ -20090,7 +20903,7 @@ components:
             type: string
         confirmations_required:
           type: integer
-          description: the confirmations a payment needs before it is credited
+          description: the confirmations a payment needs before it is credited (for TAO, ETH and SOL, 1 is a finalized block)
         quote_ttl_seconds:
           type: integer
           description: how long a quote holds, in seconds
@@ -20099,8 +20912,8 @@ components:
           description: |
             Whether the asset can be paid with now: true for every asset of
             `assets` and of `crypto_assets`, false for one of
-            `unavailable_assets`. Absent from older servers, which listed only
-            assets they would sell.
+            `unavailable_assets` and `crypto_unavailable_assets`. Absent from
+            older servers, which listed only assets they would sell.
         unavailable_reason:
           $ref: "#/components/schemas/CryptoAssetUnavailableReason"
 
@@ -20108,14 +20921,22 @@ components:
       type: string
       description: |
         Why an asset that is on cannot be paid with now; absent when it can.
-        `scanner_lagging`: its wallet scanner has not succeeded within three
-        scan intervals (or never), or the wallet lags the network by more than
-        the coin's allowed blocks. `network_height_unknown`: the scanner knows
-        no network height or wallet height, so the lag cannot be judged. A UI
+        `scanner_lagging`: its scanner has not succeeded within three scan
+        intervals (or never), or lags the network by more than the coin's
+        allowed blocks. `network_height_unknown`: the scanner knows no network
+        height or wallet height, so the lag cannot be judged.
+        `not_configured`: the coin is switched on but its backend is not
+        configured (its chain source, or for TAO, Bitcoin, ETH and SOL the key
+        that makes their deposit addresses). `address_pool_empty`: no free
+        receive address is ready. `rates_unavailable`: its rate sources were
+        asked lately and left fewer than two fresh answers that agree. A UI
         shows any value as temporarily unavailable.
       enum:
         - scanner_lagging
         - network_height_unknown
+        - not_configured
+        - address_pool_empty
+        - rates_unavailable
 
     CryptoPaymentAssetsResult:
       type: object
@@ -20152,11 +20973,17 @@ components:
       properties:
         market:
           type: string
-          description: the subscription market of the credit
+          description: |
+            The subscription market of the credit: `solana` (USDC or SOL),
+            `monero`, `zcash`, `bittensor` (TAO), `bitcoin` or `ethereum`
+            (ETH).
           enum:
             - solana
             - monero
             - zcash
+            - bittensor
+            - bitcoin
+            - ethereum
         term_end_time:
           type: string
           format: date-time
@@ -20165,6 +20992,103 @@ components:
           type: string
           format: date-time
           description: when the grace ends, and Pro with it
+
+    CryptoPaymentQuoteArgs:
+      type: object
+      required:
+        - asset
+      properties:
+        asset:
+          $ref: "#/components/schemas/CryptoAsset"
+        plan:
+          type: string
+          description: |
+            The plan, when pricing Pro: `yearly`, or `yearly_onboarding` for the
+            welcome offer (with a bearer token of a network that may redeem
+            it). Give exactly one of `plan` and `item_id`. `monthly` is card
+            only and is refused (`plan_unavailable`).
+          enum:
+            - yearly
+            - yearly_onboarding
+        item_id:
+          type: string
+          description: The data pack, when pricing data.
+          enum:
+            - data_1tib
+            - data_10tib
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the caller knows it; the server resolves the regional tier otherwise
+
+    CryptoPaymentQuoteResult:
+      type: object
+      description: |
+        What an invoice made now would ask, or a refusal in `error`. In a
+        refusal every other field is empty: the strings empty, the numbers 0,
+        the booleans false and the times null.
+      required: []
+      properties:
+        asset:
+          type: string
+          description: the coin (CryptoAsset)
+        plan:
+          type: string
+          description: the plan priced; empty for a data pack
+        item_id:
+          type: string
+          description: the data pack priced; empty for a plan
+        tier:
+          type: string
+          description: the regional price tier of a plan's price; empty for a data pack
+        offer_applied:
+          type: boolean
+          description: the welcome offer's price was applied
+        price_usd:
+          type: number
+          description: the price in USD, the same as the card price
+        regular_price_usd:
+          type: number
+          description: the regular price (the full-year price for `yearly_onboarding`)
+        rate_usd:
+          type: number
+          description: the coin's USD rate the amount is quoted at (1 for USDC)
+        amount:
+          type: string
+          description: |
+            What an invoice made now asks, an exact decimal in the coin: the
+            price × (1 + the coin's buffer: 1% for TAO, 0.5% for the others) ÷
+            `rate_usd`, rounded up to `quote_decimals`. A USDC invoice adds a
+            unique sub-cent suffix to this price.
+        amount_atomic:
+          type: string
+          description: the same amount in the coin's atomic unit, a decimal integer string
+        network:
+          type: string
+          description: the chain the payment is sent on (CryptoNetwork)
+        decimals:
+          type: integer
+          description: the decimals of the coin's atomic unit
+        quote_decimals:
+          type: integer
+          description: the most decimals a quoted amount has
+        payment_link:
+          type: boolean
+          description: whether the coin's invoices carry a payment uri (false for `tao`)
+        quote_ttl_seconds:
+          type: integer
+          description: how long an invoice's quote holds, in seconds
+        confirmations_required:
+          type: integer
+          description: the confirmations a payment needs before it is credited
+        quoted_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/PurchaseError"
+            - type: "null"
 
     CreateCryptoPaymentIntentArgs:
       type: object
@@ -20237,7 +21161,7 @@ components:
           type: string
         asset:
           type: string
-          description: "`usdc_solana`, `zec` or `xmr` (CryptoAsset)"
+          description: the coin (CryptoAsset)
         plan:
           type: string
           description: the plan the invoice buys; empty for a data pack
@@ -20260,8 +21184,10 @@ components:
           type: string
           description: |
             Why the invoice is in `review`: `underpaid`, `late_underpaid`,
-            `orphaned` or `voided` (/pay/crypto/status says when each
-            applies). Empty otherwise.
+            `extra`, `orphaned`, `voided`, `credit_failed`, `screening`,
+            `transfer_shape` or `amount_unmatched` (/pay/crypto/status says
+            when each applies). Empty otherwise. A UI shows the review copy for
+            any value, a new one included.
         amount:
           type: string
           description: the quoted amount, an exact decimal in the coin
@@ -20270,17 +21196,31 @@ components:
           description: the quoted amount in atomic units, a decimal integer
         received:
           type: string
-          description: what has arrived so far, mempool included
+          description: what has arrived so far, mempool included, top-ups to the same address counted
         received_atomic:
           type: string
         remaining:
           type: string
-          description: how much more to send; "0" once the amount is covered
+          description: how much more to send to the same address; "0" once the amount is covered
         remaining_atomic:
           type: string
+        excess:
+          type: string
+          description: |
+            What arrived beyond `amount`, "0" when nothing did. An overpaid
+            invoice is credited as `paid`; the surplus is returned on request to
+            support, in the same coin. Absent from older servers.
+        excess_atomic:
+          type: string
+        network:
+          type: string
+          description: the chain the payment is sent on (CryptoNetwork); absent from older servers
         confirmations:
           type: integer
-          description: the lowest confirmation count among the payments that make up the amount
+          description: |
+            The lowest confirmation count among the payments that make up the
+            amount (0 in the mempool). Blocks for Bitcoin, Zcash and Monero;
+            for TAO, ETH and SOL, 1 once the payment's block is finalized.
         confirmations_required:
           type: integer
         expires_at:
@@ -20324,7 +21264,7 @@ components:
             comes with a new token; every token handed out stays valid.
         asset:
           type: string
-          description: "`usdc_solana`, `zec` or `xmr` (CryptoAsset)"
+          description: the coin (CryptoAsset)
         plan:
           type: string
           description: the plan the invoice buys; empty for a data pack
@@ -20358,26 +21298,50 @@ components:
           description: the coin's USD rate the amount was quoted at (1 for USDC)
         address:
           type: string
-          description: the invoice's own receive address
+          description: |
+            Where to pay: the invoice's own receive address (a Zcash unified
+            address, a Monero subaddress, or a Coinbase deposit address for
+            TAO, Bitcoin, ETH and SOL, ETH's in EIP-55 case), or for USDC the
+            one merchant address.
         amount:
           type: string
           description: |
-            The exact amount to send, a decimal string in the coin. Zcash and
-            Monero amounts are rounded up to 6 decimals; a USDC amount carries
-            its unique 6-decimal suffix, so show and pay every decimal.
+            The exact amount to send, a decimal string in the coin. Amounts are
+            rounded up to the coin's quote decimals (8 for Bitcoin, 6 for the
+            others); a USDC amount carries its unique 6-decimal suffix, so
+            show and pay every decimal.
         amount_atomic:
           type: string
-          description: the same amount in atomic units (piconero, zatoshi or millionths of a USDC), a decimal integer string
+          description: the same amount in atomic units (piconero, zatoshi, millionths of a USDC, rao, satoshi, wei or lamport), a decimal integer string
         memo:
           type: string
-          description: the reference, for a USDC transfer sent by hand; set for `usdc_solana` only
+          description: |
+            The Solana Pay reference: for `usdc_solana` the memo of a USDC
+            transfer sent by hand; for `sol` optional, since the address alone
+            identifies the invoice. Empty for every other coin.
         uri:
           type: string
           description: |
-            The payment uri the server built (`monero:`, `zcash:` per ZIP 321, or
-            `solana:` per Solana Pay), to show as a QR code and open in a
-            wallet. A client never builds its own, and refuses one that does
-            not pay `address`.
+            The payment uri the server built, to show as a QR code and open in
+            a wallet: `solana:` (Solana Pay; USDC with the USDC mint as its one
+            `spl-token`, SOL with none), `zcash:` (ZIP 321), `monero:`,
+            `bitcoin:` (BIP 21, `amount`, `label` and `message` only) or
+            `ethereum:<address>@1?value=<wei>` (EIP 681). Empty for `tao`,
+            which has no payment link standard (`uri_note`). A client never
+            builds its own, and refuses one that does not pay `address` byte
+            for byte.
+        uri_note:
+          type: string
+          description: when `uri` is empty, why, in English (TAO has no payment link standard); else empty
+        network:
+          type: string
+          description: the chain the payment must be sent on (CryptoNetwork)
+        network_warning:
+          type: string
+          description: |
+            What to send and on which network, in English, for a person or an
+            agent paying by hand: a coin sent on another network, or a token
+            instead of the coin, is not credited.
         quoted_at:
           oneOf:
             - type: string
@@ -21932,6 +22896,55 @@ components:
       properties:
         message:
           description: Set only when the transfer was not credited.
+          type: string
+
+    AlchemyWebhookArgs:
+      type: object
+      description: |
+        An Alchemy Address Activity delivery, as Alchemy sends it; only these
+        fields are read.
+      required:
+        - webhookId
+      properties:
+        webhookId:
+          type: string
+          description: the webhook the delivery is from, which picks its signing key and its coin
+        id:
+          type: string
+          description: the delivery's own id
+        type:
+          type: string
+          description: the webhook type (`ADDRESS_ACTIVITY`)
+        event:
+          type: object
+          properties:
+            network:
+              type: string
+              description: the webhook's network (`ETH_MAINNET`)
+            activity:
+              type: array
+              items:
+                type: object
+                properties:
+                  fromAddress:
+                    type: string
+                  toAddress:
+                    type: string
+                    description: the recipient; an invoice address is read on the coin's next scan
+                  hash:
+                    type: string
+                  category:
+                    type: string
+                    description: "`external` or `internal` for ETH; token categories are ignored"
+                  asset:
+                    type: string
+
+    AlchemyWebhookResult:
+      type: object
+      required: []
+      properties:
+        message:
+          description: What the delivery prompted, for the log.
           type: string
 
     CircleChallengeNotification:
