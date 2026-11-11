@@ -6898,8 +6898,10 @@ paths:
         (a coin sent on another network, or a token instead of the coin). The
         address alone identifies the invoice for every coin but USDC; `memo`
         is the Solana Pay reference for `usdc_solana` (a USDC transfer sent by
-        hand carries it as its memo) and for `sol` (optional there), and
-        empty for every other coin.
+        hand carries it as its memo) and empty for every other coin, `sol`
+        included: a SOL invoice's own deposit address identifies it, and its
+        Solana Pay reference is in `uri` only. Show a memo only when it is
+        not empty.
 
         `uri` is the payment link to show as a QR code and open in a wallet:
         `solana:` (Solana Pay; USDC names the USDC mint as its one
@@ -7181,11 +7183,11 @@ paths:
                     address: FRVmftNSNTjqLYroX272fSaPYoSJw2XDLS7Wre4Sm6zr
                     amount: "0.036374"
                     amount_atomic: "36374000"
-                    memo: HqExRvNq6XGUrsy9F9sjkugK1AinoL3YpDw8eXtztJjF
+                    memo: ""
                     uri: solana:FRVmftNSNTjqLYroX272fSaPYoSJw2XDLS7Wre4Sm6zr?amount=0.036374&reference=HqExRvNq6XGUrsy9F9sjkugK1AinoL3YpDw8eXtztJjF&label=URnetwork&message=URnetwork%201%20TiB%20data
                     uri_note: ""
                     network: solana
-                    network_warning: "Send native SOL on Solana to this address, exactly the amount. A token (SPL) transfer is not credited. The address alone identifies this invoice; the memo is optional."
+                    network_warning: "Send native SOL on Solana to this address, exactly the amount. A token (SPL) transfer is not credited. The address alone identifies this invoice: no memo is needed."
                     quoted_at: "2026-11-10T20:00:00Z"
                     expires_at: "2026-11-10T20:30:00Z"
                     confirmations_required: 1
@@ -15251,6 +15253,10 @@ components:
 
     EventStore:
       type: string
+      description: |
+        The store of a purchase. A crypto purchase names its coin's market:
+        `solana` for USDC and SOL, `zcash`, `monero`, `bittensor` for TAO,
+        `bitcoin` and `ethereum`.
       enum:
         - apple
         - play
@@ -15258,6 +15264,9 @@ components:
         - solana
         - zcash
         - monero
+        - bittensor
+        - bitcoin
+        - ethereum
 
     EventPlatform:
       type: string
@@ -21577,9 +21586,25 @@ components:
         and never before.
       required:
         - market
+        - asset
         - term_end_time
         - grace_end_time
       properties:
+        asset:
+          type: string
+          description: |
+            The coin the term was paid with. USDC and native SOL share the
+            `solana` market; `asset` tells them apart (`usdc_solana` or
+            `sol`) for the whole term, after the payment's 30-day unlink
+            too.
+          enum:
+            - usdc_solana
+            - sol
+            - xmr
+            - zec
+            - tao
+            - btc
+            - eth
         market:
           type: string
           description: |
@@ -21925,9 +21950,11 @@ components:
         memo:
           type: string
           description: |
-            The Solana Pay reference: for `usdc_solana` the memo of a USDC
-            transfer sent by hand; for `sol` optional, since the address alone
-            identifies the invoice. Empty for every other coin.
+            For `usdc_solana`, the Solana Pay reference: the memo of a USDC
+            transfer sent by hand. Empty for every other coin, `sol` included
+            (its own deposit address identifies the invoice; its Solana Pay
+            reference is in `uri` only). Show a memo only when it is not
+            empty.
         uri:
           type: string
           description: |
@@ -22050,7 +22077,7 @@ components:
             properties:
               store:
                 type: string
-                description: stripe | apple | google | solana | monero | zcash | manual | x402 | "" (unknown)
+                description: stripe | apple | google | solana | monero | zcash | bittensor | bitcoin | ethereum | manual | x402 | "" (unknown)
               plan:
                 type: string
                 description: The wire plan value ("supporter"); shown as Pro.
@@ -22078,6 +22105,21 @@ components:
               transaction_id:
                 type: string
                 description: The store handle for support; invoice id, original transaction id, purchase token, payment reference or crypto invoice id.
+              crypto_asset:
+                type: string
+                description: |
+                  A one-time crypto year's coin: usdc_solana, sol, xmr, zec,
+                  tao, btc or eth. USDC and native SOL share the `solana`
+                  store; this tells them apart for the whole term. Left out
+                  for the other stores.
+                enum:
+                  - usdc_solana
+                  - sol
+                  - xmr
+                  - zec
+                  - tao
+                  - btc
+                  - eth
         has_stripe_customer:
           type: boolean
           description: A Stripe customer exists for the network; gate for /stripe/customer-portal.
