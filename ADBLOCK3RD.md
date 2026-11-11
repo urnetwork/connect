@@ -270,18 +270,20 @@ Line numbers in this section refer to connect on `fix/default-resolvers-v2`;
   can only be a choice made after the move.
 - Version 4 (`fix/regional-dns-ir-tr-tm-1111`, 2026-11-11): ir's regional
   recommendation names Shecan and Electro instead of Shecan and 403.online's
-  private 10.202.10.10, which no query through the tunnel reaches; tr's names
-  Cloudflare and Quad9's 9.9.9.10, as kz's, instead of TTNET's and Turkcell
-  Superonline's resolvers, which answer only their own customers; and tm has
-  none, since Turkmentelecom refuses outside clients and answers the
-  platform's own names with 127.0.0.1 (`net_http_doh_regional.go` records
-  the measurements). In sdk a record from before the presets that holds an
-  earlier ir, tr or tm recommendation exactly (remote plain DNS alone, the
-  tm one with or without Google, servers in any order, any fallback choice
-  and mask) loads as that country's regional pick, so ir and tr follow
-  today's lists and `regional-tm` applies URnetwork's default with its
-  notice. The edit rule reads a regional selection holding an earlier
-  recommendation of its country as that release's derivation
+  private 10.202.10.10, which no query through the tunnel reaches. tr has
+  none (owner decision): DoH works in Turkey, so the apps never suggest
+  unencrypted DNS on a Turkish exit, and its old TTNET and Turkcell
+  Superonline resolvers answer only their own customers. tm has none either,
+  since Turkmentelecom refuses outside clients and answers the platform's
+  own names with 127.0.0.1 (`net_http_doh_regional.go` records the
+  measurements). In sdk a record below version 4 that holds an earlier ir,
+  tr or tm recommendation exactly as Custom (remote plain DNS alone, the tm
+  one with or without Google, servers in any order, any fallback choice and
+  mask) loads as that country's regional pick: `regional-ir` follows today's
+  list, and `regional-tr` and `regional-tm` apply URnetwork's default with
+  the dropped-selection notice, never remote plain DNS with no server. The
+  edit rule reads a regional selection holding an earlier recommendation of
+  its country as that release's derivation
   (`dnsResolverSettingsEarlierRegionalRecommendations`). The Google-era tm
   pair no longer migrates to the current tm list, which tm no longer has.
 - mmm updated the ur.io threat model's resolver rows to match

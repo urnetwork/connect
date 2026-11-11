@@ -332,43 +332,36 @@ func TestIrRecommendationIsShecanAndElectro(t *testing.T) {
 	}
 }
 
-// tr's recommendation is Cloudflare and Quad9's unfiltered 9.9.9.10, as kz's,
-// in both families, each v6 server paired with its operator's v4 one so the
-// dual-stack walk keeps both.
-func TestTrRecommendationIsCloudflareAndQuad9(t *testing.T) {
-	ipv4 := RegionalDnsServerIps("tr")
-	ipv6 := RegionalDnsServerIpv6s("tr")
-	if want := []string{"1.1.1.1", "9.9.9.10"}; !slices.Equal(ipv4, want) {
-		t.Errorf("tr v4 recommendation = %v, want %v", ipv4, want)
-	}
-	if want := []string{"2606:4700:4700::1111", "2620:fe::10"}; !slices.Equal(ipv6, want) {
-		t.Errorf("tr v6 recommendation = %v, want %v", ipv6, want)
-	}
-	if want := []string{"1.1.1.1", "2606:4700:4700::1111", "9.9.9.10", "2620:fe::10"}; !slices.Equal(dualStackList(ipv4, ipv6, knownDnsServerPairs), want) {
-		t.Errorf("tr dual-stack walk = %v, want %v", dualStackList(ipv4, ipv6, knownDnsServerPairs), want)
-	}
-	if strategy := IngressDnsStrategyForCountry("tr"); !slices.Equal(strategy.PlainDnsIpv4, ipv4) || !slices.Equal(strategy.PlainDnsIpv6, ipv6) {
-		t.Errorf("tr ingress plain dns = %v %v, want the recommendation", strategy.PlainDnsIpv4, strategy.PlainDnsIpv6)
-	}
-}
-
-// tm has no recommendation and is no connection region: a user who declared
-// it is undisclosed, with the defaults' bootstrap plain servers, and the
-// tunnel uses the default resolvers.
-func TestTmHasNoRecommendation(t *testing.T) {
-	if resolver := RegionalDnsResolverSettings("tm"); resolver != nil {
-		t.Errorf("tm recommendation = %+v, want none", resolver)
-	}
-	if slices.Contains(IngressCountryCodes(), "tm") {
-		t.Errorf("tm is a connection region: %v", IngressCountryCodes())
-	}
-	strategy := IngressDnsStrategyForCountry("tm")
-	if 0 < len(strategy.DohUrlsIpv4) || 0 < len(strategy.DohUrlsIpv6) || 0 < len(strategy.PlainDnsIpv4) || 0 < len(strategy.PlainDnsIpv6) {
-		t.Errorf("tm ingress strategy = %+v, want the defaults", strategy)
-	}
-	for _, network := range []string{"udp", "udp4", "udp6", "tcp"} {
-		if got, want := bootstrapPlainDnsServers(IngressDohSettings("tm", nil, nil), network), bootstrapPlainDnsServers(IngressDohSettings("", nil, nil), network); !slices.Equal(got, want) {
-			t.Errorf("tm bootstrap plain dns %s = %v, want the undisclosed %v", network, got, want)
+// tr and tm have no recommendation and are no connection region: a user who
+// declared one is undisclosed, with the defaults' bootstrap plain servers, and
+// the tunnel uses the default resolvers. tr's was dropped on 2026-11-11
+// because DoH works in Turkey (owner decision), so the apps never suggest
+// unencrypted dns on a Turkish exit; tm's because nothing could be verified
+// from inside Turkmenistan.
+func TestTrAndTmHaveNoRecommendation(t *testing.T) {
+	for _, countryCode := range []string{"tr", "tm"} {
+		if resolver := RegionalDnsResolverSettings(countryCode); resolver != nil {
+			t.Errorf("%s recommendation = %+v, want none", countryCode, resolver)
+		}
+		if ipv4, ipv6 := RegionalDnsServerIps(countryCode), RegionalDnsServerIpv6s(countryCode); 0 < len(ipv4) || 0 < len(ipv6) {
+			t.Errorf("%s regional servers = %v %v, want none", countryCode, ipv4, ipv6)
+		}
+		for _, server := range RegionalDnsServers() {
+			if server.CountryCode == countryCode {
+				t.Errorf("the regional servers name %s's %s %s", countryCode, server.Name, server.Ipv4)
+			}
+		}
+		if slices.Contains(IngressCountryCodes(), countryCode) {
+			t.Errorf("%s is a connection region: %v", countryCode, IngressCountryCodes())
+		}
+		strategy := IngressDnsStrategyForCountry(countryCode)
+		if 0 < len(strategy.DohUrlsIpv4) || 0 < len(strategy.DohUrlsIpv6) || 0 < len(strategy.PlainDnsIpv4) || 0 < len(strategy.PlainDnsIpv6) {
+			t.Errorf("%s ingress strategy = %+v, want the defaults", countryCode, strategy)
+		}
+		for _, network := range []string{"udp", "udp4", "udp6", "tcp"} {
+			if got, want := bootstrapPlainDnsServers(IngressDohSettings(countryCode, nil, nil), network), bootstrapPlainDnsServers(IngressDohSettings("", nil, nil), network); !slices.Equal(got, want) {
+				t.Errorf("%s bootstrap plain dns %s = %v, want the undisclosed %v", countryCode, network, got, want)
+			}
 		}
 	}
 }

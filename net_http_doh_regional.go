@@ -55,21 +55,21 @@ type RegionalDnsServer struct {
 // injected 10.10.34.x. Shecan's second address (185.51.200.2) answers no
 // recursive query from outside, and no v6 resolver of either is known.
 //
-// tr's recommendation is Cloudflare and Quad9, as kz's. Until 2026-11-11 it
+// tr has no recommendation (owner decision 2026-11-11): DoH works in Turkey,
+// so the apps never suggest unencrypted dns on a Turkish exit, and the
+// defaults serve both the tunnel and the ingress fallback. Until 2026-11-11 tr
 // named TTNET (195.175.39.39) and Turkcell Superonline (212.252.114.8), which
 // answer only their own networks: through the 14 URnetwork exits in Turkey on
 // 2026-11-11 (TurkNet, 2E Telekom, TTNET, two small networks and one that
 // Cloudflare places in Germany), TTNET's resolvers answered only the 2E
-// Telekom exit, Superonline's no exit, and TurkNet's own only TurkNet's.
-// 1.1.1.1 answered on all 13 exits that carried udp and 9.9.9.10 on 9; the
-// other 4, all on one network, answered only Cloudflare's. Their answers were
-// right and none was intercepted; only the ISP resolvers answered with
-// Turkey's block address (discord.com as 195.175.254.2). In OONI from Turkey
-// (Oct-Nov 2026) plain UDP to their v4 addresses answered 99% of queries on
-// Superonline, 97% on TurkNet and all on Turkcell mobile, none intercepted,
-// and DoH answered on Türk Telekom, TT Mobil, Superonline, Turkcell and
-// TurkNet. Their v6 addresses are in the anycast networks that answered DoH
-// over v6 from TurkNet and Türk Telekom; no exit had v6.
+// Telekom exit, Superonline's no exit, and TurkNet's own only TurkNet's, and
+// only the ISP resolvers answered with Turkey's block address (discord.com as
+// 195.175.254.2). 1.1.1.1 answered on all 13 exits that carried udp and
+// 9.9.9.10 on 9, the other 4 all on one network, none intercepted. In OONI
+// from Turkey (Oct-Nov 2026) DoH to Cloudflare and Quad9 answered on Türk
+// Telekom, TT Mobil, Superonline, Turkcell and TurkNet, and plain UDP to them
+// answered 99% of queries on Superonline, 97% on TurkNet and all on Turkcell
+// mobile.
 //
 // tm has no recommendation. Until 2026-11-11 it named Turkmentelecom
 // (217.174.238.141), which refuses recursion to clients outside its network
@@ -99,8 +99,6 @@ var regionalDnsServers = []*RegionalDnsServer{
 	{CountryCode: "ru", Name: "National DNS (NSDI)", Ipv4: "195.208.5.1"},
 	{CountryCode: "ir", Name: "Shecan", Ipv4: "178.22.122.100"},
 	{CountryCode: "ir", Name: "Electro", Ipv4: "78.157.42.100"},
-	{CountryCode: "tr", Name: "Cloudflare", Ipv4: "1.1.1.1", Ipv6: "2606:4700:4700::1111"},
-	{CountryCode: "tr", Name: "Quad9", Ipv4: "9.9.9.10", Ipv6: "2620:fe::10"},
 	{CountryCode: "kz", Name: "Cloudflare", Ipv4: "1.1.1.1", Ipv6: "2606:4700:4700::1111"},
 	{CountryCode: "kz", Name: "Quad9", Ipv4: "9.9.9.10", Ipv6: "2620:fe::10"},
 }
