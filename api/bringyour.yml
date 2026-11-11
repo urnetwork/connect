@@ -1474,11 +1474,13 @@ paths:
             their `error`.
           headers:
             PAYMENT-REQUIRED:
-              description: |
-                The x402 v2 terms: base64 of the JSON of
-                `#/components/schemas/X402PaymentRequiredV2`.
+              description: The x402 v2 terms, base64 of their JSON.
               schema:
                 type: string
+                contentEncoding: base64
+                contentMediaType: application/json
+                contentSchema:
+                  $ref: "#/components/schemas/X402PaymentRequiredV2"
           content:
             application/json:
               schema:
@@ -4389,11 +4391,13 @@ paths:
             `PAYMENT-RESPONSE` (v2) or `X-PAYMENT-RESPONSE` (v1).
           headers:
             PAYMENT-REQUIRED:
-              description: |
-                The x402 v2 terms: base64 of the JSON of
-                `#/components/schemas/X402PaymentRequiredV2`.
+              description: The x402 v2 terms, base64 of their JSON.
               schema:
                 type: string
+                contentEncoding: base64
+                contentMediaType: application/json
+                contentSchema:
+                  $ref: "#/components/schemas/X402PaymentRequiredV2"
           content:
             application/json:
               schema:
