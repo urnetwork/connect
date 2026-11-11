@@ -9562,24 +9562,51 @@ paths:
   /sn/ledger/account:
     get:
       tags: [Other]
-      summary: A coldkey's settlement v2 accounts with their claim proofs
+      summary: A coldkey's settlement v2 accounts in every pool, with their claim proofs
       description: |
         The coldkey's settlement v2 account in each pool that holds it, one
         entry per pool in ascending `no_id`, with what a claim needs: the
         latest finalized root's cumulative, its bottom-up proof, and vault2's
-        `claimed`, read at the finalized block tag. The pools are this
-        operator's pool, when its latest finalized root or its pending root
-        holds the coldkey, and any other pool where this server has recorded
-        an account for the coldkey. Amounts are decimal strings of rao.
+        `claimed`, read at the finalized block tag. The pools are the
+        operator's own two, its pool (`no_id` n) and its capture the flag
+        pool (`no_id` 2^32 + n, 4294967297 for operator 1), when the latest
+        finalized root or the pending root holds the coldkey, and any other
+        pool where this server has recorded an account for the coldkey.
+        Amounts are decimal strings of rao. A capture the flag account is
+        claimed from vault2 like any pool's.
+
+        Each entry names its pool's `kind` and a display `label`. Entries
+        carry every field they carried before, so a client that predates
+        `kind` shows a capture the flag account as "Pool 4294967297" and
+        claims it like any pool.
 
         An account only in the pending root has a null `root_index` and
         `proof`, and a `cumulative` and `claimed` of "0". A coldkey that no
         root holds, like every coldkey while settlement v2 is not configured,
-        has `"accounts": []`. The answer is whole or a 502, never partial, and
-        carries `Cache-Control: no-store`.
+        has `"accounts": []`.
+
+        **Whole or partial**. Without `partial=true` the answer is whole or a
+        502, never partial, exactly as before, so a client that does not know
+        `unavailable_pools` can never mistake a partial list for a whole one;
+        its `unavailable_pools` is always `[]`. With `partial=true` a pool
+        whose ledger cannot be read (its objects cannot be read or do not
+        rebuild its committed root, vault2's `claimed` cannot be read or is
+        above the finalized cumulative, or a recorded account is not at its
+        index) is left out of `accounts` and named in `unavailable_pools`,
+        and the other pools are answered. A client shows such a pool as
+        unavailable, never as zero. Even then the answer is a 502 when the
+        server cannot tell which pools to answer, because its record of the
+        coldkey's accounts cannot be read. From the first capture the flag
+        root a fault in either pool's ledger answers a request without
+        `partial=true` with a 502, the operator's pool's balance included, so
+        a client that knows `unavailable_pools` sends `partial=true`.
+
+        Errors are RFC 9457 problem details. The answer carries
+        `Cache-Control: no-store`.
 
         Public: a proof only reveals published data, and a claim always pays
-        the leaf's coldkey.
+        the leaf's coldkey. sn/api/operator.yml documents this operation too,
+        beside the operator's capture the flag routes, with the same fields.
       operationId: snLedgerAccount
       security: []
       parameters:
@@ -9591,6 +9618,15 @@ paths:
             valid checksum, or `0x` and 64 hex digits in either case.
           schema:
             type: string
+        - in: query
+          name: partial
+          required: false
+          description: |
+            `true` to answer the pools that can be read and name the others in
+            `unavailable_pools`, instead of failing the whole answer with a 502.
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
           description: OK.
@@ -9600,13 +9636,36 @@ paths:
                 $ref: "#/components/schemas/SnLedgerAccountResult"
         "400":
           description: The coldkey is missing, or is neither an ss58 address with the Bittensor prefix nor `0x` and 64 hex digits.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/SnProblem"
+              example:
+                type: about:blank
+                title: Bad Request
+                status: 400
+                code: bad_request
+                detail: coldkey is not an ss58 address or 0x and 64 hex digits
         "502":
           description: |
-            The ledger is unavailable, so nothing is answered: a root's ledger
-            objects cannot be read or do not rebuild its committed root, there
-            is no chain client or vault2's `claimed` cannot be read, `claimed`
-            is above the finalized cumulative, or an account the server
-            recorded is not at its index in the finalized root.
+            The ledger is unavailable, so nothing is answered. Without
+            `partial=true`: any pool's ledger objects cannot be read or do not
+            rebuild its committed root, there is no chain client or vault2's
+            `claimed` cannot be read, `claimed` is above the finalized
+            cumulative, or an account the server recorded is not at its index
+            in the finalized root. With `partial=true`: the server's record of
+            the coldkey's accounts cannot be read, so it cannot tell which
+            pools to answer.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/SnProblem"
+              example:
+                type: about:blank
+                title: Bad Gateway
+                status: 502
+                code: ledger_unavailable
+                detail: Ledger account unavailable.
 
   /sn/claim-relay:
     get:
@@ -9620,11 +9679,19 @@ paths:
         wait for the next UTC day, which costs nothing, since v2 credit never
         expires. A device can always claim for itself with its gas key.
 
-        This answers for the caller's network: each of its coldkeys with an
-        account in the operator's pool, what a claim would pay now, why it is
-        still pending, and whether Claim now can be tapped. A coldkey the network
-        has replaced stays listed while it has an account, since URnetwork keeps
-        claiming it.
+        This answers for the caller's network: each account of its coldkeys in
+        the operator's pools, its pool and its capture the flag pool, one row
+        per coldkey and pool with the pool's `kind` and `label`; what a claim
+        would pay now, why it is still pending, and whether Claim now can be
+        tapped. A coldkey the network has replaced stays listed while it has
+        an account, since URnetwork keeps claiming it. When one of a coldkey's
+        accounts is due, URnetwork claims the coldkey's other accounts above
+        the transfer floor in the same batch, so those read as `queued`.
+
+        Without `partial=true` the accounts are whole, or `error` says the
+        balances could not be read. With `partial=true` an operator's pool
+        whose ledger cannot be read is named in `unavailable_pools` and the
+        others are answered: show that pool as unavailable, never as zero.
 
         An account whose latest claim URnetwork sent names that claim's
         transaction, `claim_tx_hash`, and what it paid, `claim_amount_rao`. A
@@ -9642,6 +9709,16 @@ paths:
       operationId: snClaimRelay
       security:
         - BearerAuth: []
+      parameters:
+        - in: query
+          name: partial
+          required: false
+          description: |
+            `true` to answer the pools that can be read and name the others in
+            `unavailable_pools`, instead of an `error` for all of them.
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
           description: OK.
@@ -9656,12 +9733,14 @@ paths:
       tags: [Other]
       summary: Ask URnetwork to claim one coldkey's balance now
       description: |
-        Queues a balance of one of the caller's network's coldkeys for the relay's
-        next pass, ahead of the balances over the automatic threshold, under the
-        same daily cap, once the balance clears the transfer floor. A coldkey can
-        do this once per 30 days, counted from when URnetwork pays a tapped claim
-        it would not have sent by itself, so a tap that sends nothing, or only
-        moves an automatic claim ahead, uses nothing up.
+        Queues the balances of one of the caller's network's coldkeys for the
+        relay's next pass, ahead of the balances over the automatic threshold,
+        under the same daily cap: its account in each of the operator's pools
+        whose balance clears the transfer floor, in one batch where the relay
+        batches. A coldkey can do this once per 30 days, counted from when
+        URnetwork pays a tapped claim it would not have sent by itself, so a
+        tap that sends nothing, or only moves an automatic claim ahead, uses
+        nothing up.
 
         `requested` false with a `reason` is the answer for a balance that cannot
         be claimed for now: the same values as an account's `claim_now_reason`. A
@@ -24204,17 +24283,31 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SnClaimRelayAccount"
+        unavailable_pools:
+          type: array
+          description: |
+            With `partial=true`, the operator's pools whose ledger could not be
+            read, in ascending `no_id`: their balances are unavailable, never
+            zero. Always `[]` without `partial=true`.
+          items:
+            $ref: "#/components/schemas/SnLedgerUnavailablePool"
         error:
           $ref: "#/components/schemas/SnClaimRelayError"
     SnClaimRelayAccount:
       type: object
-      required: [coldkey_ss58, no_id, index, claimable_rao, value_tao_rao, pending_rao, reason, claim_now_available]
+      required: [coldkey_ss58, no_id, kind, label, index, claimable_rao, value_tao_rao, pending_rao, reason, claim_now_available]
       properties:
         coldkey_ss58:
           type: string
         no_id:
           type: integer
           format: int64
+          description: The pool's vault2 id, which a claim names.
+        kind:
+          $ref: "#/components/schemas/SnLedgerPoolKind"
+        label:
+          type: string
+          description: An English display name for the pool, for clients without a localized one. Not for parsing.
         index:
           type: integer
           format: int64
@@ -24285,6 +24378,7 @@ components:
       required:
         - coldkey
         - accounts
+        - unavailable_pools
       properties:
         coldkey:
           description: The coldkey, `0x` and 64 lowercase hex digits.
@@ -24298,12 +24392,50 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SnLedgerAccount"
+        unavailable_pools:
+          description: |
+            With `partial=true`, the pools whose ledger could not be read, in
+            ascending `no_id`: whether the coldkey has an account there is
+            unknown. Always `[]` without `partial=true`.
+          type: array
+          items:
+            $ref: "#/components/schemas/SnLedgerUnavailablePool"
+
+    SnLedgerPoolKind:
+      type: string
+      description: |
+        `pool`: an operator's pool, paying providers and, from epoch 8,
+        extenders. `ctf`: an operator's capture the flag pool. A client that
+        does not know a kind shows the entry as a pool.
+      enum: [pool, ctf]
+
+    SnLedgerUnavailablePool:
+      type: object
+      description: A pool the answer would cover whose ledger could not be read.
+      required:
+        - vault
+        - no_id
+        - kind
+        - label
+      properties:
+        vault:
+          description: The pool's settlement vault (vault2), `0x` and 40 lowercase hex digits.
+          type: string
+          pattern: "^0x[0-9a-f]{40}$"
+        no_id:
+          type: integer
+        kind:
+          $ref: "#/components/schemas/SnLedgerPoolKind"
+        label:
+          type: string
 
     SnLedgerAccount:
       type: object
       required:
         - vault
         - no_id
+        - kind
+        - label
         - index
         - root_index
         - cumulative
@@ -24316,8 +24448,17 @@ components:
           type: string
           pattern: "^0x[0-9a-f]{40}$"
         no_id:
-          description: The pool's operator id.
+          description: The pool's vault2 id, which a claim names; the operator's id for its pool, 2^32 + the operator's id for its capture the flag pool.
           type: integer
+        kind:
+          $ref: "#/components/schemas/SnLedgerPoolKind"
+        label:
+          description: |
+            An English display name for the pool, for clients without a
+            localized one: "Pool 1" for operator 1's pool, as the apps name
+            it, and "Capture the flag" for its capture the flag pool. Not for
+            parsing.
+          type: string
         index:
           description: The account's fixed position in the pool's sum tree.
           type: integer
@@ -24355,6 +24496,29 @@ components:
             it.
           type: [string, "null"]
           pattern: "^[0-9]+$"
+
+    SnProblem:
+      type: object
+      description: |
+        An RFC 9457 problem details object, as the routes of
+        sn/api/operator.yml answer errors: `type` is `about:blank`, `title`
+        the status phrase, and `code` for programs, one of `bad_request`,
+        `unauthorized`, `unknown_country`, `unknown_epoch`, `unavailable` and
+        `ledger_unavailable`. A code a client does not know reads as the
+        status alone.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+        detail:
+          type: string
+          description: A sentence for people, never for parsing.
 
     SnLedgerProofNode:
       type: object
