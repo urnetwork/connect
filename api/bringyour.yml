@@ -12038,6 +12038,61 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/usage:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: Read the network's usage and limits
+      description: |
+        The caller's network's effective limits (`QuotaLimits`, as
+        `GET /sidecar/limits` answers them), its stored byte count as the
+        nightly count last wrote it, whether it is over its storage limit,
+        whether it is spent (no balance left: new streams and payload-adding
+        writes are refused), and its usage by UTC day and meter for up to 13
+        months, newest first: transfer meters in bytes, `storage` the day's
+        stored bytes. A page answers at most `count` day rows, at most 1,000;
+        `next`, when present, is the cursor the next page passes as
+        `after_day` and `after_meter`.
+
+        The read roles reach it (`RolePermissionRead`); a Member of a team is
+        refused by the role gate (`RolePermissionRefused`). 503 while usage is
+        not available.
+      operationId: networkUsage
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after_day
+          in: query
+          required: false
+          description: The cursor's day, `YYYY-MM-DD`, from the last page's `next`.
+          schema:
+            type: string
+        - name: after_meter
+          in: query
+          required: false
+          description: The cursor's meter, from the last page's `next`.
+          schema:
+            type: string
+        - name: count
+          in: query
+          required: false
+          description: The most day rows to answer, at most 1,000; 200 when absent.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkUsage"
+        "400":
+          description: "`count` is not a positive number, or the cursor's day does not parse."
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Usage is not available.
+
   /network/audit-webhook:
     post:
       x-internal: true
@@ -27704,6 +27759,45 @@ components:
             type: string
         revoked:
           type: boolean
+    NetworkUsage:
+      type: object
+      required: [limits, stored_byte_count, storage_over, spent, days]
+      properties:
+        limits:
+          $ref: "#/components/schemas/QuotaLimits"
+        stored_byte_count:
+          type: integer
+          format: int64
+        storage_over:
+          type: boolean
+        spent:
+          type: boolean
+        days:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkUsageDay"
+        next:
+          $ref: "#/components/schemas/NetworkUsageCursor"
+    NetworkUsageDay:
+      type: object
+      required: [usage_day, meter, quantity]
+      properties:
+        usage_day:
+          type: string
+          description: The UTC day, `YYYY-MM-DD`.
+        meter:
+          type: string
+        quantity:
+          type: integer
+          format: int64
+    NetworkUsageCursor:
+      type: object
+      required: [usage_day, meter]
+      properties:
+        usage_day:
+          type: string
+        meter:
+          type: string
     QuotaLimits:
       type: object
       required:
