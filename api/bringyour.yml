@@ -11673,6 +11673,51 @@ paths:
         "503":
           description: Wakes are not enabled; see Retry-After.
 
+  /sidecar/wake:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Summon another device of the caller's member
+      description: |
+        A sidecar asks for another admitted device of its own member, an app
+        host that has gone silent, to be woken, so it can check the network's
+        state with its peers again. The server writes a content-free hint to
+        that device's current client, which wakes the app only if it holds a
+        wake token. One device is summoned at most once an hour, whoever
+        asks; past that the answer is 429.
+
+        The caller must be a sidecar's client, and `sidecar_id` must name
+        another device of the caller's member that the network's verified
+        state holds admitted, neither revoked nor parked. Any other
+        `sidecar_id` is refused with 403, which says nothing of the device.
+        503 with Retry-After while wakes are not enabled.
+      operationId: sidecarWake
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SidecarWakeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarWakeResult"
+        "400":
+          description: No `sidecar_id`, or the caller's own.
+        "401":
+          description: The caller is not a client, or its client is removed.
+        "403":
+          description: The caller is no sidecar's client, or `sidecar_id` is not another admitted device of its member.
+        "429":
+          description: The device was summoned within the hour.
+        "503":
+          description: Wakes are not enabled, or the network's state is not available; see Retry-After.
+
   /sidecar/close:
     post:
       x-internal: true
@@ -27934,6 +27979,19 @@ components:
           maxLength: 4096
 
     SidecarPushTokenResult:
+      type: object
+      properties: {}
+
+    SidecarWakeArgs:
+      type: object
+      required:
+        - sidecar_id
+      properties:
+        sidecar_id:
+          description: udid. The device to summon, another of the caller's member's.
+          type: string
+
+    SidecarWakeResult:
       type: object
       properties: {}
 
