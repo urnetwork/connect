@@ -15384,7 +15384,9 @@ components:
             `does_not_renew`: a one-time crypto payment (USDC, Zcash, Monero,
             TAO, Bitcoin, ETH or SOL) covers one period and never renews, so
             there is nothing to cancel.
-            `not_cancelable`: a store the server cannot act on.
+            `not_cancelable`: a store the server cannot act on. For a plan
+            paid with Gamma, turn renewal off with `POST /pay/gamma/settings`
+            (`auto_renew: false`); `manage_url` explains it.
             `no_subscription`: no Stripe subscription is billing this network.
             `no_customer`: this network has no Stripe customer, so there is no
             billing portal.
@@ -22077,7 +22079,7 @@ components:
             properties:
               store:
                 type: string
-                description: stripe | apple | google | solana | monero | zcash | bittensor | bitcoin | ethereum | manual | x402 | "" (unknown)
+                description: stripe | apple | google | solana | monero | zcash | bittensor | bitcoin | ethereum | gamma | manual | x402 | "" (unknown). A `gamma` plan renews from its SN25 deposit while the account's `auto_renew` is on (`/pay/gamma/settings`).
               plan:
                 type: string
                 description: The wire plan value ("supporter"); shown as Pro.
