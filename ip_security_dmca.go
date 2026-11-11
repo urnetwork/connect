@@ -136,7 +136,7 @@ type DmcaSecurityPolicySettings struct {
 	// first. 0 disables the bound.
 	MaxFlows int
 
-	// FlowTtl evicts a tracked flow after this much wall-clock time with no packet
+	// FlowTtl evicts a tracked flow after this much time (on Now) with no packet
 	// activity in either direction — every sent (RefreshEgress) and received (RefreshIngress)
 	// packet refreshes it, so only genuinely idle flows are reclaimed. An active scan goroutine
 	// performs the eviction. 0 disables the scan (flows then persist until MaxFlows
@@ -149,6 +149,11 @@ type DmcaSecurityPolicySettings struct {
 	// FlowTtl. It schedules reclamation and decides no verdict, so it is not
 	// part of the policy's identity (SecurityPolicyHash).
 	FlowScanInterval time.Duration `json:"-"`
+	// The clock of flow activity and of the idle scan's cutoff; the scan's
+	// cadence stays on wall-clock timers. Nil is the wall clock. Tests install
+	// a fake one, so a fill of any length ages no flow. It decides no verdict,
+	// so it is not part of the policy's identity (SecurityPolicyHash).
+	Now func() time.Time `json:"-"`
 
 	// Tests count the idle scans. Runs on the scan goroutine; nil is a
 	// production no-op.
@@ -560,11 +565,19 @@ func (self *dmcaDetector) run(ctx context.Context) {
 			return
 		case <-scanTimer.C:
 		}
-		self.evictIdle(time.Now())
+		self.evictIdle(self.now())
 		if self.settings.afterFlowScanForTest != nil {
 			self.settings.afterFlowScanForTest()
 		}
 	}
+}
+
+// Reads the settings clock, else the wall clock.
+func (self *dmcaDetector) now() time.Time {
+	if now := self.settings.Now; now != nil {
+		return now()
+	}
+	return time.Now()
 }
 
 // Parks the idle scan while no flow is tracked. False when ctx ends first.
@@ -636,7 +649,7 @@ func (self *dmcaDetector) refresh(key dmcaFlowKey) {
 	st := shard.flows[key]
 	shard.mu.RUnlock()
 	if st != nil {
-		atomic.StoreInt64(&st.lastActivityUnixNanos, time.Now().UnixNano())
+		atomic.StoreInt64(&st.lastActivityUnixNanos, self.now().UnixNano())
 	}
 }
 
@@ -817,7 +830,7 @@ func (self *dmcaDetector) classifyForSenderDetailed(
 	createState := func() *dmcaFlowState {
 		state := &dmcaFlowState{
 			key:                   key,
-			lastActivityUnixNanos: time.Now().UnixNano(),
+			lastActivityUnixNanos: self.now().UnixNano(),
 		}
 		if ipPath.Protocol == IpProtocolTcp && ipPath.Syn {
 			state.synSeen = true
