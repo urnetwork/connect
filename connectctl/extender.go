@@ -793,10 +793,11 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	)
 	run.closers = append(run.closers, run.server.CloseAndWait)
 	if run.webRtcManager != nil {
-		run.webRtcManager.SetExtenderCarrierAnswerer(run.webRtcCarrier.Answerer(run.server))
+		answerer := run.webRtcCarrier.Answerer(run.server)
+		run.webRtcManager.SetExtenderCarrierAnswerer(answerer)
 		// the carrier stops answering before the server it answers with goes
 		run.closers = append(run.closers, func() {
-			run.webRtcManager.SetExtenderCarrierAnswerer(nil)
+			run.webRtcManager.RemoveExtenderCarrierAnswerer(answerer)
 		})
 	}
 	go func() {

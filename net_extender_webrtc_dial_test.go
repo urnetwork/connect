@@ -232,3 +232,31 @@ func TestExtenderWebRtcDialerComesAfterDnsWithNoOuterName(t *testing.T) {
 		}
 	}
 }
+
+// Root cause: a role that closes after its successor installed its own
+// answerer cleared it with SetExtenderCarrierAnswerer(nil), and the device
+// declined every offer until its next role. Observable: a remove of an
+// answerer that was replaced leaves the successor answering; a remove of the
+// one installed declines again.
+func TestWebRtcManagerRemovesOnlyItsOwnExtenderAnswerer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bridge := newTestSignalBridge()
+	manager, _ := bridge.newManager(t, ctx, nil)
+	first := newTestOfferAnswerer()
+	second := newTestOfferAnswerer()
+	manager.SetExtenderCarrierAnswerer(first)
+	manager.SetExtenderCarrierAnswerer(second)
+	manager.RemoveExtenderCarrierAnswerer(first)
+	if !manager.HasExtenderCarrierAnswerer() {
+		t.Fatal("the remove of a replaced answerer cleared its successor")
+	}
+	manager.RemoveExtenderCarrierAnswerer(nil)
+	if !manager.HasExtenderCarrierAnswerer() {
+		t.Fatal("a remove of nil cleared the answerer")
+	}
+	manager.RemoveExtenderCarrierAnswerer(second)
+	if manager.HasExtenderCarrierAnswerer() {
+		t.Fatal("the remove of the installed answerer left it answering")
+	}
+}
