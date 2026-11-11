@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -90,10 +91,12 @@ func DefaultDohSettings() *DohSettings {
 		// each operator's v4 and v6 endpoint is raced as a pair (see
 		// dohLaunchWaves). A caller that knows its path carries one family
 		// pins 4 or 6.
-		IpVersion:       0,
-		MissExpiration:  300 * time.Second,
-		LocalExpiration: 300 * time.Second,
-		MinCacheTtl:     30 * time.Second,
+		IpVersion:      0,
+		MissExpiration: 300 * time.Second,
+		// an uncorroborated nxdomain is asked again soon (see LoneMissExpiration)
+		LoneMissExpiration: 30 * time.Second,
+		LocalExpiration:    300 * time.Second,
+		MinCacheTtl:        30 * time.Second,
 		// per doh cache, so scaled by the memory budget
 		CacheMaxEntries:           MemoryScaledCount(4096, 512),
 		MaxConcurrentResolutions:  64,
@@ -111,7 +114,11 @@ func DefaultDohSettings() *DohSettings {
 		DohServerWarmStagger:     100 * time.Millisecond,
 		DohServerRaceMaxInFlight: 4,
 		DohServerHedgeReserve:    4,
-		DnsResolverSettings:      DefaultDnsResolverSettings(),
+		// it applies only to settings with lead servers: the control names'
+		// when a user named a server or the ingress country has presets,
+		// never the tunnel's
+		DohServerLeadReserve: 1,
+		DnsResolverSettings:  DefaultDnsResolverSettings(),
 	}
 }
 
@@ -145,10 +152,23 @@ func dnsTargetCacheEntries(targetByteCount ByteCount, fallback int) int {
 //
 // the remote doh servers are queried as RFC 8484 wire-format (application/dns-message) in a
 // staggered, weighted-random order (see dohClient.queryResult); the first server to return records
-// wins. each must present an IP-SAN cert when addressed by IP (these do). Cloudflare, Google, Quad9,
-// and OpenDNS all serve wire-format on :443 /dns-query.
+// wins, and a built-in endpoint's policy-filtered response never does (see dohBuiltInEndpoints).
+// each must present an IP-SAN cert when addressed by IP; these do, serving wire-format on :443.
 // https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/
-// https://developers.google.com/speed/public-dns/docs/doh
+//
+// The defaults are Cloudflare, at both of its addresses (1.1.1.1 and 1.0.0.1, which guards
+// against one address being blocked or hijacked but not against an operator-wide outage), and
+// Quad9 at 9.9.9.10, its unfiltered service: the defaults do not filter (2026-11-08), so
+// 9.9.9.9, Quad9's malware filter, is not among them. The operators interleave, so a list
+// walked in order asks Quad9 second. DNS.SB (xTom GmbH, Düsseldorf) follows them at both of its
+// addresses (owner decision 2026-11-09): it is unfiltered, keeps no query logs, sends no ECS and
+// validates DNSSEC, and its ip-literal DoH certificate names its v4 and v6 addresses (research
+// 2026-11-08). A third operator also means fewer lookups whose two picks both fail on a French
+// exit once Quad9 leaves France on 2026-11-24. None of these lists, nor the regional ones
+// (net_http_doh_regional.go), names Google Public DNS (owner decision 2026-11-08 for user
+// privacy, support inbox 8236) or OpenDNS (it refuses French clients and has left Portugal and
+// Belgium, answers blocks with ordinary records, forwards the client's /24 as ECS, and its free
+// terms are marked expired). A user can still name any of them in their own settings.
 func DefaultDnsResolverSettings() *DnsResolverSettings {
 	return &DnsResolverSettings{
 		EnableRemoteDoh:       true,
@@ -157,16 +177,18 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// the v4 and v6 lists pair by operator (knownDohUrlPairs) and a
 		// query races each pair as one wave (see dohLaunchWaves)
 		RemoteDohUrlsIpv4: []string{
-			"https://1.1.1.1/dns-query",        // Cloudflare
-			"https://8.8.8.8/dns-query",        // Google
-			"https://9.9.9.9/dns-query",        // Quad9
-			"https://208.67.222.222/dns-query", // OpenDNS
+			"https://1.1.1.1/dns-query",         // Cloudflare
+			"https://9.9.9.10/dns-query",        // Quad9, unfiltered
+			"https://1.0.0.1/dns-query",         // Cloudflare
+			"https://185.222.222.222/dns-query", // DNS.SB
+			"https://45.11.45.11/dns-query",     // DNS.SB
 		},
 		RemoteDohUrlsIpv6: []string{
 			"https://[2606:4700:4700::1111]/dns-query", // Cloudflare
-			"https://[2001:4860:4860::8888]/dns-query", // Google
-			"https://[2620:fe::fe]/dns-query",          // Quad9
-			"https://[2620:119:35::35]/dns-query",      // OpenDNS
+			"https://[2620:fe::10]/dns-query",          // Quad9, unfiltered
+			"https://[2606:4700:4700::1001]/dns-query", // Cloudflare
+			"https://[2a09::]/dns-query",               // DNS.SB
+			"https://[2a11::]/dns-query",               // DNS.SB
 		},
 		// remote plain-dns servers, dialed through the tunnel. remote dns
 		// stays disabled by default for general resolution — while disabled,
@@ -174,37 +196,54 @@ func DefaultDnsResolverSettings() *DnsResolverSettings {
 		// it (see DohCache.resolve), so a hostname-form doh server never
 		// leaks to the local resolver
 		RemoteDnsIpv4: []string{
-			"1.1.1.1",        // Cloudflare
-			"9.9.9.9",        // Quad9
-			"8.8.8.8",        // Google
-			"208.67.222.222", // OpenDNS
+			"1.1.1.1",         // Cloudflare
+			"9.9.9.10",        // Quad9, unfiltered
+			"1.0.0.1",         // Cloudflare
+			"185.222.222.222", // DNS.SB
+			"45.11.45.11",     // DNS.SB
 		},
 		RemoteDnsIpv6: []string{
 			"2606:4700:4700::1111", // Cloudflare
-			"2620:fe::fe",          // Quad9
-			"2001:4860:4860::8888", // Google
-			"2620:119:35::35",      // OpenDNS
+			"2620:fe::10",          // Quad9, unfiltered
+			"2606:4700:4700::1001", // Cloudflare
+			"2a09::",               // DNS.SB
+			"2a11::",               // DNS.SB
 		},
 		// local plain-dns servers: host-side resolution, and the actual tunnel
 		// resolver targets when the local-dns toggle is explicitly enabled. These
 		// are independent of DnsUpgradeMaskAddress, which is only the destination
 		// advertised to the OS while UpgradeMux owns plain DNS interception.
 		LocalDnsIpv4: []string{
-			"9.9.9.9", // Quad9
-			"1.1.1.1", // Cloudflare
+			"9.9.9.10",        // Quad9, unfiltered
+			"1.1.1.1",         // Cloudflare
+			"1.0.0.1",         // Cloudflare
+			"185.222.222.222", // DNS.SB
+			"45.11.45.11",     // DNS.SB
 		},
 		LocalDnsIpv6: []string{
-			"2620:fe::fe",          // Quad9
+			"2620:fe::10",          // Quad9, unfiltered
 			"2606:4700:4700::1111", // Cloudflare
+			"2606:4700:4700::1001", // Cloudflare
+			"2a09::",               // DNS.SB
+			"2a11::",               // DNS.SB
 		},
 	}
 }
 
 type DohSettings struct {
 	ConnectSettings
-	IpVersion       int
-	MissExpiration  time.Duration
-	LocalExpiration time.Duration
+	IpVersion      int
+	MissExpiration time.Duration
+	// How long an authoritative miss stays cached when one source alone
+	// reported it, a DoH endpoint and its other-family sibling counting as one
+	// source, and that source is a built-in endpoint (see dohBuiltInEndpoints),
+	// instead of MissExpiration. Nothing corroborates such a miss: a resolver
+	// withdrawing from a country, or a censor, may answer NXDOMAIN without an
+	// extended dns error, and the default is short so the next lookup soon asks
+	// again. A miss from a server the user chose is cached for MissExpiration.
+	// Non-positive caches every miss for MissExpiration.
+	LoneMissExpiration time.Duration
+	LocalExpiration    time.Duration
 	// MinCacheTtl floors the cache lifetime of a resolved record so very-low / zero-TTL records
 	// don't re-resolve (a full fan-out) on nearly every query. 0 disables the floor.
 	MinCacheTtl     time.Duration
@@ -244,6 +283,18 @@ type DohSettings struct {
 	// second-server hedges can therefore run even when a stale/dead primary
 	// has filled the ordinary wave. Zero disables the reserve.
 	DohServerHedgeReserve int
+	// DohServerLeadReserve keeps this many MaxConcurrentHttpRequests slots
+	// unavailable to every server but the lead servers (NamedRemoteDohUrls)
+	// when the settings have any. A request to a server that a network
+	// black-holes holds its slot until the query deadline, so without the
+	// reserve the defaults could hold every slot, and a lead server's request
+	// would wait for one until its lookup failed: a lookup collecting past an
+	// empty answer, for one, holds its defaults to its deadline. One slot is
+	// enough, because a lead server is the one expected to answer, which frees
+	// its slot at once. At least one slot always stays open to the other
+	// servers. Zero or negative disables the reserve; the lead servers still
+	// launch first.
+	DohServerLeadReserve int
 	// DohPathWarm reports whether the shared tunnel path is proven/warm.
 	// nil means state-aware staggering and hedge reservation are disabled.
 	// UpgradeMux supplies an atomic, allocation-free callback.
@@ -263,9 +314,21 @@ type DohSettings struct {
 	// server that was fastest then — instead of uniform-random. Live results take over as
 	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
 	ServerStatsSeed map[string]float64
+	// NamedRemoteDohUrls are the remote DoH servers a user named ahead of the
+	// default servers, of both families (`ControlDohSettings`). They and the
+	// regional presets of `RegionalRemoteDoh` are the lead servers: a query
+	// launches every lead server before any other server, each group in its
+	// weighted order, so no draw of the order can put defaults that a network
+	// black-holes ahead of them, and the other servers leave them
+	// `DohServerLeadReserve` of the request slots. A lead server that a
+	// network black-holes holds the slot it takes until the query deadline,
+	// like any server; with fewer lead servers than slots the others still
+	// race them. Only a url in a server list is queried. nil names none.
+	NamedRemoteDohUrls []string
 	// RegionalRemoteDoh puts the regional bootstrap DoH presets of the
 	// ingress country (`RegionalControlDohUrls` of `IngressCountryCode`)
-	// ahead of the remote DoH servers. Only the control-name
+	// ahead of the remote DoH servers, as lead servers (NamedRemoteDohUrls).
+	// Only the control-name
 	// settings (`ControlDohSettings`) turn it on: in a country that blocks the
 	// default servers (cn) the space's own names still resolve, and the
 	// regional servers see only those names, as any bootstrap DoH server
@@ -355,6 +418,18 @@ type DnsResolverSettings struct {
 	RemoteDnsIpv6     []string `json:"remote_dns_ipv6,omitempty"`
 	LocalDnsIpv4      []string `json:"local_dns_ipv4,omitempty"`
 	LocalDnsIpv6      []string `json:"local_dns_ipv6,omitempty"`
+	// The addresses a hostname-form DoH server is dialed at, by host: lower
+	// case, as in the url, without a port. A listed host is never looked up,
+	// not over remote plain dns, not with the host's resolver and not over
+	// DoH, on any path: every DoH client dials the host's addresses of the
+	// dial's family, and a lookup of the host through the cache answers them
+	// authoritatively for the query's family, so a family with no address
+	// answers empty and the dial uses the other. TLS still verifies the server
+	// against the host name. A listed host with no usable address fails
+	// closed; an address that does not parse is ignored. Nil pins nothing: an
+	// unlisted hostname resolves as before (see DohCache.resolve). The device
+	// sets it for the DoH hosts of the third-party presets (ADBLOCK3RD B1).
+	DohServerHostAddrs map[string][]string `json:"doh_server_host_addrs,omitempty"`
 
 	// TlsConfig, if set, is used by the DoH HTTP clients — production cert pinning,
 	// or trusting a local server's cert in tests. Not serialized.
@@ -404,8 +479,11 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 		tlsConfig.ClientSessionCache = sessionCache
 	}
 	tr.TLSClientConfig = tlsConfig
-	// most doh providers discontinued http1.1 late 2025; force h2 instead of the default
-	// h1->h2 autonegotiate, since that no longer works.
+	// most doh providers discontinued http1.1 late 2025, and some (Quad9, DNS4EU)
+	// require h2 negotiated by ALPN. A transport with its own dialer and tls config
+	// does not attempt h2 at all, so ConfigureTransports registers it here and puts
+	// "h2" first in the ALPN offer, ahead of "http/1.1": an h2 server is spoken to
+	// over h2, and a server that only speaks HTTP/1.1 still answers over it.
 	// see https://quad9.net/news/blog/doh-http-1-1-retirement/
 	// ConfigureTransports (plural) returns the h2 transport so we can keep the connection
 	// warm: ReadIdleTimeout sends keepalive PINGs while idle, which both holds the pooled
@@ -441,6 +519,12 @@ type DohCache struct {
 	// plain dns through the tunnel even when EnableRemoteDns is false — the
 	// one permitted consumer while it is disabled (see resolve)
 	dohServerNames map[string]bool
+
+	// the pinned DoH server hosts (DnsResolverSettings.DohServerHostAddrs, see
+	// dohPinnedHostAddrs): a lookup of one answers its addresses (see lookup)
+	// and is never resolved, and every DoH client dials them
+	// (dohPinnedDialContext). nil pins nothing.
+	pinnedHostAddrs map[string][]netip.Addr
 
 	stateLock             sync.Mutex
 	queryResultExpiration map[DohKey]*DohResult
@@ -533,13 +617,163 @@ func (self *dohCacheLifecycle) shutdown() {
 }
 
 // dohFlight is one in-flight resolution shared by every caller waiting on the same query. the
-// leader resolves, sets addrs/authoritative, then closes done to release the waiters.
+// leader resolves, sets the result fields (those of dohLookupResult), then closes done to
+// release the waiters.
 type dohFlight struct {
 	done          chan struct{}
 	addrs         []netip.Addr
 	authoritative bool
+	fresh         bool
 	stale         bool
+	blocked       bool
 	ownerCanceled bool
+}
+
+// The flight's published outcome, for a waiter.
+func (self *dohFlight) result() dohLookupResult {
+	return dohLookupResult{
+		addrs:         self.addrs,
+		authoritative: self.authoritative,
+		fresh:         self.fresh,
+		stale:         self.stale,
+		blocked:       self.blocked,
+	}
+}
+
+// Publishes a leader's outcome on the flight, and returns it.
+func (self *dohFlight) setResult(result dohLookupResult) dohLookupResult {
+	self.addrs = result.addrs
+	self.authoritative = result.authoritative
+	self.fresh = result.fresh
+	self.stale = result.stale
+	self.blocked = result.blocked
+	return result
+}
+
+// One lookup's outcome (DohCache.lookup): what QueryResult returns, and the
+// evidence the mux needs for its resolver health and block count.
+type dohLookupResult struct {
+	addrs []netip.Addr
+	// records, or an authoritative no-record answer (NXDOMAIN, NODATA)
+	authoritative bool
+	// a network resolution produced the answer, records or an authoritative
+	// miss: false for a cache hit, a pinned host, an answer served stale and
+	// a failure
+	fresh bool
+	// the answer is a retained one served stale (RFC 8767) because the fresh
+	// resolution failed
+	stale bool
+	// the authoritative miss is a filtering block: an NXDOMAIN carrying an
+	// extended dns error of 15, 16 or 17 (dnsBlockEdeCode)
+	blocked bool
+}
+
+// The pinned addresses of DnsResolverSettings.DohServerHostAddrs by host, lower
+// case and without a trailing dot: parsed, unmapped and without repeats. An
+// address that does not parse, has a zone, or is unspecified is dropped. A
+// listed host keeps its entry with no usable address, so it still never
+// resolves. An ip literal key is ignored: it needs no pin. nil for none.
+func dohPinnedHostAddrs(rs *DnsResolverSettings) map[string][]netip.Addr {
+	if rs == nil || len(rs.DohServerHostAddrs) == 0 {
+		return nil
+	}
+	pinnedHostAddrs := make(map[string][]netip.Addr, len(rs.DohServerHostAddrs))
+	for host, values := range rs.DohServerHostAddrs {
+		host = dohPinnedHostKey(host)
+		if host == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			continue
+		}
+		addrs := pinnedHostAddrs[host]
+		if addrs == nil {
+			addrs = []netip.Addr{}
+		}
+		for _, value := range values {
+			addr, err := netip.ParseAddr(strings.TrimSpace(value))
+			if err != nil || addr.Zone() != "" {
+				continue
+			}
+			addr = addr.Unmap()
+			if addr.IsUnspecified() || slices.Contains(addrs, addr) {
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
+		pinnedHostAddrs[host] = addrs
+	}
+	return pinnedHostAddrs
+}
+
+// A host as the key of the pinned host table: trimmed, lower case, without a
+// trailing dot.
+func dohPinnedHostKey(host string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+// A deep copy of DnsResolverSettings.DohServerHostAddrs, nil for nil, for the
+// copies of resolver settings that clone their lists.
+func cloneDohServerHostAddrs(hostAddrs map[string][]string) map[string][]string {
+	if hostAddrs == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(hostAddrs))
+	for host, addrs := range hostAddrs {
+		cloned[host] = slices.Clone(addrs)
+	}
+	return cloned
+}
+
+// Wraps a DoH client's dial so that a pinned host (dohPinnedHostAddrs) is
+// dialed at its addresses of the dial's family, raced as a stream dial races
+// resolved addresses (dialHostPortRace), and never looked up: the dial below
+// sees ip literals only, whether it is the tun's (which would resolve a name
+// through its cache), the host's (the OS resolver) or a caller's. A pinned host
+// with no address of the family fails, so a dead pin set fails closed instead
+// of falling back to a lookup. Every other address passes through unchanged,
+// and with no pins the dial is returned as it is. onPinned, when set, is
+// called with the host and the addresses before they are dialed.
+func dohPinnedDialContext(pinnedHostAddrs map[string][]netip.Addr, onPinned func(host string, addrs []netip.Addr), dial DialContextFunction) DialContextFunction {
+	if len(pinnedHostAddrs) == 0 {
+		return dial
+	}
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return dial(ctx, network, address)
+		}
+		pins, ok := pinnedHostAddrs[dohPinnedHostKey(host)]
+		if !ok {
+			return dial(ctx, network, address)
+		}
+		addrs := orderDialAddrs(dialAddrsMatchNetwork(network, pins))
+		if len(addrs) == 0 {
+			return nil, &net.DNSError{Err: "no pinned address of the dial's family", Name: host, IsNotFound: true}
+		}
+		if onPinned != nil {
+			HandleError(func() {
+				onPinned(dohPinnedHostKey(host), addrs)
+			})
+		}
+		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, dial)
+	}
+}
+
+// Whether addrs is a sink answer: at least one address, every one 0.0.0.0 or
+// ::. A filtering resolver answers a blocked name so (ADBLOCK3RD B4); the mux
+// delivers it but never records it in the reverse index or binds it to an
+// exit, as with the built-in blocker's answers.
+func dnsSinkAddrs(addrs []netip.Addr) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	for _, addr := range addrs {
+		if !addr.IsUnspecified() {
+			return false
+		}
+	}
+	return true
 }
 
 func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []string {
@@ -661,17 +895,31 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		maxResolutions = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
 	}
 
+	// a pinned DoH server host is dialed at its addresses on both paths and never
+	// looked up (DnsResolverSettings.DohServerHostAddrs). The tunnel path reports
+	// the pins as the host's addresses, as a resolution of the name would
+	// (DohServerResolvedCallback), so the reverse index names them.
+	pinnedHostAddrs := dohPinnedHostAddrs(settings.DnsResolverSettings)
+	onRemotePinned := func(host string, addrs []netip.Addr) {
+		if settings.DohServerResolvedCallback != nil {
+			settings.DohServerResolvedCallback(host, addrs)
+		}
+	}
 	// distinct TLS session caches per dial path: a ticket obtained via the host egress
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
-	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, onRemotePinned, wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, nil, wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
 	httpConcurrency := maxConcurrentHttpRequests(settings)
 	httpSem := make(chan struct{}, httpConcurrency)
 	primarySem := newDohPrimarySem(httpConcurrency, settings.DohServerHedgeReserve)
+	// the lead servers' reserve is cache wide too, so the defaults of every
+	// lookup together leave it free
+	leadDohUrls := dohLeadUrls(settings)
+	followerSem := newDohFollowerSem(httpConcurrency, settings.DohServerLeadReserve, leadDohUrls)
 	activeQueries := &atomic.Int64{}
 	stats := newServerStats()
 	// seed the fan-out order from the last session's per-server scores (if the owner
@@ -706,14 +954,15 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	siblings := dohServerSiblings(settings.DnsResolverSettings)
 
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings},
-		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, followerSem: followerSem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings, leadDohUrls: leadDohUrls},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, followerSem: followerSem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings, leadDohUrls: leadDohUrls},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		bootstrapLookupIP:     newBootstrapPlainDnsLookup(settings, lifecycle, netDialer),
 		settings:              settings,
 		log:                   loggerOrDefault(settings.Log),
 		dohServerNames:        dohServerNames,
+		pinnedHostAddrs:       pinnedHostAddrs,
 		queryResultExpiration: map[DohKey]*DohResult{},
 		inflight:              map[DohKey]*dohFlight{},
 		resolveSem:            make(chan struct{}, maxResolutions),
@@ -731,6 +980,37 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 func newDohPrimarySem(httpConcurrency int, hedgeReserve int) chan struct{} {
 	reserve := min(max(0, hedgeReserve), max(0, httpConcurrency-1))
 	if reserve == 0 {
+		return nil
+	}
+	return make(chan struct{}, httpConcurrency-reserve)
+}
+
+// The lead servers of settings (DohSettings.NamedRemoteDohUrls): the servers a
+// user named and, with RegionalRemoteDoh, the regional presets of the ingress
+// country, which are the servers remoteDohUrls puts ahead of the defaults. nil
+// for none, as for the tunnel's settings.
+func dohLeadUrls(settings *DohSettings) map[string]bool {
+	dohUrls := settings.NamedRemoteDohUrls
+	if settings.RegionalRemoteDoh {
+		ingressDnsStrategy := IngressDnsStrategyForCountry(settings.IngressCountryCode)
+		dohUrls = slices.Concat(dohUrls, ingressDnsStrategy.DohUrlsIpv4, ingressDnsStrategy.DohUrlsIpv6)
+	}
+	if len(dohUrls) == 0 {
+		return nil
+	}
+	leadDohUrls := make(map[string]bool, len(dohUrls))
+	for _, dohUrl := range dohUrls {
+		leadDohUrls[dohUrl] = true
+	}
+	return leadDohUrls
+}
+
+// The share of the request slots the servers outside the lead tier may hold:
+// all but the lead reserve (DohSettings.DohServerLeadReserve), and at least
+// one. nil, no share, without a lead server or a reserve.
+func newDohFollowerSem(httpConcurrency int, leadReserve int, leadDohUrls map[string]bool) chan struct{} {
+	reserve := min(max(0, leadReserve), max(0, httpConcurrency-1))
+	if reserve == 0 || len(leadDohUrls) == 0 {
 		return nil
 	}
 	return make(chan struct{}, httpConcurrency-reserve)
@@ -797,7 +1077,7 @@ func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
 	default:
 		return false
 	}
-	ordered := client.stats.order(dohUrls)
+	ordered := client.launchOrder(dohUrls)
 	if 0 < serverCount && serverCount < len(ordered) {
 		ordered = ordered[:serverCount]
 	}
@@ -813,31 +1093,24 @@ func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
 	var failureLock sync.Mutex
 	var firstFailure string
 	var warmWg sync.WaitGroup
-warmLoop:
 	for _, dohUrl := range ordered {
-		// respect the shared in-flight cap and byte budget like any real request, so a warm
-		// can never crowd out a user query
-		if client.httpSem != nil {
-			select {
-			case client.httpSem <- struct{}{}:
-			case <-queryCtx.Done():
-				break warmLoop
-			}
-		}
-		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
-			if client.httpSem != nil {
-				<-client.httpSem
-			}
-			break warmLoop
+		// respect the shared in-flight cap, the lead servers' reserve and the
+		// byte budget like any real request, so a warm can never crowd out a
+		// user query
+		follower := !client.leadDohUrls[dohUrl]
+		if !client.admitRequest(queryCtx, false, follower) {
+			break
 		}
 		warmWg.Add(1)
 		go HandleError(func() {
 			defer warmWg.Done()
-			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
-			if client.httpSem != nil {
-				defer func() { <-client.httpSem }()
-			}
+			defer client.releaseRequest(false, follower)
 			result, queryErr := client.queryWireDetailed(queryCtx, dohUrl, "A", dohWarmDomain)
+			// a built-in endpoint's filtered answer earns no success credit here
+			// either (see dohBuiltInEndpoints)
+			if dohEndpointGuarded(dohUrl) {
+				result = dohGuardedResult(result)
+			}
 			ok := 0 < len(result.AddrTtls) || result.Miss
 			if ok {
 				client.stats.record(dohUrl, true)
@@ -849,11 +1122,12 @@ warmLoop:
 				successCancelOnce.Do(queryCancel)
 			} else if successCount.Load() == 0 {
 				client.stats.record(dohUrl, false)
+				// the url by scheme and host only: its path can hold a personal id
 				var failure string
 				if queryErr != nil {
 					failure = queryErr.Error()
 				} else {
-					failure = fmt.Sprintf("%s returned no usable A answer", dohUrl)
+					failure = fmt.Sprintf("%s returned no usable A answer", DohUrlForLog(dohUrl))
 				}
 				failureLock.Lock()
 				if firstFailure == "" {
@@ -871,6 +1145,128 @@ warmLoop:
 		self.log.Infof("[dns]warm failed: %s\n", firstFailure)
 	}
 	return false
+}
+
+// probe asks every remote DoH url of the cache for the A records of name, once
+// each and concurrently, and returns each url's response in the cache's url
+// order (see UpgradeMux.ProbeDnsResolver). It reads nothing from and writes
+// nothing to the answer cache, records no server score, fires no callback and
+// applies no guard: the responses are reported as the servers sent them. Each
+// request holds an in-flight slot and the dns memory reservation like any
+// query and is bounded by ctx and RequestTimeout. nil when the cache has no
+// remote DoH.
+func (self *DohCache) probe(ctx context.Context, name string) []DnsResolverProbeResult {
+	if self.lifecycle.retired.Load() {
+		return nil
+	}
+	probeLifetimeCtx, probeLifetimeDone, ok := self.lifecycle.context(ctx)
+	if !ok {
+		return nil
+	}
+	defer probeLifetimeDone()
+
+	settings := self.settings
+	rs := settings.DnsResolverSettings
+	if rs == nil || !rs.EnableRemoteDoh || settings.RequestTimeout <= 0 {
+		return nil
+	}
+	dohUrls := remoteDohUrls(settings, settings.IpVersion)
+	if len(dohUrls) == 0 {
+		return nil
+	}
+	results := make([]DnsResolverProbeResult, len(dohUrls))
+	for i, dohUrl := range dohUrls {
+		results[i].Url = dohUrl
+	}
+	asciiName, err := Punycode(name)
+	if err != nil {
+		for i := range results {
+			results[i].Err = fmt.Errorf("probe name: %w", err)
+		}
+		return results
+	}
+
+	queryCtx, queryCancel := context.WithTimeout(probeLifetimeCtx, settings.RequestTimeout)
+	defer queryCancel()
+	client := self.remoteClient
+	var probeWg sync.WaitGroup
+	for i, dohUrl := range dohUrls {
+		if client.httpSem != nil {
+			select {
+			case client.httpSem <- struct{}{}:
+			case <-queryCtx.Done():
+				results[i].Err = queryCtx.Err()
+				continue
+			}
+		}
+		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
+			if client.httpSem != nil {
+				<-client.httpSem
+			}
+			results[i].Err = context.Cause(queryCtx)
+			if results[i].Err == nil {
+				results[i].Err = fmt.Errorf("probe %s: no dns memory", DohUrlForLog(dohUrl))
+			}
+			continue
+		}
+		probeWg.Add(1)
+		go HandleError(func() {
+			defer probeWg.Done()
+			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
+			if client.httpSem != nil {
+				defer func() { <-client.httpSem }()
+			}
+			data, err := client.queryWireRawDetailed(queryCtx, dohUrl, dnsmessage.TypeA, asciiName)
+			if err != nil {
+				results[i].Err = err
+				return
+			}
+			results[i] = dnsProbeResult(dohUrl, data)
+		})
+	}
+	probeWg.Wait()
+	return results
+}
+
+// One url's probe result from its raw response: the response code, the A
+// records and the extended dns error codes. A response that does not parse
+// past its header is no answer.
+func dnsProbeResult(dohUrl string, response []byte) DnsResolverProbeResult {
+	result := DnsResolverProbeResult{Url: dohUrl}
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		result.Err = fmt.Errorf("probe %s: malformed response: %w", DohUrlForLog(dohUrl), err)
+		return result
+	}
+	result.Answered = true
+	result.RCode = header.RCode
+	if err := p.SkipAllQuestions(); err != nil {
+		return result
+	}
+	for {
+		ah, err := p.AnswerHeader()
+		if err != nil {
+			// dnsmessage.ErrSectionDone, or a malformed answer
+			if err != dnsmessage.ErrSectionDone {
+				return result
+			}
+			break
+		}
+		if ah.Type != dnsmessage.TypeA {
+			if err := p.SkipAnswer(); err != nil {
+				return result
+			}
+			continue
+		}
+		r, err := p.AResource()
+		if err != nil {
+			return result
+		}
+		result.Addrs = append(result.Addrs, netip.AddrFrom4(r.A))
+	}
+	result.EdeCodes = dnsResponseEdeCodes(&p)
+	return result
 }
 
 // ShedMemory drops the query result cache and releases the pooled connections, for the host's
@@ -937,23 +1333,37 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 // through the normal resolve() caching. The stale entry never suppresses the resolution attempt
 // itself — every expired-entry query still resolves (or joins the in-flight resolution) first.
 func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain string) (addrs []netip.Addr, authoritative bool) {
+	result := self.lookup(ctx, recordType, domain)
+	return result.addrs, result.authoritative
+}
+
+// QueryResult with the evidence of the outcome (dohLookupResult): whether a
+// network resolution produced it, whether it was served stale, and whether a
+// miss was a filtering block. A pinned host (DnsResolverSettings.
+// DohServerHostAddrs) is answered from its pins before anything else, never
+// resolved, cached or held behind the resolution bounds: it is the name a DoH
+// request through this cache's own tun dials.
+func (self *DohCache) lookup(ctx context.Context, recordType string, domain string) (result dohLookupResult) {
+	if addrs, ok := self.pinnedHostAnswer(recordType, domain); ok {
+		return dohLookupResult{addrs: addrs, authoritative: true}
+	}
+
 	callerCtx := ctx
 	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeAddress)
-	stale := false
 	defer func() {
 		resultCtx := callerCtx
 		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
 			resultCtx = self.lifecycle.ctx
 		}
-		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(addrs), authoritative, stale))
+		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(result.addrs), result.authoritative, result.stale))
 	}()
 
 	q := NewDohKey(recordType, domain)
 	retryDeadline := time.Now().Add(self.settings.RequestTimeout)
 	var retry bool
-	addrs, authoritative, stale, retry = self.queryResult(ctx, q)
+	result, retry = self.queryResult(ctx, q)
 	if !retry || ctx.Err() != nil || self.lifecycle.retired.Load() || self.settings.RequestTimeout <= 0 {
-		return addrs, authoritative
+		return result
 	}
 
 	// One remaining-budget owner covers every handoff, never one deferred
@@ -962,36 +1372,83 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 	defer retryCancel()
 	for {
 		if retryCtx.Err() != nil || self.lifecycle.retired.Load() {
-			return nil, false
+			return dohLookupResult{}
 		}
 		reconnect := NewPacedReconnect(DefaultDialFallbackDelay)
-		addrs, authoritative, stale, retry = self.queryResult(retryCtx, q)
+		result, retry = self.queryResult(retryCtx, q)
 		if !retry {
-			return addrs, authoritative
+			return result
 		}
 		// Repeated foreign cancellation cannot spin or replenish the budget.
 		select {
 		case <-retryCtx.Done():
-			return nil, false
+			return dohLookupResult{}
 		case <-self.lifecycle.ctx.Done():
-			return nil, false
+			return dohLookupResult{}
 		case <-reconnect.After():
 		}
 	}
 }
 
+// Whether domain is a pinned DoH server host (dohPinnedHostAddrs).
+func (self *DohCache) pinnedHost(domain string) bool {
+	if len(self.pinnedHostAddrs) == 0 {
+		return false
+	}
+	_, ok := self.pinnedHostAddrs[dohPinnedHostKey(domain)]
+	return ok
+}
+
+// The answer to a lookup of a pinned DoH server host: its addresses of the
+// record type's family, authoritative even when there are none, so a dial of
+// the name uses the other family and never falls through to a resolver. Any
+// other record type of a pinned host answers empty. ok is false for a host
+// that is not pinned. The pins are reported like a resolution of the name
+// (DohServerResolvedCallback).
+func (self *DohCache) pinnedHostAnswer(recordType string, domain string) (addrs []netip.Addr, ok bool) {
+	if len(self.pinnedHostAddrs) == 0 {
+		return nil, false
+	}
+	host := dohPinnedHostKey(domain)
+	pins, ok := self.pinnedHostAddrs[host]
+	if !ok {
+		return nil, false
+	}
+	addrs = []netip.Addr{}
+	switch strings.ToUpper(recordType) {
+	case "A":
+		for _, pin := range pins {
+			if pin.Is4() {
+				addrs = append(addrs, pin)
+			}
+		}
+	case "AAAA":
+		for _, pin := range pins {
+			if pin.Is6() {
+				addrs = append(addrs, pin)
+			}
+		}
+	}
+	if 0 < len(addrs) && self.settings.DohServerResolvedCallback != nil {
+		HandleError(func() {
+			self.settings.DohServerResolvedCallback(host, addrs)
+		})
+	}
+	return addrs, true
+}
+
 // Resolves or joins one generation; only an empty canceled owner permits retry.
-func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.Addr, authoritative bool, stale bool, retry bool) {
+func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLookupResult, retry bool) {
 	callerCtx := ctx
 	if self.lifecycle.retired.Load() {
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
 	now := time.Now()
 
 	var fl *dohFlight
 	var leader bool
 	var hit bool
-	var hitAddrs []netip.Addr
+	var hitResult dohLookupResult
 	var staleAddrs []netip.Addr
 	func() {
 		self.stateLock.Lock()
@@ -1000,7 +1457,9 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		if r := self.queryResultExpiration[q]; r != nil {
 			if r.Valid(now, self.settings.MissExpiration) {
 				hit = true
-				hitAddrs = r.Addrs()
+				// a cached entry (records or an authoritative miss) is itself
+				// authoritative, and no network resolution produced it now
+				hitResult = dohLookupResult{addrs: r.Addrs(), authoritative: true, blocked: r.Blocked}
 				return
 			}
 			if r.staleUsable(now) {
@@ -1021,20 +1480,18 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		}
 	}()
 	if hit {
-		// a cached entry (records or an authoritative miss) is itself authoritative
-		return hitAddrs, true, false, false
+		return hitResult, false
 	}
 
 	// serveStale is the one place a stale answer leaves this method: it logs (one line per
 	// stale serve, naming the domain — the field signal that failover leaned on the cache) and
 	// counts, so neither can drift from the other.
-	serveStale := func() ([]netip.Addr, bool) {
-		stale = true
+	serveStale := func() dohLookupResult {
 		self.staleServeCount.Add(1)
 		// loggerOrDefault: nil-safe against a literally-constructed cache (NewDohCache always
 		// sets log, but a panic in the DNS fallback path is never acceptable)
 		loggerOrDefault(self.log).Infof("[doh]serve stale %s %s (%d addrs)\n", q.RecordType, q.Domain, len(staleAddrs))
-		return staleAddrs, true
+		return dohLookupResult{addrs: staleAddrs, authoritative: true, stale: true}
 	}
 
 	if !leader {
@@ -1043,24 +1500,21 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		select {
 		case <-fl.done:
 			if fl.ownerCanceled && !fl.authoritative && len(fl.addrs) == 0 && ctx.Err() == nil {
-				return nil, false, false, true
+				return dohLookupResult{}, true
 			}
-			stale = fl.stale
-			return fl.addrs, fl.authoritative, stale, false
+			return fl.result(), false
 		case <-ctx.Done():
 			if 0 < len(staleAddrs) {
-				addrs, authoritative = serveStale()
-				return addrs, authoritative, stale, false
+				return serveStale(), false
 			}
-			return nil, false, false, false
+			return dohLookupResult{}, false
 		case <-self.lifecycle.ctx.Done():
-			return nil, false, false, false
+			return dohLookupResult{}, false
 		}
 	}
 
 	// leader: resolve once, publish to any waiters, and drop the in-flight entry
 	defer func() {
-		fl.stale = stale
 		// Cleanup cancels resolveCtx before this defer; only the original
 		// owner's context can authorize a foreign waiter's new generation.
 		fl.ownerCanceled = callerCtx.Err() != nil && !fl.authoritative && len(fl.addrs) == 0
@@ -1075,7 +1529,7 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 	// Close and keep using the retired tunnel generation.
 	resolveCtx, resolveDone, ok := self.lifecycle.context(ctx)
 	if !ok {
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
 	defer resolveDone()
 	ctx = resolveCtx
@@ -1088,20 +1542,19 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 		defer func() { <-self.resolveSem }()
 	case <-ctx.Done():
 		if 0 < len(staleAddrs) {
-			fl.addrs, fl.authoritative = serveStale()
-			return fl.addrs, fl.authoritative, stale, false
+			return fl.setResult(serveStale()), false
 		}
-		return nil, false, false, false
+		return dohLookupResult{}, false
 	}
-	fl.addrs, fl.authoritative = self.resolve(ctx, q, now)
-	if !fl.authoritative && len(fl.addrs) == 0 && 0 < len(staleAddrs) {
+	addrs, authoritative, blocked := self.resolve(ctx, q, now)
+	if !authoritative && len(addrs) == 0 && 0 < len(staleAddrs) {
 		// the exact SERVFAIL shape (resolve returns authoritative=false only with no
 		// addresses: every resolver path failed or answered non-authoritatively empty):
 		// serve the retained stale answer instead. An authoritative NXDOMAIN/NODATA came
 		// back authoritative=true and is deliberately NOT overridden.
-		fl.addrs, fl.authoritative = serveStale()
+		return fl.setResult(serveStale()), false
 	}
-	return fl.addrs, fl.authoritative, stale, false
+	return fl.setResult(dohLookupResult{addrs: addrs, authoritative: authoritative, fresh: authoritative, blocked: blocked}), false
 }
 
 // Forward resolves qType for domain and returns the raw RFC 8484 response wire
@@ -1130,8 +1583,9 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 	ctx = forwardCtx
 
 	rs := self.settings.DnsResolverSettings
-	if self.dohServerNames[domain] {
-		// a doh server name must not resolve through doh (circular)
+	if self.dohServerNames[domain] || self.pinnedHost(domain) {
+		// a doh server name must not resolve through doh (circular), and a
+		// pinned host is never looked up at all
 		return nil, false
 	}
 	if rs.EnableRemoteDoh {
@@ -1158,11 +1612,17 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 }
 
 // resolve runs the resolver chain (remote DoH -> local DoH -> remote DNS -> local DNS) for one
-// query, caches an authoritative result, and returns the addresses plus whether the answer was
-// authoritative. it is not single-flighted itself; QueryResult coalesces concurrent callers.
-func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool) {
+// query, caches an authoritative result, and returns the addresses, whether the answer was
+// authoritative, and whether an authoritative miss was a filtering block (dohQueryResult.Blocked).
+// it is not single-flighted itself; QueryResult coalesces concurrent callers.
+func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool, bool) {
 	addrExpirations := map[netip.Addr]time.Time{}
 	cacheMiss := false
+	// the miss is one source's alone (see DohSettings.LoneMissExpiration);
+	// a later resolver path that also finds the name absent corroborates it
+	loneMiss := false
+	// a DoH miss carried a filtering block's extended dns error
+	blockedMiss := false
 	minCacheTtl := self.settings.MinCacheTtl
 
 	// a doh server name can not resolve through doh (circular). it resolves
@@ -1183,12 +1643,18 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			for addr := range queryResult.AddrTtls {
 				addrs = append(addrs, addr)
 			}
-			HandleError(func() {
-				self.settings.DohResultCallback(q.Domain, addrs, queryResult.Route)
-			})
+			// a sink answer (0.0.0.0, ::) is a filter's block, not a destination:
+			// it is never bound to an exit (ADBLOCK3RD B4). A mixed answer is.
+			if !dnsSinkAddrs(addrs) {
+				HandleError(func() {
+					self.settings.DohResultCallback(q.Domain, addrs, queryResult.Route)
+				})
+			}
 		}
 		if len(addrExpirations) == 0 && queryResult.Miss {
 			cacheMiss = true
+			loneMiss = queryResult.LoneMiss
+			blockedMiss = queryResult.Blocked
 		}
 	}
 
@@ -1199,7 +1665,10 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
 		}
 		if len(addrExpirations) == 0 && queryResult.Miss {
+			// a second path's miss corroborates the first's
+			loneMiss = !cacheMiss && queryResult.LoneMiss
 			cacheMiss = true
+			blockedMiss = blockedMiss || queryResult.Blocked
 		}
 	}
 
@@ -1220,9 +1689,11 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			}
 			if !found {
 				cacheMiss = true
+				loneMiss = false
 			}
 		} else if authoritativeDnsMiss(err) {
 			cacheMiss = true
+			loneMiss = false
 		} else if log := self.log.V(2); log.Enabled() {
 			log.Infof("[doh]remote (%s) err = %s\n", q.Domain, err)
 		}
@@ -1243,9 +1714,11 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			}
 			if !found {
 				cacheMiss = true
+				loneMiss = false
 			}
 		} else if authoritativeDnsMiss(err) {
 			cacheMiss = true
+			loneMiss = false
 		} else if log := self.log.V(2); log.Enabled() {
 			log.Infof("[doh]local (%s) err = %s\n", q.Domain, err)
 		}
@@ -1286,11 +1759,16 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	}
 
 	authoritative := 0 < len(addrExpirations) || cacheMiss
+	blocked := blockedMiss && cacheMiss && len(addrExpirations) == 0
 	if ctx.Err() == nil && authoritative {
 		r := &DohResult{
 			Time:            now,
 			AddrExpirations: addrExpirations,
 			Miss:            cacheMiss && len(addrExpirations) == 0,
+			Blocked:         blocked,
+		}
+		if r.Miss && loneMiss {
+			r.MissExpiration = self.settings.LoneMissExpiration
 		}
 		func() {
 			self.stateLock.Lock()
@@ -1304,7 +1782,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	return (&DohResult{
 		Time:            now,
 		AddrExpirations: addrExpirations,
-	}).Addrs(), authoritative
+	}).Addrs(), authoritative, blocked
 }
 
 func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...string) map[netip.Addr]int {
@@ -1322,18 +1800,25 @@ func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []stri
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
+		lifecycle.dialContext(dohPinnedDialContext(
+			dohPinnedHostAddrs(settings.DnsResolverSettings),
+			nil,
+			wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext),
+		)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
+	leadDohUrls := dohLeadUrls(settings)
 	c := &dohClient{
 		httpClient:    httpClient,
 		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
 		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		followerSem:   newDohFollowerSem(maxConcurrentHttpRequests(settings), settings.DohServerLeadReserve, leadDohUrls),
 		activeQueries: &atomic.Int64{},
 		stats:         nil,
 		memoryTarget:  settings.MemoryTarget,
 		lifecycle:     lifecycle,
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		leadDohUrls:   leadDohUrls,
 	}
 	// both families' servers: a txt answer has no family of its own
 	result := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name)
@@ -1356,7 +1841,11 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	lifecycle := newDohCacheLifecycle()
 	httpClient := httpClientWithDialer(
 		settings,
-		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
+		lifecycle.dialContext(dohPinnedDialContext(
+			dohPinnedHostAddrs(settings.DnsResolverSettings),
+			nil,
+			wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext),
+		)),
 		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
 	)
 	result := dohQueryWithClient(
@@ -1409,16 +1898,19 @@ func dohQueryWithClient(
 	}
 	ctx, observation := newDohResolverObservation(ctx, path, dohScopeOneShot)
 	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
-	// (nil stats -> uniform-random fan-out order)
+	// (nil stats -> uniform-random fan-out order within the lead and the other servers)
+	leadDohUrls := dohLeadUrls(settings)
 	c := &dohClient{
 		httpClient:    httpClient,
 		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
 		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		followerSem:   newDohFollowerSem(maxConcurrentHttpRequests(settings), settings.DohServerLeadReserve, leadDohUrls),
 		activeQueries: &atomic.Int64{},
 		stats:         nil,
 		memoryTarget:  settings.MemoryTarget,
 		lifecycle:     lifecycle,
 		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		leadDohUrls:   leadDohUrls,
 	}
 	result := c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...)
 	observation.finish(settings.Log, dohFinalResolverOutcome(callerCtx, 0 < len(result.AddrTtls), result.Miss, false))
@@ -1465,9 +1957,26 @@ type dohQueryResult struct {
 	// Txts is the TXT answers of a TXT query, one entry per record with its
 	// character strings joined, which is how RFC 7208 and every consumer of
 	// a long TXT value reads them. Empty for an address query.
-	Txts  []string
-	Miss  bool
-	Route *DohRoute
+	Txts []string
+	Miss bool
+	// A policy-filtered response (see parseDohWire). For a built-in endpoint
+	// the guard (dohGuardedResult) makes it empty with no Miss, so it counts
+	// as that endpoint failing; any other endpoint's response keeps its
+	// records or Miss.
+	Filtered bool
+	// A Miss that is a filtering block: an NXDOMAIN carrying an extended dns
+	// error of 15, 16 or 17 (dnsBlockEdeCode), as Quad9 answers a blocked
+	// name. Also Filtered, so a built-in endpoint's is guarded away. A merged
+	// Miss is Blocked when any of its sources' was. The mux counts these
+	// (ADBLOCK3RD B9); a plain NXDOMAIN never is one.
+	Blocked bool
+	// A merged Miss that one source alone reported, an endpoint and its
+	// other-family sibling counting as one source, and that source a built-in
+	// endpoint (see DohSettings.LoneMissExpiration).
+	LoneMiss bool
+	// The DoH url that answered, for one server's result.
+	Server string
+	Route  *DohRoute
 }
 
 func newDohQueryResult() *dohQueryResult {
@@ -1481,9 +1990,13 @@ func newDohQueryResult() *dohQueryResult {
 // order toward recently-successful servers. stats may be nil (one-shot queries: uniform-random
 // order, no recording).
 type dohClient struct {
-	httpClient    *http.Client
-	httpSem       chan struct{}
-	primarySem    chan struct{}
+	httpClient *http.Client
+	httpSem    chan struct{}
+	primarySem chan struct{}
+	// the share of httpSem the servers outside the lead tier may hold, all
+	// but the lead reserve (newDohFollowerSem); shared like httpSem. nil when
+	// there is no lead server.
+	followerSem   chan struct{}
 	activeQueries *atomic.Int64
 	stats         *serverStats
 	// the owner's live dns byte budget (see DohSettings.MemoryTarget).
@@ -1498,32 +2011,46 @@ type dohClient struct {
 	// siblings pairs each server url with the same operator's other-family
 	// url (dohServerSiblings), so a fan-out launches the pair as one wave.
 	siblings map[string]string
+	// the lead servers (dohLeadUrls), launched ahead of the others and
+	// exempt from followerSem. nil for none.
+	leadDohUrls map[string]bool
 }
 
-// knownDohUrlPairs are the v4/v6 endpoint pairs of the default DoH
-// operators. A pair is what "race each operator's v4 and v6 endpoint" means
-// for a url the defaults ship; a url outside this table pairs by index only
-// with another url outside it (see familySiblings).
+// knownDohUrlPairs are the v4/v6 endpoint pairs of well known DoH operators:
+// the defaults, and Quad9's filtering 9.9.9.9 family, Google Public DNS and
+// OpenDNS, which are no longer defaults but which a user may still name. A pair
+// is what "race each operator's v4 and v6 endpoint" means for a url in this
+// table; a url outside this table pairs by index only with another url outside
+// it (see familySiblings). The table only pairs urls a list already holds; it
+// never adds a server to a list. DNS.SB's pairs are its two published servers,
+// public-dns-a and public-dns-b.
 var knownDohUrlPairs = [][2]string{
 	{"https://1.1.1.1/dns-query", "https://[2606:4700:4700::1111]/dns-query"},
 	{"https://1.0.0.1/dns-query", "https://[2606:4700:4700::1001]/dns-query"},
 	{"https://8.8.8.8/dns-query", "https://[2001:4860:4860::8888]/dns-query"},
 	{"https://8.8.4.4/dns-query", "https://[2001:4860:4860::8844]/dns-query"},
+	{"https://9.9.9.10/dns-query", "https://[2620:fe::10]/dns-query"},
 	{"https://9.9.9.9/dns-query", "https://[2620:fe::fe]/dns-query"},
 	{"https://149.112.112.112/dns-query", "https://[2620:fe::9]/dns-query"},
+	{"https://185.222.222.222/dns-query", "https://[2a09::]/dns-query"},
+	{"https://45.11.45.11/dns-query", "https://[2a11::]/dns-query"},
 	{"https://208.67.222.222/dns-query", "https://[2620:119:35::35]/dns-query"},
 	{"https://208.67.220.220/dns-query", "https://[2620:119:53::53]/dns-query"},
 }
 
 // knownDnsServerPairs are the v4/v6 pairs of the default and regional plain
-// dns operators, the same rule for the plain-dns lists.
+// dns operators, and of Quad9's filtering 9.9.9.9 family, Google Public DNS and
+// OpenDNS for a user who names them, the same rule for the plain-dns lists.
 var knownDnsServerPairs = [][2]string{
 	{"1.1.1.1", "2606:4700:4700::1111"},
 	{"1.0.0.1", "2606:4700:4700::1001"},
 	{"8.8.8.8", "2001:4860:4860::8888"},
 	{"8.8.4.4", "2001:4860:4860::8844"},
+	{"9.9.9.10", "2620:fe::10"},
 	{"9.9.9.9", "2620:fe::fe"},
 	{"149.112.112.112", "2620:fe::9"},
+	{"185.222.222.222", "2a09::"},
+	{"45.11.45.11", "2a11::"},
 	{"208.67.222.222", "2620:119:35::35"},
 	{"208.67.220.220", "2620:119:53::53"},
 	{"223.5.5.5", "2400:3200::1"},
@@ -1721,11 +2248,105 @@ func waitDohLaunchStagger(
 	}
 }
 
+// The order a query launches its servers in: the lead servers (leadDohUrls),
+// then the others, each group in the weighted order of the stats. A launcher
+// takes request slots in this order, and a request to a server that a network
+// black-holes holds its slot until the query deadline, so a lead server drawn
+// behind such defaults would wait for a slot until its lookup failed: with the
+// internal resolver's four slots, whenever two default pairs were drawn ahead
+// of it (DNS defaults v3 follow-up, 2026-11-09).
+func (self *dohClient) launchOrder(dohUrls []string) []string {
+	ordered := self.stats.order(dohUrls)
+	if len(self.leadDohUrls) == 0 {
+		return ordered
+	}
+	launchOrdered := make([]string, 0, len(ordered))
+	for _, dohUrl := range ordered {
+		if self.leadDohUrls[dohUrl] {
+			launchOrdered = append(launchOrdered, dohUrl)
+		}
+	}
+	for _, dohUrl := range ordered {
+		if !self.leadDohUrls[dohUrl] {
+			launchOrdered = append(launchOrdered, dohUrl)
+		}
+	}
+	return launchOrdered
+}
+
+// Admits one request of a launcher, in lock order: the first-wave share of a
+// warm path when primary (primarySem), the share of the servers outside the
+// lead tier when follower (followerSem), the in-flight slot (httpSem), then
+// the byte reservation against the owner's dns memory target, which a request
+// holds for up to a full response read. Waiting work parks in the launcher
+// rather than in one goroutine per request. It takes nothing and returns
+// false when ctx ends first. A true return hands the admission to the
+// request, which gives it back with releaseRequest and the same flags.
+func (self *dohClient) admitRequest(ctx context.Context, primary bool, follower bool) bool {
+	acquire := func(sem chan struct{}) bool {
+		if sem == nil {
+			return true
+		}
+		select {
+		case sem <- struct{}{}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	release := func(sem chan struct{}) {
+		if sem != nil {
+			<-sem
+		}
+	}
+	var primarySem chan struct{}
+	if primary {
+		primarySem = self.primarySem
+	}
+	var followerSem chan struct{}
+	if follower {
+		followerSem = self.followerSem
+	}
+	if !acquire(primarySem) {
+		return false
+	}
+	if !acquire(followerSem) {
+		release(primarySem)
+		return false
+	}
+	if !acquire(self.httpSem) {
+		release(followerSem)
+		release(primarySem)
+		return false
+	}
+	if !self.memoryTarget.Acquire(ctx, dohQueryReserveByteCount) {
+		release(self.httpSem)
+		release(followerSem)
+		release(primarySem)
+		return false
+	}
+	return true
+}
+
+// Gives back an admission of admitRequest, with its flags.
+func (self *dohClient) releaseRequest(primary bool, follower bool) {
+	self.memoryTarget.Release(dohQueryReserveByteCount)
+	if self.httpSem != nil {
+		<-self.httpSem
+	}
+	if follower && self.followerSem != nil {
+		<-self.followerSem
+	}
+	if primary && self.primarySem != nil {
+		<-self.primarySem
+	}
+}
+
 // queryResult resolves recordType for the given domains across dohUrls (RFC 8484 wire), returning
-// as soon as any server returns records. Servers are tried in a weighted-random order biased toward
-// recent success, and launched one wave per DohServerStagger so a fast primary answers before the
-// rest fire — which bounds concurrent in-flight requests and skips the redundant fan-out entirely
-// when an early server wins.
+// as soon as any server returns records. Servers are tried lead servers first (launchOrder), each
+// group in a weighted-random order biased toward recent success, and launched one wave per
+// DohServerStagger so a fast primary answers before the rest fire — which bounds concurrent
+// in-flight requests and skips the redundant fan-out entirely when an early server wins.
 func (self *dohClient) queryResult(
 	ctx context.Context,
 	dohUrls []string,
@@ -1760,9 +2381,9 @@ func (self *dohClient) queryResult(
 	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
 	defer queryCancel()
 
-	// weighted-random order: the best recent performers tend to fire first (and the rest are
-	// skipped when an early server wins)
-	ordered := self.stats.order(dohUrls)
+	// the lead servers first, then weighted-random order: the best recent performers tend to
+	// fire first (and the rest are skipped when an early server wins)
+	ordered := self.launchOrder(dohUrls)
 	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
 		ordered = ordered[:settings.MaxServersPerQuery]
 	}
@@ -1790,71 +2411,37 @@ func (self *dohClient) queryResult(
 	// snapshot before launchers acquired their slots, so a synchronized burst
 	// could nondeterministically admit many more hedges than intended.
 
-	// launcher: start one server-wave per stagger interval (in weighted order) until an early
+	// launcher: start one server-wave per stagger interval (in launch order) until an early
 	// server wins (stop), the deadline passes, or every server has been launched.
 	go HandleError(func() {
 		for waveIndex, wave := range waves {
 			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
 				return
 			}
+			// a warm path's first wave leaves the hedges their reserve
+			primary := pathWarm && waveIndex == 0
 			for _, dohUrl := range wave {
+				// a server outside the lead tier leaves the lead servers theirs
+				follower := !self.leadDohUrls[dohUrl]
 				for _, name := range names {
-					primaryAcquired := false
-					if pathWarm && waveIndex == 0 && self.primarySem != nil {
-						select {
-						case self.primarySem <- struct{}{}:
-							primaryAcquired = true
-						case <-stop:
-							return
-						case <-queryCtx.Done():
-							return
-						}
-					}
-					// acquire the in-flight slot and byte reservation here so work
-					// waiting on the caps parks in this one launcher instead of one
-					// parked goroutine per (server, name); the request goroutine owns
-					// both and releases them when done
-					if self.httpSem != nil {
-						select {
-						case self.httpSem <- struct{}{}:
-						case <-stop:
-							if primaryAcquired {
-								<-self.primarySem
-							}
-							return
-						case <-queryCtx.Done():
-							if primaryAcquired {
-								<-self.primarySem
-							}
-							return
-						}
-					}
-					// the request pins up to a full response read; the owner's dns
-					// memory target bounds its total in-flight bytes across all of
-					// its resolver caches
-					if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-						if self.httpSem != nil {
-							<-self.httpSem
-						}
-						if primaryAcquired {
-							<-self.primarySem
-						}
+					// launchCtx ends at stop or at the deadline
+					if !self.admitRequest(launchCtx, primary, follower) {
 						return
 					}
 					go HandleError(func() {
-						defer self.memoryTarget.Release(dohQueryReserveByteCount)
-						if self.httpSem != nil {
-							defer func() { <-self.httpSem }()
-						}
-						if primaryAcquired {
-							defer func() { <-self.primarySem }()
-						}
+						defer self.releaseRequest(primary, follower)
 						result := self.queryWire(queryCtx, dohUrl, recordType, name)
+						result.Server = dohUrl
+						// the policy-filter guard covers built-in endpoints only: a server the
+						// user chose answers as it answers (see dohBuiltInEndpoints)
+						if dohEndpointGuarded(dohUrl) {
+							result = dohGuardedResult(result)
+						}
 						// a server that returns records or an authoritative no-record answer is healthy;
-						// anything else (error, non-200, or no answer before it was beaten) counts
-						// against it. The large stagger means the first wave is the usual winner, so a
-						// later wave is only launched — and only judged — when an earlier server was
-						// slow or failed.
+						// anything else (error, non-200, a guarded filtered response, or no answer before
+						// it was beaten) counts against it. The large stagger means the first wave is the
+						// usual winner, so a later wave is only launched — and only judged — when an
+						// earlier server was slow or failed.
 						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || 0 < len(result.Txts) || result.Miss)
 						select {
 						case receiveResults <- result:
@@ -1867,15 +2454,33 @@ func (self *dohClient) queryResult(
 	})
 
 	mergedResult := newDohQueryResult()
+	// the sources that reported a miss, an endpoint and its other-family
+	// sibling counting as one (one operator's nxdomain on both families
+	// corroborates nothing), and whether every miss came from a built-in
+	// endpoint, for LoneMiss. A miss from a server the user chose is cached
+	// normally.
+	missSources := map[string]bool{}
+	builtInMisses := true
+	// any miss source reported a filtering block (dohQueryResult.Blocked)
+	blockedMiss := false
+	missSource := func(dohUrl string) string {
+		if sibling, ok := self.siblings[dohUrl]; ok && sibling < dohUrl {
+			return sibling
+		}
+		return dohUrl
+	}
 	for range queryCount {
 		select {
 		case <-queryCtx.Done():
+			miss := mergedResult.Miss && ctx.Err() == nil
 			return &dohQueryResult{
 				AddrTtls: mergedResult.AddrTtls,
 				Txts:     mergedResult.Txts,
 				// Keep an observed empty answer at our own fanout deadline.
 				// Caller cancellation retains the existing deadline outcome.
-				Miss: mergedResult.Miss && ctx.Err() == nil,
+				Miss:     miss,
+				Blocked:  miss && blockedMiss,
+				LoneMiss: miss && len(missSources) == 1 && builtInMisses,
 			}
 		case result := <-receiveResults:
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
@@ -1890,11 +2495,20 @@ func (self *dohClient) queryResult(
 			}
 			if result.Miss {
 				mergedResult.Miss = true
+				missSources[missSource(result.Server)] = true
+				if !dohEndpointGuarded(result.Server) {
+					builtInMisses = false
+				}
+				if result.Blocked {
+					blockedMiss = true
+				}
 			}
 			// fastest-record-wins: return as soon as any server returns records rather than
 			// waiting for the rest, so a slow or dead server can't delay a successful lookup. an
 			// authoritative miss is not short-circuited — keep collecting so a filtering
-			// resolver's NXDOMAIN can't override a server that resolves the name.
+			// resolver's NXDOMAIN can't override a server that resolves the name. a built-in
+			// endpoint's policy-filtered response is neither (see dohGuardedResult), so it
+			// counts as that endpoint failing.
 			if 0 < len(mergedResult.AddrTtls) || 0 < len(mergedResult.Txts) {
 				stopLaunching()
 				return &dohQueryResult{
@@ -1906,6 +2520,8 @@ func (self *dohClient) queryResult(
 		}
 	}
 	mergedResult.Miss = len(mergedResult.AddrTtls) == 0 && len(mergedResult.Txts) == 0 && mergedResult.Miss
+	mergedResult.Blocked = mergedResult.Miss && blockedMiss
+	mergedResult.LoneMiss = mergedResult.Miss && len(missSources) == 1 && builtInMisses
 	return mergedResult
 }
 
@@ -2017,20 +2633,36 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 	if err != nil {
 		return nil, nil, fmt.Errorf("build name: %w", err)
 	}
+	// an EDNS(0) OPT record (DO clear, no options) asks for extended dns
+	// errors: Cloudflare and AdGuard attach them only to a query that has one,
+	// and the policy-filter guard reads them (see parseDohWire)
+	var optHeader dnsmessage.ResourceHeader
+	if err := optHeader.SetEDNS0(dohEdnsUdpPayloadSize, dnsmessage.RCodeSuccess, false); err != nil {
+		return nil, nil, fmt.Errorf("build opt: %w", err)
+	}
 	// id 0 is recommended for DoH (RFC 8484 §4.1); recursion desired
 	msg := dnsmessage.Message{
-		Header:    dnsmessage.Header{RecursionDesired: true},
-		Questions: []dnsmessage.Question{{Name: dnsName, Type: qType, Class: dnsmessage.ClassINET}},
+		Header:      dnsmessage.Header{RecursionDesired: true},
+		Questions:   []dnsmessage.Question{{Name: dnsName, Type: qType, Class: dnsmessage.ClassINET}},
+		Additionals: []dnsmessage.Resource{{Header: optHeader, Body: &dnsmessage.OPTResource{}}},
 	}
 	wire, err := msg.Pack()
 	if err != nil {
 		return nil, nil, fmt.Errorf("pack query: %w", err)
 	}
 	requestUrl := fmt.Sprintf("%s?dns=%s", dohUrl, base64.RawURLEncoding.EncodeToString(wire))
+	// errors name the server by scheme and host only: the path can hold a
+	// personal configuration id, and the query encodes the looked up name
+	// (ADBLOCK3RD B7)
+	logUrl := DohUrlForLog(dohUrl)
 
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build request for %s: %w", dohUrl, err)
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
+			err = urlError.Err
+		}
+		return nil, nil, fmt.Errorf("build request for %s: %w", logUrl, err)
 	}
 	var route atomic.Pointer[DohRoute]
 	if self.captureRoute {
@@ -2052,23 +2684,24 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
-		return nil, nil, fmt.Errorf("request %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("request %s: %w", logUrl, err)
 	}
 	defer releaseHttpResponseBody(ctx, response)
 	if response.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
+		return nil, nil, fmt.Errorf("request %s: HTTP status %s", logUrl, response.Status)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", dohUrl, err)
+		return nil, nil, fmt.Errorf("read %s: %w", logUrl, err)
 	}
 	return data, route.Load(), nil
 }
 
-// forwardRaw resolves qType for domain across dohUrls (best recent performers
-// first) and returns the fastest usable raw response wire (NOERROR/NXDOMAIN).
-// It uses the same load-aware stagger, quiet-query admission, hedge reserve,
-// shared HTTP cap, and live memory target as parsed A/AAAA queries. This is
+// forwardRaw resolves qType for domain across dohUrls (lead servers, then best
+// recent performers first) and returns the fastest usable raw response wire
+// (NOERROR/NXDOMAIN). It uses the same launch order, load-aware stagger,
+// quiet-query admission, hedge and lead reserves, shared HTTP cap, and live
+// memory target as parsed A/AAAA queries. This is
 // important for browsers: Chromium commonly waits for HTTPS before opening an
 // origin, so serially waiting for one slow DoH server multiplied its delay
 // across an entire parallel first-load fan-out.
@@ -2087,7 +2720,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
 	defer queryCancel()
 
-	ordered := self.stats.order(dohUrls)
+	ordered := self.launchOrder(dohUrls)
 	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
 		ordered = ordered[:settings.MaxServersPerQuery]
 	}
@@ -2125,54 +2758,22 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
 				return
 			}
+			primary := pathWarm && waveIndex == 0
 			for _, dohUrl := range wave {
-
-				primaryAcquired := false
-				if pathWarm && waveIndex == 0 && self.primarySem != nil {
-					select {
-					case self.primarySem <- struct{}{}:
-						primaryAcquired = true
-					case <-stop:
-						return
-					case <-queryCtx.Done():
-						return
-					}
-				}
-				if self.httpSem != nil {
-					select {
-					case self.httpSem <- struct{}{}:
-					case <-stop:
-						if primaryAcquired {
-							<-self.primarySem
-						}
-						return
-					case <-queryCtx.Done():
-						if primaryAcquired {
-							<-self.primarySem
-						}
-						return
-					}
-				}
-				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
-					if self.httpSem != nil {
-						<-self.httpSem
-					}
-					if primaryAcquired {
-						<-self.primarySem
-					}
+				follower := !self.leadDohUrls[dohUrl]
+				// launchCtx ends at stop or at the deadline
+				if !self.admitRequest(launchCtx, primary, follower) {
 					return
 				}
 
 				go HandleError(func() {
-					defer self.memoryTarget.Release(dohQueryReserveByteCount)
-					if self.httpSem != nil {
-						defer func() { <-self.httpSem }()
-					}
-					if primaryAcquired {
-						defer func() { <-self.primarySem }()
-					}
+					defer self.releaseRequest(primary, follower)
 					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
-					usable := ok && dnsResponseUsable(data)
+					// a built-in endpoint's policy-filtered response is no answer: the next
+					// server is tried (see dohBuiltInEndpoints); a server the user chose is
+					// forwarded as it answers
+					usable := ok && dnsResponseUsable(data) &&
+						!(dohEndpointGuarded(dohUrl) && dnsResponseFiltered(data))
 					self.stats.record(dohUrl, usable)
 					select {
 					case results <- rawResult{data: data, usable: usable}:
@@ -2198,9 +2799,10 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	return nil, false
 }
 
-// dnsResponseUsable reports whether a raw DNS response is a well-formed answer worth forwarding:
-// a NOERROR (records or NODATA) or NXDOMAIN. A SERVFAIL/REFUSED/other is not (the caller tries the
-// next server).
+// Whether a raw DNS response is a well-formed answer worth forwarding: a NOERROR (records or
+// NODATA) or NXDOMAIN. A SERVFAIL/REFUSED/other is not (the caller tries the next server). A
+// response from a built-in endpoint must also not be policy-filtered (dnsResponseFiltered);
+// forwardRaw checks that per endpoint.
 func dnsResponseUsable(response []byte) bool {
 	if len(response) < 12 {
 		return false
@@ -2214,8 +2816,302 @@ func dnsResponseUsable(response []byte) bool {
 	}
 }
 
-// parseDohWire parses an RFC 8484 wire-format DNS response, extracting the A or AAAA answers
-// matching qType. NXDOMAIN -> Miss; other non-success RCODEs -> failure (empty, not Miss).
+// Whether a raw DNS response is policy-filtered: it carries a policy extended dns error
+// (dnsPolicyEdeCode) under any RCODE, or it is a NOERROR whose A and AAAA answers are all
+// 0.0.0.0 or ::. A body that does not parse past the header reads as not filtered: the guard
+// only refuses what it can read as filtered.
+func dnsResponseFiltered(response []byte) bool {
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		return false
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return false
+	}
+	unspecified := false
+	specified := false
+	for {
+		ah, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return false
+		}
+		var ip netip.Addr
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom4(r.A)
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom16(r.AAAA)
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				return false
+			}
+			continue
+		}
+		if ip.IsUnspecified() {
+			unspecified = true
+		} else {
+			specified = true
+		}
+	}
+	if dnsResponsePolicyEde(&p) {
+		return true
+	}
+	return header.RCode == dnsmessage.RCodeSuccess && unspecified && !specified
+}
+
+// The extended dns error option code (RFC 8914 §2).
+const dnsEdeOptionCode = 15
+
+// The UDP payload size the OPT record of every DoH query advertises, the dns
+// flag day 2020 value. Over DoH it is informational.
+const dohEdnsUdpPayloadSize = 1232
+
+// Whether an extended dns error INFO-CODE (RFC 8914 §4) marks a response as a
+// resolver's policy decision rather than an answer: 4 Forged Answer, 15
+// Blocked, 16 Censored, 17 Filtered, 18 Prohibited. Every other code, such as
+// 6, 7 and 9 (DNSSEC), 21 (Not Supported) and 29 (Synthesized), arrives on
+// genuine answers and is ignored.
+func dnsPolicyEdeCode(infoCode uint16) bool {
+	switch infoCode {
+	case 4, 15, 16, 17, 18:
+		return true
+	default:
+		return false
+	}
+}
+
+// Whether an extended dns error INFO-CODE marks a filtering resolver's block,
+// for the count of block answers (ADBLOCK3RD B9): 15 Blocked, 16
+// Censored, 17 Filtered. 4 (Forged Answer) and 18 (Prohibited) are policy codes
+// to the guard (dnsPolicyEdeCode) but not the block of a filter the user chose.
+func dnsBlockEdeCode(infoCode uint16) bool {
+	switch infoCode {
+	case 15, 16, 17:
+		return true
+	default:
+		return false
+	}
+}
+
+// Reads the rest of a response whose answer section p has consumed: skips the
+// authority section and reports whether an OPT record in the additional
+// section carries a policy extended dns error (dnsPolicyEdeCode). Quad9 sends
+// one even to a query without OPT. A response without OPT, or a tail that does
+// not parse, has none.
+func dnsResponsePolicyEde(p *dnsmessage.Parser) bool {
+	return slices.ContainsFunc(dnsResponseEdeCodes(p), dnsPolicyEdeCode)
+}
+
+// Reads the rest of a response whose answer section p has consumed: skips the
+// authority section and returns the extended dns error INFO-CODEs (RFC 8914)
+// of the OPT records in the additional section, in order. A response without
+// OPT has none; a tail that stops parsing yields the codes read before it.
+func dnsResponseEdeCodes(p *dnsmessage.Parser) []uint16 {
+	if err := p.SkipAllAuthorities(); err != nil {
+		return nil
+	}
+	var codes []uint16
+	for {
+		h, err := p.AdditionalHeader()
+		if err != nil {
+			// dnsmessage.ErrSectionDone, or a malformed tail
+			return codes
+		}
+		if h.Type != dnsmessage.TypeOPT {
+			if err := p.SkipAdditional(); err != nil {
+				return codes
+			}
+			continue
+		}
+		opt, err := p.OPTResource()
+		if err != nil {
+			return codes
+		}
+		for _, option := range opt.Options {
+			if option.Code == dnsEdeOptionCode && 2 <= len(option.Data) {
+				codes = append(codes, binary.BigEndian.Uint16(option.Data[:2]))
+			}
+		}
+	}
+}
+
+// Whether a raw DNS response is a recognizable block answer (ADBLOCK3RD
+// B9): a NOERROR whose A and AAAA answers are all 0.0.0.0 or :: (one
+// at least), or an NXDOMAIN carrying an extended dns error of 15, 16 or 17
+// (dnsBlockEdeCode). A plain NXDOMAIN, a REFUSED or a SERVFAIL is not, and a
+// body that does not parse is not.
+func dnsResponseBlockAnswer(response []byte) bool {
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		return false
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return false
+	}
+	unspecified := false
+	specified := false
+	for {
+		ah, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return false
+		}
+		var ip netip.Addr
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom4(r.A)
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				return false
+			}
+			ip = netip.AddrFrom16(r.AAAA)
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				return false
+			}
+			continue
+		}
+		if ip.IsUnspecified() {
+			unspecified = true
+		} else {
+			specified = true
+		}
+	}
+	switch header.RCode {
+	case dnsmessage.RCodeSuccess:
+		return unspecified && !specified
+	case dnsmessage.RCodeNameError:
+		return slices.ContainsFunc(dnsResponseEdeCodes(&p), dnsBlockEdeCode)
+	default:
+		return false
+	}
+}
+
+// A DoH url as it may appear in a log, an error or a feedback upload: the
+// scheme and the host (with its port), never the user info, path, query or
+// fragment, so a personal configuration id in the path (ADBLOCK3RD D1, B7)
+// never leaves the device. A url that does not parse as one with a host is
+// replaced by a fixed placeholder rather than echoed.
+func DohUrlForLog(dohUrl string) string {
+	u, err := url.Parse(strings.TrimSpace(dohUrl))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<doh url>"
+	}
+	return strings.ToLower(u.Scheme) + "://" + u.Host
+}
+
+// A DoH url as an endpoint key: lower case scheme, the host (an ip in its
+// canonical form), the port unless it is 443, and the path without trailing
+// slashes. Two spellings of one endpoint get one key.
+func dohEndpointKey(dohUrl string) string {
+	u, err := url.Parse(strings.TrimSpace(dohUrl))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(dohUrl)
+	}
+	host := strings.ToLower(u.Hostname())
+	if addr, err := netip.ParseAddr(host); err == nil {
+		host = addr.Unmap().String()
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		host = host + ":" + port
+	}
+	return strings.ToLower(u.Scheme) + "://" + host + strings.TrimRight(u.Path, "/")
+}
+
+// The DoH endpoints connect ships, by endpoint key (dohEndpointKey): the default
+// remote and local DoH lists and the regional bootstrap DoH presets of every
+// country. The policy-filter guard (dohGuardedResult) applies to their
+// responses only. It exists so that filtering or censorship by URnetwork's own
+// defaults never wins the race or is cached, and it never overrides filtering a
+// user chose: a server the user added, or a filtering preset, is answered as it
+// answers, 0.0.0.0 sink answers and extended-error nxdomains included. A user
+// who names a built-in endpoint in their own list (1.1.1.1, say) gets the guard
+// for that endpoint, because it is the same endpoint. Quad9's filtering
+// 9.9.9.9 is not built-in (the default is its unfiltered 9.9.9.10), so a user
+// who names it gets its blocks.
+//
+// Plain dns servers have no guard: their lookups go through net.Resolver, which
+// shows neither the extended error nor which server answered.
+var dohBuiltInEndpoints = sync.OnceValue(func() map[string]bool {
+	endpoints := map[string]bool{}
+	resolver := DefaultDnsResolverSettings()
+	for _, dohUrl := range slices.Concat(
+		resolver.RemoteDohUrlsIpv4, resolver.RemoteDohUrlsIpv6,
+		resolver.LocalDohUrlsIpv4, resolver.LocalDohUrlsIpv6,
+	) {
+		endpoints[dohEndpointKey(dohUrl)] = true
+	}
+	for _, server := range regionalControlDohServers {
+		for _, dohUrl := range []string{server.DohUrlIpv4, server.DohUrlIpv6} {
+			if dohUrl != "" {
+				endpoints[dohEndpointKey(dohUrl)] = true
+			}
+		}
+	}
+	return endpoints
+})
+
+// Whether a DoH url is a built-in endpoint, whose responses the policy-filter
+// guard applies to (see dohBuiltInEndpoints).
+func dohEndpointGuarded(dohUrl string) bool {
+	return dohBuiltInEndpoints()[dohEndpointKey(dohUrl)]
+}
+
+// The policy-filter guard, for one built-in endpoint's parsed response (see
+// dohBuiltInEndpoints): a policy-filtered response (parseDohWire) becomes that
+// endpoint failing, neither an answer nor a Miss, so it never ends the race,
+// never earns its endpoint success credit, and can never merge into an
+// authoritative miss and be cached for MissExpiration; when every endpoint
+// failed or was filtered the lookup is a SERVFAIL, with serve-stale. A 0.0.0.0
+// or :: beside real addresses is dropped and the real addresses kept. It
+// decides which redundant upstream to believe and what to cache, and only ever
+// turns a policy answer into no answer from that endpoint (RFC 8914 §6).
+func dohGuardedResult(result *dohQueryResult) *dohQueryResult {
+	if result.Filtered {
+		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Filtered: true, Server: result.Server}
+	}
+	for addr := range result.AddrTtls {
+		if addr.IsUnspecified() {
+			delete(result.AddrTtls, addr)
+		}
+	}
+	return result
+}
+
+// Parses an RFC 8484 wire-format DNS response, extracting the A or AAAA answers matching qType,
+// or the TXT values. NXDOMAIN, and a NOERROR with no matching answer, is a Miss; any other RCODE
+// is a failure (empty, not a Miss).
+//
+// It also classifies the response: Filtered is set when the response carries a policy extended
+// dns error under any RCODE (dnsPolicyEdeCode: a Quad9 malware block, a country withdrawal), or is
+// a NOERROR whose matching answers are all 0.0.0.0 or :: (a sink answer, which some filters send
+// with no extended error). Blocked is set on an NXDOMAIN whose extended dns error is a block's
+// (dnsBlockEdeCode). The result is otherwise as the server answered, sink addresses
+// included: the caller applies the guard (dohGuardedResult) to a built-in endpoint's response
+// only.
 func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 	result := newDohQueryResult()
 
@@ -2225,42 +3121,72 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 		return result
 	}
 	switch header.RCode {
-	case dnsmessage.RCodeSuccess:
-	case dnsmessage.RCodeNameError: // NXDOMAIN
-		result.Miss = true
-		return result
+	case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
 	default:
 		return result
 	}
+	nxdomain := header.RCode == dnsmessage.RCodeNameError
+	// an nxdomain is a Miss whatever its sections hold; a section that does
+	// not parse ends the read before any extended error
+	nxdomainResult := func(filtered bool, blocked bool) *dohQueryResult {
+		return &dohQueryResult{AddrTtls: map[netip.Addr]int{}, Miss: true, Filtered: filtered, Blocked: blocked}
+	}
 	if err := p.SkipAllQuestions(); err != nil {
+		if nxdomain {
+			return nxdomainResult(false, false)
+		}
 		return result
 	}
+	unspecified := false
+	specified := false
 	for {
 		ah, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
 			break
 		}
 		if err != nil {
+			if nxdomain {
+				return nxdomainResult(false, false)
+			}
 			return result
 		}
 		switch {
 		case ah.Type == dnsmessage.TypeA && qType == dnsmessage.TypeA:
 			r, err := p.AResource()
 			if err != nil {
+				if nxdomain {
+					return nxdomainResult(false, false)
+				}
 				return result
 			}
 			ip := netip.AddrFrom4(r.A)
+			if ip.IsUnspecified() {
+				unspecified = true
+			} else {
+				specified = true
+			}
 			result.AddrTtls[ip] = max(result.AddrTtls[ip], int(ah.TTL))
 		case ah.Type == dnsmessage.TypeAAAA && qType == dnsmessage.TypeAAAA:
 			r, err := p.AAAAResource()
 			if err != nil {
+				if nxdomain {
+					return nxdomainResult(false, false)
+				}
 				return result
 			}
 			ip := netip.AddrFrom16(r.AAAA)
+			if ip.IsUnspecified() {
+				unspecified = true
+			} else {
+				specified = true
+			}
 			result.AddrTtls[ip] = max(result.AddrTtls[ip], int(ah.TTL))
 		case ah.Type == dnsmessage.TypeTXT && qType == dnsmessage.TypeTXT:
 			r, err := p.TXTResource()
 			if err != nil {
+				if nxdomain {
+					return nxdomainResult(false, false)
+				}
 				return result
 			}
 			// one record is a sequence of character strings that together
@@ -2272,10 +3198,19 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 			}
 		default:
 			if err := p.SkipAnswer(); err != nil {
+				if nxdomain {
+					return nxdomainResult(false, false)
+				}
 				return result
 			}
 		}
 	}
+	edeCodes := dnsResponseEdeCodes(&p)
+	policyEde := slices.ContainsFunc(edeCodes, dnsPolicyEdeCode)
+	if nxdomain {
+		return nxdomainResult(policyEde, slices.ContainsFunc(edeCodes, dnsBlockEdeCode))
+	}
+	result.Filtered = policyEde || (unspecified && !specified && len(result.Txts) == 0)
 	if len(result.AddrTtls) == 0 && len(result.Txts) == 0 {
 		result.Miss = true
 	}
@@ -2290,6 +3225,10 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 type serverStats struct {
 	lock  sync.Mutex
 	byUrl map[string]*serverStat
+	// Stands in for the uniform draw in [0, 1) of each server's key in the
+	// weighted order (orderAt), by url, so a test can force an order. nil
+	// draws from math/rand. Guarded by lock.
+	draw func(dohUrl string) float64
 }
 
 func newServerStats() *serverStats {
@@ -2449,7 +3388,12 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 	self.lock.Lock()
 	for i, url := range ordered {
 		weight := dohServerWeightFloor + self.scoreLocked(url, now)
-		u := mathrand.Float64()
+		var u float64
+		if self.draw != nil {
+			u = self.draw(url)
+		} else {
+			u = mathrand.Float64()
+		}
 		if u <= 0 {
 			u = math.SmallestNonzeroFloat64
 		}
@@ -2482,10 +3426,20 @@ type DohResult struct {
 	Time            time.Time
 	AddrExpirations map[netip.Addr]time.Time
 	Miss            bool
+	// When positive and shorter than the cache's MissExpiration, how long
+	// this miss stays valid: a lone miss (see DohSettings.LoneMissExpiration).
+	// Zero keeps the cache's.
+	MissExpiration time.Duration
+	// The miss was a filtering block (dohQueryResult.Blocked), so a cache hit
+	// still counts as a block answer delivered.
+	Blocked bool
 }
 
 func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
 	if len(self.AddrExpirations) == 0 {
+		if 0 < self.MissExpiration && self.MissExpiration < missExpiration {
+			missExpiration = self.MissExpiration
+		}
 		return self.Miss && !self.Time.Add(missExpiration).Before(now)
 	}
 	for _, expireTime := range self.AddrExpirations {

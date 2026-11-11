@@ -569,7 +569,7 @@ func TestRetainedReceiveDuplicatePreservesCommitAndHeadProgress(t *testing.T) {
 		fixture := newWindowRoundFixture(t, nil, func(settings *ReceiveBufferSettings) {
 			settings.ReceiveQueueRetainedByteAccounting = true
 			settings.ReceiveQueueBudget = budget
-			settings.ReceiveHoldPolicy = ReceiveHoldRefuse
+			settings.ReceiveHoldPolicy = ReceiveHoldCommittedPrefix
 		})
 		fixture.forward(fixture.write(100), fixture.receiverIn)
 		fixture.acknowledge()
@@ -583,6 +583,19 @@ func TestRetainedReceiveDuplicatePreservesCommitAndHeadProgress(t *testing.T) {
 		held := seq.receiveQueue.GetBySequenceNumber(2)
 		if held == nil || !held.committed || budget.UsedByteCount() == 0 {
 			t.Fatal("future item was not committed under an exact reservation")
+		}
+		// Owned predecode must fund the missing original before publishing its
+		// successor's SACK. The former Refuse fixture relied on an unpaid
+		// direct-head path after it deliberately exhausted physical capacity.
+		path, err := FilteredTransferPath(head.bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan, status := scanReceiveMemoryPack(head.bytes, path)
+		if status != receiveMemoryPackScanReady || !seq.holdPromise.set || seq.holdPromise.boundary != held.sequenceNumber ||
+			seq.holdPromise.reservedByteCount < scan.retainedByteCount ||
+			budget.UsedByteCount() != held.QueueByteCount()+seq.holdPromise.reservedByteCount+seq.heldHeadRepair.reservedByteCount {
+			t.Fatal("selective custody did not prepay the real missing predecessor and repair metadata")
 		}
 		budget.SetTotalByteCount(budget.UsedByteCount())
 		reserved, _ := budget.Counts()

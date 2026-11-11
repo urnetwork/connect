@@ -724,22 +724,25 @@ func TestMultiClientBlockActionIgnoreHosts(t *testing.T) {
 	})
 }
 
-// testHardCodedRemoteDohIps are the DefaultDnsResolverSettings remote doh
-// resolver ips of the family, and a same-operator neighbor that is not in
-// the baseline.
-func testHardCodedRemoteDohIps(ipVersion int) (hardCodedIps []string, controlIp string) {
+// Resolver ips of the family in the built-in ignore baseline
+// (wellKnownResolverAddrs): the default remote doh servers, DNS.SB's included,
+// Quad9's filtering 9.9.9.9, Google Public DNS and OpenDNS (no longer
+// defaults, still queried directly by devices) and another operator's second
+// address. The control ip is a same-operator neighbor that is not in the
+// baseline.
+func testWellKnownResolverIps(ipVersion int) (resolverIps []string, controlIp string) {
 	if ipVersion == 4 {
-		return []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}, "1.0.0.1"
+		return []string{"1.1.1.1", "1.0.0.1", "9.9.9.10", "185.222.222.222", "45.11.45.11", "9.9.9.9", "208.67.222.222", "8.8.8.8", "8.8.4.4", "149.112.112.112"}, "1.1.1.2"
 	}
-	return []string{"2606:4700:4700::1111", "2001:4860:4860::8888", "2620:fe::fe", "2620:119:35::35"}, "2606:4700:4700::1001"
+	return []string{"2606:4700:4700::1111", "2606:4700:4700::1001", "2620:fe::10", "2a09::", "2a11::", "2620:fe::fe", "2620:119:35::35", "2001:4860:4860::8888", "2001:4860:4860::8844", "2620:fe::9"}, "2606:4700:4700::1112"
 }
 
-// TestMultiClientBlockActionDefaultRemoteDohIgnored verifies the built-in
-// ignore baseline: the hard coded remote doh resolver ips are excluded from
-// override decisions with NO SetBlockActionIgnoreHosts wiring at all, while
-// a neighboring non-baseline ip still matches overrides. Both families: the
-// baseline carries the v6 resolver endpoints too.
-func TestMultiClientBlockActionDefaultRemoteDohIgnored(t *testing.T) {
+// The built-in ignore baseline: the well known resolver ips, Google Public DNS
+// included, are excluded from override decisions with NO
+// SetBlockActionIgnoreHosts wiring at all, while a neighboring non-baseline ip
+// still matches overrides. Both families: the baseline carries the v6
+// resolver endpoints too.
+func TestMultiClientBlockActionWellKnownResolversIgnored(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -755,26 +758,26 @@ func TestMultiClientBlockActionDefaultRemoteDohIgnored(t *testing.T) {
 		})
 		defer unsub()
 
-		// an un-block override covering the hard coded resolver ips and a
+		// an un-block override covering the well known resolver ips and a
 		// non-baseline control ip. note: no SetBlockActionIgnoreHosts call.
-		hardCodedIps, controlIp := testHardCodedRemoteDohIps(ipVersion)
+		resolverIps, controlIp := testWellKnownResolverIps(ipVersion)
 		unblockOverride := &BlockActionOverride{
 			OverrideId:    NewId(),
-			Hosts:         append(append([]string{}, hardCodedIps...), controlIp),
+			Hosts:         append(append([]string{}, resolverIps...), controlIp),
 			BlockOverride: &BlockOverride{Block: false},
 		}
 		multiClient.SetBlockActionOverrides([]*BlockActionOverride{unblockOverride})
 
-		// the baseline ignores the override for every hard coded resolver ip:
+		// the baseline ignores the override for every well known resolver ip:
 		// the drop policy blocks, and no block action is surfaced
-		for _, ip := range hardCodedIps {
+		for _, ip := range resolverIps {
 			packet := testingUdpPacket(ipVersion, testBlockActionSourceIp(ipVersion), ip, 9, []byte("hello"))
 			success := multiClient.SendPacket(source, protocol.ProvideMode_Network, packet, 0)
 			AssertEqual(t, false, success)
 		}
 		select {
 		case blockActions := <-blockActionsChannel:
-			t.Fatalf("expected no block actions for the hard coded resolver ips, got %d", len(blockActions))
+			t.Fatalf("expected no block actions for the well known resolver ips, got %d", len(blockActions))
 		case <-time.After(4 * settings.EventEpoch):
 		}
 

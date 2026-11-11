@@ -42,7 +42,7 @@ func TestProviderReliableTcpPrepaidSharedRootHandoff(t *testing.T) {
 					f.establishForControl()
 					sequence := f.runningReceiveSequence(reliableIngressBudgetSettings(receiveBudget))
 					payload := bytes.Repeat([]byte{0x6d}, 1200)
-					id := f.pack(sequence, 1, payload)
+					id := f.packOwned(sequence, 1, payload)
 					synctest.Wait()
 					held := sequence.receiveQueue.GetByMessageId(id)
 					if held == nil || !held.committed || held.deliveryPrepaid == 0 || held.memoryBudget != receiveBudget {
@@ -50,11 +50,12 @@ func TestProviderReliableTcpPrepaidSharedRootHandoff(t *testing.T) {
 					}
 					originalCharge, prepaid := held.queueByteCount, held.deliveryPrepaid
 					promised := sequence.holdPromise.reservedByteCount
-					if promised != originalCharge || receiveBudget.UsedByteCount() != originalCharge+promised {
+					repairBytes := assertReliableIngressRepairCustody(t, sequence, held)
+					if promised != originalCharge || receiveBudget.UsedByteCount() != originalCharge+promised+repairBytes {
 						t.Fatal("one missing predecessor did not own exactly one additional held-size promise")
 					}
 					rootBytes := MessagePoolRootByteCount(held.frames[0].MessageBytes)
-					t.Logf("retained=%dB downstream-prepaid=%dB original-root=%dB", originalCharge, prepaid, rootBytes)
+					t.Logf("retained=%dB downstream-prepaid=%dB original-root=%dB repair-metadata=%dB", originalCharge, prepaid, rootBytes, repairBytes)
 					witness := MessagePoolShareReadOnly(held.frames[0].MessageBytes)
 					defer MessagePoolReturn(witness)
 					fill := root.Available()
@@ -67,20 +68,21 @@ func TestProviderReliableTcpPrepaidSharedRootHandoff(t *testing.T) {
 						defer natBudget.SetTotalByteCount(mib(3))
 					}
 					rootReserved, rootReleased := root.reservedByteCount.Load(), root.releasedByteCount.Load()
-					controlID := f.pack(sequence, 0, nil)
+					controlID := f.packOwned(sequence, 0, nil)
 					synctest.Wait()
 					if present, head := reliableIngressCumulativeHead(sequence); !present || head.messageId != controlID {
 						t.Fatal("shared-root pressure blocked control or cumulatively ACKed data")
 					}
 					if ceiling {
-						if held.deliveryPrepaid != prepaid || receiveBudget.UsedByteCount() != originalCharge {
+						if held.deliveryPrepaid != prepaid || receiveBudget.UsedByteCount() != originalCharge+repairBytes {
 							t.Fatal("target-child refusal consumed source credit")
 						}
 						natBudget.SetTotalByteCount(mib(3))
 						synctest.Wait()
 					}
 					if held.deliveryPrepaid >= prepaid || held.queueByteCount < rootBytes ||
-						receiveBudget.UsedByteCount() != held.queueByteCount {
+						receiveBudget.UsedByteCount() != held.queueByteCount+repairBytes ||
+						assertReliableIngressRepairCustody(t, sequence, held) != repairBytes {
 						t.Fatal("handoff either failed or removed still-live receive-root credit")
 					}
 					// The predecessor consumed/retired its separately reserved

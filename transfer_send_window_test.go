@@ -975,6 +975,17 @@ func TestALargerWindowIsFasterAtALongRoundTrip(t *testing.T) {
 					}
 				}, func(settings *ClientSettings) {
 					settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+					// Since d90ac7f4 the shared receive loop hands each Pack to
+					// its sequence with zero wait and refuses one that finds the
+					// handoff full, leaving the sender to retransmit it. Whether
+					// the worker drains between two arrivals of one virtual
+					// instant is goroutine scheduling, not path timing, so this
+					// lossless cell gives the handoff room for its largest window.
+					receive := settings.ReceiveBufferSettings
+					receive.SequenceBufferSize = 2 * int(ceiling/payloadByteCount)
+					receive.H1SequenceBufferSize = receive.SequenceBufferSize
+					receive.SequenceBufferByteCount = 2 * ceiling
+					receive.H1SequenceBufferByteCount = receive.SequenceBufferByteCount
 				})
 			if advertise {
 				harness.receiveHold(ceiling)

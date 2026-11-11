@@ -19,6 +19,16 @@ type serviceRefreshSnapshot struct {
 	stamp  uint64
 }
 
+// A pending original may have blocked the refusal callback's one request.
+// Reconsider only after actual SYN materialization, publication indexing and
+// memory release. The ordinary claim rechecks current paid lineage and every
+// refusal, lifetime, capacity and reservation guard; no authority is retained.
+func (self *multiClientChannelUpdate) reassertServiceRefreshAfterMaterialization() {
+	if parent := self.sequenceParentSnapshot(); parent != nil {
+		parent.requestServiceRefresh(self, self.ipPath)
+	}
+}
+
 // No parent/window lock nesting: gather membership first, then qualify the
 // exact source and claim one idle victim under the parent's routing lock.
 func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientChannelUpdate, path *IpPath) {
@@ -64,14 +74,6 @@ func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientC
 	update.stateLock.Lock()
 	qualified := update.client.Load() == nil && !update.serviceRefreshRequested && !update.pinned && update.synRetryHasRemoteRefusalWithLock() &&
 		!update.synRetry.remoteRefusalOverflow && discoveryDemandAttemptLive(update, update.discoveryAttemptStamp.Load())
-	if qualified {
-		for _, client := range offered {
-			if !update.synRetryRemoteTailRefusedWithLock(client) {
-				qualified = false
-				break
-			}
-		}
-	}
 	update.stateLock.Unlock()
 	if !qualified {
 		return
@@ -94,7 +96,7 @@ func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientC
 			}
 			victim.releaseServiceRefreshReservation(owner)
 			update.stateLock.Lock()
-			if update.synRetry == owner && update.discoveryAttemptStamp.Load() == stamp {
+			if update.currentSynRetryLineageWithLock(owner) != nil && update.discoveryAttemptStamp.Load() == stamp {
 				update.serviceRefreshRequested = false
 			}
 			update.releaseSynRetryReferenceWithLock(owner)
@@ -102,6 +104,23 @@ func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientC
 			update.releaseSynRetryMemory()
 		}
 	}
+}
+
+// Only the exact paid reservation may reassert its bounded acquisition before
+// ordinary exhausted-field observation. Metadata successors keep that lineage.
+func (self *multiClientWindow) observeServiceRefreshAttempt(update *multiClientChannelUpdate, source *IpPath) (discoveryAttemptObservation, bool) {
+	snapshot := self.serviceRefreshSnapshot()
+	if snapshot.owner == nil || snapshot.update != update {
+		return discoveryAttemptObservation{}, false
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	if update.currentSynRetryLineageWithLock(snapshot.owner) == nil || !update.synRetryHasRemoteRefusalWithLock() || !update.synRetryRemoteTailRefusedWithLock(snapshot.victim) ||
+		!discoveryDemandAttemptLive(update, snapshot.stamp) ||
+		(source != nil && (source.Protocol != IpProtocolTcp || !source.Syn || source.Ack || source.SequenceNumber != update.dialFailedSyn)) {
+		return discoveryAttemptObservation{}, false
+	}
+	return discoveryAttemptObservation{stamp: snapshot.stamp, serviceOwner: snapshot.owner}, true
 }
 
 // The fence precedes the scan. Fresh race registration/adoption observes it
@@ -115,10 +134,12 @@ func (self *RemoteUserNatMultiClient) claimServiceRefreshOwner(update *multiClie
 	}
 	owner.references++
 	update.stateLock.Unlock()
-	claimed := false
+	claimed, reservationAcquired := false, false
 	defer func() {
 		if !claimed {
-			victim.releaseServiceRefreshReservation(owner)
+			if reservationAcquired {
+				victim.releaseServiceRefreshReservation(owner)
+			}
 			update.stateLock.Lock()
 			update.releaseSynRetryReferenceWithLock(owner)
 			update.stateLock.Unlock()
@@ -128,6 +149,7 @@ func (self *RemoteUserNatMultiClient) claimServiceRefreshOwner(update *multiClie
 	if !victim.serviceRefreshReservation.CompareAndSwap(nil, owner) {
 		return nil, 0
 	}
+	reservationAcquired = true
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.ctx.Err() != nil || self.affinityUpdateWithLock(path) != update || self.affinityTransitions[update] != nil {
@@ -142,17 +164,21 @@ func (self *RemoteUserNatMultiClient) claimServiceRefreshOwner(update *multiClie
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	stamp := update.discoveryAttemptStamp.Load()
+	current := update.currentSynRetryLineageWithLock(owner)
 	if update.client.Load() != nil || update.serviceRefreshRequested || !discoveryDemandAttemptLive(update, stamp) ||
-		update.synRetry != owner || !update.synRetryHasRemoteRefusalWithLock() || owner.remoteRefusalOverflow || victim.IsDone() ||
+		current == nil || !update.synRetryHasRemoteRefusalWithLock() || current.remoteRefusalOverflow || victim.IsDone() ||
 		victim.serviceRefreshReservation.Load() != owner {
 		return nil, 0
 	}
-	for _, client := range offered {
-		if client.IsDone() || !update.synRetryRemoteTailRefusedWithLock(client) {
-			return nil, 0
-		}
+	// The retirement authority is this idle victim's authenticated refusal.
+	// Other candidates may still answer; they retain their race references.
+	// Requiring every peer to refuse delays replacement of an unusable idle
+	// slot behind unrelated silent peers and their native retry schedule.
+	if !update.synRetryRemoteTailRefusedWithLock(victim) {
+		return nil, 0
 	}
 	update.serviceRefreshRequested = true
+	update.serviceRefreshLineage.Store(owner.retryLineage)
 	claimed = true
 	return owner, stamp
 }
@@ -214,11 +240,23 @@ func (self *multiClientWindow) serviceRefreshSnapshot() serviceRefreshSnapshot {
 		victim: self.serviceRefreshVictim, stamp: self.serviceRefreshStamp}
 }
 
-// A pending invalid owner must release its fence even before expansion starts.
+// A prior empty snapshot cannot authorize clearing a new live reservation.
+// Recheck validity under the same window lock that detaches the current owner.
+func (self *multiClientWindow) pruneInvalidServiceRefresh() {
+	self.finishServiceRefreshMatching(nil, true)
+}
+
+// An exact pass owner may finish itself; nil remains force cleanup for teardown.
 func (self *multiClientWindow) finishServiceRefresh(expected *tcpSynRetry) {
+	self.finishServiceRefreshMatching(expected, false)
+}
+
+// Detachment is atomic with its predicate. Returning the source reference and
+// its paid memory remains outside the window lock for both cleanup paths.
+func (self *multiClientWindow) finishServiceRefreshMatching(expected *tcpSynRetry, invalidOnly bool) {
 	self.stateLock.Lock()
 	owner, victim := self.serviceRefreshOwner, self.serviceRefreshVictim
-	if owner == nil || expected != nil && owner != expected {
+	if owner == nil || expected != nil && owner != expected || invalidOnly && self.serviceRefreshLiveWithLock() {
 		self.stateLock.Unlock()
 		return
 	}
@@ -228,7 +266,7 @@ func (self *multiClientWindow) finishServiceRefresh(expected *tcpSynRetry) {
 	self.stateLock.Unlock()
 	victim.releaseServiceRefreshReservation(owner)
 	update.stateLock.Lock()
-	if !attempted && update.synRetry == owner && update.discoveryAttemptStamp.Load() == stamp {
+	if !attempted && update.currentSynRetryLineageWithLock(owner) != nil && update.discoveryAttemptStamp.Load() == stamp {
 		update.serviceRefreshRequested = false
 	}
 	update.releaseSynRetryReferenceWithLock(owner)
@@ -247,11 +285,11 @@ func (self *multiClientWindow) addServiceRefreshExclusions(excluded map[MultiHop
 	}
 	snapshot.update.stateLock.Lock()
 	defer snapshot.update.stateLock.Unlock()
-	if snapshot.owner.references == 0 || snapshot.update.synRetry != snapshot.owner ||
-		!discoveryDemandAttemptLive(snapshot.update, snapshot.stamp) {
+	current := snapshot.update.currentSynRetryLineageWithLock(snapshot.owner)
+	if current == nil || !discoveryDemandAttemptLive(snapshot.update, snapshot.stamp) {
 		return
 	}
-	for _, id := range snapshot.owner.refusedRemoteIds {
+	for _, id := range current.refusedRemoteIds {
 		excluded[RequireMultiHopId(id)] = true
 	}
 }
@@ -279,7 +317,7 @@ func (self *multiClientWindow) serviceRefreshCandidateAllowed(owner *tcpSynRetry
 	}
 	snapshot.update.stateLock.Lock()
 	defer snapshot.update.stateLock.Unlock()
-	return snapshot.update.synRetry == owner && discoveryDemandAttemptLive(snapshot.update, snapshot.stamp) &&
+	return snapshot.update.currentSynRetryLineageWithLock(owner) != nil && discoveryDemandAttemptLive(snapshot.update, snapshot.stamp) &&
 		!snapshot.update.synRetryRemoteTailRefusedWithLock(client)
 }
 
@@ -292,10 +330,17 @@ func (self *RemoteUserNatMultiClient) serviceRefreshConnected(path *IpPath) {
 	}
 	update.stateLock.Lock()
 	useful := update.serviceRefreshRequested && update.receivedInbound.Load()
+	lineage := update.serviceRefreshLineage.Load()
+	if useful {
+		update.serviceRefreshRequested = false
+	}
 	update.stateLock.Unlock()
 	if useful {
 		for _, window := range self.windows {
-			window.clearDiscoveryExpandRetry()
+			window.clearDiscoveryExpandRetryForService(update, lineage)
+			if window.resizeMonitor != nil && window.serviceRefreshAnswerObserved(update) {
+				window.resizeMonitor.NotifyAll()
+			}
 		}
 	}
 }
@@ -390,4 +435,32 @@ func (self *multiClientChannel) releaseServiceRefreshReservation(owner *tcpSynRe
 	}
 	self.stateLock.Unlock()
 	return true
+}
+
+// A pass canceled by the same source's actual useful answer is no longer an
+// unproductive service attempt. A new source generation cannot inherit this.
+func (self *multiClientWindow) serviceRefreshAnswerObserved(update *multiClientChannelUpdate) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	owner := self.serviceRefreshOwner
+	return owner != nil && owner.update != nil && (update == nil || owner.update == update) && owner.update.ctx != nil && owner.update.ctx.Err() == nil &&
+		owner.retryLineage != 0 && owner.update.serviceRefreshLineage.Load() == owner.retryLineage &&
+		!owner.update.sourceReset.Load() && owner.update.receivedInbound.Load()
+}
+
+// Only the refresh actually attempted by this resize pass may exempt its own
+// canceled speculative work. A pending unrelated owner supplies no authority.
+func (self *multiClientWindow) serviceRefreshPassAnswered(expected *tcpSynRetry) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.serviceRefreshPassAnsweredWithLock(expected)
+}
+
+// The caller owns the window lock through the backoff decision/publication.
+func (self *multiClientWindow) serviceRefreshPassAnsweredWithLock(expected *tcpSynRetry) bool {
+	owner := self.serviceRefreshOwner
+	return expected != nil && owner == expected && self.serviceRefreshAttempted &&
+		owner.update != nil && owner.update.ctx != nil && owner.update.ctx.Err() == nil &&
+		owner.retryLineage != 0 && owner.update.serviceRefreshLineage.Load() == owner.retryLineage &&
+		!owner.update.sourceReset.Load() && owner.update.receivedInbound.Load()
 }

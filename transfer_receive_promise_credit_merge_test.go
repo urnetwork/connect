@@ -20,16 +20,19 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 		f := newReliableTcpIngressFixtureWithPath(t, reliableDeliveryTestPath(4), nil)
 		sequence := f.runningReceiveSequence(reliableIngressBudgetSettings(budget))
 		payload := bytes.Repeat([]byte{0x6d}, 1200)
-		later, laterId := f.uploadPack(sequence, 1, 1301, payload)
-		if ok, err := sequence.Pack(later, 0); !ok || err != nil {
-			later.messagePoolReturn()
-			t.Fatalf("later Pack handoff: ok=%t err=%v", ok, err)
-		}
+		// Since 00d4f62b only a paid decoded owner can fund the repair escrow
+		// a selective lease needs, so both originals use the production
+		// scanner and paid decoder, as the client's receive loop does.
+		laterId := f.packOwnedTcp(sequence, 1, 1301, payload)
 		synctest.Wait()
 		held := sequence.receiveQueue.GetByMessageId(laterId)
 		if held == nil || !held.committed || held.memoryBudget != budget ||
 			sequence.holdPromise.reservedByteCount != held.queueByteCount {
 			t.Fatal("successor did not prepay its missing data head")
+		}
+		repairBytes := assertReliableIngressRepairCustody(t, sequence, held)
+		if budget.UsedByteCount() != held.queueByteCount+sequence.holdPromise.reservedByteCount+repairBytes {
+			t.Fatal("successor's lease has unexplained receive ownership")
 		}
 		fill := root.Available()
 		if !root.TryReserve(fill) {
@@ -37,7 +40,14 @@ func TestReceiveDeliveryPromisedDataHeadUsesExistingCredit(t *testing.T) {
 		}
 		defer root.Release(fill)
 		reserved, released := root.reservedByteCount.Load(), root.releasedByteCount.Load()
-		head, _ := f.uploadPack(sequence, 0, 101, payload)
+		input, _ := f.uploadPack(sequence, 0, 101, payload)
+		head := func() *ReceivePack {
+			defer input.messagePoolReturn()
+			return f.decodeOwnedPack(sequence, input)
+		}()
+		if head == nil {
+			t.Fatal("prepaid data head could not decode at the full root from its promised credit")
+		}
 		if ok, err := sequence.Pack(head, 0); !ok || err != nil {
 			head.messagePoolReturn()
 			t.Fatalf("head Pack handoff: ok=%t err=%v", ok, err)

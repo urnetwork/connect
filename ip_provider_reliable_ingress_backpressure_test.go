@@ -503,24 +503,29 @@ func TestProviderReliableTcpSelectiveLeaseSurvivesFinalAdmissionPressure(t *test
 					settings.ReceiveHoldPolicy = ReceiveHoldCommittedPrefix
 				})
 				payload := []byte("leased exact out-of-order item")
-				messageID := f.pack(sequence, 1, payload)
+				messageID := f.packOwned(sequence, 1, payload)
 				synctest.Wait()
 				held := sequence.receiveQueue.GetByMessageId(messageID)
 				if held == nil || !held.committed || held.memoryBudget != holdBudget || holdBudget.UsedByteCount() == 0 {
 					t.Fatal("out-of-order fixture has no exact retained selective-ACK lease")
+				}
+				repairBytes := assertReliableIngressRepairCustody(t, sequence, held)
+				if holdBudget.UsedByteCount() != held.queueByteCount+sequence.holdPromise.reservedByteCount+repairBytes {
+					t.Fatal("selective lease has unexplained receive ownership")
 				}
 				witness := MessagePoolShareReadOnly(held.frames[0].MessageBytes)
 				defer MessagePoolReturn(witness)
 				if present, _ := reliableIngressCumulativeHead(sequence); present {
 					t.Fatal("out-of-order item was cumulatively ACKed before its missing head")
 				}
-				controlID := f.pack(sequence, 0, nil)
+				controlID := f.packOwned(sequence, 0, nil)
 				synctest.Wait()
 				if present, head := reliableIngressCumulativeHead(sequence); !present || head.messageId != controlID {
 					t.Errorf("leased item became terminal before final admission: head=%s, want secured head=%s (leased=%s)", head.messageId, controlID, messageID)
 				}
-				if holdBudget.UsedByteCount() == 0 {
-					t.Error("selectively leased packet lost its retained claim under final queue pressure")
+				if held.memoryBudget != holdBudget || holdBudget.UsedByteCount() != held.queueByteCount+repairBytes ||
+					assertReliableIngressRepairCustody(t, sequence, held) != repairBytes {
+					t.Error("selectively leased packet lost its exact roots or repair custody under final queue pressure")
 				}
 				(<-f.tcp.sendItems).release()
 				synctest.Wait()
@@ -535,6 +540,9 @@ func TestProviderReliableTcpSelectiveLeaseSurvivesFinalAdmissionPressure(t *test
 				}
 				if present, head := reliableIngressCumulativeHead(sequence); !present || head.messageId != messageID {
 					t.Error("secured leased item did not advance the cumulative head")
+				}
+				if holdBudget.UsedByteCount() != 0 || sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0 {
+					t.Error("final admission retained receive roots or repair custody")
 				}
 			})
 		})

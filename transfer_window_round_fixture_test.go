@@ -37,6 +37,7 @@ type windowRoundFixture struct {
 	nextNumber     uint64
 	deliveredCount int
 	ackedCount     int
+	frameFactory   func(int) *protocol.Frame
 }
 
 // Configures every policy before workers start. Background key publication is
@@ -203,9 +204,14 @@ func (self *windowRoundFixture) write(payloadByteCount int) *windowRoundFrame {
 // Sends one application message and keeps caller ownership on refusal. The
 // acknowledgement callback is counted only after successful terminal delivery.
 func (self *windowRoundFixture) send(payloadByteCount int) (bool, error) {
-	frame := RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{
-		Content: string(make([]byte, payloadByteCount)),
-	})
+	var frame *protocol.Frame
+	if self.frameFactory != nil {
+		frame = self.frameFactory(payloadByteCount)
+	} else {
+		frame = RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{
+			Content: string(make([]byte, payloadByteCount)),
+		})
+	}
 	admitted, err := self.sender.SendWithTimeoutDetailed(frame, self.receiver.ClientId(), func(err error) {
 		if err == nil {
 			self.ackedCount += 1

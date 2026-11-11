@@ -33,6 +33,25 @@ func (self *checkedTestPeerPinStore) CommitPeerClientKeyPin(peer Id, pin ClientK
 	return nil
 }
 
+// Preserves the checked fixture's injected read failure on the atomic path.
+func (self *checkedTestPeerPinStore) ReadPeerClientKeyPinSnapshot(peerId Id) (ClientKeyPinSnapshot, error) {
+	if self.readErr != nil {
+		return ClientKeyPinSnapshot{}, self.readErr
+	}
+	return self.testPeerClientKeyPinStore.ReadPeerClientKeyPinSnapshot(peerId)
+}
+
+// Preserves injected persistence failures without publishing either ratchet.
+func (self *checkedTestPeerPinStore) CompareAndSwapPeerClientKeyPin(peerId Id, previous ClientKeyPinSnapshot, next *ClientKeyPin) (bool, error) {
+	if next != nil {
+		self.commits++
+		if self.commitErr != nil {
+			return false, self.commitErr
+		}
+	}
+	return self.testPeerClientKeyPinStore.CompareAndSwapPeerClientKeyPin(peerId, previous, next)
+}
+
 func TestSignedIdentityCheckedStoreFailureIsLocalAndTerminal(t *testing.T) {
 	for _, phase := range []string{"read", "capacity", "io"} {
 		t.Run(phase, func(t *testing.T) {

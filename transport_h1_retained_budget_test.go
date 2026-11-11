@@ -569,9 +569,10 @@ func TestPlatformH1RetainedPhysicalWriterAndControl(t *testing.T) {
 	})
 }
 
-// A physical owner must join with the Client still alive while the exact
-// received Pack waits for bytes. The rejected unacknowledged Pack can then
-// arrive on a new physical generation without a hole or duplicate delivery.
+// The shared Client pump refuses a full Pack leaf immediately, returns the
+// physical receipt and emits no ACK. Retiring that physical owner still leaves
+// the logical Client alive, and a replacement delivers the same original once.
+// The separate direct negative-wait cancellation root remains unchanged.
 func TestH1ReceiveCarrierCloseJoinsLiveClientAndReplacement(t *testing.T) {
 	resetH1UpgradeTestState(t)
 	MessagePoolReturn(MessagePoolGet(1))
@@ -635,21 +636,32 @@ func TestH1ReceiveCarrierCloseJoinsLiveClientAndReplacement(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer MessagePoolReturn(wire)
+		started := time.Now()
 		if err := fixture.peer.WriteMessage(websocket.BinaryMessage, wire); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if client.ReceiveStats().PackHandoffWaitCount != 1 || h1RetainedTestByteCount(&fixture.transport.h1RetainedBudget.receive) == 0 ||
-			packBudget.Stats().UsedByteCount != kib(64) || len(delivered) != 0 || fixture.payloads.Load() != 0 {
-			t.Fatal("actual Client did not hold an unacknowledged root at full Pack admission")
+		stats := client.ReceiveStats()
+		if !time.Now().Equal(started) || stats.PackHandoffWaitCount != 0 || stats.PackHandoffWaitSuccess != 0 ||
+			stats.PackHandoffDropCount != 1 || stats.PackHandoffMaxCount != 0 ||
+			h1RetainedTestByteCount(&fixture.transport.h1RetainedBudget.receive) != 0 ||
+			packBudget.Stats().UsedByteCount != kib(64) || packBudget.Stats().QuotaByteCount != 0 ||
+			receive.ReceiveQueueBudget.Stats().UsedByteCount != 0 || receive.ReceiveQueueBudget.Stats().QuotaByteCount != 0 ||
+			len(delivered) != 0 || fixture.payloads.Load() != 0 {
+			t.Fatal("shared Client did not immediately refuse and refund the unacknowledged full-leaf Pack")
 		}
+		fixture.assertConnected(t)
 		client.receiveBuffer.mutex.Lock()
+		sequenceCount := len(client.receiveBuffer.receiveSequences)
 		for _, sequence := range client.receiveBuffer.receiveSequences {
-			if sequence.receiveBufferSettings.PackQueueBudget != packBudget {
-				t.Error("receive sequence bypassed the held budget")
+			if sequence.receiveBufferSettings.PackQueueBudget != packBudget || sequence.packQueueCount.Load() != 0 || len(sequence.packs) != 0 {
+				t.Error("refused sequence bypassed the held budget or retained an admitted Pack")
 			}
 		}
 		client.receiveBuffer.mutex.Unlock()
+		if sequenceCount != 1 {
+			t.Fatal("refusal did not reach the actual receive sequence")
+		}
 		joined := make(chan error, 1)
 		go func() { joined <- fixture.transport.CloseAndWait(context.Background()) }()
 		synctest.Wait()
@@ -700,8 +712,10 @@ func TestH1ReceiveCarrierCloseJoinsLiveClientAndReplacement(t *testing.T) {
 				acks++
 			}
 		}
-		if acks != 1 || len(delivered) != 0 {
-			t.Fatalf("replacement completion: acks=%d extra payloads=%d", acks, len(delivered))
+		stats = client.ReceiveStats()
+		if acks != 1 || len(delivered) != 0 || stats.PackHandoffDropCount != 1 ||
+			stats.PackHandoffWaitCount != 0 || stats.PackHandoffWaitSuccess != 0 {
+			t.Fatalf("replacement completion: acks=%d extra payloads=%d stats=%+v", acks, len(delivered), stats)
 		}
 		if err := replacement.transport.CloseAndWait(context.Background()); err != nil {
 			t.Fatal(err)

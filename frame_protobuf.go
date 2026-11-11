@@ -637,7 +637,7 @@ const (
 	// Free objects, not in-flight objects. 256 covers the parallel receive
 	// width of the production-shaped provider kernel (166 owners created in
 	// the exact profile) while bounding retained protocol + pipeline state to
-	// 250 KiB (1000 bytes/owner on arm64). The previous 1024 x 536-byte
+	// 256 KiB within the checked one-KiB owner envelope. The previous 1024 x 536-byte
 	// protocol-only cache had a ~536 KiB worst retained bound and still
 	// allocated separate ReceivePack/receiveItem envelopes.
 	decodedPackOwnerPoolCapacity = 256
@@ -748,7 +748,13 @@ func (owner *decodedPackOwner) release() {
 	if owner == nil || !owner.inUse {
 		return
 	}
+	if pack := owner.receivePack.Pack; pack != nil && pack != &owner.pack {
+		// Legacy protobuf merge/unknown-field semantics use one funded external
+		// Pack; the existing owner still owns its complete terminal return.
+		returnDecodedPackMessageBytes(pack)
+	}
 	returnDecodedPackMessageBytes(&owner.pack)
+	owner.releaseReceiveMemory()
 	owner.pack = protocol.Pack{}
 	for i := range owner.frames {
 		owner.frames[i] = protocol.Frame{}
@@ -1221,12 +1227,19 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 	return pack, true
 }
 
-func decodePackOwned(b []byte) (owner *decodedPackOwner, success bool) {
-	owner = inboundDecodedPackOwners.take()
+func decodePackOwned(b []byte, prepaid ...*decodedPackOwner) (owner *decodedPackOwner, success bool) {
+	borrowed := len(prepaid) != 0 && prepaid[0] != nil
+	if borrowed {
+		owner = prepaid[0]
+	} else {
+		owner = inboundDecodedPackOwners.take()
+	}
 	pack := &owner.pack
 	defer func() {
 		if !success {
-			owner.release()
+			if !borrowed {
+				owner.release()
+			}
 			owner = nil
 		}
 	}()

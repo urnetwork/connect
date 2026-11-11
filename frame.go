@@ -91,6 +91,8 @@ func ToFrame(message proto.Message, protocolVersion int) (*protocol.Frame, error
 		messageType = protocol.MessageType_TransferResidentMoveResult
 	case *protocol.CloseSequences:
 		messageType = protocol.MessageType_TransferCloseSequences
+	case *protocol.ObservedAddresses:
+		messageType = protocol.MessageType_TransferObservedAddresses
 	case *protocol.SubprotocolMessage:
 		// the generic path; the send functions in subprotocol.go hand-roll
 		// this encoding so the codec writes the payload in place
@@ -269,6 +271,8 @@ func FromFrame(frame *protocol.Frame) (proto.Message, error) {
 		message = &protocol.ResidentMoveResult{}
 	case protocol.MessageType_TransferCloseSequences:
 		message = &protocol.CloseSequences{}
+	case protocol.MessageType_TransferObservedAddresses:
+		message = &protocol.ObservedAddresses{}
 	case protocol.MessageType_Subprotocol:
 		// the generic path copies the payload; the client's dispatch decodes
 		// the header in place instead (subprotocol.go)

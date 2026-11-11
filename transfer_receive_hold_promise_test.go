@@ -6,11 +6,14 @@
 package connect
 
 import (
+	"bytes"
 	"math"
 	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 const receiveHoldPromisePayloadByteCount = 2000
@@ -23,7 +26,8 @@ func newReceiveHoldPromiseFixture(t *testing.T, budget *TransferMemoryBudget) *w
 }
 
 // The same, with eviction notices on, as shipped, or off, the measurement arm.
-func newReceiveHoldPromiseFixtureWithEvictionNotice(t *testing.T, budget *TransferMemoryBudget, evictionNotice bool) *windowRoundFixture {
+func newReceiveHoldPromiseFixtureWithEvictionNotice(t *testing.T, budget *TransferMemoryBudget, evictionNotice bool, headRecovery ...*TransferMemoryBudget) *windowRoundFixture {
+	t.Cleanup(func() { assertRetainedBudgetBalance(t, budget) })
 	return newWindowRoundFixture(t, func(settings *SendBufferSettings) {
 		settings.ResendQueueMaxByteCount = mib(4)
 	}, func(settings *ReceiveBufferSettings) {
@@ -32,6 +36,9 @@ func newReceiveHoldPromiseFixtureWithEvictionNotice(t *testing.T, budget *Transf
 		settings.ReceiveQueueRetainedByteAccounting = true
 		settings.ReceiveHoldPolicy = ReceiveHoldCommittedPrefix
 		settings.EvictionNotice = evictionNotice
+		if len(headRecovery) != 0 {
+			settings.ReceiveHeadRecoveryBudget = headRecovery[0]
+		}
 	})
 }
 
@@ -47,6 +54,13 @@ func receiveHoldPromiseSequence(fixture *windowRoundFixture) *ReceiveSequence {
 		}
 	}
 	return nil
+}
+
+// Exact accounting can refuse the physical owner before the decoded Pack
+// reaches the receive queue. Both boundaries leave its sender owning retry.
+func receiveHoldPromiseRefusedCount(fixture *windowRoundFixture) uint64 {
+	stats := fixture.receiver.ReceiveStats()
+	return stats.PackHandoffDropCount + stats.ReceiveQueueDropCount
 }
 
 // Delivers `deliveredCount` Packs, withholds the next `gapCount` the way a
@@ -81,14 +95,14 @@ func fillReceiveHoldPromise(
 	}
 	budget.SetTotalByteCount(ByteCount(budgetPackCount) * charge)
 
-	dropBase := fixture.receiver.ReceiveStats().ReceiveQueueDropCount
+	dropBase := receiveHoldPromiseRefusedCount(fixture)
 	for range 4 * budgetPackCount {
-		if fixture.receiver.ReceiveStats().ReceiveQueueDropCount != dropBase {
+		if receiveHoldPromiseRefusedCount(fixture) != dropBase {
 			break
 		}
 		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
 	}
-	if fixture.receiver.ReceiveStats().ReceiveQueueDropCount == dropBase {
+	if receiveHoldPromiseRefusedCount(fixture) == dropBase {
 		t.Fatal("the shared budget never refused a later Pack, so the hold was never budget bound")
 	}
 	newest := receiveSequence.receiveQueue.PeekLast()
@@ -127,14 +141,14 @@ func fillReceiveHoldPromiseBehindALargePredecessor(
 	fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
 	first := receiveSequence.receiveQueue.PeekLast()
 	budget.SetTotalByteCount(12 * first.QueueByteCount())
-	dropBase := fixture.receiver.ReceiveStats().ReceiveQueueDropCount
+	dropBase := receiveHoldPromiseRefusedCount(fixture)
 	for range 48 {
-		if fixture.receiver.ReceiveStats().ReceiveQueueDropCount != dropBase {
+		if receiveHoldPromiseRefusedCount(fixture) != dropBase {
 			break
 		}
 		fixture.forward(fixture.write(receiveHoldPromisePayloadByteCount), fixture.receiverIn)
 	}
-	if fixture.receiver.ReceiveStats().ReceiveQueueDropCount == dropBase {
+	if receiveHoldPromiseRefusedCount(fixture) == dropBase {
 		t.Fatal("the shared budget never refused a later Pack")
 	}
 	committed = map[uint64]bool{}
@@ -146,7 +160,54 @@ func fillReceiveHoldPromiseBehindALargePredecessor(
 	if len(committed) == 0 {
 		t.Fatal("the hold acknowledged nothing, so the gap carries no promise")
 	}
+	path, err := FilteredTransferPath(large.bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan, status := scanReceiveMemoryPack(large.bytes, path)
+	if status != receiveMemoryPackScanReady || scan.retainedByteCount > budget.TotalByteCount() ||
+		scan.retainedByteCount <= receiveSequence.holdPromise.reservedByteCount {
+		t.Fatalf("large predecessor is not a genuine within-cap promise shortfall: cost=%d cap=%d prefix=%d status=%d",
+			scan.retainedByteCount, budget.TotalByteCount(), receiveSequence.holdPromise.reservedByteCount, status)
+	}
 	return receiveSequence, next, large, committed
+}
+
+// Settles real selective acknowledgements before inspecting custody. The
+// source keeps its exact retry originals leased while these owners remain held.
+func receiveHoldPromiseCommittedOwners(t *testing.T, fixture *windowRoundFixture, sequence *ReceiveSequence, committed map[uint64]bool) map[uint64]*receiveItem {
+	t.Helper()
+	fixture.acknowledge()
+	owners := make(map[uint64]*receiveItem, len(committed))
+	for number := range committed {
+		item := sequence.receiveQueue.GetBySequenceNumber(number)
+		if item == nil || !item.committed {
+			t.Fatal("committed owner vanished before the pressure control")
+		}
+		owners[number] = item
+	}
+	assertReceiveHoldPromiseCommittedOwners(t, fixture, sequence, owners)
+	return owners
+}
+
+// A predecode refusal must preserve both exact physical owners and the source's
+// selective leases. No acceptance or withdrawal may appear on the wire.
+func assertReceiveHoldPromiseCommittedOwners(t *testing.T, fixture *windowRoundFixture, sequence *ReceiveSequence, owners map[uint64]*receiveItem) {
+	t.Helper()
+	for number, owner := range owners {
+		if sequence.receiveQueue.GetBySequenceNumber(number) != owner || !owner.committed {
+			t.Fatalf("predecode pressure changed committed owner %d", number)
+		}
+	}
+	leased := 0
+	for _, item := range fixture.sequence().sendItems {
+		if item != nil && owners[item.sequenceNumber] != nil && item.selectiveAcked {
+			leased++
+		}
+	}
+	if leased != len(owners) || len(fixture.receiverOut) != 0 {
+		t.Fatalf("pressure changed selective custody: leased=%d owners=%d wire=%d", leased, len(owners), len(fixture.receiverOut))
+	}
 }
 
 // Root cause. A hold whose shared budget is spent had acknowledged Packs whose
@@ -277,81 +338,65 @@ func TestReceiveGapTimeoutWithdrawsTheAcknowledgementsItDiscards(t *testing.T) {
 	})
 }
 
-// The reservation is sized from the largest Pack the hold has taken. A lost
-// Pack can be larger than all of them, and then admitting it needs more than
-// was reserved. Refusing it would bring back the stall, so the hold withdraws
-// its newest acknowledgements, with notice, until the predecessor fits.
-func TestReceiveHoldWithdrawsAnAcknowledgementForAPredecessorLargerThanItsReservation(t *testing.T) {
+// The old queue-only path withdrew committed acknowledgements to fund this
+// larger predecessor. Physical predecode cannot discard SACK custody: it
+// refuses the complete retriable offer while every original and lease stays.
+func TestReceiveHoldKeepsAcknowledgementsForAnOversizedPromisedPredecessor(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	const deliveredCount = 4
 	synctest.Test(t, func(t *testing.T) {
 		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
 		fixture := newReceiveHoldPromiseFixture(t, budget)
 		receiveSequence, next, large, committed := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, deliveredCount)
-		heldCount, _ := receiveSequence.receiveQueue.QueueSize()
-		// Settle the acknowledgements published so far; what follows on the
-		// wire is the receiver's answer to the large predecessor.
-		synctest.Wait()
-		for len(fixture.receiverOut) != 0 {
-			fixture.forward(fixture.take(fixture.receiverOut), fixture.senderIn)
-		}
-
+		owners := receiveHoldPromiseCommittedOwners(t, fixture, receiveSequence, committed)
+		prefix := receiveSequence.holdPromise.reservedByteCount
+		reserved, released := budget.Counts()
 		before := fixture.receiver.ReceiveStats()
 		fixture.forward(large, fixture.receiverIn)
 		after := fixture.receiver.ReceiveStats()
-		if after.ReceiveQueueDropCount != before.ReceiveQueueDropCount {
-			t.Fatal("the hold refused a predecessor of Packs it had acknowledged")
+		afterReserved, afterReleased := budget.Counts()
+		if after.PackHandoffDropCount != before.PackHandoffDropCount+1 ||
+			after.PackHandoffDropByteCount-before.PackHandoffDropByteCount != uint64(MessageByteCount(large.pack.Frames)) ||
+			after.ReceiveQueueDropCount != before.ReceiveQueueDropCount ||
+			after.ReceiveQueueEvictionCount != before.ReceiveQueueEvictionCount ||
+			after.ReceiveQueueTentativeEvictionCount != before.ReceiveQueueTentativeEvictionCount ||
+			after.ReceiveQueueCommitShortfallCount != before.ReceiveQueueCommitShortfallCount ||
+			prefix != receiveSequence.holdPromise.reservedByteCount || reserved != afterReserved || released != afterReleased ||
+			fixture.deliveredCount != deliveredCount || receiveSequence.ctx.Err() != nil {
+			t.Fatal("larger predecode refusal spent the promise, withdrew custody, or changed prefix/lifetime")
 		}
-		withdrawnCount := int(after.ReceiveQueueEvictionCount - before.ReceiveQueueEvictionCount)
-		if withdrawnCount == 0 {
-			t.Fatal("the larger predecessor was admitted without withdrawing anything; this row no longer exceeds the reservation")
-		}
-
-		// The withdrawal is announced, never silent.
-		withdrawn := map[uint64]bool{}
-		synctest.Wait()
-		for len(fixture.receiverOut) != 0 {
-			frame := fixture.take(fixture.receiverOut)
-			if frame.ack != nil {
-				for _, number := range frame.ack.EvictedSequenceNumbers {
-					withdrawn[number] = true
-				}
-			}
-			fixture.forward(frame, fixture.senderIn)
-		}
-		if len(withdrawn) != withdrawnCount {
-			t.Errorf("%d acknowledgements were withdrawn and %d announced", withdrawnCount, len(withdrawn))
-		}
-		for number := range withdrawn {
-			if !committed[number] {
-				t.Errorf("Pack %d was announced as withdrawn but had not been acknowledged", number)
-			}
-		}
-
-		// The gap fills: the delivery point arrives and everything still held
-		// below the withdrawn Packs drains with it.
-		fixture.forward(next, fixture.receiverIn)
-		if want := deliveredCount + 2 + heldCount - withdrawnCount; fixture.deliveredCount != want {
-			t.Errorf("delivered %d, want %d once the gap's two Packs had arrived", fixture.deliveredCount, want)
-		}
+		assertReceiveHoldPromiseCommittedOwners(t, fixture, receiveSequence, owners)
+		fixture.drop(next)
 	})
 }
 
-// With eviction notices off a withdrawal could not reach the sender, which
-// would lease the withdrawn Pack until its selective acknowledgement timeout:
-// the sixty second wait on one Pack that a hold must never cause. The hold
-// keeps every acknowledgement and turns the larger predecessor away instead.
-// The gap still closes, because that predecessor becomes the delivery point's
-// next Pack once the gap below it fills, and its resend takes the direct path.
+// Without eviction notices every committed original must survive. The first
+// larger non-current predecessor is refused, then its natural exact-current
+// retry uses the production consumer family's bounded sibling head budget.
+// A generic uncharged direct callback is not a physical recovery path.
 func TestReceiveHoldWithoutEvictionNoticesKeepsEveryAcknowledgementForALargerPredecessor(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	const deliveredCount = 4
 	synctest.Test(t, func(t *testing.T) {
-		budget := NewTransferMemoryBudget(ByteCount(math.MaxInt32))
-		fixture := newReceiveHoldPromiseFixtureWithEvictionNotice(t, budget, false)
+		root := NewTransferMemoryBudget(mib(1))
+		budget := NewTransferMemoryBudgetWithParent(mib(1), root)
+		recovery := NewTransferMemoryBudgetWithParent(kib(64), root)
+		t.Cleanup(func() {
+			assertRetainedBudgetBalance(t, recovery)
+			assertRetainedBudgetBalance(t, root)
+		})
+		fixture := newReceiveHoldPromiseFixtureWithEvictionNotice(t, budget, false, recovery)
+		fixture.frameFactory = func(payloadByteCount int) *protocol.Frame {
+			packet := ipOosTcpPacketSequence(reliableDeliveryTestPath(4), tcpFlagAck, 11, bytes.Repeat([]byte{0x5a}, payloadByteCount))
+			return &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketFromProvider, Raw: true, MessageBytes: packet}
+		}
 		receiveSequence, next, large, committed := fillReceiveHoldPromiseBehindALargePredecessor(t, fixture, budget, deliveredCount)
+		root.SetTotalByteCount(budget.TotalByteCount() + recovery.TotalByteCount())
 		heldCount, _ := receiveSequence.receiveQueue.QueueSize()
-		fixture.acknowledge()
+		owners := receiveHoldPromiseCommittedOwners(t, fixture, receiveSequence, committed)
+		if recovery.UsedByteCount() != 0 || recovery.TotalByteCount() > budget.TotalByteCount() {
+			t.Fatal("consumer recovery child is not an unused bounded sibling of RX")
+		}
 
 		before := fixture.receiver.ReceiveStats()
 		fixture.forward(large, fixture.receiverIn)
@@ -359,33 +404,50 @@ func TestReceiveHoldWithoutEvictionNoticesKeepsEveryAcknowledgementForALargerPre
 		if discarded := after.ReceiveQueueEvictionCount - before.ReceiveQueueEvictionCount; discarded != 0 {
 			t.Errorf("the hold discarded %d acknowledged Packs it could not announce; the sender leases each until its selective acknowledgement timeout", discarded)
 		}
-		for _, held := range receiveSequence.receiveQueue.AscendingItems(nil) {
-			if held.committed {
-				delete(committed, held.sequenceNumber)
-			}
-		}
-		if len(committed) != 0 {
-			gone := []uint64{}
-			for number := range committed {
-				gone = append(gone, number)
-			}
-			slices.Sort(gone)
-			t.Errorf("acknowledged Packs %v left the hold with no notice", gone)
-		}
-		if refused := after.ReceiveQueueDropCount - before.ReceiveQueueDropCount; refused != 1 {
-			t.Errorf("%d arrivals refused, want the one larger predecessor", refused)
-		}
-		if shortfalls := after.ReceiveQueueCommitShortfallCount - before.ReceiveQueueCommitShortfallCount; shortfalls != 1 {
-			t.Errorf("%d shortfalls counted, want the one refusal", shortfalls)
+		assertReceiveHoldPromiseCommittedOwners(t, fixture, receiveSequence, owners)
+		if after.PackHandoffDropCount != before.PackHandoffDropCount+1 ||
+			after.PackHandoffDropByteCount-before.PackHandoffDropByteCount != uint64(MessageByteCount(large.pack.Frames)) ||
+			after.ReceiveQueueDropCount != before.ReceiveQueueDropCount ||
+			after.ReceiveQueueCommitShortfallCount != before.ReceiveQueueCommitShortfallCount || recovery.UsedByteCount() != 0 {
+			t.Fatal("non-current predecessor was not one exact predecode refusal with custody preserved")
 		}
 
 		// The delivery point arrives, and the larger predecessor is next.
+		retry := fixture.naturalRetry(large)
 		fixture.forward(next, fixture.receiverIn)
 		fixture.acknowledge()
-		fixture.forward(fixture.recovery(large), fixture.receiverIn)
+		path, err := FilteredTransferPath(retry.bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan, status := scanReceiveMemoryPack(retry.bytes, path)
+		if status != receiveMemoryPackScanReady || retry.pack.Head || receiveSequence.nextSequenceNumber != retry.pack.SequenceNumber ||
+			scan.retainedByteCount > recovery.TotalByteCount() || scan.retainedByteCount > budget.TotalByteCount() {
+			t.Fatal("real retry is not a within-cap logical current consumer head")
+		}
+		observedChild := false
+		receiveSequence.receiveBufferSettings.receiveOwnerStageForTest = func(sequence *ReceiveSequence, owner *decodedPackOwner, stage string) {
+			if sequence == receiveSequence && stage == "pack_released" && owner != nil && owner.receiveItem.sequenceNumber == retry.pack.SequenceNumber {
+				observedChild = owner.receiveItem.memoryBudget == recovery && owner.receiveItem.QueueByteCount() == scan.retainedByteCount &&
+					root.UsedByteCount() <= root.TotalByteCount()
+			}
+		}
+		fixture.forward(retry, fixture.receiverIn)
+		fixture.acknowledge()
 		if want := deliveredCount + 2 + heldCount; fixture.deliveredCount != want {
 			t.Errorf("delivered %d, want %d once the larger predecessor's resend landed", fixture.deliveredCount, want)
 		}
+		if !observedChild || fixture.ackedCount != fixture.deliveredCount {
+			t.Fatal("funded consumer retry did not deliver and cumulatively acknowledge the held prefix")
+		}
+		for _, item := range fixture.sequence().sendItems {
+			if item != nil && (item.sequenceNumber < receiveSequence.nextSequenceNumber || committed[item.sequenceNumber]) {
+				t.Fatal("cumulative delivery retained an original from the committed prefix")
+			}
+		}
+		assertRetainedBudgetBalance(t, budget)
+		assertRetainedBudgetBalance(t, recovery)
+		assertRetainedBudgetBalance(t, root)
 	})
 }
 

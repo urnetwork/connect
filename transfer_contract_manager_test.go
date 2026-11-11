@@ -387,7 +387,8 @@ func TestTakeContract(t *testing.T) {
 // asserting:
 //   - SignStoredContract emits the legacy format when the cutoff is in the future
 //   - SignStoredContract emits the standard format when the cutoff is in the past
-//   - VerifyStoredContract accepts BOTH formats regardless of the cutoff time
+//   - VerifyStoredContract accepts the standard format regardless of the cutoff
+//     time, and the legacy format only while the cutoff is in the future
 //   - Tampered bytes and wrong keys are rejected for both formats
 func TestStoredContractHmacCutover(t *testing.T) {
 	provideSecretKey := []byte("test-provide-secret-key-which-is-long-enough")
@@ -422,8 +423,9 @@ func TestStoredContractHmacCutover(t *testing.T) {
 	pastHmac := SignStoredContract(pastSettings, provideSecretKey, storedContractBytes)
 	AssertEqual(t, standardExpected, pastHmac)
 
-	// VerifyStoredContract accepts both formats regardless of the cutoff time
-	AssertEqual(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, legacyExpected))
+	// the standard format verifies regardless of the cutoff time; the legacy
+	// format only while signers still emit it
+	AssertEqual(t, false, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, legacyExpected))
 	AssertEqual(t, true, VerifyStoredContract(pastSettings, provideSecretKey, storedContractBytes, standardExpected))
 	AssertEqual(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, legacyExpected))
 	AssertEqual(t, true, VerifyStoredContract(futureSettings, provideSecretKey, storedContractBytes, standardExpected))

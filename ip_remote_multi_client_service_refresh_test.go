@@ -5,6 +5,7 @@ package connect
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -510,8 +511,17 @@ func TestFullServiceRefreshRefusesFreshLocalAliasOfFailedRemote(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, generator, window, path, paths, owners := newFullServiceRefreshFixture(t, 53010)
 		original := window.unorderedClients()
-		aliasRemote := original[0]
+		var aliasRemote *multiClientChannel
+		for _, candidate := range original {
+			if h.multiClient.clientFlowCount(candidate) == 0 {
+				aliasRemote = candidate
+			}
+		}
+		if aliasRemote == nil {
+			t.Fatal("alias control has no actual idle victim")
+		}
 		generator.mutex.Lock()
+		generator.holdNextAvailable = true
 		generator.resultOverrideForTest = map[MultiHopId]DestinationStats{
 			aliasRemote.Destination(): {IpFamily: aliasRemote.IpFamily()},
 		}
@@ -522,8 +532,31 @@ func TestFullServiceRefreshRefusesFreshLocalAliasOfFailedRemote(t *testing.T) {
 		if !privateCrossWindowNativeSyn(h, path) {
 			t.Fatal("alias control's original actual source was not admitted")
 		}
+		if !discoveryDemandTestAwaitPublication(t, generator.availableEntered, start.Add(window.settings.WindowExpandTimeout)) {
+			t.Fatal("alias listing did not reach its actual availability barrier")
+		}
+		update := h.update(path)
+		update.stateLock.Lock()
+		known := update.synRetryRemoteTailRefusedWithLock(aliasRemote)
+		update.stateLock.Unlock()
+		if !known {
+			t.Fatal("alias control lacks actual refused remote provenance before evaluation")
+		}
+		finished := make(chan struct{}, 1)
+		window.beforeDiscoveryRetryPublishForTest = func(owner *tcpSynRetry) {
+			if owner != nil {
+				select {
+				case finished <- struct{}{}:
+				default:
+				}
+			}
+		}
+		close(generator.availableRelease)
 		if !discoveryDemandTestAwaitPublication(t, evaluated, start.Add(window.settings.WindowExpandTimeout)) {
 			t.Fatal("actual alias candidate did not finish its normal evaluation")
+		}
+		if !discoveryDemandTestAwaitPublication(t, finished, start.Add(window.settings.WindowExpandTimeout+time.Second)) {
+			t.Fatal("alias rejection did not finish its actual bounded pass")
 		}
 		h.settle()
 		_, _, mints, retired := generator.counts()
@@ -543,4 +576,667 @@ func TestFullServiceRefreshRefusesFreshLocalAliasOfFailedRemote(t *testing.T) {
 		}
 		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
 	})
+}
+
+// These cells hold four actual old contenders and four established bodies.
+// Only the fifth, idle provider supplies a real target-service refusal.
+type earlyIdleRefusalFixture struct {
+	h              *reraceHarness
+	generator      *discoveryDemandTestGenerator
+	window         *multiClientWindow
+	path           *IpPath
+	siblingPaths   []*IpPath
+	siblingOwners  []*multiClientChannel
+	victim         *multiClientChannel
+	ordinaryVictim *multiClientChannel
+	update         *multiClientChannelUpdate
+	owner          *tcpSynRetry
+	stamp          uint64
+	serial         uint64
+	refuseIdle     atomic.Bool
+	nativePacket   func() []byte
+	started        time.Time
+	attemptStarted time.Time
+	reads          int
+	empty          int
+	mints          int
+}
+
+// Provider availability and answers use the real harness; no failure, race,
+// source-age, reservation or generator notification is assigned by the test.
+func newEarlyIdleRefusalFixture(t *testing.T, port int, holdEmpty bool) *earlyIdleRefusalFixture {
+	t.Helper()
+	return newEarlyIdleRefusalFixtureWithBodyCount(t, port, holdEmpty, 4)
+}
+
+// A three-body interleaving reserves a separate idle lifetime victim for an
+// ordinary handover. Source generation and remote-refusal fields stay real.
+func newEarlyIdleRefusalFixtureWithBodyCount(t *testing.T, port int, holdEmpty bool, bodyCount int, configureClients ...func(*ClientSettings)) *earlyIdleRefusalFixture {
+	t.Helper()
+	f := &earlyIdleRefusalFixture{path: unboundFlowTcpPath(port)}
+	f.refuseIdle.Store(true)
+	var idle atomic.Int32
+	idle.Store(-1)
+	specs := make([]reraceExitSpec, 5)
+	for index := range specs {
+		var configure func(*ClientSettings)
+		if len(configureClients) != 0 {
+			configure = configureClients[0]
+		}
+		specs[index] = reraceExitSpec{name: string(rune('a' + index)), clientSettings: configure, answer: func(path *IpPath) reraceAnswer {
+			if path.DestinationIp.Equal(f.path.DestinationIp) && path.DestinationPort == f.path.DestinationPort {
+				if idle.Load() == int32(index) && f.refuseIdle.Load() {
+					return reraceSignal
+				}
+				return reraceSilent
+			}
+			return reraceAccept
+		}}
+	}
+	f.h, f.generator = newDiscoveryDemandTestHarness(t, specs, func(settings *MultiClientSettings) { settings.StrictWindowHandover = true })
+	if bodyCount == 4 {
+		f.window, f.siblingPaths, f.siblingOwners = discoveryDemandTestCarryFour(t, f.h)
+	} else if bodyCount == 3 {
+		f.window = f.h.multiClient.windows[WindowTypeQuality]
+		for index := range bodyCount {
+			path, owner := bindStrictHandoverTestFlow(t, f.h, index)
+			for _, previous := range f.siblingOwners {
+				if previous == owner {
+					t.Fatal("three-body control reused its original owner")
+				}
+			}
+			f.siblingPaths = append(f.siblingPaths, path)
+			f.siblingOwners = append(f.siblingOwners, owner)
+		}
+		payload := []byte("held original CSS sibling")
+		for bucket := range 4 {
+			if bucket != 0 {
+				f.h.sleep(f.window.settings.StatsWindowBucketDuration + time.Nanosecond)
+			}
+			for _, path := range f.siblingPaths {
+				if !f.h.send(reraceSegment(path, uint32(bucket*len(payload)), payload)) {
+					t.Fatal("three-body owner stopped real progress")
+				}
+			}
+		}
+	} else {
+		t.Fatal("unsupported early-refusal body-count control")
+	}
+	for _, client := range f.window.unorderedClients() {
+		busy := false
+		for _, owner := range f.siblingOwners {
+			busy = busy || client == owner
+		}
+		if !busy {
+			if f.victim == nil {
+				f.victim = client
+			} else if bodyCount == 3 && f.ordinaryVictim == nil {
+				f.ordinaryVictim = client
+			} else {
+				t.Fatal("early idle control has extra idle slots")
+			}
+		}
+	}
+	if f.victim == nil || len(f.window.unorderedClients()) != 5 || f.h.multiClient.clientFlowCount(f.victim) != 0 {
+		t.Fatal("early idle control lacks one genuine idle slot at the hard maximum")
+	}
+	for index := range specs {
+		if f.victim.Destination() == f.h.exit(specs[index].name).destination {
+			idle.Store(int32(index))
+		}
+	}
+	if idle.Load() < 0 {
+		t.Fatal("idle slot is not backed by one real provider")
+	}
+	reliability := *f.h.multiClient.ReliabilitySettings()
+	reliability.MaxFlowsPerExit = DefaultMultiClientSettings().MaxFlowsPerExit
+	f.h.multiClient.SetReliabilitySettings(&reliability)
+	f.generator.mutex.Lock()
+	f.generator.holdNextEmpty = holdEmpty
+	f.generator.mutex.Unlock()
+	f.reads, f.empty, f.mints, _ = f.generator.counts()
+	return f
+}
+
+// This is the native source and the standing remote refusal, with all other
+// original contenders still unproven. The source remains the same paid owner.
+func (self *earlyIdleRefusalFixture) start(t *testing.T) {
+	t.Helper()
+	self.started = time.Now()
+	accepted := false
+	if self.nativePacket == nil {
+		accepted = privateCrossWindowNativeSyn(self.h, self.path)
+	} else {
+		accepted = synRetryControlOffer(t, self.h, MessagePoolCopy(self.nativePacket()))
+	}
+	if !accepted {
+		t.Fatal("early idle original native SYN was not admitted")
+	}
+	self.update = self.h.update(self.path)
+	if self.update == nil {
+		t.Fatal("early idle source has no canonical update")
+	}
+	self.owner = discoveryDemandServiceRefreshOwner(t, self.window, self.update)
+	self.update.stateLock.Lock()
+	refusals := len(self.update.dialFailedClients)
+	valid := self.update.client.Load() == nil && !self.update.receivedInbound.Load() && self.update.race != nil &&
+		refusals == 1 && self.update.synRetryRemoteTailRefusedWithLock(self.victim)
+	for _, old := range self.siblingOwners {
+		valid = valid && !self.update.synRetryRemoteTailRefusedWithLock(old)
+	}
+	self.stamp, self.serial = self.update.discoveryAttemptStamp.Load(), self.owner.serial
+	self.attemptStarted = self.update.discoveryAttemptStarted
+	self.update.stateLock.Unlock()
+	if !valid || self.h.metrics().DialFailuresIntercepted != 1 || self.victim.serviceRefreshRaceReferences.Load() != 0 {
+		t.Fatalf("early idle premise lacks one idle actual refusal plus a live unexhausted race: valid=%t failures=%d victim_refs=%d", valid, refusals, self.victim.serviceRefreshRaceReferences.Load())
+	}
+	for _, old := range self.siblingOwners {
+		if self.h.multiClient.clientFlowCount(old) != 1 || old.serviceRefreshRaceReferences.Load() == 0 {
+			t.Fatal("early idle control did not retain its actual busy old contender")
+		}
+	}
+}
+
+// An unchanged native reoffer reasserts existing work; no test timer wake is sent.
+func (self *earlyIdleRefusalFixture) offerAt(t *testing.T, offset time.Duration) {
+	t.Helper()
+	self.h.sleep(self.started.Add(offset).Sub(time.Now()))
+	beforeCollapse := self.h.multiClient.TcpCollapseDropCount()
+	accepted := privateCrossWindowNativeSyn(self.h, self.path)
+	collapseDelta := self.h.multiClient.TcpCollapseDropCount() - beforeCollapse
+	self.update.stateLock.Lock()
+	inbound := self.update.receivedInbound.Load()
+	original := self.update.synRetry == self.owner && self.owner.packet != nil && self.owner.credit != nil &&
+		!self.owner.credit.released.Load() && self.owner.serial == self.serial &&
+		self.update.discoveryAttemptStamp.Load() == self.stamp && self.update.discoveryAttemptStarted.Equal(self.attemptStarted) &&
+		self.update.dialFailedSyn == self.path.SequenceNumber
+	self.update.stateLock.Unlock()
+	if !accepted && collapseDelta != 1 {
+		t.Fatalf("native reoffer did not reach the actual post-observation collapse guard: collapse_delta=%d", collapseDelta)
+	}
+	if !inbound && (accepted || !original || self.h.update(self.path) != self.update) {
+		t.Fatalf("same-SYN collapse lost its original paid source: accepted=%t retained=%t", accepted, original)
+	}
+	t.Logf("early native reoffer: age=%s accepted=%t collapse_delta=%d retained=%t inbound=%t", time.Since(self.started), accepted, collapseDelta, original, inbound)
+}
+
+// Only actual reads/mints/admission qualify. Bodies, strict capacity and the
+// original update remain independently checked after the target observation.
+func (self *earlyIdleRefusalFixture) requireLate(t *testing.T, publication <-chan struct{}, deadline time.Time, marker string) {
+	t.Helper()
+	published := discoveryDemandTestAwaitPublication(t, publication, deadline)
+	self.h.settle()
+	reads, empty, mints, _ := self.generator.counts()
+	installed := len(self.window.unorderedClients())
+	if !published || reads == self.reads {
+		t.Fatalf("%s: published=%t reads=%d empty=%d mints=%d installed=%d age=%s", marker, published, reads-self.reads, empty-self.empty, mints-self.mints, installed, time.Since(self.started))
+	}
+	if reads > self.reads+3 || mints != self.mints+1 || installed != 5 || self.window.strictWindowAdmissionAllowed(NewId(), self.window.settings.WindowSizes[WindowTypeQuality]) {
+		t.Fatal("early idle refresh escaped the existing window/read/mint ceiling")
+	}
+	if self.h.update(self.path) != self.update || self.owner.serial != self.serial {
+		t.Fatal("early refresh replaced the original source update or paid owner generation")
+	}
+	late := self.h.channel("early-late")
+	if late.IsDone() || late.isWarning() {
+		t.Fatal("early listing did not publish an actual healthy provider")
+	}
+	if len(self.h.exit("early-late").syns(self.path)) != 1 {
+		t.Fatalf("EARLY_IDLE_REFUSAL_MISSING_TARGET_SYN: actual=%d", len(self.h.exit("early-late").syns(self.path)))
+	}
+	if reply, answered := self.h.synAck(self.path); !answered || self.h.boundTo(self.path) != late {
+		t.Fatal("EARLY_IDLE_REFUSAL_MISSING_TARGET_SYN_ACK")
+	} else if parsed, err := ParseIpPath(reply.packet); err != nil || parsed.AckSequenceNumber != self.path.SequenceNumber+1 {
+		t.Fatal("early target answer does not acknowledge the original retained SYN")
+	}
+	for _, syn := range self.h.exit("early-late").syns(self.path) {
+		if syn.path.SequenceNumber != self.path.SequenceNumber {
+			t.Fatal("early publication changed the retained original SYN")
+		}
+	}
+	discoveryDemandFullWindowAssertSiblings(t, self.h, self.siblingPaths, self.siblingOwners)
+	reraceAssertNoErrorDelivered(t, self.h, self.path)
+}
+
+// Holds the reaper's publication visit to this source until release. The visit
+// only tries the flow lock and defers a contended visit by
+// SynRetryPublicationRetryDelay, and the pass that publishes the provider then
+// takes that lock in finishServiceRefresh. Settle while the visit waits.
+func (self *earlyIdleRefusalFixture) holdPublicationVisit(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	releaseVisit := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseVisit)
+	self.h.multiClient.beforeSynPublicationQueueForTest = func(current *multiClientChannelUpdate) {
+		if current == self.update {
+			enteredOnce.Do(func() {
+				close(entered)
+				select {
+				case <-release:
+				case <-self.h.multiClient.ctx.Done():
+				}
+			})
+		}
+	}
+	return entered, releaseVisit
+}
+
+// The production OLD guard cannot use the one actual-refused idle tail while
+// four old contenders remain silent. Availability0.733 and reoffer1.109 precede
+// the unchanged3s age gate and complete field exhaustion.
+func TestEarlyIdleServiceRefusalListsBeforeUnfinishedContenders(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53120, false)
+		publication := discoveryDemandTestObservePublication(f.window)
+		f.start(t)
+		f.h.sleep(f.started.Add(733 * time.Millisecond).Sub(time.Now()))
+		// A listing inside the reoffer can publish the provider there: that
+		// retires the refused idle victim, which renews the attempt stamp, while
+		// the paid SYN's visit can still wait behind finishServiceRefresh. The
+		// reoffer then sees an unanswered source it cannot call retained. Hold
+		// the listing until the reoffer completes, and the visit until it settles.
+		f.generator.mutex.Lock()
+		f.generator.holdNextAvailable = true
+		f.generator.mutex.Unlock()
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		f.offerAt(t, 1109*time.Millisecond)
+		if !discoveryDemandTestAwaitPublication(t, f.generator.availableEntered, f.started.Add(2*time.Second)) {
+			t.Fatal("EARLY_IDLE_REFUSAL_DID_NOT_RELIST: the available provider was never listed")
+		}
+		visit, releaseVisit := f.holdPublicationVisit(t)
+		close(f.generator.availableRelease)
+		if !discoveryDemandTestAwaitPublication(t, visit, f.started.Add(2*time.Second)) {
+			t.Fatal("published provider never reached the paid source's publication visit")
+		}
+		f.h.settle()
+		releaseVisit()
+		f.requireLate(t, publication, f.started.Add(2*time.Second), "EARLY_IDLE_REFUSAL_DID_NOT_RELIST")
+	})
+}
+
+// An early empty response owns no identity and must leave the same pass able
+// to read again after ordinary native demand. The existing one-second listing
+// cadence and three-read budget remain; no5--10s expansion retry is bypassed.
+func TestEarlyIdleServiceRefusalReassertsAfterEmptyListing(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53121, true)
+		publication := discoveryDemandTestObservePublication(f.window)
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		select {
+		case <-f.generator.emptyEntered:
+		default:
+			t.Fatal("EARLY_IDLE_REFUSAL_FIRST_EMPTY_NOT_REACHED")
+		}
+		f.h.sleep(f.started.Add(733 * time.Millisecond).Sub(time.Now()))
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		close(f.generator.emptyRelease)
+		f.h.settle()
+		f.offerAt(t, 1109*time.Millisecond)
+		f.requireLate(t, publication, f.started.Add(2500*time.Millisecond), "EARLY_IDLE_REFUSAL_EMPTY_REASSERT_STALLED")
+		_, empty, _, _ := f.generator.counts()
+		if empty != f.empty+1 {
+			t.Fatal("early-empty control did not preserve its one actual empty listing")
+		}
+	})
+}
+
+// Duplicate source offers and distinct rapid navigations share the window's
+// one acquisition authority; an unavailable provider set mints no new identity.
+func TestEarlyIdleServiceRefusalBurstKeepsOneWindowBudget(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53122, false)
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		for index := range 32 {
+			privateCrossWindowNativeSyn(f.h, f.path)
+			if index < 8 {
+				page := *f.path
+				page.SourcePort += 100 + index
+				page.SequenceNumber += uint32(100 + index)
+				privateCrossWindowNativeSyn(f.h, &page)
+			}
+		}
+		f.h.sleep(f.started.Add(2900 * time.Millisecond).Sub(time.Now()))
+		reads, _, mints, _ := f.generator.counts()
+		if reads == f.reads {
+			t.Fatal("EARLY_IDLE_REFUSAL_BURST_NEVER_ACQUIRED")
+		}
+		if reads > f.reads+1+min(f.window.settings.DiscoveryDemandListingsPerPass, 3) || mints != f.mints || len(f.window.unorderedClients()) != 5 {
+			t.Fatalf("early native/page burst exceeded one window's existing budget: reads=%d mints=%d", reads-f.reads, mints-f.mints)
+		}
+		f.window.stateLock.Lock()
+		owner := f.window.serviceRefreshOwner
+		f.window.stateLock.Unlock()
+		if owner != nil && owner != f.owner {
+			t.Fatal("rapid pages replaced the original live refresh owner")
+		}
+		// Continue actual same-source pressure through acquisition expiry.
+		for offset := 4 * time.Second; offset < f.window.settings.WindowExpandTimeout; offset += time.Second {
+			f.offerAt(t, offset)
+		}
+		f.h.sleep(f.started.Add(f.window.settings.WindowExpandTimeout + time.Second).Sub(time.Now()))
+		readsAtExpiry, _, mintsAtExpiry, _ := f.generator.counts()
+		f.window.stateLock.Lock()
+		deferred := time.Now().Before(f.window.discoveryRetry.notBefore)
+		deadline := f.window.discoveryRetry.notBefore
+		failures := f.window.discoveryRetry.failureCount
+		owner = f.window.serviceRefreshOwner
+		f.window.stateLock.Unlock()
+		if readsAtExpiry > f.reads+1+min(f.window.settings.DiscoveryDemandListingsPerPass, 3) || mintsAtExpiry != f.mints || owner != nil || failures != 1 || !deferred {
+			t.Fatalf("early outage exceeded one full acquisition: reads=%d mints=%d owner=%t failures=%d", readsAtExpiry-f.reads, mintsAtExpiry-f.mints, owner != nil, failures)
+		}
+		for range 16 {
+			privateCrossWindowNativeSyn(f.h, f.path)
+		}
+		f.h.sleep(min(time.Second, time.Until(deadline)/2))
+		readsAfter, _, mintsAfter, _ := f.generator.counts()
+		f.window.stateLock.Lock()
+		unchanged := f.window.discoveryRetry.failureCount == failures && f.window.discoveryRetry.notBefore.Equal(deadline)
+		f.window.stateLock.Unlock()
+		if !unchanged || readsAfter != readsAtExpiry || mintsAfter != mintsAtExpiry {
+			t.Fatal("EARLY_IDLE_REFUSAL_OUTAGE_BYPASSED_BACKOFF")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// A real reply to one held original SYN wins while the available late listing
+// is blocked. The fresh speculative identity must never be minted afterward.
+func TestEarlyIdleServiceRefusalOldRaceAnswerCancelsSpeculation(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53123, false)
+		f.start(t)
+		credit := f.owner.credit
+		f.generator.mutex.Lock()
+		f.generator.holdNextAvailable = true
+		f.generator.mutex.Unlock()
+		f.h.sleep(f.started.Add(733 * time.Millisecond).Sub(time.Now()))
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		f.offerAt(t, 1109*time.Millisecond)
+		if !discoveryDemandTestAwaitPublication(t, f.generator.availableEntered, f.started.Add(2500*time.Millisecond)) {
+			t.Fatal("EARLY_IDLE_REFUSAL_OLD_ANSWER_DID_NOT_REACH_LISTING")
+		}
+		f.answerOld(t)
+		close(f.generator.availableRelease)
+		f.h.settle()
+		_, _, mints, _ := f.generator.counts()
+		f.window.stateLock.Lock()
+		owned, failures := f.window.serviceRefreshOwner, f.window.discoveryRetry.failureCount
+		f.window.stateLock.Unlock()
+		if mints != f.mints || len(f.h.exit("early-late").syns(f.path)) != 0 || owned != nil || f.owner.packet != nil || !credit.released.Load() || failures != 0 {
+			t.Fatalf("old answer failed to retire unneeded early speculation: mints=%d owner=%t retained=%t failures=%d", mints-f.mints, owned != nil, f.owner.packet != nil, failures)
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// Actual native source cancellation withdraws the borrowed window reference
+// before a later provider may be consumed. The failed body/update is not reused.
+func TestEarlyIdleServiceRefusalCanceledSourceCannotSpendLateListing(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53124, true)
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		select {
+		case <-f.generator.emptyEntered:
+		default:
+			t.Fatal("EARLY_IDLE_REFUSAL_CANCEL_NEVER_ACQUIRED")
+		}
+		credit := f.owner.credit
+		f.update.Close()
+		f.h.settle()
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		close(f.generator.emptyRelease)
+		f.h.settle()
+		_, _, mints, _ := f.generator.counts()
+		if mints != f.mints || len(f.h.exit("early-late").syns(f.path)) != 0 || f.owner.packet != nil || !credit.released.Load() {
+			t.Fatal("canceled early refresh spent a later listing or retained its paid owner")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// The same tuple's real new SYN changes its stamp and remote-refusal ledger.
+// Completing the old empty response cannot lend the new source early authority.
+func TestEarlyIdleServiceRefusalNewSynCannotBorrowOldReservation(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53125, true)
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		select {
+		case <-f.generator.emptyEntered:
+		default:
+			t.Fatal("EARLY_IDLE_REFUSAL_NEW_SYN_NEVER_ACQUIRED")
+		}
+		f.refuseIdle.Store(false)
+		changed := *f.path
+		changed.SequenceNumber++
+		if !privateCrossWindowNativeSyn(f.h, &changed) {
+			t.Fatal("changed native SYN was not admitted")
+		}
+		current := f.h.update(&changed)
+		current.stateLock.Lock()
+		fresh := current.discoveryAttemptStamp.Load() != f.stamp && current.synRetry != f.owner &&
+			!current.synRetryHasRemoteRefusalWithLock()
+		current.stateLock.Unlock()
+		if !fresh {
+			t.Fatal("new native generation inherited old early-refusal history")
+		}
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		close(f.generator.emptyRelease)
+		f.h.settle()
+		_, _, mints, _ := f.generator.counts()
+		if mints != f.mints || len(f.h.exit("early-late").syns(&changed)) != 0 {
+			t.Fatal("old listing crossed a changed native source generation")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// Answers the real already-recorded original SYN from an old provider through
+// its actual transfer channel; no race winner or ownership flag is assigned.
+func (self *earlyIdleRefusalFixture) answerOld(t *testing.T) {
+	t.Helper()
+	old := self.siblingOwners[0]
+	var provider *reraceExit
+	for _, exit := range self.h.generator.exitList() {
+		if exit.destination == old.Destination() {
+			provider = exit
+		}
+	}
+	if provider == nil {
+		t.Fatal("held old contender has no actual provider")
+	}
+	syns := provider.syns(self.path)
+	if len(syns) == 0 {
+		t.Fatal("old race answer has no real original SYN")
+	}
+	provider.sendTo(syns[0].source, reraceSynAck(syns[0].path))
+	self.h.settle()
+	if _, answered := self.h.synAck(self.path); !answered || self.h.boundTo(self.path) != old {
+		t.Fatal("actual old race answer did not establish the unchanged original navigation")
+	}
+}
+
+// The evaluated alternative is a real minted client whose actual ping result
+// is held. An old contender's useful answer must cancel it before admission.
+func TestEarlyIdleServiceRefusalOldAnswerCancelsPendingCandidate(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53126, false)
+		f.start(t)
+		credit := f.owner.credit
+		entered, release := make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		finish := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(finish)
+		f.window.beforeExpandPingResultForTest = func() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		}
+		_, _, _, beforeRetired := f.generator.counts()
+		f.h.sleep(f.started.Add(733 * time.Millisecond).Sub(time.Now()))
+		f.h.addExit(reraceExitSpec{name: "early-late"})
+		f.offerAt(t, 1109*time.Millisecond)
+		if !discoveryDemandTestAwaitPublication(t, entered, f.started.Add(2500*time.Millisecond)) {
+			t.Fatal("EARLY_IDLE_REFUSAL_OLD_ANSWER_NEVER_REACHED_ACTUAL_PING")
+		}
+		_, _, mints, _ := f.generator.counts()
+		if mints != f.mints+1 || len(f.window.unorderedClients()) != 5 {
+			t.Fatal("pending-ping control lacks one actual bounded speculative identity")
+		}
+		f.answerOld(t)
+		finish()
+		f.h.settle()
+		_, _, afterMints, retired := f.generator.counts()
+		f.window.stateLock.Lock()
+		owned, failures := f.window.serviceRefreshOwner, f.window.discoveryRetry.failureCount
+		f.window.stateLock.Unlock()
+		if afterMints != mints || retired != beforeRetired+1 || len(f.window.unorderedClients()) != 5 || owned != nil || failures != 0 || !credit.released.Load() {
+			t.Fatalf("late old answer did not cancel/join the pending candidate: mints=%d retired=%d owner=%t failures=%d", afterMints-f.mints, retired-beforeRetired, owned != nil, failures)
+		}
+		for _, client := range f.window.unorderedClients() {
+			if client.Destination() == f.h.exit("early-late").destination {
+				t.Fatal("canceled speculative candidate displaced an original owner")
+			}
+		}
+		// The useful reply is one proof, not permission for every later body
+		// packet to erase a future window's genuine failed-expansion backoff.
+		f.window.noteDiscoveryExpandUnproductive(time.Now())
+		f.window.stateLock.Lock()
+		deadline, count := f.window.discoveryRetry.notBefore, f.window.discoveryRetry.failureCount
+		f.window.stateLock.Unlock()
+		if count != 1 || !time.Now().Before(deadline) || !f.h.send(reraceSegment(f.path, 0, []byte("old winner body"))) {
+			t.Fatal("answer replay control lacks new deferral and real body progress")
+		}
+		f.window.stateLock.Lock()
+		unchanged := f.window.discoveryRetry.failureCount == count && f.window.discoveryRetry.notBefore.Equal(deadline)
+		f.window.stateLock.Unlock()
+		if !unchanged {
+			t.Fatal("EARLY_IDLE_REFUSAL_ANSWER_REPLAY_RESET_BACKOFF")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// An ordinary handover has already minted its own real candidate and holds
+// the initial-ping result. A distinct pending early owner then gets its real
+// old-race answer; that answer must not forgive the ordinary ping's failure.
+func TestEarlyIdleServiceRefusalPendingAnswerCannotEraseOrdinaryPassBackoff(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixtureWithBodyCount(t, 53127, false, 3)
+		if f.ordinaryVictim == nil || f.ordinaryVictim == f.victim || f.h.multiClient.clientFlowCount(f.ordinaryVictim) != 0 {
+			t.Fatal("ordinary/early interleaving lacks two distinct real idle owners")
+		}
+		entered, release := make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		finish := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(finish)
+		f.window.beforeExpandPingResultForTest = func() { enteredOnce.Do(func() { close(entered) }); <-release }
+		expirePing := make(chan struct{}, 1)
+		f.window.expireExpandPingForTest = expirePing
+		f.h.addExit(reraceExitSpec{name: "ordinary-spare"})
+		ageWindowClientForTest(f.ordinaryVictim, time.Minute, 2*time.Minute)
+		if !discoveryDemandTestAwaitPublication(t, entered, time.Now().Add(f.window.settings.WindowResizeTimeout+time.Second)) {
+			t.Fatal("ordinary handover never reached its actual held ping")
+		}
+		f.h.settle()
+		f.window.stateLock.Lock()
+		ordinaryPass := f.window.strictPass
+		ordinary := ordinaryPass != nil && ordinaryPass.handover != nil && ordinaryPass.handover.victim == f.ordinaryVictim && ordinaryPass.handover.serviceRefresh == nil
+		noRefresh := f.window.serviceRefreshOwner == nil
+		f.window.stateLock.Unlock()
+		_, _, beforeMints, beforeRetired := f.generator.counts()
+		if !ordinary || !noRefresh || beforeMints != f.mints+1 {
+			t.Fatal("ordinary interleaving lacks one real owned non-refresh candidate")
+		}
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		f.window.stateLock.Lock()
+		pending := f.window.serviceRefreshOwner == f.owner && !f.window.serviceRefreshAttempted && f.window.strictPass == ordinaryPass
+		f.window.stateLock.Unlock()
+		if !pending {
+			t.Fatal("ordinary pass did not retain its distinct pending early owner")
+		}
+		f.answerOld(t)
+		expirePing <- struct{}{}
+		f.h.settle()
+		finish()
+		f.h.settle()
+		f.window.stateLock.Lock()
+		failures, deadline := f.window.discoveryRetry.failureCount, f.window.discoveryRetry.notBefore
+		owned := f.window.serviceRefreshOwner
+		f.window.stateLock.Unlock()
+		_, _, afterMints, retired := f.generator.counts()
+		if failures != 1 || !time.Now().Before(deadline) || owned != nil || afterMints != beforeMints || retired != beforeRetired+1 {
+			t.Fatalf("EARLY_IDLE_REFUSAL_ORDINARY_BACKOFF_WAS_CLEARED: failures=%d deferred=%t pending=%t mints=%d retired=%d", failures, time.Now().Before(deadline), owned != nil, afterMints-beforeMints, retired-beforeRetired)
+		}
+		if !strictHandoverTestInstalled(f.window, f.ordinaryVictim) || f.ordinaryVictim.IsDone() || len(f.window.unorderedClients()) != 5 {
+			t.Fatal("failed ordinary candidate displaced a retained original owner")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+// The old target reply arrives after this source's attempted acquisition has
+// ended. It may clear that exact failure, but never a newer ordinary failure.
+func testEarlyIdleServiceRefusalLateBackoffAnswer(t *testing.T, ordinaryFailure bool) {
+	t.Helper()
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newEarlyIdleRefusalFixture(t, 53128, false)
+		f.start(t)
+		f.offerAt(t, 500*time.Millisecond)
+		f.h.sleep(f.started.Add(f.window.settings.WindowExpandTimeout + time.Second).Sub(time.Now()))
+		f.window.stateLock.Lock()
+		failed := f.window.discoveryRetry.failureCount == 1 && time.Now().Before(f.window.discoveryRetry.notBefore) && f.window.serviceRefreshOwner == nil
+		f.window.stateLock.Unlock()
+		if !failed {
+			t.Fatal("late-answer control lacks its actual completed failed refresh pass")
+		}
+		if ordinaryFailure {
+			f.window.noteDiscoveryExpandUnproductive(time.Now())
+		}
+		f.window.stateLock.Lock()
+		deadline, count := f.window.discoveryRetry.notBefore, f.window.discoveryRetry.failureCount
+		f.window.stateLock.Unlock()
+		f.answerOld(t)
+		f.window.stateLock.Lock()
+		remaining, afterDeadline := f.window.discoveryRetry.failureCount, f.window.discoveryRetry.notBefore
+		f.window.stateLock.Unlock()
+		if ordinaryFailure {
+			if count != 2 || remaining != count || !afterDeadline.Equal(deadline) {
+				t.Fatal("EARLY_IDLE_REFUSAL_LATE_ANSWER_CLEARED_ORDINARY_BACKOFF")
+			}
+		} else if remaining != 0 || !afterDeadline.IsZero() {
+			t.Fatal("EARLY_IDLE_REFUSAL_LATE_ANSWER_LEFT_OWN_BACKOFF")
+		}
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
+	})
+}
+
+func TestEarlyIdleServiceRefusalLateAnswerClearsOnlyOwnBackoff(t *testing.T) {
+	testEarlyIdleServiceRefusalLateBackoffAnswer(t, false)
+}
+
+func TestEarlyIdleServiceRefusalLateAnswerKeepsFutureOrdinaryBackoff(t *testing.T) {
+	testEarlyIdleServiceRefusalLateBackoffAnswer(t, true)
 }

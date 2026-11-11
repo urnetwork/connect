@@ -42,13 +42,46 @@ type synPublicationTestFixture struct {
 // source's completed selection without minting, selecting or sending for it.
 func newSynPublicationTestFixture(t *testing.T, version int, partial bool, configure func(*ClientSettings), addLateExit ...func(*synPublicationTestFixture) *reraceExit) *synPublicationTestFixture {
 	t.Helper()
+	return newSynPublicationPacketFixture(t, version, partial, configure, nil, addLateExit...)
+}
+
+// Optional test-owned wire construction preserves the original ordering and
+// all admission predicates while modeling real native metadata refreshes.
+type synPublicationPacketOptions struct {
+	silentRepeat      *atomic.Bool
+	silentRepeatIndex int
+	packet            func(*IpPath, int) []byte
+	beforeRetry       func(*synPublicationTestFixture)
+	afterRetry        func(*synPublicationTestFixture)
+	// Holds the four original providers' frames to their sources while set.
+	providerHold *reraceProviderHold
+}
+
+// Nil options retain the original public native packet and every old oracle.
+func newSynPublicationPacketFixture(t *testing.T, version int, partial bool, configure func(*ClientSettings), options *synPublicationPacketOptions, addLateExit ...func(*synPublicationTestFixture) *reraceExit) *synPublicationTestFixture {
+	t.Helper()
 	f := &synPublicationTestFixture{path: reraceFlow(version, 88, 52920+version)}
+	offerCount := 0
+	offer := func() bool {
+		offerCount++
+		if options == nil || options.packet == nil {
+			return privateCrossWindowNativeSyn(f.h, f.path)
+		}
+		return synRetryControlOffer(t, f.h, MessagePoolCopy(options.packet(f.path, offerCount)))
+	}
+	var providerHold *reraceProviderHold
+	if options != nil {
+		providerHold = options.providerHold
+	}
 	specs := make([]reraceExitSpec, 4)
 	for index := range specs {
 		position := index
-		specs[index] = reraceExitSpec{name: string(rune('a' + index)), clientSettings: configure,
+		specs[index] = reraceExitSpec{name: string(rune('a' + index)), clientSettings: configure, providerHold: providerHold,
 			answer: func(candidate *IpPath) reraceAnswer {
 				if reraceSameFlow(candidate, f.path) {
+					if options != nil && options.silentRepeat != nil && options.silentRepeat.Load() && position == options.silentRepeatIndex {
+						return reraceSilent
+					}
 					if partial && position != 0 {
 						return reraceSilent
 					}
@@ -73,7 +106,7 @@ func newSynPublicationTestFixture(t *testing.T, version int, partial bool, confi
 	f.beforeReads, f.beforeEmpty, f.beforeMints, f.beforeRetired = f.generator.counts()
 	f.expectedReads, f.expectedEmpty = f.beforeReads+2, f.beforeEmpty+1
 	start := time.Now()
-	if !privateCrossWindowNativeSyn(f.h, f.path) {
+	if !offer() {
 		t.Fatal("publication fixture's original native SYN was refused")
 	}
 	f.update = f.h.update(f.path)
@@ -193,7 +226,7 @@ func newSynPublicationTestFixture(t *testing.T, version int, partial bool, confi
 		f.update.stateLock.Unlock()
 		before := observedAt.Add(-time.Nanosecond)
 		f.h.sleep(before.Sub(time.Now()))
-		privateCrossWindowNativeSyn(f.h, f.path)
+		offer()
 		reads, empty, _, _ := f.generator.counts()
 		if !time.Now().Equal(before) || reads != f.beforeReads || empty != f.beforeEmpty {
 			t.Fatal("SYN_PUBLICATION_PARTIAL_DEMAND_EARLY: just-before-boundary source offer triggered a discovery read")
@@ -210,7 +243,13 @@ func newSynPublicationTestFixture(t *testing.T, version int, partial bool, confi
 	} else {
 		f.h.sleep(start.Add(reraceSynSchedule[1]).Sub(time.Now()))
 	}
-	admitted := privateCrossWindowNativeSyn(f.h, f.path)
+	if options != nil && options.beforeRetry != nil {
+		options.beforeRetry(f)
+	}
+	admitted := offer()
+	if options != nil && options.afterRetry != nil {
+		options.afterRetry(f)
+	}
 	if !partial && !admitted {
 		t.Fatal("publication fixture's reasserting source offer was refused")
 	}

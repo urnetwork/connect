@@ -98,6 +98,11 @@ func newFlightGateVnetPair(
 	}
 	settingsA.DataPlaneStats = pair.activeStats
 	settingsB.DataPlaneStats = pair.passiveStats
+	// the factories below are built on these virtual networks: declare them,
+	// so the peers' private vnet candidates are applied as the caller's
+	// topology (transport_p2p_webrtc_candidate.go)
+	settingsA.Network = netA
+	settingsB.Network = netB
 	if configure != nil {
 		configure(settingsA, settingsB)
 	}

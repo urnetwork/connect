@@ -285,6 +285,7 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		{path: "ip.go", callback: "userNatClient.ClientReceive"},
 		{path: "ip.go", callback: "userNatProvider.ClientReceive"},
 		{path: "ip_remote_multi_client.go", callback: "clientChannel.clientReceive"},
+		{path: "transfer.go", callback: "client.receiveObservedAddresses"},
 		{path: "transfer.go", callback: "client.sequenceCloser.Receive"},
 		{path: "transfer.go", callback: "peerManager.Receive"},
 		{path: "transfer.go", callback: "streamManager.Receive"},
@@ -309,6 +310,10 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 		// records bounded ids under a leaf lock and wakes its worker without waiting
 		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "Receive"},
 		{path: "transfer_close_sequences.go", receiver: "sequenceCloser", method: "add"},
+		// replaces the observed set under the snapshot's leaf lock and
+		// republishes from the last interface read; it never reads interfaces
+		{path: "transfer_observed_addresses.go", receiver: "Client", method: "receiveObservedAddresses"},
+		{path: "ip_security_local.go", receiver: "providerLocalNetworks", method: "setObservedAddresses"},
 		{path: "transfer_peer_manager.go", receiver: "PeerManager", method: "Receive"},
 		{path: "transfer_stream_manager.go", receiver: "StreamManager", method: "Receive"},
 		{path: "transport_p2p_webrtc.go", receiver: "clientSignalDispatcher", method: "Receive"},
@@ -335,10 +340,9 @@ func TestProductionClientReceiveCallbacksAreAudited(t *testing.T) {
 }
 
 // TestSharedClientReceivePumpHandoffsUseCarrierPolicy pins the two admissions
-// that run before per-sequence callbacks. Pack may use only the bounded
-// exact carrier-lane handoff policy. Neither may inherit
-// ClientSettings.BufferTimeout; reliable lanes wait and datagrams remain
-// zero-wait independently of the broad transport family.
+// before per-sequence callbacks. The shared pump must not wait for capacity or
+// another admission owner, regardless of carrier or configured dedicated-API
+// timeouts. Physical carrier receipts and classification remain route-owned.
 func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 	parsed := parseProductionGo(t)
 	body := findReceiveCallbackBody(t, parsed, receiveCallbackBody{
@@ -347,22 +351,7 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 		method:   "run",
 	})
 	counts := map[string]int{}
-	packTimeoutPolicyCount := 0
-	ackTimeoutPolicyCount := 0
 	ast.Inspect(body, func(node ast.Node) bool {
-		assignment, ok := node.(*ast.AssignStmt)
-		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&
-			formatAstExpr(t, parsed.fileSet, assignment.Lhs[0]) == "handoffTimeout" &&
-			strings.Join(strings.Fields(formatAstExpr(t, parsed.fileSet, assignment.Rhs[0])), "") ==
-				"self.settings.ReceiveBufferSettings.packHandoffTimeout(transportType,carrierReliability)" {
-			packTimeoutPolicyCount++
-		}
-		if ok && len(assignment.Lhs) == 1 && len(assignment.Rhs) == 1 &&
-			formatAstExpr(t, parsed.fileSet, assignment.Lhs[0]) == "ackHandoffTimeout" &&
-			strings.Join(strings.Fields(formatAstExpr(t, parsed.fileSet, assignment.Rhs[0])), "") ==
-				"self.settings.ReceiveBufferSettings.ackHandoffTimeout(transportType)" {
-			ackTimeoutPolicyCount++
-		}
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -384,22 +373,12 @@ func TestSharedClientReceivePumpHandoffsUseCarrierPolicy(t *testing.T) {
 			return true
 		}
 		timeout := formatAstExpr(t, parsed.fileSet, call.Args[argumentIndex])
-		if name == "self.receiveBuffer.Pack" && timeout != "handoffTimeout" {
+		if timeout != "0" {
 			position := parsed.fileSet.Position(call.Pos())
-			t.Errorf("%s timeout = %s at %s, want carrier handoffTimeout", name, timeout, position)
-		}
-		if name == "self.sendBuffer.ackMessageDetailed" && timeout != "ackHandoffTimeout" {
-			position := parsed.fileSet.Position(call.Pos())
-			t.Errorf("%s timeout = %s at %s, want carrier ackHandoffTimeout", name, timeout, position)
+			t.Errorf("%s timeout = %s at %s, want literal zero for the shared pump", name, timeout, position)
 		}
 		return true
 	})
-	if packTimeoutPolicyCount != 1 {
-		t.Errorf("carrier Pack timeout policy assignment count = %d, want 1", packTimeoutPolicyCount)
-	}
-	if ackTimeoutPolicyCount != 1 {
-		t.Errorf("carrier ACK timeout policy assignment count = %d, want 1", ackTimeoutPolicyCount)
-	}
 	for _, name := range []string{"self.receiveBuffer.Pack", "self.sendBuffer.ackMessageDetailed"} {
 		if counts[name] != 1 {
 			t.Errorf("%s call count = %d, want 1", name, counts[name])

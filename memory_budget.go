@@ -112,6 +112,11 @@ func MemoryScaledByteCount(unscaledByteCount ByteCount, floorByteCount ByteCount
 // MemoryScaledCount scales a default count by the memory budget,
 // with a floor that preserves a working minimum
 func MemoryScaledCount(unscaledCount int, floorCount int) int {
-	scaledCount := int(memoryScale() * float64(unscaledCount))
+	return memoryTargetScaledCount(MemoryBudget(), unscaledCount, floorCount)
+}
+
+// Use the same count floor without consulting another owner's process target.
+func memoryTargetScaledCount(memoryTargetByteCount ByteCount, unscaledCount int, floorCount int) int {
+	scaledCount := int(memoryTargetScale(memoryTargetByteCount) * float64(unscaledCount))
 	return max(floorCount, scaledCount)
 }

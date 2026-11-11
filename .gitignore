@@ -9,3 +9,5 @@ connectctl/connectctl
 tetherctl/*.conf
 api/redoc-static.html
 security/ips.{go,txt}
+__pycache__/
+*.pyc

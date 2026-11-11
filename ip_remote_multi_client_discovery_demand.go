@@ -107,6 +107,14 @@ func (self *multiClientWindow) beginDiscoveryDemandSlot(owner *multiClientEvalua
 // The normal receiver owns the handoff. A demand result for an older request
 // is retired before evaluation and does not consume a new acquisition slot.
 func (self *multiClientWindow) acceptDiscoveryDemandArgs(owner *multiClientEvaluationOwner, args *multiClientChannelArgs) bool {
+	// Listed before its provider failed in this window: the cool-off
+	// (ip_remote_multi_client_cooloff.go) refuses it here, before the demand
+	// slot is taken, so the expansion retires its args and waits for the
+	// next candidate. A candidate the starvation escape listed after the
+	// failure is evaluated.
+	if !args.deferredClientArgs && self.cooloffRefuses(args.Destination, args.cooloffListing) {
+		return false
+	}
 	var cancel context.CancelFunc
 	self.stateLock.Lock()
 	demand := &self.discoveryDemand
@@ -375,7 +383,8 @@ func (self *multiClientWindow) offerDiscoveryDemandArgs(read *discoveryDemandRea
 // A new source sequence starts this observational clock; the canonical source
 // and failed-service record remain unchanged. Completion replay never resets it.
 type discoveryAttemptObservation struct {
-	stamp uint64
+	stamp        uint64
+	serviceOwner *tcpSynRetry
 }
 
 func (self *multiClientChannelUpdate) observeDiscoveryAttempt(candidates []*multiClientChannel, now time.Time, source *IpPath) (discoveryAttemptObservation, bool) {
@@ -438,6 +447,9 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 	}
 	observation, eligible := update.observeDiscoveryAttempt(candidates, time.Now(), source)
 	if !eligible {
+		observation, eligible = self.observeServiceRefreshAttempt(update, source)
+	}
+	if !eligible {
 		return
 	}
 	self.stateLock.Lock()
@@ -450,6 +462,9 @@ func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannel
 		if self.clients[id] != client {
 			return
 		}
+	}
+	if observation.serviceOwner != nil && (self.serviceRefreshOwner != observation.serviceOwner || !self.serviceRefreshLiveWithLock()) {
+		return
 	}
 	if update.discoveryAttemptStamp.Load() != observation.stamp || update.ctx.Err() != nil ||
 		update.receivedInbound.Load() || update.sourceReset.Load() || update.sequenceCloseReady.Load() {

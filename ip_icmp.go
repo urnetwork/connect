@@ -147,9 +147,14 @@ func DefaultIcmpBufferSettings() *IcmpBufferSettings {
 }
 
 func DefaultIcmpBufferSettingsWithBufferSize(bufferSize int) *IcmpBufferSettings {
+	return defaultIcmpBufferSettingsWithMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Explicit NAT construction shares the process factory's complete ICMP policy.
+func defaultIcmpBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *IcmpBufferSettings {
 	globalLimit := 0
-	if 0 < MemoryBudget() {
-		globalLimit = MemoryScaledCount(512, 64)
+	if 0 < memoryTargetByteCount {
+		globalLimit = memoryTargetScaledCount(memoryTargetByteCount, 512, 64)
 	}
 	return &IcmpBufferSettings{
 		ReadTimeout:  300 * time.Second,

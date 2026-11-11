@@ -908,8 +908,8 @@ func TestCanonicalH1FullProofLogicalGroupRetryOwnership(t *testing.T) {
 	}
 }
 
-// The first small proof admits8 frames. A real replacement grant grows the
-// proof and divides the remaining8 into7+1 after the first chunk's peer ACK.
+// The first small proof admits eight frames. A real replacement grant grows the
+// proof and divides the remaining eight into six plus two after the first ACK.
 func TestCanonicalH1FullProofRotationCompletesExpandedGroup(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	for _, cancelSuffix := range []bool{false, true} {

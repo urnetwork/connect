@@ -423,9 +423,14 @@ func DefaultUdpBufferSettings() *UdpBufferSettings {
 }
 
 func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
+	return defaultUdpBufferSettingsWithMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Explicit construction and process defaults share all policy literals.
+func defaultUdpBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *UdpBufferSettings {
 	globalLimit := 0
-	if 0 < MemoryBudget() {
-		globalLimit = MemoryScaledCount(2048, 256)
+	if 0 < memoryTargetByteCount {
+		globalLimit = memoryTargetScaledCount(memoryTargetByteCount, 2048, 256)
 	}
 	return &UdpBufferSettings{
 		ReadTimeout:  300 * time.Second,
@@ -451,7 +456,7 @@ func DefaultUdpBufferSettingsWithBufferSize(bufferSize int) *UdpBufferSettings {
 		// silently assigned the phone cap; provider entry points select their
 		// explicit profile below.
 		GlobalLimit:     globalLimit,
-		MaxWindowSize:   uint32(MemoryScaledByteCount(mib(1), kib(256))),
+		MaxWindowSize:   uint32(MemoryTargetScaledByteCount(memoryTargetByteCount, mib(1), kib(256))),
 		EgressTtlMode:   EgressTtlModeMirror,
 		ConnectSettings: *DefaultConnectSettings(),
 	}
@@ -462,19 +467,25 @@ func DefaultTcpBufferSettings() *TcpBufferSettings {
 }
 
 func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
+	return defaultTcpBufferSettingsWithMemoryTarget(bufferSize, MemoryBudget())
+}
+
+// Keep socket, window and queue sizing on the same explicit owner target.
+func defaultTcpBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteCount ByteCount) *TcpBufferSettings {
 	minWindowSize := uint32(kib(64))
-	initialWindowSize := scaledPow2WindowSize(
+	initialWindowSize := scaledPow2WindowSizeForMemoryTarget(
+		memoryTargetByteCount,
 		uint32(mib(1)),
 		minWindowSize,
 		uint32(kib(128)),
 	)
 	globalLimit := 0
-	if 0 < MemoryBudget() {
-		globalLimit = MemoryScaledCount(512, 64)
+	if 0 < memoryTargetByteCount {
+		globalLimit = memoryTargetScaledCount(memoryTargetByteCount, 512, 64)
 	}
 	returnBudget := mib(64)
-	if 0 < MemoryBudget() {
-		returnBudget = max(kib(320), transferBudgetShareByteCount())
+	if 0 < memoryTargetByteCount {
+		returnBudget = max(kib(320), transferBudgetShareByteCountForTarget(memoryTargetByteCount))
 	}
 	tcpBufferSettings := &TcpBufferSettings{
 		// ConnectTimeout:     60 * time.Second,
@@ -500,13 +511,14 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		SequenceBufferSize:     bufferSize,
 		Mtu:                    DefaultMtu,
 		// large socket reads are split into mtu-sized data packets by `DataPackets`
-		ReadBufferByteCount:      int(MemoryScaledByteCount(kib(64), kib(16))),
+		ReadBufferByteCount:      int(MemoryTargetScaledByteCount(memoryTargetByteCount, kib(64), kib(16))),
 		WriteBatchSize:           64,
 		MemoryWriteBatchSize:     8,
 		MemoryColdWriteBatchSize: 2,
 		MinWindowSize:            minWindowSize,
 		InitialWindowSize:        initialWindowSize,
-		MaxWindowSize: scaledPow2WindowSize(
+		MaxWindowSize: scaledPow2WindowSizeForMemoryTarget(
+			memoryTargetByteCount,
 			uint32(mib(16)),
 			minWindowSize,
 			uint32(kib(256)),
@@ -538,7 +550,12 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 // `minWindowSize` to preserve the `MaxWindowSize` contract (the window
 // doubling ladder must land exactly on the max)
 func scaledPow2WindowSize(maxWindowSize uint32, minWindowSize uint32, floorWindowSize uint32) uint32 {
-	scaledWindowSize := uint32(MemoryScaledByteCount(ByteCount(maxWindowSize), ByteCount(floorWindowSize)))
+	return scaledPow2WindowSizeForMemoryTarget(MemoryBudget(), maxWindowSize, minWindowSize, floorWindowSize)
+}
+
+// Use the same power-of-two ladder for explicit and process-sized owners.
+func scaledPow2WindowSizeForMemoryTarget(memoryTargetByteCount ByteCount, maxWindowSize uint32, minWindowSize uint32, floorWindowSize uint32) uint32 {
+	scaledWindowSize := uint32(MemoryTargetScaledByteCount(memoryTargetByteCount, ByteCount(maxWindowSize), ByteCount(floorWindowSize)))
 	windowSize := minWindowSize
 	for windowSize*2 <= scaledWindowSize {
 		windowSize *= 2
@@ -547,15 +564,20 @@ func scaledPow2WindowSize(maxWindowSize uint32, minWindowSize uint32, floorWindo
 }
 
 func DefaultLocalUserNatSettings() *LocalUserNatSettings {
+	return defaultLocalUserNatSettingsWithMemoryTarget(MemoryBudget())
+}
+
+// Every protocol receives one captured target, without changing host sizing.
+func defaultLocalUserNatSettingsWithMemoryTarget(memoryTargetByteCount ByteCount) *LocalUserNatSettings {
 	return &LocalUserNatSettings{
 		// scaled by the memory budget: slots on the dispatch channel pin
 		// in-flight pool buffers under backpressure
-		SequenceBufferSize: MemoryScaledCount(defaultIpBufferSize, 256),
+		SequenceBufferSize: memoryTargetScaledCount(memoryTargetByteCount, defaultIpBufferSize, 256),
 		SendShardCount:     1,
 		// BufferTimeout:      15 * time.Second,
-		UdpBufferSettings:  DefaultUdpBufferSettings(),
-		TcpBufferSettings:  DefaultTcpBufferSettings(),
-		IcmpBufferSettings: DefaultIcmpBufferSettings(),
+		UdpBufferSettings:  defaultUdpBufferSettingsWithMemoryTarget(memoryTargetScaledCount(memoryTargetByteCount, defaultUdpFlowBufferSize, 32), memoryTargetByteCount),
+		TcpBufferSettings:  defaultTcpBufferSettingsWithMemoryTarget(memoryTargetScaledCount(memoryTargetByteCount, defaultTcpFlowBufferSize, 192), memoryTargetByteCount),
+		IcmpBufferSettings: defaultIcmpBufferSettingsWithMemoryTarget(memoryTargetScaledCount(memoryTargetByteCount, defaultIcmpFlowBufferSize, 16), memoryTargetByteCount),
 	}
 }
 
@@ -631,7 +653,15 @@ func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
 // the sdk device wiring). 0 is the targetless profile above: unlimited flow
 // counts and the provider udp idle, whether or not a process budget is set.
 func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCount) *LocalUserNatSettings {
-	settings := DefaultLocalUserNatSettings()
+	return DefaultProviderLocalUserNatSettingsWithMemoryTargets(targetByteCount, MemoryBudget())
+}
+
+// Select provider flow-table capacity and the containing device sizing target
+// independently. The latter sizes complete TCP/UDP/ICMP defaults without
+// consulting or changing another device's process target. Nonpositive sizing
+// retains unscaled defaults; the one-target API preserves process defaults.
+func DefaultProviderLocalUserNatSettingsWithMemoryTargets(targetByteCount ByteCount, memoryTargetByteCount ByteCount) *LocalUserNatSettings {
+	settings := defaultLocalUserNatSettingsWithMemoryTarget(memoryTargetByteCount)
 	if 0 < targetByteCount {
 		// the provider target has its own gate, independent of the process
 		// budget. Half the target sizes the egress nat flow tables (60% udp /
@@ -4301,12 +4331,13 @@ type TcpBufferSettings struct {
 	// valve: orphan packets are attacker-influenceable). <= 0 is unlimited.
 	OrphanRstPerSecond int
 
-	// EnableSyntheticSpeed terminates TCP flows to the RFC 2544 benchmark
-	// range 198.18.0.0/15 at an in-memory synthetic speed server instead of
-	// dialing upstream (see ip_synthetic_speed.go). The range is never
-	// publicly routable, so no real destination is shadowed. Serves
-	// measurement of the tunnel path itself, isolated from origin and
-	// upstream network variability.
+	// EnableSyntheticSpeed terminates TCP flows to the benchmark ranges
+	// 198.18.0.0/15 (RFC 2544) and 2001:2::/48 (RFC 5180) at an in-memory
+	// synthetic speed server instead of dialing upstream (see
+	// ip_synthetic_speed.go). The ranges are never publicly routable, so no
+	// real destination is shadowed. Serves measurement of the tunnel path
+	// itself, isolated from origin and upstream network variability. False
+	// refuses those flows; they are never dialed either way.
 	EnableSyntheticSpeed bool
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
@@ -5727,14 +5758,21 @@ func (self *TcpSequence) Run() {
 	var err error
 	var egressDial *providerEgressDial
 	var dialDuration time.Duration
-	synthetic := self.tcpBufferSettings.EnableSyntheticSpeed && isSyntheticSpeedIp(self.IpPath().DestinationIp)
+	synthetic := isSyntheticSpeedIp(self.IpPath().DestinationIp)
 	if synthetic {
 		// benchmark-range destination: terminate at the in-memory synthetic
-		// speed server (see ip_synthetic_speed.go)
-		if self.log.V(1).Enabled() {
-			self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+		// speed server (see ip_synthetic_speed.go), or refuse it. It is never
+		// dialed: the security policy admits tcp to this range only because
+		// it is served here, and on a host the range can be a local proxy's
+		// fake-ip space (ip_security_public.go).
+		if self.tcpBufferSettings.EnableSyntheticSpeed {
+			if self.log.V(1).Enabled() {
+				self.log.Infof("[init]tcp connect synthetic %s\n", self.IpPath().DestinationHostPort())
+			}
+			socket = newSyntheticSpeedConn()
+		} else {
+			err = errSyntheticSpeedDisabled
 		}
-		socket = newSyntheticSpeedConn()
 	} else {
 		var dialCtx context.Context
 		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)

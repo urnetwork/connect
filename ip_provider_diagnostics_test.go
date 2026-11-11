@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -190,19 +191,26 @@ func TestProviderDiagnosticsReportSecurityPolicyGeneration(t *testing.T) {
 // without the memory-scaled MaxFlows, and the hand-maintained exception
 // tables. The feed-generated tables are left out: every release build
 // regenerates the CFAA blocklists and the Meta prefixes, and
-// SecurityPolicyHash identifies them.
+// SecurityPolicyHash identifies them. From generation 3 it also holds the
+// provider-local guard's defaults (the policy's and the process snapshot's)
+// and the special-purpose registry tables of the public-destination rule,
+// and from generation 4 the guard's service anycast addresses.
 func securityPolicyRulesPreimage(t *testing.T) []byte {
 	t.Helper()
 	dmca := DefaultDmcaSecurityPolicySettings()
 	dmca.MaxFlows = 0
 	settings, err := json.Marshal(struct {
-		Cfaa *CfaaSecurityPolicySettings `json:"cfaa"`
-		Dmca *DmcaSecurityPolicySettings `json:"dmca"`
-		Web  *WebStandardSettings        `json:"web"`
+		Cfaa          *CfaaSecurityPolicySettings          `json:"cfaa"`
+		Dmca          *DmcaSecurityPolicySettings          `json:"dmca"`
+		Web           *WebStandardSettings                 `json:"web"`
+		Local         *ProviderLocalSecurityPolicySettings `json:"local"`
+		LocalNetworks *providerLocalNetworksSettings       `json:"local_networks"`
 	}{
-		Cfaa: DefaultCfaaSecurityPolicySettings(),
-		Dmca: dmca,
-		Web:  DefaultWebStandardSettings(),
+		Cfaa:          DefaultCfaaSecurityPolicySettings(),
+		Dmca:          dmca,
+		Web:           DefaultWebStandardSettings(),
+		Local:         DefaultProviderLocalSecurityPolicySettings(),
+		LocalNetworks: defaultProviderLocalNetworksSettings(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -211,10 +219,15 @@ func securityPolicyRulesPreimage(t *testing.T) []byte {
 	preimage.Write(settings)
 	fmt.Fprintf(
 		&preimage,
-		"\x00steam %v\x00telegram %v %d",
+		"\x00steam %v\x00telegram %v %d\x00public %v %v %v %v\x00local anycast %v",
 		steamValveNetworkPrefixes,
 		telegramCallReflectorIpv4Ranges,
 		telegramCallV12TcpFallbackIpv4,
+		nonPublicIpv4Prefixes,
+		publicIpv4Exceptions,
+		nonPublicIpv6Prefixes,
+		publicIpv6Exceptions,
+		providerLocalAnycastAddrs,
 	)
 	return preimage.Bytes()
 }
@@ -233,10 +246,15 @@ func securityPolicyRulesDigest(t *testing.T) string {
 // pins are of this digest, which leaves out the Meta prefixes since they
 // became a feed table; neither generation had shipped then, and the first
 // refresh equaled the snapshot generation 2 had. Generation 1's pin is of its
-// own default settings (connect 4138f101).
+// own default settings (connect 4138f101). Generation 3's pin is of the
+// preimage that also holds the provider-local defaults and the
+// special-purpose registry tables; generations 1 and 2 had neither.
+// Generation 4's also holds the service anycast addresses.
 var securityPolicyRulesPins = map[uint64]string{
 	1: "265961a0f2b445d75fd5a851ec49198f580e3778f4bbe27315af7f3290c7e8c9",
 	2: "2798a1cef586738de34759ff274f084e950cbd09b9c17b35a3baeba57d80141f",
+	3: "6dbeba6f777c7ec4d3567a06f344295945a11dbef6260a0ef0a048c59edf1ee0",
+	4: "c800071a98af8523400e22c9b0212d353ecb21589a97873bab2baff4bfd3dd32",
 }
 
 // A change to the default settings or a hand-maintained exception table must
@@ -272,6 +290,18 @@ func TestSecurityPolicyRulesPinCoversHandMaintainedTablesOnly(t *testing.T) {
 	}
 	if !bytes.Contains(preimage, []byte(fmt.Sprint(telegramCallReflectorIpv4Ranges))) {
 		t.Fatal("the rules pin does not cover the Telegram reflector ranges")
+	}
+	for _, table := range [][]netip.Prefix{nonPublicIpv4Prefixes, publicIpv4Exceptions, nonPublicIpv6Prefixes, publicIpv6Exceptions} {
+		for _, prefix := range table {
+			if !bytes.Contains(preimage, []byte(prefix.String())) {
+				t.Fatalf("the rules pin does not cover the special-purpose block %s", prefix)
+			}
+		}
+	}
+	for _, addr := range providerLocalAnycastAddrs {
+		if !bytes.Contains(preimage, []byte("local anycast")) || !bytes.Contains(preimage, []byte(addr.String())) {
+			t.Fatalf("the rules pin does not cover the service anycast address %s", addr)
+		}
 	}
 	for _, prefix := range metaNetworkPrefixes {
 		if bytes.Contains(preimage, []byte(prefix.String())) {

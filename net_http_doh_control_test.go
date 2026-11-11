@@ -149,9 +149,9 @@ func TestParseControlDohUrl(t *testing.T) {
 }
 
 // The named servers go ahead of the default servers of their family, the
-// defaults stay behind them once each, and the named servers are seeded so a
-// query's weighted order starts with them. With none named the settings are
-// the defaults.
+// defaults stay behind them once each, the named servers are the lead servers
+// of a query (`NamedRemoteDohUrls`), and they are seeded so a query's weighted
+// order starts with them. With none named the settings are the defaults.
 func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	defaults := DefaultDnsResolverSettings()
 	namedDohUrlIpv4 := "https://192.0.2.53/dns-query"
@@ -184,6 +184,9 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	if len(settings.ServerStatsSeed) != 3 {
 		t.Errorf("seeds = %v, expected the named servers only", settings.ServerStatsSeed)
 	}
+	if expected := []string{namedDohUrlIpv4, defaultDohUrlIpv4, namedDohUrlIpv6}; !slices.Equal(settings.NamedRemoteDohUrls, expected) {
+		t.Errorf("lead servers = %v, expected the named servers %v", settings.NamedRemoteDohUrls, expected)
+	}
 	// the weighted order a fresh cache starts from puts a named server first,
 	// all but about one time in a hundred (8.05 against 0.05 per default)
 	stats := newServerStats()
@@ -210,6 +213,9 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	}
 	if none.ServerStatsSeed != nil {
 		t.Fatalf("no named servers seeded %v", none.ServerStatsSeed)
+	}
+	if none.NamedRemoteDohUrls != nil {
+		t.Fatalf("no named servers lead %v", none.NamedRemoteDohUrls)
 	}
 }
 

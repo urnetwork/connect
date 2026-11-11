@@ -3419,9 +3419,10 @@ func httpPostWithStrategyRaw(
 // HttpStatusError carries a non-200 response so callers can act on the STATUS rather
 // than string-matching an error message.
 //
-// This matters for 402: when a network is over its plan, the server answers 402 and
-// the body carries x402 payment terms. An agent needs to see the status and the body
-// to sign a payment and retry -- an opaque error string is unusable for that.
+// This matters for 402: when a network is over its plan and the caller asked for
+// x402 terms (`X-UR-X402: 1`), the server answers 402 and the body carries x402
+// payment terms. An agent needs to see the status and the body to sign a payment and
+// retry -- an opaque error string is unusable for that.
 //
 // Error() renders exactly as the untyped error it replaces, so existing callers that
 // only log or string-match are unaffected.

@@ -242,7 +242,8 @@ resolve(peerId, contractPub):
       prefilter already failed this candidate
 
   fetch/transport ERROR:
-      commit contractPub, log            (availability — unchanged behaviour)
+      pinned, contractPub != pinned key -> TERMINAL   (per-peer downgrade refused)
+      else  commit contractPub, log      (availability — unchanged behaviour)
 ```
 
 Under `EncryptionModeOpportunistic` every branch above **verifies and logs
@@ -266,6 +267,24 @@ provider for every Required user simultaneously — a self-inflicted global
 outage with the same shape as the blackhole this whole subsystem exists to
 avoid. Availability failures fall back; only *positively verified disagreement*
 is terminal.
+
+**Amended 2026-11-06 (Cure53 audit preparation):** a pinned peer is the
+exception. Its pin is verified signed evidence, so a contract key that
+differs from it *is* a verified disagreement. The only legitimate way off a
+pinned key is a signed rotation, and that is exactly what an unavailable
+history cannot show. As built, the fetch-error branch refuses that case
+terminally, as the per-peer downgrade in §4 does for an empty history.
+Otherwise an operator answers with an error instead of with nothing. The
+global-outage argument above does not reach it: only pinned peers whose key
+changed during the outage are affected, and a pinned peer presenting its
+pinned key still falls back.
+
+The pin check was tightened in the same change. A later chain must still
+name the pinned key *at the pinned generation*. Previously only the head was
+compared, and only when it sat at the pinned generation, so a chain that
+rewrote the pinned generation and appended one more passed as a rotation
+(`TestPinRefusesForkThatAdvancesPastThePinnedGeneration`,
+`TestSignedIdentityFetchErrorRefusesAChangedPinnedKey`).
 
 ### 5.4 Terminal failure shape
 

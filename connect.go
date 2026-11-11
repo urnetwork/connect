@@ -78,9 +78,16 @@ func NewTransferPath(sourceId Id, destinationId Id, streamId Id) (path TransferP
 	return
 }
 
+// Converts a wire path. A missing path is an error, never a zero path or a
+// nil dereference: a decoded frame leaves the field nil when it is absent, and
+// a sealed inner frame is whatever the session peer chose to send.
 func TransferPathFromProtobuf(
 	protoTransferPath *protocol.TransferPath,
 ) (path TransferPath, err error) {
+	if protoTransferPath == nil {
+		err = errors.New("Missing transfer path")
+		return
+	}
 	return TransferPathFromBytes(
 		protoTransferPath.SourceId,
 		protoTransferPath.DestinationId,

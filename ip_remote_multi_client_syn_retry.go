@@ -20,7 +20,7 @@ type tcpSynRetryRequest struct {
 	pin         flowPin
 	update      *multiClientChannelUpdate
 	serial      uint64
-	// An ordinary caller keeps serial zero; this records only exact cache identity.
+	// An ordinary caller keeps serial zero; this attests a continuous native retry.
 	nativeOwnerSerial uint64
 	// Nonzero only for a continuation of this exact unanswered wide race.
 	raceOrder uint64
@@ -44,8 +44,10 @@ type tcpSynRetry struct {
 	pin                                  flowPin
 	sequence                             uint32
 	serial                               uint64
-	references                           uint32
-	queued                               bool
+	// Continuous metadata refreshes share this bounded provenance token.
+	retryLineage uint64
+	references   uint32
+	queued       bool
 	// Weak index links are detached before final credit release. Cache or
 	// queued/in-flight references own the struct throughout membership.
 	publicationPrevious, publicationNext *tcpSynRetry
@@ -81,7 +83,7 @@ func (self *parsedPacketGroup) prepareSynRetry(source TransferPath, mode protoco
 		if owner := update.synRetry; owner != nil && owner.serial != 0 &&
 			owner.sequence == path.SequenceNumber && owner.source == source &&
 			owner.provideMode == mode && owner.pin == self.pin && owner.validWithLock(update) &&
-			0 < len(owner.packet) && bytes.Equal(owner.packet, self.packets[0].packet) {
+			0 < len(owner.packet) && (bytes.Equal(owner.packet, self.packets[0].packet) || sameSynRetryMetadata(owner.packet, self.packets[0].packet)) {
 			request.update = update
 			request.nativeOwnerSerial = owner.serial
 		}
@@ -197,6 +199,12 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		return
 	}
 	update := group.collapseAdmission.update
+	materializedSyn := false
+	defer func() {
+		if materializedSyn {
+			update.reassertServiceRefreshAfterMaterialization()
+		}
+	}()
 	defer update.releaseSynRetryMemory()
 	defer update.indexSynRetryPublication()
 	update.stateLock.Lock()
@@ -227,12 +235,24 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 		if !path.Syn || path.Ack {
 			continue
 		}
+		// An original prepared before cache publication can fence its own
+		// paid refusal until this materialization, even when bytes are equal.
+		materializedSyn = true
 		if retained := update.synRetry; retained != nil && retained.sequence == path.SequenceNumber && bytes.Equal(retained.packet, packet) {
 			continue
 		}
-		// A newly admitted different SYN cannot borrow the preceding packet,
-		// even when this bounded extra reservation cannot be obtained.
-		update.clearSynRetryWithLock()
+		previous := update.synRetry
+		continuous := previous != nil && previous.validGenerationWithLock(update) &&
+			previous.sequence == path.SequenceNumber && previous.source == group.synRetry.source &&
+			previous.provideMode == group.synRetry.provideMode && previous.pin == group.synRetry.pin &&
+			sameSynRetryMetadata(previous.packet, packet)
+		// A continuous retry may keep its older paid wire image if optional
+		// replacement credit is unavailable. A different attempt cannot borrow it.
+		if !continuous {
+			update.clearSynRetryWithLock()
+			update.serviceRefreshRequested = false
+			update.serviceRefreshLineage.Store(0)
+		}
 		if update.synRetrySerial == ^uint64(0) {
 			continue
 		}
@@ -253,8 +273,15 @@ func (self sendGroupDisposition) retainSynRetry(source *SendSequence, frames []*
 			update: update, packet: copyPacket, credit: credit,
 			source: group.synRetry.source, provideMode: group.synRetry.provideMode,
 			pin: group.synRetry.pin, sequence: path.SequenceNumber,
-			serial: update.synRetrySerial, references: 1,
+			serial: update.synRetrySerial, retryLineage: update.synRetrySerial, references: 1,
 			refusedRemoteIds: make([]Id, 0, remoteCapacity),
+		}
+		if continuous {
+			owner.retryLineage = previous.retryLineage
+			count := min(len(previous.refusedRemoteIds), cap(owner.refusedRemoteIds))
+			owner.refusedRemoteIds = append(owner.refusedRemoteIds, previous.refusedRemoteIds[:count]...)
+			owner.remoteRefusalOverflow = previous.remoteRefusalOverflow || count != len(previous.refusedRemoteIds)
+			update.clearSynRetryWithLock()
 		}
 		owner.readiness = newSynRetryReadiness(update.sequenceParent, update, source, owner.serial, owner.sequence, synRetryReadyCapacity(update.sequenceParent, update))
 		update.synRetry = owner

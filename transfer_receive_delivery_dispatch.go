@@ -16,13 +16,13 @@ func (peer Peer) deliveryReceipt() *receiveDeliveryReceipt {
 // Reliable-provider retained accounting prepays the future packet owner as a
 // distinct amount, in addition to all still-live receive roots and metadata.
 // Classify TCP before provider publication; admission precedes any SACK lease.
-func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) {
+func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) bool {
 	if item.deliveryPrepared || !item.ack || self.receiveQueue == nil ||
 		!self.receiveQueue.lifetimeBudget ||
 		!receiveDeliveryHasTcp(item.frames) {
-		return
+		return true
 	}
-	item.deliveryPrepared = true
+	prepaid := ByteCount(0)
 	metadata := ByteCount(unsafe.Sizeof(receiveDeliveryReceipt{})) + 64
 	for _, frame := range item.frames {
 		if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketToProvider {
@@ -39,12 +39,21 @@ func (self *ReceiveSequence) prepareReceiveDeliveryCredit(item *receiveItem) {
 		// Normalized legacy/control roots cannot exceed this rounded size;
 		// raw data may retain a larger borrowed root, so charge the maximum.
 		root := max(ByteCount(cap(packet)), retainedMessageCapacity(ByteCount(len(packet))))
-		item.deliveryPrepaid += 320 + root + ByteCount(unsafe.Sizeof(TcpSendItem{})) + 128
+		prepaid += 320 + root + ByteCount(unsafe.Sizeof(TcpSendItem{})) + 128
 		metadata += ByteCount(unsafe.Sizeof(receiveDeliveryOperation{})+unsafe.Sizeof(receiveDeliveryClaim{})+
 			unsafe.Sizeof(providerReliablePacket{})) + 512
 	}
-	item.queueByteCount = addReceiveQueueByteCount(item.queueByteCount,
-		item.deliveryPrepaid+(metadata+63)/64*64)
+	additional := prepaid + (metadata+63)/64*64
+	if item.memoryBudget != nil {
+		if !item.growReceiveMemory(additional) && !self.recoverProviderReceiveDeliveryCredit(item, additional) {
+			self.requestReceiveMemoryGrowth(item, additional)
+			return false
+		}
+	} else {
+		item.queueByteCount = addReceiveQueueByteCount(item.queueByteCount, additional)
+	}
+	item.deliveryPrepaid, item.deliveryPrepared = prepaid, true
+	return true
 }
 
 func receiveDeliveryHasTcp(frames []*protocol.Frame) bool {
@@ -182,6 +191,13 @@ func (self *ReceiveSequence) flushDeliveryReceipts(items []*receiveItem, frames 
 		appFrames := frames[offset : offset+count]
 		offset += count
 		nextItem++
+		// Each receipt has its own callback. A previous callback may have
+		// rejected this session after the enclosing batch was admitted.
+		if 0 < len(appFrames) && self.session != nil && !self.session.admitInboundApplication() {
+			self.discardUnadmittedApplication(item)
+			q.cancel()
+			continue
+		}
 		q.mutex.Lock()
 		closed := q.closed
 		q.mutex.Unlock()

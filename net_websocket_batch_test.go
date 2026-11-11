@@ -256,6 +256,7 @@ func TestWebSocketWriteBatchSteadyStateDoesNotAllocate(t *testing.T) {
 	AssertEqual(t, allocCount, float64(0))
 }
 
+// Ready batches balance the message cap with a byte target across tunnel MTUs.
 func TestPlatformWebSocketReadyDrainBalancesAcksAndPayloadBytes(t *testing.T) {
 	readyCount := func(messageByteCount int) (count int, byteCount int) {
 		count = 1
@@ -270,9 +271,15 @@ func TestPlatformWebSocketReadyDrainBalancesAcksAndPayloadBytes(t *testing.T) {
 	if count, bytes := readyCount(128); count != 32 || bytes != 4*1024 {
 		t.Fatalf("ACK-sized ready drain=(%d, %dB), want (32, 4096B)", count, bytes)
 	}
-	if count, bytes := readyCount(DefaultMtu); count != 12 ||
-		bytes >= webSocketWriteBatchMaxByteCount {
-		t.Fatalf("tunnel-MTU ready drain=(%d, %dB), want 12 below 16KiB", count, bytes)
+	// The historical and current MTUs reach the same byte target with different
+	// packet counts. Stop at the first complete packet that reaches that target.
+	for _, messageByteCount := range []int{1100, DefaultMtu} {
+		count, byteCount := readyCount(messageByteCount)
+		if byteCount < platformWebSocketWriteBatchDrainByteCount ||
+			platformWebSocketWriteBatchDrainByteCount <= byteCount-messageByteCount ||
+			webSocketWriteBatchMaxByteCount <= byteCount {
+			t.Fatalf("%d-byte tunnel ready drain=(%d, %dB), want the first complete prefix reaching %dB below %dB", messageByteCount, count, byteCount, platformWebSocketWriteBatchDrainByteCount, webSocketWriteBatchMaxByteCount)
+		}
 	}
 	if count, bytes := readyCount(4 * 1024); count != 3 ||
 		bytes != platformWebSocketWriteBatchDrainByteCount {
