@@ -2594,6 +2594,16 @@ paths:
         WireGuard details), and for a unique-exit proxy its `exit`. Same row
         shape as `/network/clients` otherwise: resident status, connections,
         provide status.
+
+        SOCKS and WireGuard are part of Pro. Each proxy's `pro_features` lists
+        the Pro-only features it holds credentials for (`socks_proxy` for a
+        SOCKS url, `wireguard_proxy` for a WireGuard config), and the list's
+        `plan` says whether the network holds Pro now, read live, and whether
+        the platform enforces the Pro-only features. While
+        `plan.pro_features_enforced` is false every plan uses them. Once it is
+        true, a network without Pro is issued neither, and its proxies' SOCKS
+        sign-ins are refused and their WireGuard peers dropped; HTTP and HTTPS
+        keep working.
       operationId: networkProxies
       security:
         - BearerAuth: []
@@ -14135,6 +14145,18 @@ components:
                   Set for a unique-exit proxy (`proxy_config.unique_exit`):
                   its current exit.
                 $ref: "#/components/schemas/ProxyExit"
+              pro_features:
+                description: |
+                  `/network/proxies` only: the Pro-only features the proxy
+                  holds credentials for, `socks_proxy` for a SOCKS url and
+                  `wireguard_proxy` for a WireGuard config. A network without
+                  Pro loses them at the proxy once
+                  `plan.pro_features_enforced` is true. Absent for a proxy
+                  that holds neither. A client ignores a name it does not
+                  know.
+                type: array
+                items:
+                  type: string
               connections:
                 type: array
                 items:
@@ -14163,6 +14185,27 @@ components:
                       type: string
                     connection_block:
                       type: string
+        plan:
+          description: |
+            `/network/proxies` only: the network's plan beside its proxies.
+            Absent from `/network/clients`.
+          type: object
+          required:
+            - pro
+            - pro_features_enforced
+          properties:
+            pro:
+              description: |
+                The network holds Pro now, read live, not from the jwt's
+                `pro` claim.
+              type: boolean
+            pro_features_enforced:
+              description: |
+                The platform refuses the Pro-only features (SOCKS and
+                WireGuard) to a network without Pro: none is issued, and
+                the credentials a proxy already holds stop working at the
+                proxy. While false, every plan uses them.
+              type: boolean
 
     NetworkPeer:
       type: object
