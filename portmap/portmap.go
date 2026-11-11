@@ -493,7 +493,13 @@ func (self *PortMapper) attempt() (renewAfter time.Duration, mapped bool) {
 	}()
 	if currentMethod != nil && current != nil {
 		if tryMethod(currentMethod, current.mappings) {
-			return self.renewAfter(current), true
+			// the lifetimes the renewal granted
+			renewed := func() *portMapperMethodResult {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				return self.current
+			}()
+			return self.renewAfter(renewed), true
 		}
 		// the router lost or refused them; a fresh attempt follows at once
 		self.dropCurrent()

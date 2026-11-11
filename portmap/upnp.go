@@ -43,6 +43,7 @@ const (
 	upnpSearchTarget  = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
 	upnpMulticastHost = "239.255.255.250:1900"
 
+	upnpErrorNoSuchEntryInArray           = 714
 	upnpErrorConflictInMappingEntry       = 718
 	upnpErrorOnlyPermanentLeasesSupported = 725
 )
@@ -62,6 +63,19 @@ type upnpConnection interface {
 		NewLeaseDuration uint32,
 	) error
 	DeletePortMappingCtx(ctx context.Context, NewRemoteHost string, NewExternalPort uint16, NewProtocol string) error
+	GetSpecificPortMappingEntryCtx(
+		ctx context.Context,
+		NewRemoteHost string,
+		NewExternalPort uint16,
+		NewProtocol string,
+	) (
+		NewInternalPort uint16,
+		NewInternalClient string,
+		NewEnabled bool,
+		NewPortMappingDescription string,
+		NewLeaseDuration uint32,
+		err error,
+	)
 	GetExternalIPAddressCtx(ctx context.Context) (NewExternalIPAddress string, err error)
 	GetServiceClient() *goupnp.ServiceClient
 }
@@ -152,11 +166,9 @@ func (self *upnpMethod) mapPorts(
 			errs[i] = err
 			continue
 		}
-		if previousMapping != nil && previousMapping.ExternalPort != externalPort {
-			// a upnp mapping is named by its external port, so the one the
-			// router moved from would otherwise stay
-			self.removePorts(ctx, []*methodMapping{previousMapping})
-		}
+		// A renewal on another external port is one the router answered with a
+		// conflict on the old port, which another host holds now: that mapping
+		// is not this host's to remove, and removePorts would leave it anyway
 		mappings[i] = &methodMapping{
 			PortMapping: PortMapping{
 				Protocol:     request.Protocol,
@@ -230,6 +242,12 @@ func (self *upnpMethod) addPortMapping(
 	}
 }
 
+// Removes each mapping that is still this host's. A upnp mapping is named by its
+// external port alone, and the router may have given that port to another host
+// since -- a reboot that lost the table, then another host's request -- so the
+// entry is read first (GetSpecificPortMappingEntry), and one that forwards
+// anywhere but this host's address and the mapping's internal port is left
+// alone. An entry that cannot be read is left too: it runs out with its lease.
 func (self *upnpMethod) removePorts(ctx context.Context, mappings []*methodMapping) error {
 	errs := []error{}
 	for _, mapping := range mappings {
@@ -240,15 +258,37 @@ func (self *upnpMethod) removePorts(ctx context.Context, mappings []*methodMappi
 		if device == nil {
 			continue
 		}
-		err := func() error {
+		protocol := strings.ToUpper(mapping.Protocol)
+		ours, err := func() (bool, error) {
 			callCtx, cancel := context.WithTimeout(ctx, self.mapper.settings.UpnpRequestTimeout)
 			defer cancel()
-			return device.connection.DeletePortMappingCtx(
+			internalPort, internalClient, _, _, _, err := device.connection.GetSpecificPortMappingEntryCtx(
 				callCtx,
 				"",
 				uint16(mapping.ExternalPort),
-				strings.ToUpper(mapping.Protocol),
+				protocol,
 			)
+			if err != nil {
+				if upnpErrorCode(err) == upnpErrorNoSuchEntryInArray {
+					// gone already
+					return false, nil
+				}
+				return false, err
+			}
+			internalIp, err := netip.ParseAddr(strings.TrimSpace(internalClient))
+			return err == nil && internalIp.Unmap() == self.localIp && int(internalPort) == mapping.InternalPort, nil
+		}()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s %d: not removed, the entry is not readable: %w", mapping.Protocol, mapping.ExternalPort, upnpError(err)))
+			continue
+		}
+		if !ours {
+			continue
+		}
+		err = func() error {
+			callCtx, cancel := context.WithTimeout(ctx, self.mapper.settings.UpnpRequestTimeout)
+			defer cancel()
+			return device.connection.DeletePortMappingCtx(callCtx, "", uint16(mapping.ExternalPort), protocol)
 		}()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s %d: %w", mapping.Protocol, mapping.ExternalPort, upnpError(err)))

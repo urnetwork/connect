@@ -378,6 +378,46 @@ func TestPortMapperRemovesEveryUpnpMappingWhenItCloses(t *testing.T) {
 	}
 }
 
+// A upnp mapping is named by its external port alone. A router that lost its
+// table and gave the port to another host answers the renewal with a conflict:
+// the mapper moves to another port and leaves the other host's mapping alone,
+// at the renewal and when it closes.
+func TestPortMapperNeverRemovesAnotherHostsUpnpMapping(t *testing.T) {
+	clock := newTestClock()
+	upnpGateway := newTestUpnpGateway(t, 2)
+	upnpGateway.anyPort = 40443
+	mapper := NewPortMapper(context.Background(), testExtenderRequests(), testPortMapperSettings(clock, nil, upnpGateway))
+
+	testWaitReady(t, mapper)
+	anotherHost := testUpnpMapping{internalPort: 443, internalClient: "127.0.0.2", leaseSeconds: 0, description: "another host"}
+	upnpGateway.set(func() {
+		upnpGateway.mappings["TCP/443"] = anotherHost
+		upnpGateway.takenPorts["TCP/443"] = true
+	})
+	clock.elapse(clock.nextWait(t))
+	testWaitStatus(t, mapper, func(status *PortMapperStatus) bool {
+		mapping := status.Mapping(ProtocolTcp, 443)
+		return mapping != nil && mapping.ExternalPort == 40443
+	})
+	if held := upnpGateway.held()["TCP/443"]; held != anotherHost {
+		t.Fatalf("the other host's mapping is %+v after the renewal, expected it untouched", held)
+	}
+
+	mapper.Close()
+	held := upnpGateway.held()
+	if held["TCP/443"] != anotherHost {
+		t.Fatalf("the other host's mapping is %+v after close, expected it untouched", held["TCP/443"])
+	}
+	if len(held) != 1 {
+		t.Fatalf("the router holds %v after close, expected the other host's mapping alone", held)
+	}
+	for _, action := range upnpGateway.receivedActions() {
+		if action.name == "DeletePortMapping" && action.args["NewExternalPort"] == "443" && action.args["NewProtocol"] == "TCP" {
+			t.Fatal("the mapper deleted tcp 443, which another host holds")
+		}
+	}
+}
+
 func TestPortMapperRemovesThePartOfAMethodThatFailedTheFirstPort(t *testing.T) {
 	clock := newTestClock()
 	gateway := newTestPmpGateway()

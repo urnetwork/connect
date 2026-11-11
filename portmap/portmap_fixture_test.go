@@ -465,10 +465,21 @@ func (self *testUpnpGateway) serveControl(w http.ResponseWriter, r *http.Request
 				return "<NewReservedPort>" + args["NewExternalPort"] + "</NewReservedPort>", 0
 			}
 			return "", 0
+		case "GetSpecificPortMappingEntry":
+			mapping, ok := self.mappings[key]
+			if !ok {
+				return "", upnpErrorNoSuchEntryInArray
+			}
+			return fmt.Sprintf(
+				"<NewInternalPort>%d</NewInternalPort><NewInternalClient>%s</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>%s</NewPortMappingDescription><NewLeaseDuration>%d</NewLeaseDuration>",
+				mapping.internalPort,
+				mapping.internalClient,
+				mapping.description,
+				mapping.leaseSeconds,
+			), 0
 		case "DeletePortMapping":
 			if _, ok := self.mappings[key]; !ok {
-				// NoSuchEntryInArray
-				return "", 714
+				return "", upnpErrorNoSuchEntryInArray
 			}
 			delete(self.mappings, key)
 			return "", 0
