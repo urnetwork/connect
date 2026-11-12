@@ -2923,6 +2923,12 @@ paths:
         A city or region the platform holds no admitted provider for is
         answered from its region, then its country, unless `strict` is set;
         each provider found that way carries `match`.
+        A request with `select` is in selector mode: providers are classified
+        by capability (ip `dualstack` or `ipv4`, protocol `dualproto` or
+        `tcp`) instead of excluded, every provider carries its
+        `capabilities`, and the answer echoes the selectors it applied. A
+        request without `select` gets exactly the answer it got before the
+        field.
       operationId: networkFindProviders2
       security: []
       requestBody:
@@ -15029,6 +15035,77 @@ components:
             A target whose admitted providers the request's own exclusions
             removed is not widened.
           type: boolean
+        select:
+          description: |
+            Selector mode. Absent or null is legacy mode: exactly the answer
+            of a request before the field, with the hard udp gate and no
+            capability labels. Present, the request is filled in the decided
+            order: the window's ipv6 need from `dualstack` providers, then
+            the requested protocol's providers, then, for a `dualproto`
+            request whose held clients and eligible candidates do not reach
+            `target_count`, `tcp` providers as overflow. A `tcp` request
+            never receives a `dualproto` provider.
+          $ref: "#/components/schemas/FindProvidersSelect"
+
+    FindProvidersSelect:
+      description: |
+        The selectors of a selector-mode request, and, echoed in the answer,
+        the selectors the server applied with its defaults filled in.
+      type: object
+      required: []
+      properties:
+        ip:
+          description: the ip axis to fill the window's ipv6 need from
+          type: string
+          enum: [dualstack, ipv4]
+          default: dualstack
+        protocol:
+          description: the protocol axis the window is filled from
+          type: string
+          enum: [dualproto, tcp]
+          default: dualproto
+        target_count:
+          description: |
+            The window's target count, for the protocol axis. Defaults to
+            `count`, or 1 when `count` is below 1. At least 1.
+          type: integer
+          minimum: 1
+        held_count:
+          description: |
+            The window clients the caller already holds whose protocol label
+            is the requested one; they count toward `target_count`.
+          type: integer
+          minimum: 0
+          default: 0
+        dualstack_target_count:
+          description: |
+            The window's ipv6 minimum. Defaults to 1 when `ip` is
+            `dualstack`, and is treated as 0 when `ip` is `ipv4`.
+          type: integer
+          minimum: 0
+        held_dualstack_count:
+          description: The window clients the caller already holds that are labelled `dualstack`.
+          type: integer
+          minimum: 0
+          default: 0
+
+    ProviderCapabilities:
+      description: |
+        A provider's labels on the two capability axes: its advertised
+        capabilities less each one the quality probe's evidence took away.
+        `ipv4` is a provider whose ipv6 failed or was never proven; `tcp` is
+        a provider whose udp (http/3) failed.
+      type: object
+      required:
+        - ip
+        - protocol
+      properties:
+        ip:
+          type: string
+          enum: [dualstack, ipv4]
+        protocol:
+          type: string
+          enum: [dualproto, tcp]
 
     LocationCoordinates:
       description: |
@@ -15158,6 +15235,27 @@ components:
                   `client_id`, and with `strict`.
                 type: string
                 enum: [region, country]
+              capabilities:
+                description: |
+                  The provider's capability labels. Selector mode only, on
+                  every provider, providers named by `client_id` included.
+                $ref: "#/components/schemas/ProviderCapabilities"
+              overflow_step:
+                description: |
+                  1 for a `tcp` provider given to a `dualproto` request that
+                  its requested protocol could not fill; its `tier` carries
+                  three times the borrowing offset (33 by default) so it ranks
+                  after every provider of the requested protocol. Selector
+                  mode only; absent otherwise.
+                type: integer
+                minimum: 1
+                maximum: 1
+        select:
+          description: |
+            Selector mode only: the selectors the server applied, defaults
+            filled in. Absent in legacy mode and from a server that predates
+            selector mode, which is how a client tells the two apart.
+          $ref: "#/components/schemas/FindProvidersSelect"
         window_strict_handover:
           description: |
             The platform's override of the clients' strict window handover:
