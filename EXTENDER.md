@@ -4316,8 +4316,10 @@ off by default, the router's ports in every ipv4 post and ipv4 mesh address
 and the bound ones over ipv6, nothing asked with a public address, the mappings
 removed when the setting turns off and when the role stops, a moved mapping
 posted at once, the space's stored setting read by a device that starts
-later); the operator's storage, record, probes and measurement rule
-(server `extender_address_ports_test.go`); the miner's default, the
+later); the operator's record and measurement rule
+(server `controller/extender_address_ports_test.go`, with an activation of
+each family keeping its ports) and its storage, readers and probe targets
+(`model/network_extender_address_ports_test.go`); the miner's default, the
 environment, the flag and the status lines (`sn/miner/port_mapping_test.go`).
 
 ### I. Tests
