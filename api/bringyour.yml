@@ -11057,19 +11057,23 @@ paths:
       description: |
         Edge login's authorization request: a published name's own front
         sends a visitor here with `client_id` its own origin
-        (`https://<host>.<net>.<root>`), `redirect_uri` exactly that
+        (`https://<host>.<net>.<root>`, with `:<port>` for an endpoint on
+        8443, 8883 or 5671 and never `:443`), `redirect_uri` exactly that
         origin's `/.well-known/ur/callback`, `scope=openid`, a `nonce`,
         `state` and a PKCE S256 challenge. The answer is a 302 to the
         advertised `authorization_endpoint`, the consent page where the
         signed-in session lives, with the query unchanged.
 
-        An origin is a client only while its network publishes its host to
-        the network's members by an active grant; then only a member of that
-        network may sign in, and the code redeems at `/oauth/token` for an ID
-        token alone, `{iss, aud = origin, network_id, nonce, exp = 60 s, sub
-        = member_id}`, signed by the keys `/.well-known/ur/id-jwks.json`
-        lists. Any other origin, any other `redirect_uri`, and an origin
-        whose grant has ended are refused.
+        An origin is a client only while its network publishes its host on
+        that port to the network's members by an active grant; then only a
+        member of that network may sign in, and the code redeems at
+        `/oauth/token` for an ID token alone, `{iss, aud = origin, network_id,
+        nonce, exp = 60 s, sub = member_id}`, signed by the keys
+        `/.well-known/ur/id-jwks.json` lists. Each port's endpoint is an
+        origin of its own, so a code or a token of one counts for nothing on
+        another. Any other origin, any other port, `:443` written out, any
+        other `redirect_uri`, and an origin whose grant has ended are
+        refused.
       operationId: oauthAuthorizeRedirect
       security: []
       responses:
