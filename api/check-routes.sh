@@ -12,13 +12,20 @@
 # does not. A streaming route (one whose request body the server reads at the
 # client's pace) is a route like any other here.
 #
-# The /competition/* routes are the one exception. This api process serves
-# them, but they are a separate security domain with their own document,
-# sn/api/competition.yml, so bringyour.yml must NOT list them: a competition
-# path found there is drift. They are checked against that document instead,
-# looked up at <server>/../sn/api/competition.yml; when it is not reachable
-# that half of the check is skipped with a note rather than failed, so the
-# script still works in a checkout without the sn repo beside the server.
+# Two groups of routes are documented elsewhere, and bringyour.yml must NOT
+# list them: a path of theirs found there is drift. Each is checked against
+# its own document instead, looked up beside the server checkout; when that
+# document is not reachable its half of the check is skipped with a note
+# rather than failed, so the script still works in a checkout without the sn
+# repo beside the server.
+#
+#   - /competition/* is a separate security domain this api process serves:
+#     <server>/../sn/api/competition.yml.
+#   - /sn/ctf, /sn/ctf/* and /sn/openapi.yml are the operator's public SN
+#     routes: <server>/../sn/api/operator.yml, which the server serves at
+#     GET /sn/openapi.yml. That document also lists GET /sn/ledger/account,
+#     which bringyour.yml lists too; every operation it lists must be a
+#     registered route.
 #
 # Deliberately dependency-free: zsh, grep, sed, sort, comm. No yaml parser and
 # no go toolchain, so it runs in a bare checkout and in CI.
@@ -60,6 +67,10 @@ if [[ ! -f $spec ]]; then
 fi
 
 competition_spec=${server_dir:A:h}/sn/api/competition.yml
+operator_spec=${server_dir:A:h}/sn/api/operator.yml
+
+# the "METHOD /path" lines sn/api/operator.yml alone documents
+operator_owned='^[A-Z]+ /sn/(ctf(/.*)?|openapi[.]yml)$'
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -94,13 +105,15 @@ grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
     | sed -e 's/\\\\\./\./g' -e 's/(\[^\/\]+)/*/g' \
     | sort -u > $work/routes.all
 
-grep -v ' /competition/' $work/routes.all > $work/routes
+grep -v ' /competition/' $work/routes.all | grep -Ev "$operator_owned" > $work/routes
 grep ' /competition/' $work/routes.all > $work/routes.competition
+grep -E "$operator_owned" $work/routes.all > $work/routes.operator
 
 # --- the specs -------------------------------------------------------------
 spec_paths $spec > $work/spec.all
-grep -v ' /competition/' $work/spec.all > $work/spec
+grep -v ' /competition/' $work/spec.all | grep -Ev "$operator_owned" > $work/spec
 grep ' /competition/' $work/spec.all > $work/spec.competition
+grep -E "$operator_owned" $work/spec.all > $work/spec.operator_listed
 
 drifted=0
 
@@ -122,6 +135,11 @@ missing_from_server=$(comm -13 $work/routes $work/spec)
 listed_competition=$(cat $work/spec.competition)
 [[ -n $listed_competition ]] && \
     report "in bringyour.yml but belongs in sn/api/competition.yml" "$listed_competition"
+
+# likewise the routes sn/api/operator.yml owns
+listed_operator=$(cat $work/spec.operator_listed)
+[[ -n $listed_operator ]] && \
+    report "in bringyour.yml but belongs in sn/api/operator.yml" "$listed_operator"
 
 # --- sn/api/competition.yml ------------------------------------------------
 route_count=$(grep -c . $work/routes)
@@ -145,10 +163,33 @@ else
     competition_summary="$competition_route_count competition routes NOT CHECKED (no $competition_spec)"
 fi
 
-if (( drifted == 0 )); then
-    print "ok: $route_count registered routes, $spec_count documented operations; $competition_summary; no drift"
+# --- sn/api/operator.yml ---------------------------------------------------
+operator_route_count=$(grep -c . $work/routes.operator)
+
+if [[ -f $operator_spec ]]; then
+    spec_paths $operator_spec > $work/spec.operator.all
+    grep -E "$operator_owned" $work/spec.operator.all > $work/spec.operator
+    operator_spec_count=$(grep -c . $work/spec.operator.all)
+
+    operator_missing=$(comm -23 $work/routes.operator $work/spec.operator)
+    # every operation the document lists, its own and the shared ledger
+    # route alike, is served
+    operator_extra=$(comm -13 $work/routes.all $work/spec.operator.all)
+
+    [[ -n $operator_missing ]] && \
+        report "registered but NOT in sn/api/operator.yml" "$operator_missing"
+    [[ -n $operator_extra ]] && \
+        report "in sn/api/operator.yml but NOT registered" "$operator_extra"
+
+    operator_summary="$operator_route_count operator routes, $operator_spec_count operations documented in sn/api/operator.yml"
 else
-    print -u2 "drift: $route_count registered routes, $spec_count documented operations; $competition_summary"
+    operator_summary="$operator_route_count operator routes NOT CHECKED (no $operator_spec)"
+fi
+
+if (( drifted == 0 )); then
+    print "ok: $route_count registered routes, $spec_count documented operations; $competition_summary; $operator_summary; no drift"
+else
+    print -u2 "drift: $route_count registered routes, $spec_count documented operations; $competition_summary; $operator_summary"
 fi
 
 exit $drifted
