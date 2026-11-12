@@ -17713,14 +17713,14 @@ func (self *ReceiveSequence) Run() {
 			retryNotBefore = time.Now().Add(max(time.Millisecond, self.receiveBufferSettings.AckCompressTimeout))
 			return true
 		}
-		writePending := func() bool {
+		writePending := func(keepBurstCredit bool) bool {
 			var evicted []uint64
 			if self.receiveBufferSettings.EvictionNotice && (hasLastAck || self.ackWindow.Pending()) {
 				evicted = self.takeEvictions()
 			}
 			countLimit := min(ackResponseMaxCount,
 				(ackResponseMaxByteCount-10*len(evicted))/ackResponseEntryMaxByteCount)
-			acks, overflow := self.ackWindow.takeResponse(ackScratch[:0], countLimit)
+			acks, overflow := self.ackWindow.takeResponseKeepingBurstCredit(ackScratch[:0], countLimit, keepBurstCredit)
 			// SACK overflow belongs to this compression turn. Metadata alone
 			// needs another ACK carrier, so pace it at the next deadline rather
 			// than repeating a cumulative head in an immediate burst.
@@ -17774,7 +17774,7 @@ func (self *ReceiveSequence) Run() {
 		}
 		drainAndStop := func() {
 			stopping = true
-			for writePending() {
+			for writePending(false) {
 			}
 		}
 		// ctxDone is disabled after its first edge. Cancellation may drain the
@@ -17784,7 +17784,7 @@ func (self *ReceiveSequence) Run() {
 		ctxDone := self.ctx.Done()
 		drainCanceledSequence := func() {
 			ctxDone = nil
-			writePending()
+			writePending(false)
 		}
 
 		for {
@@ -17836,6 +17836,7 @@ func (self *ReceiveSequence) Run() {
 			}
 
 			headOnly := false
+			keepBurstCredit := false
 			if 0 < ackCompressWait {
 				// A quiet tenth of the configured interval allows at most
 				// ten extra head turns per interval. The byte quantum bounds
@@ -17850,6 +17851,7 @@ func (self *ReceiveSequence) Run() {
 				for {
 					now := time.Now()
 					if !now.Before(compressDeadline) {
+						keepBurstCredit = true
 						break
 					}
 					ack, ready, quietDeadline := self.ackWindow.takeQuietHead(now, quiet)
@@ -17893,7 +17895,7 @@ func (self *ReceiveSequence) Run() {
 				continue
 			}
 
-			writePending()
+			writePending(keepBurstCredit)
 		}
 	}, self.cancel)
 
