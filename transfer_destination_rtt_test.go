@@ -238,6 +238,9 @@ func TestRttEstimateCarriesItsMinimum(t *testing.T) {
 	if empty.Min != 0 || empty.Mean != 0 {
 		t.Errorf("an untouched window reports mean %s and minimum %s", empty.Mean, empty.Min)
 	}
+	if !empty.MinSampleAt.IsZero() {
+		t.Errorf("an untouched window reports a minimum sample time %s", empty.MinSampleAt)
+	}
 
 	// a backlog's shape: one fast sample and a rising series behind it, which
 	// is what a serial delay element produces
@@ -274,6 +277,9 @@ func TestRttEstimateCarriesItsMinimum(t *testing.T) {
 			samples[0],
 			estimate.Mean,
 		)
+	}
+	if !estimate.MinSampleAt.Equal(sampleTime) {
+		t.Errorf("the estimate's minimum sample time is %s, want ACK arrival %s", estimate.MinSampleAt, sampleTime)
 	}
 	wantMean := meanTotal / time.Duration(len(samples))
 	if estimate.Mean < wantMean || wantMean+truncation < estimate.Mean {

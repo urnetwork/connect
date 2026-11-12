@@ -97,16 +97,20 @@ type pathLatencyState struct {
 }
 
 func (self *Client) pathLatency(destination Id) *pathLatencyState {
+	return self.pathLatencyStateFor(destination, true)
+}
+
+func (self *Client) pathLatencyStateFor(destination Id, create bool) *pathLatencyState {
 	if self == nil {
 		return nil
 	}
 	self.pathLatencyLock.Lock()
 	defer self.pathLatencyLock.Unlock()
-	if self.pathLatencies == nil {
+	if self.pathLatencies == nil && create {
 		self.pathLatencies = map[Id]*pathLatencyState{}
 	}
 	state, ok := self.pathLatencies[destination]
-	if !ok {
+	if !ok && create {
 		state = &pathLatencyState{}
 		self.pathLatencies[destination] = state
 	}
@@ -123,18 +127,29 @@ func (self *SendSequence) windowLatencyBudget() time.Duration {
 // Records this sequence's current minimum and returns the path's, or zero
 // when the bound is off or there is no sample yet.
 func (self *SendSequence) observePathRoundTrip(sample time.Duration, now time.Time) time.Duration {
+	return self.observePathRoundTripAt(sample, now, now, true)
+}
+
+// Polling an estimator must not relabel an old minimum as a fresh ACK.
+// Statistics read existing evidence without admitting a sample at all.
+func (self *SendSequence) observePathRoundTripAt(sample time.Duration, sampledAt, now time.Time, observe bool) time.Duration {
 	if self.windowLatencyBudget() <= 0 {
 		return 0
 	}
-	state := self.client.pathLatency(self.destination)
+	state := self.client.pathLatencyStateFor(self.destination, observe)
 	if state == nil {
 		return 0
 	}
 	state.stateLock.Lock()
 	defer state.stateLock.Unlock()
-	minimum := state.roundTrip.observe(sample, now)
-	if 0 < sample && float64(sample) <= float64(minimum)*pathRoundTripNearMinimum {
-		state.nearMinimumAt = now
+	fresh := observe && sample > 0 && !sampledAt.IsZero() && !sampledAt.After(now) &&
+		now.Unix()-sampledAt.Unix() < int64(pathRoundTripMinimumBucketCount)
+	if fresh {
+		state.roundTrip.observe(sample, sampledAt)
+	}
+	minimum := state.roundTrip.observe(0, now)
+	if fresh && float64(sample) <= float64(minimum)*pathRoundTripNearMinimum && state.nearMinimumAt.Before(sampledAt) {
+		state.nearMinimumAt = sampledAt
 	}
 	return minimum
 }
@@ -143,33 +158,46 @@ func (self *SendSequence) observePathRoundTrip(sample time.Duration, now time.Ti
 // its path round trip plus the latency budget, never below the floor, and
 // drains it to the floor while the path is being measured again.
 func (self *SendSequence) boundWindowByLatency(estimate SendWindowEstimate, now time.Time) SendWindowEstimate {
+	return self.boundWindowByLatencyWithObservation(estimate, now, true)
+}
+
+func (self *SendSequence) boundWindowByLatencyWithObservation(estimate SendWindowEstimate, now time.Time, observe bool) SendWindowEstimate {
 	budget := self.windowLatencyBudget()
 	if budget <= 0 {
 		return estimate
 	}
-	state := self.client.pathLatency(self.destination)
+	state := self.client.pathLatencyStateFor(self.destination, observe)
 	if state == nil {
 		return estimate
 	}
 	state.stateLock.Lock()
-	if 0 < estimate.DeliveryByteRate {
-		state.deliveryByteRate = estimate.DeliveryByteRate
-		state.deliveryObservedAt = now
-	}
 	deliveryByteRate := state.deliveryByteRate
 	deliveryFresh := now.Sub(state.deliveryObservedAt) <= pathDeliveryRateLifetime
+	if 0 < estimate.DeliveryByteRate {
+		deliveryByteRate, deliveryFresh = estimate.DeliveryByteRate, true
+		if observe {
+			state.deliveryByteRate = estimate.DeliveryByteRate
+			state.deliveryObservedAt = now
+		}
+	}
 	roundTrip := state.roundTrip.observe(0, now)
 	probing := false
 	if 0 < roundTrip && deliveryFresh && 0 < deliveryByteRate {
-		if state.nearMinimumAt.IsZero() {
-			state.nearMinimumAt = now
+		nearMinimumAt := state.nearMinimumAt
+		if nearMinimumAt.IsZero() {
+			nearMinimumAt = now
+			if observe {
+				state.nearMinimumAt = now
+			}
 		}
 		if now.Before(state.probeUntil) {
 			probing = true
-		} else if pathRoundTripProbeInterval <= now.Sub(state.nearMinimumAt) {
-			state.probeUntil = now.Add(max(pathRoundTripProbeDuration, 2*roundTrip))
-			// the drain is the attempt; another waits a full interval
-			state.nearMinimumAt = now
+		} else if pathRoundTripProbeInterval <= now.Sub(nearMinimumAt) {
+			if observe {
+				state.probeUntil = now.Add(max(pathRoundTripProbeDuration, 2*roundTrip))
+				// the drain is the attempt; another waits a full interval
+				state.nearMinimumAt = now
+			}
 			probing = true
 		}
 	}
