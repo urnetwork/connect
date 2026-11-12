@@ -12648,6 +12648,53 @@ paths:
         "503":
           description: The store's outcome is unknown or the log is unavailable; retry the same bytes.
 
+  /network/config/reseed:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Upload the authorization log a device keeps, after a site loss
+      description: |
+        While a restore runs (the server's `reseed` setting), a member device
+        that is not read_only uploads what it keeps of the network's
+        authorization log: the Signed Genesis, its entries verbatim and in
+        position order, the rows of their bases, or a phone's `(n, chain)`
+        pins. The server checks each upload's links, signatures and signer
+        rules, and adopts positions in order only where devices of two members
+        agree on them, by bytes or pin, or one member's where the network has
+        one: a position they do not agree on stops the log before it, and the
+        answer says where. The run is never re-sequenced. A config writer's
+        device that has re-seeded the config repo adds `config_pushes`, every
+        version from 1 to the re-seeded head: the adopted run is written back
+        at its own positions only if its newest base's config head lies on
+        that walk, else it is discarded. The log then resumes at `tip + 1`.
+        Outside a restore the route answers 403.
+      operationId: networkConfigReseed
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkConfigReseedArgs"
+      responses:
+        "200":
+          description: The run adopted so far, where it stops, and whether it is written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigReseedResult"
+        "400":
+          description: An upload past its bounds.
+        "403":
+          description: Outside a restore, from a client no sidecar binds, a run that disagrees with the restored head, or a re-seeded head off the adopted run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigRefusal"
+        "503":
+          description: The store or the restored head cannot be read.
+
   /network/config/delta:
     post:
       x-internal: true
@@ -12698,32 +12745,6 @@ paths:
             `config_admissions` limit, with a `QuotaRefusal` body.
         "503":
           description: The store's outcome is unknown or the log is unavailable; retry the same bytes.
-
-  /network/config/reseed:
-    post:
-      x-internal: true
-      x-status: planned
-      tags: [Network]
-      summary: Upload the authorization log after a site loss
-      description: |
-        After a site loss, member devices other than read-only ones upload the
-        entries they keep verbatim, the rows of their bases, and their pins. Served
-        only while the deployment's re-seed mode is on. The log comes back from
-        devices and is never re-sequenced: an entry is adopted only once devices of
-        two members hold it.
-      operationId: networkConfigReseed
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        "200":
-          description: Taken. Adoption follows from the devices' agreement.
 
   /acl/ack:
     post:
@@ -28747,6 +28768,47 @@ components:
           properties:
             message:
               type: string
+    NetworkConfigReseedArgs:
+      type: object
+      properties:
+        genesis:
+          description: The Signed Genesis, verbatim, base64.
+          type: string
+          format: byte
+        entries:
+          description: The entries the device keeps, each AuthEntry verbatim, base64, in position order.
+          type: array
+          items:
+            type: string
+            format: byte
+        rows:
+          description: The rows of each base among the entries, verbatim, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+        pins:
+          description: A phone's pins, for positions it keeps no bytes of.
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkConfigPinResult"
+        config_pushes:
+          description: A config writer's re-seeded config head's Signed EvsPush of every version from 1, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+    NetworkConfigReseedResult:
+      type: object
+      properties:
+        tip:
+          $ref: "#/components/schemas/NetworkConfigPinResult"
+        stopped_at:
+          description: The position the log stops before, as no two members' devices agree on it.
+          type: integer
+        written:
+          description: The adopted run is written back, and the log resumes at its tip plus one.
+          type: boolean
     NetworkMembersResult:
       type: object
       required:
