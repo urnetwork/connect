@@ -70,6 +70,7 @@ const (
 	windowStatsIpCount
 )
 
+// The label value an exporter publishes: the wire label.
 func (self windowStatsIp) String() string {
 	switch self {
 	case windowStatsIpDualstack:
@@ -88,6 +89,7 @@ const (
 	windowStatsProtocolCount
 )
 
+// The label value an exporter publishes: the wire label.
 func (self windowStatsProtocol) String() string {
 	switch self {
 	case windowStatsProtocolDualproto:
@@ -123,6 +125,7 @@ const (
 	windowStatsIpVersionCount
 )
 
+// The label value an exporter publishes.
 func (self windowStatsIpVersion) String() string {
 	switch self {
 	case windowStatsIpVersion6:
@@ -142,6 +145,7 @@ const (
 	windowStatsFlowProtocolCount
 )
 
+// The label value an exporter publishes.
 func (self windowStatsFlowProtocol) String() string {
 	switch self {
 	case windowStatsFlowProtocolUdp:
@@ -468,7 +472,8 @@ type WindowClientStats struct {
 	// the live windows' clients by their labels, as each window's last
 	// resize pass counted them (server FP2-PROTOCOL.md §8.2)
 	clients [windowStatsWindowCount][windowStatsIpCount][windowStatsProtocolCount]atomic.Int64
-	// flows by the window of their first exit, their ip version and protocol
+	// bound flows, counted once by the window of their first exit, their ip
+	// version and protocol
 	flows [windowStatsWindowCount][windowStatsIpVersionCount][windowStatsFlowProtocolCount]atomic.Uint64
 	// flows answered with an unreachable because no window held an exit
 	// labelled to carry them

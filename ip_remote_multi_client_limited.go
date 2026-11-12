@@ -192,6 +192,7 @@ func (self *multiClientWindow) publishSizing(sizing windowSizing) {
 	}
 }
 
+// The sizing this window last published, for the limited window's sizing.
 func (self *multiClientWindow) publishedSizingSnapshot() windowSizing {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

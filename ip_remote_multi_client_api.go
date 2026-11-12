@@ -825,8 +825,8 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 	return destinations, err
 }
 
-// nextDestinationsContext is the discovery body shared by the plain, the
-// family-filtered and the selector-mode entry points. The filter rides
+// The discovery body shared by the plain, the family-filtered and the
+// selector-mode entry points. The filter rides
 // straight into find-providers2; the server treats the empty filter as
 // v4-capable. A non-nil providerSelect puts the request in selector mode, and
 // selectorMode reports whether the answer echoed it; fixed and restored
@@ -1012,6 +1012,7 @@ const (
 	providerSelectorModeLegacy  int32 = 2
 )
 
+// Records one answer to a request that carried `select`: echoed or not.
 func (self *providerSelectorMode) observe(selectorMode bool) {
 	if selectorMode {
 		self.value.Store(providerSelectorModeEchoed)
@@ -1020,6 +1021,8 @@ func (self *providerSelectorMode) observe(selectorMode bool) {
 	}
 }
 
+// The last recorded answer's mode; known is false until an answer is
+// recorded.
 func (self *providerSelectorMode) get() (selectorMode bool, known bool) {
 	switch self.value.Load() {
 	case providerSelectorModeEchoed:

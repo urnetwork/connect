@@ -422,6 +422,12 @@ func (self *multiClientChannelUpdate) observeDiscoveryAttempt(candidates []*mult
 	return discoveryAttemptObservation{stamp: self.discoveryAttemptStamp.Load()}, true
 }
 
+// Records one pending listing for a flow the window cannot place, while the
+// window is below its demand target: the offered exits that can carry the
+// flow have all failed it or outlived the inferred dial-failure timeout, or a
+// paid service-refresh reservation reasserts it. need narrows those exits to
+// the ones whose labels carry the flow and picks the family the listing asks
+// for. Only the enumerator makes the request.
 func (self *multiClientWindow) requestDiscoveryDemand(update *multiClientChannelUpdate, need flowNeed, source *IpPath, failed *multiClientChannel) {
 	if self.settings == nil || self.settings.DiscoveryDemandListingsPerPass <= 0 || !self.cooperativeDiscoveryDemand() {
 		return

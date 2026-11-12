@@ -16575,9 +16575,9 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 	return self.lastResortClientsForFlow(flowNeed{})
 }
 
-// lastResortClientsForFlow is lastResortClients narrowed to the exits whose
-// labels carry the flow -- a benched exit that cannot carry v6, or udp, is no
-// exit at all for such a flow. The zero need is any.
+// The last-resort offer narrowed to the exits whose labels carry the flow --
+// a benched exit that cannot carry v6, or udp, is no exit at all for such a
+// flow. The zero need is any.
 //
 // A sticky window (the user's Fixed IP) can hold two live exits at once, the
 // warned exit and its replacement. Racing both would let each new flow leave
@@ -16681,9 +16681,8 @@ func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
 	return self.orderedClients(false, flowNeed{})
 }
 
-// OrderedClientsForFlow is OrderedClients narrowed to the exits whose labels
-// can carry the flow (IPV6.md B3, server FP2-PROTOCOL.md §7.2). The zero need
-// is any.
+// The race offer narrowed to the exits whose labels can carry the flow
+// (IPV6.md B3, server FP2-PROTOCOL.md §7.2). The zero need is any.
 func (self *multiClientWindow) OrderedClientsForFlow(need flowNeed) []*multiClientChannel {
 	return self.orderedClients(false, need)
 }
@@ -16695,8 +16694,8 @@ func (self *multiClientWindow) orderedClientsCrossTier() []*multiClientChannel {
 	return self.orderedClients(true, flowNeed{})
 }
 
-// orderedClientsCrossTierForFlow is orderedClientsCrossTier narrowed to the
-// exits whose labels can carry the flow. The zero need is any.
+// The cross-tier offer narrowed to the exits whose labels can carry the
+// flow. The zero need is any.
 func (self *multiClientWindow) orderedClientsCrossTierForFlow(need flowNeed) []*multiClientChannel {
 	return self.orderedClients(true, need)
 }

@@ -84,9 +84,8 @@ func (self *multiClientChannel) windowType() WindowType {
 	return self.args.windowType
 }
 
-// supportsFlow is the placement predicate (server FP2-PROTOCOL.md §7.2):
-// whether this exit's labels can carry a flow of the ip version and
-// protocol. ipv6 needs an ipv6-capable category, udp needs dualproto, and tcp
+// The placement predicate (server FP2-PROTOCOL.md §7.2): whether this exit's
+// labels can carry a flow of the ip version and protocol. ipv6 needs an ipv6-capable category, udp needs dualproto, and tcp
 // and icmp follow every label. A zero version or an unknown protocol needs
 // nothing, for callers that gather exits without a flow in hand. A
 // fixed-destination exit carries every flow: it is the user's choice, with no
@@ -294,23 +293,22 @@ func (self *multiClientWindow) noteIpv6CandidateAdmitted() {
 	self.ipv6FillFailures = 0
 }
 
-// ipv6Available reports whether this window holds an added, unwarned exit
-// labelled to carry v6 (B6). Read live from the client set rather than from
-// the last resize snapshot, so the flag follows an admission without waiting
-// for the next pass.
+// Whether this window holds an added, unwarned exit labelled to carry v6
+// (B6). Read live from the client set rather than from the last resize
+// snapshot, so the flag follows an admission without waiting for the next
+// pass.
 func (self *multiClientWindow) ipv6Available() bool {
 	return self.flowAvailable(flowNeed{ipVersion: 6})
 }
 
-// udpAvailable reports whether this window holds an added, unwarned exit
-// labelled dualproto (server FP2-PROTOCOL.md §7.7), read live like
-// ipv6Available.
+// Whether this window holds an added, unwarned exit labelled dualproto
+// (server FP2-PROTOCOL.md §7.7), read live like ipv6Available.
 func (self *multiClientWindow) udpAvailable() bool {
 	return self.flowAvailable(flowNeed{ipProtocol: IpProtocolUdp})
 }
 
-// flowAvailable reports whether this window holds an added, unwarned exit
-// whose labels carry the flow.
+// Whether this window holds an added, unwarned exit whose labels carry the
+// flow.
 func (self *multiClientWindow) flowAvailable(need flowNeed) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -594,10 +592,9 @@ func collapseFamilyOrder(a *multiClientChannel, b *multiClientChannel) int {
 
 // --- parent ---
 
-// Ipv6Available reports whether any window, the limited one included, holds
-// an added, unwarned exit labelled to carry v6 (B6): a limited exit labelled
-// dualstack carries tcp over v6. This is the raw flag the window status
-// carries.
+// Whether any window, the limited one included, holds an added, unwarned exit
+// labelled to carry v6 (B6): a limited exit labelled dualstack carries tcp
+// over v6. This is the raw flag the window status carries.
 func (self *RemoteUserNatMultiClient) Ipv6Available() bool {
 	for _, window := range self.windows {
 		if window.ipv6Available() {
@@ -607,9 +604,9 @@ func (self *RemoteUserNatMultiClient) Ipv6Available() bool {
 	return false
 }
 
-// UdpAvailable reports whether any window holds an added, unwarned exit
-// labelled dualproto (server FP2-PROTOCOL.md §7.7). The limited window's exits
-// are tcp, so only the normal windows can make it true.
+// Whether any window holds an added, unwarned exit labelled dualproto (server
+// FP2-PROTOCOL.md §7.7). The limited window's exits are tcp, so only the
+// normal windows can make it true.
 func (self *RemoteUserNatMultiClient) UdpAvailable() bool {
 	for _, window := range self.windows {
 		if window.udpAvailable() {
@@ -642,14 +639,14 @@ func (self *RemoteUserNatMultiClient) Ipv6Unroutable() bool {
 	return self.windowsFormed() && !self.Ipv6Available()
 }
 
-// UdpUnroutable mirrors Ipv6Unroutable for udp (server FP2-PROTOCOL.md §7.7):
-// the windows have formed and no window holds an exit labelled dualproto.
+// The udp mirror of Ipv6Unroutable (server FP2-PROTOCOL.md §7.7): the windows
+// have formed and no window holds an exit labelled dualproto.
 func (self *RemoteUserNatMultiClient) UdpUnroutable() bool {
 	return self.windowsFormed() && !self.UdpAvailable()
 }
 
-// flowUnroutable reports whether a flow can be answered as having no route,
-// judged on the windows the flow may use: its selected windows have formed
+// Whether a flow can be answered as having no route, judged on the windows
+// the flow may use: its selected windows have formed
 // (one holds an added, unwarned exit), and neither they nor the limited
 // window hold one whose labels carry it. A profile's inactive window is never
 // selected, so its exits do not count. A udp flow over v6 needs an exit
@@ -705,9 +702,9 @@ func (self *RemoteUserNatMultiClient) Ipv6NoRouteCount() uint64 {
 	return self.ipv6NoRouteCount.Load()
 }
 
-// replyUdpNoRoute answers a udp flow that no window holds an exit labelled to
-// carry with an icmp port unreachable as if from the destination (server
-// FP2-PROTOCOL.md §7.7), so a quic stack falls back to tcp at once instead of
+// Answers a udp flow that no window holds an exit labelled to carry with an
+// icmp port unreachable as if from the destination (server FP2-PROTOCOL.md
+// §7.7), so a quic stack falls back to tcp at once instead of
 // waiting out its handshake timeout. Delivered like replyIpv6NoRoute. Returns
 // whether a reply went out.
 func (self *RemoteUserNatMultiClient) replyUdpNoRoute(ipPath *IpPath) bool {
@@ -727,14 +724,14 @@ func (self *RemoteUserNatMultiClient) replyUdpNoRoute(ipPath *IpPath) bool {
 	return true
 }
 
-// UdpNoRouteCount is how many udp flows were answered with port unreachable
-// because no window held an exit labelled to carry them, for diagnostics.
+// How many udp flows were answered with port unreachable because no window
+// held an exit labelled to carry them, for diagnostics.
 func (self *RemoteUserNatMultiClient) UdpNoRouteCount() uint64 {
 	return self.udpNoRouteCount.Load()
 }
 
-// candidatesForFlow narrows a candidate list to exits whose labels carry the
-// flow, preserving order. The zero need returns the list unchanged.
+// Narrows a candidate list to exits whose labels carry the flow, preserving
+// order. The zero need returns the list unchanged.
 func candidatesForFlow(clients []*multiClientChannel, need flowNeed) []*multiClientChannel {
 	if need == (flowNeed{}) {
 		return clients
