@@ -1022,19 +1022,29 @@ func TestUnboundFlowIsNotAdoptedByAnExitAtItsFlowCap(t *testing.T) {
 	}
 }
 
-// An exit downgraded to IPv4 only (B5, which a v6 attempt's own strikes can
-// trigger) does not adopt an unbound IPv6 flow, as it is no longer raced for
-// one; a dual-stack exit does.
-func TestUnboundIpv6FlowIsNotAdoptedByAnExitDowngradedToIpv4(t *testing.T) {
-	for _, downgraded := range []bool{false, true} {
+// An exit the server labels ipv4 does not adopt an unbound IPv6 flow, as it
+// is not raced for one; an exit labelled dualstack does. The server's label
+// is the only source of an exit's family (server FP2-PROTOCOL.md D11.8
+// retired the local downgrade this test once latched directly).
+func TestUnboundIpv6FlowIsNotAdoptedByAnExitLabelledIpv4(t *testing.T) {
+	for _, labelledIpv4 := range []bool{false, true} {
 		path := reraceFlow(6, 0, 51500)
 		path.SourceIp = net.ParseIP("2001:db8::2")
 		parent, exit, update, delivered := unboundFlowFixture(t, path)
-		exit.args = &multiClientChannelArgs{DestinationStats: DestinationStats{IpFamily: IpFamilyDualstack}}
-		exit.ipFamilyDowngraded.Store(downgraded)
+		capabilities := ProviderCapabilities{
+			Ip:       ProviderIpCapabilityDualstack,
+			Protocol: ProviderProtocolCapabilityDualproto,
+		}
+		if labelledIpv4 {
+			capabilities.Ip = ProviderIpCapabilityIpv4
+		}
+		exit.args = &multiClientChannelArgs{DestinationStats: DestinationStats{
+			IpFamily:     capabilities.IpFamily(),
+			Capabilities: capabilities,
+		}}
 		adopted := unboundFlowAnswer(t, parent, exit, delivered, reraceSynAck(path))
-		if adopted == downgraded || (update.client.Load() == exit) == downgraded {
-			t.Errorf("exit downgraded to IPv4 %t: adopted %t, want %t", downgraded, adopted, !downgraded)
+		if adopted == labelledIpv4 || (update.client.Load() == exit) == labelledIpv4 {
+			t.Errorf("exit labelled ipv4 %t: adopted %t, want %t", labelledIpv4, adopted, !labelledIpv4)
 		}
 	}
 }

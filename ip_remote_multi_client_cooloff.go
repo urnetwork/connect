@@ -308,10 +308,11 @@ func (self *multiClientWindow) cooloffRoundAsksThePool(probeOnly bool, demandRea
 	if probeOnly {
 		return false
 	}
-	if demandRead != nil && demandRead.ipVersion == 6 {
-		// listDiscoveryDemand filters by family only with this capability
+	if demandRead != nil && demandRead.need.ipVersion == 6 {
+		// listDiscoveryDemand filters by family only with these capabilities
 		_, familyAware := self.generator.(multiClientGeneratorFamilyDiscoveryContext)
-		return !familyAware
+		_, capabilityAware := self.generator.(MultiClientGeneratorWithCapabilities)
+		return !familyAware && !capabilityAware
 	}
 	return true
 }

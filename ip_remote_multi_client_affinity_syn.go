@@ -69,7 +69,7 @@ func (self *RemoteUserNatMultiClient) reuseAffinitySyn(
 	client.stateLock.Lock()
 	defer client.stateLock.Unlock()
 	if update.client.loadSelection() != selection || client.IsDone() || !client.healthy ||
-		client.warning || client.quarantined || client.endErr != nil || !client.supportsIpVersion(path.Version) {
+		client.warning || client.quarantined || client.endErr != nil || !client.supportsIpPath(path) {
 		return false
 	}
 	select {

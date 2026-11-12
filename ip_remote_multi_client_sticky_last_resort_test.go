@@ -57,7 +57,7 @@ func TestStickyLastResortOffersOneStableExit(t *testing.T) {
 	}
 	var first *multiClientChannel
 	for i := 0; i < 64; i += 1 {
-		candidates := multiClient.raceCandidates(window, 4)
+		candidates := multiClient.raceCandidates(window, flowNeed{ipVersion: 4})
 		if len(candidates) != 1 {
 			t.Fatalf("sticky last-resort race = %d exits, want 1", len(candidates))
 		}
@@ -71,7 +71,7 @@ func TestStickyLastResortOffersOneStableExit(t *testing.T) {
 	// a window that is not Fixed IP still races the whole benched field
 	window = benchedWindow(unfixedTestProfile(WindowTypeQuality))
 	multiClient = newMultiClient(window)
-	if got := len(multiClient.raceCandidates(window, 4)); got != 2 {
+	if got := len(multiClient.raceCandidates(window, flowNeed{ipVersion: 4})); got != 2 {
 		t.Fatalf("unfixed last-resort race = %d exits, want 2", got)
 	}
 }

@@ -162,7 +162,7 @@ func testDiscoveryDemandMixedFamily(t *testing.T, latestVersion int) {
 		if _, first := v6.dialFailureStanding(f.client, true, true, true); !first {
 			t.Fatal("mixed-family control lacks an actual IPv6 refusal")
 		}
-		request6 := func() { f.window.requestDiscoveryDemand(v6, 6, v6.ipPath, nil) }
+		request6 := func() { f.window.requestDiscoveryDemand(v6, flowNeed{ipVersion: 6}, v6.ipPath, nil) }
 		if latestVersion == 6 {
 			f.request()
 			request6()
@@ -246,7 +246,7 @@ func (self *discoveryDemandTestBudgetFixture) start() {
 }
 
 func (self *discoveryDemandTestBudgetFixture) request() {
-	self.window.requestDiscoveryDemand(self.update, 4, self.update.ipPath, nil)
+	self.window.requestDiscoveryDemand(self.update, flowNeed{ipVersion: 4}, self.update.ipPath, nil)
 }
 
 func TestDiscoveryDemandCoalescesAndPacesActualReads(t *testing.T) {

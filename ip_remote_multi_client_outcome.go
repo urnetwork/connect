@@ -204,6 +204,9 @@ func deriveStallReason(counts [windowFailureClassCount]int) string {
 
 // windowName renders the window type for the [rel] grammar.
 func (self *multiClientWindow) windowName() string {
+	if self.windowType == WindowTypeLimited {
+		return "limited"
+	}
 	if name := self.windowType.RankMode(); name != "" {
 		return name
 	}

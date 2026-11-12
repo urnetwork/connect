@@ -165,7 +165,7 @@ func (self *RemoteUserNatMultiClient) adoptAffinityClientWithLock(
 	client.stateLock.Lock()
 	defer client.stateLock.Unlock()
 	if client.IsDone() || client.serviceRefreshReservation.Load() != nil || !client.healthy || client.endErr != nil || client.warning || client.quarantined ||
-		update.ipPath != nil && !client.supportsIpVersion(update.ipPath.Version) {
+		update.ipPath != nil && !client.supportsIpPath(update.ipPath) {
 		return false
 	}
 	select {

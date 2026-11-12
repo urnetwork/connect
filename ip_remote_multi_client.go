@@ -90,14 +90,28 @@ type DestinationStats struct {
 	// normalized; see location_match.go). Exact for fixed and restored
 	// destinations and for older servers.
 	LocationMatch LocationMatch
-	// IpFamily is the destination provider's proven address-family
-	// category from find-providers2. Legacy (empty) for fixed and restored
-	// destinations and for older servers; legacy carries v4 only.
+	// The destination provider's proven address-family category from
+	// find-providers2. Legacy (empty) for fixed and restored
+	// destinations and for older servers; legacy carries v4 only. In selector
+	// mode it is the provider's ip label (see addProviderDestinations), so
+	// every placement site reads the server's label through it.
 	IpFamily IpFamily
+	// The provider's labels from find-providers2 (server FP2-PROTOCOL.md
+	// §7.1): from the answer's `capabilities` when it echoed `select`, else
+	// from `ip_family` with dualproto. The zero value, for fixed and restored
+	// destinations and generators that predate the labels, carries udp. The
+	// ip label is mirrored into IpFamily; the protocol label decides udp.
+	Capabilities ProviderCapabilities
+	// 1 for a tcp provider the server gave a dualproto request as overflow;
+	// its Tier already carries the overflow offset. Diagnostics only.
+	OverflowStep int
 }
 
 type WindowType int
 
+// The find-providers2 rank mode of a normal window. The limited window has
+// none of its own: it asks with the performance profile's (see
+// limitedWindowRankMode), so its type reads "" here.
 func (self WindowType) RankMode() string {
 	switch self {
 	case WindowTypeQuality:
@@ -117,6 +131,12 @@ const (
 	WindowTypeAuto    WindowType = 0
 	WindowTypeQuality WindowType = 1
 	WindowTypeSpeed   WindowType = 2
+	// The limited window (server FP2-PROTOCOL.md §7.4): the tcp providers,
+	// asked for with ipv4 and tcp selectors. It is never a performance
+	// profile's window type. Its clients join the race of every flow they
+	// can carry (see coalesceOrderedClients), and it is sized from the normal
+	// windows (see limitedWindowSize).
+	WindowTypeLimited WindowType = 3
 )
 
 // for each `NewClientArgs`,
@@ -202,6 +222,49 @@ type MultiClientGeneratorWithPostQuantumEncryption interface {
 	SetPostQuantumEncryption(postQuantumEncryption bool)
 }
 
+// An optional generator capability: discover in find-providers2's selector
+// mode (server FP2-PROTOCOL.md §5, §7.4). Each request carries the asking
+// window's `select`, and the answer labels every provider
+// (`DestinationStats.Capabilities`, with the ip label in `IpFamily`). Each
+// call also reports whether the answer echoed `select`, which a server that
+// predates selector mode never does. A generator without the capability is
+// called as before; its destinations carry udp and their `ip_family`
+// category, and it gets no limited window clients.
+//
+// Like every discovery call, these narrow to modern providers while the
+// generator's post-quantum setting is on
+// (MultiClientGeneratorWithPostQuantumEncryption).
+type MultiClientGeneratorWithCapabilities interface {
+	NextDestinationsWithCapabilities(
+		count int,
+		excludeDestinations []MultiHopId,
+		rankMode string,
+		ipFamily IpFamilyFilter,
+		providerSelect FindProvidersSelect,
+	) (destinations map[MultiHopId]DestinationStats, selectorMode bool, err error)
+	// The cancellation-bounded form, for discovery demand reads.
+	NextDestinationsWithCapabilitiesContext(
+		ctx context.Context,
+		count int,
+		excludeDestinations []MultiHopId,
+		rankMode string,
+		ipFamily IpFamilyFilter,
+		providerSelect FindProvidersSelect,
+	) (destinations map[MultiHopId]DestinationStats, selectorMode bool, err error)
+	// One named provider, as MultiClientGeneratorWithClientId asks for it,
+	// answered with its labels.
+	NextDestinationsForClientIdWithCapabilities(
+		clientId Id,
+		excludeDestinations []MultiHopId,
+		rankMode string,
+		providerSelect FindProvidersSelect,
+	) (destinations map[MultiHopId]DestinationStats, selectorMode bool, err error)
+	// What the platform's latest answer to a request with `select` said:
+	// whether it echoed the selectors, and whether such an answer has come
+	// back yet.
+	SelectorMode() (selectorMode bool, known bool)
+}
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
 		// the queue depth of a default client's transfer buffers
@@ -245,7 +308,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		SendRetryTimeout: 2000 * time.Millisecond,
+		// half the largest normal window, at least one (server
+		// FP2-PROTOCOL.md D8): 3 limited clients beside a desktop quality
+		// window of 6
+		LimitedWindowSizeFraction: 0.5,
+		LimitedWindowSizeMax:      0,
+		SendRetryTimeout:          2000 * time.Millisecond,
 		// Fallback rescan for time-expiring filters; a newly published offer
 		// wakes the empty-window send immediately.
 		FormationPollTimeout:          200 * time.Millisecond,
@@ -620,6 +688,18 @@ type MultiClientSettings struct {
 	// Positive limits cap only default windows; explicit profiles and fixed
 	// destinations keep their caller-selected topology. Zero is unchanged.
 	WindowSizeLimit int
+	// Sizes the limited window (server FP2-PROTOCOL.md §7.4, D8): its target
+	// is max(1, floor(fraction x S)), S the largest current target among the
+	// active normal windows, and its hard max is max(1, floor(fraction x the
+	// largest active normal hard max)), unbounded when that is. Default 0.5.
+	// Non-positive or NaN: no limited window. A fixed destination and the
+	// user's Fixed IP never have one. RemoteUserNatMultiClient
+	// .SetLimitedWindowSizeFraction overrides it at runtime.
+	LimitedWindowSizeFraction float64
+	// Caps the limited window's target and hard max (D11.5: a mobile device
+	// whose memory gate fails holds one limited client). Non-positive: no cap
+	// beyond the fraction's. Default 0.
+	LimitedWindowSizeMax int
 	// StrictWindowSizeHardMax makes WindowSizeHardMax an admission ceiling as
 	// well as a resize target. When a flow-carrying warned client cannot yet be
 	// collapsed, a new identity is declined instead of temporarily growing the
@@ -1740,6 +1820,14 @@ func (self *PerformanceProfile) FixedWindow() (windowType WindowType, windowSize
 }
 
 func (self *PerformanceProfile) Validate() error {
+	// the limited window is sized from the normal windows and carries only
+	// the flows its labels allow, so it can never be the window a profile
+	// routes every flow to
+	switch self.WindowType {
+	case WindowTypeAuto, WindowTypeQuality, WindowTypeSpeed:
+	default:
+		return fmt.Errorf("Window type %d is not a performance profile window type", self.WindowType)
+	}
 	err := self.WindowSize.Validate()
 	if err != nil {
 		return err
@@ -1827,6 +1915,14 @@ type RemoteUserNatMultiClient struct {
 	// ipv6NoRouteCount counts v6 flows answered with no-route because no
 	// v6-capable exit existed (IPV6.md B6); see replyIpv6NoRoute.
 	ipv6NoRouteCount atomic.Uint64
+	// Counts udp flows answered with port unreachable because no window held
+	// an exit labelled to carry them (server FP2-PROTOCOL.md §7.7); see
+	// replyUdpNoRoute.
+	udpNoRouteCount atomic.Uint64
+	// The limited window's size fraction in force, as math.Float64bits:
+	// MultiClientSettings.LimitedWindowSizeFraction until
+	// SetLimitedWindowSizeFraction overrides it.
+	limitedWindowSizeFractionBits atomic.Uint64
 
 	// receivePacketCallback delivers to the app through an atomic holder so
 	// the owner can be swapped or retired at runtime: later deliveries
@@ -2182,6 +2278,9 @@ type RemoteUserNatMultiClient struct {
 type MultiClientMemorySnapshot struct {
 	QualityClientCount int
 	SpeedClientCount   int
+	// the limited window's clients (server FP2-PROTOCOL.md §7.10); their
+	// transfer counters are aggregated below with the other windows'
+	LimitedClientCount int
 	FlowCount          int
 
 	// Aggregate existing per-Client Transfer counters without installing a
@@ -2306,6 +2405,11 @@ func (self *RemoteUserNatMultiClient) MemorySnapshot() MultiClientMemorySnapshot
 		&snapshot,
 		self.windows[WindowTypeSpeed],
 		&snapshot.SpeedClientCount,
+	)
+	addMultiClientTransferMemorySnapshot(
+		&snapshot,
+		self.windows[WindowTypeLimited],
+		&snapshot.LimitedClientCount,
 	)
 	self.stateLock.Lock()
 	snapshot.FlowCount = len(self.flowUpdates)
@@ -2970,6 +3074,8 @@ func NewRemoteUserNatMultiClient(
 	}
 	// every count recorded through the counters wakes a parked event epoch
 	multiClient.packetStatsCounters.changed = multiClient.eventEpochChange
+	// before any window reads it through the limited window's sizing
+	multiClient.limitedWindowSizeFractionBits.Store(math.Float64bits(settings.LimitedWindowSizeFraction))
 	if settings.IpAssocSettings != nil {
 		cache := multiClient.blockActionCache
 		afterShed := cache.clear
@@ -3079,16 +3185,74 @@ func NewRemoteUserNatMultiClient(
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 		multiClient.windows[WindowTypeSpeed].userSentSinceFunc = multiClient.userSentSince
+
+		// the limited window (server FP2-PROTOCOL.md §7.4). A fixed
+		// destination has none: the fixed exit carries every flow
+		multiClient.windows[WindowTypeLimited] = newMultiClientWindow(
+			cancelCtx,
+			cancel,
+			generator,
+			multiClient.clientReceivePacket,
+			multiClient.clientReceivePackets,
+			provideMode == protocol.ProvideMode_Network,
+			multiClient.clientDialFailureSignal,
+			multiClient.securityPolicy,
+			multiClient.removeClient,
+			multiClient.retireSynPublicationClientMetadata,
+			WindowTypeLimited,
+			effectivePerformanceProfile,
+			settings,
+			multiClient.reliabilitySettings,
+			multiClient.uplinkGate,
+			multiClient.uplinkLastIngress,
+			multiClient.reliabilityMetricsRef,
+			multiClient.clientFlowCount,
+			multiClient.providerQualified,
+			multiClient.receivingChannelCount,
+			multiClient.recordProbePass,
+			multiClient.providerPolicyPreference,
+			multiClient.publishTransportDelayStats,
+			multiClient.clientAdded,
+		)
+		multiClient.windows[WindowTypeLimited].clientMigrateFunc = multiClient.migrateClientFlows
+		multiClient.windows[WindowTypeLimited].userSentSinceFunc = multiClient.userSentSince
 	}
 	// else only keep the quality window for fixed destination
 
+	// The windows are running, and the map is complete and immutable from
+	// here. The hooks are published atomically for the same reason: a window
+	// reads them only after the store, never the map while it was built. The
+	// limited window is woken once for any target a normal window published
+	// before.
+	if limitedWindow := multiClient.windows[WindowTypeLimited]; limitedWindow != nil {
+		limitedHooks := &limitedWindowHooks{
+			sizing: multiClient.limitedWindowSizing,
+			wake: func() {
+				limitedWindow.resizeMonitor.NotifyAll()
+			},
+		}
+		for _, window := range multiClient.windows {
+			window.limitedHooks.Store(limitedHooks)
+		}
+		limitedWindow.resizeMonitor.NotifyAll()
+	}
+
 	multiClient.localUserNatUnsub = localUserNat.AddReceivePacketCallback(multiClient.localReceivePacket)
 
+	// the apps' status reads the normal windows: the limited window adds its
+	// address-family and udp availability only, never its size, readiness,
+	// failure or providers (FP2-PROTOCOL.md §7.8: Connected stays on the
+	// normal windows)
 	monitors := []MultiClientMonitor{}
-	for _, window := range multiClient.windows {
-		monitors = append(monitors, window.monitor)
+	availabilityMonitors := []MultiClientMonitor{}
+	for windowType, window := range multiClient.windows {
+		if windowType == WindowTypeLimited {
+			availabilityMonitors = append(availabilityMonitors, window.monitor)
+		} else {
+			monitors = append(monitors, window.monitor)
+		}
 	}
-	multiClient.monitor = NewMergedMultiClientMonitor(monitors)
+	multiClient.monitor = newMergedMultiClientMonitorWithAvailability(monitors, availabilityMonitors)
 
 	// the session banner (P3): one default-level line naming the build and the
 	// complete effective reliability configuration, emitted before any other
@@ -3423,10 +3587,15 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	}()
 	// before the reset windows discover again
 	self.syncGeneratorPostQuantumEncryption()
-	for _, window := range self.windows {
-		window.SetPerformanceProfile(performanceProfile)
-		// reset the window
-		window.shuffle()
+	// the normal windows first, so the limited window, which sizes itself
+	// from their next passes (limitedWindowSizing), never reads a sizing of
+	// the old profile under the new one
+	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
+		if window := self.windows[windowType]; window != nil {
+			window.SetPerformanceProfile(performanceProfile)
+			// reset the window
+			window.shuffle()
+		}
 	}
 	return nil
 }
@@ -3548,10 +3717,11 @@ func (self *RemoteUserNatMultiClient) LocalSecurityBypass() bool {
 	return self.config.Load().localSecurityBypass
 }
 
-// ordered by choice descending
+// ordered by choice descending. The limited window is never listed: its
+// clients join each listed window's race field (see coalesceOrderedClients).
 func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket, appId string) []WindowType {
-	// - web traffic is routed to quality providers
-	// - all other traffic is routed to speed providers
+	// - web traffic and udp are routed to quality providers first
+	// - all other traffic is routed to speed providers first
 
 	if _, fixed := self.generator.FixedDestinationSize(); fixed {
 		return []WindowType{WindowTypeQuality}
@@ -3563,12 +3733,16 @@ func (self *RemoteUserNatMultiClient) selectWindowTypes(sendPacket *parsedPacket
 		// HTTPS remains quality-first even with no classifier. A classifier can
 		// additionally identify streaming carried on another port (or by a
 		// streaming app), which needs the same low-stall quality window rather
-		// than the bulk-oriented speed window.
+		// than the bulk-oriented speed window. Udp of any port goes to quality
+		// first, then to speed's exits labelled to carry it (server
+		// FP2-PROTOCOL.md D11.4): placement only ever offers a udp flow the
+		// exits whose labels carry udp, so speed is no risk to it.
 		flowClass := ClassUnknown
 		if p := self.flowClassifier.Load(); p != nil {
 			flowClass = classifyOrUnknown(*p, sendPacket.ipPath, appId).Class
 		}
-		if sendPacket.ipPath.DestinationPort == 443 || flowClass == ClassStreaming {
+		if sendPacket.ipPath.DestinationPort == 443 || flowClass == ClassStreaming ||
+			sendPacket.ipPath.Protocol == IpProtocolUdp {
 			return []WindowType{WindowTypeQuality, WindowTypeSpeed}
 		}
 		return []WindowType{WindowTypeSpeed, WindowTypeQuality}
@@ -4064,7 +4238,7 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 	return under
 }
 
-// raceCandidates assembles the field a new flow is placed over.
+// Assembles the field a new flow is placed over.
 //
 // The window offers only its best rank (OrderedClients keeps the min tier) so
 // traffic does not cross rank until necessary. With one or two exits in the
@@ -4089,13 +4263,14 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 // rank still has capacity would let a nearby lower-rank exit win on rtt and
 // split traffic off the rank the platform chose. A no-race placement still
 // recovers through the dial-failure and send-error re-race paths.
-// ipVersion is the flow's ip version: every list source is narrowed to the
-// exits that can carry it (IPV6.md B3).
-func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow, ipVersion int, changed ...*<-chan struct{}) []*multiClientChannel {
+// need is the flow's ip version and protocol: every list source is narrowed
+// to the exits whose labels can carry it (IPV6.md B3, server
+// FP2-PROTOCOL.md §7.2).
+func (self *RemoteUserNatMultiClient) raceCandidates(window *multiClientWindow, need flowNeed, changed ...*<-chan struct{}) []*multiClientChannel {
 	return self.raceCandidatesFrom(
-		func() []*multiClientChannel { return window.orderedClients(false, ipVersion, changed...) },
-		func() []*multiClientChannel { return window.orderedClientsCrossTierForIpVersion(ipVersion) },
-		func() []*multiClientChannel { return window.lastResortClientsForIpVersion(ipVersion) },
+		func() []*multiClientChannel { return window.orderedClients(false, need, changed...) },
+		func() []*multiClientChannel { return window.orderedClientsCrossTierForFlow(need) },
+		func() []*multiClientChannel { return window.lastResortClientsForFlow(need) },
 	)
 }
 
@@ -4551,6 +4726,12 @@ func (self *RemoteUserNatMultiClient) bindClientFlow(update *multiClientChannelU
 	}
 	updates[update] = true
 	update.finishServiceRefreshBinding(client)
+	// the window of the flow's first exit, once per flow (server
+	// FP2-PROTOCOL.md §8.2)
+	if !update.windowFlowCounted {
+		update.windowFlowCounted = true
+		self.windowClientStats().addFlow(client.windowType(), update.ipPath)
+	}
 
 	// an app-pinned flow that got here was placed by the RACE, not by
 	// affinity -- which is the case for the app's first flow of each ip
@@ -4692,10 +4873,10 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		if !update.pinned && !selection.eligible(c, now, reliabilitySettings.AffinityMaxTime) {
 			continue
 		}
-		// a donor downgraded to v4-only after this group formed still
-		// carries its established flows, but must not receive new ones of
-		// a version it no longer carries (IPV6.md B3, B5)
-		if c == nil || c.IsDone() || !c.supportsIpVersion(4) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+		// a donor must be labelled to carry the new flow (IPV6.md B3, server
+		// FP2-PROTOCOL.md §7.6): a quic flow never inherits the tcp exit its
+		// site's tcp flows share, and egresses from another address instead
+		if c == nil || c.IsDone() || !c.supportsFlow(4, flowNeedOf(update.ipPath).ipProtocol) || (!sticky && self.clientAtFlowCapWithLock(c)) {
 			continue
 		}
 		if self.affinityDonorServiceFailedWithLock(update, c, now) {
@@ -4786,8 +4967,8 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		if !update.pinned && !selection.eligible(c, now, reliabilitySettings.AffinityMaxTime) {
 			continue
 		}
-		// see the v4 twin: a downgraded donor takes no new v6 flows
-		if c == nil || c.IsDone() || !c.supportsIpVersion(6) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+		// see the v4 twin: the donor must be labelled to carry the new v6 flow
+		if c == nil || c.IsDone() || !c.supportsFlow(6, flowNeedOf(update.ipPath).ipProtocol) || (!sticky && self.clientAtFlowCapWithLock(c)) {
 			continue
 		}
 		if self.affinityDonorServiceFailedWithLock(update, c, now) {
@@ -5484,7 +5665,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					true,
 					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
 					reliabilitySettings.AffinityStickyPastCap,
-				); donor != nil && donor.supportsIpVersion(4) {
+				); donor != nil && donor.supportsFlow(4, ipPath.Protocol) {
 					// The app's canonical provider is a pin, not a new race.
 					// Missing origin cannot authorize a later ordinary donor.
 					self.adoptAffinityClientWithLock(update, donor, nil)
@@ -5592,7 +5773,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					true,
 					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
 					reliabilitySettings.AffinityStickyPastCap,
-				); donor != nil && donor.supportsIpVersion(6) {
+				); donor != nil && donor.supportsFlow(6, ipPath.Protocol) {
 					// Cross-family app convergence is still inherited placement.
 					self.adoptAffinityClientWithLock(update, donor, nil)
 				}
@@ -6469,12 +6650,13 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 		}
 	}
 
-	// a replacement must carry every flow it is handed (IPV6.md B3): a group
-	// is narrowed to the candidates that can carry all of its versions, and
-	// a single flow to the candidates that can carry its own
+	// a replacement must carry every flow it is handed (IPV6.md B3, server
+	// FP2-PROTOCOL.md §7.6): a group is narrowed to the candidates whose
+	// labels carry all of its versions and protocols, and a single flow to
+	// the candidates that carry its own. A quic flow never moves to a tcp exit
 	carriesUpdates := func(c *multiClientChannel, updates []*multiClientChannelUpdate) bool {
 		for _, update := range updates {
-			if update.ipPath != nil && !c.supportsIpVersion(update.ipPath.Version) {
+			if update.ipPath != nil && !c.supportsIpPath(update.ipPath) {
 				return false
 			}
 		}
@@ -8362,9 +8544,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			default:
 				// a client whose contract requests are held races last, and a
 				// race that would still send to one is bounded like one during
-				// an outage (contractRateLimitHeldRaced)
+				// an outage (contractRateLimitHeldRaced). The normal windows'
+				// candidates come before the limited window's, so a bounded
+				// race spends its slots on them first (server FP2-PROTOCOL.md
+				// §7.5)
 				raceTime := time.Now()
-				orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)
+				orderedClients = limitedClientsLast(contractRateLimitHeldLast(orderedClients, raceTime))
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
@@ -8573,10 +8758,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			}
 		}
 
-		var qualityOfferChanged, speedOfferChanged <-chan struct{}
+		var qualityOfferChanged, speedOfferChanged, limitedOfferChanged <-chan struct{}
 		coalesceOrderedClients := func() []*multiClientChannel {
 			// Re-arm only the windows selected by this flow on each read.
-			qualityOfferChanged, speedOfferChanged = nil, nil
+			qualityOfferChanged, speedOfferChanged, limitedOfferChanged = nil, nil, nil
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
@@ -8584,6 +8769,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// original field without another health walk.
 			preferHealthyWindows := ipPath.Protocol == IpProtocolTcp && ipPath.Syn && !ipPath.Ack &&
 				!sendPacketGroup.pin.pinned() && !update.receivedInbound.Load()
+			need := flowNeedOf(ipPath)
 			var failedFallback, benchedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
@@ -8594,15 +8780,17 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					case WindowTypeSpeed:
 						offerChanged = &speedOfferChanged
 					}
-					orderedClients := self.raceCandidates(window, ipPath.Version, offerChanged)
+					// the window's field with the limited window's merged in
+					// (raceField); every filter below runs on the merged field
+					orderedClients := self.raceField(window, need, offerChanged, &limitedOfferChanged)
 					// A destination+port failure is narrower than the
 					// window's rank. Widen across healthy tiers before
 					// filtering so a rejected SMTP endpoint actually gets a
 					// different egress address on its retransmitted SYN.
 					if self.destinationServiceFailurePresent(orderedClients, ipPath) {
-						if crossed := window.orderedClientsCrossTierForIpVersion(ipPath.Version); 0 < len(crossed) {
+						if crossed := self.crossTierRaceField(window, need); 0 < len(crossed) {
 							orderedClients = crossed
-						} else if fallback := window.lastResortClientsForIpVersion(ipPath.Version); 0 < len(fallback) {
+						} else if fallback := self.lastResortRaceField(window, need); 0 < len(fallback) {
 							orderedClients = fallback
 						}
 					}
@@ -8719,6 +8907,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 
 			orderedClients := coalesceOrderedClients()
 			if len(orderedClients) == 0 {
+				// Server FP2-PROTOCOL.md §7.7: once the windows have formed,
+				// a udp flow no window holds an exit labelled to carry is
+				// answered with port unreachable and dropped, so a quic stack
+				// falls back to tcp at once instead of waiting out its
+				// handshake timeout.
+				if ipPath.Protocol == IpProtocolUdp &&
+					self.flowUnroutable(flowNeedOf(ipPath), self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId)) {
+					self.replyUdpNoRoute(ipPath)
+					return
+				}
 				// IPV6.md B6: once the windows hold exits and none can carry
 				// v6, a v6 flow is answered with no-route and dropped, so the
 				// application fails fast (and falls back to v4) instead of
@@ -8743,6 +8941,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				case <-qualityOfferChanged:
 				case <-speedOfferChanged:
+				case <-limitedOfferChanged:
 				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 				continue
@@ -10127,18 +10326,18 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	})
 	// The sender of inbound for a flow with no client adopts it, binding it as
 	// a race commit would, when it passes the placement filters a race
-	// candidate passes: not quarantined, able to carry the flow's ip version,
-	// and under the flow cap. Those take the channel and parent locks, which
-	// never nest under the flow lock, so they are read here and the commit
-	// re-validates the flow under its lock. A flow that is racing, re-raced
-	// onto other exits by the inference, takes the answer into its race as
-	// that of a candidate and commits it, which resets the candidates as any
-	// race commit does.
+	// candidate passes: not quarantined, labelled to carry the flow's ip
+	// version and protocol, and under the flow cap. Those take the channel
+	// and parent locks, which never nest under the flow lock, so they are
+	// read here and the commit re-validates the flow under its lock. A flow
+	// that is racing, re-raced onto other exits by the inference, takes the
+	// answer into its race as that of a candidate and commits it, which
+	// resets the candidates as any race commit does.
 	if adoptUpdate != nil {
 		adopted, joined, connected := false, false, false
 		var adoptedPackets []*receivePacket
 		placeable := !sourceClient.isQuarantined() &&
-			sourceClient.supportsIpVersion(adoptUpdate.ipPath.Version) &&
+			sourceClient.supportsIpPath(adoptUpdate.ipPath) &&
 			!func() bool {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
@@ -10400,12 +10599,10 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		// retransmitting into this path must not starve-warn the exit by
 		// itself. net.IP.String() on a nil ip yields a stable "<nil>" key, so a
 		// pathological signal still records safely rather than panicking.
+		// The strike keeps its ip version, but no strike changes the exit's
+		// category: placement reads only the server's labels (server
+		// FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local downgrade)
 		sourceClient.addDialFailure(egressIpPath.DestinationIp.String(), egressIpPath.Version)
-		// B5: v6 strikes with healthy v4 downgrade the exit to v4-only; the
-		// window republishes the category and fills the v6 shortfall it opened
-		if egressIpPath.Version == 6 && sourceClient.maybeDowngradeIpv6() {
-			self.noteIpFamilyDowngrade(sourceClient)
-		}
 	}
 	if rerace && firstFromExit {
 		self.requestDiscoveryForFailedAttempt(signaledUpdate, sourceClient, egressIpPath)
@@ -10582,11 +10779,19 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 // menu: enough to see which exits exist, which the flows are pinned to, and
 // which are on their way out.
 type ExitInfo struct {
-	ClientId   Id
+	ClientId Id
+	// WindowTypeLimited for an exit of the limited window
 	WindowType WindowType
-	// IpFamily is the exit's address-family category as discovered, after any
-	// local downgrade. Legacy reads as v4-only.
+	// The exit's address-family category as discovered: in selector mode its
+	// ip label. Legacy reads as v4-only.
 	IpFamily IpFamily
+	// The exit's labels as placement reads them (server FP2-PROTOCOL.md
+	// §7.1): "dualstack" or "ipv4", and "dualproto" or "tcp". An exit
+	// discovered without labels reads its category and "dualproto".
+	CapabilityIp       ProviderIpCapability
+	CapabilityProtocol ProviderProtocolCapability
+	// 1 when the server gave this tcp exit to a dualproto request as overflow
+	OverflowStep int
 	// Warning marks a client new flows already avoid -- either unhealthy or
 	// past MaxClientLifetime and draining. Note this is isWarning(), which is
 	// true for a quarantined exit as well: quarantine's whole mechanism is
@@ -10695,11 +10900,15 @@ func (self *RemoteUserNatMultiClient) Exits() []*ExitInfo {
 			// effectiveTier below also reaches the parent lock through the
 			// injected lookup -- nothing here may hold it across these calls
 			proven, probeAge := self.qualificationExitInfo(client.probeDestination())
+			capabilities := client.capabilities()
 			exitInfo := &ExitInfo{
-				ClientId:   clientId,
-				WindowType: windowType,
-				IpFamily:   client.IpFamily(),
-				Warning:    client.isWarning(),
+				ClientId:           clientId,
+				WindowType:         windowType,
+				IpFamily:           client.IpFamily(),
+				CapabilityIp:       capabilities.Ip,
+				CapabilityProtocol: capabilities.Protocol,
+				OverflowStep:       client.overflowStep(),
+				Warning:            client.isWarning(),
 				// each of these takes only the channel's own stateLock, and the
 				// parent lock is released above -- the same discipline the rest
 				// of this walk follows
@@ -11054,6 +11263,10 @@ type multiClientChannelUpdate struct {
 	// the cross-version convergence work for an app's FIRST flow of each ip
 	// version (review finding, 2026-08-03).
 	pinAppId string
+	// Whether the process counters (WindowClientStats) have counted this flow
+	// under the window of its first exit, so a re-raced flow counts once.
+	// Guarded by the parent stateLock, which bindClientFlow holds.
+	windowFlowCounted bool
 
 	// receivedInbound is set true the first time an inbound (non-icmp) packet
 	// resolves this flow to its committed client (the receiveClientPath path).
@@ -12740,6 +12953,28 @@ type multiClientWindow struct {
 	ipv6CandidateReady bool
 	ipv6FillFailures   int
 
+	// --- capabilities (see ip_remote_multi_client_limited.go) ---
+
+	// What this window's find-providers2 requests carry beside its held
+	// counts (server FP2-PROTOCOL.md §7.4): the target its last resize pass
+	// computed before the standing reserve, and its ipv6 minimum. Set from
+	// the window's configuration at construction, then by every resize pass.
+	// Guarded by stateLock.
+	requestTargetCount          int
+	requestDualstackTargetCount int
+	// What a normal window's last resize pass published for the limited
+	// window's sizing: whether the window is active, its target before the
+	// standing reserve, and its hard max. Guarded by stateLock.
+	publishedSizing windowSizing
+	// The parent's limited window hooks, stored once the multi client has
+	// built every window. nil before that, without a limited window, and in
+	// bare fixtures.
+	limitedHooks atomic.Pointer[limitedWindowHooks]
+	// The labelled clients this window's last resize pass published to the
+	// process counters (WindowClientStats), retracted when the pass loop
+	// ends. Owned by the resize loop.
+	publishedClientLabels windowClientLabelCounts
+
 	// --- the user's Fixed IP (see ip_remote_multi_client_sticky.go) ---
 
 	// The exit a sticky window lost to transport loss, for the next discovery
@@ -12837,6 +13072,8 @@ func newMultiClientWindow(
 		enumerateZeroThrottle:        newLogThrottle(settings.EvaluationFailureLogInterval),
 	}
 	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
+	// the enumerator's first round can list before the first resize pass
+	window.initRequestSizing()
 
 	go HandleError(window.randomEnumerateClientArgs, cancel)
 	go HandleError(window.resize, cancel)
@@ -13387,6 +13624,9 @@ func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *Perform
 			return 0
 		}
 		self.performanceProfile = performanceProfile
+		// sized under the old profile: the limited window waits for this
+		// window's next pass rather than size itself from it
+		self.publishedSizing = windowSizing{}
 		// a lost exit is only wanted back under the profile it was lost in
 		self.stickyRedial.Forget()
 		forgottenCount := self.recentExits.Forget()
@@ -13589,8 +13829,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a window the payer's balance holds lists and mints nothing
 			// either; the probe in its expansion step releases it. Nor does
 			// the window of an idle device whose refill is held; its next
-			// user packet wakes the expansion that asks again
-			if !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld() || self.idleRefillListingHeld()) {
+			// user packet wakes the expansion that asks again. Nor does the
+			// limited window while it has nothing to fill (limitedListingHeld)
+			if !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld() || self.idleRefillListingHeld() || self.limitedListingHeld()) {
 				demandRead = self.waitDiscoveryDemand(generatorNotify, true)
 				if self.ctx.Err() != nil {
 					return
@@ -13693,7 +13934,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					continue
 				}
 
-				if demandRead == nil && !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld() || self.idleRefillListingHeld()) {
+				if demandRead == nil && !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld() || self.idleRefillListingHeld() || self.limitedListingHeld()) {
 					return
 				}
 				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
@@ -13908,6 +14149,7 @@ func (self *multiClientWindow) resize() {
 	publishedWindowState := windowStateNone
 	defer func() {
 		windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowStateNone)
+		windowClientStats.moveClientLabels(self.windowType, self.publishedClientLabels, windowClientLabelCounts{})
 	}()
 	warningTransitions := windowWarningTransitions{}
 	for {
@@ -13929,17 +14171,24 @@ func (self *multiClientWindow) resize() {
 		// read with the size, under the same lock, so one pass never sizes
 		// for one profile and rotates for another
 		var stickyExit bool
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			if profileWindowType, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
-				fixedWindowType = &profileWindowType
-				windowSize = profileWindowSize
-			} else {
-				windowSize = self.defaultWindowSizeWithLock()
-			}
-			stickyExit = stickyExitProfile(self.performanceProfile)
-		}()
+		if self.windowType == WindowTypeLimited {
+			// sized from the normal windows' last passes, read with no lock
+			// held: each sibling's sizing is read under its own lock. Never
+			// sticky (the Fixed IP has no limited window) and never inactive
+			windowSize = self.limitedWindowSize()
+		} else {
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if profileWindowType, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
+					fixedWindowType = &profileWindowType
+					windowSize = profileWindowSize
+				} else {
+					windowSize = self.defaultWindowSizeWithLock()
+				}
+				stickyExit = stickyExitProfile(self.performanceProfile)
+			}()
+		}
 
 		startTime := time.Now()
 
@@ -14441,6 +14690,23 @@ func (self *multiClientWindow) resize() {
 			windowSizeMin = windowSize.WindowSizeMin
 		}
 
+		// the target before the standing reserve is what this window's
+		// find-providers2 requests carry, and a normal window publishes it,
+		// with its hard max, for the limited window's size (server
+		// FP2-PROTOCOL.md §7.4)
+		self.setRequestSizing(
+			targetWindowSize,
+			requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize),
+		)
+		if self.windowType != WindowTypeLimited {
+			self.publishSizing(windowSizing{
+				published:  true,
+				active:     !inactive && !fixedDestination,
+				targetSize: targetWindowSize,
+				hardMax:    windowSize.WindowSizeHardMax,
+			})
+		}
+
 		// the standing reserve: hold one spare exit beyond the computed
 		// target, bounded by WindowSizeHardMax, so a failed or draining
 		// exit's replacement is already dialed and evaluated before it is
@@ -14454,11 +14720,12 @@ func (self *multiClientWindow) resize() {
 		// recovery path". windowSizeMin is deliberately untouched -- the
 		// spare must never make the window read as unsatisfied. The user's
 		// Fixed IP holds no spare: a second selectable exit is a second
-		// egress ip (see standingReserveTarget).
+		// egress ip (see standingReserveTarget). Nor does the limited window:
+		// its size is exactly its share of the normal windows'.
 		targetWindowSize = standingReserveTarget(
 			targetWindowSize,
 			windowSize.WindowSizeHardMax,
-			self.reliabilitySettings().StandingReserve,
+			self.reliabilitySettings().StandingReserve && self.windowType != WindowTypeLimited,
 			fixedDestination,
 			stickyExit,
 		)
@@ -14545,8 +14812,11 @@ func (self *multiClientWindow) resize() {
 		hardMinimumCount := hardMinimumCount(clients, fixedDestination)
 
 		// the outcome clock arms the first time this window actually tries to
-		// form (see watchOutcome); a disabled window (target 0) never arms
-		if 0 < targetWindowSize {
+		// form (see watchOutcome); a disabled window (target 0) never arms.
+		// Nor does the limited window: the clock exists for the user's
+		// connection, which the normal windows carry, and a location with no
+		// tcp provider leaves the limited window empty by design
+		if 0 < targetWindowSize && self.windowType != WindowTypeLimited {
 			self.armOutcome()
 		}
 		minSatisfied := func(clientCount int) bool {
@@ -14663,6 +14933,7 @@ func (self *multiClientWindow) resize() {
 				minSatisfied(hardMinimumCount),
 				targetWindowSize+len(warnedClients),
 				self.ipv6Available(),
+				self.udpAvailable(),
 				inactive,
 			)
 			if refresh.owner != nil {
@@ -14714,6 +14985,7 @@ func (self *multiClientWindow) resize() {
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
 				windowSize.WindowSizeHardMax,
 				self.ipv6Available(),
+				self.udpAvailable(),
 				inactive,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
@@ -14733,6 +15005,7 @@ func (self *multiClientWindow) resize() {
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
 				publishedTargetSize,
 				self.ipv6Available(),
+				self.udpAvailable(),
 				inactive,
 			)
 		}
@@ -14749,6 +15022,11 @@ func (self *multiClientWindow) resize() {
 			)
 			windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowState)
 			publishedWindowState = windowState
+			// the window's clients by label (server FP2-PROTOCOL.md §8.2),
+			// replacing what the last pass published
+			clientLabels := self.clientLabelCounts()
+			windowClientStats.moveClientLabels(self.windowType, self.publishedClientLabels, clientLabels)
+			self.publishedClientLabels = clientLabels
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
@@ -15423,6 +15701,7 @@ requestCandidates:
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.ackRouteWriteFailureOwner = &self.ackRouteWriteFailures
+			args.windowType = self.windowType
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
@@ -16293,22 +16572,22 @@ func (self *multiClientWindow) appendUnorderedClients(clients []*multiClientChan
 // races it, and the first responder is by construction whichever benched
 // exit is currently moving bytes.
 func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
-	return self.lastResortClientsForIpVersion(0)
+	return self.lastResortClientsForFlow(flowNeed{})
 }
 
-// lastResortClientsForIpVersion is lastResortClients narrowed to the exits
-// that can carry the version -- a benched exit that cannot carry v6 is no
-// exit at all for a v6 flow. 0 is any.
+// The last-resort offer narrowed to the exits whose labels carry the flow --
+// a benched exit that cannot carry v6, or udp, is no exit at all for such a
+// flow. The zero need is any.
 //
 // A sticky window (the user's Fixed IP) can hold two live exits at once, the
 // warned exit and its replacement. Racing both would let each new flow leave
 // on whichever answers first, so the egress ip changes between page loads.
 // Its offer keeps one exit: the most recently used, then the busiest, then
 // the lowest client id, so every call picks the same one.
-func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*multiClientChannel {
+func (self *multiClientWindow) lastResortClientsForFlow(need flowNeed) []*multiClientChannel {
 	clients := []*multiClientChannel{}
 	for _, client := range self.unorderedClients() {
-		if client.IsDone() || !client.supportsIpVersion(ipVersion) {
+		if client.IsDone() || !client.supportsFlow(need.ipVersion, need.ipProtocol) {
 			continue
 		}
 		clients = append(clients, client)
@@ -16399,33 +16678,33 @@ func windowMinSatisfied(
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
-	return self.orderedClients(false, 0)
+	return self.orderedClients(false, flowNeed{})
 }
 
-// OrderedClientsForIpVersion is OrderedClients narrowed to the exits that
-// can carry a flow of the packet's ip version (IPV6.md B3). 0 is any.
-func (self *multiClientWindow) OrderedClientsForIpVersion(ipVersion int) []*multiClientChannel {
-	return self.orderedClients(false, ipVersion)
+// The race offer narrowed to the exits whose labels can carry the flow
+// (IPV6.md B3, server FP2-PROTOCOL.md §7.2). The zero need is any.
+func (self *multiClientWindow) OrderedClientsForFlow(need flowNeed) []*multiClientChannel {
+	return self.orderedClients(false, need)
 }
 
 // orderedClientsCrossTier is OrderedClients without the min-tier gate, for
 // the caller that has decided crossing rank IS now necessary -- every min-tier
 // exit sitting at the flow cap. See RemoteUserNatMultiClient.raceCandidates.
 func (self *multiClientWindow) orderedClientsCrossTier() []*multiClientChannel {
-	return self.orderedClients(true, 0)
+	return self.orderedClients(true, flowNeed{})
 }
 
-// orderedClientsCrossTierForIpVersion is orderedClientsCrossTier narrowed
-// to the exits that can carry the version. 0 is any.
-func (self *multiClientWindow) orderedClientsCrossTierForIpVersion(ipVersion int) []*multiClientChannel {
-	return self.orderedClients(true, ipVersion)
+// The cross-tier offer narrowed to the exits whose labels can carry the
+// flow. The zero need is any.
+func (self *multiClientWindow) orderedClientsCrossTierForFlow(need flowNeed) []*multiClientChannel {
+	return self.orderedClients(true, need)
 }
 
-// ipVersion narrows the offer to exits whose category can carry a flow of
-// that version (IPV6.md B3); 0 keeps every exit. The narrowing runs before
-// the weighting and the rank gate, so a v6 flow sees the best rank among
-// the exits that can actually carry it.
-func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, changed ...*<-chan struct{}) []*multiClientChannel {
+// need narrows the offer to exits whose labels can carry the flow (IPV6.md
+// B3, server FP2-PROTOCOL.md §7.2); the zero need keeps every exit. The
+// narrowing runs before the weighting and the rank gate, so a v6 or udp flow
+// sees the best rank among the exits that can actually carry it.
+func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, changed ...*<-chan struct{}) []*multiClientChannel {
 	var windowSize WindowSizeSettings
 	var offeredClients []*multiClientChannel
 	func() {
@@ -16440,7 +16719,10 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 			}
 		}
 		offeredClients = slices.Collect(maps.Values(self.clients))
-		if _, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
+		if self.windowType == WindowTypeLimited {
+			// sized from the normal windows with no fixed size: nothing to
+			// truncate the offer to (see limitedWindowSize)
+		} else if _, profileWindowSize, ok := self.performanceProfile.FixedWindow(); ok {
 			windowSize = profileWindowSize
 		} else {
 			windowSize = self.defaultWindowSizeWithLock()
@@ -16452,7 +16734,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 	weights := map[*multiClientChannel]float32{}
 
 	for _, client := range offeredClients {
-		if !client.supportsIpVersion(ipVersion) {
+		if !client.supportsFlow(need.ipVersion, need.ipProtocol) {
 			continue
 		}
 		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
@@ -16475,7 +16757,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 		if self.generator != nil {
 			if _, fixed := self.generator.FixedDestinationSize(); fixed {
 				for _, client := range offeredClients {
-					if !client.supportsIpVersion(ipVersion) {
+					if !client.supportsFlow(need.ipVersion, need.ipProtocol) {
 						continue
 					}
 					if stats, err := client.WindowStats(); err == nil {
@@ -16693,6 +16975,12 @@ type multiClientChannelArgs struct {
 	// name (enumerateRecentExits). It is evaluated and admitted like any other
 	// candidate; the mark only names its outcome in the log.
 	recentExit bool
+
+	// The window that admitted this exit, stamped by expand before the
+	// channel is built: the race orders the limited window's exits after
+	// the normal windows' (limitedClientsLast), and the process counters
+	// label the exit's flows by it.
+	windowType WindowType
 
 	// How the discovery round that listed this candidate read the window's
 	// cool-off; the expansion refuses a candidate listed before its provider
@@ -17241,22 +17529,18 @@ type multiClientChannel struct {
 	// still convicts at full speed.
 	dialFailureTimes        []time.Time
 	dialFailureDestinations []string
-	// dialFailureVersions parallels dialFailureTimes entry for entry with the
-	// ip version of the failed dial, pruned with the same prefix cut, so the
-	// v6 downgrade (ipv6DialStarvedWithLock) can judge v6 strikes apart from
-	// v4 ones. connectSuccessVersions does the same for connectSuccessTimes.
-	// Entries a legacy fixture never wrote read as v4 (dialStrikeVersion).
+	// The failed dials' ip versions, parallel to dialFailureTimes entry for
+	// entry and pruned with the same prefix cut.
+	// connectSuccessVersions does the same for connectSuccessTimes. No strike
+	// changes the exit's category: placement reads only the server's labels
+	// (server FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local downgrade).
 	dialFailureVersions    []int
 	connectSuccessTimes    []time.Time
 	connectSuccessVersions []int
 
-	// ipFamilyDowngraded latches the local v6 downgrade (IPV6.md B5): set
-	// once by maybeDowngradeIpv6, never cleared -- for the life of the
-	// window this exit is v4-only whatever discovery said. familySwapVictim
-	// marks an exit the resize pass chose to give up its slot to a
-	// v6-capable candidate (selectFamilySwapVictim). Both atomics: read on
-	// the placement path, written from the strike record and the resize pass.
-	ipFamilyDowngraded           atomic.Bool
+	// Marks an exit the resize pass chose to give up its slot to a
+	// v6-capable candidate (selectFamilySwapVictim). Atomic: read
+	// on the placement path, written by the resize pass.
 	familySwapVictim             atomic.Bool
 	serviceRefreshReservation    atomic.Pointer[tcpSynRetry]
 	serviceRefreshRaceReferences atomic.Int64

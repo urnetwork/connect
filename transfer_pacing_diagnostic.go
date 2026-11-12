@@ -135,7 +135,7 @@ func (self *RemoteUserNatMultiClient) pacingDiagnosticSnapshot(origin time.Time,
 			client *Client
 		}
 		count, visited := 0, 0
-		for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
+		for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 			window := self.windows[windowType]
 			if window == nil {
 				continue
@@ -153,10 +153,7 @@ func (self *RemoteUserNatMultiClient) pacingDiagnosticSnapshot(origin time.Time,
 					if channel == nil || channel.client == nil {
 						continue
 					}
-					clients[count].window = "speed"
-					if windowType == WindowTypeQuality {
-						clients[count].window = "quality"
-					}
+					clients[count].window = windowStatsWindowOf(windowType).String()
 					clients[count].client = channel.client
 					count++
 				}

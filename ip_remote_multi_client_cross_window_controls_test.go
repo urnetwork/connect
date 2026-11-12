@@ -248,7 +248,7 @@ func privateCrossWindowTestIncompatibleSpeedKeepsQualityFallback(t *testing.T, v
 			}
 		})
 		incompatible := privateCrossWindowChannel(t, harness, "speed")
-		if incompatible.supportsIpVersion(version) {
+		if incompatible.supportsFlow(version, IpProtocolUnknown) {
 			t.Fatal("declared speed owner is not family-incompatible")
 		}
 		if version == 4 {

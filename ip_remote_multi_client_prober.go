@@ -389,7 +389,8 @@ func (self *RemoteUserNatMultiClient) probeProviderPass(client *multiClientChann
 	_, _, passIndex := self.qualificationSnapshot(destination)
 	seed := probeSeedBase(destination) + uint64(passIndex)
 	ipVersion := probeIpVersionForFamily(seed, client.IpFamily())
-	if !client.supportsIpVersion(ipVersion) {
+	// a probe is a tcp handshake, so the ip label alone decides
+	if !client.supportsFlow(ipVersion, IpProtocolTcp) {
 		// unreachable by construction (the category is what the version was
 		// chosen from), kept as the guard that makes the no-wrong-family
 		// rule structural: a pass over a family the exit cannot carry asks

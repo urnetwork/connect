@@ -580,10 +580,36 @@ func testNativeSynLatePublicationDeclinesClient(t *testing.T, reason string) {
 			<-f.callbackDone
 			return
 		}
-		f := newSynPublicationTestFixture(t, 6, false, nil)
+		var addLateExit []func(*synPublicationTestFixture) *reraceExit
+		if reason == "family" {
+			// the server labels the late exit ipv4 in the very listing that
+			// installs it for the v6 flow's demand read: the label, never a
+			// local downgrade, is what makes it incompatible (server
+			// FP2-PROTOCOL.md D11.8)
+			addLateExit = append(addLateExit, func(f *synPublicationTestFixture) *reraceExit {
+				exit := f.h.addExit(reraceExitSpec{name: "late"})
+				capabilities := ProviderCapabilities{
+					Ip:       ProviderIpCapabilityIpv4,
+					Protocol: ProviderProtocolCapabilityDualproto,
+				}
+				f.generator.mutex.Lock()
+				f.generator.resultOverrideForTest = map[MultiHopId]DestinationStats{
+					exit.destination: {IpFamily: capabilities.IpFamily(), Capabilities: capabilities},
+				}
+				f.generator.mutex.Unlock()
+				return exit
+			})
+		}
+		f := newSynPublicationTestFixture(t, 6, false, nil, addLateExit...)
 		switch reason {
 		case "family":
-			f.late.ipFamilyDowngraded.Store(true)
+			if f.late.supportsIpPath(f.path) {
+				t.Fatal("late exit labelled ipv4 can carry the v6 flow")
+			}
+			// installed: no later listing offers it again
+			f.generator.mutex.Lock()
+			f.generator.resultOverrideForTest = nil
+			f.generator.mutex.Unlock()
 		case "closed":
 			f.withdrawLateAvailability(t)
 			f.late.Close()

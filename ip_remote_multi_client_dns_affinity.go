@@ -168,8 +168,10 @@ func (self *RemoteUserNatMultiClient) inheritDnsExitHintWithLock(
 		}
 		// a hint learned from one family's answer must not place a flow of
 		// the other on an exit that cannot carry it (IPV6.md B3): the AAAA
-		// answer for a name may have come back through a v4-only exit
-		if !client.supportsIpVersion(ipPath.Version) {
+		// answer for a name may have come back through a v4-only exit. Nor
+		// a quic flow on the tcp exit the lookup went through (server
+		// FP2-PROTOCOL.md §7.2)
+		if !client.supportsIpPath(ipPath) {
 			return false
 		}
 		if key, ok := destinationServiceFailureKeyFor(ipPath, client); ok {

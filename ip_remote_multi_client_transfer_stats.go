@@ -19,7 +19,7 @@ func (self *RemoteUserNatMultiClient) ClientTransferStats() []MultiClientTransfe
 		return nil
 	}
 	out := []MultiClientTransferStats{}
-	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
+	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 		window := self.windows[windowType]
 		if window == nil {
 			continue

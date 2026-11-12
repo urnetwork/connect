@@ -180,11 +180,16 @@ with `NextDestinationsWithIpFamily(count, exclude, rankMode, ipFamily)`.
 `ApiMultiClientGenerator` implements it. A generator without it is called as
 today and its destinations are treated as legacy v4-only.
 
-B5. Local downgrade. Per-exit dial-failure counters are split by version.
-When the v6 counter reaches the existing dial-starvation threshold while v4
-stays healthy, the exit is downgraded to v4-only for the life of the window.
-That may open a v6 shortfall and trigger a `v6-capable` fill. Qualification
-probing follows the category: v4-capable exits probe over v4, v6-only exits
+B5. Local downgrade. **Superseded by server FP2-PROTOCOL.md D11.8 (§7.9):
+retired.** An exit's category is the server's ip label and nothing a client
+observes on its own flows changes it; a dual-stack exit whose IPv6 breaks
+keeps receiving IPv6 flows until the quality probe's evidence relabels it,
+typically within a few hours. The per-exit dial-failure counters stay split
+by version for the ordinary starvation warning. As shipped before, B5
+downgraded an exit to v4-only for the life of its window when the v6 counter
+reached the dial-starvation threshold while v4 stayed healthy, which could
+open a v6 shortfall and trigger a `v6-capable` fill. Qualification probing
+still follows the category: v4-capable exits probe over v4, v6-only exits
 over v6, and dualstack exits alternate families across passes; a dualstack
 exit is proven by either family's pass.
 
@@ -442,8 +447,10 @@ and receive today's behavior; old cache entries read as v4-only.
 
 - Same-network detection by address hash works only when the consumer and
   the provider are observed on the same family.
-- A provider's category is the server's view at discovery time; B5 covers
-  loss of v6 locally until the cache rebuilds.
+- A provider's category is the server's view at discovery time. B5 used to
+  cover loss of v6 locally until the cache rebuilt; it is retired (server
+  FP2-PROTOCOL.md D11.8), so the loss lasts until the quality probe relabels
+  the provider.
 - Categories depend on the reliability aggregation and score-cache cadence,
   so a family change on a provider lags by up to one rebuild.
 - P2P transports are family-independent and are not part of the tag.

@@ -1320,7 +1320,7 @@ func TestPacketGroupSendSourceAnchorsExcludeUnrelatedPolicyText(t *testing.T) {
 		"FormationPollTimeout",
 		"dialProbePacket(ipPath)",
 		"orderedClients[:multiRaceClientCount(",
-		"self.raceCandidates(window, ipPath.Version, offerChanged)",
+		"self.raceField(window, need, offerChanged, &limitedOfferChanged)",
 	} {
 		if !strings.Contains(body, marker) || !strings.Contains(mutated, marker) {
 			t.Fatalf("control lost policy marker %q instead of moving it", marker)
