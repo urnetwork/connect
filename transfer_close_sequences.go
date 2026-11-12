@@ -29,9 +29,16 @@ import (
 //   - A live send sequence has taken it, or it waits queued for one: the send
 //     sequence is canceled and its exit reports the finals. A queued contract
 //     leaves its queue with a final of (0, 0).
-//   - Nothing holds it: a final of (0, 0). Its counts went out before, for
-//     example in the checkpoint at its sequence's exit, and the platform turns
-//     that checkpoint into a final with the same count.
+//   - Nothing holds it, but its reports are still pending or its reported
+//     checkpoint is remembered (`CloseRequestCheckpointRecordCount`): a final
+//     of (0, 0) behind those counts, which the platform turns into a final
+//     with the checkpoint's count.
+//   - Nothing holds it and the client has no record of it, for example after
+//     a hard kill or a crash before its first checkpoint: ContractsNoRecord,
+//     never a count. A final of (0, 0) would claim the client counted
+//     nothing, and the platform would settle at the mean of the two counts;
+//     with no record the platform settles as for a client that never
+//     answered.
 //
 // For each peer id, a client removed through the api: every receive sequence
 // from it ends with finals for all of its contracts, every send sequence to it
@@ -162,7 +169,9 @@ func (self *sequenceCloser) closePending() {
 }
 
 // Each contract goes to the receive sequence that holds it, then to the send
-// side, and otherwise reports a final of (0, 0).
+// side. A contract that leaves its queue, or that the manager holds open
+// without a live sequence, reports a final of (0, 0); any other goes to the
+// contract manager, which answers from the records it keeps.
 func (self *sequenceCloser) closeContracts(contractIds []Id) {
 	unheldContractIds := []Id{}
 	seenContractIds := map[Id]bool{}
@@ -191,13 +200,26 @@ func (self *sequenceCloser) closeContracts(contractIds []Id) {
 		sendSequenceIds[contractKey.sendSequenceId()] = true
 	}
 	canceledSendSequenceIds := self.client.sendBuffer.cancelSendSequences(sendSequenceIds)
+	unownedContractIds := []Id{}
 	for _, contractId := range unheldContractIds {
-		if contractKey, ok := openKeys[contractId]; ok && canceledSendSequenceIds[contractKey.sendSequenceId()] {
-			// the canceled sequence's exit reports the final
+		if contractKey, ok := openKeys[contractId]; ok {
+			if canceledSendSequenceIds[contractKey.sendSequenceId()] {
+				// the canceled sequence's exit reports the final
+				continue
+			}
+			// open in the manager with no live sequence
+			contractManager.requestContractClose(contractId)
 			continue
 		}
-		// nothing holds it, or it has just left its queue
-		contractManager.requestContractClose(contractId)
+		if _, ok := queuedKeys[contractId]; ok {
+			// it has just left its queue unused
+			contractManager.requestContractClose(contractId)
+			continue
+		}
+		unownedContractIds = append(unownedContractIds, contractId)
+	}
+	if 0 < len(unownedContractIds) {
+		contractManager.closeUnheldContracts(unownedContractIds)
 	}
 }
 
