@@ -37,9 +37,8 @@ type enumeratedDestination struct {
 
 // --- exit category ---
 
-// IpFamily is this exit's category: the server's label for it, never a local
-// inference (server FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local v6
-// downgrade). In selector mode it is the provider's ip label; from an older
+// This exit's category: the server's label for it, never a local inference
+// (server FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local v6 downgrade). In selector mode it is the provider's ip label; from an older
 // server, its proven `ip_family` (see addProviderDestinations). It changes
 // only when a fresh find-providers2 answer relabels the destination. A bare
 // fixture without args reads as legacy, which carries v4 only.
@@ -446,8 +445,7 @@ func (self *multiClientWindow) enumerateDestinations(excludeDestinations []Multi
 	return self.enumerateRecentExits(excludeDestinations, rankMode, discover)
 }
 
-// discoverDestinations is one discovery request set in push order. A
-// capability-aware generator asks in selector mode (see
+// One discovery request set in push order. A capability-aware generator asks in selector mode (see
 // discoverDestinationsWithCapabilities). With a family-aware generator it is:
 // the v6-capable request first while a v6 shortfall is open and not starved
 // (sized to the shortfall), then the main v4-capable fill, which the platform

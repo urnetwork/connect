@@ -734,8 +734,7 @@ func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamily(count int, exc
 	return destinations, err
 }
 
-// NextDestinationsWithIpFamilyContext is the cancellation-bounded form of
-// family discovery. It uses the same request, identity and exclusion owner.
+// The cancellation-bounded form of family discovery. It uses the same request, identity and exclusion owner.
 // Wrappers that constrain discovery must override this method as well as
 // NextDestinationsWithIpFamily, retaining their count, exclusion, rank and family
 // policy while forwarding the caller's context. The same holds for the

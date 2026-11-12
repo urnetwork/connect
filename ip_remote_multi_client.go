@@ -90,8 +90,8 @@ type DestinationStats struct {
 	// normalized; see location_match.go). Exact for fixed and restored
 	// destinations and for older servers.
 	LocationMatch LocationMatch
-	// IpFamily is the destination provider's proven address-family
-	// category from find-providers2. Legacy (empty) for fixed and restored
+	// The destination provider's proven address-family category from
+	// find-providers2. Legacy (empty) for fixed and restored
 	// destinations and for older servers; legacy carries v4 only. In selector
 	// mode it is the provider's ip label (see addProviderDestinations), so
 	// every placement site reads the server's label through it.
@@ -4238,7 +4238,7 @@ func (self *RemoteUserNatMultiClient) underFlowCap(clients []*multiClientChannel
 	return under
 }
 
-// raceCandidates assembles the field a new flow is placed over.
+// Assembles the field a new flow is placed over.
 //
 // The window offers only its best rank (OrderedClients keeps the min tier) so
 // traffic does not cross rank until necessary. With one or two exits in the
@@ -10782,8 +10782,8 @@ type ExitInfo struct {
 	ClientId Id
 	// WindowTypeLimited for an exit of the limited window
 	WindowType WindowType
-	// IpFamily is the exit's address-family category as discovered: in
-	// selector mode its ip label. Legacy reads as v4-only.
+	// The exit's address-family category as discovered: in selector mode its
+	// ip label. Legacy reads as v4-only.
 	IpFamily IpFamily
 	// The exit's labels as placement reads them (server FP2-PROTOCOL.md
 	// §7.1): "dualstack" or "ipv4", and "dualproto" or "tcp". An exit
@@ -17529,8 +17529,8 @@ type multiClientChannel struct {
 	// still convicts at full speed.
 	dialFailureTimes        []time.Time
 	dialFailureDestinations []string
-	// dialFailureVersions parallels dialFailureTimes entry for entry with the
-	// ip version of the failed dial, pruned with the same prefix cut.
+	// The failed dials' ip versions, parallel to dialFailureTimes entry for
+	// entry and pruned with the same prefix cut.
 	// connectSuccessVersions does the same for connectSuccessTimes. No strike
 	// changes the exit's category: placement reads only the server's labels
 	// (server FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local downgrade).
@@ -17538,8 +17538,8 @@ type multiClientChannel struct {
 	connectSuccessTimes    []time.Time
 	connectSuccessVersions []int
 
-	// familySwapVictim marks an exit the resize pass chose to give up its
-	// slot to a v6-capable candidate (selectFamilySwapVictim). Atomic: read
+	// Marks an exit the resize pass chose to give up its slot to a
+	// v6-capable candidate (selectFamilySwapVictim). Atomic: read
 	// on the placement path, written by the resize pass.
 	familySwapVictim             atomic.Bool
 	serviceRefreshReservation    atomic.Pointer[tcpSynRetry]

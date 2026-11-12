@@ -33,8 +33,8 @@ type WindowExpandEvent struct {
 	// Failed is the terminal outcome state: the window hit its outcome
 	// deadline twice with zero providers Added. Cleared when a provider lands.
 	Failed bool
-	// Ipv6Available is whether the window holds an added, unwarned exit that
-	// can carry v6 (IPV6.md B6). Merged across windows by OR, the limited
+	// Whether the window holds an added, unwarned exit that can carry v6
+	// (IPV6.md B6). Merged across windows by OR, the limited
 	// window's included. While false the apps can tell the user v6 is not
 	// carried, the in-tunnel resolver answers AAAA empty, and v6 flows are
 	// answered with no-route.
@@ -811,8 +811,8 @@ func (self *MergedMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
 	return netProviderEvents
 }
 
-// SetProviderIpFamily rewrites the address-family category of a provider's
-// current event in place and dispatches the change. The event's state and
+// Rewrites the address-family category of a provider's current event in
+// place and dispatches the change. The event's state and
 // EventTime are untouched: the provider is still Added and its connected-since
 // time must not restart because its category was corrected. Returns whether
 // anything changed; unknown client ids and unchanged categories are no-ops.
