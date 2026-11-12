@@ -154,6 +154,19 @@ type extenderOptions struct {
 	// the server is built. The test reads what the command passes through it.
 	configureServer func(settings *extender.ExtenderSettings)
 
+	// whether this extender serves the peer-to-peer webrtc carrier (EXTENDER.md
+	// S, S8): --webrtc. Its offers arrive through a client under the jwt
+	// connected to connectUrl, and a run whose tcp carrier does not bind
+	// serves on it rather than exiting (extender_webrtc.go)
+	webRtc bool
+	// the platform url that client connects to, --connect_url; empty takes
+	// the compiled default
+	connectUrl string
+	// webRtcSignaling, when set, replaces the client that connects to
+	// connectUrl: it returns the manager the carrier's offers arrive on and
+	// its close. The test answers on an in-process manager through it.
+	webRtcSignaling func(ctx context.Context) (*connect.WebRtcManager, func(), error)
+
 	// whether this extender posts what its tcp camouflage came to to the operator
 	// (connect/EXTENDER-SPLICE-ROLLOUT.md): --camouflage_report, off by default.
 	// This is the operator hosts' cohort control, which have no network space.
@@ -198,6 +211,12 @@ func extenderOptionsFromOpts(opts docopt.Opts) (*extenderOptions, error) {
 	}
 	if camouflageReport, err := opts.Bool("--camouflage_report"); err == nil {
 		options.camouflageReport = camouflageReport
+	}
+	if webRtc, err := opts.Bool("--webrtc"); err == nil {
+		options.webRtc = webRtc
+	}
+	if connectUrl, err := opts.String("--connect_url"); err == nil {
+		options.connectUrl = strings.TrimSpace(connectUrl)
 	}
 	if stateDir, err := opts.String("--state_dir"); err == nil {
 		options.stateDir = stateDir
@@ -539,6 +558,10 @@ type extenderRun struct {
 	measurementCert *extender.ExtenderMeasurementCert
 	// the tcp carrier camouflage (EXTENDER.md P), nil unless the owner asked
 	camouflage *extender.ExtenderCamouflageRole
+	// the peer-to-peer webrtc carrier and the manager its offers arrive on
+	// (EXTENDER.md S8), nil unless the owner asked: --webrtc
+	webRtcCarrier *connect.WebRtcExtenderCarrier
+	webRtcManager *connect.WebRtcManager
 
 	serveDone chan error
 	// wakes the run loop when the carriers being served change
@@ -735,6 +758,26 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	if run.camouflage != nil {
 		run.camouflage.ConfigureServer(serverSettings)
 	}
+	// the peer-to-peer webrtc carrier, when the owner asked (EXTENDER.md S8):
+	// the server lists it, so the activation offers it, and serves its
+	// streams through the answerer installed below
+	if options.webRtc {
+		openSignaling := options.webRtcSignaling
+		if openSignaling == nil {
+			openSignaling = func(ctx context.Context) (*connect.WebRtcManager, func(), error) {
+				return openExtenderWebRtcSignaling(ctx, options, run.clientStrategy)
+			}
+		}
+		manager, closeSignaling, err := openSignaling(ctx)
+		if err != nil {
+			return nil, err
+		}
+		run.closers = append(run.closers, closeSignaling)
+		run.webRtcManager = manager
+		run.webRtcCarrier = connect.NewWebRtcExtenderCarrier(ctx, connect.DefaultWebRtcExtenderSettings(), nil)
+		run.closers = append(run.closers, run.webRtcCarrier.Close)
+		serverSettings.WebRtcCarrier = true
+	}
 	if options.configureServer != nil {
 		options.configureServer(serverSettings)
 	}
@@ -749,6 +792,14 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 		serverSettings,
 	)
 	run.closers = append(run.closers, run.server.CloseAndWait)
+	if run.webRtcManager != nil {
+		answerer := run.webRtcCarrier.Answerer(run.server)
+		run.webRtcManager.SetExtenderCarrierAnswerer(answerer)
+		// the carrier stops answering before the server it answers with goes
+		run.closers = append(run.closers, func() {
+			run.webRtcManager.RemoveExtenderCarrierAnswerer(answerer)
+		})
+	}
 	go func() {
 		run.serveDone <- run.server.ListenAndServe()
 	}()
@@ -776,12 +827,19 @@ func newExtenderRun(ctx context.Context, options *extenderOptions) (*extenderRun
 	}
 	Out.Printf("extender carriers: %s", strings.Join(run.server.Carriers(), ","))
 	// A carrier whose first bind failed stays down (G2), and the operator accepts no
-	// activation without tcp, so this run could never post and would never end. A
-	// role waits for the port and says so; this process exits for whatever runs it to
-	// see (G4).
+	// activation without tcp or webrtc (C2a), so this run could never post and would
+	// never end. A role waits for the port and says so; this process exits for
+	// whatever runs it to see (G4). With --webrtc the carrier is the required path
+	// a host behind nat is accepted on, and the run goes on without the port.
 	if !slices.Contains(run.server.Carriers(), connect.ExtenderCarrierTcp) {
-		return nil, fmt.Errorf(
-			"the extender tcp carrier did not bind: %w",
+		if !slices.Contains(run.server.Carriers(), connect.ExtenderCarrierWebRtc) {
+			return nil, fmt.Errorf(
+				"the extender tcp carrier did not bind: %w",
+				run.server.ListenErrors()[connect.ExtenderCarrierTcp],
+			)
+		}
+		Err.Printf(
+			"extender tcp carrier did not bind, serving on the webrtc carrier: %s",
 			run.server.ListenErrors()[connect.ExtenderCarrierTcp],
 		)
 	}

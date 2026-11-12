@@ -47,6 +47,20 @@ func logIceInterfaces(log Logger) {
 	})
 }
 
+// The ICE network types of a factory pinned to one family
+// (WebRtcSettings.IceIpVersion): udp of that family alone, or nil, Pion's
+// default of both, for 0 and any other value.
+func webRtcIceNetworkTypes(ipVersion int) []webrtc.NetworkType {
+	switch ipVersion {
+	case 4:
+		return []webrtc.NetworkType{webrtc.NetworkTypeUDP4}
+	case 6:
+		return []webrtc.NetworkType{webrtc.NetworkTypeUDP6}
+	default:
+		return nil
+	}
+}
+
 // newWebRtcPeerConnectionFactory builds immutable manager-scoped Pion state
 // once. This transport is data-channel-only, so it needs neither the default
 // media codecs nor RTP interceptors. A caller-provided certificate is also
@@ -167,6 +181,11 @@ func newWebRtcPeerConnectionFactory(
 	)
 	if 0 < settings.StunGatherTimeout {
 		s.SetSTUNGatherTimeout(settings.StunGatherTimeout)
+	}
+	// one family when the owner pins it (WebRtcSettings.IceIpVersion): no
+	// candidate of the other is gathered, so no pair of it can be selected
+	if networkTypes := webRtcIceNetworkTypes(settings.IceIpVersion); networkTypes != nil {
+		s.SetNetworkTypes(networkTypes)
 	}
 	if certificate == nil {
 		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

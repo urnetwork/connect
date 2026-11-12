@@ -99,6 +99,10 @@ type testActivateOperator struct {
 	// the `refused_carriers` an activation carries (C2a), none as an operator
 	// that predates the field sends
 	refusedCarriers []*ExtenderActivateCarrierRefusal
+	// answers as an operator that predates the webrtc carrier (EXTENDER.md
+	// S8): a list naming a carrier it does not know, or none with tcp, is
+	// refused before anything is probed, in that operator's words
+	predatesWebRtc bool
 	// the address an activation of a family is answered with, by family; the
 	// family's fixed address while unset
 	publishedIps map[int]string
@@ -185,6 +189,20 @@ func (self *testActivateOperator) familyHandler(ipVersion int) http.Handler {
 		probeSteps := self.probeSteps
 		answer := self.answer
 		self.postCounts[ipVersion] += 1
+		if self.predatesWebRtc && refusal == "" {
+			for _, carrier := range args.Carriers {
+				switch carrier {
+				case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns:
+				default:
+					if refusal == "" {
+						refusal = fmt.Sprintf("unknown carrier %q", carrier)
+					}
+				}
+			}
+			if refusal == "" && !slices.Contains(args.Carriers, ExtenderCarrierTcp) {
+				refusal = "an activation must offer the tcp carrier"
+			}
+		}
 		self.stateLock.Unlock()
 		select {
 		case self.posts <- &testActivatePost{ipVersion: ipVersion, args: args, postTime: now}:
