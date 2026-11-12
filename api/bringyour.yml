@@ -22826,6 +22826,17 @@ components:
           type: array
           items:
             type: string
+        address_ports:
+          description: |
+            True on every answer of an operator that keeps each address's
+            ports (EXTENDER.md S10): it stores the ports a post offers with
+            that family's address alone and signs them per address, so an
+            extender may offer each family its own, such as the ports a
+            router forwards over ipv4 and the bound ones over ipv6. An
+            extender offers them only while the operator's last answer said
+            this; absent from an operator that predates it, which keeps one
+            port per carrier for every address of an extender.
+          type: boolean
 
     ExtenderCarrierRefusal:
       type: object

@@ -4526,24 +4526,48 @@ host with a public ipv4 address maps nothing (`connect.FamilyPublic(4)`), and
 neither does a host whose default route is a tunnel (`connect.
 IsTunnelInterfaceName`), such as an app's own vpn while connected.
 
-The activation offers what the router forwards. The first post waits for the
-router's first answer at most 15 s, so a missing or broken router delays the
-first activation by that and nothing else; each post reads the external ports
-(`ExtenderActivatorSettings.OfferedPorts`, and the dns carrier's within
-`DnsPorts`), a mapping that lands or moves later is posted at once
-(`Reactivate`), and the mesh address uses the external tcp port. A router may
-give an external port other than 443: PCP and NAT-PMP pick one, and an IGD:2
-router answers a conflict (718) through AddAnyPortMapping; IGD:1's conflict
-fails the method. The record holds one port per carrier for every address of
-an extender, so with an external port other than the bound one a v6 address is
-offered that port too and the operator's probe leaves it out unless it answers
-there; per-address ports are a record and server change for later. Only ipv4 is
+The activation offers what the router forwards, to the family it forwards. The
+first post waits for the router's first answer at most 15 s, so a missing or
+broken router delays the first activation by that and nothing else; each ipv4
+post reads the external ports and each ipv6 post offers the bound ones, since
+only ipv4 is mapped (`ExtenderActivatorSettings.FamilyOfferedPorts` and
+`FamilyDnsPorts`, read per family at each post; a post to the plain api url,
+whose family the operator derives, offers the ipv4 ones); a mapping that lands
+or moves later is posted at once (`Reactivate`), and each family's mesh address
+uses the tcp port its post offered. A router may give an external port other
+than 443: PCP and NAT-PMP pick one, and an IGD:2 router answers a conflict (718)
+through AddAnyPortMapping; IGD:1's conflict fails the method. Only ipv4 is
 mapped; a v6 firewall pinhole (PCP or WANIPv6FirewallControl) is not done.
+
+Each address keeps its own ports (built 2026-11-12). The operator stores the
+tcp and udp ports each family's activation was probed on with that family's
+address (`network_extender_address.tcp_port` and `udp_port`, beside its
+`dns_ports`); the uptime and recovery probes dial an address on its own tcp
+port; the lag.dev measurement takes only the addresses that serve tcp on 443;
+and the signed record names an address's own ports where they are not the
+record's (`protocol.ExtenderAddress` `TcpPort`, `UdpPort` and `DnsPorts`,
+fields 4 to 6), which a client's candidate dials (`ExtenderDirectory`). The
+record's own ports stay the extender's latest activation's, so an address on
+them names none, and the record of an extender whose addresses share their
+ports is the record it always was. A reader that predates the fields skips them
+and dials every address on the record's, which is what it did before; an
+address activated before the operator kept its ports reads the extender's.
+Every answer of such an operator says so (`address_ports`,
+`ExtenderActivateResult.AddressPorts`), and a family's post offers its own
+ports only while the last answer did: until then, and to an operator that
+predates it, every post offers the one set of ports, the router's (the family
+seams asked for family 0), since an operator keeping one port per carrier would
+publish each family on the other's. The first post of a pass is the ipv4 one,
+so the ipv6 post of the same pass already offers its own. The order the
+operator and the extenders are deployed in does not matter.
 
 `ExtenderProvideStatus` reports it: `PortMapping` (off, not_needed, mapping,
 mapped, failed), `PortMappingMethod`, `PortMappingExternalIp`, the external
 `PortMappingTcpPort`, `PortMappingUdpPort` and `PortMappingDnsPort`, and
-`PortMappingError`, why nothing is mapped or why a udp carrier is not. Tests,
+`PortMappingError`, why nothing is mapped or why a udp carrier is not. The
+apps show `PortMapping` with `PortMappingMethodName` and `PortMappingPorts`,
+the method and the forwarded ports as one text in every language; never
+`PortMappingError`, whose router words can name an address. Tests,
 all in process: `portmap/` against a PCP and NAT-PMP server answered in memory
 and a UPnP IGD:1 and IGD:2 device on httptest, with a clock whose waits the test
 fires (the methods, the fallback, the router's external port, renewal at the
@@ -4551,13 +4575,21 @@ granted lifetime and a moved port, the retry backoff, removal on close, the
 partial method undone, permanent leases, conflicts, double NAT, urls off the
 gateway, and every request naming only the caller's ports), and the real udp
 exchange and SSDP search on loopback; connect's
-`TestExtenderActivatorOffersTheMappedPorts`; the sdk role at the device's
-entry points with a NAT-PMP router behind the mapper's seam
-(`device_local_extender_port_mapping_test.go`: off by default, the router's
-ports in every post and in the mesh address, nothing asked with a public
-address, the mappings removed when the setting turns off and when the role
-stops, a moved mapping posted at once); the miner's default, the environment,
-the flag and the status lines (`sn/miner/port_mapping_test.go`).
+`TestExtenderActivatorOffersTheMappedPorts`, and for the per-address ports
+`net_extender_address_ports_test.go` (the fields' wire numbers, an address
+without them encoding as before, a candidate on its address's ports and on the
+record's without them, each family's post offering its own ports, a carrier
+change compared per family); the sdk role at the device's entry points with a
+NAT-PMP router behind the mapper's seam (`device_local_extender_port_mapping_test.go`:
+off by default, the router's ports in every ipv4 post and ipv4 mesh address
+and the bound ones over ipv6, nothing asked with a public address, the mappings
+removed when the setting turns off and when the role stops, a moved mapping
+posted at once, the space's stored setting read by a device that starts
+later); the operator's record and measurement rule
+(server `controller/extender_address_ports_test.go`, with an activation of
+each family keeping its ports) and its storage, readers and probe targets
+(`model/network_extender_address_ports_test.go`); the miner's default, the
+environment, the flag and the status lines (`sn/miner/port_mapping_test.go`).
 
 ### I. Tests
 
@@ -4659,6 +4691,10 @@ with the database.
 | `POST /network/extender-activate` answer | a key another network holds is refused with the fixed `error` of C2c and no `retry_after_seconds`; old providers read it as any refusal (C2c) |
 | api metrics | stage `owner` on `urnetwork_extender_activations_total` (C2b, C2c) |
 | alt api front and status listener | `X-UR-Forwarded-For` set from the peer; `X-Forwarded-For`, `X-Forwarded-Source-Port` and `X-UR-Request-Buffering` cleared (L1) |
+| `protocol.ExtenderAddress` | `TcpPort`, `UdpPort` and `DnsPorts` added (fields 4 to 6): an address's own ports where they are not the record's; zero and empty take the record's, and a reader that predates them skips them (S10) |
+| `ExtenderActivatorSettings` | `FamilyOfferedPorts` and `FamilyDnsPorts` added, read per family in place of `OfferedPorts` and `DnsPorts`, for family 0 while the operator keeps no address ports (S10) |
+| `POST /network/extender-activate` answer | `address_ports` added: the operator keeps each address's ports; old providers skip it (S10) |
+| `network_extender_address` | `tcp_port` and `udp_port` added, nullable; null is the extender's (S10) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still

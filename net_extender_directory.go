@@ -2213,6 +2213,24 @@ func (self *ExtenderDirectory) candidateWithLock(
 	if carriers := recordAddressCarriers(body, address.ip); carriers != nil {
 		candidate.Carriers = carriers
 	}
+	// an address whose ports are not the record's own -- one family a router
+	// maps to other ports (S10) -- is dialed on its own
+	if recordAddress := recordAddressEntry(body, address.ip); recordAddress != nil {
+		if 0 < recordAddress.TcpPort {
+			candidate.TcpPort = int(recordAddress.TcpPort)
+		}
+		if 0 < recordAddress.UdpPort {
+			candidate.UdpPort = int(recordAddress.UdpPort)
+		}
+		dnsPorts := []int{}
+		for _, dnsPort := range recordAddress.DnsPorts {
+			dnsPorts = append(dnsPorts, int(dnsPort))
+		}
+		if dnsPorts = orderedDnsPorts(dnsPorts); 0 < len(dnsPorts) {
+			candidate.DnsPort = dnsPorts[0]
+			candidate.DnsPorts = dnsPorts
+		}
+	}
 	// the webrtc carrier needs the record's rendezvous id and a signaling
 	// path on this host, which the enable says the owner has (S)
 	if webRtcClientId, err := IdFromBytes(body.WebRtcClientId); err == nil {
@@ -2290,24 +2308,32 @@ func recordDnsPorts(body *protocol.ExtenderRecordBody) []int {
 	return nil
 }
 
+// The record's entry for one address, nil when the record does not name it.
+func recordAddressEntry(body *protocol.ExtenderRecordBody, ip netip.Addr) *protocol.ExtenderAddress {
+	for _, recordAddress := range body.Addresses {
+		recordIp, err := netip.ParseAddr(recordAddress.Ip)
+		if err == nil && recordIp.Unmap() == ip {
+			return recordAddress
+		}
+	}
+	return nil
+}
+
 // The carriers the record lists for one address, or nil when the record does
 // not name the address, which leaves the caller on the carrier defaults.
 func recordAddressCarriers(body *protocol.ExtenderRecordBody, ip netip.Addr) []string {
-	for _, recordAddress := range body.Addresses {
-		recordIp, err := netip.ParseAddr(recordAddress.Ip)
-		if err != nil || recordIp.Unmap() != ip {
-			continue
-		}
-		carriers := []string{}
-		for _, carrier := range recordAddress.Carriers {
-			switch carrier {
-			case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc:
-				carriers = append(carriers, carrier)
-			}
-		}
-		return carriers
+	recordAddress := recordAddressEntry(body, ip)
+	if recordAddress == nil {
+		return nil
 	}
-	return nil
+	carriers := []string{}
+	for _, carrier := range recordAddress.Carriers {
+		switch carrier {
+		case ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns, ExtenderCarrierWebRtc:
+			carriers = append(carriers, carrier)
+		}
+	}
+	return carriers
 }
 
 // Reports whether the key backing an address is active (B5) -- an unverified
