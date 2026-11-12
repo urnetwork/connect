@@ -164,6 +164,15 @@ func (self *webRtcExtenderSignaling) setAnswerer(answerer WebRtcExtenderOfferAns
 	self.answerer = answerer
 }
 
+// removeAnswerer clears the answerer only while it is still answerer.
+func (self *webRtcExtenderSignaling) removeAnswerer(answerer WebRtcExtenderOfferAnswerer) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if answerer != nil && self.answerer == answerer {
+		self.answerer = nil
+	}
+}
+
 func (self *webRtcExtenderSignaling) stats() WebRtcExtenderSignalingStats {
 	return WebRtcExtenderSignalingStats{
 		UnansweredOfferCount: self.unansweredOfferCount.Load(),
@@ -400,6 +409,13 @@ func (self *webRtcExtenderSignalExchanger) ExchangeOffer(
 // not an extender does.
 func (self *WebRtcManager) SetExtenderCarrierAnswerer(answerer WebRtcExtenderOfferAnswerer) {
 	self.extenderCarrier.setAnswerer(answerer)
+}
+
+// RemoveExtenderCarrierAnswerer uninstalls answerer when it is still the one
+// installed (EXTENDER.md S8): a role that closes after its successor
+// installed an answerer of its own takes nothing from it.
+func (self *WebRtcManager) RemoveExtenderCarrierAnswerer(answerer WebRtcExtenderOfferAnswerer) {
+	self.extenderCarrier.removeAnswerer(answerer)
 }
 
 // ExtenderCarrierExchanger is the dial side of the webrtc carrier for one

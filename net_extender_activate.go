@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -566,6 +567,11 @@ type ExtenderActivator struct {
 	// true when neither family api url is set, so one post per cycle goes to
 	// the plain api url and the answer names the family it activated
 	fallback bool
+	// set once the operator refused a list naming the webrtc carrier as an
+	// unknown carrier, which an operator that predates the carrier does before
+	// it probes anything (EXTENDER.md S8): every later post leaves the carrier
+	// off, so the socket carriers still activate there
+	webRtcUnknown atomic.Bool
 
 	stateLock sync.Mutex
 	version   uint64
@@ -1418,8 +1424,24 @@ func (self *ExtenderActivator) carriers() []string {
 	if self.settings.Carriers == nil {
 		return []string{}
 	}
-	return self.settings.Carriers()
+	carriers := self.settings.Carriers()
+	if self.webRtcUnknown.Load() {
+		carriers = extenderActivateWithoutWebRtc(carriers)
+	}
+	return carriers
 }
+
+// The carriers less the webrtc carrier, a new list.
+func extenderActivateWithoutWebRtc(carriers []string) []string {
+	return slices.DeleteFunc(slices.Clone(carriers), func(carrier string) bool {
+		return carrier == ExtenderCarrierWebRtc
+	})
+}
+
+// The refusal of an operator that predates the webrtc carrier for a list that
+// names it (EXTENDER.md S8): its carrier check refuses any carrier it does not
+// know, by name, before it probes or spends anything.
+const extenderActivateUnknownWebRtcCarrierError = `unknown carrier "webrtc"`
 
 // The carrier ports a post offers: OfferedPorts' where it answers one, else the
 // configured port.
@@ -1821,6 +1843,20 @@ func (self *ExtenderActivator) activateUrl(
 	if result == nil {
 		self.recordFailure(ipVersion, now, "the operator sent no activation result", false)
 		return extenderActivateAnswer{outcome: extenderActivateFailed}
+	}
+	if !result.Activated && result.Error == extenderActivateUnknownWebRtcCarrierError &&
+		slices.Contains(carriers, ExtenderCarrierWebRtc) {
+		// an operator that predates the webrtc carrier (S8): it probed and
+		// spent nothing, so the same post goes again at once without the
+		// carrier, and no later post names it
+		self.webRtcUnknown.Store(true)
+		self.log.Infof("[extender]activate v%d: the operator predates the webrtc carrier, posting without it\n", ipVersion)
+		withoutWebRtc := extenderActivateWithoutWebRtc(carriers)
+		if message := extenderActivateCarrierFailure(withoutWebRtc); message != "" {
+			self.recordCarrierHeld(ipVersion, now, message)
+			return extenderActivateAnswer{outcome: extenderActivateCarrierHeld}
+		}
+		return self.activateUrl(ipVersion, apiUrl, withoutWebRtc, dnsPorts, measurementCsr, now)
 	}
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)

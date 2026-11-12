@@ -140,7 +140,9 @@ Usage:
         [--camouflage_splice]
         [--camouflage_revalidate_interval=<duration>]
         [--camouflage_report]
-    
+        [--webrtc]
+        [--connect_url=<connect_url>]
+
 Options:
     -h --help                        Show this screen.
     --version                        Show version.
@@ -192,7 +194,13 @@ Options:
                                      settled. Needs --camouflage.
     --camouflage_revalidate_interval=<duration>
                                      How often the borrowed names are verified again, such as 6h
-                                     (default 6h, at least 10m). Needs --camouflage.`,
+                                     (default 6h, at least 10m). Needs --camouflage.
+    --webrtc                         Also serve the peer-to-peer webrtc carrier, which a host
+                                     behind NAT is accepted on without a public tcp port. Its
+                                     offers arrive through a client under --jwt (a client jwt)
+                                     connected to --connect_url; the operator's probes and the
+                                     network's own devices reach it. Without a tcp bind the
+                                     extender serves on this carrier alone.`,
 		DefaultApiUrl,
 		DefaultConnectUrl,
 	)

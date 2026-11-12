@@ -2,6 +2,7 @@ package connect
 
 import (
 	"crypto/ed25519"
+	"net/netip"
 	"slices"
 	"testing"
 	"time"
@@ -186,5 +187,59 @@ func TestClientStrategyExpandsAWebRtcDialerForAWebRtcCandidate(t *testing.T) {
 		if expandedDialers[0].description != "extender webrtc" {
 			t.Fatalf("dialer description = %q", expandedDialers[0].description)
 		}
+	}
+}
+
+// The hold of one address, read under the directory's lock.
+func testExtenderAddressHold(directory *ExtenderDirectory, ip netip.Addr) (time.Time, int) {
+	directory.stateLock.Lock()
+	defer directory.stateLock.Unlock()
+	address := directory.ipAddresses[ip]
+	if address == nil {
+		return time.Time{}, -1
+	}
+	return address.holdUntilTime, address.consecutiveFailureCount
+}
+
+// Root cause: a hold is of the whole address, so a webrtc join this client
+// could not make -- the nats between the two ends, its own signaling down --
+// held an extender's working tcp, quic and dns too (S8, S9). Observable: a
+// failed webrtc dial holds nothing of an address that lists a socket carrier,
+// a failed tcp dial of the same address holds it, and a failed webrtc dial of
+// an address that lists webrtc alone holds it, since webrtc is all it serves.
+func TestExtenderDirectoryHoldsAWebRtcFailureOnlyAgainstAWebRtcOnlyAddress(t *testing.T) {
+	clock := newTestClock()
+	_, directory, rootPrivateKey := newTestExtenderStrategy(t, clock, nil)
+	directory.SetWebRtcCarrierEnabled(true)
+	apply := func(ip string, carriers ...string) netip.Addr {
+		record := signTestWebRtcRecord(
+			t,
+			rootPrivateKey,
+			newTestExtenderKey(t),
+			clock.Now(),
+			clock.Now().Add(14*24*time.Hour),
+			NewId(),
+			testExtenderAddress(ip, carriers...),
+		)
+		if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+			t.Fatal(err)
+		}
+		return netip.MustParseAddr(ip)
+	}
+	dual := apply("192.0.2.120", ExtenderCarrierTcp, ExtenderCarrierWebRtc)
+	webRtcOnly := apply("192.0.2.121", ExtenderCarrierWebRtc)
+
+	directory.RecordFailure(dual, ExtenderConnectModeWebRtc)
+	if holdUntil, failures := testExtenderAddressHold(directory, dual); !holdUntil.IsZero() || failures != 0 {
+		t.Fatalf("a webrtc failure held a socket address: hold %s, %d failures", holdUntil, failures)
+	}
+	directory.RecordFailure(dual, ExtenderConnectModeTcpTls)
+	if holdUntil, failures := testExtenderAddressHold(directory, dual); holdUntil.IsZero() || failures != 1 {
+		t.Fatalf("a tcp failure did not hold the address: hold %s, %d failures", holdUntil, failures)
+	}
+
+	directory.RecordFailure(webRtcOnly, ExtenderConnectModeWebRtc)
+	if holdUntil, failures := testExtenderAddressHold(directory, webRtcOnly); holdUntil.IsZero() || failures != 1 {
+		t.Fatalf("a webrtc failure did not hold a webrtc-only address: hold %s, %d failures", holdUntil, failures)
 	}
 }
