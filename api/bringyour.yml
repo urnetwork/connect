@@ -796,6 +796,38 @@ paths:
         "403":
           $ref: "#/components/responses/SidecarProofRefused"
 
+  /auth/network-switch:
+    post:
+      tags: [Auth]
+      summary: Switch to another network
+      description: |
+        A person's own network credential, never a client's, an API key or an
+        admin token, buys a network credential of the same user for another
+        network it signs in to: a personal network it owns, or a team it is a
+        live member of, whose credential names the membership's `member_id`.
+        The target's sign-in rule holds: a team that requires its IdP refuses
+        every switch, "This team signs in only through its IdP.", since no
+        credential of another network came through that IdP. A network the
+        person has no sign-in to, or its current one, is refused in `error`.
+      operationId: authNetworkSwitch
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkSwitchArgs"
+      responses:
+        "200":
+          description: The credential, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkSwitchResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
   /auth/network-refresh:
     post:
       tags: [Authentication]
@@ -12426,6 +12458,102 @@ paths:
           description: "`after` is not a member id."
         "402":
           description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/member-invite:
+    post:
+      tags: [Network]
+      summary: Invite a person to a team
+      description: |
+        A team's Owner or Admin invites a person by email. The server keeps
+        the email, the role, the expiry and only the SHA-256 of the invite's
+        secret, and answers `invite_bearer`, `ur-invite-<invite_id>-<secret>`,
+        which this answer alone holds. The inviting device appends the link's
+        client-only fragment, which no request ever carries: the network's
+        genesis hash, the authorization pin it stood at, its own key and a
+        one-time secret that MACs the join of the person's first device, which
+        that device's admin admits. An invite lives `expire_days`, 1 to 30.
+        The role is the one the admitting device signs in the team's config
+        repo; the server mirrors roles from there, never from the invite. A new
+        invite emails the team's Owners and Admins.
+
+        A member's credential reaches the route only with the members
+        permission (`RolePermissionRefused`), and any other caller is refused
+        403 "Only the team's Owners and Admins may invite members." A
+        one-command admin token with the `all` scope reaches it once: a retry
+        of the same token answers the first result and makes no second
+        invite. A network outside the team tier is refused 402 with a
+        `QuotaRefusal` whose `limit_key` is `team`. 503 while teams are not
+        available.
+      operationId: networkMemberInvite
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkMemberInviteArgs"
+      responses:
+        "200":
+          description: The invite, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkMemberInviteResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/member-invite-accept:
+    post:
+      tags: [Network]
+      summary: Join a team from an invite
+      description: |
+        The invited person joins the team with its own sign-in: a network
+        credential of any network it holds, never a client's, an API key or
+        an admin token. One of the person's verified sign-in emails must be
+        the invite's. The membership starts with the member role, whatever
+        the invite names: the device that admits the person's first device
+        signs the invite's role in the team's config repo, and the server
+        mirrors it from there. The answer names the team, the new `member_id`
+        and the invite's role. The invite is spent; an expired one is refused
+        and gone. Then `POST /auth/network-switch` gives the person a
+        credential for the team. `invite_bearer` is the bearer alone: a body
+        holding the link's fragment is a client's mistake, and the client
+        refuses to send it.
+      operationId: networkMemberInviteAccept
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkMemberInviteAcceptArgs"
+      responses:
+        "200":
+          description: The membership, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkMemberInviteAcceptResult"
+        "402":
+          description: The team is outside the team tier.
           content:
             application/json:
               schema:
@@ -28532,6 +28660,93 @@ components:
           description: datetime. When the member's access ends unless its IdP signs it in again.
           type: string
 
+    NetworkMemberInviteArgs:
+      type: object
+      required:
+        - email
+        - role
+        - expire_days
+      properties:
+        email:
+          description: The invited person's email, which its sign-in must hold.
+          type: string
+        role:
+          description: One of owner, admin, network_admin, it_admin, billing_admin, auditor or member, which the admitting device signs.
+          type: string
+        expire_days:
+          description: 1 to 30.
+          type: integer
+    NetworkMemberInviteResult:
+      type: object
+      properties:
+        invite_id:
+          description: udid
+          type: string
+        invite_bearer:
+          description: ur-invite-<invite_id>-<secret>, which this answer alone holds.
+          type: string
+        expire_time:
+          type: string
+          format: date-time
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    NetworkMemberInviteAcceptArgs:
+      type: object
+      required:
+        - invite_bearer
+      properties:
+        invite_bearer:
+          description: ur-invite-<invite_id>-<secret>, never the link's fragment.
+          type: string
+    NetworkMemberInviteAcceptResult:
+      type: object
+      properties:
+        network_id:
+          description: udid. The team.
+          type: string
+        member_id:
+          description: udid. The new membership.
+          type: string
+        invited_role:
+          description: The role the invite names, which the admitting device signs; the membership holds member until then.
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    NetworkSwitchArgs:
+      type: object
+      required:
+        - network_id
+      properties:
+        network_id:
+          description: udid
+          type: string
+    NetworkSwitchResult:
+      type: object
+      properties:
+        by_jwt:
+          description: A network credential for the target.
+          type: string
+        network_id:
+          description: udid
+          type: string
+        network_name:
+          type: string
+        member_id:
+          description: udid. The membership a team credential names; absent for a personal network.
+          type: string
+        role:
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     NetworkMembersResult:
       type: object
       required:
