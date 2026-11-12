@@ -4465,9 +4465,10 @@ same branch:
    2-pending cap, the ttls, the size bounds and the answer list are as they
    were. A wake is advisory, which the keyspace event was too: one lost to
    a resubscribe is made up by the take every listener makes when the
-   subscription starts, and one lost to a move by the take the resident's
-   new registration makes; an offer nobody takes expires with its prober's
-   wait, and the next probe tries again.
+   subscription starts, and one that goes to a process the client's
+   resident has just left, by the take the resident's new registration
+   makes when the offer was added before it; an offer nobody takes expires
+   with its prober's wait, and the next probe tries again.
 6. A cap on extenders accepted on webrtc without tcp, 100 at first, with
    its refusal and its metrics (S8); `ExtenderProbeConcurrency` stays 16.
 7. Monitor alert classes on the relay's no_answer and busy shares
