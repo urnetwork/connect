@@ -1,5 +1,5 @@
-// Failed hold admission returns only newly acquired legacy credit. Real paid
-// decoder roots remain charged until their caller returns the refused owner.
+// Unpaid repair refusal acquires no legacy hold credit. Real paid decoder
+// roots remain charged until their caller returns the refused owner.
 package connect
 
 import (
@@ -11,7 +11,7 @@ import (
 
 // Drives the real handoff worker with an allocating decoder that has no paid
 // ingress owner. Strict repair admission refuses it without acquiring a lease.
-func TestCanonicalDecodedMetadataRepairRefusalRefundsLegacyHold(t *testing.T) {
+func TestCanonicalDecodedMetadataRepairRefusalDoesNotAcquireLegacyHold(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		for _, count := range []int{2, 8} {
@@ -62,13 +62,25 @@ func TestCanonicalDecodedMetadataRepairRefusalRefundsLegacyHold(t *testing.T) {
 				packBudget.UsedByteCount() != witness.want || receiveBudget.UsedByteCount() != 0 {
 				t.Fatal("legacy refusal did not enter with only its real handoff owner", count, accepted, err)
 			}
-			release()
-			synctest.Wait()
 			manager := fixture.receiver.receiveBuffer
 			manager.mutex.Lock()
 			sequence := manager.receiveSequences[receiveSequenceId{Source: SourceId(fixture.sender.ClientId()), SequenceId: sequenceId, EncryptionRole: sequenceTlsRoleServer}]
 			manager.mutex.Unlock()
-			if sequence == nil || sequence.receiveQueue.GetByMessageId(messageId) != nil || sequence.ackWindow.Pending() ||
+			// The blocked worker has room for this ordinary future original.
+			// Only its absent paid RX owner prevents the repair commitment.
+			if sequence == nil || sequence.nextSequenceNumber != 0 || sequence.receiveQueue.Len() != 0 ||
+				!sequence.receiveQueue.lifetimeBudget || sequence.receiveQueue.budget != receiveBudget ||
+				witness.pack.Pack.SequenceNumber != 1 || witness.pack.Pack.Head || witness.pack.Pack.Nack ||
+				protocolOnlyReceivePack(witness.pack) || receiveDeliveryHasTcp(witness.pack.Pack.Frames) ||
+				witness.pack.receiveQueueByteCount() != witness.want || receiveBudget.Available() < witness.want ||
+				parent.UsedByteCount() != witness.want ||
+				!sequence.receiveQueue.CanAddWithQueueByteCountAndCredit(witness.pack.MessageByteCount, witness.want,
+					sequence.receiveBufferSettings.ReceiveQueueMaxByteCount, 0) {
+				t.Fatal("legacy repair refusal lacks an otherwise admissible future original", count)
+			}
+			release()
+			synctest.Wait()
+			if sequence.receiveQueue.GetByMessageId(messageId) != nil || sequence.ackWindow.Pending() ||
 				sequence.heldHeadRepair.eligibleCount != 0 || sequence.heldHeadRepair.reservedByteCount != 0 ||
 				fixture.receiver.receiveQueueDropCount.Load() != 1 || len(fixture.receiverOut) != 0 || fixture.deliveredCount != 0 ||
 				witness.owner.inUse || packBudget.UsedByteCount() != 0 {
@@ -77,8 +89,8 @@ func TestCanonicalDecodedMetadataRepairRefusalRefundsLegacyHold(t *testing.T) {
 			stats := receiveBudget.Stats()
 			t.Logf("legacy_repair_refusal frames=%d C=%d used=%d reserved=%d released=%d held=0 ack=0 ownerReturned=true", count,
 				witness.want, stats.UsedByteCount, stats.ReservedByteCount, stats.ReleasedByteCount)
-			if stats.UsedByteCount != 0 || stats.ReservedByteCount != witness.want || stats.ReleasedByteCount != witness.want || parent.UsedByteCount() != 0 {
-				t.Errorf("failed repair admission leaked legacy decoded hold credit: frames=%d C=%d stats=%+v parent=%d", count, witness.want, stats, parent.UsedByteCount())
+			if stats.UsedByteCount != 0 || stats.ReservedByteCount != 0 || stats.ReleasedByteCount != 0 || parent.UsedByteCount() != 0 {
+				t.Errorf("repair refusal acquired legacy decoded hold credit: frames=%d C=%d stats=%+v parent=%d", count, witness.want, stats, parent.UsedByteCount())
 				// The counterfactual is already recorded. Return only the exact
 				// orphan for fixture teardown; no retry or progress uses it.
 				if stats.UsedByteCount == witness.want && stats.ReservedByteCount == witness.want && stats.ReleasedByteCount == 0 {
