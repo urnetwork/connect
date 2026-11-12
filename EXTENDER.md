@@ -4281,8 +4281,10 @@ nothing, and every webrtc test was refused.
 - Tests. connect: the gate and the resolver of the dial signaling, an offer
   resolved through it reaching the extender over the bridged signaling, the
   dialer's port, outer name, shaping and priority, the directory's failure
-  rule, the pinned ICE family, the answerer removal, connectctl's flags and
-  a run serving on the carrier alone. server: the acceptance rule over fake
+  rule, the pinned ICE family (the network types; Pion's gathering under
+  them on loopback behind the `urnetwork_webrtc_loopback` build tag), the
+  answerer removal, connectctl's flags and a run serving on the carrier
+  alone. server: the acceptance rule over fake
   probes (webrtc alone, webrtc while tcp waits out the budget with the
   optional carriers running first, both, neither, the webrtc failures as
   counted stages, a panic contained, no webrtc test without the offer), the
