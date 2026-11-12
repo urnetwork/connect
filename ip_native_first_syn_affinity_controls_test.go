@@ -167,6 +167,93 @@ func TestNativeFirstSynInheritedAffinityQueuedSourceCloseReturnsBacking(t *testi
 	testInheritedSynQueuedRetirement(t, true)
 }
 
+// A successful raw admission can dequeue before the dispatching worker returns.
+// Holding materialization exposes that admission's still-pending cache owner.
+func testInheritedSynDequeuedOpening(t *testing.T, retire string) {
+	t.Helper()
+	var entered, release chan struct{}
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	var armed atomic.Bool
+	var retains, rearms atomic.Int64
+	testNativeFirstSynInheritedAffinityOpening(t, func(settings *ClientSettings) {
+		entered, release = make(chan struct{}), make(chan struct{})
+		settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+			// The pressure ACK precedes the automatically admitted SYN.
+			if armed.Load() && retains.Add(1) == 2 {
+				close(entered)
+				<-release
+			}
+		}
+	}, func(t *testing.T, fixture *inheritedSynOpeningFixture) {
+		defer finish()
+		credits := fixture.pending(t)
+		fixture.harness.multiClient.beforeSynRetryReadinessArmForTest = func(update *multiClientChannelUpdate) {
+			if update == fixture.update {
+				<-entered
+				rearms.Add(1)
+			}
+		}
+		armed.Store(true)
+		fixture.release()
+		fixture.harness.settle()
+		select {
+		case <-entered:
+		default:
+			t.Fatal("automatic inherited opening never dequeued at the source")
+		}
+		fixture.update.stateLock.Lock()
+		pending := fixture.update.synRetry == credits.owner && credits.owner.openingSerial != 0 &&
+			fixture.update.synGenerationSeen && fixture.update.client.loadSelection() == fixture.selection
+		fixture.update.stateLock.Unlock()
+		if !pending || credits.packetCredit.released.Load() || credits.readyCredit.released.Load() ||
+			fixture.nativeOffers.Load() != 1 || fixture.retries.Load() != 1 || retains.Load() != 2 {
+			t.Fatalf("admitted inherited opening lost pending custody before materialization: pending=%t packet_released=%t readiness_released=%t rearms=%d",
+				pending, credits.packetCredit.released.Load(), credits.readyCredit.released.Load(), rearms.Load())
+		}
+		if retire == "source" {
+			fixture.source.Cancel()
+		} else if retire == "selection" {
+			fixture.update.stateLock.Lock()
+			fixture.update.selectAffinityClient(fixture.selected)
+			fixture.update.stateLock.Unlock()
+		}
+		finish()
+		fixture.harness.settle()
+		if retire != "" {
+			fixture.requireRetired(t, credits)
+			if retire == "source" {
+				if fixture.donor.client.loadSelection() != fixture.selection || !fixture.donor.receivedInbound.Load() || fixture.donor.IsDone() {
+					t.Fatal("dequeued source cancellation changed its established sibling's logical owner")
+				}
+			} else {
+				fixture.requireDonorProgress(t)
+			}
+			return
+		}
+		if _, ok := fixture.harness.synAck(fixture.path); !ok || len(fixture.harness.exit("a").syns(fixture.path)) != 1 ||
+			fixture.budget.UsedByteCount() != 0 || time.Since(fixture.before) != 0 {
+			t.Fatal("admitted inherited opening did not establish exactly once without source timer progress")
+		}
+		fixture.requireDonorProgress(t)
+	})
+}
+
+// Its own dequeue must preserve pending custody until the source materializes.
+func TestNativeFirstSynInheritedAffinityDequeuedOpeningKeepsCustody(t *testing.T) {
+	testInheritedSynDequeuedOpening(t, "")
+}
+
+// Cancellation after dequeue still returns both reservations without wire work.
+func TestNativeFirstSynInheritedAffinityDequeuedSourceCloseReturnsBacking(t *testing.T) {
+	testInheritedSynDequeuedOpening(t, "source")
+}
+
+// A source-owned claim cannot serialize after its exact selection is replaced.
+func TestNativeFirstSynInheritedAffinityDequeuedSelectionChangeRetiresOpening(t *testing.T) {
+	testInheritedSynDequeuedOpening(t, "selection")
+}
+
 // The final watched source's close releases pending custody immediately.
 func TestNativeFirstSynInheritedAffinitySourceCloseReturnsBacking(t *testing.T) {
 	testNativeFirstSynInheritedAffinityOpening(t, nil, func(t *testing.T, fixture *inheritedSynOpeningFixture) {

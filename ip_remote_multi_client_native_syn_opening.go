@@ -205,12 +205,21 @@ func (self *parsedPacketGroup) nativeSynOpeningCurrent() bool {
 	return self.nativeSynOpeningCurrentWithLock()
 }
 
-// A failed first opening with no live wake source has no standing remote
-// retry obligation. Return its optional backing instead of waiting for TCP idle.
+// A first opening without a capacity watch or admitted source custody has no
+// retry owner. Return its optional backing instead of waiting for TCP idle.
 func (self *multiClientChannelUpdate) retireUnwatchedSynOpeningWithLock(owner *tcpSynRetry, ready *tcpSynRetryReadiness) {
 	if owner != nil && owner == self.synRetry && ready != nil && owner.readiness == ready &&
 		owner.serial == ready.serial && owner.sequence == ready.sequence && owner.openingSerial != 0 && !owner.queued &&
 		(self.client.Load() == nil || owner.openingSelection != nil) && self.race == nil && !self.pendingCollapseCloseWithLock() {
+		// Dequeue advances the source epoch before materialization. That
+		// admitted claim owns recovery even after its capacity watch is gone.
+		for group := self.sequenceClaims; group != nil; group = group.collapseNext {
+			request := group.synRetry
+			if request != nil && request.update == self && request.serial == owner.serial && request.openingSerial == owner.openingSerial &&
+				group.completionFlags.Load()&(groupCompletionAdmitted|groupCompletionDisposed|groupCompletionDone|groupCompletionAbandoned) == groupCompletionAdmitted {
+				return
+			}
+		}
 		self.clearSynRetryWithLock()
 	}
 }

@@ -2,6 +2,8 @@
 package connect
 
 import (
+	"fmt"
+
 	"github.com/urnetwork/connect/protocol"
 	"google.golang.org/protobuf/proto"
 )
@@ -37,6 +39,11 @@ func (self *SendSequence) prepareSendItem(
 	}
 	err = item.acks.commitPreparedHandoffs(func() error {
 		if err := self.ctx.Err(); err != nil {
+			// This optional opening still has no wire ordinal. Losing its
+			// source is local retirement, not evidence against the provider.
+			if group, ok := disposition.target.(*parsedPacketGroup); ok && group.isSynRetry() && group.synRetry.openingSerial != 0 {
+				return newUnwrittenSendPackError(fmt.Errorf("%w: %w", errNativeSynOpeningSuperseded, err))
+			}
 			return err
 		}
 		if item.noBudget || !effectiveAck || !self.resendQueue.lifetimeBudget {
