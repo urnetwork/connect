@@ -4301,6 +4301,57 @@ paths:
         "429":
           description: The per-account verify budget is exhausted.
 
+  /subscription/verify-stripe-checkout:
+    post:
+      tags: [Subscription]
+      summary: Report a card payment for verification
+      description: |
+        The app reports a card payment as soon as the checkout or the payment
+        sheet finishes: the checkout session id `/stripe/create-checkout-session`
+        answered (also the `{CHECKOUT_SESSION_ID}` of the return url), or the
+        subscription id `/subscription/stripe/payment-sheet` answered. Name
+        exactly one of them. The server reads it back from Stripe, checks that
+        it is for the caller's network, and credits it through the same code
+        as the Stripe webhooks: a Pro invoice through the invoice.paid handler
+        and its invoice ledger, a payment sheet trial whose card is attached
+        through the setup_intent.succeeded finalization, and a data pack
+        through the checkout.session.completed handler. A report racing a
+        webhook or the hourly reconcile credits once; a late webhook no longer
+        keeps a paid customer on Free.
+
+        Statuses are the same as the store endpoints: `credited`,
+        `already_credited`, `wrong_network` and `invalid` are terminal;
+        `pending` (the checkout is open, or Stripe has not finished taking the
+        payment, or a payment sheet trial is waiting for its card) and any
+        non-2xx are retried. A refunded or disputed charge, a canceled
+        subscription that was never credited, and a data pack checkout older
+        than 72 hours are `invalid` here; the webhooks and the reconcile still
+        judge them. `expiry_time` is the end of the period the invoice pays
+        for.
+
+        Shares the per-account budget of the Play and Apple endpoints; every
+        attempt counts, including failures.
+      operationId: subscriptionVerifyStripeCheckout
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyStripeCheckoutArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyStorePurchaseResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "429":
+          description: The per-account verify budget is exhausted.
+
   # ----- x402 inline agent payments -----
 
   /x402/skus:
@@ -23680,6 +23731,20 @@ components:
       properties:
         signed_transaction:
           description: The StoreKit transaction JWS (`Transaction.jwsRepresentation`).
+          type: string
+
+    VerifyStripeCheckoutArgs:
+      type: object
+      properties:
+        session_id:
+          description: |
+            The checkout session id (`cs_...`) `/stripe/create-checkout-session`
+            answered, also the `{CHECKOUT_SESSION_ID}` of the return url.
+          type: string
+        subscription_id:
+          description: |
+            The subscription id (`sub_...`) `/subscription/stripe/payment-sheet`
+            answered, for the inline payment sheet.
           type: string
 
     VerifyStorePurchaseResult:
