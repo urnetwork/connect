@@ -466,6 +466,9 @@ func (self *parsedPacketGroup) sendGroupDequeued(source *SendSequence) {
 	if self.completionFlags.Or(groupCompletionReceived)&groupCompletionReceived != 0 {
 		return
 	}
+	if !self.nativeSynOpeningStampCurrentWithLock() {
+		self.completionFlags.Or(groupCompletionAbandoned)
+	}
 	// A canceled receive still proves enqueue if its producer is paused.
 	// Record only successful admission; never replay generation/close state.
 	if source.ctx.Err() != nil {
@@ -491,6 +494,9 @@ func (self *parsedPacketGroup) sendGroupDequeued(source *SendSequence) {
 		if self.completionFlags.CompareAndSwap(flags, flags&0xffff|groupCompletionDequeued|order<<16) {
 			break
 		}
+	}
+	if !self.nativeSynOpeningCurrentWithLock() {
+		self.completionFlags.Or(groupCompletionAbandoned)
 	}
 	if self.completionFlags.Load()&groupCompletionAbandoned != 0 || update.IsDone() || self.completionClient.IsDone() {
 		return
@@ -811,6 +817,14 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 	defer update.stateLock.Unlock()
 	if materialized {
 		self.affinitySourceState |= affinitySourceMaterialized
+	} else if start == 0 && end == len(self.packets) && self.completionFlags.Load()&groupCompletionAdmitted != 0 {
+		// An admitted opening that never materialized has no remaining wake
+		// source. A raw refusal, newer owner or retained prefix keeps its custody.
+		request, opening := self.synRetry, update.synRetry
+		if request != nil && request.serial != 0 && request.openingSerial != 0 && opening != nil &&
+			opening.serial == request.serial && opening.openingSerial == request.openingSerial {
+			update.clearSynRetryWithLock()
+		}
 	}
 	owner := self.collapseOwner
 	if owner == nil {

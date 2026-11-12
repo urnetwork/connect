@@ -7818,7 +7818,7 @@ func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	selection := update.client.loadSelection()
-	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || !self.synRetryDispatchEligibleWithLock(update, sendPacketGroup.synRetry.raceOrder)) {
+	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || !update.synRetry.synRetrySelectionCurrentWithLock(update) || !self.synRetryDispatchEligibleWithLock(update, sendPacketGroup.synRetry.raceOrder)) {
 		if self.ctx.Err() == nil && sendPacketGroup.validSynRetryWithLock(update) {
 			update.synRetry.preserveRaceRequestWithLock(sendPacketGroup.synRetry.raceOrder)
 		}
@@ -7924,6 +7924,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			}
 		}
 		sendPacketGroup.finishCollapseSynOffer()
+		self.finishNativeSynOpening(sendPacketGroup, success)
 	}()
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
@@ -7951,6 +7952,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 			}
 			self.requestDiscoveryForSourceSyn(update, ipPath)
+			sendPacketGroup.prepareNativeSynOpeningOffer(self, update, nativeIngress)
 		}
 
 		// Client-side dial-failure inference. A connection attempt
@@ -8260,7 +8262,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
-				if sendPacketGroup.isSynRetry() {
+				if sendPacketGroup.synRetry != nil {
 					sendPacketGroup.noteSynRetryReadinessWidth(1)
 				}
 				sendPacketGroup.prepareAdmissionObservations(client)
@@ -8438,7 +8440,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
-				if sendPacketGroup.isSynRetry() {
+				if sendPacketGroup.synRetry != nil {
 					sendPacketGroup.noteSynRetryReadinessWidth(len(raceOrderedClients))
 				}
 				var scheduleOnce sync.Once
@@ -11017,9 +11019,11 @@ type multiClientChannelUpdate struct {
 	// value seals an old TCP generation during/after a tuple transition.
 	affinityDelivery atomic.Int64
 	// All admitted sources, including race losers; leaf-lock-owned scalar proof.
-	affinitySources  multiClientAffinitySources
-	synRetry         *tcpSynRetry
-	synRetrySerial   uint64
+	affinitySources multiClientAffinitySources
+	synRetry        *tcpSynRetry
+	synRetrySerial  uint64
+	// Ordinary unestablished TCP offers supersede only an unwritten opening.
+	synOpeningSerial uint64
 	synRetryReleased atomic.Pointer[tcpSynRetry]
 	nativeAckRetry   *tcpNativeAckRetry
 	nativeAckSerial  uint64
@@ -19599,7 +19603,7 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 		self.addSendGroupCompletion(sendPacketGroup, ack)
 		return
 	}
-	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) || errors.Is(err, errNativeAckRetrySuperseded) {
+	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) || errors.Is(err, errNativeAckRetrySuperseded) || errors.Is(err, errNativeSynOpeningSuperseded) {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		return
 	}

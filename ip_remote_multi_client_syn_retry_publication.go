@@ -63,10 +63,11 @@ func (self *multiClientChannelUpdate) indexSynRetryPublication() {
 	}
 	self.stateLock.Lock()
 	currentParent, owner := self.sequenceParentWithLock(), self.synRetry
+	opening := owner != nil && owner.openingSerial != 0
 	self.stateLock.Unlock()
 	// The before-capture observer may allow another source admission. Never
 	// index a new parent's current owner through a stale parent snapshot.
-	if currentParent != parent || owner == nil {
+	if currentParent != parent || owner == nil || opening {
 		return
 	}
 	parent.stateLock.Lock()

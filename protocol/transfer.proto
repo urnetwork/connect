@@ -426,14 +426,27 @@ message StreamReset {
 // it when the other party of a contract has sent its final close, and to each
 // counterparty of a client removed through the api. For each contract the
 // client reports a final close: with the counts of the live sequence that
-// holds it, or with zero counts when no sequence holds it any more, since its
-// counts were reported before. For each peer the client closes every sequence
-// with the peer, reporting finals for their contracts.
+// holds it, or with zero counts when it left a queue unused or its reported
+// checkpoint is its count. A contract the client holds no record of is
+// answered with `ContractsNoRecord` instead, never with a count. For each
+// peer the client closes every sequence with the peer, reporting finals for
+// their contracts.
 message CloseSequences {
     // ulid
     repeated bytes contract_ids = 1;
     // ulid
     repeated bytes peer_ids = 2;
+}
+
+// A client's answer to `CloseSequences` for contracts it holds no record of,
+// sent to the control id. Its counts were lost with its state, so it reports
+// none: the platform treats the client as a party that never reported, and
+// its expiry sweep settles on the other party's count without crediting the
+// unconfirmed bytes. A zero-count final in its place would settle at the mean
+// of the two counts.
+message ContractsNoRecord {
+    // ulid
+    repeated bytes contract_ids = 1;
 }
 
 // The public addresses the platform observes this client's transports
