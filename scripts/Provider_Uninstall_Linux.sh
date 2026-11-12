@@ -110,6 +110,17 @@ if [ -d "$install_path" ]; then
     fi
 fi
 
+# a system service (urnet-tools --system) needs root to remove, and the
+# binary it runs must not go first; urnet-tools uninstall does both
+system_service_file="/etc/systemd/system/urnetwork.service"
+if [ -f "$system_service_file" ] &&
+    [ "$(head -n1 "$system_service_file" | cut -d. -f1)" = "# Installed by urnet-tools --system" ] &&
+    [ "$(sed -n 's/^User=//p' "$system_service_file" | head -n1)" = "$(id -un)" ]; then
+    echo "$me: The provider runs as a system service (urnet-tools --system); remove it with: urnet-tools uninstall" >&2
+    echo "$me: Nothing was removed" >&2
+    exit 1
+fi
+
 # `su - user' and `sudo -iu user' shells often lack XDG_RUNTIME_DIR
 if [ -z "$XDG_RUNTIME_DIR" ] && [ -S "/run/user/$(id -u)/bus" ]; then
     XDG_RUNTIME_DIR="/run/user/$(id -u)"

@@ -87,6 +87,128 @@ class SpecTest(unittest.TestCase):
             set(schemas["RotateProxyExitResult"]["properties"]["error"]["properties"]),
         )
 
+    def test_256gib_pack_is_sold_over_x402_and_gamma_only(self):
+        # config/all/pro.yml: data_256gib, 256 GiB for $0.75, the pack for
+        # clients with a $1 per-payment cap, rails [x402, gamma] (the owner,
+        # 2026-11-11). The server refuses it on every other path.
+        pack = "data_256gib"
+        schemas = self.spec["components"]["schemas"]
+        paths = self.spec["paths"]
+
+        for name, field in (
+            ("GammaTermsItem", "item_id"),
+            ("CreateGammaPaymentIntentArgs", "item_id"),
+            ("GammaSettingsArgs", "topup_item_id"),
+        ):
+            with self.subTest(schema=name):
+                self.assertIn(pack, schemas[name]["properties"][field]["enum"])
+        terms = paths["/pay/gamma/terms"]["get"]["responses"]["200"]
+        for name, example in terms["content"]["application/json"]["examples"].items():
+            with self.subTest(example=name):
+                items = {
+                    item["item_id"]: item
+                    for item in example["value"]["items"]
+                    if "item_id" in item
+                }
+                self.assertEqual("0.75", items[pack]["price_gamma"])
+                self.assertEqual(0.75, items[pack]["price_usd"])
+                self.assertEqual("0.75", items[pack]["min_daily_cap_gamma"])
+        self.assertIn(pack, paths["/pay/gamma/intent"]["post"]["description"])
+
+        skus = paths["/x402/skus"]["get"]["description"]
+        self.assertIn(pack, skus)
+        self.assertIn("$0.75", skus)
+        self.assertIn("$1 per-payment cap", skus)
+        self.assertIn(pack, schemas["X402Sku"]["properties"]["sku_id"]["description"])
+        self.assertIn(pack, paths["/x402/purchase"]["post"]["description"])
+
+        # card, the crypto invoices and USDC by Solana Pay never offer it
+        for name in (
+            "PayDataCheckoutArgs",
+            "PayDataSolanaIntentArgs",
+            "PayDataSolanaStatusResult",
+            "CryptoPaymentQuoteArgs",
+            "CreateCryptoPaymentIntentArgs",
+            "CreateDataCryptoPaymentIntentArgs",
+        ):
+            with self.subTest(schema=name):
+                enum = schemas[name]["properties"]["item_id"]["enum"]
+                self.assertEqual(["data_1tib", "data_10tib"], enum)
+        card = schemas["StripeCreateCheckoutSessionArgs"]["properties"]["item_id"]
+        self.assertIn(pack, card["description"])
+        self.assertIn("item_unavailable", card["description"])
+
+    def test_gamma_documents_already_subscribed_and_the_deletion_refusal(self):
+        # server controller/gamma_controller.go: a Gamma plan or Gamma renewal
+        # is refused, and a plan's status is covered, with already_subscribed
+        # (the owner, 2026-11-11: never charge twice for the same period);
+        # account deletion waits for a Gamma charge in flight
+        schemas = self.spec["components"]["schemas"]
+        paths = self.spec["paths"]
+        code = schemas["GammaPaymentError"]["properties"]["code"]
+        self.assertIn("already_subscribed", code["enum"])
+        self.assertIn("already_subscribed", code["description"])
+
+        intent = paths["/pay/gamma/intent"]["post"]
+        self.assertIn("already_subscribed", intent["description"])
+        self.assertIn("replaces it", intent["description"])
+        examples = intent["responses"]["200"]["content"]["application/json"]["examples"]
+        self.assertEqual("already_subscribed", examples["renewalBeingCharged"]["value"]["error"]["code"])
+        self.assertEqual("already_subscribed", examples["otherProRenews"]["value"]["error"]["code"])
+
+        status = paths["/pay/gamma/status"]["post"]
+        self.assertIn("covered", status["description"])
+        self.assertIn("already_subscribed", status["description"])
+        covered = status["responses"]["200"]["content"]["application/json"]["examples"]["covered"]["value"]
+        self.assertEqual("seen", covered["status"])
+        self.assertEqual("already_subscribed", covered["error"]["code"])
+
+        settings = paths["/pay/gamma/settings"]["post"]
+        self.assertIn("already_subscribed", settings["description"])
+        refused = settings["responses"]["200"]["content"]["application/json"]["examples"]["otherProRenews"]["value"]
+        self.assertEqual(False, refused["auto_renew"])
+        self.assertEqual("already_subscribed", refused["error"]["code"])
+
+        delete = paths["/auth/network-delete"]["post"]
+        self.assertIn("Pay with Gamma charge in flight", delete["description"])
+        in_flight = delete["responses"]["200"]["content"]["application/json"]["examples"]["gammaChargeInFlight"]
+        self.assertIn("Gamma payment", in_flight["value"]["error"]["message"])
+
+    def test_gamma_settings_document_what_a_switch_turned_off_cancels(self):
+        # server controller/gamma_controller.go SetGammaSettings: a switch
+        # turned off cancels the automatic charges it governs not yet sent; one
+        # already sent is listed in charging and said in notice; an upgrade at
+        # the client limit needs auto_renew too
+        schemas = self.spec["components"]["schemas"]
+        settings = self.spec["paths"]["/pay/gamma/settings"]
+        get = " ".join(settings["get"]["description"].split())
+        self.assertIn("at most once a day, while `auto_renew` is on too", get)
+        self.assertIn("`charging`", get)
+        post = " ".join(settings["post"]["description"].split())
+        self.assertIn("cancels the open automatic charges it governs", post)
+        self.assertIn("can still be charged this once", post)
+        self.assertIn("`charging`", post)
+        self.assertIn("`notice`", post)
+
+        result = schemas["GammaSettingsResult"]["properties"]
+        self.assertEqual("#/components/schemas/GammaSettingsCharge", result["charging"]["items"]["$ref"])
+        self.assertEqual("string", result["notice"]["type"])
+        charge = schemas["GammaSettingsCharge"]["properties"]
+        self.assertEqual(["renew", "topup", "seat"], charge["purpose"]["enum"])
+        self.assertEqual(["confirming"], charge["status"]["enum"])
+        for name in ("intent_id", "plan", "item_id", "amount_gamma"):
+            self.assertIn(name, charge)
+
+        examples = settings["post"]["responses"]["200"]["content"]["application/json"]["examples"]
+        charging = examples["chargingOnceMore"]["value"]
+        self.assertEqual(False, charging["auto_renew"])
+        self.assertEqual("renew", charging["charging"][0]["purpose"])
+        self.assertEqual("confirming", charging["charging"][0]["status"])
+        self.assertIn("charged this once", charging["notice"])
+        self.assertEqual([], examples["otherProRenews"]["value"]["charging"])
+        defaults = settings["get"]["responses"]["200"]["content"]["application/json"]["examples"]["defaults"]["value"]
+        self.assertEqual([], defaults["charging"])
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):

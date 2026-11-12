@@ -1292,9 +1292,12 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 	// blocks window replacement. CloseAndWait joins every Client-owned producer
 	// of contract-close controls; closing and joining the OOB boundary after
 	// that proves all admitted cleanup requests and callbacks are done before
-	// RemoveClientArgs revokes the identity. These asynchronous owners remain
-	// until actually joined, even when CloseAndWait's caller has timed out.
-	// Only then does identity removal start its independent finite budget.
+	// RemoveClientArgs revokes the identity. A close report's cleanup retries a
+	// transient failure inside its one admitted request, so this join gives each
+	// in-flight report its whole ContractManagerSettings.CloseReportRetry budget
+	// and no more. These asynchronous owners remain until actually joined, even
+	// when CloseAndWait's caller has timed out. Only then does identity removal
+	// start its independent finite budget.
 	go HandleError(func() {
 		if retirementAdmitted {
 			defer retirements.finish()

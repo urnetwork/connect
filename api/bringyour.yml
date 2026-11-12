@@ -997,6 +997,19 @@ paths:
 
         A caller that is not the network's admin is also refused with a 403,
         with the plain text body `Could not remove network`.
+
+        A deletion that cannot go ahead yet answers 200 with `error.message`
+        and removes nothing; retry once its cause is gone. The causes: an App
+        Store subscription that may still renew (only its owner can cancel it,
+        in the App Store), a Stripe or Google Play subscription that could not
+        be cancelled, a store renewal credited while the deletion ran, and a
+        Pay with Gamma charge in flight: a spend from the network's gamma
+        deposit in a spend batch that can still land, or spent and not yet
+        credited. Gamma cannot be refunded, so the deletion waits for that
+        charge to be credited, minutes at most. Retried then, it deletes the
+        network, turns its automatic gamma renewal, top-up and seat upgrade
+        off, and voids its open gamma purchases; the deposit is on chain and
+        keeps its gamma.
       operationId: authNetworkDelete
       security:
         - BearerAuth: []
@@ -1007,6 +1020,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkDeleteResult"
+              examples:
+                deleted:
+                  summary: Deleted
+                  value: {}
+                gammaChargeInFlight:
+                  summary: Refused while a Gamma charge is in flight
+                  value:
+                    error:
+                      message: A Gamma payment for your account is still being processed, so your account was not deleted. Please try again in a few minutes.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
         "409":
@@ -2594,6 +2616,16 @@ paths:
         WireGuard details), and for a unique-exit proxy its `exit`. Same row
         shape as `/network/clients` otherwise: resident status, connections,
         provide status.
+
+        SOCKS and WireGuard are part of Pro. Each proxy's `pro_features` lists
+        the Pro-only features it holds credentials for (`socks_proxy` for a
+        SOCKS url, `wireguard_proxy` for a WireGuard config), and the list's
+        `plan` says whether the network holds Pro now, read live, and whether
+        the platform enforces the Pro-only features. While
+        `plan.pro_features_enforced` is false every plan uses them. Once it is
+        true, a network without Pro is issued neither, and its proxies' SOCKS
+        sign-ins are refused and their WireGuard peers dropped; HTTP and HTTPS
+        keep working.
       operationId: networkProxies
       security:
         - BearerAuth: []
@@ -4279,11 +4311,18 @@ paths:
         The catalog an agent can buy from, so a skill can discover it without
         triggering a `402`. Prices come from the Pro price list, never from
         the x402 configuration, so an agent is quoted the same number a human
-        pays by card; a sku with no price is not offered at all. It names the
-        x402 protocol versions spoken (v2 and v1), each network's x402 v2
-        (CAIP-2) id, and each sku's exact `amount` in atomic units of the
-        asset, from which an agent sets its client's per-payment cap: x402
-        clients refuse a payment over $1 by default.
+        pays on any other rail; a sku with no price is not offered at all. It
+        names the x402 protocol versions spoken (v2 and v1), each network's
+        x402 v2 (CAIP-2) id, and each sku's exact `amount` in atomic units of
+        the asset, from which an agent sets its client's per-payment cap:
+        x402 clients refuse a payment over $1 by default.
+
+        The skus are `pro_1month`, `data_1tib`, `data_10tib` and
+        `data_256gib`. `data_256gib` is 256 GiB of data for $0.75 (`amount`
+        "750000"): the pack for clients with a $1 per-payment cap, such as
+        Cloudflare Agents' `withX402Client`, which cannot raise it. It is
+        sold only over x402 and with Gamma, and it adds data only: it does
+        not lift a limit that UR Pro lifts.
       operationId: x402Skus
       security: []
       responses:
@@ -4313,7 +4352,8 @@ paths:
         The terms' `error` states the price. The x402 SDK clients refuse any
         payment over $1 unless their per-payment cap is raised
         (`maxAmountPerPayment`; `maxPaymentUsdc` in Coinbase AgentKit), so
-        an agent raises the cap to the price first.
+        an agent raises the cap to the price first. A client that cannot
+        raise it can buy `data_256gib`, 256 GiB of data for $0.75.
 
         A v2 payment's `accepted` terms must equal one of the quoted terms
         (every field but `extra`, which must hold the quoted `extra`). A
@@ -4549,6 +4589,12 @@ paths:
                         min_daily_cap_gamma: "20"
                         renews: false
                         indicative_tao: "0.094583"
+                      - item_id: data_256gib
+                        price_gamma: "0.75"
+                        price_usd: 0.75
+                        min_daily_cap_gamma: "0.75"
+                        renews: false
+                        indicative_tao: "0.003547"
                     auto_min_daily_cap_gamma: "40"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
@@ -4598,6 +4644,12 @@ paths:
                         min_daily_cap_gamma: "20"
                         renews: false
                         indicative_tao: ""
+                      - item_id: data_256gib
+                        price_gamma: "0.75"
+                        price_usd: 0.75
+                        min_daily_cap_gamma: "0.75"
+                        renews: false
+                        indicative_tao: ""
                     auto_min_daily_cap_gamma: "40"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
@@ -4611,11 +4663,13 @@ paths:
         Start a purchase paid from the signed-in network's SN25 gamma
         deposit: Pro `monthly`, `yearly` or `yearly_onboarding` (the welcome
         offer, while redeemable), or a data pack (`data_1tib`,
-        `data_10tib`), to the network (delivery `account`) or as a balance
-        code (delivery `code`, data packs only; with `email`, the code is
-        emailed too). Give exactly one of `plan` and `item_id`. The price is
-        the card price in US dollars at the caller's tier, and one gamma is
-        one dollar, so `amount_gamma` needs no rate.
+        `data_10tib`, or `data_256gib`: 256 GiB for $0.75, sold only with
+        Gamma and over x402), to the network (delivery `account`) or as a
+        balance code (delivery `code`, data packs only; with `email`, the
+        code is emailed too). Give exactly one of `plan` and `item_id`. The
+        price is the card price in US dollars at the caller's tier (the
+        256 GiB pack's is the same on both rails that sell it), and one gamma
+        is one dollar, so `amount_gamma` needs no rate.
 
         The answer names `deposit_hotkey`: the hotkey URnetwork assigned
         this account, on `netuid` 25. It is not a pay-to address, and there
@@ -4655,11 +4709,39 @@ paths:
         purchase needs; `auto_min_daily_cap_gamma` the cap the automatic
         charges need.
 
+        A plan is never charged for days another Pro payment pays for:
+
+        - Beside another Pro subscription that renews (the App Store, Google
+          Play, or a card subscription, also one whose renewal Stripe is still
+          retrying), a plan is refused (`already_subscribed`); a prepaid
+          crypto year refuses nothing. A plan started before such a
+          subscription began waits while it pays for the days the plan would
+          buy, and is charged only if it ends before the purchase expires.
+        - A plan bought while the network's Gamma renewal (or an automatic
+          upgrade at the client limit) waits to be charged replaces it: the
+          renewal waits while the purchase is open, is voided once the
+          purchase is paid, and goes ahead if the purchase expires unpaid.
+        - While a Gamma payment for the network's Pro plan is being charged
+          (its renewal, an upgrade at the client limit, or another plan), a
+          plan is refused (`already_subscribed`): that spend may still land,
+          so it cannot be voided. Asking again for the purchase being charged
+          returns it. Check again in a few minutes.
+        - A plan purchase made before another Gamma plan of the network was
+          paid is never charged: of two plans opened together, the first the
+          deposit can pay is charged and the other is not. Its status says so
+          (`already_subscribed`).
+
+        Otherwise a plan bought while the network has a paid Gamma plan starts
+        at once, as an upgrade; the rest of the paid term is not carried over.
+        A data pack is not Pro, and is sold beside any of these.
+
         A refusal returns `error` with a 200 (GammaPaymentError):
         `invalid_request`, `asset_unavailable` (purchases are off, or minting
         is off while the deposit cannot already pay: `mint_unavailable_reason`
         says why), `plan_unavailable`, `item_unavailable`,
         `guest_sign_in_required` (plans only), `offer_unavailable`,
+        `already_subscribed` (plans only: another Pro subscription renews, or
+        a Gamma payment for the network's Pro plan is being charged),
         `invalid_email`, `deposit_coldkey_mismatch` (every hotkey of the
         account belongs to another coldkey), `rate_limited` or
         `start_failed`.
@@ -4753,6 +4835,18 @@ paths:
                     error:
                       code: asset_unavailable
                       message: "Minting gamma is paused: the chain's TAO/USD price is more than 300 blocks old. Try again later, or pay with TAO or x402."
+                renewalBeingCharged:
+                  summary: A plan while the Gamma renewal is being charged
+                  value:
+                    error:
+                      code: already_subscribed
+                      message: "A Gamma payment for your Pro plan is being charged now (its renewal, an upgrade at your client limit, or a plan you bought), so no Gamma payment was started: paying for a plan as well would charge you twice for the same days. Check again in a few minutes, once it is paid."
+                otherProRenews:
+                  summary: A plan beside another Pro subscription that renews
+                  value:
+                    error:
+                      code: already_subscribed
+                      message: "You already have a Pro subscription that renews, so no Gamma payment was started: paying with Gamma as well would charge you twice for the same days. Cancel that subscription, then pay with Gamma once it has ended."
         "401":
           description: Missing or invalid bearer token.
 
@@ -4775,6 +4869,15 @@ paths:
           run spends it.
         - `expired`: past `expires_at` with nothing spent (`quote_expired`).
           Unspent gamma stays in the deposit for the next purchase.
+        - covered, a plan only: `seen` (`pending` with no gamma at the hotkey
+          yet) with `error.code` `already_subscribed`. Another payment pays
+          for the days the plan would buy, so it is not charged now, whatever
+          the deposit holds; `error.message` says which: another Pro
+          subscription pays for or still bills those days (the plan is charged
+          only if that one ends before `expires_at`), another Gamma payment for
+          the network's Pro plan is being charged (if that one is paid, this
+          one is not), or another Gamma plan was paid after this purchase
+          started (it is never charged; unspent gamma stays in the deposit).
         - `seen`: the deposit holds gamma but cannot pay yet: less than the
           price (`remaining_gamma` is how much more to mint), a daily cap
           below the price (`daily_cap_too_low`; raise it to at least
@@ -4848,6 +4951,18 @@ paths:
                     error:
                       code: insufficient_gamma
                       message: The deposit held less gamma than the price when we spent. Mint more; we try again once the deposit changes.
+                covered:
+                  summary: A plan another payment pays for
+                  value:
+                    intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                    status: seen
+                    plan: yearly
+                    amount_gamma: "40"
+                    deposit_balance_gamma: "45"
+                    remaining_gamma: "0"
+                    error:
+                      code: already_subscribed
+                      message: "Another Gamma payment for your Pro plan was paid after this one was started, so this one is not charged: both would pay for the same days."
         "429":
           description: Too many requests from this address this minute. Plain text body.
 
@@ -4861,15 +4976,24 @@ paths:
 
         - `auto_renew`: at the end of each term of a plan paid with gamma,
           charge the plan's current price from the deposit (`renew_plan`;
-          a welcome-offer year renews at the yearly price). Unless the network
-          pays for Pro elsewhere past that term.
+          a welcome-offer year renews at the yearly price). Not while another
+          Pro subscription of the network pays for or still bills those days
+          (the App Store, Google Play, or a card subscription, also one whose
+          renewal Stripe is still retrying): the renewal waits, and when that
+          one ends within the term's 30-day grace, the new term starts where
+          it ended. A Gamma plan bought while the renewal waits replaces it
+          (/pay/gamma/intent).
         - `auto_topup`: when the data balance runs out, or will within the
-          next check, buy `topup_item_id` (`data_1tib` unless set), at most one
-          an hour; and when a free account hits its client limit
-          (`client_limit_exceeded` with `upgrade_required`), buy Pro
-          (`renew_plan`, else `monthly`), at most once a day. A Pro account at
-          its limit gets the error as before. An automatic upgrade never
-          changes how the network provides.
+          next check, buy `topup_item_id` (`data_1tib` unless set; any pack
+          Gamma sells), at most one an hour; and when a free account hits
+          its client limit (`client_limit_exceeded` with
+          `upgrade_required`), buy Pro
+          (`renew_plan`, else `monthly`), at most once a day, while
+          `auto_renew` is on too (an upgrade is an automatic Pro charge), and
+          unless another Pro subscription already pays for or still bills
+          now. A Pro account at its limit gets the error as before. An
+          automatic upgrade never changes how the network provides; a Gamma
+          plan bought while it waits replaces it, as it does a renewal.
 
         `monthly_limit_gamma` caps what the automatic charges take in a
         calendar month (UTC; "" for no limit); `month_spent_gamma` is this
@@ -4877,7 +5001,10 @@ paths:
         purpose, period) with its own reference, is spent from
         `deposit_hotkey` (the hotkey that paid last), sends a receipt email,
         and when the chain skips it, one notice; it is tried again only after
-        the deposit changes. Network credential only.
+        the deposit changes. `charging` lists the automatic charges whose
+        switch is off that were already being charged when it was turned off
+        (see POST), and `notice` says it in a sentence. Network credential
+        only.
       operationId: gammaSettings
       security:
         - BearerAuth: []
@@ -4900,6 +5027,7 @@ paths:
                     renew_plan: yearly
                     deposit_hotkey: "<deposit_hotkey>"
                     deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging: []
         "401":
           description: Missing or invalid bearer token.
         "403":
@@ -4909,10 +5037,28 @@ paths:
       summary: Set Gamma Settings
       description: |
         Set the automatic gamma charges' switches (see GET), the top-up item
-        (`data_1tib` or `data_10tib`) and the monthly limit (a decimal amount
-        of gamma; "0" or "" removes it). A field left out is unchanged. The
-        answer is the settings as they now are; a refusal returns `error`
-        (`item_unavailable`, `invalid_request`). Network credential only.
+        (`data_1tib`, `data_10tib` or `data_256gib`) and the monthly limit (a
+        decimal amount of gamma; "0" or "" removes it). A field left out is
+        unchanged. The answer is the settings as they now are; a refusal
+        returns `error` and applies nothing in the request:
+        `item_unavailable`, `invalid_request`, or `already_subscribed` for
+        `auto_renew: true` while another Pro subscription of the network
+        renews (the App Store, Google Play, or a card subscription, also one
+        whose renewal Stripe is still retrying): both would bill the same
+        days. That answer carries the settings unchanged. Turning automatic
+        renewal off is always allowed. Network credential only.
+
+        Turning a switch off cancels the open automatic charges it governs
+        that are not yet sent to the chain: the renewal waiting at the end of
+        a term (`auto_renew`), a data top-up (`auto_topup`), and an upgrade at
+        the client limit (either switch). They are never charged, and turning
+        the switch back on makes them again for the same term, hour or day. A
+        charge already sent to the chain cannot be recalled, and is not
+        cancelled: the switch is still turned off, and the answer lists that
+        charge in `charging` (status `confirming`) and says in `notice` that
+        it can still be charged this once, and none after it while the switch
+        is off. If its payment lands, it is credited as usual (a renewal adds
+        its term).
       operationId: gammaSetSettings
       security:
         - BearerAuth: []
@@ -4935,6 +5081,41 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GammaSettingsResult"
+              examples:
+                chargingOnceMore:
+                  summary: Renewal turned off while the renewal's payment was already sent
+                  value:
+                    auto_renew: false
+                    auto_topup: true
+                    topup_item_id: data_1tib
+                    monthly_limit_gamma: ""
+                    month_spent_gamma: "5"
+                    renew_plan: monthly
+                    deposit_hotkey: "<deposit_hotkey>"
+                    deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging:
+                      - intent_id: 0b6f2f7e-4f1c-4a8e-9d1a-1f6a2b3c4d5e
+                        purpose: renew
+                        plan: monthly
+                        item_id: ""
+                        amount_gamma: "5"
+                        status: confirming
+                    notice: "The renewal of your plan (URnetwork Pro monthly, 5 gamma) was already being charged when you turned this off. A payment already sent to the chain can't be recalled, so it can still be charged this once, but none after it while the switch is off."
+                otherProRenews:
+                  summary: Renewal not turned on beside another renewing subscription
+                  value:
+                    auto_renew: false
+                    auto_topup: true
+                    topup_item_id: data_1tib
+                    monthly_limit_gamma: ""
+                    month_spent_gamma: "0"
+                    renew_plan: monthly
+                    deposit_hotkey: "<deposit_hotkey>"
+                    deposit_hotkeys: ["<deposit_hotkey>"]
+                    charging: []
+                    error:
+                      code: already_subscribed
+                      message: "You have another Pro subscription that renews, so Gamma renewal was not turned on: both would charge you for the same days. Cancel that subscription, then turn Gamma renewal on once it has ended."
         "401":
           description: Missing or invalid bearer token.
         "403":
@@ -11295,13 +11476,23 @@ components:
       name: X-UR-ClientInfo
       required: false
       description: |
-        Optional JSON ClientInfo v1, at most 512 UTF-8 bytes. Advisory display
-        metadata only. Duplicate headers/fields, unsupported version or invalid
-        fields become unknown metadata without rejecting authentication.
-        App and SDK version strings are at most 64 UTF-8 bytes.
+        Optional JSON ClientInfo v1 (the ClientInfo schema), at most 512 UTF-8
+        bytes. Advisory metadata only, never authentication, a device binding
+        or an entitlement. Duplicate headers/fields, unsupported version or
+        invalid fields become unknown metadata without rejecting
+        authentication. App and SDK version strings are at most 64 UTF-8
+        bytes. The optional `distribution` names how the app's build reached
+        the device; a value the server does not know, or one that does not
+        pair with `device_type`, is read as unknown and the rest of the object
+        still stands, and leaving it out means unknown. With the device type
+        it decides the platform recorded for the account's onboarding at
+        sign-up and when a device authenticates (the onboarding email copy
+        and offers): the App Store and direct-download macOS builds send the
+        same device type and version, and only the distribution tells them
+        apart.
       schema:
         type: string
-      example: '{"v":1,"device_type":"android","app_version":"1.2.3","sdk_version":"1.2.3"}'
+      example: '{"v":1,"device_type":"android","app_version":"1.2.3","sdk_version":"1.2.3","distribution":"play"}'
     ProviderWorkDomain:
       in: query
       name: domain
@@ -11454,6 +11645,24 @@ components:
         sdk_version:
           type: string
           maxLength: 64
+        distribution:
+          type: string
+          enum: [app_store, mac_direct, play, android_direct, solana_dapp, ethos_dapp, windows, linux, linux_appimage, linux_flatpak, web, extension_chrome, extension_firefox]
+          description: |
+            How the build reached the device, stamped by the build; absent is
+            unknown. Each value pairs with device types, and any other
+            pairing, or a value not listed here, is read as unknown:
+            `app_store` (ios, macos: the App Store builds and their TestFlight
+            builds, which the App Store bills); `mac_direct` (macos: the
+            Developer ID DMG, which Stripe bills); `play` (android: the play
+            flavor, which Google Play bills); `android_direct` (android: the
+            github flavor, the GitHub APK and the F-Droid build);
+            `solana_dapp` and `ethos_dapp` (android: those dApp store
+            flavors); `windows` (windows); `linux` (linux, the package not
+            known), `linux_appimage` and `linux_flatpak` (linux); `web`,
+            `extension_chrome` and `extension_firefox` (web: ur.io and the
+            browser extension's two builds). Every distribution but
+            `app_store` and `play` is billed by Stripe.
     SessionLastUsed:
       type: object
       required: [unix_time, city, region, country, country_code, device_type, app_version]
@@ -14107,6 +14316,18 @@ components:
                   Set for a unique-exit proxy (`proxy_config.unique_exit`):
                   its current exit.
                 $ref: "#/components/schemas/ProxyExit"
+              pro_features:
+                description: |
+                  `/network/proxies` only: the Pro-only features the proxy
+                  holds credentials for, `socks_proxy` for a SOCKS url and
+                  `wireguard_proxy` for a WireGuard config. A network without
+                  Pro loses them at the proxy once
+                  `plan.pro_features_enforced` is true. Absent for a proxy
+                  that holds neither. A client ignores a name it does not
+                  know.
+                type: array
+                items:
+                  type: string
               connections:
                 type: array
                 items:
@@ -14135,6 +14356,27 @@ components:
                       type: string
                     connection_block:
                       type: string
+        plan:
+          description: |
+            `/network/proxies` only: the network's plan beside its proxies.
+            Absent from `/network/clients`.
+          type: object
+          required:
+            - pro
+            - pro_features_enforced
+          properties:
+            pro:
+              description: |
+                The network holds Pro now, read live, not from the jwt's
+                `pro` claim.
+              type: boolean
+            pro_features_enforced:
+              description: |
+                The platform refuses the Pro-only features (SOCKS and
+                WireGuard) to a network without Pro: none is issued, and
+                the credentials a proxy already holds stop working at the
+                proxy. While false, every plan uses them.
+              type: boolean
 
     NetworkPeer:
       type: object
@@ -21522,7 +21764,9 @@ components:
             type: string
         items:
           type: array
-          description: the data packs the asset sells (`data_1tib`, `data_10tib`)
+          description: |
+            the data packs the asset sells (`data_1tib`, `data_10tib`); never
+            `data_256gib`, which is sold only over x402 and with Gamma
           items:
             type: string
         confirmations_required:
@@ -22011,6 +22255,11 @@ components:
         - item_id
       properties:
         item_id:
+          description: |
+            `pro_monthly`, `pro_yearly`, or a data pack sold by card:
+            `data_1tib` or `data_10tib`. The 256 GiB pack (`data_256gib`) is
+            sold only over x402 and with Gamma, and is refused here with
+            `item_unavailable`.
           type: string
         storefront_country:
           type: string
@@ -23331,6 +23580,10 @@ components:
         - pro
       properties:
         sku_id:
+          description: |
+            `pro_1month`, `data_1tib`, `data_10tib` or `data_256gib` (256 GiB
+            for $0.75, the pack for clients with a $1 per-payment cap, sold
+            only over x402 and with Gamma).
           type: string
         description:
           type: string
@@ -23508,6 +23761,7 @@ components:
       required: [sku_id]
       properties:
         sku_id:
+          description: A sku of `GET /x402/skus`.
           type: string
         network:
           description: |
@@ -25171,7 +25425,11 @@ components:
           enum: [monthly, yearly]
         item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: |
+            A data pack Gamma sells. `data_256gib` is 256 GiB for $0.75, the
+            pack for clients with a $1 per-payment cap; it is sold only with
+            Gamma and over x402, never by card or with the crypto invoices.
+          enum: [data_1tib, data_10tib, data_256gib]
         price_gamma:
           type: string
           description: The price in gamma, one gamma per US dollar.
@@ -25249,7 +25507,8 @@ components:
           enum: [monthly, yearly, yearly_onboarding]
         item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: A data pack Gamma sells; `data_256gib` is 256 GiB for $0.75.
+          enum: [data_1tib, data_10tib, data_256gib]
         delivery:
           type: string
           enum: [account, code]
@@ -25412,7 +25671,8 @@ components:
           type: boolean
         topup_item_id:
           type: string
-          enum: [data_1tib, data_10tib]
+          description: The data pack an automatic top-up buys, any pack Gamma sells.
+          enum: [data_1tib, data_10tib, data_256gib]
         monthly_limit_gamma:
           type: string
           description: A decimal amount of gamma; "0" or "" removes the limit.
@@ -25438,8 +25698,44 @@ components:
           type: array
           items:
             type: string
+        charging:
+          type: array
+          description: |
+            The automatic charges whose switch is off that were already being
+            charged when it was turned off: their payment was sent to the
+            chain (or landed and is being credited), so each can still be
+            charged this once, and none after it while the switch is off.
+            Empty when there is none. A charge not yet sent when its switch
+            was turned off is cancelled and never listed.
+          items:
+            $ref: "#/components/schemas/GammaSettingsCharge"
+        notice:
+          type: string
+          description: "`charging` in a plain sentence for the customer; absent when it is empty."
         error:
           $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaSettingsCharge:
+      type: object
+      properties:
+        intent_id:
+          type: string
+        purpose:
+          type: string
+          description: "`renew` (the renewal at the end of a term), `topup` (a data top-up) or `seat` (the upgrade to Pro at the client limit)."
+          enum: [renew, topup, seat]
+        plan:
+          type: string
+          description: The plan it buys; "" for a data pack.
+        item_id:
+          type: string
+          description: The data pack it buys; "" for a plan.
+        amount_gamma:
+          type: string
+        status:
+          type: string
+          description: "`confirming`: its payment was sent to the chain, or landed and is being credited."
+          enum: [confirming]
 
     GammaPaymentError:
       type: object
@@ -25455,7 +25751,11 @@ components:
             The PurchaseError codes `invalid_request`, `asset_unavailable`,
             `plan_unavailable`, `item_unavailable`, `offer_unavailable`,
             `guest_sign_in_required`, `invalid_email`, `rate_limited`,
-            `start_failed` and `quote_expired`, and Gamma's own:
+            `start_failed` and `quote_expired`; `already_subscribed`: a plan
+            (or Gamma renewal) refused, or a plan's status covered, because
+            another payment pays for or bills the same days (another Pro
+            subscription that renews, or another Gamma payment for the
+            network's Pro plan); and Gamma's own:
             `insufficient_gamma`: the deposit holds, or held when we spent,
             less gamma than the price.
             `daily_cap_exceeded`: the deposit's daily spend cap did not allow
@@ -25474,6 +25774,6 @@ components:
             to `mint_liquidity_exceeded`, `SlippageTooHigh` (less than the
             mint's minimum) to `mint_slippage`, `TaoUsdPriceUnavailable` and
             `GammaDisabled` to `asset_unavailable`.
-          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
+          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
         message:
           type: string

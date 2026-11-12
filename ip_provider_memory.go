@@ -45,8 +45,8 @@ const (
 // evidence, diagnostics, mode/priority maps and six leaf tombstones.
 // SMTP, bulk callback scratch and return roots are separately admitted dynamically.
 // With the required 1-KiB stats registration per provider, two providers plus
-// fallback/old/new NATs cost 1922 KiB, leaving 126 KiB of the shared 2-MiB
-// child for useful traffic during generation overlap.
+// fallback/old/new NATs (240 KiB each) cost 1874 KiB, leaving 174 KiB of the
+// shared 2-MiB child for useful traffic during generation overlap.
 func natProviderMemoryByteCount(sourceCount int) ByteCount {
 	return natProviderFixedBytes + ByteCount(sourceCount)*natProviderSourceBytes
 }

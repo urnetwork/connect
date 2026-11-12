@@ -401,6 +401,36 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		CompanionRefusalHoldMax:         5 * time.Minute,
 		CompanionRefusalMaxDestinations: 1024,
 
+		// Waits of 0.5-1, 1-2, 2-4 and 4-8 s spread five attempts over 7.5-15 s
+		// when each failure answers at once, which rides out a deploy's 502/503
+		// edge or a short api overload. A black-holed route spends each attempt's
+		// full RequestTimeout (15 s by default), so it still gets about one more
+		// attempt within 30 s, as after a network handover. Retries of failures
+		// that answer at once end well inside the 30 s that owners already give a
+		// closing client's join (the SN25 validator's tunnel retirement cancels
+		// its transport past that). A retired window client keeps its identity,
+		// and its device's close join waits, for at most 30 s or one
+		// RequestTimeout if that is longer, where the one attempt before held
+		// them for up to one RequestTimeout.
+		CloseReportRetry: OobRetrySettings{
+			MaxAttemptCount: 5,
+			Timeout:         30 * time.Second,
+			RetryTimeout:    1 * time.Second,
+			RetryMaxTimeout: 8 * time.Second,
+		},
+
+		// a contract lives at most an hour at the platform, so an older record
+		// answers a request for a contract the expiry sweep has already closed;
+		// one id and time an entry, about 64 KiB at the bound
+		CloseRequestCheckpointRecordCount:   1024,
+		CloseRequestCheckpointRecordTimeout: 60 * time.Minute,
+		// the platform's largest CloseSequences lists 1024 contracts
+		ContractsNoRecordMaxCount: 1024,
+		// a full control queue drains in well under a second; the answer
+		// changes nothing at the platform, so a longer wait only holds the
+		// close worker
+		ContractsNoRecordSendTimeout: 1 * time.Second,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -542,6 +572,44 @@ type ContractManagerSettings struct {
 	// Test hook for the hold's jitter draw. Nil uses math/rand.
 	companionRefusalRandomForTest func(n int64) int64
 
+	// Bounds the retries of a close report's out-of-band cleanup, the one
+	// request that carries a checkpoint or final report once its native
+	// delivery has lost the client lifecycle: every report made after the
+	// client closed, and every earlier one still unacknowledged then. The
+	// request is retried after no answer (a network error or a timeout), a 408,
+	// a 429 or a 5xx, and never after any other answer: a 401 from a retired
+	// identity or a rejected unknown contract ends it. Retrying is safe because
+	// each report carries its identity (ReportId), so the platform applies an
+	// exact repeat once. The first attempt is the request sent before, with its
+	// RequestTimeout; the retries run inside the same admitted request, so the
+	// client control's join, and the identity retirement of a window client
+	// behind it, wait for them within this bound. A control without
+	// SendControlWithRetry, the zero value and a MaxAttemptCount at or below 1
+	// send once, as before; server-side contract expiry remains the backstop
+	// when every attempt fails.
+	CloseReportRetry OobRetrySettings
+
+	// How many contracts the manager remembers as checkpointed once every
+	// report of theirs succeeded and none was a final. The platform's close
+	// request (CloseSequences) for a remembered contract that nothing holds
+	// any more is answered with a final of (0, 0), which the platform turns
+	// into a final with the checkpoint's count. Past the bound the oldest is
+	// forgotten and answered as a contract with no record, which the platform
+	// leaves to its expiry sweep; the sweep finalizes the checkpoint with the
+	// same count. Non-positive remembers none.
+	CloseRequestCheckpointRecordCount int
+	// How long a remembered checkpoint answers a close request, from its
+	// report's success. Non-positive remembers none.
+	CloseRequestCheckpointRecordTimeout time.Duration
+	// The most contract ids in one ContractsNoRecord, the answer to a close
+	// request for contracts the client holds no record of. More ids go in
+	// further frames. Non-positive sends one id a frame.
+	ContractsNoRecordMaxCount int
+	// How long the close worker waits to enqueue one ContractsNoRecord on the
+	// control sequence. A refused answer is dropped: the platform treats a
+	// client that never answers the same way. Non-positive does not wait.
+	ContractsNoRecordSendTimeout time.Duration
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -582,6 +650,9 @@ type ContractManager struct {
 	closeControlSyncs map[*ControlSync]bool
 	// Report ownership outlives sequence indexes until delivery is acknowledged.
 	pendingCloseReportKVs map[Id]*contractCloseReports
+	// Protected by mutex. Contracts whose reported checkpoints succeeded, for
+	// the platform's close requests after their reports retire.
+	checkpointRecords contractCheckpointRecords
 	// Protected by mutex. Consecutive contract requests refused as a rate
 	// limit. See CreateContractRateLimitBackoffMin.
 	createContractRateLimitCount int
@@ -692,6 +763,8 @@ type ContractManager struct {
 	beforeCloseControlSendForTest      func(*protocol.Frame)
 	// Nil test barrier at the atomic queue-to-open ownership handoff.
 	afterPollContractForTest func()
+	// Nil in production; exposes each no-record answer before its control send.
+	beforeContractsNoRecordSendForTest func(*protocol.ContractsNoRecord)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -854,6 +927,7 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 		// No admitted sequence can add reports after the client's joined exit.
 		self.mutex.Lock()
 		self.pendingCloseReportKVs = nil
+		self.checkpointRecords = contractCheckpointRecords{}
 		self.mutex.Unlock()
 	}
 	return result
@@ -2387,9 +2461,13 @@ func (self *ContractManager) closeContractWithPendingReport(
 		return
 	}
 
-	// Takes the retained frame for one cleanup attempt after native delivery
-	// loses its lifecycle. The external OOB owner takes custody on return;
-	// server expiry remains the backstop if that attempt fails.
+	// The report's identity makes its exact bytes safe to deliver more than
+	// once, which is what lets its cleanup retry.
+	identified := len(report.ReportId) != 0
+	// Takes the retained frame for one cleanup request after native delivery
+	// loses its lifecycle. The external OOB owner takes custody on return and
+	// retries a transient failure within CloseReportRetry; server expiry
+	// remains the backstop if every attempt fails.
 	sendCleanup := func(cleanupFrame *protocol.Frame) {
 		var stateLock sync.Mutex
 		cleanupReturned, cleanupCompleted, cleanupSucceeded := false, false, false
@@ -2415,7 +2493,10 @@ func (self *ContractManager) closeContractWithPendingReport(
 			}
 		}
 		frames := []*protocol.Frame{cleanupFrame}
-		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
+		if retryOob, ok := self.client.ClientOob().(OutOfBandControlWithRetry); ok && identified {
+			retry := self.settings.CloseReportRetry
+			retryOob.SendControlWithRetry(context.Background(), frames, &retry, sendCallback)
+		} else if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
 			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)

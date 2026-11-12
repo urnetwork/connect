@@ -3,6 +3,7 @@ package connect
 import (
 	"encoding/base32"
 	"encoding/base64"
+	"errors"
 	// "fmt"
 	// mathrand "math/rand"
 	"slices"
@@ -170,6 +171,13 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 					}
 				}
 
+				// Compressed question names can expand beyond the datagram's
+				// size. Decode requires enough space for the entire label.
+				if enc.DecodedLen(j-i) > len(out)-n {
+					out = nil
+					err = errors.New("DNS request exceeds decode buffer")
+					return
+				}
 				var m int
 				m, err = enc.Decode(out[n:], q.Name.Data[i:j])
 				if err != nil {
