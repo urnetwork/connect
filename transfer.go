@@ -13651,7 +13651,7 @@ func (self *SendSequence) sendWindowEstimate(now time.Time) SendWindowEstimate {
 // Report current evidence without allowing a statistics consumer to change
 // which service rate a later physical drain probe will preserve.
 func (self *SendSequence) sendWindowSnapshot(now time.Time) SendWindowEstimate {
-	return self.boundWindowByLatency(self.estimateSendWindow(now, false, false), now)
+	return self.boundWindowByLatencyWithObservation(self.estimateSendWindow(now, false, false), now, false)
 }
 
 // A generation-bound H1-only write uses physical pacing evidence even when
@@ -13890,7 +13890,7 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 	// first ACK. Read that evidence before the local cold-window decision.
 	adjustedRoundTrip, receiverResidence, receiverSampled := self.receiverWindowTiming(now)
 	roundTrip := self.rttWindow.estimate(now)
-	pathRoundTrip := self.observePathRoundTrip(roundTrip.Min, now)
+	pathRoundTrip := self.observePathRoundTripAt(roundTrip.Min, roundTrip.MinSampleAt, now, retainService)
 	if !roundTrip.Sampled() && !receiverSampled {
 		estimate.Reason = "no round trip samples"
 		return estimate

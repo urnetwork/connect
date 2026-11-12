@@ -20,8 +20,9 @@ type rttWindowItem struct {
 }
 
 type rttWindowMinimum struct {
-	rtt      time.Duration
-	sequence uint64
+	rtt             time.Duration
+	sequence        uint64
+	receiveUnixNano int64
 }
 
 type RttWindow struct {
@@ -253,7 +254,7 @@ func (self *RttWindow) observeRoundTripForWrite(roundTrip time.Duration, receive
 		self.minimumCount--
 	}
 	minimumTailIndex := (self.minimumHeadIndex + self.minimumCount) % len(self.minimums)
-	self.minimums[minimumTailIndex] = rttWindowMinimum{rtt: item.rtt, sequence: item.sequence}
+	self.minimums[minimumTailIndex] = rttWindowMinimum{rtt: item.rtt, sequence: item.sequence, receiveUnixNano: item.receiveUnixNano}
 	self.minimumCount++
 }
 
@@ -293,6 +294,9 @@ type RttEstimate struct {
 	// queueing, ours or the window's own.
 	Min         time.Duration
 	SampleCount int
+	// The minimum's actual ACK arrival, so a consumer cannot renew old path
+	// evidence merely by reading the estimate again.
+	MinSampleAt time.Time
 	// Age of the newest sample when the estimate was taken. An estimate whose
 	// newest sample is older than the path's behaviour describes a path that
 	// no longer exists, so freshness travels with the value rather than being
@@ -321,13 +325,17 @@ func (self *RttWindow) estimate(sampleTime time.Time) RttEstimate {
 	newestIndex := (self.windowTailIndex + self.windowCount - 1) % len(self.window)
 	newestSampleAge := sampleTime.Sub(time.Unix(0, self.window[newestIndex].receiveUnixNano))
 	minimum := time.Duration(0)
+	minimumAt := time.Time{}
 	if self.minimumCount != 0 {
-		minimum = self.minimums[self.minimumHeadIndex].rtt
+		item := self.minimums[self.minimumHeadIndex]
+		minimum = item.rtt
+		minimumAt = time.Unix(0, item.receiveUnixNano)
 	}
 	return RttEstimate{
 		Mean:            self.netRtt / time.Duration(self.windowCount),
 		Min:             minimum,
 		SampleCount:     self.windowCount,
+		MinSampleAt:     minimumAt,
 		NewestSampleAge: max(0, newestSampleAge),
 	}
 }

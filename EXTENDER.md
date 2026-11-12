@@ -851,11 +851,36 @@ the address was accepted on (C2a), 15 s timeout.
 A failure increments `consecutive_probe_failures`; at 6 the address is
 deactivated. When an extender has no active address it becomes inactive,
 `revoke_time` is set and a revocation publish row is inserted. A success
-resets the counter and stamps `last_probe_success_time`. A deactivated
-address is re-probed only by a new activation. The read of an extender's
-remaining active addresses is locked, so two probes losing both families
-of one extender in the same tick cannot each see the other still active
-and leave the extender active with no address and no revocation.
+resets the counter and stamps `last_probe_success_time`. The read of an
+extender's remaining active addresses is locked, so two probes losing both
+families of one extender in the same tick cannot each see the other still
+active and leave the extender active with no address and no revocation.
+
+A pass's failures count only when the prober could have passed them
+(server 6845ebf36, 2026-11-11; `taskworker/work/extender_probe_common_mode.go`,
+`extender_probe_control.go`). Each family of a pass is judged first: it is
+held as the prober's own fault when at least three quarters of its addresses
+failed and either at least three quarters of its networks lost half or more of
+theirs (with at least 4 networks and 8 addresses in the pass), or the prober's
+control target failed over that family with them -- a tls handshake, before and
+after the pass, with the operator's api host, the destination every probe
+names, which counts only once it has answered in this process. A held family's
+failures record nothing, deactivate nothing and revoke no one; its successes
+count as always, and each held pass logs an error line.
+
+A deactivated address is probed for its return as well as re-activated by a new
+activation (`extender_probe_recovery.go`, `model/network_extender_recovery_model.go`).
+For 72 h after it last worked -- an uptime probe or its activation passed --
+an address the probes deactivated, with the failure count that deactivated it
+and on the ip it was deactivated on, is probed in the same passes with the same
+dial: every pass for the first 2 h, then at most every 30 minutes, after the
+active addresses and never counting toward the pass's verdict. The first time it
+passes the same tcp challenge under the extender's published key at that ip, the
+address is active again with a clean count, and a revoked extender is active
+again with a record queued in the same transaction, issued after the revocation
+so it supersedes it in every directory (B5). Only what the probes took away is
+restored: a dead extender still fails its six probes, is revoked half an hour
+after it stopped answering, and never answers a probe for its return.
 
 C4. Publish tick. Taskworker task every 10 minutes. Drip: select up to 8
 active extenders ordered by the oldest `last_publish_time` (nulls first),
@@ -4175,13 +4200,9 @@ one and never the bootstrap -- the socket carriers and the dns carrier
 remain the paths where udp is dead or nothing else reaches the operator.
 connectctl's extender gains no flag yet. The webrtc dialer's priority and
 port in `extenderConfigsForCandidate` (net_http.go, in flight elsewhere).
-UPnP-IGD, NAT-PMP and PCP port mapping, which would also let today's socket
-carriers activate on many home routers, scoped as a follow-on: a mapping
-of tcp 443 and udp 443/4053 attempted by the role before its binds, with
-the mapped external port offered to the activation (a port field per
-carrier the record already has), through an MIT or BSD library only. A
-TURN fallback for the symmetric NATs hole punching cannot cross. The apps'
-setting for `ProvideExtenderWebRtc`.
+UPnP-IGD, NAT-PMP and PCP port mapping, scoped here as a follow-on, is built
+(S10). A TURN fallback for the symmetric NATs hole punching cannot cross. The
+apps' setting for `ProvideExtenderWebRtc`.
 
 S9. Decisions. The flag on `ExchangeSignals` rather than a new message
 type: the frames already reach the manager through the client's signal
@@ -4195,6 +4216,87 @@ dial would hold the address's other carriers. The answerer on the manager
 rather than a second signal receiver: one receive path, one ownership. The
 uptime fallback from tcp to webrtc rather than one path per address: an
 extender accepted on both is live while either answers.
+
+S10. Router port mapping (built 2026-11-11), connect and sdk. A provider
+extender behind a home router has no inbound path on its carriers unless the
+router forwards them, so the role can ask it to. Owner, 2026-11-11: "make it a
+configurable option. the miners can turn it on by default, but the apps should
+turn it off by default." The setting is the sdk's
+(`DeviceLocal.GetProvideExtenderPortMapping`, `SetProvideExtenderPortMapping`,
+on the `Device` interface and through `DeviceRemote`'s rpc), stored per space
+as `.provide_extender_port_mapping`; until the user sets it the device default
+applies, `DeviceLocalSettings.DefaultProvideExtenderPortMapping`: off in
+`DefaultDeviceLocalSettings`, so off on every app (macOS, Windows and Linux
+carry the switch, "Open a port on my router", under the speed tests switch, and
+its description says it opens a port on the router; Android and iOS carry no
+role), and on in the sn miner (`miner.ProviderDeviceSettings`), which
+`URNETWORK_PORT_MAPPING=0` and `provide --no-port-mapping` turn off and
+`provider status` and `provider doctor` report. A changed setting replaces a
+running role, so off removes what the router forwards.
+
+`connect/portmap` asks the router of the host's ipv4 default route, read with
+go-netroute (BSD-3-Clause): PCP (RFC 6887) first, NAT-PMP (RFC 6886) when the
+server answers the PCP request with its own version, then UPnP IGD through
+goupnp (BSD-2-Clause) for the description and the SOAP actions. PCP and
+NAT-PMP are implemented in the package, a few hundred lines with their wire
+formats tested byte for byte: the one NAT-PMP library, jackpal/go-nat-pmp, is
+Apache-2.0, and no MIT or BSD PCP library exists. The first method that maps
+the tcp carrier is used for every carrier; a method that maps only the udp
+ones is undone and the next is tried. Mappings ask for an hour, renew at half
+the lifetime granted (at least a minute apart), and a mapper that maps nothing
+asks again after five minutes, doubling to an hour. Every exchange is bounded:
+three PCP or NAT-PMP sends from 250 ms, a 1.5 s SSDP search, 2 s per UPnP
+request, 10 s for a whole attempt, 3 s to remove everything.
+
+What it may map is narrow. The role asks only for the carriers it holds once
+its binds settle -- tcp 443, and udp 443 and udp 4053 when they bound -- never
+a port it does not hold, since the router would forward it to whatever does,
+and never udp 53. Every mapping forwards to this host's own address. Only the
+gateway is talked to: a PCP or NAT-PMP answer from another source is dropped,
+the SSDP answer must come from the gateway's address, and a UPnP description
+or control url off the gateway is refused, so another device on the lan can
+neither steer a mapping nor make the host request anything elsewhere; the
+http client uses no proxy and follows no redirect. A UPnP router that grants
+only permanent leases (725) is not used, since a mapping that outlives a
+crashed process would later forward to whichever host takes the address. A
+router whose own external address is private or CGNAT is behind another NAT,
+which nothing on it crosses: its mappings are removed and the attempt fails. A
+host with a public ipv4 address maps nothing (`connect.FamilyPublic(4)`), and
+neither does a host whose default route is a tunnel (`connect.
+IsTunnelInterfaceName`), such as an app's own vpn while connected.
+
+The activation offers what the router forwards. The first post waits for the
+router's first answer at most 15 s, so a missing or broken router delays the
+first activation by that and nothing else; each post reads the external ports
+(`ExtenderActivatorSettings.OfferedPorts`, and the dns carrier's within
+`DnsPorts`), a mapping that lands or moves later is posted at once
+(`Reactivate`), and the mesh address uses the external tcp port. A router may
+give an external port other than 443: PCP and NAT-PMP pick one, and an IGD:2
+router answers a conflict (718) through AddAnyPortMapping; IGD:1's conflict
+fails the method. The record holds one port per carrier for every address of
+an extender, so with an external port other than the bound one a v6 address is
+offered that port too and the operator's probe leaves it out unless it answers
+there; per-address ports are a record and server change for later. Only ipv4 is
+mapped; a v6 firewall pinhole (PCP or WANIPv6FirewallControl) is not done.
+
+`ExtenderProvideStatus` reports it: `PortMapping` (off, not_needed, mapping,
+mapped, failed), `PortMappingMethod`, `PortMappingExternalIp`, the external
+`PortMappingTcpPort`, `PortMappingUdpPort` and `PortMappingDnsPort`, and
+`PortMappingError`, why nothing is mapped or why a udp carrier is not. Tests,
+all in process: `portmap/` against a PCP and NAT-PMP server answered in memory
+and a UPnP IGD:1 and IGD:2 device on httptest, with a clock whose waits the test
+fires (the methods, the fallback, the router's external port, renewal at the
+granted lifetime and a moved port, the retry backoff, removal on close, the
+partial method undone, permanent leases, conflicts, double NAT, urls off the
+gateway, and every request naming only the caller's ports), and the real udp
+exchange and SSDP search on loopback; connect's
+`TestExtenderActivatorOffersTheMappedPorts`; the sdk role at the device's
+entry points with a NAT-PMP router behind the mapper's seam
+(`device_local_extender_port_mapping_test.go`: off by default, the router's
+ports in every post and in the mesh address, nothing asked with a public
+address, the mappings removed when the setting turns off and when the role
+stops, a moved mapping posted at once); the miner's default, the environment,
+the flag and the status lines (`sn/miner/port_mapping_test.go`).
 
 ### I. Tests
 
