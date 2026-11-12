@@ -4104,10 +4104,11 @@ record carries them and the rendezvous. The webrtc test runs connect's
 `ProbeExtenderWebRtcForward` over a carrier signaled through the relay of
 S8 (the operator's probe settings, `newExtenderWebRtcProbeConnectSettings`
 in the server's extender_webrtc_controller.go); the uptime probe runs
-`ProbeExtenderWebRtcCarrier` the same way. Uptime probes an address over the required path it was
-accepted on: the tcp challenge when the address lists tcp, and the webrtc
-challenge when it lists webrtc -- also when its tcp stopped answering, so
-an address is live while any required path it was accepted on answers and
+`ProbeExtenderWebRtcCarrier` the same way. Uptime probes an address over
+the required path it was accepted on: the tcp challenge when the address
+lists tcp, and the webrtc challenge when it lists webrtc -- beside tcp once
+tcp has failed or been slow to pass (S8), so an address is live while any
+required path it was accepted on answers and
 a webrtc-accepted extender is never deactivated for a public tcp port it
 may not have (`NetworkExtenderProbeTarget.ClientId`, read from the
 extender row).
@@ -4231,9 +4232,14 @@ nothing, and every webrtc test was refused.
   those are a client's first contact, and the carrier signals through an
   exchange connection a client in first contact does not have. Its records
   reach connected clients through the drip and the feed.
-- Uptime (C3). An address is probed over the required paths it lists, both
-  at once when it lists both, live while either answers, so a tcp port that
-  stopped answering does not starve the webrtc probe of the address budget.
+- Uptime (C3). An address is probed over the required paths it lists, live
+  while either answers. One that lists both is a staggered race: tcp first,
+  and webrtc beside it once tcp has failed or not passed within its head
+  start (5 s, the address budget less the activation's), the first to pass
+  ending the other, both joined before the address's place in the pass is
+  freed. So a tcp port that stopped answering does not starve the webrtc
+  probe of the address budget, and a tcp port that answers sends the
+  extender's device no offer each pass.
 - The device's dial side (connect, sdk). `WebRtcExtenderDialSignaling` holds
   the client a device signals through, resolves an extender's key to the
   rendezvous id of its verified record and that client's exchanger (never
@@ -4283,7 +4289,8 @@ nothing, and every webrtc test was refused.
   prober's exchanger over a fake relay, the listener over a fake store and
   exchange (every refusal, the client's burst, the exchange's slots, no
   worker while idle, the close), the subscriber's routing, the control
-  no-op, the uptime paths, and against the test Redis and database the
+  no-op, the uptime paths and tcp's head start (no offer while tcp passes,
+  the losing path joined), and against the test Redis and database the
   relay keys, the first-contact rule and the relay end to end through a
   real exchange to a real client's answerer. sdk: the default, the role on
   by default with the provider client's manager, on the carrier without tcp
@@ -4314,8 +4321,9 @@ candidate with no signaling path is never expanded; and a failed webrtc
 dial holds only a webrtc-only address, since a hold is of the whole
 address. The answerer on the manager rather than a second signal receiver:
 one receive path, one ownership. Uptime over every required path an
-address was accepted on, at once: an extender accepted on both is live
-while either answers. The relay on per-client Redis keys and the exchange's
+address was accepted on, tcp with a head start rather than both at once:
+an extender accepted on both is live while either answers, and a device
+whose tcp port answers is not sent an offer every five minutes for nothing. The relay on per-client Redis keys and the exchange's
 keyspace subscriber (S8) rather than a channel per connect process or the
 close-request set: an offer survives a resubscribe and a move, which kick
 the listener, and an old connect process, which would take a close set's
