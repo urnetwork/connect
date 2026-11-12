@@ -150,6 +150,14 @@ type ExtenderActivateResult struct {
 	// client is told to dial them. Empty on a refusal, which probes no optional
 	// carrier, and from an operator that predates the field.
 	RefusedCarriers []*ExtenderActivateCarrierRefusal `json:"refused_carriers,omitempty"`
+	// whether the operator keeps each address's ports (S10): it stores the
+	// ports a post offers with that family's address alone and signs them per
+	// address, so each family's post may offer its own
+	// (ExtenderActivatorSettings.FamilyOfferedPorts). On every answer of an
+	// operator that does. False from one that predates it, which keeps one port
+	// per carrier for every address of an extender, so a post there offers the
+	// same ports whatever its family.
+	AddressPorts bool `json:"address_ports,omitempty"`
 }
 
 // One optional carrier, or one dns port, the operator's probe left out of an
@@ -370,12 +378,16 @@ type ExtenderActivatorSettings struct {
 	// FamilyOfferedPorts, when set, is read at each post in place of OfferedPorts,
 	// with the family the post activates: a router's mapping forwards the carriers
 	// of the family behind it, ipv4, on the ports it picks, while the other
-	// family's address answers on the bound ports, and the operator keeps and
-	// signs each address's own (S10; protocol.ExtenderAddress TcpPort, UdpPort,
-	// DnsPorts). The family is 0 for a post to the plain api url, which the
-	// operator derives from the caller address. A zero port leaves the
-	// configured one. FamilyDnsPorts answers the family's dns ports beside it. It
-	// runs on the loop goroutine and must not block.
+	// family's address answers on the bound ports, and an operator that keeps
+	// each address's ports signs each address's own (S10; protocol.
+	// ExtenderAddress TcpPort, UdpPort, DnsPorts). It is asked for family 0 --
+	// the one set of ports every family offers -- for a post to the plain api
+	// url, whose family the operator derives from the caller address, and for
+	// every post until an answer says the operator keeps each address's ports
+	// (ExtenderActivateResult.AddressPorts): one that keeps one port per carrier
+	// for the extender would otherwise publish one family on the other's ports.
+	// A zero port leaves the configured one. FamilyDnsPorts answers the dns
+	// ports beside it. It runs on the loop goroutine and must not block.
 	FamilyOfferedPorts func(ipVersion int) (tcpPort int, udpPort int, dnsPort int)
 
 	// The carriers that are listening right now (G2). Only these are offered,
@@ -389,10 +401,10 @@ type ExtenderActivatorSettings struct {
 	// operator probes and the record lists. Nil offers DnsPort alone.
 	DnsPorts func() []int
 	// FamilyDnsPorts, when set, is read in place of DnsPorts with the family a
-	// post activates, or whose standing post a carrier change is compared with:
-	// the dns ports that family's address is reached on (FamilyOfferedPorts).
-	// Nil or empty for a family offers DnsPort alone. It runs on the loop
-	// goroutine and must not block.
+	// post activates, or whose standing post a carrier change is compared with,
+	// and asked for family 0 as FamilyOfferedPorts is: the dns ports that
+	// family's address is reached on. Nil or empty offers DnsPort alone. It runs
+	// on the loop goroutine and must not block.
 	FamilyDnsPorts func(ipVersion int) []int
 
 	// The directory the signed record and the bootstrap records are applied
@@ -606,6 +618,12 @@ type ExtenderActivator struct {
 	// other. Both are read and written by the loop goroutine alone.
 	extenderId          Id
 	measurementFollowUp bool
+
+	// whether the operator's last answer said it keeps each address's ports
+	// (ExtenderActivateResult.AddressPorts, S10), which is when a family's post
+	// offers the family's own (portsFamily). Read and written by the loop
+	// goroutine alone.
+	addressPorts bool
 
 	// The schedule of each family (G3), keyed by ip version, or by 0 for the
 	// one post a cycle of the fallback mode; and the address the caller address
@@ -1440,13 +1458,13 @@ func (self *ExtenderActivator) carriers() []string {
 // configured port.
 //
 // FamilyOfferedPorts takes OfferedPorts' place when it is set, asked for the
-// family posted, 0 for the plain api url's (S10).
+// family posted, 0 for the plain api url's (S10, portsFamily).
 func (self *ExtenderActivator) offeredPorts(ipVersion int) (tcpPort int, udpPort int, dnsPort int) {
 	tcpPort, udpPort, dnsPort = self.settings.TcpPort, self.settings.UdpPort, self.settings.DnsPort
 	var offeredTcpPort, offeredUdpPort, offeredDnsPort int
 	switch {
 	case self.settings.FamilyOfferedPorts != nil:
-		offeredTcpPort, offeredUdpPort, offeredDnsPort = self.settings.FamilyOfferedPorts(ipVersion)
+		offeredTcpPort, offeredUdpPort, offeredDnsPort = self.settings.FamilyOfferedPorts(self.portsFamily(ipVersion))
 	case self.settings.OfferedPorts != nil:
 		offeredTcpPort, offeredUdpPort, offeredDnsPort = self.settings.OfferedPorts()
 	default:
@@ -1465,13 +1483,13 @@ func (self *ExtenderActivator) offeredPorts(ipVersion int) (tcpPort int, udpPort
 }
 
 // The dns ports a post of the family offers, ascending (L2), 0 for the plain
-// api url's: FamilyDnsPorts', else DnsPorts'. Nil when the caller offers none,
-// which leaves the operator on DnsPort alone.
+// api url's: FamilyDnsPorts' (portsFamily), else DnsPorts'. Nil when the caller
+// offers none, which leaves the operator on DnsPort alone.
 func (self *ExtenderActivator) dnsPorts(ipVersion int) []int {
 	var dnsPorts []int
 	switch {
 	case self.settings.FamilyDnsPorts != nil:
-		dnsPorts = self.settings.FamilyDnsPorts(ipVersion)
+		dnsPorts = self.settings.FamilyDnsPorts(self.portsFamily(ipVersion))
 	case self.settings.DnsPorts != nil:
 		dnsPorts = self.settings.DnsPorts()
 	default:
@@ -1481,6 +1499,19 @@ func (self *ExtenderActivator) dnsPorts(ipVersion int) []int {
 		return dnsPorts
 	}
 	return nil
+}
+
+// The family whose ports a post of the family offers (S10): its own once the
+// operator's last answer said it keeps each address's ports, else 0, the one
+// set of ports every family offers. An operator that keeps one port per
+// carrier for the extender takes the latest post's for every address, so
+// families that offered their own would each publish the other on the wrong
+// port.
+func (self *ExtenderActivator) portsFamily(ipVersion int) int {
+	if self.addressPorts {
+		return ipVersion
+	}
+	return 0
 }
 
 // What one post, or one family's turn in a pass, came to.
@@ -1562,12 +1593,9 @@ type extenderActivateAnswer struct {
 // own on it when it can (OnRefused), and a trigger still posts at once.
 func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	carriers := self.carriers()
-	// the dns ports each family's post offers, which a router's mapping may
+	// the dns ports each family's post offered, which a router's mapping may
 	// make differ by family (FamilyDnsPorts)
 	keyDnsPorts := map[int][]int{}
-	for _, key := range due {
-		keyDnsPorts[key] = self.dnsPorts(key)
-	}
 	// a pass forced to carry the measurement request is followed by no
 	// other, so a request that keeps missing cannot hold the loop (C4)
 	followUp := self.measurementFollowUp
@@ -1577,6 +1605,9 @@ func (self *ExtenderActivator) activate(now time.Time, due []int) {
 	// whether a post of this pass delivered the measurement request
 	measurementCarried := false
 	for i, key := range due {
+		// read at the post, after the answers before it, which say whether the
+		// operator keeps each address's ports (portsFamily)
+		keyDnsPorts[key] = self.dnsPorts(key)
 		if self.fallback {
 			answers[i] = self.activateFallback(carriers, keyDnsPorts[key], now)
 		} else {
@@ -1863,6 +1894,9 @@ func (self *ExtenderActivator) activateUrl(
 	if ipVersion == 0 {
 		ipVersion = extenderActivateResultIpVersion(result)
 	}
+	// every answer says whether the operator keeps each address's ports, which
+	// the next post's ports follow (portsFamily, S10)
+	self.addressPorts = result.AddressPorts
 	if !result.Activated {
 		message := result.Error
 		if message == "" {

@@ -153,14 +153,45 @@ func TestExtenderDirectoryCandidateDialsTheAddressPorts(t *testing.T) {
 	}
 }
 
-// Each family's post offers that family's ports when FamilyOfferedPorts and
-// FamilyDnsPorts are set: the v4 post the router's, the v6 post the bound ones,
-// read again at each post, so a mapping the router moves reaches only the v4
-// post.
-func TestExtenderActivatorOffersEachFamilyItsPorts(t *testing.T) {
-	var stateLock sync.Mutex
-	mappedTcpPort := 40443
-	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+// The ports of a role behind a router that forwards its ipv4 carriers on
+// 40443 (or where it moved it), 40444 and 40053, as the sdk's role answers
+// FamilyOfferedPorts and FamilyDnsPorts: the router's for ipv4 and for family
+// 0, the one set of ports every family offers, and the bound ones for ipv6.
+type testFamilyPorts struct {
+	stateLock     sync.Mutex
+	mappedTcpPort int
+}
+
+func (self *testFamilyPorts) offeredPorts(ipVersion int) (int, int, int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if ipVersion == 6 {
+		return 0, 0, 0
+	}
+	return self.mappedTcpPort, 40444, 40053
+}
+
+func (self *testFamilyPorts) dnsPorts(ipVersion int) []int {
+	if ipVersion == 6 {
+		return []int{ExtenderDnsPort}
+	}
+	return []int{40053}
+}
+
+func (self *testFamilyPorts) setMappedTcpPort(mappedTcpPort int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.mappedTcpPort = mappedTcpPort
+}
+
+// An activator whose role answers the family seams as testFamilyPorts does, to
+// an operator that keeps each address's ports or not.
+func newTestFamilyPortsActivatorFixture(t *testing.T, addressPorts bool) (*testActivatorFixture, *testFamilyPorts) {
+	t.Helper()
+	familyPorts := &testFamilyPorts{mappedTcpPort: 40443}
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.addressPorts = addressPorts
+	}, func(settings *ExtenderActivatorSettings) {
 		// the configured ports, which a family the router does not forward
 		// keeps
 		settings.TcpPort = ExtenderTcpPort
@@ -173,63 +204,95 @@ func TestExtenderActivatorOffersEachFamilyItsPorts(t *testing.T) {
 		settings.DnsPorts = func() []int {
 			return []int{1}
 		}
-		settings.FamilyOfferedPorts = func(ipVersion int) (int, int, int) {
-			stateLock.Lock()
-			defer stateLock.Unlock()
-			if ipVersion == 4 {
-				return mappedTcpPort, 40444, 40053
-			}
-			return 0, 0, 0
-		}
-		settings.FamilyDnsPorts = func(ipVersion int) []int {
-			if ipVersion == 4 {
-				return []int{40053}
-			}
-			return []int{ExtenderDnsPort}
-		}
+		settings.FamilyOfferedPorts = familyPorts.offeredPorts
+		settings.FamilyDnsPorts = familyPorts.dnsPorts
 	})
+	return fixture, familyPorts
+}
 
-	expectPosts := func(v4TcpPort int) {
-		t.Helper()
-		posts := map[int]*testActivatePost{}
-		for range 2 {
-			post := fixture.waitPost()
-			posts[post.ipVersion] = post
+// The next post of each family, which must offer the router's ports with the
+// v4 tcp port given, and over v6 the router's too when v6Bound is false, else
+// the bound ones.
+func (self *testActivatorFixture) expectFamilyPorts(what string, v4TcpPort int, v6Bound bool) {
+	self.t.Helper()
+	posts := map[int]*testActivatePost{}
+	for range 2 {
+		post := self.waitPost()
+		posts[post.ipVersion] = post
+	}
+	type ports struct {
+		tcpPort  int
+		udpPort  int
+		dnsPort  int
+		dnsPorts []int
+	}
+	expectedPorts := map[int]ports{
+		4: {tcpPort: v4TcpPort, udpPort: 40444, dnsPort: 40053, dnsPorts: []int{40053}},
+		6: {tcpPort: v4TcpPort, udpPort: 40444, dnsPort: 40053, dnsPorts: []int{40053}},
+	}
+	if v6Bound {
+		expectedPorts[6] = ports{tcpPort: ExtenderTcpPort, udpPort: ExtenderQuicPort, dnsPort: ExtenderDnsPort, dnsPorts: []int{ExtenderDnsPort}}
+	}
+	for ipVersion, expected := range expectedPorts {
+		post := posts[ipVersion]
+		if post == nil {
+			self.t.Fatalf("%s: no v%d post", what, ipVersion)
 		}
-		for ipVersion, expected := range map[int]struct {
-			tcpPort  int
-			udpPort  int
-			dnsPort  int
-			dnsPorts []int
-		}{
-			4: {tcpPort: v4TcpPort, udpPort: 40444, dnsPort: 40053, dnsPorts: []int{40053}},
-			6: {tcpPort: ExtenderTcpPort, udpPort: ExtenderQuicPort, dnsPort: ExtenderDnsPort, dnsPorts: []int{ExtenderDnsPort}},
-		} {
-			post := posts[ipVersion]
-			if post == nil {
-				t.Fatalf("no v%d post", ipVersion)
-			}
-			if post.args.TcpPort != expected.tcpPort || post.args.UdpPort != expected.udpPort ||
-				post.args.DnsPort != expected.dnsPort || !slices.Equal(post.args.DnsPorts, expected.dnsPorts) {
-				t.Fatalf("v%d offers %d/%d/%d %v, expected %d/%d/%d %v",
-					ipVersion,
-					post.args.TcpPort, post.args.UdpPort, post.args.DnsPort, post.args.DnsPorts,
-					expected.tcpPort, expected.udpPort, expected.dnsPort, expected.dnsPorts)
-			}
+		if post.args.TcpPort != expected.tcpPort || post.args.UdpPort != expected.udpPort ||
+			post.args.DnsPort != expected.dnsPort || !slices.Equal(post.args.DnsPorts, expected.dnsPorts) {
+			self.t.Fatalf("%s: v%d offers %d/%d/%d %v, expected %d/%d/%d %v",
+				what,
+				ipVersion,
+				post.args.TcpPort, post.args.UdpPort, post.args.DnsPort, post.args.DnsPorts,
+				expected.tcpPort, expected.udpPort, expected.dnsPort, expected.dnsPorts)
 		}
 	}
+}
 
+// To an operator that keeps each address's ports, each family's post offers
+// that family's: the v4 post the router's, the v6 post the bound ones. The
+// first post offers the one set of ports every family offers, and its answer
+// says the operator keeps them, so the v6 post of the same pass already offers
+// its own. Read again at each post, so a mapping the router moves reaches only
+// the v4 post.
+func TestExtenderActivatorOffersEachFamilyItsPorts(t *testing.T) {
+	fixture, familyPorts := newTestFamilyPortsActivatorFixture(t, true)
 	fixture.waitPass()
-	expectPosts(40443)
+	fixture.expectFamilyPorts("the first pass", 40443, true)
 
 	// the router moved the v4 mapping
+	familyPorts.setMappedTcpPort(41443)
+	fixture.activator.Reactivate()
+	fixture.expectFamilyPorts("the moved mapping", 41443, true)
+}
+
+// To an operator that keeps one port per carrier for every address of an
+// extender, every family's post offers the one set of ports, the router's, as
+// a post did before the families had their own: that operator would sign each
+// family's address on the other's ports. The latest answer decides, so an
+// operator that stops keeping them is followed at the next post.
+func TestExtenderActivatorOffersOneSetOfPortsWithoutAddressPorts(t *testing.T) {
+	fixture, _ := newTestFamilyPortsActivatorFixture(t, false)
+	fixture.waitPass()
+	fixture.expectFamilyPorts("an operator without address ports", 40443, false)
+
 	func() {
-		stateLock.Lock()
-		defer stateLock.Unlock()
-		mappedTcpPort = 41443
+		fixture.operator.stateLock.Lock()
+		defer fixture.operator.stateLock.Unlock()
+		fixture.operator.addressPorts = true
 	}()
 	fixture.activator.Reactivate()
-	expectPosts(41443)
+	fixture.expectFamilyPorts("the operator keeps them now", 40443, true)
+
+	func() {
+		fixture.operator.stateLock.Lock()
+		defer fixture.operator.stateLock.Unlock()
+		fixture.operator.addressPorts = false
+	}()
+	fixture.activator.Reactivate()
+	// the v4 post goes out under the last answer, and its answer moves the v6
+	// post back to the one set of ports
+	fixture.expectFamilyPorts("the operator stopped keeping them", 40443, false)
 }
 
 // A carrier change compares each family's standing post with the dns ports that
@@ -238,10 +301,13 @@ func TestExtenderActivatorOffersEachFamilyItsPorts(t *testing.T) {
 func TestExtenderActivatorComparesEachFamilyWithItsDnsPorts(t *testing.T) {
 	var stateLock sync.Mutex
 	familyDnsPorts := map[int][]int{
+		0: {40053},
 		4: {40053},
 		6: {ExtenderDnsPort},
 	}
-	fixture := newTestActivatorFixtureActivated(t, func(settings *ExtenderActivatorSettings) {
+	fixture := newTestActivatorFixtureWithOperator(t, func(operator *testActivateOperator) {
+		operator.addressPorts = true
+	}, func(settings *ExtenderActivatorSettings) {
 		settings.CarrierReturnJitter = -1
 		settings.FamilyDnsPorts = func(ipVersion int) []int {
 			stateLock.Lock()
@@ -249,6 +315,10 @@ func TestExtenderActivatorComparesEachFamilyWithItsDnsPorts(t *testing.T) {
 			return slices.Clone(familyDnsPorts[ipVersion])
 		}
 	})
+	fixture.waitFirstPass()
+	for range 2 {
+		fixture.waitActivation()
+	}
 	fixture.step(time.Minute)
 
 	fixture.activator.CarriersChanged()

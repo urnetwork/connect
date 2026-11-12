@@ -113,6 +113,9 @@ type testActivateOperator struct {
 	// keeps each signed record newer than the last, which is what the newest
 	// wins rule of B5 needs when two activations land in the same instant
 	issueSerial int
+	// the `address_ports` an activation carries (S10), false as an operator
+	// that predates the field sends
+	addressPorts bool
 }
 
 func newTestActivateOperator(
@@ -258,6 +261,7 @@ func (self *testActivateOperator) activateResult(
 		ip = publishedIp
 	}
 	refusedCarriers := self.refusedCarriers
+	addressPorts := self.addressPorts
 	self.activatedIps[ipVersion] = ip
 	activatedIps := []string{}
 	for _, activatedIpVersion := range []int{4, 6} {
@@ -292,6 +296,7 @@ func (self *testActivateOperator) activateResult(
 		Record:          record,
 		Bootstrap:       []string{bootstrapRecord},
 		RefusedCarriers: refusedCarriers,
+		AddressPorts:    addressPorts,
 	}, nil
 }
 

@@ -4291,6 +4291,14 @@ them names none, and the record of an extender whose addresses share their
 ports is the record it always was. A reader that predates the fields skips them
 and dials every address on the record's, which is what it did before; an
 address activated before the operator kept its ports reads the extender's.
+Every answer of such an operator says so (`address_ports`,
+`ExtenderActivateResult.AddressPorts`), and a family's post offers its own
+ports only while the last answer did: until then, and to an operator that
+predates it, every post offers the one set of ports, the router's (the family
+seams asked for family 0), since an operator keeping one port per carrier would
+publish each family on the other's. The first post of a pass is the ipv4 one,
+so the ipv6 post of the same pass already offers its own. The order the
+operator and the extenders are deployed in does not matter.
 
 `ExtenderProvideStatus` reports it: `PortMapping` (off, not_needed, mapping,
 mapped, failed), `PortMappingMethod`, `PortMappingExternalIp`, the external
@@ -4423,7 +4431,8 @@ with the database.
 | api metrics | stage `owner` on `urnetwork_extender_activations_total` (C2b, C2c) |
 | alt api front and status listener | `X-UR-Forwarded-For` set from the peer; `X-Forwarded-For`, `X-Forwarded-Source-Port` and `X-UR-Request-Buffering` cleared (L1) |
 | `protocol.ExtenderAddress` | `TcpPort`, `UdpPort` and `DnsPorts` added (fields 4 to 6): an address's own ports where they are not the record's; zero and empty take the record's, and a reader that predates them skips them (S10) |
-| `ExtenderActivatorSettings` | `FamilyOfferedPorts` and `FamilyDnsPorts` added, read per family in place of `OfferedPorts` and `DnsPorts` (S10) |
+| `ExtenderActivatorSettings` | `FamilyOfferedPorts` and `FamilyDnsPorts` added, read per family in place of `OfferedPorts` and `DnsPorts`, for family 0 while the operator keeps no address ports (S10) |
+| `POST /network/extender-activate` answer | `address_ports` added: the operator keeps each address's ports; old providers skip it (S10) |
 | `network_extender_address` | `tcp_port` and `udp_port` added, nullable; null is the extender's (S10) |
 
 Old clients keep working: the header's new fields are optional, the hello
