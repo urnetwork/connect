@@ -161,7 +161,7 @@ func TestStrictWindowNeverBelowMinimumDuringHandover(t *testing.T) {
 				installedCount, _ := strictHandoverTestCounts(window)
 				// selection's offer without the rank gate counts every
 				// selectable client
-				offered := window.orderedClientsCrossTierForIpVersion(0)
+				offered := window.orderedClientsCrossTierForFlow(flowNeed{ipVersion: 0})
 				minSatisfied := h.multiClient.Monitor().WindowExpandEvent().MinSatisfied
 				snapshotLock.Lock()
 				defer snapshotLock.Unlock()

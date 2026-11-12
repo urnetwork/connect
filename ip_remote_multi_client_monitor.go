@@ -34,10 +34,16 @@ type WindowExpandEvent struct {
 	// deadline twice with zero providers Added. Cleared when a provider lands.
 	Failed bool
 	// Ipv6Available is whether the window holds an added, unwarned exit that
-	// can carry v6 (IPV6.md B6). Merged across windows by OR. While false the
-	// apps can tell the user v6 is not carried, the in-tunnel resolver
-	// answers AAAA empty, and v6 flows are answered with no-route.
+	// can carry v6 (IPV6.md B6). Merged across windows by OR, the limited
+	// window's included. While false the apps can tell the user v6 is not
+	// carried, the in-tunnel resolver answers AAAA empty, and v6 flows are
+	// answered with no-route.
 	Ipv6Available bool
+	// Whether the window holds an added, unwarned exit labelled dualproto
+	// (server FP2-PROTOCOL.md §7.7). Merged across windows by OR. While false
+	// once the windows have formed, udp flows are answered with port
+	// unreachable. False from a publisher that predates it.
+	UdpAvailable bool
 	// Whether the Added providers are in the location that was asked for, or
 	// in its region or country because it had none (see location_match.go).
 	// A provider counts once Added, while the window may still be short of
@@ -454,14 +460,21 @@ func (self *RemoteUserNatMultiClientMonitor) ProviderEvents() map[Id]*ProviderEv
 	return maps.Clone(self.clientIdProviderEvents)
 }
 
+// A publisher that predates udp availability: UdpAvailable reads false.
 func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool) {
-	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, false)
+	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, false, false)
+}
+
+// AddWindowExpandEvent with the window's udp availability (server
+// FP2-PROTOCOL.md §7.8), for a publisher outside the window's resize pass.
+func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEventWithAvailability(minSatisfied bool, targetSize int, ipv6Available bool, udpAvailable bool) {
+	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, udpAvailable, false)
 }
 
 // Resize publishes profile activity with the same snapshot as its size. Keep
 // the raw state for later outcome/provider updates; every public copy masks
 // inactive admission fields, including queued and coalesced callbacks.
-func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool, inactive bool) {
+func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool, udpAvailable bool, inactive bool) {
 	var windowExpandEvent WindowExpandEvent
 	changed := false
 	func() {
@@ -475,6 +488,7 @@ func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied b
 			TargetSize:    targetSize,
 			MinSatisfied:  minSatisfied,
 			Ipv6Available: ipv6Available,
+			UdpAvailable:  udpAvailable,
 			// the stall diagnosis is carried, not owned, by the expand event:
 			// this call updates the size half only (SetStallStatus owns the
 			// other half)
@@ -653,6 +667,12 @@ func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIps(clientId Id,
 
 type MergedMultiClientMonitor struct {
 	monitors []MultiClientMonitor
+	// Windows that contribute only their address-family and udp availability:
+	// the limited window (server FP2-PROTOCOL.md §7.8). Their size,
+	// readiness, stall reason, failure and provider events are not merged, so
+	// the apps' Connected status, grid and provider counts read the normal
+	// windows alone.
+	availabilityMonitors []MultiClientMonitor
 
 	// Test hook, set before AddMonitorEventCallback: runs in a window's
 	// callback after the merged event is read and before it is dispatched,
@@ -661,8 +681,15 @@ type MergedMultiClientMonitor struct {
 }
 
 func NewMergedMultiClientMonitor(monitors []MultiClientMonitor) *MergedMultiClientMonitor {
+	return newMergedMultiClientMonitorWithAvailability(monitors, nil)
+}
+
+// A merged monitor whose availabilityMonitors contribute their availability
+// only (see MergedMultiClientMonitor.availabilityMonitors).
+func newMergedMultiClientMonitorWithAvailability(monitors []MultiClientMonitor, availabilityMonitors []MultiClientMonitor) *MergedMultiClientMonitor {
 	return &MergedMultiClientMonitor{
-		monitors: monitors,
+		monitors:             monitors,
+		availabilityMonitors: availabilityMonitors,
 	}
 }
 
@@ -688,10 +715,24 @@ func (self *MergedMultiClientMonitor) AddMonitorEventCallback(monitorEventCallba
 		}
 		worker.Dispatch(windowExpandEvent, providerEvents, reset)
 	}
+	// an availability window's change dispatches the merged expand event
+	// alone: its providers are never the listener's
+	availabilityChanged := func(_ *WindowExpandEvent, _ map[Id]*ProviderEvent, reset bool) {
+		windowExpandEvent := self.WindowExpandEvent()
+		var providerEvents map[Id]*ProviderEvent
+		if reset {
+			windowExpandEvent, providerEvents = self.Events()
+		}
+		worker.Dispatch(windowExpandEvent, providerEvents, reset)
+	}
 
 	subs := []func(){}
 	for _, monitor := range self.monitors {
 		sub := monitor.AddMonitorEventCallback(c)
+		subs = append(subs, sub)
+	}
+	for _, monitor := range self.availabilityMonitors {
+		sub := monitor.AddMonitorEventCallback(availabilityChanged)
 		subs = append(subs, sub)
 	}
 	return func() {
@@ -722,11 +763,17 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 	// profile) must not veto, and a live window must
 	trying := 0
 	failed := 0
+	for _, monitor := range self.availabilityMonitors {
+		windowExpandEvent := monitor.WindowExpandEvent()
+		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
+		netWindowExpandEvent.UdpAvailable = netWindowExpandEvent.UdpAvailable || windowExpandEvent.UdpAvailable
+	}
 	for _, monitor := range self.monitors {
 		windowExpandEvent := monitor.WindowExpandEvent()
 		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
 		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
 		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
+		netWindowExpandEvent.UdpAvailable = netWindowExpandEvent.UdpAvailable || windowExpandEvent.UdpAvailable
 		if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
 			netWindowExpandEvent.Reason = windowExpandEvent.Reason
 		}
@@ -765,11 +812,12 @@ func (self *MergedMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
 }
 
 // SetProviderIpFamily rewrites the address-family category of a provider's
-// current event in place (IPV6.md B5, the local v6 downgrade) and dispatches
-// the change. The event's state and EventTime are untouched: the provider is
-// still Added and its connected-since time must not restart because its
-// category was corrected. Returns whether anything changed; unknown client
-// ids and unchanged categories are no-ops.
+// current event in place and dispatches the change. The event's state and
+// EventTime are untouched: the provider is still Added and its connected-since
+// time must not restart because its category was corrected. Returns whether
+// anything changed; unknown client ids and unchanged categories are no-ops.
+// The multi client no longer calls it: IPV6.md B5's local downgrade, its one
+// caller, is retired (server FP2-PROTOCOL.md D11.8).
 func (self *RemoteUserNatMultiClientMonitor) SetProviderIpFamily(clientId Id, ipFamily IpFamily) bool {
 	var windowExpandEvent WindowExpandEvent
 	clientIdProviderEvents := map[Id]*ProviderEvent{}

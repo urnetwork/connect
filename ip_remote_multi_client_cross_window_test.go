@@ -240,7 +240,7 @@ func newPrivateCrossWindowHarnessWithOptions(t *testing.T, specs []privateCrossW
 		deadline := time.After(time.Minute)
 		for {
 			var changed <-chan struct{}
-			clients := window.orderedClients(true, 0, &changed)
+			clients := window.orderedClients(true, flowNeed{}, &changed)
 			if len(clients) == expectedCounts[windowType] {
 				break
 			}

@@ -251,7 +251,8 @@ func TestProberPlanNextDue(t *testing.T) {
 	}
 }
 
-// Both windows the parent builds wake its prober when they admit an exit.
+// Every window the parent builds wakes its prober when it admits an exit:
+// quality, speed and the limited window (server FP2-PROTOCOL.md §7.4).
 func TestWindowsWakeTheProberOnAdmission(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
@@ -268,8 +269,8 @@ func TestWindowsWakeTheProberOnAdmission(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find NewRemoteUserNatMultiClient")
 	}
-	if n := strings.Count(constructor, "multiClient.clientAdded,"); n != 2 {
-		t.Errorf("the parent hands its admission callback to %d windows, want both", n)
+	if n := strings.Count(constructor, "multiClient.clientAdded,"); n != 3 {
+		t.Errorf("the parent hands its admission callback to %d windows, want all three", n)
 	}
 }
 

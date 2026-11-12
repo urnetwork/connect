@@ -214,7 +214,7 @@ func (self *RemoteUserNatMultiClient) MemoryOwnerCensus() MultiClientOwnerCensus
 	}
 	var clients [64]*Client
 	count := 0
-	for _, kind := range [...]WindowType{WindowTypeQuality, WindowTypeSpeed} {
+	for _, kind := range [...]WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 		window := self.windows[kind]
 		if window == nil {
 			continue

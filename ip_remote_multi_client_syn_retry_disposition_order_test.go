@@ -60,6 +60,9 @@ func nativeSynDispositionFundingFor(settings *MultiClientSettings) nativeSynDisp
 	for kind := range settings.WindowSizes {
 		geometryParent.windows[kind] = nil
 	}
+	// the constructor builds the limited window beside them for the
+	// harness's discovery generator (server FP2-PROTOCOL.md §7.4)
+	geometryParent.windows[WindowTypeLimited] = nil
 	geometryUpdate := &multiClientChannelUpdate{}
 	readyCapacity := synRetryReadyCapacity(geometryParent, geometryUpdate)
 	remoteCapacity := synRetryRemoteTailCapacity(geometryParent, geometryUpdate)

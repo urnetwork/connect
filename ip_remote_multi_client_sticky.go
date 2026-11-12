@@ -147,11 +147,12 @@ func (self *multiClientWindow) enumerateStickyRedial(
 	if !capable {
 		return
 	}
-	destinations, err := windowGeneratorCall(
+	answer, err := windowGeneratorCall(
 		self.ctx,
 		self.settings.WindowGeneratorTimeout,
-		func() (map[MultiHopId]DestinationStats, error) {
-			return clientIdGenerator.NextDestinationsForClientId(
+		func() (capabilityDiscovery, error) {
+			return self.lookupClientId(
+				clientIdGenerator,
 				destination.Tail(),
 				excludeDestinations,
 				rankMode,
@@ -163,7 +164,7 @@ func (self *multiClientWindow) enumerateStickyRedial(
 		self.stickyRedial.Remember(destination, stats)
 		return enumeratedDestination{}, false, err
 	}
-	for candidate := range destinations {
+	for candidate, candidateStats := range answer.destinations {
 		if candidate.Tail() == destination.Tail() {
 			loggerOrDefault(self.log).Infof("%s\n", relEvent(
 				"sticky_redial",
@@ -172,7 +173,7 @@ func (self *multiClientWindow) enumerateStickyRedial(
 			))
 			return enumeratedDestination{
 				destination:  destination,
-				stats:        stats,
+				stats:        relabelledStats(stats, candidateStats, answer.selectorMode),
 				stickyRedial: true,
 			}, true, nil
 		}

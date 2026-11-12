@@ -6,8 +6,10 @@
 // a window builds only to discard is the cost these counters size. They count
 // every candidate an expansion builds by its outcome, every resize pass that
 // wants to grow by the window state it found, every warning by cause, every
-// removal by cause, and the windows by the state their last resize pass ended
-// in.
+// removal by cause, the windows by the state their last resize pass ended in,
+// and, for the two capability axes (server FP2-PROTOCOL.md §8.2), the window
+// clients by label, the flows by the window of their first exit, and the
+// flows no window held an exit labelled to carry.
 //
 // Labels are fixed vocabularies, never identities. One instance is shared by
 // every window of the process; a nil instance counts nothing, so a device
@@ -26,6 +28,8 @@ type windowStatsWindow int
 const (
 	windowStatsWindowQuality windowStatsWindow = iota
 	windowStatsWindowSpeed
+	// the limited window (server FP2-PROTOCOL.md §7.4)
+	windowStatsWindowLimited
 	// any other window type
 	windowStatsWindowAuto
 	windowStatsWindowCount
@@ -37,6 +41,8 @@ func (self windowStatsWindow) String() string {
 		return "quality"
 	case windowStatsWindowSpeed:
 		return "speed"
+	case windowStatsWindowLimited:
+		return "limited"
 	default:
 		return "auto"
 	}
@@ -48,9 +54,132 @@ func windowStatsWindowOf(windowType WindowType) windowStatsWindow {
 		return windowStatsWindowQuality
 	case WindowTypeSpeed:
 		return windowStatsWindowSpeed
+	case WindowTypeLimited:
+		return windowStatsWindowLimited
 	default:
 		return windowStatsWindowAuto
 	}
+}
+
+// A window client's ip label, as the counters index it.
+type windowStatsIp int
+
+const (
+	windowStatsIpDualstack windowStatsIp = iota
+	windowStatsIpIpv4
+	windowStatsIpCount
+)
+
+func (self windowStatsIp) String() string {
+	switch self {
+	case windowStatsIpDualstack:
+		return string(ProviderIpCapabilityDualstack)
+	default:
+		return string(ProviderIpCapabilityIpv4)
+	}
+}
+
+// A window client's protocol label, as the counters index it.
+type windowStatsProtocol int
+
+const (
+	windowStatsProtocolDualproto windowStatsProtocol = iota
+	windowStatsProtocolTcp
+	windowStatsProtocolCount
+)
+
+func (self windowStatsProtocol) String() string {
+	switch self {
+	case windowStatsProtocolDualproto:
+		return string(ProviderProtocolCapabilityDualproto)
+	default:
+		return string(ProviderProtocolCapabilityTcp)
+	}
+}
+
+// The counters' index of one client's labels.
+func windowStatsLabelsOf(capabilities ProviderCapabilities) (windowStatsIp, windowStatsProtocol) {
+	capabilities = capabilities.Normalize()
+	ip := windowStatsIpIpv4
+	if capabilities.Ip == ProviderIpCapabilityDualstack {
+		ip = windowStatsIpDualstack
+	}
+	protocol := windowStatsProtocolTcp
+	if capabilities.Protocol == ProviderProtocolCapabilityDualproto {
+		protocol = windowStatsProtocolDualproto
+	}
+	return ip, protocol
+}
+
+// A window's clients by label, as one resize pass counted them.
+type windowClientLabelCounts [windowStatsIpCount][windowStatsProtocolCount]int64
+
+// A flow's ip version, as the counters index it.
+type windowStatsIpVersion int
+
+const (
+	windowStatsIpVersion4 windowStatsIpVersion = iota
+	windowStatsIpVersion6
+	windowStatsIpVersionCount
+)
+
+func (self windowStatsIpVersion) String() string {
+	switch self {
+	case windowStatsIpVersion6:
+		return "6"
+	default:
+		return "4"
+	}
+}
+
+// A flow's protocol, as the counters index it.
+type windowStatsFlowProtocol int
+
+const (
+	windowStatsFlowProtocolTcp windowStatsFlowProtocol = iota
+	windowStatsFlowProtocolUdp
+	windowStatsFlowProtocolIcmp
+	windowStatsFlowProtocolCount
+)
+
+func (self windowStatsFlowProtocol) String() string {
+	switch self {
+	case windowStatsFlowProtocolUdp:
+		return "udp"
+	case windowStatsFlowProtocolIcmp:
+		return "icmp"
+	default:
+		return "tcp"
+	}
+}
+
+// The counters' index of a flow's ip version and protocol; false for a path
+// they do not count.
+func windowStatsFlowOf(ipPath *IpPath) (windowStatsIpVersion, windowStatsFlowProtocol, bool) {
+	if ipPath == nil {
+		return 0, 0, false
+	}
+	var ipVersion windowStatsIpVersion
+	switch ipPath.Version {
+	case 4:
+		ipVersion = windowStatsIpVersion4
+	case 6:
+		ipVersion = windowStatsIpVersion6
+	default:
+		return 0, 0, false
+	}
+	var protocol windowStatsFlowProtocol
+	switch ipPath.Protocol {
+	case IpProtocolTcp:
+		protocol = windowStatsFlowProtocolTcp
+	case IpProtocolUdp:
+		protocol = windowStatsFlowProtocolUdp
+	case IpProtocolIcmp:
+		protocol = windowStatsFlowProtocolIcmp
+	default:
+		return 0, 0, false
+	}
+	return ipVersion, protocol, true
 }
 
 // The state a resize pass that wants to grow found its window in. The states
@@ -336,6 +465,14 @@ type WindowClientStats struct {
 	windows      [windowStatsWindowCount][windowStateCount]atomic.Int64
 	// balance probes held windows sent, by what each learned
 	balanceProbes [windowStatsWindowCount][balanceProbeOutcomeCount]atomic.Uint64
+	// the live windows' clients by their labels, as each window's last
+	// resize pass counted them (server FP2-PROTOCOL.md §8.2)
+	clients [windowStatsWindowCount][windowStatsIpCount][windowStatsProtocolCount]atomic.Int64
+	// flows by the window of their first exit, their ip version and protocol
+	flows [windowStatsWindowCount][windowStatsIpVersionCount][windowStatsFlowProtocolCount]atomic.Uint64
+	// flows answered with an unreachable because no window held an exit
+	// labelled to carry them
+	noCompatible [windowStatsIpVersionCount][windowStatsFlowProtocolCount]atomic.Uint64
 }
 
 // A process-wide instance to share by every window of the process.
@@ -402,6 +539,90 @@ func (self *WindowClientStats) moveWindowState(windowType WindowType, from windo
 	}
 	if windowStateNone < to && to < windowStateCount {
 		self.windows[window][to].Add(1)
+	}
+}
+
+// Replaces one window's published clients by label: from what its last pass
+// published to what this pass counted. A window ends by moving to the zero
+// counts. Nil-safe.
+func (self *WindowClientStats) moveClientLabels(windowType WindowType, from windowClientLabelCounts, to windowClientLabelCounts) {
+	if self == nil || from == to {
+		return
+	}
+	window := windowStatsWindowOf(windowType)
+	for ip := range windowStatsIpCount {
+		for protocol := range windowStatsProtocolCount {
+			if delta := to[ip][protocol] - from[ip][protocol]; delta != 0 {
+				self.clients[window][ip][protocol].Add(delta)
+			}
+		}
+	}
+}
+
+// One flow bound to its first exit, of the window. Nil-safe.
+func (self *WindowClientStats) addFlow(windowType WindowType, ipPath *IpPath) {
+	if self == nil {
+		return
+	}
+	if ipVersion, protocol, ok := windowStatsFlowOf(ipPath); ok {
+		self.flows[windowStatsWindowOf(windowType)][ipVersion][protocol].Add(1)
+	}
+}
+
+// One flow answered with an unreachable because no window held an exit
+// labelled to carry it. Nil-safe.
+func (self *WindowClientStats) addNoCompatible(ipPath *IpPath) {
+	if self == nil {
+		return
+	}
+	if ipVersion, protocol, ok := windowStatsFlowOf(ipPath); ok {
+		self.noCompatible[ipVersion][protocol].Add(1)
+	}
+}
+
+// Calls visit for every client label gauge, in a fixed order, with its
+// window, ip and protocol label values and the live clients counted there
+// (urnetwork_proxy_window_clients).
+func (self *WindowClientStats) VisitWindowClients(visit func(window string, ip string, protocol string, count int64)) {
+	if self == nil {
+		return
+	}
+	for window := range windowStatsWindowCount {
+		for ip := range windowStatsIpCount {
+			for protocol := range windowStatsProtocolCount {
+				visit(window.String(), ip.String(), protocol.String(), self.clients[window][ip][protocol].Load())
+			}
+		}
+	}
+}
+
+// Calls visit for every flow counter, in a fixed order, with the window of
+// the flows' first exit and their ip version ("4", "6") and protocol ("tcp",
+// "udp", "icmp") label values (urnetwork_proxy_window_flows_total).
+func (self *WindowClientStats) VisitWindowFlows(visit func(window string, ipVersion string, protocol string, count uint64)) {
+	if self == nil {
+		return
+	}
+	for window := range windowStatsWindowCount {
+		for ipVersion := range windowStatsIpVersionCount {
+			for protocol := range windowStatsFlowProtocolCount {
+				visit(window.String(), ipVersion.String(), protocol.String(), self.flows[window][ipVersion][protocol].Load())
+			}
+		}
+	}
+}
+
+// Calls visit for every no-compatible-exit counter, in a fixed order, with its
+// ip version and protocol label values
+// (urnetwork_proxy_window_no_compatible_total).
+func (self *WindowClientStats) VisitNoCompatible(visit func(ipVersion string, protocol string, count uint64)) {
+	if self == nil {
+		return
+	}
+	for ipVersion := range windowStatsIpVersionCount {
+		for protocol := range windowStatsFlowProtocolCount {
+			visit(ipVersion.String(), protocol.String(), self.noCompatible[ipVersion][protocol].Load())
+		}
 	}
 }
 
@@ -600,6 +821,20 @@ func (self *windowWarningTransitions) observe(
 		clientCauses[client] = cause
 	}
 	self.clientCauses = clientCauses
+}
+
+// This window's installed clients that are not done, by label, at this
+// moment.
+func (self *multiClientWindow) clientLabelCounts() windowClientLabelCounts {
+	var counts windowClientLabelCounts
+	for _, client := range self.unorderedClients() {
+		if client.IsDone() {
+			continue
+		}
+		ip, protocol := windowStatsLabelsOf(client.capabilities())
+		counts[ip][protocol] += 1
+	}
+	return counts
 }
 
 // The selectable (live, unwarned, and counted as the monitor's readiness

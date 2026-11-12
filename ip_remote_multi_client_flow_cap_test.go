@@ -317,8 +317,20 @@ func TestSendPathPlacesFlowsThroughRaceCandidates(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find the packet-group attempt through both owning entry points")
 	}
-	if !strings.Contains(body, "self.raceCandidates(window, ipPath.Version, offerChanged)") {
-		t.Error("sendParsedPacketGroupAttempt does not assemble its field through raceCandidates: the cap and the rank gate are disconnected again")
+	if !strings.Contains(body, "self.raceField(window, need, offerChanged, &limitedOfferChanged)") {
+		t.Error("sendParsedPacketGroupAttempt does not assemble its field through raceField: the cap and the rank gate are disconnected again")
+	}
+	limitedSource, err := readSource("ip_remote_multi_client_limited.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok = functionBody(limitedSource, "func (self *RemoteUserNatMultiClient) raceField(")
+	if !ok {
+		t.Fatal("could not find raceField")
+	}
+	if !strings.Contains(body, "self.raceCandidates(window, need, offerChanged)") ||
+		!strings.Contains(body, "self.raceCandidates(limitedWindow, need, limitedOfferChanged)") {
+		t.Error("raceField does not assemble each window's field through raceCandidates")
 	}
 
 	body, ok = functionBody(source, "func (self *RemoteUserNatMultiClient) raceCandidates(")

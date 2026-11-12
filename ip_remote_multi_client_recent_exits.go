@@ -490,6 +490,9 @@ type recentExitAnswer struct {
 	found bool
 	// the platform could not be asked
 	err error
+	// the stats to dial it with: as it was discovered, relabelled by a
+	// selector-mode answer (relabelledStats)
+	stats DestinationStats
 }
 
 // Starts one by-id lookup per entry, all at once, each under the generator
@@ -510,11 +513,12 @@ func (self *multiClientWindow) lookupRecentExits(
 		lookups.Add(1)
 		go HandleError(func() {
 			defer lookups.Done()
-			destinations, err := windowGeneratorCall(
+			answer, err := windowGeneratorCall(
 				self.ctx,
 				self.settings.WindowGeneratorTimeout,
-				func() (map[MultiHopId]DestinationStats, error) {
-					return clientIdGenerator.NextDestinationsForClientId(
+				func() (capabilityDiscovery, error) {
+					return self.lookupClientId(
+						clientIdGenerator,
 						exit.destination.Tail(),
 						excludeDestinations,
 						rankMode,
@@ -523,14 +527,19 @@ func (self *multiClientWindow) lookupRecentExits(
 				nil,
 			)
 			found := false
-			for candidate := range destinations {
+			stats := exit.stats
+			for candidate, candidateStats := range answer.destinations {
 				if candidate.Tail() == exit.destination.Tail() {
-					found = true
+					stats = relabelledStats(exit.stats, candidateStats, answer.selectorMode)
+					// a provider relabelled dualproto is no longer the limited
+					// window's to hold
+					found = self.admitsCapabilities(stats.Capabilities)
 					break
 				}
 			}
 			answers[i].found = err == nil && found
 			answers[i].err = err
+			answers[i].stats = stats
 		})
 	}
 	return func() []recentExitAnswer {
@@ -541,9 +550,9 @@ func (self *multiClientWindow) lookupRecentExits(
 
 // Turns the lookups' answers into the round's leading candidates: a provider
 // the platform still offers is tried as the destination the window held, with
-// the stats it was discovered with; one it no longer offers is dropped; one it
-// could not be asked about is put back for the next round. Nothing is offered
-// after a forget since the take.
+// the stats it was discovered with and the labels of a selector-mode answer;
+// one it no longer offers is dropped; one it could not be asked about is put
+// back for the next round. Nothing is offered after a forget since the take.
 func (self *multiClientWindow) resolveRecentExits(answers []recentExitAnswer, generation uint64) []enumeratedDestination {
 	if !self.recentExits.Current(generation) {
 		return nil
@@ -567,7 +576,7 @@ func (self *multiClientWindow) resolveRecentExits(answers []recentExitAnswer, ge
 			))
 			recovered = append(recovered, enumeratedDestination{
 				destination: exit.destination,
-				stats:       exit.stats,
+				stats:       answer.stats,
 				recentExit:  true,
 			})
 		default:

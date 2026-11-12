@@ -491,8 +491,8 @@ func (self *cooloffFamilyContextTestGenerator) NextDestinationsWithIpFamilyConte
 func TestCooloffRoundAsksThePoolUnlessItAskedOnlyForIpv6(t *testing.T) {
 	familyAware := recentExitBareWindow(&cooloffFamilyContextTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
 	legacy := recentExitBareWindow(&recentExitTestGenerator{}, unfixedTestProfile(WindowTypeSpeed))
-	ipv4 := &discoveryDemandRead{ipVersion: 4}
-	ipv6 := &discoveryDemandRead{ipVersion: 6}
+	ipv4 := &discoveryDemandRead{need: flowNeed{ipVersion: 4}}
+	ipv6 := &discoveryDemandRead{need: flowNeed{ipVersion: 6}}
 
 	AssertEqual(t, familyAware.cooloffRoundAsksThePool(false, nil), true)
 	AssertEqual(t, familyAware.cooloffRoundAsksThePool(true, nil), false)
@@ -519,7 +519,7 @@ func TestCooloffRoundThatAsksOnlyForIpv6LeavesTheSkip(t *testing.T) {
 		demandRead *discoveryDemandRead
 	}{
 		{name: "probe", probeOnly: true},
-		{name: "ipv6 demand read", demandRead: &discoveryDemandRead{ipVersion: 6}},
+		{name: "ipv6 demand read", demandRead: &discoveryDemandRead{need: flowNeed{ipVersion: 6}}},
 	}
 	for _, c := range cases {
 		// a round that applied the exclusions came back empty

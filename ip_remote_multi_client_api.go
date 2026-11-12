@@ -398,6 +398,9 @@ type ApiMultiClientGenerator struct {
 	// The platform's override of the strict window handover, as the latest
 	// discovery answer carried it (StrictWindowHandoverOverride).
 	strictWindowHandoverOverride strictWindowHandoverOverride
+	// Whether the latest answer to a request carrying `select` echoed it
+	// (SelectorMode).
+	providerSelectorMode providerSelectorMode
 
 	api *BringYourApi
 
@@ -727,16 +730,36 @@ func (self *ApiMultiClientGenerator) NextDestinations(count int, excludeDestinat
 
 // NextDestinationsWithIpFamily implements MultiClientGeneratorWithIpFamily.
 func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
-	return self.nextDestinationsContext(self.ctx, count, excludeDestinations, rankMode, ipFamily)
+	destinations, _, err := self.nextDestinationsContext(self.ctx, count, excludeDestinations, rankMode, ipFamily, nil)
+	return destinations, err
 }
 
 // NextDestinationsWithIpFamilyContext is the cancellation-bounded form of
 // family discovery. It uses the same request, identity and exclusion owner.
 // Wrappers that constrain discovery must override this method as well as
 // NextDestinationsWithIpFamily, retaining their count, exclusion, rank and family
-// policy while forwarding the caller's context.
+// policy while forwarding the caller's context. The same holds for the
+// selector-mode methods of MultiClientGeneratorWithCapabilities.
 func (self *ApiMultiClientGenerator) NextDestinationsWithIpFamilyContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
-	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily)
+	destinations, _, err := self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily, nil)
+	return destinations, err
+}
+
+// Implements MultiClientGeneratorWithCapabilities: family discovery in
+// selector mode.
+func (self *ApiMultiClientGenerator) NextDestinationsWithCapabilities(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter, providerSelect FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
+	return self.nextDestinationsContext(self.ctx, count, excludeDestinations, rankMode, ipFamily, &providerSelect)
+}
+
+// Implements MultiClientGeneratorWithCapabilities: the cancellation-bounded
+// form, with the same request, identity and exclusion owner.
+func (self *ApiMultiClientGenerator) NextDestinationsWithCapabilitiesContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter, providerSelect FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
+	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, ipFamily, &providerSelect)
+}
+
+// Implements MultiClientGeneratorWithCapabilities.
+func (self *ApiMultiClientGenerator) SelectorMode() (selectorMode bool, known bool) {
+	return self.providerSelectorMode.get()
 }
 
 // Implements MultiClientGeneratorWithPostQuantumEncryption. While it is set,
@@ -798,13 +821,17 @@ func (self *ApiMultiClientGenerator) ExcludeClientId(clientId Id) {
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
 func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
-	return self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, IpFamilyFilterDefault)
+	destinations, _, err := self.nextDestinationsContext(ctx, count, excludeDestinations, rankMode, IpFamilyFilterDefault, nil)
+	return destinations, err
 }
 
-// nextDestinationsContext is the discovery body shared by the plain and the
-// family-filtered entry points. The filter rides straight into find-providers2;
-// the server treats the empty filter as v4-capable.
-func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
+// nextDestinationsContext is the discovery body shared by the plain, the
+// family-filtered and the selector-mode entry points. The filter rides
+// straight into find-providers2; the server treats the empty filter as
+// v4-capable. A non-nil providerSelect puts the request in selector mode, and
+// selectorMode reports whether the answer echoed it; fixed and restored
+// destinations make no request, so they report nothing about the server.
+func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter, providerSelect *FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
 	excludeClientIds := self.ExcludeClientIds()
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -858,7 +885,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		// fails), continue this SAME discovery attempt with fresh identities.
 		// Only cancellation of the authoritative generator call stops work.
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 		restoredDestinations = nil
 	}
@@ -872,6 +899,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		destinations[destination] = DestinationStats{}
 	}
 
+	selectorMode := false
 	if 0 < len(discoverySpecs) {
 		// the modern requirement narrows only this request: the fixed and
 		// restored destinations above are returned as they are
@@ -883,20 +911,22 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			RankMode:              rankMode,
 			IpFamily:              ipFamily,
 			RequireModernProvider: self.postQuantumEncryption.Load(),
+			Select:                cloneFindProvidersSelect(providerSelect),
 		}
 
 		result, err := self.findProviders2(ctx, findProviders2)
 		if err != nil {
 			// prefer returning any fixed destinations over failing the whole call
 			if 0 < len(destinations) {
-				return destinations, nil
+				return destinations, false, nil
 			}
-			return nil, err
+			return nil, false, err
 		}
-		addProviderDestinations(destinations, result.Providers)
+		selectorMode = self.observeSelectorMode(providerSelect, result)
+		addProviderDestinations(destinations, result.Providers, selectorMode)
 	}
 
-	return destinations, nil
+	return destinations, selectorMode, nil
 }
 
 // Implements MultiClientGeneratorWithClientId: one find-providers2 request that
@@ -906,10 +936,23 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 // empty too. An id this generator excludes is answered empty without a
 // request, as discovery would never return it either.
 func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
+	destinations, _, err := self.nextDestinationsForClientId(clientId, excludeDestinations, rankMode, nil)
+	return destinations, err
+}
+
+// Implements MultiClientGeneratorWithCapabilities: NextDestinationsForClientId
+// in selector mode, so the named provider is answered with its labels.
+func (self *ApiMultiClientGenerator) NextDestinationsForClientIdWithCapabilities(clientId Id, excludeDestinations []MultiHopId, rankMode string, providerSelect FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
+	return self.nextDestinationsForClientId(clientId, excludeDestinations, rankMode, &providerSelect)
+}
+
+// The by-id request body. A non-nil providerSelect puts it in selector mode;
+// an excluded id makes no request and reports nothing about the server.
+func (self *ApiMultiClientGenerator) nextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string, providerSelect *FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
 	destinations := map[MultiHopId]DestinationStats{}
 	excludeClientIds := self.ExcludeClientIds()
 	if slices.Contains(excludeClientIds, clientId) {
-		return destinations, nil
+		return destinations, false, nil
 	}
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
@@ -924,12 +967,68 @@ func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, ex
 		Count:                 1,
 		RankMode:              rankMode,
 		RequireModernProvider: self.postQuantumEncryption.Load(),
+		Select:                cloneFindProvidersSelect(providerSelect),
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	addProviderDestinations(destinations, result.Providers)
-	return destinations, nil
+	selectorMode := self.observeSelectorMode(providerSelect, result)
+	addProviderDestinations(destinations, result.Providers, selectorMode)
+	return destinations, selectorMode, nil
+}
+
+// Whether the answer to a request is in selector mode: the request carried
+// `select` and the answer echoed it. Every answer to a request that carried
+// it is recorded for SelectorMode.
+func (self *ApiMultiClientGenerator) observeSelectorMode(providerSelect *FindProvidersSelect, result *FindProviders2Result) bool {
+	if providerSelect == nil {
+		return false
+	}
+	selectorMode := result.Select != nil
+	self.providerSelectorMode.observe(selectorMode)
+	return selectorMode
+}
+
+// A request's own copy of the window's `select`, so the caller's value is
+// never shared with a request in flight. nil stays nil (legacy mode).
+func cloneFindProvidersSelect(providerSelect *FindProvidersSelect) *FindProvidersSelect {
+	if providerSelect == nil {
+		return nil
+	}
+	cloned := *providerSelect
+	return &cloned
+}
+
+// What the platform's answers to requests carrying `select` said: none yet,
+// echoed, or not echoed. Each answer replaces the last, so a server deployed
+// or rolled back mid-session is followed. Safe for concurrent use.
+type providerSelectorMode struct {
+	value atomic.Int32
+}
+
+const (
+	providerSelectorModeUnknown int32 = 0
+	providerSelectorModeEchoed  int32 = 1
+	providerSelectorModeLegacy  int32 = 2
+)
+
+func (self *providerSelectorMode) observe(selectorMode bool) {
+	if selectorMode {
+		self.value.Store(providerSelectorModeEchoed)
+	} else {
+		self.value.Store(providerSelectorModeLegacy)
+	}
+}
+
+func (self *providerSelectorMode) get() (selectorMode bool, known bool) {
+	switch self.value.Load() {
+	case providerSelectorModeEchoed:
+		return true, true
+	case providerSelectorModeLegacy:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // Sends one discovery request through the injected provider discovery when
@@ -996,8 +1095,15 @@ func (self *strictWindowHandoverOverride) get() (enabled bool, set bool) {
 	}
 }
 
-// Adds each discovered provider as a destination with its discovery stats.
-func addProviderDestinations(destinations map[MultiHopId]DestinationStats, providers []*FindProvidersProvider) {
+// Adds each discovered provider as a destination with its discovery stats and
+// labels (server FP2-PROTOCOL.md §7.1). In selector mode the labels are the
+// answer's, and the ip label is the category placement reads. Otherwise, and
+// for a provider an echoed answer left unlabelled, they come from the proven
+// category with dualproto (§5.4). A v6-only provider keeps its v6-only
+// category there: the two-axis model has no label for it, and reading it as
+// ipv4, the doc's label, would route v4 flows into an exit that cannot carry
+// them.
+func addProviderDestinations(destinations map[MultiHopId]DestinationStats, providers []*FindProvidersProvider, selectorMode bool) {
 	for _, provider := range providers {
 		ids := []Id{}
 		if 0 < len(provider.IntermediaryIds) {
@@ -1009,6 +1115,16 @@ func addProviderDestinations(destinations map[MultiHopId]DestinationStats, provi
 			ids = ids[len(ids)-maximumMultiHopIdLength:]
 		}
 		if destination, err := NewMultiHopId(ids...); err == nil {
+			ipFamily := provider.IpFamily.Normalize()
+			capabilities := providerCapabilitiesFromIpFamily(ipFamily)
+			overflowStep := 0
+			if selectorMode {
+				if provider.Capabilities != nil {
+					capabilities = provider.Capabilities.Normalize()
+					ipFamily = capabilities.IpFamily()
+				}
+				overflowStep = max(0, provider.OverflowStep)
+			}
 			destinations[destination] = DestinationStats{
 				EstimatedBytesPerSecond: provider.EstimatedBytesPerSecond,
 				Tier:                    provider.Tier,
@@ -1016,7 +1132,9 @@ func addProviderDestinations(destinations map[MultiHopId]DestinationStats, provi
 				ReputationFailures:      normalizeProviderReputationFailures(provider.ReputationFailedNames),
 				Location:                provider.Location,
 				LocationMatch:           LocationMatch(provider.Match).Normalize(),
-				IpFamily:                provider.IpFamily.Normalize(),
+				IpFamily:                ipFamily,
+				Capabilities:            capabilities,
+				OverflowStep:            overflowStep,
 			}
 		}
 	}

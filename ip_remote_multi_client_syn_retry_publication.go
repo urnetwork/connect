@@ -246,7 +246,7 @@ func (self *RemoteUserNatMultiClient) enqueuePublishedSynOwner(client *multiClie
 	owner := update.synRetry
 	if self.ctx.Err() != nil || client.IsDone() || owner != expected || owner == nil ||
 		self.affinityUpdateWithLock(update.ipPath) != update || self.affinityTransitions[update] != nil ||
-		!client.supportsIpVersion(update.ipPath.Version) || !owner.validWithLock(update) || update.client.Load() != nil ||
+		!client.supportsIpPath(update.ipPath) || !owner.validWithLock(update) || update.client.Load() != nil ||
 		!update.synRetryHasRemoteRefusalWithLock() || update.synRetryRemoteTailRefusedWithLock(client) ||
 		slices.Contains(update.dialFailedClients, client) {
 		return true

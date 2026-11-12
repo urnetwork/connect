@@ -1,16 +1,16 @@
 package connect
 
 // ip_remote_multi_client_family.go — the address-family half of the window
-// (IPV6.md B1–B6): each exit's effective category with the local v6
-// downgrade, the versioned dial-strike record the downgrade is judged on, the
-// soft v6-capable minimum's shortfall and starvation state, the family-aware
-// discovery order, the admission preference, the capacity swap, and the v6
-// no-route reply.
+// (IPV6.md B1–B4, B6) and the placement predicate both capability axes share
+// (server FP2-PROTOCOL.md §7): each exit's category and labels as the server
+// gave them, the soft v6-capable minimum's shortfall and starvation state, the
+// family-aware discovery order, the admission preference, the capacity swap,
+// and the v6 and udp no-route replies. IPV6.md B5, the local v6 downgrade, is
+// retired (FP2-PROTOCOL.md D11.8): no client-side state changes a label.
 //
-// Threading: an exit's category is read on the send hot path, so the two
-// per-exit flags are atomics. The window's shortfall state is guarded by the
-// window stateLock. The versioned strike record extends the channel's
-// stateLock-guarded strike slices entry for entry. Nothing here takes the
+// Threading: an exit's category is read on the send hot path from its
+// immutable channel args, and the swap mark is an atomic. The window's
+// shortfall state is guarded by the window stateLock. Nothing here takes the
 // parent stateLock except through the injected flow-count seam, which is
 // only reached from the resize pass with no lock held.
 
@@ -37,104 +37,75 @@ type enumeratedDestination struct {
 
 // --- exit category ---
 
-// IpFamily is this exit's effective category: the discovered category, or
-// v4-only once the local v6 downgrade fired (maybeDowngradeIpv6). A bare
+// IpFamily is this exit's category: the server's label for it, never a local
+// inference (server FP2-PROTOCOL.md D11.8 retired IPV6.md B5's local v6
+// downgrade). In selector mode it is the provider's ip label; from an older
+// server, its proven `ip_family` (see addProviderDestinations). It changes
+// only when a fresh find-providers2 answer relabels the destination. A bare
 // fixture without args reads as legacy, which carries v4 only.
 func (self *multiClientChannel) IpFamily() IpFamily {
-	if self.ipFamilyDowngraded.Load() {
-		return IpFamilyV4Only
-	}
 	if self.args == nil {
 		return IpFamilyLegacy
 	}
 	return self.args.DestinationStats.IpFamily.Normalize()
 }
 
-// supportsIpVersion is the placement predicate: whether this exit can carry
-// a flow of the packet's ip version. 0 means "any", for callers that gather
-// exits without a flow in hand. A fixed-destination exit carries every
-// version: it is the user's choice, with no alternative to prefer (see
-// multiClientChannelArgs.FixedDestination).
-func (self *multiClientChannel) supportsIpVersion(ipVersion int) bool {
-	if ipVersion == 0 {
-		return true
+// The exit's labels as placement reads them: the ip label from its category
+// (IpFamily) and the protocol label the server gave it. A bare fixture
+// without args reads as legacy: ipv4 and dualproto.
+func (self *multiClientChannel) capabilities() ProviderCapabilities {
+	capabilities := ProviderCapabilities{
+		Ip:       ProviderIpCapabilityIpv4,
+		Protocol: ProviderProtocolCapabilityDualproto,
 	}
+	if self.IpFamily() == IpFamilyDualstack {
+		capabilities.Ip = ProviderIpCapabilityDualstack
+	}
+	if self.args != nil {
+		capabilities.Protocol = self.args.DestinationStats.Capabilities.Normalize().Protocol
+	}
+	return capabilities
+}
+
+// 1 when the server gave this tcp exit to a dualproto request as overflow.
+func (self *multiClientChannel) overflowStep() int {
+	if self.args == nil {
+		return 0
+	}
+	return self.args.DestinationStats.OverflowStep
+}
+
+// The window that admitted this exit. WindowTypeAuto, which no window is, for
+// a channel built outside a window (bare fixtures).
+func (self *multiClientChannel) windowType() WindowType {
+	if self.args == nil {
+		return WindowTypeAuto
+	}
+	return self.args.windowType
+}
+
+// supportsFlow is the placement predicate (server FP2-PROTOCOL.md §7.2):
+// whether this exit's labels can carry a flow of the ip version and
+// protocol. ipv6 needs an ipv6-capable category, udp needs dualproto, and tcp
+// and icmp follow every label. A zero version or an unknown protocol needs
+// nothing, for callers that gather exits without a flow in hand. A
+// fixed-destination exit carries every flow: it is the user's choice, with no
+// alternative to prefer (see multiClientChannelArgs.FixedDestination).
+func (self *multiClientChannel) supportsFlow(ipVersion int, ipProtocol IpProtocol) bool {
 	if self.args != nil && self.args.FixedDestination {
 		return true
 	}
-	return self.IpFamily().SupportsIpVersion(ipVersion)
+	need := flowNeed{
+		ipVersion:  ipVersion,
+		ipProtocol: ipProtocol,
+	}
+	return need.carriedBy(self.IpFamily(), self.capabilities())
 }
 
-// maybeDowngradeIpv6 is B5: when this exit's v6 dials are starved while its
-// v4 stays healthy, its category drops to v4-only for the life of the
-// window. Returns true exactly once, on the transition, so the caller can
-// publish it. An exit whose category never carried v6 has nothing to lose.
-func (self *multiClientChannel) maybeDowngradeIpv6() bool {
-	// only a dualstack exit has a v4 side to fall back on: a v6-only exit
-	// whose v6 is starved is simply starved, and the ordinary warning is the
-	// right answer
-	if self.IpFamily() != IpFamilyDualstack {
-		return false
-	}
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	if !self.ipv6DialStarvedWithLock(time.Now()) {
-		return false
-	}
-	return self.ipFamilyDowngraded.CompareAndSwap(false, true)
-}
-
-// dialStrikeVersion is the recorded ip version of strike i. A legacy
-// fixture that injects dialFailureTimes alone has no versions; its strikes
-// read as v4, which keeps every pre-existing starvation test exact.
-func dialStrikeVersion(versions []int, i int) int {
-	if i < len(versions) && versions[i] == 6 {
-		return 6
-	}
-	return 4
-}
-
-// ipv6DialStarvedWithLock is dialStarvedWithLock restricted to v6, plus the
-// "v4 stays healthy" half of B5: v6 has at least dialStarvedFailureThreshold
-// strikes across dialStarvedMinDestinations distinct destinations and no
-// proven v6 connect, while v4 has fewer strikes than the threshold or a
-// proven connect. Without the v4 half a provider whose whole upstream is
-// failing would be misread as v4-only instead of starved, and the ordinary
-// starvation warning is the right answer there.
-//
-// must be called with stateLock
-func (self *multiClientChannel) ipv6DialStarvedWithLock(now time.Time) bool {
-	horizon := now.Add(-dialStrikeWindow)
-	self.pruneDialStrikesWithLock(horizon)
-	self.pruneConnectSuccessesWithLock(horizon)
-
-	v4Fails, v6Fails := 0, 0
-	v6Destinations := map[string]bool{}
-	for i := range self.dialFailureTimes {
-		if dialStrikeVersion(self.dialFailureVersions, i) == 6 {
-			v6Fails += 1
-			if i < len(self.dialFailureDestinations) {
-				v6Destinations[self.dialFailureDestinations[i]] = true
-			}
-		} else {
-			v4Fails += 1
-		}
-	}
-	if v6Fails < dialStarvedFailureThreshold || len(v6Destinations) < dialStarvedMinDestinations {
-		return false
-	}
-	v4Success, v6Success := 0, 0
-	for i := range self.connectSuccessTimes {
-		if dialStrikeVersion(self.connectSuccessVersions, i) == 6 {
-			v6Success += 1
-		} else {
-			v4Success += 1
-		}
-	}
-	if 0 < v6Success {
-		return false
-	}
-	return v4Fails < dialStarvedFailureThreshold || 0 < v4Success
+// supportsFlow for the flow on the path; a nil path needs nothing.
+func (self *multiClientChannel) supportsIpPath(ipPath *IpPath) bool {
+	need := flowNeedOf(ipPath)
+	return self.supportsFlow(need.ipVersion, need.ipProtocol)
 }
 
 // pruneConnectSuccessesWithLock prunes the proven-connect record to the
@@ -324,17 +295,30 @@ func (self *multiClientWindow) noteIpv6CandidateAdmitted() {
 }
 
 // ipv6Available reports whether this window holds an added, unwarned exit
-// that can carry v6 (B6). Read live from the client set rather than from the
-// last resize snapshot, so the flag follows an admission or a downgrade
-// without waiting for the next pass.
+// labelled to carry v6 (B6). Read live from the client set rather than from
+// the last resize snapshot, so the flag follows an admission without waiting
+// for the next pass.
 func (self *multiClientWindow) ipv6Available() bool {
+	return self.flowAvailable(flowNeed{ipVersion: 6})
+}
+
+// udpAvailable reports whether this window holds an added, unwarned exit
+// labelled dualproto (server FP2-PROTOCOL.md §7.7), read live like
+// ipv6Available.
+func (self *multiClientWindow) udpAvailable() bool {
+	return self.flowAvailable(flowNeed{ipProtocol: IpProtocolUdp})
+}
+
+// flowAvailable reports whether this window holds an added, unwarned exit
+// whose labels carry the flow.
+func (self *multiClientWindow) flowAvailable(need flowNeed) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	for _, client := range self.clients {
 		if client == nil || client.IsDone() || client.isWarning() {
 			continue
 		}
-		if client.supportsIpVersion(6) {
+		if client.supportsFlow(need.ipVersion, need.ipProtocol) {
 			return true
 		}
 	}
@@ -416,7 +400,8 @@ func (self *multiClientWindow) selectFamilySwapVictim(
 ) (victim *multiClientChannel, flowless bool) {
 	var loaded *multiClientChannel
 	for _, client := range clients {
-		if client.supportsIpVersion(6) {
+		// the ip label decides: an exit labelled dualstack holds the slot
+		if client.supportsFlow(6, IpProtocolUnknown) {
 			continue
 		}
 		if self.flowCount(client) == 0 {
@@ -445,7 +430,7 @@ func (self *multiClientWindow) selectFamilySwapVictim(
 // enumerateRecentExits). probeOnly is the resize pass's probe
 // (requestIpv6Probe): discovery's v6-capable request alone, with neither.
 func (self *multiClientWindow) enumerateDestinations(excludeDestinations []MultiHopId, probeOnly bool) ([]enumeratedDestination, error) {
-	rankMode := self.windowType.RankMode()
+	rankMode := self.requestRankMode()
 	discover := func(excludeDestinations []MultiHopId) ([]enumeratedDestination, error) {
 		return self.discoverDestinations(excludeDestinations, probeOnly, rankMode)
 	}
@@ -463,16 +448,25 @@ func (self *multiClientWindow) enumerateDestinations(excludeDestinations []Multi
 	return self.enumerateRecentExits(excludeDestinations, rankMode, discover)
 }
 
-// discoverDestinations is one discovery request set in push order. With a
-// family-aware generator it is: the v6-capable request first while a v6
-// shortfall is open and not starved (sized to the shortfall), then the main
-// v4-capable fill, which the platform draws dualstack-first. Duplicates across
-// the two are dropped. probeOnly asks the v6-capable request alone, and
-// nothing when no shortfall is open. A generator without the capability is
-// called exactly as before and its destinations read as legacy. Every call
+// discoverDestinations is one discovery request set in push order. A
+// capability-aware generator asks in selector mode (see
+// discoverDestinationsWithCapabilities). With a family-aware generator it is:
+// the v6-capable request first while a v6 shortfall is open and not starved
+// (sized to the shortfall), then the main v4-capable fill, which the platform
+// draws dualstack-first. Duplicates across the two are dropped. probeOnly asks
+// the v6-capable request alone, and nothing when no shortfall is open. A
+// generator without either capability is called exactly as before and its
+// destinations read as legacy. The limited window asks only a
+// capability-aware generator: no other has a tcp provider to give. Every call
 // carries the generator deadline, so a hung platform surfaces as an error on
 // the caller's ordinary retry cadence.
 func (self *multiClientWindow) discoverDestinations(excludeDestinations []MultiHopId, probeOnly bool, rankMode string) ([]enumeratedDestination, error) {
+	if capabilityGenerator, ok := self.generator.(MultiClientGeneratorWithCapabilities); ok {
+		return self.discoverDestinationsWithCapabilities(capabilityGenerator, excludeDestinations, probeOnly, rankMode)
+	}
+	if self.windowType == WindowTypeLimited {
+		return []enumeratedDestination{}, nil
+	}
 	call := func(f func() (map[MultiHopId]DestinationStats, error)) (map[MultiHopId]DestinationStats, error) {
 		return windowGeneratorCall(
 			self.ctx,
@@ -600,11 +594,37 @@ func collapseFamilyOrder(a *multiClientChannel, b *multiClientChannel) int {
 
 // --- parent ---
 
-// Ipv6Available reports whether any window holds an added, unwarned exit
-// that can carry v6 (B6). This is the raw flag the window status carries.
+// Ipv6Available reports whether any window, the limited one included, holds
+// an added, unwarned exit labelled to carry v6 (B6): a limited exit labelled
+// dualstack carries tcp over v6. This is the raw flag the window status
+// carries.
 func (self *RemoteUserNatMultiClient) Ipv6Available() bool {
 	for _, window := range self.windows {
 		if window.ipv6Available() {
+			return true
+		}
+	}
+	return false
+}
+
+// UdpAvailable reports whether any window holds an added, unwarned exit
+// labelled dualproto (server FP2-PROTOCOL.md §7.7). The limited window's exits
+// are tcp, so only the normal windows can make it true.
+func (self *RemoteUserNatMultiClient) UdpAvailable() bool {
+	for _, window := range self.windows {
+		if window.udpAvailable() {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether the normal windows have formed: one of them holds an added,
+// unwarned exit. The limited window never counts: until a normal window holds
+// an exit, its fill may still land one that carries any flow.
+func (self *RemoteUserNatMultiClient) windowsFormed() bool {
+	for windowType, window := range self.windows {
+		if windowType != WindowTypeLimited && window.hasAddedExit() {
 			return true
 		}
 	}
@@ -619,14 +639,30 @@ func (self *RemoteUserNatMultiClient) Ipv6Available() bool {
 // still forming, when the dualstack-first fill may land a v6-capable exit
 // at any moment.
 func (self *RemoteUserNatMultiClient) Ipv6Unroutable() bool {
-	formed := false
+	return self.windowsFormed() && !self.Ipv6Available()
+}
+
+// UdpUnroutable mirrors Ipv6Unroutable for udp (server FP2-PROTOCOL.md §7.7):
+// the windows have formed and no window holds an exit labelled dualproto.
+func (self *RemoteUserNatMultiClient) UdpUnroutable() bool {
+	return self.windowsFormed() && !self.UdpAvailable()
+}
+
+// flowUnroutable reports whether a flow can be answered as having no route:
+// the windows have formed and no window holds an added, unwarned exit whose
+// labels carry it. A udp flow over v6 needs an exit labelled dualstack and
+// dualproto at once, so it can be unroutable while UdpAvailable and
+// Ipv6Available are both true.
+func (self *RemoteUserNatMultiClient) flowUnroutable(need flowNeed) bool {
+	if !self.windowsFormed() {
+		return false
+	}
 	for _, window := range self.windows {
-		if window.hasAddedExit() {
-			formed = true
-			break
+		if window.flowAvailable(need) {
+			return false
 		}
 	}
-	return formed && !self.Ipv6Available()
+	return true
 }
 
 // replyIpv6NoRoute answers a v6 flow that has no v6-capable exit anywhere
@@ -643,7 +679,10 @@ func (self *RemoteUserNatMultiClient) replyIpv6NoRoute(ipPath *IpPath) bool {
 		return false
 	}
 	self.ipv6NoRouteCount.Add(1)
-	loggerOrDefault(self.log).V(1).Infof("[multi]ipv6 no route %s: no v6-capable exit\n", ipPath.DestinationHostPort())
+	self.windowClientStats().addNoCompatible(ipPath)
+	if log := loggerOrDefault(self.log); log.V(1).Enabled() {
+		log.Infof("[multi]ipv6 no route %s: no v6-capable exit\n", ipPath.DestinationHostPort())
+	}
 	self.deliverReceivePacket(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
 	return true
 }
@@ -654,49 +693,41 @@ func (self *RemoteUserNatMultiClient) Ipv6NoRouteCount() uint64 {
 	return self.ipv6NoRouteCount.Load()
 }
 
-// noteIpFamilyDowngrade publishes an exit's local v6 downgrade (B5): the
-// monitor event's category changes in place -- the exit stays Added, its
-// connected-since time untouched -- and the owning window's resize pass is
-// woken so the v6 shortfall the downgrade may have opened is filled now.
-func (self *RemoteUserNatMultiClient) noteIpFamilyDowngrade(client *multiClientChannel) {
-	loggerOrDefault(self.log).Infof("%s\n", relEvent(
-		"family_downgrade",
-		"exit", client.ClientId(),
-		"to", string(IpFamilyV4Only),
-		"dialfails", client.dialFailureCount(),
-	))
-	for _, window := range self.windows {
-		if window.noteClientIpFamily(client) {
-			return
-		}
-	}
-}
-
-// noteClientIpFamily republishes the client's category on this window's
-// monitor when the client is one of this window's exits, and wakes resize.
-// Returns whether the client belonged to this window.
-func (self *multiClientWindow) noteClientIpFamily(client *multiClientChannel) bool {
-	owned := false
-	func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		owned = self.clients[client.ClientId()] == client
-	}()
-	if !owned {
+// replyUdpNoRoute answers a udp flow that no window holds an exit labelled to
+// carry with an icmp port unreachable as if from the destination (server
+// FP2-PROTOCOL.md §7.7), so a quic stack falls back to tcp at once instead of
+// waiting out its handshake timeout. Delivered like replyIpv6NoRoute. Returns
+// whether a reply went out.
+func (self *RemoteUserNatMultiClient) replyUdpNoRoute(ipPath *IpPath) bool {
+	if ipPath == nil || ipPath.Protocol != IpProtocolUdp {
 		return false
 	}
-	self.monitor.SetProviderIpFamily(client.ClientId(), client.IpFamily())
-	self.resizeMonitor.NotifyAll()
+	packet, ok := ipOosUnreachable(ipPath)
+	if !ok {
+		return false
+	}
+	self.udpNoRouteCount.Add(1)
+	self.windowClientStats().addNoCompatible(ipPath)
+	if log := loggerOrDefault(self.log); log.V(1).Enabled() {
+		log.Infof("[multi]udp no route %s: no exit labelled dualproto\n", ipPath.DestinationHostPort())
+	}
+	self.deliverReceivePacket(TransferPath{}, protocol.ProvideMode_Network, ipPath, packet)
 	return true
 }
 
-// candidatesForIpVersion narrows a candidate list to exits that can carry
-// the version, preserving order. 0 returns the list unchanged.
-func candidatesForIpVersion(clients []*multiClientChannel, ipVersion int) []*multiClientChannel {
-	if ipVersion == 0 {
+// UdpNoRouteCount is how many udp flows were answered with port unreachable
+// because no window held an exit labelled to carry them, for diagnostics.
+func (self *RemoteUserNatMultiClient) UdpNoRouteCount() uint64 {
+	return self.udpNoRouteCount.Load()
+}
+
+// candidatesForFlow narrows a candidate list to exits whose labels carry the
+// flow, preserving order. The zero need returns the list unchanged.
+func candidatesForFlow(clients []*multiClientChannel, need flowNeed) []*multiClientChannel {
+	if need == (flowNeed{}) {
 		return clients
 	}
 	return slices.DeleteFunc(slices.Clone(clients), func(client *multiClientChannel) bool {
-		return !client.supportsIpVersion(ipVersion)
+		return !client.supportsFlow(need.ipVersion, need.ipProtocol)
 	})
 }
