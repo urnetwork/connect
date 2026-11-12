@@ -632,6 +632,15 @@ func controlFamilyAddrIP(addr net.Addr) net.IP {
 	return nil
 }
 
+// IsTunnelInterfaceName reports whether an interface of this name is a tunnel,
+// this product's own or another vpn's, rather than a path of the host's own
+// network: the interfaces the family probes leave out. The router port mapping
+// (connect/portmap) reads it to tell a default route through a tunnel from one
+// through the router.
+func IsTunnelInterfaceName(name string) bool {
+	return isControlFamilyTunnelInterface(name)
+}
+
 func isControlFamilyTunnelInterface(name string) bool {
 	for _, prefix := range controlFamilyTunnelInterfacePrefixes {
 		if strings.HasPrefix(name, prefix) {

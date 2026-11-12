@@ -361,6 +361,13 @@ type ExtenderActivatorSettings struct {
 	UdpPort int
 	DnsPort int
 	DnsTld  string
+	// OfferedPorts, when set, is read at each post and replaces TcpPort, UdpPort
+	// and DnsPort, each a zero of it leaving that one as it is: the ports a
+	// router's mapping forwards to this extender, which the router picks and may
+	// change while the role runs (S10, the port mapping, connect/portmap). DnsPorts
+	// answers the mapped dns ports beside it. It runs on the loop goroutine and
+	// must not block.
+	OfferedPorts func() (tcpPort int, udpPort int, dnsPort int)
 
 	// The carriers that are listening right now (G2). Only these are offered,
 	// so a carrier whose bind failed is never probed. Nil offers none, which
@@ -1436,6 +1443,26 @@ func extenderActivateWithoutWebRtc(carriers []string) []string {
 // know, by name, before it probes or spends anything.
 const extenderActivateUnknownWebRtcCarrierError = `unknown carrier "webrtc"`
 
+// The carrier ports a post offers: OfferedPorts' where it answers one, else the
+// configured port.
+func (self *ExtenderActivator) offeredPorts() (tcpPort int, udpPort int, dnsPort int) {
+	tcpPort, udpPort, dnsPort = self.settings.TcpPort, self.settings.UdpPort, self.settings.DnsPort
+	if self.settings.OfferedPorts == nil {
+		return
+	}
+	offeredTcpPort, offeredUdpPort, offeredDnsPort := self.settings.OfferedPorts()
+	if 0 < offeredTcpPort {
+		tcpPort = offeredTcpPort
+	}
+	if 0 < offeredUdpPort {
+		udpPort = offeredUdpPort
+	}
+	if 0 < offeredDnsPort {
+		dnsPort = offeredDnsPort
+	}
+	return
+}
+
 func (self *ExtenderActivator) dnsPorts() []int {
 	if self.settings.DnsPorts == nil {
 		return nil
@@ -1769,11 +1796,12 @@ func (self *ExtenderActivator) activateUrl(
 	now time.Time,
 ) extenderActivateAnswer {
 	runStartTime := self.settings.Run.StartTime.UTC()
+	tcpPort, udpPort, dnsPort := self.offeredPorts()
 	args := &ExtenderActivateArgs{
 		PublicKeyHex:        hex.EncodeToString(self.settings.PublicKey),
-		TcpPort:             self.settings.TcpPort,
-		UdpPort:             self.settings.UdpPort,
-		DnsPort:             self.settings.DnsPort,
+		TcpPort:             tcpPort,
+		UdpPort:             udpPort,
+		DnsPort:             dnsPort,
 		DnsPorts:            dnsPorts,
 		DnsTld:              self.settings.DnsTld,
 		Carriers:            carriers,

@@ -1757,3 +1757,42 @@ func TestExtenderActivatorSendsDnsPorts(t *testing.T) {
 		t.Fatalf("dns port = %d, expected %d", post.args.DnsPort, ExtenderDnsPort)
 	}
 }
+
+// A post offers the ports a router's mapping forwards to this extender, read
+// at each post: they replace the configured ports one by one, and a mapping the
+// router moved is offered by the next post (S10, the port mapping).
+func TestExtenderActivatorOffersTheMappedPorts(t *testing.T) {
+	var stateLock sync.Mutex
+	tcpPort, udpPort, dnsPort := 40443, 0, 44053
+	fixture := newTestActivatorFixture(t, func(settings *ExtenderActivatorSettings) {
+		settings.OfferedPorts = func() (int, int, int) {
+			stateLock.Lock()
+			defer stateLock.Unlock()
+			return tcpPort, udpPort, dnsPort
+		}
+	})
+
+	fixture.waitPass()
+	for range 2 {
+		post := fixture.waitPost()
+		// the unmapped udp carrier keeps its configured port
+		if post.args.TcpPort != 40443 || post.args.UdpPort != ExtenderQuicPort || post.args.DnsPort != 44053 {
+			t.Fatalf("v%d ports = %d/%d/%d, expected the mapped tcp and dns ports",
+				post.ipVersion, post.args.TcpPort, post.args.UdpPort, post.args.DnsPort)
+		}
+	}
+
+	func() {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		tcpPort, udpPort = 41443, 40444
+	}()
+	fixture.activator.Reactivate()
+	for range 2 {
+		post := fixture.waitPost()
+		if post.args.TcpPort != 41443 || post.args.UdpPort != 40444 || post.args.DnsPort != 44053 {
+			t.Fatalf("v%d ports after the move = %d/%d/%d, expected the moved mapping",
+				post.ipVersion, post.args.TcpPort, post.args.UdpPort, post.args.DnsPort)
+		}
+	}
+}
