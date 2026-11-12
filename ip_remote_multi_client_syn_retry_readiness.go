@@ -105,6 +105,11 @@ func (ready *tcpSynRetryReadiness) release() {
 // Selection publishes the actual attempt field without changing its race.
 func (group *parsedPacketGroup) noteSynRetryReadinessWidth(width int) {
 	if !group.isSynRetry() {
+		if request := group.synRetry; request != nil && request.openingSerial != 0 {
+			request.update.stateLock.Lock()
+			request.openingWidth = max(request.openingWidth, width)
+			request.update.stateLock.Unlock()
+		}
 		return
 	}
 	update := group.synRetry.update
@@ -215,13 +220,15 @@ func (self *RemoteUserNatMultiClient) armSynRetryReadiness(owner *tcpSynRetry) {
 	if hook := self.beforeSynRetryReadinessArmForTest; hook != nil {
 		hook(owner.update)
 	}
+	defer owner.update.releaseSynRetryMemory()
 	self.stateLock.Lock()
 	update := owner.update
 	update.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	defer update.stateLock.Unlock()
-	if self.ctx.Err() != nil || ready.closed.Load() || self.affinityUpdateWithLock(update.ipPath) != update || self.affinityTransitions[update] != nil || !owner.validWithLock(update) || owner.queued || owner.readinessOverflow || update.client.Load() != nil || ready.attemptEpoch != update.sequenceAdmissionEpoch {
+	if self.ctx.Err() != nil || ready.closed.Load() || self.affinityUpdateWithLock(update.ipPath) != update || self.affinityTransitions[update] != nil || !owner.validWithLock(update) || owner.queued || owner.readinessOverflow || !owner.synRetrySelectionCurrentWithLock(update) || ready.attemptEpoch != update.sequenceAdmissionEpoch {
 		ready.clearSlotsWithLock()
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 		return
 	}
 	order := uint64(0)
@@ -256,6 +263,8 @@ func (self *RemoteUserNatMultiClient) armSynRetryReadiness(owner *tcpSynRetry) {
 	if watched {
 		ready.references.Add(1)
 		self.appendSynRetryReadinessWithLock(ready)
+	} else {
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 	}
 }
 
@@ -330,7 +339,7 @@ func (ready *tcpSynRetryReadiness) detach() {
 func (self *RemoteUserNatMultiClient) synRetryReadinessCurrentWithLock(ready *tcpSynRetryReadiness) (*tcpSynRetry, bool) {
 	update := ready.update
 	owner := update.synRetry
-	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && update.client.Load() == nil && update.sequenceAdmissionEpoch == ready.epoch
+	valid := self.ctx.Err() == nil && !ready.closed.Load() && self.affinityUpdateWithLock(update.ipPath) == update && self.affinityTransitions[update] == nil && owner != nil && owner.readiness == ready && owner.serial == ready.serial && owner.sequence == ready.sequence && owner.validWithLock(update) && !owner.queued && owner.synRetrySelectionCurrentWithLock(update) && update.sequenceAdmissionEpoch == ready.epoch
 	if ready.raceOrder == 0 {
 		valid = valid && update.sequenceSourceOrder == ready.sourceOrder
 	}
@@ -358,13 +367,14 @@ func (self *RemoteUserNatMultiClient) drainSynRetryReadiness() {
 }
 
 func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetryReadiness) {
+	update := ready.update
+	defer update.releaseSynRetryMemory()
 	keep := false
 	defer func() {
 		if !keep {
 			ready.release()
 		}
 	}()
-	update := ready.update
 	self.stateLock.Lock()
 	update.stateLock.Lock()
 	owner, current := self.synRetryReadinessCurrentWithLock(ready)
@@ -397,6 +407,9 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	}
 	if grantedSource != nil || !valid || !waiting {
 		ready.clearSlotsWithLock()
+		if grantedSource == nil {
+			update.retireUnwatchedSynOpeningWithLock(owner, ready)
+		}
 	} else {
 		self.appendSynRetryReadinessWithLock(ready)
 		keep = true
@@ -418,6 +431,8 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	}
 	if valid && grantedSource.ctx.Err() == nil {
 		self.queueSynRetryWithLock(owner, ready.raceOrder)
+	} else {
+		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 	}
 	update.stateLock.Unlock()
 	self.stateLock.Unlock()

@@ -1,13 +1,16 @@
 // CloseSequences tests drive a provider-side client through its real receive
 // and send buffers. Receive contracts are signed with the client's own provider
 // key, the platform's CloseSequences arrives as a control-sourced Pack on its
-// own receive sequence as it does from the platform, and each close report is
-// read at the contract manager before its control send. Fake time advances only
-// when a test sleeps, so an idle timeout never stands in for a close.
+// own receive sequence as it does from the platform, and each close report and
+// no-record answer is read at the contract manager before its control send.
+// Fake time advances only when a test sleeps, so an idle timeout never stands
+// in for a close.
 package connect
 
 import (
 	"context"
+	"encoding/hex"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -38,6 +41,7 @@ type closeSequencesHarness struct {
 
 	stateLock  sync.Mutex
 	reports    []*protocol.CloseContract
+	noRecords  []*protocol.ContractsNoRecord
 	deliveries map[string]int
 }
 
@@ -59,6 +63,11 @@ func newCloseSequencesHarness(t *testing.T, configure ...func(*ClientSettings)) 
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.reports = append(self.reports, proto.Clone(report).(*protocol.CloseContract))
+	}
+	self.client.ContractManager().beforeContractsNoRecordSendForTest = func(noRecord *protocol.ContractsNoRecord) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.noRecords = append(self.noRecords, proto.Clone(noRecord).(*protocol.ContractsNoRecord))
 	}
 	self.client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{
 		protocol.ProvideMode_Network: true,
@@ -229,6 +238,19 @@ func (self *closeSequencesHarness) requireReports(contractId Id, expected ...clo
 	}
 }
 
+// The contract ids of every no-record answer, in order.
+func (self *closeSequencesHarness) noRecordContractIds() []Id {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	contractIds := []Id{}
+	for _, noRecord := range self.noRecords {
+		for _, contractIdBytes := range noRecord.ContractIds {
+			contractIds = append(contractIds, RequireIdFromBytes(contractIdBytes))
+		}
+	}
+	return contractIds
+}
+
 // The receive sequences from one source that the buffer still holds.
 func (self *closeSequencesHarness) receiveSequences(sourceId Id) []*ReceiveSequence {
 	receiveBuffer := self.client.receiveBuffer
@@ -341,45 +363,181 @@ func TestCloseSequencesClosesOpenReceiveContractAndContinues(t *testing.T) {
 	})
 }
 
-// Nothing holds the contract any more: its sequence idled out and checkpointed
-// it, or this client never held it. The client reports a final of (0, 0),
-// which the server turns into a final with the checkpoint's count.
-func TestCloseSequencesReportsZeroFinalForUnheldContract(t *testing.T) {
+// Idles a receive sequence out on one contract and waits for its checkpoint's
+// acknowledgement, so nothing holds the contract and its reports have retired.
+// Returns the contract and its checkpoint report.
+func (self *closeSequencesHarness) checkpointedContract() (Id, closeSequencesReport) {
+	self.t.Helper()
+	checkpointAcknowledged := make(chan struct{})
+	var checkpointOnce sync.Once
+	self.client.ContractManager().beforeWorkerDoneForTest = func(name string) {
+		if name == "contract close sync" {
+			checkpointOnce.Do(func() { close(checkpointAcknowledged) })
+		}
+	}
+	self.holdControlAcknowledgements()()
+	sender := self.newSender()
+	contractId, contractFrame := self.newReceiveContract(sender.sourceId)
+	byteCount := self.deliver(sender, contractFrame, closeSequencesMessageFrame("idle"))
+	synctest.Wait()
+	time.Sleep(self.idleTimeout() + time.Second)
+	synctest.Wait()
+	if count := len(self.receiveSequences(sender.sourceId)); count != 0 {
+		self.t.Fatalf("the fixture's receive sequence did not idle out: %d live", count)
+	}
+	checkpoint := closeSequencesReport{acked: uint64(byteCount), checkpoint: true}
+	self.requireReports(contractId, checkpoint)
+	// Frame construction precedes native delivery. Wait for its actual
+	// acknowledgement before exercising the already-delivered fallback.
+	<-checkpointAcknowledged
+	return contractId, checkpoint
+}
+
+// Nothing holds the contract any more: its sequence idled out and its
+// checkpoint was acknowledged. The client reports a final of (0, 0), which the
+// server turns into a final with the checkpoint's count.
+func TestCloseSequencesReportsZeroFinalForCheckpointedContract(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
 		harness := newCloseSequencesHarness(t, func(settings *ClientSettings) {
 			// Keep the constructor worker live until its completion hook is installed.
 			settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
 		})
-		checkpointAcknowledged := make(chan struct{})
-		var checkpointOnce sync.Once
-		harness.client.ContractManager().beforeWorkerDoneForTest = func(name string) {
-			if name == "contract close sync" {
-				checkpointOnce.Do(func() { close(checkpointAcknowledged) })
-			}
-		}
-		harness.holdControlAcknowledgements()()
-		sender := harness.newSender()
-		contractId, contractFrame := harness.newReceiveContract(sender.sourceId)
-		byteCount := harness.deliver(sender, contractFrame, closeSequencesMessageFrame("idle"))
-		synctest.Wait()
-		time.Sleep(harness.idleTimeout() + time.Second)
-		synctest.Wait()
-		if count := len(harness.receiveSequences(sender.sourceId)); count != 0 {
-			t.Fatalf("the fixture's receive sequence did not idle out: %d live", count)
-		}
-		checkpoint := closeSequencesReport{acked: uint64(byteCount), checkpoint: true}
-		harness.requireReports(contractId, checkpoint)
-		// Frame construction precedes native delivery. Wait for its actual
-		// acknowledgement before exercising the already-delivered fallback.
-		<-checkpointAcknowledged
+		contractId, checkpoint := harness.checkpointedContract()
 
-		unknownContractId := NewId()
-		harness.closeSequences([]Id{contractId, unknownContractId}, nil)
+		harness.closeSequences([]Id{contractId}, nil)
 		synctest.Wait()
 		harness.requireReports(contractId, checkpoint, closeSequencesReport{})
-		harness.requireReports(unknownContractId, closeSequencesReport{})
+		if contractIds := harness.noRecordContractIds(); len(contractIds) != 0 {
+			t.Fatalf("no record of %v, want none for a checkpointed contract", contractIds)
+		}
 	})
+}
+
+// The platform asks a provider to close a contract the provider has no record
+// of: it was lost with the process that held it, to a hard kill, an OOM or a
+// power loss before its first checkpoint, and this process never held it. The
+// answer is a ContractsNoRecord and never a final of (0, 0), which would
+// settle at half the sender's count or dispute it. A checkpointed contract in
+// the same request keeps its zero final.
+func TestCloseSequencesAnswersNoRecordForContractWithoutRecord(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		harness := newCloseSequencesHarness(t, func(settings *ClientSettings) {
+			// Keep the constructor worker live until its completion hook is installed.
+			settings.ContractManagerSettings.ProvidePingTimeout = time.Hour
+		})
+		checkpointedContractId, checkpoint := harness.checkpointedContract()
+		lostContractIds := []Id{NewId(), NewId()}
+
+		harness.closeSequences(append([]Id{lostContractIds[0], checkpointedContractId}, lostContractIds[1]), nil)
+		synctest.Wait()
+		for _, lostContractId := range lostContractIds {
+			harness.requireReports(lostContractId)
+		}
+		harness.requireReports(checkpointedContractId, checkpoint, closeSequencesReport{})
+		contractIds := harness.noRecordContractIds()
+		if len(contractIds) != 2 || contractIds[0] != lostContractIds[0] || contractIds[1] != lostContractIds[1] {
+			t.Fatalf("no record of %v, want %v", contractIds, lostContractIds)
+		}
+		harness.stateLock.Lock()
+		noRecordCount := len(harness.noRecords)
+		harness.stateLock.Unlock()
+		if noRecordCount != 1 {
+			t.Fatalf("%d no-record answers, want one for the request", noRecordCount)
+		}
+	})
+}
+
+// A checkpoint the manager no longer remembers, past its record timeout, has
+// no record: the answer is a ContractsNoRecord rather than a zero final. The
+// platform's expiry sweep finalizes the checkpoint on its count.
+func TestCloseSequencesAnswersNoRecordPastCheckpointRecordTimeout(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	synctest.Test(t, func(t *testing.T) {
+		harness := newCloseSequencesHarness(t, func(settings *ClientSettings) {
+			// Keep the constructor worker live until its completion hook is installed.
+			settings.ContractManagerSettings.ProvidePingTimeout = 2 * time.Hour
+			settings.ContractManagerSettings.CloseRequestCheckpointRecordTimeout = time.Hour
+		})
+		contractId, checkpoint := harness.checkpointedContract()
+		time.Sleep(time.Hour)
+
+		harness.closeSequences([]Id{contractId}, nil)
+		synctest.Wait()
+		harness.requireReports(contractId, checkpoint)
+		if contractIds := harness.noRecordContractIds(); len(contractIds) != 1 || contractIds[0] != contractId {
+			t.Fatalf("no record of %v, want [%s]", contractIds, contractId)
+		}
+	})
+}
+
+// The ring forgets the oldest record past its bound and renews a repeated one
+// in place.
+func TestContractCheckpointRecordsForgetOldestPastBound(t *testing.T) {
+	records := contractCheckpointRecords{}
+	start := time.Unix(1000, 0)
+	first, second, third := NewId(), NewId(), NewId()
+	records.addWithLock(first, start, 2)
+	records.addWithLock(second, start, 2)
+	records.addWithLock(first, start.Add(time.Minute), 2)
+	records.addWithLock(third, start.Add(time.Minute), 2)
+	now := start.Add(2 * time.Minute)
+	if records.hasWithLock(first, now, time.Hour) {
+		t.Fatal("the oldest record survived past the bound")
+	}
+	if !records.hasWithLock(second, now, time.Hour) || !records.hasWithLock(third, now, time.Hour) {
+		t.Fatal("a record within the bound was forgotten")
+	}
+	if records.hasWithLock(second, now, 2*time.Minute) {
+		t.Fatal("a record answered at its timeout")
+	}
+	if records.hasWithLock(third, now, 0) {
+		t.Fatal("a non-positive timeout answered a record")
+	}
+	empty := contractCheckpointRecords{}
+	empty.addWithLock(first, start, 0)
+	if empty.hasWithLock(first, start, time.Hour) {
+		t.Fatal("a non-positive bound remembered a record")
+	}
+}
+
+// The no-record answer has its own message type, so a platform that predates
+// it refuses the frame as unknown and applies nothing, and no decoder maps it
+// to a close report. The bytes are pinned: the platform reads them with its
+// own parser (server controller/connect_control_no_record.go).
+func TestContractsNoRecordWireFormat(t *testing.T) {
+	contractIds := []Id{
+		{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+		{0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, 0x00},
+	}
+	message := &protocol.ContractsNoRecord{}
+	for _, contractId := range contractIds {
+		message.ContractIds = append(message.ContractIds, contractId.Bytes())
+	}
+	frame, err := ToFrame(message, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer MessagePoolReturn(frame.MessageBytes)
+	if frame.MessageType != protocol.MessageType(38) || frame.MessageType == protocol.MessageType_TransferCloseContract {
+		t.Fatalf("message type = %d, want 38", frame.MessageType)
+	}
+	want := "0a100102030405060708090a0b0c0d0e0f10" + "0a10f1f2f3f4f5f6f7f8f9fafbfcfdfeff00"
+	if got := hex.EncodeToString(frame.MessageBytes); got != want {
+		t.Fatalf("message bytes = %s, want %s", got, want)
+	}
+	decoded, err := FromFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded.(*protocol.CloseContract); ok {
+		t.Fatal("the no-record answer decoded as a close report")
+	}
+	noRecord, ok := decoded.(*protocol.ContractsNoRecord)
+	if !ok || len(noRecord.ContractIds) != 2 || RequireIdFromBytes(noRecord.ContractIds[1]) != contractIds[1] {
+		t.Fatalf("decoded = %v", decoded)
+	}
 }
 
 // A client removed through the api has finished with every contract. Its
@@ -574,8 +732,9 @@ func TestCloseSequencesSourceCancelStillCheckpointsCurrentContract(t *testing.T)
 // The worker may wait on a removed peer's sequences; the control callback must
 // not. A request that arrives meanwhile is recorded up to the pending bound,
 // the rest is dropped, and the callbacks behind it keep delivering. Once the
-// wait ends the recorded ids close, and a dropped id is admitted when the
-// platform sends it again.
+// wait ends the recorded ids are answered, here with no record since this
+// client never held them, and a dropped id is admitted when the platform sends
+// it again.
 func TestCloseSequencesReceiveStaysLiveWhileWorkerWaits(t *testing.T) {
 	MessagePoolReturn(MessagePoolGet(1))
 	synctest.Test(t, func(t *testing.T) {
@@ -625,17 +784,26 @@ func TestCloseSequencesReceiveStaysLiveWhileWorkerWaits(t *testing.T) {
 		for _, contractId := range contractIds {
 			harness.requireReports(contractId)
 		}
+		if answered := harness.noRecordContractIds(); len(answered) != 0 {
+			t.Fatalf("no record of %v while the worker waits", answered)
+		}
 
 		release()
 		synctest.Wait()
 		harness.requireReports(peerContractId, closeSequencesReport{acked: uint64(peerByteCount)})
-		harness.requireReports(contractIds[0], closeSequencesReport{})
-		harness.requireReports(contractIds[1], closeSequencesReport{})
-		harness.requireReports(contractIds[2])
+		for _, contractId := range contractIds {
+			harness.requireReports(contractId)
+		}
+		if answered := harness.noRecordContractIds(); !slices.Equal(answered, contractIds[:2]) {
+			t.Fatalf("no record of %v, want %v", answered, contractIds[:2])
+		}
 
 		harness.closeSequences([]Id{contractIds[2]}, nil)
 		synctest.Wait()
-		harness.requireReports(contractIds[2], closeSequencesReport{})
+		harness.requireReports(contractIds[2])
+		if answered := harness.noRecordContractIds(); !slices.Equal(answered, contractIds) {
+			t.Fatalf("no record of %v, want %v", answered, contractIds)
+		}
 	})
 }
 
