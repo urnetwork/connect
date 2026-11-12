@@ -15358,6 +15358,35 @@ components:
             answer returns once. Refused with `source_client_id` or
             `client_id`.
           type: boolean
+        forward_only:
+          description: |
+            Optional, default false. The new client is a sidecar's forwarding
+            client, which its app's VPN component holds: a child of the
+            sidecar's own client (`source_client_id`), asked for with that
+            client's strict_exp token and its `DPoP` proof, and only while
+            that client is the sidecar's bound client of the newest
+            generation. Implies `strict_exp` and `admin_refused`, and needs
+            `client_public_key`. Its tokens, and those of its own children,
+            which inherit the mark, reach only `GET /auth/refresh`,
+            `POST /network/auth-client` and `POST /network/remove-client` for
+            its own children, `GET /network/config/projection`,
+            `GET /sidecar/identity` (both forms), `GET /sidecar/sync/poll`,
+            `GET /key/{id}` and `POST /connect/control`: every other route
+            answers 403 "A sidecar token cannot call this route.". Its token
+            exchange (`POST /oauth/token`) grants the network config repo's
+            read scope alone, while the sidecar's forwarding Delegation is
+            live. A repeat naming a key that an active forwarding child of the
+            same client already holds reissues that client. Assigned at
+            creation; a re-auth may repeat it but not add it.
+          type: boolean
+        client_public_key:
+          description: |
+            With `forward_only` on a new client only: the forwarding client's
+            Ed25519 public key, 32 bytes, base64. With no binding, the key its
+            own `DPoP` proofs are checked against. A re-auth may repeat it but
+            never name another; any other request naming it is refused.
+          type: string
+          format: byte
         provide_intent:
           description: |
             Optional, default false. The new client is a provider install: it
@@ -15675,6 +15704,9 @@ components:
           type: boolean
         acl_enforcing:
           description: The client is marked `acl_enforcing`, which the request asked for or a parent passed down.
+          type: boolean
+        forward_only:
+          description: The client is a sidecar's forwarding client (`forward_only`), which the request asked for or a parent passed down.
           type: boolean
         close:
           description: |
