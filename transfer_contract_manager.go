@@ -419,6 +419,18 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 			RetryMaxTimeout: 8 * time.Second,
 		},
 
+		// a contract lives at most an hour at the platform, so an older record
+		// answers a request for a contract the expiry sweep has already closed;
+		// one id and time an entry, about 64 KiB at the bound
+		CloseRequestCheckpointRecordCount:   1024,
+		CloseRequestCheckpointRecordTimeout: 60 * time.Minute,
+		// the platform's largest CloseSequences lists 1024 contracts
+		ContractsNoRecordMaxCount: 1024,
+		// a full control queue drains in well under a second; the answer
+		// changes nothing at the platform, so a longer wait only holds the
+		// close worker
+		ContractsNoRecordSendTimeout: 1 * time.Second,
+
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -577,6 +589,27 @@ type ContractManagerSettings struct {
 	// when every attempt fails.
 	CloseReportRetry OobRetrySettings
 
+	// How many contracts the manager remembers as checkpointed once every
+	// report of theirs succeeded and none was a final. The platform's close
+	// request (CloseSequences) for a remembered contract that nothing holds
+	// any more is answered with a final of (0, 0), which the platform turns
+	// into a final with the checkpoint's count. Past the bound the oldest is
+	// forgotten and answered as a contract with no record, which the platform
+	// leaves to its expiry sweep; the sweep finalizes the checkpoint with the
+	// same count. Non-positive remembers none.
+	CloseRequestCheckpointRecordCount int
+	// How long a remembered checkpoint answers a close request, from its
+	// report's success. Non-positive remembers none.
+	CloseRequestCheckpointRecordTimeout time.Duration
+	// The most contract ids in one ContractsNoRecord, the answer to a close
+	// request for contracts the client holds no record of. More ids go in
+	// further frames. Non-positive sends one id a frame.
+	ContractsNoRecordMaxCount int
+	// How long the close worker waits to enqueue one ContractsNoRecord on the
+	// control sequence. A refused answer is dropped: the platform treats a
+	// client that never answers the same way. Non-positive does not wait.
+	ContractsNoRecordSendTimeout time.Duration
+
 	ProtocolVersion int
 
 	// TODO remove
@@ -617,6 +650,9 @@ type ContractManager struct {
 	closeControlSyncs map[*ControlSync]bool
 	// Report ownership outlives sequence indexes until delivery is acknowledged.
 	pendingCloseReportKVs map[Id]*contractCloseReports
+	// Protected by mutex. Contracts whose reported checkpoints succeeded, for
+	// the platform's close requests after their reports retire.
+	checkpointRecords contractCheckpointRecords
 	// Protected by mutex. Consecutive contract requests refused as a rate
 	// limit. See CreateContractRateLimitBackoffMin.
 	createContractRateLimitCount int
@@ -727,6 +763,8 @@ type ContractManager struct {
 	beforeCloseControlSendForTest      func(*protocol.Frame)
 	// Nil test barrier at the atomic queue-to-open ownership handoff.
 	afterPollContractForTest func()
+	// Nil in production; exposes each no-record answer before its control send.
+	beforeContractsNoRecordSendForTest func(*protocol.ContractsNoRecord)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -889,6 +927,7 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 		// No admitted sequence can add reports after the client's joined exit.
 		self.mutex.Lock()
 		self.pendingCloseReportKVs = nil
+		self.checkpointRecords = contractCheckpointRecords{}
 		self.mutex.Unlock()
 	}
 	return result
