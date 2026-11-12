@@ -9568,12 +9568,15 @@ paths:
         entry per pool in ascending `no_id`, with what a claim needs: the
         latest finalized root's cumulative, its bottom-up proof, and vault2's
         `claimed`, read at the finalized block tag. The pools are the
-        operator's own two, its pool (`no_id` n) and its capture the flag
-        pool (`no_id` 2^32 + n, 4294967297 for operator 1), when the latest
-        finalized root or the pending root holds the coldkey, and any other
-        pool where this server has recorded an account for the coldkey.
-        Amounts are decimal strings of rao. A capture the flag account is
-        claimed from vault2 like any pool's.
+        operator's own, its pool (`no_id` n) and, while capture the flag is
+        on at this server, its capture the flag pool (`no_id` 2^32 + n,
+        4294967297 for operator 1), when the latest finalized root or the
+        pending root holds the coldkey, and any other pool where this server
+        has recorded an account for the coldkey. While capture the flag is
+        off, no capture the flag pool is read or answered, not even one with
+        a recorded account, so none can fail an answer. Amounts are decimal
+        strings of rao. A capture the flag account is claimed from vault2
+        like any pool's.
 
         Each entry names its pool's `kind` and a display `label`. Entries
         carry every field they carried before, so a client that predates
@@ -9585,21 +9588,29 @@ paths:
         root holds, like every coldkey while settlement v2 is not configured,
         has `"accounts": []`.
 
-        **Whole or partial**. Without `partial=true` the answer is whole or a
-        502, never partial, exactly as before, so a client that does not know
-        `unavailable_pools` can never mistake a partial list for a whole one;
-        its `unavailable_pools` is always `[]`. With `partial=true` a pool
-        whose ledger cannot be read (its objects cannot be read or do not
-        rebuild its committed root, vault2's `claimed` cannot be read or is
-        above the finalized cumulative, or a recorded account is not at its
-        index) is left out of `accounts` and named in `unavailable_pools`,
-        and the other pools are answered. A client shows such a pool as
-        unavailable, never as zero. Even then the answer is a 502 when the
-        server cannot tell which pools to answer, because its record of the
-        coldkey's accounts cannot be read. From the first capture the flag
-        root a fault in either pool's ledger answers a request without
-        `partial=true` with a 502, the operator's pool's balance included, so
-        a client that knows `unavailable_pools` sends `partial=true`.
+        **Whole or partial**. With `partial=true` a pool whose ledger cannot
+        be read (its objects cannot be read or do not rebuild its committed
+        root, its roots or accounts cannot be read from the server's
+        database, vault2's `claimed` cannot be read or is above the finalized
+        cumulative, or a recorded account is not at its index) is left out of
+        `accounts` and named in `unavailable_pools`, and the other pools are
+        answered. A client shows such a pool as unavailable, never as zero.
+        Even then the answer is a 502 when the server cannot tell which pools
+        to answer, because its record of the coldkey's accounts cannot be
+        read.
+
+        Without `partial=true`, as every client that predates
+        `unavailable_pools` asks, no pool is named unavailable: the list is
+        always `[]`. A capture the flag pool whose ledger cannot be read is
+        left out of `accounts`, and the other pools are answered exactly as
+        before the capture the flag pool existed: such a client keeps the
+        operator's pool's balance, and its capture the flag balance is missing
+        until that pool can be read again. A fault in any other pool's
+        ledger, the operator's pool's above all, still fails the whole answer
+        with a 502, as before, so such a client never takes a partial list of
+        those pools for a whole one. A client that knows `unavailable_pools`
+        sends `partial=true`, so that it shows a capture the flag pool it
+        cannot read as unavailable rather than leaving it out.
 
         Errors are RFC 9457 problem details. The answer carries
         `Cache-Control: no-store`.
@@ -9623,7 +9634,9 @@ paths:
           required: false
           description: |
             `true` to answer the pools that can be read and name the others in
-            `unavailable_pools`, instead of failing the whole answer with a 502.
+            `unavailable_pools`. Without it a capture the flag pool that cannot
+            be read is left out of `accounts`, unnamed, and any other pool that
+            cannot be read fails the whole answer with a 502.
           schema:
             type: boolean
             default: false
@@ -9649,13 +9662,17 @@ paths:
         "502":
           description: |
             The ledger is unavailable, so nothing is answered. Without
-            `partial=true`: any pool's ledger objects cannot be read or do not
-            rebuild its committed root, there is no chain client or vault2's
+            `partial=true`: the server's record of the coldkey's accounts
+            cannot be read, or the ledger of a pool other than a capture the
+            flag pool cannot be read: its objects cannot be read or do not
+            rebuild its committed root, its roots or accounts cannot be read
+            from the server's database, there is no chain client or vault2's
             `claimed` cannot be read, `claimed` is above the finalized
             cumulative, or an account the server recorded is not at its index
-            in the finalized root. With `partial=true`: the server's record of
-            the coldkey's accounts cannot be read, so it cannot tell which
-            pools to answer.
+            in the finalized root. A capture the flag pool that cannot be read
+            is left out of the answer instead. With `partial=true`: the
+            server's record of the coldkey's accounts cannot be read, so it
+            cannot tell which pools to answer.
           content:
             application/problem+json:
               schema:
@@ -9680,7 +9697,8 @@ paths:
         expires. A device can always claim for itself with its gas key.
 
         This answers for the caller's network: each account of its coldkeys in
-        the operator's pools, its pool and its capture the flag pool, one row
+        the operator's pools, its pool and, while capture the flag is on, its
+        capture the flag pool, one row
         per coldkey and pool with the pool's `kind` and `label`; what a claim
         would pay now, why it is still pending, and whether Claim now can be
         tapped. A coldkey the network has replaced stays listed while it has
@@ -9688,10 +9706,14 @@ paths:
         accounts is due, URnetwork claims the coldkey's other accounts above
         the transfer floor in the same batch, so those read as `queued`.
 
-        Without `partial=true` the accounts are whole, or `error` says the
-        balances could not be read. With `partial=true` an operator's pool
-        whose ledger cannot be read is named in `unavailable_pools` and the
-        others are answered: show that pool as unavailable, never as zero.
+        With `partial=true` an operator's pool whose ledger cannot be read is
+        named in `unavailable_pools` and the others are answered: show that
+        pool as unavailable, never as zero. Without `partial=true`, as every
+        app that predates `unavailable_pools` asks, no pool is named: a
+        capture the flag pool whose ledger cannot be read is left out, and the
+        operator's pool's accounts, and `state`, are answered exactly as
+        before the capture the flag pool existed, while any other pool that
+        cannot be read is an `error` for all of them.
 
         An account whose latest claim URnetwork sent names that claim's
         transaction, `claim_tx_hash`, and what it paid, `claim_amount_rao`. A
@@ -9705,6 +9727,9 @@ paths:
         other pool can be, its accounts are still claimed, and only the
         unreadable pool's rows read `relay_paused`; `send_failed`;
         `low_balance`; `gas_price_high`; `griefing_stop`, a claim's gas jumped.
+        Without `partial=true`, a pass that claimed the operator's pool while
+        only the capture the flag pool could not be read is `running`, as it
+        was before that pool existed.
 
         An `error` means the balances could not be read: they are unavailable,
         never zero, and `state` still says what the relay is doing.
@@ -9717,7 +9742,9 @@ paths:
           required: false
           description: |
             `true` to answer the pools that can be read and name the others in
-            `unavailable_pools`, instead of an `error` for all of them.
+            `unavailable_pools`. Without it a capture the flag pool that cannot
+            be read is left out, unnamed, and any other pool that cannot be
+            read is an `error` for all of them.
           schema:
             type: boolean
             default: false
@@ -9748,6 +9775,17 @@ paths:
         be claimed for now: the same values as an account's `claim_now_reason`. A
         coldkey that is not the network's, or has no account, reads as
         `nothing_pending`.
+
+        A tap names no partial answer, so every app's tap is answered as an
+        app that predates the capture the flag pool is: a coldkey whose only
+        account is in a capture the flag pool that cannot be read reads
+        `nothing_pending`, and a tap of a coldkey that also has an account in
+        the operator's pool is answered for that account and, when taken,
+        stays open until that capture the flag pool can be read, so that its
+        account there is claimed then too.
+        A tap that reads no account while a pool other than a capture the
+        flag pool cannot be read gets an `error`: the balances could not be
+        read.
       operationId: snClaimRelayClaimNow
       security:
         - BearerAuth: []
@@ -24301,7 +24339,8 @@ components:
           description: |
             With `partial=true`, the operator's pools whose ledger could not be
             read, in ascending `no_id`: their balances are unavailable, never
-            zero. Always `[]` without `partial=true`.
+            zero. Always `[]` without `partial=true`, which leaves a capture the
+            flag pool that cannot be read out of `accounts` instead.
           items:
             $ref: "#/components/schemas/SnLedgerUnavailablePool"
         error:
@@ -24409,7 +24448,8 @@ components:
           description: |
             With `partial=true`, the pools whose ledger could not be read, in
             ascending `no_id`: whether the coldkey has an account there is
-            unknown. Always `[]` without `partial=true`.
+            unknown. Always `[]` without `partial=true`, which leaves a capture
+            the flag pool that cannot be read out of `accounts` instead.
           type: array
           items:
             $ref: "#/components/schemas/SnLedgerUnavailablePool"
