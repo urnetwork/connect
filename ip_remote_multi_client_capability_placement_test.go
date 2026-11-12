@@ -296,10 +296,11 @@ func TestUnroutableVerdictsReadTheLabels(t *testing.T) {
 	}
 	udp4 := flowNeed{ipVersion: 4, ipProtocol: IpProtocolUdp}
 	udp6 := flowNeed{ipVersion: 6, ipProtocol: IpProtocolUdp}
+	selected := []WindowType{WindowTypeQuality, WindowTypeSpeed}
 
 	// only the limited window holds an exit: still forming
 	add(limited, WindowTypeLimited, capabilityClassC)
-	if parent.UdpUnroutable() || parent.flowUnroutable(udp4) || parent.Ipv6Unroutable() {
+	if parent.UdpUnroutable() || parent.flowUnroutable(udp4, selected) || parent.Ipv6Unroutable() {
 		t.Error("an exit in the limited window alone made the windows formed")
 	}
 	if !parent.Ipv6Available() || parent.UdpAvailable() {
@@ -308,25 +309,25 @@ func TestUnroutableVerdictsReadTheLabels(t *testing.T) {
 
 	// formed with a tcp exit: udp is unroutable, v6 tcp is not
 	add(quality, WindowTypeQuality, capabilityClassD)
-	if !parent.UdpUnroutable() || !parent.flowUnroutable(udp4) || !parent.flowUnroutable(udp6) {
+	if !parent.UdpUnroutable() || !parent.flowUnroutable(udp4, selected) || !parent.flowUnroutable(udp6, selected) {
 		t.Error("formed without a dualproto exit, udp is not unroutable")
 	}
-	if parent.flowUnroutable(flowNeed{ipVersion: 6, ipProtocol: IpProtocolTcp}) || parent.Ipv6Unroutable() {
+	if parent.flowUnroutable(flowNeed{ipVersion: 6, ipProtocol: IpProtocolTcp}, selected) || parent.Ipv6Unroutable() {
 		t.Error("v6 tcp is unroutable while the limited window holds a dualstack exit")
 	}
 
 	// a dualproto exit that cannot carry v6: v4 udp routes, v6 udp still not
 	ipv4Udp := add(quality, WindowTypeQuality, capabilityClassB)
-	if parent.UdpUnroutable() || parent.flowUnroutable(udp4) || !parent.flowUnroutable(udp6) {
+	if parent.UdpUnroutable() || parent.flowUnroutable(udp4, selected) || !parent.flowUnroutable(udp6, selected) {
 		t.Error("a class B exit: want v4 udp routable and v6 udp unroutable")
 	}
 	// a warned exit carries no new flow
 	ipv4Udp.setWarning(true, warnUnhealthy)
-	if !parent.flowUnroutable(udp4) {
+	if !parent.flowUnroutable(udp4, selected) {
 		t.Error("a warned dualproto exit kept udp routable")
 	}
 	add(quality, WindowTypeQuality, capabilityClassA)
-	if parent.flowUnroutable(udp6) || parent.flowUnroutable(udp4) {
+	if parent.flowUnroutable(udp6, selected) || parent.flowUnroutable(udp4, selected) {
 		t.Error("a class A exit left udp unroutable")
 	}
 }
@@ -481,7 +482,7 @@ func TestEveryPlacementSiteReadsTheFlowLabels(t *testing.T) {
 		"self.crossTierRaceField(window, need)",
 		"self.lastResortRaceField(window, need)",
 		"case <-limitedOfferChanged:",
-		"self.flowUnroutable(flowNeedOf(ipPath))",
+		"self.flowUnroutable(flowNeedOf(ipPath), self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId))",
 	} {
 		if !strings.Contains(body, contains) {
 			t.Errorf("the send path is missing %q", contains)
@@ -557,5 +558,38 @@ func TestDnsExitHintSkipsAnExitThatCannotCarryTheFlow(t *testing.T) {
 	parent.stateLock.Unlock()
 	if !bound || tlsUpdate.client.Load() != exit {
 		t.Error("a tcp flow did not inherit the exit its lookup went through")
+	}
+}
+
+// The udp verdict reads only the windows the flow may use: under a fixed
+// Speed profile a dualproto exit left in the inactive quality window carries
+// no new flow, so it does not keep udp routable, and the speed window's
+// formation alone counts.
+func TestUdpVerdictReadsOnlyTheFlowsWindows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultMultiClientSettings()
+	generator := newCapabilityTestGenerator(true, nil)
+	quality := capabilityTestWindow(ctx, generator, settings, WindowTypeQuality)
+	speed := capabilityTestWindow(ctx, generator, settings, WindowTypeSpeed)
+	parent := capabilityTestParent(ctx, cancel, generator, settings, map[WindowType]*multiClientWindow{
+		WindowTypeQuality: quality,
+		WindowTypeSpeed:   speed,
+	})
+	udp := flowNeed{ipVersion: 4, ipProtocol: IpProtocolUdp}
+	speedOnly := []WindowType{WindowTypeSpeed}
+
+	inactive := capabilityTestChannel(t, ctx, settings, WindowTypeQuality, capabilityClassA)
+	quality.clients[inactive.ClientId()] = inactive
+	if parent.flowUnroutable(udp, speedOnly) {
+		t.Error("an unformed speed window answered udp as unroutable")
+	}
+	tcpOnly := capabilityTestChannel(t, ctx, settings, WindowTypeSpeed, capabilityClassD)
+	speed.clients[tcpOnly.ClientId()] = tcpOnly
+	if !parent.flowUnroutable(udp, speedOnly) {
+		t.Error("the inactive window's dualproto exit kept udp routable under a fixed speed profile")
+	}
+	if parent.flowUnroutable(udp, []WindowType{WindowTypeQuality, WindowTypeSpeed}) {
+		t.Error("in auto, quality's dualproto exit did not keep udp routable")
 	}
 }

@@ -648,19 +648,31 @@ func (self *RemoteUserNatMultiClient) UdpUnroutable() bool {
 	return self.windowsFormed() && !self.UdpAvailable()
 }
 
-// flowUnroutable reports whether a flow can be answered as having no route:
-// the windows have formed and no window holds an added, unwarned exit whose
-// labels carry it. A udp flow over v6 needs an exit labelled dualstack and
-// dualproto at once, so it can be unroutable while UdpAvailable and
-// Ipv6Available are both true.
-func (self *RemoteUserNatMultiClient) flowUnroutable(need flowNeed) bool {
-	if !self.windowsFormed() {
+// flowUnroutable reports whether a flow can be answered as having no route,
+// judged on the windows the flow may use: its selected windows have formed
+// (one holds an added, unwarned exit), and neither they nor the limited
+// window hold one whose labels carry it. A profile's inactive window is never
+// selected, so its exits do not count. A udp flow over v6 needs an exit
+// labelled dualstack and dualproto at once, so it can be unroutable while
+// UdpAvailable and Ipv6Available are both true.
+func (self *RemoteUserNatMultiClient) flowUnroutable(need flowNeed, windowTypes []WindowType) bool {
+	formed := false
+	for _, windowType := range windowTypes {
+		if window := self.windows[windowType]; window != nil && windowType != WindowTypeLimited && window.hasAddedExit() {
+			formed = true
+			break
+		}
+	}
+	if !formed {
 		return false
 	}
-	for _, window := range self.windows {
-		if window.flowAvailable(need) {
+	for _, windowType := range windowTypes {
+		if window := self.windows[windowType]; window != nil && window.flowAvailable(need) {
 			return false
 		}
+	}
+	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow.flowAvailable(need) {
+		return false
 	}
 	return true
 }

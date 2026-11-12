@@ -8912,7 +8912,8 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// answered with port unreachable and dropped, so a quic stack
 				// falls back to tcp at once instead of waiting out its
 				// handshake timeout.
-				if ipPath.Protocol == IpProtocolUdp && self.flowUnroutable(flowNeedOf(ipPath)) {
+				if ipPath.Protocol == IpProtocolUdp &&
+					self.flowUnroutable(flowNeedOf(ipPath), self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId)) {
 					self.replyUdpNoRoute(ipPath)
 					return
 				}
