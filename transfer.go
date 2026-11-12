@@ -8012,6 +8012,8 @@ func (self *SendSequence) acquirePackAdmissionWithin(
 			if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok {
 				if group.isSynRetry() {
 					group.noteSynRetryCapacityRefusal(self, admission.protocolReadinessGate())
+				} else if group.synRetry != nil && group.synRetry.openingSerial != 0 {
+					group.noteNativeSynOpeningRefusal(self, admission.protocolReadinessGate())
 				}
 				if group.nativeAckRetry != nil || group.nativeAckRetrySerial != 0 {
 					group.noteNativeAckCapacityRefusal(self, admission.protocolReadinessGate())
@@ -8723,6 +8725,10 @@ func (self *SendSequence) processLogicalGroupChunk(
 	flightPolicy transferFlightPolicySnapshot,
 ) (complete bool, success bool, deferForRecoveryAdmission bool) {
 	if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok {
+		if !group.nativeSynOpeningCurrent() {
+			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeSynOpeningSuperseded))
+			return true, true, false
+		}
 		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay &&
 			(attempt.source != self || !attempt.current()) {
 			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeAckRetrySuperseded))
@@ -12603,6 +12609,25 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			}()
 			if !allowed {
 				disposeErr = newUnwrittenSendPackError(errNativeAckRetrySuperseded)
+				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
+				return false
+			}
+		} else if group, ok := disposition.target.(*parsedPacketGroup); ok &&
+			group.isSynRetry() && group.synRetry.openingSerial != 0 {
+			// A newer ordinary offer and this original's ordinal are ordered
+			// under the flow lock. Once assigned, normal reliable custody owns it.
+			allowed := func() bool {
+				update := group.synRetry.update
+				update.stateLock.Lock()
+				defer update.stateLock.Unlock()
+				if !group.nativeSynOpeningCurrentWithLock() {
+					return false
+				}
+				assign()
+				return true
+			}()
+			if !allowed {
+				disposeErr = newUnwrittenSendPackError(errNativeSynOpeningSuperseded)
 				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
 				return false
 			}
@@ -16881,6 +16906,7 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 	currentByteCount ByteCount,
 	byteCount ByteCount,
 	budgetByteCount ByteCount,
+	physicalBytePermission bool,
 	saturationRecorded *bool,
 	quotaStops ...*TransferMemoryBudget,
 ) bool {
@@ -16935,7 +16961,9 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 	if 0 < nextLimit && nextLimit <= currentCount {
 		return false
 	}
-	if 0 < nextByteLimit && currentByteCount != 0 &&
+	// Count growth shares Pack's exact already-paid H1 byte permission.
+	// Its finite count ceiling and shared quota admission still apply.
+	if !physicalBytePermission && 0 < nextByteLimit && currentByteCount != 0 &&
 		(currentByteCount > nextByteLimit || nextByteLimit-currentByteCount < byteCount) {
 		return false
 	}
@@ -17083,6 +17111,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 						self.packQueueByteCount.Load(),
 						byteCount,
 						budgetByteCount,
+						physicalBytePermission,
 						&h1SaturationRecorded,
 						quotaStop,
 					) {
@@ -17111,6 +17140,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 						current,
 						byteCount,
 						budgetByteCount,
+						physicalBytePermission,
 						&h1SaturationRecorded,
 						quotaStop,
 					) {
