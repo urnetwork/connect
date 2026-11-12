@@ -1436,9 +1436,11 @@ func (self *ExtenderActivator) carriers() []string {
 	return self.settings.Carriers()
 }
 
-// The carrier ports a post of the family offers, 0 for the plain api url's:
-// FamilyOfferedPorts', else OfferedPorts', where it answers one, else the
+// The carrier ports a post offers: OfferedPorts' where it answers one, else the
 // configured port.
+//
+// FamilyOfferedPorts takes OfferedPorts' place when it is set, asked for the
+// family posted, 0 for the plain api url's (S10).
 func (self *ExtenderActivator) offeredPorts(ipVersion int) (tcpPort int, udpPort int, dnsPort int) {
 	tcpPort, udpPort, dnsPort = self.settings.TcpPort, self.settings.UdpPort, self.settings.DnsPort
 	var offeredTcpPort, offeredUdpPort, offeredDnsPort int
