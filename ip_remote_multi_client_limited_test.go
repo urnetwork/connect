@@ -706,8 +706,9 @@ func TestNamedLookupsTakeTheFreshLabels(t *testing.T) {
 
 // A profile change regenerates the limited window with the normal windows:
 // its clients are cancelled, its requests carry the new profile's rank mode,
-// and an equal profile changes nothing. A post-quantum toggle is a profile
-// change (§12.5).
+// its target is recomputed from the normal windows' passes under the new
+// profile, never from their sizing under the old one, and an equal profile
+// changes nothing. A post-quantum toggle is a profile change (§12.5).
 func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -751,8 +752,18 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		{name: "fixed quality to fixed speed", profile: fixedSpeed, rankMode: "speed"},
 		{name: "post-quantum on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed"},
 	}
+	// the normal windows' sizing as their passes under the profile in force
+	// published it, which sizes the limited window to 3
+	publishOld := func() {
+		windows[WindowTypeQuality].publishSizing(windowSizing{published: true, active: true, targetSize: 6, hardMax: 6})
+		windows[WindowTypeSpeed].publishSizing(windowSizing{published: true, active: true, targetSize: 2, hardMax: 4})
+	}
 	for _, step := range steps {
 		clients := fill()
+		publishOld()
+		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 3 {
+			t.Fatalf("%s: limited target %d before the change, want 3", step.name, size.WindowSizeMax)
+		}
 		if err := parent.SetPerformanceProfile(step.profile); err != nil {
 			t.Fatalf("%s: %v", step.name, err)
 		}
@@ -760,6 +771,15 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 			if !client.IsDone() {
 				t.Errorf("%s: the %s window's client was not cancelled", step.name, windowStatsWindowOf(windowType))
 			}
+		}
+		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 0 {
+			t.Errorf("%s: limited target %d from the old profile's sizing, want none until the normal windows size again", step.name, size.WindowSizeMax)
+		}
+		// the passes under the new profile size it again
+		windows[WindowTypeQuality].publishSizing(windowSizing{published: true, active: true, targetSize: 4, hardMax: 0})
+		windows[WindowTypeSpeed].publishSizing(windowSizing{published: true, active: false, targetSize: 8, hardMax: 8})
+		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 2 || size.WindowSizeHardMax != 0 {
+			t.Errorf("%s: recomputed limited target %d hard max %d, want 2 and unbounded", step.name, size.WindowSizeMax, size.WindowSizeHardMax)
 		}
 		if got := windows[WindowTypeLimited].requestRankMode(); got != step.rankMode {
 			t.Errorf("%s: limited rank mode %q, want %q", step.name, got, step.rankMode)
@@ -772,8 +792,9 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		}
 	}
 
-	// an equal profile is a no-op: nothing is cancelled
+	// an equal profile is a no-op: nothing is cancelled, and the sizing stays
 	clients := fill()
+	publishOld()
 	equal := *steps[len(steps)-1].profile
 	if err := parent.SetPerformanceProfile(&equal); err != nil {
 		t.Fatal(err)
@@ -782,6 +803,9 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		if client.IsDone() {
 			t.Errorf("an equal profile cancelled the %s window's client", windowStatsWindowOf(windowType))
 		}
+	}
+	if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 3 {
+		t.Errorf("an equal profile changed the limited target to %d, want 3", size.WindowSizeMax)
 	}
 }
 
