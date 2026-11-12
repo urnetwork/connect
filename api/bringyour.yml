@@ -9700,9 +9700,11 @@ paths:
         `state` is the relay's: `running`; `cap_reached`; `in_flight`, a claim's
         outcome is not final yet; `no_key`, no relayer key is configured, so the
         relay reads and sends nothing; `bad_key`; `not_configured`; `not_running`,
-        it has no recent pass; `chain_unavailable`; `ledger_unavailable`;
-        `send_failed`; `low_balance`; `gas_price_high`; `griefing_stop`, a claim's
-        gas jumped.
+        it has no recent pass; `chain_unavailable`; `ledger_unavailable`, the
+        ledger of one or both of the operator's pools cannot be read: while the
+        other pool can be, its accounts are still claimed, and only the
+        unreadable pool's rows read `relay_paused`; `send_failed`;
+        `low_balance`; `gas_price_high`; `griefing_stop`, a claim's gas jumped.
 
         An `error` means the balances could not be read: they are unavailable,
         never zero, and `state` still says what the relay is doing.
