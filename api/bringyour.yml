@@ -11665,6 +11665,103 @@ paths:
         "503":
           description: The batch cannot be applied now; the producer retries it.
 
+  /internal/gate/projection/{network_id}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: A network's authorization log, for a gate host with no metadata tier
+      description: |
+        `GET /network/config/projection`'s answer for a gate service that
+        reads the log through api (connect's contract gate, sockets,
+        tlsedge and mxedge): the entries after `after`, a page at most and
+        from the retention point when `after` is before it, the rows of each
+        base among them and, from 0, the Signed Genesis, every message
+        verbatim in base64. api carries the log and decides nothing: the
+        gate checks every entry's chain from its own pin. connect's,
+        sockets', tlsedge's and mxedge's bearers only; evs and gkm read the
+        store themselves. A network with no log answers an empty page. 503
+        while the log cannot be read.
+      operationId: internalGateProjection
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: after
+          in: query
+          required: false
+          description: The newest position the gate holds; 0, or none, reads from the genesis.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkConfigProjectionResult"
+        "400":
+          description: The network id does not parse or is zero, or `after` is no position.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "503":
+          description: The log cannot be read.
+
+  /internal/gate/rows/{network_id}/{rows_sha256}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: One base's rows, for a gate host with no metadata tier
+      description: |
+        The `ProjectionRows` bytes a base of the network names by their
+        SHA-256, verbatim, which the gate holds to that hash. The same
+        bearers as the projection route. 503 while the rows cannot be read.
+      operationId: internalGateRows
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: rows_sha256
+          in: path
+          required: true
+          description: The rows' SHA-256 in lower-case hex.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: The network id does not parse or is zero, or the hash is no SHA-256 in lower-case hex.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or the route does not take the bearer's
+            service. The body is the plain text "Forbidden.".
+        "404":
+          description: The store holds no rows of the network by that hash.
+        "503":
+          description: The rows cannot be read.
+
   /sidecar/push-token:
     post:
       x-internal: true
