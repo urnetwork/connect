@@ -34,12 +34,25 @@ func newProviderLocalEntryRig(t *testing.T, cidrs ...string) *providerLocalEntry
 	t.Cleanup(cancel)
 
 	clientSettings := DefaultClientSettings()
-	clientSettings.SendBufferSettings.SequenceBufferSize = 0
+	// Admit every diagnostics frame before its worker runs. A zero-sized
+	// channel can still admit when the worker is ready, so it cannot keep
+	// providerDiagnosticsMessage readable after ClientReceive publishes.
+	clientSettings.SendBufferSettings.SequenceBufferSize = 16
+	clientSettings.SendBufferSettings.beforeRunSendSequenceForTest = func(sendSequenceId) {
+		<-ctx.Done()
+	}
 	clientSettings.SendBufferSettings.AckBufferSize = 0
 	clientSettings.ReceiveBufferSettings.SequenceBufferSize = 0
 	clientSettings.ForwardBufferSettings.SequenceBufferSize = 0
 	providerClient := NewClient(ctx, NewId(), NewNoContractClientOob(), clientSettings)
-	t.Cleanup(providerClient.Cancel)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer closeCancel()
+		if err := providerClient.CloseAndWait(closeCtx); err != nil {
+			t.Error(err)
+		}
+	})
 
 	rig := &providerLocalEntryRig{
 		dialed: make(chan string, 64),
@@ -75,6 +88,22 @@ func newProviderLocalEntryRig(t *testing.T, cidrs ...string) *providerLocalEntry
 		}
 	}
 	return rig
+}
+
+// Reads retained counters after the real callback has published them. The
+// publication helper returns nil for an unchanged, already-published sequence.
+func (self *providerLocalEntryRig) diagnosticsSnapshot(t *testing.T, sourceId Id) providerSourceDiagnostics {
+	t.Helper()
+	self.provider.stateLock.Lock()
+	defer self.provider.stateLock.Unlock()
+	diagnostics := self.provider.sourceDiagnostics[sourceId]
+	if diagnostics == nil {
+		t.Fatal("provider diagnostics missing")
+	}
+	if diagnostics.publishedSequence != diagnostics.sequence {
+		t.Fatalf("provider diagnostics not published: %+v", diagnostics)
+	}
+	return *diagnostics
 }
 
 // receive hands the provider one consumer packet, a tcp syn or a udp
@@ -186,7 +215,7 @@ func TestRemoteUserNatProviderRefusesProviderHostAtClientReceive(t *testing.T) {
 	if count := stats[SecurityPolicyResultIncident][newSecurityDestinationPort(blocked[0])]; count == 0 {
 		t.Errorf("no incident for the provider's own address: stats = %v", stats)
 	}
-	if diagnostics := rig.provider.providerDiagnosticsMessage(source.SourceId); diagnostics == nil || diagnostics.BlockIngressPacketCount != uint64(len(blocked)) {
+	if diagnostics := rig.diagnosticsSnapshot(t, source.SourceId); diagnostics.blockIngressPacketCount != uint64(len(blocked)) {
 		t.Errorf("provider diagnostics = %+v, want %d blocked ingress packets", diagnostics, len(blocked))
 	}
 }
@@ -254,7 +283,7 @@ func TestRemoteUserNatProviderRefusesProviderHostIcmpAndUdp(t *testing.T) {
 	if !rig.admittedTo("198.51.100.77") || len(rig.admitted) != 1 {
 		t.Fatalf("an echo to an ordinary public destination did not reach the exit: admitted %v", rig.admitted)
 	}
-	if diagnostics := rig.provider.providerDiagnosticsMessage(source.SourceId); diagnostics == nil || diagnostics.BlockIngressPacketCount != 6 {
+	if diagnostics := rig.diagnosticsSnapshot(t, source.SourceId); diagnostics.blockIngressPacketCount != 6 {
 		t.Fatalf("provider diagnostics = %+v, want 6 blocked ingress packets", diagnostics)
 	}
 }
