@@ -112,6 +112,14 @@ message ExtenderAddress {
     string Ip = 1;
     uint32 IpVersion = 2;
     repeated string Carriers = 3;
+    // This address's carrier ports when they are not the record's own
+    // TcpPort, UdpPort and DnsPorts (EXTENDER.md S10): a router's mapping
+    // forwards one family's carriers on other ports than the other family's.
+    // Zero and empty take the record's, which is what every record that
+    // predates the fields carries, and what a reader that predates them dials.
+    uint32 TcpPort = 4;
+    uint32 UdpPort = 5;
+    repeated uint32 DnsPorts = 6;
 }
 
 message ExtenderRecordBody {

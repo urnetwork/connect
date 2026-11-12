@@ -447,10 +447,18 @@ func (x *ExtenderProbeVerdict) GetCosignature() []byte {
 }
 
 type ExtenderAddress struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ip            string                 `protobuf:"bytes,1,opt,name=Ip,proto3" json:"Ip,omitempty"`
-	IpVersion     uint32                 `protobuf:"varint,2,opt,name=IpVersion,proto3" json:"IpVersion,omitempty"`
-	Carriers      []string               `protobuf:"bytes,3,rep,name=Carriers,proto3" json:"Carriers,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Ip        string                 `protobuf:"bytes,1,opt,name=Ip,proto3" json:"Ip,omitempty"`
+	IpVersion uint32                 `protobuf:"varint,2,opt,name=IpVersion,proto3" json:"IpVersion,omitempty"`
+	Carriers  []string               `protobuf:"bytes,3,rep,name=Carriers,proto3" json:"Carriers,omitempty"`
+	// This address's carrier ports when they are not the record's own
+	// TcpPort, UdpPort and DnsPorts (EXTENDER.md S10): a router's mapping
+	// forwards one family's carriers on other ports than the other family's.
+	// Zero and empty take the record's, which is what every record that
+	// predates the fields carries, and what a reader that predates them dials.
+	TcpPort       uint32   `protobuf:"varint,4,opt,name=TcpPort,proto3" json:"TcpPort,omitempty"`
+	UdpPort       uint32   `protobuf:"varint,5,opt,name=UdpPort,proto3" json:"UdpPort,omitempty"`
+	DnsPorts      []uint32 `protobuf:"varint,6,rep,packed,name=DnsPorts,proto3" json:"DnsPorts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -502,6 +510,27 @@ func (x *ExtenderAddress) GetIpVersion() uint32 {
 func (x *ExtenderAddress) GetCarriers() []string {
 	if x != nil {
 		return x.Carriers
+	}
+	return nil
+}
+
+func (x *ExtenderAddress) GetTcpPort() uint32 {
+	if x != nil {
+		return x.TcpPort
+	}
+	return 0
+}
+
+func (x *ExtenderAddress) GetUdpPort() uint32 {
+	if x != nil {
+		return x.UdpPort
+	}
+	return 0
+}
+
+func (x *ExtenderAddress) GetDnsPorts() []uint32 {
+	if x != nil {
+		return x.DnsPorts
 	}
 	return nil
 }
@@ -1530,11 +1559,14 @@ const file_extender_proto_rawDesc = "" +
 	"\x14ExtenderProbeVerdict\x12\x1a\n" +
 	"\bAccepted\x18\x01 \x01(\bR\bAccepted\x12\x16\n" +
 	"\x06Reason\x18\x02 \x01(\rR\x06Reason\x12 \n" +
-	"\vCosignature\x18\x03 \x01(\fR\vCosignature\"[\n" +
+	"\vCosignature\x18\x03 \x01(\fR\vCosignature\"\xab\x01\n" +
 	"\x0fExtenderAddress\x12\x0e\n" +
 	"\x02Ip\x18\x01 \x01(\tR\x02Ip\x12\x1c\n" +
 	"\tIpVersion\x18\x02 \x01(\rR\tIpVersion\x12\x1a\n" +
-	"\bCarriers\x18\x03 \x03(\tR\bCarriers\"\x98\x05\n" +
+	"\bCarriers\x18\x03 \x03(\tR\bCarriers\x12\x18\n" +
+	"\aTcpPort\x18\x04 \x01(\rR\aTcpPort\x12\x18\n" +
+	"\aUdpPort\x18\x05 \x01(\rR\aUdpPort\x12\x1a\n" +
+	"\bDnsPorts\x18\x06 \x03(\rR\bDnsPorts\"\x98\x05\n" +
 	"\x12ExtenderRecordBody\x12\x1c\n" +
 	"\tPublicKey\x18\x01 \x01(\fR\tPublicKey\x128\n" +
 	"\tAddresses\x18\x02 \x03(\v2\x1a.bringyour.ExtenderAddressR\tAddresses\x12\x18\n" +
