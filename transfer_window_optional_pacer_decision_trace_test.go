@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -90,6 +91,8 @@ type windowOptionalPacerProof struct {
 
 type windowOptionalPacerTrace struct {
 	stateLock            sync.Mutex
+	ctx                  context.Context
+	key                  sendSequenceId
 	start                time.Time
 	cell                 windowPathCell
 	sequence             Id
@@ -103,6 +106,11 @@ type windowOptionalPacerTrace struct {
 	proofs               [8]windowOptionalPacerProof
 	overflow             bool
 	conflict             bool
+	conflictSequence     Id
+	conflictStage        string
+	conflictAt           time.Duration
+	conflictKey          sendSequenceId
+	conflictCanceled     bool
 }
 
 func windowOptionalPacerNanos(at time.Time) int64 {
@@ -115,11 +123,29 @@ func windowOptionalPacerNanos(at time.Time) int64 {
 // Only an actual Run-owned hook may copy the mutable pacer. ACK-publication
 // hooks copy atomics and lock-owned service/queue state, never that pacer.
 func (self *windowOptionalPacerTrace) capture(sequence *SendSequence, stage string, owner bool, number uint64, wire bool) {
+	if self.ctx.Err() != nil || sequence.id() != self.key {
+		return
+	}
 	service := sequence.windowPacer.service
 	if service == nil {
 		return
 	}
 	now := time.Now()
+	self.stateLock.Lock()
+	if self.sequence == (Id{}) {
+		self.sequence = sequence.sequenceId
+	} else if self.sequence != sequence.sequenceId {
+		// A different live generation of the selected transfer still fails.
+		// Reject it before reading another Run owner's mutable pacer.
+		if !self.conflict {
+			self.conflictSequence, self.conflictStage, self.conflictAt = sequence.sequenceId, stage, now.Sub(self.start)
+			self.conflictKey, self.conflictCanceled = sequence.id(), sequence.ctx.Err() != nil
+		}
+		self.conflict = true
+		self.stateLock.Unlock()
+		return
+	}
+	self.stateLock.Unlock()
 	cut := windowOptionalPacerCut{Stage: stage, At: now.Sub(self.start), SequenceId: sequence.sequenceId,
 		PermissionKnown: sequence.receiveWindowSet.Load(), Permission: sequence.receiveWindowByteCount.Load(),
 		PermissionAt: sequence.receiveWindowSetAtNanos.Load(), PhysicalWrites: sequence.writeCount.Load(),
@@ -185,14 +211,6 @@ func (self *windowOptionalPacerTrace) capture(sequence *SendSequence, stage stri
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.sequence == (Id{}) {
-		self.sequence = cut.SequenceId
-	} else if self.sequence != cut.SequenceId {
-		// These selected cells have one real transfer sequence (flows are
-		// scheduler keys). Never merge another owner's rates into its trace.
-		self.conflict = true
-		return
-	}
 	before := self.last
 	fall := before.HeldPace > 0 && cut.HeldPace < before.HeldPace
 	serviceFall := before.HeldService > 0 && cut.HeldService < before.HeldService
@@ -245,15 +263,20 @@ func (self *windowOptionalPacerTrace) capture(sequence *SendSequence, stage stri
 	}
 }
 
-// Installation precedes all offered data. Existing cold-witness hooks retain
-// their original order and assertions; this observer follows them and never waits.
-func (self *windowOptionalPacerTrace) install(cell windowPathCell, sender, _ *Client) {
+// Observe only the fixture's data key while its client is live. Buffer-wide
+// hooks also run for independent transfers and canceled workers being joined.
+// Existing cold-witness hooks retain their order and assertions.
+func (self *windowOptionalPacerTrace) install(cell windowPathCell, sender, receiver *Client) {
 	if cell.Arm != "delivery" && cell.Arm != "window-only" {
 		return
 	}
 	self.start, self.cell = time.Now(), cell
+	self.ctx, self.key = sender.ctx, sendSequenceId{Destination: receiver.ClientId()}
 	buffer := sender.sendBuffer
 	lookup := func(id sendSequenceId) *SendSequence {
+		if self.ctx.Err() != nil || id != self.key {
+			return nil
+		}
 		buffer.mutex.Lock()
 		defer buffer.mutex.Unlock()
 		return buffer.sendSequences[id]
@@ -318,6 +341,9 @@ func (self *windowOptionalPacerTrace) report(t *testing.T) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	t.Logf("optional-pacer-trace counters: cuts=%d/%d originals_and_ack_heads=%d/%d intentionally_omitted_unpaced_writes=%d overflow=%t owner_conflict=%t", self.cutCount, len(self.cuts), self.wireCount, len(self.wires), self.unpacedWritesOmitted, self.overflow, self.conflict)
+	if self.conflict {
+		t.Logf("optional-pacer-owner-conflict first=%s next=%s stage=%s at=%s key=%+v canceled=%t", self.sequence, self.conflictSequence, self.conflictStage, self.conflictAt, self.conflictKey, self.conflictCanceled)
+	}
 	for _, cut := range self.cuts[:self.cutCount] {
 		encoded, err := json.Marshal(cut)
 		if err != nil {
