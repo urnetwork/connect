@@ -35,6 +35,11 @@ const (
 	ProviderProtocolCapabilityDualproto ProviderProtocolCapability = "dualproto"
 	// carries tcp: the provider's udp failed the quality probe
 	ProviderProtocolCapabilityTcp ProviderProtocolCapability = "tcp"
+	// A selector, never a label: every protocol label, dualproto and tcp
+	// providers in one pool ranked by the request's rank mode alone, with no
+	// overflow (server FP2-PROTOCOL.md §6.3). A label that reads any
+	// normalizes to tcp like every unknown label.
+	ProviderProtocolCapabilityAny ProviderProtocolCapability = "any"
 )
 
 // One provider's labels, as find-providers2 answers them in selector mode
@@ -107,13 +112,47 @@ type FindProvidersSelect struct {
 	// dualproto request overflows to tcp providers when the held dualproto
 	// clients and the eligible candidates do not reach it (D7.3, D11.2).
 	TargetCount int `json:"target_count"`
-	// The window clients held whose protocol label is the requested one.
+	// The window clients held whose protocol label is the requested one:
+	// every one for any.
 	HeldCount int `json:"held_count"`
 	// The window's ipv6 minimum (D11.1). The server reads it as 0 for an ipv4
 	// request.
 	DualstackTargetCount int `json:"dualstack_target_count"`
 	// The window clients held that are labelled dualstack.
 	HeldDualstackCount int `json:"held_dualstack_count"`
+}
+
+// The capabilities a normal window asks find-providers2 for: `select.ip` and
+// `select.protocol` (server FP2-PROTOCOL.md §5.1, §6.3). The window fills in
+// the counts (FindProvidersSelect). The limited window always asks with ipv4
+// and tcp.
+type ProviderSelectors struct {
+	// dualstack: the window's ipv6 minimum is drawn from dualstack providers
+	// first. ipv4: no ipv6 need, so dualstack providers come only in
+	// proportion to their share of the pool.
+	Ip ProviderIpCapability
+	// dualproto: dualproto providers, and tcp ones as overflow only when the
+	// dualproto ones cannot reach the window's target. any: dualproto and tcp
+	// providers in one pool, with no overflow and no tier offset.
+	Protocol ProviderProtocolCapability
+}
+
+// The selectors as a normal window sends them. An ip other than ipv4 reads as
+// dualstack and a protocol other than any as dualproto: the server's defaults
+// for an absent member (§5.1), so a settings value built without the field
+// asks as every window did before it, and tcp stays the limited window's.
+func (self ProviderSelectors) normalize() ProviderSelectors {
+	normalized := ProviderSelectors{
+		Ip:       ProviderIpCapabilityDualstack,
+		Protocol: ProviderProtocolCapabilityDualproto,
+	}
+	if self.Ip == ProviderIpCapabilityIpv4 {
+		normalized.Ip = ProviderIpCapabilityIpv4
+	}
+	if self.Protocol == ProviderProtocolCapabilityAny {
+		normalized.Protocol = ProviderProtocolCapabilityAny
+	}
+	return normalized
 }
 
 // What a flow needs from the exit that carries it: its ip version (4 or 6)
