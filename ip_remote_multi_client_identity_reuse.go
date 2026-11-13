@@ -29,14 +29,16 @@
 //
 // A discovery generator parks too, but only identities no provider can have
 // seen: args never handed to a client, or a client whose platform transports
-// never registered. A discovered provider may not be dialed again, so these
-// park for the next candidate of any destination, and an identity a provider
-// may have seen still never follows the window to another provider. Under a
-// saturated platform most hosted candidates were cut before their transport
-// registered (2026-10-22: 65% of about 310 identities a second never
-// connected, each one registration and one retirement). The discovery park
-// holds at most DiscoveryIdentityParkMaxCount identities, oldest first, and
-// retires one that no candidate took within DiscoveryIdentityParkMaxAge.
+// never registered, and never an identity restored from the store, which its
+// provider saw before this process. A discovered provider may not be dialed
+// again, so these park for the next candidate of any destination, and an
+// identity a provider may have seen still never follows the window to another
+// provider. Under a saturated platform most hosted candidates were cut before
+// their transport registered (2026-10-22: 65% of about 310 identities a
+// second never connected, each one registration and one retirement). The
+// discovery park holds at most DiscoveryIdentityParkMaxCount identities,
+// oldest first, and retires one that no candidate took within
+// DiscoveryIdentityParkMaxAge.
 package connect
 
 import (
@@ -194,13 +196,15 @@ func (self *windowIdentityState) CloseParking() []*WindowClientIdentity {
 // fixed generator's for its destination's next dial, a discovery generator's
 // for its next candidate. `reusable` is false when the platform refused the
 // identity, its client served, or, for discovery, a provider may have seen it.
+// A restored identity's provider saw it before this process, so a discovery
+// generator never parks one.
 func (self *ApiMultiClientGenerator) parkIdentity(args *MultiClientGeneratorClientArgs, reusable bool, clientKeySeed []byte) bool {
 	if !reusable || args == nil || args.ClientAuth == nil || self.ctx.Err() != nil {
 		return false
 	}
 	size, fixed := self.FixedDestinationSize()
 	if !fixed {
-		if self.discoveryParkMaxCount <= 0 || self.discoveryParkMaxAge <= 0 || args.P2pOnly {
+		if self.discoveryParkMaxCount <= 0 || self.discoveryParkMaxAge <= 0 || args.P2pOnly || args.restored {
 			return false
 		}
 		return self.identityState.ParkDiscovery(
