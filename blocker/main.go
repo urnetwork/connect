@@ -99,6 +99,8 @@ type feed struct {
 	name   string
 	url    string
 	format feedFormat
+	// Frogeye hosts variants carry required integrity and freshness metadata.
+	frogeyeVariant string
 	// hard-fail the build if fewer valid host entries than this
 	minCount int
 	// part of the conservative tier (the standard tier uses every feed)
@@ -117,8 +119,8 @@ var feeds = []feed{
 	{name: "shadowwhisperer_tracking", url: "https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking", format: formatHostsOrDomains, minCount: 80000, credit: "ShadowWhisperer BlockLists, Tracking (Unlicense) — github.com/ShadowWhisperer/BlockLists"},
 	{name: "shadowwhisperer_wild_tracking", url: "https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Wild_Tracking", format: formatHostsOrDomains, minCount: 8000, credit: "ShadowWhisperer BlockLists, Wild_Tracking (Unlicense) — github.com/ShadowWhisperer/BlockLists"},
 	{name: "anudeepnd_adservers", url: "https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt", format: formatHostsOrDomains, minCount: 25000, conservative: true, credit: "anudeepND blacklist, adservers (MIT, Copyright (c) 2018 Anudeep ND) — github.com/anudeepND/blacklist"},
-	{name: "frogeye_firstparty", url: "https://hostfiles.frogeye.fr/firstparty-trackers.txt", format: formatHostsOrDomains, minCount: 8000, conservative: true, credit: "Geoffrey Frogeye first-party trackers (MIT) — hostfiles.frogeye.fr"},
-	{name: "frogeye_multiparty", url: "https://hostfiles.frogeye.fr/multiparty-trackers.txt", format: formatHostsOrDomains, minCount: 10000, credit: "Geoffrey Frogeye multiparty trackers (MIT) — hostfiles.frogeye.fr"},
+	{name: "frogeye_firstparty", url: "https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt", format: formatHostsOrDomains, frogeyeVariant: "first-party trackers", minCount: 4000, conservative: true, credit: "Geoffrey Frogeye first-party trackers (MIT) — hostfiles.frogeye.fr"},
+	{name: "frogeye_multiparty", url: "https://hostfiles.frogeye.fr/multiparty-trackers-hosts.txt", format: formatHostsOrDomains, frogeyeVariant: "multi-party trackers", minCount: 8000, credit: "Geoffrey Frogeye multiparty trackers (MIT) — hostfiles.frogeye.fr"},
 	{name: "hostsvn", url: "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts", format: formatHostsOrDomains, minCount: 9000, credit: "hostsVN (MIT, Copyright (c) BigDargon) — github.com/bigdargon/hostsVN"},
 
 	{name: "anudeepnd_whitelist", url: "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt", format: formatHostsOrDomains, minCount: 100, conservative: true, allow: true, credit: "anudeepND whitelist (MIT, Copyright (c) 2018 Anudeep ND) — github.com/anudeepND/whitelist [subtracted]"},
@@ -425,6 +427,9 @@ func fetchAll(tierFeeds []feed, timeout time.Duration) []parsed {
 // Records the exact decoded response body before parser normalization.
 func parseResponse(f feed, data []byte) parsed {
 	p := parseFeed(f.format, data)
+	if f.frogeyeVariant != "" {
+		p = parseFrogeye(data, f.frogeyeVariant, time.Now())
+	}
 	p.f = f
 	p.contentSHA256 = sha256.Sum256(data)
 	p.contentBytes = len(data)
