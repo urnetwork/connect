@@ -30,7 +30,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
 	"slices"
 	"sync"
@@ -134,8 +134,11 @@ type NodeSettings struct {
 
 	// The only clock this node reads.
 	Now func() time.Time
-	// The seed of the peer choice. 0 seeds from the clock; a test pins it.
-	RandSeed int64
+	// The generator of the peer choice, owned by this node's peering loop and
+	// never shared with another node. Nil, the default, uses a
+	// connect.NewSecureRand generator, so the choice does not follow from the
+	// clock or the node's start time; a test injects a deterministic one.
+	Rand *mathrand.Rand
 }
 
 // The defaults of one role (D1, D3).
@@ -268,9 +271,9 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		return nil, err
 	}
 
-	randSeed := settings.RandSeed
-	if randSeed == 0 {
-		randSeed = settings.Now().UnixNano()
+	random := settings.Rand
+	if random == nil {
+		random = connect.NewSecureRand()
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -286,7 +289,7 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		receiveDone:     make(chan struct{}),
 		topicEventsDone: make(chan struct{}),
 		statusDone:      make(chan struct{}),
-		rand:            mathrand.New(mathrand.NewSource(randSeed)),
+		rand:            random,
 		operatorAddrs:   slices.Clone(settings.OperatorAddrs),
 	}
 

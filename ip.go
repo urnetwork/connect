@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"os"
 	// "runtime/debug"
@@ -11322,7 +11322,7 @@ func (self *pathTable) SelectDestination(packet []byte) (MultiHopId, error) {
 		if destination, ok := self.paths4[ip4Path]; ok {
 			return destination, nil
 		}
-		i := mathrand.Intn(len(self.destinations))
+		i := mathrand.IntN(len(self.destinations))
 		destination := self.destinations[i]
 		self.paths4[ip4Path] = destination
 		return destination, nil
@@ -11331,7 +11331,7 @@ func (self *pathTable) SelectDestination(packet []byte) (MultiHopId, error) {
 		if destination, ok := self.paths6[ip6Path]; ok {
 			return destination, nil
 		}
-		i := mathrand.Intn(len(self.destinations))
+		i := mathrand.IntN(len(self.destinations))
 		destination := self.destinations[i]
 		self.paths6[ip6Path] = destination
 		return destination, nil

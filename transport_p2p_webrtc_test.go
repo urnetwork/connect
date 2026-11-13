@@ -5,11 +5,11 @@ package connect
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	mathrand "math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -99,7 +99,7 @@ func TestWebRtc(t *testing.T) {
 	AssertEqual(t, connB.SetDeadline(dataDeadline), nil)
 
 	b := make([]byte, 1024*1024)
-	mathrand.Read(b)
+	cryptorand.Read(b)
 
 	type ioResult struct {
 		operation string

@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -16916,7 +16916,7 @@ func raceWeightedShuffle(settings *MultiClientSettings, clients []*multiClientCh
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
 	// randonly sample log statistics for weights
-	if mathrand.Intn(self.settings.StatsSampleWeightsCount) == 0 {
+	if mathrand.IntN(self.settings.StatsSampleWeightsCount) == 0 {
 		// sample the weights
 		weightValues := slices.Collect(maps.Values(weights))
 		slices.SortFunc(weightValues, func(a float32, b float32) int {

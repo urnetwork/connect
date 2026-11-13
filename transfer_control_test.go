@@ -3,7 +3,7 @@ package connect
 import (
 	"context"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,7 +79,7 @@ func TestControlSync(t *testing.T) {
 					nil,
 				)
 				select {
-				case <-time.After(time.Duration(mathrand.Int63n(int64(sendDelay)))):
+				case <-time.After(time.Duration(mathrand.Int64N(int64(sendDelay)))):
 				case <-ctx.Done():
 					return
 				}
@@ -96,7 +96,7 @@ func TestControlSync(t *testing.T) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(time.Duration(mathrand.Int63n(int64(dropTimeout)))):
+				case <-time.After(time.Duration(mathrand.Int64N(int64(dropTimeout)))):
 				}
 
 				clientASendTransport := NewSendGatewayTransport()
@@ -122,7 +122,7 @@ func TestControlSync(t *testing.T) {
 					controlClientA.RouteManager().UpdateTransport(controlClientASendTransport, nil)
 					controlClientA.RouteManager().UpdateTransport(controlClientAReceiveTransport, nil)
 					return
-				case <-time.After(time.Duration(mathrand.Int63n(int64(allowTimeout)))):
+				case <-time.After(time.Duration(mathrand.Int64N(int64(allowTimeout)))):
 				}
 
 				clientA.RouteManager().UpdateTransport(clientASendTransport, nil)

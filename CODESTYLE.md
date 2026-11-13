@@ -21,6 +21,15 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 - Our `Id` type is a ULID. ULIDs put a millisecond creation timestamp in their high bits, so ids are **lexicographically ordered by creation time** — and we rely on this in several places: `MAX(id)` / `MAX(id::varchar)` selects the most-recently-created row of a group, and `ORDER BY id` stands in for `ORDER BY create_time`. The ordering survives the `uuid` column type and its `::varchar` canonical form (the timestamp is in the leading bytes, and hex sorts in value order), so it holds in SQL as well as in Go.
 - The timestamp is **client-local**: an id carries the clock of whatever minted it, so id order is a dependable time order within a single source but is not a global clock across sources (two ids minted on different machines can be out of true order by the clock skew between them). When strict or cross-source ordering matters, order by an explicit server-set timestamp column instead.
 
+## Randomness
+
+- Secrets, keys, nonces, tokens and unguessable ids: `crypto/rand`.
+- All other randomness: the top-level `math/rand/v2` functions (`rand.IntN`, `rand.N`, `rand.Shuffle`, ...). Never import `math/rand`.
+- Production code never builds a seeded generator. A type that needs its own uses `connect.NewSecureRand()` (`random.go`: ChaCha8 seeded from `crypto/rand`). No generator seeded from the clock, an id, a counter or a fixed value, and no fallback to one.
+- Deterministic generators (`rand.NewPCG`, a fixed-seed `rand.NewChaCha8`) belong only in tests, benchmarks and simulations, with a comment saying why.
+- Randomness that shapes traffic is security relevant, however small: padding, timing jitter, path, exit, strategy and server choice, probe and sample selection.
+- `random_rule_test.go` enforces this.
+
 ## Package layering
 
 **A package must never import its own subpackages.** Dependencies point one way:

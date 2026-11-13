@@ -7,7 +7,7 @@ import (
 	"errors"
 	"maps"
 	"math"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
 	"slices"
 	"strings"

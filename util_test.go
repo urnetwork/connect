@@ -8,7 +8,7 @@ import (
 	"time"
 
 	// "math"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 )
 
 func TestMonitor(t *testing.T) {
@@ -204,7 +204,8 @@ func TestWeightedShuffle(t *testing.T) {
 
 	k := weightedShuffleTestSamplesPerValue
 	n := weightedShuffleTestSize
-	random := mathrand.New(mathrand.NewSource(weightedShuffleTestSeed))
+	// a fixed seed keeps the averages, and so the trend checks, the same every run
+	random := mathrand.New(mathrand.NewPCG(uint64(weightedShuffleTestSeed), 0))
 
 	netIndexes1 := map[int]int64{}
 	netIndexes2 := map[int]int64{}
@@ -295,7 +296,8 @@ func TestWeightedShuffleWithEntropy(t *testing.T) {
 	}
 
 	for entropyIndex, entropy := range orderedEntropies {
-		random := mathrand.New(mathrand.NewSource(weightedShuffleTestSeed + int64(entropyIndex) + 1))
+		// a fixed seed per entropy, so the trend checks are the same every run
+		random := mathrand.New(mathrand.NewPCG(uint64(weightedShuffleTestSeed+int64(entropyIndex)+1), 0))
 		netIndexes1 := map[int]int64{}
 		netIndexes2 := map[int]int64{}
 		netIndexes3 := map[int]int64{}

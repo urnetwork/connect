@@ -7,7 +7,7 @@
 package connect
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 )

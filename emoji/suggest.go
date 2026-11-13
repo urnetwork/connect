@@ -1,7 +1,7 @@
 package emoji
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 )
 
@@ -21,10 +21,10 @@ const SuggestMaxEmoji = 3
 // faces or anything with an ambiguous meaning (a broken heart, weapons,
 // alcohol, medicine).
 func Suggest(count int, r *rand.Rand) string {
-	intn := rand.Intn
+	intn := rand.IntN
 	perm := rand.Perm
 	if r != nil {
-		intn = r.Intn
+		intn = r.IntN
 		perm = r.Perm
 	}
 	switch {

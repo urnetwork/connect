@@ -48,7 +48,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -353,7 +353,7 @@ func (self *ExtenderCamouflageRole) run(ctx context.Context, server *ExtenderSer
 
 		// never later than the interval, and spread so a fleet restarted together
 		// does not verify together
-		remaining := revalidationInterval - time.Duration(mathrand.Int63n(int64(revalidationInterval/10)+1))
+		remaining := revalidationInterval - time.Duration(mathrand.Int64N(int64(revalidationInterval/10)+1))
 		retryWait := self.settings.VerifyRetryInterval
 		for 0 < len(failedNames) && retryWait < remaining {
 			select {

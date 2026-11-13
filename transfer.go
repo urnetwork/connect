@@ -16,7 +16,7 @@ import (
 	// "runtime/debug"
 	// "runtime"
 	// "reflect"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"slices"
 	"strings"
 
@@ -4605,7 +4605,7 @@ func (self *Client) run() {
 			HandleError(func() {
 				for {
 					// uniform timeout with mean `ControlPingTimeout`
-					timeout := time.Duration(mathrand.Int63n(int64(2 * self.settings.ControlPingTimeout)))
+					timeout := time.Duration(mathrand.Int64N(int64(2 * self.settings.ControlPingTimeout)))
 					select {
 					case <-self.ctx.Done():
 						return
