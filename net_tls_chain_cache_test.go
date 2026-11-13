@@ -1047,6 +1047,21 @@ func TestTlsChainCacheServesTheDialPaths(t *testing.T) {
 	for _, hello := range hellos {
 		assertTestChromeClientHello(t, parseTestClientHello(t, hello.message), clientWebSocketNextProtos)
 	}
+
+	// the api path of every dialer, normal and resilient, reuses the
+	// verification, and its response carries the verified chains the
+	// camouflage clock reads (ObserveExtenderCamouflagePlatformTime)
+	for _, testDialer := range testTlsHelloDialers {
+		client := testDialer.clientDialer(settings).HttpClient()
+		response := testTlsHelloApiRequest(t, client, server.authority())
+		client.CloseIdleConnections()
+		if response.TLS == nil || len(response.TLS.VerifiedChains) == 0 {
+			t.Fatalf("%s: the api response carries no verified chains", testDialer.description)
+		}
+	}
+	if final := GetTlsVerifiedChainCacheStats(); final.HitCount-after.HitCount < uint64(len(testTlsHelloDialers)) || final.MissCount != after.MissCount {
+		t.Fatalf("stats moved from %+v to %+v, want a hit for every dialer's api dial", after, final)
+	}
 }
 
 // Drops a registration, for a test that registered a pool with the process
