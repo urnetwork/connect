@@ -46,6 +46,19 @@ func (raceOrderTestRandom) IntN(n int) int {
 func (raceOrderTestRandom) Shuffle(n int, swap func(i int, j int)) {
 }
 
+// raceOrderTestRandom that also counts the weighted picks it serves, one per
+// placed exit but the last of each shuffle. The tests that use it call from
+// one goroutine.
+type raceOrderCountingRandom struct {
+	raceOrderTestRandom
+	picks *int
+}
+
+func (self raceOrderCountingRandom) Float32() float32 {
+	*self.picks += 1
+	return self.raceOrderTestRandom.Float32()
+}
+
 // The estimated rates, in bytes per second, of the four exits: the race
 // weights are each 1 more. A heavy tcp exit, then a heavy dualproto one, a
 // light tcp one and a light dualproto one.
@@ -195,42 +208,60 @@ func TestUdpRaceFieldsNeverHoldALimitedExit(t *testing.T) {
 	}
 }
 
-// With no limited exit to merge the field is exactly the window's: no limited
-// window at all, or one with nothing for the flow. The merge hands back an
-// empty part's partner as it is, never a copy or a new order.
+// With no limited exit to merge the field is exactly the window's, in the
+// window's own order, with no shuffle of the merge's own: no limited window
+// at all, or one with nothing for the flow.
 func TestRaceFieldWithoutALimitedExitIsTheWindowsOwn(t *testing.T) {
-	tcp := flowNeed{ipVersion: 4, ipProtocol: IpProtocolTcp}
-
-	fixture := newRaceMergeTestFixture(t, false)
-	fixture.addExits(t)
-	own := fixture.order(fixture.parent.raceCandidates(fixture.quality, tcp))
-	if own != "normal light" {
-		t.Fatalf("the quality window's own field %q, want normal light", own)
+	picks := 0
+	counted := func(fixture *raceMergeTestFixture) {
+		fixture.settings.raceOrderRandomForTest = raceOrderCountingRandom{picks: &picks}
+	}
+	// the field and the picks it took
+	field := func(read func() []*multiClientChannel) ([]*multiClientChannel, int) {
+		picks = 0
+		clients := read()
+		return clients, picks
 	}
 	var offerChanged, limitedOfferChanged <-chan struct{}
-	if got := fixture.order(fixture.parent.raceField(fixture.quality, tcp, &offerChanged, &limitedOfferChanged)); got != own {
-		t.Errorf("without a limited window: race field %q, want the window's %q", got, own)
+
+	tcp := flowNeed{ipVersion: 4, ipProtocol: IpProtocolTcp}
+	fixture := newRaceMergeTestFixture(t, false)
+	counted(fixture)
+	fixture.addExits(t)
+	own, ownPicks := field(func() []*multiClientChannel { return fixture.parent.raceCandidates(fixture.quality, tcp) })
+	if fixture.order(own) != "normal light" || ownPicks != 1 {
+		t.Fatalf("the quality window's own field %q in %d picks, want normal light in 1", fixture.order(own), ownPicks)
+	}
+	got, gotPicks := field(func() []*multiClientChannel {
+		return fixture.parent.raceField(fixture.quality, tcp, &offerChanged, &limitedOfferChanged)
+	})
+	if fixture.order(got) != fixture.order(own) || gotPicks != ownPicks {
+		t.Errorf("without a limited window: race field %q in %d picks, want the window's %q in %d", fixture.order(got), gotPicks, fixture.order(own), ownPicks)
 	}
 
-	// a limited window with an exit the flow cannot use: a v6 flow and a
-	// limited exit that cannot carry v6
+	// a limited window whose one exit cannot carry the flow: v6 tcp beside a
+	// limited exit labelled ipv4
+	tcp6 := flowNeed{ipVersion: 6, ipProtocol: IpProtocolTcp}
 	fixture = newRaceMergeTestFixture(t, true)
+	counted(fixture)
 	fixture.add(t, fixture.quality, "normal", capabilityClassA, raceMergeTestHeavyNormalRate)
 	fixture.add(t, fixture.quality, "dual", capabilityClassA, raceMergeTestLightNormalRate)
 	fixture.add(t, fixture.limited, "limited", capabilityClassD, raceMergeTestHeavyLimitedRate)
-	tcp6 := flowNeed{ipVersion: 6, ipProtocol: IpProtocolTcp}
-	if got := fixture.order(fixture.parent.raceField(fixture.quality, tcp6, &offerChanged, &limitedOfferChanged)); got != "normal dual" {
-		t.Errorf("v6 tcp with a v4 limited exit: race field %q, want the window's normal dual", got)
+	own, ownPicks = field(func() []*multiClientChannel { return fixture.parent.raceCandidates(fixture.quality, tcp6) })
+	got, gotPicks = field(func() []*multiClientChannel {
+		return fixture.parent.raceField(fixture.quality, tcp6, &offerChanged, &limitedOfferChanged)
+	})
+	if fixture.order(got) != "normal dual" || fixture.order(got) != fixture.order(own) || gotPicks != ownPicks {
+		t.Errorf("v6 tcp with a v4 limited exit: race field %q in %d picks, want the window's %q in %d", fixture.order(got), gotPicks, fixture.order(own), ownPicks)
 	}
-
-	// the merge itself
-	field := fixture.parent.raceCandidates(fixture.quality, tcp6)
-	if merged := fixture.parent.mergeRaceField(field, nil); len(merged) != len(field) || &merged[0] != &field[0] {
-		t.Error("a field with no limited part was not handed back as it is")
+	got, gotPicks = field(func() []*multiClientChannel { return fixture.parent.crossTierRaceField(fixture.quality, tcp6) })
+	if fixture.order(got) != "normal dual" || gotPicks != ownPicks {
+		t.Errorf("v6 tcp with a v4 limited exit: cross-tier field %q in %d picks, want normal dual in %d", fixture.order(got), gotPicks, ownPicks)
 	}
-	limitedField := fixture.parent.raceCandidates(fixture.limited, tcp)
-	if merged := fixture.parent.mergeRaceField(nil, limitedField); len(merged) != len(limitedField) || &merged[0] != &limitedField[0] {
-		t.Error("a limited part with no window field was not handed back as it is")
+	// a window's last-resort offer is unordered, and stays so
+	got, gotPicks = field(func() []*multiClientChannel { return fixture.parent.lastResortRaceField(fixture.quality, tcp6) })
+	if len(got) != 2 || gotPicks != 0 {
+		t.Errorf("v6 tcp with a v4 limited exit: last-resort field %q in %d picks, want the window's two in none", fixture.order(got), gotPicks)
 	}
 }
 
