@@ -947,7 +947,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		// No exclusions ride the request: the destinations above already
 		// passed them here, as without the requirement. The platform still
 		// applies its own rules for named providers, as for a named redial.
-		confirmModern := &FindProviders2Args{
+		confirmFindProviders2 := &FindProviders2Args{
 			Specs:                 confirmSpecs,
 			ExcludeClientIds:      []Id{},
 			Count:                 len(confirmSpecs),
@@ -957,7 +957,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		go HandleError(func() {
 			defer close(confirmDone)
 			modernClientIds, confirmErr = HandleError2(func() (map[Id]bool, error) {
-				result, err := self.findProviders2(ctx, confirmModern)
+				result, err := self.findProviders2(ctx, confirmFindProviders2)
 				if err != nil {
 					return nil, err
 				}
