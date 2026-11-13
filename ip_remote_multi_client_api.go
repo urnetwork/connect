@@ -29,6 +29,10 @@ type MultiClientGeneratorClientArgs struct {
 	// The destination's transport hint (EXTENDER.md K10), set for a window
 	// client of a pinned stay. In memory only.
 	transportHint *TransportHint
+	// The identity was restored from the store (PROXYDRAIN1.md §3.5), so its
+	// provider saw it before this process. It never parks for the candidate of
+	// another destination. In memory only.
+	restored bool
 }
 
 // NetworkClientCredentials is an optional in-process authority for the
@@ -821,6 +825,22 @@ func (self *ApiMultiClientGenerator) ExcludeClientId(clientId Id) {
 	self.runtimeExcludeClientIdSet[clientId] = true
 }
 
+// Implements multiClientGeneratorExclusions: whether any hop of the
+// destination, its exit or an intermediary, is excluded now, by the
+// constructor or at runtime (ExcludeClientId). An excluded provider carries
+// none of the routes the generator returns; RemoveProvider's own cut of live
+// window clients matches the exit alone.
+func (self *ApiMultiClientGenerator) excludesDestination(destination MultiHopId) bool {
+	self.excludeLock.Lock()
+	defer self.excludeLock.Unlock()
+	for _, clientId := range destination.Ids() {
+		if self.runtimeExcludeClientIdSet[clientId] || slices.Contains(self.excludeClientIds, clientId) {
+			return true
+		}
+	}
+	return false
+}
+
 // NextDestinationsContext implements MultiClientGeneratorContext. Discovery is
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
@@ -848,6 +868,17 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 // unconfirmed, and forgets none. The confirmation runs beside the discovery
 // request, so the call still takes one platform round trip, and it carries no
 // `select`, so it says nothing about selector mode.
+//
+// The generator's exclusions (ExcludeClientIds: the constructor's, and a
+// provider the user removed or a reliability verdict cut) hold for every
+// destination returned, whichever way it was found, and for every hop of it.
+// Discovery sends them to the platform. A fixed spec or restored destination
+// with an excluded hop is left out before any request, and a restored one is
+// forgotten, so a provider is never handed back through the identity it held
+// before the restart. The exclusions are read again once the requests are
+// back, so a provider excluded while they were out is left out of this
+// answer too. A destination the caller excludes (`excludeDestinations`, the
+// window's own) is only skipped: its restored identity stays pending.
 func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter, providerSelect *FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
 	excludeClientIds := self.ExcludeClientIds()
 	excludeDestinationsIds := [][]Id{}
@@ -909,6 +940,12 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		restoredDestinations = nil
 	}
 	for _, destination := range restoredDestinations {
+		if self.excludesDestination(destination) {
+			// a provider this generator excludes: forgotten, so it never comes
+			// back through the identity it held
+			self.identityState.ForgetRestored(destination)
+			continue
+		}
 		if slices.Contains(excludeDestinations, destination) {
 			continue
 		}
@@ -995,6 +1032,13 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 
 	destinations := map[MultiHopId]DestinationStats{}
 	for destination := range undiscoveredDestinations {
+		// the exclusions as they stand now the requests are back: a provider
+		// excluded while they were out is not handed back by this answer
+		// either. A restored identity is forgotten; a fixed spec has none.
+		if self.excludesDestination(destination) {
+			self.identityState.ForgetRestored(destination)
+			continue
+		}
 		if !requireModern {
 			destinations[destination] = DestinationStats{}
 			continue
@@ -1029,7 +1073,16 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			return nil, false, discoveryErr
 		}
 		selectorMode = self.observeSelectorMode(providerSelect, discoveryResult)
-		addProviderDestinations(destinations, discoveryResult.Providers, selectorMode)
+		discoveredDestinations := map[MultiHopId]DestinationStats{}
+		addProviderDestinations(discoveredDestinations, discoveryResult.Providers, selectorMode)
+		for destination, stats := range discoveredDestinations {
+			// discovery sent the exclusions as they stood before it
+			if self.excludesDestination(destination) {
+				self.identityState.ForgetRestored(destination)
+				continue
+			}
+			destinations[destination] = stats
+		}
 	} else if confirmErr != nil {
 		// with nothing to discover, a failed confirmation fails the call
 		return nil, false, confirmErr
@@ -1043,7 +1096,8 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 // may be dialed again. While SetPostQuantumEncryption is set, the request also
 // requires a modern provider, so a provider that is not modern is answered
 // empty too. An id this generator excludes is answered empty without a
-// request, as discovery would never return it either.
+// request, as discovery would never return it either, and so is one it
+// excluded while the request was out.
 func (self *ApiMultiClientGenerator) NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	destinations, _, err := self.nextDestinationsForClientId(clientId, excludeDestinations, rankMode, nil)
 	return destinations, err
@@ -1056,7 +1110,9 @@ func (self *ApiMultiClientGenerator) NextDestinationsForClientIdWithCapabilities
 }
 
 // The by-id request body. A non-nil providerSelect puts it in selector mode;
-// an excluded id makes no request and reports nothing about the server.
+// an excluded id makes no request and reports nothing about the server. The
+// exclusions are read again once the answer is back, as discovery reads them
+// (nextDestinationsContext), so no route with an excluded hop is returned.
 func (self *ApiMultiClientGenerator) nextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string, providerSelect *FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
 	destinations := map[MultiHopId]DestinationStats{}
 	excludeClientIds := self.ExcludeClientIds()
@@ -1083,6 +1139,11 @@ func (self *ApiMultiClientGenerator) nextDestinationsForClientId(clientId Id, ex
 	}
 	selectorMode := self.observeSelectorMode(providerSelect, result)
 	addProviderDestinations(destinations, result.Providers, selectorMode)
+	for destination := range destinations {
+		if self.excludesDestination(destination) {
+			delete(destinations, destination)
+		}
+	}
 	return destinations, selectorMode, nil
 }
 
@@ -1359,6 +1420,7 @@ func (self *ApiMultiClientGenerator) newClientArgsForDestinationContext(ctx cont
 				InstanceId: identity.InstanceId,
 				AppVersion: self.appVersion,
 			},
+			restored: true,
 		}, nil
 	}
 	// an identity no provider has seen, parked by an earlier discovery

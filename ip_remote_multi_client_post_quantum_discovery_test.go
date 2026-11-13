@@ -265,9 +265,10 @@ func TestDefaultProfileKeepsCapabilityBlindDiscovery(t *testing.T) {
 
 // A generator whose find-providers2 requests are recorded and answered by
 // `answer`, whose derived identities come from a counting credential
-// authority, and whose store restores `persisted` (no store for nil). Nothing
-// reaches a public endpoint. A call confirms beside its discovery, so
-// `answer` can run on two goroutines at once.
+// authority, whose store restores `persisted` (no store for nil), and whose
+// constructor excludes `excludeClientIds`. Nothing reaches a public endpoint.
+// A call confirms beside its discovery, so `answer` can run on two goroutines
+// at once.
 type modernConfirmFixture struct {
 	generator *ApiMultiClientGenerator
 	mintCount atomic.Int32
@@ -282,6 +283,7 @@ func newModernConfirmFixture(
 	specs []*ProviderSpec,
 	persisted []*WindowClientIdentity,
 	answer func(args *FindProviders2Args) (*FindProviders2Result, error),
+	excludeClientIds ...Id,
 ) *modernConfirmFixture {
 	t.Helper()
 	fixture := &modernConfirmFixture{}
@@ -313,7 +315,7 @@ func newModernConfirmFixture(
 		ctx,
 		specs,
 		strategy,
-		nil,
+		excludeClientIds,
 		"https://api.modern.example",
 		"synthetic-parent-token",
 		"wss://platform.modern.example",
