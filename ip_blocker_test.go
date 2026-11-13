@@ -31,7 +31,7 @@ func blockerTestHostKey(pepper string, name string) uint64 {
 	return key
 }
 
-func blockerTestHostTable(pepper string, names []string) (string, int) {
+func blockerTestHostTable(pepper string, names []string) (string, int, string) {
 	keys := make([]uint64, 0, len(names))
 	for _, name := range names {
 		keys = append(keys, blockerTestHostKey(pepper, name))
@@ -39,12 +39,22 @@ func blockerTestHostTable(pepper string, names []string) (string, int) {
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	var data []byte
+	buckets := make([]byte, blockerHostBucketBytes)
+	for bucket := 0; bucket <= 256; bucket++ {
+		offset := 0
+		for _, key := range keys {
+			if key>>(8*blockerHostTailLen) < uint64(bucket) {
+				offset++
+			}
+		}
+		binary.BigEndian.PutUint32(buckets[bucket*4:], uint32(offset))
+	}
 	for _, key := range keys {
-		for i := blockerHostRecordLen - 1; 0 <= i; i -= 1 {
+		for i := blockerHostTailLen - 1; 0 <= i; i -= 1 {
 			data = append(data, byte(key>>(8*i)))
 		}
 	}
-	return string(data), len(keys)
+	return string(data), len(keys), string(buckets)
 }
 
 func blockerTestPack4(ranges [][2]uint32) (string, int) {
@@ -65,10 +75,10 @@ func blockerTestIp4(s string) uint32 {
 // ranges must be sorted and disjoint (like generator output). v6 ranges reuse
 // packV6 from ip_security_cfaa_test.go.
 func blockerTestNew(names []string, r4 [][2]uint32, r6 [][2][16]byte) *dataBlocker {
-	hostData, hostCount := blockerTestHostTable(blockerTestPepper, names)
+	hostData, hostCount, hostBuckets := blockerTestHostTable(blockerTestPepper, names)
 	d4, c4 := blockerTestPack4(r4)
 	d6, c6 := packV6(r6)
-	b := newBlockerWithData(blockerTestPepper, hostData, hostCount, d4, c4, d6, c6)
+	b := newBlockerWithData(blockerTestPepper, hostData, hostCount, hostBuckets, d4, c4, d6, c6)
 	b.SetEnabled(true)
 	return b
 }
@@ -260,9 +270,9 @@ func TestBlockerHostMaxLength(t *testing.T) {
 }
 
 func TestBlockerEnabled(t *testing.T) {
-	hostData, hostCount := blockerTestHostTable(blockerTestPepper, blockerTestEntries)
+	hostData, hostCount, hostBuckets := blockerTestHostTable(blockerTestPepper, blockerTestEntries)
 	d4, c4 := blockerTestPack4([][2]uint32{{blockerTestIp4("203.0.113.0"), blockerTestIp4("203.0.113.255")}})
-	b := newBlockerWithData(blockerTestPepper, hostData, hostCount, d4, c4, "", 0)
+	b := newBlockerWithData(blockerTestPepper, hostData, hostCount, hostBuckets, d4, c4, "", 0)
 
 	// constructed disabled
 	if b.Enabled() {
@@ -343,7 +353,7 @@ func TestBlockerIp6(t *testing.T) {
 }
 
 func TestBlockerEmptyTables(t *testing.T) {
-	b := newBlockerWithData(blockerTestPepper, "", 0, "", 0, "", 0)
+	b := newBlockerWithData(blockerTestPepper, "", 0, strings.Repeat("\x00", blockerHostBucketBytes), "", 0, "", 0)
 	b.SetEnabled(true)
 	if b.BlockHost("ads.example.com") {
 		t.Fatalf("empty host table matched")
@@ -372,17 +382,88 @@ func TestBlockerDataGuards(t *testing.T) {
 		f()
 	}
 	assertPanics("short pepper", func() {
-		newBlockerWithData("short", "", 0, "", 0, "", 0)
+		newBlockerWithData("short", "", 0, strings.Repeat("\x00", blockerHostBucketBytes), "", 0, "", 0)
 	})
 	assertPanics("host data length", func() {
-		newBlockerWithData(blockerTestPepper, "abc", 1, "", 0, "", 0)
+		newBlockerWithData(blockerTestPepper, "abc", 1, strings.Repeat("\x00", blockerHostBucketBytes), "", 0, "", 0)
 	})
 	assertPanics("v4 data length", func() {
-		newBlockerWithData(blockerTestPepper, "", 0, "abc", 1, "", 0)
+		newBlockerWithData(blockerTestPepper, "", 0, strings.Repeat("\x00", blockerHostBucketBytes), "abc", 1, "", 0)
 	})
 	assertPanics("v6 data length", func() {
-		newBlockerWithData(blockerTestPepper, "", 0, "", 0, "abc", 1)
+		newBlockerWithData(blockerTestPepper, "", 0, strings.Repeat("\x00", blockerHostBucketBytes), "", 0, "abc", 1)
 	})
+	assertPanics("short buckets", func() {
+		newBlockerWithData(blockerTestPepper, "", 0, "", "", 0, "", 0)
+	})
+	for _, badOffset := range []int{0, 128, 256} {
+		assertPanics(fmt.Sprintf("bad bucket offset %d", badOffset), func() {
+			buckets := make([]byte, blockerHostBucketBytes)
+			binary.BigEndian.PutUint32(buckets[badOffset*4:], 1)
+			newBlockerWithData(blockerTestPepper, "", 0, string(buckets), "", 0, "", 0)
+		})
+	}
+	assertPanics("decreasing buckets", func() {
+		buckets := make([]byte, blockerHostBucketBytes)
+		for i := 1; i <= 256; i++ {
+			binary.BigEndian.PutUint32(buckets[i*4:], 2)
+		}
+		binary.BigEndian.PutUint32(buckets[128*4:], 1)
+		newBlockerWithData(blockerTestPepper, strings.Repeat("\x00", 10), 2, string(buckets), "", 0, "", 0)
+	})
+	assertPanics("terminal count", func() {
+		newBlockerWithData(blockerTestPepper, strings.Repeat("\x00", 5), 1, strings.Repeat("\x00", blockerHostBucketBytes), "", 0, "", 0)
+	})
+}
+
+// Compare the lossless bucket encoding to the original full-fingerprint
+// search, including empty edge buckets and identical tails in other buckets.
+func TestBlockerBucketMembership(t *testing.T) {
+	for _, keys := range [][]uint64{
+		{}, {0}, {0xffffffffffff},
+		{0, 1, 0x00ffffffffff, 0x010000000000, 0x800000000001, 0xff0000000001, 0xffffffffffff},
+		{0x800000000001},
+	} {
+		buckets := make([]byte, blockerHostBucketBytes)
+		var full, tails []byte
+		for bucket := 0; bucket <= 256; bucket++ {
+			count := 0
+			for _, key := range keys {
+				if key>>40 < uint64(bucket) {
+					count++
+				}
+			}
+			binary.BigEndian.PutUint32(buckets[bucket*4:], uint32(count))
+		}
+		for _, key := range keys {
+			var encoded [8]byte
+			binary.BigEndian.PutUint64(encoded[:], key)
+			full = append(full, encoded[2:]...)
+			tails = append(tails, encoded[3:]...)
+		}
+		b := newBlockerWithData(blockerTestPepper, string(tails), len(keys), string(buckets), "", 0, "", 0)
+		check := func(key uint64) {
+			t.Helper()
+			want := searchHash(string(full), len(keys), blockerHostRecordLen, key)
+			if got := b.containsHostHash(key); got != want {
+				t.Fatalf("key %012x membership %t, want %t", key, got, want)
+			}
+		}
+		for _, key := range keys {
+			check(key)
+			if key > 0 {
+				check(key - 1)
+			}
+			if key < 0xffffffffffff {
+				check(key + 1)
+			}
+		}
+		for bucket := 0; bucket < 256; bucket++ {
+			for _, tail := range []uint64{0, 1, 0xffffffffff} {
+				check(uint64(bucket)<<40 | tail)
+			}
+		}
+	}
 }
 
 func TestBlockerZeroAlloc(t *testing.T) {
@@ -479,19 +560,26 @@ func TestBlockerGeneratedTables(t *testing.T) {
 	if len(blockerPepper) != blockerPepperLen {
 		t.Fatalf("pepper length %d, want %d", len(blockerPepper), blockerPepperLen)
 	}
-	if len(blockerBlockedHostData) != blockerBlockedHostCount*blockerHostRecordLen {
-		t.Fatalf("host data length %d, want %d", len(blockerBlockedHostData), blockerBlockedHostCount*blockerHostRecordLen)
+	if len(blockerBlockedHostData) != blockerBlockedHostCount*blockerHostTailLen {
+		t.Fatalf("host data length %d, want %d", len(blockerBlockedHostData), blockerBlockedHostCount*blockerHostTailLen)
 	}
-	for i := 1; i < blockerBlockedHostCount; i += 1 {
-		prev := beN(blockerBlockedHostData, (i-1)*blockerHostRecordLen, blockerHostRecordLen)
-		cur := beN(blockerBlockedHostData, i*blockerHostRecordLen, blockerHostRecordLen)
-		if prev >= cur {
-			t.Fatalf("host record %d: not strictly increasing", i)
+	b := NewBlockerWithDefaults().(*dataBlocker)
+	for bucket := 0; bucket < 256; bucket++ {
+		start := int(beN(blockerBlockedHostBuckets, bucket*4, 4))
+		end := int(beN(blockerBlockedHostBuckets, (bucket+1)*4, 4))
+		for i := start; i < end; i++ {
+			tail := beN(blockerBlockedHostData, i*blockerHostTailLen, blockerHostTailLen)
+			if i > start && beN(blockerBlockedHostData, (i-1)*blockerHostTailLen, blockerHostTailLen) >= tail {
+				t.Fatalf("bucket %d record %d: not strictly increasing", bucket, i)
+			}
+			if !b.containsHostHash(uint64(bucket)<<(8*blockerHostTailLen) | tail) {
+				t.Fatalf("bucket %d record %d: lookup failed", bucket, i)
+			}
 		}
 	}
 	// the embedded tables are what ship in the sdk binary; the generator
 	// enforces a size budget (blocker/main.go -max-bytes, default 1 MiB)
-	embedded := len(blockerPepper) + len(blockerBlockedHostData) +
+	embedded := len(blockerPepper) + len(blockerBlockedHostBuckets) + len(blockerBlockedHostData) +
 		len(blockerBlockedPrefixData) + len(blockerBlockedPrefix6Data)
 	if 1<<20 < embedded {
 		t.Fatalf("embedded blocker tables %d bytes exceed the 1 MiB size budget", embedded)
@@ -710,8 +798,8 @@ func TestBlockerHashVectors(t *testing.T) {
 	}
 	// and a blocker over the packed vector keys blocks every vector name via
 	// the real BlockHost path
-	hostData, hostCount := blockerTestHostTable(pepper, names)
-	b := newBlockerWithData(pepper, hostData, hostCount, "", 0, "", 0)
+	hostData, hostCount, hostBuckets := blockerTestHostTable(pepper, names)
+	b := newBlockerWithData(pepper, hostData, hostCount, hostBuckets, "", 0, "", 0)
 	b.SetEnabled(true)
 	for _, name := range names {
 		if !b.BlockHost(name) {

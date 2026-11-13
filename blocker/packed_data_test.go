@@ -28,12 +28,22 @@ func TestEmitPackedDataUsesSingleStringLiterals(t *testing.T) {
 				pepper[i] = byte(i)
 			}
 			keys := make([]uint64, count)
-			wantHosts := make([]byte, 0, count*hostRecordLen)
+			wantHosts := make([]byte, 0, count*hostTailLen)
 			for i := range keys {
 				keys[i] = uint64(i) * 0x010203
 				var record [8]byte
 				binary.BigEndian.PutUint64(record[:], keys[i])
-				wantHosts = append(wantHosts, record[8-hostRecordLen:]...)
+				wantHosts = append(wantHosts, record[8-hostTailLen:]...)
+			}
+			wantBuckets := make([]byte, hostBucketBytes)
+			for bucket := 0; bucket <= 256; bucket++ {
+				offset := 0
+				for _, key := range keys {
+					if key>>(8*hostTailLen) < uint64(bucket) {
+						offset++
+					}
+				}
+				binary.BigEndian.PutUint32(wantBuckets[bucket*4:], uint32(offset))
 			}
 			ranges := []iprange{{lo: 0x01020304, hi: 0xf1f2f3f4}}
 			ranges6 := []ip6range{{
@@ -51,6 +61,7 @@ func TestEmitPackedDataUsesSingleStringLiterals(t *testing.T) {
 			checkPackedStringConstants(t, source, map[string]string{
 				"blockerPepper":             string(pepper),
 				"blockerBlockedHostData":    string(wantHosts),
+				"blockerBlockedHostBuckets": string(wantBuckets),
 				"blockerBlockedPrefixData":  want4,
 				"blockerBlockedPrefix6Data": want6,
 			})
@@ -64,6 +75,43 @@ func TestCheckedInPackedDataUsesSingleStringLiterals(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkPackedStringConstants(t, source, nil)
+}
+
+func TestPackHostHashesRetainsEveryFingerprintBit(t *testing.T) {
+	var keys []uint64
+	// Leave alternating buckets empty and include equal tails in different
+	// buckets, plus both ends of the full 48-bit fingerprint range.
+	for bucket := 0; bucket < 256; bucket += 2 {
+		keys = append(keys, uint64(bucket)<<40, uint64(bucket)<<40|1, uint64(bucket)<<40|0xffffffffff)
+	}
+	keys = append(keys, 0xffffffffffff)
+	buckets, tails := packHostHashes(keys)
+	if len(buckets) != 257*4 || len(tails) != len(keys)*5 {
+		t.Fatal("unexpected packed lengths")
+	}
+	var restored []uint64
+	for bucket := 0; bucket < 256; bucket++ {
+		start := binary.BigEndian.Uint32(buckets[bucket*4:])
+		end := binary.BigEndian.Uint32(buckets[(bucket+1)*4:])
+		if end < start || int(end) > len(keys) {
+			t.Fatalf("invalid bucket %d offsets", bucket)
+		}
+		for index := start; index < end; index++ {
+			key := uint64(bucket)
+			for _, value := range tails[index*5 : (index+1)*5] {
+				key = key<<8 | uint64(value)
+			}
+			restored = append(restored, key)
+		}
+	}
+	if len(restored) != len(keys) {
+		t.Fatal("lost fingerprints")
+	}
+	for index, key := range keys {
+		if restored[index] != key {
+			t.Fatalf("fingerprint %d changed from %012x to %012x", index, key, restored[index])
+		}
+	}
 }
 
 func checkPackedStringConstants(t *testing.T, source []byte, want map[string]string) {

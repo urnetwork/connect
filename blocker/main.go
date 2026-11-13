@@ -78,6 +78,8 @@ const maxHostLen = 253
 // probe, and the pepper is regenerated every build so any collision is
 // transient rather than a permanently mis-blocked domain.
 const hostRecordLen = 6
+const hostTailLen = hostRecordLen - 1
+const hostBucketBytes = 257 * 4
 
 // poison guards for source cidrs, per security/main.go
 const minPrefixBits = 8
@@ -362,7 +364,7 @@ func main() {
 	// size budget. the packed tables are string constants: the compiler puts
 	// them in the binary's read-only data, so these bytes — not the ~4x larger
 	// .go source (each byte is a \xNN escape) — are what the sdk ships.
-	embedded := len(pepper) + len(keys)*hostRecordLen + len(final)*8 + len(final6)*32
+	embedded := len(pepper) + hostBucketBytes + len(keys)*hostTailLen + len(final)*8 + len(final6)*32
 	fmt.Fprintf(os.Stderr, "embedded tables: %d bytes (%.3f MiB) of %d budget (%.3f MiB)\n",
 		embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20))
 	if *maxBytes < embedded {
@@ -967,10 +969,11 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	c("")
 	c(fmt.Sprintf("Tier: %s. Regenerate with:  go generate ./blocker   (or: cd blocker && go run .)", tier))
 	c("")
-	c("Representation: blockerBlockedHostData is a read-only string constant of")
-	c(fmt.Sprintf("blockerBlockedHostCount records of %d bytes each — the first %d bytes, big", hostRecordLen, hostRecordLen))
-	c("endian, of SHA256(blockerPepper || name) — sorted ascending and unique,")
-	c("where name is the normalized (lower case, punycode) entry. an entry")
+	c(fmt.Sprintf("Representation: fingerprints retain the first %d bytes of SHA256(blockerPepper || name).", hostRecordLen))
+	c("blockerBlockedHostBuckets holds 257 big-endian uint32 record offsets;")
+	c(fmt.Sprintf("the first fingerprint byte selects a bucket of sorted %d-byte tails in", hostTailLen))
+	c("blockerBlockedHostData. This lossless encoding preserves all fingerprint bits.")
+	c("The name is the normalized (lower case, punycode) entry. An entry")
 	c("blocks the name and all its subdomains; the lookup walks label suffixes")
 	c("(see dataBlocker.BlockHost). the pepper is regenerated on every run,")
 	c("after the feeds are fetched: collision hardening and per-release")
@@ -1014,15 +1017,8 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	writeStringConst("blockerPepper", []byte(pepper))
 
 	fmt.Fprintf(&b, "const blockerBlockedHostCount = %d\n\n", len(keys))
-	// each key is written as its low hostRecordLen bytes, big endian — which
-	// are exactly the leading digest bytes hashHost consumed, so the sorted
-	// key order equals the packed records' lexicographic order
-	hostData := make([]byte, 0, len(keys)*hostRecordLen)
-	for _, key := range keys {
-		for i := hostRecordLen - 1; 0 <= i; i -= 1 {
-			hostData = append(hostData, byte(key>>(8*i)))
-		}
-	}
+	buckets, hostData := packHostHashes(keys)
+	writeStringConst("blockerBlockedHostBuckets", buckets)
 	writeStringConst("blockerBlockedHostData", hostData)
 
 	fmt.Fprintf(&b, "const blockerBlockedPrefixCount = %d\n\n", len(ranges))
@@ -1044,6 +1040,26 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	writeStringConst("blockerBlockedPrefix6Data", data6)
 
 	return []byte(b.String())
+}
+
+// keys are sorted unique 48-bit fingerprints. Bucket offsets remove the
+// repeated leading byte without discarding any fingerprint information.
+func packHostHashes(keys []uint64) ([]byte, []byte) {
+	buckets := make([]byte, 0, hostBucketBytes)
+	data := make([]byte, 0, len(keys)*hostTailLen)
+	position := 0
+	for bucket := 0; bucket <= 256; bucket++ {
+		for position < len(keys) && keys[position]>>(8*hostTailLen) < uint64(bucket) {
+			position++
+		}
+		buckets = binary.BigEndian.AppendUint32(buckets, uint32(position))
+	}
+	for _, key := range keys {
+		for i := hostTailLen - 1; i >= 0; i-- {
+			data = append(data, byte(key>>(8*i)))
+		}
+	}
+	return buckets, data
 }
 
 // outputFile is the generated data file. ip_blocker.go (the interface, the

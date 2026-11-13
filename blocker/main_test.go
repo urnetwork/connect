@@ -461,7 +461,7 @@ func TestGeneratedHeaderMatchesHostRecordWidth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHeader := fmt.Sprintf("blockerBlockedHostCount records of %d bytes each — the first %d bytes, big", hostRecordLen, hostRecordLen)
+	wantHeader := fmt.Sprintf("fingerprints retain the first %d bytes of SHA256", hostRecordLen)
 	for _, source := range []struct {
 		name string
 		text string
@@ -473,7 +473,7 @@ func TestGeneratedHeaderMatchesHostRecordWidth(t *testing.T) {
 			t.Errorf("%s has reviewed record-width header %d times, want 1", source.name, count)
 		}
 	}
-	const wantPayload = `const blockerBlockedHostData = "\x01\x02\x03\x04\x05\x06"`
+	const wantPayload = `const blockerBlockedHostData = "\x02\x03\x04\x05\x06"`
 	if !strings.Contains(emitted, wantPayload) {
 		t.Fatalf("fresh emission does not encode one exact %d-byte host record", hostRecordLen)
 	}

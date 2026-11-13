@@ -29,3 +29,15 @@ The source files and format are documented upstream:
 The upstream pipeline prunes old records before exporting. That mechanism is
 consistent with variable list volume; it does not prove the cause of this
 particular reduction. Future unexpected reductions require investigation.
+
+# Lossless fingerprint packing
+
+Growth in the other feeds brought the live aggregate to 183,430 unique host
+fingerprints, requiring 1,100,612 bytes with the previous six bytes per record.
+That exceeded the existing one MiB embedded-data limit. The current format
+stores the leading fingerprint byte as a bucket number: 257 four-byte offsets
+delimit the 256 buckets, and each record stores its remaining five bytes.
+This retains every fingerprint bit, all feeds and the original size limit.
+For that aggregate it uses 918,210 embedded bytes including the pepper.
+Lookup searches only within the selected bucket and allocates no heap memory
+on the ASCII path.

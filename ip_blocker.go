@@ -35,14 +35,19 @@ const blockerPepperLen = 32
 // blockerMaxHostLen is the maximum hostname length (rfc 1035)
 const blockerMaxHostLen = 253
 
-// blockerHostRecordLen is the byte length of one hostname hash record: the
+// blockerHostRecordLen is the byte length of one hostname fingerprint: the
 // leading bytes, big endian, of SHA256(pepper || hostname). it is a size /
-// collision tradeoff, and must match the generator's hostRecordLen: at 6 bytes
-// a 160k-entry table costs ~0.9 MiB of read-only data, and a random hostname
-// collides with an entry with p ≈ 160e3/2^48 ≈ 6e-10 per probe (a few probes
+// collision tradeoff, and must match the generator's hostRecordLen. At 6 bytes
+// a random hostname collides with an entry in a 160k-entry table with
+// p ≈ 160e3/2^48 ≈ 6e-10 per probe (a few probes
 // per lookup). the pepper is regenerated on every data set update, so even that
 // vanishing chance is transient rather than a permanently mis-blocked domain.
 const blockerHostRecordLen = 6
+
+// The leading hash byte selects a bucket; only the remaining five bytes are
+// stored per record. All 48 fingerprint bits still participate in matching.
+const blockerHostTailLen = blockerHostRecordLen - 1
+const blockerHostBucketBytes = 257 * 4
 
 // dataBlocker is the default `Blocker` over packed, read-only data tables
 // (the generated community data sets in ip_blocker_block.go). the hostname
@@ -54,8 +59,9 @@ type dataBlocker struct {
 
 	pepper string
 
-	hostData  string
-	hostCount int
+	hostData    string
+	hostCount   int
+	hostBuckets string
 
 	prefixData  string
 	prefixCount int
@@ -71,6 +77,7 @@ func NewBlockerWithDefaults() Blocker {
 	return newBlockerWithData(
 		blockerPepper,
 		blockerBlockedHostData, blockerBlockedHostCount,
+		blockerBlockedHostBuckets,
 		blockerBlockedPrefixData, blockerBlockedPrefixCount,
 		blockerBlockedPrefix6Data, blockerBlockedPrefix6Count,
 	)
@@ -79,14 +86,26 @@ func NewBlockerWithDefaults() Blocker {
 func newBlockerWithData(
 	pepper string,
 	hostData string, hostCount int,
+	hostBuckets string,
 	prefixData string, prefixCount int,
 	prefix6Data string, prefix6Count int,
 ) *dataBlocker {
 	if len(pepper) != blockerPepperLen {
 		panic("blocker pepper must be exactly blockerPepperLen bytes")
 	}
-	if len(hostData) != hostCount*blockerHostRecordLen {
+	if hostCount < 0 || len(hostData) != hostCount*blockerHostTailLen {
 		panic("blocker host data length does not match the record count")
+	}
+	if len(hostBuckets) != blockerHostBucketBytes {
+		panic("blocker host bucket index length is invalid")
+	}
+	previous := uint64(0)
+	for i := 0; i <= 256; i++ {
+		offset := beN(hostBuckets, i*4, 4)
+		if offset < previous || uint64(hostCount) < offset || (i == 0 && offset != 0) || (i == 256 && offset != uint64(hostCount)) {
+			panic("blocker host bucket offsets are invalid")
+		}
+		previous = offset
 	}
 	if len(prefixData) != prefixCount*8 {
 		panic("blocker ipv4 data length does not match the record count")
@@ -98,6 +117,7 @@ func newBlockerWithData(
 		pepper:       pepper,
 		hostData:     hostData,
 		hostCount:    hostCount,
+		hostBuckets:  hostBuckets,
 		prefixData:   prefixData,
 		prefixCount:  prefixCount,
 		prefix6Data:  prefix6Data,
@@ -213,7 +233,15 @@ func (self *dataBlocker) blockHash(hashBuf *[blockerPepperLen + blockerMaxHostLe
 	for i := 0; i < blockerHostRecordLen; i += 1 {
 		key = key<<8 | uint64(sum[i])
 	}
-	return searchHash(self.hostData, self.hostCount, blockerHostRecordLen, key)
+	return self.containsHostHash(key)
+}
+
+func (self *dataBlocker) containsHostHash(key uint64) bool {
+	bucket := int(key >> (8 * blockerHostTailLen))
+	start := int(beN(self.hostBuckets, bucket*4, 4))
+	end := int(beN(self.hostBuckets, (bucket+1)*4, 4))
+	tail := key & ((1 << (8 * blockerHostTailLen)) - 1)
+	return searchHash(self.hostData[start*blockerHostTailLen:end*blockerHostTailLen], end-start, blockerHostTailLen, tail)
 }
 
 // BlockIp reports whether the address falls in a blocked range. the tables
