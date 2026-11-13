@@ -10828,9 +10828,12 @@ paths:
         not matured reports 0: read `matured_days` (the cohort's age at
         `computed_at`) to tell "not yet" from "did not".
 
-        Volume floor: rows with fewer than `onboarding.results.min_exposures`
-        exposures (default 10) are suppressed, and no identifier of any kind
-        is returned. Ordered by the dimension tuple; keyset paged by
+        Volume floor: a variant whose rows total fewer than
+        `onboarding.results.min_exposures` exposures (default 10) over the
+        requested days and filters is suppressed whole, and no identifier of
+        any kind is returned. The floor holds on these totals, the sums the
+        readout compares, not on each row, and every page applies it to the
+        whole selection. Ordered by the dimension tuple; keyset paged by
         `cursor`.
 
         Auth: `Authorization: Bearer <token>` where the token is one of the
@@ -11143,8 +11146,9 @@ paths:
         fall anywhere in the day, a window of W days has closed for every
         episode of the day once `matured_days` is more than W.
 
-        Volume floor: rows with fewer than `onboarding.results.min_exposures`
-        exposures (default 10) are suppressed, as in
+        Volume floor: an experiment's variant whose rows total fewer than
+        `onboarding.results.min_exposures` exposures (default 10) over the
+        requested days and filters is suppressed whole, as in
         /admin/onboarding/results, and no identifier of any kind is
         returned. Ordered by the dimension tuple; keyset paged by `cursor`.
 
@@ -16735,7 +16739,7 @@ components:
           type: [string, "null"]
         min_exposures:
           type: integer
-          description: The volume floor applied to this page.
+          description: The volume floor applied to this page, to each variant's total exposures over the requested days and filters.
 
     ReengagementStream:
       type: string
@@ -16849,7 +16853,7 @@ components:
           type: [string, "null"]
         min_exposures:
           type: integer
-          description: The volume floor applied to this page.
+          description: The volume floor applied to this page, to each variant's total exposures over the requested days and filters.
 
     OnboardingExperiment:
       type: object
