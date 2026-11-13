@@ -12313,6 +12313,24 @@ components:
             Report a refusal that has a code (`signature_mismatch`) in the
             result `error` with a 200, instead of a 401. New clients set this.
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthLoginResult:
       type: object
@@ -12387,6 +12405,24 @@ components:
           type: string
         verify_otp_numeric:
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthLoginWithPasswordResult:
       type: object
@@ -12432,6 +12468,24 @@ components:
           type: string
         verify_code:
           type: string
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     AuthVerifyResult:
       type: object
@@ -12610,6 +12664,24 @@ components:
             result as the JSON body of its 401, instead of the plain text
             message. New clients set this.
           type: boolean
+        time_zone:
+          description: |
+            Optional. The device's or browser's IANA time zone (e.g.
+            America/Chicago). With `locales`, the campaign emails are placed in
+            the reader's day and written in their language; the server keeps
+            only the network's latest values, never with the request. A zone
+            of UTC is ignored.
+          type: string
+        locales:
+          description: |
+            Optional. The device's or browser's languages, most preferred
+            first, as BCP 47 tags (iOS and macOS `Locale.preferredLanguages`,
+            Android's `LocaleList`, a browser's `navigator.languages`). Leave
+            out a language the device cannot name rather than sending a
+            default such as "en". Same rules as `time_zone`.
+          type: array
+          items:
+            type: string
 
     NetworkCreateResult:
       type: object
@@ -12773,17 +12845,27 @@ components:
           type: string
         time_zone:
           description: |
-            Optional. The device's IANA time zone (e.g. America/Chicago), used
-            only to place the onboarding campaign's emails in the user's local
-            day (08:00-21:00 local); never stored on the client. Every app
-            sends it on each auth-client call; the latest wins.
+            Optional. The device's IANA time zone (e.g. America/Chicago). With
+            `locale` and `locales`, the campaign emails are placed in the
+            reader's day and written in their language; the server keeps only
+            the network's latest values, never on the client. Every app sends
+            it on each auth-client call; the latest wins. A zone of UTC is
+            ignored.
           type: string
         locale:
           description: |
-            Optional. The device's BCP 47 locale ("de-DE"). Selects the onboarding
-            campaign's template language, falling back to English. Same rules as
-            time_zone.
+            Optional. The device's BCP 47 locale ("de-DE"), the first of
+            `locales`. Same rules as time_zone.
           type: string
+        locales:
+          description: |
+            Optional. The device's languages, most preferred first, as BCP 47
+            tags; the campaign emails are written in the first one a template
+            serves. Leave out a language the device cannot name rather than
+            sending a default such as "en". Same rules as time_zone.
+          type: array
+          items:
+            type: string
         roles:
           description: Optional. |
             Identity roles assigned to the client at creation, immutable after. |
