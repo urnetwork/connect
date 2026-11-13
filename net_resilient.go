@@ -31,7 +31,7 @@ import (
 	// "encoding/hex"
 	// "syscall"
 
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"sync/atomic"
 	// "golang.org/x/crypto/cryptobyte"
 	// "golang.org/x/net/idna"
@@ -399,8 +399,8 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 							self.buffer = self.buffer[5+tlsHeader.contentLength:]
 							continue
 						}
-						split := meta.ServerNameValueStart + mathrand.Intn(splitRange)
-						step := 1 + mathrand.Intn(stepRange)
+						split := meta.ServerNameValueStart + mathrand.IntN(splitRange)
+						step := 1 + mathrand.IntN(stepRange)
 						blockSize := 64
 
 						if tcpConn, ok := self.conn.(*net.TCPConn); ok {
@@ -446,7 +446,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 
 								for i := split; i < meta.ServerNameValueEnd; i += step {
 									var ttl int
-									if 0 == mathrand.Intn(2) {
+									if 0 == mathrand.IntN(2) {
 										ttl = resilientLowTtl
 									} else {
 										ttl = nativeTtl

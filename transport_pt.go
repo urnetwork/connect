@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -13,7 +14,7 @@ import (
 	"time"
 	// "runtime/debug"
 
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/net/dns/dnsmessage"
@@ -324,9 +325,9 @@ func (self *packetTranslation) newHeader() [18]byte {
 	var header [18]byte
 	if 0 < len(self.headerPrefix) {
 		copy(header[0:len(self.headerPrefix)], self.headerPrefix)
-		mathrand.Read(header[len(self.headerPrefix):16])
+		cryptorand.Read(header[len(self.headerPrefix):16])
 	} else {
-		mathrand.Read(header[0:16])
+		cryptorand.Read(header[0:16])
 	}
 	return header
 }
@@ -363,7 +364,7 @@ func (self *packetTranslation) encodeDns() {
 		if maxJitterNanoseconds <= 0 {
 			return true
 		}
-		randTimeout := time.Duration(mathrand.Intn(maxJitterNanoseconds)) * time.Nanosecond
+		randTimeout := time.Duration(mathrand.IntN(maxJitterNanoseconds)) * time.Nanosecond
 		timerC := resetOrCreateTimer(&paceTimer, randTimeout)
 		select {
 		case <-timerC:
@@ -381,7 +382,7 @@ func (self *packetTranslation) encodeDns() {
 
 				// fmt.Printf("WRITE ONE\n")
 
-				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+				tld := self.settings.DnsTlds[mathrand.IntN(len(self.settings.DnsTlds))]
 
 				c := encodeDnsRequestCount(p.data, tld)
 
@@ -455,7 +456,7 @@ func (self *packetTranslation) encodeDns() {
 					if mostRecentAddr != nil {
 						startTime := time.Now()
 
-						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+						tld := self.settings.DnsTlds[mathrand.IntN(len(self.settings.DnsTlds))]
 
 						header := self.newHeader()
 
@@ -542,7 +543,7 @@ func (self *packetTranslation) encodeDns() {
 					// even when its paired header was consumed by an earlier write.
 					for len(pumpItems) < c {
 						header := self.newHeader()
-						tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+						tld := self.settings.DnsTlds[mathrand.IntN(len(self.settings.DnsTlds))]
 						item := &pumpItem{
 							id:     id,
 							header: header,

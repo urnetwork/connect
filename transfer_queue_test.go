@@ -1,7 +1,7 @@
 package connect
 
 import (
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"testing"
 )
 

@@ -14,7 +14,7 @@ package connect
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,7 +56,7 @@ type laneLossProcess struct {
 
 func newLaneLossProcess(seed int64, independent float64, burst *laneBurstLoss) *laneLossProcess {
 	return &laneLossProcess{
-		random:      rand.New(rand.NewSource(seed)),
+		random:      rand.New(rand.NewPCG(uint64(seed), 0)),
 		independent: independent,
 		burst:       burst,
 	}

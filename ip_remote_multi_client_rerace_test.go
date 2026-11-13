@@ -15,7 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -2868,7 +2868,8 @@ func TestDialFailureSignalsRaceSendsRetransmitsAndResizes(t *testing.T) {
 		go func() {
 			// duplicates and strays for live flows, from every exit
 			defer noise.Done()
-			random := rand.New(rand.NewSource(1))
+			// a fixed noise pattern, so a failure replays
+			random := rand.New(rand.NewPCG(1, 0))
 			names := []string{"a", "b", "c"}
 			for {
 				select {
@@ -2876,8 +2877,8 @@ func TestDialFailureSignalsRaceSendsRetransmitsAndResizes(t *testing.T) {
 					return
 				case <-time.After(5 * time.Millisecond):
 				}
-				path := paths[random.Intn(flowCount)]
-				exit := harness.exit(names[random.Intn(len(names))])
+				path := paths[random.IntN(flowCount)]
+				exit := harness.exit(names[random.IntN(len(names))])
 				for _, channel := range harness.multiClient.windows[WindowTypeQuality].unorderedClients() {
 					if channel.Destination() == exit.destination && !channel.IsDone() {
 						exit.sendTo(channel.ClientId(), reraceProviderSignal(t, path))

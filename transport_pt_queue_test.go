@@ -1,8 +1,9 @@
 package connect
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/binary"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	// "slices"
 	"fmt"
 	"net"
@@ -40,18 +41,18 @@ func TestCombine(t *testing.T) {
 			keyLens := map[[17]byte]int{}
 
 			for range 1024 {
-				m := 2 + mathrand.Intn(16)
+				m := 2 + mathrand.IntN(16)
 				splits := make([]int, m)
 				n := 0
 				for i := range m {
-					s := 16 + mathrand.Intn(128)
+					s := 16 + mathrand.IntN(128)
 					splits[i] = s
 					n += s
 				}
 				data := consecutive(n)
 
 				var header [18]byte
-				mathrand.Read(header[0:16])
+				cryptorand.Read(header[0:16])
 				header[16] = uint8(m)
 				keyLens[[17]byte(header[:])] = n
 
@@ -138,22 +139,22 @@ func TestCombineTrim(t *testing.T) {
 		batchCounts := make([]int, m)
 
 		for i := range m {
-			n := 128 + mathrand.Intn(1024)
+			n := 128 + mathrand.IntN(1024)
 			batchCounts[i] = n
 
 			for range n {
 				var header [18]byte
-				mathrand.Read(header[0:16])
-				c := 8 + mathrand.Intn(128)
+				cryptorand.Read(header[0:16])
+				c := 8 + mathrand.IntN(128)
 				header[16] = uint8(c)
-				header[17] = uint8(mathrand.Intn(c))
+				header[17] = uint8(mathrand.IntN(c))
 
 				addr := &net.UDPAddr{
 					IP:   testRandomIp(ipVersion),
-					Port: 8080 + mathrand.Intn(1024),
+					Port: 8080 + mathrand.IntN(1024),
 				}
-				data := make([]byte, 16+mathrand.Intn(1024))
-				mathrand.Read(data)
+				data := make([]byte, 16+mathrand.IntN(1024))
+				cryptorand.Read(data)
 				out, limit, err := cq.Combine(addr, header, data)
 				AssertEqual(t, err, nil)
 				AssertEqual(t, limit, false)
@@ -162,7 +163,7 @@ func TestCombineTrim(t *testing.T) {
 
 			batchTimes[i] = time.Now()
 			select {
-			case <-time.After(time.Duration(8+mathrand.Intn(32)) * time.Millisecond):
+			case <-time.After(time.Duration(8+mathrand.IntN(32)) * time.Millisecond):
 			}
 		}
 
@@ -181,17 +182,17 @@ func TestCombineTrim(t *testing.T) {
 		// pump beyond the limits
 		for i := range 4 * settings.DnsMaxCombine {
 			var header [18]byte
-			mathrand.Read(header[0:16])
-			c := 8 + mathrand.Intn(128)
+			cryptorand.Read(header[0:16])
+			c := 8 + mathrand.IntN(128)
 			header[16] = uint8(c)
-			header[17] = uint8(mathrand.Intn(c))
+			header[17] = uint8(mathrand.IntN(c))
 
 			addr := &net.UDPAddr{
 				IP:   testRandomIp(ipVersion),
-				Port: 8080 + mathrand.Intn(1024),
+				Port: 8080 + mathrand.IntN(1024),
 			}
-			data := make([]byte, 16+mathrand.Intn(1024))
-			mathrand.Read(data)
+			data := make([]byte, 16+mathrand.IntN(1024))
+			cryptorand.Read(data)
 			out, limit, err := cq.Combine(addr, header, data)
 			AssertEqual(t, err, nil)
 			AssertEqual(t, limit, settings.DnsMaxCombine <= i)
@@ -287,7 +288,7 @@ func TestPump(t *testing.T) {
 
 		for i := range settings.DnsMaxPumpHostsPerAddress {
 			var header [18]byte
-			mathrand.Read(header[0:16])
+			cryptorand.Read(header[0:16])
 			header[16] = uint8(1)
 			header[17] = uint8(0)
 			tld := []byte(fmt.Sprintf("foo%d.com", i))
@@ -313,7 +314,7 @@ func TestPump(t *testing.T) {
 
 		for i := range settings.DnsMaxPumpHostsPerAddress {
 			var header [18]byte
-			mathrand.Read(header[0:16])
+			cryptorand.Read(header[0:16])
 			header[16] = uint8(1)
 			header[17] = uint8(0)
 			tld := []byte(fmt.Sprintf("foo%d.com", i))
@@ -360,24 +361,24 @@ func TestPumpTrim(t *testing.T) {
 		batchCounts := make([]int, m)
 
 		for i := range m {
-			n := 128 + mathrand.Intn(1024)
+			n := 128 + mathrand.IntN(1024)
 			batchCounts[i] = n
 
 			for range n {
 				var header [18]byte
-				mathrand.Read(header[0:16])
-				c := 1 + mathrand.Intn(128)
+				cryptorand.Read(header[0:16])
+				c := 1 + mathrand.IntN(128)
 				header[16] = uint8(c)
-				header[17] = uint8(mathrand.Intn(c))
-				tld := []byte(fmt.Sprintf("foo%d.com", mathrand.Intn(1024)))
+				header[17] = uint8(mathrand.IntN(c))
+				tld := []byte(fmt.Sprintf("foo%d.com", mathrand.IntN(1024)))
 
 				addr := &net.UDPAddr{
 					IP:   testRandomIp(ipVersion),
-					Port: 8080 + mathrand.Intn(1024),
+					Port: 8080 + mathrand.IntN(1024),
 				}
 				item := &pumpItem{
 					addr:   addr,
-					id:     uint16(mathrand.Intn(32 * 1024 * 1024)),
+					id:     uint16(mathrand.IntN(32 * 1024 * 1024)),
 					header: header,
 					tld:    tld,
 				}
@@ -387,7 +388,7 @@ func TestPumpTrim(t *testing.T) {
 
 			batchTimes[i] = time.Now()
 			select {
-			case <-time.After(time.Duration(8+mathrand.Intn(32)) * time.Millisecond):
+			case <-time.After(time.Duration(8+mathrand.IntN(32)) * time.Millisecond):
 			}
 		}
 
@@ -406,18 +407,18 @@ func TestPumpTrim(t *testing.T) {
 		// pump beyond the limits
 		for i := range 4 * settings.DnsMaxPumpHosts {
 			var header [18]byte
-			mathrand.Read(header[0:16])
-			header[16] = uint8(1 + mathrand.Intn(128))
-			header[17] = uint8(mathrand.Intn(128))
-			tld := []byte(fmt.Sprintf("foo%d.com", mathrand.Intn(1024)))
+			cryptorand.Read(header[0:16])
+			header[16] = uint8(1 + mathrand.IntN(128))
+			header[17] = uint8(mathrand.IntN(128))
+			tld := []byte(fmt.Sprintf("foo%d.com", mathrand.IntN(1024)))
 
 			addr := &net.UDPAddr{
 				IP:   testRandomIp(ipVersion),
-				Port: 8080 + mathrand.Intn(1024),
+				Port: 8080 + mathrand.IntN(1024),
 			}
 			item := &pumpItem{
 				addr:   addr,
-				id:     uint16(mathrand.Intn(32 * 1024 * 1024)),
+				id:     uint16(mathrand.IntN(32 * 1024 * 1024)),
 				header: header,
 				tld:    tld,
 			}

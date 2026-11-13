@@ -14,7 +14,7 @@ import (
 	// "strings"
 	// "encoding/json"
 	// "reflect"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 )
 
 type Monitor struct {
@@ -503,14 +503,14 @@ func (self *Event) SetOnSignals(signalValues ...syscall.Signal) func() {
 
 // weightedRandomSource is the subset of a random generator used by the
 // weighted ordering routines. The public entry points use the concurrency-safe
-// math/rand package functions; tests can supply an isolated seeded generator.
+// math/rand/v2 package functions; tests can supply an isolated seeded generator.
 type weightedRandomSource interface {
 	Float32() float32
-	Intn(n int) int
+	IntN(n int) int
 	Shuffle(n int, swap func(i int, j int))
 }
 
-// weightedGlobalRandomSource adapts math/rand's package-level generator without
+// weightedGlobalRandomSource adapts the top-level math/rand/v2 generator without
 // changing the public routines' random-stream or concurrency semantics.
 type weightedGlobalRandomSource struct{}
 
@@ -518,8 +518,8 @@ func (weightedGlobalRandomSource) Float32() float32 {
 	return mathrand.Float32()
 }
 
-func (weightedGlobalRandomSource) Intn(n int) int {
-	return mathrand.Intn(n)
+func (weightedGlobalRandomSource) IntN(n int) int {
+	return mathrand.IntN(n)
 }
 
 func (weightedGlobalRandomSource) Shuffle(n int, swap func(i int, j int)) {
@@ -634,7 +634,7 @@ func weightedSelectFuncWithEntropy[T any, R weightedRandomSource](values []T, n 
 			r := random.Float32()
 			rnet := r * netRemaining
 			net := entropy * netRemaining
-			j := i + (random.Intn(len(values)-i) % (len(values) - i))
+			j := i + (random.IntN(len(values)-i) % (len(values) - i))
 			for c := 0; c < len(values)-i; c += 1 {
 				w := weight(values[j])
 				net += w
@@ -643,7 +643,7 @@ func weightedSelectFuncWithEntropy[T any, R weightedRandomSource](values []T, n 
 					return j
 				}
 				// shuffle iteration
-				j = i + (random.Intn(len(values)-i) % (len(values) - i))
+				j = i + (random.IntN(len(values)-i) % (len(values) - i))
 			}
 			// zero weights, use the last value
 			return j
@@ -663,7 +663,7 @@ func uniformJitter(maxJitter time.Duration, testDraw func(maxJitter time.Duratio
 	if testDraw != nil {
 		return max(0, min(maxJitter-1, testDraw(maxJitter)))
 	}
-	return time.Duration(mathrand.Int63n(int64(maxJitter)))
+	return time.Duration(mathrand.Int64N(int64(maxJitter)))
 }
 
 type Reconnect struct {
@@ -702,7 +702,7 @@ func (self *Reconnect) After() <-chan time.Time {
 		return c
 	} else {
 		if self.randomized {
-			timeout = time.Duration(mathrand.Int63n(int64(timeout)))
+			timeout = time.Duration(mathrand.Int64N(int64(timeout)))
 		}
 		return time.After(timeout)
 	}

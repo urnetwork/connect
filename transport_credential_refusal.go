@@ -34,7 +34,7 @@ package connect
 
 import (
 	"errors"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -85,7 +85,7 @@ func newCredentialRefusalHold() *credentialRefusalHold {
 			if maxJitter <= 0 {
 				return 0
 			}
-			return time.Duration(mathrand.Int63n(int64(maxJitter)))
+			return time.Duration(mathrand.Int64N(int64(maxJitter)))
 		},
 	}
 }

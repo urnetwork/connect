@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"regexp"
@@ -1346,7 +1346,7 @@ func extenderFeedConfig(
 		ServerName:  candidate.Ip.String(),
 	}
 	if 0 < len(spoofDomains) {
-		profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
+		profile.ServerName = spoofDomains[mathrand.IntN(len(spoofDomains))]
 	}
 	var dnsPorts []int
 	switch connectMode {
