@@ -7,9 +7,10 @@ package connect
 // judged against our OLD one, failed as a bad signature, and terminally
 // tombstoned a session the peer was still encrypting into — a permanent stall
 // (see repro-epochdesync). These cover the routing rules:
-//   - a proof for a NEWER generation converges (re-handshake), never tombstones
-//   - a proof for an OLDER generation is ignored, never tombstones
-//   - handshake bytes follow the same ordering rule
+//   - foreign proofs never adopt a generation, reset, or tombstone an epoch
+//   - only a ClientHello can select the responder's generation
+//   - ordering drops stragglers only while a TLS handshake remains in flight;
+//     an unauthenticated generation must never become a permanent lower bound
 //   - a legacy (unset) generation keeps the pre-epoch behavior
 //   - the responder adopts the initiator's generation and echoes it
 
@@ -35,21 +36,17 @@ func injectTestEpochWithId(sess *peerEncryptionSession, completed bool, handshak
 // olderId/newerId build ulid-ordered generations around a reference.
 func olderAndNewerIds(t *testing.T) (older Id, newer Id) {
 	t.Helper()
-	older = NewId()
-	// ulids are time-ordered; a later mint compares greater
-	time.Sleep(2 * time.Millisecond)
-	newer = NewId()
+	older = Id{15: 1}
+	newer = Id{15: 2}
 	if !older.LessThan(newer) {
 		t.Fatalf("expected ulid ordering: %s < %s", older, newer)
 	}
 	return older, newer
 }
 
-// TestIdentityProofForNewerEpochConverges: the peer re-handshaked, so its proof
-// names a newer generation. We must rebuild onto that generation — and must NOT
-// mark this epoch identity-failed (the old behavior, which stalled the session
-// permanently while the peer kept encrypting).
-func TestIdentityProofForNewerEpochConverges(t *testing.T) {
+// A foreign proof cannot prove which generation the peer is on; it must not
+// reset or tombstone the current handshake, even when its id sorts higher.
+func TestIdentityProofForNewerEpochIgnored(t *testing.T) {
 	older, newer := olderAndNewerIds(t)
 
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
@@ -58,8 +55,8 @@ func TestIdentityProofForNewerEpochConverges(t *testing.T) {
 
 	sess.receivePeerIdentityProofForEpoch(make([]byte, 64), newer)
 
-	if sess.currentEpoch() == e1 {
-		t.Fatal("expected a newer-generation proof to converge onto a fresh epoch")
+	if sess.currentEpoch() != e1 {
+		t.Fatal("a foreign-generation proof must not reset the current epoch")
 	}
 	sess.stateLock.Lock()
 	failed := e1.identityFailed
@@ -91,20 +88,246 @@ func TestIdentityProofForOlderEpochIgnored(t *testing.T) {
 	}
 }
 
-// TestHandshakeForOlderEpochDropped: straggling handshake bytes from a
-// superseded generation must not be fed to the live epoch's TLS state.
+// Straggling handshake bytes must not interrupt a live TLS handshake. Once
+// that attempt ends, its unauthenticated id cannot block a lower generation.
 func TestHandshakeForOlderEpochDropped(t *testing.T) {
 	older, newer := olderAndNewerIds(t)
 	clientHello := []byte{22, 3, 3, 0, 100, 1, 0, 0, 96}
 
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
 	defer cleanup()
-	e1 := injectTestEpochWithId(sess, true, nil, newer)
+	e1 := injectTestEpochWithId(sess, false, nil, newer)
 
 	sess.deliverHandshake(clientHello, older)
 
 	if sess.currentEpoch() != e1 {
 		t.Fatal("expected stale-generation handshake bytes to be dropped without reset")
+	}
+}
+
+// Both malformed and correctly sized foreign proofs leave the unnamed
+// responder available for the actual ClientHello, without waiting for timeout.
+func TestServerUnboundProofCannotChooseEpoch(t *testing.T) {
+	for _, size := range []int{1, 64} {
+		func() {
+			sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+			defer cleanup()
+			sess.settings.TlsTimeout = 0
+			var maxEpochId Id
+			for i := range maxEpochId {
+				maxEpochId[i] = 0xff
+			}
+			sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+				ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
+				EpochId:     maxEpochId.Bytes(), Payload: make([]byte, size),
+			})
+			e := sess.currentEpoch()
+			sess.stateLock.Lock()
+			poisoned := e != nil && (e.epochId != (Id{}) || e.identityFailed || len(e.pendingPeerIdentityProof) != 0)
+			sess.stateLock.Unlock()
+			if poisoned {
+				t.Fatalf("%d-byte foreign proof changed the unnamed responder", size)
+			}
+			legitEpochId := Id{15: 1}
+			sess.deliverHandshake([]byte{22, 3, 3, 0, 100, 1, 0, 0, 96}, legitEpochId)
+			if e = sess.currentEpoch(); e == nil || sess.epochIdOf(e) != legitEpochId || isClosed(e.handshakeDone) {
+				t.Fatalf("%d-byte foreign proof prevented the real ClientHello", size)
+			}
+		}()
+	}
+}
+
+// A bogus ClientHello can also carry a maximum id. Its failed TLS attempt
+// must release that ordering preference so the legitimate client can recover.
+func TestServerEpochIdPoisoningViaClientHello(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	sess.settings.TlsTimeout = 0
+	var maxEpochId Id
+	for i := range maxEpochId {
+		maxEpochId[i] = 0xff
+	}
+	clientHello := []byte{22, 3, 3, 0, 100, 1, 0, 0, 96}
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		EpochId:     maxEpochId.Bytes(), Payload: clientHello,
+	})
+	poisoned := sess.currentEpoch()
+	if poisoned == nil || sess.epochIdOf(poisoned) != maxEpochId {
+		t.Fatal("test did not install the attacker's handshake candidate")
+	}
+	sess.completeHandshake(poisoned, errors.New("synthetic handshake timeout"))
+	legitEpochId := Id{15: 1}
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		EpochId:     legitEpochId.Bytes(), Payload: clientHello,
+	})
+	if e := sess.currentEpoch(); e == poisoned || sess.epochIdOf(e) != legitEpochId || isClosed(e.handshakeDone) {
+		t.Fatal("failed unauthenticated ClientHello left a permanent epoch lower bound")
+	}
+}
+
+// With no timeout worker, even a live candidate cannot impose an ordering
+// preference indefinitely. A different ClientHello must be able to replace it.
+func TestServerEpochOrderingCannotPinWithoutTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		func() {
+			sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+			defer cleanup()
+			sess.settings.TlsTimeout = timeout
+			older, newer := olderAndNewerIds(t)
+			e := injectTestEpochWithId(sess, false, nil, newer)
+			defer e.cancel()
+			sess.deliverHandshake([]byte{22, 3, 3, 0, 100, 1, 0, 0, 96}, older)
+			if current := sess.currentEpoch(); current == e || sess.epochIdOf(current) != older || isClosed(current.handshakeDone) {
+				t.Fatalf("timeout %s left an unbounded epoch ordering preference", timeout)
+			}
+		}()
+	}
+}
+
+// Completion, identity failure, and cancellation all end the temporary
+// ordering preference. Even a verified TLS exporter does not sign epoch_id.
+func TestServerLowerEpochRecoversAfterAttemptEnds(t *testing.T) {
+	for _, state := range []string{"tls complete", "identity failed", "canceled", "established"} {
+		func() {
+			sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+			defer cleanup()
+			sess.settings.TlsTimeout = 0
+			older, newer := olderAndNewerIds(t)
+			e := injectTestEpochWithId(sess, state == "tls complete" || state == "established", nil, newer)
+			defer e.cancel()
+			sess.stateLock.Lock()
+			e.identityFailed = state == "identity failed"
+			if state == "established" {
+				e.peerIdentityVerified = true
+				e.derivedTlsCipher = &sequenceCipher{}
+				sess.establishedEpoch = e
+			}
+			sess.stateLock.Unlock()
+			if state == "canceled" {
+				e.cancel()
+			}
+			sess.deliverHandshake([]byte{22, 3, 3, 0, 100, 1, 0, 0, 96}, older)
+			if current := sess.currentEpoch(); current == e || sess.epochIdOf(current) != older || isClosed(current.handshakeDone) {
+				t.Fatalf("%s epoch blocked the lower ClientHello", state)
+			}
+			if state == "established" && sess.Cipher() != e.derivedTlsCipher {
+				t.Fatal("starting a lower generation discarded the established cipher")
+			}
+		}()
+	}
+}
+
+// A server can select a different generation only from a ClientHello, never
+// from a foreign second flight, alert, or arbitrary bytes.
+func TestServerForeignNonHelloCannotChooseEpoch(t *testing.T) {
+	for _, activeId := range []Id{{}, {15: 1}} {
+		for _, payload := range [][]byte{{23, 3, 3, 0, 1, 0}, {21, 3, 3, 0, 1, 0}, {0}} {
+			func() {
+				sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+				defer cleanup()
+				e := injectTestEpochWithId(sess, false, nil, activeId)
+				defer e.cancel()
+				e.transport = newSequenceTlsTransport(e.ctx)
+				sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+					ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+					EpochId:     Id{15: 2}.Bytes(), Payload: payload,
+				})
+				if sess.currentEpoch() != e || sess.epochIdOf(e) != activeId || e.ctx.Err() != nil {
+					t.Fatalf("foreign record %d changed server epoch %s", payload[0], activeId)
+				}
+				e.transport.inboxLock.Lock()
+				inboxBytes := len(e.transport.inboxBuf)
+				e.transport.inboxLock.Unlock()
+				if inboxBytes != 0 {
+					t.Fatal("foreign record reached the current TLS state")
+				}
+			}()
+		}
+	}
+}
+
+// The client owns its generation names. A claimed newer response cannot
+// replace a live client handshake; a matching response still reaches TLS.
+func TestClientForeignHandshakeCannotResetEpoch(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	older, newer := olderAndNewerIds(t)
+	e := injectTestEpochWithId(sess, false, nil, older)
+	defer e.cancel()
+	e.transport = newSequenceTlsTransport(e.ctx)
+	payload := []byte{22, 3, 3, 0, 1, 2}
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		EpochId:     newer.Bytes(), Payload: payload,
+	})
+	if sess.currentEpoch() != e || e.ctx.Err() != nil {
+		t.Fatal("foreign response reset the client's own generation")
+	}
+	e.transport.inboxLock.Lock()
+	inboxBytes := len(e.transport.inboxBuf)
+	e.transport.inboxLock.Unlock()
+	if inboxBytes != 0 {
+		t.Fatal("foreign response reached the client TLS state")
+	}
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		EpochId:     older.Bytes(), Payload: payload,
+	})
+	e.transport.inboxLock.Lock()
+	inboxBytes = len(e.transport.inboxBuf)
+	e.transport.inboxLock.Unlock()
+	if inboxBytes != len(payload) {
+		t.Fatal("matching response did not reach the client TLS state")
+	}
+}
+
+// Recovery must complete real TLS and identity verification, then deliver
+// required-mode application data through the ordinary transfer path.
+func TestServerEpochIdPoisoningRecoversEncryptedDelivery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a, b, aClientId, bClientId, _, receivesB := requiredGatePair(
+		ctx, EncryptionModeRequired, EncryptionModeRequired, nil, true,
+	)
+	defer func() {
+		cancel()
+		for _, client := range []*Client{a, b} {
+			if err := client.CloseAndWait(context.Background()); err != nil {
+				t.Errorf("client cleanup: %v", err)
+			}
+		}
+	}()
+	sess := b.encryptionSessionManager.Acquire(aClientId, sequenceTlsRoleServer, false)
+	defer sess.Release()
+	var maxEpochId Id
+	for i := range maxEpochId {
+		maxEpochId[i] = 0xff
+	}
+	b.encryptionSessionManager.DeliverEncryptedControl(aClientId, sequenceTlsRoleServer, &protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
+		SessionRole: sequenceTlsRoleClient.toProtobuf(),
+		EpochId:     maxEpochId.Bytes(), Payload: []byte{0},
+	})
+	sess.completeHandshake(sess.currentEpoch(), errors.New("synthetic handshake timeout"))
+	if !a.SendWithTimeout(requiredGateFrame(t, "recovered after epoch injection"), bClientId, func(error) {}, 20*time.Second) {
+		t.Fatal("required-mode send did not establish after epoch injection")
+	}
+	select {
+	case got := <-receivesB:
+		if got != "recovered after epoch injection" {
+			t.Fatalf("unexpected delivered data %q", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("encrypted delivery did not recover after epoch injection")
+	}
+	if sess.Cipher() == nil {
+		t.Fatal("delivery recovered without establishing the responder's cipher")
+	}
+	clientSession := a.encryptionSessionManager.Lookup(bClientId, sequenceTlsRoleClient, false)
+	if clientSession == nil || sess.epochIdOf(sess.currentEpoch()) != clientSession.epochIdOf(clientSession.currentEpoch()) {
+		t.Fatal("the recovered peers did not agree on the legitimate epoch")
 	}
 }
 
