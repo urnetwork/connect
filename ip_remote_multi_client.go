@@ -8578,12 +8578,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			default:
 				// a client whose contract requests are held races last, and a
 				// race that would still send to one is bounded like one during
-				// an outage (contractRateLimitHeldRaced). The normal windows'
-				// candidates come before the limited window's, so a bounded
-				// race spends its slots on them first (server FP2-PROTOCOL.md
-				// §7.5)
+				// an outage (contractRateLimitHeldRaced). Otherwise the field
+				// keeps its one weighted order across the windows
+				// (mergeRaceField), so a bounded race takes the top of that
+				// order from whichever window (server FP2-PROTOCOL.md §7.5)
 				raceTime := time.Now()
-				orderedClients = limitedClientsLast(contractRateLimitHeldLast(orderedClients, raceTime))
+				orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
@@ -17055,9 +17055,9 @@ type multiClientChannelArgs struct {
 	recentExit bool
 
 	// The window that admitted this exit, stamped by expand before the
-	// channel is built: the race orders the limited window's exits after
-	// the normal windows' (limitedClientsLast), and the process counters
-	// label the exit's flows by it.
+	// channel is built: the process counters label the exit's flows by it.
+	// The race orders the exit by its metrics, never by its window
+	// (mergeRaceField).
 	windowType WindowType
 
 	// How the discovery round that listed this candidate read the window's

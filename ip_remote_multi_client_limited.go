@@ -11,7 +11,8 @@ package connect
 // tcp providers: the providers whose udp failed, which the hard gate kept out
 // of every window before. Its clients join the race of every flow they can
 // carry (coalesceOrderedClients), so tcp traffic reaches them while udp never
-// does.
+// does, and the race orders them with the selected window's by the same
+// weighted metrics (mergeRaceField).
 //
 // The limited window is sized from the normal windows: its target is
 // max(1, floor(fraction x S)), S the largest target among the active normal
@@ -533,7 +534,10 @@ func destinationsCarryIpv6(destinations map[MultiHopId]DestinationStats) bool {
 // --- the race ---
 
 // The field a selected window offers a flow (FP2-PROTOCOL.md §7.5): its own
-// race candidates for the flow, followed by the limited window's. The caller
+// race candidates for the flow and the limited window's, merged into one
+// weighted order (mergeRaceField). Each window narrows to its own best rank
+// first (raceCandidates): one rank gate across both would drop the limited
+// window's exits, whose overflow ranks sit below the window's. The caller
 // runs every filter on the merged field, so the limited window's exits race
 // the window's on equal terms. They are tcp, so they never join a udp race;
 // and when the window offers nothing the flow can use, a tcp flow races them
@@ -547,55 +551,62 @@ func (self *RemoteUserNatMultiClient) raceField(
 ) []*multiClientChannel {
 	field := self.raceCandidates(window, need, offerChanged)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, self.raceCandidates(limitedWindow, need, limitedOfferChanged)...)
+		field = self.mergeRaceField(field, self.raceCandidates(limitedWindow, need, limitedOfferChanged))
 	}
 	return field
 }
 
 // raceField widened across tiers, for a flow whose service failed on the
-// window's best rank.
+// window's best rank: both windows' cross-tier offers, merged.
 func (self *RemoteUserNatMultiClient) crossTierRaceField(window *multiClientWindow, need flowNeed) []*multiClientChannel {
 	field := window.orderedClientsCrossTierForFlow(need)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, limitedWindow.orderedClientsCrossTierForFlow(need)...)
+		field = self.mergeRaceField(field, limitedWindow.orderedClientsCrossTierForFlow(need))
 	}
 	return field
 }
 
-// raceField's benched fallback, when the cross-tier field is empty.
+// raceField's benched fallback, when the cross-tier field is empty: both
+// windows' last-resort offers, merged.
 func (self *RemoteUserNatMultiClient) lastResortRaceField(window *multiClientWindow, need flowNeed) []*multiClientChannel {
 	field := window.lastResortClientsForFlow(need)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, limitedWindow.lastResortClientsForFlow(need)...)
+		field = self.mergeRaceField(field, limitedWindow.lastResortClientsForFlow(need))
 	}
 	return field
 }
 
-// The race field with the limited window's exits after the normal windows',
-// each part in its own order (FP2-PROTOCOL.md §7.5), so a race bounded under
-// a degraded backend spends its slots on the normal windows first. Returns
-// the field as it is when it holds no limited exit, else a reordered copy, so
-// the caller's list keeps its order.
-func limitedClientsLast(clients []*multiClientChannel) []*multiClientChannel {
-	limitedCount := 0
-	for _, client := range clients {
-		if client.windowType() == WindowTypeLimited {
-			limitedCount += 1
-		}
+// One race order over a window's field and the limited window's (owner,
+// 2026-11-13: "the windows need to merge in order based on the weighted
+// metrics"). The union is ordered as one window orders its offer
+// (orderedClients): a weighted shuffle by each exit's expected throughput
+// (raceWeight) at StatsWindowEntropy. A strong limited exit can lead the race
+// and a weak one follow, by its metrics alone, and a race bounded under a
+// degraded backend takes the top of this order from either window. An empty
+// part leaves the other in its own window's order, so a flow with no limited
+// exit to race keeps exactly the window's field.
+//
+// The weights are read without coalescing the event buckets, as
+// exitMetricsSnapshot reads them on this path; the windows' own passes
+// coalesce. A benched last-resort exit is weighed by the same metric.
+func (self *RemoteUserNatMultiClient) mergeRaceField(field []*multiClientChannel, limitedField []*multiClientChannel) []*multiClientChannel {
+	if len(limitedField) == 0 {
+		return field
 	}
-	if limitedCount == 0 || limitedCount == len(clients) {
-		return clients
+	if len(field) == 0 {
+		return limitedField
 	}
-	sorted := make([]*multiClientChannel, 0, len(clients))
-	limited := make([]*multiClientChannel, 0, limitedCount)
-	for _, client := range clients {
-		if client.windowType() == WindowTypeLimited {
-			limited = append(limited, client)
-		} else {
-			sorted = append(sorted, client)
-		}
+	merged := make([]*multiClientChannel, 0, len(field)+len(limitedField))
+	merged = append(merged, field...)
+	merged = append(merged, limitedField...)
+	weights := make(map[*multiClientChannel]float32, len(merged))
+	for _, client := range merged {
+		// an exit that ended since its pass still has its stats filled in
+		stats, _ := client.windowStatsWithCoalesce(false)
+		weights[client] = raceWeight(stats)
 	}
-	return append(sorted, limited...)
+	raceWeightedShuffle(self.settings, merged, weights)
+	return merged
 }
 
 // --- parent ---
