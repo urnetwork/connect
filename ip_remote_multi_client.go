@@ -1085,6 +1085,11 @@ type MultiClientSettings struct {
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
 	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
 	StatsWindowEntropy float32
+	// The random source of the race order's weighted shuffles: a window's
+	// offer (orderedClients) and the merged race field (mergeRaceField). nil,
+	// as every constructed settings value has it, draws from the package
+	// generator; a test pins the order with a scripted source.
+	raceOrderRandomForTest weightedRandomSource
 	// WindowExpandTimeout bounds candidate acquisition for one expansion pass.
 	// A candidate accepted inside this phase remains owned by the same pass
 	// through bounded client setup and its full PingTimeout. The pass retains
@@ -16646,7 +16651,7 @@ func (self *multiClientWindow) lastResortClientsForFlow(need flowNeed) []*multiC
 		for _, client := range clients {
 			if stats, err := client.WindowStats(); err == nil {
 				lruTimes[client] = stats.lastEventTime
-				weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+				weights[client] = raceWeight(stats)
 			}
 		}
 		sortClientsByRecentUse(clients, lruTimes, weights)
@@ -16790,7 +16795,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 			if !stats.lastEventTime.IsZero() {
 				lruTimes[client] = stats.lastEventTime
 			}
-			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+			weights[client] = raceWeight(stats)
 		}
 	}
 
@@ -16813,7 +16818,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 						if !stats.lastEventTime.IsZero() {
 							lruTimes[client] = stats.lastEventTime
 						}
-						weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+						weights[client] = raceWeight(stats)
 					}
 				}
 			}
@@ -16832,7 +16837,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 		clients = clients[:windowSize.FixedWindowSize]
 	}
 
-	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
+	raceWeightedShuffle(self.settings, clients, weights)
 
 	if crossTier {
 		return clients
@@ -16880,6 +16885,31 @@ func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
 		}
 	}
 	return kept
+}
+
+// The weight an exit takes in a race order: its expected throughput, plus 1
+// so an exit with no headroom left still draws. A window's offer
+// (orderedClients) and the merged race field (mergeRaceField) both order by
+// it.
+func raceWeight(stats *clientWindowStats) float32 {
+	return float32(1 + stats.ExpectedByteCountPerSecond())
+}
+
+// Weighted-shuffles a race order in place (WeightedShuffleWithEntropy) at the
+// settings' StatsWindowEntropy, from their test source when one is set. Nil
+// settings shuffle with no entropy.
+func raceWeightedShuffle(settings *MultiClientSettings, clients []*multiClientChannel, weights map[*multiClientChannel]float32) {
+	entropy := float32(0)
+	var random weightedRandomSource
+	if settings != nil {
+		entropy = settings.StatsWindowEntropy
+		random = settings.raceOrderRandomForTest
+	}
+	if random == nil {
+		WeightedShuffleWithEntropy(clients, weights, entropy)
+		return
+	}
+	weightedShuffleWithEntropy(clients, weights, entropy, random)
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
