@@ -26,17 +26,11 @@ import (
 
 // A scripted random source for the race order's weighted shuffles
 // (MultiClientSettings.raceOrderRandomForTest): no pre-shuffle, and every draw
-// at the middle of the remaining weight. It implements both spellings of the
-// integer draw, so it serves the source interface before and after its
-// math/rand/v2 rename.
+// at the middle of the remaining weight.
 type raceOrderTestRandom struct{}
 
 func (raceOrderTestRandom) Float32() float32 {
 	return 0.5
-}
-
-func (raceOrderTestRandom) Intn(n int) int {
-	return 0
 }
 
 func (raceOrderTestRandom) IntN(n int) int {
