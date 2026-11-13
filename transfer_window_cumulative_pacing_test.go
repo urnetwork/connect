@@ -25,6 +25,8 @@ func newWindowCumulativePacingFixture(t *testing.T) (*SendSequence, time.Time) {
 		settings.ResendQueueMinByteCount = 64 * 1024
 		settings.ResendQueueBudget = NewTransferMemoryBudget(16 * 1024 * 1024)
 		settings.TargetGoodputByteRate = 125000000
+		// pacing internals, measured without the latency bound
+		settings.WindowLatencyBudget = 0
 	})
 	sequence.sequenceId = NewId()
 	sequence.contractMultiRouteWriter = &windowPacingPolicyWriter{policy: transferFlightPolicySnapshot{h1Only: true}}

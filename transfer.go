@@ -955,6 +955,9 @@ func defaultSendBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteC
 		// Recover a small scoreboard of proven holes per ACK round. QUIC still
 		// paces these writes; the cap prevents a window-wide retry burst.
 		SelectiveAckGapBurstSize: 4,
+		// Queueing the delivery-sized window may add above the path round trip
+		// (transfer_window_latency.go). Zero disables the bound.
+		WindowLatencyBudget: 50 * time.Millisecond,
 		// Once a path RTT exists, cumulative ACK progress can pace up to two
 		// probes of the oldest remaining Pack before its queue-inflated/cold RTO.
 		AckTailProbeLimit: 2,
@@ -5667,8 +5670,8 @@ type SendBufferSettings struct {
 	// WindowLatencyBudget bounds the admitted window to twice what the
 	// destination delivers within its path round trip plus this budget, so a
 	// window grown on a queue-inflated round trip cannot stand as queue
-	// (transfer_window_latency.go). Zero, the default, disables the bound;
-	// 50ms held a provider's downloads near 250ms of queue.
+	// (transfer_window_latency.go). Zero disables the bound. The default,
+	// 50ms, held a provider's downloads near 250ms of queue.
 	WindowLatencyBudget time.Duration
 	// Bounds distinct missing Packs released from one selective-ACK snapshot.
 	// Zero disables gap recovery even when the threshold is configured.

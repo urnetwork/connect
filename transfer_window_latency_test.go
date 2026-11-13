@@ -2,6 +2,7 @@ package connect
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -154,8 +155,44 @@ func TestWindowLatencyBoundProbesAPathThatStaysBusy(t *testing.T) {
 	}
 }
 
-func TestWindowLatencyBoundOffByDefault(t *testing.T) {
-	if budget := DefaultSendBufferSettings().WindowLatencyBudget; budget != 0 {
-		t.Fatalf("default budget = %s, want off", budget)
+func TestWindowLatencyBoundOnByDefault(t *testing.T) {
+	if budget := DefaultSendBufferSettings().WindowLatencyBudget; budget != 50*time.Millisecond {
+		t.Fatalf("default budget = %s, want 50ms", budget)
+	}
+}
+
+// A bottleneck slower than the sender, with room to queue, is where the window
+// reads its own queue as path delay. The bound keeps that standing queue near
+// what the path delivers in a round trip plus the budget, at the same rate.
+func TestWindowPathLatencyBoundLimitsStandingQueue(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	var unbounded, bounded windowPathReading
+	for _, budget := range []time.Duration{0, 50 * time.Millisecond} {
+		synctest.Test(t, func(t *testing.T) {
+			cell := windowPathCell{Arm: "delivery", RoundTrip: 50 * time.Millisecond, Compression: 10 * time.Millisecond,
+				Flows: 8, Payload: 64 * 1024, Budget: mib(48), Rate: 1250000, Warmup: 5 * time.Second,
+				LatencyBudget: budget}
+			reading := measureWindowPathCell(t, cell, 10*time.Second)
+			logWindowServiceReading(t, reading)
+			if budget == 0 {
+				unbounded = reading
+			} else {
+				bounded = reading
+			}
+		})
+	}
+	t.Logf("window unbounded=%d (%s) bounded=%d (%s), peak relay queue unbounded=%d bounded=%d, rate unbounded=%.1f bounded=%.1f Mbps",
+		unbounded.Window.Window, unbounded.Window.Reason, bounded.Window.Window, bounded.Window.Reason,
+		unbounded.MaxRelayQueuedBytes, bounded.MaxRelayQueuedBytes, unbounded.Mbps, bounded.Mbps)
+	// twice the 1.25 MB/s delivered within the 50ms path plus the 50ms budget,
+	// with room for the compression residence and the measured round trip
+	if bounded.Window.Reason != "latency bound" || bounded.Window.Window > kib(512) {
+		t.Fatalf("the bound did not hold the window: %d (%s)", bounded.Window.Window, bounded.Window.Reason)
+	}
+	if unbounded.Window.Window <= 2*bounded.Window.Window {
+		t.Fatalf("the unbounded window was already small: unbounded=%d bounded=%d", unbounded.Window.Window, bounded.Window.Window)
+	}
+	if bounded.Mbps < .9*unbounded.Mbps {
+		t.Fatalf("the bound cost throughput: unbounded=%.1f bounded=%.1f Mbps", unbounded.Mbps, bounded.Mbps)
 	}
 }
