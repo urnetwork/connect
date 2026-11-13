@@ -249,9 +249,9 @@ func TestApiGeneratorReadsAnUnechoedAnswerAsLegacy(t *testing.T) {
 // A running multi client's windows ask in selector mode (§7.4): quality with
 // dualstack and dualproto, its target 6 and ipv6 minimum 1; speed with its
 // target 1 and no ipv6 minimum; and the limited window with ipv4 and tcp,
-// target 3 (half of quality's 6), no ipv6 need, v4-capable, and the
-// profile's rank mode: quality in auto, speed under a fixed Speed profile,
-// where its target is half the profile's size. Under post-quantum every
+// target 6 (the same size as quality's 6, D8), no ipv6 need, v4-capable,
+// and the profile's rank mode: quality in auto, speed under a fixed Speed
+// profile, where its target is the profile's size. Under post-quantum every
 // request, the limited window's included, asks for modern providers.
 func TestMultiClientWindowsAskInSelectorMode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -301,10 +301,10 @@ func TestMultiClientWindowsAskInSelectorMode(t *testing.T) {
 	want := FindProvidersSelect{
 		Ip:          ProviderIpCapabilityIpv4,
 		Protocol:    ProviderProtocolCapabilityTcp,
-		TargetCount: 3,
+		TargetCount: 6,
 	}
 	if *limitedArgs.Select != want || limitedArgs.RankMode != "quality" || limitedArgs.IpFamily != IpFamilyFilterV4Capable {
-		t.Errorf("limited request %s, want ipv4/tcp target 3 in quality, v4-capable", limitedBody)
+		t.Errorf("limited request %s, want ipv4/tcp target 6 in quality, v4-capable", limitedBody)
 	}
 	for _, body := range stub.recordedRequests() {
 		if capabilityTestRequestSelect(t, body) == nil {
@@ -312,18 +312,18 @@ func TestMultiClientWindowsAskInSelectorMode(t *testing.T) {
 		}
 		assertCapabilityBlindDiscoveryRequest(t, body, "a window request without post-quantum")
 	}
-	if multi.LimitedWindowTargetSize() != 3 {
-		t.Errorf("limited target %d, want 3", multi.LimitedWindowTargetSize())
+	if multi.LimitedWindowTargetSize() != 6 {
+		t.Errorf("limited target %d, want 6", multi.LimitedWindowTargetSize())
 	}
 
-	// a fixed Speed profile of 4: the limited window asks speed for 2
+	// a fixed Speed profile of 4: the limited window asks speed for 4
 	fixedSpeed := &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: WindowSizeSettings{WindowSizeMin: 4, WindowSizeMax: 4}}
 	if err := multi.SetPerformanceProfile(fixedSpeed); err != nil {
 		t.Fatal(err)
 	}
 	stub.awaitRequest(t, ctx, "the limited window under a fixed speed profile", func(body string, providerSelect *FindProvidersSelect) bool {
 		return providerSelect != nil && providerSelect.Protocol == ProviderProtocolCapabilityTcp &&
-			rankMode(body) == "speed" && providerSelect.TargetCount == 2
+			rankMode(body) == "speed" && providerSelect.TargetCount == 4
 	})
 
 	// post-quantum: every request asks for modern providers, the limited

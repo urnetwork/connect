@@ -309,10 +309,11 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		// half the largest normal window, at least one (server
-		// FP2-PROTOCOL.md D8): 3 limited clients beside a desktop quality
-		// window of 6
-		LimitedWindowSizeFraction: 0.5,
+		// the same size as the largest normal window (server
+		// FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window
+		// to be the same size as the normal window"): 6 limited clients
+		// beside a desktop quality window of 6
+		LimitedWindowSizeFraction: 1.0,
 		LimitedWindowSizeMax:      0,
 		SendRetryTimeout:          2000 * time.Millisecond,
 		// Fallback rescan for time-expiring filters; a newly published offer
@@ -692,10 +693,11 @@ type MultiClientSettings struct {
 	// Sizes the limited window (server FP2-PROTOCOL.md §7.4, D8): its target
 	// is max(1, floor(fraction x S)), S the largest current target among the
 	// active normal windows, and its hard max is max(1, floor(fraction x the
-	// largest active normal hard max)), unbounded when that is. Default 0.5.
-	// Non-positive or NaN: no limited window. A fixed destination and the
-	// user's Fixed IP never have one. RemoteUserNatMultiClient
-	// .SetLimitedWindowSizeFraction overrides it at runtime.
+	// largest active normal hard max)), unbounded when that is. Default 1:
+	// the same size as the normal window. Non-positive or NaN: no limited
+	// window. A fixed destination and the user's Fixed IP never have one.
+	// RemoteUserNatMultiClient.SetLimitedWindowSizeFraction overrides it at
+	// runtime.
 	LimitedWindowSizeFraction float64
 	// Caps the limited window's target and hard max (D11.5: a mobile device
 	// whose memory gate fails holds one limited client). Non-positive: no cap

@@ -18,7 +18,8 @@ package connect
 // max(1, floor(fraction x S)), S the largest target among the active normal
 // windows as their last resize passes computed it before the standing reserve,
 // and its hard max follows the largest active normal hard max the same way.
-// Its rank mode is the performance profile's, quality in auto (D10). It does
+// The default fraction is 1, the same size as the normal window (D8). Its
+// rank mode is the performance profile's, quality in auto (D10). It does
 // not fill without a capability-aware generator, while the server is known
 // not to echo `select`, under the user's Fixed IP (a second selectable exit
 // would change the egress ip) or with a non-positive fraction; and a fixed
