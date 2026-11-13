@@ -11229,6 +11229,14 @@ paths:
         once: posting the same bytes again answers the stored generation and
         writes nothing, and any other bytes for a bound client are refused.
 
+        Both answer `by_client_jwt`: the bearer re-minted with the binding's
+        sidecar as its `sidecar_id` claim, every other claim as presented,
+        its lifetime included, since bind takes no proof of the client's key.
+        The sidecar keeps it in place of the token it presented, and sockets
+        reads the caller's sidecar from that claim with no database read. A
+        refresh keeps the claim as presented and never adds it, so a token
+        without one stays without one until a bind re-mints it.
+
         A refusal answers `{"error", "code"}`: 400 `binding_invalid` (a bad
         signature, a malformed body, or another client or network than the
         token's), 403 `sidecar_revoked`, 409 `generation_conflict` and 409
@@ -28487,11 +28495,18 @@ components:
       type: object
       required:
         - generation
+        - by_client_jwt
       properties:
         generation:
           description: The generation the server recorded for the client.
           type: integer
           format: int64
+        by_client_jwt:
+          description: |
+            The bearer re-minted with the binding's sidecar as its `sidecar_id`
+            claim, every other claim and the lifetime as presented. The client
+            uses it from then on in place of the token it presented.
+          type: string
 
     SidecarPushTokenArgs:
       type: object
