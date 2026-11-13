@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -366,7 +366,7 @@ func (self *ApiOutOfBandControl) SendControlWithRetry(
 			if self.retryJitterForTest != nil {
 				return half + max(0, min(half-1, self.retryJitterForTest(half)))
 			}
-			return half + time.Duration(mathrand.Int63n(int64(half)))
+			return half + time.Duration(mathrand.Int64N(int64(half)))
 		}
 
 		var attempt func()

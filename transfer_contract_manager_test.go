@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	// mathrand "math/rand"
+	// mathrand "math/rand/v2"
 
 	// "google.golang.org/protobuf/proto"
 

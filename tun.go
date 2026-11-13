@@ -17,6 +17,7 @@ package connect
 import (
 	// "bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,7 +26,7 @@ import (
 	"os"
 	"runtime"
 	// "regexp"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -470,7 +471,7 @@ func ReturnLocalIpv6Address(addr netip.Addr) {
 func RandomLocalIpv6() netip.Addr {
 	addr := LocalIpv6Prefix.Masked().Addr().As16()
 	for {
-		mathrand.Read(addr[8:])
+		cryptorand.Read(addr[8:])
 		candidate := netip.AddrFrom16(addr)
 		// keep clear of the subnet anycast address and the tun pool
 		if candidate != LocalIpv6Prefix.Masked().Addr() && !localIpv6AllocatorPrefix.Contains(candidate) {
@@ -536,7 +537,7 @@ func LocalIpv4Networks() []netip.Prefix {
 // /24 lands on common subnets such as 10.0.0.0/24 that blend in. If every /24 is
 // excluded (e.g. the device holds all of 10/8), it falls back to 10.0.0.h.
 func RandomLocalIpv4(avoid []netip.Prefix) netip.Addr {
-	h := byte(2 + mathrand.Intn(253)) // 2..254, never .0/.1/.255
+	h := byte(2 + mathrand.IntN(253)) // 2..254, never .0/.1/.255
 	for a := 0; a < 256; a++ {
 		for b := 0; b < 256; b++ {
 			subnet := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(a), byte(b), 0}), 24)

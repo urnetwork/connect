@@ -21,7 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -270,7 +270,7 @@ func extenderGossipConfig(
 		Port:        port,
 	}
 	if 0 < len(spoofDomains) {
-		profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
+		profile.ServerName = spoofDomains[mathrand.IntN(len(spoofDomains))]
 	}
 	return &connect.ExtenderConfig{
 		Profile:   profile,

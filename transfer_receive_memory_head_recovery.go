@@ -424,15 +424,14 @@ func (self *ReceiveBuffer) takeReceiveFreshOpeningOwnerInSession(scan receiveMem
 	head := receiveSequenceHeadKey{Source: id.Source, EncryptionRole: role, EncryptionCompanion: companion,
 		ForceStream: scan.forceStream, CompanionContract: scan.companionContract, LogicalLane: scan.logicalLane}
 	// Keep closed, rejected and already-published generations outside this
-	// new physical path. A newer opening may still reach the existing normal
+	// new physical path. A different opening may still reach the existing normal
 	// supersession path, which cancels/refunds before its exact retry binds.
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	if self.closed || self.ctx.Err() != nil || self.receiveSequences[id] != nil {
 		return nil
 	}
-	if rejected, ok := self.rejectedReceiveSequenceIds[head]; ok &&
-		(scan.sequenceId == rejected || scan.sequenceId.LessThan(rejected)) {
+	if rejected, ok := self.rejectedReceiveSequenceIds[head]; ok && scan.sequenceId == rejected {
 		return nil
 	}
 	if current, ok := self.headReceiveSequenceIds[head]; ok && scan.sequenceId.LessThan(current.SequenceId) {

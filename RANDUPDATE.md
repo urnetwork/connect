@@ -1,6 +1,6 @@
 # Random numbers: move to math/rand/v2 and secure generators
 
-Status: proposal, 2026-11-13. Nothing here is implemented yet. Section 6 is the CODESTYLE rule this proposal produces.
+Status: implemented, 2026-11-13 (owner: "go ahead and implement"). Section 6 is now the "Randomness" section of CODESTYLE.md. Section 7 records where the implementation differs from this proposal.
 
 ## 1. The question
 
@@ -178,3 +178,31 @@ There is no wire or protocol change, and the distributions are the same. The fix
 > - Deterministic generators (`rand.NewPCG`, a fixed-seed `rand.NewChaCha8`) belong only in tests, benchmarks and simulations, with a comment saying why.
 > - Randomness that shapes traffic is security relevant, however small: padding, timing jitter, path, exit, strategy and server choice, probe and sample selection.
 > - `random_rule_test.go` enforces this.
+
+## 7. As built, 2026-11-13
+
+- **Helper:** `connect.NewSecureRand()` in `random.go`, as proposed.
+- **C1** draws the retain coin from the store's own `NewSecureRand` generator, under `stateLock` as before.
+- **C2:** `NodeSettings.Rand`, an injected `*rand.Rand`, replaces `NodeSettings.RandSeed`.
+  - Nil uses `NewSecureRand`. Tests inject a v2 PCG.
+  - Building the test generator from `RandSeed` inside `gossip/node.go` would have put a seeded generator in production code, which section 4.1 and the guard rule out.
+- **C3:** `cryptoSeededRand` is gone. It also chose the DTLS ClientHello fingerprint (`transport_p2p_webrtc_dtls.go`), which now uses `NewSecureRand` too.
+- **S1, S3, S4** use `connect.NewSecureRand()`. **S2** does too: `servePool` builds one per request when no generator is injected.
+- **S5** draws its reservoir from the top-level `rand.Int64N`, one draw per sample, with no generator of its own.
+- **`rand.Read`:** the pt header, `RandomLocalIpv6` and the server's speed-test chunks now read `crypto/rand`.
+- **The simulations keep the Go 1 source.**
+  - `connect/sim-latency` and the competition's `providers.yml` generator (`controller/competition_sim_latency_controller.go`) must reproduce recorded runs and the frozen simulator byte for byte. `TestGenerateSimLatencyWorkloadMatchesFrozenSimulator` pins the generator's SHA-256.
+  - v2 has no Go 1 source, so these files keep their `math/rand` imports. The guard's allowlist exempts them from all three checks, as it does `third_party/`.
+- **Guard:** besides the three checks of 4.3, it counts a `rand.PCG` or `rand.ChaCha8` value as its constructor, because the zero value is a fixed seed. It also flags a dot import of either package, and it fails on an allowlist entry that names nothing.
+- **Allowlists:**
+
+  | Repo | Allowlist |
+  |---|---|
+  | connect | none |
+  | server | `third_party/`, `connect/sim-latency/`, `controller/competition_sim_latency_controller.go` |
+  | sdk | `js/gen_lag.go` |
+  | sn | `third_party/` |
+  | proxy | none |
+
+  `runner/perf` is in the tests repository, which this change does not cover.
+- **Tests** moved to v2 as well: a test that seeded a Go 1 source now seeds a v2 PCG with the same seed.

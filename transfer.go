@@ -16,7 +16,7 @@ import (
 	// "runtime/debug"
 	// "runtime"
 	// "reflect"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"slices"
 	"strings"
 
@@ -4605,7 +4605,7 @@ func (self *Client) run() {
 			HandleError(func() {
 				for {
 					// uniform timeout with mean `ControlPingTimeout`
-					timeout := time.Duration(mathrand.Int63n(int64(2 * self.settings.ControlPingTimeout)))
+					timeout := time.Duration(mathrand.Int64N(int64(2 * self.settings.ControlPingTimeout)))
 					select {
 					case <-self.ctx.Done():
 						return
@@ -15928,8 +15928,9 @@ type ReceiveBuffer struct {
 	receiveSequences       map[receiveSequenceId]*ReceiveSequence
 	headReceiveSequenceIds map[receiveSequenceHeadKey]receiveSequenceId
 	// rejectedReceiveSequenceIds stores the newest permanently rejected
-	// sequence per source/session key. The FIFO bounds memory across a
-	// process-long succession of hostile or stale peers.
+	// sequence per source/session key. Rejection applies to that exact id;
+	// failed authentication cannot impose an ordering floor on other ids.
+	// The FIFO bounds memory across hostile or stale peers.
 	rejectedReceiveSequenceIds   map[receiveSequenceHeadKey]Id
 	rejectedReceiveSequenceOrder []receiveSequenceHeadKey
 	// activeReceiveSequences retains workers through their final Pack-channel
@@ -16039,10 +16040,9 @@ func (self *ReceiveBuffer) rejectReceiveSequenceWithLock(
 		append(self.rejectedReceiveSequenceOrder, headKey)
 }
 
-// rejectReceiveSequenceRetransmitWithLock reports whether an incoming sequence
-// is the rejected id (or an older one it superseded). A genuinely newer
-// sequence clears the tombstone and can present a fresh contract. Caller holds
-// mutex.
+// Rejects only repeats of the failed generation. Its unauthenticated id cannot
+// prevent another generation, even a lower one, from presenting a valid
+// contract. Caller holds mutex.
 func (self *ReceiveBuffer) rejectReceiveSequenceRetransmitWithLock(
 	headKey receiveSequenceHeadKey,
 	sequenceId Id,
@@ -16051,8 +16051,7 @@ func (self *ReceiveBuffer) rejectReceiveSequenceRetransmitWithLock(
 	if !ok {
 		return false
 	}
-	if sequenceId == rejectedSequenceId ||
-		sequenceId.LessThan(rejectedSequenceId) {
+	if sequenceId == rejectedSequenceId {
 		return true
 	}
 	self.removeRejectedReceiveSequenceWithLock(headKey)

@@ -6253,7 +6253,8 @@ paths:
       tags: [Account]
       summary: Account Set Payout Wallet
       description: |
-        Set an existing account wallet as the wallet to receive network payments.
+        USDC provider payouts have ended. This endpoint remains for existing
+        apps and refuses every payout wallet selection with 400.
       operationId: accountSetPayoutWallet
       security:
         - BearerAuth: []
@@ -6265,13 +6266,15 @@ paths:
               $ref: "#/components/schemas/SetPayoutWalletArgs"
       responses:
         "200":
-          description: OK.
+          description: Legacy success response. Current servers refuse selections with 400.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetPayoutWalletResult"
         "400":
-          description: The wallet is a Bittensor wallet, or not an active wallet of the network. Plain text body.
+          description: |
+            USDC payouts have ended, so a payout wallet is no longer used.
+            Every selection is refused. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
     get:
@@ -6333,8 +6336,8 @@ paths:
       tags: [Account]
       summary: Account Create Wallet
       description: |
-        Create a new wallet for your network. You can then use it as a payout wallet
-        by posting to /account/payout-wallet.
+        Create a new wallet for your network. Adding a wallet does not select
+        it for payouts; USDC provider payouts have ended.
       operationId: accountCreateWallet
       security:
         - BearerAuth: []
@@ -6354,7 +6357,8 @@ paths:
         "400":
           description: |
             An unsupported blockchain, an invalid wallet address or default
-            token type, or a wallet the payout cannot go to. Plain text body.
+            token type, or an address already recorded on another blockchain
+            for this network. Plain text body.
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
@@ -6383,10 +6387,8 @@ paths:
       summary: Account Remove Wallet
       description: |
         Remove a wallet from your list of account wallets. Removing the
-        payout wallet makes another active Solana or Polygon wallet of the
-        network the payout wallet, when there is one, and names it in
-        `payout_wallet_id`; otherwise USDC payouts are held until a payout
-        wallet is set.
+        selected payout wallet clears that selection without promoting
+        another wallet. USDC provider payouts have ended.
       operationId: accountRemoveWallet
       security:
         - BearerAuth: []
@@ -18312,16 +18314,6 @@ components:
         success:
           description: Wallet successfully removed
           type: boolean
-        payout_wallet_id:
-          description: |
-            udid. Set when the removed wallet was the network's payout wallet
-            and another of the network's active Solana or Polygon wallets
-            became the payout wallet in the same transaction (the newest,
-            preferring the removed wallet's chain; never a Bittensor wallet).
-            Absent when nothing was promoted, which leaves the network with no
-            payout wallet, and from older servers. Apps show where payouts go
-            now.
-          type: string
         error:
           type: object
           required:
@@ -19528,6 +19520,24 @@ components:
         explanation:
           description: what the number means and what raises it, in English
           type: string
+        reason:
+          description: |
+            English capability downgrade reason for `url_checks`, one sentence
+            per dropped capability with TCP first. `explanation` ends with the
+            same text. Omitted when there is no such downgrade.
+          type: string
+        reason_tcp_count:
+          description: |
+            Positive count used by the TCP-only sentence in `reason`, for
+            localization. Omitted when that sentence is absent.
+          type: integer
+          minimum: 1
+        reason_ipv4_count:
+          description: |
+            Positive count used by the IPv4-only sentence in `reason`, for
+            localization. Omitted when that sentence is absent.
+          type: integer
+          minimum: 1
 
     ProviderStatusCountry:
       type: object
@@ -19625,9 +19635,10 @@ components:
 
     ProviderRankingNumberCompact:
       description: |
-        A `ProviderRankingNumber` without its explanation. `value`, `minimum`
-        and `maximum` are present only when the number has one (`has_value`,
-        `has_minimum` and `has_maximum` in the full form). `count` and `total`
+        A `ProviderRankingNumber` without its English explanation or reason.
+        `value`, `minimum` and `maximum` are present only when the number has
+        one (`has_value`, `has_minimum` and `has_maximum` in the full form).
+        `count` and `total`
         are present only for a counted number with a value (`url_checks`).
       type: object
       required:
@@ -19655,6 +19666,16 @@ components:
           type: integer
         total:
           type: integer
+        reason_tcp_count:
+          description: |
+            As `ProviderRankingNumber.reason_tcp_count`, without the English reason.
+          type: integer
+          minimum: 1
+        reason_ipv4_count:
+          description: |
+            As `ProviderRankingNumber.reason_ipv4_count`, without the English reason.
+          type: integer
+          minimum: 1
 
     ProviderStatusCountryCompact:
       description: A `ProviderStatusCountry` without its explanation.

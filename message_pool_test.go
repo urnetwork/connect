@@ -2,10 +2,11 @@ package connect
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"os"
 	"sync"
 	"testing"
@@ -44,7 +45,7 @@ func TestMessagePool(t *testing.T) {
 		}
 		for range 128 {
 			message := make([]byte, n)
-			mathrand.Read(message)
+			cryptorand.Read(message)
 
 			messageCopy := MessagePoolCopy(message)
 			AssertEqual(t, len(messageCopy), n)
@@ -57,8 +58,8 @@ func TestMessagePool(t *testing.T) {
 		if n%32 == 0 {
 			fmt.Printf("memr[%d]\n", n)
 		}
-		b := make([]byte, mathrand.Intn(32*1024))
-		mathrand.Read(b)
+		b := make([]byte, mathrand.IntN(32*1024))
+		cryptorand.Read(b)
 		bCopy, err := MessagePoolReadAll(bytes.NewReader(b))
 		AssertEqual(t, err, nil)
 		AssertEqual(t, b, bCopy)
@@ -80,12 +81,12 @@ func TestMessagePoolShare(t *testing.T) {
 	holdMessages := make([][][]byte, holdCount)
 
 	for range 1024 {
-		message := MessagePoolGet(mathrand.Intn(4096))
+		message := MessagePoolGet(mathrand.IntN(4096))
 		pooled, shared := MessagePoolCheck(message)
 		AssertEqual(t, pooled, true)
 		AssertEqual(t, shared, false)
 		holdMessages[0] = append(holdMessages[0], message)
-		k := mathrand.Intn(holdCount)
+		k := mathrand.IntN(holdCount)
 		for i := 1; i < k; i += 1 {
 			MessagePoolShareReadOnly(message)
 			pooled, shared = MessagePoolCheck(message)
@@ -97,11 +98,11 @@ func TestMessagePoolShare(t *testing.T) {
 
 	// exercise shares across every pooled size class
 	for range 1024 {
-		message := MessagePoolGet(mathrand.Intn(32 * 1024))
+		message := MessagePoolGet(mathrand.IntN(32 * 1024))
 		pooled, shared := MessagePoolCheck(message)
 		AssertEqual(t, pooled, len(message) <= 12288)
 		AssertEqual(t, shared, false)
-		k := mathrand.Intn(holdCount)
+		k := mathrand.IntN(holdCount)
 		for i := 1; i < k; i += 1 {
 			MessagePoolShareReadOnly(message)
 			pooled, shared = MessagePoolCheck(message)
@@ -357,9 +358,9 @@ func TestMessagePoolDeviceTunEgressClassificationFollowsRootLifetime(t *testing.
 
 func TestBase64(t *testing.T) {
 	for range 128 {
-		n := mathrand.Intn(512)
+		n := mathrand.IntN(512)
 		b := make([]byte, n)
-		mathrand.Read(b)
+		cryptorand.Read(b)
 		b2, err := DecodeBase64(base64.StdEncoding, EncodeBase64(base64.StdEncoding, b))
 		AssertEqual(t, err, nil)
 		AssertEqual(t, b, b2)

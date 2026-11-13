@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	// "fmt"
-	// mathrand "math/rand"
+	// mathrand "math/rand/v2"
 	"slices"
 
 	// "golang.org/x/net/idna"

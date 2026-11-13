@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -178,9 +178,19 @@ const (
 // provider from near-term discovery. Implementations own the retention policy;
 // the API generator uses a bounded oldest-evicted runtime history. Used by
 // RemoteUserNatMultiClient.RemoveProvider so a removed provider is not handed
-// straight back by the next discovery call.
+// straight back by the next discovery call, nor by a call already out, nor
+// through a window identity restored for it (PROXYDRAIN1.md §3.5), which the
+// API generator forgets.
 type MultiClientGeneratorExcluder interface {
 	ExcludeClientId(clientId Id)
+}
+
+// The companion of MultiClientGeneratorExcluder: whether the generator
+// excludes any hop of a destination now. The expansion refuses a candidate
+// listed before its provider was excluded (acceptDiscoveryDemandArgs). A
+// generator without it has its candidates evaluated as before.
+type multiClientGeneratorExclusions interface {
+	excludesDestination(destination MultiHopId) bool
 }
 
 // MultiClientGeneratorWithIpFamily is an optional generator capability:
@@ -213,11 +223,12 @@ type MultiClientGeneratorWithClientId interface {
 // `EncryptionModeRequired`, so a provider that cannot seal a session can never
 // carry its traffic; asking for modern providers keeps a provider without
 // evidence that it negotiates the session from being dialed and evaluated at
-// all. It narrows only the requests the generator makes: fixed `ClientId`
-// destinations and restored window identities bypass discovery and are not
-// filtered. The window clients' required gate still decides every send, and a
-// modern provider that fails to seal costs a failed dial, never plaintext. A
-// generator without the capability discovers as before.
+// all. Fixed `ClientId` destinations and restored window identities bypass
+// discovery, so the generator asks the platform to confirm them modern before
+// it returns them, and returns none it could not confirm. The window clients'
+// required gate still decides every send, and a modern provider that fails to
+// seal costs a failed dial, never plaintext. A generator without the
+// capability discovers as before.
 type MultiClientGeneratorWithPostQuantumEncryption interface {
 	SetPostQuantumEncryption(postQuantumEncryption bool)
 }
@@ -11144,7 +11155,9 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 // near-term discovery under the generator's retention policy. Both halves are
 // required: the resize loop wakes as soon as a client dies, so a removal
 // without the exclusion is immediately undone by re-discovering the same
-// provider. Reports whether a window client was actually removed.
+// provider. The exclusion also keeps it from coming back through a window
+// identity restored for it, and from a candidate listed before the removal.
+// Reports whether a window client was actually removed.
 //
 // A fixed-destination connection (every spec is an explicit client id, e.g. a
 // chosen network peer) is NOT excluded — there is nothing to replace it with,
@@ -13915,8 +13928,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
-		// destination set is listed locally without asking the platform, so
-		// it proves nothing about the platform either.
+		// destination set needs no discovery: it is listed locally, or under
+		// the modern requirement confirmed by a named request that says
+		// nothing of the pool, so its listing keeps the error backoff until a
+		// mint succeeds.
 		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
 			self.windowListingRetryReset()
 		}
@@ -16881,7 +16896,7 @@ func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
 	// randonly sample log statistics for weights
-	if mathrand.Intn(self.settings.StatsSampleWeightsCount) == 0 {
+	if mathrand.IntN(self.settings.StatsSampleWeightsCount) == 0 {
 		// sample the weights
 		weightValues := slices.Collect(maps.Values(weights))
 		slices.SortFunc(weightValues, func(a float32, b float32) int {

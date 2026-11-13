@@ -8,8 +8,8 @@ package connect
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"fmt"
-	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -78,7 +78,7 @@ func testRandomIp(ipVersion int) net.IP {
 	if ipVersion == 6 {
 		ip = make(net.IP, net.IPv6len)
 	}
-	mathrand.Read(ip)
+	cryptorand.Read(ip)
 	return ip
 }
 

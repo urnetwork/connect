@@ -20,6 +20,7 @@ package gossip
 import (
 	"context"
 	"fmt"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"strings"
@@ -213,7 +214,8 @@ func (self *testMesh) newNode(
 	settings.PeerCoalesceTimeout = 10 * time.Millisecond
 	settings.DialTimeout = 20 * time.Second
 	settings.StatusTimeout = 50 * time.Millisecond
-	settings.RandSeed = int64(len(name))
+	// a fixed peer order per node, so a mesh replays the same way every run
+	settings.Rand = mathrand.New(mathrand.NewPCG(uint64(len(name)), 0))
 	if configure != nil {
 		configure(settings)
 	}

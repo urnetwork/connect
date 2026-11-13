@@ -48,7 +48,6 @@ import (
 	"errors"
 	"io"
 	"math"
-	mathrand "math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -212,8 +211,9 @@ type networkStrategyScores struct {
 	retainFailedProbability float64
 
 	// now and retainFailedWinner are seams. now defaults to time.Now;
-	// retainFailedWinner defaults to a seeded rng draw. Tests inject a fake
-	// clock and a scripted coin for determinism.
+	// retainFailedWinner defaults to a draw from the store's own
+	// NewSecureRand generator. Tests inject a fake clock and a scripted coin
+	// for determinism.
 	now                func() time.Time
 	retainFailedWinner func() bool
 
@@ -225,9 +225,12 @@ type networkStrategyScores struct {
 }
 
 // newNetworkStrategyScores builds an empty store with the production decay, ttl
-// and retain policy and a time-seeded rng.
+// and retain policy. The retain coin draws from a generator seeded from
+// crypto/rand, never from the clock: which proven winner survives a stall
+// shows on the wire, so it must not follow from when the client started.
 func newNetworkStrategyScores() *networkStrategyScores {
-	rng := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+	// shared by every retain draw, so guarded by stateLock
+	rng := NewSecureRand()
 	scores := &networkStrategyScores{
 		scores:                  map[networkScoreKey]*decayedScore{},
 		halfLife:                strategyScoreHalfLife,

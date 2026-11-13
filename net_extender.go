@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -1027,7 +1027,7 @@ func JitterExtenderLimitedBackoff(retryAfter time.Duration, defaultBackoff time.
 	if backoff <= 0 {
 		return 0
 	}
-	return backoff/2 + time.Duration(mathrand.Int63n(int64(backoff)+1))
+	return backoff/2 + time.Duration(mathrand.Int64N(int64(backoff)+1))
 }
 
 // Limit bytes supplied to http.ReadResponse, not just its bufio read-ahead:

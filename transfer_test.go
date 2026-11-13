@@ -5,7 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"os"
 	"sync"
 	"testing"
@@ -694,7 +694,7 @@ func (self *conditioner) calcDelay() time.Duration {
 
 	delay := self.fixedDelay
 	if 0 < self.randomDelay {
-		delay += time.Duration(mathrand.Intn(int(self.randomDelay)))
+		delay += time.Duration(mathrand.IntN(int(self.randomDelay)))
 	}
 	return delay
 }

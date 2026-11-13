@@ -3,8 +3,11 @@ package connect
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +22,10 @@ import (
 // https://github.com/urnetwork/connect/issues/220). It no longer asks for
 // declaring providers (post_quantum_encryption). Destinations the generator
 // does not discover, fixed ClientId specs and restored window identities, are
-// not narrowed. The requests are read as the JSON the platform receives.
+// confirmed by a named request with the same requirement before they are
+// returned (owner, 2026-11-13: "They must have a positive quality probe
+// handshake to count"). The requests are read as the JSON the platform
+// receives.
 
 // postQuantumDiscoveryFixture is a multi client over a real API generator
 // whose find-providers2 requests go to a local discovery that records them
@@ -257,84 +263,543 @@ func TestDefaultProfileKeepsCapabilityBlindDiscovery(t *testing.T) {
 	}
 }
 
-// Fixed ClientId destinations and restored window identities are not
-// discovered, so the modern requirement does not narrow them: the generator
-// returns them unchanged even when the one request for its other specs, which
-// carries only those specs, answers no provider. The window clients'
-// EncryptionModeRequired still decides every send to them.
-func TestModernDiscoveryKeepsFixedAndRestoredDestinations(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+// A generator whose find-providers2 requests are recorded and answered by
+// `answer`, whose derived identities come from a counting credential
+// authority, whose store restores `persisted` (no store for nil), and whose
+// constructor excludes `excludeClientIds`. Nothing reaches a public endpoint.
+// A call confirms beside its discovery, so `answer` can run on two goroutines
+// at once.
+type modernConfirmFixture struct {
+	generator *ApiMultiClientGenerator
+	mintCount atomic.Int32
 
-	fixedClientId := NewId()
-	fixed := RequireMultiHopId(fixedClientId)
-	restored := RequireMultiHopId(NewId())
+	stateLock sync.Mutex
+	requests  []*FindProviders2Args
+}
 
-	// the discovery runs on this goroutine, inside the generator's calls
-	requests := []*FindProviders2Args{}
-	requestBodies := []string{}
-	discovery := localDiscoveryTestFunc(func(callCtx context.Context, token string, args *FindProviders2Args) (*FindProviders2Result, error) {
-		body, err := json.Marshal(args)
-		if err != nil {
-			return nil, err
+func newModernConfirmFixture(
+	t *testing.T,
+	ctx context.Context,
+	specs []*ProviderSpec,
+	persisted []*WindowClientIdentity,
+	answer func(args *FindProviders2Args) (*FindProviders2Result, error),
+	excludeClientIds ...Id,
+) *modernConfirmFixture {
+	t.Helper()
+	fixture := &modernConfirmFixture{}
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableResilient = false
+	strategySettings.RequestTimeout = time.Second
+	strategy := NewClientStrategy(ctx, strategySettings)
+	t.Cleanup(strategy.Close)
+
+	generatorSettings := DefaultApiMultiClientGeneratorSettings()
+	generatorSettings.ProviderDiscovery = localDiscoveryTestFunc(func(callCtx context.Context, token string, args *FindProviders2Args) (*FindProviders2Result, error) {
+		func() {
+			fixture.stateLock.Lock()
+			defer fixture.stateLock.Unlock()
+			fixture.requests = append(fixture.requests, args)
+		}()
+		return answer(args)
+	})
+	generatorSettings.ClientCredentials = &generatorCredentialFixture{
+		auth: func(context.Context, *AuthNetworkClientArgs) (*AuthNetworkClientResult, error) {
+			fixture.mintCount.Add(1)
+			return &AuthNetworkClientResult{ByClientJwt: generatorCredentialTestJwt(t, NewId())}, nil
+		},
+		remove: func(context.Context, *RemoveNetworkClientArgs) (*RemoveNetworkClientResult, error) {
+			return &RemoveNetworkClientResult{}, nil
+		},
+	}
+	fixture.generator = NewApiMultiClientGenerator(
+		ctx,
+		specs,
+		strategy,
+		excludeClientIds,
+		"https://api.modern.example",
+		"synthetic-parent-token",
+		"wss://platform.modern.example",
+		"synthetic modern",
+		"synthetic",
+		"test",
+		nil,
+		DefaultClientSettings,
+		generatorSettings,
+	)
+	if persisted != nil {
+		fixture.generator.SetIdentityStore(&fakeIdentityStore{persisted: persisted})
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer closeCancel()
+		_ = fixture.generator.CloseAndWait(closeCtx)
+	})
+	return fixture
+}
+
+// Takes the requests recorded since the last take, split into confirmations
+// of fixed and restored destinations and every other request.
+func (self *modernConfirmFixture) takeRequests() (confirms []*FindProviders2Args, others []*FindProviders2Args) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for _, request := range self.requests {
+		if testingModernConfirmRequest(request) {
+			confirms = append(confirms, request)
+		} else {
+			others = append(others, request)
 		}
-		requests = append(requests, args)
-		requestBodies = append(requestBodies, string(body))
-		// the answer of a platform with no modern provider to offer
-		return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
-	})
-	generator := newPostQuantumDiscoveryGenerator(t, ctx, []*ProviderSpec{{ClientId: &fixedClientId}, {BestAvailable: true}}, discovery)
-	generator.SetIdentityStore(&fakeIdentityStore{
-		persisted: []*WindowClientIdentity{{
-			ClientId:    NewId(),
-			ByJwt:       "jwt-restored",
-			InstanceId:  NewId(),
-			Destination: restored,
-		}},
-	})
-	// as the multi client sets it for a profile with PostQuantumEncryption
-	generator.SetPostQuantumEncryption(true)
+	}
+	self.requests = nil
+	return confirms, others
+}
 
-	wantDestinations := map[MultiHopId]DestinationStats{fixed: {}, restored: {}}
-	destinations, err := generator.NextDestinationsContext(ctx, 3, nil, "quality")
-	AssertEqual(t, err, nil)
-	AssertEqual(t, destinations, wantDestinations)
-	destinations, err = generator.NextDestinationsWithIpFamily(3, nil, "speed", IpFamilyFilterV6Capable)
-	AssertEqual(t, err, nil)
-	AssertEqual(t, destinations, wantDestinations)
+// Whether a request names its providers by client id only and requires them
+// modern, as a confirmation does.
+func testingModernConfirmRequest(args *FindProviders2Args) bool {
+	if !args.RequireModernProvider || len(args.Specs) == 0 {
+		return false
+	}
+	for _, spec := range args.Specs {
+		if spec.ClientId == nil {
+			return false
+		}
+	}
+	return true
+}
 
-	AssertEqual(t, len(requests), 2)
-	for i, request := range requests {
-		// only the discovery spec rides the request, never the fixed one
-		AssertEqual(t, request.Specs, []*ProviderSpec{{BestAvailable: true}})
-		assertModernDiscoveryRequest(t, requestBodies[i], "discovery beside fixed and restored destinations")
+// The client ids a request names.
+func testingNamedClientIds(args *FindProviders2Args) map[Id]bool {
+	clientIds := map[Id]bool{}
+	for _, spec := range args.Specs {
+		if spec.ClientId != nil {
+			clientIds[*spec.ClientId] = true
+		}
+	}
+	return clientIds
+}
+
+// The platform's answer to a named request: the named providers that are
+// modern, and nothing else, as the server's named path answers.
+func testingNamedModernAnswer(args *FindProviders2Args, modernClientIds ...Id) *FindProviders2Result {
+	providers := []*FindProvidersProvider{}
+	for clientId := range testingNamedClientIds(args) {
+		if slices.Contains(modernClientIds, clientId) {
+			providers = append(providers, &FindProvidersProvider{ClientId: clientId})
+		}
+	}
+	return &FindProviders2Result{Providers: providers}
+}
+
+// The destinations of an answer, without their stats.
+func testingDestinationSet(destinations map[MultiHopId]DestinationStats) map[MultiHopId]bool {
+	destinationSet := map[MultiHopId]bool{}
+	for destination := range destinations {
+		destinationSet[destination] = true
+	}
+	return destinationSet
+}
+
+// Fails unless a confirmation names each of `clientIds` exactly once, in
+// legacy mode with no family filter and no exclusion, at the window's rank
+// mode, and requires them modern.
+func assertModernConfirmRequest(t *testing.T, args *FindProviders2Args, rankMode string, clientIds ...Id) {
+	t.Helper()
+	wantClientIds := map[Id]bool{}
+	for _, clientId := range clientIds {
+		wantClientIds[clientId] = true
+	}
+	if !maps.Equal(testingNamedClientIds(args), wantClientIds) || len(args.Specs) != len(wantClientIds) {
+		t.Fatalf("confirmation named %v, want %v", testingNamedClientIds(args), wantClientIds)
+	}
+	if !args.RequireModernProvider || args.PostQuantumEncryption {
+		t.Fatalf("confirmation did not require modern providers alone: %+v", args)
+	}
+	if args.Select != nil || args.IpFamily != IpFamilyFilterDefault || args.RankMode != rankMode {
+		t.Fatalf("confirmation carried a selector, a family filter or another rank mode: %+v", args)
+	}
+	if len(args.ExcludeClientIds) != 0 || len(args.ExcludeDestinations) != 0 || args.ForceMinimum || args.Strict {
+		t.Fatalf("confirmation carried exclusions or discovery options: %+v", args)
 	}
 }
 
-// A generator whose every spec names a fixed ClientId, as a pinned tunnel's
-// does, has nothing to discover. With the requirement set it still makes no
-// request and returns its destination unchanged, so a provider with no
-// evidence yet stays reachable.
-func TestModernDiscoveryMakesNoRequestForFixedDestinations(t *testing.T) {
+// The root cause of post-quantum windows failing to connect to about half
+// their providers: a restored window identity re-formed the window against its
+// provider from before with no check, though that provider never passed the
+// modern requirement and could not seal the session. Under the requirement the
+// platform must confirm it; one the platform does not answer is never
+// returned by any discovery path and is forgotten, so no window can dial it,
+// whether by its restored identity or a fresh one.
+func TestPostQuantumNeverReturnsRestoredDestinationThePlatformDoesNotConfirm(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	restoredIdentity := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-restored-token",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	discovered := RequireMultiHopId(NewId())
+	fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{BestAvailable: true}}, []*WindowClientIdentity{restoredIdentity}, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		if testingModernConfirmRequest(args) {
+			// the restored provider never had a positive probe handshake
+			return testingNamedModernAnswer(args), nil
+		}
+		return &FindProviders2Result{Providers: []*FindProvidersProvider{{ClientId: discovered.Tail()}}}, nil
+	})
+	// as the multi client sets it for a profile with PostQuantumEncryption
+	fixture.generator.SetPostQuantumEncryption(true)
+
+	wantDestinations := map[MultiHopId]bool{discovered: true}
+	destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, testingDestinationSet(destinations), wantDestinations)
+	confirms, others := fixture.takeRequests()
+	AssertEqual(t, len(confirms), 1)
+	assertModernConfirmRequest(t, confirms[0], "quality", restoredIdentity.Destination.Tail())
+	AssertEqual(t, len(others), 1)
+	AssertEqual(t, others[0].Specs, []*ProviderSpec{{BestAvailable: true}})
+	AssertEqual(t, others[0].RequireModernProvider, true)
+
+	// forgotten, so no window expansion of this process meets it again
+	AssertEqual(t, len(fixture.generator.identityState.RestoredDestinations()), 0)
+
+	// no other discovery path returns it either, and none asks about it again
+	providerSelect := FindProvidersSelect{
+		Ip:          ProviderIpCapabilityDualstack,
+		Protocol:    ProviderProtocolCapabilityDualproto,
+		TargetCount: 6,
+	}
+	for _, call := range []func() (map[MultiHopId]DestinationStats, error){
+		func() (map[MultiHopId]DestinationStats, error) {
+			return fixture.generator.NextDestinations(3, nil, "quality")
+		},
+		func() (map[MultiHopId]DestinationStats, error) {
+			return fixture.generator.NextDestinationsWithIpFamily(1, nil, "speed", IpFamilyFilterV6Capable)
+		},
+		func() (map[MultiHopId]DestinationStats, error) {
+			return fixture.generator.NextDestinationsWithIpFamilyContext(ctx, 3, nil, "quality", IpFamilyFilterV4Capable)
+		},
+		func() (map[MultiHopId]DestinationStats, error) {
+			destinations, _, err := fixture.generator.NextDestinationsWithCapabilities(3, nil, "quality", IpFamilyFilterV4Capable, providerSelect)
+			return destinations, err
+		},
+		func() (map[MultiHopId]DestinationStats, error) {
+			destinations, _, err := fixture.generator.NextDestinationsWithCapabilitiesContext(ctx, 3, nil, "speed", IpFamilyFilterV4Capable, providerSelect)
+			return destinations, err
+		},
+	} {
+		destinations, err := call()
+		AssertEqual(t, err, nil)
+		AssertEqual(t, testingDestinationSet(destinations), wantDestinations)
+	}
+	confirms, others = fixture.takeRequests()
+	AssertEqual(t, len(confirms), 0)
+	AssertEqual(t, len(others), 5)
+
+	// a dial of its destination could not reuse the restored identity: the
+	// generator mints a fresh one instead
+	args, err := fixture.generator.NewClientArgsForDestinationContext(ctx, restoredIdentity.Destination)
+	AssertEqual(t, err, nil)
+	AssertNotEqual(t, args.ClientId, restoredIdentity.ClientId)
+	AssertEqual(t, fixture.mintCount.Load(), int32(1))
+	fixture.generator.RemoveClientArgs(args)
+}
+
+// A restored identity the platform confirms modern is returned, and the
+// window's dial of it reuses the restored identity itself, so its provider's
+// flows resume as without the requirement.
+func TestPostQuantumKeepsAndReusesConfirmedRestoredIdentity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	restoredIdentity := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-restored-token",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{BestAvailable: true}}, []*WindowClientIdentity{restoredIdentity}, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		if testingModernConfirmRequest(args) {
+			return testingNamedModernAnswer(args, restoredIdentity.Destination.Tail()), nil
+		}
+		// a platform with no other modern provider to offer
+		return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
+	})
+	fixture.generator.SetPostQuantumEncryption(true)
+
+	destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "speed")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, destinations, map[MultiHopId]DestinationStats{restoredIdentity.Destination: {}})
+	confirms, others := fixture.takeRequests()
+	AssertEqual(t, len(confirms), 1)
+	assertModernConfirmRequest(t, confirms[0], "speed", restoredIdentity.Destination.Tail())
+	AssertEqual(t, len(others), 1)
+	// still pending reuse
+	AssertEqual(t, fixture.generator.identityState.RestoredDestinations(), []MultiHopId{restoredIdentity.Destination})
+
+	args, err := fixture.generator.NewClientArgsForDestinationContext(ctx, restoredIdentity.Destination)
+	AssertEqual(t, err, nil)
+	AssertEqual(t, args.ClientId, restoredIdentity.ClientId)
+	AssertEqual(t, args.ClientAuth.ByJwt, restoredIdentity.ByJwt)
+	AssertEqual(t, args.ClientAuth.InstanceId, restoredIdentity.InstanceId)
+	AssertEqual(t, fixture.mintCount.Load(), int32(0))
+	fixture.generator.RemoveClientArgs(args)
+}
+
+// A fixed ClientId spec is confirmed the same way: in the one named request,
+// never in discovery, on every call, since a fixed spec has no memory. A
+// generator whose every spec is fixed, as a pinned tunnel's is, now asks the
+// platform before each answer, and returns its destination only once the
+// platform confirms it. The confirmation carries no `select`, so it reports
+// nothing about selector mode.
+func TestPostQuantumConfirmsFixedClientIdDestinations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	legacyClientId := NewId()
+	modernClientId := NewId()
+	fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &legacyClientId}, {ClientId: &modernClientId}, {BestAvailable: true}}, nil, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		if testingModernConfirmRequest(args) {
+			return testingNamedModernAnswer(args, modernClientId), nil
+		}
+		return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
+	})
+	fixture.generator.SetPostQuantumEncryption(true)
+
+	destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, destinations, map[MultiHopId]DestinationStats{RequireMultiHopId(modernClientId): {}})
+	confirms, others := fixture.takeRequests()
+	AssertEqual(t, len(confirms), 1)
+	assertModernConfirmRequest(t, confirms[0], "quality", legacyClientId, modernClientId)
+	AssertEqual(t, len(others), 1)
+	// only the discovery spec rides discovery, never a fixed one
+	AssertEqual(t, others[0].Specs, []*ProviderSpec{{BestAvailable: true}})
+
+	var pinnedModern atomic.Bool
+	pinnedClientId := NewId()
+	pinned := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &pinnedClientId}}, nil, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		if pinnedModern.Load() {
+			return testingNamedModernAnswer(args, pinnedClientId), nil
+		}
+		return testingNamedModernAnswer(args), nil
+	})
+	pinned.generator.SetPostQuantumEncryption(true)
+	providerSelect := FindProvidersSelect{
+		Ip:          ProviderIpCapabilityIpv4,
+		Protocol:    ProviderProtocolCapabilityTcp,
+		TargetCount: 1,
+	}
+	for range 2 {
+		destinations, err := pinned.generator.NextDestinationsContext(ctx, 1, nil, "quality")
+		AssertEqual(t, err, nil)
+		AssertEqual(t, len(destinations), 0)
+		destinations, selectorMode, err := pinned.generator.NextDestinationsWithCapabilities(1, nil, "quality", IpFamilyFilterV4Capable, providerSelect)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, selectorMode, false)
+		AssertEqual(t, len(destinations), 0)
+	}
+	confirms, others = pinned.takeRequests()
+	AssertEqual(t, len(confirms), 4)
+	for _, confirm := range confirms {
+		assertModernConfirmRequest(t, confirm, "quality", pinnedClientId)
+	}
+	AssertEqual(t, len(others), 0)
+	if _, known := pinned.generator.SelectorMode(); known {
+		t.Fatal("a confirmation was read as an answer about selector mode")
+	}
+
+	// once the provider has its positive handshake, the pinned window dials it
+	pinnedModern.Store(true)
+	destinations, err = pinned.generator.NextDestinationsContext(ctx, 1, nil, "quality")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, destinations, map[MultiHopId]DestinationStats{RequireMultiHopId(pinnedClientId): {}})
+}
+
+// Without the requirement nothing changes: fixed and restored destinations
+// are returned as they are, with no request of their own, beside discovery
+// that asks capability-blind, and a pinned generator makes no request at all.
+// Clearing the requirement after it was set returns to exactly that.
+func TestPostQuantumOffReturnsFixedAndRestoredWithoutConfirmation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	fixedClientId := NewId()
-	// the discovery runs on this goroutine, inside the generator's calls
-	requestCount := 0
-	discovery := localDiscoveryTestFunc(func(callCtx context.Context, token string, args *FindProviders2Args) (*FindProviders2Result, error) {
-		requestCount += 1
+	restoredIdentity := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-restored-token",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &fixedClientId}, {BestAvailable: true}}, []*WindowClientIdentity{restoredIdentity}, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		// a platform that would confirm nothing
 		return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
 	})
-	generator := newPostQuantumDiscoveryGenerator(t, ctx, []*ProviderSpec{{ClientId: &fixedClientId}}, discovery)
-	generator.SetPostQuantumEncryption(true)
+	wantDestinations := map[MultiHopId]DestinationStats{
+		RequireMultiHopId(fixedClientId): {},
+		restoredIdentity.Destination:     {},
+	}
+	assertUnconfirmed := func() {
+		t.Helper()
+		destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+		AssertEqual(t, err, nil)
+		AssertEqual(t, destinations, wantDestinations)
+		destinations, err = fixture.generator.NextDestinationsWithIpFamily(3, nil, "speed", IpFamilyFilterV6Capable)
+		AssertEqual(t, err, nil)
+		AssertEqual(t, destinations, wantDestinations)
+		confirms, others := fixture.takeRequests()
+		AssertEqual(t, len(confirms), 0)
+		AssertEqual(t, len(others), 2)
+		for _, request := range others {
+			AssertEqual(t, request.Specs, []*ProviderSpec{{BestAvailable: true}})
+			body, err := json.Marshal(request)
+			AssertEqual(t, err, nil)
+			assertCapabilityBlindDiscoveryRequest(t, string(body), "discovery without the requirement")
+		}
+		// still pending reuse
+		AssertEqual(t, fixture.generator.identityState.RestoredDestinations(), []MultiHopId{restoredIdentity.Destination})
+	}
+	assertUnconfirmed()
+	fixture.generator.SetPostQuantumEncryption(true)
+	fixture.generator.SetPostQuantumEncryption(false)
+	assertUnconfirmed()
 
-	wantDestinations := map[MultiHopId]DestinationStats{RequireMultiHopId(fixedClientId): {}}
-	destinations, err := generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	pinnedClientId := NewId()
+	pinned := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &pinnedClientId}}, nil, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
+	})
+	destinations, err := pinned.generator.NextDestinationsContext(ctx, 1, nil, "quality")
 	AssertEqual(t, err, nil)
-	AssertEqual(t, destinations, wantDestinations)
-	destinations, err = generator.NextDestinationsWithIpFamily(3, nil, "speed", IpFamilyFilterV4Capable)
+	AssertEqual(t, destinations, map[MultiHopId]DestinationStats{RequireMultiHopId(pinnedClientId): {}})
+	confirms, others := pinned.takeRequests()
+	AssertEqual(t, len(confirms)+len(others), 0)
+}
+
+// A confirmation that fails confirms nothing: the fixed and restored
+// destinations are left out of the answer, never dialed unconfirmed, while
+// discovery still answers. The failure says nothing against them, so a
+// restored identity stays pending and the next confirmation returns it. A
+// pinned generator, with nothing to discover, fails the call. When discovery
+// fails beside a confirmation that succeeds, the confirmed destinations are
+// still returned, as fixed ones were before the requirement.
+func TestPostQuantumConfirmationFailureDropsUnconfirmedDestinations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	fixedClientId := NewId()
+	restoredIdentity := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-restored-token",
+		InstanceId:  NewId(),
+		Destination: RequireMultiHopId(NewId()),
+	}
+	discovered := RequireMultiHopId(NewId())
+	// the failures the platform answers with, under the lock
+	var stateLock sync.Mutex
+	confirmErr := errors.New("synthetic confirmation failure")
+	var discoveryErr error
+	setErrs := func(confirm error, discovery error) {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		confirmErr = confirm
+		discoveryErr = discovery
+	}
+	fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &fixedClientId}, {BestAvailable: true}}, []*WindowClientIdentity{restoredIdentity}, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		if testingModernConfirmRequest(args) {
+			if confirmErr != nil {
+				return nil, confirmErr
+			}
+			return testingNamedModernAnswer(args, fixedClientId, restoredIdentity.Destination.Tail()), nil
+		}
+		if discoveryErr != nil {
+			return nil, discoveryErr
+		}
+		return &FindProviders2Result{Providers: []*FindProvidersProvider{{ClientId: discovered.Tail()}}}, nil
+	})
+	fixture.generator.SetPostQuantumEncryption(true)
+
+	destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
 	AssertEqual(t, err, nil)
-	AssertEqual(t, destinations, wantDestinations)
-	AssertEqual(t, requestCount, 0)
+	AssertEqual(t, testingDestinationSet(destinations), map[MultiHopId]bool{discovered: true})
+	confirms, others := fixture.takeRequests()
+	AssertEqual(t, len(confirms), 1)
+	assertModernConfirmRequest(t, confirms[0], "quality", fixedClientId, restoredIdentity.Destination.Tail())
+	AssertEqual(t, len(others), 1)
+	AssertEqual(t, fixture.generator.identityState.RestoredDestinations(), []MultiHopId{restoredIdentity.Destination})
+
+	// both requests fail: the call fails as discovery alone did
+	setErrs(errors.New("synthetic confirmation failure"), errors.New("synthetic discovery failure"))
+	destinations, err = fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	AssertNotEqual(t, err, nil)
+	AssertEqual(t, len(destinations), 0)
+
+	// discovery fails beside a confirmation that succeeds
+	setErrs(nil, errors.New("synthetic discovery failure"))
+	destinations, err = fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, destinations, map[MultiHopId]DestinationStats{
+		RequireMultiHopId(fixedClientId): {},
+		restoredIdentity.Destination:     {},
+	})
+
+	// confirmed and discovered together
+	setErrs(nil, nil)
+	destinations, err = fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+	AssertEqual(t, err, nil)
+	AssertEqual(t, testingDestinationSet(destinations), map[MultiHopId]bool{
+		RequireMultiHopId(fixedClientId): true,
+		restoredIdentity.Destination:     true,
+		discovered:                       true,
+	})
+
+	pinnedClientId := NewId()
+	pinned := newModernConfirmFixture(t, ctx, []*ProviderSpec{{ClientId: &pinnedClientId}}, nil, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+		return nil, errors.New("synthetic confirmation failure")
+	})
+	pinned.generator.SetPostQuantumEncryption(true)
+	destinations, err = pinned.generator.NextDestinationsContext(ctx, 1, nil, "quality")
+	AssertNotEqual(t, err, nil)
+	AssertEqual(t, len(destinations), 0)
+}
+
+// A restored multi-hop destination counts only when the platform confirms
+// every hop modern: a confirmed exit behind an unconfirmed intermediary is
+// dropped and forgotten.
+func TestPostQuantumConfirmsEveryHopOfRestoredMultiHopDestination(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	intermediaryId := NewId()
+	exitId := NewId()
+	for _, modernClientIds := range [][]Id{{exitId}, {intermediaryId, exitId}} {
+		restoredIdentity := &WindowClientIdentity{
+			ClientId:    NewId(),
+			ByJwt:       "synthetic-restored-token",
+			InstanceId:  NewId(),
+			Destination: RequireMultiHopId(intermediaryId, exitId),
+		}
+		fixture := newModernConfirmFixture(t, ctx, []*ProviderSpec{{BestAvailable: true}}, []*WindowClientIdentity{restoredIdentity}, func(args *FindProviders2Args) (*FindProviders2Result, error) {
+			if testingModernConfirmRequest(args) {
+				return testingNamedModernAnswer(args, modernClientIds...), nil
+			}
+			return &FindProviders2Result{Providers: []*FindProvidersProvider{}}, nil
+		})
+		fixture.generator.SetPostQuantumEncryption(true)
+
+		destinations, err := fixture.generator.NextDestinationsContext(ctx, 3, nil, "quality")
+		AssertEqual(t, err, nil)
+		confirms, _ := fixture.takeRequests()
+		AssertEqual(t, len(confirms), 1)
+		assertModernConfirmRequest(t, confirms[0], "quality", intermediaryId, exitId)
+		if len(modernClientIds) == 2 {
+			AssertEqual(t, destinations, map[MultiHopId]DestinationStats{restoredIdentity.Destination: {}})
+			AssertEqual(t, fixture.generator.identityState.RestoredDestinations(), []MultiHopId{restoredIdentity.Destination})
+		} else {
+			AssertEqual(t, len(destinations), 0)
+			AssertEqual(t, len(fixture.generator.identityState.RestoredDestinations()), 0)
+		}
+	}
 }

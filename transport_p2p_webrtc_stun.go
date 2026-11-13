@@ -8,9 +8,7 @@ package connect
 // Snowflake design (a random subset of a high-collateral pool per rendezvous).
 
 import (
-	cryptorand "crypto/rand"
-	"encoding/binary"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 )
 
 // defaultStunServerUrls is the shipped high-collateral STUN pool. It keeps the
@@ -62,30 +60,20 @@ func sampleStunServerUrls(poolUrls []string, sampleCount int, rng *mathrand.Rand
 	return selectedUrls
 }
 
-// cryptoSeededRand builds a math/rand source seeded from crypto/rand, so the
-// per-session STUN subset is not predictable from wall-clock time. A crypto
-// read failure falls back to a fixed seed rather than panicking; the selection
-// is a traffic-shaping choice, not a security boundary.
-func cryptoSeededRand() *mathrand.Rand {
-	var seedBytes [8]byte
-	if _, err := cryptorand.Read(seedBytes[:]); err != nil {
-		return mathrand.New(mathrand.NewSource(1))
-	}
-	return mathrand.New(mathrand.NewSource(int64(binary.LittleEndian.Uint64(seedBytes[:]))))
-}
-
 // selectIceServerUrls resolves the per-session ICE/STUN server list the peer
 // connection factory offers. An explicit IceServerUrls override wins so callers
 // and tests can pin exact servers; otherwise a random IceServerSampleCount
 // subset is drawn from IceServerPoolUrls. The factory is manager scoped and
-// calls this once, so every manager (session) offers its own subset.
+// calls this once, so every manager (session) offers its own subset, drawn
+// from its own NewSecureRand generator: the subset shows on the wire, so it
+// must not be predictable from the sessions drawn before it.
 func (self *WebRtcSettings) selectIceServerUrls() []string {
 	if 0 < len(self.IceServerUrls) {
 		return append([]string{}, self.IceServerUrls...)
 	}
 	rng := self.iceServerRandForTest
 	if rng == nil {
-		rng = cryptoSeededRand()
+		rng = NewSecureRand()
 	}
 	return sampleStunServerUrls(self.IceServerPoolUrls, self.IceServerSampleCount, rng)
 }

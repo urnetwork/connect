@@ -21,6 +21,15 @@ In the URnetwork code, the following Go style is used. A few conventions — not
 - Our `Id` type is a ULID. ULIDs put a millisecond creation timestamp in their high bits, so ids are **lexicographically ordered by creation time** — and we rely on this in several places: `MAX(id)` / `MAX(id::varchar)` selects the most-recently-created row of a group, and `ORDER BY id` stands in for `ORDER BY create_time`. The ordering survives the `uuid` column type and its `::varchar` canonical form (the timestamp is in the leading bytes, and hex sorts in value order), so it holds in SQL as well as in Go.
 - The timestamp is **client-local**: an id carries the clock of whatever minted it, so id order is a dependable time order within a single source but is not a global clock across sources (two ids minted on different machines can be out of true order by the clock skew between them). When strict or cross-source ordering matters, order by an explicit server-set timestamp column instead.
 
+## Randomness
+
+- Secrets, keys, nonces, tokens and unguessable ids: `crypto/rand`.
+- All other randomness: the top-level `math/rand/v2` functions (`rand.IntN`, `rand.N`, `rand.Shuffle`, ...). Never import `math/rand`.
+- Production code never builds a seeded generator. A type that needs its own uses `connect.NewSecureRand()` (`random.go`: ChaCha8 seeded from `crypto/rand`). No generator seeded from the clock, an id, a counter or a fixed value, and no fallback to one.
+- Deterministic generators (`rand.NewPCG`, a fixed-seed `rand.NewChaCha8`) belong only in tests, benchmarks and simulations, with a comment saying why.
+- Randomness that shapes traffic is security relevant, however small: padding, timing jitter, path, exit, strategy and server choice, probe and sample selection.
+- `random_rule_test.go` enforces this.
+
 ## Package layering
 
 **A package must never import its own subpackages.** Dependencies point one way:
@@ -99,6 +108,7 @@ A routing key is a value that decides *which* instance of something a message be
 - **Sender-local state that selects a route must be visible to the receiver**, or the receiver cannot distinguish two live things and will collapse them into one — dropping whichever it decides is "older". If a key must stay off the wire, the sender is responsible for never running two things that differ only by it.
 - **Prefer routing a mismatch over judging it.** A message from another instance is evidence about that instance, not about this one. Judging it here produces a wrong verdict on state it does not describe (a proof for another generation fails signature verification and looks like an attack), and the wrong verdict is usually sticky. Route it, ignore it, or converge onto it.
 - **Order the key when the instances are ordered.** `Id` is a ULID, so generations compare directly: older is a straggler to drop, newer is a signal to converge. Without an ordering the receiver can only tell "different", which is not enough to decide who should move.
+- **Unauthenticated routing keys cannot establish permanent ordering floors.** A peer-supplied generation is a routing hint until authenticated evidence binds that exact value. TLS completion or a signature over an exporter does not authenticate an outer `epoch_id`. Restrict adoption to the message that starts the generation, ignore foreign responses and proofs, and release any temporary ordering preference when the attempt ends so a forged maximum cannot block recovery.
 - **A key with a single-slot consumer needs the key checked before the slot is taken.** Pending/first-wins state (one buffered proof per epoch, one head per sequence) is a resource a stale message can consume; validate the key first, or a straggler denies the slot to the message that belongs there.
 
 ## Packet flow and durable state
