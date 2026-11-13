@@ -12292,6 +12292,104 @@ paths:
         "503":
           description: Teams are not available.
 
+  # §12.8's record API on api (sidecar DESIGN.md §12.8): the console's and a
+  # network credential's view and writes of the network's own zone. Sidecars
+  # read and write through the dns block's /dns/zone and /dns/records below.
+  /network/dns:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: Read the network's zone
+      description: |
+        The network's label, allocated on the first request that needs one, its
+        alias, the zone's version (the serial of its last write) and every RRset
+        the zone holds, with `dns_entries`' count and the network's limit, -1 for
+        none. Read roles by the role gate. 503 while no dns root is configured or
+        the zone tables are not available.
+      operationId: networkDns
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkDns"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: No dns root, or the zone tables are not available.
+
+  /network/dns/records:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Write the network's own records
+      description: |
+        `{expect_version, upserts, deletes}`: each upsert replaces one RRset with
+        its values, each delete removes one, all in one write that takes one
+        serial, and only while the zone's version is `expect_version` when it is
+        set. Names are canonical, lowercase with their final dot, at or below the
+        zone's apex `<label>.<root>`; types are mnemonics. The DNS permission by
+        the role gate. A network credential writes under no decision, so
+        `approval` is refused.
+
+        Refusals, in the order they are checked: an upsert creating a public name
+        (A, AAAA, CNAME, MX or SRV) while the network is not verified, 402 with
+        `QuotaRefusal{limit_key: verification}`; a network on probation writing A,
+        AAAA or CNAME, 403; `dns_entries` (or probation's `probation_dns_entries`)
+        and `dns_changes_per_hour`, 402 or 429 with the `QuotaRefusal`; a record
+        §12.7 refuses or a name the screen refuses, 400 or 403; a stale
+        `expect_version`, 409 `version_conflict`. A refusal writes nothing. A
+        403 that is not the credential's carries a `DnsApiErrorBody`: `refused`
+        for the standing or a screened name, `suspended` for a suspended zone or
+        host.
+      operationId: networkDnsRecords
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsRecordsRequest"
+      responses:
+        "200":
+          description: Written, or nothing needed writing. The zone's version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsRecordsAnswer"
+        "400":
+          description: A body, name, type or value the route does not take, or a record §12.7 refuses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "402":
+          description: A limit a purchase or a higher tier lifts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: The zone moved past `expect_version`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "429":
+          description: A limit whose window resets, with Retry-After.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "503":
+          description: A restore, or a state the server has not loaded, with Retry-After.
+
   /auth/sso-discover:
     post:
       x-internal: true
@@ -13998,6 +14096,117 @@ paths:
   # (sidecar protocol/tls.proto) by the device's identity key, purpose
   # `tls-key`. `POST /tls/suspend` is not listed: it stays a model call inside
   # api and taskworker until a caller outside them exists.
+  # The dns block's record routes for sidecars (sidecar DESIGN.md §12.8 and
+  # plan-DNS-sidecar-zone-read). server/cli/dns serves them on its own host from
+  # sidecar's dnsservice, never api, under §7.4's /dns/*. Each takes a service
+  # token for audience `dns` from an admitted sidecar of the network.
+  /dns/records:
+    servers:
+      - url: https://dns.bringyour.com
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Write the network's records from a sidecar
+      description: |
+        The body of `POST /network/dns/records`, from a sidecar. Under a standing
+        grant the caller needs §8's `admin` on `dns:<host>` for every owner it
+        names, else 403, or 503 while the gate has not loaded the network.
+
+        Under a decision rather than a grant, the body's `approval` carries the
+        decision and the use's action, and `Idempotency-Key` the use's effect key
+        as base64url with no padding. The write names one RRset with one value,
+        or one delete, equal to the action's `dns_name`, `dns_type`,
+        `dns_value` and `dns_ttl`. A use already committed under that key answers
+        its stored answer, byte for byte, with no write, even past the decision's
+        `not_after` or with a stale `expect_version`; else the decision is spent
+        and the use consumed in the write's own transaction, 409 `spent` when no
+        use is left. Every other refusal is the network route's.
+      operationId: dnsRecords
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Under a decision, the use's effect key, base64url with no padding.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsRecordsRequest"
+      responses:
+        "200":
+          description: Written, or a stored use's answer. The zone's version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsRecordsAnswer"
+        "400":
+          description: A body the route does not take, or a record §12.7 refuses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "401":
+          description: A token the block refuses.
+        "402":
+          description: A limit a purchase or a higher tier lifts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          description: No grant or decision covers the write, or the network's standing refuses it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "409":
+          description: A stale `expect_version`, or every use of the decision is spent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "429":
+          description: A limit whose window resets, with Retry-After.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "503":
+          description: A restore, a gate or state not loaded, or the dns gate closed, with Retry-After.
+
+  /dns/zone:
+    servers:
+      - url: https://dns.bringyour.com
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: Read the caller's view of its network's zone
+      description: |
+        The network's label, allocated on the first request that needs one, its
+        alias and the zone's version, and the RRsets of the owners on whose host
+        the caller holds §8's `publish` or `admin` on `dns:<host>`: never the
+        whole zone, which `GET /network/dns` keeps to read roles. While the gate
+        has not loaded the network the view holds no RRset.
+      operationId: dnsZone
+      security:
+        - ServiceTokenAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsZone"
+        "401":
+          description: A token the block refuses.
+        "503":
+          description: The zone tables or the dns gate are not available.
+
   /tls/cert-order:
     post:
       x-internal: true
@@ -28389,6 +28598,149 @@ components:
           additionalProperties:
             type: integer
             format: int64
+    DnsRecordUpsert:
+      type: object
+      required: [name, type, values]
+      properties:
+        name:
+          description: The owner, lowercase with its final dot, at or below the zone's apex.
+          type: string
+        type:
+          description: The type's mnemonic, such as A, AAAA, CNAME, TXT, MX or SRV.
+          type: string
+        ttl:
+          description: Seconds; 0 or absent takes the zone's default for user records.
+          type: integer
+          format: int64
+        values:
+          description: Each record's RDATA in presentation form. The RRset becomes exactly these.
+          type: array
+          items:
+            type: string
+    DnsRecordDelete:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+    DnsRecordsApproval:
+      type: object
+      required: [decisions, action]
+      properties:
+        decisions:
+          description: Each signed ApprovalDecision the use spends on, base64.
+          type: array
+          items:
+            type: string
+            format: byte
+        action:
+          description: This use's CanonicalAction, base64.
+          type: string
+          format: byte
+        template:
+          description: A multi-use decision's template, base64, when the decisions hash it.
+          type: string
+          format: byte
+    DnsRecordsRequest:
+      type: object
+      properties:
+        expect_version:
+          description: The zone's version the write goes ahead only at.
+          type: integer
+          format: int64
+        upserts:
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsRecordUpsert"
+        deletes:
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsRecordDelete"
+        approval:
+          $ref: "#/components/schemas/DnsRecordsApproval"
+    DnsRecordsAnswer:
+      type: object
+      required: [version]
+      properties:
+        version:
+          description: The zone's version after the write.
+          type: integer
+          format: int64
+    DnsZoneRecordSet:
+      type: object
+      required: [name, type, ttl, kind]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        ttl:
+          type: integer
+          format: int64
+        kind:
+          description: user, system, edge, router, copy, challenge, canary, key or withheld.
+          type: string
+        values:
+          type: array
+          items:
+            type: string
+    DnsZone:
+      type: object
+      required: [network_id, root, label, version, record_sets]
+      properties:
+        network_id:
+          type: string
+        root:
+          type: string
+        label:
+          type: string
+        alias:
+          type: string
+        version:
+          type: integer
+          format: int64
+        record_sets:
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsZoneRecordSet"
+    NetworkDns:
+      type: object
+      required: [network_id, root, label, version, record_sets, entry_count, entry_limit]
+      properties:
+        network_id:
+          type: string
+        root:
+          type: string
+        label:
+          type: string
+        alias:
+          type: string
+        version:
+          type: integer
+          format: int64
+        record_sets:
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsZoneRecordSet"
+        entry_count:
+          description: The network's user RRsets, each one dns_entries unit.
+          type: integer
+          format: int64
+        entry_limit:
+          description: dns_entries' limit, -1 for none.
+          type: integer
+          format: int64
+    DnsApiErrorBody:
+      type: object
+      required: [code]
+      properties:
+        code:
+          description: invalid, refused, suspended, version_conflict, spent or unavailable.
+          type: string
+        error:
+          type: string
     QuotaRefusal:
       type: object
       required:
