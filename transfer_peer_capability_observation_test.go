@@ -17,6 +17,68 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Sticky capabilities survive rekeys and demotion, but a request proof
+// follows the concrete sending cipher and identifies its current epoch.
+func TestPeerCapabilityRecorderBindsLiveSendingEpoch(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	peerId := NewId()
+	session := &peerEncryptionSession{
+		ctx: ctx, client: &Client{clientId: NewId(), log: NewNoopLogger()},
+		peerId: peerId, role: sequenceTlsRoleClient, settings: DefaultEncryptionSettings(),
+	}
+	recorder := NewPeerCapabilityRecorder(1)
+	seal := func(group tls.CurveID) Id {
+		epochCtx, epochCancel := context.WithCancel(ctx)
+		epoch := &tlsHandshakeEpoch{
+			ctx: epochCtx, cancel: epochCancel, epochId: NewId(),
+			negotiatedCurveId: group, peerIdentityVerified: true, derivedTlsCipher: &sequenceCipher{},
+		}
+		session.stateLock.Lock()
+		session.epoch = epoch
+		session.markEstablishedWithLock(epoch)
+		session.stateLock.Unlock()
+		recorder.observeE2eSealed(peerId, group, session)
+		return epoch.epochId
+	}
+	classicalEpoch := seal(tls.X25519)
+	request, _ := recorder.Get(peerId)
+	if request.Session.EpochId != classicalEpoch || request.Session.PostQuantum || request.Session.KeyExchange != "X25519" {
+		t.Fatalf("classical request session: %+v", request)
+	}
+	pqEpoch := seal(tls.X25519MLKEM768)
+	final, _ := recorder.Get(peerId)
+	if final.Session.EpochId != pqEpoch || !final.Session.PostQuantum || final.Session == request.Session {
+		t.Fatalf("rekey reused the request proof: request %+v, final %+v", request.Session, final.Session)
+	}
+	// The ordinary cipher gate can withhold an established session without
+	// clearing its sticky seal. The recorder must read that same live gate.
+	session.stateLock.Lock()
+	session.keyHistoryState = clientKeyHistoryRejected
+	session.stateLock.Unlock()
+	if session.Cipher() != nil {
+		t.Fatal("fixture failed to withhold the application cipher")
+	}
+	demoted, _ := recorder.Get(peerId)
+	if !demoted.E2eSealed || demoted.Session != (PeerCapabilitySession{}) {
+		t.Fatalf("a sticky seal supplied a live proof after demotion: %+v", demoted)
+	}
+	session.stateLock.Lock()
+	session.keyHistoryState = clientKeyHistoryNotRequired
+	session.stateLock.Unlock()
+	for _, role := range []sequenceTlsRole{sequenceTlsRoleServer, sequenceTlsRoleClient} {
+		session.role, session.companion = role, role == sequenceTlsRoleClient
+		if observation, _ := recorder.Get(peerId); observation.Session != (PeerCapabilitySession{}) {
+			t.Fatalf("role %v companion %t supplied an ordinary initiator proof", role, session.companion)
+		}
+	}
+	session.role, session.companion = sequenceTlsRoleClient, false
+	cancel()
+	if observation, _ := recorder.Get(peerId); observation.Session != (PeerCapabilitySession{}) {
+		t.Fatal("closed session retained its proof")
+	}
+}
+
 // Returns a recorder whose clock steps one second per observation from a
 // fixed origin, and the time of the nth (0-based) observation, so every
 // recorded time is exact.
@@ -69,7 +131,7 @@ func TestPeerCapabilityRecorderRecordPostQuantumSession(t *testing.T) {
 		LastObservationTime: at(1),
 	})
 
-	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768, nil)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
@@ -90,7 +152,7 @@ func TestPeerCapabilityRecorderRecordClassicalSession(t *testing.T) {
 
 	recorder.observeE2eAttempt(peerId)
 	recorder.observeE2eHandshake(peerId, tls.X25519)
-	recorder.observeE2eSealed(peerId, tls.X25519)
+	recorder.observeE2eSealed(peerId, tls.X25519, nil)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
@@ -141,7 +203,7 @@ func TestPeerCapabilityRecorderHandshakeImpliesAttempt(t *testing.T) {
 		LastObservationTime: at(1),
 	})
 
-	recorder.observeE2eSealed(sealedPeerId, tls.X25519)
+	recorder.observeE2eSealed(sealedPeerId, tls.X25519, nil)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              sealedPeerId,
 		E2eAttempted:        true,
@@ -185,7 +247,7 @@ func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testin
 		LastObservationTime: at(1),
 	})
 
-	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	recorder.observeE2eSealed(peerId, tls.X25519MLKEM768, nil)
 	recorder.observeE2eHandshake(peerId, tls.X25519)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
@@ -198,7 +260,7 @@ func TestPeerCapabilityRecorderSealedKeyExchangeOutranksLaterHandshake(t *testin
 		LastObservationTime: at(3),
 	})
 
-	recorder.observeE2eSealed(peerId, tls.X25519)
+	recorder.observeE2eSealed(peerId, tls.X25519, nil)
 	requirePeerCapabilityObservation(t, recorder, PeerCapabilityObservation{
 		PeerId:              peerId,
 		E2eAttempted:        true,
@@ -339,7 +401,7 @@ func TestPeerCapabilityRecorderNilAndZeroValue(t *testing.T) {
 	peerId := NewId()
 	nilRecorder.observeE2eAttempt(peerId)
 	nilRecorder.observeE2eHandshake(peerId, tls.X25519MLKEM768)
-	nilRecorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+	nilRecorder.observeE2eSealed(peerId, tls.X25519MLKEM768, nil)
 	nilRecorder.observeAck(peerId)
 	nilRecorder.observeReceiveWindow(peerId, 4096)
 	if _, ok := nilRecorder.Get(peerId); ok {
@@ -447,7 +509,7 @@ func TestPeerCapabilityRecorderConcurrentReadsAndWrites(t *testing.T) {
 				for _, peerId := range peerIds {
 					recorder.observeE2eAttempt(peerId)
 					recorder.observeE2eHandshake(peerId, tls.X25519)
-					recorder.observeE2eSealed(peerId, tls.X25519MLKEM768)
+					recorder.observeE2eSealed(peerId, tls.X25519MLKEM768, nil)
 					recorder.observeAck(peerId)
 					recorder.observeReceiveWindow(peerId, ByteCount(writer*roundCount+round))
 				}

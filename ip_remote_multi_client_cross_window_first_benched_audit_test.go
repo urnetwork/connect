@@ -35,13 +35,13 @@ func privateCrossWindowTestFirstBenchedBeforeHealthySpeed(t *testing.T, quaranti
 			quality.setWarning(true, warnUnhealthy)
 		}
 		qualityWindow, speedWindow := harness.multiClient.windows[WindowTypeQuality], harness.multiClient.windows[WindowTypeSpeed]
-		if clients := qualityWindow.orderedClients(false, 4); len(clients) != 0 || !quality.isWarning() || quality.IsDone() {
+		if clients := qualityWindow.orderedClients(false, flowNeed{ipVersion: 4}); len(clients) != 0 || !quality.isWarning() || quality.IsDone() {
 			t.Fatal("first quality window is not live and wholly benched")
 		}
-		if clients := harness.multiClient.raceCandidates(qualityWindow, 4); len(clients) != 1 || clients[0] != quality {
+		if clients := harness.multiClient.raceCandidates(qualityWindow, flowNeed{ipVersion: 4}); len(clients) != 1 || clients[0] != quality {
 			t.Fatal("existing per-window last-resort field is not the benched quality owner")
 		}
-		if clients := speedWindow.orderedClients(false, 4); len(clients) != 1 || clients[0] != speed || speed.isWarning() || speed.IsDone() {
+		if clients := speedWindow.orderedClients(false, flowNeed{ipVersion: 4}); len(clients) != 1 || clients[0] != speed || speed.isWarning() || speed.IsDone() {
 			t.Fatal("permitted speed window does not have its ordinary healthy owner")
 		}
 		harness.multiClient.stateLock.Lock()

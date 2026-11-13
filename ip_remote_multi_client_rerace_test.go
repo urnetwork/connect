@@ -2168,20 +2168,21 @@ func TestDialFailureRepeatOnTheOnlyExitStillReraces(t *testing.T) {
 	})
 }
 
-// --- RR-7: the v6 downgrade ---
+// --- RR-7: no local downgrade (server FP2-PROTOCOL.md D11.8) ---
 
-// RR-7. A dual-stack exit whose v6 dials fail across two destinations while
-// its v4 connects is downgraded to v4-only by the signals: each failed v6
-// flow is re-raced with nothing reaching the app, the exit's monitor
-// category changes in place, the window fills the v6 shortfall from another
-// exit, new v6 flows go only to the v6-capable exit and v4 flows still use
-// the downgraded one.
-func TestDialFailureDowngradesStarvedIpv6AndFillsShortfall(t *testing.T) {
+// RR-7. IPV6.md B5's old trigger -- a dual-stack exit whose v6 dials fail
+// across two destinations while its v4 connects -- re-races each failed v6
+// flow with nothing reaching the app, as before, but no longer touches the
+// exit's category: placement reads only the server's labels. The exit stays
+// dualstack in its monitor event, no family_downgrade is published, IPv6
+// stays available, and a later v6 flow still goes to it. Pre-change, the
+// third strike latched it to v4-only for the life of the window.
+func TestDialFailureNeverDowngradesAStarvedIpv6Exit(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		harness := newReraceHarness(t, []reraceExitSpec{
 			{name: "a", tier: 0, family: IpFamilyDualstack, answer: func(path *IpPath) reraceAnswer {
-				if path.Version == 6 {
+				if path.Version == 6 && path.SourcePort < 42010 {
 					return reraceSignal
 				}
 				return reraceAccept
@@ -2190,17 +2191,13 @@ func TestDialFailureDowngradesStarvedIpv6AndFillsShortfall(t *testing.T) {
 		}, nil)
 		a := harness.channel("a")
 		window := harness.multiClient.windows[WindowTypeQuality]
-		addedAt := window.monitor.ProviderEvents()[a.ClientId()].EventTime
-		// a v6-only provider is drawn only by a v6-capable request, which the
-		// window makes only while it holds no v6-capable exit
-		c := harness.addExit(reraceExitSpec{name: "c", tier: 0, family: IpFamilyV6Only})
+		before := *window.monitor.ProviderEvents()[a.ClientId()]
 
 		v4 := reraceFlow(4, 0, 42000)
 		if _, _, ok := harness.connect(v4); !ok || harness.boundTo(v4) != a {
 			t.Fatal("A's v4 connect did not complete")
 		}
-		v6Flows := []*IpPath{reraceFlow(6, 1, 42001), reraceFlow(6, 2, 42002), reraceFlow(6, 1, 42003)}
-		for i, path := range v6Flows {
+		for i, path := range []*IpPath{reraceFlow(6, 1, 42001), reraceFlow(6, 2, 42002), reraceFlow(6, 1, 42003)} {
 			harness.syn(path)
 			if got := len(harness.exit("a").syns(path)); got != 1 {
 				t.Fatalf("v6 flow %d: A received %d SYNs, want 1", i, got)
@@ -2211,91 +2208,29 @@ func TestDialFailureDowngradesStarvedIpv6AndFillsShortfall(t *testing.T) {
 			if got := len(harness.delivered(path)); got != 0 {
 				t.Errorf("v6 flow %d: the app received %d packets, want none", i, got)
 			}
-			if i < 2 && a.IpFamily() != IpFamilyDualstack {
-				t.Fatalf("A was downgraded after %d v6 strikes", i+1)
-			}
+		}
+		if got := a.dialFailureCount(); got != 3 {
+			t.Fatalf("A carries %d dial strikes, want 3: the strike record is kept", got)
 		}
 
-		if got := a.IpFamily(); got != IpFamilyV4Only {
-			t.Fatalf("A's category = %q, want v4-only", got)
+		if got := a.IpFamily(); got != IpFamilyDualstack {
+			t.Errorf("A's category = %q, want the server's dualstack", got)
 		}
-		event := window.monitor.ProviderEvents()[a.ClientId()]
-		if event == nil || event.IpFamily != IpFamilyV4Only || event.State != ProviderStateAdded || !event.EventTime.Equal(addedAt) {
-			t.Errorf("A's monitor event = %+v, want v4-only republished in place", event)
-		}
-		downgrade := relEvent("family_downgrade", "exit", a.ClientId(), "to", string(IpFamilyV4Only), "dialfails", 3)
-		if got := len(harness.log.linesWith(downgrade)); got != 1 {
-			t.Errorf("%d %q events, want 1", got, downgrade)
-		}
-
-		// the shortfall is filled by the v6-only provider
-		harness.waitForExits(3)
-		filled := harness.channel("c")
-		if filled.IpFamily() != IpFamilyV6Only || !harness.multiClient.Ipv6Available() {
-			t.Errorf("the filled exit's category = %q and v6 available = %t, want v6-only and true", filled.IpFamily(), harness.multiClient.Ipv6Available())
-		}
-
-		// new v6 flows use only the v6-capable exit; v4 flows still use A
-		for i := range 3 {
-			path := reraceFlow(6, 3+i, 42010+i)
-			if _, elapsed, ok := harness.connect(path); !ok || reraceSettle < elapsed {
-				t.Errorf("v6 flow %d: completed=%t after %s, want at once", i, ok, elapsed)
-			}
-			if harness.boundTo(path) != filled || 0 < len(harness.exit("a").received(path)) {
-				t.Errorf("v6 flow %d did not go to the v6-capable exit alone", i)
-			}
-		}
-		next := reraceFlow(4, 6, 42020)
-		if _, _, ok := harness.connect(next); !ok || harness.boundTo(next) != a {
-			t.Error("a v4 flow no longer goes to the downgraded exit")
-		}
-		if got := len(c.received(next)); got != 0 {
-			t.Errorf("the v6-only exit received %d packets of a v4 flow", got)
-		}
-	})
-}
-
-// RR-7. A v6-only exit is never downgraded: its v6 strikes across two
-// destinations leave its category and its monitor event alone, and read as
-// plain starvation instead.
-func TestDialFailureNeverDowngradesIpv6OnlyExit(t *testing.T) {
-	GetMessagePoolAggregateStats()
-	synctest.Test(t, func(t *testing.T) {
-		// the v6-only provider joins through the v6 shortfall that the v4-only
-		// exit leaves open
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "v4", tier: 1, family: IpFamilyV4Only},
-			{name: "v6", tier: 0, family: IpFamilyV6Only, answer: reraceAlways(reraceSignal)},
-		}, nil)
-		v6 := harness.channel("v6")
-		window := harness.multiClient.windows[WindowTypeQuality]
-		before := *window.monitor.ProviderEvents()[v6.ClientId()]
-		if before.IpFamily != IpFamilyV6Only {
-			t.Fatalf("setup: the v6-only exit's monitor category = %q", before.IpFamily)
-		}
-
-		for i, path := range []*IpPath{reraceFlow(6, 1, 43001), reraceFlow(6, 2, 43002), reraceFlow(6, 1, 43003)} {
-			harness.syn(path)
-			if got := len(harness.exit("v6").syns(path)); got != 1 {
-				t.Fatalf("v6 flow %d: the v6-only exit received %d SYNs, want 1", i, got)
-			}
-			if harness.boundTo(path) != nil {
-				t.Errorf("v6 flow %d was not re-raced", i)
-			}
-		}
-
-		if got := v6.IpFamily(); got != IpFamilyV6Only {
-			t.Errorf("the v6-only exit's category = %q, want v6-only", got)
-		}
-		after := window.monitor.ProviderEvents()[v6.ClientId()]
+		after := window.monitor.ProviderEvents()[a.ClientId()]
 		if after == nil || after.IpFamily != before.IpFamily || after.State != before.State || !after.EventTime.Equal(before.EventTime) {
-			t.Errorf("the v6-only exit's monitor event changed: %+v, want %+v", after, before)
+			t.Errorf("A's monitor event changed: %+v, want %+v", after, before)
 		}
 		if got := len(harness.log.linesWith(relEvent("family_downgrade"))); got != 0 {
 			t.Errorf("%d family_downgrade events, want none", got)
 		}
-		if !v6.dialStarved() {
-			t.Error("the v6-only exit's strikes did not read as starvation")
+		if !harness.multiClient.Ipv6Available() || harness.multiClient.Ipv6Unroutable() {
+			t.Error("IPv6 is no longer available through the window")
+		}
+
+		// a later v6 flow still goes to A
+		later := reraceFlow(6, 3, 42010)
+		if _, _, ok := harness.connect(later); !ok || harness.boundTo(later) != a {
+			t.Error("a later v6 flow did not go to the exit the server labels dualstack")
 		}
 	})
 }

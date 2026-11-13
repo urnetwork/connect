@@ -55,7 +55,7 @@ func affinityTimeTestDonor(t *testing.T, parent *RemoteUserNatMultiClient, versi
 		ctx: parent.ctx, settings: parent.settings, healthy: true,
 		args: &multiClientChannelArgs{DestinationStats: DestinationStats{IpFamily: IpFamilyDualstack}},
 	}
-	if !donor.supportsIpVersion(version) || donor.args.FixedDestination {
+	if !donor.supportsFlow(version, IpProtocolUnknown) || donor.args.FixedDestination {
 		t.Fatal("ordinary donor fixture lacks the requested address family")
 	}
 	update.selectAffinityClient(donor)

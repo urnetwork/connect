@@ -9,6 +9,7 @@ package connect
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -170,52 +171,28 @@ func familyTestFilters(calls []familyTestCall) []IpFamilyFilter {
 // --- B1: the soft minimum and its exemptions ---
 
 func TestIpv6CapableShortfall(t *testing.T) {
-	auto := WindowSizeSettings{WindowSizeMin: 6, WindowSizeMax: 6, WindowSizeHardMax: 6, WindowSizeMinIpv6Capable: 1}
-	fixedSize := auto
-	fixedSize.FixedWindowSize = 1
-	off := auto
-	off.WindowSizeMinIpv6Capable = 0
-	cases := []struct {
+	for _, c := range []struct {
 		name             string
-		windowSize       WindowSizeSettings
-		fixedProfile     bool
+		target           int
 		fixedDestination bool
-		clientCount      int
-		ipv6CapableCount int
+		inactive         bool
+		held             int
 		want             int
 	}{
-		{"open once the fill has exits and none carries v6", auto, false, false, 3, 0, 1},
-		{"closed by one v6-capable exit", auto, false, false, 3, 1, 0},
-		{"forming window asks nothing extra", auto, false, false, 0, 0, 0},
-		{"fixed profile exempt", auto, true, false, 3, 0, 0},
-		{"fixed size exempt", fixedSize, false, false, 3, 0, 0},
-		{"fixed destination exempt", auto, false, true, 3, 0, 0},
-		{"minimum off", off, false, false, 3, 0, 0},
-	}
-	for _, c := range cases {
-		got := ipv6CapableShortfall(c.windowSize, c.fixedProfile, c.fixedDestination, c.clientCount, c.ipv6CapableCount)
-		if got != c.want {
-			t.Errorf("%s: shortfall = %d, want %d", c.name, got, c.want)
+		{name: "forming or full without IPv6", target: 1, want: 1},
+		{name: "satisfied", target: 1, held: 1},
+		{name: "partial target", target: 3, held: 1, want: 2},
+		{name: "fixed destination", target: 1, fixedDestination: true},
+		{name: "inactive profile window", target: 1, inactive: true},
+		{name: "no requested target"},
+	} {
+		if got := ipv6CapableShortfall(c.target, c.fixedDestination, c.inactive, c.held); got != c.want {
+			t.Errorf("%s: shortfall %d, want %d", c.name, got, c.want)
 		}
 	}
-
-	// the shipped defaults: the quality window holds one v6-capable exit
-	// softly, the speed window (fixed size 1) none
-	sizes := DefaultMultiClientSettings().WindowSizes
-	if sizes[WindowTypeQuality].WindowSizeMinIpv6Capable != 1 {
-		t.Errorf("quality WindowSizeMinIpv6Capable = %d, want 1", sizes[WindowTypeQuality].WindowSizeMinIpv6Capable)
-	}
-	if got := ipv6CapableShortfall(sizes[WindowTypeSpeed], false, false, 1, 0); got != 0 {
-		t.Errorf("speed window shortfall = %d, want 0 (fixed size)", got)
-	}
-	if got := ipv6CapableShortfall(sizes[WindowTypeQuality], false, false, 6, 0); got != 1 {
-		t.Errorf("quality window shortfall = %d, want 1", got)
-	}
-
-	negative := auto
-	negative.WindowSizeMinIpv6Capable = -1
+	negative := WindowSizeSettings{WindowSizeMinIpv6Capable: -1}
 	if err := negative.Validate(); err == nil {
-		t.Error("a negative WindowSizeMinIpv6Capable validated")
+		t.Error("negative IPv6 minimum validated")
 	}
 }
 
@@ -568,7 +545,7 @@ func TestIpFamilySupportsIpVersion(t *testing.T) {
 		}
 	}
 	bare := &multiClientChannel{}
-	if !bare.supportsIpVersion(4) || bare.supportsIpVersion(6) || !bare.supportsIpVersion(0) {
+	if !bare.supportsFlow(4, IpProtocolUnknown) || bare.supportsFlow(6, IpProtocolUnknown) || !bare.supportsFlow(0, IpProtocolUnknown) {
 		t.Error("a bare channel must read as legacy: v4 and any, never v6")
 	}
 }
@@ -624,150 +601,33 @@ func TestCandidatePathsRespectIpVersion(t *testing.T) {
 				}
 			}
 		}
-		check("OrderedClientsForIpVersion", window.OrderedClientsForIpVersion(ipVersion))
-		check("orderedClientsCrossTierForIpVersion", window.orderedClientsCrossTierForIpVersion(ipVersion))
-		check("lastResortClientsForIpVersion", window.lastResortClientsForIpVersion(ipVersion))
-		check("raceCandidates", multiClient.raceCandidates(window, ipVersion))
-		check("candidatesForIpVersion", candidatesForIpVersion(all, ipVersion))
+		need := flowNeed{ipVersion: ipVersion}
+		check("OrderedClientsForFlow", window.OrderedClientsForFlow(need))
+		check("orderedClientsCrossTierForFlow", window.orderedClientsCrossTierForFlow(need))
+		check("lastResortClientsForFlow", window.lastResortClientsForFlow(need))
+		check("raceCandidates", multiClient.raceCandidates(window, need))
+		check("candidatesForFlow", candidatesForFlow(all, need))
 
 		// the version-agnostic offers still return everything
 		if got := len(window.OrderedClients()); got != len(all) {
 			t.Errorf("OrderedClients = %d, want every exit (%d)", got, len(all))
 		}
-		if got := len(candidatesForIpVersion(all, 0)); got != len(all) {
-			t.Errorf("candidatesForIpVersion(0) = %d, want every exit (%d)", got, len(all))
+		if got := len(candidatesForFlow(all, flowNeed{})); got != len(all) {
+			t.Errorf("candidatesForFlow(any) = %d, want every exit (%d)", got, len(all))
 		}
 	})
 }
 
-// --- B5: the local v6 downgrade ---
+// --- B5 retired: no local downgrade (server FP2-PROTOCOL.md D11.8) ---
 
-// v6 strikes across distinct destinations while v4 stays healthy downgrade a
-// dualstack exit to v4-only exactly once; a starved v4 side, a proven v6
-// connect, or an exit that never carried v6 never trip it.
-func TestMaybeDowngradeIpv6(t *testing.T) {
-	settings := DefaultMultiClientSettings()
-	newChannel := func(family IpFamily) *multiClientChannel {
-		return &multiClientChannel{
-			settings: settings,
-			args: &multiClientChannelArgs{
-				MultiClientGeneratorClientArgs: MultiClientGeneratorClientArgs{ClientId: NewId()},
-				Destination:                    RequireMultiHopId(NewId()),
-				DestinationStats:               DestinationStats{IpFamily: family},
-			},
-		}
-	}
-	strikeV6 := func(client *multiClientChannel) {
-		client.addDialFailure("2606:2800:220:1::1", 6)
-		client.addDialFailure("2001:4860:4860::8888", 6)
-		client.addDialFailure("2606:2800:220:1::1", 6)
-	}
-
-	// the transition, once
-	client := newChannel(IpFamilyDualstack)
-	client.addDialFailure("2606:2800:220:1::1", 6)
-	client.addDialFailure("2001:4860:4860::8888", 6)
-	if client.maybeDowngradeIpv6() {
-		t.Fatal("two v6 strikes (below the threshold) downgraded the exit")
-	}
-	client.addDialFailure("2606:2800:220:1::1", 6)
-	if !client.maybeDowngradeIpv6() {
-		t.Fatal("three v6 strikes across two destinations with healthy v4 did not downgrade")
-	}
-	if got := client.IpFamily(); got != IpFamilyV4Only {
-		t.Errorf("downgraded family = %q, want v4-only", got)
-	}
-	if client.maybeDowngradeIpv6() {
-		t.Error("the downgrade fired twice")
-	}
-	if client.supportsIpVersion(6) || !client.supportsIpVersion(4) {
-		t.Error("a downgraded exit must carry v4 and not v6")
-	}
-	// the ordinary starvation verdict is separate: v6-only strikes with no
-	// v4 evidence at all read as starved for the plain threshold too, which
-	// is fine -- the downgrade is the narrower, family-aware answer
-	if !client.dialStarved() {
-		t.Error("three strikes did not read as starved on the plain threshold")
-	}
-
-	// v4 starved too: the whole upstream is failing, not the v6 side
-	both := newChannel(IpFamilyDualstack)
-	strikeV6(both)
-	both.addDialFailure("93.184.216.34", 4)
-	both.addDialFailure("142.250.74.100", 4)
-	both.addDialFailure("93.184.216.34", 4)
-	if both.maybeDowngradeIpv6() {
-		t.Error("an exit whose v4 is also starved was downgraded instead of read as starved")
-	}
-	if both.IpFamily() != IpFamilyDualstack {
-		t.Errorf("family = %q, want dualstack untouched", both.IpFamily())
-	}
-
-	// a proven v6 connect in the window clears the v6 verdict
-	proven := newChannel(IpFamilyDualstack)
-	strikeV6(proven)
-	proven.addConnectSuccess(6)
-	if proven.maybeDowngradeIpv6() {
-		t.Error("a proven v6 connect did not clear the downgrade")
-	}
-
-	// a proven v4 connect beside starved v4 strikes still reads v4 healthy
-	healthyV4 := newChannel(IpFamilyDualstack)
-	strikeV6(healthyV4)
-	healthyV4.addDialFailure("93.184.216.34", 4)
-	healthyV4.addDialFailure("142.250.74.100", 4)
-	healthyV4.addDialFailure("93.184.216.34", 4)
-	healthyV4.addConnectSuccess(4)
-	if !healthyV4.maybeDowngradeIpv6() {
-		t.Error("v4 with a proven connect did not count as healthy")
-	}
-
-	// strikes on one destination only never convict, like the plain verdict
-	single := newChannel(IpFamilyDualstack)
-	single.addDialFailure("2606:2800:220:1::1", 6)
-	single.addDialFailure("2606:2800:220:1::1", 6)
-	single.addDialFailure("2606:2800:220:1::1", 6)
-	if single.maybeDowngradeIpv6() {
-		t.Error("three strikes on one destination downgraded the exit")
-	}
-
-	// nothing to lose
-	for _, family := range []IpFamily{IpFamilyV4Only, IpFamilyLegacy} {
-		never := newChannel(family)
-		strikeV6(never)
-		if never.maybeDowngradeIpv6() {
-			t.Errorf("a %q exit reported a downgrade", family)
-		}
-	}
-	// a v6-only exit whose v6 is starved has no v4 to fall back on: the
-	// plain starvation warning is the right answer, not a downgrade
-	v6Only := newChannel(IpFamilyV6Only)
-	strikeV6(v6Only)
-	if v6Only.maybeDowngradeIpv6() {
-		t.Error("a v6-only exit was downgraded to v4-only")
-	}
-	if !v6Only.dialStarved() {
-		t.Error("a v6-only exit with v6 strikes did not read as starved")
-	}
-
-	// the versioned strike record prunes as one: legacy fixtures that write
-	// the times alone still read every strike as v4
-	fixture := newChannel(IpFamilyDualstack)
-	fixture.dialFailureTimes = []time.Time{time.Now(), time.Now(), time.Now()}
-	fixture.dialFailureDestinations = []string{"a", "b", "a"}
-	if fixture.maybeDowngradeIpv6() {
-		t.Error("unversioned strikes read as v6")
-	}
-	if !fixture.dialStarved() {
-		t.Error("unversioned strikes stopped counting toward the plain verdict")
-	}
-}
-
-// The dial-failure path drives the downgrade end to end: the exit's category
-// drops, the monitor's provider event is rewritten in place (state and
-// connected-since untouched), the exit readout agrees, and the owning
-// window's resize pass is woken to fill the shortfall that opened.
-func TestClientDialFailureDowngradesAndRepublishes(t *testing.T) {
+// B5's old trigger -- v6 strikes across distinct destinations while v4 stays
+// healthy -- leaves a dualstack exit's labels alone end to end: its category,
+// the monitor's provider event, the exit readout, its v6 placement and the
+// window's v6 availability are all unchanged, no family_downgrade event is
+// published and the window opens no v6 shortfall. The strikes still count
+// toward the ordinary starvation warning. Pre-change, the third strike
+// latched the exit to v4-only and republished it.
+func TestIpv6DialStrikesLeaveTheServerLabels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultMultiClientSettings()
@@ -776,10 +636,11 @@ func TestClientDialFailureDowngradesAndRepublishes(t *testing.T) {
 	client := familyTestChannel(t, ctx, settings, IpFamilyDualstack)
 	window.clients[client.ClientId()] = client
 
+	log := newRecordingLogger()
 	multiClient := &RemoteUserNatMultiClient{
 		ctx:                ctx,
 		cancel:             cancel,
-		log:                NewNoopLogger(),
+		log:                log,
 		settings:           settings,
 		windows:            map[WindowType]*multiClientWindow{WindowTypeQuality: window},
 		ip4PathUpdates:     map[Ip4Path]*multiClientChannelUpdate{},
@@ -803,46 +664,93 @@ func TestClientDialFailureDowngradesAndRepublishes(t *testing.T) {
 		multiClient.ip6PathUpdates[path.ToIp6Path()] = update
 		multiClient.clientUpdates[client][update] = true
 	}
+	// v4 stays healthy: a proven v4 connect, the "v4 healthy" half of B5
+	client.addConnectSuccess(4)
 
 	window.monitor.AddProviderEvent(client.ClientId(), ProviderStateAdded, client.Destination().Tail(), nil, client.IpFamily())
-	addedAt := window.monitor.ProviderEvents()[client.ClientId()].EventTime
+	addedEvent := window.monitor.ProviderEvents()[client.ClientId()]
 	resizeNotify := window.resizeMonitor.NotifyChannel()
 
 	multiClient.clientDialFailureSignal(client, first)
 	multiClient.clientDialFailureSignal(client, second)
-	// a repeat of the first flow's failure is no strike
-	multiClient.clientDialFailureSignal(client, first)
-	if got := client.IpFamily(); got != IpFamilyDualstack {
-		t.Fatalf("family after two strikes = %q, want dualstack", got)
-	}
 	multiClient.clientDialFailureSignal(client, third)
 
-	if got := client.IpFamily(); got != IpFamilyV4Only {
-		t.Fatalf("family after three strikes = %q, want v4-only", got)
+	if got := client.dialFailureCount(); got != 3 {
+		t.Fatalf("dial strikes = %d, want 3: the strike record is kept", got)
 	}
-	event := window.monitor.ProviderEvents()[client.ClientId()]
-	if event == nil || event.IpFamily != IpFamilyV4Only {
-		t.Fatalf("monitor event = %+v, want the v4-only category republished", event)
+	if got := client.IpFamily(); got != IpFamilyDualstack {
+		t.Errorf("family after three v6 strikes = %q, want the server's dualstack", got)
 	}
-	if event.State != ProviderStateAdded || !event.EventTime.Equal(addedAt) {
-		t.Errorf("republish changed state/time: %v %v, want Added at %v", event.State, event.EventTime, addedAt)
+	if got := client.capabilities(); got.Ip != ProviderIpCapabilityDualstack {
+		t.Errorf("labels after three v6 strikes = %+v, want the server's dualstack", got)
+	}
+	if !client.supportsFlow(6, IpProtocolTcp) {
+		t.Error("the exit stopped carrying v6 flows on strikes alone")
+	}
+	if event := window.monitor.ProviderEvents()[client.ClientId()]; event != addedEvent {
+		t.Errorf("monitor event = %+v, want the Added event untouched", event)
 	}
 	select {
 	case <-resizeNotify:
+		t.Error("the strikes woke the resize pass to fill a v6 shortfall")
 	default:
-		t.Error("the downgrade did not wake the window's resize pass")
 	}
-	exits := multiClient.Exits()
-	if len(exits) != 1 || exits[0].IpFamily != IpFamilyV4Only {
-		t.Errorf("exits = %+v, want one v4-only exit", exits)
+	if exits := multiClient.Exits(); len(exits) != 1 || exits[0].IpFamily != IpFamilyDualstack {
+		t.Errorf("exits = %+v, want one dualstack exit", exits)
 	}
-	if window.ipv6Available() {
-		t.Error("a downgraded exit still reads as v6 available")
+	if !window.ipv6Available() || multiClient.Ipv6Unroutable() {
+		t.Error("the window stopped reading as v6 available on strikes alone")
 	}
-	// the flow that failed is a v6 flow bound to an exit that no longer
-	// carries v6: the rebind of new flows must skip it
-	if candidates := window.OrderedClientsForIpVersion(6); len(candidates) != 0 {
-		t.Errorf("a downgraded exit is still offered to v6 flows (%d candidates)", len(candidates))
+	if candidates := window.OrderedClientsForFlow(flowNeed{ipVersion: 6, ipProtocol: IpProtocolTcp}); len(candidates) != 1 {
+		t.Errorf("v6 placement offers %d exits, want the dualstack exit", len(candidates))
+	}
+	if 0 < len(log.linesWith("family_downgrade")) {
+		t.Error("a family_downgrade event was published")
+	}
+}
+
+// Udp flows whose datagrams get no answer leave the protocol label alone:
+// no client-side state lowers a label (D7.5), so the exit still carries udp
+// until a fresh find-providers2 answer relabels it.
+func TestUnansweredUdpLeavesTheProtocolLabel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultMultiClientSettings()
+	window := familyTestWindow(ctx, newFamilyTestGenerator(nil), settings)
+	client := familyTestChannel(t, ctx, settings, IpFamilyV4Only)
+	window.clients[client.ClientId()] = client
+	for i := range 4 {
+		path := udpTestPath(4)
+		path.SourcePort += i
+		client.addDialFailure(path.DestinationIp.String(), path.Version)
+	}
+	if got := client.capabilities().Protocol; got != ProviderProtocolCapabilityDualproto {
+		t.Errorf("protocol label after unanswered udp = %q, want dualproto", got)
+	}
+	if !client.supportsFlow(4, IpProtocolUdp) || !window.udpAvailable() {
+		t.Error("unanswered udp lowered the exit's udp placement")
+	}
+}
+
+// A label changes only when a fresh find-providers2 answer relabels the
+// entry: an echoed answer's labels replace the remembered ones a redial
+// would use, and a legacy answer leaves them.
+func TestOnlyAFreshAnswerRelabelsAnExit(t *testing.T) {
+	remembered := DestinationStats{
+		Tier:         2,
+		IpFamily:     IpFamilyDualstack,
+		Capabilities: ProviderCapabilities{Ip: ProviderIpCapabilityDualstack, Protocol: ProviderProtocolCapabilityDualproto},
+	}
+	fresh := DestinationStats{
+		IpFamily:     IpFamilyV4Only,
+		Capabilities: ProviderCapabilities{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityTcp},
+	}
+	relabelled := relabelledStats(remembered, fresh, true)
+	if relabelled.IpFamily != IpFamilyV4Only || relabelled.Capabilities != fresh.Capabilities || relabelled.Tier != 2 {
+		t.Errorf("selector-mode answer relabelled to %+v, want the fresh labels on the remembered stats", relabelled)
+	}
+	if kept := relabelledStats(remembered, fresh, false); !reflect.DeepEqual(kept, remembered) {
+		t.Errorf("legacy answer changed the remembered stats to %+v", kept)
 	}
 }
 
@@ -1052,8 +960,7 @@ func TestExitInfoAndProviderEventCarryIpFamily(t *testing.T) {
 	if !window.monitor.SetProviderIpFamily(byFamily[IpFamilyDualstack].ClientId(), IpFamilyV4Only) {
 		t.Error("a changed category was not reported")
 	}
-	// removal carries the effective category
-	byFamily[IpFamilyDualstack].ipFamilyDowngraded.Store(true)
+	// removal carries the exit's category, the server's label
 	var removed *ProviderEvent
 	var removedMutex sync.Mutex
 	unsub := window.monitor.AddMonitorEventCallback(func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool) {
@@ -1074,8 +981,8 @@ func TestExitInfoAndProviderEventCarryIpFamily(t *testing.T) {
 		event := removed
 		removedMutex.Unlock()
 		if event != nil {
-			if event.IpFamily != IpFamilyV4Only {
-				t.Errorf("removed event family = %q, want the downgraded v4-only", event.IpFamily)
+			if event.IpFamily != IpFamilyDualstack {
+				t.Errorf("removed event family = %q, want the server's dualstack", event.IpFamily)
 			}
 			break
 		}
@@ -1098,7 +1005,7 @@ func TestFixedDestinationExitCarriesEveryVersion(t *testing.T) {
 	peer.args.FixedDestination = true
 
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
-		if !peer.supportsIpVersion(ipVersion) {
+		if !peer.supportsFlow(ipVersion, IpProtocolUnknown) {
 			t.Errorf("a fixed-destination legacy exit refused v%d", ipVersion)
 		}
 	})
@@ -1118,7 +1025,7 @@ func TestFixedDestinationExitCarriesEveryVersion(t *testing.T) {
 	if victim, _ := window.selectFamilySwapVictim([]*multiClientChannel{peer}, map[*multiClientChannel]float32{}); victim != nil {
 		t.Error("a fixed-destination exit was chosen as a swap victim")
 	}
-	if got := len(window.OrderedClientsForIpVersion(6)); got != 1 {
+	if got := len(window.OrderedClientsForFlow(flowNeed{ipVersion: 6})); got != 1 {
 		t.Errorf("fixed window offered %d exits to a v6 flow, want 1", got)
 	}
 }

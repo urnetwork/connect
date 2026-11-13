@@ -46,7 +46,7 @@ func defaultCollapseTestProvider(
 		},
 		sendGroupForTest: admit,
 	}
-	if !selected.hasActiveTransport() || !selected.supportsIpVersion(4) || !selected.supportsIpVersion(6) {
+	if !selected.hasActiveTransport() || !selected.supportsFlow(4, IpProtocolUnknown) || !selected.supportsFlow(6, IpProtocolUnknown) {
 		t.Fatal("default collapse provider lacks its real dual-stack carrier premise")
 	}
 	return selected

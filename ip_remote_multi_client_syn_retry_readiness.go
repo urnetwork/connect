@@ -51,9 +51,22 @@ func synRetryReadyCapacity(parent *RemoteUserNatMultiClient, update *multiClient
 	}
 	if parent != nil && parent.settings != nil {
 		capacity = max(capacity, parent.settings.MultiRaceClientCount, parent.settings.MultiRaceDegradedClientCount, parent.settings.WindowSizeLimit)
+		field := 0
 		for _, settings := range parent.settings.WindowSizes {
-			capacity = max(capacity, settings.WindowSizeMin, settings.WindowSizeMax, settings.WindowSizeHardMax, settings.FixedWindowSize)
+			field = max(field, settings.WindowSizeMin, settings.WindowSizeMax, settings.WindowSizeHardMax, settings.FixedWindowSize)
 		}
+		// the limited window's exits join every selected window's field
+		// (server FP2-PROTOCOL.md §7.5), at the configured fraction
+		if _, limited := parent.windows[WindowTypeLimited]; limited {
+			field += limitedWindowSize(limitedSizing{
+				enabled:    true,
+				fraction:   parent.settings.LimitedWindowSizeFraction,
+				sizeMax:    parent.settings.LimitedWindowSizeMax,
+				targetSize: field,
+				hardMax:    field,
+			}).WindowSizeMax
+		}
+		capacity = max(capacity, field)
 	}
 	return capacity
 }

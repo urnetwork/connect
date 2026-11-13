@@ -22,6 +22,7 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"weak"
 )
 
 // The ML-KEM TLS key exchanges by IANA NamedGroup codepoint, named here so the
@@ -64,7 +65,8 @@ func tlsKeyExchangeName(curveId tls.CurveID) string {
 
 // One peer's evidence as of the read.
 //
-// Every flag is sticky for the life of the owning PeerCapabilityRecorder:
+// The capability flags are sticky for the life of the owning recorder;
+// Session separately reads the currently usable sending epoch.
 // each records something the peer did, not a current state. A false flag is
 // an absence of evidence, and it is evidence of absence only when the
 // precondition named on the field holds.
@@ -111,6 +113,11 @@ type PeerCapabilityObservation struct {
 	// responder chose a post-quantum group. With E2eSealed, a post-quantum key
 	// exchange the peer's identity proof authenticated.
 	PostQuantum bool
+	// The currently usable ordinary initiator session, separate from sticky
+	// capability evidence. Zero after demotion/close or without a live cipher.
+	// A request proof must bind its first write and completion to this exact
+	// client and epoch, never to the most recently recorded sticky group.
+	Session PeerCapabilitySession
 
 	// A send sequence to the peer processed an acknowledgement of its own
 	// retained data. The precondition for reading WindowAdvertised as false.
@@ -125,6 +132,15 @@ type PeerCapabilityObservation struct {
 	// When the record last received an observation of any kind, including one
 	// that changed no field.
 	LastObservationTime time.Time
+}
+
+// A single current sending epoch, without aggregation across clients, roles
+// or companion lanes. Comparable so a probe can fence a request against rekey.
+type PeerCapabilitySession struct {
+	ClientId    Id
+	EpochId     Id
+	KeyExchange string
+	PostQuantum bool
 }
 
 // Records, per peer, what the peer has shown it supports on the wire (see
@@ -172,6 +188,9 @@ type peerCapability struct {
 	// in which case a later unauthenticated handshake does not replace it
 	keyExchange       tls.CurveID
 	keyExchangeSealed bool
+	// A weak reference cannot retain a retired client's graph for the life
+	// of a shared recorder. Read only after releasing the recorder lock.
+	sealedSession weak.Pointer[peerEncryptionSession]
 
 	ackObserved               bool
 	windowAdvertised          bool
@@ -306,7 +325,7 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 // Records a client-role session whose epoch, negotiated with the given group,
 // verified the peer's identity proof and became established. Called only for
 // sessions this client initiated.
-func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.CurveID) {
+func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.CurveID, session *peerEncryptionSession) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
@@ -324,6 +343,7 @@ func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.
 		capability.e2eSealed = true
 		capability.keyExchange = keyExchange
 		capability.keyExchangeSealed = true
+		capability.sealedSession = weak.Make(session)
 		capability.lastObservationTime = now
 		return true
 	}()
@@ -428,7 +448,7 @@ func (self *peerCapability) markAttemptedWithLock(now time.Time) {
 }
 
 func (self peerCapability) observation(peerId Id) PeerCapabilityObservation {
-	return PeerCapabilityObservation{
+	observation := PeerCapabilityObservation{
 		PeerId:                    peerId,
 		E2eAttempted:              self.e2eAttempted,
 		E2eFirstAttemptTime:       self.e2eFirstAttemptTime,
@@ -441,4 +461,8 @@ func (self peerCapability) observation(peerId Id) PeerCapabilityObservation {
 		MaxReceiveWindowByteCount: self.maxReceiveWindowByteCount,
 		LastObservationTime:       self.lastObservationTime,
 	}
+	if session := self.sealedSession.Value(); session != nil {
+		observation.Session = session.capabilitySession()
+	}
+	return observation
 }

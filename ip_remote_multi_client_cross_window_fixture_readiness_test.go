@@ -28,7 +28,7 @@ func TestPrivateCrossWindowFixedProfileReadinessAfterSpeedPublication(t *testing
 				deadline := time.After(time.Minute)
 				for {
 					var changed <-chan struct{}
-					if clients := window.orderedClients(true, 0, &changed); len(clients) == 1 {
+					if clients := window.orderedClients(true, flowNeed{}, &changed); len(clients) == 1 {
 						published = true
 						t.Log("fixture publication barrier: actual speed owner=1, fixed profile size=0")
 						return

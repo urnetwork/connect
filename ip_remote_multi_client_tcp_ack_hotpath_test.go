@@ -259,7 +259,7 @@ func TestTcpRecoveryPublicSynRefusalPreservesHealthyRetry(t *testing.T) {
 // preserves the selected receipt and leaves the established IPv4 sibling live.
 func TestTcpRecoveryPublicSynRejectsUnsupportedSelectedFamily(t *testing.T) {
 	f := newTcpAckBenchFixture(t, 0, 1)
-	if !f.channel.supportsIpVersion(4) || f.channel.supportsIpVersion(6) {
+	if !f.channel.supportsFlow(4, IpProtocolUnknown) || f.channel.supportsFlow(6, IpProtocolUnknown) {
 		t.Fatal("legacy fixture provider must retain its IPv4-only family contract")
 	}
 	path := &IpPath{Version: 6, Protocol: IpProtocolTcp,

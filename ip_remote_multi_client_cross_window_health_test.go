@@ -48,7 +48,7 @@ func privateCrossWindowTestSoleUnavailableSpeed(t *testing.T, kind string) {
 			if _, err := speed.WindowStats(); err != nil || !speed.isWarning() || speed.IsDone() {
 				t.Fatal("live benched-only speed premise was not observed")
 			}
-			if got := harness.multiClient.raceCandidates(harness.multiClient.windows[WindowTypeSpeed], 4); len(got) != 1 || got[0] != speed {
+			if got := harness.multiClient.raceCandidates(harness.multiClient.windows[WindowTypeSpeed], flowNeed{ipVersion: 4}); len(got) != 1 || got[0] != speed {
 				t.Fatal("existing per-window last-resort availability premise changed")
 			}
 		}

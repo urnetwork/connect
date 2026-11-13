@@ -98,8 +98,14 @@ func TestReadinessFixtureLegacyDiscoveryJoinsOwner(t *testing.T) {
 				}
 			}()
 			synctest.Wait()
-			if generator.entered.Load() != int32(len(multi.windows)) || generator.returned.Load() != 0 {
-				t.Fatalf("fixed=%t: actual legacy discovery not held: entered=%d returned=%d windows=%d", fixed, generator.entered.Load(), generator.returned.Load(), len(multi.windows))
+			// the limited window asks only a capability-aware generator, so
+			// a legacy one is entered by the normal windows alone
+			discovering := len(multi.windows)
+			if multi.windows[WindowTypeLimited] != nil {
+				discovering -= 1
+			}
+			if generator.entered.Load() != int32(discovering) || generator.returned.Load() != 0 {
+				t.Fatalf("fixed=%t: actual legacy discovery not held: entered=%d returned=%d windows=%d", fixed, generator.entered.Load(), generator.returned.Load(), discovering)
 			}
 			if _, providers := multi.Monitor().Events(); len(providers) != 0 {
 				t.Fatalf("fixed=%t: held discovery published %d providers", fixed, len(providers))

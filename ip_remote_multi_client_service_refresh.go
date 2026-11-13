@@ -56,13 +56,19 @@ func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientC
 		return
 	}
 	windowTypes := self.selectWindowTypes(&parsedPacket{ipPath: path}, appId)
+	// the limited window's exits race tcp flows beside every selected
+	// window's (server FP2-PROTOCOL.md §7.5), so they are offered too, and
+	// its slots rotate last
+	if self.windows[WindowTypeLimited] != nil {
+		windowTypes = append(windowTypes, WindowTypeLimited)
+	}
 	members := make(map[WindowType][]*multiClientChannel, len(windowTypes))
 	var offered []*multiClientChannel
 	for _, windowType := range windowTypes {
 		if window := self.windows[windowType]; window != nil {
 			members[windowType] = window.unorderedClients()
 			for _, client := range members[windowType] {
-				if !client.IsDone() && !client.isWarning() && client.supportsIpVersion(path.Version) {
+				if !client.IsDone() && !client.isWarning() && client.supportsIpPath(path) {
 					offered = append(offered, client)
 				}
 			}
@@ -84,7 +90,7 @@ func (self *RemoteUserNatMultiClient) requestServiceRefresh(update *multiClientC
 			continue
 		}
 		for _, victim := range members[windowType] {
-			if victim.IsDone() || victim.isWarning() || !victim.supportsIpVersion(path.Version) {
+			if victim.IsDone() || victim.isWarning() || !victim.supportsIpPath(path) {
 				continue
 			}
 			owner, stamp := self.claimServiceRefreshOwner(update, path, victim, offered)

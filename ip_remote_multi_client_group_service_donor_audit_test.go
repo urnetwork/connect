@@ -127,7 +127,7 @@ func privateTestGroupDonorServiceFailure(t *testing.T, version int) {
 		if harness.boundTo(donorPath) != quality || !donor.receivedInbound.Load() || quality.isWarning() || quality.IsDone() || !quality.positiveAffinityHealth() {
 			t.Fatal("exact-service refusal changed the retained established donor's global health or owner")
 		}
-		if speed.isWarning() || speed.IsDone() || !speed.supportsIpVersion(version) {
+		if speed.isWarning() || speed.IsDone() || !speed.supportsFlow(version, IpProtocolUnknown) {
 			t.Fatal("ordinary unfailed speed alternative was not available")
 		}
 		freshPath := privateCrossWindowFlow(version, 26, freshPort)
