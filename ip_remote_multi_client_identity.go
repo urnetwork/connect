@@ -323,11 +323,11 @@ func (self *windowIdentityState) TakeRestoredContext(ctx context.Context, destin
 
 // ForgetRestored drops every identity still pending reuse for a destination
 // the platform refused to confirm modern, so no later window expansion of
-// this process returns or dials it again. An identity whose own generation is
-// live leaves the live set too, and the store snapshot is rewritten. A
-// pending identity is not in the live set, so the store loses it at its next
-// write, as it loses every pending identity no window took. Returns the
-// identities dropped.
+// this process offers the destination as restored or reuses one of its
+// identities. An identity whose own generation is live leaves the live set
+// too, and the store snapshot is rewritten. A pending identity is not in the
+// live set, so the store loses it at its next write, as it loses every
+// pending identity no window took. Returns the identities dropped.
 func (self *windowIdentityState) ForgetRestored(destination MultiHopId) []*WindowClientIdentity {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
