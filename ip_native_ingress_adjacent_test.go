@@ -62,9 +62,15 @@ func TestNativeIngressEncryptionReadinessKeepsOwner(t *testing.T) {
 				update.client.Load() != selected || selected.endErr != nil {
 				t.Fatalf("encryption readiness reset, waited or committed an original: mux=%t calls=%d resets=%d", throughMux, calls, resets)
 			}
+			if got := parent.NativeAdmissionRefusalCount(); got != 1 {
+				t.Fatalf("encryption readiness refusal count=%d, want 1", got)
+			}
 			ready = true
 			if offer() != 1 || calls != 2 || resets != 0 {
 				t.Fatalf("previous refusal consumed retry/collapse authority: mux=%t calls=%d resets=%d", throughMux, calls, resets)
+			}
+			if got := parent.NativeAdmissionRefusalCount(); got != 1 {
+				t.Fatalf("successful encryption retry changed refusal count to %d", got)
 			}
 		})
 	}

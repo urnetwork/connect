@@ -320,6 +320,9 @@ func TestNativeAckCompactionQueueRefusalThenRetry(t *testing.T) {
 			t.Fatalf("queue refusal changed native custody: count=%d membership=%v calls=%d provider=%d drops=%d elapsed=%s",
 				count, membership, calls, providerPackets.Load(), fixture.parent.TcpCollapseDropCount()-drops, time.Since(before))
 		}
+		if got := fixture.parent.NativeAdmissionRefusalCount(); got != 1 {
+			t.Fatalf("compacted ACK refusal count=%d, want 1 independently of 31 collapsed DATA packets", got)
+		}
 		fixture.selected.sendGroupForTest = nil
 		count, membership = offer()
 		synctest.Wait()
@@ -329,6 +332,9 @@ func TestNativeAckCompactionQueueRefusalThenRetry(t *testing.T) {
 			fixture.parent.TcpCollapseDropCount() != drops+62 || time.Since(before) != 0 {
 			t.Fatalf("queue refusal prevented exact fresh-read recovery: count=%d membership=%v provider=%d drops=%d elapsed=%s",
 				count, membership, providerPackets.Load(), fixture.parent.TcpCollapseDropCount()-drops, time.Since(before))
+		}
+		if got := fixture.parent.NativeAdmissionRefusalCount(); got != 1 {
+			t.Fatalf("recovered ACK or collapsed DATA changed refusal count to %d", got)
 		}
 	})
 }

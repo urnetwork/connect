@@ -83,6 +83,9 @@ func TestNativeIngressNextReadPrecedesUnrelatedCreditRelease(t *testing.T) {
 				if counts != [2]int{0, 1} || time.Since(started) != 0 {
 					t.Fatalf("native disposition=%v elapsed=%s; want refused/accepted without waiting", counts, time.Since(started))
 				}
+				if got := f.base.parent.NativeAdmissionRefusalCount(); got != 1 {
+					t.Fatalf("retained-credit refusal count=%d, want 1 before independent progress", got)
+				}
 			default:
 				t.Fatal("ready later native batch did not finish before peer credit")
 			}
@@ -112,6 +115,9 @@ func TestNativeIngressNextReadPrecedesUnrelatedCreditRelease(t *testing.T) {
 				t.Fatal("refusal committed collapse state or prevented the original source's retransmission")
 			}
 			f.finishPackets(f.tcp)
+			if got := f.base.parent.NativeAdmissionRefusalCount(); got != 1 {
+				t.Fatalf("successful source retry changed refusal count to %d", got)
+			}
 		})
 	}
 }
@@ -134,5 +140,8 @@ func TestNativeIngressKeepsGenericBlockingContract(t *testing.T) {
 			t.Fatal("ordinary waiting caller lost its owned original")
 		}
 		f.finishPackets(f.tcp)
+		if got := f.base.parent.NativeAdmissionRefusalCount(); got != 0 {
+			t.Fatalf("ordinary blocking caller counted as native refusal: %d", got)
+		}
 	})
 }

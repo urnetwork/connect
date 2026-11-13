@@ -1849,6 +1849,9 @@ type RemoteUserNatMultiClient struct {
 	// Redundant TCP packets are deliberately refused before admission. Count
 	// packets, not send calls, so singular and grouped sends reconcile alike.
 	tcpCollapseDropCount atomic.Uint64
+	// Native ready-only offers can refuse unavailable routes or admission
+	// without a policy block, duplicate, or terminal transport error.
+	nativeAdmissionRefusalCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
 	// maintenance paths; the fixed queue caps retained packets and memory.
@@ -7694,6 +7697,13 @@ func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
 	return self.tcpCollapseDropCount.Load()
 }
 
+// Counts original native packets refused for route, queue or encryption
+// readiness after policy and collapse checks. Internal recovery offers and
+// terminal errors are excluded. Safe to read concurrently with sends.
+func (self *RemoteUserNatMultiClient) NativeAdmissionRefusalCount() uint64 {
+	return self.nativeAdmissionRefusalCount.Load()
+}
+
 // AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
 // every window client's transports, passed through unchanged (DELAY.md §9).
 // Callbacks run on transport goroutines and must not block.
@@ -7906,11 +7916,19 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
 	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress || sendPacketGroup.isSynRetry()
+	nativeReadinessRefused := false
+	nativeTerminalError := false
+	var sentUpdate *multiClientChannelUpdate
 	if nativeIngress {
 		// This is a ready offer, not a shorter delivery or recovery deadline.
 		timeout = 0
 	}
 	defer func() {
+		if !success && nativeReadinessRefused && batchAdmission != nil && batchAdmission.nativeIngress &&
+			!sendPacketGroup.isSynRetry() && !nativeTerminalError && self.ctx.Err() == nil &&
+			sentUpdate != nil && sentUpdate.ctx.Err() == nil {
+			self.nativeAdmissionRefusalCount.Add(uint64(len(sendPacketGroup.packets)))
+		}
 		if !success {
 			sendPacketGroup.collapseAdmission.releaseTcpRecovery()
 		}
@@ -7928,7 +7946,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	}()
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
-	var sentUpdate *multiClientChannelUpdate
 	self.sendAffinityClientPath(sendPacketGroup, timeout, func(update *multiClientChannelUpdate, currentClient *multiClientChannel, affinityTimeout time.Duration) {
 		if batchAdmission != nil && batchAdmission.expectedUpdate != nil && batchAdmission.expectedUpdate != update {
 			return
@@ -8004,6 +8021,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			currentClient = gateSelection.client
 		}
 		if !canSend {
+			nativeReadinessRefused = false
 			if batchAdmission != nil {
 				batchAdmission.stop = true
 			}
@@ -8049,6 +8067,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return false
 			}
 			if !canSend {
+				nativeReadinessRefused = false
 				if batchAdmission != nil {
 					batchAdmission.stop = true
 				}
@@ -8060,6 +8079,13 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
+			if !success {
+				if err == nil || errors.Is(err, ErrEncryptionRequiredNotEstablished) {
+					nativeReadinessRefused = true
+				} else {
+					nativeTerminalError = true
+				}
+			}
 			if !success && err == nil && nativeIngress {
 				self.retainNativeAckRetry(sendPacketGroup, sendPacketGroup.nativeAckRetry, source, provideMode)
 			}
@@ -8193,6 +8219,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				update.stateLock.Unlock()
 				orderedClients = freshClients
 				if collapsed && len(orderedClients) == 0 {
+					nativeReadinessRefused = false
 					collapseStopped = true
 					if batchAdmission != nil {
 						batchAdmission.stop = true
@@ -8271,6 +8298,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// attempt. Keep that first group reliable; once committed,
 				// sendBoundClient applies the ordinary NoAck UDP policy.
 				sent, sendErr := client.SendGroupDetailedWithAck(sendPacketGroup, sendTimeout, true, race.collapseOrder)
+				if sendErr != nil && !errors.Is(sendErr, ErrEncryptionRequiredNotEstablished) {
+					nativeTerminalError = true
+				}
 				sent = sent && sendErr == nil
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
@@ -8453,6 +8483,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 
 				var successCount atomic.Int32
+				var raceTerminalError atomic.Bool
 				for _, client := range raceOrderedClients {
 					sendPacketGroup.prepareAdmissionObservations(client)
 				}
@@ -8462,12 +8493,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					case <-update.ctx.Done():
 					default:
 						if update.client.Load() == nil {
-							sent = sendMultiClientGroupRaceAttempt(
+							var sendErr error
+							sent, sendErr = sendMultiClientGroupRaceAttempt(
 								client,
 								sendPacketGroup,
 								sendTimeout,
 								race.collapseOrder,
 							)
+							if sendErr != nil && !errors.Is(sendErr, ErrEncryptionRequiredNotEstablished) {
+								raceTerminalError.Store(true)
+							}
 						}
 					}
 					if sent {
@@ -8557,6 +8592,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				}
 
 				wg.Wait()
+				nativeTerminalError = nativeTerminalError || raceTerminalError.Load()
 				// } else {
 				// 	for _, client := range raceOrderedClients {
 				// 		send(client)
@@ -8708,6 +8744,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				remainingTimeout := enterTime.Add(timeout).Sub(time.Now())
 
 				if remainingTimeout <= 0 {
+					nativeReadinessRefused = nativeIngress
 					// drop
 					return
 				}
@@ -19167,7 +19204,7 @@ func sendMultiClientGroupRaceAttempt(
 	sendPacketGroup *parsedPacketGroup,
 	timeout time.Duration,
 	raceOrder uint64,
-) bool {
+) (bool, error) {
 	sharedGroup := &parsedPacketGroup{
 		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
 		retainedIpPathCount:   sendPacketGroup.retainedIpPathCount,
@@ -19188,16 +19225,17 @@ func sendMultiClientGroupRaceAttempt(
 			sendPacketGroup.packets[packetIndex].packet,
 		)
 	}
-	if accepted, err := client.SendGroupDetailedWithAck(sharedGroup, timeout, true, raceOrder); accepted && err == nil {
+	accepted, err := client.SendGroupDetailedWithAck(sharedGroup, timeout, true, raceOrder)
+	if accepted && err == nil {
 		if sharedGroup.completionFlags.Load()&groupCompletionTracked != 0 {
 			sendPacketGroup.completionFlags.Or(groupCompletionSourceControls)
 		}
-		return true
+		return true, nil
 	}
 	for packetIndex := range sharedGroup.packets {
 		MessagePoolReturn(sharedGroup.packets[packetIndex].packet)
 	}
-	return false
+	return false, err
 }
 
 func (self *multiClientChannel) SendWithAck(parsedPacket *parsedPacket, timeout time.Duration, ack bool) bool {
