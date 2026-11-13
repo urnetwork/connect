@@ -322,8 +322,9 @@ func (self *windowIdentityState) TakeRestoredContext(ctx context.Context, destin
 }
 
 // ForgetRestored drops every identity still pending reuse for a destination
-// the platform refused to confirm modern, so no later window expansion of
-// this process offers the destination as restored or reuses one of its
+// this process must not dial through it: one the platform refused to confirm
+// modern, or one with a hop the generator excludes. No later window expansion
+// of this process offers the destination as restored or reuses one of its
 // identities. An identity whose own generation is live leaves the live set
 // too, and the store snapshot is rewritten. A pending identity is not in the
 // live set, so the store loses it at its next write, as it loses every

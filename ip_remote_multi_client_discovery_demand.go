@@ -116,6 +116,20 @@ func (self *multiClientWindow) acceptDiscoveryDemandArgs(owner *multiClientEvalu
 	if !args.deferredClientArgs && self.cooloffRefuses(args.Destination, args.cooloffListing) {
 		return false
 	}
+	// Listed before the generator excluded a hop of it: the user removed the
+	// provider (RemoveProvider), or a reliability verdict cut it. Refused the
+	// same way, so a removed provider is never dialed from a listing that
+	// predates its removal. A fixed generator's deferred destination is never
+	// excluded at runtime.
+	if exclusions, ok := self.generator.(multiClientGeneratorExclusions); ok && !args.deferredClientArgs && exclusions.excludesDestination(args.Destination) {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"exclusion",
+			"window", self.windowName(),
+			"provider", args.Destination.Tail(),
+			"action", "refuse",
+		))
+		return false
+	}
 	var cancel context.CancelFunc
 	self.stateLock.Lock()
 	demand := &self.discoveryDemand
