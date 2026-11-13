@@ -213,11 +213,12 @@ type MultiClientGeneratorWithClientId interface {
 // `EncryptionModeRequired`, so a provider that cannot seal a session can never
 // carry its traffic; asking for modern providers keeps a provider without
 // evidence that it negotiates the session from being dialed and evaluated at
-// all. It narrows only the requests the generator makes: fixed `ClientId`
-// destinations and restored window identities bypass discovery and are not
-// filtered. The window clients' required gate still decides every send, and a
-// modern provider that fails to seal costs a failed dial, never plaintext. A
-// generator without the capability discovers as before.
+// all. Fixed `ClientId` destinations and restored window identities bypass
+// discovery, so the generator asks the platform to confirm them modern before
+// it returns them, and returns none it could not confirm. The window clients'
+// required gate still decides every send, and a modern provider that fails to
+// seal costs a failed dial, never plaintext. A generator without the
+// capability discovers as before.
 type MultiClientGeneratorWithPostQuantumEncryption interface {
 	SetPostQuantumEncryption(postQuantumEncryption bool)
 }
@@ -13915,8 +13916,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
-		// destination set is listed locally without asking the platform, so
-		// it proves nothing about the platform either.
+		// destination set needs no discovery: it is listed locally, or under
+		// the modern requirement confirmed by a named request that says
+		// nothing of the pool, so its listing keeps the error backoff until a
+		// mint succeeds.
 		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
 			self.windowListingRetryReset()
 		}
