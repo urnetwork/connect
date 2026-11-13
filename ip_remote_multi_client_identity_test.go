@@ -183,6 +183,89 @@ func TestWindowIdentityStaleRemovalCannotDeleteReplacementGeneration(t *testing.
 	})
 }
 
+// Forgetting a destination the platform did not confirm drops every identity
+// pending for it, so no later expansion returns or reuses one, and leaves the
+// other destinations pending. A forgotten identity's own live generation
+// leaves the store snapshot too; another generation of its client id stays.
+// Forgetting again, or a destination with nothing pending, changes nothing.
+func TestWindowIdentityForgetRestored(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	destinationA := RequireMultiHopId(NewId())
+	destinationB := RequireMultiHopId(NewId())
+	identityA := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-a",
+		InstanceId:  NewId(),
+		Destination: destinationA,
+	}
+	identityA2 := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-a2",
+		InstanceId:  NewId(),
+		Destination: destinationA,
+	}
+	identityB := &WindowClientIdentity{
+		ClientId:    NewId(),
+		ByJwt:       "synthetic-b",
+		InstanceId:  NewId(),
+		Destination: destinationB,
+	}
+	store := &fakeIdentityStore{
+		persisted: []*WindowClientIdentity{identityA, identityA2, identityB},
+	}
+	state := newWindowIdentityState(ctx, store)
+	AssertEqual(t, len(state.RestoredDestinations()), 2)
+
+	// identityA's own generation is live; identityA2's client id is live
+	// under another generation
+	state.Record(identityA)
+	identityA2Replacement := &WindowClientIdentity{
+		ClientId:    identityA2.ClientId,
+		ByJwt:       "synthetic-a2-replacement",
+		InstanceId:  NewId(),
+		Destination: destinationA,
+	}
+	state.Record(identityA2Replacement)
+	waitForPersisted(t, store, "both live identities", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 2
+	})
+
+	forgotten := state.ForgetRestored(destinationA)
+	AssertEqual(t, forgotten, []*WindowClientIdentity{identityA, identityA2})
+	AssertEqual(t, state.RestoredDestinations(), []MultiHopId{destinationB})
+	AssertEqual(t, state.TakeRestored(destinationA) == nil, true)
+	waitForPersisted(t, store, "the forgotten generation removed", func(persisted []*WindowClientIdentity) bool {
+		return len(persisted) == 1 && persisted[0] == identityA2Replacement
+	})
+	state.mutex.Lock()
+	_, identityALive := state.live[identityA.ClientId]
+	identityA2Live := state.live[identityA2.ClientId]
+	state.mutex.Unlock()
+	AssertEqual(t, identityALive, false)
+	AssertEqual(t, identityA2Live == identityA2Replacement, true)
+
+	storeCount := func() int {
+		store.mutex.Lock()
+		defer store.mutex.Unlock()
+		return store.stores
+	}
+	storesBefore := storeCount()
+	AssertEqual(t, len(state.ForgetRestored(destinationA)), 0)
+	AssertEqual(t, len(state.ForgetRestored(RequireMultiHopId(NewId()))), 0)
+	AssertEqual(t, state.RestoredDestinations(), []MultiHopId{destinationB})
+	// nothing live changed, so nothing was scheduled for the store
+	state.mutex.Lock()
+	pendingSnapshot := state.pendingSnapshot
+	state.mutex.Unlock()
+	AssertEqual(t, pendingSnapshot == nil, true)
+	AssertEqual(t, storeCount(), storesBefore)
+
+	// the destination left pending is still restorable
+	AssertEqual(t, state.TakeRestored(destinationB), identityB)
+}
+
 func TestWindowIdentityRestoreResultIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

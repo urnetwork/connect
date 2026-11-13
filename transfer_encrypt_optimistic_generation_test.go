@@ -165,6 +165,16 @@ func TestOptimisticIdentityProofRejectsMalformedWireGeneration(t *testing.T) {
 	}
 }
 
+// A validly encoded but foreign id has no authority to reset a handshake or
+// name an unnamed responder, through either supported wire decoder.
+func TestOptimisticIdentityProofRejectsForeignWireGenerations(t *testing.T) {
+	for _, active := range []Id{{}, {15: 2}} {
+		for _, foreign := range []Id{{15: 1}, {15: 3}} {
+			testOptimisticControlWireGeneration(t, protocol.EncryptedControlType_EncryptedControlIdentityProof, active, foreign.Bytes(), false)
+		}
+	}
+}
+
 // Ordered controls follow the same parse boundary. In particular, a malformed
 // nack cannot masquerade as the empty generation used for lost-state recovery.
 func TestMalformedEncryptedControlEpochCannotActAsLegacy(t *testing.T) {
