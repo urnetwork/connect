@@ -166,14 +166,14 @@ func TestRandomnessRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walk the repository: %v", err)
 	}
-	if len(judgedPaths) == 0 {
-		t.Fatal("the walk judged no file, so it read the wrong tree")
-	}
-	if allowlist.helperPath != "" && !slices.Contains(judgedPaths, allowlist.helperPath) {
-		t.Fatalf("the walk judged %d files but not %s, so it read the wrong tree", len(judgedPaths), allowlist.helperPath)
-	}
 	for _, finding := range findings {
 		t.Error(finding)
+	}
+	if len(judgedPaths) == 0 {
+		t.Error("the walk judged no file, so it read the wrong tree")
+	}
+	if allowlist.helperPath != "" && !slices.Contains(judgedPaths, allowlist.helperPath) {
+		t.Errorf("the walk judged %d files but not %s, so it read the wrong tree", len(judgedPaths), allowlist.helperPath)
 	}
 }
 
