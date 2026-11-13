@@ -436,6 +436,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		EvaluationFailureCooloff: 5 * time.Minute,
 		// the egress-dial lines' cadence (controlDialLogInterval)
 		EvaluationFailureLogInterval: 5 * time.Second,
+		// a connect server restart's transport reconnect ends well inside it
+		WindowPlatformUnreachableHold: 30 * time.Second,
+		// the outcome watch's cap (outcomeWatchPollTimeout)
+		WindowPlatformUnreachablePollTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -1192,6 +1196,24 @@ type MultiClientSettings struct {
 	// continuously, and one line per shape per interval keeps the signal
 	// without the flood. Non-positive logs every line.
 	EvaluationFailureLogInterval time.Duration
+	// How long a window's diagnosis must stay platform-unreachable before the
+	// window publishes it (ip_remote_multi_client_outcome.go
+	// publishStallStatus). Every app offers its "Can't reach URnetwork"
+	// prompt when the published diagnosis turns to it (sdk CantReachOnStall),
+	// so a platform transport that reconnects inside the hold must not turn
+	// it. 30s covers a reconnect after a connect server restart
+	// (PlatformTransportSettings ReconnectTimeout 5s plus up to 5s
+	// ReconnectJitter, then the dial and auth) with room for a second attempt
+	// during a rolling restart, and stays inside the 45s
+	// WindowOutcomeDeadline. Non-positive publishes the diagnosis as soon as
+	// it turns.
+	WindowPlatformUnreachableHold time.Duration
+	// How often a window re-reads a platform-unreachable diagnosis, held or
+	// published, so a transport that came back ends the episode within it
+	// and a held turn lands when the hold ends. Non-positive turns the
+	// re-read off: the diagnosis is read again only when the window publishes
+	// for its own reasons (a failure, an install).
+	WindowPlatformUnreachablePollTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -12970,6 +12992,12 @@ type multiClientWindow struct {
 	// everAdded: a provider has been installed; permanently disarms the
 	// outcome watchdog for this window.
 	everAdded bool
+	// When the diagnosis turned to platform-unreachable in the episode now
+	// running, zero outside one; the turn is published only
+	// WindowPlatformUnreachableHold after it. The watch flag is held by the one
+	// watchPlatformUnreachable that re-reads the episode.
+	platformUnreachableSince time.Time
+	platformUnreachableWatch bool
 	// evalEpochCtx is the context evaluation channels are built under; the
 	// rebuild cancels and replaces it. See evalEpochContext.
 	evalEpochCtx    context.Context
