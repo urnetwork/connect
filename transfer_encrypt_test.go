@@ -748,6 +748,40 @@ func TestHandshakeEpochResetReplacesEpoch(t *testing.T) {
 	}
 }
 
+// Researcher regression: an unauthenticated maximum epoch must not prevent
+// the server from accepting the legitimate client's next handshake.
+func TestServerEpochIdPoisoning(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+
+	// poison server with max epoch_id
+	var maxEpochId Id
+	for i := range maxEpochId {
+		maxEpochId[i] = 0xff
+	}
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlIdentityProof,
+		SessionRole: sequenceTlsRoleClient.toProtobuf(),
+		EpochId:     maxEpochId.Bytes(),
+		Payload:     []byte{0x00},
+	})
+	sess.completeHandshake(sess.currentEpoch(), errors.New("timeout"))
+
+	// deliver legitimate ClientHello
+	legitEpochId := NewId()
+	sess.DeliverEncryptedControl(&protocol.EncryptedControl{
+		ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+		SessionRole: sequenceTlsRoleClient.toProtobuf(),
+		EpochId:     legitEpochId.Bytes(),
+		Payload:     []byte{22, 3, 3, 0, 100, 1, 0, 0, 96},
+	})
+
+	// verify server adopted legitimate epoch
+	if e := sess.currentEpoch(); e == nil || sess.epochIdOf(e) != legitEpochId || isClosed(e.handshakeDone) {
+		t.Fatalf("server wedged on %s; dropped ClientHello %s", sess.epochIdOf(e), legitEpochId)
+	}
+}
+
 func TestHandshakeFailureCancelsEpochWorkers(t *testing.T) {
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
 	defer cleanup()
