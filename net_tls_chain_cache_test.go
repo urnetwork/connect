@@ -422,15 +422,24 @@ func TestTlsChainCacheRefusesGenuineChainWithoutItsKey(t *testing.T) {
 	}
 }
 
-// A chain from another authority, self-signed or under another root, is
-// refused cold and after the genuine chain's verification is remembered, with
-// the error uTLS returns.
+// A chain from another authority, self-signed or under another root, and the
+// genuine chain with one byte of its leaf's signature changed, are refused
+// cold and after the genuine chain's verification is remembered, with the
+// error uTLS returns.
 func TestTlsChainCacheRefusesUntrustedChains(t *testing.T) {
 	now := time.Now()
 	clock := newTestTlsChainClock(now)
 	pki := newTestTlsChainPki(t, now, false)
 	otherPki := newTestTlsChainPki(t, now, false)
-	genuineServer := newTestTlsChainServer(t, pki.newLeaf(t, testTlsChainServerName, now.Add(-time.Hour), now.Add(time.Hour)), 0)
+	genuine := pki.newLeaf(t, testTlsChainServerName, now.Add(-time.Hour), now.Add(time.Hour))
+	genuineServer := newTestTlsChainServer(t, genuine, 0)
+	// the leaf's signature is its last bytes
+	tamperedLeaf := slices.Clone(genuine.Certificate[0])
+	tamperedLeaf[len(tamperedLeaf)-1] ^= 0x01
+	tamperedServer := newTestTlsChainServer(t, tls.Certificate{
+		Certificate: [][]byte{tamperedLeaf, genuine.Certificate[1]},
+		PrivateKey:  genuine.PrivateKey,
+	}, 0)
 	otherRootServer := newTestTlsChainServer(t, otherPki.newLeaf(t, testTlsChainServerName, now.Add(-time.Hour), now.Add(time.Hour)), 0)
 	selfSignedKey := newTestTlsChainKey(t, elliptic.P256())
 	selfSigned := newTestTlsChainCertificate(t, &x509.Certificate{
@@ -457,6 +466,7 @@ func TestTlsChainCacheRefusesUntrustedChains(t *testing.T) {
 		}{
 			{description: "another root", server: otherRootServer},
 			{description: "self-signed", server: selfSignedServer},
+			{description: "tampered leaf", server: tamperedServer},
 		} {
 			description := fmt.Sprintf("%s warm=%t", untrusted.description, warm)
 			uncachedState, uncachedErr := testTlsChainDial(t, newTestTlsChainHandshaker(nil), untrusted.server, config)
@@ -472,6 +482,39 @@ func TestTlsChainCacheRefusesUntrustedChains(t *testing.T) {
 	if stats := cache.stats(); stats.HitCount != 0 || stats.StoreCount != 1 || stats.EntryCount != 1 {
 		t.Fatalf("stats = %+v, want only the genuine chain remembered and no reuse", stats)
 	}
+}
+
+// A renewed certificate, a new leaf with a new key under the same chain, is
+// new bytes: its first dial verifies in full and is accepted as without the
+// cache, and the previous certificate's verification still answers a server
+// that presents it.
+func TestTlsChainCacheVerifiesARenewedCertificate(t *testing.T) {
+	now := time.Now()
+	clock := newTestTlsChainClock(now)
+	pki := newTestTlsChainPki(t, now, true)
+	previousServer := newTestTlsChainServer(t, pki.newLeaf(t, testTlsChainServerName, now.Add(-time.Hour), now.Add(time.Hour)), 0)
+	renewedServer := newTestTlsChainServer(t, pki.newLeaf(t, testTlsChainServerName, now.Add(-time.Minute), now.Add(2*time.Hour)), 0)
+	cache := newTestTlsChainCache(clock, pki.rootPool)
+	config := newTestTlsChainConfig(pki.rootPool, testTlsChainServerName, clock)
+	config.SessionTicketsDisabled = true
+
+	for _, c := range []struct {
+		description string
+		server      *testTlsChainServer
+	}{
+		{description: "previous", server: previousServer},
+		{description: "renewed", server: renewedServer},
+		{description: "renewed again", server: renewedServer},
+		{description: "previous again", server: previousServer},
+	} {
+		uncachedState, uncachedErr := testTlsChainDial(t, newTestTlsChainHandshaker(nil), c.server, config)
+		cachedState, cachedErr := testTlsChainDial(t, newTestTlsChainHandshaker(cache), c.server, config)
+		if cachedErr != nil {
+			t.Fatalf("%s: %s", c.description, cachedErr)
+		}
+		assertTestTlsChainSameVerdict(t, c.description, cachedState, cachedErr, uncachedState, uncachedErr)
+	}
+	assertTestTlsChainStats(t, "renewal", cache, TlsVerifiedChainCacheStats{HitCount: 2, MissCount: 2, StoreCount: 2, EntryCount: 2})
 }
 
 // A dial for a name the leaf does not hold is refused, as without the cache:
