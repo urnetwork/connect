@@ -20,7 +20,7 @@ package connect
 // presents a real browser fingerprint, so there is nothing to shape there.
 
 import (
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 
 	"github.com/pion/dtls/v3/pkg/protocol/handshake"
 	"github.com/theodorsm/covert-dtls/pkg/fingerprints"
@@ -42,9 +42,9 @@ func dtlsClientHelloMimicryHookForFingerprint(
 }
 
 // dtlsClientHelloMimicryHook chooses a random fingerprint from the covert-dtls
-// corpus and returns its hook. rng selects the entry; nil uses a crypto-seeded
-// source. Returns nil (leave pion's default hello in place) when the corpus is
-// empty or the chosen entry fails to load, so shaping can never fail the
+// corpus and returns its hook. rng selects the entry; nil uses a NewSecureRand
+// generator. Returns nil (leave pion's default hello in place) when the corpus
+// is empty or the chosen entry fails to load, so shaping can never fail the
 // handshake.
 func dtlsClientHelloMimicryHook(
 	rng *mathrand.Rand,
@@ -54,9 +54,9 @@ func dtlsClientHelloMimicryHook(
 		return nil
 	}
 	if rng == nil {
-		rng = cryptoSeededRand()
+		rng = NewSecureRand()
 	}
-	hook, err := dtlsClientHelloMimicryHookForFingerprint(corpus[rng.Intn(len(corpus))])
+	hook, err := dtlsClientHelloMimicryHookForFingerprint(corpus[rng.IntN(len(corpus))])
 	if err != nil {
 		return nil
 	}

@@ -8,6 +8,7 @@ package gossip
 
 import (
 	"context"
+	mathrand "math/rand/v2"
 	"slices"
 	"testing"
 	"time"
@@ -203,6 +204,33 @@ func TestGossipNewNodeDoesNotMutateTheCallerSettings(t *testing.T) {
 	}
 }
 
+// The peer choice of a node built without an injected generator does not follow
+// from its clock (RANDUPDATE.md C2). It was drawn from a generator seeded with
+// the clock at construction, so anyone who knew roughly when a node started
+// could replay which extenders it would peer with. Two nodes built at one fixed
+// fake instant must draw different streams.
+func TestGossipNodePeerChoiceIsNotSeededFromTheClock(t *testing.T) {
+	now := time.Date(2026, time.November, 13, 12, 0, 0, 0, time.UTC)
+	draws := func() []uint64 {
+		node := newTestLocalNode(t, func(settings *NodeSettings) {
+			settings.Now = func() time.Time { return now }
+			settings.Rand = nil
+		})
+		// the peering loop owns the generator, and close joins it
+		node.Close()
+		values := []uint64{}
+		for range 4 {
+			values = append(values, node.rand.Uint64())
+		}
+		return values
+	}
+	first := draws()
+	second := draws()
+	if slices.Equal(first, second) {
+		t.Fatalf("two nodes built at one instant drew the same peer choice stream %v", first)
+	}
+}
+
 // A publish with nothing to publish is refused rather than marshalled into an
 // empty message the mesh would relay (D1, D6).
 func TestGossipNodePublishNeedsAMessage(t *testing.T) {
@@ -383,7 +411,8 @@ func newTestLocalNode(t *testing.T, configure func(settings *NodeSettings)) *Nod
 	settings.IdentityKeySeed = newTestKey(t).seed
 	settings.PeerTimeout = 5 * time.Minute
 	settings.StatusTimeout = 5 * time.Minute
-	settings.RandSeed = 1
+	// a fixed peer order, so no test depends on the draw
+	settings.Rand = mathrand.New(mathrand.NewPCG(1, 0))
 	if configure != nil {
 		configure(settings)
 	}

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"os"
 	"runtime"
@@ -1113,8 +1113,9 @@ type WebRtcSettings struct {
 	// IceServerSampleCount is how many pool servers to offer per session. 0 or a
 	// value past the pool size offers the whole pool.
 	IceServerSampleCount int
-	// Nil in production; tests inject a seeded source so the per-session subset
-	// is deterministic (see selectIceServerUrls).
+	// Nil in production, which draws each session's subset from its own
+	// NewSecureRand generator; tests inject a deterministic one (see
+	// selectIceServerUrls).
 	iceServerRandForTest *mathrand.Rand
 
 	// DtlsClientHelloMimicry shapes the emitted DTLS ClientHello to a rotating
@@ -1124,8 +1125,9 @@ type WebRtcSettings struct {
 	// on the censorship-circumvention path. No-op on js/wasm (browser owns DTLS).
 	// See transport_p2p_webrtc_dtls.go.
 	DtlsClientHelloMimicry bool
-	// Nil in production; tests inject a seeded source so the fingerprint choice
-	// is deterministic (see dtlsClientHelloMimicryHook).
+	// Nil in production, which draws the fingerprint from a NewSecureRand
+	// generator; tests inject a deterministic one (see
+	// dtlsClientHelloMimicryHook).
 	dtlsClientHelloRandForTest *mathrand.Rand
 
 	// ExtenderCarrierAnswerConcurrency bounds the offers of the peer-to-peer

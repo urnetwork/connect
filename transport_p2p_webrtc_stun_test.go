@@ -1,7 +1,7 @@
 package connect
 
 import (
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"sort"
 	"strings"
 	"testing"
@@ -35,8 +35,8 @@ func TestStunServerSampleIsRandomSubsetOfPool(t *testing.T) {
 	const sampleCount = 3
 	distinctSelections := map[string]struct{}{}
 	coveredUrls := map[string]struct{}{}
-	for seed := int64(1); seed <= 200; seed += 1 {
-		rng := mathrand.New(mathrand.NewSource(seed))
+	for seed := uint64(1); seed <= 200; seed += 1 {
+		rng := mathrand.New(mathrand.NewPCG(seed, 0))
 		selectedUrls := sampleStunServerUrls(testStunPoolUrls, sampleCount, rng)
 		if len(selectedUrls) != sampleCount {
 			t.Fatalf("seed %d: got %d urls, want %d", seed, len(selectedUrls), sampleCount)
@@ -72,7 +72,8 @@ func TestStunServerSampleIsRandomSubsetOfPool(t *testing.T) {
 // Sampling more than the pool size (or 0) offers the whole pool, still randomly
 // ordered, without panicking or duplicating.
 func TestStunServerSampleCountClampedToPool(t *testing.T) {
-	rng := mathrand.New(mathrand.NewSource(7))
+	// a fixed seed, so a failing order replays
+	rng := mathrand.New(mathrand.NewPCG(7, 0))
 	for _, sampleCount := range []int{0, len(testStunPoolUrls), len(testStunPoolUrls) + 5} {
 		selectedUrls := sampleStunServerUrls(testStunPoolUrls, sampleCount, rng)
 		if len(selectedUrls) != len(testStunPoolUrls) {
@@ -94,11 +95,12 @@ func TestStunServerSampleCountClampedToPool(t *testing.T) {
 func TestSelectIceServerUrlsVariesPerSession(t *testing.T) {
 	const sampleCount = 3
 	distinctSelections := map[string]struct{}{}
-	for seed := int64(1); seed <= 50; seed += 1 {
+	for seed := uint64(1); seed <= 50; seed += 1 {
 		settings := &WebRtcSettings{
 			IceServerPoolUrls:    testStunPoolUrls,
 			IceServerSampleCount: sampleCount,
-			iceServerRandForTest: mathrand.New(mathrand.NewSource(seed)),
+			// one fixed seed per session, so a failing session replays
+			iceServerRandForTest: mathrand.New(mathrand.NewPCG(seed, 0)),
 		}
 		selectedUrls := settings.selectIceServerUrls()
 		if len(selectedUrls) != sampleCount {
@@ -111,6 +113,31 @@ func TestSelectIceServerUrlsVariesPerSession(t *testing.T) {
 	}
 }
 
+// A session with no injected generator draws its subset from its own
+// NewSecureRand generator (RANDUPDATE.md C3). It was drawn from a Go 1 source,
+// whose outputs reveal its state, behind a fixed seed of 1 for a crypto/rand
+// read that cannot fail. Sessions built the production way must not repeat one
+// another: of the 336 ordered draws of three from eight, 32 sessions offering
+// the same list happen with probability 336^-31.
+func TestSelectIceServerUrlsDrawsEachSessionFromItsOwnGenerator(t *testing.T) {
+	const sampleCount = 3
+	distinctOrders := map[string]struct{}{}
+	for range 32 {
+		settings := &WebRtcSettings{
+			IceServerPoolUrls:    testStunPoolUrls,
+			IceServerSampleCount: sampleCount,
+		}
+		selectedUrls := settings.selectIceServerUrls()
+		if len(selectedUrls) != sampleCount {
+			t.Fatalf("a session offered %d servers, want %d", len(selectedUrls), sampleCount)
+		}
+		distinctOrders[strings.Join(selectedUrls, "|")] = struct{}{}
+	}
+	if len(distinctOrders) < 2 {
+		t.Fatalf("32 sessions with the production generator all offered %v", distinctOrders)
+	}
+}
+
 // The explicit override pins servers and bypasses the pool, so operators and
 // tests can force an exact set.
 func TestSelectIceServerUrlsOverrideWins(t *testing.T) {
@@ -119,7 +146,8 @@ func TestSelectIceServerUrlsOverrideWins(t *testing.T) {
 		IceServerUrls:        overrideUrls,
 		IceServerPoolUrls:    testStunPoolUrls,
 		IceServerSampleCount: 3,
-		iceServerRandForTest: mathrand.New(mathrand.NewSource(1)),
+		// a fixed seed, so a draw that wrongly ran is the same every time
+		iceServerRandForTest: mathrand.New(mathrand.NewPCG(1, 0)),
 	}
 	selectedUrls := settings.selectIceServerUrls()
 	if selectionSignature(selectedUrls) != selectionSignature(overrideUrls) {
@@ -146,7 +174,8 @@ func TestDefaultWebRtcSettingsReplacesFixedStunPair(t *testing.T) {
 	if len(settings.IceServerPoolUrls) <= 2 {
 		t.Fatalf("default pool must be larger than the old fixed pair, got %d entries", len(settings.IceServerPoolUrls))
 	}
-	settings.iceServerRandForTest = mathrand.New(mathrand.NewSource(1))
+	// a fixed seed, so a failing default session replays
+	settings.iceServerRandForTest = mathrand.New(mathrand.NewPCG(1, 0))
 	selectedUrls := settings.selectIceServerUrls()
 	if len(selectedUrls) != settings.IceServerSampleCount {
 		t.Fatalf("default session offered %d servers, want %d", len(selectedUrls), settings.IceServerSampleCount)
