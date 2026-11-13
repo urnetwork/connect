@@ -79,6 +79,56 @@ func TestPeerCapabilityRecorderBindsLiveSendingEpoch(t *testing.T) {
 	}
 }
 
+// A client sending with a companion contract (resolveSendOptions) runs a
+// client-role companion session to the same peer beside its ordinary one,
+// and either can seal last. The companion's seal is evidence of the peer, but
+// it supplies no ordinary initiator proof (capabilitySession), so it must not
+// replace the ordinary session a request proof binds to: when it sealed
+// second, the observation read no live session at all, and a post-quantum
+// URL turn whose request rode the sealed ordinary session read unmeasured.
+func TestPeerCapabilityRecorderCompanionSealKeepsTheOrdinarySession(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	peerId := NewId()
+	client := &Client{clientId: NewId(), log: NewNoopLogger()}
+	newSession := func(companion bool) *peerEncryptionSession {
+		return &peerEncryptionSession{
+			ctx: ctx, client: client, peerId: peerId, role: sequenceTlsRoleClient,
+			companion: companion, settings: DefaultEncryptionSettings(),
+		}
+	}
+	recorder := NewPeerCapabilityRecorder(1)
+	seal := func(session *peerEncryptionSession, group tls.CurveID) Id {
+		epochCtx, epochCancel := context.WithCancel(ctx)
+		epoch := &tlsHandshakeEpoch{
+			ctx: epochCtx, cancel: epochCancel, epochId: NewId(),
+			negotiatedCurveId: group, peerIdentityVerified: true, derivedTlsCipher: &sequenceCipher{},
+		}
+		session.stateLock.Lock()
+		session.epoch = epoch
+		session.markEstablishedWithLock(epoch)
+		session.stateLock.Unlock()
+		recorder.observeE2eSealed(peerId, group, session)
+		return epoch.epochId
+	}
+	ordinary, companion := newSession(false), newSession(true)
+	ordinaryEpoch := seal(ordinary, tls.X25519MLKEM768)
+	seal(companion, tls.X25519MLKEM768)
+	observation, _ := recorder.Get(peerId)
+	if !observation.E2eSealed || !observation.PostQuantum {
+		t.Fatalf("the companion's seal lost the sticky evidence: %+v", observation)
+	}
+	want := PeerCapabilitySession{ClientId: client.clientId, EpochId: ordinaryEpoch, KeyExchange: "X25519MLKEM768", PostQuantum: true}
+	if observation.Session != want {
+		t.Fatalf("the companion's later seal replaced the ordinary session: got %+v, want %+v", observation.Session, want)
+	}
+	// the ordinary session still binds a later rekey of its own
+	rekeyEpoch := seal(ordinary, tls.X25519MLKEM768)
+	if observation, _ := recorder.Get(peerId); observation.Session.EpochId != rekeyEpoch {
+		t.Fatalf("the ordinary session's rekey did not bind: %+v", observation.Session)
+	}
+}
+
 // Returns a recorder whose clock steps one second per observation from a
 // fixed origin, and the time of the nth (0-based) observation, so every
 // recorded time is exact.
