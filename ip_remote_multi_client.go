@@ -312,7 +312,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// the same size as the largest normal window (server
 		// FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window
 		// to be the same size as the normal window"): 6 limited clients
-		// beside a desktop quality window of 6
+		// beside a desktop quality window of 6. The sdk passes 0.5 for its
+		// 32-MiB memory tier (iOS, hosted proxies) until the owner decides.
 		LimitedWindowSizeFraction: 1.0,
 		LimitedWindowSizeMax:      0,
 		SendRetryTimeout:          2000 * time.Millisecond,

@@ -257,17 +257,20 @@ func TestLimitedWindowSizingFromTheNormalWindows(t *testing.T) {
 
 // The limited window is the same size as the normal window (server
 // FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window to be
-// the same size as the normal window"): its target and hard max equal the
-// largest active normal window's on every platform's window sizes, and the
-// low-memory bound (D11.5) still caps it. Before, the default fraction of
-// 0.5 gave half: 3 on desktop, 2 on iOS and hosted proxies, 5 on Android.
+// the same size as the normal window"): at the default fraction its target
+// and hard max equal the largest active normal window's, and the low-memory
+// bound (D11.5) still caps it. Before, the default fraction of 0.5 gave half:
+// 3 on desktop and 5 on Android. A device that passes its own fraction keeps
+// it: the sdk holds the 32-MiB tier of iOS and the hosted proxies at half, 2
+// of its 5, until the owner decides.
 func TestLimitedWindowIsTheSizeOfTheNormalWindow(t *testing.T) {
 	cases := []struct {
-		name    string
-		quality windowSizing
-		speed   windowSizing
-		sizeMax int
-		want    int
+		name     string
+		quality  windowSizing
+		speed    windowSizing
+		fraction float64
+		sizeMax  int
+		want     int
 	}{
 		{
 			name:    "desktop auto",
@@ -276,10 +279,17 @@ func TestLimitedWindowIsTheSizeOfTheNormalWindow(t *testing.T) {
 			want:    6,
 		},
 		{
-			name:    "ios and hosted proxies, 32 MiB",
+			name:    "a quality window of 5",
 			quality: windowSizing{published: true, active: true, targetSize: 5, hardMax: 5},
 			speed:   windowSizing{published: true, active: true, targetSize: 1, hardMax: 1},
 			want:    5,
+		},
+		{
+			name:     "the 32-MiB tier's half",
+			quality:  windowSizing{published: true, active: true, targetSize: 5, hardMax: 5},
+			speed:    windowSizing{published: true, active: true, targetSize: 1, hardMax: 1},
+			fraction: 0.5,
+			want:     2,
 		},
 		{
 			name:    "android, 64 MiB",
@@ -298,6 +308,9 @@ func TestLimitedWindowIsTheSizeOfTheNormalWindow(t *testing.T) {
 	for _, c := range cases {
 		ctx, cancel := context.WithCancel(context.Background())
 		settings := DefaultMultiClientSettings()
+		if 0 < c.fraction {
+			settings.LimitedWindowSizeFraction = c.fraction
+		}
 		settings.LimitedWindowSizeMax = c.sizeMax
 		generator := newCapabilityTestGenerator(true, nil)
 		quality := capabilityTestWindow(ctx, generator, settings, WindowTypeQuality)
