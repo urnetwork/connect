@@ -171,52 +171,28 @@ func familyTestFilters(calls []familyTestCall) []IpFamilyFilter {
 // --- B1: the soft minimum and its exemptions ---
 
 func TestIpv6CapableShortfall(t *testing.T) {
-	auto := WindowSizeSettings{WindowSizeMin: 6, WindowSizeMax: 6, WindowSizeHardMax: 6, WindowSizeMinIpv6Capable: 1}
-	fixedSize := auto
-	fixedSize.FixedWindowSize = 1
-	off := auto
-	off.WindowSizeMinIpv6Capable = 0
-	cases := []struct {
+	for _, c := range []struct {
 		name             string
-		windowSize       WindowSizeSettings
-		fixedProfile     bool
+		target           int
 		fixedDestination bool
-		clientCount      int
-		ipv6CapableCount int
+		inactive         bool
+		held             int
 		want             int
 	}{
-		{"open once the fill has exits and none carries v6", auto, false, false, 3, 0, 1},
-		{"closed by one v6-capable exit", auto, false, false, 3, 1, 0},
-		{"forming window asks nothing extra", auto, false, false, 0, 0, 0},
-		{"fixed profile exempt", auto, true, false, 3, 0, 0},
-		{"fixed size exempt", fixedSize, false, false, 3, 0, 0},
-		{"fixed destination exempt", auto, false, true, 3, 0, 0},
-		{"minimum off", off, false, false, 3, 0, 0},
-	}
-	for _, c := range cases {
-		got := ipv6CapableShortfall(c.windowSize, c.fixedProfile, c.fixedDestination, c.clientCount, c.ipv6CapableCount)
-		if got != c.want {
-			t.Errorf("%s: shortfall = %d, want %d", c.name, got, c.want)
+		{name: "forming or full without IPv6", target: 1, want: 1},
+		{name: "satisfied", target: 1, held: 1},
+		{name: "partial target", target: 3, held: 1, want: 2},
+		{name: "fixed destination", target: 1, fixedDestination: true},
+		{name: "inactive profile window", target: 1, inactive: true},
+		{name: "no requested target"},
+	} {
+		if got := ipv6CapableShortfall(c.target, c.fixedDestination, c.inactive, c.held); got != c.want {
+			t.Errorf("%s: shortfall %d, want %d", c.name, got, c.want)
 		}
 	}
-
-	// the shipped defaults: the quality window holds one v6-capable exit
-	// softly, the speed window (fixed size 1) none
-	sizes := DefaultMultiClientSettings().WindowSizes
-	if sizes[WindowTypeQuality].WindowSizeMinIpv6Capable != 1 {
-		t.Errorf("quality WindowSizeMinIpv6Capable = %d, want 1", sizes[WindowTypeQuality].WindowSizeMinIpv6Capable)
-	}
-	if got := ipv6CapableShortfall(sizes[WindowTypeSpeed], false, false, 1, 0); got != 0 {
-		t.Errorf("speed window shortfall = %d, want 0 (fixed size)", got)
-	}
-	if got := ipv6CapableShortfall(sizes[WindowTypeQuality], false, false, 6, 0); got != 1 {
-		t.Errorf("quality window shortfall = %d, want 1", got)
-	}
-
-	negative := auto
-	negative.WindowSizeMinIpv6Capable = -1
+	negative := WindowSizeSettings{WindowSizeMinIpv6Capable: -1}
 	if err := negative.Validate(); err == nil {
-		t.Error("a negative WindowSizeMinIpv6Capable validated")
+		t.Error("negative IPv6 minimum validated")
 	}
 }
 

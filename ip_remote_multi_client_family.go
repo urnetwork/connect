@@ -141,35 +141,23 @@ func (self *multiClientChannel) clearFamilySwapVictim() {
 
 // --- window shortfall state ---
 
-// ipv6CapableShortfall is the soft v6-capable minimum's open shortfall for
-// one resize pass (IPV6.md B1): how many v6-capable exits the window wants
-// and holds none of. Zero when the minimum does not apply -- a fixed
-// performance profile, a fixed window size or a fixed destination pins the
-// membership and a soft minimum has no slot to claim -- and zero while the
-// window is still forming (no healthy exit yet): during formation the
-// dualstack-first main fill is the way to get a v6-capable exit, so nothing
-// extra is asked for. The shortfall is the whole minimum, not the
-// difference, because it is only open while the count is zero: one
-// v6-capable exit satisfies the minimum however large it is set, which is
-// what keeps the extra request to one candidate.
+// The same IPv6 target discovery requests must survive formation, admission
+// and full-window refill, including fixed-size and mobile windows. A chosen
+// destination and an inactive profile window have no replaceable family need.
 func ipv6CapableShortfall(
-	windowSize WindowSizeSettings,
-	fixedProfile bool,
+	dualstackTargetCount int,
 	fixedDestination bool,
-	clientCount int,
+	inactive bool,
 	ipv6CapableCount int,
 ) int {
-	if fixedProfile || 0 < windowSize.FixedWindowSize || fixedDestination {
+	if fixedDestination || inactive {
 		return 0
 	}
-	if windowSize.WindowSizeMinIpv6Capable <= 0 || clientCount <= 0 || 0 < ipv6CapableCount {
-		return 0
-	}
-	return windowSize.WindowSizeMinIpv6Capable
+	return max(0, dualstackTargetCount-ipv6CapableCount)
 }
 
 // setIpv6Shortfall records the v6-capable shortfall the resize pass computed:
-// how many v6-capable exits the window wants and has none of. 0 closes it.
+// how many requested v6-capable exits the window still lacks. 0 closes it.
 func (self *multiClientWindow) setIpv6Shortfall(shortfall int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

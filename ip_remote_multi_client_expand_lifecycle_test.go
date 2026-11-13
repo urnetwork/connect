@@ -19,6 +19,36 @@ const (
 	expandLifecycleRequestTimeout = 7 * time.Second
 )
 
+// The first IPv4 ping finishes before the dualstack candidate is even handed
+// to expansion. The requested IPv6 slot must survive that deterministic lead.
+func TestExpandReservesRequestedIpv6Admission(t *testing.T) {
+	fixture := newMultiClientExpandLifecycleFixture(t)
+	dualstackFixture := newMultiClientExpandLifecycleFixture(t)
+	window := fixture.window
+	window.settings.EvaluationPoolMultiple = 2
+	first := <-window.clientChannelArgs
+	second := <-dualstackFixture.window.clientChannelArgs
+	first.IpFamily = IpFamilyV4Only
+	second.IpFamily = IpFamilyDualstack
+	window.generator = newIpv6AdmissionGenerator(fixture, first, dualstackFixture, second)
+	window.clientChannelArgs <- first
+	done := make(chan int, 1)
+	go func() {
+		done <- window.expand(WindowSizeSettings{FixedWindowSize: 1, WindowSizeHardMax: 1}, 0, 0, 1, 1, 1, 1, windowExpandPassPlan{})
+	}()
+	fixture.wait(t, "first IPv4 ping", fixture.pingResultEntered)
+	fixture.releasePing()
+	fixture.wait(t, "first IPv4 result processed", fixture.pingResultDone)
+	window.clientChannelArgs <- second
+	if admitted := fixture.result(t, done); admitted != 1 {
+		t.Fatalf("admitted %d candidates, want one", admitted)
+	}
+	clients := window.unorderedClients()
+	if len(clients) != 1 || clients[0].IpFamily() != IpFamilyDualstack {
+		t.Fatalf("fast IPv4 consumed the only requested IPv6 slot: %d clients, IPv6 available %t", len(clients), window.ipv6Available())
+	}
+}
+
 // TestExpandCandidateWithinAcquisitionDeadline pins the inclusive acquisition
 // boundary without relying on scheduler timing.
 func TestExpandCandidateWithinAcquisitionDeadline(t *testing.T) {
@@ -177,7 +207,7 @@ func newMultiClientExpandLifecycleFixture(t *testing.T) *multiClientExpandLifecy
 		})
 	}
 	var generatedClientLock sync.Mutex
-	var generatedClient *Client
+	var generatedClients []*Client
 	originalNewClient := generator.newClient
 	generator.newClient = func(
 		clientCtx context.Context,
@@ -186,22 +216,23 @@ func newMultiClientExpandLifecycleFixture(t *testing.T) *multiClientExpandLifecy
 	) (*Client, error) {
 		client, err := originalNewClient(clientCtx, args, clientSettings)
 		generatedClientLock.Lock()
-		generatedClient = client
+		if client != nil {
+			generatedClients = append(generatedClients, client)
+		}
 		generatedClientLock.Unlock()
 		return client, err
 	}
 	t.Cleanup(func() {
 		generatedClientLock.Lock()
-		client := generatedClient
+		clients := append([]*Client{}, generatedClients...)
 		generatedClientLock.Unlock()
-		if client == nil {
-			return
-		}
-		client.Cancel()
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer closeCancel()
-		if err := client.CloseAndWait(closeCtx); err != nil {
-			t.Errorf("join expand-lifecycle client: %v", err)
+		for _, client := range clients {
+			client.Cancel()
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := client.CloseAndWait(closeCtx); err != nil {
+				t.Errorf("join expand-lifecycle client: %v", err)
+			}
+			closeCancel()
 		}
 	})
 
