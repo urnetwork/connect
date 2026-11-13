@@ -7,7 +7,7 @@ package connect
 
 import (
 	"context"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"slices"
 	"sync"
 	"testing"
@@ -188,7 +188,8 @@ func TestReceiveSequenceSelectiveAcksWrittenInSequenceOrder(t *testing.T) {
 	for i := range selectiveAckCount {
 		sequenceNumbers = append(sequenceNumbers, uint64(i+2))
 	}
-	mathrand.New(mathrand.NewSource(1)).Shuffle(len(sequenceNumbers), func(i int, j int) {
+	// a fixed scrambled ack order, so a failure replays
+	mathrand.New(mathrand.NewPCG(1, 0)).Shuffle(len(sequenceNumbers), func(i int, j int) {
 		sequenceNumbers[i], sequenceNumbers[j] = sequenceNumbers[j], sequenceNumbers[i]
 	})
 

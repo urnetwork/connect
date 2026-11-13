@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -284,7 +284,7 @@ func (self *ClientStrategy) altDialCandidatesWithResolver(
 // none.
 func altDnsTld(settings *ClientStrategySettings) []byte {
 	if 0 < len(settings.DnsTlds) {
-		return settings.DnsTlds[mathrand.Intn(len(settings.DnsTlds))]
+		return settings.DnsTlds[mathrand.IntN(len(settings.DnsTlds))]
 	}
 	return []byte(DefaultExtenderDnsTld)
 }

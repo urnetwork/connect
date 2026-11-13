@@ -1,7 +1,7 @@
 package emoji
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -34,7 +34,8 @@ func TestSuggestPool(t *testing.T) {
 }
 
 func TestSuggest(t *testing.T) {
-	r := rand.New(rand.NewSource(7))
+	// a fixed seed, so a failing tag replays
+	r := rand.New(rand.NewPCG(7, 0))
 	for i := 0; i < 500; i++ {
 		count := i%6 - 1 // -1, 0, 1, 2, 3, 4
 		tag := Suggest(count, r)
@@ -75,7 +76,7 @@ func TestSuggest(t *testing.T) {
 		t.Fatalf("random lengths = %v", lengths)
 	}
 	// seeded sources are reproducible; nil uses the shared source
-	if Suggest(3, rand.New(rand.NewSource(1))) != Suggest(3, rand.New(rand.NewSource(1))) {
+	if Suggest(3, rand.New(rand.NewPCG(1, 0))) != Suggest(3, rand.New(rand.NewPCG(1, 0))) {
 		t.Fatal("seeded Suggest is not reproducible")
 	}
 	if tag := Suggest(2, nil); Count(tag) != 2 || strings.TrimSpace(tag) != tag {

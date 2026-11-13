@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"net/url"
@@ -488,7 +488,7 @@ func parseExtenderHopSpec(hopSpec string) (*connect.ExtenderConfig, error) {
 		// the name a client dialer would present (A10): never the operator's,
 		// and none at all while the list is empty
 		if spoofDomains := connect.SpoofDomains(); 0 < len(spoofDomains) {
-			profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
+			profile.ServerName = spoofDomains[mathrand.IntN(len(spoofDomains))]
 		}
 	}
 	if secretFilePath != "" {

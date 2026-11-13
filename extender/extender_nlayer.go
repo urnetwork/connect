@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"slices"
 	"time"
@@ -485,7 +485,7 @@ func (self *ExtenderServer) pickNLayerHop(clientIpVersion int, triedIndexes []in
 	if len(candidateIndexes) == 0 {
 		return 0, false
 	}
-	return candidateIndexes[mathrand.Intn(len(candidateIndexes))], true
+	return candidateIndexes[mathrand.IntN(len(candidateIndexes))], true
 }
 
 // One dial of one hop, bounded by NLayerDialTimeout. The dial context bounds

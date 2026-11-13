@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -1013,7 +1013,7 @@ func (self *ClientStrategy) NextConnectTime() (time.Time, func()) {
 	connectDelayRange := self.settings.MaxNextConnectDelay - self.settings.MinNextConnectDelay
 	connectDelay := self.settings.MinNextConnectDelay
 	if 0 < connectDelayRange {
-		connectDelay += time.Duration(mathrand.Int63n(int64(connectDelayRange)))
+		connectDelay += time.Duration(mathrand.Int64N(int64(connectDelayRange)))
 	}
 	nextConnectTime := self.nextConnectTime.Add(connectDelay)
 	if nextConnectTime.Before(now) {
@@ -1119,7 +1119,7 @@ func (self *ClientStrategy) nextReconnectTime() (connectTime time.Time, release 
 // uniform in [0, ReconnectFastPathMaxDelay); none when that is non-positive.
 func (self *ClientStrategy) reconnectFastPathJitter() time.Duration {
 	if maxDelay := self.settings.ReconnectFastPathMaxDelay; 0 < maxDelay {
-		return time.Duration(mathrand.Int63n(int64(maxDelay)))
+		return time.Duration(mathrand.Int64N(int64(maxDelay)))
 	}
 	return 0
 }
@@ -2747,7 +2747,7 @@ func extenderConfigsForCandidate(
 	extenderConfigs := []*ExtenderConfig{}
 	appendConfig := func(profile ExtenderProfile, dnsPorts []int) {
 		if 0 < len(spoofDomains) && profile.ConnectMode != ExtenderConnectModeWebRtc {
-			profile.ServerName = spoofDomains[mathrand.Intn(len(spoofDomains))]
+			profile.ServerName = spoofDomains[mathrand.IntN(len(spoofDomains))]
 		}
 		if profile.Port <= 0 {
 			return
@@ -2794,8 +2794,8 @@ func extenderConfigsForCandidate(
 		default:
 			profile.Port = candidate.TcpPort
 			// fragment and reorder apply to tcp only
-			profile.Fragment = mathrand.Intn(2) != 0
-			profile.Reorder = mathrand.Intn(2) != 0
+			profile.Fragment = mathrand.IntN(2) != 0
+			profile.Reorder = mathrand.IntN(2) != 0
 			appendConfig(profile, nil)
 		}
 	}
@@ -3570,7 +3570,7 @@ func HttpGetWithStrategyRaw(
 			// jittered pause before the retry
 			retryTimeout := settings.GetRetryMinTimeout
 			if settings.GetRetryMinTimeout < settings.GetRetryMaxTimeout {
-				retryTimeout += time.Duration(mathrand.Int63n(int64(settings.GetRetryMaxTimeout - settings.GetRetryMinTimeout)))
+				retryTimeout += time.Duration(mathrand.Int64N(int64(settings.GetRetryMaxTimeout - settings.GetRetryMinTimeout)))
 			}
 			select {
 			case <-ctx.Done():

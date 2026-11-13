@@ -3,7 +3,7 @@ package connect
 import (
 	"encoding/hex"
 	"maps"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
 	"slices"
 	"strings"
@@ -370,7 +370,7 @@ func (self *ExtenderDirectory) deleteKeyRecordWithLock(keyHex string) {
 // one.
 func (self *ExtenderDirectory) randomIndexWithLock(n int) int {
 	if self.settings.Random == nil {
-		return mathrand.Intn(n)
+		return mathrand.IntN(n)
 	}
 	i := int(self.settings.Random() * float64(n))
 	return min(max(i, 0), n-1)

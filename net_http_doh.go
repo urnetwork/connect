@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptrace"

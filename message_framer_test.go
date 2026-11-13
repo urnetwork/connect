@@ -3,9 +3,10 @@ package connect
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"time"
 
@@ -56,11 +57,13 @@ func TestFramerWriteRead(t *testing.T) {
 		n := 10
 		maxMessageLen := 1500
 
+		// the reader regenerates each message from its index and length, so
+		// the bytes come from a fixed-seed generator
 		randMessage := func(messageLen int, i int) []byte {
-			source := mathrand.NewSource(int64(i*maxMessageLen + messageLen))
-			r := mathrand.New(source)
+			var seed [32]byte
+			binary.LittleEndian.PutUint64(seed[:], uint64(i*maxMessageLen+messageLen))
 			message := make([]byte, messageLen)
-			r.Read(message)
+			mathrand.NewChaCha8(seed).Read(message)
 			return message
 		}
 

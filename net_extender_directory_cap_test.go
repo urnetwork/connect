@@ -6,7 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
 	"slices"
 	"sync"
@@ -88,7 +88,7 @@ func testCapRetained(directory *ExtenderDirectory, capRecord *testCapRecord) boo
 // A seeded draw for the Random seams, safe to share.
 func testSeededRandom(seed int64) func() float64 {
 	var stateLock sync.Mutex
-	random := mathrand.New(mathrand.NewSource(seed))
+	random := mathrand.New(mathrand.NewPCG(uint64(seed), 0))
 	return func() float64 {
 		stateLock.Lock()
 		defer stateLock.Unlock()
@@ -169,7 +169,8 @@ func TestExtenderDirectoryActiveCapEvictsTheRestFirst(t *testing.T) {
 	})
 	directory.SetContinentHint("EU")
 
-	random := mathrand.New(mathrand.NewSource(2))
+	// a fixed arrival order, so a failure replays
+	random := mathrand.New(mathrand.NewPCG(2, 0))
 	preferredRecords := []*testCapRecord{}
 	restRecords := []*testCapRecord{}
 	retainedCount := func(capRecords []*testCapRecord) int {
@@ -186,7 +187,7 @@ func TestExtenderDirectoryActiveCapEvictsTheRestFirst(t *testing.T) {
 	preferredEvictionCount := 0
 	for i := range 400 {
 		continent := "NA"
-		if random.Intn(5) == 0 {
+		if random.IntN(5) == 0 {
 			continent = "EU"
 		}
 		capRecord := signTestCapRecord(t, rootPrivateKey, clock.Now(), i, continent)
@@ -211,9 +212,9 @@ func TestExtenderDirectoryActiveCapEvictsTheRestFirst(t *testing.T) {
 		switch {
 		case continent == "EU":
 			preferredRecords = append(preferredRecords, capRecord)
-		case random.Intn(4) == 0 && testCapRetained(directory, capRecord):
+		case random.IntN(4) == 0 && testCapRetained(directory, capRecord):
 			// a measured record is preferred as well
-			directory.RecordLatency(capRecord.ip, time.Duration(1+random.Intn(100))*time.Millisecond, false)
+			directory.RecordLatency(capRecord.ip, time.Duration(1+random.IntN(100))*time.Millisecond, false)
 			preferredRecords = append(preferredRecords, capRecord)
 		default:
 			restRecords = append(restRecords, capRecord)

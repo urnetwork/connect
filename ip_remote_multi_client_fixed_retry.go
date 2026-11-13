@@ -26,7 +26,7 @@
 package connect
 
 import (
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"time"
 )
 
@@ -68,7 +68,7 @@ func (self *multiClientWindow) retryJitter(delay time.Duration) time.Duration {
 	if self.retryJitterForTest != nil {
 		return half + max(0, min(half-1, self.retryJitterForTest(half)))
 	}
-	return half + time.Duration(mathrand.Int63n(int64(half)))
+	return half + time.Duration(mathrand.Int64N(int64(half)))
 }
 
 // Records one failed attempt of a fixed destination and defers its next one.

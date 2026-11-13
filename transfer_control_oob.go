@@ -2,7 +2,7 @@ package connect
 
 import (
 	"context"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"sync"
 	"time"
 
@@ -192,7 +192,7 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 		if self.retryJitterForTest != nil {
 			return half + max(0, min(half-1, self.retryJitterForTest(half)))
 		}
-		return half + time.Duration(mathrand.Int63n(int64(half)))
+		return half + time.Duration(mathrand.Int64N(int64(half)))
 	}
 
 	var send func()
