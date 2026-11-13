@@ -2144,7 +2144,7 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 			// capability evidence for a session this client initiated, as the
 			// handshake's is, recorded before the callbacks below so a Sealed
 			// event's consumer already reads it
-			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId)
+			self.client.peerCapabilityRecorder.observeE2eSealed(self.peerId, sealedCurveId, self)
 		}
 		// the established + identity-verified peer set grew (or the
 		// established epoch swapped): the only promote path runs above
@@ -2761,6 +2761,27 @@ func (self *peerEncryptionSession) encryptionStateSnapshot() (
 	establishing = self.handshakeInFlightLocked()
 	failureReason = self.lastEstablishFailureReason
 	return
+}
+
+// A probe's current ordinary sending epoch, using the same cipher gate as
+// application sends. Called outside the recorder lock; no packet-path work
+// is added, and a retired or companion session supplies no positive proof.
+func (self *peerEncryptionSession) capabilitySession() PeerCapabilitySession {
+	if self.role != sequenceTlsRoleClient || self.companion || self.ctx.Err() != nil {
+		return PeerCapabilitySession{}
+	}
+	clientId := self.client.ClientId()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.cipherWithLock() == nil {
+		return PeerCapabilitySession{}
+	}
+	return PeerCapabilitySession{
+		ClientId:    clientId,
+		EpochId:     self.establishedEpoch.epochId,
+		KeyExchange: tlsKeyExchangeName(self.establishedEpoch.negotiatedCurveId),
+		PostQuantum: isPostQuantumKeyExchange(self.establishedEpoch.negotiatedCurveId),
+	}
 }
 
 // Cipher returns the AEAD cipher, or nil if the session can't safely

@@ -31,6 +31,7 @@ package connect
 
 import (
 	"math"
+	"slices"
 	"time"
 )
 
@@ -240,6 +241,10 @@ func (self *multiClientWindow) initRequestSizing() {
 	if self.windowType == WindowTypeLimited {
 		return
 	}
+	fixedDestination := false
+	if self.generator != nil {
+		_, fixedDestination = self.generator.FixedDestinationSize()
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	var fixedWindowType *WindowType
@@ -259,6 +264,10 @@ func (self *multiClientWindow) initRequestSizing() {
 	}
 	self.requestTargetCount = targetCount
 	self.requestDualstackTargetCount = requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+	if fixedDestination || targetCount <= 0 {
+		self.requestDualstackTargetCount = 0
+	}
+	self.ipv6Shortfall = self.requestDualstackTargetCount
 }
 
 // The rank mode the limited window asks with (D10): the performance
@@ -393,6 +402,20 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 			ordered = append(ordered, enumeratedDestination{
 				destination: destination,
 				stats:       stats,
+			})
+		}
+		if providerSelect.HeldDualstackCount < providerSelect.DualstackTargetCount {
+			// The API returns a map after selecting its single need candidate.
+			// Keep that candidate ahead of IPv4 fill before bounded evaluation
+			// and identity allocation can consume the whole pass budget.
+			slices.SortStableFunc(ordered, func(a enumeratedDestination, b enumeratedDestination) int {
+				if a.stats.IpFamily.SupportsIpv6() == b.stats.IpFamily.SupportsIpv6() {
+					return 0
+				}
+				if a.stats.IpFamily.SupportsIpv6() {
+					return -1
+				}
+				return 1
 			})
 		}
 	}

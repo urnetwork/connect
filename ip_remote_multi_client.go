@@ -1716,13 +1716,11 @@ type WindowSizeSettings struct {
 	WindowSizeMin int
 	// the minimumum number of items in the windows that must be connected via p2p only
 	WindowSizeMinP2pOnly int
-	// WindowSizeMinIpv6Capable is the SOFT minimum of v6-capable exits
-	// (dualstack or v6-only) an auto-sized window tries to hold (IPV6.md
-	// B1). Like WindowSizeMinP2pOnly it raises the resize target by its
-	// shortfall and steers admission, but it never changes the hard minimum,
-	// so a window with no v6-capable provider in reach still reads as
-	// connected. Fixed-size, fixed-profile and fixed-destination windows
-	// ignore it.
+	// Soft minimum of v6-capable exits. Discovery, admission and refill share
+	// this target, floored at one for auto quality and the active fixed-profile
+	// window. Auto sizing may grow within its caps; a full fixed-size window
+	// swaps a suitable IPv4 exit after discovering supply. It never changes
+	// the hard connected minimum. Fixed destinations are exempt.
 	WindowSizeMinIpv6Capable int
 	// inclusive
 	WindowSizeMax     int
@@ -12821,6 +12819,8 @@ type multiClientWindow struct {
 	// Production leaves these unset.
 	// Nil test-only acquisition barrier; called outside every evaluation lock.
 	afterExpandAcquisitionForTest func(*sync.Mutex)
+	// Nil test-only pass barrier, after publication and outside all locks.
+	afterResizePassForTest func()
 	// Nil test-only sender boundary: false after the returned error snapshot,
 	// true after its terminal lock is released. Neither call holds a lock.
 	afterExpandPingSendForTest    func(client *multiClientChannel, finished bool)
@@ -12935,7 +12935,7 @@ type multiClientWindow struct {
 	// --- address family (see ip_remote_multi_client_family.go) ---
 
 	// ipv6Shortfall is the v6-capable shortfall the resize pass last
-	// computed: how many v6-capable exits the window wants and has none of
+	// computed: how many requested v6-capable exits the window still lacks
 	// (0 when none, or when the soft minimum does not apply). The enumerator
 	// asks for that many v6-capable candidates ahead of the main fill.
 	// ipv6StarvedUntil is when it may ask again after a request returned
@@ -14630,27 +14630,23 @@ func (self *multiClientWindow) resize() {
 				ipv6CapableCount += 1
 			}
 		}
-		// the soft v6-capable minimum (IPV6.md B1) applies to auto-sized
-		// windows only: a fixed profile, a fixed size or a fixed destination
-		// pins the membership, and a soft minimum has no slot to claim there.
-		// The shortfall is CONFIRMED only once the main fill has produced
-		// exits and none carries v6 -- during formation the dualstack-first
-		// fill is still the way to get one, so nothing extra is asked for.
-		_, familyFixedDestination := self.generator.FixedDestinationSize()
+		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
+		inactive := !fixedDestination && fixedWindowType != nil && self.windowType != *fixedWindowType
+		dualstackTargetCount := requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+		if fixedDestination || inactive {
+			dualstackTargetCount = 0
+		}
 		ipv6Shortfall := ipv6CapableShortfall(
-			windowSize,
-			fixedWindowType != nil,
-			familyFixedDestination,
-			len(clients),
+			dualstackTargetCount,
+			fixedDestination,
+			inactive,
 			ipv6CapableCount,
 		)
 
 		var windowSizeMin int
 		var targetWindowSize int
-		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
 		// A fixed peer always routes through its sole quality window. Other
 		// profiles admit new flows only through the selected window class.
-		inactive := !fixedDestination && fixedWindowType != nil && self.windowType != *fixedWindowType
 		if fixedDestination {
 			targetWindowSize = fixedDestinationSize
 			windowSizeMin = targetWindowSize
@@ -14696,7 +14692,7 @@ func (self *multiClientWindow) resize() {
 		// FP2-PROTOCOL.md §7.4)
 		self.setRequestSizing(
 			targetWindowSize,
-			requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize),
+			dualstackTargetCount,
 		)
 		if self.windowType != WindowTypeLimited {
 			self.publishSizing(windowSizing{
@@ -15029,6 +15025,9 @@ func (self *multiClientWindow) resize() {
 			self.publishedClientLabels = clientLabels
 		}
 
+		if self.afterResizePassForTest != nil {
+			self.afterResizePassForTest()
+		}
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
 		if redialDeferred {
 			timeout = min(timeout, time.Until(redialTime))
@@ -15479,7 +15478,7 @@ func (self *multiClientWindow) expand(
 			// v6-capable candidate this pass asked for must land before
 			// the fill closes the slot with another single-family exit
 			var pick int
-			if 0 < ipv6Shortfall && admittedIpv6Capable == 0 {
+			if admittedIpv6Capable < ipv6Shortfall {
 				closesShortfall := make([]bool, len(pending))
 				for i, candidate := range pending {
 					closesShortfall[i] = candidate.client.IpFamily().SupportsIpv6()
@@ -15489,6 +15488,15 @@ func (self *multiClientWindow) expand(
 				pick = poolAdmitOrder(qualified, 1)[0]
 			}
 			candidate := pending[pick]
+			if !candidate.client.IpFamily().SupportsIpv6() &&
+				admitBudget-admitted <= ipv6Shortfall-admittedIpv6Capable &&
+				!expandEnded && !fixedDestination && !self.ipv6Starved(time.Now()) {
+				// Preserve the requested slots while a slower family candidate
+				// can still finish. Terminal cleanup releases the reservation at
+				// the existing pass deadline, so absent/failed IPv6 never prevents
+				// a healthy IPv4 fallback from forming even a size-one window.
+				break
+			}
 			pending = append(pending[:pick], pending[pick+1:]...)
 			if admitCandidate(candidate) {
 				admitted += 1
@@ -16962,7 +16970,7 @@ type multiClientChannelArgs struct {
 	// always legacy, and the user chose the peer whatever its family: the
 	// placement predicate does not narrow a fixed exit by ip version, it
 	// reads as v6 available, and it is never a family-swap victim
-	// (IPV6.md B1 exempts fixed windows from the soft minimum).
+	// (fixed destinations are exempt from the soft family minimum).
 	FixedDestination bool
 
 	// Marks the exit a sticky window lost to transport loss, asked for again by
