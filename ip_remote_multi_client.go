@@ -178,9 +178,19 @@ const (
 // provider from near-term discovery. Implementations own the retention policy;
 // the API generator uses a bounded oldest-evicted runtime history. Used by
 // RemoteUserNatMultiClient.RemoveProvider so a removed provider is not handed
-// straight back by the next discovery call.
+// straight back by the next discovery call, nor by a call already out, nor
+// through a window identity restored for it (PROXYDRAIN1.md §3.5), which the
+// API generator forgets.
 type MultiClientGeneratorExcluder interface {
 	ExcludeClientId(clientId Id)
+}
+
+// The companion of MultiClientGeneratorExcluder: whether the generator
+// excludes any hop of a destination now. The expansion refuses a candidate
+// listed before its provider was excluded (acceptDiscoveryDemandArgs). A
+// generator without it has its candidates evaluated as before.
+type multiClientGeneratorExclusions interface {
+	excludesDestination(destination MultiHopId) bool
 }
 
 // MultiClientGeneratorWithIpFamily is an optional generator capability:
@@ -11153,7 +11163,9 @@ func (self *RemoteUserNatMultiClient) Shuffle() {
 // near-term discovery under the generator's retention policy. Both halves are
 // required: the resize loop wakes as soon as a client dies, so a removal
 // without the exclusion is immediately undone by re-discovering the same
-// provider. Reports whether a window client was actually removed.
+// provider. The exclusion also keeps it from coming back through a window
+// identity restored for it, and from a candidate listed before the removal.
+// Reports whether a window client was actually removed.
 //
 // A fixed-destination connection (every spec is an explicit client id, e.g. a
 // chosen network peer) is NOT excluded — there is nothing to replace it with,
