@@ -16,7 +16,7 @@ import (
 
 	// "slices"
 	// "runtime/debug"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 
 	"maps"
 
@@ -1144,7 +1144,7 @@ func (self *ContractManager) providePing() {
 		}
 
 		// uniform timeout with mean `ProvidePingTimeout`
-		timeout := time.Duration(mathrand.Int63n(int64(2*self.settings.ProvidePingTimeout))) - time.Now().Sub(lastPingTime)
+		timeout := time.Duration(mathrand.Int64N(int64(2*self.settings.ProvidePingTimeout))) - time.Now().Sub(lastPingTime)
 		if 0 < timeout {
 			select {
 			case <-self.ctx.Done():

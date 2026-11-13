@@ -3,7 +3,7 @@ package connect
 import (
 	"context"
 	"encoding/binary"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"strings"
 	"sync"

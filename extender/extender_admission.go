@@ -4,7 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
@@ -373,5 +373,5 @@ func (self *ExtenderServer) admissionRetryAfter() time.Duration {
 	if maxSeconds <= 0 {
 		return 0
 	}
-	return time.Duration(minSeconds+mathrand.Int63n(maxSeconds-minSeconds+1)) * time.Second
+	return time.Duration(minSeconds+mathrand.Int64N(maxSeconds-minSeconds+1)) * time.Second
 }

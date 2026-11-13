@@ -10,7 +10,7 @@ package connect
 
 import (
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -126,7 +126,8 @@ func TestGossipSampleWithDualStackOnly(t *testing.T) {
 func TestGossipSampleDoesNotStarveDualStack(t *testing.T) {
 	records, bodies := balanceTestRecords(50, 50, 4)
 
-	random := mathrand.New(mathrand.NewSource(7))
+	// a fixed seed, so the stand-in epoch orders are the same every run
+	random := mathrand.New(mathrand.NewPCG(7, 0))
 	dualSeen := 0
 	for range 50 {
 		random.Shuffle(len(records), func(i int, j int) {

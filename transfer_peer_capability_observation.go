@@ -188,8 +188,10 @@ type peerCapability struct {
 	// in which case a later unauthenticated handshake does not replace it
 	keyExchange       tls.CurveID
 	keyExchangeSealed bool
-	// A weak reference cannot retain a retired client's graph for the life
-	// of a shared recorder. Read only after releasing the recorder lock.
+	// The ordinary session that sealed last, never a companion's
+	// (observeE2eSealed). A weak reference cannot retain a retired client's
+	// graph for the life of a shared recorder. Read only after releasing the
+	// recorder lock.
 	sealedSession weak.Pointer[peerEncryptionSession]
 
 	ackObserved               bool
@@ -325,6 +327,12 @@ func (self *PeerCapabilityRecorder) observeE2eHandshake(peerId Id, keyExchange t
 // Records a client-role session whose epoch, negotiated with the given group,
 // verified the peer's identity proof and became established. Called only for
 // sessions this client initiated.
+//
+// A companion lane's client-role session (resolveSendOptions) seals beside the
+// ordinary one, in either order. Its seal is evidence of the peer like any
+// other, but it supplies no ordinary initiator session (capabilitySession), so
+// it never replaces the session a request proof binds to: had it, a companion
+// that sealed second would leave the observation no live session at all.
 func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.CurveID, session *peerEncryptionSession) {
 	if self == nil || peerId == (Id{}) {
 		return
@@ -343,7 +351,9 @@ func (self *PeerCapabilityRecorder) observeE2eSealed(peerId Id, keyExchange tls.
 		capability.e2eSealed = true
 		capability.keyExchange = keyExchange
 		capability.keyExchangeSealed = true
-		capability.sealedSession = weak.Make(session)
+		if session != nil && !session.companion {
+			capability.sealedSession = weak.Make(session)
+		}
 		capability.lastObservationTime = now
 		return true
 	}()

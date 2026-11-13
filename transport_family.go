@@ -43,7 +43,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -380,7 +380,7 @@ func (self *pinnedDialBackoff) delay() time.Duration {
 	if half <= 0 {
 		return d
 	}
-	return half + time.Duration(mathrand.Int63n(int64(half)))
+	return half + time.Duration(mathrand.Int64N(int64(half)))
 }
 
 func (self *pinnedDialBackoff) fail() {
@@ -2122,7 +2122,7 @@ func (self *PlatformTransport) dialH3(
 
 // randomDnsTld picks the tld one dns carrier attempt encodes with.
 func (self *PlatformTransport) randomDnsTld() []byte {
-	return self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+	return self.settings.DnsTlds[mathrand.IntN(len(self.settings.DnsTlds))]
 }
 
 // extenderPlaceholderUDPAddr stands in for the address an extender dial does

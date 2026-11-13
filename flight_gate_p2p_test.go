@@ -11,7 +11,7 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -170,7 +170,7 @@ func newFlightGateVnetPair(
 // a seeded source, so a run is repeatable; every other chunk passes.
 func rtpLossFilter(activeIp net.IP, p float64, seed int64) (func(vnet.Chunk) bool, *atomic.Bool) {
 	var enabled atomic.Bool
-	random := rand.New(rand.NewSource(seed))
+	random := rand.New(rand.NewPCG(uint64(seed), 0))
 	return func(chunk vnet.Chunk) bool {
 		if !enabled.Load() || !rtpUdpPayload(chunk.UserData()) {
 			return true

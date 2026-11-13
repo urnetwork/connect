@@ -21,7 +21,7 @@ package connect
 
 import (
 	"errors"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -44,7 +44,7 @@ func jitterContractRetryWait(interval time.Duration, fraction float64, random fu
 		return interval
 	}
 	if random == nil {
-		random = mathrand.Int63n
+		random = mathrand.Int64N
 	}
 	// clamp a test source to the documented range
 	offset := time.Duration(max(0, min(int64(spread)-1, random(int64(spread)))))

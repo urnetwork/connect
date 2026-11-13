@@ -41,10 +41,17 @@ package connect
 // client certificates, an ech configuration, or a restriction of the cipher
 // suites, groups or versions, each of which the Chrome hello would drop or
 // widen.
+//
+// A Chrome-hello dial that verifies against connect's pinned roots verifies
+// its chain through the process verified-chain cache (net_tls_chain_cache.go),
+// which reuses the verification of an identical chain, name and root pool and
+// checks the name and the validity time on every handshake. The hello on the
+// wire is the same either way.
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"slices"
 	"sync"
@@ -175,11 +182,21 @@ func tlsConnectionState(state utls.ConnectionState) tls.ConnectionState {
 // connection already reads.
 type chromeTlsConn struct {
 	*utls.UConn
+	// the verified-chain cache verified the chain (net_tls_chain_cache.go):
+	// uTLS skipped its own verification, so its state holds no chains, and
+	// these are the chains the cache verified or reused
+	chainCacheVerified bool
+	verifiedChains     [][]*x509.Certificate
 }
 
-// The handshake's state in crypto/tls's type (`tlsConnectionState`).
+// The handshake's state in crypto/tls's type (`tlsConnectionState`), with
+// the verified chains wherever they were verified.
 func (self *chromeTlsConn) ConnectionState() tls.ConnectionState {
-	return tlsConnectionState(self.UConn.ConnectionState())
+	state := tlsConnectionState(self.UConn.ConnectionState())
+	if self.chainCacheVerified {
+		state.VerifiedChains = self.verifiedChains
+	}
+	return state
 }
 
 // The Chrome hello's session cache of one dial path: a bounded cache of the
@@ -254,6 +271,9 @@ type clientTlsHandshaker struct {
 	// the Chrome hello's tickets; nil for Go's hello, whose tickets live in the
 	// path's crypto/tls configuration
 	chromeSessionCache *chromeSessionCache
+	// verifies the Chrome hello's chains where it serves the dial; nil for Go's
+	// hello, which verifies as crypto/tls does
+	chainCache *tlsVerifiedChainCache
 }
 
 // The handshaker of a dial path with config, presenting the hello the
@@ -265,6 +285,7 @@ func newClientTlsHandshaker(fingerprint string, config *tls.Config) *clientTlsHa
 	}
 	if handshaker.chrome {
 		handshaker.chromeSessionCache = newChromeSessionCache()
+		handshaker.chainCache = processTlsVerifiedChainCache
 	}
 	return handshaker
 }
@@ -286,7 +307,15 @@ func (self *clientTlsHandshaker) handshake(ctx context.Context, conn net.Conn, c
 		conn.Close()
 		return nil, err
 	}
-	uconn := utls.UClient(conn, newChromeTlsConfig(config, self.chromeSessionCache), utls.HelloCustom)
+	chromeConfig := newChromeTlsConfig(config, self.chromeSessionCache)
+	chainVerification := self.chainCache.verification(config)
+	if chainVerification != nil {
+		// the cache verifies the chain in place of uTLS, on every full and
+		// resumed handshake; uTLS still checks key possession after it
+		chromeConfig.InsecureSkipVerify = true
+		chromeConfig.VerifyConnection = chainVerification.verifyConnection
+	}
+	uconn := utls.UClient(conn, chromeConfig, utls.HelloCustom)
 	if err := uconn.ApplyPreset(spec); err != nil {
 		uconn.Close()
 		return nil, err
@@ -330,5 +359,10 @@ func (self *clientTlsHandshaker) handshake(ctx context.Context, conn net.Conn, c
 	// 10 KiB and ephemeral keys for the life of the connection
 	uconn.Extensions = nil
 	uconn.HandshakeState.State13.KeyShareKeys = nil
-	return &chromeTlsConn{UConn: uconn}, nil
+	chromeConn := &chromeTlsConn{UConn: uconn}
+	if chainVerification != nil {
+		chromeConn.chainCacheVerified = true
+		chromeConn.verifiedChains = chainVerification.verifiedChains
+	}
+	return chromeConn, nil
 }

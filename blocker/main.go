@@ -78,6 +78,8 @@ const maxHostLen = 253
 // probe, and the pepper is regenerated every build so any collision is
 // transient rather than a permanently mis-blocked domain.
 const hostRecordLen = 6
+const hostTailLen = hostRecordLen - 1
+const hostBucketBytes = 257 * 4
 
 // poison guards for source cidrs, per security/main.go
 const minPrefixBits = 8
@@ -99,6 +101,8 @@ type feed struct {
 	name   string
 	url    string
 	format feedFormat
+	// Frogeye hosts variants carry required integrity and freshness metadata.
+	frogeyeVariant string
 	// hard-fail the build if fewer valid host entries than this
 	minCount int
 	// part of the conservative tier (the standard tier uses every feed)
@@ -117,8 +121,8 @@ var feeds = []feed{
 	{name: "shadowwhisperer_tracking", url: "https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking", format: formatHostsOrDomains, minCount: 80000, credit: "ShadowWhisperer BlockLists, Tracking (Unlicense) — github.com/ShadowWhisperer/BlockLists"},
 	{name: "shadowwhisperer_wild_tracking", url: "https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Wild_Tracking", format: formatHostsOrDomains, minCount: 8000, credit: "ShadowWhisperer BlockLists, Wild_Tracking (Unlicense) — github.com/ShadowWhisperer/BlockLists"},
 	{name: "anudeepnd_adservers", url: "https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt", format: formatHostsOrDomains, minCount: 25000, conservative: true, credit: "anudeepND blacklist, adservers (MIT, Copyright (c) 2018 Anudeep ND) — github.com/anudeepND/blacklist"},
-	{name: "frogeye_firstparty", url: "https://hostfiles.frogeye.fr/firstparty-trackers.txt", format: formatHostsOrDomains, minCount: 8000, conservative: true, credit: "Geoffrey Frogeye first-party trackers (MIT) — hostfiles.frogeye.fr"},
-	{name: "frogeye_multiparty", url: "https://hostfiles.frogeye.fr/multiparty-trackers.txt", format: formatHostsOrDomains, minCount: 10000, credit: "Geoffrey Frogeye multiparty trackers (MIT) — hostfiles.frogeye.fr"},
+	{name: "frogeye_firstparty", url: "https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt", format: formatHostsOrDomains, frogeyeVariant: "first-party trackers", minCount: 4000, conservative: true, credit: "Geoffrey Frogeye first-party trackers (MIT) — hostfiles.frogeye.fr"},
+	{name: "frogeye_multiparty", url: "https://hostfiles.frogeye.fr/multiparty-trackers-hosts.txt", format: formatHostsOrDomains, frogeyeVariant: "multi-party trackers", minCount: 8000, credit: "Geoffrey Frogeye multiparty trackers (MIT) — hostfiles.frogeye.fr"},
 	{name: "hostsvn", url: "https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts", format: formatHostsOrDomains, minCount: 9000, credit: "hostsVN (MIT, Copyright (c) BigDargon) — github.com/bigdargon/hostsVN"},
 
 	{name: "anudeepnd_whitelist", url: "https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt", format: formatHostsOrDomains, minCount: 100, conservative: true, allow: true, credit: "anudeepND whitelist (MIT, Copyright (c) 2018 Anudeep ND) — github.com/anudeepND/whitelist [subtracted]"},
@@ -360,7 +364,7 @@ func main() {
 	// size budget. the packed tables are string constants: the compiler puts
 	// them in the binary's read-only data, so these bytes — not the ~4x larger
 	// .go source (each byte is a \xNN escape) — are what the sdk ships.
-	embedded := len(pepper) + len(keys)*hostRecordLen + len(final)*8 + len(final6)*32
+	embedded := len(pepper) + hostBucketBytes + len(keys)*hostTailLen + len(final)*8 + len(final6)*32
 	fmt.Fprintf(os.Stderr, "embedded tables: %d bytes (%.3f MiB) of %d budget (%.3f MiB)\n",
 		embedded, float64(embedded)/(1<<20), *maxBytes, float64(*maxBytes)/(1<<20))
 	if *maxBytes < embedded {
@@ -425,6 +429,9 @@ func fetchAll(tierFeeds []feed, timeout time.Duration) []parsed {
 // Records the exact decoded response body before parser normalization.
 func parseResponse(f feed, data []byte) parsed {
 	p := parseFeed(f.format, data)
+	if f.frogeyeVariant != "" {
+		p = parseFrogeye(data, f.frogeyeVariant, time.Now())
+	}
 	p.f = f
 	p.contentSHA256 = sha256.Sum256(data)
 	p.contentBytes = len(data)
@@ -962,10 +969,11 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	c("")
 	c(fmt.Sprintf("Tier: %s. Regenerate with:  go generate ./blocker   (or: cd blocker && go run .)", tier))
 	c("")
-	c("Representation: blockerBlockedHostData is a read-only string constant of")
-	c(fmt.Sprintf("blockerBlockedHostCount records of %d bytes each — the first %d bytes, big", hostRecordLen, hostRecordLen))
-	c("endian, of SHA256(blockerPepper || name) — sorted ascending and unique,")
-	c("where name is the normalized (lower case, punycode) entry. an entry")
+	c(fmt.Sprintf("Representation: fingerprints retain the first %d bytes of SHA256(blockerPepper || name).", hostRecordLen))
+	c("blockerBlockedHostBuckets holds 257 big-endian uint32 record offsets;")
+	c(fmt.Sprintf("the first fingerprint byte selects a bucket of sorted %d-byte tails in", hostTailLen))
+	c("blockerBlockedHostData. This lossless encoding preserves all fingerprint bits.")
+	c("The name is the normalized (lower case, punycode) entry. An entry")
 	c("blocks the name and all its subdomains; the lookup walks label suffixes")
 	c("(see dataBlocker.BlockHost). the pepper is regenerated on every run,")
 	c("after the feeds are fetched: collision hardening and per-release")
@@ -1009,15 +1017,8 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	writeStringConst("blockerPepper", []byte(pepper))
 
 	fmt.Fprintf(&b, "const blockerBlockedHostCount = %d\n\n", len(keys))
-	// each key is written as its low hostRecordLen bytes, big endian — which
-	// are exactly the leading digest bytes hashHost consumed, so the sorted
-	// key order equals the packed records' lexicographic order
-	hostData := make([]byte, 0, len(keys)*hostRecordLen)
-	for _, key := range keys {
-		for i := hostRecordLen - 1; 0 <= i; i -= 1 {
-			hostData = append(hostData, byte(key>>(8*i)))
-		}
-	}
+	buckets, hostData := packHostHashes(keys)
+	writeStringConst("blockerBlockedHostBuckets", buckets)
 	writeStringConst("blockerBlockedHostData", hostData)
 
 	fmt.Fprintf(&b, "const blockerBlockedPrefixCount = %d\n\n", len(ranges))
@@ -1039,6 +1040,26 @@ func emit(tier string, pepper string, keys []uint64, ranges []iprange, ranges6 [
 	writeStringConst("blockerBlockedPrefix6Data", data6)
 
 	return []byte(b.String())
+}
+
+// keys are sorted unique 48-bit fingerprints. Bucket offsets remove the
+// repeated leading byte without discarding any fingerprint information.
+func packHostHashes(keys []uint64) ([]byte, []byte) {
+	buckets := make([]byte, 0, hostBucketBytes)
+	data := make([]byte, 0, len(keys)*hostTailLen)
+	position := 0
+	for bucket := 0; bucket <= 256; bucket++ {
+		for position < len(keys) && keys[position]>>(8*hostTailLen) < uint64(bucket) {
+			position++
+		}
+		buckets = binary.BigEndian.AppendUint32(buckets, uint32(position))
+	}
+	for _, key := range keys {
+		for i := hostTailLen - 1; i >= 0; i-- {
+			data = append(data, byte(key>>(8*i)))
+		}
+	}
+	return buckets, data
 }
 
 // outputFile is the generated data file. ip_blocker.go (the interface, the

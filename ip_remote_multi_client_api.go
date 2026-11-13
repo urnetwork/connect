@@ -392,7 +392,9 @@ type ApiMultiClientGenerator struct {
 
 	// While set, every discovery request asks only for modern providers
 	// (`FindProviders2Args.RequireModernProvider`) and leaves
-	// `PostQuantumEncryption` unset (SetPostQuantumEncryption).
+	// `PostQuantumEncryption` unset, and fixed and restored destinations are
+	// returned only once the platform confirms them modern
+	// (SetPostQuantumEncryption).
 	postQuantumEncryption atomic.Bool
 
 	// The platform's override of the strict window handover, as the latest
@@ -766,7 +768,10 @@ func (self *ApiMultiClientGenerator) SelectorMode() (selectorMode bool, known bo
 // and a named redial alike, asks only for modern providers
 // (`FindProviders2Args.RequireModernProvider`) and does not send
 // `PostQuantumEncryption`. Fixed `ClientId` specs and restored window
-// identities make no request, so it does not narrow them.
+// identities, which have nothing to discover, are returned only once a named
+// request with the same requirement confirms every hop modern, and a restored
+// identity the platform does not confirm is forgotten
+// (nextDestinationsContext). Unset, they are returned with no request.
 func (self *ApiMultiClientGenerator) SetPostQuantumEncryption(postQuantumEncryption bool) {
 	self.postQuantumEncryption.Store(postQuantumEncryption)
 }
@@ -828,20 +833,35 @@ func (self *ApiMultiClientGenerator) NextDestinationsContext(ctx context.Context
 // selector-mode entry points. The filter rides
 // straight into find-providers2; the server treats the empty filter as
 // v4-capable. A non-nil providerSelect puts the request in selector mode, and
-// selectorMode reports whether the answer echoed it; fixed and restored
-// destinations make no request, so they report nothing about the server.
+// selectorMode reports whether the answer echoed it.
+//
+// Fixed `ClientId` specs and restored window identities are their own
+// destinations, with nothing to discover. Without the modern requirement
+// (SetPostQuantumEncryption) they are returned with no request, as always.
+// Under it the platform must confirm them first, since a provider counts as
+// modern only with a positive capability probe handshake (owner, 2026-11-13).
+// One find-providers2 request names every hop of every such destination by
+// `ClientId` with `RequireModernProvider`, and a destination is returned only
+// when the answer names each of its hops. A restored destination left out of
+// a successful answer is forgotten (windowIdentityState.ForgetRestored). A
+// failed confirmation drops all of them from this answer, so none is dialed
+// unconfirmed, and forgets none. The confirmation runs beside the discovery
+// request, so the call still takes one platform round trip, and it carries no
+// `select`, so it says nothing about selector mode.
 func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context, count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter, providerSelect *FindProvidersSelect) (map[MultiHopId]DestinationStats, bool, error) {
 	excludeClientIds := self.ExcludeClientIds()
 	excludeDestinationsIds := [][]Id{}
 	for _, excludeDestination := range excludeDestinations {
 		excludeDestinationsIds = append(excludeDestinationsIds, excludeDestination.Ids())
 	}
-	destinations := map[MultiHopId]DestinationStats{}
+	// the fixed and restored destinations, which discovery does not check
+	undiscoveredDestinations := map[MultiHopId]bool{}
 
 	// A fixed-destination spec (an explicit client id, e.g. a known network peer)
 	// is its own destination — there is nothing to discover. Short-circuit
 	// find-providers2 for these so a peer connect is a direct send with no platform
-	// round trip (and does not hang if the server would not return the peer).
+	// round trip (and does not hang if the server would not return the peer),
+	// unless the modern requirement asks the platform to confirm them below.
 	// Specs that need discovery (location / group / best-available) still go
 	// through the api below.
 	excludedClientIds := map[Id]bool{}
@@ -865,7 +885,7 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		if slices.Contains(excludeDestinations, destination) {
 			continue
 		}
-		destinations[destination] = DestinationStats{}
+		undiscoveredDestinations[destination] = true
 	}
 
 	// destinations with a restored identity pending reuse are dialed first
@@ -892,16 +912,73 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 		if slices.Contains(excludeDestinations, destination) {
 			continue
 		}
-		if _, ok := destinations[destination]; ok {
-			continue
-		}
-		destinations[destination] = DestinationStats{}
+		undiscoveredDestinations[destination] = true
 	}
 
-	selectorMode := false
+	// one read for both requests, so the undiscovered destinations and the
+	// discovered ones are judged under the same setting
+	requireModern := self.postQuantumEncryption.Load()
+
+	// Every hop of every undiscovered destination, once each. The restored
+	// identities are capped (maxRestoredWindowIdentityCount), so one request
+	// holds them with the fixed specs: the platform reads any number of named
+	// providers and bounds only the request body, by megabytes.
+	confirmClientIds := []Id{}
+	if requireModern {
+		seenClientIds := map[Id]bool{}
+		for destination := range undiscoveredDestinations {
+			for _, clientId := range destination.Ids() {
+				if !seenClientIds[clientId] {
+					seenClientIds[clientId] = true
+					confirmClientIds = append(confirmClientIds, clientId)
+				}
+			}
+		}
+	}
+	// the hops the confirmation answered modern; nil until it succeeds
+	var modernClientIds map[Id]bool
+	var confirmErr error
+	confirmDone := make(chan struct{})
+	if 0 < len(confirmClientIds) {
+		confirmSpecs := make([]*ProviderSpec, 0, len(confirmClientIds))
+		for _, clientId := range confirmClientIds {
+			confirmSpecs = append(confirmSpecs, &ProviderSpec{ClientId: &clientId})
+		}
+		// No exclusions ride the request: the destinations above already
+		// passed them here, as without the requirement. The platform still
+		// applies its own rules for named providers, as for a named redial.
+		confirmFindProviders2 := &FindProviders2Args{
+			Specs:                 confirmSpecs,
+			ExcludeClientIds:      []Id{},
+			Count:                 len(confirmSpecs),
+			RankMode:              rankMode,
+			RequireModernProvider: true,
+		}
+		go HandleError(func() {
+			defer close(confirmDone)
+			modernClientIds, confirmErr = HandleError2(func() (map[Id]bool, error) {
+				result, err := self.findProviders2(ctx, confirmFindProviders2)
+				if err != nil {
+					return nil, err
+				}
+				answeredClientIds := map[Id]bool{}
+				for _, provider := range result.Providers {
+					if provider != nil {
+						answeredClientIds[provider.ClientId] = true
+					}
+				}
+				return answeredClientIds, nil
+			}, func(err error) (map[Id]bool, error) {
+				return nil, err
+			})
+		})
+	} else {
+		close(confirmDone)
+	}
+
+	var discoveryResult *FindProviders2Result
+	var discoveryErr error
 	if 0 < len(discoverySpecs) {
-		// the modern requirement narrows only this request: the fixed and
-		// restored destinations above are returned as they are
 		findProviders2 := &FindProviders2Args{
 			Specs:                 discoverySpecs,
 			ExcludeClientIds:      excludeClientIds,
@@ -909,20 +986,53 @@ func (self *ApiMultiClientGenerator) nextDestinationsContext(ctx context.Context
 			Count:                 count,
 			RankMode:              rankMode,
 			IpFamily:              ipFamily,
-			RequireModernProvider: self.postQuantumEncryption.Load(),
+			RequireModernProvider: requireModern,
 			Select:                cloneFindProvidersSelect(providerSelect),
 		}
+		discoveryResult, discoveryErr = self.findProviders2(ctx, findProviders2)
+	}
+	<-confirmDone
 
-		result, err := self.findProviders2(ctx, findProviders2)
-		if err != nil {
+	destinations := map[MultiHopId]DestinationStats{}
+	for destination := range undiscoveredDestinations {
+		if !requireModern {
+			destinations[destination] = DestinationStats{}
+			continue
+		}
+		if modernClientIds == nil {
+			// the confirmation failed, or had no hop to ask about: never
+			// dialed unconfirmed, and kept for the next call
+			continue
+		}
+		modern := 0 < destination.Len()
+		for _, clientId := range destination.Ids() {
+			if !modernClientIds[clientId] {
+				modern = false
+				break
+			}
+		}
+		if modern {
+			destinations[destination] = DestinationStats{}
+		} else {
+			// a destination with no restored identity forgets nothing
+			self.identityState.ForgetRestored(destination)
+		}
+	}
+
+	selectorMode := false
+	if 0 < len(discoverySpecs) {
+		if discoveryErr != nil {
 			// prefer returning any fixed destinations over failing the whole call
 			if 0 < len(destinations) {
 				return destinations, false, nil
 			}
-			return nil, false, err
+			return nil, false, discoveryErr
 		}
-		selectorMode = self.observeSelectorMode(providerSelect, result)
-		addProviderDestinations(destinations, result.Providers, selectorMode)
+		selectorMode = self.observeSelectorMode(providerSelect, discoveryResult)
+		addProviderDestinations(destinations, discoveryResult.Providers, selectorMode)
+	} else if confirmErr != nil {
+		// with nothing to discover, a failed confirmation fails the call
+		return nil, false, confirmErr
 	}
 
 	return destinations, selectorMode, nil

@@ -5,7 +5,7 @@ package connect
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"sync"
@@ -73,7 +73,8 @@ func newUdpSctpLedgerLink(ctx context.Context, p udpSctpLedgerProfile, download 
 	q := &udpSctpLedgerLink{ctx: ctx, profile: p, rate: rate,
 		queueBytes: queueBytes, queuePackets: max(8, (queueBytes+p.mtu-1)/p.mtu),
 		out: out, ready: make(chan struct{}, 1), done: make(chan struct{}),
-		random: rand.New(rand.NewSource(seed))}
+		// the caller's seed, so an experiment replays
+		random: rand.New(rand.NewPCG(uint64(seed), 0))}
 	go q.run()
 	return q
 }
@@ -129,7 +130,7 @@ func (q *udpSctpLedgerLink) submit(wire []byte) (int, error) {
 	}
 	jitter := time.Duration(0)
 	if !lost {
-		jitter = time.Duration(q.random.Int63n(int64(2*q.profile.jitter)+1) - int64(q.profile.jitter))
+		jitter = time.Duration(q.random.Int64N(int64(2*q.profile.jitter)+1) - int64(q.profile.jitter))
 		_ = q.random.Float64() // unchanged zero-probability reorder draw
 	}
 	at := rateReady.Add(q.profile.rtt/2 + jitter)

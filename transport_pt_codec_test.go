@@ -1,8 +1,9 @@
 package connect
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/base32"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"slices"
 	"testing"
 
@@ -21,16 +22,16 @@ func TestDnsRequestEncodeDecode(t *testing.T) {
 	}
 
 	for range 32 {
-		rlen := 4*1024 + mathrand.Intn(32*1024)
+		rlen := 4*1024 + mathrand.IntN(32*1024)
 		data := make([]byte, rlen)
-		mathrand.Read(data)
+		cryptorand.Read(data)
 
 		c := 0
 		i := 0
 		for i < len(data) {
 
 			var header [18]byte
-			mathrand.Read(header[0:16])
+			cryptorand.Read(header[0:16])
 			header[16] = uint8(c)
 			header[17] = 0
 
@@ -54,7 +55,7 @@ func TestDnsRequestEncodeDecode(t *testing.T) {
 	}
 
 	var header [18]byte
-	mathrand.Read(header[0:16])
+	cryptorand.Read(header[0:16])
 	header[16] = 0
 	header[17] = 0
 
@@ -83,15 +84,15 @@ func TestDnsResponseEncodeDecode(t *testing.T) {
 	}
 
 	for range 32 {
-		rlen := 4*1024 + mathrand.Intn(32*1024)
+		rlen := 4*1024 + mathrand.IntN(32*1024)
 		data := make([]byte, rlen)
-		mathrand.Read(data)
+		cryptorand.Read(data)
 
 		c := 0
 		i := 0
 		for i < len(data) {
 			var header [18]byte
-			mathrand.Read(header[0:16])
+			cryptorand.Read(header[0:16])
 			header[16] = uint8(c)
 			header[17] = 0
 
@@ -113,7 +114,7 @@ func TestDnsResponseEncodeDecode(t *testing.T) {
 	}
 
 	var header [18]byte
-	mathrand.Read(header[0:16])
+	cryptorand.Read(header[0:16])
 	header[16] = 0
 	header[17] = 0
 

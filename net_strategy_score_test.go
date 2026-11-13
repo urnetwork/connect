@@ -6,8 +6,9 @@ package connect
 // rng, and fixed verdict sequences. No real network and no sleeps.
 
 import (
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ import (
 // newTestScores is a store with an injected clock fixed at `now`, so decay and
 // ttl are driven by advancing the returned pointer rather than by wall time,
 // and a deterministic retain coin (never retain -> always count a failure) so
-// no test depends on the default time-seeded rng. The two retain tests install
+// no test depends on the default generator's draw. The two retain tests install
 // their own coin to exercise the gate.
 func newTestScores(now *time.Time) *networkStrategyScores {
 	scores := newNetworkStrategyScores()
@@ -158,13 +159,13 @@ func TestStrategyScoreFailedWinnerRetainedPerCoin(t *testing.T) {
 }
 
 // TestStrategyScoreFailedWinnerRetainedAboutHalf exercises the retain rule with
-// the real seeded rng over many trials, so the ~0.5 rate is actually produced,
-// not just the logic. A fixed seed makes it reproducible; the band and the
-// never-all-one-way check make it meaningful.
+// an injected generator over many trials, so the ~0.5 rate is actually
+// produced, not just the logic. A fixed seed makes it reproducible; the band and
+// the never-all-one-way check make it meaningful.
 func TestStrategyScoreFailedWinnerRetainedAboutHalf(t *testing.T) {
 	now := time.Now()
 	scores := newTestScores(&now)
-	rng := mathrand.New(mathrand.NewSource(1))
+	rng := mathrand.New(mathrand.NewPCG(1, 0))
 	scores.retainFailedWinner = func() bool { return rng.Float64() < scores.retainFailedProbability }
 	key := networkScoreKey{networkId: "netA", dialerKey: "fragment"}
 
@@ -183,6 +184,30 @@ func TestStrategyScoreFailedWinnerRetainedAboutHalf(t *testing.T) {
 	}
 	if retained < 400 || 600 < retained {
 		t.Fatalf("retained %d of %d, want about half", retained, trials)
+	}
+}
+
+// TestStrategyScoreRetainCoinIsNotSeededFromTheClock is root cause
+// (RANDUPDATE.md C1): the production retain coin was drawn from a Go 1 source
+// seeded with time.Now().UnixNano() at construction, so anyone who knew roughly
+// when the client started could replay which proven winner a stall keeps, and
+// that choice shows on the wire. Two stores built by the production
+// constructor under one fixed fake clock must draw different coins; at a 0.5
+// rate, 128 equal draws happen with probability 2^-128.
+func TestStrategyScoreRetainCoinIsNotSeededFromTheClock(t *testing.T) {
+	now := time.Date(2026, time.November, 13, 12, 0, 0, 0, time.UTC)
+	coins := func() []bool {
+		scores := newNetworkStrategyScores()
+		scores.now = func() time.Time { return now }
+		scores.retainFailedProbability = 0.5
+		coins := []bool{}
+		for range 128 {
+			coins = append(coins, scores.retainFailedWinner())
+		}
+		return coins
+	}
+	if first, second := coins(), coins(); slices.Equal(first, second) {
+		t.Fatalf("two stores built at one instant drew the same retain coins %v", first)
 	}
 }
 

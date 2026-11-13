@@ -50,8 +50,8 @@ func TestReceiveSequenceMalformedContractRejectsRetransmits(t *testing.T) {
 	}
 }
 
-// TestReceiveBufferRejectedSequenceDropsRetransmits verifies that equal and
-// older sequence ids are discarded before constructing another receive worker.
+// Repeats of the exact rejected sequence are discarded before constructing
+// another receive worker. A rejection cannot judge a different generation.
 func TestReceiveBufferRejectedSequenceDropsRetransmits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -61,7 +61,6 @@ func TestReceiveBufferRejectedSequenceDropsRetransmits(t *testing.T) {
 	}
 	buffer := NewReceiveBuffer(ctx, client, DefaultReceiveBufferSettings())
 	source := SourceId(NewId())
-	olderSequenceId := NewId()
 	rejectedSequenceId := NewId()
 	headKey := receiveSequenceHeadKey{
 		Source:         source,
@@ -71,11 +70,11 @@ func TestReceiveBufferRejectedSequenceDropsRetransmits(t *testing.T) {
 	buffer.rejectReceiveSequenceWithLock(headKey, rejectedSequenceId)
 	buffer.mutex.Unlock()
 
-	for _, sequenceId := range []Id{olderSequenceId, rejectedSequenceId} {
+	for i := 0; i < 2; i++ {
 		success, err := buffer.Pack(
 			&ReceivePack{
 				Source:         source,
-				SequenceId:     sequenceId,
+				SequenceId:     rejectedSequenceId,
 				EncryptionRole: sequenceTlsRoleServer,
 			},
 			0,
@@ -93,6 +92,152 @@ func TestReceiveBufferRejectedSequenceDropsRetransmits(t *testing.T) {
 	buffer.mutex.Unlock()
 	if receiveSequenceCount != 0 {
 		t.Fatalf("rejected retransmits created %d receive sequences", receiveSequenceCount)
+	}
+}
+
+// A maximum sequence id with an invalid contract must reject its own retries,
+// then allow the real peer's lower generation through the ordinary Pack path.
+func TestReceiveBufferRejectedMaximumSequenceDoesNotPoisonPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var maxSequenceId Id
+	for i := range maxSequenceId {
+		maxSequenceId[i] = 0xff
+	}
+	legitSequenceId := Id{15: 1}
+	rejected := make(chan struct{})
+	release := make(chan struct{})
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.EncryptionSettings.Mode = EncryptionModeOff
+	settings.ReceiveBufferSettings.afterRunReceiveSequenceForTest = func(id receiveSequenceId) {
+		if id.SequenceId == maxSequenceId {
+			close(rejected)
+		}
+	}
+	settings.ReceiveBufferSettings.beforeRunReceiveSequenceForTest = func(id receiveSequenceId) {
+		if id.SequenceId == legitSequenceId {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer func() {
+		cancel()
+		if err := client.CloseAndWait(context.Background()); err != nil {
+			t.Errorf("client cleanup: %v", err)
+		}
+	}()
+	source := SourceId(NewId())
+	contractFrame, err := ToFrame(&protocol.Contract{
+		StoredContractBytes: []byte{1}, StoredContractHmac: []byte{2},
+		ProvideMode: protocol.ProvideMode_Stream,
+	}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attack := &ReceivePack{
+		Source: source, SequenceId: maxSequenceId,
+		EncryptionRole: sequenceTlsRoleServer, Unwrapped: true,
+		Pack: &protocol.Pack{
+			MessageId: NewId().Bytes(), SequenceId: maxSequenceId.Bytes(),
+			Head: true, ContractFrame: contractFrame,
+		},
+	}
+	if ok, err := client.receiveBuffer.Pack(attack, time.Second); err != nil || !ok {
+		attack.messagePoolReturn()
+		t.Fatalf("invalid opening was not admitted: %t, %v", ok, err)
+	}
+	select {
+	case <-rejected:
+	case <-ctx.Done():
+		t.Fatal("invalid opening did not finish rejection")
+	}
+	headKey := receiveSequenceHeadKey{Source: source, EncryptionRole: sequenceTlsRoleServer}
+	client.receiveBuffer.mutex.Lock()
+	tombstone, exists := client.receiveBuffer.rejectedReceiveSequenceIds[headKey]
+	client.receiveBuffer.mutex.Unlock()
+	if !exists || tombstone != maxSequenceId {
+		t.Fatal("invalid opening did not install the maximum rejection")
+	}
+	client.ContractManager().AddNoContractPeer(source.SourceId)
+	delivered := make(chan struct{}, 1)
+	frame := requiredGateFrame(t, "legitimate lower sequence")
+	legit := &ReceivePack{
+		Source: source, SequenceId: legitSequenceId,
+		EncryptionRole: sequenceTlsRoleServer, Unwrapped: true,
+		MessageByteCount: MessageByteCount([]*protocol.Frame{frame}),
+		Pack: &protocol.Pack{
+			MessageId: NewId().Bytes(), SequenceId: legitSequenceId.Bytes(),
+			Head: true, Nack: true, Frames: []*protocol.Frame{frame},
+		},
+		ReceiveCallback: func(TransferPath, []*protocol.Frame, Peer) { delivered <- struct{}{} },
+	}
+	if ok, err := client.receiveBuffer.Pack(legit, time.Second); err != nil || !ok {
+		legit.messagePoolReturn()
+		t.Fatalf("legitimate opening was not admitted: %t, %v", ok, err)
+	}
+	// The barrier keeps an admitted worker indexed until this assertion; a
+	// silent rejection therefore fails immediately without a negative timeout.
+	client.receiveBuffer.mutex.Lock()
+	head, admitted := client.receiveBuffer.headReceiveSequenceIds[headKey]
+	client.receiveBuffer.mutex.Unlock()
+	if !admitted || head.SequenceId != legitSequenceId {
+		t.Fatal("maximum rejected sequence permanently blocked the legitimate lower generation")
+	}
+	close(release)
+	select {
+	case <-delivered:
+	case <-ctx.Done():
+		t.Fatal("admitted lower generation did not deliver application data")
+	}
+}
+
+// The independently funded opening path must apply the same exact rejection
+// boundary before an ordinary worker can verify the new opening's contract.
+func TestReceiveFreshOpeningRejectsOnlyExactFailedSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := TransferPath{SourceId: NewId(), DestinationId: NewId()}
+	var maxSequenceId Id
+	for i := range maxSequenceId {
+		maxSequenceId[i] = 0xff
+	}
+	root := NewTransferMemoryBudget(32 * 1024)
+	rx := NewTransferMemoryBudgetWithParent(16*1024, root)
+	recovery := NewTransferMemoryBudgetWithParent(16*1024, root)
+	settings := DefaultReceiveBufferSettings()
+	settings.ReceiveQueueBudget = rx
+	settings.ReceiveHeadRecoveryBudget = recovery
+	buffer := NewReceiveBuffer(ctx, &Client{ctx: ctx, clientId: path.DestinationId, log: NewNoopLogger()}, settings)
+	headKey := receiveSequenceHeadKey{Source: path.SourceMask(), EncryptionRole: sequenceTlsRoleServer}
+	buffer.mutex.Lock()
+	buffer.rejectReceiveSequenceWithLock(headKey, maxSequenceId)
+	buffer.mutex.Unlock()
+	for _, sequenceId := range []Id{maxSequenceId, {15: 1}} {
+		pack := sendPackFrame{
+			messageId: NewId(), sequenceId: sequenceId, head: true,
+			contractFrame: &protocol.Frame{
+				MessageType: protocol.MessageType_TransferContract, MessageBytes: []byte{0},
+			},
+		}
+		wire := receiveMemoryScanTestWire(path, pack.appendPack(nil), false)
+		scan, status := scanReceiveMemoryPack(wire, path)
+		if status != receiveMemoryPackScanReady || !receiveConsumerOpeningHeadScan(scan) {
+			t.Fatal("opening fixture did not reach the real scanner admission boundary")
+		}
+		owner := buffer.takeReceiveFreshOpeningOwnerInSession(scan, sequenceTlsRoleServer, false, false)
+		if owner != nil {
+			owner.receivePack.messagePoolReturn()
+		}
+		if (owner != nil) != (sequenceId != maxSequenceId) {
+			t.Fatalf("opening admission for %s did not respect exact failed-generation rejection", sequenceId)
+		}
+	}
+	for _, budget := range []*TransferMemoryBudget{rx, recovery, root} {
+		assertRetainedBudgetBalance(t, budget)
 	}
 }
 

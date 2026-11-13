@@ -85,10 +85,16 @@ var (
 // session cache below, but x509 verification only reads RootCAs, so duplicating
 // the same parsed certificates for every Auto exit is allocation and retained
 // memory with no isolation benefit. PinnedCertPool intentionally remains the
-// public fresh-pool API for callers that plan to mutate their result.
+// public fresh-pool API for callers that plan to mutate their result. The
+// pool is registered with the process verified-chain cache, so the Chrome
+// hello's dials that verify against it reuse a verified chain
+// (net_tls_chain_cache.go).
 func sharedDefaultPinnedCertPool() (*x509.CertPool, error) {
 	defaultPinnedCertPoolOnce.Do(func() {
 		defaultPinnedCertPool, defaultPinnedCertPoolErr = PinnedCertPool()
+		if defaultPinnedCertPoolErr == nil {
+			processTlsVerifiedChainCache.addRootPool(defaultPinnedCertPool)
+		}
 	})
 	return defaultPinnedCertPool, defaultPinnedCertPoolErr
 }
@@ -124,7 +130,8 @@ func appendStrictRootCertificates(certPool *x509.CertPool, contents []byte) erro
 // Builds the root set for one client configuration. Ordinary clients retain
 // the shared immutable pool. A private deployment gets a clone before its
 // explicit roots are appended, so one process cannot mutate another config's
-// default trust set.
+// default trust set. Either is registered with the process verified-chain
+// cache (net_tls_chain_cache.go).
 func defaultRootCertPool() (*x509.CertPool, error) {
 	certPool, err := sharedDefaultPinnedCertPool()
 	if err != nil {
@@ -152,6 +159,7 @@ func defaultRootCertPool() (*x509.CertPool, error) {
 	if err := appendStrictRootCertificates(configuredCertPool, extraRootCAPem); err != nil {
 		return nil, fmt.Errorf("%s: %w", ExtraRootCAFileEnv, err)
 	}
+	processTlsVerifiedChainCache.addRootPool(configuredCertPool)
 	return configuredCertPool, nil
 }
 

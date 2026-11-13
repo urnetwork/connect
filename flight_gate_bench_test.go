@@ -3,7 +3,7 @@ package connect
 // Performance tests of FLIGHTGATEFIX.md §6.1 for the transfer layer.
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -132,7 +132,8 @@ func BenchmarkSendSequenceMixedCarriers(b *testing.B) {
 				client:   client,
 				peerId:   peerId,
 				fromPeer: fromPeer,
-				random:   rand.New(rand.NewSource(20260910)),
+				// a fixed loss pattern, so runs compare
+				random: rand.New(rand.NewPCG(20260910, 0)),
 			}
 			stop := make(chan struct{})
 			go model.run(b, unreliable, 20*time.Millisecond, scenario.drop, stop)
