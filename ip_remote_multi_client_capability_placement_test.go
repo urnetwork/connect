@@ -104,9 +104,10 @@ func TestRaceFieldMergesTheLimitedWindow(t *testing.T) {
 	}
 }
 
-// A bounded race takes the top of the merged order (§7.5, owner 2026-11-13):
-// the send path moves only held clients last before it bounds the race, and
-// never an exit by its window. The behaviour is pinned end to end in
+// A bounded race takes each window's top and then the merged order (§7.5,
+// owner 2026-11-13): the send path puts the window tops first and held
+// clients last before it bounds the race, and moves no other exit by its
+// window. The behaviour is pinned end to end in
 // ip_remote_multi_client_race_merge_test.go.
 func TestBoundedRaceKeepsTheMergedOrder(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
@@ -117,10 +118,10 @@ func TestBoundedRaceKeepsTheMergedOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find the packet-group attempt")
 	}
-	order := strings.Index(body, "orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)")
+	order := strings.Index(body, "orderedClients = contractRateLimitHeldLast(raceWindowTopsFirst(orderedClients, self.settings, raceTime), raceTime)")
 	bound := strings.Index(body, "raceOrderedClients := orderedClients[:multiRaceClientCount(")
 	if order < 0 || bound < 0 || bound < order {
-		t.Error("the race is bounded before its held clients are ordered last")
+		t.Error("the race is bounded before its window tops are first and its held clients last")
 	}
 	if strings.Contains(body, "limitedClientsLast") || strings.Contains(body, ".windowType()") {
 		t.Error("the send path orders the race by window")

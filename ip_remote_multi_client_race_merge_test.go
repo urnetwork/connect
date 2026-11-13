@@ -3,9 +3,11 @@ package connect
 // Tests that a selected window's race field and the limited window's merge in
 // one order by the weighted metrics (owner, 2026-11-13: "the windows need to
 // merge in order based on the weighted metrics"; server FP2-PROTOCOL.md
-// §7.5): the order of every race field, the bounded race through the send
-// path, held clients still last, udp fields without a limited exit, and the
-// window's own order kept when there is nothing to merge.
+// §7.5), and that a race takes each window's top first (owner, 2026-11-13:
+// "keep the top from each list to be always included"): the order of every
+// race field, the bounded race through the send path, held clients still
+// last, udp fields without a limited exit, and the window's own order kept
+// when there is nothing to merge.
 //
 // The weighted shuffles are pinned by raceOrderTestRandom. Every exit's
 // weight is 1 + its estimated rate (a fixture exit has no traffic), and the
@@ -127,6 +129,41 @@ func (self *raceMergeTestFixture) addExits(t *testing.T) {
 		self.add(t, self.limited, "limited", capabilityClassD, raceMergeTestHeavyLimitedRate)
 		self.add(t, self.limited, "slight", capabilityClassC, raceMergeTestLightLimitedRate)
 	}
+}
+
+// Exits whose limited ones are lighter than every normal one: in quality,
+// first (A), second (B) and third (A); in the limited window, tcp (D) and
+// tcp2 (C). The merged order alone puts both limited exits last.
+func (self *raceMergeTestFixture) addLightLimitedExits(t *testing.T) {
+	t.Helper()
+	self.add(t, self.quality, "first", capabilityClassA, 1_000_000)
+	self.add(t, self.quality, "second", capabilityClassB, 100_000)
+	self.add(t, self.quality, "third", capabilityClassA, 10_000)
+	self.add(t, self.limited, "tcp", capabilityClassD, 1_000)
+	self.add(t, self.limited, "tcp2", capabilityClassC, 100)
+}
+
+// Makes the platform rate limit the named exit's contract requests for an
+// hour: its channel takes a held client, under a new id in its window.
+func (self *raceMergeTestFixture) hold(t *testing.T, name string) {
+	t.Helper()
+	for client, clientName := range self.names {
+		if clientName != name {
+			continue
+		}
+		window := self.quality
+		if client.windowType() == WindowTypeLimited {
+			window = self.limited
+		}
+		window.stateLock.Lock()
+		delete(window.clients, client.ClientId())
+		client.client = contractHeldTestClient(t)
+		client.args.MultiClientGeneratorClientArgs.ClientId = client.client.ClientId()
+		window.clients[client.ClientId()] = client
+		window.stateLock.Unlock()
+		return
+	}
+	t.Fatalf("no exit named %s", name)
 }
 
 // The field's exits by name, in order.
@@ -260,9 +297,10 @@ func TestRaceFieldWithoutALimitedExitIsTheWindowsOwn(t *testing.T) {
 }
 
 // One race of a cold-start SYN through sendPacketGroup over the fixture's
-// windows, with the backend degraded or not. Returns the names of the exits
-// the race registered and the ones it sent the packet to.
-func raceMergeTestSend(t *testing.T, degraded bool, held string) (registeredNames []string, sentNames []string) {
+// windows holding the exits addExits adds, with the backend degraded or not
+// and the exit named held held. Returns the names of the exits the race
+// registered and the ones it sent the packet to.
+func raceMergeTestSend(t *testing.T, degraded bool, held string, addExits func(*raceMergeTestFixture, *testing.T)) (registeredNames []string, sentNames []string) {
 	t.Helper()
 	parent, update, closeParent := groupTestParent(t, DisableSecurityPolicy())
 	defer closeParent()
@@ -277,23 +315,13 @@ func raceMergeTestSend(t *testing.T, degraded bool, held string) (registeredName
 		names:    map[*multiClientChannel]string{},
 	}
 	fixture.addWindows(parent.generator, true)
-	fixture.addExits(t)
+	addExits(fixture, t)
 
+	if held != "" {
+		fixture.hold(t, held)
+	}
 	sent := make(chan *multiClientChannel, len(fixture.names))
-	for client, name := range fixture.names {
-		if name == held {
-			// the platform is rate limiting this exit's contract requests
-			window := fixture.quality
-			if client.windowType() == WindowTypeLimited {
-				window = fixture.limited
-			}
-			window.stateLock.Lock()
-			delete(window.clients, client.ClientId())
-			client.client = contractHeldTestClient(t)
-			client.args.MultiClientGeneratorClientArgs.ClientId = client.client.ClientId()
-			window.clients[client.ClientId()] = client
-			window.stateLock.Unlock()
-		}
+	for client := range fixture.names {
 		client.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
 			sent <- client
 			for packetIndex := range group.packets {
@@ -356,7 +384,7 @@ func raceMergeTestSend(t *testing.T, degraded bool, held string) (registeredName
 // Before, the bound spent both slots on the quality window's exits, so the
 // race never reached the heaviest exit.
 func TestDegradedRaceTakesTheTopOfTheMergedOrder(t *testing.T) {
-	registered, sent := raceMergeTestSend(t, true, "")
+	registered, sent := raceMergeTestSend(t, true, "", (*raceMergeTestFixture).addExits)
 	want := []string{"limited", "normal"}
 	if !slices.Equal(registered, want) {
 		t.Errorf("the degraded race registered %v, want %v", registered, want)
@@ -371,7 +399,7 @@ func TestDegradedRaceTakesTheTopOfTheMergedOrder(t *testing.T) {
 // is held, so the race goes to the next two by weight, one from each window.
 // Before, both slots went to the quality window's exits.
 func TestHeldClientStillRacesLastInTheMergedOrder(t *testing.T) {
-	registered, sent := raceMergeTestSend(t, false, "limited")
+	registered, sent := raceMergeTestSend(t, false, "limited", (*raceMergeTestFixture).addExits)
 	want := []string{"normal", "slight"}
 	if !slices.Equal(registered, want) {
 		t.Errorf("the race with a held exit registered %v, want %v", registered, want)
@@ -384,12 +412,43 @@ func TestHeldClientStillRacesLastInTheMergedOrder(t *testing.T) {
 // With a healthy backend and no held exit the race is unbounded: every exit
 // of both windows that carries the flow is dialed.
 func TestHealthyRaceDialsTheWholeMergedField(t *testing.T) {
-	registered, sent := raceMergeTestSend(t, false, "")
+	registered, sent := raceMergeTestSend(t, false, "", (*raceMergeTestFixture).addExits)
 	want := []string{"light", "limited", "normal", "slight"}
 	if !slices.Equal(registered, want) {
 		t.Errorf("the race registered %v, want %v", registered, want)
 	}
 	if !slices.Equal(sent, want) {
 		t.Errorf("the race sent to %v, want %v", sent, want)
+	}
+}
+
+// A degraded race of two is exactly the two windows' tops (owner,
+// 2026-11-13: "if it's 2, i want to make sure a member of the limited window
+// is always tried"): the best normal exit and the best limited exit, even
+// though both limited exits are lighter than every normal one. Before, both
+// slots went to the quality window's two heaviest.
+func TestDegradedRaceTriesBothWindowsTops(t *testing.T) {
+	registered, sent := raceMergeTestSend(t, true, "", (*raceMergeTestFixture).addLightLimitedExits)
+	want := []string{"first", "tcp"}
+	if !slices.Equal(registered, want) {
+		t.Errorf("the degraded race registered %v, want the two tops %v", registered, want)
+	}
+	if !slices.Equal(sent, want) {
+		t.Errorf("the degraded race sent to %v, want the two tops %v", sent, want)
+	}
+}
+
+// When the limited window's top is held, its next exit stands in as the top,
+// and the held exit still races last: a race bounded to two for the held
+// client tries the best normal exit and the limited window's next. Before,
+// both slots went to the quality window's two heaviest.
+func TestHeldTopGivesWayToItsWindowsNext(t *testing.T) {
+	registered, sent := raceMergeTestSend(t, false, "tcp", (*raceMergeTestFixture).addLightLimitedExits)
+	want := []string{"first", "tcp2"}
+	if !slices.Equal(registered, want) {
+		t.Errorf("the race with a held limited top registered %v, want %v", registered, want)
+	}
+	if !slices.Equal(sent, want) {
+		t.Errorf("the race with a held limited top sent to %v, want %v", sent, want)
 	}
 }

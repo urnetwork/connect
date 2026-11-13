@@ -582,10 +582,10 @@ func (self *RemoteUserNatMultiClient) lastResortRaceField(window *multiClientWin
 // metrics"). The union is ordered as one window orders its offer
 // (orderedClients): a weighted shuffle by each exit's expected throughput
 // (raceWeight) at StatsWindowEntropy. A strong limited exit can lead the race
-// and a weak one follow, by its metrics alone, and a race bounded under a
-// degraded backend takes the top of this order from either window. An empty
-// part leaves the other in its own window's order, so a flow with no limited
-// exit to race keeps exactly the window's field.
+// and a weak one follow, by its metrics alone. The race then puts each
+// window's top first (raceWindowTopsFirst) before it bounds. An empty part
+// leaves the other in its own window's order, so a flow with no limited exit
+// to race keeps exactly the window's field.
 //
 // The weights are read without coalescing the event buckets, as
 // exitMetricsSnapshot reads them on this path; the windows' own passes
@@ -608,6 +608,59 @@ func (self *RemoteUserNatMultiClient) mergeRaceField(field []*multiClientChannel
 	}
 	raceWeightedShuffle(self.settings, merged, weights)
 	return merged
+}
+
+// The race's order over a field that merges windows (owner, 2026-11-13: "if
+// it's 2, i want to make sure a member of the limited window is always tried.
+// I want to combine that with the merged sort, but keep the top from each
+// list to be always included"). Each window's top, its first candidate in
+// the field whose contract requests are not held, comes first, the tops
+// ordered between themselves by the weighted metrics (raceWeight at
+// StatsWindowEntropy). Every other candidate follows in the field's own
+// order, the merged weighted order (mergeRaceField). So a race bounded to two
+// tries the best exit of the normal window and the best of the limited window
+// together, and an unbounded race still tries every one. In a merged field
+// the first of a window is that window's own weighted top: at the default
+// entropy of 0, the weighted order of the union orders each window's exits
+// among themselves as a weighted order of that window alone would.
+//
+// The send path calls it after every filter and right before the bound, so a
+// top that a filter removed is replaced by its window's next. A field of one
+// window, every udp field among them, comes back as it is, as does a field in
+// which fewer than two windows have a candidate that is not held. Held
+// clients are then moved last by contractRateLimitHeldLast, which keeps the
+// tops first. Returns a reordered copy, so the caller's list keeps its order.
+func raceWindowTopsFirst(clients []*multiClientChannel, settings *MultiClientSettings, now time.Time) []*multiClientChannel {
+	if len(clients) < 2 {
+		return clients
+	}
+	tops := make([]*multiClientChannel, 0, 2)
+	windowTypes := make([]WindowType, 0, 2)
+	for _, client := range clients {
+		windowType := client.windowType()
+		if slices.Contains(windowTypes, windowType) || contractRateLimitHeldChannel(client, now) {
+			continue
+		}
+		windowTypes = append(windowTypes, windowType)
+		tops = append(tops, client)
+	}
+	if len(tops) < 2 {
+		return clients
+	}
+	weights := make(map[*multiClientChannel]float32, len(tops))
+	for _, client := range tops {
+		stats, _ := client.windowStatsWithCoalesce(false)
+		weights[client] = raceWeight(stats)
+	}
+	raceWeightedShuffle(settings, tops, weights)
+	ordered := make([]*multiClientChannel, 0, len(clients))
+	ordered = append(ordered, tops...)
+	for _, client := range clients {
+		if !slices.Contains(tops, client) {
+			ordered = append(ordered, client)
+		}
+	}
+	return ordered
 }
 
 // --- parent ---

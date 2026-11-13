@@ -8589,14 +8589,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return
 
 			default:
-				// a client whose contract requests are held races last, and a
-				// race that would still send to one is bounded like one during
-				// an outage (contractRateLimitHeldRaced). Otherwise the field
-				// keeps its one weighted order across the windows
-				// (mergeRaceField), so a bounded race takes the top of that
-				// order from whichever window (server FP2-PROTOCOL.md §7.5)
+				// each window's top races first, then the rest of the field's
+				// one weighted order across the windows (raceWindowTopsFirst,
+				// mergeRaceField), so a bounded race always tries the best of
+				// each window (server FP2-PROTOCOL.md §7.5). A client whose
+				// contract requests are held races last, and a race that
+				// would still send to one is bounded like one during an
+				// outage (contractRateLimitHeldRaced)
 				raceTime := time.Now()
-				orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)
+				orderedClients = contractRateLimitHeldLast(raceWindowTopsFirst(orderedClients, self.settings, raceTime), raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
