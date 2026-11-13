@@ -161,6 +161,9 @@ tags:
         data packs paid in USDC on Solana, Zcash, Monero, TAO, Bitcoin, ETH
         or SOL, end to end through the API alone: the coins on offer, a quote,
         the invoice, its status and a new quote for an unpaid one
+      - gift codes (`/pay/gift`): a year of Pro given as a code, bought by
+        card or in a coin with or without signing in, the order's status and
+        its printable cards, and a public check of a code
       - inline agent payments over the x402 header protocol (`/x402`), in
         x402 v2 and v1: an agent asks for a sku, is answered `402` with the
         payment terms (v2 in the `PAYMENT-REQUIRED` header, v1 in the body),
@@ -4152,7 +4155,11 @@ paths:
       tags: [Subscription]
       summary: Subscription Check Balance Code
       description: |
-        Check if the balance code is valid.
+        Check if the balance code is valid, without redeeming it. `kind` says
+        what the code grants: data, or, for a gift code (`pro_gift`), a year
+        of Pro (`pro_days`) from when it is redeemed. `redeem_by` is the last
+        time the code can be redeemed. /pay/gift/check-code checks a code
+        without signing in.
       operationId: subscriptionCheckBalanceCode
       security:
         - BearerAuth: []
@@ -4176,6 +4183,14 @@ paths:
       summary: Subscription Redeem Balance Code
       description: |
         Redeem the balance code and add the transfer balance to the caller network.
+
+        A gift code (`pro_gift`) grants a year of Pro instead of data, and its
+        answer adds `pro`: the year's `start_time` and `end_time`, and
+        `queued`, true when the year starts after the network's current paid
+        Pro period (card, App Store or Google Play) instead of now. A gift
+        answer still carries `transfer_balance`: the grant's Pro balance, with
+        `balance_byte_count` 0 and the year's start and end, so a client that
+        predates `pro` reports the redeem as a success with no data line.
       operationId: subscriptionRedeemBalanceCode
       security:
         - BearerAuth: []
@@ -7815,6 +7830,294 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CryptoPaymentIntentResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+
+  # ----- gift codes: a year of Pro given as a code (mmm/GIFTOFPRIVACY.md §10.2) -----
+
+  /pay/gift/config:
+    get:
+      tags: [Other]
+      summary: Pay Gift Config
+      description: |
+        What gift codes sell for now, for the gift dialog. A gift code grants
+        a year of Pro (`pro_days`) from when it is redeemed, queued after the
+        recipient's paid Pro period, and can be redeemed for
+        `redeemable_days` after purchase. It redeems like any balance code:
+        /subscription/redeem-balance-code, or `balance_code` when a network
+        is created.
+
+        The unit price depends on how many gifts the order has: the tier
+        with the highest `min_quantity` not over the quantity prices every
+        gift in the order. Prices are integer cents in `currency`, one price
+        worldwide (no regional tiers). An order takes 1 to `max_quantity`
+        gifts. `crypto_assets` are the coins /pay/gift/crypto-intent takes.
+
+        While `enabled` is false, gift codes are not on sale:
+        /pay/gift/checkout and /pay/gift/crypto-intent refuse with
+        `gift_sales_closed`. Unauthenticated.
+      operationId: payGiftConfig
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftConfigResult"
+              examples:
+                winter:
+                  summary: Gift codes on sale for the winter season
+                  value:
+                    enabled: true
+                    season: winter-2026
+                    currency: usd
+                    max_quantity: 20
+                    tiers:
+                      - min_quantity: 1
+                        unit_price_cents: 3999
+                      - min_quantity: 2
+                        unit_price_cents: 2999
+                      - min_quantity: 5
+                        unit_price_cents: 2399
+                    pro_days: 365
+                    redeemable_days: 365
+                    crypto_assets: [usdc_solana, zec, xmr]
+
+  /pay/gift/checkout:
+    post:
+      tags: [Other]
+      summary: Pay Gift Checkout
+      description: |
+        Buy gift codes by card: makes the order and starts its Stripe
+        checkout for `quantity` gifts at the order's unit price
+        (/pay/gift/config). `ui_mode` `embedded` returns `client_secret` and
+        `publishable_key` for a checkout inside the gift dialog; `hosted`
+        returns `url`, the checkout page, which comes back to
+        `https://ur.io/gift?order=<order_id>` once paid (the token is not in
+        it) and to `https://ur.io/gift` when cancelled.
+
+        Once paid, the order makes `quantity` codes and renders a card for
+        each. `email` gets every card in one PDF. With delivery `them`, each
+        address in `recipients` (exactly `quantity`, in order) also gets an
+        email with its own card and the note, from URnetwork with `email` as
+        its reply-to, on `send_on` at 09:00 in `timezone`, or right after
+        payment without `send_on`. The cards and the emails are in
+        `language`.
+
+        With a signed-in session, `referral_credit` links the codes to the
+        caller's network: whoever redeems one and has no referrer yet
+        becomes the network's referral, within the referral cap. It is
+        ignored without a session.
+
+        `order_id` and `order_token` read the order (/pay/gift/order) and
+        download its cards (/pay/gift/cards.pdf). The token is a bearer
+        secret for this one order: both take it in a POST body, so it never
+        appears in a URL.
+
+        A refusal returns `error` with a 200 and a stable `error.code`
+        (PurchaseError): `gift_sales_closed`, `invalid_quantity`,
+        `invalid_email`, `invalid_recipients`, `invalid_send_on` or
+        `message_too_long`, or a shared one: `invalid_request` (an unknown
+        delivery, language or ui mode), `rate_limited` (too many checkouts
+        from this address this minute), `checkout_unavailable` or
+        `start_failed`.
+      operationId: payGiftCheckout
+      # optional auth: anonymous callers buy as guests, a bearer can take referral credit
+      security:
+        - {}
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftCheckoutArgs"
+            examples:
+              them:
+                summary: Three gifts, one to each friend on Christmas Eve, in Spanish
+                value:
+                  quantity: 3
+                  delivery: them
+                  email: buyer@example.com
+                  recipients: [a@example.com, b@example.com, c@example.com]
+                  send_on: "2026-12-24"
+                  timezone: America/Chicago
+                  message: Pienso en ti estas fiestas.
+                  signature: Ana
+                  language: es
+                  referral_credit: true
+                  ui_mode: embedded
+      responses:
+        "200":
+          description: The order and its checkout, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftCheckoutResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+
+  /pay/gift/crypto-intent:
+    post:
+      tags: [Other]
+      summary: Pay Gift Crypto Intent
+      description: |
+        Buy gift codes in a coin: makes the order and a crypto invoice for
+        its total. The request is that of /pay/gift/checkout without
+        `ui_mode`, plus `asset` and `bittensor_footer`, which adds a "Made
+        with Bittensor" line to the cards and the friend emails. The result
+        is the invoice, as /pay/crypto/intent returns it, to pay and to
+        follow with /pay/crypto/status the same way, plus the order's
+        `order_id` and `order_token` and `bittensor_footer` as given. Once
+        the invoice is paid, the order is fulfilled as a card order is.
+
+        The invoice's `item_id` is `gift_pro_year` and its `delivery` is
+        `code`, and each order has an invoice of its own. Its status never
+        shows a code (`balance_code` stays empty): the order's cards carry
+        them (/pay/gift/cards.pdf).
+
+        A refusal returns `error` with a 200 and a stable `error.code`
+        (PurchaseError): `gift_sales_closed` and the order's own, as
+        /pay/gift/checkout answers them (`invalid_quantity`, `invalid_email`,
+        `invalid_recipients`, `invalid_send_on`, `message_too_long`), or the
+        invoice's, as /pay/crypto/intent answers them: `invalid_request` (an
+        unknown asset, delivery or language), `asset_unavailable`,
+        `item_unavailable` (gift orders cannot be paid in a coin now),
+        `rate_limited` or `start_failed`.
+      operationId: payGiftCryptoIntent
+      # optional auth: anonymous callers buy as guests, a bearer can take referral credit
+      security:
+        - {}
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftCryptoIntentArgs"
+      responses:
+        "200":
+          description: The order's invoice, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftCryptoIntentResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+
+  /pay/gift/order:
+    post:
+      tags: [Other]
+      summary: Pay Gift Order
+      description: |
+        A gift order's state, read with the `order_id` and `order_token`
+        that /pay/gift/checkout or /pay/gift/crypto-intent returned, sent as
+        `order_id` and `token` in the body: `pending` until it is paid, then
+        `paid`, or `refunded` after a refund, which voids its unredeemed
+        codes. After payment the gift dialog polls it about every 2 seconds
+        until `pdf_ready`, then downloads the cards from /pay/gift/cards.pdf.
+
+        An unknown order, a malformed `order_id` and a wrong `token` are all
+        answered 404, so an answer says nothing about which orders exist.
+        Unauthenticated, per-ip rate limited.
+      operationId: payGiftOrder
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftOrderArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftOrderResult"
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+        "404":
+          description: No order matches the id and token. Plain text body.
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/gift/cards.pdf:
+    post:
+      tags: [Other]
+      summary: Pay Gift Cards PDF
+      description: |
+        Every card of a paid gift order in one PDF, a card per page, read
+        with the order's `order_id` and `token` in the body, as
+        /pay/gift/order takes them, and answered as an attachment named
+        `URnetwork-gift-cards.pdf`. The gift dialog fetches it as a Blob and
+        saves it through an object URL, so the token never appears in a URL.
+        Not found until the cards are rendered (poll /pay/gift/order until
+        `pdf_ready`), for a refunded order, whose codes are void, and when
+        no order matches the id and token. Unauthenticated, per-ip rate
+        limited.
+      operationId: payGiftCardsPdf
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftOrderArgs"
+      responses:
+        "200":
+          description: The cards, a card per page.
+          headers:
+            Content-Disposition:
+              description: '`attachment; filename="URnetwork-gift-cards.pdf"`'
+              schema:
+                type: string
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+        "404":
+          description: |
+            The cards are not rendered yet, the order was refunded, or no
+            order matches the id and token. Plain text body.
+        "429":
+          description: Too many requests from this address this minute. Plain text body.
+
+  /pay/gift/check-code:
+    post:
+      tags: [Other]
+      summary: Pay Gift Check Code
+      description: |
+        Check a balance code without signing in, for the redeem page: what
+        it grants (`kind`: `data`, or `pro_gift` for a gift code's year of
+        Pro, `pro_days`), whether it can be redeemed (`status`) and until
+        when (`redeem_by`). /subscription/check-balance-code is the signed-in
+        check.
+
+        `status` is `ok` (it can be redeemed), `redeemed`, `expired` (past
+        `redeem_by`), `voided` (refunded) or `not_found`, which carries
+        nothing else. Unauthenticated, per-ip rate limited: too many checks
+        from this address this minute return `error.code` `rate_limited`
+        with a 200, and no `status`.
+      operationId: payGiftCheckCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftCheckCodeArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftCheckCodeResult"
         "400":
           description: The body is not a JSON object of the arguments. Plain text body.
 
@@ -15913,9 +16216,9 @@ components:
         Why a checkout or payment intent was refused (/stripe/create-checkout-session,
         /stripe/payment-intent, /subscription/stripe/payment-sheet,
         /solana/payment-intent, /pay/data/checkout, /pay/data/solana-intent,
-        /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent and
-        /pay/crypto/requote), or why a crypto invoice's status needs attention
-        (/pay/crypto/status).
+        /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent,
+        /pay/crypto/requote, /pay/gift/checkout and /pay/gift/crypto-intent),
+        or why a crypto invoice's status needs attention (/pay/crypto/status).
         Every refusal carries `message`, worded as before the codes, and a
         stable `code` beside it.
       required:
@@ -15957,6 +16260,16 @@ components:
             `quote_expired`: the quote's time ran out with nothing received;
             /pay/crypto/requote gives a new one.
             `underpaid`: the invoice ended short, and an operator reviews it.
+            `gift_sales_closed`: gift codes are not on sale now
+            (/pay/gift/config `enabled` is false).
+            `invalid_quantity`: the number of gifts is not between 1 and the
+            most one order takes (/pay/gift/config `max_quantity`).
+            `invalid_recipients`: delivery `them` needs exactly one
+            recipient address per gift, each an email address.
+            `invalid_send_on`: `send_on` is not a date from tomorrow to a year
+            out in the buyer's `timezone`, or comes without a known one.
+            `message_too_long`: the gift's note is over 240 characters or its
+            signature over 40.
             Absent from older servers; clients fall back to `message` for an
             absent or unknown code.
           type: string
@@ -17350,6 +17663,21 @@ components:
               type: string
             balance_byte_count:
               type: integer
+        kind:
+          type: string
+          description: |
+            What the code grants: `data`, or `pro_gift` for a gift code, a
+            year of Pro from when it is redeemed (queued after a paid Pro
+            period). Absent from older servers, whose codes all add data.
+        pro_days:
+          type: integer
+          description: the days of Pro a gift code grants (365); absent for a data code
+        redeem_by:
+          description: the last time the code can be redeemed (RFC 3339)
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
         error:
           type: object
           required:
@@ -17387,6 +17715,25 @@ components:
               type: string
             balance_byte_count:
               type: integer
+        pro:
+          type: object
+          description: |
+            The year of Pro a gift code (`pro_gift`) granted; absent for a data
+            code. `queued` is true when the year starts after the network's
+            current paid Pro period instead of now.
+          required:
+            - start_time
+            - end_time
+            - queued
+          properties:
+            start_time:
+              type: string
+              format: date-time
+            end_time:
+              type: string
+              format: date-time
+            queued:
+              type: boolean
         error:
           type: object
           required:
@@ -19452,10 +19799,22 @@ components:
           description: datetime
           type: string
         end_time:
-          description: datetime
+          description: |
+            datetime. For a gift code (`kind` `pro_gift`), the end of its year
+            of Pro, which may be queued after a paid Pro period; the code is
+            listed until then.
           type: string
         secret:
           type: string
+        kind:
+          type: string
+          description: |
+            What the code granted: `data`, or `pro_gift` for a gift code, a
+            year of Pro and no data (`balance_byte_count` 0). Absent from older
+            servers, whose codes all add data.
+        pro_days:
+          type: integer
+          description: the days of Pro a gift code granted (365); 0 for a data code
 
     NetworkBalanceCodesError:
       type: object
@@ -22036,6 +22395,254 @@ components:
           type: string
           format: date-time
 
+    PayGiftConfigResult:
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: gift codes are on sale; while false, /pay/gift/checkout and /pay/gift/crypto-intent refuse with `gift_sales_closed`
+        season:
+          type: string
+          description: the season the gift dialog and the cards are dressed for, such as `winter-2026`
+        currency:
+          type: string
+          description: the currency of every price, `usd`
+        max_quantity:
+          type: integer
+          description: the most gifts one order takes
+        tiers:
+          type: array
+          description: |
+            The unit price by quantity: the tier with the highest
+            `min_quantity` not over an order's quantity prices every gift in
+            the order.
+          items:
+            $ref: "#/components/schemas/PayGiftTier"
+        pro_days:
+          type: integer
+          description: the days of Pro a gift code grants, from when it is redeemed
+        redeemable_days:
+          type: integer
+          description: how many days after purchase a gift code can be redeemed
+        crypto_assets:
+          type: array
+          description: the coins a gift order can be paid in (CryptoAsset), with /pay/gift/crypto-intent
+          items:
+            type: string
+
+    PayGiftTier:
+      type: object
+      required:
+        - min_quantity
+        - unit_price_cents
+      properties:
+        min_quantity:
+          type: integer
+        unit_price_cents:
+          type: integer
+          description: the price of each gift in an order of at least `min_quantity` gifts, in cents
+
+    PayGiftPurchaseArgs:
+      type: object
+      description: The order, as /pay/gift/checkout and /pay/gift/crypto-intent take it.
+      required:
+        - quantity
+        - delivery
+        - email
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          description: how many gifts, from 1 to `max_quantity` (/pay/gift/config)
+        delivery:
+          type: string
+          enum: [me, them]
+          description: |
+            `me`: every card goes to `email`. `them`: each address in
+            `recipients` also gets its own card, on `send_on`.
+        email:
+          type: string
+          description: |
+            The buyer's email. It gets every card in one PDF (the receipt,
+            with delivery `them`), and is the reply-to of the friend emails.
+        recipients:
+          type: array
+          description: delivery `them`, exactly `quantity` email addresses, a card each, in order
+          items:
+            type: string
+        send_on:
+          type: string
+          format: date
+          description: |
+            Delivery `them`: the buyer's local date to send the friend emails
+            on, at 09:00 in `timezone`. Omitted, they are sent right after
+            payment.
+        timezone:
+          type: string
+          description: the buyer's IANA time zone, such as `America/Chicago`, so `send_on` means 09:00 their time
+        message:
+          type: string
+          maxLength: 240
+          description: the note on the cards and in the friend emails
+        signature:
+          type: string
+          maxLength: 40
+          description: the signature under the note
+        language:
+          type: string
+          enum: [en, es, de, zh, ru, ar]
+          description: the language of the cards and the emails
+        referral_credit:
+          type: boolean
+          description: |
+            With a signed-in session, link the codes to the caller's network
+            for referral credit. Ignored without a session.
+
+    PayGiftCheckoutArgs:
+      allOf:
+        - $ref: "#/components/schemas/PayGiftPurchaseArgs"
+        - type: object
+          properties:
+            ui_mode:
+              type: string
+              enum: [embedded, hosted]
+              description: |
+                `embedded` returns `client_secret` and `publishable_key` for
+                a checkout inside the gift dialog; `hosted` returns `url`, the
+                checkout page.
+
+    PayGiftCheckoutResult:
+      type: object
+      description: |
+        The order and its checkout, or a refusal in `error`.
+      required: []
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        order_token:
+          type: string
+          description: the bearer secret for this one order, for /pay/gift/order and /pay/gift/cards.pdf; send it in a POST body, never in a URL
+        total_cents:
+          type: integer
+          description: the order's total, `quantity` gifts at the unit price, in cents
+        client_secret:
+          type: string
+          description: for `ui_mode` `embedded`, the Stripe checkout session's client secret
+        publishable_key:
+          type: string
+          description: for `ui_mode` `embedded`, the Stripe publishable key to mount the checkout with
+        url:
+          type: string
+          description: for `ui_mode` `hosted`, the checkout page to send the buyer to
+        error:
+          $ref: "#/components/schemas/PurchaseError"
+
+    PayGiftCryptoIntentArgs:
+      allOf:
+        - $ref: "#/components/schemas/PayGiftPurchaseArgs"
+        - type: object
+          required:
+            - asset
+          properties:
+            asset:
+              $ref: "#/components/schemas/CryptoAsset"
+            bittensor_footer:
+              type: boolean
+              description: add a "Made with Bittensor" line to the cards and the friend emails
+
+    PayGiftCryptoIntentResult:
+      description: |
+        The order's invoice, as /pay/crypto/intent returns one, and the
+        order.
+      allOf:
+        - $ref: "#/components/schemas/CryptoPaymentIntentResult"
+        - type: object
+          properties:
+            order_id:
+              type: string
+              format: uuid
+            order_token:
+              type: string
+              description: the bearer secret for this one order, for /pay/gift/order and /pay/gift/cards.pdf; send it in a POST body, never in a URL
+            bittensor_footer:
+              type: boolean
+              description: the request's `bittensor_footer`
+
+    PayGiftOrderArgs:
+      type: object
+      description: An order and its token, for /pay/gift/order and /pay/gift/cards.pdf.
+      required:
+        - order_id
+        - token
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        token:
+          type: string
+          description: the order's `order_token`, from /pay/gift/checkout or /pay/gift/crypto-intent
+
+    PayGiftOrderResult:
+      type: object
+      required: []
+      properties:
+        status:
+          type: string
+          enum: [pending, paid, refunded]
+        quantity:
+          type: integer
+        delivery:
+          type: string
+          enum: [me, them]
+        send_on:
+          type: string
+          format: date
+          description: delivery `them`, the buyer's local date the friend emails are sent on; absent when they go right after payment
+        email_masked:
+          type: string
+          description: the buyer's email, masked, such as `b•••@example.com`
+        pdf_ready:
+          type: boolean
+          description: the cards are rendered, and /pay/gift/cards.pdf serves them
+
+    PayGiftCheckCodeArgs:
+      type: object
+      required:
+        - secret
+      properties:
+        secret:
+          type: string
+          description: the code, 26 characters
+
+    PayGiftCheckCodeResult:
+      type: object
+      description: A code's kind and status, or a refusal in `error`.
+      required: []
+      properties:
+        kind:
+          type: string
+          description: what the code grants, `data` or `pro_gift` (a gift code, a year of Pro); absent for `not_found`
+        status:
+          type: string
+          enum: [ok, redeemed, expired, voided, not_found]
+          description: |
+            `ok`: it can be redeemed. `redeemed`, `expired` (past
+            `redeem_by`), `voided` (refunded) or `not_found`: it cannot.
+        pro_days:
+          type: integer
+          description: the days of Pro a gift code grants (365); 0 for a data code
+        redeem_by:
+          description: the last time the code can be redeemed
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        error:
+          $ref: "#/components/schemas/PurchaseError"
+
     CryptoAsset:
       type: string
       description: |
@@ -22405,7 +23012,7 @@ components:
           description: the plan the invoice buys; empty for a data pack
         item_id:
           type: string
-          description: the data pack the invoice buys; empty for a plan
+          description: the data pack the invoice buys, or `gift_pro_year` for a gift order's codes (/pay/gift/crypto-intent); empty for a plan
         delivery:
           type: string
           description: |
@@ -22474,7 +23081,7 @@ components:
             - type: "null"
         balance_code:
           type: string
-          description: the balance code a paid invoice bought, for delivery `code`
+          description: the balance code a paid invoice bought, for delivery `code`; empty for a gift order, whose codes are on its cards
         error:
           description: |
             `quote_expired` while `expired`, and `underpaid` while in `review`
@@ -22508,7 +23115,7 @@ components:
           description: the plan the invoice buys; empty for a data pack
         item_id:
           type: string
-          description: the data pack the invoice buys; empty for a plan
+          description: the data pack the invoice buys, or `gift_pro_year` for a gift order's codes (/pay/gift/crypto-intent); empty for a plan
         delivery:
           type: string
           description: |
@@ -22686,7 +23293,7 @@ components:
             properties:
               store:
                 type: string
-                description: stripe | apple | google | solana | monero | zcash | bittensor | bitcoin | ethereum | gamma | manual | x402 | "" (unknown). A `gamma` plan renews from its SN25 deposit while the account's `auto_renew` is on (`/pay/gamma/settings`).
+                description: stripe | apple | google | solana | monero | zcash | bittensor | bitcoin | ethereum | gamma | gift | manual | x402 | "" (unknown). A `gamma` plan renews from its SN25 deposit while the account's `auto_renew` is on (`/pay/gamma/settings`). A `gift` plan is a redeemed gift code's year of Pro; it never renews.
               plan:
                 type: string
                 description: The wire plan value ("supporter"); shown as Pro.
