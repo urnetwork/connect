@@ -319,10 +319,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		// half the largest normal window, at least one (server
-		// FP2-PROTOCOL.md D8): 3 limited clients beside a desktop quality
-		// window of 6
-		LimitedWindowSizeFraction: 0.5,
+		// the same size as the largest normal window (server
+		// FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window
+		// to be the same size as the normal window"): 6 limited clients
+		// beside a desktop quality window of 6. The sdk passes 0.5 for its
+		// 32-MiB memory tier (iOS, hosted proxies) until the owner decides.
+		LimitedWindowSizeFraction: 1.0,
 		LimitedWindowSizeMax:      0,
 		SendRetryTimeout:          2000 * time.Millisecond,
 		// Fallback rescan for time-expiring filters; a newly published offer
@@ -706,10 +708,11 @@ type MultiClientSettings struct {
 	// Sizes the limited window (server FP2-PROTOCOL.md §7.4, D8): its target
 	// is max(1, floor(fraction x S)), S the largest current target among the
 	// active normal windows, and its hard max is max(1, floor(fraction x the
-	// largest active normal hard max)), unbounded when that is. Default 0.5.
-	// Non-positive or NaN: no limited window. A fixed destination and the
-	// user's Fixed IP never have one. RemoteUserNatMultiClient
-	// .SetLimitedWindowSizeFraction overrides it at runtime.
+	// largest active normal hard max)), unbounded when that is. Default 1:
+	// the same size as the normal window. Non-positive or NaN: no limited
+	// window. A fixed destination and the user's Fixed IP never have one.
+	// RemoteUserNatMultiClient.SetLimitedWindowSizeFraction overrides it at
+	// runtime.
 	LimitedWindowSizeFraction float64
 	// Caps the limited window's target and hard max (D11.5: a mobile device
 	// whose memory gate fails holds one limited client). Non-positive: no cap
@@ -1099,6 +1102,11 @@ type MultiClientSettings struct {
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
 	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
 	StatsWindowEntropy float32
+	// The random source of the race order's weighted shuffles: a window's
+	// offer (orderedClients) and the merged race field (mergeRaceField). nil,
+	// as every constructed settings value has it, draws from the package
+	// generator; a test pins the order with a scripted source.
+	raceOrderRandomForTest weightedRandomSource
 	// WindowExpandTimeout bounds candidate acquisition for one expansion pass.
 	// A candidate accepted inside this phase remains owned by the same pass
 	// through bounded client setup and its full PingTimeout. The pass retains
@@ -8603,14 +8611,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return
 
 			default:
-				// a client whose contract requests are held races last, and a
-				// race that would still send to one is bounded like one during
-				// an outage (contractRateLimitHeldRaced). The normal windows'
-				// candidates come before the limited window's, so a bounded
-				// race spends its slots on them first (server FP2-PROTOCOL.md
-				// §7.5)
+				// each window's top races first, then the rest of the field's
+				// one weighted order across the windows (raceWindowTopsFirst,
+				// mergeRaceField), so a bounded race always tries the best of
+				// each window (server FP2-PROTOCOL.md §7.5). A client whose
+				// contract requests are held races last, and a race that
+				// would still send to one is bounded like one during an
+				// outage (contractRateLimitHeldRaced)
 				raceTime := time.Now()
-				orderedClients = limitedClientsLast(contractRateLimitHeldLast(orderedClients, raceTime))
+				orderedClients = contractRateLimitHeldLast(raceWindowTopsFirst(orderedClients, self.settings, raceTime), raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
@@ -16686,7 +16695,7 @@ func (self *multiClientWindow) lastResortClientsForFlow(need flowNeed) []*multiC
 		for _, client := range clients {
 			if stats, err := client.WindowStats(); err == nil {
 				lruTimes[client] = stats.lastEventTime
-				weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+				weights[client] = raceWeight(stats)
 			}
 		}
 		sortClientsByRecentUse(clients, lruTimes, weights)
@@ -16830,7 +16839,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 			if !stats.lastEventTime.IsZero() {
 				lruTimes[client] = stats.lastEventTime
 			}
-			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+			weights[client] = raceWeight(stats)
 		}
 	}
 
@@ -16853,7 +16862,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 						if !stats.lastEventTime.IsZero() {
 							lruTimes[client] = stats.lastEventTime
 						}
-						weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+						weights[client] = raceWeight(stats)
 					}
 				}
 			}
@@ -16872,7 +16881,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 		clients = clients[:windowSize.FixedWindowSize]
 	}
 
-	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
+	raceWeightedShuffle(self.settings, clients, weights)
 
 	if crossTier {
 		return clients
@@ -16920,6 +16929,31 @@ func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
 		}
 	}
 	return kept
+}
+
+// The weight an exit takes in a race order: its expected throughput, plus 1
+// so an exit with no headroom left still draws. A window's offer
+// (orderedClients) and the merged race field (mergeRaceField) both order by
+// it.
+func raceWeight(stats *clientWindowStats) float32 {
+	return float32(1 + stats.ExpectedByteCountPerSecond())
+}
+
+// Weighted-shuffles a race order in place (WeightedShuffleWithEntropy) at the
+// settings' StatsWindowEntropy, from their test source when one is set. Nil
+// settings shuffle with no entropy.
+func raceWeightedShuffle(settings *MultiClientSettings, clients []*multiClientChannel, weights map[*multiClientChannel]float32) {
+	entropy := float32(0)
+	var random weightedRandomSource
+	if settings != nil {
+		entropy = settings.StatsWindowEntropy
+		random = settings.raceOrderRandomForTest
+	}
+	if random == nil {
+		WeightedShuffleWithEntropy(clients, weights, entropy)
+		return
+	}
+	weightedShuffleWithEntropy(clients, weights, entropy, random)
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
@@ -17065,9 +17099,9 @@ type multiClientChannelArgs struct {
 	recentExit bool
 
 	// The window that admitted this exit, stamped by expand before the
-	// channel is built: the race orders the limited window's exits after
-	// the normal windows' (limitedClientsLast), and the process counters
-	// label the exit's flows by it.
+	// channel is built: the process counters label the exit's flows by it.
+	// The race orders the exit by its metrics, never by its window
+	// (mergeRaceField).
 	windowType WindowType
 
 	// How the discovery round that listed this candidate read the window's

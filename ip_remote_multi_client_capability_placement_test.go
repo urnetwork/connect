@@ -19,9 +19,10 @@ import (
 )
 
 // The race field of a selected window (§7.5): the window's exits that carry
-// the flow, then the limited window's. A udp flow never sees a limited exit;
-// a v6 flow only a limited exit labelled dualstack; and a tcp flow the window
-// offers nothing for races the limited window's alone.
+// the flow and the limited window's, in one order (see
+// ip_remote_multi_client_race_merge_test.go for the order). A udp flow never
+// sees a limited exit; a v6 flow only a limited exit labelled dualstack; and
+// a tcp flow the window offers nothing for races the limited window's alone.
 func TestRaceFieldMergesTheLimitedWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -44,19 +45,14 @@ func TestRaceFieldMergesTheLimitedWindow(t *testing.T) {
 	add(limited, WindowTypeLimited, "C", capabilityClassC)
 	add(limited, WindowTypeLimited, "D", capabilityClassD)
 
+	// the field's members, the quality window's then the limited window's,
+	// each sorted: the order is the weighted metrics', not the windows'
 	classes := func(field []*multiClientChannel) string {
-		names := []string{}
-		for _, client := range field {
-			names = append(names, byClass[client])
-		}
-		// the window's own come first, each part in its own order
 		quality := []string{}
 		limited := []string{}
-		for _, name := range names {
+		for _, client := range field {
+			name := byClass[client]
 			if name == "A" || name == "B" {
-				if 0 < len(limited) {
-					return "limited before quality: " + strings.Join(names, "")
-				}
 				quality = append(quality, name)
 			} else {
 				limited = append(limited, name)
@@ -108,35 +104,12 @@ func TestRaceFieldMergesTheLimitedWindow(t *testing.T) {
 	}
 }
 
-// A bounded race spends its slots on the normal windows' candidates first
-// (§7.5), and keeps held clients last within each part.
-func TestLimitedClientsLastOrdersTheBoundedRace(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	settings := DefaultMultiClientSettings()
-	normal1 := capabilityTestChannel(t, ctx, settings, WindowTypeQuality, capabilityClassB)
-	normal2 := capabilityTestChannel(t, ctx, settings, WindowTypeSpeed, capabilityClassB)
-	limited1 := capabilityTestChannel(t, ctx, settings, WindowTypeLimited, capabilityClassD)
-	limited2 := capabilityTestChannel(t, ctx, settings, WindowTypeLimited, capabilityClassC)
-
-	field := []*multiClientChannel{limited1, normal1, limited2, normal2}
-	ordered := limitedClientsLast(field)
-	if !slices.Equal(ordered, []*multiClientChannel{normal1, normal2, limited1, limited2}) {
-		t.Error("the limited window's candidates did not follow the normal windows' in their own order")
-	}
-	if !slices.Equal(field, []*multiClientChannel{limited1, normal1, limited2, normal2}) {
-		t.Error("the caller's field was reordered in place")
-	}
-	normals := []*multiClientChannel{normal1, normal2}
-	if got := limitedClientsLast(normals); &got[0] != &normals[0] {
-		t.Error("a field without a limited exit was copied")
-	}
-	// a two-way bound now dials the normal windows' two
-	if width := multiRaceClientCount(len(ordered), 0, 2, true); !slices.Equal(ordered[:width], normals) {
-		t.Error("a degraded race of two does not dial the normal windows' candidates")
-	}
-
-	// the send path orders the field this way before it bounds the race
+// A bounded race takes each window's top and then the merged order (§7.5,
+// owner 2026-11-13): the send path puts the window tops first and held
+// clients last before it bounds the race, and moves no other exit by its
+// window. The behaviour is pinned end to end in
+// ip_remote_multi_client_race_merge_test.go.
+func TestBoundedRaceKeepsTheMergedOrder(t *testing.T) {
 	source, err := readSource("ip_remote_multi_client.go")
 	if err != nil {
 		t.Fatal(err)
@@ -145,10 +118,13 @@ func TestLimitedClientsLastOrdersTheBoundedRace(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find the packet-group attempt")
 	}
-	order := strings.Index(body, "orderedClients = limitedClientsLast(contractRateLimitHeldLast(orderedClients, raceTime))")
+	order := strings.Index(body, "orderedClients = contractRateLimitHeldLast(raceWindowTopsFirst(orderedClients, self.settings, raceTime), raceTime)")
 	bound := strings.Index(body, "raceOrderedClients := orderedClients[:multiRaceClientCount(")
 	if order < 0 || bound < 0 || bound < order {
-		t.Error("the race is bounded before the limited window's candidates are ordered last")
+		t.Error("the race is bounded before its window tops are first and its held clients last")
+	}
+	if strings.Contains(body, "limitedClientsLast") || strings.Contains(body, ".windowType()") {
+		t.Error("the send path orders the race by window")
 	}
 }
 
