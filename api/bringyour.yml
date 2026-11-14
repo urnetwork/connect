@@ -6480,10 +6480,28 @@ paths:
         other kinds (reliability, referral, multipliers, and payout-plan
         points for traffic before the cutoff) have no bytes behind them.
 
-        `current_epoch` is the open epoch's running figure: the bytes served
-        so far in the blocks that end in it, counted with the rule above and
-        a few hours behind live traffic. When the epoch finalizes, its
-        `served_byte_count` continues this figure.
+        Two running figures cover the traffic no finalized epoch holds yet,
+        both counted with the rule above. They run two to three hours behind
+        live traffic: a settlement is counted two hours after it started, so
+        that it has committed, and the figures refresh about hourly. Each
+        carries `as_of_millis`, the time it counts traffic through.
+
+        - `current_block` is the open block's bytes so far. Its `epoch` is
+          the epoch it will count in, the one whose window holds the block's
+          end. It grows all week and starts again from 0 at Sunday 00:00 UTC.
+        - `current_epoch` is the open epoch's bytes so far: those of the
+          blocks that end in it. When the epoch finalizes, its
+          `served_byte_count` continues this figure. It grows only while a
+          block that ends in the epoch is open, or still settling just after
+          it ended. Traffic in a block that ends after the epoch counts toward
+          a later epoch, and shows in `current_block` until then.
+
+        On mainnet, epochs currently open on Friday evenings (UTC) and blocks
+        end at Sunday 00:00 UTC. From Friday to Sunday the open block ends in
+        the open epoch, and both figures grow. From Sunday on, the open block
+        counts toward the next epoch: `current_epoch` holds still once the
+        block that ended on Sunday is counted, about Sunday 02:00 to 03:00
+        UTC, and `current_block` keeps growing.
 
         While settlement v2 is configured, an epoch it settles is listed from
         the ledger instead of its v1 row, once a finalized v2 root covering it
@@ -20653,7 +20671,8 @@ components:
           description: |
             The bytes served so far in the operator blocks whose end is in
             the window, counted as for a finalized epoch. Traffic in a block
-            that ends after the window counts toward the next epoch.
+            that ends after the window counts toward the next epoch, and
+            shows in `current_block` until then.
           type: integer
           format: int64
           minimum: 0
@@ -20662,6 +20681,50 @@ components:
             The figure counts traffic through this time, unix milliseconds:
             a few hours behind live traffic while a block is open, and a
             block's end once all of it is counted.
+          type: integer
+
+    AccountCurrentBlock:
+      type: object
+      description: |
+        The open operator block, Sunday 00:00 UTC to the next Sunday 00:00
+        UTC, and the bytes served in it so far. Absent from the result while
+        the epoch clock is unknown.
+      required:
+        - block_number
+        - start_millis
+        - end_millis
+        - served_byte_count
+        - as_of_millis
+        - epoch
+      properties:
+        block_number:
+          description: The operator block, counted from 1 at Sunday 2026-06-28 00:00 UTC.
+          type: integer
+          format: int64
+        start_millis:
+          description: Block start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: Block end, unix milliseconds.
+          type: integer
+        served_byte_count:
+          description: |
+            The bytes served so far in the block, counted as for a finalized
+            epoch.
+          type: integer
+          format: int64
+          minimum: 0
+        as_of_millis:
+          description: |
+            The figure counts traffic through this time, unix milliseconds:
+            two to three hours behind live traffic, and the block's start
+            until any of it is counted.
+          type: integer
+        epoch:
+          description: |
+            The epoch the block counts in once it ends: the one whose window
+            holds the block's end, the open epoch or a later one, projected
+            at the chain's block period.
           type: integer
 
     AccountEpochsResult:
@@ -20675,6 +20738,8 @@ components:
             $ref: "#/components/schemas/AccountEpoch"
         current_epoch:
           $ref: "#/components/schemas/AccountCurrentEpoch"
+        current_block:
+          $ref: "#/components/schemas/AccountCurrentBlock"
         error:
           type: object
           required:
