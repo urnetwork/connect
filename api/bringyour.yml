@@ -7905,8 +7905,11 @@ paths:
         address in `recipients` (exactly `quantity`, in order) also gets an
         email with its own card and the note, from URnetwork with `email` as
         its reply-to, on `send_on` at 09:00 in `timezone`, or right after
-        payment without `send_on`. The cards and the emails are in
-        `language`.
+        payment without `send_on`. Paid by card, these emails never go out
+        before two hours after the payment, past the early fraud warnings;
+        a refund or a dispute in that time withdraws them.
+        /pay/gift/order answers when they go out (`friends_send_at`). The
+        cards and the emails are in `language`.
 
         With a signed-in session, `referral_credit` links the codes to the
         caller's network: whoever redeems one and has no referrer yet
@@ -7920,10 +7923,13 @@ paths:
 
         A refusal returns `error` with a 200 and a stable `error.code`
         (PurchaseError): `gift_sales_closed`, `invalid_quantity`,
-        `invalid_email`, `invalid_recipients`, `invalid_send_on` or
-        `message_too_long`, or a shared one: `invalid_request` (an unknown
-        delivery, language or ui mode), `rate_limited` (too many checkouts
-        from this address this minute), `checkout_unavailable` or
+        `invalid_email`, `invalid_recipients`, `invalid_send_on`,
+        `message_too_long`, `gift_note_has_link` (the note or the signature
+        holds a link) or `gift_daily_limit` (with this order's recipients,
+        the buyer's email would pass 20 friend emails in 24 hours; delivery
+        `me` has no daily limit), or a shared one: `invalid_request` (an
+        unknown delivery, language or ui mode), `rate_limited` (too many
+        checkouts from this address this minute), `checkout_unavailable` or
         `start_failed`.
       operationId: payGiftCheckout
       # optional auth: anonymous callers buy as guests, a bearer can take referral credit
@@ -7973,7 +7979,9 @@ paths:
         is the invoice, as /pay/crypto/intent returns it, to pay and to
         follow with /pay/crypto/status the same way, plus the order's
         `order_id` and `order_token` and `bittensor_footer` as given. Once
-        the invoice is paid, the order is fulfilled as a card order is.
+        the invoice is paid, the order is fulfilled as a card order is,
+        except that a coin payment has no hold: the friend emails go out on
+        `send_on` at 09:00 in `timezone`, or right after payment.
 
         The invoice's `item_id` is `gift_pro_year` and its `delivery` is
         `code`, and each order has an invoice of its own. Its status never
@@ -7983,7 +7991,8 @@ paths:
         A refusal returns `error` with a 200 and a stable `error.code`
         (PurchaseError): `gift_sales_closed` and the order's own, as
         /pay/gift/checkout answers them (`invalid_quantity`, `invalid_email`,
-        `invalid_recipients`, `invalid_send_on`, `message_too_long`), or the
+        `invalid_recipients`, `invalid_send_on`, `message_too_long`,
+        `gift_note_has_link`, `gift_daily_limit`), or the
         invoice's, as /pay/crypto/intent answers them: `invalid_request` (an
         unknown asset, delivery or language), `asset_unavailable`,
         `item_unavailable` (gift orders cannot be paid in a coin now),
@@ -16279,6 +16288,16 @@ components:
             out in the buyer's `timezone`, or comes without a known one.
             `message_too_long`: the gift's note is over 240 characters or its
             signature over 40.
+            `gift_note_has_link`: the gift's note or signature holds a link:
+            a URL scheme (`https://`, any `scheme://`), `mailto:`, `www.`, or
+            a domain with a listed TLD (example.com, bit.ly, t.me/x). The
+            exact rule is the server's `model.GiftTextHasLink`
+            (GIFTOFPRIVACY.md §10.2), which the site mirrors.
+            `gift_daily_limit`: with this order's recipients, the buyer's
+            email (case-insensitive) would pass 20 friend emails in 24 hours:
+            the recipients of its delivery `them` orders of the last 24 hours
+            that are pending or paid. Delivery `me` has no daily limit beyond
+            `max_quantity` cards per order.
             Absent from older servers; clients fall back to `message` for an
             absent or unknown code.
           type: string
@@ -22629,6 +22648,10 @@ components:
           type: string
           format: date
           description: delivery `them`, the buyer's local date the friend emails are sent on; absent when they go right after payment
+        friends_send_at:
+          type: [string, "null"]
+          format: date-time
+          description: when the friend emails go out (or went out), RFC 3339; `send_on` at 09:00 in the buyer's time zone, else right after payment, and paid by card never before two hours after the payment. Null when no friend is emailed - delivery `me`, an order not paid yet, or a refunded one.
         email_masked:
           type: string
           description: the buyer's email, masked, such as `b•••@example.com`
