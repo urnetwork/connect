@@ -2930,8 +2930,9 @@ paths:
         by capability (ip `dualstack` or `ipv4`, protocol `dualproto` or
         `tcp`) instead of excluded, every provider carries its
         `capabilities`, and the answer echoes the selectors it applied. A
-        request without `select` gets exactly the answer it got before the
-        field.
+        request may also select protocol `any`: every provider of both
+        protocol labels in one pool. A request without `select` gets exactly
+        the answer it got before the field.
       operationId: networkFindProviders2
       security: []
       requestBody:
@@ -15435,7 +15436,9 @@ components:
             the requested protocol's providers, then, for a `dualproto`
             request whose held clients and eligible candidates do not reach
             `target_count`, `tcp` providers as overflow. A `tcp` request
-            never receives a `dualproto` provider.
+            never receives a `dualproto` provider. An `any` request draws
+            `dualproto` and `tcp` providers as one pool, ranked by its rank
+            mode alone, with no overflow.
           $ref: "#/components/schemas/FindProvidersSelect"
 
     FindProvidersSelect:
@@ -15451,9 +15454,12 @@ components:
           enum: [dualstack, ipv4]
           default: dualstack
         protocol:
-          description: the protocol axis the window is filled from
+          description: |
+            The protocol axis the window is filled from. `any` takes every
+            protocol label in one pool, with no overflow; it is a selector
+            only, never a provider's label.
           type: string
-          enum: [dualproto, tcp]
+          enum: [dualproto, tcp, any]
           default: dualproto
         target_count:
           description: |
@@ -15464,7 +15470,8 @@ components:
         held_count:
           description: |
             The window clients the caller already holds whose protocol label
-            is the requested one; they count toward `target_count`.
+            is the requested one (every one for `any`); they count toward
+            `target_count`.
           type: integer
           minimum: 0
           default: 0

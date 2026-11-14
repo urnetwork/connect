@@ -760,9 +760,20 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 	// the stall diagnosis merges by sharpness (stallReasonRank), and Failed
 	// only when EVERY window that is actually trying (failed, or a non-zero
 	// target) has failed — a disabled window (target 0 under a fixed-window
-	// profile) must not veto, and a live window must
+	// profile) must not veto, and a live window must.
+	//
+	// platform-unreachable follows the Failed rule, not sharpness: it is the
+	// merged reason only when every trying window says it (with no window
+	// trying, when any window does). Every app offers its "Can't reach
+	// URnetwork" prompt on that turn (sdk CantReachOnStall), and a window
+	// that is still working proves the platform reachable: on iOS the speed
+	// window holds one exit, and that one exit's carrier dropping turned the
+	// whole connection platform-unreachable while the quality window's exits
+	// carried traffic.
 	trying := 0
 	failed := 0
+	unreachable := 0
+	anyUnreachable := false
 	for _, monitor := range self.availabilityMonitors {
 		windowExpandEvent := monitor.WindowExpandEvent()
 		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
@@ -774,15 +785,24 @@ func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
 		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
 		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
 		netWindowExpandEvent.UdpAvailable = netWindowExpandEvent.UdpAvailable || windowExpandEvent.UdpAvailable
-		if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
+		windowTrying := windowExpandEvent.Failed || 0 < windowExpandEvent.TargetSize
+		if windowExpandEvent.Reason == WindowStallPlatformUnreachable {
+			anyUnreachable = true
+			if windowTrying {
+				unreachable += 1
+			}
+		} else if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
 			netWindowExpandEvent.Reason = windowExpandEvent.Reason
 		}
 		if windowExpandEvent.Failed {
 			trying += 1
 			failed += 1
-		} else if 0 < windowExpandEvent.TargetSize {
+		} else if windowTrying {
 			trying += 1
 		}
+	}
+	if (0 < trying && unreachable == trying) || (trying == 0 && anyUnreachable) {
+		netWindowExpandEvent.Reason = WindowStallPlatformUnreachable
 	}
 	if netWindowExpandEvent.Reason == "" {
 		netWindowExpandEvent.Reason = WindowStallEvaluating

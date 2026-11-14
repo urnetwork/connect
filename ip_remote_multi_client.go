@@ -288,6 +288,14 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// consider them open; traditional vpns hold nat state for 5-30 minutes
 		TcpSequenceIdleTimeout: 600 * time.Second,
 
+		// a window's ipv6 minimum from dualstack providers, dualproto
+		// providers before tcp ones, and the limited window for the tcp
+		// providers (server FP2-PROTOCOL.md D6.1); a host whose windows take
+		// every provider asks with ipv4 and any
+		NormalWindowSelectors: ProviderSelectors{
+			Ip:       ProviderIpCapabilityDualstack,
+			Protocol: ProviderProtocolCapabilityDualproto,
+		},
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
@@ -319,10 +327,12 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 				KeepHealthiestCount:      0,
 			},
 		},
-		// half the largest normal window, at least one (server
-		// FP2-PROTOCOL.md D8): 3 limited clients beside a desktop quality
-		// window of 6
-		LimitedWindowSizeFraction: 0.5,
+		// the same size as the largest normal window (server
+		// FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window
+		// to be the same size as the normal window"): 6 limited clients
+		// beside a desktop quality window of 6. The sdk passes 0.5 for its
+		// 32-MiB memory tier (iOS, hosted proxies) until the owner decides.
+		LimitedWindowSizeFraction: 1.0,
 		LimitedWindowSizeMax:      0,
 		SendRetryTimeout:          2000 * time.Millisecond,
 		// Fallback rescan for time-expiring filters; a newly published offer
@@ -436,6 +446,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		EvaluationFailureCooloff: 5 * time.Minute,
 		// the egress-dial lines' cadence (controlDialLogInterval)
 		EvaluationFailureLogInterval: 5 * time.Second,
+		// a connect server restart's transport reconnect ends well inside it
+		WindowPlatformUnreachableHold: 30 * time.Second,
+		// the outcome watch's cap (outcomeWatchPollTimeout)
+		WindowPlatformUnreachablePollTimeout: 1 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -699,13 +713,31 @@ type MultiClientSettings struct {
 	// Positive limits cap only default windows; explicit profiles and fixed
 	// destinations keep their caller-selected topology. Zero is unchanged.
 	WindowSizeLimit int
+	// The capabilities the normal windows ask find-providers2 for (server
+	// FP2-PROTOCOL.md §5.1, §6.3). Default dualstack and dualproto (D6.1),
+	// which apps keep: a window's ipv6 minimum from dualstack providers first,
+	// then dualproto providers, then tcp ones as overflow, with a limited
+	// window beside them for the tcp providers.
+	//
+	// ipv4 and any (owner, 2026-11-13, for the proxy service's hosted
+	// devices): no ipv6 need and every provider in one pool, ranked by the
+	// window's rank mode alone. Such a multi client builds no limited window,
+	// whatever LimitedWindowSizeFraction or SetLimitedWindowSizeFraction say:
+	// its normal windows hold the tcp providers themselves. A flow still races
+	// only the exits whose labels carry it, so udp never reaches a tcp exit,
+	// and a udp flow with none in its windows is answered as unroutable.
+	//
+	// An empty member reads as the default, and a protocol other than any as
+	// dualproto: tcp is the limited window's.
+	NormalWindowSelectors ProviderSelectors
 	// Sizes the limited window (server FP2-PROTOCOL.md §7.4, D8): its target
 	// is max(1, floor(fraction x S)), S the largest current target among the
 	// active normal windows, and its hard max is max(1, floor(fraction x the
-	// largest active normal hard max)), unbounded when that is. Default 0.5.
-	// Non-positive or NaN: no limited window. A fixed destination and the
-	// user's Fixed IP never have one. RemoteUserNatMultiClient
-	// .SetLimitedWindowSizeFraction overrides it at runtime.
+	// largest active normal hard max)), unbounded when that is. Default 1:
+	// the same size as the normal window. Non-positive or NaN: no limited
+	// window. A fixed destination and the user's Fixed IP never have one.
+	// RemoteUserNatMultiClient.SetLimitedWindowSizeFraction overrides it at
+	// runtime.
 	LimitedWindowSizeFraction float64
 	// Caps the limited window's target and hard max (D11.5: a mobile device
 	// whose memory gate fails holds one limited client). Non-positive: no cap
@@ -1095,6 +1127,11 @@ type MultiClientSettings struct {
 	StatsWindowMaxEstimatedByteCountPerSecond ByteCount
 	// StatsWindowMaxEffectiveByteCountPerSecondScale float32
 	StatsWindowEntropy float32
+	// The random source of the race order's weighted shuffles: a window's
+	// offer (orderedClients) and the merged race field (mergeRaceField). nil,
+	// as every constructed settings value has it, draws from the package
+	// generator; a test pins the order with a scripted source.
+	raceOrderRandomForTest weightedRandomSource
 	// WindowExpandTimeout bounds candidate acquisition for one expansion pass.
 	// A candidate accepted inside this phase remains owned by the same pass
 	// through bounded client setup and its full PingTimeout. The pass retains
@@ -1192,6 +1229,24 @@ type MultiClientSettings struct {
 	// continuously, and one line per shape per interval keeps the signal
 	// without the flood. Non-positive logs every line.
 	EvaluationFailureLogInterval time.Duration
+	// How long a window's diagnosis must stay platform-unreachable before the
+	// window publishes it (ip_remote_multi_client_outcome.go
+	// publishStallStatus). Every app offers its "Can't reach URnetwork"
+	// prompt when the published diagnosis turns to it (sdk CantReachOnStall),
+	// so a platform transport that reconnects inside the hold must not turn
+	// it. 30s covers a reconnect after a connect server restart
+	// (PlatformTransportSettings ReconnectTimeout 5s plus up to 5s
+	// ReconnectJitter, then the dial and auth) with room for a second attempt
+	// during a rolling restart, and stays inside the 45s
+	// WindowOutcomeDeadline. Non-positive publishes the diagnosis as soon as
+	// it turns.
+	WindowPlatformUnreachableHold time.Duration
+	// How often a window re-reads a platform-unreachable diagnosis, held or
+	// published, so a transport that came back ends the episode within it
+	// and a held turn lands when the hold ends. Non-positive turns the
+	// re-read off: the diagnosis is read again only when the window publishes
+	// for its own reasons (a failure, an install).
+	WindowPlatformUnreachablePollTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -3199,35 +3254,39 @@ func NewRemoteUserNatMultiClient(
 		multiClient.windows[WindowTypeSpeed].userSentSinceFunc = multiClient.userSentSince
 
 		// the limited window (server FP2-PROTOCOL.md §7.4). A fixed
-		// destination has none: the fixed exit carries every flow
-		multiClient.windows[WindowTypeLimited] = newMultiClientWindow(
-			cancelCtx,
-			cancel,
-			generator,
-			multiClient.clientReceivePacket,
-			multiClient.clientReceivePackets,
-			provideMode == protocol.ProvideMode_Network,
-			multiClient.clientDialFailureSignal,
-			multiClient.securityPolicy,
-			multiClient.removeClient,
-			multiClient.retireSynPublicationClientMetadata,
-			WindowTypeLimited,
-			effectivePerformanceProfile,
-			settings,
-			multiClient.reliabilitySettings,
-			multiClient.uplinkGate,
-			multiClient.uplinkLastIngress,
-			multiClient.reliabilityMetricsRef,
-			multiClient.clientFlowCount,
-			multiClient.providerQualified,
-			multiClient.receivingChannelCount,
-			multiClient.recordProbePass,
-			multiClient.providerPolicyPreference,
-			multiClient.publishTransportDelayStats,
-			multiClient.clientAdded,
-		)
-		multiClient.windows[WindowTypeLimited].clientMigrateFunc = multiClient.migrateClientFlows
-		multiClient.windows[WindowTypeLimited].userSentSinceFunc = multiClient.userSentSince
+		// destination has none: the fixed exit carries every flow. Nor do
+		// normal windows that ask for any protocol: they hold the tcp
+		// providers themselves (MultiClientSettings.NormalWindowSelectors)
+		if settings.NormalWindowSelectors.normalize().Protocol != ProviderProtocolCapabilityAny {
+			multiClient.windows[WindowTypeLimited] = newMultiClientWindow(
+				cancelCtx,
+				cancel,
+				generator,
+				multiClient.clientReceivePacket,
+				multiClient.clientReceivePackets,
+				provideMode == protocol.ProvideMode_Network,
+				multiClient.clientDialFailureSignal,
+				multiClient.securityPolicy,
+				multiClient.removeClient,
+				multiClient.retireSynPublicationClientMetadata,
+				WindowTypeLimited,
+				effectivePerformanceProfile,
+				settings,
+				multiClient.reliabilitySettings,
+				multiClient.uplinkGate,
+				multiClient.uplinkLastIngress,
+				multiClient.reliabilityMetricsRef,
+				multiClient.clientFlowCount,
+				multiClient.providerQualified,
+				multiClient.receivingChannelCount,
+				multiClient.recordProbePass,
+				multiClient.providerPolicyPreference,
+				multiClient.publishTransportDelayStats,
+				multiClient.clientAdded,
+			)
+			multiClient.windows[WindowTypeLimited].clientMigrateFunc = multiClient.migrateClientFlows
+			multiClient.windows[WindowTypeLimited].userSentSinceFunc = multiClient.userSentSince
+		}
 	}
 	// else only keep the quality window for fixed destination
 
@@ -3563,7 +3622,32 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-// Installs the profile on every window and resets the windows. A profile that
+// Whether the window clients installed under the previous profile cannot carry
+// the next one. A client keeps what it was built with (newMultiClientChannel):
+// fail-closed sessions only when post-quantum encryption was on, and direct
+// streams when direct mode was on. A post-quantum toggle, either way,
+// regenerates every window so all of them select under the current setting
+// (owner decision D12.3, server FP2-PROTOCOL.md §12.5); turning direct mode off
+// must end every direct stream now, since a direct stream shows the provider
+// the user's own address. Any other change -- the window type, the window size
+// and Fixed IP, or direct mode turned on -- the installed clients carry as they
+// are: each window takes the new profile and its resize pass grows or drains
+// it to the new target, so exits that work keep their flows. On 2026-11-13 two
+// profile changes on an iOS tunnel retired all 17 working exits and reset 400
+// flows at once.
+func performanceProfileRetiresClients(previous *PerformanceProfile, next *PerformanceProfile) bool {
+	allowDirect := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.AllowDirect
+	}
+	postQuantumEncryption := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.PostQuantumEncryption
+	}
+	return postQuantumEncryption(previous) != postQuantumEncryption(next) ||
+		(allowDirect(previous) && !allowDirect(next))
+}
+
+// Installs the profile on every window, and retires the windows' clients only
+// when they cannot carry it (performanceProfileRetiresClients). A profile that
 // does not validate is refused with its error and the previous profile stays in
 // force: the window size comes from the caller, and a bad one must never panic
 // the connection or reach the windows.
@@ -3576,13 +3660,13 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		}
 	}
 
-	// an equivalent profile is a no-op: shuffle() below retires every window
-	// client, and presentation code commonly re-applies an equal profile on
-	// resume -- that must not tear the window down
+	// an equivalent profile is a no-op: presentation code commonly re-applies
+	// an equal profile on resume, and that must not touch the windows
 	if performanceProfilesEqual(self.config.Load().performanceProfile, performanceProfile) {
 		return nil
 	}
 
+	var previousPerformanceProfile *PerformanceProfile
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -3590,6 +3674,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		// rebuild the immutable config snapshot under the lock so concurrent
 		// setters do not lose each other's field
 		prev := self.config.Load()
+		previousPerformanceProfile = prev.performanceProfile
 		self.config.Store(&multiClientConfig{
 			performanceProfile:  performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
@@ -3597,7 +3682,8 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			blocker:             prev.blocker,
 		})
 	}()
-	// before the reset windows discover again
+	retire := performanceProfileRetiresClients(previousPerformanceProfile, performanceProfile)
+	// before the windows discover again
 	self.syncGeneratorPostQuantumEncryption()
 	// the normal windows first, so the limited window, which sizes itself
 	// from their next passes (limitedWindowSizing), never reads a sizing of
@@ -3605,8 +3691,9 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 		if window := self.windows[windowType]; window != nil {
 			window.SetPerformanceProfile(performanceProfile)
-			// reset the window
-			window.shuffle()
+			if retire {
+				window.shuffle()
+			}
 		}
 	}
 	return nil
@@ -8581,14 +8668,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				return
 
 			default:
-				// a client whose contract requests are held races last, and a
-				// race that would still send to one is bounded like one during
-				// an outage (contractRateLimitHeldRaced). The normal windows'
-				// candidates come before the limited window's, so a bounded
-				// race spends its slots on them first (server FP2-PROTOCOL.md
-				// §7.5)
+				// each window's top races first, then the rest of the field's
+				// one weighted order across the windows (raceWindowTopsFirst,
+				// mergeRaceField), so a bounded race always tries the best of
+				// each window (server FP2-PROTOCOL.md §7.5). A client whose
+				// contract requests are held races last, and a race that
+				// would still send to one is bounded like one during an
+				// outage (contractRateLimitHeldRaced)
 				raceTime := time.Now()
-				orderedClients = limitedClientsLast(contractRateLimitHeldLast(orderedClients, raceTime))
+				orderedClients = contractRateLimitHeldLast(raceWindowTopsFirst(orderedClients, self.settings, raceTime), raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
@@ -12970,6 +13058,12 @@ type multiClientWindow struct {
 	// everAdded: a provider has been installed; permanently disarms the
 	// outcome watchdog for this window.
 	everAdded bool
+	// When the diagnosis turned to platform-unreachable in the episode now
+	// running, zero outside one; the turn is published only
+	// WindowPlatformUnreachableHold after it. The watch flag is held by the one
+	// watchPlatformUnreachable that re-reads the episode.
+	platformUnreachableSince time.Time
+	platformUnreachableWatch bool
 	// evalEpochCtx is the context evaluation channels are built under; the
 	// rebuild cancels and replaces it. See evalEpochContext.
 	evalEpochCtx    context.Context
@@ -14684,7 +14778,7 @@ func (self *multiClientWindow) resize() {
 		}
 		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
 		inactive := !fixedDestination && fixedWindowType != nil && self.windowType != *fixedWindowType
-		dualstackTargetCount := requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+		dualstackTargetCount := requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize, self.providerSelectors())
 		if fixedDestination || inactive {
 			dualstackTargetCount = 0
 		}
@@ -16658,7 +16752,7 @@ func (self *multiClientWindow) lastResortClientsForFlow(need flowNeed) []*multiC
 		for _, client := range clients {
 			if stats, err := client.WindowStats(); err == nil {
 				lruTimes[client] = stats.lastEventTime
-				weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+				weights[client] = raceWeight(stats)
 			}
 		}
 		sortClientsByRecentUse(clients, lruTimes, weights)
@@ -16802,7 +16896,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 			if !stats.lastEventTime.IsZero() {
 				lruTimes[client] = stats.lastEventTime
 			}
-			weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+			weights[client] = raceWeight(stats)
 		}
 	}
 
@@ -16825,7 +16919,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 						if !stats.lastEventTime.IsZero() {
 							lruTimes[client] = stats.lastEventTime
 						}
-						weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+						weights[client] = raceWeight(stats)
 					}
 				}
 			}
@@ -16844,7 +16938,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 		clients = clients[:windowSize.FixedWindowSize]
 	}
 
-	WeightedShuffleWithEntropy(clients, weights, self.settings.StatsWindowEntropy)
+	raceWeightedShuffle(self.settings, clients, weights)
 
 	if crossTier {
 		return clients
@@ -16892,6 +16986,31 @@ func minTierClients(clients []*multiClientChannel) []*multiClientChannel {
 		}
 	}
 	return kept
+}
+
+// The weight an exit takes in a race order: its expected throughput, plus 1
+// so an exit with no headroom left still draws. A window's offer
+// (orderedClients) and the merged race field (mergeRaceField) both order by
+// it.
+func raceWeight(stats *clientWindowStats) float32 {
+	return float32(1 + stats.ExpectedByteCountPerSecond())
+}
+
+// Weighted-shuffles a race order in place (WeightedShuffleWithEntropy) at the
+// settings' StatsWindowEntropy, from their test source when one is set. Nil
+// settings shuffle with no entropy.
+func raceWeightedShuffle(settings *MultiClientSettings, clients []*multiClientChannel, weights map[*multiClientChannel]float32) {
+	entropy := float32(0)
+	var random weightedRandomSource
+	if settings != nil {
+		entropy = settings.StatsWindowEntropy
+		random = settings.raceOrderRandomForTest
+	}
+	if random == nil {
+		WeightedShuffleWithEntropy(clients, weights, entropy)
+		return
+	}
+	weightedShuffleWithEntropy(clients, weights, entropy, random)
 }
 
 func (self *multiClientWindow) statsSampleWeights(weights map[*multiClientChannel]float32) {
@@ -17037,9 +17156,9 @@ type multiClientChannelArgs struct {
 	recentExit bool
 
 	// The window that admitted this exit, stamped by expand before the
-	// channel is built: the race orders the limited window's exits after
-	// the normal windows' (limitedClientsLast), and the process counters
-	// label the exit's flows by it.
+	// channel is built: the process counters label the exit's flows by it.
+	// The race orders the exit by its metrics, never by its window
+	// (mergeRaceField).
 	windowType WindowType
 
 	// How the discovery round that listed this candidate read the window's

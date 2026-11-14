@@ -27,10 +27,12 @@ const (
 	// Keep ordinary placement entirely on the stack; an unusually shared
 	// address can still grow safely through append.
 	affinityPerformanceDestinationStack = 8
-	// Production quality windows are capped at six exits. Keep ample room for
-	// overrides while retaining all candidate scores on the placement stack;
-	// an unexpectedly wider field fails open instead of allocating.
-	affinityPerformanceCandidateStack = 16
+	// A race field is a window's exits merged with the limited window's, which
+	// is the same size (server FP2-PROTOCOL.md D8): 12 on desktop and 20 on
+	// Android's 64-MiB quality window. Keep room for overrides while retaining
+	// all candidate scores on the placement stack; an unexpectedly wider field
+	// fails open instead of allocating.
+	affinityPerformanceCandidateStack = 32
 	// A posterior is a routing hint, not proof that one public exit will keep
 	// working for the next origin connection. Preserve a small simultaneous
 	// escape set when measurements would otherwise collapse a full quality race
@@ -618,7 +620,7 @@ func (self *RemoteUserNatMultiClient) preferAffinityPerformanceCandidates(
 	}
 	if affinityPerformanceCandidateStack < len(candidates) {
 		// A pathological runtime override must not turn provider count into a
-		// placement allocation vector. Normal quality windows have at most six.
+		// placement allocation vector. Normal race fields hold at most 20.
 		return candidates
 	}
 

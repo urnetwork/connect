@@ -182,9 +182,10 @@ func capabilityTestClassDestinations() map[MultiHopId]DestinationStats {
 // --- sizing ---
 
 // The limited window reads its size from the normal windows' last resize
-// passes: half the largest active target (desktop auto: quality 6 and speed
-// 1 give 3), the hard max likewise; an inactive window of a fixed profile
-// never counts.
+// passes: the largest active target (desktop auto: quality 6 and speed 1
+// give 6), the hard max likewise; an inactive window of a fixed profile
+// never counts. A developer-menu fraction resizes it, and the default
+// returns it to the normal window's size.
 func TestLimitedWindowSizingFromTheNormalWindows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -213,8 +214,8 @@ func TestLimitedWindowSizingFromTheNormalWindows(t *testing.T) {
 		t.Fatal("a normal window's new target did not wake the limited window")
 	}
 	speed.publishSizing(windowSizing{published: true, active: true, targetSize: 1, hardMax: 4})
-	if size := limited.limitedWindowSize(); size.WindowSizeMax != 3 || size.WindowSizeHardMax != 3 {
-		t.Errorf("desktop auto: target %d hard max %d, want 3 and 3", size.WindowSizeMax, size.WindowSizeHardMax)
+	if size := limited.limitedWindowSize(); size.WindowSizeMax != 6 || size.WindowSizeHardMax != 6 {
+		t.Errorf("desktop auto: target %d hard max %d, want 6 and 6", size.WindowSizeMax, size.WindowSizeHardMax)
 	}
 	// an unchanged publication wakes nothing
 	wake = limited.resizeMonitor.NotifyChannel()
@@ -228,8 +229,8 @@ func TestLimitedWindowSizingFromTheNormalWindows(t *testing.T) {
 	// a fixed Speed profile of 4: quality is inactive and does not count
 	quality.publishSizing(windowSizing{published: true, active: false, targetSize: 6, hardMax: 6})
 	speed.publishSizing(windowSizing{published: true, active: true, targetSize: 4, hardMax: 0})
-	if size := limited.limitedWindowSize(); size.WindowSizeMax != 2 || size.WindowSizeHardMax != 0 {
-		t.Errorf("fixed profile of 4: target %d hard max %d, want 2 and unbounded", size.WindowSizeMax, size.WindowSizeHardMax)
+	if size := limited.limitedWindowSize(); size.WindowSizeMax != 4 || size.WindowSizeHardMax != 0 {
+		t.Errorf("fixed profile of 4: target %d hard max %d, want 4 and unbounded", size.WindowSizeMax, size.WindowSizeHardMax)
 	}
 
 	// the cap
@@ -246,7 +247,87 @@ func TestLimitedWindowSizingFromTheNormalWindows(t *testing.T) {
 	}
 	parent.SetLimitedWindowSizeFraction(0.5)
 	if size := limited.limitedWindowSize(); size.WindowSizeMax != 2 {
-		t.Errorf("fraction back at 0.5: target %d, want 2", size.WindowSizeMax)
+		t.Errorf("fraction at 0.5: target %d, want 2", size.WindowSizeMax)
+	}
+	parent.SetLimitedWindowSizeFraction(DefaultMultiClientSettings().LimitedWindowSizeFraction)
+	if size := limited.limitedWindowSize(); size.WindowSizeMax != 4 {
+		t.Errorf("fraction back at the default: target %d, want 4", size.WindowSizeMax)
+	}
+}
+
+// The limited window is the same size as the normal window (server
+// FP2-PROTOCOL.md D8; owner, 2026-11-13: "I want the limited window to be
+// the same size as the normal window"): at the default fraction its target
+// and hard max equal the largest active normal window's, and the low-memory
+// bound (D11.5) still caps it. Before, the default fraction of 0.5 gave half:
+// 3 on desktop and 5 on Android. A device that passes its own fraction keeps
+// it: the sdk holds the 32-MiB tier of iOS and the hosted proxies at half, 2
+// of its 5, until the owner decides.
+func TestLimitedWindowIsTheSizeOfTheNormalWindow(t *testing.T) {
+	cases := []struct {
+		name     string
+		quality  windowSizing
+		speed    windowSizing
+		fraction float64
+		sizeMax  int
+		want     int
+	}{
+		{
+			name:    "desktop auto",
+			quality: windowSizing{published: true, active: true, targetSize: 6, hardMax: 6},
+			speed:   windowSizing{published: true, active: true, targetSize: 1, hardMax: 4},
+			want:    6,
+		},
+		{
+			name:    "a quality window of 5",
+			quality: windowSizing{published: true, active: true, targetSize: 5, hardMax: 5},
+			speed:   windowSizing{published: true, active: true, targetSize: 1, hardMax: 1},
+			want:    5,
+		},
+		{
+			name:     "the 32-MiB tier's half",
+			quality:  windowSizing{published: true, active: true, targetSize: 5, hardMax: 5},
+			speed:    windowSizing{published: true, active: true, targetSize: 1, hardMax: 1},
+			fraction: 0.5,
+			want:     2,
+		},
+		{
+			name:    "android, 64 MiB",
+			quality: windowSizing{published: true, active: true, targetSize: 10, hardMax: 10},
+			speed:   windowSizing{published: true, active: true, targetSize: 2, hardMax: 2},
+			want:    10,
+		},
+		{
+			name:    "the low-memory bound",
+			quality: windowSizing{published: true, active: true, targetSize: 5, hardMax: 5},
+			speed:   windowSizing{published: true, active: true, targetSize: 1, hardMax: 1},
+			sizeMax: 1,
+			want:    1,
+		},
+	}
+	for _, c := range cases {
+		ctx, cancel := context.WithCancel(context.Background())
+		settings := DefaultMultiClientSettings()
+		if 0 < c.fraction {
+			settings.LimitedWindowSizeFraction = c.fraction
+		}
+		settings.LimitedWindowSizeMax = c.sizeMax
+		generator := newCapabilityTestGenerator(true, nil)
+		quality := capabilityTestWindow(ctx, generator, settings, WindowTypeQuality)
+		speed := capabilityTestWindow(ctx, generator, settings, WindowTypeSpeed)
+		limited := capabilityTestWindow(ctx, generator, settings, WindowTypeLimited)
+		parent := capabilityTestParent(ctx, cancel, generator, settings, map[WindowType]*multiClientWindow{
+			WindowTypeQuality: quality,
+			WindowTypeSpeed:   speed,
+			WindowTypeLimited: limited,
+		})
+		capabilityTestWireLimitedWindow(parent)
+		quality.publishSizing(c.quality)
+		speed.publishSizing(c.speed)
+		if size := limited.limitedWindowSize(); size.WindowSizeMin != c.want || size.WindowSizeMax != c.want || size.WindowSizeHardMax != c.want {
+			t.Errorf("%s: limited window min %d target %d hard max %d, want %d", c.name, size.WindowSizeMin, size.WindowSizeMax, size.WindowSizeHardMax, c.want)
+		}
+		cancel()
 	}
 }
 
@@ -274,8 +355,8 @@ func TestLimitedWindowDoesNotFillWhereItCannot(t *testing.T) {
 	// echo turns it back on
 	generator := newCapabilityTestGenerator(false, nil)
 	_, limited := build(generator)
-	if size := limited.limitedWindowSize(); size.WindowSizeMax != 3 {
-		t.Fatalf("before any answer: target %d, want 3", size.WindowSizeMax)
+	if size := limited.limitedWindowSize(); size.WindowSizeMax != 6 {
+		t.Fatalf("before any answer: target %d, want 6", size.WindowSizeMax)
 	}
 	generator.ask(capabilityTestCall{})
 	if size := limited.limitedWindowSize(); size.WindowSizeMax != 0 {
@@ -285,8 +366,8 @@ func TestLimitedWindowDoesNotFillWhereItCannot(t *testing.T) {
 	generator.echo = true
 	generator.mutex.Unlock()
 	generator.ask(capabilityTestCall{})
-	if size := limited.limitedWindowSize(); size.WindowSizeMax != 3 {
-		t.Errorf("after an echoed answer: target %d, want 3", size.WindowSizeMax)
+	if size := limited.limitedWindowSize(); size.WindowSizeMax != 6 {
+		t.Errorf("after an echoed answer: target %d, want 6", size.WindowSizeMax)
 	}
 
 	// a generator without labels
@@ -318,8 +399,8 @@ func TestMultiClientBuildsTheLimitedWindow(t *testing.T) {
 	if multi.windows[WindowTypeLimited] == nil || len(multi.windows) != 3 {
 		t.Errorf("windows %d, want quality, speed and limited", len(multi.windows))
 	}
-	if multi.LimitedWindowSizeFraction() != 0.5 {
-		t.Errorf("fraction %v, want the default 0.5", multi.LimitedWindowSizeFraction())
+	if multi.LimitedWindowSizeFraction() != 1 {
+		t.Errorf("fraction %v, want the default 1, the normal window's size", multi.LimitedWindowSizeFraction())
 	}
 	multi.Close()
 
@@ -704,11 +785,14 @@ func TestNamedLookupsTakeTheFreshLabels(t *testing.T) {
 
 // --- profile changes ---
 
-// A profile change regenerates the limited window with the normal windows:
-// its clients are cancelled, its requests carry the new profile's rank mode,
-// its target is recomputed from the normal windows' passes under the new
-// profile, never from their sizing under the old one, and an equal profile
-// changes nothing. A post-quantum toggle is a profile change (§12.5).
+// A profile change reaches the limited window with the normal windows: its
+// requests carry the new profile's rank mode, and its target is recomputed
+// from the normal windows' passes under the new profile, never from their
+// sizing under the old one. The windows' clients are cancelled only when they
+// cannot carry the new profile (performanceProfileRetiresClients): a
+// post-quantum toggle either way regenerates every window (§12.5), and so does
+// direct mode turned off; a window type or size change and direct mode turned
+// on keep them. An equal profile changes nothing.
 func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -745,15 +829,20 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		name     string
 		profile  *PerformanceProfile
 		rankMode string
+		retires  bool
 	}{
 		{name: "auto to fixed speed", profile: fixedSpeed, rankMode: "speed"},
 		{name: "fixed speed to auto", profile: nil, rankMode: "quality"},
 		{name: "auto to fixed quality", profile: fixedQuality, rankMode: "quality"},
 		{name: "fixed quality to fixed speed", profile: fixedSpeed, rankMode: "speed"},
-		{name: "post-quantum on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed"},
+		{name: "direct on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, AllowDirect: true}, rankMode: "speed"},
+		{name: "direct off", profile: fixedSpeed, rankMode: "speed", retires: true},
+		{name: "post-quantum on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed", retires: true},
+		{name: "post-quantum off", profile: fixedSpeed, rankMode: "speed", retires: true},
+		{name: "post-quantum on again", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed", retires: true},
 	}
 	// the normal windows' sizing as their passes under the profile in force
-	// published it, which sizes the limited window to 3
+	// published it, which sizes the limited window to 6
 	publishOld := func() {
 		windows[WindowTypeQuality].publishSizing(windowSizing{published: true, active: true, targetSize: 6, hardMax: 6})
 		windows[WindowTypeSpeed].publishSizing(windowSizing{published: true, active: true, targetSize: 2, hardMax: 4})
@@ -761,15 +850,15 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 	for _, step := range steps {
 		clients := fill()
 		publishOld()
-		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 3 {
-			t.Fatalf("%s: limited target %d before the change, want 3", step.name, size.WindowSizeMax)
+		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 6 {
+			t.Fatalf("%s: limited target %d before the change, want 6", step.name, size.WindowSizeMax)
 		}
 		if err := parent.SetPerformanceProfile(step.profile); err != nil {
 			t.Fatalf("%s: %v", step.name, err)
 		}
 		for windowType, client := range clients {
-			if !client.IsDone() {
-				t.Errorf("%s: the %s window's client was not cancelled", step.name, windowStatsWindowOf(windowType))
+			if client.IsDone() != step.retires {
+				t.Errorf("%s: the %s window's client cancelled=%t, want %t", step.name, windowStatsWindowOf(windowType), client.IsDone(), step.retires)
 			}
 		}
 		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 0 {
@@ -778,8 +867,8 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		// the passes under the new profile size it again
 		windows[WindowTypeQuality].publishSizing(windowSizing{published: true, active: true, targetSize: 4, hardMax: 0})
 		windows[WindowTypeSpeed].publishSizing(windowSizing{published: true, active: false, targetSize: 8, hardMax: 8})
-		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 2 || size.WindowSizeHardMax != 0 {
-			t.Errorf("%s: recomputed limited target %d hard max %d, want 2 and unbounded", step.name, size.WindowSizeMax, size.WindowSizeHardMax)
+		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 4 || size.WindowSizeHardMax != 0 {
+			t.Errorf("%s: recomputed limited target %d hard max %d, want 4 and unbounded", step.name, size.WindowSizeMax, size.WindowSizeHardMax)
 		}
 		if got := windows[WindowTypeLimited].requestRankMode(); got != step.rankMode {
 			t.Errorf("%s: limited rank mode %q, want %q", step.name, got, step.rankMode)
@@ -804,8 +893,8 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 			t.Errorf("an equal profile cancelled the %s window's client", windowStatsWindowOf(windowType))
 		}
 	}
-	if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 3 {
-		t.Errorf("an equal profile changed the limited target to %d, want 3", size.WindowSizeMax)
+	if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 6 {
+		t.Errorf("an equal profile changed the limited target to %d, want 6", size.WindowSizeMax)
 	}
 }
 

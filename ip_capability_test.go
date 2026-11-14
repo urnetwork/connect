@@ -289,31 +289,82 @@ func TestLimitedWindowSize(t *testing.T) {
 
 // The ipv6 minimum a request carries: the quality window in auto and the
 // profile's window are floored at one, the speed window in auto reads its
-// setting, and the limited window has none.
+// setting, and the limited window has none. Neither has a normal window whose
+// selectors ask with ipv4, the hosted devices' (owner, 2026-11-13), whatever
+// its setting or profile.
 func TestRequestDualstackTargetCount(t *testing.T) {
 	quality := WindowTypeQuality
 	speed := WindowTypeSpeed
+	defaultSelectors := DefaultMultiClientSettings().NormalWindowSelectors
+	hostedSelectors := ProviderSelectors{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityAny}
 	cases := []struct {
 		name            string
 		windowType      WindowType
 		fixedWindowType *WindowType
 		minIpv6Capable  int
+		selectors       ProviderSelectors
 		want            int
 	}{
-		{name: "desktop quality", windowType: WindowTypeQuality, minIpv6Capable: 1, want: 1},
-		{name: "mobile quality", windowType: WindowTypeQuality, minIpv6Capable: 0, want: 1},
-		{name: "speed in auto", windowType: WindowTypeSpeed, minIpv6Capable: 0, want: 0},
-		{name: "fixed speed profile", windowType: WindowTypeSpeed, fixedWindowType: &speed, want: 1},
-		{name: "fixed quality profile", windowType: WindowTypeQuality, fixedWindowType: &quality, want: 1},
-		{name: "inactive window of a fixed profile", windowType: WindowTypeQuality, fixedWindowType: &speed, want: 0},
-		{name: "a larger setting", windowType: WindowTypeQuality, minIpv6Capable: 2, want: 2},
-		{name: "limited", windowType: WindowTypeLimited, minIpv6Capable: 1, want: 0},
+		{name: "desktop quality", windowType: WindowTypeQuality, minIpv6Capable: 1, selectors: defaultSelectors, want: 1},
+		{name: "mobile quality", windowType: WindowTypeQuality, minIpv6Capable: 0, selectors: defaultSelectors, want: 1},
+		{name: "speed in auto", windowType: WindowTypeSpeed, minIpv6Capable: 0, selectors: defaultSelectors, want: 0},
+		{name: "fixed speed profile", windowType: WindowTypeSpeed, fixedWindowType: &speed, selectors: defaultSelectors, want: 1},
+		{name: "fixed quality profile", windowType: WindowTypeQuality, fixedWindowType: &quality, selectors: defaultSelectors, want: 1},
+		{name: "inactive window of a fixed profile", windowType: WindowTypeQuality, fixedWindowType: &speed, selectors: defaultSelectors, want: 0},
+		{name: "a larger setting", windowType: WindowTypeQuality, minIpv6Capable: 2, selectors: defaultSelectors, want: 2},
+		{name: "limited", windowType: WindowTypeLimited, minIpv6Capable: 1, selectors: defaultSelectors, want: 0},
+		{name: "empty selectors read as the default", windowType: WindowTypeQuality, minIpv6Capable: 0, selectors: ProviderSelectors{}.normalize(), want: 1},
+		{name: "hosted quality", windowType: WindowTypeQuality, minIpv6Capable: 1, selectors: hostedSelectors, want: 0},
+		{name: "hosted fixed speed profile", windowType: WindowTypeSpeed, fixedWindowType: &speed, selectors: hostedSelectors, want: 0},
+		{name: "hosted with a larger setting", windowType: WindowTypeQuality, minIpv6Capable: 2, selectors: hostedSelectors, want: 0},
 	}
 	for _, c := range cases {
-		got := requestDualstackTargetCount(c.windowType, c.fixedWindowType, WindowSizeSettings{WindowSizeMinIpv6Capable: c.minIpv6Capable})
+		got := requestDualstackTargetCount(c.windowType, c.fixedWindowType, WindowSizeSettings{WindowSizeMinIpv6Capable: c.minIpv6Capable}, c.selectors)
 		if got != c.want {
 			t.Errorf("%s: %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// A normal window's selectors as it sends them: the default dualstack and
+// dualproto, ipv4 and any as a host sets them, and anything else read as the
+// server's defaults, tcp included, which stays the limited window's.
+func TestProviderSelectorsNormalize(t *testing.T) {
+	defaultSelectors := ProviderSelectors{Ip: ProviderIpCapabilityDualstack, Protocol: ProviderProtocolCapabilityDualproto}
+	if got := DefaultMultiClientSettings().NormalWindowSelectors; got != defaultSelectors {
+		t.Errorf("default selectors %+v, want %+v", got, defaultSelectors)
+	}
+	cases := []struct {
+		selectors ProviderSelectors
+		want      ProviderSelectors
+	}{
+		{selectors: ProviderSelectors{}, want: defaultSelectors},
+		{selectors: defaultSelectors, want: defaultSelectors},
+		{
+			selectors: ProviderSelectors{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityAny},
+			want:      ProviderSelectors{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityAny},
+		},
+		{
+			selectors: ProviderSelectors{Ip: ProviderIpCapabilityDualstack, Protocol: ProviderProtocolCapabilityAny},
+			want:      ProviderSelectors{Ip: ProviderIpCapabilityDualstack, Protocol: ProviderProtocolCapabilityAny},
+		},
+		{
+			selectors: ProviderSelectors{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityTcp},
+			want:      ProviderSelectors{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityDualproto},
+		},
+		{
+			selectors: ProviderSelectors{Ip: "v6", Protocol: "udp"},
+			want:      defaultSelectors,
+		},
+	}
+	for _, c := range cases {
+		if got := c.selectors.normalize(); got != c.want {
+			t.Errorf("%+v normalized to %+v, want %+v", c.selectors, got, c.want)
+		}
+	}
+	// any is a selector, never a label: an exit labelled any carries no udp
+	if (ProviderCapabilities{Ip: ProviderIpCapabilityIpv4, Protocol: ProviderProtocolCapabilityAny}).CarriesUdp() {
+		t.Error("an exit labelled any reads as carrying udp")
 	}
 }
 

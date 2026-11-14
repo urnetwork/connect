@@ -79,7 +79,9 @@ func (self windowFailureClass) reason() string {
 // stallReasonRank orders reasons for tie-breaks and for the merged monitor's
 // pick across windows: the sharper the diagnosis, the higher the rank.
 // platform-unreachable outranks everything because it names the root cause the
-// other classes are usually downstream of.
+// other classes are usually downstream of. Across windows it is the exception:
+// the merged monitor takes it only when every trying window says it
+// (MergedMultiClientMonitor.WindowExpandEvent), never by rank.
 func stallReasonRank(reason string) int {
 	switch reason {
 	case WindowStallPlatformUnreachable:
@@ -180,6 +182,22 @@ func (self *windowFailureRecorder) counts(now time.Time) [windowFailureClassCoun
 		counts[class] = len(times)
 	}
 	return counts
+}
+
+// Forgets the recorded failures of one class and returns whether there were
+// any. The platform answering (a listing, a mint, an installed client)
+// ends what its earlier failures said: without this one timeout kept the
+// diagnosis platform-unreachable for the whole horizon after the platform had
+// answered again.
+func (self *windowFailureRecorder) clear(class windowFailureClass) bool {
+	if self == nil || class < 0 || windowFailureClassCount <= class {
+		return false
+	}
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	cleared := 0 < len(self.times[class])
+	self.times[class] = nil
+	return cleared
 }
 
 // deriveStallReason picks the dominant recent failure class; ties break to the
@@ -308,6 +326,8 @@ func (self *multiClientWindow) noteClientAdded(client *multiClientChannel) {
 			"window", self.windowName(),
 		))
 	}
+	// the install went through the platform's mint and contract
+	self.failures.clear(windowFailurePlatform)
 	self.publishStallStatus()
 }
 
@@ -384,6 +404,7 @@ func (self *multiClientWindow) windowBackoff(streak *atomic.Uint64, min time.Dur
 func (self *multiClientWindow) windowRetryReset() {
 	self.rateLimitStreak.Store(0)
 	self.errorStreak.Store(0)
+	self.notePlatformAnswered()
 }
 
 // Clears the error streak after a listing the platform answered. The
@@ -393,6 +414,16 @@ func (self *multiClientWindow) windowRetryReset() {
 // a second). Only a mint that succeeds ends it (windowRetryReset).
 func (self *multiClientWindow) windowListingRetryReset() {
 	self.errorStreak.Store(0)
+	self.notePlatformAnswered()
+}
+
+// Ends the platform failures' part in the diagnosis: the platform just
+// answered, so it is not unreachable. The reason is published
+// again only when there was something to forget. Called with no locks held.
+func (self *multiClientWindow) notePlatformAnswered() {
+	if self.failures.clear(windowFailurePlatform) && self.monitor != nil {
+		self.publishStallStatus()
+	}
 }
 
 // networkChangeNotify is the channel that ends a retry wait when the host's
@@ -478,13 +509,55 @@ func (self *multiClientWindow) stallReason() string {
 // monitor, which dispatches to listeners only on change. The transition is
 // logged here — once per change, never per pass — so the field capture carries
 // the diagnosis timeline.
+//
+// A turn to platform-unreachable is held back for
+// MultiClientSettings.WindowPlatformUnreachableHold: until the diagnosis has
+// stayed there that long, the reason published before it stays. Every app
+// offers its "Can't reach URnetwork" prompt when the published reason turns to
+// platform-unreachable (sdk CantReachOnStall), and stallReason's transport
+// detector reads it the moment a connect server restart drops the window's
+// transports, which come back seconds later; the prompt fired on every such
+// drop (2026-11-13). While the diagnosis is platform-unreachable, held or
+// published, a watch re-reads it every WindowPlatformUnreachablePollTimeout
+// (watchPlatformUnreachable), so a transport that came back ends the episode
+// and a later drop starts a new hold.
 func (self *multiClientWindow) publishStallStatus() {
 	reason := self.stallReason()
-	failed := func() bool {
+	now := time.Now()
+	var hold time.Duration
+	if self.settings != nil {
+		hold = self.settings.WindowPlatformUnreachableHold
+	}
+	var failed bool
+	held := false
+	startWatch := false
+	func() {
 		self.outcomeLock.Lock()
 		defer self.outcomeLock.Unlock()
-		return self.outcomeFailed
+		failed = self.outcomeFailed
+		if reason != WindowStallPlatformUnreachable || hold <= 0 {
+			self.platformUnreachableSince = time.Time{}
+			return
+		}
+		if self.platformUnreachableSince.IsZero() {
+			self.platformUnreachableSince = now
+		}
+		held = now.Sub(self.platformUnreachableSince) < hold
+		if !self.platformUnreachableWatch && self.ctx != nil && 0 < self.settings.WindowPlatformUnreachablePollTimeout {
+			self.platformUnreachableWatch = true
+			startWatch = true
+		}
 	}()
+	if startWatch {
+		go HandleError(self.watchPlatformUnreachable)
+	}
+	if held {
+		// the turn waits out the hold: what was published before stays
+		reason = self.monitor.WindowExpandEvent().Reason
+		if reason == "" {
+			reason = WindowStallEvaluating
+		}
+	}
 	if self.monitor.SetStallStatus(reason, failed) {
 		self.log.Infof("%s\n", relEvent(
 			"window_stall",
@@ -492,6 +565,38 @@ func (self *multiClientWindow) publishStallStatus() {
 			"reason", reason,
 			"failed", failed,
 		))
+	}
+}
+
+// Re-reads a platform-unreachable diagnosis every
+// WindowPlatformUnreachablePollTimeout until the episode ends or the window
+// does. Nothing else publishes on a timer once the window has installed a
+// provider (watchOutcome stops there), so without it a held turn would wait
+// for the next failure to land, and a transport that came back would leave
+// the published reason platform-unreachable until then. One per window at a
+// time: publishStallStatus starts it under outcomeLock, and it gives the slot
+// back in the same critical section that sees the episode over.
+func (self *multiClientWindow) watchPlatformUnreachable() {
+	release := func() bool {
+		self.outcomeLock.Lock()
+		defer self.outcomeLock.Unlock()
+		if self.ctx.Err() == nil && !self.platformUnreachableSince.IsZero() {
+			return false
+		}
+		self.platformUnreachableWatch = false
+		return true
+	}
+	for {
+		select {
+		case <-self.ctx.Done():
+			release()
+			return
+		case <-time.After(self.settings.WindowPlatformUnreachablePollTimeout):
+		}
+		self.publishStallStatus()
+		if release() {
+			return
+		}
 	}
 }
 
@@ -736,6 +841,8 @@ func (self *multiClientWindow) failOutcome(elapsed time.Duration) {
 		"after", elapsed,
 	))
 	if self.monitor != nil {
-		self.monitor.SetStallStatus(reason, true)
+		// the latch is published with the reason the hold allows
+		// (publishStallStatus), as every other publish is
+		self.publishStallStatus()
 	}
 }

@@ -7,17 +7,22 @@ package connect
 // window asks for dualstack and dualproto providers with its target, its ipv6
 // minimum and the clients it holds of each label; the server fills its ipv6
 // need first, then its protocol's providers, and only when those cannot reach
-// the target, tcp providers as overflow. The limited window asks for ipv4 and
+// the target, tcp providers as overflow. A host's normal windows may ask for
+// ipv4 and any instead (MultiClientSettings.NormalWindowSelectors): every
+// provider in one pool by rank, and no limited window beside them. The
+// limited window asks for ipv4 and
 // tcp providers: the providers whose udp failed, which the hard gate kept out
 // of every window before. Its clients join the race of every flow they can
 // carry (coalesceOrderedClients), so tcp traffic reaches them while udp never
-// does.
+// does, and the race orders them with the selected window's by the same
+// weighted metrics (mergeRaceField).
 //
 // The limited window is sized from the normal windows: its target is
 // max(1, floor(fraction x S)), S the largest target among the active normal
 // windows as their last resize passes computed it before the standing reserve,
 // and its hard max follows the largest active normal hard max the same way.
-// Its rank mode is the performance profile's, quality in auto (D10). It does
+// The default fraction is 1, the same size as the normal window (D8). Its
+// rank mode is the performance profile's, quality in auto (D10). It does
 // not fill without a capability-aware generator, while the server is known
 // not to echo `select`, under the user's Fixed IP (a second selectable exit
 // would change the egress ip) or with a non-positive fraction; and a fixed
@@ -209,9 +214,11 @@ func (self *multiClientWindow) publishedSizingSnapshot() windowSizing {
 // the setting alone: the mobile policy and every fixed profile leave the
 // setting at 0, and a request without an ipv6 need no longer draws dualstack
 // first (FP2-PROTOCOL.md §6.3), so those windows would lose the one dualstack
-// exit today's draw gives them. The limited window has no ipv6 need.
-func requestDualstackTargetCount(windowType WindowType, fixedWindowType *WindowType, windowSize WindowSizeSettings) int {
-	if windowType == WindowTypeLimited {
+// exit today's draw gives them. The limited window has no ipv6 need, and
+// neither has a normal window whose selectors ask with ipv4: its pool is
+// drawn by rank alone (MultiClientSettings.NormalWindowSelectors).
+func requestDualstackTargetCount(windowType WindowType, fixedWindowType *WindowType, windowSize WindowSizeSettings, selectors ProviderSelectors) int {
+	if windowType == WindowTypeLimited || selectors.Ip == ProviderIpCapabilityIpv4 {
 		return 0
 	}
 	dualstackTargetCount := max(0, windowSize.WindowSizeMinIpv6Capable)
@@ -263,7 +270,7 @@ func (self *multiClientWindow) initRequestSizing() {
 		}
 	}
 	self.requestTargetCount = targetCount
-	self.requestDualstackTargetCount = requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+	self.requestDualstackTargetCount = requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize, self.providerSelectors())
 	if fixedDestination || targetCount <= 0 {
 		self.requestDualstackTargetCount = 0
 	}
@@ -291,21 +298,38 @@ func (self *multiClientWindow) requestRankMode() string {
 	return limitedWindowRankMode(self.performanceProfile)
 }
 
-// The `select` this window's requests carry (FP2-PROTOCOL.md §7.4). The held
-// counts are the window's live, unwarned clients: a warned client is being
-// replaced, so it holds no slot the request should count.
+// The selectors this window asks with: the limited window's ipv4 and tcp, and
+// the normal windows' from the settings (MultiClientSettings
+// .NormalWindowSelectors). Takes no lock: the settings do not change.
+func (self *multiClientWindow) providerSelectors() ProviderSelectors {
+	if self.windowType == WindowTypeLimited {
+		return ProviderSelectors{
+			Ip:       ProviderIpCapabilityIpv4,
+			Protocol: ProviderProtocolCapabilityTcp,
+		}
+	}
+	if self.settings == nil {
+		return ProviderSelectors{}.normalize()
+	}
+	return self.settings.NormalWindowSelectors.normalize()
+}
+
+// The `select` this window's requests carry (FP2-PROTOCOL.md §7.4): its
+// selectors with its target, its ipv6 minimum (none for ipv4) and the clients
+// it holds of each label. The held counts are the window's live, unwarned
+// clients: a warned client is being replaced, so it holds no slot the request
+// should count. Every label is the protocol any asks for.
 func (self *multiClientWindow) providerSelect() FindProvidersSelect {
+	selectors := self.providerSelectors()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	providerSelect := FindProvidersSelect{
-		Ip:                   ProviderIpCapabilityDualstack,
-		Protocol:             ProviderProtocolCapabilityDualproto,
+		Ip:                   selectors.Ip,
+		Protocol:             selectors.Protocol,
 		TargetCount:          max(1, self.requestTargetCount),
 		DualstackTargetCount: max(0, self.requestDualstackTargetCount),
 	}
-	if self.windowType == WindowTypeLimited {
-		providerSelect.Ip = ProviderIpCapabilityIpv4
-		providerSelect.Protocol = ProviderProtocolCapabilityTcp
+	if selectors.Ip == ProviderIpCapabilityIpv4 {
 		providerSelect.DualstackTargetCount = 0
 	}
 	for _, client := range self.clients {
@@ -313,7 +337,7 @@ func (self *multiClientWindow) providerSelect() FindProvidersSelect {
 			continue
 		}
 		capabilities := client.capabilities()
-		if capabilities.Protocol == providerSelect.Protocol {
+		if selectors.Protocol == ProviderProtocolCapabilityAny || capabilities.Protocol == selectors.Protocol {
 			providerSelect.HeldCount += 1
 		}
 		if capabilities.Ip == ProviderIpCapabilityDualstack {
@@ -335,7 +359,9 @@ func (self *multiClientWindow) limitedListingHeld() bool {
 	return self.requestTargetCount <= 0
 }
 
-// Whether a provider this window was given may join it. The limited window
+// Whether a provider this window was given may join it. A normal window takes
+// every label: tcp providers come to a dualproto request as overflow, and to
+// an any request as members of its one pool. The limited window
 // keeps only providers labelled tcp: a server that predates selector mode
 // answers its request with hard-gate providers, which carry no label and so
 // read dualproto, and a tcp request never receives a dualproto provider
@@ -533,7 +559,10 @@ func destinationsCarryIpv6(destinations map[MultiHopId]DestinationStats) bool {
 // --- the race ---
 
 // The field a selected window offers a flow (FP2-PROTOCOL.md §7.5): its own
-// race candidates for the flow, followed by the limited window's. The caller
+// race candidates for the flow and the limited window's, merged into one
+// weighted order (mergeRaceField). Each window narrows to its own best rank
+// first (raceCandidates): one rank gate across both would drop the limited
+// window's exits, whose overflow ranks sit below the window's. The caller
 // runs every filter on the merged field, so the limited window's exits race
 // the window's on equal terms. They are tcp, so they never join a udp race;
 // and when the window offers nothing the flow can use, a tcp flow races them
@@ -547,55 +576,115 @@ func (self *RemoteUserNatMultiClient) raceField(
 ) []*multiClientChannel {
 	field := self.raceCandidates(window, need, offerChanged)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, self.raceCandidates(limitedWindow, need, limitedOfferChanged)...)
+		field = self.mergeRaceField(field, self.raceCandidates(limitedWindow, need, limitedOfferChanged))
 	}
 	return field
 }
 
 // raceField widened across tiers, for a flow whose service failed on the
-// window's best rank.
+// window's best rank: both windows' cross-tier offers, merged.
 func (self *RemoteUserNatMultiClient) crossTierRaceField(window *multiClientWindow, need flowNeed) []*multiClientChannel {
 	field := window.orderedClientsCrossTierForFlow(need)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, limitedWindow.orderedClientsCrossTierForFlow(need)...)
+		field = self.mergeRaceField(field, limitedWindow.orderedClientsCrossTierForFlow(need))
 	}
 	return field
 }
 
-// raceField's benched fallback, when the cross-tier field is empty.
+// raceField's benched fallback, when the cross-tier field is empty: both
+// windows' last-resort offers, merged.
 func (self *RemoteUserNatMultiClient) lastResortRaceField(window *multiClientWindow, need flowNeed) []*multiClientChannel {
 	field := window.lastResortClientsForFlow(need)
 	if limitedWindow := self.windows[WindowTypeLimited]; limitedWindow != nil && limitedWindow != window {
-		field = append(field, limitedWindow.lastResortClientsForFlow(need)...)
+		field = self.mergeRaceField(field, limitedWindow.lastResortClientsForFlow(need))
 	}
 	return field
 }
 
-// The race field with the limited window's exits after the normal windows',
-// each part in its own order (FP2-PROTOCOL.md §7.5), so a race bounded under
-// a degraded backend spends its slots on the normal windows first. Returns
-// the field as it is when it holds no limited exit, else a reordered copy, so
-// the caller's list keeps its order.
-func limitedClientsLast(clients []*multiClientChannel) []*multiClientChannel {
-	limitedCount := 0
-	for _, client := range clients {
-		if client.windowType() == WindowTypeLimited {
-			limitedCount += 1
-		}
+// One race order over a window's field and the limited window's (owner,
+// 2026-11-13: "the windows need to merge in order based on the weighted
+// metrics"). The union is ordered as one window orders its offer
+// (orderedClients): a weighted shuffle by each exit's expected throughput
+// (raceWeight) at StatsWindowEntropy. A strong limited exit can lead the race
+// and a weak one follow, by its metrics alone. The race then puts each
+// window's top first (raceWindowTopsFirst) before it bounds. An empty part
+// leaves the other in its own window's order, so a flow with no limited exit
+// to race keeps exactly the window's field.
+//
+// The weights are read without coalescing the event buckets, as
+// exitMetricsSnapshot reads them on this path; the windows' own passes
+// coalesce. A benched last-resort exit is weighed by the same metric.
+func (self *RemoteUserNatMultiClient) mergeRaceField(field []*multiClientChannel, limitedField []*multiClientChannel) []*multiClientChannel {
+	if len(limitedField) == 0 {
+		return field
 	}
-	if limitedCount == 0 || limitedCount == len(clients) {
+	if len(field) == 0 {
+		return limitedField
+	}
+	merged := make([]*multiClientChannel, 0, len(field)+len(limitedField))
+	merged = append(merged, field...)
+	merged = append(merged, limitedField...)
+	weights := make(map[*multiClientChannel]float32, len(merged))
+	for _, client := range merged {
+		// an exit that ended since its pass still has its stats filled in
+		stats, _ := client.windowStatsWithCoalesce(false)
+		weights[client] = raceWeight(stats)
+	}
+	raceWeightedShuffle(self.settings, merged, weights)
+	return merged
+}
+
+// The race's order over a field that merges windows (owner, 2026-11-13: "if
+// it's 2, i want to make sure a member of the limited window is always tried.
+// I want to combine that with the merged sort, but keep the top from each
+// list to be always included"). Each window's top, its first candidate in
+// the field whose contract requests are not held, comes first, the tops
+// ordered between themselves by the weighted metrics (raceWeight at
+// StatsWindowEntropy). Every other candidate follows in the field's own
+// order, the merged weighted order (mergeRaceField). So a race bounded to two
+// tries the best exit of the normal window and the best of the limited window
+// together, and an unbounded race still tries every one. In a merged field
+// the first of a window is that window's own weighted top: at the default
+// entropy of 0, the weighted order of the union orders each window's exits
+// among themselves as a weighted order of that window alone would.
+//
+// The send path calls it after every filter and right before the bound, so a
+// top that a filter removed is replaced by its window's next. A field of one
+// window, every udp field among them, comes back as it is, as does a field in
+// which fewer than two windows have a candidate that is not held. Held
+// clients are then moved last by contractRateLimitHeldLast, which keeps the
+// tops first. Returns a reordered copy, so the caller's list keeps its order.
+func raceWindowTopsFirst(clients []*multiClientChannel, settings *MultiClientSettings, now time.Time) []*multiClientChannel {
+	if len(clients) < 2 {
 		return clients
 	}
-	sorted := make([]*multiClientChannel, 0, len(clients))
-	limited := make([]*multiClientChannel, 0, limitedCount)
+	tops := make([]*multiClientChannel, 0, 2)
+	windowTypes := make([]WindowType, 0, 2)
 	for _, client := range clients {
-		if client.windowType() == WindowTypeLimited {
-			limited = append(limited, client)
-		} else {
-			sorted = append(sorted, client)
+		windowType := client.windowType()
+		if slices.Contains(windowTypes, windowType) || contractRateLimitHeldChannel(client, now) {
+			continue
+		}
+		windowTypes = append(windowTypes, windowType)
+		tops = append(tops, client)
+	}
+	if len(tops) < 2 {
+		return clients
+	}
+	weights := make(map[*multiClientChannel]float32, len(tops))
+	for _, client := range tops {
+		stats, _ := client.windowStatsWithCoalesce(false)
+		weights[client] = raceWeight(stats)
+	}
+	raceWeightedShuffle(settings, tops, weights)
+	ordered := make([]*multiClientChannel, 0, len(clients))
+	ordered = append(ordered, tops...)
+	for _, client := range clients {
+		if !slices.Contains(tops, client) {
+			ordered = append(ordered, client)
 		}
 	}
-	return append(sorted, limited...)
+	return ordered
 }
 
 // --- parent ---

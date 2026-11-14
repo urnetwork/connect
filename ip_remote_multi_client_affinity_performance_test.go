@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"net"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -217,6 +218,38 @@ func TestAffinityPerformanceKeepsFourRouteTailInsurance(t *testing.T) {
 	}
 	if filtered := parent.ReliabilityMetrics().AffinityPerformanceCandidatesFiltered; filtered != 2 {
 		t.Fatalf("filtered candidates=%d, want 2 beyond the four-route floor", filtered)
+	}
+}
+
+// A fresh TLS race on Android merges the 64-MiB quality window's 10 exits
+// with the limited window's 10, the same size (server FP2-PROTOCOL.md D8).
+// The performance preference still reads that whole field, so the low
+// measured provider leaves the race. Before, a field wider than 16 failed
+// open and kept it.
+func TestAffinityPerformancePrefersAcrossAMergedAndroidField(t *testing.T) {
+	parent := reputationTestParent("www.bloomberg.com")
+	parent.reliabilityMetrics = newReliabilityMetrics()
+	low := affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000})
+	update := recordAffinityPerformanceTestSample(t, parent, low, 47100, 25_000, time.Second)
+	update.Close()
+	field := []*multiClientChannel{low}
+	for range 19 {
+		field = append(field, affinityPerformanceTestClient(DestinationStats{EstimatedBytesPerSecond: 5_000_000}))
+	}
+	unmeasured := slices.Clone(field[1:])
+
+	preferred := parent.preferAffinityPerformanceCandidates(
+		field,
+		affinityPerformanceTestCandidateUpdate(affinityPerformanceTestPath(47101)),
+	)
+	if len(preferred) != len(unmeasured) || slices.Contains(preferred, low) {
+		t.Fatalf("a 20-exit merged field kept %d candidates, low included %t; want the 19 unmeasured",
+			len(preferred), slices.Contains(preferred, low))
+	}
+	for _, client := range unmeasured {
+		if !slices.Contains(preferred, client) {
+			t.Fatal("an unmeasured provider left the merged field")
+		}
 	}
 }
 
