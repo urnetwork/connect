@@ -266,6 +266,8 @@ func TestFirstLoadCloseRejectsPostCloseAdmission(t *testing.T) {
 // the next success.
 func TestUpgradeMuxTunnelDohCold(t *testing.T) {
 	mux := &UpgradeMux{}
+	settings := DefaultUpgradeMuxSettings()
+	mux.settings.Store(settings)
 	if !mux.tunnelDohCold() {
 		t.Fatalf("a fresh mux must be cold (tunnel unproven)")
 	}
@@ -274,7 +276,7 @@ func TestUpgradeMuxTunnelDohCold(t *testing.T) {
 		t.Fatalf("a proven mux must be warm")
 	}
 	mux.tunnelDohLastSuccessNanos.Store(
-		time.Now().Add(-tunnelDohWarmLease - time.Millisecond).UnixNano(),
+		time.Now().Add(-settings.Dns.WarmLease - time.Millisecond).UnixNano(),
 	)
 	if !mux.tunnelDohCold() {
 		t.Fatalf("an idle mux must expire its stale warm state")
@@ -286,7 +288,7 @@ func TestUpgradeMuxTunnelDohCold(t *testing.T) {
 	}
 	mux.recordTunnelDohFailureForGeneration(mux.tunnelDohGeneration.Load())
 	if !mux.tunnelDohCold() {
-		t.Fatalf("%d consecutive failures must flip cold", tunnelDohColdFailureCount)
+		t.Fatalf("%d consecutive failures must flip cold", settings.Dns.ColdFailureCount)
 	}
 	mux.markTunnelDohProven()
 	if mux.tunnelDohCold() {
