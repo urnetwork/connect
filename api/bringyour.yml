@@ -14689,6 +14689,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/SocketKeysResult"
 
+  /mail/enable:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Turn mail on for the caller's network
+      description: |
+        Turns mail on for the caller's network: its mail row and its zone's
+        mail records, the wildcard MX included, in one write, after which
+        mxedge routes the network's mail host. The body is empty. Calling it
+        again changes nothing and answers the first time. Mail does not need a
+        verified network to be turned on; only internet sending and MTA-STS do.
+        503 with Retry-After while the server does not serve mail yet, while
+        mail is not open to the network, or while the zone cannot be written;
+        403 while the network's zone is suspended.
+      operationId: mailEnable
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailEnableResult"
+        "403":
+          description: The network's zone is suspended.
+        "503":
+          description: Mail is not served, not open to the network, or its zone cannot be written now.
+
+  /mail/status:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's network's mail status
+      description: |
+        Whether mail is on for the caller's network, whether the network is at
+        its storage limit or spent, in which case its receivers defer new mail,
+        and whether it names a direct MX. A receiver reads it at most every
+        30 s. 503 with Retry-After while the server does not serve mail yet.
+      operationId: mailStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailStatus"
+        "503":
+          description: Mail is not served.
+
 components:
   parameters:
     GkmGroupId:
@@ -28767,6 +28819,30 @@ components:
           type: string
         meter:
           type: string
+    MailEnableResult:
+      type: object
+      required: [enabled_time]
+      properties:
+        enabled_time:
+          description: When mail was first turned on for the network, in Unix milliseconds. Sending to the internet opens 24 hours after it.
+          type: integer
+          format: int64
+    MailStatus:
+      type: object
+      required: [enabled, storage_full, spent, direct_mx]
+      properties:
+        enabled:
+          description: Mail is on for the network.
+          type: boolean
+        storage_full:
+          description: The network is at or past its storage limit, so its receivers defer new mail.
+          type: boolean
+        spent:
+          description: The network is spent until a purchase.
+          type: boolean
+        direct_mx:
+          description: The network names a direct MX.
+          type: boolean
     QuotaLimits:
       type: object
       required:
