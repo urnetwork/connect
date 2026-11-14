@@ -567,6 +567,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// outside any normal ack round trip so ordinary latency is not mistaken
 		// for a stall
 		SendStallTimeout: 3 * time.Second,
+		// a lossy but working return stream fills a hole within a few resend
+		// rounds; one still open after the send-stall bar is a stream that has
+		// stopped, not a slow one
+		ReceiveGapStallTimeout: 3 * time.Second,
 		// ask before convicting: a congested exit answers, a dead one does not.
 		// false is the convict-immediately A/B comparison point
 		BusyProbe: true,
@@ -1406,7 +1410,19 @@ type MultiClientSettings struct {
 	// the window. A client in that state looks busy rather than broken, so
 	// without this it survives until AckTimeout (30s) while every flow pinned to
 	// it is frozen. 0 disables the check. See `sendStalled`.
+	//
+	// The same bar keeps new flows and affinity donation off an exit whose
+	// outstanding sends have made no ack progress (a busy-probe answer is not
+	// progress), in a warm window, until an ack arrives; see
+	// ip_remote_multi_client_exit_stall.go.
 	SendStallTimeout time.Duration
+	// ReceiveGapStallTimeout is how long a hole in an exit's return stream may
+	// stay open before new flows and affinity donation avoid the exit, in a
+	// warm window, until the hole fills; a restart does not restore such an
+	// exit either (ip_remote_multi_client_exit_stall.go). Every item behind a
+	// hole waits for it, so the exit's whole return stream is frozen. Removal
+	// stays with the receive sequence's GapTimeout. 0 disables the hold.
+	ReceiveGapStallTimeout time.Duration
 
 	// BusyProbe interposes an active liveness probe between the send-stall bar
 	// tripping and the conviction it used to execute immediately. Concept
@@ -3900,6 +3916,7 @@ type ReliabilitySettings struct {
 	QuicRebindOnExitLoss     bool
 	TcpCollapseMaxHold       time.Duration
 	SendStallTimeout         time.Duration
+	ReceiveGapStallTimeout   time.Duration
 	ClusterAffinityFallback  bool
 	ServerNameAffinityBridge bool
 	SequenceIdleTimeout      time.Duration
@@ -3989,6 +4006,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		QuicRebindOnExitLoss:       settings.QuicRebindOnExitLoss,
 		TcpCollapseMaxHold:         settings.TcpCollapseMaxHold,
 		SendStallTimeout:           settings.SendStallTimeout,
+		ReceiveGapStallTimeout:     settings.ReceiveGapStallTimeout,
 		ClusterAffinityFallback:    settings.ClusterAffinityFallback,
 		ServerNameAffinityBridge:   settings.ServerNameAffinityBridge,
 		SequenceIdleTimeout:        settings.SequenceIdleTimeout,
@@ -6693,7 +6711,9 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 			// guaranteed teardown.
 			return true
 		}
-		return !c.isWarning() && !self.clientAtFlowCapWithLock(c)
+		// a moved flow is a new flow to its replacement: never one that has
+		// stopped making progress (ip_remote_multi_client_exit_stall.go)
+		return !c.isWarning() && !self.clientAtFlowCapWithLock(c) && !c.placementStalled(time.Now())
 	}
 	// headroom is how many more flows a candidate may take; negative means
 	// unbounded (the cap is off, or this is the last-resort pass where the
@@ -13076,6 +13096,11 @@ type multiClientWindow struct {
 	// Nil outside focused tests. Runs at the start of each send-stall pass
 	// (watchSendStalls). Set before the loop starts.
 	sendStallPassForTest func()
+	// Orders the stall watchdog's and the resize pass's restore-safety notes
+	// (noteIdentityRestore), so the generator sees each exit's changes in the
+	// order they were judged. Taken with no other lock held; channel and
+	// generator locks are taken under it, never the reverse.
+	identityRestoreLock sync.Mutex
 	// networkChangeMonitor ends a platform-error retry wait when the host's
 	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
 	// never wakes a wait.
@@ -13387,6 +13412,12 @@ func (self *multiClientWindow) watchSendStalls() {
 		if stallTimeout <= 0 {
 			continue
 		}
+		// an ack stall starts and ends between resize passes: keep the restore
+		// snapshot in step with it (ip_remote_multi_client_exit_stall.go),
+		// before the busy probes below spend their budget
+		parkClients = self.appendUnorderedClients(parkClients[:0])
+		self.noteIdentityRestore(time.Now(), parkClients)
+		clear(parkClients)
 		if self.convictSendStalls(stallTimeout) {
 			// wake resize for the reap and the backfill only; the verdict has
 			// already been executed above
@@ -14337,6 +14368,9 @@ func (self *windowErrorRemoval) begin() {
 	// against the provider: ask for the same provider first (see
 	// stickyRedial)
 	window.rememberStickyRedial(self.client, self.err, self.stickyExit)
+	// a restart must not restore an exit removed with a verdict, even when
+	// it outruns the identity's asynchronous retirement
+	window.forgetIdentityRestore(self.client, self.err)
 }
 
 // The cause the removal counts under.
@@ -14788,6 +14822,9 @@ func (self *multiClientWindow) resize() {
 		}
 
 		warningTransitions.observe(windowClientStats, self.windowType, warnedClients)
+		// the warnings this pass set decide which exits a restart restores
+		// (ip_remote_multi_client_exit_stall.go)
+		self.noteIdentityRestore(time.Now(), slices.Concat(clients, warnedClients))
 
 		collapseLowestWeighted := func(targetWindowSize int) {
 
@@ -15591,10 +15628,22 @@ func (self *multiClientWindow) expand(
 		}
 		var replacedClient *multiClientChannel
 		installed := false
+		excluded := false
+		exclusions, exclusionsOk := self.generator.(multiClientGeneratorExclusions)
 		if admissible || strictHandover != nil {
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
+				// a provider removed while this candidate was being evaluated
+				// (RemoveProvider excludes it, then cancels the window's clients
+				// of it under this lock): read here, under the same lock as the
+				// install, either the removal's cut finds the installed client
+				// or this read finds the exclusion. A fixed generator's deferred
+				// destination is never excluded at runtime.
+				if exclusionsOk && !args.deferredClientArgs && exclusions.excludesDestination(args.Destination) {
+					excluded = true
+					return
+				}
 				if strictHandover != nil {
 					// the swap: the victim leaves and the candidate takes its
 					// slot in one section, so the installed count never
@@ -15617,6 +15666,21 @@ func (self *multiClientWindow) expand(
 				self.sendStallWake.signal()
 				installed = true
 			}()
+		}
+		if excluded {
+			self.log.Infof("%s\n", relEvent(
+				"expand_decline",
+				"exit", clientId,
+				"provider", args.Destination.Tail(),
+				"reason", "excluded",
+			))
+			// never visible to selection, as below; a strict handover's victim
+			// keeps its slot, since the swap never ran
+			client.Cancel()
+			self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
+			self.noteRecentExitDropped(args, "excluded")
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateCanceled)
+			return false
 		}
 		if !installed {
 			self.log.Infof("%s\n", relEvent(
@@ -16022,6 +16086,7 @@ requestCandidates:
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
 			args.sendStallWake = self.sendStallWake
+			args.uplinkLastIngress = self.uplinkLastIngressFunc
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -17052,11 +17117,16 @@ func (self *multiClientWindow) orderedClients(crossTier bool, need flowNeed, cha
 	lruTimes := map[*multiClientChannel]time.Time{}
 	weights := map[*multiClientChannel]float32{}
 
+	now := time.Now()
+	warm := self.windowWarm(now)
 	for _, client := range offeredClients {
 		if !client.supportsFlow(need.ipVersion, need.ipProtocol) {
 			continue
 		}
-		if stats, err := client.WindowStats(); err == nil && !client.isWarning() {
+		// an exit that has stopped making progress takes no new flow until it
+		// moves again (ip_remote_multi_client_exit_stall.go); the last-resort
+		// offer still holds it
+		if stats, err := client.WindowStats(); err == nil && !client.isWarning() && client.exitStall(now, warm) == exitStallNone {
 			clients = append(clients, client)
 			if !stats.lastEventTime.IsZero() {
 				lruTimes[client] = stats.lastEventTime
@@ -17341,6 +17411,9 @@ type multiClientChannelArgs struct {
 	// The window's send-stall watchdog wake, signaled at the first send of a
 	// run. nil (directly constructed channels) signals nothing.
 	sendStallWake *outstandingSendWake
+	// The parent's tunnel-wide ingress stamp (uplinkLastIngressFunc on the
+	// channel). nil (directly constructed channels) reads as a cold window.
+	uplinkLastIngress func() time.Time
 	// The parent's, shared by every channel: armed from this channel's provider
 	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
 	// leaves the channel at its rank.
@@ -17576,6 +17649,14 @@ type multiClientChannel struct {
 	// convention here. The func takes the parent stateLock inside, so it must
 	// never be called with this channel's stateLock (or any leaf lock) held.
 	receivingSiblingsFunc func(exclude *multiClientChannel) int
+	// Reads when the tunnel last received return traffic from any exit (RemoteUserNatMultiClient.uplinkLastIngress), the evidence
+	// that the window is warm (ip_remote_multi_client_exit_stall.go). Lock-free.
+	// nil on channels built directly by tests, which reads as cold: no exit is
+	// held out of placement or restore, as before.
+	uplinkLastIngressFunc func() time.Time
+	// The restore safety last handed to the generator (noteIdentityRestore),
+	// so only a change writes the identity store.
+	restoreUnsafeNoted atomic.Bool
 	// busyProbeSendFunc, when non-nil, overrides how the busy-flow liveness
 	// probe offers its control ping for admission. Test seam only: the real path
 	// needs a live Client under the channel and a provider to answer, and what
@@ -18014,9 +18095,14 @@ func newMultiClientChannel(
 		receivingSiblingsFunc:     receivingSiblingsFunc,
 		qualificationRefreshFunc:  qualificationRefreshFunc,
 		sendStallWake:             args.sendStallWake,
+		uplinkLastIngressFunc:     args.uplinkLastIngress,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
+	// The eviction notice of a receive hole that outlived GapTimeout
+	// (receiveGapTimedOut). Installed before the first ping and before the
+	// receive callback, so no sequence of this client can time out without it.
+	client.setReceiveGapTimeoutCallback(clientChannel.receiveGapTimedOut)
 
 	// The window-owned callback includes this channel's identity so a typed
 	// reliability failure can retire only its source. Direct constructor users
@@ -19528,10 +19614,16 @@ const (
 // handshake can land in that small transition window and inherit the exact
 // exit the verdict proved receive-silent. The follow arguments remain in the
 // signature for source/settings compatibility but no longer override a
-// quarantine for a newly-created flow.
+// quarantine for a newly-created flow. An exit that has stopped making
+// progress refuses too, until it moves again
+// (ip_remote_multi_client_exit_stall.go). Must not be called with this
+// channel's stateLock held.
 func (self *multiClientChannel) affinityDonorEligible(followQuarantine bool, window time.Duration) donorVerdict {
 	_ = followQuarantine
 	_ = window
+	if self.placementStalled(time.Now()) {
+		return donorRefused
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if self.warning {

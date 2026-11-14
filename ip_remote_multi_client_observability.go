@@ -237,6 +237,9 @@ func relRemovalReason(err error) string {
 	if strings.HasPrefix(message, "send stalled") {
 		return "send-stalled"
 	}
+	if receiveGapTimeoutErr(err) {
+		return "receive-gap"
+	}
 	return relFirstToken(message)
 }
 
