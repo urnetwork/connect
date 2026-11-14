@@ -12398,6 +12398,55 @@ paths:
         "503":
           description: A restore, or a state the server has not loaded, with Retry-After.
 
+  /network/dns/label-reclaim:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Re-bind a name after a restore
+      description: |
+        After a Postgres restore only: binds an ownerless `retiring` name, which
+        the restore's CT replay found logged and the restored rows lacked, back
+        to the caller's network, as its label when it holds none in the root,
+        else as its alias. The body names the name, the network, the restore's
+        incident id, the CT-logged leaf certificate naming it, and a signature by
+        that leaf's P-256 key over `("urnetwork-sidecar-v1/label-reclaim", name,
+        network_id, incident_id)`, each part a 2-byte big-endian length then its
+        bytes. A signature for another name, network or incident, a leaf the
+        replay did not record, or a name that is not ownerless and retiring is
+        refused, and nothing is written. The DNS permission by the role gate.
+      operationId: networkDnsLabelReclaim
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsLabelReclaimRequest"
+      responses:
+        "200":
+          description: The name is the network's again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsLabelReclaimAnswer"
+        "400":
+          description: A body or name the route does not take.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: The name is not ownerless and retiring, or the network holds a label and an alias already.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The label tables or the dns root are not available.
+
   /auth/sso-discover:
     post:
       x-internal: true
@@ -14214,6 +14263,103 @@ paths:
           description: A token the block refuses.
         "503":
           description: The zone tables or the dns gate are not available.
+
+  /dns/label-reclaim:
+    servers:
+      - url: https://dns.bringyour.com
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Re-bind a name after a restore, from a sidecar
+      description: |
+        The body and checks of `POST /network/dns/label-reclaim`, from a sidecar
+        whose service token, aud `dns`, names the tuple's network: a tuple for
+        another network is refused 403. A device runs it once §19.10's rows step
+        shows its stored label gone, after it re-registers.
+      operationId: dnsLabelReclaim
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsLabelReclaimRequest"
+      responses:
+        "200":
+          description: The name is the network's again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsLabelReclaimAnswer"
+        "401":
+          description: A token the block refuses.
+        "403":
+          description: The tuple names another network, or the leaf, key or signature does not prove it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "409":
+          description: The name is not ownerless and retiring.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The label tables or the dns gate are not available.
+
+  /dns/key-record:
+    servers:
+      - url: https://dns.bringyour.com
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Publish a mail receiver's TLSA
+      description: |
+        The only TLSA writer. A receiver holding §8's `listen` on
+        `sock:smtp/25/mx` posts its P-256 key's DER SubjectPublicKeyInfo with a
+        `TlsKeyAttestation` its identity key signed for that key and the host's
+        identifier set; the block writes TLSA `3 1 1` for it at `_25._tcp.mx`,
+        one value a published receiver key, TTL 300, with an admin event and a
+        hint to the network's sidecars. A key the attestation does not cover, or
+        a caller that is no active sidecar of the network, is refused with
+        nothing written. Posting a published key again changes nothing, as a
+        restore's re-registration does. A scope's `mx.<scope>` answers 503 until
+        the gate can name the scope's member. A receiver's removal deletes its
+        TLSA in the removal's own transaction.
+      operationId: dnsKeyRecord
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsKeyRecordRequest"
+      responses:
+        "200":
+          description: The host's TLSA holds the key. The zone's version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsKeyRecordAnswer"
+        "400":
+          description: A host other than mx or mx.<scope>, or a key that is not P-256.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "401":
+          description: A token the block refuses.
+        "403":
+          description: No listen grant, or the attestation does not prove the key is the caller's.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The gate has not loaded the network, or the tables or the dns gate are not available.
 
   /tls/cert-order:
     post:
@@ -28745,6 +28891,57 @@ components:
           format: int64
         entry_limit:
           description: dns_entries' limit, -1 for none.
+          type: integer
+          format: int64
+    DnsLabelReclaimRequest:
+      type: object
+      required: [name, network_id, incident_id, leaf, signature]
+      properties:
+        name:
+          description: The name as CT logs it, <label>.<root>, lowercase with no final dot.
+          type: string
+        network_id:
+          type: string
+        incident_id:
+          description: The restore's incident id, the tuple's nonce.
+          type: string
+        leaf:
+          description: The CT-logged leaf certificate's DER, base64.
+          type: string
+          format: byte
+        signature:
+          description: The leaf key's ASN.1 ECDSA signature over SHA-256 of the tuple, base64.
+          type: string
+          format: byte
+    DnsLabelReclaimAnswer:
+      type: object
+      required: [name, kind]
+      properties:
+        name:
+          type: string
+        kind:
+          description: label or alias.
+          type: string
+    DnsKeyRecordRequest:
+      type: object
+      required: [host, spki, attestation]
+      properties:
+        host:
+          description: mx, or mx.<scope>.
+          type: string
+        spki:
+          description: The receiver key's DER SubjectPublicKeyInfo, base64.
+          type: string
+          format: byte
+        attestation:
+          description: The encoded Signed TlsKeyAttestation by the caller's identity key, base64.
+          type: string
+          format: byte
+    DnsKeyRecordAnswer:
+      type: object
+      required: [version]
+      properties:
+        version:
           type: integer
           format: int64
     DnsApiErrorBody:
