@@ -61,8 +61,9 @@ func htonl(x uint32) uint32 {
 //
 // The error travels back through egressControl to net.Dialer.Control, so the
 // dial fails and shows up in the existing [net]dial log line. A failed dial
-// retries; an unpinned socket blackholes.
-func applyEgressInterface(fd uintptr, index4 uint32, index6 uint32) error {
+// retries; an unpinned socket blackholes. The egress mark is Linux's
+// (egress_linux.go) and has no effect here.
+func applyEgressInterface(fd uintptr, index4 uint32, index6 uint32, _ uint32) error {
 	if index4 == 0 && index6 == 0 {
 		return nil
 	}

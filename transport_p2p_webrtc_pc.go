@@ -73,10 +73,11 @@ func newWebRtcPeerConnectionFactory(
 			ifc, err := net.InterfaceByName(interfaceName)
 			return err == nil && ifc.Flags&net.FlagLoopback != 0
 		})
-	} else if index4, index6 := EgressInterfaceIndex(); index4 != 0 || index6 != 0 {
-		// bind ICE sockets to the physical egress interface so p2p does not
-		// loop into the tunnel this process provides (R1); a no-op off
-		// Windows and when no egress index is set.
+	} else if egressConfigured() {
+		// bind ICE sockets to the physical egress interface, or mark them on
+		// Linux, so p2p does not loop into the tunnel this process provides
+		// (R1, QD-800); a no-op where the platform takes neither, and when no
+		// egress index or mark is set.
 		if egressNet, err := newEgressNet(log); err == nil {
 			selectedNet = egressNet
 		} else {

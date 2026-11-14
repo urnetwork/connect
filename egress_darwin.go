@@ -16,8 +16,9 @@ import (
 // The socket family is not available to the Control callback, so both options
 // are attempted. A single success is sufficient; if both applicable attempts
 // fail, using the socket would silently route the provider back into the client
-// tunnel and invalidate the peer-to-peer test.
-func applyEgressInterface(fd uintptr, index4 uint32, index6 uint32) error {
+// tunnel and invalidate the peer-to-peer test. The egress mark is Linux's
+// (egress_linux.go) and has no effect here.
+func applyEgressInterface(fd uintptr, index4 uint32, index6 uint32, _ uint32) error {
 	attempted := 0
 	var lastErr error
 	if index4 != 0 {

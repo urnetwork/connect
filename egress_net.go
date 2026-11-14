@@ -11,10 +11,11 @@ import (
 )
 
 // egressNet is a pion transport.Net that binds the UDP sockets pion creates for
-// ICE to the egress interface, so p2p (webrtc) traffic does not loop back into
-// the tunnel this process provides (R1). It embeds the standard net and only
-// overrides socket creation; a no-op unless an egress index is set / off
-// Windows.
+// ICE to the egress interface, or marks them with the egress mark on Linux, so
+// p2p (webrtc) traffic does not loop back into the tunnel this process provides
+// (R1, QD-800). It embeds the standard net and only overrides socket creation;
+// a no-op unless an egress index or mark is set, and where the platform takes
+// neither.
 type egressNet struct {
 	transport.Net
 	log Logger
