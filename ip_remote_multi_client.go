@@ -3622,7 +3622,32 @@ func performanceProfilesEqual(a *PerformanceProfile, b *PerformanceProfile) bool
 	return a.WindowSize == b.WindowSize
 }
 
-// Installs the profile on every window and resets the windows. A profile that
+// Whether the window clients installed under the previous profile cannot carry
+// the next one. A client keeps what it was built with (newMultiClientChannel):
+// fail-closed sessions only when post-quantum encryption was on, and direct
+// streams when direct mode was on. A post-quantum toggle, either way,
+// regenerates every window so all of them select under the current setting
+// (owner decision D12.3, server FP2-PROTOCOL.md §12.5); turning direct mode off
+// must end every direct stream now, since a direct stream shows the provider
+// the user's own address. Any other change -- the window type, the window size
+// and Fixed IP, or direct mode turned on -- the installed clients carry as they
+// are: each window takes the new profile and its resize pass grows or drains
+// it to the new target, so exits that work keep their flows. On 2026-11-13 two
+// profile changes on an iOS tunnel retired all 17 working exits and reset 400
+// flows at once.
+func performanceProfileRetiresClients(previous *PerformanceProfile, next *PerformanceProfile) bool {
+	allowDirect := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.AllowDirect
+	}
+	postQuantumEncryption := func(profile *PerformanceProfile) bool {
+		return profile != nil && profile.PostQuantumEncryption
+	}
+	return postQuantumEncryption(previous) != postQuantumEncryption(next) ||
+		(allowDirect(previous) && !allowDirect(next))
+}
+
+// Installs the profile on every window, and retires the windows' clients only
+// when they cannot carry it (performanceProfileRetiresClients). A profile that
 // does not validate is refused with its error and the previous profile stays in
 // force: the window size comes from the caller, and a bad one must never panic
 // the connection or reach the windows.
@@ -3635,13 +3660,13 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		}
 	}
 
-	// an equivalent profile is a no-op: shuffle() below retires every window
-	// client, and presentation code commonly re-applies an equal profile on
-	// resume -- that must not tear the window down
+	// an equivalent profile is a no-op: presentation code commonly re-applies
+	// an equal profile on resume, and that must not touch the windows
 	if performanceProfilesEqual(self.config.Load().performanceProfile, performanceProfile) {
 		return nil
 	}
 
+	var previousPerformanceProfile *PerformanceProfile
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -3649,6 +3674,7 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		// rebuild the immutable config snapshot under the lock so concurrent
 		// setters do not lose each other's field
 		prev := self.config.Load()
+		previousPerformanceProfile = prev.performanceProfile
 		self.config.Store(&multiClientConfig{
 			performanceProfile:  performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
@@ -3656,7 +3682,8 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			blocker:             prev.blocker,
 		})
 	}()
-	// before the reset windows discover again
+	retire := performanceProfileRetiresClients(previousPerformanceProfile, performanceProfile)
+	// before the windows discover again
 	self.syncGeneratorPostQuantumEncryption()
 	// the normal windows first, so the limited window, which sizes itself
 	// from their next passes (limitedWindowSizing), never reads a sizing of
@@ -3664,8 +3691,9 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 		if window := self.windows[windowType]; window != nil {
 			window.SetPerformanceProfile(performanceProfile)
-			// reset the window
-			window.shuffle()
+			if retire {
+				window.shuffle()
+			}
 		}
 	}
 	return nil

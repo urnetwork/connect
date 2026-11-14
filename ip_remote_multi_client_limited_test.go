@@ -785,11 +785,14 @@ func TestNamedLookupsTakeTheFreshLabels(t *testing.T) {
 
 // --- profile changes ---
 
-// A profile change regenerates the limited window with the normal windows:
-// its clients are cancelled, its requests carry the new profile's rank mode,
-// its target is recomputed from the normal windows' passes under the new
-// profile, never from their sizing under the old one, and an equal profile
-// changes nothing. A post-quantum toggle is a profile change (§12.5).
+// A profile change reaches the limited window with the normal windows: its
+// requests carry the new profile's rank mode, and its target is recomputed
+// from the normal windows' passes under the new profile, never from their
+// sizing under the old one. The windows' clients are cancelled only when they
+// cannot carry the new profile (performanceProfileRetiresClients): a
+// post-quantum toggle either way regenerates every window (§12.5), and so does
+// direct mode turned off; a window type or size change and direct mode turned
+// on keep them. An equal profile changes nothing.
 func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -826,12 +829,17 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 		name     string
 		profile  *PerformanceProfile
 		rankMode string
+		retires  bool
 	}{
 		{name: "auto to fixed speed", profile: fixedSpeed, rankMode: "speed"},
 		{name: "fixed speed to auto", profile: nil, rankMode: "quality"},
 		{name: "auto to fixed quality", profile: fixedQuality, rankMode: "quality"},
 		{name: "fixed quality to fixed speed", profile: fixedSpeed, rankMode: "speed"},
-		{name: "post-quantum on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed"},
+		{name: "direct on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, AllowDirect: true}, rankMode: "speed"},
+		{name: "direct off", profile: fixedSpeed, rankMode: "speed", retires: true},
+		{name: "post-quantum on", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed", retires: true},
+		{name: "post-quantum off", profile: fixedSpeed, rankMode: "speed", retires: true},
+		{name: "post-quantum on again", profile: &PerformanceProfile{WindowType: WindowTypeSpeed, WindowSize: fixedSpeed.WindowSize, PostQuantumEncryption: true}, rankMode: "speed", retires: true},
 	}
 	// the normal windows' sizing as their passes under the profile in force
 	// published it, which sizes the limited window to 6
@@ -849,8 +857,8 @@ func TestProfileChangeRegeneratesTheLimitedWindow(t *testing.T) {
 			t.Fatalf("%s: %v", step.name, err)
 		}
 		for windowType, client := range clients {
-			if !client.IsDone() {
-				t.Errorf("%s: the %s window's client was not cancelled", step.name, windowStatsWindowOf(windowType))
+			if client.IsDone() != step.retires {
+				t.Errorf("%s: the %s window's client cancelled=%t, want %t", step.name, windowStatsWindowOf(windowType), client.IsDone(), step.retires)
 			}
 		}
 		if size := windows[WindowTypeLimited].limitedWindowSize(); size.WindowSizeMax != 0 {
