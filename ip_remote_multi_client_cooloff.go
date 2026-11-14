@@ -372,7 +372,8 @@ func (self *multiClientWindow) verdictJudgeable(client *multiClientChannel) bool
 
 // Whether a removal's error is a verdict against the provider: a blackhole
 // verdict, or a send-stall conviction, which is admitted only while a sibling
-// exit receives.
+// exit receives, or a receive gap eviction, which is admitted only while the
+// tunnel receives (ip_remote_multi_client_exit_stall.go).
 func providerVerdictErr(err error) bool {
-	return blackholeVerdictErr(err) || err != nil && strings.HasPrefix(err.Error(), "send stalled")
+	return blackholeVerdictErr(err) || err != nil && strings.HasPrefix(err.Error(), "send stalled") || receiveGapTimeoutErr(err)
 }

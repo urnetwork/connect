@@ -2349,6 +2349,11 @@ type Client struct {
 	networkQuality           *clientNetworkQualityState
 	sequenceCloser           *sequenceCloser
 
+	// The receive gaps this client holds open from its peers, and its owner's
+	// notice for one that times out (transfer_receive_gap.go).
+	receiveGaps               receiveGapRegistry
+	receiveGapTimeoutCallback atomic.Pointer[receiveGapTimeoutFunction]
+
 	// ready is closed by NewClientWithTag right before it returns, once every
 	// manager, buffer, callback, and the `run` loop are wired up. See
 	// ReadyNotify for the gating contract.
@@ -16633,6 +16638,9 @@ type ReceiveSequence struct {
 
 	receiveQueue       *receiveQueue
 	nextSequenceNumber uint64
+	// When the earliest item past the open hole arrived, as last published to
+	// the client (publishReceiveGap); zero with no hole. Owned by Run.
+	publishedGapSince time.Time
 
 	idleCondition *IdleCondition
 
@@ -17318,6 +17326,8 @@ func (self *ReceiveSequence) Run() {
 		}
 	}()
 	defer func() {
+		// an ended sequence holds no hole open for its owner
+		self.publishReceiveGap(time.Time{})
 		// deliver-then-die: an exit path (error, idle, cancel) must not strand
 		// buffered head items — deliver their frames, send their acks, and
 		// return their pool buffers
@@ -17951,6 +17961,8 @@ func (self *ReceiveSequence) Run() {
 		var timeout time.Duration
 		// the earliest hole's absolute deadline; zero when none
 		var gapDeadline time.Time
+		// when the earliest item past that hole arrived; zero when none
+		var gapSince time.Time
 		var expiredGap *receiveItem
 		deliveryBlocked := false
 
@@ -18017,9 +18029,11 @@ func (self *ReceiveSequence) Run() {
 							}
 						}
 						expiredGap = item
+						gapSince = item.receiveTime
 						break
 					}
 					gapDeadline = itemGapDeadline
+					gapSince = item.receiveTime
 					if itemGapTimeout < timeout {
 						timeout = itemGapTimeout
 					}
@@ -18085,6 +18099,9 @@ func (self *ReceiveSequence) Run() {
 				self.commitHeldPrefix()
 			}
 		}
+		// the owner reads how long the peer's stream has been frozen behind
+		// this hole (transfer_receive_gap.go); stored only when it changes
+		self.publishReceiveGap(gapSince)
 
 		processPack := func(receivePack *ReceivePack, ok bool) bool {
 			if !ok {
@@ -18207,6 +18224,9 @@ func (self *ReceiveSequence) Run() {
 				return
 			}
 			self.log.Errorf("[r]%s<-%s s(%s) exit gap timeout expected=%d queued=%d age=%s budget=%s\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, self.nextSequenceNumber, expiredGap.sequenceNumber, time.Since(gapHandoff.receivedAt), self.receiveBufferSettings.GapTimeout)
+			// the eviction notice: the peer's return stream on this sequence
+			// stays frozen, so its owner moves the flows instead of waiting
+			self.client.receiveGapTimedOut(self.source)
 			return
 		}
 
