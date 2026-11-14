@@ -440,7 +440,7 @@ func TestExtenderDirectoryEventRingIsBounded(t *testing.T) {
 	now := clock.Now()
 
 	// each apply is a distinct key, so every one is a real change and an event
-	applyCount := ExtenderDirectoryEventRingCount + 64
+	applyCount := DefaultExtenderDirectorySettings().EventRingCount + 64
 	for i := 0; i < applyCount; i += 1 {
 		publicKey := newTestExtenderKey(t)
 		record := signTestRecord(
@@ -456,10 +456,10 @@ func TestExtenderDirectoryEventRingIsBounded(t *testing.T) {
 		}
 	}
 	eventCount := directory.EventCountSince(now.Add(-time.Hour))
-	if eventCount != ExtenderDirectoryEventRingCount {
+	if eventCount != DefaultExtenderDirectorySettings().EventRingCount {
 		t.Fatalf(
 			"the ring holds %d events after %d applies, expected the cap %d",
-			eventCount, applyCount, ExtenderDirectoryEventRingCount)
+			eventCount, applyCount, DefaultExtenderDirectorySettings().EventRingCount)
 	}
 }
 

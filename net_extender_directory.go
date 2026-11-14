@@ -93,14 +93,6 @@ const ExtenderDirectoryStoreVersion = 1
 // version is skipped alone: the records and addresses beside it still load.
 const extenderDirectoryStoreCountryHintVersion = 1
 
-// The bounded buffer of one Subscribe consumer (D4). A consumer that falls
-// this far behind is cut off rather than waited on.
-const ExtenderDirectorySubscribeBufferCount = 64
-
-// Cap of the apply-time ring (K4). The window prunes it long before this on
-// any normal feed; the cap is what bounds a flood.
-const ExtenderDirectoryEventRingCount = 1024
-
 // The answer to a record or revocation whose verification began before a
 // reset and ended after it (Reset): it is not applied.
 var errExtenderDirectoryReset = errors.New("the extender directory was reset while the message was verified")
@@ -190,6 +182,15 @@ type ExtenderDirectorySettings struct {
 	// kept and reported over (K4). The app panel shows the count over the
 	// last minute, which is the default.
 	EventWindowTimeout time.Duration
+	// The cap of the apply-time ring (K4): 1024. The window prunes it long
+	// before this on any normal feed; the cap is what bounds a flood.
+	// Non-positive keeps none, so the panel's count reads 0.
+	EventRingCount int
+	// The bounded buffer of one Subscribe consumer (D4): 64 messages. A
+	// consumer that falls this far behind is cut off rather than waited on.
+	// Non-positive buffers none, so a consumer not already waiting for its
+	// next message is cut off.
+	SubscribeBufferCount int
 	// A latency sample older than this counts as never measured
 	// (DESIGNNOTES4.md §4): the ordering stops trusting it and a probe pass
 	// measures the address again. The default is half the day the operator
@@ -277,6 +278,8 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		MaxActiveRecordCount:           512,
 		SaveTimeout:                    1 * time.Second,
 		EventWindowTimeout:             60 * time.Second,
+		EventRingCount:                 1024,
+		SubscribeBufferCount:           64,
 		LatencyMaxAge:                  12 * time.Hour,
 		ExtenderLimitedBackoff:         30 * time.Second,
 		ExtenderLimitedSettings:        DefaultExtenderLimitedSettings(),
@@ -991,7 +994,7 @@ func (self *ExtenderDirectory) applyVerifiedRevocation(
 // closed by an overflow.
 func (self *ExtenderDirectory) Subscribe() (<-chan *protocol.ExtenderGossipMessage, func()) {
 	subscription := &extenderDirectorySubscription{
-		messages: make(chan *protocol.ExtenderGossipMessage, ExtenderDirectorySubscribeBufferCount),
+		messages: make(chan *protocol.ExtenderGossipMessage, max(0, self.settings.SubscribeBufferCount)),
 	}
 	func() {
 		self.stateLock.Lock()
@@ -2910,8 +2913,8 @@ func (self *ExtenderDirectory) pruneEventsWithLock(now time.Time) {
 	for self.eventHead < len(self.eventTimes) && self.eventTimes[self.eventHead].Before(windowStartTime) {
 		self.eventHead += 1
 	}
-	if ExtenderDirectoryEventRingCount < len(self.eventTimes)-self.eventHead {
-		self.eventHead = len(self.eventTimes) - ExtenderDirectoryEventRingCount
+	if ringCount := max(0, self.settings.EventRingCount); ringCount < len(self.eventTimes)-self.eventHead {
+		self.eventHead = len(self.eventTimes) - ringCount
 	}
 	if 0 < self.eventHead && len(self.eventTimes) <= 2*self.eventHead {
 		keptCount := copy(self.eventTimes, self.eventTimes[self.eventHead:])

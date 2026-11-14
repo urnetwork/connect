@@ -1102,7 +1102,7 @@ func TestExtenderDirectorySubscribeDeliversAndCutsOff(t *testing.T) {
 
 	// fill the buffer without reading: one message over it cuts the
 	// subscription off rather than holding the apply
-	for i := 0; i <= ExtenderDirectorySubscribeBufferCount; i += 1 {
+	for i := 0; i <= DefaultExtenderDirectorySettings().SubscribeBufferCount; i += 1 {
 		overflowKey := newTestExtenderKey(t)
 		overflowRecord := signTestRecord(
 			t,
@@ -1117,7 +1117,7 @@ func TestExtenderDirectorySubscribeDeliversAndCutsOff(t *testing.T) {
 		}
 	}
 	closed := false
-	for range ExtenderDirectorySubscribeBufferCount + 2 {
+	for range DefaultExtenderDirectorySettings().SubscribeBufferCount + 2 {
 		if _, ok := <-messages; !ok {
 			closed = true
 			break

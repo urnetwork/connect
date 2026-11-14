@@ -1,12 +1,14 @@
 // The extender protocol's limits and a client's treatment of a 429 are settings
 // objects (QD-702): every check reads the instance it is handed or its owner
-// carries, and the defaults are A3's and A12's.
+// carries, and the defaults are A3's and A12's. So are the directory's counts
+// and the alt dialers' priorities, which the same change moved.
 
 package connect
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -215,5 +217,70 @@ func TestExtenderLimitedBackoffJitterFollowsSettings(t *testing.T) {
 	huge := DefaultExtenderLimitedSettings().JitterBackoff(time.Duration(math.MaxInt64), 0)
 	if huge < time.Duration(math.MaxInt64)/2-1 {
 		t.Fatalf("a huge backoff wrapped to %s", huge)
+	}
+}
+
+// A directory caps its event ring and a consumer's buffer at its own settings'
+// counts.
+func TestExtenderDirectoryReadsItsCounts(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
+		settings.EventWindowTimeout = time.Hour
+		settings.MaxAddressCount = 0
+		settings.EventRingCount = 8
+		settings.SubscribeBufferCount = 2
+	})
+	messages, unsubscribe := directory.Subscribe()
+	defer unsubscribe()
+	AssertEqual(t, cap(messages), 2)
+	now := clock.Now()
+	apply := func(i int) {
+		record := signTestRecord(
+			t,
+			rootPrivateKey,
+			newTestExtenderKey(t),
+			now.Add(time.Duration(i)*time.Millisecond),
+			now.Add(time.Hour),
+			testExtenderAddress(fmt.Sprintf("192.0.2.%d", i)),
+		)
+		if _, err := directory.ApplyRecord(record, ExtenderSourceGossip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// two fit the consumer's buffer while it reads nothing
+	apply(0)
+	apply(1)
+	AssertEqual(t, len(messages), 2)
+	// a third cuts it off, its queue voided
+	apply(2)
+	_, ok := <-messages
+	AssertEqual(t, ok, false)
+
+	for i := 3; i < 12; i += 1 {
+		apply(i)
+	}
+	AssertEqual(t, directory.EventCountSince(now.Add(-time.Hour)), 8)
+}
+
+// The alt dialers, whose QUIC socket is the extender carrier's, take their
+// priorities and minimum weight from the strategy's settings, L4's by default.
+func TestAltDialersTakeTheirPrioritiesFromSettings(t *testing.T) {
+	settings := DefaultClientStrategySettings()
+	AssertEqual(t, settings.AltH3DialerPriority, 60)
+	AssertEqual(t, settings.AltWhodisDialerPriority, 130)
+	AssertEqual(t, settings.AltDialerMinimumWeight, float32(0.25))
+
+	settings.AltUrl = "https://alt.example"
+	settings.AltH3DialerPriority = 61
+	settings.AltWhodisDialerPriority = 131
+	settings.AltDialerMinimumWeight = 0.5
+	dialers := newAltDialers(nil, settings)
+	AssertEqual(t, len(dialers), 2)
+	AssertEqual(t, dialers[0].description, "alt h3")
+	AssertEqual(t, dialers[0].priority, 61)
+	AssertEqual(t, dialers[1].description, "alt whodis")
+	AssertEqual(t, dialers[1].priority, 131)
+	for _, dialer := range dialers {
+		AssertEqual(t, dialer.minimumWeight, float32(0.5))
 	}
 }

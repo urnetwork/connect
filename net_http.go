@@ -57,6 +57,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		DohSettings: DefaultDohSettings(),
 		DnsTlds:     [][]byte{[]byte(DefaultExtenderDnsTld)},
 
+		AltH3DialerPriority:     60,
+		AltWhodisDialerPriority: 130,
+		AltDialerMinimumWeight:  0.25,
+
 		HelloRetryTimeout: 5 * time.Second,
 		// API calls return JSON/control data rather than streamed payloads;
 		// larger payloads must use an explicitly streaming transport
@@ -186,6 +190,16 @@ type ClientStrategySettings struct {
 	// The encoding tlds of the alt whodis dialer, one picked at random per
 	// dial. Empty takes `DefaultExtenderDnsTld`.
 	DnsTlds [][]byte
+	// The priorities of the two alt dialers among the strategy's (L4): alt h3
+	// runs after the tcp dialers (0 to 50) and before the extender carriers
+	// (100, 110, 120), at 60; alt whodis runs last, at 130, since it is the
+	// slowest path and the one that looks least like ordinary traffic.
+	AltH3DialerPriority     int
+	AltWhodisDialerPriority int
+	// The alt dialers' minimum weight, the same floor the resilient dialers
+	// carry, 0.25: a path that is never chosen while direct tcp works must
+	// still be tried often enough to learn that it works when tcp stops.
+	AltDialerMinimumWeight float32
 
 	DohSettings *DohSettings
 	// Refuses DoH servers other than the built-in ones, whatever path they

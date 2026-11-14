@@ -228,7 +228,7 @@ func TestGossipFeedDisconnectsASlowSubscriber(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-barrier.entered
-	for i := range connect.ExtenderDirectorySubscribeBufferCount + 1 {
+	for i := range connect.DefaultExtenderDirectorySettings().SubscribeBufferCount + 1 {
 		record := signTestRecord(
 			t,
 			rootKey,

@@ -450,11 +450,11 @@ func TestExtenderFeedCountsAreTheDesignBounds(t *testing.T) {
 	if ExtenderKeyIdByteCount != 8 {
 		t.Errorf("the key id is %d bytes", ExtenderKeyIdByteCount)
 	}
-	if ExtenderDirectoryEventRingCount != 1024 {
-		t.Errorf("the event ring is %d", ExtenderDirectoryEventRingCount)
+	if DefaultExtenderDirectorySettings().EventRingCount != 1024 {
+		t.Errorf("the event ring is %d", DefaultExtenderDirectorySettings().EventRingCount)
 	}
-	if ExtenderDirectorySubscribeBufferCount != 64 {
-		t.Errorf("the subscribe buffer is %d", ExtenderDirectorySubscribeBufferCount)
+	if DefaultExtenderDirectorySettings().SubscribeBufferCount != 64 {
+		t.Errorf("the subscribe buffer is %d", DefaultExtenderDirectorySettings().SubscribeBufferCount)
 	}
 	if extenderHelloMaxByteCount != 64*1024 {
 		t.Errorf("the hello read ceiling is %d", extenderHelloMaxByteCount)

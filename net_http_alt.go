@@ -34,20 +34,8 @@ import (
 // teardown. The whodis dialer races 53 before 4053, so a network that passes
 // public dns still reaches alt on the port the router forwards.
 
-// The dialer priorities of L4: alt h3 runs after the tcp dialers (0 to 50) and
-// before the extender carriers (100, 110, 120); alt whodis runs last, since it
-// is the slowest path and the one that looks least like ordinary traffic.
-const (
-	altH3DialerPriority     = 60
-	altWhodisDialerPriority = 130
-)
-
-// The alt dialers' minimum weight, the same floor the resilient dialers carry:
-// a path that is never chosen while direct tcp works must still be tried often
-// enough to learn that it works when tcp stops.
-const altDialerMinimumWeight = 0.25
-
-// newAltDialers builds the two api-only alt dialers of one strategy (L4). None
+// newAltDialers builds the two api-only alt dialers of one strategy (L4), at
+// the priorities and minimum weight the strategy's settings give them. None
 // when no alt url is configured, which is every space that has not deployed
 // alt yet.
 func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySettings) []*clientDialer {
@@ -61,14 +49,14 @@ func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySetti
 		priority    int
 		whodis      bool
 	}{
-		{description: "alt h3", priority: altH3DialerPriority, whodis: false},
-		{description: "alt whodis", priority: altWhodisDialerPriority, whodis: true},
+		{description: "alt h3", priority: settings.AltH3DialerPriority, whodis: false},
+		{description: "alt whodis", priority: settings.AltWhodisDialerPriority, whodis: true},
 	} {
 		whodis := altDialer.whodis
 		dialers = append(dialers, &clientDialer{
 			description:   altDialer.description,
 			createTime:    time.Now(),
-			minimumWeight: altDialerMinimumWeight,
+			minimumWeight: settings.AltDialerMinimumWeight,
 			priority:      altDialer.priority,
 			// no dialTlsContext: there is no websocket over alt from here
 			httpClientFactory: func() *http.Client {
