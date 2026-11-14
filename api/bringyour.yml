@@ -10368,6 +10368,29 @@ paths:
           description: Out of scope, or not epoch `n`'s uploader.
         "429":
           description: Queued out by the write budget.
+    head:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Whether epoch n's Welcome stands
+      description: |
+        Answers whether epoch `n`'s Welcome has been stored, with no body. A
+        writer leaf that took an Add another leaf uploaded asks once, ten
+        minutes after the epoch, and on a 404 removes and adds the joiner again.
+        Needs `rw`, as storing the Welcome does.
+      operationId: gkmWelcomeStands
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/GkmGroupId"
+        - $ref: "#/components/parameters/GkmEpoch"
+      responses:
+        "200":
+          description: The Welcome stands.
+        "403":
+          description: Out of scope.
+        "404":
+          description: No Welcome is stored for epoch `n`.
 
   /gkm/groups/{group_id}/group-info:
     servers:
