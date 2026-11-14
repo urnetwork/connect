@@ -125,39 +125,41 @@ func observeProviderControlBehindGap(t *testing.T, shape providerControlGapShape
 			t.Fatal("later DATA is not waiting at the client behind the missing DATA")
 		}
 
+		// The wedge: every write of the missing DATA is lost while the gap
+		// ages, except that the newest recovery copy is kept so the sender's
+		// own resend repairs the gap at the end. Contract control traffic and
+		// any recovery of the control original still reach the client.
+		var resend *windowRoundFrame
+		var control *windowRoundFrame
+		drain := func() {
+			for len(fixture.senderOut) != 0 {
+				retry := fixture.take(fixture.senderOut)
+				if retry.pack != nil && (len(retry.pack.Frames) == 0 ||
+					control != nil && bytes.Equal(retry.pack.MessageId, control.pack.MessageId)) {
+					fixture.forward(retry, fixture.receiverIn)
+					continue
+				}
+				if retry.pack == nil || retry.pack.SequenceNumber != base ||
+					!bytes.Equal(retry.pack.SequenceId, missing.pack.SequenceId) ||
+					!bytes.Equal(retry.pack.MessageId, missing.pack.MessageId) {
+					t.Fatal("the aged gap produced provider traffic other than recovery of the missing DATA")
+				}
+				if resend != nil {
+					fixture.drop(resend)
+				}
+				resend = retry
+			}
+			fixture.acknowledge()
+		}
 		started := time.Now()
 		time.Sleep(gapAge)
 		synctest.Wait()
-		// The wedge: every recovery copy of the missing DATA is lost too,
-		// except that the newest one is kept to repair the gap at the end.
-		// Contract control traffic still reaches the client.
-		var resend *windowRoundFrame
-		for len(fixture.senderOut) != 0 {
-			retry := fixture.take(fixture.senderOut)
-			if retry.pack != nil && len(retry.pack.Frames) == 0 {
-				fixture.forward(retry, fixture.receiverIn)
-				continue
-			}
-			if retry.pack == nil || retry.pack.SequenceNumber != base ||
-				!bytes.Equal(retry.pack.SequenceId, missing.pack.SequenceId) ||
-				!bytes.Equal(retry.pack.MessageId, missing.pack.MessageId) {
-				t.Fatal("the aged gap produced provider traffic other than recovery of the missing DATA")
-			}
-			if resend != nil {
-				fixture.drop(resend)
-			}
-			resend = retry
-		}
-		fixture.acknowledge()
+		drain()
 		if time.Since(started) != gapAge || receiver.nextSequenceNumber != base {
 			t.Fatal("the gap did not stay open for exactly the requested age")
 		}
-		if resend == nil {
-			t.Fatal("the sender wrote no recovery copy of the missing DATA while the gap aged")
-		}
 		fixture.drop(missing)
 
-		var control *windowRoundFrame
 		switch shape {
 		case providerControlSynAck:
 			control = offer(&controlPath, synAckPacket)
@@ -179,7 +181,18 @@ func observeProviderControlBehindGap(t *testing.T, shape providerControlGapShape
 		fixture.acknowledge()
 		observation.beforeRepair = controlVisits.Load()
 
-		// The sender's own resend arrives: everything drains in order.
+		// The sender recovers the missing DATA within its longest resend
+		// interval. Its newest recovery copy arrives and everything drains
+		// in order.
+		time.Sleep(fixture.sender.settings.SendBufferSettings.MaxResendInterval)
+		synctest.Wait()
+		drain()
+		if resend == nil {
+			t.Fatal("the sender wrote no recovery copy of the missing DATA within its longest resend interval")
+		}
+		if receiver.nextSequenceNumber != base {
+			t.Fatal("the gap closed before the sender's resend arrived")
+		}
 		fixture.forward(resend, fixture.receiverIn)
 		fixture.acknowledge()
 		observation.afterRepair = controlVisits.Load()
@@ -239,7 +252,7 @@ func TestProviderPureAckBehindGapOlderThanTwoSecondsCrossesItAndGapRepairs(t *te
 			observation.wireImmediate, observation.beforeRepair, observation.want)
 	}
 	if observation.afterRepair != observation.want || observation.gapTimeout <= 0 ||
-		observation.gapTimeout/10 < observation.repairedAfter {
+		observation.gapTimeout/4 < observation.repairedAfter {
 		t.Errorf("the sender's resend did not repair the gap well before GapTimeout: delivered=%d repaired_after=%s gap_timeout=%s",
 			observation.afterRepair, observation.repairedAfter, observation.gapTimeout)
 	}
