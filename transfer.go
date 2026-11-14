@@ -5669,10 +5669,10 @@ type SendBufferSettings struct {
 	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
-	// ImmediateDeliveryMaxGapAge bounds how long a Pack may still ask its
-	// receiver for immediate delivery ahead of a gap. The gap's age is that
-	// of the oldest outstanding Pack without a selective ACK, from its first
-	// write. Past the bound the Pack is written ordered, as every Pack was
+	// Bounds how long a Pack may still ask its receiver for immediate
+	// delivery ahead of a gap. The gap's age is that of the oldest
+	// outstanding Pack without a selective ACK, from its first write.
+	// Past the bound the Pack is written ordered, as every Pack was
 	// before immediate delivery: a gap that old is a stalled stream, and the
 	// SYN-ACKs and pure ACKs crossing it would complete handshakes and look
 	// like progress from a peer whose DATA waits for the gap timeout.
