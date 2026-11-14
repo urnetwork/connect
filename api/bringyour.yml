@@ -570,12 +570,13 @@ paths:
         ranked on three dimensions (total points, finalized epochs with points
         = "blocks", current streak of consecutive finalized epochs with points)
         with competition ranks (1, 2, 2, 4), and every ranked network is
-        listed: the pages form one continuous list. A row carries the network
-        name and the network id only when that network turned on
-        /network/points-ranking-visibility (its "show my network name"
-        switch); otherwise the row is anonymous and never identifies its
-        network. The emoji tag (/network/emoji) shows on every row that set
-        one.
+        listed: the pages form one continuous list. A block is one week; a week
+        whose points could not be awarded, or are still being awarded, does not
+        break a streak. A row carries the network name and the network id only
+        when that network turned on /network/points-ranking-visibility (its
+        "show my network name" switch); otherwise the row is anonymous and
+        never identifies its network. The emoji tag (/network/emoji) shows on
+        every row that set one.
         Each sort has its own tie-break order, every key descending, then the
         network id ascending so the order is total: `points` = (points,
         streak, blocks), `blocks` = (blocks, streak, points), `streak` =
@@ -18922,7 +18923,11 @@ components:
           description: Finalized epochs in which the network earned points
           type: integer
         streak:
-          description: Consecutive finalized epochs with points ending at the latest finalized epoch
+          description: |
+            Consecutive blocks (weeks) with points, ending at the latest
+            finalized one. A week whose points could not be awarded (its award
+            expired), or are still being awarded (the latest week, until its
+            award commits), does not break the streak, and does not add to it.
           type: integer
         longest_streak:
           description: The best streak ever (informational, never ranked)
