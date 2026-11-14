@@ -11797,6 +11797,50 @@ paths:
         "503":
           description: The rows cannot be read.
 
+  /internal/gate/edge-client:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Mint one of an edge block's platform client tokens
+      description: |
+        One client of an edge block (tlsedge, mxedge's router, smtpedge) in
+        the urnetwork-edge platform network: a short-lived client token for
+        the client whose id api derives from its own environment and the
+        asked block, host and index, creating the client on first use, so a
+        block's restart reuses its ids. The `edge` bearer only. api answers
+        only for a block its environment's `edge.yml` lists, a host among that
+        block's hosts and an index below the block's client count, and 403
+        otherwise. The token ends at `expire_time_millis` with no grace, and
+        the block asks again before then. 503 while api has no `edge.yml`,
+        its `sidecar.yml` names no urnetwork-edge network, or the client
+        cannot be minted.
+      operationId: internalGateEdgeClient
+      security:
+        - InternalGateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalGateEdgeClientArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateEdgeClientResult"
+        "400":
+          description: The body does not parse.
+        "403":
+          description: |
+            Refused: api holds no verify file, the bearer is none it holds or
+            is not the `edge` service's, the block, host or index is not one
+            `edge.yml` lists, or the derived client was removed. The body is
+            the plain text "Forbidden.".
+        "503":
+          description: The client cannot be minted now; the block asks again.
+
   /sidecar/push-token:
     post:
       x-internal: true
@@ -29190,6 +29234,35 @@ components:
         applied:
           description: False when the batch id was applied before, so nothing was applied twice.
           type: boolean
+    InternalGateEdgeClientArgs:
+      type: object
+      required: [block, host, index]
+      properties:
+        block:
+          description: The edge block, as `edge.yml` lists it.
+          type: string
+        host:
+          description: The host the block runs on, as `edge.yml` lists it.
+          type: string
+        index:
+          description: Which of the block's clients, from 0.
+          type: integer
+    InternalGateEdgeClientResult:
+      type: object
+      required: [client_id, by_client_jwt, expire_time_millis, platform_url]
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        by_client_jwt:
+          description: The client's token, which ends at `expire_time_millis` with no grace.
+          type: string
+        expire_time_millis:
+          type: integer
+          format: int64
+        platform_url:
+          description: Where the client connects.
+          type: string
     SidecarIdentityResult:
       type: object
       required:
