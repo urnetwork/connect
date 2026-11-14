@@ -284,7 +284,7 @@ func TestUpgradeMuxCoalescedForwardKeepsOptPerResponder(t *testing.T) {
 		}
 	}
 	key := NewDohKey("HTTPS", domain)
-	fl := mux.attachDnsResponder(key, responder(0x6896, 40001, false))
+	fl, _ := mux.attachDnsResponder(key, responder(0x6896, 40001, false))
 	if fl == nil {
 		t.Fatal("expected a new flight for the first responder")
 	}

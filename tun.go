@@ -128,6 +128,8 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		DialRaceTimeout:   2 * time.Second,
 		DialTimeout:       30 * time.Second,
 		DohRequestTimeout: 60 * time.Second,
+		// a tunnel that is still forming can hold a handshake's round trips
+		DohTlsTimeout: 30 * time.Second,
 
 		// the gvisor udp endpoint buffers default to 32KiB, which is too small for fast
 		// transfer; cap at 1MiB (gvisor clamps to at most 4MiB) to bound per-endpoint
@@ -211,11 +213,17 @@ type TunSettings struct {
 	// TLS + query). The IpMux sets it from DnsUpgradeSettings.ResolveTimeout so DNS resolution has
 	// a single timeout knob. 0 falls back to a default.
 	DohRequestTimeout time.Duration
+	// DohTlsTimeout bounds the tls handshake of a DoH connection through this
+	// tun's resolver. The UpgradeMux sets its in-tunnel DoH timer here
+	// (DnsUpgradeSettings.DohTlsTimeout). Zero or negative keeps the
+	// TlsTimeout of the base DohSettings.
+	DohTlsTimeout time.Duration
 
 	// DohSettings, when set, is the base settings for the tun's resolver cache — a
 	// memory-constrained consumer bounds the cache and fan-out here (see the UpgradeMux).
-	// buildDohCache copies it and overlays the tun dialer, log, timeouts, and resolver
-	// settings, so those fields of the base are ignored. nil uses DefaultDohSettings.
+	// buildDohCache copies it and overlays the tun dialer, log, request timeout, tls timeout
+	// (DohTlsTimeout, when set) and resolver settings, so those fields of the base are
+	// ignored. nil uses DefaultDohSettings.
 	DohSettings *DohSettings
 
 	UdpReceiveBufferByteCount int
@@ -1032,7 +1040,9 @@ func (self *Tun) buildDohCache(dnsResolverSettings *DnsResolverSettings, request
 	if dohSettings.RequestTimeout <= 0 {
 		dohSettings.RequestTimeout = 60 * time.Second
 	}
-	dohSettings.TlsTimeout = 30 * time.Second
+	if 0 < self.settings.DohTlsTimeout {
+		dohSettings.TlsTimeout = self.settings.DohTlsTimeout
+	}
 	dohSettings.DialContextSettings = &DialContextSettings{
 		DialContext: self.DialContext,
 		dohTun:      true,

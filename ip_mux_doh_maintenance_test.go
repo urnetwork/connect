@@ -58,11 +58,14 @@ func TestUpgradeMuxStaleDohSuccessCannotProveNewPath(t *testing.T) {
 
 func TestUpgradeMuxStaleDohFailureCannotPoisonNewPath(t *testing.T) {
 	mux := &UpgradeMux{}
+	settings := DefaultUpgradeMuxSettings()
+	mux.settings.Store(settings)
+	coldFailureCount := settings.Dns.ColdFailureCount
 	oldGeneration := mux.markTunnelDohUnproven()
 	currentGeneration := mux.markTunnelDohUnproven()
 	mux.markTunnelDohProvenForGeneration(currentGeneration)
 
-	for range tunnelDohColdFailureCount {
+	for range coldFailureCount {
 		if count := mux.recordTunnelDohFailureForGeneration(oldGeneration); count != 0 {
 			t.Fatalf("stale failure count = %d, expected 0", count)
 		}
@@ -71,7 +74,7 @@ func TestUpgradeMuxStaleDohFailureCannotPoisonNewPath(t *testing.T) {
 		t.Fatal("stale failures made the proven replacement path cold")
 	}
 
-	for range tunnelDohColdFailureCount {
+	for range coldFailureCount {
 		mux.recordTunnelDohFailureForGeneration(currentGeneration)
 	}
 	if !mux.tunnelDohCold() {

@@ -123,8 +123,8 @@ func TestDnsResponseUsable(t *testing.T) {
 }
 
 // TestDohCacheForward verifies the raw SVCB/HTTPS forward: the cache POSTs the query to the
-// remote DoH server and returns the raw response wire (from which hints parse), and does not
-// cache it (each call re-queries).
+// remote DoH server and returns the raw response wire (from which hints parse), and caches
+// an HTTPS answer as it caches an address answer (a second call is answered from the cache).
 func TestDohCacheForward(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -169,11 +169,13 @@ func TestDohCacheForward(t *testing.T) {
 		t.Fatalf("forwarded response hints = %v, want to contain 104.16.1.1", hints)
 	}
 
-	// the forward is best-effort and uncached: a second call re-queries the server
-	if _, ok := dohCache.Forward(ctx, dnsTypeHttps, "cdn.example"); !ok {
+	// an HTTPS answer is cached until its ttl: a second call does not ask the server
+	if resp, ok := dohCache.Forward(ctx, dnsTypeHttps, "cdn.example"); !ok {
 		t.Fatal("second Forward returned ok=false")
+	} else if hints := parseHttpsHints(resp); !slices.Contains(hints, netip.MustParseAddr("104.16.1.1")) {
+		t.Fatalf("cached response hints = %v, want to contain 104.16.1.1", hints)
 	}
-	AssertEqual(t, int32(2), atomic.LoadInt32(&requestCount))
+	AssertEqual(t, int32(1), atomic.LoadInt32(&requestCount))
 }
 
 func TestDohCacheForwardLocalPath(t *testing.T) {
@@ -628,7 +630,7 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 	}
 	// two clients coalesced onto one flight for the same HTTPS question
 	key := NewDohKey("HTTPS", domain)
-	fl := mux.attachDnsResponder(key, mkResponder(0x1111, 40001, "CdN.Example.Test"))
+	fl, _ := mux.attachDnsResponder(key, mkResponder(0x1111, 40001, "CdN.Example.Test"))
 	if fl == nil {
 		t.Fatal("expected a new flight for the first responder")
 	}
@@ -640,7 +642,7 @@ func TestUpgradeMuxHttpsForwardFanOut(t *testing.T) {
 	// The responder snapshot and flight removal are atomic: a query attaching
 	// after completion starts a new flight instead of joining a responder list
 	// that has already been delivered.
-	next := mux.attachDnsResponder(key, mkResponder(0x3333, 40003, "CDN.example.test"))
+	next, _ := mux.attachDnsResponder(key, mkResponder(0x3333, 40003, "CDN.example.test"))
 	if next == nil || next == fl {
 		t.Fatal("post-completion query did not start a fresh HTTPS flight")
 	}
@@ -731,7 +733,7 @@ func TestRawDnsFlightAccountingPrecedesGenerationRetirement(t *testing.T) {
 		reverse:     path.Reverse(),
 	}
 	key := NewDohKey("HTTPS", "generation.example.test")
-	fl := mux.attachDnsResponder(key, responder)
+	fl, _ := mux.attachDnsResponder(key, responder)
 	if fl == nil {
 		t.Fatal("first generation was not admitted")
 	}
@@ -760,7 +762,7 @@ func TestRawDnsFlightAccountingPrecedesGenerationRetirement(t *testing.T) {
 	if !stillOwned {
 		t.Fatal("DNS flight generation retired before its accounting completed")
 	}
-	if next := mux.attachDnsResponder(key, responder); next != nil {
+	if next, _ := mux.attachDnsResponder(key, responder); next != nil {
 		t.Fatal("a new generation started while old accounting still owned the key")
 	}
 
@@ -770,7 +772,7 @@ func TestRawDnsFlightAccountingPrecedesGenerationRetirement(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("raw DNS completion did not retire after accounting resumed")
 	}
-	next := mux.attachDnsResponder(key, responder)
+	next, _ := mux.attachDnsResponder(key, responder)
 	if next == nil || next == fl {
 		t.Fatal("new DNS generation was not admitted after owned retirement")
 	}
