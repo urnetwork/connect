@@ -6463,9 +6463,27 @@ paths:
       summary: Account Epochs
       description: |
         The caller network's finalized epochs, newest first: the points earned
-        inside each epoch's wall-clock window and the network's share of the
-        operator pool in basis points (0 when no coldkey was attached, i.e.
-        points only). `limit` defaults to 26 and is capped at 104.
+        inside each epoch's wall-clock window, the bytes the network served
+        behind those points, and the network's share of the operator pool in
+        basis points (0 when no coldkey was attached, i.e. points only).
+        `limit` defaults to 26 and is capped at 104.
+
+        Points and bytes count the weekly operator blocks (Sunday 00:00 UTC to
+        the next Sunday 00:00 UTC) the same way: a block counts in the epoch
+        whose window contains the block's end. A block's bytes are the payout
+        bytes of the provider network's settled traffic in the block: sweeps
+        of contracts with a credit-bearing outcome (settled, or a dispute
+        resolved) that closed at or after the earning cutoff, by settlement
+        time. A contract settled without escrow, and traffic before the
+        cutoff, carry none. Once a block's points are awarded, its bytes are
+        the ones the award shared the block's payout points by. Points of
+        other kinds (reliability, referral, multipliers, and payout-plan
+        points for traffic before the cutoff) have no bytes behind them.
+
+        `current_epoch` is the open epoch's running figure: the bytes served
+        so far in the blocks that end in it, counted with the rule above and
+        a few hours behind live traffic. When the epoch finalizes, its
+        `served_byte_count` continues this figure.
 
         While settlement v2 is configured, an epoch it settles is listed from
         the ledger instead of its v1 row, once a finalized v2 root covering it
@@ -20571,6 +20589,7 @@ components:
         - end_millis
         - points
         - share_bps
+        - served_byte_count
       properties:
         epoch:
           type: integer
@@ -20598,6 +20617,52 @@ components:
             when the network has none.
           type: string
           pattern: "^[0-9]+$"
+        served_byte_count:
+          description: |
+            The bytes the network served in the operator blocks whose points
+            the epoch counts (see the operation); 0 when none. For a block
+            whose award has not committed yet, the bytes so far.
+          type: integer
+          format: int64
+          minimum: 0
+
+    AccountCurrentEpoch:
+      type: object
+      description: |
+        The open epoch, not yet finalized, and the bytes served so far that
+        count toward it. Absent from the result while the epoch clock is
+        unknown.
+      required:
+        - epoch
+        - start_millis
+        - end_millis
+        - served_byte_count
+        - as_of_millis
+      properties:
+        epoch:
+          type: integer
+        start_millis:
+          description: Epoch window start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: |
+            Epoch window end, unix milliseconds, projected at the chain's
+            block period: the epoch is still open.
+          type: integer
+        served_byte_count:
+          description: |
+            The bytes served so far in the operator blocks whose end is in
+            the window, counted as for a finalized epoch. Traffic in a block
+            that ends after the window counts toward the next epoch.
+          type: integer
+          format: int64
+          minimum: 0
+        as_of_millis:
+          description: |
+            The figure counts traffic through this time, unix milliseconds:
+            a few hours behind live traffic while a block is open, and a
+            block's end once all of it is counted.
+          type: integer
 
     AccountEpochsResult:
       type: object
@@ -20608,6 +20673,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AccountEpoch"
+        current_epoch:
+          $ref: "#/components/schemas/AccountCurrentEpoch"
         error:
           type: object
           required:
