@@ -110,18 +110,22 @@ func TestControlDialSitesUseTheBoundDialer(t *testing.T) {
 }
 
 // Every socket this package makes for a dial or a datagram endpoint must reach
-// the egress machinery (egressDialer, egressControl, applyEgress, egressNet),
-// so a forced interface index on Windows and macOS and the egress mark on
-// Linux (QD-800, ur tun under exits) land on it, or its entry here says why
-// not. This pins the sites statically, as the allowlist above pins raw dials:
-// a socket constructor in a package-root non-test file that its file's entry
-// does not name fails. TestEgressMarkLandsAtEverySocketSite
-// (egress_dial_sites_linux_test.go) proves the mark on Linux at each site an
-// entry says reaches the machinery.
+// the egress machinery (egressDialer, egressControl, applyEgress, egressNet,
+// listenEgressUdp, listenEgressIcmp), so a forced interface index on Windows
+// and macOS and the egress mark on Linux (QD-800, ur tun under exits) land on
+// it, or its entry here says why not. This pins the sites statically, as the
+// allowlist above pins raw dials: a socket constructor in a package-root
+// non-test file that its file's entry does not name fails.
+// TestEgressMarkLandsAtEverySocketSite (egress_dial_sites_linux_test.go)
+// proves the mark on Linux at each site an entry says reaches the machinery.
+//
+// The extender carrier's socket and the provider's ICMP echo socket are made by
+// the machinery's own constructors (QD-810), so neither file has an entry.
 //
 // If this test fails on new code, make the socket through ConnectSettings
-// (NetDialer or DialContext) or call applyEgress on it before its first send,
-// or, if it really is exempt, add it here WITH the reason.
+// (NetDialer or DialContext), listenEgressUdp or listenEgressIcmp, or call
+// applyEgress on it before its first send, or, if it really is exempt, add it
+// here WITH the reason.
 var allowedSocketSites = map[string]map[string]string{
 	"net.go": {
 		"net.Dialer": "ConnectSettings.NetDialer, through egressDialer: every ConnectSettings dial, " +
@@ -130,9 +134,14 @@ var allowedSocketSites = map[string]map[string]string{
 	"transport_family.go": {
 		"net.ListenUDP": "openH3PacketConn's QUIC socket, through applyEgress before its first send",
 	},
-	"net_extender.go": {
-		"net.ListenUDP": "openExtenderPacketConn: the alt api dial applies egress to it (net_http_alt.go); " +
-			"the extender carrier's packet dial does not, so that socket is outside the machinery on every platform",
+	"egress.go": {
+		"net.ListenConfig": "listenEgressUdp, the machinery's own datagram socket: egressControl at its creation, " +
+			"refused when it cannot be bound; openExtenderPacketConn's, for an extender carrier's QUIC dial " +
+			"(the dns carrier's too) and the alt api's",
+	},
+	"egress_icmp_unix.go": {
+		"icmp.ListenPacket": "listenEgressIcmp, the machinery's own datagram ICMP socket: applyEgressFor before " +
+			"its first send, refused when it cannot be bound; the provider's echo egress off Windows",
 	},
 	"egress_resolver_linux.go": {
 		"net.Dialer": "egressResolverDial: the marked path through egressDialer; the unmarked one, " +
@@ -147,9 +156,6 @@ var allowedSocketSites = map[string]map[string]string{
 	},
 	"net_extender_seed_bootstrap.go": {
 		"net.Dialer": "the default for a pass whose settings name no DialContext",
-	},
-	"ip_icmp_egress_unix.go": {
-		"icmp.ListenPacket": "provider ICMP egress off Windows, outside the machinery; the Windows file pins its own",
 	},
 	"net_resilient_syscall_windows.go": {
 		"windows.WSASocket": "a duplicate handle of a connected socket, which carries socket options and no I/O",
@@ -246,6 +252,23 @@ func TestSocketSitesReachTheEgressMachinery(t *testing.T) {
 	slices.Sort(violations)
 	if 0 < len(violations) {
 		t.Fatalf("socket sites outside the audited allowlist:\n%s", strings.Join(violations, "\n"))
+	}
+}
+
+// The extender carrier's socket, which the alt api shares, and the provider's
+// ICMP echo socket are the machinery's own (QD-810): the files that use them
+// make no socket themselves, so the audit above passes with neither excused,
+// and an entry that excused one again would hide a socket the binding misses.
+func TestExtenderAndIcmpEgressSocketsAreNotExcused(t *testing.T) {
+	for _, name := range []string{"net_extender.go", "net_http_alt.go", "ip_icmp_egress_unix.go"} {
+		if kinds, ok := allowedSocketSites[name]; ok {
+			t.Errorf("%s is excused from the egress machinery: %v", name, kinds)
+		}
+	}
+	for name, kind := range map[string]string{"egress.go": "net.ListenConfig", "egress_icmp_unix.go": "icmp.ListenPacket"} {
+		if _, ok := allowedSocketSites[name][kind]; !ok {
+			t.Errorf("%s's %s, the machinery's own constructor, has no entry", name, kind)
+		}
 	}
 }
 

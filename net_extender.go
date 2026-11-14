@@ -1161,7 +1161,16 @@ func (self *extenderResponseHeaderReader) Read(b []byte) (int, error) {
 
 // One unconnected udp endpoint for a carrier dial, narrowed to the family of
 // the extender address. A configured packet endpoint factory wins, so a
-// headless host keeps one source identity.
+// headless host keeps one source identity; its endpoint is the embedder's, with
+// its own binding, and is left alone.
+//
+// Otherwise the socket is made through the egress machinery (listenEgressUdp),
+// so both callers, an extender carrier's QUIC dial (the dns carrier rides it
+// too) and the alt api's, are covered: the forced interface on Windows and
+// macOS (R1) and the egress mark on Linux (QD-800) land on it before it sends,
+// and an extender transport never follows the default route of a tunnel this
+// process provides back into it. A socket that cannot take them is refused, as
+// a dial is, and the carrier dial fails rather than loop (QD-810).
 func openExtenderPacketConn(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -1171,7 +1180,11 @@ func openExtenderPacketConn(
 		return connectSettings.DialContextSettings.PacketConnFactory(ctx)
 	}
 	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
-	return net.ListenUDP(udpNetwork, wildcard)
+	udpConn, err := listenEgressUdp(ctx, udpNetwork, wildcard, udpAddr)
+	if err != nil {
+		return nil, err
+	}
+	return udpConn, nil
 }
 
 // The A3 response body: a 4-byte big-endian length and the serialized

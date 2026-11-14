@@ -25,6 +25,13 @@ import (
 // linux gates these sockets by `net.ipv4.ping_group_range` (open by default
 // under systemd >= 239, and always on android); a refused socket fails the
 // flow soft (see IcmpSequence.Run).
+//
+// the socket is made through the egress machinery (listenEgressIcmp), as every
+// socket connect sends from is: the forced interface on macOS and the egress
+// mark on linux land on it before its first echo, so an echo this provider
+// serves for a peer never follows a tunnel this process provides back into it,
+// and a socket that cannot carry them fails the flow soft rather than loop
+// (QD-810). windows has no socket to bind; its file pins the source instead.
 
 // process-wide identifier allocator for platforms where the kernel does not
 // assign one. 16-bit wrap; zero is skipped so an assigned id is always
@@ -58,7 +65,7 @@ func newIcmpEgress(ctx context.Context, ipVersion int, destinationIp net.IP, set
 	default:
 		return nil, icmpEgressUnsupportedError(ipVersion)
 	}
-	conn, err := icmp.ListenPacket(network, "")
+	conn, err := listenEgressIcmp(network, destinationIp)
 	if err != nil {
 		return nil, err
 	}

@@ -4,9 +4,10 @@
 // says reaches the egress machinery, read back off each socket with SO_MARK.
 //
 // Setting a mark needs CAP_NET_ADMIN, or CAP_NET_RAW on a kernel that admits it. Where the process has neither, a
-// dial must refuse rather than make a socket that follows the tunnel's route, and a datagram endpoint goes on unmarked
-// and says so, as its bind failure is not fatal (transport_family.go); the tests check that instead. Both runs, from
-// connect/, on a host with Docker:
+// dial must refuse rather than make a socket that follows the tunnel's route, and so must the machinery's own datagram
+// sockets, the extender carrier's (the alt api's too) and the provider's ICMP echo socket (QD-810); the platform
+// transport's and the ICE net's datagram endpoints go on unmarked and say so, as their bind failure is not fatal
+// (transport_family.go, egress_net.go); the tests check that instead. Both runs, from connect/, on a host with Docker:
 //
 //	CGO_ENABLED=0 GOOS=linux GOARCH=<the engine's arch> go test -c -o <dir>/connect.test .
 //	docker run --rm --name sidecar-test-egress-mark --cap-add NET_ADMIN -v <dir>:/t:ro alpine:3.22 \
@@ -21,8 +22,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -181,7 +184,35 @@ func testEgressMarkSites(t *testing.T) []testEgressMarkSite {
 			},
 		},
 		{
-			name: "net_http_alt.go: the alt api's QUIC socket (openExtenderPacketConn, then applyEgress)",
+			name: "net_extender.go: an extender carrier's QUIC socket (openExtenderPacketConn, through listenEgressUdp)",
+			open: func(t *testing.T) (int, error) {
+				packetConn, err := openExtenderPacketConn(ctx, DefaultConnectSettings(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+				if err != nil {
+					return 0, err
+				}
+				defer packetConn.Close()
+				return testSocketMark(t, packetConn.(syscall.Conn)), nil
+			},
+			refuses: true,
+		},
+		{
+			name: "ip_icmp_egress_unix.go: the provider's ICMP echo socket (newIcmpEgress, through listenEgressIcmp)",
+			open: func(t *testing.T) (int, error) {
+				egress, err := newIcmpEgress(ctx, 4, net.IPv4(127, 0, 0, 1), DefaultIcmpBufferSettings())
+				if err != nil {
+					return 0, err
+				}
+				defer egress.Close()
+				socketConn, ok := egress.(*icmpEgressConn).conn.IPv4PacketConn().PacketConn.(syscall.Conn)
+				if !ok {
+					t.Fatal("the echo socket has no descriptor")
+				}
+				return testSocketMark(t, socketConn), nil
+			},
+			refuses: true,
+		},
+		{
+			name: "net_http_alt.go: the alt api's QUIC socket (openExtenderPacketConn, through listenEgressUdp)",
 			open: func(t *testing.T) (int, error) {
 				altCtx := (&PlatformTransport{settings: DefaultPlatformTransportSettings()}).dialContext(ctx)
 				connectSettings := DefaultConnectSettings()
@@ -200,6 +231,7 @@ func testEgressMarkSites(t *testing.T) []testEgressMarkSite {
 				// the attempt closed its socket on the way out, after wrap read its mark
 				return mark, nil
 			},
+			refuses: true,
 		},
 		{
 			name: "egress_net.go: egressNet.ListenUDP",
@@ -324,4 +356,35 @@ func TestEgressMarkMarksTheProcess(t *testing.T) {
 	SetEgressMark(0)
 	AssertEqual(t, egressProcessMarked(), cgroupMarked)
 	AssertEqual(t, egressBound(), cgroupMarked)
+}
+
+// Where the process may not set a mark, an extender carrier's QUIC dial and the dns carrier's refuse with the mark's
+// error before anything is sent, as the ICMP echo egress does, rather than go on over an unmarked socket that would
+// follow the tunnel's route (QD-810). Where it may, TestEgressMarkLandsAtEverySocketSite reads the mark off both
+// sockets instead.
+func TestExtenderCarrierAndIcmpEgressRefuseAnUnmarkableSocket(t *testing.T) {
+	if testEgressMarkPermitted(t) {
+		t.Skip("this process may set a mark: TestEgressMarkLandsAtEverySocketSite reads it off the sockets instead")
+	}
+	setTestEgressMark(t, 0x7572)
+	ctx := context.Background()
+	refused := func(name string, err error) {
+		if err == nil || !strings.Contains(err.Error(), "egress mark") {
+			t.Errorf("%s: an unmarkable socket was not refused: %v", name, err)
+		}
+	}
+	for _, connectMode := range []ExtenderConnectMode{ExtenderConnectModeQuic, ExtenderConnectModeDns} {
+		_, _, err := DialExtender(
+			ctx,
+			DefaultConnectSettings(),
+			&ExtenderConfig{
+				Profile: ExtenderProfile{ConnectMode: connectMode, Port: 443},
+				Ip:      netip.MustParseAddr("192.0.2.1"),
+			},
+			&ExtenderDial{DestinationHost: "dest.example", DestinationPort: 443},
+		)
+		refused(string(connectMode), err)
+	}
+	_, err := newIcmpEgress(ctx, 4, net.IPv4(192, 0, 2, 1), DefaultIcmpBufferSettings())
+	refused("the ICMP echo egress", err)
 }

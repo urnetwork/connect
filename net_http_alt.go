@@ -322,7 +322,9 @@ func dialAltQuicAttemptWithReservation(
 ) (*h3DialAttempt, error) {
 	// the same endpoint policy the extender carriers use: an injected factory
 	// wins, so a headless host keeps one source identity, and otherwise the
-	// wildcard of the destination's family
+	// wildcard of the destination's family, made through the egress machinery,
+	// so an api dial never loops into the tunnel this process provides (R1,
+	// QD-800); a socket that cannot be bound is refused there
 	packetConn, err := openExtenderPacketConn(ctx, connectSettings, udpAddr)
 	if err != nil {
 		// ownership transfers for every non-nil result, including a rejected
@@ -348,21 +350,6 @@ func dialAltQuicAttemptWithReservation(
 			attempt.close()
 		}
 	}()
-	// bind to the physical egress interface so an api dial never loops into
-	// the tunnel this process provides (R1); a no-op off windows and when no
-	// egress index is set. a bind failure is not fatal, and the log line is
-	// where an unpinned socket becomes visible. an injected endpoint is the
-	// embedder's, with its own binding, so it is left alone
-	injectedPacketConn := connectSettings.DialContextSettings != nil &&
-		connectSettings.DialContextSettings.PacketConnFactory != nil
-	if udpConn, ok := packetConn.(*net.UDPConn); ok && !injectedPacketConn {
-		if bindErr := applyEgress(udpConn); bindErr != nil {
-			loggerOrDefault(connectSettings.Log).Infof(
-				"[net]alt egress bind failed, the api connection may loop into the tunnel: %s\n",
-				bindErr,
-			)
-		}
-	}
 	attempt.packetConn = capPlatformPacketConn(packetConn, policy.readBufferByteCount, policy.writeBufferByteCount)
 	wrapped, err := wrap(ctx, attempt.packetConn)
 	if err != nil {

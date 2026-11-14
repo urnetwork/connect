@@ -1,7 +1,9 @@
 package connect
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -127,6 +129,14 @@ func egressDialer(d *net.Dialer) *net.Dialer {
 // mark is set, and where the platform takes neither. The caller applies it
 // before the socket sends, since the routing decision is made at the send.
 func applyEgress(conn syscall.Conn) error {
+	return applyEgressFor(conn, "")
+}
+
+// applyEgressFor is applyEgress for a socket that sends only to destination, a
+// host:port or empty when it is not known: an AF_INET6 socket whose IPv6 traffic
+// could not be pinned is refused when destination is IPv6, as a dial's control
+// refuses it (egressControl).
+func applyEgressFor(conn syscall.Conn, destination string) error {
 	if !egressConfigured() {
 		return nil
 	}
@@ -134,5 +144,44 @@ func applyEgress(conn syscall.Conn) error {
 	if err != nil {
 		return err
 	}
-	return egressControl("", "", raw)
+	return egressControl("", destination, raw)
+}
+
+// listenEgressUdp makes one unconnected UDP socket on laddr through the egress
+// machinery, for a socket that sends only to destination: the binding, the
+// forced interface on Windows and macOS and the egress mark on Linux, is applied
+// as the socket is made, before it binds or sends, and a socket that cannot take
+// it is closed and refused, as a dial is, rather than follow the tunnel's route
+// back into this process (R1, QD-800). The destination decides only whether an
+// IPv6 socket whose IPv6 traffic could not be pinned is refused (egressControl);
+// nil leaves that to the listen address, as a wildcard listener's is. With
+// neither an egress index nor a mark set the socket is made exactly as
+// net.ListenUDP makes it.
+func listenEgressUdp(ctx context.Context, network string, laddr *net.UDPAddr, destination *net.UDPAddr) (*net.UDPConn, error) {
+	destinationAddress := ""
+	if destination != nil {
+		destinationAddress = destination.String()
+	}
+	listenConfig := &net.ListenConfig{
+		Control: func(network string, address string, c syscall.RawConn) error {
+			if destinationAddress != "" {
+				address = destinationAddress
+			}
+			return egressControl(network, address, c)
+		},
+	}
+	listenAddress := ""
+	if laddr != nil {
+		listenAddress = laddr.String()
+	}
+	packetConn, err := listenConfig.ListenPacket(ctx, network, listenAddress)
+	if err != nil {
+		return nil, err
+	}
+	udpConn, ok := packetConn.(*net.UDPConn)
+	if !ok {
+		packetConn.Close()
+		return nil, fmt.Errorf("connect: a %s listen made a %T, not a udp socket", network, packetConn)
+	}
+	return udpConn, nil
 }

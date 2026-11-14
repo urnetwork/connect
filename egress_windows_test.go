@@ -88,3 +88,41 @@ func TestEgressControlFailsIpv6DialOnInterfaceWithoutIpv6(t *testing.T) {
 	AssertEqual(t, err, nil)
 	listener.Close()
 }
+
+// While an egress interface is set, the socket openExtenderPacketConn makes, an
+// extender carrier's QUIC socket (the dns carrier's too) and the alt api's, is
+// pinned to it as R1 intends, on the destination's family (QD-810). Read back
+// as TestApplyEgressInterfacePinsEverySocketFamily reads its sockets.
+func TestExtenderCarrierSocketIsPinnedWindows(t *testing.T) {
+	const index = 1
+	saved4, saved6 := EgressInterfaceIndex()
+	defer SetEgressInterfaceIndex(saved4, saved6)
+	SetEgressInterfaceIndex(index, index)
+
+	for _, c := range []struct {
+		destination *net.UDPAddr
+		is6         bool
+	}{
+		{destination: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}, is6: false},
+		{destination: &net.UDPAddr{IP: net.IPv6loopback, Port: 443}, is6: true},
+	} {
+		packetConn, err := openExtenderPacketConn(context.Background(), DefaultConnectSettings(), c.destination)
+		if err != nil {
+			t.Fatalf("%s: %v", c.destination, err)
+		}
+		raw, err := packetConn.(*net.UDPConn).SyscallConn()
+		AssertEqual(t, err, nil)
+		var readErr error
+		var pinned int
+		AssertEqual(t, raw.Control(func(fd uintptr) {
+			if c.is6 {
+				pinned, readErr = windows.GetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, ipv6UnicastIf)
+			} else {
+				pinned, readErr = windows.GetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, ipUnicastIf)
+			}
+		}), nil)
+		packetConn.Close()
+		AssertEqual(t, readErr, nil)
+		AssertEqual(t, pinned, index)
+	}
+}
