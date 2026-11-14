@@ -22223,12 +22223,22 @@ func (self *multiClientChannel) providerDiagnosticsSnapshot() *ProviderDiagnosti
 }
 
 // `connect.ReceiveFunction`
+//
+// A receive delivered ahead of a gap in this exit's return sequence
+// (Peer.aheadOfGap: a SYN-ACK or pure ACK on reliable immediate delivery)
+// still reaches the local stack, so a handshake can finish while one lost Pack
+// is recovered. It is not receive progress: it neither counts, nor stamps the
+// receive clock, nor answers a connect, lifts a quarantine or refreshes
+// qualification, and a probe answer in it is consumed unanswered. The exit's
+// DATA may be waiting behind that gap until the gap timeout, and only the
+// ordered stream moving shows otherwise.
 func (self *multiClientChannel) clientReceive(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	select {
 	case <-self.ctx.Done():
 		return
 	default:
 	}
+	progress := !peer.aheadOfGap
 
 	// only process frames from the destinations
 	// if allow := self.sourceFilter[source]; !allow {
@@ -22317,7 +22327,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 						ipPath, parseErr := ParseIpPath(result.packet)
 						if parseErr == nil && ipPath.Protocol == IpProtocolUdp {
 							for _, fragment := range result.fragments {
-								self.addReceiveAck(ByteCount(len(fragment)))
+								if progress {
+									self.addReceiveAck(ByteCount(len(fragment)))
+								}
 								if batch {
 									batchIpPaths = append(batchIpPaths, ipPath)
 									batchPackets = append(batchPackets, fragment)
@@ -22343,9 +22355,15 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				ipPath, err := ParseIpPath(packet)
 				if err == nil {
-					self.addReceiveAck(ByteCount(len(packet)))
-					if ipPath.Syn {
-						self.addReceiveSyn(1)
+					if progress {
+						self.addReceiveAck(ByteCount(len(packet)))
+						if ipPath.Syn {
+							self.addReceiveSyn(1)
+						}
+					} else if probeIngressPath(ipPath) {
+						// a probe answered only ahead of the gap proves the
+						// dial, not delivery; it must not qualify this exit
+						continue
 					}
 					if batch {
 						batchIpPaths = append(batchIpPaths, ipPath)
