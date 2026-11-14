@@ -954,9 +954,9 @@ func defaultSendBufferSettingsWithMemoryTarget(bufferSize int, memoryTargetByteC
 		// pause on resend for selectively acknowledged messages
 		SelectiveAckTimeout: 60 * time.Second,
 		// A gap that recovery has not closed in two seconds is a stall, not
-		// one lost Pack (owner, 2026-11-14). Control written behind it waits
+		// one lost Pack (owner, 2026-11-14). A SYN-ACK written behind it waits
 		// in order, so a stalled peer's handshakes cannot outrun its DATA.
-		ImmediateDeliveryMaxGapAge: 2 * time.Second,
+		ImmediateHandshakeMaxGapAge: 2 * time.Second,
 		// Three distinct later deliveries are the conventional reordering-safe
 		// evidence for one missing Pack. Recovery is limited to one immediate
 		// retransmit per item; ordinary timeout/backoff owns any further loss.
@@ -5669,16 +5669,19 @@ type SendBufferSettings struct {
 	IdleTimeout        time.Duration
 
 	SelectiveAckTimeout time.Duration
-	// Bounds how long a Pack may still ask its receiver for immediate
-	// delivery ahead of a gap. The gap's age is that of the oldest
-	// outstanding Pack without a selective ACK, from its first write.
-	// Past the bound the Pack is written ordered, as every Pack was
-	// before immediate delivery: a gap that old is a stalled stream, and the
-	// SYN-ACKs and pure ACKs crossing it would complete handshakes and look
-	// like progress from a peer whose DATA waits for the gap timeout.
-	// Non-positive never asks for immediate delivery behind an outstanding
-	// predecessor. Resends keep the choice made at the first write.
-	ImmediateDeliveryMaxGapAge time.Duration
+	// Bounds how long a Pack carrying a SYN-ACK may still ask its receiver
+	// for immediate delivery ahead of a gap. The gap's age is that of the
+	// oldest outstanding Pack without a selective ACK, from its first write.
+	// Past the bound the Pack is written ordered, as every Pack was before
+	// immediate delivery: a gap that old is a stalled stream, and a new
+	// handshake completing across it would put a flow on a peer whose DATA
+	// waits for the gap timeout. Pure ACKs are not bounded: they carry the
+	// window updates and acknowledgements that let other flows, often the
+	// other direction's, move and release retained bytes while the gap is
+	// repaired. Non-positive never asks for a SYN-ACK's immediate delivery
+	// behind an outstanding predecessor. Resends keep the choice made at the
+	// first write.
+	ImmediateHandshakeMaxGapAge time.Duration
 	// The number of distinct later selectively acknowledged Packs required to
 	// recover the earliest missing Pack before its resend timeout. Zero disables
 	// gap recovery; each item can trigger it at most once.
@@ -12653,8 +12656,8 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 		} else {
 			assign()
 		}
-		if item.deliverImmediately && !self.immediateGapYoung(sendTime) {
-			// The gap ahead is older than the bound: this control waits in
+		if item.deliverImmediately && immediateIpHandshakeFrames(sendFrames) && !self.immediateGapYoung(sendTime) {
+			// The gap ahead is older than the bound: this SYN-ACK waits in
 			// order behind it. Decided once, before the identity is derived.
 			item.deliverImmediately = false
 		}

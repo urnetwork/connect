@@ -21,8 +21,8 @@ func (self *sendAckSet) deliversImmediately() bool {
 	return self.budgetTracked && !self.hasOrdered
 }
 
-// Reports whether a Pack first written at now may still ask for immediate
-// delivery (SendBufferSettings.ImmediateDeliveryMaxGapAge). The oldest
+// Reports whether a SYN-ACK first written at now may still ask for immediate
+// delivery (SendBufferSettings.ImmediateHandshakeMaxGapAge). The oldest
 // outstanding item without a selective ACK is the first ordinal the receiver
 // may be missing, and its first write starts the gap. A selective ACK
 // refreshes an item's sendTime, but such an item is no gap. Called by the
@@ -32,7 +32,7 @@ func (self *SendSequence) immediateGapYoung(now time.Time) bool {
 		if item == nil || item.selectiveAcked {
 			continue
 		}
-		maxGapAge := self.sendBufferSettings.ImmediateDeliveryMaxGapAge
+		maxGapAge := self.sendBufferSettings.ImmediateHandshakeMaxGapAge
 		return 0 < maxGapAge && now.Sub(item.sendTime) <= maxGapAge
 	}
 	return true

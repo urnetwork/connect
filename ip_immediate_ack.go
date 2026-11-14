@@ -15,6 +15,28 @@ func immediateIpAckFrames(frames []*protocol.Frame) bool {
 	return true
 }
 
+// Reports whether a group carries a SYN-ACK. A SYN-ACK completes a new
+// handshake, so a stalled return stream must not deliver one ahead of an old
+// gap (SendBufferSettings.ImmediateHandshakeMaxGapAge). A pure ACK carries the
+// window and acknowledgement that another flow, often the other direction's,
+// needs to move, so it stays immediate behind a gap of any age.
+func immediateIpHandshakeFrames(frames []*protocol.Frame) bool {
+	for _, frame := range frames {
+		if frame == nil || frame.MessageType != protocol.MessageType_IpIpPacketToProvider &&
+			frame.MessageType != protocol.MessageType_IpIpPacketFromProvider {
+			continue
+		}
+		packet, ok := protocolClassIpPacket(frame.MessageBytes, frame.Raw)
+		if !ok {
+			continue
+		}
+		if tcp := protocolClassTcpPacket(packet); 13 < len(tcp) && tcp[13]&0x02 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Payload, malformed packets and SYN-only/FIN/RST stay ordered. SYNACKs may
 // finish another flow's handshake without waiting for an unrelated DATA gap.
 // This chooses local policy; downstream TCP and authentication still validate.

@@ -1,6 +1,7 @@
 // A provider return stream wedged behind a missing DATA Pack must not keep
-// handing a client SYN-ACKs and pure ACKs ahead of that gap once it is older
-// than two seconds. Real provider, real signed Clients, controlled wire.
+// completing new handshakes across that gap once it is older than two seconds,
+// while its pure ACKs keep crossing any gap and the gap is still repaired by
+// the sender's own resend. Real provider, real signed Clients, controlled wire.
 package connect
 
 import (
@@ -14,21 +15,37 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
+// Which return controls the provider offers behind the gap.
+type providerControlGapShape int
+
+const (
+	// a new flow's SYN-ACK
+	providerControlSynAck providerControlGapShape = iota
+	// a new flow's SYN-ACK and its pure ACK in one provider batch
+	providerControlSynAckBatch
+	// a pure ACK on the stalled flow, as when the client uploads
+	providerControlPureAck
+)
+
 // What the client observed for the control original sent behind the gap.
 type providerControlGapObservation struct {
 	wireImmediate bool
 	// control packets the client application saw while the gap was open
 	beforeRepair int32
-	// and after the missing DATA finally arrived
+	// and after the sender's resend of the missing DATA filled the gap
 	afterRepair int32
 	want        int32
+	// how long the gap was open when the resend filled it
+	repairedAfter time.Duration
+	gapTimeout    time.Duration
 }
 
 // Runs the wedged-return shape through the public provider return API: one
 // DATA Pack is lost on every write, a later DATA Pack waits behind it at the
-// client, the gap ages by gapAge, and a new flow's SYN-ACK (with a pure ACK in
-// the batch form) is offered. The fake clock only moves inside time.Sleep.
-func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Duration) providerControlGapObservation {
+// client, the gap ages by gapAge, and the provider offers return controls.
+// The gap is then filled by the newest recovery copy the sender itself wrote.
+// The fake clock only moves inside time.Sleep.
+func observeProviderControlBehindGap(t *testing.T, shape providerControlGapShape, gapAge time.Duration) providerControlGapObservation {
 	t.Helper()
 	var observation providerControlGapObservation
 	GetMessagePoolAggregateStats()
@@ -54,6 +71,7 @@ func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Durat
 					settings.SendBufferSettings.ResendQueueMinByteCount = 0
 				}
 			})
+		observation.gapTimeout = fixture.receiver.settings.ReceiveBufferSettings.GapTimeout
 		nat := NewLocalUserNatWithDefaults(fixture.ctx, "control-gap-age-test")
 		settings := DefaultRemoteUserNatProviderSettings()
 		settings.SecurityPolicyGenerator = DisableSecurityPolicyWithStats
@@ -78,11 +96,13 @@ func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Durat
 		laterPacket := ipOosTcpPacketSequence(path, tcpFlagAck, 2244, bytes.Repeat([]byte{0x59}, 1240))
 		synAckPacket := ipOosTcpPacketSequence(&controlPath, tcpFlagSyn|tcpFlagAck, 7000, nil)
 		ackPacket := ipOosTcpPacketSequence(&controlPath, tcpFlagAck, 7001, nil)
+		uploadAckPacket := ipOosTcpPacketSequence(path, tcpFlagAck, 3484, nil)
 		var controlVisits atomic.Int32
 		fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 			for _, frame := range frames {
 				actual, err := ipPacketFromProviderBytes(frame)
-				if err == nil && (bytes.Equal(actual, synAckPacket) || bytes.Equal(actual, ackPacket)) {
+				if err == nil && (bytes.Equal(actual, synAckPacket) || bytes.Equal(actual, ackPacket) ||
+					bytes.Equal(actual, uploadAckPacket)) {
 					controlVisits.Add(1)
 				}
 			}
@@ -108,8 +128,10 @@ func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Durat
 		started := time.Now()
 		time.Sleep(gapAge)
 		synctest.Wait()
-		// The wedge: every recovery copy of the missing DATA is lost too.
+		// The wedge: every recovery copy of the missing DATA is lost too,
+		// except that the newest one is kept to repair the gap at the end.
 		// Contract control traffic still reaches the client.
+		var resend *windowRoundFrame
 		for len(fixture.senderOut) != 0 {
 			retry := fixture.take(fixture.senderOut)
 			if retry.pack != nil && len(retry.pack.Frames) == 0 {
@@ -117,48 +139,61 @@ func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Durat
 				continue
 			}
 			if retry.pack == nil || retry.pack.SequenceNumber != base ||
-				!bytes.Equal(retry.pack.SequenceId, missing.pack.SequenceId) {
+				!bytes.Equal(retry.pack.SequenceId, missing.pack.SequenceId) ||
+				!bytes.Equal(retry.pack.MessageId, missing.pack.MessageId) {
 				t.Fatal("the aged gap produced provider traffic other than recovery of the missing DATA")
 			}
-			fixture.drop(retry)
+			if resend != nil {
+				fixture.drop(resend)
+			}
+			resend = retry
 		}
 		fixture.acknowledge()
 		if time.Since(started) != gapAge || receiver.nextSequenceNumber != base {
 			t.Fatal("the gap did not stay open for exactly the requested age")
 		}
+		if resend == nil {
+			t.Fatal("the sender wrote no recovery copy of the missing DATA while the gap aged")
+		}
+		fixture.drop(missing)
 
 		var control *windowRoundFrame
-		observation.want = 1
-		if batch {
+		switch shape {
+		case providerControlSynAck:
+			control = offer(&controlPath, synAckPacket)
+			observation.want = 1
+		case providerControlSynAckBatch:
 			provider.ReceiveBatch(SourceId(fixture.receiver.ClientId()), protocol.ProvideMode_Network, &controlPath, [][]byte{synAckPacket, ackPacket})
 			control = synAckProviderApplicationWire(t, fixture, synAckPacket, ackPacket)
 			observation.want = 2
-		} else {
-			control = offer(&controlPath, synAckPacket)
+		case providerControlPureAck:
+			control = offer(path, uploadAckPacket)
+			observation.want = 1
 		}
 		if control.pack.SequenceNumber != base+2 || control.pack.Head || control.pack.Nack ||
 			!bytes.Equal(control.pack.SequenceId, missing.pack.SequenceId) {
-			t.Fatal("the SYN-ACK did not follow the waiting DATA in the same return generation")
+			t.Fatal("the control did not follow the waiting DATA in the same return generation")
 		}
 		observation.wireImmediate = control.pack.DeliverImmediately
 		fixture.forward(control, fixture.receiverIn)
 		fixture.acknowledge()
 		observation.beforeRepair = controlVisits.Load()
 
-		// The missing DATA finally arrives: everything drains in order.
-		fixture.forward(missing, fixture.receiverIn)
+		// The sender's own resend arrives: everything drains in order.
+		fixture.forward(resend, fixture.receiverIn)
 		fixture.acknowledge()
 		observation.afterRepair = controlVisits.Load()
+		observation.repairedAfter = time.Since(started)
 		if receiver.nextSequenceNumber != base+3 {
-			t.Fatalf("the repaired return stream did not drain through the control original: floor=%d want=%d",
+			t.Fatalf("the resend did not repair the return stream through the control original: floor=%d want=%d",
 				receiver.nextSequenceNumber, base+3)
 		}
 		sequence := fixture.sequence()
-		if len(sequence.sendItems) != 0 || sequence.immediateSendCount != 0 {
-			t.Fatal("the repaired return stream left a provider original or immediate count outstanding")
+		if len(sequence.sendItems) != 0 || sequence.immediateSendCount != 0 || fixture.receiver.Ctx().Err() != nil {
+			t.Fatal("the repaired return stream left a provider original, an immediate count or a closed receiver")
 		}
-		t.Logf("PROVIDER_CONTROL_GAP batch=%t gap_age=%s wire_immediate=%t before_repair=%d after_repair=%d",
-			batch, gapAge, observation.wireImmediate, observation.beforeRepair, observation.afterRepair)
+		t.Logf("PROVIDER_CONTROL_GAP shape=%d gap_age=%s wire_immediate=%t before_repair=%d after_repair=%d repaired_after=%s",
+			shape, gapAge, observation.wireImmediate, observation.beforeRepair, observation.afterRepair, observation.repairedAfter)
 	})
 	return observation
 }
@@ -168,7 +203,7 @@ func observeProviderControlBehindGap(t *testing.T, batch bool, gapAge time.Durat
 // the client completed a handshake through a stuck exit while that flow's
 // data would wait behind the gap until GapTimeout.
 func TestProviderSynAckBehindGapOlderThanTwoSecondsWaitsForRepair(t *testing.T) {
-	observation := observeProviderControlBehindGap(t, false, 2*time.Second+time.Millisecond)
+	observation := observeProviderControlBehindGap(t, providerControlSynAck, 2*time.Second+time.Millisecond)
 	if observation.wireImmediate || observation.beforeRepair != 0 {
 		t.Errorf("SYNACK_AHEAD_OF_AGED_GAP: a provider wedged behind a 2.001s gap still delivered its SYN-ACK ahead of the gap: wire_immediate=%t delivered_before_repair=%d",
 			observation.wireImmediate, observation.beforeRepair)
@@ -179,9 +214,10 @@ func TestProviderSynAckBehindGapOlderThanTwoSecondsWaitsForRepair(t *testing.T) 
 	}
 }
 
-// Root cause, batch form: the pure ACK rides the same policy as the SYN-ACK.
+// Root cause, batch form: a pure ACK sharing the SYN-ACK's original waits
+// with it, so the handshake still cannot complete across the old gap.
 func TestProviderSynAckAndAckBatchBehindGapOlderThanTwoSecondsWaitsForRepair(t *testing.T) {
-	observation := observeProviderControlBehindGap(t, true, 2*time.Second+time.Millisecond)
+	observation := observeProviderControlBehindGap(t, providerControlSynAckBatch, 2*time.Second+time.Millisecond)
 	if observation.wireImmediate || observation.beforeRepair != 0 {
 		t.Errorf("ACK_AHEAD_OF_AGED_GAP: a provider wedged behind a 2.001s gap still delivered a SYN-ACK and pure ACK ahead of the gap: wire_immediate=%t delivered_before_repair=%d",
 			observation.wireImmediate, observation.beforeRepair)
@@ -192,14 +228,31 @@ func TestProviderSynAckAndAckBatchBehindGapOlderThanTwoSecondsWaitsForRepair(t *
 	}
 }
 
-// Guard: a gap at most two seconds old keeps ba795437's immediate delivery.
+// A pure ACK behind a gap older than two seconds still crosses it at once:
+// it carries the window and acknowledgement another flow needs while the gap
+// is repaired. The sender's own resend then fills the gap, long before the
+// receiver's GapTimeout would end the stream.
+func TestProviderPureAckBehindGapOlderThanTwoSecondsCrossesItAndGapRepairs(t *testing.T) {
+	observation := observeProviderControlBehindGap(t, providerControlPureAck, 2*time.Second+time.Millisecond)
+	if !observation.wireImmediate || observation.beforeRepair != observation.want {
+		t.Errorf("PURE_ACK_HELD_BEHIND_AGED_GAP: a pure ACK behind a 2.001s gap waited for the repair: wire_immediate=%t delivered_before_repair=%d want=%d",
+			observation.wireImmediate, observation.beforeRepair, observation.want)
+	}
+	if observation.afterRepair != observation.want || observation.gapTimeout <= 0 ||
+		observation.gapTimeout/10 < observation.repairedAfter {
+		t.Errorf("the sender's resend did not repair the gap well before GapTimeout: delivered=%d repaired_after=%s gap_timeout=%s",
+			observation.afterRepair, observation.repairedAfter, observation.gapTimeout)
+	}
+}
+
+// Guard: a gap at most two seconds old keeps ba795437's immediate SYN-ACK.
 // Two seconds exactly is still young.
 func TestGuardProviderSynAckBehindTwoSecondGapStaysImmediate(t *testing.T) {
-	for _, batch := range []bool{false, true} {
-		observation := observeProviderControlBehindGap(t, batch, 2*time.Second)
+	for _, shape := range []providerControlGapShape{providerControlSynAck, providerControlSynAckBatch} {
+		observation := observeProviderControlBehindGap(t, shape, 2*time.Second)
 		if !observation.wireImmediate || observation.beforeRepair != observation.want || observation.afterRepair != observation.want {
-			t.Errorf("guard: a 2s gap lost immediate delivery: batch=%t wire_immediate=%t delivered_before_repair=%d after_repair=%d want=%d",
-				batch, observation.wireImmediate, observation.beforeRepair, observation.afterRepair, observation.want)
+			t.Errorf("guard: a 2s gap lost immediate delivery: shape=%d wire_immediate=%t delivered_before_repair=%d after_repair=%d want=%d",
+				shape, observation.wireImmediate, observation.beforeRepair, observation.afterRepair, observation.want)
 		}
 	}
 }
