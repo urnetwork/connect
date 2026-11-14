@@ -607,14 +607,20 @@ func TestLiveWindowEnumerationErrorIsPlatformFailure(t *testing.T) {
 	if got := counts[windowFailurePlatform]; got != 1 {
 		t.Fatalf("platform failure count=%d, want 1", got)
 	}
-	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+	if got := window.stallReason(); got != WindowStallPlatformUnreachable {
 		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	// one failure is evidence, not yet a published turn: the
+	// platform-unreachable hold (publishStallStatus) keeps it back
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("published stall reason=%q, want %q", got, WindowStallEvaluating)
 	}
 	if lines := log.linesWith("[multi]window enumerate error"); len(lines) != 1 {
 		t.Fatalf("enumeration failure lines=%d, want 1: %v", len(lines), lines)
 	}
-	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
-		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	// the held turn changed nothing published, so nothing was logged
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("window-stall lines=%d, want 0: %v", len(lines), lines)
 	}
 }
 
@@ -646,14 +652,20 @@ func TestLiveWindowClientArgsErrorIsPlatformFailure(t *testing.T) {
 	if got := counts[windowFailurePlatform]; got != 1 {
 		t.Fatalf("platform failure count=%d, want 1", got)
 	}
-	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallPlatformUnreachable {
+	if got := window.stallReason(); got != WindowStallPlatformUnreachable {
 		t.Fatalf("stall reason=%q, want %q", got, WindowStallPlatformUnreachable)
+	}
+	// one failure is evidence, not yet a published turn: the
+	// platform-unreachable hold (publishStallStatus) keeps it back
+	if got := window.monitor.WindowExpandEvent().Reason; got != WindowStallEvaluating {
+		t.Fatalf("published stall reason=%q, want %q", got, WindowStallEvaluating)
 	}
 	if lines := log.linesWith("[multi]create client args error"); len(lines) != 1 {
 		t.Fatalf("client-args failure lines=%d, want 1: %v", len(lines), lines)
 	}
-	if lines := log.linesWith("event=window_stall"); len(lines) != 1 {
-		t.Fatalf("window-stall lines=%d, want 1: %v", len(lines), lines)
+	// the held turn changed nothing published, so nothing was logged
+	if lines := log.linesWith("event=window_stall"); len(lines) != 0 {
+		t.Fatalf("window-stall lines=%d, want 0: %v", len(lines), lines)
 	}
 }
 
