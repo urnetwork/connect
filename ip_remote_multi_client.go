@@ -288,6 +288,14 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// consider them open; traditional vpns hold nat state for 5-30 minutes
 		TcpSequenceIdleTimeout: 600 * time.Second,
 
+		// a window's ipv6 minimum from dualstack providers, dualproto
+		// providers before tcp ones, and the limited window for the tcp
+		// providers (server FP2-PROTOCOL.md D6.1); a host whose windows take
+		// every provider asks with ipv4 and any
+		NormalWindowSelectors: ProviderSelectors{
+			Ip:       ProviderIpCapabilityDualstack,
+			Protocol: ProviderProtocolCapabilityDualproto,
+		},
 		WindowSizes: map[WindowType]WindowSizeSettings{
 			// TODO increase `WindowSizeMinP2pOnly` when p2p is deployed
 			WindowTypeQuality: WindowSizeSettings{
@@ -705,6 +713,23 @@ type MultiClientSettings struct {
 	// Positive limits cap only default windows; explicit profiles and fixed
 	// destinations keep their caller-selected topology. Zero is unchanged.
 	WindowSizeLimit int
+	// The capabilities the normal windows ask find-providers2 for (server
+	// FP2-PROTOCOL.md §5.1, §6.3). Default dualstack and dualproto (D6.1),
+	// which apps keep: a window's ipv6 minimum from dualstack providers first,
+	// then dualproto providers, then tcp ones as overflow, with a limited
+	// window beside them for the tcp providers.
+	//
+	// ipv4 and any (owner, 2026-11-13, for the proxy service's hosted
+	// devices): no ipv6 need and every provider in one pool, ranked by the
+	// window's rank mode alone. Such a multi client builds no limited window,
+	// whatever LimitedWindowSizeFraction or SetLimitedWindowSizeFraction say:
+	// its normal windows hold the tcp providers themselves. A flow still races
+	// only the exits whose labels carry it, so udp never reaches a tcp exit,
+	// and a udp flow with none in its windows is answered as unroutable.
+	//
+	// An empty member reads as the default, and a protocol other than any as
+	// dualproto: tcp is the limited window's.
+	NormalWindowSelectors ProviderSelectors
 	// Sizes the limited window (server FP2-PROTOCOL.md §7.4, D8): its target
 	// is max(1, floor(fraction x S)), S the largest current target among the
 	// active normal windows, and its hard max is max(1, floor(fraction x the
@@ -3229,35 +3254,39 @@ func NewRemoteUserNatMultiClient(
 		multiClient.windows[WindowTypeSpeed].userSentSinceFunc = multiClient.userSentSince
 
 		// the limited window (server FP2-PROTOCOL.md §7.4). A fixed
-		// destination has none: the fixed exit carries every flow
-		multiClient.windows[WindowTypeLimited] = newMultiClientWindow(
-			cancelCtx,
-			cancel,
-			generator,
-			multiClient.clientReceivePacket,
-			multiClient.clientReceivePackets,
-			provideMode == protocol.ProvideMode_Network,
-			multiClient.clientDialFailureSignal,
-			multiClient.securityPolicy,
-			multiClient.removeClient,
-			multiClient.retireSynPublicationClientMetadata,
-			WindowTypeLimited,
-			effectivePerformanceProfile,
-			settings,
-			multiClient.reliabilitySettings,
-			multiClient.uplinkGate,
-			multiClient.uplinkLastIngress,
-			multiClient.reliabilityMetricsRef,
-			multiClient.clientFlowCount,
-			multiClient.providerQualified,
-			multiClient.receivingChannelCount,
-			multiClient.recordProbePass,
-			multiClient.providerPolicyPreference,
-			multiClient.publishTransportDelayStats,
-			multiClient.clientAdded,
-		)
-		multiClient.windows[WindowTypeLimited].clientMigrateFunc = multiClient.migrateClientFlows
-		multiClient.windows[WindowTypeLimited].userSentSinceFunc = multiClient.userSentSince
+		// destination has none: the fixed exit carries every flow. Nor do
+		// normal windows that ask for any protocol: they hold the tcp
+		// providers themselves (MultiClientSettings.NormalWindowSelectors)
+		if settings.NormalWindowSelectors.normalize().Protocol != ProviderProtocolCapabilityAny {
+			multiClient.windows[WindowTypeLimited] = newMultiClientWindow(
+				cancelCtx,
+				cancel,
+				generator,
+				multiClient.clientReceivePacket,
+				multiClient.clientReceivePackets,
+				provideMode == protocol.ProvideMode_Network,
+				multiClient.clientDialFailureSignal,
+				multiClient.securityPolicy,
+				multiClient.removeClient,
+				multiClient.retireSynPublicationClientMetadata,
+				WindowTypeLimited,
+				effectivePerformanceProfile,
+				settings,
+				multiClient.reliabilitySettings,
+				multiClient.uplinkGate,
+				multiClient.uplinkLastIngress,
+				multiClient.reliabilityMetricsRef,
+				multiClient.clientFlowCount,
+				multiClient.providerQualified,
+				multiClient.receivingChannelCount,
+				multiClient.recordProbePass,
+				multiClient.providerPolicyPreference,
+				multiClient.publishTransportDelayStats,
+				multiClient.clientAdded,
+			)
+			multiClient.windows[WindowTypeLimited].clientMigrateFunc = multiClient.migrateClientFlows
+			multiClient.windows[WindowTypeLimited].userSentSinceFunc = multiClient.userSentSince
+		}
 	}
 	// else only keep the quality window for fixed destination
 
@@ -14721,7 +14750,7 @@ func (self *multiClientWindow) resize() {
 		}
 		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
 		inactive := !fixedDestination && fixedWindowType != nil && self.windowType != *fixedWindowType
-		dualstackTargetCount := requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+		dualstackTargetCount := requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize, self.providerSelectors())
 		if fixedDestination || inactive {
 			dualstackTargetCount = 0
 		}

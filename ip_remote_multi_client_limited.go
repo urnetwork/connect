@@ -7,7 +7,10 @@ package connect
 // window asks for dualstack and dualproto providers with its target, its ipv6
 // minimum and the clients it holds of each label; the server fills its ipv6
 // need first, then its protocol's providers, and only when those cannot reach
-// the target, tcp providers as overflow. The limited window asks for ipv4 and
+// the target, tcp providers as overflow. A host's normal windows may ask for
+// ipv4 and any instead (MultiClientSettings.NormalWindowSelectors): every
+// provider in one pool by rank, and no limited window beside them. The
+// limited window asks for ipv4 and
 // tcp providers: the providers whose udp failed, which the hard gate kept out
 // of every window before. Its clients join the race of every flow they can
 // carry (coalesceOrderedClients), so tcp traffic reaches them while udp never
@@ -211,9 +214,11 @@ func (self *multiClientWindow) publishedSizingSnapshot() windowSizing {
 // the setting alone: the mobile policy and every fixed profile leave the
 // setting at 0, and a request without an ipv6 need no longer draws dualstack
 // first (FP2-PROTOCOL.md §6.3), so those windows would lose the one dualstack
-// exit today's draw gives them. The limited window has no ipv6 need.
-func requestDualstackTargetCount(windowType WindowType, fixedWindowType *WindowType, windowSize WindowSizeSettings) int {
-	if windowType == WindowTypeLimited {
+// exit today's draw gives them. The limited window has no ipv6 need, and
+// neither has a normal window whose selectors ask with ipv4: its pool is
+// drawn by rank alone (MultiClientSettings.NormalWindowSelectors).
+func requestDualstackTargetCount(windowType WindowType, fixedWindowType *WindowType, windowSize WindowSizeSettings, selectors ProviderSelectors) int {
+	if windowType == WindowTypeLimited || selectors.Ip == ProviderIpCapabilityIpv4 {
 		return 0
 	}
 	dualstackTargetCount := max(0, windowSize.WindowSizeMinIpv6Capable)
@@ -265,7 +270,7 @@ func (self *multiClientWindow) initRequestSizing() {
 		}
 	}
 	self.requestTargetCount = targetCount
-	self.requestDualstackTargetCount = requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize)
+	self.requestDualstackTargetCount = requestDualstackTargetCount(self.windowType, fixedWindowType, windowSize, self.providerSelectors())
 	if fixedDestination || targetCount <= 0 {
 		self.requestDualstackTargetCount = 0
 	}
@@ -293,21 +298,38 @@ func (self *multiClientWindow) requestRankMode() string {
 	return limitedWindowRankMode(self.performanceProfile)
 }
 
-// The `select` this window's requests carry (FP2-PROTOCOL.md §7.4). The held
-// counts are the window's live, unwarned clients: a warned client is being
-// replaced, so it holds no slot the request should count.
+// The selectors this window asks with: the limited window's ipv4 and tcp, and
+// the normal windows' from the settings (MultiClientSettings
+// .NormalWindowSelectors). Takes no lock: the settings do not change.
+func (self *multiClientWindow) providerSelectors() ProviderSelectors {
+	if self.windowType == WindowTypeLimited {
+		return ProviderSelectors{
+			Ip:       ProviderIpCapabilityIpv4,
+			Protocol: ProviderProtocolCapabilityTcp,
+		}
+	}
+	if self.settings == nil {
+		return ProviderSelectors{}.normalize()
+	}
+	return self.settings.NormalWindowSelectors.normalize()
+}
+
+// The `select` this window's requests carry (FP2-PROTOCOL.md §7.4): its
+// selectors with its target, its ipv6 minimum (none for ipv4) and the clients
+// it holds of each label. The held counts are the window's live, unwarned
+// clients: a warned client is being replaced, so it holds no slot the request
+// should count. Every label is the protocol any asks for.
 func (self *multiClientWindow) providerSelect() FindProvidersSelect {
+	selectors := self.providerSelectors()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	providerSelect := FindProvidersSelect{
-		Ip:                   ProviderIpCapabilityDualstack,
-		Protocol:             ProviderProtocolCapabilityDualproto,
+		Ip:                   selectors.Ip,
+		Protocol:             selectors.Protocol,
 		TargetCount:          max(1, self.requestTargetCount),
 		DualstackTargetCount: max(0, self.requestDualstackTargetCount),
 	}
-	if self.windowType == WindowTypeLimited {
-		providerSelect.Ip = ProviderIpCapabilityIpv4
-		providerSelect.Protocol = ProviderProtocolCapabilityTcp
+	if selectors.Ip == ProviderIpCapabilityIpv4 {
 		providerSelect.DualstackTargetCount = 0
 	}
 	for _, client := range self.clients {
@@ -315,7 +337,7 @@ func (self *multiClientWindow) providerSelect() FindProvidersSelect {
 			continue
 		}
 		capabilities := client.capabilities()
-		if capabilities.Protocol == providerSelect.Protocol {
+		if selectors.Protocol == ProviderProtocolCapabilityAny || capabilities.Protocol == selectors.Protocol {
 			providerSelect.HeldCount += 1
 		}
 		if capabilities.Ip == ProviderIpCapabilityDualstack {
@@ -337,7 +359,9 @@ func (self *multiClientWindow) limitedListingHeld() bool {
 	return self.requestTargetCount <= 0
 }
 
-// Whether a provider this window was given may join it. The limited window
+// Whether a provider this window was given may join it. A normal window takes
+// every label: tcp providers come to a dualproto request as overflow, and to
+// an any request as members of its one pool. The limited window
 // keeps only providers labelled tcp: a server that predates selector mode
 // answers its request with hard-gate providers, which carry no label and so
 // read dualproto, and a tcp request never receives a dualproto provider
