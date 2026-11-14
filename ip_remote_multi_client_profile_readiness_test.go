@@ -134,13 +134,17 @@ func TestSelectedWindowEmptyDoesNotSatisfyMergedReadiness(t *testing.T) {
 	resetBackendDegraded()
 	defer resetBackendDegraded()
 	cases := []struct {
-		kind    WindowType
-		profile *PerformanceProfile
-		target  int
+		kind     WindowType
+		profile  *PerformanceProfile
+		ipv4Only bool
+		target   int
 	}{
 		{kind: WindowTypeQuality, profile: readinessProfile(WindowTypeQuality), target: 3},
 		{kind: WindowTypeSpeed, profile: readinessProfile(WindowTypeSpeed), target: 3},
-		{kind: WindowTypeQuality, target: 0},
+		// Auto keeps one soft dualstack goal even with a zero hard minimum.
+		{kind: WindowTypeQuality, target: 1},
+		// IPv4 has no soft family goal; preserve the actual zero-target case.
+		{kind: WindowTypeQuality, ipv4Only: true, target: 0},
 	}
 	for _, c := range cases {
 		synctest.Test(t, func(t *testing.T) {
@@ -148,6 +152,13 @@ func TestSelectedWindowEmptyDoesNotSatisfyMergedReadiness(t *testing.T) {
 			settings.Log = NewNoopLogger()
 			settings.DefaultPerformanceProfile = c.profile
 			settings.StandingReserve = false
+			if settings.NormalWindowSelectors.Ip != ProviderIpCapabilityDualstack ||
+				settings.NormalWindowSelectors.Protocol != ProviderProtocolCapabilityDualproto {
+				t.Fatal("readiness fixture requires the production dualstack/dualproto selectors")
+			}
+			if c.ipv4Only {
+				settings.NormalWindowSelectors.Ip = ProviderIpCapabilityIpv4
+			}
 			if c.profile == nil {
 				for _, kind := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
 					settings.WindowSizes[kind] = WindowSizeSettings{WindowSizeMax: 3, WindowSizeHardMax: 3}

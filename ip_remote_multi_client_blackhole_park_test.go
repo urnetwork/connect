@@ -359,7 +359,10 @@ func TestDetectBlackholeJudgesUnansweredConnectPastItsWindow(t *testing.T) {
 		synctest.Wait()
 
 		synTime := time.Now()
-		channel.addSend(64, healthParkTestPath(1, true))
+		// This counter fixture models an admitted SYN, rather than an offer
+		// still waiting for its actual Transfer admission result.
+		channel.addSend(64, healthParkTestPath(1, false))
+		channel.addSendSyn(1)
 		channel.addSendAck(64)
 		// every poll after the syn left the window, whatever the alignment of
 		// a parked loop's polls
