@@ -128,8 +128,8 @@ func TestMonitorSetStallStatus(t *testing.T) {
 	AssertEqual(t, windowExpandEvent.Failed, true)
 }
 
-// the merged monitor: reason merges by sharpness, and Failed only when every
-// window that is actually trying has failed
+// the merged monitor: reason merges by sharpness, platform-unreachable and
+// Failed only when every window that is actually trying says so
 func TestMergedMonitorStallStatus(t *testing.T) {
 	quality := NewRemoteUserNatMultiClientMonitorWithDefaults()
 	speed := NewRemoteUserNatMultiClientMonitorWithDefaults()
@@ -139,20 +139,30 @@ func TestMergedMonitorStallStatus(t *testing.T) {
 	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallEvaluating)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 
-	// the sharper reason wins across windows
+	// with no window trying yet, platform-unreachable from any window is the
+	// reason
 	quality.SetStallStatus(WindowStallProvidersUnresponsive, false)
 	speed.SetStallStatus(WindowStallPlatformUnreachable, false)
 	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallPlatformUnreachable)
 
-	// one window failed while the other is still trying (target > 0): not failed
+	// once both are trying, platform-unreachable is the reason only when
+	// every trying window says it, as Failed is; otherwise the sharpest of
+	// the others wins
 	quality.AddWindowExpandEvent(false, 4, false)
 	speed.AddWindowExpandEvent(false, 1, false)
+	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallProvidersUnresponsive)
+	quality.SetStallStatus(WindowStallPlatformUnreachable, false)
+	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallPlatformUnreachable)
+	quality.SetStallStatus(WindowStallProvidersUnresponsive, false)
+
+	// one window failed while the other is still trying (target > 0): not failed
 	quality.SetStallStatus(WindowStallProvidersUnresponsive, true)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, false)
 
 	// both trying windows failed: failed
 	speed.SetStallStatus(WindowStallPlatformUnreachable, true)
 	AssertEqual(t, merged.WindowExpandEvent().Failed, true)
+	AssertEqual(t, merged.WindowExpandEvent().Reason, WindowStallProvidersUnresponsive)
 
 	// a disabled window (target 0, not failed) must not veto
 	disabled := NewRemoteUserNatMultiClientMonitorWithDefaults()
