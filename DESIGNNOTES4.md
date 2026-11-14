@@ -79,7 +79,7 @@ connection, nothing to replay across streams.
 
 After the response frame, on the same stream, an attesting provider sends
 exactly one length-prefixed frame (the 4-byte big-endian prefix every extender
-frame uses, bounded by `ExtenderMaxHeaderByteCount`):
+frame uses, bounded by `ExtenderFormatSettings.MaxHeaderByteCount`, A3's 1024):
 
 ```
 message ExtenderProbeAttestation {
