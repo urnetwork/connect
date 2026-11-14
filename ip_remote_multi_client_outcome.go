@@ -79,7 +79,9 @@ func (self windowFailureClass) reason() string {
 // stallReasonRank orders reasons for tie-breaks and for the merged monitor's
 // pick across windows: the sharper the diagnosis, the higher the rank.
 // platform-unreachable outranks everything because it names the root cause the
-// other classes are usually downstream of.
+// other classes are usually downstream of. Across windows it is the exception:
+// the merged monitor takes it only when every trying window says it
+// (MergedMultiClientMonitor.WindowExpandEvent), never by rank.
 func stallReasonRank(reason string) int {
 	switch reason {
 	case WindowStallPlatformUnreachable:
