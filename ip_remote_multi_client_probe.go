@@ -44,7 +44,9 @@ import (
 //   - the receive records normally. A real SynAck or dns answer through the
 //     exit IS delivery, and the ordinary counters (addReceiveAck /
 //     addReceiveSyn at the channel, addConnectSuccess here) are the honest
-//     place to say so.
+//     place to say so. The exception is a SynAck delivered ahead of a gap in
+//     the exit's return sequence: the channel consumes it unanswered, because
+//     the exit's data may be stuck behind that gap.
 //   - probe flows never enter clientUpdates (no flow-cap or blast-radius
 //     impact), never join affinity maps, never open a reliabilityMetrics flow,
 //     and are removed from the path maps explicitly when the probe ends rather

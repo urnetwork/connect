@@ -399,9 +399,48 @@ func (self *ReceiveSequence) tryReceiveImmediate(item *receiveItem) (bool, bool)
 	}
 	self.adoptReceiveMemoryOwner(item)
 	self.flushDeliver()
+	item.aheadOfGap = self.immediateAheadOfGap(item.sequenceNumber)
 	self.receiveHead(item)
 	self.flushDeliver()
 	return true, true
+}
+
+// Reports whether an ordinal below number is still undelivered: at or above
+// the ordered floor and in no pending or secured immediate range. Held items
+// are undelivered too. Called by the receive worker; at most one pass over the
+// bounded ranges per covering range.
+func (self *ReceiveSequence) immediateAheadOfGap(number uint64) bool {
+	next := self.nextSequenceNumber
+	if number <= next {
+		return false
+	}
+	history := self.immediateHistory
+	if history == nil {
+		return true
+	}
+	history.stateLock.Lock()
+	defer history.stateLock.Unlock()
+	if history.sequenceId != self.sequenceId {
+		return true
+	}
+	for next < number {
+		covered := false
+		for index := range history.maxRanges {
+			span := history.ranges[index]
+			if span == nil || !span.pending && !span.secured || next < span.first || span.last < next {
+				continue
+			}
+			if number-1 <= span.last {
+				return false
+			}
+			next, covered = span.last+1, true
+			break
+		}
+		if !covered {
+			return true
+		}
+	}
+	return false
 }
 
 // The callback's roots remain owned until it seals and every actual claim
