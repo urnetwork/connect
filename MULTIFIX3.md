@@ -247,7 +247,7 @@ raises the banner at once today. With the fix, it raises only under the
 | 1, DNS | in progress | | |
 | 1, exits | in progress | | |
 | 2 | in progress | | |
-| 3 | written on a branch, landing | | |
+| 3 | landed 2026-11-14 | connect 18a7d6c9 | `TestLoneSpeedExitDropDoesNotTurnConnectionPlatformUnreachable`, `TestLimitedWindowDoesNotTurnConnectionPlatformUnreachable`, `TestMergedMonitorStallStatus` (updated); guard `TestDisabledWindowDoesNotVetoPlatformUnreachable` |
 | 4 | in progress, with fix 1's exit work | | |
-| 5 | written on a branch, landing | | |
-| Unchanged profile | in progress | | |
+| 5 | landed 2026-11-14 | sdk 83e1b169, apple 9b8d024e, android 8b0a8631a | `TestAppTransportFailureRaisesOnlyWhenFailuresLast`, `TestAppleUrlErrorsThatSettleItRaiseAtOnce`; guard `TestOtherAppleUrlErrorsAreNotCantReach`. Windows and Linux already raise only through the sdk rule |
+| Unchanged profile | landed 2026-11-14 | connect b843ee6f (main d953f4a2) | `TestProfileChangeDoesNotRetireWorkingExits`. Both rebuilds in the logs came from a user change to the connect options; a post-quantum toggle or turning Strong Anonymization on still rebuilds |
