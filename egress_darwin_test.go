@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	quic "github.com/quic-go/quic-go"
 	"golang.org/x/sys/unix"
@@ -132,7 +133,10 @@ func TestExtenderAndIcmpEgressSocketsRefuseAnUnpinnableInterfaceDarwin(t *testin
 	}
 	unusedIndex += 1000
 	setTestEgressInterfaceIndexDarwin(t, uint32(unusedIndex), uint32(unusedIndex))
-	ctx := context.Background()
+	// a refusal is at once; the bound only keeps a regression, which would dial
+	// on, from waiting out a handshake
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	refused := func(name string, err error) {
 		if err == nil || !strings.Contains(err.Error(), "egress interface") {
 			t.Errorf("%s: an unpinnable socket was not refused: %v", name, err)

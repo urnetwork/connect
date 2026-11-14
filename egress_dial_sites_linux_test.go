@@ -28,6 +28,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	quic "github.com/quic-go/quic-go"
 	"golang.org/x/sys/unix"
@@ -367,7 +368,10 @@ func TestExtenderCarrierAndIcmpEgressRefuseAnUnmarkableSocket(t *testing.T) {
 		t.Skip("this process may set a mark: TestEgressMarkLandsAtEverySocketSite reads it off the sockets instead")
 	}
 	setTestEgressMark(t, 0x7572)
-	ctx := context.Background()
+	// a refusal is at once; the bound only keeps a regression, which would dial
+	// on, from waiting out a handshake
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	refused := func(name string, err error) {
 		if err == nil || !strings.Contains(err.Error(), "egress mark") {
 			t.Errorf("%s: an unmarkable socket was not refused: %v", name, err)
