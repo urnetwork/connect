@@ -169,15 +169,20 @@ Guard: a hole younger than 2 s still gets immediate delivery.
 
 ### Fix 3: platform-unreachable only when every window says so
 
-**Root cause.** The merged window status takes the sharpest window, so the
-2-exit limited window can turn it to platform-unreachable on its own while the
-normal windows are still trying. A test currently pins "sharpest wins".
+**Root cause.** The merged window status takes the sharpest window. On iOS the
+speed window holds a single exit, so when that one exit's transports drop, the
+merged reason turns platform-unreachable while the quality windows are still
+trying. A test currently pins "sharpest wins".
+
+An earlier version of this section blamed the 2-exit limited window. That was
+wrong: the limited window only contributes availability and never reaches the
+merged reason, and a test of it alone passes on main.
 
 **Change.** Platform-unreachable wins the merge only when every trying window
 reports it, as `Failed` already works.
 
-**Root cause test.** The limited window alone turns the merged status to
-platform-unreachable.
+**Root cause test.** The iOS speed window's single exit alone turns the merged
+status to platform-unreachable.
 
 ### Fix 4: don't restore stalled exits
 
@@ -242,7 +247,7 @@ raises the banner at once today. With the fix, it raises only under the
 | 1, DNS | in progress | | |
 | 1, exits | in progress | | |
 | 2 | in progress | | |
-| 3 | queued after the profile fix | | |
+| 3 | landed 2026-11-14 | connect 18a7d6c9 | `TestLoneSpeedExitDropDoesNotTurnConnectionPlatformUnreachable`, `TestLimitedWindowDoesNotTurnConnectionPlatformUnreachable`, `TestMergedMonitorStallStatus` (updated); guard `TestDisabledWindowDoesNotVetoPlatformUnreachable` |
 | 4 | in progress, with fix 1's exit work | | |
-| 5 | queued after the profile fix | | |
-| Unchanged profile | in progress | | |
+| 5 | landed 2026-11-14 | sdk 83e1b169, apple 9b8d024e, android 8b0a8631a | `TestAppTransportFailureRaisesOnlyWhenFailuresLast`, `TestAppleUrlErrorsThatSettleItRaiseAtOnce`; guard `TestOtherAppleUrlErrorsAreNotCantReach`. Windows and Linux already raise only through the sdk rule |
+| Unchanged profile | landed 2026-11-14 | connect b843ee6f (main d953f4a2) | `TestProfileChangeDoesNotRetireWorkingExits`. Both rebuilds in the logs came from a user change to the connect options; a post-quantum toggle or turning Strong Anonymization on still rebuilds |
