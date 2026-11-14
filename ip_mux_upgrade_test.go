@@ -532,7 +532,7 @@ func testUpgradeMuxDnsHttpsOversizedTruncated(t *testing.T, ipVersion int) {
 		t.Fatal(err)
 	}
 	key := NewDohKey("HTTPS", "big.example.test")
-	fl := mux.attachDnsResponder(key, dnsResponder{
+	fl, _ := mux.attachDnsResponder(key, dnsResponder{
 		id:          qHeader.ID,
 		question:    question,
 		source:      TransferPath{},

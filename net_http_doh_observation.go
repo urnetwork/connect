@@ -91,6 +91,9 @@ const (
 	dohOutcomeFailed
 	dohOutcomeCanceled
 	dohOutcomeTimeout
+	// the owner's fan-out cap ended the call unanswered (DohSettings.DohRequestCap):
+	// the caller retries at once, so it is not a timeout of the whole budget
+	dohOutcomeCapped
 	dohOutcomeCount
 )
 
@@ -111,6 +114,8 @@ func (self dohResolverOutcome) String() string {
 		return "canceled"
 	case dohOutcomeTimeout:
 		return "timeout"
+	case dohOutcomeCapped:
+		return "capped"
 	default:
 		return "unknown"
 	}
@@ -155,6 +160,17 @@ func dohFinalResolverOutcome(ctx context.Context, answered bool, authoritative b
 	return dohOutcomeFailed
 }
 
+// dohFinalResolverOutcome for a call whose fan-out may have reached the
+// owner's cap (dohLookupResult.capped): an unanswered capped call is capped,
+// unless the caller's own deadline or cancellation ended it.
+func dohFinalResolverOutcomeCapped(ctx context.Context, answered bool, authoritative bool, stale bool, capped bool) dohResolverOutcome {
+	outcome := dohFinalResolverOutcome(ctx, answered, authoritative, stale)
+	if capped && outcome == dohOutcomeFailed {
+		return dohOutcomeCapped
+	}
+	return outcome
+}
+
 // Process-local cumulative counts have a fixed cardinality and emit at most one
 // snapshot per path/scope every five seconds. A quiet or lost log interval is
 // not a zero-failure interval; compare fresh same-process snapshots only.
@@ -184,10 +200,11 @@ func (self *dohResolverObservation) finish(log Logger, outcome dohResolverOutcom
 	self.outcome.Store(uint32(outcome))
 	counts, emit := dohResolverCounters[self.path][self.scope].record(outcome, time.Now())
 	if emit {
+		// capped comes last, so the fields before it read as they always have
 		loggerOrDefault(log).Infof(
-			"[doh]resolver observable=v1 owner_path=%s scope=%s answer=%d authoritative_empty=%d stale=%d failed=%d canceled=%d timeout=%d\n",
+			"[doh]resolver observable=v1 owner_path=%s scope=%s answer=%d authoritative_empty=%d stale=%d failed=%d canceled=%d timeout=%d capped=%d\n",
 			self.path, self.scope, counts[dohOutcomeAnswer], counts[dohOutcomeEmpty], counts[dohOutcomeStale],
-			counts[dohOutcomeFailed], counts[dohOutcomeCanceled], counts[dohOutcomeTimeout],
+			counts[dohOutcomeFailed], counts[dohOutcomeCanceled], counts[dohOutcomeTimeout], counts[dohOutcomeCapped],
 		)
 	}
 }

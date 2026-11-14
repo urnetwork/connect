@@ -15,6 +15,7 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"os"
 	"reflect"
 	"slices"
 	"sort"
@@ -118,7 +119,19 @@ func DefaultDohSettings() *DohSettings {
 		// when a user named a server or the ingress country has presets,
 		// never the tunnel's
 		DohServerLeadReserve: 1,
-		DnsResolverSettings:  DefaultDnsResolverSettings(),
+		// twice the in-tunnel HTTP/2 health check (10s idle + 5s ping, see
+		// DefaultUpgradeMuxSettings): the connection a stalled exit holds is
+		// closed well inside it, so the server's next fan-out dials anew, and
+		// a server whose path recovers is soon tried first again
+		DohServerStallDemotion: 30 * time.Second,
+		// a pooled connection whose path died is found within 45s while
+		// idle, at a ping every 30s
+		Http2ReadIdleTimeout: 30 * time.Second,
+		Http2PingTimeout:     15 * time.Second,
+		// the dns flag day size: a response that fits one UDP/53 answer
+		// (maxForwardedDnsResponse), about three address entries in memory
+		CacheMaxResponseBytes: 1232,
+		DnsResolverSettings:   DefaultDnsResolverSettings(),
 	}
 }
 
@@ -298,8 +311,56 @@ type DohSettings struct {
 	// DohPathWarm reports whether the shared tunnel path is proven/warm.
 	// nil means state-aware staggering and hedge reservation are disabled.
 	// UpgradeMux supplies an atomic, allocation-free callback.
-	DohPathWarm         func() bool
-	DnsResolverSettings *DnsResolverSettings
+	DohPathWarm func() bool
+	// DohRequestCap reports a deadline for one fan-out, shorter than
+	// RequestTimeout, that applies now. A fan-out that reaches it unanswered
+	// ends and reports capped (dohLookupResult.capped), and the servers it
+	// was still waiting on are demoted (DohServerStallDemotion), so the
+	// caller's retry goes through other servers and their connections. The
+	// UpgradeMux reports its warm attempt cap while its tunnel DoH is warm
+	// (DnsUpgradeSettings.WarmAttemptTimeout) and zero while it is cold. Zero
+	// or negative, or nil, applies RequestTimeout alone.
+	DohRequestCap func() time.Duration
+	// DohDialCap reports a bound for one remote DoH connection's dial that
+	// applies now, below the dialer's own timeout. A connect through a
+	// stalled exit then ends at it, and does not hold its connection slot
+	// and endpoint behind a fan-out that already gave up on it. The
+	// UpgradeMux reports its warm dial cap while its tunnel DoH is warm
+	// (DnsUpgradeSettings.DohDialTimeout) and zero while it is cold, when a
+	// dial parks until a forming tunnel can carry it. Zero or negative, or
+	// nil, leaves the dial to the dialer's timeout.
+	DohDialCap func() time.Duration
+	// How long a server whose request ended unanswered at a deadline (its
+	// fan-out's, a tcp dial's or a tls handshake's) is launched after every
+	// server that did not, within its tier (see launchOrder). Such a request
+	// rode a stalled exit or connection, and every stream multiplexed on that
+	// connection is stalled with it, so the next fan-outs take the other
+	// servers first; the server's next answer ends its demotion early. A
+	// fan-out that ends because another server answered demotes nothing.
+	// Zero or negative never demotes.
+	DohServerStallDemotion time.Duration
+	// The HTTP/2 health check of a DoH connection: with no frame received
+	// for Http2ReadIdleTimeout the client sends a PING, and closes the
+	// connection when no frame answers within Http2PingTimeout, failing its
+	// streams so that their lookups retry on a new connection. The idle pings
+	// also hold a pooled connection's NAT state open. Zero
+	// Http2ReadIdleTimeout disables the health check; zero Http2PingTimeout
+	// uses the HTTP/2 package's default.
+	Http2ReadIdleTimeout time.Duration
+	Http2PingTimeout     time.Duration
+	// RemoteIpv6Unroutable, when set and true, reports that the remote path
+	// cannot carry ipv6 now: the remote DoH and plain dns servers of ipv6 are
+	// left out of every query until it reports false again. The UpgradeMux
+	// reports its multi client's verdict that no exit can carry ipv6
+	// (SetIpv6Unroutable), so no query waits out a dial of an ipv6 server
+	// that no exit can carry. nil leaves both families in.
+	RemoteIpv6Unroutable func() bool
+	// The largest raw response (Forward) the cache keeps, in bytes. A larger
+	// one is forwarded uncached: over UDP it reaches the client truncated
+	// anyway, and one would hold the memory of many address entries. Zero or
+	// negative caches no raw response.
+	CacheMaxResponseBytes int
+	DnsResolverSettings   *DnsResolverSettings
 	// MemoryTarget, when set, is the owner's live dns byte budget: every
 	// in-flight DoH request reserves the response read ceiling
 	// (`dohQueryReserveByteCount`) from it for the request's lifetime, and
@@ -436,11 +497,12 @@ type DnsResolverSettings struct {
 	TlsConfig *tls.Config `json:"-"`
 }
 
-// configureDohHttp2Transport applies DoH's keepalive policy and the same
+// configureDohHttp2Transport applies DoH's keepalive policy (the health check
+// of DohSettings.Http2ReadIdleTimeout and Http2PingTimeout) and the same
 // socket-progress invariant as the native net/http HTTP/2 clients.
 func configureDohHttp2Transport(h2tr *http2.Transport, settings *DohSettings) {
-	h2tr.ReadIdleTimeout = 30 * time.Second
-	h2tr.PingTimeout = 15 * time.Second
+	h2tr.ReadIdleTimeout = settings.Http2ReadIdleTimeout
+	h2tr.PingTimeout = settings.Http2PingTimeout
 	// Context cancellation cannot interrupt an HTTP/2 flow-control or reset
 	// write already holding the connection write mutex. Give the socket write
 	// its own progress bound, as the ordinary API transports do.
@@ -626,6 +688,8 @@ type dohFlight struct {
 	fresh         bool
 	stale         bool
 	blocked       bool
+	capped        bool
+	ttl           uint32
 	ownerCanceled bool
 }
 
@@ -637,6 +701,8 @@ func (self *dohFlight) result() dohLookupResult {
 		fresh:         self.fresh,
 		stale:         self.stale,
 		blocked:       self.blocked,
+		capped:        self.capped,
+		ttl:           self.ttl,
 	}
 }
 
@@ -647,6 +713,8 @@ func (self *dohFlight) setResult(result dohLookupResult) dohLookupResult {
 	self.fresh = result.fresh
 	self.stale = result.stale
 	self.blocked = result.blocked
+	self.capped = result.capped
+	self.ttl = result.ttl
 	return result
 }
 
@@ -666,6 +734,14 @@ type dohLookupResult struct {
 	// the authoritative miss is a filtering block: an NXDOMAIN carrying an
 	// extended dns error of 15, 16 or 17 (dnsBlockEdeCode)
 	blocked bool
+	// the fresh resolution reached the fan-out cap (DohSettings.DohRequestCap)
+	// unanswered: the path it waited on is stalled, and a retry goes through
+	// other servers at once. A stale answer can be capped too.
+	capped bool
+	// the seconds the addresses stay valid: the least remaining lifetime of
+	// the record set in the cache (its TTL, floored by MinCacheTtl), 0 for
+	// no addresses
+	ttl uint32
 }
 
 // The pinned addresses of DnsResolverSettings.DohServerHostAddrs by host, lower
@@ -782,6 +858,10 @@ func dnsResolverAddrs(settings *DohSettings, remote bool, network string) []stri
 	if remote {
 		ipv4 = settings.DnsResolverSettings.RemoteDnsIpv4
 		ipv6 = settings.DnsResolverSettings.RemoteDnsIpv6
+		if remoteIpv6Unroutable(settings) {
+			// no exit carries ipv6 now: an ipv6 server could only time out
+			ipv6 = nil
+		}
 	} else {
 		ipv4 = settings.DnsResolverSettings.LocalDnsIpv4
 		ipv6 = settings.DnsResolverSettings.LocalDnsIpv6
@@ -909,7 +989,9 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, onRemotePinned, wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	// the remote dials take the owner's dial cap (DohSettings.DohDialCap)
+	remoteDialContext := dohCappedDialContext(settings.DohDialCap, settings.DialContext)
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, onRemotePinned, wrapDohDial(settings.Log, dohRemoteDialPath(settings), remoteDialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(dohPinnedDialContext(pinnedHostAddrs, nil, wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext))), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
@@ -922,6 +1004,7 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	followerSem := newDohFollowerSem(httpConcurrency, settings.DohServerLeadReserve, leadDohUrls)
 	activeQueries := &atomic.Int64{}
 	stats := newServerStats()
+	stats.stallDemotion = settings.DohServerStallDemotion
 	// seed the fan-out order from the last session's per-server scores (if the owner
 	// persisted any), so the first queries pick the known-fastest server instead of
 	// spending the first minutes re-learning the ordering
@@ -967,6 +1050,22 @@ func NewDohCache(settings *DohSettings) *DohCache {
 		inflight:              map[DohKey]*dohFlight{},
 		resolveSem:            make(chan struct{}, maxResolutions),
 		lifecycle:             lifecycle,
+	}
+}
+
+// A dial bounded by the cap dialCap reports at its start (DohSettings.DohDialCap);
+// with no cap, or a nil dialCap, the dial itself.
+func dohCappedDialContext(dialCap func() time.Duration, dial DialContextFunction) DialContextFunction {
+	if dialCap == nil {
+		return dial
+	}
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		if dialTimeout := dialCap(); 0 < dialTimeout {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+			defer cancel()
+		}
+		return dial(ctx, network, address)
 	}
 }
 
@@ -1077,10 +1176,9 @@ func (self *DohCache) Warm(ctx context.Context, serverCount int) bool {
 	default:
 		return false
 	}
-	ordered := client.launchOrder(dohUrls)
-	if 0 < serverCount && serverCount < len(ordered) {
-		ordered = ordered[:serverCount]
-	}
+	// the first serverCount, of both ip families when the order holds both
+	// (fanOutServers); all for zero
+	ordered := client.fanOutServers(client.launchOrder(dohUrls), serverCount)
 	if len(ordered) == 0 {
 		return false
 	}
@@ -1345,7 +1443,7 @@ func (self *DohCache) QueryResult(ctx context.Context, recordType string, domain
 // request through this cache's own tun dials.
 func (self *DohCache) lookup(ctx context.Context, recordType string, domain string) (result dohLookupResult) {
 	if addrs, ok := self.pinnedHostAnswer(recordType, domain); ok {
-		return dohLookupResult{addrs: addrs, authoritative: true}
+		return self.pinnedLookupResult(addrs)
 	}
 
 	callerCtx := ctx
@@ -1355,7 +1453,7 @@ func (self *DohCache) lookup(ctx context.Context, recordType string, domain stri
 		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
 			resultCtx = self.lifecycle.ctx
 		}
-		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, 0 < len(result.addrs), result.authoritative, result.stale))
+		observation.finish(self.log, dohFinalResolverOutcomeCapped(resultCtx, 0 < len(result.addrs), result.authoritative, result.stale, result.capped))
 	}()
 
 	q := NewDohKey(recordType, domain)
@@ -1437,6 +1535,160 @@ func (self *DohCache) pinnedHostAnswer(recordType string, domain string) (addrs 
 	return addrs, true
 }
 
+// The lookup result of a pinned host's answer (pinnedHostAnswer): authoritative,
+// valid for MinCacheTtl like any shortest cached answer, never fresh evidence.
+func (self *DohCache) pinnedLookupResult(addrs []netip.Addr) dohLookupResult {
+	return dohLookupResult{
+		addrs:         addrs,
+		authoritative: true,
+		ttl:           dohTtlSeconds(self.settings.MinCacheTtl),
+	}
+}
+
+// cachedLookup answers a lookup from the cache alone, without a network
+// resolution or a resolution slot: a pinned host, or a fresh cached entry
+// (records or an authoritative miss) of the key. ok is false otherwise,
+// including for an entry only stale-usable (see staleLookup). The result is
+// what lookup would return for it, with its remaining ttl.
+func (self *DohCache) cachedLookup(recordType string, domain string, now time.Time) (result dohLookupResult, ok bool) {
+	if addrs, ok := self.pinnedHostAnswer(recordType, domain); ok {
+		return self.pinnedLookupResult(addrs), true
+	}
+	q := NewDohKey(recordType, domain)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r := self.queryResultExpiration[q]
+	if r == nil || r.Response != nil || !r.Valid(now, self.settings.MissExpiration) {
+		return dohLookupResult{}, false
+	}
+	return dohLookupResult{addrs: r.Addrs(), authoritative: true, blocked: r.Blocked, ttl: r.remainingTtl(now)}, true
+}
+
+// staleLookup returns the retained addresses of a key whose cached answer has
+// expired but is still stale-usable (DohResult.staleUsable, RFC 8767), for an
+// owner that answers stale while its live lookup continues. ok is false for a
+// fresh entry, a miss, or none.
+func (self *DohCache) staleLookup(recordType string, domain string, now time.Time) (addrs []netip.Addr, ok bool) {
+	q := NewDohKey(recordType, domain)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r := self.queryResultExpiration[q]
+	if r == nil || r.Response != nil || r.Valid(now, self.settings.MissExpiration) || !r.staleUsable(now) {
+		return nil, false
+	}
+	return r.Addrs(), true
+}
+
+// Whether the cache keeps the raw responses (Forward) of a record type: HTTPS
+// and SVCB, which a browser asks beside A and AAAA for every origin. Other
+// raw types are rare and pass through uncached.
+func dohRawCacheable(qType dnsmessage.Type) bool {
+	return qType == dnsmessage.TypeHTTPS || qType == dnsmessage.TypeSVCB
+}
+
+// cachedForward answers a raw forward from the cache alone: a copy of the
+// fresh cached response of the key, every record's ttl lowered by the time it
+// has spent in the cache. ok is false for a type the cache does not keep, a
+// stale entry or none.
+func (self *DohCache) cachedForward(qType dnsmessage.Type, domain string, now time.Time) (response []byte, ok bool) {
+	if !dohRawCacheable(qType) {
+		return nil, false
+	}
+	q := NewDohKey(qType.String(), domain)
+	var cachedResponse []byte
+	var age time.Duration
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		r := self.queryResultExpiration[q]
+		if r == nil || r.Response == nil || !r.Valid(now, self.settings.MissExpiration) {
+			return
+		}
+		cachedResponse = r.Response
+		age = now.Sub(r.Time)
+	}()
+	if cachedResponse == nil {
+		return nil, false
+	}
+	elapsed := dohTtlSeconds(age)
+	return dnsResponseWithTtls(cachedResponse, func(ttl uint32) uint32 {
+		if ttl <= elapsed {
+			return 0
+		}
+		return ttl - elapsed
+	})
+}
+
+// staleForward returns a copy of the retained response of a key whose cached
+// raw answer has expired but is still stale-usable (DohResult.staleUsable),
+// every record's ttl 0: an owner that serves it sets the stale ttl it uses.
+// ok is false for a fresh entry, a miss, or none.
+func (self *DohCache) staleForward(qType dnsmessage.Type, domain string, now time.Time) (response []byte, ok bool) {
+	if !dohRawCacheable(qType) {
+		return nil, false
+	}
+	q := NewDohKey(qType.String(), domain)
+	var staleResponse []byte
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		r := self.queryResultExpiration[q]
+		if r == nil || r.Response == nil || r.Valid(now, self.settings.MissExpiration) || !r.staleUsable(now) {
+			return
+		}
+		staleResponse = r.Response
+	}()
+	if staleResponse == nil {
+		return nil, false
+	}
+	return dnsResponseWithTtls(staleResponse, func(uint32) uint32 {
+		return 0
+	})
+}
+
+// storeForward keeps a usable raw response of a type the cache keeps
+// (dohRawCacheable), as the address answers are kept: records until their
+// least ttl (floored by MinCacheTtl) and then stale-usable within
+// dohStaleServeBound; NXDOMAIN or NODATA as a miss, for LoneMissExpiration when
+// the one server that answered is a built-in endpoint and MissExpiration
+// otherwise. A response over CacheMaxResponseBytes, or one that does not
+// parse, is not kept.
+func (self *DohCache) storeForward(qType dnsmessage.Type, domain string, response []byte, server string, now time.Time) {
+	if !dohRawCacheable(qType) || self.settings.CacheMaxResponseBytes < len(response) {
+		return
+	}
+	minTtl, positive, ok := dnsResponseCacheTtl(response)
+	if !ok {
+		return
+	}
+	r := &DohResult{
+		Time:     now,
+		Response: slices.Clone(response),
+	}
+	if !positive {
+		r.Miss = true
+		if dohEndpointGuarded(server) {
+			// one source alone answered (see DohSettings.LoneMissExpiration)
+			r.MissExpiration = self.settings.LoneMissExpiration
+		}
+	} else {
+		r.Expiration = now.Add(max(time.Duration(minTtl)*time.Second, self.settings.MinCacheTtl))
+	}
+	q := NewDohKey(qType.String(), domain)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.pruneCacheLocked(now, 1)
+	self.queryResultExpiration[q] = r
+}
+
+// A duration as whole seconds for a dns ttl, rounded down; 0 for a negative one.
+func dohTtlSeconds(duration time.Duration) uint32 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint32(min(duration/time.Second, time.Duration(math.MaxUint32)))
+}
+
 // Resolves or joins one generation; only an empty canceled owner permits retry.
 func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLookupResult, retry bool) {
 	callerCtx := ctx
@@ -1459,7 +1711,7 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLook
 				hit = true
 				// a cached entry (records or an authoritative miss) is itself
 				// authoritative, and no network resolution produced it now
-				hitResult = dohLookupResult{addrs: r.Addrs(), authoritative: true, blocked: r.Blocked}
+				hitResult = dohLookupResult{addrs: r.Addrs(), authoritative: true, blocked: r.Blocked, ttl: r.remainingTtl(now)}
 				return
 			}
 			if r.staleUsable(now) {
@@ -1485,13 +1737,13 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLook
 
 	// serveStale is the one place a stale answer leaves this method: it logs (one line per
 	// stale serve, naming the domain — the field signal that failover leaned on the cache) and
-	// counts, so neither can drift from the other.
-	serveStale := func() dohLookupResult {
+	// counts, so neither can drift from the other. capped carries the failed resolution's cap.
+	serveStale := func(capped bool) dohLookupResult {
 		self.staleServeCount.Add(1)
 		// loggerOrDefault: nil-safe against a literally-constructed cache (NewDohCache always
 		// sets log, but a panic in the DNS fallback path is never acceptable)
 		loggerOrDefault(self.log).Infof("[doh]serve stale %s %s (%d addrs)\n", q.RecordType, q.Domain, len(staleAddrs))
-		return dohLookupResult{addrs: staleAddrs, authoritative: true, stale: true}
+		return dohLookupResult{addrs: staleAddrs, authoritative: true, stale: true, capped: capped}
 	}
 
 	if !leader {
@@ -1505,7 +1757,7 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLook
 			return fl.result(), false
 		case <-ctx.Done():
 			if 0 < len(staleAddrs) {
-				return serveStale(), false
+				return serveStale(false), false
 			}
 			return dohLookupResult{}, false
 		case <-self.lifecycle.ctx.Done():
@@ -1542,26 +1794,39 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (result dohLook
 		defer func() { <-self.resolveSem }()
 	case <-ctx.Done():
 		if 0 < len(staleAddrs) {
-			return fl.setResult(serveStale()), false
+			return fl.setResult(serveStale(false)), false
 		}
 		return dohLookupResult{}, false
 	}
-	addrs, authoritative, blocked := self.resolve(ctx, q, now)
-	if !authoritative && len(addrs) == 0 && 0 < len(staleAddrs) {
+	resolved := self.resolve(ctx, q, now)
+	if !resolved.authoritative && len(resolved.addrs) == 0 && 0 < len(staleAddrs) {
 		// the exact SERVFAIL shape (resolve returns authoritative=false only with no
 		// addresses: every resolver path failed or answered non-authoritatively empty):
 		// serve the retained stale answer instead. An authoritative NXDOMAIN/NODATA came
 		// back authoritative=true and is deliberately NOT overridden.
-		return fl.setResult(serveStale()), false
+		return fl.setResult(serveStale(resolved.capped)), false
 	}
-	return fl.setResult(dohLookupResult{addrs: addrs, authoritative: authoritative, fresh: authoritative, blocked: blocked}), false
+	return fl.setResult(resolved), false
 }
 
 // Forward resolves qType for domain and returns the raw RFC 8484 response wire
 // for record types the cache forwards opaquely rather than parsing into
 // addresses. It follows the cache's configured path order (remote/tunnel DoH,
-// then local DoH) and is not cached—the client stub caches by record TTL.
+// then local DoH). HTTPS and SVCB answers are cached as address answers are
+// (see forward); other types are not cached, the client stub caches them by
+// record TTL.
 func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain string) (response []byte, usable bool) {
+	result := self.forward(ctx, qType, domain)
+	return result.response, result.usable
+}
+
+// forward is Forward with the evidence of the outcome. A fresh cached
+// response of a type the cache keeps (dohRawCacheable) answers at once, its
+// ttls lowered by its age, and a usable fresh response is kept (storeForward).
+// When every path fails and a retained response is still stale-usable, it is
+// served stale (RFC 8767), with ttls 0, as a failed address lookup serves its
+// stale addresses. capped carries a fan-out the cap ended (DohSettings.DohRequestCap).
+func (self *DohCache) forward(ctx context.Context, qType dnsmessage.Type, domain string) (result dohForwardResult) {
 	callerCtx := ctx
 	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeForward)
 	defer func() {
@@ -1570,14 +1835,14 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 		if resultCtx.Err() == nil && self.lifecycle.ctx.Err() != nil {
 			resultCtx = self.lifecycle.ctx
 		}
-		observation.finish(self.log, dohFinalResolverOutcome(resultCtx, usable, false, false))
+		observation.finish(self.log, dohFinalResolverOutcomeCapped(resultCtx, result.usable && !result.stale, false, result.stale, result.capped))
 	}()
 	if self.lifecycle.retired.Load() {
-		return nil, false
+		return dohForwardResult{}
 	}
 	forwardCtx, forwardDone, ok := self.lifecycle.context(ctx)
 	if !ok {
-		return nil, false
+		return dohForwardResult{}
 	}
 	defer forwardDone()
 	ctx = forwardCtx
@@ -1586,36 +1851,58 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 	if self.dohServerNames[domain] || self.pinnedHost(domain) {
 		// a doh server name must not resolve through doh (circular), and a
 		// pinned host is never looked up at all
-		return nil, false
+		return dohForwardResult{}
 	}
+	if response, ok := self.cachedForward(qType, domain, time.Now()); ok {
+		return dohForwardResult{response: response, usable: true}
+	}
+	now := time.Now()
+	capped := false
 	if rs.EnableRemoteDoh {
-		if response, ok := self.remoteClient.forwardRaw(
+		remote := self.remoteClient.forwardRaw(
 			ctx,
 			remoteDohUrls(self.settings, self.settings.IpVersion),
 			qType,
 			self.settings,
 			domain,
-		); ok {
-			return response, true
+		)
+		if remote.usable {
+			self.storeForward(qType, domain, remote.response, remote.server, now)
+			return remote
 		}
+		capped = remote.capped
 	}
 	if rs.EnableLocalDoh {
-		return self.localClient.forwardRaw(
+		local := self.localClient.forwardRaw(
 			ctx,
 			localDohUrls(self.settings, self.settings.IpVersion),
 			qType,
 			self.settings,
 			domain,
 		)
+		if local.usable {
+			self.storeForward(qType, domain, local.response, local.server, now)
+			return local
+		}
+		capped = capped || local.capped
 	}
-	return nil, false
+	if response, ok := self.staleForward(qType, domain, time.Now()); ok {
+		self.staleServeCount.Add(1)
+		loggerOrDefault(self.log).Infof("[doh]serve stale %s %s (raw)\n", qType, domain)
+		return dohForwardResult{response: response, usable: true, stale: true, capped: capped}
+	}
+	return dohForwardResult{capped: capped}
 }
 
 // resolve runs the resolver chain (remote DoH -> local DoH -> remote DNS -> local DNS) for one
-// query, caches an authoritative result, and returns the addresses, whether the answer was
-// authoritative, and whether an authoritative miss was a filtering block (dohQueryResult.Blocked).
-// it is not single-flighted itself; QueryResult coalesces concurrent callers.
-func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]netip.Addr, bool, bool) {
+// query, caches an authoritative result, and returns it: the addresses with their remaining ttl,
+// whether the answer was authoritative (and so fresh), whether an authoritative miss was a
+// filtering block (dohQueryResult.Blocked), and whether the remote DoH fan-out reached its cap
+// unanswered (dohQueryResult.Capped). it is not single-flighted itself; QueryResult coalesces
+// concurrent callers.
+func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohLookupResult {
+	// the remote fan-out reached its cap (DohSettings.DohRequestCap) unanswered
+	capped := false
 	addrExpirations := map[netip.Addr]time.Time{}
 	cacheMiss := false
 	// the miss is one source's alone (see DohSettings.LoneMissExpiration);
@@ -1656,6 +1943,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 			loneMiss = queryResult.LoneMiss
 			blockedMiss = queryResult.Blocked
 		}
+		capped = queryResult.Capped
 	}
 
 	if len(addrExpirations) == 0 && !dohServerName && self.settings.DnsResolverSettings.EnableLocalDoh {
@@ -1779,10 +2067,18 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 		}()
 	}
 
-	return (&DohResult{
+	answer := &DohResult{
 		Time:            now,
 		AddrExpirations: addrExpirations,
-	}).Addrs(), authoritative, blocked
+	}
+	return dohLookupResult{
+		addrs:         answer.Addrs(),
+		authoritative: authoritative,
+		fresh:         authoritative,
+		blocked:       blocked,
+		capped:        capped && !authoritative,
+		ttl:           answer.remainingTtl(now),
+	}
 }
 
 func DohQueryWithDefaults(ctx context.Context, recordType string, domains ...string) map[netip.Addr]int {
@@ -1929,7 +2225,14 @@ func dohUrlsFor(ipv4 []string, ipv6 []string, ipVersion int) []string {
 	}
 }
 
+// Whether the remote path cannot carry ipv6 now (DohSettings.RemoteIpv6Unroutable).
+func remoteIpv6Unroutable(settings *DohSettings) bool {
+	return settings.RemoteIpv6Unroutable != nil && settings.RemoteIpv6Unroutable()
+}
+
 // remoteDohUrls/localDohUrls return the configured wire-format DoH server URLs for the ip version.
+// The remote ipv6 servers are left out while the remote path cannot carry ipv6
+// (DohSettings.RemoteIpv6Unroutable).
 func remoteDohUrls(settings *DohSettings, ipVersion int) []string {
 	rs := settings.DnsResolverSettings
 	remoteDohUrlsIpv4 := rs.RemoteDohUrlsIpv4
@@ -1943,6 +2246,11 @@ func remoteDohUrls(settings *DohSettings, ipVersion int) []string {
 		if 0 < len(regionalDohUrlsIpv6) {
 			remoteDohUrlsIpv6 = controlDohUrlsFirst(regionalDohUrlsIpv6, remoteDohUrlsIpv6)
 		}
+	}
+	if remoteIpv6Unroutable(settings) {
+		// a dial of an ipv6 server could only wait out its timeout: no exit
+		// carries ipv6
+		remoteDohUrlsIpv6 = nil
 	}
 	return dohUrlsFor(remoteDohUrlsIpv4, remoteDohUrlsIpv6, ipVersion)
 }
@@ -1974,6 +2282,9 @@ type dohQueryResult struct {
 	// other-family sibling counting as one source, and that source a built-in
 	// endpoint (see DohSettings.LoneMissExpiration).
 	LoneMiss bool
+	// The fan-out reached its cap (DohSettings.DohRequestCap) with neither
+	// records nor a miss: the servers it waited on are stalled.
+	Capped bool
 	// The DoH url that answered, for one server's result.
 	Server string
 	Route  *DohRoute
@@ -2195,6 +2506,146 @@ func dohLaunchWaves(ordered []string, siblings map[string]string) [][]string {
 	return waves
 }
 
+// The ip family of a DoH url's literal host, 4 or 6, or 0 for a host name or
+// a url that does not parse.
+func dohUrlFamily(dohUrl string) int {
+	u, err := url.Parse(strings.TrimSpace(dohUrl))
+	if err != nil {
+		return 0
+	}
+	addr, err := netip.ParseAddr(u.Hostname())
+	if err != nil {
+		return 0
+	}
+	if addr.Unmap().Is4() {
+		return 4
+	}
+	return 6
+}
+
+// The servers one fan-out launches: the first maxServers of ordered (see
+// launchOrder), except that when those are literal servers of one ip family
+// and a server of the other family follows that no stall demotes
+// (serverStats.stalled), it takes the last place, a server of another
+// operator than the ones kept (siblings) first. An exit that carries one
+// family badly then cannot stall a whole fan-out: ordered by score, two ipv6
+// servers often came first, and on a path that black-holes ipv6 the lookup
+// waited out its deadline. A lead server is never given up for it, and one
+// server keeps its place. maxServers zero or negative, or at least
+// len(ordered), launches every server.
+func (self *dohClient) fanOutServers(ordered []string, maxServers int) []string {
+	if maxServers <= 0 || len(ordered) <= maxServers {
+		return ordered
+	}
+	selected := slices.Clone(ordered[:maxServers])
+	if maxServers < 2 {
+		return selected
+	}
+	family := dohUrlFamily(selected[0])
+	if family == 0 || self.leadDohUrls[selected[maxServers-1]] {
+		return selected
+	}
+	for _, dohUrl := range selected[1:] {
+		if dohUrlFamily(dohUrl) != family {
+			return selected
+		}
+	}
+	keptOperator := func(dohUrl string) bool {
+		sibling, ok := self.siblings[dohUrl]
+		return ok && slices.Contains(selected, sibling)
+	}
+	now := time.Now()
+	replacement := ""
+	for _, dohUrl := range ordered[maxServers:] {
+		otherFamily := dohUrlFamily(dohUrl)
+		if otherFamily == 0 || otherFamily == family || self.stats.stalled(dohUrl, now) {
+			continue
+		}
+		if !keptOperator(dohUrl) {
+			replacement = dohUrl
+			break
+		}
+		if replacement == "" {
+			replacement = dohUrl
+		}
+	}
+	if replacement != "" {
+		selected[maxServers-1] = replacement
+	}
+	return selected
+}
+
+// The deadline of one fan-out: RequestTimeout, or the shorter cap its owner
+// applies now (DohSettings.DohRequestCap), with whether the cap applies.
+func dohFanOutTimeout(settings *DohSettings) (time.Duration, bool) {
+	if settings.DohRequestCap != nil {
+		if requestCap := settings.DohRequestCap(); 0 < requestCap && requestCap < settings.RequestTimeout {
+			return requestCap, true
+		}
+	}
+	return settings.RequestTimeout, false
+}
+
+// Whether a request failed at a deadline of its own path, a tcp dial's or a
+// tls handshake's, before its fan-out ended: it rode a stalled path.
+func dohRequestTimedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// The servers one fan-out launched and those whose results reached its
+// collector, so that at the fan-out's own deadline the collector demotes every
+// server it was still waiting on (serverStats.recordStall) before it returns,
+// and so before its caller retries. Safe for concurrent use by the launcher
+// and the collector.
+type dohFanOutStalls struct {
+	stateLock     sync.Mutex
+	launchedUrls  map[string]bool
+	completedUrls map[string]bool
+}
+
+func newDohFanOutStalls() *dohFanOutStalls {
+	return &dohFanOutStalls{
+		launchedUrls:  map[string]bool{},
+		completedUrls: map[string]bool{},
+	}
+}
+
+func (self *dohFanOutStalls) launched(dohUrl string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.launchedUrls[dohUrl] = true
+}
+
+func (self *dohFanOutStalls) completed(dohUrl string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.completedUrls[dohUrl] = true
+}
+
+// Demotes every launched server that has no completed request.
+func (self *dohFanOutStalls) record(stats *serverStats) {
+	var stalledUrls []string
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for dohUrl := range self.launchedUrls {
+			if !self.completedUrls[dohUrl] {
+				stalledUrls = append(stalledUrls, dohUrl)
+			}
+		}
+	}()
+	for _, dohUrl := range stalledUrls {
+		stats.recordStall(dohUrl)
+	}
+}
+
 // beginQuery admits one logical lookup into the shared quiet-query counter.
 // The counter is shared by parsed A/AAAA and opaque SVCB/HTTPS lookups so a
 // browser's three-record origin burst gets one predictable hedge allowance,
@@ -2346,7 +2797,10 @@ func (self *dohClient) releaseRequest(primary bool, follower bool) {
 // as soon as any server returns records. Servers are tried lead servers first (launchOrder), each
 // group in a weighted-random order biased toward recent success, and launched one wave per
 // DohServerStagger so a fast primary answers before the rest fire — which bounds concurrent
-// in-flight requests and skips the redundant fan-out entirely when an early server wins.
+// in-flight requests and skips the redundant fan-out entirely when an early server wins. The
+// fan-out ends at RequestTimeout, or at the owner's shorter cap (DohSettings.DohRequestCap): a
+// fan-out the cap ends unanswered reports Capped. A server whose request ends unanswered at a
+// deadline is demoted (DohSettings.DohServerStallDemotion).
 func (self *dohClient) queryResult(
 	ctx context.Context,
 	dohUrls []string,
@@ -2378,15 +2832,14 @@ func (self *dohClient) queryResult(
 	activeQueryCount, endQuery := self.beginQuery()
 	defer endQuery()
 
-	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
+	fanOutTimeout, capApplied := dohFanOutTimeout(settings)
+	queryCtx, queryCancel := context.WithTimeout(ctx, fanOutTimeout)
 	defer queryCancel()
 
 	// the lead servers first, then weighted-random order: the best recent performers tend to
-	// fire first (and the rest are skipped when an early server wins)
-	ordered := self.launchOrder(dohUrls)
-	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
-		ordered = ordered[:settings.MaxServersPerQuery]
-	}
+	// fire first (and the rest are skipped when an early server wins). Both ip families take
+	// part when the order holds both (fanOutServers).
+	ordered := self.fanOutServers(self.launchOrder(dohUrls), settings.MaxServersPerQuery)
 	// an operator's v4 and v6 endpoints race inside one wave
 	waves := dohLaunchWaves(ordered, self.siblings)
 
@@ -2411,6 +2864,9 @@ func (self *dohClient) queryResult(
 	// snapshot before launchers acquired their slots, so a synchronized burst
 	// could nondeterministically admit many more hedges than intended.
 
+	// the servers a deadline finds unanswered are stalled (see DohServerStallDemotion)
+	stalls := newDohFanOutStalls()
+
 	// launcher: start one server-wave per stagger interval (in launch order) until an early
 	// server wins (stop), the deadline passes, or every server has been launched.
 	go HandleError(func() {
@@ -2428,9 +2884,10 @@ func (self *dohClient) queryResult(
 					if !self.admitRequest(launchCtx, primary, follower) {
 						return
 					}
+					stalls.launched(dohUrl)
 					go HandleError(func() {
 						defer self.releaseRequest(primary, follower)
-						result := self.queryWire(queryCtx, dohUrl, recordType, name)
+						result, err := self.queryWireDetailed(queryCtx, dohUrl, recordType, name)
 						result.Server = dohUrl
 						// the policy-filter guard covers built-in endpoints only: a server the
 						// user chose answers as it answers (see dohBuiltInEndpoints)
@@ -2442,7 +2899,13 @@ func (self *dohClient) queryResult(
 						// it was beaten) counts against it. The large stagger means the first wave is the
 						// usual winner, so a later wave is only launched — and only judged — when an
 						// earlier server was slow or failed.
-						self.stats.record(dohUrl, 0 < len(result.AddrTtls) || 0 < len(result.Txts) || result.Miss)
+						answered := 0 < len(result.AddrTtls) || 0 < len(result.Txts) || result.Miss
+						self.stats.record(dohUrl, answered)
+						if !answered && queryCtx.Err() == nil && dohRequestTimedOut(err) {
+							// a dial or handshake through a stalled exit: the next
+							// fan-outs take the other servers first
+							self.stats.recordStall(dohUrl)
+						}
 						select {
 						case receiveResults <- result:
 						case <-queryCtx.Done():
@@ -2472,6 +2935,10 @@ func (self *dohClient) queryResult(
 	for range queryCount {
 		select {
 		case <-queryCtx.Done():
+			if errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
+				// demoted before the caller can retry
+				stalls.record(self.stats)
+			}
 			miss := mergedResult.Miss && ctx.Err() == nil
 			return &dohQueryResult{
 				AddrTtls: mergedResult.AddrTtls,
@@ -2481,8 +2948,12 @@ func (self *dohClient) queryResult(
 				Miss:     miss,
 				Blocked:  miss && blockedMiss,
 				LoneMiss: miss && len(missSources) == 1 && builtInMisses,
+				// our own cap ended an unanswered fan-out
+				Capped: capApplied && !miss && ctx.Err() == nil &&
+					len(mergedResult.AddrTtls) == 0 && len(mergedResult.Txts) == 0,
 			}
 		case result := <-receiveResults:
+			stalls.completed(result.Server)
 			maps.Copy(mergedResult.AddrTtls, result.AddrTtls)
 			for _, txt := range result.Txts {
 				if !slices.Contains(mergedResult.Txts, txt) {
@@ -2697,41 +3168,54 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 	return data, route.Load(), nil
 }
 
+// One raw forward's outcome (dohClient.forwardRaw).
+type dohForwardResult struct {
+	// the raw response wire, nil unless usable
+	response []byte
+	usable   bool
+	// the response is a retained one served stale (DohCache.forward)
+	stale bool
+	// the fan-out reached its cap (DohSettings.DohRequestCap) unanswered
+	capped bool
+	// the DoH url that answered, for a usable response
+	server string
+}
+
 // forwardRaw resolves qType for domain across dohUrls (lead servers, then best
 // recent performers first) and returns the fastest usable raw response wire
 // (NOERROR/NXDOMAIN). It uses the same launch order, load-aware stagger,
-// quiet-query admission, hedge and lead reserves, shared HTTP cap, and live
-// memory target as parsed A/AAAA queries. This is
+// quiet-query admission, hedge and lead reserves, shared HTTP cap, live
+// memory target, fan-out cap and stall demotion as parsed A/AAAA queries
+// (see queryResult). This is
 // important for browsers: Chromium commonly waits for HTTPS before opening an
 // origin, so serially waiting for one slow DoH server multiplied its delay
 // across an entire parallel first-load fan-out.
-func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType dnsmessage.Type, settings *DohSettings, domain string) ([]byte, bool) {
+func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType dnsmessage.Type, settings *DohSettings, domain string) dohForwardResult {
 	if len(dohUrls) == 0 || settings.RequestTimeout <= 0 {
-		return nil, false
+		return dohForwardResult{}
 	}
 	name, err := Punycode(domain)
 	if err != nil {
-		return nil, false
+		return dohForwardResult{}
 	}
 
 	activeQueryCount, endQuery := self.beginQuery()
 	defer endQuery()
 
-	queryCtx, queryCancel := context.WithTimeout(ctx, settings.RequestTimeout)
+	fanOutTimeout, capApplied := dohFanOutTimeout(settings)
+	queryCtx, queryCancel := context.WithTimeout(ctx, fanOutTimeout)
 	defer queryCancel()
 
-	ordered := self.launchOrder(dohUrls)
-	if 0 < settings.MaxServersPerQuery && settings.MaxServersPerQuery < len(ordered) {
-		ordered = ordered[:settings.MaxServersPerQuery]
-	}
+	ordered := self.fanOutServers(self.launchOrder(dohUrls), settings.MaxServersPerQuery)
 	if len(ordered) == 0 {
-		return nil, false
+		return dohForwardResult{}
 	}
 	waves := dohLaunchWaves(ordered, self.siblings)
 
 	type rawResult struct {
 		data   []byte
 		usable bool
+		server string
 	}
 	results := make(chan rawResult, len(ordered))
 
@@ -2753,6 +3237,9 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	pathWarm := settings.DohPathWarm != nil && settings.DohPathWarm()
 	stagger := dohServerStagger(settings, pathWarm, activeQueryCount)
 
+	// the servers a deadline finds unanswered are stalled (see queryResult)
+	stalls := newDohFanOutStalls()
+
 	go HandleError(func() {
 		for waveIndex, wave := range waves {
 			if 0 < waveIndex && !waitDohLaunchStagger(queryCtx, stop, stagger) {
@@ -2765,18 +3252,23 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 				if !self.admitRequest(launchCtx, primary, follower) {
 					return
 				}
+				stalls.launched(dohUrl)
 
 				go HandleError(func() {
 					defer self.releaseRequest(primary, follower)
-					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
+					data, err := self.queryWireRawDetailed(queryCtx, dohUrl, qType, name)
 					// a built-in endpoint's policy-filtered response is no answer: the next
 					// server is tried (see dohBuiltInEndpoints); a server the user chose is
 					// forwarded as it answers
-					usable := ok && dnsResponseUsable(data) &&
+					usable := err == nil && dnsResponseUsable(data) &&
 						!(dohEndpointGuarded(dohUrl) && dnsResponseFiltered(data))
 					self.stats.record(dohUrl, usable)
+					if !usable && queryCtx.Err() == nil && dohRequestTimedOut(err) {
+						// a dial or handshake through a stalled exit (see queryResult)
+						self.stats.recordStall(dohUrl)
+					}
 					select {
-					case results <- rawResult{data: data, usable: usable}:
+					case results <- rawResult{data: data, usable: usable, server: dohUrl}:
 					case <-queryCtx.Done():
 					}
 				})
@@ -2787,16 +3279,119 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	for range ordered {
 		select {
 		case <-queryCtx.Done():
-			return nil, false
+			if errors.Is(queryCtx.Err(), context.DeadlineExceeded) {
+				// demoted before the caller can retry
+				stalls.record(self.stats)
+			}
+			// our own cap ended the unanswered fan-out
+			return dohForwardResult{capped: capApplied && ctx.Err() == nil}
 		case result := <-results:
+			stalls.completed(result.server)
 			if result.usable {
 				stopLaunching()
 				queryCancel()
-				return result.data, true
+				return dohForwardResult{response: result.data, usable: true, server: result.server}
 			}
 		}
 	}
-	return nil, false
+	return dohForwardResult{}
+}
+
+// A copy of a DNS message with the ttl of every resource record, in the
+// answer, authority and additional sections, replaced by ttl(original). An OPT
+// record is left alone: its ttl field carries the extended rcode and flags.
+// The message is walked in place, so names, compression and every other byte
+// stay as they are. ok is false for a message that does not walk to its end.
+func dnsResponseWithTtls(response []byte, ttl func(uint32) uint32) ([]byte, bool) {
+	if len(response) < 12 {
+		return nil, false
+	}
+	questionCount := int(binary.BigEndian.Uint16(response[4:6]))
+	recordCount := int(binary.BigEndian.Uint16(response[6:8])) +
+		int(binary.BigEndian.Uint16(response[8:10])) +
+		int(binary.BigEndian.Uint16(response[10:12]))
+	out := slices.Clone(response)
+	offset := 12
+	// advances offset past one name: labels up to a root label or a
+	// compression pointer
+	skipName := func() bool {
+		for offset < len(out) {
+			length := int(out[offset])
+			switch {
+			case length == 0:
+				offset += 1
+				return true
+			case length&0xc0 == 0xc0:
+				offset += 2
+				return offset <= len(out)
+			case length&0xc0 != 0:
+				return false
+			default:
+				offset += 1 + length
+			}
+		}
+		return false
+	}
+	for range questionCount {
+		if !skipName() || len(out) < offset+4 {
+			return nil, false
+		}
+		offset += 4
+	}
+	for range recordCount {
+		if !skipName() || len(out) < offset+10 {
+			return nil, false
+		}
+		recordType := dnsmessage.Type(binary.BigEndian.Uint16(out[offset : offset+2]))
+		dataLength := int(binary.BigEndian.Uint16(out[offset+8 : offset+10]))
+		if recordType != dnsmessage.TypeOPT {
+			binary.BigEndian.PutUint32(out[offset+4:offset+8], ttl(binary.BigEndian.Uint32(out[offset+4:offset+8])))
+		}
+		offset += 10 + dataLength
+		if len(out) < offset {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// How a raw DNS response is cached: positive for a NOERROR with answer
+// records, with the least ttl among them; otherwise (NXDOMAIN, or NODATA) a
+// miss. ok is false for one that does not parse, and for one that is neither
+// a NOERROR nor an NXDOMAIN.
+func dnsResponseCacheTtl(response []byte) (minTtl uint32, positive bool, ok bool) {
+	var p dnsmessage.Parser
+	header, err := p.Start(response)
+	if err != nil {
+		return 0, false, false
+	}
+	switch header.RCode {
+	case dnsmessage.RCodeSuccess:
+	case dnsmessage.RCodeNameError:
+		// a miss, whatever chain it carries
+		return 0, false, true
+	default:
+		return 0, false, false
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return 0, false, false
+	}
+	for {
+		h, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			return minTtl, positive, true
+		}
+		if err != nil {
+			return 0, false, false
+		}
+		if !positive || h.TTL < minTtl {
+			minTtl = h.TTL
+		}
+		positive = true
+		if err := p.SkipAnswer(); err != nil {
+			return 0, false, false
+		}
+	}
 }
 
 // Whether a raw DNS response is a well-formed answer worth forwarding: a NOERROR (records or
@@ -3220,11 +3815,18 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 // serverStats tracks each DoH server's recent successful resolutions in per-window token buckets — a
 // current and a previous bucket per dohServerWindows span — and scores a server by summing the
 // trailing-window estimates, so the fan-out order favors servers that have resolved most recently
-// and most often. All methods are safe for concurrent use and safe to call on a nil *serverStats (a
-// no-op / uniform-random order).
+// and most often. A server whose request stalled (recordStall) is ordered after the others until
+// stallDemotion passes or it answers again. All methods are safe for concurrent use and safe to
+// call on a nil *serverStats (a no-op / uniform-random order).
 type serverStats struct {
 	lock  sync.Mutex
 	byUrl map[string]*serverStat
+	// the last stall of each server still demoted, by url (recordStall).
+	// Guarded by lock.
+	stallTimes map[string]time.Time
+	// how long a stall demotes its server (DohSettings.DohServerStallDemotion);
+	// zero or negative never demotes
+	stallDemotion time.Duration
 	// Stands in for the uniform draw in [0, 1) of each server's key in the
 	// weighted order (orderAt), by url, so a test can force an order. nil
 	// draws from math/rand. Guarded by lock.
@@ -3232,7 +3834,10 @@ type serverStats struct {
 }
 
 func newServerStats() *serverStats {
-	return &serverStats{byUrl: map[string]*serverStat{}}
+	return &serverStats{
+		byUrl:      map[string]*serverStat{},
+		stallTimes: map[string]time.Time{},
+	}
 }
 
 // serverStat holds one tokenBucket per dohServerWindows span (parallel index), counting the
@@ -3292,6 +3897,8 @@ func (self *serverStats) recordAt(url string, ok bool, now time.Time) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 
+	// an answer ends a stall demotion: the server's path works again
+	delete(self.stallTimes, url)
 	st := self.byUrl[url]
 	if st == nil {
 		st = &serverStat{windows: make([]tokenBucket, len(dohServerWindows))}
@@ -3300,6 +3907,46 @@ func (self *serverStats) recordAt(url string, ok bool, now time.Time) {
 	for k, span := range dohServerWindows {
 		st.windows[k].add(span, now, 1)
 	}
+}
+
+// recordStall demotes a server whose request ended unanswered at a deadline
+// (see DohSettings.DohServerStallDemotion) until the demotion passes or the
+// server answers again.
+func (self *serverStats) recordStall(url string) {
+	self.recordStallAt(url, time.Now())
+}
+
+func (self *serverStats) recordStallAt(url string, now time.Time) {
+	if self == nil || self.stallDemotion <= 0 {
+		return
+	}
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	if self.stallTimes == nil {
+		self.stallTimes = map[string]time.Time{}
+	}
+	self.stallTimes[url] = now
+	// bounded by the configured servers, but drop the expired anyway
+	for stalledUrl, stallTime := range self.stallTimes {
+		if self.stallDemotion <= now.Sub(stallTime) {
+			delete(self.stallTimes, stalledUrl)
+		}
+	}
+}
+
+// Whether a server is demoted by a recent stall (recordStall).
+func (self *serverStats) stalled(url string, now time.Time) bool {
+	if self == nil {
+		return false
+	}
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	return self.stalledLocked(url, now)
+}
+
+func (self *serverStats) stalledLocked(url string, now time.Time) bool {
+	stallTime, ok := self.stallTimes[url]
+	return ok && now.Sub(stallTime) < self.stallDemotion
 }
 
 // seed pre-loads each server's windows with a persisted score (clamped to dohSeedMaxScore),
@@ -3363,7 +4010,8 @@ func (self *serverStats) scoreLocked(url string, now time.Time) float64 {
 
 // order returns urls in a weighted-random permutation: a server's weight is its summed recent
 // success score plus an exploration floor. Uses the Efraimidis–Spirakis weighted-permutation method
-// (key = u^(1/w); higher weight -> earlier). A nil *serverStats yields a uniform-random shuffle.
+// (key = u^(1/w); higher weight -> earlier). The servers a recent stall demotes (recordStall) follow
+// the others, each part in that order. A nil *serverStats yields a uniform-random shuffle.
 func (self *serverStats) order(urls []string) []string {
 	return self.orderAt(urls, time.Now())
 }
@@ -3381,8 +4029,9 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 	}
 
 	type weighted struct {
-		url string
-		key float64
+		url     string
+		key     float64
+		stalled bool
 	}
 	ws := make([]weighted, len(ordered))
 	self.lock.Lock()
@@ -3397,11 +4046,14 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 		if u <= 0 {
 			u = math.SmallestNonzeroFloat64
 		}
-		ws[i] = weighted{url: url, key: math.Pow(u, 1/weight)}
+		ws[i] = weighted{url: url, key: math.Pow(u, 1/weight), stalled: self.stalledLocked(url, now)}
 	}
 	self.lock.Unlock()
 
 	sort.Slice(ws, func(i, j int) bool {
+		if ws[i].stalled != ws[j].stalled {
+			return !ws[i].stalled
+		}
 		return ws[i].key > ws[j].key
 	})
 	for i := range ws {
@@ -3433,9 +4085,20 @@ type DohResult struct {
 	// The miss was a filtering block (dohQueryResult.Blocked), so a cache hit
 	// still counts as a block answer delivered.
 	Blocked bool
+	// A raw response entry (DohCache.storeForward): the response wire as it
+	// arrived at Time. nil for an address entry. A raw miss (NXDOMAIN, or
+	// NODATA with no answer record) keeps its response and is Valid as an
+	// address miss is.
+	Response []byte
+	// When a raw response with answers stops being fresh: Time plus its
+	// least answer ttl, floored by the cache's MinCacheTtl.
+	Expiration time.Time
 }
 
 func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
+	if self.Response != nil && !self.Miss {
+		return !self.Expiration.Before(now)
+	}
 	if len(self.AddrExpirations) == 0 {
 		if 0 < self.MissExpiration && self.MissExpiration < missExpiration {
 			missExpiration = self.MissExpiration
@@ -3457,8 +4120,12 @@ func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
 // bound past what its TTL promised). A miss entry (authoritative NXDOMAIN/NODATA) is never
 // stale-servable: converting a resolution failure into a stale "does not exist" would deny a
 // name the resolver never re-confirmed absent, the harmful direction — RFC 8767's use case is
-// keeping known-good addresses reachable, and an expired miss carries none.
+// keeping known-good addresses reachable, and an expired miss carries none. A raw response with
+// answers is stale-usable on the same bound past its Expiration.
 func (self *DohResult) staleUsable(now time.Time) bool {
+	if self.Response != nil {
+		return !self.Miss && now.Before(self.Expiration.Add(dohStaleServeBound))
+	}
 	if len(self.AddrExpirations) == 0 {
 		return false
 	}
@@ -3477,6 +4144,22 @@ func (self *DohResult) Addrs() []netip.Addr {
 		ips = append(ips, ip)
 	}
 	return ips
+}
+
+// The whole seconds the entry's addresses stay valid at now: the least
+// remaining lifetime of its record set (Valid needs every address), 0 when it
+// has none or has expired.
+func (self *DohResult) remainingTtl(now time.Time) uint32 {
+	var earliest time.Time
+	for _, expireTime := range self.AddrExpirations {
+		if earliest.IsZero() || expireTime.Before(earliest) {
+			earliest = expireTime
+		}
+	}
+	if earliest.IsZero() {
+		return 0
+	}
+	return dohTtlSeconds(earliest.Sub(now))
 }
 
 func Punycode(domain string) (string, error) {
