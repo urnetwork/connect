@@ -79,7 +79,41 @@ import (
 // substitution: a socket created right now is born carrying egressSocketMark,
 // which happens only inside the cgroup urnetwork-linux attached its program
 // to. Nothing in a container, in CI, or in another embedding can satisfy it by
-// accident.
+// accident. The other way a process is marked is its own egress mark
+// (SetEgressMark, egress_linux.go), which ur tun's daemon sets under exits to
+// keep its own sockets off the default route it gives the tun: then every
+// socket connect makes carries that mark, the resolver's own among them, and
+// the same off-tunnel substitution applies (egressProcessMarked).
+
+// The Linux egress resolver's tunables (QD-702). The resolver is the process's
+// own, as egressBoundResolver is, so one instance, egressResolverLinuxSettings,
+// serves it; nothing changes it after init.
+type egressResolverSettings struct {
+	// How long one wire query's dial may take: 5 s. The Go resolver applies its
+	// own per-query timeout and retries across servers; this only keeps a single
+	// dead server from consuming the whole budget.
+	DialTimeout time.Duration
+	// How long an answer of the socket-mark probe is reused: 3 s. The cgroup's
+	// mark appears once, when the client attaches its program at daemon start,
+	// and does not change again for the life of the process; a short reuse
+	// window keeps two syscalls off the per-dial path without making that one
+	// transition slow to notice.
+	SelfMarkExpiration time.Duration
+	// How long a discovered server list is reused before the resolver
+	// configuration is read again: 60 s, since a DHCP renew or roam can change
+	// it; a change of carried families keys the cache miss at once.
+	DnsServerExpiration time.Duration
+}
+
+func defaultEgressResolverSettings() *egressResolverSettings {
+	return &egressResolverSettings{
+		DialTimeout:         5 * time.Second,
+		SelfMarkExpiration:  3 * time.Second,
+		DnsServerExpiration: 60 * time.Second,
+	}
+}
+
+var egressResolverLinuxSettings = defaultEgressResolverSettings()
 
 // egressSocketMark is the fwmark urnetwork-linux's cgroup-BPF sock_create
 // program stamps on every AF_INET/AF_INET6 socket this process creates
@@ -119,7 +153,7 @@ var egressSystemResolverRotation atomic.Uint64
 // caller constructed before the daemon's cgroup-BPF program attaches, and the
 // fix would then never engage no matter how marked the process later became:
 // present in the binary, invoked by nothing. Handing the resolver out
-// unconditionally and asking egressSelfMarked() per query makes the answer
+// unconditionally and asking egressProcessMarked() per query makes the answer
 // track reality, and matches egress_resolver_windows.go exactly.
 func egressResolver() *net.Resolver {
 	return egressBoundResolver
@@ -129,14 +163,18 @@ func init() {
 	// egressBound() — and with it the control-dial evidence lines and
 	// resolveEgressUDPAddr's escape for the H3/QUIC platform transports — asks
 	// this hook whether the platform excludes its own sockets by some means
-	// other than a forced interface index. On Linux that means is the fwmark.
-	egressSelfExcluded = egressSelfMarked
+	// other than a forced interface index. On Linux that means is the fwmark,
+	// the cgroup program's or the process's own egress mark.
+	egressSelfExcluded = egressProcessMarked
 }
 
-// egressResolverDialTimeout bounds one wire query's dial. The Go resolver
-// applies its own per-query timeout and retries across servers; this only
-// keeps a single dead server from consuming the whole budget.
-const egressResolverDialTimeout = 5 * time.Second
+// egressProcessMarked reports whether this process's own sockets are steered
+// around a tunnel it provides by a mark: its egress mark is set, so every
+// socket connect makes carries it, or the cgroup program marks every socket it
+// makes (egressSelfMarked).
+func egressProcessMarked() bool {
+	return EgressMark() != 0 || egressSelfMarked()
+}
 
 // egressResolverRotation rotates server choice across Dial calls, so the Go
 // resolver's retries actually try different servers instead of re-dialing the
@@ -154,12 +192,13 @@ var egressFallbackDnsServers = []string{
 }
 
 func egressResolverDial(ctx context.Context, network string, addr string) (net.Conn, error) {
-	if !egressSelfMarked() {
+	settings := egressResolverLinuxSettings
+	if !egressProcessMarked() {
 		// Not providing a tunnel: keep the Go resolver's choice while it still
 		// appears in the live system configuration. Go caches resolv.conf for
 		// five seconds; after a tunnel restores the file, replace its stale
 		// upgrade-mask choice at this final wire boundary.
-		dialer := &net.Dialer{Timeout: egressResolverDialTimeout}
+		dialer := &net.Dialer{Timeout: settings.DialTimeout}
 		return dialer.DialContext(ctx, network, freshSystemResolverAddress(addr))
 	}
 	_, port, err := net.SplitHostPort(addr)
@@ -173,12 +212,13 @@ func egressResolverDial(ctx context.Context, network string, addr string) (net.C
 	}
 	server := servers[int(egressResolverRotation.Add(1)-1)%len(servers)]
 	serverAddr := net.JoinHostPort(server, port)
-	// egressDialer is inert on Linux (applyEgressInterface is a no-op here and
-	// nothing sets an interface index), but it is kept so an embedder that does
-	// set one still gets the bind; egressMarkControl is the mechanism that
-	// actually matters, and egressDialer chains it rather than replacing it.
+	// egressMarkControl marks the socket for a process in the cgroup, and
+	// swallows a refusal; egressDialer chains it rather than replacing it, and
+	// sets the process's own egress mark where one is set, failing the dial if
+	// the socket cannot carry it (egress_linux.go). An interface index stays
+	// inert on Linux.
 	dialer := egressDialer(&net.Dialer{
-		Timeout: egressResolverDialTimeout,
+		Timeout: settings.DialTimeout,
 		Control: egressMarkControl,
 	})
 	conn, err := dialer.DialContext(ctx, network, serverAddr)
@@ -253,10 +293,18 @@ func freshSystemResolverAddress(addr string) string {
 // take DNS away from a socket the kernel had already marked correctly. The
 // first failure is logged once, because a silent no-op on this path is the
 // class of bug this whole file exists to undo.
+//
+// Where the process's own egress mark is set, that is the mark it sets, the
+// one the tunnel's rule passes by; egressControl, which egressDialer chains
+// after this, sets the same value and fails the dial when it cannot.
 func egressMarkControl(_ string, _ string, c syscall.RawConn) error {
+	mark := egressSocketMark
+	if processMark := EgressMark(); processMark != 0 {
+		mark = int(processMark)
+	}
 	var innerErr error
 	err := c.Control(func(fd uintptr) {
-		innerErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, egressSocketMark)
+		innerErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark)
 	})
 	if err != nil {
 		return err
@@ -271,13 +319,6 @@ func egressMarkControl(_ string, _ string, c syscall.RawConn) error {
 }
 
 var egressMarkControlReported atomic.Bool
-
-// egressSelfMarkExpiration bounds reuse of the socket-mark probe. The mark
-// appears once, when the client attaches its cgroup program at daemon start,
-// and does not change again for the life of the process; a short reuse window
-// keeps two syscalls off the per-dial path without making that one transition
-// slow to notice.
-const egressSelfMarkExpiration = 3 * time.Second
 
 type egressSelfMarkResult struct {
 	marked  bool
@@ -300,7 +341,7 @@ func egressSelfMarked() bool {
 	marked := egressReadFreshSocketMark() == egressSocketMark
 	egressSelfMarkCache.Store(&egressSelfMarkResult{
 		marked:  marked,
-		expires: now.Add(egressSelfMarkExpiration),
+		expires: now.Add(egressResolverLinuxSettings.SelfMarkExpiration),
 	})
 	return marked
 }
@@ -343,7 +384,7 @@ func egressResolverFamilies() (uint32, uint32) {
 // egressGlobalInterfaceIndexes returns the index of an up, non-loopback
 // interface carrying a global unicast address of each family, or 0 for a family
 // the host has none for. Dialing a family the host cannot carry costs a full
-// egressResolverDialTimeout per candidate before a usable server is reached —
+// dial timeout (DialTimeout) per candidate before a usable server is reached —
 // the same multi-second control-plane stall the Windows file's link-local rule
 // exists to prevent — so a family with no address is reported as not carried.
 //
@@ -392,11 +433,6 @@ func egressGlobalInterfaceIndexes() (uint32, uint32) {
 	return index4, index6
 }
 
-// egressDnsServerExpiration is how long a discovered server list is reused
-// before re-reading the resolver configuration (a DHCP renew or roam can change
-// it; a change of carried families keys the cache miss immediately).
-const egressDnsServerExpiration = 60 * time.Second
-
 type egressDnsServerList struct {
 	index4  uint32
 	index6  uint32
@@ -410,7 +446,7 @@ var egressDnsServerCache atomic.Pointer[egressDnsServerList]
 // change. The cache is keyed by interface index, which a switch between
 // networks on one interface (another SSID, a renewed bearer) leaves unchanged,
 // so it would keep querying the previous network's resolvers for up to
-// egressDnsServerExpiration.
+// DnsServerExpiration.
 func forgetEgressDnsServers() {
 	egressDnsServerCache.Store(nil)
 }
@@ -434,9 +470,9 @@ func egressDnsServers(index4 uint32, index6 uint32) []string {
 		index4:  index4,
 		index6:  index6,
 		servers: servers,
-		expires: now.Add(egressDnsServerExpiration),
+		expires: now.Add(egressResolverLinuxSettings.DnsServerExpiration),
 	})
-	// at most one line per egressDnsServerExpiration, and only while this
+	// at most one line per DnsServerExpiration, and only while this
 	// process provides a tunnel. It names the servers control-plane DNS is
 	// about to ride and where they came from, which is the difference between
 	// "the fix engaged" and "the fix fell through to public resolvers".

@@ -37,7 +37,7 @@ func TestApplyEgressInterfacePinsEverySocketFamily(t *testing.T) {
 			var applyErr, readErr error
 			var pinned int
 			AssertEqual(t, raw.Control(func(fd uintptr) {
-				applyErr = applyEgressInterface(fd, c.index4, c.index6)
+				applyErr = applyEgressInterface(fd, c.index4, c.index6, 0)
 				if socket.is6 {
 					pinned, readErr = windows.GetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, ipv6UnicastIf)
 				} else {
@@ -65,7 +65,7 @@ func TestEgressControlFailsIpv6DialOnInterfaceWithoutIpv6(t *testing.T) {
 		AssertEqual(t, err, nil)
 		var refused bool
 		raw.Control(func(fd uintptr) {
-			refused = errors.Is(applyEgressInterface(fd, uint32(candidate.Index), 0), errEgressIpv6Unpinned)
+			refused = errors.Is(applyEgressInterface(fd, uint32(candidate.Index), 0, 0), errEgressIpv6Unpinned)
 		})
 		conn.Close()
 		if refused {

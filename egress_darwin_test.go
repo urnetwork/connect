@@ -21,10 +21,10 @@ func TestApplyEgressInterfaceDarwin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fd)
-	if err := applyEgressInterface(uintptr(fd), uint32(loopback.Index), uint32(loopback.Index)); err != nil {
+	if err := applyEgressInterface(uintptr(fd), uint32(loopback.Index), uint32(loopback.Index), 0); err != nil {
 		t.Fatalf("pin valid IPv4 socket: %v", err)
 	}
-	if err := applyEgressInterface(^uintptr(0), uint32(loopback.Index), uint32(loopback.Index)); err == nil {
+	if err := applyEgressInterface(^uintptr(0), uint32(loopback.Index), uint32(loopback.Index), 0); err == nil {
 		t.Fatal("invalid socket was accepted without an egress binding")
 	}
 }
