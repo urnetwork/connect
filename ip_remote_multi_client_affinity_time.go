@@ -162,6 +162,11 @@ func (self *RemoteUserNatMultiClient) adoptAffinityClientWithLock(
 	if !client.hasActiveTransport() {
 		return false
 	}
+	// an exit that has stopped making progress adopts no new flow, as it
+	// donates none (ip_remote_multi_client_exit_stall.go)
+	if client.placementStalled(time.Now()) {
+		return false
+	}
 	client.stateLock.Lock()
 	defer client.stateLock.Unlock()
 	if client.IsDone() || client.serviceRefreshReservation.Load() != nil || !client.healthy || client.endErr != nil || client.warning || client.quarantined ||

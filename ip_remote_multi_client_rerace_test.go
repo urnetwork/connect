@@ -83,6 +83,16 @@ type reraceExitSpec struct {
 	// Optional test-owned hold on this provider's frames to its source
 	// clients, acknowledgements included. Nil keeps the direct route.
 	providerHold *reraceProviderHold
+	// Optional test-owned relay of this provider's frames to each source
+	// client, in place of the hold, for a test that drops or delays some of
+	// them. Nil keeps the direct route.
+	providerRelay reraceProviderRelay
+}
+
+// Carries one provider's frames to one source client until ctx ends, owning
+// each frame read from provider until source takes it.
+type reraceProviderRelay interface {
+	relay(ctx context.Context, provider <-chan []byte, source chan<- []byte)
 }
 
 // While held, a relay per source client keeps the provider's frames in order
@@ -453,9 +463,15 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 	providerTransportSend := NewSendClientTransport(DestinationId(args.ClientId))
 	providerTransportReceive := NewReceiveGatewayTransport()
 	providerRoute := routeReceive
-	if hold := exit.providerHold; hold != nil {
+	var relay reraceProviderRelay
+	if exit.providerHold != nil {
+		relay = exit.providerHold
+	} else if exit.providerRelay != nil {
+		relay = exit.providerRelay
+	}
+	if relay != nil {
 		providerRoute = make(chan []byte)
-		go hold.relay(ctx, providerRoute, routeReceive)
+		go relay.relay(ctx, providerRoute, routeReceive)
 	}
 	exit.provider.RouteManager().UpdateTransport(providerTransportReceive, []Route{routeSend})
 	exit.provider.RouteManager().UpdateTransport(providerTransportSend, []Route{providerRoute})
@@ -519,6 +535,19 @@ type reraceHarness struct {
 // bubble's -- must not decide whether this window forms.
 func newReraceHarness(t *testing.T, specs []reraceExitSpec, configure func(*MultiClientSettings)) *reraceHarness {
 	t.Helper()
+	return newReraceHarnessWithGenerator(t, specs, configure, nil)
+}
+
+// newReraceHarnessWithGenerator is newReraceHarness with the multi client's
+// generator wrapped by wrap, so a test can add a generator capability (such as
+// exclusions) over the test providers. Nil wrap uses the test generator as is.
+func newReraceHarnessWithGenerator(
+	t *testing.T,
+	specs []reraceExitSpec,
+	configure func(*MultiClientSettings),
+	wrap func(*reraceGenerator) MultiClientGenerator,
+) *reraceHarness {
+	t.Helper()
 	resetBackendDegraded()
 	// registered first, so it runs last: after the clients below have closed
 	t.Cleanup(resetBackendDegraded)
@@ -544,9 +573,13 @@ func newReraceHarness(t *testing.T, specs []reraceExitSpec, configure func(*Mult
 	if configure != nil {
 		configure(settings)
 	}
+	var generator MultiClientGenerator = harness.generator
+	if wrap != nil {
+		generator = wrap(harness.generator)
+	}
 	harness.multiClient = NewRemoteUserNatMultiClient(
 		ctx,
-		harness.generator,
+		generator,
 		harness.receive,
 		protocol.ProvideMode_Network,
 		settings,

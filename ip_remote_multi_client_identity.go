@@ -116,6 +116,12 @@ type windowIdentityState struct {
 	restored map[MultiHopId][]*WindowClientIdentity
 	// the live pairs, by client id, mirrored to the store on every change
 	live map[Id]*WindowClientIdentity
+	// live identities a restart must not restore, by client id with the
+	// generation judged: their exit was held, warned, gapped or in an ack
+	// stall when last judged, or was removed with a verdict
+	// (ip_remote_multi_client_exit_stall.go). The snapshot leaves them out;
+	// each stays live, so the in-process reuse and retirement are unchanged.
+	unrestorable map[Id]Id
 	// torn-down identities of a fixed generator awaiting the next dial of
 	// their destination, at most one per destination; each also stays in
 	// live. See ip_remote_multi_client_identity_reuse.go.
@@ -221,7 +227,10 @@ func (self *windowIdentityState) load() {
 	if !self.loadAbandoned && loadErr == nil {
 		restoredCount := 0
 		for _, identity := range identities {
-			if identity == nil {
+			// a corrupt identity that names no destination has no provider to
+			// dial, and a window would panic on it: dropped here, so nothing
+			// lists or takes it, and the store loses it at its next write
+			if identity == nil || identity.Destination.Len() == 0 {
 				continue
 			}
 			if maxRestoredWindowIdentityCount <= restoredCount {
@@ -339,6 +348,7 @@ func (self *windowIdentityState) ForgetRestored(destination MultiHopId) []*Windo
 	for _, identity := range identities {
 		if live, ok := self.live[identity.ClientId]; ok && live.InstanceId == identity.InstanceId {
 			delete(self.live, identity.ClientId)
+			delete(self.unrestorable, identity.ClientId)
 			liveChanged = true
 		}
 	}
@@ -349,12 +359,44 @@ func (self *windowIdentityState) ForgetRestored(destination MultiHopId) []*Windo
 }
 
 // Record adds a live (identity, destination) pair and mirrors the snapshot
-// to the store.
+// to the store. A recorded generation is restorable until its window judges
+// it otherwise (SetRestorable).
 func (self *windowIdentityState) Record(identity *WindowClientIdentity) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	self.live[identity.ClientId] = identity
+	delete(self.unrestorable, identity.ClientId)
 	self.storeSnapshotWithLock()
+}
+
+// Keeps a live identity out of the store snapshot a restart restores, or puts
+// it back, and rewrites the snapshot when that changes it: a window judged its
+// exit held, warned, gapped or in an ack stall, or saw it recover
+// (ip_remote_multi_client_exit_stall.go). instanceId is the generation judged;
+// a removed or superseded generation changes nothing. Returns whether the
+// snapshot changed.
+func (self *windowIdentityState) SetRestorable(clientId Id, instanceId Id, restorable bool) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	identity, ok := self.live[clientId]
+	if !ok || identity.InstanceId != instanceId {
+		return false
+	}
+	unrestorableInstanceId, unrestorable := self.unrestorable[clientId]
+	unrestorable = unrestorable && unrestorableInstanceId == instanceId
+	if unrestorable != restorable {
+		return false
+	}
+	if restorable {
+		delete(self.unrestorable, clientId)
+	} else {
+		if self.unrestorable == nil {
+			self.unrestorable = map[Id]Id{}
+		}
+		self.unrestorable[clientId] = instanceId
+	}
+	self.storeSnapshotWithLock()
+	return true
 }
 
 // Remove drops the live pair for a client id and mirrors the snapshot to the
@@ -384,13 +426,19 @@ func (self *windowIdentityState) RemoveIfCurrent(clientId Id, instanceId Id) boo
 		return false
 	}
 	delete(self.live, clientId)
+	delete(self.unrestorable, clientId)
 	self.storeSnapshotWithLock()
 	return true
 }
 
+// The live pairs a restart may restore: every live identity but those a
+// window judged unrestorable (SetRestorable).
 func (self *windowIdentityState) snapshotWithLock() []*WindowClientIdentity {
 	identities := make([]*WindowClientIdentity, 0, len(self.live))
-	for _, identity := range self.live {
+	for clientId, identity := range self.live {
+		if instanceId, ok := self.unrestorable[clientId]; ok && instanceId == identity.InstanceId {
+			continue
+		}
 		identities = append(identities, identity)
 	}
 	return identities

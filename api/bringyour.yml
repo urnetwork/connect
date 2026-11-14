@@ -6463,9 +6463,45 @@ paths:
       summary: Account Epochs
       description: |
         The caller network's finalized epochs, newest first: the points earned
-        inside each epoch's wall-clock window and the network's share of the
-        operator pool in basis points (0 when no coldkey was attached, i.e.
-        points only). `limit` defaults to 26 and is capped at 104.
+        inside each epoch's wall-clock window, the bytes the network served
+        behind those points, and the network's share of the operator pool in
+        basis points (0 when no coldkey was attached, i.e. points only).
+        `limit` defaults to 26 and is capped at 104.
+
+        Points and bytes count the weekly operator blocks (Sunday 00:00 UTC to
+        the next Sunday 00:00 UTC) the same way: a block counts in the epoch
+        whose window contains the block's end. A block's bytes are the payout
+        bytes of the provider network's settled traffic in the block: sweeps
+        of contracts with a credit-bearing outcome (settled, or a dispute
+        resolved) that closed at or after the earning cutoff, by settlement
+        time. A contract settled without escrow, and traffic before the
+        cutoff, carry none. Once a block's points are awarded, its bytes are
+        the ones the award shared the block's payout points by. Points of
+        other kinds (reliability, referral, multipliers, and payout-plan
+        points for traffic before the cutoff) have no bytes behind them.
+
+        Two running figures cover the traffic no finalized epoch holds yet,
+        both counted with the rule above. They run two to three hours behind
+        live traffic: a settlement is counted two hours after it started, so
+        that it has committed, and the figures refresh about hourly. Each
+        carries `as_of_millis`, the time it counts traffic through.
+
+        - `current_block` is the open block's bytes so far. Its `epoch` is
+          the epoch it will count in, the one whose window holds the block's
+          end. It grows all week and starts again from 0 at Sunday 00:00 UTC.
+        - `current_epoch` is the open epoch's bytes so far: those of the
+          blocks that end in it. When the epoch finalizes, its
+          `served_byte_count` continues this figure. It grows only while a
+          block that ends in the epoch is open, or still settling just after
+          it ended. Traffic in a block that ends after the epoch counts toward
+          a later epoch, and shows in `current_block` until then.
+
+        On mainnet, epochs currently open on Friday evenings (UTC) and blocks
+        end at Sunday 00:00 UTC. From Friday to Sunday the open block ends in
+        the open epoch, and both figures grow. From Sunday on, the open block
+        counts toward the next epoch: `current_epoch` holds still once the
+        block that ended on Sunday is counted, about Sunday 02:00 to 03:00
+        UTC, and `current_block` keeps growing.
 
         While settlement v2 is configured, an epoch it settles is listed from
         the ledger instead of its v1 row, once a finalized v2 root covering it
@@ -7905,8 +7941,11 @@ paths:
         address in `recipients` (exactly `quantity`, in order) also gets an
         email with its own card and the note, from URnetwork with `email` as
         its reply-to, on `send_on` at 09:00 in `timezone`, or right after
-        payment without `send_on`. The cards and the emails are in
-        `language`.
+        payment without `send_on`. Paid by card, these emails never go out
+        before two hours after the payment, past the early fraud warnings;
+        a refund or a dispute in that time withdraws them.
+        /pay/gift/order answers when they go out (`friends_send_at`). The
+        cards and the emails are in `language`.
 
         With a signed-in session, `referral_credit` links the codes to the
         caller's network: whoever redeems one and has no referrer yet
@@ -7920,10 +7959,13 @@ paths:
 
         A refusal returns `error` with a 200 and a stable `error.code`
         (PurchaseError): `gift_sales_closed`, `invalid_quantity`,
-        `invalid_email`, `invalid_recipients`, `invalid_send_on` or
-        `message_too_long`, or a shared one: `invalid_request` (an unknown
-        delivery, language or ui mode), `rate_limited` (too many checkouts
-        from this address this minute), `checkout_unavailable` or
+        `invalid_email`, `invalid_recipients`, `invalid_send_on`,
+        `message_too_long`, `gift_note_has_link` (the note or the signature
+        holds a link) or `gift_daily_limit` (with this order's recipients,
+        the buyer's email would pass 20 friend emails in 24 hours; delivery
+        `me` has no daily limit), or a shared one: `invalid_request` (an
+        unknown delivery, language or ui mode), `rate_limited` (too many
+        checkouts from this address this minute), `checkout_unavailable` or
         `start_failed`.
       operationId: payGiftCheckout
       # optional auth: anonymous callers buy as guests, a bearer can take referral credit
@@ -7973,7 +8015,9 @@ paths:
         is the invoice, as /pay/crypto/intent returns it, to pay and to
         follow with /pay/crypto/status the same way, plus the order's
         `order_id` and `order_token` and `bittensor_footer` as given. Once
-        the invoice is paid, the order is fulfilled as a card order is.
+        the invoice is paid, the order is fulfilled as a card order is,
+        except that a coin payment has no hold: the friend emails go out on
+        `send_on` at 09:00 in `timezone`, or right after payment.
 
         The invoice's `item_id` is `gift_pro_year` and its `delivery` is
         `code`, and each order has an invoice of its own. Its status never
@@ -7983,7 +8027,8 @@ paths:
         A refusal returns `error` with a 200 and a stable `error.code`
         (PurchaseError): `gift_sales_closed` and the order's own, as
         /pay/gift/checkout answers them (`invalid_quantity`, `invalid_email`,
-        `invalid_recipients`, `invalid_send_on`, `message_too_long`), or the
+        `invalid_recipients`, `invalid_send_on`, `message_too_long`,
+        `gift_note_has_link`, `gift_daily_limit`), or the
         invoice's, as /pay/crypto/intent answers them: `invalid_request` (an
         unknown asset, delivery or language), `asset_unavailable`,
         `item_unavailable` (gift orders cannot be paid in a coin now),
@@ -16279,6 +16324,16 @@ components:
             out in the buyer's `timezone`, or comes without a known one.
             `message_too_long`: the gift's note is over 240 characters or its
             signature over 40.
+            `gift_note_has_link`: the gift's note or signature holds a link:
+            a URL scheme (`https://`, any `scheme://`), `mailto:`, `www.`, or
+            a domain with a listed TLD (example.com, bit.ly, t.me/x). The
+            exact rule is the server's `model.GiftTextHasLink`
+            (GIFTOFPRIVACY.md §10.2), which the site mirrors.
+            `gift_daily_limit`: with this order's recipients, the buyer's
+            email (case-insensitive) would pass 20 friend emails in 24 hours:
+            the recipients of its delivery `them` orders of the last 24 hours
+            that are pending or paid. Delivery `me` has no daily limit beyond
+            `max_quantity` cards per order.
             Absent from older servers; clients fall back to `message` for an
             absent or unknown code.
           type: string
@@ -20552,6 +20607,7 @@ components:
         - end_millis
         - points
         - share_bps
+        - served_byte_count
       properties:
         epoch:
           type: integer
@@ -20579,6 +20635,97 @@ components:
             when the network has none.
           type: string
           pattern: "^[0-9]+$"
+        served_byte_count:
+          description: |
+            The bytes the network served in the operator blocks whose points
+            the epoch counts (see the operation); 0 when none. For a block
+            whose award has not committed yet, the bytes so far.
+          type: integer
+          format: int64
+          minimum: 0
+
+    AccountCurrentEpoch:
+      type: object
+      description: |
+        The open epoch, not yet finalized, and the bytes served so far that
+        count toward it. Absent from the result while the epoch clock is
+        unknown.
+      required:
+        - epoch
+        - start_millis
+        - end_millis
+        - served_byte_count
+        - as_of_millis
+      properties:
+        epoch:
+          type: integer
+        start_millis:
+          description: Epoch window start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: |
+            Epoch window end, unix milliseconds, projected at the chain's
+            block period: the epoch is still open.
+          type: integer
+        served_byte_count:
+          description: |
+            The bytes served so far in the operator blocks whose end is in
+            the window, counted as for a finalized epoch. Traffic in a block
+            that ends after the window counts toward the next epoch, and
+            shows in `current_block` until then.
+          type: integer
+          format: int64
+          minimum: 0
+        as_of_millis:
+          description: |
+            The figure counts traffic through this time, unix milliseconds:
+            a few hours behind live traffic while a block is open, and a
+            block's end once all of it is counted.
+          type: integer
+
+    AccountCurrentBlock:
+      type: object
+      description: |
+        The open operator block, Sunday 00:00 UTC to the next Sunday 00:00
+        UTC, and the bytes served in it so far. Absent from the result while
+        the epoch clock is unknown.
+      required:
+        - block_number
+        - start_millis
+        - end_millis
+        - served_byte_count
+        - as_of_millis
+        - epoch
+      properties:
+        block_number:
+          description: The operator block, counted from 1 at Sunday 2026-06-28 00:00 UTC.
+          type: integer
+          format: int64
+        start_millis:
+          description: Block start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: Block end, unix milliseconds.
+          type: integer
+        served_byte_count:
+          description: |
+            The bytes served so far in the block, counted as for a finalized
+            epoch.
+          type: integer
+          format: int64
+          minimum: 0
+        as_of_millis:
+          description: |
+            The figure counts traffic through this time, unix milliseconds:
+            two to three hours behind live traffic, and the block's start
+            until any of it is counted.
+          type: integer
+        epoch:
+          description: |
+            The epoch the block counts in once it ends: the one whose window
+            holds the block's end, the open epoch or a later one, projected
+            at the chain's block period.
+          type: integer
 
     AccountEpochsResult:
       type: object
@@ -20589,6 +20736,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AccountEpoch"
+        current_epoch:
+          $ref: "#/components/schemas/AccountCurrentEpoch"
+        current_block:
+          $ref: "#/components/schemas/AccountCurrentBlock"
         error:
           type: object
           required:
@@ -22629,6 +22780,10 @@ components:
           type: string
           format: date
           description: delivery `them`, the buyer's local date the friend emails are sent on; absent when they go right after payment
+        friends_send_at:
+          type: [string, "null"]
+          format: date-time
+          description: when the friend emails go out (or went out), RFC 3339; `send_on` at 09:00 in the buyer's time zone, else right after payment, and paid by card never before two hours after the payment. Null when no friend is emailed - delivery `me`, an order not paid yet, or a refunded one.
         email_masked:
           type: string
           description: the buyer's email, masked, such as `b•••@example.com`

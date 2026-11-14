@@ -841,6 +841,18 @@ func (self *ApiMultiClientGenerator) excludesDestination(destination MultiHopId)
 	return false
 }
 
+// Implements multiClientGeneratorIdentityRestore: a window keeps the identity
+// of an exit it judged held, warned, gapped or in an ack stall out of the
+// snapshot a restart restores, and puts it back once the exit recovers
+// (ip_remote_multi_client_exit_stall.go). Args without a credential name no
+// recorded identity.
+func (self *ApiMultiClientGenerator) setIdentityRestorable(args *MultiClientGeneratorClientArgs, restorable bool) {
+	if args == nil || args.ClientAuth == nil {
+		return
+	}
+	self.identityState.SetRestorable(args.ClientId, args.ClientAuth.InstanceId, restorable)
+}
+
 // NextDestinationsContext implements MultiClientGeneratorContext. Discovery is
 // owned by the caller's maintenance deadline rather than only by the
 // generator's process-lifetime context.
