@@ -255,28 +255,77 @@ func TestAnyWindowUdpNeverRacesATcpExit(t *testing.T) {
 	}
 }
 
+// The merged race (mergeRaceField, raceWindowTopsFirst) leaves an any
+// window's field as it is: with no limited window there is nothing to merge,
+// so the window's race field holds exactly its own candidates, and the tops
+// step keeps a one-window field in its order, in the same slice.
+func TestAnyWindowRaceFieldIsTheWindowsOwn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := anyWindowTestSettings()
+	generator := newCapabilityTestGenerator(true, nil)
+	quality := capabilityTestWindow(ctx, generator, settings, WindowTypeQuality)
+	parent := capabilityTestParent(ctx, cancel, generator, settings, map[WindowType]*multiClientWindow{
+		WindowTypeQuality: quality,
+	})
+	for _, capabilities := range []ProviderCapabilities{capabilityClassA, capabilityClassB, capabilityClassC, capabilityClassD} {
+		client := capabilityTestChannel(t, ctx, settings, WindowTypeQuality, capabilities)
+		quality.clients[client.ClientId()] = client
+	}
+	clientIds := func(field []*multiClientChannel) []Id {
+		ids := []Id{}
+		for _, client := range field {
+			ids = append(ids, client.ClientId())
+		}
+		slices.SortFunc(ids, func(a Id, b Id) int {
+			return a.Cmp(b)
+		})
+		return ids
+	}
+	for _, c := range []struct {
+		need      flowNeed
+		wantCount int
+	}{
+		{need: flowNeed{ipVersion: 4, ipProtocol: IpProtocolTcp}, wantCount: 4},
+		{need: flowNeed{ipVersion: 4, ipProtocol: IpProtocolUdp}, wantCount: 2},
+	} {
+		field := parent.raceField(quality, c.need, nil, nil)
+		own := parent.raceCandidates(quality, c.need)
+		if len(field) != c.wantCount || !slices.Equal(clientIds(field), clientIds(own)) {
+			t.Fatalf("protocol %d: race field of %d exits, want the window's own %d", c.need.ipProtocol, len(field), len(own))
+		}
+		ordered := raceWindowTopsFirst(field, settings, time.Now())
+		if !slices.Equal(ordered, field) || &ordered[0] != &field[0] {
+			t.Errorf("protocol %d: the tops step reordered a one-window field", c.need.ipProtocol)
+		}
+	}
+}
+
 // A multi client whose normal windows ask for any builds no limited window,
-// whatever the fraction says at construction or at runtime, and its windows
-// ask with ipv4 and any. The default selectors still build one, even at a
-// fraction of 0, which the developer override can turn on.
+// whatever the fraction says at construction or at runtime (connect's default
+// and the sdk's hold of its 32-MiB tier among them), and its windows ask with
+// ipv4 and any. The default selectors still build one, even at a fraction of
+// 0, which the developer override can turn on.
 func TestAnyWindowsBuildNoLimitedWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	settings := anyWindowTestSettings()
-	settings.LimitedWindowSizeFraction = 1
-	multi := NewRemoteUserNatMultiClient(ctx, newCapabilityTestGenerator(true, nil), nil, 0, settings)
-	defer multi.Close()
-	if multi.windows[WindowTypeLimited] != nil || len(multi.windows) != 2 {
-		t.Fatalf("windows %d with limited %t, want quality and speed alone", len(multi.windows), multi.windows[WindowTypeLimited] != nil)
-	}
-	multi.SetLimitedWindowSizeFraction(1)
-	if multi.windows[WindowTypeLimited] != nil || multi.LimitedWindowSize() != 0 || multi.LimitedWindowTargetSize() != 0 {
-		t.Error("a runtime fraction gave an any multi client a limited window")
-	}
-	for windowType, window := range multi.windows {
-		if got := window.providerSelect(); got.Ip != ProviderIpCapabilityIpv4 || got.Protocol != ProviderProtocolCapabilityAny || got.DualstackTargetCount != 0 {
-			t.Errorf("window %d asks %+v, want ipv4 and any with no ipv6 minimum", windowType, got)
+	for _, fraction := range []float64{DefaultMultiClientSettings().LimitedWindowSizeFraction, 0.5, 1} {
+		settings := anyWindowTestSettings()
+		settings.LimitedWindowSizeFraction = fraction
+		multi := NewRemoteUserNatMultiClient(ctx, newCapabilityTestGenerator(true, nil), nil, 0, settings)
+		defer multi.Close()
+		if multi.windows[WindowTypeLimited] != nil || len(multi.windows) != 2 {
+			t.Fatalf("fraction %v: windows %d with limited %t, want quality and speed alone", fraction, len(multi.windows), multi.windows[WindowTypeLimited] != nil)
+		}
+		multi.SetLimitedWindowSizeFraction(1)
+		if multi.windows[WindowTypeLimited] != nil || multi.LimitedWindowSize() != 0 || multi.LimitedWindowTargetSize() != 0 {
+			t.Errorf("fraction %v: a runtime fraction gave an any multi client a limited window", fraction)
+		}
+		for windowType, window := range multi.windows {
+			if got := window.providerSelect(); got.Ip != ProviderIpCapabilityIpv4 || got.Protocol != ProviderProtocolCapabilityAny || got.DualstackTargetCount != 0 {
+				t.Errorf("fraction %v: window %d asks %+v, want ipv4 and any with no ipv6 minimum", fraction, windowType, got)
+			}
 		}
 	}
 
