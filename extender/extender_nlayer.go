@@ -150,6 +150,10 @@ func (self *ExtenderServer) newNLayerConnectSettings() *connect.ConnectSettings 
 	// one kill switch per extender: a hop dial offers what this extender's
 	// own carriers accept (A13)
 	connectSettings.QuicVersionPolicy = self.settings.QuicVersionPolicy
+	// a hop speaks the protocol this extender serves (A3), and its 429 is
+	// believed as this extender's limited settings say (A12)
+	connectSettings.ExtenderFormatSettings = self.settings.extenderFormatSettings()
+	connectSettings.ExtenderLimitedSettings = self.settings.extenderLimitedSettings()
 	return connectSettings
 }
 
@@ -399,7 +403,7 @@ func (self *ExtenderServer) dialNLayerHop(
 // NLayerLimitedBackoff when it gave none, jittered as a client jitters it
 // (A12). A later backoff is never shortened by an earlier one.
 func (self *ExtenderServer) limitNLayerHop(index int, retryAfter time.Duration) {
-	limitedUntil := time.Now().Add(connect.JitterExtenderLimitedBackoff(retryAfter, self.settings.NLayerLimitedBackoff))
+	limitedUntil := time.Now().Add(self.settings.extenderLimitedSettings().JitterBackoff(retryAfter, self.settings.NLayerLimitedBackoff))
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	hop := self.nlayerHops[index]

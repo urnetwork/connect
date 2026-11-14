@@ -212,7 +212,7 @@ func newTestQuicCarrierServer(
 		port:     packetConn.LocalAddr().(*net.UDPAddr).Port,
 		versions: make(chan quic.Version, 16),
 	}
-	responseFrame, err := ExtenderResponseFrame(&protocol.ExtenderResponse{})
+	responseFrame, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderResponse{})
 	if err != nil {
 		packetConn.Close()
 		t.Fatal(err)

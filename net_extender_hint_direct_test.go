@@ -134,7 +134,7 @@ func (self *testRelayExtender) relay(conn net.Conn) {
 	if err != nil {
 		return
 	}
-	headerBytes, err := io.ReadAll(io.LimitReader(request.Body, ExtenderMaxHeaderByteCount))
+	headerBytes, err := io.ReadAll(io.LimitReader(request.Body, int64(DefaultExtenderFormatSettings().MaxHeaderByteCount)))
 	if err != nil {
 		return
 	}
@@ -161,7 +161,7 @@ func (self *testRelayExtender) relay(conn net.Conn) {
 		defer self.stateLock.Unlock()
 		self.relayAddrs[destination.LocalAddr().String()] = true
 	}()
-	frameBytes, err := ExtenderResponseFrame(&protocol.ExtenderResponse{})
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderResponse{})
 	if err != nil {
 		return
 	}

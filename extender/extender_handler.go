@@ -59,7 +59,7 @@ func (self *extenderHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	header, err := readExtenderHeader(req)
+	header, err := readExtenderHeader(req, server.settings.extenderFormatSettings())
 	if err != nil {
 		self.refuse(w, req, "header decode", err)
 		return
@@ -239,7 +239,7 @@ func (self *extenderHandler) writeResponse(
 	req *http.Request,
 	response *protocol.ExtenderResponse,
 ) bool {
-	responseFrameBytes, err := connect.ExtenderResponseFrame(response)
+	responseFrameBytes, err := connect.ExtenderResponseFrame(self.server.settings.extenderFormatSettings(), response)
 	if err != nil {
 		self.refuse(w, req, "response", err)
 		return false
@@ -276,12 +276,12 @@ func isExtenderRequest(req *http.Request) bool {
 }
 
 // Reads the serialized header, which every carrier delimits with the request
-// content length.
-func readExtenderHeader(req *http.Request) (*protocol.ExtenderHeader, error) {
+// content length, of at most the format's header limit.
+func readExtenderHeader(req *http.Request, formatSettings *connect.ExtenderFormatSettings) (*protocol.ExtenderHeader, error) {
 	if req.ContentLength < 0 {
 		return nil, extenderFixedError("the extender header has no content length")
 	}
-	if connect.ExtenderMaxHeaderByteCount < req.ContentLength {
+	if int64(formatSettings.MaxHeaderByteCount) < req.ContentLength {
 		return nil, extenderFixedError("the extender header is over its byte limit")
 	}
 	headerBytes := make([]byte, req.ContentLength)

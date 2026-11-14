@@ -391,13 +391,13 @@ func TestExtenderResponseFrameIsSelfDelimiting(t *testing.T) {
 		PublicKey: []byte{1, 2, 3},
 		Carriers:  []string{ExtenderCarrierTcp, ExtenderCarrierQuic},
 	}
-	frameBytes, err := ExtenderResponseFrame(response)
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), response)
 	if err != nil {
 		t.Fatal(err)
 	}
 	trailing := []byte("the inner bytes")
 	reader := &sliceReader{data: append(slices.Clone(frameBytes), trailing...)}
-	readResponse, err := ReadExtenderResponseFrame(reader)
+	readResponse, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(), reader)
 	if err != nil {
 		t.Fatal(err)
 	}

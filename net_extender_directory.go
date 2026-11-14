@@ -201,11 +201,15 @@ type ExtenderDirectorySettings struct {
 	// RefreshSleptLatencies). <= 0 keeps a sample until a probe replaces it.
 	LatencyMaxAge time.Duration
 	// How long an address that answered 429 with no Retry-After is left alone
-	// before the jitter, which is the same +-50 % a Retry-After gets (A12). A
+	// before the jitter, which is the same one a Retry-After gets (A12). A
 	// limited address is never a failure: it orders after every healthy one
 	// until its backoff passes, and the probe pass and the feed dial skip it.
 	// A backoff passes like a hold, by either clock.
 	ExtenderLimitedBackoff time.Duration
+	// How a limited backoff is jittered (A12, net_extender.go), the one object
+	// a client jitters every limit by; the strategy's dialers jitter by the
+	// directory's. Nil takes DefaultExtenderLimitedSettings().
+	ExtenderLimitedSettings *ExtenderLimitedSettings
 	// How long the operator's last country stands in once its hint is no
 	// longer current (SpoofCountryCode), by the wall clock from the operator's
 	// last answer. The country is stored, so a restart keeps it: the iOS packet
@@ -251,6 +255,14 @@ type ExtenderDirectorySettings struct {
 	Random func() float64
 }
 
+// How a limited backoff is jittered: the directory's own settings, else A12's.
+func (self *ExtenderDirectorySettings) extenderLimitedSettings() *ExtenderLimitedSettings {
+	if self.ExtenderLimitedSettings != nil {
+		return self.ExtenderLimitedSettings
+	}
+	return DefaultExtenderLimitedSettings()
+}
+
 func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 	return &ExtenderDirectorySettings{
 		HoldTimeout:                    10 * time.Minute,
@@ -267,6 +279,7 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		EventWindowTimeout:             60 * time.Second,
 		LatencyMaxAge:                  12 * time.Hour,
 		ExtenderLimitedBackoff:         30 * time.Second,
+		ExtenderLimitedSettings:        DefaultExtenderLimitedSettings(),
 		CountryHintMaxAge:              7 * 24 * time.Hour,
 		OpenEpochTimeout:               ExtenderOpenEpochTimeout,
 		Now:                            time.Now,
@@ -1357,13 +1370,13 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 
 // Records a 429 from an address (A12): it is left alone until the Retry-After
 // it answered with, or ExtenderLimitedBackoff when it gave none, jittered by
-// +-50 % and never past MaxHoldTimeout. A limit is not a failure: no failure
-// count, no hold, nothing toward removal. A later backoff is never shortened
-// by an earlier one still in force; one that has passed by either clock is
-// replaced, even when the monotonic clock alone, stopped while the host slept,
-// would still place it after the new one. Returns when the address stops being
-// limited, zero for an address the directory does not know, which it records
-// nothing for.
+// ExtenderLimitedSettings and never past MaxHoldTimeout. A limit is not a
+// failure: no failure count, no hold, nothing toward removal. A later backoff
+// is never shortened by an earlier one still in force; one that has passed by
+// either clock is replaced, even when the monotonic clock alone, stopped while
+// the host slept, would still place it after the new one. Returns when the
+// address stops being limited, zero for an address the directory does not
+// know, which it records nothing for.
 func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Duration) time.Time {
 	if !ip.IsValid() {
 		return time.Time{}
@@ -1371,7 +1384,7 @@ func (self *ExtenderDirectory) RecordLimited(ip netip.Addr, retryAfter time.Dura
 	ip = ip.Unmap()
 	now := self.settings.Now()
 	backoff := min(
-		JitterExtenderLimitedBackoff(retryAfter, self.settings.ExtenderLimitedBackoff),
+		self.settings.extenderLimitedSettings().JitterBackoff(retryAfter, self.settings.ExtenderLimitedBackoff),
 		self.settings.MaxHoldTimeout,
 	)
 

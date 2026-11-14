@@ -417,7 +417,7 @@ func readTestVerdict(t *testing.T, conn net.Conn) *protocol.ExtenderProbeVerdict
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	verdict, err := connect.ReadExtenderProbeVerdictFrame(conn)
+	verdict, err := connect.ReadExtenderProbeVerdictFrame(connect.DefaultExtenderFormatSettings(), conn)
 	if err != nil {
 		t.Fatalf("no verdict: %v", err)
 	}
@@ -427,7 +427,7 @@ func readTestVerdict(t *testing.T, conn net.Conn) *protocol.ExtenderProbeVerdict
 // Writes one attestation frame on the probe's stream.
 func writeTestAttestation(t *testing.T, conn net.Conn, attestation *protocol.ExtenderProbeAttestation) {
 	t.Helper()
-	frameBytes, err := connect.ExtenderProbeAttestationFrame(attestation)
+	frameBytes, err := connect.ExtenderProbeAttestationFrame(connect.DefaultExtenderFormatSettings(), attestation)
 	if err != nil {
 		t.Fatal(err)
 	}

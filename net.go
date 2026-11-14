@@ -104,6 +104,9 @@ func DefaultConnectSettings() *ConnectSettings {
 
 		QuicVersionPolicy: QuicVersionPolicyPreferV2,
 
+		ExtenderFormatSettings:  DefaultExtenderFormatSettings(),
+		ExtenderLimitedSettings: DefaultExtenderLimitedSettings(),
+
 		TlsConfig:                 tlsConfig,
 		TlsClientHelloFingerprint: TlsClientHelloFingerprintChrome,
 	}
@@ -177,6 +180,14 @@ type ConnectSettings struct {
 	// dialers offer (A13, net_quic_version.go). The zero value and an unknown
 	// value offer version 2 first with version 1 behind it.
 	QuicVersionPolicy QuicVersionPolicy
+
+	// The extender protocol's limits (A3, net_extender.go), which the
+	// extenders this client dials share. Nil takes
+	// DefaultExtenderFormatSettings().
+	ExtenderFormatSettings *ExtenderFormatSettings
+	// How an extender dial takes a 429 (A12, net_extender.go): the most a
+	// Retry-After is believed for. Nil takes DefaultExtenderLimitedSettings().
+	ExtenderLimitedSettings *ExtenderLimitedSettings
 
 	// WebRtcExtenderCarrier, when set, is the dial side of the peer-to-peer
 	// webrtc extender carrier (EXTENDER.md S, net_extender_webrtc.go): it

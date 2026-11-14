@@ -181,7 +181,7 @@ func (self *testWebRtcExtender) HandleWebRtcExtenderStream(ctx context.Context, 
 	if err != nil {
 		return
 	}
-	headerBytes, err := io.ReadAll(io.LimitReader(request.Body, ExtenderMaxHeaderByteCount))
+	headerBytes, err := io.ReadAll(io.LimitReader(request.Body, int64(DefaultExtenderFormatSettings().MaxHeaderByteCount)))
 	if err != nil {
 		return
 	}
@@ -209,7 +209,7 @@ func (self *testWebRtcExtender) HandleWebRtcExtenderStream(ctx context.Context, 
 	if self.signKey != nil {
 		challengeSignature = SignExtenderChallenge(self.signKey, header.Challenge)
 	}
-	frameBytes, err := ExtenderResponseFrame(&protocol.ExtenderResponse{
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderResponse{
 		PublicKey:          self.publishKey,
 		ChallengeSignature: challengeSignature,
 		Carriers:           []string{ExtenderCarrierWebRtc},

@@ -106,7 +106,7 @@ func TestExtenderRetryAfterParsesBothForms(t *testing.T) {
 		if c.value != "" {
 			header.Set("Retry-After", c.value)
 		}
-		if retryAfter := extenderRetryAfter(header, now); retryAfter != c.expect {
+		if retryAfter := extenderRetryAfter(DefaultExtenderLimitedSettings(), header, now); retryAfter != c.expect {
 			t.Errorf("%q: %s, expected %s", c.value, retryAfter, c.expect)
 		}
 	}
@@ -117,7 +117,7 @@ func TestExtenderRetryAfterParsesBothForms(t *testing.T) {
 func TestJitterExtenderLimitedBackoffStaysWithinHalf(t *testing.T) {
 	low, high := time.Duration(0), time.Duration(0)
 	for i := 0; i < 2000; i += 1 {
-		backoff := JitterExtenderLimitedBackoff(30*time.Second, time.Hour)
+		backoff := DefaultExtenderLimitedSettings().JitterBackoff(30*time.Second, time.Hour)
 		if backoff < 15*time.Second || 45*time.Second < backoff {
 			t.Fatalf("backoff %s is outside 15s to 45s", backoff)
 		}
@@ -131,11 +131,11 @@ func TestJitterExtenderLimitedBackoffStaysWithinHalf(t *testing.T) {
 		t.Fatalf("2000 draws spanned only %s to %s", low, high)
 	}
 	for i := 0; i < 100; i += 1 {
-		if backoff := JitterExtenderLimitedBackoff(0, 30*time.Second); backoff < 15*time.Second || 45*time.Second < backoff {
+		if backoff := DefaultExtenderLimitedSettings().JitterBackoff(0, 30*time.Second); backoff < 15*time.Second || 45*time.Second < backoff {
 			t.Fatalf("the default backoff drew %s", backoff)
 		}
 	}
-	if backoff := JitterExtenderLimitedBackoff(0, 0); backoff != 0 {
+	if backoff := DefaultExtenderLimitedSettings().JitterBackoff(0, 0); backoff != 0 {
 		t.Fatalf("no backoff at all drew %s", backoff)
 	}
 }

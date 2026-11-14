@@ -27,7 +27,7 @@ import (
 // response given, and the config that dials it.
 func newTestFixedExtenderResponder(t *testing.T, response *protocol.ExtenderResponse) *ExtenderConfig {
 	t.Helper()
-	frameBytes, err := ExtenderResponseFrame(response)
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), response)
 	if err != nil {
 		t.Fatal(err)
 	}

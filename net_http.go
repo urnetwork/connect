@@ -3188,7 +3188,7 @@ func (self *clientDialer) limit(retryAfter time.Duration) {
 		directorySettings = directory.settings
 	}
 	backoff := min(
-		JitterExtenderLimitedBackoff(retryAfter, directorySettings.ExtenderLimitedBackoff),
+		directorySettings.extenderLimitedSettings().JitterBackoff(retryAfter, directorySettings.ExtenderLimitedBackoff),
 		directorySettings.MaxHoldTimeout,
 	)
 	limitedUntil := time.Now().Add(backoff)

@@ -37,9 +37,6 @@ import (
 // streams. A probe over the per-source rate is refused before any of this,
 // because a probe is cheap by design and would otherwise be a lever.
 
-// The map cap of the probe limiter, the same as the dns forwarder's.
-const extenderProbeMaxSourceCount = 4096
-
 // The state of one probe request between the header and the stream.
 type extenderProbe struct {
 	// the attesting provider's client id, nil unless a provider asked
@@ -58,15 +55,18 @@ func (self *extenderProbe) nonceBytes() []byte {
 }
 
 // The per-source admission of probes: one token bucket per address, pruned
-// when the map grows past the cap.
+// when the map grows past maxSourceCount (ExtenderSettings.ProbeMaxSourceCount).
 type extenderProbeLimiter struct {
+	maxSourceCount int
+
 	stateLock     sync.Mutex
 	sourceBuckets map[string]*tokenBucket
 }
 
-func newExtenderProbeLimiter() *extenderProbeLimiter {
+func newExtenderProbeLimiter(maxSourceCount int) *extenderProbeLimiter {
 	return &extenderProbeLimiter{
-		sourceBuckets: map[string]*tokenBucket{},
+		maxSourceCount: maxSourceCount,
+		sourceBuckets:  map[string]*tokenBucket{},
 	}
 }
 
@@ -88,7 +88,7 @@ func (self *extenderProbeLimiter) admit(source string, now time.Time, ratePerSec
 	if available {
 		bucket.take()
 	}
-	if extenderProbeMaxSourceCount < len(self.sourceBuckets) {
+	if self.maxSourceCount < len(self.sourceBuckets) {
 		// a source with a full bucket is indistinguishable from one never
 		// seen, so a flood of addresses cannot grow the map without bound
 		for otherSource, otherBucket := range self.sourceBuckets {
@@ -167,7 +167,7 @@ func (self *ExtenderServer) serveProbe(ctx context.Context, clientConn net.Conn,
 		self.reportError("probe attestation", err)
 		return
 	}
-	attestation, err := connect.ReadExtenderProbeAttestationFrame(clientConn)
+	attestation, err := connect.ReadExtenderProbeAttestationFrame(self.settings.extenderFormatSettings(), clientConn)
 	if err != nil {
 		self.reportError("probe attestation", err)
 		return
@@ -181,7 +181,7 @@ func (self *ExtenderServer) serveProbe(ctx context.Context, clientConn net.Conn,
 	// refusal from a lost connection (GEOMAP §2.3). A provider built before
 	// the verdict closes its side after the frame without reading, so a
 	// failed write here is expected, costs nothing, and changes nothing.
-	verdictFrameBytes, err := connect.ExtenderProbeVerdictFrame(verdict)
+	verdictFrameBytes, err := connect.ExtenderProbeVerdictFrame(self.settings.extenderFormatSettings(), verdict)
 	if err != nil {
 		self.reportError("probe verdict", err)
 		return

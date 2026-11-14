@@ -441,8 +441,8 @@ func TestExtenderFeedCountsAreTheDesignBounds(t *testing.T) {
 	if ExtenderSharePrefix != "ur-ext:1:" {
 		t.Errorf("the share prefix is %q", ExtenderSharePrefix)
 	}
-	if ExtenderMaxHeaderByteCount != 1024 {
-		t.Errorf("the header cap is %d", ExtenderMaxHeaderByteCount)
+	if DefaultExtenderFormatSettings().MaxHeaderByteCount != 1024 {
+		t.Errorf("the header cap is %d", DefaultExtenderFormatSettings().MaxHeaderByteCount)
 	}
 	if ExtenderChallengeByteCount != 32 {
 		t.Errorf("the challenge is %d bytes", ExtenderChallengeByteCount)

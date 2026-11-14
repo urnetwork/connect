@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	mathrand "math/rand"
 	"net"
 	"net/http"
@@ -125,11 +126,77 @@ const (
 // Content type of both the extender request and its response (A3).
 const ExtenderContentType = "application/x-ur-extender"
 
-// Maximum serialized extender header, request and response alike (A3).
-const ExtenderMaxHeaderByteCount = 1024
-
 // Encoding tld of the dns carrier when a record does not carry one (A1).
 const DefaultExtenderDnsTld = "ur.xyz."
+
+// The extender protocol's limits (A3): the protocol's values, which the client
+// and the extender share. Changing one is a protocol change no deployment makes
+// on one side alone, so each side's settings carry this one object, the
+// client's ConnectSettings.ExtenderFormatSettings and the extender's
+// ExtenderSettings.ExtenderFormatSettings, and its defaults stay here (QD-702).
+// The carrier ports and the dns tld above name endpoints rather than bound
+// anything, and stay identifiers.
+type ExtenderFormatSettings struct {
+	// The most bytes a serialized extender header holds, the request's and the
+	// response's alike: 1024 (A3). It also bounds every frame the extender
+	// streams carry before their raw bytes, the response frame and a probe's
+	// attestation and verdict frames, the tcp response's http head, and the v1
+	// header length the extender still tells from an http request.
+	// Non-positive refuses every header and frame.
+	MaxHeaderByteCount int
+}
+
+// A3's values, the only source of their defaults. A fresh value each call,
+// sharing nothing mutable with any other.
+func DefaultExtenderFormatSettings() *ExtenderFormatSettings {
+	return &ExtenderFormatSettings{
+		MaxHeaderByteCount: 1024,
+	}
+}
+
+// How a client takes an extender's 429 (A12): how far it believes the
+// Retry-After the answer carried, and how a limited backoff is jittered, so the
+// clients one limit turned away do not all come back at once. The client's
+// ConnectSettings, the directory's settings and an NLayer front's settings each
+// carry this one object, so a front jitters a hop's limit as a client jitters
+// an extender's, and its defaults stay here (QD-702).
+type ExtenderLimitedSettings struct {
+	// The most a Retry-After is taken for, in either of RFC 9110's forms: a
+	// day, which is past any backoff this client keeps and bounds the
+	// arithmetic of a hostile value. Non-positive takes none, so every 429
+	// reads as one that carried no Retry-After.
+	RetryAfterMax time.Duration
+	// How far a limited backoff is jittered either way, as a fraction of it,
+	// drawn uniformly: 0.5, A12's +-50 %, so a backoff lands between half and
+	// one and a half times itself. 0 or less jitters nothing, and more than 1
+	// is taken as 1, so a backoff never falls below zero.
+	BackoffJitterFraction float64
+}
+
+// A12's values, the only source of their defaults. A fresh value each call,
+// sharing nothing mutable with any other.
+func DefaultExtenderLimitedSettings() *ExtenderLimitedSettings {
+	return &ExtenderLimitedSettings{
+		RetryAfterMax:         24 * time.Hour,
+		BackoffJitterFraction: 0.5,
+	}
+}
+
+// The extender protocol's limits this client dials with: its own, else A3's.
+func (self *ConnectSettings) extenderFormatSettings() *ExtenderFormatSettings {
+	if self.ExtenderFormatSettings != nil {
+		return self.ExtenderFormatSettings
+	}
+	return DefaultExtenderFormatSettings()
+}
+
+// How this client takes an extender's 429: its own settings, else A12's.
+func (self *ConnectSettings) extenderLimitedSettings() *ExtenderLimitedSettings {
+	if self.ExtenderLimitedSettings != nil {
+		return self.ExtenderLimitedSettings
+	}
+	return DefaultExtenderLimitedSettings()
+}
 
 // The carrier name of a connect mode, as it appears on the wire.
 func ExtenderCarrierForConnectMode(connectMode ExtenderConnectMode) string {
@@ -476,7 +543,7 @@ func dialExtenderStream(
 		return dialExtenderWebRtc(ctx, connectSettings, extenderConfig, extenderDial)
 	}
 
-	headerBytes, err := extenderRequestHeaderBytes(extenderConfig, extenderDial)
+	headerBytes, err := extenderRequestHeaderBytes(connectSettings.extenderFormatSettings(), extenderConfig, extenderDial)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -494,8 +561,9 @@ func dialExtenderStream(
 }
 
 // The serialized request header, with the hmac over timestamp and nonce when
-// the extender is private.
+// the extender is private, and never longer than the format's header limit.
 func extenderRequestHeaderBytes(
+	formatSettings *ExtenderFormatSettings,
 	extenderConfig *ExtenderConfig,
 	extenderDial *ExtenderDial,
 ) ([]byte, error) {
@@ -527,8 +595,8 @@ func extenderRequestHeaderBytes(
 		return nil, err
 	}
 	defer MessagePoolReturn(headerMessageBytes)
-	if ExtenderMaxHeaderByteCount < len(headerMessageBytes) {
-		return nil, fmt.Errorf("extender header is %d bytes, at most %d", len(headerMessageBytes), ExtenderMaxHeaderByteCount)
+	if formatSettings.MaxHeaderByteCount < len(headerMessageBytes) {
+		return nil, fmt.Errorf("extender header is %d bytes, at most %d", len(headerMessageBytes), formatSettings.MaxHeaderByteCount)
 	}
 	return append([]byte(nil), headerMessageBytes...), nil
 }
@@ -759,7 +827,8 @@ func extenderStreamRequest(
 
 	// the reader may buffer past the response; it becomes the read side of
 	// the returned connection
-	headerReader := &extenderResponseHeaderReader{reader: serverConn, remaining: ExtenderMaxHeaderByteCount}
+	formatSettings := connectSettings.extenderFormatSettings()
+	headerReader := newExtenderResponseHeaderReader(serverConn, formatSettings)
 	reader := bufio.NewReader(headerReader)
 	var response *protocol.ExtenderResponse
 	if err := withConnReadPhaseDeadline(ctx, serverConn, connectSettings.ConnectTimeout, func() error {
@@ -770,7 +839,7 @@ func extenderStreamRequest(
 		timeSource.observe(httpResponse.Header, sendTime, extenderCamouflageLocalNow())
 		headerReader.remaining = -1
 		if httpResponse.StatusCode == http.StatusTooManyRequests {
-			return &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
+			return &ExtenderLimitedError{RetryAfter: extenderRetryAfter(connectSettings.extenderLimitedSettings(), httpResponse.Header, time.Now())}
 		}
 		if httpResponse.StatusCode != http.StatusOK {
 			return &ExtenderRefusedError{StatusCode: httpResponse.StatusCode}
@@ -778,11 +847,11 @@ func extenderStreamRequest(
 		// A stream extender sends exactly one bounded, length-delimited frame
 		// before handing the connection over. Reject chunked bodies/trailers:
 		// Body.Close would otherwise parse unbounded trailer MIME headers.
-		if len(httpResponse.TransferEncoding) != 0 || httpResponse.ContentLength < 4 || httpResponse.ContentLength > 4+ExtenderMaxHeaderByteCount {
+		if len(httpResponse.TransferEncoding) != 0 || httpResponse.ContentLength < 4 || httpResponse.ContentLength > int64(4+formatSettings.MaxHeaderByteCount) {
 			return fmt.Errorf("extender response must have a bounded content length")
 		}
 		defer httpResponse.Body.Close()
-		response, err = ReadExtenderResponseFrame(httpResponse.Body)
+		response, err = ReadExtenderResponseFrame(formatSettings, httpResponse.Body)
 		if err == nil {
 			roundTrip.markReceive()
 		}
@@ -892,7 +961,10 @@ func dialExtenderQuic(
 	flight := quicSendFlightForConn(quicConn)
 	flight.bind(quicConn)
 
-	h3Transport := &http3.Transport{MaxResponseHeaderBytes: ExtenderMaxHeaderByteCount}
+	formatSettings := connectSettings.extenderFormatSettings()
+	// http3 takes a non-positive limit as its own default, so the request
+	// header's check above is what refuses one; this stays bounded either way
+	h3Transport := &http3.Transport{MaxResponseHeaderBytes: max(1, formatSettings.MaxHeaderByteCount)}
 	clientConn := h3Transport.NewClientConn(quicConn)
 	stream, err := clientConn.OpenRequestStream(ctx)
 	if err != nil {
@@ -935,12 +1007,12 @@ func dialExtenderQuic(
 		extenderCamouflageLocalNow(),
 	)
 	if httpResponse.StatusCode == http.StatusTooManyRequests {
-		return nil, nil, &ExtenderLimitedError{RetryAfter: extenderRetryAfter(httpResponse.Header, time.Now())}
+		return nil, nil, &ExtenderLimitedError{RetryAfter: extenderRetryAfter(connectSettings.extenderLimitedSettings(), httpResponse.Header, time.Now())}
 	}
 	if httpResponse.StatusCode != http.StatusOK {
 		return nil, nil, &ExtenderRefusedError{StatusCode: httpResponse.StatusCode}
 	}
-	response, err := ReadExtenderResponseFrame(stream)
+	response, err := ReadExtenderResponseFrame(formatSettings, stream)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -996,30 +1068,32 @@ func (self *ExtenderLimitedError) Error() string {
 }
 
 // The Retry-After of a 429, in either form RFC 9110 allows -- seconds, or a
-// date -- and zero when there is none or it does not parse, or has passed.
-func extenderRetryAfter(header http.Header, now time.Time) time.Duration {
+// date -- and zero when there is none or it does not parse, or has passed. It
+// is never taken for longer than the settings' RetryAfterMax.
+func extenderRetryAfter(limitedSettings *ExtenderLimitedSettings, header http.Header, now time.Time) time.Duration {
 	value := strings.TrimSpace(header.Get("Retry-After"))
-	if value == "" {
+	if value == "" || limitedSettings.RetryAfterMax <= 0 {
 		return 0
 	}
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
-		// a day is past any backoff this client would keep, and bounds the
-		// arithmetic of a hostile value
 		if seconds <= 0 {
 			return 0
 		}
-		return time.Duration(min(seconds, int64(24*60*60))) * time.Second
+		// whole seconds of the bound, so the product cannot overflow
+		maxSeconds := int64(limitedSettings.RetryAfterMax / time.Second)
+		return time.Duration(min(seconds, maxSeconds)) * time.Second
 	}
 	if date, err := http.ParseTime(value); err == nil {
-		return max(0, min(date.Sub(now), 24*time.Hour))
+		return max(0, min(date.Sub(now), limitedSettings.RetryAfterMax))
 	}
 	return 0
 }
 
 // How long to leave a limited extender alone (A12): the Retry-After it
 // answered with, or defaultBackoff when it gave none, jittered uniformly by
-// +-50 %, so the clients one limit turned away do not all come back at once.
-func JitterExtenderLimitedBackoff(retryAfter time.Duration, defaultBackoff time.Duration) time.Duration {
+// BackoffJitterFraction either way, so the clients one limit turned away do
+// not all come back at once. Zero when there is no backoff at all.
+func (self *ExtenderLimitedSettings) JitterBackoff(retryAfter time.Duration, defaultBackoff time.Duration) time.Duration {
 	backoff := retryAfter
 	if backoff <= 0 {
 		backoff = defaultBackoff
@@ -1027,22 +1101,53 @@ func JitterExtenderLimitedBackoff(retryAfter time.Duration, defaultBackoff time.
 	if backoff <= 0 {
 		return 0
 	}
-	return backoff/2 + time.Duration(mathrand.Int63n(int64(backoff)+1))
+	fraction := min(max(self.BackoffJitterFraction, 0), 1)
+	// within [0, backoff] whatever the float rounding of a huge backoff did
+	spread := min(max(time.Duration(float64(backoff)*fraction), 0), backoff)
+	if spread == 0 {
+		return backoff
+	}
+	// uniform over [backoff - spread, backoff + spread], the top cut at the
+	// largest duration so a huge backoff cannot wrap
+	low := backoff - spread
+	high := backoff + spread
+	if high < backoff {
+		high = math.MaxInt64
+	}
+	window := int64(high - low)
+	if window < math.MaxInt64 {
+		window += 1
+	}
+	return low + time.Duration(mathrand.Int63n(window))
 }
 
 // Limit bytes supplied to http.ReadResponse, not just its bufio read-ahead:
 // net/http's MIME parser can otherwise grow a single line or header map
 // without bound. Once headers are parsed, -1 allows the buffered reader to
 // continue as the inner tunnel's read side. All parser roots fit the outer
-// H1 claim; at most the 1-KiB wire header plus the fixed bufio buffer is read.
+// H1 claim; at most the wire header limit (ExtenderFormatSettings) plus the
+// fixed bufio buffer is read.
 type extenderResponseHeaderReader struct {
 	reader    io.Reader
 	remaining int
+	// the limit remaining started from, for the refusal
+	maxByteCount int
+}
+
+// A reader of at most the format's header limit from reader. A non-positive
+// limit reads nothing, never the unbounded -1.
+func newExtenderResponseHeaderReader(reader io.Reader, formatSettings *ExtenderFormatSettings) *extenderResponseHeaderReader {
+	maxByteCount := max(0, formatSettings.MaxHeaderByteCount)
+	return &extenderResponseHeaderReader{
+		reader:       reader,
+		remaining:    maxByteCount,
+		maxByteCount: maxByteCount,
+	}
 }
 
 func (self *extenderResponseHeaderReader) Read(b []byte) (int, error) {
 	if self.remaining == 0 {
-		return 0, fmt.Errorf("extender HTTP response headers exceed %d bytes", ExtenderMaxHeaderByteCount)
+		return 0, fmt.Errorf("extender HTTP response headers exceed %d bytes", self.maxByteCount)
 	}
 	if self.remaining > 0 {
 		b = b[:min(len(b), self.remaining)]
@@ -1070,17 +1175,17 @@ func openExtenderPacketConn(
 }
 
 // The A3 response body: a 4-byte big-endian length and the serialized
-// ExtenderResponse. The length prefix makes the body self-delimiting, which
-// the udp carriers need: there the response body and the raw bytes that follow
-// it are the same http3 DATA stream, so a content length would bound the
-// reader the caller keeps using.
-func ExtenderResponseFrame(response *protocol.ExtenderResponse) ([]byte, error) {
+// ExtenderResponse, which is at most the format's header limit. The length
+// prefix makes the body self-delimiting, which the udp carriers need: there
+// the response body and the raw bytes that follow it are the same http3 DATA
+// stream, so a content length would bound the reader the caller keeps using.
+func ExtenderResponseFrame(formatSettings *ExtenderFormatSettings, response *protocol.ExtenderResponse) ([]byte, error) {
 	responseBytes, err := proto.Marshal(response)
 	if err != nil {
 		return nil, err
 	}
-	if ExtenderMaxHeaderByteCount < len(responseBytes) {
-		return nil, fmt.Errorf("extender response is %d bytes, at most %d", len(responseBytes), ExtenderMaxHeaderByteCount)
+	if formatSettings.MaxHeaderByteCount < len(responseBytes) {
+		return nil, fmt.Errorf("extender response is %d bytes, at most %d", len(responseBytes), formatSettings.MaxHeaderByteCount)
 	}
 	frameBytes := make([]byte, 4+len(responseBytes))
 	binary.BigEndian.PutUint32(frameBytes[0:4], uint32(len(responseBytes)))
@@ -1089,15 +1194,16 @@ func ExtenderResponseFrame(response *protocol.ExtenderResponse) ([]byte, error) 
 }
 
 // Reads exactly one response frame, leaving the reader on the first byte that
-// follows it.
-func ReadExtenderResponseFrame(reader io.Reader) (*protocol.ExtenderResponse, error) {
+// follows it. A length past the format's header limit is refused before
+// anything is allocated for it.
+func ReadExtenderResponseFrame(formatSettings *ExtenderFormatSettings, reader io.Reader) (*protocol.ExtenderResponse, error) {
 	lengthBytes := make([]byte, 4)
 	if _, err := io.ReadFull(reader, lengthBytes); err != nil {
 		return nil, err
 	}
 	responseByteCount := int(binary.BigEndian.Uint32(lengthBytes))
-	if ExtenderMaxHeaderByteCount < responseByteCount {
-		return nil, fmt.Errorf("extender response is %d bytes, at most %d", responseByteCount, ExtenderMaxHeaderByteCount)
+	if formatSettings.MaxHeaderByteCount < responseByteCount {
+		return nil, fmt.Errorf("extender response is %d bytes, at most %d", responseByteCount, formatSettings.MaxHeaderByteCount)
 	}
 	responseBytes := make([]byte, responseByteCount)
 	if _, err := io.ReadFull(reader, responseBytes); err != nil {

@@ -282,7 +282,7 @@ func (self *WebRtcExtenderCarrier) DialWithExchanger(
 		}
 		dial.Challenge = challenge
 	}
-	headerBytes, err := extenderRequestHeaderBytes(extenderConfig, &dial)
+	headerBytes, err := extenderRequestHeaderBytes(connectSettings.extenderFormatSettings(), extenderConfig, &dial)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -25,26 +25,26 @@ func TestExtenderTCPResponseHeaderParserHasAnInputBound(t *testing.T) {
 	} {
 		source := strings.NewReader("HTTP/1.1 200 OK\r\n" + headers + "Content-Length: 4\r\n\r\n\x00\x00\x00\x00")
 		initial := source.Len()
-		reader := &extenderResponseHeaderReader{reader: source, remaining: ExtenderMaxHeaderByteCount}
+		reader := newExtenderResponseHeaderReader(source, DefaultExtenderFormatSettings())
 		if _, err := http.ReadResponse(bufio.NewReader(reader), nil); err == nil {
 			t.Fatal("oversized MIME headers were parsed")
 		}
-		if read := initial - source.Len(); read != ExtenderMaxHeaderByteCount {
-			t.Fatalf("parser consumed %d input bytes, cap=%d", read, ExtenderMaxHeaderByteCount)
+		if read := initial - source.Len(); read != DefaultExtenderFormatSettings().MaxHeaderByteCount {
+			t.Fatalf("parser consumed %d input bytes, cap=%d", read, DefaultExtenderFormatSettings().MaxHeaderByteCount)
 		}
 	}
 	// Read-ahead bytes must still become the tunnel's first bytes when the
 	// header cap is disabled after a valid response.
 	const inner = "first inner bytes"
 	source := strings.NewReader("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x00\x00\x00\x00" + inner)
-	limited := &extenderResponseHeaderReader{reader: source, remaining: ExtenderMaxHeaderByteCount}
+	limited := newExtenderResponseHeaderReader(source, DefaultExtenderFormatSettings())
 	reader := bufio.NewReader(limited)
 	response, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	limited.remaining = -1
-	if _, err := ReadExtenderResponseFrame(response.Body); err != nil {
+	if _, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(), response.Body); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
@@ -117,7 +117,7 @@ func TestExtenderOuterResponseHeadersFailBoundedAndReleaseClaim(t *testing.T) {
 				}
 				value := strings.Repeat("X~Z|Q^", 512)
 				if carrier == "quic-decoded" {
-					value = strings.Repeat("a", ExtenderMaxHeaderByteCount+64)
+					value = strings.Repeat("a", DefaultExtenderFormatSettings().MaxHeaderByteCount+64)
 				}
 				server := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("X-Large", value)

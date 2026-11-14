@@ -79,6 +79,8 @@ func DefaultExtenderSettings() *ExtenderSettings {
 			Count:    9,
 		},
 
+		RelayBufferByteCount: 4096,
+
 		HeaderTimeout:               10 * time.Second,
 		ForwardDialTimeout:          5 * time.Second,
 		QuicIdleTimeout:             30 * time.Second,
@@ -106,6 +108,7 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		ProbeAttestationTimeout: 5 * time.Second,
 		ProbeMaxRatePerSource:   1,
 		ProbeMaxBurstPerSource:  10,
+		ProbeMaxSourceCount:     4096,
 
 		NLayerMaxDepth:           4,
 		NLayerDialTimeout:        10 * time.Second,
@@ -137,7 +140,26 @@ func DefaultExtenderSettings() *ExtenderSettings {
 		ExtenderCamouflageSpliceMaxPerTarget: 32,
 
 		Measurement: DefaultExtenderLagSettings(),
+
+		ExtenderFormatSettings:  connect.DefaultExtenderFormatSettings(),
+		ExtenderLimitedSettings: connect.DefaultExtenderLimitedSettings(),
 	}
+}
+
+// The extender protocol's limits this extender serves by: its own, else A3's.
+func (self *ExtenderSettings) extenderFormatSettings() *connect.ExtenderFormatSettings {
+	if self.ExtenderFormatSettings != nil {
+		return self.ExtenderFormatSettings
+	}
+	return connect.DefaultExtenderFormatSettings()
+}
+
+// How this extender takes a hop's 429: its own settings, else A12's.
+func (self *ExtenderSettings) extenderLimitedSettings() *connect.ExtenderLimitedSettings {
+	if self.ExtenderLimitedSettings != nil {
+		return self.ExtenderLimitedSettings
+	}
+	return connect.DefaultExtenderLimitedSettings()
 }
 
 type ExtenderSettings struct {
@@ -153,6 +175,11 @@ type ExtenderSettings struct {
 	// may only fill a socket buffer and do not replace this liveness backstop.
 	// Enable=false disables it. A custom Listen callback owns its socket policy.
 	TcpKeepAliveConfig net.KeepAliveConfig
+
+	// The read buffer of each direction of a forward's relay, in bytes: 4 KiB,
+	// one read's worth of a stream that is mostly small records. Non-positive
+	// relays a byte at a time.
+	RelayBufferByteCount int
 
 	// Budget for the outer handshake and the extender request of one
 	// connection (A9). A client that opens a connection and says nothing is
@@ -287,6 +314,11 @@ type ExtenderSettings struct {
 	// disables the limit.
 	ProbeMaxRatePerSource  float64
 	ProbeMaxBurstPerSource int
+	// The sources the probe limiter keeps a bucket for before it prunes the
+	// ones whose bucket is full again, which are indistinguishable from
+	// sources never seen: 4096, the same as the dns forwarder's. Non-positive
+	// prunes at every probe.
+	ProbeMaxSourceCount int
 
 	// NLayerHops, when set, makes this an NLayer extender (A11): a forward
 	// request is relayed, as an extender client, to one of these other
@@ -322,8 +354,9 @@ type ExtenderSettings struct {
 	// block.
 	NLayerHoldHandler func(index int, held bool, err error)
 	// How long an NLayer hop that answered 429 with no Retry-After is left
-	// alone before the +-50 % jitter a Retry-After gets too (A12). A limited
-	// hop is not held: the other hops are preferred until its backoff passes.
+	// alone before the jitter a Retry-After gets too (A12,
+	// ExtenderLimitedSettings). A limited hop is not held: the other hops are
+	// preferred until its backoff passes.
 	NLayerLimitedBackoff time.Duration
 
 	// The admission limits of this instance (A12), each a rate per minute
@@ -499,6 +532,16 @@ type ExtenderSettings struct {
 	// certificate, so the API never serves.
 	Measurement  ExtenderLagSettings
 	LagLifecycle *ExtenderLagLifecycleSettings
+
+	// The extender protocol's limits (A3, connect's net_extender.go), which
+	// the clients this extender serves share, and its NLayer hop dials too.
+	// Nil takes connect.DefaultExtenderFormatSettings().
+	ExtenderFormatSettings *connect.ExtenderFormatSettings
+	// How this extender, as an NLayer front, takes a hop's 429 (A12): the
+	// Retry-After its hop dials believe, and the jitter of a limited hop's
+	// backoff, the one a client jitters by. Nil takes
+	// connect.DefaultExtenderLimitedSettings().
+	ExtenderLimitedSettings *connect.ExtenderLimitedSettings
 }
 
 type ExtenderServer struct {
@@ -684,7 +727,7 @@ func NewExtenderServer(
 		carrierListenErrs:        map[string]error{},
 		forwardDialer:            forwardDialer,
 		listening:                make(chan struct{}),
-		probeLimiter:             newExtenderProbeLimiter(),
+		probeLimiter:             newExtenderProbeLimiter(settings.ProbeMaxSourceCount),
 		nlayerHops:               newExtenderNLayerHops(settings.NLayerHops),
 		nlayerClientRandomCounts: map[[32]byte]int{},
 		nlayerProbeSources:       map[nlayerProbeSource]bool{},
@@ -1956,7 +1999,7 @@ func (self *ExtenderServer) serveTerminatedConnection(
 	}
 
 	headerByteCount := int(binary.BigEndian.Uint32(initialBytes))
-	if headerByteCount <= connect.ExtenderMaxHeaderByteCount {
+	if headerByteCount <= self.settings.extenderFormatSettings().MaxHeaderByteCount {
 		// v1: a length-prefixed header and no response frame. No http method
 		// and no tls record begins with such a length.
 		self.handleV1Connection(ctx, cancel, clientConn, headerByteCount)
@@ -2189,7 +2232,7 @@ func (self *ExtenderServer) relay(
 		// read packet from clientConn, write to forwardConn
 		defer cancel()
 
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, max(1, self.settings.RelayBufferByteCount))
 
 		for {
 			select {
@@ -2236,7 +2279,7 @@ func (self *ExtenderServer) relay(
 		// read packet from forwardConn, write to clientConn
 		defer cancel()
 
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, max(1, self.settings.RelayBufferByteCount))
 
 		for {
 			select {

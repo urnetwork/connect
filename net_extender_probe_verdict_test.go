@@ -94,7 +94,7 @@ func (self *testVerdictTarget) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		response.ProbeNonce = nonce
 	}
-	frameBytes, err := ExtenderResponseFrame(response)
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), response)
 	if err != nil {
 		w.WriteHeader(http.StatusForbidden)
 		return
@@ -113,7 +113,7 @@ func (self *testVerdictTarget) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	attestation, err := ReadExtenderProbeAttestationFrame(bufrw.Reader)
+	attestation, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bufrw.Reader)
 	if err != nil {
 		return
 	}
@@ -144,7 +144,7 @@ func testVerdictConnectSettings() *ConnectSettings {
 
 // Writes one verdict frame on the stream, as a target does.
 func writeTestVerdict(conn net.Conn, verdict *protocol.ExtenderProbeVerdict) {
-	frameBytes, err := ExtenderProbeVerdictFrame(verdict)
+	frameBytes, err := ExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), verdict)
 	if err != nil {
 		panic(err)
 	}

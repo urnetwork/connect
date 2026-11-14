@@ -26,6 +26,7 @@ func TestDefaultExtenderSettingsValues(t *testing.T) {
 		{name: "WriteTimeout", value: settings.WriteTimeout, expected: 30 * time.Second},
 		{name: "ValidFrom", value: settings.ValidFrom, expected: 180 * 24 * time.Hour},
 		{name: "ValidFor", value: settings.ValidFor, expected: 180 * 24 * time.Hour},
+		{name: "RelayBufferByteCount", value: settings.RelayBufferByteCount, expected: 4096},
 
 		{name: "HeaderTimeout", value: settings.HeaderTimeout, expected: 10 * time.Second},
 		{name: "QuicIdleTimeout", value: settings.QuicIdleTimeout, expected: 30 * time.Second},
@@ -52,6 +53,11 @@ func TestDefaultExtenderSettingsValues(t *testing.T) {
 		{name: "NLayerAttempts", value: settings.NLayerAttempts, expected: 2},
 		{name: "NLayerClientHelloTimeout", value: settings.NLayerClientHelloTimeout, expected: 2 * time.Second},
 		{name: "NLayerLimitedBackoff", value: settings.NLayerLimitedBackoff, expected: 30 * time.Second},
+
+		{name: "ProbeMaxSourceCount", value: settings.ProbeMaxSourceCount, expected: 4096},
+		{name: "ExtenderFormatSettings.MaxHeaderByteCount", value: settings.ExtenderFormatSettings.MaxHeaderByteCount, expected: 1024},
+		{name: "ExtenderLimitedSettings.RetryAfterMax", value: settings.ExtenderLimitedSettings.RetryAfterMax, expected: 24 * time.Hour},
+		{name: "ExtenderLimitedSettings.BackoffJitterFraction", value: settings.ExtenderLimitedSettings.BackoffJitterFraction, expected: 0.5},
 
 		{name: "AdmissionSubnetsPerMinute", value: settings.AdmissionSubnetsPerMinute, expected: 1000},
 		{name: "AdmissionActionsPerSubnetPerMinute", value: settings.AdmissionActionsPerSubnetPerMinute, expected: 8},

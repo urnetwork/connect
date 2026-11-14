@@ -134,16 +134,16 @@ func TestExtenderLeafVerifierCopiesItsKey(t *testing.T) {
 func TestExtenderResponseFrameIsBoundedBothWays(t *testing.T) {
 	// a response that serializes over the cap is refused rather than written
 	oversized := &protocol.ExtenderResponse{
-		PublicKey: make([]byte, ExtenderMaxHeaderByteCount+1),
+		PublicKey: make([]byte, DefaultExtenderFormatSettings().MaxHeaderByteCount+1),
 	}
-	if frameBytes, err := ExtenderResponseFrame(oversized); err == nil {
+	if frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), oversized); err == nil {
 		t.Errorf("an oversized response was framed as %d bytes", len(frameBytes))
 	}
 	// one that fits is framed with its length prefix
 	response := &protocol.ExtenderResponse{
 		Carriers: []string{ExtenderCarrierTcp},
 	}
-	frameBytes, err := ExtenderResponseFrame(response)
+	frameBytes, err := ExtenderResponseFrame(DefaultExtenderFormatSettings(), response)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,23 +153,23 @@ func TestExtenderResponseFrameIsBoundedBothWays(t *testing.T) {
 
 	// a length prefix over the cap is refused before the body is allocated
 	overlong := []byte{0xff, 0xff, 0xff, 0xff}
-	if _, err := ReadExtenderResponseFrame(strings.NewReader(string(overlong))); err == nil {
+	if _, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(), strings.NewReader(string(overlong))); err == nil {
 		t.Error("an overlong response length was accepted")
 	}
 	// a truncated body is the read error, not a short response
 	truncated := append([]byte(nil), frameBytes...)
-	if _, err := ReadExtenderResponseFrame(
+	if _, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(),
 		strings.NewReader(string(truncated[:len(truncated)-1])),
 	); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("a truncated frame returned %v", err)
 	}
 	// a truncated length prefix is likewise a read error
-	if _, err := ReadExtenderResponseFrame(strings.NewReader("ab")); err == nil {
+	if _, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(), strings.NewReader("ab")); err == nil {
 		t.Error("a truncated length prefix was accepted")
 	}
 	// a body that is not a response does not decode
 	badBody := []byte{0x00, 0x00, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff}
-	if _, err := ReadExtenderResponseFrame(strings.NewReader(string(badBody))); err == nil {
+	if _, err := ReadExtenderResponseFrame(DefaultExtenderFormatSettings(), strings.NewReader(string(badBody))); err == nil {
 		t.Error("a body that is not a response decoded")
 	}
 }
@@ -185,14 +185,14 @@ func TestExtenderRequestHeaderIsBoundedAtTheCap(t *testing.T) {
 			Port:        443,
 		},
 	}
-	headerBytes, err := extenderRequestHeaderBytes(extenderConfig, &ExtenderDial{
+	headerBytes, err := extenderRequestHeaderBytes(DefaultExtenderFormatSettings(), extenderConfig, &ExtenderDial{
 		DestinationHost: "dest.example",
 		DestinationPort: 443,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ExtenderMaxHeaderByteCount < len(headerBytes) {
+	if DefaultExtenderFormatSettings().MaxHeaderByteCount < len(headerBytes) {
 		t.Fatalf("an ordinary header is %d bytes", len(headerBytes))
 	}
 	header := &protocol.ExtenderHeader{}
@@ -207,8 +207,8 @@ func TestExtenderRequestHeaderIsBoundedAtTheCap(t *testing.T) {
 		t.Fatal("an open extender header carried a signature")
 	}
 
-	oversized := strings.Repeat("a", ExtenderMaxHeaderByteCount+1) + ".example"
-	if headerBytes, err := extenderRequestHeaderBytes(extenderConfig, &ExtenderDial{
+	oversized := strings.Repeat("a", DefaultExtenderFormatSettings().MaxHeaderByteCount+1) + ".example"
+	if headerBytes, err := extenderRequestHeaderBytes(DefaultExtenderFormatSettings(), extenderConfig, &ExtenderDial{
 		DestinationHost: oversized,
 		DestinationPort: 443,
 	}); err == nil {

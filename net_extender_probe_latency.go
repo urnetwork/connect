@@ -320,7 +320,7 @@ func ProbeExtenderLatency(
 		probe.AttestErr = err
 		return probe, nil
 	}
-	frameBytes, err := ExtenderProbeAttestationFrame(attestation)
+	frameBytes, err := ExtenderProbeAttestationFrame(connectSettings.extenderFormatSettings(), attestation)
 	if err != nil {
 		probe.AttestErr = err
 		return probe, nil
@@ -343,7 +343,7 @@ func ProbeExtenderLatency(
 	var verdict *protocol.ExtenderProbeVerdict
 	readErr := withConnReadPhaseDeadline(probeCtx, conn, connectSettings.ConnectTimeout, func() error {
 		var err error
-		verdict, err = ReadExtenderProbeVerdictFrame(conn)
+		verdict, err = ReadExtenderProbeVerdictFrame(connectSettings.extenderFormatSettings(), conn)
 		return err
 	})
 	if verdict == nil {
@@ -611,31 +611,43 @@ func VerifyExtenderProbeVerdict(
 }
 
 // The attestation frame: the 4-byte big-endian length prefix every extender
-// frame uses, bounded by the header ceiling.
-func ExtenderProbeAttestationFrame(attestation *protocol.ExtenderProbeAttestation) ([]byte, error) {
-	return extenderProbeFrame(attestation, "attestation")
+// frame uses, bounded by the format's header limit.
+func ExtenderProbeAttestationFrame(
+	formatSettings *ExtenderFormatSettings,
+	attestation *protocol.ExtenderProbeAttestation,
+) ([]byte, error) {
+	return extenderProbeFrame(formatSettings, attestation, "attestation")
 }
 
 // Reads exactly one attestation frame.
-func ReadExtenderProbeAttestationFrame(reader io.Reader) (*protocol.ExtenderProbeAttestation, error) {
+func ReadExtenderProbeAttestationFrame(
+	formatSettings *ExtenderFormatSettings,
+	reader io.Reader,
+) (*protocol.ExtenderProbeAttestation, error) {
 	attestation := &protocol.ExtenderProbeAttestation{}
-	if err := readExtenderProbeFrame(reader, attestation, "attestation"); err != nil {
+	if err := readExtenderProbeFrame(formatSettings, reader, attestation, "attestation"); err != nil {
 		return nil, err
 	}
 	return attestation, nil
 }
 
 // The verdict frame, framed exactly as the attestation is.
-func ExtenderProbeVerdictFrame(verdict *protocol.ExtenderProbeVerdict) ([]byte, error) {
-	return extenderProbeFrame(verdict, "verdict")
+func ExtenderProbeVerdictFrame(
+	formatSettings *ExtenderFormatSettings,
+	verdict *protocol.ExtenderProbeVerdict,
+) ([]byte, error) {
+	return extenderProbeFrame(formatSettings, verdict, "verdict")
 }
 
 // Reads exactly one verdict frame. An empty frame is refused: no verdict the
 // target sends is empty, since an acceptance carries its flag and a refusal
 // its reason.
-func ReadExtenderProbeVerdictFrame(reader io.Reader) (*protocol.ExtenderProbeVerdict, error) {
+func ReadExtenderProbeVerdictFrame(
+	formatSettings *ExtenderFormatSettings,
+	reader io.Reader,
+) (*protocol.ExtenderProbeVerdict, error) {
 	verdict := &protocol.ExtenderProbeVerdict{}
-	if err := readExtenderProbeFrame(reader, verdict, "verdict"); err != nil {
+	if err := readExtenderProbeFrame(formatSettings, reader, verdict, "verdict"); err != nil {
 		return nil, err
 	}
 	return verdict, nil
@@ -644,7 +656,7 @@ func ReadExtenderProbeVerdictFrame(reader io.Reader) (*protocol.ExtenderProbeVer
 // One probe frame of either kind: the length prefix, then the message. An
 // empty message is refused on the way out exactly as on the way in, so a
 // frame is never written that no reader accepts.
-func extenderProbeFrame(message proto.Message, name string) ([]byte, error) {
+func extenderProbeFrame(formatSettings *ExtenderFormatSettings, message proto.Message, name string) ([]byte, error) {
 	messageBytes, err := proto.Marshal(message)
 	if err != nil {
 		return nil, err
@@ -652,12 +664,12 @@ func extenderProbeFrame(message proto.Message, name string) ([]byte, error) {
 	if len(messageBytes) == 0 {
 		return nil, fmt.Errorf("extender probe %s is empty", name)
 	}
-	if ExtenderMaxHeaderByteCount < len(messageBytes) {
+	if formatSettings.MaxHeaderByteCount < len(messageBytes) {
 		return nil, fmt.Errorf(
 			"extender probe %s is %d bytes, at most %d",
 			name,
 			len(messageBytes),
-			ExtenderMaxHeaderByteCount,
+			formatSettings.MaxHeaderByteCount,
 		)
 	}
 	frameBytes := make([]byte, 4+len(messageBytes))
@@ -667,19 +679,19 @@ func extenderProbeFrame(message proto.Message, name string) ([]byte, error) {
 }
 
 // Reads one probe frame into the message. The length is checked against the
-// ceiling before anything is allocated for it.
-func readExtenderProbeFrame(reader io.Reader, message proto.Message, name string) error {
+// format's header limit before anything is allocated for it.
+func readExtenderProbeFrame(formatSettings *ExtenderFormatSettings, reader io.Reader, message proto.Message, name string) error {
 	lengthBytes := make([]byte, 4)
 	if _, err := io.ReadFull(reader, lengthBytes); err != nil {
 		return err
 	}
 	messageByteCount := int(binary.BigEndian.Uint32(lengthBytes))
-	if messageByteCount == 0 || ExtenderMaxHeaderByteCount < messageByteCount {
+	if messageByteCount == 0 || formatSettings.MaxHeaderByteCount < messageByteCount {
 		return fmt.Errorf(
 			"extender probe %s is %d bytes, at most %d",
 			name,
 			messageByteCount,
-			ExtenderMaxHeaderByteCount,
+			formatSettings.MaxHeaderByteCount,
 		)
 	}
 	messageBytes := make([]byte, messageByteCount)

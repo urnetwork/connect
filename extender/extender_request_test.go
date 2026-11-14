@@ -91,7 +91,7 @@ func TestExtenderRefusesAnOversizedHeader(t *testing.T) {
 	client := newRawExtenderHttpClient(fixture, nil)
 	defer client.CloseIdleConnections()
 
-	oversizedBytes := make([]byte, connect.ExtenderMaxHeaderByteCount+1)
+	oversizedBytes := make([]byte, connect.DefaultExtenderFormatSettings().MaxHeaderByteCount+1)
 	response, err := client.Post(
 		"https://"+testServerName+"/",
 		connect.ExtenderContentType,

@@ -161,11 +161,11 @@ func TestExtenderProbeAttestationSignsAndVerifies(t *testing.T) {
 		t.Fatalf("kind = %q", kind)
 	}
 	// the frame carries it intact
-	frameBytes, err := ExtenderProbeAttestationFrame(attestation)
+	frameBytes, err := ExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), attestation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := ReadExtenderProbeAttestationFrame(bytes.NewReader(frameBytes))
+	read, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,11 +195,11 @@ func TestExtenderPeerProbeAttestationSignsAndVerifies(t *testing.T) {
 	if !VerifyExtenderProbeAttestation(pingerPublicKey, attestation) {
 		t.Fatal("a freshly signed peer attestation does not verify")
 	}
-	frameBytes, err := ExtenderProbeAttestationFrame(attestation)
+	frameBytes, err := ExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), attestation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := ReadExtenderProbeAttestationFrame(bytes.NewReader(frameBytes))
+	read, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -931,29 +931,29 @@ func TestExtenderProbeAttestationFrameBounds(t *testing.T) {
 	if err := SignExtenderProbeAttestation(attestor, attestation); err != nil {
 		t.Fatal(err)
 	}
-	frameBytes, err := ExtenderProbeAttestationFrame(attestation)
+	frameBytes, err := ExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), attestation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// truncated
-	if _, err := ReadExtenderProbeAttestationFrame(bytes.NewReader(frameBytes[0 : len(frameBytes)-1])); err == nil {
+	if _, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes[0:len(frameBytes)-1])); err == nil {
 		t.Fatal("a truncated frame was read")
 	}
 	// an empty frame
-	if _, err := ReadExtenderProbeAttestationFrame(bytes.NewReader([]byte{0, 0, 0, 0})); err == nil {
+	if _, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bytes.NewReader([]byte{0, 0, 0, 0})); err == nil {
 		t.Fatal("an empty frame was read")
 	}
 	// a length past the ceiling is refused before anything is allocated
-	if _, err := ReadExtenderProbeAttestationFrame(bytes.NewReader([]byte{0xff, 0xff, 0xff, 0xff})); err == nil {
+	if _, err := ReadExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), bytes.NewReader([]byte{0xff, 0xff, 0xff, 0xff})); err == nil {
 		t.Fatal("an oversized frame was read")
 	}
 	// an empty message is refused on the way out, as it is on the way in
-	if _, err := ExtenderProbeAttestationFrame(&protocol.ExtenderProbeAttestation{}); err == nil {
+	if _, err := ExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderProbeAttestation{}); err == nil {
 		t.Fatal("an empty attestation was framed")
 	}
 	// an oversized message is refused on the way out too
-	attestation.Signature = make([]byte, ExtenderMaxHeaderByteCount)
-	if _, err := ExtenderProbeAttestationFrame(attestation); err == nil {
+	attestation.Signature = make([]byte, DefaultExtenderFormatSettings().MaxHeaderByteCount)
+	if _, err := ExtenderProbeAttestationFrame(DefaultExtenderFormatSettings(), attestation); err == nil {
 		t.Fatal("an oversized attestation was framed")
 	}
 }
@@ -971,7 +971,7 @@ func TestExtenderProbeVerdictFrameRoundTripAndBounds(t *testing.T) {
 		{Reason: ExtenderProbeVerdictReasonRttBelowObserved},
 		{Reason: ExtenderProbeVerdictReasonRateLimited},
 	} {
-		frameBytes, err := ExtenderProbeVerdictFrame(verdict)
+		frameBytes, err := ExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), verdict)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -981,7 +981,7 @@ func TestExtenderProbeVerdictFrameRoundTripAndBounds(t *testing.T) {
 		}
 		// followed by anything: exactly one frame is read
 		reader := bytes.NewReader(append(slices.Clone(frameBytes), 1, 2, 3))
-		read, err := ReadExtenderProbeVerdictFrame(reader)
+		read, err := ReadExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), reader)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -991,7 +991,7 @@ func TestExtenderProbeVerdictFrameRoundTripAndBounds(t *testing.T) {
 		if reader.Len() != 3 {
 			t.Fatalf("the read consumed past its frame: %d left", reader.Len())
 		}
-		if _, err := ReadExtenderProbeVerdictFrame(bytes.NewReader(frameBytes[0 : len(frameBytes)-1])); err == nil {
+		if _, err := ReadExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes[0:len(frameBytes)-1])); err == nil {
 			t.Fatal("a truncated verdict frame was read")
 		}
 	}
@@ -1003,28 +1003,28 @@ func TestExtenderProbeVerdictFrameRoundTripAndBounds(t *testing.T) {
 		"nothing":          {},
 		"not a verdict":    {0, 0, 0, 2, 0xff, 0xff},
 	} {
-		if _, err := ReadExtenderProbeVerdictFrame(bytes.NewReader(frameBytes)); err == nil {
+		if _, err := ReadExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes)); err == nil {
 			t.Fatalf("%s: a verdict frame was read", name)
 		}
 	}
 	// the refusal with no reason is the one empty verdict, and it is never
 	// framed, so a reader never sees one
-	if _, err := ExtenderProbeVerdictFrame(&protocol.ExtenderProbeVerdict{}); err == nil {
+	if _, err := ExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderProbeVerdict{}); err == nil {
 		t.Fatal("an empty verdict was framed")
 	}
-	if _, err := ExtenderProbeVerdictFrame(&protocol.ExtenderProbeVerdict{Accepted: true, Cosignature: make([]byte, ExtenderMaxHeaderByteCount)}); err == nil {
+	if _, err := ExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), &protocol.ExtenderProbeVerdict{Accepted: true, Cosignature: make([]byte, DefaultExtenderFormatSettings().MaxHeaderByteCount)}); err == nil {
 		t.Fatal("an oversized verdict was framed")
 	}
 	// the ceiling itself is allowed
-	atCeiling := &protocol.ExtenderProbeVerdict{Accepted: true, Cosignature: make([]byte, ExtenderMaxHeaderByteCount-2-3)}
-	frameBytes, err := ExtenderProbeVerdictFrame(atCeiling)
+	atCeiling := &protocol.ExtenderProbeVerdict{Accepted: true, Cosignature: make([]byte, DefaultExtenderFormatSettings().MaxHeaderByteCount-2-3)}
+	frameBytes, err := ExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), atCeiling)
 	if err != nil {
 		t.Fatalf("a verdict at the ceiling was refused: %v", err)
 	}
-	if len(frameBytes) != 4+ExtenderMaxHeaderByteCount {
+	if len(frameBytes) != 4+DefaultExtenderFormatSettings().MaxHeaderByteCount {
 		t.Fatalf("the ceiling verdict is %d bytes", len(frameBytes))
 	}
-	if _, err := ReadExtenderProbeVerdictFrame(bytes.NewReader(frameBytes)); err != nil {
+	if _, err := ReadExtenderProbeVerdictFrame(DefaultExtenderFormatSettings(), bytes.NewReader(frameBytes)); err != nil {
 		t.Fatalf("a verdict at the ceiling was not read: %v", err)
 	}
 }
