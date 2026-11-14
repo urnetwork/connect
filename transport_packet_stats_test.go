@@ -42,56 +42,66 @@ func TestMultiRouteSelectorReportsActualTransport(t *testing.T) {
 }
 
 func TestTransportPacketAttributionReconcilesWithAggregate(t *testing.T) {
-	counters := &packetStatsCounters{}
-	attribution := newTransportPacketAttribution(counters, 2, 2400)
-	attribution.admit()
+	for _, firstTransport := range []TransportType{TransportTypeH1, TransportTypeH3} {
+		counters := &packetStatsCounters{}
+		attribution := newTransportPacketAttribution(counters, 2, 2400)
+		attribution.admit()
 
-	stats := counters.snapshot()
-	if stats.RemoteEgressPacketCount != 2 || stats.RemoteEgressByteCount != 2400 {
-		t.Fatalf("unexpected aggregate before route: %+v", stats)
-	}
-	unknown := stats.TransportStats[TransportTypeUnknown]
-	if unknown.RemoteEgressPacketCount != 2 || unknown.RemoteEgressByteCount != 2400 {
-		t.Fatalf("unexpected unknown bucket before route: %+v", unknown)
-	}
+		stats := counters.snapshot()
+		if stats.RemoteEgressPacketCount != 2 || stats.RemoteEgressByteCount != 2400 {
+			t.Fatalf("unexpected aggregate before route: %+v", stats)
+		}
+		unknown := stats.TransportStats[TransportTypeUnknown]
+		if unknown.RemoteEgressPacketCount != 2 || unknown.RemoteEgressByteCount != 2400 {
+			t.Fatalf("unexpected unknown bucket before route: %+v", unknown)
+		}
 
-	attribution.observe(TransportTypeH3)
-	// A duplicate race attempt cannot move the same logical traffic again.
-	attribution.observe(TransportTypeH1)
-	counters.recordRemoteIngress(TransportTypeH1, 3, 3600)
-	stats = counters.snapshot()
-	if stats.TransportStats[TransportTypeUnknown].RemoteEgressPacketCount != 0 ||
-		stats.TransportStats[TransportTypeH3].RemoteEgressPacketCount != 2 ||
-		stats.TransportStats[TransportTypeH1].RemoteIngressPacketCount != 3 {
-		t.Fatalf("unexpected attributed stats: %+v", stats.TransportStats)
-	}
+		attribution.observe(firstTransport)
+		// A duplicate race attempt cannot move the same logical traffic again.
+		otherTransport := TransportTypeH1
+		if firstTransport == TransportTypeH1 {
+			otherTransport = TransportTypeH3
+		}
+		attribution.observe(otherTransport)
+		counters.recordRemoteIngress(TransportTypeH1, 3, 3600)
+		stats = counters.snapshot()
+		if stats.TransportStats[TransportTypeUnknown].RemoteEgressPacketCount != 0 ||
+			stats.TransportStats[TransportTypeUnknown].RemoteEgressByteCount != 0 ||
+			stats.TransportStats[firstTransport].RemoteEgressPacketCount != 2 ||
+			stats.TransportStats[firstTransport].RemoteEgressByteCount != 2400 ||
+			stats.TransportStats[otherTransport].RemoteEgressPacketCount != 0 ||
+			stats.TransportStats[otherTransport].RemoteEgressByteCount != 0 ||
+			stats.TransportStats[TransportTypeH1].RemoteIngressPacketCount != 3 {
+			t.Fatalf("unexpected attributed stats: %+v", stats.TransportStats)
+		}
 
-	var egressPackets int64
-	var egressBytes ByteCount
-	var ingressPackets int64
-	var ingressBytes ByteCount
-	for _, transportType := range TransportTypes() {
-		transportStats := stats.TransportStats[transportType]
-		egressPackets += transportStats.RemoteEgressPacketCount
-		egressBytes += transportStats.RemoteEgressByteCount
-		ingressPackets += transportStats.RemoteIngressPacketCount
-		ingressBytes += transportStats.RemoteIngressByteCount
-	}
-	if egressPackets != stats.RemoteEgressPacketCount ||
-		egressBytes != stats.RemoteEgressByteCount ||
-		ingressPackets != stats.RemoteIngressPacketCount ||
-		ingressBytes != stats.RemoteIngressByteCount {
-		t.Fatalf(
-			"transport sum (%d, %d, %d, %d) != aggregate (%d, %d, %d, %d)",
-			egressPackets,
-			egressBytes,
-			ingressPackets,
-			ingressBytes,
-			stats.RemoteEgressPacketCount,
-			stats.RemoteEgressByteCount,
-			stats.RemoteIngressPacketCount,
-			stats.RemoteIngressByteCount,
-		)
+		var egressPackets int64
+		var egressBytes ByteCount
+		var ingressPackets int64
+		var ingressBytes ByteCount
+		for _, transportType := range TransportTypes() {
+			transportStats := stats.TransportStats[transportType]
+			egressPackets += transportStats.RemoteEgressPacketCount
+			egressBytes += transportStats.RemoteEgressByteCount
+			ingressPackets += transportStats.RemoteIngressPacketCount
+			ingressBytes += transportStats.RemoteIngressByteCount
+		}
+		if egressPackets != stats.RemoteEgressPacketCount ||
+			egressBytes != stats.RemoteEgressByteCount ||
+			ingressPackets != stats.RemoteIngressPacketCount ||
+			ingressBytes != stats.RemoteIngressByteCount {
+			t.Fatalf(
+				"transport sum (%d, %d, %d, %d) != aggregate (%d, %d, %d, %d)",
+				egressPackets,
+				egressBytes,
+				ingressPackets,
+				ingressBytes,
+				stats.RemoteEgressPacketCount,
+				stats.RemoteEgressByteCount,
+				stats.RemoteIngressPacketCount,
+				stats.RemoteIngressByteCount,
+			)
+		}
 	}
 }
 

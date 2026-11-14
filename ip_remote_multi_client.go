@@ -1986,6 +1986,8 @@ type tcpControlObservation struct {
 	valid              bool
 	syn                bool
 	windowScaleEnabled bool
+	// TCP ownership may complete ahead of a return gap without exit-health credit.
+	aheadOfGap bool
 }
 
 type pendingIngressTcpControl struct {
@@ -2008,6 +2010,7 @@ func tcpControlFromIpPath(ipPath *IpPath) tcpControlObservation {
 		valid:              true,
 		syn:                ipPath.Syn,
 		windowScaleEnabled: ipPath.TcpWindowScaleEnabled,
+		aheadOfGap:         ipPath.receiveAheadOfGap,
 	}
 }
 
@@ -6449,7 +6452,6 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				delete(updates, update)
 				update.discoveryAttemptStamp.Add(1)
 				update.sourceReset.Store(true)
-				update.invalidateNativeAckRetryWithLock()
 				update.client.Store(nil)
 				if update.cancel != nil {
 					update.cancel()
@@ -11456,6 +11458,9 @@ type multiClientChannelUpdate struct {
 	// already carrying data. New-SYN generation commit and its first response
 	// are serialized by stateLock; established ingress remains lock-free.
 	receivedInbound atomic.Bool
+	// An ahead-of-gap first response establishes protocol ownership while its
+	// one health receipt waits for ordered progress. Guarded by stateLock.
+	deferredInboundHealth bool
 	// Set once the flow was torn down by removeClient, a send error or
 	// quarantine, each of which offers its source a reset. The connect
 	// attempt is then dead to the app, so later inbound for it is never
@@ -11861,6 +11866,7 @@ func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32
 	self.ackPerformance.reset()
 	if self.synGenerationSeen || self.sequencePacketCount != 0 {
 		self.receivedInbound.Store(false)
+		self.deferredInboundHealth = false
 		self.synGenerationAwaiting = true
 	}
 	self.synGenerationSeen, self.synGenerationNumber = true, sequence
@@ -11925,6 +11931,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 				proof := &observations.synAdmission
 				if proof.update == self && proof.sequence == sendPacket.ipPath.SequenceNumber && proof.responseClient == client {
 					self.receivedInbound.Store(true)
+					self.deferredInboundHealth = !proof.responseHealthCredited
 					self.synGenerationAwaiting = false
 					self.observeTcpRecoveryAckWithLock(client, proof.responseControl)
 				}
@@ -12637,6 +12644,7 @@ type parsedPacketGroup struct {
 	collapseAdmission          tcpCollapseAdmission
 	collapseOwner              *tcpCollapseGroup
 	completionClient           *multiClientChannel
+	connectSynOffer            *connectSynOffer
 	completionSelection        *multiClientAffinitySelection
 	collapseNext               *parsedPacketGroup
 	collapseSource             *SendSequence
@@ -17437,7 +17445,10 @@ type clientWindowStats struct {
 	// blackholeReasonFromStats doc) — with BlackholeConnectTimeout at that
 	// same scale, the windowed clock ages out at the very moment the
 	// no-receive-syn bar matures and the verdict can barely ever fire.
-	firstUnansweredSendSynTime  time.Time
+	firstUnansweredSendSynTime time.Time
+	// Real channel snapshots distinguish no admitted attempt from legacy
+	// classifier fixtures that supply only the windowed SYN clock.
+	connectProgressKnown        bool
 	estimatedByteCountPerSecond ByteCount
 	// FIXME firstStatDuration
 	clientDuration       time.Duration
@@ -17751,6 +17762,12 @@ type multiClientChannel struct {
 	pendingSendTime time.Time
 	// Orders pending-episode changes even when their clock readings tie.
 	pendingSendGeneration uint64
+	// Only unresolved admitted SYN offers remain linked. Successful completion
+	// reduces their evidence to one lifetime clock; received SYNs end the epoch.
+	// Guarded by stateLock, like packetStats and the pending-send clock.
+	connectSynEpoch         uint64
+	connectSynPending       *connectSynOffer
+	connectSynConfirmedTime time.Time
 	// The health loop's wake while it is parked on an idle channel
 	// (parkIdleBlackhole), nil otherwise. The first send of a run and the
 	// channel's first error signal it and clear it, so the loop judges the
@@ -19909,7 +19926,12 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		frames[packetIndex] = frame
 	}
 
-	self.addSendGroup(sendPacketGroup)
+	synOffer := self.addSendGroup(sendPacketGroup)
+	sendPacketGroup.connectSynOffer = synOffer
+	synAdmitted := false
+	if synOffer != nil {
+		defer func() { self.resolveConnectSynAdmission(synOffer, synAdmitted) }()
+	}
 	if self.stalled.Load() {
 		if sendPacketGroup.affinityTransition.Load() != nil {
 			// Stalling can change after the entry check. Synthetic success
@@ -19930,6 +19952,10 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
 		}
 		sendPacketGroup.completionSelection = nil
+		// The explicit stall fault accepts and swallows the source input.
+		// It cannot later prove an unwritten local expiry.
+		self.finishConnectSynOffer(synOffer, true)
+		synAdmitted = true
 		return true, nil
 	}
 
@@ -20018,6 +20044,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	if self.sendTransferForTest != nil {
 		sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
 	}
+	synAdmitted = true
 	for packetIndex, frame := range frames {
 		if !frame.Raw {
 			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
@@ -20035,7 +20062,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		return false, err
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
-		self.addSend(packetByteCount, parsedPacket.ipPath)
+		synOffer := self.addSend(packetByteCount, parsedPacket.ipPath)
+		synAdmitted := false
+		if synOffer != nil {
+			defer func() { self.resolveConnectSynAdmission(synOffer, synAdmitted) }()
+		}
 		// The packet-local clock is needed only when a peer Ack will complete a
 		// real round trip. A NoAck callback observes the initial route write.
 		var sendTime time.Time
@@ -20061,6 +20092,8 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 				MessagePoolReturn(frame.MessageBytes)
 			}
 			MessagePoolReturn(parsedPacket.packet)
+			self.finishConnectSynOffer(synOffer, true)
+			synAdmitted = true
 			return true, nil
 		}
 
@@ -20068,6 +20101,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		collapseAdmission := parsedPacket.collapseAdmission
 		ackCallback := func(err error) {
 			completionOnce.Do(func() {
+				self.finishConnectSynOffer(synOffer, !packetTransferExpiredUnwritten(err))
 				collapseAdmission.complete(err)
 				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
 			})
@@ -20117,6 +20151,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			return success, err
 		}
 		if success {
+			synAdmitted = true
 			if !frame.Raw {
 				MessagePoolReturn(parsedPacket.packet)
 			}
@@ -20232,11 +20267,15 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	ack bool,
 	err error,
 ) {
+	localUnwritten := packetGroupTransferUnwritten(err)
+	if offer := sendPacketGroup.connectSynOffer; offer != nil {
+		self.finishConnectSynOffer(offer, !localUnwritten || offer.materialized.Load())
+	}
 	if err == nil {
 		self.addSendGroupCompletion(sendPacketGroup, ack)
 		return
 	}
-	if packetTransferExpiredUnwritten(err) || sendGroupCapacityFailure(err) || errors.Is(err, errNativeAckRetrySuperseded) || errors.Is(err, errNativeSynOpeningSuperseded) {
+	if localUnwritten || errors.Is(err, errNativeAckRetrySuperseded) || errors.Is(err, errNativeSynOpeningSuperseded) {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		return
 	}
@@ -20384,14 +20423,16 @@ type blackholeGates struct {
 // and usually past it. The fallback under-reports (that is the defect) but
 // never over-reports, so fixtures that predate the marker keep their meaning.
 //
-// The fallback is skipped once a SYN was answered in the window
+// Real channel snapshots never need the fallback: a zero owned marker means
+// no unanswered admitted offer, even if an attempted SYN remains windowed.
+// The legacy fallback is also skipped once a SYN was answered in the window
 // (receiveSynCount > 0): the marker being zero then means "answered", not
 // "unknown", and the windowed clock must not resurrect a dead attempt.
 func unansweredConnectSince(windowStats *clientWindowStats) time.Time {
 	if !windowStats.firstUnansweredSendSynTime.IsZero() {
 		return windowStats.firstUnansweredSendSynTime
 	}
-	if windowStats.receiveSynCount <= 0 {
+	if !windowStats.connectProgressKnown && windowStats.receiveSynCount <= 0 {
 		return windowStats.firstSendSynTime
 	}
 	return time.Time{}
@@ -21449,7 +21490,7 @@ func (self *multiClientChannel) ping() {
 // addSend records the per-packet send stats (nack, optional syn, and source)
 // in a single locked section, so the hot send path takes the channel lock and
 // resolves the event bucket once per packet instead of two-three times.
-func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath) {
+func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath) *connectSynOffer {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -21473,10 +21514,9 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	eventBucket.sendNackCount += 1
 	eventBucket.sendNackByteCount += packetByteCount
 
+	var synOffer *connectSynOffer
 	if ipPath.Syn {
-		if self.packetStats.firstUnansweredSendSynTime.IsZero() {
-			self.packetStats.firstUnansweredSendSynTime = time.Now()
-		}
+		synOffer = self.newConnectSynOfferWithLock()
 		self.packetStats.sendSynCount += 1
 		if eventBucket.sendSynCount == 0 {
 			eventBucket.sendSynTime = time.Now()
@@ -21485,11 +21525,12 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	}
 
 	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
+	return synOffer
 }
 
-// Records an admitted group in one existing channel-lock section while
+// Records one offered group in the existing channel-lock section while
 // retaining packet-accurate health and event accounting.
-func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup) {
+func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup) *connectSynOffer {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -21518,10 +21559,9 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 			synCount += 1
 		}
 	}
+	var synOffer *connectSynOffer
 	if 0 < synCount {
-		if self.packetStats.firstUnansweredSendSynTime.IsZero() {
-			self.packetStats.firstUnansweredSendSynTime = time.Now()
-		}
+		synOffer = self.newConnectSynOfferWithLock()
 		self.packetStats.sendSynCount += synCount
 		if eventBucket.sendSynCount == 0 {
 			eventBucket.sendSynTime = time.Now()
@@ -21529,6 +21569,7 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 		eventBucket.sendSynCount += synCount
 	}
 	self.addSourceToEventBucketWithLock(eventBucket, sendPacketGroup.ipPath)
+	return synOffer
 }
 
 // addSendAbandoned is the symmetric undo of addSend for a send that cannot
@@ -21561,9 +21602,9 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 // advanced: a retraction is not activity, and extending the bucket's life or
 // the stats window on it would fabricate both.
 //
-// The syn count addSend may also have recorded is deliberately left alone:
-// it is windowed, so it ages out with its bucket, and unwinding it here could
-// just as easily erase a different live syn's record from the newest bucket.
+// Windowed SYN counters remain attempted-packet telemetry. The separate
+// offer owner retracts lifetime connect evidence exactly, without borrowing
+// another SYN's bucket or discarding an independently admitted attempt.
 func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -21697,10 +21738,8 @@ func (self *multiClientChannel) addSendSyn(synCount int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	if 0 < synCount && self.packetStats.firstUnansweredSendSynTime.IsZero() {
-		self.packetStats.firstUnansweredSendSynTime = time.Now()
-		// an unanswered connect is evidence for a parked health loop
-		self.wakeBlackholeWithLock()
+	if 0 < synCount {
+		self.confirmConnectSynWithLock(time.Now())
 	}
 	self.packetStats.sendSynCount += synCount
 
@@ -21772,7 +21811,7 @@ func (self *multiClientChannel) addReceiveSyn(synCount int) {
 	if 0 < synCount {
 		// an answered connect: the route forwards connect traffic right now,
 		// so any pending attempt state is stale
-		self.packetStats.firstUnansweredSendSynTime = time.Time{}
+		self.clearConnectSynWithLock()
 	}
 	self.packetStats.receiveSynCount += synCount
 
@@ -22096,6 +22135,7 @@ func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWind
 		peerSendAckInWindow:        !self.lastSendAckTime.IsZero() && time.Since(self.lastSendAckTime) <= self.settings.StatsWindowDuration,
 		firstSendSynTime:           firstSendSynTime,
 		firstUnansweredSendSynTime: self.packetStats.firstUnansweredSendSynTime,
+		connectProgressKnown:       true,
 		bucketCount:                len(eventBuckets),
 	}
 	if 0 < len(eventBuckets) || !self.firstEventTime.IsZero() {
@@ -22355,6 +22395,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 				ipPath, err := ParseIpPath(packet)
 				if err == nil {
+					ipPath.receiveAheadOfGap = !progress
 					if progress {
 						self.addReceiveAck(ByteCount(len(packet)))
 						if ipPath.Syn {

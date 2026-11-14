@@ -22,8 +22,11 @@ type tcpSynAdmission struct {
 	update          *multiClientChannelUpdate
 	responseClient  *multiClientChannel
 	responseControl tcpControlObservation
-	sequence        uint32
-	sequenceEnd     uint32
+	// Monotonic for this exact client's pending SYN, including ordered DATA
+	// before publication and a later ahead-of-gap SYN-ACK proof overwrite.
+	responseHealthCredited bool
+	sequence               uint32
+	sequenceEnd            uint32
 }
 
 func (admission *tcpSynAdmission) clear() {
@@ -141,6 +144,9 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 	if control.syn && control.ack {
 		for admission := update.synAdmissions; admission != nil; admission = admission.next {
 			if tcpSynAckInRange(admission.sequence, admission.sequenceEnd, control.ackSequenceNumber) {
+				if admission.responseClient != client {
+					admission.responseHealthCredited = false
+				}
 				admission.responseClient = client
 				admission.responseControl = control
 			}
@@ -154,7 +160,38 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 	}
 	update.observeTcpRecoveryAckWithLock(client, control)
 	update.clearSynRetryWithLock()
-	return update.receivedInbound.CompareAndSwap(false, true)
+	// Preserve protocol establishment and ACK custody ahead of a gap without
+	// spending the first ordered health receipt for this same generation.
+	firstInbound := update.receivedInbound.CompareAndSwap(false, true)
+	if control.aheadOfGap {
+		update.deferredInboundHealth = update.deferredInboundHealth || firstInbound
+		return false
+	}
+	healthProgress := firstInbound || update.deferredInboundHealth
+	update.deferredInboundHealth = false
+	if healthProgress && control.ack {
+		for admission := update.synAdmissions; admission != nil; admission = admission.next {
+			if admission.responseClient != client {
+				continue
+			}
+			synAckRange := tcpSynAckInRange(admission.sequence, admission.sequenceEnd, control.ackSequenceNumber)
+			synResponse := control.syn && synAckRange
+			// A server-first reply may retain the exact SYN/TFO ACK range.
+			// An advancing ACK additionally needs contiguous materialized
+			// source coverage through that frontier before SYN publication.
+			materializedAck := update.sequenceCovered &&
+				tcpSequenceAtOrAfter(admission.sequenceEnd, update.sequenceCoveredFrom) &&
+				tcpSequenceAtOrAfter(update.sequenceCoveredTo, control.ackSequenceNumber)
+			orderedResponse := !control.syn && !control.rst &&
+				tcpSequenceAtOrAfter(control.sequenceNumber, admission.responseControl.sequenceNumber+1) &&
+				tcpSequenceAtOrAfter(control.ackSequenceNumber, admission.responseControl.ackSequenceNumber) &&
+				(synAckRange || materializedAck)
+			if synResponse || orderedResponse {
+				admission.responseHealthCredited = true
+			}
+		}
+	}
+	return healthProgress
 }
 
 func (admission tcpCollapseAdmission) complete(err error) {

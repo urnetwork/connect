@@ -149,26 +149,17 @@ func TestMultiClientReconnectAfterAnsweredConnectIsBlackhole(t *testing.T) {
 	defer cancel()
 	channel := evidenceTestChannel(ctx, settings)
 
-	synIpPath := &IpPath{
-		Version:         4,
-		Protocol:        IpProtocolTcp,
-		SourceIp:        []byte{10, 0, 0, 1},
-		SourcePort:      40001,
-		DestinationIp:   []byte{10, 0, 0, 2},
-		DestinationPort: 443,
-		Syn:             true,
-	}
-
-	// arm
-	channel.addSend(64, synIpPath)
+	// The explicit counter helper represents known admitted SYNs. Public
+	// offer/refusal ordering is covered by the admission-boundary controls.
+	channel.addSendSyn(1)
 	first := channel.packetStats.firstUnansweredSendSynTime
 	if first.IsZero() {
 		t.Fatal("the first SYN must arm the attempt marker")
 	}
 	// retransmits must not move it
 	time.Sleep(5 * time.Millisecond)
-	channel.addSend(64, synIpPath)
-	channel.addSend(64, synIpPath)
+	channel.addSendSyn(1)
+	channel.addSendSyn(1)
 	if !channel.packetStats.firstUnansweredSendSynTime.Equal(first) {
 		t.Fatal("SYN retransmits must not reset the attempt clock: a retransmitting stack would keep the verdict from ever maturing")
 	}
@@ -178,7 +169,7 @@ func TestMultiClientReconnectAfterAnsweredConnectIsBlackhole(t *testing.T) {
 		t.Fatal("a received SYN must clear the attempt marker: the route forwards connects")
 	}
 	// a new attempt re-arms, and matures on its own clock
-	channel.addSend(64, synIpPath)
+	channel.addSendSyn(1)
 	rearmed := channel.packetStats.firstUnansweredSendSynTime
 	if rearmed.IsZero() || rearmed.Equal(first) {
 		t.Fatal("a new connect attempt after an answered one must arm a fresh marker")

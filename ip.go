@@ -11389,6 +11389,9 @@ type IpPath struct {
 	Fin                 bool
 	Rst                 bool
 	Ack                 bool
+	// Receive-local stream provenance; never serialized or part of a flow key.
+	// The parent preserves it in TCP control receipts across ordinary dispatch.
+	receiveAheadOfGap bool
 
 	ServerName string
 	// Only a TCP constructor's immutable canonical callback path carries this
