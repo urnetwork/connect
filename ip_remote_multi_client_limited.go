@@ -389,7 +389,16 @@ type capabilityDiscovery struct {
 //     first shows it. A selector-mode answer without a dualstack provider
 //     while the window's shortfall is open starves the family, as an empty
 //     v6-capable answer does.
-//   - probeOnly asks the v6-capable request alone, with the same `select`.
+//   - While the window's udp shortfall is open (the udp swap,
+//     ip_remote_multi_client_udp_swap.go), a request for a provider that
+//     carries udp leads the main fill: the window's `select` with protocol
+//     dualproto for that request alone. Only providers labelled to carry udp
+//     are kept, and an answer without one starves the swap.
+//   - probeOnly asks the v6-capable request, the udp request, or both, alone,
+//     each only while its shortfall is open.
+//   - A window that asks for any protocol and is sized to one exit lists
+//     first a provider that carries udp and ranks about as well as the best
+//     listed, when it has one (singleExitListingOrder).
 func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 	generator MultiClientGeneratorWithCapabilities,
 	excludeDestinations []MultiHopId,
@@ -397,7 +406,7 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 	rankMode string,
 ) ([]enumeratedDestination, error) {
 	providerSelect := self.providerSelect()
-	call := func(count int, ipFamily IpFamilyFilter) (capabilityDiscovery, error) {
+	callSelect := func(count int, ipFamily IpFamilyFilter, requestSelect FindProvidersSelect) (capabilityDiscovery, error) {
 		return windowGeneratorCall(
 			self.ctx,
 			self.settings.WindowGeneratorTimeout,
@@ -407,7 +416,7 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 					excludeDestinations,
 					rankMode,
 					ipFamily,
-					providerSelect,
+					requestSelect,
 				)
 				return capabilityDiscovery{
 					destinations: destinations,
@@ -416,6 +425,9 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 			},
 			nil,
 		)
+	}
+	call := func(count int, ipFamily IpFamilyFilter) (capabilityDiscovery, error) {
+		return callSelect(count, ipFamily, providerSelect)
 	}
 	ordered := []enumeratedDestination{}
 	seen := map[MultiHopId]bool{}
@@ -472,9 +484,41 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 		}
 		return nil
 	}
+	udpWanted := self.udpFillWanted(now)
+	udpFill := func() error {
+		udpSelect := providerSelect
+		udpSelect.Protocol = ProviderProtocolCapabilityDualproto
+		udpSelect.TargetCount = udpWanted
+		udpSelect.HeldCount = 0
+		answer, err := callSelect(udpWanted, IpFamilyFilterV4Capable, udpSelect)
+		if err != nil {
+			return err
+		}
+		found := 0
+		for destination, stats := range answer.destinations {
+			if seen[destination] || !stats.Capabilities.CarriesUdp() {
+				continue
+			}
+			seen[destination] = true
+			ordered = append(ordered, enumeratedDestination{
+				destination: destination,
+				stats:       stats,
+			})
+			found += 1
+		}
+		if found == 0 {
+			self.noteUdpStarved(now)
+		}
+		return nil
+	}
 	if probeOnly {
 		if 0 < wanted {
 			if err := ipv6Fill(); err != nil {
+				return nil, err
+			}
+		}
+		if 0 < udpWanted {
+			if err := udpFill(); err != nil {
 				return nil, err
 			}
 		}
@@ -484,6 +528,13 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 	legacyServer := known && !selectorMode
 	if 0 < wanted && legacyServer {
 		if err := ipv6Fill(); err != nil {
+			return nil, err
+		}
+	}
+	// a server without selector mode labels every provider dualproto, so the
+	// window never has a udp shortfall to fill there
+	if 0 < udpWanted && !legacyServer {
+		if err := udpFill(); err != nil {
 			return nil, err
 		}
 	}
@@ -501,6 +552,13 @@ func (self *multiClientWindow) discoverDestinationsWithCapabilities(
 		} else if !destinationsCarryIpv6(answer.destinations) {
 			self.noteIpv6Starved(now)
 		}
+	}
+	if self.singleExitListingPreferred(providerSelect) {
+		ranks := make([]singleExitRank, len(ordered))
+		for i, enumerated := range ordered {
+			ranks[i] = self.singleExitRankOf(enumerated)
+		}
+		ordered = singleExitListingOrder(ordered, ranks, self.settings.SingleExitDualprotoTierBand)
 	}
 	return ordered, nil
 }

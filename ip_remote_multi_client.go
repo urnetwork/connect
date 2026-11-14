@@ -436,6 +436,19 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// on every resize pass, short enough that a provider coming online is
 		// picked up within a minute
 		IpFamilyStarvedRetryTimeout: 60 * time.Second,
+		// the udp swap of a window that asks for any protocol: a udp flow that
+		// found no exit keeps the window looking for one for five minutes,
+		// long enough to outlast a starved minute and a failed candidate or
+		// two, short enough that one failure does not hold the window to udp
+		// once nobody sends it; a platform with no dualproto provider is asked
+		// again after the ipv6 family's minute, and two failed candidates in
+		// a row starve it as they starve the ipv6 fill
+		UdpSwapDemandHold:          5 * time.Minute,
+		UdpSwapStarvedRetryTimeout: 60 * time.Second,
+		UdpSwapStarveAfterFailures: 2,
+		// the single-exit preference ranks a provider that carries udp with
+		// the best listed one only within the same server tier
+		SingleExitDualprotoTierBand: 0,
 		// long enough to cover an outage of a few minutes, counted from the
 		// loss, and short enough that a provider the window has not seen for
 		// longer is found again through discovery like any other
@@ -1211,6 +1224,34 @@ type MultiClientSettings struct {
 	// returned nothing (IPV6.md B2). Non-positive uses the default
 	// (DefaultMultiClientSettings).
 	IpFamilyStarvedRetryTimeout time.Duration
+	// How long a udp flow that no exit could carry keeps the first window it
+	// would use, when that window asks for any protocol
+	// (NormalWindowSelectors), looking for an exit that can, each such flow
+	// restarting it (ip_remote_multi_client_udp_swap.go). While it lasts and
+	// the window holds no exit labelled dualproto, the window probes for a
+	// dualproto provider and, at capacity, gives a flowless tcp-only exit's
+	// slot to it, as the ipv6 family swap does. The user's Fixed IP never
+	// swaps. Default 5 minutes. Non-positive: no udp swap. A window that asks
+	// for dualproto ignores it.
+	UdpSwapDemandHold time.Duration
+	// How long the udp swap waits before asking again once the platform
+	// offered no dualproto provider, or after UdpSwapStarveAfterFailures
+	// dualproto candidates in a row failed their evaluation. Default 60 s,
+	// as IpFamilyStarvedRetryTimeout. Non-positive uses the default.
+	UdpSwapStarvedRetryTimeout time.Duration
+	// How many dualproto candidates in a row may fail their evaluation while
+	// the udp swap is open before it starves (UdpSwapStarvedRetryTimeout), so
+	// a dud candidate cannot churn an exit per pass. Default 2, as the ipv6
+	// fill's. Non-positive starves after the first.
+	UdpSwapStarveAfterFailures int
+	// The tie band of the single-exit preference
+	// (ip_remote_multi_client_udp_swap.go): a window that asks for any
+	// protocol and is sized to one exit lists first a provider that carries
+	// udp when it ranks about as well as the best listed provider: no less
+	// qualified, found at the same or a nearer location level, and a server
+	// tier at most this many above the best's (a lower tier is better).
+	// Default 0, the same tier. Negative reads 0.
+	SingleExitDualprotoTierBand int
 	// RecentExitMemoryTimeout is how long, from the loss, a window remembers an
 	// exit it lost to an outage of ours, so the rounds that re-form the window
 	// ask the platform for that provider by client id ahead of discovery
@@ -9020,6 +9061,10 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// handshake timeout.
 				if ipPath.Protocol == IpProtocolUdp &&
 					self.flowUnroutable(flowNeedOf(ipPath), self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId)) {
+					// the first of the flow's windows that asks for any
+					// protocol looks for an exit that carries udp (the udp
+					// swap, ip_remote_multi_client_udp_swap.go)
+					self.noteUdpDemand(self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId))
 					self.replyUdpNoRoute(ipPath)
 					return
 				}
@@ -13069,6 +13114,20 @@ type multiClientWindow struct {
 	ipv6CandidateReady bool
 	ipv6FillFailures   int
 
+	// --- udp swap (see ip_remote_multi_client_udp_swap.go) ---
+
+	// udpDemandUntil is when the udp demand a udp flow without an exit
+	// opened ends (noteUdpDemand); zero for none. udpShortfall is what the
+	// resize pass last computed from it. udpStarvedUntil, udpProbeRequested,
+	// udpCandidateReady and udpFillFailures are the ipv6 fields above for the
+	// protocol axis. All guarded by stateLock.
+	udpDemandUntil    time.Time
+	udpShortfall      int
+	udpStarvedUntil   time.Time
+	udpProbeRequested bool
+	udpCandidateReady bool
+	udpFillFailures   int
+
 	// --- capabilities (see ip_remote_multi_client_limited.go) ---
 
 	// What this window's find-providers2 requests carry beside its held
@@ -13914,8 +13973,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}
 
 		// whether this round is a resize-pass probe, decided before its
-		// listing below
+		// listing below: for a v6-capable candidate, a candidate that carries
+		// udp (the udp swap), or both
 		probeOnly := false
+		ipv6Probe := false
+		udpProbe := false
 
 		// exclude healthy destinations that are already in the window, and
 		// the providers cooling off (ip_remote_multi_client_cooloff.go). The
@@ -13938,7 +14000,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		var destinations []enumeratedDestination
 		var err error
 		if demandRead == nil {
-			probeOnly = self.takeIpv6ProbeRequest()
+			ipv6Probe = self.takeIpv6ProbeRequest()
+			udpProbe = self.takeUdpProbeRequest()
+			probeOnly = ipv6Probe || udpProbe
 			// a strict window at its hard max with no handover to fill lists
 			// and mints nothing until an expansion asks again; a family-swap
 			// probe still asks before the window gives anything up
@@ -14013,11 +14077,22 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			self.recordEvaluationFailure(windowFailureProvider, nil)
 		}
 
-		if probeOnly && 0 < len(destinations) {
-			// the probe found a v6-capable candidate: the resize pass may now
-			// give an exit up for it. The candidate stays "ready" for as long
-			// as the push below is waiting to be consumed.
+		// the probe found the candidate it asked for: the resize pass may now
+		// give an exit up for it. The candidate stays "ready" for as long as
+		// the push below is waiting to be consumed.
+		ipv6Ready := ipv6Probe && slices.ContainsFunc(destinations, func(enumerated enumeratedDestination) bool {
+			return enumerated.stats.IpFamily.SupportsIpv6()
+		})
+		udpReady := udpProbe && slices.ContainsFunc(destinations, func(enumerated enumeratedDestination) bool {
+			return enumerated.stats.Capabilities.CarriesUdp()
+		})
+		if ipv6Ready {
 			self.setIpv6CandidateReady(true)
+		}
+		if udpReady {
+			self.setUdpCandidateReady(true)
+		}
+		if ipv6Ready || udpReady {
 			self.resizeMonitor.NotifyAll()
 		}
 		func() {
@@ -14158,8 +14233,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				}
 			}
 		}()
-		if probeOnly {
+		if ipv6Ready {
 			self.setIpv6CandidateReady(false)
+		}
+		if udpReady {
+			self.setUdpCandidateReady(false)
 		}
 
 		demandRead = nil
@@ -14519,11 +14597,12 @@ func (self *multiClientWindow) resize() {
 						if self.clientMigrateFunc != nil && client.markDrainMigrateOnce() {
 							self.clientMigrateFunc(client, "drain")
 						}
-					} else if client.isFamilySwapVictim() {
+					} else if client.isFamilySwapVictim() || client.isUdpSwapVictim() {
 						// chosen to give up its slot to a v6-capable
-						// candidate (see selectFamilySwapVictim): the mark
+						// candidate (see selectFamilySwapVictim), or to one
+						// that carries udp (selectUdpSwapVictim): the mark
 						// persists so the warning survives every pass until
-						// the collapse removes it or the v6 fill starves
+						// the collapse removes it or the fill starves
 						printStats("client family swap")
 						previousCause, causeChanged := client.setWarning(true, warnFamilySwap)
 						self.logWarnTransition(client, previousCause, causeChanged, stats)
@@ -14736,6 +14815,7 @@ func (self *multiClientWindow) resize() {
 		p2pOnlyWindowSize := 0
 		ipv4CapableCount := 0
 		ipv6CapableCount := 0
+		udpCapableCount := 0
 		for _, client := range clients {
 			if client.IsP2pOnly() {
 				p2pOnlyWindowSize += 1
@@ -14746,6 +14826,9 @@ func (self *multiClientWindow) resize() {
 			}
 			if family.SupportsIpv6() {
 				ipv6CapableCount += 1
+			}
+			if client.supportsFlow(0, IpProtocolUdp) {
+				udpCapableCount += 1
 			}
 		}
 		fixedDestinationSize, fixedDestination := self.generator.FixedDestinationSize()
@@ -14760,6 +14843,10 @@ func (self *multiClientWindow) resize() {
 			inactive,
 			ipv6CapableCount,
 		)
+		// one while a udp flow that found no exit keeps a window that asks
+		// for any protocol looking for an exit that carries udp
+		// (ip_remote_multi_client_udp_swap.go)
+		udpShortfall := self.udpSwapShortfall(startTime, fixedDestination, inactive, stickyExit, udpCapableCount)
 
 		var windowSizeMin int
 		var targetWindowSize int
@@ -14792,6 +14879,10 @@ func (self *multiClientWindow) resize() {
 			// it is bounded by WindowSizeMax below; windowSizeMin is untouched
 			if 0 < ipv6Shortfall {
 				targetWindowSize += ipv6Shortfall
+			}
+			// and so does the udp swap's
+			if 0 < udpShortfall {
+				targetWindowSize += udpShortfall
 			}
 
 			targetWindowSize = min(
@@ -14857,6 +14948,7 @@ func (self *multiClientWindow) resize() {
 		// window, so a v6-capable candidate can only enter by taking the slot
 		// of an exit that cannot carry v6. See selectFamilySwapVictim.
 		self.setIpv6Shortfall(ipv6Shortfall)
+		self.setUdpShortfall(udpShortfall)
 		withinCeiling := windowSize.WindowSizeHardMax <= 0 ||
 			len(clients)+len(warnedClients) <= windowSize.WindowSizeHardMax
 		// a family swap is an expansion by another name (it asks the
@@ -14919,6 +15011,55 @@ func (self *multiClientWindow) resize() {
 			// victim still draining returns to service on the next pass
 			for _, client := range warnedClients {
 				client.clearFamilySwapVictim()
+			}
+		}
+		// the udp swap (ip_remote_multi_client_udp_swap.go), the family swap
+		// above on the protocol axis: a window that asks for any protocol, at
+		// capacity, whose udp flow found no exit gives a flowless tcp-only
+		// exit's slot to a candidate that carries udp, with the same probe,
+		// ceiling and limits. It never takes a slot that carries flows.
+		if !degraded && 0 < udpShortfall && targetWindowSize <= len(clients) &&
+			!self.udpStarved(startTime) && !self.hasUdpSwapVictim() {
+			victim := self.selectUdpSwapVictim(clients, weights)
+			if victim != nil && !self.hasUdpCandidateReady() {
+				// ask before giving anything up: the enumerator probes for
+				// one candidate that carries udp and wakes this pass when it
+				// has one
+				self.requestUdpProbe()
+			} else if victim != nil && self.settings.StrictWindowSizeHardMax {
+				// strict: the victim leaves first and the candidate takes its
+				// slot, as in the family swap
+				self.log.Infof("%s\n", relEvent(
+					"udp_swap",
+					"exit", victim.ClientId(),
+					"action", "remove_idle",
+				))
+				removeClient(victim, windowRemovalFamilySwap)
+				clients = slices.DeleteFunc(clients, func(c *multiClientChannel) bool { return c == victim })
+			} else if victim != nil {
+				// non-strict: the victim is warned out of selection and the
+				// window admits one exit in its place. The family swap leaves a
+				// flowless victim unwarned and admits one over target, but the
+				// capacity collapse that sheds an exit above the ceiling orders
+				// by ip family and weight, not protocol, and could shed the new
+				// exit instead; it sheds the warned first.
+				victim.markUdpSwapVictim()
+				previousCause, causeChanged := victim.setWarning(true, warnFamilySwap)
+				self.logWarnTransition(victim, previousCause, causeChanged, clientStats[victim])
+				self.log.Infof("%s\n", relEvent(
+					"udp_swap",
+					"exit", victim.ClientId(),
+					"action", "warn_idle",
+				))
+				clients = slices.DeleteFunc(clients, func(c *multiClientChannel) bool { return c == victim })
+				warnedClients = append(warnedClients, victim)
+				targetWindowSize = len(clients) + 1
+			}
+		} else if udpShortfall == 0 && withinCeiling && self.hasUdpSwapVictim() {
+			// the shortfall closed and the window is within its ceiling: a
+			// victim still warned returns to service on the next pass
+			for _, client := range warnedClients {
+				client.clearUdpSwapVictim()
 			}
 		}
 		// the hard minimum ignores a window whose only exits are v6-only;
@@ -15034,7 +15175,8 @@ func (self *multiClientWindow) resize() {
 					self.settings.StrictWindowSizeHardMax,
 					windowSize.WindowSizeHardMax,
 				),
-				handover: strictHandover,
+				handover:     strictHandover,
+				udpShortfall: udpShortfall,
 			}
 			windowClientStats.addExpandPass(self.windowType, expandPass.state)
 			neededCount := min(targetWindowSize-len(clients), strictCapacity)
@@ -15187,6 +15329,10 @@ type windowExpandPassPlan struct {
 	// the candidate this pass admits; nil for every other pass
 	handover       *strictWindowHandover
 	serviceRefresh *tcpSynRetry
+	// The window's open udp shortfall (ip_remote_multi_client_udp_swap.go):
+	// while positive and unfilled, an evaluated candidate that carries udp is
+	// admitted ahead of every other, as for the ipv6 shortfall. 0 for none.
+	udpShortfall int
 }
 
 // multiClientExpandStepMax bounds every object-producing expansion pass, not
@@ -15262,6 +15408,7 @@ func (self *multiClientWindow) expand(
 	added := 0
 	addedP2pOnly := 0
 	admittedIpv6Capable := 0
+	admittedUdpCapable := 0
 	pingSuccess := 0
 
 	defer func() {
@@ -15499,6 +15646,10 @@ func (self *multiClientWindow) expand(
 			admittedIpv6Capable += 1
 			self.noteIpv6CandidateAdmitted()
 		}
+		if client.supportsFlow(0, IpProtocolUdp) {
+			admittedUdpCapable += 1
+			self.noteUdpCandidateAdmitted()
+		}
 		if replacedClient != nil {
 			// the replaced client is stored under the same client id as the
 			// new client, so they share one monitor dot. Cancel it without
@@ -15594,12 +15745,16 @@ func (self *multiClientWindow) expand(
 			}
 			// the open family shortfall outranks qualification: the one
 			// v6-capable candidate this pass asked for must land before
-			// the fill closes the slot with another single-family exit
+			// the fill closes the slot with another single-family exit. The
+			// udp swap's candidate likewise, before another tcp-only exit
 			var pick int
-			if admittedIpv6Capable < ipv6Shortfall {
+			ipv6Open := admittedIpv6Capable < ipv6Shortfall
+			udpOpen := admittedUdpCapable < pass.udpShortfall
+			if ipv6Open || udpOpen {
 				closesShortfall := make([]bool, len(pending))
 				for i, candidate := range pending {
-					closesShortfall[i] = candidate.client.IpFamily().SupportsIpv6()
+					closesShortfall[i] = (ipv6Open && candidate.client.IpFamily().SupportsIpv6()) ||
+						(udpOpen && candidate.client.supportsFlow(0, IpProtocolUdp))
 				}
 				pick = poolAdmitOrderWithShortfall(closesShortfall, qualified, 1)[0]
 			} else {
@@ -15613,6 +15768,13 @@ func (self *multiClientWindow) expand(
 				// can still finish. Terminal cleanup releases the reservation at
 				// the existing pass deadline, so absent/failed IPv6 never prevents
 				// a healthy IPv4 fallback from forming even a size-one window.
+				break
+			}
+			if !candidate.client.supportsFlow(0, IpProtocolUdp) &&
+				admitBudget-admitted <= pass.udpShortfall-admittedUdpCapable &&
+				!expandEnded && !fixedDestination && !self.udpStarved(time.Now()) {
+				// the udp swap's slot is kept the same way while a candidate
+				// that carries udp can still finish
 				break
 			}
 			pending = append(pending[:pick], pending[pick+1:]...)
@@ -15968,6 +16130,9 @@ requestCandidates:
 					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
+					}
+					if providerFailure && 0 < pass.udpShortfall && client.supportsFlow(0, IpProtocolUdp) {
+						self.noteUdpCandidateFailed()
 					}
 					self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 					windowClientStats.addCandidate(self.windowType, pass.state, failureOutcome)
@@ -17695,6 +17860,10 @@ type multiClientChannel struct {
 	familySwapVictim             atomic.Bool
 	serviceRefreshReservation    atomic.Pointer[tcpSynRetry]
 	serviceRefreshRaceReferences atomic.Int64
+	// Marks an exit the resize pass chose to give up its slot to a candidate
+	// that carries udp (selectUdpSwapVictim). Apart from familySwapVictim, so
+	// neither swap ends the other's.
+	udpSwapVictim atomic.Bool
 }
 
 func newMultiClientChannel(
