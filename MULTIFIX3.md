@@ -244,9 +244,9 @@ raises the banner at once today. With the fix, it raises only under the
 
 | Fix | State | Merges | Root cause tests |
 |---|---|---|---|
-| 1, DNS | in progress | | |
+| 1, DNS | landed 2026-11-14 | connect 008b9d3d | `TestDnsWarmTunnelStalledExitAnswersThroughAnotherPathWithinFiveSeconds`, `TestDnsStalledExitGivesAddressAndHttpsAnswersNotSilenceOrServfail`, `TestDnsCachedNameIsAnsweredWhenTheInflightCapIsFull`, `TestDnsIpv6EndpointIsNeverDialedThroughV4OnlyExits`, `TestDnsFanOutKeepsAnIpv4ServerWhenIpv6ServersRankFirst`, `TestDnsStaleAnswerIsServedWhileTheLiveLookupHangs`, `TestDnsAnswerTtlIsTheUpstreamTtlCappedAtFiveMinutes`, `TestDnsHttpsAnswerIsCachedLikeAddressAnswers`, `TestDnsTunnelDohConnectionTimersAreShort`; guard `TestDnsColdTunnelKeepsTheWholeFlightBudget`. Hosted proxies use their own resolver and get only the server-stall demotion |
 | 1, exits | in progress | | |
-| 2 | in progress | | |
+| 2 | landed 2026-11-14 | connect 97cf0d02 | The 2 s hole-age bound applies only to SYN-ACKs. Pure ACKs stay immediate at any hole age, because they carry the window updates that release a provider's retained bytes; the FIFO tests pin this. Immediate-only receives never count as exit health. Tests: the 4 root-cause tests and `TestProviderPureAckBehindGapOlderThanTwoSecondsCrossesItAndGapRepairs` |
 | 3 | landed 2026-11-14 | connect 18a7d6c9 | `TestLoneSpeedExitDropDoesNotTurnConnectionPlatformUnreachable`, `TestLimitedWindowDoesNotTurnConnectionPlatformUnreachable`, `TestMergedMonitorStallStatus` (updated); guard `TestDisabledWindowDoesNotVetoPlatformUnreachable` |
 | 4 | in progress, with fix 1's exit work | | |
 | 5 | landed 2026-11-14 | sdk 83e1b169, apple 9b8d024e, android 8b0a8631a | `TestAppTransportFailureRaisesOnlyWhenFailuresLast`, `TestAppleUrlErrorsThatSettleItRaiseAtOnce`; guard `TestOtherAppleUrlErrorsAreNotCantReach`. Windows and Linux already raise only through the sdk rule |
