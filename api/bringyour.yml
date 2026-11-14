@@ -13150,52 +13150,83 @@ paths:
   /acl/invite:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: File a cross-network share invite
       description: |
-        Files the inviting network's request under a hashed 256-bit code, with a
-        use count and a 7-day window. Each activation is a statement in its own
-        network, and an admin approves it. The body carries the share's sealed
-        tables. Lands with cross-network shares.
+        Files the inviting network's invite: the SHA-256 of a 256-bit code the
+        inviting sidecar drew, never the code, with a use count and a window of
+        at most 7 days, and the share's row with the network's targets sealed
+        under a key the code derives and the server cannot. Nothing is granted:
+        each network activates the share by a statement in its own log, which
+        an admin approves. A code filed before is refused. A sidecar's client
+        token only, on the sidecar allowlist; the network's plan must include
+        network shares, and its standing must allow an outbound share.
       operationId: aclInvite
       security:
         - BearerAuth: []
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/json:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/AclInviteArgs"
       responses:
         "200":
           description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AclInviteResult"
+        "400":
+          description: A code hash that is not 32 bytes, a use count or window out of range, an empty or oversized table, or a code filed before.
+        "403":
+          description: Not a sidecar's client token, a plan without network shares, or a standing that allows no outbound share.
+        "503":
+          description: Network shares are not available on this server yet.
 
   /acl/accept-invite:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
-      summary: Accept a cross-network share invite
+      summary: Claim or complete a cross-network share invite
       description: |
-        Files the invited network's side. The server binds the invited network, and
-        the row goes once its uses run out or its window closes. The body carries
-        the share's sealed tables and the accept status. Lands with cross-network
-        shares.
+        The invited network's side, in two calls. A claim names the code's hash
+        alone: it takes one of the invite's uses and binds the caller's network
+        to a share, the invite's own for its first claim and a new one of the
+        same targets for each later claim, and answers the share with the
+        sharing network's sealed targets; a network claiming again is answered
+        the share it holds and takes no use. The invite's row goes once its uses
+        run out or its window closes. A completion names that share with the
+        invited network's aliases, sealed, and the accept status: stored once,
+        a retry of the same bytes answering as the first did. A sidecar's client
+        token only, on the sidecar allowlist; the claiming network's plan must
+        include network shares.
       operationId: aclAcceptInvite
       security:
         - BearerAuth: []
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/json:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/AclAcceptInviteArgs"
       responses:
         "200":
-          description: OK.
+          description: The share as it now stands.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkBridgeShareResult"
+        "400":
+          description: A code hash that is not 32 bytes, a network claiming its own invite, or a completion with no table, version or status.
+        "403":
+          description: Not a sidecar's client token, a plan without network shares, or a sharing network whose standing allows no outbound share.
+        "404":
+          description: No such invite, its uses run out or its window closed; or a share the caller's network did not claim.
+        "409":
+          description: The share was completed with other tables.
+        "503":
+          description: Network shares are not available on this server yet.
 
   /network/bridge/share/{shareId}:
     get:
@@ -29801,6 +29832,75 @@ components:
         cancelled_use_count:
           description: The uses this cancel made cancelled; 0 when every use was spent or cancelled already.
           type: integer
+
+    AclInviteArgs:
+      type: object
+      required:
+        - code_hash
+        - use_count
+        - target_table
+        - target_table_version
+      properties:
+        code_hash:
+          description: SHA-256 of the invite's 256-bit code, 32 bytes; base64.
+          type: string
+          format: byte
+        use_count:
+          description: How many networks may accept it, at least 1.
+          type: integer
+        window_seconds:
+          description: How long it stays open, at most 7 days; absent or 0 takes 7 days.
+          type: integer
+          format: int64
+        target_table:
+          description: The sharing network's targets, sealed; base64.
+          type: string
+          format: byte
+        target_table_version:
+          description: 1 at an invite.
+          type: integer
+          format: int64
+
+    AclInviteResult:
+      type: object
+      required:
+        - share_id
+        - use_count
+        - expire_time
+      properties:
+        share_id:
+          description: The share the invite filed, which its first claim binds.
+          type: string
+          format: uuid
+        use_count:
+          type: integer
+        expire_time:
+          type: string
+          format: date-time
+
+    AclAcceptInviteArgs:
+      type: object
+      properties:
+        code_hash:
+          description: A claim's SHA-256 of the invite's code; base64.
+          type: string
+          format: byte
+        share_id:
+          description: A completion's share, the one its claim answered.
+          type: string
+          format: uuid
+        alias_table:
+          description: A completion's aliases, sealed; base64.
+          type: string
+          format: byte
+        alias_table_version:
+          description: A completion's alias table version, 1 at an accept.
+          type: integer
+          format: int64
+        accept_status:
+          description: A completion's status, what the invited network's preflight reached.
+          type: string
+          enum: [active, refused_too_large, refused_no_space]
 
     NetworkBridgeShareResult:
       type: object
