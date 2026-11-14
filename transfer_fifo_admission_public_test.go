@@ -79,11 +79,6 @@ func testFifoRepairAdmissionPublic(t *testing.T, mode string) {
 				// The queued-deadline cell owns one real admitted channel slot.
 				// No hidden scheduler or unbounded producer queue is introduced.
 				send.SequenceBufferSize = 1
-				// This proof's resend timers age the DATA gap past the 2 s
-				// immediate bound before its NoBudget ACK is offered. It pins
-				// FIFO admission, not that bound, so the ACK stays immediate;
-				// ip_provider_control_gap_age_test.go pins the bound itself.
-				send.ImmediateDeliveryMaxGapAge = time.Hour
 				send.beforeDueResendForTest = func(id sendSequenceId, number uint64) {
 					owner := senderRef.Load()
 					if owner == nil || owner.id() != id || number != tailNumber.Load() ||
