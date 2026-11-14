@@ -76,6 +76,19 @@ func exitStallChannel(harness *reraceHarness, name string) *multiClientChannel {
 	return nil
 }
 
+// The name of the exit a channel serves, for a failure line; "none" for nil.
+func exitStallName(harness *reraceHarness, channel *multiClientChannel) string {
+	if channel == nil {
+		return "none"
+	}
+	for _, exit := range harness.generator.exitList() {
+		if channel.Destination() == exit.destination {
+			return exit.name
+		}
+	}
+	return "unknown"
+}
+
 // Whether the app received a tcp reset for the flow: the teardown signal a
 // removed exit's tcp flows get, so the app reconnects through another exit.
 func exitStallResetDelivered(harness *reraceHarness, path *IpPath) bool {
@@ -168,6 +181,7 @@ type exitStallGapRelay struct {
 	filledOnce sync.Once
 }
 
+// An unarmed relay that passes every frame.
 func newExitStallGapRelay() *exitStallGapRelay {
 	return &exitStallGapRelay{filled: make(chan struct{})}
 }
@@ -193,6 +207,9 @@ func (self *exitStallGapRelay) holeOpen() bool {
 	return self.targetSet
 }
 
+// Whether to drop one frame: the chosen Pack while armed, choosing it from
+// the first return Pack seen armed. A passing retransmission of it after
+// disarm closes filled.
 func (self *exitStallGapRelay) drop(frameBytes []byte) bool {
 	key, ok := exitStallDataPackKey(frameBytes)
 	if !ok {
@@ -219,6 +236,7 @@ func (self *exitStallGapRelay) drop(frameBytes []byte) bool {
 	return false
 }
 
+// Implements reraceProviderRelay: passes or drops each frame, in order.
 func (self *exitStallGapRelay) relay(ctx context.Context, provider <-chan []byte, source chan<- []byte) {
 	for {
 		select {
@@ -245,6 +263,7 @@ type exitStallDelayRelay struct {
 	delay time.Duration
 }
 
+// Implements reraceProviderRelay: holds each frame for delay, in order.
 func (self *exitStallDelayRelay) relay(ctx context.Context, provider <-chan []byte, source chan<- []byte) {
 	type delayedFrame struct {
 		at    time.Time
@@ -291,6 +310,7 @@ type exitStallExclusionGenerator struct {
 	excluded  map[Id]bool
 }
 
+// The test providers of inner, with no exclusion yet.
 func newExitStallExclusionGenerator(inner *reraceGenerator) *exitStallExclusionGenerator {
 	return &exitStallExclusionGenerator{
 		reraceGenerator: inner,
@@ -299,12 +319,14 @@ func newExitStallExclusionGenerator(inner *reraceGenerator) *exitStallExclusionG
 	}
 }
 
+// Implements MultiClientGeneratorExcluder.
 func (self *exitStallExclusionGenerator) ExcludeClientId(clientId Id) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.excluded[clientId] = true
 }
 
+// Implements multiClientGeneratorExclusions: any hop excluded.
 func (self *exitStallExclusionGenerator) excludesDestination(destination MultiHopId) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -316,6 +338,7 @@ func (self *exitStallExclusionGenerator) excludesDestination(destination MultiHo
 	return false
 }
 
+// Leaves out the excluded destinations of a listing.
 func (self *exitStallExclusionGenerator) filter(destinations map[MultiHopId]DestinationStats) map[MultiHopId]DestinationStats {
 	for destination := range destinations {
 		if self.excludesDestination(destination) {
@@ -325,16 +348,19 @@ func (self *exitStallExclusionGenerator) filter(destinations map[MultiHopId]Dest
 	return destinations
 }
 
+// The test providers' listing, less the excluded ones.
 func (self *exitStallExclusionGenerator) NextDestinations(count int, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error) {
 	destinations, err := self.reraceGenerator.NextDestinations(count, excludeDestinations, rankMode)
 	return self.filter(destinations), err
 }
 
+// The test providers' family listing, less the excluded ones.
 func (self *exitStallExclusionGenerator) NextDestinationsWithIpFamily(count int, excludeDestinations []MultiHopId, rankMode string, ipFamily IpFamilyFilter) (map[MultiHopId]DestinationStats, error) {
 	destinations, err := self.reraceGenerator.NextDestinationsWithIpFamily(count, excludeDestinations, rankMode, ipFamily)
 	return self.filter(destinations), err
 }
 
+// Builds the test client, and announces its provider on built.
 func (self *exitStallExclusionGenerator) NewClient(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error) {
 	self.reraceGenerator.mutex.Lock()
 	exit := self.reraceGenerator.clientExits[args.ClientId]
@@ -353,8 +379,8 @@ func (self *exitStallExclusionGenerator) NewClient(ctx context.Context, args *Mu
 // none of them holds every flow on it until the window's send-ack lifetime
 // closes its sequence: 30 s in the owner's logs, where the busy probe held the
 // stall verdict each time ("liveness probe unanswered"). The app windows now
-// run a 12 s lifetime (the sdk's TestAppWindowsRunTheShortExitTimers pins the
-// value and fails on the old one); this pins what the value buys. The exit
+// run a 12 s lifetime (the sdk's TestAppWindowsRunTheShortSendAckLifetime pins
+// the value and fails on the old one); this pins what the value buys. The exit
 // stays until the lifetime, is gone at it, and its flows re-home: the
 // established quic flow moves to the healthy exit, the tcp flow gets its
 // reset, and the app's reconnect lands on the healthy exit at once.
@@ -388,7 +414,6 @@ func TestNeverAckingExitIsEvictedAtTheWindowAckTimeoutAndItsFlowsRehome(t *testi
 		// the exit takes every packet from here and acknowledges none
 		hold.set(true)
 		start := time.Now()
-
 		offset := uint32(0)
 		for time.Since(start) < exitStallTestAppAckTimeout-500*time.Millisecond {
 			harness.send(reraceSegment(tcp, offset, []byte("segment")))
@@ -406,7 +431,7 @@ func TestNeverAckingExitIsEvictedAtTheWindowAckTimeoutAndItsFlowsRehome(t *testi
 
 		// re-homed: the established quic flow moved, the tcp flow was reset
 		if got := harness.boundTo(quic); got != healthy {
-			t.Errorf("the quic flow is bound to %v after the eviction, want the healthy exit", got)
+			t.Errorf("the quic flow is bound to %s after the eviction, want the healthy exit", exitStallName(harness, got))
 		}
 		if harness.boundTo(tcp) != nil {
 			t.Error("the tcp flow is still bound after its exit left")
@@ -417,7 +442,7 @@ func TestNeverAckingExitIsEvictedAtTheWindowAckTimeoutAndItsFlowsRehome(t *testi
 		reconnect := exitStallFlow(1, 41003, 443)
 		synCount, _, ok := harness.connect(reconnect)
 		if !ok || synCount != 1 || harness.boundTo(reconnect) != healthy {
-			t.Errorf("the reconnect took %d SYNs (ok %t) to %v, want one SYN to the healthy exit", synCount, ok, harness.boundTo(reconnect))
+			t.Errorf("the reconnect took %d SYNs (ok %t) to %s, want one SYN to the healthy exit", synCount, ok, exitStallName(harness, harness.boundTo(reconnect)))
 		}
 	})
 }
@@ -426,8 +451,9 @@ func TestNeverAckingExitIsEvictedAtTheWindowAckTimeoutAndItsFlowsRehome(t *testi
 // exit: in the owner's logs four exits held one for the whole 60 s
 // GapTimeout, one of them carrying 65 flows, and stayed in their window after
 // the timeout ended the sequence, because nothing told the window. The app
-// windows run a 15 s GapTimeout (the sdk pins it), and the timeout is now an
-// eviction notice: the exit leaves its window at the timeout, while the
+// windows run a 15 s GapTimeout (the sdk's
+// TestAppWindowClientsRunTheShortGapTimeout pins it), and the timeout is now
+// an eviction notice: the exit leaves its window at the timeout, while the
 // tunnel receives from another exit, and its flows re-home.
 func TestGapWedgedExitIsEvictedAtTheGapTimeoutAndItsFlowsRehome(t *testing.T) {
 	GetMessagePoolAggregateStats()
@@ -488,7 +514,7 @@ func TestGapWedgedExitIsEvictedAtTheGapTimeoutAndItsFlowsRehome(t *testing.T) {
 		}
 
 		if got := harness.boundTo(quic); got != warm {
-			t.Errorf("the quic flow is bound to %v after the eviction, want the warm exit", got)
+			t.Errorf("the quic flow is bound to %s after the eviction, want the warm exit", exitStallName(harness, got))
 		}
 		if harness.boundTo(tcp) != nil {
 			t.Error("the tcp flow is still bound after its exit left")
@@ -532,7 +558,7 @@ func TestAckStalledExitTakesNoNewFlowsUntilItAcksAgain(t *testing.T) {
 		for _, path := range []*IpPath{donated, offered} {
 			harness.syn(path)
 			if got := harness.boundTo(path); got != healthy {
-				t.Errorf("a new flow to port %d went to %v 3.5 s into the stall, want the healthy exit", path.DestinationPort, got)
+				t.Errorf("a new flow to port %d is bound to %s 3.5 s into the stall, want the healthy exit", path.DestinationPort, exitStallName(harness, got))
 			}
 			if got := len(harness.exit("stall").syns(path)); got != 0 {
 				t.Errorf("the stalled exit took %d SYNs of a new flow to port %d", got, path.DestinationPort)
@@ -544,7 +570,7 @@ func TestAckStalledExitTakesNoNewFlowsUntilItAcksAgain(t *testing.T) {
 		harness.settle()
 		back := exitStallFlow(5, 43005, 995)
 		if _, _, ok := harness.connect(back); !ok || harness.boundTo(back) != stall {
-			t.Errorf("a new flow after the acks resumed went to %v, want the best-ranked exit again", harness.boundTo(back))
+			t.Errorf("a new flow after the acks resumed is bound to %s, want the best-ranked exit again", exitStallName(harness, harness.boundTo(back)))
 		}
 	})
 }
@@ -589,7 +615,7 @@ func TestGapStalledExitTakesNoNewFlowsUntilTheHoleFills(t *testing.T) {
 		for _, path := range []*IpPath{donated, offered} {
 			harness.syn(path)
 			if got := harness.boundTo(path); got != warm {
-				t.Errorf("a new flow to port %d went to %v 3.5 s into the hole, want the warm exit", path.DestinationPort, got)
+				t.Errorf("a new flow to port %d is bound to %s 3.5 s into the hole, want the warm exit", path.DestinationPort, exitStallName(harness, got))
 			}
 			if got := len(harness.exit("gapped").syns(path)); got != 0 {
 				t.Errorf("the gap-stalled exit took %d SYNs of a new flow to port %d", got, path.DestinationPort)
@@ -606,7 +632,7 @@ func TestGapStalledExitTakesNoNewFlowsUntilTheHoleFills(t *testing.T) {
 		harness.settle()
 		back := exitStallFlow(5, 44005, 995)
 		if _, _, ok := harness.connect(back); !ok || harness.boundTo(back) != gapped {
-			t.Errorf("a new flow after the hole filled went to %v, want the best-ranked exit again", harness.boundTo(back))
+			t.Errorf("a new flow after the hole filled is bound to %s, want the best-ranked exit again", exitStallName(harness, harness.boundTo(back)))
 		}
 	})
 }
@@ -775,7 +801,7 @@ func TestStalledExitIsNotRestoredAfterRestart(t *testing.T) {
 		// the kill: a new process restores what the store holds
 		restarted := newModernConfirmFixture(t, ctx, []*ProviderSpec{{BestAvailable: true}}, store.snapshot(), testingExclusionPlatform(nil))
 		if got := testingRestoredDestinationSet(restarted.generator); got[stalledDestination] || !got[healthyDestination] {
-			t.Errorf("a restart restores %v, want only the healthy exit: the stalled exit was restored", got)
+			t.Errorf("a restart restores the stalled exit %t and the healthy exit %t, want only the healthy exit", got[stalledDestination], got[healthyDestination])
 		}
 
 		// the exit acks again, and a restart would restore it
@@ -858,10 +884,13 @@ func TestRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanic(t *testing.
 	testRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanic(t, false)
 }
 
+// The same with post-quantum on, where the confirmation already left it out
+// of every listing, but it stayed pending reuse.
 func TestRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanicUnderPostQuantum(t *testing.T) {
 	testRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanic(t, true)
 }
 
+// The empty-destination case with post-quantum off or on.
 func testRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanic(t *testing.T, postQuantum bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -882,7 +911,7 @@ func testRestoredIdentityWithAnEmptyDestinationIsDroppedWithoutPanic(t *testing.
 	)
 	fixture.generator.SetPostQuantumEncryption(postQuantum)
 	if got := testingRestoredDestinationSet(fixture.generator); got[MultiHopId{}] || !got[kept] {
-		t.Errorf("the identities pending reuse are for %v, want only the kept destination", got)
+		t.Errorf("an identity is pending reuse for the empty destination %t and the kept one %t, want only the kept one", got[MultiHopId{}], got[kept])
 	}
 
 	for _, call := range testingEveryDiscoveryCall(ctx, fixture.generator, nil) {
