@@ -570,6 +570,58 @@ func NewUpgradeMux(
 	log Logger,
 ) (*UpgradeMux, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
+	tunSettings := upgradeMuxTunSettings(settings, log)
+	self := newUpgradeMuxState(cancelCtx, cancel, source, provideMode, settings)
+	var dnsMemoryTarget *MemoryTarget
+	var serverStatsSeed map[string]float64
+	if settings != nil && settings.Dns != nil {
+		dnsMemoryTarget = settings.Dns.MemoryTarget
+		serverStatsSeed = settings.Dns.ServerStatsSeed
+	}
+	tunSettings.DohSettings = self.tunnelDohSettings(settings)
+	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
+	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
+	// it too, so a runtime settings change updates both.
+	tunSettings.DohRequestTimeout = dohRequestTimeout(settings)
+	tun, err := CreateTunWithResolver(cancelCtx, tunSettings, dnsResolverSettings(settings))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings), dnsMemoryTarget, serverStatsSeed))
+	self.failoverDohCache.Store(buildFailoverDohCache(tun, settings))
+	// one mux per connect, so the first-load timeline's activation is the connect start
+	self.firstLoad = newFirstLoadTimeline(log)
+	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
+	self.mux.setOnSendGroup(self.onSendGroup)
+	self.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
+		// the resolver queries go to now: the failover's while failed over
+		cache, _ := self.activeTunnelDohCache()
+		return cache.Warm(ctx, serverCount)
+	}
+	self.fallbackDohWarmFunction = func(ctx context.Context, cache *DohCache, serverCount int) bool {
+		return cache.Warm(ctx, serverCount)
+	}
+	if err := self.startDnsTcpServer(tun); err != nil {
+		if failover := self.failoverDohCache.Load(); failover != nil {
+			failover.Close()
+		}
+		self.mux.Close()
+		cancel()
+		return nil, err
+	}
+	// drop recoverable caches when the host signals memory pressure
+	self.unregisterShed = AddMemoryShedder(self.ShedMemory)
+	// active maintenance: TTL-evict the IP→hostname affinity map so it doesn't grow unbounded
+	go HandleError(self.run)
+	// resolver health changes reach their callbacks from their own goroutine
+	go HandleError(self.runResolverHealthCallbacks)
+	return self, nil
+}
+
+// The settings of the mux's internal tun, which carries only DoH resolution
+// traffic: small buffers and queue, and one dial per attempt.
+func upgradeMuxTunSettings(settings *UpgradeMuxSettings, log Logger) *TunSettings {
 	tunSettings := DefaultTunSettings()
 	tunSettings.Log = log
 	// the DoH connections run inside a memory-constrained host (notably the iOS network
@@ -588,6 +640,18 @@ func NewUpgradeMux(
 	// dial holds an extra gVisor endpoint (and its goroutines) for up to the dial timeout
 	// while the tunnel is still establishing
 	tunSettings.DialRace = 1
+	return tunSettings
+}
+
+// The mux with its state built, before its tun, resolvers and workers are:
+// the part of NewUpgradeMux that needs no network stack.
+func newUpgradeMuxState(
+	cancelCtx context.Context,
+	cancel context.CancelFunc,
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	settings *UpgradeMuxSettings,
+) *UpgradeMux {
 	self := &UpgradeMux{
 		ctx:                        cancelCtx,
 		cancel:                     cancel,
@@ -618,6 +682,12 @@ func NewUpgradeMux(
 	self.sni = newSniSniffer(func(dstAddr netip.Addr, serverName string) {
 		self.reverse.record([]netip.Addr{dstAddr}, serverName)
 	})
+	return self
+}
+
+// The base settings of the mux's tunnel DoH resolvers (TunSettings.DohSettings),
+// wired to the mux: its warm state and its reverse index.
+func (self *UpgradeMux) tunnelDohSettings(settings *UpgradeMuxSettings) *DohSettings {
 	// bound the resolver cache and fan-out below the server/proxy defaults (see
 	// DefaultDohSettings); the mux resolves a device's queries, not a data plane's.
 	// with a dns memory target set (the device's per-instance target) the count
@@ -664,45 +734,7 @@ func NewUpgradeMux(
 	dohSettings.DohResultCallback = func(domain string, addrs []netip.Addr, route *DohRoute) {
 		self.bindDnsResultToExit(domain, addrs, route)
 	}
-	tunSettings.DohSettings = dohSettings
-	// ResolveTimeout is the single DNS-resolution timeout: it bounds each handleDns attempt (the
-	// query context) and the underlying DoH request through the tun alike. SetSettings re-derives
-	// it too, so a runtime settings change updates both.
-	tunSettings.DohRequestTimeout = dohRequestTimeout(settings)
-	tun, err := CreateTunWithResolver(cancelCtx, tunSettings, dnsResolverSettings(settings))
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	self.fallbackDohCache.Store(buildFallbackDohCache(fallbackResolverSettings(settings), dnsMemoryTarget, serverStatsSeed))
-	self.failoverDohCache.Store(buildFailoverDohCache(tun, settings))
-	// one mux per connect, so the first-load timeline's activation is the connect start
-	self.firstLoad = newFirstLoadTimeline(log)
-	self.mux = NewIpMux(cancelCtx, tun, source, provideMode, sendTimeout, self.onSend, self.onPump, initialReceiver, log)
-	self.mux.setOnSendGroup(self.onSendGroup)
-	self.tunnelDohWarmFunction = func(ctx context.Context, serverCount int) bool {
-		// the resolver queries go to now: the failover's while failed over
-		cache, _ := self.activeTunnelDohCache()
-		return cache.Warm(ctx, serverCount)
-	}
-	self.fallbackDohWarmFunction = func(ctx context.Context, cache *DohCache, serverCount int) bool {
-		return cache.Warm(ctx, serverCount)
-	}
-	if err := self.startDnsTcpServer(tun); err != nil {
-		if failover := self.failoverDohCache.Load(); failover != nil {
-			failover.Close()
-		}
-		self.mux.Close()
-		cancel()
-		return nil, err
-	}
-	// drop recoverable caches when the host signals memory pressure
-	self.unregisterShed = AddMemoryShedder(self.ShedMemory)
-	// active maintenance: TTL-evict the IP→hostname affinity map so it doesn't grow unbounded
-	go HandleError(self.run)
-	// resolver health changes reach their callbacks from their own goroutine
-	go HandleError(self.runResolverHealthCallbacks)
-	return self, nil
+	return dohSettings
 }
 
 // startDnsTcpServer listens on port 53 of the internal stack's first v4
