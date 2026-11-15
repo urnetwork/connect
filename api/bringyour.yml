@@ -14980,13 +14980,12 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Start a drop's dry run
       description: |
         Needs `admin`. `{ref_id, paths}`, each an `EvsDropPath` whose
         `through_version` is the one a drop now would keep. One at a time a repo.
-        Lands with storage format 2.
+        Storage format 2.
       operationId: evsDropPreviewCreate
       security:
         - ServiceTokenAuth: []
@@ -15010,12 +15009,11 @@ paths:
       - url: https://evs.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a drop's dry run
       description: |
         Needs `admin`. State, progress, and per path `list_match`, versions, frees,
-        shared, inline, packed, young and snapshot. Lands with storage format 2.
+        shared, inline, packed, young and snapshot. Storage format 2.
       operationId: evsDropPreview
       security:
         - ServiceTokenAuth: []
@@ -15035,12 +15033,11 @@ paths:
       - url: https://evs.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List a repo's drops
       description: |
         Needs `r`. Each drop's state, progress and freed bytes, a held drop reading
-        done. Lands with storage format 2.
+        done. Storage format 2.
       operationId: evsDrops
       security:
         - ServiceTokenAuth: []
