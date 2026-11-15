@@ -27,7 +27,7 @@ func TestSendSequenceExitDiscriminator(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				destination := NewId()
-				log := newRecordingLogger()
+				log := newVerboseRecordingLogger(1)
 				settings := DefaultClientSettings()
 				settings.Log = log
 				settings.EncryptionSettings.Mode = EncryptionModeOff
@@ -135,7 +135,7 @@ func TestSendSequenceExitDiscriminator(t *testing.T) {
 // Run observes ctx.Done would therefore mislabel this as context cancellation.
 // The event must retain the exact due record and its never-written evidence.
 func TestSendSequenceExitDiscriminatorBlockedRoute(t *testing.T) {
-	log := newRecordingLogger()
+	log := newVerboseRecordingLogger(1)
 	runWindowInitialLifetimeFixture(t, 400*time.Millisecond, 500*time.Millisecond, false, func(t *testing.T, fixture *windowInitialLifetimeFixture) {
 		time.Sleep(500 * time.Millisecond)
 		synctest.Wait()
@@ -163,10 +163,48 @@ func TestSendSequenceExitDiscriminatorBlockedRoute(t *testing.T) {
 	})
 }
 
+// The exit line is diagnostic detail, written about 900 times a second when it
+// was INFO (server CPUOPT6 A #2(b)). At the default verbosity no line is
+// written, and the exit is still counted by its reason. The test above runs
+// the same exit at V(1) and reads the full line.
+func TestSendSequenceExitDefaultVerbosityCountsWithoutALine(t *testing.T) {
+	log := newRecordingLogger()
+	before := GetSendSequenceExitCounts()
+	runWindowInitialLifetimeFixture(t, 400*time.Millisecond, 500*time.Millisecond, false, func(t *testing.T, fixture *windowInitialLifetimeFixture) {
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		if len(fixture.failed) != 1 || len(fixture.written) != 0 {
+			t.Fatal("blocked route did not preserve the original expiry outcome")
+		}
+		if lines := log.linesWith("event=sequence_exit"); len(lines) != 0 {
+			t.Fatalf("sequence exit written at the default verbosity: %v", lines)
+		}
+	}, func(fixture *windowInitialLifetimeFixture) {
+		fixture.sequence.log = log
+		fixture.sequence.sendBufferSettings.WriteTimeout = time.Second
+		for range cap(fixture.route) {
+			wire := MessagePoolGet(16)
+			clear(wire)
+			fixture.route <- wire
+		}
+	})
+	after := GetSendSequenceExitCounts()
+	// other tests of the package may count exits meanwhile; this one adds one
+	if after["ack_lifetime"] <= before["ack_lifetime"] {
+		t.Fatalf("ack_lifetime exits %d -> %d, want the exit counted", before["ack_lifetime"], after["ack_lifetime"])
+	}
+	if _, ok := after["idle"]; ok {
+		t.Fatal("idle exits are not counted")
+	}
+	if len(after) != len(sendSequenceExitReasons)+1 {
+		t.Fatalf("counts=%v, want every fixed reason and other", after)
+	}
+}
+
 // Recovery order is not lifetime order. Capture the actual expired record,
 // not whichever younger record happens to be first in the resend heap.
 func TestSendSequenceExitDiscriminatorDueIdentity(t *testing.T) {
-	log := newRecordingLogger()
+	log := newVerboseRecordingLogger(1)
 	runWindowRetryClockFixture(t, 4*time.Second, 500*time.Millisecond, func(t *testing.T, fixture *windowRetryClockFixture) {
 		fixture.sequence.log = log
 		older := fixture.sequence.resendQueue.PeekFirst()
