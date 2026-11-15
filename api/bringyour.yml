@@ -10823,6 +10823,25 @@ paths:
         the network's authorization projection, so until a network has one
         the exchange grants no scope.
 
+        `client_credentials` (rfc 6749 section 4.4) is a team's network
+        OAuth client, its CI: `ur-oauth-<id>` and `ur_sk_<secret>` in the form
+        (`client_secret_post`) or HTTP Basic (`client_secret_basic`), an
+        optional `scope` within the client's and an optional `resource`, the
+        api's origin. The answer is a one-hour Bearer access token acting as
+        the client's creating member within the client's scopes, which the
+        role gate cuts to that member's role on every request; it reaches only
+        the auth key, client and admin event routes, and stops at once when
+        the client is revoked or its creator leaves the team. An auth key it
+        creates lives at most an hour.
+
+        `urn:ietf:params:oauth:grant-type:device_code` (rfc 8628) is ur-cli's
+        device grant: `client_id` ur-cli, the `device_code` and a `DPoP` proof
+        by the key the device authorization named, its `ath` the hash of the
+        device code. The answers are `authorization_pending`, `slow_down` for
+        a poll inside the interval, `access_denied`, `expired_token`, or once
+        the one-command admin token, redeemed once. 503
+        `temporarily_unavailable` while the device grant is not available.
+
         Errors are the rfc 6749 section 5.2 envelope. The descriptions are
         deliberately terse and the detail is logged rather than returned, so
         an error cannot be used to probe which check failed. The response is
@@ -11022,6 +11041,104 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OauthError"
+
+  /oauth/device_authorization:
+    post:
+      tags: [Other]
+      summary: Start ur-cli's device authorization
+      description: |
+        RFC 8628's device authorization request, ur-cli's alone, as a form
+        post: `client_id` ur-cli, `scope`, `resource` (the api's origin),
+        `dpop_jkt` and the one command as RFC 9396 `authorization_details`
+        beside the consent code the terminal shows, each checked as ur-cli's
+        authorization request is. The answer holds the `device_code`, a
+        `user_code` of eight letters, the `verification_uri` on the consent
+        page's origin, `expires_in` and `interval`. The person enters the
+        user code there, compares the consent code with the terminal's, and
+        approves; ur-cli polls `POST /oauth/token`. 503
+        `temporarily_unavailable` while the device grant is not available.
+      operationId: oauthDeviceAuthorization
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: The device authorization.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthDeviceAuthorizationResult"
+        "400":
+          description: An rfc 6749 error.
+        "503":
+          description: The device grant is not available.
+
+  /oauth/device_consent:
+    post:
+      tags: [Other]
+      summary: Describe a device authorization to the consent page
+      description: |
+        The signed-in consent page's read of the device authorization a
+        `user_code` names: the one command and the consent code to show side
+        by side, with a receipt of this authorization for this person, valid
+        10 minutes. A sign-in older than 10 minutes is answered
+        `reauthentication_required`, and the page signs the person in again.
+        Consent is never remembered. The caller is a team member's credential
+        with the keys permission (`RolePermissionRefused`).
+      operationId: oauthDeviceConsent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OauthDeviceConsentArgs"
+      responses:
+        "200":
+          description: The command and its consent code, or a fresh sign-in owed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthDeviceConsentResult"
+        "400":
+          description: An rfc 6749 error.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "401":
+          description: Not signed in.
+
+  /oauth/device_approve:
+    post:
+      tags: [Other]
+      summary: Approve or deny a device authorization
+      description: |
+        The signed-in person's answer to a device authorization: `approve`
+        true with the receipt `/oauth/device_consent` gave, on a sign-in at
+        most 10 minutes old, or false to deny it. The caller is a team
+        member's credential with the keys permission
+        (`RolePermissionRefused`).
+      operationId: oauthDeviceApprove
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OauthDeviceConsentArgs"
+      responses:
+        "200":
+          description: The answer was recorded.
+        "400":
+          description: An rfc 6749 error.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "401":
+          description: Not signed in.
 
   /oauth/consent:
     post:
@@ -13530,6 +13647,115 @@ paths:
           description: No such resource.
         "503":
           description: SCIM is not available.
+
+  /network/oauth-clients:
+    get:
+      tags: [Network]
+      summary: List a team's OAuth clients
+      description: |
+        The team's network OAuth clients, its CI credentials: each one's id,
+        `client_id`, scopes and creating member, never a secret. The team's
+        Owners and Admins read them, a member's credential by the role gate
+        (`RolePermissionRefused`); a one-command admin token with the `all`
+        scope reads them once. A network outside the team tier is refused 402
+        with a `QuotaRefusal`. 503 while teams are not available.
+      operationId: networkOauthClients
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkOauthClientsResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+    post:
+      tags: [Network]
+      summary: Create a team OAuth client
+      description: |
+        A new network OAuth client for the team's CI, with scopes among
+        devices:core, auth_keys, policy:read, logs:read and all. The answer
+        alone holds `client_secret`; the server keeps only its SHA-256. The
+        client exchanges its `client_id` and secret at `POST /oauth/token`
+        (`client_credentials`) for an hour's token acting as its creating
+        member, cut to that member's role. It mints auth keys of at most an
+        hour and never admits: CI's Delegation admits its sidecars. A new
+        client emails the team's Owners and Admins. Owners and Admins only; a
+        one-command admin token with the `all` scope creates once. A network
+        outside the team tier is refused 402 with a `QuotaRefusal`. 503 while
+        teams are not available.
+      operationId: networkOauthClientCreate
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkOauthClientCreateArgs"
+      responses:
+        "200":
+          description: The client with its secret, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkOauthClientCreateResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /network/oauth-client-revoke:
+    post:
+      tags: [Network]
+      summary: Revoke a team OAuth client
+      description: |
+        The client goes, and its live tokens stop at their next request.
+        Owners and Admins only; a one-command admin token with the `all` scope
+        revokes once. A network outside the team tier is refused 402 with a
+        `QuotaRefusal`. 503 while teams are not available.
+      operationId: networkOauthClientRevoke
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkOauthClientRevokeArgs"
+      responses:
+        "200":
+          description: The revocation, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkOauthClientRevokeResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
 
   /network/member-invite-accept:
     post:
@@ -30287,12 +30513,121 @@ components:
                 description: member_revoke, user_create or group.
                 type: string
               detail:
-                description: The change as the server normalized it.
-                type: object
+                description: The change as the server normalized it, a JSON object by kind.
               create_time:
                 type: string
                 format: date-time
         more:
+          type: boolean
+    NetworkOauthClientsResult:
+      type: object
+      properties:
+        oauth_clients:
+          type: array
+          items:
+            type: object
+            properties:
+              oauth_client_id:
+                description: udid
+                type: string
+              client_id:
+                description: ur-oauth-<id>
+                type: string
+              scopes:
+                type: array
+                items:
+                  type: string
+              creator_member_id:
+                description: udid
+                type: string
+    NetworkOauthClientCreateArgs:
+      type: object
+      required:
+        - scopes
+      properties:
+        scopes:
+          description: Among devices:core, auth_keys, policy:read, logs:read and all.
+          type: array
+          items:
+            type: string
+    NetworkOauthClientCreateResult:
+      type: object
+      properties:
+        oauth_client_id:
+          description: udid
+          type: string
+        client_id:
+          description: ur-oauth-<id>
+          type: string
+        client_secret:
+          description: ur_sk_<secret>, which this answer alone holds.
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    NetworkOauthClientRevokeArgs:
+      type: object
+      required:
+        - oauth_client_id
+      properties:
+        oauth_client_id:
+          description: udid
+          type: string
+    NetworkOauthClientRevokeResult:
+      type: object
+      properties:
+        oauth_client_id:
+          description: udid
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    OauthDeviceAuthorizationResult:
+      type: object
+      properties:
+        device_code:
+          type: string
+        user_code:
+          description: Eight letters as XXXX-XXXX.
+          type: string
+        verification_uri:
+          type: string
+        expires_in:
+          type: integer
+        interval:
+          type: integer
+    OauthDeviceConsentArgs:
+      type: object
+      required:
+        - user_code
+      properties:
+        user_code:
+          type: string
+        consent_receipt:
+          description: /oauth/device_approve's, from /oauth/device_consent.
+          type: string
+        approve:
+          description: /oauth/device_approve's; true approves, false denies.
+          type: boolean
+    OauthDeviceConsentResult:
+      type: object
+      properties:
+        client_name:
+          type: string
+        network_name:
+          type: string
+        admin_command:
+          description: The command, its consent code and the receipt.
+          type: object
+        reauthentication_required:
           type: boolean
     NetworkMemberInviteArgs:
       type: object
