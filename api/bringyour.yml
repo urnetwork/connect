@@ -162,8 +162,9 @@ tags:
         or SOL, end to end through the API alone: the coins on offer, a quote,
         the invoice, its status and a new quote for an unpaid one
       - gift codes (`/pay/gift`): a year of Pro given as a code, bought by
-        card or in a coin with or without signing in, the order's status and
-        its printable cards, and a public check of a code
+        card or in a coin with or without signing in, or with Gamma from the
+        signed-in account's deposit, the order's status and its printable
+        cards, and a public check of a code
       - inline agent payments over the x402 header protocol (`/x402`), in
         x402 v2 and v1: an agent asks for a sku, is answered `402` with the
         payment terms (v2 in the `PAYMENT-REQUIRED` header, v1 in the body),
@@ -4819,6 +4820,9 @@ paths:
         `invalid_email`, `deposit_coldkey_mismatch` (every hotkey of the
         account belongs to another coldkey), `rate_limited` or
         `start_failed`.
+
+        Gift codes (a year of Pro each) are bought from the same deposit with
+        /pay/gift/gamma-intent.
       operationId: gammaPaymentIntent
       security:
         - BearerAuth: []
@@ -4935,7 +4939,9 @@ paths:
         - `unknown`: no such purchase, or the token does not match.
         - `paid`: credited, on our own finalized `GammaSpent` that carries
           `reference` (`spent_block`). Never on a mint alone. `balance_code`
-          is set for delivery `code`.
+          is set for a data pack's delivery `code`; a gift order's
+          (/pay/gift/gamma-intent) stays empty, since its codes are on the
+          order's cards (/pay/gift/order).
         - `review`: an operator looks (`review_reason` `voided`, or
           `credit_failed`: the spend landed and the credit keeps failing).
         - `confirming`: our spend is pending or landed and the credit is
@@ -7892,10 +7898,15 @@ paths:
         gift in the order. Prices are integer cents in `currency`, one price
         worldwide (no regional tiers). An order takes 1 to `max_quantity`
         gifts. `crypto_assets` are the coins /pay/gift/crypto-intent takes.
+        `gamma_available` says whether /pay/gift/gamma-intent can take an
+        order now: Gamma purchases are available (/pay/gamma/terms
+        `available`) and the cap of a gift paid in a coin or with Gamma is
+        set.
 
         While `enabled` is false, gift codes are not on sale:
-        /pay/gift/checkout and /pay/gift/crypto-intent refuse with
-        `gift_sales_closed`. Unauthenticated.
+        /pay/gift/checkout, /pay/gift/crypto-intent and
+        /pay/gift/gamma-intent refuse with `gift_sales_closed`.
+        Unauthenticated.
       operationId: payGiftConfig
       security: []
       responses:
@@ -7923,6 +7934,7 @@ paths:
                     pro_days: 365
                     redeemable_days: 365
                     crypto_assets: [usdc_solana, zec, xmr]
+                    gamma_available: true
 
   /pay/gift/checkout:
     post:
@@ -8010,9 +8022,11 @@ paths:
       summary: Pay Gift Crypto Intent
       description: |
         Buy gift codes in a coin: makes the order and a crypto invoice for
-        its total. The request is that of /pay/gift/checkout without
-        `ui_mode`, plus `asset` and `bittensor_footer`, which adds a "Made
-        with Bittensor" line to the cards and the friend emails. The result
+        its total, at most $500, the cap of a gift order paid in a coin or
+        with Gamma (an order of 20 at $23.99 is $479.80). The request is that
+        of /pay/gift/checkout without `ui_mode`, plus `asset` and
+        `bittensor_footer`, which adds a "Made with Bittensor" line to the
+        cards and the friend emails. The result
         is the invoice, as /pay/crypto/intent returns it, to pay and to
         follow with /pay/crypto/status the same way, plus the order's
         `order_id` and `order_token` and `bittensor_footer` as given. Once
@@ -8055,16 +8069,176 @@ paths:
         "400":
           description: The body is not a JSON object of the arguments. Plain text body.
 
+  /pay/gift/gamma-intent:
+    post:
+      tags: [Other]
+      summary: Pay Gift Gamma Intent
+      description: |
+        Buy gift codes with Gamma: makes the order and a Gamma purchase for
+        its total, paid from the signed-in account's SN25 gamma deposit,
+        exactly as /pay/gamma/intent sells a plan or a data pack. It takes
+        the same bearer (a network JWT or an API key), and a guest account
+        may buy, since the codes are the delivery. The request is that of
+        /pay/gift/crypto-intent without `asset`: the order's fields, and
+        `bittensor_footer`, which adds a "Made with Bittensor" line to the
+        cards and the friend emails; plus `coldkey`, as /pay/gamma/intent
+        takes it, when a mint failed with `NonAssociatedColdKey`.
+
+        The purchase is priced at the order's total by the gift's quantity
+        tiers (/pay/gift/config), one gamma per US dollar, with no price
+        tier and no welcome offer, and at most $500, the cap of a gift order
+        paid in a coin or with Gamma (an order of 20 at $23.99 is $479.80).
+        The answer is the purchase, with every field /pay/gamma/intent
+        answers: `deposit_hotkey`, `amount_gamma`, `reference`,
+        `min_daily_cap_gamma`, `indicative_tao`, `status_token` and the two
+        mint commands, with `item_id` `gift_pro_year` and `delivery` `code`;
+        plus the order's `order_id` and `order_token` and
+        `bittensor_footer` as given. Each order has a purchase of its own: an
+        open one is never returned again. A gift starts no automatic charge,
+        so `automatic_notice` is empty and `auto_min_daily_cap_gamma` is
+        `min_daily_cap_gamma`.
+
+        Mint into `deposit_hotkey` as /pay/gamma/intent explains, follow the
+        purchase with /pay/gamma/status and its `status_token`, and the
+        order with /pay/gift/order and its `order_token`. Once our spend of
+        `amount_gamma` is finalized, the order is paid and fulfilled as a
+        card order is: its codes, its cards (/pay/gift/cards.pdf) and its
+        emails. As for a coin, there is no hold: the friend emails go out on
+        `send_on` at 09:00 in `timezone`, or right after payment
+        (/pay/gift/order `friends_send_at`). The purchase's status never
+        shows a code (`balance_code` stays empty): the order's cards carry
+        them. Buying a gift turns on no automatic renewal or top-up and
+        sends no Gamma receipt; the order's own email to `email` is the
+        receipt.
+
+        Gamma can't be refunded, so a gift order paid with Gamma is final
+        sale: no refund or dispute voids its codes.
+
+        A refusal returns `error` with a 200 and a stable `error.code`
+        (GammaPaymentError): `gift_sales_closed` and the order's own, as
+        /pay/gift/checkout answers them (`invalid_quantity`,
+        `invalid_email`, `invalid_recipients`, `invalid_send_on`,
+        `message_too_long`, `gift_note_has_link`, `gift_daily_limit`), or
+        the purchase's, as /pay/gamma/intent answers them: `invalid_request`
+        (an unknown delivery or language, or a `coldkey` that is not an
+        SS58 address), `asset_unavailable` (Gamma purchases are off, or
+        minting is off while the deposit cannot already pay:
+        `mint_unavailable_reason` says why), `item_unavailable` (gift orders
+        cannot be paid with Gamma now, or the order is over the cap),
+        `deposit_coldkey_mismatch` (every hotkey of the account belongs to
+        another coldkey; ask again with `coldkey`), `rate_limited` (too many
+        attempts from this address or this account, or too many open Gamma
+        purchases) or `start_failed`.
+      operationId: payGiftGammaIntent
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayGiftGammaIntentArgs"
+            examples:
+              them:
+                summary: Three gifts, one to each friend on Christmas Eve, with the Bittensor line
+                value:
+                  quantity: 3
+                  delivery: them
+                  email: buyer@example.com
+                  recipients: [a@example.com, b@example.com, c@example.com]
+                  send_on: "2026-12-24"
+                  timezone: America/Chicago
+                  message: Thinking of you this season.
+                  signature: Ana
+                  language: en
+                  bittensor_footer: true
+      responses:
+        "200":
+          description: The order's purchase, or a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayGiftGammaIntentResult"
+              examples:
+                them:
+                  summary: Three gifts at $29.99
+                  description: >-
+                    `<deposit_hotkey>` stands for the hotkey in your own answer,
+                    which belongs to your account. Mint only into that one, never
+                    into a hotkey copied from an example.
+                  value:
+                    intent_id: 6a1d3c2e-8b4f-4f0e-9c7a-2d5e1f3a4b6c
+                    status_token: Xb7r2kq9-L0mJp1v5n2xQd3J7mH0bWzM4tYcRrUeA8kE
+                    plan: ""
+                    item_id: gift_pro_year
+                    delivery: code
+                    tier: ""
+                    offer_applied: false
+                    price_usd: 89.97
+                    regular_price_usd: 89.97
+                    amount_gamma: "89.97"
+                    reference: "0x9e1f0c3b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f"
+                    netuid: 25
+                    deposit_hotkey: "<deposit_hotkey>"
+                    service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
+                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    min_daily_cap_gamma: "89.97"
+                    auto_min_daily_cap_gamma: "89.97"
+                    min_mint_gamma: "0.1"
+                    indicative_tao: "0.423592"
+                    mint_available: true
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
+                    disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
+                    automatic_notice: ""
+                    expires_at: "2026-11-15T12:00:00Z"
+                    status:
+                      intent_id: 6a1d3c2e-8b4f-4f0e-9c7a-2d5e1f3a4b6c
+                      purpose: purchase
+                      plan: ""
+                      item_id: gift_pro_year
+                      delivery: code
+                      status: pending
+                      review_reason: ""
+                      amount_gamma: "89.97"
+                      reference: "0x9e1f0c3b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f"
+                      deposit_hotkey: "<deposit_hotkey>"
+                      deposit_balance_gamma: ""
+                      spendable_gamma: ""
+                      remaining_gamma: "89.97"
+                      daily_cap_gamma: ""
+                      min_daily_cap_gamma: "89.97"
+                      observed_block: null
+                      spent_block: null
+                      expires_at: "2026-11-15T12:00:00Z"
+                      credited_at: null
+                      balance_code: ""
+                      stray_tao_rao: 0
+                    order_id: 3f2b1a0c-9d8e-4f7a-b6c5-d4e3f2a1b0c9
+                    order_token: QWERTYUIOPASDFGHJKLZXCVBNM
+                    bittensor_footer: true
+                salesClosed:
+                  summary: Gift codes not on sale
+                  value:
+                    error:
+                      code: gift_sales_closed
+                      message: Gift codes are not on sale right now.
+        "400":
+          description: The body is not a JSON object of the arguments. Plain text body.
+        "401":
+          description: Missing or invalid bearer token.
+
   /pay/gift/order:
     post:
       tags: [Other]
       summary: Pay Gift Order
       description: |
         A gift order's state, read with the `order_id` and `order_token`
-        that /pay/gift/checkout or /pay/gift/crypto-intent returned, sent as
-        `order_id` and `token` in the body: `pending` until it is paid, then
-        `paid`, or `refunded` after a refund, which voids its unredeemed
-        codes. After payment the gift dialog polls it about every 2 seconds
+        that /pay/gift/checkout, /pay/gift/crypto-intent or
+        /pay/gift/gamma-intent returned, sent as `order_id` and `token` in
+        the body: `pending` until it is paid, then `paid`, or `refunded`
+        after a refund, which voids its unredeemed codes. An order paid with
+        Gamma is final sale and is never refunded. After payment the gift dialog polls it about every 2 seconds
         until `pdf_ready`, then downloads the cards from /pay/gift/cards.pdf.
 
         An unknown order, a malformed `order_id` and a wrong `token` are all
@@ -16274,6 +16448,8 @@ components:
         /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent,
         /pay/crypto/requote, /pay/gift/checkout and /pay/gift/crypto-intent),
         or why a crypto invoice's status needs attention (/pay/crypto/status).
+        /pay/gift/gamma-intent answers the gift codes below in its
+        GammaPaymentError.
         Every refusal carries `message`, worded as before the codes, and a
         stable `code` beside it.
       required:
@@ -22615,6 +22791,14 @@ components:
           description: the coins a gift order can be paid in (CryptoAsset), with /pay/gift/crypto-intent
           items:
             type: string
+        gamma_available:
+          type: boolean
+          description: |
+            A gift order can be paid with Gamma now, with
+            /pay/gift/gamma-intent: gift codes are on sale, Gamma purchases
+            are available (/pay/gamma/terms `available`), and the cap of a
+            gift order paid in a coin or with Gamma is set. Absent from older
+            servers, which read as false.
 
     PayGiftTier:
       type: object
@@ -22630,7 +22814,7 @@ components:
 
     PayGiftPurchaseArgs:
       type: object
-      description: The order, as /pay/gift/checkout and /pay/gift/crypto-intent take it.
+      description: The order, as /pay/gift/checkout, /pay/gift/crypto-intent and /pay/gift/gamma-intent take it.
       required:
         - quantity
         - delivery
@@ -22755,6 +22939,44 @@ components:
               type: boolean
               description: the request's `bittensor_footer`
 
+    PayGiftGammaIntentArgs:
+      allOf:
+        - $ref: "#/components/schemas/PayGiftPurchaseArgs"
+        - type: object
+          properties:
+            bittensor_footer:
+              type: boolean
+              description: add a "Made with Bittensor" line to the cards and the friend emails
+            coldkey:
+              type: string
+              description: |
+                The SS58 coldkey that will mint, as /pay/gamma/intent takes
+                it: to get a deposit hotkey whose deposit that coldkey can open
+                or already owns, after a mint failed with
+                `NonAssociatedColdKey`.
+
+    PayGiftGammaIntentResult:
+      description: |
+        The order's Gamma purchase, as /pay/gamma/intent returns one, with
+        `item_id` `gift_pro_year` and `delivery` `code`, and the order. A gift
+        starts no automatic charge: `automatic_notice` is empty and
+        `auto_min_daily_cap_gamma` is `min_daily_cap_gamma`. On a refusal only
+        `error` (and, with minting off, `mint_unavailable_reason`) is filled
+        in.
+      allOf:
+        - $ref: "#/components/schemas/GammaPaymentIntentResult"
+        - type: object
+          properties:
+            order_id:
+              type: string
+              format: uuid
+            order_token:
+              type: string
+              description: the bearer secret for this one order, for /pay/gift/order and /pay/gift/cards.pdf; send it in a POST body, never in a URL
+            bittensor_footer:
+              type: boolean
+              description: the request's `bittensor_footer`
+
     PayGiftOrderArgs:
       type: object
       description: An order and its token, for /pay/gift/order and /pay/gift/cards.pdf.
@@ -22767,7 +22989,7 @@ components:
           format: uuid
         token:
           type: string
-          description: the order's `order_token`, from /pay/gift/checkout or /pay/gift/crypto-intent
+          description: the order's `order_token`, from /pay/gift/checkout, /pay/gift/crypto-intent or /pay/gift/gamma-intent
 
     PayGiftOrderResult:
       type: object
@@ -22788,7 +23010,7 @@ components:
         friends_send_at:
           type: [string, "null"]
           format: date-time
-          description: when the friend emails go out (or went out), RFC 3339; `send_on` at 09:00 in the buyer's time zone, else right after payment, and paid by card never before two hours after the payment. Null when no friend is emailed - delivery `me`, an order not paid yet, or a refunded one.
+          description: when the friend emails go out (or went out), RFC 3339; `send_on` at 09:00 in the buyer's time zone, else right after payment, and paid by card never before two hours after the payment (paid in a coin or with Gamma, there is no hold). Null when no friend is emailed - delivery `me`, an order not paid yet, or a refunded one.
         email_masked:
           type: string
           description: the buyer's email, masked, such as `b•••@example.com`
@@ -26799,8 +27021,10 @@ components:
           type: string
         item_id:
           type: string
+          description: The data pack, or `gift_pro_year` for a gift order's codes (/pay/gift/gamma-intent); "" for a plan.
         delivery:
           type: string
+          description: "`account` or `code`; a gift order's is `code`."
         tier:
           type: string
         offer_applied:
@@ -26917,6 +27141,7 @@ components:
           format: date-time
         balance_code:
           type: string
+          description: A paid data pack's code, for delivery `code`; always "" for a gift order (/pay/gift/gamma-intent), whose codes are on its cards.
         stray_tao_rao:
           type: integer
           description: Plain TAO sent to the deposit hotkey by mistake, in rao.
@@ -27003,7 +27228,8 @@ components:
       description: |
         Why a gamma purchase was refused, or why its status needs attention.
         Clients pick a localized message by `code` and fall back to
-        `message`.
+        `message`. /pay/gift/gamma-intent also refuses a gift order with the
+        gift codes of PurchaseError.
       required: [message]
       properties:
         code:
@@ -27035,6 +27261,10 @@ components:
             to `mint_liquidity_exceeded`, `SlippageTooHigh` (less than the
             mint's minimum) to `mint_slippage`, `TaoUsdPriceUnavailable` and
             `GammaDisabled` to `asset_unavailable`.
-          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage]
+            /pay/gift/gamma-intent only, a gift order refused, as PurchaseError
+            describes each: `gift_sales_closed`, `invalid_quantity`,
+            `invalid_recipients`, `invalid_send_on`, `message_too_long`,
+            `gift_note_has_link` and `gift_daily_limit`.
+          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage, gift_sales_closed, invalid_quantity, invalid_recipients, invalid_send_on, message_too_long, gift_note_has_link, gift_daily_limit]
         message:
           type: string
