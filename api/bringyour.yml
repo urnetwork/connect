@@ -12874,9 +12874,10 @@ paths:
         refused 403, a member's credential by the role gate
         (`RolePermissionRefused`) and any other with the plain text message
         "Only the team's Owners and Admins may list its members." A
-        network outside the team tier is refused 402 with a `QuotaRefusal`
-        whose `limit_key` is `team` and whose `upgrade` is set. 503 while teams
-        are not available.
+        one-command admin token with the `all` scope reads the first page
+        once (`ur admin members`). A network outside the team tier is refused
+        402 with a `QuotaRefusal` whose `limit_key` is `team` and whose
+        `upgrade` is set. 503 while teams are not available.
       operationId: networkMembers
       security:
         - BearerAuth: []
