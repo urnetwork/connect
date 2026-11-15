@@ -15,6 +15,15 @@ import (
 
 const idleRefillTestHold = 10 * time.Minute
 
+// Holds a window's refill without trimming it: the idle trim
+// (ip_remote_multi_client_idle_trim.go) waits for the longest sequence idle
+// timeout, so a tcp timeout this long leaves the held window every exit it has
+// for the length of these tests, which read the hold alone.
+func idleRefillTestHoldWithoutTrim(settings *MultiClientSettings) {
+	settings.IdleRefillHold = idleRefillTestHold
+	settings.TcpSequenceIdleTimeout = 6 * idleRefillTestHold
+}
+
 // The host's record of user activity, as the proxy service keeps it: the time
 // of the latest activity, zero for none.
 type idleRefillTestHost struct {
@@ -71,13 +80,13 @@ func TestIdleDeviceWindowRefillsWithoutTheHold(t *testing.T) {
 // With the hold, the window of a device idle for longer than the hold builds
 // nothing after it loses an exit: nothing is listed, minted or admitted, and
 // each resize pass counts as held_idle. The device's next user packet wakes
-// the pass, which refills the window at once.
+// the pass, which refills the window at once. The idle trim is kept out of
+// the way (idleRefillTestHoldWithoutTrim); a trimmed window refills the same
+// way (TestIdleDeviceWindowTrimsToOneExitAndRefillsWhenTheUserReturns).
 func TestIdleDeviceWindowHoldsItsRefillUntilTheUserReturns(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
-		h, generator, stats := newBalanceHoldTestHarness(t, func(settings *MultiClientSettings) {
-			settings.IdleRefillHold = idleRefillTestHold
-		})
+		h, generator, stats := newBalanceHoldTestHarness(t, idleRefillTestHoldWithoutTrim)
 		window := h.multiClient.windows[WindowTypeQuality]
 		h.sleep(idleRefillTestHold + time.Minute)
 		if installedCount, _ := strictHandoverTestCounts(window); installedCount != 5 {
@@ -120,13 +129,14 @@ func TestIdleDeviceWindowHoldsItsRefillUntilTheUserReturns(t *testing.T) {
 // A hosted device's tun sends its own upkeep through the device (DoH
 // keepalive pings), so with the host's record of user activity set, a packet
 // the host did not record as activity leaves the refill held, and the host's
-// activity signal refills the window at once.
+// activity signal refills the window at once. The idle trim is kept out of
+// the way (idleRefillTestHoldWithoutTrim).
 func TestHostActivityDecidesTheIdleRefillHold(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	synctest.Test(t, func(t *testing.T) {
 		host := &idleRefillTestHost{}
 		h, generator, _ := newBalanceHoldTestHarness(t, func(settings *MultiClientSettings) {
-			settings.IdleRefillHold = idleRefillTestHold
+			idleRefillTestHoldWithoutTrim(settings)
 			settings.UserActivitySince = host.activitySince
 		})
 		window := h.multiClient.windows[WindowTypeQuality]
@@ -172,6 +182,11 @@ func TestHostActivityDecidesTheIdleRefillHold(t *testing.T) {
 // settled refill completes in zero or one 10 ms step of fake time at random,
 // with or without the hold (the candidate build draws at random), so an
 // exact comparison of two runs' times failed whatever the hold.
+//
+// The device is idle until the user arrives, past the hold, so the idle trim
+// is kept out of the way (a long tcp sequence idle timeout, as in
+// idleRefillTestHoldWithoutTrim, in both runs): the refill read is the one
+// exit the loss takes, not the trimmed window's refill.
 func TestActiveDeviceWindowRefillTimingUnchangedByTheHold(t *testing.T) {
 	const refillBound = time.Second
 	resizeInterval := DefaultMultiClientSettings().WindowResizeTimeout
@@ -182,6 +197,7 @@ func TestActiveDeviceWindowRefillTimingUnchangedByTheHold(t *testing.T) {
 		t.Helper()
 		synctest.Test(t, func(t *testing.T) {
 			h, generator, stats := newBalanceHoldTestHarness(t, func(settings *MultiClientSettings) {
+				idleRefillTestHoldWithoutTrim(settings)
 				settings.IdleRefillHold = hold
 			})
 			window := h.multiClient.windows[WindowTypeQuality]
