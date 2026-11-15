@@ -12576,7 +12576,12 @@ paths:
         alias, the zone's version (the serial of its last write) and every RRset
         the zone holds, with `dns_entries`' count and the network's limit, -1 for
         none. Read roles by the role gate. 503 while no dns root is configured or
-        the zone tables are not available.
+        the zone tables are not available. Each custom host carries its state, CAA
+        mode and readiness: an active host is ready once every lb interface has
+        loaded the custom-host map version it entered with and passed the dns
+        edges' route probes (sidecar DESIGN.md §13.4), and one that is not names
+        those interfaces in `pending_interfaces`. A device starts a TLS-ALPN-01
+        order only for a ready host; DNS-01 never waits.
       operationId: networkDns
       security:
         - BearerAuth: []
@@ -30393,8 +30398,13 @@ components:
         effective_caa_chain_ok:
           type: boolean
         ready:
+          description: Every lb interface is current for the host's map version.
           type: boolean
         pending_interfaces:
+          description: |
+            While an active host is not ready, the lb interfaces not yet current
+            for its map version, by their inventory names; empty for a host
+            pending its CAA checks, which is in no map yet.
           type: array
           items:
             type: string
