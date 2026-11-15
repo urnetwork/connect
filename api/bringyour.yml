@@ -12842,6 +12842,56 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/member-remove:
+    post:
+      tags: [Network]
+      summary: Remove a member from a team
+      description: |
+        Denies a team's member at once: its membership's row goes, so every
+        credential naming its `member_id` stops, its untagged clients are
+        deactivated, and its tokens at evs and gkm are voided by a revocation
+        object within 15 minutes. Its tagged agents stay and keep their tags'
+        grants. The denial is not the removal: until an admin device signs
+        the member's `MemberRevoke` in the team's config repo, members still
+        encrypt to the member's devices, so the answer always sets
+        `signature_owed`, and `admin_set` says whether that statement needs k
+        of n. `ur admin members remove` signs it beside this call.
+
+        A member's credential reaches the route only with the members
+        permission (`RolePermissionRefused`), and any other caller is refused
+        403 "Only the team's Owners and Admins may remove members." A member
+        of the admin set is removed only by an Owner, and the team's last
+        Owner never. A one-command admin token with the `all` scope reaches it
+        once: a retry of the same token answers the first result. A network
+        outside the team tier is refused 402 with a `QuotaRefusal` whose
+        `limit_key` is `team`. 503 while teams are not available.
+      operationId: networkMemberRemove
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkMemberRemoveArgs"
+      responses:
+        "200":
+          description: The denial, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkMemberRemoveResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
   /network/member-invite-accept:
     post:
       tags: [Network]
@@ -29549,6 +29599,34 @@ components:
           description: datetime. When the member's access ends unless its IdP signs it in again.
           type: string
 
+    NetworkMemberRemoveArgs:
+      type: object
+      required:
+        - member_id
+      properties:
+        member_id:
+          description: udid. The member to remove.
+          type: string
+    NetworkMemberRemoveResult:
+      type: object
+      properties:
+        member_id:
+          description: udid
+          type: string
+        admin_set:
+          description: The member was in the admin set, so its MemberRevoke needs k of n.
+          type: boolean
+        deactivated_client_count:
+          description: The member's untagged clients the denial deactivated.
+          type: integer
+        signature_owed:
+          description: Set on every removal. The removal is cryptographic only once an admin device signs the member's MemberRevoke.
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     NetworkMemberInviteArgs:
       type: object
       required:
