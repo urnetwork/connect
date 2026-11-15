@@ -12277,6 +12277,14 @@ paths:
         tier is refused 402 with a `QuotaRefusal`. An argument the server
         cannot take answers 200 with `error`. 503 while teams are not
         available.
+
+        A one-command admin token with the `all` scope adds a
+        `private_key_jwt` IdP once (`ur admin idp add`): a retry of the same
+        token answers the first result and adds nothing. It never adds a
+        `client_secret` IdP: ur-cli's authorization request carries the
+        command's body in the browser's URL and the consent page shows it, so
+        such a command is refused at the consent, and such a body answers 200
+        with `error`. A `client_secret` IdP is added from a signed-in session.
       operationId: networkIdpCreate
       security:
         - BearerAuth: []
@@ -12368,7 +12376,9 @@ paths:
         tier is refused 402 with a `QuotaRefusal`. An argument the server
         cannot take answers 200 with `error`. Adding a domain records an admin
         event and sends the network's Owners and Admins a security notice.
-        503 while teams are not available.
+        503 while teams are not available. A one-command admin token with the
+        `all` scope adds once (`ur admin domains add`): a retry of the same
+        token answers the first result.
       operationId: networkDomainAdd
       security:
         - BearerAuth: []
@@ -12419,6 +12429,12 @@ paths:
         is refused 402 with a `QuotaRefusal`. Verifying a domain records an
         admin event and sends the network's Owners and Admins a security
         notice. 503 while teams are not available.
+
+        A one-command admin token with the `all` scope verifies once (`ur
+        admin domains verify`): a retry of the same token answers the first
+        result and looks nothing up. The lookup runs between two transactions,
+        so a retry that arrives before the first answered, or after a first
+        use that stopped between them, is refused 409 and runs nothing.
       operationId: networkDomainVerify
       security:
         - BearerAuth: []
@@ -12443,6 +12459,8 @@ paths:
                 $ref: "#/components/schemas/QuotaRefusal"
         "403":
           $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: An admin token's retry met a first use that has not answered.
         "503":
           description: Teams are not available.
 
@@ -12456,7 +12474,9 @@ paths:
         Discovery stops routing it at once. `removed` says whether the team
         held it. The team's Owner removes its domains. A network outside the
         team tier is refused 402 with a `QuotaRefusal`. Removing a domain
-        records an admin event. 503 while teams are not available.
+        records an admin event. 503 while teams are not available. A
+        one-command admin token with the `all` scope removes once (`ur admin
+        domains remove`): a retry of the same token answers the first result.
       operationId: networkDomainRemove
       security:
         - BearerAuth: []
@@ -12704,6 +12724,10 @@ paths:
         Auditors and above read the events; a Member is refused by the role
         gate (`RolePermissionRefused`). A network outside the team tier is
         refused 402 with a `QuotaRefusal`. 503 while teams are not available.
+
+        A one-command admin token with the `all` scope reads once (`ur admin
+        events`): a retry of the same token answers the first page. Its command
+        covers no query, so it reads from the oldest event kept, at most 50.
       operationId: networkAdminEvents
       security:
         - BearerAuth: []
@@ -12830,6 +12854,12 @@ paths:
         cannot take answers 200 with `error`. Adding or removing a webhook
         records an admin event, and adding one sends the network's Owners and
         Admins a security notice. 503 while teams are not available.
+
+        A one-command admin token with the `all` scope runs it once (`ur admin
+        audit-webhook`): a retry of the same token answers the first result,
+        an added webhook without its `signing_key`, which the server never
+        keeps; whoever lost the first answer removes the webhook and adds
+        another.
       operationId: networkAuditWebhook
       security:
         - BearerAuth: []
@@ -12929,10 +12959,10 @@ paths:
         permission (`RolePermissionRefused`), and any other caller is refused
         403 "Only the team's Owners and Admins may invite members." A
         one-command admin token with the `all` scope reaches it once: a retry
-        of the same token answers the first result and makes no second
-        invite. A network outside the team tier is refused 402 with a
-        `QuotaRefusal` whose `limit_key` is `team`. 503 while teams are not
-        available.
+        of the same token answers the first result without `invite_bearer`,
+        which the server never keeps, and makes no second invite. A network
+        outside the team tier is refused 402 with a `QuotaRefusal` whose
+        `limit_key` is `team`. 503 while teams are not available.
       operationId: networkMemberInvite
       security:
         - BearerAuth: []
