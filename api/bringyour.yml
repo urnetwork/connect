@@ -12710,6 +12710,187 @@ paths:
         "503":
           description: The label tables or the dns root are not available.
 
+  /network/dns/alias-claim:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Claim the network's name as its alias
+      description: |
+        Claims `<network_name>.<root>` as the network's alias (§12.5), opt-in
+        and public forever: every certificate naming it is logged in
+        Certificate Transparency, and once released it retires for 90 days and
+        is never anyone's again. The body names the network's name as it
+        stands, which must pass the label rules and the name screen; the
+        network must be verified and not on probation, and no label or alias,
+        live, retiring or tombstoned, may hold the name. A network holding
+        another live alias changes it: the old one retires. The alias answers
+        only its own challenges until a certificate names it, and from then on
+        the label's records under its own apex. The DNS permission by the role
+        gate; a suspended network, one on probation and a name the screen
+        refuses are refused 403 with a DnsApiErrorBody.
+      operationId: networkDnsAliasClaim
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsAliasClaimRequest"
+      responses:
+        "200":
+          description: The alias as it stands, with the disclosure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsAliasAnswer"
+        "400":
+          description: A name the label rules refuse.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "402":
+          description: The network is not verified (limit_key verification).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: The name is not the network's name, or a row holds it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The alias tables, the dns root or the network's standing are not available.
+
+  /network/dns/alias-release:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Release the network's alias
+      description: |
+        The live alias retires (D-DNS-10): it keeps answering for 90 days,
+        outlasting senders' mail retries, under a CAA record that refuses
+        every new certificate for it, every issued certificate naming it is
+        revoked, and then it is tombstoned for good. Releasing an alias already
+        retiring answers it again. The DNS permission by the role gate.
+      operationId: networkDnsAliasRelease
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsAliasReleaseRequest"
+      responses:
+        "200":
+          description: The alias, retiring, with when it tombstones.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsAliasAnswer"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: The name is no alias of the network.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The alias tables or the dns root are not available.
+
+  /network/dns/custom-host-add:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Map a custom host to a host of the network
+      description: |
+        Team only. Maps `<host>.<domain>`, or an apex `<domain>`, of one of
+        the network's verified domains to a host owner of its zone,
+        `<host>.<label>.<root>`, never the zone's apex or a system owner
+        (§12.8). Strong mode, the default and every apex's, commits the host
+        pending and unmapped until certs' CAA walk and probe pass. Weak mode, a
+        CNAME into the root, is active at once and taken only with its
+        disclosure accepted, since URnetwork could then publish the CAA record
+        that governs the host. Naming the network's mail host as the owner maps
+        a strict-mode MX host for the mail edge, which dns publishes nothing
+        for. An owner maps at most 64 custom hosts. The DNS permission by the
+        role gate; a host under no verified domain of the network is refused
+        403 with a DnsApiErrorBody.
+      operationId: networkDnsCustomHostAdd
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsCustomHostAddRequest"
+      responses:
+        "200":
+          description: The custom host as it stands.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsCustomHostAnswer"
+        "400":
+          description: A host, owner or mode the route does not take, or weak mode without its disclosure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "402":
+          description: The network is not a team (limit_key team_tier).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "409":
+          description: The host is mapped already, or the owner maps its most custom hosts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsApiErrorBody"
+        "503":
+          description: The custom-host tables or the dns root are not available.
+
+  /network/dns/custom-host-remove:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Withdraw a custom host
+      description: |
+        Removes one of the network's custom hosts, strict-mode MX hosts
+        included. The DNS permission by the role gate.
+      operationId: networkDnsCustomHostRemove
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DnsCustomHostRemoveRequest"
+      responses:
+        "200":
+          description: Whether a row went.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsCustomHostAnswer"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: The custom-host tables or the dns root are not available.
+
   /auth/sso-discover:
     post:
       x-internal: true
@@ -30092,6 +30273,9 @@ components:
           type: string
         alias:
           type: string
+        alias_certified:
+          description: A certificate names the live alias, so it answers the label's records.
+          type: boolean
         version:
           type: integer
           format: int64
@@ -30111,6 +30295,9 @@ components:
           type: string
         alias:
           type: string
+        alias_certified:
+          description: A certificate names the live alias, so it answers the label's records.
+          type: boolean
         version:
           type: integer
           format: int64
@@ -30126,6 +30313,109 @@ components:
           description: dns_entries' limit, -1 for none.
           type: integer
           format: int64
+        custom_hosts:
+          description: The network's custom hosts, by host.
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsCustomHost"
+        custom_domains:
+          description: The verified domains, each with the target its one-time _acme-challenge CNAME names.
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsCustomDomain"
+    DnsAliasClaimRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          description: The network's name as it stands.
+          type: string
+    DnsAliasReleaseRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          description: The live alias.
+          type: string
+    DnsAliasAnswer:
+      type: object
+      required: [name, state, certified, disclosure]
+      properties:
+        name:
+          description: <alias>.<root>, lowercase with no final dot.
+          type: string
+        state:
+          description: live or retiring.
+          type: string
+        certified:
+          type: boolean
+        tombstone_time:
+          description: When a retiring alias tombstones, for good.
+          type: string
+          format: date-time
+        disclosure:
+          type: string
+    DnsCustomHostAddRequest:
+      type: object
+      required: [host, owner]
+      properties:
+        host:
+          description: <host>.<domain> or an apex <domain> of a verified domain.
+          type: string
+        owner:
+          description: The host owner, <host>.<label>.<root>, with its final dot.
+          type: string
+        mode:
+          description: strong, the default, or weak.
+          type: string
+        weak_disclosure_accepted:
+          type: boolean
+    DnsCustomHostRemoveRequest:
+      type: object
+      required: [host]
+      properties:
+        host:
+          type: string
+    DnsCustomHost:
+      type: object
+      required: [host, owner, state, caa_mode, effective_caa_chain_ok, ready]
+      properties:
+        host:
+          type: string
+        owner:
+          type: string
+        state:
+          description: pending or active.
+          type: string
+        caa_mode:
+          description: strong or weak.
+          type: string
+        effective_caa_chain_ok:
+          type: boolean
+        ready:
+          type: boolean
+        pending_interfaces:
+          type: array
+          items:
+            type: string
+    DnsCustomHostAnswer:
+      type: object
+      properties:
+        custom_host:
+          $ref: "#/components/schemas/DnsCustomHost"
+        removed:
+          type: boolean
+        disclosure:
+          type: string
+    DnsCustomDomain:
+      type: object
+      required: [domain, acme_challenge_target]
+      properties:
+        domain:
+          type: string
+        acme_challenge_target:
+          description: <acme_token>.acme.<root>, with no final dot.
+          type: string
     DnsLabelReclaimRequest:
       type: object
       required: [name, network_id, incident_id, leaf, signature]
