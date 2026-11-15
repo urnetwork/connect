@@ -14830,6 +14830,22 @@ func (self *multiClientWindow) resize() {
 		}
 
 		warningTransitions.observe(windowClientStats, self.windowType, warnedClients)
+		// a window whose device has had no user activity for the idle trim
+		// time keeps one exit, and the rest of this pass sees the trimmed
+		// window; a service refresh in flight trims nothing
+		// (ip_remote_multi_client_idle_trim.go)
+		if refresh.owner == nil {
+			releasedClients := self.idleTrim(time.Now(), clients, warnedClients, weights, durations, func(client *multiClientChannel) {
+				removeClient(client, windowRemovalIdleTrim)
+			})
+			if 0 < len(releasedClients) {
+				released := func(client *multiClientChannel) bool {
+					return slices.Contains(releasedClients, client)
+				}
+				clients = slices.DeleteFunc(clients, released)
+				warnedClients = slices.DeleteFunc(warnedClients, released)
+			}
+		}
 		// the warnings this pass set decide which exits a restart restores
 		// (ip_remote_multi_client_exit_stall.go)
 		self.noteIdentityRestore(time.Now(), slices.Concat(clients, warnedClients))
