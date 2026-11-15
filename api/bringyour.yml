@@ -12892,6 +12892,645 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/scim-changes:
+    get:
+      tags: [Network]
+      summary: List a team's queued SCIM changes
+      description: |
+        What the team's IdP told the server through SCIM that only an admin
+        device can carry out, oldest first by `change_id`, at most 1,000 at a
+        time: `more` says others follow, and `after` reads from the last one.
+        A `member_revoke` is a member the IdP deactivated or deleted, which
+        the server denied at once and whose `MemberRevoke` waits for an admin
+        device, or for the indexer `ServiceSettings.scim_signer` names when
+        the member is outside the admin set. A `user_create` is a person the
+        IdP provisioned who is no member, for an admin device to invite: SCIM
+        data alone makes no member. A `group` change is for an admin device to
+        apply to the config repo's groups. A change lasts at most 7 days, and
+        roles never sync from SCIM.
+
+        The team's Owners and Admins read the queue; any other caller is
+        refused 403, a member's credential by the role gate
+        (`RolePermissionRefused`). A one-command admin token with the `all`
+        scope reads the first page once. A network outside the team tier is
+        refused 402 with a `QuotaRefusal` whose `limit_key` is `team`. 503
+        while teams are not available.
+      operationId: networkScimChanges
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: udid. The `change_id` to read after.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkScimChangesResult"
+        "400":
+          description: "`after` is not a change id."
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
+  /scim/v2/{networkId}/ServiceProviderConfig:
+    get:
+      tags: [Network]
+      summary: SCIM service provider configuration
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        PATCH and eq filters are supported; bulk, sort, etags and passwords are not.
+      operationId: scimServiceProviderConfig
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/ResourceTypes:
+    get:
+      tags: [Network]
+      summary: SCIM resource types
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        User and Group.
+      operationId: scimResourceTypes
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/Schemas:
+    get:
+      tags: [Network]
+      summary: SCIM schemas
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        The User and Group attributes this server keeps.
+      operationId: scimSchemas
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/Users:
+    get:
+      tags: [Network]
+      summary: List a team's SCIM users
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        The team's members, id each `member_id` and userName its email; members
+        the IdP deactivated, active false while their queued removal lasts; and
+        queued provisionings. Filters: userName, emails, externalId, id or
+        displayName eq a value. startIndex and count page the list, at most 100.
+      operationId: scimUsers
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    post:
+      tags: [Network]
+      summary: Provision a SCIM user
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        A person who is a member already is a conflict (409). Anyone else is
+        queued for an admin device to invite, the user's id the queued change's.
+      operationId: scimUserCreate
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/Users/{id}:
+    get:
+      tags: [Network]
+      summary: Read a SCIM user
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+      operationId: scimUser
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    put:
+      tags: [Network]
+      summary: Replace a SCIM user
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Only active is kept: false denies a member at once and queues its
+        MemberRevoke, or withdraws a queued provisioning; true for a membership
+        that ended is refused, since only a new invite makes one.
+      operationId: scimUserReplace
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    patch:
+      tags: [Network]
+      summary: Change a SCIM user
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Only active is kept, as PUT; other attributes are ignored. active may
+        be a boolean or a string of one.
+      operationId: scimUserPatch
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    delete:
+      tags: [Network]
+      summary: Deprovision a SCIM user
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        As active false.
+      operationId: scimUserDelete
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Done.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/Groups:
+    get:
+      tags: [Network]
+      summary: List a team's SCIM groups
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Groups live in the team's config repo, so this lists the groups the
+        queue holds, folded from their changes; displayName or id eq a value.
+      operationId: scimGroups
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    post:
+      tags: [Network]
+      summary: Create a SCIM group
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Queued for an admin device to apply; members are SCIM user ids.
+      operationId: scimGroupCreate
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
+  /scim/v2/{networkId}/Groups/{id}:
+    get:
+      tags: [Network]
+      summary: Read a SCIM group
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        As the queue holds it.
+      operationId: scimGroup
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    put:
+      tags: [Network]
+      summary: Replace a SCIM group
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Queued for an admin device to apply.
+      operationId: scimGroupReplace
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: OK.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    patch:
+      tags: [Network]
+      summary: Change a SCIM group
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Members added, removed or replaced and displayName replaced, queued for
+        an admin device to apply.
+      operationId: scimGroupPatch
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              type: object
+      responses:
+        "204":
+          description: Done.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+    delete:
+      tags: [Network]
+      summary: Delete a SCIM group
+      description: |
+        SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
+        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        reader: the server queues what only an admin device can carry out
+        (`GET /network/scim-changes`), and roles never sync.
+        Queued for an admin device to apply.
+      operationId: scimGroupDelete
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: networkId
+          in: path
+          required: true
+          description: udid. The team's network.
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          description: udid. The resource's id.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Done.
+        "400":
+          description: A request this server does not answer, as a SCIM error.
+        "401":
+          description: No SCIM bearer, or not the team's.
+        "403":
+          description: The network is not a team on the team tier.
+        "404":
+          description: No such resource.
+        "503":
+          description: SCIM is not available.
+
   /network/member-invite-accept:
     post:
       tags: [Network]
@@ -29627,6 +30266,34 @@ components:
           properties:
             message:
               type: string
+    NetworkScimChangesResult:
+      type: object
+      properties:
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              change_id:
+                description: udid
+                type: string
+              network_id:
+                description: udid
+                type: string
+              member_id:
+                description: udid. A member_revoke's member.
+                type: string
+              kind:
+                description: member_revoke, user_create or group.
+                type: string
+              detail:
+                description: The change as the server normalized it.
+                type: object
+              create_time:
+                type: string
+                format: date-time
+        more:
+          type: boolean
     NetworkMemberInviteArgs:
       type: object
       required:
