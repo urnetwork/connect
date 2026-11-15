@@ -30390,7 +30390,9 @@ components:
         owner:
           type: string
         state:
-          description: pending or active.
+          description: |
+            pending, active, or withheld: a web host a downgrade took out of the
+            map and routing after §20.7's 14 days, kept for a renewal's release.
           type: string
         caa_mode:
           description: strong or weak.
