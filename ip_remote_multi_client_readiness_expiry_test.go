@@ -25,7 +25,7 @@ func TestReadinessAckExpiryOwnsTcpFlowReset(t *testing.T) {
 			assertMessagePoolOwnership(t)
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
-				log := newRecordingLogger()
+				log := newVerboseRecordingLogger(1)
 				destination := NewId()
 				settings := DefaultClientSettings()
 				settings.Log = log
