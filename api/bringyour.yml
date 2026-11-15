@@ -13694,7 +13694,8 @@ paths:
         client emails the team's Owners and Admins. Owners and Admins only; a
         one-command admin token with the `all` scope creates once. A network
         outside the team tier is refused 402 with a `QuotaRefusal`. 503 while
-        teams are not available.
+        teams are not available. A retry of the same admin token answers the
+        client without its secret, which the server never keeps.
       operationId: networkOauthClientCreate
       security:
         - BearerAuth: []
