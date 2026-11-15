@@ -11631,6 +11631,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/QuotaLimits"
 
+  /sidecar/scim-changes:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: SCIM's queued removals, for the scim_signer's indexer
+      description: |
+        The queued `member_revoke` changes of the members outside the admin
+        set that the network's newest authorization log rows hold, oldest
+        first by `change_id`, for the indexer `ServiceSettings.scim_signer`
+        names to sign each member's `MemberRevoke` at once. Unexpired changes
+        only, at most `limit` (1,000 when absent or larger) at a time: `more`
+        says others follow, and `after` reads from the last one. Each change
+        is in the form `GET /network/scim-changes` gives it. A change of
+        another kind, a removal of an admin set member, whose `MemberRevoke`
+        needs k of n, and a removal of a member the rows no longer hold are
+        not answered. `GET /network/scim-changes` stays the console's and
+        `ur admin`'s.
+
+        Only the current client token of the sidecar the newest rows'
+        `scim_signer` names reads it, and only while that sidecar stands:
+        admitted, and not revoked, parked, suspended or read_only. Every other
+        client token is refused 403, and so is every network credential, API
+        key, admin token and OAuth client token. The indexer acts on this
+        unsigned answer, so a breached server can have it remove members
+        outside the admin set: a denial only, since a removal adds no reader,
+        on a designation the network's owner chose. No tier is asked: a
+        downgraded team's removals are still signed. 503 while teams or the
+        authorization log are not available.
+      operationId: sidecarScimChanges
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: udid. The `change_id` to read after.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: The most changes to answer, at most 1,000.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkScimChangesResult"
+        "400":
+          description: "`after` is not a change id, or `limit` is not a positive count."
+        "403":
+          description: The caller is not the current client of the sidecar `ServiceSettings.scim_signer` names, standing.
+        "503":
+          description: Teams or the authorization log are not available.
+
   /internal/gate/limits/{network_id}:
     get:
       x-internal: true
