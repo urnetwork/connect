@@ -175,6 +175,8 @@ tags:
       - lag.dev (`/lag`): a guest session, the extenders it can measure and
         the tickets of a track
       - client public keys (`/key`) and client log upload (`/log`)
+      - abuse (`/abuse`): reports from ur.io's form, and a network's own
+        abuse cases, appeals and standing
       - Stripe checkout and the customer portal (`/stripe`), and data packs
         bought without signing in (`/pay/data`)
       - crypto invoices (`/pay/crypto`, `/pay/data/crypto-intent`): Pro and
@@ -16061,6 +16063,136 @@ paths:
         "503":
           description: Mail is not served.
 
+  /abuse/report:
+    post:
+      tags: [Other]
+      summary: Report abuse of a URnetwork name
+      description: |
+        ur.io's abuse form: URLs, header blocks and a category. Each URL and
+        each header block is a report of its own. Of a URL only its host is
+        read; of a header block only its headers, by a header-only parse that
+        reads nothing past the block's blank line. A report naming a URnetwork
+        host, mail address or sender opens a case, or joins the case already
+        open on that name; one that names none is kept nowhere. The answer is
+        the same either way. Nothing of the reporter is kept: no address, no
+        free text, and the caller's network address only as a keyed hash that
+        counts its reports. A bearer is not read.
+
+        At most 16 URLs of at most 2048 bytes and 4 header blocks of at most
+        64 KiB. 429 with Retry-After past 30 reports an hour from one network
+        address. 503 with Retry-After while reports cannot be taken.
+      operationId: abuseReport
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AbuseReportArgs"
+      responses:
+        "200":
+          description: Received, whether or not the report named a URnetwork name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbuseReportResult"
+        "400":
+          description: A category not listed, no URL or header block, or too many or too long.
+        "413":
+          description: The body is too large.
+        "429":
+          description: Too many reports from this network address. Retry-After says when to try again.
+        "503":
+          description: Reports cannot be taken now.
+
+  /abuse/cases:
+    get:
+      tags: [Other]
+      summary: The network's abuse cases
+      description: |
+        The caller's network's abuse cases it was told of, newest first, at
+        most 100: each case's category, target, state, actions and appeal
+        link, and its newest appeal with the second reviewer's reasons once
+        decided. A case appears once an action was taken under it, as the
+        notice to the network's Owners and Admins went out. A case under a
+        sealing order shows nothing here. Read permission by the role gate.
+      operationId: abuseCases
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbuseNetworkCasesResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /abuse/appeal:
+    post:
+      tags: [Other]
+      summary: Appeal an abuse action
+      description: |
+        An Owner's or Admin's appeal of a case of the caller's network, with
+        the appellant's own reason, at most 2048 bytes. A second reviewer, not
+        the one who reviewed the action, decides it with reasons. One appeal
+        waits at a time: filing again while one waits answers that one. An
+        appeal may be filed for the months abuse.yml's appeal window gives,
+        never under six, after the case's newest notice; once decided, a case
+        takes another appeal only for an action taken after the decision.
+        Never a client token. An unknown case, another network's, and one
+        that shows nothing to the network all answer 404 alike.
+      operationId: abuseAppeal
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AbuseAppealArgs"
+      responses:
+        "200":
+          description: Filed, or the appeal already waiting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbuseAppealResult"
+        "400":
+          description: No reason, or one too long or not text.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: Unknown case.
+        "409":
+          description: The appeal window has closed, or the case's appeal was decided.
+
+  /abuse/status:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: The caller's network's abuse standing
+      description: |
+        The caller's own network's standing (probation, standard, trusted,
+        restricted or suspended), whether it is verified, and its actions that
+        stand: neither lifted nor past their own end, the newest 100, oldest
+        first. A case under a sealing order shows its standing alone. A
+        sidecar reads it with its own client token; a change reaches it as a
+        hint, which only prompts this read.
+      operationId: abuseStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbuseStatus"
+        "404":
+          description: The caller's network does not exist.
+
 components:
   parameters:
     GkmGroupId:
@@ -30163,6 +30295,185 @@ components:
         direct_mx:
           description: The network names a direct MX.
           type: boolean
+    AbuseReportArgs:
+      type: object
+      required: [category]
+      properties:
+        category:
+          description: The kind of abuse, as the form offers it.
+          type: string
+          enum: [phishing, malware, command_and_control, spam, copyright, exposed_panel, compromise, csam, threat_to_life, other]
+        urls:
+          description: Reported URLs or bare host names. Of each only its host is read.
+          type: array
+          items:
+            type: string
+        header_blocks:
+          description: Header blocks as pasted. Nothing past a block's blank line is read.
+          type: array
+          items:
+            type: string
+    AbuseReportResult:
+      type: object
+      required: [received]
+      properties:
+        received:
+          description: Always true, whether or not the report named a URnetwork name.
+          type: boolean
+    AbuseNetworkCasesResult:
+      type: object
+      required: [cases]
+      properties:
+        cases:
+          type: array
+          items:
+            $ref: "#/components/schemas/AbuseNetworkCase"
+    AbuseNetworkCase:
+      type: object
+      required: [case_id, category, target_kind, target, state, create_time_ms, close_time_ms, actions, appeal_url]
+      properties:
+        case_id:
+          type: string
+          format: uuid
+        category:
+          description: The kind of abuse, such as phishing or copyright.
+          type: string
+        target_kind:
+          description: "`host`, `sending_domain`, `label` or `network`."
+          type: string
+        target:
+          description: The unit the case names.
+          type: string
+        state:
+          description: "`open` or `closed`. A filed appeal reopens a closed case."
+          type: string
+        create_time_ms:
+          type: integer
+          format: int64
+        close_time_ms:
+          description: 0 while open.
+          type: integer
+          format: int64
+        actions:
+          description: The case's actions, oldest first. A lifted action shows its review state.
+          type: array
+          items:
+            $ref: "#/components/schemas/AbuseNetworkCaseAction"
+        appeal_url:
+          description: The case's appeal link, empty when none is configured.
+          type: string
+        appeal:
+          $ref: "#/components/schemas/AbuseNetworkCaseAppeal"
+    AbuseNetworkCaseAction:
+      type: object
+      required: [action_id, kind, target, review_state, create_time_ms, until_time_ms]
+      properties:
+        action_id:
+          type: string
+          format: uuid
+        kind:
+          description: What the action does, such as host_kill, label_kill, zone_suspend, mail_halt or network_suspend.
+          type: string
+        target:
+          description: The unit it acts on.
+          type: string
+        review_state:
+          description: "`pending` while a machine's action waits for review, which holds it meanwhile; then `upheld`, `lifted` or `lifted_wrong`."
+          type: string
+        create_time_ms:
+          type: integer
+          format: int64
+        until_time_ms:
+          description: When it ends by itself; 0 when only a lift ends it.
+          type: integer
+          format: int64
+    AbuseNetworkCaseAppeal:
+      type: object
+      required: [appeal_id, state, create_time_ms, decide_time_ms, decision_reason]
+      properties:
+        appeal_id:
+          type: string
+          format: uuid
+        state:
+          description: "`pending`, `granted` (the case's actions lifted) or `denied` (upheld)."
+          type: string
+        create_time_ms:
+          type: integer
+          format: int64
+        decide_time_ms:
+          description: 0 while pending.
+          type: integer
+          format: int64
+        decision_reason:
+          description: The second reviewer's reasons; empty while pending.
+          type: string
+    AbuseAppealArgs:
+      type: object
+      required: [case_id, reason]
+      properties:
+        case_id:
+          type: string
+          format: uuid
+        reason:
+          description: The appellant's own words, at most 2048 bytes.
+          type: string
+    AbuseAppealResult:
+      type: object
+      required: [appeal_id, case_id, state, create_time_ms]
+      properties:
+        appeal_id:
+          type: string
+          format: uuid
+        case_id:
+          type: string
+          format: uuid
+        state:
+          description: "`pending` until a second reviewer decides."
+          type: string
+        create_time_ms:
+          type: integer
+          format: int64
+    AbuseStatus:
+      type: object
+      required: [standing, verified, actions]
+      properties:
+        standing:
+          description: "`probation`, `standard`, `trusted`, `restricted` or `suspended`. A client reads one it does not know as refused."
+          type: string
+        verified:
+          description: The network is verified, by a payment method or its owner's verified phone or email. Public names and internet mail need it.
+          type: boolean
+        actions:
+          description: The actions that stand, oldest first. Empty for none, and for a case that shows the network nothing.
+          type: array
+          items:
+            $ref: "#/components/schemas/AbuseStatusAction"
+    AbuseStatusAction:
+      type: object
+      required: [action_id, case_id, category, kind, target, review_state, create_time_ms, until_time_ms]
+      properties:
+        action_id:
+          type: string
+          format: uuid
+        case_id:
+          description: The case an Owner or Admin appeals and reads in GET /abuse/cases.
+          type: string
+          format: uuid
+        category:
+          type: string
+        kind:
+          type: string
+        target:
+          type: string
+        review_state:
+          type: string
+        create_time_ms:
+          type: integer
+          format: int64
+        until_time_ms:
+          description: 0 when only a lift ends it.
+          type: integer
+          format: int64
     QuotaLimits:
       type: object
       required:
