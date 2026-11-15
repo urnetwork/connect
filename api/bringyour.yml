@@ -8098,6 +8098,15 @@ paths:
         so `automatic_notice` is empty and `auto_min_daily_cap_gamma` is
         `min_daily_cap_gamma`.
 
+        A gift's purchase is open for two hours (`expires_at`), or for the
+        shorter life of every Gamma purchase when that is less; a plan or a
+        data pack stays open longer. Every purchase of an account draws on
+        its one deposit hotkey, and the oldest open one is charged first, so
+        a gift left behind must not be charged when the deposit is later
+        filled for something else. An expired purchase is never charged,
+        and its gamma stays in the deposit; the price is in US dollars, so
+        starting again costs the same.
+
         An account has one open gift purchase at a time, since every one
         draws on its one deposit hotkey: a new gift purchase voids the
         account's other open gift purchases (never a plan or a data
@@ -23050,9 +23059,10 @@ components:
         The order's Gamma purchase, as /pay/gamma/intent returns one, with
         `item_id` `gift_pro_year` and `delivery` `code`, and the order. A gift
         starts no automatic charge: `automatic_notice` is empty and
-        `auto_min_daily_cap_gamma` is `min_daily_cap_gamma`. On a refusal only
-        `error` (and, with minting off, `mint_unavailable_reason`) is filled
-        in.
+        `auto_min_daily_cap_gamma` is `min_daily_cap_gamma`. `expires_at` is
+        at most two hours out: past it, the purchase is never charged. On a
+        refusal only `error` (and, with minting off,
+        `mint_unavailable_reason`) is filled in.
       allOf:
         - $ref: "#/components/schemas/GammaPaymentIntentResult"
         - type: object
