@@ -16193,6 +16193,74 @@ paths:
         "404":
           description: The caller's network does not exist.
 
+  /abuse/action:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: The abuse role's one route
+      description: |
+        Staff only, never a URnetwork token: a per-person bearer, which api
+        holds only as a SHA-256 in its vault with the member's reviewer id,
+        roles (reviewer, legal, engineering) and an expiry at most 90 days
+        out. The load balancer keeps the route to the operators' addresses.
+        The body's `kind` picks the verb, and the rest of the body is the
+        verb's:
+
+        - `lookup_case` {case_id}, `lookup_join` {join_kind, join_key}:
+          reviewer or legal. A case by its id with its actions and appeals,
+          or the cases one join key names, at most 100 rows; each read is
+          logged with the reviewer before it answers, and a read that cannot
+          be logged answers nothing. No list and no filter.
+        - `action` {case_id, action_kind, target, until_time_ms, reason,
+          action_id}: reviewer. A person's action under a case, upheld as it
+          is taken; never a root or a platform name.
+        - `lift` {case_id, action_id, wrong, reason, lift_id}: reviewer.
+        - `review` {case_id, action_id, decision, reason, lift_id}: reviewer.
+          `uphold`, `lift` or `lift_wrong` a machine's action, or
+          `no_action` for a case with none, which closes it.
+        - `decide_appeal` {appeal_id, decision, reason}: reviewer, never one
+          who reviewed or took an action of the case. `granted` lifts the
+          case's standing actions as wrong; `denied` upholds them.
+        - `clear_restore_flag` {root, incident_id, network_id}: reviewer.
+          Clears one network's restore flags in an incident.
+
+        Every refusal of the credential answers one 403 "Forbidden.". 503
+        with Retry-After when a store, a mailer or an effect did not answer.
+      operationId: abuseAction
+      security:
+        - AbuseStaffAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AbuseStaffRequest"
+      responses:
+        "200":
+          description: Done, or done already by the same ids.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbuseStaffResult"
+        "400":
+          description: An unknown kind, or a body that does not read as the kind's or misses what it needs.
+        "403":
+          description: |
+            The credential is refused, the member's roles do not take the
+            kind, or an action's target is a root or a platform name.
+        "404":
+          description: No such case, action, appeal or root.
+        "409":
+          description: |
+            The action was lifted already, an id names another action, a case
+            with actions was reviewed as a whole, an appeal was decided the
+            other way, its decider reviewed an action of the case, or an
+            action still waits on its first review.
+        "413":
+          description: The body is too large.
+        "503":
+          description: A store, a mailer or an effect did not answer.
+
 components:
   parameters:
     GkmGroupId:
@@ -16478,6 +16546,14 @@ components:
         route names the scope it needs, and the service honors a scope only
         while its newest verified authorization state agrees.
 
+    AbuseStaffAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An abuse staff member's own bearer, 256 random bits, which api holds
+        only as a SHA-256 beside the member's reviewer id, roles and expiry,
+        and compares in constant time. Not a URnetwork JWT, and never a
+        customer's.
     InternalGateAuth:
       type: http
       scheme: bearer
@@ -30433,6 +30509,24 @@ components:
         create_time_ms:
           type: integer
           format: int64
+    AbuseStaffRequest:
+      type: object
+      required: [kind]
+      additionalProperties: true
+      properties:
+        kind:
+          description: The verb, which reads the rest of the body.
+          type: string
+    AbuseStaffResult:
+      type: object
+      required: [kind, result]
+      properties:
+        kind:
+          type: string
+        result:
+          description: The verb's answer.
+          type: object
+          additionalProperties: true
     AbuseStatus:
       type: object
       required: [standing, verified, actions]
