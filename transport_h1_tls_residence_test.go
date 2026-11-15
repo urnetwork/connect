@@ -319,7 +319,7 @@ func TestH1TLSFiniteResidenceTransferAckOwner(t *testing.T) {
 				pair := newH1TLSResidencePair(t, certificate)
 				defer pair.close()
 				ctx, cancel := context.WithCancel(context.Background())
-				log := newRecordingLogger()
+				log := newVerboseRecordingLogger(1)
 				settings := func(lifetime time.Duration) *ClientSettings {
 					s := DefaultClientSettings()
 					s.Log = log
