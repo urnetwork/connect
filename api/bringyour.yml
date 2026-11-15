@@ -13093,13 +13093,69 @@ paths:
         "503":
           description: Teams are not available.
 
+  /network/scim-token:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Issue or remove a team's SCIM bearer
+      description: |
+        The bearer the caller's team IdP presents at `/scim/v2/{networkId}/`.
+        With no `remove`, the server draws 32 random bytes, answers the bearer
+        `ur-scim-<secret>` in `scim_bearer` this once, with the SCIM base URL
+        in `scim_url`, and keeps only the bearer's SHA-256. A new bearer
+        replaces any earlier one at once: the earlier bearer stops working
+        when the call commits. With `remove` set, the server clears the hash,
+        which turns SCIM off, and every SCIM request then answers 401.
+        `scim_on` says whether the team holds a bearer after the call.
+
+        The team's Owner issues and removes it: any other member is refused by
+        the role gate (`RolePermissionRefused`), and an API key or an OAuth
+        client's token is refused 403. A network outside the team tier is
+        refused 402 with a `QuotaRefusal`. Issuing a bearer records an admin
+        event and sends the network's Owners and Admins a security notice;
+        removing one records an admin event. 503 while teams are not
+        available.
+
+        A one-command admin token with the `all` scope runs it once (`ur admin
+        scim-token`): a retry of the same token answers the first result
+        without its `scim_bearer`, which the server never keeps; whoever lost
+        the first answer issues another.
+      operationId: networkScimToken
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkScimTokenArgs"
+      responses:
+        "200":
+          description: OK, or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkScimTokenResult"
+        "402":
+          description: The network is outside the team tier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuotaRefusal"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "503":
+          description: Teams are not available.
+
   /scim/v2/{networkId}/ServiceProviderConfig:
     get:
       tags: [Network]
       summary: SCIM service provider configuration
       description: |
         SCIM 2.0 (RFC 7643, RFC 7644) for a team's IdP, on the team's SCIM
-        bearer, which the server keeps only hashed. Unsigned SCIM data adds no
+        bearer, which the server keeps only hashed. The team's Owner issues
+        and removes the bearer (`POST /network/scim-token`); while the team
+        holds none, every SCIM request answers 401. Unsigned SCIM data adds no
         reader: the server queues what only an admin device can carry out
         (`GET /network/scim-changes`), and roles never sync.
         PATCH and eq filters are supported; bulk, sort, etags and passwords are not.
@@ -30548,6 +30604,34 @@ components:
                 format: date-time
         more:
           type: boolean
+    NetworkScimTokenArgs:
+      type: object
+      properties:
+        remove:
+          description: Turns SCIM off, clearing the bearer. Without it, a new bearer replaces any earlier one.
+          type: boolean
+    NetworkScimTokenResult:
+      type: object
+      required:
+        - scim_on
+      properties:
+        scim_bearer:
+          description: ur-scim-<secret>, the team's new SCIM bearer. Answered this once; the server keeps only its SHA-256.
+          type: string
+        scim_url:
+          description: The SCIM base URL the team's IdP calls with the bearer.
+          type: string
+        scim_on:
+          description: The team holds a SCIM bearer after the call.
+          type: boolean
+        removed:
+          description: This call turned SCIM off; false when it was off already.
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     NetworkOauthClientsResult:
       type: object
       properties:
