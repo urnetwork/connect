@@ -14,6 +14,7 @@ require (
 	github.com/libp2p/go-netroute v0.4.0
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/multiformats/go-multiaddr-fmt v0.1.0
+	github.com/multiformats/go-multistream v0.6.1
 	github.com/pion/datachannel v1.6.2
 	github.com/pion/dtls/v3 v3.1.5
 	github.com/pion/ice/v4 v4.4.1
@@ -69,9 +70,9 @@ require (
 	github.com/multiformats/go-multibase v0.3.0 // indirect
 	github.com/multiformats/go-multicodec v0.10.0 // indirect
 	github.com/multiformats/go-multihash v0.2.3 // indirect
-	github.com/multiformats/go-multistream v0.6.1 // indirect
 	github.com/multiformats/go-varint v0.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pion/interceptor v0.1.47 // indirect
 	github.com/pion/mdns/v2 v2.1.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect

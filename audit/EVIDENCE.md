@@ -109,6 +109,13 @@ The second set is commit `5a71282c` (previous code `7dbcdd4c`, merged to
 | Pin extension compared only the head, and only when it sat at the pinned generation. A validly signed chain that rewrote the pinned generation and appended one more passed as a rotation. | The pinned generation must still name the pinned key. | §3.4.5; `TestPinRefusesForkThatAdvancesPastThePinnedGeneration` |
 | The private-extender admission header compared its secret-keyed HMAC with `slices.Equal`, an early-exit comparison. | `hmac.Equal`. | §5.7; `extender/extender_secret_compare_test.go` |
 
+The third set is branch `fix/p2p-source-binding-1116` (previous code
+`774c55b2`), from a partner security researchers' report of 2026-11-16:
+
+| Defect at `774c55b2` | Fix | Evidence |
+|---|---|---|
+| A P2P stream peer could name any other source id. Each undecryptable wrap made `NotifyUndecryptableWrap` create a session for the named id, start an unknown-wrap nack, open the send sequence that carries it, and ask the platform for a contract to the id. Each plaintext pack opened a receive sequence and a session for the named id before any contract check. 20,000 wraps with distinct ids held 20,000 sessions, 20,000 send sequences and 40,000 goroutines, sent 20,000 contract requests, and took the process to about 2.2 GB. | A production P2P association binds its receive lanes to its adjacent peer (`TransferCarrierProperties.boundSourceId`), and a frame naming any other source is dropped and counted before decode. The nack path creates a session only for an authenticated source, and at most `UnknownWrapNackMaxSessionCount` of them; a client with encryption off never nacks. | §2.3; `transfer_p2p_source_binding_test.go` |
+
 ---
 
 ## 2. System map and trust boundaries
@@ -171,12 +178,26 @@ frame. The code expects the route to have done source checks
     outside this repository).
   - On a direct WebRTC P2P route, a frame that names the platform
     (`ControlId`) or this client as its source is dropped and counted
-    (`ClientReceiveStats.ForgedSourceDropCount`, `transfer.go:4664-4680`). A
-    peer route never carries either, and either would otherwise skip contract
-    and session checks.
-  - Other source ids on a P2P route are not compared with the peer at the far
-    end. A multihop stream endpoint knows only its adjacent hop, while
-    forwarded frames name the stream's origin (§5.4, L7).
+    (`ClientReceiveStats.ForgedSourceDropCount`). A peer route never carries
+    either, and either would otherwise skip contract and session checks.
+  - A production P2P association binds its receive lanes to its adjacent peer
+    (`updateP2pConnectionReceiveRoutes`, `TransferCarrierProperties.boundSourceId`).
+    The platform relayed the signaling that set the association up from that
+    authenticated client, so it is the one source the lanes vouch for. A frame
+    naming any other source is dropped and counted the same way, before decode,
+    because what follows allocates state for the named source (a receive
+    sequence and session, or for an undecryptable wrap a session, a nack, its
+    send sequence and a contract request to the platform).
+  - Production streams are direct, so the adjacent peer is the stream's other
+    end. A multihop stream endpoint knows only its adjacent hop while
+    forwarded frames name the stream's origin, so multihop over P2P needs the
+    endpoint to bind its lane to an origin the platform authenticated (in the
+    stream open, or through the contract) before it admits forwarded frames
+    (§5.4, L7).
+  - A carrier that binds no source (a custom transport typed P2P) is checked
+    for the platform and this client only, and the undecryptable-wrap nack
+    treats the sources it names as unauthenticated: it nacks only through a
+    session the source already holds.
 
 ---
 
@@ -1386,10 +1407,10 @@ is described.
 | L4 | Random-nonce AES-GCM with no per-key invocation counter or volume/time rekey; one key serves both directions of a session | Open — review requested | §4.8.1 |
 | L5 | Plaintext surfaces inside the transport: the control plane, `EncryptedControl` frames, acks (accepted plaintext in every mode), the outer routing header, sizes and timing | By design | §3.8, §4.6 |
 | L6 | AES-GCM only. CPUs without AES instructions use table-based software AES. | Open — review requested | §4.4 |
-| L7 | Plaintext-frame source attribution is transport-level: connect does not authenticate `TransferPath.SourceId` of plaintext frames. On P2P routes, frames naming the platform or this client are dropped, but other peer ids are not compared with the far-end peer (a multihop endpoint knows only its adjacent hop). | By design for platform-relayed frames. P2P: platform and self spoofing fixed (§1.4); per-peer binding open — review requested | §2.3, §5.4 |
+| L7 | Plaintext-frame source attribution is transport-level: connect does not authenticate `TransferPath.SourceId` of plaintext frames. On P2P routes, frames naming the platform or this client are dropped, and a production association's lanes are bound to its adjacent peer, so a frame naming any other source is dropped too. | By design for platform-relayed frames. P2P: platform and self spoofing fixed (§1.4); per-peer binding fixed for production associations (§1.4, partner report 2026-11-16). Multihop over P2P would need the endpoint bound to an authenticated origin — review requested | §2.3, §5.4 |
 | L8 | No post-quantum-only policy; X25519 is accepted for peers without the hybrid | Follow-up (`DESIGNNOTES2.md` §8.4) | §4.1 |
 | L9 | X.509 validity, KeyUsage and EKU are not enforced on seal certificates (identity comes from the Ed25519 binding) | By design | §3.2, §4.8.6 |
-| L10 | No count caps on sessions or receive sequences per client, and no byte cap on the per-epoch TLS inbox. Provider NAT tables are unbounded without a memory target. | Open — review requested | §4.7, §8.4 |
+| L10 | No count caps on sessions or receive sequences per client, and no byte cap on the per-epoch TLS inbox. Provider NAT tables are unbounded without a memory target. The sessions the undecryptable-wrap nack creates are capped (`UnknownWrapNackMaxSessionCount`), and P2P lanes no longer allocate for sources other than their peer (L7). | Open — review requested | §4.7, §8.4 |
 | L11 | Secret key material is not zeroized | Accepted, recorded | §8.3 |
 | L12 | Contract stores hold contract HMACs in plaintext, integrity-protected by content digests and signatures only | Accepted, recorded | §8.1 |
 | L13 | Always-on logging of stale-DNS query domains (`net_http_doh.go:1036`) | Open | §8.2 |

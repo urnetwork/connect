@@ -33,13 +33,17 @@ func lifecycleResidueStacks() []byte {
 
 // Every node loop of every test must have been joined before the package
 // qualifies. The deadline covers the libp2p host teardown each Close waits on,
-// not a race in the join itself.
+// not a race in the join itself. The resource manager's collector is the
+// node's too: the host closes the manager its swarm was built on, so a manager
+// built outside that, or a node that failed before its host took it, would
+// leave one collector running for every node ever built.
 func TestZZZNoNodeLifecycleResidue(t *testing.T) {
 	signatures := []string{
 		"(*Node).runPeering(",
 		"(*Node).runReceive(",
 		"(*Node).runTopicEvents(",
 		"(*Node).runStatus(",
+		"(*resourceManager).background(",
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
