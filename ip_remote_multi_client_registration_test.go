@@ -256,6 +256,43 @@ func testApiMultiClientGeneratorWaitsForKeyRegistrationOfRequiredSessions(t *tes
 	}
 }
 
+// A window client without post-quantum encryption runs no session: the window
+// of every profile that leaves PostQuantumEncryption unset, hosted proxy
+// devices included (TestMultiClientChannelPqe). The required sessions' wait
+// for a processed key registration must not reach it: setup returns it after
+// the provide registration alone, with no processed key registration asked
+// for, as before the wait existed.
+func TestApiMultiClientGeneratorDoesNotWaitForKeyRegistrationWithoutSessions(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorDoesNotWaitForKeyRegistrationWithoutSessions(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorDoesNotWaitForKeyRegistrationWithoutSessions(t *testing.T, ipVersion int) {
+	var clientSettings *ClientSettings
+	_, client, _, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixtureWithSettings(t, ipVersion, nil, func(settings *ClientSettings) {
+		// as newMultiClientChannel leaves a window client without post-quantum
+		settings.EncryptionSettings.Mode = EncryptionModeOff
+		clientSettings = settings
+	})
+	select {
+	case got := <-result:
+		if got.err != nil || got.client != client {
+			t.Fatalf("setup did not return the exact client: %v", got.err)
+		}
+	case <-attempts:
+		t.Fatal("a client without sessions asked for a processed key registration")
+	case <-callCtx.Context.Done():
+		t.Fatal(callCtx.Err())
+	}
+	AssertEqual(t, false, clientSettings.ClientKeyRegistrationRequired)
+	AssertEqual(t, true, client.ClientKeyManager().registrationSync == nil)
+	callCancel()
+	if client.Ctx().Err() != nil {
+		t.Fatal("completed setup context canceled the long-lived client")
+	}
+}
+
 func TestApiMultiClientGeneratorRegistrationCancellationJoinsCleanup(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		testApiMultiClientGeneratorRegistrationCancellationJoinsCleanup(t, ipVersion)
