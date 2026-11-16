@@ -107,6 +107,28 @@ func TestGossipDefaultNodeSettingsPerRole(t *testing.T) {
 		if settings.Now == nil {
 			t.Errorf("%q: the node has no clock", c.role)
 		}
+		// nor do the inbound bounds, and the resource limits are left to the
+		// node, which derives them from the high water it is finally given
+		if settings.MaxInboundStreamCountPerConn != 32 {
+			t.Errorf(
+				"%q: inbound streams per connection = %d, expected 32",
+				c.role,
+				settings.MaxInboundStreamCountPerConn,
+			)
+		}
+		if settings.MaxStreamWindowByteCount != 1024*1024 {
+			t.Errorf(
+				"%q: stream window = %d, expected 1 MiB",
+				c.role,
+				settings.MaxStreamWindowByteCount,
+			)
+		}
+		if settings.NegotiationTimeout != 10*time.Second {
+			t.Errorf("%q: negotiation timeout = %s, expected 10s", c.role, settings.NegotiationTimeout)
+		}
+		if settings.ResourceLimits != nil {
+			t.Errorf("%q: the defaults fixed the resource limits ahead of the high water", c.role)
+		}
 	}
 }
 
@@ -201,6 +223,38 @@ func TestGossipNewNodeDoesNotMutateTheCallerSettings(t *testing.T) {
 	}
 	if node.settings.ConnectSettings == nil {
 		t.Errorf("the node has no connect settings")
+	}
+	// the inbound bounds are never off, even for settings built by hand
+	if settings.MaxInboundStreamCountPerConn != 0 ||
+		settings.MaxStreamWindowByteCount != 0 ||
+		settings.NegotiationTimeout != 0 ||
+		settings.ResourceLimits != nil {
+		t.Errorf("the caller's inbound bounds were filled in")
+	}
+	roleDefaults := DefaultNodeSettings(NodeRoleMember)
+	if node.settings.MaxInboundStreamCountPerConn != roleDefaults.MaxInboundStreamCountPerConn {
+		t.Errorf(
+			"the node's inbound streams per connection = %d, expected %d",
+			node.settings.MaxInboundStreamCountPerConn,
+			roleDefaults.MaxInboundStreamCountPerConn,
+		)
+	}
+	if node.settings.MaxStreamWindowByteCount != roleDefaults.MaxStreamWindowByteCount {
+		t.Errorf(
+			"the node's stream window = %d, expected %d",
+			node.settings.MaxStreamWindowByteCount,
+			roleDefaults.MaxStreamWindowByteCount,
+		)
+	}
+	if node.settings.NegotiationTimeout != roleDefaults.NegotiationTimeout {
+		t.Errorf(
+			"the node's negotiation timeout = %s, expected %s",
+			node.settings.NegotiationTimeout,
+			roleDefaults.NegotiationTimeout,
+		)
+	}
+	if node.settings.ResourceLimits == nil {
+		t.Errorf("the node has no resource limits")
 	}
 }
 

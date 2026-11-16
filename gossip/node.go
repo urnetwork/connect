@@ -21,6 +21,17 @@
 // directory on apply -- because the directory is also written by the feed and
 // must judge for itself.
 //
+// Whoever reaches the node can open connections and streams on it, and a mesh
+// identity costs nothing to make: an open extender hands the gossip service of
+// any client to its node, and the operator's listener is public. So what the
+// node holds open is bounded where it is accepted, whoever asks. yamux resets
+// a connection's inbound streams past `MaxInboundStreamCountPerConn` before
+// the host spends anything on them, the resource manager bounds the
+// connections, streams and window memory of one peer and of every peer
+// together (`NodeResourceLimits`), and a stream that has not agreed on a
+// protocol within `NegotiationTimeout` is reset (partner security report,
+// 2026-11-16).
+//
 // The node is safe for concurrent use.
 
 package gossip
@@ -45,12 +56,14 @@ import (
 	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/net/upgrader"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	"github.com/libp2p/go-libp2p/x/rate"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 
@@ -104,6 +117,30 @@ type NodeSettings struct {
 	ConnManagerLowWater  int
 	ConnManagerHighWater int
 
+	// The most inbound streams one connection may hold open at once, which is
+	// yamux's own bound. A connection carries one gossipsub stream each way and
+	// identify's short-lived ones, so the default of 32 is a wide margin; a
+	// stream past it is reset before the host spends a goroutine on it.
+	// Non-positive takes the role default.
+	MaxInboundStreamCountPerConn int
+	// The largest receive window one stream may grow to, in bytes. The libp2p
+	// default of 16 MiB is sized for bulk transfer; a gossip stream carries
+	// signed records, and every byte of window is buffer a peer can fill. The
+	// default is 1 MiB. yamux opens every stream at the 256 KiB its protocol
+	// fixes, so a smaller value is taken as that. Non-positive takes the role
+	// default.
+	MaxStreamWindowByteCount int
+	// How long a new stream has to agree on a protocol before it is reset.
+	// Until it agrees it holds a goroutine and counts against the transient
+	// limits, so this is how long a client that never proposes anything can
+	// hold one. Non-positive takes the role default, 10 s, the libp2p default.
+	NegotiationTimeout time.Duration
+	// The resource manager's limits. Nil derives them from
+	// `ConnManagerHighWater` when the node is built
+	// (`DefaultNodeResourceLimits`), so a node sized as a hub -- the operator,
+	// which every member dials -- gets a hub's limits without restating them.
+	ResourceLimits *NodeResourceLimits
+
 	// The operator's mesh addresses, each carrying `/p2p/<id>` (D3). Empty
 	// means no operator link, which is what a space whose operator has not
 	// published its identity yet has.
@@ -144,15 +181,18 @@ type NodeSettings struct {
 // The defaults of one role (D1, D3).
 func DefaultNodeSettings(role string) *NodeSettings {
 	settings := &NodeSettings{
-		Role:                 NodeRoleMember,
-		PeerTarget:           8,
-		ConnManagerLowWater:  8,
-		ConnManagerHighWater: 16,
-		PeerTimeout:          60 * time.Second,
-		PeerCoalesceTimeout:  1 * time.Second,
-		DialTimeout:          30 * time.Second,
-		StatusTimeout:        5 * time.Second,
-		Now:                  time.Now,
+		Role:                         NodeRoleMember,
+		PeerTarget:                   8,
+		ConnManagerLowWater:          8,
+		ConnManagerHighWater:         16,
+		MaxInboundStreamCountPerConn: 32,
+		MaxStreamWindowByteCount:     1024 * 1024,
+		NegotiationTimeout:           10 * time.Second,
+		PeerTimeout:                  60 * time.Second,
+		PeerCoalesceTimeout:          1 * time.Second,
+		DialTimeout:                  30 * time.Second,
+		StatusTimeout:                5 * time.Second,
+		Now:                          time.Now,
 	}
 	if role == NodeRoleExtender {
 		settings.Role = NodeRoleExtender
@@ -161,6 +201,117 @@ func DefaultNodeSettings(role string) *NodeSettings {
 		settings.ConnManagerHighWater = 32
 	}
 	return settings
+}
+
+// The resource manager's limits of one node. Every count bounds what is open
+// at once. Memory is what yamux reserves to grow stream windows past the
+// 256 KiB every stream opens with. A mesh identity costs nothing to make, so
+// the peer limits bound one identity and the other limits bound every peer
+// together; the transient ones are what a client that never finishes a
+// handshake, or never proposes a protocol, can hold.
+type NodeResourceLimits struct {
+	// Connections of every peer together, both directions.
+	ConnCount int
+	// Inbound and outbound streams of every peer together.
+	InboundStreamCount  int
+	OutboundStreamCount int
+	// Window memory every peer together may reserve, in bytes.
+	MemoryByteCount int64
+
+	// Connections still in their security or muxer handshake, every peer
+	// together.
+	TransientConnCount int
+	// Streams that have not agreed on a protocol yet, every peer together.
+	TransientStreamCount int
+
+	// One peer's connections, inbound and outbound streams, and window memory
+	// in bytes.
+	PeerConnCount           int
+	PeerInboundStreamCount  int
+	PeerOutboundStreamCount int
+	PeerMemoryByteCount     int64
+}
+
+// The limits of a node whose connection manager trims above
+// `connManagerHighWater`. The all-peer limits scale with it, because the high
+// water is what the node expects to hold: per expected peer, 4 connections, 8
+// streams each way and 4 MiB of window growth, and 2 connections in handshake
+// and 4 streams in negotiation, which covers a peering round that dials every
+// address of every peer at once. A member (16) and an extender (32) get small
+// limits, the operator (1024) a hub's; a high water under 16 is taken as 16.
+// One peer holds a link or two in practice, so its limits do not scale.
+func DefaultNodeResourceLimits(connManagerHighWater int) *NodeResourceLimits {
+	highWater := max(connManagerHighWater, 16)
+	return &NodeResourceLimits{
+		ConnCount:               4 * highWater,
+		InboundStreamCount:      8 * highWater,
+		OutboundStreamCount:     8 * highWater,
+		MemoryByteCount:         int64(highWater) * 4 * 1024 * 1024,
+		TransientConnCount:      2 * highWater,
+		TransientStreamCount:    4 * highWater,
+		PeerConnCount:           8,
+		PeerInboundStreamCount:  64,
+		PeerOutboundStreamCount: 64,
+		PeerMemoryByteCount:     32 * 1024 * 1024,
+	}
+}
+
+// The resource manager of these limits. What the limits leave unnamed --
+// services, protocols, single connections and streams -- is bounded by the
+// peer and all-peer limits above it.
+//
+// The per-address limits libp2p applies by default, connection count and
+// connection rate alike, are turned off. They key on the address a connection
+// arrives from, and here that is not a client's: every connection to the
+// operator arrives from its reverse proxy, and an extender's in-process
+// connection on a udp carrier carries the extender's own address
+// (`remoteMultiaddrOrDefault`), so a per-address bound would be a bound on the
+// whole mesh. An extender's admission limits (A12) already bound connections
+// per source subnet before a stream reaches the node.
+func newNodeResourceManager(limits *NodeResourceLimits) (network.ResourceManager, error) {
+	limitConfig := rcmgr.PartialLimitConfig{
+		System: rcmgr.ResourceLimits{
+			Conns:           rcmgr.LimitVal(limits.ConnCount),
+			Streams:         rcmgr.LimitVal(limits.InboundStreamCount + limits.OutboundStreamCount),
+			StreamsInbound:  rcmgr.LimitVal(limits.InboundStreamCount),
+			StreamsOutbound: rcmgr.LimitVal(limits.OutboundStreamCount),
+			Memory:          rcmgr.LimitVal64(limits.MemoryByteCount),
+		},
+		Transient: rcmgr.ResourceLimits{
+			Conns:   rcmgr.LimitVal(limits.TransientConnCount),
+			Streams: rcmgr.LimitVal(limits.TransientStreamCount),
+			Memory:  rcmgr.LimitVal64(limits.MemoryByteCount),
+		},
+		PeerDefault: rcmgr.ResourceLimits{
+			Conns:           rcmgr.LimitVal(limits.PeerConnCount),
+			Streams:         rcmgr.LimitVal(limits.PeerInboundStreamCount + limits.PeerOutboundStreamCount),
+			StreamsInbound:  rcmgr.LimitVal(limits.PeerInboundStreamCount),
+			StreamsOutbound: rcmgr.LimitVal(limits.PeerOutboundStreamCount),
+			Memory:          rcmgr.LimitVal64(limits.PeerMemoryByteCount),
+		},
+	}.Build(rcmgr.InfiniteLimits)
+	return rcmgr.NewResourceManager(
+		rcmgr.NewFixedLimiter(limitConfig),
+		rcmgr.WithLimitPerSubnet([]rcmgr.ConnLimitPerSubnet{}, []rcmgr.ConnLimitPerSubnet{}),
+		rcmgr.WithConnRateLimiters(&rate.Limiter{}),
+		// the limits are fixed, and the node exports no libp2p metrics
+		rcmgr.WithMetricsDisabled(),
+	)
+}
+
+// The muxer of D1 with this node's stream bounds. The libp2p default lifts
+// yamux's own inbound stream limit to its maximum and leaves the bound to a
+// resource manager, so without one a single connection could hold any number
+// of streams. Here yamux enforces the per-connection bound itself, and the
+// window stops at what a gossip stream needs.
+func newNodeMuxer(settings *NodeSettings) *yamux.Transport {
+	config := *yamux.DefaultTransport.Config()
+	config.MaxIncomingStreams = uint32(settings.MaxInboundStreamCountPerConn)
+	config.MaxStreamWindowSize = uint32(max(
+		settings.MaxStreamWindowByteCount,
+		int(config.InitialStreamWindowSize),
+	))
+	return (*yamux.Transport)(&config)
 }
 
 // What the sdk status reports for the mesh (F2). Comparable, so it rides a
@@ -250,6 +401,24 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 	if copied.ConnectSettings == nil {
 		copied.ConnectSettings = connect.DefaultConnectSettings()
 	}
+	// the inbound bounds are never off: a caller that built its settings by
+	// hand gets the role's
+	roleDefaults := DefaultNodeSettings(copied.Role)
+	if copied.MaxInboundStreamCountPerConn <= 0 {
+		copied.MaxInboundStreamCountPerConn = roleDefaults.MaxInboundStreamCountPerConn
+	}
+	if copied.MaxStreamWindowByteCount <= 0 {
+		copied.MaxStreamWindowByteCount = roleDefaults.MaxStreamWindowByteCount
+	}
+	if copied.NegotiationTimeout <= 0 {
+		copied.NegotiationTimeout = roleDefaults.NegotiationTimeout
+	}
+	if copied.ResourceLimits == nil {
+		copied.ResourceLimits = DefaultNodeResourceLimits(copied.ConnManagerHighWater)
+	} else {
+		resourceLimits := *copied.ResourceLimits
+		copied.ResourceLimits = &resourceLimits
+	}
 	settings = &copied
 
 	identityKeySeed := settings.IdentityKeySeed
@@ -293,17 +462,25 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		operatorAddrs:   slices.Clone(settings.OperatorAddrs),
 	}
 
+	// the host closes the resource manager it is built on, so the manager is
+	// closed here only when no host took it
+	var resourceManager network.ResourceManager
 	success := false
 	defer func() {
 		if !success {
 			cancel()
 			if self.host != nil {
 				self.host.Close()
+			} else if resourceManager != nil {
+				resourceManager.Close()
 			}
 		}
 	}()
 
-	if self.host, err = self.newHost(privateKey); err != nil {
+	if resourceManager, err = newNodeResourceManager(settings.ResourceLimits); err != nil {
+		return nil, err
+	}
+	if self.host, err = self.newHost(privateKey, resourceManager); err != nil {
 		return nil, err
 	}
 	if err := self.joinTopic(); err != nil {
@@ -339,8 +516,12 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 }
 
 // The libp2p host of D1: the extender transport in place of tcp, the websocket
-// transport for the operator, noise, yamux, a connection manager, and no
-// discovery, relay, nat service or metrics of any kind.
+// transport for the operator, noise, yamux under this node's stream bounds,
+// the node's resource manager, a connection manager, and no discovery, relay,
+// nat service or metrics of any kind. The resource manager is the swarm's and
+// the upgrader's both: the upgrader opens the scope of every inbound
+// connection, so without it inbound connections would go uncounted and their
+// yamux window growth unbounded. Closing the host closes the resource manager.
 //
 // The host is assembled from the swarm and the basic host rather than through
 // the `libp2p` root package, which is a deliberate deviation: that package's
@@ -349,7 +530,10 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 // pins. Naming the two transports we want also keeps quic, webtransport and
 // webrtc out of the binary entirely, which is what the mobile size budget
 // needs.
-func (self *Node) newHost(privateKey crypto.PrivKey) (host.Host, error) {
+func (self *Node) newHost(
+	privateKey crypto.PrivKey,
+	resourceManager network.ResourceManager,
+) (host.Host, error) {
 	peerId, err := peer.IDFromPrivateKey(privateKey)
 	if err != nil {
 		return nil, err
@@ -379,6 +563,7 @@ func (self *Node) newHost(privateKey crypto.PrivKey) (host.Host, error) {
 		peerstore,
 		eventBus,
 		swarm.WithDialTimeout(self.settings.DialTimeout),
+		swarm.WithResourceManager(resourceManager),
 	)
 	if err != nil {
 		return nil, err
@@ -396,9 +581,9 @@ func (self *Node) newHost(privateKey crypto.PrivKey) (host.Host, error) {
 	}
 	connUpgrader, err := upgrader.New(
 		[]sec.SecureTransport{noiseTransport},
-		[]upgrader.StreamMuxer{{ID: yamux.ID, Muxer: yamux.DefaultTransport}},
+		[]upgrader.StreamMuxer{{ID: yamux.ID, Muxer: newNodeMuxer(self.settings)}},
 		nil,
-		nil,
+		resourceManager,
 		nil,
 	)
 	if err != nil {
@@ -443,7 +628,8 @@ func (self *Node) newHost(privateKey crypto.PrivKey) (host.Host, error) {
 		// an extender advertises the public addresses of its own record, and a
 		// member advertises nothing, so nothing here discovers or publishes an
 		// address of its own
-		EnablePing: false,
+		EnablePing:         false,
+		NegotiationTimeout: self.settings.NegotiationTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -629,7 +815,8 @@ func (self *Node) OperatorAddrs() []ma.Multiaddr {
 	return slices.Clone(self.operatorAddrs)
 }
 
-// Ends the loops, joins them and closes the host.
+// Ends the loops, joins them, and closes the host, which closes its resource
+// manager.
 func (self *Node) Close() {
 	self.closeOnce.Do(func() {
 		self.cancel()
