@@ -15787,13 +15787,15 @@ paths:
       tags: [Other]
       summary: Register a custom domain's chain
       description: |
-        A Team custom domain's chain (v1), from a desktop that ordered it under
-        the domain's own ACME account. The chain's key and names must match a
-        queued row, or the attestation sent with it, so a device cannot register
-        another device's key. Takes a client token of the network.
+        A Team custom domain's chain (v1), from the ordering desktop that holds
+        the domain account's lock for the row (sidecar DESIGN-DETAILS 17.2.5).
+        Every custom certificate is a row first: the chain's leaf must carry the
+        row's key and exactly its one host, chain to the next certificate, be
+        unexpired, and the account must be the domain's. Takes a service token
+        for audience `certs`; the token names the caller.
       operationId: tlsCertRegister
       security:
-        - BearerAuth: []
+        - ServiceTokenAuth: []
       requestBody:
         required: true
         content:
@@ -15802,9 +15804,222 @@ paths:
               $ref: "#/components/schemas/TlsCertRegisterArgs"
       responses:
         "200":
-          description: Registered.
+          description: Registered; the row reads `custom_issued` and the lock is free.
+        "400":
+          description: "`chain`: a chain the row cannot take."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "409":
+          description: "`claim`: the caller no longer holds the lock; `state`: the row ended under its order."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+
+  /tls/custom-claim:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Take or renew a custom domain account's lock
+      description: |
+        Takes, or renews, the domain's ACME account lock for one row's order or
+        revocation, or for a key change (sidecar DESIGN-DETAILS 17.2.6). The
+        lock's clock is the database's; the answer gives the claim's sequence,
+        its lease in milliseconds, the row, a recorded order to resume, and
+        whether one newOrder is granted, its budgets checked and spent in the
+        same transaction. Only an ordering desktop: a sidecar holding an active
+        publish grant on a `tls/` name of an active custom host's owner under
+        the domain, and for a rollover a network admin's. Takes a service token
+        for audience `certs`.
+      operationId: tlsCustomClaim
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCustomClaimArgs"
+      responses:
+        "200":
+          description: The claim.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomClaimResult"
         "403":
-          description: The chain's key or names match no queued row and no attestation.
+          description: "`orderer`: the caller is no ordering desktop of the domain."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "404":
+          description: "`no_account`: the domain has no account row."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "409":
+          description: |
+            `key_seq` (with the row's), `locked` (with `retry_after_ms`),
+            `in_flight` (with the `cert_id` to claim instead) or `state`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "429":
+          description: "`budget` or `hold`, with `retry_after_ms`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+
+  /tls/custom-progress:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Report what the lock's holder learned at the CA
+      description: |
+        One event of the holder's (sidecar DESIGN-DETAILS 17.2.5):
+        `order_recorded`, `order_invalid`, `authz_failed`, `rate_limited`,
+        `not_exempt`, `release`, `failed` and `revoked` apply only under the
+        caller's current claim; `ari` and `rollover_due` take none. An
+        `order_invalid` answers a claim, granted another newOrder or not. Takes
+        a service token for audience `certs`.
+      operationId: tlsCustomProgress
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCustomProgressArgs"
+      responses:
+        "200":
+          description: Applied. For `order_invalid`, the claim as it stands.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomClaimResult"
+        "409":
+          description: "`claim`: the caller no longer holds the lock for the row, and sends the CA nothing more for it."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "429":
+          description: "`budget`: an `order_invalid` that no budget grants another newOrder; the row is queued again."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+
+  /tls/custom-account:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Create a custom domain's account row, or change its key
+      description: |
+        A network admin's ordering desktop only (sidecar DESIGN-DETAILS
+        17.2.13): `create` for a verified domain with no account row, and
+        `roll_begin`, `roll_end`, `roll_abort` and `repair` under a rollover
+        claim. The account key never reaches the server: only its public
+        RFC 7638 thumbprint and the secret repo that holds it. Takes a service
+        token for audience `certs`.
+      operationId: tlsCustomAccount
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCustomAccountArgs"
+      responses:
+        "200":
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomAccount"
+        "403":
+          description: "`orderer`: not a network admin's ordering desktop."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+        "409":
+          description: "`exists`, `key_seq`, `claim` or `state`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomRefusal"
+
+  /tls/custom-challenge:
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Write a delegated DNS-01 value
+      description: |
+        A DNS-01 value for a host mapped under the domain (QD-175), which certs,
+        the only writer, writes at the domain's `<acme_token>.acme.<root>`: at
+        most 2 values, TTL 60, 10 writes a name an hour, gone after 1 h. The
+        caller holds an active publish grant on a host mapped under that domain.
+        Takes a service token for audience `certs`.
+      operationId: tlsCustomChallenge
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TlsCustomChallengeArgs"
+      responses:
+        "200":
+          description: Written, with the serial to wait on.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomChallengeResult"
+        "403":
+          description: No publish grant on a host mapped under the domain.
+
+  /tls/custom-challenge/{challenge_id}:
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Whether the dns edges serve a delegated DNS-01 value
+      description: |
+        GET /dns/ready for the write's serial, every answer passed through:
+        `stale` (post the value again), `ready`, `canary_failing` or `waiting`.
+        The desktop asks the CA only on `ready`. Takes a service token for
+        audience `certs`.
+      operationId: tlsCustomChallengeGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: challenge_id
+          in: path
+          required: true
+          description: The serial `POST /tls/custom-challenge` answered.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TlsCustomChallengeResult"
 
   /tls/certs:
     get:
@@ -15814,13 +16029,24 @@ paths:
       summary: List the network's certificates
       description: |
         The network's certificates with their attestations, for each device's
-        certificate transparency watch, and the custom-domain CSRs waiting for an
-        ordering desktop. A reader verifies each attestation itself, under the
-        identity key its own verified state holds, and never trusts this answer
-        for it. Takes a client token of the network.
+        certificate transparency watch, custom rows in any state among them. A
+        reader verifies each attestation itself, under the identity key its own
+        verified state holds, and never trusts this answer for it. Takes a
+        client token of the network. With `work=1` and a service token for
+        audience `certs` from an ordering desktop, it answers that desktop's
+        accounts and its work list alone, in plan order, each row with its CSR,
+        attestation and wait (sidecar DESIGN-DETAILS 17.2.5, 17.2.8).
       operationId: tlsCerts
       security:
         - BearerAuth: []
+        - ServiceTokenAuth: []
+      parameters:
+        - name: work
+          in: query
+          required: false
+          description: "1: an ordering desktop's accounts and work list alone."
+          schema:
+            type: integer
       responses:
         "200":
           description: OK.
@@ -32118,13 +32344,16 @@ components:
 
     TlsCertState:
       description: |
-        Where a certificate row stands: queued for certs' queue or, for a custom
-        domain, an ordering desktop; ordering at its CA; waiting_dns for its
-        challenge's serial and the canary; issued; failed, with no retry;
-        revoking until the CA takes a revocation; revoked; expired. A reader
+        Where a certificate row stands: queued for certs' queue; ordering at its
+        CA; waiting_dns for its challenge's serial and the canary; issued;
+        failed, with no retry; revoking until the CA takes a revocation;
+        revoked; expired. A Team custom domain's rows (v1) are custom_queued
+        until an ordering desktop claims them, custom_ordering while their
+        order is at the customer's CA, custom_issued once their chain is
+        registered, and custom_revoking until a desktop revokes them. A reader
         takes a state it does not know as no certificate.
       type: string
-      enum: [queued, ordering, waiting_dns, issued, failed, revoking, revoked, expired]
+      enum: [queued, ordering, waiting_dns, issued, failed, revoking, revoked, expired, custom_queued, custom_ordering, custom_issued, custom_revoking]
 
     TlsCertOrderArgs:
       type: object
@@ -32260,6 +32489,23 @@ components:
           items:
             type: string
             format: byte
+        custom_host:
+          description: A custom row's one host.
+          type: string
+        custom_domain:
+          type: string
+        custom_reason:
+          description: Why a custom row failed or was queued again.
+          type: string
+        wait_ms:
+          description: A work-list row's wait, in milliseconds from the answer.
+          type: integer
+        host_ready:
+          description: A work-list row's host is ready for TLS-ALPN-01.
+          type: boolean
+        owner:
+          description: A work-list row's host owner label.
+          type: string
 
     TlsCertsResult:
       type: object
@@ -32271,24 +32517,30 @@ components:
           items:
             $ref: "#/components/schemas/TlsCertRecord"
         queued_csrs:
-          description: Custom-domain CSRs waiting for an ordering desktop (v1).
+          description: An ordering desktop's work list, in plan order (v1).
           type: array
           items:
             $ref: "#/components/schemas/TlsCertRecord"
+        accounts:
+          description: An ordering desktop's accounts.
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCustomAccount"
 
     TlsCertRegisterArgs:
       type: object
       required:
+        - cert_id
+        - claim_seq
         - chain
         - account_uri
       properties:
         cert_id:
-          description: udid. The queued row this chain answers. Absent when the attestation is sent instead.
+          description: udid. The custom_ordering row this chain answers.
           type: string
-        attestation:
-          description: The encoded `Signed` of a `TlsKeyAttestation` for the chain's key and names.
-          type: string
-          format: byte
+        claim_seq:
+          description: The claim the caller holds the account's lock under.
+          type: integer
         chain:
           description: Each certificate in DER, leaf first.
           type: array
@@ -32297,6 +32549,211 @@ components:
             format: byte
         account_uri:
           description: The custom domain's ACME account that ordered it.
+          type: string
+        ari_window_start:
+          description: datetime. RFC 9773's suggested window, absent when the CA gave none.
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+
+    TlsCustomRefusal:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+        retry_after_ms:
+          description: How long to wait, in milliseconds from the answer.
+          type: integer
+        cert_id:
+          description: udid. `in_flight`'s row to claim instead.
+          type: string
+        key_seq:
+          description: "`key_seq`'s: the account row's key sequence."
+          type: integer
+
+    TlsCustomAccount:
+      type: object
+      required:
+        - domain
+        - ca
+        - account_uri
+        - key_seq
+        - key_thumbprint
+        - key_repo_id
+        - acme_name
+      properties:
+        domain:
+          type: string
+        ca:
+          type: string
+        account_uri:
+          type: string
+        key_seq:
+          type: integer
+        key_thumbprint:
+          description: RFC 7638's SHA-256 thumbprint of the current account key.
+          type: string
+          format: byte
+        key_repo_id:
+          description: udid. The secret repo that holds the key file.
+          type: string
+        next_key_thumbprint:
+          type: string
+          format: byte
+        next_key_repo_id:
+          description: udid
+          type: string
+        lock_sidecar_id:
+          description: udid. The lock's holder while it holds it.
+          type: string
+        lock_retry_after_ms:
+          type: integer
+        hold_new_ms:
+          type: integer
+        hold_all_ms:
+          type: integer
+        acme_name:
+          description: The TXT owner name DNS-01 values are written at, `<acme_token>.acme.<root>`.
+          type: string
+
+    TlsCustomClaimArgs:
+      type: object
+      required:
+        - domain
+        - purpose
+        - key_seq
+      properties:
+        domain:
+          type: string
+        purpose:
+          description: "`order`, `revoke` or `rollover`."
+          type: string
+        cert_id:
+          description: udid. Absent for a rollover.
+          type: string
+        key_seq:
+          description: The key_seq of the key file the caller holds.
+          type: integer
+
+    TlsCustomClaimResult:
+      type: object
+      required:
+        - claim_seq
+        - lease_ms
+      properties:
+        claim_seq:
+          type: integer
+        lease_ms:
+          type: integer
+        record:
+          $ref: "#/components/schemas/TlsCertRecord"
+        order_url:
+          description: The order to resume. Absent when none is recorded.
+          type: string
+        may_order:
+          description: One newOrder is granted.
+          type: boolean
+        replaces_leaf:
+          description: The predecessor's leaf in DER, for RFC 9773's replaces.
+          type: string
+          format: byte
+
+    TlsCustomProgressArgs:
+      type: object
+      required:
+        - domain
+        - event
+      properties:
+        domain:
+          type: string
+        claim_seq:
+          type: integer
+        cert_id:
+          description: udid
+          type: string
+        event:
+          type: string
+        order_url:
+          type: string
+        retry_after_ms:
+          type: integer
+        reason:
+          type: string
+        ari:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsCustomAri"
+
+    TlsCustomAri:
+      type: object
+      required:
+        - cert_id
+        - ari_window_start
+        - ari_window_end
+      properties:
+        cert_id:
+          description: udid
+          type: string
+        ari_window_start:
+          description: datetime
+          type: string
+          format: date-time
+        ari_window_end:
+          description: datetime
+          type: string
+          format: date-time
+
+    TlsCustomAccountArgs:
+      type: object
+      required:
+        - domain
+        - op
+      properties:
+        domain:
+          type: string
+        op:
+          description: "`create`, `roll_begin`, `roll_end`, `roll_abort` or `repair`."
+          type: string
+        account_uri:
+          type: string
+        key_seq:
+          type: integer
+        key_thumbprint:
+          type: string
+          format: byte
+        key_repo_id:
+          description: udid
+          type: string
+        claim_seq:
+          type: integer
+
+    TlsCustomChallengeArgs:
+      type: object
+      required:
+        - domain
+        - value
+      properties:
+        domain:
+          type: string
+        value:
+          description: The 43-character base64url DNS-01 digest.
+          type: string
+
+    TlsCustomChallengeResult:
+      type: object
+      required:
+        - challenge_id
+      properties:
+        challenge_id:
+          description: The serial the write took.
+          type: integer
+        readiness:
+          description: "`stale`, `ready`, `canary_failing` or `waiting`."
           type: string
 
     TlsCertRevokeArgs:
