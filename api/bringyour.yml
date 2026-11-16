@@ -4353,6 +4353,22 @@ paths:
         judge them. `expiry_time` is the end of the period the invoice pays
         for.
 
+        A trial's card is checked when it is attached, before the trial is
+        credited: the yearly plan's 14-day trial, through the payment sheet or
+        Checkout. A card whose CVC check failed is refused, so the trial does
+        not start, no Pro is credited, and the card is detached so it is
+        never charged. The report answers `invalid` with `error.code`
+        `incorrect_cvc` and a `message` to show, and keeps answering it
+        whether the webhook or the report saw the card first. Stripe's sheet
+        or checkout has already said the card was saved, so show the refusal
+        instead of a success, and stop waiting for Pro. To try again, request
+        a new payment sheet (`/subscription/stripe/payment-sheet`; the old
+        client secret's setup has succeeded and cannot be reused, and the
+        refused subscription is replaced) or a new checkout session (the
+        refused trial's subscription is already canceled). Cards that pass
+        the check, or whose bank returns no CVC result, start the trial as
+        before.
+
         Shares the per-account budget of the Play and Apple endpoints; every
         attempt counts, including failures.
       operationId: subscriptionVerifyStripeCheckout
@@ -16540,7 +16556,8 @@ components:
         /pay/crypto/quote, /pay/crypto/intent, /pay/data/crypto-intent,
         /pay/crypto/requote, /pay/gift/checkout and /pay/gift/crypto-intent),
         or why a crypto invoice's status needs attention (/pay/crypto/status),
-        or why /pay/gift/gamma-cancel did not cancel.
+        or why /pay/gift/gamma-cancel did not cancel, or why a reported card
+        purchase will never credit (/subscription/verify-stripe-checkout).
         /pay/gift/gamma-intent answers the gift codes below in its
         GammaPaymentError.
         Every refusal carries `message`, worded as before the codes, and a
@@ -16610,6 +16627,12 @@ components:
             credited), so a new gift purchase with Gamma
             (/pay/gift/gamma-intent), or the cancel of that purchase
             (/pay/gift/gamma-cancel), must wait; try again in a few minutes.
+            `incorrect_cvc`: a Stripe trial's card failed its CVC check when
+            it was attached, so the trial did not start, no Pro was credited,
+            and the card is never charged. Only the purchase report
+            (/subscription/verify-stripe-checkout) answers it, with status
+            `invalid`. The buyer checks the card details and tries again with
+            a new payment sheet or checkout session.
             Absent from older servers; clients fall back to `message` for an
             absent or unknown code.
           type: string
@@ -25078,6 +25101,16 @@ components:
           description: The credited window's end, when the store reported one.
           type: string
           format: date-time
+        error:
+          description: |
+            Why the purchase will never credit, beside status `invalid`, when
+            the buyer can do something about it. Only
+            /subscription/verify-stripe-checkout sets it: `incorrect_cvc`, a
+            Stripe trial whose card failed its CVC check when it was
+            attached; show `message` and offer a new payment sheet or
+            checkout. Absent otherwise, and from older servers; a client that
+            does not read it stops at `invalid`.
+          $ref: "#/components/schemas/PurchaseError"
 
     # ----- x402 -----
 
