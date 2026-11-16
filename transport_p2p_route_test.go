@@ -125,13 +125,18 @@ func TestP2pReceiveConstructorPublishesExactPhysicalLanes(t *testing.T) {
 		t.Fatal("P2P physical lanes share route identity")
 	}
 	manager := &recordingP2pRouteManager{}
-	if !updateP2pConnectionReceiveRoutes(ctx, manager, lanes, true) {
+	peerId := NewId()
+	if !updateP2pConnectionReceiveRoutes(ctx, manager, lanes, peerId, true) {
 		t.Fatal("active P2P receive lanes were not published")
 	}
 	if len(manager.propertyUpdates) != 2 ||
 		manager.propertyUpdates[0].ReceiveReliability != CarrierReliabilityReliable ||
 		manager.propertyUpdates[1].ReceiveReliability != CarrierReliabilityUnreliable {
 		t.Fatalf("published P2P lane properties=%+v", manager.propertyUpdates)
+	}
+	// both physical lanes vouch for the association's adjacent peer only
+	for _, properties := range manager.propertyUpdates {
+		AssertEqual(t, peerId, properties.boundSourceId)
 	}
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
 	defer closeCancel()

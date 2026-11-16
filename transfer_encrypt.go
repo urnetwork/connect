@@ -757,6 +757,18 @@ type EncryptionSettings struct {
 	// to the default.
 	UnknownWrapNackRestartCooldown time.Duration
 
+	// UnknownWrapNackMaxSessionCount bounds the sessions an undecryptable wrap
+	// may create to carry its nack that are still live, for the whole client.
+	// The nack path creates a session only for an authenticated source, the
+	// one a peer's coming re-handshake will drive; at the bound it nacks
+	// through sessions that already exist and creates none, leaving recovery
+	// to the sealer's sequence lifecycle. A provider that restarts hears
+	// undecryptable wraps from every client that was sealing to it and needs
+	// one session for each of their nacks, so the default covers a busy
+	// provider's clients while bounding what the path can hold to that many
+	// idle sessions and their nack carriers. Zero or negative creates none.
+	UnknownWrapNackMaxSessionCount int
+
 	// EncryptionControlUseCompanion, when true (default), sends
 	// EncryptedControl handshake packs as companion-contract traffic.
 	// This is required for asymmetric contract setups where the TLS
@@ -825,6 +837,8 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		// other's pacing.
 		UnknownWrapNackMinInterval:     1 * time.Second,
 		UnknownWrapNackRestartCooldown: 5 * time.Second,
+		// one session per client of a busy provider that restarted
+		UnknownWrapNackMaxSessionCount: 1024,
 		// 0 reaps a standalone session immediately at refs==0 (<0 keeps it
 		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
 		// overrides this with max(send-sequence idle, receive-sequence idle) so
@@ -1049,6 +1063,10 @@ type peerEncryptionSession struct {
 	// create the sequence before the application Pack that triggered it.
 	carrierNetworkPeer atomic.Bool
 	logTag             string
+	// true when an undecryptable wrap created this session for its nack, so the
+	// manager's unknownWrapNackSessionCount counts it until it exits. Guarded
+	// by the manager's stateLock, not this session's.
+	unknownWrapNackCreated bool
 
 	settings *EncryptionSettings
 
@@ -3325,7 +3343,10 @@ type EncryptionSessionManager struct {
 	stateLock sync.Mutex
 	closed    bool
 	sessions  map[sessionKey]*peerEncryptionSession
-	workers   *lifecycleAdmission
+	// live sessions an undecryptable wrap created to carry its nack, bounded by
+	// UnknownWrapNackMaxSessionCount
+	unknownWrapNackSessionCount int
+	workers                     *lifecycleAdmission
 	// Nil test barrier pauses a publisher or session supervisor after cleanup
 	// and before joined completion.
 	beforeWorkerDoneForTest func(string)
@@ -3813,6 +3834,11 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 				defer self.stateLock.Unlock()
 				if self.sessions[key] == s {
 					delete(self.sessions, key)
+				}
+				// counted once, when the session ends, whoever removed it
+				// from the map
+				if s.unknownWrapNackCreated {
+					self.unknownWrapNackSessionCount -= 1
 				}
 			}()
 			// a removed session may shrink the established + verified peer set
@@ -4401,18 +4427,54 @@ func (self *peerEncryptionSession) unknownWrapNackRestartCooldown() time.Duratio
 
 // NotifyUndecryptableWrap reports that a wrapped frame from `peerId`, pinned
 // by its wire hints to the (complement(senderRole), companion) local session,
-// could not be opened by any local cipher. The local session — created if
-// absent, exactly the session the peer's coming re-handshake will drive —
-// nacks the sealer, rate-limited per session.
+// could not be opened by any local cipher. The local session nacks the sealer,
+// rate-limited per session.
+//
+// A wrap no session opens proves nothing about who sent it, and the nack is
+// not free: its session, the send sequence that carries it, and the contract
+// that sequence asks the platform for are all state for `peerId`. So the
+// session is created when absent -- exactly the session the peer's coming
+// re-handshake will drive -- only when the caller vouches that `peerId` is
+// `authenticated`, and only while the sessions this path created number fewer
+// than UnknownWrapNackMaxSessionCount. Otherwise the wrap is nacked through a
+// session that already exists, or not at all, and the sealer recovers through
+// its sequence lifecycle. A client with encryption off never nacks: it can
+// neither open a wrap nor answer the handshake a nack asks for.
 func (self *EncryptionSessionManager) NotifyUndecryptableWrap(
 	peerId Id,
 	senderRole sequenceTlsRole,
 	companion bool,
+	authenticated bool,
 ) {
 	if self == nil || peerId == (Id{}) {
 		return
 	}
-	session := self.getOrCreate(peerId, senderRole.complement(), companion)
+	if self.settings.Mode == EncryptionModeOff {
+		return
+	}
+	role := senderRole.complement()
+	if self.beforeSessionAdmissionLockForTest != nil {
+		self.beforeSessionAdmissionLockForTest()
+	}
+	session := func() *peerEncryptionSession {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if session, ok := self.sessions[sessionKey{peerId: peerId, companion: companion, role: role}]; ok {
+			return session
+		}
+		if !authenticated {
+			return nil
+		}
+		if self.settings.UnknownWrapNackMaxSessionCount <= self.unknownWrapNackSessionCount {
+			return nil
+		}
+		session := self.getOrCreateWithLock(peerId, role, companion)
+		if session != nil {
+			session.unknownWrapNackCreated = true
+			self.unknownWrapNackSessionCount += 1
+		}
+		return session
+	}()
 	if session == nil {
 		return
 	}

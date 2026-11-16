@@ -1816,8 +1816,9 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 type ClientReceiveStatsSnapshot struct {
 	ReceiveDecodeReservedByteCount ByteCount
 	ReceiveDecodePressureDropCount uint64
-	// Frames a direct peer (P2P) route delivered that named the platform or
-	// this client as their source, dropped as forged.
+	// Frames a direct peer (P2P) route delivered that named the platform, this
+	// client, or a source other than the peer the route is bound to, dropped
+	// as forged.
 	ForgedSourceDropCount           uint64
 	PackHandoffDropCount            uint64
 	PackHandoffDropByteCount        uint64
@@ -4723,6 +4724,9 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var receiveWireLimit int
+		// the only source the delivering route vouches for, zero when it
+		// binds none (TransferCarrierProperties.boundSourceId)
+		var boundSourceId Id
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4734,6 +4738,7 @@ func (self *Client) run() {
 				transportType = disposition.transportType
 				receiveWireLimit = disposition.maxMessageByteCount
 				h1ReceiveCredit = disposition.h1Credit
+				boundSourceId = disposition.boundSourceId
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
@@ -4786,11 +4791,22 @@ func (self *Client) run() {
 		// either as its source is forged: taken as control-plane or self
 		// traffic it would skip contract and session checks and drive
 		// platform-only control (stream setup, sequence close, transport
-		// migration). Other peer ids cannot be checked here, because a
-		// multihop endpoint knows only its adjacent hop (see §2.3 of
-		// audit/EVIDENCE.md).
+		// migration).
+		//
+		// A production P2P association also binds its lanes to its adjacent
+		// peer, the one source the platform-relayed signaling authenticated,
+		// and a frame naming any other source is forged as well. It is dropped
+		// here, before decode, because everything after allocates state for the
+		// named source: a receive sequence and a session for a plaintext pack,
+		// and for an undecryptable wrap a session, an unknown-wrap nack, the
+		// send sequence that carries it and a contract request to the platform
+		// (partner security researchers' report 2026-11-16; §2.3 of
+		// audit/EVIDENCE.md). A route that binds no source, a custom carrier,
+		// is checked for the platform and this client only.
 		if transportType == TransportTypeP2p &&
-			(path.SourceId == ControlId || path.SourceId == self.clientId) {
+			(path.SourceId == ControlId ||
+				path.SourceId == self.clientId ||
+				(boundSourceId != (Id{}) && path.SourceId != boundSourceId)) {
 			self.receiveForgedSourceDropCount.Add(1)
 			if self.log.V(1).Enabled() {
 				self.log.Infof("[cr] %s dropped a p2p frame claiming source %s\n", self.clientTag, path.SourceId)
@@ -4798,6 +4814,12 @@ func (self *Client) run() {
 			MessagePoolReturn(transferFrameBytes)
 			continue
 		}
+		// The platform attributes the source of every frame it relays (it
+		// refuses a client's frame naming any source but that client), and a
+		// bound P2P route delivers its adjacent peer's frames only, so the
+		// source is authenticated unless an unbound P2P route delivered the
+		// frame, where it is the sender's word.
+		sourceAuthenticated := transportType != TransportTypeP2p || boundSourceId != (Id{})
 
 		source := path.SourceMask()
 
@@ -4876,14 +4898,16 @@ func (self *Client) run() {
 					// instead of resending into the void until its sequence
 					// lifecycle recovers (rate-limited; requires the role
 					// hint to pin the session — anonymous wraps keep the
-					// timeout path). See EncryptedControlUnknownWrapNack.
+					// timeout path). See EncryptedControlUnknownWrapNack. Only
+					// an authenticated source may have a session created for
+					// it; any other is nacked through a session it already has.
 					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && !errors.Is(err, errInboundKeyHistoryBlocked) {
 						nackCompanion := false
 						if transferFrame.SessionCompanion != nil {
 							nackCompanion = *transferFrame.SessionCompanion
 						}
 						self.encryptionSessionManager.NotifyUndecryptableWrap(
-							path.SourceId, senderRole, nackCompanion)
+							path.SourceId, senderRole, nackCompanion, sourceAuthenticated)
 					}
 					MessagePoolReturn(transferFrameBytes)
 					inboundDecodedTransferFrames.put(decodedFrame)

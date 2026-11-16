@@ -446,10 +446,17 @@ type p2pReceiveRouteLane struct {
 // updateP2pConnectionReceiveRoutes publishes or retires both physical receive
 // lanes as one connection-state transition. Each route gets immutable exact
 // reliability while the association remains one observable P2P adjacency.
+//
+// Both lanes are bound to `boundSourceId`, the association's adjacent peer.
+// The platform relayed the signaling that set the association up from that
+// authenticated client, so it is the only source the lanes can vouch for; a
+// frame naming any other is dropped by the client before it allocates peer
+// state (TransferCarrierProperties.boundSourceId).
 func updateP2pConnectionReceiveRoutes(
 	ctx context.Context,
 	manager p2pRouteManager,
 	lanes []p2pReceiveRouteLane,
+	boundSourceId Id,
 	connected bool,
 	testHooks ...p2pConnectionRouteTestHooks,
 ) bool {
@@ -473,7 +480,10 @@ func updateP2pConnectionReceiveRoutes(
 		manager.UpdateTransportWithProperties(
 			lane.transport,
 			[]Route{lane.route},
-			TransferCarrierProperties{ReceiveReliability: lane.reliability},
+			TransferCarrierProperties{
+				ReceiveReliability: lane.reliability,
+				boundSourceId:      boundSourceId,
+			},
 		)
 	}
 	if hooks.afterConnectedUpdate != nil {
@@ -938,6 +948,9 @@ func (self *P2pTransport) run() {
 						handleCtx,
 						self.receiveRouteManager,
 						receiveLanes,
+						// the association's adjacent peer, whose identity the
+						// platform-relayed signaling authenticated
+						self.peerId,
 						connected,
 						p2pConnectionRouteTestHooks{
 							beforeConnectedUpdate: func() {
