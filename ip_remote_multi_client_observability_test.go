@@ -850,14 +850,23 @@ func TestQuarantineLiftLogsOutsideTheLock(t *testing.T) {
 
 // recordingLogger captures lines so a test can assert on what a field capture
 // would contain. Concurrency-safe because the heartbeat writes from its own
-// goroutine while the test reads.
+// goroutine while the test reads. Verbose lines are not recorded unless the
+// logger was made with newVerboseRecordingLogger.
 type recordingLogger struct {
 	mutex sync.Mutex
 	out   []string
+	// V levels from 1 up to this are enabled and recorded; zero enables none
+	verbosity int32
 }
 
 func newRecordingLogger() *recordingLogger {
 	return &recordingLogger{}
+}
+
+// a recording logger with V(1) through V(verbosity) enabled, as glog runs at
+// -v=verbosity
+func newVerboseRecordingLogger(verbosity int32) *recordingLogger {
+	return &recordingLogger{verbosity: verbosity}
 }
 
 // record takes the args as a plain slice rather than as a variadic forward.
@@ -913,5 +922,25 @@ func (self *recordingLogger) Errorf(format string, args ...any) {
 }
 
 func (self *recordingLogger) V(level int32) Verbose {
+	if 0 < level && level <= self.verbosity {
+		return recordingVerbose{log: self}
+	}
 	return noopVerbose{}
+}
+
+// an enabled verbose level of a recordingLogger
+type recordingVerbose struct {
+	log *recordingLogger
+}
+
+func (self recordingVerbose) Enabled() bool {
+	return true
+}
+
+func (self recordingVerbose) Info(args ...any) {
+	self.log.Info(args...)
+}
+
+func (self recordingVerbose) Infof(format string, args ...any) {
+	self.log.record(format, args)
 }

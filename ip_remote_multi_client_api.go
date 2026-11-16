@@ -1699,6 +1699,19 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	// window clients are the non-provider client connections that measure
 	// transport delay (DELAY.md D3)
 	clientSettings.TransportDelay = self.settings.TransportDelay
+	// A client whose sessions are required (a post-quantum window client)
+	// seals its traffic from the first application byte, and the provider can
+	// open it only with this client's identity key: from the contract the
+	// platform issues it or from its /key/<client_id> fetch, and both read the
+	// platform's processed registration. So setup waits for that registration
+	// below, as the capability probe's clients do (server
+	// qualityprobe/providertunnel). Without the wait the provider resolves no
+	// key for a client minted moments ago, drops every sealed frame unacked,
+	// and the window fails a healthy candidate (2026-11-15: post-quantum
+	// windows found peers and failed every one).
+	if clientSettings.EncryptionSettings != nil && clientSettings.EncryptionSettings.Mode == EncryptionModeRequired {
+		clientSettings.ClientKeyRegistrationRequired = true
+	}
 	client := NewClient(ctx, args.ClientId, clientOob, clientSettings)
 	settings := self.newPlatformTransportSettings()
 	settings.TransportDelay = self.settings.TransportDelay

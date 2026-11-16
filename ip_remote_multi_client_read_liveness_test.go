@@ -236,7 +236,7 @@ func TestBlackholeReadTimeoutRealTransferBoundary(t *testing.T) {
 				var lifecycle []event
 				var writes []time.Time
 				wire := make(chan *protocol.Pack, 64)
-				log := newRecordingLogger()
+				log := newVerboseRecordingLogger(1)
 				settings := DefaultClientSettings()
 				settings.Log = log
 				settings.EncryptionSettings.Mode = EncryptionModeOff

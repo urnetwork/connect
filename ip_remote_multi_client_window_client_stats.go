@@ -355,6 +355,9 @@ const (
 	windowRemovalFamilySwap
 	// it was canceled without another error, or its window closed
 	windowRemovalClosed
+	// its device had no user activity for the idle trim time, and the window
+	// kept another exit (ip_remote_multi_client_idle_trim.go)
+	windowRemovalIdleTrim
 	windowRemovalCauseCount
 )
 
@@ -374,6 +377,8 @@ func (self windowRemovalCause) String() string {
 		return "family_swap"
 	case windowRemovalClosed:
 		return "closed"
+	case windowRemovalIdleTrim:
+		return "idle_trim"
 	default:
 		return "unknown"
 	}

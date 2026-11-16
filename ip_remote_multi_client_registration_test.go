@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -37,6 +38,15 @@ type registrationSetupResult struct {
 }
 
 func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJoin func()) (*ApiMultiClientGenerator, *Client, *fakeWindowPlatformTransport, *registrationSetupContext, context.CancelFunc, <-chan registrationSetupResult, <-chan clientKeyRegistrationHttpAttempt) {
+	t.Helper()
+	return newGeneratorRegistrationFixtureWithSettings(t, ipVersion, beforeClientJoin, func(settings *ClientSettings) {
+		settings.ClientKeyRegistrationRequired = true
+	})
+}
+
+// configure shapes the generated client's settings before setup, as the
+// window that asks for the client would.
+func newGeneratorRegistrationFixtureWithSettings(t *testing.T, ipVersion int, beforeClientJoin func(), configure func(*ClientSettings)) (*ApiMultiClientGenerator, *Client, *fakeWindowPlatformTransport, *registrationSetupContext, context.CancelFunc, <-chan registrationSetupResult, <-chan clientKeyRegistrationHttpAttempt) {
 	t.Helper()
 	// Cleanup retires the identity over HTTP. The strategy must outlive
 	// t.Context(), which Go cancels before running test cleanup functions.
@@ -104,13 +114,17 @@ func newGeneratorRegistrationFixture(t *testing.T, ipVersion int, beforeClientJo
 	constructed := make(chan *Client, 1)
 	publish := make(chan struct{})
 	generator.newPlatformTransport = func(client *Client, _ *ClientAuth, _ TransportMode, _ *PlatformTransportSettings) apiWindowPlatformTransport {
-		client.ClientKeyManager().registrationSync.settings.RetryTimeout = 0
+		// a client that does not wait for registration has no processed
+		// publisher to retry
+		if registrationSync := client.ClientKeyManager().registrationSync; registrationSync != nil {
+			registrationSync.settings.RetryTimeout = 0
+		}
 		constructed <- client
 		close(publish)
 		return transport
 	}
 	settings := closeWaitClientSettings()
-	settings.ClientKeyRegistrationRequired = true
+	configure(settings)
 	settings.beforeClientKeyPublishForTest = func() { <-publish }
 	settings.beforeRunDoneWaitForTest = beforeClientJoin
 	callCtx, callCancel := context.WithCancel(ctx)
@@ -185,6 +199,49 @@ func testApiMultiClientGeneratorWaitsForProcessedKeyRegistration(t *testing.T, i
 	default:
 	}
 	retry.response <- `{"pack":"","error":null}`
+	select {
+	case got := <-result:
+		if got.err != nil || got.client != client || !client.ClientKeyManager().Registered() {
+			t.Fatalf("processed key did not admit the exact client: %v", got.err)
+		}
+	case <-callCtx.Context.Done():
+		t.Fatal(callCtx.Err())
+	}
+	callCancel()
+	if client.Ctx().Err() != nil {
+		t.Fatal("completed setup context canceled the long-lived client")
+	}
+}
+
+// A post-quantum window client runs required sessions: its traffic is sealed
+// from the first application byte, and the provider opens it only with the key
+// the platform has processed for this client. The window asks for required
+// sessions and nothing about registration, so the generator itself must hold
+// setup until the registration completes. On 2026-11-15 it did not: providers
+// resolved no key for the new client, dropped its sealed frames unacked, and
+// every post-quantum candidate failed evaluation.
+func TestApiMultiClientGeneratorWaitsForKeyRegistrationOfRequiredSessions(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		testApiMultiClientGeneratorWaitsForKeyRegistrationOfRequiredSessions(t, ipVersion)
+	})
+}
+
+func testApiMultiClientGeneratorWaitsForKeyRegistrationOfRequiredSessions(t *testing.T, ipVersion int) {
+	_, client, _, callCtx, callCancel, result, attempts := newGeneratorRegistrationFixtureWithSettings(t, ipVersion, nil, func(settings *ClientSettings) {
+		// as newMultiClientChannel leaves a post-quantum window client's settings
+		settings.EncryptionSettings.Mode = EncryptionModeRequired
+	})
+	waitForGeneratedKeyRegistration(t, callCtx, result)
+	attempt := nextClientKeyRegistrationAttempt(t, attempts)
+	if !bytes.Equal(attempt.key, client.ClientKeyManager().PublicKey()) {
+		t.Fatal("registration did not carry the client's own key")
+	}
+	select {
+	case got := <-result:
+		t.Fatalf("unprocessed key admitted client: %+v", got)
+	default:
+	}
+	attempt.response <- `{"pack":"","error":null}`
 	select {
 	case got := <-result:
 		if got.err != nil || got.client != client || !client.ClientKeyManager().Registered() {

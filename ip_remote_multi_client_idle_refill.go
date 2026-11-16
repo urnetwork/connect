@@ -22,9 +22,10 @@
 //   - A window refills freely for IdleRefillHold after it is created, so a new
 //     device forms before its first packet, as before.
 //   - The clients a held window keeps, their pings, health checks and contract
-//     retries, the expansion backoff and every detection bound are unchanged,
-//     and nothing is disconnected. A held window that loses an exit stays
-//     smaller until the user is back.
+//     retries, the expansion backoff and every detection bound are unchanged.
+//     The hold itself disconnects nothing: a held window that loses an exit
+//     stays smaller until the user is back, and a window idle for the idle
+//     trim time keeps one exit (ip_remote_multi_client_idle_trim.go).
 //
 // Activity is the host's record when it keeps one (UserActivitySince), and
 // the device's last user packet otherwise. A hosted device's tun sends its

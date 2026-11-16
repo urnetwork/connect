@@ -71,12 +71,14 @@ func TestMultiClientChannelPqe(t *testing.T) {
 	})
 	AssertEqual(t, EncryptionModeOff, clientSettings.EncryptionSettings.Mode)
 
-	// pqe on an auto profile enables the e2e sessions
+	// pqe on an auto profile enables the e2e sessions, and the window client
+	// answers a session its provider starts on a regular contract
 	clientSettings = newChannelClientSettings(&PerformanceProfile{
 		WindowType:            WindowTypeAuto,
 		PostQuantumEncryption: true,
 	})
 	AssertEqual(t, EncryptionModeRequired, clientSettings.EncryptionSettings.Mode)
+	AssertEqual(t, false, clientSettings.EncryptionSettings.EncryptionControlUseCompanion)
 
 	// pqe on a fixed profile enables the e2e sessions
 	clientSettings = newChannelClientSettings(&PerformanceProfile{

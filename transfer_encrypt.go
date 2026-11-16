@@ -494,6 +494,11 @@ const (
 	// not the scaffolding that bootstraps and acknowledges it. The cost is
 	// availability — a peer that cannot establish a session carries no
 	// application traffic at all rather than falling back to plaintext.
+	//
+	// Required is the post-quantum setting's mode, so its sessions offer and
+	// accept only the post-quantum groups of their configs, in both TLS roles
+	// (sessionTlsConfigWithLock). A peer with no post-quantum group fails the
+	// handshake instead of sealing classically, and carries nothing.
 	EncryptionModeRequired
 )
 
@@ -1500,22 +1505,22 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	// taking the manager lock while holding the session lock, which would invert
 	// the manager→session lock order Release/CancelIfIdle rely on (ABBA deadlock).
 	tlsCfg := self.tlsConfig
+	if tlsCfg == nil {
+		// No usable config: no server cert, or a required session whose
+		// config has no post-quantum group. Fail the epoch closed so the
+		// cipher stays nil, matching a never-completed handshake.
+		e.handshakeErr = fmt.Errorf("%s tls config unavailable", self.role)
+		close(e.handshakeDone)
+		close(e.establishmentDone)
+		self.epoch = e
+		self.notifyRequiredCipherChangedWithLock()
+		self.notifyIdleStateChanged()
+		return
+	}
 	switch self.role {
 	case sequenceTlsRoleClient:
 		e.tlsConn = tls.Client(e.transport, tlsCfg)
 	case sequenceTlsRoleServer:
-		if tlsCfg == nil {
-			// Encryption misconfigured (no server cert): fail the epoch
-			// closed so the cipher stays nil and traffic flows in
-			// plaintext, matching a never-completed handshake.
-			e.handshakeErr = errors.New("server tls config unavailable")
-			close(e.handshakeDone)
-			close(e.establishmentDone)
-			self.epoch = e
-			self.notifyRequiredCipherChangedWithLock()
-			self.notifyIdleStateChanged()
-			return
-		}
 		if 0 < len(tlsCfg.Certificates) && tlsCfg.Certificates[0].Leaf != nil {
 			if self.client.log.V(1).Enabled() {
 				self.client.log.Infof(
@@ -1874,7 +1879,7 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		return
 	}
 	if err == nil || logFailure {
-		logTlsHandshake(self.client.log, self.logTag, err)
+		logTlsHandshake(self.client.log, self.logTag, negotiatedCurveId, err)
 	}
 	if err == nil {
 		if self.client.log.V(1).Enabled() {
@@ -3525,19 +3530,45 @@ func (self *EncryptionSessionManager) ClientTlsConfig() *tls.Config {
 // is picked up by sessions created afterward; live sessions keep the identity
 // they were created with. Server role returns nil when no cert is configured —
 // the misconfigured case the epoch build fails closed on.
+//
+// Under EncryptionModeRequired the snapshot keeps only the post-quantum groups
+// of its curve preferences, in either role and whatever config the manager
+// holds (a caller's, a rotation's or the default), so crypto/tls neither offers
+// nor selects a classical group. A config left with no post-quantum group fails
+// every handshake, closed.
 func (self *EncryptionSessionManager) sessionTlsConfigWithLock(role sequenceTlsRole) *tls.Config {
+	var config *tls.Config
 	switch role {
 	case sequenceTlsRoleClient:
 		if self.clientTlsConfig != nil {
-			return self.clientTlsConfig.Clone()
+			config = self.clientTlsConfig.Clone()
+		} else {
+			config = resolveSendTlsConfig(self.settings.ClientTlsConfig)
 		}
-		return resolveSendTlsConfig(self.settings.ClientTlsConfig)
 	case sequenceTlsRoleServer:
 		if self.serverTlsConfig != nil {
-			return self.serverTlsConfig.Clone()
+			config = self.serverTlsConfig.Clone()
 		}
 	}
-	return nil
+	if config != nil && self.settings.Mode == EncryptionModeRequired {
+		curves := config.CurvePreferences
+		if len(curves) == 0 {
+			// crypto/tls reads an empty list as its own defaults
+			curves = DefaultSequencePostQuantumCurves
+		}
+		postQuantumCurves := []tls.CurveID{}
+		for _, curve := range curves {
+			if isPostQuantumKeyExchange(curve) {
+				postQuantumCurves = append(postQuantumCurves, curve)
+			}
+		}
+		if len(postQuantumCurves) == 0 {
+			// an empty list would read as the defaults again
+			return nil
+		}
+		config.CurvePreferences = postQuantumCurves
+	}
+	return config
 }
 
 // SetProvideTlsKeyMaterial replaces the local sequence-level TLS identity
@@ -4219,14 +4250,16 @@ func cloneByteSlices(in [][]byte) [][]byte {
 	return out
 }
 
-func logTlsHandshake(log Logger, tag string, err error) {
+// The completion line names the negotiated key-exchange group, so a session
+// can be read as post-quantum or classical from the log.
+func logTlsHandshake(log Logger, tag string, keyExchange tls.CurveID, err error) {
 	if err != nil {
 		if log.V(1).Enabled() {
 			log.Infof("[tls]%s handshake error = %s\n", tag, err)
 		}
 	} else {
 		if log.V(1).Enabled() {
-			log.Infof("[tls]%s handshake complete\n", tag)
+			log.Infof("[tls]%s handshake complete group=%s\n", tag, tlsKeyExchangeName(keyExchange))
 		}
 	}
 }

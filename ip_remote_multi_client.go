@@ -1923,7 +1923,8 @@ type PerformanceProfile struct {
 	AllowDirect bool
 	// enable the per-peer e2e encryption sessions (post-quantum key
 	// exchange) on the window clients. Required when set: a provider that
-	// cannot seal the session is skipped, never used in plaintext at this
+	// cannot seal the session, with a post-quantum group in both directions,
+	// is skipped, never used in plaintext or under a classical key at this
 	// layer. Unset, the shipping default, the window clients keep
 	// DefaultEncryptionSettings and open no session at all.
 	PostQuantumEncryption bool
@@ -14833,6 +14834,22 @@ func (self *multiClientWindow) resize() {
 		}
 
 		warningTransitions.observe(windowClientStats, self.windowType, warnedClients)
+		// a window whose device has had no user activity for the idle trim
+		// time keeps one exit, and the rest of this pass sees the trimmed
+		// window; a service refresh in flight trims nothing
+		// (ip_remote_multi_client_idle_trim.go)
+		if refresh.owner == nil {
+			releasedClients := self.idleTrim(time.Now(), clients, warnedClients, weights, durations, func(client *multiClientChannel) {
+				removeClient(client, windowRemovalIdleTrim)
+			})
+			if 0 < len(releasedClients) {
+				released := func(client *multiClientChannel) bool {
+					return slices.Contains(releasedClients, client)
+				}
+				clients = slices.DeleteFunc(clients, released)
+				warnedClients = slices.DeleteFunc(warnedClients, released)
+			}
+		}
 		// the warnings this pass set decide which exits a restart restores
 		// (ip_remote_multi_client_exit_stall.go)
 		self.noteIdentityRestore(time.Now(), slices.Concat(clients, warnedClients))
@@ -18056,10 +18073,24 @@ func newMultiClientChannel(
 		// carries no application data for this client rather than downgrading it
 		// to plaintext the operator could read. (The provider side runs
 		// Opportunistic so it keeps serving non-pqe consumers.)
-		if clientSettings.EncryptionSettings == nil {
-			clientSettings.EncryptionSettings = DefaultEncryptionSettings()
+		// A copy, so settings a generator shares keep their own encryption.
+		encryption := DefaultEncryptionSettings()
+		if clientSettings.EncryptionSettings != nil {
+			copied := *clientSettings.EncryptionSettings
+			encryption = &copied
 		}
-		clientSettings.EncryptionSettings.Mode = EncryptionModeRequired
+		encryption.Mode = EncryptionModeRequired
+		// A window client is the paying side of its one relationship: it holds
+		// regular contracts to its destination and is never granted a
+		// companion contract toward it, since a companion needs an origin
+		// contract from the destination. So its replies to a session the
+		// destination starts (a provider that seals its return traffic in a
+		// session of its own) ride a regular contract. On a companion carrier
+		// the reply never leaves, that session never seals, and everything the
+		// provider returns arrives in plaintext, which the required gate
+		// discards (2026-11-15).
+		encryption.EncryptionControlUseCompanion = false
+		clientSettings.EncryptionSettings = encryption
 	}
 
 	client, err := newMultiClientChannelClient(
