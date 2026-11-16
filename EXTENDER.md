@@ -1611,6 +1611,29 @@ with the contract. A contract need not carry its data over the extender:
 every active extender of an endpoint counts, which is fuzzy but averages
 to the right allocation.
 
+Only a tag that can be a relay is a party (owner, 2026-11-11: only real
+relays earn), since a connection is tagged by its caller address alone and
+a client on the extender's own address is tagged as if the extender
+carried it. Three tags carry nothing and make no party
+(`contractExtenderInsertSql` in the server):
+- the extender's own network's: its own provider client, and the clients of
+  its network behind its address;
+- a public provider's (J4);
+- that of an extender reached over the webrtc carrier alone, on an endpoint
+  that holds no connected connection elsewhere, nor does the client it is
+  derived from. Such an address is no first contact: the carrier signals
+  through the dialer's own connection to the platform (S8), and a window
+  client is derived from the client that signals, so a relayed endpoint
+  always arrives beside one. Without one the endpoint shares the extender's
+  address, a host behind the same nat (2026-11-16: one such extender was a
+  party to every contract of 84 clients of two other networks behind its
+  address).
+
+A client of another network behind the address of an extender that is a
+first contact -- tcp, quic or dns -- is still tagged as a relay: nothing on
+the connection tells the two apart until a client declares the extender it
+dialed.
+
 J3. Payout. Participant gathering unions the contract's extender rows into
 the participant set. Every hop has equal weight, intermediary, egress and
 extender alike, so the even split applies unchanged; an extender on the
