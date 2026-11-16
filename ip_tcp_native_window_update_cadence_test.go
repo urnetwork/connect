@@ -32,6 +32,30 @@ type nativeWindowCadenceCut struct {
 	at                                        time.Time
 	immediate, limit, retained, raw, rawLimit int
 	dataBytes                                 ByteCount
+	totalBytes, quotaBytes                    ByteCount
+	budget                                    *TransferMemoryBudget
+	quota                                     *connectSynOwnerQuota
+	quotaState                                uint64
+}
+
+// Only the test goroutine takes the channel lock. The source hook copies raw
+// total bytes and atomic quota identity/state at its original owner boundary.
+// An active, replaced or closed quota makes the DATA attribution unknown.
+func (self nativeWindowCadenceCut) separateQuota(t *testing.T, budget *TransferMemoryBudget, channel *multiClientChannel) nativeWindowCadenceCut {
+	t.Helper()
+	if self.budget != budget {
+		t.Fatal("native source cut does not name the actual source DATA ledger")
+	}
+	self.quotaBytes = nativeConnectQuotaByteCount(t, budget, channel)
+	if channel == nil || self.quota != channel.connectSynQuota.Load() ||
+		self.quota != nil && self.quotaState != 1 || self.quota == nil && self.quotaState != 0 {
+		t.Fatalf("native source cut changed its exact quota identity or lease state: state=%d quota_bytes=%d", self.quotaState, self.quotaBytes)
+	}
+	if self.totalBytes < self.quotaBytes {
+		t.Fatalf("native source cut lost paid quota credit: total=%d quota=%d", self.totalBytes, self.quotaBytes)
+	}
+	self.dataBytes = self.totalBytes - self.quotaBytes
+	return self
 }
 
 // All SendSequence scalars in a cut are copied by that sequence's Run owner.
@@ -285,7 +309,11 @@ func newNativeWindowCadenceWitness(t *testing.T) *nativeWindowCadenceWitness {
 				sequence := wire.sequence
 				cut := nativeWindowCadenceCut{at: time.Now(), immediate: sequence.immediateSendCount,
 					limit: sequence.immediateSendLimit, retained: sequence.resendQueue.Len(),
-					dataBytes: sequence.sendBufferSettings.ResendQueueBudget.UsedByteCount()}
+					totalBytes: sequence.sendBufferSettings.ResendQueueBudget.UsedByteCount(), budget: sequence.sendBufferSettings.ResendQueueBudget,
+					quota: w.f.selected.connectSynQuota.Load()}
+				if cut.quota != nil {
+					cut.quotaState = cut.quota.state.Load()
+				}
 				sequence.protocolAdmission.mutex.Lock()
 				cut.raw, cut.rawLimit = sequence.protocolAdmission.count, sequence.protocolAdmission.capacity
 				sequence.protocolAdmission.mutex.Unlock()
@@ -387,7 +415,7 @@ func (self *nativeWindowCadenceWitness) cut() nativeWindowCadenceCut {
 	self.f.zeroWire.Load().sequence.ackWindow.Wake()
 	select {
 	case cut := <-reply:
-		return cut
+		return cut.separateQuota(self.t, self.f.sender.settings.SendBufferSettings.ResendQueueBudget, self.f.selected)
 	case <-self.f.ctx.Done():
 		self.t.Fatal("native owner cut", self.f.ctx.Err())
 		return nativeWindowCadenceCut{}

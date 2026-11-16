@@ -193,6 +193,9 @@ func (self *parsedPacketGroup) sendGroupMemoryByteCount() ByteCount {
 func (self *parsedPacketGroup) collapsePromotionByteCount() ByteCount {
 	round := func(bytes ByteCount) ByteCount { return (bytes + 63) / 64 * 64 }
 	bytes := round(ByteCount(unsafe.Sizeof(parsedPacketGroup{})))
+	if self.connectSynOffer != nil {
+		bytes = addReceiveQueueByteCount(bytes, round(ByteCount(unsafe.Sizeof(connectSynOffer{}))))
+	}
 	bytes = addReceiveQueueByteCount(bytes, round(ByteCount(cap(self.packets))*ByteCount(unsafe.Sizeof(parsedPacket{}))))
 	pathCount := max(ByteCount(len(self.packets)), ByteCount(self.retainedIpPathCount))
 	bytes = addReceiveQueueByteCount(bytes, pathCount*round(ByteCount(unsafe.Sizeof(IpPath{}))))
@@ -318,6 +321,7 @@ func (self *parsedPacketGroup) unlinkCollapseWithLock() {
 // Detached terminal descriptors need no new release owner. Drain their existing
 // links outside the flow lock so budget notification never nests underneath it.
 func (self *multiClientChannelUpdate) releaseCollapseClaims() {
+	defer self.releaseConnectSynOwners()
 	defer self.releaseSynRetryMemory()
 	if self.sequenceReleasedClaims.Load() == nil && !self.sequenceCloseReady.Load() {
 		return
@@ -596,6 +600,13 @@ func (self *parsedPacketGroup) observeCandidateControlWithLock() {
 			updateLatestTcpSequence(&state.finSeen, &state.finSequence, path.SequenceNumber+uint32(path.TcpPayloadByteCount)+1)
 		}
 	}
+	if self.connectSynOffer != nil || changed {
+		cohortOrder := uint64(0)
+		if state.synOrder == self.collapseOrder() {
+			cohortOrder = state.synOrder
+		}
+		self.observeConnectSynSourceWithLock(cohortOrder)
+	}
 	if changed {
 		update.observeCandidateCloseWithLock()
 	}
@@ -678,6 +689,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 		update.sequenceRecovery.clear()
 		update.sequenceClient = self.completionClient
 	}
+	newConnectCohortOrder := uint64(0)
 	for index := range self.packets {
 		packet := &self.packets[index]
 		path := packet.ipPath
@@ -692,6 +704,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 			}
 			update.resetSequenceWithLock(packet)
 			if path.Syn {
+				newConnectCohortOrder = self.collapseOrder()
 				update.restartSynWaitWithLock(self.completionClient, self.completionSelection, path, self.admissionTime)
 			}
 			update.sequenceTime = admittedAt
@@ -730,6 +743,9 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 		if update.observeTcpControlWithLock(tcpControlFromIpPath(path), false) {
 			update.sequenceCloseReady.Store(true)
 		}
+	}
+	if self.connectSynOffer != nil || update.sequenceCloseReady.Load() {
+		self.observeConnectSynSourceWithLock(newConnectCohortOrder)
 	}
 	if following {
 		update.sequenceAdmissionAck, update.sequenceAdmissionWindow = acceptedAck, acceptedWindow
@@ -878,6 +894,7 @@ func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized
 // The terminal callback preserves provider accounting and completion once.
 // A range error cannot erase a successfully retained prefix.
 func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
+	defer self.releaseConnectSynReferences()
 	if self.completionFlags.Or(groupCompletionDone)&groupCompletionDone != 0 {
 		return
 	}

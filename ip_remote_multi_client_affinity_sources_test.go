@@ -192,7 +192,7 @@ func testAffinityRenewalCanceledRetention(t *testing.T, budgeted bool) {
 				budgeted, materialized, entry.ambiguous, settled, entry.pending, f.terminal.Load())
 		}
 		if budgeted {
-			if wireObservations.Load() != 0 || writeReturns.Load() != 0 || budget.UsedByteCount() != 0 {
+			if wireObservations.Load() != 0 || writeReturns.Load() != 0 || groupDispositionTransferByteCount(t, budget, f) != 0 {
 				t.Fatal("canceled retained-memory admission serialized or kept a budget owner")
 			}
 		} else if wireObservations.Load() != 1 || writeReturns.Load() != 1 {

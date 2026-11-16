@@ -68,8 +68,8 @@ func testAffinitySourceCancellationBeforeRetention(t *testing.T, retained bool) 
 			t.Errorf("canceled source started=%d terminal=%d written=%d, want 1, 1, 0",
 				f.started.Load(), f.terminal.Load(), len(f.route))
 		}
-		if budget != nil && budget.UsedByteCount() != 0 {
-			t.Errorf("canceled source retained %d charged bytes", budget.UsedByteCount())
+		if budget != nil && groupDispositionTransferByteCount(t, budget, f) != 0 {
+			t.Errorf("canceled source retained %d transfer bytes", groupDispositionTransferByteCount(t, budget, f))
 		}
 		if f.client.IsDone() || f.update.IsDone() {
 			t.Fatal("one source cancellation closed its shared parent or flow")

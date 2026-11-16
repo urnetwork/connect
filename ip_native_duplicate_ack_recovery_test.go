@@ -361,6 +361,9 @@ func (self *nativeDuplicateAckFixture) close() {
 				if err := client.CloseAndWait(joinCtx); err != nil {
 					self.t.Error(err)
 				}
+				if client == self.sender && self.selected != nil {
+					self.selected.closeConnectSynOwners()
+				}
 				if budget := client.settings.SendBufferSettings.ResendQueueBudget; budget != nil && budget.UsedByteCount() != 0 {
 					self.t.Errorf("joined native client retained %d resend bytes", budget.UsedByteCount())
 				}

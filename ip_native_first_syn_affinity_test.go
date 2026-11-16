@@ -23,6 +23,16 @@ type inheritedSynOpeningFixture struct {
 	release               func()
 	nativeOffers, retries *atomic.Int64
 	before                time.Time
+	connectReceipts       func(*testing.T) []groupDispositionConnectReceipt
+}
+
+// Exact flow and admitted offer roots share one real channel and data ledger.
+// Physical identity keeps optional packet/readiness custody visible separately.
+func (self *inheritedSynOpeningFixture) transferByteCount(t *testing.T) ByteCount {
+	t.Helper()
+	return connectMetadataTransferByteCount(t, self.budget,
+		[]*multiClientChannel{self.selected},
+		[]*multiClientChannelUpdate{self.donor, self.update}, self.connectReceipts(t))
 }
 
 // Real provider traffic supplies positive donor health. The only held worker
@@ -39,6 +49,20 @@ func testNativeFirstSynInheritedAffinityOpening(t *testing.T, configure func(*Cl
 		var armed atomic.Bool
 		var refusals, otherErrors atomic.Int64
 		budget := NewTransferMemoryBudget(1024 * 1024)
+		var connectReceiptLock sync.Mutex
+		// The harness health sibling, donor and fresh opening each admit one syn.
+		var connectReceipts [3]groupDispositionConnectReceipt
+		var connectReceiptCount int
+		var connectReceiptOverflow bool
+		readConnectReceipts := func(t *testing.T) []groupDispositionConnectReceipt {
+			t.Helper()
+			connectReceiptLock.Lock()
+			defer connectReceiptLock.Unlock()
+			if connectReceiptOverflow {
+				t.Fatal("bounded inherited SYN offer receipt census overflowed; source-byte ownership is unknown")
+			}
+			return append([]groupDispositionConnectReceipt(nil), connectReceipts[:connectReceiptCount]...)
+		}
 		harness := newSilenceInferenceHarness(t, []reraceExitSpec{{
 			name: "a", answer: reraceAlways(reraceAccept),
 			clientSettings: func(settings *ClientSettings) {
@@ -67,6 +91,24 @@ func testNativeFirstSynInheritedAffinityOpening(t *testing.T, configure func(*Cl
 				}
 				if configure != nil {
 					configure(settings)
+				}
+				previous := settings.SendBufferSettings.afterGroupAdmissionForTest
+				settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+					if group, ok := target.(*parsedPacketGroup); ok && group.connectSynOffer != nil {
+						func() {
+							connectReceiptLock.Lock()
+							defer connectReceiptLock.Unlock()
+							if connectReceiptCount == len(connectReceipts) {
+								connectReceiptOverflow = true
+								return
+							}
+							connectReceipts[connectReceiptCount] = groupDispositionConnectReceipt{offer: group.connectSynOffer, update: group.collapseAdmission.update}
+							connectReceiptCount++
+						}()
+					}
+					if previous != nil {
+						previous(target)
+					}
 				}
 			},
 		}}, nil)
@@ -124,13 +166,15 @@ func testNativeFirstSynInheritedAffinityOpening(t *testing.T, configure func(*Cl
 			update.synGenerationSeen || !update.synWaitStart.IsZero() || nativeOffers.Load() != 1 || refusals.Load() != 1 || otherErrors.Load() != 0 {
 			t.Fatal("first refusal did not traverse actual fresh-tuple inheritance without materialization")
 		}
+		fixture := &inheritedSynOpeningFixture{
+			harness: harness, selected: selected, donor: donor, update: update,
+			donorPath: donorPath, path: path, selection: selection,
+			source: source, budget: budget, release: finish,
+			nativeOffers: &nativeOffers, retries: &retryOffers, before: before,
+			connectReceipts: readConnectReceipts,
+		}
 		if inspect != nil {
-			inspect(t, &inheritedSynOpeningFixture{
-				harness: harness, selected: selected, donor: donor, update: update,
-				donorPath: donorPath, path: path, selection: selection,
-				source: source, budget: budget, release: finish,
-				nativeOffers: &nativeOffers, retries: &retryOffers, before: before,
-			})
+			inspect(t, fixture)
 			return
 		}
 		finish()
@@ -140,7 +184,7 @@ func testNativeFirstSynInheritedAffinityOpening(t *testing.T, configure func(*Cl
 		}
 		if _, ok := harness.synAck(path); ok {
 			if len(harness.exit("a").syns(path)) != 1 || nativeOffers.Load() != 1 || retryOffers.Load() != 1 ||
-				update.client.loadSelection() != selection || budget.UsedByteCount() != 0 {
+				update.client.loadSelection() != selection || fixture.transferByteCount(t) != 0 {
 				t.Fatal("automatic inherited opening duplicated admission, changed selection or retained backing")
 			}
 			return

@@ -20,6 +20,9 @@ import (
 type protocolProducerPressure struct {
 	client            *Client
 	budget            *TransferMemoryBudget
+	channel           *multiClientChannel
+	quota             *connectSynOwnerQuota
+	quotaBytes        ByteCount
 	total             ByteCount
 	used              ByteCount
 	sequence          *SendSequence
@@ -34,12 +37,19 @@ type protocolProducerPressure struct {
 
 // Uses public serialization, then republishes the unchanged live peer route
 // so a dynamic cap change has reached the ordinary admission publication.
-func newProtocolProducerPressure(t *testing.T, client *Client, liveRoute Route) *protocolProducerPressure {
+func newProtocolProducerPressure(t *testing.T, client *Client, liveRoute Route, channel *multiClientChannel) *protocolProducerPressure {
 	t.Helper()
-	pressure := &protocolProducerPressure{client: client, budget: client.settings.SendBufferSettings.ResendQueueBudget, parked: make(Route, 16), liveRoute: liveRoute}
+	pressure := &protocolProducerPressure{client: client, budget: client.settings.SendBufferSettings.ResendQueueBudget, channel: channel, parked: make(Route, 16), liveRoute: liveRoute}
 	pressure.lifecycleObserver = client.settings.SendBufferSettings.SendPackLifecycleObserver
 	pressure.total = pressure.budget.TotalByteCount()
 	t.Cleanup(func() { pressure.release(t) })
+	pressure.quotaBytes = nativeConnectQuotaByteCount(t, pressure.budget, channel)
+	if channel != nil {
+		pressure.quota = channel.connectSynQuota.Load()
+	}
+	if pressure.budget.UsedByteCount() != pressure.quotaBytes {
+		t.Fatalf("pressure fixture has pre-existing DATA custody: total=%d quota=%d", pressure.budget.UsedByteCount(), pressure.quotaBytes)
+	}
 	peer := NewId()
 	client.ContractManager().AddNoContractPeer(peer)
 	client.RouteManager().UpdateTransport(NewSendClientTransport(DestinationId(peer)), []Route{pressure.parked})
@@ -114,8 +124,20 @@ func newProtocolProducerPressure(t *testing.T, client *Client, liveRoute Route) 
 // A protocol transition cannot release or borrow the retained DATA original.
 func (self *protocolProducerPressure) require(t *testing.T) {
 	t.Helper()
+	self.requireQuota(t)
 	if self.budget.UsedByteCount() != self.used || self.budget.TotalByteCount() != self.used || self.completion.calls.Load() != 0 || self.sequence.resendQueue.Len() != 1 {
 		t.Fatal("protocol producer changed the pressure owner's DATA custody")
+	}
+}
+
+// Joining the pressure child must preserve the independently owned channel
+// lease. Its exact identity and physical size are checked, not inferred from
+// whatever bytes happen to remain after the DATA owner leaves.
+func (self *protocolProducerPressure) requireQuota(t *testing.T) {
+	t.Helper()
+	if nativeConnectQuotaByteCount(t, self.budget, self.channel) != self.quotaBytes ||
+		self.channel != nil && self.channel.connectSynQuota.Load() != self.quota {
+		t.Fatal("pressure changed its independent native channel quota")
 	}
 }
 
@@ -140,8 +162,9 @@ func (self *protocolProducerPressure) release(t *testing.T) {
 		if self.sequence != nil && (self.completion.calls.Load() != 1 || self.completion.canceled.Load() != 1 || self.completion.success.Load() != 0 || self.completion.other.Load() != 0) {
 			t.Error("pressure cancellation lost its exact non-success callback")
 		}
-		if self.budget.UsedByteCount() != 0 {
-			t.Errorf("pressure child retained %d DATA bytes after joining", self.budget.UsedByteCount())
+		self.requireQuota(t)
+		if self.budget.UsedByteCount() != self.quotaBytes {
+			t.Errorf("pressure child retained DATA bytes after joining: total=%d exact_live_quota=%d", self.budget.UsedByteCount(), self.quotaBytes)
 		}
 	})
 }
@@ -165,7 +188,7 @@ func checkNativeProtocolProducerPressure(t *testing.T, alternating bool) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, _, ack := nativeAckPartitionCoveredFixture(t)
-		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward)
+		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward, fixture.selected)
 		providerPackets := watchNativePureAckProvider(t, fixture)
 		beforeTerminals := fixture.senderTerminals.Load()
 		// The same ordinary producer can already send a singleton ACK. This
@@ -250,7 +273,7 @@ func checkProviderProtocolTerminalPressure(t *testing.T, flags byte) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture := newNativeDuplicateAckFixture(t, false)
-		pressure := newProtocolProducerPressure(t, fixture.receiver, fixture.reverse)
+		pressure := newProtocolProducerPressure(t, fixture.receiver, fixture.reverse, nil)
 		path := fixture.providerSequence.Load().IpPath()
 		returnPath := path.Reverse()
 		data := ipOosTcpPacketSequence(returnPath, tcpFlagAck, 9000, []byte("next"))
@@ -336,7 +359,7 @@ func checkNativeProtocolTerminalPressure(t *testing.T, flags byte) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, _, ack := nativeAckPartitionCoveredFixture(t)
-		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward)
+		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward, fixture.selected)
 		path := groupRecoveryParsed(t, ack).ipPath
 		data := groupRecoveryPacket(path.SequenceNumber, path.AckSequenceNumber, path.TcpWindowSize, tcpFlagAck, []byte("next"))
 		control := groupRecoveryPacket(path.SequenceNumber+4, path.AckSequenceNumber, path.TcpWindowSize, flags, nil)
@@ -378,7 +401,7 @@ func TestNativeProtocolProducerPayloadAndMalformedControlsStayData(t *testing.T)
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, _, ack := nativeAckPartitionCoveredFixture(t)
-		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward)
+		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward, fixture.selected)
 		path := groupRecoveryParsed(t, ack).ipPath
 		before := fixture.senderTerminals.Load()
 		malformed := bytes.Clone(ack)
@@ -413,7 +436,7 @@ func TestNativeProtocolProducerResetBetweenRunsKeepsPrefixCustody(t *testing.T) 
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		fixture, _, ack := nativeAckPartitionCoveredFixture(t)
-		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward)
+		pressure := newProtocolProducerPressure(t, fixture.sender, fixture.forward, fixture.selected)
 		path := groupRecoveryParsed(t, ack).ipPath
 		data := groupRecoveryPacket(path.SequenceNumber, path.AckSequenceNumber, path.TcpWindowSize, tcpFlagAck, []byte("next"))
 		reset := groupRecoveryPacket(path.SequenceNumber, path.AckSequenceNumber, path.TcpWindowSize, tcpFlagAck|tcpFlagRst, nil)

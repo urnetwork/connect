@@ -46,7 +46,7 @@ func TestColdSynPayloadRetentionRefusalRetriesExactBytes(t *testing.T) {
 		failed.update.commitRaceClientWithLock(failed.selected)
 		failed.update.stateLock.Unlock()
 		failed.update.releaseCollapseClaims()
-		if budget.UsedByteCount() != 0 || failed.update.sequenceClaims != nil {
+		if groupDispositionTransferByteCount(t, budget, failed, owned) != 0 || failed.update.sequenceClaims != nil {
 			t.Fatal("recovered winner retained a discarded candidate or range owner")
 		}
 	})

@@ -52,8 +52,8 @@ func TestNativeFirstSynOpeningPaidCustodyMaterializesAndJoins(t *testing.T) {
 		})
 		update, owner := fixture.requirePending(t)
 		credit, readyCredit := owner.credit, owner.readiness.credit
-		if used := budget.UsedByteCount(); used != credit.byteCount+readyCredit.byteCount {
-			t.Fatalf("pending opening has uncharged or duplicate backing: used=%d want=%d", used, credit.byteCount+readyCredit.byteCount)
+		if used := groupDispositionTransferByteCount(t, budget, fixture.base); used != credit.byteCount+readyCredit.byteCount {
+			t.Fatalf("pending opening has uncharged or duplicate backing: transfer_used=%d total=%d want=%d", used, budget.UsedByteCount(), credit.byteCount+readyCredit.byteCount)
 		}
 		before := time.Now()
 		fixture.base.unpark()
@@ -69,7 +69,7 @@ func TestNativeFirstSynOpeningPaidCustodyMaterializesAndJoins(t *testing.T) {
 			t.Fatal(err)
 		}
 		synRetryControlReleased(t, owner)
-		if !credit.released.Load() || !readyCredit.released.Load() || budget.UsedByteCount() != 0 {
+		if !credit.released.Load() || !readyCredit.released.Load() || groupDispositionTransferByteCount(t, budget, fixture.base) != 0 {
 			t.Fatal("joined pending opening retained real byte permission")
 		}
 		fixture.requireLaterAck(t)
@@ -243,6 +243,7 @@ func testNativeFirstSynOpeningSourceBoundary(t *testing.T, boundary string, rese
 		finish := func() { once.Do(func() { close(release) }) }
 		defer finish()
 		var visits atomic.Int64
+		var supersededUnwritten atomic.Int64
 		pause := func(ctx context.Context) {
 			if visits.Add(1) == 2 {
 				close(entered)
@@ -253,6 +254,16 @@ func testNativeFirstSynOpeningSourceBoundary(t *testing.T, boundary string, rese
 			}
 		}
 		fixture := newFirstSynPressureFixture(t, 1, port, func(settings *ClientSettings) {
+			if reset {
+				previous := settings.SendBufferSettings.SendPackLifecycleObserver
+				settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+					previous(event)
+					var unwritten *sendPackUnwrittenError
+					if event.Phase == SendPackLifecyclePhaseTerminal && errors.Is(event.Err, errNativeSynOpeningSuperseded) && errors.As(event.Err, &unwritten) {
+						supersededUnwritten.Add(1)
+					}
+				}
+			}
 			if boundary == "dequeue" {
 				settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) { pause(source.ctx) }
 			} else {
@@ -299,6 +310,26 @@ func testNativeFirstSynOpeningSourceBoundary(t *testing.T, boundary string, rese
 			t.Fatalf("source boundary changed exact custody: ACKs=%d SYNs=%d want=%d elapsed=%s", acks, syns, wantSyns, time.Since(before))
 		}
 		fixture.requirePeerAckIdle(t, wantSyns, before)
+		if reset {
+			if supersededUnwritten.Load() != 1 {
+				t.Fatalf("superseded opening did not publish its actual unwritten terminal proof: count=%d", supersededUnwritten.Load())
+			}
+			stats, err := fixture.base.selected.WindowStats()
+			if err != nil {
+				t.Fatal("unwritten opening left a provider error: ", err)
+			}
+			// Advance only the pure classifier input past the unchanged full
+			// connect bar. Peer Pack ACKs are not native SYN-ACK receipts.
+			bar := fixture.base.selected.settings.BlackholeConnectTimeout
+			if bar <= 0 {
+				t.Fatal("default connect detector must remain enabled")
+			}
+			reason, held := blackholeReasonFromStats(time.Now().Add(2*bar), stats, 0, 0, bar, blackholeGates{})
+			if !stats.firstUnansweredSendSynTime.IsZero() || !unansweredConnectSince(stats).IsZero() || reason != blackholeNone || held != blackholeNone {
+				t.Fatalf("UNWRITTEN_NATIVE_SYN_CONNECT_DEBT: no SYN serialized; marker_zero=%t unanswered_zero=%t verdict=%s held=%s",
+					stats.firstUnansweredSendSynTime.IsZero(), unansweredConnectSince(stats).IsZero(), reason, held)
+			}
+		}
 		fixture.requireLaterAck(t)
 	})
 }
@@ -488,11 +519,11 @@ func TestNativeFirstSynOpeningWideAdmissionDiscardsTentativeOwner(t *testing.T) 
 			t.Fatal("healthy wide candidate did not reach its independent admission barrier")
 		}
 		// The first source remains parked with only its original raw ACK.
-		// Its initially empty retained budget can now belong only to the
-		// refused candidate's tentative opening. Typed terminal diagnostics
+		// Beyond the independently charged live channel metadata, retained
+		// transfer bytes belong only to the refused tentative opening. Typed diagnostics
 		// are intentionally deferred until both candidate calls return.
 		first.base.requireParked()
-		peak := budget.UsedByteCount()
+		peak := groupDispositionTransferByteCount(t, budget, first.base)
 		update := first.harness.update(first.path)
 		if update == nil {
 			t.Fatal("wide original did not create its actual flow")
@@ -509,8 +540,8 @@ func TestNativeFirstSynOpeningWideAdmissionDiscardsTentativeOwner(t *testing.T) 
 		if count != 1 || !accepted[0] || first.native.Load() != 1 {
 			t.Fatalf("real wide original lost public custody: count=%d accepted=%t native=%d", count, accepted[0], first.native.Load())
 		}
-		if budget.UsedByteCount() != 0 || first.refusals.Load() != 1 || recovered.Load() != 1 || first.retries.Load() != 0 {
-			t.Fatalf("wide success leaked tentative custody or its deferred result: peak=%d remaining=%d refused=%d recovered=%d retry=%d", peak, budget.UsedByteCount(), first.refusals.Load(), recovered.Load(), first.retries.Load())
+		if groupDispositionTransferByteCount(t, budget, first.base) != 0 || first.refusals.Load() != 1 || recovered.Load() != 1 || first.retries.Load() != 0 {
+			t.Fatalf("wide success leaked tentative custody or its deferred result: peak_transfer=%d remaining_transfer=%d total=%d refused=%d recovered=%d retry=%d", peak, groupDispositionTransferByteCount(t, budget, first.base), budget.UsedByteCount(), first.refusals.Load(), recovered.Load(), first.retries.Load())
 		}
 		acks, syns = second.drain(t, true)
 		if acks != 0 || syns != 1 || time.Since(before) != 0 {

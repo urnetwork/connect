@@ -290,7 +290,7 @@ func TestSynRetryRemoteRefusalBackingRejectsOneByteShortParent(t *testing.T) {
 			t.Fatal("SYN_RETRY_REMOTE_BACKING_ESCAPED_SHORT_PARENT: owner/backing acquired without full permission")
 		}
 		f.acknowledgeAll(first)
-		if root.UsedByteCount() != 0 || budget.UsedByteCount() != 0 {
+		if groupDispositionTransferByteCount(t, root, f) != 0 || groupDispositionTransferByteCount(t, budget, f) != 0 {
 			t.Fatal("real first Pack ACK did not return its separate source owners")
 		}
 		root.SetTotalByteCount(kib(64))
@@ -316,20 +316,20 @@ func TestSynRetryRemoteRefusalBackingRejectsOneByteShortParent(t *testing.T) {
 		// No extra permission was granted for the independent optional readiness
 		// owner. This boundary tests the cache graph; that supplement declines.
 		f.acknowledgeAll(next)
-		if root.UsedByteCount() != exact.total || budget.UsedByteCount() != exact.total {
+		if groupDispositionTransferByteCount(t, root, f) != exact.total || groupDispositionTransferByteCount(t, budget, f) != exact.total {
 			t.Fatal("cache permission was confused with the separately ACKed source Pack")
 		}
 		f.update.stateLock.Lock()
 		f.update.clearSynRetryWithLock()
 		f.update.stateLock.Unlock()
 		f.update.releaseSynRetryMemory()
-		if owner.refusedRemoteIds != nil || owner.credit != nil || root.UsedByteCount() != 0 || budget.UsedByteCount() != 0 {
+		if owner.refusedRemoteIds != nil || owner.credit != nil || groupDispositionTransferByteCount(t, root, f) != 0 || groupDispositionTransferByteCount(t, budget, f) != 0 {
 			t.Fatal("exact enlarged-owner admission did not return all backing and permission")
 		}
 		for _, ledger := range []*TransferMemoryBudget{budget, root} {
 			r, l := ledger.Counts()
-			if r != l {
-				t.Fatal("short/exact actual-source admission changed credit conservation")
+			if r-l != ledger.UsedByteCount() || groupDispositionTransferByteCount(t, ledger, f) != 0 {
+				t.Fatal("short/exact actual-source admission changed transfer or health credit conservation")
 			}
 		}
 	})

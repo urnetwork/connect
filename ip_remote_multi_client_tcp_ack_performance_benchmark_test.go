@@ -400,6 +400,11 @@ func (self *tcpAckBenchFixture) close() {
 				self.t.Errorf("join benchmark Multi: %v", err)
 			}
 		}
+		// This channel bypasses its real constructor's Client-context hook.
+		// Both actual native Client and parent flow have joined above.
+		if self.channel != nil {
+			self.channel.closeConnectSynOwners()
+		}
 		for len(self.nativeRoute) != 0 {
 			MessagePoolReturn(<-self.nativeRoute)
 		}
