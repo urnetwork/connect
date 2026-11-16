@@ -16063,6 +16063,72 @@ paths:
         "503":
           description: Mail is not served.
 
+  /mail/direct-mx:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Name a Team network's direct MX
+      description: |
+        Names up to two of the Team network's mail indexers that answer public
+        TCP 25 themselves. Each is written pending; the mail edge then checks
+        each one's public address, STARTTLS and published mail host key, and
+        only a receiver that passes is published as the network's mail host,
+        after which the mail edge stops routing the network's mail. A receiver
+        that later fails its checks stays published until DELETE, and the
+        network's receivers are told. The caller is the network's Owner or an
+        Admin, with the network credential: a client token is refused. Naming a
+        receiver already named changes nothing. 402 outside the Team tier; 409
+        while mail is off or two receivers are named already; 503 with
+        Retry-After while the server does not serve mail yet.
+      operationId: mailDirectMxPut
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MailDirectMxArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailDirectMxResult"
+        "400":
+          description: A receiver with no published mail host key, or an address that is not public unicast.
+        "402":
+          description: Direct MX is a Team feature.
+        "403":
+          description: The caller is not the network's Owner or an Admin.
+        "409":
+          description: Mail is off, or two receivers are named already.
+        "503":
+          description: Mail is not served, or the zone cannot be written now.
+    delete:
+      x-internal: true
+      tags: [Network]
+      summary: Take a Team network's direct MX back
+      description: |
+        Removes every direct-MX receiver of the network, and the mail edge's
+        own addresses answer for the network's mail host again. The caller is
+        the network's Owner or an Admin, with the network credential.
+      operationId: mailDirectMxDelete
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MailDirectMxResult"
+        "403":
+          description: The caller is not the network's Owner or an Admin.
+        "503":
+          description: Mail is not served, or the zone cannot be written now.
+
   /abuse/report:
     post:
       tags: [Other]
@@ -30371,6 +30437,52 @@ components:
         direct_mx:
           description: The network names a direct MX.
           type: boolean
+    MailDirectMxArgs:
+      type: object
+      required: [receivers]
+      properties:
+        receivers:
+          description: One or two of the network's mail indexers.
+          type: array
+          items:
+            $ref: "#/components/schemas/MailDirectMxReceiverArgs"
+    MailDirectMxReceiverArgs:
+      type: object
+      required: [receiver_sidecar_id, address]
+      properties:
+        receiver_sidecar_id:
+          description: The mail indexer, which holds a published mail host key for the network's mail host.
+          type: string
+          format: uuid
+        address:
+          description: Its public unicast address, IPv4 or IPv6.
+          type: string
+    MailDirectMxResult:
+      type: object
+      required: [receivers]
+      properties:
+        receivers:
+          description: The network's direct-MX receivers after the call.
+          type: array
+          items:
+            $ref: "#/components/schemas/MailDirectMxReceiverResult"
+    MailDirectMxReceiverResult:
+      type: object
+      required: [receiver_sidecar_id, address, state]
+      properties:
+        receiver_sidecar_id:
+          type: string
+          format: uuid
+        address:
+          type: string
+        state:
+          description: pending until its checks pass, verified once they have, failing once a later check failed.
+          type: string
+          enum: [pending, verified, failing]
+        verify_time:
+          description: When its last check passed, in Unix milliseconds.
+          type: integer
+          format: int64
     AbuseReportArgs:
       type: object
       required: [category]
