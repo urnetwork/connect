@@ -13091,6 +13091,14 @@ type multiClientWindow struct {
 	// Nil outside focused tests. Runs before a handover's swap section, with
 	// no lock held. Guarded by stateLock.
 	beforeStrictHandoverSwapForTest func()
+	// The newest owner generation of an extender dot (K1): each channel the
+	// window installs takes the next one, and its watcher publishes the dot
+	// under it (watchExtenderIps). Guarded by stateLock.
+	extenderIpsGeneration uint64
+	// Nil outside focused tests. Runs in watchExtenderIps between its
+	// ownership check and its publish, with no lock held. Guarded by
+	// stateLock.
+	beforeExtenderIpsPublishForTest func(client *multiClientChannel)
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -15684,6 +15692,7 @@ func (self *multiClientWindow) expand(
 				// above and here can never leak an uncancelled channel
 				replacedClient = self.clients[clientId]
 				self.clients[clientId] = client
+				self.installExtenderIpsGenerationWithLock(client)
 				if self.resizeMonitor != nil {
 					self.resizeMonitor.NotifyAll()
 				}
@@ -16793,6 +16802,13 @@ func (self *multiClientWindow) clientExtenderIps(client *multiClientChannel) []n
 	return ips
 }
 
+// Gives a channel the window is installing the next extender dot generation
+// (extenderIpsGeneration), which its watcher publishes under.
+func (self *multiClientWindow) installExtenderIpsGenerationWithLock(client *multiClientChannel) {
+	self.extenderIpsGeneration += 1
+	client.extenderIpsGeneration = self.extenderIpsGeneration
+}
+
 // watchExtenderIps republishes one exit's extender addresses on this window's
 // monitor whenever they change (K1), so a provider dot follows the transport
 // it is actually carried by. It ends with the window or with the client. The
@@ -16810,16 +16826,22 @@ func (self *multiClientWindow) watchExtenderIps(client *multiClientChannel) {
 		extenderIps, change := source.ClientExtenderIps(client.client)
 		// the dot belongs to whichever channel currently holds this id: a
 		// same-id replacement installs its own watcher, and this one must not
-		// publish over it
-		owned := func() bool {
+		// publish over it. A replacement can be installed and publish between
+		// this check and the publish below, which holds no window lock, so the
+		// publish carries the generation the window gave this channel and the
+		// monitor refuses it once a newer channel has published
+		owned, generation, beforePublish := func() (bool, uint64, func(*multiClientChannel)) {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-			return self.clients[clientId] == client
+			return self.clients[clientId] == client, client.extenderIpsGeneration, self.beforeExtenderIpsPublishForTest
 		}()
 		if !owned {
 			return
 		}
-		self.monitor.SetProviderExtenderIps(clientId, extenderIps)
+		if beforePublish != nil {
+			beforePublish(client)
+		}
+		self.monitor.SetProviderExtenderIpsForGeneration(clientId, generation, extenderIps)
 		select {
 		case <-self.ctx.Done():
 			return
@@ -17596,6 +17618,10 @@ type multiClientChannel struct {
 	synPublicationRetryAt  time.Time
 	// Immutable at construction from the explicit fixed-provider authority.
 	dataOnlyProviderProbe bool
+	// The generation of this channel's extender dot, given by the window that
+	// installs it (multiClientWindow.installExtenderIpsGenerationWithLock).
+	// Guarded by that window's stateLock.
+	extenderIpsGeneration uint64
 
 	ctx    context.Context
 	cancel context.CancelFunc

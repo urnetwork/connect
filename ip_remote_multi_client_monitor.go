@@ -158,6 +158,10 @@ type RemoteUserNatMultiClientMonitor struct {
 
 	windowExpandEvent      WindowExpandEvent
 	clientIdProviderEvents map[Id]*ProviderEvent
+	// the newest owner generation each provider id's extender addresses were
+	// published under (SetProviderExtenderIpsForGeneration), kept while the id
+	// has an event
+	clientIdExtenderIpsGenerations map[Id]uint64
 	// the fold of clientIdProviderEvents behind windowExpandEvent.LocationMatch,
 	// kept so a merged monitor can merge it without copying the events
 	locationMatchFold locationMatchFold
@@ -196,8 +200,9 @@ func NewRemoteUserNatMultiClientMonitor(settings *RemoteUserNatMultiClientMonito
 			MinSatisfied: false,
 			Reason:       WindowStallEvaluating,
 		},
-		clientIdProviderEvents: map[Id]*ProviderEvent{},
-		monitorEventCallbacks:  NewCallbackList[*monitorEventCallbackWorker](),
+		clientIdProviderEvents:         map[Id]*ProviderEvent{},
+		clientIdExtenderIpsGenerations: map[Id]uint64{},
+		monitorEventCallbacks:          NewCallbackList[*monitorEventCallbackWorker](),
 	}
 }
 
@@ -605,6 +610,7 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithLocationMatch(
 		// self.coalesceProviderEvents()
 		if state.IsTerminal() {
 			delete(self.clientIdProviderEvents, clientId)
+			delete(self.clientIdExtenderIpsGenerations, clientId)
 		} else {
 			self.clientIdProviderEvents[clientId] = providerEvent
 		}
@@ -633,6 +639,32 @@ func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithLocationMatch(
 // transport moved to another extender. Returns whether anything changed;
 // unknown client ids and an unchanged set are no-ops.
 func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIps(clientId Id, extenderIps []netip.Addr) bool {
+	return self.setProviderExtenderIps(clientId, extenderIps, nil)
+}
+
+// SetProviderExtenderIpsForGeneration is SetProviderExtenderIps from the owner
+// of a provider id's dot at `generation`: a window gives each channel it
+// installs the next generation, and the channel's watcher publishes under it
+// (multiClientWindow.watchExtenderIps). A publish under a generation older
+// than one already published for the id is refused, so a replaced channel's
+// watcher whose publish lands after its replacement's cannot put the departed
+// channel's extenders back on the live channel's dot. The generation is kept
+// even when the set is unchanged, and dropped with the id's event.
+func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIpsForGeneration(
+	clientId Id,
+	generation uint64,
+	extenderIps []netip.Addr,
+) bool {
+	return self.setProviderExtenderIps(clientId, extenderIps, &generation)
+}
+
+// The rewrite of SetProviderExtenderIps, under the owner generation
+// `generation` when it is not nil (SetProviderExtenderIpsForGeneration).
+func (self *RemoteUserNatMultiClientMonitor) setProviderExtenderIps(
+	clientId Id,
+	extenderIps []netip.Addr,
+	generation *uint64,
+) bool {
 	var windowExpandEvent WindowExpandEvent
 	clientIdProviderEvents := map[Id]*ProviderEvent{}
 	changed := false
@@ -642,7 +674,17 @@ func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIps(clientId Id,
 		defer self.stateLock.Unlock()
 
 		providerEvent, ok := self.clientIdProviderEvents[clientId]
-		if !ok || slices.Equal(providerEvent.ExtenderIps, extenderIps) {
+		if !ok {
+			return
+		}
+		if generation != nil {
+			if *generation < self.clientIdExtenderIpsGenerations[clientId] {
+				// a newer channel owns the dot
+				return
+			}
+			self.clientIdExtenderIpsGenerations[clientId] = *generation
+		}
+		if slices.Equal(providerEvent.ExtenderIps, extenderIps) {
 			return
 		}
 		// shallow clone: events are shared with listeners by pointer, so the
