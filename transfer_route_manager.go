@@ -118,6 +118,14 @@ type TransferCarrierProperties struct {
 	// route-wide meaning of Unreliable. The callback must be safe for concurrent
 	// use and must not block.
 	unreliableForMessageByteCount func(transferFrameByteCount int) bool
+	// boundSourceId is the only source a frame this receive carrier delivers
+	// may name. A P2P association binds its receive lanes to its adjacent
+	// peer, which the platform-relayed signaling that set the association up
+	// authenticated; any other source on such a lane is the sender's word and
+	// is dropped before it can allocate peer state. Zero binds nothing, which
+	// is every platform carrier (the platform attributes sources itself) and
+	// every custom carrier.
+	boundSourceId Id
 }
 
 func (self TransferCarrierProperties) messageUnreliable(
@@ -344,6 +352,9 @@ type transferReceiveDisposition struct {
 	transportType       TransportType
 	reliability         CarrierReliability
 	h1Credit            platformH1ReceiveCredit
+	// the source the delivering route is bound to, zero when it binds none
+	// (TransferCarrierProperties.boundSourceId)
+	boundSourceId Id
 }
 
 type transferCarrierMultiRouteReader interface {
@@ -2009,6 +2020,7 @@ func (self *routeSnapshot) receiveDisposition(route Route, message []byte) trans
 			byteCount: ByteCount(cap(message)),
 			done:      self.routeCarrierProperties[route].h1ReceiveDone,
 		},
+		boundSourceId: self.routeCarrierProperties[route].boundSourceId,
 	}
 }
 
