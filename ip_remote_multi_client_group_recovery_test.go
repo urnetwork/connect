@@ -21,28 +21,24 @@ import (
 // Owns one actual client, selected channel and pre-Run barrier. Cleanup joins
 // production before checking witnesses, including every early fatal path.
 type groupDispositionQueueFixture struct {
-	t                      *testing.T
-	client                 *Client
-	cancel                 context.CancelFunc
-	parent                 *RemoteUserNatMultiClient
-	update                 *multiClientChannelUpdate
-	selected               *multiClientChannel
-	peer                   Id
-	source                 TransferPath
-	route                  Route
-	transport              *sendClientTransport
-	entered                chan struct{}
-	keyEntered             chan struct{}
-	encryptedKeyEntered    chan struct{}
-	release                chan struct{}
-	releaseOnce            sync.Once
-	started                atomic.Int64
-	terminal               atomic.Int64
-	witnesses              [][]byte
-	connectReceiptLock     sync.Mutex
-	connectReceipts        [256]groupDispositionConnectReceipt
-	connectReceiptCount    int
-	connectReceiptOverflow bool
+	t                   *testing.T
+	client              *Client
+	cancel              context.CancelFunc
+	parent              *RemoteUserNatMultiClient
+	update              *multiClientChannelUpdate
+	selected            *multiClientChannel
+	peer                Id
+	source              TransferPath
+	route               Route
+	transport           *sendClientTransport
+	entered             chan struct{}
+	keyEntered          chan struct{}
+	encryptedKeyEntered chan struct{}
+	release             chan struct{}
+	releaseOnce         sync.Once
+	started             atomic.Int64
+	terminal            atomic.Int64
+	witnesses           [][]byte
 }
 
 // A configuration callback changes only the specific boundary under test.
@@ -94,22 +90,6 @@ func newGroupDispositionQueueFixture(
 	if configure != nil {
 		configure(settings)
 	}
-	configuredAdmission := settings.SendBufferSettings.afterGroupAdmissionForTest
-	settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
-		if group, ok := target.(*parsedPacketGroup); ok && group.connectSynOffer != nil {
-			f.connectReceiptLock.Lock()
-			if f.connectReceiptCount < len(f.connectReceipts) {
-				f.connectReceipts[f.connectReceiptCount] = groupDispositionConnectReceipt{offer: group.connectSynOffer, update: group.collapseAdmission.update}
-				f.connectReceiptCount++
-			} else {
-				f.connectReceiptOverflow = true
-			}
-			f.connectReceiptLock.Unlock()
-		}
-		if configuredAdmission != nil {
-			configuredAdmission(target)
-		}
-	}
 	f.client = NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	f.client.ContractManager().AddNoContractPeer(f.peer)
 	f.transport = NewSendClientTransport(DestinationId(f.peer))
@@ -128,7 +108,6 @@ func newGroupDispositionQueueFixture(
 			t.Errorf("join queued group client: %v", err)
 		}
 		closeParent()
-		f.selected.closeConnectSynOwners()
 		for len(f.route) != 0 {
 			MessagePoolReturn(<-f.route)
 		}
@@ -151,11 +130,7 @@ func (self *groupDispositionQueueFixture) unpark() {
 func (self *groupDispositionQueueFixture) closeClient(ctx context.Context) error {
 	self.cancel()
 	self.unpark()
-	err := self.client.CloseAndWait(ctx)
-	if err == nil {
-		self.selected.closeConnectSynOwners()
-	}
-	return err
+	return self.client.CloseAndWait(ctx)
 }
 
 // Closing a child client cannot release a barrier owned by its parent fixture.
@@ -1218,12 +1193,12 @@ func testTcpGroupRecoveryAckBeforePromotion(t *testing.T, wide, abandon bool) {
 			if flags&groupCompletionTerminal == 0 || flags&groupCompletionReturned != 0 ||
 				flags&groupCompletionLinked == 0 || group.collapseOwner == nil || group.collapseOwner.budgetBytes == 0 ||
 				group.collapseOwner.remaining != 0 || group.collapseSource == nil ||
-				groupDispositionTransferByteCount(t, group.collapseOwner.budget, f, other) != group.collapseOwner.budgetBytes {
+				group.collapseOwner.budget.UsedByteCount() != group.collapseOwner.budgetBytes {
 				t.Fatal("acknowledged unselected candidate lost its charged promotion metadata")
 			}
 		}
 		if f.update.client.Load() != nil || f.update.synGenerationNumber != 100 || !f.update.egressFinSeen ||
-			groupDispositionTransferByteCount(t, budget, f, other) == 0 || wide && groupDispositionTransferByteCount(t, otherBudget, f, other) == 0 {
+			budget.UsedByteCount() == 0 || wide && otherBudget.UsedByteCount() == 0 {
 			t.Fatal("candidate completion activated controls or refunded pending promotion")
 		}
 		unpark()
@@ -1238,8 +1213,7 @@ func testTcpGroupRecoveryAckBeforePromotion(t *testing.T, wide, abandon bool) {
 			for _, group := range groups {
 				minimumGraph := ByteCount(unsafe.Sizeof(parsedPacketGroup{})) +
 					ByteCount(cap(group.packets))*ByteCount(unsafe.Sizeof(parsedPacket{})) +
-					ByteCount(len(group.packets))*ByteCount(unsafe.Sizeof(IpPath{})) +
-					ByteCount(unsafe.Sizeof(connectSynOffer{}))
+					ByteCount(len(group.packets))*ByteCount(unsafe.Sizeof(IpPath{}))
 				if group.completionFlags.Load()&groupCompletionReturned == 0 || group.collapseOwner.budgetBytes < minimumGraph ||
 					group.collapseSource != nil {
 					t.Fatal("returned terminal race candidate released its promotion charge")
@@ -1270,7 +1244,7 @@ func testTcpGroupRecoveryAckBeforePromotion(t *testing.T, wide, abandon bool) {
 				other.acknowledgeAll(reset)
 			}
 		}
-		if groupDispositionTransferByteCount(t, budget, f, other) != 0 || wide && groupDispositionTransferByteCount(t, otherBudget, f, other) != 0 ||
+		if budget.UsedByteCount() != 0 || wide && otherBudget.UsedByteCount() != 0 ||
 			f.update.sequenceClaims != nil || f.update.sequenceReleasedClaims.Load() != nil {
 			t.Fatal("race outcome did not release every terminal candidate charge/link")
 		}
@@ -1369,7 +1343,7 @@ func testTcpGroupRecoveryReplacedRaceProducer(t *testing.T, beforePrepare bool) 
 		f.update.commitRaceClientWithLock(f.selected)
 		f.update.stateLock.Unlock()
 		f.update.releaseCollapseClaims()
-		if groupDispositionTransferByteCount(t, budget, f) != 0 || f.update.sequenceCovered || f.update.synGenerationSeen || f.offer(syn) != 1 {
+		if budget.UsedByteCount() != 0 || f.update.sequenceCovered || f.update.synGenerationSeen || f.offer(syn) != 1 {
 			t.Fatal("replacement winner inherited old producer proof or retained charge")
 		}
 		f.acknowledgeAll(syn)
@@ -1419,7 +1393,7 @@ func TestTcpGroupRecoveryUnwrittenCandidateDoesNotRetainPromotionHistory(t *test
 		f.unpark()
 		synctest.Wait()
 		if group.completionFlags.Load()&groupCompletionTerminal == 0 || group.collapseOwner != nil ||
-			f.update.sequenceClaims != nil || groupDispositionTransferByteCount(t, budget, f) != 0 || len(f.route) != 0 {
+			f.update.sequenceClaims != nil || budget.UsedByteCount() != 0 || len(f.route) != 0 {
 			t.Fatal("unfunded terminal candidate retained uncharged promotion history")
 		}
 		f.requireLocalRefusalHealthy()
@@ -1581,7 +1555,7 @@ func testTcpGroupRecoveryUnselectedRaceReset(t *testing.T, newSynAfter bool) {
 		} else if !f.update.IsDone() || f.update.race != nil {
 			t.Fatal("source reset left an unanswered race waiting for impossible response evidence")
 		}
-		if groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 || f.update.sequenceClaims != nil {
+		if firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 || f.update.sequenceClaims != nil {
 			t.Fatal("race reset outcome retained candidate receipts or range charge")
 		}
 	})

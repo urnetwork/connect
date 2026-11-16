@@ -692,9 +692,6 @@ func (self *persistNativeFixture) close() {
 			if err := client.CloseAndWait(context.Background()); err != nil {
 				self.t.Error(err)
 			}
-			if client == self.sender && self.selected != nil {
-				self.selected.closeConnectSynOwners()
-			}
 			if used := client.settings.SendBufferSettings.ResendQueueBudget.UsedByteCount(); used != 0 {
 				self.t.Errorf("joined native Transfer owner retained %d bytes", used)
 			}

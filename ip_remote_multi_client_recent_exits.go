@@ -264,13 +264,13 @@ func recentExitMemoryMaxCount(windowSize WindowSizeSettings) int {
 }
 
 // The earliest clock a blackhole verdict's evidence can run on: the
-// outstanding unacknowledged sends, the first response-bearing peer ACK
-// in the stats window, and the current unanswered connect. Zero when none runs.
+// outstanding unacknowledged sends, the first unacknowledged send in the
+// stats window, and the current unanswered connect. Zero when none runs.
 func blackholeEvidenceSince(stats *clientWindowStats) time.Time {
 	evidenceSince := time.Time{}
 	for _, since := range []time.Time{
 		unacknowledgedSendSince(stats),
-		receiveExpectedSince(stats),
+		stats.firstSendNackTime,
 		unansweredConnectSince(stats),
 	} {
 		if !since.IsZero() && (evidenceSince.IsZero() || since.Before(evidenceSince)) {

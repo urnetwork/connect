@@ -73,7 +73,6 @@ func testMultiTcpReorderPublicRetry(t *testing.T, reorderCount int, reorderBytes
 		natBudget := NewTransferMemoryBudget(2 * 1024 * 1024)
 		var clients []*Client
 		var parent *RemoteUserNatMultiClient
-		var selected *multiClientChannel
 		var nat *LocalUserNat
 		var provider *RemoteUserNatProvider
 		var gapDone, readerDone chan struct{}
@@ -111,9 +110,6 @@ func testMultiTcpReorderPublicRetry(t *testing.T, reorderCount int, reorderBytes
 				if err := client.CloseAndWait(context.Background()); err != nil {
 					t.Error(err)
 				}
-			}
-			if selected != nil {
-				selected.closeConnectSynOwners()
 			}
 			if held := starvedBytes.Swap(0); held != 0 {
 				senderBudget.Release(ByteCount(held))
@@ -247,7 +243,7 @@ func testMultiTcpReorderPublicRetry(t *testing.T, reorderCount int, reorderBytes
 			t.Fatal(err)
 		}
 		update, _, _ := parent.sendUpdate(path, flowPin{})
-		selected = newPacketTransferTestChannel()
+		selected := newPacketTransferTestChannel()
 		selected.ctx, selected.log, selected.settings, selected.client = ctx, NewNoopLogger(), parent.settings, sender
 		selected.healthy = true
 		selected.args = &multiClientChannelArgs{Destination: RequireMultiHopId(receiver.ClientId())}

@@ -130,7 +130,6 @@ func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientC
 	if (!established || control.syn) && client != nil && client.beforeFirstAnswerMarkForTest != nil {
 		client.beforeFirstAnswerMarkForTest(update)
 	}
-	defer update.releaseConnectSynOwners()
 	defer update.releaseSynRetryMemory()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
@@ -158,19 +157,6 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 			return false
 		}
 		update.synGenerationAwaiting = false
-	}
-	if control.syn && control.ack && !control.aheadOfGap && update.synGenerationSeen &&
-		tcpSynAckInRange(update.synGenerationNumber, update.synGenerationEnd, control.ackSequenceNumber) {
-		// The authenticated responder acquits only its own source. A failed
-		// provider's unanswered opening survives a successful retry elsewhere.
-		if key, valid := client.affinitySourceKey(); valid {
-			for owner := update.connectSynOwners; owner != nil; owner = owner.flowNext {
-				if owner.sourceKey == key {
-					update.detachConnectSynOwnerWithLock(owner, true)
-					break
-				}
-			}
-		}
 	}
 	update.observeTcpRecoveryAckWithLock(client, control)
 	update.clearSynRetryWithLock()
