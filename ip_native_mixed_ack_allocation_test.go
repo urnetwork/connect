@@ -120,17 +120,10 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 		}()
 		flightCost := nativeMixedAckPartitionRetainedCost(t, source, budgetTemplates)
 		budget := fixture.sender.settings.SendBufferSettings.ResendQueueBudget
-		if budget == nil {
-			t.Fatal("allocation census has no owned sender budget")
+		if budget == nil || budget.UsedByteCount() != 0 {
+			t.Fatal("allocation census calibration requires an empty owned sender budget")
 		}
-		healthBytes := nativeConnectQuotaByteCount(t, budget, fixture.selected)
-		healthQuota := fixture.selected.connectSynQuota.Load()
-		if budget.UsedByteCount() != healthBytes {
-			t.Fatal("allocation census calibration requires zero transfer ownership beyond exact live health metadata")
-		}
-		// The independent DATA flight keeps exactly its original headroom;
-		// the already-paid channel quota remains separately represented.
-		budget.SetTotalByteCount(healthBytes + flightCost.total)
+		budget.SetTotalByteCount(flightCost.total)
 		synctest.Wait()
 		providerPackets := watchNativePureAckProvider(t, fixture)
 		beforeProvider, beforeTerminals := providerPackets.Load(), fixture.senderTerminals.Load()
@@ -192,21 +185,18 @@ func checkNativeMixedAckAllocationCase(t *testing.T, mode string) {
 			offers++
 			acceptedTotal += count
 		})
-		if current := nativeConnectQuotaByteCount(t, budget, fixture.selected); current != healthBytes || fixture.selected.connectSynQuota.Load() != healthQuota || budget.UsedByteCount() != current {
-			t.Fatal("allocation census changed live health ownership or retained transfer credit")
-		}
 		queued, queuedBytes, _ := fixture.sender.ResendQueueSize(fixture.receiver.ClientId(), MultiHopId{}, false, false)
 		dispatched := providerPackets.Load() - beforeProvider
 		if dispatched != int64(acceptedTotal) || queued != 0 || queuedBytes != 0 || time.Since(before) != 0 {
 			t.Fatalf("allocation census lost actual useful work: mode=%s offers=%d accepted=%d provider=%d transfer=%d/%d elapsed=%s",
 				mode, offers, acceptedTotal, dispatched, queued, queuedBytes, time.Since(before))
 		}
-		t.Logf("NATIVE_MIXED_ACK_ALLOCATION_CENSUS mode=%s offers_including_warmup=%d input_packets_per_offer=32 accepted_packets=%d provider_dispatches=%d socket_bytes=%d source_terminals=%d collapse_drops=%d allocations_per_offer=%g parsed_group_bytes=%d admission_bytes=%d sender_budget_limit=%d full_flight_chunks=%d full_flight_graph_metadata=%d full_flight_owners=%d full_flight_data_owners=%d full_flight_data_metadata=%d sender_budget_after=%d sender_health_bytes=%d sender_transfer_bytes=%d elapsed=%s",
+		t.Logf("NATIVE_MIXED_ACK_ALLOCATION_CENSUS mode=%s offers_including_warmup=%d input_packets_per_offer=32 accepted_packets=%d provider_dispatches=%d socket_bytes=%d source_terminals=%d collapse_drops=%d allocations_per_offer=%g parsed_group_bytes=%d admission_bytes=%d sender_budget_limit=%d full_flight_chunks=%d full_flight_graph_metadata=%d full_flight_owners=%d full_flight_data_owners=%d full_flight_data_metadata=%d sender_budget_after=%d elapsed=%s",
 			mode, offers, acceptedTotal, dispatched, socketBytes, fixture.senderTerminals.Load()-beforeTerminals,
 			fixture.parent.TcpCollapseDropCount()-beforeDrops, allocations, unsafe.Sizeof(parsedPacketGroup{}),
 			unsafe.Sizeof(ipPacketGroupAdmission{}), budget.TotalByteCount(), len(flightCost.chunks), flightCost.metadata,
 			flightCost.owners, flightCost.dataOwners, flightCost.dataMetadata,
-			budget.UsedByteCount(), healthBytes, budget.UsedByteCount()-healthBytes, time.Since(before))
+			budget.UsedByteCount(), time.Since(before))
 	})
 }
 

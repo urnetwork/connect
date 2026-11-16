@@ -64,7 +64,7 @@ func TestTcpGroupRecoveryResetSynPostEnqueueObserverGap(t *testing.T) {
 		f.unpark()
 		f.acknowledgeAll(rst, syn)
 		if f.update.IsDone() || f.update.synGenerationNumber != 900 || f.update.sourceRstSequence() != 800 ||
-			f.update.sequenceSynOffers != 1 || f.terminal.Load() != 2 || groupDispositionTransferByteCount(t, budget, f) != 0 ||
+			f.update.sequenceSynOffers != 1 || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 ||
 			claim == nil || claim.collapseOwner == nil ||
 			claim.collapseOwner.budget != nil || claim.collapseOwner.budgetBytes <= 0 ||
 			claim.completionFlags.Load()&groupCompletionTerminal == 0 ||
@@ -78,7 +78,7 @@ func TestTcpGroupRecoveryResetSynPostEnqueueObserverGap(t *testing.T) {
 		if <-result != 1 {
 			t.Fatal("queued SYN lost its successful public result")
 		}
-		if f.update.sequenceSynOffers != 0 || f.update.sequenceClaims != nil || groupDispositionTransferByteCount(t, budget, f) != 0 {
+		if f.update.sequenceSynOffers != 0 || f.update.sequenceClaims != nil || budget.UsedByteCount() != 0 {
 			t.Fatal("finished SYN offer retained its scalar, range charge or descriptor link")
 		}
 	})
@@ -105,12 +105,12 @@ func TestTcpGroupRecoveryRefusedSynDoesNotHoldResetClose(t *testing.T) {
 		}
 		if f.update.sequenceSynOffers != 0 || f.update.synAdmissions != nil || f.update.synGenerationNumber != 100 ||
 			f.update.sourceRstSequence() != 700 || f.update.sequenceClaims == nil || f.update.sequenceClaims.collapseNext != nil ||
-			groupDispositionTransferByteCount(t, budget, f) != 0 {
+			budget.UsedByteCount() != 0 {
 			t.Fatal("refused new SYN changed generation, successful control or pending ownership")
 		}
 		f.unpark()
 		f.acknowledgeAll(rst)
-		if !f.update.IsDone() || f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 || groupDispositionTransferByteCount(t, budget, f) != 0 {
+		if !f.update.IsDone() || f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 || budget.UsedByteCount() != 0 {
 			t.Fatal("refused SYN left the genuine source reset or its owners pending")
 		}
 	})
@@ -152,7 +152,7 @@ func TestTcpGroupRecoveryRefusedSynRetriesAsNewCohort(t *testing.T) {
 		}
 		f.acknowledgeAll(next)
 		if f.update.synGenerationNumber != 1000 || f.offer(next) != 0 || f.update.sequenceSynOffers != 0 ||
-			f.update.synAdmissions != nil || groupDispositionTransferByteCount(t, budget, f) != 0 {
+			f.update.synAdmissions != nil || budget.UsedByteCount() != 0 {
 			t.Fatal("new cohort failed to settle its own ownership and duplicate gate")
 		}
 	})
@@ -290,7 +290,7 @@ func testTcpGroupRecoveryResetSynCancellation(t *testing.T, producerPaused bool)
 		}
 		synctest.Wait()
 		if !f.update.IsDone() || f.update.sourceRstSequence() != 800 || f.update.sequenceSynOffers != 0 ||
-			f.update.synAdmissions != nil || groupDispositionTransferByteCount(t, budget, f) != 0 {
+			f.update.synAdmissions != nil || budget.UsedByteCount() != 0 {
 			t.Fatal("completed cancellation retained its close barrier or lost the latest accepted ACK")
 		}
 	})
@@ -363,7 +363,7 @@ func TestTcpGroupRecoveryCanceledOlderObserverKeepsFollowingAck(t *testing.T) {
 		}
 		synctest.Wait()
 		if f.update.sourceRstSequence() != 800 || f.update.sequenceClaims != nil ||
-			f.update.sequenceSynOffers != 0 || f.terminal.Load() != 2 || groupDispositionTransferByteCount(t, budget, f) != 0 {
+			f.update.sequenceSynOffers != 0 || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 {
 			t.Fatal("canceled source failed to release both claims while preserving accepted state")
 		}
 	})
@@ -712,7 +712,7 @@ func testTcpGroupRecoverySeparateRaceReset(t *testing.T, sameSyn, refuseOtherSyn
 			}
 		}
 		if f.update.sequenceSynOffers != 0 || f.update.sequenceClaims != nil ||
-			groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 {
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
 			t.Fatal("candidate close/promotion retained source metadata or charged ownership")
 		}
 	})
@@ -792,7 +792,7 @@ func TestTcpGroupRecoveryUnwrittenNewSynPromotionKeepsSemanticTail(t *testing.T)
 		if f.update.IsDone() || f.update.synGenerationNumber != 1000 || f.update.sourceRstSequence() != 800 ||
 			f.update.sequenceAdmissionWindow != 96 || f.update.egressFinSeen || f.update.ingressFinSeen ||
 			f.update.sequenceCovered || f.update.sequenceSynSeen || f.update.sequenceClaims != nil ||
-			groupDispositionTransferByteCount(t, budget, f, other) != 0 || state.collapseControl != (tcpCandidateControlState{}) ||
+			budget.UsedByteCount() != 0 || state.collapseControl != (tcpCandidateControlState{}) ||
 			!f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, syn), f.selected) {
 			t.Fatal("promotion replayed the old reset, fabricated SYN proof, or retained scalar race history")
 		}
@@ -802,7 +802,7 @@ func TestTcpGroupRecoveryUnwrittenNewSynPromotionKeepsSemanticTail(t *testing.T)
 			t.Fatal("same public winner did not admit the unwritten SYN after capacity publication")
 		}
 		f.acknowledgeAll(syn)
-		if f.offer(syn) != 0 || groupDispositionTransferByteCount(t, budget, f, other) != 0 || f.update.sequenceSynOffers != 0 {
+		if f.offer(syn) != 0 || budget.UsedByteCount() != 0 || f.update.sequenceSynOffers != 0 {
 			t.Fatal("actual retained retry did not install its own identical-SYN gate and release ownership")
 		}
 	})
@@ -977,7 +977,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		other.acknowledgeAll(data, progressingSyn)
 		if !f.update.IsDone() || f.update.race != nil || f.update.synGenerationNumber != 900 ||
 			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
-			groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 {
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
 			t.Fatal("same-SYN winner reopened the reset cohort or retained discarded race ownership")
 		}
 	})
@@ -1042,7 +1042,7 @@ func TestTcpGroupRecoveryPendingRaceSynAbaIsNotSameSyn(t *testing.T) {
 		f.update.releaseCollapseClaims()
 		if f.update.IsDone() || f.update.synGenerationNumber != 100 || f.offer(syn) != 0 ||
 			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
-			groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 ||
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 ||
 			f.started.Load() != f.terminal.Load() || other.started.Load() != other.terminal.Load() {
 			t.Fatal("actual ABA winner lost its final gate or retained source ownership")
 		}
@@ -1146,14 +1146,14 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		f.update.releaseCollapseClaims()
 		if f.update.IsDone() || f.update.synGenerationNumber != 100 || f.update.egressFinSeen || f.update.ingressFinSeen ||
 			!f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, prefix), f.selected) || f.offer(syn) != 0 ||
-			f.update.sequenceClaims != nil || groupDispositionTransferByteCount(t, budget, f, other) != 0 {
+			f.update.sequenceClaims != nil || budget.UsedByteCount() != 0 {
 			t.Fatal("retained final A was mistaken for identical old A after the unwritten B cohort")
 		}
 		if f.offer(prefix) != 1 {
 			t.Fatal("pre-reset retained prefix falsely suppressed the actual new-cohort public offer")
 		}
 		f.acknowledgeAll(prefix)
-		if f.offer(prefix) != 0 || groupDispositionTransferByteCount(t, budget, f, other) != 0 {
+		if f.offer(prefix) != 0 || budget.UsedByteCount() != 0 {
 			t.Fatal("actual new-cohort data did not retain its own duplicate proof")
 		}
 	})
@@ -1238,8 +1238,8 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 			t.Fatal("old-A candidate did not actually refuse both later ABA offers")
 		}
 		if admissions.Load() != 4 || f.started.Load() != 4 || f.terminal.Load() != 0 ||
-			groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 {
-			t.Fatal("four successful raw admissions acquired transfer charge or completed before source ownership")
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
+			t.Fatal("four successful raw admissions acquired prequeue charge or completed before source ownership")
 		}
 		source := firstGroups[0].collapseSource
 		var prefixPeerAck time.Time
@@ -1288,7 +1288,7 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 				}
 			}
 			state := f.update.race.clientStates[f.selected].collapseControl
-			if groupDispositionTransferByteCount(t, firstBudget, f, other) != retainedBytes || state.synNumber != 900 ||
+			if firstBudget.UsedByteCount() != retainedBytes || state.synNumber != 900 ||
 				state.synOrder != last.collapseOrder() || state.closed || f.update.synGenerationNumber != 100 ||
 				!f.update.sequenceSynSeen || f.update.sequenceSynNumber != 100 {
 				t.Fatal("unwritten final A lost semantic admission or acquired durable proof")
@@ -1386,7 +1386,7 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 			f.update.releaseCollapseClaims()
 			if capacityRefusal {
 				if f.update.IsDone() || f.update.synGenerationNumber != 900 || f.update.sourceRstSequence() != 500 ||
-					f.update.sequenceCovered || f.update.sequenceSynSeen || groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 ||
+					f.update.sequenceCovered || f.update.sequenceSynSeen || firstBudget.UsedByteCount() != 0 ||
 					!f.update.canUpdateSequenceForClient(groupRecoveryParsed(t, syn), f.selected) {
 					t.Fatal("promotion manufactured final-A proof or lost the latest accepted control")
 				}
@@ -1434,7 +1434,7 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 			t.Fatal("funded ABA control hid an unexpected terminal failure or incomplete callback")
 		}
 		if f.update.sequenceClaims != nil || state.collapseControl != (tcpCandidateControlState{}) ||
-			groupDispositionTransferByteCount(t, firstBudget, f, other) != 0 || groupDispositionTransferByteCount(t, secondBudget, f, other) != 0 {
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
 			t.Fatal("race termination retained semantic state or charged candidate receipts")
 		}
 	})

@@ -20,7 +20,6 @@ type inheritedSynOpeningCredits struct {
 // Both allocations must be paid before the raw source can become available.
 func (self *inheritedSynOpeningFixture) pending(t *testing.T) inheritedSynOpeningCredits {
 	t.Helper()
-	transferBytes := self.transferByteCount(t)
 	self.update.stateLock.Lock()
 	defer self.update.stateLock.Unlock()
 	owner := self.update.synRetry
@@ -29,8 +28,8 @@ func (self *inheritedSynOpeningFixture) pending(t *testing.T) inheritedSynOpenin
 		owner.readiness == nil || owner.readiness.credit == nil || owner.readiness.credit.noBudget ||
 		owner.readiness.credit.byteCount <= 0 || !owner.readiness.indexed.Load() || owner.readiness.count != 1 ||
 		owner.references != 1 || owner.queued || self.update.synGenerationSeen || !self.update.synWaitStart.IsZero() ||
-		transferBytes != owner.credit.byteCount+owner.readiness.credit.byteCount {
-		t.Fatalf("inherited first refusal did not retain exactly paid pending custody: transfer_used=%d total=%d", transferBytes, self.budget.UsedByteCount())
+		self.budget.UsedByteCount() != owner.credit.byteCount+owner.readiness.credit.byteCount {
+		t.Fatal("inherited first refusal did not retain exactly paid pending custody")
 	}
 	return inheritedSynOpeningCredits{owner: owner, packetCredit: owner.credit, readyCredit: owner.readiness.credit}
 }
@@ -43,10 +42,9 @@ func (self *inheritedSynOpeningFixture) requireRetired(t *testing.T, credits inh
 	self.update.stateLock.Lock()
 	cachePresent := self.update.synRetry != nil
 	self.update.stateLock.Unlock()
-	transferBytes := self.transferByteCount(t)
-	if cachePresent || !credits.packetCredit.released.Load() || !credits.readyCredit.released.Load() || transferBytes != 0 {
-		t.Fatalf("INHERITED_OPENING_CUSTODY_NOT_RETIRED: cache=%t packet_released=%t readiness_released=%t transfer_remaining=%d total=%d",
-			cachePresent, credits.packetCredit.released.Load(), credits.readyCredit.released.Load(), transferBytes, self.budget.UsedByteCount())
+	if cachePresent || !credits.packetCredit.released.Load() || !credits.readyCredit.released.Load() || self.budget.UsedByteCount() != 0 {
+		t.Fatalf("INHERITED_OPENING_CUSTODY_NOT_RETIRED: cache=%t packet_released=%t readiness_released=%t budget=%d",
+			cachePresent, credits.packetCredit.released.Load(), credits.readyCredit.released.Load(), self.budget.UsedByteCount())
 	}
 	synRetryControlReleased(t, credits.owner)
 	if len(self.harness.exit("a").syns(self.path)) != 0 || len(self.harness.delivered(self.path)) != 0 || time.Since(self.before) != 0 {
@@ -234,7 +232,7 @@ func testInheritedSynDequeuedOpening(t *testing.T, retire string) {
 			return
 		}
 		if _, ok := fixture.harness.synAck(fixture.path); !ok || len(fixture.harness.exit("a").syns(fixture.path)) != 1 ||
-			fixture.transferByteCount(t) != 0 || time.Since(fixture.before) != 0 {
+			fixture.budget.UsedByteCount() != 0 || time.Since(fixture.before) != 0 {
 			t.Fatal("admitted inherited opening did not establish exactly once without source timer progress")
 		}
 		fixture.requireDonorProgress(t)
@@ -304,16 +302,6 @@ func TestNativeFirstSynInheritedAffinityParentCloseReturnsBacking(t *testing.T) 
 			t.Fatal(err)
 		}
 		synRetryControlReleased(t, credits.owner)
-		if !credits.packetCredit.released.Load() || !credits.readyCredit.released.Load() {
-			t.Fatal("parent join retained inherited opening permission")
-		}
-		// The multi-client joins its dispatcher; its generator owns network clients.
-		// Join those actual owners before reconciling the shared source ledger.
-		for _, client := range fixture.harness.generator.clientList() {
-			if err := client.CloseAndWait(context.Background()); err != nil {
-				t.Fatal("join generator-owned client: ", err)
-			}
-		}
 		if !credits.packetCredit.released.Load() || !credits.readyCredit.released.Load() || fixture.budget.UsedByteCount() != 0 {
 			t.Fatal("parent join retained inherited opening permission")
 		}

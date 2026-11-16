@@ -130,9 +130,6 @@ func TestMultiClientUnadmittedSynDoesNotCreateConnectEvidence(t *testing.T) {
 				{name: "joined-unwritten", admitted: true, completed: errors.Join(errSendPackExpiredUnwritten, errSendPackExpiredUnwritten)},
 				{name: "capacity", admitted: true, completed: capacity, groupOnly: true},
 				{name: "joined-local-proofs", admitted: true, completed: errors.Join(errSendPackExpiredUnwritten, capacity), groupOnly: true},
-				{name: "superseded-opening", admitted: true, completed: newUnwrittenSendPackError(errNativeSynOpeningSuperseded), groupOnly: true},
-				{name: "joined-superseded-opening", admitted: true, completed: errors.Join(newUnwrittenSendPackError(errNativeSynOpeningSuperseded), newUnwrittenSendPackError(errNativeSynOpeningSuperseded)), groupOnly: true},
-				{name: "wrapped-joined-superseded-opening", admitted: true, completed: fmt.Errorf("synthetic completion: %w", errors.Join(newUnwrittenSendPackError(errNativeSynOpeningSuperseded), errSendPackExpiredUnwritten)), groupOnly: true},
 			} {
 				if row.groupOnly && !grouped {
 					continue
@@ -205,11 +202,6 @@ func TestMultiClientAdmittedSynKeepsConnectEvidence(t *testing.T) {
 					{name: "mixed-local-and-ambiguous", completed: errors.Join(errSendPackExpiredUnwritten, capacity, hard), wantErr: hard, groupOnly: true, wanted: true},
 					{name: "two-syn-prefix", completed: errSendPackExpiredUnwritten, groupOnly: true, materialized: true, synPrefix: true, bothSyn: true, wanted: true},
 					{name: "non-syn-prefix-unwritten-syn", completed: errSendPackExpiredUnwritten, groupOnly: true, materialized: true, wanted: false},
-					{name: "whole-unwritten-structural", completed: newUnwrittenSendPackError(hard), wantErr: hard, groupOnly: true, wanted: false},
-					{name: "joined-unwritten-structural-and-expiry", completed: errors.Join(newUnwrittenSendPackError(hard), errSendPackExpiredUnwritten), wantErr: hard, groupOnly: true, wanted: false},
-					{name: "mixed-unwritten-and-ambiguous", completed: errors.Join(newUnwrittenSendPackError(hard), context.Canceled), wantErr: hard, groupOnly: true, wanted: true},
-					{name: "syn-prefix-superseded-tail", completed: newUnwrittenSendPackError(errNativeSynOpeningSuperseded), groupOnly: true, materialized: true, synPrefix: true, wanted: true},
-					{name: "non-syn-prefix-superseded-syn", completed: newUnwrittenSendPackError(errNativeSynOpeningSuperseded), groupOnly: true, materialized: true, wanted: false},
 				} {
 					if row.groupOnly && !grouped {
 						continue

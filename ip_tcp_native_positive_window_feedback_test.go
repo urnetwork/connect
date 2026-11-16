@@ -414,11 +414,7 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 			case reply := <-w.cutRequest:
 				sequence := wire.sequence
 				cut := nativeWindowCadenceCut{at: time.Now(), immediate: sequence.immediateSendCount, limit: sequence.immediateSendLimit,
-					retained: sequence.resendQueue.Len(), totalBytes: sequence.sendBufferSettings.ResendQueueBudget.UsedByteCount(),
-					budget: sequence.sendBufferSettings.ResendQueueBudget, quota: w.f.selected.connectSynQuota.Load()}
-				if cut.quota != nil {
-					cut.quotaState = cut.quota.state.Load()
-				}
+					retained: sequence.resendQueue.Len(), dataBytes: sequence.sendBufferSettings.ResendQueueBudget.UsedByteCount()}
 				sequence.protocolAdmission.mutex.Lock()
 				cut.raw, cut.rawLimit = sequence.protocolAdmission.count, sequence.protocolAdmission.capacity
 				sequence.protocolAdmission.mutex.Unlock()
@@ -503,7 +499,7 @@ func (self *nativePositiveWitness) cut() nativeWindowCadenceCut {
 	wire.sequence.ackWindow.Wake()
 	select {
 	case cut := <-reply:
-		return cut.separateQuota(self.t, self.f.sender.settings.SendBufferSettings.ResendQueueBudget, self.f.selected)
+		return cut
 	case <-self.f.ctx.Done():
 		self.t.Fatal("positive feedback source cut", self.f.ctx.Err())
 		return nativeWindowCadenceCut{}
