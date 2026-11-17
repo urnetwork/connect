@@ -135,24 +135,59 @@ func TestWindowOptionalPacerTraceRejectsLiveReplacement(t *testing.T) {
 // A worker admitted before cancellation may first reach Run-owned hooks while
 // cleanup joins it. Those hooks are outside the completed fixture interval.
 func TestWindowOptionalPacerTraceExcludesCleanupStartup(t *testing.T) {
+	testWindowOptionalPacerCleanupStartup(t, false)
+}
+
+// Exercises the original cleanup boundary with an optional real unrelated owner.
+// The selected replacement stays parked until cancellation; other keys must run.
+func testWindowOptionalPacerCleanupStartup(t *testing.T, includeUnrelated bool) {
 	runWindowOptionalPacerOwnerFixture(t, func(t *testing.T, fixture *windowOptionalPacerOwnerFixture) {
 		original := fixture.create(t, fixture.key)
 		synctest.Wait()
 		before := fixture.trace.cutCount
 		original.Cancel()
 		<-original.done
+		unrelatedKey := fixture.key
+		unrelatedKey.Destination = NewId()
+		var unrelatedRuns atomic.Int32
 		entered, release := make(chan struct{}), make(chan struct{})
+		released := false
+		defer func() {
+			if !released {
+				close(release)
+			}
+		}()
 		previousRun := fixture.sender.sendBuffer.beforeRunSendSequenceForTest
 		fixture.sender.sendBuffer.beforeRunSendSequenceForTest = func(id sendSequenceId) {
-			close(entered)
-			<-release
+			if id == fixture.key {
+				close(entered)
+				<-release
+			}
 			previousRun(id)
+			if id == unrelatedKey {
+				unrelatedRuns.Add(1)
+			}
 		}
 		replacement := fixture.create(t, fixture.key)
 		<-entered
+		var unrelated *SendSequence
+		if includeUnrelated {
+			unrelated = fixture.create(t, unrelatedKey)
+			if unrelated == replacement || unrelated.sequenceId == replacement.sequenceId {
+				t.Fatal("independent transfer key reused the selected physical owner")
+			}
+			synctest.Wait()
+			if unrelatedRuns.Load() != 1 {
+				t.Fatal("unrelated real worker did not pass the selected cleanup startup barrier")
+			}
+		}
 		fixture.cancel()
 		close(release)
+		released = true
 		<-replacement.done
+		if unrelated != nil {
+			<-unrelated.done
+		}
 		fixture.trace.stateLock.Lock()
 		defer fixture.trace.stateLock.Unlock()
 		if fixture.canceledAcks.Load() != 1 {

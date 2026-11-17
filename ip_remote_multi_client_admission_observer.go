@@ -20,10 +20,11 @@ type pendingNoAckAdmissionObservation struct {
 // One scope belongs to one exact input group and one native send invocation,
 // not a destination, flow tuple, Client, or token reused by another call.
 type sendPackAdmissionObservations struct {
-	mutex        sync.Mutex
-	pending      []pendingSendPackAdmissionObservation
-	noAckPending []pendingNoAckAdmissionObservation
-	completed    bool
+	mutex                 sync.Mutex
+	pending               []pendingSendPackAdmissionObservation
+	noAckPending          []pendingNoAckAdmissionObservation
+	completed             bool
+	nativeReadyPureTcpAck bool
 	// Only a new TCP generation needs this inline observation. Reuse the
 	// optional scope, not every packet/group descriptor or a packet owner.
 	synAdmission tcpSynAdmission
@@ -31,10 +32,12 @@ type sendPackAdmissionObservations struct {
 
 // Called only by the serialized selection owner, before candidate goroutines
 // start. The ordinary nil-observer path allocates neither scope nor callback.
-func (self *parsedPacketGroup) prepareAdmissionObservations(client *multiClientChannel) {
+func (self *parsedPacketGroup) prepareAdmissionObservations(client *multiClientChannel, nativeIngress bool) {
 	if self.admissionObservations == nil && client != nil && client.client != nil &&
 		client.client.settings.SendBufferSettings.SendPackLifecycleObserver != nil {
-		self.admissionObservations = &sendPackAdmissionObservations{}
+		self.admissionObservations = &sendPackAdmissionObservations{
+			nativeReadyPureTcpAck: nativeIngress && self.onlyPureTcpAcks(),
+		}
 	}
 }
 
@@ -42,6 +45,14 @@ func (self *parsedPacketGroup) prepareAdmissionObservations(client *multiClientC
 // failures, timeouts, and terminal acknowledgements pass through unchanged.
 func (self *sendPackAdmissionObservations) wrap(observer func(SendPackLifecycleObservation)) func(SendPackLifecycleObservation) {
 	return func(observation SendPackLifecycleObservation) {
+		if admissionErr, ok := observation.Err.(*SendPackAdmissionError); ok && self.nativeReadyPureTcpAck &&
+			(observation.Phase == SendPackLifecyclePhaseFirstRouteWrite || observation.Phase == SendPackLifecyclePhaseTerminal) {
+			// First-route refusal passes through before terminal publication.
+			// Copy both phases; never mutate the original error or public result.
+			err := *admissionErr
+			err.NativeReadyPureTcpAck = true
+			observation.Err = &err
+		}
 		if observation.Phase == SendPackLifecyclePhaseTerminal {
 			if admissionErr, ok := observation.Err.(*SendPackAdmissionError); ok {
 				self.mutex.Lock()

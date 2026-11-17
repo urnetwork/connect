@@ -12,6 +12,16 @@ import (
 
 var errNativeAckRetrySuperseded = errors.New("native TCP feedback superseded before serialization")
 
+// Only newer native TCP preparation on the same live owners can produce this
+// pre-ordinal replay disposition. Other vetoes retain the same text and cause.
+var errSendPackNativeAckRetrySuperseded = &sendPackUnwrittenError{cause: errNativeAckRetrySuperseded}
+
+// Reports an unwritten local pure ACK replay superseded by a later native TCP
+// offer. The later packet's admission and delivery have their own outcomes.
+func IsSendPackNativeAckRetrySuperseded(err error) bool {
+	return err == errSendPackNativeAckRetrySuperseded
+}
+
 // The original synchronous attempt records only an actual raw-count refusal.
 // A retry copies this immutable flow/source stamp, never the pending owner.
 type tcpNativeAckRetryAttempt struct {
@@ -54,7 +64,7 @@ func (self *parsedPacketGroup) prepareNativeAckRetryWithLock(update *multiClient
 	self.nativeAckRetry = nil
 	self.nativeAckRetrySerial = 0
 	self.nativeAckRetrySelection = nil
-	update.invalidateNativeAckRetryWithLock()
+	update.advanceNativeAckRetryWithLock(true)
 	if len(self.packets) != 1 || !self.packets[0].pureTcpAck() {
 		return
 	}
@@ -87,11 +97,19 @@ func (self *parsedPacketGroup) prepareNativeAckRetryWithLock(update *multiClient
 	self.nativeAckRetrySerial = update.nativeAckSerial
 }
 
-// Overflow permanently disables this optional recovery for the flow. Waking
-// the existing reaper is nonblocking and takes no parent lock.
+// Lifecycle controls, resets and teardown invalidate independently of native preparation.
 func (self *multiClientChannelUpdate) invalidateNativeAckRetryWithLock() {
+	self.advanceNativeAckRetryWithLock(false)
+}
+
+// Preserve which serials advanced solely on native TCP offers. Overflow permanently
+// disables optional recovery. Waking the existing reaper takes no parent lock.
+func (self *multiClientChannelUpdate) advanceNativeAckRetryWithLock(nativeOffer bool) {
 	if self.nativeAckSerial != ^uint64(0) {
 		self.nativeAckSerial++
+	}
+	if !nativeOffer {
+		self.nativeAckLastUnrelatedSerial = self.nativeAckSerial
 	}
 	if self.nativeAckRetry != nil && self.sequenceParent != nil {
 		self.sequenceParent.notifyFlowReaper()
@@ -101,13 +119,45 @@ func (self *multiClientChannelUpdate) invalidateNativeAckRetryWithLock() {
 // Ordinary admitted originals are never changed by this predicate. Only a
 // newly offered local retry needs the complete generation/selection fence.
 func (self *tcpNativeAckRetryAttempt) currentWithLock() bool {
+	return self.update != nil && self.update.nativeAckSerial == self.serial && self.ownerCurrentWithLock()
+}
+
+// The owner's lifetime, flow generation and selection stay independent from
+// the feedback serial, which a newer native offer may advance while all live.
+func (self *tcpNativeAckRetryAttempt) ownerCurrentWithLock() bool {
 	update := self.update
 	return update != nil && !update.IsDone() && !update.sourceReset.Load() &&
-		update.receivedInbound.Load() && update.nativeAckSerial == self.serial &&
+		update.receivedInbound.Load() &&
 		update.sequenceAdmissionEpoch == self.epoch &&
-		update.client.loadSelection() == self.selection && self.selection != nil &&
+		update.client.loadSelection() == self.selection && self.selection != nil && self.selection.client != nil &&
 		!self.selection.client.IsDone() && !update.pendingCollapseCloseWithLock() &&
 		(self.source == nil || self.source.ctx.Err() == nil)
+}
+
+// Check the retry at chunk entry, before any application frame is serialized.
+func (self *tcpNativeAckRetryAttempt) replayDisposition(source *SendSequence) error {
+	if self.update == nil {
+		return newUnwrittenSendPackError(errNativeAckRetrySuperseded)
+	}
+	self.update.stateLock.Lock()
+	defer self.update.stateLock.Unlock()
+	return self.replayDispositionWithLock(source)
+}
+
+// The final serialization fence calls this under the same lock as ordinal
+// assignment. Native offers explain only the replay's local disposal.
+func (self *tcpNativeAckRetryAttempt) replayDispositionWithLock(source *SendSequence) error {
+	if self.source == source && self.ownerCurrentWithLock() {
+		update := self.update
+		if update.nativeAckSerial == self.serial {
+			return nil
+		}
+		if self.replay && source != nil && self.serial != 0 && update.nativeAckLastUnrelatedSerial <= self.serial &&
+			self.serial < update.nativeAckSerial && update.nativeAckSerial != ^uint64(0) {
+			return errSendPackNativeAckRetrySuperseded
+		}
+	}
+	return newUnwrittenSendPackError(errNativeAckRetrySuperseded)
 }
 
 func (self *tcpNativeAckRetryAttempt) current() bool {

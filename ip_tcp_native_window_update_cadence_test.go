@@ -103,9 +103,20 @@ func (self *nativeWindowCadenceWitness) notify() {
 	}
 }
 
+// A source can discard a stale local copy on chunk entry or immediately
+// before assigning its first wire ordinal after contract work.
+type nativeWindowSupersessionPoint uint8
+
+const (
+	nativeWindowSupersessionNone nativeWindowSupersessionPoint = iota
+	nativeWindowSupersessionBeforeChunk
+	nativeWindowSupersessionByData
+	nativeWindowSupersessionBeforeOrdinal
+)
+
 // The unchanged native fixture supplies the real TCP handshake, bytes, window
 // updates, provider socket, Multi admission, route writes and peer receipts.
-func newNativeWindowCadenceWitness(t *testing.T) *nativeWindowCadenceWitness {
+func newNativeWindowCadenceWitness(t *testing.T, supersession nativeWindowSupersessionPoint) *nativeWindowCadenceWitness {
 	t.Helper()
 	w := &nativeWindowCadenceWitness{openAdmitted: make(chan struct{}), retryEntered: make(chan struct{}), releaseRetry: make(chan struct{}), t: t, changed: make(chan struct{}, 1), cutRequest: make(chan chan nativeWindowCadenceCut, 1),
 		opened: make(chan struct{}), openAcked: make(chan struct{}), fourthEntered: make(chan struct{}), releaseFourth: make(chan struct{})}
@@ -141,6 +152,15 @@ func newNativeWindowCadenceWitness(t *testing.T) *nativeWindowCadenceWitness {
 				w.openAdmitDo.Do(func() { close(w.openAdmitted) })
 			}
 		}
+		parkRetry := func() {
+			if w.pauseRetry.CompareAndSwap(true, false) {
+				w.retryDo.Do(func() { close(w.retryEntered) })
+				select {
+				case <-w.releaseRetry:
+				case <-w.f.ctx.Done():
+				}
+			}
+		}
 		previousRetain := settings.SendBufferSettings.beforeGroupRetainForTest
 		settings.SendBufferSettings.beforeGroupRetainForTest = func() {
 			if previousRetain != nil {
@@ -149,14 +169,10 @@ func newNativeWindowCadenceWitness(t *testing.T) *nativeWindowCadenceWitness {
 			w.stateLock.Lock()
 			pressureWritten := w.zeroWireCount == len(w.zeroWires)
 			w.stateLock.Unlock()
-			if pressureWritten && w.retryGroup.Load() != nil && w.pauseRetry.CompareAndSwap(true, false) {
+			if supersession == nativeWindowSupersessionBeforeOrdinal && pressureWritten && w.retryGroup.Load() != nil {
 				// The source has passed its entry check and contract work.
 				// Its next step after this existing hook is materialization.
-				w.retryDo.Do(func() { close(w.retryEntered) })
-				select {
-				case <-w.releaseRetry:
-				case <-w.f.ctx.Done():
-				}
+				parkRetry()
 			}
 		}
 		previousWire := settings.SendBufferSettings.TransferWireMessageObserver
@@ -331,6 +347,12 @@ func newNativeWindowCadenceWitness(t *testing.T) *nativeWindowCadenceWitness {
 				// The next owner-loop boundary is the first safe one-slot cut.
 				w.fourthWritten.Store(true)
 			}
+			if (supersession == nativeWindowSupersessionBeforeChunk || supersession == nativeWindowSupersessionByData) &&
+				wire != nil && id == wire.owner && number == wire.number+5 {
+				// The sixth physical write owns the sender. The admitted retry
+				// is still behind it, with room for one newer original.
+				parkRetry()
+			}
 		}
 	}, func(sequence *TcpSequence) {
 		prior := sequence.receiveCallback
@@ -459,23 +481,36 @@ func nativeWindowCadenceProviderCut(sequence *TcpSequence) zeroWindowWaitSnapsho
 // after natural persist, complete HTTP recovery and all cleanup. It does not
 // assert that a false native offer acquired a retry owner.
 func TestTcpNativeWindowUpdateProgressesAfterFiniteAckService(t *testing.T) {
-	checkNativeWindowUpdateCadence(t, false, false)
+	checkNativeWindowUpdateCadence(t, false, nativeWindowSupersessionNone)
 }
 
 // The retained identical native update is admitted automatically when one
 // raw slot becomes free; older zero-window originals must not close it again.
 func TestTcpNativeWindowUpdateSamePacketAfterOneSlotResumesHttp(t *testing.T) {
-	checkNativeWindowUpdateCadence(t, true, false)
+	checkNativeWindowUpdateCadence(t, true, nativeWindowSupersessionNone)
 }
 
 // New native feedback arrives after Client admission and inside preparation.
 // Its stale retry must consume no ordinal before the next real exact update.
 func TestTcpNativeWindowRetrySupersededBeforeSerializationLeavesNoHole(t *testing.T) {
-	checkNativeWindowUpdateCadence(t, true, true)
+	checkNativeWindowUpdateCadence(t, true, nativeWindowSupersessionBeforeOrdinal)
 }
 
-func checkNativeWindowUpdateCadence(t *testing.T, replayAfterOneSlot, supersedeBeforeMaterialization bool) {
+// A newer original arrives while the sixth predecessor is still writing.
+// The retained replay must report both lifecycles before any ordinal or wire.
+func TestTcpNativeWindowRetrySupersededBeforeChunkLeavesNoHole(t *testing.T) {
+	checkNativeWindowUpdateCadence(t, true, nativeWindowSupersessionBeforeChunk)
+}
+
+// An actual pipelined request invalidates the earlier local replay. Its own
+// public native admission, Transfer receipt, and HTTP response remain required.
+func TestTcpNativeWindowRetrySupersededByNativeDataLeavesDeliveryStrict(t *testing.T) {
+	checkNativeWindowUpdateCadence(t, true, nativeWindowSupersessionByData)
+}
+
+func checkNativeWindowUpdateCadence(t *testing.T, replayAfterOneSlot bool, supersession nativeWindowSupersessionPoint) {
 	t.Helper()
+	supersedeBeforeMaterialization := supersession != nativeWindowSupersessionNone
 	MessagePoolReturn(MessagePoolGet(1))
 	assertMessagePoolOwnership(t)
 	penaltyAfterJoin := false
@@ -487,7 +522,7 @@ func checkNativeWindowUpdateCadence(t *testing.T, replayAfterOneSlot, supersedeB
 			t.Error("NATIVE_WINDOW_UPDATE_LOST_BEFORE_TRANSFER: finite 40ms receipt service drained every accepted original, but the real open-window update had no retry owner and the same HTTP flow waited for ordinary TCP persist")
 		}
 	})
-	w := newNativeWindowCadenceWitness(t)
+	w := newNativeWindowCadenceWitness(t, supersession)
 	w.pauseRetry.Store(supersedeBeforeMaterialization)
 	f := w.f
 	connection, err := f.tun.DialContext(f.ctx, "tcp4", "198.51.100.19:80")
@@ -657,10 +692,61 @@ func checkNativeWindowUpdateCadence(t *testing.T, replayAfterOneSlot, supersedeB
 	}
 	w.releaseExtraClaims()
 	if supersedeBeforeMaterialization {
-		f.await(w.retryEntered, "admitted retry parked after contract work and before materialization")
+		f.await(w.retryEntered, "admitted retry parked before serialization")
 		group := w.retryGroup.Load()
 		if group == nil || group.nativeAckRetry == nil || !group.nativeAckRetry.current() {
-			t.Fatal("late-fence premise lacks the still-current admitted retry")
+			t.Fatal("source fence lacks the still-current admitted retry")
+		}
+		if supersession == nativeWindowSupersessionByData {
+			request := []byte("GET /reuse HTTP/1.1\r\nHost: native-persist.example\r\n\r\n")
+			if n, err := connection.Write(request); err != nil || n != len(request) {
+				t.Fatalf("native successor write: n=%d err=%v", n, err)
+			}
+			packet, err := f.tun.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			path, payload, err := ParseIpPathWithPayload(packet)
+			if err != nil || !bytes.Equal(payload, request) || !path.Ack || path.Fin || path.Syn || path.Rst {
+				MessagePoolReturn(packet)
+				t.Fatalf("native socket did not emit the exact request as ACK-bearing DATA: %v", err)
+			}
+			data := f.offer(packet, false)
+			if !data.accepted || data.count != 1 || data.collapseDrops != 0 {
+				t.Fatalf("later native DATA did not acquire its own admission: %+v", data)
+			}
+			dataToken := w.latest()
+			w.releaseRetryDo.Do(func() { close(w.releaseRetry) })
+			w.waitFor("stale local replay and independent DATA terminal receipt", func() bool {
+				return w.lifetimes[replayToken].terminal == 1 && w.lifetimes[dataToken].terminal == 1
+			})
+			w.stateLock.Lock()
+			stale, successor := w.lifetimes[replayToken], w.lifetimes[dataToken]
+			w.stateLock.Unlock()
+			if stale.started != 1 || stale.written != 1 || stale.terminal != 1 ||
+				!IsSendPackNativeAckRetrySuperseded(stale.writeErr) || !IsSendPackNativeAckRetrySuperseded(stale.terminalErr) ||
+				successor.started != 1 || successor.written != 1 || successor.terminal != 1 || successor.writeErr != nil || successor.terminalErr != nil ||
+				dataToken == replayToken || w.exactOpenWrites.Load() != 0 {
+				t.Fatalf("newer native DATA lacks distinct local replay and successful delivery evidence: replay=%+v successor=%+v", stale, successor)
+			}
+			f.resumeDo.Do(func() { close(f.resumeBridge) })
+			f.probeReleaseDo.Do(func() { close(f.releaseProbe) })
+			reader := bufio.NewReader(io.MultiReader(bytes.NewReader(prefix), connection))
+			for _, expected := range [][]byte{f.body, []byte("reuse")} {
+				response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, readErr := io.ReadAll(response.Body)
+				closeErr := response.Body.Close()
+				if response.StatusCode != http.StatusOK || !bytes.Equal(body, expected) || readErr != nil || closeErr != nil {
+					t.Fatalf("native successor lost exact application response: status=%d bytes=%d read=%v close=%v", response.StatusCode, len(body), readErr, closeErr)
+				}
+			}
+			if f.dials.Load() != 1 || f.tun.LinkStats().OutboundDropCount != 0 || w.targetResends.Load() != 0 {
+				t.Fatal("successor required reconnection, a native drop or a Transfer resend")
+			}
+			return
 		}
 		// This is a newer real native zero-window packet, not a forced serial
 		// change. The source is parked, so its public acceptance precedes the
@@ -682,6 +768,10 @@ func checkNativeWindowUpdateCadence(t *testing.T, replayAfterOneSlot, supersedeB
 			zeroLife.started != 1 || zeroLife.written != 1 || zeroLife.terminal != 1 || zeroLife.terminalErr != nil ||
 			f.openWire.Load() != nil || w.exactOpenWrites.Load() != 0 {
 			t.Fatalf("superseded retry escaped or lost local custody: stale=%+v new_zero=%+v", stale, zeroLife)
+		}
+		if !IsSendPackNativeAckRetrySuperseded(stale.writeErr) || !IsSendPackNativeAckRetrySuperseded(stale.terminalErr) {
+			t.Fatalf("live newer native acknowledgement lacks original replay proof at both phases: first=%T %v terminal=%T %v",
+				stale.writeErr, stale.writeErr, stale.terminalErr, stale.terminalErr)
 		}
 		zeroWire := w.supersedingWire.Load()
 		if zeroWire == nil || zeroWire.owner != wire.owner || zeroWire.generation != wire.generation || zeroWire.number != wire.number+6 {

@@ -68,6 +68,11 @@ func testTcpReturnBurstRecovery(t *testing.T, initial uint32, ipVersion int, tim
 		sourceIp, 41000, destinationIp, 443, initial, settings)
 	sequence.receiveSeqAck = base
 	sequence.receiveSeq = base + uint32(len(want))
+	// Prime an actual valid ACK/window baseline before retaining this lost
+	// flight. Its later three identical headers are genuine duplicate ACKs.
+	sequence.mutex.Lock()
+	sequence.applySendAckWithLock(&parsedTcp{ack: true, ackNumber: base, windowSize: math.MaxUint16})
+	sequence.mutex.Unlock()
 	if !sequence.retainReturnChunk(want, base, false) {
 		t.Fatal("lost burst was not retained")
 	}

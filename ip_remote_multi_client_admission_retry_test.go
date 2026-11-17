@@ -339,7 +339,59 @@ func TestMultiClientAdmissionObservationBoundedCandidates(t *testing.T) {
 func TestMultiClientAdmissionObserverDisabledAllocations(t *testing.T) {
 	client := &multiClientChannel{client: &Client{settings: DefaultClientSettings()}}
 	group := &parsedPacketGroup{}
-	if allocations := testing.AllocsPerRun(100, func() { group.prepareAdmissionObservations(client) }); allocations != 0 || group.admissionObservations != nil {
+	if allocations := testing.AllocsPerRun(100, func() { group.prepareAdmissionObservations(client, false) }); allocations != 0 || group.admissionObservations != nil {
 		t.Fatalf("nil-observer admission added allocations=%g scope=%p", allocations, group.admissionObservations)
+	}
+}
+
+// Producer provenance comes from the real whole-group wrapper, never from a
+// timeout or first frame. Both no-writer phases receive independent copies.
+func TestNativeReadyPureAckAdmissionProvenanceCopiesBothPhases(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		native  bool
+		flags   byte
+		payload []byte
+		mixed   bool
+		want    bool
+	}{
+		{name: "native pure ACK", native: true, flags: tcpFlagAck, want: true},
+		{name: "generic pure ACK", flags: tcpFlagAck},
+		{name: "native DATA", native: true, flags: tcpFlagAck, payload: []byte{1}},
+		{name: "native SYN", native: true, flags: tcpFlagAck | tcpFlagSyn},
+		{name: "native FIN", native: true, flags: tcpFlagAck | tcpFlagFin},
+		{name: "native RST", native: true, flags: tcpFlagAck | tcpFlagRst},
+		{name: "native mixed ACK DATA", native: true, flags: tcpFlagAck, mixed: true},
+	} {
+		packet := groupRecoveryParsed(t, groupRecoveryPacket(1001, 2001, 4096, test.flags, test.payload))
+		group := &parsedPacketGroup{packets: []parsedPacket{*packet}, ipPath: packet.ipPath}
+		if test.mixed {
+			data := groupRecoveryParsed(t, groupRecoveryPacket(1001, 2001, 4096, tcpFlagAck, []byte{1}))
+			group.packets = append(group.packets, *data)
+		}
+		settings := DefaultClientSettings()
+		settings.SendBufferSettings.SendPackLifecycleObserver = func(SendPackLifecycleObservation) {}
+		selected := &multiClientChannel{client: &Client{settings: settings}}
+		group.prepareAdmissionObservations(selected, test.native)
+		var seen []SendPackLifecycleObservation
+		observe := group.admissionObservations.wrap(func(event SendPackLifecycleObservation) { seen = append(seen, event) })
+		original := &SendPackAdmissionError{Boundary: "pack-admission", Err: ErrSendPackNotAdmitted}
+		observe(SendPackLifecycleObservation{Phase: SendPackLifecyclePhaseFirstRouteWrite, Err: original})
+		observe(SendPackLifecycleObservation{Phase: SendPackLifecyclePhaseTerminal, Err: original})
+		if len(seen) != 1 {
+			t.Fatalf("%s: terminal was not deferred to its exact synchronous owner", test.name)
+		}
+		group.admissionObservations.complete(false)
+		if len(seen) != 2 || original.NativeReadyPureTcpAck || original.RecoveredByOwner {
+			t.Fatalf("%s: observer changed the original error or phase count", test.name)
+		}
+		for _, event := range seen {
+			var detail *SendPackAdmissionError
+			if !errors.As(event.Err, &detail) || !errors.Is(event.Err, ErrSendPackNotAdmitted) ||
+				(detail == original && (test.want || event.Phase == SendPackLifecyclePhaseTerminal)) ||
+				detail.NativeReadyPureTcpAck != test.want || detail.RecoveredByOwner {
+				t.Fatalf("%s: provenance or error identity changed: %+v", test.name, event)
+			}
+		}
 	}
 }

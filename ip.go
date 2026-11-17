@@ -5323,7 +5323,12 @@ type TcpSequence struct {
 	// must receive SYN-ACK again, not the pure ACK used for a stale SYN on an
 	// established connection. Guarded by ConnectionState.mutex.
 	handshakeAcked bool
-	flowCloseOnce  sync.Once
+	// Valid ACK headers keep their raw advertised window separately from the
+	// greatest accepted right edge. Window progress is not duplicate evidence.
+	// Guarded by ConnectionState.mutex.
+	returnAckWindowSeen bool
+	returnAckWindow     uint16
+	flowCloseOnce       sync.Once
 	// Called once after Run and its child workers release the socket lifecycle.
 	flowCloseCallback tcpFlowCloseFunction
 
@@ -5618,6 +5623,8 @@ func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
 	self.receiveWindowSize = uint32(tcp.windowSize)
 	self.receiveWindowEnd = self.receiveSeqAck + self.receiveWindowSize
 	self.receiveWindowEndSet = true
+	self.returnAckWindowSeen = false
+	self.returnAckWindow = 0
 	self.established = true
 	if self.enableWindowScale {
 		bits := math.Log2(float64(self.tcpBufferSettings.MaxWindowSize) / float64(math.MaxUint16))
@@ -7169,7 +7176,10 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
 		reopenedPendingReturn := self.receiveWindowSize == 0 && tcp.ackNumber == self.receiveSeqAck
-		self.acknowledgeReturnWithLock(tcp.ackNumber)
+		duplicateAck := tcp.ackNumber == self.receiveSeqAck && self.returnAckWindowSeen &&
+			tcp.windowSize == self.returnAckWindow && len(tcp.payload) == 0 && !tcp.syn && !tcp.fin && !tcp.rst
+		self.returnAckWindowSeen, self.returnAckWindow = true, tcp.windowSize
+		self.acknowledgeReturnWithLock(tcp.ackNumber, duplicateAck)
 		if !self.handshakeAcked &&
 			0 <= int32(tcp.ackNumber-(self.initialSynSeq+1)) {
 			self.handshakeAcked = true

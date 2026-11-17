@@ -332,12 +332,10 @@ func (self *sendPackScheduler) TakeFifoEligible(
 	return nil
 }
 
-// TakeFifoEligibleAround is TakeFifoEligible with the Packs `held` reports
-// passed over. A held Pack is a no-acknowledgement Pack waiting at a contract
-// boundary for the receiver to acknowledge its next contract
-// (FILLFRACTION.md); no-acknowledgement data is unordered, so what is behind
-// it may go first. The first Pack that is not held keeps the FIFO rule, taken
-// only if it is eligible, so ordered traffic is never reordered among itself.
+// TakeFifoEligibleAround passes the unordered Packs that held reports:
+// NoAck at a contract boundary (FILLFRACTION.md), or validated pure TCP feedback
+// whose separate immediate custody is full. The first nonheld Pack keeps the
+// FIFO rule and all eligibility gates, preserving order among ordinary DATA.
 // With nothing held this is TakeFifoEligible.
 func (self *sendPackScheduler) TakeFifoEligibleAround(
 	held func(*SendPack) bool,
