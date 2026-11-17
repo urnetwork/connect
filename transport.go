@@ -647,22 +647,21 @@ type PlatformTransportSettings struct {
 	// PinnedReconnectMaxTimeout caps a pinned transport's own exponential
 	// dial backoff. Non-positive resolves to five minutes.
 	PinnedReconnectMaxTimeout time.Duration
-	// PinnedNoRouteHoldTimeout is how long a pinned transport sleeps after a
-	// dial in which the routing refused every attempt with no route
-	// (EHOSTUNREACH, ENETUNREACH): a host with only ULA or link-local
-	// addresses of the family, or whose default route of the family is scoped
-	// to a vpn's tunnel, which the address probe counts as a path. Each such
-	// dial after a hold ran out doubles the next hold, up to
-	// PinnedNoRouteHoldMaxTimeout; a connection or a network change ends the
-	// hold and forgets the doubling (pinnedRouteHold). Five minutes, the first
-	// sentence of a demoted family (control_family.go). Non-positive holds
-	// nothing, and the pinned backoff alone paces such a transport.
+	// How long a pinned transport sleeps after a dial in which the routing
+	// refused every attempt with no route (EHOSTUNREACH, ENETUNREACH): a host
+	// with only ULA or link-local addresses of the family, or whose default
+	// route of the family is scoped to a vpn's tunnel, which the address probe
+	// counts as a path. Each such dial after a hold ran out doubles the next
+	// hold, up to PinnedNoRouteHoldMaxTimeout; a connection or a network
+	// change ends the hold and forgets the doubling (pinnedRouteHold). Five
+	// minutes, the first sentence of a demoted family (control_family.go).
+	// Non-positive holds nothing, and the pinned backoff alone paces such a
+	// transport.
 	PinnedNoRouteHoldTimeout time.Duration
-	// PinnedNoRouteHoldMaxTimeout caps the doubling of
-	// PinnedNoRouteHoldTimeout. One hour: a host that never reports a network
-	// change, such as a headless provider, still tries the family once an hour
-	// and finds a route that came back within the hour. At or below
-	// PinnedNoRouteHoldTimeout the hold does not grow.
+	// Caps the doubling of PinnedNoRouteHoldTimeout. One hour: a host that
+	// never reports a network change, such as a headless provider, still tries
+	// the family once an hour and finds a route that came back within the
+	// hour. At or below PinnedNoRouteHoldTimeout the hold does not grow.
 	PinnedNoRouteHoldMaxTimeout time.Duration
 	// ReconnectMaxTimeout caps a family-agnostic transport's exponential
 	// backoff after consecutive failed dials (see dialRetryAfter).
@@ -2468,12 +2467,12 @@ func (self *PlatformTransport) runInactiveDrain(
 	}
 }
 
-// logAuthError logs a failed dial of one of this transport's modes, throttled
-// at INFO across every transport (shouldLogAuthErr) and every attempt at
-// V(1). The line names the mode and a pinned transport's family, which a
-// redacted bundle cannot read off the dialed addresses, and the causes an
-// exhausted strategy retained (httpRequestErrorWithCauses), which its own
-// message does not: which leg failed, and why.
+// Logs a failed dial of one of this transport's modes, throttled at INFO
+// across every transport (shouldLogAuthErr) and every attempt at V(1). The
+// line names the mode and a pinned transport's family, which a redacted
+// bundle cannot read off the dialed addresses, and the causes an exhausted
+// strategy retained (httpRequestErrorWithCauses), which its own message does
+// not: which leg failed, and why.
 func (self *PlatformTransport) logAuthError(clientId Id, mode TransportMode, err error) {
 	leg := string(mode)
 	if self.pinned() {

@@ -24,21 +24,20 @@ import (
 	"time"
 )
 
-// noRouteDialError is what a stream dial of a family the routing has no route
-// for returns at once: connect refused with no route to host.
+// What a stream dial of a family the routing has no route for returns at
+// once: connect refused with no route to host.
 func noRouteDialError(network string) error {
 	return &net.OpError{Op: "dial", Net: network, Err: os.NewSyscallError("connect", syscall.EHOSTUNREACH)}
 }
 
-// refusedDialError is a dial that reached the host and found no listener: the
-// family has a route.
+// A dial that reached the host and found no listener: the family has a route.
 func refusedDialError(network string) error {
 	return &net.OpError{Op: "dial", Net: network, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 }
 
-// noRoutePacketConn is a real udp endpoint whose sends the routing refuses
-// with no route, as sendmsg answers on a host without a route of the family.
-// Reads, deadlines and close are the endpoint's own.
+// A real udp endpoint whose sends the routing refuses with no route, as
+// sendmsg answers on a host without a route of the family. Reads, deadlines
+// and close are the endpoint's own.
 type noRoutePacketConn struct {
 	net.PacketConn
 }
@@ -47,17 +46,17 @@ func (self *noRoutePacketConn) WriteTo(packet []byte, addr net.Addr) (int, error
 	return 0, &net.OpError{Op: "write", Net: "udp6", Addr: addr, Err: os.NewSyscallError("sendmsg", syscall.EHOSTUNREACH)}
 }
 
-// pinnedRouteFixtureHold is one no-route hold the hold watcher armed a timer
-// for. Sending on end runs the hold out.
+// One no-route hold the hold watcher armed a timer for. Sending on end runs
+// the hold out.
 type pinnedRouteFixtureHold struct {
 	hold time.Duration
 	end  chan time.Time
 }
 
-// pinnedRouteFixture is a v6-pinned transport whose dials meet `refusal`
-// until the test routes them to its v6 loopback platform. The test decides
-// when a no-route hold runs out, and sees each hold armed, each park of a
-// mode runner on a hold, and each wait of a runner's redial pacing.
+// A v6-pinned transport whose dials meet `refusal` until the test routes them
+// to its v6 loopback platform. The test decides when a no-route hold runs out,
+// and sees each hold armed, each park of a mode runner on a hold, and each
+// wait of a runner's redial pacing.
 type pinnedRouteFixture struct {
 	transport *PlatformTransport
 	platform  *testingFamilyPlatformServer
@@ -138,10 +137,10 @@ func newPinnedRouteFixture(
 	return fixture
 }
 
-// requireSleep waits for the hold that a refused dial starts and for the mode
-// runner to park on it. With redialFirst the runner first waits out its
-// redial pacing once, as a dial after a hold or a network change does; any
-// other pacing before the park is a redial of a family that has no route.
+// Waits for the hold that a refused dial starts and for the mode runner to
+// park on it. With redialFirst the runner first waits out its redial pacing
+// once, as a dial after a hold or a network change does; any other pacing
+// before the park is a redial of a family that has no route.
 func (self *pinnedRouteFixture) requireSleep(t *testing.T, redialFirst bool) pinnedRouteFixtureHold {
 	t.Helper()
 	var hold pinnedRouteFixtureHold

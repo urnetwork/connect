@@ -15,9 +15,9 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// exhaustedContractOob fails every contract request as a control post does
-// whose every attempt met no route, and answers other control empty. Takes the
-// frames, like every OutOfBandControl.
+// Fails every contract request as a control post does whose every attempt met
+// no route, and answers other control empty. Takes the frames, like every
+// OutOfBandControl.
 type exhaustedContractOob struct{}
 
 func (self *exhaustedContractOob) SendControl(frames []*protocol.Frame, callback OobResultFunction) {

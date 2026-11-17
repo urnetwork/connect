@@ -403,7 +403,7 @@ func (self *pinnedDialBackoff) reset() {
 	self.failures = 0
 }
 
-// pinnedRouteHoldState is a no-route hold as one comparable value.
+// A no-route hold as one comparable value.
 type pinnedRouteHoldState struct {
 	// the refused dials since the last connection or network change, at most
 	// one per hold
@@ -414,20 +414,20 @@ type pinnedRouteHoldState struct {
 	generation uint64
 }
 
-// pinnedRouteHold is a pinned transport's memory that the routing has no route
-// for its family (IPV6.md A5). The probe counts an address of the family as a
-// path, but a host whose only addresses of the family are ULA or link-local,
-// or whose default route of the family is scoped to a vpn's tunnel, refuses
-// every dial of it at once with no route, and the transport used to redial on
-// its backoff forever, an auth error each time, with nothing leaving the host.
+// A pinned transport's memory that the routing has no route for its family
+// (IPV6.md A5). The probe counts an address of the family as a path, but a
+// host whose only addresses of the family are ULA or link-local, or whose
+// default route of the family is scoped to a vpn's tunnel, refuses every dial
+// of it at once with no route, and the transport used to redial on its
+// backoff forever, an auth error each time, with nothing leaving the host.
 //
 // A dial whose every attempt the routing refused (dialRouteRefused) starts a
 // hold: the transport sleeps, as without an address of the family, until the
 // hold runs out, the path changes or the policy moves it. Each refused dial
-// after a hold ran out doubles the next hold, from
-// PinnedNoRouteHoldTimeout up to PinnedNoRouteHoldMaxTimeout. A connection or
-// a network change forgets the strikes. A non-positive base, and a nil hold --
-// a family-agnostic transport's -- hold nothing.
+// after a hold ran out doubles the next hold, from PinnedNoRouteHoldTimeout up
+// to PinnedNoRouteHoldMaxTimeout. A connection or a network change forgets the
+// strikes. A non-positive base, and a nil hold -- a family-agnostic
+// transport's -- hold nothing.
 //
 // Safe for concurrent use. The state is a MonitorValue, so the hold watcher
 // (runFamilyHoldWatcher) wakes on every change.
@@ -445,8 +445,8 @@ func newPinnedRouteHold(base time.Duration, max time.Duration) *pinnedRouteHold 
 	}
 }
 
-// refuse records a dial the routing refused and starts a hold, unless one is
-// in force: the mode runners of a transport dial together, and one round of
+// Records a dial the routing refused and starts a hold, unless one is in
+// force: the mode runners of a transport dial together, and one round of
 // their refusals is one strike. Returns the hold it started, zero when it
 // started none.
 func (self *pinnedRouteHold) refuse() time.Duration {
@@ -478,7 +478,7 @@ func (self *pinnedRouteHold) refuse() time.Duration {
 	return started
 }
 
-// get returns the state and a channel that closes on its next change.
+// The state, and a channel that closes on its next change.
 func (self *pinnedRouteHold) get() (pinnedRouteHoldState, chan struct{}) {
 	if self == nil {
 		return pinnedRouteHoldState{}, nil
@@ -493,8 +493,8 @@ func (self *pinnedRouteHold) value() pinnedRouteHoldState {
 	return self.state.Value()
 }
 
-// end ends the hold of `generation` if it is still the one in force. The
-// strikes stay, so the next refused dial holds longer.
+// Ends the hold of `generation` if it is still the one in force. The strikes
+// stay, so the next refused dial holds longer.
 func (self *pinnedRouteHold) end(generation uint64) {
 	if self == nil {
 		return
@@ -507,7 +507,7 @@ func (self *pinnedRouteHold) end(generation uint64) {
 	})
 }
 
-// reset forgets the strikes and ends any hold in force.
+// Forgets the strikes and ends any hold in force.
 func (self *pinnedRouteHold) reset() {
 	if self == nil {
 		return
@@ -519,14 +519,13 @@ func (self *pinnedRouteHold) reset() {
 	})
 }
 
-// dialRouteRefused reports whether a failed dial met no route on every attempt
-// it made: each cause is a no route from the routing (isNoRouteErrno), and none
-// failed any other way. The deadline or cancellation that closes an exhausted
-// strategy budget (HttpRequestExhaustedError) is no attempt's answer and
-// counts neither way, but a dial that ended on those alone was refused
-// nothing. The causes are the exhaustion's own bounded walk
-// (flattenHttpRequestCauses), whose incomplete or overflowing tree leaves a
-// cause of another kind.
+// Reports whether a failed dial met no route on every attempt it made: each
+// cause is a no route from the routing (isNoRouteErrno), and none failed any
+// other way. The deadline or cancellation that closes an exhausted strategy
+// budget (HttpRequestExhaustedError) is no attempt's answer and counts neither
+// way, but a dial that ended on those alone was refused nothing. The causes
+// are the exhaustion's own bounded walk (flattenHttpRequestCauses), whose
+// incomplete or overflowing tree leaves a cause of another kind.
 func dialRouteRefused(err error) bool {
 	if err == nil {
 		return false
@@ -744,7 +743,7 @@ func (self *PlatformTransport) runFamilyHoldWatcher() {
 	}
 }
 
-// routeHoldAfter is the timer of a no-route hold, given the hold.
+// The timer of a no-route hold, given the hold.
 func (self *PlatformTransport) routeHoldAfter(hold time.Duration) <-chan time.Time {
 	if self.settings != nil && self.settings.routeHoldAfterForTest != nil {
 		return self.settings.routeHoldAfterForTest(hold)
