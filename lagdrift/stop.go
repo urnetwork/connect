@@ -14,7 +14,9 @@ package lagdrift
 //   - clear: the same 12-round-trip minimum, and the whole region at the
 //     run's k_early (StopTolerance.KEarly, V11) lies outside the IP country,
 //     or the fit is inside it and the whole region lies inside it. Both are
-//     D ≥ k_early (V6);
+//     D ≥ k_early (V6). A tolerance without a k_early allows no clear stop;
+//     falling back to EarlyK would make one easier than a verdict at a k
+//     above 3.035 (review V-4);
 //   - interrupted: no pong from any extender for 4 s;
 //   - cap: 12 s after the sessions opened.
 //
@@ -64,18 +66,21 @@ const (
 type StopTolerance struct {
 	AreaRatio float64 `json:"areaRatio"`
 	// lag.dev/DRIFTTEST.md I3 (V11): the run's k_early (KEarly of its k), for
-	// the clear rule; 0, or anything not positive, means EarlyK
+	// the clear rule; unset (0), or anything not positive, allows no clear
+	// stop (review V-4)
 	KEarly float64 `json:"kEarly"`
 }
 
-// The clear rule's k: the tolerance's KEarly, or EarlyK when it has none.
-func (self StopTolerance) kEarly() float64 {
+// The clear rule's k: the tolerance's KEarly, and false when it has none.
+func (self StopTolerance) kEarly() (float64, bool) {
 	if 0 < self.KEarly {
-		return self.KEarly
+		return self.KEarly, true
 	}
-	return EarlyK
+	return 0, false
 }
 
+// The browser's and the server's area ratios. Neither carries a k_early, which
+// is the run's: set KEarly to KEarly(k) for its k, or clear never holds.
 var (
 	// ±5%: 1.05 / 0.95
 	BrowserStopTolerance = StopTolerance{AreaRatio: 1.105}
@@ -88,8 +93,9 @@ var (
 // run's snapshots in time order; those after nowMs are ignored. lastPongMs is
 // the last pong from any extender, before which openedMs stands in. c is the IP
 // country, nil when unknown, which rules out clear, as a country without a
-// ring with a point does. When several rules hold, the first of interrupted,
-// clear, converged and cap is the reason.
+// ring with a point does, and as a tolerance without the run's k_early does.
+// When several rules hold, the first of interrupted, clear, converged and cap
+// is the reason.
 func EvaluateStop(history []Snapshot, openedMs int64, nowMs int64, lastPongMs int64, c *Country, tol StopTolerance) (StopReason, bool) {
 	for _, reason := range []StopReason{StopInterrupted, StopClear, StopConverged, StopCap} {
 		if StopHolds(reason, history, openedMs, nowMs, lastPongMs, c, tol) {
@@ -116,7 +122,10 @@ func StopHolds(reason StopReason, history []Snapshot, openedMs int64, nowMs int6
 		if !ok || latest.Fit == nil || c == nil || !c.hasBoundary() || !enoughRoundTrips(latest.RoundTrips) {
 			return false
 		}
-		kEarly := tol.kEarly()
+		kEarly, ok := tol.kEarly()
+		if !ok {
+			return false
+		}
 		return kEarly <= Judge(latest.Fit, c, kEarly).D
 	case StopConverged:
 		latest, ok := latestSnapshot(history, nowMs)

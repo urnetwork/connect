@@ -363,7 +363,8 @@ func TestJudgeSkipsNaturalEarthsCuts(t *testing.T) {
 			t.Errorf("%s: D %.6f, brute force %.6f", c.name, j.D, brute)
 		}
 		history := []Snapshot{{AtMs: StopEarliestMs, Fit: f, RoundTrips: []int{12, 12, 12, 12, 12, 12, 12, 12}}}
-		if reason, ok := EvaluateStop(history, 0, StopEarliestMs, StopEarliestMs, c.country, BrowserStopTolerance); !ok || reason != StopClear {
+		tol := StopTolerance{AreaRatio: BrowserStopTolerance.AreaRatio, KEarly: KEarly(k99)}
+		if reason, ok := EvaluateStop(history, 0, StopEarliestMs, StopEarliestMs, c.country, tol); !ok || reason != StopClear {
 			t.Errorf("%s: stop %q %v, not clear", c.name, reason, ok)
 		}
 	}

@@ -834,8 +834,12 @@ func buildStops(v *vectorsFile) {
 		}
 		v.EvaluateStop = append(v.EvaluateStop, stopVector{Name: name, History: h, OpenedMs: opened, NowMs: now, LastPongMs: lastPong, Country: c, Tolerance: tol, Stop: ok, Reason: reason, Holds: holds})
 	}
+	// the tolerances at the textbook 99% k's k_early, EarlyK: without one, no
+	// clear stop holds (review V-4)
 	browser := lagdrift.BrowserStopTolerance
+	browser.KEarly = lagdrift.KEarly(textbookK99)
 	server := lagdrift.ServerStopTolerance
+	server.KEarly = lagdrift.KEarly(textbookK99)
 	add("clear, but before 3 s", history(opened+3000, far, 12), opened+2999, opened+2999, square, browser)
 	add("clear at 3 s", history(opened+3000, far, 12), opened+3000, opened+3000, square, browser)
 	add("before the cap", history(opened+12000, none, 0), opened+11999, opened+11900, square, browser)
@@ -867,19 +871,25 @@ func buildStops(v *vectorsFile) {
 	add("not clear: too few ready", one(covFit(p6(1, -10), circle(30), 0, 0), 7), clearAt, clearAt, square, browser)
 	add("not clear: no country", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, nil, browser)
 	add("not clear: a country of no polygons", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{}}, browser)
-	// the run's k_early (V11): D ≈ 6.7 is clear at EarlyK and at Antarctica's
-	// k_early, not at Oceania's; a k_early not above 0 is EarlyK
+	// the run's k_early (V11): D ≈ 6.7 is clear at the textbook k_early and at
+	// Antarctica's, not at Oceania's, and without a k_early (0, or below)
+	// nothing is clear, while the other rules hold (review V-4)
 	kEarly := func(tol lagdrift.StopTolerance, kEarly float64) lagdrift.StopTolerance {
 		tol.KEarly = kEarly
 		return tol
 	}
 	between := one(covFit(p6(1, -1.5), circle(25), 0, 0), 8)
-	add("clear at EarlyK", between, clearAt, clearAt, square, browser)
+	add("clear at the textbook k_early", between, clearAt, clearAt, square, browser)
 	add("clear at Antarctica's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(3.49))))
 	add("not clear at Oceania's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(7.88))))
 	add("not clear at Oceania's k_early, the server", between, clearAt, clearAt, square, kEarly(server, r6(lagdrift.KEarly(7.88))))
-	add("a k_early below 0 is EarlyK", between, clearAt, clearAt, square, kEarly(browser, -1))
+	add("not clear without a k_early", between, clearAt, clearAt, square, kEarly(browser, 0))
+	add("not clear far outside without a k_early, the server", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, square, kEarly(server, 0))
+	add("not clear with a k_early below 0", between, clearAt, clearAt, square, kEarly(browser, -1))
+	add("converged without a k_early", history(now, steady, 8), now, now, square, kEarly(browser, 0))
 	end := int64(opened + 12000)
+	add("the cap without a k_early", history(end, none, 0), end, end, square, kEarly(browser, 0))
+	add("interrupted without a k_early", history(end, far, 12), end, opened+5000, square, kEarly(browser, 0))
 	add("interrupted before clear", history(end, far, 12), end, opened+5000, square, browser)
 	add("clear before converged and the cap", history(end, far, 12), end, end, square, browser)
 	add("converged before the cap", history(end, steady, 8), end, end, square, browser)

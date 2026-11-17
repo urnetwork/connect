@@ -8,7 +8,7 @@ package lagdrift
 // calibrated k, the empirical quantile V4 measures per continent from lag.dev
 // tracks; a continent without enough tracks uses DefaultK, T3's per-region k.
 // The clear stop's k, KEarly, scales with k, so a clear stop is never easier
-// than the verdict.
+// than the verdict, and a stop rule without it allows no clear stop.
 
 import (
 	"math"
@@ -16,7 +16,8 @@ import (
 	"strings"
 )
 
-// k_early's scale: EarlyK over the textbook 99% k, 4.0 / 3.035 ≈ 1.32 (V11).
+// k_early's scale: EarlyK over the textbook 99% k, the exact ratio 4.0 / 3.035,
+// about 1.318 (V11).
 const KEarlyScale = 4.0 / 3.035
 
 // GeoLite2's continent codes.
@@ -57,9 +58,10 @@ func DefaultK(confidence float64, continent string) float64 {
 	return math.Max(k, defaults[code])
 }
 
-// The clear stop's k for a run's k (V11): max(EarlyK, 1.32 × k), with 1.32 =
-// KEarlyScale, so a clear stop is never easier than the verdict. At the
-// textbook 99% k it is EarlyK.
+// The clear stop's k for a run's k (V11): max(EarlyK, KEarlyScale × k), so a
+// clear stop is never easier than the verdict. At the textbook 99% k it is
+// EarlyK. A stop tolerance needs it (StopTolerance.KEarly): without one, no
+// clear stop holds.
 func KEarly(k float64) float64 {
 	return math.Max(EarlyK, KEarlyScale*k)
 }
