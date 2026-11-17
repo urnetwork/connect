@@ -1368,6 +1368,20 @@ func (self *ExtenderDirectory) RecordFailure(ip netip.Addr, connectMode Extender
 	self.changedWithLock()
 }
 
+// addressServesSocketCarrierWithLock for one address by ip. An address the
+// directory does not know is dialed on the carrier defaults, which are all
+// socket carriers.
+func (self *ExtenderDirectory) addressServesSocketCarrier(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	address := self.ipAddresses[ip]
+	if address == nil {
+		return true
+	}
+	return self.addressServesSocketCarrierWithLock(address)
+}
+
 // Whether the verified record of an address lists a socket carrier for it:
 // tcp, quic or dns. An address with no verified record is dialed on the
 // carrier defaults, which are all socket carriers.

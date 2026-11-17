@@ -226,7 +226,7 @@ func TestExtenderWebRtcDialerComesAfterDnsWithNoOuterName(t *testing.T) {
 		if string(webRtcConfig.PublicKey) != string(candidate.PublicKey) {
 			t.Fatalf("webrtc config does not carry the record key")
 		}
-		dialer := newExtenderClientDialer(DefaultClientStrategySettings(), webRtcConfig)
+		dialer := newExtenderClientDialer(DefaultClientStrategySettings(), webRtcConfig, nil)
 		if dialer.priority != extenderDialerPriority(ExtenderConnectModeWebRtc) {
 			t.Fatalf("webrtc dialer priority = %d", dialer.priority)
 		}
