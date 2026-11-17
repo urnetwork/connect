@@ -32,56 +32,9 @@ import (
 
 // FIXME DoH certs need to be included in the pinned certs
 
-const (
-	// dohServerWeightFloor keeps every server a small chance of being tried first (exploration), so
-	// a server that recovers can climb back even after a streak of failures.
-	dohServerWeightFloor = 0.05
-	// maxDohResponseBytes caps a DoH response body read (a memory guard); a real DNS answer is tiny
-	// (typically <1 KiB, a few KiB for dnssec-heavy or ech/https records), so this only bounds a
-	// hostile or broken server. It doubles as the per-request reservation unit against the dns
-	// memory target, so the target divided by this is the guaranteed-parallelism floor.
-	maxDohResponseBytes = 16 * 1024
-	// dohStaleServeBound is how long past its expiration a resolved answer may still be served
-	// when a FRESH resolution fails (RFC 8767 serve-stale). The failure this exists for is exit
-	// failover: DNS is the one dependency every new connection shares, and the moment every
-	// resolver path is briefly unreachable (the tunnel re-racing onto a new exit) is exactly the
-	// moment a burst of resolutions arrives — answering SERVFAIL then makes DNS the reason the
-	// failover looks broken. Failover completes in seconds-to-a-minute, so 5 minutes covers it
-	// with margin while keeping the worst-case staleness far below the RFC's permitted days —
-	// an address that was correct 5 minutes ago is overwhelmingly still correct, and a wrong one
-	// costs one failed connect followed by a re-resolve. Stale answers are only served when the
-	// fresh resolve FAILS (resolver failure / non-authoritative empty), never over an
-	// authoritative answer (records or NXDOMAIN/NODATA), and retained entries stay subject to
-	// the CacheMaxEntries cap in pruneCacheLocked, so the bound adds no unmetered memory.
-	dohStaleServeBound = 5 * time.Minute
-	// dohQueryReserveByteCount is the dns memory target reservation held for the lifetime of one
-	// in-flight DoH HTTP request (the response read cap; the request wire and goroutine are noise
-	// next to it)
-	dohQueryReserveByteCount = maxDohResponseBytes
-	// dnsLookupReserveByteCount is the dns memory target reservation for one plain-dns LookupIP
-	// (small udp/tcp exchanges via net.Resolver, no doh response body)
-	dnsLookupReserveByteCount = 4 * 1024
-	// dohTlsSessionCacheCapacity bounds a DoH client's TLS session ticket cache; a ticket or
-	// two per configured server is plenty (see httpClientWithDialer).
-	dohTlsSessionCacheCapacity = 16
-	// dohSeedMaxScore clamps a persisted per-server score on seed (see serverStats.seed): high
-	// enough to make the last session's fastest server the clear first pick, low enough that a
-	// few live successes on another server can overturn a stale ordering.
-	dohSeedMaxScore = 8.0
-	// dohWarmDomain is the benign, universally-answered name Warm queries to open a server
-	// connection (TCP+TLS+h2) ahead of the first real lookup. The answer is never cached.
-	dohWarmDomain = "example.com"
-)
-
-// dohServerWindows are the trailing time spans over which each server's successful resolutions are
-// counted (per-window token buckets). A success falls inside every window whose span covers it, so a
-// recent success is counted in more windows and weighted more — the fan-out order then favors
-// servers that have resolved most recently and most often. See serverStats.
-var dohServerWindows = []time.Duration{
-	5 * time.Minute,
-	15 * time.Minute,
-	60 * time.Minute,
-}
+// dohWarmDomain is the benign, universally-answered name Warm queries to open a server
+// connection (TCP+TLS+h2) ahead of the first real lookup. The answer is never cached.
+const dohWarmDomain = "example.com"
 
 func DefaultDohSettings() *DohSettings {
 	return &DohSettings{
@@ -107,22 +60,34 @@ func DefaultDohSettings() *DohSettings {
 		// on the single shared h2 connection through the (cold) tunnel at
 		// exactly the wrong moment — measured as a real first-load
 		// regression on device. See PACKETRESEARCH1 §11.
-		DohServerStagger:         750 * time.Millisecond,
-		DohServerWarmStagger:     100 * time.Millisecond,
-		DohServerRaceMaxInFlight: 4,
-		DohServerHedgeReserve:    4,
-		DnsResolverSettings:      DefaultDnsResolverSettings(),
+		DohServerStagger:          750 * time.Millisecond,
+		DohServerWarmStagger:      100 * time.Millisecond,
+		DohServerRaceMaxInFlight:  4,
+		DohServerHedgeReserve:     4,
+		DnsResolverSettings:       DefaultDnsResolverSettings(),
+		ResponseMaxByteCount:      kib(16),
+		DnsLookupReserveByteCount: kib(4),
+		StaleServeBound:           5 * time.Minute,
+		TlsSessionCacheCapacity:   16,
+		ServerWindows: []time.Duration{
+			5 * time.Minute,
+			15 * time.Minute,
+			60 * time.Minute,
+		},
+		ServerWeightFloor:  0.05,
+		ServerSeedMaxScore: 8.0,
 	}
 }
 
 // dnsTargetHttpConcurrency returns the in-flight http request cap implied by
-// a dns memory target's byte capacity (the capacity divided by the
-// per-request reservation), or `fallback` when there is no target. With a
-// target, the count cap is a generous upper bound and the owner's byte
-// target is the real limiter (see DohSettings.MemoryTarget).
-func dnsTargetHttpConcurrency(targetByteCount ByteCount, fallback int) int {
-	if 0 < targetByteCount {
-		return max(fallback, int(targetByteCount/dohQueryReserveByteCount))
+// a dns memory target's byte capacity (the capacity divided by
+// reserveByteCount, the per-request reservation, which is the owning
+// settings' `ResponseMaxByteCount`), or `fallback` when there is no target or
+// no reservation. With a target, the count cap is a generous upper bound and
+// the owner's byte target is the real limiter (see DohSettings.MemoryTarget).
+func dnsTargetHttpConcurrency(targetByteCount ByteCount, reserveByteCount ByteCount, fallback int) int {
+	if 0 < targetByteCount && 0 < reserveByteCount {
+		return max(fallback, int(targetByteCount/reserveByteCount))
 	}
 	return fallback
 }
@@ -251,14 +216,14 @@ type DohSettings struct {
 	DnsResolverSettings *DnsResolverSettings
 	// MemoryTarget, when set, is the owner's live dns byte budget: every
 	// in-flight DoH request reserves the response read ceiling
-	// (`dohQueryReserveByteCount`) from it for the request's lifetime, and
+	// (`ResponseMaxByteCount`) from it for the request's lifetime, and
 	// plain-dns lookups reserve a smaller unit — so the owner's in-flight
 	// resolution memory tracks the target, waiting (not failing) when it is
 	// exhausted. The owner shares one target across its caches (e.g. the
 	// mux's tunnel + fallback resolvers). nil disables the byte bound.
 	MemoryTarget *MemoryTarget
 	// ServerStatsSeed, when set, pre-loads the per-server success stats with the given
-	// scores (url -> score, clamped to dohSeedMaxScore) at construction, so the weighted
+	// scores (url -> score, clamped to ServerSeedMaxScore) at construction, so the weighted
 	// fan-out order starts from the last session's experience — the first queries go to the
 	// server that was fastest then — instead of uniform-random. Live results take over as
 	// they accrue (seeds decay on the same trailing windows). See DohCache.ServerScores.
@@ -300,6 +265,51 @@ type DohSettings struct {
 	// topology-sensitive DNS locality without exposing the queried name in
 	// telemetry. nil and host-dialed DoH remain inert.
 	DohResultCallback func(domain string, addrs []netip.Addr, route *DohRoute)
+	// ResponseMaxByteCount caps a DoH response body read (a memory guard), 16 KiB: a real DNS
+	// answer is tiny (typically <1 KiB, a few KiB for dnssec-heavy or ech/https records), so
+	// this only bounds a hostile or broken server. It doubles as the per-request reservation
+	// unit against the dns memory target, so the target divided by this is the
+	// guaranteed-parallelism floor, and ForwardDnssec advertises it as its EDNS0 payload size.
+	// A longer body is cut at the cap. Non-positive reads no response, so every DoH query fails.
+	ResponseMaxByteCount ByteCount
+	// DnsLookupReserveByteCount is the dns memory target reservation for one plain-dns LookupIP,
+	// 4 KiB (small udp/tcp exchanges via net.Resolver, no doh response body). Zero reserves
+	// nothing, and a negative value refuses every plain-dns lookup.
+	DnsLookupReserveByteCount ByteCount
+	// StaleServeBound is how long past its expiration a resolved answer may still be served
+	// when a FRESH resolution fails (RFC 8767 serve-stale). The failure this exists for is exit
+	// failover: DNS is the one dependency every new connection shares, and the moment every
+	// resolver path is briefly unreachable (the tunnel re-racing onto a new exit) is exactly the
+	// moment a burst of resolutions arrives — answering SERVFAIL then makes DNS the reason the
+	// failover looks broken. Failover completes in seconds-to-a-minute, so 5 minutes covers it
+	// with margin while keeping the worst-case staleness far below the RFC's permitted days —
+	// an address that was correct 5 minutes ago is overwhelmingly still correct, and a wrong one
+	// costs one failed connect followed by a re-resolve. Stale answers are only served when the
+	// fresh resolve FAILS (resolver failure / non-authoritative empty), never over an
+	// authoritative answer (records or NXDOMAIN/NODATA), and retained entries stay subject to
+	// the CacheMaxEntries cap in pruneCacheLocked, so the bound adds no unmetered memory.
+	// Non-positive serves nothing stale and retains no expired entry.
+	StaleServeBound time.Duration
+	// TlsSessionCacheCapacity bounds a DoH client's TLS session ticket cache, 16: a ticket or
+	// two per configured server is plenty (see httpClientWithDialer). Non-positive takes
+	// crypto/tls's default capacity.
+	TlsSessionCacheCapacity int
+	// ServerWindows are the trailing time spans over which each server's successful
+	// resolutions are counted (per-window token buckets), 5, 15 and 60 minutes. A success
+	// falls inside every window whose span covers it, so a recent success is counted in more
+	// windows and weighted more — the fan-out order then favors servers that have resolved
+	// most recently and most often. See serverStats. Empty keeps no score, so every fan-out
+	// order is weighted by ServerWeightFloor alone, which is uniform.
+	ServerWindows []time.Duration
+	// ServerWeightFloor keeps every server a small chance of being tried first (exploration),
+	// 0.05, so a server that recovers can climb back even after a streak of failures.
+	// Non-positive gives a server with no recent success no chance of going ahead of one with.
+	ServerWeightFloor float64
+	// ServerSeedMaxScore clamps a persisted per-server score on seed (see serverStats.seed),
+	// 8: high enough to make the last session's fastest server the clear first pick, low
+	// enough that a few live successes on another server can overturn a stale ordering.
+	// Non-positive seeds nothing.
+	ServerSeedMaxScore float64
 }
 
 // DohRoute identifies the tunnel TCP connection that delivered a DoH answer.
@@ -459,7 +469,7 @@ type DohCache struct {
 	// installing an h2 connection after CloseIdleConnections already ran.
 	lifecycle *dohCacheLifecycle
 
-	// staleServeCount counts stale answers served under dohStaleServeBound (RFC 8767): each
+	// staleServeCount counts stale answers served under StaleServeBound (RFC 8767): each
 	// increment pairs with the per-serve log line in QueryResult. An atomic (not stateLock) so
 	// tests can read it without reaching into the lock, and so the zero value works on any
 	// DohCache.
@@ -658,22 +668,22 @@ func NewDohCache(settings *DohSettings) *DohCache {
 
 	maxResolutions := settings.MaxConcurrentResolutions
 	if maxResolutions <= 0 {
-		maxResolutions = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
+		maxResolutions = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), settings.ResponseMaxByteCount, 16)
 	}
 
 	// distinct TLS session caches per dial path: a ticket obtained via the host egress
 	// (localClient) must never be redeemed through the tunnel (remoteClient) — ticket reuse
 	// across paths would let the DoH server link the host address with the tunnel egress.
 	// Within a path, resumption saves a handshake round trip on every re-dial.
-	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
-	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext)), tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)), tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity))
+	localHttpClient := httpClientWithDialer(settings, lifecycle.dialContext(wrapDohDial(settings.Log, dohPathHost, netDialer.DialContext)), tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity))
 	// one in-flight-request semaphore and one stats table shared across the remote + local clients,
 	// so the cap bounds the cache's total concurrent DoH requests
 	httpConcurrency := maxConcurrentHttpRequests(settings)
 	httpSem := make(chan struct{}, httpConcurrency)
 	primarySem := newDohPrimarySem(httpConcurrency, settings.DohServerHedgeReserve)
 	activeQueries := &atomic.Int64{}
-	stats := newServerStats()
+	stats := newServerStats(settings)
 	// seed the fan-out order from the last session's per-server scores (if the owner
 	// persisted any), so the first queries pick the known-fastest server instead of
 	// spending the first minutes re-learning the ordering
@@ -706,8 +716,8 @@ func NewDohCache(settings *DohSettings) *DohCache {
 	siblings := dohServerSiblings(settings.DnsResolverSettings)
 
 	return &DohCache{
-		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings},
-		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, lifecycle: lifecycle, siblings: siblings},
+		remoteClient:          &dohClient{httpClient: httpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, responseMaxByteCount: settings.ResponseMaxByteCount, lifecycle: lifecycle, captureRoute: settings.DialContextSettings != nil, siblings: siblings},
+		localClient:           &dohClient{httpClient: localHttpClient, httpSem: httpSem, primarySem: primarySem, activeQueries: activeQueries, stats: stats, memoryTarget: settings.MemoryTarget, responseMaxByteCount: settings.ResponseMaxByteCount, lifecycle: lifecycle, siblings: siblings},
 		remoteResolver:        remoteResolver,
 		localResolver:         localResolver,
 		bootstrapLookupIP:     newBootstrapPlainDnsLookup(settings, lifecycle, netDialer),
@@ -725,7 +735,7 @@ func maxConcurrentHttpRequests(settings *DohSettings) int {
 	if 0 < settings.MaxConcurrentHttpRequests {
 		return settings.MaxConcurrentHttpRequests
 	}
-	return dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
+	return dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), settings.ResponseMaxByteCount, 16)
 }
 
 func newDohPrimarySem(httpConcurrency int, hedgeReserve int) chan struct{} {
@@ -824,7 +834,7 @@ warmLoop:
 				break warmLoop
 			}
 		}
-		if !settings.MemoryTarget.Acquire(queryCtx, dohQueryReserveByteCount) {
+		if !settings.MemoryTarget.Acquire(queryCtx, settings.ResponseMaxByteCount) {
 			if client.httpSem != nil {
 				<-client.httpSem
 			}
@@ -833,7 +843,7 @@ warmLoop:
 		warmWg.Add(1)
 		go HandleError(func() {
 			defer warmWg.Done()
-			defer settings.MemoryTarget.Release(dohQueryReserveByteCount)
+			defer settings.MemoryTarget.Release(settings.ResponseMaxByteCount)
 			if client.httpSem != nil {
 				defer func() { <-client.httpSem }()
 			}
@@ -887,10 +897,10 @@ func (self *DohCache) ShedMemory() {
 func (self *DohCache) pruneCacheLocked(now time.Time, reserve int) {
 	for key, result := range self.queryResultExpiration {
 		// an expired entry is retained while it is still stale-servable (RFC 8767, see
-		// dohStaleServeBound) so a resolution failure during that window can fall back to it.
+		// StaleServeBound) so a resolution failure during that window can fall back to it.
 		// memory stays bounded regardless: the CacheMaxEntries cap below evicts oldest-first
 		// over ALL entries, fresh and stale alike.
-		if !result.Valid(now, self.settings.MissExpiration) && !result.staleUsable(now) {
+		if !result.Valid(now, self.settings.MissExpiration) && !result.staleUsable(now, self.settings.StaleServeBound) {
 			delete(self.queryResultExpiration, key)
 		}
 	}
@@ -930,7 +940,7 @@ func (self *DohCache) Query(ctx context.Context, recordType string, domain strin
 //
 // Serve-stale (RFC 8767): when a fresh resolution would return non-authoritative empty (the
 // SERVFAIL shape) and an expired-but-retained answer for the key exists inside
-// dohStaleServeBound, the stale answer is served instead — reported as authoritative, because
+// StaleServeBound, the stale answer is served instead — reported as authoritative, because
 // this method's callers use the flag only to decide answer-vs-SERVFAIL and the stale answer
 // exists precisely to avoid the SERVFAIL. An authoritative fresh answer (records or
 // NXDOMAIN/NODATA) is never overridden by stale data; it also overwrites the retained entry
@@ -1003,7 +1013,7 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 				hitAddrs = r.Addrs()
 				return
 			}
-			if r.staleUsable(now) {
+			if r.staleUsable(now, self.settings.StaleServeBound) {
 				// expired but inside the serve-stale bound: keep the entry (a later query may
 				// need it too) and remember its answer as the fallback for a failed resolve
 				staleAddrs = r.Addrs()
@@ -1229,10 +1239,10 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	lookupNetwork, lookupFamilyEnabled := dnsLookupNetwork(q.RecordType, self.settings.IpVersion)
 
 	if len(addrExpirations) == 0 && lookupFamilyEnabled && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) &&
-		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		self.settings.MemoryTarget.Acquire(ctx, self.settings.DnsLookupReserveByteCount) {
 		// try the remote resolver
 		resolvedIps, err := self.remoteResolver.LookupIP(ctx, lookupNetwork, q.Domain)
-		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
+		self.settings.MemoryTarget.Release(self.settings.DnsLookupReserveByteCount)
 		if err == nil {
 			found := false
 			for _, ip := range resolvedIps {
@@ -1252,10 +1262,10 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 	}
 
 	if len(addrExpirations) == 0 && lookupFamilyEnabled && self.settings.DnsResolverSettings.EnableLocalDns &&
-		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		self.settings.MemoryTarget.Acquire(ctx, self.settings.DnsLookupReserveByteCount) {
 		// try the local resolver
 		resolvedIps, err := self.localResolver.LookupIP(ctx, lookupNetwork, q.Domain)
-		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
+		self.settings.MemoryTarget.Release(self.settings.DnsLookupReserveByteCount)
 		if err == nil {
 			found := false
 			for _, ip := range resolvedIps {
@@ -1276,12 +1286,12 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) ([]n
 
 	if len(addrExpirations) == 0 && !cacheMiss && lookupFamilyEnabled && ctx.Err() == nil &&
 		bootstrapPlainDnsName(self.settings, q.Domain) &&
-		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		self.settings.MemoryTarget.Acquire(ctx, self.settings.DnsLookupReserveByteCount) {
 		// every encrypted resolver failed: the bootstrap plain dns fallback.
 		// Its answer is used but a miss is not taken as authoritative, so the
 		// next lookup asks DoH again.
 		resolvedIps, err := self.bootstrapLookupIP(ctx, lookupNetwork, q.Domain)
-		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
+		self.settings.MemoryTarget.Release(self.settings.DnsLookupReserveByteCount)
 		if err == nil {
 			for _, ip := range resolvedIps {
 				if addr, ok := netIPAddr(ip); ok {
@@ -1346,17 +1356,18 @@ func DohQueryTxt(ctx context.Context, settings *DohSettings, name string) []stri
 	httpClient := httpClientWithDialer(
 		settings,
 		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
-		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
+		tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity),
 	)
 	c := &dohClient{
-		httpClient:    httpClient,
-		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
-		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
-		activeQueries: &atomic.Int64{},
-		stats:         nil,
-		memoryTarget:  settings.MemoryTarget,
-		lifecycle:     lifecycle,
-		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		httpClient:           httpClient,
+		httpSem:              make(chan struct{}, maxConcurrentHttpRequests(settings)),
+		primarySem:           newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		activeQueries:        &atomic.Int64{},
+		stats:                nil,
+		memoryTarget:         settings.MemoryTarget,
+		lifecycle:            lifecycle,
+		responseMaxByteCount: settings.ResponseMaxByteCount,
+		siblings:             dohServerSiblings(settings.DnsResolverSettings),
 	}
 	// both families' servers: a txt answer has no family of its own
 	result := c.queryResult(ctx, remoteDohUrls(settings, 0), "TXT", settings, name)
@@ -1380,7 +1391,7 @@ func DohQuery(ctx context.Context, ipVersion int, recordType string, settings *D
 	httpClient := httpClientWithDialer(
 		settings,
 		lifecycle.dialContext(wrapDohDial(settings.Log, dohRemoteDialPath(settings), settings.DialContext)),
-		tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity),
+		tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity),
 	)
 	result := dohQueryWithClient(
 		ctx,
@@ -1434,14 +1445,15 @@ func dohQueryWithClient(
 	// a one-shot client: bound its in-flight requests, but keep no persistent per-server stats
 	// (nil stats -> uniform-random fan-out order)
 	c := &dohClient{
-		httpClient:    httpClient,
-		httpSem:       make(chan struct{}, maxConcurrentHttpRequests(settings)),
-		primarySem:    newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
-		activeQueries: &atomic.Int64{},
-		stats:         nil,
-		memoryTarget:  settings.MemoryTarget,
-		lifecycle:     lifecycle,
-		siblings:      dohServerSiblings(settings.DnsResolverSettings),
+		httpClient:           httpClient,
+		httpSem:              make(chan struct{}, maxConcurrentHttpRequests(settings)),
+		primarySem:           newDohPrimarySem(maxConcurrentHttpRequests(settings), settings.DohServerHedgeReserve),
+		activeQueries:        &atomic.Int64{},
+		stats:                nil,
+		memoryTarget:         settings.MemoryTarget,
+		lifecycle:            lifecycle,
+		responseMaxByteCount: settings.ResponseMaxByteCount,
+		siblings:             dohServerSiblings(settings.DnsResolverSettings),
 	}
 	result := c.queryResult(ctx, remoteDohUrls(settings, ipVersion), recordType, settings, domains...)
 	observation.finish(settings.Log, dohFinalResolverOutcome(callerCtx, 0 < len(result.AddrTtls), result.Miss, false))
@@ -1512,6 +1524,9 @@ type dohClient struct {
 	// the owner's live dns byte budget (see DohSettings.MemoryTarget).
 	// nil disables the byte bound.
 	memoryTarget *MemoryTarget
+	// the settings' ResponseMaxByteCount: the most of a response body read,
+	// and what each request reserves from memoryTarget
+	responseMaxByteCount ByteCount
 	// nil only for caller-owned HTTP clients supplied to DohQueryWithClient.
 	lifecycle *dohCacheLifecycle
 	// captureRoute is true only when the remote DoH client dials through an
@@ -1855,7 +1870,7 @@ func (self *dohClient) queryResult(
 					// the request pins up to a full response read; the owner's dns
 					// memory target bounds its total in-flight bytes across all of
 					// its resolver caches
-					if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
+					if !self.memoryTarget.Acquire(launchCtx, self.responseMaxByteCount) {
 						if self.httpSem != nil {
 							<-self.httpSem
 						}
@@ -1865,7 +1880,7 @@ func (self *dohClient) queryResult(
 						return
 					}
 					go HandleError(func() {
-						defer self.memoryTarget.Release(dohQueryReserveByteCount)
+						defer self.memoryTarget.Release(self.responseMaxByteCount)
 						if self.httpSem != nil {
 							defer func() { <-self.httpSem }()
 						}
@@ -2086,7 +2101,7 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 	if response.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
 	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxDohResponseBytes))
+	data, err := io.ReadAll(io.LimitReader(response.Body, self.responseMaxByteCount))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read %s: %w", dohUrl, err)
 	}
@@ -2122,7 +2137,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 	var additionals []dnsmessage.Resource
 	if dnssecOk {
 		var optHeader dnsmessage.ResourceHeader
-		if err := optHeader.SetEDNS0(int(min(maxDohResponseBytes, math.MaxUint16)), dnsmessage.RCodeSuccess, true); err != nil {
+		if err := optHeader.SetEDNS0(int(min(max(0, settings.ResponseMaxByteCount), math.MaxUint16)), dnsmessage.RCodeSuccess, true); err != nil {
 			return nil, false
 		}
 		additionals = []dnsmessage.Resource{{Header: optHeader, Body: &dnsmessage.OPTResource{}}}
@@ -2200,7 +2215,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 						return
 					}
 				}
-				if !self.memoryTarget.Acquire(launchCtx, dohQueryReserveByteCount) {
+				if !self.memoryTarget.Acquire(launchCtx, self.responseMaxByteCount) {
 					if self.httpSem != nil {
 						<-self.httpSem
 					}
@@ -2211,7 +2226,7 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 				}
 
 				go HandleError(func() {
-					defer self.memoryTarget.Release(dohQueryReserveByteCount)
+					defer self.memoryTarget.Release(self.responseMaxByteCount)
 					if self.httpSem != nil {
 						defer func() { <-self.httpSem }()
 					}
@@ -2409,20 +2424,30 @@ func parseDohWire(data []byte, qType dnsmessage.Type) *dohQueryResult {
 }
 
 // serverStats tracks each DoH server's recent successful resolutions in per-window token buckets — a
-// current and a previous bucket per dohServerWindows span — and scores a server by summing the
+// current and a previous bucket per DohSettings.ServerWindows span — and scores a server by summing the
 // trailing-window estimates, so the fan-out order favors servers that have resolved most recently
 // and most often. All methods are safe for concurrent use and safe to call on a nil *serverStats (a
 // no-op / uniform-random order).
 type serverStats struct {
+	// the settings' ServerWindows, ServerWeightFloor and ServerSeedMaxScore, fixed at construction
+	windows      []time.Duration
+	weightFloor  float64
+	seedMaxScore float64
+
 	lock  sync.Mutex
 	byUrl map[string]*serverStat
 }
 
-func newServerStats() *serverStats {
-	return &serverStats{byUrl: map[string]*serverStat{}}
+func newServerStats(settings *DohSettings) *serverStats {
+	return &serverStats{
+		windows:      slices.Clone(settings.ServerWindows),
+		weightFloor:  settings.ServerWeightFloor,
+		seedMaxScore: settings.ServerSeedMaxScore,
+		byUrl:        map[string]*serverStat{},
+	}
 }
 
-// serverStat holds one tokenBucket per dohServerWindows span (parallel index), counting the
+// serverStat holds one tokenBucket per DohSettings.ServerWindows span (parallel index), counting the
 // server's successful resolutions.
 type serverStat struct {
 	windows []tokenBucket
@@ -2481,15 +2506,15 @@ func (self *serverStats) recordAt(url string, ok bool, now time.Time) {
 
 	st := self.byUrl[url]
 	if st == nil {
-		st = &serverStat{windows: make([]tokenBucket, len(dohServerWindows))}
+		st = &serverStat{windows: make([]tokenBucket, len(self.windows))}
 		self.byUrl[url] = st
 	}
-	for k, span := range dohServerWindows {
+	for k, span := range self.windows {
 		st.windows[k].add(span, now, 1)
 	}
 }
 
-// seed pre-loads each server's windows with a persisted score (clamped to dohSeedMaxScore),
+// seed pre-loads each server's windows with a persisted score (clamped to the seed max score),
 // spread evenly across the windows so the summed score matches and decays on the normal
 // trailing-window schedule. Used at construction to carry the fan-out ordering across a
 // restart; live results then dominate as they accrue.
@@ -2501,17 +2526,17 @@ func (self *serverStats) seed(scores map[string]float64) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	for url, score := range scores {
+		score = min(score, self.seedMaxScore)
 		if score <= 0 {
 			continue
 		}
-		score = min(score, dohSeedMaxScore)
 		st := self.byUrl[url]
 		if st == nil {
-			st = &serverStat{windows: make([]tokenBucket, len(dohServerWindows))}
+			st = &serverStat{windows: make([]tokenBucket, len(self.windows))}
 			self.byUrl[url] = st
 		}
-		for k, span := range dohServerWindows {
-			st.windows[k].add(span, now, score/float64(len(dohServerWindows)))
+		for k, span := range self.windows {
+			st.windows[k].add(span, now, score/float64(len(self.windows)))
 		}
 	}
 }
@@ -2542,7 +2567,7 @@ func (self *serverStats) scoreLocked(url string, now time.Time) float64 {
 		return 0
 	}
 	var score float64
-	for k, span := range dohServerWindows {
+	for k, span := range self.windows {
 		score += st.windows[k].estimate(span, now)
 	}
 	return score
@@ -2574,7 +2599,7 @@ func (self *serverStats) orderAt(urls []string, now time.Time) []string {
 	ws := make([]weighted, len(ordered))
 	self.lock.Lock()
 	for i, url := range ordered {
-		weight := dohServerWeightFloor + self.scoreLocked(url, now)
+		weight := self.weightFloor + self.scoreLocked(url, now)
 		u := mathrand.Float64()
 		if u <= 0 {
 			u = math.SmallestNonzeroFloat64
@@ -2623,14 +2648,14 @@ func (self *DohResult) Valid(now time.Time, missExpiration time.Duration) bool {
 }
 
 // staleUsable reports whether an entry that is no longer Valid may still be served as a stale
-// answer under dohStaleServeBound (RFC 8767): it holds addresses, and less than the bound has
+// answer under bound, DohSettings.StaleServeBound (RFC 8767): it holds addresses, and less than the bound has
 // passed since the answer's last moment of freshness (its latest address expiration — the
 // point the whole record set stopped being fresh, so the served data is never older than
 // bound past what its TTL promised). A miss entry (authoritative NXDOMAIN/NODATA) is never
 // stale-servable: converting a resolution failure into a stale "does not exist" would deny a
 // name the resolver never re-confirmed absent, the harmful direction — RFC 8767's use case is
 // keeping known-good addresses reachable, and an expired miss carries none.
-func (self *DohResult) staleUsable(now time.Time) bool {
+func (self *DohResult) staleUsable(now time.Time, bound time.Duration) bool {
 	if len(self.AddrExpirations) == 0 {
 		return false
 	}
@@ -2640,7 +2665,7 @@ func (self *DohResult) staleUsable(now time.Time) bool {
 			latest = expireTime
 		}
 	}
-	return now.Before(latest.Add(dohStaleServeBound))
+	return now.Before(latest.Add(bound))
 }
 
 func (self *DohResult) Addrs() []netip.Addr {

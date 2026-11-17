@@ -17,6 +17,14 @@ Already migrated (2026-08-08, with the fail-closed encryption work):
 the new Required-gate poll interval was introduced directly as
 `EncryptionSettings.RequiredCipherPollInterval` (never shipped as a const).
 
+Migrated 2026-11-17, with `DohCache.ForwardDnssec` (QD-702): net_http_doh.go's
+`maxDohResponseBytes` and `dohQueryReserveByteCount` → `DohSettings.ResponseMaxByteCount`,
+`dnsLookupReserveByteCount` → `DnsLookupReserveByteCount`, `dohStaleServeBound` →
+`StaleServeBound`, `dohTlsSessionCacheCapacity` → `TlsSessionCacheCapacity`,
+`dohServerWindows` → `ServerWindows`, `dohServerWeightFloor` → `ServerWeightFloor` and
+`dohSeedMaxScore` → `ServerSeedMaxScore`. `dohWarmDomain`, the name a warm query asks,
+stays a constant: an identifier, not a limit.
+
 ---
 
 ## A. Wire / protocol / ABI constants — stay fixed (compatibility-bearing)
@@ -95,7 +103,6 @@ constructor like most settings do, so the default lives in exactly one place.
 | `webSocketWriteBatchMaxByteCount` | net_websocket_batch.go | platform-transport settings |
 | `clientTlsSessionCacheCapacity`, `tlsClientSessionCacheCapacity` | net_tls.go | connect/net settings (also: two near-duplicate names — unify) |
 | `reconnectFastPathLimit`, `reconnectFastPathMaxDelay` | net_http.go | client-strategy settings |
-| `dohServerWeightFloor`, `maxDohResponseBytes`, `dohStaleServeBound`, `dohQueryReserveByteCount`, `dnsLookupReserveByteCount`, `dohTlsSessionCacheCapacity`, `dohSeedMaxScore`, `dohWarmDomain` | net_http_doh.go | DoH settings |
 | `firstLoadMaxFlows`, `firstLoadMaxDnsQueries`, `firstLoadWindow`, `firstLoadFlowExpiration`, `firstLoadLogQueueSize` | net_first_load.go | first-load observability settings |
 | `providerUdpIdleTimeout`, `providerUdpFlowByteCount`, `providerTcpFlowByteCount`, `providerIcmpFlowByteCount`, `providerIcmpTargetDivisor`, `providerMin*Limit` | ip.go | egress/provider settings |
 | `providerP2pPriorityRefreshInterval`, `lruEvictionSampleSize` | ip.go | egress/provider settings |

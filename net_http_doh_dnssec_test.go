@@ -183,7 +183,8 @@ func TestDohForwardDnssecQueryCarriesTheDoBit(t *testing.T) {
 	}
 	// the OPT record whole: the root, type 41, the read cap as payload size,
 	// extended RCODE 0, version 0, the DO bit and no options
-	wantOpt := []byte{0, 0, 41, byte(maxDohResponseBytes >> 8), byte(maxDohResponseBytes & 0xff), 0, 0, 0x80, 0, 0, 0}
+	responseMaxByteCount := DefaultDohSettings().ResponseMaxByteCount
+	wantOpt := []byte{0, 0, 41, byte(responseMaxByteCount >> 8), byte(responseMaxByteCount & 0xff), 0, 0, 0x80, 0, 0, 0}
 	if !bytes.HasSuffix(query, wantOpt) {
 		t.Fatalf("query %x does not end with the OPT record %x", query, wantOpt)
 	}

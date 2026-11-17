@@ -161,7 +161,7 @@ func IngressDohSettings(ingressCountryCode string, dohUrlsIpv4 []string, dohUrls
 	resolverSettings.RemoteDohUrlsIpv6 = controlDohUrlsFirst(dohUrlsIpv6, resolverSettings.RemoteDohUrlsIpv6)
 	settings.ServerStatsSeed = map[string]float64{}
 	for _, dohUrl := range slices.Concat(dohUrlsIpv4, dohUrlsIpv6) {
-		settings.ServerStatsSeed[dohUrl] = dohSeedMaxScore
+		settings.ServerStatsSeed[dohUrl] = settings.ServerSeedMaxScore
 	}
 	return settings
 }

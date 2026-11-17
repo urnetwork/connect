@@ -29,7 +29,7 @@ import (
 // tail). A burst of distinct names (defeating the answer cache and
 // single-flight) measures per-query latency distribution, total wall time,
 // and effective parallelism sampled live off the dns MemoryTarget
-// (used / dohQueryReserveByteCount).
+// (used / DohSettings.ResponseMaxByteCount).
 //
 // Env knobs:
 //
@@ -302,13 +302,13 @@ func TestDnsFlowKernel(t *testing.T) {
 		}
 		peakConcurrency := int64(0)
 		if 0 < targetByteCount {
-			peakConcurrency = int64(peakUsed) / dohQueryReserveByteCount
+			peakConcurrency = int64(peakUsed) / settings.ResponseMaxByteCount
 		}
 
 		effectiveHttpCap := maxConcurrentHttpRequests(settings)
 		effectiveResolutionCap := settings.MaxConcurrentResolutions
 		if effectiveResolutionCap <= 0 {
-			effectiveResolutionCap = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), 16)
+			effectiveResolutionCap = 4 * dnsTargetHttpConcurrency(settings.MemoryTarget.Capacity(), settings.ResponseMaxByteCount, 16)
 		}
 		fmt.Printf("[dnsflow] servers=%s dead=%s stagger_ms=%d maxsrv=%d target_kb=%d timeout_ms=%d warm=%d path_warm=%d queries=%d http_cap=%d resolution_cap=%d race_max=%d hedge_reserve=%d pipe_slots=%d pipe_ms=%d seed_first=%d | ok=%d p50_ms=%d p95_ms=%d p99_ms=%d max_ms=%d wall_ms=%d peak_conc=%d requests=%d pipe_peak=%d\n",
 			dnsFlowEnv("URNET_DNS_SERVERS", "5,50"),

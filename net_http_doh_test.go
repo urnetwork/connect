@@ -366,7 +366,7 @@ func TestDohCanceledResponseReadDoesNotBlockOnClose(t *testing.T) {
 	t.Cleanup(releaseBlockedClose)
 
 	responseCh := make(chan *http.Response, 1)
-	client := &dohClient{httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
+	client := &dohClient{responseMaxByteCount: DefaultDohSettings().ResponseMaxByteCount, httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
 		request *http.Request,
 	) (*http.Response, error) {
 		response := &http.Response{
@@ -459,7 +459,7 @@ func TestDohLiveResponseReadClosesBody(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			body := &dohCloseRecordingBody{read: test.bodyReader}
 			var response *http.Response
-			client := &dohClient{httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
+			client := &dohClient{responseMaxByteCount: DefaultDohSettings().ResponseMaxByteCount, httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
 				request *http.Request,
 			) (*http.Response, error) {
 				response = &http.Response{
@@ -537,8 +537,9 @@ func TestDohQueryPreservesResponseWhenRouteEndpointMissing(t *testing.T) {
 		}, nil
 	})
 	client := &dohClient{
-		httpClient:   &http.Client{Transport: transport},
-		captureRoute: true,
+		httpClient:           &http.Client{Transport: transport},
+		responseMaxByteCount: DefaultDohSettings().ResponseMaxByteCount,
+		captureRoute:         true,
 	}
 
 	data, route, err := client.queryWireRawDetailedWithRoute(
@@ -1059,7 +1060,7 @@ func TestDohCacheMinTtl(t *testing.T) {
 // TestServerStatsTokenBucket: a server's score is the summed trailing-window success count, which
 // decays as time passes without new successes.
 func TestServerStatsTokenBucket(t *testing.T) {
-	stats := newServerStats()
+	stats := newServerStats(DefaultDohSettings())
 	base := time.Unix(1_700_000_000, 0)
 	const url = "https://r.example/dns-query"
 
@@ -1091,7 +1092,7 @@ func TestServerStatsTokenBucket(t *testing.T) {
 // TestServerStatsOrderBias: the weighted-random order favors the server with the stronger recent
 // success history the large majority of the time, while the floor still lets others be tried.
 func TestServerStatsOrderBias(t *testing.T) {
-	stats := newServerStats()
+	stats := newServerStats(DefaultDohSettings())
 	now := time.Unix(1_700_000_000, 0)
 	good := "https://good.example/dns-query"
 	bad := "https://bad.example/dns-query"
@@ -1358,7 +1359,7 @@ func TestDohCacheStaleDoesNotOverrideAuthoritative(t *testing.T) {
 }
 
 // TestDohCacheStalePastBoundNotServed: the serve-stale bound is a hard limit -- an answer
-// expired longer than dohStaleServeBound ago is not served on failure, and its entry leaves
+// expired longer than StaleServeBound ago is not served on failure, and its entry leaves
 // the cache.
 func TestDohCacheStalePastBoundNotServed(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
@@ -1388,7 +1389,7 @@ func TestDohCacheStalePastBoundNotServed(t *testing.T) {
 		_, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "ancient.example")
 		AssertEqual(t, authoritative, true)
 
-		expireCachedDohEntry(t, dohCache, testDnsRecordType(ipVersion), "ancient.example", dohStaleServeBound+1*time.Second)
+		expireCachedDohEntry(t, dohCache, testDnsRecordType(ipVersion), "ancient.example", dohCache.settings.StaleServeBound+1*time.Second)
 		failing.Store(true)
 
 		addrs, authoritative := dohCache.QueryResult(ctx, testDnsRecordType(ipVersion), "ancient.example")
@@ -1412,6 +1413,7 @@ func TestDohCacheStalePastBoundNotServed(t *testing.T) {
 // resolver failure into a stale "does not exist" would be the harmful direction).
 func TestDohStaleUsableBounds(t *testing.T) {
 	now := time.Now()
+	bound := DefaultDohSettings().StaleServeBound
 	addr := netip.MustParseAddr("203.0.113.45")
 
 	inside := &DohResult{
@@ -1419,19 +1421,19 @@ func TestDohStaleUsableBounds(t *testing.T) {
 		AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-1 * time.Second)},
 	}
 	AssertEqual(t, inside.Valid(now, 5*time.Minute), false)
-	AssertEqual(t, inside.staleUsable(now), true)
+	AssertEqual(t, inside.staleUsable(now, bound), true)
 
 	past := &DohResult{
 		Time:            now.Add(-1 * time.Hour),
-		AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-dohStaleServeBound - time.Second)},
+		AddrExpirations: map[netip.Addr]time.Time{addr: now.Add(-bound - time.Second)},
 	}
-	AssertEqual(t, past.staleUsable(now), false)
+	AssertEqual(t, past.staleUsable(now, bound), false)
 
 	miss := &DohResult{
 		Time: now.Add(-1 * time.Hour),
 		Miss: true,
 	}
-	AssertEqual(t, miss.staleUsable(now), false)
+	AssertEqual(t, miss.staleUsable(now, bound), false)
 }
 
 // TestDohStaleRetentionMemoryBound: retaining expired entries must not unbound the cache --
