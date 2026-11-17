@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -279,8 +280,59 @@ func TestBootstrapPlainDnsOnlyForBootstrapNames(t *testing.T) {
 	}
 }
 
+// Every DoH server black-holed and no ingress country (support inbox 8397,
+// urnetwork/windows#26; 7956): a control dial whose own deadline ends before
+// the encrypted fan-out would, as the platform websocket's 5s handshake ends
+// before the 15s DoH request timeout, still reaches the bootstrap plain dns
+// fallback inside that deadline and dials its answer. Before, the fan-out held
+// the dial's whole deadline, so the fallback never ran and every platform dial
+// ended in "context deadline exceeded" with no address tried.
+func TestInternalDohDialReachesBootstrapPlainDnsBeforeItsDeadline(t *testing.T) {
+	dohDialer := &controlDohTestDialer{}
+	dohSettings := controlDohTestDefaultSettings(dohDialer)
+	// the fan-out outlasts the dial's own deadline below
+	dohSettings.RequestTimeout = 6 * time.Second
+
+	settings := DefaultClientStrategySettings()
+	settings.InternalDohDomains = []string{"space.example"}
+	settings.DohSettings = dohSettings
+	strategy := NewClientStrategy(t.Context(), settings)
+	defer strategy.Close()
+
+	plainAnswer := netip.MustParseAddr("192.0.2.81")
+	plainDns := &bootstrapPlainDns{answer: net.IP(plainAnswer.AsSlice())}
+	strategy.internalDohResolver.getCache().bootstrapLookupIP = plainDns.lookupIP
+
+	dialedAddresses := make(chan string, 4)
+	dial := strategy.internalDohResolver.wrapDialContext(func(ctx context.Context, network string, address string) (net.Conn, error) {
+		dialedAddresses <- address
+		client, server := net.Pipe()
+		server.Close()
+		return client, nil
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	conn, err := dial(ctx, "tcp4", "connect.space.example:443")
+	if err != nil {
+		t.Fatalf("control dial = %v, expected the bootstrap plain dns answer inside the dial's deadline (plain dns queried %v)", err, plainDns.queried())
+	}
+	conn.Close()
+	if address := <-dialedAddresses; address != "192.0.2.81:443" {
+		t.Fatalf("dialed %s, expected the plain dns answer", address)
+	}
+	if names := plainDns.queried(); !slices.Equal(names, []string{"connect.space.example"}) {
+		t.Fatalf("plain dns queried %v, expected only the dialed name", names)
+	}
+	// the encrypted resolvers were asked first
+	if dohDialer.blackholedCount.Load() == 0 {
+		t.Fatal("no DoH server was dialed before plain dns")
+	}
+}
+
 // A DoH answer is final: a found record or an NXDOMAIN never reaches plain
-// dns.
+// dns, also for a caller whose deadline sets aside the fallback's share
+// (`DohSettings.BootstrapPlainDnsReserve`).
 func TestBootstrapPlainDnsNotQueriedWhenDohAnswers(t *testing.T) {
 	defaults := DefaultDnsResolverSettings()
 	defaultHosts := map[string]bool{}
@@ -292,22 +344,31 @@ func TestBootstrapPlainDnsNotQueriedWhenDohAnswers(t *testing.T) {
 		defaultHosts[addr.String()] = true
 	}
 	answer := netip.MustParseAddr("192.0.2.30")
-	for _, nxdomain := range []bool{false, true} {
-		transport := &bootstrapDohTransport{answer: answer, answerHosts: defaultHosts, nxdomain: nxdomain}
-		plainDns := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.99")}
-		cache := newBootstrapTestCache(t, "", transport, plainDns)
-		addrs, authoritative := cache.QueryResult(context.Background(), "A", "api.example.test")
-		if !authoritative {
-			t.Fatalf("nxdomain %t: not authoritative", nxdomain)
-		}
-		if !nxdomain && !slices.Equal(addrs, []netip.Addr{answer}) {
-			t.Fatalf("lookup = %v, expected %v", addrs, answer)
-		}
-		if nxdomain && len(addrs) != 0 {
-			t.Fatalf("nxdomain lookup = %v, expected none", addrs)
-		}
-		if names := plainDns.queried(); len(names) != 0 {
-			t.Fatalf("nxdomain %t: plain dns queried %v, expected never", nxdomain, names)
+	// no deadline, and one shorter than the DoH request timeout
+	for _, timeout := range []time.Duration{0, 3 * time.Second} {
+		for _, nxdomain := range []bool{false, true} {
+			transport := &bootstrapDohTransport{answer: answer, answerHosts: defaultHosts, nxdomain: nxdomain}
+			plainDns := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.99")}
+			cache := newBootstrapTestCache(t, "", transport, plainDns)
+			ctx := context.Background()
+			if 0 < timeout {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			addrs, authoritative := cache.QueryResult(ctx, "A", "api.example.test")
+			if !authoritative {
+				t.Fatalf("timeout %s, nxdomain %t: not authoritative", timeout, nxdomain)
+			}
+			if !nxdomain && !slices.Equal(addrs, []netip.Addr{answer}) {
+				t.Fatalf("timeout %s: lookup = %v, expected %v", timeout, addrs, answer)
+			}
+			if nxdomain && len(addrs) != 0 {
+				t.Fatalf("timeout %s: nxdomain lookup = %v, expected none", timeout, addrs)
+			}
+			if names := plainDns.queried(); len(names) != 0 {
+				t.Fatalf("timeout %s, nxdomain %t: plain dns queried %v, expected never", timeout, nxdomain, names)
+			}
 		}
 	}
 }
