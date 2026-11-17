@@ -5857,3 +5857,57 @@ and every retry was a full tls 1.3 handshake that verified the operator's P-384 
   - A tls front, standing in for the lb, sees a full handshake and then a resumption.
   - A node with a dialer still listens.
   - A node without one is unchanged.
+
+## Design note: one extender stack per miner process (connect#227, 2026-11-17)
+
+A miner ran one network space per proxy slot, and each space built a whole
+extender stack: a directory, a network client with its sample, hello, hint and
+probe loops, a gossip node, and the release, camouflage, block and seed parts. At
+1000 slots that was 54-62% of the process's CPU, and most of its 19-31% in GC. Every
+slot also read and wrote one `.provider.extender.key`, so every node presented one
+peer id. Owner's decision, 2026-11-17: one stack per miner process, and one key per
+gossip node.
+
+- **The stack.** The run's extender slot (sn `providerExtenderSlot`) hosts it: its
+  space is built as before (sdk `NewNetworkSpaceWithUrls`), through that slot's own
+  proxy, and the run owns it, so the stack serves every slot until all of them have
+  joined. Every other slot's space is built on it (sdk
+  `NewNetworkSpaceWithUrlsOnExtenderHost`). Such a space runs none of the stack:
+  - its strategy draws extenders from the host's directory;
+  - its device presents no extender identity, attests no probes and runs no role;
+  - it has no webrtc carrier, since the carrier and its signaling are the host's.
+
+  A space with no host, a closed one, or one for another network runs its own stack.
+  Nothing changes for apps and for every other embedder, which build no space on a
+  host.
+- **Reading a shared directory** (`ClientStrategySettings.ExtenderDirectoryReadOnly`,
+  `net_extender_strategy_evidence.go`). The slots dial along different paths, each
+  through its own proxy. A slot whose proxy is down would report every extender it
+  tried as failed, and so hold it for every slot and for the host's own network
+  client and mesh. So a reading strategy writes none of its dial outcomes into the
+  directory:
+  - it honors the holds and limits the owner's dials set;
+  - it holds an address it failed to reach for itself, on the directory's doubling
+    hold schedule and clock, bounded by the directory's address cap and cleared by a
+    success;
+  - its 429 limits stay on its dialers;
+  - the live connections it carries still count as in use, which is a fact of the
+    process.
+- **The node's dial.** The host's node dials through the host slot's proxy, as the
+  node's supplied dialer note above describes (sdk `spaceExtenderNodeSettings`).
+- **Identity** (sn `providerExtenderKeyFileName`). Each gossip node keeps its key in
+  `.provider.extender.<client id>.key`. The first node that finds its own file missing
+  adopts an install's `.provider.extender.key` by renaming it to its own name:
+  - an install that ran one node keeps its peer id and its extender record;
+  - the rename is the claim, so no other node, in this process or another on the
+    same state directory, can take that key, and a node that finds neither file
+    starts on a new one;
+  - sn's legacy key adoption keeps counting either name as an extender side file.
+- **Not changed.** The sn swarm (`ProviderSwarm`) still runs a stack per member.
+  Its members each bind a source address of their own, and none runs the extender
+  role.
+- **Tests.**
+  - connect: `net_extender_strategy_read_only_test.go`.
+  - sdk: `network_space_extender_host_test.go` and `extender_node_dial_test.go`.
+  - sn: `miner/provider_extender_stack_test.go`, which counts the run's directory loops
+    and status watches; three slots ran three before.
