@@ -82,6 +82,16 @@ type ClientKeyManager struct {
 	registrationUpdates *MonitorValue[clientKeyRegistrationGeneration]
 	registrationReady   *MonitorValue[bool]
 
+	// The native publication of a client that requires no processed
+	// registration (Published). Each key the manager holds is a generation,
+	// the constructor's 1 and each rotation the next. The acknowledgment of the
+	// ClientKey control that carried a generation sets `published` while that
+	// generation is still current, and a rotation clears it, so an
+	// acknowledgment of a replaced key, or of the first key of an a-b-a
+	// rotation, records nothing. Guarded by stateLock.
+	publicationGeneration uint64
+	published             *MonitorValue[bool]
+
 	stateLock sync.RWMutex
 	closed    bool
 	workers   *lifecycleAdmission
@@ -156,6 +166,9 @@ func NewClientKeyManager(ctx context.Context, client *Client) (*ClientKeyManager
 		workers:     newLifecycleAdmission(),
 
 		skipPublication: skipPublication,
+
+		publicationGeneration: 1,
+		published:             NewMonitorValue(false),
 	}
 	if client.settings.ContractManagerSettings != nil {
 		m.historyDomainHash = client.settings.ContractManagerSettings.CloseReportDomainHash
@@ -266,6 +279,9 @@ func (self *ClientKeyManager) SetSeed(seed []byte) error {
 	}
 	self.privateKey = privateKey
 	self.publicKey = publicKey
+	// the platform holds the old key until the new one is acknowledged
+	self.publicationGeneration += 1
+	self.published.Set(false)
 	self.stateLock.Unlock()
 	return nil
 }
@@ -397,12 +413,78 @@ func (self *ClientKeyManager) publishClientKey() {
 	if self.skipPublication {
 		return
 	}
-	frame, err := ToFrame(self.clientKeyMessage(self.PublicKey()), self.client.settings.ProtocolVersion)
+	// the key and its generation are read together, so the acknowledgment is
+	// recorded against the key this frame carries
+	publicKey, generation := func() (ed25519.PublicKey, uint64) {
+		self.stateLock.RLock()
+		defer self.stateLock.RUnlock()
+		return self.publicKey, self.publicationGeneration
+	}()
+	frame, err := ToFrame(self.clientKeyMessage(publicKey), self.client.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Errorf("[key]%s could not build ClientKey frame: %s\n", self.client.ClientTag(), err)
 		return
 	}
-	self.controlSync.Send(frame, nil, nil)
+	self.controlSync.Send(frame, nil, func(err error) {
+		if err == nil {
+			self.publicationAcknowledged(generation)
+		}
+	})
+}
+
+// Records the platform's acknowledgment of the ClientKey control that carried
+// one generation of the key. A generation a rotation has replaced records
+// nothing.
+func (self *ClientKeyManager) publicationAcknowledged(generation uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed || generation != self.publicationGeneration {
+		return
+	}
+	self.published.Set(true)
+}
+
+// Published reports whether the platform holds the current public key: its
+// processed registration where the client requires one (Registered), and
+// otherwise the platform's acknowledgment of the ClientKey control that
+// published it. After a rotation it reads false until the new key is
+// acknowledged in turn. A skipped publication never reads true, and neither
+// does a closed manager.
+func (self *ClientKeyManager) Published() bool {
+	if self.registrationReady != nil {
+		return self.Registered()
+	}
+	self.stateLock.RLock()
+	defer self.stateLock.RUnlock()
+	return !self.closed && self.ctx.Err() == nil && self.published.Value()
+}
+
+// Waits until Published reads true, with caller and manager cancellation. A
+// later rotation clears it again, so callers still read their live state
+// before relying on it.
+func (self *ClientKeyManager) WaitForPublication(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("client key publication wait has no context")
+	}
+	if self.registrationReady != nil {
+		return self.WaitForRegistration(ctx)
+	}
+	for {
+		published, changed := self.published.Get()
+		if err := errors.Join(ctx.Err(), self.ctx.Err()); err != nil {
+			return err
+		}
+		if published && self.Published() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-self.ctx.Done():
+			return self.ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // Native and processed Http publication share one immutable domain. The zero
