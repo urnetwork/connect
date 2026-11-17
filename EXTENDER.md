@@ -989,7 +989,10 @@ from the extender's ed25519 key. Listen exists only on
 extenders: a listener fed by the extender's gossip accept channel (A8),
 advertising `/ip4|ip6/<public ip>/tcp/443` per activated family. Apps have
 no listener. The operator is dialed at `/dns/gossip.<host>/tcp/443/wss/p2p/<id>` by
-the websocket transport (`/dns`, so a v6-only host resolves it too).
+the websocket transport (`/dns`, so a v6-only host resolves it too). A node
+whose owner supplies a dialer (`NodeSettings.DialContext`) makes every
+connection through it instead, the operator link and the carrier alike; see
+the design note on the node's supplied dialer (2026-11-17).
 
 D3. Peering. Every node keeps a connection to the operator and to up to N
 random active extenders from the directory, N 8 for members and 16 for
@@ -5794,3 +5797,63 @@ Two corrections to the block report note above, which this adds to.
   through `extenderErrorText`, which takes every ip literal out by parsing it, and the
   feed and probe lines no longer name the candidate. Lines behind a verbosity someone
   opted into still do. Tests: `net_extender_network_log_test.go`.
+
+## Design note: the node's supplied dialer and operator tls resumption (connect#227, 2026-11-17)
+
+A miner runs one network space per SOCKS5 proxy slot, and each space runs a gossip
+node. go-libp2p's websocket transport takes no dialer: it resolves `gossip.<host>`
+with the host's resolver and dials it with `net.DialTCP`. So every slot's operator
+link left from the host's own address, outside the slot's proxy, which 8395's
+constraint forbids. At 1000 slots those links were refused after tls and retried,
+and every retry was a full tls 1.3 handshake that verified the operator's P-384 chain.
+
+- **API** (`connect/gossip`, `NodeSettings`):
+  - `DialContext connect.DialContextFunction`. When set, every connection of the
+    node goes through it: the operator link's tcp, tls and websocket upgrade
+    (`transport_websocket.go`), and every extender carrier dial. The swarm hands the
+    operator's address over unresolved (`SkipResolve`), so the dialer gets
+    `tcp gossip.<host>:443` and a socks proxy resolves the name on its own side. The
+    carrier gets a copy of `ConnectSettings` with
+    `DialContextSettings{DialContext: dialer}`, which `ConnectSettings.DialContext`
+    takes ahead of its own proxy. Listening stays with libp2p's transport. Nil, the
+    default, is the node exactly as before.
+  - `TlsSessionCache tls.ClientSessionCache`: the operator link's session cache when
+    `DialContext` is set. Nil takes the process's shared cache.
+  - With a dialer, the operator's tls verifies against `ConnectSettings.TlsConfig`:
+    the pinned roots, plus `URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE` where set. The
+    server name is the address's sni or dns name, and the alpn is http/1.1.
+- **Session cache** (`tls_session_cache.go`). One per process, by the owner's
+  decision, bounded at 16 servers and 64 sessions per server. Each session is handed
+  out once (RFC 8446 C.4). The slots leave through different proxies, and a ticket
+  presented twice would let anyone who sees both connections link those proxies. The
+  operator, which issued the ticket, can link them either way.
+- **Server side.** The warp lb's nginx terminates the operator's tls:
+  `ssl_session_cache shared:SSL:10m`, `ssl_session_timeout 10m`,
+  `ssl_session_tickets off`, tls 1.2 and 1.3, no early data. With tickets off, OpenSSL
+  issues tls 1.3 stateful tickets backed by that cache. A probe from a developer Mac
+  to `gossip.bringyour.com` on 2026-11-17 found:
+  - tls 1.3, with two tickets after a full handshake and one after a resumption;
+  - the second dial resumed, and a ticket presented twice resumed too, since a
+    session stays usable for the 10 minute timeout;
+  - the pinned roots verify the chain.
+
+  The cache is per lb host, so a dial that lands on another host does a full
+  handshake.
+- **Resumption by platform.** On linux, where the miners run, a resumption checks no
+  chain. On darwin, windows and ios, crypto/tls re-verifies the cached chain on
+  resumption, so there it saves the certificate exchange but not the verification.
+- **The sdk's part** (not built here). In `newSpaceExtenderNodeWithRole`
+  (`sdk/extender_node_native.go`), a space whose `ClientStrategySettings.ConnectSettings`
+  routes through a proxy (`ProxySettings` or `DialContextSettings` set) passes
+  `settings.DialContext = clientStrategySettings.ConnectSettings.DialContext`. Other
+  spaces leave it nil and keep today's behaviour. sn's miner already gives each slot's
+  space its `ProxySettings`.
+- **Tests:** `gossip/node_dialer_test.go`, `gossip/tls_session_cache_test.go` and
+  `gossip/transport_websocket_test.go`.
+  - A canary listener stands at the address the node is told, and another stands on
+    `ConnectSettings`' own route; neither sees a connection, the dialer gets the name
+    unresolved, and every connection the operator accepts came from a socket the
+    dialer made, redials included.
+  - A tls front, standing in for the lb, sees a full handshake and then a resumption.
+  - A node with a dialer still listens.
+  - A node without one is unchanged.
