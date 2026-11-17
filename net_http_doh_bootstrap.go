@@ -6,22 +6,23 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 // The bootstrap plain dns fallback of the control-name lookups (support inbox
 // 7956, 7957, 7973): when every encrypted resolver fails, the space's own
 // names (and only those) resolve over plain dns.
 //
+// On a network that black-holes the DoH servers, a request to one fails only
+// at its deadline, so the fallback runs inside the caller's own deadline only
+// because the encrypted resolvers leave it a share
+// (`DohSettings.BootstrapPlainDnsReserve`, support inbox 8397). Its answer is
+// held for `DohSettings.BootstrapPlainDnsExpiration`.
+//
 // On a censored network a poisoned plain answer gains nothing: the dial
 // that follows still verifies the platform's TLS certificate against the
 // original hostname, so a forged address fails the handshake. The fallback
 // mainly helps networks whose dns is broken (DoH blocked by a captive or
 // misconfigured network) rather than censored.
-
-// A plain dns answer of the bootstrap fallback is held at most this long, so
-// DoH is asked again soon.
-const bootstrapPlainDnsExpiration = 60 * time.Second
 
 // Whether the name is one of `DohSettings.BootstrapPlainDnsDomains` or under
 // one.

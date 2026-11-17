@@ -98,6 +98,11 @@ func DefaultDohSettings() *DohSettings {
 		LoneMissExpiration: 30 * time.Second,
 		LocalExpiration:    300 * time.Second,
 		MinCacheTtl:        30 * time.Second,
+		// room for one plain udp query round, at the end of a deadline as
+		// short as the platform websocket's 5s, while DoH keeps the larger part
+		BootstrapPlainDnsReserve: 2 * time.Second,
+		// a bootstrap name's plain answer is asked of DoH again within a minute
+		BootstrapPlainDnsExpiration: 60 * time.Second,
 		// per doh cache, so scaled by the memory budget
 		CacheMaxEntries:           MemoryScaledCount(4096, 512),
 		MaxConcurrentResolutions:  64,
@@ -411,6 +416,19 @@ type DohSettings struct {
 	// other name ever takes it. Only the control-name resolver
 	// (`internalDohSettings`) sets these.
 	BootstrapPlainDnsDomains []string
+	// The part of a lookup's own deadline the bootstrap plain dns fallback
+	// keeps: the encrypted resolvers of a bootstrap name stop this long before
+	// the caller's deadline, and at most half of what it has left. A caller
+	// whose deadline ends before RequestTimeout (the platform websocket's 5s
+	// HandshakeTimeout against 15s) otherwise spends all of it on DoH servers a
+	// network black-holes and never reaches the fallback (support inbox 8397).
+	// A caller with no deadline keeps RequestTimeout for them, as does every
+	// other name. Zero or negative leaves them the caller's whole deadline.
+	BootstrapPlainDnsReserve time.Duration
+	// How long a plain dns answer of the bootstrap fallback is held at most,
+	// so DoH is asked again soon; LocalExpiration bounds it too. Zero or
+	// negative holds it for LocalExpiration.
+	BootstrapPlainDnsExpiration time.Duration
 	// DohServerResolvedCallback, when set, is called after a doh server name
 	// (the hostname of a remote doh url) resolves, with the resolved
 	// addresses. the upgrade mux records these into its ip→hostname reverse
@@ -1919,8 +1937,22 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	// remains disabled for every other name.
 	dohServerName := self.dohServerNames[q.Domain]
 
+	// the resolvers ahead of the bootstrap plain dns fallback leave it a share
+	// of the caller's own deadline (DohSettings.BootstrapPlainDnsReserve).
+	// Every other name, and a caller with no deadline, give them all of it.
+	resolverCtx := ctx
+	if 0 < self.settings.BootstrapPlainDnsReserve && bootstrapPlainDnsName(self.settings, q.Domain) {
+		if deadline, ok := ctx.Deadline(); ok {
+			if reserve := min(self.settings.BootstrapPlainDnsReserve, time.Until(deadline)/2); 0 < reserve {
+				var resolverCancel context.CancelFunc
+				resolverCtx, resolverCancel = context.WithDeadline(ctx, deadline.Add(-reserve))
+				defer resolverCancel()
+			}
+		}
+	}
+
 	if !dohServerName && self.settings.DnsResolverSettings.EnableRemoteDoh {
-		queryResult := self.remoteClient.queryResult(ctx, remoteDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
+		queryResult := self.remoteClient.queryResult(resolverCtx, remoteDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
@@ -1947,7 +1979,7 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	}
 
 	if len(addrExpirations) == 0 && !dohServerName && self.settings.DnsResolverSettings.EnableLocalDoh {
-		queryResult := self.localClient.queryResult(ctx, localDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
+		queryResult := self.localClient.queryResult(resolverCtx, localDohUrls(self.settings, self.settings.IpVersion), q.RecordType, self.settings, q.Domain)
 
 		for addr, ttlSeconds := range queryResult.AddrTtls {
 			addrExpirations[addr] = now.Add(max(time.Duration(ttlSeconds)*time.Second, minCacheTtl))
@@ -1963,9 +1995,9 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	lookupNetwork, lookupFamilyEnabled := dnsLookupNetwork(q.RecordType, self.settings.IpVersion)
 
 	if len(addrExpirations) == 0 && lookupFamilyEnabled && (dohServerName || self.settings.DnsResolverSettings.EnableRemoteDns) &&
-		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		self.settings.MemoryTarget.Acquire(resolverCtx, dnsLookupReserveByteCount) {
 		// try the remote resolver
-		resolvedIps, err := self.remoteResolver.LookupIP(ctx, lookupNetwork, q.Domain)
+		resolvedIps, err := self.remoteResolver.LookupIP(resolverCtx, lookupNetwork, q.Domain)
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
@@ -1988,9 +2020,9 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	}
 
 	if len(addrExpirations) == 0 && lookupFamilyEnabled && self.settings.DnsResolverSettings.EnableLocalDns &&
-		self.settings.MemoryTarget.Acquire(ctx, dnsLookupReserveByteCount) {
+		self.settings.MemoryTarget.Acquire(resolverCtx, dnsLookupReserveByteCount) {
 		// try the local resolver
-		resolvedIps, err := self.localResolver.LookupIP(ctx, lookupNetwork, q.Domain)
+		resolvedIps, err := self.localResolver.LookupIP(resolverCtx, lookupNetwork, q.Domain)
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
 			found := false
@@ -2021,9 +2053,13 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 		resolvedIps, err := self.bootstrapLookupIP(ctx, lookupNetwork, q.Domain)
 		self.settings.MemoryTarget.Release(dnsLookupReserveByteCount)
 		if err == nil {
+			bootstrapExpiration := self.settings.LocalExpiration
+			if 0 < self.settings.BootstrapPlainDnsExpiration {
+				bootstrapExpiration = min(bootstrapExpiration, self.settings.BootstrapPlainDnsExpiration)
+			}
 			for _, ip := range resolvedIps {
 				if addr, ok := netIPAddr(ip); ok {
-					addrExpirations[addr] = now.Add(min(self.settings.LocalExpiration, bootstrapPlainDnsExpiration))
+					addrExpirations[addr] = now.Add(bootstrapExpiration)
 				}
 			}
 			if 0 < len(addrExpirations) {
