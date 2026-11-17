@@ -111,6 +111,8 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 	// return to the same receive without falling through into construction.
 	staleDemandCleanups := 0
 	endedRefreshCleanups := 0
+	retiredProfileReceiptCleanups := 0
+	retiredProfileBuildCleanups := 0
 	ast.Inspect(function.Body, func(node ast.Node) bool {
 		receive, ok := node.(*ast.CommClause)
 		if !ok {
@@ -157,6 +159,62 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 				endedRefreshCleanups++
 				continue
 			}
+			// Args listed under another profile generation than the pass's,
+			// or received by a pass whose generation the window retired:
+			// minted credentials or an inert fixed offer, neither of which
+			// reached construction. Only the minted one is retired, and the
+			// same receive waits for the next candidate.
+			if formatAstExpr(t, fileSet, guard.Cond) == "args.profileGeneration != passProfileGeneration || passProfileRetired()" {
+				if guard.Init != nil {
+					continue
+				}
+				unowned, ok := guard.Body.List[0].(*ast.IfStmt)
+				if !ok || unowned.Init != nil || unowned.Else != nil || len(unowned.Body.List) != 1 ||
+					formatAstExpr(t, fileSet, unowned.Cond) != "!args.deferredClientArgs" {
+					continue
+				}
+				retry, ok := guard.Body.List[1].(*ast.BranchStmt)
+				if !ok || retry.Tok != token.GOTO || retry.Label == nil || retry.Label.Name != "awaitCandidate" {
+					continue
+				}
+				expression, ok := unowned.Body.List[0].(*ast.ExprStmt)
+				if !ok {
+					continue
+				}
+				call, ok := expression.X.(*ast.CallExpr)
+				if !ok || formatAstExpr(t, fileSet, call.Fun) != "self.generator.RemoveClientArgs" ||
+					len(call.Args) != 1 || formatAstExpr(t, fileSet, call.Args[0]) != "&args.MultiClientGeneratorClientArgs" {
+					continue
+				}
+				allowed[call.Pos()] = true
+				retiredProfileReceiptCleanups++
+				continue
+			}
+			// The window retired the pass's profile generation between the
+			// receipt and the construction, a fixed destination's mint
+			// included: minted credentials no channel owns. The pass ends
+			// with their retirement.
+			if formatAstExpr(t, fileSet, guard.Cond) == "profileGeneration != passProfileGeneration" {
+				if guard.Init != nil {
+					continue
+				}
+				expression, ok := guard.Body.List[0].(*ast.ExprStmt)
+				if !ok {
+					continue
+				}
+				call, ok := expression.X.(*ast.CallExpr)
+				if !ok || formatAstExpr(t, fileSet, call.Fun) != "self.generator.RemoveClientArgs" ||
+					len(call.Args) != 1 || formatAstExpr(t, fileSet, call.Args[0]) != "&args.MultiClientGeneratorClientArgs" {
+					continue
+				}
+				terminal, ok := guard.Body.List[1].(*ast.ReturnStmt)
+				if !ok || len(terminal.Results) != 0 {
+					continue
+				}
+				allowed[call.Pos()] = true
+				retiredProfileBuildCleanups++
+				continue
+			}
 			if formatAstExpr(t, fileSet, guard.Cond) != "!self.acceptDiscoveryDemandArgs(evaluationOwner, args)" {
 				continue
 			}
@@ -183,6 +241,12 @@ func expandArgsCleanupViolations(t *testing.T, body string) []string {
 	}
 	if endedRefreshCleanups != 1 {
 		violations = append(violations, fmt.Sprintf("expand has %d guarded ended refresh cleanups, want 1", endedRefreshCleanups))
+	}
+	if retiredProfileReceiptCleanups != 1 {
+		violations = append(violations, fmt.Sprintf("expand has %d guarded retired profile receipt cleanups, want 1", retiredProfileReceiptCleanups))
+	}
+	if retiredProfileBuildCleanups != 1 {
+		violations = append(violations, fmt.Sprintf("expand has %d guarded retired profile build cleanups, want 1", retiredProfileBuildCleanups))
 	}
 	for _, call := range removals {
 		if !allowed[call.Pos()] {
