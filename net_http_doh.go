@@ -1109,6 +1109,27 @@ func (self *DohCache) queryResult(ctx context.Context, q DohKey) (addrs []netip.
 // addresses. It follows the cache's configured path order (remote/tunnel DoH,
 // then local DoH) and is not cached—the client stub caches by record TTL.
 func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain string) (response []byte, usable bool) {
+	return self.forward(ctx, qType, domain, false)
+}
+
+// ForwardDnssec is Forward with EDNS0's DO bit set on the query (RFC 3225), so
+// a security-aware server answers with the RRSIGs it holds for the answer and
+// the NSEC or NSEC3 records of a denial. The response is the raw wire, which
+// the caller validates itself against its own trust anchors: nothing here
+// checks a signature or trusts the AD bit. domain has no final dot, and "."
+// asks the root. A response is usable only when it answers the question asked,
+// is not truncated, echoes the DO bit in its one OPT record (a server that
+// dropped the bit holds no signatures for the caller, so the next server is
+// tried) and carries an extended RCODE of NOERROR or NXDOMAIN. The OPT record
+// advertises the response read cap as its payload size, which DoH servers
+// ignore (RFC 8484 §6). Paths, hedging and admission are Forward's, and nothing
+// is cached. A client that never calls it sends no OPT record at all.
+func (self *DohCache) ForwardDnssec(ctx context.Context, qType dnsmessage.Type, domain string) (response []byte, usable bool) {
+	return self.forward(ctx, qType, domain, true)
+}
+
+// forward is Forward, and ForwardDnssec when dnssecOk is set.
+func (self *DohCache) forward(ctx context.Context, qType dnsmessage.Type, domain string, dnssecOk bool) (response []byte, usable bool) {
 	callerCtx := ctx
 	ctx, observation := newDohResolverObservation(ctx, dohRemoteDialPath(self.settings), dohScopeForward)
 	defer func() {
@@ -1141,6 +1162,7 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 			qType,
 			self.settings,
 			domain,
+			dnssecOk,
 		); ok {
 			return response, true
 		}
@@ -1152,6 +1174,7 @@ func (self *DohCache) Forward(ctx context.Context, qType dnsmessage.Type, domain
 			qType,
 			self.settings,
 			domain,
+			dnssecOk,
 		)
 	}
 	return nil, false
@@ -1945,17 +1968,18 @@ func (self *dohClient) queryWireDetailed(ctx context.Context, dohUrl string, rec
 // response wire, without parsing it. Used to forward record types the cache handles
 // opaquely (SVCB/HTTPS) — preserving the exact record for the client — where queryWire
 // parses A/AAAA into addresses. Like queryWire, the caller holds an httpSem slot for the
-// lifetime of this request.
-func (self *dohClient) queryWireRaw(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, bool) {
-	data, err := self.queryWireRawDetailed(ctx, dohUrl, qType, name)
+// lifetime of this request. additionals go in the query's additional section, which only
+// ForwardDnssec fills (its OPT record).
+func (self *dohClient) queryWireRaw(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string, additionals ...dnsmessage.Resource) ([]byte, bool) {
+	data, err := self.queryWireRawDetailed(ctx, dohUrl, qType, name, additionals...)
 	return data, err == nil
 }
 
 // queryWireRawDetailed returns stage-specific errors without exposing the
 // encoded DNS question. Maintenance logs therefore identify the failed DoH
 // server and transport stage while preserving the queried hostname.
-func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, error) {
-	data, _, err := self.queryWireRawDetailedWithRoute(ctx, dohUrl, qType, name)
+func (self *dohClient) queryWireRawDetailed(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string, additionals ...dnsmessage.Resource) ([]byte, error) {
+	data, _, err := self.queryWireRawDetailedWithRoute(ctx, dohUrl, qType, name, additionals...)
 	return data, err
 }
 
@@ -2002,8 +2026,9 @@ func dohRouteForConn(conn net.Conn) *DohRoute {
 
 // queryWireRawDetailedWithRoute is the route-observing form used for parsed
 // A/AAAA answers. The compatibility wrapper above keeps raw forwarders and
-// maintenance probes on their existing signature.
-func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string) ([]byte, *DohRoute, error) {
+// maintenance probes on their existing signature. additionals are
+// queryWireRaw's, and none leaves the query as it always was.
+func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl string, qType dnsmessage.Type, name string, additionals ...dnsmessage.Resource) ([]byte, *DohRoute, error) {
 	if self.lifecycle != nil {
 		linkedCtx, done, ok := self.lifecycle.context(ctx)
 		if !ok {
@@ -2017,10 +2042,13 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 	if err != nil {
 		return nil, nil, fmt.Errorf("build name: %w", err)
 	}
-	// id 0 is recommended for DoH (RFC 8484 §4.1); recursion desired
+	// id 0 is recommended for DoH (RFC 8484 §4.1); recursion desired. Packing
+	// writes each resource's header, so the message holds its own copy of the
+	// additionals, which concurrent requests of one forward share.
 	msg := dnsmessage.Message{
-		Header:    dnsmessage.Header{RecursionDesired: true},
-		Questions: []dnsmessage.Question{{Name: dnsName, Type: qType, Class: dnsmessage.ClassINET}},
+		Header:      dnsmessage.Header{RecursionDesired: true},
+		Questions:   []dnsmessage.Question{{Name: dnsName, Type: qType, Class: dnsmessage.ClassINET}},
+		Additionals: slices.Clone(additionals),
 	}
 	wire, err := msg.Pack()
 	if err != nil {
@@ -2072,13 +2100,32 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 // important for browsers: Chromium commonly waits for HTTPS before opening an
 // origin, so serially waiting for one slow DoH server multiplied its delay
 // across an entire parallel first-load fan-out.
-func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType dnsmessage.Type, settings *DohSettings, domain string) ([]byte, bool) {
+//
+// dnssecOk makes it ForwardDnssec's: the query carries an OPT record with the
+// DO bit, "." names the root, and the fastest response dnssecResponseUsable
+// accepts wins. Server stats still record whether a response was usable as
+// Forward's, so a server that answers without signatures keeps its standing
+// for every other query.
+func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType dnsmessage.Type, settings *DohSettings, domain string, dnssecOk bool) ([]byte, bool) {
 	if len(dohUrls) == 0 || settings.RequestTimeout <= 0 {
 		return nil, false
 	}
-	name, err := Punycode(domain)
-	if err != nil {
-		return nil, false
+	// "." punycodes to itself, which the query's final dot would make an empty
+	// label, so ForwardDnssec asks the root as the empty name
+	name := ""
+	if !dnssecOk || domain != "." {
+		var err error
+		if name, err = Punycode(domain); err != nil {
+			return nil, false
+		}
+	}
+	var additionals []dnsmessage.Resource
+	if dnssecOk {
+		var optHeader dnsmessage.ResourceHeader
+		if err := optHeader.SetEDNS0(int(min(maxDohResponseBytes, math.MaxUint16)), dnsmessage.RCodeSuccess, true); err != nil {
+			return nil, false
+		}
+		additionals = []dnsmessage.Resource{{Header: optHeader, Body: &dnsmessage.OPTResource{}}}
 	}
 
 	activeQueryCount, endQuery := self.beginQuery()
@@ -2171,9 +2218,12 @@ func (self *dohClient) forwardRaw(ctx context.Context, dohUrls []string, qType d
 					if primaryAcquired {
 						defer func() { <-self.primarySem }()
 					}
-					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name)
+					data, ok := self.queryWireRaw(queryCtx, dohUrl, qType, name, additionals...)
 					usable := ok && dnsResponseUsable(data)
 					self.stats.record(dohUrl, usable)
+					if dnssecOk {
+						usable = ok && dnssecResponseUsable(data, qType, name)
+					}
 					select {
 					case results <- rawResult{data: data, usable: usable}:
 					case <-queryCtx.Done():
@@ -2208,6 +2258,82 @@ func dnsResponseUsable(response []byte) bool {
 	// header flags are bytes 2-3; RCODE is the low 4 bits of byte 3
 	switch response[3] & 0x0f {
 	case 0, 3: // NOERROR, NXDOMAIN
+		return true
+	default:
+		return false
+	}
+}
+
+// dnssecResponseUsable reports whether a raw response answers ForwardDnssec's
+// query for (qType, name), name being the punycoded question without its
+// final dot and empty for the root. The whole message must parse, so a
+// response cut at the read cap fails. It must be a response, not truncated,
+// to that one question (the name compared without regard to ASCII case), and
+// carry exactly one OPT record (RFC 6891 §6.1.1) whose DO bit is set (RFC
+// 3225 §3), with an extended RCODE (RFC 6891 §6.1.3) of NOERROR or NXDOMAIN.
+// It checks no signature: the caller validates the answer.
+func dnssecResponseUsable(response []byte, qType dnsmessage.Type, name string) bool {
+	var parser dnsmessage.Parser
+	header, err := parser.Start(response)
+	if err != nil || !header.Response || header.Truncated {
+		return false
+	}
+	questions, err := parser.AllQuestions()
+	if err != nil || len(questions) != 1 {
+		return false
+	}
+	question := questions[0]
+	if question.Type != qType || question.Class != dnsmessage.ClassINET {
+		return false
+	}
+	questionName := question.Name.String()
+	wantName := name + "."
+	if len(questionName) != len(wantName) {
+		return false
+	}
+	for i := range len(wantName) {
+		// ASCII case only: a fold such as unicode's would match bytes the
+		// question never held
+		questionByte, wantByte := questionName[i], wantName[i]
+		if 'A' <= questionByte && questionByte <= 'Z' {
+			questionByte += 'a' - 'A'
+		}
+		if 'A' <= wantByte && wantByte <= 'Z' {
+			wantByte += 'a' - 'A'
+		}
+		if questionByte != wantByte {
+			return false
+		}
+	}
+	if err := parser.SkipAllAnswers(); err != nil {
+		return false
+	}
+	if err := parser.SkipAllAuthorities(); err != nil {
+		return false
+	}
+	optCount := 0
+	var opt dnsmessage.ResourceHeader
+	for {
+		additional, err := parser.AdditionalHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return false
+		}
+		if additional.Type == dnsmessage.TypeOPT {
+			optCount += 1
+			opt = additional
+		}
+		if err := parser.SkipAdditional(); err != nil {
+			return false
+		}
+	}
+	if optCount != 1 || !opt.DNSSECAllowed() {
+		return false
+	}
+	switch opt.ExtendedRCode(header.RCode) {
+	case dnsmessage.RCodeSuccess, dnsmessage.RCodeNameError:
 		return true
 	default:
 		return false
