@@ -1,14 +1,19 @@
 package extender
 
 // The drift test's tickets on the measurement API (lag.dev/DRIFTTEST.md E3,
-// T1): latency alone.
+// E4, T1): latency alone, a report posted at once, and the demo's no report.
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
 )
 
@@ -122,4 +127,131 @@ func TestLagApiLatencyOnlyTicketRefusesLoad(t *testing.T) {
 		t.Errorf("window %d session %d pings %d", body.WindowStartTimeMs, body.SessionStartTimeMs, len(body.PingMicros))
 	}
 	fixture.noReport(100 * time.Millisecond)
+}
+
+// lag.dev/DRIFTTEST.md E4, T1, from the ticket to the operator through the
+// lifecycle's queue on the test clock. The report of a session whose ticket
+// says ReportPromptly is posted as soon as the session closes, with no wait
+// for its batch. A demo's session, whose ticket says NoReport, signs and posts
+// nothing. A session whose ticket says neither, as every ticket reads to an
+// extender that predates the flags, waits for its batch as before.
+func TestLagApiDriftTicketReports(t *testing.T) {
+	clock := newTestLagClock()
+	operator := newTestLagApi(t)
+	lifecycle := newTestLagLifecycle(t, operator, clock, nil, nil)
+	fixture := newLagApiFixture(t, nil)
+	// the lifecycle's queue in place of the sink, before any session opens
+	fixture.api.reports = lifecycle
+
+	// the tickets of the reports in the operator's next post, each report
+	// verified as this extender's
+	postedTicketIds := func() [][]byte {
+		t.Helper()
+		ticketIds := [][]byte{}
+		for _, postedReport := range operator.waitPost() {
+			reportBytes, err := base64.StdEncoding.DecodeString(postedReport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := &protocol.LagReport{}
+			if err := proto.Unmarshal(reportBytes, report); err != nil {
+				t.Fatal(err)
+			}
+			body, err := connect.VerifyLagReport(report, fixture.identityPublicKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ticketIds = append(ticketIds, body.TicketId)
+		}
+		return ticketIds
+	}
+	driftTicket := func(ticketId []byte, configure func(body *protocol.LagTicketBody)) string {
+		return fixture.ticket(func(body *protocol.LagTicketBody) {
+			body.TicketId = ticketId
+			testLagLatencyOnly(body)
+			configure(body)
+		})
+	}
+
+	demoTicketId := testLagRandomBytes(16)
+	demo := fixture.openHelloSession(driftTicket(demoTicketId, func(body *protocol.LagTicketBody) {
+		body.NoReport = true
+	}))
+	promptTicketId := testLagRandomBytes(16)
+	prompt := fixture.openHelloSession(driftTicket(promptTicketId, func(body *protocol.LagTicketBody) {
+		body.ReportPromptly = true
+	}))
+	for _, session := range []*lagTestSession{demo, prompt} {
+		if rtts := session.rttsFor(600 * time.Millisecond); len(rtts) < 2 {
+			t.Fatalf("%d rtts", len(rtts))
+		}
+	}
+
+	// the demo's session is gone, report and all, before the prompt one
+	// closes, so a report of the demo's would be queued first and posted with
+	// the prompt one
+	demo.close()
+	waitFor(t, func() bool {
+		return fixture.api.sessionCountNow() == 1
+	})
+	prompt.close()
+	if ticketIds := postedTicketIds(); len(ticketIds) != 1 || !bytes.Equal(ticketIds[0], promptTicketId) {
+		t.Fatalf("posted %x, expected the prompt session's report alone", ticketIds)
+	}
+	operator.expectQuiet()
+
+	plainTicketId := testLagRandomBytes(16)
+	plain := fixture.openHelloSession(driftTicket(plainTicketId, func(body *protocol.LagTicketBody) {}))
+	plain.rttsFor(600 * time.Millisecond)
+	plain.close()
+	if wait := clock.nextWait(t); wait != 10*time.Second {
+		t.Fatalf("flush wait = %s, expected the flush timeout", wait)
+	}
+	operator.expectQuiet()
+	clock.advance(10 * time.Second)
+	if ticketIds := postedTicketIds(); len(ticketIds) != 1 || !bytes.Equal(ticketIds[0], plainTicketId) {
+		t.Fatalf("posted %x, expected the plain session's report", ticketIds)
+	}
+	operator.expectQuiet()
+}
+
+// lag.dev/DRIFTTEST.md E4, W8: a session whose ticket says NoReport signs and
+// sends no report however it ends: closed by the browser, or by the extender
+// when its page stops answering, and after a load it asked for was refused.
+func TestLagApiNoReport(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	fixture.setTimings(func(timings *lagApiTimings) {
+		timings.pingLost = 100 * time.Millisecond
+		timings.pongTimeout = 400 * time.Millisecond
+	})
+	demoTicket := func() string {
+		return fixture.ticket(func(body *protocol.LagTicketBody) {
+			testLagLatencyOnly(body)
+			body.NoReport = true
+		})
+	}
+
+	closed := fixture.openHelloSession(demoTicket())
+	if rtts := closed.rttsFor(300 * time.Millisecond); len(rtts) < 1 {
+		t.Fatalf("%d rtts", len(rtts))
+	}
+	closed.load("download")
+	closed.next("error", 5*time.Second)
+	closed.close()
+
+	timedOut := fixture.openHelloSession(demoTicket())
+	timedOut.dropPongs.Store(true)
+	if code, _ := timedOut.waitClosed(5 * time.Second); code != lagApiCloseCodeTimeout {
+		t.Errorf("close %d, expected the pong timeout's", code)
+	}
+
+	waitFor(t, func() bool {
+		return fixture.api.sessionCountNow() == 0
+	})
+	fixture.noReport(200 * time.Millisecond)
+
+	// the same ticket without the flag reports, so the quiet above is the flag's
+	reported := fixture.openHelloSession(fixture.ticket(testLagLatencyOnly))
+	reported.close()
+	fixture.nextReport(5 * time.Second)
 }

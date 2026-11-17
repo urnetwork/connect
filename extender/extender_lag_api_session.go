@@ -26,7 +26,9 @@ package extender
 //
 // Each session yields one signed report: the minute around its load, or its
 // last minute when it had none (M8). A drift test's ticket leaves every load
-// cap at zero, and its session pings with no load (lag.dev/DRIFTTEST.md E3).
+// cap at zero, and its session pings with no load; it may ask for its report
+// to be posted at once, and a demo's for none at all (lag.dev/DRIFTTEST.md E3,
+// E4).
 
 import (
 	"bytes"
@@ -439,6 +441,10 @@ type lagApiSession struct {
 	// defaults above, since the browser's client takes a hello without a load
 	// for a malformed one (S5), and it asks for no load on such a ticket.
 	latencyOnly bool
+	// lag.dev/DRIFTTEST.md E4: the ticket asks for the session's report to be
+	// posted at once, or for no report at all (the demo token's, W8)
+	reportPromptly bool
+	noReport       bool
 
 	// done when the session ends, which ends its load
 	ctx    context.Context
@@ -529,6 +535,8 @@ func newLagApiSession(
 		maxDownloadBytes: byteCountOf(body.MaxDownloadBytes),
 		maxUploadBytes:   byteCountOf(body.MaxUploadBytes),
 		latencyOnly:      lagApiLatencyOnly(body),
+		reportPromptly:   body.ReportPromptly,
+		noReport:         body.NoReport,
 		ctx:              ctx,
 		cancel:           cancel,
 		messages:         make(chan lagApiControlMessage, 16),
@@ -1705,18 +1713,29 @@ func (self *lagApiSession) finish() {
 }
 
 // Builds, signs and submits the session's one report (M8), at the close of its
-// minute or when the session ends first.
+// minute or when the session ends first. A ticket that asks for no report gets
+// none, neither signed nor sent, though the session counts as reported as any
+// other does; one that asks for its report promptly has it posted at once
+// (lag.dev/DRIFTTEST.md E4).
 func (self *lagApiSession) report(now time.Time) {
 	if self.reported {
 		return
 	}
 	self.reported = true
+	if self.noReport {
+		return
+	}
 	report, err := connect.SignLagReport(self.reportBody(now), self.api.identityPrivateKey)
 	if err != nil {
 		self.api.server.reportError("lag report", err)
 		return
 	}
-	if self.api.reports != nil {
+	if self.api.reports == nil {
+		return
+	}
+	if self.reportPromptly {
+		self.api.reports.SubmitPromptly(report)
+	} else {
 		self.api.reports.Submit(report)
 	}
 }

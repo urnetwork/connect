@@ -82,12 +82,18 @@ func (self *testLagCertificates) setQuietly(names []string, certificate *tls.Cer
 	self.certificate = certificate
 }
 
-// The lifecycle's report queue, as a sink (M10).
+// The lifecycle's report queue, as a sink (M10). A report submitted promptly
+// (lag.dev/DRIFTTEST.md E4) arrives the same way; the drift tests put the real
+// queue in its place to see the difference.
 type testLagReports struct {
 	reports chan *protocol.LagReport
 }
 
 func (self *testLagReports) Submit(report *protocol.LagReport) {
+	self.reports <- report
+}
+
+func (self *testLagReports) SubmitPromptly(report *protocol.LagReport) {
 	self.reports <- report
 }
 
