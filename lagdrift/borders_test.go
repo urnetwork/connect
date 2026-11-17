@@ -170,7 +170,7 @@ func TestCountryAt(t *testing.T) {
 // simplified map.
 func TestBordersBeneluxAndGermany(t *testing.T) {
 	borders, world := fixtureBorders(t)
-	if borders.Version() != "ne-admin0-10m-v5.1.2-claims1" || world.Version() != "ne-admin0-50m-v5.1.2-claims1" {
+	if borders.Version() != "ne-admin0-10m-v5.1.2-claims2" || world.Version() != "ne-admin0-50m-v5.1.2-claims2" {
 		t.Errorf("versions %q and %q", borders.Version(), world.Version())
 	}
 	places := []struct {

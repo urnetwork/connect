@@ -48,14 +48,14 @@
 // resolved like mmdb/: config's all/lag/<version>/ne-admin0-10m.bin, or
 // local/lag/ne-admin0-10m.bin. The name is stable; the Natural Earth release,
 // and the revision of how claims are drawn, are in the file's version
-// (Borders.Version, e.g. "ne-admin0-10m-v5.1.2-claims1"), which a verdict
+// (Borders.Version, e.g. "ne-admin0-10m-v5.1.2-claims2"), which a verdict
 // records as geometry_version. Integers are Go's varints
 // (encoding/binary): uvarint, and zigzag varint for signed ones.
 //
 //	magic          16 bytes, "lagdrift-borders"
 //	format         uvarint, 1
 //	version        uvarint length, then that many bytes of UTF-8: the
-//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2-claims1",
+//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2-claims2",
 //	               which a verdict records as geometry_version (P4)
 //	countries      uvarint count, then each country, sorted by code:
 //	  code         2 bytes, two lower-case ASCII letters
@@ -86,7 +86,7 @@
 // and read by ReadWorld:
 //
 //	{"format": "lagdrift-world/1",
-//	 "version": "ne-admin0-50m-v5.1.2-claims1", the geometry's version
+//	 "version": "ne-admin0-50m-v5.1.2-claims2", the geometry's version
 //	 "simplifyKm": 5,                      the simplification's tolerance, km
 //	 "scale": 1000,                        units per degree
 //	 "countries": [                        sorted by code, one to a line
@@ -114,22 +114,31 @@
 //
 // # Claims
 //
-// A disputed area belongs to every country that claims it (G3, the user's
-// decision of 2026-11-17), so that no claimant's visitors are rejected for
-// standing in it. Each code's polygons are the union of its polygons in
-// Natural Earth's default layer, which draws de facto lines, in each of its 31
-// points of view at 1:10m, and of the pieces of its disputed-areas layer that
-// any view gives it: Crimea is ru and ua, Kashmir in and pk, Western Sahara ma
-// and eh, the Golan il and sy, Kosovo xk and rs, the Spratlys every claimant,
-// and so on. Taiwan and China are kept apart both ways, since an IP database
-// never labels one side with the other's code: Taiwan and Kinmen are tw alone,
-// and nothing China holds goes to tw, so the Paracels are cn and vn. Every
-// other area a view claims is added, which G3 intends, for example Arunachal
-// Pradesh to cn and the Falklands to ar. Countries therefore overlap, and a
-// country's polygons overlap each other; that changes no region test, since a
-// point inside any polygon is inside, and an edge inside the country is never
-// the nearest to a fit outside it. cmd/drift-borders checks G3's list on every
-// file it writes.
+// A claim counts only inside a piece of Natural Earth's disputed-areas layer
+// (G3, the user's decisions of 2026-11-17), and there each piece belongs to
+// every country with a claim to it, so that no claimant's visitors are
+// rejected for standing in it; everywhere else the default layer, which draws
+// de facto lines, alone decides. Each piece goes to its de facto owner (its
+// admin and its sovereign: Gibraltar is gi and gb, the West Bank and Gaza ps
+// and il), to the owner each of Natural Earth's points of view gives it, and
+// to each claimant its note names: Crimea is ru and ua, Kashmir in and pk,
+// Western Sahara ma and eh, the Golan il and sy, Kosovo xk and rs, the
+// Falklands fk and ar, Halaib eg and sd, Abyei sd and ss, Essequibo gy and ve,
+// Arunachal Pradesh in, cn and tw, the Spratlys every claimant, and so on. Two
+// pieces stay their owner's alone, Taiwan's and Israel's own, which some views
+// give to China and to Palestine, so Tel Aviv is il alone. Taiwan and China
+// are kept apart both ways, since an IP database never labels one side with
+// the other's code: Taiwan and Kinmen are tw alone, and nothing China holds
+// goes to tw, so the Paracels are cn and vn and Beijing is cn alone.
+//
+// A piece a country's default polygons already hold isn't added to it again;
+// one they don't is added whole. Countries therefore overlap, and a country's
+// polygons can overlap each other. That changes no verdict, since a point
+// inside any polygon is inside, and an edge inside the country is never the
+// nearest to a fit outside it. It can be the nearest to a fit inside, near a
+// claim's line within the claimant's own land, such as the line of control
+// for pk, which only delays V10's clear stop there. cmd/drift-borders checks
+// G3's list and every claim on both files it writes.
 //
 // # The commands
 //

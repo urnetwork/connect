@@ -4,19 +4,21 @@
 //
 //   - -borders: the full 1:10m, in lagdrift's borders format, for the api's
 //     verdicts. It goes in the api's config as lag/ne-admin0-10m.bin. Each
-//     disputed area belongs to every country that claims it, except that
-//     Taiwan and China are kept apart (claims.go, G3).
+//     piece of Natural Earth's disputed-areas layer belongs to every country
+//     with a claim to it, except that Taiwan and China are kept apart, and
+//     the default layer alone decides everywhere else (claims.go, G3).
 //   - -world: the 1:50m simplified by Douglas–Peucker at about 5 km and
 //     quantized, as lagdrift's world map JSON, for the SDK
-//     (js/src/lag/drift/world.generated.json). A country too small to draw at
-//     1:50m is taken from 1:10m, simplified the same way.
+//     (js/src/lag/drift/world.generated.json), with the same claims. A
+//     country too small to draw at 1:50m is taken from 1:10m, simplified the
+//     same way.
 //
 // It downloads the release's GeoJSON, or reads it from -source, a directory
-// holding ne_10m_admin_0_countries.geojson, ne_50m_admin_0_countries.geojson,
-// ne_10m_admin_0_disputed_areas.geojson and the 31 points of view,
-// ne_10m_admin_0_countries_<view>.geojson, and checks each file's SHA-256
-// against the pin either way. -countries limits
-// the output to some codes, for test fixtures.
+// holding ne_10m_admin_0_countries.geojson, ne_50m_admin_0_countries.geojson
+// and ne_10m_admin_0_disputed_areas.geojson, and checks each file's SHA-256
+// against the pin either way. Both outputs are checked against G3's list and
+// every claim before they are written. -countries limits the output to some
+// codes, for test fixtures, and skips the checks.
 //
 //	go run ./lagdrift/cmd/drift-borders -borders ne-admin0-10m.bin -world world.generated.json
 package main
@@ -104,10 +106,7 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 	if err != nil {
 		return err
 	}
-	readView := func(view string) ([]byte, error) {
-		return readSource(source, viewFile(view), viewSha256s[view])
-	}
-	countries10m, pieceClaims, err := withClaims(base10m, data10m, readView, disputedData)
+	countries10m, claims, err := withClaims(base10m, data10m, disputedData)
 	if err != nil {
 		return err
 	}
@@ -124,7 +123,7 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 			return fmt.Errorf("the borders file doesn't read back: %w", err)
 		}
 		if len(only) == 0 {
-			if err := checkClaims(borders, disputedData, false, 0); err != nil {
+			if err := checkClaims(borders, disputedData, claims, claimCheckMode{}); err != nil {
 				return err
 			}
 		}
@@ -144,7 +143,7 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 			return fmt.Errorf("%s: %w", countries50mFile, err)
 		}
 		countries50m = keep(countries50m, only)
-		world, filled := worldCountries(countries50m, base10m, countries10m, pieceClaims, simplifyKm, scale)
+		world, filled := worldCountries(countries50m, base10m, countries10m, claims, simplifyKm, scale)
 		out := &bytes.Buffer{}
 		if err := lagdrift.WriteWorld(out, worldVersion, simplifyKm, scale, world); err != nil {
 			return err
@@ -160,7 +159,8 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 			}
 		}
 		if len(only) == 0 {
-			if err := checkClaims(borders, disputedData, true, simplifyKm); err != nil {
+			mode := claimCheckMode{world: true, slackKm: simplifyKm, scale: scale}
+			if err := checkClaims(borders, disputedData, claims, mode); err != nil {
 				return fmt.Errorf("the world map: %w", err)
 			}
 		}
@@ -393,36 +393,42 @@ func keep(countries []lagdrift.Country, only []string) []lagdrift.Country {
 	return kept
 }
 
-// The world map: each 1:50m country simplified, with the disputed pieces the
-// 1:10m union gave it (pieceClaims) that its 1:50m polygons don't already
-// hold, simplified the same way, since Natural Earth has no points of view at
-// 1:50m, and with each of its 1:10m default polygons at least 0.1° across
-// that 1:50m draws inside a neighbor (Bir Tawil for Egypt, inside Sudan at
-// 1:50m, and the UK's bases on Cyprus). A polygon is held, or inside a
-// neighbor, when most of its interior points are. Each code the 1:10m has and the
-// 1:50m lacks, or loses to quantization, is taken from the 1:10m union.
+// The world map: each 1:50m country simplified, with every disputed piece
+// the 1:10m claims give it (claims, its de facto pieces too) that its 1:50m
+// polygons don't already hold at every interior point, simplified the same
+// way, or as drawn when simplifying would leave it too small to draw
+// (Dokdo), since Natural Earth has no disputed areas at 1:50m; and with each
+// of its 1:10m default polygons at least 0.1° across that 1:50m draws inside
+// a neighbor at most of its interior points (Bir Tawil for Egypt, inside
+// Sudan at 1:50m, and the UK's bases on Cyprus). Each code the 1:10m has and
+// the 1:50m lacks, or loses to quantization, is taken from the 1:10m claims.
 // Returns the codes taken from the 1:10m too.
-func worldCountries(countries50m []lagdrift.Country, base10m []lagdrift.Country, countries10m []lagdrift.Country, pieceClaims map[string][][][]lagdrift.Point, simplifyKm float64, scale int) ([]lagdrift.Country, []string) {
+func worldCountries(countries50m []lagdrift.Country, base10m []lagdrift.Country, countries10m []lagdrift.Country, claims []claim, simplifyKm float64, scale int) ([]lagdrift.Country, []string) {
+	simplifyPolygon := func(polygon [][]lagdrift.Point) [][]lagdrift.Point {
+		rings := [][]lagdrift.Point{}
+		for _, ring := range polygon {
+			rings = append(rings, simplifyRing(ring, simplifyKm))
+		}
+		return rings
+	}
 	simplify := func(country lagdrift.Country) lagdrift.Country {
 		simplified := lagdrift.Country{Code: country.Code}
 		for _, polygon := range country.Polygons {
-			rings := [][]lagdrift.Point{}
-			for _, ring := range polygon {
-				rings = append(rings, simplifyRing(ring, simplifyKm))
-			}
-			simplified.Polygons = append(simplified.Polygons, rings)
+			simplified.Polygons = append(simplified.Polygons, simplifyPolygon(polygon))
 		}
 		return simplified
+	}
+	pieceClaims := map[string][][][]lagdrift.Point{}
+	for _, c := range claims {
+		for _, code := range c.codes {
+			pieceClaims[code] = append(pieceClaims[code], c.polygon)
+		}
 	}
 	// a country survives quantization when one of its outlines keeps 3
 	// distinct points
 	survives := func(country lagdrift.Country) bool {
 		for _, polygon := range country.Polygons {
-			distinct := map[[2]int64]bool{}
-			for _, p := range polygon[0] {
-				distinct[[2]int64{int64(math.Round(p.Lat * float64(scale))), int64(math.Round(p.Lon * float64(scale)))}] = true
-			}
-			if 3 <= len(distinct) {
+			if drawable(polygon[0], scale) {
 				return true
 			}
 		}
@@ -443,21 +449,27 @@ func worldCountries(countries50m []lagdrift.Country, base10m []lagdrift.Country,
 			Code:     country.Code,
 			Polygons: slices.Clone(country.Polygons),
 		}
-		// a polygon most of whose interior points the 1:50m polygons already
-		// hold adds nothing to the map
+		// a piece whose every interior point the 1:50m polygons already hold
+		// adds nothing to the map
 		held := func(polygon [][]lagdrift.Point) bool {
 			points := interiorPoints(polygon)
-			contained := 0
 			for _, p := range points {
-				if country.Contains(p) {
-					contained += 1
+				if !country.Contains(p) {
+					return false
 				}
 			}
-			return len(points) <= 2*contained
+			return 0 < len(points)
 		}
+		// the pieces, simplified here, or as drawn when too small to draw
+		// simplified
+		pieces := [][][]lagdrift.Point{}
 		for _, polygon := range pieceClaims[country.Code] {
 			if !held(polygon) {
-				withClaims.Polygons = append(withClaims.Polygons, polygon)
+				simplified := simplifyPolygon(polygon)
+				if !drawable(simplified[0], scale) {
+					simplified = polygon
+				}
+				pieces = append(pieces, simplified)
 			}
 		}
 		// a default polygon most of which 1:50m draws inside a neighbor
@@ -478,6 +490,7 @@ func worldCountries(countries50m []lagdrift.Country, base10m []lagdrift.Country,
 			}
 		}
 		simplified := simplify(withClaims)
+		simplified.Polygons = append(simplified.Polygons, pieces...)
 		if survives(simplified) {
 			world = append(world, simplified)
 			codes[country.Code] = true
