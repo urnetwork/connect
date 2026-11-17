@@ -11620,7 +11620,10 @@ paths:
         reaches daemons and readers. A limit counts bytes as bytes, a true as
         1 and a false as 0, and -1 means none. A key the body lacks reads 0,
         not included. The limits are the plan's whether or not the server
-        enforces them yet.
+        enforces them yet, and `enforced` says whether it does: while it is
+        false a daemon's or a reader's own pre-checks refuse on no limit,
+        dark as the server's refusals are, while the closure floor and pacing
+        hold either way. A body with no `enforced` reads false.
 
         A refusal by any of these limits elsewhere answers a `QuotaRefusal`:
         429 with Retry-After when a window resets, 402 when a purchase or a
@@ -31012,6 +31015,12 @@ components:
           additionalProperties:
             type: integer
             format: int64
+        enforced:
+          description: |
+            Whether the server enforces the limits yet (`enforce_sidecar_limits`).
+            Local pre-checks refuse on a limit only while it is true; absent
+            reads false.
+          type: boolean
     DnsRecordUpsert:
       type: object
       required: [name, type, values]
