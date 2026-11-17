@@ -11633,6 +11633,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/QuotaLimits"
 
+  /sidecar/label:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's network's label and alias
+      description: |
+        The label of the network the bearer signs in to, allocated on the
+        first request that needs one, and the network's live alias: the names
+        a sidecar resolves its networks by in `.ur` names, git-remote-ur, its
+        addresses and `network:<net>` (sidecar DESIGN.md §12.5). The network
+        is the credential's own. The route reads no parameter and no body,
+        so no request names another network. A label is 10 characters,
+        `[a-z][a-z0-9]{9}`, drawn at random and never derived from the
+        network id; it never changes and is never given to another network.
+        `alias` is absent while the network has no live alias. Both are under
+        the environment's dns root, the one `GET /network/dns` serves.
+
+        Any credential of the network reads it, a sidecar's `strict_exp`
+        token among them; a sidecar's forwarding client (`forward_only`) is
+        refused 403. 503 while no dns root is configured or labels are not
+        available, and the answer then holds no label.
+      operationId: sidecarLabel
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SidecarLabel"
+        "403":
+          description: |
+            The bearer is a sidecar's forwarding client (`forward_only`),
+            whose token this route does not take. The route did nothing. The
+            body is the plain text message "A sidecar token cannot call this
+            route."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: No dns root is configured, or labels are not available.
+
   /sidecar/scim-changes:
     get:
       x-internal: true
@@ -31018,6 +31062,20 @@ components:
           type: array
           items:
             type: string
+    SidecarLabel:
+      type: object
+      required: [network_id, label]
+      properties:
+        network_id:
+          description: The credential's own network.
+          type: string
+          format: uuid
+        label:
+          description: The network's label, `[a-z][a-z0-9]{9}`, allocated on the first request that needs one.
+          type: string
+        alias:
+          description: The network's live alias, a label with no root. Absent while the network has none.
+          type: string
     DnsZone:
       type: object
       required: [network_id, root, label, version, record_sets]
