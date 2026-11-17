@@ -3707,11 +3707,13 @@ func performanceProfileRetiresClients(previous *PerformanceProfile, next *Perfor
 		(allowDirect(previous) && !allowDirect(next))
 }
 
-// Installs the profile on every window, and retires the windows' clients only
-// when they cannot carry it (performanceProfileRetiresClients). A profile that
-// does not validate is refused with its error and the previous profile stays in
-// force: the window size comes from the caller, and a bad one must never panic
-// the connection or reach the windows.
+// Installs the profile on every window. A window retires what it formed under
+// the previous profile, its clients, candidates and listings, only when its
+// clients cannot carry the new one (performanceProfileRetiresClients,
+// multiClientWindow.SetPerformanceProfile). A profile that does not validate is
+// refused with its error and the previous profile stays in force: the window
+// size comes from the caller, and a bad one must never panic the connection or
+// reach the windows.
 func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *PerformanceProfile) error {
 	performanceProfile = self.overrideAllowDirect(performanceProfile)
 	if performanceProfile != nil {
@@ -3727,7 +3729,6 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		return nil
 	}
 
-	var previousPerformanceProfile *PerformanceProfile
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -3735,7 +3736,6 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 		// rebuild the immutable config snapshot under the lock so concurrent
 		// setters do not lose each other's field
 		prev := self.config.Load()
-		previousPerformanceProfile = prev.performanceProfile
 		self.config.Store(&multiClientConfig{
 			performanceProfile:  performanceProfile,
 			localSecurityBypass: prev.localSecurityBypass,
@@ -3743,8 +3743,9 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			blocker:             prev.blocker,
 		})
 	}()
-	retire := performanceProfileRetiresClients(previousPerformanceProfile, performanceProfile)
-	// before the windows discover again
+	// before the windows discover again: a window lists under its new profile
+	// generation only after this, so such a listing always carries the
+	// generator's new requirement
 	self.syncGeneratorPostQuantumEncryption()
 	// the normal windows first, so the limited window, which sizes itself
 	// from their next passes (limitedWindowSizing), never reads a sizing of
@@ -3752,9 +3753,6 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 	for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed, WindowTypeLimited} {
 		if window := self.windows[windowType]; window != nil {
 			window.SetPerformanceProfile(performanceProfile)
-			if retire {
-				window.shuffle()
-			}
 		}
 	}
 	return nil
@@ -13024,7 +13022,12 @@ type multiClientWindow struct {
 	stateLock          sync.Mutex
 	clients            map[Id]*multiClientChannel
 	performanceProfile *PerformanceProfile
-	windowSizeLimit    int
+	// Counts the profile changes the window's clients cannot carry
+	// (performanceProfileRetiresClients), changed with performanceProfile under
+	// stateLock. A listing is made under one generation, and a pass plans and
+	// builds under one; neither is used under another (see SetPerformanceProfile).
+	profileGeneration uint64
+	windowSizeLimit   int
 	// Nil test seams expose one initial-evaluation callback across the exact
 	// expand-pass phase and terminal boundaries, and hold the ping's
 	// evaluation-cancellation branch before it takes the pass mutex.
@@ -13865,14 +13868,37 @@ func (self *multiClientWindow) peerIdentityChanged() {
 	}
 }
 
-// the performance profile will take effect at the next `resize` iteration
+// Installs the profile, which takes effect at the next `resize` iteration. A
+// change the window's clients cannot carry (performanceProfileRetiresClients:
+// a post-quantum toggle either way, or direct mode turned off) retires
+// everything the window formed under the previous profile, not only its
+// installed clients. It starts a new profile generation, in the same critical
+// section as the profile, and ends the evaluation epoch, so every candidate
+// built under the previous profile fails now, as a canceled evaluation rather
+// than a provider failure. A listing made under the previous generation is
+// neither minted nor built (randomEnumerateClientArgs, expand), a pass planned
+// under it ends, and a candidate built under it is never admitted. Then the
+// window shuffles, and the enumerator lists again under the new profile.
+//
+// The toggle used to retire only the installed clients. The enumerator went on
+// minting a listing the platform had answered without the modern requirement,
+// the passes built its providers as post-quantum candidates, and each one that
+// cannot seal a post-quantum session failed its evaluation after the full ping
+// budget: the providers that failed for a while after post-quantum was turned
+// on (owner report 2026-11-17). A candidate built before the change could be
+// admitted after it, running post-quantum and direct mode as they were.
 func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
+	retire := false
 	forgottenCount := func() int {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
 		if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
 			return 0
+		}
+		retire = performanceProfileRetiresClients(self.performanceProfile, performanceProfile)
+		if retire {
+			self.profileGeneration += 1
 		}
 		self.performanceProfile = performanceProfile
 		// sized under the old profile: the limited window waits for this
@@ -13888,6 +13914,47 @@ func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *Perform
 	}()
 	// logged with no lock held
 	self.logRecentExitsForgotten(forgottenCount, "profile_change")
+	if !retire {
+		return
+	}
+
+	// a new evaluation epoch, as the outcome rebuild starts one: the old
+	// epoch's candidates and clients end now, and later ones are built under
+	// the new epoch
+	var cancelEpoch context.CancelFunc
+	func() {
+		self.outcomeLock.Lock()
+		defer self.outcomeLock.Unlock()
+		if self.evalEpochCtx == nil {
+			// a bare fixture window builds under the window ctx
+			return
+		}
+		cancelEpoch = self.evalEpochCancel
+		self.evalEpochCtx, self.evalEpochCancel = context.WithCancel(self.ctx)
+	}()
+	if cancelEpoch != nil {
+		cancelEpoch()
+	}
+	self.shuffle()
+	// the enumerator drops a listing of the old profile and lists under the
+	// new one now, before a pass asks
+	if self.generatorMonitor != nil {
+		self.generatorMonitor.NotifyAll()
+	}
+}
+
+// The window's profile generation (profileGeneration).
+func (self *multiClientWindow) currentProfileGeneration() uint64 {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.profileGeneration
+}
+
+// The profile in force and its generation, read together.
+func (self *multiClientWindow) performanceProfileSnapshot() (*PerformanceProfile, uint64) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.performanceProfile, self.profileGeneration
 }
 
 // generatorCallResult carries one generator call's result across the deadline
@@ -14066,6 +14133,18 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			return windowDestinations
 		}
 
+		// The profile generation this round lists under, read before its
+		// discovery request. A request out across a profile change the
+		// window's clients cannot carry answers for the old profile: before a
+		// post-quantum toggle the generator asked the platform without the
+		// modern requirement. The parent syncs the generator before it
+		// changes the window's generation, so a round that reads the new
+		// generation also asks with the new requirement.
+		listingGeneration := self.currentProfileGeneration()
+		listingRetired := func() bool {
+			return self.currentProfileGeneration() != listingGeneration
+		}
+
 		// deadline-wrapped: a hung platform API surfaces here as an error on
 		// the ordinary retry cadence instead of wedging this goroutine (and
 		// with it every future window expand). A late listing carries no
@@ -14175,6 +14254,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// destinations must be used by `expirationTime`
 			expirationTime := time.Now().Add(self.settings.WindowExpandArgsTimeout)
 			for _, enumerated := range destinations {
+				if listingRetired() {
+					// listed under a profile the window has since retired;
+					// the next round lists under the profile in force
+					return
+				}
 				destination, stats := enumerated.destination, enumerated.stats
 				if _, fixed := self.generator.FixedDestinationSize(); fixed {
 					// A destination waiting out its re-dial backoff is not
@@ -14188,6 +14272,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					args := &multiClientChannelArgs{
 						Destination: destination, DestinationStats: stats,
 						FixedDestination: true, deferredClientArgs: true,
+						profileGeneration: listingGeneration,
 					}
 					timeout := time.Until(expirationTime)
 					if timeout <= 0 {
@@ -14212,6 +14297,10 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				serviceOwner := self.serviceRefreshSnapshot().owner
 				for {
 					if serviceOwner != nil && !self.serviceRefreshLive(serviceOwner) {
+						return
+					}
+					// a mint retry can outlast a profile change
+					if listingRetired() {
 						return
 					}
 					timeout := expirationTime.Sub(time.Now())
@@ -14293,6 +14382,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
 						cooloffListing:                 cooloffListing,
+						profileGeneration:              listingGeneration,
 					}
 					offered := self.offerPassCandidate(demandRead, args, time.Now().Add(timeout), serviceOwner)
 					if !offered {
@@ -15296,6 +15386,7 @@ func (self *multiClientWindow) resize() {
 				self.serviceRefreshAttempted = true
 				self.stateLock.Unlock()
 			}
+			passProfileGeneration := self.currentProfileGeneration()
 			addedCount = self.expand(
 				windowSize,
 				len(clients),
@@ -15313,7 +15404,9 @@ func (self *multiClientWindow) resize() {
 					return client == strictHandover.victim
 				})
 			}
-			if !fixedDestination {
+			// a pass a profile change ended says nothing of the providers: it
+			// neither starts the expansion backoff nor clears it
+			if !fixedDestination && self.currentProfileGeneration() == passProfileGeneration {
 				if 0 < addedCount && (refresh.owner == nil || refresh.update.receivedInbound.Load()) {
 					self.noteDiscoveryExpandAdmitted()
 				} else {
@@ -15500,6 +15593,14 @@ func (self *multiClientWindow) expand(
 	if pass.serviceRefresh != nil {
 		serviceSourceDone = pass.serviceRefresh.update.ctx.Done()
 	}
+	// The pass builds every candidate under this profile generation, and only
+	// while the window holds it: a change the window's clients cannot carry
+	// ends the pass (passProfileRetired), and the next pass plans under the
+	// profile in force (multiClientWindow.SetPerformanceProfile).
+	passProfileGeneration := self.currentProfileGeneration()
+	passProfileRetired := func() bool {
+		return self.currentProfileGeneration() != passProfileGeneration
+	}
 	evaluationOwner := &multiClientEvaluationOwner{}
 	defer self.releaseOutcomeEvaluation(evaluationOwner)
 	pendingPingDones := []context.Context{}
@@ -15662,6 +15763,7 @@ func (self *multiClientWindow) expand(
 		var replacedClient *multiClientChannel
 		installed := false
 		excluded := false
+		profileRetired := false
 		exclusions, exclusionsOk := self.generator.(multiClientGeneratorExclusions)
 		if admissible || strictHandover != nil {
 			func() {
@@ -15675,6 +15777,15 @@ func (self *multiClientWindow) expand(
 				// destination is never excluded at runtime.
 				if exclusionsOk && !args.deferredClientArgs && exclusions.excludesDestination(args.Destination) {
 					excluded = true
+					return
+				}
+				// built under a profile the window has since retired, with
+				// post-quantum and direct mode as they were: read under the
+				// same lock as the change (SetPerformanceProfile), so either
+				// the change's shuffle finds the installed client or this read
+				// finds the new generation
+				if args.profileGeneration != self.profileGeneration {
+					profileRetired = true
 					return
 				}
 				if strictHandover != nil {
@@ -15701,18 +15812,22 @@ func (self *multiClientWindow) expand(
 				installed = true
 			}()
 		}
-		if excluded {
+		if excluded || profileRetired {
+			reason := "excluded"
+			if profileRetired {
+				reason = "profile_changed"
+			}
 			self.log.Infof("%s\n", relEvent(
 				"expand_decline",
 				"exit", clientId,
 				"provider", args.Destination.Tail(),
-				"reason", "excluded",
+				"reason", reason,
 			))
 			// never visible to selection, as below; a strict handover's victim
 			// keeps its slot, since the swap never ran
 			client.Cancel()
 			self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
-			self.noteRecentExitDropped(args, "excluded")
+			self.noteRecentExitDropped(args, reason)
 			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateCanceled)
 			return false
 		}
@@ -15974,8 +16089,9 @@ func (self *multiClientWindow) expand(
 			effectiveBudgetMin,
 			observedBudgetMax,
 		)
-		// window teardown is lifecycle, not evidence against a destination
-		if self.ctx.Err() == nil {
+		// window teardown is lifecycle, not evidence against a destination,
+		// and so is a profile change that ended the pass's attempts
+		if self.ctx.Err() == nil && !passProfileRetired() {
 			now := time.Now()
 			for _, destination := range failedFixedDestinations {
 				self.noteFixedDestinationFailed(destination, false, now)
@@ -16011,6 +16127,11 @@ requestCandidates:
 		if !self.serviceRefreshLive(pass.serviceRefresh) {
 			return
 		}
+		// the change notifies resize, which lands here; the next pass plans
+		// under the profile in force
+		if passProfileRetired() {
+			return
+		}
 		select {
 		case <-self.ctx.Done():
 			return
@@ -16040,6 +16161,17 @@ requestCandidates:
 					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				}
 				return
+			}
+			// Listed under another profile generation than the pass builds
+			// under, or the window retired the pass's: its destination was
+			// chosen for another profile (before a post-quantum toggle,
+			// without the modern requirement), so it is returned unbuilt. A
+			// retired pass ends at awaitCandidate.
+			if args.profileGeneration != passProfileGeneration || passProfileRetired() {
+				if !args.deferredClientArgs {
+					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				}
+				goto awaitCandidate
 			}
 			if !self.acceptDiscoveryDemandArgs(evaluationOwner, args) {
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
@@ -16130,6 +16262,17 @@ requestCandidates:
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
 			evaluationCtx := self.beginOutcomeEvaluation(evaluationOwner)
+			// Read after the epoch: the change starts its generation before
+			// it ends the epoch (SetPerformanceProfile), so a change since the
+			// receipt, a fixed destination's mint included, either shows here
+			// or ends the epoch this candidate is built under. The profile is
+			// the latest of the pass's generation, so a change the clients can
+			// carry, direct mode turned on, reaches candidates built after it.
+			performanceProfile, profileGeneration := self.performanceProfileSnapshot()
+			if profileGeneration != passProfileGeneration {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				return
+			}
 			client, err := newMultiClientChannel(
 				evaluationCtx,
 				args,
@@ -16140,7 +16283,7 @@ requestCandidates:
 				self.contractStatus,
 				self.contractStats,
 				self.peerIdentityChanged,
-				self.performanceProfile,
+				performanceProfile,
 				self.settings,
 				self.reliabilitySettings,
 				self.uplinkGateFunc,
@@ -16538,6 +16681,11 @@ requestCandidates:
 		defer pingWaitTimer.Stop()
 	awaitPing:
 		resizeChanged := self.resizeMonitor.NotifyChannel()
+		// the change ended the epoch of this pass's candidates, and notifies
+		// resize, which lands here
+		if passProfileRetired() {
+			return
+		}
 		select {
 		case <-self.ctx.Done():
 			return
@@ -17448,6 +17596,13 @@ type multiClientChannelArgs struct {
 	// failed (ip_remote_multi_client_cooloff.go). The zero value is a round
 	// that applied the exclusions.
 	cooloffListing cooloffListing
+
+	// The window profile generation the destination was listed under, read
+	// before the round's discovery request (randomEnumerateClientArgs). A
+	// pass builds the candidate only under that generation, and the window
+	// admits it only while it still holds it
+	// (multiClientWindow.SetPerformanceProfile).
+	profileGeneration uint64
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry
