@@ -23014,9 +23014,9 @@ components:
         outcome:
           description: |
             Once complete: `counted`, or why the run stays out of the
-            verdict.
+            verdict; `failed` for a run of a test that failed.
           type: string
-          enum: [counted, ip_mismatch, ip_family_mismatch, stopped_early, too_few_extenders, reports_missing]
+          enum: [counted, ip_mismatch, ip_family_mismatch, stopped_early, too_few_extenders, reports_missing, failed]
 
     LagDriftIp:
       type: object
