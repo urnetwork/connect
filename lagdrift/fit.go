@@ -31,37 +31,65 @@ package lagdrift
 // The predicted distance is smoothed within 10 km of an extender
 // (smoothedDistanceKm), so the model is differentiable at an extender's place.
 //
-// The solver is driftFit.ts's Gauss–Newton on local east and north km and the
-// offsets, with its Levenberg–Marquardt damping made adaptive: the diagonal is
-// multiplied by 1 + λ, λ starting at driftFit.ts's 0.001, and a step is taken
-// only when it lowers F. λ follows Nielsen's rule: after a step taken, it is
-// multiplied by max(1/3, 1 − (2γ − 1)³), γ the gain in F over the quadratic
-// model's, and never falls below 0.001; after a step refused, it is
-// multiplied by ν, which starts at 2 and doubles with each refusal in a row. The position step is capped at 400 km, the fit warm-starts from
-// the last one, and it settles once a step taken moves the position less than
-// 0.05 km and every offset less than 0.005 ms, or when no step lowers F, or
-// after 12 steps tried from a warm start and 30 from a cold one. The Huber
-// weights are recomputed at every step. An offset at its bound of 0 whose step
-// would go below it is held there for that step (an active set), so the
-// position's step is the constrained one. With driftFit.ts's fixed damping
-// alone, a step against a gross outlier can overshoot a direction the other
-// extenders hardly constrain and circle there for good.
+// The solver steps as driftFit.ts's does, on local east and north km, with its
+// Levenberg–Marquardt damping made adaptive: λ times JᵀWJ's position diagonal
+// is added to the step's matrix, λ starting at driftFit.ts's 0.001, and a step
+// is taken only when it lowers F. λ follows Nielsen's rule: after a step
+// taken, it is multiplied by max(1/3, 1 − (2γ − 1)³), γ the gain in F over the
+// quadratic model's, and never falls below 0.001; after a step refused, it is
+// multiplied by ν, which starts at 2 and doubles with each refusal in a row.
+// The position step is capped at 400 km. The Huber weights are recomputed at
+// every step. An offset at its bound of 0 is held there (an active set). With
+// driftFit.ts's fixed damping alone, a step against a gross outlier can
+// overshoot a direction the other extenders hardly constrain and circle there
+// for good.
+//
+// Starts and convergence (V5, 2026-11-17): the fit starts from the expected
+// point, the places of the three fastest extenders and the warm fit, if any.
+// It iterates each start until a step lowers F by less than 10⁻⁶ of F and the
+// undamped step from there would move the position less than 0.1 km, or no
+// step lowers F, within 100 trial steps, and keeps the lowest F. It leaves the
+// warm fit's basin only for an F lower by more than 1, so the radar's shadow
+// doesn't flip between near-equal fits.
 //
 // lag.dev/DRIFTTEST.md V3 recomputes the variances, whose route error grows
-// with dᵢ, at every iteration. Here they are recomputed at every pass (feasible
-// GLS in two steps): the first pass measures each dᵢ from the expected place,
-// the second from the first pass's fit, and the covariance from the fit.
-// Recomputed at every iteration, they make the fit the fixed point of a
-// reweighting that moves with the position, and in about 1 fit in 20 of E2's
-// geometry (by simulation) that point repels the iteration, which then circles
-// it without settling. With the variances fixed for a pass, F is a fixed
-// function each pass minimizes, and the fit depends on the data alone, not on
-// where the last fit left off.
+// with dᵢ, at every iteration. Here they are recomputed at every pass
+// (feasible GLS in two steps), and the covariance measures them from the fit:
+//
+//  1. the first pass measures each dᵢ from the expected place and runs the
+//     cold starts, the expected point and the three fastest extenders, so it
+//     depends on the data alone;
+//  2. the second measures each dᵢ from the first pass's fit and runs from that
+//     fit and from the warm fit, which wins unless the other's F is lower by
+//     more than 1.
+//
+// Recomputed at every iteration, the variances make the fit the fixed point of
+// a reweighting that moves with the position, and in about 1 fit in 20 of
+// E2's geometry (by simulation) that point repels the iteration, which then
+// circles it without settling from any start. With the variances fixed for a
+// pass, F is one function its starts all minimize, so their Fs compare. And a
+// warm refit of the same data repeats the first pass exactly, and finds the
+// warm fit already a minimum of the same second F.
+//
+// Each start is minimized by variable projection (minimizeFit): the offsets
+// enter the model linearly and F is convex in them, so at every position they
+// are solved exactly, and Levenberg–Marquardt steps the position alone on the
+// profile min_b F, with the Schur complement of Newton's matrix over the free
+// offsets. Newton's matrix is JᵀWJ plus the position's curvature that
+// Gauss–Newton leaves out, −K Σⱼ (Wr)ⱼ ∇²dⱼ. Near an extender a residual of a
+// millisecond curves F as much as JᵀWJ does (|r| / K d is near 1 at 100 km),
+// and a joint step in the position and the offsets zig-zags across the valley
+// they trade along, since moving away from a near extender lengthens the far
+// paths alike and b absorbs that. Gauss–Newton alone crawled along it for
+// hundreds of steps in about 1 pooled fit in 20.
 //
 // The covariance of (east, north, b) is (JᵀWJ)⁻¹ × max(1, χ²/(n − 2 − R)) at
 // the solution, with W the Huber-weighted block inverse (normalEquations) and
-// χ² = Σ rᵀWr. An offset at 0 is held fixed, and the position's covariance is
-// the 2 × 2 of the rest.
+// χ² = Σ rᵀWr. It is the full inverse, every offset free, even one the solver
+// holds at 0 (V5, 2026-11-17): with the extenders mostly to one side, moving
+// away from them lengthens every path alike, which b absorbs, so a fit can
+// slide away until b reaches 0, and conditioning on b = 0 would claim a
+// certainty the fit doesn't have.
 
 import (
 	"errors"
@@ -77,18 +105,31 @@ const (
 	// fewer extenders can't place anyone
 	MinFitExtenders = 3
 
-	settledKm      = 0.05
-	settledMs      = 0.005
-	warmIterations = 12
-	coldIterations = 30
-	// Levenberg–Marquardt's damping: the diagonal is multiplied by 1 + λ, λ
-	// starting at, and never below, driftFit.ts's 0.001
+	// a start has converged when a step lowers F by less than this share of F
+	// and the undamped step from there would move the position less than
+	// this, km (V5)
+	convergedKm    = 0.1
+	convergedShare = 1e-6
+	// a start's trial steps (V5)
+	maxFitIterations = 100
+	// the starts besides the warm fit and the expected point: the places of
+	// this many fastest extenders (V5)
+	startExtenders = 3
+	// the warm fit's basin is left only for an F lower by more than this (V5)
+	warmBasinMargin = 1
+	// Levenberg–Marquardt's λ, which scales JᵀWJ's diagonal into the step's
+	// matrix: it starts at, and never falls below, driftFit.ts's 0.001
 	minDamping = 0.001
 	maxDamping = 1e9
 	// a cold start's offset, as a share of the run's lowest round trip
 	coldLastMileShare = 0.7
 	// a pivot this small is singular
 	minPivot = 1e-20
+	// solving the offsets at a position: Newton's steps until they move less
+	// than this, ms, or this many, each halved at most this many times
+	offsetSettledMs     = 1e-9
+	maxOffsetIterations = 30
+	maxOffsetBacktracks = 20
 	// the passes of feasible GLS
 	fitPasses = 2
 	// the distance is smoothed this close to an extender, km
@@ -177,10 +218,10 @@ type fitBlock struct {
 // needs 3 distinct extenders and 3 + R observations for R runs, else
 // ErrTooFewObservations. The 6-extender minimum of a run is the caller's.
 //
-// warm, when given, starts the fit from its position and its offsets, matched
-// by run number through warm.Runs (by index when warm has no Runs and as many
-// offsets as obs has runs). A run it lacks starts, as a cold fit's runs do, at
-// 0.7 times the run's lowest round trip, and a cold fit starts at expected.
+// warm, when given, is a start too, with its offsets matched by run number
+// through warm.Runs (by index when warm has no Runs and as many offsets as obs
+// has runs). The other starts, and a run warm lacks, begin each offset at 0.7
+// times the run's lowest round trip.
 //
 // Blocks are in the order their extenders first appear in obs, and rows in a
 // block in obs's order. The TypeScript model sums in the same order.
@@ -240,19 +281,6 @@ func FitPosition(m Model, expected Point, obs []Observation, warm *Fit) (*Fit, e
 		coldLastMile[r] *= coldLastMileShare
 	}
 
-	p := expected
-	b := slices.Clone(coldLastMile)
-	maxIterations := coldIterations
-	if warm != nil && warm.At.Valid() {
-		p = warm.At
-		maxIterations = warmIterations
-		for r, run := range runNumbers {
-			if lastMile, ok := warmLastMile(warm, run, r, runCount); ok {
-				b[r] = math.Max(0, lastMile)
-			}
-		}
-	}
-
 	// τ for each row, its distance measured from a place
 	routeErrorsFrom := func(at Point) {
 		for _, block := range blocks {
@@ -263,84 +291,53 @@ func FitPosition(m Model, expected Point, obs []Observation, warm *Fit) (*Fit, e
 		}
 	}
 
-	var a [][]float64
-	var g []float64
-	var objective float64
-	settled := false
+	// pass 1: the route errors measured from the expected place, one F that
+	// every cold start minimizes, from the expected point and the places of
+	// the three fastest extenders (each by its lowest round trip); the lowest
+	// F wins, so this pass depends on the data alone
 	iterations := 0
-	reference := expected
-	for pass := 0; pass < fitPasses; pass++ {
-		routeErrorsFrom(reference)
-		settled = false
-		lambda := minDamping
-		nu := 2.0
-		a, g, _, objective = normalEquations(blocks, p, b, paramCount)
-		for iteration := 0; iteration < maxIterations; iteration++ {
-			iterations += 1
-			step, ok := constrainedStep(a, g, b, 1+lambda)
-			if ok {
-				length := math.Hypot(step[0], step[1])
-				scale := 1.0
-				if MaxStepKm < length {
-					scale = MaxStepKm / length
-				}
-				for i := range step {
-					step[i] *= scale
-				}
-				nextP := MoveKm(p, step[0], step[1])
-				nextB := make([]float64, len(b))
-				small := math.Hypot(step[0], step[1]) < settledKm
-				for r := range b {
-					nextB[r] = math.Max(0, b[r]+step[2+r])
-					small = small && math.Abs(nextB[r]-b[r]) < settledMs
-				}
-				nextA, nextG, _, nextObjective := normalEquations(blocks, nextP, nextB, paramCount)
-				if nextObjective <= objective {
-					// the gain over the quadratic model's 2δᵀg − δᵀAδ
-					predicted := 0.0
-					for i := range step {
-						predicted += 2 * step[i] * g[i]
-						for j := range step {
-							predicted -= step[i] * a[i][j] * step[j]
-						}
-					}
-					gain := 0.0
-					if 0 < predicted {
-						gain = (objective - nextObjective) / predicted
-					}
-					p, b = nextP, nextB
-					a, g, objective = nextA, nextG, nextObjective
-					c := 2*gain - 1
-					lambda = math.Max(minDamping, lambda*math.Max(1.0/3, 1-c*c*c))
-					nu = 2
-					if small {
-						settled = true
-						break
-					}
-					continue
-				}
-			}
-			// no step lowers F at this damping: damp more, unless no step
-			// can, which is a minimum
-			lambda *= nu
-			nu *= 2
-			if maxDamping < lambda {
-				settled = true
-				break
+	routeErrorsFrom(expected)
+	coldStarts := append([]Point{expected}, fastestPlaces(blocks, startExtenders)...)
+	var first *fitMinimum
+	for _, start := range coldStarts {
+		minimum := minimizeFit(blocks, start, coldLastMile, paramCount)
+		iterations += minimum.iterations
+		if first == nil || minimum.objective < first.objective {
+			first = minimum
+		}
+	}
+	// pass 2: the route errors measured from the first pass's fit, from that
+	// fit and from the warm fit, if any, whose basin is left only for an F
+	// lower by more than 1
+	routeErrorsFrom(first.p)
+	final := minimizeFit(blocks, first.p, first.b, paramCount)
+	iterations += final.iterations
+	if warm != nil && warm.At.Valid() {
+		warmB := slices.Clone(coldLastMile)
+		for r, run := range runNumbers {
+			if lastMile, ok := warmLastMile(warm, run, r, runCount); ok {
+				warmB[r] = math.Max(0, lastMile)
 			}
 		}
-		reference = p
+		fromWarm := minimizeFit(blocks, warm.At, warmB, paramCount)
+		iterations += fromWarm.iterations
+		if !(final.objective < fromWarm.objective-warmBasinMargin) {
+			final = fromWarm
+		}
 	}
+	converged := first.converged && final.converged
+	p := final.p
+	b := final.b
+
 	// the covariance and χ² with the route errors measured from the fit
 	routeErrorsFrom(p)
-	a, _, chi2, _ := normalEquations(blocks, p, b, paramCount)
+	a, _, chi2, _, _ := normalEquations(blocks, p, b, paramCount)
 
-	// an offset at its bound is held fixed: the covariance is the rest's
+	// lag.dev/DRIFTTEST.md V5: an offset held at its bound in the solver is
+	// free here, so the position keeps the freedom b would absorb
 	free := make([]bool, paramCount)
-	free[0] = true
-	free[1] = true
-	for r := range b {
-		free[2+r] = 0 < b[r]
+	for i := range free {
+		free[i] = true
 	}
 	inverse, ok := invertFree(a, free)
 	if !ok {
@@ -379,8 +376,257 @@ func FitPosition(m Model, expected Point, obs []Observation, warm *Fit) (*Fit, e
 		Runs:         runNumbers,
 		Observations: n,
 		iterations:   iterations,
-		settled:      settled,
+		settled:      converged,
 	}, nil
+}
+
+// Where one start's minimization of F ended.
+type fitMinimum struct {
+	p         Point
+	b         []float64
+	objective float64
+	// trial steps taken
+	iterations int
+	// it met the convergence rule, rather than the iteration cap
+	converged bool
+}
+
+// Minimizes F, with the rows' τ as they are, from (p, b), by variable
+// projection: the offsets enter the model linearly and F is convex in them, so
+// at every position they are solved exactly (solveOffsets), and
+// Levenberg–Marquardt steps the position alone on the profile
+// φ(p) = min_b F(p, b). Its matrix is the Schur complement of Newton's matrix
+// (newtonMatrix) over the free offsets, damped by λ times JᵀWJ's position
+// diagonal, and a step is taken only when it lowers φ. A position and its
+// offsets otherwise trade along a curved valley, since moving away from a near
+// extender lengthens the far paths alike and b absorbs that, and a joint step
+// zig-zags across it. It converges once a step taken lowers φ by less than
+// 10⁻⁶ of φ and the undamped step from there would move the position less
+// than 0.1 km, or when no step lowers φ, within 100 trial steps.
+func minimizeFit(blocks []*fitBlock, p Point, b []float64, paramCount int) *fitMinimum {
+	eq := solveOffsets(blocks, p, b, paramCount)
+	lambda := minDamping
+	nu := 2.0
+	minimum := &fitMinimum{}
+	for minimum.iterations < maxFitIterations {
+		minimum.iterations += 1
+		s, gr, ok := eq.profile()
+		var step [2]float64
+		if ok {
+			step, ok = solve2([2][2]float64{
+				{s[0][0] + lambda*eq.a[0][0], s[0][1]},
+				{s[1][0], s[1][1] + lambda*eq.a[1][1]},
+			}, gr)
+		}
+		if ok {
+			if length := math.Hypot(step[0], step[1]); MaxStepKm < length {
+				step[0] *= MaxStepKm / length
+				step[1] *= MaxStepKm / length
+			}
+			next := solveOffsets(blocks, MoveKm(eq.p, step[0], step[1]), eq.b, paramCount)
+			if next.objective <= eq.objective {
+				// the gain over the quadratic model's 2δᵀg − δᵀSδ
+				predicted := 2*(step[0]*gr[0]+step[1]*gr[1]) -
+					(step[0]*(s[0][0]*step[0]+s[0][1]*step[1]) + step[1]*(s[1][0]*step[0]+s[1][1]*step[1]))
+				gain := 0.0
+				if 0 < predicted {
+					gain = (eq.objective - next.objective) / predicted
+				}
+				drop := eq.objective - next.objective
+				eq = next
+				c := 2*gain - 1
+				lambda = math.Max(minDamping, lambda*math.Max(1.0/3, 1-c*c*c))
+				nu = 2
+				// converged when the whole step from here is short and φ
+				// barely moved: a damped step can be short far from the minimum
+				if drop < convergedShare*eq.objective {
+					if s, gr, ok := eq.profile(); ok {
+						if whole, ok := solve2(s, gr); ok && math.Hypot(whole[0], whole[1]) < convergedKm {
+							minimum.converged = true
+							break
+						}
+					}
+				}
+				continue
+			}
+		}
+		// no step lowers φ at this damping: damp more, unless no step can,
+		// which is a minimum
+		lambda *= nu
+		nu *= 2
+		if maxDamping < lambda {
+			minimum.converged = true
+			break
+		}
+	}
+	minimum.p = eq.p
+	minimum.b = eq.b
+	minimum.objective = eq.objective
+	return minimum
+}
+
+// A position, its offsets, and the normal equations there.
+type fitEquations struct {
+	p         Point
+	b         []float64
+	a         [][]float64
+	g         []float64
+	objective float64
+	curvature [2][2]float64
+}
+
+// The position's profile at the equations' offsets: the Schur complement of
+// Newton's matrix over the free offsets, S = H_pp − H_pf H_ff⁻¹ H_fp, and the
+// reduced gradient g_p − H_pf H_ff⁻¹ g_f. An offset at 0 is held, not free.
+func (self *fitEquations) profile() ([2][2]float64, [2]float64, bool) {
+	h := newtonMatrix(self.a, self.curvature)
+	free := []int{}
+	for r := range self.b {
+		if 0 < self.b[r] {
+			free = append(free, 2+r)
+		}
+	}
+	s := [2][2]float64{{h[0][0], h[0][1]}, {h[1][0], h[1][1]}}
+	gr := [2]float64{self.g[0], self.g[1]}
+	if 0 < len(free) {
+		// H_ff⁻¹ [H_fp | g_f], column by column
+		k := len(free)
+		for col := 0; col < 3; col++ {
+			augmented := make([][]float64, k)
+			for row, i := range free {
+				augmented[row] = make([]float64, k+1)
+				for c, j := range free {
+					augmented[row][c] = h[i][j]
+				}
+				if col < 2 {
+					augmented[row][k] = h[i][col]
+				} else {
+					augmented[row][k] = self.g[i]
+				}
+			}
+			x, ok := gaussSolve(augmented)
+			if !ok {
+				return s, gr, false
+			}
+			for u := 0; u < 2; u++ {
+				sum := 0.0
+				for row, i := range free {
+					sum += h[u][i] * x[row]
+				}
+				if col < 2 {
+					s[u][col] -= sum
+				} else {
+					gr[u] -= sum
+				}
+			}
+		}
+	}
+	return s, gr, true
+}
+
+// The offsets that minimize F at the position p, from b: Newton's steps on the
+// offsets alone, which F is convex in, each offset at its bound of 0 whose
+// step would go below it held there, a step halved while it raises F, until
+// the offsets move less than 10⁻⁹ ms or 30 steps.
+func solveOffsets(blocks []*fitBlock, p Point, b []float64, paramCount int) *fitEquations {
+	eq := &fitEquations{p: p, b: slices.Clone(b)}
+	eq.a, eq.g, _, eq.objective, eq.curvature = normalEquations(blocks, p, eq.b, paramCount)
+	held := make([]bool, paramCount)
+	held[0] = true
+	held[1] = true
+	for iteration := 0; iteration < maxOffsetIterations; iteration++ {
+		free := make([]bool, paramCount)
+		for i := range free {
+			free[i] = !held[i]
+		}
+		step, ok := constrainedStepOver(eq.a, eq.g, eq.b, free)
+		if !ok {
+			break
+		}
+		largest := 0.0
+		for r := range eq.b {
+			largest = math.Max(largest, math.Abs(step[2+r]))
+		}
+		if largest < offsetSettledMs {
+			break
+		}
+		t := 1.0
+		var next *fitEquations
+		for tries := 0; tries < maxOffsetBacktracks; tries++ {
+			nextB := make([]float64, len(eq.b))
+			for r := range eq.b {
+				nextB[r] = math.Max(0, eq.b[r]+step[2+r]*t)
+			}
+			candidate := &fitEquations{p: p, b: nextB}
+			candidate.a, candidate.g, _, candidate.objective, candidate.curvature = normalEquations(blocks, p, nextB, paramCount)
+			if candidate.objective <= eq.objective {
+				next = candidate
+				break
+			}
+			t /= 2
+		}
+		if next == nil {
+			break
+		}
+		eq = next
+	}
+	return eq
+}
+
+// The 2 × 2 system's solution; false when it is singular.
+func solve2(m [2][2]float64, v [2]float64) ([2]float64, bool) {
+	solution, ok := gaussSolve([][]float64{{m[0][0], m[0][1], v[0]}, {m[1][0], m[1][1], v[1]}})
+	if !ok {
+		return [2]float64{}, false
+	}
+	return [2]float64{solution[0], solution[1]}, true
+}
+
+// JᵀWJ with the position block's curvature added: half of F's Hessian.
+func newtonMatrix(a [][]float64, curvature [2][2]float64) [][]float64 {
+	h := make([][]float64, len(a))
+	for i := range a {
+		h[i] = slices.Clone(a[i])
+	}
+	for u := 0; u < 2; u++ {
+		for v := 0; v < 2; v++ {
+			h[u][v] += curvature[u][v]
+		}
+	}
+	return h
+}
+
+// The places of the n extenders with the lowest round trips, each at the place
+// of its lowest, in the order of their round trips (ties in the blocks' order).
+func fastestPlaces(blocks []*fitBlock, n int) []Point {
+	type fastest struct {
+		at Point
+		y  float64
+	}
+	extenders := make([]fastest, 0, len(blocks))
+	for _, block := range blocks {
+		f := fastest{at: block.rows[0].at, y: block.rows[0].y}
+		for _, row := range block.rows[1:] {
+			if row.y < f.y {
+				f = fastest{at: row.at, y: row.y}
+			}
+		}
+		extenders = append(extenders, f)
+	}
+	slices.SortStableFunc(extenders, func(a fastest, b fastest) int {
+		if a.y < b.y {
+			return -1
+		}
+		if b.y < a.y {
+			return 1
+		}
+		return 0
+	})
+	places := []Point{}
+	for _, f := range extenders[:min(n, len(extenders))] {
+		places = append(places, f.at)
+	}
+	return places
 }
 
 func usableObservation(o Observation) bool {
@@ -419,9 +665,10 @@ func warmLastMile(warm *Fit, run int, index int, runCount int) (float64, bool) {
 //
 // so rᵀWr = ‖r⊥‖² + h z², and W = V⁻¹ when h = 1. ρ_H(z) is z²/2 within c
 // and c|z| − c²/2 beyond. The parameters are east km, north km, then b per
-// run; J is the model's slope, so a step solves (JᵀWJ) δ = JᵀWr, and JᵀWr is
-// half of −∂F/∂δ.
-func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) ([][]float64, []float64, float64, float64) {
+// run; J is the model's slope, and JᵀWr is half of −∂F/∂δ. The last return
+// is the position block's curvature that JᵀWJ leaves out, −K Σⱼ (Wr)ⱼ ∇²dⱼ:
+// half of ∂²F/∂δ² is JᵀWJ plus it, with W held, which is Newton's matrix.
+func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) ([][]float64, []float64, float64, float64, [2][2]float64) {
 	a := make([][]float64, paramCount)
 	for i := range a {
 		a[i] = make([]float64, paramCount)
@@ -436,7 +683,11 @@ func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) (
 		run    int
 		r      float64
 		d      float64
+		t      float64
+		// ∇²d, the smoothed distance's curvature in east and north
+		curvature [2][2]float64
 	}
+	var curvature [2][2]float64
 	alpha := make([]float64, paramCount)
 	terms := []rowTerms{}
 	for _, block := range blocks {
@@ -452,12 +703,16 @@ func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) (
 			d := DistanceKm(p, row.at)
 			beta := BearingDeg(p, row.at) * radPerDeg
 			smooth, slope := smoothedDistanceKm(d)
+			sinBeta := math.Sin(beta)
+			cosBeta := math.Cos(beta)
 			term := rowTerms{
-				jEast:  -math.Sin(beta) * MsPerKm * slope,
-				jNorth: -math.Cos(beta) * MsPerKm * slope,
-				run:    row.run,
-				r:      row.y - (b[row.run] + MsPerKm*smooth),
-				d:      row.noiseVar,
+				jEast:     -sinBeta * MsPerKm * slope,
+				jNorth:    -cosBeta * MsPerKm * slope,
+				run:       row.run,
+				r:         row.y - (b[row.run] + MsPerKm*smooth),
+				d:         row.noiseVar,
+				t:         row.tauMs,
+				curvature: distanceCurvature(d, sinBeta, cosBeta),
 			}
 			terms = append(terms, term)
 			t := row.tauMs
@@ -494,6 +749,13 @@ func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) (
 					a[index[u]][index[v]] += j[u] * j[v] / term.d
 				}
 			}
+			// −K (Wr)ⱼ ∇²dⱼ, with (Wr)ⱼ = (rⱼ − ω tⱼ ρ) / Dⱼ
+			wr := (term.r - omega*term.t*rho) / term.d
+			for u := 0; u < 2; u++ {
+				for v := 0; v < 2; v++ {
+					curvature[u][v] -= MsPerKm * wr * term.curvature[u][v]
+				}
+			}
 		}
 		for u := 0; u < paramCount; u++ {
 			if alpha[u] == 0 {
@@ -505,7 +767,20 @@ func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) (
 			}
 		}
 	}
-	return a, g, chi2, objective
+	return a, g, chi2, objective, curvature
+}
+
+// ∇²d of the smoothed distance (smoothedDistanceKm) in east and north km at a
+// distance d, β the bearing from the fit to the extender: (I − u uᵀ) / d with u
+// the unit vector from the extender, and I / ε within ε of it.
+func distanceCurvature(d float64, sinBeta float64, cosBeta float64) [2][2]float64 {
+	if d < smoothingKm {
+		return [2][2]float64{{1 / smoothingKm, 0}, {0, 1 / smoothingKm}}
+	}
+	return [2][2]float64{
+		{cosBeta * cosBeta / d, -sinBeta * cosBeta / d},
+		{-sinBeta * cosBeta / d, sinBeta * sinBeta / d},
+	}
 }
 
 // The distance the model predicts a round trip from (V2), and its slope in the
@@ -521,17 +796,13 @@ func smoothedDistanceKm(d float64) (float64, float64) {
 	return (d*d + smoothingKm*smoothingKm) / (2 * smoothingKm), d / smoothingKm
 }
 
-// The Gauss–Newton step with the diagonal multiplied by diagonalFactor, each
-// offset at its bound of 0 whose step would go below it held there. False when
-// the system is singular.
-func constrainedStep(a [][]float64, g []float64, b []float64, diagonalFactor float64) ([]float64, bool) {
-	paramCount := len(g)
-	free := make([]bool, paramCount)
-	for i := range free {
-		free[i] = true
-	}
+// The step solving a δ = g over the free parameters, the rest held at a step
+// of 0, and each offset at its bound of 0 whose step would go below it held
+// there too.
+func constrainedStepOver(a [][]float64, g []float64, b []float64, free []bool) ([]float64, bool) {
+	free = slices.Clone(free)
 	for {
-		step, ok := solveFree(a, g, free, diagonalFactor)
+		step, ok := solveFree(a, g, free)
 		if !ok {
 			return nil, false
 		}
@@ -548,10 +819,9 @@ func constrainedStep(a [][]float64, g []float64, b []float64, diagonalFactor flo
 	}
 }
 
-// Solves the system over the free parameters, with their diagonal multiplied by
-// diagonalFactor; a held parameter's step is 0. Gaussian elimination with
-// partial pivoting (driftFit.ts solve3).
-func solveFree(a [][]float64, g []float64, free []bool, diagonalFactor float64) ([]float64, bool) {
+// Solves the system over the free parameters; a held parameter's step is 0.
+// Gaussian elimination with partial pivoting (driftFit.ts solve3).
+func solveFree(a [][]float64, g []float64, free []bool) ([]float64, bool) {
 	indexes := []int{}
 	for i, isFree := range free {
 		if isFree {
@@ -563,11 +833,7 @@ func solveFree(a [][]float64, g []float64, free []bool, diagonalFactor float64) 
 	for row, i := range indexes {
 		augmented[row] = make([]float64, k+1)
 		for col, j := range indexes {
-			v := a[i][j]
-			if i == j {
-				v *= diagonalFactor
-			}
-			augmented[row][col] = v
+			augmented[row][col] = a[i][j]
 		}
 		augmented[row][k] = g[i]
 	}
@@ -627,7 +893,7 @@ func invertFree(a [][]float64, free []bool) ([][]float64, bool) {
 		}
 		unit := make([]float64, paramCount)
 		unit[j] = 1
-		column, ok := solveFree(a, unit, free, 1)
+		column, ok := solveFree(a, unit, free)
 		if !ok {
 			return nil, false
 		}

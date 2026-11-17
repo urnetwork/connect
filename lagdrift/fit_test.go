@@ -186,11 +186,11 @@ func TestFitPositionThreeIdenticalRunsAreOneRunWithAThirdOfTheNoise(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := DistanceKm(f1.At, f3.At); settledKm < d {
+	if d := DistanceKm(f1.At, f3.At); convergedKm < d {
 		t.Errorf("the fits are %.9f km apart", d)
 	}
 	for r := 0; r < 3; r++ {
-		if math.Abs(f3.LastMileMs[r]-f1.LastMileMs[0]) > settledMs {
+		if math.Abs(f3.LastMileMs[r]-f1.LastMileMs[0]) > 0.01 {
 			t.Errorf("run %d's offset %.9f, not %.9f", r, f3.LastMileMs[r], f1.LastMileMs[0])
 		}
 	}
