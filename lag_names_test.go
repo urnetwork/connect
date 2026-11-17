@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math/rand/v2"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -273,6 +274,243 @@ func TestExtenderMeasurementNameRoundTrip(t *testing.T) {
 			if otherId, ok := ParseExtenderMeasurementName(other, zone); ok {
 				t.Fatalf("%q, another spelling of %q, parsed as %v", other, name, otherId)
 			}
+		}
+	}
+}
+
+// The family-pinned names of the N1 example (lag.dev/DRIFTTEST.md K6): the
+// id, the family's label and the zone.
+const (
+	testExtenderMeasurementIpv4Name = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv4.extender.bringyour.com"
+	testExtenderMeasurementIpv6Name = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv6.extender.bringyour.com"
+)
+
+func TestExtenderMeasurementFamilyNamePlanExample(t *testing.T) {
+	for ipFamily, want := range map[int]string{4: testExtenderMeasurementIpv4Name, 6: testExtenderMeasurementIpv6Name} {
+		if name := ExtenderMeasurementFamilyName(testExtenderMeasurementId, ExtenderMeasurementZone, ipFamily); name != want {
+			t.Fatalf("family %d name = %q, want %q", ipFamily, name, want)
+		}
+	}
+	// the certificate's names: the measurement name, then each family's
+	names := ExtenderMeasurementNames(testExtenderMeasurementId, ExtenderMeasurementZone)
+	want := []string{testExtenderMeasurementName, testExtenderMeasurementIpv4Name, testExtenderMeasurementIpv6Name}
+	if !slices.Equal(names, want) {
+		t.Fatalf("names = %q, want %q", names, want)
+	}
+	for i, ipFamily := range []int{0, 4, 6} {
+		extenderId, parsedFamily, ok := ParseExtenderMeasurementFamilyName(want[i], ExtenderMeasurementZone)
+		if !ok || extenderId != testExtenderMeasurementId || parsedFamily != ipFamily {
+			t.Fatalf("parse of %q = %v %d %v, want %v %d", want[i], extenderId, parsedFamily, ok, testExtenderMeasurementId, ipFamily)
+		}
+	}
+	// the measurement name's own parse is unchanged: a family's name is not it
+	for _, name := range want[1:] {
+		if extenderId, ok := ParseExtenderMeasurementName(name, ExtenderMeasurementZone); ok {
+			t.Fatalf("%q parsed as a measurement name of %v", name, extenderId)
+		}
+	}
+}
+
+// The zone is normalized as for the measurement name, and a name of one zone
+// does not parse in another.
+func TestExtenderMeasurementFamilyNameZone(t *testing.T) {
+	for _, zone := range []string{"", ExtenderMeasurementZone, "Extender.BringYour.COM", "extender.bringyour.com.", " extender.bringyour.com "} {
+		for ipFamily, want := range map[int]string{4: testExtenderMeasurementIpv4Name, 6: testExtenderMeasurementIpv6Name} {
+			if name := ExtenderMeasurementFamilyName(testExtenderMeasurementId, zone, ipFamily); name != want {
+				t.Errorf("family %d name in zone %q = %q", ipFamily, zone, name)
+			}
+			if extenderId, parsedFamily, ok := ParseExtenderMeasurementFamilyName(want, zone); !ok || extenderId != testExtenderMeasurementId || parsedFamily != ipFamily {
+				t.Errorf("parse of %q in zone %q = %v %d %v", want, zone, extenderId, parsedFamily, ok)
+			}
+		}
+	}
+
+	// one trailing dot is the root, a second is not, as for the measurement
+	// name; the zone is normalized once, so the parse takes the same zone
+	for _, ipFamily := range []int{4, 6} {
+		zone := "extender.bringyour.com.."
+		name := ExtenderMeasurementFamilyName(testExtenderMeasurementId, zone, ipFamily)
+		if name != ExtenderMeasurementFamilyName(testExtenderMeasurementId, "", ipFamily)+"." {
+			t.Fatalf("family %d name in a zone with two trailing dots = %q", ipFamily, name)
+		}
+		if extenderId, parsedFamily, ok := ParseExtenderMeasurementFamilyName(name, zone); !ok || extenderId != testExtenderMeasurementId || parsedFamily != ipFamily {
+			t.Fatalf("parse of %q in its own zone = %v %d %v", name, extenderId, parsedFamily, ok)
+		}
+		if _, _, ok := ParseExtenderMeasurementFamilyName(name, ""); ok {
+			t.Fatalf("%q parsed in the default zone", name)
+		}
+	}
+
+	name := ExtenderMeasurementFamilyName(testExtenderMeasurementId, "Measure.Example.", 6)
+	if name != "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv6.measure.example" {
+		t.Fatalf("name in another zone = %q", name)
+	}
+	if extenderId, ipFamily, ok := ParseExtenderMeasurementFamilyName(name, "measure.example"); !ok || extenderId != testExtenderMeasurementId || ipFamily != 6 {
+		t.Fatalf("parse in another zone = %v %d %v", extenderId, ipFamily, ok)
+	}
+	if _, _, ok := ParseExtenderMeasurementFamilyName(name, ExtenderMeasurementZone); ok {
+		t.Fatal("a name in another zone parsed in the default zone")
+	}
+	if _, _, ok := ParseExtenderMeasurementFamilyName(testExtenderMeasurementIpv6Name, "measure.example"); ok {
+		t.Fatal("a name in the default zone parsed in another zone")
+	}
+}
+
+// The zero Id has no names, and no family but 4 and 6 has one.
+func TestExtenderMeasurementFamilyNameUnset(t *testing.T) {
+	for _, ipFamily := range []int{4, 6} {
+		if name := ExtenderMeasurementFamilyName(Id{}, ExtenderMeasurementZone, ipFamily); name != "" {
+			t.Fatalf("family %d name of the zero Id = %q", ipFamily, name)
+		}
+	}
+	if names := ExtenderMeasurementNames(Id{}, ExtenderMeasurementZone); names != nil {
+		t.Fatalf("names of the zero Id = %q", names)
+	}
+	for _, ipFamily := range []int{0, 1, 5, 46, 64, -4, 41} {
+		if name := ExtenderMeasurementFamilyName(testExtenderMeasurementId, ExtenderMeasurementZone, ipFamily); name != "" {
+			t.Fatalf("family %d has the name %q", ipFamily, name)
+		}
+	}
+	for _, label := range []string{"ipv4", "ipv6"} {
+		name := Id{}.String() + "." + label + "." + ExtenderMeasurementZone
+		if extenderId, ipFamily, ok := ParseExtenderMeasurementFamilyName(name, ExtenderMeasurementZone); ok {
+			t.Fatalf("the zero Id's spelling %q parsed as %v %d", name, extenderId, ipFamily)
+		}
+	}
+}
+
+// Every spelling of a family-pinned name but the canonical one is refused,
+// and so is every other name under the zone.
+func TestParseExtenderMeasurementFamilyNameRefuses(t *testing.T) {
+	const id = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f"
+	for _, name := range []string{
+		// the family label in another case or spelling
+		id + ".IPV4.extender.bringyour.com",
+		id + ".Ipv6.extender.bringyour.com",
+		id + ".ipv5.extender.bringyour.com",
+		id + ".ip4.extender.bringyour.com",
+		id + ".v6.extender.bringyour.com",
+		id + ".ipv46.extender.bringyour.com",
+		id + ".ipv4.ipv6.extender.bringyour.com",
+		id + ".ipv6.ipv4.extender.bringyour.com",
+		id + ".ipv4.ipv4.extender.bringyour.com",
+		// the label joined to the id or the zone, or moved
+		id + "ipv4.extender.bringyour.com",
+		id + "-ipv4.extender.bringyour.com",
+		id + ".ipv4extender.bringyour.com",
+		id + ".ipv4..extender.bringyour.com",
+		"ipv4." + id + ".extender.bringyour.com",
+		// a trailing dot, extra labels, the dns-01 record of the name (C1, C5)
+		id + ".ipv4.extender.bringyour.com.",
+		"x." + id + ".ipv4.extender.bringyour.com",
+		"_acme-challenge." + id + ".ipv4.extender.bringyour.com",
+		"_acme-challenge." + id + ".ipv6.extender.bringyour.com",
+		// an id that is not canonical
+		strings.ToUpper(id) + ".ipv4.extender.bringyour.com",
+		strings.ReplaceAll(id, "-", "") + ".ipv6.extender.bringyour.com",
+		id[1:] + ".ipv4.extender.bringyour.com",
+		id + "0.ipv6.extender.bringyour.com",
+		"00000000-0000-0000-0000-000000000000.ipv4.extender.bringyour.com",
+		// the labels between, the apex, and another zone
+		"ipv4.extender.bringyour.com",
+		"ipv6.extender.bringyour.com",
+		".ipv4.extender.bringyour.com",
+		"extender.bringyour.com",
+		id + ".ipv4.bringyour.com",
+		id + ".ipv4.measure.example",
+		"",
+	} {
+		if extenderId, ipFamily, ok := ParseExtenderMeasurementFamilyName(name, ExtenderMeasurementZone); ok {
+			t.Errorf("%q parsed as %v %d", name, extenderId, ipFamily)
+		}
+		if extenderId, ok := ParseExtenderMeasurementName(name, ExtenderMeasurementZone); ok {
+			t.Errorf("%q parsed as a measurement name of %v", name, extenderId)
+		}
+	}
+}
+
+// A certificate's or a request's names are an extender's measurement name
+// alone, or all three of its names in any order, and nothing else.
+func TestParseExtenderMeasurementNames(t *testing.T) {
+	zone := ExtenderMeasurementZone
+	names := ExtenderMeasurementNames(testExtenderMeasurementId, zone)
+	plain, ipv4, ipv6 := names[0], names[1], names[2]
+	otherId := Id{0x01, 0x92, 0xe4, 0xa1, 0x7b, 0x3c, 0x7d, 0x2e, 0x9f, 0x10, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x10}
+	other := ExtenderMeasurementNames(otherId, zone)
+
+	// the measurement name alone, as an extender from before K6 asks for it
+	if extenderId, familyNames, ok := ParseExtenderMeasurementNames([]string{plain}, zone); !ok || extenderId != testExtenderMeasurementId || familyNames {
+		t.Fatalf("the measurement name alone = %v %v %v", extenderId, familyNames, ok)
+	}
+	// all three in every order
+	for _, order := range [][]string{
+		{plain, ipv4, ipv6},
+		{plain, ipv6, ipv4},
+		{ipv4, plain, ipv6},
+		{ipv4, ipv6, plain},
+		{ipv6, plain, ipv4},
+		{ipv6, ipv4, plain},
+	} {
+		if extenderId, familyNames, ok := ParseExtenderMeasurementNames(order, zone); !ok || extenderId != testExtenderMeasurementId || !familyNames {
+			t.Fatalf("%q = %v %v %v", order, extenderId, familyNames, ok)
+		}
+	}
+	// another extender's sets are its own
+	if extenderId, familyNames, ok := ParseExtenderMeasurementNames(other, zone); !ok || extenderId != otherId || !familyNames {
+		t.Fatalf("another extender's names = %v %v %v", extenderId, familyNames, ok)
+	}
+
+	for kind, sets := range map[string][][]string{
+		"no names":                   {nil, {}},
+		"a family's name alone":      {{ipv4}, {ipv6}, {ipv4, ipv6}},
+		"one family's name missing":  {{plain, ipv4}, {plain, ipv6}, {ipv6, plain}},
+		"a name twice":               {{plain, plain}, {plain, ipv4, ipv4}, {plain, plain, ipv4}, {plain, plain, plain}, {plain, ipv6, ipv6}},
+		"a fourth name":              {{plain, ipv4, ipv6, plain}, {plain, ipv4, ipv6, other[0]}, {plain, ipv4, ipv6, "x." + plain}},
+		"another extender's name":    {{plain, ipv4, other[2]}, {other[0], ipv4, ipv6}, {plain, other[1], ipv6}, {plain, other[0]}},
+		"another zone":               {ExtenderMeasurementNames(testExtenderMeasurementId, "measure.example"), {ExtenderMeasurementName(testExtenderMeasurementId, "measure.example")}, {plain, ExtenderMeasurementFamilyName(testExtenderMeasurementId, "measure.example", 4), ipv6}},
+		"not a measurement name":     {{plain + "."}, {strings.ToUpper(plain)}, {"_acme-challenge." + plain}, {"", ipv4, ipv6}, {plain, "_acme-challenge." + ipv4, ipv6}, {zone}},
+		"a family label in its case": {{plain, strings.Replace(ipv4, ".ipv4.", ".IPV4.", 1), ipv6}},
+	} {
+		for _, set := range sets {
+			if extenderId, familyNames, ok := ParseExtenderMeasurementNames(set, zone); ok {
+				t.Errorf("%s: %q parsed as %v %v", kind, set, extenderId, familyNames)
+			}
+		}
+	}
+}
+
+// Every id's three names parse back to it and their family, in any order as
+// a set, and a family's name never parses as another family's or as the
+// measurement name.
+func TestExtenderMeasurementFamilyNameRoundTrip(t *testing.T) {
+	random := rand.New(rand.NewPCG(0x4b6, 0x6b4))
+	zones := []string{ExtenderMeasurementZone, "measure.example", "ipv4.example"}
+	for i := 0; i < 3000; i++ {
+		var extenderId Id
+		for j := range extenderId {
+			extenderId[j] = byte(random.IntN(256))
+		}
+		if extenderId == (Id{}) {
+			continue
+		}
+		zone := zones[i%len(zones)]
+
+		names := ExtenderMeasurementNames(extenderId, zone)
+		for j, ipFamily := range []int{0, 4, 6} {
+			parsedId, parsedFamily, ok := ParseExtenderMeasurementFamilyName(names[j], zone)
+			if !ok || parsedId != extenderId || parsedFamily != ipFamily {
+				t.Fatalf("parse of %q = %v %d %v, want %v %d", names[j], parsedId, parsedFamily, ok, extenderId, ipFamily)
+			}
+			_, plain := ParseExtenderMeasurementName(names[j], zone)
+			if plain != (ipFamily == 0) {
+				t.Fatalf("%q parsed as a measurement name: %v", names[j], plain)
+			}
+		}
+		random.Shuffle(len(names), func(a int, b int) {
+			names[a], names[b] = names[b], names[a]
+		})
+		if parsedId, familyNames, ok := ParseExtenderMeasurementNames(names, zone); !ok || parsedId != extenderId || !familyNames {
+			t.Fatalf("names %q = %v %v %v", names, parsedId, familyNames, ok)
 		}
 	}
 }

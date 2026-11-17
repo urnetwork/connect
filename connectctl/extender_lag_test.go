@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
@@ -144,7 +145,10 @@ func (self *testMeasurementOperator) handle(w http.ResponseWriter, r *http.Reque
 	case extender.ExtenderMeasurementCertPath:
 		self.stateLock.Lock()
 		self.certPolls += 1
-		certResult := self.certResult
+		// an operator since lag.dev/DRIFTTEST.md K6, which says in every
+		// answer that it issues for the family-pinned names
+		certResult := maps.Clone(self.certResult)
+		certResult["family_names"] = true
 		self.stateLock.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(certResult)
@@ -153,8 +157,9 @@ func (self *testMeasurementOperator) handle(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// Takes a request: issues a chain for its key and its one name, the
-// extender's, or holds it pending (C5).
+// Takes a request: issues a chain for its key and its names, the extender's
+// measurement name and its two family-pinned names (K6), or holds it pending
+// (C5).
 func (self *testMeasurementOperator) request(csr string) {
 	csrBytes, err := base64.StdEncoding.DecodeString(csr)
 	if err != nil {
@@ -166,9 +171,9 @@ func (self *testMeasurementOperator) request(csr string) {
 		self.t.Errorf("the measurement request does not verify: %v", err)
 		return
 	}
-	name := connect.ExtenderMeasurementName(self.extenderId, "")
-	if !slices.Equal(request.DNSNames, []string{name}) {
-		self.t.Errorf("request names = %v, expected %s", request.DNSNames, name)
+	names := connect.ExtenderMeasurementNames(self.extenderId, "")
+	if !slices.Equal(request.DNSNames, names) {
+		self.t.Errorf("request names = %v, expected %v", request.DNSNames, names)
 		return
 	}
 	self.stateLock.Lock()
@@ -582,12 +587,14 @@ func TestExtenderCommandMeasurementAdmitsATicket(t *testing.T) {
 	if args := operator.waitActivation(); args.MeasurementCsr == "" || args.MeasurementDisabled {
 		t.Fatal("the activation after the first carried no request")
 	}
-	name := connect.ExtenderMeasurementName(operator.extenderId, "")
+	// the measurement name and the family-pinned names (lag.dev/DRIFTTEST.md K6)
+	names := connect.ExtenderMeasurementNames(operator.extenderId, "")
+	name := names[0]
 	for {
 		_, change := started.run.measurementCert.ChangeMonitor().Get()
-		if names, certificate := started.run.measurementCert.Certificate(); certificate != nil {
-			if !slices.Equal(names, []string{name}) {
-				t.Fatalf("served names = %v, expected %s", names, name)
+		if servedNames, certificate := started.run.measurementCert.Certificate(); certificate != nil {
+			if !slices.Equal(servedNames, names) {
+				t.Fatalf("served names = %v, expected %v", servedNames, names)
 			}
 			break
 		}
@@ -600,10 +607,13 @@ func TestExtenderCommandMeasurementAdmitsATicket(t *testing.T) {
 
 	rootCas := x509.NewCertPool()
 	rootCas.AddCert(operator.caCertificate)
-	message := started.openSession(t, name, rootCas, testMeasurementTicket(
-		t, operator.inner.rootPrivateKey, started.publicKey, testExtenderNetworkHost))
-	if message["type"] != "hello" {
-		t.Fatalf("session answer = %v, expected hello", message)
+	// a session opens under each of the names
+	for _, sessionName := range names {
+		message := started.openSession(t, sessionName, rootCas, testMeasurementTicket(
+			t, operator.inner.rootPrivateKey, started.publicKey, testExtenderNetworkHost))
+		if message["type"] != "hello" {
+			t.Fatalf("session answer under %s = %v, expected hello", sessionName, message)
+		}
 	}
 
 	_, otherRootPrivateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -712,7 +722,7 @@ func TestExtenderCommandMeasurementAsksForAPassOnAnotherKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	operator.issueFor(&otherKey.PublicKey, []string{connect.ExtenderMeasurementName(operator.extenderId, "")})
+	operator.issueFor(&otherKey.PublicKey, connect.ExtenderMeasurementNames(operator.extenderId, ""))
 	// nothing else would activate before the 24 hour tick
 	for {
 		args := operator.waitActivation()

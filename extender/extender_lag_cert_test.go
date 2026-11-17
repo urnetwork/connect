@@ -237,6 +237,10 @@ type testLagApi struct {
 	stateLock sync.Mutex
 	// what the certificate route answers; nil answers 404
 	certResult *extenderMeasurementCertResult
+	// whether the operator is one from before the family-pinned names
+	// (lag.dev/DRIFTTEST.md K6), whose answers never say it issues for them;
+	// otherwise every answer says so
+	plainNameOnly bool
 	// the identity key the last read of the certificate route named
 	certPublicKeyHexValue string
 	reportStatus          int
@@ -304,12 +308,15 @@ func (self *testLagApi) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == ExtenderMeasurementCertPath:
 		self.stateLock.Lock()
 		certResult := self.certResult
+		plainNameOnly := self.plainNameOnly
 		self.certPublicKeyHexValue = r.URL.Query().Get("public_key_hex")
 		self.stateLock.Unlock()
 		if certResult == nil {
 			w.WriteHeader(http.StatusNotFound)
 		} else {
-			json.NewEncoder(w).Encode(certResult)
+			answer := *certResult
+			answer.FamilyNames = !plainNameOnly
+			json.NewEncoder(w).Encode(&answer)
 		}
 		self.polls <- struct{}{}
 	case r.Method == http.MethodPost && r.URL.Path == ExtenderLagReportPath:
@@ -344,6 +351,13 @@ func (self *testLagApi) setCertResult(certResult *extenderMeasurementCertResult)
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.certResult = certResult
+}
+
+// Makes the operator one from before the family-pinned names, or one since.
+func (self *testLagApi) setPlainNameOnly(plainNameOnly bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.plainNameOnly = plainNameOnly
 }
 
 // The identity key the last read of the certificate route named.
@@ -526,6 +540,16 @@ var testLagCertExtenderId = connect.RequireIdFromBytes([]byte{
 
 const testLagCertName = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.extender.bringyour.com"
 
+// Its names that resolve in one IP family alone (lag.dev/DRIFTTEST.md K6).
+const (
+	testLagCertIpv4Name = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv4.extender.bringyour.com"
+	testLagCertIpv6Name = "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv6.extender.bringyour.com"
+)
+
+// The names its request asks for and its certificate carries: the measurement
+// name, then each family's (C4, K6).
+var testLagCertNames = []string{testLagCertName, testLagCertIpv4Name, testLagCertIpv6Name}
+
 // The key is made once, kept beside the extender key file with mode 0600 as
 // PKCS #8 PEM, and the same key is loaded from it again (C4).
 func TestLagCertKeyPersistence(t *testing.T) {
@@ -653,22 +677,22 @@ func TestLagCertKeyRefusesAnotherKey(t *testing.T) {
 	}
 }
 
-// The request names exactly the extender's measurement name, its id under the
-// zone (N1, C4): one name, nothing else in the request, and signed by the
-// measurement key.
+// The request names exactly the extender's measurement names (N1, C4, K6): its
+// id under the zone, and its id under each family's label, nothing else in
+// the request, and signed by the measurement key.
 func TestLagCertCsrName(t *testing.T) {
-	if name := connect.ExtenderMeasurementName(testLagCertExtenderId, ""); name != testLagCertName {
-		t.Fatalf("measurement name = %s, expected %s", name, testLagCertName)
+	if names := connect.ExtenderMeasurementNames(testLagCertExtenderId, ""); !slices.Equal(names, testLagCertNames) {
+		t.Fatalf("measurement names = %v, expected %v", names, testLagCertNames)
 	}
 
 	certificate := newTestLagCertificate(t)
 	csr := certificate.ActivationCsr(testLagCertExtenderId)
 	request := parseTestLagCsr(t, csr)
-	if !slices.Equal(request.DNSNames, []string{testLagCertName}) {
-		t.Fatalf("request names = %v, expected %s alone", request.DNSNames, testLagCertName)
+	if !slices.Equal(request.DNSNames, testLagCertNames) {
+		t.Fatalf("request names = %v, expected %v", request.DNSNames, testLagCertNames)
 	}
 	if 0 < len(request.IPAddresses)+len(request.EmailAddresses)+len(request.URIs) || request.Subject.CommonName != "" {
-		t.Fatalf("request = %+v, expected the one dns name alone", request)
+		t.Fatalf("request = %+v, expected the dns names alone", request)
 	}
 	if publicKey, ok := request.PublicKey.(*ecdsa.PublicKey); !ok || !publicKey.Equal(certificate.PublicKey()) {
 		t.Fatal("the request is not for the measurement key")
@@ -692,9 +716,13 @@ func TestLagCertCsrName(t *testing.T) {
 		t.Fatal(err)
 	}
 	request = parseTestLagCsr(t, zoned.ActivationCsr(testLagCertExtenderId))
-	zonedName := "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.measure.example"
-	if !slices.Equal(request.DNSNames, []string{zonedName}) {
-		t.Fatalf("zoned names = %v, expected %s", request.DNSNames, zonedName)
+	zonedNames := []string{
+		"0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.measure.example",
+		"0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv4.measure.example",
+		"0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv6.measure.example",
+	}
+	if !slices.Equal(request.DNSNames, zonedNames) {
+		t.Fatalf("zoned names = %v, expected %v", request.DNSNames, zonedNames)
 	}
 }
 
@@ -709,7 +737,7 @@ func TestLagCertCsrAsksOnlyWhileTheOperatorHoldsNone(t *testing.T) {
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: certificate.keySha256,
 	})
 	newTestLagLifecycle(t, api, clock, certificate, nil)
@@ -729,7 +757,7 @@ func TestLagCertCsrAsksOnlyWhileTheOperatorHoldsNone(t *testing.T) {
 	// refused: the operator holds nothing, and the next activation asks again
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateRefused,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		Reason:    "the extender has no public inbound address",
 		KeySha256: certificate.keySha256,
 	})
@@ -737,7 +765,7 @@ func TestLagCertCsrAsksOnlyWhileTheOperatorHoldsNone(t *testing.T) {
 	api.waitPoll()
 	clock.nextWait(t)
 	request := parseTestLagCsr(t, certificate.ActivationCsr(testLagCertExtenderId))
-	if !slices.Equal(request.DNSNames, []string{testLagCertName}) {
+	if !slices.Equal(request.DNSNames, testLagCertNames) {
 		t.Fatalf("request names = %v, expected %s", request.DNSNames, testLagCertName)
 	}
 }
@@ -755,7 +783,7 @@ func TestLagCertHeldMeansNameAndKey(t *testing.T) {
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: otherKeySha256,
 	})
 	newTestLagLifecycle(t, api, clock, certificate, nil)
@@ -773,7 +801,7 @@ func TestLagCertHeldMeansNameAndKey(t *testing.T) {
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: certificate.keySha256,
 	})
 	clock.advance(time.Hour)
@@ -801,7 +829,7 @@ func TestLagCertKeyReplacedWhilePending(t *testing.T) {
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: oldCertificate.keySha256,
 	})
 	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
@@ -821,7 +849,7 @@ func TestLagCertKeyReplacedWhilePending(t *testing.T) {
 	now := clock.Now()
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateIssued,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		ChainPem:  ca.issue(t, oldCsr, now, now.Add(90*time.Hour)),
 		KeySha256: oldCertificate.keySha256,
 	})
@@ -875,7 +903,7 @@ func TestLagCertOptOut(t *testing.T) {
 	installed.clock.advance(15 * time.Second)
 	installed.api.waitPoll()
 	waitTestLagInstall(t, installed.certificate, version)
-	if names, tlsCertificate := installed.lifecycle.Certificate(); !slices.Equal(names, []string{testLagCertName}) || tlsCertificate == nil ||
+	if names, tlsCertificate := installed.lifecycle.Certificate(); !slices.Equal(names, testLagCertNames) || tlsCertificate == nil ||
 		!bytes.Equal(tlsCertificate.Certificate[0], installedCertificate.Certificate[0]) {
 		t.Fatalf("served names = %v after opting back in, expected the held certificate", names)
 	}
@@ -889,7 +917,7 @@ func TestLagCertPollInstallRenew(t *testing.T) {
 	api := newTestLagApi(t)
 	ca := newTestLagCa(t)
 	certificate := newTestLagCertificate(t)
-	names := []string{testLagCertName}
+	names := testLagCertNames
 	csr := certificate.ActivationCsr(testLagCertExtenderId)
 
 	api.setCertResult(&extenderMeasurementCertResult{
@@ -1010,7 +1038,7 @@ func newTestLagInstalled(t *testing.T) *testLagInstalled {
 	now := clock.Now()
 	issued := &extenderMeasurementCertResult{
 		State: ExtenderMeasurementCertStateIssued,
-		Names: []string{testLagCertName},
+		Names: testLagCertNames,
 		ChainPem: newTestLagCa(t).issue(
 			t, certificate.ActivationCsr(testLagCertExtenderId), now, now.Add(90*24*time.Hour)),
 		KeySha256: certificate.keySha256,
@@ -1025,7 +1053,7 @@ func newTestLagInstalled(t *testing.T) *testLagInstalled {
 	if wait := clock.nextWait(t); wait != time.Hour {
 		t.Fatalf("installed wait = %s, expected the check timeout", wait)
 	}
-	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, []string{testLagCertName}) || tlsCertificate == nil {
+	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, testLagCertNames) || tlsCertificate == nil {
 		t.Fatalf("served names = %v, expected %s", names, testLagCertName)
 	}
 	return &testLagInstalled{
@@ -1043,7 +1071,7 @@ func newTestLagInstalled(t *testing.T) *testLagInstalled {
 // is asked for at once (C9, amendment 24).
 func TestLagCertWithdrawnDropsAtOnce(t *testing.T) {
 	otherName := connect.ExtenderMeasurementName(connect.NewId(), "")
-	for _, withdrawnNames := range [][]string{{testLagCertName}, nil, {otherName}} {
+	for _, withdrawnNames := range [][]string{testLagCertNames, nil, {otherName}} {
 		installed := newTestLagInstalled(t)
 		reactivations := testLagReactivations(installed.certificate)
 		installed.api.setCertResult(&extenderMeasurementCertResult{
@@ -1085,7 +1113,7 @@ func TestLagCertWithdrawnAsksForAPassOnce(t *testing.T) {
 	reactivations := testLagReactivations(installed.certificate)
 	installed.api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateWithdrawn,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		Reason:    "the extender is not active",
 		KeySha256: installed.certificate.keySha256,
 	})
@@ -1129,7 +1157,7 @@ func TestLagCertWithdrawnAsksAgainOnceHeld(t *testing.T) {
 		reactivations := testLagReactivations(installed.certificate)
 		withdrawn := &extenderMeasurementCertResult{
 			State:     ExtenderMeasurementCertStateWithdrawn,
-			Names:     []string{testLagCertName},
+			Names:     testLagCertNames,
 			Reason:    "the extender is not active",
 			KeySha256: installed.certificate.keySha256,
 		}
@@ -1149,7 +1177,7 @@ func TestLagCertWithdrawnAsksAgainOnceHeld(t *testing.T) {
 		}
 		held := &extenderMeasurementCertResult{
 			State:     state,
-			Names:     []string{testLagCertName},
+			Names:     testLagCertNames,
 			KeySha256: installed.certificate.keySha256,
 		}
 		if state == ExtenderMeasurementCertStateIssued {
@@ -1182,7 +1210,7 @@ func TestLagCertWithdrawnAsksAgainOnceHeld(t *testing.T) {
 func TestLagCertWithdrawnThenRefusedDoesNotLoop(t *testing.T) {
 	installed := newTestLagInstalled(t)
 	reactivations := testLagReactivations(installed.certificate)
-	names := []string{testLagCertName}
+	names := testLagCertNames
 	keySha256 := installed.certificate.keySha256
 	installed.api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateWithdrawn,
@@ -1256,7 +1284,7 @@ func TestLagCertBackFromAwayReadsAtThePass(t *testing.T) {
 	reactivations := testLagReactivations(installed.certificate)
 	installed.api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateWithdrawn,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		Reason:    "the extender is not active",
 		KeySha256: installed.certificate.keySha256,
 	})
@@ -1287,7 +1315,7 @@ func TestLagCertBackFromAwayReadsAtThePass(t *testing.T) {
 	_, oldCertificate := installed.lifecycle.Certificate()
 	installed.api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: installed.certificate.keySha256,
 	})
 	if csr := installed.certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
@@ -1304,9 +1332,9 @@ func TestLagCertBackFromAwayReadsAtThePass(t *testing.T) {
 	now := installed.clock.Now()
 	installed.api.setCertResult(&extenderMeasurementCertResult{
 		State: ExtenderMeasurementCertStateIssued,
-		Names: []string{testLagCertName},
+		Names: testLagCertNames,
 		ChainPem: newTestLagCa(t).issueFor(
-			t, installed.certificate.PublicKey(), []string{testLagCertName}, now, now.Add(90*24*time.Hour)),
+			t, installed.certificate.PublicKey(), testLagCertNames, now, now.Add(90*24*time.Hour)),
 		KeySha256: installed.certificate.keySha256,
 	})
 	version, _ = installed.certificate.ChangeMonitor().Get()
@@ -1328,8 +1356,8 @@ func TestLagCertBackFromAwayReadsAtThePass(t *testing.T) {
 func TestLagCertKeepsThroughATransientAnswer(t *testing.T) {
 	for _, transient := range []*extenderMeasurementCertResult{
 		{State: ExtenderMeasurementCertStateNone},
-		{State: ExtenderMeasurementCertStatePending, Names: []string{testLagCertName}},
-		{State: ExtenderMeasurementCertStateRefused, Names: []string{testLagCertName}, Reason: "the operator does not issue now"},
+		{State: ExtenderMeasurementCertStatePending, Names: testLagCertNames},
+		{State: ExtenderMeasurementCertStateRefused, Names: testLagCertNames, Reason: "the operator does not issue now"},
 		{State: "unsettled"},
 		// answered 404, which is a read that failed
 		nil,
@@ -1344,7 +1372,7 @@ func TestLagCertKeepsThroughATransientAnswer(t *testing.T) {
 		// the wait the lifecycle starts next is after it took the answer in
 		wait := installed.clock.nextWait(t)
 		names, tlsCertificate := installed.lifecycle.Certificate()
-		if !slices.Equal(names, []string{testLagCertName}) || tlsCertificate != installedCertificate {
+		if !slices.Equal(names, testLagCertNames) || tlsCertificate != installedCertificate {
 			t.Errorf("transient %+v: served %v, expected the installed certificate kept", transient, names)
 		}
 
@@ -1368,7 +1396,7 @@ func TestLagCertOfferPollsSoon(t *testing.T) {
 	clock := newTestLagClock()
 	api := newTestLagApi(t)
 	certificate := newTestLagCertificate(t)
-	names := []string{testLagCertName}
+	names := testLagCertNames
 
 	newTestLagLifecycle(t, api, clock, certificate, nil)
 	api.waitPoll()
@@ -1426,7 +1454,7 @@ func TestLagCertHeldPassWakesThePoll(t *testing.T) {
 	reactivations := testLagReactivations(certificate)
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: certificate.keySha256,
 	})
 	newTestLagLifecycle(t, api, clock, certificate, nil)
@@ -1462,7 +1490,7 @@ func TestLagCertHeldPassWakesThePoll(t *testing.T) {
 // The whole of C4 with the real activation loop. A new identity learns its id
 // from its first activation answer, so that post carries no request; with one
 // post a pass, one more pass follows at once and carries the request for the
-// one name of that id. The lifecycle polls once the post has landed and
+// names of that id (K6). The lifecycle polls once the post has landed and
 // installs the chain the operator issued for it, and a later activation asks
 // for nothing new while the operator holds the certificate.
 func TestLagCertFromActivationToInstall(t *testing.T) {
@@ -1518,7 +1546,7 @@ func TestLagCertFromActivationToInstall(t *testing.T) {
 	}
 	csr := api.waitActivation()
 	request := parseTestLagCsr(t, csr)
-	names := []string{testLagCertName}
+	names := testLagCertNames
 	if !slices.Equal(request.DNSNames, names) {
 		t.Fatalf("request names = %v, expected %v", request.DNSNames, names)
 	}
@@ -1569,7 +1597,7 @@ func TestLagCertKeyMismatchAsksForAPassNow(t *testing.T) {
 
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: certificate.keySha256,
 	})
 	newTestLagLifecycle(t, api, clock, certificate, nil)
@@ -1626,7 +1654,7 @@ func TestLagCertKeyMismatchAsksForAPassNow(t *testing.T) {
 	// the request it holds is an old key's after all
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStatePending,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		KeySha256: oldCertificate.keySha256,
 	})
 	clock.advance(30 * time.Second)
@@ -1641,7 +1669,7 @@ func TestLagCertKeyMismatchAsksForAPassNow(t *testing.T) {
 	now := clock.Now()
 	api.setCertResult(&extenderMeasurementCertResult{
 		State:     ExtenderMeasurementCertStateIssued,
-		Names:     []string{testLagCertName},
+		Names:     testLagCertNames,
 		ChainPem:  ca.issue(t, oldCsr, now, now.Add(90*time.Hour)),
 		KeySha256: oldCertificate.keySha256,
 	})
@@ -1655,14 +1683,16 @@ func TestLagCertKeyMismatchAsksForAPassNow(t *testing.T) {
 }
 
 // A chain issued for another key, for a name outside the measurement zone, for
-// a name under it that is no extender's, or for more than the one name, is
-// never installed, and the next activation asks for a request for this key.
+// a name under it that is no extender's, or for any set of names but an
+// extender's measurement name alone or with both its family-pinned names
+// (K6), is never installed, and the next activation asks for a request for
+// this key.
 func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 	clock := newTestLagClock()
 	api := newTestLagApi(t)
 	ca := newTestLagCa(t)
 	certificate := newTestLagCertificate(t)
-	names := []string{testLagCertName}
+	names := testLagCertNames
 
 	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -1687,10 +1717,19 @@ func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
 	}
 
+	otherNames := connect.ExtenderMeasurementNames(connect.NewId(), "")
 	for _, chainNames := range [][]string{
 		{"0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.other.example"},
 		{"www.extender.bringyour.com"},
-		{testLagCertName, connect.ExtenderMeasurementName(connect.NewId(), "")},
+		{testLagCertName, otherNames[0]},
+		// a family's name without the others, or with another extender's
+		{testLagCertIpv4Name},
+		{testLagCertIpv4Name, testLagCertIpv6Name},
+		{testLagCertName, testLagCertIpv6Name},
+		{testLagCertName, testLagCertIpv4Name, otherNames[2]},
+		{testLagCertName, testLagCertIpv4Name, testLagCertIpv6Name, otherNames[0]},
+		{testLagCertName, testLagCertIpv4Name, testLagCertIpv4Name},
+		{testLagCertName, "0192e4a1-7b3c-7d2e-9f10-5a6b7c8d9e0f.ipv5.extender.bringyour.com", testLagCertIpv6Name},
 	} {
 		api.setCertResult(&extenderMeasurementCertResult{
 			State:    ExtenderMeasurementCertStateIssued,
@@ -1703,6 +1742,180 @@ func TestLagCertRefusesAChainItCannotServe(t *testing.T) {
 		if _, tlsCertificate := lifecycle.Certificate(); tlsCertificate != nil {
 			t.Fatalf("a chain for %v was installed", chainNames)
 		}
+	}
+}
+
+// An operator from before the family-pinned names (lag.dev/DRIFTTEST.md K6)
+// never says it issues for them, and refuses a request that asks for them. The
+// request an activation makes before the operator has answered asks for all
+// three names. Once an answer says nothing of them, a request asks for the
+// measurement name alone: the refusal of the three asks for a pass at once,
+// once however often it is read, and the pass carries that request. The chain
+// the operator issues for it is installed and served for the measurement name
+// alone, and once the operator says it issues for the family-pinned names,
+// the next activation asks for all three again.
+func TestLagCertOperatorFromBeforeFamilyNames(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	ca := newTestLagCa(t)
+	certificate := newTestLagCertificate(t)
+	reactivations := testLagReactivations(certificate)
+	plainNames := []string{testLagCertName}
+
+	if request := parseTestLagCsr(t, certificate.ActivationCsr(testLagCertExtenderId)); !slices.Equal(request.DNSNames, testLagCertNames) {
+		t.Fatalf("request names before an answer = %v, expected %v", request.DNSNames, testLagCertNames)
+	}
+	api.setPlainNameOnly(true)
+	refused := &extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateRefused,
+		Names:     testLagCertNames,
+		Reason:    "the measurement certificate request names more than the extender's measurement name",
+		KeySha256: certificate.keySha256,
+	}
+	api.setCertResult(refused)
+	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("refused wait = %s, expected the check timeout", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 1)
+
+	// the pass asks for the measurement name alone
+	csr := certificate.ActivationCsr(testLagCertExtenderId)
+	if request := parseTestLagCsr(t, csr); !slices.Equal(request.DNSNames, plainNames) {
+		t.Fatalf("request names after the refusal = %v, expected %v", request.DNSNames, plainNames)
+	}
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
+	}
+	// the refusal read again, the request not stored yet, asks for no second
+	// pass, and the request is read for on the backoff
+	clock.advance(15 * time.Second)
+	api.waitPoll()
+	if wait := clock.nextWait(t); wait != 30*time.Second {
+		t.Fatalf("unanswered offer wait = %s, expected the min backoff", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 0)
+
+	// issued for the measurement name alone: installed and served for it
+	now := clock.Now()
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateIssued,
+		Names:     plainNames,
+		ChainPem:  ca.issue(t, csr, now, now.Add(90*24*time.Hour)),
+		KeySha256: certificate.keySha256,
+	})
+	version, _ := certificate.ChangeMonitor().Get()
+	clock.advance(30 * time.Second)
+	api.waitPoll()
+	waitTestLagInstall(t, certificate, version)
+	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, plainNames) || tlsCertificate == nil {
+		t.Fatalf("served names = %v, expected %v", names, plainNames)
+	}
+	if wait := clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("installed wait = %s, expected the check timeout", wait)
+	}
+	// the operator holds what this extender asks of it
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("asked with %q for the name the operator holds", csr)
+	}
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("pass wait = %s, expected the offer poll timeout", wait)
+	}
+	testLagExpectReactivations(t, reactivations, 0)
+
+	// the operator now issues for the family-pinned names too: the next
+	// activation asks for all three, and the chain held meanwhile stays
+	api.setPlainNameOnly(false)
+	clock.advance(15 * time.Second)
+	api.waitPoll()
+	clock.nextWait(t)
+	if request := parseTestLagCsr(t, certificate.ActivationCsr(testLagCertExtenderId)); !slices.Equal(request.DNSNames, testLagCertNames) {
+		t.Fatalf("request names once the operator issues for them = %v, expected %v", request.DNSNames, testLagCertNames)
+	}
+	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, plainNames) || tlsCertificate == nil {
+		t.Fatalf("served names = %v while the request is out, expected %v", names, plainNames)
+	}
+}
+
+// An extender whose certificate is for its measurement name alone, issued
+// before K6, asks a current operator for all three names. While the operator
+// holds that request, it answers with the certificate the extender has, which
+// the extender keeps serving and reads again on the backoff, and a later
+// activation carries the same request again. Then the certificate for all
+// three names is installed and served for each of them, and an activation
+// asks for nothing more.
+func TestLagCertFamilyNamesUpgrade(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	ca := newTestLagCa(t)
+	certificate := newTestLagCertificate(t)
+	plainNames := []string{testLagCertName}
+	now := clock.Now()
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateIssued,
+		Names:     plainNames,
+		ChainPem:  ca.issueFor(t, certificate.PublicKey(), plainNames, now, now.Add(90*24*time.Hour)),
+		KeySha256: certificate.keySha256,
+	})
+	version, _ := certificate.ChangeMonitor().Get()
+	lifecycle := newTestLagLifecycle(t, api, clock, certificate, nil)
+	api.waitPoll()
+	version = waitTestLagInstall(t, certificate, version)
+	if wait := clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("installed wait = %s, expected the check timeout", wait)
+	}
+	_, plainCertificate := lifecycle.Certificate()
+
+	csr := certificate.ActivationCsr(testLagCertExtenderId)
+	if request := parseTestLagCsr(t, csr); !slices.Equal(request.DNSNames, testLagCertNames) {
+		t.Fatalf("request names = %v, expected %v", request.DNSNames, testLagCertNames)
+	}
+	if wait := clock.nextWait(t); wait != 15*time.Second {
+		t.Fatalf("offer wait = %s, expected the offer poll timeout", wait)
+	}
+	// answered with the certificate it has, which it keeps serving, and the
+	// request still out is read for on the backoff
+	wait := 15 * time.Second
+	for _, expectedWait := range []time.Duration{30 * time.Second, time.Minute} {
+		clock.advance(wait)
+		api.waitPoll()
+		if wait = clock.nextWait(t); wait != expectedWait {
+			t.Fatalf("waiting for the family names: wait = %s, expected %s", wait, expectedWait)
+		}
+		if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, plainNames) || tlsCertificate != plainCertificate {
+			t.Fatalf("served names = %v while the family names wait, expected the certificate held", names)
+		}
+		// a later activation carries the request the operator holds again,
+		// which offers nothing new
+		if again := certificate.ActivationCsr(testLagCertExtenderId); again != csr {
+			t.Fatal("a later activation did not carry the same request")
+		}
+	}
+	if current, _ := certificate.ChangeMonitor().Get(); current != version {
+		t.Fatalf("the certificate changed %d times while the family names waited", current-version)
+	}
+
+	// issued for all three: installed and served for each
+	now = clock.Now()
+	api.setCertResult(&extenderMeasurementCertResult{
+		State:     ExtenderMeasurementCertStateIssued,
+		Names:     testLagCertNames,
+		ChainPem:  ca.issue(t, csr, now, now.Add(90*24*time.Hour)),
+		KeySha256: certificate.keySha256,
+	})
+	clock.advance(wait)
+	api.waitPoll()
+	waitTestLagInstall(t, certificate, version)
+	if names, tlsCertificate := lifecycle.Certificate(); !slices.Equal(names, testLagCertNames) || tlsCertificate == nil ||
+		!slices.Equal(tlsCertificate.Leaf.DNSNames, testLagCertNames) {
+		t.Fatalf("served names = %v, expected %v", names, testLagCertNames)
+	}
+	if wait := clock.nextWait(t); wait != time.Hour {
+		t.Fatalf("installed wait = %s, expected the check timeout", wait)
+	}
+	if csr := certificate.ActivationCsr(testLagCertExtenderId); csr != "" {
+		t.Fatalf("asked with %q for the names the operator holds", csr)
 	}
 }
 

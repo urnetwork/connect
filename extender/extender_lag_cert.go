@@ -10,13 +10,17 @@ package extender
 //   - the measurement key and its certificate (C4). The key is ECDSA P-256 and
 //     used for nothing else -- not the identity key, not the camouflage key --
 //     and lives in `extender-measurement-key.pem`, mode 0600, beside the
-//     extender key file. An activation carries a certificate request whose one
-//     name is the extender's measurement name, its id under the measurement
-//     zone (N1), which it learns from its activation answer (N4); the
-//     lifecycle polls the operator until the certificate is issued, installs
-//     the chain without a restart, and polls again for each renewal (C6). The
-//     name outlives every address change, so an address change asks for
-//     nothing. A certificate the operator withdraws is dropped at once (C9);
+//     extender key file. An activation carries a certificate request for the
+//     extender's measurement names: its measurement name, its id under the
+//     measurement zone (N1), which it learns from its activation answer (N4),
+//     and the two names that resolve in one IP family alone
+//     (lag.dev/DRIFTTEST.md K6). An operator from before K6 issues for the
+//     measurement name alone, and is asked for that alone once it has said
+//     so. The lifecycle polls the operator until the certificate is issued,
+//     installs the chain without a restart, and polls again for each renewal
+//     (C6). The names outlive every address change, so an address change asks
+//     for nothing. A certificate the operator withdraws is dropped at once
+//     (C9);
 //   - the report queue (M8, extender_lag_report.go), which posts what each
 //     session measured under the activation credential;
 //   - the feed over websocket (M9, extender_lag_feed.go).
@@ -98,6 +102,12 @@ type ExtenderMeasurementCert struct {
 	// whether the owner opted out of measurement (SetEnabled); while it stands
 	// no certificate is served and no request is asked for
 	disabled atomic.Bool
+	// whether the operator's last answer said it issues for the measurement
+	// name alone (lag.dev/DRIFTTEST.md K6): an operator from before the
+	// family-pinned names, whose answers do not say it takes them, refuses a
+	// request for them. Until an answer says so, a request asks for all three
+	// names.
+	plainNameOnly atomic.Bool
 
 	// wakes the lifecycle's poll, which reads soon on a fresh backoff, when an
 	// activation carries a request or measurement is turned back on
@@ -252,36 +262,37 @@ func (self *ExtenderMeasurementCert) PublicKey() *ecdsa.PublicKey {
 }
 
 // The activation's MeasurementCsr hook (connect.ExtenderActivatorSettings, C4):
-// the standard base64 of the DER certificate request whose one name is the
-// measurement name of `extenderId` (N1), this extender's id as the operator's
+// the standard base64 of the DER certificate request for the measurement
+// names of `extenderId` (N1, K6), this extender's id as the operator's
 // activation answer reported it (N4), signed by the measurement key, which
-// never leaves the extender. "" for the zero id, which has no name; while the
-// owner has opted out; and when the operator already holds a request or a
-// certificate for that name under this key, so a routine activation asks for
-// nothing new. The request is made once and kept, since the id never changes.
-// Being asked wakes the lifecycle's poll, which reads once the post has
-// landed: what the operator made of the request, or, when it holds the
-// request already, what it holds now, which may have moved on since the last
-// read. A pass is when an extender back from a week away hears of that: its
-// certificate withdrawn, or a new one issued from the request the operator
-// kept (C4, C9, amendment 24).
+// never leaves the extender. The names are its measurement name and its two
+// family-pinned names, or its measurement name alone once the operator has
+// said it issues for nothing more (requestNames). "" for the zero id, which
+// has no name; while the owner has opted out; and when the operator already
+// holds a request or a certificate for those names under this key, so a
+// routine activation asks for nothing new. The request is made once for each
+// set of names and kept, since the id never changes. Being asked wakes the
+// lifecycle's poll, which reads once the post has landed: what the operator
+// made of the request, or, when it holds the request already, what it holds
+// now, which may have moved on since the last read. A pass is when an
+// extender back from a week away hears of that: its certificate withdrawn, or
+// a new one issued from the request the operator kept (C4, C9, amendment 24).
 func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string {
 	if self.disabled.Load() {
 		// opted out: the activation says so instead (SetEnabled)
 		return ""
 	}
-	name := connect.ExtenderMeasurementName(extenderId, self.zone)
-	if name == "" {
+	names := self.requestNames(extenderId)
+	if len(names) == 0 {
 		return ""
 	}
-	names := []string{name}
 	held, csr := func() (bool, string) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if slices.Equal(self.heldNames, names) {
+		if sameExtenderMeasurementNames(self.heldNames, names) {
 			return true, ""
 		}
-		if slices.Equal(self.csrNames, names) {
+		if sameExtenderMeasurementNames(self.csrNames, names) {
 			return false, self.csr
 		}
 		return false, ""
@@ -305,13 +316,46 @@ func (self *ExtenderMeasurementCert) ActivationCsr(extenderId connect.Id) string
 		defer self.stateLock.Unlock()
 		self.csrNames = names
 		self.csr = csr
-		if !slices.Equal(self.offeredNames, names) {
+		if !sameExtenderMeasurementNames(self.offeredNames, names) {
 			// a new offer; the poll is already reading for one outstanding
 			self.offeredNames = names
 			self.offerMonitor.NotifyAll()
 		}
 	}()
 	return csr
+}
+
+// The names a request of `extenderId` asks for (C4, K6): its measurement name
+// and both of its family-pinned names, or its measurement name alone while the
+// operator's last answer said it issues for nothing more. Nil for the zero id.
+func (self *ExtenderMeasurementCert) requestNames(extenderId connect.Id) []string {
+	if self.plainNameOnly.Load() {
+		if name := connect.ExtenderMeasurementName(extenderId, self.zone); name != "" {
+			return []string{name}
+		}
+		return nil
+	}
+	return connect.ExtenderMeasurementNames(extenderId, self.zone)
+}
+
+// Takes in whether the operator's answer says it issues for the family-pinned
+// names (K6), and returns whether a request asks for them from now on.
+func (self *ExtenderMeasurementCert) setOperatorFamilyNames(familyNames bool) bool {
+	self.plainNameOnly.Store(!familyNames)
+	return familyNames
+}
+
+// Whether two lists of names are one set. The operator sorts the names it
+// answers with, and a certificate lists them in its own order.
+func sameExtenderMeasurementNames(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a = slices.Clone(a)
+	b = slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }
 
 // A counter of every install and removal of the certificate, so a role can
@@ -321,9 +365,10 @@ func (self *ExtenderMeasurementCert) ChangeMonitor() *connect.MonitorValue[uint6
 	return self.installMonitor
 }
 
-// The installed certificate and the one name it serves (M10's
-// lagCertificates), or nil when none is installed, it has expired, the
-// operator withdrew it, or the owner opted out.
+// The installed certificate and the names it serves (M10's lagCertificates):
+// the measurement name, and the family-pinned names when it carries them
+// (K6). Nil when none is installed, it has expired, the operator withdrew it,
+// or the owner opted out.
 func (self *ExtenderMeasurementCert) Certificate() (names []string, certificate *tls.Certificate) {
 	return self.certificateAt(time.Now())
 }
@@ -348,7 +393,7 @@ func (self *ExtenderMeasurementCert) setHeld(heldNames []string, answeredNames [
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.heldNames = slices.Clone(heldNames)
-	if 0 < len(answeredNames) && slices.Equal(self.offeredNames, answeredNames) {
+	if 0 < len(answeredNames) && sameExtenderMeasurementNames(self.offeredNames, answeredNames) {
 		self.offeredNames = nil
 	}
 }
@@ -416,8 +461,10 @@ func (self *ExtenderMeasurementCert) drop() *extenderMeasurementInstalled {
 
 // Checks a chain the operator issued (A8) for this key and zone: PEM
 // certificates, leaf first, each signed by the next; the leaf for this key,
-// unexpired, and named with one measurement name of the zone and nothing
-// else, so the dispatch never presents it for anything else (M1).
+// unexpired, and named with one extender's measurement names of the zone and
+// nothing else -- its measurement name alone, as an operator from before K6
+// issues, or with both of its family-pinned names -- so the dispatch never
+// presents it for anything else (M1).
 func (self *ExtenderMeasurementCert) parseChain(chainPem string, now time.Time) (*extenderMeasurementInstalled, error) {
 	certificateDers := [][]byte{}
 	certificates := []*x509.Certificate{}
@@ -448,11 +495,11 @@ func (self *ExtenderMeasurementCert) parseChain(chainPem string, now time.Time) 
 	if !now.Before(leaf.NotAfter) {
 		return nil, fmt.Errorf("the certificate expired at %s", leaf.NotAfter.Format(time.RFC3339))
 	}
-	if len(leaf.DNSNames) != 1 || 0 < len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) {
-		return nil, fmt.Errorf("the certificate is not for one measurement name alone")
+	if 0 < len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) {
+		return nil, fmt.Errorf("the certificate is not for measurement names alone")
 	}
-	if _, ok := connect.ParseExtenderMeasurementName(leaf.DNSNames[0], self.zone); !ok {
-		return nil, fmt.Errorf("%q is not a measurement name under %s", leaf.DNSNames[0], self.zone)
+	if _, _, ok := connect.ParseExtenderMeasurementNames(leaf.DNSNames, self.zone); !ok {
+		return nil, fmt.Errorf("%q are not one extender's measurement names under %s", leaf.DNSNames, self.zone)
 	}
 	for i := 0; i+1 < len(certificates); i += 1 {
 		if err := certificates[i].CheckSignatureFrom(certificates[i+1]); err != nil {
@@ -855,6 +902,11 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		}
 		return now.Add(backoff), nextBackoff
 	}
+	// an operator since K6 says in every answer that it issues for the
+	// family-pinned names; one from before says nothing of them, and refuses
+	// a request that asks for them, so the next asks for the measurement name
+	// alone
+	familyNames := self.certificate.setOperatorFamilyNames(result.FamilyNames)
 
 	switch result.State {
 	case ExtenderMeasurementCertStatePending:
@@ -931,11 +983,17 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 
 	case ExtenderMeasurementCertStateNone, ExtenderMeasurementCertStateRefused:
 		answeredNames := []string(nil)
+		// a refusal of a request for other names than this extender asks for
+		// now -- the family-pinned names, which an operator from before them
+		// refuses (K6) -- says nothing of the request it would make
+		otherNames := false
 		if result.State == ExtenderMeasurementCertStateRefused {
 			log.Printf("[extender] lag: measurement certificate refused by the operator = %s", result.Reason)
 			if result.KeySha256 == "" || result.KeySha256 == self.certificate.keySha256 {
 				// the refusal of this key's request settles it
 				answeredNames = result.Names
+				_, refusedFamilyNames, ok := connect.ParseExtenderMeasurementNames(result.Names, self.certificate.zone)
+				otherNames = ok && refusedFamilyNames != familyNames
 			} else {
 				// a refusal of another key's request says nothing of this key's,
 				// which goes out with a pass now
@@ -945,6 +1003,14 @@ func (self *extenderLagLifecycle) poll(now time.Time, backoff time.Duration) (ti
 		// the installed certificate, if any, is served until it expires or is
 		// withdrawn: a transient answer must not take a valid one down (C4)
 		self.certificate.setHeld(nil, answeredNames)
+		if otherNames {
+			// the request for the names asked for now goes out with a pass now,
+			// once while the refusal stands, as for another key's
+			self.askForPass(
+				"request refused for "+strings.Join(result.Names, ",")+" "+result.KeySha256,
+				"the operator refused a measurement request for other names than it issues for",
+			)
+		}
 		return self.idlePollTime(now, backoff)
 
 	default:
@@ -1051,9 +1117,13 @@ func (self *extenderLagLifecycle) getCertificate() (*extenderMeasurementCertResu
 // The certificate route's answer (A8). The json is the server's contract.
 type extenderMeasurementCertResult struct {
 	State string `json:"state"`
-	// the extender's one measurement name: the request's when pending or
+	// the extender's measurement names: the request's when pending or
 	// refused, the certificate's when issued or withdrawn
 	Names []string `json:"names,omitempty"`
+	// whether the operator issues for the family-pinned names (K6); an
+	// operator from before them leaves it out, and issues for the measurement
+	// name alone
+	FamilyNames bool `json:"family_names,omitempty"`
 	// the issued chain, leaf first
 	ChainPem string `json:"chain_pem,omitempty"`
 	// RFC 3339. The leaf's own NotAfter is what is read.
