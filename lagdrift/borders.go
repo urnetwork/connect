@@ -121,6 +121,7 @@ func NewBorders(version string, countries []Country) (*Borders, error) {
 				}
 			}
 		}
+		country.index = newCountryIndex(country.Polygons)
 		borders.countries = append(borders.countries, *country)
 		borders.polygonBoxes = append(borders.polygonBoxes, boxes)
 		borders.countryBoxes = append(borders.countryBoxes, countryBox)

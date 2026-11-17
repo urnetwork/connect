@@ -62,12 +62,76 @@ func KForConfidence(confidence float64) float64 {
 type Country struct {
 	Code     string      `json:"code"`
 	Polygons [][][]Point `json:"polygons"`
+
+	// bounds on each polygon, for skipping the far ones; Borders sets it,
+	// and a country without it is searched whole, to the same result
+	index *countryIndex
+}
+
+// Bounds on each of a country's polygons.
+type countryIndex struct {
+	polygons []polygonBound
+}
+
+type polygonBound struct {
+	// the outline's degree box
+	box degreeBox
+	// every boundary point, and every chord the region test draws between
+	// them, is within radiusKm of center
+	center   Point
+	radiusKm float64
+}
+
+// Bounds on a country's polygons. A lon/lat-straight edge stays within half
+// its length, at most √(Δlat² + Δlon²) degrees of 111.2 km, of its nearer end,
+// and a chord between split points in the azimuthal plane, within 10,000 km,
+// strays from the edge by less than 32 km more.
+func newCountryIndex(polygons [][][]Point) *countryIndex {
+	index := &countryIndex{polygons: make([]polygonBound, len(polygons))}
+	for i, polygon := range polygons {
+		bound := polygonBound{box: emptyBox()}
+		if len(polygon) == 0 || len(polygon[0]) == 0 {
+			bound.radiusKm = math.Inf(1)
+			index.polygons[i] = bound
+			continue
+		}
+		sum := vector3{}
+		for _, ring := range polygon {
+			for _, p := range ring {
+				sum = sum.add(unitVector(p))
+			}
+		}
+		for _, p := range polygon[0] {
+			bound.box.add(p)
+		}
+		if sum.norm() < 1e-9 {
+			bound.radiusKm = math.Inf(1)
+			index.polygons[i] = bound
+			continue
+		}
+		bound.center = sum.point()
+		vertexKm := 0.0
+		halfEdgeKm := 0.0
+		for _, ring := range polygon {
+			for j, p := range ring {
+				vertexKm = math.Max(vertexKm, DistanceKm(bound.center, p))
+				q := ring[(j+1)%len(ring)]
+				halfEdgeKm = math.Max(halfEdgeKm, math.Hypot(q.Lat-p.Lat, q.Lon-p.Lon)*111.2/2)
+			}
+		}
+		bound.radiusKm = vertexKm + halfEdgeKm + 32
+		index.polygons[i] = bound
+	}
+	return index
 }
 
 // p is inside one of the country's polygons and in none of that polygon's
 // holes.
 func (self *Country) Contains(p Point) bool {
-	for _, polygon := range self.Polygons {
+	for i, polygon := range self.Polygons {
+		if self.index != nil && !self.index.polygons[i].box.contains(p) {
+			continue
+		}
 		if polygonContains(polygon, p) {
 			return true
 		}
@@ -149,7 +213,16 @@ func judgeK(f *Fit, c *Country, k float64) Judgement {
 		return Judgement{D: inf, DistanceKm: inf, MarginKm: inf, K: k}
 	}
 	search := newBoundarySearch(f.At, f.Cov)
-	for _, polygon := range c.Polygons {
+	sigmaMajorKm := search.sigmaMajorKm()
+	for i, polygon := range c.Polygons {
+		// a polygon whose every point is farther than the best in whitened
+		// space can't hold the nearest
+		if c.index != nil && search.found {
+			bound := c.index.polygons[i]
+			if search.best < (DistanceKm(f.At, bound.center)-bound.radiusKm)/sigmaMajorKm {
+				continue
+			}
+		}
 		for _, ring := range polygon {
 			search.ring(ring)
 		}
@@ -218,6 +291,15 @@ func newBoundarySearch(at Point, cov [2][2]float64) *boundarySearch {
 		l22:        l22,
 		best:       math.Inf(1),
 	}
+}
+
+// The whitening's largest axis, √λ_max(LLᵀ), km: no point is nearer in
+// whitened space than its distance over this.
+func (self *boundarySearch) sigmaMajorKm() float64 {
+	s00 := self.l11 * self.l11
+	s01 := self.l11 * self.l21
+	s11 := self.l21*self.l21 + self.l22*self.l22
+	return math.Sqrt((s00+s11)/2 + math.Hypot((s00-s11)/2, s01))
 }
 
 // L⁻¹ applied to east and north km.

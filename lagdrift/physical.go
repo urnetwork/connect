@@ -48,6 +48,8 @@ const (
 // One extender's disc of the physical check.
 type physicalDisc struct {
 	center vector3
+	// the center as a place
+	point Point
 	// the radius as an angle, radians
 	angle float64
 	// the cosines of the radius widened by boundaryCoverKm and by
@@ -71,7 +73,11 @@ func PhysicallyPossible(obs []Observation, c *Country) bool {
 
 	// (a) the boundary
 	possible := false
-	for _, polygon := range c.Polygons {
+	for i, polygon := range c.Polygons {
+		// a polygon outside two widened discs has no sample that counts
+		if c.index != nil && farFromTwo(discs, c.index.polygons[i]) {
+			continue
+		}
 		for _, ring := range polygon {
 			eachBoundarySample(ring, func(p Point) bool {
 				if outsideAtMostOne(discs, unitVector(p), true) {
@@ -99,6 +105,25 @@ func PhysicallyPossible(obs []Observation, c *Country) bool {
 	for _, candidate := range candidates {
 		if outsideAtMostOne(discs, candidate, false) && c.Contains(candidate.point()) {
 			return true
+		}
+	}
+	return false
+}
+
+// Every point of the polygon is outside at least two discs widened by
+// boundaryCoverKm.
+func farFromTwo(discs []physicalDisc, bound polygonBound) bool {
+	if math.IsInf(bound.radiusKm, 1) {
+		return false
+	}
+	outside := 0
+	for _, disc := range discs {
+		reachKm := disc.angle*EarthRadiusKm + boundaryCoverKm
+		if reachKm < DistanceKm(disc.point, bound.center)-bound.radiusKm {
+			outside += 1
+			if 1 < outside {
+				return true
+			}
 		}
 	}
 	return false
@@ -141,6 +166,7 @@ func physicalDiscs(obs []Observation) []physicalDisc {
 		angle := radiusKm / EarthRadiusKm
 		discs = append(discs, physicalDisc{
 			center:       unitVector(e.at),
+			point:        e.at,
 			angle:        angle,
 			coverCos:     capCos(angle + boundaryCoverKm/EarthRadiusKm),
 			toleranceCos: capCos(angle + circleToleranceKm/EarthRadiusKm),
