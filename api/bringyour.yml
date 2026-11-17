@@ -9613,9 +9613,18 @@ paths:
         estimate instead: split-adjusted distinct routable egress-IP breadth
         from the live trail egress index, with `floor` the score of the last
         network inside `cutoff` (0 while fewer networks score).
-        `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
-        "server" until validators publish consensus scores on chain; a chain
-        outage degrades to the estimate, never an error.
+        A network qualifies (`eligible`) only while the validator can measure
+        it, the rule the claim guide states (since 2026-11-17; before, it
+        meant the rank alone, which `in_head` now carries): `measurable` and
+        `not_measurable_reason` are the board's, as `GET /sn/top/me` gives
+        them, and `claim_prompt` is the board's claim prompt, the one the
+        Earnings tile shows Claim your spot on. The live estimate knows no
+        measurability, so before the first snapshot no network is eligible.
+        `bound`/`hotkey`/`uid` reflect an active head binding. `chain_id`,
+        `netuid` and `coordinator` name the deployment a fleet manifest
+        binds to. `source` is "server" until validators publish consensus
+        scores on chain; a chain outage degrades to the estimate, never an
+        error.
       operationId: snHead
       security:
         - BearerAuth: []
@@ -21059,15 +21068,46 @@ components:
         - floor
         - rank_estimate
         - cutoff
+        - in_head
+        - measurable
+        - not_measurable_reason
+        - claim_prompt
         - bound
         - uid
         - rank
         - epoch
         - netuid
+        - chain_id
         - source
       properties:
         eligible:
-          description: The estimate places the network inside the cutoff.
+          description: |
+            The network qualifies for a head spot: `in_head` and `measurable`.
+            Until 2026-11-17 it meant `in_head` alone.
+          type: boolean
+        in_head:
+          description: |
+            The board ranks the network inside the cutoff with a positive
+            score, measurable or not.
+          type: boolean
+        measurable:
+          description: |
+            The validator can measure the network: the board's own row says
+            so. False before the board's first snapshot.
+          type: boolean
+        not_measurable_reason:
+          description: |
+            Why the network is not measurable, as `GET /sn/top/me` gives it:
+            `not_in_cohort` (none of its providers is in the set the validator
+            measures), `shared_egress` (its providers' egress is shared with
+            another network), `not_providing` (no row on the board); empty
+            when it is measurable or before the board's first snapshot.
+          type: string
+          enum: ["", not_in_cohort, shared_egress, not_providing]
+        claim_prompt:
+          description: |
+            The board's claim prompt: measurable, inside the cutoff and not
+            claimed yet. The Earnings tile shows Claim your spot on it.
           type: boolean
         score:
           description: |
@@ -21106,6 +21146,12 @@ components:
           type: integer
         netuid:
           type: integer
+        chain_id:
+          description: The EVM chain id a fleet manifest names; 0 while unset.
+          type: integer
+        coordinator:
+          description: The coordinator contract a fleet manifest names, lowercase 0x hex; absent while unset.
+          type: string
         source:
           description: '"server" (estimate) or "chain" (validator consensus).'
           type: string
