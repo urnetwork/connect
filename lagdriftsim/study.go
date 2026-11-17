@@ -39,8 +39,14 @@ type studyConfig struct {
 	// distance from the address's place (a distance-dependent s_ext), within
 	// lagdrift's [10, 100] km hold
 	placeErrorPerKm float64
-	// more extender sites, for a denser fleet
+	// the fleet's sites in place of extenderSites, and more sites besides
+	sites      []extenderSite
 	extraSites []extenderSite
+	// how a run's extenders are chosen (choice.go)
+	choiceMode string
+	// the review's rule (V10): an interrupted run counts only if converged
+	// or clear held, by the server's check, when the silence began
+	interruptedRule bool
 	// the runs each visitor makes: 1 to 3, 0 for 3
 	runs int
 	// V10's cadence: the frame refits warm at each ping round and runs the
@@ -134,6 +140,9 @@ func buildVisitors(w *world, seed uint64, counts []scenarioCount, firstIndex int
 			if 0 < len(count.regions) && !slices.Contains(count.regions, region) {
 				continue
 			}
+			if 0 < len(sc.pairs) {
+				continue
+			}
 			cities := regionCities[region]
 			for k := 0; k < count.perRegion; k++ {
 				c := cities[k%len(cities)]
@@ -158,7 +167,36 @@ func buildVisitors(w *world, seed uint64, counts []scenarioCount, firstIndex int
 			}
 		}
 	}
+	// the named pairs: perRegion visitors each, in their city's region
+	for _, count := range counts {
+		sc := count.scenario
+		for _, pair := range sc.pairs {
+			c, ok := cityNamed(pair.cityName)
+			for k := 0; k < count.perRegion; k++ {
+				var spec *visitorSpec
+				if ok && w.borders != nil {
+					spec = realPair(index, sc, c, pair.code, w.borders, seed)
+				}
+				if spec == nil {
+					skipped[sc.name+", "+pair.cityName+"/"+pair.code] += 1
+				} else {
+					specs = append(specs, spec)
+				}
+				index += 1
+			}
+		}
+	}
 	return specs, skipped
+}
+
+// The visitor city of a name.
+func cityNamed(name string) (visitorCity, bool) {
+	for _, c := range visitorCities {
+		if c.name == name {
+			return c, true
+		}
+	}
+	return visitorCity{}, false
 }
 
 // Simulates every visitor under every policy.

@@ -681,3 +681,134 @@ func cadenceTable(refits *studyResult, full *studyResult) string {
 	}
 	return t.String()
 }
+
+// The VPN parts that ran, by pool, in the modes' order.
+func vpnPartsOf(parts []*studyPart, results map[string]*studyResult, pool string) ([]string, []*studyResult) {
+	modes := []string{}
+	ran := []*studyResult{}
+	for _, part := range parts {
+		if result, ok := results[part.name]; ok && strings.HasPrefix(part.name, "VPN: "+pool+", ") {
+			modes = append(modes, part.config.choiceMode)
+			ran = append(ran, result)
+		}
+	}
+	return modes, ran
+}
+
+// Power against a VPN at 99%, k_early 4: per named pair or distance, after 1
+// and 3 runs, under each choice.
+func vpnPowerTable(parts []*studyPart, results map[string]*studyResult, pool string, byPair bool) string {
+	modes, ran := vpnPartsOf(parts, results, pool)
+	if len(ran) == 0 {
+		return ""
+	}
+	header := []string{"Visitor / address", "Distance to the country, km"}
+	if !byPair {
+		header = []string{"Claim", "Distance to the country, km"}
+	}
+	for _, mode := range modes {
+		header = append(header, mode+": 1 run", "3 runs")
+	}
+	t := &table{header: header}
+	type row struct {
+		name   string
+		filter visitorFilter
+	}
+	rows := []row{}
+	if byPair {
+		for _, pair := range vpnPairs {
+			name := pair.cityName + "/" + strings.ToUpper(pair.code)
+			rows = append(rows, row{name: name, filter: func(s *visitorSummary) bool { return s.scenario == scenarioVpnPairs && s.claimName == name }})
+		}
+		rows = append(rows, row{name: "All pairs", filter: ofScenario(scenarioVpnPairs)})
+	} else {
+		for _, sc := range vpnScenarios {
+			rows = append(rows, row{name: formatThousands(sc.claimKm) + " km", filter: ofScenario(sc)})
+		}
+	}
+	for _, r := range rows {
+		distances := []float64{}
+		for _, s := range ran[0].summaries {
+			if r.filter(s) {
+				distances = append(distances, s.borderKm)
+			}
+		}
+		cells := []string{r.name, fmt.Sprintf("%.0f", median(distances))}
+		for _, result := range ran {
+			policy := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
+			cells = append(cells, result.rateOf(r.filter, policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+				result.rateOf(r.filter, policy, result.runs()-1, verdictIs(1, lagdrift.VerdictDisagree)).short())
+		}
+		t.add(cells...)
+	}
+	return t.String()
+}
+
+// Each VPN part's k_early, false rejects and power side by side.
+func vpnVariantTable(parts []*studyPart, results map[string]*studyResult) string {
+	t := &table{header: []string{"Fleet, choice", "k_early by the rule", "False rejects, 99%, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Worst cell at 99.9%", "Region misses, 99%", "VPN pairs: 1 run", "3 runs", "Median stop, s"}}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "VPN: ") {
+			continue
+		}
+		policy := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
+		checks, recommended := recommendEarlyK(result)
+		rule := "none holds"
+		if 0 <= recommended {
+			rule = formatK(checks[recommended].k)
+		}
+		worst := rate{}
+		for _, sc := range result.present(honestScenarios) {
+			for run := 0; run < result.runs(); run++ {
+				r := result.rateOf(ofScenario(sc), policy, run, verdictIs(2, lagdrift.VerdictDisagree))
+				if worst.n == 0 || worst.value() < r.value() {
+					worst = r
+				}
+			}
+		}
+		last := result.runs() - 1
+		times := result.stopTimes(func(*visitorSummary) bool { return true }, policy, 0)
+		t.add(strings.TrimPrefix(part.name, "VPN: "), rule,
+			result.rateOf(ofScenario(scenarioTiny), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioTiny), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioRealHonest), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioRealHonest), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			worst.short(),
+			result.missRate(ofScenario(scenarioTiny), policy, 0, 1).short(),
+			result.rateOf(ofScenario(scenarioVpnPairs), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioVpnPairs), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			quantile(times, 0.5))
+	}
+	return t.String()
+}
+
+// The interrupted-stop rule: honest V10 and the silent attacker, without and
+// with it, after one run at 99%.
+func interruptedTable(parts []*studyPart, results map[string]*studyResult) string {
+	t := &table{header: []string{"Rule", "Client", "Claims agree: 300 km", "1,000 km", "3,000 km", "Claims rejected: 300 km", "1,000 km", "3,000 km", "False rejects (tiny)", "Runs that don't count", "interrupted"}}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "interrupted: ") {
+			continue
+		}
+		for p, policy := range result.config.policies {
+			client := "honest (V10)"
+			if policy.attack {
+				client = "silent at a favourable look"
+			}
+			row := []string{strings.TrimPrefix(part.name, "interrupted: "), client}
+			for _, verdict := range []lagdrift.Verdict{lagdrift.VerdictAgree, lagdrift.VerdictDisagree} {
+				for _, sc := range []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000} {
+					row = append(row, result.rateOf(ofScenario(sc), p, 0, verdictIs(1, verdict)).short())
+				}
+			}
+			all := func(*visitorSummary) bool { return true }
+			row = append(row, result.rateOf(ofScenario(scenarioTiny), p, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+				result.rateOf(all, p, 0, func(r runSummary) bool { return !r.counted }).short(),
+				result.rateOf(all, p, 0, func(r runSummary) bool { return r.reason == lagdrift.StopInterrupted }).short())
+			t.add(row...)
+		}
+	}
+	return t.String()
+}

@@ -16,6 +16,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/urnetwork/connect/lagdrift"
@@ -98,13 +99,18 @@ type worldConfig struct {
 	// an extender that is somewhere else entirely, 300 to 1,500 km from its
 	// place: a share of the fleet, 0 in the study's main world
 	misplacedShare float64
-	// sites added to extenderSites
+	// the sites in place of extenderSites, and sites added to them
+	sites      []extenderSite
 	extraSites []extenderSite
 }
 
 func newWorld(config worldConfig, borders *lagdrift.Borders) *world {
 	w := &world{borders: borders}
-	sites := append(slices.Clone(extenderSites), config.extraSites...)
+	sites := extenderSites
+	if config.sites != nil {
+		sites = config.sites
+	}
+	sites = append(slices.Clone(sites), config.extraSites...)
 	for i := range sites {
 		s := &sites[i]
 		for k := 1; k <= s.count; k++ {
@@ -175,6 +181,8 @@ type scenario struct {
 	depthKm  float64
 	// a claim's country: its nearest point is about this far from the truth, km
 	claimKm float64
+	// named claims: a city and the country its address claims
+	pairs []vpnPair
 }
 
 // One simulated visitor: where they are, what their address says, and the
@@ -388,4 +396,41 @@ func realClaimOptions(borders *lagdrift.Borders) map[string][]claimOption {
 		}
 	}
 	return options
+}
+
+// A named pair's visitor: in the pair's city, with an address in the claimed
+// country at its claim place. nil when the borders lack the country, or the
+// truth is in it.
+func realPair(index int, sc *scenario, c visitorCity, code string, borders *lagdrift.Borders, seed uint64) *visitorSpec {
+	var claimed *place
+	for i := range claimPlaces {
+		if claimPlaces[i].code == code {
+			claimed = &claimPlaces[i]
+			break
+		}
+	}
+	country := borders.Country(code)
+	if claimed == nil || country == nil {
+		return nil
+	}
+	r := newRand(seed, drawScenario, stringKey(sc.name), uint64(index))
+	truth := drawTruth(c, r)
+	local := localCountry(country, localKeepKm, truth, claimed.at)
+	inside, borderKm := borderDistanceKm(local, truth)
+	if inside {
+		return nil
+	}
+	return &visitorSpec{
+		index:     index,
+		scenario:  sc,
+		region:    c.region,
+		city:      c,
+		truth:     truth,
+		ipPlace:   claimed.at,
+		ipCode:    code,
+		ipCountry: local,
+		claimName: c.name + "/" + strings.ToUpper(code),
+		borderKm:  borderKm,
+		fleet:     index % fleetCount,
+	}
 }

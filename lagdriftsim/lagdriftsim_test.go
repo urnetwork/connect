@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -308,5 +309,116 @@ func TestCadence(t *testing.T) {
 		if !reflect.DeepEqual(one.summaries[i].runs, four.summaries[i].runs) {
 			t.Fatalf("visitor %d differs with 4 workers", i)
 		}
+	}
+}
+
+// The VPN variants of E2: the joint spread keeps the mid and far bands off
+// the near band's directions, the hubs take an extender at each hub beyond
+// 300 km, and the information choice keeps E2's near band and fills 12.
+func TestChoiceVariants(t *testing.T) {
+	ip := lagdrift.Point{Lat: 40.4, Lon: -3.7}
+	candidates := []choiceCandidate{}
+	add := func(bearing float64, km float64) int {
+		p := destination(ip, bearing, km)
+		candidates = append(candidates, choiceCandidate{index: len(candidates), distanceKm: lagdrift.DistanceKm(ip, p), bearingDeg: lagdrift.BearingDeg(ip, p)})
+		return len(candidates) - 1
+	}
+	// the near extenders all to the north east
+	for i := 0; i < 4; i++ {
+		add(40+float64(i), 150+float64(10*i))
+	}
+	for i := 0; i < 24; i++ {
+		add(float64(15*i), 1000)
+		add(float64(15*i)+7, 5000)
+	}
+	joint := chooseExtendersBy(candidates, choiceOptions{mode: choiceJoint}, newRand(1, 1))
+	for _, index := range joint.primaries[nearCount:] {
+		if gap := math.Abs(math.Remainder(candidates[index].bearingDeg-41.5, 360)); gap < 20 {
+			t.Errorf("the joint spread took an extender %g° from the near band's direction", gap)
+		}
+	}
+	hubs := chooseExtendersBy(candidates, choiceOptions{mode: choiceHubs, hubIndexes: []int{0, 4, 5, 6}}, newRand(1, 2))
+	for _, hub := range []int{4, 5, 6} {
+		if !slices.Contains(hubs.primaries, hub) {
+			t.Errorf("the hub extender %d wasn't taken", hub)
+		}
+	}
+	w := newWorld(worldConfig{seed: 1}, nil)
+	spec := syntheticHonest(0, scenarioTiny, visitorCities[0], 1)
+	sim := &visitorSim{world: w, config: &studyConfig{seed: 1, modelKappa: 0.25}, spec: spec, fleet: w.fleets[0], model: lagdrift.DefaultModel()}
+	pool := []choiceCandidate{}
+	for i := range w.pool {
+		at := w.fleets[0][i].at
+		pool = append(pool, choiceCandidate{index: i, distanceKm: lagdrift.DistanceKm(spec.ipPlace, at), bearingDeg: lagdrift.BearingDeg(spec.ipPlace, at)})
+	}
+	e2 := chooseExtendersBy(pool, choiceOptions{mode: choiceE2}, newRand(1, 3))
+	information := chooseExtendersBy(pool, choiceOptions{mode: choiceInformation, score: sim.informationScore()}, newRand(1, 3))
+	if len(information.primaries) != runExtenders || !reflect.DeepEqual(e2.primaries[:nearCount], information.primaries[:nearCount]) {
+		t.Errorf("the information choice: %v, E2's near band %v", information.primaries, e2.primaries[:nearCount])
+	}
+	if score := sim.informationScore(); !(score(choiceOf(pool, information.primaries)) < score(choiceOf(pool, e2.primaries))) {
+		t.Errorf("the information choice scores no better than E2's")
+	}
+}
+
+func choiceOf(pool []choiceCandidate, indexes []int) []choiceCandidate {
+	out := []choiceCandidate{}
+	for _, index := range indexes {
+		out = append(out, pool[index])
+	}
+	return out
+}
+
+// The review's interrupted rule: a client that goes silent at a favourable
+// look before any stop rule held counts without the rule and not with it.
+func TestInterruptedRule(t *testing.T) {
+	w := newWorld(worldConfig{seed: 5}, nil)
+	specs, _ := buildVisitors(w, 5, []scenarioCount{{scenario: scenarioClaim300, perRegion: 3}}, 0)
+	counted := map[bool]int{}
+	attacked := 0
+	for _, rule := range []bool{false, true} {
+		config := baseConfig(5, []stopPolicy{attackPolicy()})
+		config.runs = 1
+		config.interruptedRule = rule
+		result := runStudy(w, &config, specs)
+		for _, s := range result.summaries {
+			r := s.runs[0][0]
+			if r.reason != lagdrift.StopInterrupted {
+				continue
+			}
+			if !rule {
+				attacked += 1
+			}
+			if r.counted {
+				counted[rule] += 1
+			}
+		}
+	}
+	if attacked == 0 {
+		t.Fatalf("no client went silent")
+	}
+	if !(counted[true] < counted[false]) {
+		t.Errorf("silent runs counted: %d without the rule, %d with it", counted[false], counted[true])
+	}
+}
+
+// A named pair's visitor is in its city, with the address at the claimed
+// country's claim place, and outside that country.
+func TestRealPair(t *testing.T) {
+	frankfurt := lagdrift.Point{Lat: 50.1109, Lon: 8.6821}
+	borders, err := lagdrift.NewBorders("test", []lagdrift.Country{*diskCountry("de", frankfurt, 300, 72)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	madrid, _ := cityNamed("Madrid")
+	spec := realPair(0, scenarioVpnPairs, madrid, "de", borders, 1)
+	if spec == nil {
+		t.Fatalf("no visitor")
+	}
+	if spec.ipPlace != frankfurt || spec.claimName != "Madrid/DE" || spec.ipCountry.Contains(spec.truth) {
+		t.Errorf("the visitor: %+v", spec)
+	}
+	if d := lagdrift.DistanceKm(spec.truth, frankfurt) - 300; math.Abs(spec.borderKm-d) > 5 {
+		t.Errorf("%g km from the border, expected about %g", spec.borderKm, d)
 	}
 }

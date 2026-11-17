@@ -58,6 +58,19 @@ type stopPolicy struct {
 	// converged's window, ms, and its area ratio
 	windowMs  int64
 	areaRatio float64
+	// a custom client that goes silent at its first look whose region
+	// touches the IP country at 99% once the run would count, or when clear
+	// would stop it outside, ending the run as interrupted at a moment it
+	// likes (review F-02)
+	attack bool
+}
+
+// The attacker of the interrupted-stop gap, at V10 otherwise.
+func attackPolicy() stopPolicy {
+	p := v10Policy(lagdrift.EarlyK)
+	p.name = "silent at a favourable look"
+	p.attack = true
+	return p
 }
 
 // V10's policy at a k_early.
@@ -82,7 +95,7 @@ func formatK(k float64) string {
 
 // The policy is lagdrift's own V10, so EvaluateStop decides as it does.
 func (self stopPolicy) isLagdrift() bool {
-	return self.earlyK == lagdrift.EarlyK && self.converged &&
+	return self.earlyK == lagdrift.EarlyK && self.converged && !self.attack &&
 		self.extenders == lagdrift.StopExtenders && self.roundTrips == lagdrift.StopRoundTrips &&
 		self.windowMs == lagdrift.StopWindowMs && self.areaRatio == lagdrift.BrowserStopTolerance.AreaRatio
 }
@@ -103,8 +116,10 @@ type tickState struct {
 	fit        *lagdrift.Fit
 	roundTrips []int
 	lastPongMs int64
-	// Judge's D against the IP country, once asked for
+	// Judge's D against the IP country, and whether the fit is in it, once
+	// asked for
 	d      float64
+	inside bool
 	judged bool
 	// under the cadence: the fit was the full multi-start, and its
 	// observations, for the full fit before a stop
@@ -278,6 +293,95 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 	return sim.outcome
 }
 
+// How this visitor's runs choose their extenders.
+func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOptions {
+	options := choiceOptions{mode: self.config.choiceMode}
+	switch options.mode {
+	case choiceHubs:
+		// each hub's nearest serving extender, the hubs nearest the address's
+		// place first
+		hubs := slices.Clone(vpnHubs)
+		slices.SortStableFunc(hubs, func(a place, b place) int {
+			return compareFloat(lagdrift.DistanceKm(self.spec.ipPlace, a.at), lagdrift.DistanceKm(self.spec.ipPlace, b.at))
+		})
+		for _, hub := range hubs {
+			best := -1
+			bestKm := math.Inf(1)
+			for _, c := range candidates {
+				if km := lagdrift.DistanceKm(hub.at, self.fleet[c.index].at); km < bestKm {
+					best = c.index
+					bestKm = km
+				}
+			}
+			if 0 <= best && bestKm < midMinKm {
+				options.hubIndexes = append(options.hubIndexes, best)
+			}
+		}
+	case choiceInformation:
+		options.score = self.informationScore()
+	}
+	return options
+}
+
+// A set's expected region, by the model's variances, averaged in log over
+// plausible places for the visitor: the address's place (weight 1) and the VPN
+// hubs (1/7 each). Lower is better. A place's region is the position block of
+// the inverse information of (east, north, b), b free; a near extender's
+// direction fades within 10 km of it, as lagdrift smooths its distance there.
+func (self *visitorSim) informationScore() func(picked []choiceCandidate) float64 {
+	type weighted struct {
+		at     lagdrift.Point
+		weight float64
+	}
+	places := []weighted{{at: self.spec.ipPlace, weight: 1}}
+	for _, hub := range vpnHubs {
+		places = append(places, weighted{at: hub.at, weight: 1 / float64(len(vpnHubs))})
+	}
+	const measurementMs = 0.3
+	return func(picked []choiceCandidate) float64 {
+		total := 0.0
+		for _, p := range places {
+			var a [3][3]float64
+			for _, c := range picked {
+				e := self.fleet[c.index]
+				d := lagdrift.DistanceKm(p.at, e.at)
+				beta := lagdrift.BearingDeg(p.at, e.at) * radPerDeg
+				fade := math.Min(1, d/10)
+				j := [3]float64{-math.Sin(beta) * lagdrift.MsPerKm * fade, -math.Cos(beta) * lagdrift.MsPerKm * fade, 1}
+				route := self.model.Kappa * lagdrift.MsPerKm * d
+				placeMs := lagdrift.MsPerKm * lagdrift.HeldPlaceErrorKm(e.placeErrorKm)
+				variance := measurementMs*measurementMs + self.model.Sigma0Ms*self.model.Sigma0Ms + route*route + placeMs*placeMs
+				for u := 0; u < 3; u++ {
+					for v := 0; v < 3; v++ {
+						a[u][v] += j[u] * j[v] / variance
+					}
+				}
+			}
+			total += p.weight * positionLogDet(a)
+		}
+		return total
+	}
+}
+
+// log det of the position block of a 3 × 3 information's inverse, or a large
+// number when it is singular.
+func positionLogDet(a [3][3]float64) float64 {
+	det := a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1]) - a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0]) + a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0])
+	if !(1e-30 < math.Abs(det)) {
+		return 1e6
+	}
+	// the inverse's position block is the adjugate's over det
+	c00 := (a[1][1]*a[2][2] - a[1][2]*a[2][1]) / det
+	c01 := -(a[0][1]*a[2][2] - a[0][2]*a[2][1]) / det
+	c10 := -(a[1][0]*a[2][2] - a[1][2]*a[2][0]) / det
+	c11 := (a[0][0]*a[2][2] - a[0][2]*a[2][0]) / det
+	block := c00*c11 - c01*c10
+	if !(0 < block) {
+		return 1e6
+	}
+	return math.Log(block)
+}
+
 // The model's κ for a region's visitors.
 func modelKappaFor(config *studyConfig, region string) float64 {
 	if kappa, ok := config.regionModelKappas[region]; ok {
@@ -340,7 +444,7 @@ func (self *visitorSim) openSessions() {
 				used:       used[i],
 			})
 		}
-		c := chooseExtenders(candidates, newRand(self.config.seed, drawChoice, uint64(self.spec.index), uint64(run)))
+		c := chooseExtendersBy(candidates, self.choiceOptions(candidates), newRand(self.config.seed, drawChoice, uint64(self.spec.index), uint64(run)))
 		self.choices[run] = c
 		r := newRand(self.config.seed, drawRun, uint64(self.spec.index), uint64(run))
 		link := drawRunLink(&self.access, r)
@@ -398,7 +502,7 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 			prior = append(prior, obs...)
 		}
 		trace := self.trace(run, strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), prior)
-		tick, reason := trace.stopFor(policy)
+		stopTrace, tick, reason := trace.stopFor(policy)
 		if self.checks && policy.isLagdrift() && !trace.cadence {
 			trace.checkStops(tick)
 		}
@@ -408,6 +512,14 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 			reason:  reason,
 			usable:  len(obs),
 			counted: countingExtenders <= len(obs),
+		}
+		if outcome.counted && self.config.interruptedRule && reason == lagdrift.StopInterrupted {
+			// the silence began at the attacker's look, or at the last pong
+			silence := tick
+			if !policy.attack {
+				silence = int(stopTrace.tick(tick).lastPongMs / tickMs)
+			}
+			outcome.counted = stopTrace.heldAt(policy, silence)
 		}
 		if outcome.counted {
 			countingKeys = append(countingKeys, fmt.Sprintf("%d@%d", run, tick))
@@ -564,7 +676,9 @@ func (self *runTrace) d(j int) float64 {
 		state.judged = true
 		state.d = math.Inf(1)
 		if state.fit != nil {
-			state.d = lagdrift.Judge(state.fit, self.sim.spec.ipCountry, lagdrift.DefaultConfidence).D
+			j := lagdrift.Judge(state.fit, self.sim.spec.ipCountry, lagdrift.DefaultConfidence)
+			state.d = j.D
+			state.inside = j.Inside
 		}
 	}
 	return state.d
@@ -574,13 +688,22 @@ func (self *runTrace) d(j int) float64 {
 // holds, in EvaluateStop's order, and the rule. Under the cadence, a stop on a
 // warm refit first runs the full fit, and goes on in a fork when that lands in
 // another basin.
-func (self *runTrace) stopFor(policy stopPolicy) (int, lagdrift.StopReason) {
+func (self *runTrace) stopFor(policy stopPolicy) (*runTrace, int, lagdrift.StopReason) {
 	trace := self
 	first := int(lagdrift.StopEarliestMs / tickMs)
 	for j := first; j <= capTicks; j++ {
+		// the attacker waits until the run would count, 6 extenders with 12
+		// round trips (E5), then goes silent at a look that touches
+		if state := trace.tick(j); policy.attack && state.fit != nil && enoughRoundTrips(state.roundTrips, countingExtenders, policy.roundTrips) && trace.touches(j) {
+			return trace, j, lagdrift.StopInterrupted
+		}
 		reason, ok := trace.rule(policy, j)
 		if !ok {
 			continue
+		}
+		if policy.attack && reason == lagdrift.StopClear {
+			// clear outside: the client goes silent rather than be rejected
+			return trace, j, lagdrift.StopInterrupted
 		}
 		if trace.cadence && (reason == lagdrift.StopClear || reason == lagdrift.StopConverged) && !trace.tick(j).full {
 			if fork := trace.forkAt(j); fork != nil {
@@ -589,9 +712,30 @@ func (self *runTrace) stopFor(policy stopPolicy) (int, lagdrift.StopReason) {
 				continue
 			}
 		}
-		return j, reason
+		return trace, j, reason
 	}
-	return capTicks, lagdrift.StopCap
+	return trace, capTicks, lagdrift.StopCap
+}
+
+// The region at 99% touches the IP country at ping round j: the fit is in it
+// or D is within k.
+func (self *runTrace) touches(j int) bool {
+	d := self.d(j)
+	return self.tick(j).inside || d <= lagdrift.KForConfidence(lagdrift.DefaultConfidence)
+}
+
+// converged or clear held at ping round j by the server's check, with its
+// wider tolerance (V10): what an interrupted run needs to count under the
+// review's rule.
+func (self *runTrace) heldAt(policy stopPolicy, j int) bool {
+	if j < int(lagdrift.StopEarliestMs/tickMs) {
+		return false
+	}
+	server := policy
+	server.attack = false
+	server.areaRatio = lagdrift.ServerStopTolerance.AreaRatio
+	reason, ok := self.rule(server, j)
+	return ok && (reason == lagdrift.StopConverged || reason == lagdrift.StopClear)
 }
 
 // The rule that holds at ping round j under a policy, if one does.

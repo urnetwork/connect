@@ -404,6 +404,50 @@ func reportFindings(parts []*studyPart, results map[string]*studyResult, times f
 		}
 		b.WriteString("\n")
 	}
+	vpnLines := []string{}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "VPN: ") || result.count(ofScenario(scenarioVpnPairs)) == 0 {
+			continue
+		}
+		policy := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
+		last := result.runs() - 1
+		pairs := []string{}
+		for _, pair := range vpnPairs {
+			name := pair.cityName + "/" + strings.ToUpper(pair.code)
+			filter := func(s *visitorSummary) bool { return s.scenario == scenarioVpnPairs && s.claimName == name }
+			pairs = append(pairs, fmt.Sprintf("%s %s/%s", name,
+				result.rateOf(filter, policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+				result.rateOf(filter, policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short()))
+		}
+		vpnLines = append(vpnLines, fmt.Sprintf("- %s: rejected after 1/%d runs: %s; tiny-country false rejects %s/%s.",
+			strings.TrimPrefix(part.name, "VPN: "), last+1, strings.Join(pairs, ", "),
+			result.rateOf(ofScenario(scenarioTiny), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioTiny), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short()))
+	}
+	if 0 < len(vpnLines) {
+		b.WriteString("**A visitor far from the address's place (VPN)**, at 99%:\n\n" + strings.Join(vpnLines, "\n") + "\n\n")
+	}
+	interruptedLines := []string{}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "interrupted: ") {
+			continue
+		}
+		for p, policy := range result.config.policies {
+			if !policy.attack {
+				continue
+			}
+			interruptedLines = append(interruptedLines, fmt.Sprintf("- %s: the silent client is agreed with in %s of 300 km claims and %s of 1,000 km ones; an honest client's runs that don't count: %s.",
+				strings.TrimPrefix(part.name, "interrupted: "),
+				result.rateOf(ofScenario(scenarioClaim300), p, 0, verdictIs(1, lagdrift.VerdictAgree)).short(),
+				result.rateOf(ofScenario(scenarioClaim1000), p, 0, verdictIs(1, lagdrift.VerdictAgree)).short(),
+				result.rateOf(func(*visitorSummary) bool { return true }, result.policyIndex(v10Policy(lagdrift.EarlyK).name), 0, func(r runSummary) bool { return !r.counted }).short()))
+		}
+	}
+	if 0 < len(interruptedLines) {
+		b.WriteString("**The interrupted stop** (one run, 99%):\n\n" + strings.Join(interruptedLines, "\n") + "\n\n")
+	}
 	b.WriteString("**The fit** (the checks table): ")
 	refits, moved, grids, lower := 0, 0, 0, 0
 	for _, part := range parts {

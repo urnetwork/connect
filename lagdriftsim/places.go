@@ -560,3 +560,72 @@ var claimPlaces = []place{
 	newPlace("Santiago", "cl", -33.4489, -70.6693),
 	newPlace("Nuuk", "gl", 64.1814, -51.6941),
 }
+
+// The VPN hubs: where VPN providers' servers mostly are, so where a visitor
+// whose address claims another country most likely is.
+var vpnHubs = []place{
+	newPlace("Amsterdam", "nl", 52.3676, 4.9041),
+	newPlace("Frankfurt am Main", "de", 50.1109, 8.6821),
+	newPlace("London", "gb", 51.5074, -0.1278),
+	newPlace("Ashburn", "us", 39.0438, -77.4874),
+	newPlace("San Jose", "us", 37.3382, -121.8863),
+	newPlace("Singapore", "sg", 1.3521, 103.8198),
+	newPlace("Tokyo", "jp", 35.6762, 139.6503),
+}
+
+// A sparse fleet: one extender in each of 35 major cities.
+var sparseSites = []extenderSite{
+	site("London", "gb", 51.5074, -0.1278, 1),
+	site("Amsterdam", "nl", 52.3676, 4.9041, 1),
+	site("Frankfurt am Main", "de", 50.1109, 8.6821, 1),
+	site("Paris", "fr", 48.8566, 2.3522, 1),
+	site("Madrid", "es", 40.4168, -3.7038, 1),
+	site("Milan", "it", 45.4642, 9.1900, 1),
+	site("Stockholm", "se", 59.3293, 18.0686, 1),
+	site("Warsaw", "pl", 52.2297, 21.0122, 1),
+	site("Bucharest", "ro", 44.4268, 26.1025, 1),
+	site("Istanbul", "tr", 41.0082, 28.9784, 1),
+	site("New York", "us", 40.7128, -74.0060, 1),
+	site("Ashburn", "us", 39.0438, -77.4874, 1),
+	site("Chicago", "us", 41.8781, -87.6298, 1),
+	site("Dallas", "us", 32.7767, -96.7970, 1),
+	site("Los Angeles", "us", 34.0522, -118.2437, 1),
+	site("San Jose", "us", 37.3382, -121.8863, 1),
+	site("Seattle", "us", 47.6062, -122.3321, 1),
+	site("Miami", "us", 25.7617, -80.1918, 1),
+	site("Toronto", "ca", 43.6532, -79.3832, 1),
+	site("Mexico City", "mx", 19.4326, -99.1332, 1),
+	site("São Paulo", "br", -23.5505, -46.6333, 1),
+	site("Buenos Aires", "ar", -34.6037, -58.3816, 1),
+	site("Bogotá", "co", 4.7110, -74.0721, 1),
+	site("Johannesburg", "za", -26.2041, 28.0473, 1),
+	site("Lagos", "ng", 6.5244, 3.3792, 1),
+	site("Cairo", "eg", 30.0444, 31.2357, 1),
+	site("Dubai", "ae", 25.2048, 55.2708, 1),
+	site("Mumbai", "in", 19.0760, 72.8777, 1),
+	site("Singapore", "sg", 1.3521, 103.8198, 1),
+	site("Hong Kong", "hk", 22.3193, 114.1694, 1),
+	site("Tokyo", "jp", 35.6762, 139.6503, 1),
+	site("Seoul", "kr", 37.5665, 126.9780, 1),
+	site("Jakarta", "id", -6.2088, 106.8456, 1),
+	site("Sydney", "au", -33.8688, 151.2093, 1),
+	site("Auckland", "nz", -36.8485, 174.7633, 1),
+}
+
+// A visitor in a city whose address claims a country: a VPN's virtual
+// location, the address placed at the country's claim place.
+type vpnPair struct {
+	cityName string
+	code     string
+}
+
+// The pairs the study reports one by one.
+var vpnPairs = []vpnPair{
+	{cityName: "Madrid", code: "de"},
+	{cityName: "Paris", code: "nl"},
+	{cityName: "Warsaw", code: "de"},
+	{cityName: "Toronto", code: "us"},
+	{cityName: "Mexico City", code: "us"},
+	{cityName: "Singapore", code: "jp"},
+	{cityName: "Lagos", code: "gb"},
+}

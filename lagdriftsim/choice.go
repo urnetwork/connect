@@ -23,6 +23,11 @@ import (
 )
 
 const (
+	// choiceHubs takes at most this many hub extenders
+	maxHubs = 4
+	// choiceJoint: an extender nearer than this to the address's place covers
+	// no direction
+	directionMinKm  = 100
 	nearCount       = 4
 	nearInCountry   = 2
 	nearRetestPool  = 8
@@ -52,8 +57,41 @@ type choice struct {
 	spares    []int
 }
 
+// E2 and the variants the study compares with it, for a visitor far from
+// the address's place (a VPN):
+//
+//   - choiceE2: E2 as it is;
+//   - choiceJoint: the mid and far bands spread by bearing together with the
+//     near band, so they cover the directions the near extenders don't;
+//   - choiceHubs: after the near band, an extender at each of the VPN hubs
+//     nearest the address's place but more than 300 km from it (up to 4), the
+//     rest from the mid and far bands;
+//   - choiceInformation: after the near band, greedily the extender that most
+//     shrinks the region, by the model's variances, averaged over plausible
+//     places for the visitor: the address's place and the VPN hubs.
+const (
+	choiceE2          = "E2"
+	choiceJoint       = "joint spread"
+	choiceHubs        = "VPN hubs"
+	choiceInformation = "information"
+)
+
+// How to choose.
+type choiceOptions struct {
+	mode string
+	// choiceHubs: the candidate nearest each hub, in the order to take them
+	hubIndexes []int
+	// choiceInformation: a set's score, lower better
+	score func(picked []choiceCandidate) float64
+}
+
 // The choice from candidates, every one serving now. r breaks ties.
 func chooseExtenders(candidates []choiceCandidate, r *rand.Rand) choice {
+	return chooseExtendersBy(candidates, choiceOptions{mode: choiceE2}, r)
+}
+
+// The choice from candidates by a mode. r breaks ties.
+func chooseExtendersBy(candidates []choiceCandidate, options choiceOptions, r *rand.Rand) choice {
 	// nearest first; a shuffle first makes ties fall by r
 	ordered := slices.Clone(candidates)
 	r.Shuffle(len(ordered), func(i int, j int) {
@@ -71,9 +109,11 @@ func chooseExtenders(candidates []choiceCandidate, r *rand.Rand) choice {
 
 	// near
 	nearPool := ordered[:min(len(ordered), nearRetestPool)]
-	for _, c := range pickNear(nearPool, ordered) {
+	near := pickNear(nearPool, ordered)
+	for _, c := range near {
 		take(c)
 	}
+	chosen := slices.Clone(near)
 
 	// mid, then far, each spread by bearing
 	inBand := func(lo float64, hi float64) []choiceCandidate {
@@ -85,17 +125,63 @@ func chooseExtenders(candidates []choiceCandidate, r *rand.Rand) choice {
 		}
 		return band
 	}
-	short := 0
-	for _, band := range [][2]float64{{midMinKm, midMaxKm}, {midMaxKm, farMaxKm}, {farMaxKm, math.Inf(1)}} {
-		want := bandCount + short
-		if band[0] == farMaxKm {
-			want = short
+	bands := func(midWant int, farWant int) {
+		short := 0
+		for i, band := range [][2]float64{{midMinKm, midMaxKm}, {midMaxKm, farMaxKm}, {farMaxKm, math.Inf(1)}} {
+			want := []int{midWant, farWant, 0}[i] + short
+			var picked []choiceCandidate
+			if options.mode == choiceJoint {
+				picked = pickSpreadAround(inBand(band[0], band[1]), chosen, want)
+			} else {
+				picked = pickSpread(inBand(band[0], band[1]), want)
+			}
+			for _, c := range picked {
+				take(c)
+				chosen = append(chosen, c)
+			}
+			short = want - len(picked)
 		}
-		picked := pickSpread(inBand(band[0], band[1]), want)
-		for _, c := range picked {
-			take(c)
+	}
+	switch options.mode {
+	case choiceHubs:
+		hubs := 0
+		for _, index := range options.hubIndexes {
+			if maxHubs <= hubs {
+				break
+			}
+			for _, c := range ordered {
+				if c.index == index && !taken[c.index] && midMinKm <= c.distanceKm {
+					take(c)
+					chosen = append(chosen, c)
+					hubs += 1
+				}
+			}
 		}
-		short = want - len(picked)
+		rest := runExtenders - len(primaries)
+		bands((rest+1)/2, rest/2)
+	case choiceInformation:
+		for _, unusedOnly := range []bool{true, false} {
+			for len(primaries) < runExtenders {
+				best := -1
+				bestScore := math.Inf(1)
+				for i, c := range ordered {
+					if taken[c.index] || (unusedOnly && c.used) {
+						continue
+					}
+					if score := options.score(append(slices.Clone(chosen), c)); score < bestScore {
+						best = i
+						bestScore = score
+					}
+				}
+				if best < 0 {
+					break
+				}
+				take(ordered[best])
+				chosen = append(chosen, ordered[best])
+			}
+		}
+	default:
+		bands(bandCount, bandCount)
 	}
 	// whatever is still short: the nearest left
 	for _, c := range ordered {
@@ -191,6 +277,45 @@ func pickSpread(band []choiceCandidate, want int) []choiceCandidate {
 		picked = spreadFrom(used, picked, want)
 	}
 	return picked
+}
+
+// want candidates from band whose bearings, with those of fixed, have the
+// largest smallest gap, unused first; fixed stay as they are.
+func pickSpreadAround(band []choiceCandidate, fixed []choiceCandidate, want int) []choiceCandidate {
+	if want <= 0 || len(band) == 0 {
+		return nil
+	}
+	unused := []choiceCandidate{}
+	used := []choiceCandidate{}
+	for _, c := range band {
+		if c.used {
+			used = append(used, c)
+		} else {
+			unused = append(unused, c)
+		}
+	}
+	// a direction is covered by an extender far enough away for its bearing
+	// to mean one, once however many share it
+	directions := []choiceCandidate{}
+	for _, c := range fixed {
+		if c.distanceKm < directionMinKm {
+			continue
+		}
+		duplicate := false
+		for _, d := range directions {
+			if math.Abs(math.Remainder(c.bearingDeg-d.bearingDeg, 360)) < 1 {
+				duplicate = true
+			}
+		}
+		if !duplicate {
+			directions = append(directions, c)
+		}
+	}
+	picked := spreadFrom(unused, directions, len(directions)+want)
+	if len(picked) < len(directions)+want {
+		picked = spreadFrom(used, picked, len(directions)+want)
+	}
+	return picked[len(directions):]
 }
 
 // Adds to picked, up to want in all, the candidates that keep the bearings'

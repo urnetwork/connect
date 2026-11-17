@@ -34,12 +34,22 @@ var (
 	scenarioRealClaim300  = &scenario{name: "real claim 300 km", kind: kindClaim, geometry: geometryReal, claimKm: 300}
 	scenarioRealClaim1000 = &scenario{name: "real claim 1,000 km", kind: kindClaim, geometry: geometryReal, claimKm: 1000}
 	scenarioRealClaim3000 = &scenario{name: "real claim 3,000 km", kind: kindClaim, geometry: geometryReal, claimKm: 3000}
+
+	// a VPN: the visitor far from their address's place, at the distances
+	// the drift test's customers ask about, and named pairs
+	scenarioRealClaim800  = &scenario{name: "real claim 800 km", kind: kindClaim, geometry: geometryReal, claimKm: 800}
+	scenarioRealClaim1500 = &scenario{name: "real claim 1,500 km", kind: kindClaim, geometry: geometryReal, claimKm: 1500}
+	scenarioRealClaim6000 = &scenario{name: "real claim 6,000 km", kind: kindClaim, geometry: geometryReal, claimKm: 6000}
+	scenarioVpnPairs      = &scenario{name: "VPN pairs", kind: kindClaim, geometry: geometryReal, pairs: vpnPairs}
 )
+
+// The VPN distances, nearest first.
+var vpnScenarios = []*scenario{scenarioRealClaim300, scenarioRealClaim800, scenarioRealClaim1500, scenarioRealClaim3000, scenarioRealClaim6000}
 
 // The honest scenarios, worst first, and the claims, nearest first.
 var (
 	honestScenarios = []*scenario{scenarioTiny, scenarioSmallEdge, scenarioLargeEdge, scenarioSmallCenter, scenarioLargeInland, scenarioRealHonest}
-	claimScenarios  = []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000, scenarioRealClaim300, scenarioRealClaim1000, scenarioRealClaim3000}
+	claimScenarios  = []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000, scenarioRealClaim300, scenarioRealClaim800, scenarioRealClaim1000, scenarioRealClaim1500, scenarioRealClaim3000, scenarioRealClaim6000, scenarioVpnPairs}
 )
 
 // The k_early values the study sweeps.
@@ -187,7 +197,57 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	}
 	parts = append(parts, kappa...)
 	parts = append(parts, variants, misplaced, normal)
+	parts = append(parts, vpnParts(seed, scale)...)
+	parts = append(parts, interruptedParts(seed, scale)...)
 	return append(parts, oceaniaParts(seed, scale)...)
+}
+
+// The VPN study: visitors far from their address's place, on a dense fleet
+// (the study's) and a sparse one, under E2 and its variants (choice.go), with
+// the k_early sweep, so each variant's power, false rejects and k_early come
+// from the same visitors.
+func vpnParts(seed uint64, scale float64) []*studyPart {
+	counts := append(counted(scale, 40, scenarioVpnPairs), counted(scale, 40, vpnScenarios...)...)
+	counts = append(counts, counted(scale, 120, scenarioTiny)...)
+	counts = append(counts, counted(scale, 60, scenarioLargeEdge, scenarioRealHonest)...)
+	parts := []*studyPart{}
+	for _, pool := range []struct {
+		name  string
+		sites []extenderSite
+	}{{name: "dense", sites: nil}, {name: "sparse", sites: sparseSites}} {
+		for _, mode := range []string{choiceE2, choiceJoint, choiceHubs, choiceInformation} {
+			part := &studyPart{
+				name:   "VPN: " + pool.name + ", " + mode,
+				about:  "the " + pool.name + " fleet, extenders chosen by " + mode + "; 3 runs",
+				config: baseConfig(seed, sweepPolicies()),
+				counts: counts,
+			}
+			part.config.sites = pool.sites
+			part.config.choiceMode = mode
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// The review's interrupted-stop rule (V10): honest runs and a client that
+// goes silent at a favourable look, with and without it, one run each.
+func interruptedParts(seed uint64, scale float64) []*studyPart {
+	counts := append(counted(scale, 200, scenarioTiny), counted(scale, 100, scenarioLargeEdge, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
+	parts := []*studyPart{}
+	for _, rule := range []bool{false, true} {
+		name := "interrupted: counted"
+		about := "an interrupted run counts with 6 usable extenders, as before the review; one run"
+		if rule {
+			name = "interrupted: review's rule"
+			about = "an interrupted run counts only if converged or clear held when the silence began; one run"
+		}
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), attackPolicy()}), counts: counts}
+		part.config.runs = 1
+		part.config.interruptedRule = rule
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 // The k_early sweep.

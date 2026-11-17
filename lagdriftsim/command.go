@@ -71,7 +71,7 @@ func runParts(options Options, parts []*studyPart) (string, error) {
 		partStarted := time.Now()
 		config := part.config
 		config.workers = options.Workers
-		w := newWorld(worldConfig{seed: options.Seed, misplacedShare: config.misplacedShare, extraSites: config.extraSites}, borders)
+		w := newWorld(worldConfig{seed: options.Seed, misplacedShare: config.misplacedShare, sites: config.sites, extraSites: config.extraSites}, borders)
 		specs, skipped := buildVisitors(w, options.Seed, part.counts, 0)
 		result := runStudy(w, &config, specs)
 		result.skipped = skipped
@@ -224,6 +224,26 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 			paragraph("The same visitors, 3 runs each: the frame's fit by V10's cadence (a warm refit at each ping round, the full multi-start when the extenders change, every 2 s and before any stop) and by the full multi-start at every ping round. Under the cadence, %d stops were withdrawn because the full fit before them landed in another basin.", refits.withdrawnStops)
 			b.WriteString(cadenceTable(refits, full) + "\n")
 		}
+	}
+
+	if variants := vpnVariantTable(parts, results); strings.Count(variants, "\n") > 2 {
+		section("A visitor far from the address's place (VPN)")
+		paragraph("Visitors whose address claims a country they are not in, as a VPN's virtual location does, with the extenders chosen around the address's place (E2) or by a variant (choice.go): the mid and far bands spread together with the near band (joint spread), an extender at each VPN hub nearest the address's place (VPN hubs), or greedily by the region they are expected to give for the address's place and the VPN hubs (information). Each on the study's dense fleet and on a sparse one of one extender in each of 35 cities. Power is the share rejected at 99%%, k_early %s.", formatK(lagdrift.EarlyK))
+		b.WriteString(variants + "\n")
+		for _, pool := range []string{"dense", "sparse"} {
+			if pairs := vpnPowerTable(parts, results, pool, true); pairs != "" {
+				paragraph("The named pairs on the %s fleet:", pool)
+				b.WriteString(pairs + "\n")
+				paragraph("Real countries at each distance, on the %s fleet:", pool)
+				b.WriteString(vpnPowerTable(parts, results, pool, false) + "\n")
+			}
+		}
+	}
+
+	if interrupted := interruptedTable(parts, results); strings.Count(interrupted, "\n") > 2 {
+		section("The interrupted stop")
+		paragraph("The review's rule (V10): an interrupted run counts only if converged or clear held, by the server's check, when the silence began. Against an honest client and one that goes silent at its first look whose region touches the claimed country at 99%% once the run would count (6 extenders with 12 round trips), or when clear would stop it outside (review F-02). One run, 99%%.")
+		b.WriteString(interrupted + "\n")
 	}
 
 	kappaRows := &table{header: comparisonHeader}
