@@ -177,8 +177,8 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 		t.Fatalf("v6 servers = %v, expected %v", settings.DnsResolverSettings.RemoteDohUrlsIpv6, expectedIpv6)
 	}
 	for _, dohUrl := range []string{namedDohUrlIpv4, defaultDohUrlIpv4, namedDohUrlIpv6} {
-		if score := settings.ServerStatsSeed[dohUrl]; score != dohSeedMaxScore {
-			t.Errorf("seed of %s = %v, expected %v", dohUrl, score, dohSeedMaxScore)
+		if score := settings.ServerStatsSeed[dohUrl]; score != settings.ServerSeedMaxScore {
+			t.Errorf("seed of %s = %v, expected %v", dohUrl, score, settings.ServerSeedMaxScore)
 		}
 	}
 	if len(settings.ServerStatsSeed) != 3 {
@@ -186,7 +186,7 @@ func TestControlDohSettingsPutsTheNamedServersFirst(t *testing.T) {
 	}
 	// the weighted order a fresh cache starts from puts a named server first,
 	// all but about one time in a hundred (8.05 against 0.05 per default)
-	stats := newServerStats()
+	stats := newServerStats(settings)
 	stats.seed(settings.ServerStatsSeed)
 	namedFirstCount := 0
 	for range 400 {

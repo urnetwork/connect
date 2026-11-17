@@ -16426,8 +16426,20 @@ paths:
         At most 16 URLs of at most 2048 bytes and 4 header blocks of at most
         64 KiB. 429 with Retry-After past 30 reports an hour from one network
         address. 503 with Retry-After while reports cannot be taken.
+
+        A trusted flagger sends its key in `X-UR-Flagger-Key`: a key listed
+        for a flagger makes its URLs' hosts blocked at once, pending review,
+        up to the flagger's daily cap. A wrong or absent key is an ordinary
+        report, and the answer is the same either way.
       operationId: abuseReport
       security: []
+      parameters:
+        - in: header
+          name: X-UR-Flagger-Key
+          required: false
+          description: A trusted flagger's key. Its digest is kept, never the key.
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -16568,6 +16580,18 @@ paths:
           case's standing actions as wrong; `denied` upholds them.
         - `clear_restore_flag` {root, incident_id, network_id}: reviewer.
           Clears one network's restore flags in an incident.
+        - `file_legal_request` {instrument, country, network_ids, sealed,
+          seal_until_ms, emergency, due_time_ms, case_id, request_id}: legal.
+          Records an order or request and its due time, an EU production
+          order's 10 days or 8 hours in an emergency.
+        - `sign_production` {request_id, role}: legal or engineering, in a
+          role the member holds; one person signs one role.
+        - `produce` {request_id}: legal, once a legal and an engineering
+          sign-off stand. Answers the production for counsel, each section a
+          retained record kind, and logs the read.
+        - `close_legal_request` {request_id}: legal.
+        - `transparency_counts` {from_time_ms, to_time_ms}: legal. The
+          transparency report's totals over the window, naming no network.
 
         Every refusal of the credential answers one 403 "Forbidden.". 503
         with Retry-After when a store, a mailer or an effect did not answer.
@@ -31328,6 +31352,13 @@ components:
         upgrade:
           description: A purchase or a higher tier lifts the limit.
           type: boolean
+        case_id:
+          description: |
+            For `screen_review` alone: the review case the refusal opened or
+            joined, which a reviewer's allow of the name answers. Absent for
+            every other limit.
+          type: string
+          format: uuid
     InternalGateNetworkRefusal:
       type: object
       required: [network_id, refusal]
