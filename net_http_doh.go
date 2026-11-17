@@ -417,13 +417,15 @@ type DohSettings struct {
 	// (`internalDohSettings`) sets these.
 	BootstrapPlainDnsDomains []string
 	// The part of a lookup's own deadline the bootstrap plain dns fallback
-	// keeps: the encrypted resolvers of a bootstrap name stop this long before
-	// the caller's deadline, and at most half of what it has left. A caller
-	// whose deadline ends before RequestTimeout (the platform websocket's 5s
-	// HandshakeTimeout against 15s) otherwise spends all of it on DoH servers a
-	// network black-holes and never reaches the fallback (support inbox 8397).
-	// A caller with no deadline keeps RequestTimeout for them, as does every
-	// other name. Zero or negative leaves them the caller's whole deadline.
+	// keeps, at most: the encrypted resolvers of a bootstrap name stop that
+	// much before the caller's deadline, but only after they have had at least
+	// this long themselves, so a caller with this long or less left gives them
+	// all of it. A caller whose deadline ends before RequestTimeout (the
+	// platform websocket's 5s HandshakeTimeout against 15s) otherwise spends
+	// all of it on DoH servers a network black-holes and never reaches the
+	// fallback (support inbox 8397). A caller with no deadline keeps
+	// RequestTimeout for them, as does every other name. Zero or negative
+	// leaves them the caller's whole deadline.
 	BootstrapPlainDnsReserve time.Duration
 	// How long a plain dns answer of the bootstrap fallback is held at most,
 	// so DoH is asked again soon; LocalExpiration bounds it too. Zero or
@@ -1938,12 +1940,13 @@ func (self *DohCache) resolve(ctx context.Context, q DohKey, now time.Time) dohL
 	dohServerName := self.dohServerNames[q.Domain]
 
 	// the resolvers ahead of the bootstrap plain dns fallback leave it a share
-	// of the caller's own deadline (DohSettings.BootstrapPlainDnsReserve).
-	// Every other name, and a caller with no deadline, give them all of it.
+	// of the caller's own deadline (DohSettings.BootstrapPlainDnsReserve),
+	// after keeping at least the reserve for themselves. Every other name, and
+	// a caller with no deadline, give them all of it.
 	resolverCtx := ctx
 	if 0 < self.settings.BootstrapPlainDnsReserve && bootstrapPlainDnsName(self.settings, q.Domain) {
 		if deadline, ok := ctx.Deadline(); ok {
-			if reserve := min(self.settings.BootstrapPlainDnsReserve, time.Until(deadline)/2); 0 < reserve {
+			if reserve := min(self.settings.BootstrapPlainDnsReserve, time.Until(deadline)-self.settings.BootstrapPlainDnsReserve); 0 < reserve {
 				var resolverCancel context.CancelFunc
 				resolverCtx, resolverCancel = context.WithDeadline(ctx, deadline.Add(-reserve))
 				defer resolverCancel()

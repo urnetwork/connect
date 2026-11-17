@@ -330,6 +330,33 @@ func TestInternalDohDialReachesBootstrapPlainDnsBeforeItsDeadline(t *testing.T) 
 	}
 }
 
+// The fallback's share never cuts the encrypted resolvers below the reserve
+// itself: a caller with no more than `DohSettings.BootstrapPlainDnsReserve`
+// left gives DoH all of it, so plain dns is asked only after DoH had at least
+// that long.
+func TestBootstrapPlainDnsLeavesDohAtLeastTheReserve(t *testing.T) {
+	dohDialer := &controlDohTestDialer{}
+	dohSettings := controlDohTestDefaultSettings(dohDialer)
+	dohSettings.RequestTimeout = 6 * time.Second
+	dohSettings.BootstrapPlainDnsReserve = time.Second
+	cache := NewDohCache(internalDohSettings(dohSettings, []string{"space.example"}))
+	defer cache.Close()
+	plainDns := &bootstrapPlainDns{answer: net.ParseIP("192.0.2.82")}
+	cache.bootstrapLookupIP = plainDns.lookupIP
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if addrs, _ := cache.QueryResult(ctx, "A", "connect.space.example"); len(addrs) != 0 {
+		t.Fatalf("lookup = %v, expected none from black-holed DoH servers", addrs)
+	}
+	if names := plainDns.queried(); len(names) != 0 {
+		t.Fatalf("plain dns queried %v with only the reserve left, expected DoH to keep the whole deadline", names)
+	}
+	if dohDialer.blackholedCount.Load() == 0 {
+		t.Fatal("no DoH server was dialed")
+	}
+}
+
 // A DoH answer is final: a found record or an NXDOMAIN never reaches plain
 // dns, also for a caller whose deadline sets aside the fallback's share
 // (`DohSettings.BootstrapPlainDnsReserve`).
