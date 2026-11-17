@@ -11375,13 +11375,9 @@ paths:
         once: posting the same bytes again answers the stored generation and
         writes nothing, and any other bytes for a bound client are refused.
 
-        Both answer `by_client_jwt`: the bearer re-minted with the binding's
-        sidecar as its `sidecar_id` claim, every other claim as presented,
-        its lifetime included, since bind takes no proof of the client's key.
-        The sidecar keeps it in place of the token it presented, and sockets
-        reads the caller's sidecar from that claim with no database read. A
-        refresh keeps the claim as presented and never adds it, so a token
-        without one stays without one until a bind re-mints it.
+        Both answer the generation alone. The token exchange names the bound
+        sidecar as a service token's `ur_sidecar_id`, which is where sockets
+        reads the caller's sidecar.
 
         A refusal answers `{"error", "code"}`: 400 `binding_invalid` (a bad
         signature, a malformed body, or another client or network than the
@@ -16174,11 +16170,13 @@ paths:
 
         Every call re-checks each entry against the network's newest verified
         projection and recreates missing state, so the answer is authoritative
-        for its page. Takes a client token whose client is the listener. Each
-        page takes one token of the caller's control-plane bucket.
+        for its page. Takes a service token of audience `sockets` from the
+        token exchange, whose client is the listener and whose
+        `ur_sidecar_id` names its sidecar. Each page takes one token of the
+        caller's control-plane bucket.
       operationId: socketRegistrations
       security:
-        - BearerAuth: []
+        - ServiceTokenAuth: []
       requestBody:
         required: true
         content:
@@ -16198,7 +16196,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/SocketRegistrationsResult"
         "401":
-          description: No client token, or one revoked or rotated.
+          description: |
+            No service token of audience `sockets`, an expired one, or one whose
+            client, sidecar or member a revocation object voids.
 
   /socket/find:
     servers:
@@ -16219,12 +16219,13 @@ paths:
         The checks run in order, and a refusal signs nothing: the caller's
         control-plane bucket, `unavailable`; the projection, `denied`, checked
         before any listener is read; the paying network not spent, `quota`; the
-        pick, `no_listener` or `busy`. Takes a client token. A `urnetwork-edge`
-        caller sends its K client ids, one of which each ticket names, and any
-        other caller sending them is refused.
+        pick, `no_listener` or `busy`. Takes a service token of audience
+        `sockets` from the token exchange. A `urnetwork-edge` caller sends its K
+        client ids, one of which each ticket names, and any other caller sending
+        them is refused.
       operationId: socketFind
       security:
-        - BearerAuth: []
+        - ServiceTokenAuth: []
       requestBody:
         required: true
         content:
@@ -16239,7 +16240,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/SocketFindResult"
         "401":
-          description: No client token, or one revoked or rotated.
+          description: |
+            No service token of audience `sockets`, an expired one, or one whose
+            client, sidecar or member a revocation object voids.
 
   /socket/list:
     servers:
@@ -16253,11 +16256,11 @@ paths:
         The caller's own network's registered names: an edge name as it is, and
         any other name as its token path with its seal, which only a holder of
         the network's socket key opens, so a client unseals names locally. Takes
-        a client token of the network. Each page takes one token of the caller's
-        control-plane bucket.
+        a service token of audience `sockets` of the network. Each page takes
+        one token of the caller's control-plane bucket.
       operationId: socketList
       security:
-        - BearerAuth: []
+        - ServiceTokenAuth: []
       parameters:
         - name: cursor
           in: query
@@ -16273,7 +16276,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/SocketListResult"
         "401":
-          description: No client token, or one revoked or rotated.
+          description: |
+            No service token of audience `sockets`, an expired one, or one whose
+            client, sidecar or member a revocation object voids.
 
   /socket/keys:
     servers:
@@ -30630,18 +30635,11 @@ components:
       type: object
       required:
         - generation
-        - by_client_jwt
       properties:
         generation:
           description: The generation the server recorded for the client.
           type: integer
           format: int64
-        by_client_jwt:
-          description: |
-            The bearer re-minted with the binding's sidecar as its `sidecar_id`
-            claim, every other claim and the lifetime as presented. The client
-            uses it from then on in place of the token it presented.
-          type: string
 
     SidecarPushTokenArgs:
       type: object
