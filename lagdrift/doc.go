@@ -107,4 +107,24 @@
 // Caribbean Netherlands; the Cocos and Christmas Islands; Tokelau). A
 // disputed area may belong to more than one code, so that no claimant's
 // visitors are rejected for standing in it (G3).
+//
+// # The commands
+//
+//	go run ./lagdrift/cmd/drift-borders -borders ne-admin0-10m.bin -world world.generated.json [-source dir]
+//	go run ./lagdrift/cmd/drift-vectors -out drift-vectors.json
+//
+// drift-borders downloads Natural Earth's GeoJSON at the release it pins, or
+// reads it from -source, and checks it against the pinned SHA-256. drift-vectors
+// writes the TypeScript model's parity vectors.
+//
+// # Beyond lag.dev/DRIFTTEST.md I3
+//
+// The package extends I3's API, narrowing none of it: RoundTrip.MinMs for the
+// physical check; Fit.Runs, the run numbers Fit.LastMileMs follows, and
+// Fit.Observations; Judgement.K; StopHolds, for the server's check of a
+// reported stop; Decide, V6's verdict over a fit; CovEllipse, HeldPlaceErrorKm,
+// Country.Contains, DistanceKm, BearingDeg, MoveKm and AzimuthalKm; and
+// NewBorders, Borders.Codes and Borders.Countries, WriteBorders, ReadWorld and
+// WriteWorld. FitPosition recomputes V3's variances at every pass rather than
+// every iteration; fit.go says why.
 package lagdrift
