@@ -118,8 +118,11 @@ func randomRuleFindings(fset *token.FileSet, file *ast.File, path string, allowl
 // finding names its file and line.
 func TestRandomnessRule(t *testing.T) {
 	allowlist := randomRuleAllowlist{
-		// connect has no vendored code and no simulation that seeds a generator
-		paths:          []string{},
+		paths: []string{
+			// the drift test's calibration study, whose seeded generators
+			// reproduce lagdriftsim/REPORT.md exactly
+			"lagdriftsim/",
+		},
 		helperPath:     "random.go",
 		helperFuncName: "NewSecureRand",
 	}
