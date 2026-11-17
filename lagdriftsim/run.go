@@ -186,6 +186,7 @@ type visitorOutcome struct {
 	fitCosts         [fitKinds]fitCost
 	// stops the full fit before them withdrew (V10's cadence)
 	withdrawnStops int
+	fitSamples     []fitSample
 }
 
 // The fit's own checks (the acceptance test of V5's starts): a warm refit
@@ -200,7 +201,9 @@ type fitChecks struct {
 	gridLower     int
 	gridLowerBy1  int
 	gridLargestBy float64
-	examples      []string
+	// of those lower by more than 1, the ones nearer the truth than the fit
+	gridLowerNearer int
+	examples        []string
 }
 
 func (self *fitChecks) add(other fitChecks) {
@@ -211,6 +214,7 @@ func (self *fitChecks) add(other fitChecks) {
 	self.gridLower += other.gridLower
 	self.gridLowerBy1 += other.gridLowerBy1
 	self.gridLargestBy = math.Max(self.gridLargestBy, other.gridLargestBy)
+	self.gridLowerNearer += other.gridLowerNearer
 	if len(self.examples) < 6 {
 		self.examples = append(self.examples, other.examples[:min(len(other.examples), 6-len(self.examples))]...)
 	}
@@ -236,6 +240,8 @@ type visitorSim struct {
 	outcome   *visitorOutcome
 	// the runs each visitor makes, at most visitorRuns
 	runs int
+	// the fits made so far, for sampling
+	fitCalls int
 }
 
 func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorOutcome {
@@ -868,6 +874,7 @@ func (self *visitorSim) refit(obs []lagdrift.Observation, warm *lagdrift.Fit) (*
 	if fitKindOf(false, obs) == fitFramePooled {
 		kind = fitRefitPooled
 	}
+	self.sampleFit(kind, obs, warm)
 	start := time.Now()
 	f, err := refitPosition(self.model, self.spec.ipPlace, obs, warm)
 	self.outcome.fitCosts[kind].add(time.Since(start))
@@ -877,10 +884,40 @@ func (self *visitorSim) refit(obs []lagdrift.Observation, warm *lagdrift.Fit) (*
 // lagdrift.FitPosition from the address's place, timed: the frame fits after
 // every ping round, so what a fit costs is what the widget costs.
 func (self *visitorSim) fit(obs []lagdrift.Observation, warm *lagdrift.Fit, server bool) (*lagdrift.Fit, error) {
+	kind := fitKindOf(server, obs)
+	self.sampleFit(kind, obs, warm)
 	start := time.Now()
 	f, err := lagdrift.FitPosition(self.model, self.spec.ipPlace, obs, warm)
-	self.outcome.fitCosts[fitKindOf(server, obs)].add(time.Since(start))
+	self.outcome.fitCosts[kind].add(time.Since(start))
 	return f, err
+}
+
+// One fit's inputs, kept to time it again once the study is done.
+type fitSample struct {
+	kind     fitKind
+	model    lagdrift.Model
+	expected lagdrift.Point
+	obs      []lagdrift.Observation
+	warm     *lagdrift.Fit
+}
+
+// Every this many fits, by a visitor's own count, is sampled for timing.
+const fitSampleEvery = 29
+
+// Keeps a sample of the fits' inputs, chosen by the visitor and its count of
+// fits so the samples are the same in every run of the study.
+func (self *visitorSim) sampleFit(kind fitKind, obs []lagdrift.Observation, warm *lagdrift.Fit) {
+	self.fitCalls += 1
+	if (uint64(self.spec.index)*2654435761+uint64(self.fitCalls))%fitSampleEvery != 0 {
+		return
+	}
+	self.outcome.fitSamples = append(self.outcome.fitSamples, fitSample{
+		kind:     kind,
+		model:    self.model,
+		expected: self.spec.ipPlace,
+		obs:      obs,
+		warm:     warm,
+	})
 }
 
 // What the fits cost: how many, and their durations in buckets that double
@@ -1006,13 +1043,18 @@ func (self *visitorSim) checkFit(key string, obs []lagdrift.Observation, fit *la
 	}
 	if 1e-3 < best {
 		checks.gridLower += 1
+		fitTruthKm := lagdrift.DistanceKm(fit.At, self.spec.truth)
+		lowerTruthKm := lagdrift.DistanceKm(bestFit.At, self.spec.truth)
 		if 1 < best {
 			checks.gridLowerBy1 += 1
+			if lowerTruthKm < fitTruthKm {
+				checks.gridLowerNearer += 1
+			}
 		}
 		checks.gridLargestBy = math.Max(checks.gridLargestBy, best)
-		if len(checks.examples) < 6 {
-			checks.examples = append(checks.examples, fmt.Sprintf("visitor %d (%s, %s) %s: χ² %.2f at %.3f,%.3f, a start converges to χ² %.2f at %.3f,%.3f, %.0f km away",
-				self.spec.index, self.spec.region, self.spec.city.name, key, chi2Of(fit), fit.At.Lat, fit.At.Lon, chi2Of(bestFit), bestFit.At.Lat, bestFit.At.Lon, lagdrift.DistanceKm(fit.At, bestFit.At)))
+		if len(checks.examples) < 6 && 1 < best {
+			checks.examples = append(checks.examples, fmt.Sprintf("visitor %d (%s, %s) %s: χ² %.2f at %.3f,%.3f, %.0f km from the truth; a start converges to χ² %.2f at %.3f,%.3f, %.0f km away and %.0f km from the truth",
+				self.spec.index, self.spec.region, self.spec.city.name, key, chi2Of(fit), fit.At.Lat, fit.At.Lon, fitTruthKm, chi2Of(bestFit), bestFit.At.Lat, bestFit.At.Lon, lagdrift.DistanceKm(fit.At, bestFit.At), lowerTruthKm))
 		}
 	}
 }

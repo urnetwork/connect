@@ -84,17 +84,45 @@ func runParts(options Options, parts []*studyPart) (string, error) {
 		return "", errors.New("lagdriftsim: no part to run")
 	}
 	method := worlds[ran[0].name]
+	timingStarted := time.Now()
+	times := timeFits(mergedFitSamples(ran, results))
+	logf("timed %d sampled fits again in %s", countTimes(times), time.Since(timingStarted).Round(time.Second))
 
 	var b strings.Builder
 	b.WriteString(reportIntro())
 	b.WriteString(reportSummary(ran, results))
 	b.WriteString(reportMethod(method, options.CommandLine, bordersVersion))
-	b.WriteString(reportFindings(ran, results))
+	b.WriteString(reportFindings(ran, results, times))
 	b.WriteString("## Tables\n\n")
 	fmt.Fprintf(&b, "Generated %s in %s: seed %d, scale %g, %s, borders %s, lagdrift's EarlyK %s.\n\n",
 		time.Now().UTC().Format("2006-01-02"), time.Since(started).Round(time.Second), options.Seed, options.Scale, runtime.Version(), bordersVersion, formatK(lagdrift.EarlyK))
-	writeParts(&b, ran, results, worlds)
+	writeParts(&b, ran, results, worlds, times)
 	return b.String(), nil
+}
+
+// The parts' fit samples, at most maxFitSamples per kind in all, taken
+// evenly across the parts in their order.
+func mergedFitSamples(parts []*studyPart, results map[string]*studyResult) [fitKinds][]fitSample {
+	merged := [fitKinds][]fitSample{}
+	for kind := range merged {
+		all := []fitSample{}
+		for _, part := range parts {
+			all = append(all, results[part.name].fitSamples[kind]...)
+		}
+		stride := max(1, (len(all)+maxFitSamples-1)/maxFitSamples)
+		for i := 0; i < len(all); i += stride {
+			merged[kind] = append(merged[kind], all[i])
+		}
+	}
+	return merged
+}
+
+func countTimes(times fitTimes) int {
+	n := 0
+	for _, kindTimes := range times {
+		n += len(kindTimes)
+	}
+	return n
 }
 
 // Writes the report at path.
@@ -103,7 +131,7 @@ func WriteReport(path string, report string) error {
 }
 
 // The tables of every part that ran.
-func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*studyResult, worlds map[string]*world) {
+func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*studyResult, worlds map[string]*world, times fitTimes) {
 	main := results["main"]
 	worldOf := func(name string) *world {
 		if w, ok := worlds[name]; ok {
@@ -259,8 +287,8 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 	}
 
 	section("What a fit costs")
-	paragraph("Every fit's duration in Go on the machine that ran the study, over every part, by who fits and what; a duration is shown as the upper limit of its doubling bucket from 0.25 ms. The study's workers share the machine, so these are upper bounds on a quiet one. V10's budget: a warm refit at p95 ≤ 1 ms and a full fit at p95 ≤ 10 ms.")
-	b.WriteString(fitCostTable(parts, results) + "\n")
+	paragraph("By who fits and what. In the study: every fit's wall-clock duration, shown as the upper limit of its doubling bucket from 0.25 ms; the study's workers share the machine with each other and anything else, so these count waits for a core. One at a time: a sample of the same fits run again after the study on one thread, each measured by the CPU time it took, which is what a quiet machine would see. V10's budget: a warm refit at p95 ≤ 1 ms and a full fit at p95 ≤ 10 ms, in Go.")
+	b.WriteString(fitCostTable(parts, results, times) + "\n")
 
 	section("Checks against lagdrift")
 	paragraph("The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide, every seventh visitor. And the fit's own (V5's acceptance): the checked visitors' verdict fits refitted warm from themselves, which should move under 1 km in at least 99.9%% of fits, and, for every 21st visitor's single-run verdicts, a grid of starts (the address's place, the three fastest extenders, 6 bearings at 300, 1,000 and 3,000 km from the fit), each refitted until it settles, which should find no fixed point with a χ² lower by more than 1, the warm rule's tolerance.")

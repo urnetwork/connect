@@ -317,7 +317,7 @@ func medianStop(result *studyResult, policy int, kind string) string {
 }
 
 // The report's findings beyond the summary, each from the parts that ran.
-func reportFindings(parts []*studyPart, results map[string]*studyResult) string {
+func reportFindings(parts []*studyPart, results map[string]*studyResult, times fitTimes) string {
 	var b strings.Builder
 	b.WriteString("## Findings\n\n")
 	if main := results["main"]; main != nil && 0 <= main.policyIndex(v10Policy(math.Inf(1)).name) {
@@ -416,12 +416,21 @@ func reportFindings(parts []*studyPart, results map[string]*studyResult) string 
 	}
 	fmt.Fprintf(&b, "%s of %s warm refits of a verdict's fit moved it 1 km or more, and %d of %s grids of starts found a fixed point with a χ² lower by more than 1.",
 		rate{k: moved, n: refits}.short(), formatThousands(float64(refits)), lower, formatThousands(float64(grids)))
-	costs := mergedFitCosts(parts, results)
-	for kind, cost := range costs {
-		if 0 < cost.fits {
-			fmt.Fprintf(&b, " %s: p50 under %s ms, p95 under %s ms.", strings.ToUpper(fitKindNames[kind][:1])+fitKindNames[kind][1:], durationMs(cost.quantile(0.5)), durationMs(cost.quantile(0.95)))
+	gridNearer := 0
+	for _, part := range parts {
+		if result, ok := results[part.name]; ok {
+			gridNearer += result.fitChecks.gridLowerNearer
 		}
 	}
-	b.WriteString("\n\n")
+	if 0 < lower {
+		fmt.Fprintf(&b, " Of those, %d lie nearer the truth than the fit.", gridNearer)
+	}
+	b.WriteString(" One at a time, by CPU time:")
+	for kind, sorted := range times {
+		if 0 < len(sorted) {
+			fmt.Fprintf(&b, " %s, p50 %.2f ms and p95 %.2f ms;", fitKindNames[kind], float64(durationQuantile(sorted, 0.5).Microseconds())/1000, float64(durationQuantile(sorted, 0.95).Microseconds())/1000)
+		}
+	}
+	b.WriteString(" against V10's budget of a warm refit at p95 ≤ 1 ms and a full fit at p95 ≤ 10 ms.\n\n")
 	return b.String()
 }

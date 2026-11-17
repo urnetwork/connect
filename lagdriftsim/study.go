@@ -106,6 +106,8 @@ type studyResult struct {
 	fitChecks        fitChecks
 	fitCosts         [fitKinds]fitCost
 	withdrawnStops   int
+	// a sample of the fits' inputs per kind, at most maxFitSamples each
+	fitSamples [fitKinds][]fitSample
 	// visitors a scenario couldn't place (no claim at its distance, a city
 	// outside its country's borders)
 	skipped map[string]int
@@ -118,8 +120,10 @@ func buildVisitors(w *world, seed uint64, counts []scenarioCount, firstIndex int
 	regionCities := citiesByRegion()
 	candidates := claimCandidates()
 	var options map[string][]claimOption
-	if w.borders != nil {
-		options = realClaimOptions(w.borders)
+	for _, count := range counts {
+		if count.scenario.kind == kindClaim && count.scenario.geometry == geometryReal && w.borders != nil && options == nil {
+			options = w.claimOptions()
+		}
 	}
 	specs := []*visitorSpec{}
 	skipped := map[string]int{}
@@ -196,6 +200,12 @@ func runStudy(w *world, config *studyConfig, specs []*visitorSpec) *studyResult 
 			result.fitCosts[kind].merge(outcome.fitCosts[kind])
 		}
 		result.withdrawnStops += outcome.withdrawnStops
+		for _, sample := range outcome.fitSamples {
+			if len(result.fitSamples[sample.kind]) < maxFitSamples {
+				result.fitSamples[sample.kind] = append(result.fitSamples[sample.kind], sample)
+			}
+		}
+		outcome.fitSamples = nil
 	}
 	return result
 }
@@ -236,6 +246,9 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 	}
 	return s
 }
+
+// The fits kept per kind to time again.
+const maxFitSamples = 1500
 
 // The policy's index in the study's config, or −1.
 func (self *studyResult) policyIndex(name string) int {

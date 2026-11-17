@@ -575,16 +575,25 @@ func oceaniaCityTable(result *studyResult) string {
 	return t.String()
 }
 
-// Fit durations by kind, over the parts that ran.
-func fitCostTable(parts []*studyPart, results map[string]*studyResult) string {
-	t := &table{header: []string{"Fit", "Fits", "mean, ms", "p50 under, ms", "p90 under, ms", "p95 under, ms", "p99 under, ms"}}
+// Fit durations by kind, over the parts that ran: wall clock in the study,
+// and CPU time timed one at a time after it.
+func fitCostTable(parts []*studyPart, results map[string]*studyResult, times fitTimes) string {
+	t := &table{header: []string{"Fit", "In the study: fits", "mean, ms", "p50 under, ms", "p95 under, ms", "One at a time: fits", "p50, ms", "p90, ms", "p95, ms", "p99, ms", "most, ms"}}
 	costs := mergedFitCosts(parts, results)
 	for kind, cost := range costs {
 		if cost.fits == 0 {
 			continue
 		}
+		sorted := times[kind]
+		cpu := func(q float64) string {
+			if len(sorted) == 0 {
+				return "–"
+			}
+			return fmt.Sprintf("%.2f", float64(durationQuantile(sorted, q).Microseconds())/1000)
+		}
 		t.add(fitKindNames[kind], formatThousands(float64(cost.fits)), fmt.Sprintf("%.2f", float64(cost.total.Microseconds())/1000/float64(cost.fits)),
-			durationMs(cost.quantile(0.5)), durationMs(cost.quantile(0.9)), durationMs(cost.quantile(0.95)), durationMs(cost.quantile(0.99)))
+			durationMs(cost.quantile(0.5)), durationMs(cost.quantile(0.95)),
+			formatThousands(float64(len(sorted))), cpu(0.5), cpu(0.9), cpu(0.95), cpu(0.99), cpu(1))
 	}
 	return t.String()
 }

@@ -16,6 +16,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"sync"
 
 	"github.com/urnetwork/connect/lagdrift"
 )
@@ -71,6 +72,24 @@ type world struct {
 	fleets [][]fleetExtender
 	// nil: synthetic countries only
 	borders *lagdrift.Borders
+}
+
+// realClaimOptions for the borders, computed once per borders: it measures
+// every city against every country.
+var claimOptionsCache = struct {
+	sync.Mutex
+	borders *lagdrift.Borders
+	options map[string][]claimOption
+}{}
+
+func (self *world) claimOptions() map[string][]claimOption {
+	claimOptionsCache.Lock()
+	defer claimOptionsCache.Unlock()
+	if claimOptionsCache.borders != self.borders {
+		claimOptionsCache.borders = self.borders
+		claimOptionsCache.options = realClaimOptions(self.borders)
+	}
+	return claimOptionsCache.options
 }
 
 // How the world is drawn.
