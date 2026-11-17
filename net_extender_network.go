@@ -162,7 +162,9 @@ type ExtenderNetworkClientSettings struct {
 	// loop on the period without a sleep.
 	ProbeAfter func(wait time.Duration) <-chan time.Time
 	// ResolveDns, when set, replaces the bootstrap resolution. Nil resolves A
-	// and AAAA over DoH with the system resolver as the fallback (E3).
+	// and AAAA over DoH with the system resolver as the fallback (E3). A
+	// space whose egress is a proxy resolves over DoH through the proxy, with
+	// no fallback (bootstrapResolution).
 	ResolveDns func(ctx context.Context, name string) ([]netip.Addr, error)
 	// ResolveDnsTxt, when set, replaces the bootstrap TXT resolution. Nil
 	// resolves TXT over the strategy's DoH settings with the system resolver
@@ -994,25 +996,57 @@ func (self *ExtenderNetworkClient) bootstrap() *ExtenderRootKeySet {
 
 // The default bootstrap TXT resolution: over the strategy's DoH settings in
 // force, with the system resolver as the fallback when DoH yields nothing,
-// mirroring resolveDns.
+// mirroring resolveDns. A space whose egress is a proxy resolves through the
+// proxy alone (bootstrapResolution).
 func (self *ExtenderNetworkClient) resolveDnsTxt(
 	ctx context.Context,
 	name string,
 ) ([]string, error) {
-	dohSettings := self.settings.DohSettings
-	if dohSettings == nil && self.clientStrategy != nil {
-		dohSettings = self.clientStrategy.DohSettings()
-	}
+	dohSettings, systemFallback := self.bootstrapResolution()
 	if dohSettings != nil {
 		if txts := DohQueryTxt(ctx, dohSettings, name); 0 < len(txts) {
 			return txts, nil
 		}
+	}
+	if !systemFallback {
+		return nil, errExtenderBootstrapNoProxiedAnswer
 	}
 	var customResolver *net.Resolver
 	if self.clientStrategy != nil {
 		customResolver = self.clientStrategy.settings.ConnectSettings.Resolver
 	}
 	return dialResolver(customResolver).LookupTXT(ctx, name)
+}
+
+// A bootstrap name the proxy's DoH did not answer. A space whose egress is a
+// proxy asks this host's resolver nothing.
+var errExtenderBootstrapNoProxiedAnswer = errors.New("no answer through the proxy's DoH")
+
+// The DoH settings the dns bootstrap queries with, nil for none, and whether a
+// name DoH does not answer falls back to the system resolver.
+//
+// A space whose egress is a socks proxy resolves through the proxy alone
+// (connect#227). Its DoH dials go through the strategy's dial, the proxy, where
+// the DoH settings' own dial would leave from this host, and DoH is the
+// defaults when the strategy names none; and nothing falls back to the system
+// resolver, which would ask from this host's address. The DoH settings in
+// force are not changed, only copied.
+func (self *ExtenderNetworkClient) bootstrapResolution() (*DohSettings, bool) {
+	dohSettings := self.settings.DohSettings
+	if dohSettings == nil && self.clientStrategy != nil {
+		dohSettings = self.clientStrategy.DohSettings()
+	}
+	if self.clientStrategy == nil || self.clientStrategy.settings.ConnectSettings.ProxySettings == nil {
+		return dohSettings, true
+	}
+	if dohSettings == nil {
+		dohSettings = DefaultDohSettings()
+	}
+	proxiedDohSettings := *dohSettings
+	proxiedDohSettings.DialContextSettings = &DialContextSettings{
+		DialContext: self.clientStrategy.settings.ConnectSettings.DialContext,
+	}
+	return &proxiedDohSettings, false
 }
 
 // DecodeExtenderDnsRecord decodes one TXT value of the extender dns name: the
@@ -1180,6 +1214,11 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		}
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
+			continue
+		}
+		// a carrier the space's egress cannot carry is not tried, so it never
+		// counts against the candidate (net_proxy_packet_path.go)
+		if !extenderConnectModeDialable(connectSettings, connectMode) {
 			continue
 		}
 		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)
@@ -1864,12 +1903,12 @@ func (self *ExtenderNetworkClient) probeCandidate(
 		defer cancel()
 		return self.settings.Probe(ctx, candidate, attestor)
 	}
+	connectSettings := DefaultConnectSettings()
+	if self.clientStrategy != nil {
+		connectSettings = &self.clientStrategy.settings.ConnectSettings
+	}
 	probeLatency := self.settings.ProbeLatency
 	if probeLatency == nil {
-		connectSettings := DefaultConnectSettings()
-		if self.clientStrategy != nil {
-			connectSettings = &self.clientStrategy.settings.ConnectSettings
-		}
 		probeLatency = func(
 			ctx context.Context,
 			extenderConfig *ExtenderConfig,
@@ -1880,6 +1919,7 @@ func (self *ExtenderNetworkClient) probeCandidate(
 	}
 	candidateProbe, err := probeExtenderCandidate(
 		self.ctx,
+		connectSettings,
 		self.directory,
 		candidate,
 		self.settings.ProbeCountPerExtender,
@@ -1940,9 +1980,12 @@ func (self *extenderCandidateProbe) outcome() (ExtenderPingOutcome, uint32) {
 // exactly as a feed dial records it, and a carrier that does clears the hold.
 // Both probe passes walk carriers here -- the network client's
 // (DESIGNNOTES4.md §4) and the extender's peer pinger (GEOMAP §2.1) -- so the
-// two can never disagree about what a ping of one extender is.
+// two can never disagree about what a ping of one extender is. A carrier
+// `connectSettings` cannot carry is not tried (net_proxy_packet_path.go); nil
+// tries every carrier.
 func probeExtenderCandidate(
 	ctx context.Context,
+	connectSettings *ConnectSettings,
 	directory *ExtenderDirectory,
 	candidate *ExtenderCandidate,
 	count int,
@@ -1956,6 +1999,9 @@ func probeExtenderCandidate(
 	for _, carrier := range orderedExtenderCarriers(candidate.Carriers) {
 		connectMode, ok := ExtenderConnectModeForCarrier(carrier)
 		if !ok {
+			continue
+		}
+		if !extenderConnectModeDialable(connectSettings, connectMode) {
 			continue
 		}
 		extenderConfig := extenderFeedConfig(candidate, connectMode, spoofDomains, borrowCountryCode)

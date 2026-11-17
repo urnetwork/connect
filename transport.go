@@ -1883,6 +1883,27 @@ func NewPlatformTransportWithTargetMode(
 			transport.targetMode = targetMode
 		}
 	}
+	if clientStrategy != nil && clientStrategy.ConnectSettings().ProxySettings != nil &&
+		clientStrategy.H3ExtenderConfig() == nil {
+		// a socks proxy carries no udp: an h3 mode would resolve the platform
+		// host on this host and open a socket of this host's, or of an
+		// endpoint factory, after a lookup outside the proxy; so no h3 mode is
+		// offered, and h1 carries the transport through the proxy. An
+		// extender-only strategy keeps h3: the extender resolves the name
+		// (net_proxy_packet_path.go)
+		for _, h3Mode := range []TransportMode{TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
+			delete(transport.modePreferences, h3Mode)
+		}
+		if len(transport.modePreferences) == 0 {
+			transport.modePreferences[TransportModeH1] = DefaultTransportModePreferences()[TransportModeH1]
+		}
+		switch targetMode {
+		case TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump:
+			log.Infof("[t]%s is not available through a proxy; using h1\n", targetMode)
+			targetMode = TransportModeH1
+			transport.targetMode = targetMode
+		}
+	}
 	transport.h3Gate = newPlatformH3Gate(transport)
 	h1Enabled := targetMode == TransportModeH1 ||
 		(targetMode == TransportModeAuto &&

@@ -749,6 +749,7 @@ func (self *ExtenderPeerPinger) ping(publicKey []byte, candidates []*ExtenderCan
 		}
 		candidateProbe, err := probeExtenderCandidate(
 			self.ctx,
+			self.connectSettings,
 			self.directory,
 			candidate,
 			self.settings.ProbeCount,

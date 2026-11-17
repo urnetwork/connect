@@ -211,6 +211,7 @@ func TestProbeExtenderCandidateRecordsALimitAndNoFailure(t *testing.T) {
 	probeCount := 0
 	_, err := probeExtenderCandidate(
 		context.Background(),
+		nil,
 		directory,
 		candidate,
 		2,

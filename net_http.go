@@ -560,6 +560,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		if extenderConfig == nil || settings.DisableManualExtenders {
 			continue
 		}
+		// a carrier the space's egress cannot carry is never dialed
+		// (net_proxy_packet_path.go)
+		if !extenderConnectModeDialable(&settings.ConnectSettings, extenderConfig.Profile.ConnectMode) {
+			continue
+		}
 		copiedConfig := *extenderConfig
 		dialer := &clientDialer{
 			description:        "configured extender",
@@ -780,13 +785,15 @@ func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]
 //
 // Racing a direct h3 dial against an extender one, the way the stream dialers
 // race, would be the fuller answer and is not what this does. A strategy that
-// refuses extenders configured by hand (`DisableManualExtenders`) answers nil.
+// refuses extenders configured by hand (`DisableManualExtenders`) answers nil,
+// and a configured extender on a carrier the space's egress cannot carry is
+// passed over (net_proxy_packet_path.go).
 func (self *ClientStrategy) H3ExtenderConfig() *ExtenderConfig {
 	if self.settings.EnableNormal || self.settings.EnableResilient || self.settings.DisableManualExtenders {
 		return nil
 	}
 	for _, extenderConfig := range self.settings.ExtenderConfigs {
-		if extenderConfig != nil {
+		if extenderConfig != nil && extenderConnectModeDialable(&self.settings.ConnectSettings, extenderConfig.Profile.ConnectMode) {
 			return extenderConfig
 		}
 	}
@@ -2564,6 +2571,9 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 			}
 		}
 	}
+	// a carrier the space's egress cannot carry is never dialed, so it never
+	// counts against its extender (net_proxy_packet_path.go)
+	extenderConfigs = dialableExtenderConfigs(&self.settings.ConnectSettings, extenderConfigs)
 
 	func() {
 		self.mutex.Lock()
@@ -2671,12 +2681,12 @@ func (self *ClientStrategy) expandPinnedExtenderDialers() (expandedDialers []*cl
 	if candidate == nil || !candidate.LimitedUntil.IsZero() {
 		return []*clientDialer{}
 	}
-	extenderConfigs := extenderConfigsForCandidate(
+	extenderConfigs := dialableExtenderConfigs(&self.settings.ConnectSettings, extenderConfigsForCandidate(
 		candidate,
 		secret,
 		spoofDomains,
 		directoryBorrowCountryCode(self.settings.ExtenderDirectory),
-	)
+	))
 
 	func() {
 		self.mutex.Lock()

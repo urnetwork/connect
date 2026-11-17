@@ -1056,7 +1056,9 @@ func (self *extenderResponseHeaderReader) Read(b []byte) (int, error) {
 
 // One unconnected udp endpoint for a carrier dial, narrowed to the family of
 // the extender address. A configured packet endpoint factory wins, so a
-// headless host keeps one source identity.
+// headless host keeps one source identity. A space whose egress is a
+// proxy and that supplies no factory has no udp path: a host socket would leave
+// from this host, outside the proxy, so none is opened (net_proxy_packet_path.go).
 func openExtenderPacketConn(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -1064,6 +1066,9 @@ func openExtenderPacketConn(
 ) (net.PacketConn, error) {
 	if connectSettings.DialContextSettings != nil && connectSettings.DialContextSettings.PacketConnFactory != nil {
 		return connectSettings.DialContextSettings.PacketConnFactory(ctx)
+	}
+	if !connectSettingsHavePacketPath(connectSettings) {
+		return nil, ErrExtenderPacketCarrierUnavailable
 	}
 	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
 	return net.ListenUDP(udpNetwork, wildcard)

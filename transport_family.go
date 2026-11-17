@@ -1263,6 +1263,12 @@ func (self *PlatformTransport) openH3PacketConn(
 		// says it is.
 		return packetConn, ExtenderPacketConnRemoteAddr(packetConn), false, nil
 	}
+	// a strategy whose egress is a socks proxy offers no h3 mode; should one
+	// still dial, no host socket leaves outside the proxy
+	// (net_proxy_packet_path.go)
+	if self.clientStrategy != nil && self.clientStrategy.ConnectSettings().ProxySettings != nil {
+		return nil, nil, false, ErrExtenderPacketCarrierUnavailable
+	}
 	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
 	udpConn, err := net.ListenUDP(udpNetwork, wildcard)
 	if err != nil {
