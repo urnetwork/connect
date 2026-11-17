@@ -271,7 +271,7 @@ const (
 	maxDnsTcpFlows = 32
 	// maxDnsTcpQueryBytes admits normal DNS + EDNS queries without permitting
 	// a 64 KiB allocation per accepted client. DoH responses remain separately
-	// bounded by maxDohResponseBytes.
+	// bounded by DohSettings.ResponseMaxByteCount.
 	maxDnsTcpQueryBytes = 4 * 1024
 	dnsTcpFlowTtl       = 2 * time.Minute
 	dnsTcpIoTimeout     = 15 * time.Second
@@ -472,7 +472,7 @@ func buildFallbackDohCache(rs *DnsResolverSettings, memoryTarget *MemoryTarget, 
 	// then draws from the same owner byte target as the primary (see DohSettings.MemoryTarget)
 	// — but stay wave-capped like the primary (the shared-pipe bound; see NewUpgradeMux).
 	dohSettings.MemoryTarget = memoryTarget
-	fallbackHttpConcurrency := min(muxFallbackDohHttpWaveSize, dnsTargetHttpConcurrency(memoryTarget.Capacity(), 4))
+	fallbackHttpConcurrency := min(muxFallbackDohHttpWaveSize, dnsTargetHttpConcurrency(memoryTarget.Capacity(), dohSettings.ResponseMaxByteCount, 4))
 	dohSettings.MaxConcurrentHttpRequests = fallbackHttpConcurrency
 	dohSettings.MaxConcurrentResolutions = 2 * fallbackHttpConcurrency
 	dohSettings.MaxServersPerQuery = 2
@@ -563,7 +563,7 @@ func NewUpgradeMux(
 	// carry the last session's per-server ordering into the first fan-outs
 	dohSettings.ServerStatsSeed = serverStatsSeed
 	dohSettings.CacheMaxEntries = dnsTargetCacheEntries(dnsMemoryTarget.Capacity(), 1024)
-	muxHttpConcurrency := min(muxDohHttpWaveSize, dnsTargetHttpConcurrency(dnsMemoryTarget.Capacity(), 8))
+	muxHttpConcurrency := min(muxDohHttpWaveSize, dnsTargetHttpConcurrency(dnsMemoryTarget.Capacity(), dohSettings.ResponseMaxByteCount, 8))
 	dohSettings.MaxConcurrentResolutions = 2 * muxHttpConcurrency
 	dohSettings.MaxConcurrentHttpRequests = muxHttpConcurrency
 	dohSettings.MaxServersPerQuery = 2

@@ -78,7 +78,7 @@ func TestDohClientSessionCache(t *testing.T) {
 	pinned := &tls.Config{ServerName: "pinned.example"}
 	settings.DnsResolverSettings.TlsConfig = pinned
 
-	httpClient := httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient := httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity))
 	tr := httpClient.Transport.(*http.Transport)
 	if tr.TLSClientConfig.ClientSessionCache == nil {
 		t.Fatalf("doh client tls config must carry a session cache")
@@ -96,7 +96,7 @@ func TestDohClientSessionCache(t *testing.T) {
 	// a config that already has a cache keeps it
 	ownCache := tls.NewLRUClientSessionCache(4)
 	settings.DnsResolverSettings.TlsConfig = &tls.Config{ClientSessionCache: ownCache}
-	httpClient = httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(dohTlsSessionCacheCapacity))
+	httpClient = httpClientWithDialer(settings, settings.DialContext, tls.NewLRUClientSessionCache(settings.TlsSessionCacheCapacity))
 	tr = httpClient.Transport.(*http.Transport)
 	if tr.TLSClientConfig.ClientSessionCache != tls.ClientSessionCache(ownCache) {
 		t.Fatalf("existing session cache must be kept")
@@ -110,13 +110,14 @@ func TestServerStatsSeed(t *testing.T) {
 	now := time.Now()
 	urls := []string{"https://a/dns-query", "https://b/dns-query"}
 
-	stats := newServerStats()
+	seedMaxScore := DefaultDohSettings().ServerSeedMaxScore
+	stats := newServerStats(DefaultDohSettings())
 	stats.seed(map[string]float64{urls[0]: 100.0})
 
 	// clamped on seed
 	scores := stats.scores()
-	if scores[urls[0]] < dohSeedMaxScore-0.5 || dohSeedMaxScore+0.5 < scores[urls[0]] {
-		t.Fatalf("seed must clamp to dohSeedMaxScore, got %v", scores[urls[0]])
+	if scores[urls[0]] < seedMaxScore-0.5 || seedMaxScore+0.5 < scores[urls[0]] {
+		t.Fatalf("seed must clamp to ServerSeedMaxScore, got %v", scores[urls[0]])
 	}
 	if _, ok := scores[urls[1]]; ok {
 		t.Fatalf("unseeded server must have no score")
@@ -224,7 +225,7 @@ func TestDohCacheWarmReturnsAfterFirstHealthyServer(t *testing.T) {
 		settings := DefaultDohSettings()
 		settings.RequestTimeout = 3 * time.Second
 		settings.MaxConcurrentHttpRequests = 2
-		settings.ServerStatsSeed = map[string]float64{slowServer.URL: dohSeedMaxScore}
+		settings.ServerStatsSeed = map[string]float64{slowServer.URL: settings.ServerSeedMaxScore}
 		settings.DnsResolverSettings = remoteDohResolverSettings(ipVersion, slowServer.URL, fastServer.URL)
 		cache := NewDohCache(settings)
 		defer cache.Close()
