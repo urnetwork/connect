@@ -21,7 +21,8 @@ func TestNativeDuplicateAckAfterInnerLossReachesProviderFastRecovery(t *testing.
 	checkNativeDuplicateAckRecovery(t, true, false)
 }
 
-// A real window change traverses the same public entry and provider ACK handler.
+// Real window changes traverse the same public entry and provider ACK handler
+// without supplying loss credit. Three later equal-window ACKs repair the loss.
 func TestNativeWindowChangingDuplicateAcksRepairInnerLoss(t *testing.T) {
 	checkNativeDuplicateAckRecovery(t, true, true)
 }
@@ -288,6 +289,31 @@ func checkNativeDuplicateAckRecovery(t *testing.T, loss, changeWindow bool) {
 		if loss && ack != base || !loss && ack != base+uint32(len(want)) {
 			t.Fatal("synthetic inner consumer did not retain the exact expected cumulative frontier")
 		}
+		duplicateWindow := f.window
+		if changeWindow {
+			phaseStarted := time.Now()
+			sequence.mutex.Lock()
+			progress := sequence.returnProgressTime
+			sequence.mutex.Unlock()
+			for index := range 3 {
+				duplicateWindow = f.window + uint16(index+1)
+				if !f.offer(groupRecoveryPacket(f.initial+1, ack, duplicateWindow, tcpFlagAck, nil)) {
+					t.Fatal("actual native window update was refused")
+				}
+				synctest.Wait()
+			}
+			sequence.mutex.Lock()
+			windowProgressOnly := sequence.returnDuplicateAcks == 0 && sequence.returnAttempts == 0 &&
+				sequence.receiveSeqAck == base && sequence.receiveWindowEnd == base+uint32(duplicateWindow) &&
+				sequence.returnByteCount == retained && sequence.returnProgressTime.Equal(progress)
+			sequence.mutex.Unlock()
+			f.consumer.stateLock.Lock()
+			noReplay := f.consumer.replays == 0 && f.consumer.received == ""
+			f.consumer.stateLock.Unlock()
+			if !windowProgressOnly || !noReplay || !time.Now().Equal(phaseStarted) {
+				t.Fatal("actual increasing native windows became duplicate-ACK loss evidence")
+			}
+		}
 		before := time.Now()
 		drops := f.parent.TcpCollapseDropCount()
 		beforeTerminals := f.senderTerminals.Load()
@@ -297,11 +323,7 @@ func checkNativeDuplicateAckRecovery(t *testing.T, loss, changeWindow bool) {
 			count = 3
 		}
 		for index := 0; index < count; index++ {
-			window := f.window
-			if changeWindow {
-				window += uint16(index + 1)
-			}
-			if f.offer(groupRecoveryPacket(f.initial+1, ack, window, tcpFlagAck, nil)) {
+			if f.offer(groupRecoveryPacket(f.initial+1, ack, duplicateWindow, tcpFlagAck, nil)) {
 				accepted++
 			}
 			synctest.Wait()

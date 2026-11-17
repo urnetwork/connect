@@ -1231,6 +1231,11 @@ type SendPack struct {
 	// takes them and the Pack's records at the call. The Pack then owns only
 	// itself, its admission slot and its prepared handoff.
 	serialized bool
+	// Cached before any logical-group prefix is serialized and returned.
+	// Pure feedback may be passed only while its own immediate custody is full.
+	pureTcpAck bool
+	// First pin selected the independent non-H1 policy; later narrowing keeps it.
+	groupPureTcpAckPolicy bool
 	// Logical-group chunk limits are pinned when the first chunk enters its
 	// SendSequence. H1 can safely carry a larger WebSocket message; pinning
 	// keeps completion accounting stable if carrier availability changes while
@@ -3684,7 +3689,8 @@ func (self *SendPack) pinGroupChunkLimits(policy transferFlightPolicySnapshot) {
 		return
 	}
 	settings := DefaultSendBufferChunkSettings()
-	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	self.groupChunkMaxFrames, self.groupChunkMaxMessageByteCount = settings.logicalGroupLimits(policy, self.pureTcpAck)
+	self.groupPureTcpAckPolicy = self.pureTcpAck && !policy.h1Only && 0 < settings.PureTcpAckMaxFrames
 	self.groupH1Known = settings.knownH1Enabled(policy)
 }
 
@@ -3713,7 +3719,8 @@ func (self *SendSequence) pinLogicalGroupChunkLimits(
 		return
 	}
 	settings := self.chunkSettings()
-	sendPack.groupChunkMaxFrames, sendPack.groupChunkMaxMessageByteCount = settings.chunkLimits(policy)
+	sendPack.groupChunkMaxFrames, sendPack.groupChunkMaxMessageByteCount = settings.logicalGroupLimits(policy, sendPack.pureTcpAck)
+	sendPack.groupPureTcpAckPolicy = sendPack.pureTcpAck && !policy.h1Only && 0 < settings.PureTcpAckMaxFrames
 	sendPack.groupH1Known = settings.knownH1Enabled(policy)
 	if !policy.h1Only || sendPack.groupH1Known || len(sendPack.Frames) <= sendPack.groupFrameIndex {
 		return
@@ -5529,12 +5536,19 @@ func (self *Client) Flush() {
 // an advertised complete-wire ceiling. The fixed callback storage bounds all
 // positive frame counts, including owner overrides.
 type SendBufferChunkSettings struct {
-	// SharedMaxFrames defaults to the two inline completion records for mixed,
-	// H3, P2P and untyped routes. Nonpositive uses the constructor default.
+	// SharedMaxFrames defaults to two for non-H1 groups. A positive
+	// PureTcpAckMaxFrames separately owns the validated pure-feedback limit.
+	// Nonpositive uses the constructor default.
 	SharedMaxFrames int
 	// SharedMaxMessageByteCount defaults to one tunnel MTU of message bytes.
 	// Nonpositive uses the constructor default; one indivisible owner advances.
 	SharedMaxMessageByteCount ByteCount
+	// PureTcpAckMaxFrames defaults to sixteen within one already-ready group
+	// on non-H1 routes. Only reliable NoBudget immediate pure TCP ACKs qualify;
+	// their message-byte cap stays shared. Positive values own this class limit
+	// independently from SharedMaxFrames and clamp to existing frame storage.
+	// Nonpositive retains the shared frame limit. H1 policy remains unchanged.
+	PureTcpAckMaxFrames int
 	// H1KnownMaxFrames defaults to eight for H1 routes whose complete-message
 	// ceilings are all known. Nonpositive disables this enlarged policy.
 	H1KnownMaxFrames int
@@ -5560,6 +5574,7 @@ func DefaultSendBufferChunkSettings() SendBufferChunkSettings {
 	return SendBufferChunkSettings{
 		SharedMaxFrames:                  sendPackBatchMaxFrames,
 		SharedMaxMessageByteCount:        DefaultMtu,
+		PureTcpAckMaxFrames:              sendPackH1GroupMaxFrames,
 		H1KnownMaxFrames:                 8,
 		H1KnownMaxMessageByteCount:       8 * DefaultMtu,
 		H1UnknownMaxFrames:               sendPackH1GroupMaxFrames,
@@ -5606,6 +5621,16 @@ func (self SendBufferChunkSettings) chunkLimits(policy transferFlightPolicySnaps
 	return min(frames, sendPackH1GroupMaxFrames), byteCount
 }
 
+// Only a validated whole-group cache can select this independent feedback
+// limit. It takes no future frame or extra owner and retains the message-byte cap.
+func (self SendBufferChunkSettings) logicalGroupLimits(policy transferFlightPolicySnapshot, pureTcpAck bool) (int, ByteCount) {
+	frames, byteCount := self.chunkLimits(policy)
+	if pureTcpAck && !policy.h1Only && 0 < self.PureTcpAckMaxFrames {
+		frames = min(self.PureTcpAckMaxFrames, sendPackH1GroupMaxFrames)
+	}
+	return frames, byteCount
+}
+
 // Resolves the legacy established byte cap without raising a positive lower value.
 func (self SendBufferChunkSettings) establishedByteLimit() ByteCount {
 	if self.H1EstablishedMaxMessageByteCount > 0 {
@@ -5615,8 +5640,8 @@ func (self SendBufferChunkSettings) establishedByteLimit() ByteCount {
 }
 
 type SendBufferSettings struct {
-	// ChunkSettings belongs to this sender; its defaults preserve shared and
-	// unknown-H1 policy while enabling the guarded known-H1 eight-frame path.
+	// ChunkSettings belongs to this sender; its defaults retain shared DATA
+	// and H1 policy while compacting validated, already-ready pure feedback.
 	ChunkSettings SendBufferChunkSettings
 
 	// Extra Transfer-level pacing is disabled for every transport by default.
@@ -8084,6 +8109,8 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		sendPack.Ack = true
 	}
 	sendPack.tcpOrderBarrier = sendPack.hasTcpOrderBarrier()
+	sendPack.pureTcpAck = sendPack.Ack && sendPack.NoBudget && sendPack.DeliverImmediately &&
+		!sendPack.tcpOrderBarrier && immediateIpAckFrames(sendPack.frameList())
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
 	sendPack.admissionFailure = sendAdmissionUnknown
@@ -8780,10 +8807,11 @@ func (self *SendSequence) processLogicalGroupChunk(
 			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeSynOpeningSuperseded))
 			return true, true, false
 		}
-		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay &&
-			(attempt.source != self || !attempt.current()) {
-			sendPack.disposeUnsentGroup(newUnwrittenSendPackError(errNativeAckRetrySuperseded))
-			return true, true, false
+		if attempt := group.nativeAckRetry; attempt != nil && attempt.replay {
+			if err := attempt.replayDisposition(self); err != nil {
+				sendPack.disposeUnsentGroup(err)
+				return true, true, false
+			}
 		}
 	}
 	// A new sequence has no writer when the scheduler takes its first Pack, so
@@ -8840,11 +8868,13 @@ func (self *SendSequence) processLogicalGroupChunk(
 	// Contract acquisition can wait through a carrier replacement. Only the
 	// current published ceiling may bound this still-unwritten chunk.
 	envelopePolicy := self.transferFlightPolicy()
-	// An unknown or mixed replacement cannot inherit permission to enlarge a
-	// still-unwritten chunk. Existing unknown-H1 partitions keep their policy.
+	// Repartition only the unwritten remainder before creating its next child.
+	// Newly compacted feedback narrows when a replacement selects a lower frame or
+	// byte limit; shrinkGroupLimits adjusts the live completion owner first.
+	// Initially unknown-H1 partitions keep their policy.
 	settings := self.chunkSettings()
-	currentFrames, currentBytes := settings.chunkLimits(envelopePolicy)
-	if sendPack.groupH1Known && !settings.knownH1Enabled(envelopePolicy) &&
+	currentFrames, currentBytes := settings.logicalGroupLimits(envelopePolicy, sendPack.pureTcpAck)
+	if (sendPack.groupPureTcpAckPolicy || sendPack.groupH1Known && !settings.knownH1Enabled(envelopePolicy)) &&
 		(currentFrames < maxFrames || currentBytes < maxMessageByteCount) {
 		sendPack.shrinkGroupLimits(min(maxFrames, currentFrames), min(maxMessageByteCount, currentBytes))
 		maxFrames, maxMessageByteCount = sendPack.groupChunkLimits()
@@ -10579,6 +10609,11 @@ sendSequenceLoop:
 		// go first; it is taken once the introduction is acknowledged, or once
 		// its caller's budget has run out, for the deadline to drop.
 		held := func(candidate *SendPack) bool {
+			// Already-unordered pure TCP feedback owns no sequence-space
+			// dependency. Its separate receipt count cannot hold eligible DATA.
+			if candidate.pureTcpAck && !self.immediateSendAvailable(candidate) {
+				return true
+			}
 			if !self.noAckPackHeldAtContract(candidate, sendTime) {
 				return false
 			}
@@ -12652,14 +12687,14 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			allowed := func() bool {
 				attempt.update.stateLock.Lock()
 				defer attempt.update.stateLock.Unlock()
-				if attempt.source != self || !attempt.currentWithLock() {
+				if err := attempt.replayDispositionWithLock(self); err != nil {
+					disposeErr = err
 					return false
 				}
 				assign()
 				return true
 			}()
 			if !allowed {
-				disposeErr = newUnwrittenSendPackError(errNativeAckRetrySuperseded)
 				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
 				return false
 			}

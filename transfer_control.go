@@ -27,8 +27,12 @@ type ControlSync struct {
 	beforeWorkerDoneForTest func()
 	beforeCloseWaitForTest  func()
 
-	sendLock  sync.Mutex
-	syncCount uint64
+	// Publication never waits for admission. One active attempt retains the
+	// old-before-new admission order while the existing monitor wakes retries.
+	sendLock      sync.Mutex
+	syncCount     uint64
+	attemptActive bool
+	currentCancel context.CancelFunc
 }
 
 func NewControlSync(ctx context.Context, client *Client, scopeTag string) *ControlSync {
@@ -60,6 +64,43 @@ func (self *ControlSync) startWorker(run func()) bool {
 	return true
 }
 
+// claimSendAttempt serializes actual sends without holding the publication
+// mutex during client admission. A canceled generation cannot claim a new turn.
+func (self *ControlSync) claimSendAttempt(handleCtx context.Context, syncIndex uint64, wait bool) bool {
+	for {
+		self.sendLock.Lock()
+		if handleCtx.Err() != nil || syncIndex != self.syncCount {
+			self.sendLock.Unlock()
+			return false
+		}
+		if !self.attemptActive {
+			self.attemptActive = true
+			self.sendLock.Unlock()
+			return true
+		}
+		if !wait {
+			self.sendLock.Unlock()
+			return false
+		}
+		notify := self.monitor.NotifyChannel()
+		self.sendLock.Unlock()
+		select {
+		case <-handleCtx.Done():
+			return false
+		case <-notify:
+		}
+	}
+}
+
+// finishSendAttempt runs even when client admission panics or completes an ACK
+// inline. A successor starts only after the older admission call has returned.
+func (self *ControlSync) finishSendAttempt() {
+	self.sendLock.Lock()
+	self.attemptActive = false
+	self.monitor.NotifyAll()
+	self.sendLock.Unlock()
+}
+
 func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protocol.Frame, ackCallback AckFunction) {
 	// 1. try to send non-blocking
 	// 2. if fails, send blocking with no timeout
@@ -76,12 +117,15 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 	handleCtx, handleCancel := context.WithCancel(self.ctx)
 
 	self.sendLock.Lock()
-	defer self.sendLock.Unlock()
-
+	previousCancel := self.currentCancel
 	self.syncCount += 1
 	syncIndex := self.syncCount
-
+	self.currentCancel = handleCancel
 	notify := self.monitor.NotifyAll()
+	self.sendLock.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 	if !self.startWorker(func() {
 		defer handleCancel()
 
@@ -91,12 +135,10 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			case <-handleCtx.Done():
 				return
 			}
-			// re-subscribe and read syncCount in the same locked scope. the
-			// notify channel is closed by `NotifyAll`, so without the
-			// re-subscribe a wake that does not exit the loop would re-select
-			// the already closed channel and hot spin. today the only notifier
-			// (above) always bumps syncCount first, so this loop always exits on
-			// its first wake — a second notifier that did not would spin
+			// Read the generation and rearm in the same locked scope. The
+			// monitor also wakes on same-generation attempt completion, so a
+			// current watcher must re-subscribe rather than reuse a closed
+			// notification or cancel a still-live acknowledged owner.
 			done := false
 			func() {
 				self.sendLock.Lock()
@@ -148,19 +190,11 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 			success := false
 			var err error
 			func() {
-				self.sendLock.Lock()
-				defer self.sendLock.Unlock()
-
-				select {
-				case <-handleCtx.Done():
+				if !self.claimSendAttempt(handleCtx, syncIndex, true) {
 					done = true
-				default:
-					done = syncIndex != self.syncCount
-				}
-
-				if done {
 					return
 				}
+				defer self.finishSendAttempt()
 
 				updatedFrameCopy := &protocol.Frame{
 					MessageType:  updatedFrame.MessageType,
@@ -236,39 +270,45 @@ func (self *ControlSync) Send(frame *protocol.Frame, updateFrame func() *protoco
 		}
 	}
 
-	frameCopy := &protocol.Frame{
-		MessageType:  frame.MessageType,
-		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
-	}
-	success := self.client.SendWithTimeout(
-		frameCopy,
-		ControlId,
-		func(err error) {
-			if err == nil {
-				safeAckCallback(nil)
-				MessagePoolReturn(frame.MessageBytes)
-				// the sync is complete: release the watcher and ctx
-				handleCancel()
-			} else {
-				if !self.startWorker(func() {
-					controlSync(frame)
-				}) {
+	success := func() bool {
+		if !self.claimSendAttempt(handleCtx, syncIndex, false) {
+			return false
+		}
+		defer self.finishSendAttempt()
+		frameCopy := &protocol.Frame{
+			MessageType:  frame.MessageType,
+			MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
+		}
+		success := self.client.SendWithTimeout(
+			frameCopy,
+			ControlId,
+			func(err error) {
+				if err == nil {
+					safeAckCallback(nil)
 					MessagePoolReturn(frame.MessageBytes)
+					// the sync is complete: release the watcher and ctx
 					handleCancel()
+				} else {
+					if !self.startWorker(func() {
+						controlSync(frame)
+					}) {
+						MessagePoolReturn(frame.MessageBytes)
+						handleCancel()
+					}
 				}
-			}
-		},
-		0,
-		Ctx(handleCtx),
-		NoBudget(),
-	)
+			},
+			0,
+			Ctx(handleCtx),
+			NoBudget(),
+		)
+		if !success {
+			MessagePoolReturn(frameCopy.MessageBytes)
+		}
+		return success
+	}()
 	if success {
 		return
 	}
-
-	// the non-blocking send did not accept the frame, so no ack will ever fire for
-	// the copy: undo its share (see the retry loop above for the same rule)
-	MessagePoolReturn(frameCopy.MessageBytes)
 
 	if !self.startWorker(func() {
 		controlSync(frame)

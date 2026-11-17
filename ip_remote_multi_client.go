@@ -8416,7 +8416,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			}
 			client = selection.client
 			sendPacketGroup.completionSelection = selection
-			sendPacketGroup.prepareAdmissionObservations(client)
+			sendPacketGroup.prepareAdmissionObservations(client, nativeIngress)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
 			if !success {
@@ -8632,7 +8632,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				if sendPacketGroup.synRetry != nil {
 					sendPacketGroup.noteSynRetryReadinessWidth(1)
 				}
-				sendPacketGroup.prepareAdmissionObservations(client)
+				sendPacketGroup.prepareAdmissionObservations(client, nativeIngress)
 				sendPacketGroup.completionSelection = nil
 				// A one-candidate formation still has an initial race/probe
 				// attempt. Keep that first group reliable; once committed,
@@ -8829,7 +8829,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var successCount atomic.Int32
 				var raceTerminalError atomic.Bool
 				for _, client := range raceOrderedClients {
-					sendPacketGroup.prepareAdmissionObservations(client)
+					sendPacketGroup.prepareAdmissionObservations(client, nativeIngress)
 				}
 				send := func(client *multiClientChannel) {
 					sent := false
@@ -11438,6 +11438,8 @@ type multiClientChannelUpdate struct {
 	synRetryReleased atomic.Pointer[tcpSynRetry]
 	nativeAckRetry   *tcpNativeAckRetry
 	nativeAckSerial  uint64
+	// Last replay invalidation outside the native TCP offer preparation.
+	nativeAckLastUnrelatedSerial uint64
 	// openTime and activityTime bound one TCP generation's active lifetime for
 	// the affinity-performance learner; no timer or goroutine is retained per
 	// flow. Construction initializes it, and a same-tuple fresh SYN resets it

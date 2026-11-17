@@ -75,6 +75,9 @@ func newTcpReturnFlightFixtureWithMtu(t *testing.T, maxPackets int, base uint32,
 	f.sequence.receiveWindowSize = uint32(window)
 	f.sequence.receiveWindowEnd = base + uint32(window)
 	f.sequence.receiveWindowEndSet = true
+	// Establish the last valid raw ACK header before any return is outstanding;
+	// an unknown first ACK is not one of a later three-duplicate loss proof.
+	acknowledgeTcpReturnFlight(t, f.sequence, base, window)
 	if !f.sequence.retainReturnChunk(payload, base, false) {
 		cancel()
 		f.sequence.memory.release()

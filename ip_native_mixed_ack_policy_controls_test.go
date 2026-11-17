@@ -14,18 +14,24 @@ import (
 // Alternating classes create sixteen independently funded DATA owners and
 // sixteen protocol owners; one old mixed-group estimate cannot fund them.
 func TestNativeMixedAckAllocationPartitionBudgetMatchesRetainedData(t *testing.T) {
-	checkNativeMixedAckPartitionCapacity(t, false)
+	checkNativeMixedAckPartitionCapacity(t, false, 0, 32)
 }
 
 // A full 32-member protocol flight keeps positive graph metadata and exact
-// packet custody while zero DATA permission remains sufficient.
+// packet custody in two default sixteen-frame children without DATA permission.
 func TestNativeMixedAckAllocationPureProtocolRetainsGraphWithoutDataCharge(t *testing.T) {
-	checkNativeMixedAckPartitionCapacity(t, true)
+	checkNativeMixedAckPartitionCapacity(t, true, 0, 2)
 }
 
-// Both cases use the public native entry and the actual serializer. Only the
+// A caller's explicit pure-feedback cap retains the older sixteen-child
+// geometry with the same graph, packet custody and zero DATA permission.
+func TestNativeMixedAckAllocationConfiguredPureProtocolRetainsGraphWithoutDataCharge(t *testing.T) {
+	checkNativeMixedAckPartitionCapacity(t, true, 2, 16)
+}
+
+// All cases use the public native entry and the actual serializer. Only the
 // fixture-owned source barrier and later decoded peer ACKs control progress.
-func checkNativeMixedAckPartitionCapacity(t *testing.T, pureProtocol bool) {
+func checkNativeMixedAckPartitionCapacity(t *testing.T, pureProtocol bool, pureFrameLimit, wantChunks int) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -34,6 +40,9 @@ func checkNativeMixedAckPartitionCapacity(t *testing.T, pureProtocol bool) {
 		var groupsLock sync.Mutex
 		var groups []*parsedPacketGroup
 		fixture := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			if pureFrameLimit > 0 {
+				settings.SendBufferSettings.ChunkSettings.PureTcpAckMaxFrames = pureFrameLimit
+			}
 			settings.SendBufferSettings.beforeGroupRetainForTest = func() { retainCalls.Add(1) }
 			settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
 				groupsLock.Lock()
@@ -70,9 +79,9 @@ func checkNativeMixedAckPartitionCapacity(t *testing.T, pureProtocol bool) {
 		groupsLock.Lock()
 		admittedGroups := append([]*parsedPacketGroup(nil), groups...)
 		groupsLock.Unlock()
-		wantOwners, wantDataOwners, wantChunks := 32, 16, 32
+		wantOwners, wantDataOwners := 32, 16
 		if pureProtocol {
-			wantOwners, wantDataOwners, wantChunks = 1, 0, 16
+			wantOwners, wantDataOwners = 1, 0
 		}
 		if len(admittedGroups) != wantOwners || budget.UsedByteCount() != 0 {
 			t.Fatalf("pre-Run partition custody changed: owners=%d want=%d used=%d", len(admittedGroups), wantOwners, budget.UsedByteCount())
@@ -82,7 +91,7 @@ func checkNativeMixedAckPartitionCapacity(t *testing.T, pureProtocol bool) {
 		if cost.owners != wantOwners || cost.dataOwners != wantDataOwners || len(cost.chunks) != wantChunks || cost.metadata <= 0 ||
 			pureProtocol && (cost.total != 0 || cost.dataMetadata != 0) ||
 			!pureProtocol && (cost.total <= 0 || cost.dataMetadata <= 0 || cost.dataMetadata*2 != cost.metadata) {
-			t.Fatalf("partition calibration lost independent class accounting: pure=%t cost=%+v", pureProtocol, cost)
+			t.Fatalf("NATIVE_MIXED_ACK_CALIBRATION_POLICY_MISMATCH: pure=%t configured_pure_frames=%d want_chunks=%d cost=%+v", pureProtocol, pureFrameLimit, wantChunks, cost)
 		}
 		graphCharges := make([]ByteCount, len(admittedGroups))
 		var independentlyCharged ByteCount

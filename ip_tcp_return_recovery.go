@@ -164,13 +164,15 @@ func (self *TcpSequence) signalReturnRecoveryWithLock() {
 }
 
 // Called only after the ACK was validated against the emitted sequence range.
+// Duplicate credit additionally requires the caller's unchanged raw window and
+// payload-free ACK classification. Other feedback preserves earlier credit.
 //
 // An advancing ACK is progress, which moves the resend deadline later; the
 // recovery goroutine finds the new deadline when its armed timer fires, so an
 // ordinary ACK costs it no wake. It is woken only when the deadline moves
 // earlier: an ACK that resets a backed-off delay, one that readies the next
 // replay of a recovery, or the third duplicate.
-func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
+func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32, duplicateAck bool) {
 	if self.returnHead == len(self.returnChunks) {
 		return
 	}
@@ -211,7 +213,7 @@ func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32) {
 		if backedOff || self.returnRecoveryReady {
 			self.signalReturnRecoveryWithLock()
 		}
-	} else if self.returnDuplicateAcks < 3 {
+	} else if duplicateAck && self.returnDuplicateAcks < 3 {
 		self.returnDuplicateAcks++
 		if self.returnDuplicateAcks == 3 {
 			self.signalReturnRecoveryWithLock()

@@ -41,7 +41,7 @@ type privateProviderEncryptedAckFixture struct {
 
 // Both peers negotiate TLS and verify identity against genuinely MAC-verified
 // contract keys. Every memory policy is installed before either client starts.
-func newPrivateProviderEncryptedAckFixture(t *testing.T) *privateProviderEncryptedAckFixture {
+func newPrivateProviderEncryptedAckFixture(t *testing.T, configure ...func(*ClientSettings)) *privateProviderEncryptedAckFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	root := NewTransferMemoryBudget(16 * 1024 * 1024)
@@ -88,6 +88,9 @@ func newPrivateProviderEncryptedAckFixture(t *testing.T) *privateProviderEncrypt
 			receive.AdvertiseReceiveWindow = false
 			receive.PackQueueBudget = nil
 			receive.PackQueueRetainedByteAccounting = false
+		}
+		for _, apply := range configure {
+			apply(value)
 		}
 		return value
 	}

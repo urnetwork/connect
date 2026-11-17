@@ -77,6 +77,19 @@ func TestNativeReturnFlightWindowHeaderCannotShrinkOutstandingEdge(t *testing.T)
 		base := f.consumer.base
 		f.consumer.stateLock.Unlock()
 		sequence := f.providerSequence.Load()
+		// This changed raw header supplies the baseline, while the accepted
+		// greatest right edge stays open. The next three are duplicates.
+		if !f.offer(groupRecoveryPacket(f.initial+1, base, 0, tcpFlagAck, nil)) {
+			t.Fatal("native zero-window-header baseline was refused")
+		}
+		synctest.Wait()
+		sequence.mutex.Lock()
+		baseline := sequence.returnDuplicateAcks == 0 && sequence.returnAttempts == 0 &&
+			sequence.receiveSeqAck == base && sequence.receiveWindowEnd == base+16 && sequence.receiveWindowSize == 16
+		sequence.mutex.Unlock()
+		if !baseline {
+			t.Fatal("the changed zero header counted as a duplicate or shrank the accepted edge")
+		}
 		for range 3 {
 			if !f.offer(groupRecoveryPacket(f.initial+1, base, 0, tcpFlagAck, nil)) {
 				t.Fatal("native zero-window-header ACK was refused")

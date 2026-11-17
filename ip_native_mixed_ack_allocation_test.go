@@ -252,8 +252,7 @@ func nativeMixedAckFlightRetainedCost(t *testing.T, source *SendSequence, templa
 		!source.client.ContractManager().SendNoContract(source.destination) || !source.resendQueue.lifetimeBudget {
 		t.Fatal("allocation flight calibration requires the actual no-contract, retained, non-H1 source")
 	}
-	pack := SendPack{logicalGroup: true}
-	pack.pinGroupChunkLimits(policy)
+	pack := SendPack{logicalGroup: true, Ack: true}
 	defer func() {
 		for _, frame := range pack.Frames {
 			if !frame.Raw {
@@ -271,6 +270,13 @@ func nativeMixedAckFlightRetainedCost(t *testing.T, source *SendSequence, templa
 			t.Fatal("allocation flight calibration requires the fixture's raw-v2 path")
 		}
 	}
+	// Native TCP groups are reliable. Classify their complete owned frame
+	// list before pinning the actual source's independent feedback policy.
+	pack.NoBudget = protocolOnlyFrames(pack.Frames)
+	pack.DeliverImmediately = immediateIpAckFrames(pack.Frames)
+	pack.tcpOrderBarrier = pack.hasTcpOrderBarrier()
+	pack.pureTcpAck = pack.NoBudget && pack.DeliverImmediately && !pack.tcpOrderBarrier
+	source.pinLogicalGroupChunkLimits(&pack, policy)
 	group := parsedPacketGroup{packets: make([]parsedPacket, len(templates))}
 	group.completionFlags.Store(groupCompletionTracked)
 	cost := nativeMixedAckFlightCost{metadata: group.sendGroupMemoryByteCount()}

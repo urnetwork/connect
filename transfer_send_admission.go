@@ -18,6 +18,9 @@ type SendPackAdmissionError struct {
 	// successfully admits the same retained input (possibly to another exit).
 	RecoveredByOwner      bool
 	OwnerTrackingOverflow bool
+	// NativeReadyPureTcpAck identifies the trusted native input owner's
+	// whole-group pure ACK offer. It changes observation only, never admission.
+	NativeReadyPureTcpAck bool
 	Err                   error
 }
 
