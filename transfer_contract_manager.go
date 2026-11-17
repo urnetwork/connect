@@ -2090,14 +2090,17 @@ func (self *ContractManager) createContract(contractKey ContractKey, contractSeq
 						return
 					}
 					noteBackendFailure()
+					// an exhausted request's own message names no cause: the
+					// line names the causes its attempts retained
+					// (httpRequestErrorWithCauses)
 					if ok, suppressed := shouldLogOobErr(); ok {
 						if suppressed > 0 {
-							self.client.log.Infof("[contract]oob err = %s (%d suppressed)\n", err, suppressed)
+							self.client.log.Infof("[contract]oob err = %s (%d suppressed)\n", httpRequestErrorWithCauses(err), suppressed)
 						} else {
-							self.client.log.Infof("[contract]oob err = %s\n", err)
+							self.client.log.Infof("[contract]oob err = %s\n", httpRequestErrorWithCauses(err))
 						}
 					} else if v := self.client.log.V(1); v.Enabled() {
-						v.Infof("[contract]oob err = %s\n", err)
+						v.Infof("[contract]oob err = %s\n", httpRequestErrorWithCauses(err))
 					}
 				}
 			}
