@@ -47,6 +47,10 @@ type studyConfig struct {
 	// the review's rule (V10): an interrupted run counts only if converged
 	// or clear held, by the server's check, when the silence began
 	interruptedRule bool
+	// the server's verdict from the lowest χ² of lagdrift's fit and a grid of
+	// starts around the fit and the address's place, when lower by more than
+	// 1: what wider starts would change
+	wideStarts bool
 	// the runs each visitor makes: 1 to 3, 0 for 3
 	runs int
 	// V10's cadence: the frame refits warm at each ping round and runs the

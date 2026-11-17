@@ -448,6 +448,36 @@ func reportFindings(parts []*studyPart, results map[string]*studyResult, times f
 	if 0 < len(interruptedLines) {
 		b.WriteString("**The interrupted stop** (one run, 99%):\n\n" + strings.Join(interruptedLines, "\n") + "\n\n")
 	}
+	calibrationLines := []string{}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "calibration: ") {
+			continue
+		}
+		ks := result.empiricalKs(ofScenario(scenarioTiny), 0, 0)
+		calibrationLines = append(calibrationLines, fmt.Sprintf("- %s (%s): the region misses %s, %s and %s at 95%%, 99%% and 99.9%%; the k that would hold each is %s, %s and %s.",
+			strings.TrimPrefix(part.name, "calibration: "), part.about,
+			result.missRate(ofScenario(scenarioTiny), 0, 0, 0).short(), result.missRate(ofScenario(scenarioTiny), 0, 0, 1).short(), result.missRate(ofScenario(scenarioTiny), 0, 0, 2).short(),
+			ks[0], ks[1], ks[2]))
+	}
+	if 0 < len(calibrationLines) {
+		b.WriteString("**Where the region's misses come from** (tiny country, one run; nominal 5%, 1% and 0.1%, k 2.448, 3.035 and 3.717):\n\n" + strings.Join(calibrationLines, "\n") + "\n\n")
+	}
+	startLines := []string{}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "starts: ") {
+			continue
+		}
+		startLines = append(startLines, fmt.Sprintf("- %s: false rejects %s (tiny) and %s (real countries) at 99%%; VPN pairs rejected %s.",
+			strings.TrimPrefix(part.name, "starts: "),
+			result.rateOf(ofScenario(scenarioTiny), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioRealHonest), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioVpnPairs), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short()))
+	}
+	if 0 < len(startLines) {
+		b.WriteString("**The verdict's starts** (one run): lagdrift's against the lowest χ² of a wider grid of starts:\n\n" + strings.Join(startLines, "\n") + "\n\n")
+	}
 	b.WriteString("**The fit** (the checks table): ")
 	refits, moved, grids, lower := 0, 0, 0, 0
 	for _, part := range parts {

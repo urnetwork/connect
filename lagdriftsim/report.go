@@ -316,6 +316,11 @@ func calibrationTable(result *studyResult, policy int) string {
 		}
 	}
 	t.add(row...)
+	row = []string{"k that would hold it (nominal 2.448, 3.035, 3.717)"}
+	for _, run := range []int{0, 2} {
+		row = append(row, result.empiricalKs(ofScenario(scenarioTiny), policy, run)...)
+	}
+	t.add(row...)
 	return t.String()
 }
 
@@ -811,4 +816,75 @@ func interruptedTable(parts []*studyPart, results map[string]*studyResult) strin
 		}
 	}
 	return t.String()
+}
+
+// lagdrift's starts against wide ones for the server's verdict, one run, 99%
+// and 99.9%: false rejects, the region's misses, and power against a VPN.
+func startsTable(parts []*studyPart, results map[string]*studyResult) string {
+	t := &table{header: []string{"Verdict's starts", "False rejects, 99%: tiny", "real countries", "99.9%: tiny", "real countries", "Region misses, 99%", "99.9%", "VPN pairs", "300 km", "800 km", "1,500 km", "3,000 km", "6,000 km"}}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "starts: ") {
+			continue
+		}
+		row := []string{strings.TrimPrefix(part.name, "starts: ")}
+		for _, c := range []int{1, 2} {
+			for _, sc := range []*scenario{scenarioTiny, scenarioRealHonest} {
+				row = append(row, result.rateOf(ofScenario(sc), 0, 0, verdictIs(c, lagdrift.VerdictDisagree)).short())
+			}
+		}
+		row = append(row, result.missRate(ofScenario(scenarioTiny), 0, 0, 1).short(), result.missRate(ofScenario(scenarioTiny), 0, 0, 2).short())
+		for _, sc := range append([]*scenario{scenarioVpnPairs}, vpnScenarios...) {
+			row = append(row, result.rateOf(ofScenario(sc), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short())
+		}
+		t.add(row...)
+	}
+	return t.String()
+}
+
+// The region's misses per calibration world, one run: per confidence, and
+// the false rejects of the tiny country and the large country's edge.
+func calibrationWorldTable(parts []*studyPart, results map[string]*studyResult) string {
+	t := &table{header: []string{"World", "Region misses: 95%", "99%", "99.9%", "False rejects, 99%: tiny", "large country, 5 km in", "99.9%: tiny", "k that holds 95%", "99%", "99.9%"}}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "calibration: ") {
+			continue
+		}
+		row := []string{strings.TrimPrefix(part.name, "calibration: ") + ": " + part.about}
+		for c := range confidences {
+			row = append(row, result.missRate(ofScenario(scenarioTiny), 0, 0, c).String())
+		}
+		row = append(row, result.rateOf(ofScenario(scenarioTiny), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioLargeEdge), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+			result.rateOf(ofScenario(scenarioTiny), 0, 0, verdictIs(2, lagdrift.VerdictDisagree)).short())
+		for _, k := range result.empiricalKs(ofScenario(scenarioTiny), 0, 0) {
+			row = append(row, k)
+		}
+		t.add(row...)
+	}
+	return t.String()
+}
+
+// The k at each confidence whose region would miss the truth at the nominal
+// rate: the quantile of the truth's Mahalanobis distance from the fit, over
+// fitted verdicts. Nominal: 2.448, 3.035 and 3.717.
+func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int) []string {
+	ms := []float64{}
+	for _, s := range self.summaries {
+		if filter(s) && s.runs[policy][run].fitted {
+			ms = append(ms, s.runs[policy][run].truthM)
+		}
+	}
+	slices.Sort(ms)
+	out := []string{}
+	for _, c := range confidences {
+		if len(ms) == 0 {
+			out = append(out, "–")
+			continue
+		}
+		i := min(len(ms)-1, int(math.Ceil(c*float64(len(ms))))-1)
+		out = append(out, fmt.Sprintf("%.2f", ms[max(0, i)]))
+	}
+	return out
 }

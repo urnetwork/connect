@@ -197,6 +197,8 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	}
 	parts = append(parts, kappa...)
 	parts = append(parts, variants, misplaced, normal)
+	parts = append(parts, calibrationParts(seed, scale)...)
+	parts = append(parts, startsParts(seed, scale)...)
 	parts = append(parts, vpnParts(seed, scale)...)
 	parts = append(parts, interruptedParts(seed, scale)...)
 	return append(parts, oceaniaParts(seed, scale)...)
@@ -226,6 +228,52 @@ func vpnParts(seed uint64, scale float64) []*studyPart {
 			part.config.choiceMode = mode
 			parts = append(parts, part)
 		}
+	}
+	return parts
+}
+
+// Where the region's excess misses come from: honest visitors, one run each,
+// in worlds that each take away a source of error the model's variance
+// doesn't hold, and in the model's own world without all three.
+func calibrationParts(seed uint64, scale float64) []*studyPart {
+	counts := append(counted(scale, 300, scenarioTiny), counted(scale, 100, scenarioLargeEdge)...)
+	part := func(name string, about string, tweak func(*studyConfig)) *studyPart {
+		config := baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+		config.runs = 1
+		tweak(&config)
+		return &studyPart{name: "calibration: " + name, about: about, config: config, counts: counts}
+	}
+	return []*studyPart{
+		part("base", "the study's world", func(c *studyConfig) {}),
+		part("ideal pings", "no queue, jitter, spike or loss", func(c *studyConfig) { c.idealPings = true }),
+		part("no place error", "every extender exactly at its place", func(c *studyConfig) { c.noPlaceError = true }),
+		part("normal stretch", "the route stretch normal and unfloored", func(c *studyConfig) { c.stretchShape = stretchNormal }),
+		part("model's world", "all three: the route stretch normal, no place error, ideal pings", func(c *studyConfig) {
+			c.idealPings = true
+			c.noPlaceError = true
+			c.stretchShape = stretchNormal
+		}),
+	}
+}
+
+// lagdrift's starts against wider ones for the server's verdict: the same
+// visitors, one run each, honest and far from the address's place.
+func startsParts(seed uint64, scale float64) []*studyPart {
+	counts := append(counted(scale, 150, scenarioTiny), counted(scale, 60, scenarioLargeEdge, scenarioRealHonest)...)
+	counts = append(counts, counted(scale, 40, scenarioVpnPairs)...)
+	counts = append(counts, counted(scale, 40, vpnScenarios...)...)
+	parts := []*studyPart{}
+	for _, wide := range []bool{false, true} {
+		name := "starts: lagdrift"
+		about := "the server's verdict from lagdrift's fit, one run"
+		if wide {
+			name = "starts: wide"
+			about = "the server's verdict from the lowest χ² of lagdrift's fit and a grid of starts around it and the address's place, one run"
+		}
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}), counts: counts}
+		part.config.runs = 1
+		part.config.wideStarts = wide
+		parts = append(parts, part)
 	}
 	return parts
 }

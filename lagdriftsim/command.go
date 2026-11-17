@@ -226,6 +226,18 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 		}
 	}
 
+	if worlds := calibrationWorldTable(parts, results); strings.Count(worlds, "\n") > 2 {
+		section("Where the region's misses come from")
+		paragraph("Tiny-country visitors, one run each, in worlds that each take away a source of error the model's variance doesn't hold, and in the model's own world without all three. Nominal misses: 5%%, 1%% and 0.1%%.")
+		b.WriteString(worlds + "\n")
+	}
+
+	if starts := startsTable(parts, results); strings.Count(starts, "\n") > 2 {
+		section("The verdict's starts")
+		paragraph("The same visitors, one run each, with the server's verdict from lagdrift's fit, and from the lowest χ² of that fit and the fixed points a grid of starts settles in (300, 1,000 and 3,000 km in 6 bearings around the fit and around the address's place), when lower by more than 1: what V5's starts miss when the visitor is far from every one of them.")
+		b.WriteString(starts + "\n")
+	}
+
 	if variants := vpnVariantTable(parts, results); strings.Count(variants, "\n") > 2 {
 		section("A visitor far from the address's place (VPN)")
 		paragraph("Visitors whose address claims a country they are not in, as a VPN's virtual location does, with the extenders chosen around the address's place (E2) or by a variant (choice.go): the mid and far bands spread together with the near band (joint spread), an extender at each VPN hub nearest the address's place (VPN hubs), or greedily by the region they are expected to give for the address's place and the VPN hubs (information) or a ring of places 800 and 2,000 km around it (information ring), or E2's near and far bands with the 4 others by the ring (ring mid band). Each on the study's dense fleet and on a sparse one of one extender in each of 35 cities. Power is the share rejected at 99%%, k_early %s.", formatK(lagdrift.EarlyK))

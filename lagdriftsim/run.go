@@ -935,6 +935,9 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 	}
 	c := self.spec.ipCountry
 	fit, err := self.fit(obs, nil, true)
+	if err == nil && self.config.wideStarts {
+		fit = self.widestFit(obs, fit)
+	}
 	if err != nil || !(fit.MajorKm <= lagdrift.DefaultMaxSigmaKm) {
 		for i := range confidences {
 			v.verdicts[i] = lagdrift.VerdictInconclusive
@@ -1223,6 +1226,36 @@ func (self *visitorSim) checkFit(key string, obs []lagdrift.Observation, fit *la
 				self.spec.index, self.spec.region, self.spec.city.name, key, chi2Of(fit), fit.At.Lat, fit.At.Lon, fitTruthKm, chi2Of(bestFit), bestFit.At.Lat, bestFit.At.Lon, lagdrift.DistanceKm(fit.At, bestFit.At), lowerTruthKm))
 		}
 	}
+}
+
+// The fit of the lowest χ² among fit and the fixed points a grid of starts
+// settles in, when lower than fit's by more than 1, V5's margin: starts at 300,
+// 1,000 and 3,000 km in 6 bearings around the fit and around the address's
+// place, each with b at 0.7 times its run's lowest round trip.
+func (self *visitorSim) widestFit(obs []lagdrift.Observation, fit *lagdrift.Fit) *lagdrift.Fit {
+	coldLastMile := map[int]float64{}
+	for _, o := range obs {
+		if b, ok := coldLastMile[o.Run]; !ok || o.RoundTrip.Ms < b {
+			coldLastMile[o.Run] = o.RoundTrip.Ms
+		}
+	}
+	lastMile := []float64{}
+	for _, run := range fit.Runs {
+		lastMile = append(lastMile, 0.7*coldLastMile[run])
+	}
+	best := fit
+	for _, center := range []lagdrift.Point{fit.At, self.spec.ipPlace} {
+		for _, km := range []float64{300, 1000, 3000} {
+			for k := 0; k < 6; k++ {
+				start := destination(center, 60*float64(k)+20, km)
+				found, ok := self.converge(obs, &lagdrift.Fit{At: start, LastMileMs: slices.Clone(lastMile), Runs: fit.Runs})
+				if ok && chi2Of(found) < chi2Of(best)-1 {
+					best = found
+				}
+			}
+		}
+	}
+	return best
 }
 
 // Some run's b is at its bound of 0.
