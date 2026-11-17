@@ -41,10 +41,13 @@
 // # The borders file
 //
 // For verdicts: Natural Earth's Admin 0 at 1:10m (G1), written by
-// cmd/drift-borders as ne-admin0-10m-<release>.bin and read by ReadBorders.
-// The api reads it from its config with
-// server.Config.ResourcePath("lag/ne-admin0-10m-<release>.bin"). Integers are
-// Go's varints (encoding/binary): uvarint, and zigzag varint for signed ones.
+// cmd/drift-borders as ne-admin0-10m.bin and read by ReadBorders. The api
+// reads it from its config with server.Config.ResourcePath("lag/ne-admin0-10m.bin"),
+// resolved like mmdb/: config's all/lag/<version>/ne-admin0-10m.bin, or
+// local/lag/ne-admin0-10m.bin. The name is stable; the Natural Earth release is
+// in the file's version (Borders.Version, e.g. "ne-admin0-10m-v5.1.2"), which a
+// verdict records as geometry_version. Integers are Go's varints
+// (encoding/binary): uvarint, and zigzag varint for signed ones.
 //
 //	magic          16 bytes, "lagdrift-borders"
 //	format         uvarint, 1
