@@ -6147,6 +6147,295 @@ paths:
         "401":
           description: Missing or invalid client bearer token.
 
+  /lag/drift-test:
+    post:
+      tags: [Network]
+      summary: Allocate a drift test
+      description: |
+        Allocate a drift test (lag.dev/DRIFTTEST.md P2): a token for one
+        visitor, whose widget is the frame `embed_url` on your page. The
+        widget measures the visitor's round trips to about 12 URnetwork
+        extenders, and the verdict says whether they place the visitor in the
+        country their IP address says. Read the verdict with
+        `GET /lag/drift-test` when the visitor moves on, for example on
+        submit: retests can change it for 15 minutes after the first run.
+
+        `client_ip` is required: the visitor's address as your server sees
+        it. A run counts only when it starts from that address; the api keeps
+        only a peppered hash of its /29 (IPv6 /56), and deletes it once no run
+        can start. A run from the other address family counts, with
+        `client_ip_matches: null` for you to judge.
+
+        The token is `dt1_` and 43 characters of base64url, 32 random bytes.
+        The api stores only its SHA-256. It is good for 6 runs, one at a
+        time; the first must start before `expires_at` (`ttl_seconds`, 60 to
+        3600, default 300), and retests are allowed for 15 minutes after the
+        first start. `parent_origins` narrows the network's allowed parent
+        origins (`bringyourctl network drift-test`); without either list any
+        `https:` origin is accepted, and so is an unknown one. For
+        development, `http://localhost` and `http://127.0.0.1` on any port
+        count wherever `https:` origins do. `confidence` is 0.95, 0.99 (the
+        default) or 0.999. `reference` is at most 128 characters and is
+        returned as given.
+
+        An Embed API: the network's root JWT or an API key, on a network the
+        URnetwork team has enabled Embed for. Every refusal carries
+        `{"error": {"code", "message"}}` with its status:
+        - `400`, `invalid`: a missing or invalid `client_ip`, or a field out
+          of range;
+        - `403`, `embed`: the network is not Embed-enabled, with the message
+          "Embed isn't enabled for this network.", checked before any other
+          work; `disabled`: the URnetwork team switched the network's drift
+          tests off. A client token is refused by the route itself, as on
+          every network route;
+        - `429`, `limit`: more than 600 allocations a minute for the
+          network, with `retry_after_ms` and a `Retry-After` header in whole
+          seconds;
+        - `503`, `unavailable`: drift tests are switched off for every
+          network.
+      operationId: lagDriftTestAllocate
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LagDriftTestArgs"
+      responses:
+        "200":
+          description: The drift test's token and embed url.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftTestResult"
+        "400":
+          description: |
+            `invalid`: no valid `client_ip`, or a `confidence`, `reference`,
+            `ttl_seconds` or `parent_origins` outside its bounds, including
+            an origin the network's list does not hold.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "429":
+          description: "`limit`: the network's allocations are over 600 a minute."
+          headers:
+            Retry-After:
+              description: When the limit's window ends, in whole seconds, rounded up.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+        "503":
+          description: "`unavailable`: drift tests are switched off for every network."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+    get:
+      tags: [Network]
+      summary: Read a drift test
+      description: |
+        A drift test's state, its runs and its verdict (lag.dev/DRIFTTEST.md
+        P4), for the network that allocated it.
+
+        `state` is `created` before the first run, `active` while a run can
+        start or is being processed, `closed` once neither holds (6 runs, or
+        the retest window over), when the verdict is final, `expired` when no
+        run started in time, and `failed` after an internal error.
+
+        `result` appears once a run has completed, and each completed run
+        replaces it. It is computed by the api from the extenders' signed
+        reports, never from figures the browser supplies, pooling the last 3
+        runs that count: those from `client_ip` (or its other family) whose
+        stop the reports support, with at least 6 extenders of 12 round
+        trips. `pending_run` names a run whose verdict is not in yet, usually
+        for about 2 s after the visitor finished it.
+
+        The visitor is outside the IP country only when the whole uncertainty
+        region at `confidence` lies outside it: then `disagree`, with
+        `margin_km` positive. `drift.country_code` is the country the pings
+        place the visitor in, else the nearest within 300 km, else null. No
+        coordinates are returned. `relay_suspected` is advisory: a last-mile
+        offset far above normal for the visitor's continent and network type,
+        as a relay adds; it does not change the verdict. `calibration` names
+        the model the verdict was judged with, and `geometry_version` the
+        borders, so it can be reproduced.
+
+        An Embed API, refused as `POST /lag/drift-test` is: `403` `embed` for
+        a network that is not Embed-enabled, and a client token by the route
+        itself. A drift test of a network whose drift tests are switched off
+        still reads. An id of another network, or past the 7 days drift tests
+        are kept, is `404` `not_found`.
+      operationId: lagDriftTestGet
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: drift_test_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The drift test.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftTest"
+        "400":
+          description: "`invalid`: no valid `drift_test_id`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: "`not_found`: no drift test of the network has that id."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+
+  /lag/drift-test/start:
+    post:
+      tags: [Other]
+      summary: Start a drift test run
+      description: |
+        Start a drift test's next run (lag.dev/DRIFTTEST.md P5): its tickets
+        to the extenders the api chose around the caller's address (E2), 12
+        and up to 4 spares in positions 12-15, each for pings only. A ticket's
+        load caps are 1 ms, 1 stream and 1 byte each way, which every
+        extender version bounds any load to (E3), so its hello names 250 ms,
+        250 ms and 1 stream; the widget never asks for a load. The lag.dev
+        widget calls this; a customer's server never needs to.
+
+        No credential but the token, in the body so no log line carries it.
+        `parent_origin` is the frame's parent, from its ancestor origins or
+        referrer, empty when unknown. Refused with status 200 and
+        `{"error": {"code", "retry_after_ms"}}`: `expired` for an unknown
+        token as well as one whose first run did not start in time, one
+        revoked, or one whose network lost Embed or had its drift tests
+        switched off, so the api never confirms a token exists; `closed` when
+        it is out of runs or past its retest window; `busy` while another run
+        of it is still measuring; `origin` for a parent origin that is not
+        allowed; `limit` past 120 runs an hour per /24 (IPv6 /48), with
+        `retry_after_ms`; and `unavailable` when too few extenders can be
+        measured, the borders are missing, or drift tests are switched off.
+
+        A run from another address than the token's `client_ip` is still
+        measured, and never enters a verdict.
+
+        The token `demo` runs for anyone, on any `https:` page: tickets as a
+        run's, which the extenders never report, `demo: true` and no
+        `drift_test_id`. It stores nothing but a rate limit of 30 an hour per
+        /24 (IPv6 /48), and no api can read how it went.
+      operationId: lagDriftTestStart
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LagDriftStartArgs"
+      responses:
+        "200":
+          description: The run's tickets, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftStartResult"
+        "400":
+          description: "`invalid`: no token."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+
+  /lag/drift-test/finish:
+    post:
+      tags: [Other]
+      summary: Finish a drift test run
+      description: |
+        The widget closed a run's sessions (lag.dev/DRIFTTEST.md P5), for the
+        reason in `stop`: `converged`, `clear`, `interrupted` or `cap`. The
+        api checks the stop against the extenders' signed reports; a stop
+        they do not support, before the cap, keeps the run out of the
+        verdict. Idempotent: a finished run keeps its first stop. The run
+        completes as soon as its reports are in, or 20 s after its finish.
+
+        No credential but the token. The `demo` token has no runs to finish
+        and is refused with 400.
+      operationId: lagDriftTestFinish
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LagDriftFinishArgs"
+      responses:
+        "200":
+          description: The run's state, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftFinishResult"
+        "400":
+          description: "`invalid`: no token, no such run, a `stop` that is none of the four, or the `demo` token."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+
+  /lag/drift-test/result:
+    post:
+      tags: [Other]
+      summary: What the drift test widget shows
+      description: |
+        Only what the widget shows the visitor (lag.dev/DRIFTTEST.md P5): the
+        state, the newest run and its state, the verdict, the IP country's
+        name, the runs in the verdict, and whether a retest is allowed. Never
+        the country the pings point to, a distance or the fit: the token
+        holder may be the person being checked. Read the verdict with
+        `GET /lag/drift-test` instead; a message from the frame can be forged
+        by any script on the page.
+
+        No credential but the token. The `demo` token's verdict is the
+        frame's own, and it is refused with 400.
+      operationId: lagDriftTestResult
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LagDriftResultArgs"
+      responses:
+        "200":
+          description: What the widget shows, or a refusal in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftWidgetResult"
+        "400":
+          description: "`invalid`: no token, or the `demo` token."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LagDriftErrorResult"
+
   /account/change-name:
     post:
       tags: [Account]
@@ -22589,6 +22878,524 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ExtenderLagReportRejection"
+
+    LagDriftError:
+      description: |
+        A refusal of a drift test call (lag.dev/DRIFTTEST.md P5): with status
+        200 on the widget's routes, and with its status on the network's.
+      type: object
+      required:
+        - code
+        - retry_after_ms
+      properties:
+        code:
+          description: |
+            The network's routes: `invalid` (400), `embed`, `disabled` and
+            `client_token` (403), `not_found` (404), `limit` (429) and
+            `unavailable` (503). The widget's: `expired`, `closed`, `busy`,
+            `origin`, `limit` and `unavailable` (200), and `invalid` (400).
+          type: string
+          enum: [invalid, embed, disabled, client_token, not_found, expired, closed, busy, origin, limit, unavailable]
+        message:
+          type: string
+        retry_after_ms:
+          description: How long to wait before asking again; 0 when there is no wait to name.
+          type: integer
+          format: int64
+
+    LagDriftErrorResult:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/LagDriftError"
+
+    LagDriftTestArgs:
+      type: object
+      required:
+        - client_ip
+      properties:
+        client_ip:
+          description: The visitor's address as your server sees it.
+          type: string
+          example: 203.0.113.7
+        parent_origins:
+          description: |
+            The pages the widget may run on, which narrow the network's list:
+            `https:` origins, or for development `http://localhost` and
+            `http://127.0.0.1` on any port, at most 16.
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            example: https://example.com
+        confidence:
+          description: The verdict's confidence (V6). Default 0.99.
+          type: number
+          enum: [0.95, 0.99, 0.999]
+        reference:
+          description: Your own reference, at most 128 characters, returned as given.
+          type: string
+          maxLength: 128
+        ttl_seconds:
+          description: Until the first run must start, s. Default 300.
+          type: integer
+          minimum: 60
+          maximum: 3600
+
+    LagDriftTestResult:
+      type: object
+      required:
+        - drift_test_id
+        - token
+        - embed_url
+        - expires_at
+      properties:
+        drift_test_id:
+          type: string
+          format: uuid
+        token:
+          description: "`dt1_` and the base64url of 32 random bytes. The api keeps only its SHA-256."
+          type: string
+        embed_url:
+          description: The widget's frame source, `https://lag.dev/?t=<token>`.
+          type: string
+        expires_at:
+          description: "The first run must start before this: RFC 3339, whole seconds, UTC."
+          type: string
+          format: date-time
+
+    LagDriftRun:
+      type: object
+      required:
+        - run
+        - state
+        - started_at
+        - client_ip_matches
+        - extenders
+        - in_verdict
+      properties:
+        run:
+          description: The run's number, from 1.
+          type: integer
+        state:
+          description: "`started` while measuring, `processing` once finished, `complete` once its reports are in."
+          type: string
+          enum: [started, processing, complete]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        measured_ms:
+          description: From its sessions' opening to their close, as the extenders' reports show it.
+          type: integer
+        stop:
+          description: The widget's reason to end the run.
+          type: string
+          enum: [converged, clear, interrupted, cap]
+        client_ip_matches:
+          description: |
+            Whether the run started from `client_ip`; null when it started
+            from the other address family. A run that does not match never
+            enters a verdict.
+          type: [boolean, "null"]
+        extenders:
+          description: The extenders the run was ticketed with, spares apart.
+          type: integer
+        answered:
+          description: The extenders that answered, once the run is complete.
+          type: integer
+        in_verdict:
+          description: Whether the run is in the current verdict.
+          type: boolean
+        outcome:
+          description: |
+            Once complete: `counted`, or why the run stays out of the
+            verdict.
+          type: string
+          enum: [counted, ip_mismatch, ip_family_mismatch, stopped_early, too_few_extenders, reports_missing]
+
+    LagDriftIp:
+      type: object
+      required:
+        - family
+      properties:
+        country_code:
+          description: The IP country, ISO 3166-1 alpha-2, lower case.
+          type: string
+        country_name:
+          type: string
+        family:
+          description: The address family the run started from, 4 or 6.
+          type: integer
+
+    LagDriftEllipse:
+      description: The fit's 1σ ellipse.
+      type: object
+      required:
+        - major
+        - minor
+        - bearing_deg
+      properties:
+        major:
+          description: km
+          type: number
+        minor:
+          description: km
+          type: number
+        bearing_deg:
+          description: The major axis's bearing, degrees clockwise from north.
+          type: number
+
+    LagDriftDrift:
+      description: Where the pings place the visitor, without coordinates.
+      type: object
+      required:
+        - country_code
+        - distance_km
+        - significance_km
+        - margin_km
+        - ellipse_km
+        - last_mile_ms
+        - relay_suspected
+        - fit_chi2_per_dof
+        - extenders
+      properties:
+        country_code:
+          description: |
+            The country containing the fit, else the nearest within 300 km;
+            null at sea.
+          type: [string, "null"]
+        distance_km:
+          description: |
+            From the fit to the IP country, toward its nearest point in the
+            region's own metric; 0 inside. Null when the IP country has no
+            borders.
+          type: [number, "null"]
+        significance_km:
+          description: The region's radius in that direction, at the confidence.
+          type: [number, "null"]
+        margin_km:
+          description: |
+            `distance_km` less `significance_km`: positive only when the
+            whole region is outside the IP country.
+          type: [number, "null"]
+        ellipse_km:
+          $ref: "#/components/schemas/LagDriftEllipse"
+        last_mile_ms:
+          description: The last-mile offset b of each run in the verdict, ms.
+          type: array
+          items:
+            type: number
+        relay_suspected:
+          description: |
+            Advisory: a last-mile offset far above normal, as a relay adds.
+            The verdict is unchanged.
+          type: boolean
+        fit_chi2_per_dof:
+          type: number
+        extenders:
+          description: The distinct extenders in the fit.
+          type: integer
+
+    LagDriftResult:
+      type: object
+      required:
+        - verdict
+        - reason
+        - runs_in_verdict
+        - pending_run
+        - confidence
+        - ip
+      properties:
+        verdict:
+          type: string
+          enum: [agree, disagree, inconclusive]
+        reason:
+          type: string
+          enum:
+            - inside_ip_country
+            - region_overlaps
+            - region_outside
+            - inconsistent
+            - too_few_extenders
+            - low_precision
+            - ip_mismatch
+            - ip_family_mismatch
+            - ip_country_unknown
+            - reports_missing
+            - stopped_early
+        runs_in_verdict:
+          description: The runs pooled for the verdict, at most the last 3 that count.
+          type: array
+          items:
+            type: integer
+        pending_run:
+          description: A run whose verdict is not in yet, else null.
+          type: [integer, "null"]
+        confidence:
+          type: number
+        geometry_version:
+          description: The borders the verdict was judged against.
+          type: string
+          example: ne-admin0-10m-v5.1.2
+        ip:
+          $ref: "#/components/schemas/LagDriftIp"
+        drift:
+          $ref: "#/components/schemas/LagDriftDrift"
+        calibration:
+          $ref: "#/components/schemas/LagDriftCalibration"
+
+    LagDriftCalibration:
+      description: |
+        The model a verdict was judged with (V3, V4): the weekly
+        calibration's id and when it ran, both null for the design's
+        defaults, κ, σ₀, and the relay threshold for the window's newest run.
+      type: object
+      required:
+        - calibration_id
+        - calibrated_at
+        - kappa
+        - sigma0_ms
+        - relay_threshold_ms
+      properties:
+        calibration_id:
+          type: [string, "null"]
+          format: uuid
+        calibrated_at:
+          type: [string, "null"]
+          format: date-time
+        kappa:
+          description: The route error as a share of distance.
+          type: number
+        sigma0_ms:
+          description: The timing floor, ms.
+          type: number
+        relay_threshold_ms:
+          description: The last-mile offset above which a relay is suspected, ms.
+          type: number
+
+    LagDriftTest:
+      type: object
+      required:
+        - drift_test_id
+        - state
+        - confidence
+        - created_at
+        - expires_at
+        - first_started_at
+        - retest_until
+        - updated_at
+        - runs
+        - result
+      properties:
+        drift_test_id:
+          type: string
+          format: uuid
+        reference:
+          type: string
+        state:
+          type: string
+          enum: [created, active, closed, expired, failed]
+        confidence:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        first_started_at:
+          type: [string, "null"]
+          format: date-time
+        retest_until:
+          description: Retests may start until this.
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        runs:
+          type: array
+          items:
+            $ref: "#/components/schemas/LagDriftRun"
+        result:
+          description: The verdict, null until a run has completed.
+          oneOf:
+            - $ref: "#/components/schemas/LagDriftResult"
+            - type: "null"
+
+    LagDriftStartArgs:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          description: The drift test's token, or `demo`.
+          type: string
+        parent_origin:
+          description: |
+            The frame's parent origin, empty when unknown: an `https:` origin,
+            or for development `http://localhost` or `http://127.0.0.1` on any
+            port.
+          type: string
+
+    LagDriftIpPlace:
+      description: The place the caller's address resolves to, which the radar centers on.
+      type: object
+      required: []
+      properties:
+        country_code:
+          type: string
+        country_name:
+          type: string
+        region:
+          type: string
+        city:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+
+    LagDriftTicket:
+      type: object
+      required:
+        - extender_id
+        - host
+        - position
+        - ticket
+        - location
+      properties:
+        extender_id:
+          type: string
+        host:
+          description: The extender's measurement name, which the session connects to.
+          type: string
+        position:
+          description: 0-11 for the run's extenders, 12-15 for the spares, opened only for a session that fails to open.
+          type: integer
+        ticket:
+          description: |
+            The ticket text for the session url: base64url, without padding,
+            of the signed `LagTicket`, for pings only.
+          type: string
+        location:
+          $ref: "#/components/schemas/LagExtenderLocation"
+
+    LagDriftStartResult:
+      type: object
+      required:
+        - runs_left
+      properties:
+        drift_test_id:
+          description: Absent for the `demo` token.
+          type: string
+          format: uuid
+        demo:
+          type: boolean
+        track_id:
+          type: string
+        run:
+          description: The run's number, from 1; absent for the `demo` token.
+          type: integer
+        runs_left:
+          description: The runs the token can start after this one.
+          type: integer
+        measure_ms:
+          description: The run's cap from its sessions' opening, ms.
+          type: integer
+          example: 12000
+        confidence:
+          description: The token's confidence, at which the radar draws the region.
+          type: number
+        ip:
+          $ref: "#/components/schemas/LagDriftIpPlace"
+        tickets:
+          type: array
+          items:
+            $ref: "#/components/schemas/LagDriftTicket"
+        expires_at:
+          description: "Every session must open before this: RFC 3339, whole seconds, UTC."
+          type: string
+          format: date-time
+        error:
+          $ref: "#/components/schemas/LagDriftError"
+
+    LagDriftFinishArgs:
+      type: object
+      required:
+        - token
+        - run
+        - stop
+      properties:
+        token:
+          type: string
+        run:
+          type: integer
+        stop:
+          type: string
+          enum: [converged, clear, interrupted, cap]
+
+    LagDriftFinishResult:
+      type: object
+      required: []
+      properties:
+        run:
+          type: integer
+        run_state:
+          type: string
+          enum: [processing, complete]
+        error:
+          $ref: "#/components/schemas/LagDriftError"
+
+    LagDriftResultArgs:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+
+    LagDriftWidgetResult:
+      description: What the widget shows, and nothing more.
+      type: object
+      required:
+        - run
+        - verdict
+        - runs_in_verdict
+        - retest_allowed
+        - runs_left
+      properties:
+        state:
+          type: string
+          enum: [created, active, closed, expired, failed]
+        run:
+          description: The newest run, 0 before the first.
+          type: integer
+        run_state:
+          type: string
+          enum: [started, processing, complete]
+        verdict:
+          description: Null before a run has completed.
+          type: [string, "null"]
+          enum: [agree, disagree, inconclusive, null]
+        ip_country_name:
+          type: string
+        runs_in_verdict:
+          description: The runs the verdict pools, which the widget keeps on its radar.
+          type: array
+          items:
+            type: integer
+        retest_allowed:
+          type: boolean
+        runs_left:
+          type: integer
+        error:
+          $ref: "#/components/schemas/LagDriftError"
 
     GetNetworkUserResult:
       type: object
