@@ -46,16 +46,17 @@
 // cmd/drift-borders as ne-admin0-10m.bin and read by ReadBorders. The api
 // reads it from its config with server.Config.ResourcePath("lag/ne-admin0-10m.bin"),
 // resolved like mmdb/: config's all/lag/<version>/ne-admin0-10m.bin, or
-// local/lag/ne-admin0-10m.bin. The name is stable; the Natural Earth release is
-// in the file's version (Borders.Version, e.g. "ne-admin0-10m-v5.1.2"), which a
-// verdict records as geometry_version. Integers are Go's varints
+// local/lag/ne-admin0-10m.bin. The name is stable; the Natural Earth release,
+// and the revision of how claims are drawn, are in the file's version
+// (Borders.Version, e.g. "ne-admin0-10m-v5.1.2-claims1"), which a verdict
+// records as geometry_version. Integers are Go's varints
 // (encoding/binary): uvarint, and zigzag varint for signed ones.
 //
 //	magic          16 bytes, "lagdrift-borders"
 //	format         uvarint, 1
 //	version        uvarint length, then that many bytes of UTF-8: the
-//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2", which a
-//	               verdict records as geometry_version (P4)
+//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2-claims1",
+//	               which a verdict records as geometry_version (P4)
 //	countries      uvarint count, then each country, sorted by code:
 //	  code         2 bytes, two lower-case ASCII letters
 //	  box          4 varints: the lowest latitude, lowest longitude, highest
@@ -82,7 +83,7 @@
 // and read by ReadWorld:
 //
 //	{"format": "lagdrift-world/1",
-//	 "version": "ne-admin0-50m-v5.1.2",   the geometry's version
+//	 "version": "ne-admin0-50m-v5.1.2-claims1", the geometry's version
 //	 "simplifyKm": 5,                      the simplification's tolerance, km
 //	 "scale": 1000,                        units per degree
 //	 "countries": [                        sorted by code, one to a line
@@ -95,7 +96,7 @@
 // point, in 1 / scale degree, at least 3 points, closed implicitly. A point's
 // degrees are its integers / scale. A country too small to draw at 1:50m is
 // taken from 1:10m, simplified the same way, so the map has every code the
-// borders file has.
+// borders file has, and it carries the borders file's claims (below).
 //
 // # Codes
 //
@@ -106,9 +107,26 @@
 // territories GeoLite2 codes apart that Natural Earth draws inside another
 // feature (French Guiana, Guadeloupe, Martinique, Réunion and Mayotte from
 // France; Svalbard and Jan Mayen and Bouvet Island from Norway; the
-// Caribbean Netherlands; the Cocos and Christmas Islands; Tokelau). A
-// disputed area may belong to more than one code, so that no claimant's
-// visitors are rejected for standing in it (G3).
+// Caribbean Netherlands; the Cocos and Christmas Islands; Tokelau).
+//
+// # Claims
+//
+// A disputed area belongs to every country that claims it (G3, the user's
+// decision of 2026-11-17), so that no claimant's visitors are rejected for
+// standing in it. Each code's polygons are the union of its polygons in
+// Natural Earth's default layer, which draws de facto lines, in each of its 31
+// points of view at 1:10m, and of the pieces of its disputed-areas layer that
+// any view gives it: Crimea is ru and ua, Kashmir in and pk, Western Sahara ma
+// and eh, the Golan il and sy, Kosovo xk and rs, the Spratlys every claimant,
+// and so on. Taiwan and China are kept apart both ways, since an IP database
+// never labels one side with the other's code: Taiwan and Kinmen are tw alone,
+// and nothing China holds goes to tw, so the Paracels are cn and vn. Every
+// other area a view claims is added, which G3 intends, for example Arunachal
+// Pradesh to cn and the Falklands to ar. Countries therefore overlap, and a
+// country's polygons overlap each other; that changes no region test, since a
+// point inside any polygon is inside, and an edge inside the country is never
+// the nearest to a fit outside it. cmd/drift-borders checks G3's list on every
+// file it writes.
 //
 // # The commands
 //

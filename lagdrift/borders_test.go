@@ -10,7 +10,8 @@ import (
 
 // Belgium, the Netherlands, Germany and Luxembourg, from Natural Earth
 // v5.1.2 by drift-borders -countries be,nl,de,lu: the 1:10m borders file and
-// the 1:50m world map.
+// the 1:50m world map, as drawn with G3's claims, of which these four have
+// none.
 func fixtureBorders(t *testing.T) (*Borders, *Borders) {
 	t.Helper()
 	full, err := os.Open("testdata/benelux-de-10m.bin")
@@ -167,7 +168,7 @@ func TestCountryAt(t *testing.T) {
 // simplified map.
 func TestBordersBeneluxAndGermany(t *testing.T) {
 	borders, world := fixtureBorders(t)
-	if borders.Version() != "ne-admin0-10m-v5.1.2" || world.Version() != "ne-admin0-50m-v5.1.2" {
+	if borders.Version() != "ne-admin0-10m-v5.1.2-claims1" || world.Version() != "ne-admin0-50m-v5.1.2-claims1" {
 		t.Errorf("versions %q and %q", borders.Version(), world.Version())
 	}
 	places := []struct {

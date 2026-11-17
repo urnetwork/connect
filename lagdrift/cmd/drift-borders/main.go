@@ -3,15 +3,19 @@
 // a pinned release of github.com/nvkelso/natural-earth-vector (public domain):
 //
 //   - -borders: the full 1:10m, in lagdrift's borders format, for the api's
-//     verdicts. It goes in the api's config as lag/ne-admin0-10m.bin.
+//     verdicts. It goes in the api's config as lag/ne-admin0-10m.bin. Each
+//     disputed area belongs to every country that claims it, except that
+//     Taiwan and China are kept apart (claims.go, G3).
 //   - -world: the 1:50m simplified by Douglas–Peucker at about 5 km and
 //     quantized, as lagdrift's world map JSON, for the SDK
 //     (js/src/lag/drift/world.generated.json). A country too small to draw at
 //     1:50m is taken from 1:10m, simplified the same way.
 //
 // It downloads the release's GeoJSON, or reads it from -source, a directory
-// holding ne_10m_admin_0_countries.geojson and ne_50m_admin_0_countries.geojson,
-// and checks each file's SHA-256 against the pin either way. -countries limits
+// holding ne_10m_admin_0_countries.geojson, ne_50m_admin_0_countries.geojson,
+// ne_10m_admin_0_disputed_areas.geojson and the 31 points of view,
+// ne_10m_admin_0_countries_<view>.geojson, and checks each file's SHA-256
+// against the pin either way. -countries limits
 // the output to some codes, for test fixtures.
 //
 //	go run ./lagdrift/cmd/drift-borders -borders ne-admin0-10m.bin -world world.generated.json
@@ -51,12 +55,15 @@ const (
 	countries50mSha256 = "3e458fc036ad0a66411f2c1e6cac49c5d7bfb81cb1123bc513b22511a2b7fdeb"
 
 	// the versions the files record (lagdrift Borders.Version)
-	bordersVersion = "ne-admin0-10m-" + release
-	worldVersion   = "ne-admin0-50m-" + release
+	bordersVersion = "ne-admin0-10m-" + release + "-" + claimsRevision
+	worldVersion   = "ne-admin0-50m-" + release + "-" + claimsRevision
 
 	defaultSimplifyKm = 5
 	defaultWorldScale = 1000
-	downloadTimeout   = 5 * time.Minute
+	// a 1:10m polygon this wide, degrees, that its code's 1:50m polygons don't
+	// hold is added to the world map
+	minTransferDeg  = 0.1
+	downloadTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -89,9 +96,20 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 	if err != nil {
 		return err
 	}
-	countries10m, err := convert(data10m, true)
+	base10m, err := convert(data10m, true)
 	if err != nil {
 		return fmt.Errorf("%s: %w", countries10mFile, err)
+	}
+	disputedData, err := readSource(source, disputedFile, disputedSha256)
+	if err != nil {
+		return err
+	}
+	readView := func(view string) ([]byte, error) {
+		return readSource(source, viewFile(view), viewSha256s[view])
+	}
+	countries10m, pieceClaims, err := withClaims(base10m, data10m, readView, disputedData)
+	if err != nil {
+		return err
 	}
 	countries10m = keep(countries10m, only)
 
@@ -100,9 +118,15 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 		if err := lagdrift.WriteBorders(out, bordersVersion, countries10m); err != nil {
 			return err
 		}
-		// what it wrote reads back
-		if _, err := lagdrift.ReadBorders(bytes.NewReader(out.Bytes())); err != nil {
+		// what it wrote reads back, and holds G3's claims
+		borders, err := lagdrift.ReadBorders(bytes.NewReader(out.Bytes()))
+		if err != nil {
 			return fmt.Errorf("the borders file doesn't read back: %w", err)
+		}
+		if len(only) == 0 {
+			if err := checkClaims(borders, disputedData, false, 0); err != nil {
+				return err
+			}
 		}
 		if err := writeFile(bordersPath, out.Bytes()); err != nil {
 			return err
@@ -120,7 +144,7 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 			return fmt.Errorf("%s: %w", countries50mFile, err)
 		}
 		countries50m = keep(countries50m, only)
-		world, filled := worldCountries(countries50m, countries10m, simplifyKm, scale)
+		world, filled := worldCountries(countries50m, base10m, countries10m, pieceClaims, simplifyKm, scale)
 		out := &bytes.Buffer{}
 		if err := lagdrift.WriteWorld(out, worldVersion, simplifyKm, scale, world); err != nil {
 			return err
@@ -129,10 +153,15 @@ func run(bordersPath string, worldPath string, source string, only []string, sim
 		if err != nil {
 			return fmt.Errorf("the world map doesn't read back: %w", err)
 		}
-		// every code of the borders is on the map
+		// every code of the borders is on the map, holding G3's claims
 		for _, country := range countries10m {
 			if borders.Country(country.Code) == nil {
 				return fmt.Errorf("the world map has no %s at scale %d", country.Code, scale)
+			}
+		}
+		if len(only) == 0 {
+			if err := checkClaims(borders, disputedData, true, simplifyKm); err != nil {
+				return fmt.Errorf("the world map: %w", err)
 			}
 		}
 		if err := writeFile(worldPath, out.Bytes()); err != nil {
@@ -196,21 +225,20 @@ type featureCollection struct {
 }
 
 type feature struct {
-	Properties struct {
-		Adm0A3  string `json:"ADM0_A3"`
-		IsoA2Eh string `json:"ISO_A2_EH"`
-		Name    string `json:"NAME"`
-	} `json:"properties"`
-	Geometry struct {
+	Properties map[string]any `json:"properties"`
+	Geometry   struct {
 		Type        string          `json:"type"`
 		Coordinates json.RawMessage `json:"coordinates"`
 	} `json:"geometry"`
 }
 
-// The countries of an Admin 0 feature collection, keyed by GeoLite2's codes
-// (codes.go), sorted by code, each with its polygons in the features' order.
-// strict requires every split to find a polygon, as at 1:10m.
-func convert(data []byte, strict bool) ([]lagdrift.Country, error) {
+// A property as text, "" when it is missing or null.
+func (self feature) text(key string) string {
+	v, _ := self.Properties[key].(string)
+	return v
+}
+
+func parseCollection(data []byte) (*featureCollection, error) {
 	var collection featureCollection
 	if err := json.Unmarshal(data, &collection); err != nil {
 		return nil, err
@@ -218,24 +246,41 @@ func convert(data []byte, strict bool) ([]lagdrift.Country, error) {
 	if collection.Type != "FeatureCollection" || len(collection.Features) == 0 {
 		return nil, errors.New("not a feature collection")
 	}
+	return &collection, nil
+}
+
+// The countries of an Admin 0 feature collection, keyed by GeoLite2's codes
+// (codes.go), sorted by code, each with its polygons in the features' order.
+// strict requires every split to find a polygon, as at 1:10m.
+func convert(data []byte, strict bool) ([]lagdrift.Country, error) {
+	collection, err := parseCollection(data)
+	if err != nil {
+		return nil, err
+	}
 	codePolygons := map[string][][][]lagdrift.Point{}
+	codes := []string{}
 	splitMatches := map[string][]int{}
 	for _, f := range collection.Features {
-		adm0 := f.Properties.Adm0A3
-		codes, err := featureCodes(adm0, f.Properties.IsoA2Eh)
+		adm0 := f.text("ADM0_A3")
+		// a point of view leaves a piece it gives no country without
+		// properties
+		if !strict && adm0 == "" {
+			continue
+		}
+		featureCodes, err := featureCodes(adm0, f.text("ISO_A2_EH"))
 		if err != nil {
-			return nil, fmt.Errorf("%s (%s): %w", f.Properties.Name, adm0, err)
+			return nil, fmt.Errorf("%s (%s): %w", f.text("NAME"), adm0, err)
 		}
 		polygons, err := geometryPolygons(f.Geometry.Type, f.Geometry.Coordinates)
 		if err != nil {
-			return nil, fmt.Errorf("%s (%s): %w", f.Properties.Name, adm0, err)
+			return nil, fmt.Errorf("%s (%s): %w", f.text("NAME"), adm0, err)
 		}
 		featureSplits := splits[adm0]
 		if _, ok := splitMatches[adm0]; !ok && 0 < len(featureSplits) {
 			splitMatches[adm0] = make([]int, len(featureSplits))
 		}
 		for _, polygon := range polygons {
-			polygonCodes := codes
+			polygonCodes := featureCodes
 			minLon, minLat, maxLon, maxLat := outlineBox(polygon)
 			for i, s := range featureSplits {
 				if s.contains(minLon, minLat, maxLon, maxLat) {
@@ -245,6 +290,9 @@ func convert(data []byte, strict bool) ([]lagdrift.Country, error) {
 				}
 			}
 			for _, code := range polygonCodes {
+				if _, ok := codePolygons[code]; !ok {
+					codes = append(codes, code)
+				}
 				codePolygons[code] = append(codePolygons[code], polygon)
 			}
 		}
@@ -262,10 +310,6 @@ func convert(data []byte, strict bool) ([]lagdrift.Country, error) {
 				return nil, fmt.Errorf("no feature %s to split", adm0)
 			}
 		}
-	}
-	codes := []string{}
-	for code := range codePolygons {
-		codes = append(codes, code)
 	}
 	slices.Sort(codes)
 	countries := []lagdrift.Country{}
@@ -349,10 +393,16 @@ func keep(countries []lagdrift.Country, only []string) []lagdrift.Country {
 	return kept
 }
 
-// The world map: each 1:50m country simplified, and each code the 1:10m has and
-// the 1:50m lacks, or loses to quantization, taken from the 1:10m. Returns the
-// codes taken from the 1:10m too.
-func worldCountries(countries50m []lagdrift.Country, countries10m []lagdrift.Country, simplifyKm float64, scale int) ([]lagdrift.Country, []string) {
+// The world map: each 1:50m country simplified, with the disputed pieces the
+// 1:10m union gave it (pieceClaims) that its 1:50m polygons don't already
+// hold, simplified the same way, since Natural Earth has no points of view at
+// 1:50m, and with each of its 1:10m default polygons at least 0.1° across
+// that 1:50m draws inside a neighbor (Bir Tawil for Egypt, inside Sudan at
+// 1:50m, and the UK's bases on Cyprus). A polygon is held, or inside a
+// neighbor, when most of its interior points are. Each code the 1:10m has and the
+// 1:50m lacks, or loses to quantization, is taken from the 1:10m union.
+// Returns the codes taken from the 1:10m too.
+func worldCountries(countries50m []lagdrift.Country, base10m []lagdrift.Country, countries10m []lagdrift.Country, pieceClaims map[string][][][]lagdrift.Point, simplifyKm float64, scale int) ([]lagdrift.Country, []string) {
 	simplify := func(country lagdrift.Country) lagdrift.Country {
 		simplified := lagdrift.Country{Code: country.Code}
 		for _, polygon := range country.Polygons {
@@ -380,8 +430,54 @@ func worldCountries(countries50m []lagdrift.Country, countries10m []lagdrift.Cou
 	}
 	world := []lagdrift.Country{}
 	codes := map[string]bool{}
+	basePolygons10m := map[string][][][]lagdrift.Point{}
+	for _, country := range base10m {
+		basePolygons10m[country.Code] = country.Polygons
+	}
+	borders50m, err := lagdrift.NewBorders("", countries50m)
+	if err != nil {
+		panic(err)
+	}
 	for _, country := range countries50m {
-		simplified := simplify(country)
+		withClaims := lagdrift.Country{
+			Code:     country.Code,
+			Polygons: slices.Clone(country.Polygons),
+		}
+		// a polygon most of whose interior points the 1:50m polygons already
+		// hold adds nothing to the map
+		held := func(polygon [][]lagdrift.Point) bool {
+			points := interiorPoints(polygon)
+			contained := 0
+			for _, p := range points {
+				if country.Contains(p) {
+					contained += 1
+				}
+			}
+			return len(points) <= 2*contained
+		}
+		for _, polygon := range pieceClaims[country.Code] {
+			if !held(polygon) {
+				withClaims.Polygons = append(withClaims.Polygons, polygon)
+			}
+		}
+		// a default polygon most of which 1:50m draws inside a neighbor
+		for _, polygon := range basePolygons10m[country.Code] {
+			minLon, minLat, maxLon, maxLat := outlineBox(polygon)
+			if math.Hypot(maxLon-minLon, maxLat-minLat) < minTransferDeg {
+				continue
+			}
+			points := interiorPoints(polygon)
+			inNeighbor := 0
+			for _, p := range points {
+				if !country.Contains(p) && borders50m.CountryAt(p, 0) != "" {
+					inNeighbor += 1
+				}
+			}
+			if 0 < len(points) && len(points) < 2*inNeighbor {
+				withClaims.Polygons = append(withClaims.Polygons, polygon)
+			}
+		}
+		simplified := simplify(withClaims)
 		if survives(simplified) {
 			world = append(world, simplified)
 			codes[country.Code] = true
