@@ -71,13 +71,17 @@ type choice struct {
 //     places for the visitor: the address's place and the VPN hubs;
 //   - choiceInformationRing: the same, with the plausible places the address's
 //     place and a ring of 12 places at each of 800 and 2,000 km around it, so
-//     the region shrinks wherever near the address the visitor may be.
+//     the region shrinks wherever near the address the visitor may be;
+//   - choiceRingMid: E2's near and far bands, and the 4 others by
+//     choiceInformationRing's score: the ring's gain near the address
+//     without giving up E2's far band.
 const (
 	choiceE2              = "E2"
 	choiceJoint           = "joint spread"
 	choiceHubs            = "VPN hubs"
 	choiceInformation     = "information"
 	choiceInformationRing = "information ring"
+	choiceRingMid         = "ring mid band"
 )
 
 // How to choose.
@@ -163,7 +167,14 @@ func chooseExtendersBy(candidates []choiceCandidate, options choiceOptions, r *r
 		}
 		rest := runExtenders - len(primaries)
 		bands((rest+1)/2, rest/2)
-	case choiceInformation, choiceInformationRing:
+	case choiceInformation, choiceInformationRing, choiceRingMid:
+		if options.mode == choiceRingMid {
+			// E2's far band first, spread by bearing
+			for _, c := range pickSpread(inBand(midMaxKm, farMaxKm), bandCount) {
+				take(c)
+				chosen = append(chosen, c)
+			}
+		}
 		for _, unusedOnly := range []bool{true, false} {
 			for len(primaries) < runExtenders {
 				best := -1

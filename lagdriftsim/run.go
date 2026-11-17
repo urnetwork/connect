@@ -319,7 +319,7 @@ func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOption
 		}
 	case choiceInformation:
 		options.score = self.informationScore()
-	case choiceInformationRing:
+	case choiceInformationRing, choiceRingMid:
 		options.score = self.informationRingScore()
 	}
 	return options

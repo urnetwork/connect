@@ -215,7 +215,7 @@ func vpnParts(seed uint64, scale float64) []*studyPart {
 		name  string
 		sites []extenderSite
 	}{{name: "dense", sites: nil}, {name: "sparse", sites: sparseSites}} {
-		for _, mode := range []string{choiceE2, choiceJoint, choiceHubs, choiceInformation, choiceInformationRing} {
+		for _, mode := range []string{choiceE2, choiceJoint, choiceHubs, choiceInformation, choiceInformationRing, choiceRingMid} {
 			part := &studyPart{
 				name:   "VPN " + pool.name + ": " + mode,
 				about:  "the " + pool.name + " fleet, extenders chosen by " + mode + "; 3 runs",
