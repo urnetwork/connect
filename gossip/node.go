@@ -32,6 +32,15 @@
 // protocol within `NegotiationTimeout` is reset (partner security report,
 // 2026-11-16).
 //
+// A node whose owner supplies a dialer (`DialContext`) makes every connection
+// through it: the operator link's tcp, tls and websocket upgrade
+// (transport_websocket.go), and the extender carrier's dials. The operator's
+// name goes to the dialer unresolved, so the node makes no dial and no lookup
+// from this host. A miner proxy slot supplies its proxy's dialer, so its mesh
+// traffic leaves through that proxy like the rest of the slot's traffic
+// (connect#227). A node with no dialer is unchanged: libp2p's websocket
+// transport dials the operator from this host.
+//
 // The node is safe for concurrent use.
 
 package gossip
@@ -40,6 +49,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"fmt"
 	mathrand "math/rand/v2"
 	"net/netip"
@@ -153,8 +163,22 @@ type NodeSettings struct {
 	// Its own advertised addresses are added to ListenAddrs.
 	ExtenderListener *InProcessListener
 
-	// Dial configuration of the extender carrier.
+	// Dial configuration of the extender carrier. Its TlsConfig also gives the
+	// roots a `DialContext` node verifies the operator against.
 	ConnectSettings *connect.ConnectSettings
+	// When set, every connection of this node goes through this dialer: the
+	// operator link's tcp, tls and websocket upgrade, and every extender
+	// carrier dial, which then ignores ConnectSettings' own proxy and dialer.
+	// The operator's name is handed to it unresolved, for a socks proxy to
+	// resolve on its own side. A miner proxy slot passes its proxy's dialer
+	// (connect#227). Nil, the default, is the node as it always was: libp2p's
+	// websocket transport resolves the operator's name and dials it from this
+	// host, and the carrier dials through ConnectSettings.
+	DialContext connect.DialContextFunction
+	// The session cache of the operator link's tls when `DialContext` is set.
+	// Nil takes the process's shared cache, which hands out each session once
+	// (tls_session_cache.go). Unused without `DialContext`.
+	TlsSessionCache tls.ClientSessionCache
 
 	// The peering round period (D3).
 	PeerTimeout time.Duration
@@ -419,6 +443,9 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		resourceLimits := *copied.ResourceLimits
 		copied.ResourceLimits = &resourceLimits
 	}
+	if copied.DialContext != nil && copied.TlsSessionCache == nil {
+		copied.TlsSessionCache = processTlsSessionCache()
+	}
 	settings = &copied
 
 	identityKeySeed := settings.IdentityKeySeed
@@ -516,12 +543,14 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 }
 
 // The libp2p host of D1: the extender transport in place of tcp, the websocket
-// transport for the operator, noise, yamux under this node's stream bounds,
-// the node's resource manager, a connection manager, and no discovery, relay,
-// nat service or metrics of any kind. The resource manager is the swarm's and
-// the upgrader's both: the upgrader opens the scope of every inbound
-// connection, so without it inbound connections would go uncounted and their
-// yamux window growth unbounded. Closing the host closes the resource manager.
+// transport for the operator (with a `DialContext`, transport_websocket.go
+// dials and libp2p's only listens), noise, yamux under this node's stream
+// bounds, the node's resource manager, a connection manager, and no
+// discovery, relay, nat service or metrics of any kind. The resource manager
+// is the swarm's and the upgrader's both: the upgrader opens the scope of
+// every inbound connection, so without it inbound connections would go
+// uncounted and their yamux window growth unbounded. Closing the host closes
+// the resource manager.
 //
 // The host is assembled from the swarm and the basic host rather than through
 // the `libp2p` root package, which is a deliberate deviation: that package's
@@ -590,10 +619,21 @@ func (self *Node) newHost(
 		return nil, err
 	}
 
+	extenderConnectSettings := self.settings.ConnectSettings
+	if self.settings.DialContext != nil {
+		// ConnectSettings.DialContext takes a DialContextSettings dial ahead of
+		// its proxy and its own dialer, so every carrier dial goes through the
+		// node's dialer
+		copied := *self.settings.ConnectSettings
+		copied.DialContextSettings = &connect.DialContextSettings{
+			DialContext: self.settings.DialContext,
+		}
+		extenderConnectSettings = &copied
+	}
 	extenderTransport, err := newExtenderTransport(&extenderTransportSettings{
 		Log:             self.settings.Log,
 		Directory:       self.settings.Directory,
-		ConnectSettings: self.settings.ConnectSettings,
+		ConnectSettings: extenderConnectSettings,
 		Listener:        self.settings.ExtenderListener,
 		Upgrader:        connUpgrader,
 		ResourceManager: swarmNetwork.ResourceManager(),
@@ -608,8 +648,26 @@ func (self *Node) newHost(
 	if err != nil {
 		return nil, err
 	}
-	if err := swarmNetwork.AddTransport(websocketTransport); err != nil {
-		return nil, err
+	if self.settings.DialContext == nil {
+		if err := swarmNetwork.AddTransport(websocketTransport); err != nil {
+			return nil, err
+		}
+	} else {
+		// libp2p's transport still listens; the dials go through the dialer
+		dialTransport, err := newWebsocketDialTransport(&websocketDialTransportSettings{
+			DialContext:     self.settings.DialContext,
+			TlsConfig:       self.settings.ConnectSettings.TlsConfig,
+			TlsSessionCache: self.settings.TlsSessionCache,
+			Upgrader:        connUpgrader,
+			ResourceManager: swarmNetwork.ResourceManager(),
+			ListenTransport: websocketTransport,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := swarmNetwork.AddTransport(dialTransport); err != nil {
+			return nil, err
+		}
 	}
 
 	listenAddrs := slices.Clone(self.settings.ListenAddrs)
