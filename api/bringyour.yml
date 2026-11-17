@@ -15670,9 +15670,14 @@ paths:
         hint to the network's sidecars. A key the attestation does not cover, or
         a caller that is no active sidecar of the network, is refused with
         nothing written. Posting a published key again changes nothing, as a
-        restore's re-registration does. A scope's `mx.<scope>` answers 503 until
-        the gate can name the scope's member. A receiver's removal deletes its
-        TLSA in the removal's own transaction.
+        restore's re-registration does. Once a rotation's new key serves, the
+        receiver posts it again with the rotated-out key's SPKI SHA-256 in
+        `retire_spki_sha256`: the same write retires the caller's own published
+        keys of the host the list names and rebuilds the host's TLSA, a hash
+        naming another receiver's key, or no key, retiring nothing (owner
+        decision 443). A scope's `mx.<scope>` answers 503 until the gate can
+        name the scope's member. A receiver's removal deletes its TLSA in the
+        removal's own transaction.
       operationId: dnsKeyRecord
       security:
         - ServiceTokenAuth: []
@@ -15690,7 +15695,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/DnsKeyRecordAnswer"
         "400":
-          description: A host other than mx or mx.<scope>, or a key that is not P-256.
+          description: A host other than mx or mx.<scope>, a key that is not P-256, or a retire_spki_sha256 entry that is not 32 bytes or names the posted key.
           content:
             application/json:
               schema:
@@ -31215,6 +31220,12 @@ components:
           description: The encoded Signed TlsKeyAttestation by the caller's identity key, base64.
           type: string
           format: byte
+        retire_spki_sha256:
+          description: The SHA-256 of each DER SubjectPublicKeyInfo, base64, of the caller's own published keys of the host to retire in the same write; one naming no published key of the caller's at the host is ignored. Absent retires nothing.
+          type: array
+          items:
+            type: string
+            format: byte
     DnsKeyRecordAnswer:
       type: object
       required: [version]
