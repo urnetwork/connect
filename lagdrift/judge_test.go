@@ -94,7 +94,9 @@ func TestKForConfidence(t *testing.T) {
 	}
 }
 
-// V11's defaults, by confidence and continent, never below textbook.
+// V11's fixed table, by confidence and continent, never below textbook: at
+// 99% NA 3.25, SA 3.50, AF 3.95, OC 7.88, AS 3.35, EU textbook, AN and
+// unknown 3.49.
 func TestDefaultK(t *testing.T) {
 	k95 := KForConfidence(0.95)
 	cases := []struct {
@@ -107,12 +109,13 @@ func TestDefaultK(t *testing.T) {
 		{confidence: 0.95, continent: "EU", k: k95},
 		{confidence: 0.95, continent: "na", k: k95},
 		{confidence: 0.95, continent: "", k: k95},
-		{confidence: 0.99, continent: "NA", k: 3.13},
+		{confidence: 0.99, continent: "NA", k: 3.25},
 		{confidence: 0.99, continent: "sa", k: 3.50},
-		{confidence: 0.99, continent: "Af", k: 3.71},
+		{confidence: 0.99, continent: "Af", k: 3.95},
 		{confidence: 0.99, continent: "OC", k: 7.88},
 		{confidence: 0.99, continent: "eu", k: k99},
-		{confidence: 0.99, continent: "AS", k: k99},
+		{confidence: 0.99, continent: "AS", k: 3.35},
+		{confidence: 0.99, continent: "as", k: 3.35},
 		{confidence: 0.99, continent: "AN", k: 3.49},
 		// unknown: none, not a continent, or not GeoLite2's code
 		{confidence: 0.99, continent: "", k: 3.49},
@@ -137,7 +140,7 @@ func TestKEarly(t *testing.T) {
 	if KEarly(k99) != EarlyK || KEarly(3.035) != EarlyK || KEarly(KForConfidence(0.95)) != EarlyK {
 		t.Errorf("k_early at the textbook k: %.6f, %.6f, %.6f", KEarly(k99), KEarly(3.035), KEarly(KForConfidence(0.95)))
 	}
-	for _, k := range []float64{3.13, 3.49, 3.71, 7.88} {
+	for _, k := range []float64{3.25, 3.35, 3.49, 3.5, 3.95, 7.88} {
 		if want := 4.0 / 3.035 * k; math.Abs(KEarly(k)-want) > 1e-12 || !(EarlyK < KEarly(k)) {
 			t.Errorf("k %.2f: k_early %.6f, not %.6f", k, KEarly(k), want)
 		}

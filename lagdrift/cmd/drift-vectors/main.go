@@ -230,6 +230,11 @@ var (
 	textbookK99 = r6(lagdrift.KForConfidence(0.99))
 )
 
+// A continent's 99% k from V11's table, as an input.
+func tableK99(continent string) float64 {
+	return r6(lagdrift.DefaultK(0.99, continent))
+}
+
 // An output rounded to 12 significant digits.
 func r12(x float64) float64 {
 	if x == 0 || math.IsNaN(x) || math.IsInf(x, 0) {
@@ -520,7 +525,7 @@ func buildGeometry(v *vectorsFile) {
 			v.DefaultK = append(v.DefaultK, defaultKVector{Confidence: c, Continent: continent, K: r12(lagdrift.DefaultK(c, continent))})
 		}
 	}
-	for _, k := range []float64{0, 2.447747, 3.034854, 3.035, 3.13, 3.49, 3.5, 3.71, 7.88, 12} {
+	for _, k := range []float64{0, 2.447747, 3.034854, 3.035, 3.25, 3.35, 3.49, 3.5, 3.95, 7.88, 12} {
 		v.KEarly = append(v.KEarly, kEarlyVector{K: k, KEarly: r12(lagdrift.KEarly(k))})
 	}
 	covs := [][2][2]float64{
@@ -705,9 +710,9 @@ func buildJudge(v *vectorsFile) {
 	add("outside at 95%", covFit(p6(1, -0.9), circle(30), 0, 0), square, textbookK95)
 	// V11's calibrated k: D ≈ 3.34 is outside at the textbook 99% k but not at
 	// Africa's, and D ≈ 5.56 is outside at North America's but not Oceania's
-	add("overlapping at Africa's 99% k", covFit(p6(1, -0.9), circle(30), 0, 0), square, 3.71)
-	add("outside at North America's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, 3.13)
-	add("overlapping at Oceania's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, 7.88)
+	add("overlapping at Africa's 99% k", covFit(p6(1, -0.9), circle(30), 0, 0), square, tableK99("AF"))
+	add("outside at North America's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, tableK99("NA"))
+	add("overlapping at Oceania's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, tableK99("OC"))
 	add("a long ellipse along the border", covFit(p6(1, -1.5), tilted(300, 20, 0), 0, 0), square, textbookK99)
 	add("a long ellipse at the border", covFit(p6(1, -1.5), tilted(300, 20, 90), 0, 0), square, textbookK99)
 	for i := 0; i < 6; i++ {
@@ -880,9 +885,9 @@ func buildStops(v *vectorsFile) {
 	}
 	between := one(covFit(p6(1, -1.5), circle(25), 0, 0), 8)
 	add("clear at the textbook k_early", between, clearAt, clearAt, square, browser)
-	add("clear at Antarctica's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(3.49))))
-	add("not clear at Oceania's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(7.88))))
-	add("not clear at Oceania's k_early, the server", between, clearAt, clearAt, square, kEarly(server, r6(lagdrift.KEarly(7.88))))
+	add("clear at Antarctica's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(tableK99("AN")))))
+	add("not clear at Oceania's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(tableK99("OC")))))
+	add("not clear at Oceania's k_early, the server", between, clearAt, clearAt, square, kEarly(server, r6(lagdrift.KEarly(tableK99("OC")))))
 	add("not clear without a k_early", between, clearAt, clearAt, square, kEarly(browser, 0))
 	add("not clear far outside without a k_early, the server", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, square, kEarly(server, 0))
 	add("not clear with a k_early below 0", between, clearAt, clearAt, square, kEarly(browser, -1))
@@ -972,8 +977,8 @@ func buildDecide(v *vectorsFile) {
 		{name: "inconsistent", fit: covFit(p6(1, 1), circle(30), 0, 0), c: square, obs: impossible},
 		{name: "outside and impossible", fit: covFit(p6(1, -3), circle(30), 0, 0), c: square, obs: impossible},
 		// V11's calibrated k
-		{name: "outside at North America's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: 3.13},
-		{name: "overlapping at Oceania's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: 7.88},
+		{name: "outside at North America's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: tableK99("NA")},
+		{name: "overlapping at Oceania's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: tableK99("OC")},
 	}
 	for _, c := range cases {
 		k := c.k
