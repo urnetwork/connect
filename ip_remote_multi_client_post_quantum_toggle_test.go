@@ -262,6 +262,28 @@ func newPostQuantumToggleTestMultiClient(
 	return multi
 }
 
+// Waits until the window's expansion pass is acquiring candidates
+// (beginDiscoveryAcquisition), subscribed in the same section as the read.
+func waitPostQuantumToggleTestAcquiring(t *testing.T, ctx context.Context, window *multiClientWindow) {
+	t.Helper()
+	for {
+		acquiring, changed := func() (bool, <-chan struct{}) {
+			window.stateLock.Lock()
+			defer window.stateLock.Unlock()
+			changed := window.discoveryDemandChangedWithLock()
+			return window.discoveryDemand.owner != nil, changed
+		}()
+		if acquiring {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("the %s window's pass is not acquiring", windowStatsWindowOf(window.windowType))
+		}
+	}
+}
+
 // The two post-quantum toggles: from the first profile to the second.
 type postQuantumToggleTestCase struct {
 	name string
@@ -311,7 +333,9 @@ func assertPostQuantumToggleBuilds(t *testing.T, toggle postQuantumToggleTestCas
 // The pass each window was running when the profile changed ends with the
 // change. It admitted nothing, and that is no evidence about the providers,
 // so it does not defer the window's next expansion: the first candidate of
-// the new listing is built with no expansion backoff in any window.
+// the new listing is built with no expansion backoff in any window. Every
+// window's pass is acquiring when the profile changes, so the window that
+// builds first had its pass ended by the change.
 func TestPostQuantumToggleNeverBuildsAListingMadeBeforeIt(t *testing.T) {
 	for _, toggle := range postQuantumToggleTestCases() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -320,7 +344,10 @@ func TestPostQuantumToggleNeverBuildsAListingMadeBeforeIt(t *testing.T) {
 		generator := newPostQuantumToggleTestGenerator()
 		generator.holdListing = true
 		generator.holdPostQuantum = toggle.from != nil && toggle.from.PostQuantumEncryption
-		multi := newPostQuantumToggleTestMultiClient(t, ctx, generator, toggle.from, nil)
+		multi := newPostQuantumToggleTestMultiClient(t, ctx, generator, toggle.from, func(settings *MultiClientSettings) {
+			// a pass waits out the test's barriers in its acquisition
+			settings.WindowExpandTimeout = time.Minute
+		})
 		t.Cleanup(generator.releaseHeld)
 
 		// each discovery window's expansion backoff, read as the first
@@ -346,8 +373,12 @@ func TestPostQuantumToggleNeverBuildsAListingMadeBeforeIt(t *testing.T) {
 		})
 
 		// every window's listing is out, asked for under the previous
-		// requirement, so whichever window builds first builds after it
+		// requirement, so whichever window builds first builds after it, and
+		// every window's pass is acquiring the candidates the listing holds
 		generator.waitHeld(t, ctx, multi)
+		for _, windowType := range []WindowType{WindowTypeQuality, WindowTypeSpeed} {
+			waitPostQuantumToggleTestAcquiring(t, ctx, multi.windows[windowType])
+		}
 		AssertEqual(t, multi.SetPerformanceProfile(toggle.to), nil)
 		generator.releaseHeld()
 
@@ -405,6 +436,9 @@ type postQuantumToggleFixedTestGenerator struct {
 
 	stateLock sync.Mutex
 	builds    []postQuantumToggleTestBuild
+	// called on the building pass's goroutine, with no lock held, with the
+	// count of builds so far, this one included
+	onBuild func(buildCount int)
 }
 
 func newPostQuantumToggleFixedTestGenerator() *postQuantumToggleFixedTestGenerator {
@@ -429,7 +463,7 @@ func (self *postQuantumToggleFixedTestGenerator) NewClientArgsForDestination(des
 }
 
 func (self *postQuantumToggleFixedTestGenerator) NewClient(ctx context.Context, args *MultiClientGeneratorClientArgs, clientSettings *ClientSettings) (*Client, error) {
-	first := func() bool {
+	buildCount, onBuild := func() (int, func(int)) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.builds = append(self.builds, postQuantumToggleTestBuild{
@@ -437,13 +471,23 @@ func (self *postQuantumToggleFixedTestGenerator) NewClient(ctx context.Context, 
 			destination: self.destination,
 			mode:        postQuantumToggleTestMode(clientSettings),
 		})
-		return len(self.builds) == 1
+		return len(self.builds), self.onBuild
 	}()
-	if first {
+	if onBuild != nil {
+		onBuild(buildCount)
+	}
+	if buildCount == 1 {
 		self.held <- args.ClientId
 		<-self.release
 	}
 	return NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings), nil
+}
+
+// Sets the build observer before the builds it observes.
+func (self *postQuantumToggleFixedTestGenerator) setOnBuild(onBuild func(buildCount int)) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.onBuild = onBuild
 }
 
 // Releases every hold, now and later. Safe to call more than once.
@@ -479,6 +523,26 @@ func TestRetiringProfileChangeNeverAdmitsACandidateBuiltBeforeIt(t *testing.T) {
 			settings.DataOnlyProviderProbe = true
 		})
 		t.Cleanup(generator.releaseHeld)
+
+		// the provider's re-dial failures as the window builds it again after
+		// the change, before an admission clears them
+		var retryLock sync.Mutex
+		retryFailureCount := -1
+		generator.setOnBuild(func(buildCount int) {
+			if buildCount != 2 {
+				return
+			}
+			window := multi.windows[WindowTypeQuality]
+			window.stateLock.Lock()
+			failureCount := 0
+			if retry := window.fixedRetries[generator.destination]; retry != nil {
+				failureCount = retry.failureCount
+			}
+			window.stateLock.Unlock()
+			retryLock.Lock()
+			defer retryLock.Unlock()
+			retryFailureCount = failureCount
+		})
 
 		// every client the window admits, as the user's provider list shows it
 		added := make(chan Id, 16)
@@ -518,15 +582,17 @@ func TestRetiringProfileChangeNeverAdmitsACandidateBuiltBeforeIt(t *testing.T) {
 		window := multi.windows[WindowTypeQuality]
 		window.stateLock.Lock()
 		client := window.clients[addedClientId]
-		retry := window.fixedRetries[generator.destination]
 		window.stateLock.Unlock()
 		if client == nil || !performanceProfilesEqual(client.performanceProfile, toggle.to) {
 			t.Errorf("%s: the window admitted %s, not a candidate built under the new profile", toggle.name, addedClientId)
 			continue
 		}
-		// the change cut the attempt; the provider is not deferred for it
-		if retry != nil && 0 < retry.failureCount {
-			t.Errorf("%s: the provider's re-dial was deferred by %d failures the change caused", toggle.name, retry.failureCount)
+		// the change cut the attempt; the provider was not deferred for it
+		retryLock.Lock()
+		failureCount := retryFailureCount
+		retryLock.Unlock()
+		if failureCount != 0 {
+			t.Errorf("%s: the provider was built again with %d re-dial failures the change caused", toggle.name, failureCount)
 		}
 	}
 }
