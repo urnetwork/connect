@@ -1,0 +1,226 @@
+package lagdriftsim
+
+// A study: visitors of several scenarios, each simulated under every stop
+// policy, summarized for the report's tables. Visitors run on parallel
+// workers, but every draw is keyed (seed.go), so the summaries are the same in
+// any order, and they are kept in the visitors' order.
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+
+	"github.com/urnetwork/connect/lagdrift"
+)
+
+// How a study's world is drawn and what it varies.
+type studyConfig struct {
+	seed uint64
+	// the route stretch's standard deviation in the simulated world, and its
+	// shape (network.go)
+	truthKappa   float64
+	stretchShape string
+	// κ as the model assumes it (V3)
+	modelKappa float64
+	// extenders somewhere else entirely, a share of the fleet (world.go)
+	misplacedShare float64
+	// emulates a change to V5: at a b of 0, the position's covariance with b
+	// left free rather than held fixed (run.go, fit)
+	freeLastMile bool
+	policies     []stopPolicy
+	// every this many visitors, the study checks its stops and verdicts
+	// against lagdrift.EvaluateStop and lagdrift.Decide
+	checkEvery int
+	workers    int
+}
+
+// How many visitors a scenario has, per region.
+type scenarioCount struct {
+	scenario  *scenario
+	perRegion int
+}
+
+// The parts of a visitor's outcome the tables use.
+type visitorSummary struct {
+	index     int
+	scenario  *scenario
+	region    string
+	cityName  string
+	access    string
+	borderKm  float64
+	claimName string
+	// per policy, per run
+	runs [][visitorRuns]runSummary
+}
+
+type runSummary struct {
+	stopMs  int64
+	reason  lagdrift.StopReason
+	usable  int
+	counted bool
+	// the verdict after the run: the counting runs it pools, and per
+	// confidence
+	counting int
+	verdicts [3]lagdrift.Verdict
+	reasons  [3]lagdrift.Reason
+	fitted   bool
+	d        float64
+	majorKm  float64
+	minorKm  float64
+	chi2     float64
+	bAtZero  bool
+	truthM   float64
+	errorKm  float64
+}
+
+// The study's result: its summaries and its checks against lagdrift.
+type studyResult struct {
+	config           *studyConfig
+	summaries        []*visitorSummary
+	stopChecks       int
+	stopMismatches   []string
+	decideChecks     int
+	decideMismatches []string
+	// visitors a scenario couldn't place (no claim at its distance, a city
+	// outside its country's borders)
+	skipped map[string]int
+}
+
+// The visitors of the scenarios, in order: for each scenario, perRegion per
+// region, cycling through the region's cities. Real scenarios need borders;
+// without them they are skipped.
+func buildVisitors(w *world, seed uint64, counts []scenarioCount, firstIndex int) ([]*visitorSpec, map[string]int) {
+	regionCities := citiesByRegion()
+	candidates := claimCandidates()
+	var options map[string][]claimOption
+	if w.borders != nil {
+		options = realClaimOptions(w.borders)
+	}
+	specs := []*visitorSpec{}
+	skipped := map[string]int{}
+	index := firstIndex
+	for _, count := range counts {
+		sc := count.scenario
+		for _, region := range regions {
+			cities := regionCities[region]
+			for k := 0; k < count.perRegion; k++ {
+				c := cities[k%len(cities)]
+				var spec *visitorSpec
+				switch {
+				case sc.geometry == geometryReal && w.borders == nil:
+				case sc.kind == kindHonest && sc.geometry == geometrySynthetic:
+					spec = syntheticHonest(index, sc, c, seed)
+				case sc.kind == kindClaim && sc.geometry == geometrySynthetic:
+					spec = syntheticClaim(index, sc, c, candidates, seed)
+				case sc.kind == kindHonest:
+					spec = realHonest(index, sc, c, w.borders, seed)
+				default:
+					spec = realClaim(index, sc, c, options[c.name+"/"+c.code], w.borders, seed)
+				}
+				if spec == nil {
+					skipped[sc.name+", "+region] += 1
+				} else {
+					specs = append(specs, spec)
+				}
+				index += 1
+			}
+		}
+	}
+	return specs, skipped
+}
+
+// Simulates every visitor under every policy.
+func runStudy(w *world, config *studyConfig, specs []*visitorSpec) *studyResult {
+	workers := config.workers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	summaries := make([]*visitorSummary, len(specs))
+	outcomes := make([]*visitorOutcome, len(specs))
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for k := 0; k < workers; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				outcome := simulateVisitor(w, config, specs[i])
+				summaries[i] = summarize(outcome)
+				outcome.outcomes = nil
+				outcomes[i] = outcome
+			}
+		}()
+	}
+	for i := range specs {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+
+	result := &studyResult{config: config, summaries: summaries}
+	for _, outcome := range outcomes {
+		result.stopChecks += outcome.stopChecks
+		result.stopMismatches = append(result.stopMismatches, outcome.stopMismatches...)
+		result.decideChecks += outcome.decideChecks
+		result.decideMismatches = append(result.decideMismatches, outcome.decideMismatches...)
+	}
+	return result
+}
+
+func summarize(outcome *visitorOutcome) *visitorSummary {
+	spec := outcome.spec
+	s := &visitorSummary{
+		index:     spec.index,
+		scenario:  spec.scenario,
+		region:    spec.region,
+		cityName:  spec.city.name,
+		borderKm:  spec.borderKm,
+		claimName: spec.claimName,
+	}
+	for _, runs := range outcome.outcomes {
+		var row [visitorRuns]runSummary
+		for i, o := range runs {
+			v := o.verdict
+			row[i] = runSummary{
+				stopMs:   o.stopMs,
+				reason:   o.reason,
+				usable:   o.usable,
+				counted:  o.counted,
+				counting: v.counting,
+				verdicts: v.verdicts,
+				reasons:  v.reasons,
+				fitted:   v.fitted,
+				d:        v.d,
+				majorKm:  v.majorKm,
+				minorKm:  v.minorKm,
+				chi2:     v.chi2,
+				bAtZero:  v.bAtZero,
+				truthM:   v.truthM,
+				errorKm:  v.errorKm,
+			}
+		}
+		s.runs = append(s.runs, row)
+	}
+	return s
+}
+
+// The policy's index in the study's config, or −1.
+func (self *studyResult) policyIndex(name string) int {
+	for i, p := range self.config.policies {
+		if p.name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func (self *studyResult) String() string {
+	return fmt.Sprintf("%d visitors, %d stop checks (%d mismatches), %d verdict checks (%d mismatches)",
+		len(self.summaries), self.stopChecks, len(self.stopMismatches), self.decideChecks, len(self.decideMismatches))
+}
+
+// The study's k for a confidence index.
+func kAt(i int) float64 {
+	return lagdrift.KForConfidence(confidences[i])
+}
+
