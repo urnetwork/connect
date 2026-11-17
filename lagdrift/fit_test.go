@@ -342,3 +342,30 @@ func TestCovEllipse(t *testing.T) {
 		}
 	}
 }
+
+// Within 10 km of an extender the smoothed distance curves as I / 10 km, and
+// beyond as (I − u uᵀ) / d. smoothingKm is an untyped integer constant, so
+// 1 / smoothingKm would be integer division, 0, and lose the curvature there.
+func TestDistanceCurvatureNearAnExtender(t *testing.T) {
+	for _, d := range []float64{0, 3.5, 9.99} {
+		if c := distanceCurvature(d, 0.6, 0.8); c != [2][2]float64{{0.1, 0}, {0, 0.1}} {
+			t.Errorf("at %.2f km: %v, not I / 10 km", d, c)
+		}
+	}
+	want := [2][2]float64{{0.032, -0.024}, {-0.024, 0.018}}
+	c := distanceCurvature(20, 0.6, 0.8)
+	for i := range c {
+		for j := range c[i] {
+			if math.Abs(c[i][j]-want[i][j]) > 1e-15 {
+				t.Errorf("at 20 km: %v, not %v", c, want)
+			}
+		}
+	}
+	// the smoothed distance meets the true one at 10 km, value and slope
+	if d, slope := smoothedDistanceKm(10); d != 10 || slope != 1 {
+		t.Errorf("at 10 km: %v, %v", d, slope)
+	}
+	if d, slope := smoothedDistanceKm(0); d != 5 || slope != 0 {
+		t.Errorf("at the extender: %v, %v", d, slope)
+	}
+}

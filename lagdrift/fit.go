@@ -775,7 +775,8 @@ func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) (
 // the unit vector from the extender, and I / ε within ε of it.
 func distanceCurvature(d float64, sinBeta float64, cosBeta float64) [2][2]float64 {
 	if d < smoothingKm {
-		return [2][2]float64{{1 / smoothingKm, 0}, {0, 1 / smoothingKm}}
+		// 1.0: smoothingKm is an untyped integer constant, and 1 / 10 is 0
+		return [2][2]float64{{1.0 / smoothingKm, 0}, {0, 1.0 / smoothingKm}}
 	}
 	return [2][2]float64{
 		{cosBeta * cosBeta / d, -sinBeta * cosBeta / d},
