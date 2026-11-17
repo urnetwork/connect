@@ -18,6 +18,8 @@
 //     by generalized least squares whose covariance shares each extender's
 //     route and place error across its runs, with Huber weights per extender.
 //     The 1σ ellipse comes from the position's covariance (CovEllipse).
+//     RefitPosition is the frame's cheaper refit on each tick (V10), from the
+//     warm fit alone.
 //   - V6 (Judge, KForConfidence, Decide): the visitor is outside the IP
 //     country only when the whole uncertainty region is.
 //   - V5 (PhysicallyPossible): the speed of light's limit, leaving one

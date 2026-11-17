@@ -369,3 +369,47 @@ func TestDistanceCurvatureNearAnExtender(t *testing.T) {
 		t.Errorf("at the extender: %v, %v", d, slope)
 	}
 }
+
+// The frame's refit (V10): one start from the warm fit. On the same
+// observations it lands where the full fit did; a tick later it follows the
+// full fit of the new observations; without a warm fit it is the full fit.
+func TestRefitPosition(t *testing.T) {
+	m := DefaultModel()
+	rng := testRand(41)
+	for i := 0; i < 40; i++ {
+		v := corpusDrawN(rng, 1+i%3, 12+i%9)
+		full, err := FitPosition(m, v.expected, v.obs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		same, err := RefitPosition(m, v.expected, v.obs, full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := DistanceKm(full.At, same.At); convergedKm < d {
+			t.Errorf("visitor %d: a refit of the same round trips moved %.3f km", i, d)
+		}
+		next := slices.Clone(v.obs)
+		for j := range next {
+			next[j].RoundTrip.Ms += 0.08 * float64((i+j)%5-2)
+		}
+		tick, err := RefitPosition(m, v.expected, next, full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fullNext, err := FitPosition(m, v.expected, next, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := DistanceKm(tick.At, fullNext.At); fullNext.MinorKm/20 < d {
+			t.Errorf("visitor %d: a tick's refit is %.3f km from its full fit (σ_minor %.1f km)", i, d, fullNext.MinorKm)
+		}
+		cold, err := RefitPosition(m, v.expected, v.obs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cold.At != full.At || !slices.Equal(cold.LastMileMs, full.LastMileMs) || cold.Cov != full.Cov {
+			t.Errorf("visitor %d: a refit without a warm fit isn't the full fit", i)
+		}
+	}
+}

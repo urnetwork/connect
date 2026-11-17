@@ -8,6 +8,7 @@ package lagdrift
 import (
 	"math"
 	"math/rand/v2"
+	"os"
 	"slices"
 	"testing"
 )
@@ -54,6 +55,11 @@ var corpusCities = []Point{
 // and 2,500 km and 4 between 2,500 and 9,000 km, each spread by bearing (the
 // largest smallest gap). A band short of cities takes the nearest outside it.
 func corpusExtenders(at Point) []Point {
+	return corpusExtendersN(at, 12)
+}
+
+// E2's 12, then the nearest others up to n.
+func corpusExtendersN(at Point, n int) []Point {
 	type candidate struct {
 		p       Point
 		d       float64
@@ -116,6 +122,15 @@ func corpusExtenders(at Point) []Point {
 	}
 	spread(300, 2500)
 	spread(2500, 9000)
+	for i := range all {
+		if n <= len(chosen) {
+			break
+		}
+		if !used[i] {
+			used[i] = true
+			chosen = append(chosen, all[i])
+		}
+	}
 	places := []Point{}
 	for _, c := range chosen {
 		places = append(places, c.p)
@@ -136,11 +151,16 @@ type corpusVisitor struct {
 // per path (κ = 0.25 of the distance), places off by up to their accuracy
 // radius, and pings with exponential queueing and rare spikes.
 func corpusDraw(rng *rand.Rand, runs int) corpusVisitor {
+	return corpusDrawN(rng, runs, 12)
+}
+
+// A corpus visitor with n extenders per run, E2's 12 and the nearest others.
+func corpusDrawN(rng *rand.Rand, runs int, n int) corpusVisitor {
 	m := DefaultModel()
 	city := corpusCities[rng.IntN(len(corpusCities))]
 	truth := destination(city, rng.Float64()*360, rng.Float64()*150)
 	expected := destination(truth, rng.Float64()*360, rng.ExpFloat64()*60)
-	extenders := corpusExtenders(truth)
+	extenders := corpusExtendersN(truth, n)
 	type path struct {
 		listed  Point
 		actual  Point
@@ -234,4 +254,8 @@ func TestFitPositionCorpus(t *testing.T) {
 			t.Errorf("%s: %d of %d fits didn't converge", c.label, unconverged, c.fits)
 		}
 	}
+}
+
+func envSet(name string) bool {
+	return os.Getenv(name) != ""
 }

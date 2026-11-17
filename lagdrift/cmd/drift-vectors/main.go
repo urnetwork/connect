@@ -55,6 +55,7 @@ type vectorsFile struct {
 	KForConfidence     []kVector            `json:"kForConfidence"`
 	CovEllipse         []ellipseVector      `json:"covEllipse"`
 	FitPosition        []fitVector          `json:"fitPosition"`
+	RefitPosition      []fitVector          `json:"refitPosition"`
 	Judge              []judgeVector        `json:"judge"`
 	PhysicallyPossible []physicalVector     `json:"physicallyPossible"`
 	EvaluateStop       []stopVector         `json:"evaluateStop"`
@@ -438,6 +439,7 @@ func build() vectorsFile {
 	buildGeometry(&v)
 	buildRoundTrips(&v)
 	buildFits(&v)
+	buildRefits(&v)
 	buildJudge(&v)
 	buildPhysical(&v)
 	buildStops(&v)
@@ -607,6 +609,50 @@ func buildFits(v *vectorsFile) {
 	add("a calibrated model", lagdrift.Model{Kappa: 0.18, Sigma0Ms: 0.7}, chicago, single, nil)
 	add("two extenders", m, chicago, single[:2], nil)
 	add("no valid expected place", m, lagdrift.Point{Lat: 91, Lon: 0}, single, nil)
+}
+
+// The frame's refits (V10): from the warm fit alone.
+func buildRefits(v *vectorsFile) {
+	m := lagdrift.DefaultModel()
+	truth := p6(41.862, -87.842)
+	add := func(name string, expected lagdrift.Point, obs []lagdrift.Observation, warm *lagdrift.Fit) {
+		f, err := lagdrift.RefitPosition(m, expected, obs, warm)
+		vector := fitVector{Name: name, Model: m, Expected: expected, Observations: obs, Warm: roundFit(warm), Fit: roundFit(f)}
+		if err != nil {
+			vector.Error = err.Error()
+		}
+		v.RefitPosition = append(v.RefitPosition, vector)
+	}
+	single := runObservations(truth, chicagoA, "chi-a", 1, 7.5, 0.13)
+	full, err := lagdrift.FitPosition(m, chicago, single, nil)
+	if err != nil {
+		panic(err)
+	}
+	// the warm fit as the TypeScript reads it from these vectors
+	warm := roundFit(full)
+	add("the same round trips", chicago, single, warm)
+	later := cloneObservations(single)
+	for i := range later {
+		later[i].RoundTrip.Ms = r6(later[i].RoundTrip.Ms - 0.05*golden(i, 0.9))
+		later[i].RoundTrip.Count += 1
+	}
+	add("a tick later", chicago, later, warm)
+	add("no warm fit", chicago, later, nil)
+	// a warm fit 500 km off, as after the extenders changed
+	far := *warm
+	far.At = destination(warm.At, 210, 500)
+	add("a warm fit 500 km off", chicago, later, &far)
+	pooled := append(cloneObservations(single), runObservations(truth, chicagoA[:8], "chi-a", 2, 9, 0.29)...)
+	pooledFull, err := lagdrift.FitPosition(m, chicago, pooled, nil)
+	if err != nil {
+		panic(err)
+	}
+	pooledLater := cloneObservations(pooled)
+	for i := range pooledLater {
+		pooledLater[i].RoundTrip.Ms = r6(pooledLater[i].RoundTrip.Ms + 0.04*(golden(i, 0.3)-0.5))
+	}
+	add("two runs, a tick later", chicago, pooledLater, roundFit(pooledFull))
+	add("two extenders", chicago, single[:2], warm)
 }
 
 func cloneObservations(obs []lagdrift.Observation) []lagdrift.Observation {

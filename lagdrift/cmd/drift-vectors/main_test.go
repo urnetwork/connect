@@ -29,6 +29,7 @@ func TestVectorsAreDeterministic(t *testing.T) {
 		"kForConfidence":     len(v.KForConfidence),
 		"covEllipse":         len(v.CovEllipse),
 		"fitPosition":        len(v.FitPosition),
+		"refitPosition":      len(v.RefitPosition),
 		"judge":              len(v.Judge),
 		"physicallyPossible": len(v.PhysicallyPossible),
 		"evaluateStop":       len(v.EvaluateStop),
