@@ -20,7 +20,7 @@
 // AS32934 (an ISP-hosted cache) and the RPKI-to-IRR conversions are left out.
 //
 // Generated input provenance v1:
-//   - name=radb server=whois.radb.net:43 query="-i origin AS32934" accepted_v4=440 accepted_v6=655 accepted_sha256=29cd80719f45265ab56003341d460d91f70a7aaa268d080875153bf20ecc34cd prefixes_v4=24 prefixes_v6=5 disposition=accepted_allow
+//   - name=radb server=whois.radb.net:43 query="-i origin AS32934" accepted_v4=442 accepted_v6=657 accepted_sha256=985e216ac2c47d4526eba7826daecb54f56694659c5421b768b7d69c069f46d1 prefixes_v4=21 prefixes_v6=5 disposition=accepted_allow
 
 package connect
 
@@ -35,10 +35,7 @@ var metaNetworkPrefixes = [...]netip.Prefix{
 	netip.MustParsePrefix("31.13.24.0/21"),
 	netip.MustParsePrefix("31.13.64.0/18"),
 	netip.MustParsePrefix("45.64.40.0/22"),
-	netip.MustParsePrefix("57.141.0.0/20"),
-	netip.MustParsePrefix("57.141.16.0/21"),
-	netip.MustParsePrefix("57.141.24.0/22"),
-	netip.MustParsePrefix("57.141.28.0/23"),
+	netip.MustParsePrefix("57.141.0.0/19"),
 	netip.MustParsePrefix("57.144.0.0/14"),
 	netip.MustParsePrefix("66.220.144.0/20"),
 	netip.MustParsePrefix("69.63.176.0/20"),
