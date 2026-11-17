@@ -20,6 +20,16 @@ message LagTicketBody {
     uint32 MaxStreams = 12;        // per direction, 4
     uint64 MaxDownloadBytes = 13;
     uint64 MaxUploadBytes = 14;
+    // the extender's reporter posts its batch as soon as it holds this
+    // session's report, instead of waiting up to 10 s for 32 (M8), so a drift
+    // test's verdict needn't wait (lag.dev/DRIFTTEST.md E4). An older
+    // extender ignores it and reports within 10 s.
+    bool ReportPromptly = 15;
+    // the extender signs and sends no report for this session: the drift
+    // test's demo token, which stores nothing (lag.dev/DRIFTTEST.md E4, W8).
+    // An older extender ignores it and reports, and the api rejects the
+    // report, since no stored ticket matches (A7).
+    bool NoReport = 16;
 }
 
 message LagTicket {
