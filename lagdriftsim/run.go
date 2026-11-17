@@ -174,11 +174,16 @@ type verdictRecord struct {
 	counting int
 	verdicts [3]lagdrift.Verdict
 	reasons  [3]lagdrift.Reason
-	fitted   bool
-	d        float64
-	majorKm  float64
-	minorKm  float64
-	chi2     float64
+	// at the recalibrated k values, recalibratedKs
+	kVerdicts [2]lagdrift.Verdict
+	// the fit's place and covariance
+	at      lagdrift.Point
+	cov     [2][2]float64
+	fitted  bool
+	d       float64
+	majorKm float64
+	minorKm float64
+	chi2    float64
 	// some run's b is at its bound of 0
 	bAtZero bool
 	// the truth's Mahalanobis distance from the fit: the region at a
@@ -319,7 +324,7 @@ func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOption
 		}
 	case choiceInformation:
 		options.score = self.informationScore()
-	case choiceInformationRing, choiceRingMid:
+	case choiceInformationRing, choiceRingMid, choiceHybrid:
 		options.score = self.informationRingScore()
 	}
 	return options
@@ -927,6 +932,9 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			v.verdicts[i] = lagdrift.VerdictInconclusive
 			v.reasons[i] = reasonTooFewExtenders
 		}
+		for i := range recalibratedKs {
+			v.kVerdicts[i] = lagdrift.VerdictInconclusive
+		}
 		return v
 	}
 	obs := []lagdrift.Observation{}
@@ -943,6 +951,9 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			v.verdicts[i] = lagdrift.VerdictInconclusive
 			v.reasons[i] = lagdrift.ReasonLowPrecision
 		}
+		for i := range recalibratedKs {
+			v.kVerdicts[i] = lagdrift.VerdictInconclusive
+		}
 		if err == nil {
 			// no region test: D is +Inf, as Judge gives with no country
 			v.recordFit(fit, self.spec.truth, math.Inf(1))
@@ -954,8 +965,8 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 	v.fitted = true
 	v.recordFit(fit, self.spec.truth, j.D)
 	physical := -1
-	for i, confidence := range confidences {
-		k := lagdrift.KForConfidence(confidence)
+	// Decide's rules at a k, with at most one physical check for every k
+	decide := func(k float64) (lagdrift.Verdict, lagdrift.Reason) {
 		overlaps := j.Inside || j.D <= k
 		if overlaps && physical < 0 {
 			physical = 0
@@ -965,18 +976,20 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		}
 		switch {
 		case overlaps && physical == 0:
-			v.verdicts[i] = lagdrift.VerdictInconclusive
-			v.reasons[i] = lagdrift.ReasonInconsistent
+			return lagdrift.VerdictInconclusive, lagdrift.ReasonInconsistent
 		case j.Inside:
-			v.verdicts[i] = lagdrift.VerdictAgree
-			v.reasons[i] = lagdrift.ReasonInsideIpCountry
+			return lagdrift.VerdictAgree, lagdrift.ReasonInsideIpCountry
 		case overlaps:
-			v.verdicts[i] = lagdrift.VerdictAgree
-			v.reasons[i] = lagdrift.ReasonRegionOverlaps
+			return lagdrift.VerdictAgree, lagdrift.ReasonRegionOverlaps
 		default:
-			v.verdicts[i] = lagdrift.VerdictDisagree
-			v.reasons[i] = lagdrift.ReasonRegionOutside
+			return lagdrift.VerdictDisagree, lagdrift.ReasonRegionOutside
 		}
+	}
+	for i, confidence := range confidences {
+		v.verdicts[i], v.reasons[i] = decide(lagdrift.KForConfidence(confidence))
+	}
+	for i, k := range recalibratedKs {
+		v.kVerdicts[i], _ = decide(k)
 	}
 	if self.checks {
 		verdict, reason, _ := lagdrift.Decide(fit, c, obs, lagdrift.DefaultConfidence, lagdrift.DefaultMaxSigmaKm)
@@ -1271,8 +1284,15 @@ func atBound(fit *lagdrift.Fit) bool {
 // P4's reason for a window with no counting run.
 const reasonTooFewExtenders lagdrift.Reason = "too_few_extenders"
 
+// k values the study also judges at, for the choice of a recalibrated k:
+// the k at 99% and at 99.9% whose region missed the truth at the nominal
+// rate in the study's tiny country (empiricalKs).
+var recalibratedKs = []float64{3.28, 7.15}
+
 func (self *verdictRecord) recordFit(fit *lagdrift.Fit, truth lagdrift.Point, d float64) {
 	self.d = d
+	self.at = fit.At
+	self.cov = fit.Cov
 	self.majorKm = fit.MajorKm
 	self.minorKm = fit.MinorKm
 	self.chi2 = fit.Chi2PerDof

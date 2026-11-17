@@ -74,7 +74,10 @@ type choice struct {
 //     the region shrinks wherever near the address the visitor may be;
 //   - choiceRingMid: E2's near and far bands, and the 4 others by
 //     choiceInformationRing's score: the ring's gain near the address
-//     without giving up E2's far band.
+//     without giving up E2's far band;
+//   - choiceHybrid: E2 with its mid band chosen by the ring's score from the
+//     band's own candidates, and a short mid band's slots passing to the far
+//     band as E2's do, so a place with few mid extenders keeps E2's far ones.
 const (
 	choiceE2              = "E2"
 	choiceJoint           = "joint spread"
@@ -82,6 +85,7 @@ const (
 	choiceInformation     = "information"
 	choiceInformationRing = "information ring"
 	choiceRingMid         = "ring mid band"
+	choiceHybrid          = "hybrid"
 )
 
 // How to choose.
@@ -167,6 +171,41 @@ func chooseExtendersBy(candidates []choiceCandidate, options choiceOptions, r *r
 		}
 		rest := runExtenders - len(primaries)
 		bands((rest+1)/2, rest/2)
+	case choiceHybrid:
+		// the mid band by the ring's score, unused first
+		midPicked := 0
+		for _, unusedOnly := range []bool{true, false} {
+			for midPicked < bandCount {
+				best := -1
+				bestScore := math.Inf(1)
+				for i, c := range ordered {
+					if taken[c.index] || (unusedOnly && c.used) || c.distanceKm < midMinKm || midMaxKm <= c.distanceKm {
+						continue
+					}
+					if score := options.score(append(slices.Clone(chosen), c)); score < bestScore {
+						best = i
+						bestScore = score
+					}
+				}
+				if best < 0 {
+					break
+				}
+				take(ordered[best])
+				chosen = append(chosen, ordered[best])
+				midPicked += 1
+			}
+		}
+		// the far band and beyond as E2's, with the mid band's shortfall
+		short := bandCount - midPicked
+		for i, band := range [][2]float64{{midMaxKm, farMaxKm}, {farMaxKm, math.Inf(1)}} {
+			want := []int{bandCount, 0}[i] + short
+			picked := pickSpread(inBand(band[0], band[1]), want)
+			for _, c := range picked {
+				take(c)
+				chosen = append(chosen, c)
+			}
+			short = want - len(picked)
+		}
 	case choiceInformation, choiceInformationRing, choiceRingMid:
 		if options.mode == choiceRingMid {
 			// E2's far band first, spread by bearing

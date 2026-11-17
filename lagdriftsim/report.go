@@ -888,3 +888,142 @@ func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int) 
 	}
 	return out
 }
+
+// The k options for the user's choice: as now (2.448, 3.035, 3.717), the
+// empirical k (2.448, 3.28, 7.15), and no 99.9% with 3.28 at 99%.
+var kOptionNames = []string{"(a) k as now", "(b) empirical k", "(c) no 99.9%, 3.28 at 99%"}
+
+// The verdict at confidence index c under a k option, false where the option
+// has no such confidence.
+func optionVerdict(option int, r runSummary, c int) (lagdrift.Verdict, bool) {
+	switch {
+	case option == 0:
+		return r.verdicts[c], true
+	case c == 0:
+		return r.verdicts[0], true
+	case c == 1:
+		return r.kVerdicts[0], true
+	case option == 1:
+		return r.kVerdicts[1], true
+	default:
+		return "", false
+	}
+}
+
+func optionK(option int, c int) float64 {
+	if option == 0 || c == 0 {
+		return kAt(c)
+	}
+	return recalibratedKs[c-1]
+}
+
+// False rejects and power under each k option, after 1 and 3 runs.
+func recalibrationTable(result *studyResult, policy int) string {
+	t := &table{header: []string{"k", "Confidence", "False rejects, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Power: 300 km, 1 run", "3 runs", "1,000 km: 1 run", "3 runs", "3,000 km: 1 run", "3 runs", "real 1,000 km: 1 run", "3 runs"}}
+	last := result.runs() - 1
+	for option := range kOptionNames {
+		for c := range confidences {
+			if _, ok := optionVerdict(option, runSummary{}, c); !ok {
+				continue
+			}
+			disagree := func(r runSummary) bool {
+				v, _ := optionVerdict(option, r, c)
+				return v == lagdrift.VerdictDisagree
+			}
+			row := []string{fmt.Sprintf("%s: %.3f", kOptionNames[option], optionK(option, c)), confidenceName(c)}
+			for _, sc := range []*scenario{scenarioTiny, scenarioRealHonest, scenarioClaim300, scenarioClaim1000, scenarioClaim3000, scenarioRealClaim1000} {
+				row = append(row, result.rateOf(ofScenario(sc), policy, 0, disagree).short(), result.rateOf(ofScenario(sc), policy, last, disagree).short())
+			}
+			t.add(row...)
+		}
+	}
+	return t.String()
+}
+
+// The Mahalanobis distance of p from a fit at at with covariance cov.
+func mahalanobisKm(at lagdrift.Point, cov [2][2]float64, p lagdrift.Point) float64 {
+	east, north := lagdrift.AzimuthalKm(at, p)
+	a := cov[0][0]
+	b := (cov[0][1] + cov[1][0]) / 2
+	c := cov[1][1]
+	det := a*c - b*b
+	if !(0 < det) {
+		return math.Inf(1)
+	}
+	return math.Sqrt((c*east*east - 2*b*east*north + a*north*north) / det)
+}
+
+// A city point's error, per axis, km: a mean radial error of about 30 km.
+const cityErrorKm = 24
+
+// V4 estimating k from tracks: honest single-run fits measured from a city
+// point off the truth by a normal error of 24 km per axis (about 30 km), as
+// is and with the city's variance added to the fit's covariance, and how much
+// the 99% and 99.9% quantiles of a sample of n tracks spread.
+func calibrationFromTracksTable(result *studyResult, policy int) string {
+	truthMs, cityMs, correctedMs := []float64{}, []float64{}, []float64{}
+	for _, s := range result.summaries {
+		r := s.runs[policy][0]
+		if s.scenario.kind != kindHonest || !r.fitted {
+			continue
+		}
+		rr := newRand(result.config.seed, drawScenario, stringKey("city error"), uint64(s.index))
+		city := lagdrift.MoveKm(s.truth, cityErrorKm*rr.NormFloat64(), cityErrorKm*rr.NormFloat64())
+		widened := r.cov
+		widened[0][0] += cityErrorKm * cityErrorKm
+		widened[1][1] += cityErrorKm * cityErrorKm
+		truthMs = append(truthMs, r.truthM)
+		cityMs = append(cityMs, mahalanobisKm(r.at, r.cov, city))
+		correctedMs = append(correctedMs, mahalanobisKm(r.at, widened, city))
+	}
+	if len(truthMs) == 0 {
+		return ""
+	}
+	quantileOf := func(xs []float64, q float64) float64 {
+		sorted := slices.Clone(xs)
+		slices.Sort(sorted)
+		return sorted[min(len(sorted)-1, max(0, int(math.Ceil(q*float64(len(sorted))))-1))]
+	}
+	t := &table{header: []string{"Measured from", "Tracks", "k at 99%: estimate", "5–95% of estimates", "k at 99.9%: estimate", "5–95% of estimates"}}
+	for _, from := range []struct {
+		name string
+		ms   []float64
+	}{{"the truth", truthMs}, {"the city point", cityMs}, {"the city point, its variance added", correctedMs}} {
+		t.add(from.name, formatThousands(float64(len(from.ms))), fmt.Sprintf("%.2f", quantileOf(from.ms, 0.99)), "", fmt.Sprintf("%.2f", quantileOf(from.ms, 0.999)), "")
+	}
+	r := newRand(result.config.seed, drawScenario, stringKey("bootstrap"))
+	for _, n := range []int{1000, 3000, 10000, 30000} {
+		k99, k999 := []float64{}, []float64{}
+		for b := 0; b < 300; b++ {
+			sample := make([]float64, n)
+			for i := range sample {
+				sample[i] = correctedMs[r.IntN(len(correctedMs))]
+			}
+			k99 = append(k99, quantileOf(sample, 0.99))
+			k999 = append(k999, quantileOf(sample, 0.999))
+		}
+		t.add("the city point, its variance added: a sample of", formatThousands(float64(n)),
+			fmt.Sprintf("%.2f", quantileOf(k99, 0.5)), fmt.Sprintf("%.2f–%.2f", quantileOf(k99, 0.05), quantileOf(k99, 0.95)),
+			fmt.Sprintf("%.2f", quantileOf(k999, 0.5)), fmt.Sprintf("%.2f–%.2f", quantileOf(k999, 0.05), quantileOf(k999, 0.95)))
+	}
+	return t.String()
+}
+
+// The empirical k per region, from the truth, honest single runs.
+func regionKTable(result *studyResult, policy int) string {
+	t := &table{header: []string{"Region", "Fits", "k at 95%", "99%", "99.9%"}}
+	for _, region := range append(slices.Clone(regions), "All") {
+		filter := ofRegion(kindHonest, region)
+		if region == "All" {
+			filter = ofKind(kindHonest)
+		}
+		n := 0
+		for _, s := range result.summaries {
+			if filter(s) && s.runs[policy][0].fitted {
+				n += 1
+			}
+		}
+		t.add(append([]string{region, formatThousands(float64(n))}, result.empiricalKs(filter, policy, 0)...)...)
+	}
+	return t.String()
+}

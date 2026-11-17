@@ -422,3 +422,65 @@ func TestRealPair(t *testing.T) {
 		t.Errorf("%g km from the border, expected about %g", spec.borderKm, d)
 	}
 }
+
+// The hybrid takes its mid band from the mid band's own candidates and hands
+// a short mid band's slots to the far band, as E2 does.
+func TestHybridChoice(t *testing.T) {
+	ip := lagdrift.Point{Lat: 35.7, Lon: 139.7}
+	candidates := []choiceCandidate{}
+	add := func(bearing float64, km float64) {
+		p := destination(ip, bearing, km)
+		candidates = append(candidates, choiceCandidate{index: len(candidates), distanceKm: lagdrift.DistanceKm(ip, p), bearingDeg: lagdrift.BearingDeg(ip, p)})
+	}
+	for i := 0; i < 4; i++ {
+		add(float64(90*i), 20)
+	}
+	// only 2 mid candidates, many far ones
+	add(280, 1100)
+	add(240, 2100)
+	for i := 0; i < 12; i++ {
+		add(float64(30*i), 6000)
+	}
+	score := func(picked []choiceCandidate) float64 { return -float64(len(picked)) }
+	c := chooseExtendersBy(candidates, choiceOptions{mode: choiceHybrid, score: score}, newRand(1, 1))
+	mid, far := 0, 0
+	for _, index := range c.primaries {
+		switch d := candidates[index].distanceKm; {
+		case midMinKm <= d && d < midMaxKm:
+			mid += 1
+		case midMaxKm <= d:
+			far += 1
+		}
+	}
+	if len(c.primaries) != runExtenders || mid != 2 || far != 6 {
+		t.Errorf("%d extenders, %d mid and %d far; expected 12 with 2 mid and 6 far", len(c.primaries), mid, far)
+	}
+}
+
+// The k options: (a) as now, (b) 3.28 and 7.15 at 99% and 99.9%, (c) no
+// 99.9%.
+func TestKOptions(t *testing.T) {
+	r := runSummary{
+		verdicts:  [3]lagdrift.Verdict{lagdrift.VerdictDisagree, lagdrift.VerdictDisagree, lagdrift.VerdictAgree},
+		kVerdicts: [2]lagdrift.Verdict{lagdrift.VerdictAgree, lagdrift.VerdictInconclusive},
+	}
+	for _, c := range []struct {
+		option     int
+		confidence int
+		expect     lagdrift.Verdict
+		ok         bool
+	}{
+		{0, 1, lagdrift.VerdictDisagree, true},
+		{1, 0, lagdrift.VerdictDisagree, true},
+		{1, 1, lagdrift.VerdictAgree, true},
+		{1, 2, lagdrift.VerdictInconclusive, true},
+		{2, 2, "", false},
+	} {
+		if v, ok := optionVerdict(c.option, r, c.confidence); v != c.expect || ok != c.ok {
+			t.Errorf("option %d at %d: %q %v", c.option, c.confidence, v, ok)
+		}
+	}
+	if optionK(1, 2) != 7.15 || optionK(2, 1) != 3.28 || optionK(0, 1) != lagdrift.KForConfidence(0.99) {
+		t.Errorf("the options' k")
+	}
+}

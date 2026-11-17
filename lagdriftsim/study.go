@@ -76,6 +76,7 @@ type scenarioCount struct {
 type visitorSummary struct {
 	index     int
 	scenario  *scenario
+	truth     lagdrift.Point
 	region    string
 	cityName  string
 	access    string
@@ -92,17 +93,20 @@ type runSummary struct {
 	counted bool
 	// the verdict after the run: the counting runs it pools, and per
 	// confidence
-	counting int
-	verdicts [3]lagdrift.Verdict
-	reasons  [3]lagdrift.Reason
-	fitted   bool
-	d        float64
-	majorKm  float64
-	minorKm  float64
-	chi2     float64
-	bAtZero  bool
-	truthM   float64
-	errorKm  float64
+	counting  int
+	verdicts  [3]lagdrift.Verdict
+	reasons   [3]lagdrift.Reason
+	kVerdicts [2]lagdrift.Verdict
+	at        lagdrift.Point
+	cov       [2][2]float64
+	fitted    bool
+	d         float64
+	majorKm   float64
+	minorKm   float64
+	chi2      float64
+	bAtZero   bool
+	truthM    float64
+	errorKm   float64
 }
 
 // The study's result: its summaries and its checks against lagdrift.
@@ -257,6 +261,7 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 	s := &visitorSummary{
 		index:     spec.index,
 		scenario:  spec.scenario,
+		truth:     spec.truth,
 		region:    spec.region,
 		cityName:  spec.city.name,
 		borderKm:  spec.borderKm,
@@ -267,21 +272,24 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 		for i, o := range runs {
 			v := o.verdict
 			row[i] = runSummary{
-				stopMs:   o.stopMs,
-				reason:   o.reason,
-				usable:   o.usable,
-				counted:  o.counted,
-				counting: v.counting,
-				verdicts: v.verdicts,
-				reasons:  v.reasons,
-				fitted:   v.fitted,
-				d:        v.d,
-				majorKm:  v.majorKm,
-				minorKm:  v.minorKm,
-				chi2:     v.chi2,
-				bAtZero:  v.bAtZero,
-				truthM:   v.truthM,
-				errorKm:  v.errorKm,
+				stopMs:    o.stopMs,
+				reason:    o.reason,
+				usable:    o.usable,
+				counted:   o.counted,
+				counting:  v.counting,
+				verdicts:  v.verdicts,
+				reasons:   v.reasons,
+				kVerdicts: v.kVerdicts,
+				at:        v.at,
+				cov:       v.cov,
+				fitted:    v.fitted,
+				d:         v.d,
+				majorKm:   v.majorKm,
+				minorKm:   v.minorKm,
+				chi2:      v.chi2,
+				bAtZero:   v.bAtZero,
+				truthM:    v.truthM,
+				errorKm:   v.errorKm,
 			}
 		}
 		s.runs = append(s.runs, row)
