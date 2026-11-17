@@ -50,14 +50,14 @@
 // resolved like mmdb/: config's all/lag/<version>/ne-admin0-10m.bin, or
 // local/lag/ne-admin0-10m.bin. The name is stable; the Natural Earth release,
 // and the revision of how claims are drawn, are in the file's version
-// (Borders.Version, e.g. "ne-admin0-10m-v5.1.2-claims2"), which a verdict
+// (Borders.Version, e.g. "ne-admin0-10m-v5.1.2-claims3"), which a verdict
 // records as geometry_version. Integers are Go's varints
 // (encoding/binary): uvarint, and zigzag varint for signed ones.
 //
 //	magic          16 bytes, "lagdrift-borders"
 //	format         uvarint, 1
 //	version        uvarint length, then that many bytes of UTF-8: the
-//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2-claims2",
+//	               geometry's version, e.g. "ne-admin0-10m-v5.1.2-claims3",
 //	               which a verdict records as geometry_version (P4)
 //	countries      uvarint count, then each country, sorted by code:
 //	  code         2 bytes, two lower-case ASCII letters
@@ -88,7 +88,7 @@
 // and read by ReadWorld:
 //
 //	{"format": "lagdrift-world/1",
-//	 "version": "ne-admin0-50m-v5.1.2-claims2", the geometry's version
+//	 "version": "ne-admin0-50m-v5.1.2-claims3", the geometry's version
 //	 "simplifyKm": 5,                      the simplification's tolerance, km
 //	 "scale": 1000,                        units per degree
 //	 "countries": [                        sorted by code, one to a line
@@ -132,6 +132,13 @@
 // are kept apart both ways, since an IP database never labels one side with
 // the other's code: Taiwan and Kinmen are tw alone, and nothing China holds
 // goes to tw, so the Paracels are cn and vn and Beijing is cn alone.
+//
+// Natural Earth 5.1.2 predates Russia's 2022 annexation claim, so Donetsk and
+// Luhansk, which its Russian view gives their own breakaway codes, go to ru as
+// well as ua by an explicit exception, as Crimea does. The release draws no
+// piece for the other areas Russia claims, the occupied parts of Zaporizhzhia
+// and Kherson, and none is invented, so they are ua's alone: a visitor there
+// whose address is labeled RU can be judged outside Russia.
 //
 // A piece a country's default polygons already hold isn't added to it again;
 // one they don't is added whole. Countries therefore overlap, and a country's

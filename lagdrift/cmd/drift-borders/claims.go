@@ -24,7 +24,12 @@ package main
 // Two pieces stay their de facto owner's alone (undisputedPieces): Taiwan's,
 // which several views give to China, and Israel's own, which the views that
 // don't recognize Israel give to Palestine. G3 counts neither, since their
-// control isn't contested and IP labels vary only where it is.
+// control isn't contested and IP labels vary only where it is. Two pieces get
+// a claimant their attributes miss (addedClaimants): Natural Earth 5.1.2
+// predates Russia's 2022 annexation claim, so Donetsk and Luhansk go to ru as
+// well as ua, as Crimea does. No geometry is invented for the other areas
+// Russia claims, the occupied parts of Zaporizhzhia and Kherson, which the
+// release draws no piece for, so they stay ua's alone.
 //
 // Taiwan and China are kept apart both ways (G3): no piece goes to tw where
 // the default layer gives cn alone or China holds it de facto (the Paracels,
@@ -54,8 +59,9 @@ const (
 	disputedFile   = "ne_10m_admin_0_disputed_areas.geojson"
 	disputedSha256 = "9cafef8b7dfb6b164dc58f218f981f4ace9f716f6c03795d4c62d1ac9f3d50f5"
 	// what the version strings add for the claims: claims1 was the union of
-	// every point of view; claims2 counts claims only in disputed pieces
-	claimsRevision = "claims2"
+	// every point of view; claims2 counts claims only in disputed pieces;
+	// claims3 adds Russia's claim to Donetsk and Luhansk
+	claimsRevision = "claims3"
 	taiwanCode     = "tw"
 	chinaCode      = "cn"
 	// interior points are taken on this many parallels across a polygon
@@ -77,6 +83,19 @@ var undisputedPieces = []pieceId{
 	// the views that don't recognize Israel (Pakistan's, Saudi Arabia's,
 	// Indonesia's and Bangladesh's) give all of it to Palestine
 	{adm0: "ISR", name: "Israel"},
+}
+
+// The claimants a piece's attributes miss, by piece (G3: every claimant where
+// control is contested). Each must match one piece of the pinned layer.
+var addedClaimants = []struct {
+	piece pieceId
+	codes []string
+}{
+	// Natural Earth 5.1.2 predates Russia's 2022 annexation claim: its Russian
+	// view gives these breakaway pieces their own codes, C02 and C03, not
+	// Russia's, and Crimea is ru and ua
+	{piece: pieceId{adm0: "UKR", name: "Donetsk People's Republic"}, codes: []string{"ru"}},
+	{piece: pieceId{adm0: "UKR", name: "Luhansk People's Republic"}, codes: []string{"ru"}},
 }
 
 // The codes of the claimants NOTE_BRK names, as Natural Earth writes them
@@ -413,6 +432,7 @@ func withClaims(base []lagdrift.Country, defaultData []byte, disputedData []byte
 		return nil, nil, err
 	}
 	undisputed := make([]int, len(undisputedPieces))
+	added := make([]int, len(addedClaimants))
 	claims := []claim{}
 	for _, f := range collection.Features {
 		id := pieceId{adm0: f.text("ADM0_A3"), name: pieceName(f)}
@@ -440,6 +460,12 @@ func withClaims(base []lagdrift.Country, defaultData []byte, disputedData []byte
 			if err != nil {
 				return nil, nil, fmt.Errorf("%s %s: %w", disputedFile, id.name, err)
 			}
+			for i, a := range addedClaimants {
+				if a.piece == id {
+					added[i] += 1
+					named = append(named, a.codes...)
+				}
+			}
 		}
 		slices.Sort(claimants)
 		claimants = slices.Compact(claimants)
@@ -464,6 +490,11 @@ func withClaims(base []lagdrift.Country, defaultData []byte, disputedData []byte
 	for i, id := range undisputedPieces {
 		if undisputed[i] != 1 {
 			return nil, nil, fmt.Errorf("%s: %d pieces %s of %s, not 1", disputedFile, undisputed[i], id.name, id.adm0)
+		}
+	}
+	for i, a := range addedClaimants {
+		if added[i] != 1 {
+			return nil, nil, fmt.Errorf("%s: %d pieces %s of %s, not 1", disputedFile, added[i], a.piece.name, a.piece.adm0)
 		}
 	}
 	return union.countries(), claims, nil
@@ -498,6 +529,7 @@ type claimCheck struct {
 
 var claimChecks = []claimCheck{
 	{name: "Crimea", pieces: []string{"Crimea"}, holders: []string{"ru", "ua"}},
+	{name: "Donetsk and Luhansk", pieces: []string{"Donetsk People's Republic", "Luhansk People's Republic"}, places: []lagdrift.Point{{Lat: 48.0159, Lon: 37.8028}, {Lat: 48.5740, Lon: 39.3078}}, holders: []string{"ua", "ru"}},
 	{name: "Indian-held Kashmir", pieces: []string{"Jammu and Kashmir"}, holders: []string{"in", "pk"}},
 	{name: "Pakistani-held Kashmir", pieces: []string{"Gilgit-Baltistan", "Azad Kashmir"}, holders: []string{"in", "pk"}},
 	{name: "Aksai Chin", pieces: []string{"Aksai Chin"}, holders: []string{"cn", "in"}, excluded: []string{taiwanCode}},

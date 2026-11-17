@@ -180,6 +180,10 @@ func TestWithClaims(t *testing.T) {
 		arunachal = [4]float64{91.5, 26.7, 97, 29.4}
 		georgia   = [4]float64{40, 41, 46.7, 43.6}
 		abkhazia  = [4]float64{40, 42.4, 42, 43.6}
+		ukraine   = [4]float64{22, 44.4, 40.2, 52.4}
+		russia    = [4]float64{40.3, 44, 60, 60}
+		donetsk   = [4]float64{37.5, 47.5, 38.5, 48.5}
+		luhansk   = [4]float64{38.6, 48, 39.9, 48.9}
 	)
 	defaultData := testLayer(
 		testFeature(`{"ADM0_A3":"DEU","ISO_A2_EH":"DE","SOV_A3":"DEU","HOMEPART":1}`, aland, strip),
@@ -196,6 +200,8 @@ func TestWithClaims(t *testing.T) {
 		testFeature(`{"ADM0_A3":"SDN","ISO_A2_EH":"SD","SOV_A3":"SDN","HOMEPART":1}`, sudan),
 		testFeature(`{"ADM0_A3":"IND","ISO_A2_EH":"IN","SOV_A3":"IND","HOMEPART":1}`, india),
 		testFeature(`{"ADM0_A3":"GEO","ISO_A2_EH":"GE","SOV_A3":"GEO","HOMEPART":1}`, georgia),
+		testFeature(`{"ADM0_A3":"UKR","ISO_A2_EH":"UA","SOV_A3":"UKR","HOMEPART":1}`, ukraine),
+		testFeature(`{"ADM0_A3":"RUS","ISO_A2_EH":"RU","SOV_A3":"RUS","HOMEPART":1}`, russia),
 	)
 	// not strict: the synthetic layer has none of the features splits name
 	base, err := convert(defaultData, false)
@@ -212,6 +218,9 @@ func TestWithClaims(t *testing.T) {
 		testFeature(`{"BRK_NAME":"Halayib Triangle","ADM0_A3":"EGY","SOV_A3":"EGY","NOTE_BRK":"Admin. by Egypt; Claimed by Sudan"}`, halaib),
 		testFeature(`{"BRK_NAME":"Arunachal Pradesh","ADM0_A3":"IND","SOV_A3":"IND","ADM0_A3_CN":"CHN","ADM0_A3_TW":"TWN","NOTE_BRK":"Admin. by India; Claimed by China"}`, arunachal),
 		testFeature(`{"BRK_NAME":"Abkhazia","ADM0_A3":"B35","SOV_A3":"GEO","ADM0_A3_RU":"B35","NOTE_BRK":"Self admin.; Claimed by Georgia"}`, abkhazia),
+		// Russia's view gives them their own codes, which name no country
+		testFeature(`{"BRK_NAME":"Donetsk People's Republic","ADM0_A3":"UKR","SOV_A3":"UKR","ADM0_A3_RU":"C02","NOTE_BRK":"Self admin.; Claimed by Ukraine"}`, donetsk),
+		testFeature(`{"BRK_NAME":"Luhansk People's Republic","ADM0_A3":"UKR","SOV_A3":"UKR","ADM0_A3_RU":"C03","NOTE_BRK":"Self admin.; Claimed by Ukraine"}`, luhansk),
 	)
 	countries, claims, err := withClaims(base, defaultData, disputedData)
 	if err != nil {
@@ -252,6 +261,9 @@ func TestWithClaims(t *testing.T) {
 		{name: "Arunachal Pradesh", p: lagdrift.Point{Lat: 28, Lon: 94}, codes: []string{"cn", "in", "tw"}},
 		{name: "Delhi", p: lagdrift.Point{Lat: 28.6, Lon: 77.2}, codes: []string{"in"}},
 		{name: "Abkhazia", p: lagdrift.Point{Lat: 43, Lon: 41}, codes: []string{"ge"}},
+		{name: "Donetsk", p: lagdrift.Point{Lat: 48.0, Lon: 37.8}, codes: []string{"ru", "ua"}},
+		{name: "Luhansk", p: lagdrift.Point{Lat: 48.57, Lon: 39.31}, codes: []string{"ru", "ua"}},
+		{name: "Kyiv", p: lagdrift.Point{Lat: 50.45, Lon: 30.52}, codes: []string{"ua"}},
 	}
 	for _, c := range cases {
 		if got := holders(c.p); !slices.Equal(got, c.codes) {
@@ -283,14 +295,26 @@ func TestWithClaims(t *testing.T) {
 		"Halayib Triangle":  {"eg", "sd"},
 		"Arunachal Pradesh": {"cn", "in", "tw"},
 		"Abkhazia":          {"ge"},
+		// added: the release predates Russia's claim
+		"Donetsk People's Republic": {"ru", "ua"},
+		"Luhansk People's Republic": {"ru", "ua"},
 	} {
 		if !slices.Equal(pieceCodes[piece], codes) {
 			t.Errorf("claim %s: %v, not %v", piece, pieceCodes[piece], codes)
 		}
 	}
-	// an undisputed piece the layer lacks fails the build
+	// an undisputed piece, or one with an added claimant, that the layer
+	// lacks fails the build
 	if _, _, err := withClaims(base, defaultData, testLayer(testFeature(`{"BRK_NAME":"Taiwan","ADM0_A3":"TWN"}`, taiwan))); err == nil || !strings.Contains(err.Error(), "Israel") {
 		t.Errorf("a layer without Israel's piece: %v", err)
+	}
+	withoutDonetsk := testLayer(
+		testFeature(`{"BRK_NAME":"Taiwan","ADM0_A3":"TWN"}`, taiwan),
+		testFeature(`{"BRK_NAME":"Israel","ADM0_A3":"ISR"}`, israel),
+		testFeature(`{"BRK_NAME":"Luhansk People's Republic","ADM0_A3":"UKR"}`, luhansk),
+	)
+	if _, _, err := withClaims(base, defaultData, withoutDonetsk); err == nil || !strings.Contains(err.Error(), "Donetsk") {
+		t.Errorf("a layer without Donetsk's piece: %v", err)
 	}
 }
 
