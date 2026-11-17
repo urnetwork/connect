@@ -203,6 +203,8 @@ type visitorSpec struct {
 	// honest visitor, outside for a claim
 	borderKm float64
 	fleet    int
+	// the address's country's continent (V11)
+	continent string
 }
 
 // A visitor's truth: their city's point, moved up to 15 km.
@@ -242,6 +244,7 @@ func syntheticHonest(index int, sc *scenario, c visitorCity, seed uint64) *visit
 		ipCountry: country,
 		borderKm:  depthKm,
 		fleet:     index % fleetCount,
+		continent: continentOf(c.code),
 	}
 }
 
@@ -288,6 +291,7 @@ func syntheticClaim(index int, sc *scenario, c visitorCity, candidates []place, 
 		claimName: claimed.name,
 		borderKm:  sc.claimKm,
 		fleet:     index % fleetCount,
+		continent: continentOf(claimed.code),
 	}
 }
 
@@ -321,6 +325,7 @@ func realHonest(index int, sc *scenario, c visitorCity, borders *lagdrift.Border
 		ipCountry: local,
 		borderKm:  borderKm,
 		fleet:     index % fleetCount,
+		continent: continentOf(c.code),
 	}
 }
 
@@ -365,6 +370,7 @@ func realClaim(index int, sc *scenario, c visitorCity, options []claimOption, bo
 		claimName: o.claimed.name,
 		borderKm:  borderKm,
 		fleet:     index % fleetCount,
+		continent: continentOf(o.claimed.code),
 	}
 }
 
@@ -432,5 +438,6 @@ func realPair(index int, sc *scenario, c visitorCity, code string, borders *lagd
 		claimName: c.name + "/" + strings.ToUpper(code),
 		borderKm:  borderKm,
 		fleet:     index % fleetCount,
+		continent: continentOf(code),
 	}
 }

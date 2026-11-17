@@ -69,6 +69,9 @@ func runParts(options Options, parts []*studyPart) (string, error) {
 			continue
 		}
 		partStarted := time.Now()
+		if part.prepare != nil {
+			part.prepare(part, results)
+		}
 		config := part.config
 		config.workers = options.Workers
 		w := newWorld(worldConfig{seed: options.Seed, misplacedShare: config.misplacedShare, sites: config.sites, extraSites: config.extraSites}, borders)
@@ -235,6 +238,8 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 			b.WriteString(cadenceTable(refits, full) + "\n")
 		}
 	}
+
+	writeV11(b, results)
 
 	if worlds := calibrationWorldTable(parts, results); strings.Count(worlds, "\n") > 2 {
 		section("Where the region's misses come from")

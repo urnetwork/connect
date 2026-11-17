@@ -51,6 +51,12 @@ type studyConfig struct {
 	// starts around the fit and the address's place, when lower by more than
 	// 1: what wider starts would change
 	wideStarts bool
+	// V11's calibration tracks: lag.dev's own choice, one run to the cap with
+	// no frame fits, and the fit measured from the city point as well
+	lagTracks bool
+	// V11's k at 99% per continent, a visitor's from its address's continent
+	// (else DefaultK), with KEarly of it for clear; nil leaves V11 out
+	kByContinent map[string]float64
 	// the runs each visitor makes: 1 to 3, 0 for 3
 	runs int
 	// V10's cadence: the frame refits warm at each ping round and runs the
@@ -77,6 +83,7 @@ type visitorSummary struct {
 	index     int
 	scenario  *scenario
 	truth     lagdrift.Point
+	continent string
 	region    string
 	cityName  string
 	access    string
@@ -97,16 +104,23 @@ type runSummary struct {
 	verdicts  [3]lagdrift.Verdict
 	reasons   [3]lagdrift.Reason
 	kVerdicts [2]lagdrift.Verdict
-	at        lagdrift.Point
-	cov       [2][2]float64
-	fitted    bool
-	d         float64
-	majorKm   float64
-	minorKm   float64
-	chi2      float64
-	bAtZero   bool
-	truthM    float64
-	errorKm   float64
+	// at the visitor's V11 k
+	v11Verdict lagdrift.Verdict
+	v11K       float64
+	// a lag track's fit measured from the city point, and whether light rules
+	// the city point out from two or more extenders
+	cityM          float64
+	cityImpossible bool
+	at             lagdrift.Point
+	cov            [2][2]float64
+	fitted         bool
+	d              float64
+	majorKm        float64
+	minorKm        float64
+	chi2           float64
+	bAtZero        bool
+	truthM         float64
+	errorKm        float64
 }
 
 // The study's result: its summaries and its checks against lagdrift.
@@ -262,6 +276,7 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 		index:     spec.index,
 		scenario:  spec.scenario,
 		truth:     spec.truth,
+		continent: spec.continent,
 		region:    spec.region,
 		cityName:  spec.city.name,
 		borderKm:  spec.borderKm,
@@ -272,24 +287,28 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 		for i, o := range runs {
 			v := o.verdict
 			row[i] = runSummary{
-				stopMs:    o.stopMs,
-				reason:    o.reason,
-				usable:    o.usable,
-				counted:   o.counted,
-				counting:  v.counting,
-				verdicts:  v.verdicts,
-				reasons:   v.reasons,
-				kVerdicts: v.kVerdicts,
-				at:        v.at,
-				cov:       v.cov,
-				fitted:    v.fitted,
-				d:         v.d,
-				majorKm:   v.majorKm,
-				minorKm:   v.minorKm,
-				chi2:      v.chi2,
-				bAtZero:   v.bAtZero,
-				truthM:    v.truthM,
-				errorKm:   v.errorKm,
+				stopMs:         o.stopMs,
+				reason:         o.reason,
+				usable:         o.usable,
+				counted:        o.counted,
+				counting:       v.counting,
+				verdicts:       v.verdicts,
+				reasons:        v.reasons,
+				kVerdicts:      v.kVerdicts,
+				v11Verdict:     v.v11Verdict,
+				v11K:           v.v11K,
+				cityM:          v.cityM,
+				cityImpossible: v.cityImpossible,
+				at:             v.at,
+				cov:            v.cov,
+				fitted:         v.fitted,
+				d:              v.d,
+				majorKm:        v.majorKm,
+				minorKm:        v.minorKm,
+				chi2:           v.chi2,
+				bAtZero:        v.bAtZero,
+				truthM:         v.truthM,
+				errorKm:        v.errorKm,
 			}
 		}
 		s.runs = append(s.runs, row)

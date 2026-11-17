@@ -629,3 +629,27 @@ var vpnPairs = []vpnPair{
 	{cityName: "Singapore", code: "jp"},
 	{cityName: "Lagos", code: "gb"},
 }
+
+// GeoLite2's continent of each country the study places an address in, by
+// code: V11's k is the address's continent's.
+var countryContinents = func() map[string]string {
+	continents := map[string]string{}
+	for continent, codes := range map[string][]string{
+		"EU": {"al", "ad", "at", "by", "be", "ba", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de", "gr", "hu", "is", "ie", "it", "xk", "lv", "li", "lt", "lu", "mt", "md", "mc", "me", "nl", "mk", "no", "pl", "pt", "ro", "ru", "sm", "rs", "sk", "si", "es", "se", "ch", "ua", "gb", "va"},
+		"AS": {"am", "az", "ge", "tr", "il", "ps", "jo", "lb", "sy", "iq", "ir", "kw", "sa", "bh", "qa", "ae", "om", "ye", "kz", "uz", "tm", "kg", "tj", "af", "pk", "in", "np", "bt", "bd", "lk", "mv", "cn", "mn", "kp", "kr", "jp", "tw", "hk", "mo", "vn", "la", "kh", "th", "mm", "my", "sg", "id", "bn", "ph", "tl"},
+		"OC": {"au", "nz", "fj", "nc", "pg"},
+		"AF": {"eg", "ly", "tn", "dz", "ma", "eh", "mr", "sn", "gm", "gw", "gn", "sl", "lr", "ci", "ml", "bf", "gh", "tg", "bj", "ng", "ne", "td", "cm", "cf", "gq", "ga", "cg", "cd", "ao", "sd", "ss", "et", "er", "dj", "so", "ke", "ug", "rw", "bi", "tz", "zm", "mw", "mz", "zw", "bw", "na", "za", "ls", "sz", "mg", "mu"},
+		"NA": {"us", "ca", "mx", "gt", "bz", "sv", "hn", "ni", "cr", "pa", "cu", "jm", "ht", "do", "pr", "bs", "tt", "gl"},
+		"SA": {"co", "ve", "gy", "sr", "ec", "pe", "bo", "br", "py", "uy", "ar", "cl"},
+	} {
+		for _, code := range codes {
+			continents[code] = continent
+		}
+	}
+	return continents
+}()
+
+// The continent of a country code, "" when unknown.
+func continentOf(code string) string {
+	return countryContinents[code]
+}

@@ -104,6 +104,8 @@ type studyPart struct {
 	about  string
 	config studyConfig
 	counts []scenarioCount
+	// sets the part up from the parts that ran before it, when given
+	prepare func(part *studyPart, results map[string]*studyResult)
 }
 
 // The study's world and model unless a part varies them: the route stretch
@@ -197,6 +199,7 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	}
 	parts = append(parts, kappa...)
 	parts = append(parts, variants, misplaced, normal)
+	parts = append(parts, v11Parts(seed, scale)...)
 	parts = append(parts, calibrationParts(seed, scale)...)
 	parts = append(parts, startsParts(seed, scale)...)
 	parts = append(parts, vpnParts(seed, scale)...)
@@ -230,6 +233,43 @@ func vpnParts(seed uint64, scale float64) []*studyPart {
 		}
 	}
 	return parts
+}
+
+// V11's k (review V-8): calibrated on single-run lag.dev tracks, used on drift
+// verdicts with the hybrid choice pooled over up to 3 runs. The lag part
+// calibrates k per continent by V11's upper-bound rule; the drift parts judge
+// the same visitors at V11's defaults and at that calibrated k.
+func v11Parts(seed uint64, scale float64) []*studyPart {
+	lag := &studyPart{
+		name:   "V11: lag.dev tracks",
+		about:  "lag.dev's own choice of 8 extenders, one run to the cap, the fit measured from the visitor's city point: V11's calibration tracks",
+		config: baseConfig(seed, []stopPolicy{capPolicy()}),
+		counts: counted(scale, 10000, scenarioTiny),
+	}
+	lag.config.runs = 1
+	lag.config.lagTracks = true
+	lag.config.choiceMode = choiceLag
+	honest := append(counted(scale, 800, scenarioTiny), counted(scale, 500, scenarioRealHonest)...)
+	honest = append(honest, counted(scale, 200, scenarioLargeEdge)...)
+	drift := func(name string, about string) *studyPart {
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}), counts: honest}
+		part.config.choiceMode = choiceHybrid
+		part.config.kByContinent = map[string]float64{}
+		for _, continent := range []string{"AF", "AN", "AS", "EU", "NA", "OC", "SA", ""} {
+			part.config.kByContinent[continent] = lagdrift.DefaultK(lagdrift.DefaultConfidence, continent)
+		}
+		return part
+	}
+	defaults := drift("V11 drift: default k", "the hybrid choice, 3 runs, judged at V11's default k for the address's continent, k_early KEarly(k)")
+	calibrated := drift("V11 drift: lag k", "the same visitors judged at the k calibrated from the lag.dev tracks by V11's upper-bound rule")
+	calibrated.prepare = func(part *studyPart, results map[string]*studyResult) {
+		if lagResult, ok := results[lag.name]; ok {
+			for continent, k := range v11CalibratedKs(lagResult) {
+				part.config.kByContinent[continent] = k
+			}
+		}
+	}
+	return []*studyPart{lag, defaults, calibrated}
 }
 
 // Where the region's excess misses come from: honest visitors, one run each,

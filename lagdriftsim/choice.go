@@ -20,6 +20,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+
+	"github.com/urnetwork/connect/lagdrift"
 )
 
 const (
@@ -48,6 +50,10 @@ type choiceCandidate struct {
 	bearingDeg float64
 	inCountry  bool
 	used       bool
+	// its place, country and city, for lag.dev's own choice (choiceLag)
+	at   lagdrift.Point
+	code string
+	city string
 }
 
 // A run's extenders: 12 to open, and the spares in the order they replace a
@@ -86,11 +92,16 @@ const (
 	choiceInformationRing = "information ring"
 	choiceRingMid         = "ring mid band"
 	choiceHybrid          = "hybrid"
+	// lag.dev's own track (PLAN.md L3), for V11's calibration tracks
+	choiceLag = "lag.dev"
 )
 
 // How to choose.
 type choiceOptions struct {
 	mode string
+	// choiceLag: the visitor's own country, which its far extenders' count of
+	// countries leaves out
+	visitorCode string
 	// choiceHubs: the candidate nearest each hub, in the order to take them
 	hubIndexes []int
 	// choiceInformation: a set's score, lower better
@@ -104,6 +115,9 @@ func chooseExtenders(candidates []choiceCandidate, r *rand.Rand) choice {
 
 // The choice from candidates by a mode. r breaks ties.
 func chooseExtendersBy(candidates []choiceCandidate, options choiceOptions, r *rand.Rand) choice {
+	if options.mode == choiceLag {
+		return chooseLagTrack(candidates, options.visitorCode, r)
+	}
 	// nearest first; a shuffle first makes ties fall by r
 	ordered := slices.Clone(candidates)
 	r.Shuffle(len(ordered), func(i int, j int) {
@@ -441,4 +455,147 @@ func compareFloat(a float64, b float64) int {
 	default:
 		return 0
 	}
+}
+
+const (
+	lagNear       = 3
+	lagNearPool   = 8
+	lagFar        = 5
+	lagFarMinKm   = 1500
+	lagFarApartKm = 500
+	lagSpares     = 4
+	lagSwapPasses = 20
+)
+
+// lag.dev's track (PLAN.md L3): 3 near, at random among the 8 nearest,
+// preferring distinct cities; 5 far, at least 1,500 km from the visitor and
+// 500 km from every near pick, maximizing the number of distinct countries
+// among them other than the visitor's, then the sum of pairwise distances
+// over all 8, picked greedily with a random choice among the top 3 at each
+// step, then swapped pairwise until no swap improves; and 4 spares by the
+// same objective.
+func chooseLagTrack(candidates []choiceCandidate, visitorCode string, r *rand.Rand) choice {
+	ordered := slices.Clone(candidates)
+	r.Shuffle(len(ordered), func(i int, j int) {
+		ordered[i], ordered[j] = ordered[j], ordered[i]
+	})
+	slices.SortStableFunc(ordered, func(a choiceCandidate, b choiceCandidate) int {
+		return compareFloat(a.distanceKm, b.distanceKm)
+	})
+	pool := slices.Clone(ordered[:min(len(ordered), lagNearPool)])
+	r.Shuffle(len(pool), func(i int, j int) {
+		pool[i], pool[j] = pool[j], pool[i]
+	})
+	near := []choiceCandidate{}
+	cities := map[string]bool{}
+	for _, distinct := range []bool{true, false} {
+		for _, c := range pool {
+			if lagNear <= len(near) {
+				break
+			}
+			if slices.ContainsFunc(near, func(n choiceCandidate) bool { return n.index == c.index }) || (distinct && cities[c.city]) {
+				continue
+			}
+			near = append(near, c)
+			cities[c.city] = true
+		}
+	}
+	far := []choiceCandidate{}
+	eligible := []choiceCandidate{}
+	for _, c := range ordered {
+		if c.distanceKm < lagFarMinKm || slices.ContainsFunc(near, func(n choiceCandidate) bool { return n.index == c.index }) {
+			continue
+		}
+		apart := true
+		for _, n := range near {
+			if lagdrift.DistanceKm(n.at, c.at) < lagFarApartKm {
+				apart = false
+			}
+		}
+		if apart {
+			eligible = append(eligible, c)
+		}
+	}
+	// the objective: distinct countries, then the sum of pairwise km over all
+	objective := func(far []choiceCandidate) (int, float64) {
+		countries := map[string]bool{}
+		for _, c := range far {
+			if c.code != visitorCode {
+				countries[c.code] = true
+			}
+		}
+		all := append(slices.Clone(near), far...)
+		sum := 0.0
+		for i := range all {
+			for j := i + 1; j < len(all); j++ {
+				sum += lagdrift.DistanceKm(all[i].at, all[j].at)
+			}
+		}
+		return len(countries), sum
+	}
+	better := func(a []choiceCandidate, b []choiceCandidate) bool {
+		ac, as := objective(a)
+		bc, bs := objective(b)
+		return bc < ac || (ac == bc && bs < as)
+	}
+	greedy := func(want int, taken []choiceCandidate) []choiceCandidate {
+		picked := []choiceCandidate{}
+		for len(picked) < want {
+			type scored struct {
+				c     choiceCandidate
+				trial []choiceCandidate
+			}
+			options := []scored{}
+			for _, c := range eligible {
+				if slices.ContainsFunc(append(slices.Clone(taken), picked...), func(t choiceCandidate) bool { return t.index == c.index }) {
+					continue
+				}
+				options = append(options, scored{c: c, trial: append(append(slices.Clone(taken), picked...), c)})
+			}
+			if len(options) == 0 {
+				break
+			}
+			slices.SortStableFunc(options, func(a scored, b scored) int {
+				switch {
+				case better(a.trial, b.trial):
+					return -1
+				case better(b.trial, a.trial):
+					return 1
+				default:
+					return 0
+				}
+			})
+			picked = append(picked, options[r.IntN(min(3, len(options)))].c)
+		}
+		return picked
+	}
+	far = greedy(lagFar, nil)
+	for pass := 0; pass < lagSwapPasses; pass++ {
+		improved := false
+		for i := range far {
+			for _, c := range eligible {
+				if slices.ContainsFunc(far, func(f choiceCandidate) bool { return f.index == c.index }) {
+					continue
+				}
+				trial := slices.Clone(far)
+				trial[i] = c
+				if better(trial, far) {
+					far = trial
+					improved = true
+				}
+			}
+		}
+		if !improved {
+			break
+		}
+	}
+	primaries := []int{}
+	for _, c := range append(slices.Clone(near), far...) {
+		primaries = append(primaries, c.index)
+	}
+	spares := []int{}
+	for _, c := range greedy(lagSpares, far) {
+		spares = append(spares, c.index)
+	}
+	return choice{primaries: primaries, spares: spares}
 }

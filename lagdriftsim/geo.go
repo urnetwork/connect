@@ -134,7 +134,7 @@ func borderDistanceKm(c *lagdrift.Country, p lagdrift.Point) (inside bool, dista
 		At:  p,
 		Cov: [2][2]float64{{1, 0}, {0, 1}},
 	}
-	j := lagdrift.Judge(f, c, lagdrift.DefaultConfidence)
+	j := lagdrift.Judge(f, c, lagdrift.KForConfidence(lagdrift.DefaultConfidence))
 	return j.Inside, j.D
 }
 

@@ -484,3 +484,75 @@ func TestKOptions(t *testing.T) {
 		t.Errorf("the options' k")
 	}
 }
+
+// V11's upper bound: the value at rank n·q + 1.645·√(n·q·(1 − q)), rounded up
+// to its 0.05 bin's upper edge, a value on an edge in the bin above it, and
+// nothing from the overflow bin or past the sample.
+func TestV11UpperBound(t *testing.T) {
+	ms := []float64{}
+	for i := 1; i <= 1000; i++ {
+		ms = append(ms, 0.01*float64(i))
+	}
+	// rank ⌈990 + 1.645 √9.9⌉ = 996: 9.96, in [9.95, 10.00)
+	if k, ok := v11UpperBound(ms, 0.99); !ok || k != 10.0 {
+		t.Errorf("k %g %v, expected 10", k, ok)
+	}
+	// the rank-996 value exactly on the edge 10.00
+	edge := slices.Clone(ms)
+	for i := 995; i < len(edge); i++ {
+		edge[i] = 10.0
+	}
+	if k, _ := v11UpperBound(edge, 0.99); k != 10.05 {
+		t.Errorf("a value on an edge: k %g, expected 10.05", k)
+	}
+	high := []float64{}
+	for i := 0; i < 1000; i++ {
+		high = append(high, 12.5)
+	}
+	if _, ok := v11UpperBound(high, 0.99); ok {
+		t.Errorf("an overflow bin's quantile was used")
+	}
+	if _, ok := v11UpperBound(ms[:50], 0.99); ok {
+		t.Errorf("a rank past the sample was used")
+	}
+}
+
+// lag.dev's track: 3 near from the 8 nearest in distinct cities, and 5 far,
+// 1,500 km away and 500 km from every near pick, in distinct countries.
+func TestLagTrackChoice(t *testing.T) {
+	w := newWorld(worldConfig{seed: 3}, nil)
+	paris, _ := cityNamed("Paris")
+	candidates := []choiceCandidate{}
+	for i, e := range w.pool {
+		at := w.fleets[0][i].at
+		candidates = append(candidates, choiceCandidate{index: i, distanceKm: lagdrift.DistanceKm(paris.at, at), bearingDeg: lagdrift.BearingDeg(paris.at, at), at: at, code: e.site.code, city: e.site.name})
+	}
+	c := chooseExtendersBy(candidates, choiceOptions{mode: choiceLag, visitorCode: "fr"}, newRand(3, 4))
+	if len(c.primaries) != lagNear+lagFar || len(c.spares) != lagSpares {
+		t.Fatalf("%d primaries and %d spares", len(c.primaries), len(c.spares))
+	}
+	near := c.primaries[:lagNear]
+	cities := map[string]bool{}
+	for _, index := range near {
+		cities[candidates[index].city] = true
+	}
+	if len(cities) != lagNear {
+		t.Errorf("the near extenders share a city: %v", cities)
+	}
+	countries := map[string]bool{}
+	for _, index := range c.primaries[lagNear:] {
+		far := candidates[index]
+		countries[far.code] = true
+		if far.distanceKm < lagFarMinKm {
+			t.Errorf("a far extender %g km away", far.distanceKm)
+		}
+		for _, n := range near {
+			if d := lagdrift.DistanceKm(candidates[n].at, far.at); d < lagFarApartKm {
+				t.Errorf("a far extender %g km from a near one", d)
+			}
+		}
+	}
+	if len(countries) < lagFar {
+		t.Errorf("the far extenders are in %d countries, expected 5", len(countries))
+	}
+}

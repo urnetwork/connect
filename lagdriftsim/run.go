@@ -176,6 +176,13 @@ type verdictRecord struct {
 	reasons  [3]lagdrift.Reason
 	// at the recalibrated k values, recalibratedKs
 	kVerdicts [2]lagdrift.Verdict
+	// at the visitor's V11 k, and that k
+	v11Verdict lagdrift.Verdict
+	v11K       float64
+	// a lag track's city point: its Mahalanobis distance from the fit, and
+	// whether light rules it out from two or more extenders (V11)
+	cityM          float64
+	cityImpossible bool
 	// the fit's place and covariance
 	at      lagdrift.Point
 	cov     [2][2]float64
@@ -260,6 +267,8 @@ type visitorSim struct {
 	outcome   *visitorOutcome
 	// the runs each visitor makes, at most visitorRuns
 	runs int
+	// V11's k for the visitor, 0 without V11
+	k11 float64
 	// the fits made so far, for sampling
 	fitCalls int
 }
@@ -279,6 +288,12 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 	}
 	if 0 < config.runs && config.runs < visitorRuns {
 		sim.runs = config.runs
+	}
+	if config.kByContinent != nil {
+		sim.k11 = config.kByContinent[spec.continent]
+		if !(0 < sim.k11) {
+			sim.k11 = lagdrift.DefaultK(lagdrift.DefaultConfidence, spec.continent)
+		}
 	}
 	sim.outcome = &visitorOutcome{spec: spec}
 	r := newRand(config.seed, drawVisitor, uint64(spec.index))
@@ -300,7 +315,7 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 
 // How this visitor's runs choose their extenders.
 func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOptions {
-	options := choiceOptions{mode: self.config.choiceMode}
+	options := choiceOptions{mode: self.config.choiceMode, visitorCode: self.spec.city.code}
 	switch options.mode {
 	case choiceHubs:
 		// each hub's nearest serving extender, the hubs nearest the address's
@@ -469,6 +484,9 @@ func (self *visitorSim) openSessions() {
 				bearingDeg: lagdrift.BearingDeg(self.spec.ipPlace, at),
 				inCountry:  inCountry,
 				used:       used[i],
+				at:         at,
+				code:       e.site.code,
+				city:       e.site.name,
 			})
 		}
 		c := chooseExtendersBy(candidates, self.choiceOptions(candidates), newRand(self.config.seed, drawChoice, uint64(self.spec.index), uint64(run)))
@@ -517,6 +535,10 @@ func (self *visitorSim) openSessions() {
 
 // The runs of one policy.
 func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
+	if 0 < self.k11 {
+		// V11: clear stops at the visitor's k_early
+		policy.earlyK = lagdrift.KEarly(self.k11)
+	}
 	outcomes := []runOutcome{}
 	// the counting runs: their keys and usable observations
 	countingKeys := []string{}
@@ -529,9 +551,17 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 			prior = append(prior, obs...)
 		}
 		trace := self.trace(run, strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), prior)
-		stopTrace, tick, reason := trace.stopFor(policy)
-		if self.checks && policy.isLagdrift() && !trace.cadence {
-			trace.checkStops(tick)
+		var stopTrace *runTrace
+		var tick int
+		var reason lagdrift.StopReason
+		if self.config.lagTracks {
+			// lag.dev's radar doesn't stop: the track's pings to the cap
+			stopTrace, tick, reason = trace, capTicks, lagdrift.StopCap
+		} else {
+			stopTrace, tick, reason = trace.stopFor(policy)
+		}
+		if self.checks && policy.isLagdrift() && !trace.cadence && !self.config.lagTracks {
+			trace.checkStops(tick, policy.earlyK)
 		}
 		obs := trace.serverObservations(tick, policy.roundTrips)
 		outcome := runOutcome{
@@ -703,7 +733,7 @@ func (self *runTrace) d(j int) float64 {
 		state.judged = true
 		state.d = math.Inf(1)
 		if state.fit != nil {
-			j := lagdrift.Judge(state.fit, self.sim.spec.ipCountry, lagdrift.DefaultConfidence)
+			j := lagdrift.Judge(state.fit, self.sim.spec.ipCountry, lagdrift.KForConfidence(lagdrift.DefaultConfidence))
 			state.d = j.D
 			state.inside = j.Inside
 		}
@@ -879,11 +909,13 @@ func steady(history []lagdrift.Snapshot, nowMs int64, latest *lagdrift.Fit, wind
 
 // Checks the study's stop against lagdrift.EvaluateStop at every ping round
 // from 3 s to the stop.
-func (self *runTrace) checkStops(stopTick int) {
+func (self *runTrace) checkStops(stopTick int, earlyK float64) {
+	tol := lagdrift.BrowserStopTolerance
+	tol.KEarly = earlyK
 	first := int(lagdrift.StopEarliestMs / tickMs)
 	for j := first; j <= stopTick; j++ {
 		state := self.tick(j)
-		reason, ok := lagdrift.EvaluateStop(self.history[:j], 0, state.atMs, state.lastPongMs, self.sim.spec.ipCountry, lagdrift.BrowserStopTolerance)
+		reason, ok := lagdrift.EvaluateStop(self.history[:j], 0, state.atMs, state.lastPongMs, self.sim.spec.ipCountry, tol)
 		expectOk := j == stopTick
 		self.sim.outcome.stopChecks += 1
 		if ok != expectOk {
@@ -935,6 +967,8 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		for i := range recalibratedKs {
 			v.kVerdicts[i] = lagdrift.VerdictInconclusive
 		}
+		v.v11Verdict = lagdrift.VerdictInconclusive
+		v.v11K = self.k11
 		return v
 	}
 	obs := []lagdrift.Observation{}
@@ -954,6 +988,8 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		for i := range recalibratedKs {
 			v.kVerdicts[i] = lagdrift.VerdictInconclusive
 		}
+		v.v11Verdict = lagdrift.VerdictInconclusive
+		v.v11K = self.k11
 		if err == nil {
 			// no region test: D is +Inf, as Judge gives with no country
 			v.recordFit(fit, self.spec.truth, math.Inf(1))
@@ -961,7 +997,7 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		return v
 	}
 	self.checkFit(key, obs, fit)
-	j := lagdrift.Judge(fit, c, lagdrift.DefaultConfidence)
+	j := lagdrift.Judge(fit, c, lagdrift.KForConfidence(lagdrift.DefaultConfidence))
 	v.fitted = true
 	v.recordFit(fit, self.spec.truth, j.D)
 	physical := -1
@@ -991,8 +1027,18 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 	for i, k := range recalibratedKs {
 		v.kVerdicts[i], _ = decide(k)
 	}
+	if 0 < self.k11 {
+		v.v11Verdict, _ = decide(self.k11)
+		v.v11K = self.k11
+	}
+	if self.config.lagTracks {
+		// V11 measures a lag track from the visitor's city point, and leaves out
+		// a track whose city point light rules out from two or more extenders
+		v.cityM = mahalanobisKm(fit.At, fit.Cov, self.spec.city.at)
+		v.cityImpossible = !lagdrift.PhysicallyPossible(obs, diskCountry("zz", self.spec.city.at, 1, 12))
+	}
 	if self.checks {
-		verdict, reason, _ := lagdrift.Decide(fit, c, obs, lagdrift.DefaultConfidence, lagdrift.DefaultMaxSigmaKm)
+		verdict, reason, _ := lagdrift.Decide(fit, c, obs, lagdrift.KForConfidence(lagdrift.DefaultConfidence), lagdrift.DefaultMaxSigmaKm)
 		self.outcome.decideChecks += 1
 		if verdict != v.verdicts[1] || reason != v.reasons[1] {
 			self.outcome.decideMismatches = append(self.outcome.decideMismatches,
