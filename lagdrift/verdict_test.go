@@ -36,3 +36,24 @@ func TestDecide(t *testing.T) {
 		}
 	}
 }
+
+// A country with no boundary to judge against is an unknown country, as nil
+// is, not one the region lies wholly outside (review F-04): the shipped files
+// can't hold one, but a caller can build one.
+func TestDecideWithoutABoundary(t *testing.T) {
+	honest := honestObservations(Point{Lat: 1, Lon: 1}, physicalExtenders)
+	for _, c := range []*Country{
+		{Code: "zn"},
+		{Code: "zn", Polygons: [][][]Point{}},
+		{Code: "zn", Polygons: [][][]Point{{}}},
+		{Code: "zn", Polygons: [][][]Point{{{}}, {{}, {}}}},
+	} {
+		// wide too: an unknown country comes before low precision
+		for _, f := range []*Fit{fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), fitAt(Point{Lat: 1, Lon: 1}, circleCov(2000))} {
+			verdict, reason, j := Decide(f, c, honest, DefaultConfidence, DefaultMaxSigmaKm)
+			if verdict != VerdictInconclusive || reason != ReasonIpCountryUnknown || j != (Judgement{}) {
+				t.Errorf("%+v: %s/%s %+v", c.Polygons, verdict, reason, j)
+			}
+		}
+	}
+}

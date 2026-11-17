@@ -831,6 +831,7 @@ func buildStops(v *vectorsFile) {
 	add("not clear: inside near the edge", one(covFit(p6(1, 0.3), circle(30), 0, 0), 8), clearAt, clearAt, square, browser)
 	add("not clear: too few ready", one(covFit(p6(1, -10), circle(30), 0, 0), 7), clearAt, clearAt, square, browser)
 	add("not clear: no country", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, nil, browser)
+	add("not clear: a country of no polygons", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{}}, browser)
 	end := int64(opened + 12000)
 	add("interrupted before clear", history(end, far, 12), end, opened+5000, square, browser)
 	add("clear before converged and the cap", history(end, far, 12), end, end, square, browser)
@@ -902,6 +903,9 @@ func buildDecide(v *vectorsFile) {
 		obs  []lagdrift.Observation
 	}{
 		{name: "no country", fit: covFit(p6(1, 1), circle(30), 0, 0), c: nil, obs: honest},
+		// a country with no boundary is unknown too (review F-04)
+		{name: "a country of no polygons", fit: covFit(p6(1, 1), circle(30), 0, 0), c: &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{}}, obs: honest},
+		{name: "a country of empty rings", fit: covFit(p6(1, -3), circle(30), 0, 0), c: &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{{{}}}}, obs: honest},
 		{name: "too wide", fit: covFit(p6(1, 1), circle(2000), 0, 0), c: square, obs: honest},
 		{name: "inside", fit: covFit(p6(1, 1), circle(30), 0, 0), c: square, obs: honest},
 		{name: "overlapping", fit: covFit(p6(1, -0.5), circle(30), 0, 0), c: square, obs: honest},

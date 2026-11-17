@@ -34,7 +34,8 @@ const DefaultMaxSigmaKm = 1500
 // The verdict of a fit against the IP country c (V6), with obs the fit's
 // observations for the physical check (V5):
 //
-//  1. c unknown (nil) → inconclusive, ip_country_unknown;
+//  1. c unknown (nil, or without a ring with a point) → inconclusive,
+//     ip_country_unknown;
 //  2. σ_major above maxSigmaKm → inconclusive, low_precision;
 //  3. the region touches c but c is physically impossible → inconclusive,
 //     inconsistent. The check never rejects on its own (V5);
@@ -44,7 +45,7 @@ const DefaultMaxSigmaKm = 1500
 //
 // The judgement is zero for the first two.
 func Decide(f *Fit, c *Country, obs []Observation, confidence float64, maxSigmaKm float64) (Verdict, Reason, Judgement) {
-	if c == nil {
+	if c == nil || !c.hasBoundary() {
 		return VerdictInconclusive, ReasonIpCountryUnknown, Judgement{}
 	}
 	if f == nil || !(f.MajorKm <= maxSigmaKm) {

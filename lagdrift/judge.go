@@ -128,6 +128,20 @@ func newCountryIndex(polygons [][][]Point) *countryIndex {
 	return index
 }
 
+// The country has a boundary to judge against: a ring with a point. One
+// without, such as a country of no polygons, is an unknown country to Decide
+// and EvaluateStop, as a nil one is (lag.dev/DRIFTTEST.md V6, V10).
+func (self *Country) hasBoundary() bool {
+	for _, polygon := range self.Polygons {
+		for _, ring := range polygon {
+			if 0 < len(ring) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // p is inside one of the country's polygons and in none of that polygon's
 // holes.
 func (self *Country) Contains(p Point) bool {

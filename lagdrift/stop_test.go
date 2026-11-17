@@ -164,6 +164,9 @@ func TestEvaluateStopClear(t *testing.T) {
 		{name: "inside near the edge", fit: stopFit(Point{Lat: 1, Lon: 0.3}, 0, 0, 30), c: squareCountry, ready: 8, clear: false},
 		{name: "too few ready", fit: stopFit(Point{Lat: 1, Lon: -10}, 0, 0, 30), c: squareCountry, ready: 7, clear: false},
 		{name: "no country", fit: stopFit(Point{Lat: 1, Lon: -10}, 0, 0, 30), c: nil, ready: 8, clear: false},
+		// a country with no boundary is unknown too, not one the region is
+		// wholly outside (review F-04)
+		{name: "a country of no polygons", fit: stopFit(Point{Lat: 1, Lon: -10}, 0, 0, 30), c: &Country{Code: "zn", Polygons: [][][]Point{}}, ready: 8, clear: false},
 	}
 	for _, c := range cases {
 		// one snapshot, so converged can't hold

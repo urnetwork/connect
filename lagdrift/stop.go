@@ -75,8 +75,9 @@ var (
 // The rule that stops the run at nowMs, if one does (V10). history is the
 // run's snapshots in time order; those after nowMs are ignored. lastPongMs is
 // the last pong from any extender, before which openedMs stands in. c is the IP
-// country, nil when unknown, which rules out clear. When several rules hold,
-// the first of interrupted, clear, converged and cap is the reason.
+// country, nil when unknown, which rules out clear, as a country without a
+// ring with a point does. When several rules hold, the first of interrupted,
+// clear, converged and cap is the reason.
 func EvaluateStop(history []Snapshot, openedMs int64, nowMs int64, lastPongMs int64, c *Country, tol StopTolerance) (StopReason, bool) {
 	for _, reason := range []StopReason{StopInterrupted, StopClear, StopConverged, StopCap} {
 		if StopHolds(reason, history, openedMs, nowMs, lastPongMs, c, tol) {
@@ -100,7 +101,7 @@ func StopHolds(reason StopReason, history []Snapshot, openedMs int64, nowMs int6
 		return openedMs+StopCapMs <= nowMs
 	case StopClear:
 		latest, ok := latestSnapshot(history, nowMs)
-		if !ok || latest.Fit == nil || c == nil || !enoughRoundTrips(latest.RoundTrips) {
+		if !ok || latest.Fit == nil || c == nil || !c.hasBoundary() || !enoughRoundTrips(latest.RoundTrips) {
 			return false
 		}
 		return EarlyK <= judgeK(latest.Fit, c, EarlyK).D
