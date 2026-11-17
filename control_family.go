@@ -186,8 +186,10 @@ var controlFamilyLedger = struct {
 }
 
 func init() {
-	// a path change invalidates everything learned about the old path
+	// a path change invalidates everything learned about the old path, and
+	// the interface table read on it
 	AddNetworkChangeListener(controlFamilyClear)
+	AddNetworkChangeListener(controlFamilyInterfaceReadClear)
 }
 
 // controlFamilyDemote records that `family` connected and then failed. It
@@ -429,13 +431,113 @@ func hostControlFamilyInterfaces() ([]controlFamilyInterface, error) {
 	return probed, nil
 }
 
-// the enumeration seam, separate from the ledger's mutex because
-// probeFamilySupport runs while the ledger is held.
+// Tunes the read of the interface table that the family probes share
+// (controlFamilyInterfaces).
+type controlFamilyProbeSettings struct {
+	// How long one read of the interface table answers the probes that start
+	// after it began. The table is the host's, and every probe in the process
+	// asks it the same question: each extender sampler pass, peer pinger,
+	// pinned transport hold and activation pass, in every provider of a
+	// process that runs many. A process that runs no path change through
+	// NetworkChanged (the ios app process) still sees a new table within this
+	// long. Non-positive reads the table for every probe.
+	InterfaceReadReuseTimeout time.Duration
+	// The only clock the shared read reads.
+	Now func() time.Time
+}
+
+// A new instance on every call.
+func defaultControlFamilyProbeSettings() *controlFamilyProbeSettings {
+	return &controlFamilyProbeSettings{
+		InterfaceReadReuseTimeout: 2 * time.Second,
+		Now:                       time.Now,
+	}
+}
+
+// the enumeration seam and the read the probes share, separate from the
+// ledger's mutex because probeFamilySupport runs while the ledger is held.
 var controlFamilyProbeSource = struct {
-	mu         sync.Mutex
+	stateLock  sync.Mutex
 	interfaces func() ([]controlFamilyInterface, error)
+	settings   *controlFamilyProbeSettings
+	// the last read, nil before the first one and after a network change or a
+	// seam swap
+	read *controlFamilyInterfaceRead
 }{
 	interfaces: hostControlFamilyInterfaces,
+	settings:   defaultControlFamilyProbeSettings(),
+}
+
+// A read that ended without a result, which a probe takes for an unreadable
+// table.
+var errControlFamilyInterfaceReadIncomplete = errors.New("the interface table read did not complete")
+
+// One read of the interface table. Its result is written once, before done
+// closes, and is read only after done closes. The interfaces are shared by
+// every probe that takes the read, so nothing may write to them.
+type controlFamilyInterfaceRead struct {
+	startTime  time.Time
+	done       chan struct{}
+	interfaces []controlFamilyInterface
+	err        error
+}
+
+// The interface table, read at most once per reuse window for the whole
+// process (controlFamilyProbeSettings). A probe that starts inside the window
+// of a read that is still out waits for it, and one that starts after the
+// window reads again, so a read that never returns holds only the probes of
+// its own window. A read that failed answers only the probes that waited on
+// it, so an unreadable table is never taken for longer than one read. A
+// network change or a seam swap drops the read.
+func controlFamilyInterfaces() ([]controlFamilyInterface, error) {
+	read, enumerate := func() (*controlFamilyInterfaceRead, func() ([]controlFamilyInterface, error)) {
+		controlFamilyProbeSource.stateLock.Lock()
+		defer controlFamilyProbeSource.stateLock.Unlock()
+		settings := controlFamilyProbeSource.settings
+		now := settings.Now()
+		if read := controlFamilyProbeSource.read; read != nil {
+			// a clock that went back does not extend a read
+			age := now.Sub(read.startTime)
+			if 0 <= age && age < settings.InterfaceReadReuseTimeout {
+				select {
+				case <-read.done:
+					if read.err == nil {
+						return read, nil
+					}
+				default:
+					return read, nil
+				}
+			}
+		}
+		read := &controlFamilyInterfaceRead{
+			startTime: now,
+			done:      make(chan struct{}),
+			err:       errControlFamilyInterfaceReadIncomplete,
+		}
+		controlFamilyProbeSource.read = read
+		return read, controlFamilyProbeSource.interfaces
+	}()
+	if enumerate != nil {
+		func() {
+			// the waiters are released even when the enumeration panics, and
+			// they take the incomplete read for an unreadable table
+			defer close(read.done)
+			interfaces, err := enumerate()
+			read.interfaces, read.err = interfaces, err
+		}()
+	} else {
+		<-read.done
+	}
+	return read.interfaces, read.err
+}
+
+// Drops the shared read, so the next probe reads the table again. Wired to
+// NetworkChanged: the addresses of the old path are no evidence about the new
+// one. A read that is out still answers the probes waiting on it.
+func controlFamilyInterfaceReadClear() {
+	controlFamilyProbeSource.stateLock.Lock()
+	defer controlFamilyProbeSource.stateLock.Unlock()
+	controlFamilyProbeSource.read = nil
 }
 
 // controlFamilyTunnelInterfacePrefixes are the interface names a tunnel takes
@@ -487,7 +589,9 @@ var controlFamilyReservedPrefixes = []*net.IPNet{
 // sync.Once, so they answer for whatever network the process started on and
 // never re-evaluate across a wifi/cellular switch. A stale "yes, IPv4 works"
 // is exactly the wrong answer for the guard that keeps a demotion from taking
-// an IPv6-only user offline.
+// an IPv6-only user offline. The table is read through the shared read
+// instead (controlFamilyInterfaces), which answers for one short window and is
+// dropped by a network change.
 //
 // FAILS CLOSED. An unreadable interface table means "no evidence", and the
 // only job this function has is to REFUSE a dangerous demotion. A refused
@@ -509,11 +613,7 @@ func probeFamilyAddress(family int, accept func(ip net.IP) bool) bool {
 // probeFamilyAddress, and whether the interface table could be read at all, for
 // the one caller that must not take an unreadable table for a no.
 func probeFamilyAddressReadable(family int, accept func(ip net.IP) bool) (found bool, readable bool) {
-	controlFamilyProbeSource.mu.Lock()
-	enumerate := controlFamilyProbeSource.interfaces
-	controlFamilyProbeSource.mu.Unlock()
-
-	ifaces, err := enumerate()
+	ifaces, err := controlFamilyInterfaces()
 	if err != nil {
 		return false, false
 	}
@@ -811,14 +911,31 @@ func ControlFamilyStatus() string {
 func swapControlFamilyInterfaces(
 	interfaces func() ([]controlFamilyInterface, error),
 ) func() {
-	controlFamilyProbeSource.mu.Lock()
-	defer controlFamilyProbeSource.mu.Unlock()
+	controlFamilyProbeSource.stateLock.Lock()
+	defer controlFamilyProbeSource.stateLock.Unlock()
 	prev := controlFamilyProbeSource.interfaces
 	controlFamilyProbeSource.interfaces = interfaces
+	// a read of the previous source must not answer for this one
+	controlFamilyProbeSource.read = nil
 	return func() {
-		controlFamilyProbeSource.mu.Lock()
-		defer controlFamilyProbeSource.mu.Unlock()
+		controlFamilyProbeSource.stateLock.Lock()
+		defer controlFamilyProbeSource.stateLock.Unlock()
 		controlFamilyProbeSource.interfaces = prev
+		controlFamilyProbeSource.read = nil
+	}
+}
+
+func swapControlFamilyProbeSettings(settings *controlFamilyProbeSettings) func() {
+	controlFamilyProbeSource.stateLock.Lock()
+	defer controlFamilyProbeSource.stateLock.Unlock()
+	prev := controlFamilyProbeSource.settings
+	controlFamilyProbeSource.settings = settings
+	controlFamilyProbeSource.read = nil
+	return func() {
+		controlFamilyProbeSource.stateLock.Lock()
+		defer controlFamilyProbeSource.stateLock.Unlock()
+		controlFamilyProbeSource.settings = prev
+		controlFamilyProbeSource.read = nil
 	}
 }
 
