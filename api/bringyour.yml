@@ -2251,10 +2251,14 @@ paths:
       description: |
         What became of the certificate request an activation carried
         (lag.dev/PLAN.md A8, C4). An open tier extender serves the lag.dev
-        measurement API under one name, its `extender_id` under the
-        measurement zone, and asks for a certificate for that name in
-        `measurement_csr` on an activation; the operator orders it from the
-        CA and keeps the zone's address records for the name (C5, C8).
+        measurement API under its measurement name, its `extender_id` under
+        the measurement zone, and under `<extender_id>.ipv4.<zone>` and
+        `<extender_id>.ipv6.<zone>`, which resolve in one IP family alone
+        (lag.dev/DRIFTTEST.md K6). It asks for a certificate for all three
+        names, or for the measurement name alone as an extender from before
+        K6 does, in `measurement_csr` on an activation; the operator orders
+        it from the CA and keeps the zone's address records for the names
+        (C5, C8).
 
         Requires a CLIENT jwt: the one the extender activated with. The
         answer is for an extender that client activated -- the one with
@@ -2268,7 +2272,11 @@ paths:
           again on a backoff, and keep serving an installed certificate.
         - `issued`: `chain_pem` is the chain for `names`, the leaf first.
           Install it. A renewal at two thirds of its lifetime answers
-          `issued` with a new chain (C6). Read the expiry from the leaf.
+          `issued` with a new chain (C6). Read the expiry from the leaf. A
+          request for all three names from an extender whose certificate is
+          for its measurement name alone waits under the weekly cap, as a
+          new set of names to the CA, and meanwhile is answered `issued`
+          with that certificate and its renewals.
         - `refused`: the request cannot be issued, and `reason` says why.
           Keep serving an installed certificate until it expires.
         - `withdrawn`: the certificate for `names` was withdrawn and is
@@ -2285,6 +2293,11 @@ paths:
         queue; one for the name and key already held, pending or issued,
         changes nothing. An activation without `measurement_csr` leaves the
         stored request as it is.
+
+        `family_names` is true in every answer of an operator that issues for
+        the family-pinned names. An operator from before K6 leaves it out and
+        refuses a request for more than the measurement name, so an extender
+        that reads an answer without it asks for its measurement name alone.
       operationId: extenderMeasurementCert
       security:
         - BearerAuth: []
@@ -6163,8 +6176,11 @@ paths:
         `client_ip` is required: the visitor's address as your server sees
         it. A run counts only when it starts from that address; the api keeps
         only a peppered hash of its /29 (IPv6 /56), and deletes it once no run
-        can start. A run from the other address family counts, with
-        `client_ip_matches: null` for you to judge.
+        can start, and its country, which every run is judged against. The
+        widget starts runs over `client_ip`'s address family. A run that still
+        starts from the other family reads `client_ip_matches: null`; it
+        counts only when its address is in `client_ip`'s country, and then
+        the verdict's `bound` is false.
 
         The token is `dt1_` and 43 characters of base64url, 32 random bytes.
         The api stores only its SHA-256. It is good for 6 runs, one at a
@@ -22999,8 +23015,9 @@ components:
         client_ip_matches:
           description: |
             Whether the run started from `client_ip`; null when it started
-            from the other address family. A run that does not match never
-            enters a verdict.
+            from the other address family, which counts only from
+            `client_ip`'s country. A run that does not match never enters a
+            verdict.
           type: [boolean, "null"]
         extenders:
           description: The extenders the run was ticketed with, spares apart.
@@ -23014,7 +23031,9 @@ components:
         outcome:
           description: |
             Once complete: `counted`, or why the run stays out of the
-            verdict; `failed` for a run of a test that failed.
+            verdict: `ip_family_mismatch` for a run from the other address
+            family outside `client_ip`'s country, or whose sessions mostly
+            took the other family; `failed` for a run of a test that failed.
           type: string
           enum: [counted, ip_mismatch, ip_family_mismatch, stopped_early, too_few_extenders, reports_missing, failed]
 
@@ -23024,12 +23043,15 @@ components:
         - family
       properties:
         country_code:
-          description: The IP country, ISO 3166-1 alpha-2, lower case.
+          description: |
+            client_ip's country, ISO 3166-1 alpha-2, lower case, looked up when
+            the test was allocated. Every run is judged against it, never
+            against the country of the address a run started from.
           type: string
         country_name:
           type: string
         family:
-          description: The address family the run started from, 4 or 6.
+          description: The address family of the runs judged, 4 or 6; client_ip's before any run.
           type: integer
 
     LagDriftEllipse:
@@ -23080,8 +23102,9 @@ components:
           type: [number, "null"]
         margin_km:
           description: |
-            `distance_km` less `significance_km`: positive only when the
-            whole region is outside the IP country.
+            `distance_km` less `significance_km`, to 0.1 km: positive exactly
+            when the whole region is outside the IP country, and then at least
+            0.1; otherwise at most 0.
           type: [number, "null"]
         ellipse_km:
           $ref: "#/components/schemas/LagDriftEllipse"
@@ -23129,10 +23152,20 @@ components:
             - reports_missing
             - stopped_early
         runs_in_verdict:
-          description: The runs pooled for the verdict, at most the last 3 that count.
+          description: |
+            The runs pooled for the verdict: at most the last 3 that count, all
+            of the family of the latest that counts.
           type: array
           items:
             type: integer
+        bound:
+          description: |
+            Whether every run in the verdict matched client_ip in its family.
+            False when a run from client_ip's other family counted, which it
+            does only from client_ip's own country, or when no run is in the
+            verdict. A customer that needs protection against relays can
+            require it.
+          type: boolean
         pending_run:
           description: A run whose verdict is not in yet, else null.
           type: [integer, "null"]
@@ -23242,6 +23275,12 @@ components:
             or for development `http://localhost` or `http://127.0.0.1` on any
             port.
           type: string
+        unpinned:
+          description: |
+            Set when the frame, pointed at `pin`, couldn't reach it: the run
+            goes ahead from client_ip's other family. Such a run counts only
+            from client_ip's own country, and leaves the verdict unbound.
+          type: boolean
 
     LagDriftIpPlace:
       description: The place the caller's address resolves to, which the radar centers on.
@@ -23287,9 +23326,12 @@ components:
           $ref: "#/components/schemas/LagExtenderLocation"
 
     LagDriftStartResult:
+      description: |
+        A start that arrives over client_ip's other family without `unpinned`
+        is answered with `pin` alone: no run is used and no limit is counted.
+        Every other answer has `runs_left`.
       type: object
-      required:
-        - runs_left
+      required: []
       properties:
         drift_test_id:
           description: Absent for the `demo` token.
@@ -23324,6 +23366,14 @@ components:
           format: date-time
         error:
           $ref: "#/components/schemas/LagDriftError"
+        pin:
+          description: |
+            The API's origin in client_ip's family, such as
+            `https://api4.bringyour.com`, for a start that arrived over the
+            other family. The frame sends the same start there, and once more
+            here with `unpinned` if it can't connect within 3 s.
+          type: string
+          format: uri
 
     LagDriftFinishArgs:
       type: object
@@ -25416,13 +25466,21 @@ components:
           enum: [none, pending, issued, refused, withdrawn]
         names:
           description: |
-            The extender's one measurement name, `<extender_id>.<zone>`:
-            the request's when `pending` or `refused`, the certificate's when
-            `issued`, the withdrawn certificate's when `withdrawn`. Empty for
-            `none`, and for a request that could not be read.
+            The extender's measurement names: `<extender_id>.<zone>` alone,
+            or with `<extender_id>.ipv4.<zone>` and `<extender_id>.ipv6.<zone>`
+            (lag.dev/DRIFTTEST.md K6). The request's when `pending` or
+            `refused`, the certificate's when `issued`, the withdrawn
+            certificate's when `withdrawn`. Empty for `none`, and for a
+            request that could not be read.
           type: array
           items:
             type: string
+        family_names:
+          description: |
+            True: the operator issues for the family-pinned names (K6) as
+            well as the measurement name. An operator from before K6 leaves it
+            out, and refuses a request for more than the measurement name.
+          type: boolean
         key_sha256:
           description: |
             Hex SHA-256 of the SubjectPublicKeyInfo (DER) of the key the
