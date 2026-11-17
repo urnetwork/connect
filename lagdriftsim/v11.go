@@ -145,6 +145,11 @@ func v11VerdictTable(drift *studyResult) string {
 
 // The V11 section of the report, when its parts ran.
 func writeV11(b *strings.Builder, results map[string]*studyResult) {
+	if table, ok := results["V11 table"]; ok {
+		fmt.Fprintf(b, "### V11's fixed table on drift verdicts\n\n")
+		fmt.Fprintf(b, "The hybrid choice, 3 runs, each visitor judged at V11's 99%% k for the address's continent (NA 3.25, SA 3.50, AF 3.95, OC 7.88, AS 3.35, EU 3.035, AN and unknown 3.49), k_early KEarly(k). Per continent of the address, after 1, 2 and 3 runs: the region's misses for tiny-country visitors with their Wilson interval, false rejects, and power. Where the misses run over 1%%, the k they'd need: their 99%% quantile, rounded up to 0.05.\n\n")
+		b.WriteString(v11TableCheck(table) + "\n")
+	}
 	lag, okLag := results["V11: lag.dev tracks"]
 	if !okLag {
 		return
@@ -164,4 +169,39 @@ func writeV11(b *strings.Builder, results map[string]*studyResult) {
 		fmt.Fprintf(b, "Drift verdicts at %s (tiny-country visitors for the region's misses; k_early is KEarly(k)):\n\n", named.name)
 		b.WriteString(v11VerdictTable(named.result) + "\n")
 	}
+}
+
+// V11's table on drift geometry, per continent of the address: the k, and
+// after 1, 2 and 3 runs the region's misses (tiny-country visitors), false
+// rejects (tiny and real countries) and power (claims 300, 1,000 and 3,000
+// km away), with a flag where the misses run over 1% and the k they'd need,
+// the 99% quantile rounded up to 0.05.
+func v11TableCheck(result *studyResult) string {
+	t := &table{header: []string{"Continent", "k", "Runs", "Tiny visitors", "Region misses", "False rejects: tiny", "real countries", "Power: 300 km", "1,000 km", "3,000 km", "Over 1%: k needed"}}
+	for _, continent := range append(slices.Clone(v11Continents), "All") {
+		of := func(s *visitorSummary) bool { return continent == "All" || s.continent == continent }
+		k := "per continent"
+		if continent != "All" {
+			k = fmt.Sprintf("%.3f", result.config.kByContinent[continent])
+		}
+		for run := 0; run < result.runs(); run++ {
+			tiny := func(s *visitorSummary) bool { return of(s) && s.scenario == scenarioTiny }
+			fitted := func(s *visitorSummary) bool { return tiny(s) && s.runs[0][run].fitted }
+			misses := result.rateOf(fitted, 0, run, func(r runSummary) bool { return r.v11K < r.truthM })
+			disagree := func(r runSummary) bool { return r.v11Verdict == lagdrift.VerdictDisagree }
+			flag := ""
+			if 0.01 < misses.value() {
+				needed := result.empiricalK(fitted, 0, run, lagdrift.DefaultConfidence)
+				flag = fmt.Sprintf("**%.2f**", math.Ceil(needed/0.05-1e-9)*0.05)
+			}
+			row := []string{continent, k, fmt.Sprint(run + 1), formatThousands(float64(misses.n)), misses.String(),
+				result.rateOf(tiny, 0, run, disagree).short(),
+				result.rateOf(func(s *visitorSummary) bool { return of(s) && s.scenario == scenarioRealHonest }, 0, run, disagree).short()}
+			for _, sc := range []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000} {
+				row = append(row, result.rateOf(func(s *visitorSummary) bool { return of(s) && s.scenario == sc }, 0, run, disagree).short())
+			}
+			t.add(append(row, flag)...)
+		}
+	}
+	return t.String()
 }

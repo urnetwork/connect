@@ -269,8 +269,23 @@ func v11Parts(seed uint64, scale float64) []*studyPart {
 			}
 		}
 	}
-	return []*studyPart{lag, defaults, calibrated}
+	// V11's table as the user fixed it, on drift geometry, with enough
+	// tiny-country visitors per continent to see a 1% rate, and claims for
+	// power
+	table := &studyPart{
+		name:   "V11 table",
+		about:  "the hybrid choice, 3 runs, judged at V11's fixed 99% table for the address's continent, k_early KEarly(k)",
+		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}),
+		counts: append(counted(scale, 2000, scenarioTiny), append(counted(scale, 500, scenarioRealHonest), counted(scale, 300, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)...),
+	}
+	table.config.choiceMode = choiceHybrid
+	table.config.kByContinent = v11Table99
+	return []*studyPart{lag, defaults, calibrated, table}
 }
+
+// V11's fixed 99% table (lag.dev/DRIFTTEST.md V11, the user's decision of
+// 2026-11-17), by GeoLite2 continent, "" for AN and unknown.
+var v11Table99 = map[string]float64{"NA": 3.25, "SA": 3.50, "AF": 3.95, "OC": 7.88, "AS": 3.35, "EU": 3.035, "AN": 3.49, "": 3.49}
 
 // Where the region's excess misses come from: honest visitors, one run each,
 // in worlds that each take away a source of error the model's variance

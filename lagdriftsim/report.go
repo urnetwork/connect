@@ -866,25 +866,33 @@ func calibrationWorldTable(parts []*studyPart, results map[string]*studyResult) 
 	return t.String()
 }
 
-// The k at each confidence whose region would miss the truth at the nominal
+// The k at a confidence whose region would miss the truth at the nominal
 // rate: the quantile of the truth's Mahalanobis distance from the fit, over
-// fitted verdicts. Nominal: 2.448, 3.035 and 3.717.
-func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int) []string {
+// fitted verdicts; NaN without any.
+func (self *studyResult) empiricalK(filter visitorFilter, policy int, run int, confidence float64) float64 {
 	ms := []float64{}
 	for _, s := range self.summaries {
 		if filter(s) && s.runs[policy][run].fitted {
 			ms = append(ms, s.runs[policy][run].truthM)
 		}
 	}
+	if len(ms) == 0 {
+		return math.NaN()
+	}
 	slices.Sort(ms)
+	return ms[min(len(ms)-1, max(0, int(math.Ceil(confidence*float64(len(ms))))-1))]
+}
+
+// empiricalK at each of the study's confidences, formatted. Nominal: 2.448,
+// 3.035 and 3.717.
+func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int) []string {
 	out := []string{}
 	for _, c := range confidences {
-		if len(ms) == 0 {
+		if k := self.empiricalK(filter, policy, run, c); math.IsNaN(k) {
 			out = append(out, "–")
-			continue
+		} else {
+			out = append(out, fmt.Sprintf("%.2f", k))
 		}
-		i := min(len(ms)-1, int(math.Ceil(c*float64(len(ms))))-1)
-		out = append(out, fmt.Sprintf("%.2f", ms[max(0, i)]))
 	}
 	return out
 }
