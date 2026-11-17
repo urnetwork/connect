@@ -42,7 +42,11 @@ type studyConfig struct {
 	// more extender sites, for a denser fleet
 	extraSites []extenderSite
 	// the runs each visitor makes: 1 to 3, 0 for 3
-	runs     int
+	runs int
+	// V10's cadence: the frame refits warm at each ping round and runs the
+	// full multi-start when its extenders change, every 2 s and before any
+	// stop; without it, the full multi-start at every ping round
+	cadence  bool
 	policies []stopPolicy
 	// every this many visitors, the study checks its stops and verdicts
 	// against lagdrift.EvaluateStop and lagdrift.Decide
@@ -101,6 +105,7 @@ type studyResult struct {
 	decideMismatches []string
 	fitChecks        fitChecks
 	fitCosts         [fitKinds]fitCost
+	withdrawnStops   int
 	// visitors a scenario couldn't place (no claim at its distance, a city
 	// outside its country's borders)
 	skipped map[string]int
@@ -190,6 +195,7 @@ func runStudy(w *world, config *studyConfig, specs []*visitorSpec) *studyResult 
 		for kind := range result.fitCosts {
 			result.fitCosts[kind].merge(outcome.fitCosts[kind])
 		}
+		result.withdrawnStops += outcome.withdrawnStops
 	}
 	return result
 }

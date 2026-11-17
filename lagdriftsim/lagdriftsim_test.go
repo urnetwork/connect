@@ -204,6 +204,9 @@ func TestStudyMatchesLagdriftAndReproduces(t *testing.T) {
 	counts := []scenarioCount{{scenario: scenarioTiny, perRegion: 1}, {scenario: scenarioClaim1000, perRegion: 1}}
 	specs, _ := buildVisitors(w, 7, counts, 0)
 	config := baseConfig(7, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(3)})
+	// the full fit at every ping round, so every stop can be checked against
+	// EvaluateStop on the same snapshots
+	config.cadence = false
 	config.runs = 2
 	config.checkEvery = 1
 	config.workers = 1
@@ -268,5 +271,42 @@ func TestReport(t *testing.T) {
 	}
 	if _, err := runParts(Options{Seed: 3, Parts: []string{"none"}}, []*studyPart{part}); err == nil {
 		t.Errorf("a study with no part to run made a report")
+	}
+}
+
+// V10's cadence: the frame refits warm between full fits, the study times
+// both, its stops are V10's rules on that history, and it reproduces whatever
+// the number of workers.
+func TestCadence(t *testing.T) {
+	w := newWorld(worldConfig{seed: 11}, nil)
+	counts := []scenarioCount{{scenario: scenarioTiny, perRegion: 1}, {scenario: scenarioClaim1000, perRegion: 1}}
+	specs, _ := buildVisitors(w, 11, counts, 0)
+	config := baseConfig(11, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(3)})
+	config.cadence = true
+	config.runs = 2
+	config.workers = 1
+	one := runStudy(w, &config, specs)
+	if one.fitCosts[fitRefitSingle].fits == 0 || one.fitCosts[fitFrameSingle].fits == 0 {
+		t.Fatalf("refits %d and full fits %d of single runs", one.fitCosts[fitRefitSingle].fits, one.fitCosts[fitFrameSingle].fits)
+	}
+	if one.fitCosts[fitRefitSingle].fits <= one.fitCosts[fitFrameSingle].fits {
+		t.Errorf("%d refits for %d full fits: the full fit should run only on changes, every 2 s and before a stop",
+			one.fitCosts[fitRefitSingle].fits, one.fitCosts[fitFrameSingle].fits)
+	}
+	for _, s := range one.summaries {
+		for _, row := range s.runs {
+			for run := 0; run < config.runs; run++ {
+				if r := row[run]; r.stopMs < lagdrift.StopEarliestMs || lagdrift.StopCapMs < r.stopMs || r.reason == "" {
+					t.Errorf("visitor %d run %d stopped at %d ms as %q", s.index, run+1, r.stopMs, r.reason)
+				}
+			}
+		}
+	}
+	config.workers = 4
+	four := runStudy(w, &config, specs)
+	for i := range one.summaries {
+		if !reflect.DeepEqual(one.summaries[i].runs, four.summaries[i].runs) {
+			t.Fatalf("visitor %d differs with 4 workers", i)
+		}
 	}
 }

@@ -106,6 +106,8 @@ func baseConfig(seed uint64, policies []stopPolicy) studyConfig {
 		modelKappa:   lagdrift.DefaultKappa,
 		policies:     policies,
 		checkEvery:   7,
+		// V10's cadence, once lagdrift has its warm refit
+		cadence: refitPosition != nil,
 	}
 }
 
@@ -145,9 +147,14 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 		return part
 	}
 
+	// κ matched in the world and the model, and the model's 0.25 against
+	// another world's and the reverse
 	kappa := []*studyPart{}
 	for _, truthKappa := range []float64{0.15, 0.25, 0.35} {
 		for _, modelKappa := range []float64{0.15, 0.25, 0.35} {
+			if truthKappa != modelKappa && truthKappa != lagdrift.DefaultKappa && modelKappa != lagdrift.DefaultKappa {
+				continue
+			}
 			part := single("κ "+formatK(truthKappa)+"/"+formatK(modelKappa), "κ "+formatK(truthKappa)+" in the world, "+formatK(modelKappa)+" in the model, one run",
 				[]stopPolicy{v10Policy(lagdrift.EarlyK)},
 				append(counted(scale, 150, scenarioTiny), counted(scale, 100, scenarioLargeEdge, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...))
@@ -168,6 +175,16 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	normal.config.stretchShape = stretchNormal
 
 	parts := []*studyPart{main, noEarly}
+	if refitPosition != nil {
+		// the same visitors with V10's cadence and with the full multi-start
+		// at every ping round
+		counts := append(counted(scale, 300, scenarioTiny), counted(scale, 100, scenarioLargeEdge, scenarioRealHonest, scenarioClaim300, scenarioClaim1000)...)
+		refits := &studyPart{name: "cadence: refits", about: "V10's cadence: a warm refit at each ping round, the full multi-start when the extenders change, every 2 s and before any stop", config: baseConfig(seed, sweepPolicies()), counts: counts}
+		refits.config.cadence = true
+		full := &studyPart{name: "cadence: full fits", about: "the same visitors with the full multi-start at every ping round", config: baseConfig(seed, sweepPolicies()), counts: counts}
+		full.config.cadence = false
+		parts = append(parts, refits, full)
+	}
 	parts = append(parts, kappa...)
 	parts = append(parts, variants, misplaced, normal)
 	return append(parts, oceaniaParts(seed, scale)...)

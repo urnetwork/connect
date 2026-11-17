@@ -604,3 +604,71 @@ func mergedFitCosts(parts []*studyPart, results map[string]*studyResult) [fitKin
 func durationMs(d time.Duration) string {
 	return strings.TrimSuffix(strings.TrimRight(fmt.Sprintf("%.2f", float64(d.Microseconds())/1000), "0"), ".")
 }
+
+// The cadence against the full fit at every ping round, per k_early: the
+// rule's outcome, the worst false-reject cell at 99% and 99.9%, the median
+// stop, and how many runs stopped elsewhere or ended in another verdict.
+func cadenceTable(refits *studyResult, full *studyResult) string {
+	t := &table{header: []string{"k_early", "Rule: cadence", "full fits", "Worst cell at 99%: cadence", "full fits", "at 99.9%: cadence", "full fits", "Median stop, s: cadence", "full fits", "Runs that stop elsewhere", "Verdicts at 99% that differ"}}
+	refitChecks, _ := recommendEarlyK(refits)
+	fullChecks, _ := recommendEarlyK(full)
+	ruleOf := func(checks []earlyKCheck, k float64) string {
+		for _, check := range checks {
+			if check.k == k {
+				if check.holds {
+					return "holds"
+				}
+				return fmt.Sprintf("fails (%d)", len(check.failures))
+			}
+		}
+		return "–"
+	}
+	worst := func(result *studyResult, policy int, c int) string {
+		w := rate{}
+		for _, sc := range result.present(honestScenarios) {
+			for run := 0; run < result.runs(); run++ {
+				r := result.rateOf(ofScenario(sc), policy, run, verdictIs(c, lagdrift.VerdictDisagree))
+				if w.n == 0 || w.value() < r.value() {
+					w = r
+				}
+			}
+		}
+		return w.short()
+	}
+	for p, policy := range refits.config.policies {
+		q := full.policyIndex(policy.name)
+		if q < 0 {
+			continue
+		}
+		moved, differ, n := 0, 0, 0
+		for i, s := range refits.summaries {
+			o := full.summaries[i]
+			if s.index != o.index {
+				continue
+			}
+			for run := 0; run < refits.runs(); run++ {
+				n += 1
+				if s.runs[p][run].stopMs != o.runs[q][run].stopMs {
+					moved += 1
+				}
+				if s.runs[p][run].verdicts[1] != o.runs[q][run].verdicts[1] {
+					differ += 1
+				}
+			}
+		}
+		all := func(*visitorSummary) bool { return true }
+		times := func(result *studyResult, policy int) []int64 {
+			ts := []int64{}
+			for run := 0; run < result.runs(); run++ {
+				ts = append(ts, result.stopTimes(all, policy, run)...)
+			}
+			slices.Sort(ts)
+			return ts
+		}
+		t.add(formatK(policy.earlyK), ruleOf(refitChecks, policy.earlyK), ruleOf(fullChecks, policy.earlyK),
+			worst(refits, p, 1), worst(full, q, 1), worst(refits, p, 2), worst(full, q, 2),
+			quantile(times(refits, p), 0.5), quantile(times(full, q), 0.5),
+			rate{k: moved, n: n}.short(), rate{k: differ, n: n}.short())
+	}
+	return t.String()
+}

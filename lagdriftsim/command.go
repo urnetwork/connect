@@ -190,6 +190,14 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 		b.WriteString(t.String() + "\n")
 	}
 
+	if refits, ok := results["cadence: refits"]; ok {
+		if full, ok := results["cadence: full fits"]; ok {
+			section("V10's cadence")
+			paragraph("The same visitors, 3 runs each: the frame's fit by V10's cadence (a warm refit at each ping round, the full multi-start when the extenders change, every 2 s and before any stop) and by the full multi-start at every ping round. Under the cadence, %d stops were withdrawn because the full fit before them landed in another basin.", refits.withdrawnStops)
+			b.WriteString(cadenceTable(refits, full) + "\n")
+		}
+	}
+
 	kappaRows := &table{header: comparisonHeader}
 	for _, part := range parts {
 		result, ok := results[part.name]

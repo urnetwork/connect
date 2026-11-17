@@ -106,10 +106,21 @@ type tickState struct {
 	// Judge's D against the IP country, once asked for
 	d      float64
 	judged bool
+	// under the cadence: the fit was the full multi-start, and its
+	// observations, for the full fit before a stop
+	full bool
+	obs  []lagdrift.Observation
 }
 
 // One run's sessions, and what the frame sees at each ping round, given the
 // runs before it that the verdict holds.
+//
+// Under V10's cadence the frame refits from the warm fit at each ping round
+// and runs the full multi-start when the extenders in the fit change, at least
+// every 2 s, and before any stop. When that last one lands in another basin,
+// the stop is withdrawn and the steadiness window restarts from it: the run
+// goes on in a fork of the trace, which every policy that would have stopped
+// there shares.
 type runTrace struct {
 	sim      *visitorSim
 	run      int
@@ -121,6 +132,17 @@ type runTrace struct {
 	// per session: the answered pings the last estimate is from, and it
 	estimateCounts []int
 	estimates      []lagdrift.RoundTrip
+
+	cadence bool
+	// the steadiness window looks no further back than this history index
+	historyFrom int
+	// the last full fit: when, and over which extenders
+	lastFullMs  int64
+	lastFullSet string
+	// the full fit before a stop at a ping round, and the fork it leads to
+	// when it lands in another basin
+	preStops map[int]*lagdrift.Fit
+	forks    map[int]*runTrace
 }
 
 // What one run of one policy came to.
@@ -162,6 +184,8 @@ type visitorOutcome struct {
 	decideMismatches []string
 	fitChecks        fitChecks
 	fitCosts         [fitKinds]fitCost
+	// stops the full fit before them withdrew (V10's cadence)
+	withdrawnStops int
 }
 
 // The fit's own checks (the acceptance test of V5's starts): a warm refit
@@ -369,7 +393,7 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 		}
 		trace := self.trace(run, strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), prior)
 		tick, reason := trace.stopFor(policy)
-		if self.checks && policy.isLagdrift() {
+		if self.checks && policy.isLagdrift() && !trace.cadence {
 			trace.checkStops(tick)
 		}
 		obs := trace.serverObservations(tick, policy.roundTrips)
@@ -411,9 +435,24 @@ func (self *visitorSim) trace(run int, priorKey string, prior []lagdrift.Observa
 		prior:          prior,
 		estimateCounts: make([]int, len(self.sessions[run])),
 		estimates:      make([]lagdrift.RoundTrip, len(self.sessions[run])),
+		cadence:        self.config.cadence,
+		preStops:       map[int]*lagdrift.Fit{},
+		forks:          map[int]*runTrace{},
 	}
 	self.traces[key] = t
 	return t
+}
+
+// The extenders of observations, as a key.
+func extenderSet(obs []lagdrift.Observation) string {
+	ids := []string{}
+	for _, o := range obs {
+		if !slices.Contains(ids, o.ExtenderId) {
+			ids = append(ids, o.ExtenderId)
+		}
+	}
+	slices.Sort(ids)
+	return strings.Join(ids, ",")
 }
 
 // The frame's state after ping round j (1 to the cap), computed in order.
@@ -460,7 +499,22 @@ func (self *runTrace) compute(j int) *tickState {
 	}
 	if fitExtenders <= len(obs) || fitExtenders <= distinctExtenders(self.prior) {
 		all := append(append([]lagdrift.Observation{}, self.prior...), obs...)
-		fit, err := self.sim.fit(all, self.warm, false)
+		var fit *lagdrift.Fit
+		var err error
+		if self.cadence {
+			state.obs = all
+			set := extenderSet(all)
+			state.full = self.warm == nil || set != self.lastFullSet || lagdrift.StopWindowMs <= atMs-self.lastFullMs
+			if state.full {
+				fit, err = self.sim.fit(all, self.warm, false)
+				self.lastFullMs = atMs
+				self.lastFullSet = set
+			} else {
+				fit, err = self.sim.refit(all, self.warm)
+			}
+		} else {
+			fit, err = self.sim.fit(all, self.warm, false)
+		}
 		if err == nil {
 			state.fit = fit
 			self.warm = fit
@@ -511,26 +565,94 @@ func (self *runTrace) d(j int) float64 {
 }
 
 // Where a policy stops the run: the first ping round from 3 s at which a rule
-// holds, in EvaluateStop's order, and the rule.
+// holds, in EvaluateStop's order, and the rule. Under the cadence, a stop on a
+// warm refit first runs the full fit, and goes on in a fork when that lands in
+// another basin.
 func (self *runTrace) stopFor(policy stopPolicy) (int, lagdrift.StopReason) {
+	trace := self
 	first := int(lagdrift.StopEarliestMs / tickMs)
 	for j := first; j <= capTicks; j++ {
-		state := self.tick(j)
-		if lagdrift.StopInterruptedMs <= state.atMs-state.lastPongMs {
-			return j, lagdrift.StopInterrupted
+		reason, ok := trace.rule(policy, j)
+		if !ok {
+			continue
 		}
-		enough := state.fit != nil && enoughRoundTrips(state.roundTrips, policy.extenders, policy.roundTrips)
-		if enough && !math.IsInf(policy.earlyK, 1) && policy.earlyK <= self.d(j) {
-			return j, lagdrift.StopClear
+		if trace.cadence && (reason == lagdrift.StopClear || reason == lagdrift.StopConverged) && !trace.tick(j).full {
+			if fork := trace.forkAt(j); fork != nil {
+				self.sim.outcome.withdrawnStops += 1
+				trace = fork
+				continue
+			}
 		}
-		if enough && policy.converged && steady(self.history[:j], state.atMs, state.fit, policy.windowMs, policy.areaRatio) {
-			return j, lagdrift.StopConverged
-		}
-		if lagdrift.StopCapMs <= state.atMs {
-			return j, lagdrift.StopCap
-		}
+		return j, reason
 	}
 	return capTicks, lagdrift.StopCap
+}
+
+// The rule that holds at ping round j under a policy, if one does.
+func (self *runTrace) rule(policy stopPolicy, j int) (lagdrift.StopReason, bool) {
+	state := self.tick(j)
+	if lagdrift.StopInterruptedMs <= state.atMs-state.lastPongMs {
+		return lagdrift.StopInterrupted, true
+	}
+	enough := state.fit != nil && enoughRoundTrips(state.roundTrips, policy.extenders, policy.roundTrips)
+	if enough && !math.IsInf(policy.earlyK, 1) && policy.earlyK <= self.d(j) {
+		return lagdrift.StopClear, true
+	}
+	if enough && policy.converged && steady(self.history[self.historyFrom:j], state.atMs, state.fit, policy.windowMs, policy.areaRatio) {
+		return lagdrift.StopConverged, true
+	}
+	if lagdrift.StopCapMs <= state.atMs {
+		return lagdrift.StopCap, true
+	}
+	return "", false
+}
+
+// A fork lands in another basin farther than this from the refit, km.
+const basinKm = 1
+
+// The fork the full fit before a stop at ping round j leads to, or nil when it
+// stays in the refit's basin.
+func (self *runTrace) forkAt(j int) *runTrace {
+	if fork, ok := self.forks[j]; ok {
+		return fork
+	}
+	state := self.tick(j)
+	full, ok := self.preStops[j]
+	if !ok {
+		var err error
+		full, err = self.sim.fit(state.obs, state.fit, false)
+		if err != nil {
+			full = nil
+		}
+		self.preStops[j] = full
+	}
+	if full == nil || lagdrift.DistanceKm(full.At, state.fit.At) <= basinKm {
+		self.forks[j] = nil
+		return nil
+	}
+	forkState := *state
+	forkState.fit = full
+	forkState.full = true
+	forkState.judged = false
+	fork := &runTrace{
+		sim:            self.sim,
+		run:            self.run,
+		sessions:       self.sessions,
+		prior:          self.prior,
+		ticks:          append(slices.Clone(self.ticks[:j-1]), &forkState),
+		history:        append(slices.Clone(self.history[:j-1]), lagdrift.Snapshot{AtMs: state.atMs, Fit: full, RoundTrips: state.roundTrips}),
+		warm:           full,
+		estimateCounts: slices.Clone(self.estimateCounts),
+		estimates:      slices.Clone(self.estimates),
+		cadence:        true,
+		historyFrom:    j - 1,
+		lastFullMs:     state.atMs,
+		lastFullSet:    extenderSet(state.obs),
+		preStops:       map[int]*lagdrift.Fit{},
+		forks:          map[int]*runTrace{},
+	}
+	self.forks[j] = fork
+	return fork
 }
 
 // At least extenders have roundTrips each.
@@ -647,7 +769,8 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			v.reasons[i] = lagdrift.ReasonLowPrecision
 		}
 		if err == nil {
-			v.recordFit(fit, self.spec.truth, math.NaN())
+			// no region test: D is +Inf, as Judge gives with no country
+			v.recordFit(fit, self.spec.truth, math.Inf(1))
 		}
 		return v
 	}
@@ -733,6 +856,22 @@ func fitKindOf(server bool, obs []lagdrift.Observation) fitKind {
 	default:
 		return fitFrameSingle
 	}
+}
+
+// V10's warm refit. A variable so the study's parts can tell whether the
+// cadence is there to run.
+var refitPosition = lagdrift.RefitPosition
+
+// The frame's warm refit, timed.
+func (self *visitorSim) refit(obs []lagdrift.Observation, warm *lagdrift.Fit) (*lagdrift.Fit, error) {
+	kind := fitRefitSingle
+	if fitKindOf(false, obs) == fitFramePooled {
+		kind = fitRefitPooled
+	}
+	start := time.Now()
+	f, err := refitPosition(self.model, self.spec.ipPlace, obs, warm)
+	self.outcome.fitCosts[kind].add(time.Since(start))
+	return f, err
 }
 
 // lagdrift.FitPosition from the address's place, timed: the frame fits after
