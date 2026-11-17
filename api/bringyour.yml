@@ -1466,9 +1466,13 @@ paths:
         a marked client inherits its marks. The reply confirms them. Until the
         second stage of the client-token fix is live, a call that would end in
         a `strict_exp` token, an inherited mark included, is refused outside
-        the deployment's preview networks with `error.message` "This network
-        cannot hold sidecar clients yet.", and nothing is created. A sidecar's
-        JWT calls this route only with a `DPoP` proof of its client's key.
+        the deployment's preview networks: the call answers 200 with
+        `error.code` `not_preview` and `error.message` "This network cannot
+        hold sidecar clients yet.", and nothing is created. A client tells
+        this refusal by its code, never its message; `POST /network/enroll`
+        refuses with the same code. No other refusal of this route carries a
+        code. A sidecar's JWT calls this route only with a `DPoP` proof of its
+        client's key.
 
         Like roles or a principal the call may not set, a `proxy_config`
         the call cannot use is refused before anything is created: the call
@@ -18355,6 +18359,16 @@ components:
                 rate was spent: try another location, or best available.
               type: boolean
             message:
+              type: string
+            code:
+              description: |
+                The refusal's structured code, which a client reads in place
+                of `message`. Absent for a refusal with no code, which is every
+                refusal but one:
+                - `not_preview`: the network is outside the sidecar preview. A
+                  call that would end in a `strict_exp` token is refused until
+                  the second stage of the client-token fix is live, outside the
+                  deployment's preview networks, and nothing is created.
               type: string
 
     ClientDataCapArgs:
