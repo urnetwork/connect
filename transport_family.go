@@ -12,7 +12,12 @@ package connect
 // backend-degraded gate. A pinned transport that cannot possibly connect is
 // HELD rather than spun: it sleeps while the device has no path of its family
 // and idles while a Force policy contradicts it, and it wakes on a network
-// change or a policy change.
+// change or a policy change. An address of the family is not a path when the
+// routing has no route for it -- a host whose only addresses of the family are
+// ULA or link-local, or whose default route of the family is scoped to a vpn's
+// tunnel -- so a dial in which every attempt was refused with no route also
+// puts the transport to sleep, for a hold that doubles while the refusals
+// continue and ends at once on a network change (pinnedRouteHold).
 //
 // The family reaches the dial layers by two routes, because the transport does
 // not own them. A context value narrows the network inside
@@ -50,6 +55,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -397,6 +403,149 @@ func (self *pinnedDialBackoff) reset() {
 	self.failures = 0
 }
 
+// pinnedRouteHoldState is a no-route hold as one comparable value.
+type pinnedRouteHoldState struct {
+	// the refused dials since the last connection or network change, at most
+	// one per hold
+	strikes int
+	// the hold in force, zero when none is
+	hold time.Duration
+	// counts the holds started, so a timer ends only the hold it was armed for
+	generation uint64
+}
+
+// pinnedRouteHold is a pinned transport's memory that the routing has no route
+// for its family (IPV6.md A5). The probe counts an address of the family as a
+// path, but a host whose only addresses of the family are ULA or link-local,
+// or whose default route of the family is scoped to a vpn's tunnel, refuses
+// every dial of it at once with no route, and the transport used to redial on
+// its backoff forever, an auth error each time, with nothing leaving the host.
+//
+// A dial whose every attempt the routing refused (dialRouteRefused) starts a
+// hold: the transport sleeps, as without an address of the family, until the
+// hold runs out, the path changes or the policy moves it. Each refused dial
+// after a hold ran out doubles the next hold, from
+// PinnedNoRouteHoldTimeout up to PinnedNoRouteHoldMaxTimeout. A connection or
+// a network change forgets the strikes. A non-positive base, and a nil hold --
+// a family-agnostic transport's -- hold nothing.
+//
+// Safe for concurrent use. The state is a MonitorValue, so the hold watcher
+// (runFamilyHoldWatcher) wakes on every change.
+type pinnedRouteHold struct {
+	base  time.Duration
+	max   time.Duration
+	state *MonitorValue[pinnedRouteHoldState]
+}
+
+func newPinnedRouteHold(base time.Duration, max time.Duration) *pinnedRouteHold {
+	return &pinnedRouteHold{
+		base:  base,
+		max:   max,
+		state: NewMonitorValue(pinnedRouteHoldState{}),
+	}
+}
+
+// refuse records a dial the routing refused and starts a hold, unless one is
+// in force: the mode runners of a transport dial together, and one round of
+// their refusals is one strike. Returns the hold it started, zero when it
+// started none.
+func (self *pinnedRouteHold) refuse() time.Duration {
+	if self == nil || self.base <= 0 {
+		return 0
+	}
+	started := time.Duration(0)
+	self.state.Update(func(state pinnedRouteHoldState) pinnedRouteHoldState {
+		if 0 < state.hold {
+			return state
+		}
+		if state.strikes < 62 {
+			state.strikes += 1
+		}
+		hold := self.base
+		for i := 1; i < state.strikes && hold < self.max; i += 1 {
+			// compare against half the cap, since doubling could overflow
+			if self.max/2 < hold {
+				hold = self.max
+				break
+			}
+			hold *= 2
+		}
+		state.hold = max(self.base, min(hold, self.max))
+		state.generation += 1
+		started = state.hold
+		return state
+	})
+	return started
+}
+
+// get returns the state and a channel that closes on its next change.
+func (self *pinnedRouteHold) get() (pinnedRouteHoldState, chan struct{}) {
+	if self == nil {
+		return pinnedRouteHoldState{}, nil
+	}
+	return self.state.Get()
+}
+
+func (self *pinnedRouteHold) value() pinnedRouteHoldState {
+	if self == nil {
+		return pinnedRouteHoldState{}
+	}
+	return self.state.Value()
+}
+
+// end ends the hold of `generation` if it is still the one in force. The
+// strikes stay, so the next refused dial holds longer.
+func (self *pinnedRouteHold) end(generation uint64) {
+	if self == nil {
+		return
+	}
+	self.state.Update(func(state pinnedRouteHoldState) pinnedRouteHoldState {
+		if state.generation == generation {
+			state.hold = 0
+		}
+		return state
+	})
+}
+
+// reset forgets the strikes and ends any hold in force.
+func (self *pinnedRouteHold) reset() {
+	if self == nil {
+		return
+	}
+	self.state.Update(func(state pinnedRouteHoldState) pinnedRouteHoldState {
+		state.strikes = 0
+		state.hold = 0
+		return state
+	})
+}
+
+// dialRouteRefused reports whether a failed dial met no route on every attempt
+// it made: each cause is a no route from the routing (isNoRouteErrno), and none
+// failed any other way. The deadline or cancellation that closes an exhausted
+// strategy budget (HttpRequestExhaustedError) is no attempt's answer and
+// counts neither way, but a dial that ended on those alone was refused
+// nothing. The causes are the exhaustion's own bounded walk
+// (flattenHttpRequestCauses), whose incomplete or overflowing tree leaves a
+// cause of another kind.
+func dialRouteRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	refused := false
+	for _, cause := range flattenHttpRequestCauses(err) {
+		switch cause.err {
+		case context.Canceled, context.DeadlineExceeded:
+			continue
+		}
+		errno, ok := cause.err.(syscall.Errno)
+		if !ok || !isNoRouteErrno(errno) {
+			return false
+		}
+		refused = true
+	}
+	return refused
+}
+
 // ClientLimitBackoff is the client limit hold of this transport, shared with
 // the other transports of its client when its settings carried one
 // (transport_client_limit.go).
@@ -518,42 +667,89 @@ func (self *PlatformTransport) heldNotify() (bool, chan struct{}) {
 }
 
 // refreshFamilyHold re-evaluates a pinned transport's own reasons not to dial.
-// Policy first: a Force is definitive and cheaper than an interface walk.
+// Policy first: a Force is definitive and cheaper than an interface walk. An
+// address of the family does not wake a transport whose no-route hold is in
+// force (pinnedRouteHold). The mode runner that starts a no-route hold
+// refreshes at once, beside the hold watcher, so familyHoldLock makes each
+// evaluation and its swap one step: of two refreshes, the later one reads the
+// later evidence and its swap stands.
 func (self *PlatformTransport) refreshFamilyHold() {
 	if !self.pinned() {
 		return
 	}
 	hold := PlatformTransportStateConnecting
-	if pinnedFamilyPolicyConflict(self.ipFamily) {
-		hold = PlatformTransportStateIdlePolicy
-	} else if !pinnedFamilySupported(self.ipFamily) {
-		hold = PlatformTransportStateSleeping
-	}
-	previous := PlatformTransportState(self.familyHold.Swap(int32(hold)))
+	var previous PlatformTransportState
+	var routeHold time.Duration
+	func() {
+		self.familyHoldLock.Lock()
+		defer self.familyHoldLock.Unlock()
+		if pinnedFamilyPolicyConflict(self.ipFamily) {
+			hold = PlatformTransportStateIdlePolicy
+		} else if !pinnedFamilySupported(self.ipFamily) {
+			hold = PlatformTransportStateSleeping
+		} else if routeHold = self.routeHold.value().hold; 0 < routeHold {
+			hold = PlatformTransportStateSleeping
+		}
+		previous = PlatformTransportState(self.familyHold.Swap(int32(hold)))
+	}()
 	if previous != hold {
 		// one line per transition, never per attempt: the hold exists so a
 		// family that cannot work is silent, not noisy
-		self.log.Infof("[t]ipv%d transport %s -> %s\n", self.ipFamily, previous, hold)
+		if 0 < routeHold {
+			self.log.Infof("[t]ipv%d transport %s -> %s: no route for ipv%d, next dial in %s\n", self.ipFamily, previous, hold, self.ipFamily, routeHold)
+		} else {
+			self.log.Infof("[t]ipv%d transport %s -> %s\n", self.ipFamily, previous, hold)
+		}
 	}
 	self.updateHold()
+	if previous != hold {
+		// the group releases its standby early when every pin is held, so it
+		// re-evaluates on a hold change as on a connect change (setUnresolvable)
+		self.connectedMonitor.NotifyAll()
+	}
 }
 
 // runFamilyHoldWatcher keeps a pinned transport's hold current. It wakes on a
-// network change (the kick, which the transport already subscribes to) and on
-// a control family policy change; the channels are captured before each
-// evaluation so a change between the two cannot be missed.
+// network change (the kick, which the transport already subscribes to), on a
+// control family policy change, on a change of the no-route hold, and when a
+// no-route hold runs out; the channels are captured before each evaluation so
+// a change between the two cannot be missed. The timer of a no-route hold is
+// armed once per hold, so a wake for anything else does not lengthen it.
 func (self *PlatformTransport) runFamilyHoldWatcher() {
+	var routeHoldEnd <-chan time.Time
+	var routeHoldEndGeneration uint64
 	for {
 		kick := self.kickMonitor.NotifyChannel()
 		policy := controlFamilyPolicyNotify()
+		routeHold, routeHoldChanged := self.routeHold.get()
 		self.refreshFamilyHold()
+		if routeHold.hold <= 0 {
+			routeHoldEnd = nil
+		} else if routeHoldEnd == nil || routeHoldEndGeneration != routeHold.generation {
+			routeHoldEnd = self.routeHoldAfter(routeHold.hold)
+			routeHoldEndGeneration = routeHold.generation
+		}
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-kick:
 		case <-policy:
+		case <-routeHoldChanged:
+		case <-routeHoldEnd:
+			// the next dial tries the family again; the strikes stay, so a
+			// refusal holds it twice as long
+			self.routeHold.end(routeHoldEndGeneration)
+			routeHoldEnd = nil
 		}
 	}
+}
+
+// routeHoldAfter is the timer of a no-route hold, given the hold.
+func (self *PlatformTransport) routeHoldAfter(hold time.Duration) <-chan time.Time {
+	if self.settings != nil && self.settings.routeHoldAfterForTest != nil {
+		return self.settings.routeHoldAfterForTest(hold)
+	}
+	return time.After(hold)
 }
 
 // dialContext tags a dial with the transport's settings, with the pinned family
@@ -731,11 +927,20 @@ func (self *PlatformTransport) waitDialPacing(
 
 // noteDialFailure records a failed connect. A pinned transport's failure is
 // evidence about one family on this device, not about the backend, so it only
-// feeds the transport's own backoff; the process-wide degraded gate is left to
+// feeds the transport's own backoff, and its no-route hold when the routing
+// refused every attempt of the dial; the process-wide degraded gate is left to
 // family-agnostic transports (A5).
-func (self *PlatformTransport) noteDialFailure() {
+func (self *PlatformTransport) noteDialFailure(err error) {
 	if self.pinned() {
 		self.pinnedBackoff.fail()
+		// a live connection of another mode is a route of the family,
+		// whatever this dial met
+		if dialRouteRefused(err) && !self.IsConnected() {
+			if 0 < self.routeHold.refuse() {
+				// in force before this runner can dial again
+				self.refreshFamilyHold()
+			}
+		}
 		return
 	}
 	self.failBackoff.fail()
@@ -766,11 +971,14 @@ func (self *PlatformTransport) dialRetryAfter(reconnect *Reconnect) <-chan time.
 }
 
 // noteDialSuccess clears the transport's own backoff and, for a
-// family-agnostic transport, the process-wide degraded state.
+// family-agnostic transport, the process-wide degraded state. A pinned
+// transport's connection is a route of its family, so it also forgets the
+// no-route strikes.
 func (self *PlatformTransport) noteDialSuccess() {
 	if self.pinned() {
 		self.pinnedBackoff.reset()
 		self.setUnresolvable(false)
+		self.routeHold.reset()
 		return
 	}
 	self.failBackoff.reset()
