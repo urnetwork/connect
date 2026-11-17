@@ -1,10 +1,10 @@
-// The tls session cache of the operator links that go through a supplied
-// dialer (NodeSettings.DialContext, transport_websocket.go, connect#227).
+// The tls session cache of the nodes' operator links (transport_websocket.go,
+// connect#227).
 //
-// One cache serves the whole process, by the owner's decision of 2026-11-17. A
-// miner runs a node per proxy slot, and every slot's link reaches the same
-// operator. With the cache, a link the operator refuses after tls, or one that
-// drops and is dialed again, resumes from a session any slot was issued.
+// One cache serves the whole process, by the owner's decision of 2026-11-17.
+// The nodes of one process reach the same operator. With the cache, a link the
+// operator refuses after tls, or one that drops and is dialed again, resumes
+// from a session any node was issued.
 // Without it, every attempt is a full handshake that verifies the operator's
 // whole P-384 chain, which was most of the gossip cost in the reporter's
 // profiles.

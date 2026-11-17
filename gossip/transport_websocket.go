@@ -1,14 +1,17 @@
-// The websocket transport of a node whose owner supplies a dialer
-// (NodeSettings.DialContext, EXTENDER.md D2, connect#227).
+// The websocket transport every node dials with (EXTENDER.md D2, connect#227).
 //
 // libp2p's websocket transport takes no dialer. It resolves the operator's
 // name with this host's resolver and opens the socket with net.DialTCP, so the
 // node of a miner proxy slot reached the operator from the host's own address
-// rather than through the slot's proxy. A node with a dialer dials ws and wss
-// addresses here instead, and every step of the link goes through the dialer:
-//   - The swarm hands the address over unresolved (SkipResolve), so the dialer
-//     gets the operator's name, which a socks proxy resolves on its own side.
-//   - tls runs over the dialer's stream, verified against the space's roots
+// rather than through the slot's proxy, and an app's node dialed outside the
+// space's egress binding (R1) and DialControl. Every node dials ws and wss
+// addresses here instead, through the space's dial (`ConnectSettings.DialContext`)
+// or the dialer its owner supplies (`NodeSettings.DialContext`), and every step
+// of the link goes through that dial:
+//   - The swarm hands the address over unresolved (SkipResolve), so the dial
+//     gets the operator's name: a socks proxy resolves it on its own side, and
+//     a direct dial resolves it the way every other dial of the space does.
+//   - tls runs over the dial's stream, verified against the space's roots
 //     (ConnectSettings.TlsConfig), with the process's session cache
 //     (tls_session_cache.go), so a redial resumes rather than verifying the
 //     whole chain again.
@@ -16,8 +19,7 @@
 //     exactly as over libp2p's transport.
 //
 // Listening stays with libp2p's transport. An inbound connection is not a
-// dial, and the operator, the one node that listens on websocket, supplies no
-// dialer.
+// dial.
 //
 // The transport is safe for concurrent use.
 

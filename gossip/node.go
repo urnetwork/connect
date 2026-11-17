@@ -32,14 +32,19 @@
 // protocol within `NegotiationTimeout` is reset (partner security report,
 // 2026-11-16).
 //
-// A node whose owner supplies a dialer (`DialContext`) makes every connection
-// through it: the operator link's tcp, tls and websocket upgrade
-// (transport_websocket.go), and the extender carrier's dials. The operator's
-// name goes to the dialer unresolved, so the node makes no dial and no lookup
-// from this host. A miner proxy slot supplies its proxy's dialer, so its mesh
-// traffic leaves through that proxy like the rest of the slot's traffic
-// (connect#227). A node with no dialer is unchanged: libp2p's websocket
-// transport dials the operator from this host.
+// Every connection the node makes goes through the space's dial: the operator
+// link's tcp, tls and websocket upgrade (transport_websocket.go) through
+// `ConnectSettings.DialContext`, which carries the space's proxy, its egress
+// binding (R1) and its DialControl, and the extender carrier's dials through
+// `ConnectSettings`. The operator's name goes to that dial unresolved. A node
+// whose owner supplies a dialer of its own (`DialContext`) makes every
+// connection through that one instead (connect#227).
+//
+// The node dials only what it chose: the operator addresses it was given and
+// the addresses the directory's records name, each for its own peer. A dial
+// to anything else -- an address a peer announced over identify, a peer a
+// prune's peer exchange named -- is refused before any transport sees it, and
+// gossipsub takes no peer exchange at all (`nodeGossipSubParams`).
 //
 // The node is safe for concurrent use.
 
@@ -163,21 +168,21 @@ type NodeSettings struct {
 	// Its own advertised addresses are added to ListenAddrs.
 	ExtenderListener *InProcessListener
 
-	// Dial configuration of the extender carrier. Its TlsConfig also gives the
-	// roots a `DialContext` node verifies the operator against.
+	// The space's dial configuration. The operator link dials through its
+	// DialContext -- the space's proxy, egress binding (R1) and DialControl --
+	// and verifies the operator against its TlsConfig's roots; the extender
+	// carrier dials through it as a whole. Nil takes
+	// `connect.DefaultConnectSettings()`.
 	ConnectSettings *connect.ConnectSettings
-	// When set, every connection of this node goes through this dialer: the
-	// operator link's tcp, tls and websocket upgrade, and every extender
-	// carrier dial, which then ignores ConnectSettings' own proxy and dialer.
-	// The operator's name is handed to it unresolved, for a socks proxy to
-	// resolve on its own side. A miner proxy slot passes its proxy's dialer
-	// (connect#227). Nil, the default, is the node as it always was: libp2p's
-	// websocket transport resolves the operator's name and dials it from this
-	// host, and the carrier dials through ConnectSettings.
+	// When set, every connection of this node goes through this dialer in
+	// place of `ConnectSettings`' own: the operator link's tcp, tls and
+	// websocket upgrade, and every extender carrier dial, which then ignores
+	// ConnectSettings' proxy and dialer. The operator's name is handed to it
+	// unresolved, for a socks proxy to resolve on its own side (connect#227).
+	// Nil, the default, dials through `ConnectSettings.DialContext`.
 	DialContext connect.DialContextFunction
-	// The session cache of the operator link's tls when `DialContext` is set.
-	// Nil takes the process's shared cache, which hands out each session once
-	// (tls_session_cache.go). Unused without `DialContext`.
+	// The session cache of the operator link's tls. Nil takes the process's
+	// shared cache, which hands out each session once (tls_session_cache.go).
 	TlsSessionCache tls.ClientSessionCache
 
 	// The peering round period (D3).
@@ -200,6 +205,10 @@ type NodeSettings struct {
 	// connect.NewSecureRand generator, so the choice does not follow from the
 	// clock or the node's start time; a test injects a deterministic one.
 	Rand *mathrand.Rand
+
+	// Test seam only, nil otherwise: called on pubsub's event loop each time
+	// the peer exchange of an incoming prune is dropped (`Node.inspectRpc`).
+	peerExchangeStrippedHook func(from peer.ID, peerCount int)
 }
 
 // The defaults of one role (D1, D3).
@@ -389,6 +398,9 @@ type Node struct {
 
 	stateLock     sync.Mutex
 	operatorAddrs []ma.Multiaddr
+	// the addresses the current peering round chose, per peer: the only ones
+	// the swarm may dial (node_gater.go)
+	peerIdDialAddrs map[peer.ID][]ma.Multiaddr
 
 	// statusLock serializes the read of the host and the topic with the
 	// publish of the status. Both the peering round and the topic event loop
@@ -443,7 +455,7 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		resourceLimits := *copied.ResourceLimits
 		copied.ResourceLimits = &resourceLimits
 	}
-	if copied.DialContext != nil && copied.TlsSessionCache == nil {
+	if copied.TlsSessionCache == nil {
 		copied.TlsSessionCache = processTlsSessionCache()
 	}
 	settings = &copied
@@ -543,8 +555,8 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 }
 
 // The libp2p host of D1: the extender transport in place of tcp, the websocket
-// transport for the operator (with a `DialContext`, transport_websocket.go
-// dials and libp2p's only listens), noise, yamux under this node's stream
+// transport for the operator (transport_websocket.go dials through the space's
+// dial and libp2p's only listens), noise, yamux under this node's stream
 // bounds, the node's resource manager, a connection manager, and no
 // discovery, relay, nat service or metrics of any kind. The resource manager
 // is the swarm's and the upgrader's both: the upgrader opens the scope of
@@ -593,6 +605,8 @@ func (self *Node) newHost(
 		eventBus,
 		swarm.WithDialTimeout(self.settings.DialTimeout),
 		swarm.WithResourceManager(resourceManager),
+		// only what the peering round chose is dialed (node_gater.go)
+		swarm.WithConnectionGater(&nodeDialGater{node: self}),
 	)
 	if err != nil {
 		return nil, err
@@ -644,30 +658,30 @@ func (self *Node) newHost(
 	if err := swarmNetwork.AddTransport(extenderTransport); err != nil {
 		return nil, err
 	}
+	// libp2p's websocket transport only listens: it dials with net.DialTCP
+	// from this host, outside the space's proxy, egress binding and
+	// DialControl, so every dial goes through the space's dial instead
 	websocketTransport, err := websocket.New(connUpgrader, swarmNetwork.ResourceManager(), nil)
 	if err != nil {
 		return nil, err
 	}
-	if self.settings.DialContext == nil {
-		if err := swarmNetwork.AddTransport(websocketTransport); err != nil {
-			return nil, err
-		}
-	} else {
-		// libp2p's transport still listens; the dials go through the dialer
-		dialTransport, err := newWebsocketDialTransport(&websocketDialTransportSettings{
-			DialContext:     self.settings.DialContext,
-			TlsConfig:       self.settings.ConnectSettings.TlsConfig,
-			TlsSessionCache: self.settings.TlsSessionCache,
-			Upgrader:        connUpgrader,
-			ResourceManager: swarmNetwork.ResourceManager(),
-			ListenTransport: websocketTransport,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if err := swarmNetwork.AddTransport(dialTransport); err != nil {
-			return nil, err
-		}
+	websocketDialContext := self.settings.DialContext
+	if websocketDialContext == nil {
+		websocketDialContext = self.settings.ConnectSettings.DialContext
+	}
+	dialTransport, err := newWebsocketDialTransport(&websocketDialTransportSettings{
+		DialContext:     websocketDialContext,
+		TlsConfig:       self.settings.ConnectSettings.TlsConfig,
+		TlsSessionCache: self.settings.TlsSessionCache,
+		Upgrader:        connUpgrader,
+		ResourceManager: swarmNetwork.ResourceManager(),
+		ListenTransport: websocketTransport,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := swarmNetwork.AddTransport(dialTransport); err != nil {
+		return nil, err
 	}
 
 	listenAddrs := slices.Clone(self.settings.ListenAddrs)
@@ -707,6 +721,10 @@ func (self *Node) joinTopic() error {
 	pubSub, err := pubsub.NewGossipSub(
 		self.ctx,
 		self.host,
+		// the defaults, taking no peer exchange (node_gater.go)
+		pubsub.WithGossipSubParams(nodeGossipSubParams()),
+		// and every prune's peer exchange is dropped before gossipsub reads it
+		pubsub.WithAppSpecificRpcInspector(self.inspectRpc),
 		pubsub.WithMessageSignaturePolicy(pubsub.StrictSign),
 		// A message this node originates goes to every topic peer it holds,
 		// not only to its grafted mesh. Only the operator originates (D6), and
@@ -958,6 +976,19 @@ func (self *Node) peer() {
 		addrInfos = append(addrInfos, addrInfo)
 		extenderCount += 1
 	}
+
+	// what this round chose is all the swarm may dial until the next round
+	// (node_gater.go); the previous round's dials were joined before this one
+	// began
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		peerIdDialAddrs := map[peer.ID][]ma.Multiaddr{}
+		for _, addrInfo := range addrInfos {
+			peerIdDialAddrs[addrInfo.ID] = append(peerIdDialAddrs[addrInfo.ID], addrInfo.Addrs...)
+		}
+		self.peerIdDialAddrs = peerIdDialAddrs
+	}()
 
 	if 0 < len(addrInfos) {
 		// the round's dials are in flight from here until they are joined,
