@@ -5963,6 +5963,7 @@ binding (R1) and DialControl.
   - The alt api dialers are off, and the h3 platform transport modes are not
     offered, endpoint or not: each resolves a platform name on this host before
     it dials. h1 carries the transport, and an explicit h3 target falls back to h1.
+    An extender-only strategy keeps h3, since its extender resolves the name.
   - The webrtc carrier is off, since ice gathers its own sockets.
 
   These carriers are left out where they are chosen, so none is ever tried or held
