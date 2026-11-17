@@ -90,11 +90,11 @@ func TestDialRetryAfterBacksOffOnConsecutiveFailures(t *testing.T) {
 	if !fired() {
 		t.Fatal("with no failures the retry must keep the reconnect timing")
 	}
-	transport.noteDialFailure()
+	transport.noteDialFailure(context.DeadlineExceeded)
 	if !fired() {
 		t.Fatal("the first failure must keep the reconnect timing")
 	}
-	transport.noteDialFailure()
+	transport.noteDialFailure(context.DeadlineExceeded)
 	if fired() {
 		t.Fatal("a second consecutive failure retried on the expired reconnect timer instead of backing off")
 	}
@@ -106,8 +106,8 @@ func TestDialRetryAfterBacksOffOnConsecutiveFailures(t *testing.T) {
 	}
 
 	// a network change resets the backoff
-	transport.noteDialFailure()
-	transport.noteDialFailure()
+	transport.noteDialFailure(context.DeadlineExceeded)
+	transport.noteDialFailure(context.DeadlineExceeded)
 	if fired() {
 		t.Fatal("precondition: backing off")
 	}
@@ -125,9 +125,9 @@ func TestDialRetryAfterPinnedKeepsReconnectTimer(t *testing.T) {
 
 	transport := newDialBackoffTestTransport(time.Hour, 4*time.Hour)
 	transport.ipFamily = 4
-	transport.noteDialFailure()
-	transport.noteDialFailure()
-	transport.noteDialFailure()
+	transport.noteDialFailure(context.DeadlineExceeded)
+	transport.noteDialFailure(context.DeadlineExceeded)
+	transport.noteDialFailure(context.DeadlineExceeded)
 	select {
 	case <-transport.dialRetryAfter(NewReconnect(0)):
 	case <-time.After(time.Second):

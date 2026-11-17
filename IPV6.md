@@ -93,6 +93,20 @@ Implementation check: the probe's
 reserved-range list must not exclude the 464XLAT CLAT range (192.0.0.0/29),
 or v4 over NAT64 hosts is never attempted.
 
+An address is not a route. The probe counts a ULA (fc00::/7 passes
+`IsGlobalUnicast`), so a host whose only v6 address is a ULA, or whose v6
+default routes are scoped to vpn tunnels, kept its v6 pin dialing, and every
+dial was refused at once with no route to host (2026-11-17, a macOS
+provider). A pinned dial whose every attempt the routing refused with no route
+(`EHOSTUNREACH`, `ENETUNREACH`, and their Windows socket errors) puts the
+transport to sleep as well (`pinnedRouteHold`, transport_family.go): 5 minutes
+(`PinnedNoRouteHoldTimeout`), doubling with each refusal after a hold up to an
+hour (`PinnedNoRouteHoldMaxTimeout`), ended at once by a network change and
+forgotten on a connection. The timed end matters for headless providers, which
+report no network change. A refused port, a timeout or a live connection of
+another mode proves nothing about the route and keeps the ordinary backoff.
+The ULA stays in the probe: a ULA behind NAT66 is a working path.
+
 A6. Policy. `IpFamilyForce4`/`Force6` conflicts with the opposite pinned
 transport; `controlDialNetwork` already errors on that, so the transport idles
 and the provider advertises one family. Demotions leave explicit families
