@@ -16,10 +16,13 @@ package lagdrift
 // equidistant plane centered on p̂, whitened with Σ = LLᵀ, and searched for the
 // point q nearest p̂: D = ‖L⁻¹(q − p̂)‖. D ≤ k overlaps, D > k is outside. No
 // convexity is assumed, so concave borders, holes and islands are all exact,
-// and an island inside the region counts as touching. A boundary shared by two
-// of a country's polygons, such as a cut at the antimeridian, is never the
-// nearest point to a fit outside them both, since the line to it crosses the
-// outer boundary first.
+// and an island inside the region counts as touching. Natural Earth's cuts are
+// not borders and are skipped (isCut): the edges along the antimeridian that
+// split a polygon there, and those along a pole that close Antarctica. The
+// country goes on across them, so a fit inside beside a cut is as far from
+// the boundary as from the country's real edges, and V10's clear stop holds
+// there as anywhere; for a fit outside, the line to a cut crosses a real edge
+// first.
 //
 // An edge is straight in degrees, as Natural Earth's are, so before projecting
 // an edge longer than 0.25° in latitude or longitude is split into equal parts
@@ -314,7 +317,7 @@ func (self *boundarySearch) nearestKm() (float64, float64) {
 }
 
 // Searches a closed ring's edges, starting with the one from its last point
-// to its first.
+// to its first, all but its cuts.
 func (self *boundarySearch) ring(ring []Point) {
 	n := len(ring)
 	if n == 0 {
@@ -327,13 +330,25 @@ func (self *boundarySearch) ring(ring []Point) {
 		return
 	}
 	for _, cur := range ring {
-		splitEdge(prev, cur, func(p Point) {
-			e, nn, d := self.projection.project(p)
-			self.segment(prevE, prevN, prevD, e, nn, d)
-			prevE, prevN, prevD = e, nn, d
-		})
+		if isCut(prev, cur) {
+			prevE, prevN, prevD = self.projection.project(cur)
+		} else {
+			splitEdge(prev, cur, func(p Point) {
+				e, nn, d := self.projection.project(p)
+				self.segment(prevE, prevN, prevD, e, nn, d)
+				prevE, prevN, prevD = e, nn, d
+			})
+		}
 		prev = cur
 	}
+}
+
+// An edge Natural Earth draws to cut a polygon, not a border: along the
+// antimeridian, both ends at longitude 180 or both at −180, or along a pole,
+// both ends at latitude 90 or both at −90. The country goes on across it
+// (lag.dev/DRIFTTEST.md V6).
+func isCut(a Point, b Point) bool {
+	return (math.Abs(a.Lon) == 180 && a.Lon == b.Lon) || (math.Abs(a.Lat) == 90 && a.Lat == b.Lat)
 }
 
 func (self *boundarySearch) segment(aEast float64, aNorth float64, aDistance float64, bEast float64, bNorth float64, bDistance float64) {

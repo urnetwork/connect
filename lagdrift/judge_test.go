@@ -39,7 +39,8 @@ func tiltedCov(majorKm float64, minorKm float64, bearingDeg float64) [2][2]float
 }
 
 // The Mahalanobis distance to the nearest point of the country's boundary,
-// by brute force: every edge sampled every few meters, straight in degrees.
+// by brute force: every edge sampled every few meters, straight in degrees,
+// but the cuts along the antimeridian and the poles.
 func bruteForceD(f *Fit, c *Country) float64 {
 	c00, c01, c11 := f.Cov[0][0], f.Cov[0][1], f.Cov[1][1]
 	det := c00*c11 - c01*c01
@@ -49,6 +50,10 @@ func bruteForceD(f *Fit, c *Country) float64 {
 			for i := range ring {
 				a := ring[i]
 				b := ring[(i+1)%len(ring)]
+				if (a.Lon == 180 && b.Lon == 180) || (a.Lon == -180 && b.Lon == -180) ||
+					(a.Lat == 90 && b.Lat == 90) || (a.Lat == -90 && b.Lat == -90) {
+					continue
+				}
 				steps := 2000
 				for s := 0; s <= steps; s++ {
 					q := Point{
@@ -262,6 +267,52 @@ func TestJudgeAcrossTheAntimeridian(t *testing.T) {
 		if j := Judge(fitAt(Point{Lat: 0.5, Lon: lon}, circleCov(25)), c, 0.99); !j.Inside {
 			t.Errorf("inside at %.1f: %+v", lon, j)
 		}
+	}
+}
+
+// Natural Earth's cuts are not borders (lag.dev/DRIFTTEST.md V6, V10): a fit
+// inside a country beside its cut at the antimeridian, or near the pole that
+// closes Antarctica, is as far from the boundary as from the real edges, and
+// the clear stop holds there.
+func TestJudgeSkipsNaturalEarthsCuts(t *testing.T) {
+	split := &Country{Code: "zf", Polygons: [][][]Point{
+		{boxRing(-1, 179, 1, 180)},
+		{boxRing(-1, -180, 1, -179)},
+	}}
+	// closed along the pole, as Natural Earth draws Antarctica
+	polar := &Country{Code: "zq", Polygons: [][][]Point{{{
+		{Lat: -70, Lon: -180}, {Lat: -68, Lon: -90}, {Lat: -72, Lon: 0}, {Lat: -66, Lon: 90},
+		{Lat: -70, Lon: 180}, {Lat: -90, Lon: 180}, {Lat: -90, Lon: -180},
+	}}}}
+	for _, c := range []struct {
+		name    string
+		country *Country
+		at      Point
+		sigmaKm float64
+		// the nearest real edge
+		nearest Point
+	}{
+		{name: "west of the cut", country: split, at: Point{Lat: 0, Lon: 179.9}, sigmaKm: 5, nearest: Point{Lat: 0, Lon: 179}},
+		{name: "east of the cut", country: split, at: Point{Lat: 0, Lon: -179.9}, sigmaKm: 5, nearest: Point{Lat: 0, Lon: -179}},
+		{name: "near the pole", country: polar, at: Point{Lat: -89, Lon: 0}, sigmaKm: 20, nearest: Point{Lat: -72, Lon: 0}},
+	} {
+		f := fitAt(c.at, circleCov(c.sigmaKm))
+		j := Judge(f, c.country, 0.99)
+		wantKm := DistanceKm(c.at, c.nearest)
+		if !j.Inside || math.Abs(j.D*c.sigmaKm-wantKm) > 0.01*wantKm {
+			t.Errorf("%s: D %.3f, %.1f km from the boundary, not %.1f: %+v", c.name, j.D, j.D*c.sigmaKm, wantKm, j)
+		}
+		if brute := bruteForceD(f, c.country); math.Abs(j.D-brute) > 1e-3*brute {
+			t.Errorf("%s: D %.6f, brute force %.6f", c.name, j.D, brute)
+		}
+		history := []Snapshot{{AtMs: StopEarliestMs, Fit: f, RoundTrips: []int{12, 12, 12, 12, 12, 12, 12, 12}}}
+		if reason, ok := EvaluateStop(history, 0, StopEarliestMs, StopEarliestMs, c.country, BrowserStopTolerance); !ok || reason != StopClear {
+			t.Errorf("%s: stop %q %v, not clear", c.name, reason, ok)
+		}
+	}
+	// a fit outside still finds the edge across the line
+	if j := Judge(fitAt(Point{Lat: 0, Lon: -178.5}, circleCov(25)), split, 0.99); j.Inside || math.Abs(j.DistanceKm-55.6) > 0.5 {
+		t.Errorf("outside across the line: %+v", j)
 	}
 }
 

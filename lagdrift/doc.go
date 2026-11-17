@@ -72,8 +72,11 @@
 //
 // Rings are closed implicitly: a ring's last point does not repeat its first.
 // Edges are straight in degrees and never cross the antimeridian; a polygon
-// that does is split there, as Natural Earth splits them. A point's degrees
-// are its microdegrees / 1e6.
+// that does is split there, as Natural Earth splits them. An edge along the
+// antimeridian (both ends at longitude 180, or both at −180) or along a pole
+// (both ends at latitude 90, or both at −90) is such a cut, not a border: the
+// region test and CountryAt skip it. A point's degrees are its
+// microdegrees / 1e6.
 //
 // # The world map
 //

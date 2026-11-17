@@ -688,6 +688,9 @@ func buildJudge(v *vectorsFile) {
 	add("east of the antimeridian", covFit(p6(0, -178.5), circle(25), 0, 0), antimeridan, 0.99)
 	add("west of the antimeridian", covFit(p6(0, 178.5), circle(25), 0, 0), antimeridan, 0.99)
 	add("inside across the antimeridian", covFit(p6(0.5, -179.5), circle(25), 0, 0), antimeridan, 0.99)
+	// the cut along the antimeridian is no border (judge.go's isCut)
+	add("inside beside the cut, west", covFit(p6(0, 179.9), circle(5), 0, 0), antimeridan, 0.99)
+	add("inside beside the cut, east", covFit(p6(0, -179.9), circle(5), 0, 0), antimeridan, 0.99)
 	add("the fit's antipode", covFit(p6(31.23, 121.47), circle(50), 0, 0), antipodal, 0.99)
 	add("near the pole, inside", covFit(p6(-85, 30), circle(100), 0, 0), polar, 0.99)
 	add("off the polar coast", covFit(p6(-62, 30), circle(100), 0, 0), polar, 0.99)
@@ -860,7 +863,8 @@ func buildCountryAt(v *vectorsFile) {
 		{name: "in a hole, too far", p: p6(11.5, 11.5), withinKm: 10},
 		{name: "111 km away, within 300", p: p6(-1, 1), withinKm: 300},
 		{name: "111 km away, within 100", p: p6(-1, 1), withinKm: 100},
-		{name: "across the antimeridian", p: p6(0, -179.5), withinKm: 100},
+		{name: "across the antimeridian", p: p6(0, -179.5), withinKm: 150},
+		{name: "across the antimeridian, whose cut is no border", p: p6(0, -179.5), withinKm: 100},
 		{name: "at sea", p: p6(40, -40), withinKm: 300},
 		{name: "near the pole", p: p6(-89.5, 77), withinKm: 300},
 		{name: "off the polar coast", p: p6(-66, 0), withinKm: 300},

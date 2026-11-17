@@ -153,8 +153,10 @@ func TestCountryAt(t *testing.T) {
 		// 1° south of zz, 111 km
 		{p: Point{Lat: -1, Lon: 1}, withinKm: 300, code: "zz"},
 		{p: Point{Lat: -1, Lon: 1}, withinKm: 100, code: ""},
-		// across the antimeridian from zy's sliver, 56 km
-		{p: Point{Lat: 0, Lon: -179.5}, withinKm: 100, code: "zy"},
+		// across the antimeridian from zy's sliver: its corners, 124 km, since
+		// its edge along the antimeridian is a cut, not a border
+		{p: Point{Lat: 0, Lon: -179.5}, withinKm: 150, code: "zy"},
+		{p: Point{Lat: 0, Lon: -179.5}, withinKm: 100, code: ""},
 		{p: Point{Lat: 40, Lon: -40}, withinKm: 300, code: ""},
 	}
 	for _, c := range cases {
