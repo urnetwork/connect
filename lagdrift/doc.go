@@ -20,8 +20,10 @@
 //     The 1σ ellipse comes from the position's covariance (CovEllipse).
 //     RefitPosition is the frame's cheaper refit on each tick (V10), from the
 //     warm fit alone.
-//   - V6 (Judge, KForConfidence, Decide): the visitor is outside the IP
-//     country only when the whole uncertainty region is.
+//   - V6, V11 (Judge, Decide, KForConfidence, DefaultK, KEarly): the visitor
+//     is outside the IP country only when the whole uncertainty region is,
+//     the region's k the larger of the textbook k and the continent's
+//     calibrated k.
 //   - V5 (PhysicallyPossible): the speed of light's limit, leaving one
 //     extender out.
 //   - V10 (EvaluateStop, StopHolds): when a run can stop.
@@ -154,9 +156,11 @@
 // The package extends I3's API, narrowing none of it: RoundTrip.MinMs for the
 // physical check; Fit.Runs, the run numbers Fit.LastMileMs follows, and
 // Fit.Observations; Judgement.K; StopHolds, for the server's check of a
-// reported stop; Decide, V6's verdict over a fit; CovEllipse, HeldPlaceErrorKm,
-// Country.Contains, DistanceKm, BearingDeg, MoveKm and AzimuthalKm; and
-// NewBorders, Borders.Codes and Borders.Countries, WriteBorders, ReadWorld and
-// WriteWorld. FitPosition recomputes V3's variances at every pass rather than
-// every iteration; fit.go says why.
+// reported stop; Decide, V6's verdict over a fit; KEarlyScale, V11's 1.32;
+// CovEllipse, HeldPlaceErrorKm, Country.Contains, DistanceKm, BearingDeg,
+// MoveKm and AzimuthalKm; and NewBorders, Borders.Codes and
+// Borders.Countries, WriteBorders, ReadWorld and WriteWorld. Judge and Decide
+// take V11's k where they took a confidence, and StopTolerance carries the
+// run's k_early, as I3 now says. FitPosition recomputes V3's variances at
+// every pass rather than every iteration; fit.go says why.
 package lagdrift

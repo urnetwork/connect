@@ -201,23 +201,23 @@ func TestBordersBeneluxAndGermany(t *testing.T) {
 	for _, b := range []*Borders{borders, world} {
 		be := b.Country("be")
 		k := KForConfidence(0.99)
-		d := Judge(fitAt(utrecht, circleCov(10)), be, 0.99).DistanceKm
+		d := Judge(fitAt(utrecht, circleCov(10)), be, k99).DistanceKm
 		if !(60 < d && d < 120) {
 			t.Fatalf("Utrecht is %.1f km from Belgium (%s)", d, b.Version())
 		}
-		if j := Judge(fitAt(utrecht, circleCov(d/(4*k))), be, 0.99); j.Inside || j.Overlaps || !(0 < j.MarginKm) {
+		if j := Judge(fitAt(utrecht, circleCov(d/(4*k))), be, k99); j.Inside || j.Overlaps || !(0 < j.MarginKm) {
 			t.Errorf("Utrecht against Belgium, narrow: %+v (%s)", j, b.Version())
 		}
-		if j := Judge(fitAt(utrecht, circleCov(2*d/k)), be, 0.99); j.Inside || !j.Overlaps || !(j.MarginKm <= 0) {
+		if j := Judge(fitAt(utrecht, circleCov(2*d/k)), be, k99); j.Inside || !j.Overlaps || !(j.MarginKm <= 0) {
 			t.Errorf("Utrecht against Belgium, wide: %+v (%s)", j, b.Version())
 		}
-		if j := Judge(fitAt(utrecht, circleCov(10)), b.Country("nl"), 0.99); !j.Inside || !j.Overlaps {
+		if j := Judge(fitAt(utrecht, circleCov(10)), b.Country("nl"), k99); !j.Inside || !j.Overlaps {
 			t.Errorf("Utrecht against the Netherlands: %+v (%s)", j, b.Version())
 		}
 	}
 	// the two maps agree on the distance to within the simplification
-	full := Judge(fitAt(utrecht, circleCov(10)), borders.Country("be"), 0.99)
-	simple := Judge(fitAt(utrecht, circleCov(10)), world.Country("be"), 0.99)
+	full := Judge(fitAt(utrecht, circleCov(10)), borders.Country("be"), k99)
+	simple := Judge(fitAt(utrecht, circleCov(10)), world.Country("be"), k99)
 	if d := full.DistanceKm - simple.DistanceKm; 6 < d || d < -6 {
 		t.Errorf("Utrecht is %.2f km from Belgium at 1:10m and %.2f km on the world map", full.DistanceKm, simple.DistanceKm)
 	}

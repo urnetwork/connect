@@ -20,9 +20,11 @@ const (
 	VacuumKmPerMs = 299.792458
 	// the quantile of an extender's round trips that the fit uses (V1)
 	RoundTripQuantile = 0.10
-	// the verdict's confidence when none is chosen (V6)
+	// the verdict's confidence when none is chosen (V6); V11 allows 0.95 and
+	// 0.99
 	DefaultConfidence = 0.99
-	// the region's k for a clear stop (V10)
+	// the region's least k for a clear stop (V10), the k_early of the textbook
+	// 99% k (KEarly)
 	EarlyK = 4.0
 )
 

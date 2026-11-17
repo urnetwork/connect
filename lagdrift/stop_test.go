@@ -178,6 +178,29 @@ func TestEvaluateStopClear(t *testing.T) {
 	}
 }
 
+// The clear rule uses the run's k_early (V11): a region clear of the country
+// at EarlyK isn't at Oceania's k_early.
+func TestEvaluateStopClearAtTheRunsKEarly(t *testing.T) {
+	now := int64(testOpenedMs + 3000)
+	// 1.5° west of the square, about 167 km, with σ 25 km: D ≈ 6.7
+	history := []Snapshot{{AtMs: now, Fit: stopFit(Point{Lat: 1, Lon: -1.5}, 0, 0, 25), RoundTrips: roundTripsReady(8)}}
+	for _, c := range []struct {
+		kEarly float64
+		clear  bool
+	}{
+		{kEarly: 0, clear: true},
+		{kEarly: -1, clear: true},
+		{kEarly: KEarly(DefaultK(0.99, "AN")), clear: true},
+		{kEarly: KEarly(DefaultK(0.99, "OC")), clear: false},
+	} {
+		tol := StopTolerance{AreaRatio: BrowserStopTolerance.AreaRatio, KEarly: c.kEarly}
+		reason, ok := EvaluateStop(history, testOpenedMs, now, now, squareCountry, tol)
+		if (ok && reason == StopClear) != c.clear || StopHolds(StopClear, history, testOpenedMs, now, now, squareCountry, tol) != c.clear {
+			t.Errorf("k_early %.3f: %s, %v", c.kEarly, reason, ok)
+		}
+	}
+}
+
 // When several rules hold, interrupted comes first, then clear, converged and
 // the cap.
 func TestEvaluateStopOrder(t *testing.T) {

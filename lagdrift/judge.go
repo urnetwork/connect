@@ -45,9 +45,9 @@ const (
 	minVarianceKm2 = 1e-9
 )
 
-// The k of a confidence: √χ²₂(confidence) = √(−2 ln(1 − confidence)). 2.448 at
-// 95%, 3.035 at 99% and 3.717 at 99.9%. 0 for a confidence of 0 or less, and
-// +Inf for 1 or more.
+// The textbook k of a confidence: √χ²₂(confidence) = √(−2 ln(1 − confidence)).
+// 2.448 at 95% and 3.035 at 99%. 0 for a confidence of 0 or less, and +Inf for
+// 1 or more. A run's k is never below it (V11, DefaultK).
 func KForConfidence(confidence float64) float64 {
 	if !(0 < confidence) {
 		return 0
@@ -202,13 +202,14 @@ type Judgement struct {
 	// DistanceKm − SignificanceKm: positive exactly when the whole region
 	// is outside, km
 	MarginKm float64 `json:"marginKm"`
-	// an extension of lag.dev/DRIFTTEST.md I3: the k the confidence gave
+	// an extension of lag.dev/DRIFTTEST.md I3: the k judged at
 	K float64 `json:"k"`
 }
 
-// The region test of f against c at a confidence (V6). The figures are toward
-// q, the boundary point nearest the fit in whitened space, with u the unit
-// vector from p̂ to q:
+// The region test of f against c with the region's k (V6): the run's k from
+// V11 (DefaultK, or a calibrated k), or the textbook KForConfidence. The
+// figures are toward q, the boundary point nearest the fit in whitened space,
+// with u the unit vector from p̂ to q:
 //
 //	DistanceKm = ‖q − p̂‖, 0 when inside
 //	SignificanceKm = k / √(uᵀΣ⁻¹u) = k ‖q − p̂‖ / D
@@ -219,12 +220,9 @@ type Judgement struct {
 // itself, u is undefined and SignificanceKm is the region's smallest radius,
 // k σ_minor. A nil or empty country is never touched: D, DistanceKm and
 // MarginKm are +Inf.
-func Judge(f *Fit, c *Country, confidence float64) Judgement {
-	k := KForConfidence(confidence)
-	return judgeK(f, c, k)
-}
-
-func judgeK(f *Fit, c *Country, k float64) Judgement {
+//
+// lag.dev/DRIFTTEST.md I3 (V11): Judge takes k, where it took a confidence.
+func Judge(f *Fit, c *Country, k float64) Judgement {
 	inf := math.Inf(1)
 	if f == nil || c == nil {
 		return Judgement{D: inf, DistanceKm: inf, MarginKm: inf, K: k}

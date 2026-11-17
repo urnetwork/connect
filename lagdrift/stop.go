@@ -11,9 +11,10 @@ package lagdrift
 //     trailing 2 s the ellipse's area (σ_major · σ_minor) has stayed within
 //     the tolerance's ratio and the position has moved less than a quarter of
 //     σ_minor;
-//   - clear: the same 12-round-trip minimum, and the whole region at EarlyK
-//     lies outside the IP country, or the fit is inside it and the whole
-//     region lies inside it. Both are D ≥ EarlyK (V6);
+//   - clear: the same 12-round-trip minimum, and the whole region at the
+//     run's k_early (StopTolerance.KEarly, V11) lies outside the IP country,
+//     or the fit is inside it and the whole region lies inside it. Both are
+//     D ≥ k_early (V6);
 //   - interrupted: no pong from any extender for 4 s;
 //   - cap: 12 s after the sessions opened.
 //
@@ -58,10 +59,21 @@ const (
 	StopCap         StopReason = "cap"
 )
 
-// How far converged lets the ellipse's area move: the largest area over the
-// window divided by the smallest.
+// How far converged lets the ellipse's area move, the largest area over the
+// window divided by the smallest, and the run's k_early for clear.
 type StopTolerance struct {
 	AreaRatio float64 `json:"areaRatio"`
+	// lag.dev/DRIFTTEST.md I3 (V11): the run's k_early (KEarly of its k), for
+	// the clear rule; 0, or anything not positive, means EarlyK
+	KEarly float64 `json:"kEarly"`
+}
+
+// The clear rule's k: the tolerance's KEarly, or EarlyK when it has none.
+func (self StopTolerance) kEarly() float64 {
+	if 0 < self.KEarly {
+		return self.KEarly
+	}
+	return EarlyK
 }
 
 var (
@@ -104,7 +116,8 @@ func StopHolds(reason StopReason, history []Snapshot, openedMs int64, nowMs int6
 		if !ok || latest.Fit == nil || c == nil || !c.hasBoundary() || !enoughRoundTrips(latest.RoundTrips) {
 			return false
 		}
-		return EarlyK <= judgeK(latest.Fit, c, EarlyK).D
+		kEarly := tol.kEarly()
+		return kEarly <= Judge(latest.Fit, c, kEarly).D
 	case StopConverged:
 		latest, ok := latestSnapshot(history, nowMs)
 		if !ok || latest.Fit == nil || !enoughRoundTrips(latest.RoundTrips) {

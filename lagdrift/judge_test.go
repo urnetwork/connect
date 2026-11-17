@@ -72,6 +72,9 @@ func bruteForceD(f *Fit, c *Country) float64 {
 
 var squareCountry = &Country{Code: "zz", Polygons: [][][]Point{{boxRing(0, 0, 2, 2)}}}
 
+// The textbook 99% k.
+var k99 = KForConfidence(0.99)
+
 func TestKForConfidence(t *testing.T) {
 	cases := []struct {
 		confidence float64
@@ -91,9 +94,62 @@ func TestKForConfidence(t *testing.T) {
 	}
 }
 
+// V11's defaults, by confidence and continent, never below textbook.
+func TestDefaultK(t *testing.T) {
+	k95 := KForConfidence(0.95)
+	cases := []struct {
+		confidence float64
+		continent  string
+		k          float64
+	}{
+		{confidence: 0.95, continent: "AF", k: 2.50},
+		{confidence: 0.95, continent: "oc", k: 2.79},
+		{confidence: 0.95, continent: "EU", k: k95},
+		{confidence: 0.95, continent: "na", k: k95},
+		{confidence: 0.95, continent: "", k: k95},
+		{confidence: 0.99, continent: "NA", k: 3.13},
+		{confidence: 0.99, continent: "sa", k: 3.50},
+		{confidence: 0.99, continent: "Af", k: 3.71},
+		{confidence: 0.99, continent: "OC", k: 7.88},
+		{confidence: 0.99, continent: "eu", k: k99},
+		{confidence: 0.99, continent: "AS", k: k99},
+		{confidence: 0.99, continent: "AN", k: 3.49},
+		// unknown: none, not a continent, or not GeoLite2's code
+		{confidence: 0.99, continent: "", k: 3.49},
+		{confidence: 0.99, continent: "XX", k: 3.49},
+		{confidence: 0.99, continent: " eu", k: 3.49},
+		// no default but the textbook k at a confidence V11 doesn't allow
+		{confidence: 0.999, continent: "OC", k: KForConfidence(0.999)},
+		{confidence: 0.9, continent: "AF", k: KForConfidence(0.9)},
+	}
+	for _, c := range cases {
+		if k := DefaultK(c.confidence, c.continent); k != c.k {
+			t.Errorf("%.3f %q: k %.6f, not %.6f", c.confidence, c.continent, k, c.k)
+		}
+		if k := DefaultK(c.confidence, c.continent); k < KForConfidence(c.confidence) {
+			t.Errorf("%.3f %q: k %.6f below textbook", c.confidence, c.continent, k)
+		}
+	}
+}
+
+// k_early scales with k, from EarlyK at the textbook 99% k (V11).
+func TestKEarly(t *testing.T) {
+	if KEarly(k99) != EarlyK || KEarly(3.035) != EarlyK || KEarly(KForConfidence(0.95)) != EarlyK {
+		t.Errorf("k_early at the textbook k: %.6f, %.6f, %.6f", KEarly(k99), KEarly(3.035), KEarly(KForConfidence(0.95)))
+	}
+	for _, k := range []float64{3.13, 3.49, 3.71, 7.88} {
+		if want := 4.0 / 3.035 * k; math.Abs(KEarly(k)-want) > 1e-12 || !(EarlyK < KEarly(k)) {
+			t.Errorf("k %.2f: k_early %.6f, not %.6f", k, KEarly(k), want)
+		}
+	}
+	if math.Abs(KEarlyScale-1.32) > 0.005 {
+		t.Errorf("the scale %.6f", KEarlyScale)
+	}
+}
+
 // Inside, an overlapping region, and a region clear of the country (V6).
 func TestJudgeInsideOverlapsOutside(t *testing.T) {
-	inside := Judge(fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), squareCountry, 0.99)
+	inside := Judge(fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), squareCountry, k99)
 	if !inside.Inside || !inside.Overlaps || inside.DistanceKm != 0 || !(inside.MarginKm < 0) {
 		t.Errorf("inside: %+v", inside)
 	}
@@ -102,7 +158,7 @@ func TestJudgeInsideOverlapsOutside(t *testing.T) {
 		t.Errorf("inside D %.4f", inside.D)
 	}
 	// half a degree west of the west edge, about 56 km, and σ = 30 km: D ≈ 1.85
-	near := Judge(fitAt(Point{Lat: 1, Lon: -0.5}, circleCov(30)), squareCountry, 0.99)
+	near := Judge(fitAt(Point{Lat: 1, Lon: -0.5}, circleCov(30)), squareCountry, k99)
 	if near.Inside || !near.Overlaps || !(near.D < near.K) || !(near.MarginKm <= 0) {
 		t.Errorf("overlapping: %+v", near)
 	}
@@ -110,7 +166,7 @@ func TestJudgeInsideOverlapsOutside(t *testing.T) {
 		t.Errorf("overlapping figures: %+v", near)
 	}
 	// 3° west, about 333 km
-	far := Judge(fitAt(Point{Lat: 1, Lon: -3}, circleCov(30)), squareCountry, 0.99)
+	far := Judge(fitAt(Point{Lat: 1, Lon: -3}, circleCov(30)), squareCountry, k99)
 	if far.Inside || far.Overlaps || !(far.D > far.K) || !(far.MarginKm > 0) {
 		t.Errorf("outside: %+v", far)
 	}
@@ -128,8 +184,9 @@ func TestJudgeMarginIsPositiveExactlyWhenDExceedsK(t *testing.T) {
 		major := 5 + rng.Float64()*120
 		minor := major * (0.2 + 0.8*rng.Float64())
 		f := fitAt(at, tiltedCov(major, minor, rng.Float64()*180))
-		confidence := []float64{0.95, 0.99, 0.999}[trial%3]
-		j := Judge(f, squareCountry, confidence)
+		// the textbook 95% and 99% k, and V11's widest default, Oceania's
+		k := []float64{KForConfidence(0.95), k99, 7.88}[trial%3]
+		j := Judge(f, squareCountry, k)
 		if j.Inside != squareCountry.Contains(at) {
 			t.Fatalf("inside %v at %v", j.Inside, at)
 		}
@@ -167,13 +224,13 @@ func TestJudgeTiltedEllipseClearOfTheBorder(t *testing.T) {
 	// 1.5° west of the square's west edge, about 167 km, with the ellipse long
 	// north-south: 300 km by 20 km
 	f := fitAt(Point{Lat: 1, Lon: -1.5}, tiltedCov(300, 20, 0))
-	j := Judge(f, squareCountry, 0.99)
+	j := Judge(f, squareCountry, k99)
 	if j.Overlaps || !(0 < j.MarginKm) {
 		t.Errorf("a north-south ellipse 167 km west of the square: %+v", j)
 	}
 	// turned east-west it reaches the square
 	g := fitAt(Point{Lat: 1, Lon: -1.5}, tiltedCov(300, 20, 90))
-	if j := Judge(g, squareCountry, 0.99); !j.Overlaps || 0 < j.MarginKm {
+	if j := Judge(g, squareCountry, k99); !j.Overlaps || 0 < j.MarginKm {
 		t.Errorf("an east-west ellipse 167 km west of the square: %+v", j)
 	}
 }
@@ -188,7 +245,7 @@ func TestJudgeConcaveBorder(t *testing.T) {
 	// the notch's middle: half a degree, about 56 km, from its sides
 	at := Point{Lat: 2, Lon: 1.5}
 	f := fitAt(at, circleCov(25))
-	j := Judge(f, u, 0.99)
+	j := Judge(f, u, k99)
 	if j.Inside || !j.Overlaps {
 		t.Errorf("in the notch: %+v", j)
 	}
@@ -199,7 +256,7 @@ func TestJudgeConcaveBorder(t *testing.T) {
 		t.Errorf("D %.6f, brute force %.6f", j.D, want)
 	}
 	// a tight fit in the notch is clear of the country
-	if j := Judge(fitAt(at, circleCov(10)), u, 0.99); j.Overlaps {
+	if j := Judge(fitAt(at, circleCov(10)), u, k99); j.Overlaps {
 		t.Errorf("a tight fit in the notch: %+v", j)
 	}
 }
@@ -213,12 +270,12 @@ func TestJudgeIslandInsideTheRegion(t *testing.T) {
 		{boxRing(0, 0.4, 0.02, 0.42)},
 	}}
 	f := fitAt(Point{Lat: 0, Lon: 0}, circleCov(30))
-	j := Judge(f, c, 0.99)
+	j := Judge(f, c, k99)
 	if j.Inside || !j.Overlaps || !(j.D < 1.6) {
 		t.Errorf("an island 45 km away: %+v", j)
 	}
 	// without the island, the region is clear of the mainland
-	if j := Judge(f, &Country{Code: "zi", Polygons: c.Polygons[:1]}, 0.99); j.Overlaps {
+	if j := Judge(f, &Country{Code: "zi", Polygons: c.Polygons[:1]}, k99); j.Overlaps {
 		t.Errorf("the mainland alone: %+v", j)
 	}
 }
@@ -234,11 +291,11 @@ func TestJudgeHole(t *testing.T) {
 		t.Error("the land around the hole is not")
 	}
 	// the hole's edge is a degree, about 111 km, from its center
-	tight := Judge(fitAt(center, circleCov(20)), c, 0.99)
+	tight := Judge(fitAt(center, circleCov(20)), c, k99)
 	if tight.Inside || tight.Overlaps || math.Abs(tight.DistanceKm-111) > 2 {
 		t.Errorf("a tight fit in the hole: %+v", tight)
 	}
-	loose := Judge(fitAt(center, circleCov(60)), c, 0.99)
+	loose := Judge(fitAt(center, circleCov(60)), c, k99)
 	if loose.Inside || !loose.Overlaps {
 		t.Errorf("a loose fit in the hole: %+v", loose)
 	}
@@ -253,18 +310,18 @@ func TestJudgeAcrossTheAntimeridian(t *testing.T) {
 	}}
 	// half a degree east of the eastern part, about 56 km
 	f := fitAt(Point{Lat: 0, Lon: -178.5}, circleCov(25))
-	j := Judge(f, c, 0.99)
+	j := Judge(f, c, k99)
 	if j.Inside || !j.Overlaps || math.Abs(j.DistanceKm-55.6) > 0.5 {
 		t.Errorf("east of the antimeridian: %+v", j)
 	}
 	// half a degree west of the western part
 	g := fitAt(Point{Lat: 0, Lon: 178.5}, circleCov(25))
-	if j := Judge(g, c, 0.99); j.Inside || math.Abs(j.DistanceKm-55.6) > 0.5 {
+	if j := Judge(g, c, k99); j.Inside || math.Abs(j.DistanceKm-55.6) > 0.5 {
 		t.Errorf("west of the antimeridian: %+v", j)
 	}
 	// on the line itself, inside both halves' span
 	for _, lon := range []float64{179.5, -179.5} {
-		if j := Judge(fitAt(Point{Lat: 0.5, Lon: lon}, circleCov(25)), c, 0.99); !j.Inside {
+		if j := Judge(fitAt(Point{Lat: 0.5, Lon: lon}, circleCov(25)), c, k99); !j.Inside {
 			t.Errorf("inside at %.1f: %+v", lon, j)
 		}
 	}
@@ -297,7 +354,7 @@ func TestJudgeSkipsNaturalEarthsCuts(t *testing.T) {
 		{name: "near the pole", country: polar, at: Point{Lat: -89, Lon: 0}, sigmaKm: 20, nearest: Point{Lat: -72, Lon: 0}},
 	} {
 		f := fitAt(c.at, circleCov(c.sigmaKm))
-		j := Judge(f, c.country, 0.99)
+		j := Judge(f, c.country, k99)
 		wantKm := DistanceKm(c.at, c.nearest)
 		if !j.Inside || math.Abs(j.D*c.sigmaKm-wantKm) > 0.01*wantKm {
 			t.Errorf("%s: D %.3f, %.1f km from the boundary, not %.1f: %+v", c.name, j.D, j.D*c.sigmaKm, wantKm, j)
@@ -311,7 +368,7 @@ func TestJudgeSkipsNaturalEarthsCuts(t *testing.T) {
 		}
 	}
 	// a fit outside still finds the edge across the line
-	if j := Judge(fitAt(Point{Lat: 0, Lon: -178.5}, circleCov(25)), split, 0.99); j.Inside || math.Abs(j.DistanceKm-55.6) > 0.5 {
+	if j := Judge(fitAt(Point{Lat: 0, Lon: -178.5}, circleCov(25)), split, k99); j.Inside || math.Abs(j.DistanceKm-55.6) > 0.5 {
 		t.Errorf("outside across the line: %+v", j)
 	}
 }
@@ -323,7 +380,7 @@ func TestJudgeAtTheAntipode(t *testing.T) {
 	shanghai := Point{Lat: 31.23, Lon: 121.47}
 	antipodal := &Country{Code: "za", Polygons: [][][]Point{{boxRing(-35, -62, -27, -55)}}}
 	f := fitAt(shanghai, circleCov(50))
-	j := Judge(f, antipodal, 0.99)
+	j := Judge(f, antipodal, k99)
 	if j.Inside || j.Overlaps {
 		t.Errorf("Shanghai against its antipode: %+v", j)
 	}
@@ -337,15 +394,15 @@ func TestJudgeClosedRing(t *testing.T) {
 	ring := boxRing(0, 0, 2, 2)
 	closed := &Country{Code: "zc", Polygons: [][][]Point{{append(ring, ring[0])}}}
 	f := fitAt(Point{Lat: 1, Lon: -0.7}, tiltedCov(60, 25, 70))
-	a := Judge(f, squareCountry, 0.99)
-	b := Judge(f, closed, 0.99)
+	a := Judge(f, squareCountry, k99)
+	b := Judge(f, closed, k99)
 	if a != b {
 		t.Errorf("open %+v, closed %+v", a, b)
 	}
 }
 
 func TestJudgeWithoutACountry(t *testing.T) {
-	j := Judge(fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), nil, 0.99)
+	j := Judge(fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), nil, k99)
 	if j.Overlaps || !math.IsInf(j.D, 1) {
 		t.Errorf("no country: %+v", j)
 	}

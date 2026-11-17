@@ -53,6 +53,8 @@ type vectorsFile struct {
 	HeldPlaceErrorKm   []heldPlaceVector    `json:"heldPlaceErrorKm"`
 	EstimateRoundTrip  []roundTripVector    `json:"estimateRoundTrip"`
 	KForConfidence     []kVector            `json:"kForConfidence"`
+	DefaultK           []defaultKVector     `json:"defaultK"`
+	KEarly             []kEarlyVector       `json:"kEarly"`
 	CovEllipse         []ellipseVector      `json:"covEllipse"`
 	FitPosition        []fitVector          `json:"fitPosition"`
 	RefitPosition      []fitVector          `json:"refitPosition"`
@@ -70,6 +72,7 @@ type constants struct {
 	RoundTripQuantile    float64                `json:"roundTripQuantile"`
 	DefaultConfidence    float64                `json:"defaultConfidence"`
 	EarlyK               float64                `json:"earlyK"`
+	KEarlyScale          float64                `json:"kEarlyScale"`
 	EarthRadiusKm        float64                `json:"earthRadiusKm"`
 	MsPerKm              float64                `json:"msPerKm"`
 	HuberC               float64                `json:"huberC"`
@@ -124,6 +127,17 @@ type kVector struct {
 	K          float64 `json:"k"`
 }
 
+type defaultKVector struct {
+	Confidence float64 `json:"confidence"`
+	Continent  string  `json:"continent"`
+	K          float64 `json:"k"`
+}
+
+type kEarlyVector struct {
+	K      float64 `json:"k"`
+	KEarly float64 `json:"kEarly"`
+}
+
 type ellipseVector struct {
 	Cov        [2][2]float64 `json:"cov"`
 	MajorKm    float64       `json:"majorKm"`
@@ -143,11 +157,11 @@ type fitVector struct {
 }
 
 type judgeVector struct {
-	Name       string             `json:"name"`
-	Fit        *lagdrift.Fit      `json:"fit"`
-	Country    *lagdrift.Country  `json:"country"`
-	Confidence float64            `json:"confidence"`
-	Judgement  lagdrift.Judgement `json:"judgement"`
+	Name      string             `json:"name"`
+	Fit       *lagdrift.Fit      `json:"fit"`
+	Country   *lagdrift.Country  `json:"country"`
+	K         float64            `json:"k"`
+	Judgement lagdrift.Judgement `json:"judgement"`
 }
 
 type physicalVector struct {
@@ -184,7 +198,7 @@ type decideVector struct {
 	Fit          *lagdrift.Fit          `json:"fit"`
 	Country      *lagdrift.Country      `json:"country"`
 	Observations []lagdrift.Observation `json:"observations"`
-	Confidence   float64                `json:"confidence"`
+	K            float64                `json:"k"`
 	MaxSigmaKm   float64                `json:"maxSigmaKm"`
 	Verdict      lagdrift.Verdict       `json:"verdict"`
 	Reason       lagdrift.Reason        `json:"reason"`
@@ -209,6 +223,12 @@ func r6(x float64) float64 {
 func p6(lat float64, lon float64) lagdrift.Point {
 	return lagdrift.Point{Lat: r6(lat), Lon: r6(lon)}
 }
+
+// The textbook k at 95% and 99%, as inputs: rounded to 6 decimals.
+var (
+	textbookK95 = r6(lagdrift.KForConfidence(0.95))
+	textbookK99 = r6(lagdrift.KForConfidence(0.99))
+)
 
 // An output rounded to 12 significant digits.
 func r12(x float64) float64 {
@@ -419,6 +439,7 @@ func build() vectorsFile {
 			RoundTripQuantile:    lagdrift.RoundTripQuantile,
 			DefaultConfidence:    lagdrift.DefaultConfidence,
 			EarlyK:               lagdrift.EarlyK,
+			KEarlyScale:          lagdrift.KEarlyScale,
 			EarthRadiusKm:        lagdrift.EarthRadiusKm,
 			MsPerKm:              lagdrift.MsPerKm,
 			HuberC:               lagdrift.HuberC,
@@ -491,6 +512,16 @@ func buildGeometry(v *vectorsFile) {
 	}
 	for _, c := range []float64{0.5, 0.9, 0.95, 0.99, 0.999} {
 		v.KForConfidence = append(v.KForConfidence, kVector{Confidence: c, K: r12(lagdrift.KForConfidence(c))})
+	}
+	// V11's defaults: every continent in either case, unknown ones, and
+	// confidences V11 doesn't allow
+	for _, c := range []float64{0.95, 0.99, 0.999, 0.9} {
+		for _, continent := range []string{"AF", "af", "AN", "AS", "EU", "Eu", "NA", "OC", "oc", "SA", "", "XX", " EU"} {
+			v.DefaultK = append(v.DefaultK, defaultKVector{Confidence: c, Continent: continent, K: r12(lagdrift.DefaultK(c, continent))})
+		}
+	}
+	for _, k := range []float64{0, 2.447747, 3.034854, 3.035, 3.13, 3.49, 3.5, 3.71, 7.88, 12} {
+		v.KEarly = append(v.KEarly, kEarlyVector{K: k, KEarly: r12(lagdrift.KEarly(k))})
 	}
 	covs := [][2][2]float64{
 		circle(30),
@@ -665,38 +696,42 @@ func cloneObservations(obs []lagdrift.Observation) []lagdrift.Observation {
 }
 
 func buildJudge(v *vectorsFile) {
-	add := func(name string, f *lagdrift.Fit, c *lagdrift.Country, confidence float64) {
-		v.Judge = append(v.Judge, judgeVector{Name: name, Fit: f, Country: c, Confidence: confidence, Judgement: roundJudgement(lagdrift.Judge(f, c, confidence))})
+	add := func(name string, f *lagdrift.Fit, c *lagdrift.Country, k float64) {
+		v.Judge = append(v.Judge, judgeVector{Name: name, Fit: f, Country: c, K: k, Judgement: roundJudgement(lagdrift.Judge(f, c, k))})
 	}
-	add("inside", covFit(p6(1, 1), circle(30), 0, 0), square, 0.99)
-	add("overlapping", covFit(p6(1, -0.5), circle(30), 0, 0), square, 0.99)
-	add("outside", covFit(p6(1, -3), circle(30), 0, 0), square, 0.99)
-	add("outside at 95%", covFit(p6(1, -0.9), circle(30), 0, 0), square, 0.95)
-	add("outside at 99.9%", covFit(p6(1, -0.9), circle(30), 0, 0), square, 0.999)
-	add("a long ellipse along the border", covFit(p6(1, -1.5), tilted(300, 20, 0), 0, 0), square, 0.99)
-	add("a long ellipse at the border", covFit(p6(1, -1.5), tilted(300, 20, 90), 0, 0), square, 0.99)
+	add("inside", covFit(p6(1, 1), circle(30), 0, 0), square, textbookK99)
+	add("overlapping", covFit(p6(1, -0.5), circle(30), 0, 0), square, textbookK99)
+	add("outside", covFit(p6(1, -3), circle(30), 0, 0), square, textbookK99)
+	add("outside at 95%", covFit(p6(1, -0.9), circle(30), 0, 0), square, textbookK95)
+	// V11's calibrated k: D ≈ 3.34 is outside at the textbook 99% k but not at
+	// Africa's, and D ≈ 5.56 is outside at North America's but not Oceania's
+	add("overlapping at Africa's 99% k", covFit(p6(1, -0.9), circle(30), 0, 0), square, 3.71)
+	add("outside at North America's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, 3.13)
+	add("overlapping at Oceania's 99% k", covFit(p6(1, -1.5), circle(30), 0, 0), square, 7.88)
+	add("a long ellipse along the border", covFit(p6(1, -1.5), tilted(300, 20, 0), 0, 0), square, textbookK99)
+	add("a long ellipse at the border", covFit(p6(1, -1.5), tilted(300, 20, 90), 0, 0), square, textbookK99)
 	for i := 0; i < 6; i++ {
 		at := p6(-2+6*golden(i, 0.21), -2+6*golden(i, 0.63))
 		cov := tilted(10+110*golden(i, 0.35), 5+40*golden(i, 0.85), 180*golden(i, 0.05))
-		add(fmt.Sprintf("tilted %d", i), covFit(at, cov, 0, 0), square, 0.99)
+		add(fmt.Sprintf("tilted %d", i), covFit(at, cov, 0, 0), square, textbookK99)
 	}
-	add("a concave border's notch", covFit(p6(2, 1.5), circle(25), 0, 0), u, 0.99)
-	add("a tight fit in the notch", covFit(p6(2, 1.5), circle(10), 0, 0), u, 0.99)
-	add("an island inside the region", covFit(p6(0, 0), circle(30), 0, 0), islands, 0.99)
-	add("a tight fit in a hole", covFit(p6(5, 5), circle(20), 0, 0), holed, 0.99)
-	add("a loose fit in a hole", covFit(p6(5, 5), circle(60), 0, 0), holed, 0.99)
-	add("east of the antimeridian", covFit(p6(0, -178.5), circle(25), 0, 0), antimeridan, 0.99)
-	add("west of the antimeridian", covFit(p6(0, 178.5), circle(25), 0, 0), antimeridan, 0.99)
-	add("inside across the antimeridian", covFit(p6(0.5, -179.5), circle(25), 0, 0), antimeridan, 0.99)
+	add("a concave border's notch", covFit(p6(2, 1.5), circle(25), 0, 0), u, textbookK99)
+	add("a tight fit in the notch", covFit(p6(2, 1.5), circle(10), 0, 0), u, textbookK99)
+	add("an island inside the region", covFit(p6(0, 0), circle(30), 0, 0), islands, textbookK99)
+	add("a tight fit in a hole", covFit(p6(5, 5), circle(20), 0, 0), holed, textbookK99)
+	add("a loose fit in a hole", covFit(p6(5, 5), circle(60), 0, 0), holed, textbookK99)
+	add("east of the antimeridian", covFit(p6(0, -178.5), circle(25), 0, 0), antimeridan, textbookK99)
+	add("west of the antimeridian", covFit(p6(0, 178.5), circle(25), 0, 0), antimeridan, textbookK99)
+	add("inside across the antimeridian", covFit(p6(0.5, -179.5), circle(25), 0, 0), antimeridan, textbookK99)
 	// the cut along the antimeridian is no border (judge.go's isCut)
-	add("inside beside the cut, west", covFit(p6(0, 179.9), circle(5), 0, 0), antimeridan, 0.99)
-	add("inside beside the cut, east", covFit(p6(0, -179.9), circle(5), 0, 0), antimeridan, 0.99)
-	add("the fit's antipode", covFit(p6(31.23, 121.47), circle(50), 0, 0), antipodal, 0.99)
-	add("near the pole, inside", covFit(p6(-85, 30), circle(100), 0, 0), polar, 0.99)
-	add("off the polar coast", covFit(p6(-62, 30), circle(100), 0, 0), polar, 0.99)
-	add("off the polar coast, far", covFit(p6(-50, -120), circle(100), 0, 0), polar, 0.99)
-	add("a closed ring", covFit(p6(1, -0.7), tilted(60, 25, 70), 0, 0), &lagdrift.Country{Code: "zc", Polygons: [][][]lagdrift.Point{{append(box(0, 0, 2, 2), lagdrift.Point{Lat: 0, Lon: 0})}}}, 0.99)
-	add("on the boundary", covFit(p6(1, 0), circle(30), 0, 0), square, 0.99)
+	add("inside beside the cut, west", covFit(p6(0, 179.9), circle(5), 0, 0), antimeridan, textbookK99)
+	add("inside beside the cut, east", covFit(p6(0, -179.9), circle(5), 0, 0), antimeridan, textbookK99)
+	add("the fit's antipode", covFit(p6(31.23, 121.47), circle(50), 0, 0), antipodal, textbookK99)
+	add("near the pole, inside", covFit(p6(-85, 30), circle(100), 0, 0), polar, textbookK99)
+	add("off the polar coast", covFit(p6(-62, 30), circle(100), 0, 0), polar, textbookK99)
+	add("off the polar coast, far", covFit(p6(-50, -120), circle(100), 0, 0), polar, textbookK99)
+	add("a closed ring", covFit(p6(1, -0.7), tilted(60, 25, 70), 0, 0), &lagdrift.Country{Code: "zc", Polygons: [][][]lagdrift.Point{{append(box(0, 0, 2, 2), lagdrift.Point{Lat: 0, Lon: 0})}}}, textbookK99)
+	add("on the boundary", covFit(p6(1, 0), circle(30), 0, 0), square, textbookK99)
 }
 
 func buildPhysical(v *vectorsFile) {
@@ -832,6 +867,18 @@ func buildStops(v *vectorsFile) {
 	add("not clear: too few ready", one(covFit(p6(1, -10), circle(30), 0, 0), 7), clearAt, clearAt, square, browser)
 	add("not clear: no country", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, nil, browser)
 	add("not clear: a country of no polygons", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{}}, browser)
+	// the run's k_early (V11): D ≈ 6.7 is clear at EarlyK and at Antarctica's
+	// k_early, not at Oceania's; a k_early not above 0 is EarlyK
+	kEarly := func(tol lagdrift.StopTolerance, kEarly float64) lagdrift.StopTolerance {
+		tol.KEarly = kEarly
+		return tol
+	}
+	between := one(covFit(p6(1, -1.5), circle(25), 0, 0), 8)
+	add("clear at EarlyK", between, clearAt, clearAt, square, browser)
+	add("clear at Antarctica's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(3.49))))
+	add("not clear at Oceania's k_early", between, clearAt, clearAt, square, kEarly(browser, r6(lagdrift.KEarly(7.88))))
+	add("not clear at Oceania's k_early, the server", between, clearAt, clearAt, square, kEarly(server, r6(lagdrift.KEarly(7.88))))
+	add("a k_early below 0 is EarlyK", between, clearAt, clearAt, square, kEarly(browser, -1))
 	end := int64(opened + 12000)
 	add("interrupted before clear", history(end, far, 12), end, opened+5000, square, browser)
 	add("clear before converged and the cap", history(end, far, 12), end, end, square, browser)
@@ -901,6 +948,8 @@ func buildDecide(v *vectorsFile) {
 		fit  *lagdrift.Fit
 		c    *lagdrift.Country
 		obs  []lagdrift.Observation
+		// the region's k, the textbook 99% k when 0
+		k float64
 	}{
 		{name: "no country", fit: covFit(p6(1, 1), circle(30), 0, 0), c: nil, obs: honest},
 		// a country with no boundary is unknown too (review F-04)
@@ -912,9 +961,16 @@ func buildDecide(v *vectorsFile) {
 		{name: "outside", fit: covFit(p6(1, -3), circle(30), 0, 0), c: square, obs: honest},
 		{name: "inconsistent", fit: covFit(p6(1, 1), circle(30), 0, 0), c: square, obs: impossible},
 		{name: "outside and impossible", fit: covFit(p6(1, -3), circle(30), 0, 0), c: square, obs: impossible},
+		// V11's calibrated k
+		{name: "outside at North America's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: 3.13},
+		{name: "overlapping at Oceania's 99% k", fit: covFit(p6(1, -1.5), circle(30), 0, 0), c: square, obs: honest, k: 7.88},
 	}
 	for _, c := range cases {
-		verdict, reason, j := lagdrift.Decide(c.fit, c.c, c.obs, lagdrift.DefaultConfidence, lagdrift.DefaultMaxSigmaKm)
-		v.Decide = append(v.Decide, decideVector{Name: c.name, Fit: c.fit, Country: c.c, Observations: c.obs, Confidence: lagdrift.DefaultConfidence, MaxSigmaKm: lagdrift.DefaultMaxSigmaKm, Verdict: verdict, Reason: reason, Judgement: roundJudgement(j)})
+		k := c.k
+		if k == 0 {
+			k = textbookK99
+		}
+		verdict, reason, j := lagdrift.Decide(c.fit, c.c, c.obs, k, lagdrift.DefaultMaxSigmaKm)
+		v.Decide = append(v.Decide, decideVector{Name: c.name, Fit: c.fit, Country: c.c, Observations: c.obs, K: k, MaxSigmaKm: lagdrift.DefaultMaxSigmaKm, Verdict: verdict, Reason: reason, Judgement: roundJudgement(j)})
 	}
 }

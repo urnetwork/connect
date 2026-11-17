@@ -590,7 +590,7 @@ func holdsPoint(borders *lagdrift.Borders, code string, p lagdrift.Point, mode c
 	}
 	if mode.world {
 		fit := &lagdrift.Fit{At: p, Cov: [2][2]float64{{1, 0}, {0, 1}}}
-		return lagdrift.Judge(fit, country, lagdrift.DefaultConfidence).DistanceKm <= mode.slackKm
+		return lagdrift.Judge(fit, country, lagdrift.KForConfidence(lagdrift.DefaultConfidence)).DistanceKm <= mode.slackKm
 	}
 	return false
 }

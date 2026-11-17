@@ -31,8 +31,9 @@ const (
 // place the visitor (V6), km.
 const DefaultMaxSigmaKm = 1500
 
-// The verdict of a fit against the IP country c (V6), with obs the fit's
-// observations for the physical check (V5):
+// The verdict of a fit against the IP country c (V6) with the region's k
+// (V11, as Judge takes it), and obs the fit's observations for the physical
+// check (V5):
 //
 //  1. c unknown (nil, or without a ring with a point) → inconclusive,
 //     ip_country_unknown;
@@ -44,14 +45,14 @@ const DefaultMaxSigmaKm = 1500
 //  6. otherwise → disagree, region_outside.
 //
 // The judgement is zero for the first two.
-func Decide(f *Fit, c *Country, obs []Observation, confidence float64, maxSigmaKm float64) (Verdict, Reason, Judgement) {
+func Decide(f *Fit, c *Country, obs []Observation, k float64, maxSigmaKm float64) (Verdict, Reason, Judgement) {
 	if c == nil || !c.hasBoundary() {
 		return VerdictInconclusive, ReasonIpCountryUnknown, Judgement{}
 	}
 	if f == nil || !(f.MajorKm <= maxSigmaKm) {
 		return VerdictInconclusive, ReasonLowPrecision, Judgement{}
 	}
-	j := Judge(f, c, confidence)
+	j := Judge(f, c, k)
 	switch {
 	case j.Overlaps && !PhysicallyPossible(obs, c):
 		return VerdictInconclusive, ReasonInconsistent, j
