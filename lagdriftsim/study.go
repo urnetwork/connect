@@ -8,6 +8,7 @@ package lagdriftsim
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/urnetwork/connect/lagdrift"
@@ -24,20 +25,37 @@ type studyConfig struct {
 	modelKappa float64
 	// extenders somewhere else entirely, a share of the fleet (world.go)
 	misplacedShare float64
-	// emulates a change to V5: at a b of 0, the position's covariance with b
-	// left free rather than held fixed (run.go, fit)
-	freeLastMile bool
-	policies     []stopPolicy
+	// κ as the model assumes it for one region's visitors, in place of
+	// modelKappa (a κ calibrated per continent, V4)
+	regionModelKappas map[string]float64
+	// diagnoses: the route stretch only on paths whose length is in
+	// [routeMinKm, routeMaxKm) (both 0: every path), every extender exactly at
+	// its place, and pings with no queue, jitter, spike or loss
+	routeMinKm   float64
+	routeMaxKm   float64
+	noPlaceError bool
+	idealPings   bool
+	// the model's place error for an extender at least this share of its
+	// distance from the address's place (a distance-dependent s_ext), within
+	// lagdrift's [10, 100] km hold
+	placeErrorPerKm float64
+	// more extender sites, for a denser fleet
+	extraSites []extenderSite
+	// the runs each visitor makes: 1 to 3, 0 for 3
+	runs     int
+	policies []stopPolicy
 	// every this many visitors, the study checks its stops and verdicts
 	// against lagdrift.EvaluateStop and lagdrift.Decide
 	checkEvery int
 	workers    int
 }
 
-// How many visitors a scenario has, per region.
+// How many visitors a scenario has, per region, in the regions given (none:
+// every region).
 type scenarioCount struct {
 	scenario  *scenario
 	perRegion int
+	regions   []string
 }
 
 // The parts of a visitor's outcome the tables use.
@@ -81,6 +99,8 @@ type studyResult struct {
 	stopMismatches   []string
 	decideChecks     int
 	decideMismatches []string
+	fitChecks        fitChecks
+	fitCosts         [fitKinds]fitCost
 	// visitors a scenario couldn't place (no claim at its distance, a city
 	// outside its country's borders)
 	skipped map[string]int
@@ -102,6 +122,9 @@ func buildVisitors(w *world, seed uint64, counts []scenarioCount, firstIndex int
 	for _, count := range counts {
 		sc := count.scenario
 		for _, region := range regions {
+			if 0 < len(count.regions) && !slices.Contains(count.regions, region) {
+				continue
+			}
 			cities := regionCities[region]
 			for k := 0; k < count.perRegion; k++ {
 				c := cities[k%len(cities)]
@@ -163,6 +186,10 @@ func runStudy(w *world, config *studyConfig, specs []*visitorSpec) *studyResult 
 		result.stopMismatches = append(result.stopMismatches, outcome.stopMismatches...)
 		result.decideChecks += outcome.decideChecks
 		result.decideMismatches = append(result.decideMismatches, outcome.decideMismatches...)
+		result.fitChecks.add(outcome.fitChecks)
+		for kind := range result.fitCosts {
+			result.fitCosts[kind].merge(outcome.fitCosts[kind])
+		}
 	}
 	return result
 }
@@ -223,4 +250,3 @@ func (self *studyResult) String() string {
 func kAt(i int) float64 {
 	return lagdrift.KForConfidence(confidences[i])
 }
-

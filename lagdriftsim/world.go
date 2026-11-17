@@ -79,12 +79,15 @@ type worldConfig struct {
 	// an extender that is somewhere else entirely, 300 to 1,500 km from its
 	// place: a share of the fleet, 0 in the study's main world
 	misplacedShare float64
+	// sites added to extenderSites
+	extraSites []extenderSite
 }
 
 func newWorld(config worldConfig, borders *lagdrift.Borders) *world {
 	w := &world{borders: borders}
-	for i := range extenderSites {
-		s := &extenderSites[i]
+	sites := append(slices.Clone(extenderSites), config.extraSites...)
+	for i := range sites {
+		s := &sites[i]
 		for k := 1; k <= s.count; k++ {
 			w.pool = append(w.pool, poolExtender{
 				id:   fmt.Sprintf("%s/%d", s.name, k),

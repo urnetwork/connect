@@ -53,15 +53,6 @@ func capPolicy() stopPolicy {
 	return p
 }
 
-// The k_early sweep and the cap-only baseline.
-func sweepPolicies() []stopPolicy {
-	policies := []stopPolicy{}
-	for _, k := range earlyKs {
-		policies = append(policies, v10Policy(k))
-	}
-	return append(policies, capPolicy())
-}
-
 // V10 with one of its other constants changed, at k_early.
 func variantPolicies(earlyK float64) []stopPolicy {
 	base := v10Policy(earlyK)
@@ -130,62 +121,109 @@ func counted(scale float64, perRegion int, scenarios ...*scenario) []scenarioCou
 func studyParts(seed uint64, scale float64) []*studyPart {
 	main := &studyPart{
 		name:   "main",
-		about:  "lagdrift as it is: κ 0.25 in the world and the model, the k_early sweep and the cap-only baseline",
+		about:  "lagdrift as it is: κ 0.25 in the world and the model, 3 runs, the k_early sweep",
 		config: baseConfig(seed, sweepPolicies()),
 	}
-	main.counts = append(main.counts, counted(scale, 1200, scenarioTiny)...)
-	main.counts = append(main.counts, counted(scale, 400, scenarioSmallEdge, scenarioLargeEdge, scenarioSmallCenter, scenarioLargeInland)...)
-	main.counts = append(main.counts, counted(scale, 1000, scenarioRealHonest)...)
-	main.counts = append(main.counts, counted(scale, 300, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
-	main.counts = append(main.counts, counted(scale, 300, scenarioRealClaim300, scenarioRealClaim1000, scenarioRealClaim3000)...)
+	main.counts = append(main.counts, counted(scale, 800, scenarioTiny)...)
+	main.counts = append(main.counts, counted(scale, 200, scenarioSmallEdge, scenarioLargeEdge, scenarioSmallCenter, scenarioLargeInland)...)
+	main.counts = append(main.counts, counted(scale, 500, scenarioRealHonest)...)
+	main.counts = append(main.counts, counted(scale, 150, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
+	main.counts = append(main.counts, counted(scale, 150, scenarioRealClaim300, scenarioRealClaim1000, scenarioRealClaim3000)...)
 
-	fixed := &studyPart{
-		name:   "free b",
-		about:  "the main part's visitors with V5 changed: at a b of 0, the position's covariance with b left free",
-		config: baseConfig(seed, sweepPolicies()),
-		counts: main.counts,
+	// a run that never stops early, beside V10 and V10 without clear
+	noEarly := &studyPart{
+		name:   "no early stop",
+		about:  "one run under V10, V10 without clear, and no early stop at all (the cap)",
+		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(math.Inf(1)), capPolicy()}),
+		counts: append(counted(scale, 200, scenarioTiny), counted(scale, 100, scenarioLargeEdge, scenarioClaim300, scenarioClaim1000)...),
 	}
-	fixed.config.freeLastMile = true
+	noEarly.config.runs = 1
+
+	single := func(name string, about string, policies []stopPolicy, counts []scenarioCount) *studyPart {
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, policies), counts: counts}
+		part.config.runs = 1
+		return part
+	}
 
 	kappa := []*studyPart{}
 	for _, truthKappa := range []float64{0.15, 0.25, 0.35} {
 		for _, modelKappa := range []float64{0.15, 0.25, 0.35} {
-			part := &studyPart{
-				name:   "κ " + formatK(truthKappa) + "/" + formatK(modelKappa),
-				about:  "κ " + formatK(truthKappa) + " in the world, " + formatK(modelKappa) + " in the model",
-				config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(math.Inf(1))}),
-				counts: append(counted(scale, 300, scenarioTiny), append(counted(scale, 150, scenarioLargeEdge), counted(scale, 100, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)...),
-			}
+			part := single("κ "+formatK(truthKappa)+"/"+formatK(modelKappa), "κ "+formatK(truthKappa)+" in the world, "+formatK(modelKappa)+" in the model, one run",
+				[]stopPolicy{v10Policy(lagdrift.EarlyK)},
+				append(counted(scale, 150, scenarioTiny), counted(scale, 100, scenarioLargeEdge, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...))
 			part.config.truthKappa = truthKappa
 			part.config.modelKappa = modelKappa
 			kappa = append(kappa, part)
 		}
 	}
 
-	variants := &studyPart{
-		name:   "stop rule",
-		about:  "V10's constants one at a time: round trips, the steadiness window, the area ratio, the extenders",
-		config: baseConfig(seed, variantPolicies(lagdrift.EarlyK)),
-		counts: append(counted(scale, 400, scenarioTiny, scenarioLargeEdge), counted(scale, 200, scenarioClaim300, scenarioClaim1000)...),
-	}
-
-	misplaced := &studyPart{
-		name:   "misplaced",
-		about:  "3% of extenders misplaced by 300 to 1,500 km, beyond their accuracy radius",
-		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(math.Inf(1))}),
-		counts: append(counted(scale, 400, scenarioTiny, scenarioLargeEdge), counted(scale, 200, scenarioClaim300, scenarioClaim1000)...),
-	}
+	other := append(counted(scale, 250, scenarioTiny), counted(scale, 150, scenarioLargeEdge, scenarioClaim300, scenarioClaim1000)...)
+	variants := single("stop rule", "V10's constants one at a time: round trips, the steadiness window, the area ratio, the extenders; one run",
+		variantPolicies(lagdrift.EarlyK), other)
+	misplaced := single("misplaced", "3% of extenders misplaced by 300 to 1,500 km, beyond their accuracy radius; one run",
+		[]stopPolicy{v10Policy(lagdrift.EarlyK)}, other)
 	misplaced.config.misplacedShare = 0.03
-
-	normal := &studyPart{
-		name:   "normal stretch",
-		about:  "the route stretch normal, the model's own assumption, rather than skewed and floored",
-		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(math.Inf(1))}),
-		counts: misplaced.counts,
-	}
+	normal := single("normal stretch", "the route stretch normal, the model's own assumption, rather than skewed and floored; one run",
+		[]stopPolicy{v10Policy(lagdrift.EarlyK)}, other)
 	normal.config.stretchShape = stretchNormal
 
-	parts := []*studyPart{main, fixed}
+	parts := []*studyPart{main, noEarly}
 	parts = append(parts, kappa...)
-	return append(parts, variants, misplaced, normal)
+	parts = append(parts, variants, misplaced, normal)
+	return append(parts, oceaniaParts(seed, scale)...)
+}
+
+// The k_early sweep.
+func sweepPolicies() []stopPolicy {
+	policies := []stopPolicy{}
+	for _, k := range earlyKs {
+		policies = append(policies, v10Policy(k))
+	}
+	return policies
+}
+
+// The Oceania diagnosis: Oceania's visitors, one run each, in worlds that
+// each take one source of error away (what causes its regions to miss), and
+// under models that each try one remedy (what a remedy costs in power).
+func oceaniaParts(seed uint64, scale float64) []*studyPart {
+	only := []string{regionOceania}
+	counts := []scenarioCount{
+		{scenario: scenarioTiny, perRegion: max(1, int(math.Round(scale*1200))), regions: only},
+		{scenario: scenarioLargeEdge, perRegion: max(1, int(math.Round(scale*300))), regions: only},
+		{scenario: scenarioRealHonest, perRegion: max(1, int(math.Round(scale*400))), regions: only},
+		{scenario: scenarioClaim300, perRegion: max(1, int(math.Round(scale*200))), regions: only},
+		{scenario: scenarioClaim1000, perRegion: max(1, int(math.Round(scale*200))), regions: only},
+	}
+	part := func(name string, about string, tweak func(*studyConfig)) *studyPart {
+		config := baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+		config.runs = 1
+		tweak(&config)
+		return &studyPart{name: "Oceania: " + name, about: about, config: config, counts: counts}
+	}
+	return []*studyPart{
+		part("base", "the study's world", func(c *studyConfig) {}),
+		part("normal stretch", "the route stretch normal and unfloored: no long tail of detours", func(c *studyConfig) { c.stretchShape = stretchNormal }),
+		part("no long-path error", "no route error on paths of 2,500 km or more", func(c *studyConfig) { c.routeMaxKm = 2500 }),
+		part("no short-path error", "no route error on paths under 2,500 km", func(c *studyConfig) {
+			c.routeMinKm = 2500
+			c.routeMaxKm = math.Inf(1)
+		}),
+		part("no place error", "every extender exactly at its place", func(c *studyConfig) { c.noPlaceError = true }),
+		part("ideal pings", "no queue, jitter, spike or loss", func(c *studyConfig) { c.idealPings = true }),
+		part("denser fleet", "9 more extenders: Adelaide, Canberra, Hobart, Darwin, Wellington, Christchurch, Port Moresby, Suva, Nouméa", func(c *studyConfig) {
+			c.extraSites = oceaniaExtraSites
+		}),
+		part("model κ 0.30", "the model's κ 0.30 for Oceania (a κ calibrated per continent, V4)", func(c *studyConfig) {
+			c.regionModelKappas = map[string]float64{regionOceania: 0.30}
+		}),
+		part("model κ 0.35", "the model's κ 0.35 for Oceania", func(c *studyConfig) {
+			c.regionModelKappas = map[string]float64{regionOceania: 0.35}
+		}),
+		part("model κ 0.45", "the model's κ 0.45 for Oceania", func(c *studyConfig) {
+			c.regionModelKappas = map[string]float64{regionOceania: 0.45}
+		}),
+		part("s_ext by distance", "each extender's place error at least 5% of its distance from the address's place, within lagdrift's [10, 100] km hold", func(c *studyConfig) {
+			c.placeErrorPerKm = 0.05
+		}),
+	}
 }

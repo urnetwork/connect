@@ -15,5 +15,7 @@
 //
 // Every draw comes from a generator keyed by the study's seed and by what it
 // draws for, so a study reproduces exactly whatever order its workers run in.
-// cmd/drift-sim runs the study and writes the tables into REPORT.md.
+// cmd/drift-sim runs the study and writes REPORT.md from end to end: its
+// method, its summary and the k_early its rule picks, its findings and its
+// tables all come from the program and the run.
 package lagdriftsim

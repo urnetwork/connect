@@ -2,7 +2,10 @@ package lagdriftsim
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/connect/lagdrift"
@@ -198,9 +201,10 @@ func TestStretchMoments(t *testing.T) {
 // out the same whatever the number of workers.
 func TestStudyMatchesLagdriftAndReproduces(t *testing.T) {
 	w := newWorld(worldConfig{seed: 7}, nil)
-	counts := []scenarioCount{{scenario: scenarioTiny, perRegion: 3}, {scenario: scenarioClaim1000, perRegion: 2}}
+	counts := []scenarioCount{{scenario: scenarioTiny, perRegion: 1}, {scenario: scenarioClaim1000, perRegion: 1}}
 	specs, _ := buildVisitors(w, 7, counts, 0)
-	config := baseConfig(7, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(3), capPolicy()})
+	config := baseConfig(7, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(3)})
+	config.runs = 2
 	config.checkEvery = 1
 	config.workers = 1
 	one := runStudy(w, &config, specs)
@@ -216,5 +220,53 @@ func TestStudyMatchesLagdriftAndReproduces(t *testing.T) {
 		if !reflect.DeepEqual(one.summaries[i].runs, four.summaries[i].runs) {
 			t.Fatalf("visitor %d differs with 4 workers", i)
 		}
+	}
+}
+
+// drift-sim's report: a tiny study's REPORT.md has its summary and
+// recommendation, its method, its findings and its tables, and WriteReport
+// writes it as it is.
+func TestReport(t *testing.T) {
+	part := &studyPart{
+		name:   "main",
+		about:  "a tiny k_early sweep",
+		config: baseConfig(3, []stopPolicy{v10Policy(lagdrift.EarlyK), v10Policy(math.Inf(1))}),
+		counts: []scenarioCount{{scenario: scenarioTiny, perRegion: 1}, {scenario: scenarioClaim1000, perRegion: 1}},
+	}
+	part.config.runs = 1
+	report, err := runParts(Options{Seed: 3, Scale: 1, CommandLine: "go run ./lagdriftsim/cmd/drift-sim -seed=3"}, []*studyPart{part})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# The drift test's error rates",
+		"## Summary",
+		"- **k_early: ",
+		"- **False rejects** at ",
+		"- **Power** at 99%",
+		"## How the study works",
+		"go run ./lagdriftsim/cmd/drift-sim -seed=3",
+		"## Findings",
+		"**The k_early sweep.**",
+		"## Tables",
+		"### False rejects: lagdrift",
+		"### k_early: lagdrift",
+		"### What a fit costs",
+		"### Checks against lagdrift",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("the report lacks %q", want)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "REPORT.md")
+	if err := WriteReport(path, report); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil || string(written) != report {
+		t.Fatalf("WriteReport wrote %d bytes of %d: %v", len(written), len(report), err)
+	}
+	if _, err := runParts(Options{Seed: 3, Parts: []string{"none"}}, []*studyPart{part}); err == nil {
+		t.Errorf("a study with no part to run made a report")
 	}
 }

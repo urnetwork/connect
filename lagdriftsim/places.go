@@ -163,6 +163,20 @@ var extenderSites = []extenderSite{
 	site("Casablanca", "ma", 33.5731, -7.5898, 1),
 }
 
+// A denser Oceania, for the study's diagnosis of its regions: Australia's
+// and New Zealand's other cities, and the Pacific's.
+var oceaniaExtraSites = []extenderSite{
+	site("Adelaide", "au", -34.9285, 138.6007, 1),
+	site("Canberra", "au", -35.2809, 149.1300, 1),
+	site("Hobart", "au", -42.8821, 147.3272, 1),
+	site("Darwin", "au", -12.4634, 130.8456, 1),
+	site("Wellington", "nz", -41.2865, 174.7762, 1),
+	site("Christchurch", "nz", -43.5321, 172.6362, 1),
+	site("Port Moresby", "pg", -9.4438, 147.1803, 1),
+	site("Suva", "fj", -18.1416, 178.4419, 1),
+	site("Nouméa", "nc", -22.2758, 166.4580, 1),
+}
+
 // The regions the study reports by. Europe and North America have the fleet's
 // dense coverage; the others are sparser, Africa and Oceania the sparsest.
 const (

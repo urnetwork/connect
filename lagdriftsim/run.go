@@ -18,7 +18,9 @@ package lagdriftsim
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/urnetwork/connect/lagdrift"
 )
@@ -158,6 +160,36 @@ type visitorOutcome struct {
 	stopMismatches   []string
 	decideChecks     int
 	decideMismatches []string
+	fitChecks        fitChecks
+	fitCosts         [fitKinds]fitCost
+}
+
+// The fit's own checks (the acceptance test of V5's starts): a warm refit
+// of every verdict's fit, and, for the checked visitors, a grid of starts.
+type fitChecks struct {
+	refits int
+	// refits that moved 1 km or more, and the farthest, km
+	refitMoved   int
+	refitMovedKm float64
+	grids        int
+	// grids that found a fixed point with a lower χ², and the largest drop
+	gridLower     int
+	gridLowerBy1  int
+	gridLargestBy float64
+	examples      []string
+}
+
+func (self *fitChecks) add(other fitChecks) {
+	self.refits += other.refits
+	self.refitMoved += other.refitMoved
+	self.refitMovedKm = math.Max(self.refitMovedKm, other.refitMovedKm)
+	self.grids += other.grids
+	self.gridLower += other.gridLower
+	self.gridLowerBy1 += other.gridLowerBy1
+	self.gridLargestBy = math.Max(self.gridLargestBy, other.gridLargestBy)
+	if len(self.examples) < 6 {
+		self.examples = append(self.examples, other.examples[:min(len(other.examples), 6-len(self.examples))]...)
+	}
 }
 
 // A visitor being simulated.
@@ -178,6 +210,8 @@ type visitorSim struct {
 	verdicts  map[string]*verdictRecord
 	checks    bool
 	outcome   *visitorOutcome
+	// the runs each visitor makes, at most visitorRuns
+	runs int
 }
 
 func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorOutcome {
@@ -186,15 +220,22 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 		config:    config,
 		spec:      spec,
 		fleet:     w.fleets[spec.fleet],
-		model:     lagdrift.Model{Kappa: config.modelKappa, Sigma0Ms: lagdrift.DefaultSigma0Ms},
+		model:     lagdrift.Model{Kappa: modelKappaFor(config, spec.region), Sigma0Ms: lagdrift.DefaultSigma0Ms},
 		stretches: map[int]float64{},
 		traces:    map[string]*runTrace{},
 		verdicts:  map[string]*verdictRecord{},
 		checks:    config.checkEvery <= 1 || spec.index%config.checkEvery == 0,
+		runs:      visitorRuns,
+	}
+	if 0 < config.runs && config.runs < visitorRuns {
+		sim.runs = config.runs
 	}
 	sim.outcome = &visitorOutcome{spec: spec}
 	r := newRand(config.seed, drawVisitor, uint64(spec.index))
 	sim.access = drawAccessLink(r)
+	if config.idealPings {
+		sim.access = accessLink{kind: sim.access.kind, lastMileMs: sim.access.lastMileMs}
+	}
 	sim.serving = make([]bool, len(w.pool))
 	for i := range sim.serving {
 		sim.serving[i] = r.Float64() < servingShare
@@ -205,6 +246,14 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 		sim.outcome.outcomes = append(sim.outcome.outcomes, sim.runPolicy(policy))
 	}
 	return sim.outcome
+}
+
+// The model's κ for a region's visitors.
+func modelKappaFor(config *studyConfig, region string) float64 {
+	if kappa, ok := config.regionModelKappas[region]; ok {
+		return kappa
+	}
+	return config.modelKappa
 }
 
 // The path's route stretch to a pool extender, drawn once per path.
@@ -218,17 +267,31 @@ func (self *visitorSim) stretch(poolIndex int) float64 {
 	return s
 }
 
+// Where a pool extender is.
+func (self *visitorSim) trueAt(poolIndex int) lagdrift.Point {
+	if self.config.noPlaceError {
+		return self.fleet[poolIndex].at
+	}
+	return self.fleet[poolIndex].trueAt
+}
+
 // The propagation to a pool extender, ms: K · d(truth, its true place) times
 // the path's stretch.
 func (self *visitorSim) propagationMs(poolIndex int) float64 {
-	d := lagdrift.DistanceKm(self.spec.truth, self.fleet[poolIndex].trueAt)
-	return lagdrift.MsPerKm * d * (1 + self.stretch(poolIndex))
+	d := lagdrift.DistanceKm(self.spec.truth, self.trueAt(poolIndex))
+	stretch := self.stretch(poolIndex)
+	if self.config.routeMinKm != 0 || self.config.routeMaxKm != 0 {
+		if d < self.config.routeMinKm || self.config.routeMaxKm <= d {
+			stretch = 0
+		}
+	}
+	return lagdrift.MsPerKm * d * (1 + stretch)
 }
 
 // Chooses each run's extenders (E2) and draws its link and sessions.
 func (self *visitorSim) openSessions() {
 	used := map[int]bool{}
-	for run := 0; run < visitorRuns; run++ {
+	for run := 0; run < self.runs; run++ {
 		candidates := []choiceCandidate{}
 		for i, e := range self.world.pool {
 			if !self.serving[i] {
@@ -297,7 +360,7 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 	// the counting runs: their keys and usable observations
 	countingKeys := []string{}
 	countingObs := [][]lagdrift.Observation{}
-	for run := 0; run < visitorRuns; run++ {
+	for run := 0; run < self.runs; run++ {
 		windowKeys := lastN(countingKeys, windowRuns)
 		windowObs := lastN(countingObs, windowRuns)
 		prior := []lagdrift.Observation{}
@@ -397,7 +460,7 @@ func (self *runTrace) compute(j int) *tickState {
 	}
 	if fitExtenders <= len(obs) || fitExtenders <= distinctExtenders(self.prior) {
 		all := append(append([]lagdrift.Observation{}, self.prior...), obs...)
-		fit, err := self.sim.fit(all, self.warm)
+		fit, err := self.sim.fit(all, self.warm, false)
 		if err == nil {
 			state.fit = fit
 			self.warm = fit
@@ -412,10 +475,15 @@ func (self *runTrace) compute(j int) *tickState {
 }
 
 func (self *visitorSim) observation(s *session, run int, estimate lagdrift.RoundTrip) lagdrift.Observation {
+	placeErrorKm := s.extender.placeErrorKm
+	if 0 < self.config.placeErrorPerKm {
+		byDistance := self.config.placeErrorPerKm * lagdrift.DistanceKm(self.spec.ipPlace, s.extender.at)
+		placeErrorKm = math.Max(lagdrift.HeldPlaceErrorKm(placeErrorKm), byDistance)
+	}
 	return lagdrift.Observation{
 		ExtenderId:   s.id,
 		At:           s.extender.at,
-		PlaceErrorKm: s.extender.placeErrorKm,
+		PlaceErrorKm: placeErrorKm,
 		Run:          run + 1,
 		RoundTrip:    estimate,
 	}
@@ -452,7 +520,7 @@ func (self *runTrace) stopFor(policy stopPolicy) (int, lagdrift.StopReason) {
 			return j, lagdrift.StopInterrupted
 		}
 		enough := state.fit != nil && enoughRoundTrips(state.roundTrips, policy.extenders, policy.roundTrips)
-		if enough && policy.earlyK <= self.d(j) {
+		if enough && !math.IsInf(policy.earlyK, 1) && policy.earlyK <= self.d(j) {
 			return j, lagdrift.StopClear
 		}
 		if enough && policy.converged && steady(self.history[:j], state.atMs, state.fit, policy.windowMs, policy.areaRatio) {
@@ -572,7 +640,7 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		obs = append(obs, o...)
 	}
 	c := self.spec.ipCountry
-	fit, err := self.fit(obs, nil)
+	fit, err := self.fit(obs, nil, true)
 	if err != nil || !(fit.MajorKm <= lagdrift.DefaultMaxSigmaKm) {
 		for i := range confidences {
 			v.verdicts[i] = lagdrift.VerdictInconclusive
@@ -583,6 +651,7 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		}
 		return v
 	}
+	self.checkFit(key, obs, fit)
 	j := lagdrift.Judge(fit, c, lagdrift.DefaultConfidence)
 	v.fitted = true
 	v.recordFit(fit, self.spec.truth, j.D)
@@ -611,7 +680,7 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			v.reasons[i] = lagdrift.ReasonRegionOutside
 		}
 	}
-	if self.checks && !self.config.freeLastMile {
+	if self.checks {
 		verdict, reason, _ := lagdrift.Decide(fit, c, obs, lagdrift.DefaultConfidence, lagdrift.DefaultMaxSigmaKm)
 		self.outcome.decideChecks += 1
 		if verdict != v.verdicts[1] || reason != v.reasons[1] {
@@ -622,38 +691,191 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 	return v
 }
 
-// lagdrift.FitPosition from the address's place, or, when the study emulates
-// a change to V5 and a run's b is at its bound of 0, the same fit with the
-// position's covariance taken with b left free. That covariance comes from
-// the fit of the same round trips each 50 ms longer, which lifts every b off
-// its bound and leaves the position's problem unchanged, started from this
-// fit: its covariance is the full inverse's position block.
-func (self *visitorSim) fit(obs []lagdrift.Observation, warm *lagdrift.Fit) (*lagdrift.Fit, error) {
-	fit, err := lagdrift.FitPosition(self.model, self.spec.ipPlace, obs, warm)
-	if err != nil || !self.config.freeLastMile || !atBound(fit) {
-		return fit, err
-	}
-	const liftMs = 50
-	lifted := make([]lagdrift.Observation, len(obs))
-	for i, o := range obs {
-		o.RoundTrip.Ms += liftMs
-		if 0 < o.RoundTrip.MinMs {
-			o.RoundTrip.MinMs += liftMs
+// Who fits and what: the frame after a ping round or the server for a
+// verdict, over one run or a pool, by the full multi-start (FitPosition) or
+// the warm refit (V10).
+type fitKind int
+
+const (
+	fitFrameSingle fitKind = iota
+	fitFramePooled
+	fitServerSingle
+	fitServerPooled
+	fitRefitSingle
+	fitRefitPooled
+	fitKinds
+)
+
+var fitKindNames = [fitKinds]string{
+	"the frame's full fit, one run",
+	"the frame's full fit, pooled runs",
+	"the server's fit, one run",
+	"the server's fit, pooled runs",
+	"the frame's warm refit, one run",
+	"the frame's warm refit, pooled runs",
+}
+
+func fitKindOf(server bool, obs []lagdrift.Observation) fitKind {
+	pooled := false
+	for _, o := range obs {
+		if o.Run != obs[0].Run {
+			pooled = true
+			break
 		}
-		lifted[i] = o
 	}
-	liftedWarm := &lagdrift.Fit{At: fit.At, Runs: fit.Runs}
-	for _, b := range fit.LastMileMs {
-		liftedWarm.LastMileMs = append(liftedWarm.LastMileMs, b+liftMs)
+	switch {
+	case server && pooled:
+		return fitServerPooled
+	case server:
+		return fitServerSingle
+	case pooled:
+		return fitFramePooled
+	default:
+		return fitFrameSingle
 	}
-	free, liftedErr := lagdrift.FitPosition(self.model, self.spec.ipPlace, lifted, liftedWarm)
-	if liftedErr != nil {
-		return fit, err
+}
+
+// lagdrift.FitPosition from the address's place, timed: the frame fits after
+// every ping round, so what a fit costs is what the widget costs.
+func (self *visitorSim) fit(obs []lagdrift.Observation, warm *lagdrift.Fit, server bool) (*lagdrift.Fit, error) {
+	start := time.Now()
+	f, err := lagdrift.FitPosition(self.model, self.spec.ipPlace, obs, warm)
+	self.outcome.fitCosts[fitKindOf(server, obs)].add(time.Since(start))
+	return f, err
+}
+
+// What the fits cost: how many, and their durations in buckets that double
+// from 0.25 ms.
+type fitCost struct {
+	fits    int
+	total   time.Duration
+	buckets [16]int
+}
+
+func (self *fitCost) add(d time.Duration) {
+	self.fits += 1
+	self.total += d
+	bucket := 0
+	for limit := 250 * time.Microsecond; limit < d && bucket < len(self.buckets)-1; limit *= 2 {
+		bucket += 1
 	}
-	emulated := *fit
-	emulated.Cov = free.Cov
-	emulated.MajorKm, emulated.MinorKm, emulated.BearingDeg = lagdrift.CovEllipse(free.Cov)
-	return &emulated, nil
+	self.buckets[bucket] += 1
+}
+
+func (self *fitCost) merge(other fitCost) {
+	self.fits += other.fits
+	self.total += other.total
+	for i := range self.buckets {
+		self.buckets[i] += other.buckets[i]
+	}
+}
+
+// The duration below which a share of the fits ended: a bucket's upper limit.
+func (self *fitCost) quantile(q float64) time.Duration {
+	need := int(math.Ceil(q * float64(self.fits)))
+	seen := 0
+	limit := 250 * time.Microsecond
+	for _, n := range self.buckets {
+		seen += n
+		if need <= seen {
+			return limit
+		}
+		limit *= 2
+	}
+	return limit
+}
+
+// The fit's χ², summed.
+func chi2Of(fit *lagdrift.Fit) float64 {
+	return fit.Chi2PerDof * float64(max(1, fit.Observations-2-len(fit.Runs)))
+}
+
+// Refits from fit until a refit moves it less than 0.1 km, at most 4 times.
+func (self *visitorSim) converge(obs []lagdrift.Observation, fit *lagdrift.Fit) (*lagdrift.Fit, bool) {
+	for i := 0; i < 4; i++ {
+		next, err := lagdrift.FitPosition(self.model, self.spec.ipPlace, obs, fit)
+		if err != nil {
+			return fit, false
+		}
+		moved := lagdrift.DistanceKm(fit.At, next.At)
+		fit = next
+		if moved < 0.1 {
+			return fit, true
+		}
+	}
+	return fit, false
+}
+
+// Checks a checked visitor's verdict fit: a warm refit from it moves under
+// 1 km, and, for a third of them, no start on a grid converges to a fixed
+// point with a lower χ². The grid is the address's place, the three fastest extenders' places,
+// and 6 bearings at 300, 1,000 and 3,000 km from the fit, each starting with
+// b at 0.7 times its run's lowest round trip, as a cold fit does.
+func (self *visitorSim) checkFit(key string, obs []lagdrift.Observation, fit *lagdrift.Fit) {
+	if !self.checks {
+		return
+	}
+	checks := &self.outcome.fitChecks
+	refit, err := lagdrift.FitPosition(self.model, self.spec.ipPlace, obs, fit)
+	if err == nil {
+		checks.refits += 1
+		moved := lagdrift.DistanceKm(fit.At, refit.At)
+		if 1 <= moved {
+			checks.refitMoved += 1
+		}
+		checks.refitMovedKm = math.Max(checks.refitMovedKm, moved)
+	}
+	// the grid on a third of the checked visitors' single runs
+	if self.spec.index%(3*max(1, self.config.checkEvery)) != 0 || 1 < len(fit.Runs) {
+		return
+	}
+	starts := []lagdrift.Point{self.spec.ipPlace}
+	fastest := slices.Clone(obs)
+	slices.SortFunc(fastest, func(a lagdrift.Observation, b lagdrift.Observation) int {
+		return compareFloat(a.RoundTrip.Ms, b.RoundTrip.Ms)
+	})
+	for _, o := range fastest[:min(3, len(fastest))] {
+		starts = append(starts, o.At)
+	}
+	for _, km := range []float64{300, 1000, 3000} {
+		for k := 0; k < 6; k++ {
+			starts = append(starts, destination(fit.At, 60*float64(k)+20, km))
+		}
+	}
+	coldLastMile := map[int]float64{}
+	for _, o := range obs {
+		if b, ok := coldLastMile[o.Run]; !ok || o.RoundTrip.Ms < b {
+			coldLastMile[o.Run] = o.RoundTrip.Ms
+		}
+	}
+	lastMile := []float64{}
+	for _, run := range fit.Runs {
+		lastMile = append(lastMile, 0.7*coldLastMile[run])
+	}
+	checks.grids += 1
+	best := 0.0
+	var bestFit *lagdrift.Fit
+	for _, start := range starts {
+		found, ok := self.converge(obs, &lagdrift.Fit{At: start, LastMileMs: slices.Clone(lastMile), Runs: fit.Runs})
+		if !ok {
+			continue
+		}
+		if drop := chi2Of(fit) - chi2Of(found); best < drop {
+			best = drop
+			bestFit = found
+		}
+	}
+	if 1e-3 < best {
+		checks.gridLower += 1
+		if 1 < best {
+			checks.gridLowerBy1 += 1
+		}
+		checks.gridLargestBy = math.Max(checks.gridLargestBy, best)
+		if len(checks.examples) < 6 {
+			checks.examples = append(checks.examples, fmt.Sprintf("visitor %d (%s, %s) %s: χ² %.2f at %.3f,%.3f, a start converges to χ² %.2f at %.3f,%.3f, %.0f km away",
+				self.spec.index, self.spec.region, self.spec.city.name, key, chi2Of(fit), fit.At.Lat, fit.At.Lon, chi2Of(bestFit), bestFit.At.Lat, bestFit.At.Lon, lagdrift.DistanceKm(fit.At, bestFit.At)))
+		}
+	}
 }
 
 // Some run's b is at its bound of 0.
