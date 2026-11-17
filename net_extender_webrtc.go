@@ -217,13 +217,18 @@ func (self *WebRtcExtenderCarrier) openTimeout() time.Duration {
 	return defaultWebRtcExtenderCarrierOpenTimeout
 }
 
-// dialExtenderWebRtc is the dialExtenderStream branch of the webrtc carrier.
+// dialExtenderWebRtc is the dialExtenderStream branch of the webrtc carrier. A
+// space whose egress is a proxy never dials it: ice gathers this host's own
+// candidates, outside the proxy (net_proxy_packet_path.go).
 func dialExtenderWebRtc(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
 	extenderDial *ExtenderDial,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
+	if !extenderConnectModeDialable(connectSettings, ExtenderConnectModeWebRtc) {
+		return nil, nil, fmt.Errorf("%w: %w", ErrWebRtcExtenderCarrierUnavailable, ErrExtenderPacketCarrierUnavailable)
+	}
 	carrier := connectSettings.WebRtcExtenderCarrier
 	if carrier == nil {
 		return nil, nil, ErrWebRtcExtenderCarrierUnavailable

@@ -30,12 +30,12 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
-	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -662,32 +662,63 @@ func TestGossipNodeWithDialerStillListensOnWebsocket(t *testing.T) {
 	}
 }
 
-// A node with no dialer is the node it always was: libp2p's websocket
-// transport dials the operator, from this host, and the extender carrier dials
-// through the very ConnectSettings it was given. Nothing of the dialer path is
-// built, the process's session cache included.
-func TestGossipNodeWithoutDialerIsUnchanged(t *testing.T) {
+// A node with no dialer of its own -- every app's -- dials through the space's
+// dial (ConnectSettings.DialContext), the operator link included. The
+// operator's name reaches that dial unresolved, and the link's socket is the
+// space's dialer's, under the space's DialControl, which is where an app's
+// egress binding (R1) also runs. libp2p's websocket transport, which dialed
+// with net.DialTCP from this host, only listens; the extender carrier dials
+// through the very ConnectSettings the node was given.
+func TestGossipNodeWithoutDialerDialsThroughTheSpacesDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	canary := newTestCanaryListener(t)
-	operatorPeerId, err := PeerIdForExtenderPublicKey(newTestKey(t).publicKey)
+	operator, operatorAddress := newTestWebsocketOperator(t, ctx)
+	_, operatorPort, err := net.SplitHostPort(operatorAddress)
 	if err != nil {
 		t.Fatal(err)
 	}
+	observedLock := sync.Mutex{}
+	// what reached the space's dial, and the sockets its dialer made
+	dialedAddresses := []string{}
+	controlledAddresses := []string{}
+	observed := func() ([]string, []string) {
+		observedLock.Lock()
+		defer observedLock.Unlock()
+		return slices.Clone(dialedAddresses), slices.Clone(controlledAddresses)
+	}
 	connectSettings := connect.DefaultConnectSettings()
-	settings := DefaultNodeSettings(NodeRoleMember)
-	if settings.DialContext != nil || settings.TlsSessionCache != nil {
-		t.Fatal("the default settings carry a dialer")
+	connectSettings.DialNetworkHook = func(network string, address string) {
+		observedLock.Lock()
+		defer observedLock.Unlock()
+		dialedAddresses = append(dialedAddresses, address)
+	}
+	connectSettings.DialControl = func(network string, address string, c syscall.RawConn) error {
+		observedLock.Lock()
+		defer observedLock.Unlock()
+		controlledAddresses = append(controlledAddresses, address)
+		return nil
+	}
+	if DefaultNodeSettings(NodeRoleMember).DialContext != nil {
+		t.Fatal("the default settings carry a dialer of their own")
 	}
 	member := newTestDialerNode(t, ctx, "member", func(settings *NodeSettings) {
 		settings.ConnectSettings = connectSettings
 		settings.OperatorAddrs = []ma.Multiaddr{
-			newTestMultiaddr(t, "/ip4/127.0.0.1/tcp/%d/ws/p2p/%s", canary.port(), operatorPeerId),
+			newTestMultiaddr(t, "/dns/localhost/tcp/%s/ws/p2p/%s", operatorPort, operator.PeerId()),
 		}
 	})
-	if member.settings.DialContext != nil || member.settings.TlsSessionCache != nil {
-		t.Fatal("a node with no dialer was given a dialer or a session cache")
+
+	waitForNodeStatus(t, member, "the operator link", func(status NodeStatus) bool {
+		return status.OperatorConnected
+	})
+	dialed, controlled := observed()
+	if !slices.Contains(dialed, net.JoinHostPort("localhost", operatorPort)) {
+		t.Fatalf("the operator's name never reached the space's dial unresolved, it saw %v", dialed)
+	}
+	// the operator listens on v4 loopback alone, so the link is that socket
+	if !slices.Contains(controlled, operatorAddress) {
+		t.Fatalf("the operator link's socket was not the space's dialer's: its DialControl saw %v", controlled)
 	}
 
 	swarmNetwork, ok := member.host.Network().(*swarm.Swarm)
@@ -695,10 +726,8 @@ func TestGossipNodeWithoutDialerIsUnchanged(t *testing.T) {
 		t.Fatalf("the host's network is %T, expected the swarm", member.host.Network())
 	}
 	websocketAddr := newTestMultiaddr(t, "/dns/gossip.space.example/tcp/443/wss")
-	if dialTransport := swarmNetwork.TransportForDialing(websocketAddr); dialTransport == nil {
-		t.Fatal("no transport dials the operator")
-	} else if _, ok := dialTransport.(*websocket.WebsocketTransport); !ok {
-		t.Fatalf("the operator is dialed by %T, expected libp2p's websocket transport", dialTransport)
+	if _, ok := swarmNetwork.TransportForDialing(websocketAddr).(*websocketDialTransport); !ok {
+		t.Fatalf("the operator is dialed by %T, expected the space's dial", swarmNetwork.TransportForDialing(websocketAddr))
 	}
 	carrierAddr := newTestMultiaddr(t, "/ip4/192.0.2.1/tcp/443")
 	carrier, ok := swarmNetwork.TransportForDialing(carrierAddr).(*extenderTransport)
@@ -708,11 +737,7 @@ func TestGossipNodeWithoutDialerIsUnchanged(t *testing.T) {
 	if carrier.settings.ConnectSettings != connectSettings {
 		t.Fatal("the extender carrier dials through other ConnectSettings than the node was given")
 	}
-
-	// the operator is dialed from this host directly, as it always was
-	select {
-	case <-canary.accepted:
-	case <-time.After(testMeshTimeout):
-		t.Fatal("the node did not dial its operator")
+	if member.settings.TlsSessionCache != processTlsSessionCache() {
+		t.Fatal("the operator link resumes from a cache other than the process's")
 	}
 }

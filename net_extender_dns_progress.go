@@ -218,16 +218,15 @@ func (self *ExtenderNetworkClient) resolveDnsPublication(
 
 // Concurrent permitted families publish in arrival order, without dropping
 // later inventory. Ordinary resolver fallback occurs only when DoH yields no
-// address, exactly as before. This call joins both one-shot query owners.
+// address, exactly as before. This call joins both one-shot query owners. A
+// space whose egress is a proxy resolves through the proxy alone and never
+// falls back (bootstrapResolution).
 func (self *ExtenderNetworkClient) resolveDnsProgress(
 	ctx context.Context,
 	name string,
 	publish func([]netip.Addr),
 ) ([]netip.Addr, error) {
-	dohSettings := self.settings.DohSettings
-	if dohSettings == nil && self.clientStrategy != nil {
-		dohSettings = self.clientStrategy.DohSettings()
-	}
+	dohSettings, systemFallback := self.bootstrapResolution()
 	var ips []netip.Addr
 	seen := map[netip.Addr]bool{}
 	accept := func(addrs []netip.Addr) {
@@ -292,6 +291,9 @@ func (self *ExtenderNetworkClient) resolveDnsProgress(
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !systemFallback {
+		return nil, errExtenderBootstrapNoProxiedAnswer
 	}
 	var customResolver *net.Resolver
 	if self.clientStrategy != nil {

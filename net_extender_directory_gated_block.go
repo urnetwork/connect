@@ -560,6 +560,12 @@ func (self *ExtenderDirectory) AttemptBlockSuspect(
 			if IsExtenderMemoryBudgetError(err) {
 				return ExtenderBlockAttemptAborted
 			}
+			// a carrier the probe's space cannot carry was never dialed: it is
+			// no evidence, and the next carrier is tried (net_proxy_packet_path.go)
+			if errors.Is(err, ErrExtenderPacketCarrierUnavailable) {
+				dialCount -= 1
+				continue
+			}
 		}
 	}
 	if dialCount == 0 {

@@ -158,6 +158,24 @@ func blockingBorrowSiteHandler(release <-chan struct{}) func(conn net.Conn) {
 	}
 }
 
+// The same site, reporting the first byte each connection relays. The extender
+// counts a splice before it relays the client's hello, so a splice whose first
+// byte has arrived is already counted; the accept alone comes during the splice
+// dial, ahead of the count.
+func blockingBorrowSiteHandlerReportingHello(release <-chan struct{}, hellos chan<- struct{}) func(conn net.Conn) {
+	return func(conn net.Conn) {
+		defer conn.Close()
+		go func() {
+			firstByte := make([]byte, 1)
+			if _, err := io.ReadFull(conn, firstByte); err == nil {
+				hellos <- struct{}{}
+			}
+			io.Copy(io.Discard, conn)
+		}()
+		<-release
+	}
+}
+
 // The connect settings of a client whose first dial, which is a camouflaged dial's
 // camouflaged attempt, takes longer than the stagger of the race (P8). A busy machine
 // does that now and then. Without the stagger held, the legacy attempt launches and
@@ -705,7 +723,8 @@ func TestExtenderCamouflageSpliceNotCountedAsRelay(t *testing.T) {
 func TestExtenderCamouflageSpliceTotalCap(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
-	site := newFakeBorrowSite(t, blockingBorrowSiteHandler(release))
+	hellos := make(chan struct{}, 4)
+	site := newFakeBorrowSite(t, blockingBorrowSiteHandlerReportingHello(release, hellos))
 	terminated := make(chan struct{}, 4)
 	fixture := newExtenderFixture(t, "127.0.0.1", func(settings *ExtenderSettings) {
 		settings.CamouflageEnabled = true
@@ -728,6 +747,13 @@ func TestExtenderCamouflageSpliceTotalCap(t *testing.T) {
 		case <-site.accepted:
 		case <-time.After(10 * time.Second):
 			t.Fatalf("splice %d was not started", i)
+		}
+		// a hello at the site is a counted splice: the count comes before the
+		// relay, where the accept comes during the dial, ahead of the count
+		select {
+		case <-hellos:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("splice %d relayed no hello", i)
 		}
 	}
 	// the third prober is over the cap: it is terminated, not spliced, so the

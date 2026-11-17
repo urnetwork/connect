@@ -49,10 +49,16 @@ const altDialerMinimumWeight = 0.25
 
 // newAltDialers builds the two api-only alt dialers of one strategy (L4). None
 // when no alt url is configured, which is every space that has not deployed
-// alt yet.
+// alt yet. None either for a strategy whose egress is a proxy: both dialers are
+// udp, and resolve the alt host on this host before they dial, so even through
+// an endpoint the owner supplied they would look a name up outside the proxy
+// (net_proxy_packet_path.go).
 func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySettings) []*clientDialer {
 	altHost, _ := altUrlHostPort(settings.AltUrl)
 	if altHost == "" {
+		return nil
+	}
+	if settings.ConnectSettings.ProxySettings != nil {
 		return nil
 	}
 	dialers := []*clientDialer{}

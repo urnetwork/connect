@@ -37,8 +37,16 @@ type internalDohResolver struct {
 // captured before installing the wrapper so non-owned names retain their
 // existing resolution path and DoH endpoint dials cannot recurse through the
 // protected-domain rule.
+//
+// A strategy whose egress is a socks proxy installs none. The cache's DoH
+// dials, and its plain dns fallback for the protected names, leave from this
+// host, outside the proxy, so every protected name was looked up from this
+// host's own address before its dial went through the proxy (connect#227).
+// Without the resolver every name goes to the proxy unresolved, and the proxy
+// resolves it on its own side (ProxySettings.NewDialContext); tls still
+// verifies the name against the platform's roots.
 func clientStrategySettingsWithInternalDoh(settings *ClientStrategySettings) (*ClientStrategySettings, *internalDohResolver) {
-	if settings == nil || settings.ConnectSettings.Resolver != nil {
+	if settings == nil || settings.ConnectSettings.Resolver != nil || settings.ConnectSettings.ProxySettings != nil {
 		return settings, nil
 	}
 	domains := normalizeInternalDohDomains(settings.InternalDohDomains)
