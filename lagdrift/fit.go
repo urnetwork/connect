@@ -18,22 +18,50 @@ package lagdrift
 // what its runs share: z = tᵀD⁻¹r / √(Q (1 + Q)), which is N(0, 1) under the
 // model for a block of any size and is r / σ for a single run (V5). A detoured
 // path, or an extender in the wrong place, moves every run's residual the same
-// way, so it is discounted in every run at once (V7). A block's weight h scales
-// its V⁻¹.
+// way, which is z's direction, so it is discounted in every run at once (V7).
+// The rest of the block's residual, ‖r⊥‖² = rᵀV⁻¹r − z², is how its runs
+// differ from each other, which is measurement noise, and keeps its full
+// weight. So the fit minimizes
 //
-// The solver is driftFit.ts's: Gauss–Newton on local east and north km and the
-// offsets, with the diagonal damped by 1.001 (Levenberg–Marquardt), the
-// position step capped at 400 km, warm-started from the last fit, and settled
-// once a step moves the position less than 0.05 km and every offset less than
-// 0.005 ms, or after 12 iterations from a warm start and 30 from a cold one.
-// The variances depend on p, so they and the Huber weights are recomputed at
-// every iteration. An offset at its bound of 0 whose step would go below it is
-// held there for that step (an active set), so the position's step is the
-// constrained one.
+//	F = Σ_blocks 2ρ_H(z) + ‖r⊥‖²
 //
-// The covariance of (east, north, b) is (JᵀWJ)⁻¹ × max(1, χ²/(n − 2 − R)),
-// with W the Huber-weighted V⁻¹ at the solution and χ² = Σ h rᵀV⁻¹r. An offset
-// at 0 is held fixed, and the position's covariance is the 2 × 2 of the rest.
+// with ρ_H(z) = z²/2 within c and c|z| − c²/2 beyond, which is rᵀV⁻¹r with
+// every z within c, and Σ (r/σ)² Huberized for single runs.
+//
+// The predicted distance is smoothed within 10 km of an extender
+// (smoothedDistanceKm), so the model is differentiable at an extender's place.
+//
+// The solver is driftFit.ts's Gauss–Newton on local east and north km and the
+// offsets, with its Levenberg–Marquardt damping made adaptive: the diagonal is
+// multiplied by 1 + λ, λ starting at driftFit.ts's 0.001, and a step is taken
+// only when it lowers F. λ follows Nielsen's rule: after a step taken, it is
+// multiplied by max(1/3, 1 − (2γ − 1)³), γ the gain in F over the quadratic
+// model's, and never falls below 0.001; after a step refused, it is
+// multiplied by ν, which starts at 2 and doubles with each refusal in a row. The position step is capped at 400 km, the fit warm-starts from
+// the last one, and it settles once a step taken moves the position less than
+// 0.05 km and every offset less than 0.005 ms, or when no step lowers F, or
+// after 12 steps tried from a warm start and 30 from a cold one. The Huber
+// weights are recomputed at every step. An offset at its bound of 0 whose step
+// would go below it is held there for that step (an active set), so the
+// position's step is the constrained one. With driftFit.ts's fixed damping
+// alone, a step against a gross outlier can overshoot a direction the other
+// extenders hardly constrain and circle there for good.
+//
+// lag.dev/DRIFTTEST.md V3 recomputes the variances, whose route error grows
+// with dᵢ, at every iteration. Here they are recomputed at every pass (feasible
+// GLS in two steps): the first pass measures each dᵢ from the expected place,
+// the second from the first pass's fit, and the covariance from the fit.
+// Recomputed at every iteration, they make the fit the fixed point of a
+// reweighting that moves with the position, and in about 1 fit in 20 of E2's
+// geometry (by simulation) that point repels the iteration, which then circles
+// it without settling. With the variances fixed for a pass, F is a fixed
+// function each pass minimizes, and the fit depends on the data alone, not on
+// where the last fit left off.
+//
+// The covariance of (east, north, b) is (JᵀWJ)⁻¹ × max(1, χ²/(n − 2 − R)) at
+// the solution, with W the Huber-weighted block inverse (normalEquations) and
+// χ² = Σ rᵀWr. An offset at 0 is held fixed, and the position's covariance is
+// the 2 × 2 of the rest.
 
 import (
 	"errors"
@@ -53,11 +81,18 @@ const (
 	settledMs      = 0.005
 	warmIterations = 12
 	coldIterations = 30
-	damping        = 1.001
+	// Levenberg–Marquardt's damping: the diagonal is multiplied by 1 + λ, λ
+	// starting at, and never below, driftFit.ts's 0.001
+	minDamping = 0.001
+	maxDamping = 1e9
 	// a cold start's offset, as a share of the run's lowest round trip
 	coldLastMileShare = 0.7
 	// a pivot this small is singular
 	minPivot = 1e-20
+	// the passes of feasible GLS
+	fitPasses = 2
+	// the distance is smoothed this close to an extender, km
+	smoothingKm = MinPlaceErrorKm
 )
 
 var (
@@ -108,6 +143,10 @@ type Fit struct {
 	Runs []int `json:"runs"`
 	// an extension: the observations in the fit
 	Observations int `json:"observations"`
+
+	// the steps taken, and whether the last was settled, for tests
+	iterations int
+	settled    bool
 }
 
 // One usable observation.
@@ -122,6 +161,8 @@ type fitRow struct {
 	run int
 	// the observation's run number, until the runs are indexed
 	runNumber int
+	// τ, the route and place error, for the pass
+	tauMs float64
 }
 
 // The observations of one extender: one block of V.
@@ -212,32 +253,87 @@ func FitPosition(m Model, expected Point, obs []Observation, warm *Fit) (*Fit, e
 		}
 	}
 
-	var a [][]float64
-	var chi2 float64
-	settled := false
-	for iteration := 0; ; iteration++ {
-		var g []float64
-		a, g, chi2 = normalEquations(m, blocks, p, b, paramCount)
-		if settled || maxIterations <= iteration {
-			break
-		}
-		step, ok := constrainedStep(a, g, b)
-		if !ok {
-			break
-		}
-		length := math.Hypot(step[0], step[1])
-		scale := 1.0
-		if MaxStepKm < length {
-			scale = MaxStepKm / length
-		}
-		p = MoveKm(p, step[0]*scale, step[1]*scale)
-		settled = length*scale < settledKm
-		for r := range b {
-			next := math.Max(0, b[r]+step[2+r]*scale)
-			settled = settled && math.Abs(next-b[r]) < settledMs
-			b[r] = next
+	// τ for each row, its distance measured from a place
+	routeErrorsFrom := func(at Point) {
+		for _, block := range blocks {
+			for j := range block.rows {
+				row := &block.rows[j]
+				row.tauMs = m.pathSigmaMs(DistanceKm(at, row.at), row.placeKm)
+			}
 		}
 	}
+
+	var a [][]float64
+	var g []float64
+	var objective float64
+	settled := false
+	iterations := 0
+	reference := expected
+	for pass := 0; pass < fitPasses; pass++ {
+		routeErrorsFrom(reference)
+		settled = false
+		lambda := minDamping
+		nu := 2.0
+		a, g, _, objective = normalEquations(blocks, p, b, paramCount)
+		for iteration := 0; iteration < maxIterations; iteration++ {
+			iterations += 1
+			step, ok := constrainedStep(a, g, b, 1+lambda)
+			if ok {
+				length := math.Hypot(step[0], step[1])
+				scale := 1.0
+				if MaxStepKm < length {
+					scale = MaxStepKm / length
+				}
+				for i := range step {
+					step[i] *= scale
+				}
+				nextP := MoveKm(p, step[0], step[1])
+				nextB := make([]float64, len(b))
+				small := math.Hypot(step[0], step[1]) < settledKm
+				for r := range b {
+					nextB[r] = math.Max(0, b[r]+step[2+r])
+					small = small && math.Abs(nextB[r]-b[r]) < settledMs
+				}
+				nextA, nextG, _, nextObjective := normalEquations(blocks, nextP, nextB, paramCount)
+				if nextObjective <= objective {
+					// the gain over the quadratic model's 2δᵀg − δᵀAδ
+					predicted := 0.0
+					for i := range step {
+						predicted += 2 * step[i] * g[i]
+						for j := range step {
+							predicted -= step[i] * a[i][j] * step[j]
+						}
+					}
+					gain := 0.0
+					if 0 < predicted {
+						gain = (objective - nextObjective) / predicted
+					}
+					p, b = nextP, nextB
+					a, g, objective = nextA, nextG, nextObjective
+					c := 2*gain - 1
+					lambda = math.Max(minDamping, lambda*math.Max(1.0/3, 1-c*c*c))
+					nu = 2
+					if small {
+						settled = true
+						break
+					}
+					continue
+				}
+			}
+			// no step lowers F at this damping: damp more, unless no step
+			// can, which is a minimum
+			lambda *= nu
+			nu *= 2
+			if maxDamping < lambda {
+				settled = true
+				break
+			}
+		}
+		reference = p
+	}
+	// the covariance and χ² with the route errors measured from the fit
+	routeErrorsFrom(p)
+	a, _, chi2, _ := normalEquations(blocks, p, b, paramCount)
 
 	// an offset at its bound is held fixed: the covariance is the rest's
 	free := make([]bool, paramCount)
@@ -282,6 +378,8 @@ func FitPosition(m Model, expected Point, obs []Observation, warm *Fit) (*Fit, e
 		BearingDeg:   bearingDeg,
 		Runs:         runNumbers,
 		Observations: n,
+		iterations:   iterations,
+		settled:      settled,
 	}, nil
 }
 
@@ -312,16 +410,25 @@ func warmLastMile(warm *Fit, run int, index int, runCount int) (float64, bool) {
 	return 0, false
 }
 
-// JᵀWJ, JᵀWr and χ² = Σ h rᵀV⁻¹r at (p, b), with W the Huber-weighted block
-// inverse. The parameters are east km, north km, then b per run; J is the
-// model's slope, so a step solves (JᵀWJ) δ = JᵀWr.
-func normalEquations(m Model, blocks []*fitBlock, p Point, b []float64, paramCount int) ([][]float64, []float64, float64) {
+// The normal equations at (p, b): JᵀWJ, JᵀWr, χ² = Σ rᵀWr and the objective
+// F = Σ 2ρ_H(z) + ‖r⊥‖², with τ the rows' own. Per block, the shared
+// component of r, z = tᵀD⁻¹r / √(Q (1 + Q)), is Huber-weighted by h, and the
+// rest, ‖r⊥‖² = rᵀD⁻¹r − (tᵀD⁻¹r)² / Q, is not:
+//
+//	W = D⁻¹ − ω D⁻¹ t tᵀ D⁻¹,  ω = (1 + Q − h) / (Q (1 + Q))
+//
+// so rᵀWr = ‖r⊥‖² + h z², and W = V⁻¹ when h = 1. ρ_H(z) is z²/2 within c
+// and c|z| − c²/2 beyond. The parameters are east km, north km, then b per
+// run; J is the model's slope, so a step solves (JᵀWJ) δ = JᵀWr, and JᵀWr is
+// half of −∂F/∂δ.
+func normalEquations(blocks []*fitBlock, p Point, b []float64, paramCount int) ([][]float64, []float64, float64, float64) {
 	a := make([][]float64, paramCount)
 	for i := range a {
 		a[i] = make([]float64, paramCount)
 	}
 	g := make([]float64, paramCount)
 	chi2 := 0.0
+	objective := 0.0
 
 	type rowTerms struct {
 		jEast  float64
@@ -329,7 +436,6 @@ func normalEquations(m Model, blocks []*fitBlock, p Point, b []float64, paramCou
 		run    int
 		r      float64
 		d      float64
-		t      float64
 	}
 	alpha := make([]float64, paramCount)
 	terms := []rowTerms{}
@@ -338,70 +444,94 @@ func normalEquations(m Model, blocks []*fitBlock, p Point, b []float64, paramCou
 		for i := range alpha {
 			alpha[i] = 0
 		}
-		// Q = tᵀD⁻¹t, ρ = tᵀD⁻¹r, α = JᵀD⁻¹t
+		// Q = tᵀD⁻¹t, ρ = tᵀD⁻¹r, rᵀD⁻¹r and α = JᵀD⁻¹t
 		q := 0.0
 		rho := 0.0
+		rr := 0.0
 		for _, row := range block.rows {
 			d := DistanceKm(p, row.at)
 			beta := BearingDeg(p, row.at) * radPerDeg
+			smooth, slope := smoothedDistanceKm(d)
 			term := rowTerms{
-				jEast:  -math.Sin(beta) * MsPerKm,
-				jNorth: -math.Cos(beta) * MsPerKm,
+				jEast:  -math.Sin(beta) * MsPerKm * slope,
+				jNorth: -math.Cos(beta) * MsPerKm * slope,
 				run:    row.run,
-				r:      row.y - (b[row.run] + MsPerKm*d),
+				r:      row.y - (b[row.run] + MsPerKm*smooth),
 				d:      row.noiseVar,
-				t:      m.pathSigmaMs(d, row.placeKm),
 			}
 			terms = append(terms, term)
-			q += term.t * term.t / term.d
-			rho += term.t * term.r / term.d
-			alpha[0] += term.jEast * term.t / term.d
-			alpha[1] += term.jNorth * term.t / term.d
-			alpha[2+term.run] += term.t / term.d
+			t := row.tauMs
+			q += t * t / term.d
+			rho += t * term.r / term.d
+			rr += term.r * term.r / term.d
+			alpha[0] += term.jEast * t / term.d
+			alpha[1] += term.jNorth * t / term.d
+			alpha[2+term.run] += t / term.d
 		}
-		h := 1.0
+		omega := 0.0
 		if 0 < q {
 			z := math.Abs(rho / math.Sqrt(q*(1+q)))
+			h := 1.0
+			huber := z * z
 			if HuberC < z {
 				h = HuberC / z
+				huber = 2*HuberC*z - HuberC*HuberC
 			}
+			omega = (1 + q - h) / (q * (1 + q))
+			perp := rr - rho*rho/q
+			chi2 += perp + h*z*z
+			objective += perp + huber
+		} else {
+			chi2 += rr
+			objective += rr
 		}
 		for _, term := range terms {
 			index := [3]int{0, 1, 2 + term.run}
 			j := [3]float64{term.jEast, term.jNorth, 1}
 			for u := 0; u < 3; u++ {
-				g[index[u]] += h * j[u] * term.r / term.d
+				g[index[u]] += j[u] * term.r / term.d
 				for v := 0; v < 3; v++ {
-					a[index[u]][index[v]] += h * j[u] * j[v] / term.d
+					a[index[u]][index[v]] += j[u] * j[v] / term.d
 				}
 			}
-			chi2 += h * term.r * term.r / term.d
 		}
-		shrink := 1 / (1 + q)
 		for u := 0; u < paramCount; u++ {
 			if alpha[u] == 0 {
 				continue
 			}
-			g[u] -= h * alpha[u] * rho * shrink
+			g[u] -= omega * alpha[u] * rho
 			for v := 0; v < paramCount; v++ {
-				a[u][v] -= h * alpha[u] * alpha[v] * shrink
+				a[u][v] -= omega * alpha[u] * alpha[v]
 			}
 		}
-		chi2 -= h * rho * rho * shrink
 	}
-	return a, g, chi2
+	return a, g, chi2, objective
 }
 
-// The damped Gauss–Newton step, with each offset at its bound of 0 whose step
-// would go below it held there. False when the system is singular.
-func constrainedStep(a [][]float64, g []float64, b []float64) ([]float64, bool) {
+// The distance the model predicts a round trip from (V2), and its slope in the
+// true distance d: d itself, except within 10 km of the extender, below its
+// place error's floor (V3), where it is (d² + ε²) / (2ε), ε = 10 km. That is
+// d's value and slope at ε, and smooth at the extender's place, where d has a
+// cone that a visitor in the extender's city would leave the fit chattering
+// on. It adds at most 5 km, 0.075 ms.
+func smoothedDistanceKm(d float64) (float64, float64) {
+	if smoothingKm <= d {
+		return d, 1
+	}
+	return (d*d + smoothingKm*smoothingKm) / (2 * smoothingKm), d / smoothingKm
+}
+
+// The Gauss–Newton step with the diagonal multiplied by diagonalFactor, each
+// offset at its bound of 0 whose step would go below it held there. False when
+// the system is singular.
+func constrainedStep(a [][]float64, g []float64, b []float64, diagonalFactor float64) ([]float64, bool) {
 	paramCount := len(g)
 	free := make([]bool, paramCount)
 	for i := range free {
 		free[i] = true
 	}
 	for {
-		step, ok := solveFree(a, g, free, damping)
+		step, ok := solveFree(a, g, free, diagonalFactor)
 		if !ok {
 			return nil, false
 		}
