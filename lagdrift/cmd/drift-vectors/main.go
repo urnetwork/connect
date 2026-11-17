@@ -399,8 +399,13 @@ var (
 		{box(-1, -180, 1, -179)},
 	}}
 	antipodal = &lagdrift.Country{Code: "za", Polygons: [][][]lagdrift.Point{{box(-35, -62, -27, -55)}}}
-	large     = &lagdrift.Country{Code: "zl", Polygons: [][][]lagdrift.Point{{box(-20, -20, 20, 20)}}}
-	beyond    = &lagdrift.Country{Code: "zb", Polygons: [][][]lagdrift.Point{{box(5, 5, 7, 7)}}}
+	// closed along the pole, as Natural Earth draws Antarctica
+	polar = &lagdrift.Country{Code: "zq", Polygons: [][][]lagdrift.Point{{{
+		{Lat: -70, Lon: -180}, {Lat: -68, Lon: -90}, {Lat: -72, Lon: 0}, {Lat: -66, Lon: 90},
+		{Lat: -70, Lon: 180}, {Lat: -90, Lon: 180}, {Lat: -90, Lon: -180},
+	}}}}
+	large  = &lagdrift.Country{Code: "zl", Polygons: [][][]lagdrift.Point{{box(-20, -20, 20, 20)}}}
+	beyond = &lagdrift.Country{Code: "zb", Polygons: [][][]lagdrift.Point{{box(5, 5, 7, 7)}}}
 )
 
 func build() vectorsFile {
@@ -684,6 +689,9 @@ func buildJudge(v *vectorsFile) {
 	add("west of the antimeridian", covFit(p6(0, 178.5), circle(25), 0, 0), antimeridan, 0.99)
 	add("inside across the antimeridian", covFit(p6(0.5, -179.5), circle(25), 0, 0), antimeridan, 0.99)
 	add("the fit's antipode", covFit(p6(31.23, 121.47), circle(50), 0, 0), antipodal, 0.99)
+	add("near the pole, inside", covFit(p6(-85, 30), circle(100), 0, 0), polar, 0.99)
+	add("off the polar coast", covFit(p6(-62, 30), circle(100), 0, 0), polar, 0.99)
+	add("off the polar coast, far", covFit(p6(-50, -120), circle(100), 0, 0), polar, 0.99)
 	add("a closed ring", covFit(p6(1, -0.7), tilted(60, 25, 70), 0, 0), &lagdrift.Country{Code: "zc", Polygons: [][][]lagdrift.Point{{append(box(0, 0, 2, 2), lagdrift.Point{Lat: 0, Lon: 0})}}}, 0.99)
 	add("on the boundary", covFit(p6(1, 0), circle(30), 0, 0), square, 0.99)
 }
@@ -831,6 +839,7 @@ func buildStops(v *vectorsFile) {
 func buildCountryAt(v *vectorsFile) {
 	overlapping := []lagdrift.Country{
 		*square,
+		*polar,
 		{Code: "zy", Polygons: [][][]lagdrift.Point{{box(10, 10, 14, 14), box(11, 11, 12, 12)}}},
 		{Code: "zy", Polygons: [][][]lagdrift.Point{{box(-1, 179, 1, 180)}}},
 		{Code: "aa", Polygons: [][][]lagdrift.Point{{box(1, 1, 3, 3)}}},
@@ -853,6 +862,8 @@ func buildCountryAt(v *vectorsFile) {
 		{name: "111 km away, within 100", p: p6(-1, 1), withinKm: 100},
 		{name: "across the antimeridian", p: p6(0, -179.5), withinKm: 100},
 		{name: "at sea", p: p6(40, -40), withinKm: 300},
+		{name: "near the pole", p: p6(-89.5, 77), withinKm: 300},
+		{name: "off the polar coast", p: p6(-66, 0), withinKm: 300},
 		{name: "not a place", p: lagdrift.Point{Lat: 95, Lon: 0}, withinKm: 300},
 	}
 	for _, c := range cases {
