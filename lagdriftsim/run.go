@@ -319,6 +319,8 @@ func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOption
 		}
 	case choiceInformation:
 		options.score = self.informationScore()
+	case choiceInformationRing:
+		options.score = self.informationRingScore()
 	}
 	return options
 }
@@ -329,14 +331,34 @@ func (self *visitorSim) choiceOptions(candidates []choiceCandidate) choiceOption
 // the inverse information of (east, north, b), b free; a near extender's
 // direction fades within 10 km of it, as lagdrift smooths its distance there.
 func (self *visitorSim) informationScore() func(picked []choiceCandidate) float64 {
-	type weighted struct {
-		at     lagdrift.Point
-		weight float64
-	}
 	places := []weighted{{at: self.spec.ipPlace, weight: 1}}
 	for _, hub := range vpnHubs {
 		places = append(places, weighted{at: hub.at, weight: 1 / float64(len(vpnHubs))})
 	}
+	return self.regionScore(places)
+}
+
+// informationScore's, over the address's place (weight 1) and a ring of 12
+// places at each of 800 and 2,000 km around it (1/24 each).
+func (self *visitorSim) informationRingScore() func(picked []choiceCandidate) float64 {
+	places := []weighted{{at: self.spec.ipPlace, weight: 1}}
+	for _, km := range []float64{800, 2000} {
+		for k := 0; k < 12; k++ {
+			places = append(places, weighted{at: destination(self.spec.ipPlace, 30*float64(k), km), weight: 1.0 / 24})
+		}
+	}
+	return self.regionScore(places)
+}
+
+// A plausible place for the visitor and its weight.
+type weighted struct {
+	at     lagdrift.Point
+	weight float64
+}
+
+// The weighted log of the region a set of extenders is expected to give at
+// each place.
+func (self *visitorSim) regionScore(places []weighted) func(picked []choiceCandidate) float64 {
 	const measurementMs = 0.3
 	return func(picked []choiceCandidate) float64 {
 		total := 0.0

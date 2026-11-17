@@ -687,7 +687,7 @@ func vpnPartsOf(parts []*studyPart, results map[string]*studyResult, pool string
 	modes := []string{}
 	ran := []*studyResult{}
 	for _, part := range parts {
-		if result, ok := results[part.name]; ok && strings.HasPrefix(part.name, "VPN: "+pool+", ") {
+		if result, ok := results[part.name]; ok && strings.HasPrefix(part.name, "VPN "+pool+": ") {
 			modes = append(modes, part.config.choiceMode)
 			ran = append(ran, result)
 		}
@@ -749,7 +749,7 @@ func vpnVariantTable(parts []*studyPart, results map[string]*studyResult) string
 	t := &table{header: []string{"Fleet, choice", "k_early by the rule", "False rejects, 99%, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Worst cell at 99.9%", "Region misses, 99%", "VPN pairs: 1 run", "3 runs", "Median stop, s"}}
 	for _, part := range parts {
 		result, ok := results[part.name]
-		if !ok || !strings.HasPrefix(part.name, "VPN: ") {
+		if !ok || !strings.HasPrefix(part.name, "VPN ") {
 			continue
 		}
 		policy := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
@@ -769,7 +769,7 @@ func vpnVariantTable(parts []*studyPart, results map[string]*studyResult) string
 		}
 		last := result.runs() - 1
 		times := result.stopTimes(func(*visitorSummary) bool { return true }, policy, 0)
-		t.add(strings.TrimPrefix(part.name, "VPN: "), rule,
+		t.add(strings.TrimPrefix(part.name, "VPN "), rule,
 			result.rateOf(ofScenario(scenarioTiny), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
 			result.rateOf(ofScenario(scenarioTiny), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short(),
 			result.rateOf(ofScenario(scenarioRealHonest), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),

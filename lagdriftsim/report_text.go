@@ -407,7 +407,7 @@ func reportFindings(parts []*studyPart, results map[string]*studyResult, times f
 	vpnLines := []string{}
 	for _, part := range parts {
 		result, ok := results[part.name]
-		if !ok || !strings.HasPrefix(part.name, "VPN: ") || result.count(ofScenario(scenarioVpnPairs)) == 0 {
+		if !ok || !strings.HasPrefix(part.name, "VPN ") || result.count(ofScenario(scenarioVpnPairs)) == 0 {
 			continue
 		}
 		policy := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
@@ -421,7 +421,7 @@ func reportFindings(parts []*studyPart, results map[string]*studyResult, times f
 				result.rateOf(filter, policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short()))
 		}
 		vpnLines = append(vpnLines, fmt.Sprintf("- %s: rejected after 1/%d runs: %s; tiny-country false rejects %s/%s.",
-			strings.TrimPrefix(part.name, "VPN: "), last+1, strings.Join(pairs, ", "),
+			strings.TrimPrefix(part.name, "VPN "), last+1, strings.Join(pairs, ", "),
 			result.rateOf(ofScenario(scenarioTiny), policy, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
 			result.rateOf(ofScenario(scenarioTiny), policy, last, verdictIs(1, lagdrift.VerdictDisagree)).short()))
 	}

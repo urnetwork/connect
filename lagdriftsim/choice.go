@@ -68,12 +68,16 @@ type choice struct {
 //     rest from the mid and far bands;
 //   - choiceInformation: after the near band, greedily the extender that most
 //     shrinks the region, by the model's variances, averaged over plausible
-//     places for the visitor: the address's place and the VPN hubs.
+//     places for the visitor: the address's place and the VPN hubs;
+//   - choiceInformationRing: the same, with the plausible places the address's
+//     place and a ring of 12 places at each of 800 and 2,000 km around it, so
+//     the region shrinks wherever near the address the visitor may be.
 const (
-	choiceE2          = "E2"
-	choiceJoint       = "joint spread"
-	choiceHubs        = "VPN hubs"
-	choiceInformation = "information"
+	choiceE2              = "E2"
+	choiceJoint           = "joint spread"
+	choiceHubs            = "VPN hubs"
+	choiceInformation     = "information"
+	choiceInformationRing = "information ring"
 )
 
 // How to choose.
@@ -159,7 +163,7 @@ func chooseExtendersBy(candidates []choiceCandidate, options choiceOptions, r *r
 		}
 		rest := runExtenders - len(primaries)
 		bands((rest+1)/2, rest/2)
-	case choiceInformation:
+	case choiceInformation, choiceInformationRing:
 		for _, unusedOnly := range []bool{true, false} {
 			for len(primaries) < runExtenders {
 				best := -1
