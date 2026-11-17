@@ -478,8 +478,10 @@ func TestEveryPlacementSiteReadsTheFlowLabels(t *testing.T) {
 		}
 	}
 
-	// every window client is built under its own window's profile, so a
-	// limited client runs EncryptionModeRequired under post-quantum (§12.5)
+	// every window client is built under its own window's profile, read with
+	// its profile generation (multiClientWindow.performanceProfileSnapshot),
+	// so a limited client runs EncryptionModeRequired under post-quantum
+	// (§12.5)
 	source, err = readSource("ip_remote_multi_client.go")
 	if err != nil {
 		t.Fatal(err)
@@ -488,8 +490,14 @@ func TestEveryPlacementSiteReadsTheFlowLabels(t *testing.T) {
 	if !ok {
 		t.Fatal("could not find expand")
 	}
-	if !strings.Contains(body, "self.performanceProfile,") || !strings.Contains(body, "args.windowType = self.windowType") {
+	if !strings.Contains(body, "performanceProfile, profileGeneration := self.performanceProfileSnapshot()") ||
+		!strings.Contains(body, "\t\t\t\tperformanceProfile,\n\t\t\t\tself.settings,\n") ||
+		!strings.Contains(body, "args.windowType = self.windowType") {
 		t.Error("expand does not build each window's clients under that window's profile and type")
+	}
+	snapshot, ok := functionBody(source, "func (self *multiClientWindow) performanceProfileSnapshot(")
+	if !ok || !strings.Contains(snapshot, "return self.performanceProfile, self.profileGeneration") {
+		t.Error("the profile snapshot is not the window's own profile")
 	}
 }
 

@@ -30,11 +30,12 @@ func expandOwnershipStaleCleanup() string {
 		"\t\t\t\tgoto awaitCandidate\n\t\t\t}\n"
 }
 
-// Stale demand and ended-refresh receipts own no constructed channel. Every
-// direct retirement in the healthy body must retain its exact ownership guard.
+// Stale demand, ended-refresh and retired-profile receipts own no constructed
+// channel. Every direct retirement in the healthy body must retain its exact
+// ownership guard.
 func TestExpandArgsCleanupAnchorAcceptsStaleDemandBeforeOwnership(t *testing.T) {
 	body := expandOwnershipControlBody(t)
-	if strings.Count(body, expandOwnershipStaleCleanup()) != 1 || strings.Count(body, "RemoveClientArgs(") != 5 {
+	if strings.Count(body, expandOwnershipStaleCleanup()) != 1 || strings.Count(body, "RemoveClientArgs(") != 7 {
 		t.Fatal("preownership cleanup premises changed")
 	}
 	if violations := expandArgsCleanupViolations(t, body); len(violations) != 0 {
@@ -339,4 +340,98 @@ func TestExpandArgsCleanupAnchorRejectsEndedRefreshDeferredInitializer(t *testin
 	}
 	wrong := strings.Replace(ended, "if !args.deferredClientArgs", "if args = self.clients[args.ClientId].args; !args.deferredClientArgs", 1)
 	expandOwnershipRequireRejectedRefreshMutation(t, body, strings.Replace(body, ended, wrong, 1))
+}
+
+// Args listed under another profile generation than the pass's, or received
+// by a pass whose generation the window retired (a post-quantum toggle or
+// direct mode turned off), own no channel: the receipt retires only minted
+// ones and waits for the next candidate.
+func expandOwnershipRetiredProfileReceiptCleanup() string {
+	return "\t\t\tif args.profileGeneration != passProfileGeneration || passProfileRetired() {\n" +
+		"\t\t\t\tif !args.deferredClientArgs {\n" +
+		"\t\t\t\t\tself.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)\n" +
+		"\t\t\t\t}\n\t\t\t\tgoto awaitCandidate\n\t\t\t}\n"
+}
+
+// The window retired the pass's generation between the receipt and the
+// construction: the pass retires the minted args no channel owns and ends.
+func expandOwnershipRetiredProfileBuildCleanup() string {
+	return "\t\t\tif profileGeneration != passProfileGeneration {\n" +
+		"\t\t\t\tself.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)\n" +
+		"\t\t\t\treturn\n\t\t\t}\n"
+}
+
+// Both are the exact current source paths, and the inventory accepts them.
+func TestExpandArgsCleanupAnchorAcceptsRetiredProfileBeforeOwnership(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	if strings.Count(body, expandOwnershipRetiredProfileReceiptCleanup()) != 1 ||
+		strings.Count(body, expandOwnershipRetiredProfileBuildCleanup()) != 1 {
+		t.Fatal("retired profile cleanup premises changed")
+	}
+	if violations := expandArgsCleanupViolations(t, body); len(violations) != 0 {
+		t.Fatalf("SDK_EXPAND_PREOWNERSHIP_RETIRED_PROFILE_CLEANUP_UNRECOGNIZED: %v", violations)
+	}
+}
+
+// Without its jump back to the receive, a retired-profile receipt falls
+// through into construction with the args it retired.
+func TestExpandArgsCleanupAnchorRejectsRetiredProfileReceiptFallthrough(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	receipt := expandOwnershipRetiredProfileReceiptCleanup()
+	if strings.Count(body, receipt) != 1 {
+		t.Fatal("retired profile receipt site changed")
+	}
+	wrong := strings.Replace(receipt, "\t\t\t\tgoto awaitCandidate\n", "", 1)
+	expandOwnershipRequireRejectedRetiredProfileMutation(t, body, strings.Replace(body, receipt, wrong, 1))
+}
+
+// A deferred fixed offer carries no minted credential. Reversing the guard
+// makes the same direct call revoke authority that was never acquired.
+func TestExpandArgsCleanupAnchorRejectsDeferredRetiredProfileReceipt(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	receipt := expandOwnershipRetiredProfileReceiptCleanup()
+	if strings.Count(body, receipt) != 1 {
+		t.Fatal("retired profile receipt site changed")
+	}
+	wrong := strings.Replace(receipt, "!args.deferredClientArgs", "args.deferredClientArgs", 1)
+	expandOwnershipRequireRejectedRetiredProfileMutation(t, body, strings.Replace(body, receipt, wrong, 1))
+}
+
+// Without its return, a retired-profile build constructs a channel with the
+// args it retired.
+func TestExpandArgsCleanupAnchorRejectsRetiredProfileBuildFallthrough(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	build := expandOwnershipRetiredProfileBuildCleanup()
+	if strings.Count(body, build) != 1 {
+		t.Fatal("retired profile build site changed")
+	}
+	wrong := strings.Replace(build, "\t\t\t\treturn\n", "", 1)
+	expandOwnershipRequireRejectedRetiredProfileMutation(t, body, strings.Replace(body, build, wrong, 1))
+}
+
+// Once constructed, the channel owns the args, so the same guard cannot
+// retire them there.
+func TestExpandArgsCleanupAnchorRejectsRetiredProfileBuildAfterConstruction(t *testing.T) {
+	body := expandOwnershipControlBody(t)
+	build := expandOwnershipRetiredProfileBuildCleanup()
+	constructed := "\n\t\t\tif err != nil {\n\t\t\t\tproviderFailure := self.recordChannelCreationFailure("
+	if strings.Count(body, build) != 1 || strings.Count(body, constructed) != 1 {
+		t.Fatal("retired profile build sites changed")
+	}
+	mutated := strings.Replace(body, build, "", 1)
+	mutated = strings.Replace(mutated, constructed, "\n"+build+constructed, 1)
+	expandOwnershipRequireRejectedRetiredProfileMutation(t, body, mutated)
+}
+
+// The retired-profile controls preserve the direct retirement count; rejection
+// must identify unproved ownership placement rather than count fewer calls.
+func expandOwnershipRequireRejectedRetiredProfileMutation(t *testing.T, original, mutated string) {
+	t.Helper()
+	if strings.Count(original, "RemoveClientArgs(") != strings.Count(mutated, "RemoveClientArgs(") {
+		t.Fatal("retired profile mutation changed the direct cleanup count")
+	}
+	violations := expandArgsCleanupViolations(t, mutated)
+	if !strings.Contains(strings.Join(violations, "\n"), "outside a pre-ownership cleanup") {
+		t.Fatalf("unsafe same-count retired profile retirement was not rejected: %v", violations)
+	}
 }
