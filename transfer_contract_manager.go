@@ -414,8 +414,6 @@ func DefaultContractManagerSettingsWithBufferSize(bufferSize int) *ContractManag
 		CompanionRefusalHoldMax:         5 * time.Minute,
 		CompanionRefusalMaxDestinations: 1024,
 
-		PeerWindow: DefaultPeerWindowSettings(),
-
 		ProtocolVersion: DefaultProtocolVersion,
 
 		// TODO remove
@@ -557,10 +555,6 @@ type ContractManagerSettings struct {
 	// Test hook for the hold's jitter draw. Nil uses math/rand.
 	companionRefusalRandomForTest func(n int64) int64
 
-	// The timing of the windows `SetPeerWindowAccounting` turns on. Nothing
-	// reads it until a peer is marked.
-	PeerWindow PeerWindowSettings
-
 	ProtocolVersion int
 
 	// TODO remove
@@ -644,17 +638,6 @@ type ContractManager struct {
 	windowDelegation atomic.Pointer[[]byte]
 	// Every contract answers to this before use; nil for no check.
 	destinationCheck atomic.Pointer[ContractDestinationCheckFunction]
-
-	// Nil until a peer is marked (`SetPeerWindowAccounting`), so a client that
-	// never uses the mode pays one nil check per contract and nothing per Pack.
-	peerWindows atomic.Pointer[peerWindowLedger]
-	// Wakes the worker that ends windows, to look at the ledger again.
-	peerWindowWake chan struct{}
-	// Listeners for each window's opening, and what wakes their worker.
-	peerWindowCallbacks    *CallbackList[PeerWindowFunction]
-	peerWindowCallbackWake chan struct{}
-	// Protected by mutex.
-	peerWindowCallbacksStarted bool
 
 	// `provideSecretKeys` retains all keys until app restart (typically system restart)
 	// this makes it faster for clients to reconnect with existing contracts
@@ -766,9 +749,6 @@ func NewContractManager(
 		provideMonitor:                  NewMonitor(),
 		destinationContracts:            map[ContractKey]*contractQueue{},
 		contractExpiryWake:              make(chan struct{}, 1),
-		peerWindowWake:                  make(chan struct{}, 1),
-		peerWindowCallbacks:             NewCallbackList[PeerWindowFunction](),
-		peerWindowCallbackWake:          make(chan struct{}, 1),
 		receiveNoContractClientIds:      receiveNoContractClientIds,
 		sendNoContractClientIds:         sendNoContractClientIds,
 		contractStatusCallbacks:         NewCallbackList[*contractStatusCallbackWorker](),
@@ -1777,7 +1757,6 @@ func (self *ContractManager) TakeContract(
 						self.localStats.ContractOpenCount += 1
 						self.localStats.ContractOpenByteCounts[contractId] = ByteCount(parsed.TransferByteCount)
 						self.localStats.ContractOpenKeys[contractId] = contractKey
-						self.notePeerWindowTakenWithLock(contractKey, contractId, storedContract)
 					}
 				}
 			}
@@ -1925,7 +1904,6 @@ func (self *ContractManager) addContractToQueue(
 	if err := contractQueue.Add(contract, storedContract); err != nil {
 		return err
 	}
-	self.notePeerWindowQueuedWithLock(contractKey, storedContract)
 	self.queuedContractGeneration.Add(1)
 	if !self.contractExpiryStarted {
 		// This admission shares Close's lock, so a successfully queued result
@@ -2446,9 +2424,6 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	unackedByteCount ByteCount,
 	checkpoint bool,
 ) {
-	if self.withholdPeerWindowReport(contractId, ackedByteCount, unackedByteCount, checkpoint) {
-		return
-	}
 	self.closeContractWithPendingReport(contractId, ackedByteCount, unackedByteCount, checkpoint, self.newContractCloseReport(contractId, checkpoint))
 }
 
@@ -3105,21 +3080,6 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 		// drop this contract. it has already been used locally
 	}
 	return nil
-}
-
-// Removes the queued contracts `match` picks and returns them.
-func (self *contractQueue) removeWhere(match func(contractId Id) bool) []*protocol.Contract {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-
-	contracts := []*protocol.Contract{}
-	for contractId, queued := range self.contracts {
-		if match(contractId) {
-			delete(self.contracts, contractId)
-			contracts = append(contracts, queued.contract)
-		}
-	}
-	return contracts
 }
 
 // Removes the listed contracts that are still queued and returns their ids.
