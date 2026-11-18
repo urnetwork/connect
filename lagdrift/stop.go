@@ -7,13 +7,14 @@ package lagdrift
 // on the signed reports at the moment the sessions closed, with wider
 // tolerances.
 //
-//   - converged: at least 8 extenders have 12 round trips each, and over the
-//     trailing 2 s the ellipse's area (σ_major · σ_minor) has stayed within
-//     the tolerance's ratio and the position has moved less than a quarter of
+//   - converged: at least 8 extenders are usable, with 8 or more round trips
+//     each (E5's usable_round_trips, 2 s of pings), and over the trailing 2 s
+//     the ellipse's area (σ_major · σ_minor) has stayed within the
+//     tolerance's ratio and the position has moved less than a quarter of
 //     σ_minor;
-//   - clear: the same 12-round-trip minimum, and the whole region at the
-//     run's k_early (StopTolerance.KEarly, V11) lies outside the IP country,
-//     or the fit is inside it and the whole region lies inside it. Both are
+//   - clear: the same usable minimum, and the whole region at the run's
+//     k_early (StopTolerance.KEarly, V11) lies outside the IP country, or the
+//     fit is inside it and the whole region lies inside it. Both are
 //     D ≥ k_early (V6). A tolerance without a k_early allows no clear stop;
 //     falling back to EarlyK would make one easier than a verdict at a k
 //     above 3.035 (review V-4);
@@ -36,9 +37,12 @@ const (
 	StopInterruptedMs = 4000
 	// cap: this long after the sessions opened, ms
 	StopCapMs = 12000
-	// converged and clear need this many extenders with StopRoundTrips each
+	// converged and clear need this many usable extenders, each with at
+	// least StopRoundTrips round trips: E5's usable minimum, 8 since T3
+	// found it changes no rate and saves about a second when far sessions
+	// open late (2026-11-17; 12 before)
 	StopExtenders  = 8
-	StopRoundTrips = 12
+	StopRoundTrips = 8
 )
 
 // The run's state after a ping round.
@@ -147,7 +151,8 @@ func latestSnapshot(history []Snapshot, nowMs int64) (Snapshot, bool) {
 	return Snapshot{}, false
 }
 
-// At least 8 extenders have 12 round trips each.
+// At least StopExtenders extenders are usable: StopRoundTrips or more round
+// trips each (E5).
 func enoughRoundTrips(roundTrips []int) bool {
 	count := 0
 	for _, n := range roundTrips {

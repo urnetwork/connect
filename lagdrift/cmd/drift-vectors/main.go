@@ -874,6 +874,24 @@ func buildStops(v *vectorsFile) {
 	add("not clear: straddling", one(covFit(p6(1, -0.3), circle(30), 0, 0), 8), clearAt, clearAt, square, browser)
 	add("not clear: inside near the edge", one(covFit(p6(1, 0.3), circle(30), 0, 0), 8), clearAt, clearAt, square, browser)
 	add("not clear: too few ready", one(covFit(p6(1, -10), circle(30), 0, 0), 7), clearAt, clearAt, square, browser)
+	// usable at 8 round trips (E5, 2026-11-17): 8 extenders with 8 each are
+	// enough, with 7 each they aren't
+	counts := func(usable int, roundTrips int) []int {
+		c := make([]int, 12)
+		for i := range c {
+			c[i] = 3
+			if i < usable {
+				c[i] = roundTrips
+			}
+		}
+		return c
+	}
+	farAt := func(roundTrips []int) []lagdrift.Snapshot {
+		return []lagdrift.Snapshot{{AtMs: clearAt, Fit: covFit(p6(1, -10), circle(30), 0, 0), RoundTrips: roundTrips}}
+	}
+	add("clear: 8 extenders with 8 round trips each", farAt(counts(8, 8)), clearAt, clearAt, square, browser)
+	add("not clear: 8 extenders with 7 round trips each", farAt(counts(8, 7)), clearAt, clearAt, square, browser)
+	add("not clear: 7 extenders with 8 round trips each", farAt(counts(7, 8)), clearAt, clearAt, square, browser)
 	add("not clear: no country", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, nil, browser)
 	add("not clear: a country of no polygons", one(covFit(p6(1, -10), circle(30), 0, 0), 8), clearAt, clearAt, &lagdrift.Country{Code: "zn", Polygons: [][][]lagdrift.Point{}}, browser)
 	// the run's k_early (V11): D ≈ 6.7 is clear at the textbook k_early and at

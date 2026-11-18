@@ -89,7 +89,7 @@ func TestEvaluateStopConverged(t *testing.T) {
 	if reason, ok := EvaluateStop(history, testOpenedMs, now, now, squareCountry, browserAt99); !ok || reason != StopConverged {
 		t.Errorf("a steady fit: %s, %v", reason, ok)
 	}
-	// 7 extenders with 12 round trips aren't enough
+	// 7 usable extenders aren't enough
 	if reason, ok := EvaluateStop(stopHistory(now, steadyFit, 7), testOpenedMs, now, now, squareCountry, browserAt99); ok {
 		t.Errorf("7 extenders ready: %s", reason)
 	}
@@ -233,6 +233,50 @@ func TestEvaluateStopWithoutKEarly(t *testing.T) {
 		steadyNow := int64(testOpenedMs + 3500)
 		if reason, ok := EvaluateStop(stopHistory(steadyNow, steadyFit, 8), testOpenedMs, steadyNow, steadyNow, squareCountry, tol); !ok || reason != StopConverged {
 			t.Errorf("%+v: %s, %v steady", tol, reason, ok)
+		}
+	}
+}
+
+// An extender is usable at 8 round trips (E5, V10, 2026-11-17; 12 before):
+// clear and converged need 8 extenders with 8 or more each.
+func TestEvaluateStopUsableAtEightRoundTrips(t *testing.T) {
+	if StopRoundTrips != 8 || StopExtenders != 8 {
+		t.Fatalf("usable at %d round trips on %d extenders", StopRoundTrips, StopExtenders)
+	}
+	counts := func(usable int, roundTrips int) []int {
+		c := make([]int, 12)
+		for i := range c {
+			c[i] = 3
+			if i < usable {
+				c[i] = roundTrips
+			}
+		}
+		return c
+	}
+	now := int64(testOpenedMs + 3000)
+	far := stopFit(Point{Lat: 1, Lon: -10}, 0, 0, 30)
+	steadyNow := int64(testOpenedMs + 3500)
+	for _, c := range []struct {
+		name       string
+		roundTrips []int
+		stop       bool
+	}{
+		{name: "8 extenders with 8 each", roundTrips: counts(8, 8), stop: true},
+		{name: "12 extenders with 8 each", roundTrips: counts(12, 8), stop: true},
+		{name: "8 extenders with 7 each", roundTrips: counts(8, 7), stop: false},
+		{name: "7 extenders with 8 each", roundTrips: counts(7, 8), stop: false},
+	} {
+		history := []Snapshot{{AtMs: now, Fit: far, RoundTrips: c.roundTrips}}
+		if StopHolds(StopClear, history, testOpenedMs, now, now, squareCountry, browserAt99) != c.stop {
+			t.Errorf("%s: clear %v", c.name, !c.stop)
+		}
+		steady := []Snapshot{}
+		for _, s := range stopHistory(steadyNow, steadyFit, 8) {
+			s.RoundTrips = c.roundTrips
+			steady = append(steady, s)
+		}
+		if StopHolds(StopConverged, steady, testOpenedMs, steadyNow, steadyNow, squareCountry, browserAt99) != c.stop {
+			t.Errorf("%s: converged %v", c.name, !c.stop)
 		}
 	}
 }
