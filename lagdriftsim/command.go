@@ -241,6 +241,12 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 
 	writeV11(b, results)
 
+	if usable := usableStopTable(parts, results); strings.Count(usable, "\n") > 2 {
+		section("Stops on the verdict's evidence")
+		paragraph("V10 (e2e): far sessions open late on the real stack, so here they open 3 s × min(1, d / 7,500 km) later than their round trips take. The frame decides its stops on its fit over every extender with 4 round trips, as before, or over the usable extenders only, as V10 now says, at 12 and at 8 usable round trips (8 also the server's usable minimum, E5). The hybrid choice, V11's table, 3 runs; seconds from the sessions opening.")
+		b.WriteString(usable + "\n")
+	}
+
 	if worlds := calibrationWorldTable(parts, results); strings.Count(worlds, "\n") > 2 {
 		section("Where the region's misses come from")
 		paragraph("Tiny-country visitors, one run each, in worlds that each take away a source of error the model's variance doesn't hold, and in the model's own world without all three. Nominal misses: 5%%, 1%% and 0.1%%.")

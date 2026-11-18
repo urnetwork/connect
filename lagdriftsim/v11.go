@@ -205,3 +205,40 @@ func v11TableCheck(result *studyResult) string {
 	}
 	return t.String()
 }
+
+// V10's stops on the verdict's evidence: per frame and usable round trips,
+// after runs 1 and 3, the stop times and how runs stop, and at V11's k the
+// false rejects, the region's misses, power, and the verdicts that came out
+// low_precision.
+func usableStopTable(parts []*studyPart, results map[string]*studyResult) string {
+	t := &table{header: []string{"Stops decided on", "Usable round trips", "Run", "Stop p50, s", "p90, s", "p99, s", "clear", "cap", "Runs counted", "False rejects: tiny", "real", "Region misses", "Power: 300 km", "1,000 km", "3,000 km", "VPN pairs", "low_precision: claims", "honest"}}
+	for _, part := range parts {
+		result, ok := results[part.name]
+		if !ok || !strings.HasPrefix(part.name, "late sessions: ") {
+			continue
+		}
+		for p, policy := range result.config.policies {
+			for _, run := range []int{0, result.runs() - 1} {
+				all := func(*visitorSummary) bool { return true }
+				times := result.stopTimes(all, p, run)
+				disagree := func(r runSummary) bool { return r.v11Verdict == lagdrift.VerdictDisagree }
+				lowPrecision := func(r runSummary) bool { return r.reasons[1] == lagdrift.ReasonLowPrecision }
+				tinyFitted := func(s *visitorSummary) bool { return s.scenario == scenarioTiny && s.runs[p][run].fitted }
+				row := []string{strings.TrimPrefix(part.name, "late sessions: stops on "), fmt.Sprint(policy.roundTrips), fmt.Sprint(run + 1),
+					quantile(times, 0.5), quantile(times, 0.9), quantile(times, 0.99),
+					result.rateOf(all, p, run, func(r runSummary) bool { return r.reason == lagdrift.StopClear }).short(),
+					result.rateOf(all, p, run, func(r runSummary) bool { return r.reason == lagdrift.StopCap }).short(),
+					result.rateOf(all, p, run, func(r runSummary) bool { return r.counted }).short(),
+					result.rateOf(ofScenario(scenarioTiny), p, run, disagree).short(),
+					result.rateOf(ofScenario(scenarioRealHonest), p, run, disagree).short(),
+					result.rateOf(tinyFitted, p, run, func(r runSummary) bool { return r.v11K < r.truthM }).short()}
+				for _, sc := range []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000, scenarioVpnPairs} {
+					row = append(row, result.rateOf(ofScenario(sc), p, run, disagree).short())
+				}
+				row = append(row, result.rateOf(ofKind(kindClaim), p, run, lowPrecision).short(), result.rateOf(ofKind(kindHonest), p, run, lowPrecision).short())
+				t.add(row...)
+			}
+		}
+	}
+	return t.String()
+}

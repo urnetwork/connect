@@ -149,6 +149,8 @@ type runTrace struct {
 	estimates      []lagdrift.RoundTrip
 
 	cadence bool
+	// with stopOnUsable, the round trips an extender needs to be in the fit
+	usable int
 	// the steadiness window looks no further back than this history index
 	historyFrom int
 	// the last full fit: when, and over which extenders
@@ -510,6 +512,10 @@ func (self *visitorSim) openSessions() {
 			}
 			propagationMs := self.propagationMs(poolIndex)
 			s.openMs = afterMs + sessionOpenMs(link, propagationMs, sr)
+			if self.config.lateFarSessions {
+				d := lagdrift.DistanceKm(self.spec.truth, self.trueAt(poolIndex))
+				s.openMs += lateSessionMs * math.Min(1, d/lateSessionKm)
+			}
 			for _, p := range sessionPings(link, propagationMs, s.openMs, sr) {
 				if 0 < p.ms {
 					s.answered = append(s.answered, p)
@@ -550,7 +556,7 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 		for _, obs := range windowObs {
 			prior = append(prior, obs...)
 		}
-		trace := self.trace(run, strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), prior)
+		trace := self.trace(run, strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), prior, policy.roundTrips)
 		var stopTrace *runTrace
 		var tick int
 		var reason lagdrift.StopReason
@@ -598,7 +604,7 @@ func lastN[T any](xs []T, n int) []T {
 }
 
 // The run's trace given the counting runs before it, kept by key.
-func (self *visitorSim) trace(run int, priorKey string, prior []lagdrift.Observation) *runTrace {
+func (self *visitorSim) trace(run int, priorKey string, prior []lagdrift.Observation, usable int) *runTrace {
 	key := fmt.Sprintf("%d|%s", run, priorKey)
 	if t, ok := self.traces[key]; ok {
 		return t
@@ -611,6 +617,7 @@ func (self *visitorSim) trace(run int, priorKey string, prior []lagdrift.Observa
 		estimateCounts: make([]int, len(self.sessions[run])),
 		estimates:      make([]lagdrift.RoundTrip, len(self.sessions[run])),
 		cadence:        self.config.cadence,
+		usable:         usable,
 		preStops:       map[int]*lagdrift.Fit{},
 		forks:          map[int]*runTrace{},
 	}
@@ -655,7 +662,7 @@ func (self *runTrace) compute(j int) *tickState {
 			n += 1
 		}
 		state.roundTrips[i] = n
-		if n < lagdrift.MinRoundTripSamples {
+		if n < lagdrift.MinRoundTripSamples || (self.sim.config.stopOnUsable && n < self.usable) {
 			continue
 		}
 		if self.estimateCounts[i] != n {
@@ -817,6 +824,13 @@ func (self *runTrace) rule(policy stopPolicy, j int) (lagdrift.StopReason, bool)
 // A fork lands in another basin farther than this from the refit, km.
 const basinKm = 1
 
+// lateFarSessions: a session's extra opening time, ms, at and beyond this
+// distance, km, and in proportion nearer.
+const (
+	lateSessionMs = 3000
+	lateSessionKm = 7500
+)
+
 // The fork the full fit before a stop at ping round j leads to, or nil when it
 // stays in the refit's basin.
 func (self *runTrace) forkAt(j int) *runTrace {
@@ -852,6 +866,7 @@ func (self *runTrace) forkAt(j int) *runTrace {
 		estimateCounts: slices.Clone(self.estimateCounts),
 		estimates:      slices.Clone(self.estimates),
 		cadence:        true,
+		usable:         self.usable,
 		historyFrom:    j - 1,
 		lastFullMs:     state.atMs,
 		lastFullSet:    extenderSet(state.obs),

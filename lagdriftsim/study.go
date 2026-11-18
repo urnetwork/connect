@@ -51,6 +51,13 @@ type studyConfig struct {
 	// starts around the fit and the address's place, when lower by more than
 	// 1: what wider starts would change
 	wideStarts bool
+	// V10 (e2e): the frame decides its stops on the fit over usable extenders
+	// only, those with the policy's round trips; else over every extender with
+	// 4
+	stopOnUsable bool
+	// far sessions open late, as on the real stack: 3 s × min(1, d / 7,500 km)
+	// more than their round trips take
+	lateFarSessions bool
 	// V11's calibration tracks: lag.dev's own choice, one run to the cap with
 	// no frame fits, and the fit measured from the city point as well
 	lagTracks bool

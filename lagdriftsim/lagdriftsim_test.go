@@ -556,3 +556,54 @@ func TestLagTrackChoice(t *testing.T) {
 		t.Errorf("the far extenders are in %d countries, expected 5", len(countries))
 	}
 }
+
+// V10 (e2e): with stops on the usable fit, every ping round's fit holds only
+// extenders with the usable round trips; and a far session opens late in
+// proportion to its distance.
+func TestStopsOnUsable(t *testing.T) {
+	w := newWorld(worldConfig{seed: 9}, nil)
+	specs, _ := buildVisitors(w, 9, []scenarioCount{{scenario: scenarioTiny, perRegion: 1, regions: []string{regionEurope}}}, 0)
+	config := baseConfig(9, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+	config.stopOnUsable = true
+	config.lateFarSessions = true
+	config.runs = 1
+	sim := &visitorSim{world: w, config: &config, spec: specs[0], fleet: w.fleets[specs[0].fleet], model: lagdrift.DefaultModel(),
+		stretches: map[int]float64{}, traces: map[string]*runTrace{}, verdicts: map[string]*verdictRecord{}, runs: 1}
+	sim.outcome = &visitorOutcome{spec: specs[0]}
+	r := newRand(9, drawVisitor, uint64(specs[0].index))
+	sim.access = drawAccessLink(r)
+	sim.serving = make([]bool, len(w.pool))
+	for i := range sim.serving {
+		sim.serving[i] = r.Float64() < servingShare
+	}
+	sim.openSessions()
+	trace := sim.trace(0, "|12", nil, 12)
+	fits := 0
+	for j := 1; j <= capTicks; j++ {
+		state := trace.tick(j)
+		usable := 0
+		for _, n := range state.roundTrips {
+			if 12 <= n {
+				usable += 1
+			}
+		}
+		if state.fit != nil {
+			fits += 1
+			if usable < state.fit.Extenders {
+				t.Fatalf("at %d ms the fit has %d extenders, only %d usable", state.atMs, state.fit.Extenders, usable)
+			}
+		}
+	}
+	if fits == 0 {
+		t.Fatalf("no fit in 12 s")
+	}
+	for _, s := range sim.sessions[0] {
+		if s.openMs < 0 {
+			continue
+		}
+		d := lagdrift.DistanceKm(specs[0].truth, sim.trueAt(s.poolIndex))
+		if late := lateSessionMs * math.Min(1, d/lateSessionKm); s.openMs < late {
+			t.Errorf("a session %g km away opened at %g ms, before its %g ms of lateness", d, s.openMs, late)
+		}
+	}
+}

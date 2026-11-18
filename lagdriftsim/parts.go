@@ -200,6 +200,7 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	parts = append(parts, kappa...)
 	parts = append(parts, variants, misplaced, normal)
 	parts = append(parts, v11Parts(seed, scale)...)
+	parts = append(parts, usableStopParts(seed, scale)...)
 	parts = append(parts, calibrationParts(seed, scale)...)
 	parts = append(parts, startsParts(seed, scale)...)
 	parts = append(parts, vpnParts(seed, scale)...)
@@ -281,6 +282,35 @@ func v11Parts(seed uint64, scale float64) []*studyPart {
 	table.config.choiceMode = choiceHybrid
 	table.config.kByContinent = v11Table99
 	return []*studyPart{lag, defaults, calibrated, table}
+}
+
+// V10's stops on the verdict's evidence (e2e): far sessions opening late, as
+// on the real stack, and the frame deciding its stops on every extender with
+// 4 round trips, as before, or on the usable ones only, as V10 now says, at
+// 12 and at 8 usable round trips. The hybrid choice, V11's table, 3 runs.
+func usableStopParts(seed uint64, scale float64) []*studyPart {
+	counts := append(counted(scale, 800, scenarioTiny), counted(scale, 500, scenarioRealHonest)...)
+	counts = append(counts, counted(scale, 150, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
+	counts = append(counts, counted(scale, 40, scenarioVpnPairs)...)
+	eight := v10Policy(lagdrift.EarlyK)
+	eight.roundTrips = 8
+	eight.name = "round trips 8"
+	parts := []*studyPart{}
+	for _, usable := range []bool{false, true} {
+		name := "late sessions: stops on 4"
+		about := "far sessions 3 s × min(1, d / 7,500 km) late; the frame's stops on every extender with 4 round trips"
+		if usable {
+			name = "late sessions: stops on usable"
+			about = "far sessions 3 s × min(1, d / 7,500 km) late; the frame's stops on the usable extenders only (V10)"
+		}
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), eight}), counts: counts}
+		part.config.choiceMode = choiceHybrid
+		part.config.kByContinent = v11Table99
+		part.config.lateFarSessions = true
+		part.config.stopOnUsable = usable
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 // V11's fixed 99% table (lag.dev/DRIFTTEST.md V11, the user's decision of
