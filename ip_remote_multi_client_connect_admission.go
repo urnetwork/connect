@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"errors"
 	"sync/atomic"
 	"time"
 )
@@ -29,6 +30,11 @@ func packetGroupTransferUnwritten(err error) bool {
 		return true
 	}
 	if _, ok := err.(*sendGroupCapacityError); ok {
+		return true
+	}
+	// A superseded native opening has no wire ordinal when its source
+	// certifies the original Pack was still unwritten.
+	if unwritten, ok := err.(*sendPackUnwrittenError); ok && errors.Is(unwritten.cause, errNativeSynOpeningSuperseded) {
 		return true
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {

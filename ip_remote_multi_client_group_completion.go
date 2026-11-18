@@ -815,6 +815,9 @@ func (self *parsedPacketGroup) publishCollapseWithLock() {
 // Disposition precedes original pool return and follows successful retention.
 // An unfunded first chunk disposes the raw group before its source waits.
 func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized bool) {
+	if materialized && self.receiveAckOffer.use != nil && self.completionFlags.Load()&groupCompletionAck != 0 {
+		self.receiveAckOffer.dispatched.Store(true)
+	}
 	if offer := self.connectSynOffer; offer != nil && materialized {
 		// The group callback joins only errors. A later unwritten chunk
 		// cannot retract a SYN already taken by an earlier serializer.

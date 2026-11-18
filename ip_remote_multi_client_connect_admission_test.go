@@ -4,11 +4,13 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/netip"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -177,6 +179,7 @@ func TestMultiClientUnadmittedSynDoesNotCreateConnectEvidence(t *testing.T) {
 func TestMultiClientAdmittedSynKeepsConnectEvidence(t *testing.T) {
 	hard := errors.New("synthetic admitted structural failure")
 	capacity := &sendGroupCapacityError{cause: ErrSendPackNotAdmitted}
+	unwrittenOpening := newUnwrittenSendPackError(errNativeSynOpeningSuperseded)
 	for _, grouped := range []bool{false, true} {
 		for _, requestedAck := range []bool{false, true} {
 			for _, inline := range []bool{false, true} {
@@ -191,6 +194,11 @@ func TestMultiClientAdmittedSynKeepsConnectEvidence(t *testing.T) {
 					wanted       bool
 				}{
 					{name: "peer-ack", wanted: true},
+					{name: "unwritten-opening", completed: unwrittenOpening, groupOnly: true},
+					{name: "canceled-unwritten-opening", completed: newUnwrittenSendPackError(fmt.Errorf("%w: %w", errNativeSynOpeningSuperseded, context.Canceled)), groupOnly: true},
+					{name: "opening-without-unwritten-proof", completed: errNativeSynOpeningSuperseded, groupOnly: true, wanted: true},
+					{name: "unwritten-opening-and-ambiguous-chunk", completed: errors.Join(unwrittenOpening, hard), groupOnly: true, wanted: true},
+					{name: "materialized-syn-before-unwritten-opening", completed: unwrittenOpening, groupOnly: true, materialized: true, synPrefix: true, wanted: true},
 					{name: "ambiguous", completed: ErrSendPackNotAdmitted, wantErr: ErrSendPackNotAdmitted, wanted: true},
 					{name: "write-timeout", completed: errTransferRouteWriteTimeout, wantErr: errTransferRouteWriteTimeout, wanted: true},
 					{name: "hard-error", completed: hard, wantErr: hard, wanted: true},
@@ -419,6 +427,219 @@ func TestMultiClientReceivedSynFencesLateAdmissionEvidence(t *testing.T) {
 					}
 				}
 			}
+		}
+	}
+}
+
+// A second destination corroborates silence only after its original entered
+// Transfer. The older A buckets contain real sends and peer acknowledgements.
+func TestMultiClientReceiveAckCorroborationUsesAdmittedDestinations(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	const writeTimeout = 20 * time.Millisecond
+	for _, disposition := range []string{
+		"refused", "unwritten", "inline-unwritten", "wire-unacked", "ambiguous",
+		"overlap", "rotated-overlap", "noack-inline-timeout", "noack-single-inline-timeout",
+		"noack-written", "noack-partially-written",
+	} {
+		// Report verdict differences after the bubble so a failed case does
+		// not stop the remaining independent cases inside synctest.Test.
+		var verdictErrors []string
+		synctest.Test(t, func(t *testing.T) {
+			t.Logf("receive-ACK disposition %s", disposition)
+			noAckTerminals := make(chan error, 1)
+			fixture := newGroupDispositionQueueFixture(t, nil, func(settings *ClientSettings) {
+				settings.SendBufferSettings.ChunkSettings.SharedMaxFrames = 1
+				settings.SendBufferSettings.WriteTimeout = writeTimeout
+				observe := settings.SendBufferSettings.SendPackLifecycleObserver
+				settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+					observe(event)
+					if !event.AckRequired && event.Phase == SendPackLifecyclePhaseTerminal {
+						select {
+						case noAckTerminals <- event.Err:
+						default:
+							t.Error("extra NoAck terminal event")
+						}
+					}
+				}
+			})
+			fixture.route = make(Route, 1)
+			fixture.client.RouteManager().UpdateTransport(fixture.transport, []Route{fixture.route})
+			channel := fixture.selected
+			first := reraceSegment(reraceFlow(4, 1, 40321), 0, []byte("first destination"))
+			second := reraceSegment(reraceFlow(4, 2, 40322), 0, []byte("second destination"))
+			udpPath := reraceUdpFlow(4, 2, 40322)
+			datagram := ipOosUdpPacket(udpPath, []byte("second destination datagram"))
+			offer := func(simulated, ack, grouped bool, templates ...[]byte) (bool, error) {
+				t.Helper()
+				group := &parsedPacketGroup{}
+				for _, template := range templates {
+					packet := MessagePoolCopy(template)
+					parsed := groupRecoveryParsed(t, packet)
+					group.packets = append(group.packets, *parsed)
+					group.byteCount += ByteCount(len(packet))
+				}
+				group.ipPath = group.packets[0].ipPath
+				var admitted bool
+				var err error
+				if grouped {
+					admitted, err = channel.SendGroupDetailedWithAck(group, 0, ack)
+				} else {
+					admitted, err = channel.SendDetailedWithAck(&group.packets[0], 0, ack)
+				}
+				if simulated || !admitted {
+					for _, packet := range group.packets {
+						MessagePoolReturn(packet.packet)
+					}
+				}
+				return admitted, err
+			}
+			acknowledgeFirst := func(initial bool) {
+				t.Helper()
+				if admitted, err := offer(false, true, true, first); !admitted || err != nil {
+					t.Fatalf("first destination admission=%t err=%v", admitted, err)
+				}
+				if initial {
+					fixture.requireParked()
+					fixture.unpark()
+				}
+				fixture.acknowledgeAll(first)
+			}
+			acknowledgeFirst(true)
+			time.Sleep(2 * time.Second)
+			acknowledgeFirst(false)
+			const receiveTimeout = 20 * time.Second
+			time.Sleep(receiveTimeout - time.Second)
+			requireVerdict := func(stage string, want blackholeReason, wantRaw int) {
+				t.Helper()
+				stats, err := channel.WindowStats()
+				if err != nil || stats.sendDestinationCount != wantRaw || !hasPeerSendAckInWindow(stats) || stats.receiveAckCount != 0 {
+					t.Fatalf("%s: lost exact premise: offered=%d peerAck=%t received=%d err=%v", stage, stats.sendDestinationCount, hasPeerSendAckInWindow(stats), stats.receiveAckCount, err)
+				}
+				got, held := blackholeReasonFromStats(time.Now(), stats, 30*time.Second, receiveTimeout, 30*time.Second,
+					blackholeGates{minReceiveAckDestinations: 2})
+				if got != want || held != blackholeNone {
+					verdictErrors = append(verdictErrors, fmt.Sprintf("%s: no-receive-ACK verdict=%s held=%s, want %s", stage, got, held, want))
+				}
+			}
+			readWire := func(wantNack bool, template []byte) {
+				t.Helper()
+				select {
+				case wire := <-fixture.route:
+					defer MessagePoolReturn(wire)
+					pack := decodeSendPackLifecycleWirePack(t, wire)
+					if pack.Nack != wantNack || len(pack.Frames) != 1 || !bytes.Equal(pack.Frames[0].MessageBytes, template) {
+						t.Fatalf("wrong second-destination wire Pack: NoAck=%t frames=%d", pack.Nack, len(pack.Frames))
+					}
+				default:
+					t.Fatal("second destination supplied no wire proof")
+				}
+			}
+			requireVerdict("only first destination", blackholeNone, 1)
+			var complete AckFunction
+			simulated := disposition != "wire-unacked" && disposition != "noack-written" && disposition != "noack-partially-written"
+			if simulated {
+				channel.sendTransferForTest = func(callback AckFunction) (bool, error) {
+					complete = callback
+					requireVerdict("inside second destination admission", blackholeNone, 2)
+					switch disposition {
+					case "inline-unwritten":
+						callback(errSendPackExpiredUnwritten)
+					case "noack-inline-timeout", "noack-single-inline-timeout":
+						callback(errTransferRouteWriteTimeout)
+					}
+					return disposition != "refused", nil
+				}
+			}
+			var admitted bool
+			var err error
+			switch disposition {
+			case "noack-inline-timeout", "noack-written":
+				admitted, err = offer(simulated, false, true, datagram)
+			case "noack-single-inline-timeout":
+				admitted, err = offer(true, false, false, datagram)
+			case "noack-partially-written":
+				suffix := ipOosUdpPacket(udpPath, []byte("suffix blocked by full route"))
+				admitted, err = offer(false, false, true, datagram, suffix)
+			default:
+				admitted, err = offer(simulated, true, true, second)
+			}
+			if err != nil || admitted != (disposition != "refused") {
+				t.Fatalf("second destination admission=%t err=%v", admitted, err)
+			}
+
+			switch disposition {
+			case "refused", "inline-unwritten", "noack-inline-timeout", "noack-single-inline-timeout":
+				requireVerdict("second destination definitively unwritten", blackholeNone, 2)
+			case "unwritten":
+				requireVerdict("second destination admitted", blackholeNoReceiveAck, 2)
+				complete(errSendPackExpiredUnwritten)
+				requireVerdict("second destination proved unwritten", blackholeNone, 2)
+			case "wire-unacked":
+				synctest.Wait()
+				readWire(false, second)
+				if stats, err := channel.WindowStats(); err != nil || stats.sendNackCount != 1 || stats.sendAckCount != 2 {
+					t.Fatalf("lost-ACK ledger: outstanding=%d peer-completed=%d err=%v", stats.sendNackCount, stats.sendAckCount, err)
+				}
+				requireVerdict("second destination serialized, ACK withheld", blackholeNoReceiveAck, 2)
+			case "ambiguous":
+				requireVerdict("second destination admitted", blackholeNoReceiveAck, 2)
+				terminal := errors.New("synthetic ambiguous writer failure")
+				complete(terminal)
+				if _, err := channel.WindowStats(); !errors.Is(err, terminal) {
+					t.Fatalf("ambiguous writer failure was softened: %v", err)
+				}
+			case "overlap", "rotated-overlap":
+				firstCompletion := complete
+				requireVerdict("older second-destination offer admitted", blackholeNoReceiveAck, 2)
+				if disposition == "rotated-overlap" {
+					channel.sendTransferForTest = nil
+					time.Sleep(3 * time.Second)
+					acknowledgeFirst(false)
+					time.Sleep(2 * time.Second)
+					acknowledgeFirst(false)
+					time.Sleep(27 * time.Second)
+					requireVerdict("original second-destination bucket expired", blackholeNone, 1)
+				}
+				channel.sendTransferForTest = func(callback AckFunction) (bool, error) {
+					complete = callback
+					return true, nil
+				}
+				if admitted, err := offer(true, true, true, second); !admitted || err != nil {
+					t.Fatalf("overlapping offer admission=%t err=%v", admitted, err)
+				}
+				firstCompletion(errSendPackExpiredUnwritten)
+				requireVerdict("newer original remains eligible", blackholeNoReceiveAck, 2)
+				complete(errSendPackExpiredUnwritten)
+				requireVerdict("both second-destination originals proved unwritten", blackholeNone, 2)
+			case "noack-written", "noack-partially-written":
+				synctest.Wait()
+				if disposition == "noack-partially-written" {
+					// The first chunk occupies the only carrier slot
+					// until the second chunk reaches its write bound.
+					if len(fixture.route) != 1 {
+						t.Fatal("split NoAck did not fill the carrier with its prefix")
+					}
+					time.Sleep(writeTimeout + time.Millisecond)
+					synctest.Wait()
+				}
+				select {
+				case err := <-noAckTerminals:
+					if disposition == "noack-partially-written" && !errors.Is(err, errTransferRouteWriteTimeout) ||
+						disposition == "noack-written" && err != nil {
+						t.Fatalf("unexpected NoAck terminal result: %v", err)
+					}
+				default:
+					t.Fatal("NoAck group did not reach terminal custody")
+				}
+				readWire(true, datagram)
+				requireVerdict("a NoAck carrier accepted the second destination", blackholeNoReceiveAck, 2)
+			}
+			if len(fixture.route) != 0 {
+				t.Fatal("unexpected physical Pack remained in the second destination test")
+			}
+		})
+		for _, verdictError := range verdictErrors {
+			t.Errorf("%s: %s", disposition, verdictError)
 		}
 	}
 }

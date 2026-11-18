@@ -266,11 +266,11 @@ func TestExitsReportEffectiveTier(t *testing.T) {
 func TestBlackholeDestinationGate(t *testing.T) {
 	receiveSilent := func(destinations int) *clientWindowStats {
 		return &clientWindowStats{
-			log:                  DefaultLogger(),
-			firstSendNackTime:    time.Now().Add(-21 * time.Second),
-			sendAckCount:         7,
-			receiveAckCount:      0,
-			sendDestinationCount: destinations,
+			log:                        DefaultLogger(),
+			firstSendNackTime:          time.Now().Add(-21 * time.Second),
+			sendAckCount:               7,
+			receiveAckCount:            0,
+			receiveAckDestinationCount: destinations,
 		}
 	}
 

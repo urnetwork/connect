@@ -12681,6 +12681,8 @@ type parsedPacketGroup struct {
 	nativeAckRetry          *tcpNativeAckRetryAttempt
 	nativeAckRetrySelection *multiClientAffinitySelection
 	nativeAckRetrySerial    uint64
+
+	receiveAckOffer receiveAckOffer
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -17656,6 +17658,8 @@ type multiClientEventBucket struct {
 	errs                []error
 	ip4Paths            map[Ip4Path]bool
 	ip6Paths            map[Ip6Path]bool
+
+	receiveAckDestinationUses map[receiveAckDestination]*receiveAckDestinationUse
 }
 
 func newMultiClientEventBucket() *multiClientEventBucket {
@@ -17671,31 +17675,25 @@ type clientWindowStats struct {
 
 	sourceCount    int
 	netSourceCount int
-	// sendDestinationCount is how many distinct destination paths (protocol,
-	// destination ip, destination port) this channel has sent toward inside
-	// the surviving stats window. Computed as the key count of the
-	// ip{4,6}DestinationSourceCount maps, which addSend maintains per
-	// surviving bucket and coalesceEventBuckets releases with the buckets --
-	// so the count covers exactly the same buckets the packet counters
-	// aggregate over (all surviving buckets, including the newest partial
-	// ones). This is the corroboration input to the no-receive-ack blackhole
-	// gate: with only one destination in the window, tunnel silence is
-	// indistinguishable from that one destination being dead. See
-	// MinBlackholeDestinations.
+	// Offered destinations support the same raw path telemetry as sourceCount.
 	sendDestinationCount int
-	sendAckCount         int
-	sendAckByteCount     ByteCount
-	sendNackCount        int
-	sendNackByteCount    ByteCount
-	sendSynCount         int
-	receiveAckCount      int
-	receiveAckByteCount  ByteCount
-	receiveSynCount      int
-	ackByteCount         ByteCount
-	windowDuration       time.Duration
-	firstSendAckTime     time.Time
-	firstSendNackTime    time.Time
-	firstSendSynTime     time.Time
+	// Accepted destinations with no definitive no-write result corroborate
+	// exit silence across the surviving stats buckets.
+	receiveAckDestinationCount int
+
+	sendAckCount        int
+	sendAckByteCount    ByteCount
+	sendNackCount       int
+	sendNackByteCount   ByteCount
+	sendSynCount        int
+	receiveAckCount     int
+	receiveAckByteCount ByteCount
+	receiveSynCount     int
+	ackByteCount        ByteCount
+	windowDuration      time.Duration
+	firstSendAckTime    time.Time
+	firstSendNackTime   time.Time
+	firstSendSynTime    time.Time
 	// A snapshot of the lifetime outstanding-send clock, not a rolling
 	// bucket. sendProgressKnown distinguishes an idle real channel from old
 	// synthetic stats that only carry firstSendNackTime.
@@ -18049,6 +18047,10 @@ type multiClientChannel struct {
 	connectSynEpoch         uint64
 	connectSynPending       *connectSynOffer
 	connectSynConfirmedTime time.Time
+
+	// The same destination can be eligible in several retained event buckets.
+	// Entries exist only while at least one such bucket supplies evidence.
+	receiveAckDestinationBucketCounts map[receiveAckDestination]int
 	// The health loop's wake while it is parked on an idle channel
 	// (parkIdleBlackhole), nil otherwise. The first send of a run and the
 	// channel's first error signal it and clear it, so the loop judges the
@@ -20262,6 +20264,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		// It cannot later prove an unwritten local expiry.
 		self.finishConnectSynOffer(synOffer, true)
 		synAdmitted = true
+		self.admitReceiveAckOffer(&sendPacketGroup.receiveAckOffer)
 		return true, nil
 	}
 
@@ -20314,11 +20317,10 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	if !ack {
 		opts = append(opts, NoAck())
 	}
-	if sendPacketGroup.transportAttribution != nil {
-		opts = append(
-			opts,
-			observeTransportWrite(sendPacketGroup.transportAttribution.observe),
-		)
+	if !ack && sendPacketGroup.receiveAckOffer.use != nil {
+		opts = append(opts, observeTransportWrite(sendPacketGroup.observeReceiveAckNoAckRouteWrite))
+	} else if sendPacketGroup.transportAttribution != nil {
+		opts = append(opts, observeTransportWrite(sendPacketGroup.transportAttribution.observe))
 	}
 	var success bool
 	var err error
@@ -20351,6 +20353,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
 	}
 	synAdmitted = true
+	self.admitReceiveAckOffer(&sendPacketGroup.receiveAckOffer)
 	for packetIndex, frame := range frames {
 		if !frame.Raw {
 			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
@@ -20368,7 +20371,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		return false, err
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
-		synOffer := self.addSend(packetByteCount, parsedPacket.ipPath)
+		var completion struct {
+			once         sync.Once
+			receiveOffer receiveAckOffer
+		}
+		synOffer := self.addSend(packetByteCount, parsedPacket.ipPath, &completion.receiveOffer)
 		synAdmitted := false
 		if synOffer != nil {
 			defer func() { self.resolveConnectSynAdmission(synOffer, synAdmitted) }()
@@ -20400,15 +20407,16 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			MessagePoolReturn(parsedPacket.packet)
 			self.finishConnectSynOffer(synOffer, true)
 			synAdmitted = true
+			self.admitReceiveAckOffer(&completion.receiveOffer)
 			return true, nil
 		}
 
-		var completionOnce sync.Once
 		collapseAdmission := parsedPacket.collapseAdmission
 		ackCallback := func(err error) {
-			completionOnce.Do(func() {
+			completion.once.Do(func() {
 				self.finishConnectSynOffer(synOffer, !packetTransferExpiredUnwritten(err))
 				collapseAdmission.complete(err)
+				self.finishReceiveAckOffer(&completion.receiveOffer, !ack, err)
 				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
 			})
 		}
@@ -20458,6 +20466,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 		if success {
 			synAdmitted = true
+			self.admitReceiveAckOffer(&completion.receiveOffer)
 			if !frame.Raw {
 				MessagePoolReturn(parsedPacket.packet)
 			}
@@ -20573,6 +20582,7 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	ack bool,
 	err error,
 ) {
+	self.finishReceiveAckOffer(&sendPacketGroup.receiveAckOffer, !ack, err)
 	localUnwritten := packetGroupTransferUnwritten(err)
 	if offer := sendPacketGroup.connectSynOffer; offer != nil {
 		self.finishConnectSynOffer(offer, !localUnwritten || offer.materialized.Load())
@@ -20698,7 +20708,7 @@ type blackholeGates struct {
 	receiveFreshSince time.Time
 	// minReceiveAckDestinations is the corroboration bar for the
 	// no-receive-ack verdict: the window must contain sends toward at least
-	// this many distinct destination paths (windowStats.sendDestinationCount)
+	// this many corroborating destinations (windowStats.receiveAckDestinationCount)
 	// or the verdict does not fire at all. One destination silent through an
 	// alive, acking exit is what a single dead website looks like, not what
 	// a broken exit looks like. Strictly speaking this is a config threshold
@@ -20946,7 +20956,7 @@ func blackholeReasonFromStats(
 			// "held" verdict -- insufficient evidence, not inadmissible; see
 			// blackholeGates.minReceiveAckDestinations
 			(gates.minReceiveAckDestinations <= 1 ||
-				gates.minReceiveAckDestinations <= windowStats.sendDestinationCount) {
+				gates.minReceiveAckDestinations <= windowStats.receiveAckDestinationCount) {
 			return verdict(blackholeNoReceiveAck, true)
 		}
 	}
@@ -21521,12 +21531,8 @@ func (self *multiClientChannel) detectBlackhole() {
 						if action == verdictActionExecuteExpired {
 							expired = " quarantine expired"
 						}
-						// dsts is the distinct-send-destination count behind the
-						// MinBlackholeDestinations gate: a field capture must be
-						// able to tell "many destinations silent" (a real
-						// blackhole) from "one destination silent" (a dead
-						// website that squeaked past a lowered gate) on the one
-						// line that survives into a field log.
+						// dsts is the corroborating count read by the
+						// no-receive-ACK verdict.
 						nackSince := windowStats.firstSendNackTime
 						if reason == blackholeNoSendAck {
 							nackSince = unacknowledgedSendSince(windowStats)
@@ -21543,7 +21549,7 @@ func (self *multiClientChannel) detectBlackhole() {
 							windowStats.receiveSynCount,
 							blackholeAgeString(nackSince),
 							blackholeAgeString(windowStats.firstSendSynTime),
-							windowStats.sendDestinationCount,
+							windowStats.receiveAckDestinationCount,
 						))
 						return
 					}
@@ -21796,7 +21802,7 @@ func (self *multiClientChannel) ping() {
 // addSend records the per-packet send stats (nack, optional syn, and source)
 // in a single locked section, so the hot send path takes the channel lock and
 // resolves the event bucket once per packet instead of two-three times.
-func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath) *connectSynOffer {
+func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath, receiveOffers ...*receiveAckOffer) *connectSynOffer {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -21831,6 +21837,9 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	}
 
 	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
+	if len(receiveOffers) != 0 {
+		eventBucket.prepareReceiveAckOfferWithLock(ipPath, receiveOffers[0])
+	}
 	return synOffer
 }
 
@@ -21875,6 +21884,11 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 		eventBucket.sendSynCount += synCount
 	}
 	self.addSourceToEventBucketWithLock(eventBucket, sendPacketGroup.ipPath)
+	// Only the caller owns a descriptor reused after a public refusal.
+	sendPacketGroup.receiveAckOffer = receiveAckOffer{}
+	if packetCount != 0 {
+		eventBucket.prepareReceiveAckOfferWithLock(sendPacketGroup.ipPath, &sendPacketGroup.receiveAckOffer)
+	}
 	return synOffer
 }
 
@@ -22243,6 +22257,12 @@ func (self *multiClientChannel) coalesceEventBuckets() {
 		self.packetStats.receiveAckByteCount -= eventBucket.receiveAckByteCount
 		self.packetStats.receiveSynCount -= eventBucket.receiveSynCount
 
+		for _, use := range eventBucket.receiveAckDestinationUses {
+			use.retired = true
+			if use.pending != 0 || use.retained {
+				self.removeReceiveAckDestinationBucketWithLock(use)
+			}
+		}
 		for ip4Path, _ := range eventBucket.ip4Paths {
 			source := ip4Path.Source()
 			destination := ip4Path.Destination()
@@ -22425,6 +22445,7 @@ func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWind
 		// keyed by destination path and pruned to zero with their buckets,
 		// so the key count is exactly the window's distinct-destination set
 		sendDestinationCount:       len(self.ip4DestinationSourceCount) + len(self.ip6DestinationSourceCount),
+		receiveAckDestinationCount: len(self.receiveAckDestinationBucketCounts),
 		sendAckCount:               self.packetStats.sendAckCount,
 		sendNackCount:              self.packetStats.sendNackCount,
 		sendAckByteCount:           self.packetStats.sendAckByteCount,

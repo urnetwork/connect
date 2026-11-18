@@ -299,6 +299,7 @@ func testNativeFirstSynOpeningSourceBoundary(t *testing.T, boundary string, rese
 			t.Fatalf("source boundary changed exact custody: ACKs=%d SYNs=%d want=%d elapsed=%s", acks, syns, wantSyns, time.Since(before))
 		}
 		fixture.requirePeerAckIdle(t, wantSyns, before)
+		requireConnectAdmissionEvidence(t, "native SYN source disposition", fixture.base.selected, syns != 0, time.Time{}, nil)
 		fixture.requireLaterAck(t)
 	})
 }
