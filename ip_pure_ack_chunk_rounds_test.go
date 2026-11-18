@@ -70,7 +70,7 @@ func newPureAckChunkFixture(t *testing.T, version int, carrier TransportType,
 	self.selected.ctx, self.selected.client, self.selected.settings = parent.ctx, self.sender, parent.settings
 	self.selected.args = &multiClientChannelArgs{Destination: RequireMultiHopId(self.receiver.ClientId())}
 	update.client.Store(self.selected)
-	t.Cleanup(func() { closeParent(); self.selected.closeConnectSynOwners() })
+	t.Cleanup(closeParent)
 	self.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, peer Peer) {
 		receipt := peer.deliveryReceipt()
 		if receipt == nil || receipt.item == nil {

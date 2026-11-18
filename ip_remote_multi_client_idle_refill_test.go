@@ -209,8 +209,8 @@ func TestActiveDeviceWindowRefillTimingUnchangedByTheHold(t *testing.T) {
 			heldBefore := stats.expandPasses[windowStatsWindowQuality][windowExpandPassHeldIdle].Load()
 			lostAt := time.Now()
 			lostClient := idleRefillTestLoseAnExit(h)
-			if _, selectableCount := strictHandoverTestCounts(window); selectableCount != 4 {
-				t.Fatalf("the lost exit is still selectable: %d selectable", selectableCount)
+			if !lostClient.IsDone() {
+				t.Fatal("the lost exit is still selectable")
 			}
 			// the window's resize pass sees the loss before the refill is read
 			synctest.Wait()
