@@ -16420,6 +16420,166 @@ paths:
         "503":
           description: Mail is not served, or the zone cannot be written now.
 
+  /smtp/dkim-keys:
+    post:
+      x-internal: true
+      tags: [Network]
+      summary: Publish and retire a sending sidecar's DKIM selectors
+      description: |
+        A sending sidecar's own DKIM selectors, with its client token: each
+        one to publish names its selector (26 lowercase base32 characters),
+        its d= (the network's name, a replying burner's label under it, or a
+        verified Team domain, whose _domainkey points each selector at the
+        network's name) and its RSA-2048 public key as DER
+        SubjectPublicKeyInfo; URnetwork holds only public keys. One call
+        publishes and retires together, so a rotation is one write; a retired
+        selector stays in DNS 7 days, then leaves it, and its key is kept 30
+        days more so late reports still check. Publishing a selector the
+        caller published with the same key again, and retiring one already
+        retired or one it does not hold, are no errors, so a sidecar that lost
+        an answer sends the same body again. A publish needs the sidecar's
+        mail_send grant and mail sending open to the network. Past the
+        network's dns_dkim_selectors, 64 device selectors with burners' not
+        counted, the call is refused whole with the quota's refusal, and
+        nothing in it applies. A removal of the sidecar takes its selectors
+        out of DNS in the same write. The answer names every selector the
+        call published and every one it retired. 503 with Retry-After while
+        the server does not serve this yet, while a check cannot be read, or
+        while the zone cannot be written.
+      operationId: smtpDkimKeys
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmtpDkimKeysArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmtpDkimKeysResult"
+        "400":
+          description: A selector, domain or key out of its form, a domain that is not the network's, or too many selectors (code smtp_dkim_args or smtp_dkim_domain).
+        "402":
+          description: Past the network's dns_dkim_selectors, which a higher tier lifts (a QuotaRefusal).
+        "403":
+          description: The caller is no sidecar of the network, holds no mail_send grant, or the network's zone is suspended (code smtp_no_sidecar or mail_send).
+        "409":
+          description: A selector is stored under another key, another sidecar, or retired (code smtp_dkim_selector_taken).
+        "429":
+          description: Past the network's dns_dkim_selectors (a QuotaRefusal).
+        "503":
+          description: Not served yet, a check cannot be read, mail sending is not open to the network, or the zone cannot be written now.
+
+  /smtp/status:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's network's outbound mail status
+      description: |
+        The caller's network's smtp limits as its tier and §21 set them,
+        today's counts (UTC) as the mail edges keep them, absent when they
+        cannot be read, and the halts holding now: the whole network's or one
+        burner label's, each with its trigger, start and end. A sender whose
+        queue a halt holds reads the halt's scope here.
+      operationId: smtpStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmtpStatusResult"
+        "503":
+          description: Not served yet, or the status cannot be read now.
+
+  /smtp/reports:
+    get:
+      x-internal: true
+      tags: [Network]
+      summary: The caller's network's mail reports
+      description: |
+        The feedback-loop complaints and role mail attributed to the caller's
+        network that arrived at or after since, each with its attribution
+        fields and its sealed copy, the raw report sealed to the network mail
+        key (kept 30 days), and the network's aggregate (DMARC and TLS-RPT)
+        counts of the days from since's on, one row per report and
+        header_from. A page holds at most 100 complaints, 8 MiB of sealed
+        copies and 1,000 aggregate rows; pass the answer's cursor back for the
+        next. Only a sidecar the network's policy grants read on the repo that
+        holds the network mail key may read them.
+      operationId: smtpReports
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: since
+          in: query
+          required: true
+          description: Unix milliseconds.
+          schema:
+            type: integer
+            format: int64
+        - name: cursor
+          in: query
+          required: false
+          description: The cursor of the page before, to read the next.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmtpReportsResult"
+        "400":
+          description: No since, or a cursor this route did not give.
+        "403":
+          description: The caller is no sidecar of the network, or may not read the network's reports.
+        "503":
+          description: Not served yet, or a check or the reports cannot be read now.
+
+  /smtp/appeal:
+    post:
+      tags: [Network]
+      summary: Appeal the network's mail halts
+      description: |
+        An Owner's or Admin's recheck of the network's halts holding now, or
+        of the one named: each halt whose complaints, counted again, no
+        longer meet its rule (a duplicate, or one a not-spam report
+        cancelled since) is lifted, and leaves every mail edge within a
+        minute; the rest stay for abuse review. Never a client token. An
+        unknown halt, another network's and one that has ended answer 404
+        alike.
+      operationId: smtpAppeal
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmtpAppealArgs"
+      responses:
+        "200":
+          description: Each halt rechecked, and whether it lifted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmtpAppealResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+        "404":
+          description: Unknown halt.
+        "503":
+          description: Not served yet, or appeals cannot be taken now.
+
   /abuse/report:
     post:
       tags: [Other]
@@ -30913,6 +31073,233 @@ components:
         decision_reason:
           description: The second reviewer's reasons; empty while pending.
           type: string
+    SmtpDkimKeysArgs:
+      type: object
+      properties:
+        publish:
+          description: The selectors to publish.
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpDkimKeyPublish"
+        retire:
+          description: The selectors to retire, kept in DNS 7 days more.
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpDkimKeyRetire"
+    SmtpDkimKeyPublish:
+      type: object
+      required: [selector, domain, public_key]
+      properties:
+        selector:
+          description: 26 lowercase base32 characters of 16 random octets.
+          type: string
+        domain:
+          description: The selector's d=, lowercase.
+          type: string
+        public_key:
+          description: DER SubjectPublicKeyInfo of an RSA-2048 key, base64.
+          type: string
+          format: byte
+    SmtpDkimKeyRetire:
+      type: object
+      required: [selector, domain]
+      properties:
+        selector:
+          type: string
+        domain:
+          type: string
+    SmtpDkimKeysResult:
+      type: object
+      required: [published, retired]
+      properties:
+        published:
+          description: Every selector the call published, those already published with the same key included.
+          type: array
+          items:
+            type: string
+        retired:
+          description: Every selector the call named to retire.
+          type: array
+          items:
+            type: string
+    SmtpStatusResult:
+      type: object
+      required: [tier, enforced, limits, halts]
+      properties:
+        tier:
+          description: The network's tier.
+          type: string
+        enforced:
+          description: Whether the network's limits are enforced.
+          type: boolean
+        limits:
+          description: The smtp_* limits and dns_dkim_selectors by key; -1 is none and 0 not included.
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+        today:
+          $ref: "#/components/schemas/SmtpStatusDay"
+        halts:
+          description: The halts holding now, oldest first.
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpStatusHalt"
+    SmtpStatusDay:
+      type: object
+      required: [connection_count, recipient_count, byte_count]
+      properties:
+        connection_count:
+          type: integer
+          format: int64
+        recipient_count:
+          type: integer
+          format: int64
+        byte_count:
+          type: integer
+          format: int64
+    SmtpStatusHalt:
+      type: object
+      required: [halt_id, trigger, start_time, end_time]
+      properties:
+        halt_id:
+          type: string
+          format: uuid
+        label:
+          description: A burner label the halt holds; absent for the whole network.
+          type: string
+        trigger:
+          description: The rule that set it.
+          type: string
+        start_time:
+          description: Unix milliseconds, the report's arrival.
+          type: integer
+          format: int64
+        end_time:
+          description: Unix milliseconds, 24 hours after the start.
+          type: integer
+          format: int64
+    SmtpReportsResult:
+      type: object
+      required: [complaints, aggregates]
+      properties:
+        complaints:
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpReportsComplaint"
+        aggregates:
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpReportsAggregate"
+        cursor:
+          description: Where the next page starts; absent when both lists are done.
+          type: string
+    SmtpReportsComplaint:
+      type: object
+      required: [complaint_id, type, arrival_time]
+      properties:
+        complaint_id:
+          type: string
+          format: uuid
+        reporter:
+          description: The verified DKIM d= of the operator that sent it; absent for role mail.
+          type: string
+        type:
+          type: string
+        arrival_time:
+          description: Unix milliseconds.
+          type: integer
+          format: int64
+        domain:
+          type: string
+        dkim_domain:
+          type: string
+        dkim_selector:
+          type: string
+        dkim_result:
+          type: string
+        message_id_hash:
+          type: string
+          format: byte
+        x_ur_ref:
+          type: string
+        feedback_id:
+          type: string
+        join_result:
+          type: string
+        sealed_report:
+          description: The raw report sealed to the network mail key; absent when none was kept or after 30 days.
+          type: string
+          format: byte
+    SmtpReportsAggregate:
+      type: object
+      required: [reporter, report_id, kind, day, arrival_time, domain]
+      properties:
+        reporter:
+          type: string
+        report_id:
+          type: string
+        kind:
+          description: dmarc or tlsrpt.
+          type: string
+        day:
+          description: Unix milliseconds, the UTC day the report counts.
+          type: integer
+          format: int64
+        arrival_time:
+          type: integer
+          format: int64
+        domain:
+          description: The header_from, or for TLS-RPT the policy domain.
+          type: string
+        policy_type:
+          type: string
+        message_count:
+          type: integer
+          format: int64
+        dkim_pass_count:
+          type: integer
+          format: int64
+        spf_pass_count:
+          type: integer
+          format: int64
+        quarantine_count:
+          type: integer
+          format: int64
+        reject_count:
+          type: integer
+          format: int64
+        success_count:
+          type: integer
+          format: int64
+        failure_count:
+          type: integer
+          format: int64
+    SmtpAppealArgs:
+      type: object
+      properties:
+        halt_id:
+          description: The halt to recheck; absent rechecks every halt of the network holding now.
+          type: string
+          format: uuid
+    SmtpAppealResult:
+      type: object
+      required: [halts]
+      properties:
+        halts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SmtpAppealHalt"
+    SmtpAppealHalt:
+      type: object
+      required: [halt_id, lifted]
+      properties:
+        halt_id:
+          type: string
+          format: uuid
+        lifted:
+          description: Lifted on the recheck; one that still holds is for abuse review.
+          type: boolean
     AbuseAppealArgs:
       type: object
       required: [case_id, reason]
