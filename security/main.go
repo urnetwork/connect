@@ -82,7 +82,8 @@ type feed struct {
 // permissive-first policy for commercial redistribution (the transformed table
 // ships embedded in released binaries): included are permissive/public-domain
 // feeds (CC0, BSD), Spamhaus DROP (free for product use, attribution retained
-// in the header below), and openly-published feeds that state no license
+// in the header below), the NetAPI honeypot list (CC BY 4.0, attribution
+// retained in the header below), and openly-published feeds that state no license
 // (treated as usable). Feeds whose terms explicitly forbid commercial use or
 // redistribution are excluded — AlienVault OTX (EULA forbids distribution),
 // Binary Defense (non-commercial), AbuseIPDB / GreenSnow / DShield (via the
@@ -107,6 +108,8 @@ var feeds = []feed{
 	// free for product use with attribution (Spamhaus credit retained in the header below)
 	{name: "spamhaus", url: "https://www.spamhaus.org/drop/drop.txt", kind: kindText, minCount: 800, credit: "The Spamhaus DROP list — spamhaus.org/drop (© The Spamhaus Project; credit retained below)"},
 	{name: "spamhaus6", url: "https://www.spamhaus.org/drop/dropv6.txt", kind: kindText, minCount: 50, minV6Count: 50, credit: "The Spamhaus DROPv6 list — spamhaus.org/drop (© The Spamhaus Project)"},
+	// CC BY 4.0 (attribution retained in the header below): first-party honeypot data, not an aggregate
+	{name: "netapi", url: "https://netapi.com/api2/?method=compromised&dataset_type=ip", kind: kindText, minCount: 10000, credit: "NetAPI compromised IPs, attack sources seen by its honeypot sensors in the last 48 h (CC BY 4.0) — netapi.com/compromised-ips"},
 	// openly published, no stated license (treated as usable per the sourcing policy)
 	{name: "blocklistde", url: "https://lists.blocklist.de/lists/all.txt", kind: kindText, minCount: 8000, credit: "Blocklist.de fail2ban reports (no stated license) — lists.blocklist.de"},
 	{name: "cins", url: "https://cinsscore.com/list/ci-badguys.txt", kind: kindText, minCount: 7000, credit: "CINS Army / CI Army ci-badguys (no stated license) — cinsscore.com"},
