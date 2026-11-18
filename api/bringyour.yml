@@ -6272,7 +6272,7 @@ paths:
         replaces it. It is computed by the api from the extenders' signed
         reports, never from figures the browser supplies, pooling the last 3
         runs that count: those from `client_ip` (or its other family) whose
-        stop the reports support, with at least 6 extenders of 12 round
+        stop the reports support, with at least 6 extenders of 8 round
         trips. `pending_run` names a run whose verdict is not in yet, usually
         for about 2 s after the visitor finished it.
 
