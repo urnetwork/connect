@@ -25,7 +25,10 @@ package extender
 // client's retries would also cover.
 //
 // Each session yields one signed report: the minute around its load, or its
-// last minute when it had none (M8).
+// last minute when it had none (M8). A drift test's ticket leaves every load
+// cap at zero, and its session pings with no load; it may ask for its report
+// to be posted at once, and a demo's for none at all (lag.dev/DRIFTTEST.md E3,
+// E4).
 
 import (
 	"bytes"
@@ -432,6 +435,16 @@ type lagApiSession struct {
 	maxStreamCount   int
 	maxDownloadBytes int64
 	maxUploadBytes   int64
+	// lag.dev/DRIFTTEST.md E3: the ticket leaves every load cap at zero, as a
+	// drift test's does, so the session is for latency alone. It pings as any
+	// other, and any load it asks for is refused. Its hello still names the
+	// defaults above, since the browser's client takes a hello without a load
+	// for a malformed one (S5), and it asks for no load on such a ticket.
+	latencyOnly bool
+	// lag.dev/DRIFTTEST.md E4: the ticket asks for the session's report to be
+	// posted at once, or for no report at all (the demo token's, W8)
+	reportPromptly bool
+	noReport       bool
 
 	// done when the session ends, which ends its load
 	ctx    context.Context
@@ -521,6 +534,9 @@ func newLagApiSession(
 		maxStreamCount:   maxStreamCount,
 		maxDownloadBytes: byteCountOf(body.MaxDownloadBytes),
 		maxUploadBytes:   byteCountOf(body.MaxUploadBytes),
+		latencyOnly:      lagApiLatencyOnly(body),
+		reportPromptly:   body.ReportPromptly,
+		noReport:         body.NoReport,
 		ctx:              ctx,
 		cancel:           cancel,
 		messages:         make(chan lagApiControlMessage, 16),
@@ -528,6 +544,15 @@ func newLagApiSession(
 		wake:             make(chan struct{}, 1),
 		changed:          make(chan struct{}),
 	}, nil
+}
+
+// Whether a ticket is for latency alone (lag.dev/DRIFTTEST.md E3): it leaves
+// every load cap at zero, as a drift test's does, and its session admits no
+// load. A ticket that leaves only some of them unset takes the defaults for
+// those, as before; the api sets every one on a lag.dev track's (A6).
+func lagApiLatencyOnly(body *protocol.LagTicketBody) bool {
+	return body.DownloadMs == 0 && body.UploadMs == 0 && body.MaxStreams == 0 &&
+		body.MaxDownloadBytes == 0 && body.MaxUploadBytes == 0
 }
 
 // GET /lag/v1/session?ticket=<ticket text> (M3, M4). The websocket is upgraded
@@ -1137,6 +1162,11 @@ func (self *lagApiSession) phaseOf(direction lagApiDirection) (*lagApiPhase, boo
 	defer self.stateLock.Unlock()
 	load := self.load
 	if load == nil {
+		// lag.dev/DRIFTTEST.md E3: no phase comes for latency alone, so a
+		// stream is refused at once rather than waiting for one
+		if self.latencyOnly {
+			return nil, false, nil
+		}
 		return nil, true, self.changed
 	}
 	phase := load.download
@@ -1384,6 +1414,17 @@ func (self *lagApiSession) run() {
 				// one load per session: a second is refused as busy with
 				// retryAfterMs 0, since no wait would admit it
 				// (lag.dev/PLAN.md M3)
+				retryAfterMs := int64(0)
+				return self.write(&lagApiErrorMessage{Type: "error", Code: lagApiErrorBusy, RetryAfterMs: &retryAfterMs})
+			}
+			if self.latencyOnly {
+				// a ticket for latency alone admits no load, so it is refused
+				// as a second load is, as busy with retryAfterMs 0, which the
+				// browser's client takes without ending the session: the
+				// session goes on pinging (lag.dev/DRIFTTEST.md E3, M4).
+				// Nothing is admitted, so nothing counts against the subnet or
+				// the budget, and the report says the load was refused (M8).
+				self.refused = true
 				retryAfterMs := int64(0)
 				return self.write(&lagApiErrorMessage{Type: "error", Code: lagApiErrorBusy, RetryAfterMs: &retryAfterMs})
 			}
@@ -1672,18 +1713,29 @@ func (self *lagApiSession) finish() {
 }
 
 // Builds, signs and submits the session's one report (M8), at the close of its
-// minute or when the session ends first.
+// minute or when the session ends first. A ticket that asks for no report gets
+// none, neither signed nor sent, though the session counts as reported as any
+// other does; one that asks for its report promptly has it posted at once
+// (lag.dev/DRIFTTEST.md E4).
 func (self *lagApiSession) report(now time.Time) {
 	if self.reported {
 		return
 	}
 	self.reported = true
+	if self.noReport {
+		return
+	}
 	report, err := connect.SignLagReport(self.reportBody(now), self.api.identityPrivateKey)
 	if err != nil {
 		self.api.server.reportError("lag report", err)
 		return
 	}
-	if self.api.reports != nil {
+	if self.api.reports == nil {
+		return
+	}
+	if self.reportPromptly {
+		self.api.reports.SubmitPromptly(report)
+	} else {
 		self.api.reports.Submit(report)
 	}
 }

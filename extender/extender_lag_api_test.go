@@ -82,12 +82,18 @@ func (self *testLagCertificates) setQuietly(names []string, certificate *tls.Cer
 	self.certificate = certificate
 }
 
-// The lifecycle's report queue, as a sink (M10).
+// The lifecycle's report queue, as a sink (M10). A report submitted promptly
+// (lag.dev/DRIFTTEST.md E4) arrives the same way; the drift tests put the real
+// queue in its place to see the difference.
 type testLagReports struct {
 	reports chan *protocol.LagReport
 }
 
 func (self *testLagReports) Submit(report *protocol.LagReport) {
+	self.reports <- report
+}
+
+func (self *testLagReports) SubmitPromptly(report *protocol.LagReport) {
 	self.reports <- report
 }
 
@@ -1213,6 +1219,82 @@ func TestLagApiDispatchNames(t *testing.T) {
 	fixture.certificates.set(nil, nil)
 	if fixture.api.peeks() {
 		t.Error("peeks with no names")
+	}
+}
+
+// M1 with the family-pinned names (lag.dev/DRIFTTEST.md K6): a certificate for
+// an extender's three names is served for each of them, and the dispatch takes
+// each. With a certificate for the measurement name alone, as an extender from
+// before K6 holds, a family's name is not the api's. No carrier gives a
+// family's name an identity leaf, whether a certificate is installed or not.
+func TestLagApiDispatchFamilyNames(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	fixture.server.measurementZone = "extender.example"
+	extenderId, ok := connect.ParseExtenderMeasurementName(testLagName, "extender.example")
+	if !ok {
+		t.Fatalf("%s is not a measurement name", testLagName)
+	}
+	names := connect.ExtenderMeasurementNames(extenderId, "extender.example")
+	certificate, err := selfSignedCertificate(names, "Lag", time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCas := x509.NewCertPool()
+	rootCas.AddCert(certificate.Leaf)
+	fixture.certificates.set(names, certificate)
+
+	for _, name := range names {
+		conn, err := tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
+			RootCAs:    rootCas,
+			ServerName: name,
+			NextProtos: []string{"h2", "http/1.1"},
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		state := conn.ConnectionState()
+		conn.Close()
+		if state.NegotiatedProtocol != "http/1.1" || !state.PeerCertificates[0].Equal(certificate.Leaf) {
+			t.Errorf("%s: alpn %q, or not the measurement certificate", name, state.NegotiatedProtocol)
+		}
+		if dispatch := <-fixture.dispatches; !dispatch.dispatched || dispatch.serverName != name {
+			t.Errorf("%s: dispatch %+v", name, dispatch)
+		}
+		if !fixture.api.serves(name) {
+			t.Errorf("%s is not served", name)
+		}
+	}
+
+	// the measurement name's certificate alone: a family's name is not the
+	// api's, and the existing path, which this fixture has none of, closes it
+	fixture.certificates.set([]string{testLagName}, fixture.certificate)
+	for _, name := range names[1:] {
+		if _, err := tls.Dial("tcp", fixture.dialAddress(), &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         name,
+		}); err == nil {
+			t.Errorf("%s was answered without a certificate for it", name)
+		}
+		if dispatch := <-fixture.dispatches; dispatch.dispatched {
+			t.Errorf("%s: dispatch %+v", name, dispatch)
+		}
+		if fixture.api.serves(name) {
+			t.Errorf("%s is served by the measurement name's certificate", name)
+		}
+	}
+
+	// never an identity leaf, with a certificate for the names or with none
+	for _, installed := range []bool{true, false} {
+		if installed {
+			fixture.certificates.set(names, certificate)
+		} else {
+			fixture.certificates.set(nil, nil)
+		}
+		for _, name := range names[1:] {
+			if _, err := fixture.server.carrierCertificate(&tls.ClientHelloInfo{ServerName: name}); err == nil {
+				t.Errorf("an identity leaf for %q, certificate installed %t", name, installed)
+			}
+		}
 	}
 }
 

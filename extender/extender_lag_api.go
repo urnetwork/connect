@@ -57,6 +57,10 @@ type lagCertificates interface {
 
 type lagReports interface {
 	Submit(report *protocol.LagReport)
+	// lag.dev/DRIFTTEST.md E4: as Submit, for a session whose ticket asks for
+	// its report promptly. The queue posts it, with what is queued before it,
+	// at once, rather than when its batch is full or 10 s after its first.
+	SubmitPromptly(report *protocol.LagReport)
 }
 
 // The paths of the API (M4, M5, M6) and of the feed the lifecycle serves over

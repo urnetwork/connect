@@ -11,9 +11,11 @@ package extender
 //
 // A submit never blocks the session that made it. A batch of up to
 // ReportMaxBatchCount goes when it is full or ReportFlushTimeout after its
-// first report. A post the operator did not answer is put back at the front
-// and retried on a backoff that doubles to its max; the queue holds at most
-// ReportMaxPendingCount reports and drops the oldest, so an operator that
+// first report, or at once while the queue holds a report submitted promptly,
+// one a drift test's verdict waits on (lag.dev/DRIFTTEST.md E4). A post the
+// operator did not answer is put back at the front and retried on a backoff
+// that doubles to its max, which holds a prompt report too; the queue holds at
+// most ReportMaxPendingCount reports and drops the oldest, so an operator that
 // cannot be reached never grows the extender's memory. What is still queued
 // when the extender closes is dropped: it is a measurement, and a post on the
 // way out would hold the shutdown.
@@ -76,10 +78,19 @@ type extenderLagReporter struct {
 
 	stateLock sync.Mutex
 	// serialized reports, oldest first
-	pendingReports [][]byte
+	pendingReports []extenderLagPendingReport
 	// when the oldest pending report arrived, which starts the flush clock
 	firstPendingTime time.Time
 	droppedCount     int
+}
+
+// One queued report: its serialized bytes, and whether its session's ticket
+// asked for it promptly, which has the batch it goes in posted at once
+// (lag.dev/DRIFTTEST.md E4). The flag goes back with a batch put back, so a
+// retry of it is as prompt as the backoff allows.
+type extenderLagPendingReport struct {
+	reportBytes []byte
+	promptly    bool
 }
 
 // The reporter is running when this returns, as a worker of the server. The
@@ -89,7 +100,7 @@ func newExtenderLagReporter(server *ExtenderServer, settings *ExtenderLagLifecyc
 		server:         server,
 		settings:       settings,
 		wakeMonitor:    connect.NewMonitor(),
-		pendingReports: [][]byte{},
+		pendingReports: []extenderLagPendingReport{},
 	}
 	if server.beginWorker() {
 		go func() {
@@ -100,9 +111,32 @@ func newExtenderLagReporter(server *ExtenderServer, settings *ExtenderLagLifecyc
 	return self
 }
 
+// Queues one signed report whose session's ticket asked for it promptly, and
+// has it posted at once (lagReports, lag.dev/DRIFTTEST.md E4): a drift test's
+// verdict waits on it. Only a failed post's backoff holds it. It never blocks;
+// without an api to post to the report is dropped, as by Submit.
+func (self *extenderLagLifecycle) SubmitPromptly(report *protocol.LagReport) {
+	if self == nil || self.reporter == nil {
+		return
+	}
+	self.reporter.submitPromptly(report)
+}
+
 // Queues one signed report (M8). It never blocks; beyond the pending cap the
 // oldest report is dropped. A report that does not serialize is dropped.
 func (self *extenderLagReporter) submit(report *protocol.LagReport) {
+	self.queue(report, false)
+}
+
+// Queues one signed report as submit does, and has its batch posted at once
+// (lag.dev/DRIFTTEST.md E4).
+func (self *extenderLagReporter) submitPromptly(report *protocol.LagReport) {
+	self.queue(report, true)
+}
+
+// Appends one report, dropping the oldest beyond the pending cap, and wakes the
+// post loop.
+func (self *extenderLagReporter) queue(report *protocol.LagReport, promptly bool) {
 	if report == nil {
 		return
 	}
@@ -121,7 +155,10 @@ func (self *extenderLagReporter) submit(report *protocol.LagReport) {
 	if len(self.pendingReports) == 0 {
 		self.firstPendingTime = self.settings.Now()
 	}
-	self.pendingReports = append(self.pendingReports, reportBytes)
+	self.pendingReports = append(self.pendingReports, extenderLagPendingReport{
+		reportBytes: reportBytes,
+		promptly:    promptly,
+	})
 	self.wakeMonitor.NotifyAll()
 }
 
@@ -180,7 +217,7 @@ func (self *extenderLagReporter) run() {
 // The channel is subscribed in the same locked scope as the read, as a submit
 // notifies in the same scope as its append, so a report is either in this read
 // or wakes the wait after it, never both.
-func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) ([][]byte, time.Duration, chan struct{}) {
+func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) ([]extenderLagPendingReport, time.Duration, chan struct{}) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -192,7 +229,12 @@ func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) (
 		return nil, retryTime.Sub(now), wake
 	}
 	flushTime := self.firstPendingTime.Add(self.settings.ReportFlushTimeout)
-	if len(self.pendingReports) < self.settings.ReportMaxBatchCount && now.Before(flushTime) {
+	// lag.dev/DRIFTTEST.md E4: a batch is due at once while a prompt report is
+	// pending, so one queued behind a full batch goes in the next, right after
+	promptly := slices.ContainsFunc(self.pendingReports, func(pendingReport extenderLagPendingReport) bool {
+		return pendingReport.promptly
+	})
+	if !promptly && len(self.pendingReports) < self.settings.ReportMaxBatchCount && now.Before(flushTime) {
 		return nil, flushTime.Sub(now), wake
 	}
 	count := min(len(self.pendingReports), self.settings.ReportMaxBatchCount)
@@ -208,7 +250,7 @@ func (self *extenderLagReporter) takeBatch(now time.Time, retryTime time.Time) (
 
 // Puts a batch the operator did not answer back at the front. Beyond the cap
 // the oldest go, which are the batch's own.
-func (self *extenderLagReporter) requeue(reportBatch [][]byte) {
+func (self *extenderLagReporter) requeue(reportBatch []extenderLagPendingReport) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.pendingReports = append(slices.Clone(reportBatch), self.pendingReports...)
@@ -223,12 +265,12 @@ func (self *extenderLagReporter) requeue(reportBatch [][]byte) {
 // Posts one batch under the activation credential (A7). True when the batch is
 // done with: the operator answered it, whatever it accepted, or refused the
 // batch itself as one it would refuse again. False when it should be retried.
-func (self *extenderLagReporter) post(reportBatch [][]byte) bool {
+func (self *extenderLagReporter) post(reportBatch []extenderLagPendingReport) bool {
 	args := &extenderLagReportArgs{
 		Reports: make([]string, 0, len(reportBatch)),
 	}
-	for _, reportBytes := range reportBatch {
-		args.Reports = append(args.Reports, base64.StdEncoding.EncodeToString(reportBytes))
+	for _, pendingReport := range reportBatch {
+		args.Reports = append(args.Reports, base64.StdEncoding.EncodeToString(pendingReport.reportBytes))
 	}
 	argsBytes, err := json.Marshal(args)
 	if err != nil {

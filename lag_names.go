@@ -5,9 +5,8 @@ import (
 )
 
 // Measurement names of extenders (lag.dev/PLAN.md N). An open tier extender
-// that serves the measurement API (M) is reached by browsers under one name,
-// in a zone of its own, and its measurement certificate names exactly that
-// (N3, C4).
+// that serves the measurement API (M) is reached by browsers under its
+// measurement name, in a zone of its own (N3, C4).
 //
 // The name is the extender's id, '.', and the zone (N1). The id is the
 // operator's id of the extender, one per identity key, written as Id.String
@@ -18,7 +17,17 @@ import (
 // from its activation answer, and a reader of the feed or gossip from the
 // record's MeasurementId (N4, C10).
 //
-// The TypeScript twin is extenderMeasurementHost in sdk/js (S1, S2), pinned
+// Beside it, an extender has a name for each IP family that resolves in that
+// family alone (lag.dev/DRIFTTEST.md K6): `<id>.ipv4.<zone>` with only its A
+// records and `<id>.ipv6.<zone>` with only its AAAA records. A browser that
+// connects to the measurement name picks the family itself, and a drift test
+// run is bound to the customer's client_ip only when its sessions use
+// client_ip's family, so a drift ticket names the family's own name. The
+// measurement certificate carries all three names. An extender from before
+// K6 asks for its measurement name alone, and has no family-pinned names.
+//
+// The TypeScript twins are extenderMeasurementHost and
+// extenderMeasurementFamilyHost in sdk/js (S1, S2), with their parses, pinned
 // by vectors generated from these functions.
 
 // The zone measurement names are under unless configured otherwise (N1, C1).
@@ -53,9 +62,16 @@ func ExtenderMeasurementName(extenderId Id, zone string) string {
 // also reads upper case, an id without its hyphens and any character in a
 // hyphen's place, so the id must write back as exactly the label given.
 // Another zone, an extra label, a trailing dot and the zero Id are refused
-// with the rest.
+// with the rest, and so is a family-pinned name, which
+// ParseExtenderMeasurementFamilyName reads.
 func ParseExtenderMeasurementName(name string, zone string) (Id, bool) {
-	label, ok := strings.CutSuffix(name, "."+extenderMeasurementZone(zone))
+	return parseExtenderMeasurementId(name, "."+extenderMeasurementZone(zone))
+}
+
+// The id that `name` spells before `suffix`, in its canonical spelling only
+// (ParseExtenderMeasurementName).
+func parseExtenderMeasurementId(name string, suffix string) (Id, bool) {
+	label, ok := strings.CutSuffix(name, suffix)
 	if !ok {
 		return Id{}, false
 	}
@@ -64,4 +80,90 @@ func ParseExtenderMeasurementName(name string, zone string) (Id, bool) {
 		return Id{}, false
 	}
 	return extenderId, true
+}
+
+// The label between the id and the zone of the name that resolves in one IP
+// family alone (K6), "" for anything but 4 and 6.
+func extenderMeasurementFamilyLabel(ipFamily int) string {
+	switch ipFamily {
+	case 4:
+		return "ipv4"
+	case 6:
+		return "ipv6"
+	default:
+		return ""
+	}
+}
+
+// The name of an extender that resolves in IP family `ipFamily` alone, 4 or 6
+// (lag.dev/DRIFTTEST.md K6): its id, '.', "ipv4" or "ipv6", '.', and the
+// zone, which is written as ExtenderMeasurementName writes it. Its records are
+// those of the measurement name in that family only. The zero Id is no
+// extender's, and it and any other family have no name, "".
+func ExtenderMeasurementFamilyName(extenderId Id, zone string, ipFamily int) string {
+	label := extenderMeasurementFamilyLabel(ipFamily)
+	if extenderId == (Id{}) || label == "" {
+		return ""
+	}
+	return extenderId.String() + "." + label + "." + extenderMeasurementZone(zone)
+}
+
+// The names an extender's measurement certificate carries (C4, K6): its
+// measurement name, then its IPv4 name and its IPv6 name. Nil for the zero Id.
+func ExtenderMeasurementNames(extenderId Id, zone string) []string {
+	if extenderId == (Id{}) {
+		return nil
+	}
+	return []string{
+		ExtenderMeasurementName(extenderId, zone),
+		ExtenderMeasurementFamilyName(extenderId, zone, 4),
+		ExtenderMeasurementFamilyName(extenderId, zone, 6),
+	}
+}
+
+// The id of the extender any of its measurement names is for, and the IP
+// family the name resolves in: 0 for its measurement name, which resolves in
+// both, and 4 or 6 for a name of one family (K6). Exactly those three shapes
+// parse, each in the one canonical spelling ParseExtenderMeasurementName
+// takes, so another label between the id and the zone, a family label in
+// upper case and a name at the zone's apex are refused with the rest.
+func ParseExtenderMeasurementFamilyName(name string, zone string) (extenderId Id, ipFamily int, ok bool) {
+	zone = extenderMeasurementZone(zone)
+	if extenderId, ok := parseExtenderMeasurementId(name, "."+zone); ok {
+		return extenderId, 0, true
+	}
+	for _, ipFamily := range []int{4, 6} {
+		if extenderId, ok := parseExtenderMeasurementId(name, "."+extenderMeasurementFamilyLabel(ipFamily)+"."+zone); ok {
+			return extenderId, ipFamily, true
+		}
+	}
+	return Id{}, 0, false
+}
+
+// The extender a measurement certificate or its request is for, read from its
+// names (C4, K6), and whether they include the family-pinned names. Two sets
+// are an extender's, in any order: its measurement name alone, which an
+// extender from before K6 asks for, and its measurement name with both of its
+// family-pinned names. Every other set is refused: another extender's name
+// beside its own, a name twice, a family-pinned name without the measurement
+// name or without the other family's, a name of another shape or zone.
+func ParseExtenderMeasurementNames(names []string, zone string) (extenderId Id, familyNames bool, ok bool) {
+	if len(names) != 1 && len(names) != 3 {
+		return Id{}, false, false
+	}
+	// each family's name at most once, all of one extender
+	ipFamilies := map[int]bool{}
+	for i, name := range names {
+		nameId, ipFamily, ok := ParseExtenderMeasurementFamilyName(name, zone)
+		if !ok || ipFamilies[ipFamily] || (0 < i && nameId != extenderId) {
+			return Id{}, false, false
+		}
+		extenderId = nameId
+		ipFamilies[ipFamily] = true
+	}
+	// one name is the measurement name, and three are one of each family
+	if !ipFamilies[0] {
+		return Id{}, false, false
+	}
+	return extenderId, len(names) == 3, true
 }

@@ -9,6 +9,10 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -130,6 +134,153 @@ func TestLagTicketRoundTrips(t *testing.T) {
 	hintless.RootKeyId = nil
 	if _, err := VerifyLagTicket(hintless, []ed25519.PublicKey{rootPublicKey}, now); err != nil {
 		t.Fatalf("a missing key id refused the ticket: %v", err)
+	}
+}
+
+// The drift test's flags (lag.dev/DRIFTTEST.md E4) round-trip through the
+// root signature and the ticket's text form, each alone and together, on the
+// latency-only caps its tickets carry (E3). A ticket without them reads both
+// as false, and neither can be set or cleared on a signed ticket.
+func TestLagTicketDriftFlagsRoundTrip(t *testing.T) {
+	now := time.Now()
+	rootPrivateKey, rootPublicKey := newTestLagKey(t)
+	_, extenderPublicKey := newTestLagKey(t)
+	rootPublicKeys := []ed25519.PublicKey{rootPublicKey}
+
+	for _, flags := range []struct{ reportPromptly, noReport bool }{
+		{false, false},
+		{true, false},
+		{false, true},
+		{true, true},
+	} {
+		body := newTestLagTicketBody(extenderPublicKey, now)
+		body.DownloadMs = 0
+		body.UploadMs = 0
+		body.MaxStreams = 0
+		body.MaxDownloadBytes = 0
+		body.MaxUploadBytes = 0
+		body.ReportPromptly = flags.reportPromptly
+		body.NoReport = flags.noReport
+
+		ticket, err := SignLagTicket(body, rootPrivateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text, err := EncodeLagTicket(ticket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decodedTicket, err := DecodeLagTicket(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		verifiedBody, err := VerifyLagTicket(decodedTicket, rootPublicKeys, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if verifiedBody.ReportPromptly != flags.reportPromptly || verifiedBody.NoReport != flags.noReport {
+			t.Fatalf("flags %+v came back as ReportPromptly %t, NoReport %t", flags, verifiedBody.ReportPromptly, verifiedBody.NoReport)
+		}
+		if !proto.Equal(verifiedBody, body) {
+			t.Fatalf("flags %+v: the verified body is not the signed body", flags)
+		}
+
+		// a holder can't add NoReport to a real ticket, or drop it from a demo's
+		for _, flip := range []func(*protocol.LagTicketBody){
+			func(b *protocol.LagTicketBody) { b.ReportPromptly = !b.ReportPromptly },
+			func(b *protocol.LagTicketBody) { b.NoReport = !b.NoReport },
+		} {
+			flippedBody := proto.Clone(body).(*protocol.LagTicketBody)
+			flip(flippedBody)
+			flippedBodyBytes, err := proto.Marshal(flippedBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flipped := &protocol.LagTicket{Body: flippedBodyBytes, RootSignature: ticket.RootSignature, RootKeyId: ticket.RootKeyId}
+			if _, err := VerifyLagTicket(flipped, rootPublicKeys, now); err == nil {
+				t.Fatalf("flags %+v: a ticket verified with a flag changed after signing", flags)
+			}
+		}
+	}
+}
+
+// LagTicketBody as an extender built before the drift test's flags knows it.
+func oldLagTicketBodyDescriptor(t *testing.T) protoreflect.MessageDescriptor {
+	t.Helper()
+	fileProto := protodesc.ToFileDescriptorProto(protocol.File_lag_proto)
+	found := false
+	for _, messageProto := range fileProto.MessageType {
+		if messageProto.GetName() != "LagTicketBody" {
+			continue
+		}
+		found = true
+		var fields []*descriptorpb.FieldDescriptorProto
+		for _, field := range messageProto.Field {
+			if field.GetNumber() < 15 {
+				fields = append(fields, field)
+			}
+		}
+		messageProto.Field = fields
+	}
+	if !found {
+		t.Fatal("LagTicketBody is missing from lag.proto")
+	}
+	file, err := protodesc.NewFile(fileProto, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file.Messages().ByName("LagTicketBody")
+}
+
+// An older extender admits a ticket that carries the flags, and reads every
+// field it knows as signed: the signature is over the body's bytes, and the
+// flags decode as unknown fields it ignores. Such an extender reports a
+// prompt ticket's session within 10 s, and a demo's anyway
+// (lag.dev/DRIFTTEST.md E4, T1).
+func TestLagTicketDriftFlagsOlderExtender(t *testing.T) {
+	now := time.Now()
+	rootPrivateKey, rootPublicKey := newTestLagKey(t)
+	_, extenderPublicKey := newTestLagKey(t)
+	oldDescriptor := oldLagTicketBodyDescriptor(t)
+	if oldDescriptor.Fields().Len() != 14 {
+		t.Fatalf("old descriptor has %d fields, want the 14 before the flags", oldDescriptor.Fields().Len())
+	}
+	oldType := dynamicpb.NewMessageType(oldDescriptor)
+
+	body := newTestLagTicketBody(extenderPublicKey, now)
+	body.ReportPromptly = true
+	body.NoReport = true
+	ticket, err := SignLagTicket(body, rootPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the signature check comes before any decoding, so it is the same for an
+	// older extender
+	if _, err := VerifyLagTicket(ticket, []ed25519.PublicKey{rootPublicKey}, now); err != nil {
+		t.Fatal(err)
+	}
+	oldBody := oldType.New()
+	if err := proto.Unmarshal(ticket.Body, oldBody.Interface()); err != nil {
+		t.Fatalf("an older extender cannot decode a ticket with the flags: %v", err)
+	}
+	if len(oldBody.GetUnknown()) == 0 {
+		t.Fatal("the older extender did not carry the flags as unknown fields")
+	}
+	oldBody.SetUnknown(nil)
+
+	unflaggedBody := proto.Clone(body).(*protocol.LagTicketBody)
+	unflaggedBody.ReportPromptly = false
+	unflaggedBody.NoReport = false
+	unflaggedBodyBytes, err := proto.Marshal(unflaggedBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedOldBody := oldType.New()
+	if err := proto.Unmarshal(unflaggedBodyBytes, expectedOldBody.Interface()); err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(oldBody.Interface(), expectedOldBody.Interface()) {
+		t.Fatal("the older extender read the ticket's other fields differently")
 	}
 }
 

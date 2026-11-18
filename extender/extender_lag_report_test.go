@@ -168,7 +168,7 @@ func TestLagReportDropsTheOldest(t *testing.T) {
 	reporter := &extenderLagReporter{
 		settings:       settings,
 		wakeMonitor:    connect.NewMonitor(),
-		pendingReports: [][]byte{},
+		pendingReports: []extenderLagPendingReport{},
 	}
 	reports := []*protocol.LagReport{}
 	for i := range 340 {
@@ -176,9 +176,9 @@ func TestLagReportDropsTheOldest(t *testing.T) {
 	}
 	pendingReports := func() []*protocol.LagReport {
 		pending := []*protocol.LagReport{}
-		for _, reportBytes := range reporter.pendingReports {
+		for _, pendingReport := range reporter.pendingReports {
 			report := &protocol.LagReport{}
-			if err := proto.Unmarshal(reportBytes, report); err != nil {
+			if err := proto.Unmarshal(pendingReport.reportBytes, report); err != nil {
 				t.Fatal(err)
 			}
 			pending = append(pending, report)
@@ -222,4 +222,97 @@ func TestLagReportDropsTheOldest(t *testing.T) {
 	// a nil report is no report
 	reporter.submit(nil)
 	expectPending(reports[84:340], 84)
+}
+
+// lag.dev/DRIFTTEST.md E4, T1: a report submitted promptly is posted at once,
+// with what was queued before it, while the clock stands still. The queue then
+// batches as before, so the next report without the flag waits for its flush.
+// Without an api to post to, a prompt report is dropped as any other is.
+func TestLagReportPromptly(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	lifecycle := newTestLagLifecycle(t, api, clock, nil, nil)
+
+	queued := testLagReport(0)
+	lifecycle.Submit(queued)
+	if wait := clock.nextWait(t); wait != 10*time.Second {
+		t.Fatalf("flush wait = %s, expected the flush timeout", wait)
+	}
+	api.expectQuiet()
+	prompt := testLagReport(1)
+	lifecycle.SubmitPromptly(prompt)
+	expectTestLagReports(t, api.waitPost(), []*protocol.LagReport{queued, prompt})
+
+	next := testLagReport(2)
+	lifecycle.Submit(next)
+	if wait := clock.nextWait(t); wait != 10*time.Second {
+		t.Fatalf("flush wait = %s, expected the flush timeout after a prompt post", wait)
+	}
+	api.expectQuiet()
+	clock.advance(10 * time.Second)
+	expectTestLagReports(t, api.waitPost(), []*protocol.LagReport{next})
+	api.expectQuiet()
+
+	var noLifecycle *extenderLagLifecycle
+	noLifecycle.SubmitPromptly(testLagReport(3))
+	(&extenderLagLifecycle{}).SubmitPromptly(testLagReport(4))
+}
+
+// lag.dev/DRIFTTEST.md E4: a prompt report queued behind a full batch goes in
+// the batch right after it, with no flush wait between them, however the
+// queue's loop and the submits interleave: the first batch is the oldest 32,
+// and no smaller one is due before the prompt report is queued.
+func TestLagReportPromptlyBehindAFullBatch(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	lifecycle := newTestLagLifecycle(t, api, clock, nil, nil)
+
+	reports := []*protocol.LagReport{}
+	for i := range 40 {
+		report := testLagReport(i)
+		reports = append(reports, report)
+		if i < 39 {
+			lifecycle.Submit(report)
+		} else {
+			lifecycle.SubmitPromptly(report)
+		}
+	}
+	expectTestLagReports(t, api.waitPost(), reports[0:32])
+	expectTestLagReports(t, api.waitPost(), reports[32:40])
+	api.expectQuiet()
+}
+
+// lag.dev/DRIFTTEST.md E4: a post the operator did not answer holds even a
+// prompt report to its backoff, since a post at once would only fail again.
+// The report keeps its flag when its batch is put back, so the retry goes as
+// soon as the backoff ends, ahead of the flush clock the put back restarted.
+func TestLagReportPromptlyHeldByBackoff(t *testing.T) {
+	clock := newTestLagClock()
+	api := newTestLagApi(t)
+	api.setReportAnswer(http.StatusInternalServerError, nil)
+	// a backoff shorter than the flush timeout, so only the flag can make the
+	// retry due when the backoff ends
+	lifecycle := newTestLagLifecycle(t, api, clock, nil, func(settings *ExtenderLagLifecycleSettings) {
+		settings.ReportMinBackoff = 5 * time.Second
+	})
+
+	prompt := testLagReport(0)
+	lifecycle.SubmitPromptly(prompt)
+	expectTestLagReports(t, api.waitPost(), []*protocol.LagReport{prompt})
+	if wait := clock.nextWait(t); wait != 5*time.Second {
+		t.Fatalf("retry wait = %s, expected the backoff", wait)
+	}
+	// a report while the prompt one is held wakes the queue, which waits out
+	// the rest of the backoff rather than posting
+	queued := testLagReport(1)
+	lifecycle.Submit(queued)
+	if wait := clock.nextWait(t); wait != 5*time.Second {
+		t.Fatalf("retry wait = %s, expected the rest of the backoff", wait)
+	}
+	api.expectQuiet()
+
+	api.setReportAnswer(http.StatusOK, nil)
+	clock.advance(5 * time.Second)
+	expectTestLagReports(t, api.waitPost(), []*protocol.LagReport{prompt, queued})
+	api.expectQuiet()
 }
